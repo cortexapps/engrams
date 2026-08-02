@@ -491,6 +491,7 @@ impl SessionState {
             .collect();
         if !secrets.is_empty() || !injects.is_empty() || !observes.is_empty() {
             return Decision::Intercept {
+                foreign_placeholders: self.foreign_placeholders(hostname),
                 secrets,
                 injects,
                 observes,
@@ -506,6 +507,7 @@ impl SessionState {
                     secrets: Vec::new(),
                     injects: Vec::new(),
                     observes: Vec::new(),
+                    foreign_placeholders: self.foreign_placeholders(hostname),
                 };
             }
             Decision::Bypass
@@ -524,6 +526,24 @@ impl SessionState {
             .map(|s| s.placeholder.as_str())
             .collect()
     }
+
+    /// Placeholders whose secret does NOT allow `hostname`. Seeing one of these
+    /// in a request to that host is a leak attempt, and the intercept path
+    /// closes the connection.
+    ///
+    /// This must be computed HERE, beside the narrowing that hides it: the
+    /// intercept path receives only host-matching secrets, so the leak scan it
+    /// used to run — "which of these secrets does this host disallow?" — asked
+    /// a question whose answer is always "none". The detector, and the e2e
+    /// fixture built on it, tested an empty set.
+    fn foreign_placeholders(&self, hostname: &str) -> Vec<&str> {
+        self.secrets
+            .iter()
+            .filter(|entry| !entry.allow.matches(hostname))
+            .map(|entry| entry.placeholder.as_str())
+            .filter(|placeholder| !placeholder.is_empty())
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -539,6 +559,8 @@ pub enum Decision<'a> {
         secrets: Vec<&'a SecretEntry>,
         injects: Vec<&'a InjectEntry>,
         observes: Vec<&'a ObserveEntry>,
+        /// Placeholders this host may NOT receive — the leak scan's needles.
+        foreign_placeholders: Vec<&'a str>,
     },
 }
 
@@ -615,6 +637,7 @@ mod tests {
                 secrets,
                 injects,
                 observes,
+                ..
             } => {
                 assert!(secrets.is_empty());
                 assert_eq!(injects.len(), 1);
@@ -635,6 +658,7 @@ mod tests {
                 secrets,
                 injects,
                 observes,
+                ..
             } => {
                 assert!(secrets.is_empty());
                 assert!(injects.is_empty());
@@ -697,6 +721,7 @@ mod tests {
                 secrets,
                 injects,
                 observes,
+                ..
             } => {
                 assert!(secrets.is_empty());
                 assert!(injects.is_empty());

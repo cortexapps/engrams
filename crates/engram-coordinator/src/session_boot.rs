@@ -910,6 +910,29 @@ struct ConnectionBrokerResponse {
     expires_at: String,
 }
 
+/// How long a mint may take before the caller gives up.
+///
+/// A re-mint is awaited inside the per-entry single-flight guard, so every
+/// other guest request for that credential waits behind it. Without a timeout a
+/// hung orchestrator stalls them all until the TCP connection dies. Well above
+/// a real mint (one STS exchange plus one IAM call).
+const CONNECTION_BROKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The shared HTTP client for credential minting.
+///
+/// One client, built once. `reqwest::Client` owns a connection pool, so a fresh
+/// one per mint threw the pool away and paid a new TCP + TLS handshake on every
+/// call — while holding the single-flight guard.
+fn connection_broker_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(CONNECTION_BROKER_TIMEOUT)
+            .build()
+            .expect("the connection broker client builds from static settings")
+    })
+}
+
 /// Ask the orchestrator's generic connection broker for a short-lived
 /// credential. Provider-specific exchange stays behind that broker. The
 /// credential travels only between host-side processes.
@@ -936,7 +959,7 @@ async fn mint_remote_connection_inject_header(
             return None;
         }
     };
-    let response = match reqwest::Client::new()
+    let response = match connection_broker_client()
         .post(format!("{base}/internal/v1/integrations/credentials/mint"))
         .bearer_auth(bearer.trim())
         .json(&ConnectionBrokerRequest {

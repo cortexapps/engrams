@@ -37,7 +37,7 @@ use crate::observe::{self, ObserveSink};
 use crate::registry::{InjectEntry, InjectRefresher, ObserveEntry, SecretEntry};
 use crate::replayed::Replayed;
 use crate::resolver::{ResolveError, UpstreamResolver};
-use crate::substitute::{scan_for_violation, substitute};
+use crate::substitute::substitute;
 
 /// Cap on the HTTP/1 request header block. The block MUST terminate inside this
 /// bound: every gate in this module (authority pinning, injected-header
@@ -252,30 +252,60 @@ impl rustls::server::ResolvesServerCert for SniResolver {
     }
 }
 
+/// Everything the policy gate reads for one intercepted connection.
+///
+/// Both HTTP adapters take this same struct and run the same
+/// [`evaluate_stream`] over it, so a change to the gate cannot reach one
+/// protocol and miss the other. They used to carry two hand-copied versions of
+/// the gate, which is how HTTP/2 kept its own drift.
+pub struct StreamContext<'a> {
+    pub sni: &'a str,
+    pub port: u16,
+    /// Secrets whose `allow` list covers this host, so their placeholders are
+    /// substituted here.
+    pub secrets: &'a [&'a SecretEntry],
+    pub injects: &'a [&'a InjectEntry],
+    pub observes: &'a [&'a ObserveEntry],
+    /// Placeholders belonging to secrets this host is NOT allowed to receive.
+    /// Seeing one in a request is a leak attempt and closes the connection.
+    ///
+    /// This has to be supplied separately because `decide()` already narrowed
+    /// `secrets` to the host-matching ones. The old leak scan re-derived the
+    /// disallowed set from that narrowed list, which is always empty — so the
+    /// detector could never fire in production.
+    pub foreign_placeholders: &'a [&'a str],
+    pub session_id: SessionId,
+    pub sink: Option<&'a ObserveSink>,
+    pub refresher: Option<&'a dyn InjectRefresher>,
+}
+
 /// Drive a MITM intercept on `client_stream`. Bytes already peeked
 /// during SNI extraction are stitched back at the front via
 /// [`crate::replayed::Replayed`]. The upstream is dialed by SNI
 /// through `resolver`, not by guest-supplied IP — see the
 /// `resolver` module for why.
-#[allow(clippy::too_many_arguments)]
 pub async fn run<C>(
     client_stream: C,
     peeked: Vec<u8>,
-    sni: &str,
-    port: u16,
     resolver: Arc<dyn UpstreamResolver>,
-    secrets: &[&SecretEntry],
-    injects: &[&InjectEntry],
-    observes: &[&ObserveEntry],
-    session_id: SessionId,
-    sink: Option<&ObserveSink>,
-    refresher: Option<&dyn InjectRefresher>,
+    context: StreamContext<'_>,
     server_cfg: Arc<ServerConfig>,
     client_cfg: Arc<ClientConfig>,
 ) -> Result<(), InterceptError>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let StreamContext {
+        sni,
+        port,
+        secrets,
+        injects,
+        observes,
+        foreign_placeholders,
+        session_id,
+        sink,
+        refresher,
+    } = context;
     // Stitch the peeked bytes back onto the client stream so the TLS acceptor
     // sees the full ClientHello from byte 0. Stop after parsing the hello: the
     // upstream must select a protocol before this leg promises one to the
@@ -320,12 +350,13 @@ where
         return run_h2(
             client_tls,
             upstream_tls,
-            H2Context {
+            StreamContext {
                 sni,
                 port,
                 secrets,
                 injects,
                 observes,
+                foreign_placeholders,
                 session_id,
                 sink,
                 refresher,
@@ -333,6 +364,17 @@ where
         )
         .await;
     }
+    let context = StreamContext {
+        sni,
+        port,
+        secrets,
+        injects,
+        observes,
+        foreign_placeholders,
+        session_id,
+        sink,
+        refresher,
+    };
 
     // Buffer the WHOLE request head, then prove it is a shape this module's
     // CRLF walkers read the same way the upstream does. Both steps fail closed:
@@ -350,49 +392,19 @@ where
     head_end = head_end_of(&bound).ok_or(InterceptError::MalformedRequest)?;
     prefix = bound;
 
-    let parsed_request_line =
-        inject::request_line(&prefix).ok_or(InterceptError::MalformedRequest)?;
-    if !request_target_is_origin_form(&parsed_request_line.1) {
+    let (method, path) = inject::request_line(&prefix).ok_or(InterceptError::MalformedRequest)?;
+    if !request_target_is_origin_form(&path) {
         return Err(InterceptError::InvalidRequestTarget);
     }
-    if google_denylist::denies_operation(sni, &parsed_request_line.0, &parsed_request_line.1) {
-        return Err(InterceptError::CredentialRequestRejected {
-            method: parsed_request_line.0.clone(),
-            path: path_without_query(&parsed_request_line.1).to_string(),
-        });
-    }
-    let head_request = parsed_request_line.0.eq_ignore_ascii_case("HEAD");
-
-    // Parse the request line once if any inject/observe gating needs it
-    // (method + path are stable across header injection + substitution).
-    let req_line = if !injects.is_empty() || !observes.is_empty() {
-        Some(parsed_request_line)
-    } else {
-        None
-    };
-
-    // ADR 0059: is this request destined for a declared GraphQL endpoint? (Any
-    // inject/observe entry that carries a GraphQL matcher AND whose path glob
-    // matches this request's path — i.e. `POST /graphql`.) Only then do we buffer
-    // + parse the body; REST/bypass hosts keep the header-only early stop above.
-    let is_graphql = match &req_line {
-        Some((_, path)) => {
-            injects
-                .iter()
-                .any(|i| i.policy.graphql.is_some() && i.policy.path_matches(path))
-                || observes
-                    .iter()
-                    .any(|o| o.policy.graphql.is_some() && o.policy.path_matches(path))
-        }
-        None => false,
-    };
+    deny_credential_operation(sni, &method, &path)?;
+    let head_request = method.eq_ignore_ascii_case("HEAD");
 
     // ADR 0059: for a GraphQL endpoint, read the FULL request body (bounded) and
     // parse it into its top-level operation/fields. Fail-closed: anything we can't
     // read or parse cleanly rejects the request before a byte reaches upstream.
     // `gh` (and standard GraphQL clients) send a Content-Length'd, identity-encoded
     // JSON body — chunked/compressed bodies are denied.
-    let parsed_graphql: Option<ParsedGraphql> = if is_graphql {
+    let parsed_graphql: Option<ParsedGraphql> = if is_graphql_endpoint(injects, observes, &path) {
         let head = std::str::from_utf8(&prefix[..head_end]).map_err(|_| {
             InterceptError::GraphqlRejected {
                 reason: "non-utf8 headers",
@@ -420,94 +432,24 @@ where
         None
     };
 
-    // ADR 0056/0059 (Plane B): an inject-gated host must satisfy a request policy.
-    // REST: gate by (method, path) glob. GraphQL: every top-level field must be
-    // covered by some granted GraphQL inject (set coverage). A request matching no
-    // injection is rejected — the operation isn't permitted on this host.
-    // Any host-side credential that this request can send must be removed from
-    // the response. This includes both injected credentials and static secrets
-    // that replace guest placeholders.
-    let mut response_redactions: Vec<Vec<u8>> = secrets
-        .iter()
-        .filter(|entry| entry.allow.matches(sni))
-        .map(|entry| entry.real_value.as_bytes().to_vec())
-        .filter(|secret| !secret.is_empty())
-        .collect();
-    if !injects.is_empty() {
-        let (method, path) = req_line.clone().ok_or(InterceptError::MalformedRequest)?;
-        let matched: Vec<&InjectEntry> = if let Some(doc) = &parsed_graphql {
-            gate_graphql_injects(injects, &method, &path, doc).ok_or(
-                InterceptError::GraphqlRejected {
-                    reason: "operation not permitted by integration policy",
-                },
-            )?
-        } else {
-            let m: Vec<&InjectEntry> = injects
-                .iter()
-                .copied()
-                .filter(|i| i.policy.graphql.is_none() && i.policy.allows(&method, &path))
-                .collect();
-            if m.is_empty() {
-                return Err(InterceptError::RequestRejected { method, path });
-            }
-            m
-        };
-        // WS4: re-mint any near-expiry minted credential BEFORE injecting it, so a
-        // long-lived session never sends a stale (expired ~1h post-boot)
-        // installation token — the campaign's reads-401/writes-succeed asymmetry.
-        // Single-flighted per entry; on refresh failure the stale secret is kept
-        // (see `InjectEntry::refresh_if_stale`). Static entries are a no-op.
-        if let Some(refresher) = refresher {
-            for e in &matched {
-                e.refresh_if_stale(session_id, refresher).await;
-            }
-        }
-        response_redactions.extend(
-            matched
-                .iter()
-                .map(|entry| entry.secret().into_bytes())
-                .filter(|secret| !secret.is_empty()),
-        );
-        response_redactions.sort_unstable();
-        response_redactions.dedup();
+    let plan = evaluate_stream(&context, &method, &path, parsed_graphql.as_ref()).await?;
+    let StreamPlan {
+        matched,
+        firing,
+        response_redactions,
+    } = plan;
+    if !matched.is_empty() {
         prefix = inject::inject_headers(prefix, &matched)?;
     }
 
-    if let Some(ph) = scan_for_violation(&prefix, sni, secrets) {
+    if let Some(placeholder) = crate::violation::first_match(&prefix, foreign_placeholders) {
         return Err(InterceptError::Violation {
-            placeholder: ph.to_string(),
+            placeholder: placeholder.to_string(),
         });
     }
     prefix = substitute_request(&mut client_tls, prefix, sni, secrets).await?;
 
-    // ADR 0056 (Phase 4) / 0059: observe the response for any observe spec whose
-    // request shape matches — REST by (method, path); GraphQL by a top-level
-    // (operation, field) in the parsed body. Only when a sink is wired (the
-    // host-agent's bridge to the coordinator) — without a consumer there's no
-    // point buffering the response.
-    let firing: Vec<&ObserveEntry> = match (&req_line, sink) {
-        (Some((method, path)), Some(_)) => observes
-            .iter()
-            .copied()
-            .filter(|o| match (&o.policy.graphql, &parsed_graphql) {
-                (Some(g), Some(doc)) => {
-                    o.policy.method_matches(method)
-                        && o.policy.path_matches(path)
-                        && doc
-                            .top_level
-                            .iter()
-                            .any(|(op, field)| g.matches(*op, field))
-                }
-                (None, _) => o.policy.allows(method, path),
-                // A GraphQL observe spec never fires on a non-GraphQL request.
-                (Some(_), None) => false,
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-
     if !firing.is_empty() {
-        let (method, path) = req_line.expect("firing observes imply a parsed request line");
         let sink = sink.expect("firing observes imply a sink");
         // Force identity encoding + a single, close-delimited response so the
         // observation completes on upstream EOF without keep-alive bookkeeping.
@@ -570,31 +512,42 @@ where
     Ok(())
 }
 
-/// Data shared by every stream on one authenticated HTTP/2 connection.
-struct H2Context<'a> {
-    sni: &'a str,
-    port: u16,
-    secrets: &'a [&'a SecretEntry],
-    injects: &'a [&'a InjectEntry],
-    observes: &'a [&'a ObserveEntry],
-    session_id: SessionId,
-    sink: Option<&'a ObserveSink>,
-    refresher: Option<&'a dyn InjectRefresher>,
-}
+/// Cap on the streams one HTTP/2 connection may run at once.
+///
+/// Each stream can buffer up to [`GRAPHQL_REQUEST_BODY_BUDGET`] of request body
+/// and [`OBSERVE_RESPONSE_BUDGET`] of tapped response, so the per-connection
+/// worst case is this number times those budgets. Without a cap that product is
+/// unbounded: a guest could open thousands of streams and hold half a gigabyte
+/// of host memory on one connection.
+const H2_MAX_CONCURRENT_STREAMS: u32 = 64;
+
+/// Flow-control windows. The connection window is the aggregate bound on data
+/// in flight; the stream window bounds any single stream.
+const H2_STREAM_WINDOW: u32 = 256 * 1024;
+const H2_CONNECTION_WINDOW: u32 = 1024 * 1024;
 
 /// Forward one HTTP/2 connection. A denied stream gets its own response. Other
 /// streams continue, and slow streams do not block new policy decisions.
 async fn run_h2<C, U>(
     client_tls: C,
     upstream_tls: U,
-    context: H2Context<'_>,
+    context: StreamContext<'_>,
 ) -> Result<(), InterceptError>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut inbound = h2::server::handshake(client_tls).await?;
-    let (outbound, connection) = h2::client::handshake(upstream_tls).await?;
+    let mut inbound = h2::server::Builder::new()
+        .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS)
+        .initial_window_size(H2_STREAM_WINDOW)
+        .initial_connection_window_size(H2_CONNECTION_WINDOW)
+        .handshake(client_tls)
+        .await?;
+    let (outbound, connection) = h2::client::Builder::new()
+        .initial_window_size(H2_STREAM_WINDOW)
+        .initial_connection_window_size(H2_CONNECTION_WINDOW)
+        .handshake(upstream_tls)
+        .await?;
     let upstream = tokio::spawn(connection);
     let mut active = FuturesUnordered::new();
     let mut accepting = true;
@@ -637,100 +590,68 @@ async fn process_h2_stream(
     request: http::Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<bytes::Bytes>,
     mut outbound: h2::client::SendRequest<bytes::Bytes>,
-    context: &H2Context<'_>,
+    context: &StreamContext<'_>,
 ) -> Result<(), InterceptError> {
     let method = request.method().as_str().to_string();
     let path = request
         .uri()
         .path_and_query()
         .map_or_else(|| "/".to_string(), ToString::to_string);
-    if google_denylist::denies_operation(context.sni, &method, &path) {
+    if let Err(error) = deny_credential_operation(context.sni, &method, &path) {
         deny_h2(&mut respond, http::StatusCode::FORBIDDEN)?;
-        return Ok(());
+        return Err(error);
     }
-    let is_graphql = context
-        .injects
-        .iter()
-        .any(|entry| entry.policy.graphql.is_some() && entry.policy.path_matches(&path))
-        || context
-            .observes
-            .iter()
-            .any(|entry| entry.policy.graphql.is_some() && entry.policy.path_matches(&path));
 
     let (mut parts, mut request_body) = request.into_parts();
-    let (buffered_body, request_trailers, parsed_graphql) = if is_graphql {
-        match read_h2_body(&mut request_body, GRAPHQL_REQUEST_BODY_BUDGET).await {
-            Ok((body, trailers)) => {
-                let parsed = match graphql::parse_request_body(&body) {
-                    Some(parsed) => parsed,
-                    None => {
-                        deny_h2(&mut respond, http::StatusCode::BAD_REQUEST)?;
-                        return Ok(());
-                    }
-                };
-                (Some(body), trailers, Some(parsed))
+    let (buffered_body, request_trailers, parsed_graphql) =
+        if is_graphql_endpoint(context.injects, context.observes, &path) {
+            match read_h2_body(&mut request_body, GRAPHQL_REQUEST_BODY_BUDGET).await {
+                Ok((body, trailers)) => {
+                    let parsed = match graphql::parse_request_body(&body) {
+                        Some(parsed) => parsed,
+                        None => {
+                            deny_h2(&mut respond, http::StatusCode::BAD_REQUEST)?;
+                            return Ok(());
+                        }
+                    };
+                    (Some(body), trailers, Some(parsed))
+                }
+                Err(_) => {
+                    deny_h2(&mut respond, http::StatusCode::PAYLOAD_TOO_LARGE)?;
+                    return Ok(());
+                }
             }
-            Err(_) => {
-                deny_h2(&mut respond, http::StatusCode::PAYLOAD_TOO_LARGE)?;
-                return Ok(());
-            }
+        } else {
+            (None, None, None)
+        };
+
+    // The SAME gate the HTTP/1 adapter runs. Both used to carry a hand-copied
+    // version, so a policy change could reach one protocol and miss the other.
+    let plan = match evaluate_stream(context, &method, &path, parsed_graphql.as_ref()).await {
+        Ok(plan) => plan,
+        Err(error) => {
+            deny_h2(&mut respond, denial_status(&error))?;
+            return Err(error);
         }
-    } else {
-        (None, None, None)
     };
+    let StreamPlan {
+        matched,
+        firing,
+        response_redactions,
+    } = plan;
 
-    let matched: Vec<&InjectEntry> = if let Some(document) = &parsed_graphql {
-        match gate_graphql_injects(context.injects, &method, &path, document) {
-            Some(entries) => entries,
-            None => {
-                deny_h2(&mut respond, http::StatusCode::FORBIDDEN)?;
-                return Ok(());
-            }
-        }
-    } else {
-        context
-            .injects
-            .iter()
-            .copied()
-            .filter(|entry| entry.policy.graphql.is_none() && entry.policy.allows(&method, &path))
-            .collect()
-    };
-    if !context.injects.is_empty() && matched.is_empty() {
-        deny_h2(&mut respond, http::StatusCode::FORBIDDEN)?;
-        return Ok(());
-    }
-    if let Some(refresher) = context.refresher {
-        for entry in &matched {
-            entry.refresh_if_stale(context.session_id, refresher).await;
-        }
-    }
-
-    let firing: Vec<&ObserveEntry> = context
-        .observes
-        .iter()
-        .copied()
-        .filter(|entry| match (&entry.policy.graphql, &parsed_graphql) {
-            (Some(graphql_match), Some(document)) => {
-                entry.policy.method_matches(&method)
-                    && entry.policy.path_matches(&path)
-                    && document
-                        .top_level
-                        .iter()
-                        .any(|(operation, field)| graphql_match.matches(*operation, field))
-            }
-            (None, _) => entry.policy.allows(&method, &path),
-            (Some(_), None) => false,
-        })
-        .collect();
-
-    transform_h2_headers(&mut parts.headers, context.sni, context.secrets)?;
+    transform_h2_headers(
+        &mut parts.headers,
+        context.sni,
+        context.secrets,
+        context.foreign_placeholders,
+    )?;
     // The `:method` pseudo-header is what the gate above read, so no header may
     // ask the upstream to run a different verb.
     for header in google_denylist::METHOD_OVERRIDE_HEADERS {
         parts.headers.remove(header);
     }
     inject_h2_headers(&mut parts.headers, &matched)?;
-    let response_redactions = response_redactions(context.sni, context.secrets, &matched);
     if !response_redactions.is_empty() || !firing.is_empty() {
         parts.headers.remove(http::header::ACCEPT_ENCODING);
         parts.headers.remove("grpc-accept-encoding");
@@ -761,15 +682,26 @@ async fn process_h2_stream(
 
     let forward_request = async {
         if let Some(body) = buffered_body {
-            let body = transform_complete(body, context.sni, context.secrets)?;
+            let body = transform_complete(
+                body,
+                context.sni,
+                context.secrets,
+                context.foreign_placeholders,
+            )?;
             let end = request_trailers.is_none();
             send_h2_data(&mut upstream_body, body.into(), end).await?;
             if let Some(mut trailers) = request_trailers {
-                transform_h2_headers(&mut trailers, context.sni, context.secrets)?;
+                transform_h2_headers(
+                    &mut trailers,
+                    context.sni,
+                    context.secrets,
+                    context.foreign_placeholders,
+                )?;
                 upstream_body.send_trailers(trailers)?;
             }
         } else if !request_end {
-            let mut transformer = PlaceholderTransformer::new(context.sni, context.secrets);
+            let mut transformer =
+                PlaceholderTransformer::new(context.secrets, context.foreign_placeholders);
             while let Some(data) = request_body.data().await {
                 let data = data?;
                 let len = data.len();
@@ -784,7 +716,12 @@ async fn process_h2_stream(
                 send_h2_data(&mut upstream_body, tail.into(), false).await?;
             }
             if let Some(mut trailers) = request_body.trailers().await? {
-                transform_h2_headers(&mut trailers, context.sni, context.secrets)?;
+                transform_h2_headers(
+                    &mut trailers,
+                    context.sni,
+                    context.secrets,
+                    context.foreign_placeholders,
+                )?;
                 upstream_body.send_trailers(trailers)?;
             } else {
                 send_h2_data(&mut upstream_body, bytes::Bytes::new(), true).await?;
@@ -808,26 +745,30 @@ async fn process_h2_stream(
         let mut client_body =
             respond.send_response(http::Response::from_parts(response_parts, ()), response_end)?;
         let mut redactor = ByteRedactor::new(&response_redactions);
+        // Tap the body ONLY when an observe spec will read it. The HTTP/1 path
+        // has always guarded on that; HTTP/2 copied up to 256 KiB of every
+        // response for a consumer that usually does not exist.
+        let observing = !firing.is_empty();
         let mut observed_body = Vec::new();
+        let tap = |output: &[u8], observed: &mut Vec<u8>| {
+            if observing && observed.len() < OBSERVE_RESPONSE_BUDGET {
+                let take = (OBSERVE_RESPONSE_BUDGET - observed.len()).min(output.len());
+                observed.extend_from_slice(&output[..take]);
+            }
+        };
         if !response_end {
             while let Some(data) = response_body.data().await {
                 let data = data?;
                 let len = data.len();
                 response_body.flow_control().release_capacity(len)?;
                 let output = redactor.push(&data, false);
-                if observed_body.len() < OBSERVE_RESPONSE_BUDGET {
-                    let take = (OBSERVE_RESPONSE_BUDGET - observed_body.len()).min(output.len());
-                    observed_body.extend_from_slice(&output[..take]);
-                }
+                tap(&output, &mut observed_body);
                 if !output.is_empty() {
                     send_h2_data(&mut client_body, output.into(), false).await?;
                 }
             }
             let tail = redactor.push(&[], true);
-            if observed_body.len() < OBSERVE_RESPONSE_BUDGET {
-                let take = (OBSERVE_RESPONSE_BUDGET - observed_body.len()).min(tail.len());
-                observed_body.extend_from_slice(&tail[..take]);
-            }
+            tap(&tail, &mut observed_body);
             if !tail.is_empty() {
                 send_h2_data(&mut client_body, tail.into(), false).await?;
             }
@@ -860,6 +801,138 @@ async fn process_h2_stream(
 
     tokio::try_join!(forward_request, forward_response)?;
     Ok(())
+}
+
+/// What the policy gate decided for one request. Produced once, by
+/// [`evaluate_stream`], and read the same way by both HTTP adapters.
+struct StreamPlan<'a> {
+    /// Injections whose credential this request may carry.
+    matched: Vec<&'a InjectEntry>,
+    /// Observe specs whose request shape matched AND for which a sink exists.
+    firing: Vec<&'a ObserveEntry>,
+    /// Every host-side credential this request can send, which the response
+    /// must therefore not return.
+    response_redactions: Vec<Vec<u8>>,
+}
+
+/// Google credential minting is never a guest surface, whatever endpoint an
+/// administrator selects. Checked before anything is buffered.
+fn deny_credential_operation(sni: &str, method: &str, path: &str) -> Result<(), InterceptError> {
+    if google_denylist::denies_operation(sni, method, path) {
+        return Err(InterceptError::CredentialRequestRejected {
+            method: method.to_string(),
+            path: path_without_query(path).to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// ADR 0059: is this request going to a declared GraphQL endpoint? Only then is
+/// the body buffered and parsed; a REST host keeps the header-only early stop.
+fn is_graphql_endpoint(injects: &[&InjectEntry], observes: &[&ObserveEntry], path: &str) -> bool {
+    injects
+        .iter()
+        .any(|entry| entry.policy.graphql.is_some() && entry.policy.path_matches(path))
+        || observes
+            .iter()
+            .any(|entry| entry.policy.graphql.is_some() && entry.policy.path_matches(path))
+}
+
+/// Run the integration policy for one request and return the plan both adapters
+/// act on.
+///
+/// ADR 0056/0059 (Plane B): an inject-gated host must satisfy a request policy.
+/// REST gates by (method, path) glob; GraphQL requires every top-level field to
+/// be covered by some granted GraphQL inject (set coverage). A request matching
+/// no injection is rejected — the operation is not permitted on this host.
+async fn evaluate_stream<'a>(
+    context: &StreamContext<'a>,
+    method: &str,
+    path: &str,
+    parsed_graphql: Option<&ParsedGraphql>,
+) -> Result<StreamPlan<'a>, InterceptError> {
+    let matched: Vec<&'a InjectEntry> = if context.injects.is_empty() {
+        Vec::new()
+    } else if let Some(document) = parsed_graphql {
+        gate_graphql_injects(context.injects, method, path, document).ok_or(
+            InterceptError::GraphqlRejected {
+                reason: "operation not permitted by integration policy",
+            },
+        )?
+    } else {
+        let matched: Vec<&'a InjectEntry> = context
+            .injects
+            .iter()
+            .copied()
+            .filter(|entry| entry.policy.graphql.is_none() && entry.policy.allows(method, path))
+            .collect();
+        if matched.is_empty() {
+            return Err(InterceptError::RequestRejected {
+                method: method.to_string(),
+                path: path.to_string(),
+            });
+        }
+        matched
+    };
+
+    // WS4: re-mint any near-expiry minted credential BEFORE injecting it, so a
+    // long-lived session never sends a stale (expired ~1h post-boot)
+    // installation token — the campaign's reads-401/writes-succeed asymmetry.
+    // Single-flighted per entry; on refresh failure the stale secret is kept
+    // (see `InjectEntry::refresh_if_stale`). Static entries are a no-op.
+    if let Some(refresher) = context.refresher {
+        for entry in &matched {
+            entry.refresh_if_stale(context.session_id, refresher).await;
+        }
+    }
+
+    // ADR 0056 (Phase 4) / 0059: observe the response for any observe spec whose
+    // request shape matches — REST by (method, path); GraphQL by a top-level
+    // (operation, field) in the parsed body. Only when a sink is wired (the
+    // host-agent's bridge to the coordinator) — without a consumer there is no
+    // point buffering the response.
+    let firing: Vec<&'a ObserveEntry> = if context.sink.is_none() {
+        Vec::new()
+    } else {
+        context
+            .observes
+            .iter()
+            .copied()
+            .filter(|entry| match (&entry.policy.graphql, parsed_graphql) {
+                (Some(matcher), Some(document)) => {
+                    entry.policy.method_matches(method)
+                        && entry.policy.path_matches(path)
+                        && document
+                            .top_level
+                            .iter()
+                            .any(|(operation, field)| matcher.matches(*operation, field))
+                }
+                (None, _) => entry.policy.allows(method, path),
+                // A GraphQL observe spec never fires on a non-GraphQL request.
+                (Some(_), None) => false,
+            })
+            .collect()
+    };
+
+    Ok(StreamPlan {
+        response_redactions: response_redactions(context.sni, context.secrets, &matched),
+        matched,
+        firing,
+    })
+}
+
+/// The status an HTTP/2 stream answers a policy denial with. HTTP/1 never
+/// synthesizes a response — it closes the connection, so the guest's client
+/// reports a transport error and can never read a denial as a 2xx. HTTP/2 has
+/// no such option: a stream is one frame sequence inside a multiplexed
+/// connection, so closing it needs an explicit status. A 4xx is safe here for
+/// the same reason the HTTP/1 close is: it is a REFUSAL, never a synthesized
+/// success, and the guest's client surfaces it as an error.
+fn denial_status(error: &InterceptError) -> http::StatusCode {
+    match error {
+        InterceptError::GraphqlRejected { .. } => http::StatusCode::BAD_REQUEST,
+        _ => http::StatusCode::FORBIDDEN,
+    }
 }
 
 fn deny_h2(
@@ -920,8 +993,9 @@ fn transform_complete(
     value: Vec<u8>,
     sni: &str,
     secrets: &[&SecretEntry],
+    foreign_placeholders: &[&str],
 ) -> Result<Vec<u8>, InterceptError> {
-    if let Some(placeholder) = scan_for_violation(&value, sni, secrets) {
+    if let Some(placeholder) = crate::violation::first_match(&value, foreign_placeholders) {
         return Err(InterceptError::Violation {
             placeholder: placeholder.to_string(),
         });
@@ -933,9 +1007,15 @@ fn transform_h2_headers(
     headers: &mut http::HeaderMap,
     sni: &str,
     secrets: &[&SecretEntry],
+    foreign_placeholders: &[&str],
 ) -> Result<(), InterceptError> {
     for (name, value) in headers.iter_mut() {
-        let transformed = transform_complete(value.as_bytes().to_vec(), sni, secrets)?;
+        let transformed = transform_complete(
+            value.as_bytes().to_vec(),
+            sni,
+            secrets,
+            foreign_placeholders,
+        )?;
         if transformed != value.as_bytes() {
             *value = http::HeaderValue::from_bytes(&transformed)
                 .map_err(|_| InterceptError::InvalidInjectedHeader(name.to_string()))?;
@@ -1001,25 +1081,31 @@ fn h2_response_is_inspectable(headers: &http::HeaderMap) -> bool {
 }
 
 struct PlaceholderTransformer<'a> {
-    sni: &'a str,
     secrets: &'a [&'a SecretEntry],
+    /// Placeholders this host may not receive. Seeing one closes the stream.
+    foreign_placeholders: &'a [&'a str],
     pending: Vec<u8>,
     keep: usize,
 }
 
 impl<'a> PlaceholderTransformer<'a> {
-    fn new(sni: &'a str, secrets: &'a [&'a SecretEntry]) -> Self {
+    fn new(secrets: &'a [&'a SecretEntry], foreign_placeholders: &'a [&'a str]) -> Self {
+        // The hold-back window has to cover the LONGEST needle of either kind,
+        // or a foreign placeholder split across two DATA frames slips past the
+        // scan.
+        let keep = secrets
+            .iter()
+            .map(|entry| entry.placeholder.len())
+            .chain(foreign_placeholders.iter().map(|value| value.len()))
+            .filter(|length| *length > 0)
+            .max()
+            .unwrap_or(1)
+            .saturating_sub(1);
         Self {
-            sni,
             secrets,
+            foreign_placeholders,
             pending: Vec::new(),
-            keep: secrets
-                .iter()
-                .map(|entry| entry.placeholder.len())
-                .filter(|length| *length > 0)
-                .max()
-                .unwrap_or(1)
-                .saturating_sub(1),
+            keep,
         }
     }
 
@@ -1030,6 +1116,13 @@ impl<'a> PlaceholderTransformer<'a> {
         } else {
             self.pending.len().saturating_sub(self.keep)
         };
+        if let Some(placeholder) =
+            crate::violation::first_match(&self.pending[..process_limit], self.foreign_placeholders)
+        {
+            return Err(InterceptError::Violation {
+                placeholder: placeholder.to_string(),
+            });
+        }
         let mut output = Vec::new();
         let mut cursor = 0;
         while cursor < process_limit {
@@ -1054,11 +1147,6 @@ impl<'a> PlaceholderTransformer<'a> {
                 break;
             };
             output.extend_from_slice(&self.pending[cursor..start]);
-            if !entry.allow.matches(self.sni) {
-                return Err(InterceptError::Violation {
-                    placeholder: entry.placeholder.clone(),
-                });
-            }
             output.extend_from_slice(entry.real_value.as_bytes());
             cursor = start + entry.placeholder.len();
         }
@@ -2508,7 +2596,7 @@ mod hardening_tests {
             allow: HostList::from_manifest(&["api.example".into()], &[]).unwrap(),
         };
         let secrets = [&secret];
-        let mut transformer = PlaceholderTransformer::new("api.example", &secrets);
+        let mut transformer = PlaceholderTransformer::new(&secrets, &[]);
         let mut output = transformer.push(b"before-guest-", false).unwrap();
         output.extend(transformer.push(b"placeholder-after", false).unwrap());
         output.extend(transformer.push(&[], true).unwrap());
@@ -2543,12 +2631,13 @@ mod hardening_tests {
             run_h2(
                 proxy_guest_io,
                 proxy_upstream_io,
-                H2Context {
+                StreamContext {
                     sni: "api.example",
                     port: 443,
                     secrets: &[&secret],
                     injects: &[&inject],
                     observes: &[],
+                    foreign_placeholders: &[],
                     session_id: SessionId::new(),
                     sink: None,
                     refresher: None,
