@@ -37,6 +37,15 @@ function makeFakeProvider(overrides: Partial<ConnectionProvider> = {}): Connecti
       curated: ["acme.widgets.list"],
       passthrough: [],
       forbidden: new Set(["acme.keys.create"]),
+      describe: [
+        {
+          action: "acme.widgets.list",
+          label: "List Acme widgets",
+          access: "read",
+          host: "api.acme.example",
+          endpointRule: null,
+        },
+      ],
     },
     guestEnv: { ACME_TOKEN_URL: "http://169.254.169.254/acme" },
     guestBundles: ["acme-cli"],
@@ -104,7 +113,7 @@ function emptyPolicy(): IntegrationPolicyJson {
     secrets: [],
     injects: [],
     observes: [],
-    google_adc: false,
+    metadata_flavor: null,
   };
 }
 

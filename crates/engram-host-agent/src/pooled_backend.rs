@@ -9143,7 +9143,7 @@ impl SandboxBackend for PooledBackend {
         self.session_bindings.insert(sandbox_id, session_id);
 
         let Some(egress) = self.egress.as_ref() else {
-            if policy.google_adc {
+            if policy.metadata_flavor.is_some() {
                 return Err(SandboxError::InvalidSpec(
                     "Google ADC requires a host egress proxy".into(),
                 ));
@@ -9923,7 +9923,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn google_adc_requires_the_local_egress_proxy() {
+    async fn metadata_delivery_requires_the_local_egress_proxy() {
+        use engram_core::types::integration::MetadataFlavor;
         let tmp = tempfile::tempdir().unwrap();
         let inner: Arc<dyn SandboxBackend> =
             Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
@@ -9940,7 +9941,7 @@ mod tests {
                 secrets: Vec::new(),
                 injects: Vec::new(),
                 observes: Vec::new(),
-                google_adc: true,
+                metadata_flavor: Some(MetadataFlavor::Gce),
                 secret_mode: engram_core::types::image::SecretMode::Broker,
             })
             .await
@@ -10254,7 +10255,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            google_adc: false,
+            metadata_flavor: None,
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -10277,7 +10278,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            google_adc: false,
+            metadata_flavor: None,
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -13726,7 +13727,7 @@ mod tests {
                 secrets: Vec::new(),
                 injects: Vec::new(),
                 observes: Vec::new(),
-                google_adc: false,
+                metadata_flavor: None,
                 secret_mode: SecretMode::Literal,
             }
         }

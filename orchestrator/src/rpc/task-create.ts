@@ -510,7 +510,7 @@ export async function compileSessionCreateInput(
   compileProviderPolicy(policy, resolvedEffectiveGrants);
   // The host proxy serves a metadata endpoint only for a provider that
   // delivers its credential that way.
-  policy.google_adc = providerMetadataFlavor(resolvedEffectiveGrants) === "gce";
+  policy.metadata_flavor = providerMetadataFlavor(resolvedEffectiveGrants) ?? null;
   // ADR 0063 B4: a programmatic task (cron / Slack / API) authenticates the
   // harness with the ORG credential, not a per-user token. The org-secret value
   // never leaves the coordinator (ADR 0057), so we can't read it here — instead

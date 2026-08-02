@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use engram_core::traits::{SecretContext, SessionFence};
 use engram_core::types::image::ImageConfig;
+use engram_core::types::integration::MetadataFlavor;
 use engram_core::types::session::{split_image_ref, ImageRef, SessionMode};
 use engram_core::types::BindingDisposition;
 use engram_core::types::{Session, SessionSpec, SessionState};
@@ -517,7 +518,7 @@ async fn build_resume_egress_policy_core(
             &network,
             injects,
             observes,
-            policy.as_ref().is_some_and(|policy| policy.google_adc),
+            policy.as_ref().and_then(|policy| policy.metadata_flavor),
         )),
         resolution_failures: secret_failures + inject_failures,
     }
@@ -538,7 +539,7 @@ pub(crate) fn assemble_resume_egress_policy(
     network: &engram_core::types::image::NetworkPolicy,
     injects: Vec<engram_core::types::egress::EgressInjectEntry>,
     observes: Vec<engram_core::types::egress::EgressObserveEntry>,
-    google_adc: bool,
+    metadata_flavor: Option<MetadataFlavor>,
 ) -> engram_core::types::egress::SessionEgressPolicy {
     engram_core::types::egress::SessionEgressPolicy {
         session_id,
@@ -557,7 +558,7 @@ pub(crate) fn assemble_resume_egress_policy(
         // ADR 0056 (Phase 4): observe specs (from the persisted policy), so a
         // resumed session keeps emitting assets on the new host.
         observes,
-        google_adc,
+        metadata_flavor,
         // ADR 0057: per-secret mode; the proxy substitutes per entry. Vestigial.
         secret_mode: engram_core::types::image::SecretMode::Broker,
     }
@@ -2485,7 +2486,7 @@ mod tests {
             &network,
             Vec::new(),
             Vec::new(),
-            false,
+            None,
         );
 
         // Real IP, not UNSPECIFIED.
@@ -2521,7 +2522,7 @@ mod tests {
             &NetworkPolicy::default(),
             Vec::new(),
             Vec::new(),
-            false,
+            None,
         );
         assert_eq!(policy.guest_ip, guest_ip);
         assert!(policy.network_allow_hosts.is_empty());

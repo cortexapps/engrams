@@ -376,8 +376,17 @@ export interface IntegrationPolicyJson {
   // these). Mirrors engram_core::types::IntegrationPolicy.
   network: IntegrationNetworkJson;
   secrets: IntegrationSecretJson[];
-  google_adc: boolean;
+  /**
+   * Which cloud metadata service the host serves for the session, or null for
+   * none. Mirrors `engram_core::types::integration::MetadataFlavor` — a
+   * boolean here would have to grow a second field per cloud, and the proxy
+   * would then have to decide which one wins.
+   */
+  metadata_flavor: MetadataFlavor | null;
 }
+
+/** Keep in step with `MetadataFlavor` in engram-core. */
+export type MetadataFlavor = "gce";
 
 /** Profile-side inputs compiled into the policy's network + secrets (ADR 0057). */
 export interface SessionPolicyInputs {
@@ -409,7 +418,7 @@ export function policyHasContent(p: IntegrationPolicyJson): boolean {
     p.network.allow_hosts.length > 0 ||
     p.network.allow_host_patterns.length > 0 ||
     p.network.default === "allow" ||
-    p.google_adc
+    p.metadata_flavor !== null
   );
 }
 
@@ -1325,7 +1334,7 @@ export function compileIntegrationPolicy(
     allow_hosts: s.allowHosts ?? [],
     allow_host_patterns: s.allowHostPatterns ?? [],
   }));
-  return { injects, observes, network, secrets, google_adc: false };
+  return { injects, observes, network, secrets, metadata_flavor: null };
 }
 
 // ---------------------------------------------------------------------------

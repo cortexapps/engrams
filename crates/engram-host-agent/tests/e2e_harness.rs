@@ -715,7 +715,7 @@ async fn e2e_harness_cold_via_pooled_backend() {
         secrets: Vec::new(),
         injects: Vec::new(),
         observes: Vec::new(),
-        google_adc: false,
+        metadata_flavor: None,
     });
 
     drive_harness(&pooled, sandbox_id, session_id, &ca_pem, captured, cmd_tx).await;
@@ -812,7 +812,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
         secrets: Vec::new(),
         injects: Vec::new(),
         observes: Vec::new(),
-        google_adc: false,
+        metadata_flavor: None,
     });
 
     drive_harness(&pooled, warm_id, session_id, &ca_pem, captured, cmd_tx).await;

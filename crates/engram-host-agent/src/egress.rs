@@ -337,7 +337,7 @@ pub fn register_policy(
         secrets,
         injects,
         observes,
-        google_adc: policy.google_adc,
+        metadata_flavor: policy.metadata_flavor,
     });
     Ok(())
 }
@@ -442,7 +442,7 @@ mod tests {
                         }),
                     },
                 ],
-                google_adc: false,
+                metadata_flavor: None,
                 secret_mode: SecretMode::Broker,
             },
         )

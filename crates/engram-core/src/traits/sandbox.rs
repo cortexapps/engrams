@@ -238,10 +238,14 @@ pub trait SandboxBackend: Send + Sync {
     /// real metadata service. Other policies remain a no-op for Process
     /// and in-test fixtures. ADR 0006 and ADR 0109.
     async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
-        if policy.google_adc {
-            return Err(SandboxError::InvalidSpec(
-                "Google ADC requires host egress metadata interception".into(),
-            ));
+        // Fail closed for ANY metadata flavor, not just Google's. A backend
+        // with no egress proxy cannot stop a guest from reaching the
+        // deployment's REAL metadata service, so serving a session that
+        // expects an intercepted one would hand it the host's identity.
+        if let Some(flavor) = policy.metadata_flavor {
+            return Err(SandboxError::InvalidSpec(format!(
+                "{flavor:?} metadata requires host egress interception"
+            )));
         }
         Ok(())
     }
