@@ -27,6 +27,16 @@ FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bb
 # repoint to the https snapshot and install everything (which re-pins
 # ca-certificates from the snapshot too). To BUMP: pick a newer timestamp from
 # https://snapshot.debian.org/ and update SNAPSHOT_TS.
+#
+# `iptables` is load-bearing on the VZ backend, not a convenience: ADR 0096 D6
+# steers guest egress through the proxy with an IN-GUEST nat DNAT that the
+# engram-init shim installs (`crates/engram-rootfs-materializer/src/inject.rs`),
+# because VZNATNetworkDeviceAttachment admits no host-side filter. Without the
+# binary the shim logs "steering not installed … open egress" and every guest
+# tcp/443 bypasses the proxy — so broker-mode secrets ship their placeholder
+# raw and the upstream 401s. (Firecracker needs nothing here: its REDIRECT is
+# host-side in the netns.) The owned guest kernel carries the matching
+# CONFIG_IP_NF_NAT / CONFIG_NETFILTER_XT_NAT.
 ARG SNAPSHOT_TS=20260630T000000Z
 RUN set -eux; \
     apt-get update; \
@@ -39,7 +49,7 @@ RUN set -eux; \
     } > /etc/apt/sources.list; \
     apt-get -o Acquire::Check-Valid-Until=false update; \
     apt-get install -y --no-install-recommends \
-        git ca-certificates curl socat iproute2 jq ripgrep unzip; \
+        git ca-certificates curl socat iproute2 iptables jq ripgrep unzip; \
     rm -rf /var/lib/apt/lists/*
 
 # ast-grep (ADR 0100): a prebuilt release binary — not in apt. Arch-mapped from

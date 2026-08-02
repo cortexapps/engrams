@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { SessionProfileEditor } from "./SessionProfileEditor";
 
 const profileHolder = vi.hoisted(() => ({ value: undefined as undefined | { profile: unknown } }));
@@ -46,7 +47,10 @@ vi.mock("../../hooks/useSkills", () => ({
   }),
   useUploadSkill: () => ({ mutateAsync: uploadSkill, isPending: false }),
 }));
-vi.mock("../../hooks/useOrgSecrets", () => ({ useOrgSecretNames: () => ({ data: [] }) }));
+const orgSecretNamesHolder = vi.hoisted(() => ({ value: [] as string[] }));
+vi.mock("../../hooks/useOrgSecrets", () => ({
+  useOrgSecretNames: () => ({ data: orgSecretNamesHolder.value }),
+}));
 vi.mock("../../hooks/useIntegrations", () => ({
   useIntegrationConnections: () => ({ data: { connections: [] } }),
 }));
@@ -99,6 +103,33 @@ describe("SessionProfileEditor (create)", () => {
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
     await waitFor(() => expect(create).toHaveBeenCalled());
     expect(create.mock.calls[0][0]).toMatchObject({ harness: "claude" });
+  });
+
+  // Regression: the collection editors have no registered input behind them, so
+  // they must ride useController. With a bare watch/setValue pair, react-hook-form
+  // kept ADDING a row (the array's length changed) but silently dropped an
+  // in-place edit — picking an org secret left `ref` empty, all the way to the
+  // wire. This drives the real path: add a row, pick a ref, save.
+  it("carries an org secret picked in a secret row through to the payload", async () => {
+    orgSecretNamesHolder.value = ["OPENROUTER_API_KEY", "DATADOG_API_KEY"];
+    const user = userEvent.setup();
+    render(<SessionProfileEditor mode="create" />);
+    fireEvent.change(screen.getByLabelText(/profile name/i), { target: { value: "Gateway" } });
+
+    await user.click(screen.getByRole("button", { name: /advanced/i }));
+    await user.click(screen.getByRole("button", { name: /add secret/i }));
+
+    await user.click(screen.getByRole("combobox", { name: "" }));
+    await user.click(await screen.findByText("OPENROUTER_API_KEY"));
+    fireEvent.change(screen.getByLabelText(/env var name/i), {
+      target: { value: "ANTHROPIC_AUTH_TOKEN" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0].secrets).toMatchObject([
+      { ref: "OPENROUTER_API_KEY", envVar: "ANTHROPIC_AUTH_TOKEN", mode: "broker" },
+    ]);
   });
 
   it("includes the deny-default network + extra allowed hosts in the payload (ADR 0057)", async () => {

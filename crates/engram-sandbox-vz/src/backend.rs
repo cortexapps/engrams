@@ -158,11 +158,15 @@ struct VzSandboxState {
     /// originating bake / snapshot file stays intact.
     rootfs_path: PathBuf,
     /// Cached guest-network identity, discovered by querying agentd
-    /// over the existing vsock-bridge transport. Populated on first
-    /// `guest_endpoints` call (the agent's eth0 takes a moment to come
-    /// up after IP_PNP DHCP, so we don't try at create time). Used by
-    /// the coordinator's `GET /sessions/:id/shell` proxy to dial
-    /// `ttyd` running inside the guest.
+    /// over the existing vsock-bridge transport. Populated lazily on
+    /// the first `guest_endpoints` call, which waits for the guest
+    /// rather than polling it — the address itself is assigned by the
+    /// kernel's IP_PNP before init even runs (`ip=dhcp` on the cmdline,
+    /// see `vm.rs`), so any agentd that can answer already has one.
+    /// Read on the session boot path, to key the egress proxy's guest
+    /// registry against this VM (`guest_ip()` → `SessionEgressPolicy`).
+    /// The shell/port proxies no longer read it: `open_guest_stream`
+    /// always returns `Some` on VZ, so they take the vsock relay.
     guest_endpoints: Mutex<Option<GuestEndpoints>>,
 }
 
@@ -1866,11 +1870,13 @@ impl SandboxBackend for VzBackend {
     /// Discover the guest's network identity by asking agentd over
     /// the vsock-bridge. First successful answer is cached on the
     /// per-sandbox state; subsequent calls are O(1) memory reads.
-    /// Returns `None` if the agent isn't reachable yet (e.g. shell
-    /// requested before bootstrap completes), reports no non-loopback
-    /// address, or reports an address that doesn't parse as IPv4.
-    /// VZ has no netns indirection, so `egress_identity` and
-    /// `dial_ip` are always the same value.
+    /// BLOCKS until the guest's agentd answers — callers are on the
+    /// boot path and need the real address, not a fast `None` (see the
+    /// hang-guard comment below). Returns `None` only if the guest
+    /// never answers, reports no non-loopback address, or reports an
+    /// address that doesn't parse as IPv4. VZ has no netns
+    /// indirection, so `egress_identity` and `dial_ip` are always the
+    /// same value.
     async fn guest_endpoints(&self, id: SandboxId) -> Option<GuestEndpoints> {
         if let Some(live) = self.sandboxes.get(&id) {
             if let Some(ep) = live.guest_endpoints.lock().clone() {
@@ -1882,10 +1888,31 @@ impl SandboxBackend for VzBackend {
             live.vsock_uds_path.clone()
         };
         let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
-        // Bound the round-trip — an agent that doesn't understand the
-        // GuestIp verb (e.g. an older bake) would otherwise leave the read
-        // hanging. 2s is plenty for a healthy in-guest round trip and short
-        // enough that a dashboard SHELL-tab click sees a prompt 503.
+        // HANG-GUARD, not a latency knob. The bridge binds the host-side
+        // UDS before restore returns, so `connect` succeeds instantly and
+        // the read blocks until the guest's agentd answers — the same
+        // natural wait `start_agent` relies on (see its comment: "no
+        // host-side retry loop, no deadline knob"). The only thing that
+        // could hang forever is a bake whose agentd doesn't understand the
+        // GuestIp verb, so we bound it — generously enough to cover a cold
+        // guest boot.
+        //
+        // This was 2s, sized for "a dashboard SHELL-tab click sees a prompt
+        // 503". That caller is gone: `open_guest_stream` now always returns
+        // `Some` on VZ (ADR 0066 Phase 2), so the shell/port proxies take
+        // the vsock relay and never reach here. The remaining callers are
+        // both boot-path — `guest_ip()` for the egress policy and the
+        // capture-egress stamp — and a boot-path caller must WAIT for the
+        // guest, not race it. At 2s it lost: the coordinator asks for the
+        // guest IP the moment restore returns, the guest reaches agentd at
+        // ~2.5s uptime, and the lookup gave up half a second early. The
+        // coordinator then fell back to an UNSPECIFIED-IP policy with no
+        // secrets, so the egress proxy answered every guest DNS query with
+        // `UnknownGuest` NXDOMAIN and broker-mode credentials never
+        // substituted. Any bound here is still strictly tighter than
+        // `start_agent`, which does an unbounded blocking read on this same
+        // channel moments later.
+        const GUEST_IP_HANG_GUARD: Duration = Duration::from_secs(30);
         let fut = async {
             let conn = UnixStream::connect(&agent_uds).await.ok()?;
             let (mut reader, mut writer) = tokio::io::split(conn);
@@ -1896,16 +1923,16 @@ impl SandboxBackend for VzBackend {
                 _ => None,
             }
         };
-        let ip_str: Option<String> = tokio::time::timeout(Duration::from_secs(2), fut)
+        let ip_str: Option<String> = tokio::time::timeout(GUEST_IP_HANG_GUARD, fut)
             .await
             .ok()
             .flatten();
         // Not cached: today agentd only ever answers via
         // `read_primary_ipv4()`, which can't produce a non-IPv4
         // string, so this is unreachable in practice. If that ever
-        // changes, a parse failure re-pays the full 2s vsock
-        // round-trip on every subsequent call instead of failing
-        // fast from a cached negative.
+        // changes, a parse failure re-pays the full vsock round-trip
+        // on every subsequent call instead of failing fast from a
+        // cached negative.
         let ip: std::net::Ipv4Addr = ip_str?.parse().ok()?;
         let ep = GuestEndpoints {
             egress_identity: ip,

@@ -10,6 +10,7 @@
  */
 
 import { expect, test, describe } from "bun:test";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { z } from "zod";
 import {
   compileSessionCreateInput,
@@ -85,6 +86,47 @@ const fakeHarnessCatalog = (): HarnessCatalogClient => ({
             { id: "sonnet", default: false, env: { ANTHROPIC_MODEL: "claude-sonnet-4-6" } },
           ],
           effort: [{ id: "high", default: true, env: { MAX_THINKING_TOKENS: "32000" } }],
+        },
+      },
+    ],
+  }),
+});
+
+const providerHarnessCatalog = (): HarnessCatalogClient => ({
+  listHarnesses: async () => ({
+    harnesses: [
+      {
+        name: "claude",
+        descriptor: {
+          auth: { userEnv: USER_ENV, orgEnv: ORG_ENV },
+          models: [
+            {
+              id: "glm-5.2",
+              default: true,
+              env: {
+                ANTHROPIC_MODEL: "z-ai/glm-5.2",
+                ANTHROPIC_BASE_URL: "https://openrouter.ai/api",
+                [ORG_ENV]: "",
+              },
+              secrets: [
+                {
+                  ref: "openrouter.api_key",
+                  env: "ANTHROPIC_AUTH_TOKEN",
+                  mode: "broker",
+                  hosts: ["openrouter.ai"],
+                  hostPatterns: [],
+                },
+                {
+                  ref: "openrouter.api_key",
+                  env: "OPENROUTER_API_KEY",
+                  mode: "broker",
+                  hosts: ["openrouter.ai"],
+                  hostPatterns: [],
+                },
+              ],
+            },
+          ],
+          effort: [],
         },
       },
     ],
@@ -420,6 +462,99 @@ describe("compileSessionCreateInput", () => {
       { model: "sonnet" },
     );
     expect(inp.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
+  });
+
+  test("model secrets compile to broker policy secrets for human and programmatic principals", async () => {
+    const providerDeps: SessionCompileDeps = {
+      ...deps(),
+      harnessCatalog: providerHarnessCatalog(),
+      orgSecret: {
+        listSecrets: async () => ({ secrets: [{ name: "openrouter.api_key" }] }),
+      },
+    };
+
+    for (const programmatic of [false, true]) {
+      const inp = await compileSessionCreateInput(
+        profile(),
+        providerDeps,
+        programmatic ? { programmatic: true } : {},
+      );
+      expect(inp.harnessEnv).toMatchObject({
+        ANTHROPIC_MODEL: "z-ai/glm-5.2",
+        ANTHROPIC_BASE_URL: "https://openrouter.ai/api",
+        [ORG_ENV]: "",
+      });
+      const policy = JSON.parse(inp.integrationPolicyJson!) as {
+        secrets: Array<{
+          secret_ref: string;
+          env_var: string;
+          mode: string;
+          allow_hosts: string[];
+          allow_host_patterns: string[];
+        }>;
+      };
+      expect(policy.secrets).toEqual([
+        {
+          secret_ref: "openrouter.api_key",
+          env_var: "ANTHROPIC_AUTH_TOKEN",
+          mode: "broker",
+          allow_hosts: ["openrouter.ai"],
+          allow_host_patterns: [],
+        },
+        {
+          secret_ref: "openrouter.api_key",
+          env_var: "OPENROUTER_API_KEY",
+          mode: "broker",
+          allow_hosts: ["openrouter.ai"],
+          allow_host_patterns: [],
+        },
+      ]);
+      if (programmatic) {
+        expect(policy.secrets.some((secret) => secret.env_var === ORG_ENV)).toBe(false);
+      }
+    }
+  });
+
+  test("fails before create when a model references a missing org secret", async () => {
+    const providerDeps: SessionCompileDeps = {
+      ...deps(),
+      harnessCatalog: providerHarnessCatalog(),
+      orgSecret: { listSecrets: async () => ({ secrets: [] }) },
+    };
+    try {
+      await compileSessionCreateInput(profile(), providerDeps);
+      throw new Error("expected a missing-secret failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConnectError);
+      if (!(error instanceof ConnectError)) throw error;
+      expect(error.code).toBe(Code.FailedPrecondition);
+      expect(error.message).toContain("model option glm-5.2");
+      expect(error.message).toContain("openrouter.api_key");
+    }
+  });
+
+  test("models without secret refs preserve native principal credential rules", async () => {
+    const human = await compileSessionCreateInput(profile(), deps("human-token"));
+    expect(human.harnessEnv?.[USER_ENV]).toBe("human-token");
+    expect(human.harnessEnv?.[ORG_ENV]).toBeUndefined();
+    const humanPolicy = human.integrationPolicyJson
+      ? (JSON.parse(human.integrationPolicyJson) as { secrets: Array<{ env_var: string }> })
+      : { secrets: [] };
+    expect(humanPolicy.secrets.some((secret) => secret.env_var === ORG_ENV)).toBe(false);
+
+    const programmatic = await compileSessionCreateInput(profile(), deps(), { programmatic: true });
+    expect(programmatic.harnessEnv?.[USER_ENV]).toBeUndefined();
+    expect(programmatic.harnessEnv?.[ORG_ENV]).toBeUndefined();
+    const programmaticPolicy = JSON.parse(programmatic.integrationPolicyJson!) as {
+      secrets: Array<{ secret_ref: string; env_var: string; mode: string }>;
+    };
+    expect(programmaticPolicy.secrets).toEqual([
+      expect.objectContaining({
+        secret_ref: ORG_ENV,
+        env_var: ORG_ENV,
+        mode: "literal",
+      }),
+    ]);
   });
 
   // ADR 0031 §7: git commit attribution.

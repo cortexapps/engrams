@@ -147,8 +147,28 @@ pub enum OAuthDelivery {
     OpaqueBundle,
 }
 
-/// One model or effort option. `env` is the set of env vars (with values) that
-/// select this option.
+/// One org-secret delivery specification attached to a model or effort option.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessOptionSecret {
+    /// Org-secret name (the `SecretStore` ref). NEVER a value — the
+    /// descriptor is projected to the browser.
+    pub r#ref: String,
+    /// Env var in the guest that receives the resolved value (`literal`) or
+    /// the broker placeholder (`broker`).
+    pub env: String,
+    #[serde(default)]
+    pub mode: crate::types::image::SecretMode,
+    /// Broker only: exact hosts the proxy may substitute the value on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    /// Broker only: wildcard host patterns (`*.example.com`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_patterns: Vec<String>,
+}
+
+/// One model or effort option. `env` is the set of literal env vars that
+/// select this option; `secrets` describes org-secret delivery separately.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessOption {
@@ -170,6 +190,10 @@ pub struct HarnessOption {
     /// orchestrator dict-merges these into the session's harness env).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+
+    /// Org-secret names and their guest delivery rules. Never secret values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<HarnessOptionSecret>,
 }
 
 /// One session mode (ADR 0107). Unlike [`HarnessOption`] there is no env map:
@@ -246,8 +270,8 @@ impl HarnessDescriptor {
             validate_stable_id(&oauth.provider)
                 .map_err(|e| format!("harness.toml [auth.user_oauth] provider: {e}"))?;
         }
-        validate_options("models", &self.models)?;
-        validate_options("effort", &self.effort)?;
+        validate_options("models", &self.models, &self.auth)?;
+        validate_options("effort", &self.effort, &self.auth)?;
         validate_modes(&self.modes)?;
         Ok(())
     }
@@ -314,7 +338,7 @@ impl HarnessOption {
     }
 }
 
-fn validate_options(field: &str, opts: &[HarnessOption]) -> Result<(), String> {
+fn validate_options(field: &str, opts: &[HarnessOption], auth: &HarnessAuth) -> Result<(), String> {
     let mut seen: HashSet<&str> = HashSet::new();
     let mut defaults = 0usize;
     for o in opts {
@@ -327,9 +351,100 @@ fn validate_options(field: &str, opts: &[HarnessOption]) -> Result<(), String> {
         if o.default {
             defaults += 1;
         }
-        for k in o.env.keys() {
+        for (k, v) in &o.env {
             validate_env_name(k)
                 .map_err(|e| format!("harness.toml [[{field}]] {:?} env: {e}", o.id))?;
+            if v.contains("{secrets.") {
+                return Err(format!(
+                    "harness.toml [[{field}]] {:?} env {k:?}: secret references belong in the option's `secrets` list, not in env values",
+                    o.id
+                ));
+            }
+            if auth.user_env.as_deref() == Some(k) {
+                return Err(format!(
+                    "harness.toml [[{field}]] {:?} env must not set auth.user_env {k:?}; the human credential is principal-authoritative",
+                    o.id
+                ));
+            }
+            // A descriptor may disable the native org credential for a model,
+            // but it may never supply one; org credentials remain
+            // principal-authoritative (ADR 0063 §4).
+            if auth.org_env.as_deref() == Some(k) && !v.is_empty() {
+                return Err(format!(
+                    "harness.toml [[{field}]] {:?} env may set auth.org_env {k:?} only to an empty string; a descriptor may disable the native credential but never supply one",
+                    o.id
+                ));
+            }
+        }
+        let mut secret_envs: HashSet<&str> = HashSet::new();
+        for secret in &o.secrets {
+            if secret.r#ref.trim().is_empty() {
+                return Err(format!(
+                    "harness.toml [[{field}]] {:?} secrets: ref must not be empty",
+                    o.id
+                ));
+            }
+            validate_env_name(&secret.env).map_err(|e| {
+                format!(
+                    "harness.toml [[{field}]] {:?} secrets env {:?}: {e}",
+                    o.id, secret.env
+                )
+            })?;
+            if auth.user_env.as_deref() == Some(secret.env.as_str()) {
+                return Err(format!(
+                    "harness.toml [[{field}]] {:?} secrets must not target auth.user_env {:?}",
+                    o.id, secret.env
+                ));
+            }
+            if auth.org_env.as_deref() == Some(secret.env.as_str()) {
+                return Err(format!(
+                    "harness.toml [[{field}]] {:?} secrets must not target auth.org_env {:?}",
+                    o.id, secret.env
+                ));
+            }
+            if o.env.contains_key(&secret.env) {
+                return Err(format!(
+                    "harness.toml [[{field}]] {:?} env {:?} is set by both env and secrets",
+                    o.id, secret.env
+                ));
+            }
+            if !secret_envs.insert(&secret.env) {
+                return Err(format!(
+                    "harness.toml [[{field}]] {:?} secrets has duplicate env {:?}",
+                    o.id, secret.env
+                ));
+            }
+            if secret.hosts.iter().any(String::is_empty) {
+                return Err(format!(
+                    "harness.toml [[{field}]] {:?} secrets env {:?}: hosts must not contain empty strings",
+                    o.id, secret.env
+                ));
+            }
+            if secret.host_patterns.iter().any(String::is_empty) {
+                return Err(format!(
+                    "harness.toml [[{field}]] {:?} secrets env {:?}: host_patterns must not contain empty strings",
+                    o.id, secret.env
+                ));
+            }
+            match secret.mode {
+                crate::types::image::SecretMode::Broker
+                    if secret.hosts.is_empty() && secret.host_patterns.is_empty() =>
+                {
+                    return Err(format!(
+                        "harness.toml [[{field}]] {:?} secrets env {:?}: broker mode requires at least one host or host_pattern",
+                        o.id, secret.env
+                    ));
+                }
+                crate::types::image::SecretMode::Literal
+                    if !secret.hosts.is_empty() || !secret.host_patterns.is_empty() =>
+                {
+                    return Err(format!(
+                        "harness.toml [[{field}]] {:?} secrets env {:?}: literal mode must not specify hosts or host_patterns",
+                        o.id, secret.env
+                    ));
+                }
+                _ => {}
+            }
         }
     }
     if defaults > 1 {
@@ -560,6 +675,153 @@ org_env = "1BAD"
         let err = HarnessDescriptor::parse(src).unwrap_err();
         assert!(err.contains("org_env"), "{err}");
         assert!(err.contains("invalid env var name"), "{err}");
+    }
+
+    #[test]
+    fn parses_broker_secret_delivery_spec() {
+        let src = r#"
+name = "x"
+[[models]]
+id = "provider"
+secrets = [
+  { ref = "openrouter.api_key", env = "TOKEN", mode = "broker", hosts = ["openrouter.ai"] },
+]
+"#;
+        let d = HarnessDescriptor::parse(src).unwrap();
+        let secret = &d.models[0].secrets[0];
+        assert_eq!(secret.r#ref, "openrouter.api_key");
+        assert_eq!(secret.env, "TOKEN");
+        assert_eq!(secret.mode, crate::types::image::SecretMode::Broker);
+        assert_eq!(secret.hosts, ["openrouter.ai"]);
+    }
+
+    #[test]
+    fn rejects_legacy_secret_templates_with_pointer_to_secrets_list() {
+        let src = r#"
+name = "x"
+[[effort]]
+id = "high"
+env = { TOKEN = "Bearer {secrets.openrouter.api_key}" }
+"#;
+        let err = HarnessDescriptor::parse(src).unwrap_err();
+        assert!(err.contains("high"), "{err}");
+        assert!(err.contains("option's `secrets` list"), "{err}");
+    }
+
+    #[test]
+    fn rejects_secret_hosts_that_do_not_match_the_delivery_mode() {
+        for (secret, expected) in [
+            (
+                r#"{ ref = "key", env = "TOKEN", mode = "broker" }"#,
+                "broker mode requires at least one host or host_pattern",
+            ),
+            (
+                r#"{ ref = "key", env = "TOKEN", mode = "literal", hosts = ["api.example.com"] }"#,
+                "literal mode must not specify hosts or host_patterns",
+            ),
+        ] {
+            let src = format!("name = \"x\"\n[[models]]\nid = \"provider\"\nsecrets = [{secret}]");
+            let err = HarnessDescriptor::parse(&src).unwrap_err();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn rejects_secret_targets_owned_elsewhere_in_the_option() {
+        for (env, option_env, expected) in [
+            ("USER_TOKEN", "", "auth.user_env"),
+            ("ORG_TOKEN", "", "auth.org_env"),
+            (
+                "MODEL_TOKEN",
+                "env = { MODEL_TOKEN = \"\" }",
+                "both env and secrets",
+            ),
+        ] {
+            let src = format!(
+                r#"name = "x"
+[auth]
+user_env = "USER_TOKEN"
+org_env = "ORG_TOKEN"
+[[models]]
+id = "provider"
+{option_env}
+secrets = [{{ ref = "key", env = "{env}" }}]
+"#
+            );
+            let err = HarnessDescriptor::parse(&src).unwrap_err();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_secret_delivery_specs() {
+        for (secrets, expected) in [
+            (r#"[{ ref = "", env = "TOKEN" }]"#, "ref must not be empty"),
+            (r#"[{ ref = "key", env = "1BAD" }]"#, "invalid env var name"),
+            (
+                r#"[{ ref = "one", env = "TOKEN" }, { ref = "two", env = "TOKEN" }]"#,
+                "duplicate env",
+            ),
+            (
+                r#"[{ ref = "key", env = "TOKEN", mode = "broker", hosts = [""] }]"#,
+                "hosts must not contain empty strings",
+            ),
+            (
+                r#"[{ ref = "key", env = "TOKEN", mode = "broker", host_patterns = [""] }]"#,
+                "host_patterns must not contain empty strings",
+            ),
+        ] {
+            let src = format!("name = \"x\"\n[[models]]\nid = \"provider\"\nsecrets = {secrets}");
+            let err = HarnessDescriptor::parse(&src).unwrap_err();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn rejects_user_env_in_option_env() {
+        let src = r#"
+name = "x"
+[auth]
+user_env = "USER_TOKEN"
+[[models]]
+id = "provider"
+env = { USER_TOKEN = "" }
+"#;
+        let err = HarnessDescriptor::parse(src).unwrap_err();
+        assert!(err.contains("must not set auth.user_env"), "{err}");
+        assert!(err.contains("principal-authoritative"), "{err}");
+    }
+
+    #[test]
+    fn rejects_non_empty_org_env_in_option_env() {
+        let src = r#"
+name = "x"
+[auth]
+org_env = "ORG_TOKEN"
+[[models]]
+id = "provider"
+env = { ORG_TOKEN = "actual-value" }
+"#;
+        let err = HarnessDescriptor::parse(src).unwrap_err();
+        assert!(err.contains("only to an empty string"), "{err}");
+        assert!(
+            err.contains("disable the native credential but never supply one"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn accepts_empty_org_env_in_option_env() {
+        let src = r#"
+name = "x"
+[auth]
+org_env = "ORG_TOKEN"
+[[models]]
+id = "provider"
+env = { ORG_TOKEN = "" }
+"#;
+        let d = HarnessDescriptor::parse(src).unwrap();
+        assert_eq!(d.models[0].env["ORG_TOKEN"], "");
     }
 
     #[test]

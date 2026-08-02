@@ -327,6 +327,10 @@ pub(crate) async fn boot_on_reserved_host(
     // Egress policy from the resolved guest IP (None on backends without
     // one) + the injects/observes already resolved by the overlapped leg.
     let observes = build_observe_entries(integration_policy.as_ref());
+    // Counted before the vecs move into the assembly — the degraded-policy
+    // warning below reports what a missing guest IP costs this session.
+    let egress_secret_count = egress_secrets.len();
+    let inject_count = injects.len();
     let resolved_policy = ResolvedEgressPolicy {
         secrets: egress_secrets,
         injects,
@@ -381,21 +385,47 @@ pub(crate) async fn boot_on_reserved_host(
         binding_epoch: 0,
     });
     agent.binding_epoch = binding_epoch;
-    let policy = egress_policy.unwrap_or_else(|| engram_core::types::egress::SessionEgressPolicy {
-        session_id,
-        sandbox_id,
-        guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
-        network_allow_hosts: network.allow_hosts.clone(),
-        network_allow_host_patterns: network.allow_host_patterns.clone(),
-        allow_all: false,
-        secrets: Vec::new(),
-        injects: Vec::new(),
-        observes: Vec::new(),
-        google_adc: integration_policy
-            .as_ref()
-            .is_some_and(|policy| policy.google_adc),
-        // ADR 0057: vestigial wire field; substitution is per-entry.
-        secret_mode: engram_core::types::image::SecretMode::Broker,
+    // `assemble_egress_policy` returned `None` — the backend could not
+    // name this sandbox's guest IP. ADR 0013 bundled the policy into
+    // `start_agent` so the host applies it BEFORE spawning the agent
+    // ("atomic by construction"), which makes the parameter non-optional,
+    // which is why there is a stub here at all. It is a poor stub: an
+    // UNSPECIFIED IP matches no packet the guest will ever send, so the
+    // proxy answers every request with `UnknownGuest`, and it drops the
+    // resolved secrets and injects on the floor. The session boots looking
+    // healthy and 401s on its first upstream call.
+    //
+    // Never silently. A degraded session must be visible in the log, or
+    // the next thing that trips this is as invisible as the VZ boot race
+    // was (a 2s guest-IP timeout that lost to a 2.5s guest boot; fixed in
+    // `engram-sandbox-vz`'s `guest_endpoints`, which now waits).
+    let policy = egress_policy.unwrap_or_else(|| {
+        tracing::warn!(
+            %session_id,
+            %sandbox_id,
+            %host_id,
+            dropped_secrets = egress_secret_count,
+            dropped_injects = inject_count,
+            "no guest IP for this sandbox; registering a DEGRADED egress policy \
+             (unspecified IP, no secrets, no injects) — the proxy will reject all \
+             guest traffic as UnknownGuest and brokered credentials will not substitute",
+        );
+        engram_core::types::egress::SessionEgressPolicy {
+            session_id,
+            sandbox_id,
+            guest_ip: std::net::Ipv4Addr::UNSPECIFIED,
+            network_allow_hosts: network.allow_hosts.clone(),
+            network_allow_host_patterns: network.allow_host_patterns.clone(),
+            allow_all: false,
+            secrets: Vec::new(),
+            injects: Vec::new(),
+            observes: Vec::new(),
+            google_adc: integration_policy
+                .as_ref()
+                .is_some_and(|policy| policy.google_adc),
+            // ADR 0057: vestigial wire field; substitution is per-entry.
+            secret_mode: engram_core::types::image::SecretMode::Broker,
+        }
     });
 
     // Emit pending → created (the row materialized at Created above).

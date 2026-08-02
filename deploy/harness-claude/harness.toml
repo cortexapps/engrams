@@ -58,6 +58,29 @@ id    = "haiku"
 label = "Claude Haiku 4.5"
 env   = { ANTHROPIC_MODEL = "claude-haiku-4-5" }
 
+# The per-option `secrets` list carries credential names only, never values.
+# In broker mode the guest holds a placeholder while the proxy substitutes the
+# real key only on requests to `openrouter.ai`.
+#
+# Claude Code routes by TIER, not by a single model: the main loop reads
+# ANTHROPIC_MODEL, sub-agents read CLAUDE_CODE_SUBAGENT_MODEL, and the
+# sonnet/haiku tier defaults name what it falls back to for cheaper work.
+# All four are pointed at OpenRouter slugs so no tier silently escapes to
+# api.anthropic.com on a credential the guest doesn't have.
+[[models]]
+id    = "glm-5.2"
+label = "Open Weight Frontier (GLM + DS)"
+env   = { ANTHROPIC_MODEL = "z-ai/glm-5.2",
+          ANTHROPIC_BASE_URL = "https://openrouter.ai/api",
+          ANTHROPIC_API_KEY = "",
+          CLAUDE_CODE_SUBAGENT_MODEL = "z-ai/glm-5.2",
+          ANTHROPIC_DEFAULT_SONNET_MODEL = "~deepseek/deepseek-v4-flash-latest",
+          ANTHROPIC_DEFAULT_HAIKU_MODEL = "~deepseek/deepseek-v4-flash-latest" }
+secrets = [
+  { ref = "openrouter.api_key", env = "ANTHROPIC_AUTH_TOKEN", mode = "broker", hosts = ["openrouter.ai"] },
+  { ref = "openrouter.api_key", env = "OPENROUTER_API_KEY",   mode = "broker", hosts = ["openrouter.ai"] },
+]
+
 # Session modes (ADR 0107). Pure declaration: mode selection rides prompts
 # (harness_mode) and the harness maps `plan` to `--permission-mode plan`.
 [[modes]]
