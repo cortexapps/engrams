@@ -95,14 +95,45 @@ export function useConnectorViews(): ConnectorViewsResult {
   const googleConnections = (namedConnections.data?.connections ?? []).filter(
     (connection) => connection.provider === GOOGLE_CLOUD_PROVIDER,
   );
-  const googleConnectionIds = new Set(googleConnections.map((connection) => connection.id));
-  const googleProfiles = allProfiles.filter((profile) =>
-    (profile.integrationGrants ?? []).some((grant) => googleConnectionIds.has(grant.connectionId)),
+  views.push(googleCloudView(googleConnections, allProfiles));
+
+  return {
+    views,
+    isLoading: cat.isLoading || conns.isLoading || namedConnections.isLoading,
+    error: cat.error ?? conns.error ?? namedConnections.error,
+  };
+}
+
+interface GrantingProfileLike {
+  id: string;
+  name: string;
+  icon: string;
+  integrationGrants?: { connectionId: string }[];
+}
+
+interface GoogleConnectionLike {
+  id: string;
+  googleCloud?: { endpoints: string[] };
+}
+
+/**
+ * The synthetic Google Cloud view (ADR 0109 named connections). Google has no
+ * row in the connector catalog yet, so both view joins build its entry here —
+ * with per-connection data when the caller can list connections (admin), and
+ * a placeholder host when it cannot (member surfaces).
+ */
+function googleCloudView(
+  connections: readonly GoogleConnectionLike[],
+  profiles: readonly GrantingProfileLike[],
+): ConnectorView {
+  const connectionIds = new Set(connections.map((connection) => connection.id));
+  const granting = profiles.filter((profile) =>
+    (profile.integrationGrants ?? []).some((grant) => connectionIds.has(grant.connectionId)),
   );
-  const googleHosts = [
-    ...new Set(googleConnections.flatMap((connection) => connection.googleCloud?.endpoints ?? [])),
+  const hosts = [
+    ...new Set(connections.flatMap((connection) => connection.googleCloud?.endpoints ?? [])),
   ];
-  views.push({
+  return {
     provider: GOOGLE_CLOUD_PROVIDER,
     defaultConnectionId: "",
     name: "Google Cloud",
@@ -111,24 +142,18 @@ export function useConnectorViews(): ConnectorViewsResult {
       "Run gcloud against approved Google Cloud APIs through keyless Workload Identity Federation. Credentials remain outside the session.",
     icon: { mono: "GC", color: "#4285f4" },
     credentialSource: "mint",
-    hosts: googleHosts.length > 0 ? googleHosts : ["googleapis.com"],
+    hosts: hosts.length > 0 ? hosts : ["googleapis.com"],
     capabilities: GOOGLE_CLOUD_OPERATIONS.map(({ action, access }) => ({ action, access })),
-    status: googleConnections.length > 0 ? "connected" : "available",
+    status: connections.length > 0 ? "connected" : "available",
     builtin: true,
-    usedBy: googleProfiles.length,
-    usedByProfiles: googleProfiles.map((profile) => ({
+    usedBy: granting.length,
+    usedByProfiles: granting.map((profile) => ({
       id: profile.id,
       name: profile.name,
       icon: profile.icon,
     })),
     connectionModel: "named",
-    connectionCount: googleConnections.length,
-  });
-
-  return {
-    views,
-    isLoading: cat.isLoading || conns.isLoading || namedConnections.isLoading,
-    error: cat.error ?? conns.error ?? namedConnections.error,
+    connectionCount: connections.length,
   };
 }
 
@@ -144,7 +169,7 @@ export function writeCount(caps: ConnectorCapabilityView[]): number {
  * reported "available" (unused by these surfaces).
  */
 export function catalogToViews(providers: ProviderCatalogEntry[]): ConnectorView[] {
-  return providers.map((e) => {
+  const views = providers.map((e): ConnectorView => {
     const fb = fallbackIdentity(e.provider);
     const logo = builtinLogo(e.provider) ?? (e.display?.icon?.logo || undefined);
     return {
@@ -171,4 +196,9 @@ export function catalogToViews(providers: ProviderCatalogEntry[]): ConnectorView
       usedByProfiles: [],
     };
   });
+  // Members cannot list named connections, so the launch receipt gets the
+  // placeholder-host Google view; it still names the powers a Google grant
+  // opens instead of dropping them (web-M1).
+  views.push(googleCloudView([], []));
+  return views;
 }

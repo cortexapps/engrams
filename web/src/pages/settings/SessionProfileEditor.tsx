@@ -48,7 +48,14 @@ import { IconPicker } from "../../components/profiles/IconPicker";
 import { PowerSelector } from "../../components/profiles/PowerSelector";
 import { PolicyRail } from "../../components/profiles/PolicyRail";
 import { ProviderTile } from "../../components/integrations/ProviderTile";
-import { GOOGLE_CLOUD_OPERATIONS } from "../../components/integrations/googleCloud";
+import {
+  GOOGLE_CLOUD_OPERATIONS,
+  GOOGLE_CLOUD_PROVIDER,
+  googleOperationLabel,
+  googleOperationsForEndpoints,
+  type GoogleCloudOperation,
+} from "../../components/integrations/googleCloud";
+import type { IntegrationConnection } from "../../gen/engram/app/v1/integration_pb";
 import { HostChip } from "../../components/integrations/chips";
 import {
   EnvVarsEditor,
@@ -63,6 +70,7 @@ import {
   type SecretRow,
 } from "../../components/profiles/ProfileSecretsEditor";
 import { derivePolicy } from "../../lib/profilePolicy";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
@@ -137,6 +145,34 @@ function useFieldValue<K extends keyof ProfileFormValues>(
 ): [ProfileFormValues[K], (next: ProfileFormValues[K]) => void] {
   const { field } = useController({ control, name });
   return [field.value as ProfileFormValues[K], field.onChange];
+}
+
+/**
+ * A per-connection ConnectorView so the shared PowerSelector drives Google
+ * grants exactly like every other connector's powers. `capabilities` carries
+ * the operations the connection's endpoints enable, plus any orphaned grants
+ * the caller wants to keep revocable.
+ */
+function googleConnectionView(
+  connection: IntegrationConnection,
+  operations: readonly GoogleCloudOperation[],
+): ConnectorView {
+  return {
+    provider: GOOGLE_CLOUD_PROVIDER,
+    defaultConnectionId: connection.id,
+    name: connection.displayName,
+    category: "Infrastructure",
+    blurb: "",
+    icon: { mono: "GC", color: "#4285f4" },
+    credentialSource: "mint",
+    hosts: connection.googleCloud?.endpoints ?? [],
+    capabilities: operations.map(({ action, access }) => ({ action, access })),
+    status: "connected",
+    builtin: true,
+    usedBy: 0,
+    usedByProfiles: [],
+    connectionModel: "named",
+  };
 }
 
 const EMPTY: ProfileFormValues = {
@@ -301,8 +337,11 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const connected = views.filter(
     (view) => view.status === "connected" && view.connectionModel !== "named",
   );
+  // Disabled connections stay visible: editing a connection's endpoints
+  // auto-disables it, and a hidden grant on a disabled connection blocked
+  // every unrelated save of the profile with no way to remove it (web-H1).
   const googleConnections = (connectionData?.connections ?? []).filter(
-    (connection) => connection.provider === "gcp" && connection.enabled,
+    (connection) => connection.provider === "gcp",
   );
   const imageUri = images?.find((i) => i.id === imageId)?.image_uri;
 
@@ -337,13 +376,6 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   };
   const disableProvider = (v: ConnectorView) =>
     setGrants(integrationGrants.filter((grant) => grant.connectionId !== v.defaultConnectionId));
-
-  const toggleConnectionOperation = (connectionId: string, operation: string, on: boolean) => {
-    const without = integrationGrants.filter(
-      (grant) => grant.connectionId !== connectionId || grant.operation !== operation,
-    );
-    setGrants(on ? [...without, { connectionId, operation, resourceConstraints: [] }] : without);
-  };
 
   const onSubmit = async (vals: ProfileFormValues) => {
     const payload = {
@@ -738,11 +770,20 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                   );
                 })}
                 {googleConnections.map((connection) => {
-                  const selectedOperations = GOOGLE_CLOUD_OPERATIONS.filter(({ action }) =>
-                    integrationGrants.some(
-                      (grant) => grant.connectionId === connection.id && grant.operation === action,
-                    ),
+                  const endpoints = connection.googleCloud?.endpoints ?? [];
+                  const offered = googleOperationsForEndpoints(endpoints);
+                  const offeredActions = new Set(offered.map(({ action }) => action));
+                  const grantedActions = new Set(
+                    integrationGrants
+                      .filter((grant) => grant.connectionId === connection.id)
+                      .map((grant) => grant.operation),
                   );
+                  // A grant can outlive its endpoint (the connection's APIs
+                  // were edited): keep it visible so it can be removed.
+                  const orphaned = GOOGLE_CLOUD_OPERATIONS.filter(
+                    ({ action }) => grantedActions.has(action) && !offeredActions.has(action),
+                  );
+                  const view = googleConnectionView(connection, [...offered, ...orphaned]);
                   return (
                     <div
                       key={connection.id}
@@ -753,42 +794,44 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                           GC
                         </span>
                         <div className="min-w-0 flex-1">
-                          <div className="text-[0.92rem] font-semibold">
+                          <div className="flex items-center gap-2 text-[0.92rem] font-semibold">
                             {connection.displayName}
+                            {!connection.enabled && <Badge variant="secondary">Disabled</Badge>}
                           </div>
                           <div className="truncate font-mono text-[0.7rem] text-muted-foreground">
                             {connection.googleCloud?.serviceAccountEmail}
                           </div>
                         </div>
-                        <Text
-                          variant="label"
-                          tone={selectedOperations.length ? "inherit" : "muted"}
-                        >
-                          {selectedOperations.length} granted
+                        <Text variant="label" tone={grantedActions.size ? "inherit" : "muted"}>
+                          {grantedActions.size} granted
                         </Text>
                       </div>
-                      <div className="divide-y border-t">
-                        {GOOGLE_CLOUD_OPERATIONS.map(({ action, label }) => {
-                          const checked = selectedOperations.some(
-                            (operation) => operation.action === action,
-                          );
-                          return (
-                            <label
-                              key={action}
-                              className="flex cursor-pointer items-center gap-3 px-3.5 py-2.5 text-sm"
-                            >
-                              <Switch
-                                checked={checked}
-                                aria-label={`${connection.displayName} ${label}`}
-                                onCheckedChange={(value) =>
-                                  toggleConnectionOperation(connection.id, action, value)
-                                }
-                              />
-                              <span className="flex-1">{label}</span>
-                              <code className="text-[10px] text-muted-foreground">{action}</code>
-                            </label>
-                          );
-                        })}
+                      {!connection.enabled && (
+                        <p className="border-t px-3.5 py-2 text-[0.74rem] text-muted-foreground">
+                          This connection is disabled — sessions cannot use these powers. Test and
+                          enable it again from{" "}
+                          <Link
+                            to="/settings/integrations/gcp/$connectionId/setup"
+                            params={{ connectionId: connection.id }}
+                            className="underline underline-offset-2"
+                          >
+                            its setup page
+                          </Link>
+                          , or remove the grants here.
+                        </p>
+                      )}
+                      <div className="border-t">
+                        <PowerSelector
+                          view={view}
+                          isOn={(action) => capOn(connection.id, action)}
+                          onToggle={(action, value) => toggleCap(connection.id, action, value)}
+                          labelFor={googleOperationLabel}
+                          noteFor={(action) =>
+                            offeredActions.has(action)
+                              ? undefined
+                              : "not in this connection's allowed APIs"
+                          }
+                        />
                       </div>
                     </div>
                   );

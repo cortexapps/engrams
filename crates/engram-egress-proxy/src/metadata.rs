@@ -141,7 +141,16 @@ fn response(
                 "{{\"access_token\":\"{PLACEHOLDER_TOKEN}\",\"expires_in\":300,\"token_type\":\"Bearer\"}}"
             ),
         ),
-        "/computeMetadata/v1/project/project-id" => text("engrams-broker"),
+        // No project id. The proxy brokers a credential; it does not know which
+        // project the session's service account belongs to, and inventing one
+        // is worse than admitting it: `engrams-broker` was answered here, so
+        // `gcloud compute instances list` silently targeted a project that does
+        // not exist until the operator passed `--project`. A 404 is what a
+        // metadata server returns for an attribute it does not hold, so the
+        // Cloud SDK reports a missing project and asks for one.
+        "/computeMetadata/v1/project/project-id" => {
+            ("404 Not Found", "text/plain", "not found".into())
+        }
         // Cloud SDK uses this digits-only response to detect a GCE metadata
         // server. This is a synthetic identifier, not a customer project.
         "/computeMetadata/v1/project/numeric-project-id" => text("0"),
@@ -215,6 +224,13 @@ mod tests {
         assert_eq!(content_type, "text/plain");
         assert_eq!(body, "0");
         assert!(body.bytes().all(|byte| byte.is_ascii_digit()));
+
+        // The proxy does not know the session's project, and answering with a
+        // made-up one made `gcloud compute …` target a project that does not
+        // exist until `--project` was passed. A metadata server returns 404 for
+        // an attribute it does not hold.
+        let (status, _, _) = response("GET", "/computeMetadata/v1/project/project-id", true);
+        assert_eq!(status, "404 Not Found");
     }
 
     #[test]

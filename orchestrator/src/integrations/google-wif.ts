@@ -4,6 +4,7 @@ import { createPrivateKey, createSign, type KeyObject } from "node:crypto";
 
 import type { IntegrationOidcKeyStore } from "../db/integration-oidc-keys.ts";
 import type { GoogleCloudConnectionConfig } from "../db/integration-connections.ts";
+import { isDeniedGoogleHost } from "./google-credential-denylist.ts";
 
 const STS_URL = "https://sts.googleapis.com/v1/token";
 const IAM_CREDENTIALS_ORIGIN = "https://iamcredentials.googleapis.com";
@@ -98,12 +99,7 @@ export function assertGoogleCloudConfig(value: Record<string, unknown>): GoogleC
     ) {
       throw new Error(`endpoint "${endpoint}" must be an exact hostname`);
     }
-    if (
-      endpoint === "sts.googleapis.com" ||
-      endpoint === "oauth2.googleapis.com" ||
-      endpoint === "accounts.google.com" ||
-      endpoint === "securetoken.googleapis.com"
-    ) {
+    if (isDeniedGoogleHost(endpoint)) {
       throw new Error(`credential exchange endpoint "${endpoint}" cannot be guest-accessible`);
     }
   }

@@ -22,7 +22,7 @@ use crate::{SandboxId, SessionId};
 /// against a session's `guest_ip`. Built by the coordinator from
 /// the image manifest + resolved secret bundle, shipped to the
 /// owning host over the WS, applied locally by the host-agent.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEgressPolicy {
     pub session_id: SessionId,
     pub sandbox_id: SandboxId,
@@ -70,7 +70,7 @@ pub struct SessionEgressPolicy {
 /// guest sees in its env (`engram_ph_<session>_<hash>`); the proxy
 /// replaces it with `real_value` in outbound HTTPS traffic when the
 /// destination SNI matches `allow_hosts` / `allow_host_patterns`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressSecretEntry {
     pub placeholder: String,
     pub real_value: String,
@@ -85,7 +85,7 @@ pub struct EgressSecretEntry {
 /// request policy (`methods` + `path_globs`), the proxy adds
 /// `header_name: <header_template with "{}" → secret>`. The guest never
 /// holds the secret. Empty `methods`/`path_globs` = any.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressInjectEntry {
     pub secret: String,
     pub header_name: String,
@@ -126,7 +126,7 @@ pub struct EgressInjectEntry {
 /// request policy (`methods` + `path_globs`), the proxy parses the response
 /// and emits an `IntegrationAsset` (`provider`/`asset_kind`/`surface`) built
 /// from `data` + `fetchable`, gated by `success_status_class`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressObserveEntry {
     pub allow_hosts: Vec<String>,
     pub allow_host_patterns: Vec<String>,

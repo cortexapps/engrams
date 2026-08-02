@@ -41,6 +41,12 @@ PUP_VERSION="${PUP_VERSION:-1.4.0}"
 GLAB_VERSION="${GLAB_VERSION:-1.105.0}"
 STRIPE_VERSION="${STRIPE_VERSION:-1.43.2}"
 GCLOUD_VERSION="${GCLOUD_VERSION:-577.0.0}"
+# Build-container base, pinned by digest (multi-arch index, amd64+arm64).
+# The bundle COPIES this image's Python runtime and shared libraries into the
+# tree, so a floating tag changed the bundle content between builds and broke
+# the content-addressed reproducibility promise. Bump deliberately, with the
+# other pins.
+BOOKWORM_IMAGE="debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818"
 
 build_tree() {
     local dest="$1"
@@ -68,7 +74,7 @@ build_tree() {
         -e GCLOUD_VERSION="$GCLOUD_VERSION" \
         -e HOST_UID="$(id -u)" \
         -e HOST_GID="$(id -g)" \
-        debian:bookworm-slim bash -euo pipefail -c '
+        "$BOOKWORM_IMAGE" bash -euo pipefail -c '
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
         apt-get install -y -qq --no-install-recommends curl ca-certificates tar python3

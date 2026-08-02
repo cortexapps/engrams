@@ -7,6 +7,7 @@ import {
   googleOidcAudience,
   makeGoogleWifBroker,
 } from "../integrations/google-wif.ts";
+import { deniedGoogleHosts } from "../integrations/google-credential-denylist.ts";
 
 const PROVIDER =
   "//iam.googleapis.com/projects/123456/locations/global/" +
@@ -157,5 +158,31 @@ describe("Google WIF broker", () => {
       private_key: "must-not-be-accepted",
     })).toThrow(/unsupported fields/);
     expect(googleOidcAudience(PROVIDER)).toBe(PROVIDER);
+  });
+
+  test("refuses every credential exchange endpoint, mutual-TLS twins included", () => {
+    const reject = (endpoint: string) =>
+      expect(() => assertGoogleCloudConfig({
+        workloadIdentityProvider: PROVIDER,
+        serviceAccountEmail: "engram-reader@customer.iam.gserviceaccount.com",
+        endpoints: [endpoint],
+      })).toThrow(/cannot be guest-accessible/);
+
+    for (const host of deniedGoogleHosts) {
+      reject(host);
+      // Google serves every one of these at a mutual-TLS twin. The old
+      // exact-host list did not know the twins, which made it a complete
+      // bypass.
+      reject(host.replace(".", ".mtls."));
+      reject(host.toUpperCase());
+    }
+    // The proxy owns the table; this validator must read the same one.
+    expect(deniedGoogleHosts).toContain("iamcredentials.googleapis.com");
+
+    expect(() => assertGoogleCloudConfig({
+      workloadIdentityProvider: PROVIDER,
+      serviceAccountEmail: "engram-reader@customer.iam.gserviceaccount.com",
+      endpoints: ["compute.googleapis.com"],
+    })).not.toThrow();
   });
 });
