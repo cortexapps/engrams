@@ -169,7 +169,12 @@ jobs:
       - name: Build and start the bundle
         run: |
           deploy/bundles/integrations-cli/build.sh --stage var/integrations-cli
-          CLOUDSDK_CONFIG="$(mktemp -d)" var/integrations-cli/bin/gcloud --version
+          config_dir="$(mktemp -d)"
+          trap 'rm -rf "$config_dir"' EXIT
+          CLOUDSDK_CONFIG="$config_dir" var/integrations-cli/bin/gcloud --version
+          test "$(CLOUDSDK_CONFIG="$config_dir" var/integrations-cli/bin/gcloud \
+            config get core/custom_ca_certs_file)" = \
+            "/etc/ssl/certs/ca-certificates.crt"
       - name: Verify metadata ADC with the bundled gcloud
         run: |
           export PATH="$PWD/var/integrations-cli/bin:$PATH"
