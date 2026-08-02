@@ -24,6 +24,7 @@ interface Caps {
   puts: Array<{ name: string; value: string }>;
   upserts: string[];
   mints: Array<{ provider: string; kind: string; values: Record<string, string> }>;
+  connectionCreates: Array<{ alias: string; serviceAccountEmail: string; endpoints: string[] }>;
 }
 
 const CATALOG = [
@@ -85,6 +86,7 @@ function installTransport(): Caps {
   const puts: Caps["puts"] = [];
   const upserts: string[] = [];
   const mints: Caps["mints"] = [];
+  const connectionCreates: Caps["connectionCreates"] = [];
   const transport = createRouterTransport((router) => {
     router.service(IntegrationService, {
       listConnectors: () => ({ connectors: CONNECTORS }),
@@ -111,6 +113,39 @@ function installTransport(): Caps {
       testConnector: () => ({
         ok: true,
         message: "Reached api.github.com · HTTP 200 · credential accepted",
+      }),
+      listConnections: () => ({ connections: [] }),
+      createConnection: (req) => {
+        connectionCreates.push({
+          alias: req.alias,
+          serviceAccountEmail: req.googleCloud?.serviceAccountEmail ?? "",
+          endpoints: [...(req.googleCloud?.endpoints ?? [])],
+        });
+        return {
+          connection: {
+            id: "connection-1",
+            alias: req.alias,
+            provider: "gcp",
+            displayName: req.displayName,
+            enabled: false,
+            testedAt: "",
+            createdAt: "",
+            updatedAt: "",
+            googleCloud: req.googleCloud,
+          },
+        };
+      },
+      deleteConnection: () => ({ deleted: true }),
+      testConnection: () => ({ ok: true, message: "STS and impersonation passed" }),
+      setConnectionEnabled: () => ({ connection: undefined }),
+      getGoogleCloudSetup: () => ({
+        issuer: "https://engrams.example/oidc",
+        audience:
+          "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
+        subjectAttribute: "google.subject=assertion.sub",
+        connectionAttribute: "attribute.engrams_connection=assertion.engrams_connection",
+        gcloudScript: "gcloud iam workload-identity-pools create engrams",
+        terraform: 'resource "google_iam_workload_identity_pool" "engrams" {}',
       }),
     });
     router.service(MintService, {
@@ -144,7 +179,7 @@ function installTransport(): Caps {
       deleteProfile: () => ({}),
     });
   });
-  return { transport, puts, upserts, mints };
+  return { transport, puts, upserts, mints, connectionCreates };
 }
 
 describe("IntegrationsPanel (marketplace)", () => {
@@ -211,5 +246,39 @@ describe("IntegrationsPanel (marketplace)", () => {
     expect(cfg.credential.injects[0].secretRef).toBe("sentry-token");
     expect(cfg.operations[0].grants).toEqual(["issues:read"]);
     expect(puts).toContainEqual({ name: "sentry-token", value: "sk-live-abc" });
+  });
+
+  test("adds a keyless Google Cloud connection and shows generated setup", async () => {
+    const { transport, connectionCreates } = installTransport();
+    renderWithProviders(<IntegrationsPanel />, { transport });
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: /add connection/i }));
+    await user.type(screen.getByLabelText(/connection alias/i), "prod-readonly");
+    await user.type(screen.getByLabelText(/display name/i), "Production read only");
+    await user.type(
+      screen.getByLabelText(/workload identity provider resource/i),
+      "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
+    );
+    await user.type(
+      screen.getByLabelText(/target service-account email/i),
+      "reader@customer.iam.gserviceaccount.com",
+    );
+    await user.click(screen.getByRole("button", { name: /create connection/i }));
+
+    await waitFor(() => expect(connectionCreates).toHaveLength(1));
+    expect(connectionCreates[0]).toEqual({
+      alias: "prod-readonly",
+      serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
+      endpoints: [
+        "compute.googleapis.com",
+        "logging.googleapis.com",
+        "cloudtrace.googleapis.com",
+        "container.googleapis.com",
+        "tunnel.cloudproxy.app",
+      ],
+    });
+    expect(await screen.findByText("Terraform")).toBeTruthy();
+    expect(screen.getByText(/google_iam_workload_identity_pool/)).toBeTruthy();
   });
 });
