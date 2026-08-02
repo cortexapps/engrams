@@ -3,4 +3,9 @@ set -eu
 here="$(dirname "$(readlink -f "$0")")"
 export CLOUDSDK_PYTHON="$here/../python/bin/python3"
 export LD_LIBRARY_PATH="$here/../lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# gcloud does not consistently honor the persisted custom_ca_certs_file
+# property before it creates its client session. Pin the documented environment
+# form so its Python Requests client trusts the egress proxy CA in the system
+# bundle.
+export CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE=/etc/ssl/certs/ca-certificates.crt
 exec "$here/../google-cloud-sdk/bin/gcloud" "$@"
