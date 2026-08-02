@@ -1,6 +1,6 @@
 # ADR 0109: Portable Google Cloud access through Workload Identity Federation
 
-Status: 2026-07-31 — **Proposed.**
+Status: 2026-07-31 — Proposed. 2026-08-02 — **Accepted.**
 
 ## Context
 
@@ -150,3 +150,142 @@ headers.
    denials in the egress proxy.
 4. Add the admin UI, Google setup generator, and authenticated `gcloud` bundle.
 5. Accept this ADR after focused security tests and real GCP staging smokes pass.
+
+## Divergences, closeout, and lessons
+
+A deep quality review after the first implementation landed (#930-#964) found
+the decision sound and the implementation short of it in specific, verifiable
+ways. What follows is what changed and why, so a reader of this ADR sees the
+shipped design rather than the proposed one.
+
+### The egress gate
+
+**The HTTP/1 header gate was bounded, the header block was not.** The adapter
+buffered a request prefix, gated on it, and relayed the tail. A guest that
+padded its headers past the buffer put its own `Host` or `Authorization` beyond
+the gate's view. The block is now buffered whole or the request is refused, and
+every line shape the CRLF walkers and the upstream would read differently — a
+bare LF, an obsolete fold, whitespace before the colon, `Content-Length` beside
+`Transfer-Encoding` — is rejected.
+
+**`Content-Length` went stale after substitution.** A real secret is longer than
+its placeholder. HTTP/2 drops the header because it has a structural length;
+HTTP/1 has none, so a broker-mode secret in a request body truncated or hung the
+request. The declared length is now rewritten from what is actually sent.
+
+**Response redaction was not chunk-aware.** A chunked upstream can split a
+credential across a chunk boundary, where the wire bytes carry `\r\n<size>\r\n`
+between the halves; the raw scan found nothing and the credential reached the
+guest whole. The scan now runs over the DECODED stream and writes matches back
+in place. Redaction is length-preserving, so chunk sizes stay exact and no
+re-framing is needed. This de-chunks rather than rejecting chunked responses,
+because Google frontends send them.
+
+**The credential denylist ran in the wrong place and was written twice.** It
+lived inside the intercept path, so a broad `*.googleapis.com` network allow
+beside a narrow injection spliced STS straight through with no gate at all. It
+matched only REST shapes, so the gRPC form of service-account key creation was
+allowed. It did not know the mutual-TLS twins (`sts.mtls.googleapis.com`), which
+against an exact-host list is a complete bypass. And the orchestrator kept its
+own copy, which already knew a different set of hosts.
+
+The denylist is now ONE checked-in table
+(`crates/engram-egress-proxy/policy/google-credential-denylist.json`) that the
+proxy `include_str!`s and the orchestrator imports. A denied HOST is refused at
+admission, in `SessionState::decide()`, before any TLS — which is what covers a
+bypass connection. A denied OPERATION needs the request line, so a host carrying
+one is never spliced: admission upgrades it to an intercept with an empty
+policy. `X-HTTP-Method-Override` is stripped on both protocols, because Google
+honours it and it otherwise defeats every method-gated rule.
+
+**One gate, not two.** The HTTP/1 and HTTP/2 adapters each carried a hand-copied
+version of the policy gate. They had already drifted: the placeholder-leak
+detector could not fire at all (`decide()` narrows secrets to the host-matching
+ones, and the scan then asked which of THOSE the host disallows — always none),
+and the e2e fixture built its own list, so it tested the same empty set and
+passed. Both adapters now run one `evaluate_stream`, and `decide()` supplies the
+foreign placeholders beside the narrowing that hid them.
+
+**Reachability and resolution must answer the same question.** Making the mint
+fail closed meant no longer adding a Google host to `network_allow` —
+reachability rides the injection, so a failed mint leaves nothing reachable. That
+immediately exposed a latent gap: the DNS gate consulted only `network_allow`
+and secrets, never injections. A host the proxy was willing to intercept was one
+the guest could not look up.
+
+### Authorization and the issuer
+
+- A "read" grant allowed writes. Curated operations emitted one entry with
+  `["GET","POST"]` shared across the REST and gRPC paths, which the proxy matches
+  independently — so `timeSeries.create` was permitted under a `timeSeries.list`
+  grant, and the test suite pinned it. Methods are now bound per path.
+- Broker authorization is bounded by session LIFETIME. It checked only
+  `task_session` rows, which outlive the session, so it minted for ended sessions
+  forever. It also used the shared control-plane bearer; it has its own now.
+- Signing-key rotation was implemented and had no caller. It runs on a schedule
+  with an admin trigger, on the ADR-0098 `spawn`/`run_once` split.
+- The claims were wrong. `engrams_organization` carried the issuer URL, already
+  present in `issuer_uri`; `engrams_profile_snapshot` was `${profileId}:${sessionId}`,
+  not an immutable snapshot id. They now carry a deployment id and a content hash
+  of the compiled snapshot, persisted on `task_session`. **This is a clean
+  break**: an existing WIF pool whose attribute condition pins the issuer URL
+  must re-apply the regenerated setup.
+- A successful brokered call left no audit trace — only denials and mint
+  outcomes were logged, which this ADR's own closeout note flagged as owed. One
+  structured event per permitted request now records session, connection source,
+  target, method and query-free path.
+
+### The provider seam
+
+This ADR says the design has "no runtime branches on the provider". The first
+implementation did not hold to that: `provider === "gcp"` appeared at nine call
+sites plus a `startsWith("gcp:")` in profile save. Each was a place a second
+provider would have to be threaded through by hand.
+
+Three seams close it. `ConnectionProvider` in the orchestrator carries config
+validation, the operation catalog, grant validation, policy compilation,
+minting, the setup document, and the guest environment a credential needs to be
+findable; the registry hands each provider only its OWN grants, so the Google
+functions dropped their internal provider filters. `MetadataFlavor` replaces
+`google_adc: bool` on the wire, because that boolean conflated "does this
+session need a metadata endpoint?" with "is it Google's?"; the proxy resolves a
+flavor to a `MetadataService` through a wildcard-free `match`, so a second cloud
+is a compile error rather than a silently unserved session. And the integration
+catalog serves named-connection providers, so the web renders from the same
+table the orchestrator compiles policy from instead of a hand-maintained copy.
+
+### Lessons
+
+**A duplicated table is a security bug waiting for time to pass.** The denylist,
+the curated operation list, and the endpoint gate each existed twice. In every
+case the copies had already diverged, and in every case the divergence favoured
+the permissive side.
+
+**A test that cannot fail is worse than no test.** The placeholder-leak e2e built
+its own inputs and asserted on a set that production makes empty. It passed for
+months while the detector was unreachable. Its fixture now drives
+`SessionState::decide()`, and it fails against the old code.
+
+**Read the flake.** Four e2e tests failed about once in twenty runs behind a
+growing list of "tolerated" errors. Instrumenting each leg found three unrelated
+causes — one of them a real proxy behaviour (a normal upstream
+`Connection: close` reported as a failure of the whole intercept), the other two
+fixtures that only worked when data happened to arrive in one segment. The
+tolerated-error lists are deleted.
+
+**Column drops are two-phase in principle.** Migration 0044 dropped
+`profile.capabilities` inside the same transaction that read it. That is safe
+only pre-users, and it is already applied and therefore immutable. A later drop
+should stop writing in one release and drop in the next.
+
+### Closeout
+
+Phases 1-4 shipped in #930-#964. The remediation above shipped as four reviewed
+changes: the egress proxy hardening, the orchestrator policy and issuer work,
+the web surfaces, and the provider seam.
+
+Production smokes covered GKE, Logging, Monitoring and Trace over REST. The
+HTTP/2 leg — the one a real Google gRPC call takes — had never been exercised
+end to end; it now has two tests through `intercept::run` with ALPN on both
+legs, and a live gRPC smoke is the remaining verification before the next
+deploy.
