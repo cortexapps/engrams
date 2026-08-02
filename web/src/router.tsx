@@ -50,6 +50,7 @@ import { HarnessesPanel } from "./components/settings/HarnessesPanel";
 import { IntegrationsPanel } from "./components/settings/IntegrationsPanel";
 import { ReviewedReposPanel } from "./components/settings/ReviewedReposPanel";
 import { IntegrationDetail } from "./components/integrations/IntegrationDetail";
+import { GoogleCloudSetupPage } from "./components/integrations/GoogleCloudSetupPage";
 import { TokensPanel } from "./components/settings/TokensPanel";
 import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
@@ -318,6 +319,12 @@ const integrationDetailRoute = createRoute({
   beforeLoad: requireAdmin,
   component: IntegrationDetail,
 });
+const googleCloudSetupRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "integrations/gcp/$connectionId/setup",
+  beforeLoad: requireAdmin,
+  component: GoogleCloudSetupPage,
+});
 const profilesRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "profiles",
@@ -388,6 +395,7 @@ export const routeTree = rootRoute.addChildren([
       harnessesRoute,
       integrationsRoute,
       integrationDetailRoute,
+      googleCloudSetupRoute,
       reviewedReposRoute,
       profilesRoute,
       profilesNewRoute,

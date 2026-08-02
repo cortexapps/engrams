@@ -1,8 +1,9 @@
 import { useState } from "react";
+import { Link, useNavigate } from "@tanstack/react-router";
 import {
-  CheckCircle2Icon,
+  CheckIcon,
+  ChevronDownIcon,
   CloudIcon,
-  CopyIcon,
   PlusIcon,
   ShieldCheckIcon,
   Trash2Icon,
@@ -10,6 +11,7 @@ import {
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
   Dialog,
   DialogContent,
@@ -23,12 +25,48 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   useCreateConnection,
   useDeleteConnection,
-  useGoogleCloudSetup,
   useIntegrationConnections,
   useSetConnectionEnabled,
   useTestConnection,
 } from "@/hooks/useIntegrations";
-import type { IntegrationConnection } from "@/gen/engram/app/v1/integration_pb";
+
+const GOOGLE_API_OPTIONS = [
+  {
+    host: "logging.googleapis.com",
+    label: "Cloud Logging",
+    description: "Read log entries and log metadata.",
+  },
+  {
+    host: "monitoring.googleapis.com",
+    label: "Cloud Monitoring",
+    description: "Read metrics, time series, and monitoring metadata.",
+  },
+  {
+    host: "cloudtrace.googleapis.com",
+    label: "Cloud Trace",
+    description: "Read distributed traces.",
+  },
+  {
+    host: "container.googleapis.com",
+    label: "Google Kubernetes Engine",
+    description: "Read GKE cluster metadata and credentials.",
+  },
+  {
+    host: "compute.googleapis.com",
+    label: "Compute Engine",
+    description: "Describe or operate Compute Engine instances.",
+  },
+  {
+    host: "tunnel.cloudproxy.app",
+    label: "IAP tunnelling",
+    description: "Open an Identity-Aware Proxy TCP tunnel.",
+  },
+] as const;
+
+const ID_PATTERN = /^[a-z0-9-]{4,32}$/;
+const ALIAS_PATTERN = /^[a-z][a-z0-9-]{1,62}$/;
+const PROJECT_NUMBER_PATTERN = /^[0-9]+$/;
+const HOST_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 
 const splitHosts = (value: string) =>
   value
@@ -36,8 +74,22 @@ const splitHosts = (value: string) =>
     .map((host) => host.trim().toLowerCase())
     .filter(Boolean);
 
-const DEFAULT_ENDPOINTS =
-  "compute.googleapis.com\nlogging.googleapis.com\ncloudtrace.googleapis.com\ncontainer.googleapis.com\ntunnel.cloudproxy.app";
+export function connectionAlias(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 63)
+    .replace(/-+$/g, "");
+  if (/^[a-z]/.test(slug) && slug.length >= 2) return slug;
+  const suffix = slug || "connection";
+  return `gcp-${suffix}`.slice(0, 63).replace(/-+$/g, "");
+}
+
+function providerIdFor(alias: string): string {
+  return `engrams-${alias}`.slice(0, 32).replace(/-+$/g, "");
+}
 
 export function GoogleCloudConnectDialog({
   open,
@@ -46,24 +98,33 @@ export function GoogleCloudConnectDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
+  const navigate = useNavigate();
   const create = useCreateConnection();
-  const setup = useGoogleCloudSetup();
-  const [created, setCreated] = useState<IntegrationConnection | null>(null);
-  const [alias, setAlias] = useState("");
   const [displayName, setDisplayName] = useState("");
-  const [provider, setProvider] = useState("");
+  const [alias, setAlias] = useState("");
+  const [aliasEdited, setAliasEdited] = useState(false);
+  const [projectNumber, setProjectNumber] = useState("");
   const [serviceAccount, setServiceAccount] = useState("");
-  const [endpoints, setEndpoints] = useState(DEFAULT_ENDPOINTS);
+  const [selectedEndpoints, setSelectedEndpoints] = useState<Set<string>>(new Set());
+  const [customEndpoints, setCustomEndpoints] = useState("");
+  const [poolId, setPoolId] = useState("engrams");
+  const [providerId, setProviderId] = useState("");
+  const [providerEdited, setProviderEdited] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const reset = () => {
-    setCreated(null);
-    setAlias("");
     setDisplayName("");
-    setProvider("");
+    setAlias("");
+    setAliasEdited(false);
+    setProjectNumber("");
     setServiceAccount("");
-    setEndpoints(DEFAULT_ENDPOINTS);
+    setSelectedEndpoints(new Set());
+    setCustomEndpoints("");
+    setPoolId("engrams");
+    setProviderId("");
+    setProviderEdited(false);
+    setAdvancedOpen(false);
     create.reset();
-    setup.reset();
   };
 
   const close = () => {
@@ -71,20 +132,55 @@ export function GoogleCloudConnectDialog({
     reset();
   };
 
+  const handleNameChange = (name: string) => {
+    setDisplayName(name);
+    const nextAlias = connectionAlias(name);
+    if (!aliasEdited) setAlias(nextAlias);
+    if (!providerEdited) setProviderId(providerIdFor(aliasEdited ? alias : nextAlias));
+  };
+
+  const toggleEndpoint = (host: string) => {
+    setSelectedEndpoints((current) => {
+      const next = new Set(current);
+      if (next.has(host)) next.delete(host);
+      else next.add(host);
+      return next;
+    });
+  };
+
+  const extraEndpoints = splitHosts(customEndpoints);
+  const endpoints = [...new Set([...selectedEndpoints, ...extraEndpoints])];
+  const customEndpointsValid = extraEndpoints.every((host) => HOST_PATTERN.test(host));
+  const formValid =
+    displayName.trim().length > 0 &&
+    ALIAS_PATTERN.test(alias) &&
+    PROJECT_NUMBER_PATTERN.test(projectNumber) &&
+    ID_PATTERN.test(poolId) &&
+    ID_PATTERN.test(providerId) &&
+    serviceAccount.trim().length > 0 &&
+    endpoints.length > 0 &&
+    customEndpointsValid;
+
   const add = async () => {
     const response = await create.mutateAsync({
-      alias: alias.trim(),
+      alias,
       provider: "gcp",
       displayName: displayName.trim(),
       googleCloud: {
-        workloadIdentityProvider: provider.trim(),
+        workloadIdentityProvider:
+          `//iam.googleapis.com/projects/${projectNumber}/locations/global/` +
+          `workloadIdentityPools/${poolId}/providers/${providerId}`,
         serviceAccountEmail: serviceAccount.trim(),
-        endpoints: splitHosts(endpoints),
+        endpoints,
       },
     });
     if (!response.connection) return;
-    setCreated(response.connection);
-    await setup.mutateAsync({ id: response.connection.id });
+    const id = response.connection.id;
+    close();
+    await navigate({
+      to: "/settings/integrations/gcp/$connectionId/setup",
+      params: { connectionId: id },
+    });
   };
 
   return (
@@ -94,108 +190,170 @@ export function GoogleCloudConnectDialog({
         if (!next) close();
       }}
     >
-      <DialogContent className={created ? "max-h-[85vh] max-w-3xl overflow-y-auto" : "max-w-2xl"}>
+      <DialogContent className="max-h-[90vh] max-w-3xl overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>
-            {created ? `Configure ${created.displayName}` : "Connect Google Cloud"}
-          </DialogTitle>
+          <DialogTitle>Connect Google Cloud</DialogTitle>
           <DialogDescription>
-            {created
-              ? "Apply one setup form, then test and enable the connection."
-              : "Enter public WIF coordinates. Engrams does not accept service-account keys or deployment credentials."}
+            Choose where sessions may act. Engrams generates the keyless Google Cloud setup next.
           </DialogDescription>
         </DialogHeader>
 
-        {!created ? (
-          <>
-            <div className="grid gap-4 py-2 sm:grid-cols-2">
-              <Field label="Connection alias">
+        <div className="space-y-6 py-1">
+          <section className="space-y-3">
+            <SectionHeading number="1" title="Connection" />
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="Connection name">
                 <Input
-                  aria-label="Connection alias"
-                  value={alias}
-                  onChange={(event) => setAlias(event.target.value)}
-                  placeholder="prod-readonly"
-                />
-              </Field>
-              <Field label="Display name">
-                <Input
-                  aria-label="Display name"
+                  aria-label="Connection name"
                   value={displayName}
-                  onChange={(event) => setDisplayName(event.target.value)}
-                  placeholder="Production read only"
+                  onChange={(event) => handleNameChange(event.target.value)}
+                  placeholder="Production observer"
                 />
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  Stable alias: <code>{alias || "generated-from-name"}</code>
+                </p>
+              </Field>
+              <Field label="Google Cloud project number">
+                <Input
+                  aria-label="Google Cloud project number"
+                  inputMode="numeric"
+                  value={projectNumber}
+                  onChange={(event) => setProjectNumber(event.target.value.trim())}
+                  placeholder="123456789012"
+                />
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  Find it with{" "}
+                  <code>
+                    gcloud projects describe PROJECT_ID --format=&apos;value(projectNumber)&apos;
+                  </code>
+                  .
+                </p>
               </Field>
               <div className="sm:col-span-2">
-                <Field label="Workload identity provider resource">
+                <Field label="Service account email">
                   <Input
-                    aria-label="Workload identity provider resource"
-                    value={provider}
-                    onChange={(event) => setProvider(event.target.value)}
-                    placeholder="//iam.googleapis.com/projects/123…/providers/engrams"
-                  />
-                </Field>
-              </div>
-              <div className="sm:col-span-2">
-                <Field label="Target service-account email">
-                  <Input
-                    aria-label="Target service-account email"
+                    aria-label="Service account email"
                     value={serviceAccount}
                     onChange={(event) => setServiceAccount(event.target.value)}
                     placeholder="engrams-reader@project.iam.gserviceaccount.com"
                   />
-                </Field>
-              </div>
-              <div className="sm:col-span-2">
-                <Field label="Allowed API endpoints">
-                  <Textarea
-                    aria-label="Allowed API endpoints"
-                    value={endpoints}
-                    onChange={(event) => setEndpoints(event.target.value)}
-                    rows={4}
-                  />
                   <p className="mt-1.5 text-xs text-muted-foreground">
-                    Exact hostnames only. Remove APIs this connection does not need; keep
-                    tunnel.cloudproxy.app only when the profile can open IAP tunnels.
+                    Google IAM roles on this account control what sessions may do.
                   </p>
                 </Field>
               </div>
             </div>
-            {create.error && <p className="text-sm text-destructive">{String(create.error)}</p>}
-            <DialogFooter>
-              <Button variant="outline" onClick={close}>
-                Cancel
+          </section>
+
+          <section className="space-y-3">
+            <div>
+              <SectionHeading number="2" title="Allowed APIs" />
+              <p className="mt-1 text-xs text-muted-foreground">
+                Select only the Google services that this connection needs.
+              </p>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {GOOGLE_API_OPTIONS.map((option) => {
+                const selected = selectedEndpoints.has(option.host);
+                return (
+                  <button
+                    key={option.host}
+                    type="button"
+                    role="checkbox"
+                    aria-checked={selected}
+                    className={`flex items-start gap-3 rounded-md border p-3 text-left transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none ${
+                      selected
+                        ? "border-primary/60 bg-primary/[0.07]"
+                        : "border-border hover:bg-muted/40"
+                    }`}
+                    onClick={() => toggleEndpoint(option.host)}
+                  >
+                    <span
+                      className={`mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-sm border ${
+                        selected
+                          ? "border-primary bg-primary text-primary-foreground"
+                          : "border-input"
+                      }`}
+                    >
+                      {selected && <CheckIcon className="size-3" />}
+                    </span>
+                    <span>
+                      <span className="block text-sm font-medium">{option.label}</span>
+                      <span className="mt-0.5 block text-xs text-muted-foreground">
+                        {option.description}
+                      </span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+
+          <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+            <CollapsibleTrigger asChild>
+              <Button variant="ghost" className="w-full justify-between px-0 hover:bg-transparent">
+                Advanced settings
+                <ChevronDownIcon
+                  className={`size-4 transition-transform ${advancedOpen ? "rotate-180" : ""}`}
+                />
               </Button>
-              <Button
-                disabled={
-                  create.isPending || !alias || !displayName || !provider || !serviceAccount
-                }
-                onClick={() => void add()}
-              >
-                Create connection
-              </Button>
-            </DialogFooter>
-          </>
-        ) : (
-          <>
-            {setup.data && (
-              <div className="space-y-5">
-                <CodeBlock label="Terraform" value={setup.data.terraform} />
-                <CodeBlock label="gcloud" value={setup.data.gcloudScript} />
-                <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                  <CheckCircle2Icon className="size-4" /> Allowed audience:{" "}
-                  <code>{setup.data.audience}</code>
-                </div>
+            </CollapsibleTrigger>
+            <CollapsibleContent className="space-y-4 border-t pt-4">
+              <div className="grid gap-4 sm:grid-cols-3">
+                <Field label="Connection alias">
+                  <Input
+                    aria-label="Connection alias"
+                    value={alias}
+                    onChange={(event) => {
+                      setAliasEdited(true);
+                      setAlias(event.target.value);
+                      if (!providerEdited) setProviderId(providerIdFor(event.target.value));
+                    }}
+                  />
+                </Field>
+                <Field label="WIF pool ID">
+                  <Input
+                    aria-label="WIF pool ID"
+                    value={poolId}
+                    onChange={(event) => setPoolId(event.target.value)}
+                  />
+                </Field>
+                <Field label="WIF provider ID">
+                  <Input
+                    aria-label="WIF provider ID"
+                    value={providerId}
+                    onChange={(event) => {
+                      setProviderEdited(true);
+                      setProviderId(event.target.value);
+                    }}
+                  />
+                </Field>
               </div>
-            )}
-            {setup.isPending && <p className="text-sm text-muted-foreground">Generating setup…</p>}
-            {setup.error && <p className="text-sm text-destructive">{String(setup.error)}</p>}
-            <DialogFooter>
-              <Button variant="outline" onClick={close}>
-                Close
-              </Button>
-            </DialogFooter>
-          </>
-        )}
+              <Field label="Other allowed API hostnames">
+                <Textarea
+                  aria-label="Other allowed API hostnames"
+                  value={customEndpoints}
+                  onChange={(event) => setCustomEndpoints(event.target.value)}
+                  rows={3}
+                  placeholder="artifactregistry.googleapis.com"
+                />
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  Enter exact hostnames only. Google STS and OAuth endpoints are always blocked.
+                </p>
+              </Field>
+            </CollapsibleContent>
+          </Collapsible>
+        </div>
+
+        {create.error && <p className="text-sm text-destructive">{String(create.error)}</p>}
+        <DialogFooter>
+          <Button variant="outline" onClick={close}>
+            Cancel
+          </Button>
+          <Button disabled={create.isPending || !formValid} onClick={() => void add()}>
+            Create and continue
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );
@@ -206,20 +364,11 @@ export function GoogleCloudConnections() {
   const remove = useDeleteConnection();
   const test = useTestConnection();
   const enable = useSetConnectionEnabled();
-  const setup = useGoogleCloudSetup();
   const [adding, setAdding] = useState(false);
-  const [setupFor, setSetupFor] = useState<IntegrationConnection | null>(null);
   const [result, setResult] = useState<string | null>(null);
   const connections = (data?.connections ?? []).filter(
     (connection) => connection.provider === "gcp",
   );
-
-  const openSetup = async (connection: IntegrationConnection) => {
-    setSetupFor(connection);
-    setResult(null);
-    setup.reset();
-    await setup.mutateAsync({ id: connection.id });
-  };
 
   return (
     <section className="overflow-hidden rounded-lg border bg-card">
@@ -274,8 +423,13 @@ export function GoogleCloudConnections() {
               </p>
             </div>
             <div className="flex items-center gap-2">
-              <Button variant="outline" size="sm" onClick={() => void openSetup(connection)}>
-                Setup
+              <Button asChild variant="outline" size="sm">
+                <Link
+                  to="/settings/integrations/gcp/$connectionId/setup"
+                  params={{ connectionId: connection.id }}
+                >
+                  Setup
+                </Link>
               </Button>
               <Button
                 variant="outline"
@@ -311,34 +465,18 @@ export function GoogleCloudConnections() {
       {result && <p className="border-t px-5 py-3 text-xs text-muted-foreground">{result}</p>}
 
       <GoogleCloudConnectDialog open={adding} onOpenChange={setAdding} />
-
-      <Dialog open={setupFor !== null} onOpenChange={(open) => !open && setSetupFor(null)}>
-        <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle>Configure {setupFor?.displayName}</DialogTitle>
-            <DialogDescription>
-              Apply one setup form, then test and enable the connection.
-            </DialogDescription>
-          </DialogHeader>
-          {setup.data && (
-            <div className="space-y-5">
-              <CodeBlock label="Terraform" value={setup.data.terraform} />
-              <CodeBlock label="gcloud" value={setup.data.gcloudScript} />
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <CheckCircle2Icon className="size-4" /> Allowed audience:{" "}
-                <code>{setup.data.audience}</code>
-              </div>
-            </div>
-          )}
-          {setup.isPending && <p className="text-sm text-muted-foreground">Generating setup…</p>}
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setSetupFor(null)}>
-              Close
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </section>
+  );
+}
+
+function SectionHeading({ number, title }: { number: string; title: string }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="flex size-5 items-center justify-center rounded-full border font-mono text-[10px] text-muted-foreground">
+        {number}
+      </span>
+      <h3 className="text-sm font-semibold">{title}</h3>
+    </div>
   );
 }
 
@@ -348,21 +486,5 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       {label}
       {children}
     </label>
-  );
-}
-
-function CodeBlock({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <div className="mb-2 flex items-center justify-between">
-        <span className="text-xs font-medium">{label}</span>
-        <Button variant="ghost" size="sm" onClick={() => void navigator.clipboard.writeText(value)}>
-          <CopyIcon className="size-3.5" /> Copy
-        </Button>
-      </div>
-      <pre className="overflow-x-auto rounded-md border bg-muted/40 p-3 text-[11px] leading-5">
-        <code>{value}</code>
-      </pre>
-    </div>
   );
 }

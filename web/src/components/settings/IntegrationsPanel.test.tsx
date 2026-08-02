@@ -14,6 +14,7 @@ import userEvent from "@testing-library/user-event";
 import { createRouterTransport } from "@connectrpc/connect";
 import { renderWithProviders } from "../../test-utils";
 import { IntegrationsPanel } from "./IntegrationsPanel";
+import { GoogleCloudSetupWorkspace } from "../integrations/GoogleCloudSetupPage";
 import {
   IntegrationService,
   type Connector,
@@ -28,7 +29,12 @@ interface Caps {
   puts: Array<{ name: string; value: string }>;
   upserts: string[];
   mints: Array<{ provider: string; kind: string; values: Record<string, string> }>;
-  connectionCreates: Array<{ alias: string; serviceAccountEmail: string; endpoints: string[] }>;
+  connectionCreates: Array<{
+    alias: string;
+    workloadIdentityProvider: string;
+    serviceAccountEmail: string;
+    endpoints: string[];
+  }>;
 }
 
 const CATALOG = [
@@ -122,6 +128,7 @@ function installTransport(options: { connections?: IntegrationConnection[] } = {
       createConnection: (req) => {
         connectionCreates.push({
           alias: req.alias,
+          workloadIdentityProvider: req.googleCloud?.workloadIdentityProvider ?? "",
           serviceAccountEmail: req.googleCloud?.serviceAccountEmail ?? "",
           endpoints: [...(req.googleCloud?.endpoints ?? [])],
         });
@@ -256,7 +263,7 @@ describe("IntegrationsPanel (marketplace)", () => {
     expect(puts).toContainEqual({ name: "sentry-token", value: "sk-live-abc" });
   });
 
-  test("adds a keyless Google Cloud connection and shows generated setup", async () => {
+  test("creates a keyless Google Cloud connection from familiar project inputs", async () => {
     const { transport, connectionCreates } = installTransport();
     renderWithProviders(<IntegrationsPanel />, { transport });
     const user = userEvent.setup();
@@ -264,32 +271,56 @@ describe("IntegrationsPanel (marketplace)", () => {
     const googleCloud = await screen.findByRole("group", { name: "Google Cloud integration" });
     await user.click(within(googleCloud).getByRole("button", { name: /^connect$/i }));
     expect(screen.getByRole("heading", { name: "Connect Google Cloud" })).toBeTruthy();
-    await user.type(screen.getByLabelText(/connection alias/i), "prod-readonly");
-    await user.type(screen.getByLabelText(/display name/i), "Production read only");
+    await user.type(screen.getByLabelText(/connection name/i), "Production read only");
+    await user.type(screen.getByLabelText(/google cloud project number/i), "123");
     await user.type(
-      screen.getByLabelText(/workload identity provider resource/i),
-      "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
-    );
-    await user.type(
-      screen.getByLabelText(/target service-account email/i),
+      screen.getByLabelText(/service account email/i),
       "reader@customer.iam.gserviceaccount.com",
     );
-    await user.click(screen.getByRole("button", { name: /create connection/i }));
+    await user.click(screen.getByRole("checkbox", { name: /cloud logging/i }));
+    await user.click(screen.getByRole("checkbox", { name: /cloud trace/i }));
+    await user.click(screen.getByRole("button", { name: /create and continue/i }));
 
     await waitFor(() => expect(connectionCreates).toHaveLength(1));
     expect(connectionCreates[0]).toEqual({
-      alias: "prod-readonly",
+      alias: "production-read-only",
+      workloadIdentityProvider:
+        "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/engrams-production-read-only",
       serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
-      endpoints: [
-        "compute.googleapis.com",
-        "logging.googleapis.com",
-        "cloudtrace.googleapis.com",
-        "container.googleapis.com",
-        "tunnel.cloudproxy.app",
-      ],
+      endpoints: ["logging.googleapis.com", "cloudtrace.googleapis.com"],
     });
-    expect(await screen.findByText("Terraform")).toBeTruthy();
-    expect(screen.getByText(/google_iam_workload_identity_pool/)).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Connect Google Cloud" })).toBeNull();
+  });
+
+  test("shows generated Google Cloud setup in a tabbed workspace", async () => {
+    const connection = {
+      id: "connection-1",
+      alias: "prod-readonly",
+      provider: "gcp",
+      displayName: "Production read only",
+      enabled: false,
+      testedAt: "",
+      createdAt: "",
+      updatedAt: "",
+      googleCloud: {
+        workloadIdentityProvider:
+          "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
+        serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
+        endpoints: ["logging.googleapis.com"],
+      },
+    } as IntegrationConnection;
+    const { transport } = installTransport({ connections: [connection] });
+    renderWithProviders(<GoogleCloudSetupWorkspace connectionId="connection-1" />, { transport });
+    const user = userEvent.setup();
+
+    expect(
+      await screen.findByRole("heading", { name: "Set up Production read only" }),
+    ).toBeTruthy();
+    expect(await screen.findByText(/google_iam_workload_identity_pool/)).toBeTruthy();
+    expect(screen.queryByText(/gcloud iam workload-identity-pools create/)).toBeNull();
+
+    await user.click(screen.getByRole("tab", { name: /gcloud/i }));
+    expect(await screen.findByText(/gcloud iam workload-identity-pools create/)).toBeTruthy();
   });
 
   test("shows configured Google Cloud as a connected provider card", async () => {

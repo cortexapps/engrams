@@ -137,8 +137,12 @@ export function useSetConnectionEnabled() {
   return useMutation(setConnectionEnabled, { onSuccess: invalidate });
 }
 
-export function useGoogleCloudSetup() {
-  return useMutation(getGoogleCloudSetup);
+export function useGoogleCloudSetup(id: string) {
+  return useQuery(
+    getGoogleCloudSetup,
+    { id },
+    { enabled: id.length > 0, staleTime: Number.POSITIVE_INFINITY },
+  );
 }
 
 /**
