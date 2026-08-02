@@ -25,6 +25,9 @@ function constrainedPaths(operation: string, defaults: string[], constraints: re
     "compute.instances.start": /^\/compute\/v1\/projects\/[^/]+\/zones\/[^/]+\/instances\/[^/?]+\/start(?:\?.*)?$/,
     "compute.instances.stop": /^\/compute\/v1\/projects\/[^/]+\/zones\/[^/]+\/instances\/[^/?]+\/stop(?:\?.*)?$/,
     "trace.traces.list": /^\/v1\/projects\/[^/?]+\/traces(?:\?.*)?$/,
+    "trace.traces.get": /^\/v1\/projects\/[^/?]+\/traces\/[^/?]+(?:\?.*)?$/,
+    "monitoring.metricdescriptors.list": /^\/v3\/projects\/[^/?]+\/metricDescriptors(?:\?.*)?$/,
+    "monitoring.timeseries.list": /^\/v3\/projects\/[^/?]+\/timeSeries(?:\?.*)?$/,
     "container.clusters.get": /^\/v1\/projects\/[^/]+\/locations\/[^/]+\/clusters\/[^/?]+(?:\?.*)?$/,
     "iap.tunnel": /^\/v4\/connect(?:\?.*)?$/,
   };
@@ -82,7 +85,25 @@ const CURATED_GOOGLE_OPERATIONS: Record<string, GoogleOperationPolicy> = {
   "trace.traces.list": {
     host: "cloudtrace.googleapis.com",
     methods: ["GET"],
-    paths: ["/v1/projects/*/traces*"],
+    paths: ["/v1/projects/*/traces"],
+  },
+  "trace.traces.get": {
+    host: "cloudtrace.googleapis.com",
+    methods: ["GET"],
+    paths: ["/v1/projects/*/traces/*"],
+  },
+  "monitoring.metricdescriptors.list": {
+    host: "monitoring.googleapis.com",
+    methods: ["GET", "POST"],
+    paths: [
+      "/v3/projects/*/metricDescriptors",
+      "/google.monitoring.v3.MetricService/ListMetricDescriptors",
+    ],
+  },
+  "monitoring.timeseries.list": {
+    host: "monitoring.googleapis.com",
+    methods: ["GET", "POST"],
+    paths: ["/v3/projects/*/timeSeries", "/google.monitoring.v3.MetricService/ListTimeSeries"],
   },
   "container.clusters.get": {
     host: "container.googleapis.com",

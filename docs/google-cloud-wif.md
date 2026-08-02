@@ -37,6 +37,13 @@ Common endpoints are `compute.googleapis.com`, `logging.googleapis.com`,
 7. Enable the connection only after the test passes.
 8. Add the connection operations to a profile.
 
+Use curated read operations when they cover the API call. Cloud Logging,
+Cloud Trace list and detail, Cloud Monitoring metric descriptors and time
+series, Compute Engine instance reads, and GKE cluster metadata all have
+dedicated operations. Reserve `api.call` for APIs without a curated operation;
+it permits calls to every configured `*.googleapis.com` endpoint, subject to
+the target service account's Google IAM policy.
+
 Disabling, editing, or deleting a connection affects new sessions. An active
 session keeps its immutable launch-time connection snapshot and can refresh from
 that snapshot until it ends. To stop active sessions, revoke the Google-side WIF

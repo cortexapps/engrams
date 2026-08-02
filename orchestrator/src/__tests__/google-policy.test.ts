@@ -11,7 +11,11 @@ function policy(): IntegrationPolicyJson {
   return { network: { default: "deny", allow_hosts: [], allow_host_patterns: [] }, secrets: [], injects: [], observes: [], google_adc: false };
 }
 
-function grant(operation: string, resourceConstraints: string[] = []): ResolvedIntegrationGrant {
+function grant(
+  operation: string,
+  resourceConstraints: string[] = [],
+  endpoints = ["compute.googleapis.com", "logging.googleapis.com"],
+): ResolvedIntegrationGrant {
   return {
     grant: { connectionId: "connection-1", operation, resourceConstraints },
     connection: {
@@ -23,7 +27,7 @@ function grant(operation: string, resourceConstraints: string[] = []): ResolvedI
       config: {
         workloadIdentityProvider: "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
         serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
-        endpoints: ["compute.googleapis.com", "logging.googleapis.com"],
+        endpoints,
       },
       enabled: true,
       testedAt: new Date(0),
@@ -73,6 +77,26 @@ describe("Google egress policy", () => {
       }],
       store,
     )).rejects.toMatchObject({ code: Code.InvalidArgument });
+
+    const observerReads = await resolveIntegrationGrants(
+      [
+        {
+          connectionId: connection.id,
+          operation: "monitoring.metricdescriptors.list",
+          resourceConstraints: [],
+        },
+        {
+          connectionId: connection.id,
+          operation: "monitoring.timeseries.list",
+          resourceConstraints: [],
+        },
+      ],
+      store,
+    );
+    expect(observerReads.map(({ grant: resolved }) => resolved.operation)).toEqual([
+      "monitoring.metricdescriptors.list",
+      "monitoring.timeseries.list",
+    ]);
   });
 
   test("compiles an exact operation and constrained API path", () => {
@@ -111,6 +135,73 @@ describe("Google egress policy", () => {
         "segment:/google.logging.v2.LoggingServiceV2/ListLogEntries",
       ],
     });
+  });
+
+  test("curates Monitoring reads to list-only REST and gRPC methods", () => {
+    const output = policy();
+    const descriptors = grant(
+      "monitoring.metricdescriptors.list",
+      [],
+      ["monitoring.googleapis.com"],
+    );
+    const timeSeries = grant("monitoring.timeseries.list", [], ["monitoring.googleapis.com"]);
+
+    appendGooglePolicy(output, [descriptors, timeSeries]);
+
+    expect(output.injects).toEqual([
+      expect.objectContaining({
+        hosts: ["monitoring.googleapis.com"],
+        methods: ["GET", "POST"],
+        path_globs: [
+          "segment:/v3/projects/*/metricDescriptors",
+          "segment:/google.monitoring.v3.MetricService/ListMetricDescriptors",
+        ],
+      }),
+      expect.objectContaining({
+        hosts: ["monitoring.googleapis.com"],
+        methods: ["GET", "POST"],
+        path_globs: [
+          "segment:/v3/projects/*/timeSeries",
+          "segment:/google.monitoring.v3.MetricService/ListTimeSeries",
+        ],
+      }),
+    ]);
+  });
+
+  test("separates Trace list and detail paths", () => {
+    const output = policy();
+    const list = grant("trace.traces.list", [], ["cloudtrace.googleapis.com"]);
+    const get = grant("trace.traces.get", [], ["cloudtrace.googleapis.com"]);
+
+    appendGooglePolicy(output, [list, get]);
+
+    expect(output.injects.map((entry) => entry.path_globs)).toEqual([
+      ["segment:/v1/projects/*/traces"],
+      ["segment:/v1/projects/*/traces/*"],
+    ]);
+  });
+
+  test("validates project-scoped observer constraints", () => {
+    const monitoring = grant(
+      "monitoring.timeseries.list",
+      ["/v3/projects/cortex-internal-tooling/timeSeries"],
+      ["monitoring.googleapis.com"],
+    );
+    expect(() => appendGooglePolicy(policy(), [monitoring])).not.toThrow();
+
+    const trace = grant(
+      "trace.traces.get",
+      ["/v1/projects/cortex-internal-tooling/traces/trace-1"],
+      ["cloudtrace.googleapis.com"],
+    );
+    expect(() => appendGooglePolicy(policy(), [trace])).not.toThrow();
+
+    const invalid = grant(
+      "monitoring.timeseries.list",
+      ["/v3/projects/cortex-internal-tooling/timeSeries/credential-producing-action"],
+      ["monitoring.googleapis.com"],
+    );
+    expect(() => appendGooglePolicy(policy(), [invalid])).toThrow(/not a valid/);
   });
 
   test("broad API access remains limited to configured googleapis hosts", () => {
