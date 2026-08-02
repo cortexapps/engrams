@@ -8,17 +8,9 @@ import type {
   IntegrationConnectionRow,
   IntegrationConnectionStore,
 } from "../db/integration-connections.ts";
+import { connectionProvider } from "./providers/index.ts";
 
 const OPERATION_RE = /^[a-z][a-z0-9_.-]*(?::[a-z][a-z0-9_.-]*)*$/;
-
-/** Credential-producing Google operations remain blocked at every layer. */
-export const FORBIDDEN_GOOGLE_OPERATIONS = new Set([
-  "iam.serviceaccountkeys.create",
-  "iam.generateaccesstoken",
-  "iam.generateidtoken",
-  "iam.signblob",
-  "iam.signjwt",
-]);
 
 export interface ResolvedIntegrationGrant {
   grant: ProfileIntegrationGrant;
@@ -120,12 +112,14 @@ export async function resolveIntegrationGrants(
         Code.InvalidArgument,
       );
     }
-    if (
-      connection.provider === "gcp" &&
-      FORBIDDEN_GOOGLE_OPERATIONS.has(grant.operation)
-    ) {
+    // A provider decides which of its own operations can mint a credential
+    // outliving the session. Those are refused here, before anything is
+    // stored; the egress proxy refuses the same surfaces again at request time
+    // from its own table.
+    const provider = connectionProvider(connection.provider);
+    if (provider?.operations.forbidden.has(grant.operation)) {
       throw new ConnectError(
-        `Google Cloud operation "${grant.operation}" can produce credentials and is not allowed`,
+        `${provider.displayName} operation "${grant.operation}" can produce credentials and is not allowed`,
         Code.InvalidArgument,
       );
     }

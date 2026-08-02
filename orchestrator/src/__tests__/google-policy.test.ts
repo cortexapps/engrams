@@ -7,12 +7,10 @@ import {
   appendGooglePolicy,
   validateGoogleGrants,
   CURATED_GOOGLE_OPERATIONS,
+  FORBIDDEN_GOOGLE_OPERATIONS,
   GOOGLE_PASSTHROUGH_OPERATIONS,
 } from "../integrations/google-policy.ts";
-import {
-  FORBIDDEN_GOOGLE_OPERATIONS,
-  resolveIntegrationGrants,
-} from "../integrations/grants.ts";
+import { resolveIntegrationGrants } from "../integrations/grants.ts";
 import type { ResolvedIntegrationGrant } from "../integrations/grants.ts";
 
 function policy(): IntegrationPolicyJson {

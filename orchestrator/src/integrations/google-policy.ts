@@ -104,6 +104,22 @@ export const CURATED_GOOGLE_OPERATIONS: Record<string, GoogleOperationPolicy> = 
 };
 
 /** The broad pass-through operations that take free-form path constraints. */
+/**
+ * Credential-producing Google operations, refused at GRANT time.
+ *
+ * The egress proxy refuses the same surfaces again at request time from its own
+ * checked-in table (`crates/engram-egress-proxy/policy/`). Two independent
+ * enforcement points on purpose: this one keeps an unusable grant out of the
+ * database, and that one holds even if a grant somehow reaches a session.
+ */
+export const FORBIDDEN_GOOGLE_OPERATIONS: ReadonlySet<string> = new Set([
+  "iam.serviceaccountkeys.create",
+  "iam.generateaccesstoken",
+  "iam.generateidtoken",
+  "iam.signblob",
+  "iam.signjwt",
+]);
+
 export const GOOGLE_PASSTHROUGH_OPERATIONS = ["api.call", "gke.api.call"] as const;
 
 function isPassthroughOperation(operation: string): boolean {
@@ -207,10 +223,12 @@ function matchersOverlap(a: IntegrationInjectJson, b: IntegrationInjectJson): bo
  * admin edits) never blocks unrelated edits of a granting profile. Connection
  * STATE (enabled, endpoint membership, config validity) is enforced at
  * session-create by `appendGooglePolicy`.
+ *
+ * Reached through the provider registry, which passes only the grants whose
+ * connection is Google — hence no provider test in the loop.
  */
 export function validateGoogleGrants(resolved: readonly ResolvedIntegrationGrant[]): void {
-  for (const { grant, connection } of resolved) {
-    if (connection.provider !== "gcp") continue;
+  for (const { grant } of resolved) {
     const curated = CURATED_GOOGLE_OPERATIONS[grant.operation];
     if (!curated && !isPassthroughOperation(grant.operation)) {
       throw new ConnectError(
@@ -239,7 +257,6 @@ export function appendGooglePolicy(
 ): void {
   validateGoogleGrants(resolved);
   for (const { grant, connection } of resolved) {
-    if (connection.provider !== "gcp") continue;
     if (!connection.enabled) {
       throw new ConnectError(
         `Google Cloud connection "${connection.alias}" is disabled`,

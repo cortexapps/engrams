@@ -41,6 +41,13 @@ import {
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import { makeIntegrationOidcKeyStore } from "../db/integration-oidc-keys.ts";
 import { assertGoogleCloudConfig, makeGoogleWifBroker } from "../integrations/google-wif.ts";
+import {
+  connectionProvider,
+  connectionProviders,
+  makeConnectionProviders,
+  type ConnectionProvider,
+} from "../integrations/providers/index.ts";
+import { makeGoogleProvider } from "../integrations/providers/google.ts";
 import { googleOidcIssuer } from "../routes/google-oidc.ts";
 
 /** Logo upload cap — comfortably fits an SVG (KBs) or a square PNG at icon size. */
@@ -102,6 +109,8 @@ export interface IntegrationDeps {
   issuer?: string;
   /** Deployment identity emitted as the `engrams_organization` claim. */
   deploymentId?: string;
+  /** Override the whole provider registry (a suite with its own providers). */
+  providers?: ReadonlyMap<string, ConnectionProvider>;
 }
 
 async function requireAdmin(ctx: HandlerContext, getSession: GetSession): Promise<void> {
@@ -156,25 +165,66 @@ function statusOf(c: Connector, names: Set<string>, requiredByKind: Map<string, 
   return connectorStatus(c, names, required);
 }
 
-function googleConfigFromProto(value: {
+/**
+ * Where each provider's configuration sits on the wire.
+ *
+ * The proto carries a TYPED message per provider, not an opaque struct, so
+ * some mapping from a provider key to a wire field is unavoidable. This table
+ * is deliberately the ONLY place it exists: everything downstream — validation,
+ * policy compilation, minting, setup — goes through the provider itself.
+ */
+const PROTO_CONFIG_BY_PROVIDER: Record<string, ProtoConfigCodec> = {
+  gcp: {
+    read: (req) =>
+      req.googleCloud && {
+        workloadIdentityProvider: req.googleCloud.workloadIdentityProvider,
+        serviceAccountEmail: req.googleCloud.serviceAccountEmail,
+        endpoints: req.googleCloud.endpoints,
+      },
+    write: (config) => {
+      const google = assertGoogleCloudConfig(config);
+      return {
+        googleCloud: {
+          workloadIdentityProvider: google.workloadIdentityProvider,
+          serviceAccountEmail: google.serviceAccountEmail,
+          endpoints: google.endpoints,
+        },
+      };
+    },
+  },
+};
+
+interface ProtoConfigCodec {
+  read(req: { googleCloud?: GoogleCloudProtoConfig }): Record<string, unknown> | undefined;
+  write(config: Record<string, unknown>): { googleCloud?: GoogleCloudProtoConfig };
+}
+
+interface GoogleCloudProtoConfig {
   workloadIdentityProvider: string;
   serviceAccountEmail: string;
   endpoints: string[];
-} | undefined): GoogleCloudConnectionConfig {
-  if (!value) throw new ConnectError("google_cloud config is required", Code.InvalidArgument);
+}
+
+/** Read a request's provider config off the wire and validate it. */
+function configFromProto(
+  provider: ConnectionProvider,
+  req: { googleCloud?: GoogleCloudProtoConfig },
+): Record<string, unknown> {
+  const raw = PROTO_CONFIG_BY_PROVIDER[provider.key]?.read(req);
+  if (!raw) {
+    throw new ConnectError(`${provider.key} config is required`, Code.InvalidArgument);
+  }
   try {
-    return assertGoogleCloudConfig({
-      workloadIdentityProvider: value.workloadIdentityProvider,
-      serviceAccountEmail: value.serviceAccountEmail,
-      endpoints: value.endpoints,
-    });
+    return provider.validateConfig(raw);
   } catch (error) {
     throw new ConnectError(errorMessage(error), Code.InvalidArgument);
   }
 }
 
 function connectionToProto(row: IntegrationConnectionRow) {
-  const google = row.provider === "gcp" ? assertGoogleCloudConfig(row.config) : undefined;
+  // A row whose provider is no longer registered still has to serialize — an
+  // operator must be able to SEE it in order to delete it.
+  const config = PROTO_CONFIG_BY_PROVIDER[row.provider]?.write(row.config) ?? {};
   return {
     id: row.id,
     alias: row.alias,
@@ -185,11 +235,7 @@ function connectionToProto(row: IntegrationConnectionRow) {
     testedAt: row.testedAt?.toISOString() ?? "",
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
-    googleCloud: google ? {
-      workloadIdentityProvider: google.workloadIdentityProvider,
-      serviceAccountEmail: google.serviceAccountEmail,
-      endpoints: google.endpoints,
-    } : undefined,
+    ...config,
   };
 }
 
@@ -200,104 +246,38 @@ function assertConnectionNames(alias: string, displayName: string): void {
   if (!displayName.trim()) throw new ConnectError("display_name is required", Code.InvalidArgument);
 }
 
-function assertGoogleIssuerAvailable(issuer: string): void {
-  let url: URL;
-  try {
-    url = new URL(issuer);
-  } catch {
-    throw new ConnectError("Google Cloud WIF requires a valid public issuer URL", Code.FailedPrecondition);
-  }
-  if (url.protocol !== "https:") {
+
+/**
+ * The provider a request names, or a clear rejection.
+ *
+ * These RPCs used to hard-code `"gcp"`. A provider key that is not registered
+ * is an unknown provider, not a malformed request, so it reads as NotFound on
+ * a lookup and InvalidArgument on a create.
+ */
+function requireProviderIn(
+  providers: ReadonlyMap<string, ConnectionProvider>,
+  key: string,
+): ConnectionProvider {
+  const provider = providers.get(key);
+  if (!provider) {
     throw new ConnectError(
-      "Google Cloud WIF requires ORCHESTRATOR_PUBLIC_URL to use public HTTPS",
-      Code.FailedPrecondition,
+      `unknown connection provider "${key}"`,
+      Code.InvalidArgument,
     );
   }
-  if (url.username || url.password || !url.hostname) {
-    throw new ConnectError(
-      "Google Cloud WIF requires a public issuer without URL credentials",
-      Code.FailedPrecondition,
-    );
-  }
+  return provider;
 }
 
-function googleSetup(row: IntegrationConnectionRow, issuer: string, deploymentId: string): {
-  audience: string;
-  gcloudScript: string;
-  terraform: string;
-} {
-  const google = assertGoogleCloudConfig(row.config);
-  const match = google.workloadIdentityProvider.match(
-    /^\/\/iam\.googleapis\.com\/projects\/([0-9]+)\/locations\/global\/workloadIdentityPools\/([a-z0-9-]+)\/providers\/([a-z0-9-]+)$/,
-  );
-  if (!match) throw new Error("stored Google provider resource is invalid");
-  const [, projectNumber, poolId, providerId] = match;
-  // Terraform resource names are addresses, not labels: two connections in the
-  // same project used to emit `google_iam_workload_identity_pool.engrams`
-  // twice, so applying the second setup silently redefined the first. Derive
-  // the address from the provider id, which is already unique per connection.
-  const tfName = `engrams_${providerId!.replace(/-/g, "_")}`;
-  // `engrams_organization` carries the deployment id (the issuer URL already
-  // rides in `issuer_uri`, so pinning the URL again added nothing).
-  const condition =
-    `assertion.engrams_organization == '${deploymentId}' && ` +
-    `assertion.engrams_connection == '${row.id}'`;
-  const mapping =
-    "google.subject=assertion.sub," +
-    "attribute.engrams_organization=assertion.engrams_organization," +
-    "attribute.engrams_connection=assertion.engrams_connection";
-  const principalSet =
-    `principalSet://iam.googleapis.com/projects/${projectNumber}/locations/global/` +
-    `workloadIdentityPools/${poolId}/attribute.engrams_connection/${row.id}`;
-  return {
-    audience: google.workloadIdentityProvider,
-    // An operator pastes this into a shell. Without a shebang the lines run
-    // under whatever shell they happen to use, and without `set -euo pipefail`
-    // a failed pool creation is invisible: the next command runs anyway and the
-    // script "succeeds" with a half-built pool. Pool and provider creation are
-    // describe-then-create so re-running the setup — the normal thing to do
-    // after editing endpoints — is not an ALREADY_EXISTS error.
-    gcloudScript: [
-      `#!/usr/bin/env bash`,
-      `set -euo pipefail`,
-      ``,
-      `gcloud iam workload-identity-pools describe ${poolId} --location=global --project=${projectNumber} >/dev/null 2>&1 ||`,
-      `  gcloud iam workload-identity-pools create ${poolId} --location=global --project=${projectNumber}`,
-      ``,
-      `gcloud iam workload-identity-pools providers describe ${providerId} --location=global --workload-identity-pool=${poolId} --project=${projectNumber} >/dev/null 2>&1 ||`,
-      `  gcloud iam workload-identity-pools providers create-oidc ${providerId} --location=global --workload-identity-pool=${poolId} --project=${projectNumber} --issuer-uri=${issuer} --allowed-audiences=${google.workloadIdentityProvider} --attribute-mapping=${mapping} --attribute-condition=\"${condition}\"`,
-      ``,
-      `gcloud iam service-accounts add-iam-policy-binding ${google.serviceAccountEmail} --project=${projectNumber} --role=roles/iam.workloadIdentityUser --member=${principalSet}`,
-    ].join("\n"),
-    terraform: [
-      `resource "google_iam_workload_identity_pool" "${tfName}" {`,
-      `  project                   = "${projectNumber}"`,
-      `  workload_identity_pool_id = "${poolId}"`,
-      `}`,
-      ``,
-      `resource "google_iam_workload_identity_pool_provider" "${tfName}" {`,
-      `  project                            = "${projectNumber}"`,
-      `  workload_identity_pool_id          = google_iam_workload_identity_pool.${tfName}.workload_identity_pool_id`,
-      `  workload_identity_pool_provider_id = "${providerId}"`,
-      `  attribute_mapping = {`,
-      `    "google.subject"                 = "assertion.sub"`,
-      `    "attribute.engrams_organization" = "assertion.engrams_organization"`,
-      `    "attribute.engrams_connection"   = "assertion.engrams_connection"`,
-      `  }`,
-      `  attribute_condition = "${condition}"`,
-      `  oidc {`,
-      `    issuer_uri        = "${issuer}"`,
-      `    allowed_audiences = ["${google.workloadIdentityProvider}"]`,
-      `  }`,
-      `}`,
-      ``,
-      `resource "google_service_account_iam_member" "${tfName}" {`,
-      `  service_account_id = "projects/${projectNumber}/serviceAccounts/${google.serviceAccountEmail}"`,
-      `  role               = "roles/iam.workloadIdentityUser"`,
-      `  member             = "${principalSet}"`,
-      `}`,
-    ].join("\n"),
-  };
+/** Load a connection row along with its provider, or NotFound. */
+async function requireConnectionIn(
+  providers: ReadonlyMap<string, ConnectionProvider>,
+  connections: IntegrationConnectionStore,
+  id: string,
+): Promise<{ row: IntegrationConnectionRow; provider: ConnectionProvider }> {
+  const row = await connections.get(id);
+  const provider = row ? providers.get(row.provider) : undefined;
+  if (!row || !provider) throw new ConnectError("connection not found", Code.NotFound);
+  return { row, provider };
 }
 
 export function registerIntegration(router: ConnectRouter, deps?: IntegrationDeps): void {
@@ -313,11 +293,13 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
   const now = deps?.now ?? (() => new Date());
   const issuer = deps?.issuer ?? googleOidcIssuer();
   const deploymentId = deps?.deploymentId ?? config.deploymentId;
-  const googleExchange = deps?.googleExchange ?? makeGoogleWifBroker({
-    keys: makeIntegrationOidcKeyStore(getDb()),
-    issuer,
-    now,
-  }).exchange;
+  // Tests inject a stub exchange; production takes the shared registry.
+  const providers = deps?.providers ??
+    (deps?.googleExchange
+      ? makeConnectionProviders([makeGoogleProvider({ exchange: deps.googleExchange })])
+      : connectionProviders());
+  const requireProvider = (key: string) => requireProviderIn(providers, key);
+  const requireConnection = (id: string) => requireConnectionIn(providers, connections, id);
 
   router.service(IntegrationService, {
     async listConnectors(_req, ctx) {
@@ -555,35 +537,29 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
 
     async createConnection(req, ctx) {
       await requireAdmin(ctx, getSession);
-      assertGoogleIssuerAvailable(issuer);
-      if (req.provider !== "gcp") {
-        throw new ConnectError('provider must be "gcp"', Code.InvalidArgument);
-      }
+      const provider = requireProvider(req.provider);
+      provider.assertDeploymentReady?.({ issuer, deploymentId });
       assertConnectionNames(req.alias, req.displayName);
-      const google = googleConfigFromProto(req.googleCloud);
+      const config = configFromProto(provider, req);
       const row = await connections.create({
         alias: req.alias,
-        provider: "gcp",
+        provider: provider.key,
         displayName: req.displayName.trim(),
-        config: { ...google },
+        config,
       });
       return { connection: connectionToProto(row) };
     },
 
     async updateConnection(req, ctx) {
       await requireAdmin(ctx, getSession);
-      assertGoogleIssuerAvailable(issuer);
       assertConnectionNames(req.alias, req.displayName);
-      const current = await connections.get(req.id);
-      if (!current) throw new ConnectError("connection not found", Code.NotFound);
-      if (current.provider !== "gcp") {
-        throw new ConnectError("only Google Cloud connections can be updated here", Code.InvalidArgument);
-      }
-      const google = googleConfigFromProto(req.googleCloud);
+      const { provider } = await requireConnection(req.id);
+      provider.assertDeploymentReady?.({ issuer, deploymentId });
+      const config = configFromProto(provider, req);
       const row = await connections.update(req.id, {
         alias: req.alias,
         displayName: req.displayName.trim(),
-        config: { ...google },
+        config,
       });
       return { connection: connectionToProto(row!) };
     },
@@ -608,12 +584,12 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
 
     async testConnection(req, ctx) {
       await requireAdmin(ctx, getSession);
-      assertGoogleIssuerAvailable(issuer);
-      const row = await connections.get(req.id);
-      if (!row || row.provider !== "gcp") throw new ConnectError("connection not found", Code.NotFound);
+      const { row, provider } = await requireConnection(req.id);
+      provider.assertDeploymentReady?.({ issuer, deploymentId });
       try {
-        const google = assertGoogleCloudConfig(row.config);
-        await googleExchange(google, {
+        // A real mint, discarded. Anything short of one leaves the operator to
+        // discover a broken trust policy when a session boots.
+        await provider.mint(row, {
           sessionId: `connection-test:${row.id}`,
           organizationId: deploymentId,
           connectionId: row.id,
@@ -621,7 +597,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
           profileSnapshotId: "connection-test",
         });
         await connections.markTested(row.id, now());
-        return { ok: true, message: "STS exchange and service account impersonation succeeded" };
+        return { ok: true, message: "credential exchange and impersonation succeeded" };
       } catch (error) {
         return { ok: false, message: errorMessage(error) };
       }
@@ -631,7 +607,9 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       await requireAdmin(ctx, getSession);
       const current = await connections.get(req.id);
       if (!current) throw new ConnectError("connection not found", Code.NotFound);
-      if (req.enabled && current.provider === "gcp") assertGoogleIssuerAvailable(issuer);
+      if (req.enabled) {
+        providers.get(current.provider)?.assertDeploymentReady?.({ issuer, deploymentId });
+      }
       if (req.enabled && current.testedAt == null) {
         throw new ConnectError(
           "the connection must pass STS and impersonation tests before it can be enabled",
@@ -644,10 +622,9 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
 
     async getGoogleCloudSetup(req, ctx) {
       await requireAdmin(ctx, getSession);
-      assertGoogleIssuerAvailable(issuer);
-      const row = await connections.get(req.id);
-      if (!row || row.provider !== "gcp") throw new ConnectError("connection not found", Code.NotFound);
-      const setup = googleSetup(row, issuer, deploymentId);
+      const { row, provider } = await requireConnection(req.id);
+      provider.assertDeploymentReady?.({ issuer, deploymentId });
+      const setup = provider.setupDoc(row, { issuer, deploymentId });
       return {
         issuer,
         audience: setup.audience,
