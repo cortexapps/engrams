@@ -220,7 +220,12 @@ CI_SELF_PATHS = [".github/workflows/ci.yml",
                  ".github/scripts/detect-rebake-lanes.py"]
 PROTO_PATHS = ["crates/engram-protocol/proto/", "buf.gen.yaml"]
 WEB_PATHS = ["web/"]
-ORCH_PATHS = ["orchestrator/"]
+# The Google credential denylist (ADR 0109) is one checked-in table shared by
+# the Rust egress proxy and the orchestrator's endpoint validator. It lives with
+# the proxy, so a cargo-closure change already runs the Rust lanes — this entry
+# makes the same edit run the orchestrator lane, which imports it.
+ORCH_PATHS = ["orchestrator/",
+              "crates/engram-egress-proxy/policy/google-credential-denylist.json"]
 # A lockfile/manifest/toolchain bump recompiles the whole workspace.
 RUST_COMMON = ["Cargo.lock", "Cargo.toml", "rust-toolchain.toml"]
 
