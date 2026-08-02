@@ -25,6 +25,7 @@ import {
   useSetConnectionEnabled,
   useTestConnection,
 } from "@/hooks/useIntegrations";
+import { errorMessage } from "@/lib/errors";
 import { GoogleCloudEndpointDialog } from "./GoogleCloudConnections";
 import type { SetupCodeLanguage } from "./SyntaxHighlightedCode";
 
@@ -61,13 +62,22 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
 
   const runTest = async () => {
     setTestResult(null);
-    const response = await test.mutateAsync({ id: connection.id });
-    setTestResult({ ok: response.ok, message: response.message });
-    if (response.ok) toast.success("Google Cloud connection verified");
+    try {
+      const response = await test.mutateAsync({ id: connection.id });
+      setTestResult({ ok: response.ok, message: response.message });
+      if (response.ok) toast.success("Google Cloud connection verified");
+    } catch (error) {
+      setTestResult({ ok: false, message: errorMessage(error) });
+    }
   };
 
   const setEnabled = async () => {
-    await enable.mutateAsync({ id: connection.id, enabled: !enabled });
+    try {
+      await enable.mutateAsync({ id: connection.id, enabled: !enabled });
+    } catch (error) {
+      toast.error(errorMessage(error));
+      return;
+    }
     toast.success(enabled ? "Google Cloud connection disabled" : "Google Cloud connection enabled");
   };
 
@@ -168,7 +178,7 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
           {setup.error && (
             <div className="m-5 flex items-start gap-2 rounded-md border border-destructive/45 bg-destructive/[0.06] p-3 text-sm">
               <TriangleAlertIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
-              <span>{String(setup.error)}</span>
+              <span>{errorMessage(setup.error)}</span>
             </div>
           )}
           {setup.data && (
@@ -319,7 +329,12 @@ function SetupCode({
   value: string;
 }) {
   const copy = async () => {
-    await navigator.clipboard.writeText(value);
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch (error) {
+      toast.error(errorMessage(error));
+      return;
+    }
     toast.success(`${label} copied`);
   };
 

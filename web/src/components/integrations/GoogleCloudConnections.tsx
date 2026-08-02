@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
+import { toast } from "sonner";
 import {
   CheckIcon,
   ChevronDownIcon,
@@ -7,6 +8,7 @@ import {
   PlusIcon,
   ShieldCheckIcon,
   Trash2Icon,
+  TriangleAlertIcon,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -30,6 +32,7 @@ import {
   useTestConnection,
   useUpdateConnection,
 } from "@/hooks/useIntegrations";
+import { errorMessage } from "@/lib/errors";
 import type { IntegrationConnection } from "@/gen/engram/app/v1/integration_pb";
 
 const GOOGLE_API_OPTIONS = [
@@ -67,7 +70,13 @@ const GOOGLE_API_OPTIONS = [
 
 const GOOGLE_API_HOSTS = new Set<string>(GOOGLE_API_OPTIONS.map((option) => option.host));
 
-const ID_PATTERN = /^[a-z0-9-]{4,32}$/;
+/**
+ * Google's workload identity pool and provider ID rules (IAM
+ * `workloadIdentityPools.create` / `…providers.create`): 4-32 characters from
+ * `[a-z0-9-]`, and the `gcp-` prefix is reserved for Google.
+ */
+const WIF_ID_PATTERN = /^[a-z0-9-]{4,32}$/;
+const isValidWifId = (value: string) => WIF_ID_PATTERN.test(value) && !value.startsWith("gcp-");
 const ALIAS_PATTERN = /^[a-z][a-z0-9-]{1,62}$/;
 const PROJECT_NUMBER_PATTERN = /^[0-9]+$/;
 const HOST_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
@@ -201,32 +210,38 @@ export function GoogleCloudConnectDialog({
     displayName.trim().length > 0 &&
     ALIAS_PATTERN.test(alias) &&
     PROJECT_NUMBER_PATTERN.test(projectNumber) &&
-    ID_PATTERN.test(poolId) &&
-    ID_PATTERN.test(providerId) &&
+    isValidWifId(poolId) &&
+    isValidWifId(providerId) &&
     serviceAccount.trim().length > 0 &&
     endpoints.length > 0 &&
     customEndpointsValid;
 
   const add = async () => {
-    const response = await create.mutateAsync({
-      alias,
-      provider: "gcp",
-      displayName: displayName.trim(),
-      googleCloud: {
-        workloadIdentityProvider:
-          `//iam.googleapis.com/projects/${projectNumber}/locations/global/` +
-          `workloadIdentityPools/${poolId}/providers/${providerId}`,
-        serviceAccountEmail: serviceAccount.trim(),
-        endpoints,
-      },
-    });
-    if (!response.connection) return;
-    const id = response.connection.id;
-    close();
-    await navigate({
-      to: "/settings/integrations/gcp/$connectionId/setup",
-      params: { connectionId: id },
-    });
+    // The failure path renders through `create.error` below; the try keeps the
+    // mutateAsync rejection from escaping as an unhandled rejection.
+    try {
+      const response = await create.mutateAsync({
+        alias,
+        provider: "gcp",
+        displayName: displayName.trim(),
+        googleCloud: {
+          workloadIdentityProvider:
+            `//iam.googleapis.com/projects/${projectNumber}/locations/global/` +
+            `workloadIdentityPools/${poolId}/providers/${providerId}`,
+          serviceAccountEmail: serviceAccount.trim(),
+          endpoints,
+        },
+      });
+      if (!response.connection) return;
+      const id = response.connection.id;
+      close();
+      await navigate({
+        to: "/settings/integrations/gcp/$connectionId/setup",
+        params: { connectionId: id },
+      });
+    } catch {
+      // Shown via create.error.
+    }
   };
 
   return (
@@ -329,6 +344,7 @@ export function GoogleCloudConnectDialog({
                     value={poolId}
                     onChange={(event) => setPoolId(event.target.value)}
                   />
+                  <WifIdHint value={poolId} />
                 </Field>
                 <Field label="WIF provider ID">
                   <Input
@@ -339,6 +355,7 @@ export function GoogleCloudConnectDialog({
                       setProviderId(event.target.value);
                     }}
                   />
+                  <WifIdHint value={providerId} />
                 </Field>
               </div>
               <Field label="Other allowed API hostnames">
@@ -357,7 +374,7 @@ export function GoogleCloudConnectDialog({
           </Collapsible>
         </div>
 
-        {create.error && <p className="text-sm text-destructive">{String(create.error)}</p>}
+        {create.error && <p className="text-sm text-destructive">{errorMessage(create.error)}</p>}
         <DialogFooter>
           <Button variant="outline" onClick={close}>
             Cancel
@@ -410,16 +427,23 @@ export function GoogleCloudEndpointDialog({
 
   const save = async () => {
     if (!google) return;
-    await update.mutateAsync({
-      id: connection.id,
-      alias: connection.alias,
-      displayName: connection.displayName,
-      googleCloud: {
-        workloadIdentityProvider: google.workloadIdentityProvider,
-        serviceAccountEmail: google.serviceAccountEmail,
-        endpoints,
-      },
-    });
+    // The failure path renders through `update.error` below; the try keeps the
+    // mutateAsync rejection from escaping as an unhandled rejection.
+    try {
+      await update.mutateAsync({
+        id: connection.id,
+        alias: connection.alias,
+        displayName: connection.displayName,
+        googleCloud: {
+          workloadIdentityProvider: google.workloadIdentityProvider,
+          serviceAccountEmail: google.serviceAccountEmail,
+          endpoints,
+        },
+      });
+    } catch {
+      // Shown via update.error.
+      return;
+    }
     onOpenChange(false);
     onSaved?.();
   };
@@ -460,7 +484,7 @@ export function GoogleCloudEndpointDialog({
           </p>
         </div>
 
-        {update.error && <p className="text-sm text-destructive">{String(update.error)}</p>}
+        {update.error && <p className="text-sm text-destructive">{errorMessage(update.error)}</p>}
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
@@ -480,10 +504,53 @@ export function GoogleCloudConnections() {
   const test = useTestConnection();
   const enable = useSetConnectionEnabled();
   const [adding, setAdding] = useState(false);
-  const [result, setResult] = useState<string | null>(null);
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
+  const [rowResults, setRowResults] = useState<Record<string, { ok: boolean; message: string }>>(
+    {},
+  );
+  const setRowResult = (id: string, ok: boolean, message: string) =>
+    setRowResults((current) => ({ ...current, [id]: { ok, message } }));
+  const clearRowResult = (id: string) =>
+    setRowResults((current) => {
+      const { [id]: _dropped, ...rest } = current;
+      return rest;
+    });
   const connections = (data?.connections ?? []).filter(
     (connection) => connection.provider === "gcp",
   );
+
+  const runTest = async (id: string) => {
+    clearRowResult(id);
+    try {
+      const response = await test.mutateAsync({ id });
+      setRowResult(id, response.ok, response.message);
+    } catch (error) {
+      setRowResult(id, false, errorMessage(error));
+    }
+  };
+
+  const setEnabled = (id: string, enabled: boolean) => {
+    clearRowResult(id);
+    enable.mutate(
+      { id, enabled },
+      { onError: (error) => setRowResult(id, false, errorMessage(error)) },
+    );
+  };
+
+  const deleteConnection = (connection: IntegrationConnection) => {
+    remove.mutate(
+      { id: connection.id },
+      {
+        onSuccess: () => {
+          setConfirmingDeleteId(null);
+          toast.success(`${connection.displayName} deleted`);
+        },
+        // The server rejects the delete while a profile still grants this
+        // connection's powers — keep the confirm bar open and show why.
+        onError: (error) => setRowResult(connection.id, false, errorMessage(error)),
+      },
+    );
+  };
 
   return (
     <section className="overflow-hidden rounded-lg border bg-card">
@@ -519,65 +586,97 @@ export function GoogleCloudConnections() {
             accepted.
           </p>
         )}
-        {connections.map((connection) => (
-          <div key={connection.id} className="flex flex-wrap items-center gap-4 p-5">
-            <ShieldCheckIcon className="size-4 text-muted-foreground" />
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <span className="text-sm font-medium">{connection.displayName}</span>
-                <Badge variant={connection.enabled ? "default" : "secondary"}>
-                  {connection.enabled
-                    ? "Enabled"
-                    : connection.testedAt
-                      ? "Tested"
-                      : "Setup required"}
-                </Badge>
+        {connections.map((connection) => {
+          const rowResult = rowResults[connection.id];
+          return (
+            <div key={connection.id} className="flex flex-col gap-3 p-5">
+              <div className="flex flex-wrap items-center gap-4">
+                <ShieldCheckIcon className="size-4 text-muted-foreground" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium">{connection.displayName}</span>
+                    <Badge variant={connection.enabled ? "default" : "secondary"}>
+                      {connection.enabled
+                        ? "Enabled"
+                        : connection.testedAt
+                          ? "Tested"
+                          : "Setup required"}
+                    </Badge>
+                  </div>
+                  <p className="mt-1 truncate font-mono text-xs text-muted-foreground">
+                    {connection.alias} · {connection.googleCloud?.serviceAccountEmail}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button asChild variant="outline" size="sm">
+                    <Link
+                      to="/settings/integrations/gcp/$connectionId/setup"
+                      params={{ connectionId: connection.id }}
+                    >
+                      Setup
+                    </Link>
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={test.isPending}
+                    onClick={() => void runTest(connection.id)}
+                  >
+                    Test
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant={connection.enabled ? "outline" : "default"}
+                    disabled={enable.isPending || (!connection.enabled && !connection.testedAt)}
+                    onClick={() => setEnabled(connection.id, !connection.enabled)}
+                  >
+                    {connection.enabled ? "Disable" : "Enable"}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label={`Delete ${connection.displayName}`}
+                    onClick={() => {
+                      clearRowResult(connection.id);
+                      setConfirmingDeleteId(connection.id);
+                    }}
+                  >
+                    <Trash2Icon className="size-4" />
+                  </Button>
+                </div>
               </div>
-              <p className="mt-1 truncate font-mono text-xs text-muted-foreground">
-                {connection.alias} · {connection.googleCloud?.serviceAccountEmail}
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <Button asChild variant="outline" size="sm">
-                <Link
-                  to="/settings/integrations/gcp/$connectionId/setup"
-                  params={{ connectionId: connection.id }}
+              {confirmingDeleteId === connection.id && (
+                <div className="flex flex-wrap items-center gap-3 rounded-lg border border-destructive/40 bg-destructive/5 p-3">
+                  <TriangleAlertIcon className="size-4 shrink-0 text-destructive" />
+                  <span className="min-w-0 flex-1 text-sm">
+                    Delete "{connection.displayName}"? Sessions can no longer mint its credential.
+                    Remove its grants from profiles first.
+                  </span>
+                  <Button variant="ghost" size="sm" onClick={() => setConfirmingDeleteId(null)}>
+                    Cancel
+                  </Button>
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    disabled={remove.isPending}
+                    onClick={() => deleteConnection(connection)}
+                  >
+                    Delete
+                  </Button>
+                </div>
+              )}
+              {rowResult && (
+                <p
+                  role="status"
+                  className={`text-xs ${rowResult.ok ? "text-muted-foreground" : "text-destructive"}`}
                 >
-                  Setup
-                </Link>
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={test.isPending}
-                onClick={async () => {
-                  const response = await test.mutateAsync({ id: connection.id });
-                  setResult(response.message);
-                }}
-              >
-                Test
-              </Button>
-              <Button
-                size="sm"
-                variant={connection.enabled ? "outline" : "default"}
-                disabled={!connection.enabled && !connection.testedAt}
-                onClick={() => enable.mutate({ id: connection.id, enabled: !connection.enabled })}
-              >
-                {connection.enabled ? "Disable" : "Enable"}
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                aria-label={`Delete ${connection.displayName}`}
-                onClick={() => remove.mutate({ id: connection.id })}
-              >
-                <Trash2Icon className="size-4" />
-              </Button>
+                  {rowResult.message}
+                </p>
+              )}
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
-      {result && <p className="border-t px-5 py-3 text-xs text-muted-foreground">{result}</p>}
 
       <GoogleCloudConnectDialog open={adding} onOpenChange={setAdding} />
     </section>
@@ -592,6 +691,15 @@ function SectionHeading({ number, title }: { number: string; title: string }) {
       </span>
       <h3 className="text-sm font-semibold">{title}</h3>
     </div>
+  );
+}
+
+function WifIdHint({ value }: { value: string }) {
+  if (!value || isValidWifId(value)) return null;
+  return (
+    <p className="mt-1.5 text-xs text-destructive">
+      Use 4-32 characters from a-z, 0-9, and hyphens. Google reserves the "gcp-" prefix.
+    </p>
   );
 }
 
