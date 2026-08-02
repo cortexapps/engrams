@@ -39,6 +39,7 @@ import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
 import { useSkills, useUploadSkill } from "../../hooks/useSkills";
 import { useOrgSecretNames } from "../../hooks/useOrgSecrets";
 import { defaultCapabilitiesForGrants } from "../../lib/profileIntegrations";
+import { useIntegrationConnections } from "../../hooks/useIntegrations";
 import {
   useConnectorViews,
   type ConnectorView,
@@ -47,6 +48,7 @@ import { IconPicker } from "../../components/profiles/IconPicker";
 import { PowerSelector } from "../../components/profiles/PowerSelector";
 import { PolicyRail } from "../../components/profiles/PolicyRail";
 import { ProviderTile } from "../../components/integrations/ProviderTile";
+import { GOOGLE_CLOUD_OPERATIONS } from "../../components/integrations/googleCloud";
 import { HostChip } from "../../components/integrations/chips";
 import {
   EnvVarsEditor,
@@ -167,6 +169,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const { data: harnesses } = useHarnessCatalog(true);
   const { data: skillCatalog } = useSkills();
   const { data: orgSecretNames } = useOrgSecretNames();
+  const { data: connectionData } = useIntegrationConnections();
   const { views } = useConnectorViews();
   const create = useCreateProfile();
   const update = useUpdateProfile();
@@ -295,7 +298,12 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       ),
     [capabilities, network, secretRows, views, harnessDescriptor],
   );
-  const connected = views.filter((v) => v.status === "connected");
+  const connected = views.filter(
+    (view) => view.status === "connected" && view.connectionModel !== "named",
+  );
+  const googleConnections = (connectionData?.connections ?? []).filter(
+    (connection) => connection.provider === "gcp" && connection.enabled,
+  );
   const imageUri = images?.find((i) => i.id === imageId)?.image_uri;
 
   // --- capability helpers (enable→select) -----------------------------------
@@ -329,6 +337,13 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   };
   const disableProvider = (v: ConnectorView) =>
     setGrants(integrationGrants.filter((grant) => grant.connectionId !== v.defaultConnectionId));
+
+  const toggleConnectionOperation = (connectionId: string, operation: string, on: boolean) => {
+    const without = integrationGrants.filter(
+      (grant) => grant.connectionId !== connectionId || grant.operation !== operation,
+    );
+    setGrants(on ? [...without, { connectionId, operation, resourceConstraints: [] }] : without);
+  };
 
   const onSubmit = async (vals: ProfileFormValues) => {
     const payload = {
@@ -650,7 +665,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
             title="Integrations"
             sub="Enable an integration to bind its credential and open its egress — then choose exactly which powers sessions get."
           >
-            {connected.length === 0 ? (
+            {connected.length === 0 && googleConnections.length === 0 ? (
               <EmptyIntegrations />
             ) : (
               <div className="flex flex-col gap-3">
@@ -719,6 +734,62 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                           />
                         </div>
                       )}
+                    </div>
+                  );
+                })}
+                {googleConnections.map((connection) => {
+                  const selectedOperations = GOOGLE_CLOUD_OPERATIONS.filter(({ action }) =>
+                    integrationGrants.some(
+                      (grant) => grant.connectionId === connection.id && grant.operation === action,
+                    ),
+                  );
+                  return (
+                    <div
+                      key={connection.id}
+                      className="overflow-hidden rounded-md border bg-background"
+                    >
+                      <div className="flex items-center gap-3 bg-blue-600/[0.06] px-3.5 py-3">
+                        <span className="flex size-8 items-center justify-center rounded-md bg-blue-600 text-xs font-semibold text-white">
+                          GC
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="text-[0.92rem] font-semibold">
+                            {connection.displayName}
+                          </div>
+                          <div className="truncate font-mono text-[0.7rem] text-muted-foreground">
+                            {connection.googleCloud?.serviceAccountEmail}
+                          </div>
+                        </div>
+                        <Text
+                          variant="label"
+                          tone={selectedOperations.length ? "inherit" : "muted"}
+                        >
+                          {selectedOperations.length} granted
+                        </Text>
+                      </div>
+                      <div className="divide-y border-t">
+                        {GOOGLE_CLOUD_OPERATIONS.map(({ action, label }) => {
+                          const checked = selectedOperations.some(
+                            (operation) => operation.action === action,
+                          );
+                          return (
+                            <label
+                              key={action}
+                              className="flex cursor-pointer items-center gap-3 px-3.5 py-2.5 text-sm"
+                            >
+                              <Switch
+                                checked={checked}
+                                aria-label={`${connection.displayName} ${label}`}
+                                onCheckedChange={(value) =>
+                                  toggleConnectionOperation(connection.id, action, value)
+                                }
+                              />
+                              <span className="flex-1">{label}</span>
+                              <code className="text-[10px] text-muted-foreground">{action}</code>
+                            </label>
+                          );
+                        })}
+                      </div>
                     </div>
                   );
                 })}

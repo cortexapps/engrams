@@ -23,10 +23,13 @@ Common endpoints are `compute.googleapis.com`, `logging.googleapis.com`,
 
 1. Open **Settings → Integrations → Google Cloud**.
 2. Select **Add connection**.
-3. Enter the full workload identity provider resource, the target
-   service-account email, and exact endpoints.
-4. Create the disabled connection.
-5. Apply either the generated Terraform or `gcloud` configuration. The output
+3. Enter a connection name, the numeric Google Cloud project number, and the
+   target service-account email. Select the Google APIs that sessions may
+   reach. Engrams generates the connection alias and WIF provider resource.
+   Pool and provider IDs remain available under **Advanced settings**.
+4. Create the disabled connection. Engrams opens its dedicated setup page.
+5. Apply either the generated Terraform or `gcloud` configuration from that
+   page. The output
    fixes the allowed audience, claim mapping, connection condition, and
    `roles/iam.workloadIdentityUser` principal set.
 6. Select **Test**. Engrams performs both the STS exchange and service-account

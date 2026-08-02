@@ -51,6 +51,9 @@ const orgSecretNamesHolder = vi.hoisted(() => ({ value: [] as string[] }));
 vi.mock("../../hooks/useOrgSecrets", () => ({
   useOrgSecretNames: () => ({ data: orgSecretNamesHolder.value }),
 }));
+vi.mock("../../hooks/useIntegrations", () => ({
+  useIntegrationConnections: () => ({ data: { connections: [] } }),
+}));
 // The editor derives its policy rail + connected-connector cards from the joined
 // catalog; mock it so the test needs no QueryClient/transport.
 vi.mock("../../components/integrations/useConnectorViews", () => ({
