@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { Link, useParams } from "@tanstack/react-router";
 import { toast } from "sonner";
 import {
@@ -25,6 +25,9 @@ import {
   useSetConnectionEnabled,
   useTestConnection,
 } from "@/hooks/useIntegrations";
+import type { SetupCodeLanguage } from "./SyntaxHighlightedCode";
+
+const SyntaxHighlightedCode = lazy(() => import("./SyntaxHighlightedCode"));
 
 export function GoogleCloudSetupPage() {
   const { connectionId } = useParams({ strict: false }) as { connectionId?: string };
@@ -175,6 +178,7 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
                 <SetupCode
                   label="Terraform configuration"
                   filename={`${connection.alias}-wif.tf`}
+                  language="terraform"
                   value={setup.data.terraform}
                 />
               </TabsContent>
@@ -182,6 +186,7 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
                 <SetupCode
                   label="gcloud commands"
                   filename={`${connection.alias}-wif.sh`}
+                  language="shellscript"
                   value={setup.data.gcloudScript}
                 />
               </TabsContent>
@@ -285,7 +290,17 @@ function ProgressStep({
   );
 }
 
-function SetupCode({ label, filename, value }: { label: string; filename: string; value: string }) {
+function SetupCode({
+  label,
+  filename,
+  language,
+  value,
+}: {
+  label: string;
+  filename: string;
+  language: SetupCodeLanguage;
+  value: string;
+}) {
   const copy = async () => {
     await navigator.clipboard.writeText(value);
     toast.success(`${label} copied`);
@@ -319,7 +334,15 @@ function SetupCode({ label, filename, value }: { label: string; filename: string
         </div>
       </div>
       <pre className="max-h-[min(62vh,44rem)] min-h-72 w-full overflow-auto rounded-md border bg-muted/30 p-4 font-mono text-xs leading-6 whitespace-pre-wrap break-words">
-        <code>{value}</code>
+        <Suspense
+          fallback={
+            <code data-language={language} data-highlighted="false">
+              {value}
+            </code>
+          }
+        >
+          <SyntaxHighlightedCode language={language} value={value} />
+        </Suspense>
       </pre>
     </div>
   );
