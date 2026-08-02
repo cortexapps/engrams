@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
 import {
@@ -28,11 +28,13 @@ import {
   useCreateConnection,
   useDeleteConnection,
   useIntegrationConnections,
-  useSetConnectionEnabled,
-  useTestConnection,
   useUpdateConnection,
 } from "@/hooks/useIntegrations";
 import { errorMessage } from "@/lib/errors";
+import {
+  ConnectionTestEnableControls,
+  type ConnectionControlResult,
+} from "./ConnectionTestEnableControls";
 import type { IntegrationConnection } from "@/gen/engram/app/v1/integration_pb";
 
 const GOOGLE_API_OPTIONS = [
@@ -86,6 +88,51 @@ const splitHosts = (value: string) =>
     .split(/[\s,]+/)
     .map((host) => host.trim().toLowerCase())
     .filter(Boolean);
+
+/**
+ * Endpoint selection shared by the connect and the endpoint-edit dialogs:
+ * the curated checkboxes plus the free-form host textarea, merged and
+ * validated the same way in both.
+ */
+function useEndpointSelection() {
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [custom, setCustom] = useState("");
+
+  const toggle = useCallback(
+    (host: string) =>
+      setSelected((current) => {
+        const next = new Set(current);
+        if (next.has(host)) next.delete(host);
+        else next.add(host);
+        return next;
+      }),
+    [],
+  );
+
+  /** Seed from a connection's stored endpoints (endpoint-edit dialog).
+   * Stable, so an open-dialog effect can depend on it. */
+  const initialize = useCallback((endpoints: readonly string[]) => {
+    setSelected(new Set(endpoints.filter((host) => GOOGLE_API_HOSTS.has(host))));
+    setCustom(endpoints.filter((host) => !GOOGLE_API_HOSTS.has(host)).join("\n"));
+  }, []);
+
+  const clear = useCallback(() => {
+    setSelected(new Set());
+    setCustom("");
+  }, []);
+
+  const extra = splitHosts(custom);
+  return {
+    selected,
+    custom,
+    setCustom,
+    toggle,
+    initialize,
+    clear,
+    endpoints: [...new Set([...selected, ...extra])],
+    customValid: extra.every((host) => HOST_PATTERN.test(host)),
+  };
+}
 
 function GoogleApiOptions({
   selectedEndpoints,
@@ -160,8 +207,7 @@ export function GoogleCloudConnectDialog({
   const [aliasEdited, setAliasEdited] = useState(false);
   const [projectNumber, setProjectNumber] = useState("");
   const [serviceAccount, setServiceAccount] = useState("");
-  const [selectedEndpoints, setSelectedEndpoints] = useState<Set<string>>(new Set());
-  const [customEndpoints, setCustomEndpoints] = useState("");
+  const endpointSelection = useEndpointSelection();
   const [poolId, setPoolId] = useState("engrams");
   const [providerId, setProviderId] = useState("");
   const [providerEdited, setProviderEdited] = useState(false);
@@ -173,8 +219,7 @@ export function GoogleCloudConnectDialog({
     setAliasEdited(false);
     setProjectNumber("");
     setServiceAccount("");
-    setSelectedEndpoints(new Set());
-    setCustomEndpoints("");
+    endpointSelection.clear();
     setPoolId("engrams");
     setProviderId("");
     setProviderEdited(false);
@@ -194,18 +239,7 @@ export function GoogleCloudConnectDialog({
     if (!providerEdited) setProviderId(providerIdFor(aliasEdited ? alias : nextAlias));
   };
 
-  const toggleEndpoint = (host: string) => {
-    setSelectedEndpoints((current) => {
-      const next = new Set(current);
-      if (next.has(host)) next.delete(host);
-      else next.add(host);
-      return next;
-    });
-  };
-
-  const extraEndpoints = splitHosts(customEndpoints);
-  const endpoints = [...new Set([...selectedEndpoints, ...extraEndpoints])];
-  const customEndpointsValid = extraEndpoints.every((host) => HOST_PATTERN.test(host));
+  const { endpoints } = endpointSelection;
   const formValid =
     displayName.trim().length > 0 &&
     ALIAS_PATTERN.test(alias) &&
@@ -214,7 +248,7 @@ export function GoogleCloudConnectDialog({
     isValidWifId(providerId) &&
     serviceAccount.trim().length > 0 &&
     endpoints.length > 0 &&
-    customEndpointsValid;
+    endpointSelection.customValid;
 
   const add = async () => {
     // The failure path renders through `create.error` below; the try keeps the
@@ -313,7 +347,10 @@ export function GoogleCloudConnectDialog({
                 Select only the Google services that this connection needs.
               </p>
             </div>
-            <GoogleApiOptions selectedEndpoints={selectedEndpoints} onToggle={toggleEndpoint} />
+            <GoogleApiOptions
+              selectedEndpoints={endpointSelection.selected}
+              onToggle={endpointSelection.toggle}
+            />
           </section>
 
           <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
@@ -358,18 +395,10 @@ export function GoogleCloudConnectDialog({
                   <WifIdHint value={providerId} />
                 </Field>
               </div>
-              <Field label="Other allowed API hostnames">
-                <Textarea
-                  aria-label="Other allowed API hostnames"
-                  value={customEndpoints}
-                  onChange={(event) => setCustomEndpoints(event.target.value)}
-                  rows={3}
-                  placeholder="artifactregistry.googleapis.com"
-                />
-                <p className="mt-1.5 text-xs text-muted-foreground">
-                  Enter exact hostnames only. Google STS and OAuth endpoints are always blocked.
-                </p>
-              </Field>
+              <CustomEndpointsField
+                value={endpointSelection.custom}
+                onChange={endpointSelection.setCustom}
+              />
             </CollapsibleContent>
           </Collapsible>
         </div>
@@ -400,30 +429,18 @@ export function GoogleCloudEndpointDialog({
   onSaved?: () => void;
 }) {
   const update = useUpdateConnection();
-  const [selectedEndpoints, setSelectedEndpoints] = useState<Set<string>>(new Set());
-  const [customEndpoints, setCustomEndpoints] = useState("");
+  const endpointSelection = useEndpointSelection();
+  const { initialize } = endpointSelection;
 
+  const storedEndpoints = connection.googleCloud?.endpoints;
   useEffect(() => {
     if (!open) return;
-    const endpoints = connection.googleCloud?.endpoints ?? [];
-    setSelectedEndpoints(new Set(endpoints.filter((host) => GOOGLE_API_HOSTS.has(host))));
-    setCustomEndpoints(endpoints.filter((host) => !GOOGLE_API_HOSTS.has(host)).join("\n"));
-  }, [connection.googleCloud?.endpoints, open]);
+    initialize(storedEndpoints ?? []);
+  }, [storedEndpoints, open, initialize]);
 
-  const toggleEndpoint = (host: string) => {
-    setSelectedEndpoints((current) => {
-      const next = new Set(current);
-      if (next.has(host)) next.delete(host);
-      else next.add(host);
-      return next;
-    });
-  };
-
-  const extraEndpoints = splitHosts(customEndpoints);
-  const endpoints = [...new Set([...selectedEndpoints, ...extraEndpoints])];
-  const customEndpointsValid = extraEndpoints.every((host) => HOST_PATTERN.test(host));
+  const { endpoints } = endpointSelection;
   const google = connection.googleCloud;
-  const formValid = Boolean(google) && endpoints.length > 0 && customEndpointsValid;
+  const formValid = Boolean(google) && endpoints.length > 0 && endpointSelection.customValid;
 
   const save = async () => {
     if (!google) return;
@@ -465,19 +482,14 @@ export function GoogleCloudEndpointDialog({
         </DialogHeader>
 
         <div className="space-y-4 py-1">
-          <GoogleApiOptions selectedEndpoints={selectedEndpoints} onToggle={toggleEndpoint} />
-          <Field label="Other allowed API hostnames">
-            <Textarea
-              aria-label="Other allowed API hostnames"
-              value={customEndpoints}
-              onChange={(event) => setCustomEndpoints(event.target.value)}
-              rows={3}
-              placeholder="artifactregistry.googleapis.com"
-            />
-            <p className="mt-1.5 text-xs text-muted-foreground">
-              Enter exact hostnames only. Google STS and OAuth endpoints are always blocked.
-            </p>
-          </Field>
+          <GoogleApiOptions
+            selectedEndpoints={endpointSelection.selected}
+            onToggle={endpointSelection.toggle}
+          />
+          <CustomEndpointsField
+            value={endpointSelection.custom}
+            onChange={endpointSelection.setCustom}
+          />
           <p className="rounded-md border border-amber-500/30 bg-amber-500/[0.07] p-3 text-xs text-muted-foreground">
             Saving disables this connection and clears its test result. Test and enable it again
             before you launch a new session. Existing sessions keep their stamped configuration.
@@ -501,8 +513,6 @@ export function GoogleCloudEndpointDialog({
 export function GoogleCloudConnections() {
   const { data, isLoading } = useIntegrationConnections();
   const remove = useDeleteConnection();
-  const test = useTestConnection();
-  const enable = useSetConnectionEnabled();
   const [adding, setAdding] = useState(false);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   const [rowResults, setRowResults] = useState<Record<string, { ok: boolean; message: string }>>(
@@ -519,22 +529,12 @@ export function GoogleCloudConnections() {
     (connection) => connection.provider === "gcp",
   );
 
-  const runTest = async (id: string) => {
-    clearRowResult(id);
-    try {
-      const response = await test.mutateAsync({ id });
-      setRowResult(id, response.ok, response.message);
-    } catch (error) {
-      setRowResult(id, false, errorMessage(error));
+  const onControlResult = (id: string, result: ConnectionControlResult) => {
+    if (result.kind === "enable" && result.ok) {
+      clearRowResult(id);
+      return;
     }
-  };
-
-  const setEnabled = (id: string, enabled: boolean) => {
-    clearRowResult(id);
-    enable.mutate(
-      { id, enabled },
-      { onError: (error) => setRowResult(id, false, errorMessage(error)) },
-    );
+    setRowResult(id, result.ok, result.message);
   };
 
   const deleteConnection = (connection: IntegrationConnection) => {
@@ -616,22 +616,11 @@ export function GoogleCloudConnections() {
                       Setup
                     </Link>
                   </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={test.isPending}
-                    onClick={() => void runTest(connection.id)}
-                  >
-                    Test
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant={connection.enabled ? "outline" : "default"}
-                    disabled={enable.isPending || (!connection.enabled && !connection.testedAt)}
-                    onClick={() => setEnabled(connection.id, !connection.enabled)}
-                  >
-                    {connection.enabled ? "Disable" : "Enable"}
-                  </Button>
+                  <ConnectionTestEnableControls
+                    connection={connection}
+                    compact
+                    onResult={(result) => onControlResult(connection.id, result)}
+                  />
                   <Button
                     variant="ghost"
                     size="icon"
@@ -691,6 +680,29 @@ function SectionHeading({ number, title }: { number: string; title: string }) {
       </span>
       <h3 className="text-sm font-semibold">{title}</h3>
     </div>
+  );
+}
+
+function CustomEndpointsField({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <Field label="Other allowed API hostnames">
+      <Textarea
+        aria-label="Other allowed API hostnames"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        rows={3}
+        placeholder="artifactregistry.googleapis.com"
+      />
+      <p className="mt-1.5 text-xs text-muted-foreground">
+        Enter exact hostnames only. Google STS and OAuth endpoints are always blocked.
+      </p>
+    </Field>
   );
 }
 

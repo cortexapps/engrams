@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SessionProfileEditor } from "./SessionProfileEditor";
 
@@ -265,16 +265,23 @@ describe("SessionProfileEditor (Google Cloud connections)", () => {
     ...overrides,
   });
 
+  /** The PowerSelector row that carries an operation's curated label. */
+  const operationRow = (label: string) => {
+    const row = screen.getByText(label).closest("div");
+    if (!row) throw new Error(`no row for ${label}`);
+    return within(row);
+  };
+
   it("offers only the operations the connection's endpoints enable (web-M4)", () => {
     connectionsHolder.value = [googleConnection()];
     render(<SessionProfileEditor mode="create" />);
     expect(screen.getByText("Prod observer")).toBeTruthy();
     // logging.googleapis.com enables the Logging read + the generic Google
     // API call; it does not enable Compute or a GKE control-plane call.
-    expect(screen.getByLabelText("Prod observer Read Cloud Logging entries")).toBeTruthy();
-    expect(screen.getByLabelText("Prod observer Call configured Google APIs")).toBeTruthy();
-    expect(screen.queryByLabelText(/describe compute engine instances/i)).toBeNull();
-    expect(screen.queryByLabelText(/call the configured gke api server/i)).toBeNull();
+    expect(screen.getByText("Read Cloud Logging entries")).toBeTruthy();
+    expect(screen.getByText("Call configured Google APIs")).toBeTruthy();
+    expect(screen.queryByText("Describe Compute Engine instances")).toBeNull();
+    expect(screen.queryByText("Call the configured GKE API server")).toBeNull();
   });
 
   it("carries a toggled grant into the create payload", async () => {
@@ -283,7 +290,9 @@ describe("SessionProfileEditor (Google Cloud connections)", () => {
     fireEvent.change(screen.getByLabelText(/profile name/i), {
       target: { value: "Observer" },
     });
-    fireEvent.click(screen.getByLabelText("Prod observer Read Cloud Logging entries"));
+    fireEvent.click(
+      operationRow("Read Cloud Logging entries").getByRole("button", { name: /grant read/i }),
+    );
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
     await waitFor(() => expect(create).toHaveBeenCalled());
     expect(create.mock.calls[0][0].integrationGrants).toEqual([
@@ -322,9 +331,11 @@ describe("SessionProfileEditor (Google Cloud connections)", () => {
     render(<SessionProfileEditor mode="edit" />);
     await screen.findByDisplayValue("Backend Agent");
     expect(screen.getByText("Disabled")).toBeTruthy();
-    const toggle = screen.getByLabelText("Prod observer Read Cloud Logging entries");
-    expect(toggle.getAttribute("data-state")).toBe("checked");
-    fireEvent.click(toggle);
+    const pill = operationRow("Read Cloud Logging entries").getByRole("button", {
+      name: /granted read/i,
+    });
+    expect(pill.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(pill);
     fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
     await waitFor(() => expect(update).toHaveBeenCalledOnce());
     expect(update.mock.calls[0][0].integrationGrants).toEqual([]);
@@ -359,10 +370,12 @@ describe("SessionProfileEditor (Google Cloud connections)", () => {
     };
     render(<SessionProfileEditor mode="edit" />);
     await screen.findByDisplayValue("Backend Agent");
-    const toggle = screen.getByLabelText("Prod observer Describe Compute Engine instances");
-    expect(toggle.getAttribute("data-state")).toBe("checked");
     expect(screen.getByText(/not in this connection's allowed APIs/i)).toBeTruthy();
-    fireEvent.click(toggle);
+    const pill = operationRow("Describe Compute Engine instances").getByRole("button", {
+      name: /granted read/i,
+    });
+    expect(pill.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(pill);
     fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
     await waitFor(() => expect(update).toHaveBeenCalledOnce());
     expect(update.mock.calls[0][0].integrationGrants).toEqual([]);
