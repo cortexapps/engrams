@@ -1423,6 +1423,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_epoch_bump_detaches_idle_harness() {
+        let (sink, _) = collecting_sink();
+        let hub = test_hub(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        let (host_side, harness_side) = duplex_pair();
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+
+        hub.bind_session(session_id, sandbox_id, 1).expect("bind");
+        hub.accept_connection(
+            sandbox_id,
+            Some(session_id),
+            engram_sandbox_firecracker::EpochSeveredStream::new(host_side, epoch_rx),
+        );
+
+        let hub_for_harness = hub.clone();
+        let (prompt_read_tx, prompt_read_rx) = oneshot::channel();
+        let harness_task = tokio::spawn(async move {
+            let ack = drive_harness(
+                &hub_for_harness,
+                harness_side,
+                session_id,
+                sandbox_id,
+                |mut reader, writer| async move {
+                    let frame: HarnessFrame = read_msg(&mut reader)
+                        .await
+                        .expect("harness should read the prompt");
+                    assert!(
+                        matches!(frame, HarnessFrame::Command(HarnessCommand::Prompt { .. })),
+                        "harness should receive a prompt",
+                    );
+                    prompt_read_tx
+                        .send(())
+                        .expect("test should wait for the prompt read");
+                    std::future::pending::<()>().await;
+                    drop((reader, writer));
+                },
+            )
+            .await;
+            assert!(ack.ok, "harness should attach");
+        });
+
+        assert!(
+            wait_until(|| hub.is_attached(sandbox_id)).await,
+            "harness should attach within the 1s deadline",
+        );
+        hub.send_prompt(sandbox_id, "prompt-1".into(), "hello".into(), None)
+            .await
+            .expect("send_prompt should reach the harness");
+        prompt_read_rx
+            .await
+            .expect("harness should confirm that it read the prompt");
+
+        epoch_tx.send_modify(|epoch| *epoch += 1);
+
+        assert!(
+            wait_until(|| !hub.is_attached(sandbox_id)).await,
+            "snapshot severance should detach the idle harness within the 1s deadline",
+        );
+        harness_task.abort();
+    }
+
+    #[tokio::test]
     async fn tcp_listener_routes_attach_via_session_lookup_to_bound_sandbox() {
         // End-to-end demo wiring: bind a (session_id, sandbox_id)
         // pair, spawn a real TCP listener, connect a harness client
