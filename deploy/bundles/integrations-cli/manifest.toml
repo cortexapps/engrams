@@ -29,3 +29,7 @@ glab = "1.105.0"
 stripe = "1.43.2"
 # Google Cloud CLI versioned archive.
 gcloud = "577.0.0"
+# Build-container base (debian:bookworm-slim), pinned by digest — the bundle
+# copies its Python runtime and shared libraries, so the digest is part of
+# the bundle's reproducibility contract.
+bookworm_digest = "sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818"
