@@ -129,20 +129,24 @@ describe("Google egress policy", () => {
     ])).toThrow(/not a valid/);
   });
 
-  test("curates the Logging REST and gRPC methods", () => {
+  test("curates the Logging REST and gRPC methods as separate entries", () => {
     const output = policy();
     appendGooglePolicy(output, [grant("logging.entries.list")]);
-    expect(output.injects[0]).toMatchObject({
-      hosts: ["logging.googleapis.com"],
-      methods: ["POST"],
-      path_globs: [
-        "segment-path:/v2/entries:list",
-        "segment-path:/google.logging.v2.LoggingServiceV2/ListLogEntries",
-      ],
-    });
+    expect(output.injects).toEqual([
+      expect.objectContaining({
+        hosts: ["logging.googleapis.com"],
+        methods: ["POST"],
+        path_globs: ["segment-path:/v2/entries:list"],
+      }),
+      expect.objectContaining({
+        hosts: ["logging.googleapis.com"],
+        methods: ["POST"],
+        path_globs: ["segment-path:/google.logging.v2.LoggingServiceV2/ListLogEntries"],
+      }),
+    ]);
   });
 
-  test("curates Monitoring reads to list-only REST and gRPC methods", () => {
+  test("curates Monitoring reads to GET-only REST entries and POST-only gRPC entries", () => {
     const output = policy();
     const descriptors = grant(
       "monitoring.metricdescriptors.list",
@@ -156,19 +160,66 @@ describe("Google egress policy", () => {
     expect(output.injects).toEqual([
       expect.objectContaining({
         hosts: ["monitoring.googleapis.com"],
-        methods: ["GET", "POST"],
-        path_globs: [
-          "segment-path:/v3/projects/*/metricDescriptors",
-          "segment-path:/google.monitoring.v3.MetricService/ListMetricDescriptors",
-        ],
+        methods: ["GET"],
+        path_globs: ["segment-path:/v3/projects/*/metricDescriptors"],
       }),
       expect.objectContaining({
         hosts: ["monitoring.googleapis.com"],
-        methods: ["GET", "POST"],
-        path_globs: [
-          "segment-path:/v3/projects/*/timeSeries",
-          "segment-path:/google.monitoring.v3.MetricService/ListTimeSeries",
-        ],
+        methods: ["POST"],
+        path_globs: ["segment-path:/google.monitoring.v3.MetricService/ListMetricDescriptors"],
+      }),
+      expect.objectContaining({
+        hosts: ["monitoring.googleapis.com"],
+        methods: ["GET"],
+        path_globs: ["segment-path:/v3/projects/*/timeSeries"],
+      }),
+      expect.objectContaining({
+        hosts: ["monitoring.googleapis.com"],
+        methods: ["POST"],
+        path_globs: ["segment-path:/google.monitoring.v3.MetricService/ListTimeSeries"],
+      }),
+    ]);
+  });
+
+  test("a curated read grant never allows the write verb on a REST resource path", () => {
+    // The proxy matches methods and paths independently inside one entry.
+    // `POST /v3/projects/*/timeSeries` is `timeSeries.create` — a WRITE. No
+    // entry compiled from a read grant may pair POST with a REST resource path.
+    const output = policy();
+    appendGooglePolicy(output, [
+      grant("monitoring.timeseries.list", [], ["monitoring.googleapis.com"]),
+    ]);
+    const restPath = "segment-path:/v3/projects/*/timeSeries";
+    for (const entry of output.injects) {
+      const allowsPost = entry.methods.length === 0 || entry.methods.includes("POST");
+      const matchesRestPath = entry.path_globs.includes(restPath);
+      expect(allowsPost && matchesRestPath).toBe(false);
+    }
+    // The read stays reachable: GET on the REST path, POST on the gRPC path only.
+    expect(output.injects.some((entry) =>
+      entry.methods.length === 1 && entry.methods[0] === "GET" &&
+      entry.path_globs.includes(restPath)
+    )).toBe(true);
+    expect(output.injects.some((entry) =>
+      entry.methods.length === 1 && entry.methods[0] === "POST" &&
+      entry.path_globs.length === 1 &&
+      entry.path_globs[0] === "segment-path:/google.monitoring.v3.MetricService/ListTimeSeries"
+    )).toBe(true);
+  });
+
+  test("a resource constraint narrows the REST paths and drops the gRPC surface", () => {
+    // A path constraint cannot scope a gRPC request body, so a constrained
+    // grant compiles the REST entry only.
+    const output = policy();
+    appendGooglePolicy(output, [grant(
+      "monitoring.timeseries.list",
+      ["/v3/projects/prod/timeSeries"],
+      ["monitoring.googleapis.com"],
+    )]);
+    expect(output.injects).toEqual([
+      expect.objectContaining({
+        methods: ["GET"],
+        path_globs: ["segment-path:/v3/projects/prod/timeSeries"],
       }),
     ]);
   });

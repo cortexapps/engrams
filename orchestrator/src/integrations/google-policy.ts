@@ -6,10 +6,22 @@ import type { IntegrationInjectJson, IntegrationPolicyJson } from "../connectors
 import { assertGoogleCloudConfig } from "./google-wif.ts";
 import type { ResolvedIntegrationGrant } from "./grants.ts";
 
+/**
+ * One curated operation's egress surface. The proxy matches `methods` and
+ * `path_globs` independently INSIDE one inject entry, so the REST paths and
+ * the gRPC full-method paths must never share an entry: a shared
+ * `["GET","POST"]` entry would allow `POST` on a REST resource path, which is
+ * the provider's WRITE verb (for example `timeSeries.create`).
+ */
 interface GoogleOperationPolicy {
   host: string;
-  methods: string[];
-  paths: string[];
+  /** REST surface: these methods bind to these path globs only. Resource
+   * constraints narrow these paths. */
+  rest: { methods: string[]; paths: string[] };
+  /** gRPC full-method paths. Always POST-only, in their own inject entry.
+   * A resource constraint cannot scope a gRPC request body, so a constrained
+   * grant drops the gRPC surface. */
+  grpcPaths: string[];
 }
 
 function constrainedPaths(operation: string, defaults: string[], constraints: readonly string[]): string[] {
@@ -62,59 +74,56 @@ function matchersOverlap(a: IntegrationInjectJson, b: IntegrationInjectJson): bo
 const CURATED_GOOGLE_OPERATIONS: Record<string, GoogleOperationPolicy> = {
   "compute.instances.get": {
     host: "compute.googleapis.com",
-    methods: ["GET"],
-    paths: ["/compute/v1/projects/*/zones/*/instances/*"],
+    rest: { methods: ["GET"], paths: ["/compute/v1/projects/*/zones/*/instances/*"] },
+    grpcPaths: [],
   },
   "compute.instances.start": {
     host: "compute.googleapis.com",
-    methods: ["POST"],
-    paths: ["/compute/v1/projects/*/zones/*/instances/*/start"],
+    rest: { methods: ["POST"], paths: ["/compute/v1/projects/*/zones/*/instances/*/start"] },
+    grpcPaths: [],
   },
   "compute.instances.stop": {
     host: "compute.googleapis.com",
-    methods: ["POST"],
-    paths: ["/compute/v1/projects/*/zones/*/instances/*/stop"],
+    rest: { methods: ["POST"], paths: ["/compute/v1/projects/*/zones/*/instances/*/stop"] },
+    grpcPaths: [],
   },
   "logging.entries.list": {
     host: "logging.googleapis.com",
-    methods: ["POST"],
-    paths: [
-      "/v2/entries:list",
-      "/google.logging.v2.LoggingServiceV2/ListLogEntries",
-    ],
+    // The Logging REST list endpoint is POST by API design.
+    rest: { methods: ["POST"], paths: ["/v2/entries:list"] },
+    grpcPaths: ["/google.logging.v2.LoggingServiceV2/ListLogEntries"],
   },
   "trace.traces.list": {
     host: "cloudtrace.googleapis.com",
-    methods: ["GET"],
-    paths: ["/v1/projects/*/traces"],
+    rest: { methods: ["GET"], paths: ["/v1/projects/*/traces"] },
+    grpcPaths: [],
   },
   "trace.traces.get": {
     host: "cloudtrace.googleapis.com",
-    methods: ["GET"],
-    paths: ["/v1/projects/*/traces/*"],
+    rest: { methods: ["GET"], paths: ["/v1/projects/*/traces/*"] },
+    grpcPaths: [],
   },
   "monitoring.metricdescriptors.list": {
     host: "monitoring.googleapis.com",
-    methods: ["GET", "POST"],
-    paths: [
-      "/v3/projects/*/metricDescriptors",
-      "/google.monitoring.v3.MetricService/ListMetricDescriptors",
-    ],
+    rest: { methods: ["GET"], paths: ["/v3/projects/*/metricDescriptors"] },
+    grpcPaths: ["/google.monitoring.v3.MetricService/ListMetricDescriptors"],
   },
   "monitoring.timeseries.list": {
     host: "monitoring.googleapis.com",
-    methods: ["GET", "POST"],
-    paths: ["/v3/projects/*/timeSeries", "/google.monitoring.v3.MetricService/ListTimeSeries"],
+    rest: { methods: ["GET"], paths: ["/v3/projects/*/timeSeries"] },
+    grpcPaths: ["/google.monitoring.v3.MetricService/ListTimeSeries"],
   },
   "container.clusters.get": {
     host: "container.googleapis.com",
-    methods: ["GET"],
-    paths: ["/v1/projects/*/locations/*/clusters/*"],
+    rest: { methods: ["GET"], paths: ["/v1/projects/*/locations/*/clusters/*"] },
+    grpcPaths: [],
   },
   "iap.tunnel": {
     host: "tunnel.cloudproxy.app",
-    methods: ["GET", "POST"],
-    paths: ["/v4/connect*"],
+    // The IAP tunnel endpoint upgrades a GET and accepts POST control frames.
+    // Both verbs address the same non-REST endpoint, so one entry is correct.
+    rest: { methods: ["GET", "POST"], paths: ["/v4/connect*"] },
+    grpcPaths: [],
   },
 };
 
@@ -145,43 +154,58 @@ export function appendGooglePolicy(
         Code.FailedPrecondition,
       );
     }
+    // One inject entry per {methods, paths} surface. The proxy matches methods
+    // and paths independently inside one entry, so a curated read operation
+    // must keep its GET-only REST paths and its POST-only gRPC paths apart.
+    const surfaces: Array<{ methods: string[]; paths: string[] }> = curated
+      ? [
+          {
+            methods: curated.rest.methods,
+            paths: constrainedPaths(grant.operation, curated.rest.paths, grant.resourceConstraints),
+          },
+          ...(curated.grpcPaths.length > 0 && grant.resourceConstraints.length === 0
+            ? [{ methods: ["POST"], paths: curated.grpcPaths }]
+            : []),
+        ]
+      : [{
+          methods: [],
+          paths: constrainedPaths(grant.operation, [], grant.resourceConstraints),
+        }];
     for (const host of hosts) {
       const isGoogleApi = host.endsWith(".googleapis.com");
       if (grant.operation === "api.call" && !isGoogleApi) continue;
       if (grant.operation === "gke.api.call" && isGoogleApi) continue;
-      const entry: IntegrationInjectJson = {
-        hosts: [host],
-        header_name: "",
-        header_template: "",
-        secret_ref: "",
-        mint_source: {
-          connection: {
-            connection_id: connection.id,
-            provider: connection.provider,
+      for (const surface of surfaces) {
+        const entry: IntegrationInjectJson = {
+          hosts: [host],
+          header_name: "",
+          header_template: "",
+          secret_ref: "",
+          mint_source: {
+            connection: {
+              connection_id: connection.id,
+              provider: connection.provider,
+            },
           },
-        },
-        methods: curated?.methods ?? [],
-        path_globs: constrainedPaths(
-          grant.operation,
-          curated?.paths ?? [],
-          grant.resourceConstraints,
-        ).map((path) => `segment-path:${path}`),
-        graphql_operation: "",
-        graphql_field: "",
-      };
-      const conflict = policy.injects.find((candidate) =>
-        candidate.hosts.includes(host) &&
-        candidate.mint_source != null &&
-        candidate.mint_source.connection.connection_id !== connection.id &&
-        matchersOverlap(candidate, entry)
-      );
-      if (conflict) {
-        throw new ConnectError(
-          `Google Cloud grants select conflicting credentials for ${host}`,
-          Code.InvalidArgument,
+          methods: surface.methods,
+          path_globs: surface.paths.map((path) => `segment-path:${path}`),
+          graphql_operation: "",
+          graphql_field: "",
+        };
+        const conflict = policy.injects.find((candidate) =>
+          candidate.hosts.includes(host) &&
+          candidate.mint_source != null &&
+          candidate.mint_source.connection.connection_id !== connection.id &&
+          matchersOverlap(candidate, entry)
         );
+        if (conflict) {
+          throw new ConnectError(
+            `Google Cloud grants select conflicting credentials for ${host}`,
+            Code.InvalidArgument,
+          );
+        }
+        policy.injects.push(entry);
       }
-      policy.injects.push(entry);
       if (!policy.network.allow_hosts.includes(host)) policy.network.allow_hosts.push(host);
     }
   }
