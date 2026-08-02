@@ -4067,17 +4067,21 @@ impl PooledBackend {
         // session binding + does the synchronous coord publish itself.
         // Budget the WHOLE fan-out against `deadline` — a single
         // tokio::time::timeout around the join handles the per-sandbox
-        // parallelism + the global cap in one place. The JoinHandles
-        // deliberately live OUTSIDE the timed future: on overrun the
-        // tasks must be ABORTED, not merely no-longer-awaited (see the
-        // overrun arm below).
+        // parallelism + the global cap in one place. The `JoinSet`
+        // deliberately lives OUTSIDE the timed future: on overrun the
+        // tasks must be ABORTED, not merely no-longer-awaited (see
+        // `join_all_within`'s overrun arm). A `JoinSet`, NOT a
+        // `Vec<JoinHandle>`: `join_next` removes each task as it
+        // completes, so the overrun arm can never re-poll a handle the
+        // timed join already consumed (2026-08-02 RCA, see
+        // `join_all_within`).
         let publish = self.shutdown_manifest_publish.clone();
         let session_bindings = self.session_bindings.clone();
-        let mut tasks = Vec::with_capacity(entries.len());
+        let mut tasks = tokio::task::JoinSet::new();
         for (sandbox_id, backend, device) in entries {
             let publish = publish.clone();
             let session_id = session_bindings.get(&sandbox_id).map(|e| *e);
-            tasks.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 // 2026-07-16 RCA: FC's drive is buffered host I/O with
                 // cache_type=Unsafe, so guest-acked writes can still be
                 // sitting in the HOST page cache for /dev/nbdN — a tier
@@ -4189,41 +4193,11 @@ impl PooledBackend {
                          covers a same-node successor",
                     ),
                 }
-            }));
+            });
         }
-        let join_all = async {
-            for t in tasks.iter_mut() {
-                let _ = t.await;
-            }
-        };
 
-        let overran = tokio::time::timeout(deadline, join_all).await.is_err();
+        let overran = Self::join_all_within(&mut tasks, deadline).await;
         if overran {
-            // Deadline overrun: ABORT the in-flight flush tasks and reap
-            // each one before returning, so the abandon sweep that runs
-            // next can never race a still-live flush. Dropping the join
-            // future alone left the tokio::spawn'd flushes running
-            // DETACHED (2026-07-21 session-af28cac4 RCA): a detached
-            // final flush rebased + published v368 while the sweep's
-            // spool export had already snapshotted the dirty tier and
-            // then stamped the spool with the pre-rebase v367 head — the
-            // successor refused the behind-stamped spool per the
-            // `shutdown-spool-lineage-mismatch` gate and rolled the live
-            // guest's acked writes back under it. Aborting is safe at
-            // every await point in the flush pipeline: the manifest-ref
-            // rebase precedes the pending-tier drop, so a killed flush
-            // at worst leaves chunks to be exported redundantly
-            // (content-addressed, idempotent) or a store-ahead manifest
-            // the adopt gate's `>=` arm already covers. The almost-done
-            // upload's progress is forfeit — acceptable: those bytes
-            // ride the spool instead, which is what the post-deadline
-            // grace headroom exists for.
-            for t in &tasks {
-                t.abort();
-            }
-            for t in tasks.iter_mut() {
-                let _ = t.await;
-            }
             // Some survivors were not GCS-flushed in time. This is not a
             // data-loss event: the abandon sweep that runs next exports
             // every still-dirty tier to the node-local shutdown spool
@@ -4259,6 +4233,56 @@ impl PooledBackend {
                 }
             }
         }
+    }
+
+    /// Await every flush task in `tasks` within `deadline`; return `true`
+    /// on overrun. On overrun, ABORT the still-running tasks and reap
+    /// each one before returning, so the abandon sweep that runs next
+    /// can never race a still-live flush. Dropping the join future
+    /// alone left the tokio::spawn'd flushes running DETACHED
+    /// (2026-07-21 session-af28cac4 RCA): a detached final flush
+    /// rebased + published v368 while the sweep's spool export had
+    /// already snapshotted the dirty tier and then stamped the spool
+    /// with the pre-rebase v367 head — the successor refused the
+    /// behind-stamped spool per the `shutdown-spool-lineage-mismatch`
+    /// gate and rolled the live guest's acked writes back under it.
+    /// Aborting is safe at every await point in the flush pipeline:
+    /// the manifest-ref rebase precedes the pending-tier drop, so a
+    /// killed flush at worst leaves chunks to be exported redundantly
+    /// (content-addressed, idempotent) or a store-ahead manifest the
+    /// adopt gate's `>=` arm already covers. The almost-done upload's
+    /// progress is forfeit — acceptable: those bytes ride the spool
+    /// instead, which is what the post-deadline grace headroom exists
+    /// for.
+    ///
+    /// A `JoinSet`, NOT a `Vec<JoinHandle>` (2026-08-02 durability-
+    /// rollback RCA): the old shape re-awaited EVERY handle in the
+    /// overrun arm, including the ones the timed join had already
+    /// polled to completion — and a completed `JoinHandle` PANICS on
+    /// its next poll ("JoinHandle polled after completion"). So a
+    /// deadline overrun with at least one finished flush panicked the
+    /// SIGTERM path between the flush pass and the abandon sweep:
+    /// process unwind ran `NbdHandle::Drop`'s netlink disconnect on
+    /// every survivor's live device, the shutdown-spool export never
+    /// ran, and the quarantined survivors came back uncapturable —
+    /// the coordinator destroyed them and 8 sessions rolled back past
+    /// acked writes. `JoinSet::join_next` REMOVES a task from the set
+    /// when it yields it, so no task can ever be polled twice.
+    //
+    // `any(..., test)`: the only src caller is the linux-gated flush
+    // pass, but the regression tests below must compile on macOS too.
+    #[cfg(any(target_os = "linux", test))]
+    async fn join_all_within(
+        tasks: &mut tokio::task::JoinSet<()>,
+        deadline: std::time::Duration,
+    ) -> bool {
+        let join_all = async { while tasks.join_next().await.is_some() {} };
+        if tokio::time::timeout(deadline, join_all).await.is_ok() {
+            return false;
+        }
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        true
     }
 
     /// ADR 0044 K2 graceful shutdown: abandon every live NBD data
@@ -9852,6 +9876,51 @@ mod tests {
     use crate::image_cache::ImageBundle;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_sandbox_process::ProcessBackend;
+
+    /// 2026-08-02 durability-rollback RCA regression: a deadline overrun
+    /// with a MIX of already-completed and still-running flush tasks
+    /// must abort + reap the stragglers without re-polling the
+    /// completed ones. The old `Vec<JoinHandle>` shape re-awaited every
+    /// handle in the overrun arm and panicked ("JoinHandle polled after
+    /// completion"), unwinding the SIGTERM path before the abandon
+    /// sweep — the panic that destroyed 8 sessions' survivors. Paused
+    /// clock: the deadline elapses deterministically, no real sleeping.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_flush_join_overrun_with_completed_tasks_does_not_panic() {
+        let mut tasks = tokio::task::JoinSet::new();
+        // Completes immediately — the timed join reaps it, which is
+        // exactly the state that made the old overrun arm re-poll a
+        // consumed handle.
+        tasks.spawn(async {});
+        // Never completes — forces the deadline overrun.
+        tasks.spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        let overran =
+            PooledBackend::join_all_within(&mut tasks, std::time::Duration::from_secs(20)).await;
+
+        assert!(overran, "the pending task must trip the deadline");
+        assert!(
+            tasks.is_empty(),
+            "every task must be reaped before the abandon sweep runs",
+        );
+    }
+
+    /// The no-overrun path: all tasks finish inside the deadline, the
+    /// join reports no overrun, and the set is fully drained.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_flush_join_within_deadline_reports_no_overrun() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async {});
+        tasks.spawn(async {});
+
+        let overran =
+            PooledBackend::join_all_within(&mut tasks, std::time::Duration::from_secs(20)).await;
+
+        assert!(!overran);
+        assert!(tasks.is_empty());
+    }
 
     #[tokio::test]
     async fn google_adc_requires_the_local_egress_proxy() {
