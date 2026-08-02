@@ -193,26 +193,7 @@ async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> SocketAddr {
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut tls = acceptor.accept(stream).await.unwrap();
-        // Drain until we see the HTTP headers terminator. A single
-        // `read()` is not enough — the proxy can flush the rewritten
-        // request across several TLS records, and which boundary a
-        // record lands on depends on scheduling. The body is empty in
-        // both test cases (Content-Length: 0), so `\r\n\r\n` marks the
-        // full request.
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 8192];
-        loop {
-            match tls.read(&mut tmp).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    buf.extend_from_slice(&tmp[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        let buf = read_http1_request(&mut tls).await;
         captured.lock().extend_from_slice(&buf);
         let _ = tls
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
@@ -309,18 +290,15 @@ async fn substitutes_placeholder_in_intercept_path() {
     // about substitution correctness here, not perfect TLS
     // shutdown choreography (which is finicky to get clean across
     // tokio duplex pipes).
-    let mut resp = [0u8; 1024];
-    let _ = tls_client.read(&mut resp).await;
-    let _ = tls_client.shutdown().await;
+    let mut sink = Vec::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let _ = tls_client.read_to_end(&mut sink).await;
+    })
+    .await;
     drop(tls_client);
 
     let outcome = proxy_task.await.unwrap();
-    if let Err(e) = &outcome {
-        let msg = format!("{e}");
-        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
-            panic!("proxy returned unexpected error: {e}");
-        }
-    }
+    outcome.expect("the proxy must complete a permitted request");
 
     let body = String::from_utf8(captured.lock().clone()).unwrap();
     assert!(
@@ -505,18 +483,15 @@ async fn injects_header_on_allowed_request() {
         .await
         .unwrap();
     tls_client.flush().await.unwrap();
-    let mut resp = [0u8; 1024];
-    let _ = tls_client.read(&mut resp).await;
-    let _ = tls_client.shutdown().await;
+    let mut sink = Vec::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let _ = tls_client.read_to_end(&mut sink).await;
+    })
+    .await;
     drop(tls_client);
 
     let outcome = proxy_task.await.unwrap();
-    if let Err(e) = &outcome {
-        let msg = format!("{e}");
-        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
-            panic!("proxy returned unexpected error: {e}");
-        }
-    }
+    outcome.expect("the proxy must complete a permitted request");
 
     let body = String::from_utf8(captured.lock().clone()).unwrap();
     assert!(
@@ -1015,6 +990,47 @@ async fn near_expiry_inject_is_reminted_before_forwarding() {
 
 /// A TLS upstream that captures the request head, then replies with the given
 /// response bytes and closes. Used by the observe tests to return a JSON body.
+/// Read a whole HTTP/1 request: the header block, then the body its
+/// `Content-Length` declares.
+///
+/// Stopping at the header terminator is what a fixture wants to do and what a
+/// real server never does. It made the GraphQL tests flaky: those requests
+/// carry a body, so when the head and the body landed in different TLS records
+/// the upstream answered and closed the connection while the proxy was still
+/// writing, and the proxy failed with `broken pipe`. It also made `captured`
+/// non-deterministic — the body was present only when it rode the same record.
+async fn read_http1_request<S>(tls: &mut S) -> Vec<u8>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let head_end = loop {
+        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+        match tls.read(&mut tmp).await {
+            Ok(0) => return buf,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(_) => return buf,
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+    let content_length = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    while buf.len() < head_end + content_length {
+        match tls.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
 async fn fake_upstream_resp(captured: Arc<Mutex<Vec<u8>>>, response: Vec<u8>) -> SocketAddr {
     let mut params = CertificateParams::new(vec!["fake-upstream".to_string()]).unwrap();
     params.distinguished_name = {
@@ -1039,20 +1055,7 @@ async fn fake_upstream_resp(captured: Arc<Mutex<Vec<u8>>>, response: Vec<u8>) ->
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut tls = acceptor.accept(stream).await.unwrap();
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 8192];
-        loop {
-            match tls.read(&mut tmp).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    buf.extend_from_slice(&tmp[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        let buf = read_http1_request(&mut tls).await;
         captured.lock().extend_from_slice(&buf);
         let _ = tls.write_all(&response).await;
         let _ = tls.shutdown().await;
@@ -1145,12 +1148,7 @@ async fn observes_response_and_emits_asset() {
     drop(tls_client);
 
     let outcome = proxy_task.await.unwrap();
-    if let Err(e) = &outcome {
-        let msg = format!("{e}");
-        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
-            panic!("proxy returned unexpected error: {e}");
-        }
-    }
+    outcome.expect("the proxy must complete a permitted request");
 
     // The client received the real upstream response (forwarded unchanged).
     assert!(
@@ -1358,12 +1356,16 @@ async fn run_graphql_inject(
     let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
     tls_client.write_all(&request).await.unwrap();
     tls_client.flush().await.unwrap();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        let mut buf = [0u8; 1024];
-        let _ = tls_client.read(&mut buf).await;
+    // Read to EOF rather than taking one read and dropping the socket. The
+    // proxy forces `Connection: close`, so EOF is the end of the exchange —
+    // and tearing the client down before the proxy finished writing gave the
+    // proxy a `broken pipe`, which is what the "tolerated error" lists in these
+    // tests were really hiding.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut sink = Vec::new();
+        let _ = tls_client.read_to_end(&mut sink).await;
     })
     .await;
-    let _ = tls_client.shutdown().await;
     drop(tls_client);
 
     let outcome = proxy_task.await.unwrap();
@@ -1379,12 +1381,7 @@ async fn graphql_allows_mapped_mutation() {
         "mutation { mergePullRequest(input: {}) { clientMutationId } }",
     ));
     let (outcome, captured) = run_graphql_inject(ca, vec![inj], req).await;
-    if let Err(e) = &outcome {
-        let msg = format!("{e}");
-        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
-            panic!("proxy returned unexpected error: {e}");
-        }
-    }
+    outcome.expect("the proxy must complete a permitted request");
     let seen = String::from_utf8_lossy(&captured);
     assert!(
         seen.contains("Authorization: Bearer tok-abc\r\n"),
@@ -1438,12 +1435,7 @@ async fn graphql_multi_field_query_injects_one_authorization_header() {
         "query { viewer { login } repository(owner: \"o\", name: \"r\") { id } }",
     ));
     let (outcome, captured) = run_graphql_inject(ca, vec![viewer, repository], req).await;
-    if let Err(e) = &outcome {
-        let msg = format!("{e}");
-        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
-            panic!("proxy returned unexpected error: {e}");
-        }
-    }
+    outcome.expect("the proxy must complete a permitted request");
     let seen = String::from_utf8_lossy(&captured);
     assert_eq!(
         seen.to_ascii_lowercase().matches("authorization:").count(),
@@ -1462,12 +1454,7 @@ async fn graphql_allows_aliased_field() {
         "mutation { a: mergePullRequest(input: {}) { clientMutationId } }",
     ));
     let (outcome, captured) = run_graphql_inject(ca, vec![inj], req).await;
-    if let Err(e) = &outcome {
-        let msg = format!("{e}");
-        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
-            panic!("proxy returned unexpected error: {e}");
-        }
-    }
+    outcome.expect("the proxy must complete a permitted request");
     assert!(String::from_utf8_lossy(&captured).contains("Authorization: Bearer tok-abc\r\n"));
 }
 
@@ -1484,12 +1471,7 @@ async fn graphql_allows_aliased_type_introspection() {
         "query PullRequest_fields{PullRequest: __type(name: \"PullRequest\"){fields(includeDeprecated: true){name}},StatusCheckRollupContextConnection: __type(name: \"StatusCheckRollupContextConnection\"){fields(includeDeprecated: true){name}}}",
     ));
     let (outcome, captured) = run_graphql_inject(ca, vec![inj], req).await;
-    if let Err(e) = &outcome {
-        let msg = format!("{e}");
-        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
-            panic!("proxy returned unexpected error: {e}");
-        }
-    }
+    outcome.expect("the proxy must complete a permitted request");
     let seen = String::from_utf8_lossy(&captured);
     assert!(seen.contains("Authorization: Bearer tok-abc\r\n"));
 }
@@ -1785,30 +1767,40 @@ async fn h2_upstream(seen_authorization: Arc<Mutex<Option<String>>>) -> SocketAd
         assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
         let mut server = h2::server::handshake(tls).await.unwrap();
         while let Some(Ok((request, mut respond))) = server.accept().await {
-            *seen_authorization.lock() = request
-                .headers()
-                .get("authorization")
-                .map(|value| value.to_str().unwrap().to_string());
-            let mut body = request.into_body();
-            while let Some(Ok(data)) = body.data().await {
-                body.flow_control().release_capacity(data.len()).unwrap();
-            }
-            let response = http::Response::builder()
-                .status(200)
-                .header("content-type", "application/grpc")
-                .header("x-reflected-token", "dd-secret-xyz")
-                .body(())
-                .unwrap();
-            let mut out = respond.send_response(response, false).unwrap();
-            out.send_data(bytes::Bytes::from_static(b"token=dd-secret-xyz"), false)
-                .unwrap();
-            let mut trailers = http::HeaderMap::new();
-            trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
-            trailers.insert(
-                "x-trailer-token",
-                http::HeaderValue::from_static("dd-secret-xyz"),
-            );
-            out.send_trailers(trailers).unwrap();
+            // Handle the stream in its own task. `server.accept()` is what
+            // drives this connection's I/O, so awaiting the request body inline
+            // stops the connection from ever reading the DATA frames that body
+            // is waiting for. It only appeared to work because the DATA usually
+            // rides the same TCP segment as the HEADERS and is already buffered
+            // when `accept()` returns; when it arrived in a later segment the
+            // exchange hung.
+            let seen = seen_authorization.clone();
+            tokio::spawn(async move {
+                *seen.lock() = request
+                    .headers()
+                    .get("authorization")
+                    .map(|value| value.to_str().unwrap().to_string());
+                let mut body = request.into_body();
+                while let Some(Ok(data)) = body.data().await {
+                    body.flow_control().release_capacity(data.len()).unwrap();
+                }
+                let response = http::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/grpc")
+                    .header("x-reflected-token", "dd-secret-xyz")
+                    .body(())
+                    .unwrap();
+                let mut out = respond.send_response(response, false).unwrap();
+                out.send_data(bytes::Bytes::from_static(b"token=dd-secret-xyz"), false)
+                    .unwrap();
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+                trailers.insert(
+                    "x-trailer-token",
+                    http::HeaderValue::from_static("dd-secret-xyz"),
+                );
+                out.send_trailers(trailers).unwrap();
+            });
         }
     });
     addr
@@ -1897,7 +1889,7 @@ async fn h2_intercept_injects_and_redacts_across_headers_body_and_trailers() {
     request_body
         .send_data(bytes::Bytes::from_static(b"ping"), true)
         .unwrap();
-    let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+    let response = tokio::time::timeout(std::time::Duration::from_secs(30), response)
         .await
         .expect("the h2 leg must complete")
         .unwrap();

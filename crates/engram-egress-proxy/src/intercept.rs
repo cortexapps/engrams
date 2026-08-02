@@ -498,17 +498,32 @@ where
     // is everything.
     let (mut client_read, mut client_write) = tokio::io::split(client_tls);
     let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream_tls);
+    // The gated request is already written and checked above. What remains is a
+    // body that continues past the buffered head, and it is best-effort: we
+    // force `Connection: close`, so a correct upstream may answer and close its
+    // read half while the guest is still writing. That is a normal end of the
+    // exchange, not a proxy failure — reporting it as one made every such
+    // request log an error and turned the e2e tests flaky (`broken pipe`). A
+    // truncated request is still visible: the upstream answers with an error,
+    // and that answer reaches the guest verbatim.
+    //
+    // Both halves stay concurrent. An upstream that withholds its response
+    // until it has the whole body would otherwise deadlock against a guest that
+    // waits for the response before finishing its own write.
     let request = async {
-        tokio::io::copy(&mut client_read, &mut upstream_write).await?;
-        upstream_write.shutdown().await
+        let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
+        let _ = upstream_write.shutdown().await;
     };
+    // The response half keeps failing closed: it carries the redaction and the
+    // framing-completeness check.
     let response = copy_redacting_response(
         &mut upstream_read,
         &mut client_write,
         &response_redactions,
         head_request,
     );
-    tokio::try_join!(request, response)?;
+    let (_, response_result) = tokio::join!(request, response);
+    response_result?;
     Ok(())
 }
 
