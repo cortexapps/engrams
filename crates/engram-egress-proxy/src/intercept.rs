@@ -929,6 +929,31 @@ async fn evaluate_stream<'a>(
             .collect()
     };
 
+    // ADR 0109 (A3): one structured event per gated request that we ALLOW.
+    // Denials were already logged (`proxy::handle`); a successful brokered call
+    // left no trace at all, so an operator answering "what did this session do
+    // with that service account?" had nothing to read. Emitted from the shared
+    // gate, so both protocols report it identically.
+    //
+    // The query string is dropped. It carries filters and page tokens — the
+    // permission boundary is the resource path, and a query can hold customer
+    // data we must not copy into host logs. No credential, header value or body
+    // byte appears here.
+    tracing::info!(
+        session_id = %context.session_id,
+        target = context.sni,
+        %method,
+        path = path_without_query(path),
+        credential_source = ?matched
+            .iter()
+            .filter_map(|entry| entry.mint_source.as_ref())
+            .collect::<Vec<_>>(),
+        injected = matched.len(),
+        observed = firing.len(),
+        outcome = "allowed",
+        "egress request permitted by integration policy",
+    );
+
     Ok(StreamPlan {
         response_redactions: response_redactions(context.sni, context.secrets, &matched),
         matched,
