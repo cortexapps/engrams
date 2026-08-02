@@ -47,6 +47,7 @@ import { IconPicker } from "../../components/profiles/IconPicker";
 import { PowerSelector } from "../../components/profiles/PowerSelector";
 import { PolicyRail } from "../../components/profiles/PolicyRail";
 import { ProviderTile } from "../../components/integrations/ProviderTile";
+import { GOOGLE_CLOUD_OPERATIONS } from "../../components/integrations/googleCloud";
 import { HostChip } from "../../components/integrations/chips";
 import {
   EnvVarsEditor,
@@ -83,18 +84,6 @@ const linesOf = (text: string) =>
     .filter(Boolean);
 
 const optionId = (value: string | null | undefined): string | null => value?.trim() || null;
-
-const GOOGLE_OPERATIONS = [
-  ["compute.instances.get", "Describe Compute Engine instances"],
-  ["compute.instances.start", "Start Compute Engine instances"],
-  ["compute.instances.stop", "Stop Compute Engine instances"],
-  ["logging.entries.list", "Read Cloud Logging entries"],
-  ["trace.traces.list", "Read Cloud Trace"],
-  ["container.clusters.get", "Get GKE cluster credentials"],
-  ["iap.tunnel", "Open IAP tunnels"],
-  ["gke.api.call", "Call the configured GKE API server"],
-  ["api.call", "Call configured Google APIs"],
-] as const;
 
 const schema = z.object({
   name: z.string().trim().min(1, "Name the profile first"),
@@ -284,7 +273,9 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       ),
     [capabilities, network, secretRows, views, harnessDescriptor],
   );
-  const connected = views.filter((v) => v.status === "connected");
+  const connected = views.filter(
+    (view) => view.status === "connected" && view.connectionModel !== "named",
+  );
   const googleConnections = (connectionData?.connections ?? []).filter(
     (connection) => connection.provider === "gcp" && connection.enabled,
   );
@@ -724,10 +715,9 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                   );
                 })}
                 {googleConnections.map((connection) => {
-                  const selectedOperations = GOOGLE_OPERATIONS.filter(([operation]) =>
+                  const selectedOperations = GOOGLE_CLOUD_OPERATIONS.filter(({ action }) =>
                     integrationGrants.some(
-                      (grant) =>
-                        grant.connectionId === connection.id && grant.operation === operation,
+                      (grant) => grant.connectionId === connection.id && grant.operation === action,
                     ),
                   );
                   return (
@@ -755,22 +745,24 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                         </Text>
                       </div>
                       <div className="divide-y border-t">
-                        {GOOGLE_OPERATIONS.map(([operation, label]) => {
-                          const checked = selectedOperations.some(([value]) => value === operation);
+                        {GOOGLE_CLOUD_OPERATIONS.map(({ action, label }) => {
+                          const checked = selectedOperations.some(
+                            (operation) => operation.action === action,
+                          );
                           return (
                             <label
-                              key={operation}
+                              key={action}
                               className="flex cursor-pointer items-center gap-3 px-3.5 py-2.5 text-sm"
                             >
                               <Switch
                                 checked={checked}
                                 aria-label={`${connection.displayName} ${label}`}
                                 onCheckedChange={(value) =>
-                                  toggleConnectionOperation(connection.id, operation, value)
+                                  toggleConnectionOperation(connection.id, action, value)
                                 }
                               />
                               <span className="flex-1">{label}</span>
-                              <code className="text-[10px] text-muted-foreground">{operation}</code>
+                              <code className="text-[10px] text-muted-foreground">{action}</code>
                             </label>
                           );
                         })}
