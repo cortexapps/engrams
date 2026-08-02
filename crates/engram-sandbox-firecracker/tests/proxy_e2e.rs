@@ -30,6 +30,7 @@ mod common;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -141,6 +142,69 @@ async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> (SocketAddr, rustls::Ro
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca_der).unwrap();
     (addr, roots)
+}
+
+/// Model the metadata-concealment listener that GKE installs before the
+/// host-agent starts. Production returned this exact response when its broader
+/// PREROUTING rule won before the Engrams metadata redirect.
+async fn fake_platform_metadata(hits: Arc<AtomicUsize>) -> SocketAddr {
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            hits.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 16\r\nConnection: close\r\n\r\nUnauthenticated",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// Install a competing metadata rule before `host_startup`. The real GKE rule
+/// matches all non-eth0 bridge traffic; this test narrows it to the cold-path
+/// TAP so unrelated CI traffic cannot affect the assertion.
+fn install_platform_metadata_rule(port: u16) {
+    let output = std::process::Command::new("iptables")
+        .args([
+            "-t",
+            "nat",
+            "-A",
+            "PREROUTING",
+            "-i",
+            "tap-engr-+",
+            "-p",
+            "tcp",
+            "-d",
+            "169.254.169.254",
+            "--dport",
+            "80",
+            "-j",
+            "REDIRECT",
+            "--to-ports",
+            &port.to_string(),
+            "-m",
+            "comment",
+            "--comment",
+            "engram-test-platform-metadata",
+        ])
+        .output()
+        .expect("install competing metadata rule");
+    assert!(
+        output.status.success(),
+        "install competing metadata rule: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 /// Delete every `tap-engr-*` device on the host. Stale TAPs from
@@ -263,6 +327,13 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     tokio::spawn(async move {
         proxy.serve(listeners).await;
     });
+
+    // Reproduce the production GKE ordering: a platform metadata rule exists
+    // before Firecracker host startup installs Engrams' redirect. The Engrams
+    // rule must be inserted ahead of this rule, not appended after it.
+    let platform_metadata_hits = Arc::new(AtomicUsize::new(0));
+    let platform_metadata_addr = fake_platform_metadata(platform_metadata_hits.clone()).await;
+    install_platform_metadata_rule(platform_metadata_addr.port());
 
     // ---- 3. Bake a rootfs with engram-agentd + curl + /etc/hosts seed ----
     // The in-VM curl validates the proxy-minted leaf via the host CA bundle
@@ -482,5 +553,10 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     assert!(
         stdout.contains(engram_egress_proxy::metadata::PLACEHOLDER_TOKEN),
         "guest metadata discovery should receive only the placeholder token; got: {stdout}",
+    );
+    assert_eq!(
+        platform_metadata_hits.load(Ordering::Relaxed),
+        0,
+        "the pre-existing platform metadata rule must not intercept Engrams VM traffic",
     );
 }

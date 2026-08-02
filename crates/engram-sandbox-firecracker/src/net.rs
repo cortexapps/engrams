@@ -433,9 +433,16 @@ pub fn host_startup_lines(
              -m comment --comment engram-proxy-redirect",
         ));
         if let Some(metadata_port) = metadata_port {
+            // GKE nodes install a metadata-concealment DNAT near the top of
+            // PREROUTING before the host-agent starts. Appending these rules
+            // lets that broader rule capture 169.254.169.254:80 first, so the
+            // guest sees GKE's 403 instead of the session-scoped ADC endpoint.
+            // Insert our interface-specific redirects at the head of the
+            // chain. They affect only Engrams VM traffic and must win before
+            // any platform metadata rule.
             for interface in ["tap-engr-+", "vh-engr-+"] {
                 out.push(format!(
-                    "-t nat -A PREROUTING -i {interface} -p tcp \
+                    "-t nat -I PREROUTING 1 -i {interface} -p tcp \
                      -d 169.254.169.254 --dport 80 \
                      -j REDIRECT --to-port {metadata_port} \
                      -m comment --comment engram-metadata-redirect",
@@ -754,6 +761,7 @@ fn check_form(line: &str) -> String {
         .replacen("-A FORWARD", "-C FORWARD", 1)
         .replacen("-I INPUT 1", "-C INPUT", 1)
         .replacen("-A INPUT", "-C INPUT", 1)
+        .replacen("-t nat -I PREROUTING 1", "-t nat -C PREROUTING", 1)
         .replacen("-t nat -A PREROUTING", "-t nat -C PREROUTING", 1)
         .replacen("-t nat -A POSTROUTING", "-t nat -C POSTROUTING", 1)
 }
@@ -1820,13 +1828,28 @@ mod tests {
     }
 
     #[test]
-    fn host_startup_routes_only_the_metadata_address_to_the_adc_listener() {
+    fn host_startup_inserts_metadata_redirects_ahead_of_platform_rules() {
         let lines = host_startup_lines(Some(8443), Some(5353), Some(13338), None).join("\n");
-        assert!(lines.contains("-i tap-engr-+ -p tcp -d 169.254.169.254 --dport 80"));
-        assert!(lines.contains("-i vh-engr-+ -p tcp -d 169.254.169.254 --dport 80"));
+        assert!(lines
+            .contains("-t nat -I PREROUTING 1 -i tap-engr-+ -p tcp -d 169.254.169.254 --dport 80"));
+        assert!(lines
+            .contains("-t nat -I PREROUTING 1 -i vh-engr-+ -p tcp -d 169.254.169.254 --dport 80"));
         assert!(lines.contains("--to-port 13338"));
         assert!(lines.contains("--dport 13338 -j ACCEPT"));
         assert!(!lines.contains("-p tcp --dport 80 -j REDIRECT"));
+    }
+
+    #[test]
+    fn check_form_handles_inserted_metadata_redirects() {
+        let rule = "-t nat -I PREROUTING 1 -i tap-engr-+ -p tcp \
+                    -d 169.254.169.254 --dport 80 \
+                    -j REDIRECT --to-port 13338";
+        assert_eq!(
+            check_form(rule),
+            "-t nat -C PREROUTING -i tap-engr-+ -p tcp \
+             -d 169.254.169.254 --dport 80 \
+             -j REDIRECT --to-port 13338"
+        );
     }
 
     #[test]
