@@ -71,6 +71,13 @@ message CreateTaskAutomationAction {
   string prompt_template = 2;
   optional string title_template = 3;
   bool include_event_context = 4;
+  // ADR 0063 B2: the automation's override of the profile's default harness /
+  // model / effort, the same seam the interactive composer uses. Unset = inherit
+  // the profile default. `model`/`effort` are option ids on the EFFECTIVE
+  // harness's descriptor (this override, else the profile's harness).
+  optional string harness = 5;
+  optional string model = 6;
+  optional string effort = 7;
 }
 
 message CreateAutomationRequest {

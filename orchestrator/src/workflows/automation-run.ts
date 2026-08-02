@@ -32,6 +32,12 @@ export interface PreparedAutomationRun {
   profileId: string;
   prompt: string;
   title: string | null;
+  /** ADR 0063 B2: the automation's harness/model/effort override, if any.
+   *  Resolved from the stored action so a retried occurrence launches the same
+   *  harness the render step read. */
+  harness?: string;
+  model?: string;
+  effort?: string;
 }
 
 export interface AutomationTaskCreator {
@@ -169,6 +175,11 @@ export function makeAutomationTaskCreator(
         role: "primary",
         prompt: prepared.prompt,
         registerListener: true,
+        // ADR 0063 B2: the automation's harness/model/effort selection, absent
+        // when it inherits the profile's default.
+        ...(prepared.harness !== undefined ? { harness: prepared.harness } : {}),
+        ...(prepared.model !== undefined ? { model: prepared.model } : {}),
+        ...(prepared.effort !== undefined ? { effort: prepared.effort } : {}),
         // No owner and no policy overrides: the shared compiler keeps profile
         // secrets, env, capabilities, and network policy intact.
       });
@@ -235,6 +246,11 @@ export async function automationRunWorkflowImpl(
           profileId: automation.action.profileId,
           prompt: rendered.prompt,
           title,
+          ...(automation.action.harness !== undefined
+            ? { harness: automation.action.harness }
+            : {}),
+          ...(automation.action.model !== undefined ? { model: automation.action.model } : {}),
+          ...(automation.action.effort !== undefined ? { effort: automation.action.effort } : {}),
         };
       },
       "renderAutomationAction",

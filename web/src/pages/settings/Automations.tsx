@@ -70,6 +70,17 @@ function dateTime(value: string | undefined): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
+/** The automation's harness/model/effort override, or "" when it inherits the
+ *  profile's default (ADR 0063 B2). Ids, not labels — the descriptor labels are
+ *  not loaded on the list page. */
+function overrideSummary(automation: Automation): string {
+  const action = automation.action?.action;
+  if (action?.case !== "createTask") return "";
+  return [action.value.harness, action.value.model, action.value.effort]
+    .filter((part) => !!part)
+    .join(" · ");
+}
+
 function StatusBadge({ status }: { status: string }) {
   const variant =
     status === "launched"
@@ -93,6 +104,7 @@ function AutomationRow({
   const setEnabled = useSetAutomationEnabled();
   const archive = useArchiveAutomation();
   const trigger = automation.trigger?.trigger;
+  const override = overrideSummary(automation);
   const summary =
     trigger?.case === "cron"
       ? `${trigger.value.schedule} · ${trigger.value.timezone}`
@@ -144,6 +156,7 @@ function AutomationRow({
             <span className="truncate">{summary}</span>
           </span>
           <span>Profile: {profileName}</span>
+          {override && <span>Runs on: {override}</span>}
           {automation.nextFireAt && <span>Next: {dateTime(automation.nextFireAt)}</span>}
         </div>
       </Link>

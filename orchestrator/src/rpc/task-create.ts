@@ -447,6 +447,11 @@ export interface CreateSessionForExistingTaskParams {
   role: string;
   ownerUserId?: string;
   prompt?: string;
+  /** ADR 0063 B2: per-session override of the profile's harness / model / effort
+   *  (an automation's stored selection). Unset = the profile's default. */
+  harness?: string;
+  model?: string;
+  effort?: string;
   extraCapabilities?: readonly string[];
   capabilityOverride?: readonly string[];
   networkOverride?: ProfileNetwork;
@@ -541,6 +546,9 @@ export async function createSessionForExistingTask(
       // programmatic credential while still creating the session promptless.
       ...(params.ownerUserId === undefined ? { programmatic: true } : {}),
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
+      ...(params.harness != null ? { harness: params.harness } : {}),
+      ...(params.model != null ? { model: params.model } : {}),
+      ...(params.effort != null ? { effort: params.effort } : {}),
       ...(params.extraCapabilities ? { extraCapabilities: params.extraCapabilities } : {}),
       ...(params.capabilityOverride !== undefined
         ? { capabilityOverride: params.capabilityOverride }

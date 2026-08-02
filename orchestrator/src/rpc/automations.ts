@@ -43,7 +43,11 @@ import {
   loadRegistry,
   type WebhookAliasSpec,
 } from "../connectors/registry.ts";
-import { orgSecret as defaultOrgSecret } from "../control-plane/client.ts";
+import {
+  harnessCatalog as defaultHarnessCatalog,
+  orgSecret as defaultOrgSecret,
+} from "../control-plane/client.ts";
+import type { HarnessCatalogClient } from "./task-create.ts";
 import {
   AutomationTemplateError,
   buildAutomationTemplateContext,
@@ -67,6 +71,7 @@ export interface AutomationDeps {
   store?: AutomationStore;
   profiles?: Pick<ProfileStore, "getActive">;
   connectors?: CustomConnectorSource;
+  harnessCatalog?: HarnessCatalogClient;
   orgSecret?: OrgSecretClient;
   now?: () => Date;
   randomSecret?: () => string;
@@ -216,18 +221,29 @@ function parseTrigger(value: ProtoAutomationTrigger | undefined): AutomationTrig
   }
 }
 
+/** Optional catalog selections may arrive as ""; absent means "inherit". */
+function catalogOptionId(value: string | undefined): string | undefined {
+  return value?.trim() || undefined;
+}
+
 function parseAction(value: ProtoAutomationAction | undefined): AutomationAction {
   if (value?.action.case !== "createTask") {
     throw new ConnectError("create_task automation action is required", Code.InvalidArgument);
   }
   const action = value.action.value;
   const titleTemplate = action.titleTemplate || undefined;
+  const harness = catalogOptionId(action.harness);
+  const model = catalogOptionId(action.model);
+  const effort = catalogOptionId(action.effort);
   return {
     kind: "create_task",
     profileId: requiredText(action.profileId, "action profile_id"),
     promptTemplate: action.promptTemplate,
     ...(titleTemplate !== undefined ? { titleTemplate } : {}),
     includeEventContext: action.includeEventContext,
+    ...(harness !== undefined ? { harness } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(effort !== undefined ? { effort } : {}),
   };
 }
 
@@ -261,6 +277,9 @@ function protoAction(action: AutomationAction): ProtoAutomationAction {
         promptTemplate: action.promptTemplate,
         ...(action.titleTemplate !== undefined ? { titleTemplate: action.titleTemplate } : {}),
         includeEventContext: action.includeEventContext,
+        ...(action.harness !== undefined ? { harness: action.harness } : {}),
+        ...(action.model !== undefined ? { model: action.model } : {}),
+        ...(action.effort !== undefined ? { effort: action.effort } : {}),
       },
     },
   });
@@ -353,6 +372,8 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
   const store = deps?.store ?? makeAutomationStore(getDb());
   const profiles = deps?.profiles ?? makeProfileStore(getDb());
   const connectors = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
+  const harnessCatalog: HarnessCatalogClient =
+    deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
   const now = deps?.now ?? (() => new Date());
   const randomSecret =
     deps?.randomSecret ??
@@ -362,6 +383,49 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       putSecret: (req) => defaultOrgSecret.putSecret(req),
       deleteSecret: (req) => defaultOrgSecret.deleteSecret(req),
     };
+
+  /**
+   * ADR 0063 B2: validate the automation's harness/model/effort override against
+   * the live catalog. The effective harness is the override, else the profile's
+   * default — model/effort are option ids on THAT harness's descriptor, so a
+   * combination the editor wouldn't offer never reaches the launch path (where
+   * an unknown id would silently fall back to the descriptor default months
+   * later). The catalog is read only when the automation actually overrides
+   * something; the profile's own selection was validated by ProfileService.
+   */
+  async function assertOverrideValid(
+    action: CreateTaskAutomationAction,
+    profileHarness: string,
+  ): Promise<void> {
+    if (
+      action.harness === undefined
+      && action.model === undefined
+      && action.effort === undefined
+    ) {
+      return;
+    }
+    const effectiveHarness = action.harness ?? profileHarness;
+    const { harnesses } = await harnessCatalog.listHarnesses({});
+    const descriptor = harnesses.find((h) => h.name === effectiveHarness)?.descriptor;
+    if (!descriptor) {
+      throw new ConnectError(
+        `harness "${effectiveHarness}" is not in the catalog`,
+        Code.InvalidArgument,
+      );
+    }
+    if (action.model !== undefined && !(descriptor.models ?? []).some((m) => m.id === action.model)) {
+      throw new ConnectError(
+        `model "${action.model}" is not valid for harness "${effectiveHarness}"`,
+        Code.InvalidArgument,
+      );
+    }
+    if (action.effort !== undefined && !(descriptor.effort ?? []).some((e) => e.id === action.effort)) {
+      throw new ConnectError(
+        `effort "${action.effort}" is not valid for harness "${effectiveHarness}"`,
+        Code.InvalidArgument,
+      );
+    }
+  }
 
   async function validateInput(input: {
     name: string;
@@ -384,6 +448,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         Code.InvalidArgument,
       );
     }
+    await assertOverrideValid(action, profile.harness);
 
     try {
       validateAutomationTemplate(action.promptTemplate);

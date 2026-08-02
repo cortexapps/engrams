@@ -27,6 +27,7 @@ import {
   useWebhookRegistrations,
   useWebhookSamples,
 } from "@/hooks/useAutomations";
+import { useHarnessCatalog } from "@/hooks/useHarnessCatalog";
 import { useProfiles } from "@/hooks/useProfiles";
 import {
   automationErrorField,
@@ -36,6 +37,11 @@ import {
 } from "@/lib/automations";
 import { errorMessage } from "@/lib/errors";
 import { shortId } from "@/pages/sessions/session-format";
+import {
+  EMPTY_OVERRIDE,
+  SessionHarnessControls,
+  type HarnessOverride,
+} from "@/pages/sessions/SessionHarnessControls";
 import { PageHeading } from "@/components/page-heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -77,6 +83,8 @@ interface EditorDraft {
   registrationId: string;
   events: string[];
   profileId: string;
+  /** ADR 0063 B2: `null` on a field = inherit the profile's default. */
+  override: HarnessOverride;
   promptTemplate: string;
   titleTemplate: string;
   includeEventContext: boolean;
@@ -92,6 +100,7 @@ const EMPTY_DRAFT: EditorDraft = {
   registrationId: "",
   events: [],
   profileId: "",
+  override: EMPTY_OVERRIDE,
   promptTemplate: "",
   titleTemplate: "",
   includeEventContext: true,
@@ -107,6 +116,20 @@ const TIMEZONE_SUGGESTIONS = [
   "Asia/Tokyo",
   "Australia/Sydney",
 ];
+
+/** Send only the fields the automation actually overrides — an absent field is
+ *  the profile's default, which the server resolves at launch (ADR 0063 B2). */
+function overrideFields(override: HarnessOverride): {
+  harness?: string;
+  model?: string;
+  effort?: string;
+} {
+  return {
+    ...(override.harness ? { harness: override.harness } : {}),
+    ...(override.model ? { model: override.model } : {}),
+    ...(override.effort ? { effort: override.effort } : {}),
+  };
+}
 
 function fieldError(errors: EditorErrors, field: AutomationField) {
   return errors[field] ? <FieldError>{errors[field]}</FieldError> : null;
@@ -303,6 +326,7 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
   const navigate = useNavigate();
   const existing = useAutomation(mode === "edit" ? id : undefined);
   const profiles = useProfiles(false);
+  const harnesses = useHarnessCatalog();
   const registrations = useWebhookRegistrations();
   const createAutomation = useCreateAutomation();
   const updateAutomation = useUpdateAutomation();
@@ -340,6 +364,14 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
       registrationId: trigger?.case === "webhook" ? trigger.value.registrationId : "",
       events: trigger?.case === "webhook" ? [...trigger.value.events] : [],
       profileId: action?.case === "createTask" ? action.value.profileId : "",
+      override:
+        action?.case === "createTask"
+          ? {
+              harness: action.value.harness ?? null,
+              model: action.value.model ?? null,
+              effort: action.value.effort ?? null,
+            }
+          : EMPTY_OVERRIDE,
       promptTemplate: action?.case === "createTask" ? action.value.promptTemplate : "",
       titleTemplate: action?.case === "createTask" ? (action.value.titleTemplate ?? "") : "",
       includeEventContext: action?.case === "createTask" ? action.value.includeEventContext : true,
@@ -375,6 +407,8 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
             action: {
               case: "createTask",
               value: {
+                // The preview renders templates only; the harness/model/effort
+                // override does not affect the rendered text.
                 profileId: draft.profileId,
                 promptTemplate: draft.promptTemplate,
                 ...(draft.titleTemplate.trim() ? { titleTemplate: draft.titleTemplate } : {}),
@@ -418,6 +452,7 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
     selectedSampleId,
   ]);
 
+  const selectedProfile = profiles.data?.profiles.find((profile) => profile.id === draft.profileId);
   const selectedSample = samples.data?.samples.find((sample) => sample.id === selectedSampleId);
   const raw = useMemo(
     () => rawVariables(selectedSample?.payloadJson),
@@ -525,6 +560,7 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
             promptTemplate: draft.promptTemplate,
             ...(draft.titleTemplate.trim() ? { titleTemplate: draft.titleTemplate } : {}),
             includeEventContext: draft.includeEventContext,
+            ...overrideFields(draft.override),
           },
         },
       },
@@ -812,10 +848,19 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
             The profile supplies the image, harness, integrations, credentials, and network policy.
           </CardDescription>
         </CardHeader>
-        <CardContent>
+        <CardContent className="space-y-5">
           <Field data-invalid={!!errors.profile}>
             <FieldLabel>Profile</FieldLabel>
-            <Select value={draft.profileId} onValueChange={(value) => update("profileId", value)}>
+            <Select
+              value={draft.profileId}
+              onValueChange={(value) => {
+                update("profileId", value);
+                // Model/effort are option ids on the profile harness's
+                // descriptor, so a carried-over selection could name an option
+                // the new profile's harness does not have.
+                update("override", EMPTY_OVERRIDE);
+              }}
+            >
               <SelectTrigger className="w-full" aria-invalid={!!errors.profile}>
                 <SelectValue placeholder="Choose a session profile" />
               </SelectTrigger>
@@ -831,6 +876,19 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
               V1 cannot use profiles with public port exposures; the server checks this on save.
             </FieldDescription>
             {fieldError(errors, "profile")}
+          </Field>
+          <Field>
+            <FieldLabel>Harness, model, and effort</FieldLabel>
+            <SessionHarnessControls
+              harnesses={harnesses.data}
+              {...(selectedProfile?.harness ? { profileHarness: selectedProfile.harness } : {})}
+              value={draft.override}
+              onChange={(next) => update("override", next)}
+            />
+            <FieldDescription>
+              Every run of this automation uses this selection. A field left on the profile default
+              follows the profile.
+            </FieldDescription>
           </Field>
         </CardContent>
       </Card>
