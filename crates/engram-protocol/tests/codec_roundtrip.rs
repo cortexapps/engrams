@@ -43,3 +43,16 @@ roundtrip!(
     WireReapStats,
     support::wire_reap_stats()
 );
+
+// ADR 0109: the session egress policy carries the whole permission boundary —
+// the credentials, the hosts they may reach, and the request shapes they gate.
+// #931 was a decode failure in exactly this payload (an internally-tagged
+// `CredentialMintSource` that bincode could encode and never decode), so every
+// session with a minted inject failed at boot. The strategy's wildcard-free
+// `match` over `CredentialMintSource` makes a new mint authority a compile
+// error here rather than a silent gap in this corpus.
+roundtrip!(
+    session_egress_policy_roundtrips,
+    engram_core::types::egress::SessionEgressPolicy,
+    support::session_egress_policy()
+);
