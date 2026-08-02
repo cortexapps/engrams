@@ -233,7 +233,10 @@ impl EpochWaiter {
 /// it is pending. The watch channel can then keep each task waker registered.
 /// A ready inner read wins over an epoch change. This preserves bytes
 /// that Firecracker delivered before it severed the connection.
-struct EpochSeveredStream<S> {
+///
+/// This type is public for the host-agent behavioral test. Reuse it as
+/// the single vsock severance primitive.
+pub struct EpochSeveredStream<S> {
     inner: S,
     read_epoch: EpochWaiter,
     write_epoch: EpochWaiter,
@@ -241,7 +244,8 @@ struct EpochSeveredStream<S> {
 }
 
 impl<S> EpochSeveredStream<S> {
-    fn new(inner: S, epoch: tokio::sync::watch::Receiver<u64>) -> Self {
+    /// Creates a stream that ends when the epoch changes.
+    pub fn new(inner: S, epoch: tokio::sync::watch::Receiver<u64>) -> Self {
         Self {
             inner,
             read_epoch: EpochWaiter::new(epoch.clone()),
