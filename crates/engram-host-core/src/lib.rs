@@ -69,6 +69,7 @@ pub use survivor::{
 };
 
 pub use shutdown::{
-    admits_new_plane, classify_survivor, flush_budget, is_straggler, plan_shutdown, FlushProbe,
-    ShutdownPlan, ShutdownStage, SurvivorAction, DEFAULT_FLUSH_BUDGET_SECS,
+    admits_new_plane, classify_survivor, flush_budget, is_straggler, nbd_drop_action,
+    plan_shutdown, FlushProbe, NbdDropAction, ShutdownPlan, ShutdownStage, SurvivorAction,
+    DEFAULT_FLUSH_BUDGET_SECS,
 };
