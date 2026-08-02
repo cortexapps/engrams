@@ -160,7 +160,11 @@ const reviewerProfile = (id: string): ProfileRow => ({
   includeUserTokens: false,
   envVars: {},
   skills: [],
-  capabilities: ["engram:pr_review"],
+  integrationGrants: [{
+    connectionId: "connection-engram",
+    operation: "pr_review",
+    resourceConstraints: [],
+  }],
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   isDefault: false,

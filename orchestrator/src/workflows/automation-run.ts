@@ -32,6 +32,8 @@ export interface PreparedAutomationRun {
   profileId: string;
   prompt: string;
   title: string | null;
+  /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
+  harnessMode?: string;
   /** ADR 0063 B2: the automation's harness/model/effort override, if any.
    *  Resolved from the stored action so a retried occurrence launches the same
    *  harness the render step read. */
@@ -172,14 +174,16 @@ export function makeAutomationTaskCreator(
       const { sessionId } = await createSession()({
         taskId,
         profileId: prepared.profileId,
+        integrationPrincipalId: `automation:${input.automationId}`,
         role: "primary",
         prompt: prepared.prompt,
-        registerListener: true,
+        ...(prepared.harnessMode != null ? { harnessMode: prepared.harnessMode } : {}),
         // ADR 0063 B2: the automation's harness/model/effort selection, absent
         // when it inherits the profile's default.
         ...(prepared.harness !== undefined ? { harness: prepared.harness } : {}),
         ...(prepared.model !== undefined ? { model: prepared.model } : {}),
         ...(prepared.effort !== undefined ? { effort: prepared.effort } : {}),
+        registerListener: true,
         // No owner and no policy overrides: the shared compiler keeps profile
         // secrets, env, capabilities, and network policy intact.
       });
@@ -246,6 +250,9 @@ export async function automationRunWorkflowImpl(
           profileId: automation.action.profileId,
           prompt: rendered.prompt,
           title,
+          ...(automation.action.harnessMode != null
+            ? { harnessMode: automation.action.harnessMode }
+            : {}),
           ...(automation.action.harness !== undefined
             ? { harness: automation.action.harness }
             : {}),

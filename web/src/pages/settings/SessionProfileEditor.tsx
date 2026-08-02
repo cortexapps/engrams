@@ -9,15 +9,16 @@
  * Form stack matches the house pattern (SecretsPanel, ImagesPanel): a single
  * react-hook-form `useForm` + zodResolver drives the draft; scalar fields are
  * labeled `Field`s; the collection editors (powers, skills, env, secrets) are
- * controlled via watch/setValue. Layout is the house shadcn settings shape —
+ * controlled via `useFieldValue` (useController — NOT watch/setValue; see its
+ * doc comment). Layout is the house shadcn settings shape —
  * each section a `Card`, the policy rail a `Card` that sticks via a wrapper
  * (never `position: sticky` on the rounded/overflow-hidden card itself — that
  * combo clips the corners in Chromium).
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, Link } from "@tanstack/react-router";
-import { Controller, useForm } from "react-hook-form";
+import { Controller, useController, useForm, type Control } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
 import { toast } from "sonner";
@@ -37,6 +38,8 @@ import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
 import { useSkills, useUploadSkill } from "../../hooks/useSkills";
 import { useOrgSecretNames } from "../../hooks/useOrgSecrets";
+import { defaultCapabilitiesForGrants } from "../../lib/profileIntegrations";
+import { useIntegrationConnections } from "../../hooks/useIntegrations";
 import {
   useConnectorViews,
   type ConnectorView,
@@ -45,6 +48,14 @@ import { IconPicker } from "../../components/profiles/IconPicker";
 import { PowerSelector } from "../../components/profiles/PowerSelector";
 import { PolicyRail } from "../../components/profiles/PolicyRail";
 import { ProviderTile } from "../../components/integrations/ProviderTile";
+import {
+  GOOGLE_CLOUD_OPERATIONS,
+  GOOGLE_CLOUD_PROVIDER,
+  googleOperationLabel,
+  googleOperationsForEndpoints,
+  type GoogleCloudOperation,
+} from "../../components/integrations/googleCloud";
+import type { IntegrationConnection } from "../../gen/engram/app/v1/integration_pb";
 import { HostChip } from "../../components/integrations/chips";
 import {
   EnvVarsEditor,
@@ -59,6 +70,7 @@ import {
   type SecretRow,
 } from "../../components/profiles/ProfileSecretsEditor";
 import { derivePolicy } from "../../lib/profilePolicy";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field";
@@ -96,7 +108,13 @@ const schema = z.object({
   designation: z.boolean(),
   includeUserTokens: z.boolean(),
   skills: z.array(z.string()),
-  capabilities: z.array(z.string()),
+  integrationGrants: z.array(
+    z.object({
+      connectionId: z.string(),
+      operation: z.string(),
+      resourceConstraints: z.array(z.string()),
+    }),
+  ),
   envRows: z.array(z.custom<EnvRow>()),
   networkDefault: z.enum(["deny", "allow"]),
   allowHostsText: z.string(),
@@ -107,6 +125,55 @@ const schema = z.object({
   portExposures: z.array(z.number()),
 });
 type ProfileFormValues = z.infer<typeof schema>;
+
+/**
+ * Read/write one form field that has no registered input behind it — the row
+ * editors (`envRows`, `secretRows`), the multi-selects (`skills`,
+ * `capabilities`), and `portExposures`.
+ *
+ * These MUST go through `useController`, not `watch(name)` + `setValue(name, v)`.
+ * Measured on react-hook-form 7.83: with no registered field behind the name,
+ * a `setValue` that changes the array's LENGTH lands, and a `setValue` that
+ * edits a row IN PLACE is discarded — the form neither stores it nor re-renders.
+ * So adding and removing rows worked while picking an org secret in a secret row
+ * silently did nothing, and the profile saved with `secrets: []`. `useController`
+ * registers the field, so every write lands and notifies.
+ */
+function useFieldValue<K extends keyof ProfileFormValues>(
+  control: Control<ProfileFormValues>,
+  name: K,
+): [ProfileFormValues[K], (next: ProfileFormValues[K]) => void] {
+  const { field } = useController({ control, name });
+  return [field.value as ProfileFormValues[K], field.onChange];
+}
+
+/**
+ * A per-connection ConnectorView so the shared PowerSelector drives Google
+ * grants exactly like every other connector's powers. `capabilities` carries
+ * the operations the connection's endpoints enable, plus any orphaned grants
+ * the caller wants to keep revocable.
+ */
+function googleConnectionView(
+  connection: IntegrationConnection,
+  operations: readonly GoogleCloudOperation[],
+): ConnectorView {
+  return {
+    provider: GOOGLE_CLOUD_PROVIDER,
+    defaultConnectionId: connection.id,
+    name: connection.displayName,
+    category: "Infrastructure",
+    blurb: "",
+    icon: { mono: "GC", color: "#4285f4" },
+    credentialSource: "mint",
+    hosts: connection.googleCloud?.endpoints ?? [],
+    capabilities: operations.map(({ action, access }) => ({ action, access })),
+    status: "connected",
+    builtin: true,
+    usedBy: 0,
+    usedByProfiles: [],
+    connectionModel: "named",
+  };
+}
 
 const EMPTY: ProfileFormValues = {
   name: "",
@@ -120,7 +187,7 @@ const EMPTY: ProfileFormValues = {
   designation: false,
   includeUserTokens: false,
   skills: [],
-  capabilities: [],
+  integrationGrants: [],
   envRows: [],
   networkDefault: "deny",
   allowHostsText: "",
@@ -138,6 +205,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const { data: harnesses } = useHarnessCatalog(true);
   const { data: skillCatalog } = useSkills();
   const { data: orgSecretNames } = useOrgSecretNames();
+  const { data: connectionData } = useIntegrationConnections();
   const { views } = useConnectorViews();
   const create = useCreateProfile();
   const update = useUpdateProfile();
@@ -153,17 +221,21 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const { control, setValue, watch, reset, handleSubmit, formState } = form;
 
   // Live draft — the policy rail and derived network recompute as these change.
-  const capabilities = watch("capabilities");
-  const skills = watch("skills");
+  // The collections below have no registered input, so they ride useController
+  // (see useFieldValue): a bare watch/setValue pair drops in-place row edits.
+  const [integrationGrants, setGrants] = useFieldValue(control, "integrationGrants");
+  const [skills, setSkills] = useFieldValue(control, "skills");
+  const [envRows, setEnvRows] = useFieldValue(control, "envRows");
+  const [secretRows, setSecretRows] = useFieldValue(control, "secretRows");
+  const [portExposures, setPortExposures] = useFieldValue(control, "portExposures");
+  // Derived, never stored: capabilities follow from the granted integrations.
+  const capabilities = defaultCapabilitiesForGrants(integrationGrants, views);
   const includeUserTokens = watch("includeUserTokens");
   const imageId = watch("imageId");
   // ADR 0062/0063: the selected harness's descriptor drives the model/effort
   // option lists (they're enums on the harness, not free-form).
   const harness = watch("harness");
   const harnessDescriptor = harnesses?.find((h) => h.name === harness)?.descriptor;
-  const envRows = watch("envRows");
-  const secretRows = watch("secretRows");
-  const portExposures = watch("portExposures");
   const networkDefault = watch("networkDefault");
   const allowHostsText = watch("allowHostsText");
   const allowPatternsText = watch("allowPatternsText");
@@ -188,7 +260,11 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       designation: p.designation === "pr_reviewer",
       includeUserTokens: p.includeUserTokens,
       skills: p.skills ?? [],
-      capabilities: p.capabilities ?? [],
+      integrationGrants: (p.integrationGrants ?? []).map((grant) => ({
+        connectionId: grant.connectionId,
+        operation: grant.operation,
+        resourceConstraints: [...grant.resourceConstraints],
+      })),
       envRows: mapToEnvRows(p.envVars),
       networkDefault: p.network?.default === "allow" ? "allow" : "deny",
       allowHostsText: (p.network?.allowHosts ?? []).join("\n"),
@@ -212,8 +288,8 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
     const known = new Set(skillCatalog.map((s) => s.name));
     const current = form.getValues("skills");
     const pruned = current.filter((s) => known.has(s));
-    if (pruned.length !== current.length) setValue("skills", pruned);
-  }, [skillCatalog, existing, form, setValue]);
+    if (pruned.length !== current.length) setSkills(pruned);
+  }, [skillCatalog, existing, form, setSkills]);
 
   // Default to the first enabled image in create mode (don't clobber a choice).
   useEffect(() => {
@@ -258,29 +334,48 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       ),
     [capabilities, network, secretRows, views, harnessDescriptor],
   );
-  const connected = views.filter((v) => v.status === "connected");
+  const connected = views.filter(
+    (view) => view.status === "connected" && view.connectionModel !== "named",
+  );
+  // Disabled connections stay visible: editing a connection's endpoints
+  // auto-disables it, and a hidden grant on a disabled connection blocked
+  // every unrelated save of the profile with no way to remove it (web-H1).
+  const googleConnections = (connectionData?.connections ?? []).filter(
+    (connection) => connection.provider === "gcp",
+  );
   const imageUri = images?.find((i) => i.id === imageId)?.image_uri;
 
   // --- capability helpers (enable→select) -----------------------------------
-  const setCaps = (next: string[]) => setValue("capabilities", next, { shouldDirty: true });
-  const capOn = (provider: string, action: string) => {
-    const cap = `${provider}:${action}`;
-    return capabilities.some((x) => x === cap || x.startsWith(`${cap}@`));
+  const capOn = (connectionId: string, action: string) => {
+    return integrationGrants.some(
+      (grant) => grant.connectionId === connectionId && grant.operation === action,
+    );
   };
-  const toggleCap = (provider: string, action: string, on: boolean) => {
-    const cap = `${provider}:${action}`;
-    const without = capabilities.filter((x) => x !== cap && !x.startsWith(`${cap}@`));
-    setCaps(on ? [...without, cap] : without);
+  const toggleCap = (connectionId: string, action: string, on: boolean) => {
+    const without = integrationGrants.filter(
+      (grant) => grant.connectionId !== connectionId || grant.operation !== action,
+    );
+    setGrants(
+      on ? [...without, { connectionId, operation: action, resourceConstraints: [] }] : without,
+    );
   };
   const enableProvider = (v: ConnectorView) => {
     const reads = v.capabilities.filter((c) => c.access === "read");
-    const pick = (reads.length ? reads : v.capabilities.slice(0, 1)).map(
-      (c) => `${v.provider}:${c.action}`,
-    );
-    setCaps([...new Set([...capabilities, ...pick])]);
+    const pick = reads.length ? reads : v.capabilities.slice(0, 1);
+    const next = [...integrationGrants];
+    for (const cap of pick) {
+      if (!capOn(v.defaultConnectionId, cap.action)) {
+        next.push({
+          connectionId: v.defaultConnectionId,
+          operation: cap.action,
+          resourceConstraints: [],
+        });
+      }
+    }
+    setGrants(next);
   };
   const disableProvider = (v: ConnectorView) =>
-    setCaps(capabilities.filter((x) => !x.startsWith(`${v.provider}:`)));
+    setGrants(integrationGrants.filter((grant) => grant.connectionId !== v.defaultConnectionId));
 
   const onSubmit = async (vals: ProfileFormValues) => {
     const payload = {
@@ -294,7 +389,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       isDefault: vals.isDefault,
       includeUserTokens: vals.includeUserTokens,
       skills: vals.skills,
-      capabilities: vals.capabilities,
+      integrationGrants: vals.integrationGrants,
       envVars: envRowsToMap(vals.envRows),
       network: {
         default: vals.networkDefault,
@@ -602,13 +697,13 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
             title="Integrations"
             sub="Enable an integration to bind its credential and open its egress — then choose exactly which powers sessions get."
           >
-            {connected.length === 0 ? (
+            {connected.length === 0 && googleConnections.length === 0 ? (
               <EmptyIntegrations />
             ) : (
               <div className="flex flex-col gap-3">
                 {connected.map((v) => {
                   const grantedCount = v.capabilities.filter((c) =>
-                    capOn(v.provider, c.action),
+                    capOn(v.defaultConnectionId, c.action),
                   ).length;
                   const on = grantedCount > 0;
                   return (
@@ -664,11 +759,80 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                         <div className="border-t">
                           <PowerSelector
                             view={v}
-                            isOn={(action) => capOn(v.provider, action)}
-                            onToggle={(action, value) => toggleCap(v.provider, action, value)}
+                            isOn={(action) => capOn(v.defaultConnectionId, action)}
+                            onToggle={(action, value) =>
+                              toggleCap(v.defaultConnectionId, action, value)
+                            }
                           />
                         </div>
                       )}
+                    </div>
+                  );
+                })}
+                {googleConnections.map((connection) => {
+                  const endpoints = connection.googleCloud?.endpoints ?? [];
+                  const offered = googleOperationsForEndpoints(endpoints);
+                  const offeredActions = new Set(offered.map(({ action }) => action));
+                  const grantedActions = new Set(
+                    integrationGrants
+                      .filter((grant) => grant.connectionId === connection.id)
+                      .map((grant) => grant.operation),
+                  );
+                  // A grant can outlive its endpoint (the connection's APIs
+                  // were edited): keep it visible so it can be removed.
+                  const orphaned = GOOGLE_CLOUD_OPERATIONS.filter(
+                    ({ action }) => grantedActions.has(action) && !offeredActions.has(action),
+                  );
+                  const view = googleConnectionView(connection, [...offered, ...orphaned]);
+                  return (
+                    <div
+                      key={connection.id}
+                      className="overflow-hidden rounded-md border bg-background"
+                    >
+                      <div className="flex items-center gap-3 bg-blue-600/[0.06] px-3.5 py-3">
+                        <span className="flex size-8 items-center justify-center rounded-md bg-blue-600 text-xs font-semibold text-white">
+                          GC
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 text-[0.92rem] font-semibold">
+                            {connection.displayName}
+                            {!connection.enabled && <Badge variant="secondary">Disabled</Badge>}
+                          </div>
+                          <div className="truncate font-mono text-[0.7rem] text-muted-foreground">
+                            {connection.googleCloud?.serviceAccountEmail}
+                          </div>
+                        </div>
+                        <Text variant="label" tone={grantedActions.size ? "inherit" : "muted"}>
+                          {grantedActions.size} granted
+                        </Text>
+                      </div>
+                      {!connection.enabled && (
+                        <p className="border-t px-3.5 py-2 text-[0.74rem] text-muted-foreground">
+                          This connection is disabled — sessions cannot use these powers. Test and
+                          enable it again from{" "}
+                          <Link
+                            to="/settings/integrations/gcp/$connectionId/setup"
+                            params={{ connectionId: connection.id }}
+                            className="underline underline-offset-2"
+                          >
+                            its setup page
+                          </Link>
+                          , or remove the grants here.
+                        </p>
+                      )}
+                      <div className="border-t">
+                        <PowerSelector
+                          view={view}
+                          isOn={(action) => capOn(connection.id, action)}
+                          onToggle={(action, value) => toggleCap(connection.id, action, value)}
+                          labelFor={googleOperationLabel}
+                          noteFor={(action) =>
+                            offeredActions.has(action)
+                              ? undefined
+                              : "not in this connection's allowed APIs"
+                          }
+                        />
+                      </div>
                     </div>
                   );
                 })}
@@ -785,18 +949,18 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                 <Advanced
                   skillCatalog={skillCatalog ?? []}
                   skills={skills}
-                  setSkills={(s) => setValue("skills", s, { shouldDirty: true })}
+                  setSkills={setSkills}
                   envRows={envRows}
-                  setEnvRows={(r) => setValue("envRows", r, { shouldDirty: true })}
+                  setEnvRows={setEnvRows}
                   secretRows={secretRows}
-                  setSecretRows={(r) => setValue("secretRows", r, { shouldDirty: true })}
+                  setSecretRows={setSecretRows}
                   orgSecretNames={orgSecretNames ?? []}
                   includeUserTokens={includeUserTokens}
                   setIncludeUserTokens={(b) =>
                     setValue("includeUserTokens", b, { shouldDirty: true })
                   }
                   portExposures={portExposures}
-                  setPortExposures={(p) => setValue("portExposures", p, { shouldDirty: true })}
+                  setPortExposures={setPortExposures}
                 />
               </CardContent>
             )}
@@ -913,6 +1077,7 @@ function Advanced({
   const [skillDesc, setSkillDesc] = useState("");
   const [skillFile, setSkillFile] = useState<File | null>(null);
   const [uploadErr, setUploadErr] = useState<string | null>(null);
+  const skillFileInput = useRef<HTMLInputElement>(null);
   const [portInput, setPortInput] = useState("");
   const [portErr, setPortErr] = useState<string | null>(null);
 
@@ -949,6 +1114,7 @@ function Advanced({
       setSkillName("");
       setSkillDesc("");
       setSkillFile(null);
+      if (skillFileInput.current) skillFileInput.current.value = "";
     } catch (e) {
       setUploadErr(e instanceof Error ? e.message : String(e));
     }
@@ -1001,13 +1167,23 @@ function Advanced({
             value={skillDesc}
             onChange={(e) => setSkillDesc(e.target.value)}
           />
+          <p className="text-sm text-muted-foreground">
+            Upload a lone SKILL.md or an archive with SKILL.md at its root.
+          </p>
           <input
+            ref={skillFileInput}
             data-testid="skill-upload-file"
             type="file"
             accept=".md,.markdown,.tar,.tar.gz,.tgz,.zip"
-            className="text-sm"
-            onChange={(e) => setSkillFile(e.target.files?.[0] ?? null)}
+            className="sr-only"
+            onChange={(e) => {
+              setSkillFile(e.target.files?.[0] ?? null);
+              setUploadErr(null);
+            }}
           />
+          <p className="text-sm text-muted-foreground" aria-live="polite">
+            {skillFile ? `Selected: ${skillFile.name}` : "No skill file selected"}
+          </p>
           {uploadErr && <p className="text-sm text-destructive">{uploadErr}</p>}
           <Button
             type="button"
@@ -1016,9 +1192,20 @@ function Advanced({
             className="self-start"
             data-testid="skill-upload-submit"
             disabled={uploadSkill.isPending}
-            onClick={onUploadSkill}
+            onClick={() => {
+              if (!skillFile) {
+                setUploadErr(null);
+                skillFileInput.current?.click();
+                return;
+              }
+              void onUploadSkill();
+            }}
           >
-            {uploadSkill.isPending ? "Uploading…" : "Upload skill"}
+            {uploadSkill.isPending
+              ? "Uploading…"
+              : skillFile
+                ? "Upload skill"
+                : "Choose skill file"}
           </Button>
         </div>
       </div>

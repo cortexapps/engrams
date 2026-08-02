@@ -163,12 +163,19 @@ const PUBLIC_PATHS: ReadonlySet<string> = new Set([
   "/api/auth/device/token",
 ]);
 
+const PUBLIC_GET_PATHS: ReadonlySet<string> = new Set([
+  "/api/v1/integrations/google-cloud/oidc/.well-known/openid-configuration",
+  "/api/v1/integrations/google-cloud/oidc/jwks",
+]);
+
 const HOOK_PATH_RE = /^\/api\/v1\/hooks\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 /** Pure seam for exact-path public ingress tests (query strings are ignored). */
 export function isIapPublicPath(url: string, method = "GET"): boolean {
   const path = url.split("?", 1)[0] ?? "/";
-  return PUBLIC_PATHS.has(path) || (method === "POST" && HOOK_PATH_RE.test(path));
+  return PUBLIC_PATHS.has(path) ||
+    (method === "GET" && PUBLIC_GET_PATHS.has(path)) ||
+    (method === "POST" && HOOK_PATH_RE.test(path));
 }
 
 // ---------------------------------------------------------------------------

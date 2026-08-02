@@ -23,6 +23,8 @@ import { useRailStore } from "./rail-store";
 export interface RailRow {
   id: string;
   status: SessionState;
+  /** ADR 0107: waiting on the user (plan review / question). */
+  needsAttention?: boolean;
   image: string;
   at: string;
   profile?: ProfileSnapshotView | null;
@@ -33,6 +35,7 @@ export interface RailRow {
 const fromListItem = (s: SessionListItem): RailRow => ({
   id: s.id,
   status: s.status,
+  needsAttention: s.needsAttention ?? false,
   image: s.image,
   at: s.last_active_at,
   profile: s.profile,

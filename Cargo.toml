@@ -147,6 +147,7 @@ axum = { version = "0.7", features = ["macros", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 hyper = "1"
+h2 = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 http = "1"
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"] }
@@ -263,6 +264,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring", "x509-parser"] }
 rustls-pemfile = "2"
+webpki-roots = "1"
 tls-parser = "0.12"
 nom = "7"
 socket2 = "0.6"

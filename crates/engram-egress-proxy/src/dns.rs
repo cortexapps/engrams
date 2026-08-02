@@ -395,6 +395,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
+            google_adc: false,
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -414,6 +415,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
+            google_adc: false,
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -443,6 +445,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
+            google_adc: false,
         };
         let reg = registry_with(state);
         let q = make_query("evil.example.com.", RecordType::A);
@@ -483,6 +486,7 @@ mod tests {
             }],
             injects: Vec::new(),
             observes: Vec::new(),
+            google_adc: false,
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -533,6 +537,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
+            google_adc: false,
         });
         let proxy_task = tokio::spawn(serve_udp(proxy_sock.clone(), registry, upstream_addr));
 
@@ -570,6 +575,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
+            google_adc: false,
         });
         // Point upstream at an obviously-dead address so the test
         // can't accidentally succeed by hitting a real resolver.

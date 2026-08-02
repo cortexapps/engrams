@@ -23,6 +23,10 @@ export interface PendingToolCallStore {
   markCompleted(sessionId: string, toolCallId: string, at: Date): Promise<void>;
   find(sessionId: string, toolCallId: string): Promise<PendingToolCallRow | null>;
   listUnsubmittedSessionCallsBefore(cutoff: Date): Promise<PendingToolCallRow[]>;
+  /** ADR 0107: session_ids with a requested-but-unsubmitted session-handled
+   *  call — a plan awaiting review or an unanswered question. Powers the
+   *  task list's `awaiting_review` derivation. */
+  listSessionIdsWithPendingSessionCalls(): Promise<string[]>;
 }
 
 /** Drizzle handle narrowed by usage; exported so tests can pass a hand-rolled
@@ -90,6 +94,19 @@ export function makePendingToolCallStore(
         )
         .limit(1);
       return rows[0] ? toRow(rows[0]) : null;
+    },
+
+    async listSessionIdsWithPendingSessionCalls() {
+      const rows = await db
+        .selectDistinct({ sessionId: pendingToolCallTable.sessionId })
+        .from(pendingToolCallTable)
+        .where(
+          and(
+            eq(pendingToolCallTable.handling, "session"),
+            isNull(pendingToolCallTable.submittedAt),
+          ),
+        );
+      return rows.map((row) => row.sessionId);
     },
 
     async listUnsubmittedSessionCallsBefore(cutoff) {

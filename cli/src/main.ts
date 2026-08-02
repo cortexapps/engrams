@@ -67,10 +67,21 @@ taskCmd
   .option("--harness <name>", "override the profile's harness")
   .option("--model <name>", "override the profile's model")
   .option("--effort <level>", "override the profile's reasoning effort")
-  .action((o: { profile: string; prompt?: string; title?: string; harness?: string; model?: string; effort?: string }) => {
-    const { clients, json } = ctx();
-    return task.create(clients(), o, json);
-  });
+  .option("--mode <mode>", "session mode for the initial prompt (e.g. plan)")
+  .action(
+    (o: {
+      profile: string;
+      prompt?: string;
+      title?: string;
+      harness?: string;
+      model?: string;
+      effort?: string;
+      mode?: string;
+    }) => {
+      const { clients, json } = ctx();
+      return task.create(clients(), o, json);
+    },
+  );
 taskCmd
   .command("list")
   .description("list your tasks (admins additionally see unattributed sessions)")

@@ -29,7 +29,7 @@ const profileRow = (): ProfileRow => ({
   includeUserTokens: false,
   envVars: {},
   skills: [],
-  capabilities: [],
+  integrationGrants: [],
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   isDefault: true,
@@ -86,6 +86,7 @@ describe("makeThreadControlPlane", () => {
       harnessCatalog: fakeHarnessCatalog(),
       secrets: { get: async () => null, getAll: async () => ({}) },
       resolveUser: async () => "user-1",
+      newSessionId: () => "sess-1",
       db: recordingDb(records),
       sessions: {
         createSession: async (req) => {

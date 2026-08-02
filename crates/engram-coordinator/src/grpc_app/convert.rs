@@ -137,6 +137,9 @@ pub(crate) fn create_request_from_proto(
         integration_policy_json,
         // ADR 0062: the per-session harness selection (a catalog key).
         harness,
+        // ADR 0107: the initial prompt's mode directive (e.g. "plan").
+        harness_mode,
+        requested_session_id,
         // Phase 1b: the initial prompt's client prompt_id. The create path
         // delivers the initial prompt via send_prompt (which mints one when
         // empty), so threading the client id for the FIRST message is a
@@ -193,10 +196,19 @@ pub(crate) fn create_request_from_proto(
             })
         })
         .transpose()?;
+    let requested_session_id = requested_session_id
+        .map(|value| {
+            uuid::Uuid::parse_str(&value)
+                .map(engram_core::types::SessionId::from)
+                .map_err(|_| ApiError::BadRequest("requested_session_id must be a UUID".into()))
+        })
+        .transpose()?;
     Ok(CreateSessionRequest {
+        requested_session_id,
         image: image_uri,
         mode,
         prompt,
+        harness_mode,
         secrets,
         selected_skills,
         capabilities,

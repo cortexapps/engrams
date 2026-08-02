@@ -25,6 +25,7 @@ pub mod evac_resumer;
 pub mod evacuation;
 pub mod grpc_app;
 pub mod harness_catalog;
+pub mod harness_desync;
 pub mod harness_paths;
 pub mod host_registry;
 pub mod idle_detector;

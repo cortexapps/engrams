@@ -97,7 +97,8 @@ export function ReplaceCredentialSheet({
         // Blank fields are skipped — leave that secret unchanged.
         for (const inj of injects) {
           const v = injectSecrets[inj.secretRef];
-          if (v && v.trim().length > 0) await putSecret.mutateAsync({ name: inj.secretRef, value: v });
+          if (v && v.trim().length > 0)
+            await putSecret.mutateAsync({ name: inj.secretRef, value: v });
         }
       }
       toast.success(`${view.name} credential replaced — sealed in the org secret store`);
@@ -136,53 +137,51 @@ export function ReplaceCredentialSheet({
             </div>
           </div>
 
-          {isMint ? (
-            (mintKind?.fields ?? []).map((f) => (
-              <label key={f.name} className="flex flex-col gap-1.5">
-                <span className="flex items-baseline gap-2">
-                  <Text variant="label">{f.label}</Text>
-                  {f.fieldKind === MintFieldKind.SEALED_SECRET && (
+          {isMint
+            ? (mintKind?.fields ?? []).map((f) => (
+                <label key={f.name} className="flex flex-col gap-1.5">
+                  <span className="flex items-baseline gap-2">
+                    <Text variant="label">{f.label}</Text>
+                    {f.fieldKind === MintFieldKind.SEALED_SECRET && (
+                      <span className="text-[0.68rem] text-muted-foreground">
+                        •••• set · leave blank to keep
+                      </span>
+                    )}
+                  </span>
+                  {f.fieldKind === MintFieldKind.SEALED_SECRET ? (
+                    <SecretField
+                      value={values[f.name] ?? ""}
+                      onChange={(v) => setValues((s) => ({ ...s, [f.name]: v }))}
+                    />
+                  ) : (
+                    <input
+                      className="h-9 rounded-md border bg-transparent px-3 font-mono text-sm"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={values[f.name] ?? ""}
+                      onChange={(e) => setValues((s) => ({ ...s, [f.name]: e.target.value }))}
+                    />
+                  )}
+                </label>
+              ))
+            : injects.map((inj) => (
+                <label key={inj.secretRef} className="flex flex-col gap-1.5">
+                  <span className="flex items-baseline gap-2">
+                    <Text variant="label">{inj.header}</Text>
+                    <code className="font-mono text-[0.62rem] text-muted-foreground">
+                      {inj.secretRef}
+                    </code>
                     <span className="text-[0.68rem] text-muted-foreground">
                       •••• set · leave blank to keep
                     </span>
-                  )}
-                </span>
-                {f.fieldKind === MintFieldKind.SEALED_SECRET ? (
-                  <SecretField
-                    value={values[f.name] ?? ""}
-                    onChange={(v) => setValues((s) => ({ ...s, [f.name]: v }))}
-                  />
-                ) : (
-                  <input
-                    className="h-9 rounded-md border bg-transparent px-3 font-mono text-sm"
-                    autoComplete="off"
-                    spellCheck={false}
-                    value={values[f.name] ?? ""}
-                    onChange={(e) => setValues((s) => ({ ...s, [f.name]: e.target.value }))}
-                  />
-                )}
-              </label>
-            ))
-          ) : (
-            injects.map((inj) => (
-              <label key={inj.secretRef} className="flex flex-col gap-1.5">
-                <span className="flex items-baseline gap-2">
-                  <Text variant="label">{inj.header}</Text>
-                  <code className="font-mono text-[0.62rem] text-muted-foreground">
-                    {inj.secretRef}
-                  </code>
-                  <span className="text-[0.68rem] text-muted-foreground">
-                    •••• set · leave blank to keep
                   </span>
-                </span>
-                <SecretField
-                  value={injectSecrets[inj.secretRef] ?? ""}
-                  onChange={(v) => setInjectSecrets((s) => ({ ...s, [inj.secretRef]: v }))}
-                  placeholder="••••••"
-                />
-              </label>
-            ))
-          )}
+                  <SecretField
+                    value={injectSecrets[inj.secretRef] ?? ""}
+                    onChange={(v) => setInjectSecrets((s) => ({ ...s, [inj.secretRef]: v }))}
+                    placeholder="••••••"
+                  />
+                </label>
+              ))}
 
           {view.usedBy > 0 && (
             <div className="flex gap-2 rounded-md border border-instrument-caution/45 bg-instrument-caution/10 p-3">

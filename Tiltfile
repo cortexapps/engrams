@@ -339,6 +339,9 @@ coord_env = {
     # coord needs these — the host-agent has no app-gRPC surface.
     'ENGRAM_APP_GRPC_ADDR': env_or('ENGRAM_APP_GRPC_ADDR', '127.0.0.1:50061'),
     'ENGRAM_APP_GRPC_TOKENS': env_or('ENGRAM_APP_GRPC_TOKENS', 'dev-app-grpc-token'),
+    # ADR 0109: the coordinator calls the host-only connection credential
+    # broker with the same explicit bearer that the local orchestrator validates.
+    'ENGRAM_CONNECTION_BROKER_BEARER': env_or('ENGRAM_APP_GRPC_TOKENS', 'dev-app-grpc-token'),
     'ENGRAM_MODE': 'coordinator' if dev_split else 'all',
     'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
     'ENGRAM_SANDBOX_WORK_DIR': './var/sandboxes',
@@ -486,7 +489,7 @@ else:
 if sandbox_backend == 'firecracker':
     print('engram dev: NBD devices discovered = %r (two_hosts=%s)' % (_nbd, two_hosts))
 
-def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress_proxy_port, egress_dns_port):
+def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress_proxy_port, egress_dns_port, egress_metadata_port):
     env = {
         # `kernel_key` is only non-None for vz/firecracker, both of
         # which force `dev_split`, so this always lands on the
@@ -556,6 +559,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # host-agent wires this same value into the FC iptables `:53 -> dns`
         # REDIRECT, so the two can't drift.
         'ENGRAM_EGRESS_DNS_PORT': egress_dns_port,
+        'ENGRAM_EGRESS_METADATA_PORT': egress_metadata_port,
         'ENGRAM_HOST_METRICS_ADDR': '0.0.0.0:' + metrics_port,
         # ADR 0019: same OTLP target as the coord, so the host-side
         # restore/boot spans land in the same Jaeger trace.
@@ -825,16 +829,20 @@ _proxy_default = '8443' if sandbox_backend == 'firecracker' else '18443'
 _dns_default = '5353' if sandbox_backend == 'firecracker' else '15353'
 _proxy_base = int(env_or('ENGRAM_EGRESS_PROXY_PORT', _proxy_default))
 _dns_base = int(env_or('ENGRAM_EGRESS_DNS_PORT', _dns_default))
+_metadata_default = '13338' if sandbox_backend == 'firecracker' else '13339'
+_metadata_base = int(env_or('ENGRAM_EGRESS_METADATA_PORT', _metadata_default))
 # host-agent-b takes the next proxy and DNS ports so the two hosts don't
 # collide on the shared netns.
 if _proxy_base < 1 or _proxy_base > 65535:
     fail('ENGRAM_EGRESS_PROXY_PORT must be between 1 and 65535 (egress is mandatory)')
 if _dns_base < 1 or _dns_base > 65535:
     fail('ENGRAM_EGRESS_DNS_PORT must be between 1 and 65535 (egress is mandatory)')
-if two_hosts and (_proxy_base == 65535 or _dns_base == 65535):
+if _metadata_base < 1 or _metadata_base > 65535:
+    fail('ENGRAM_EGRESS_METADATA_PORT must be between 1 and 65535 (egress is mandatory)')
+if two_hosts and (_proxy_base == 65535 or _dns_base == 65535 or _metadata_base == 65535):
     fail('two-host mode needs room for the second host egress ports (base must be <= 65534)')
 if dev_split:
-    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base), str(_dns_base))
+    host_agent_resource('host-agent', '9101', '9100', './var/host-sandboxes', nbd_a, str(_proxy_base), str(_dns_base), str(_metadata_base))
     if fc_colima_profile:
         # ADR 0082: the coordinator dials the host-agent's advertised
         # 127.0.0.1:9101 (and scrapes metrics on :9100) — reachable only via a
@@ -883,7 +891,7 @@ if dev_split:
         # netns), else host-agent-b fails closed on Address already in use
         # (ADR 0083).
         _proxy_b = str(_proxy_base + 1)
-        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b, _proxy_b, str(_dns_base + 1))
+        host_agent_resource('host-agent-b', '9102', '9110', './var/host-sandboxes-b', nbd_b, _proxy_b, str(_dns_base + 1), str(_metadata_base + 1))
 
 # ----------------------------------------------------------------
 # Orchestrator (Bun/Hono, ADR 0051) — the web's BFF.

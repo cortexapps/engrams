@@ -31,6 +31,7 @@ import {
 
 import { createTask, listTasks } from "../../gen/engram/app/v1/task-TaskService_connectquery";
 import { useProfiles } from "../../hooks/useProfiles";
+import { defaultCapabilitiesForGrants } from "../../lib/profileIntegrations";
 import { useIntegrationCatalog } from "../../hooks/useIntegrations";
 import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
@@ -43,6 +44,7 @@ import {
   EMPTY_OVERRIDE,
   type HarnessOverride,
 } from "./SessionHarnessControls";
+import { ModeChip } from "../../components/ModeChip";
 import { useAuth } from "../../auth/AuthProvider";
 import { useKeyboardUi } from "../../keyboard/store";
 import { MOD_LABEL } from "../../keyboard/platform";
@@ -164,11 +166,15 @@ export function StartScreen() {
     selected?.harness ??
     (harnesses?.length === 1 ? harnesses[0]?.name : undefined);
   const effectiveHarness = harnesses?.find((h) => h.name === effectiveHarnessName);
+  // ADR 0107: only harnesses that declare a non-default mode get the chip.
+  const planModes = (effectiveHarness?.descriptor?.modes ?? [])
+    .filter((m) => m.id !== "default")
+    .map((m) => ({ id: m.id, label: m.label || m.id }));
 
   const policy: DerivedPolicy | null = selected
     ? derivePolicy(
         {
-          capabilities: selected.capabilities ?? [],
+          capabilities: defaultCapabilitiesForGrants(selected.integrationGrants ?? [], views),
           network: {
             default: selected.network?.default === "allow" ? "allow" : "deny",
             allowHosts: selected.network?.allowHosts ?? [],
@@ -224,6 +230,7 @@ export function StartScreen() {
         ...(harnessOverride.harness ? { harness: harnessOverride.harness } : {}),
         ...(harnessOverride.model ? { model: harnessOverride.model } : {}),
         ...(harnessOverride.effort ? { effort: harnessOverride.effort } : {}),
+        ...(harnessOverride.mode ? { harnessMode: harnessOverride.mode } : {}),
       });
       writeLastProfileId(selected.id);
       const sessionId = res.task?.sessions[0]?.sessionId;
@@ -383,13 +390,24 @@ export function StartScreen() {
                     </Tooltip>
                   </TooltipProvider>
                 )}
-                <SessionHarnessControls
-                  harnesses={harnesses}
-                  profileHarness={selected?.harness}
-                  value={harnessOverride}
-                  onChange={setHarnessOverride}
+                {/* Mode is a behavior switch — its own lit chip beside the
+                    profile. The capability selectors (harness/model/effort)
+                    stay quiet and sit right, next to Launch. */}
+                <ModeChip
+                  modes={planModes}
+                  value={harnessOverride.mode}
+                  onChange={(mode) => setHarnessOverride({ ...harnessOverride, mode })}
                   disabled={createTaskMutation.isPending}
                 />
+                <div className="@md/composer:ml-auto">
+                  <SessionHarnessControls
+                    harnesses={harnesses}
+                    profileHarness={selected?.harness}
+                    value={harnessOverride}
+                    onChange={setHarnessOverride}
+                    disabled={createTaskMutation.isPending}
+                  />
+                </div>
               </div>
               <Button
                 className="shrink-0 self-end"

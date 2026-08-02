@@ -175,6 +175,7 @@ function fakePendingCalls(rows: PendingToolCallRow[]): PendingToolCallStore {
     markSubmitted: async () => {},
     markCompleted: async () => {},
     find: async (sessionId, toolCallId) => byId.get(key(sessionId, toolCallId)) ?? null,
+    listSessionIdsWithPendingSessionCalls: async () => [],
     listUnsubmittedSessionCallsBefore: async () => [],
   };
 }

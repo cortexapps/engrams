@@ -71,13 +71,17 @@ message CreateTaskAutomationAction {
   string prompt_template = 2;
   optional string title_template = 3;
   bool include_event_context = 4;
+  // ADR 0107: session mode for the created session's initial prompt (e.g.
+  // "plan"). An ownerless (automation) plan auto-approves — the plan lands
+  // in the transcript as a reviewable record before the build runs.
+  optional string harness_mode = 5;
   // ADR 0063 B2: the automation's override of the profile's default harness /
   // model / effort, the same seam the interactive composer uses. Unset = inherit
   // the profile default. `model`/`effort` are option ids on the EFFECTIVE
   // harness's descriptor (this override, else the profile's harness).
-  optional string harness = 5;
-  optional string model = 6;
-  optional string effort = 7;
+  optional string harness = 6;
+  optional string model = 7;
+  optional string effort = 8;
 }
 
 message CreateAutomationRequest {

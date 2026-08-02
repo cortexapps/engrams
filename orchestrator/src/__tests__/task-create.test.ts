@@ -10,6 +10,7 @@
  */
 
 import { expect, test, describe } from "bun:test";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { z } from "zod";
 import {
   compileSessionCreateInput,
@@ -33,6 +34,13 @@ import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
 import { createToolRegistry } from "../tools/registry.ts";
 import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
+import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
+import { capabilityGrant } from "../integrations/grants.ts";
+
+function defaultGrant(capability: string) {
+  const provider = capability.slice(0, capability.indexOf(":"));
+  return capabilityGrant(capability, `default-${provider}`);
+}
 
 // The claude harness declares this as its `auth.user_env` (see fakeHarnessCatalog);
 // the compiler injects the user token under this name (ADR 0063 — descriptor-driven).
@@ -52,7 +60,7 @@ const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   includeUserTokens: false,
   envVars: {},
   skills: [],
-  capabilities: [],
+  integrationGrants: [],
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   isDefault: false,
@@ -84,6 +92,73 @@ const fakeHarnessCatalog = (): HarnessCatalogClient => ({
   }),
 });
 
+const providerHarnessCatalog = (): HarnessCatalogClient => ({
+  listHarnesses: async () => ({
+    harnesses: [
+      {
+        name: "claude",
+        descriptor: {
+          auth: { userEnv: USER_ENV, orgEnv: ORG_ENV },
+          models: [
+            {
+              id: "glm-5.2",
+              default: true,
+              env: {
+                ANTHROPIC_MODEL: "z-ai/glm-5.2",
+                ANTHROPIC_BASE_URL: "https://openrouter.ai/api",
+                [ORG_ENV]: "",
+              },
+              secrets: [
+                {
+                  ref: "openrouter.api_key",
+                  env: "ANTHROPIC_AUTH_TOKEN",
+                  mode: "broker",
+                  hosts: ["openrouter.ai"],
+                  hostPatterns: [],
+                },
+                {
+                  ref: "openrouter.api_key",
+                  env: "OPENROUTER_API_KEY",
+                  mode: "broker",
+                  hosts: ["openrouter.ai"],
+                  hostPatterns: [],
+                },
+              ],
+            },
+          ],
+          effort: [],
+        },
+      },
+    ],
+  }),
+});
+
+const fakeConnections = (): IntegrationConnectionStore => ({
+  list: async () => [],
+  get: async (id) => {
+    const provider = id.startsWith("default-") ? id.slice("default-".length) : "gcp";
+    return {
+      id,
+      alias: id,
+      provider,
+      displayName: provider,
+      isDefault: id.startsWith("default-"),
+      config: {},
+      enabled: true,
+      testedAt: new Date(0),
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    };
+  },
+  getDefault: async (provider) => fakeConnections().get(`default-${provider}`),
+  create: async () => { throw new Error("unused"); },
+  update: async () => { throw new Error("unused"); },
+  delete: async () => { throw new Error("unused"); },
+  markTested: async () => { throw new Error("unused"); },
+  setEnabled: async () => { throw new Error("unused"); },
+  ensureDefault: async (provider) => (await fakeConnections().get(`default-${provider}`))!,
+});
+
 // Default the user token to present ("tok") — a human (chat) run now BLOCKS when
 // the harness's declared user_env is unset, so tests exercising other
 // seams must have a token unless they specifically test the block.
@@ -94,6 +169,7 @@ const deps = (
 ): SessionCompileDeps => ({
   images: { listEnabledImages: async () => ({ images }) } as unknown as ImagesClient,
   connectors: { list: async () => [] },
+  connections: fakeConnections(),
   harnessCatalog: fakeHarnessCatalog(),
   resolveUserToken: async () => token,
   resolveAllUserTokens: async () => allTokens,
@@ -226,6 +302,7 @@ describe("compileSessionCreateInput", () => {
       },
       resolveUserToken: async (envVar) => (envVar === "OPENCODE_TOKEN" ? "tok-123" : null),
       resolveAllUserTokens: async () => ({}),
+      connections: fakeConnections(),
     };
     const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), customDeps);
     expect(inp.harnessEnv?.OPENCODE_TOKEN).toBe("tok-123");
@@ -387,6 +464,99 @@ describe("compileSessionCreateInput", () => {
     expect(inp.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
   });
 
+  test("model secrets compile to broker policy secrets for human and programmatic principals", async () => {
+    const providerDeps: SessionCompileDeps = {
+      ...deps(),
+      harnessCatalog: providerHarnessCatalog(),
+      orgSecret: {
+        listSecrets: async () => ({ secrets: [{ name: "openrouter.api_key" }] }),
+      },
+    };
+
+    for (const programmatic of [false, true]) {
+      const inp = await compileSessionCreateInput(
+        profile(),
+        providerDeps,
+        programmatic ? { programmatic: true } : {},
+      );
+      expect(inp.harnessEnv).toMatchObject({
+        ANTHROPIC_MODEL: "z-ai/glm-5.2",
+        ANTHROPIC_BASE_URL: "https://openrouter.ai/api",
+        [ORG_ENV]: "",
+      });
+      const policy = JSON.parse(inp.integrationPolicyJson!) as {
+        secrets: Array<{
+          secret_ref: string;
+          env_var: string;
+          mode: string;
+          allow_hosts: string[];
+          allow_host_patterns: string[];
+        }>;
+      };
+      expect(policy.secrets).toEqual([
+        {
+          secret_ref: "openrouter.api_key",
+          env_var: "ANTHROPIC_AUTH_TOKEN",
+          mode: "broker",
+          allow_hosts: ["openrouter.ai"],
+          allow_host_patterns: [],
+        },
+        {
+          secret_ref: "openrouter.api_key",
+          env_var: "OPENROUTER_API_KEY",
+          mode: "broker",
+          allow_hosts: ["openrouter.ai"],
+          allow_host_patterns: [],
+        },
+      ]);
+      if (programmatic) {
+        expect(policy.secrets.some((secret) => secret.env_var === ORG_ENV)).toBe(false);
+      }
+    }
+  });
+
+  test("fails before create when a model references a missing org secret", async () => {
+    const providerDeps: SessionCompileDeps = {
+      ...deps(),
+      harnessCatalog: providerHarnessCatalog(),
+      orgSecret: { listSecrets: async () => ({ secrets: [] }) },
+    };
+    try {
+      await compileSessionCreateInput(profile(), providerDeps);
+      throw new Error("expected a missing-secret failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConnectError);
+      if (!(error instanceof ConnectError)) throw error;
+      expect(error.code).toBe(Code.FailedPrecondition);
+      expect(error.message).toContain("model option glm-5.2");
+      expect(error.message).toContain("openrouter.api_key");
+    }
+  });
+
+  test("models without secret refs preserve native principal credential rules", async () => {
+    const human = await compileSessionCreateInput(profile(), deps("human-token"));
+    expect(human.harnessEnv?.[USER_ENV]).toBe("human-token");
+    expect(human.harnessEnv?.[ORG_ENV]).toBeUndefined();
+    const humanPolicy = human.integrationPolicyJson
+      ? (JSON.parse(human.integrationPolicyJson) as { secrets: Array<{ env_var: string }> })
+      : { secrets: [] };
+    expect(humanPolicy.secrets.some((secret) => secret.env_var === ORG_ENV)).toBe(false);
+
+    const programmatic = await compileSessionCreateInput(profile(), deps(), { programmatic: true });
+    expect(programmatic.harnessEnv?.[USER_ENV]).toBeUndefined();
+    expect(programmatic.harnessEnv?.[ORG_ENV]).toBeUndefined();
+    const programmaticPolicy = JSON.parse(programmatic.integrationPolicyJson!) as {
+      secrets: Array<{ secret_ref: string; env_var: string; mode: string }>;
+    };
+    expect(programmaticPolicy.secrets).toEqual([
+      expect.objectContaining({
+        secret_ref: ORG_ENV,
+        env_var: ORG_ENV,
+        mode: "literal",
+      }),
+    ]);
+  });
+
   // ADR 0031 §7: git commit attribution.
   test("owner identity stamps ENGRAM_USER_NAME/EMAIL for the guest gitconfig", async () => {
     const inp = await compileSessionCreateInput(profile(), deps(), {
@@ -437,7 +607,7 @@ describe("compileSessionCreateInput", () => {
     });
 
     const inp = await compileSessionCreateInput(
-      profile({ capabilities: ["memory:write"] }),
+      profile({ integrationGrants: [defaultGrant("memory:write")] }),
       { ...deps(), toolRegistry },
     );
     const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
@@ -459,6 +629,69 @@ describe("compileSessionCreateInput", () => {
 
     const inp = await compileSessionCreateInput(profile(), { ...deps(), toolRegistry });
     expect(inp.harnessEnv?.ENGRAM_TOOLS).toBeUndefined();
+  });
+
+  test("Google Cloud grants mount the brokered CLI bundle and metadata ADC", async () => {
+    const connections = fakeConnections();
+    connections.get = async (id) => ({
+      id,
+      alias: "dev-vm",
+      provider: "gcp",
+      displayName: "Dev VM",
+      isDefault: false,
+      config: {
+        workloadIdentityProvider:
+          "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/dev",
+        serviceAccountEmail: "dev-vm@example-project.iam.gserviceaccount.com",
+        endpoints: ["compute.googleapis.com", "tunnel.cloudproxy.app"],
+      },
+      enabled: true,
+      testedAt: new Date(0),
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    });
+    const input = await compileSessionCreateInput(
+      profile({
+        integrationGrants: [{
+          connectionId: "connection-gcp",
+          operation: "compute.instances.get",
+          resourceConstraints: [],
+        }],
+      }),
+      { ...deps(), connections },
+    );
+
+    expect(input.selectedSkills).toContain("integrations-cli");
+    expect(input.harnessEnv?.GCE_METADATA_HOST).toBe("169.254.169.254");
+    expect(input.harnessEnv?.GCE_METADATA_IP).toBe("169.254.169.254");
+    expect(input.harnessEnv?.GCE_METADATA_ROOT).toBe("169.254.169.254");
+    expect(input.harnessEnv?.CLOUDSDK_CORE_CHECK_GCE_METADATA).toBe("true");
+    expect(input.harnessEnv?.ENGRAM_CLI_INTEGRATIONS).toContain('"provider":"gcp"');
+    expect(input.harnessEnv?.ENGRAM_CLI_INTEGRATIONS).toContain('"bins":["gcloud"]');
+    expect(input.integrationConnections).toEqual([{
+      id: "connection-gcp",
+      alias: "dev-vm",
+      provider: "gcp",
+      displayName: "Dev VM",
+      config: expect.any(Object),
+    }]);
+  });
+
+  test("a disabled connection cannot be stamped into a new session", async () => {
+    const connections = fakeConnections();
+    const get = connections.get;
+    connections.get = async (id) => ({ ...(await get(id))!, enabled: false });
+
+    await expect(compileSessionCreateInput(
+      profile({
+        integrationGrants: [{
+          connectionId: "connection-gcp",
+          operation: "compute.instances.get",
+          resourceConstraints: [],
+        }],
+      }),
+      { ...deps(), connections },
+    )).rejects.toThrow('integration connection "connection-gcp" is disabled');
   });
 
   test("extra capabilities widen integration grants but never the tool manifest", async () => {
@@ -486,16 +719,21 @@ describe("compileSessionCreateInput", () => {
     });
 
     const inp = await compileSessionCreateInput(
-      profile({ capabilities: ["engram:pr_review"] }),
+      profile({ integrationGrants: [defaultGrant("engram:pr_review")] }),
       { ...deps(), toolRegistry },
       { extraCapabilities: [cloneCapability, cloneCapability] },
     );
 
     expect(inp.capabilities).toEqual(["engram:pr_review", cloneCapability]);
     const policy = JSON.parse(inp.integrationPolicyJson!) as {
-      injects?: Array<{ mint_provider: string }>;
+      injects?: Array<{
+        mint_source: { connection: { connection_id: string; provider: string } } | null;
+      }>;
     };
-    expect(policy.injects?.some((entry) => entry.mint_provider === "github")).toBe(true);
+    expect(policy.injects?.some((entry) =>
+      entry.mint_source?.connection.connection_id === "default-github" &&
+        entry.mint_source.connection.provider === "github"
+    )).toBe(true);
     const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
     expect(manifest.map((tool) => tool.name)).toEqual(["review_tool"]);
   });
@@ -527,7 +765,7 @@ describe("compileSessionCreateInput", () => {
 
     const inp = await compileSessionCreateInput(
       profile({
-        capabilities: ["github:pulls:write"],
+        integrationGrants: [defaultGrant("github:pulls:write")],
         network: {
           default: "allow",
           allowHosts: ["profile.example.com"],
@@ -650,10 +888,10 @@ function recordingDb(
   throwOnTx = false,
   failInsertAt?: number,
 ): Db {
+  let insertCount = 0;
   return {
     transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
       if (throwOnTx) throw new Error("db boom");
-      let insertCount = 0;
       const tx = {
         insert: () => ({
           values: async (v: Record<string, unknown>) => {
@@ -662,6 +900,7 @@ function recordingDb(
             records.push(v);
           },
         }),
+        delete: () => ({ where: async () => undefined }),
       };
       return fn(tx);
     },
@@ -697,6 +936,7 @@ const createDeps = (
   profiles: fakeProfiles(opts.active ?? true, opts.profileOver ?? {}),
   images: { listEnabledImages: async () => ({ images: [{ id: "img-1", imageUri: "uri-1" }] }) } as unknown as ImagesClient,
   connectors: { list: async () => [] },
+  connections: fakeConnections(),
   harnessCatalog: fakeHarnessCatalog(),
   sessions,
   // Token present by default so human (chat) creates don't hit the block.
@@ -705,6 +945,8 @@ const createDeps = (
   // Default to "unknown user" so tests exercising other seams don't hit the
   // real Drizzle fallback against the fake Db.
   users: opts.users ?? fakeUsers(),
+  newTaskId: () => "task-1",
+  newSessionId: () => "sess-1",
   ...(opts.portExposures ? { portExposures: opts.portExposures } : {}),
 });
 
@@ -744,7 +986,12 @@ describe("createTaskWithSession", () => {
       status: "open",
       source: { provider: "slack", team: "T1" },
     });
-    expect(records[1]).toMatchObject({ sessionId: "sess-1", role: "primary", profileId: "p1" });
+    expect(records[1]).toMatchObject({
+      sessionId: "sess-1",
+      role: "primary",
+      profileId: "p1",
+      integrationPrincipalId: "user-1",
+    });
     expect(records[2]).toEqual({ sessionId: "sess-1", threadWfId: "thread-wf-1" });
     expect(records[3]).toEqual({ sessionId: "sess-1" });
   });
@@ -786,7 +1033,7 @@ describe("createTaskWithSession", () => {
     expect(sessions.createReqs).toHaveLength(0);
   });
 
-  test("compensates by deleting the orphan session when the DB write fails", async () => {
+  test("does not start a session when authorization snapshot persistence fails", async () => {
     const sessions = fakeSessions();
     await expect(
       createTaskWithSession(createDeps(sessions, recordingDb([], true)), {
@@ -795,7 +1042,8 @@ describe("createTaskWithSession", () => {
         profileId: "p1",
       }),
     ).rejects.toThrow(/db boom/);
-    expect(sessions.deletedIds).toEqual(["sess-1"]);
+    expect(sessions.createReqs).toHaveLength(0);
+    expect(sessions.deletedIds).toEqual([]);
   });
 
   test("compensates when listener registration fails inside the task transaction", async () => {
@@ -910,6 +1158,22 @@ describe("createTaskWithSession", () => {
 });
 
 describe("createSessionForExistingTask", () => {
+  test("stamps an explicit automation principal into the integration snapshot", async () => {
+    const sessions = fakeSessions();
+    const records: Record<string, unknown>[] = [];
+    await createSessionForExistingTask(
+      createDeps(sessions, recordingDb(records)),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "primary",
+        integrationPrincipalId: "automation:nightly",
+      },
+    );
+    expect(sessions.createReqs).toHaveLength(1);
+    expect(records[0]?.integrationPrincipalId).toBe("automation:nightly");
+  });
+
   test("creates promptlessly and leaves listener registration off by default", async () => {
     const records: Record<string, unknown>[] = [];
     const sessions = fakeSessions();
@@ -935,6 +1199,18 @@ describe("createSessionForExistingTask", () => {
       role: "finder",
       profileId: "p1",
       capabilities: ["github:contents:read@openai/engrams"],
+      integrationGrants: [{
+        connectionId: "default-github",
+        operation: "contents:read",
+        resourceConstraints: ["openai/engrams"],
+      }],
+      integrationConnections: [{
+        id: "default-github",
+        alias: "default-github",
+        provider: "github",
+        displayName: "github",
+        config: {},
+      }],
     }]);
     const request = sessions.createReqs[0] as {
       prompt?: string;
@@ -968,6 +1244,8 @@ describe("createSessionForExistingTask", () => {
         role: "verifier",
         profileId: "p1",
         capabilities: [],
+        integrationGrants: [],
+        integrationConnections: [],
       },
       { sessionId: "sess-1" },
     ]);
@@ -975,10 +1253,11 @@ describe("createSessionForExistingTask", () => {
 
   test("threads policy clamps into the existing-task session compiler", async () => {
     const sessions = fakeSessions();
+    const records: Record<string, unknown>[] = [];
     await createSessionForExistingTask(
-      createDeps(sessions, recordingDb([]), {
+      createDeps(sessions, recordingDb(records), {
         profileOver: {
-          capabilities: ["github:pulls:write"],
+          integrationGrants: [defaultGrant("github:pulls:write")],
           envVars: { PROFILE_PAT: "must-drop" },
           network: {
             default: "allow",
@@ -1031,6 +1310,14 @@ describe("createSessionForExistingTask", () => {
       "api.github.com",
     ]);
     expect(policy.secrets.some((secret) => secret.secret_ref === "PROFILE_PAT")).toBe(false);
+    expect(records[0]?.integrationGrants).toEqual([
+      { connectionId: "default-engram", operation: "pr_review", resourceConstraints: [] },
+      {
+        connectionId: "default-github",
+        operation: "contents:read",
+        resourceConstraints: ["openai/engrams"],
+      },
+    ]);
   });
 
   test("an automation's harness/model/effort override beats the profile default", async () => {
@@ -1070,12 +1357,13 @@ describe("createSessionForExistingTask", () => {
     expect(sessions.deletedIds).toEqual(["sess-1"]);
   });
 
-  test("deletes the orphan session when task_session persistence fails", async () => {
+  test("does not start a session when task_session persistence fails", async () => {
     const sessions = fakeSessions();
     await expect(createSessionForExistingTask(
       createDeps(sessions, recordingDb([], true)),
       { taskId: "task-existing", profileId: "p1", role: "finder" },
     )).rejects.toThrow(/db boom/);
-    expect(sessions.deletedIds).toEqual(["sess-1"]);
+    expect(sessions.createReqs).toHaveLength(0);
+    expect(sessions.deletedIds).toEqual([]);
   });
 });

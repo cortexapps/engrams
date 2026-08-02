@@ -667,9 +667,13 @@ pub(crate) async fn run_evict_pipeline(
     if target_state == SessionState::Idle {
         // ADR 0074 rung 2 (parked-paused): if the host has memory
         // headroom, PAUSE the VM in place instead of snapshot+destroy.
-        // Frees CPU (not RAM), keeps the harness alive in RAM, and lets
-        // a returning user un-pause in <100ms rather than pay a full
-        // 12.2s-p50 rebuild. Under real memory pressure this branch is
+        // Frees CPU (not RAM) and lets a returning user un-pause in
+        // <100ms rather than pay a full 12.2s-p50 rebuild. The harness
+        // PROCESS stays in RAM, but the vsock link does NOT survive a
+        // long pause, and the hub can still advertise a stale handle
+        // at un-park — a forward then lands in a socket with no reader
+        // (prod 7eddce62). The ADR 0108 A8 attach-signal row recall +
+        // heartbeat disagreement repair bound that damage. Under real memory pressure this branch is
         // skipped and the full eviction below runs (rung 4). Only the
         // idle-evict path parks; drain/evac (Evacuating) always captures.
         // `allow_park == false` is the reaper's DESCENT path (already
@@ -2455,8 +2459,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -2686,8 +2693,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -2910,8 +2920,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -3237,8 +3250,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -4354,8 +4370,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -4623,8 +4642,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 

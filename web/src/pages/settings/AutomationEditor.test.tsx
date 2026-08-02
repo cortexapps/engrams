@@ -52,7 +52,7 @@ vi.mock("@/hooks/useHarnessCatalog", () => ({
             { id: "opus", label: "Claude Opus 4.8", default: true, env: {} },
             { id: "sonnet", label: "Claude Sonnet 4.6", default: false, env: {} },
           ],
-          effort: [{ id: "high", label: "High", default: false, env: {} }],
+          effort: [{ id: "high", label: "High", default: true, env: {} }],
         },
       },
       {
@@ -139,13 +139,13 @@ describe("AutomationEditor harness selection", () => {
     render(<AutomationEditor mode="edit" />);
     await screen.findByDisplayValue("Daily triage");
 
+    // With no override, each trigger states what the launch will actually use:
+    // the profile's harness ("claude") and that descriptor's default options.
     await waitFor(() => {
-      expect(screen.getByTestId("session-harness-select").textContent).toContain("Profile harness");
+      expect(screen.getByTestId("session-harness-select").textContent).toContain("Claude Code");
     });
-    // The profile's harness ("claude") drives the model/effort enums even with
-    // no harness override selected.
-    expect(screen.getByTestId("session-model-select").textContent).toContain("Default model");
-    expect(screen.getByTestId("session-effort-select").textContent).toContain("Default effort");
+    expect(screen.getByTestId("session-model-select").textContent).toContain("Claude Opus 4.8");
+    expect(screen.getByTestId("session-effort-select").textContent).toContain("High");
 
     fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
     await waitFor(() => expect(update).toHaveBeenCalledOnce());

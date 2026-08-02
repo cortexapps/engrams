@@ -88,6 +88,8 @@ interface EditorDraft {
   promptTemplate: string;
   titleTemplate: string;
   includeEventContext: boolean;
+  /** ADR 0107: start the session in plan mode (plan-then-implement). */
+  planFirst: boolean;
 }
 
 const EMPTY_DRAFT: EditorDraft = {
@@ -104,6 +106,7 @@ const EMPTY_DRAFT: EditorDraft = {
   promptTemplate: "",
   titleTemplate: "",
   includeEventContext: true,
+  planFirst: false,
 };
 
 const TIMEZONE_SUGGESTIONS = [
@@ -370,11 +373,14 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
               harness: action.value.harness ?? null,
               model: action.value.model ?? null,
               effort: action.value.effort ?? null,
+              // Mode is the `planFirst` switch below, not one of these pickers.
+              mode: null,
             }
           : EMPTY_OVERRIDE,
       promptTemplate: action?.case === "createTask" ? action.value.promptTemplate : "",
       titleTemplate: action?.case === "createTask" ? (action.value.titleTemplate ?? "") : "",
       includeEventContext: action?.case === "createTask" ? action.value.includeEventContext : true,
+      planFirst: action?.case === "createTask" ? action.value.harnessMode === "plan" : false,
     });
     setHydratedId(automation.id);
   }, [existing.data?.automation, hydratedId, mode]);
@@ -413,6 +419,7 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
                 promptTemplate: draft.promptTemplate,
                 ...(draft.titleTemplate.trim() ? { titleTemplate: draft.titleTemplate } : {}),
                 includeEventContext: draft.includeEventContext,
+                ...(draft.planFirst ? { harnessMode: "plan" } : {}),
               },
             },
           },
@@ -560,6 +567,7 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
             promptTemplate: draft.promptTemplate,
             ...(draft.titleTemplate.trim() ? { titleTemplate: draft.titleTemplate } : {}),
             includeEventContext: draft.includeEventContext,
+            ...(draft.planFirst ? { harnessMode: "plan" } : {}),
             ...overrideFields(draft.override),
           },
         },
@@ -945,6 +953,20 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
                     id="include-event-context"
                     checked={draft.includeEventContext}
                     onCheckedChange={(checked) => update("includeEventContext", checked)}
+                  />
+                </Field>
+                <Field orientation="horizontal">
+                  <div>
+                    <FieldLabel htmlFor="plan-first">Plan first</FieldLabel>
+                    <FieldDescription>
+                      The session designs a plan before implementing. Automation plans auto-approve
+                      and stay in the transcript as a reviewable record.
+                    </FieldDescription>
+                  </div>
+                  <Switch
+                    id="plan-first"
+                    checked={draft.planFirst}
+                    onCheckedChange={(checked) => update("planFirst", checked)}
                   />
                 </Field>
               </div>

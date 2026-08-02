@@ -4,7 +4,7 @@ import type { z } from "zod";
 
 import { sessions } from "../control-plane/client.ts";
 import { getDb } from "../db/client.ts";
-import { profile, task, taskSession } from "../db/schema.ts";
+import { task, taskSession } from "../db/schema.ts";
 import { log as rootLog } from "../log.ts";
 import {
   completeRegisteredToolCall,
@@ -76,15 +76,12 @@ export async function resolveToolContext(
       taskId: task.id,
       profileId: taskSession.profileId,
       userId: task.createdByUserId,
-      // The session's effective granted capabilities, persisted at create so an
-      // override (e.g. a review worker's clamped set) is honored. NULL on a
-      // legacy row → fall back to the profile's capabilities.
+      // The session's effective policy projection is immutable at create.
+      // Pre-ADR 0109 rows retain this column through the migration.
       sessionCapabilities: taskSession.capabilities,
-      profileCapabilities: profile.capabilities,
     })
     .from(taskSession)
     .innerJoin(task, eq(taskSession.taskId, task.id))
-    .leftJoin(profile, eq(taskSession.profileId, profile.id))
     .where(eq(taskSession.sessionId, sessionId))
     .limit(1);
   const row = rows[0];
@@ -94,7 +91,7 @@ export async function resolveToolContext(
     taskId: row.taskId,
     ...(row.profileId !== null ? { profileId: row.profileId } : {}),
     ...(row.userId !== null ? { userId: row.userId } : {}),
-    capabilities: row.sessionCapabilities ?? row.profileCapabilities ?? [],
+    capabilities: row.sessionCapabilities ?? [],
   };
 }
 
@@ -237,6 +234,8 @@ const productionPendingCalls: PendingToolCallStore = {
     makePendingToolCallStore().markSubmitted(sessionId, toolCallId, at),
   markCompleted: (sessionId, toolCallId, at) =>
     makePendingToolCallStore().markCompleted(sessionId, toolCallId, at),
+  listSessionIdsWithPendingSessionCalls: () =>
+    makePendingToolCallStore().listSessionIdsWithPendingSessionCalls(),
   find: (sessionId, toolCallId) =>
     makePendingToolCallStore().find(sessionId, toolCallId),
   listUnsubmittedSessionCallsBefore: (cutoff) =>

@@ -9,12 +9,17 @@
 // A custom router transport captures the proto-shaped requests; no fetch mocks.
 
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { cleanup, screen, waitFor } from "@testing-library/react";
+import { cleanup, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRouterTransport } from "@connectrpc/connect";
 import { renderWithProviders } from "../../test-utils";
 import { IntegrationsPanel } from "./IntegrationsPanel";
-import { IntegrationService, type Connector } from "../../gen/engram/app/v1/integration_pb";
+import { GoogleCloudSetupWorkspace } from "../integrations/GoogleCloudSetupPage";
+import {
+  IntegrationService,
+  type Connector,
+  type IntegrationConnection,
+} from "../../gen/engram/app/v1/integration_pb";
 import { MintService } from "../../gen/engram/app/v1/mint_pb";
 import { OrgSecretService } from "../../gen/engram/app/v1/org_secret_pb";
 import { ProfileService } from "../../gen/engram/app/v1/profile_pb";
@@ -24,6 +29,19 @@ interface Caps {
   puts: Array<{ name: string; value: string }>;
   upserts: string[];
   mints: Array<{ provider: string; kind: string; values: Record<string, string> }>;
+  connectionCreates: Array<{
+    alias: string;
+    workloadIdentityProvider: string;
+    serviceAccountEmail: string;
+    endpoints: string[];
+  }>;
+  connectionUpdates: Array<{
+    id: string;
+    alias: string;
+    workloadIdentityProvider: string;
+    serviceAccountEmail: string;
+    endpoints: string[];
+  }>;
 }
 
 const CATALOG = [
@@ -81,10 +99,12 @@ const CONNECTORS: Connector[] = [
   },
 ] as Connector[];
 
-function installTransport(): Caps {
+function installTransport(options: { connections?: IntegrationConnection[] } = {}): Caps {
   const puts: Caps["puts"] = [];
   const upserts: string[] = [];
   const mints: Caps["mints"] = [];
+  const connectionCreates: Caps["connectionCreates"] = [];
+  const connectionUpdates: Caps["connectionUpdates"] = [];
   const transport = createRouterTransport((router) => {
     router.service(IntegrationService, {
       listConnectors: () => ({ connectors: CONNECTORS }),
@@ -111,6 +131,62 @@ function installTransport(): Caps {
       testConnector: () => ({
         ok: true,
         message: "Reached api.github.com · HTTP 200 · credential accepted",
+      }),
+      listConnections: () => ({ connections: options.connections ?? [] }),
+      createConnection: (req) => {
+        connectionCreates.push({
+          alias: req.alias,
+          workloadIdentityProvider: req.googleCloud?.workloadIdentityProvider ?? "",
+          serviceAccountEmail: req.googleCloud?.serviceAccountEmail ?? "",
+          endpoints: [...(req.googleCloud?.endpoints ?? [])],
+        });
+        return {
+          connection: {
+            id: "connection-1",
+            alias: req.alias,
+            provider: "gcp",
+            displayName: req.displayName,
+            enabled: false,
+            testedAt: "",
+            createdAt: "",
+            updatedAt: "",
+            googleCloud: req.googleCloud,
+          },
+        };
+      },
+      updateConnection: (req) => {
+        connectionUpdates.push({
+          id: req.id,
+          alias: req.alias,
+          workloadIdentityProvider: req.googleCloud?.workloadIdentityProvider ?? "",
+          serviceAccountEmail: req.googleCloud?.serviceAccountEmail ?? "",
+          endpoints: [...(req.googleCloud?.endpoints ?? [])],
+        });
+        return {
+          connection: {
+            id: req.id,
+            alias: req.alias,
+            provider: "gcp",
+            displayName: req.displayName,
+            enabled: false,
+            testedAt: "",
+            createdAt: "",
+            updatedAt: "",
+            googleCloud: req.googleCloud,
+          },
+        };
+      },
+      deleteConnection: () => ({ deleted: true }),
+      testConnection: () => ({ ok: true, message: "STS and impersonation passed" }),
+      setConnectionEnabled: () => ({ connection: undefined }),
+      getGoogleCloudSetup: () => ({
+        issuer: "https://engrams.example/oidc",
+        audience:
+          "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
+        subjectAttribute: "google.subject=assertion.sub",
+        connectionAttribute: "attribute.engrams_connection=assertion.engrams_connection",
+        gcloudScript: "gcloud iam workload-identity-pools create engrams",
+        terraform: 'resource "google_iam_workload_identity_pool" "engrams" {}',
       }),
     });
     router.service(MintService, {
@@ -144,7 +220,7 @@ function installTransport(): Caps {
       deleteProfile: () => ({}),
     });
   });
-  return { transport, puts, upserts, mints };
+  return { transport, puts, upserts, mints, connectionCreates, connectionUpdates };
 }
 
 describe("IntegrationsPanel (marketplace)", () => {
@@ -161,9 +237,12 @@ describe("IntegrationsPanel (marketplace)", () => {
     expect(screen.getByText("Datadog")).toBeTruthy();
     expect(screen.getByText("Connected")).toBeTruthy();
     expect(screen.getByText("Available")).toBeTruthy();
-    // github is available → Connect; datadog connected → Manage.
-    expect(screen.getByRole("button", { name: /^connect$/i })).toBeTruthy();
-    expect(screen.getByRole("link", { name: /manage/i })).toBeTruthy();
+    const github = screen.getByRole("group", { name: "GitHub integration" });
+    const datadog = screen.getByRole("group", { name: "Datadog integration" });
+    const googleCloud = screen.getByRole("group", { name: "Google Cloud integration" });
+    expect(within(github).getByRole("button", { name: /^connect$/i })).toBeTruthy();
+    expect(within(datadog).getByRole("link", { name: /manage/i })).toBeTruthy();
+    expect(within(googleCloud).getByRole("button", { name: /^connect$/i })).toBeTruthy();
   });
 
   test("Connect (mint) calls SetMintCredential with the kind + field values", async () => {
@@ -171,7 +250,8 @@ describe("IntegrationsPanel (marketplace)", () => {
     renderWithProviders(<IntegrationsPanel />, { transport });
     const user = userEvent.setup();
 
-    await user.click(await screen.findByRole("button", { name: /^connect$/i }));
+    const github = await screen.findByRole("group", { name: "GitHub integration" });
+    await user.click(within(github).getByRole("button", { name: /^connect$/i }));
     await user.type(await screen.findByLabelText(/app id/i), "1357924");
     await user.type(screen.getByLabelText(/private key/i), "-----BEGIN KEY-----");
     // Authenticate → Test → Review → Add.
@@ -211,5 +291,151 @@ describe("IntegrationsPanel (marketplace)", () => {
     expect(cfg.credential.injects[0].secretRef).toBe("sentry-token");
     expect(cfg.operations[0].grants).toEqual(["issues:read"]);
     expect(puts).toContainEqual({ name: "sentry-token", value: "sk-live-abc" });
+  });
+
+  test("creates a keyless Google Cloud connection from familiar project inputs", async () => {
+    const { transport, connectionCreates } = installTransport();
+    renderWithProviders(<IntegrationsPanel />, { transport });
+    const user = userEvent.setup();
+
+    const googleCloud = await screen.findByRole("group", { name: "Google Cloud integration" });
+    await user.click(within(googleCloud).getByRole("button", { name: /^connect$/i }));
+    expect(screen.getByRole("heading", { name: "Connect Google Cloud" })).toBeTruthy();
+    await user.type(screen.getByLabelText(/connection name/i), "Production read only");
+    await user.type(screen.getByLabelText(/google cloud project number/i), "123");
+    await user.type(
+      screen.getByLabelText(/service account email/i),
+      "reader@customer.iam.gserviceaccount.com",
+    );
+    await user.click(screen.getByRole("checkbox", { name: /cloud logging/i }));
+    await user.click(screen.getByRole("checkbox", { name: /cloud trace/i }));
+    await user.click(screen.getByRole("button", { name: /create and continue/i }));
+
+    await waitFor(() => expect(connectionCreates).toHaveLength(1));
+    expect(connectionCreates[0]).toEqual({
+      alias: "production-read-only",
+      workloadIdentityProvider:
+        "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/engrams-production-read-only",
+      serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
+      endpoints: ["logging.googleapis.com", "cloudtrace.googleapis.com"],
+    });
+    expect(screen.queryByRole("heading", { name: "Connect Google Cloud" })).toBeNull();
+  });
+
+  test("shows generated Google Cloud setup in a tabbed workspace", async () => {
+    const connection = {
+      id: "connection-1",
+      alias: "prod-readonly",
+      provider: "gcp",
+      displayName: "Production read only",
+      enabled: false,
+      testedAt: "",
+      createdAt: "",
+      updatedAt: "",
+      googleCloud: {
+        workloadIdentityProvider:
+          "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
+        serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
+        endpoints: ["logging.googleapis.com"],
+      },
+    } as IntegrationConnection;
+    const { transport } = installTransport({ connections: [connection] });
+    const { container } = renderWithProviders(
+      <GoogleCloudSetupWorkspace connectionId="connection-1" />,
+      { transport },
+    );
+    const user = userEvent.setup();
+
+    expect(
+      await screen.findByRole("heading", { name: "Set up Production read only" }),
+    ).toBeTruthy();
+    expect(screen.queryByText(/gcloud iam workload-identity-pools create/)).toBeNull();
+    await waitFor(() => {
+      const terraformCode = container.querySelector(
+        'code[data-language="terraform"][data-highlighted="true"]',
+      );
+      expect(terraformCode?.textContent).toContain("google_iam_workload_identity_pool");
+    });
+
+    await user.click(screen.getByRole("tab", { name: /gcloud/i }));
+    await waitFor(() => {
+      const shellCode = container.querySelector(
+        'code[data-language="shellscript"][data-highlighted="true"]',
+      );
+      expect(shellCode?.textContent).toContain("gcloud iam workload-identity-pools create");
+    });
+  });
+
+  test("updates a Google Cloud connection's allowed APIs and preserves its WIF target", async () => {
+    const connection = {
+      id: "connection-1",
+      alias: "prod-readonly",
+      provider: "gcp",
+      displayName: "Production read only",
+      enabled: true,
+      testedAt: "2026-08-02T15:01:18Z",
+      createdAt: "",
+      updatedAt: "",
+      googleCloud: {
+        workloadIdentityProvider:
+          "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
+        serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
+        endpoints: ["logging.googleapis.com", "private-gke.example.com"],
+      },
+    } as IntegrationConnection;
+    const { transport, connectionUpdates } = installTransport({ connections: [connection] });
+    renderWithProviders(<GoogleCloudSetupWorkspace connectionId="connection-1" />, { transport });
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: /edit apis/i }));
+    expect(screen.getByRole("heading", { name: /edit allowed google cloud apis/i })).toBeTruthy();
+    expect(
+      (screen.getByLabelText(/other allowed api hostnames/i) as HTMLTextAreaElement).value,
+    ).toBe("private-gke.example.com");
+    await user.click(screen.getByRole("checkbox", { name: /cloud monitoring/i }));
+    await user.click(screen.getByRole("button", { name: /save api changes/i }));
+
+    await waitFor(() => expect(connectionUpdates).toHaveLength(1));
+    expect(connectionUpdates[0]).toEqual({
+      id: "connection-1",
+      alias: "prod-readonly",
+      workloadIdentityProvider:
+        "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
+      serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
+      endpoints: ["logging.googleapis.com", "monitoring.googleapis.com", "private-gke.example.com"],
+    });
+  });
+
+  test("shows configured Google Cloud as a connected provider card", async () => {
+    const { transport } = installTransport({
+      connections: [
+        {
+          id: "connection-1",
+          alias: "prod-readonly",
+          provider: "gcp",
+          displayName: "Production read only",
+          enabled: false,
+          testedAt: "",
+          createdAt: "",
+          updatedAt: "",
+          googleCloud: {
+            workloadIdentityProvider:
+              "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
+            serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
+            endpoints: ["logging.googleapis.com"],
+          },
+        } as IntegrationConnection,
+      ],
+    });
+    renderWithProviders(<IntegrationsPanel />, { transport });
+
+    const googleCloud = await screen.findByRole("group", { name: "Google Cloud integration" });
+    expect(within(googleCloud).getByText("connected", { exact: false })).toBeTruthy();
+    expect(within(googleCloud).getByText("1 connection")).toBeTruthy();
+    expect(
+      within(googleCloud)
+        .getByRole("link", { name: /manage/i })
+        .getAttribute("href"),
+    ).toBe("/settings/integrations/gcp");
   });
 });

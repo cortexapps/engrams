@@ -46,6 +46,7 @@ fn descriptor_to_proto(
         }),
         models: d.models.iter().map(option_to_proto).collect(),
         effort: d.effort.iter().map(option_to_proto).collect(),
+        modes: d.modes.iter().map(mode_to_proto).collect(),
         // ADR 0063 addendum: surfaced so the UI's "Reaches" receipts include
         // the hosts the harness itself opens (merged server-side at create).
         egress: Some(app::HarnessEgress {
@@ -61,6 +62,28 @@ fn option_to_proto(o: &engram_core::types::harness::HarnessOption) -> app::Harne
         label: o.label.clone(),
         default: o.default,
         env: o.env.clone().into_iter().collect(),
+        secrets: o
+            .secrets
+            .iter()
+            .map(|secret| app::HarnessOptionSecret {
+                r#ref: secret.r#ref.clone(),
+                env: secret.env.clone(),
+                mode: match secret.mode {
+                    engram_core::types::image::SecretMode::Literal => "literal".to_string(),
+                    engram_core::types::image::SecretMode::Broker => "broker".to_string(),
+                },
+                hosts: secret.hosts.clone(),
+                host_patterns: secret.host_patterns.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn mode_to_proto(m: &engram_core::types::harness::HarnessMode) -> app::HarnessMode {
+    app::HarnessMode {
+        id: m.id.clone(),
+        label: m.label.clone(),
+        default: m.default,
     }
 }
 

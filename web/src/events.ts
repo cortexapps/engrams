@@ -177,6 +177,10 @@ export type SessionEvent =
   // transcript renders an "interrupted" receipt and the run closes.
   | { type: "run_interrupted"; run_id: string; at: string }
   | { type: "harness_idle"; at: string }
+  // ADR 0107: a validated session-mode directive rode a prompt (e.g. "plan").
+  // Coordinator-authoritative; the composer chip and the thread's mode
+  // markers derive from the latest of these plus plan-approval results.
+  | { type: "harness_mode_changed"; mode: string; at: string }
   // ADR 0054 legacy read shape: pre-upgrade sessions may contain this durable
   // question card. Unanswered cards are read-only after ADR 0089 P5d; answered
   // cards still fold in their historical `question_answered` receipt.

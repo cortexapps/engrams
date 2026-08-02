@@ -122,7 +122,7 @@ AGENTD_BINS = {"engram-agentd"}
 # harness-claude (likewise; ADR 0062). The `engrams` CLI (which drives
 # enable/registry in that lane) is not a crate — it rides E2E_PATHS via
 # `cli/`. A change anywhere in this closure means the e2e lane could behave
-# differently, so run it. Gates the (expensive, non-required) e2e lane.
+# differently, so run it. Gates the expensive e2e stack lane.
 E2E_BINS = {
     "engram-coordinator",
     "engram-host-agent",
@@ -163,6 +163,14 @@ TF_HELM_PATHS = ["deploy/terraform/", "deploy/helm/"]
 # agentd, a compiled crate OUTSIDE this path, which needs the explicit
 # agentd_changed closure term below.)
 BUNDLES_PATHS = ["deploy/bundles/"]
+# The shared integration CLI bundle downloads and assembles provider binaries in
+# Docker. Build it directly in CI when its inputs or the metadata contract it
+# exercises change; the development and e2e staging recipe intentionally lets
+# optional bundle failures degrade.
+INTEGRATIONS_CLI_PATHS = [
+    "deploy/bundles/integrations-cli/",
+    "crates/engram-egress-proxy/src/metadata.rs",
+]
 # The node-assets image's OWN inputs (ADR 0044 K2): its Dockerfile and the fetch
 # script that pins the firecracker version + the engram guest-kernel release +
 # stages the RO bundles. The FC-fork binary (fc_fork lane) and the bundle
@@ -178,9 +186,10 @@ NODE_ASSETS_PATHS = ["docker/node-assets.Dockerfile", "docker/node-assets-fetch.
 # node-assets + roll the host fleet — folded into the `images` lane below.
 # Inert until the submodule exists (these paths don't change today).
 FC_FORK_PATHS = ["third_party/firecracker", ".gitmodules"]
-# Non-crate inputs to the `test-e2e-stack` lane: the dev-orchestration
+# Non-crate inputs to every `test-e2e-stack` variant: the dev-orchestration
 # scripts + Tiltfile that bring the stack up, the demo image sources it
-# bakes, the RO bundles it stages, and the workflow / detector themselves.
+# bakes, the RO bundles it stages, the CLI used for stack setup, and the
+# workflow / detector themselves.
 # (The e2e test file lives under crates/engram-coordinator/, so it's already
 # covered by that crate being in E2E_BINS' closure.)
 E2E_PATHS = [
@@ -189,7 +198,6 @@ E2E_PATHS = [
     "deploy/demo/",
     "deploy/bundles/",
     "cli/",  # the `engrams` CLI drives enable/registry/session in the lane
-    "orchestrator/",  # the product tier the stack (and the CLI) runs through
     ".github/workflows/ci.yml",
     ".github/scripts/detect-rebake-lanes.py",
 ]
@@ -364,15 +372,57 @@ def main():
         or any_path(changed, NODE_ASSETS_PATHS)
         or any_path(changed, BAKE_ALL_PATHS)
     )
-    # The expensive, non-required e2e lane: run it when any binary it builds
-    # moved or any of its non-crate inputs changed. Skipping it on
-    # doc/TF/web-only PRs is the win; a false positive just runs it
-    # needlessly (safe), so this errs toward running.
-    e2e = (
+    # The expensive e2e stack has two scopes. The core scope covers the Rust
+    # stack and its setup inputs, including the two automation scenarios. The
+    # orchestrator-only scope runs those scenarios in their own stack. This
+    # keeps the normal full posture at two stacks while an orchestrator-only PR
+    # does not also run the unrelated coordinator and evacuation scenarios.
+    e2e_core = (
         bool(cc & e2e_closure)
         or any_path(changed, E2E_PATHS)
         or any_path(changed, HARNESS_PATHS)
     )
+    e2e_orchestrator = e2e_core or any_path(changed, ORCH_PATHS)
+    e2e = e2e_core or e2e_orchestrator
+
+    # Keep #403 quarantined in the core suite. A 2026-07-17 un-quarantine run
+    # still timed out after prompt delivery with the pinned Claude CLI, so the
+    # failure is in the harness spawn/auth path rather than CLI shape drift.
+    e2e_core_matrix = [
+        {
+            "variant": "suite",
+            "two_hosts": "",
+            "expect_two_hosts": "",
+            "nextest_filter": (
+                "test(/e2e_/) "
+                "- test(e2e_two_host_evacuate_preserves_sentinel) "
+                "- test(e2e_claude_with_bogus_key_surfaces_anthropic_auth_error)"
+            ),
+        },
+        {
+            "variant": "teleport",
+            "two_hosts": "1",
+            "expect_two_hosts": "1",
+            "nextest_filter": "test(e2e_two_host_evacuate_preserves_sentinel)",
+        },
+    ]
+    e2e_orchestrator_matrix = [{
+        "variant": "orchestrator",
+        "two_hosts": "",
+        "expect_two_hosts": "",
+        "nextest_filter": "test(/e2e_automation_/)",
+    }]
+    # Core changes use the normal two-stack posture. Only an orchestrator-only
+    # change needs the dedicated orchestrator variant.
+    if e2e_core:
+        e2e_matrix = e2e_core_matrix
+    elif e2e_orchestrator:
+        e2e_matrix = e2e_orchestrator_matrix
+    else:
+        e2e_matrix = []
+    # Pushes to main and merge-group runs retain the full e2e posture even if
+    # their single-commit path set would select only one PR variant.
+    e2e_full_matrix = e2e_core_matrix
 
     # ── PR test-lane gating ────────────────────────────────────────────
     ci_self = any_path(changed, CI_SELF_PATHS)
@@ -404,6 +454,7 @@ def main():
     test_cli = ci_self or proto or any_path(changed, CLI_PATHS)
     # buf only lints/breaking-checks/codegen-drifts the protos.
     test_buf = ci_self or proto
+    test_integrations_cli = ci_self or any_path(changed, INTEGRATIONS_CLI_PATHS)
     # ADR 0098 P9: the host-sim swarm — its binary's own release closure.
     test_host_sim = ci_self or bool(cc & host_sim_closure)
     # ADR 0098 R-CoSim: the coordinator↔host boundary sim — its own (spanning)
@@ -438,14 +489,17 @@ def main():
     print(f"-> images={images} host_binaries={host_binaries} "
           f"host_base={host_base} host_image={host_image} cli_tools={cli_tools} "
           f"tf_or_helm={tf_or_helm} bundles={bundles} node_assets={node_assets} "
-          f"fc_fork={fc_fork} e2e={e2e}",
+          f"fc_fork={fc_fork} e2e={e2e} e2e_core={e2e_core} "
+          f"e2e_orchestrator={e2e_orchestrator}",
           file=sys.stderr)
     print(f"-> test_rust={test_rust} test_cross={test_cross} test_fc={test_fc} "
           f"test_web={test_web} test_orchestrator={test_orchestrator} "
           f"test_cli={test_cli} test_buf={test_buf} ci_self={ci_self} proto={proto} "
-          f"test_host_sim={test_host_sim} test_cosim={test_cosim}",
+          f"test_host_sim={test_host_sim} test_cosim={test_cosim} "
+          f"test_integrations_cli={test_integrations_cli}",
           file=sys.stderr)
     print(f"-> images_matrix={images_matrix}", file=sys.stderr)
+    print(f"-> e2e_matrix={e2e_matrix}", file=sys.stderr)
 
     def b(v):
         return 'true' if v else 'false'
@@ -463,6 +517,8 @@ def main():
             f.write(f"node_assets={b(node_assets)}\n")
             f.write(f"fc_fork={b(fc_fork)}\n")
             f.write(f"e2e={b(e2e)}\n")
+            f.write(f"e2e_matrix={json.dumps({'include': e2e_matrix})}\n")
+            f.write(f"e2e_full_matrix={json.dumps({'include': e2e_full_matrix})}\n")
             # PR test lanes (ci.yml + ci-macos-vz.yml gate on these).
             f.write(f"test_rust={b(test_rust)}\n")
             f.write(f"test_cross={b(test_cross)}\n")
@@ -473,6 +529,7 @@ def main():
             f.write(f"test_buf={b(test_buf)}\n")
             f.write(f"test_host_sim={b(test_host_sim)}\n")
             f.write(f"test_cosim={b(test_cosim)}\n")
+            f.write(f"test_integrations_cli={b(test_integrations_cli)}\n")
             # Per-image bake matrix (JSON array → fromJSON in bake-images.yml).
             f.write(f"images_matrix={json.dumps(images_matrix)}\n")
 

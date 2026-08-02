@@ -951,7 +951,7 @@ impl HostService for HostServiceImpl {
         let r = req.into_inner();
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
         self.inner
-            .send_prompt(sandbox_id, r.prompt_id, r.text)
+            .send_prompt(sandbox_id, r.prompt_id, r.text, r.harness_mode)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))

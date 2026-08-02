@@ -572,9 +572,9 @@ async fn e2e_vz_warm_restore_falls_back_to_cold() {
 }
 
 /// ADR 0096 D6: soft egress steering. The backend passes
-/// `ENGRAM_EGRESS=<proxy>:<dns>` on the kernel cmdline; the init shim
+/// `ENGRAM_EGRESS=<proxy>:<dns>:<metadata>` on the kernel cmdline; the init shim
 /// derives the NAT gateway from the guest's default route and installs
-/// DNAT rules for tcp/443 + {udp,tcp}/53 pointing at the egress proxy.
+/// DNAT rules for tcp/443, {udp,tcp}/53, and the metadata address.
 /// This pins the cmdline → shim → netfilter chain (the test rootfs
 /// carries Alpine's iptables; images without it warn + stay open). The
 /// full traffic path (proxy SNI dial, CA, allow_hosts) is exercised by
@@ -591,7 +591,7 @@ async fn e2e_vz_egress_steering_installs_guest_redirect() {
         work.path().join("sb"),
         VzConfig::with_kernel(env.kernel.clone())
             .with_bundle_dir(env.bundle_dir.clone())
-            .with_egress_ports(18443, 18053),
+            .with_egress_ports(18443, 18053, 13338),
     )
     .expect("VzBackend::new");
 
@@ -607,6 +607,10 @@ async fn e2e_vz_egress_steering_installs_guest_redirect() {
     assert!(
         out.contains("--dport 53") && out.contains(":18053"),
         "53 DNAT to the dns port must be installed; rules: {out}",
+    );
+    assert!(
+        out.contains("169.254.169.254") && out.contains(":13338"),
+        "metadata DNAT must target only the metadata address; rules: {out}",
     );
 
     b.destroy(id).await.expect("destroy");

@@ -1,7 +1,7 @@
 # ADR 0058: pinned versions for the `integrations-cli` RO bundle — the shared
-# CLI toolbox for connected integrations. build.sh reads GH_VERSION /
-# PUP_VERSION from the environment, defaulting to these. Bump here + in
-# build.sh's defaults together; a bundle roll (new content-addressed squashfs
+# CLI toolbox for connected integrations. build.sh reads the version variables
+# from the environment, defaulting to these values. Bump here and in build.sh's
+# defaults together; a bundle roll (new content-addressed squashfs
 # staged on the fleet) ships fleet-wide via an FC-host re-bake — no session-image
 # re-bake.
 #
@@ -14,7 +14,7 @@
 # symlinks onto PATH. Auth is brokered: each CLI carries a harmless placeholder
 # and the egress proxy injects the real credential host-side (ADR 0056/0057).
 name = "integrations-cli"
-description = "Integration CLIs (gh, glab, stripe, pup, + per-provider wrappers) + a discovery skill; binaries run on the base image's glibc."
+description = "Integration CLIs, including gcloud, and a discovery skill; binaries run on the base image's glibc."
 
 [versions]
 # GitHub CLI — a static Go binary (no glibc deps).
@@ -27,3 +27,9 @@ pup = "1.4.0"
 glab = "1.105.0"
 # Stripe CLI — a static Go binary from github.com/stripe/stripe-cli releases.
 stripe = "1.43.2"
+# Google Cloud CLI versioned archive.
+gcloud = "577.0.0"
+# Build-container base (debian:bookworm-slim), pinned by digest — the bundle
+# copies its Python runtime and shared libraries, so the digest is part of
+# the bundle's reproducibility contract.
+bookworm_digest = "sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818"

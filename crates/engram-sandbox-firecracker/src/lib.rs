@@ -70,11 +70,13 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -94,7 +96,7 @@ use engram_core::types::sandbox::{
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -165,6 +167,166 @@ fn per_port_uds(base_vsock_uds: &Path, port: u32) -> PathBuf {
 /// `pub` so the reattach integration test can assert it gets re-bound.
 pub fn harness_uds_for(base_vsock_uds: &Path) -> PathBuf {
     per_port_uds(base_vsock_uds, engram_harness_proto::HARNESS_VSOCK_PORT)
+}
+
+struct EpochWaiter {
+    epoch: tokio::sync::watch::Receiver<u64>,
+    observed_epoch: u64,
+    epoch_change: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
+}
+
+impl EpochWaiter {
+    fn new(mut epoch: tokio::sync::watch::Receiver<u64>) -> Self {
+        let observed_epoch = *epoch.borrow_and_update();
+        let mut waiter_epoch = epoch.clone();
+        let epoch_change = Box::pin(async move {
+            let _ = waiter_epoch.changed().await;
+        });
+        Self {
+            epoch,
+            observed_epoch,
+            epoch_change: Some(epoch_change),
+        }
+    }
+
+    fn epoch_changed(&self) -> bool {
+        match self.epoch.has_changed() {
+            Ok(changed) => changed,
+            // `has_changed` reports a closed channel before it reports
+            // an unseen value. Compare the value to keep the last bump.
+            Err(_) => *self.epoch.borrow() != self.observed_epoch,
+        }
+    }
+
+    fn poll_changed(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.epoch_changed() {
+            self.epoch_change = None;
+            return true;
+        }
+
+        let Some(epoch_change) = self.epoch_change.as_mut() else {
+            return false;
+        };
+        if epoch_change.as_mut().poll(cx).is_pending() {
+            return false;
+        }
+
+        self.epoch_change = None;
+        self.epoch_changed()
+    }
+}
+
+/// Ends a long-lived vsock stream when a snapshot changes its epoch.
+/// Firecracker queues a `TRANSPORT_RESET` during snapshot capture
+/// (ADR 0074). The guest then drops the connection without sending EOF
+/// to the host. The exec path already races its I/O against this epoch.
+/// This wrapper extends that protection to the harness data channel.
+///
+/// `run_connection` in `engram-host-agent/src/harness.rs` splits this stream.
+/// It gives the read half to `reader_loop`.
+/// It gives the write half to `writer_loop` in a new task.
+/// Each epoch change future has one waker slot.
+/// The read path and the write path therefore use separate waiters.
+/// A write poll must never replace the reader task's waker.
+///
+/// Each change future owns a cloned receiver. It stays allocated while
+/// it is pending. The watch channel can then keep each task waker registered.
+/// A ready inner read wins over an epoch change. This preserves bytes
+/// that Firecracker delivered before it severed the connection.
+///
+/// This type is public for the host-agent behavioral test. Reuse it as
+/// the single vsock severance primitive.
+pub struct EpochSeveredStream<S> {
+    inner: S,
+    read_epoch: EpochWaiter,
+    write_epoch: EpochWaiter,
+    severed: bool,
+}
+
+impl<S> EpochSeveredStream<S> {
+    /// Creates a stream that ends when the epoch changes.
+    pub fn new(inner: S, epoch: tokio::sync::watch::Receiver<u64>) -> Self {
+        Self {
+            inner,
+            read_epoch: EpochWaiter::new(epoch.clone()),
+            write_epoch: EpochWaiter::new(epoch.clone()),
+            severed: false,
+        }
+    }
+
+    fn poll_epoch_change(
+        severed: &mut bool,
+        epoch: &mut EpochWaiter,
+        cx: &mut Context<'_>,
+    ) -> bool {
+        if *severed || epoch.poll_changed(cx) {
+            *severed = true;
+            return true;
+        }
+        false
+    }
+
+    fn severed_write_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "snapshot capture severed the vsock connection",
+        )
+    }
+}
+
+impl<S> AsyncRead for EpochSeveredStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending
+                if Self::poll_epoch_change(&mut this.severed, &mut this.read_epoch, cx) =>
+            {
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> AsyncWrite for EpochSeveredStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if Self::poll_epoch_change(&mut this.severed, &mut this.write_epoch, cx) {
+            return Poll::Ready(Err(Self::severed_write_error()));
+        }
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if Self::poll_epoch_change(&mut this.severed, &mut this.write_epoch, cx) {
+            return Poll::Ready(Err(Self::severed_write_error()));
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if Self::poll_epoch_change(&mut this.severed, &mut this.write_epoch, cx) {
+            return Poll::Ready(Err(Self::severed_write_error()));
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
 }
 
 /// ADR 0023: host-side UDS Firecracker proxies the in-guest forge
@@ -361,6 +523,9 @@ pub struct FirecrackerConfig {
     /// (test/dev only; that lane now applies a plain FORWARD
     /// default-deny with no public-resolver ACCEPT — issue #240).
     pub egress_dns_port: Option<u16>,
+    /// TCP port for the Google metadata-compatible ADC listener. Iptables
+    /// redirects guest 169.254.169.254:80 to this port.
+    pub egress_metadata_port: Option<u16>,
     /// ADR 0007 Phase 5: this host's stable `HostId`. Stamped on
     /// the FC sidecar JSON at snapshot time (so cross-host restore
     /// knows which host's working-set trace to prefault) AND
@@ -616,6 +781,7 @@ impl FirecrackerConfig {
             net_pool: Some("10.200.0.0".parse().unwrap()),
             egress_proxy_port: None,
             egress_dns_port: None,
+            egress_metadata_port: None,
             kernel_image_path: kernel_image_path.into(),
             default_boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init"
                 .into(),
@@ -1030,6 +1196,7 @@ impl FirecrackerBackend {
         net::host_startup(
             self.config.egress_proxy_port,
             self.config.egress_dns_port,
+            self.config.egress_metadata_port,
             guest_otel_port,
         )
         .await
@@ -2647,12 +2814,29 @@ impl FirecrackerBackend {
             )
         })?;
         let sink_slot = self.harness_sink.clone();
+        let sandboxes = self.sandboxes.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _peer)) => match sink_slot.read().clone() {
                         Some(sink) => {
-                            sink(Box::pin(stream));
+                            let epoch = {
+                                sandboxes
+                                    .get(&sandbox_id)
+                                    .map(|live| live.vsock_epoch.subscribe())
+                            };
+                            match epoch {
+                                Some(epoch) => {
+                                    sink(Box::pin(EpochSeveredStream::new(stream, epoch)));
+                                }
+                                None => {
+                                    tracing::debug!(
+                                        %sandbox_id,
+                                        "sandbox left the live map before harness accept; using raw stream",
+                                    );
+                                    sink(Box::pin(stream));
+                                }
+                            }
                         }
                         None => {
                             tracing::warn!(
@@ -6927,6 +7111,117 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[tokio::test]
+    async fn epoch_severed_stream_idle_read_returns_eof_after_epoch_bump() {
+        let (host_end, _guest_end) = tokio::io::duplex(64);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let mut stream = EpochSeveredStream::new(host_end, epoch_rx);
+        let bump = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            epoch_tx.send_modify(|epoch| *epoch += 1);
+        });
+
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .expect("epoch bump must wake the parked read")
+            .expect("severed read must return EOF");
+        assert_eq!(read, 0);
+        bump.await.expect("epoch bump task");
+    }
+
+    #[tokio::test]
+    async fn epoch_severed_stream_split_write_cannot_steal_reader_wake() {
+        let (host_end, mut guest_end) = tokio::io::duplex(64);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let stream = EpochSeveredStream::new(host_end, epoch_rx);
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let reader_task = tokio::spawn(async move {
+            let mut byte = [0u8; 1];
+            reader.read(&mut byte).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        writer
+            .write_all(b"frame")
+            .await
+            .expect("write through the split write half");
+        let mut frame = [0u8; 5];
+        guest_end
+            .read_exact(&mut frame)
+            .await
+            .expect("read the frame from the far end");
+        assert_eq!(&frame, b"frame");
+
+        epoch_tx.send_modify(|epoch| *epoch += 1);
+        let read = tokio::time::timeout(Duration::from_secs(1), reader_task)
+            .await
+            .expect("epoch bump must wake the split read half")
+            .expect("reader task must finish")
+            .expect("severed read must return EOF");
+        assert_eq!(read, 0);
+    }
+
+    #[tokio::test]
+    async fn epoch_severed_stream_reads_buffered_bytes_before_eof() {
+        let (host_end, mut guest_end) = tokio::io::duplex(64);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let mut stream = EpochSeveredStream::new(host_end, epoch_rx);
+        guest_end
+            .write_all(b"frame")
+            .await
+            .expect("buffer bytes before capture");
+        epoch_tx.send_modify(|epoch| *epoch += 1);
+
+        let mut frame = [0u8; 5];
+        stream
+            .read_exact(&mut frame)
+            .await
+            .expect("buffered bytes must win over the epoch bump");
+        assert_eq!(&frame, b"frame");
+
+        let mut byte = [0u8; 1];
+        let read = stream.read(&mut byte).await.expect("severed read is EOF");
+        assert_eq!(read, 0);
+    }
+
+    #[tokio::test]
+    async fn epoch_severed_stream_rejects_write_after_epoch_bump() {
+        let (host_end, _guest_end) = tokio::io::duplex(64);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let mut stream = EpochSeveredStream::new(host_end, epoch_rx);
+        epoch_tx.send_modify(|epoch| *epoch += 1);
+
+        let error = stream
+            .write(b"lost prompt")
+            .await
+            .expect_err("write after capture must fail");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn epoch_severed_stream_passes_io_without_epoch_bump() {
+        let (host_end, mut guest_end) = tokio::io::duplex(64);
+        let (_epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let mut stream = EpochSeveredStream::new(host_end, epoch_rx);
+
+        guest_end.write_all(b"in").await.expect("guest write");
+        let mut inbound = [0u8; 2];
+        stream
+            .read_exact(&mut inbound)
+            .await
+            .expect("host read without capture");
+        assert_eq!(&inbound, b"in");
+
+        stream.write_all(b"out").await.expect("host write");
+        let mut outbound = [0u8; 3];
+        guest_end
+            .read_exact(&mut outbound)
+            .await
+            .expect("guest read without capture");
+        assert_eq!(&outbound, b"out");
+    }
+
     #[test]
     fn snapshot_timeout_scales_with_guest_memory() {
         // Small VMs stay essentially at the 60s floor (no regression).
@@ -7066,6 +7361,7 @@ mod tests {
             net_pool: None,
             egress_proxy_port: None,
             egress_dns_port: None,
+            egress_metadata_port: None,
             host_id: None,
             uffd_cache_root: None,
             uffd_substrate_sock: None,

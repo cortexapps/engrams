@@ -1475,7 +1475,9 @@ async fn enqueue_evacuating_resume(ctx: &Ctx) {
 }
 
 /// Outbox: due-ness rides not_before on the shared clock; ack is
-/// once-only; delivered rows can't be deleted as undelivered.
+/// once-only; delivered rows can't be deleted as undelivered;
+/// make_due (ADR 0108 A8) recalls exactly the waiting un-acked rows,
+/// idempotently and without an attempts bump.
 async fn outbox_flow(ctx: &Ctx) {
     let meta = &ctx.meta;
     let sid = meta.create_session(spec("conf:outbox")).await.unwrap();
@@ -1519,6 +1521,55 @@ async fn outbox_flow(ctx: &Ctx) {
     );
     assert!(meta.outbox_ack("p-1").await.unwrap());
     assert!(!meta.outbox_ack("p-1").await.unwrap(), "ack is once-only");
+    assert!(meta.outbox_next_due(sid).await.unwrap().is_none());
+
+    // ADR 0108: `outbox_make_due` — the inverse of defer. Stage a
+    // deferred row (p-2), a delivered-but-unacked row (p-3), and an
+    // already-due row (p-4); p-1 above is acked. make_due must pull
+    // exactly the two waiting rows, bump no `attempts`, and be a
+    // no-op on a repeat call.
+    let now = ctx.clock.now_utc();
+    for (i, pid) in ["p-2", "p-3", "p-4"].iter().enumerate() {
+        meta.outbox_enqueue(&engram_core::types::outbox::OutboxRow {
+            prompt_id: (*pid).into(),
+            session_id: sid,
+            kind: engram_core::types::outbox::OutboxKind::Prompt,
+            payload: serde_json::json!({"text": "hi"}),
+            // Staggered so per-row assertions below can walk
+            // next_due order deterministically on both stores.
+            created_at: now + chrono::Duration::milliseconds(i as i64),
+            attempts: 0,
+            not_before: now,
+            delivered_at: None,
+            acked_at: None,
+        })
+        .await
+        .unwrap();
+    }
+    meta.outbox_defer("p-2", Duration::from_secs(60))
+        .await
+        .unwrap(); // attempts -> 1
+    meta.outbox_mark_delivered("p-3", Duration::from_secs(30))
+        .await
+        .unwrap(); // attempts -> 1
+    assert_eq!(
+        meta.outbox_make_due(sid).await.unwrap(),
+        2,
+        "make_due moves the deferred + the delivered-unacked row; not the due row, not the acked row"
+    );
+    assert_eq!(
+        meta.outbox_make_due(sid).await.unwrap(),
+        0,
+        "idempotent: nothing left with a future not_before"
+    );
+    // Walk next_due (oldest created_at first): every row is due NOW
+    // and make_due changed no `attempts`.
+    for (pid, attempts) in [("p-2", 1), ("p-3", 1), ("p-4", 0)] {
+        let due = meta.outbox_next_due(sid).await.unwrap().expect("due row");
+        assert_eq!(due.prompt_id, pid);
+        assert_eq!(due.attempts, attempts, "make_due must not bump attempts");
+        assert!(meta.outbox_ack(pid).await.unwrap());
+    }
     assert!(meta.outbox_next_due(sid).await.unwrap().is_none());
 }
 
@@ -2887,6 +2938,14 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     meta.append_session_event(id, "harness_idle", serde_json::json!({}))
         .await
         .unwrap();
+    // ADR 0107: a mode directive is user intent — it survives a rewind.
+    meta.append_session_event(
+        id,
+        "harness_mode_changed",
+        serde_json::json!({"mode": "plan"}),
+    )
+    .await
+    .unwrap();
     // ADR 0090: the durability-rollback marker is a coordinator fact that
     // survives the very rewind it warns about — it must NOT tombstone.
     meta.append_session_event(
@@ -2907,7 +2966,8 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     // Only the guest-derived events roll back (agent_message,
     // integration_asset, tool_call_started, file_shared = 4); the
     // coordinator facts (prompt_received, resume_started, harness_idle,
-    // durability_rollback) + the anchor status_changed survive.
+    // harness_mode_changed, durability_rollback) + the anchor
+    // status_changed survive.
     assert_eq!(summary.rolled_back, 4, "rolled_back count");
     assert_eq!(summary.through_idx, cursor, "through_idx is the cursor");
     assert_eq!(summary.recovery_epoch, 1, "epoch bumped once");
@@ -2934,6 +2994,7 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
                 | "harness_idle"
                 | "status_changed"
                 | "durability_rollback"
+                | "harness_mode_changed"
         );
         assert_eq!(
             e.rewound_at.is_none(),

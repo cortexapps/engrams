@@ -194,6 +194,7 @@ async fn cross_replica_stream_delivers_every_event_once_in_order() {
         .stream_events(engram_protocol::app::StreamEventsRequest {
             session_id: session_id.to_string(),
             since: None,
+            durable_only: false,
         })
         .await
         .expect("stream_events")
