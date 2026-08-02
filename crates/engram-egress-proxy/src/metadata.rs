@@ -112,9 +112,13 @@ fn response(
     let text = |value: &str| ("200 OK", "text/plain", value.to_string());
     match path {
         "/" | "/computeMetadata/v1/" => text("instance/\nproject/\n"),
-        "/computeMetadata/v1/instance/service-accounts/" => text("default/\n"),
-        "/computeMetadata/v1/instance/service-accounts/default/"
-            if query.split('&').any(|item| item == "recursive=true") =>
+        "/computeMetadata/v1/instance/service-accounts/" => {
+            text("default/\nengrams-broker@invalid/\n")
+        }
+        path if path.starts_with("/computeMetadata/v1/instance/service-accounts/")
+            && path != "/computeMetadata/v1/instance/service-accounts/"
+            && path.ends_with('/')
+            && query.split('&').any(|item| item == "recursive=true") =>
         {
             (
                 "200 OK",
@@ -138,6 +142,9 @@ fn response(
             ),
         ),
         "/computeMetadata/v1/project/project-id" => text("engrams-broker"),
+        // Cloud SDK uses this digits-only response to detect a GCE metadata
+        // server. This is a synthetic identifier, not a customer project.
+        "/computeMetadata/v1/project/numeric-project-id" => text("0"),
         _ => ("404 Not Found", "text/plain", "not found".into()),
     }
 }
@@ -168,19 +175,46 @@ mod tests {
 
     #[test]
     fn recursive_service_account_info_matches_google_auth_adc() {
+        for account in ["default", "engrams-broker@invalid"] {
+            let (status, content_type, body) = response(
+                "GET",
+                &format!("/computeMetadata/v1/instance/service-accounts/{account}/?recursive=true"),
+                true,
+            );
+            assert_eq!(status, "200 OK");
+            assert_eq!(content_type, "application/json");
+            let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(info["email"], "engrams-broker@invalid");
+            assert_eq!(
+                info["scopes"][0],
+                "https://www.googleapis.com/auth/cloud-platform"
+            );
+        }
+    }
+
+    #[test]
+    fn service_account_listing_matches_cloud_sdk_discovery() {
         let (status, content_type, body) = response(
             "GET",
-            "/computeMetadata/v1/instance/service-accounts/default/?recursive=true",
+            "/computeMetadata/v1/instance/service-accounts/",
             true,
         );
         assert_eq!(status, "200 OK");
-        assert_eq!(content_type, "application/json");
-        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(info["email"], "engrams-broker@invalid");
-        assert_eq!(
-            info["scopes"][0],
-            "https://www.googleapis.com/auth/cloud-platform"
+        assert_eq!(content_type, "text/plain");
+        assert_eq!(body, "default/\nengrams-broker@invalid/\n");
+    }
+
+    #[test]
+    fn cloud_sdk_detection_uses_only_synthetic_project_metadata() {
+        let (status, content_type, body) = response(
+            "GET",
+            "/computeMetadata/v1/project/numeric-project-id",
+            true,
         );
+        assert_eq!(status, "200 OK");
+        assert_eq!(content_type, "text/plain");
+        assert_eq!(body, "0");
+        assert!(body.bytes().all(|byte| byte.is_ascii_digit()));
     }
 
     #[test]
@@ -274,36 +308,49 @@ mod tests {
         let config_path = config.path().to_path_buf();
         let command_config_path = config_path.clone();
         let metadata_host = address.to_string();
-        let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("gcloud")
-                .args([
+        let outputs = tokio::task::spawn_blocking(move || {
+            let run = |args: &[&str]| {
+                std::process::Command::new("gcloud")
+                    .args(args)
+                    .env("CLOUDSDK_CONFIG", &command_config_path)
+                    .env("GCE_METADATA_HOST", &metadata_host)
+                    .env("GCE_METADATA_IP", &metadata_host)
+                    .env("GCE_METADATA_ROOT", &metadata_host)
+                    .env("CLOUDSDK_CORE_CHECK_GCE_METADATA", "true")
+                    .env_remove("GOOGLE_APPLICATION_CREDENTIALS")
+                    .output()
+                    .unwrap()
+            };
+            [
+                run(&["auth", "print-access-token", "--quiet"]),
+                run(&[
                     "auth",
                     "application-default",
                     "print-access-token",
                     "--quiet",
-                ])
-                .env("CLOUDSDK_CONFIG", command_config_path)
-                .env("GCE_METADATA_HOST", &metadata_host)
-                .env("GCE_METADATA_IP", &metadata_host)
-                .env_remove("GOOGLE_APPLICATION_CREDENTIALS")
-                .output()
-                .unwrap()
+                ]),
+            ]
         })
         .await
         .unwrap();
         server.abort();
         let _ = server.await;
 
-        assert!(
-            output.status.success(),
-            "gcloud metadata ADC failed with status {}",
-            output.status
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).trim() == PLACEHOLDER_TOKEN,
-            "gcloud returned a token other than the fixed placeholder"
-        );
-        assert!(!config_path.join("credentials.db").exists());
+        for output in outputs {
+            assert!(
+                output.status.success(),
+                "gcloud metadata ADC failed with status {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).trim() == PLACEHOLDER_TOKEN,
+                "gcloud returned a token other than the fixed placeholder"
+            );
+        }
+        // Standard gcloud creates its empty credential-store database while it
+        // discovers metadata accounts. It must not create an ADC document that
+        // could outlive the session-local metadata flow.
         assert!(!config_path
             .join("application_default_credentials.json")
             .exists());

@@ -663,6 +663,9 @@ describe("compileSessionCreateInput", () => {
 
     expect(input.selectedSkills).toContain("integrations-cli");
     expect(input.harnessEnv?.GCE_METADATA_HOST).toBe("169.254.169.254");
+    expect(input.harnessEnv?.GCE_METADATA_IP).toBe("169.254.169.254");
+    expect(input.harnessEnv?.GCE_METADATA_ROOT).toBe("169.254.169.254");
+    expect(input.harnessEnv?.CLOUDSDK_CORE_CHECK_GCE_METADATA).toBe("true");
     expect(input.harnessEnv?.ENGRAM_CLI_INTEGRATIONS).toContain('"provider":"gcp"');
     expect(input.harnessEnv?.ENGRAM_CLI_INTEGRATIONS).toContain('"bins":["gcloud"]');
     expect(input.integrationConnections).toEqual([{

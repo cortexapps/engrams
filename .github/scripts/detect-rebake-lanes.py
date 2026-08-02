@@ -164,9 +164,13 @@ TF_HELM_PATHS = ["deploy/terraform/", "deploy/helm/"]
 # agentd_changed closure term below.)
 BUNDLES_PATHS = ["deploy/bundles/"]
 # The shared integration CLI bundle downloads and assembles provider binaries in
-# Docker. Build it directly in CI when its inputs change; the development and
-# e2e staging recipe intentionally lets optional bundle failures degrade.
-INTEGRATIONS_CLI_PATHS = ["deploy/bundles/integrations-cli/"]
+# Docker. Build it directly in CI when its inputs or the metadata contract it
+# exercises change; the development and e2e staging recipe intentionally lets
+# optional bundle failures degrade.
+INTEGRATIONS_CLI_PATHS = [
+    "deploy/bundles/integrations-cli/",
+    "crates/engram-egress-proxy/src/metadata.rs",
+]
 # The node-assets image's OWN inputs (ADR 0044 K2): its Dockerfile and the fetch
 # script that pins the firecracker version + the engram guest-kernel release +
 # stages the RO bundles. The FC-fork binary (fc_fork lane) and the bundle

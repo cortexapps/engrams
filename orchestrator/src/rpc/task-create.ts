@@ -462,6 +462,9 @@ export async function compileSessionCreateInput(
   if (hasGoogleCloud) {
     harness.GCE_METADATA_HOST = "169.254.169.254";
     harness.GCE_METADATA_IP = "169.254.169.254";
+    // The Cloud SDK uses GCE_METADATA_ROOT while google-auth uses
+    // GCE_METADATA_HOST. Point both clients at the session-local emulator.
+    harness.GCE_METADATA_ROOT = "169.254.169.254";
     harness.CLOUDSDK_CORE_CHECK_GCE_METADATA = "true";
   }
   const selectedSkills = [...new Set([
