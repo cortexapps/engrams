@@ -17,7 +17,18 @@ export const GOOGLE_CLOUD_OPERATIONS = [
     access: "write",
   },
   { action: "logging.entries.list", label: "Read Cloud Logging entries", access: "read" },
-  { action: "trace.traces.list", label: "Read Cloud Trace", access: "read" },
+  { action: "trace.traces.list", label: "List Cloud Trace traces", access: "read" },
+  { action: "trace.traces.get", label: "Read Cloud Trace details", access: "read" },
+  {
+    action: "monitoring.metricdescriptors.list",
+    label: "List Cloud Monitoring metric descriptors",
+    access: "read",
+  },
+  {
+    action: "monitoring.timeseries.list",
+    label: "Read Cloud Monitoring time series",
+    access: "read",
+  },
   {
     action: "container.clusters.get",
     label: "Get GKE cluster credentials",
