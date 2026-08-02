@@ -53,7 +53,7 @@ jobs:
       KERNEL_REV: ${{ github.event.inputs.kernel_rev || '2' }}
       ARCH: ${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install kernel build deps
         run: |
