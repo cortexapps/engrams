@@ -109,7 +109,7 @@ describe("Google egress policy", () => {
       hosts: ["compute.googleapis.com"],
       methods: ["POST"],
       path_globs: [
-        "segment:/compute/v1/projects/prod/zones/us-central1-a/instances/engram-dev/start",
+        "segment-path:/compute/v1/projects/prod/zones/us-central1-a/instances/engram-dev/start",
       ],
       mint_source: { connection: { connection_id: "connection-1" } },
     });
@@ -122,6 +122,11 @@ describe("Google egress policy", () => {
     expect(() => appendGooglePolicy(policy(), [
       grant("compute.instances.stop", ["/compute/v1/projects/other"]),
     ])).toThrow(/not a valid/);
+    expect(() => appendGooglePolicy(policy(), [
+      grant("monitoring.timeseries.list", [
+        "/v3/projects/prod/timeSeries?filter=metric.type%3Dx",
+      ], ["monitoring.googleapis.com"]),
+    ])).toThrow(/not a valid/);
   });
 
   test("curates the Logging REST and gRPC methods", () => {
@@ -131,8 +136,8 @@ describe("Google egress policy", () => {
       hosts: ["logging.googleapis.com"],
       methods: ["POST"],
       path_globs: [
-        "segment:/v2/entries:list",
-        "segment:/google.logging.v2.LoggingServiceV2/ListLogEntries",
+        "segment-path:/v2/entries:list",
+        "segment-path:/google.logging.v2.LoggingServiceV2/ListLogEntries",
       ],
     });
   });
@@ -153,16 +158,16 @@ describe("Google egress policy", () => {
         hosts: ["monitoring.googleapis.com"],
         methods: ["GET", "POST"],
         path_globs: [
-          "segment:/v3/projects/*/metricDescriptors",
-          "segment:/google.monitoring.v3.MetricService/ListMetricDescriptors",
+          "segment-path:/v3/projects/*/metricDescriptors",
+          "segment-path:/google.monitoring.v3.MetricService/ListMetricDescriptors",
         ],
       }),
       expect.objectContaining({
         hosts: ["monitoring.googleapis.com"],
         methods: ["GET", "POST"],
         path_globs: [
-          "segment:/v3/projects/*/timeSeries",
-          "segment:/google.monitoring.v3.MetricService/ListTimeSeries",
+          "segment-path:/v3/projects/*/timeSeries",
+          "segment-path:/google.monitoring.v3.MetricService/ListTimeSeries",
         ],
       }),
     ]);
@@ -176,8 +181,8 @@ describe("Google egress policy", () => {
     appendGooglePolicy(output, [list, get]);
 
     expect(output.injects.map((entry) => entry.path_globs)).toEqual([
-      ["segment:/v1/projects/*/traces"],
-      ["segment:/v1/projects/*/traces/*"],
+      ["segment-path:/v1/projects/*/traces"],
+      ["segment-path:/v1/projects/*/traces/*"],
     ]);
   });
 
@@ -221,7 +226,7 @@ describe("Google egress policy", () => {
     expect(output.network.allow_hosts).toEqual(["cluster.example.com"]);
     expect(output.injects[0]).toMatchObject({
       hosts: ["cluster.example.com"],
-      path_globs: ["segment:/api/v1/namespaces/default/pods"],
+      path_globs: ["segment-path:/api/v1/namespaces/default/pods"],
     });
   });
 

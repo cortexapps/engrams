@@ -21,15 +21,15 @@ function constrainedPaths(operation: string, defaults: string[], constraints: re
     );
   }
   const validators: Record<string, RegExp> = {
-    "compute.instances.get": /^\/compute\/v1\/projects\/[^/]+\/zones\/[^/]+\/instances\/[^/?]+(?:\?.*)?$/,
-    "compute.instances.start": /^\/compute\/v1\/projects\/[^/]+\/zones\/[^/]+\/instances\/[^/?]+\/start(?:\?.*)?$/,
-    "compute.instances.stop": /^\/compute\/v1\/projects\/[^/]+\/zones\/[^/]+\/instances\/[^/?]+\/stop(?:\?.*)?$/,
-    "trace.traces.list": /^\/v1\/projects\/[^/?]+\/traces(?:\?.*)?$/,
-    "trace.traces.get": /^\/v1\/projects\/[^/?]+\/traces\/[^/?]+(?:\?.*)?$/,
-    "monitoring.metricdescriptors.list": /^\/v3\/projects\/[^/?]+\/metricDescriptors(?:\?.*)?$/,
-    "monitoring.timeseries.list": /^\/v3\/projects\/[^/?]+\/timeSeries(?:\?.*)?$/,
-    "container.clusters.get": /^\/v1\/projects\/[^/]+\/locations\/[^/]+\/clusters\/[^/?]+(?:\?.*)?$/,
-    "iap.tunnel": /^\/v4\/connect(?:\?.*)?$/,
+    "compute.instances.get": /^\/compute\/v1\/projects\/[^/]+\/zones\/[^/]+\/instances\/[^/]+$/,
+    "compute.instances.start": /^\/compute\/v1\/projects\/[^/]+\/zones\/[^/]+\/instances\/[^/]+\/start$/,
+    "compute.instances.stop": /^\/compute\/v1\/projects\/[^/]+\/zones\/[^/]+\/instances\/[^/]+\/stop$/,
+    "trace.traces.list": /^\/v1\/projects\/[^/]+\/traces$/,
+    "trace.traces.get": /^\/v1\/projects\/[^/]+\/traces\/[^/]+$/,
+    "monitoring.metricdescriptors.list": /^\/v3\/projects\/[^/]+\/metricDescriptors$/,
+    "monitoring.timeseries.list": /^\/v3\/projects\/[^/]+\/timeSeries$/,
+    "container.clusters.get": /^\/v1\/projects\/[^/]+\/locations\/[^/]+\/clusters\/[^/]+$/,
+    "iap.tunnel": /^\/v4\/connect$/,
   };
   const validator = validators[operation];
   for (const constraint of constraints) {
@@ -37,6 +37,7 @@ function constrainedPaths(operation: string, defaults: string[], constraints: re
       constraint.length > 2048 ||
       !constraint.startsWith("/") ||
       constraint.includes("://") ||
+      constraint.includes("?") ||
       constraint.includes("..") ||
       (validator !== undefined && !validator.test(constraint))
     ) {
@@ -164,7 +165,7 @@ export function appendGooglePolicy(
           grant.operation,
           curated?.paths ?? [],
           grant.resourceConstraints,
-        ).map((path) => `segment:${path}`),
+        ).map((path) => `segment-path:${path}`),
         graphql_operation: "",
         graphql_field: "",
       };

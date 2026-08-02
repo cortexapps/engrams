@@ -344,6 +344,7 @@ where
             path: path_without_query(&parsed_request_line.1).to_string(),
         });
     }
+    let head_request = parsed_request_line.0.eq_ignore_ascii_case("HEAD");
 
     // Parse the request line once if any inject/observe gating needs it
     // (method + path are stable across header injection + substitution).
@@ -499,6 +500,7 @@ where
             upstream_tls,
             OBSERVE_RESPONSE_BUDGET,
             &response_redactions,
+            head_request,
         )
         .await?;
         let parsed = observe::parse_response(&resp_buf);
@@ -538,8 +540,12 @@ where
         tokio::io::copy(&mut client_read, &mut upstream_write).await?;
         upstream_write.shutdown().await
     };
-    let response =
-        copy_redacting_response(&mut upstream_read, &mut client_write, &response_redactions);
+    let response = copy_redacting_response(
+        &mut upstream_read,
+        &mut client_write,
+        &response_redactions,
+        head_request,
+    );
     tokio::try_join!(request, response)?;
     Ok(())
 }
@@ -1169,6 +1175,225 @@ struct ByteRedactor {
     keep: usize,
 }
 
+/// Tracks whether an HTTP/1 response has complete, self-delimiting framing.
+///
+/// Some Google frontends close HTTP/1 connections without a TLS `close_notify`.
+/// Rustls correctly reports that as `UnexpectedEof`, but all authenticated
+/// plaintext can still contain a complete HTTP response. We accept that EOF only
+/// after this tracker sees a complete Content-Length or chunked body. A
+/// close-delimited or incomplete response still fails closed.
+struct Http1ResponseFraming {
+    state: Http1ResponseState,
+    head_request: bool,
+}
+
+enum Http1ResponseState {
+    Headers(Vec<u8>),
+    ContentLength(usize),
+    Chunked(ChunkedFraming),
+    CloseDelimited,
+    Complete,
+    Invalid,
+}
+
+enum ChunkedFraming {
+    Size(Vec<u8>),
+    Data(usize),
+    DataCrlf(u8),
+    TrailerLine(Vec<u8>),
+    Complete,
+    Invalid,
+}
+
+impl Http1ResponseFraming {
+    fn new(head_request: bool) -> Self {
+        Self {
+            state: Http1ResponseState::Headers(Vec::new()),
+            head_request,
+        }
+    }
+
+    fn push(&mut self, mut input: &[u8]) {
+        while !input.is_empty() {
+            match &mut self.state {
+                Http1ResponseState::Headers(buffer) => {
+                    let take = input
+                        .len()
+                        .min(RESPONSE_HEADER_BUDGET.saturating_sub(buffer.len()));
+                    buffer.extend_from_slice(&input[..take]);
+                    input = &input[take..];
+                    let Some(end) = buffer.windows(4).position(|value| value == b"\r\n\r\n") else {
+                        if buffer.len() == RESPONSE_HEADER_BUDGET {
+                            self.state = Http1ResponseState::Invalid;
+                        }
+                        continue;
+                    };
+                    let remainder = buffer.split_off(end + 4);
+                    let head = &buffer[..end];
+                    let Some(next) = response_body_framing(head, self.head_request) else {
+                        self.state = Http1ResponseState::Invalid;
+                        continue;
+                    };
+                    self.state = next;
+                    self.push(&remainder);
+                }
+                Http1ResponseState::ContentLength(remaining) => {
+                    let take = input.len().min(*remaining);
+                    *remaining -= take;
+                    input = &input[take..];
+                    if *remaining == 0 {
+                        self.state = if input.is_empty() {
+                            Http1ResponseState::Complete
+                        } else {
+                            Http1ResponseState::Invalid
+                        };
+                    }
+                }
+                Http1ResponseState::Chunked(chunked) => {
+                    let consumed = chunked.push(input);
+                    input = &input[consumed..];
+                    if matches!(chunked, ChunkedFraming::Complete) {
+                        self.state = if input.is_empty() {
+                            Http1ResponseState::Complete
+                        } else {
+                            Http1ResponseState::Invalid
+                        };
+                    } else if matches!(chunked, ChunkedFraming::Invalid) {
+                        self.state = Http1ResponseState::Invalid;
+                    }
+                }
+                Http1ResponseState::CloseDelimited => return,
+                Http1ResponseState::Complete | Http1ResponseState::Invalid => {
+                    self.state = Http1ResponseState::Invalid;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, Http1ResponseState::Complete)
+    }
+}
+
+fn response_body_framing(head: &[u8], head_request: bool) -> Option<Http1ResponseState> {
+    let text = std::str::from_utf8(head).ok()?;
+    let mut lines = text.split("\r\n");
+    let status = lines
+        .next()?
+        .split_ascii_whitespace()
+        .nth(1)?
+        .parse::<u16>()
+        .ok()?;
+    let mut content_length = None;
+    let mut transfer_encoding = None;
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            let parsed = value.trim().parse::<usize>().ok()?;
+            if content_length
+                .replace(parsed)
+                .is_some_and(|prior| prior != parsed)
+            {
+                return None;
+            }
+        } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encoding = Some(value.trim().to_ascii_lowercase());
+        }
+    }
+    if (100..200).contains(&status) && status != 101 {
+        return Some(Http1ResponseState::Headers(Vec::new()));
+    }
+    if head_request || status == 204 || status == 304 {
+        return Some(Http1ResponseState::Complete);
+    }
+    if transfer_encoding.as_deref().is_some_and(|value| {
+        value
+            .split(',')
+            .next_back()
+            .is_some_and(|v| v.trim() == "chunked")
+    }) {
+        return Some(Http1ResponseState::Chunked(
+            ChunkedFraming::Size(Vec::new()),
+        ));
+    }
+    Some(match content_length {
+        Some(0) => Http1ResponseState::Complete,
+        Some(length) => Http1ResponseState::ContentLength(length),
+        None => Http1ResponseState::CloseDelimited,
+    })
+}
+
+impl ChunkedFraming {
+    fn push(&mut self, input: &[u8]) -> usize {
+        let mut consumed = 0;
+        while consumed < input.len() {
+            match self {
+                Self::Size(line) => {
+                    let byte = input[consumed];
+                    consumed += 1;
+                    line.push(byte);
+                    if line.len() > 8192 {
+                        *self = Self::Invalid;
+                    } else if line.ends_with(b"\r\n") {
+                        line.truncate(line.len() - 2);
+                        let hex = line.split(|byte| *byte == b';').next().unwrap_or_default();
+                        let Ok(text) = std::str::from_utf8(hex) else {
+                            *self = Self::Invalid;
+                            continue;
+                        };
+                        let Ok(size) = usize::from_str_radix(text.trim(), 16) else {
+                            *self = Self::Invalid;
+                            continue;
+                        };
+                        *self = if size == 0 {
+                            Self::TrailerLine(Vec::new())
+                        } else {
+                            Self::Data(size)
+                        };
+                    }
+                }
+                Self::Data(remaining) => {
+                    let take = (input.len() - consumed).min(*remaining);
+                    *remaining -= take;
+                    consumed += take;
+                    if *remaining == 0 {
+                        *self = Self::DataCrlf(0);
+                    }
+                }
+                Self::DataCrlf(seen) => {
+                    let expected = if *seen == 0 { b'\r' } else { b'\n' };
+                    if input[consumed] != expected {
+                        *self = Self::Invalid;
+                    } else {
+                        consumed += 1;
+                        *seen += 1;
+                        if *seen == 2 {
+                            *self = Self::Size(Vec::new());
+                        }
+                    }
+                }
+                Self::TrailerLine(line) => {
+                    let byte = input[consumed];
+                    consumed += 1;
+                    line.push(byte);
+                    if line.len() > RESPONSE_HEADER_BUDGET {
+                        *self = Self::Invalid;
+                    } else if line.ends_with(b"\r\n") {
+                        if line.len() == 2 {
+                            *self = Self::Complete;
+                        } else {
+                            line.clear();
+                        }
+                    }
+                }
+                Self::Complete | Self::Invalid => return consumed,
+            }
+        }
+        consumed
+    }
+}
+
 impl ByteRedactor {
     fn new(needles: &[Vec<u8>]) -> Self {
         Self {
@@ -1250,6 +1475,7 @@ async fn copy_redacting_response<R, W>(
     reader: &mut R,
     writer: &mut W,
     needles: &[Vec<u8>],
+    head_request: bool,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -1277,6 +1503,8 @@ where
         ));
     }
 
+    let mut framing = Http1ResponseFraming::new(head_request);
+    framing.push(&prefix);
     let mut redactor = ByteRedactor::new(needles);
     let first = redactor.push(&prefix, false);
     if !first.is_empty() {
@@ -1284,7 +1512,15 @@ where
     }
     let mut buffer = [0_u8; 8192];
     loop {
-        let read = reader.read(&mut buffer).await?;
+        let read = match reader.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::UnexpectedEof && framing.is_complete() =>
+            {
+                0
+            }
+            Err(error) => return Err(error),
+        };
         if read == 0 {
             let tail = redactor.push(&[], true);
             if !tail.is_empty() {
@@ -1292,6 +1528,7 @@ where
             }
             return writer.shutdown().await;
         }
+        framing.push(&buffer[..read]);
         let redacted = redactor.push(&buffer[..read], false);
         if !redacted.is_empty() {
             writer.write_all(&redacted).await?;
@@ -1416,6 +1653,7 @@ async fn pump_and_observe<C, U>(
     upstream_tls: U,
     budget: usize,
     response_redactions: &[Vec<u8>],
+    head_request: bool,
 ) -> Result<Vec<u8>, InterceptError>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1436,8 +1674,10 @@ where
     let response_result = async {
         let mut resp_buf = Vec::new();
         let mut redactor = ByteRedactor::new(response_redactions);
+        let mut framing = Http1ResponseFraming::new(head_request);
         if !response_redactions.is_empty() {
             let prefix = read_response_prefix(&mut up_rd).await?;
+            framing.push(&prefix);
             let headers_end = prefix
                 .windows(4)
                 .position(|value| value == b"\r\n\r\n")
@@ -1461,9 +1701,17 @@ where
         let mut tmp = [0u8; 8192];
         loop {
             let n = match up_rd.read(&mut tmp).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => n,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::UnexpectedEof
+                        && framing.is_complete() =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error.into()),
             };
+            framing.push(&tmp[..n]);
             let output = if response_redactions.is_empty() {
                 tmp[..n].to_vec()
             } else {
@@ -1500,6 +1748,108 @@ mod hardening_tests {
     use super::*;
     use crate::policy::HostList;
     use crate::registry::{RefreshableCred, RequestPolicy};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    struct UncleanEofReader {
+        bytes: Vec<u8>,
+        position: usize,
+    }
+
+    impl AsyncRead for UncleanEofReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.position == self.bytes.len() {
+                return Poll::Ready(Err(std::io::ErrorKind::UnexpectedEof.into()));
+            }
+            let count = output.remaining().min(self.bytes.len() - self.position);
+            let end = self.position + count;
+            output.put_slice(&self.bytes[self.position..end]);
+            self.position = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Default)]
+    struct VecWriter {
+        bytes: Vec<u8>,
+        shutdown: bool,
+    }
+
+    impl AsyncWrite for VecWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            input: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.bytes.extend_from_slice(input);
+            Poll::Ready(Ok(input.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.shutdown = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn chunked_response(body: &[u8], terminal_chunk: bool) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            body.len(),
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response.extend_from_slice(b"\r\n");
+        if terminal_chunk {
+            response.extend_from_slice(b"0\r\n\r\n");
+        }
+        response
+    }
+
+    #[tokio::test]
+    async fn complete_chunked_response_survives_unclean_tls_eof() {
+        let response = chunked_response(&vec![b'x'; 16_088], true);
+        let mut reader = UncleanEofReader {
+            bytes: response.clone(),
+            position: 0,
+        };
+        let mut writer = VecWriter::default();
+
+        copy_redacting_response(&mut reader, &mut writer, &[vec![b's'; 1024]], false)
+            .await
+            .unwrap();
+
+        assert_eq!(writer.bytes, response);
+        assert!(writer.shutdown);
+    }
+
+    #[tokio::test]
+    async fn incomplete_chunked_response_fails_closed_on_unclean_tls_eof() {
+        let response = chunked_response(&vec![b'x'; 16_088], false);
+        let mut reader = UncleanEofReader {
+            bytes: response,
+            position: 0,
+        };
+        let mut writer = VecWriter::default();
+
+        let error = copy_redacting_response(&mut reader, &mut writer, &[vec![b's'; 1024]], false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(!writer.shutdown);
+    }
 
     #[test]
     fn binds_authority_to_sni_and_removes_duplicates() {
