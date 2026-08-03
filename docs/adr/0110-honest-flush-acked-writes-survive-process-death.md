@@ -57,7 +57,7 @@ Two halves of one problem:
    uploads run every 30 seconds.
 2. **FLUSH is a lie.** FLUSH is the guest's "make my data safe now"
    command. Our server answers "done" and does nothing
-   (`runtime.rs:1509`):
+   (`runtime.rs`, the NBD command match):
 
 ```rust
 // FLUSH: ack at the wire level but defer durable-flush to the
@@ -152,15 +152,25 @@ One file per sandbox, on the node's SSD, next to the chunk cache:
 
 We create it at sandbox start as a **sparse file**: a file with holes.
 Empty parts use no disk space. It has no format. Byte N of the file is
-byte N of the guest's disk.
+byte N of the guest's disk. Next to it lives one tiny sidecar,
+`<sandbox_id>.ref` — the last manifest ref this sandbox published
+(see the punch rules below). Both are removed at sandbox destroy, and
+a startup sweep reaps the files of sandboxes that died without one.
 
 ### Data path
 
-1. **Guest write**: write the bytes into the dirty file at the same
-   offset, using `pwrite` (a system call: "write to a file at this
-   position"). Mark the touched chunks in an in-memory "dirty" bitmap.
-   Then ack. The old RAM map is deleted. A `pwrite` lands in the page
-   cache at memory speed, so ack latency does not change.
+1. **Guest write**: the first write to a chunk *materializes* it —
+   fetch the full base chunk, patch the guest's bytes into it, and
+   `pwrite` the whole merged chunk into the file at its offset
+   (`pwrite` is a system call: "write to a file at this position").
+   Later writes to the same chunk patch the file directly. Mark the
+   touched chunks in an in-memory "dirty" bitmap. Then ack. The old
+   RAM map is deleted. This whole-chunk rule is load-bearing: the
+   file's data extents are always complete chunks, so recovery can
+   never mistake hole-zeros next to a partial write for real data.
+   The base fetch was already in the write path (the RAM map did the
+   same read-modify-write); the new cost is one chunk-size `pwrite`
+   into the page cache on first touch.
 2. **Guest read**: if the bitmap says the range is dirty, read the
    dirty file with `pread`. Otherwise read the base image path,
    unchanged.
@@ -200,18 +210,49 @@ This is the same "verify the occupant" discipline PR #897 established.
 With this rule, a bug in the publish layer costs a redundant upload,
 never data. (Incident E below is why this rule exists.)
 
+**A second strict rule covers the coordinator's lag: never punch a
+hole before recording the published ref beside the file.** The
+coordinator learns a new manifest ref *after* the flush returns (an
+async publisher). A crash in that window would make the successor
+attach at the coordinator's older ref — and a punched chunk would then
+resolve to its pre-write base hash. So each publish first writes a
+tiny sidecar (`<sandbox_id>.ref`, an atomic temp-write + rename) with
+the published ref. Recovery attaches at the sidecar's ref when it is
+newer than the coordinator's. If the sidecar write fails, we skip the
+punches; the chunks stay in the file and upload again later. This
+also covers the ADR 0077 fork window: the first flush after a
+restore publishes under a brand-new private manifest id, which no
+"latest version" lookup on the coordinator's id could find — the
+sidecar records it. (The old shutdown spool recorded its ref in
+`meta.json` for the same reason; this is that idea, kept.)
+
 ### Recovery after a host-agent death
 
 The new host-agent, for each surviving sandbox:
 
-1. Open the dirty file. Ask the kernel which parts have data
+1. Pick the attach ref: the ref sidecar's, if it is newer than the
+   coordinator's (the store-ahead rule above).
+2. Open the dirty file. Ask the kernel which parts have data
    (`lseek` with `SEEK_DATA`/`SEEK_HOLE`: "find the next data / next
    hole"). Those parts are the dirty set. Rebuild the bitmap from
-   them. If a data range only touches part of a chunk, mark the whole
-   chunk dirty. The worst case is one extra harmless upload.
-2. Hand the surviving kernel NBD device a fresh socket
+   them. If the filesystem reports a data range that only touches
+   part of a chunk, mark the whole chunk dirty. The whole-chunk write
+   rule above makes this rounding safe, and the worst case is one
+   extra harmless upload. (The exact-extent scan needs ext4 semantics;
+   recovery is Linux-only, and the tests for it are Linux-gated.)
+3. Hand the surviving kernel NBD device a fresh socket
    (`NBD_CMD_RECONFIGURE`, a kernel command for exactly this).
-3. Done. No spool adoption. No probe reads. No quarantine.
+4. Done. No spool adoption. No probe reads. No quarantine.
+
+**A node reboot cannot feed us a torn file.** Without `fsync`, a
+rebooted node's dirty file may hold an arbitrary subset of writes.
+That file is never trusted: recovery runs only for a *surviving VM*
+(the startup pass reattaches to live Firecracker processes), and no
+VM survives a reboot. A post-reboot file has no surviving owner, so
+nothing ever opens it. A startup sweep deletes it — together with
+every dirty-root file whose sandbox is not in the live set, and every
+`.pending-*` temp file from a dead process. Sandbox ids never recur,
+so a swept file can never be wanted again.
 
 If step 2 fails (a kernel error, an identity mismatch): upload the
 dirty file's chunks, publish the manifest, destroy the VM, and let the
@@ -357,7 +398,7 @@ Removed outright (≈1,800+ production lines):
 | Code | Location |
 |---|---|
 | The RAM dirty map and its lock choreography | `disk_daemon/backend.rs` |
-| The quarantine rescue ladder: the 3-try budget, `reap_quarantined_survivor`, the park-and-recover arm (#972), `quarantine_reap_unevictable` | `session_verbs.rs`, `idle_evictor.rs` |
+| The quarantine rescue ladder: the 3-try budget, the park-and-recover arm (#972), `quarantine_reap_unevictable` | `session_verbs.rs`, `idle_evictor.rs` |
 | The `quarantined_survivors` map, its heartbeat advertising, and the coordinator code that consumes it | `pooled_backend.rs`, `heartbeat.rs`, `host_http.rs`, `engram-protocol` |
 | `RefuseUntracked` / `CaptureDrainPlan` (the snapshot refusal) | `engram-host-core/src/survivor.rs` (whole file) |
 | The SIGTERM spool: the shutdown dump, the all-or-nothing adoption, the final-flush sequence (#971's hardening included) | `disk_daemon/spool.rs`, `runtime.rs` adoption arms |
@@ -432,10 +473,21 @@ extent-scan recovery (~50), hole-punching after verified publishes
 ## Rollout
 
 1. Land the dirty-file backend and recovery behind the existing
-   reattach flow. The old scaffolding stays in place, now unexercised.
+   reattach flow. The old scaffolding stays in place. To be plain
+   about what that buys: the spool is still *written* at every orderly
+   shutdown, but recovery ignores it whenever a dirty file exists — so
+   during the soak the new path is the live recovery path, and the
+   spool is an on-disk copy an operator can adopt by hand, not an
+   automatic net.
 2. Prove one week of zero-rollback rolls at normal deploy cadence
    (`engram_durability_rollback_total` stays flat). Watch page-cache
-   use and SSD bandwidth (tradeoffs 1 and 2).
+   use and SSD bandwidth (tradeoffs 1 and 2). Watch two more gates:
+   **p99 write-ack latency** (under memory pressure the kernel can
+   throttle `pwrite` into writeback — the RAM map never did that) and
+   **node disk headroom** (during a chunk-store outage the files grow
+   until publishes succeed again; a full disk turns into per-sandbox
+   EIO, which degrades one guest at a time — better than the RAM
+   map's OOM, but it must be visible before it happens).
 3. Delete the scaffolding (the table above) in one retirement PR
    chain.
 4. Flip this ADR to Accepted with the commit list. Add the closing
