@@ -214,10 +214,12 @@ export function registerBuiltinTools(
       "read the user's artifacts (raw_url is a short-lived direct byte " +
       "URL you can fetch); share/unshare {artifact_id} toggle org-wide " +
       "visibility. Only text/html and text/markdown may be published. " +
-      "Author HTML artifacts as a single self-contained file (inline CSS " +
-      "and JS; no external requests — they are served inside an " +
-      "opaque-origin sandbox) and honor a ?theme=light|dark query " +
-      "parameter so the page matches the viewer's engrams theme.",
+      "BEFORE authoring an HTML artifact, read the artifact-design skill " +
+      "(mounted in this session when available) — it carries the design " +
+      "brief. Author HTML as a single self-contained file (inline CSS and " +
+      "JS; no external requests — pages are served inside an opaque-origin " +
+      "sandbox) and honor a ?theme=light|dark query parameter so the page " +
+      "matches the viewer's engrams theme.",
     input: ArtifactActionSchema,
     output: ArtifactOutputSchema,
     handling: "handled",
