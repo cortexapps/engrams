@@ -62,10 +62,16 @@ jobs:
         env:
           DEPS_JSON: ${{ steps.metadata.outputs.updated-dependencies-json }}
         run: |
+          # An empty list is not a Dependabot PR shape — every one of them
+          # bumps at least one dependency. It means `fetch-metadata` returned
+          # nothing, which a bump of that action itself can cause. Shrugging
+          # here reads as "not auto-mergeable" and the job still SUCCEEDS, so
+          # the gate stops working with every check green and nothing to see.
+          # Fail instead: a broken classifier should be loud.
           if [ -z "$DEPS_JSON" ] || [ "$DEPS_JSON" = "[]" ]; then
-            echo "Empty dependency list — skipping auto-merge."
-            echo "auto-merge=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "::error::fetch-metadata returned no dependencies for a Dependabot PR." \
+                 "The auto-merge classifier cannot decide; check the action version."
+            exit 1
           fi
           NON_PATCH_MINOR=$(echo "$DEPS_JSON" | jq '[.[].updateType] | map(select(. != "version-update:semver-patch" and . != "version-update:semver-minor")) | length')
           if [ "$NON_PATCH_MINOR" -gt 0 ]; then

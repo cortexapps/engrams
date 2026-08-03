@@ -138,6 +138,11 @@ jobs:
       test_cli: ${{ steps.lanes.outputs.test_cli }}
       test_buf: ${{ steps.lanes.outputs.test_buf }}
       test_integrations_cli: ${{ steps.lanes.outputs.test_integrations_cli }}
+      # The container-image lane. The detector has always computed these; until
+      # now nothing on a PR consumed them, so a Dockerfile-only change ran no
+      # lane at all and the gate passed on an unbuilt image.
+      images: ${{ steps.lanes.outputs.images }}
+      images_matrix: ${{ steps.lanes.outputs.images_matrix }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -155,6 +160,18 @@ jobs:
             BASE="${{ github.event.pull_request.base.sha }}"
           fi
           python3 .github/scripts/detect-rebake-lanes.py --base "$BASE" --head HEAD
+
+      # `build-images` is gated on `images`/`images_matrix`. If either output is
+      # renamed the job silently stops running and a Dockerfile change is
+      # unvalidated again — the exact hole this PR closes, reopened quietly.
+      # Assert the contract here rather than discovering it in production.
+      - name: Detector still names the images lane
+        run: |
+          printf 'docker/web.Dockerfile\n' \
+            | python3 .github/scripts/detect-rebake-lanes.py --stdin 2>&1 \
+            | tee /tmp/lanes.txt
+          grep -q 'images=True' /tmp/lanes.txt
+          grep -q "images_matrix=\['web'\]" /tmp/lanes.txt
 
   integrations-cli:
     name: integrations CLI bundle
@@ -2142,6 +2159,53 @@ jobs:
       - name: calm swarm (0..40 x 600)
         run: cargo run -p engram-dst-cosim --release --bin sim-cosim -- --seeds 0..40 --steps 600 --profile calm
 
+  # ------------------------------------------------------------------
+  # Build every container image a PR changes — WITHOUT pushing.
+  #
+  # `bake-images.yml` is `on: push: [main]` and ci.yml's `bake-demo-image` is
+  # gated on push-to-main, so before this job no workflow built any image on a
+  # pull request. A change to `docker/*.Dockerfile` therefore ran zero lanes:
+  # the detector correctly reported `images=true` and no test lane, the CI Gate
+  # passes when every lane is "succeeded-or-skipped", and the first real build
+  # happened on the push to main that deploys.
+  #
+  # That is how a base-image bump (PR #130: node 20 -> 25, rust 1.95 -> 1.97,
+  # nginx, busybox) sat green for two months having proved nothing.
+  #
+  # Build-only on purpose: publishing is still main's job, so this cannot churn
+  # the SHA tag the host-fleet DaemonSet pins (the 2026-07-20 incident where a
+  # spurious rebake rolled every FC host four times in 90 minutes).
+  #
+  # `node-assets` is deliberately excluded — it fetches Firecracker, the guest
+  # kernel and the RO bundles, and its own lane already gates those inputs.
+  # ------------------------------------------------------------------
+  build-images:
+    name: build ${{ matrix.image }} image (no push)
+    needs: detect
+    if: needs.detect.outputs.images == 'true' && needs.detect.outputs.images_matrix != '[]'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.detect.outputs.images_matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.image }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/${{ matrix.image }}.Dockerfile
+          push: false
+          load: false
+          cache-from: type=gha,scope=ci-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=ci-${{ matrix.image }}
+
   ci-gate:
     name: CI Gate
     if: always()
@@ -2169,6 +2233,9 @@ jobs:
       - bake-harness-claude-artifact
       - artifacts-e2e-stack
       - test-e2e-stack
+      # A Dockerfile-only change used to run nothing at all; this lane is the
+      # one that now proves the image still builds.
+      - build-images
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Check lane results
