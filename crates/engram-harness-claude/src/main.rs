@@ -160,22 +160,28 @@ mod adapter {
     /// not exist, or never finds the injected replacement. Derived from the
     /// manifest so a session without a tool never advertises it.
     fn injected_tool_guidance(manifest: &ToolManifest) -> Option<String> {
+        // These tools are always-loaded (see `write_mcp_config`'s alwaysLoad),
+        // so the guidance only has to REDIRECT the model from the removed
+        // built-in name to the always-present `mcp__engrams__` tool — never
+        // to "discover" it. The earlier "load it with ToolSearch" phrasing
+        // led haiku to `select:ask_user_question` (bare name → miss → gave
+        // up); with the tool resident, calling it by its full name just works.
         let mut lines: Vec<&str> = Vec::new();
         if injected_tools(manifest).any(|tool| tool.name == "ask_user_question") {
             lines.push(
-                "The built-in AskUserQuestion tool is not available here. To ask the user \
-                 a question, call the ask_user_question tool (mcp__engrams__ask_user_question); \
-                 load it with ToolSearch if it is not loaded. Its answers arrive as the tool \
-                 result.",
+                "The built-in AskUserQuestion tool is not available here. To ask the user a \
+                 question, call the mcp__engrams__ask_user_question tool directly (it is \
+                 already loaded); its answers arrive as the tool result. Never ask the user \
+                 a question as plain assistant text.",
             );
         }
         if injected_tools(manifest).any(|tool| tool.name == "exit_plan_mode") {
             lines.push(
                 "The built-in ExitPlanMode tool is not available here. In plan mode, when \
-                 your plan is complete, call the exit_plan_mode tool \
-                 (mcp__engrams__exit_plan_mode) with the full plan as markdown, then wait \
-                 for the review decision. Where instructions mention ExitPlanMode, use \
-                 exit_plan_mode instead.",
+                 your plan is complete, call the mcp__engrams__exit_plan_mode tool directly \
+                 (it is already loaded) with the full plan as markdown, then wait for the \
+                 review decision. Where instructions mention ExitPlanMode, use \
+                 mcp__engrams__exit_plan_mode instead.",
             );
         }
         if lines.is_empty() {
@@ -1906,12 +1912,27 @@ mod adapter {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+        // `alwaysLoad` opts this server OUT of the CLI's lazy MCP deferral
+        // ("all tools from this server are always included in the prompt and
+        // never deferred" — the CLI's own schema). Without it, an injected
+        // tool must be ToolSearch-discovered before the model can call it,
+        // and a tool that REPLACES a removed built-in
+        // (`ask_user_question`/`exit_plan_mode`, which the model reaches for
+        // by the built-in name) is exactly the discovery the model gets
+        // wrong: haiku searched `select:ask_user_question` (the bare name,
+        // not `mcp__engrams__ask_user_question`), missed, and gave up asking
+        // in plain text (session 03efe4f2). Always-loading restores the
+        // native binding's always-present property. The injected set is
+        // small, so the resident-schema cost is negligible; if it grows,
+        // switch to per-tool `_meta["anthropic/alwaysLoad"]` in the bridge's
+        // tools/list for just the built-in replacements.
         let config = serde_json::json!({
             "mcpServers": {
                 "engrams": {
                     "type": "stdio",
                     "command": self_exe.to_string_lossy(),
-                    "args": ["mcp-bridge"]
+                    "args": ["mcp-bridge"],
+                    "alwaysLoad": true
                 }
             }
         });
@@ -4482,7 +4503,11 @@ mod adapter {
                         "engrams": {
                             "type": "stdio",
                             "command": "/sbin/engram-harness-claude",
-                            "args": ["mcp-bridge"]
+                            "args": ["mcp-bridge"],
+                            // Always-loaded so an injected built-in replacement
+                            // (ask_user_question/exit_plan_mode) is resident and
+                            // needs no ToolSearch discovery (session 03efe4f2).
+                            "alwaysLoad": true
                         }
                     }
                 })

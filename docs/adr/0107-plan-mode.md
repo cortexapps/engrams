@@ -331,6 +331,23 @@ What changed for claude, relative to the table in §3:
   (`injected_tool_guidance`) naming `mcp__engrams__exit_plan_mode` /
   `mcp__engrams__ask_user_question`. Composed with (never replacing) the
   ADR 0060 `ENGRAM_APPEND_SYSTEM_PROMPT`.
+- **Tool discovery — `alwaysLoad` (2026-08-03, follow-on fix).** The first
+  cut had a robustness hole the native binding didn't: claude LAZY-loads MCP
+  tools (they must be `ToolSearch`-discovered before use), and an injected
+  tool that REPLACES a removed built-in is exactly the discovery the model
+  gets wrong — haiku searched `select:ask_user_question` (the bare name, not
+  the `mcp__engrams__` spelling), missed, and gave up asking as plain text
+  (session 03efe4f2, silent degradation). Two changes close it: (1) the
+  generated `mcp-config.json` sets `"alwaysLoad": true` on the `engrams`
+  server — the CLI's own opt-out of deferral ("all tools from this server are
+  always included in the prompt and never deferred"), so the tools are
+  resident and need no discovery, restoring the native binding's
+  always-present property; (2) the guidance leads with the full
+  `mcp__engrams__…` name and forbids the plain-text fallback. Verified with
+  the real CLI across haiku/sonnet/opus (9/9 direct calls, zero ToolSearch)
+  and end-to-end in a real VM. If the injected set grows large, switch to
+  per-tool `_meta["anthropic/alwaysLoad"]` in the bridge's `tools/list` so
+  only the built-in replacements stay resident.
 
 The native-binding mechanism itself (manifest-driven, ADR 0089 §6) stays: the
 codex `requestUserInput` binding still uses it, and a future harness with a
