@@ -34,6 +34,23 @@ export interface Config {
   controlPlaneHttpUrl: string;
   /** CONTROL_PLANE_BEARER — required: the coordinator app-gRPC bearer token */
   controlPlaneBearer: string;
+  /**
+   * CONNECTION_BROKER_BEARER — the bearer the internal connection credential
+   * broker accepts (ADR 0109). The coordinator sends it from its own
+   * ENGRAM_CONNECTION_BROKER_BEARER env. Set a value DISTINCT from
+   * CONTROL_PLANE_BEARER so the mint surface has its own credential; when
+   * unset it falls back to CONTROL_PLANE_BEARER so existing deployments keep
+   * working until they set the dedicated secret.
+   */
+  connectionBrokerBearer: string;
+  /**
+   * ENGRAM_DEPLOYMENT_ID — stable identifier for THIS deployment, emitted as
+   * the `engrams_organization` OIDC claim and pinned by every customer WIF
+   * attribute condition (ADR 0109). Default: the hostname of
+   * ORCHESTRATOR_PUBLIC_URL. Changing it invalidates existing WIF pool
+   * conditions, so treat it as immutable once connections exist.
+   */
+  deploymentId: string;
   /** GITHUB_APP_LOGIN — the review GitHub App's handle (its bot login/slug,
    * e.g. "acme-reviewer"), the token users @-mention on a PR to run a review.
    * ADR 0100 uses one App per deployment, so this is deployment config, not a
@@ -203,6 +220,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const port = parseInt(portStr, 10);
   const baseUrl = optional("ORCHESTRATOR_PUBLIC_URL", `http://127.0.0.1:${port}`);
   const controlPlaneBearer = require("CONTROL_PLANE_BEARER");
+  // The broker keeps working on the shared bearer until the deployment sets
+  // the dedicated secret (see the Config doc for the rollout note).
+  const connectionBrokerBearer = optional("CONNECTION_BROKER_BEARER", controlPlaneBearer);
   const githubAppLogin = optional("GITHUB_APP_LOGIN", "");
   const controlPlaneGrpcUrl = optional("CONTROL_PLANE_GRPC_URL", "http://127.0.0.1:50061");
   const controlPlaneHttpUrl = optional("CONTROL_PLANE_HTTP_URL", "http://127.0.0.1:8090");
@@ -285,6 +305,17 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // default `lvh.me:<port>` resolves `*.lvh.me` → 127.0.0.1 → this orchestrator.
   const previewBaseDomain = optional("ORCHESTRATOR_PREVIEW_BASE_DOMAIN", `lvh.me:${port}`);
 
+  // OPTIONAL: deployment identity for OIDC claims (ADR 0109). Defaults to the
+  // public hostname; a malformed base URL falls back to the raw string so the
+  // claim is never empty.
+  const deploymentId = optional("ENGRAM_DEPLOYMENT_ID", (() => {
+    try {
+      return new URL(baseUrl).hostname;
+    } catch {
+      return baseUrl;
+    }
+  })());
+
   // OPTIONAL: bootstrap-admin allowlist (restores `auth.bootstrapAdmins`).
   // Parsed + normalised (trim/lowercase/de-dup) here; empty when unset, which
   // makes the better-auth promotion hooks fully inert. No test placeholder
@@ -345,6 +376,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     controlPlaneGrpcUrl,
     controlPlaneHttpUrl,
     controlPlaneBearer,
+    connectionBrokerBearer,
+    deploymentId,
     githubAppLogin,
     trustedOrigins,
     deviceVerificationUrl,

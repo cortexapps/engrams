@@ -17,6 +17,8 @@ import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
 import { IntegrationService } from "../gen/engram/app/v1/integration_pb.ts";
 import type { MintKind } from "../gen/engram/app/v1/mint_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { config } from "../config.ts";
+import { errorMessage } from "../log.ts";
 import { getDb } from "../db/client.ts";
 import { makeConnectorStore, type ConnectorStore } from "../db/connectors.ts";
 import { makeConnectorLogoStore, type ConnectorLogoStore } from "../db/connector-logos.ts";
@@ -98,6 +100,8 @@ export interface IntegrationDeps {
   now?: () => Date;
   googleExchange?: ReturnType<typeof makeGoogleWifBroker>["exchange"];
   issuer?: string;
+  /** Deployment identity emitted as the `engrams_organization` claim. */
+  deploymentId?: string;
 }
 
 async function requireAdmin(ctx: HandlerContext, getSession: GetSession): Promise<void> {
@@ -165,7 +169,7 @@ function googleConfigFromProto(value: {
       endpoints: value.endpoints,
     });
   } catch (error) {
-    throw new ConnectError(error instanceof Error ? error.message : String(error), Code.InvalidArgument);
+    throw new ConnectError(errorMessage(error), Code.InvalidArgument);
   }
 }
 
@@ -217,7 +221,7 @@ function assertGoogleIssuerAvailable(issuer: string): void {
   }
 }
 
-function googleSetup(row: IntegrationConnectionRow, issuer: string): {
+function googleSetup(row: IntegrationConnectionRow, issuer: string, deploymentId: string): {
   audience: string;
   gcloudScript: string;
   terraform: string;
@@ -228,8 +232,15 @@ function googleSetup(row: IntegrationConnectionRow, issuer: string): {
   );
   if (!match) throw new Error("stored Google provider resource is invalid");
   const [, projectNumber, poolId, providerId] = match;
+  // Terraform resource names are addresses, not labels: two connections in the
+  // same project used to emit `google_iam_workload_identity_pool.engrams`
+  // twice, so applying the second setup silently redefined the first. Derive
+  // the address from the provider id, which is already unique per connection.
+  const tfName = `engrams_${providerId!.replace(/-/g, "_")}`;
+  // `engrams_organization` carries the deployment id (the issuer URL already
+  // rides in `issuer_uri`, so pinning the URL again added nothing).
   const condition =
-    `assertion.engrams_organization == '${issuer}' && ` +
+    `assertion.engrams_organization == '${deploymentId}' && ` +
     `assertion.engrams_connection == '${row.id}'`;
   const mapping =
     "google.subject=assertion.sub," +
@@ -240,20 +251,33 @@ function googleSetup(row: IntegrationConnectionRow, issuer: string): {
     `workloadIdentityPools/${poolId}/attribute.engrams_connection/${row.id}`;
   return {
     audience: google.workloadIdentityProvider,
+    // An operator pastes this into a shell. Without a shebang the lines run
+    // under whatever shell they happen to use, and without `set -euo pipefail`
+    // a failed pool creation is invisible: the next command runs anyway and the
+    // script "succeeds" with a half-built pool. Pool and provider creation are
+    // describe-then-create so re-running the setup — the normal thing to do
+    // after editing endpoints — is not an ALREADY_EXISTS error.
     gcloudScript: [
-      `gcloud iam workload-identity-pools create ${poolId} --location=global --project=${projectNumber}`,
-      `gcloud iam workload-identity-pools providers create-oidc ${providerId} --location=global --workload-identity-pool=${poolId} --project=${projectNumber} --issuer-uri=${issuer} --allowed-audiences=${google.workloadIdentityProvider} --attribute-mapping=${mapping} --attribute-condition=\"${condition}\"`,
+      `#!/usr/bin/env bash`,
+      `set -euo pipefail`,
+      ``,
+      `gcloud iam workload-identity-pools describe ${poolId} --location=global --project=${projectNumber} >/dev/null 2>&1 ||`,
+      `  gcloud iam workload-identity-pools create ${poolId} --location=global --project=${projectNumber}`,
+      ``,
+      `gcloud iam workload-identity-pools providers describe ${providerId} --location=global --workload-identity-pool=${poolId} --project=${projectNumber} >/dev/null 2>&1 ||`,
+      `  gcloud iam workload-identity-pools providers create-oidc ${providerId} --location=global --workload-identity-pool=${poolId} --project=${projectNumber} --issuer-uri=${issuer} --allowed-audiences=${google.workloadIdentityProvider} --attribute-mapping=${mapping} --attribute-condition=\"${condition}\"`,
+      ``,
       `gcloud iam service-accounts add-iam-policy-binding ${google.serviceAccountEmail} --project=${projectNumber} --role=roles/iam.workloadIdentityUser --member=${principalSet}`,
     ].join("\n"),
     terraform: [
-      `resource "google_iam_workload_identity_pool" "engrams" {`,
+      `resource "google_iam_workload_identity_pool" "${tfName}" {`,
       `  project                   = "${projectNumber}"`,
       `  workload_identity_pool_id = "${poolId}"`,
       `}`,
       ``,
-      `resource "google_iam_workload_identity_pool_provider" "engrams" {`,
+      `resource "google_iam_workload_identity_pool_provider" "${tfName}" {`,
       `  project                            = "${projectNumber}"`,
-      `  workload_identity_pool_id          = google_iam_workload_identity_pool.engrams.workload_identity_pool_id`,
+      `  workload_identity_pool_id          = google_iam_workload_identity_pool.${tfName}.workload_identity_pool_id`,
       `  workload_identity_pool_provider_id = "${providerId}"`,
       `  attribute_mapping = {`,
       `    "google.subject"                 = "assertion.sub"`,
@@ -267,7 +291,7 @@ function googleSetup(row: IntegrationConnectionRow, issuer: string): {
       `  }`,
       `}`,
       ``,
-      `resource "google_service_account_iam_member" "engrams" {`,
+      `resource "google_service_account_iam_member" "${tfName}" {`,
       `  service_account_id = "projects/${projectNumber}/serviceAccounts/${google.serviceAccountEmail}"`,
       `  role               = "roles/iam.workloadIdentityUser"`,
       `  member             = "${principalSet}"`,
@@ -288,6 +312,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
   const profiles = deps?.profiles ?? makeProfileStore(getDb());
   const now = deps?.now ?? (() => new Date());
   const issuer = deps?.issuer ?? googleOidcIssuer();
+  const deploymentId = deps?.deploymentId ?? config.deploymentId;
   const googleExchange = deps?.googleExchange ?? makeGoogleWifBroker({
     keys: makeIntegrationOidcKeyStore(getDb()),
     issuer,
@@ -590,7 +615,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
         const google = assertGoogleCloudConfig(row.config);
         await googleExchange(google, {
           sessionId: `connection-test:${row.id}`,
-          organizationId: issuer,
+          organizationId: deploymentId,
           connectionId: row.id,
           userId: "administrator",
           profileSnapshotId: "connection-test",
@@ -598,10 +623,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
         await connections.markTested(row.id, now());
         return { ok: true, message: "STS exchange and service account impersonation succeeded" };
       } catch (error) {
-        return {
-          ok: false,
-          message: error instanceof Error ? error.message : "Google Cloud connection test failed",
-        };
+        return { ok: false, message: errorMessage(error) };
       }
     },
 
@@ -625,7 +647,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       assertGoogleIssuerAvailable(issuer);
       const row = await connections.get(req.id);
       if (!row || row.provider !== "gcp") throw new ConnectError("connection not found", Code.NotFound);
-      const setup = googleSetup(row, issuer);
+      const setup = googleSetup(row, issuer, deploymentId);
       return {
         issuer,
         audience: setup.audience,

@@ -129,6 +129,10 @@ async function spawn(deps: ProfileDeps) {
       createdAt: new Date(0),
       updatedAt: new Date(0),
     } : null,
+    getMany: async (ids) => {
+      const rows = await Promise.all(ids.map((id) => connections.get(id)));
+      return rows.filter((row) => row != null);
+    },
     getDefault: async (provider) => connections.get(`default-${provider}`),
     create: async () => { throw new Error("unused"); },
     update: async () => { throw new Error("unused"); },
@@ -433,6 +437,10 @@ describe("ProfileService — auth + field filtering", () => {
         createdAt: new Date(0),
         updatedAt: new Date(0),
       } : null,
+      getMany: async (ids) => {
+        const rows = await Promise.all(ids.map((id) => googleConnections.get(id)));
+        return rows.filter((row) => row != null);
+      },
       getDefault: async () => null,
       create: async () => { throw new Error("unused"); },
       update: async () => { throw new Error("unused"); },
@@ -473,6 +481,69 @@ describe("ProfileService — auth + field filtering", () => {
       }), Code.InvalidArgument);
       const created = await s.client.createProfile(request);
       expect(created.profile?.integrationGrants[0]?.operation).toBe("compute.instances.get");
+    } finally {
+      await s.close();
+    }
+  });
+
+  // O9: profile save validates grant SHAPE only. Editing a connection
+  // auto-disables it, so a disabled connection must not block saves of the
+  // profiles that grant it. Session-create still rejects it (fail closed).
+  test("a disabled Google connection does not brick profile saves", async () => {
+    const disabledConnections: IntegrationConnectionStore = {
+      list: async () => [],
+      get: async (id) => id === "gcp-1" ? {
+        id,
+        alias: "prod-readonly",
+        provider: "gcp",
+        displayName: "Production read only",
+        isDefault: false,
+        config: {
+          workloadIdentityProvider:
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/prod",
+          serviceAccountEmail: "reader@example-project.iam.gserviceaccount.com",
+          endpoints: ["compute.googleapis.com"],
+        },
+        enabled: false,
+        testedAt: null,
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      } : null,
+      getMany: async (ids) => {
+        const rows = await Promise.all(ids.map((id) => disabledConnections.get(id)));
+        return rows.filter((row) => row != null);
+      },
+      getDefault: async () => null,
+      create: async () => { throw new Error("unused"); },
+      update: async () => { throw new Error("unused"); },
+      delete: async () => { throw new Error("unused"); },
+      markTested: async () => { throw new Error("unused"); },
+      setEnabled: async () => { throw new Error("unused"); },
+      ensureDefault: async () => { throw new Error("unused"); },
+    };
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      store: makeFakeStore(),
+      images: fakeImages(["img-1"]),
+      mountCatalog: fakeCatalog([]),
+      connections: disabledConnections,
+    });
+    try {
+      const created = await s.client.createProfile({
+        name: "GCP disabled",
+        description: "",
+        icon: "Bot",
+        imageId: "img-1",
+        harness: "claude",
+        includeUserTokens: false,
+        envVars: {},
+        integrationGrants: [{
+          connectionId: "gcp-1",
+          operation: "compute.instances.get",
+          resourceConstraints: [],
+        }],
+      });
+      expect(created.profile?.integrationGrants[0]?.connectionId).toBe("gcp-1");
     } finally {
       await s.close();
     }

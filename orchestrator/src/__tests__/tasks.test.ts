@@ -565,6 +565,10 @@ const fakeConnections: IntegrationConnectionStore = {
     createdAt: new Date(0),
     updatedAt: new Date(0),
   }),
+  getMany: async (ids) => {
+    const rows = await Promise.all(ids.map((id) => fakeConnections.get(id)));
+    return rows.filter((row) => row != null);
+  },
   getDefault: async (provider) => fakeConnections.get(`default-${provider}`),
   create: async () => { throw new Error("unused"); },
   update: async () => { throw new Error("unused"); },
@@ -731,6 +735,7 @@ function listSessionRef(
     integrationGrants: null,
     integrationConnections: null,
     integrationPrincipalId: null,
+    integrationSnapshotHash: null,
     createdAt: new Date("2026-01-01T00:00:00.000Z"),
   };
 }

@@ -125,6 +125,8 @@ function fakeConnections(): IntegrationConnectionStore {
   return {
     list: async () => [],
     get: async (id) => id.startsWith("default-") ? row(id.slice(8)) : null,
+    getMany: async (ids) =>
+      ids.filter((id) => id.startsWith("default-")).map((id) => row(id.slice(8))),
     getDefault: async (provider) => row(provider),
     create: async () => { throw new Error("unused"); },
     update: async () => { throw new Error("unused"); },

@@ -137,6 +137,9 @@ function fakeConnectionStore(seed: IntegrationConnectionRow[] = []): Integration
     async get(id) {
       return rows.get(id) ?? null;
     },
+    async getMany(ids) {
+      return ids.map((id) => rows.get(id)).filter((row) => row != null);
+    },
     async getDefault(provider) {
       const existing = [...rows.values()].find((row) =>
         row.provider === provider && row.isDefault
@@ -289,6 +292,7 @@ describe("IntegrationService (native)", () => {
       connections,
       profiles: noProfiles,
       issuer: "https://tenant.example/api/v1/integrations/google-cloud/oidc",
+      deploymentId: "tenant.example",
       now: () => new Date("2026-07-31T12:02:00Z"),
       googleExchange: async (_config, identity) => {
         exchanged.push(identity.connectionId);
@@ -316,11 +320,35 @@ describe("IntegrationService (native)", () => {
         "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/prod",
       );
       expect(setup.terraform).toContain(`assertion.engrams_connection == '${id}'`);
+      // A-claims: the organization claim carries the DEPLOYMENT id, not the
+      // issuer URL (the URL already rides in issuer_uri).
       expect(setup.terraform).toContain(
-        "assertion.engrams_organization == 'https://tenant.example/api/v1/integrations/google-cloud/oidc'",
+        "assertion.engrams_organization == 'tenant.example'",
+      );
+      expect(setup.terraform).toContain(
+        'issuer_uri        = "https://tenant.example/api/v1/integrations/google-cloud/oidc"',
       );
       expect(setup.gcloudScript).toContain("roles/iam.workloadIdentityUser");
       expect(setup.terraform).not.toContain("private_key");
+
+      // An operator pastes this into a shell. Without `set -euo pipefail` a
+      // failed pool creation is invisible — the next command runs anyway and
+      // the script "succeeds" with a half-built pool.
+      expect(setup.gcloudScript.startsWith("#!/usr/bin/env bash\nset -euo pipefail\n")).toBe(true);
+      // Re-running the setup is the normal thing to do after editing
+      // endpoints, so creation is describe-then-create rather than an
+      // ALREADY_EXISTS error.
+      expect(setup.gcloudScript).toContain("workload-identity-pools describe engrams");
+      expect(setup.gcloudScript).toContain("workload-identity-pools providers describe prod");
+
+      // Terraform resource names are ADDRESSES. Two connections in one project
+      // both emitted `...engrams`, so applying the second setup silently
+      // redefined the first. The address is derived from the provider id.
+      expect(setup.terraform).toContain('resource "google_iam_workload_identity_pool" "engrams_prod"');
+      expect(setup.terraform).toContain(
+        'workload_identity_pool_id          = google_iam_workload_identity_pool.engrams_prod.workload_identity_pool_id',
+      );
+      expect(setup.terraform).not.toContain('"google_iam_workload_identity_pool" "engrams"\n');
 
       expect((await s.client.testConnection({ id })).ok).toBe(true);
       expect(exchanged).toEqual([id]);

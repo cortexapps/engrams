@@ -316,6 +316,13 @@
       "when": 1785606009107,
       "tag": "0044_google_cloud_wif",
       "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1785706335566,
+      "tag": "0045_integration_snapshot_hash",
+      "breakpoints": true
     }
   ]
 }

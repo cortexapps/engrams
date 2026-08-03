@@ -471,7 +471,9 @@ async function loadTask(
   profiles: ProfileStore,
   imagesClient: ImagesClient,
   users: UserIdentityStore,
-  pendingCalls: PendingToolCallStore = makePendingToolCallStore(),
+  // REQUIRED on purpose: a defaulted store here silently bypassed the injected
+  // one (#942's default-param trap).
+  pendingCalls: PendingToolCallStore,
 ): Promise<Task> {
   const db_ = db;
 

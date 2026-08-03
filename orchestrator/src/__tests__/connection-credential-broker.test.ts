@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { GoogleAccessToken, WifIdentity } from "../integrations/google-wif.ts";
+import { integrationSnapshotHash } from "../integrations/grants.ts";
 import {
   makeConnectionCredentialBrokerRoute,
   type CredentialBrokerSessionStore,
@@ -19,6 +20,12 @@ const connection = {
   },
 };
 
+const sessionGrants = [{
+  connectionId: "connection-1",
+  operation: "compute.instances.get",
+  resourceConstraints: [],
+}];
+
 function sessionStore(): CredentialBrokerSessionStore {
   return {
     async get(sessionId) {
@@ -27,11 +34,7 @@ function sessionStore(): CredentialBrokerSessionStore {
         userId: "user-1",
         principalId: "user-1",
         profileId: "profile-1",
-        integrationGrants: [{
-          connectionId: "connection-1",
-          operation: "compute.instances.get",
-          resourceConstraints: [],
-        }],
+        integrationGrants: structuredClone(sessionGrants),
         integrationConnections: [structuredClone(connection)],
       };
     },
@@ -54,16 +57,20 @@ describe("named-connection credential broker", () => {
     let exchanges = 0;
     const exchangedPrincipals: string[] = [];
     const exchangedOrganizations: string[] = [];
+    const exchangedSnapshots: string[] = [];
     const app = makeConnectionCredentialBrokerRoute({
       db: {} as never,
       bearer: "broker-secret",
       sessions: sessionStore(),
+      sessionStatus: async () => "active",
       now: () => new Date("2026-07-31T12:00:00Z"),
       issuer: "https://tenant.example/api/v1/integrations/google-cloud/oidc",
+      organizationId: "tenant.example",
       exchange: async (_config, identity: WifIdentity): Promise<GoogleAccessToken> => {
         exchanges += 1;
         exchangedPrincipals.push(identity.userId);
         exchangedOrganizations.push(identity.organizationId);
+        exchangedSnapshots.push(identity.profileSnapshotId);
         return {
           accessToken: `host-token-${exchanges}`,
           expiresAt: new Date("2026-07-31T12:05:00Z"),
@@ -81,9 +88,14 @@ describe("named-connection credential broker", () => {
     expect((await app.request(path, post(body))).status).toBe(200);
     expect(exchanges).toBe(1);
     expect(exchangedPrincipals).toEqual(["user-1"]);
-    expect(exchangedOrganizations).toEqual([
-      "https://tenant.example/api/v1/integrations/google-cloud/oidc",
-    ]);
+    // A-claims: the organization claim is the deployment id, and the profile
+    // snapshot claim is the content-hash of the immutable snapshot.
+    expect(exchangedOrganizations).toEqual(["tenant.example"]);
+    expect(exchangedSnapshots).toEqual([integrationSnapshotHash({
+      profileId: "profile-1",
+      integrationGrants: sessionGrants,
+      integrationConnections: [connection],
+    })]);
   });
 
   test("rejects a connection that is absent from either session snapshot", async () => {
@@ -98,18 +110,77 @@ describe("named-connection credential broker", () => {
       db: {} as never,
       bearer: "broker-secret",
       sessions,
+      sessionStatus: async () => "active",
       exchange: async () => { throw new Error("must not run"); },
     });
     expect((await app.request(path, post(body))).status).toBe(403);
   });
 
-  test("rejects callers without the host control-plane bearer", async () => {
+  test("rejects callers without the broker bearer", async () => {
     const app = makeConnectionCredentialBrokerRoute({
       db: {} as never,
       bearer: "broker-secret",
       sessions: sessionStore(),
+      sessionStatus: async () => "active",
       exchange: async () => { throw new Error("must not run"); },
     });
     expect((await app.request(path, post(body, "wrong"))).status).toBe(401);
+  });
+
+  // O6: `task_session` rows outlive the session; authorization is bounded by
+  // the session's LIFETIME.
+  test("refuses to mint for an ended or deleted session and evicts its cache", async () => {
+    let status: string | null = "active";
+    let exchanges = 0;
+    const app = makeConnectionCredentialBrokerRoute({
+      db: {} as never,
+      bearer: "broker-secret",
+      sessions: sessionStore(),
+      sessionStatus: async () => status,
+      now: () => new Date("2026-07-31T12:00:00Z"),
+      issuer: "https://tenant.example/api/v1/integrations/google-cloud/oidc",
+      organizationId: "tenant.example",
+      exchange: async (): Promise<GoogleAccessToken> => {
+        exchanges += 1;
+        return {
+          accessToken: `host-token-${exchanges}`,
+          expiresAt: new Date("2026-07-31T13:00:00Z"),
+        };
+      },
+    });
+
+    // Live: mints and caches.
+    expect((await app.request(path, post(body))).status).toBe(200);
+    expect(exchanges).toBe(1);
+
+    // Ended: 403 even though a fresh cached token exists, and the cache entry
+    // is evicted.
+    for (const ended of ["completed", "failed", "dead", "host_lost", null]) {
+      status = ended;
+      expect((await app.request(path, post(body))).status).toBe(403);
+    }
+
+    // Back alive (a fresh probe result): the evicted cache forces a new
+    // exchange rather than serving the ended-session token.
+    status = "active";
+    expect((await app.request(path, post(body))).status).toBe(200);
+    expect(exchanges).toBe(2);
+  });
+
+  test("fails closed when the session status probe fails", async () => {
+    let exchanges = 0;
+    const app = makeConnectionCredentialBrokerRoute({
+      db: {} as never,
+      bearer: "broker-secret",
+      sessions: sessionStore(),
+      sessionStatus: async () => { throw new Error("control plane unreachable"); },
+      exchange: async (): Promise<GoogleAccessToken> => {
+        exchanges += 1;
+        return { accessToken: "must-not-mint", expiresAt: new Date("2026-07-31T13:00:00Z") };
+      },
+    });
+    // 502 (retryable), never a mint on unverified session state.
+    expect((await app.request(path, post(body))).status).toBe(502);
+    expect(exchanges).toBe(0);
   });
 });

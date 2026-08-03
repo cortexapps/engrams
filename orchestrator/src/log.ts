@@ -26,3 +26,12 @@ export const log =
         { level },
         pretty({ colorize: true, translateTime: "SYS:HH:MM:ss", ignore: "pid,hostname" }),
       );
+
+/**
+ * ONE formatting rule for unknown thrown values. Use this instead of ad-hoc
+ * `error instanceof Error ? error.message : String(error)` copies so log
+ * lines and user-facing messages stay uniform.
+ */
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

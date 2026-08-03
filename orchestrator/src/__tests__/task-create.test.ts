@@ -11,6 +11,7 @@
 
 import { expect, test, describe } from "bun:test";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { getTableName } from "drizzle-orm";
 import { z } from "zod";
 import {
   compileSessionCreateInput,
@@ -133,31 +134,40 @@ const providerHarnessCatalog = (): HarnessCatalogClient => ({
   }),
 });
 
-const fakeConnections = (): IntegrationConnectionStore => ({
-  list: async () => [],
-  get: async (id) => {
-    const provider = id.startsWith("default-") ? id.slice("default-".length) : "gcp";
-    return {
-      id,
-      alias: id,
-      provider,
-      displayName: provider,
-      isDefault: id.startsWith("default-"),
-      config: {},
-      enabled: true,
-      testedAt: new Date(0),
-      createdAt: new Date(0),
-      updatedAt: new Date(0),
-    };
-  },
-  getDefault: async (provider) => fakeConnections().get(`default-${provider}`),
-  create: async () => { throw new Error("unused"); },
-  update: async () => { throw new Error("unused"); },
-  delete: async () => { throw new Error("unused"); },
-  markTested: async () => { throw new Error("unused"); },
-  setEnabled: async () => { throw new Error("unused"); },
-  ensureDefault: async (provider) => (await fakeConnections().get(`default-${provider}`))!,
-});
+const fakeConnections = (): IntegrationConnectionStore => {
+  const store: IntegrationConnectionStore = {
+    list: async () => [],
+    get: async (id) => {
+      const provider = id.startsWith("default-") ? id.slice("default-".length) : "gcp";
+      return {
+        id,
+        alias: id,
+        provider,
+        displayName: provider,
+        isDefault: id.startsWith("default-"),
+        config: {},
+        enabled: true,
+        testedAt: new Date(0),
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      };
+    },
+    // Self-referencing so a test that overrides `store.get` also steers the
+    // batched lookup path.
+    getMany: async (ids) => {
+      const rows = await Promise.all(ids.map((id) => store.get(id)));
+      return rows.filter((row) => row != null);
+    },
+    getDefault: async (provider) => store.get(`default-${provider}`),
+    create: async () => { throw new Error("unused"); },
+    update: async () => { throw new Error("unused"); },
+    delete: async () => { throw new Error("unused"); },
+    markTested: async () => { throw new Error("unused"); },
+    setEnabled: async () => { throw new Error("unused"); },
+    ensureDefault: async (provider) => (await store.get(`default-${provider}`))!,
+  };
+  return store;
+};
 
 // Default the user token to present ("tok") — a human (chat) run now BLOCKS when
 // the harness's declared user_env is unset, so tests exercising other
@@ -641,7 +651,7 @@ describe("compileSessionCreateInput", () => {
       isDefault: false,
       config: {
         workloadIdentityProvider:
-          "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/dev",
+          "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/engrams-dev",
         serviceAccountEmail: "dev-vm@example-project.iam.gserviceaccount.com",
         endpoints: ["compute.googleapis.com", "tunnel.cloudproxy.app"],
       },
@@ -736,6 +746,65 @@ describe("compileSessionCreateInput", () => {
     )).toBe(true);
     const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
     expect(manifest.map((tool) => tool.name)).toEqual(["review_tool"]);
+  });
+
+  // O10: grant resolution is batched (one getMany per distinct id set) and
+  // memoized — a create never resolves the same connection id twice.
+  test("resolves each connection id at most once per create", async () => {
+    const store = fakeConnections();
+    let singleGets = 0;
+    const batchedIds: string[] = [];
+    const baseGet = store.get;
+    store.getMany = async (ids) => {
+      batchedIds.push(...ids);
+      const rows = await Promise.all(ids.map((id) => baseGet(id)));
+      return rows.filter((row) => row != null);
+    };
+    store.get = async (id) => {
+      singleGets += 1;
+      return baseGet(id);
+    };
+
+    await compileSessionCreateInput(
+      profile({
+        integrationGrants: [defaultGrant("memory:write"), defaultGrant("engram:pr_review")],
+      }),
+      { ...deps(), connections: store },
+    );
+
+    // The profile-capability pass reuses the effective-grant rows; nothing is
+    // fetched twice and nothing falls back to per-id gets.
+    expect(new Set(batchedIds).size).toBe(batchedIds.length);
+    expect(singleGets).toBe(0);
+  });
+
+  test("capabilityOverride skips profile-grant resolution entirely", async () => {
+    const store = fakeConnections();
+    const baseGet = store.get;
+    store.get = async (id) => (id === "missing-connection" ? null : baseGet(id));
+
+    const brokenProfile = profile({
+      integrationGrants: [{
+        connectionId: "missing-connection",
+        operation: "pr_review",
+        resourceConstraints: [],
+      }],
+    });
+
+    // Without an override the broken profile grant fails the create.
+    await expect(compileSessionCreateInput(
+      brokenProfile,
+      { ...deps(), connections: store },
+    )).rejects.toThrow(/does not exist/);
+
+    // An override replaces the session authority; the unused profile grants
+    // are never resolved, so the create succeeds.
+    const inp = await compileSessionCreateInput(
+      brokenProfile,
+      { ...deps(), connections: store },
+      { capabilityOverride: ["engram:pr_review"] },
+    );
+    expect(inp.capabilities).toEqual(["engram:pr_review"]);
   });
 
   test("session clamps replace capabilities/network and drop profile secrets/env", async () => {
@@ -881,12 +950,14 @@ function fakeSessions(): TaskSessionsClient & { createReqs: unknown[]; deletedId
   };
 }
 
-/** A fake DB that records each `.values()` payload in insert order, or throws
- * from the transaction / a selected insert to exercise compensation paths. */
+/** A fake DB that records each `.values()` payload in insert order and each
+ * deleted table name, or throws from the transaction / a selected insert / the
+ * deletes to exercise compensation paths. */
 function recordingDb(
   records: Record<string, unknown>[],
   throwOnTx = false,
   failInsertAt?: number,
+  opts: { deletes?: string[]; failOnDelete?: boolean } = {},
 ): Db {
   let insertCount = 0;
   return {
@@ -900,7 +971,12 @@ function recordingDb(
             records.push(v);
           },
         }),
-        delete: () => ({ where: async () => undefined }),
+        delete: (table: { _?: unknown }) => ({
+          where: async () => {
+            if (opts.failOnDelete) throw new Error("delete boom");
+            opts.deletes?.push(getTableName(table as Parameters<typeof getTableName>[0]));
+          },
+        }),
       };
       return fn(tx);
     },
@@ -1058,6 +1134,62 @@ describe("createTaskWithSession", () => {
     expect(sessions.deletedIds).toEqual(["sess-1"]);
   });
 
+  // O8: on an ID mismatch the leaked session is the one the coordinator
+  // ACTUALLY created — compensation must delete that one, not the reserved id.
+  test("on an ID mismatch, compensation deletes the session the coordinator created", async () => {
+    const sessions = fakeSessions();
+    sessions.createSession = async (req) => {
+      sessions.createReqs.push(req);
+      return { sessionId: "sess-OTHER" };
+    };
+    const deletes: string[] = [];
+    await expect(
+      createTaskWithSession(
+        createDeps(sessions, recordingDb([], false, undefined, { deletes })),
+        { type: "chat", ownerUserId: "u", profileId: "p1" },
+      ),
+    ).rejects.toThrow(/different reserved session ID/);
+    expect(sessions.deletedIds).toEqual(["sess-OTHER"]);
+    expect(deletes).toEqual(["slack_session", "task"]);
+  });
+
+  // O7: slack_session has no FK to the task model, so the compensation must
+  // remove the Slack binding explicitly.
+  test("boot-failure compensation removes the slack_session binding and the task", async () => {
+    const sessions = fakeSessions();
+    sessions.createSession = async () => {
+      throw new Error("boot boom");
+    };
+    const deletes: string[] = [];
+    await expect(
+      createTaskWithSession(
+        createDeps(sessions, recordingDb([], false, undefined, { deletes })),
+        {
+          type: "slack_thread",
+          ownerUserId: "u",
+          profileId: "p1",
+          slackThreadWorkflowId: "thread-wf-1",
+        },
+      ),
+    ).rejects.toThrow(/boot boom/);
+    expect(sessions.deletedIds).toEqual(["sess-1"]);
+    expect(deletes).toEqual(["slack_session", "task"]);
+  });
+
+  // O7: a DB failure during compensation must not mask the original error.
+  test("a compensation DB failure does not mask the boot error", async () => {
+    const sessions = fakeSessions();
+    sessions.createSession = async () => {
+      throw new Error("boot boom");
+    };
+    await expect(
+      createTaskWithSession(
+        createDeps(sessions, recordingDb([], false, undefined, { failOnDelete: true })),
+        { type: "chat", ownerUserId: "u", profileId: "p1" },
+      ),
+    ).rejects.toThrow(/boot boom/);
+  });
+
   // ADR 0064: a profile's declared portExposures auto-mint one private exposure
   // per port at session create, against the injected PortExposureStore.
   test("auto-mints one private port-exposure per profile.portExposures port", async () => {
@@ -1211,6 +1343,7 @@ describe("createSessionForExistingTask", () => {
         displayName: "github",
         config: {},
       }],
+      integrationSnapshotHash: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
     }]);
     const request = sessions.createReqs[0] as {
       prompt?: string;
@@ -1246,6 +1379,7 @@ describe("createSessionForExistingTask", () => {
         capabilities: [],
         integrationGrants: [],
         integrationConnections: [],
+        integrationSnapshotHash: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
       },
       { sessionId: "sess-1" },
     ]);
@@ -1332,6 +1466,32 @@ describe("createSessionForExistingTask", () => {
       },
     )).rejects.toThrow(/insert boom/);
     expect(sessions.deletedIds).toEqual(["sess-1"]);
+  });
+
+  test("on an ID mismatch, compensation deletes the created session and the snapshot row", async () => {
+    const sessions = fakeSessions();
+    sessions.createSession = async (req) => {
+      sessions.createReqs.push(req);
+      return { sessionId: "sess-OTHER" };
+    };
+    const deletes: string[] = [];
+    await expect(createSessionForExistingTask(
+      createDeps(sessions, recordingDb([], false, undefined, { deletes })),
+      { taskId: "task-existing", profileId: "p1", role: "finder" },
+    )).rejects.toThrow(/different reserved session ID/);
+    expect(sessions.deletedIds).toEqual(["sess-OTHER"]);
+    expect(deletes).toEqual(["task_session"]);
+  });
+
+  test("a compensation DB failure does not mask the boot error", async () => {
+    const sessions = fakeSessions();
+    sessions.createSession = async () => {
+      throw new Error("boot boom");
+    };
+    await expect(createSessionForExistingTask(
+      createDeps(sessions, recordingDb([], false, undefined, { failOnDelete: true })),
+      { taskId: "task-existing", profileId: "p1", role: "finder" },
+    )).rejects.toThrow(/boot boom/);
   });
 
   test("does not start a session when task_session persistence fails", async () => {
