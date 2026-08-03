@@ -22,7 +22,7 @@ tracing.workspace = true
 sha2.workspace = true
 tar.workspace = true
 flate2.workspace = true
-oci-client = { version = "0.15", default-features = false, features = ["rustls-tls"] }
+oci-client = { version = "0.17", default-features = false, features = ["rustls-tls"] }
 parking_lot.workspace = true
 reqwest.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
