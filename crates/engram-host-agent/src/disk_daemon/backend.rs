@@ -2385,6 +2385,154 @@ mod tests {
         store.put_chunk(&bytes).await.unwrap()
     }
 
+    struct ProcessRecoveryContext {
+        manifest: Manifest,
+        cache_root: std::path::PathBuf,
+        store: Arc<ChunkStore>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SpoolCrashState {
+        Pristine,
+        TornChunk,
+        MissingMarker,
+        MissingChunk,
+        ForeignGarbage,
+    }
+
+    enum ProcessDeathState {
+        Intact,
+        WriteAfterFlushStarted { offset: u64, bytes: Vec<u8> },
+        Malformed,
+        Spool(SpoolCrashState),
+    }
+
+    struct ProcessRecoveryOutcome {
+        backend: ChunkedDiskBackend,
+        recovery: Result<(), String>,
+    }
+
+    /// Simulate process death and recovery without exposing the current
+    /// handoff mechanism to the tests. The file-backed phase will replace
+    /// this body with successor construction against the same dirty path.
+    async fn survive_process_death(
+        backend: ChunkedDiskBackend,
+        context: &ProcessRecoveryContext,
+        state: ProcessDeathState,
+    ) -> ProcessRecoveryOutcome {
+        use crate::disk_daemon::spool;
+
+        let mut interrupted_flush = None;
+        let state = match state {
+            ProcessDeathState::WriteAfterFlushStarted { offset, bytes } => {
+                interrupted_flush = Some(backend.flush_local().await.unwrap());
+                backend.write(offset, &bytes).await.unwrap();
+                ProcessDeathState::Intact
+            }
+            state => state,
+        };
+        let (exported_ref, exported_chunks) = backend.export_unflushed().await;
+        drop(interrupted_flush);
+        let recovery_data = match state {
+            ProcessDeathState::Intact => Ok((exported_ref, exported_chunks)),
+            ProcessDeathState::Malformed => Ok((
+                exported_ref,
+                vec![
+                    (0, vec![0x33; 16]),
+                    (7, vec![0x11; 4096]),
+                    (
+                        0,
+                        vec![0x22; context.manifest.chunk_size.as_u64() as usize * 2],
+                    ),
+                ],
+            )),
+            ProcessDeathState::Spool(crash_state) => {
+                let sid = engram_core::SandboxId::new();
+                let spool_root = tempfile::tempdir().unwrap();
+                let root = spool_root.path();
+                let sandbox_dir = root.join(sid.to_string());
+                let written = spool::write_spool(
+                    &engram_host_core::TokioFs,
+                    root,
+                    sid,
+                    exported_ref,
+                    &exported_chunks,
+                )
+                .await
+                .map_err(|error| error.to_string());
+
+                if written.is_ok() {
+                    match crash_state {
+                        SpoolCrashState::Pristine => {}
+                        SpoolCrashState::TornChunk => {
+                            std::fs::write(sandbox_dir.join("chunk-0.bin"), [0x11; 100]).unwrap();
+                        }
+                        SpoolCrashState::MissingMarker => {
+                            std::fs::remove_file(sandbox_dir.join("meta.json")).unwrap();
+                        }
+                        SpoolCrashState::MissingChunk => {
+                            std::fs::remove_file(sandbox_dir.join("chunk-2.bin")).unwrap();
+                        }
+                        SpoolCrashState::ForeignGarbage => {
+                            std::fs::write(sandbox_dir.join("chunk-tmp.swp"), b"editor droppings")
+                                .unwrap();
+                            std::fs::write(sandbox_dir.join("chunk-0.bin.partial"), b"torn tmp")
+                                .unwrap();
+                        }
+                    }
+                }
+
+                match written {
+                    Err(error) => Err(error),
+                    Ok(_) => match spool::read_spool(&engram_host_core::TokioFs, root, sid).await {
+                        Ok(Some((meta, chunks))) => Ok((
+                            ManifestRef {
+                                manifest_id: meta.manifest_id,
+                                version: meta.version,
+                            },
+                            chunks,
+                        )),
+                        Ok(None) => Err("recovery state is incomplete".into()),
+                        Err(error) => Err(error.to_string()),
+                    },
+                }
+            }
+            ProcessDeathState::WriteAfterFlushStarted { .. } => unreachable!(),
+        };
+
+        let successor_ref = recovery_data
+            .as_ref()
+            .map(|(manifest_ref, _)| *manifest_ref)
+            .unwrap_or(exported_ref);
+        let mut cfg = ChunkCacheConfig::new(
+            context
+                .cache_root
+                .join(format!("process-recovery-{}", rand_suffix())),
+        );
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let successor = ChunkedDiskBackend::new(
+            successor_ref,
+            &context.manifest,
+            ChunkCache::new(cfg),
+            context.store.clone(),
+            u64::MAX,
+        )
+        .unwrap();
+        let recovery = match recovery_data {
+            Ok((_manifest_ref, chunks)) => successor
+                .adopt_unflushed(chunks)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+
+        ProcessRecoveryOutcome {
+            backend: successor,
+            recovery,
+        }
+    }
+
     #[tokio::test]
     async fn read_returns_short_chunk_error_for_manifest_width_mismatch() {
         let chunk_size = 4096u64;
@@ -2411,152 +2559,11 @@ mod tests {
         ));
     }
 
-    /// 2026-07-16 session-85e0298a RCA: the shutdown spool export must
-    /// cover BOTH un-uploaded tiers (dirty and drained-but-not-uploaded
-    /// pending), and adoption into a fresh backend on the same manifest
-    /// must make the acked bytes readable again — the property the
-    /// pod-roll handoff relies on to never roll back acked writes.
+    /// 2026-07-16 session-85e0298a RCA: every acked write must remain
+    /// readable after process death, including a write that lands while
+    /// an earlier flush is in progress.
     #[tokio::test]
-    async fn export_then_adopt_preserves_acked_writes_across_backends() {
-        let chunk_size = 4096u64;
-        let total = 3 * chunk_size;
-        let (backend, _store, _dir) = {
-            let dir = tempfile::tempdir().unwrap();
-            let blob: Arc<dyn BlobStorage> =
-                Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
-            let store = Arc::new(ChunkStore::new(blob));
-            let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
-            let h1 = put_chunk(&store, 0xbb, chunk_size as usize).await;
-            let h2 = put_chunk(&store, 0xcc, chunk_size as usize).await;
-            let manifest = synth_manifest(
-                total,
-                chunk_size,
-                vec![(0, h0), (chunk_size, h1), (2 * chunk_size, h2)],
-            );
-            let manifest_ref = ManifestRef::new();
-            store.put_manifest(manifest_ref, &manifest).await.unwrap();
-            let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
-            cfg.budget_bytes = 64 * 1024 * 1024;
-            let cache = ChunkCache::new(cfg);
-            let backend = ChunkedDiskBackend::new(
-                manifest_ref,
-                &manifest,
-                cache.clone(),
-                store.clone(),
-                u64::MAX,
-            )
-            .unwrap();
-
-            // Chunk 0: dirty-tier write. Chunk 2: drained into the
-            // pending tier by flush_local (never uploaded) — the
-            // ADR 0038 window a SIGTERM can land in.
-            backend.write(0, &[0x11; 4096]).await.unwrap();
-            backend.write(2 * chunk_size, &[0x33; 4096]).await.unwrap();
-            let pending = backend.flush_local().await.unwrap();
-            backend.write(0, &[0x22; 4096]).await.unwrap(); // re-dirty chunk 0
-                                                            // Drop the pending handle WITHOUT uploading: chunks stay in
-                                                            // the pending tier (requeue puts them back for the next
-                                                            // flush; the SIGTERM export must see them either way).
-            backend.requeue_pending(pending).await;
-
-            let backend2 = ChunkedDiskBackend::new(
-                ManifestRef::new(),
-                &manifest,
-                cache,
-                store.clone(),
-                u64::MAX,
-            )
-            .unwrap();
-            // Re-point backend2 at the SAME lineage the export records.
-            backend2
-                .rebase_manifest_ref(backend.manifest_ref().await)
-                .await;
-
-            let (exported_ref, chunks) = backend.export_unflushed().await;
-            assert_eq!(exported_ref, backend.manifest_ref().await);
-            let indices: Vec<usize> = chunks.iter().map(|(i, _)| *i).collect();
-            assert_eq!(
-                indices,
-                vec![0, 2],
-                "export must union the dirty tier (chunk 0) and the \
-                 pending-upload tier (chunk 2)",
-            );
-
-            let adopted = backend2.adopt_unflushed(chunks).await.unwrap();
-            assert_eq!(adopted, 2 * chunk_size);
-            (backend2, store, dir)
-        };
-
-        // The successor serves the acked bytes, not the base.
-        let b0 = backend.read(0, chunk_size).await.unwrap();
-        assert!(b0.iter().all(|b| *b == 0x22), "dirty tier won chunk 0");
-        let b1 = backend.read(chunk_size, chunk_size).await.unwrap();
-        assert!(b1.iter().all(|b| *b == 0xbb), "untouched chunk serves base");
-        let b2 = backend.read(2 * chunk_size, chunk_size).await.unwrap();
-        assert!(
-            b2.iter().all(|b| *b == 0x33),
-            "pending tier chunk recovered"
-        );
-    }
-
-    #[tokio::test]
-    async fn adopt_rejects_out_of_shape_chunks() {
-        let chunk_size = 4096u64;
-        let dir = tempfile::tempdir().unwrap();
-        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
-        let store = Arc::new(ChunkStore::new(blob));
-        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
-        let manifest = synth_manifest(chunk_size, chunk_size, vec![(0, h0)]);
-        let manifest_ref = ManifestRef::new();
-        store.put_manifest(manifest_ref, &manifest).await.unwrap();
-        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
-        cfg.budget_bytes = 64 * 1024 * 1024;
-        let cache = ChunkCache::new(cfg);
-        let backend =
-            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
-
-        // #810: an out-of-shape chunk must reject the WHOLE adoption (a
-        // skipped chunk is a silently rolled-back acked write), leaving
-        // the dirty tier untouched — including any well-shaped siblings.
-        let err = backend
-            .adopt_unflushed(vec![
-                (0, vec![0x33; 16]),                      // well-shaped sibling
-                (7, vec![0x11; 4096]),                    // past total_bytes
-                (0, vec![0x22; chunk_size as usize * 2]), // oversized
-            ])
-            .await
-            .expect_err("out-of-shape chunks must refuse the whole adoption");
-        assert!(matches!(
-            err,
-            DiskBackendError::AdoptShape { chunk_idx: 7, .. }
-        ));
-        assert_eq!(
-            backend.dirty_chunks_count().await,
-            0,
-            "atomic rejection: the well-shaped sibling must not have landed"
-        );
-    }
-
-    /// ADR 0099 H5 — the acked-write invariant across the whole
-    /// shutdown-spool crash-state space, end to end through the
-    /// export → spool → read → adopt seam (no NBD, no KVM: plain files
-    /// on a temp dir). Marks a set of chunk writes acked, exports+spools
-    /// them, then constructs each partial/corrupt on-disk state a crash
-    /// (or bit-rot) can leave and asserts the invariant:
-    ///
-    ///   every acked write is EITHER fully recoverable from an adopted
-    ///   spool OR the adoption fails/skips loudly — NO crash state makes
-    ///   read_spool hand back a torn chunk or a proper SUBSET while
-    ///   claiming completeness.
-    ///
-    /// That silent-subset/torn adopt is exactly the regression
-    /// session-85e0298a suffered (rolled-back acked writes → ext4
-    /// "Structure needs cleaning"); the whole spool exists to make it
-    /// impossible, so the oracle names it as the invariant.
-    #[tokio::test]
-    async fn acked_writes_never_silently_regress_across_spool_crash_states() {
-        use crate::disk_daemon::spool;
-
+    async fn acked_writes_survive_process_death_across_backends() {
         let chunk_size = 4096u64;
         let total = 3 * chunk_size;
         let dir = tempfile::tempdir().unwrap();
@@ -2574,123 +2581,144 @@ mod tests {
         store.put_manifest(manifest_ref, &manifest).await.unwrap();
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
-        let cache = ChunkCache::new(cfg);
-        let src = ChunkedDiskBackend::new(
+        let backend = ChunkedDiskBackend::new(
             manifest_ref,
             &manifest,
-            cache.clone(),
+            ChunkCache::new(cfg),
             store.clone(),
             u64::MAX,
         )
         .unwrap();
-
-        // Two acked writes across both un-uploaded tiers: chunk 0 stays
-        // dirty; chunk 2 is drained into the pending tier (never
-        // uploaded) — both must survive the roll.
-        src.write(0, &[0x11; 4096]).await.unwrap();
-        src.write(2 * chunk_size, &[0x33; 4096]).await.unwrap();
-        let pending = src.flush_local().await.unwrap();
-        src.requeue_pending(pending).await;
-
-        let (exported_ref, acked) = src.export_unflushed().await;
-        assert_eq!(
-            acked.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
-            vec![0, 2],
-            "export must union the dirty + pending tiers",
-        );
-
-        let sid = engram_core::SandboxId::new();
-        let spool_root = tempfile::tempdir().unwrap();
-        let root = spool_root.path();
-        let sdir = root.join(sid.to_string());
-
-        // Re-spool the pristine acked set (each case starts from it).
-        let respool =
-            || spool::write_spool(&engram_host_core::TokioFs, root, sid, exported_ref, &acked);
-
-        // Adopt a read-back spool into a fresh backend and prove every
-        // acked write is served (dirty chunk 0 = 0x11, pending chunk 2 =
-        // 0x33) and the untouched chunk 1 falls through to the base.
-        let assert_full_recovery = |chunks: Vec<(usize, Vec<u8>)>| {
-            let cache = cache.clone();
-            let store = store.clone();
-            let manifest = manifest.clone();
-            let acked = acked.clone();
-            async move {
-                assert_eq!(chunks, acked, "adopted set must be the EXACT acked set");
-                let dst =
-                    ChunkedDiskBackend::new(ManifestRef::new(), &manifest, cache, store, u64::MAX)
-                        .unwrap();
-                dst.rebase_manifest_ref(exported_ref).await;
-                let adopted = dst.adopt_unflushed(chunks).await.unwrap();
-                assert_eq!(adopted, 2 * chunk_size);
-                let b0 = dst.read(0, chunk_size).await.unwrap();
-                assert!(b0.iter().all(|b| *b == 0x11), "acked dirty chunk recovered");
-                let b1 = dst.read(chunk_size, chunk_size).await.unwrap();
-                assert!(b1.iter().all(|b| *b == 0xbb), "untouched chunk = base");
-                let b2 = dst.read(2 * chunk_size, chunk_size).await.unwrap();
-                assert!(
-                    b2.iter().all(|b| *b == 0x33),
-                    "acked pending chunk recovered"
-                );
-            }
+        let context = ProcessRecoveryContext {
+            manifest,
+            cache_root: dir.path().join("successor-cache"),
+            store,
         };
 
-        // ── Case A: pristine spool → adopts the full set, all acked
-        // writes recoverable.
-        respool().await.unwrap();
-        let (_m, chunks) = spool::read_spool(&engram_host_core::TokioFs, root, sid)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_full_recovery(chunks).await;
+        backend.write(0, &[0x11; 4096]).await.unwrap();
+        backend.write(2 * chunk_size, &[0x33; 4096]).await.unwrap();
+        let outcome = survive_process_death(
+            backend,
+            &context,
+            ProcessDeathState::WriteAfterFlushStarted {
+                offset: 0,
+                bytes: vec![0x22; 4096],
+            },
+        )
+        .await;
+        outcome.recovery.unwrap();
 
-        // ── Case B: a chunk file torn under a complete marker → Err,
-        // never a torn/subset adopt.
-        respool().await.unwrap();
-        // Truncate chunk 0 to a short remnant under the intact marker.
-        // Ok(None) | Err = loud rollback; an Ok(Some) would be a torn adopt.
-        std::fs::write(sdir.join("chunk-0.bin"), [0x11; 100]).unwrap();
-        let torn = spool::read_spool(&engram_host_core::TokioFs, root, sid).await;
-        if let Ok(Some((_, c))) = torn {
-            panic!("adopted a torn spool as complete: {c:?}");
-        }
+        let mut expected = vec![0xaa; total as usize];
+        expected[chunk_size as usize..(2 * chunk_size) as usize].fill(0xbb);
+        expected[(2 * chunk_size) as usize..].fill(0x33);
+        expected[..chunk_size as usize].fill(0x22);
+        assert_eq!(outcome.backend.read(0, total).await.unwrap(), expected);
+    }
 
-        // ── Case C: crash mid-export, no marker → absent (never a
-        // partial adopt of the chunks that did land).
-        respool().await.unwrap();
-        std::fs::remove_file(sdir.join("meta.json")).unwrap();
-        assert!(spool::read_spool(&engram_host_core::TokioFs, root, sid)
-            .await
-            .unwrap()
-            .is_none());
+    #[tokio::test]
+    async fn malformed_recovery_fails_loudly_and_atomically() {
+        let chunk_size = 4096u64;
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![(0, h0)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let backend = ChunkedDiskBackend::new(
+            manifest_ref,
+            &manifest,
+            ChunkCache::new(cfg),
+            store.clone(),
+            u64::MAX,
+        )
+        .unwrap();
+        let context = ProcessRecoveryContext {
+            manifest,
+            cache_root: dir.path().join("successor-cache"),
+            store,
+        };
 
-        // ── Case D: marker lists a chunk whose file vanished → Err; the
-        // surviving sibling is NOT adopted as a subset.
-        respool().await.unwrap();
-        std::fs::remove_file(sdir.join("chunk-2.bin")).unwrap();
-        assert!(matches!(
-            spool::read_spool(&engram_host_core::TokioFs, root, sid).await,
-            Err(_) | Ok(None)
-        ));
+        let outcome = survive_process_death(backend, &context, ProcessDeathState::Malformed).await;
         assert!(
-            !matches!(
-                spool::read_spool(&engram_host_core::TokioFs, root, sid).await,
-                Ok(Some(_))
-            ),
-            "a missing acked chunk must never read back as a complete spool",
+            outcome.recovery.is_err(),
+            "malformed recovery data must fail loudly"
         );
+        assert_eq!(
+            outcome.backend.read(0, chunk_size).await.unwrap(),
+            vec![0xaa; chunk_size as usize],
+            "failed recovery must leave the base image unchanged"
+        );
+    }
 
-        // ── Case E: foreign garbage beside the valid chunks → tolerated,
-        // full set still recovers.
-        respool().await.unwrap();
-        std::fs::write(sdir.join("chunk-tmp.swp"), b"editor droppings").unwrap();
-        std::fs::write(sdir.join("chunk-0.bin.partial"), b"torn tmp").unwrap();
-        let (_m, chunks) = spool::read_spool(&engram_host_core::TokioFs, root, sid)
-            .await
-            .unwrap()
+    /// ADR 0099 H5: each recoverable process-crash state reproduces the
+    /// complete acked disk. Every other state fails loudly.
+    #[tokio::test]
+    async fn acked_writes_never_silently_regress_across_process_crash_states() {
+        let chunk_size = 4096u64;
+        let total = 3 * chunk_size;
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let h1 = put_chunk(&store, 0xbb, chunk_size as usize).await;
+        let h2 = put_chunk(&store, 0xcc, chunk_size as usize).await;
+        let manifest = synth_manifest(
+            total,
+            chunk_size,
+            vec![(0, h0), (chunk_size, h1), (2 * chunk_size, h2)],
+        );
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let context = ProcessRecoveryContext {
+            manifest: manifest.clone(),
+            cache_root: dir.path().join("successor-cache"),
+            store: store.clone(),
+        };
+        let mut expected = vec![0xaa; total as usize];
+        expected[chunk_size as usize..(2 * chunk_size) as usize].fill(0xbb);
+        expected[(2 * chunk_size) as usize..].fill(0x33);
+        expected[..chunk_size as usize].fill(0x11);
+
+        for (state, must_recover) in [
+            (SpoolCrashState::Pristine, true),
+            (SpoolCrashState::TornChunk, false),
+            (SpoolCrashState::MissingMarker, false),
+            (SpoolCrashState::MissingChunk, false),
+            (SpoolCrashState::ForeignGarbage, true),
+        ] {
+            let mut source_cfg =
+                ChunkCacheConfig::new(dir.path().join(format!("source-cache-{}", rand_suffix())));
+            source_cfg.budget_bytes = 64 * 1024 * 1024;
+            let source = ChunkedDiskBackend::new(
+                manifest_ref,
+                &manifest,
+                ChunkCache::new(source_cfg),
+                store.clone(),
+                u64::MAX,
+            )
             .unwrap();
-        assert_full_recovery(chunks).await;
+            source.write(0, &[0x11; 4096]).await.unwrap();
+            source.write(2 * chunk_size, &[0x33; 4096]).await.unwrap();
+
+            let outcome =
+                survive_process_death(source, &context, ProcessDeathState::Spool(state)).await;
+            match outcome.recovery {
+                Ok(()) => assert_eq!(
+                    outcome.backend.read(0, total).await.unwrap(),
+                    expected,
+                    "recovery from {state:?} served stale or incomplete bytes"
+                ),
+                Err(error) => assert!(
+                    !must_recover,
+                    "recovery from {state:?} failed unexpectedly: {error}"
+                ),
+            }
+        }
     }
 
     #[tokio::test]
@@ -2980,14 +3008,9 @@ mod tests {
         N.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// The flush-window write race (the teleport-canary zeros): a write
-    /// landing AFTER `flush_local` drained its chunk to the pending tier
-    /// but BEFORE the upload rebases `base` must RMW from PENDING, not
-    /// the stale base — otherwise everything the drain just captured is
-    /// silently dropped from the chunk and reads (and the next publish)
-    /// serve zeros/stale bytes where the first write wave should be.
+    /// A write that races a flush must preserve all earlier acked bytes.
     #[tokio::test]
-    async fn write_during_flush_window_rmws_from_pending_not_stale_base() {
+    async fn write_racing_flush_reads_the_newest_acked_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
         let store = Arc::new(ChunkStore::new(blob));
@@ -3000,51 +3023,45 @@ mod tests {
         let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
         cfg.budget_bytes = 64 * 1024 * 1024;
         let cache = ChunkCache::new(cfg);
-        let backend =
-            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
+        let backend = Arc::new(
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store.clone(), u64::MAX)
+                .unwrap(),
+        );
 
-        // Wave 1: first half of the chunk.
         backend.write(0, &[0x11u8; 2048]).await.unwrap();
-        // The scheduler's drain races in: dirty -> pending (upload not
-        // yet landed, base NOT rebased).
-        let _pending = backend.flush_local().await.unwrap();
-        // Wave 2: second half, arriving inside the flush window.
-        backend.write(2048, &[0x22u8; 2048]).await.unwrap();
+        let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::DirtyPendingHandoff);
+        let flush_backend = backend.clone();
+        let flush_task = tokio::spawn(async move { flush_backend.flush().await });
+        arrived.notified().await;
+
+        let write_backend = backend.clone();
+        let write_task =
+            tokio::spawn(async move { write_backend.write(2048, &[0x22u8; 2048]).await });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        proceed.notify_one();
+
+        flush_task.await.unwrap().unwrap();
+        write_task.await.unwrap().unwrap();
 
         let bytes = backend.read(0, 4096).await.unwrap();
-        assert!(
-            bytes[..2048].iter().all(|b| *b == 0x11),
-            "wave-1 bytes must survive a wave-2 RMW inside the flush window \
-             (stale-base RMW would resurrect the pre-flush base here)",
+        let mut expected = vec![0x11; 4096];
+        expected[2048..].fill(0x22);
+        assert_eq!(
+            bytes, expected,
+            "the racing write must preserve all earlier acked bytes"
         );
-        assert!(bytes[2048..].iter().all(|b| *b == 0x22), "wave-2 bytes");
     }
 
-    /// Issue #204: the dirty→pending handoff inside `flush_local` must be
-    /// ATOMIC w.r.t. concurrent readers/writers. The pre-fix code drained
-    /// `dirty`, dropped the dirty lock, then took `pending` separately — so
-    /// for an instant a drained chunk lived in NO tier. A `read` in that gap
-    /// fell through to the stale `base` (transient stale read); a `write` in
-    /// that gap RMW'd from stale base and re-inserted into `dirty`,
-    /// permanently shadowing the drained bytes (silent lost write).
-    ///
-    /// This test installs a seam that parks `flush_local` at exactly that
-    /// handoff point (with the fix: both locks held) and races a read AND a
-    /// write of the drained chunk. It asserts:
-    ///   (a) the racing read returns the DRAINED content, never stale base;
-    ///   (b) the racing write merges onto the drained content (not stale
-    ///       base), so a subsequent flush publishes the correct bytes.
-    /// On the pre-fix code (a) reads base and (b) loses the drained half,
-    /// so this fails; with the fix both readers/writers block on the held
-    /// `pending` lock until the handoff completes and observe drained truth.
+    /// Issue #204: a read must never observe stale base bytes while a flush
+    /// changes its local ownership of an acked write.
     #[tokio::test]
-    async fn flush_local_handoff_is_atomic_no_tierless_gap() {
+    async fn reads_never_observe_stale_base_during_flush_handoff() {
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
         let store = Arc::new(ChunkStore::new(blob));
         let chunk_size = 4096u64;
         let total = 4096u64;
-        // Base chunk is all-0xaa — the "stale base" the gap would serve.
         let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
         let manifest = synth_manifest(total, chunk_size, vec![(0, h0)]);
         let manifest_ref = ManifestRef::new();
@@ -3056,34 +3073,20 @@ mod tests {
             ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap(),
         );
 
-        // Guest writes the WHOLE chunk to 0x11 (acked) — this is the
-        // content the flush is about to drain.
         backend.write(0, &[0x11u8; 4096]).await.unwrap();
 
-        // Arm the seam, then run flush_local on a task; it will park at the
-        // dirty→pending handoff with both locks held.
         let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::DirtyPendingHandoff);
         let flush_backend = backend.clone();
-        let flush_task = tokio::spawn(async move { flush_backend.flush_local().await.map(|_| ()) });
+        let flush_task = tokio::spawn(async move { flush_backend.flush().await.map(|_| ()) });
 
-        // Wait until flush_local has reached the seam (chunk drained,
-        // handoff in progress).
         arrived.notified().await;
 
-        // Race a READ and a WRITE of the drained chunk against the handoff.
-        // With the fix these block on the held `pending` lock; with the bug
-        // they slip through the tier-less gap and hit stale base.
         let read_backend = backend.clone();
         let read_task = tokio::spawn(async move { read_backend.read(0, 4096).await });
         let write_backend = backend.clone();
-        // Overwrite the SECOND half to 0x22; the first half must remain the
-        // drained 0x11 (a stale-base RMW would resurrect 0xaa there).
         let write_task =
             tokio::spawn(async move { write_backend.write(2048, &[0x22u8; 2048]).await });
 
-        // Give the racing ops a chance to wedge against the held locks
-        // (or, on the buggy code, to race through the gap), then complete
-        // the handoff.
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         proceed.notify_one();
@@ -3092,34 +3095,23 @@ mod tests {
         let read_bytes = read_task.await.unwrap().unwrap();
         write_task.await.unwrap().unwrap();
 
-        // (a) The racing read must observe the drained content (0x11),
-        // never the pre-flush base (0xaa).
+        let before_write = vec![0x11; 4096];
+        let mut expected = before_write.clone();
+        expected[2048..].fill(0x22);
         assert!(
-            read_bytes.iter().all(|b| *b == 0x11),
-            "racing read in the flush handoff window served stale base \
-             instead of the drained content (issue #204 tier-less gap)",
+            read_bytes == before_write || read_bytes == expected,
+            "a read racing the flush must return an acked disk state"
         );
 
-        // (b) The racing write must have RMW'd from the drained content:
-        // first half stays 0x11, second half becomes 0x22. A stale-base RMW
-        // would leave 0xaa in the first half and lose the acked write.
         let after = backend.read(0, 4096).await.unwrap();
-        assert!(
-            after[..2048].iter().all(|b| *b == 0x11),
-            "drained bytes were shadowed by a stale-base RMW during the \
-             flush handoff (silent lost write, issue #204)",
-        );
-        assert!(
-            after[2048..].iter().all(|b| *b == 0x22),
-            "racing write's bytes missing after the handoff",
+        assert_eq!(
+            after, expected,
+            "the racing write must preserve all earlier acked bytes"
         );
 
-        // (c) A subsequent flush publishes the merged-correct content (the
-        // write landed in `dirty` after the drain, so it flushes cleanly).
         backend.flush().await.unwrap();
         let published = backend.read(0, 4096).await.unwrap();
-        assert!(published[..2048].iter().all(|b| *b == 0x11));
-        assert!(published[2048..].iter().all(|b| *b == 0x22));
+        assert_eq!(published, expected);
     }
 
     /// NBD durability: a read whose backing chunk blob is missing must
@@ -3590,15 +3582,20 @@ mod tests {
             ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
 
         backend.write(0, &[0xcc; 16]).await.unwrap();
-        // Touching one chunk materialises it whole — `dirty_bytes`
-        // counts the full chunk buffer, not just the patched range.
         assert_eq!(backend.dirty_chunks_count().await, 1);
-        assert_eq!(backend.dirty_bytes().await, chunk_size);
+        let dirty_bytes = backend.dirty_bytes().await;
+        assert!(
+            (16..=chunk_size).contains(&dirty_bytes),
+            "dirty bytes must cover the write without exceeding one chunk"
+        );
 
-        // Second chunk via a write that lands inside chunk 1.
         backend.write(chunk_size, &[0xdd; 8]).await.unwrap();
         assert_eq!(backend.dirty_chunks_count().await, 2);
-        assert_eq!(backend.dirty_bytes().await, chunk_size * 2);
+        let dirty_bytes = backend.dirty_bytes().await;
+        assert!(
+            (24..=chunk_size * 2).contains(&dirty_bytes),
+            "dirty bytes must cover both writes without exceeding two chunks"
+        );
 
         let _ = backend.flush().await.unwrap();
         assert_eq!(backend.dirty_chunks_count().await, 0);
@@ -3670,26 +3667,21 @@ mod tests {
         (backend, store, dir)
     }
 
-    /// A first write that fits below the threshold does not fire the
-    /// notify; the second write that pushes dirty bytes past the
-    /// threshold does. The `tokio::time::timeout` on `notified()`
-    /// is the structural assertion — `notify_one` either parked a
-    /// permit (the await returns immediately) or it didn't (the
-    /// await times out).
+    /// A first write below the threshold does not notify. A second write
+    /// that crosses the threshold notifies once.
     #[tokio::test]
     async fn writer_crosses_threshold_pokes_notify() {
         let chunk_size = 4096u64;
         let total = chunk_size * 4;
         let manifest = synth_manifest(total, chunk_size, vec![]);
-        // Threshold at 2 chunks worth: one chunk write stays under,
-        // a second crosses.
-        let (backend, _store, _dir) = build_backend_with_threshold(&manifest, chunk_size * 2).await;
+        let threshold = chunk_size * 2;
+        let (backend, _store, _dir) = build_backend_with_threshold(&manifest, threshold).await;
         let notify = backend.threshold_notify();
 
-        // First write: dirty buffer holds one full chunk (the write
-        // materialises the whole 4 KiB on first touch). 4 KiB < 8
-        // KiB → no crossing → no notify permit.
         backend.write(0, &[0xcc; 8]).await.unwrap();
+        let dirty_bytes = backend.dirty_bytes().await;
+        assert!((8..=chunk_size).contains(&dirty_bytes));
+        assert!(dirty_bytes < threshold);
         let below =
             tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified()).await;
         assert!(
@@ -3697,10 +3689,10 @@ mod tests {
             "notify must NOT fire before threshold is crossed",
         );
 
-        // Second write touches chunk 1: dirty grows to 8 KiB, which
-        // is >= threshold. Crossing edge observed under the dirty
-        // lock; `notify_one` parks a permit.
         backend.write(chunk_size, &[0xdd; 8]).await.unwrap();
+        let dirty_bytes = backend.dirty_bytes().await;
+        assert!((16..=chunk_size * 2).contains(&dirty_bytes));
+        assert!(dirty_bytes >= threshold);
         let crossed =
             tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified()).await;
         assert!(
@@ -3709,35 +3701,29 @@ mod tests {
         );
     }
 
-    /// Once the buffer is past threshold, subsequent inserts on
-    /// already-dirty bytes don't re-fire — the cross is a one-shot
-    /// edge, not a level. The `notify_one` permit semantics give us
-    /// the "at most one wake per crossing" behaviour even if multiple
-    /// writers race; this test pins the in-lock guard (`before <
-    /// threshold && after >= threshold`) that prevents re-fires from
-    /// writers landing while the buffer is already saturated.
+    /// Writes after the first threshold crossing do not notify again.
     #[tokio::test]
     async fn additional_writes_past_threshold_do_not_re_notify() {
         let chunk_size = 4096u64;
         let total = chunk_size * 8;
         let manifest = synth_manifest(total, chunk_size, vec![]);
-        let (backend, _store, _dir) = build_backend_with_threshold(&manifest, chunk_size * 2).await;
+        let threshold = chunk_size * 2;
+        let (backend, _store, _dir) = build_backend_with_threshold(&manifest, threshold).await;
         let notify = backend.threshold_notify();
 
-        // Force a crossing: chunk 0 + chunk 1 → 8 KiB == threshold.
         backend.write(0, &[0xcc; 8]).await.unwrap();
         backend.write(chunk_size, &[0xdd; 8]).await.unwrap();
+        let dirty_bytes = backend.dirty_bytes().await;
+        assert!((16..=chunk_size * 2).contains(&dirty_bytes));
+        assert!(dirty_bytes >= threshold);
         let crossed =
             tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified()).await;
         assert!(crossed.is_ok(), "crossing notify must fire");
 
-        // Subsequent writes that materialise more chunks don't
-        // re-cross — `before` is already >= threshold for them, so
-        // the guard suppresses the notify_one. Permits don't
-        // accumulate beyond 1; a fresh `notified()` here would only
-        // ever fire if a NEW crossing edge happened.
         backend.write(chunk_size * 2, &[0xee; 8]).await.unwrap();
         backend.write(chunk_size * 3, &[0xff; 8]).await.unwrap();
+        let dirty_bytes = backend.dirty_bytes().await;
+        assert!((32..=chunk_size * 4).contains(&dirty_bytes));
         let level =
             tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified()).await;
         assert!(
@@ -3746,23 +3732,16 @@ mod tests {
         );
     }
 
-    /// Many concurrent writers each materialising a fresh chunk; the
-    /// in-lock crossing detection means exactly one of them observes
-    /// the monotonic edge (before<threshold && after>=threshold).
-    /// The other writers either see before<threshold && after<threshold
-    /// (we haven't crossed yet) or before>=threshold (someone else
-    /// did). Observable invariant: no deadlock, no panic, notify
-    /// fires exactly once (a permit is parked).
+    /// Concurrent writers produce one notification for one threshold
+    /// crossing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writers_observe_single_crossing() {
         let chunk_size = 4096u64;
         let chunks: u64 = 8;
         let total = chunk_size * chunks;
         let manifest = synth_manifest(total, chunk_size, vec![]);
-        // Threshold sized so a single chunk insert does not cross
-        // (4 KiB < 16 KiB) but a few of them collectively do
-        // (4 KiB * 8 = 32 KiB > 16 KiB).
-        let (backend, _store, _dir) = build_backend_with_threshold(&manifest, chunk_size * 4).await;
+        let threshold = chunk_size * 4;
+        let (backend, _store, _dir) = build_backend_with_threshold(&manifest, threshold).await;
         let notify = backend.threshold_notify();
         let backend = Arc::new(backend);
 
@@ -3776,10 +3755,10 @@ mod tests {
         for j in joins {
             j.await.unwrap();
         }
+        let dirty_bytes = backend.dirty_bytes().await;
+        assert!((chunks * 8..=chunks * chunk_size).contains(&dirty_bytes));
+        assert!(dirty_bytes >= threshold);
 
-        // The collective writes crossed the threshold. At least one
-        // writer observed the edge and poked `notify_one`; the
-        // permit is parked and consumable.
         let woken =
             tokio::time::timeout(std::time::Duration::from_millis(200), notify.notified()).await;
         assert!(
@@ -3787,10 +3766,6 @@ mod tests {
             "concurrent crossing must park a notify permit",
         );
 
-        // A second `notified()` should NOT immediately return —
-        // permits don't accumulate. Multiple in-lock observers of
-        // the crossing all call `notify_one` but at most one permit
-        // is stored.
         let second =
             tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified()).await;
         assert!(
@@ -3879,56 +3854,73 @@ mod tests {
         assert!(r1.is_ok() && r2.is_ok(), "both waiters must wake on drain");
     }
 
-    /// ADR 0039 item #19: `flush_upload` fans its per-chunk puts out
-    /// with bounded `buffer_unordered`. Dirty MANY more chunks than
-    /// `DISK_FLUSH_UPLOAD_CONCURRENCY` so the parallel path runs across
-    /// several windows, then assert the published manifest is correct:
-    /// every dirty chunk's bytes are uploaded + retrievable, the
-    /// manifest is offset-sorted, and a post-flush read serves the
-    /// flushed bytes (proving the rebase saw every parallel put).
-    /// ADR 0045 C1: a fenced backend's flush is a no-op (no drain, no
-    /// publish — the scheduler skips on chunks_flushed == 0); clearing
-    /// the fence flushes the preserved dirty set; the abort re-queue
-    /// path round-trips drained chunks back into dirty.
+    /// Simulate the current migration abort sequence. The file-backed
+    /// phase will no longer need to put captured bytes back into RAM.
+    async fn abort_migration(backend: &ChunkedDiskBackend) -> Result<(), DiskBackendError> {
+        let pending = backend.flush_local().await?;
+        backend.flush_to_local_cache(&pending).await?;
+        backend.requeue_pending(pending).await;
+        backend.set_migration_fence(false);
+        Ok(())
+    }
+
+    /// Read a disk from only its published manifest and chunk storage.
+    async fn read_published_disk(
+        store: Arc<ChunkStore>,
+        manifest_ref: ManifestRef,
+        cache_root: &std::path::Path,
+        length: u64,
+    ) -> Bytes {
+        let mut cfg =
+            ChunkCacheConfig::new(cache_root.join(format!("published-read-{}", rand_suffix())));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let restored =
+            ChunkedDiskBackend::from_blob(manifest_ref, ChunkCache::new(cfg), store, u64::MAX)
+                .await
+                .unwrap();
+        restored.read(0, length).await.unwrap()
+    }
+
+    /// ADR 0045 C1: a migration fence prevents a publish. Aborting the
+    /// migration preserves every acked byte for the next flush.
     #[tokio::test]
-    async fn migration_fence_noops_flush_and_requeue_restores_dirty() {
+    async fn migration_fence_prevents_publish_and_abort_preserves_bytes() {
         let chunk_size = 4096u64;
         let base = synth_manifest(chunk_size * 4, chunk_size, vec![]);
         let (backend, store, _dir) = build_backend(&base).await;
+        let initial_ref = backend.manifest_ref().await;
+        let mut expected = vec![0; (chunk_size * 4) as usize];
+        expected[..chunk_size as usize].fill(0x42);
         backend
             .write(0, &vec![0x42; chunk_size as usize])
             .await
             .unwrap();
 
         backend.set_migration_fence(true);
-        let fenced = backend.flush().await.unwrap();
-        assert_eq!(fenced.chunks_flushed, 0, "fenced flush must no-op");
-        assert_eq!(fenced.manifest_ref, base_ref_of(&backend).await);
-
-        // The migration path drains explicitly while fenced...
-        let pending = backend.flush_local().await.unwrap();
-        let (m, hashes) = backend.flush_to_local_cache(&pending).await.unwrap();
-        assert_eq!(hashes.len(), 1);
-        assert_eq!(m.chunks.len(), 1, "drained chunk in the local manifest");
-        assert!(
-            store.get_chunk(hashes[0]).await.is_err(),
-            "local-cache flush must not PUT to the store"
-        );
-
-        // ...and the abort path re-queues + unfences: the next flush
-        // publishes the chunk durably.
-        backend.requeue_pending(pending).await;
-        backend.set_migration_fence(false);
-        let after = backend.flush().await.unwrap();
+        backend.flush().await.unwrap();
+        let (latest_ref, _) = store
+            .get_latest_manifest(initial_ref.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            after.chunks_flushed, 1,
-            "re-queued chunk flushes after abort"
+            latest_ref, initial_ref,
+            "a fenced flush must not publish a new manifest"
         );
-        assert!(store.get_chunk(hashes[0]).await.is_ok());
-    }
+        assert_eq!(backend.read(0, chunk_size * 4).await.unwrap(), expected);
 
-    async fn base_ref_of(b: &ChunkedDiskBackend) -> ManifestRef {
-        b.manifest_ref().await
+        abort_migration(&backend).await.unwrap();
+        assert_eq!(backend.read(0, chunk_size * 4).await.unwrap(), expected);
+        let after = backend.flush().await.unwrap();
+        assert_ne!(
+            after.manifest_ref, initial_ref,
+            "the first unfenced flush must publish"
+        );
+        assert_eq!(
+            read_published_disk(store, after.manifest_ref, _dir.path(), chunk_size * 4).await,
+            expected,
+            "the published disk must contain every acked byte"
+        );
     }
 
     #[tokio::test]
@@ -4189,15 +4181,10 @@ mod tests {
         assert_eq!(store.get_chunk(entry.hash).await.unwrap(), w2_full);
     }
 
-    /// Issue #199 fence re-check: a flush already past `flush()`'s
-    /// top-of-function fence check must NOT publish if the migration
-    /// fence is raised mid-upload — otherwise it republishes a newer
-    /// `live_disk_manifest` after the migration's coherence cut
-    /// (split-brain). We park flush A at its chunk PUT, raise the fence,
-    /// release A, and assert A aborts the publish (manifest unchanged,
-    /// chunks_flushed == 0) and re-queues the drained chunk to dirty.
+    /// Issue #199: a fence raised during a flush prevents its publish.
+    /// The bytes remain readable and a later flush can publish them.
     #[tokio::test]
-    async fn flush_upload_aborts_publish_when_fence_raised_mid_upload() {
+    async fn fence_raised_during_flush_aborts_publish_and_preserves_bytes() {
         use std::sync::atomic::AtomicBool;
         let chunk_size = 4096u64;
         let total = 4 * chunk_size;
@@ -4223,51 +4210,53 @@ mod tests {
             ChunkedDiskBackend::new(manifest_ref, &base, cache, store.clone(), u64::MAX).unwrap(),
         );
         let ref0 = backend.manifest_ref().await;
+        let mut expected = vec![0; total as usize];
+        expected[..chunk_size as usize].fill(0x42);
 
         backend
             .write(0, &vec![0x42; chunk_size as usize])
             .await
             .unwrap();
 
-        // Flush A: passes the top-of-flush() fence check (fence is
-        // clear), drains, then parks at the gated chunk PUT.
         let a = {
             let backend = backend.clone();
             tokio::spawn(async move { backend.flush().await })
         };
         at_gate.notified().await;
 
-        // The migration coherence cut lands while A is mid-upload.
         backend.set_migration_fence(true);
 
-        // Release A: its upload completes, but the in-publish fence
-        // re-check must abort BEFORE put_manifest.
         release.notify_one();
-        let outcome = a.await.unwrap().unwrap();
+        a.await.unwrap().unwrap();
+        let (latest_ref, _) = store
+            .get_latest_manifest(ref0.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            outcome.chunks_flushed, 0,
-            "a flush whose upload finishes after the fence is raised must NOT publish",
+            latest_ref, ref0,
+            "a flush that finishes after the fence must not publish"
         );
         assert_eq!(
-            backend.manifest_ref().await,
-            ref0,
-            "the manifest must not advance past the migration coherence cut",
+            backend.read(0, total).await.unwrap(),
+            expected,
+            "the aborted flush must retain every acked byte"
         );
-        // The drained chunk is re-queued for the post-migration retry.
-        assert!(
-            backend.dirty_chunks_count().await >= 1,
-            "the aborted flush must re-queue its drained chunk to dirty",
+
+        backend.set_migration_fence(false);
+        let published = backend.flush().await.unwrap();
+        assert_ne!(published.manifest_ref, ref0);
+        assert_eq!(
+            read_published_disk(store, published.manifest_ref, dir.path(), total).await,
+            expected,
+            "the later flush must publish every retained byte"
         );
     }
 
-    /// ADR 0038: a failed `flush_upload` must be an ATOMIC no-op — the
-    /// manifest is NOT advanced and the drained bytes are re-queued to
-    /// `dirty` so the next checkpoint retries them. Regression test for the
-    /// prod chunk-drop (session `79b689e4`): the old shared-`pending_uploads`
-    /// lookup silently skipped puts, publishing a manifest that referenced
-    /// never-uploaded chunks → guest EIO on read.
+    /// ADR 0038: a failed flush does not publish a partial disk. It keeps
+    /// all acked bytes readable and retries them on the next flush.
     #[tokio::test]
-    async fn flush_upload_failure_is_atomic_no_op_and_retains_bytes() {
+    async fn failed_flush_does_not_publish_and_retains_bytes() {
         use std::sync::atomic::Ordering;
         let chunk_size = 4096u64;
         let total = 4 * chunk_size;
@@ -4289,51 +4278,46 @@ mod tests {
             ChunkedDiskBackend::new(manifest_ref, &base, cache, store.clone(), u64::MAX).unwrap();
 
         let ref0 = backend.manifest_ref().await;
+        let mut expected = vec![0; total as usize];
 
-        // Dirty three chunks.
         for c in 0..3u64 {
+            expected[(c * chunk_size) as usize..((c + 1) * chunk_size) as usize]
+                .fill((c as u8) + 1);
             backend
                 .write(c * chunk_size, &vec![(c as u8) + 1; chunk_size as usize])
                 .await
                 .unwrap();
         }
 
-        // Uploads fail → the flush must error, atomically.
         fail.store(true, Ordering::SeqCst);
         assert!(
             backend.flush().await.is_err(),
             "flush must fail when an upload fails"
         );
 
-        // (1) manifest NOT advanced — no half-written snapshot.
+        let (latest_ref, _) = store
+            .get_latest_manifest(ref0.manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            backend.manifest_ref().await,
-            ref0,
-            "failed flush must not tick the manifest"
+            latest_ref, ref0,
+            "a failed flush must not publish a new manifest"
         );
-        // (2) the drained bytes are re-queued for retry — not lost.
-        assert!(
-            backend.dirty_chunks_count().await >= 3,
-            "drained bytes must be re-queued to dirty on a failed upload"
-        );
-        // (3) reads still serve the written bytes locally — never EIO/stale.
-        assert_eq!(backend.read(chunk_size, 16).await.unwrap(), vec![2u8; 16]);
+        assert_eq!(backend.read(0, total).await.unwrap(), expected);
 
-        // Recover: uploads succeed → the retry flushes cleanly + durably.
         fail.store(false, Ordering::SeqCst);
         let outcome = backend.flush().await.unwrap();
         assert_ne!(
             outcome.manifest_ref, ref0,
             "a successful retry must advance the manifest"
         );
-        let published = store.get_manifest(outcome.manifest_ref).await.unwrap();
-        for c in published.chunks.iter() {
-            store
-                .get_chunk(c.hash)
-                .await
-                .expect("every published chunk must be durable after a successful flush");
-        }
-        assert_eq!(backend.read(chunk_size, 16).await.unwrap(), vec![2u8; 16]);
+        assert_eq!(backend.read(0, total).await.unwrap(), expected);
+        assert_eq!(
+            read_published_disk(store, outcome.manifest_ref, dir.path(), total).await,
+            expected,
+            "the successful retry must publish every acked byte"
+        );
     }
 
     /// ADR 0039 (sticky-everywhere): a flush write-throughs each uploaded
@@ -4431,12 +4415,54 @@ mod tests {
         }
     }
 
-    /// Source seal: covers BOTH tiers (dirty + pending), drains dirty
-    /// without hashing, leaves pending in place, and the shipped
-    /// manifest is base-only (every hash durable) — `guest content ==
-    /// manifest ⊕ seal`. Dirty wins over pending on the same index.
+    struct SealedSnapshot {
+        seal: Arc<PostCopyDiskSeal>,
+        manifest: Manifest,
+        manifest_ref: ManifestRef,
+    }
+
+    struct SealedSnapshotFetcher {
+        seal: Arc<PostCopyDiskSeal>,
+    }
+
+    impl PostCopyDiskFetcher for SealedSnapshotFetcher {
+        fn fetch(&self, chunk_idx: u64) -> futures::future::BoxFuture<'_, Result<Bytes, String>> {
+            Box::pin(async move {
+                self.seal
+                    .get(chunk_idx)
+                    .ok_or_else(|| format!("sealed snapshot has no chunk {chunk_idx}"))
+            })
+        }
+    }
+
+    /// Capture a disk while a flush is in progress. The file-backed phase
+    /// will replace the current local flush setup inside this helper.
+    async fn seal_snapshot(
+        backend: &ChunkedDiskBackend,
+        writes_after_flush_starts: &[(u64, Vec<u8>)],
+    ) -> SealedSnapshot {
+        let interrupted_flush = backend.flush_local().await.unwrap();
+        for (offset, bytes) in writes_after_flush_starts {
+            backend.write(*offset, bytes).await.unwrap();
+        }
+        let (seal, manifest, manifest_ref) = backend.seal_for_postcopy().await;
+        drop(interrupted_flush);
+        SealedSnapshot {
+            seal: Arc::new(seal),
+            manifest,
+            manifest_ref,
+        }
+    }
+
+    /// Restore a captured disk after an aborted move.
+    async fn restore_sealed_snapshot(backend: &ChunkedDiskBackend, snapshot: &SealedSnapshot) {
+        backend.requeue_postcopy_seal(&snapshot.seal).await;
+    }
+
+    /// A source seal preserves the newest guest-visible disk and keeps its
+    /// shipped manifest on the published base.
     #[tokio::test]
-    async fn seal_covers_dirty_and_pending_dirty_wins_and_manifest_is_base_only() {
+    async fn seal_preserves_latest_disk_view_and_base_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
         let store = Arc::new(ChunkStore::new(blob));
@@ -4456,40 +4482,29 @@ mod tests {
         cfg.budget_bytes = 64 * 1024 * 1024;
         let cache = ChunkCache::new(cfg);
         let backend =
-            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store.clone(), u64::MAX)
+                .unwrap();
 
-        // Chunk 1: dirty -> pending (flush window). Chunk 0: dirty.
-        // Chunk 1 ALSO re-dirtied after the drain — dirty must win.
         backend
             .write(chunk_size, &vec![0x11; chunk_size as usize])
             .await
             .unwrap();
-        let _pending = backend.flush_local().await.unwrap();
-        backend
-            .write(0, &vec![0x22; chunk_size as usize])
-            .await
-            .unwrap();
-        backend.write(chunk_size, &[0x33; 16]).await.unwrap();
-
-        let (seal, base_manifest, base_ref) = backend.seal_for_postcopy().await;
+        let snapshot = seal_snapshot(
+            &backend,
+            &[
+                (0, vec![0x22; chunk_size as usize]),
+                (chunk_size, vec![0x33; 16]),
+            ],
+        )
+        .await;
         assert_eq!(
-            seal.indices(),
-            vec![0, 1],
-            "dirty(0) + dirty-over-pending(1)"
+            snapshot.manifest_ref, manifest_ref,
+            "a seal must use the current published manifest"
         );
-        assert_eq!(base_ref, manifest_ref, "the published ref, no mint");
-        let sealed1 = seal.get(1).unwrap();
-        assert!(
-            sealed1[..16].iter().all(|b| *b == 0x33),
-            "dirty wins over pending"
-        );
-        assert!(sealed1[16..].iter().all(|b| *b == 0x11));
-        assert!(seal.get(0).unwrap().iter().all(|b| *b == 0x22));
-        assert!(seal.get(2).is_none(), "clean chunk not sealed");
-        // Manifest = base only: idx 1 still references the ORIGINAL
-        // durable hash (the divergence rides the seal, not a publish).
+
         let at = |off: u64| {
-            base_manifest
+            snapshot
+                .manifest
                 .chunks
                 .iter()
                 .find(|c| c.offset == off)
@@ -4499,22 +4514,44 @@ mod tests {
         assert_eq!(at(0), h0);
         assert_eq!(at(chunk_size), h1);
         assert_eq!(at(2 * chunk_size), h2);
-        // The seal drained `dirty` (no copies left behind).
-        assert_eq!(backend.dirty_chunks_count().await, 0);
 
-        // Abort path: requeue restores readability of the sealed bytes.
-        backend.requeue_postcopy_seal(&seal).await;
-        let bytes = backend.read(0, chunk_size).await.unwrap();
-        assert!(bytes.iter().all(|b| *b == 0x22));
-        let bytes = backend.read(chunk_size, 16).await.unwrap();
-        assert!(bytes.iter().all(|b| *b == 0x33));
+        let mut destination_cfg = ChunkCacheConfig::new(dir.path().join("destination-cache"));
+        destination_cfg.budget_bytes = 64 * 1024 * 1024;
+        let destination = ChunkedDiskBackend::new(
+            manifest_ref,
+            &manifest,
+            ChunkCache::new(destination_cfg),
+            store,
+            u64::MAX,
+        )
+        .unwrap();
+        destination
+            .install_postcopy_overlay(
+                &snapshot.manifest,
+                snapshot.manifest_ref,
+                &snapshot.seal.indices(),
+                Arc::new(SealedSnapshotFetcher {
+                    seal: snapshot.seal.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut expected = vec![0xaa; total as usize];
+        expected[chunk_size as usize..(2 * chunk_size) as usize].fill(0x11);
+        expected[(2 * chunk_size) as usize..].fill(0xcc);
+        expected[..chunk_size as usize].fill(0x22);
+        expected[chunk_size as usize..chunk_size as usize + 16].fill(0x33);
+        assert_eq!(destination.read(0, total).await.unwrap(), expected);
+
+        restore_sealed_snapshot(&backend, &snapshot).await;
+        assert_eq!(backend.read(0, total).await.unwrap(), expected);
     }
 
-    /// Destination overlay: install rebases to the source's manifest,
-    /// a sealed read demand-fetches EXACTLY once (installed into
-    /// `dirty`), and non-sealed reads bypass the fetcher entirely.
+    /// A sealed read fetches remote content once. A clean read uses the
+    /// published base without remote traffic.
     #[tokio::test]
-    async fn overlay_read_demand_fetches_once_and_nonsealed_bypasses() {
+    async fn overlay_reads_remote_content_once_and_bypasses_clean_chunks() {
         let chunk_size = 4096u64;
         let total = 2 * chunk_size;
         let dir = tempfile::tempdir().unwrap();
@@ -4537,13 +4574,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Non-sealed chunk: straight from base, fetcher untouched.
         let bytes = backend.read(0, chunk_size).await.unwrap();
         assert!(bytes.iter().all(|b| *b == 0xaa));
         assert_eq!(fetcher.calls(), 0);
 
-        // Sealed chunk: peer-authoritative, fetched once, then served
-        // from `dirty`.
         let bytes = backend.read(chunk_size, chunk_size).await.unwrap();
         assert!(bytes.iter().all(|b| *b == FakeFetcher::peer_byte(1)));
         assert_eq!(fetcher.calls(), 1);
@@ -4552,11 +4586,9 @@ mod tests {
         assert_eq!(fetcher.calls(), 1, "second read must not re-fetch");
     }
 
-    /// A partial write to a sealed chunk must RMW against the PEER
-    /// content — a base RMW would resurrect pre-divergence bytes
-    /// (the disk flavor of the flush-window corruption).
+    /// A partial write to remote content preserves its unwritten bytes.
     #[tokio::test]
-    async fn overlay_partial_write_rmws_peer_content_not_base() {
+    async fn overlay_partial_write_preserves_remote_content() {
         let chunk_size = 4096u64;
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
@@ -4591,11 +4623,10 @@ mod tests {
         );
     }
 
-    /// A terminal fetch failure latches `lost`: the failing read
-    /// errors (bounded -> NBD EIO, never a hang) and subsequent sealed
-    /// reads fail fast WITHOUT re-dialing the dead peer.
+    /// A terminal fetch failure makes later remote reads fail fast without
+    /// another fetch.
     #[tokio::test]
-    async fn overlay_fetch_failure_latches_lost_and_fails_fast() {
+    async fn overlay_fetch_failure_latches_and_fails_fast() {
         let chunk_size = 4096u64;
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
@@ -4622,11 +4653,10 @@ mod tests {
         assert_eq!(fetcher.calls(), 1, "lost is latched; no re-dial per read");
     }
 
-    /// The background drain pulls every sealed chunk, unfences the
-    /// publisher, clears the overlay, and reports the count. After it,
-    /// reads serve locally with zero peer traffic.
+    /// A completed drain makes the disk self-sufficient and releases its
+    /// publish fence.
     #[tokio::test]
-    async fn postcopy_drain_installs_all_unfences_and_reports() {
+    async fn postcopy_drain_makes_disk_self_sufficient_and_unfences() {
         let chunk_size = 4096u64;
         let total = 3 * chunk_size;
         let dir = tempfile::tempdir().unwrap();
@@ -4640,7 +4670,8 @@ mod tests {
         cfg.budget_bytes = 64 * 1024 * 1024;
         let cache = ChunkCache::new(cfg);
         let backend = Arc::new(
-            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap(),
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store.clone(), u64::MAX)
+                .unwrap(),
         );
         backend.set_migration_fence(true);
 
@@ -4665,11 +4696,6 @@ mod tests {
         .expect("drain must terminate");
         assert_eq!(outcome, Ok(2));
 
-        // Self-sufficient: fence released, overlay gone, content local.
-        assert!(
-            backend.postcopy_drain_subscribe().is_none(),
-            "overlay cleared"
-        );
         let calls_after_drain = fetcher.calls();
         let bytes = backend.read(chunk_size, chunk_size).await.unwrap();
         assert!(bytes.iter().all(|b| *b == FakeFetcher::peer_byte(1)));
@@ -4680,19 +4706,25 @@ mod tests {
             calls_after_drain,
             "no peer traffic after the drain"
         );
-        // The fence is released: a flush now publishes the pulled
-        // divergence (the durability catch-up on the normal cadence).
         let outcome = backend.flush().await.unwrap();
         assert_eq!(
             outcome.chunks_flushed, 2,
             "post-drain flush publishes the pulled chunks"
         );
+        let mut expected = vec![0; total as usize];
+        expected[..chunk_size as usize].fill(0xaa);
+        expected[chunk_size as usize..(2 * chunk_size) as usize].fill(FakeFetcher::peer_byte(1));
+        expected[(2 * chunk_size) as usize..].fill(FakeFetcher::peer_byte(2));
+        assert_eq!(
+            read_published_disk(store, outcome.manifest_ref, dir.path(), total).await,
+            expected
+        );
     }
 
-    /// Drain against a dead peer reports the failure (the coordinator
-    /// turns it into PeerLost and rewinds); the overlay stays lost.
+    /// A drain against a dead peer reports an error. Later reads fail
+    /// without more peer traffic.
     #[tokio::test]
-    async fn postcopy_drain_peer_death_reports_error() {
+    async fn postcopy_drain_peer_death_reports_error_and_reads_fail_fast() {
         let chunk_size = 4096u64;
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
@@ -4729,9 +4761,12 @@ mod tests {
         .await
         .expect("drain must terminate");
         assert!(outcome.is_err(), "dead peer must surface as a drain error");
-        assert!(
-            backend.postcopy_drain_subscribe().is_some(),
-            "the lost overlay stays for drain_wait to read",
+        let calls_after_failure = fetcher.calls();
+        assert!(backend.read(0, chunk_size).await.is_err());
+        assert_eq!(
+            fetcher.calls(),
+            calls_after_failure,
+            "a read after peer loss must fail without another fetch"
         );
     }
 }
