@@ -2,9 +2,10 @@
 
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError } from "@connectrpc/connect";
-import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
+import type { ConnectRouter } from "@connectrpc/connect";
 
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { requireUser } from "./require.ts";
 import { getDb } from "../db/client.ts";
 import {
   makePrRefStore,
@@ -28,13 +29,6 @@ export interface PrRefDeps {
   db?: ReturnType<typeof getDb>;
 }
 
-async function requireUser(
-  ctx: HandlerContext,
-  getSession: GetSession,
-): Promise<void> {
-  const session = await getSession(ctx.requestHeader);
-  if (!session) throw new ConnectError("unauthenticated", Code.Unauthenticated);
-}
 
 function toProto(row: PrRefRow): PrRef {
   return {

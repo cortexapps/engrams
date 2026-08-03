@@ -48,7 +48,7 @@
  */
 
 import { ConnectError, Code } from "@connectrpc/connect";
-import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
+import type { ConnectRouter } from "@connectrpc/connect";
 import { subject } from "@casl/ability";
 import { and, eq, exists, ilike, inArray, isNull, or, type SQL } from "drizzle-orm";
 
@@ -59,7 +59,7 @@ import type { Session } from "../gen/engram/app/v1/session_pb.ts";
 import { log as rootLog } from "../log.ts";
 import { abilityFor } from "../authz/ability.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
-import { isServiceAccountEmail } from "./api-key.ts";
+import { requireUser } from "./require.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
 import {
@@ -175,33 +175,6 @@ export function searchPattern(q: string): string {
   return `%${q.replace(/[\\%_]/g, "\\$&")}%`;
 }
 
-/** Extract request headers from a HandlerContext as a plain Headers object. */
-function headersOf(ctx: HandlerContext): Headers {
-  return ctx.requestHeader;
-}
-
-/**
- * Resolve the caller's better-auth session from the request headers.
- * Throws Unauthenticated if the session is absent.
- */
-async function requireUser(
-  ctx: HandlerContext,
-  getSession: GetSession,
-): Promise<{ id: string; role: string; serviceAccount: boolean }> {
-  const session = await getSession(headersOf(ctx));
-  if (!session) {
-    throw new ConnectError("unauthenticated", Code.Unauthenticated);
-  }
-  return {
-    id: session.user.id,
-    role: session.user.role ?? "user",
-    // A global API key resolves to its service-account owner (ADR 0086) —
-    // a PROGRAMMATIC principal: it has no per-user harness token, so task
-    // compilation must take the org-credential path even for "chat" tasks
-    // (the CI create-session smoke failed "not logged in" without this).
-    serviceAccount: isServiceAccountEmail(session.user.email ?? ""),
-  };
-}
 
 /**
  * Map a control-plane session status string to a task status string.

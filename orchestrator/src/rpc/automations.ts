@@ -1,6 +1,6 @@
 import { create } from "@bufbuild/protobuf";
 import { ConnectError, Code } from "@connectrpc/connect";
-import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
+import type { ConnectRouter } from "@connectrpc/connect";
 import { Cron } from "croner";
 
 import {
@@ -20,6 +20,7 @@ import {
   type WebhookSample as ProtoWebhookSample,
 } from "../gen/engram/app/v1/automation_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { requireAdmin } from "./require.ts";
 import {
   makeAutomationStore,
   type AutomationInput,
@@ -107,14 +108,6 @@ function assertWebhookFilter(filter: Record<string, unknown>): void {
   }
 }
 
-async function requireAdmin(ctx: HandlerContext, getSession: GetSession): Promise<string> {
-  const session = await getSession(ctx.requestHeader);
-  if (!session) throw new ConnectError("unauthenticated", Code.Unauthenticated);
-  if ((session.user.role ?? "user") !== "admin") {
-    throw new ConnectError("forbidden", Code.PermissionDenied);
-  }
-  return session.user.id;
-}
 
 function requiredText(value: string, field: string): string {
   const trimmed = value.trim();
@@ -492,7 +485,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
 
   router.service(AutomationService, {
     async createAutomation(req, ctx) {
-      const userId = await requireAdmin(ctx, getSession);
+      const userId = (await requireAdmin(ctx, getSession)).id;
       const input = await validateInput(req);
       return { automation: toProtoAutomation(await store.create(input, userId)) };
     },
@@ -706,7 +699,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
 
   router.service(WebhookRegistrationService, {
     async createWebhookRegistration(req, ctx) {
-      const userId = await requireAdmin(ctx, getSession);
+      const userId = (await requireAdmin(ctx, getSession)).id;
       const id = requiredText(req.id, "id");
       if (!REGISTRATION_ID_RE.test(id)) {
         throw new ConnectError(
