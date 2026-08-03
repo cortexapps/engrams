@@ -53,29 +53,46 @@ export interface BuiltinToolDeps {
 // Claude Code's Artifact tool)
 // ---------------------------------------------------------------------------
 
-const ArtifactActionSchema = z.discriminatedUnion("action", [
-  z.object({
-    action: z.literal("publish"),
-    file_path: z.string().describe("Path of the HTML or Markdown file in this session"),
+// One flat object schema, NOT a discriminated union: the claude CLI
+// requires every MCP tool's inputSchema to be a top-level
+// `type: "object"` JSON Schema, and rejects the WHOLE tools/list when
+// one tool emits an `anyOf` (session 3acf9bd1 — every injected tool
+// vanished). Per-action requirements live in the refinement so a bad
+// call still names the missing field.
+const ArtifactActionSchema = z
+  .object({
+    action: z
+      .enum(["publish", "update", "list", "get", "share", "unshare"])
+      .describe("What to do"),
+    file_path: z
+      .string()
+      .optional()
+      .describe("publish/update: path of the HTML or Markdown file in this session"),
+    artifact_id: z
+      .string()
+      .optional()
+      .describe("update/get/share/unshare: the artifact id"),
     title: z.string().optional().describe("Display title; defaults to the file name"),
-  }),
-  z.object({
-    action: z.literal("update"),
-    artifact_id: z.string(),
-    file_path: z.string().describe("Path of the new version's file in this session"),
-    title: z.string().optional(),
-  }),
-  z.object({
-    action: z.literal("list"),
     scope: z
       .enum(["mine", "shared"])
       .optional()
-      .describe('"mine" (default) or "shared" (artifacts shared with the org)'),
-  }),
-  z.object({ action: z.literal("get"), artifact_id: z.string() }),
-  z.object({ action: z.literal("share"), artifact_id: z.string() }),
-  z.object({ action: z.literal("unshare"), artifact_id: z.string() }),
-]);
+      .describe('list: "mine" (default) or "shared" (artifacts shared with the org)'),
+  })
+  .superRefine((v, ctx) => {
+    const need = (field: "file_path" | "artifact_id") => {
+      if (v[field] === undefined || v[field] === "") {
+        ctx.addIssue({
+          code: "custom",
+          path: [field],
+          message: `required for action "${v.action}"`,
+        });
+      }
+    };
+    if (v.action === "publish" || v.action === "update") need("file_path");
+    if (v.action === "update" || v.action === "get" || v.action === "share" || v.action === "unshare") {
+      need("artifact_id");
+    }
+  });
 
 const ToolArtifactSchema = z.object({
   id: z.string(),
@@ -214,6 +231,10 @@ export function registerBuiltinTools(
         };
       }
       const actor = { id: ctx.userId, role: "user" };
+      // The schema's refinement guarantees these per-action; the guards
+      // keep the narrowing honest without assertions.
+      const filePath = args.file_path ?? "";
+      const artifactId = args.artifact_id ?? "";
       try {
         switch (args.action) {
           case "publish": {
@@ -221,17 +242,17 @@ export function registerBuiltinTools(
               sessionId: ctx.sessionId,
               taskId: ctx.taskId ?? null,
               ownerUserId: ctx.userId,
-              filePath: args.file_path,
+              filePath,
               ...(args.title !== undefined ? { title: args.title } : {}),
             });
             return { artifact: toolArtifact(row, now()) };
           }
           case "update": {
             const row = await service.update(actor, {
-              artifactId: args.artifact_id,
+              artifactId,
               sessionId: ctx.sessionId,
               taskId: ctx.taskId ?? null,
-              filePath: args.file_path,
+              filePath,
               ...(args.title !== undefined ? { title: args.title } : {}),
             });
             return { artifact: toolArtifact(row, now()) };
@@ -249,14 +270,14 @@ export function registerBuiltinTools(
             };
           }
           case "get": {
-            const row = await service.get(actor, args.artifact_id);
+            const row = await service.get(actor, artifactId);
             return { artifact: toolArtifact(row, now()) };
           }
           case "share":
           case "unshare": {
             const row = await service.setVisibility(
               actor,
-              args.artifact_id,
+              artifactId,
               args.action === "share" ? "org" : "private",
             );
             return { artifact: toolArtifact(row, now()) };
