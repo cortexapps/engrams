@@ -164,14 +164,22 @@ jobs:
       # `build-images` is gated on `images`/`images_matrix`. If either output is
       # renamed the job silently stops running and a Dockerfile change is
       # unvalidated again — the exact hole this PR closes, reopened quietly.
-      # Assert the contract here rather than discovering it in production.
-      - name: Detector still names the images lane
+      #
+      # Assert the GITHUB_OUTPUT keys, NOT the human-readable stderr line. The
+      # detector emits the contract twice and the two forms differ: stderr
+      # prints the Python repr (`images=True`, `['web']`) while the real output
+      # is `images=true` and JSON `["web"]`. Grepping stderr would keep this
+      # step green through exactly the rename it exists to catch.
+      #
+      # GITHUB_OUTPUT is overridden for this one command so the job's own
+      # output file is untouched.
+      - name: Detector still emits the images lane contract
         run: |
-          printf 'docker/web.Dockerfile\n' \
-            | python3 .github/scripts/detect-rebake-lanes.py --stdin 2>&1 \
-            | tee /tmp/lanes.txt
-          grep -q 'images=True' /tmp/lanes.txt
-          grep -q "images_matrix=\['web'\]" /tmp/lanes.txt
+          env GITHUB_OUTPUT=/tmp/lanes.env python3 \
+            .github/scripts/detect-rebake-lanes.py --stdin \
+            <<< 'docker/web.Dockerfile'
+          grep -qx 'images=true' /tmp/lanes.env
+          grep -qx 'images_matrix=\["web"\]' /tmp/lanes.env
 
   integrations-cli:
     name: integrations CLI bundle
@@ -2203,8 +2211,15 @@ jobs:
           file: docker/${{ matrix.image }}.Dockerfile
           push: false
           load: false
-          cache-from: type=gha,scope=ci-${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=ci-${{ matrix.image }}
+          # NO `cache-to/from type=gha`, matching bake-images.yml — see the long
+          # comment there. That exporter round-trips to GitHub's real cache
+          # service from inside the Blacksmith microVM (~0.2 MB/s, ~24 min/job),
+          # and the repo had already blown past the hard 10 GB per-repo cap and
+          # begun evicting — which would take the `workspace-debug` rust-cache
+          # that lint/test-linux/test-e2e-stack depend on with it. The expensive
+          # layer here is a build-local `RUN --mount=type=cache` that BuildKit
+          # never exports to gha anyway; it stays warm through Blacksmith's
+          # colocated BuildKit cache.
 
   ci-gate:
     name: CI Gate
