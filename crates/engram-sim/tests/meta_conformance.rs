@@ -1943,12 +1943,11 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .await
         .unwrap();
 
-    // ADR 0101 C — a session at the `parked` STATUS (paused in place,
-    // sandbox bound). THE 2026-07-21 regression (session 61a03b7e): the
-    // hand-rolled SQL status list missed 'parked', the parked survivor
-    // vanished from the register-time rehydrate list after a host-agent
-    // roll, and the quarantine ladder destroyed its healthy paused VM
-    // (93 events rewound). Live G@3, no snapshots → G@3.
+    // ADR 0101 C: a session at the `parked` status has a paused, bound VM.
+    // A hand-written status list once missed `parked`, so the survivor was
+    // absent from the register-time rehydrate list after a host-agent roll.
+    // The list must include it so the host can re-serve its disk. Live G@3,
+    // no snapshots → G@3.
     let s_c_parked = meta
         .create_session(spec("conf:rehydrate-parked-status"))
         .await
@@ -2946,15 +2945,15 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     )
     .await
     .unwrap();
-    // ADR 0090: the durability-rollback marker is a coordinator fact that
-    // survives the very rewind it warns about — it must NOT tombstone.
+    // The durability-rollback marker records true node loss. It survives
+    // the disk rewind it reports, so it must not be tombstoned.
     meta.append_session_event(
         id,
         "durability_rollback",
         serde_json::json!({
             "sandbox_id": "sb-1",
             "rewind_disk_manifest": {"manifest_id": "00000000-0000-0000-0000-000000000000", "version": 3},
-            "reason": "quarantined-survivor evict budget exhausted; VM destroyed"
+            "reason": "host lost with unpublished disk writes; resumed from durable floor"
         }),
     )
     .await

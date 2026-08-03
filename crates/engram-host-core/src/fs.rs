@@ -7,11 +7,10 @@
 //! granularity; the exhaustively-constructed byte-level torn states stay in
 //! ADR 0099 H5's static tests).
 //!
-//! P5 wired the seam for real: `durable_record` and the shutdown spool take
-//! `&dyn HostFs` and perform every durable op through it (the sim's `CrashFs`
-//! intercepts at op boundaries). Flows not yet extracted pass the prod
-//! [`TokioFs`] at their wrappers — the seam lands with the flows that cross
-//! it.
+//! P5 wired the seam for real: `durable_record` takes `&dyn HostFs` and
+//! performs every durable operation through it. The simulator's `CrashFs`
+//! intercepts at operation boundaries. Flows not yet extracted pass the
+//! production [`TokioFs`] at their wrappers.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -56,11 +55,8 @@ pub trait HostFs: Send + Sync {
 
     /// Recursively remove `dir` and everything under it (`remove_dir_all`
     /// semantics). `NotFound` is surfaced — idempotent-tolerant callers
-    /// map it themselves, same convention as
-    /// [`remove_file`](HostFs::remove_file). Together with
-    /// [`create_dir`](HostFs::create_dir) this expresses the spool's
-    /// destructive replace-don't-merge window (remove_dir_all →
-    /// create_dir_all), which the write/rename ops alone cannot.
+    /// map it themselves, by the same convention as
+    /// [`remove_file`](HostFs::remove_file).
     async fn remove_dir(&self, dir: &Path) -> io::Result<()>;
 }
 

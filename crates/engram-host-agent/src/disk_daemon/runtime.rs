@@ -74,9 +74,8 @@ pub const NBD_BLOCK_SIZE: u64 = 4096;
 /// abandon sweep uses [`NbdHandle::abandon`], which skips `Drop`), and a
 /// disconnect from that path de-configures a surviving guest's live
 /// device — the successor's RECONFIGURE then meets "not configured" and
-/// the survivor becomes an uncapturable quarantine. The 2026-08-02 panic
-/// between the flush pass and the abandon sweep disconnected four
-/// survivors exactly this way. The decision itself is the pure
+/// the survivor disk stays unserved. The 2026-08-02 shutdown panic
+/// disconnected four survivors this way. The decision itself is the pure
 /// [`engram_host_core::nbd_drop_action`]; this flag is its process-global
 /// input.
 static SHUTDOWN_ABANDON_MODE: std::sync::atomic::AtomicBool =
@@ -922,23 +921,13 @@ pub(crate) async fn attach_manifest_content_with_dirty_file(
 /// `dead_conn_timeout`. (The pre-netlink rehydrate acquired a FRESH
 /// slot here, serving a device nobody read while the survivor's
 /// real device stayed dead.)
-/// On failure, returns the `NbdSlot` BACK to the caller (alongside the
-/// error) rather than dropping it. Dropping it would `release()` the
-/// survivor's device into the general pool — but the surviving FC may
-/// still hold an open fd to that exact `/dev/nbdN`, so a released device
-/// can be (a) DISCONNECTed by the startup stale-binding sweep or (b)
-/// handed to an unrelated session, in both cases turning a "recoverable
-/// later" survivor disk into immediate guest EIO. The caller PARKS the
-/// returned slot (quarantine) so it stays out of circulation until the
-/// evict_local → resume ladder recovers the session.
 pub async fn reattach_manifest(
     disk_manifest_ref: engram_core::types::manifest::ManifestRef,
     cache: engram_chunk_store::cache::ChunkCache,
     store: Arc<engram_chunk_store::ChunkStore>,
     slot: NbdSlot,
     threshold_bytes: u64,
-    seed_dirty: Option<Vec<(usize, Vec<u8>)>>,
-) -> Result<NbdSandboxState, (NbdSlot, NbdRuntimeError)> {
+) -> Result<NbdSandboxState, NbdRuntimeError> {
     reattach_manifest_inner(
         disk_manifest_ref,
         cache,
@@ -946,16 +935,30 @@ pub async fn reattach_manifest(
         slot,
         threshold_bytes,
         None,
-        seed_dirty,
+        &HostNbdKernel,
     )
     .await
+    .map_err(ReattachManifestError::into_runtime_error)
 }
 
-/// This structure groups the stable dirty file inputs for reattachment.
-pub(crate) struct DirtyTierSpec {
-    pub(crate) path: PathBuf,
-    pub(crate) mode: DirtyFileOpenMode,
-    pub(crate) seed: Option<Vec<(usize, Vec<u8>)>>,
+/// A survivor reattach failure, split at the durability boundary.
+/// A post-build failure keeps the recovered backend available so the
+/// caller can flush its dirty file before it destroys the sandbox.
+pub(crate) enum ReattachManifestError {
+    Build(NbdRuntimeError),
+    Reconfigure {
+        backend: Arc<ChunkedDiskBackend>,
+        slot: NbdSlot,
+        error: NbdRuntimeError,
+    },
+}
+
+impl ReattachManifestError {
+    fn into_runtime_error(self) -> NbdRuntimeError {
+        match self {
+            Self::Build(error) | Self::Reconfigure { error, .. } => error,
+        }
+    }
 }
 
 pub(crate) async fn reattach_manifest_with_dirty_file(
@@ -964,16 +967,17 @@ pub(crate) async fn reattach_manifest_with_dirty_file(
     store: Arc<engram_chunk_store::ChunkStore>,
     slot: NbdSlot,
     threshold_bytes: u64,
-    dirty_tier: DirtyTierSpec,
-) -> Result<NbdSandboxState, (NbdSlot, NbdRuntimeError)> {
+    dirty_file: (PathBuf, DirtyFileOpenMode),
+    kernel: &dyn NbdKernel,
+) -> Result<NbdSandboxState, ReattachManifestError> {
     reattach_manifest_inner(
         disk_manifest_ref,
         cache,
         store,
         slot,
         threshold_bytes,
-        Some((dirty_tier.path, dirty_tier.mode)),
-        dirty_tier.seed,
+        Some(dirty_file),
+        kernel,
     )
     .await
 }
@@ -985,14 +989,8 @@ async fn reattach_manifest_inner(
     slot: NbdSlot,
     threshold_bytes: u64,
     dirty_file: Option<(PathBuf, DirtyFileOpenMode)>,
-    // Shutdown-spool adoption (2026-07-16 RCA): the predecessor
-    // generation's acked-but-un-uploaded chunks, to seed the fresh
-    // backend's dirty tier. MUST be seeded before the RECONFIGURE
-    // below — the kernel releases the guest's parked I/O the moment
-    // it adopts our socket, and a read served before the seed would
-    // observe the rolled-back base instead of the acked bytes.
-    seed_dirty: Option<Vec<(usize, Vec<u8>)>>,
-) -> Result<NbdSandboxState, (NbdSlot, NbdRuntimeError)> {
+    kernel: &dyn NbdKernel,
+) -> Result<NbdSandboxState, ReattachManifestError> {
     // The kernel strcmp-verifies `NBD_ATTR_BACKEND_IDENTIFIER` against the
     // CONNECT-time value at RECONFIGURE (and REQUIRES one when the device
     // has it recorded) — but the connect-time value is a manifest id and
@@ -1012,12 +1010,10 @@ async fn reattach_manifest_inner(
     // The pure Flow B plan (ADR 0098 P7, `engram_host_core::reattach`):
     // resolve the RECONFIGURE backend identifier (echo the kernel's own
     // recorded value via the seam, else fall back to the ref's manifest id)
-    // and lay out the seed-then-RECONFIGURE ordering as explicit steps.
-    let kernel = HostNbdKernel;
+    // and lay out the RECONFIGURE step with that identifier.
     let plan = engram_host_core::plan_reattach(
         disk_manifest_ref.manifest_id,
         kernel.backend_identifier(slot.path()),
-        seed_dirty.is_some(),
     );
     if plan.used_identifier_fallback {
         tracing::warn!(
@@ -1050,164 +1046,51 @@ async fn reattach_manifest_inner(
             }
             Arc::new(backend)
         }
-        Err(e) => return Err((slot, e.into())),
+        Err(error) => return Err(ReattachManifestError::Build(error.into())),
     };
-    // Verify-on-read probe target (ADR 0098 P7 rider): the first seeded chunk,
-    // captured BEFORE `adopt_unflushed` consumes the seed vec. `None` unless a
-    // spool was adopted (and non-empty), so a clean rehydrate pays nothing.
-    let probe: Option<(usize, Vec<u8>)> =
-        engram_host_core::first_seeded_probe(seed_dirty.as_deref())
-            .map(|(idx, bytes)| (idx, bytes.to_vec()));
-    // Execute the PLAN's steps in the plan's own order (issue #810 finding
-    // 1a). The previous shape hand-ordered these calls and carried a
-    // `debug_assert!(plan.seed_precedes_reconfigure())` — a release no-op
-    // that checked the PLAN's internal order, not the driver's execution
-    // order, so a future driver reorder would have silently reintroduced
-    // the 2026-07-16 rolled-back-base read window. Iterating `plan.steps`
-    // makes the ordering structurally unbypassable (the ReapList lesson):
-    // the driver cannot reorder what it does not sequence.
-    // (The error is captured and returned ONCE below the loop — `slot` moves
-    // into the park-shaped `Err((slot, e))`, which the borrow checker rightly
-    // refuses inside a loop that reads `slot.path()` on later iterations.)
-    let mut seed_dirty = seed_dirty;
-    let mut handle = None;
-    let mut step_err: Option<NbdRuntimeError> = None;
-    'steps: for step in &plan.steps {
-        match step {
-            engram_host_core::ReattachStep::SeedDirtyTier => {
-                let chunks = seed_dirty.take().expect(
-                    "plan_reattach emits SeedDirtyTier iff a seed exists (host-core pinned)",
-                );
-                let count = chunks.len();
-                // #810: adoption is ATOMIC and fallible — one out-of-shape
-                // chunk refuses the whole spool (adopting a subset silently
-                // rolls back the missing chunk's acked write). Refusal parks
-                // the survivor with the spool preserved on disk.
-                let bytes = match backend.adopt_unflushed(chunks).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        step_err = Some(NbdRuntimeError::Io(io::Error::other(format!(
-                            "rehydrate: spool adoption refused; parking the survivor \
-                             rather than serving with rolled-back acked writes: {e}"
-                        ))));
-                        break 'steps;
-                    }
-                };
-                tracing::info!(
-                    device = %slot.path().display(),
-                    chunks = count,
-                    bytes,
-                    "rehydrate: adopted predecessor's shutdown-spool dirty chunks \
-                     ahead of RECONFIGURE",
-                );
+    let handle =
+        match reattach_with_kernel(backend.clone(), slot.path(), &plan.backend_id, kernel).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                return Err(ReattachManifestError::Reconfigure {
+                    backend,
+                    slot,
+                    error,
+                });
             }
-            engram_host_core::ReattachStep::VerifySeed => {
-                // Verify-on-read (ADR 0098 P7 rider): prove the seeded acked
-                // bytes are readable at their offset through the backend the
-                // RECONFIGURE below is about to hand the kernel — a
-                // single-chunk probe (a dirty-tier read), NOT a
-                // full-disk scan (latency is non-negotiable). This step runs
-                // strictly BEFORE Reconfigure: the kernel releases the
-                // guest's parked I/O the instant it adopts our socket, so a
-                // post-RECONFIGURE probe races the live guest's own writes to
-                // the probed (hottest) chunk — the 2026-07-21 incident parked
-                // and destroyed a healthy, actively-writing survivor on every
-                // host roll this way, rewinding the very acked writes the
-                // spool preserved. A mismatch here means the adoption did not
-                // land in the backend about to be served; park the survivor
-                // with the KERNEL CONFIG UNTOUCHED (still dead-parked), so a
-                // later rehydrate attempt can still recover the device. The
-                // device-plane O_DIRECT check is the FC regression lane's job.
-                let Some((idx, expected)) = probe.as_ref() else {
-                    // An adopted-but-empty spool seeds nothing to verify.
-                    continue;
-                };
-                let idx = *idx;
-                let chunk_size = backend.chunk_size();
-                let offset = idx as u64 * chunk_size;
-                // Clamp the read to the device extent: the final chunk (or a
-                // device smaller than one chunk — e.g. the 4 MiB test images)
-                // is shorter than chunk_size, and reading a full chunk_size
-                // there overruns total_bytes and errors. `probe_matches` is a
-                // prefix compare, so a full (possibly-partial) chunk read is
-                // enough to prove the seeded bytes would be served.
-                let read_len = chunk_size.min(backend.total_bytes().saturating_sub(offset));
-                match backend.read(offset, read_len).await {
-                    Ok(bytes) if engram_host_core::probe_matches(&bytes, expected) => {}
-                    Ok(_) => {
-                        step_err = Some(NbdRuntimeError::Io(io::Error::other(format!(
-                            "verify-on-read: {} backend read of seeded chunk {idx} did \
-                             not return the adopted acked bytes (seed failed to land); \
-                             parking the survivor with the kernel config untouched",
-                            slot.path().display(),
-                        ))));
-                        break 'steps;
-                    }
-                    Err(e) => {
-                        step_err = Some(NbdRuntimeError::Io(io::Error::other(format!(
-                            "verify-on-read: {} readback of seeded chunk {idx} failed \
-                             before RECONFIGURE: {e}",
-                            slot.path().display(),
-                        ))));
-                        break 'steps;
-                    }
-                }
-            }
-            engram_host_core::ReattachStep::Reconfigure => {
-                match reattach(backend.clone(), slot.path(), &plan.backend_id).await {
-                    Ok(h) => handle = Some(h),
-                    Err(e) => {
-                        step_err = Some(e);
-                        break 'steps;
-                    }
-                }
-                // #810 finding 1b (hygiene half): fresh CONNECT invalidates
-                // the reused minor's page cache (the 85e0298a cross-tenant
-                // class, documented at `attach_backend`) — but the reattach
-                // path never did, leaving the PREDECESSOR GENERATION's
-                // cached pages as exactly the stale view a surviving guest
-                // must never read. Same hard-error posture as CONNECT:
-                // serving without the invalidation risks silent corruption,
-                // strictly worse than a parked survivor.
-                let dev = slot.path().to_path_buf();
-                if let Err(e) = tokio::task::spawn_blocking(move || flush_block_device_cache(&dev))
-                    .await
-                    .map_err(|e| io::Error::other(format!("BLKFLSBUF task join: {e}")))
-                    .and_then(|r| r)
-                {
-                    step_err = Some(NbdRuntimeError::Io(io::Error::other(format!(
-                        "invalidate page cache (BLKFLSBUF) on reattached {}: {e}",
-                        slot.path().display()
-                    ))));
-                    break 'steps;
-                }
-            }
-        }
-    }
-    if let Some(e) = step_err {
+        };
+    // A reattached minor can still hold the predecessor generation's cached
+    // pages. Invalidate them before the caller serves the survivor.
+    let dev = slot.path().to_path_buf();
+    if let Err(e) = tokio::task::spawn_blocking(move || flush_block_device_cache(&dev))
+        .await
+        .map_err(|e| io::Error::other(format!("BLKFLSBUF task join: {e}")))
+        .and_then(|r| r)
+    {
         // A step can fail AFTER the RECONFIGURE handed the kernel our socket
-        // (today: the BLKFLSBUF invalidation). Dropping the handle would
+        // during the BLKFLSBUF invalidation. Dropping the handle would
         // netlink-DISCONNECT the device — immediate EIO for the surviving
-        // guest the park exists to protect (2026-07-21: exactly this drop
-        // disconnected a parked survivor's device out from under its FC and
-        // then confused the startup classification barrier). Abandon the
+        // guest. Abandon the
         // serve loop instead: the kernel observes a dead connection and
         // re-parks guest I/O under `dead_conn_timeout`, keeping the survivor
-        // recoverable (a later rehydrate attempt or the evict_local → resume
-        // ladder). Nothing serves reads meanwhile, so the failed
+        // recoverable. Nothing serves reads meanwhile, so the failed
         // invalidation cannot leak stale pages to the guest.
-        if let Some(h) = handle {
-            tracing::warn!(
-                device = %slot.path().display(),
-                "reattach step failed after RECONFIGURE; abandoning the serve \
-                 loop in place (no netlink disconnect) so the kernel re-parks \
-                 guest I/O instead of EIO-ing the survivor",
-            );
-            h.abandon();
-        }
-        return Err((slot, e));
+        tracing::warn!(
+            device = %slot.path().display(),
+            "reattach step failed after RECONFIGURE; abandoning the serve \
+             loop in place (no netlink disconnect) so the kernel re-parks \
+             guest I/O instead of EIO-ing the survivor",
+        );
+        handle.abandon();
+        return Err(ReattachManifestError::Reconfigure {
+            backend,
+            error: NbdRuntimeError::Io(io::Error::other(format!(
+                "invalidate page cache (BLKFLSBUF) on reattached {}: {e}",
+                slot.path().display()
+            ))),
+            slot,
+        });
     }
-    let handle = handle.expect("plan_reattach always emits Reconfigure (host-core pinned)");
     Ok(NbdSandboxState {
         scheduler: None,
         backend,
@@ -1321,6 +1204,15 @@ pub async fn reattach(
     nbd_device: &Path,
     backend_id: &str,
 ) -> Result<NbdHandle, NbdRuntimeError> {
+    reattach_with_kernel(backend, nbd_device, backend_id, &HostNbdKernel).await
+}
+
+async fn reattach_with_kernel(
+    backend: Arc<ChunkedDiskBackend>,
+    nbd_device: &Path,
+    backend_id: &str,
+    kernel: &dyn NbdKernel,
+) -> Result<NbdHandle, NbdRuntimeError> {
     let budget = std::time::Duration::from_secs(150);
     let started = crate::time_source::metrics_now();
     let mut attempt = 0u32;
@@ -1331,7 +1223,7 @@ pub async fn reattach(
             nbd_device,
             backend_id,
             ConnectMode::Reconfigure,
-            &HostNbdKernel,
+            kernel,
         )
         .await?;
         // An adopted socket stays open (the kernel holds its dup); a

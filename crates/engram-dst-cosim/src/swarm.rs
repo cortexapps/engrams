@@ -388,9 +388,10 @@ impl CosimSwarm {
     }
 
     /// The every-step standing oracles (deliverable 3): severed-live-holder
-    /// (#806), no-plane-leak (slot-accounting), and the cross-boundary
-    /// ACTIVE-serve ownership split-brain guard. The idle⇒durable-snapshot
-    /// (#570) oracle is asserted at QUIESCENCE instead: the D5 fast path marks
+    /// (#806), no-plane-leak (slot-accounting), the cross-boundary ACTIVE-serve
+    /// ownership split-brain guard, and zero durability rollback events. The
+    /// idle⇒durable-snapshot (#570) oracle is asserted at QUIESCENCE instead:
+    /// the D5 fast path marks
     /// Idle BEFORE the async finalize lands the durable snapshot row (a real
     /// production window — the heartbeat reconcile lands it), so the property is
     /// "the COMPLETED eviction is durable," which #570's own directed test
@@ -401,6 +402,18 @@ impl CosimSwarm {
         self.sim.assert_quarantine_reconnectable().await?;
         self.sim.assert_slot_accounting().await?;
         self.sim.assert_ownership_agreement().await?;
+        if let Some((session_id, idx)) = self.sim.world.meta.with_db(|db| {
+            db.session_events.iter().find_map(|(session_id, events)| {
+                events
+                    .iter()
+                    .find(|event| event.kind == "durability_rollback")
+                    .map(|event| (*session_id, event.idx))
+            })
+        }) {
+            return Err(format!(
+                "ADR 0110: session {session_id} has a durability_rollback event at index {idx}"
+            ));
+        }
         Ok(())
     }
 
@@ -409,11 +422,10 @@ impl CosimSwarm {
     /// convergence — every session terminal-or-stable, every device classified,
     /// within bounded rounds — and re-check the standing oracles.
     async fn quiesce(&mut self) -> Result<(), String> {
-        // Wave 7b (#784): heal the record-loss fault globally (the operator/runbook
-        // reconcile the `rehydrate-unknown-device` alert drives, applied to every
-        // survivor at quiescence like every other healed fault) so the rehydrate
-        // below re-serves every survivor. A quarantined slot MUST reach a terminal
-        // disposition (served or reaped) within bounded rounds, never wedge.
+        // Wave 7b (#784): heal the modeled record-loss fault globally, as with
+        // every other healed fault at quiescence. The rehydrate pass below then
+        // re-serves every survivor. A quarantined slot must reach a terminal
+        // disposition (served or reaped) within bounded rounds and must not wedge.
         self.sim.heal_all_records().await;
         // A fresh host generation with a clean rehydrate re-serves every
         // survivor whose session still reserves host memory.

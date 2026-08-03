@@ -1,9 +1,15 @@
 # 0076 — engram-substrated: one host data-plane daemon (design only)
 
-Status: Proposed (2026-07-06) — **implementation gated; see below**
+Status: Superseded by [ADR 0110](0110-honest-flush-acked-writes-survive-process-death.md) (2026-08-03)
 
-Issue: #547 delivers this document as an artifact. Flipping it to
-Accepted is NOT in that epic's scope.
+This design kept dirty state alive by keeping a process alive.
+ADR 0110 keeps it alive by putting it in files: the per-sandbox dirty
+file survives any process death, so a lifecycle-decoupled data-plane
+daemon is no longer needed for durability. The daemon's other
+motivations (one shared NVMe-cache owner, one epoll over N uffds) can
+be revisited on their own merits if they ever matter operationally.
+
+Issue: #547 delivered this document as an artifact.
 
 ## The end state
 

@@ -56,9 +56,8 @@ pub use finalize::{plan_finalize_retry, FinalizeRetry, FinalizeStage};
 pub use fs::{HostFs, TokioFs};
 pub use nbd::{ConnectedDevice, NbdConnectRequest, NbdKernel, NbdReconfigureRequest};
 pub use reattach::{
-    first_seeded_probe, is_local_survivor_candidate, plan_reattach, probe_matches,
-    resume_data_plane_served, sweep_verdict, DeviceHolder, PidLiveness, ReattachPlan, ReattachStep,
-    SweepAction,
+    is_local_survivor_candidate, plan_reattach, resume_data_plane_served, sweep_verdict,
+    DeviceHolder, PidLiveness, ReattachPlan, ReattachStep, SweepAction,
 };
 pub use startup::{
     classify_startup_slot, classify_startup_slots, ReapList, SlotClass, StartupClassification,
@@ -68,8 +67,4 @@ pub use survivor::{
     plan_capture_disk_drain, plan_resume_attach, CaptureDrainPlan, ResumeAttachPlan,
 };
 
-pub use shutdown::{
-    admits_new_plane, classify_survivor, flush_budget, is_straggler, nbd_drop_action,
-    plan_shutdown, FlushProbe, NbdDropAction, ShutdownPlan, ShutdownStage, SurvivorAction,
-    DEFAULT_FLUSH_BUDGET_SECS,
-};
+pub use shutdown::{nbd_drop_action, NbdDropAction};

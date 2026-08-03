@@ -339,30 +339,21 @@ pub enum SessionEvent {
         cause: RecoveryCause,
         at: DateTime<Utc>,
     },
-    /// ADR 0090 (2026-07-20 durability-rollback incident): a
-    /// quarantined-survivor eviction exhausted its retry budget, so the
-    /// coordinator DESTROYED the structurally-crippled VM. The session then
-    /// converges HostLost → Idle and its NEXT resume rewinds to the last
-    /// published disk manifest — silently discarding any guest writes the
-    /// host acked but never uploaded past that manifest version (the
-    /// incident: 134/100/50 MiB tails across three sessions, previously
-    /// inferable only by hand-diffing host spool logs against manifest
-    /// versions). This event makes that data loss LOUD and durable so the
-    /// web timeline / CLI can surface it and alerting can key on it.
-    /// Coordinator-authoritative — it records a fact the destroy already
-    /// made true, so it survives the very rewind it warns about
+    /// A true node loss rolled the guest disk back. The host died with
+    /// unpublished writes, and the session resumed from its durable floor.
+    /// This event makes the data loss visible and durable so the web
+    /// timeline, CLI, and alerts can report it. It is a
+    /// coordinator-authoritative fact, so it survives the rewind it records
     /// (`rewind_session_to_cursor` EXCLUDES this kind from its tombstone
     /// UPDATE, like the other control-plane facts).
     DurabilityRollback {
-        /// The crippled sandbox the coordinator destroyed.
+        /// The sandbox that ran on the lost node.
         sandbox_id: SandboxId,
-        /// The last published disk manifest the next resume rewinds to
-        /// (the session's `live_disk_manifest`). `None` when the session
-        /// never got a live publish — the resume falls back to the
-        /// snapshot's disk lineage.
+        /// The disk manifest used as the durable floor. `None` when the
+        /// session had no live publish and used the snapshot disk lineage.
         rewind_disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
-        /// Human-readable cause (e.g. "quarantined-survivor evict budget
-        /// exhausted; VM destroyed").
+        /// Human-readable cause (for example, "host lost with unpublished
+        /// disk writes; resumed from durable floor").
         reason: String,
         at: DateTime<Utc>,
     },

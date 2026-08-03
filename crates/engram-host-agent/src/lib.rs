@@ -31,7 +31,6 @@ pub mod capture_job;
 pub mod checkpoint;
 pub mod config;
 pub mod coord_client;
-pub mod device_sync;
 pub mod dirty_map;
 pub mod disk_daemon;
 pub mod durable_envelope;
@@ -534,32 +533,6 @@ impl HostAgent {
                             tracing::warn!(error = %e,
                                 "teardown reconcile: list() failed; skipping tick");
                         }
-                    }
-                });
-            }
-
-            // 2026-08-02 durability-rollback RCA: the quarantined-survivor
-            // rehydrate retry loop. A survivor whose register-time
-            // rehydrate failed used to stay quarantined until the
-            // coordinator's evict ladder DESTROYED it (the rollback);
-            // now the host keeps re-attempting the re-serve, and the
-            // coordinator's parked quarantine op converges losslessly
-            // once a retry lands. The loop is a thin cadence wrapper;
-            // `retry_quarantined_rehydrates_once` is the run_once step
-            // (ADR 0098). Skips are cheap when the map is empty.
-            #[cfg(target_os = "linux")]
-            {
-                const QUARANTINE_REHYDRATE_RETRY_INTERVAL: std::time::Duration =
-                    std::time::Duration::from_secs(30);
-                let pooled_for_rehydrate_retry = pooled.clone();
-                tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(QUARANTINE_REHYDRATE_RETRY_INTERVAL);
-                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    loop {
-                        tick.tick().await;
-                        pooled_for_rehydrate_retry
-                            .retry_quarantined_rehydrates_once()
-                            .await;
                     }
                 });
             }
@@ -1482,10 +1455,6 @@ impl HostAgent {
                         stages_images: stages_images_for_heartbeat,
                         capabilities,
                         capture_job_reports,
-                        // ADR 0090: re-advertised until the sandbox is
-                        // destroyed; the coord enqueues evict_local (the op
-                        // layer dedups repeats).
-                        quarantined_survivors: pooled_for_heartbeat.quarantined_survivors(),
                         // ADR 0091: control-plane-dead guests; the coord
                         // flips their sessions Active → Unreachable.
                         unreachable_guests: pooled_for_heartbeat.unreachable_guests(),
@@ -1708,46 +1677,9 @@ impl HostAgent {
             // dead_conn_timeout until the successor reconfigures.
             #[cfg(target_os = "linux")]
             {
-                // Issue #225: BEFORE abandoning the data planes, run a
-                // bounded final disk-flush pass. ADR 0110 note: acked
-                // writes now survive process death in the per-sandbox
-                // dirty file, so this pass no longer guards against
-                // rollback — it keeps the published manifest fresh so
-                // the successor's recovery has less to upload. It
-                // retires per the ADR 0110 rollout. The pass drains +
-                // uploads each survivor's dirty chunks and synchronously
-                // republishes its live_disk_manifest so the successor
-                // rehydrates from the current ref. It is budgeted against
-                // the pod's terminationGracePeriodSeconds (minus headroom
-                // for the abandon sweep + detach below); on overrun it
-                // logs the still-dirty survivors loudly and proceeds. The
-                // budget parse+default is the pure `plan_shutdown` decision
-                // (ADR 0098 P4, Flow A) so the simulator drives the same
-                // deadline arithmetic.
-                let plan = engram_host_core::plan_shutdown(
-                    std::env::var("ENGRAM_SHUTDOWN_FLUSH_BUDGET_SECS")
-                        .ok()
-                        .and_then(|v| v.parse::<f64>().ok()),
-                );
-                // 2026-08-02 durability-rollback RCA: the flush pass is
-                // best-effort GCS durability; the abandon sweep + spool
-                // export below are the survivors' correctness backstop. A
-                // panic here (the #969 JoinHandle re-poll fired at exactly
-                // this point) must therefore never unwind past the sweep —
-                // isolate it and continue the ladder.
-                shutdown_stage_unwind_isolated(
-                    "final_flush",
-                    pooled.flush_nbd_data_planes_for_shutdown(plan.flush_deadline),
-                )
-                .await;
-                // The abandon sweep also exports any still-un-uploaded
-                // dirty chunks to the node-local shutdown spool (2026-07-16
-                // session-85e0298a RCA) so the successor adopts them
-                // instead of rolling the live guest's disk back. Unwind-
-                // isolated for the same reason as the flush pass: a panic
-                // mid-sweep must still reach the detach step, and the
-                // shutdown-abandon mode keeps the un-swept remainder's
-                // kernel configs alive at process exit.
+                // A panic in the abandon sweep must not skip the detach step.
+                // The terminal abandon mode keeps any remaining kernel
+                // configurations alive at process exit.
                 let abandoned = shutdown_stage_unwind_isolated(
                     "abandon_sweep",
                     pooled.abandon_nbd_data_planes_for_shutdown(),
@@ -1810,18 +1742,10 @@ fn stages_images_gate(has_chunk_store: bool, has_chunk_cache: bool) -> bool {
     has_chunk_store && has_chunk_cache
 }
 
-/// 2026-08-02 durability-rollback RCA: run one SIGTERM shutdown-ladder
-/// stage with panic isolation. A panic between the flush pass and the
-/// abandon sweep unwound `main` on 2026-08-02, netlink-disconnected every
-/// survivor's device, and skipped the shutdown-spool export — the acked
-/// writes were unrecoverable and the coordinator destroyed the survivors.
-/// The ladder's later rungs (abandon, spool export, detach) are the
-/// durability backstop for the earlier ones, so no rung may unwind past
-/// them. Returns `None` when the stage panicked; the caller continues the
-/// ladder with the stage's effects partially applied — every rung is
-/// written to tolerate that (the sweep drains whatever is left in the
-/// map; the flag guard on `NbdHandle::Drop` covers what the unwind
-/// already dropped).
+/// Run one SIGTERM shutdown stage with panic isolation. Returns `None` when
+/// the stage panics so the caller can continue to detach the surviving VMs.
+/// The abandon sweep drains what remains in the map, and the drop guard keeps
+/// kernel NBD configurations alive during an unwind.
 ///
 /// `AssertUnwindSafe` is sound here: the shared state a panicked stage
 /// can leave behind (the data-plane map, dirty tiers) is exactly the
@@ -1847,8 +1771,7 @@ async fn shutdown_stage_unwind_isolated<T>(
             tracing::error!(
                 stage,
                 panic = %panic_msg,
-                "SIGTERM shutdown stage PANICKED; contained — the ladder \
-                 continues so the abandon sweep + spool export still run",
+                "SIGTERM shutdown stage PANICKED; contained so detach can continue",
             );
             ::metrics::counter!(crate::metrics::SHUTDOWN_STAGE_PANIC_TOTAL).increment(1);
             None
@@ -1976,14 +1899,12 @@ mod tests {
     use engram_core::SessionId;
 
     /// 2026-08-02 durability-rollback RCA regression: a panic inside a
-    /// shutdown-ladder stage must be contained (return `None`), never
-    /// propagate — the abandon sweep + spool export run after it.
+    /// shutdown stage must be contained (return `None`) and never propagate.
     #[tokio::test]
     async fn shutdown_stage_panic_is_contained() {
-        let out: Option<()> = shutdown_stage_unwind_isolated("test_stage", async {
-            panic!("boom in the flush pass")
-        })
-        .await;
+        let out: Option<()> =
+            shutdown_stage_unwind_isolated("test_stage", async { panic!("boom in shutdown") })
+                .await;
         assert_eq!(out, None, "a panicked stage yields None, not an unwind");
     }
 

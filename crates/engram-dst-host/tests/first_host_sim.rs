@@ -1,13 +1,8 @@
 //! The first host-internal sims (ADR 0098 Phase 2, P2): calm+chaos smoke
 //! over a seed range, plus the two determinism self-checks.
 //!
-//! Sizing: each step drives the REAL shutdown-spool machinery, whose per-op
-//! `fsync`s make the sim I/O-wait bound (not CPU bound) — so these in-CI
-//! tests prove the property (acked-write durability + replay determinism)
-//! over a modest seed×step budget, and the broad net is the release swarm
-//! (`just sim-host-swarm 0..50 400`, the P9 CI lane). Calm and chaos are
-//! split into separate `#[test]` fns so nextest overlaps their fsync waits
-//! across cores (AGENTS.md: size a test to the property, minimize CI time).
+//! These tests prove acked-write durability and replay determinism over a
+//! small seed and step budget. The release swarm provides the broad run.
 
 use engram_dst_host::{Profile, Sim};
 
@@ -31,8 +26,7 @@ async fn run_smoke(seed: u64, profile: Profile, steps: u64) {
     assert_eq!(report.steps_run, steps);
 }
 
-/// Calm profile: pure guest workload + flush/spool machinery, no crashes.
-/// Every seed recovers every acked write across the quiesce crash cycle.
+/// Run the guest and flush baseline without generated process deaths.
 #[tokio::test(start_paused = true)]
 async fn acked_write_durability_holds_calm() {
     for seed in 0..SMOKE_SEEDS {
@@ -40,9 +34,7 @@ async fn acked_write_durability_holds_calm() {
     }
 }
 
-/// Chaos profile: process crash/restart interleavings on top of the
-/// workload. The shipped spool-then-die + rebuild+adopt machinery must
-/// recover every acked write at every crash→restart.
+/// Add Linux process death and dirty-file recovery to the workload.
 #[tokio::test(start_paused = true)]
 async fn acked_write_durability_holds_chaos() {
     for seed in 0..SMOKE_SEEDS {

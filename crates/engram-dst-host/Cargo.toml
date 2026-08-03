@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The host-internal deterministic simulator (ADR 0098 Phase 2, P2): a seeded step scheduler driving the PORTABLE host-agent machinery (ChunkedDiskBackend, the shutdown spool) over engram-host-core's HostEffects seams, with the acked-write durability oracle."
+description = "The host-internal deterministic simulator for host-agent lifecycle and dirty-file recovery."
 
 [lints]
 workspace = true

@@ -20,35 +20,9 @@
 
 use uuid::Uuid;
 
-/// One ordered step of the survivor-rehydrate sequence. Declaration order is
-/// the required execution order: the predecessor's shutdown-spool dirty tier
-/// MUST be adopted BEFORE the RECONFIGURE, because the kernel releases the
-/// guest's parked I/O the instant it adopts our serve socket — a read served
-/// between RECONFIGURE and the seed would observe the rolled-back base
-/// instead of the acked bytes (the seed-dirty-before-RECONFIGURE ordering the
-/// 2026-07-16 RCA made load-bearing). The verify probe sits strictly between
-/// the two for the same reason, mirrored: once the RECONFIGURE releases the
-/// guest, the guest's own writes race any content check.
+/// One ordered step of the survivor-rehydrate sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReattachStep {
-    /// Adopt the predecessor's acked-but-un-uploaded chunks into the fresh
-    /// backend's dirty tier. Present only when a spool was carried over.
-    SeedDirtyTier,
-    /// Verify-on-read (ADR 0098 P7 rider): probe the first seeded chunk
-    /// through the backend and require the adopted acked bytes back. Present
-    /// only when a spool was carried over, and strictly BEFORE `Reconfigure`:
-    /// the kernel releases the guest's parked I/O the moment it adopts our
-    /// socket, so a post-RECONFIGURE probe races the live guest's own writes
-    /// to the probed chunk — and the probed (first-spooled) chunk is exactly
-    /// the guest's hottest. 2026-07-21 incident: on four consecutive host
-    /// rolls, every survivor with a non-empty spool had its probe read back
-    /// the guest's fresh post-resume write, mis-read it as a rolled-back
-    /// base, and a healthy VM was parked, destroyed, and rewound — the
-    /// acked-write loss was manufactured by the guard itself. Pre-RECONFIGURE
-    /// the probe is race-free by construction, and a failure parks the
-    /// survivor with the kernel config untouched (still dead-parked, so a
-    /// later rehydrate attempt can still recover the device).
-    VerifySeed,
     /// `NBD_CMD_RECONFIGURE`: hand the kernel the fresh serve socket, which
     /// releases the parked guest I/O.
     Reconfigure,
@@ -58,7 +32,7 @@ pub enum ReattachStep {
 /// backend identifier (with the fallback flagged for the warn) plus the
 /// ordered steps. The survivor's device + geometry are NOT part of the plan
 /// — they are the caller's already-claimed slot; the only decisions are the
-/// identifier resolution and the seed-before-RECONFIGURE ordering.
+/// identifier resolution and the reconfigure operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReattachPlan {
     /// The identifier handed to `NBD_CMD_RECONFIGURE` (the kernel
@@ -71,95 +45,21 @@ pub struct ReattachPlan {
     pub steps: Vec<ReattachStep>,
 }
 
-impl ReattachPlan {
-    /// The invariant the whole flow turns on: whenever a seed is present it is
-    /// adopted strictly BEFORE the RECONFIGURE. Always true for a
-    /// [`plan_reattach`] output — the assertion is the point (a future edit
-    /// that reorders the steps trips this).
-    pub fn seed_precedes_reconfigure(&self) -> bool {
-        match (
-            self.steps
-                .iter()
-                .position(|s| *s == ReattachStep::SeedDirtyTier),
-            self.steps
-                .iter()
-                .position(|s| *s == ReattachStep::Reconfigure),
-        ) {
-            (Some(seed), Some(reconfigure)) => seed < reconfigure,
-            // No seed → the ordering constraint is vacuous.
-            (None, _) => true,
-            // Reconfigure is always present; this arm is unreachable.
-            (Some(_), None) => false,
-        }
-    }
-
-    /// The 2026-07-21 companion invariant: the verify probe runs strictly
-    /// BETWEEN the seed and the RECONFIGURE — after the seed so there is
-    /// something to verify, before the RECONFIGURE so it can never race the
-    /// guest I/O the RECONFIGURE releases. A seed without a probe is a
-    /// coverage hole; a probe without a seed has nothing to check.
-    pub fn verify_between_seed_and_reconfigure(&self) -> bool {
-        let pos = |step: ReattachStep| self.steps.iter().position(|s| *s == step);
-        match (
-            pos(ReattachStep::SeedDirtyTier),
-            pos(ReattachStep::VerifySeed),
-            pos(ReattachStep::Reconfigure),
-        ) {
-            (Some(seed), Some(verify), Some(reconfigure)) => seed < verify && verify < reconfigure,
-            // No seed → no probe (it is gated on adoption).
-            (None, verify, _) => verify.is_none(),
-            // A seed with a missing probe or a missing Reconfigure never
-            // comes out of `plan_reattach`.
-            (Some(_), None, _) | (Some(_), Some(_), None) => false,
-        }
-    }
-}
-
 /// The pure reattach decision core. Resolves the backend identifier the way
 /// `reattach_manifest` must (echo the kernel's own recorded value, else fall
 /// back to the rehydrate ref's manifest id — the 2026-07-13 dfa0face fix:
 /// re-deriving from the live ref EINVAL'd every forked-chain survivor) and
-/// lays out the seed-then-RECONFIGURE ordering as explicit steps.
-pub fn plan_reattach(
-    ref_manifest_id: Uuid,
-    kernel_backend_id: Option<String>,
-    has_seed: bool,
-) -> ReattachPlan {
+/// emits the reconfigure step.
+pub fn plan_reattach(ref_manifest_id: Uuid, kernel_backend_id: Option<String>) -> ReattachPlan {
     let (backend_id, used_identifier_fallback) = match kernel_backend_id {
         Some(id) => (id, false),
         None => (ref_manifest_id.to_string(), true),
     };
-    let mut steps = Vec::with_capacity(3);
-    if has_seed {
-        steps.push(ReattachStep::SeedDirtyTier);
-        steps.push(ReattachStep::VerifySeed);
-    }
-    steps.push(ReattachStep::Reconfigure);
     ReattachPlan {
         backend_id,
         used_identifier_fallback,
-        steps,
+        steps: vec![ReattachStep::Reconfigure],
     }
-}
-
-/// The first seeded chunk to probe at the [`ReattachStep::VerifySeed`] step
-/// (verify-on-read rider): `(chunk_index, expected_bytes)`. `None` when no
-/// spool was adopted (or the spool carried zero chunks) — the probe is gated
-/// on adoption so a clean (no-seed) rehydrate pays nothing. Picking the FIRST
-/// seeded chunk (not a full-disk scan) keeps the probe a single in-RAM read:
-/// latency is non-negotiable.
-pub fn first_seeded_probe(seed_dirty: Option<&[(usize, Vec<u8>)]>) -> Option<(usize, &[u8])> {
-    seed_dirty
-        .and_then(|chunks| chunks.first())
-        .map(|(idx, bytes)| (*idx, bytes.as_slice()))
-}
-
-/// The verify-on-read comparison: the bytes the backend read back for the
-/// probed chunk must equal the seeded acked bytes (not the rolled-back base).
-/// A prefix compare (`read_back` may be padded to the block size) — the seed
-/// content is the authority on length.
-pub fn probe_matches(read_back: &[u8], expected: &[u8]) -> bool {
-    read_back.len() >= expected.len() && &read_back[..expected.len()] == expected
 }
 
 /// The liveness of the process the kernel recorded as a device's owner
@@ -274,88 +174,20 @@ mod tests {
     #[test]
     fn plan_reattach_echoes_kernel_identifier_when_present() {
         let ref_id = Uuid::from_u128(0xABCD);
-        let plan = plan_reattach(ref_id, Some("kernel-recorded-id".to_string()), false);
+        let plan = plan_reattach(ref_id, Some("kernel-recorded-id".to_string()));
         assert_eq!(plan.backend_id, "kernel-recorded-id");
         assert!(!plan.used_identifier_fallback);
-        // No seed → RECONFIGURE only.
         assert_eq!(plan.steps, vec![ReattachStep::Reconfigure]);
-        assert!(plan.seed_precedes_reconfigure());
     }
 
     #[test]
     fn plan_reattach_falls_back_to_ref_manifest_id() {
         let ref_id = Uuid::from_u128(0x1234);
-        let plan = plan_reattach(ref_id, None, true);
+        let plan = plan_reattach(ref_id, None);
         // The dfa0face fix: fall back to the ref's manifest id, flagged for
         // the warn.
         assert_eq!(plan.backend_id, ref_id.to_string());
         assert!(plan.used_identifier_fallback);
-    }
-
-    #[test]
-    fn plan_reattach_seeds_then_verifies_strictly_before_reconfigure() {
-        let plan = plan_reattach(Uuid::from_u128(1), Some("id".to_string()), true);
-        assert_eq!(
-            plan.steps,
-            vec![
-                ReattachStep::SeedDirtyTier,
-                ReattachStep::VerifySeed,
-                ReattachStep::Reconfigure,
-            ],
-            "a seed is adopted, then verified, before the RECONFIGURE — the \
-             probe must never run after the RECONFIGURE releases the guest's \
-             parked I/O (2026-07-21: a post-RECONFIGURE probe raced the live \
-             guest's writes and parked healthy survivors)",
-        );
-        assert!(plan.seed_precedes_reconfigure());
-        assert!(plan.verify_between_seed_and_reconfigure());
-        // Both properties hold for the no-seed plan too (vacuously).
-        let no_seed = plan_reattach(Uuid::from_u128(1), Some("id".to_string()), false);
-        assert!(no_seed.seed_precedes_reconfigure());
-        assert!(no_seed.verify_between_seed_and_reconfigure());
-    }
-
-    #[test]
-    fn verify_between_seed_and_reconfigure_rejects_hand_built_misorders() {
-        // Not `plan_reattach` outputs — the invariant method itself must
-        // reject a future edit that reorders or drops the probe.
-        let base = plan_reattach(Uuid::from_u128(1), Some("id".to_string()), true);
-        let mut probe_after_reconfigure = base.clone();
-        probe_after_reconfigure.steps = vec![
-            ReattachStep::SeedDirtyTier,
-            ReattachStep::Reconfigure,
-            ReattachStep::VerifySeed,
-        ];
-        assert!(!probe_after_reconfigure.verify_between_seed_and_reconfigure());
-        let mut probe_dropped = base.clone();
-        probe_dropped.steps = vec![ReattachStep::SeedDirtyTier, ReattachStep::Reconfigure];
-        assert!(!probe_dropped.verify_between_seed_and_reconfigure());
-        let mut probe_without_seed = base;
-        probe_without_seed.steps = vec![ReattachStep::VerifySeed, ReattachStep::Reconfigure];
-        assert!(!probe_without_seed.verify_between_seed_and_reconfigure());
-    }
-
-    #[test]
-    fn first_seeded_probe_picks_the_first_chunk_or_none() {
-        assert_eq!(first_seeded_probe(None), None);
-        assert_eq!(first_seeded_probe(Some(&[])), None);
-        let seed = vec![(3usize, vec![1u8, 2, 3]), (5, vec![9, 9])];
-        assert_eq!(
-            first_seeded_probe(Some(&seed)),
-            Some((3, [1u8, 2, 3].as_slice()))
-        );
-    }
-
-    #[test]
-    fn probe_matches_is_a_prefix_compare() {
-        // Exact.
-        assert!(probe_matches(&[1, 2, 3], &[1, 2, 3]));
-        // Padded read (block-sized) still matches the seeded prefix.
-        assert!(probe_matches(&[1, 2, 3, 0, 0, 0], &[1, 2, 3]));
-        // Mismatched content (rolled-back base) fails.
-        assert!(!probe_matches(&[0, 0, 0], &[1, 2, 3]));
-        // A short read can't satisfy the seeded length.
-        assert!(!probe_matches(&[1, 2], &[1, 2, 3]));
     }
 
     #[test]

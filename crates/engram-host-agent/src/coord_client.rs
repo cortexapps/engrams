@@ -592,10 +592,6 @@ pub struct HeartbeatRequest {
     /// heartbeat until `HeartbeatResponse.acked_capture_jobs` names them.
     #[serde(default)]
     pub capture_job_reports: Vec<engram_core::types::CaptureJobReport>,
-    /// ADR 0090: survivors whose NBD slot this generation quarantined —
-    /// re-advertised until destroyed; the coord drives evict_local.
-    #[serde(default)]
-    pub quarantined_survivors: Vec<engram_protocol::heartbeat::QuarantinedSurvivor>,
     /// ADR 0091: guests whose control plane stopped answering (the
     /// checkpoint driver's 3/3-probe verdict) — `(sandbox_id,
     /// session_id)` pairs, re-advertised until a successful capture or
@@ -806,7 +802,6 @@ mod tests {
             capabilities: Default::default(),
             harness_attached: Vec::new(),
             capture_job_reports: Vec::new(),
-            quarantined_survivors: Vec::new(),
             unreachable_guests: Vec::new(),
         };
         let v = serde_json::to_value(&req).unwrap();

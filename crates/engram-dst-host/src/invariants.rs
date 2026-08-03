@@ -1,68 +1,19 @@
-//! Oracle #1 — the acked-write durability oracle (ADR 0098 Phase 2,
-//! invariant #1; the session-85e0298a corruption RCA, PR #712; oracle-honesty
-//! pass P4.5).
+//! Oracle #1 checks acked-write durability (ADR 0098 and ADR 0110).
 //!
-//! **Property (the honest, bidirectional form):** *every guest-acked write
-//! that had a durable HANDOFF before a crash — a flush published it, OR the
-//! shutdown spool captured it — is recoverable after restart, read back
-//! through the REAL recovery path (`from_blob(published_ref)` + spool
-//! `adopt_unflushed`). A write acked from the RAM dirty tier and lost to
-//! abrupt process death BEFORE any flush or spool is an accepted, bounded loss
-//! (bounded by the flush cadence + the periodic checkpoint, ADR 0028), NOT a
-//! violation.* The oracle verifies the durability PIPELINE
-//! (flush→publish→spool→adopt) never loses a write it took responsibility for
-//! — it does not claim omniscient recovery of every RAM-only ack.
+//! Each guest write lands in a stable dirty file before the backend returns.
+//! Process death drops the backend value. It does not drop the file. Linux
+//! recovery opens the file and rebuilds the dirty set from its extents.
 //!
-//! ADR 0110 note: the live backend now gives a STRONGER guarantee — every
-//! acked write survives process death in a per-sandbox dirty file. This
-//! oracle still models only the portable legs (publish + spool), so its
-//! "accepted, bounded loss" boundary describes the pre-0110 fallback path
-//! the simulator drives, not the live contract. The dirty-file guarantee is
-//! pinned by the behavioral tests in `engram-host-agent`; teaching this
-//! oracle the dirty-file leg is a follow-up in the ADR 0110 rollout.
+//! The property is exact. Each chunk with a live backend must contain its
+//! latest guest-acked tag. A chunk that was never written must contain tag
+//! zero. The oracle does not accept an older tag. It does not use a published
+//! floor as a loss allowance.
 //!
-//! The ledger ([`AckedWriteLedger`]) is the oracle's memory. Per
-//! `(sandbox, chunk_idx)` it holds the LATEST acked tag AND the published-tier
-//! FLOOR (the highest tag a flush published to the durable/uploaded tier,
-//! observed from the REAL published manifest — see [`crate::world`]). For each
-//! chunk with a live backend, the check reads the chunk back and requires the
-//! decoded tag to be a MEMBER of that chunk's acked-tag set (or the tag-0
-//! base), bounded below by `published_floor`. Legitimate members include:
+//! The check skips a sandbox while its backend is absent. It checks the
+//! sandbox again after recovery. Thus `CrashProcess` followed by `Restart`
+//! proves that every acked write survived process death.
 //!
-//! * `== latest_ack` — a live backend that never crashed still holds the newest
-//!   write; and a rebuild where the latest write WAS itself published has
-//!   floor == latest.
-//! * `== published_floor` — a rebuild that dropped newer, un-published writes;
-//!   those newer writes are an ACCEPTED, bounded loss (flush cadence + periodic
-//!   checkpoint), never demanded back.
-//! * strictly between — a transiently-durable intermediate that a STANDING
-//!   shutdown spool adopted at recovery (the spool preserves an un-published
-//!   write across one roll; it is not a permanent floor).
-//!
-//! Three reads are violations: OLDER than the published floor (a durable
-//! published write rolled back — the 85e0298a corruption class), NEWER than
-//! the latest ack (a never-acked tag), or in-range but NEVER ACKED for this
-//! chunk (a misdirected read serving another chunk's write). The published floor is the ONLY
-//! permanent durability promise; spool RECOVERY is asserted separately by the
-//! regression seeds that crash with a STANDING spool. Reading through the live
-//! backend IS the recovery path: `from_blob(published_ref)` resolves the
-//! uploaded/published tier and spool adoption seeds the dirty tier — never a
-//! raw blob-existence check.
-//!
-//! When a sandbox has NO live backend (crashed, not yet restarted), its
-//! chunks are SKIPPED — the property is about recoverability *after* recovery,
-//! so it becomes checkable only once the successor rebuilds. Run after every
-//! step, the check is meaningful exactly at the moments that matter
-//! (post-write, post-flush, post-adopt, and the headline cases:
-//! `CrashProcess → Restart`, and — P4.5 — `AbruptCrash → Restart`, where a
-//! post-ack/pre-handoff write is correctly TOLERATED as lost).
-//!
-//! A FAILURE here is a real finding in the shipped flush/spool/adopt machinery
-//! — a write the pipeline DID hand off but cannot recover. Pin the seed, do
-//! not weaken the oracle. The regression seed
-//! `post_ack_pre_handoff_crash_is_honest_loss` pins the honest boundary from
-//! the other side: an un-handed-off write is lost and the oracle does NOT cry
-//! wolf.
+//! A FAILURE here is a real finding. Pin the seed. Do not weaken the oracle.
 //!
 //! # Oracle #9 — the reconcile None-arm stays fixed (ADR 0098 P3)
 //!
@@ -80,7 +31,7 @@ use engram_host_agent::durable_record::record_path;
 use engram_host_agent::eviction_finalize::EvictionFinalizeRecord;
 use engram_host_core::{FinalizeStage, TokioFs};
 
-use crate::world::{decode_tag, SimHost, CHUNK_SIZE};
+use crate::world::{decode_tag, SimHost, CHUNK_SIZE, NUM_CHUNKS};
 
 #[derive(Debug)]
 pub struct Violation {
@@ -392,85 +343,52 @@ fn reconcile_none_arm_fixed(host: &SimHost) -> Result<(), Violation> {
 }
 
 async fn acked_writes_recoverable(host: &SimHost) -> Result<(), Violation> {
-    // Snapshot the latest-acked set under a deterministic BTreeMap order, then
-    // read each chunk back through its live backend and check it against BOTH
-    // the durable-handoff floor and the latest ack (the honest, bidirectional
-    // form — ADR 0098 P4.5).
+    let latest = host.ledger.latest_by_chunk();
+    for (idx, slot) in host.sandboxes.iter().enumerate() {
+        let Some(backend) = slot.backend.clone() else {
+            continue;
+        };
+        for chunk_idx in 0..NUM_CHUNKS {
+            let entry = latest.get(&(idx, chunk_idx));
+            let expected = entry.map_or(0, |entry| entry.content_tag);
+            let bytes = backend
+                .read(chunk_idx * CHUNK_SIZE, CHUNK_SIZE)
+                .await
+                .map_err(|e| Violation {
+                    invariant: "acked-write-durability",
+                    detail: format!("sandbox {idx} chunk {chunk_idx} read failed: {e}"),
+                })?;
+            let got = decode_tag(&bytes);
+            if got == expected {
+                continue;
+            }
+            let lineage = entry.map(|entry| {
+                format!(
+                    "; lineage-at-ack {}v{}",
+                    entry.lineage_at_ack.manifest_id, entry.lineage_at_ack.version
+                )
+            });
+            return Err(Violation {
+                invariant: "acked-write-durability",
+                detail: format!(
+                    "sandbox {idx} chunk {chunk_idx}: read tag {got}, but the latest acked tag \
+                     is {expected}{}",
+                    lineage.as_deref().unwrap_or("")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// After the quiescence flush, each live chunk must equal both the latest ack
+/// and the published floor. Thus all surviving writes are published.
+pub async fn check_quiescent_floor(host: &SimHost) -> Result<(), Violation> {
     for ((idx, chunk_idx), entry) in host.ledger.latest_by_chunk() {
         let Some(slot) = host.sandboxes.get(idx) else {
             continue;
         };
         let Some(backend) = slot.backend.clone() else {
-            // Crashed, not yet restarted — recoverability is checkable only
-            // after the successor rebuilds.
-            continue;
-        };
-        let bytes = backend
-            .read(chunk_idx * CHUNK_SIZE, CHUNK_SIZE)
-            .await
-            .map_err(|e| Violation {
-                invariant: "acked-write-durability",
-                detail: format!("sandbox {idx} chunk {chunk_idx} read failed: {e}"),
-            })?;
-        let got = decode_tag(&bytes);
-        let latest = entry.content_tag;
-        // The published-tier floor: `0` (base) if this chunk was never flushed
-        // to the durable tier — its acked writes are all RAM-only or
-        // spool-transient, droppable by abrupt death.
-        let floor = host.ledger.handed_off_tag(idx, chunk_idx).unwrap_or(0);
-        let acked = host.ledger.acked_tags(idx, chunk_idx);
-        // A legitimate read is a tag actually acked for THIS chunk (or the tag-0
-        // base), bounded below by the published floor. Membership implies
-        // `got <= latest` (tags are globally monotone, so the chunk's latest ack
-        // is its max member) — the interval alone was NOT sufficient: tags are
-        // global, so another chunk's in-range tag must be a violation
-        // (misdirection), not a pass.
-        let member = got == 0 || acked.contains(&got);
-        if member && got >= floor {
-            continue;
-        }
-        let why = if got < floor {
-            "a durable published write rolled back below the floor"
-        } else if got > latest {
-            "a read newer than the latest ack (a never-acked tag)"
-        } else {
-            "an in-range tag never acked for THIS chunk (a misdirected read \
-             serving another chunk's write)"
-        };
-        return Err(Violation {
-            invariant: "acked-write-durability",
-            detail: format!(
-                "sandbox {idx} chunk {chunk_idx}: read {got} not a member of this chunk's acked \
-                 set within [published_floor {floor}, latest_ack {latest}] — {why}; \
-                 lineage-at-ack {}v{}",
-                entry.lineage_at_ack.manifest_id, entry.lineage_at_ack.version
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Quiescence-only tightening of oracle #1 (ADR 0098 Phase 3, R1.5): after
-/// the quiesce pass has driven a final REAL flush through every live
-/// backend, **no surviving chunk's content may sit above the published
-/// floor** — read back through the live backend, every acked-written chunk
-/// must decode at-or-below the floor (and with oracle #1's lower bound,
-/// exactly AT it: everything that survived is published). This turns
-/// "bounded loss" from an unenforced flush-cadence claim into a checked
-/// guarantee: loss is bounded by "un-flushed at crash", never "we forgot
-/// to ever flush". A write lost to an earlier abrupt crash is already gone
-/// from the backend (its `latest_ack` legitimately exceeds the floor
-/// forever — the accepted crash-window loss), so it does NOT fire; what
-/// fires is a write that SURVIVED to quiescence and the final flush still
-/// failed to publish — a flush-pipeline liveness hole. Sandboxes with no
-/// live backend (destroyed at a finalize/migration terminal, or
-/// quarantined) are exempt — their durability story is oracle #6/#8's.
-pub async fn check_quiescent_floor(host: &SimHost) -> Result<(), Violation> {
-    for ((idx, chunk_idx), _entry) in host.ledger.latest_by_chunk() {
-        let Some(slot) = host.sandboxes.get(idx) else {
-            continue;
-        };
-        let Some(backend) = slot.backend.clone() else {
             continue;
         };
         let bytes = backend
@@ -482,14 +400,13 @@ pub async fn check_quiescent_floor(host: &SimHost) -> Result<(), Violation> {
             })?;
         let got = decode_tag(&bytes);
         let floor = host.ledger.handed_off_tag(idx, chunk_idx).unwrap_or(0);
-        if got > floor {
+        let latest = entry.content_tag;
+        if got != floor || got != latest {
             return Err(Violation {
                 invariant: "quiescent-floor",
                 detail: format!(
-                    "sandbox {idx} chunk {chunk_idx}: live content {got} above the published \
-                     floor {floor} after the quiescence flush — a surviving acked write the \
-                     world never flushed (the loss bound is 'un-flushed at crash', not 'never \
-                     flushed')"
+                    "sandbox {idx} chunk {chunk_idx}: content {got}, published floor {floor}, \
+                     and latest ack {latest} differ after the quiescence flush"
                 ),
             });
         }

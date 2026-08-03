@@ -95,12 +95,9 @@ function Mode({ marker }: { marker: Extract<SystemMarker, { kind: "mode" }> }) {
   );
 }
 
-// ADR 0090 (2026-07-20 durability-rollback incident): a quarantined-survivor
-// eviction exhausted its budget, so the coordinator destroyed the crippled VM.
-// The next resume rewound the guest disk to the last published manifest,
-// silently dropping any writes the host acked but never uploaded past it. This
-// is real data loss the platform can't recover — surfaced prominently, never
-// hidden.
+// A true node loss rolled the guest disk back. The host died with unpublished
+// writes, and the session resumed from its durable floor. This is real data loss
+// that the platform cannot recover. The card makes it prominent.
 function DurabilityRollback({
   marker,
 }: {

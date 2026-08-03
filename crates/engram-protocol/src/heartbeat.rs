@@ -86,16 +86,6 @@ pub struct Heartbeat {
     /// must still decode).
     #[serde(default)]
     pub capture_job_reports: Vec<CaptureJobReport>,
-    /// ADR 0090: survivor sandboxes whose NBD rehydrate failed after a
-    /// roll — the slot is quarantined, the (possibly live) VM's disk is
-    /// unserved, and the documented remediation is `evict_local →
-    /// resume`. Re-advertised every heartbeat until the sandbox is
-    /// destroyed; the coordinator reacts by enqueueing the evict (the
-    /// op layer dedups), instead of the VM waiting for the teardown
-    /// reconciler's orphan path. `#[serde(default)]` for mixed-version
-    /// interop during the roll.
-    #[serde(default)]
-    pub quarantined_survivors: Vec<QuarantinedSurvivor>,
 }
 
 /// Issue #529: distinguishes a periodic (ADR 0028 Fix A) checkpoint
@@ -143,15 +133,6 @@ pub struct HostCapacityReport {
     pub total_mib: u64,
     pub used_mib: u64,
     pub running_sandboxes: u32,
-}
-
-/// ADR 0090: one quarantined survivor — a sandbox whose NBD slot was
-/// parked after a failed rehydrate `RECONFIGURE`, still owned by
-/// `session_id` per the generation's register reply.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct QuarantinedSurvivor {
-    pub sandbox_id: SandboxId,
-    pub session_id: SessionId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -302,7 +283,6 @@ mod tests {
             checkpoints: Vec::new(),
             utilization: Default::default(),
             capture_job_reports: Vec::new(),
-            quarantined_survivors: Vec::new(),
         }
     }
 

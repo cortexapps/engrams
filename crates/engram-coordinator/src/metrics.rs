@@ -156,7 +156,6 @@ pub fn init(addr: SocketAddr) {
     // never seen. The alert must exist before the first firing, so the
     // series must too.
     ::metrics::counter!(DURABILITY_ROLLBACK_TOTAL).absolute(0);
-    ::metrics::counter!(QUARANTINE_STUCK_TOTAL).absolute(0);
 }
 
 // ─── metric name constants ────────────────────────────────────────
@@ -356,33 +355,17 @@ pub const HARNESS_INPLACE_REATTACH_TOTAL: &str = "engram_harness_inplace_reattac
 /// snapshot pipeline is persistently failing for some session.
 pub const EVICTION_BUDGET_EXHAUSTED_TOTAL: &str = "engram_eviction_budget_exhausted_total";
 
-/// Counter (ADR 0090, 2026-07-20 durability-rollback incident). A resume
-/// was forced past acked-but-unpublished guest writes — real, user-visible
-/// data loss. Pairs with the durable `durability_rollback` session_events
-/// row.
+/// Counter. Sessions whose guest disk rolled back after true node loss.
+/// The host died with unpublished writes, and the session resumed from
+/// its durable floor. Pairs with the durable `durability_rollback`
+/// session-events row.
 ///
-/// **EMITTER-LESS since the 2026-08-02 RCA** (PR #972): the quarantine
-/// evict ladder — the only emitter — no longer destroys (it parks; see
-/// [`QUARANTINE_STUCK_TOTAL`]), so nothing increments this today and the
-/// series exports a constant 0. It is retained deliberately, NOT armed:
-/// the `SessionEvent::DurabilityRollback` variant must keep decoding (the
-/// web timeline renders the historical incident rows), and this name is
-/// the canonical counter any FUTURE durability-promise-break path must
-/// emit — re-adding an emitter re-arms the "must be ~0" alert with its
-/// original meaning. Expected host-death rewinds are NOT this counter's
-/// domain; they are counted by `session_rewound_events_total` with
-/// `cause=host_failure_recovery`.
+/// This metric is emitter-less because the process-death rollback path
+/// no longer exists. The series exports a constant 0. It stays so a
+/// future node-loss disk rollback can use the established counter, and
+/// so the alert contract stays available. `SessionEvent::DurabilityRollback`
+/// also stays because the web timeline must decode historical rows.
 pub const DURABILITY_ROLLBACK_TOTAL: &str = "engram_durability_rollback_total";
-
-/// Counter (2026-08-02 durability-rollback RCA). A quarantined survivor's
-/// eviction exhausted its fast-retry budget and the op PARKED on the slow
-/// retry lane — the VM and its acked writes are preserved, but the
-/// session is stalled until the host's rehydrate retry re-serves the disk
-/// or an operator intervenes. Alert on any increase: recovery is expected
-/// to be automatic within minutes; a session stuck longer needs a human
-/// (the runbook alternative used to be automatic VM destruction, i.e.
-/// data loss).
-pub const QUARANTINE_STUCK_TOTAL: &str = "engram_quarantine_stuck_total";
 
 /// Counter of session_events ROWS rolled back by rung-1 recovery rewinds
 /// (`apply_rung1_rewind`), labeled `cause` ∈ {planned_relocation,

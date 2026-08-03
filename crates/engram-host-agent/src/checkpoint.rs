@@ -457,17 +457,14 @@ pub fn next_epoch_after(
 impl CheckpointConfig {
     /// ADR 0043 P2a relaxed the default cadence from the old aggressive 60 s
     /// to 10 minutes. The periodic checkpoint is only the *in-RAM* backstop
-    /// for an unplanned crash of an ACTIVE session: the guest DISK is durable
-    /// on a continuous ~30 s flush ([`crate::disk_daemon::flush_scheduler`], no
-    /// guest pause) PLUS a final SIGTERM disk-flush pass (issue #225,
-    /// [`crate::pooled_backend::PooledBackend::flush_nbd_data_planes_for_shutdown`])
-    /// so a routine pod roll loses no acked writes; and the FC memory state is
+    /// for an unplanned crash of an ACTIVE session: every acknowledged guest
+    /// disk write is in the per-sandbox dirty file, and the continuous flush
+    /// uploads it to the chunk store without a guest pause. The FC memory state is
     /// captured on every event that *quiesces* a session — idle-eviction and
     /// the operator `POST /sessions/:id/snapshot`. NOTE: a SIGTERM pod roll
     /// intentionally does NOT capture FC memory — surviving VMs are detached
     /// and reattached by the successor generation (ADR 0044 K2,
-    /// [`crate::lib`]: "no SIGTERM-checkpoint pipeline"); only the disk is
-    /// flushed. So the timer bounds how much in-RAM progress an active session
+    /// [`crate::lib`]: "no SIGTERM-checkpoint pipeline"). So the timer bounds how much in-RAM progress an active session
     /// can lose to an *unplanned host crash* (its disk + harness transcript
     /// survive; a planned roll keeps the running VM). 10 min
     /// is "infrequent but sane", with far less per-session pause / capture-lock
