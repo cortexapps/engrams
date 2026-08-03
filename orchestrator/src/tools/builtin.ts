@@ -7,6 +7,10 @@ import {
 } from "../artifacts/service.ts";
 import { config } from "../config.ts";
 import { sessions } from "../control-plane/client.ts";
+import {
+  collectArtifactBytes,
+  type ArtifactStreamClient,
+} from "../control-plane/artifact-fetch.ts";
 import { makeArtifactStore } from "../db/artifacts.ts";
 import type { ArtifactWithVersions } from "../db/artifacts.ts";
 import { makePapercutStore, type PapercutStore } from "../db/papercuts.ts";
@@ -45,6 +49,9 @@ export interface BuiltinToolDeps {
   /** The shared artifact service layer (defaults to the real store +
    * coordinator pull client). */
   artifacts?: ArtifactService;
+  /** Byte reader for get + include_content (defaults to the coordinator
+   * GetArtifact stream). */
+  artifactStream?: ArtifactStreamClient;
   now?: () => Date;
 }
 
@@ -77,6 +84,20 @@ const ArtifactActionSchema = z
       .enum(["mine", "shared"])
       .optional()
       .describe('list: "mine" (default) or "shared" (artifacts shared with the org)'),
+    version: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("get: which version's content to read; defaults to the current one"),
+    include_content: z
+      .boolean()
+      .optional()
+      .describe(
+        "get: also return the artifact's source text inline (artifacts are " +
+          "HTML/Markdown; capped at 256 KiB) — the reliable way to read a " +
+          "version from inside a session",
+      ),
   })
   .superRefine((v, ctx) => {
     const need = (field: "file_path" | "artifact_id") => {
@@ -112,7 +133,14 @@ const ArtifactOutputSchema = z.object({
   artifact: ToolArtifactSchema.optional(),
   artifacts: z.array(ToolArtifactSchema).optional(),
   total_count: z.number().optional(),
+  /** get + include_content: the requested version's source text. */
+  content: z.string().optional(),
+  content_version: z.number().optional(),
 });
+
+/** Inline-content ceiling: enough for any styled report (the inlined
+ * house fonts are ~100 KiB) without flooding the model's context. */
+const MAX_INLINE_CONTENT_BYTES = 256 * 1024;
 
 function defaultArtifactService(): ArtifactService {
   return makeArtifactService({
@@ -210,10 +238,14 @@ export function registerBuiltinTools(
       "sessions (sharing a file into the chat is separate: engram-share). " +
       "Actions: publish {file_path, title?} creates a new artifact from a " +
       "file in this session; update {artifact_id, file_path} publishes the " +
-      "next version at the same URL; list {scope?} and get {artifact_id} " +
-      "read the user's artifacts (raw_url is a short-lived direct byte " +
-      "URL you can fetch); share/unshare {artifact_id} toggle org-wide " +
-      "visibility. Only text/html and text/markdown may be published. " +
+      "next version at the same URL; list {scope?} and get {artifact_id, " +
+      "version?, include_content?} read the user's artifacts — pass " +
+      "include_content: true to receive a version's source text inline " +
+      "(the reliable way to read an artifact from inside a session; " +
+      "raw_url and url are for humans in browsers and may be unreachable " +
+      "from the session shell); share/unshare {artifact_id} toggle " +
+      "org-wide visibility. Only text/html and text/markdown may be " +
+      "published. " +
       "BEFORE authoring an HTML artifact, read the artifact-design skill " +
       "(mounted in this session when available) — it carries the design " +
       "brief. Author HTML as a single self-contained file (inline CSS and " +
@@ -273,7 +305,30 @@ export function registerBuiltinTools(
           }
           case "get": {
             const row = await service.get(actor, artifactId);
-            return { artifact: toolArtifact(row, now()) };
+            const result: z.input<typeof ArtifactOutputSchema> = {
+              artifact: toolArtifact(row, now()),
+            };
+            if (args.include_content) {
+              // The reliable in-guest read: raw_url points at the
+              // browser-facing origin, which a sandbox may not reach
+              // (papercut, session c60ac26c) — so hand the source back
+              // through the tool instead.
+              const wanted = args.version ?? row.currentVersion;
+              const vrow = row.versions.find((v) => v.version === wanted);
+              if (!vrow) {
+                return { error: `artifact has no version ${wanted}` };
+              }
+              const stream = deps?.artifactStream ?? (sessions as ArtifactStreamClient);
+              const fetched = await collectArtifactBytes(
+                stream,
+                vrow.sessionId,
+                vrow.coordArtifactId,
+                { maxBytes: MAX_INLINE_CONTENT_BYTES },
+              );
+              result.content = new TextDecoder().decode(fetched.bytes);
+              result.content_version = wanted;
+            }
+            return result;
           }
           case "share":
           case "unshare": {

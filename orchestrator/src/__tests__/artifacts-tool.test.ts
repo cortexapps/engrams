@@ -100,7 +100,28 @@ function makeHarness(pullMediaType = "text/html"): Harness {
     mintId: () => `a-${++mintN}`,
   });
   const registry = createToolRegistry();
-  registerBuiltinTools(registry, { artifacts: service, now: () => T0 });
+  registerBuiltinTools(registry, {
+    artifacts: service,
+    now: () => T0,
+    // Fake byte stream: serves "content of <coordArtifactId>" so a get
+    // with include_content proves which VERSION's bytes were read.
+    artifactStream: {
+      async *getArtifact(req) {
+        const body = new TextEncoder().encode(`content of ${req.artifactId}`);
+        yield {
+          msg: {
+            case: "metadata" as const,
+            value: {
+              mediaType: "text/html",
+              sizeBytes: BigInt(body.length),
+              fileName: "x.html",
+            },
+          },
+        };
+        yield { msg: { case: "chunk" as const, value: body } };
+      },
+    },
+  });
 
   const deps: ToolExecDeps = {
     registry,
@@ -226,6 +247,44 @@ describe("Artifact tool", () => {
     expect(unshared.artifact?.["visibility"]).toBe("private");
     const bobDenied = (await h.exec("bob", { action: "get", artifact_id: "a-1" })) as ToolResult;
     expect(bobDenied.error).toContain("not found");
+  });
+
+  test("get with include_content returns a chosen version's source", async () => {
+    const h = makeHarness();
+    await h.exec("alice", { action: "publish", file_path: "/r.html" }); // coord-1
+    await h.exec("alice", { action: "update", artifact_id: "a-1", file_path: "/r.html" }); // coord-2
+
+    const current = (await h.exec("alice", {
+      action: "get",
+      artifact_id: "a-1",
+      include_content: true,
+    })) as ToolResult & { content?: string; content_version?: number };
+    expect(current.content).toBe("content of coord-2");
+    expect(current.content_version).toBe(2);
+
+    const v1 = (await h.exec("alice", {
+      action: "get",
+      artifact_id: "a-1",
+      version: 1,
+      include_content: true,
+    })) as ToolResult & { content?: string; content_version?: number };
+    expect(v1.content).toBe("content of coord-1");
+    expect(v1.content_version).toBe(1);
+
+    const missing = (await h.exec("alice", {
+      action: "get",
+      artifact_id: "a-1",
+      version: 9,
+      include_content: true,
+    })) as ToolResult;
+    expect(missing.error).toContain("no version 9");
+
+    // Without the flag the result stays metadata-only.
+    const plain = (await h.exec("alice", {
+      action: "get",
+      artifact_id: "a-1",
+    })) as ToolResult & { content?: string };
+    expect(plain.content).toBeUndefined();
   });
 
   test("a session with no owning user cannot manage artifacts", async () => {
