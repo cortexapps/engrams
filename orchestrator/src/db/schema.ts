@@ -636,6 +636,11 @@ export interface CreateTaskAutomationAction {
   includeEventContext: boolean;
   /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
   harnessMode?: string;
+  /** ADR 0063 B2: override the profile's default harness / model / effort for
+   *  every session this automation launches. Absent = inherit the profile. */
+  harness?: string;
+  model?: string;
+  effort?: string;
 }
 
 export type AutomationAction = CreateTaskAutomationAction;

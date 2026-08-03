@@ -638,6 +638,11 @@ export interface CreateSessionForExistingTaskParams {
   prompt?: string;
   /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
   harnessMode?: string;
+  /** ADR 0063 B2: per-session override of the profile's harness / model / effort
+   *  (an automation's stored selection). Unset = the profile's default. */
+  harness?: string;
+  model?: string;
+  effort?: string;
   extraCapabilities?: readonly string[];
   capabilityOverride?: readonly string[];
   networkOverride?: ProfileNetwork;
@@ -735,6 +740,9 @@ export async function createSessionForExistingTask(
       ...(params.ownerUserId === undefined ? { programmatic: true } : {}),
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
       ...(params.harnessMode != null ? { harnessMode: params.harnessMode } : {}),
+      ...(params.harness != null ? { harness: params.harness } : {}),
+      ...(params.model != null ? { model: params.model } : {}),
+      ...(params.effort != null ? { effort: params.effort } : {}),
       ...(params.extraCapabilities ? { extraCapabilities: params.extraCapabilities } : {}),
       ...(params.capabilityOverride !== undefined
         ? { capabilityOverride: params.capabilityOverride }

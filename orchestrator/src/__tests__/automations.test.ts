@@ -10,6 +10,7 @@ import type {
   WebhookSampleRow,
 } from "../db/automations.ts";
 import type { ProfileRow } from "../db/profiles.ts";
+import type { HarnessCatalogClient } from "../rpc/task-create.ts";
 import {
   AutomationService,
   WebhookRegistrationService,
@@ -48,6 +49,29 @@ const profile = (portExposures: number[] = []): ProfileRow => ({
   createdAt: NOW,
   updatedAt: NOW,
   deletedAt: null,
+});
+
+/** Two-harness catalog: enough to prove the model/effort enums are validated
+ *  against the EFFECTIVE harness, not whichever one is listed first. */
+const catalog = (): HarnessCatalogClient => ({
+  listHarnesses: async () => ({
+    harnesses: [
+      {
+        name: "claude",
+        descriptor: {
+          models: [{ id: "opus", default: true, env: {} }, { id: "sonnet", default: false, env: {} }],
+          effort: [{ id: "high", default: true, env: {} }],
+        },
+      },
+      {
+        name: "codex",
+        descriptor: {
+          models: [{ id: "gpt", default: true, env: {} }],
+          effort: [],
+        },
+      },
+    ],
+  }),
 });
 
 function fakeStore(seed?: {
@@ -289,6 +313,101 @@ describe("AutomationService", () => {
       now: () => NOW,
     });
     await expectCode(automations.createAutomation(cronRequest), Code.InvalidArgument);
+  });
+
+  test("persists a harness/model/effort override and rejects ids the catalog lacks", async () => {
+    const { automations } = clients({
+      getSession: session("admin", "admin"),
+      store: fakeStore(),
+      profiles: { getActive: async () => profile() },
+      harnessCatalog: catalog(),
+      now: () => NOW,
+    });
+    const withOverride = (override: {
+      harness?: string;
+      model?: string;
+      effort?: string;
+    }) => automations.createAutomation({
+      ...cronRequest,
+      action: {
+        action: {
+          case: "createTask" as const,
+          value: { ...cronRequest.action.action.value, ...override },
+        },
+      },
+    });
+
+    // The effective harness is the override, else the profile's ("claude").
+    await expectCode(withOverride({ harness: "ghost" }), Code.InvalidArgument);
+    await expectCode(withOverride({ model: "haiku" }), Code.InvalidArgument);
+    await expectCode(withOverride({ effort: "max" }), Code.InvalidArgument);
+    await expectCode(withOverride({ harness: "codex", model: "sonnet" }), Code.InvalidArgument);
+
+    const created = await withOverride({ harness: "codex", model: "gpt" });
+    expect(created.automation?.action?.action.value).toMatchObject({
+      harness: "codex",
+      model: "gpt",
+    });
+    expect(created.automation?.action?.action.value?.effort).toBeUndefined();
+  });
+
+  // Regression: a model/effort id is only meaningful next to one harness. Saving
+  // one without a harness used to leave the action pointing at whatever harness
+  // the PROFILE happened to name; an admin who later switched that profile to
+  // another harness orphaned the id, and the launch path resolves an unknown id
+  // to no model env at all — a silently wrong model, months later. The save now
+  // pins the harness so the stored action cannot be orphaned.
+  test("a model-only or effort-only override pins the profile's harness onto the action", async () => {
+    const { automations } = clients({
+      getSession: session("admin", "admin"),
+      store: fakeStore(),
+      profiles: { getActive: async () => profile() },
+      harnessCatalog: catalog(),
+      now: () => NOW,
+    });
+    const withOverride = (override: { model?: string; effort?: string }) =>
+      automations.createAutomation({
+        ...cronRequest,
+        action: {
+          action: {
+            case: "createTask" as const,
+            value: { ...cronRequest.action.action.value, ...override },
+          },
+        },
+      });
+
+    const modelOnly = await withOverride({ model: "sonnet" });
+    expect(modelOnly.automation?.action?.action.value).toMatchObject({
+      harness: "claude",
+      model: "sonnet",
+    });
+
+    const effortOnly = await withOverride({ effort: "high" });
+    expect(effortOnly.automation?.action?.action.value).toMatchObject({
+      harness: "claude",
+      effort: "high",
+    });
+    expect(effortOnly.automation?.action?.action.value?.model).toBeUndefined();
+  });
+
+  test("an automation with no override never reads the harness catalog", async () => {
+    let reads = 0;
+    const { automations } = clients({
+      getSession: session("admin", "admin"),
+      store: fakeStore(),
+      profiles: { getActive: async () => profile() },
+      harnessCatalog: {
+        listHarnesses: async () => {
+          reads++;
+          return { harnesses: [] };
+        },
+      },
+      now: () => NOW,
+    });
+
+    const created = await automations.createAutomation(cronRequest);
+    expect(created.automation?.action?.action.value?.harness).toBeUndefined();
+    expect(reads).toBe(0);
   });
 
   test("webhook filters accept only bounded dotted payload-path equality keys", async () => {

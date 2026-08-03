@@ -1454,6 +1454,29 @@ describe("createSessionForExistingTask", () => {
     ]);
   });
 
+  test("an automation's harness/model/effort override beats the profile default", async () => {
+    const sessions = fakeSessions();
+    await createSessionForExistingTask(
+      createDeps(sessions, recordingDb([]), { profileOver: { model: "opus" } }),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "primary",
+        harness: "claude",
+        model: "sonnet",
+        effort: "high",
+      },
+    );
+
+    const request = sessions.createReqs[0] as {
+      harness?: string;
+      harnessEnv?: Record<string, string>;
+    };
+    expect(request.harness).toBe("claude");
+    expect(request.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
+    expect(request.harnessEnv?.MAX_THINKING_TOKENS).toBe("32000");
+  });
+
   test("compensates when requested listener registration fails", async () => {
     const sessions = fakeSessions();
     await expect(createSessionForExistingTask(
