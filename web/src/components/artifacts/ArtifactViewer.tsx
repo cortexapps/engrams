@@ -63,8 +63,8 @@ function DownloadPlate({
   url: string;
   fileName?: string;
   kind: MediaKind;
-  /** Drives the download trust gate; when absent the plate is treated
-   * as renderable text (ungated). */
+  /** Shown in the download interstitial's file line; every download is
+   * gated regardless. */
   mediaType?: string;
   note?: string;
 }) {

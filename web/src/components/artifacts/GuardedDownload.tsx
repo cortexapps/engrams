@@ -2,7 +2,6 @@ import { useState, type ReactNode } from "react";
 import { TriangleAlert } from "lucide-react";
 
 import { fmtBytes } from "../transcriptFmt";
-import { mediaKind } from "../../lib/artifacts";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -15,13 +14,14 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-// A trust gate in front of downloads the product cannot vouch for.
-// Media and text render in the product first, so a person has seen what
-// they are saving; an arbitrary binary is opaque until it is on their
-// machine — and it was produced by an agent, which can be steered by
-// content it read (prompt injection) into emitting something the user
-// never asked for. Renderable kinds pass straight through; the "binary"
-// kind gets one honest interstitial.
+// A trust gate in front of EVERY download. The files come from an
+// agent, and an agent can be steered by content it read (prompt
+// injection) into emitting something the user never asked for. A
+// per-kind exemption sounds harmless but leaks: transcript HTML/SVG is
+// offered for download WITHOUT ever being rendered, and opened from
+// disk it runs scripts in a file:// origin with no sandbox (review
+// finding on #991). One uniform interstitial is simpler to reason
+// about than a taxonomy of "safe enough" types.
 export function GuardedDownload({
   url,
   mediaType,
@@ -41,22 +41,12 @@ export function GuardedDownload({
 }) {
   const [open, setOpen] = useState(false);
 
-  // A missing fileName must still FORCE a download: the empty string is
-  // the bare `download` attribute (browser derives a name), while an
-  // omitted attribute turns the anchor into plain navigation — and the
-  // server serves renderable types inline, so the click would replace
-  // the SPA with the raw bytes.
-  if (mediaKind(mediaType) !== "binary") {
-    return (
-      <a href={url} download={fileName ?? ""} className={className} aria-label={ariaLabel}>
-        {children}
-      </a>
-    );
-  }
-
   const confirm = () => {
     // Same-origin cookie-authed download via a transient anchor — the
-    // dialog owned the click, so trigger it programmatically.
+    // dialog owned the click, so trigger it programmatically. The empty
+    // string keeps the bare `download` attribute when no name exists:
+    // an omitted attribute would navigate instead (renderable types are
+    // served inline), replacing the SPA with the raw bytes.
     const a = document.createElement("a");
     a.href = url;
     a.download = fileName ?? "";
@@ -85,10 +75,10 @@ export function GuardedDownload({
                 {sizeBytes !== undefined ? <> · {fmtBytes(sizeBytes)}</> : null}
               </p>
               <p>
-                An agent produced this file, and engrams cannot inspect what is inside it. Agents
-                can be manipulated by content they read while working, so treat this like an
-                attachment from an unknown sender: do not run executables, scripts, or installers
-                from it, and open documents in a viewer you trust.
+                An agent produced this file. Agents can be manipulated by content they read while
+                working, so treat this like an attachment from an unknown sender: do not run
+                executables, scripts, or installers from it, and open documents in a viewer you
+                trust.
               </p>
               <p>Only continue if you asked for this file and know what it is.</p>
             </div>

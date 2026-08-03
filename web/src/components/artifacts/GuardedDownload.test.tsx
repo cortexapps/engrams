@@ -1,36 +1,32 @@
-import { expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { GuardedDownload } from "./GuardedDownload";
 
-// Renderable kinds download directly; opaque binaries get the trust
-// interstitial first — the whole point of the gate.
+// EVERY download goes through the trust interstitial — renderable types
+// included, because the transcript offers HTML/SVG for download without
+// ever rendering them, and one uniform gate beats a taxonomy of "safe
+// enough" kinds.
 
-test("renderable types pass straight through as a download anchor", () => {
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+test("renderable types gate too — no live anchor, dialog on click", async () => {
+  const user = userEvent.setup();
   render(
     <GuardedDownload url="/api/v1/artifacts/a1" mediaType="text/markdown" fileName="notes.md">
       Download
     </GuardedDownload>,
   );
-  const anchor = screen.getByRole("link", { name: "Download" });
-  expect(anchor.getAttribute("href")).toBe("/api/v1/artifacts/a1");
-  expect(anchor.getAttribute("download")).toBe("notes.md");
+  expect(screen.queryByRole("link")).toBeNull();
+  await user.click(screen.getByRole("button", { name: "Download" }));
+  expect(await screen.findByText("Download this file?")).toBeTruthy();
+  expect(screen.getByText(/notes\.md/)).toBeTruthy();
 });
 
-test("a missing fileName still forces a download, never inline navigation", () => {
-  // Renderable types serve Content-Disposition: inline — without the
-  // bare `download` attribute the click would replace the SPA with the
-  // raw bytes (review finding on the fileName-less share-card path).
-  render(
-    <GuardedDownload url="/api/v1/artifacts/a1" mediaType="image/png">
-      Download
-    </GuardedDownload>,
-  );
-  expect(screen.getByRole("link", { name: "Download" }).getAttribute("download")).toBe("");
-});
-
-test("binary downloads open the trust dialog instead of downloading", async () => {
+test("binary downloads show the full warning copy and both actions", async () => {
   const user = userEvent.setup();
   render(
     <GuardedDownload
@@ -42,8 +38,6 @@ test("binary downloads open the trust dialog instead of downloading", async () =
       Download
     </GuardedDownload>,
   );
-  // The trigger is a button, not a live download link.
-  expect(screen.queryByRole("link")).toBeNull();
   await user.click(screen.getByRole("button", { name: "Download" }));
 
   expect(await screen.findByText("Download this file?")).toBeTruthy();
@@ -51,4 +45,30 @@ test("binary downloads open the trust dialog instead of downloading", async () =
   expect(screen.getByText(/unknown\s+sender/)).toBeTruthy();
   expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Download anyway" })).toBeTruthy();
+});
+
+test("Download anyway forces a save even without a fileName", async () => {
+  // The transient anchor must carry the bare `download` attribute — an
+  // omitted attribute would NAVIGATE (renderable types serve inline),
+  // replacing the SPA with the raw bytes.
+  const clicked: Array<{ download: string | null; href: string }> = [];
+  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(
+    function (this: HTMLAnchorElement) {
+      clicked.push({
+        download: this.getAttribute("download"),
+        href: this.getAttribute("href") ?? "",
+      });
+    },
+  );
+
+  const user = userEvent.setup();
+  render(
+    <GuardedDownload url="/api/v1/artifacts/a3" mediaType="image/png">
+      Download
+    </GuardedDownload>,
+  );
+  await user.click(screen.getByRole("button", { name: "Download" }));
+  await user.click(await screen.findByRole("button", { name: "Download anyway" }));
+
+  expect(clicked).toEqual([{ download: "", href: "/api/v1/artifacts/a3" }]);
 });
