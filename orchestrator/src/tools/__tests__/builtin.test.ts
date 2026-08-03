@@ -162,6 +162,21 @@ describe("built-in tools", () => {
     });
   });
 
+  // The claude CLI validates every MCP tool's inputSchema as a top-level
+  // `type: "object"` JSON Schema and rejects the WHOLE tools/list when one
+  // tool deviates (an anyOf union took every injected tool down with it —
+  // session 3acf9bd1). This pins the contract for all current + future tools.
+  test("every compiled tool schema is a top-level object (MCP contract)", () => {
+    const registry = createToolRegistry();
+    registerBuiltinTools(registry);
+    for (const tool of compileToolManifest(registry)) {
+      expect(
+        (tool.inputSchema as { type?: string }).type,
+        `tool ${tool.name} must emit a type:"object" inputSchema`,
+      ).toBe("object");
+    }
+  });
+
   test("papercut is included for a profile with zero capabilities", () => {
     const registry = createToolRegistry();
     registerBuiltinTools(registry);

@@ -184,6 +184,19 @@ mod adapter {
                  mcp__engrams__exit_plan_mode instead.",
             );
         }
+        // The CLI carries a NATIVE tool also named "Artifact" that is
+        // disabled in headless mode, so a bare-name call fails with
+        // "exists but is not enabled in this context" — worse than
+        // unknown, because the model keeps retrying the built-in name
+        // (session 2769b9df). Redirect to the injected spelling.
+        if injected_tools(manifest).any(|tool| tool.name == "Artifact") {
+            lines.push(
+                "The built-in Artifact tool is not available here. To publish, update, \
+                 list, get, share, or unshare hosted artifacts, call the \
+                 mcp__engrams__Artifact tool directly (it is already loaded) — never the \
+                 bare name Artifact.",
+            );
+        }
         if lines.is_empty() {
             None
         } else {
@@ -4349,6 +4362,13 @@ mod adapter {
             let text = injected_tool_guidance(&question_only).expect("guidance for the question");
             assert!(text.contains("mcp__engrams__ask_user_question"));
             assert!(!text.contains("exit_plan_mode"));
+
+            // "Artifact" collides with a DISABLED native CLI tool of the same
+            // name, so its redirect must name the injected spelling.
+            let artifact_only = vec![generic_tool("Artifact", ToolExecution::Sync)];
+            let text = injected_tool_guidance(&artifact_only).expect("guidance for artifact");
+            assert!(text.contains("mcp__engrams__Artifact"));
+            assert!(!text.contains("ask_user_question"));
 
             // A natively-bound question (codex-style manifests never reach
             // this harness, but a claude binding would) is NOT injected, so
