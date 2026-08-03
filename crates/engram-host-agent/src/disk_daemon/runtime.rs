@@ -951,15 +951,20 @@ pub async fn reattach_manifest(
     .await
 }
 
+/// This structure groups the stable dirty file inputs for reattachment.
+pub(crate) struct DirtyTierSpec {
+    pub(crate) path: PathBuf,
+    pub(crate) mode: DirtyFileOpenMode,
+    pub(crate) seed: Option<Vec<(usize, Vec<u8>)>>,
+}
+
 pub(crate) async fn reattach_manifest_with_dirty_file(
     disk_manifest_ref: engram_core::types::manifest::ManifestRef,
     cache: engram_chunk_store::cache::ChunkCache,
     store: Arc<engram_chunk_store::ChunkStore>,
     slot: NbdSlot,
     threshold_bytes: u64,
-    dirty_path: PathBuf,
-    dirty_mode: DirtyFileOpenMode,
-    seed_dirty: Option<Vec<(usize, Vec<u8>)>>,
+    dirty_tier: DirtyTierSpec,
 ) -> Result<NbdSandboxState, (NbdSlot, NbdRuntimeError)> {
     reattach_manifest_inner(
         disk_manifest_ref,
@@ -967,8 +972,8 @@ pub(crate) async fn reattach_manifest_with_dirty_file(
         store,
         slot,
         threshold_bytes,
-        Some((dirty_path, dirty_mode)),
-        seed_dirty,
+        Some((dirty_tier.path, dirty_tier.mode)),
+        dirty_tier.seed,
     )
     .await
 }

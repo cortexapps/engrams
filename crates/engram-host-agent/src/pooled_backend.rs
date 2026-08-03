@@ -9809,9 +9809,11 @@ impl PooledBackend {
             store_arc,
             slot,
             self.flush_config.dirty_threshold_bytes,
-            dirty_path,
-            dirty_mode,
-            seed_dirty,
+            crate::disk_daemon::runtime::DirtyTierSpec {
+                path: dirty_path,
+                mode: dirty_mode,
+                seed: seed_dirty,
+            },
         )
         .await
         {

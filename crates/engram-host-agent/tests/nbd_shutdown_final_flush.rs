@@ -10,6 +10,9 @@
 //! hazard itself (acked writes survive in the per-sandbox dirty file); the
 //! final-flush pass remains in rollout stage 1 to keep the published
 //! `live_disk_manifest` fresh, and this test pins that it still runs.
+//! Two recovery tests pin the stage-1 recovery rule. The successor uses the
+//! dirty file when it exists and leaves the spool on disk. The successor uses
+//! and discards the spool when the dirty file does not exist.
 //!
 //! The fix adds `PooledBackend::flush_nbd_data_planes_for_shutdown`, run in the
 //! SIGTERM path BEFORE the abandon sweep: per surviving sandbox, under a hard
@@ -406,20 +409,27 @@ async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
     let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(index);
 }
 
-/// 2026-07-16 session-85e0298a corruption regression: when the SIGTERM
-/// final flush does NOT complete (deadline overrun / GCS unavailable — the
-/// prod incident lost 320 MiB of acked writes exactly this way), the
-/// abandon sweep must export the un-uploaded dirty tier to the hostPath
-/// shutdown spool, and a SUCCESSOR PooledBackend's `rehydrate_sandbox`
-/// must adopt it — the guest's acked bytes survive the pod roll instead
-/// of being rolled back to the last published manifest.
-///
-/// Drives the real device handoff: predecessor abandons `/dev/nbd0` with
-/// the kernel config left alive (dead connection), successor RECONFIGUREs
-/// a fresh socket onto it, seeded from the spool.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage1RecoverySource {
+    DirtyFile,
+    Spool,
+}
+
+/// Stage 1 uses the dirty file and leaves the spool when both exist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Linux + modprobe nbd + writable /dev/nbd0 (root)"]
-async fn sigterm_overrun_spools_dirty_writes_and_successor_adopts_them() {
+async fn sigterm_overrun_dirty_file_covers_acked_writes_and_spool_is_left() {
+    run_sigterm_overrun_recovery(Stage1RecoverySource::DirtyFile).await;
+}
+
+/// Stage 1 uses and discards the spool when no dirty file exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux + modprobe nbd + writable /dev/nbd0 (root)"]
+async fn spool_is_adopted_and_discarded_when_no_dirty_file_exists() {
+    run_sigterm_overrun_recovery(Stage1RecoverySource::Spool).await;
+}
+
+async fn run_sigterm_overrun_recovery(recovery_source: Stage1RecoverySource) {
     // Debug-visibility for the rehydrate short-circuit branches (all of
     // them log rather than error). Mirrors nbd_netlink_reconfigure.rs.
     let _ = tracing_subscriber::fmt()
@@ -551,6 +561,25 @@ async fn sigterm_overrun_spools_dirty_writes_and_successor_adopts_them() {
 
     drop(pooled);
 
+    let dirty_path = cache
+        .root()
+        .join("dirty")
+        .join(format!("{restored_id}.cache"));
+    assert!(
+        dirty_path.exists(),
+        "the predecessor must leave its stable dirty file",
+    );
+    if recovery_source == Stage1RecoverySource::Spool {
+        std::fs::remove_file(&dirty_path).expect("remove predecessor dirty file");
+        let dirty_ref_path = dirty_path.with_extension("ref");
+        if dirty_ref_path
+            .try_exists()
+            .expect("check predecessor dirty ref")
+        {
+            std::fs::remove_file(&dirty_ref_path).expect("remove predecessor dirty ref");
+        }
+    }
+
     // Successor generation: same node state (store, cache, checkpoints),
     // fresh slot pool over the SAME still-configured device; the mock
     // inner resolves the survivor's rootfs device like the FC sidecar
@@ -596,7 +625,7 @@ async fn sigterm_overrun_spools_dirty_writes_and_successor_adopts_them() {
         !unflushed.is_empty()
             || (adopted_ref.manifest_id == pre_abandon_ref.manifest_id
                 && adopted_ref.version > pre_abandon_ref.version),
-        "2026-07-16 RCA: the successor must ADOPT the spooled dirty tier — \
+        "2026-07-16 RCA: the successor must preserve the acked dirty tier — \
          no un-uploaded copy and no advanced manifest on the survivor's \
          lineage means the guest's acked writes were rolled back",
     );
@@ -610,18 +639,23 @@ async fn sigterm_overrun_spools_dirty_writes_and_successor_adopts_them() {
         "the successor must serve the ACKED bytes, not the stale base",
     );
 
-    // Adoption consumes the spool.
-    assert!(
-        engram_host_agent::disk_daemon::spool::read_spool(
-            &engram_host_core::TokioFs,
-            &spool_root,
-            restored_id,
-        )
-        .await
-        .expect("spool root readable")
-        .is_none(),
-        "an adopted spool must be discarded",
-    );
+    let spool_after_rehydrate = engram_host_agent::disk_daemon::spool::read_spool(
+        &engram_host_core::TokioFs,
+        &spool_root,
+        restored_id,
+    )
+    .await
+    .expect("spool root readable");
+    match recovery_source {
+        Stage1RecoverySource::DirtyFile => assert!(
+            spool_after_rehydrate.is_some(),
+            "recovery from the dirty file must leave the spool on disk",
+        ),
+        Stage1RecoverySource::Spool => assert!(
+            spool_after_rehydrate.is_none(),
+            "an adopted spool must be discarded",
+        ),
+    }
 
     drop(successor);
     tokio::time::sleep(Duration::from_millis(100)).await;
