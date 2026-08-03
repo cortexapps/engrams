@@ -46,6 +46,7 @@ const GROUPS: Group[] = [
     heading: "Go to",
     rows: [
       { label: "Tasks", cap: seq("g", "s") },
+      { label: "Artifacts", cap: seq("g", "a") },
       { label: "Operator", cap: seq("g", "o"), admin: true },
       { label: "Fleet", cap: seq("g", "f"), admin: true },
       { label: "Settings", cap: seq("g", ",") },
