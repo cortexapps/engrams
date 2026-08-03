@@ -1127,6 +1127,7 @@ mod tests {
             _: &str,
             _: i64,
             _: Option<&str>,
+            _: Option<&str>,
         ) -> Result<(), engram_core::MetaError> {
             Ok(())
         }

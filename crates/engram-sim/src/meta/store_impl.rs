@@ -1139,6 +1139,7 @@ impl MetadataStore for SimMetadataStore {
         media_type: &str,
         size_bytes: i64,
         caption: Option<&str>,
+        file_name: Option<&str>,
     ) -> Result<(), MetaError> {
         self.gate()?;
         let now = self.now();
@@ -1154,6 +1155,7 @@ impl MetadataStore for SimMetadataStore {
                 media_type: media_type.to_string(),
                 size_bytes,
                 caption: caption.map(str::to_string),
+                file_name: file_name.map(str::to_string),
                 created_at: now,
             },
         );
