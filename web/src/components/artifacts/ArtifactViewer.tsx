@@ -2,8 +2,9 @@ import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { DownloadIcon, Loader2 } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
+import { buttonVariants } from "@/components/ui/button";
 import { Text } from "@/components/ui/text";
+import { GuardedDownload } from "./GuardedDownload";
 import { Markdown } from "@/components/Markdown";
 import { KIND_GLYPHS, mediaKind, type MediaKind } from "@/lib/artifacts";
 import { cn } from "@/lib/utils";
@@ -56,11 +57,15 @@ function DownloadPlate({
   url,
   fileName,
   kind,
+  mediaType,
   note,
 }: {
   url: string;
   fileName?: string;
   kind: MediaKind;
+  /** Drives the download trust gate; when absent the plate is treated
+   * as renderable text (ungated). */
+  mediaType?: string;
   note?: string;
 }) {
   const Glyph = KIND_GLYPHS[kind];
@@ -79,11 +84,14 @@ function DownloadPlate({
           </Text>
         )}
       </div>
-      <Button asChild variant="outline" size="sm" className="ml-2">
-        <a href={url} download>
-          <DownloadIcon /> Download
-        </a>
-      </Button>
+      <GuardedDownload
+        url={url}
+        mediaType={mediaType ?? "text/plain"}
+        {...(fileName !== undefined ? { fileName } : {})}
+        className={cn(buttonVariants({ variant: "outline", size: "sm" }), "ml-2")}
+      >
+        <DownloadIcon /> Download
+      </GuardedDownload>
     </div>
   );
 }
@@ -208,11 +216,11 @@ export function ArtifactViewer({
       }
       // In the transcript an HTML file is a download; the artifact page
       // is where it runs (sandboxed).
-      return <DownloadPlate url={url} fileName={fileName} kind="html" />;
+      return <DownloadPlate url={url} fileName={fileName} kind="html" mediaType={mediaType} />;
     case "markdown":
     case "text":
       return <TextBody url={url} kind={kind} fileName={fileName} variant={variant} />;
     case "binary":
-      return <DownloadPlate url={url} fileName={fileName} kind="binary" />;
+      return <DownloadPlate url={url} fileName={fileName} kind="binary" mediaType={mediaType} />;
   }
 }

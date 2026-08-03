@@ -15,6 +15,7 @@ import { ProviderTile } from "@/components/integrations/ProviderTile";
 import { useProviderIdentity } from "../../hooks/useIntegrations";
 import { mediaKind, sessionArtifactBytesUrl } from "../../lib/artifacts";
 import { ArtifactViewer } from "../artifacts/ArtifactViewer";
+import { GuardedDownload } from "../artifacts/GuardedDownload";
 import { fmtBytes, hms } from "../transcriptFmt";
 import type { SystemMarker } from "./buildMessages";
 import { PlanCard } from "./PlanCard";
@@ -351,16 +352,19 @@ function Artifact({ marker }: { marker: Extract<SystemMarker, { kind: "artifact"
           <span className="font-mono">{marker.mediaType}</span>
           <span aria-hidden>·</span>
           <span className="tabular-nums">{fmtBytes(marker.sizeBytes)}</span>
-          {/* Every shared file — media included — is downloadable. */}
-          <a
-            href={src}
-            download
+          {/* Every shared file — media included — is downloadable; opaque
+              binaries go through the trust gate first. */}
+          <GuardedDownload
+            url={src}
+            mediaType={marker.mediaType}
+            {...(marker.fileName != null ? { fileName: marker.fileName } : {})}
+            sizeBytes={marker.sizeBytes}
             className="ml-auto flex items-center gap-1 transition-colors hover:text-foreground"
             aria-label="Download file"
           >
             <DownloadIcon className="size-3.5" />
             <span className="font-mono tabular-nums">{hms(marker.at)}</span>
-          </a>
+          </GuardedDownload>
         </div>
 
         {kind !== "binary" && (
