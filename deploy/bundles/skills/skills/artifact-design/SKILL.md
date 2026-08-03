@@ -82,11 +82,17 @@ House rules, in order of load-bearing:
   invisible. It carries one primary action, an active marker, a short
   index-tab bar sitting on a rule. Status is never lime: good/warning/
   critical keep their own quiet vocabulary; destructive is the only red.
-- **Type voices**: display/headers in a condensed grotesque, slightly
-  extended tracking (system stack: `"Saira", "Avenir Next Condensed",
-  "Arial Narrow", system-ui, sans-serif`); data, ids, and labels in
-  mono (`"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace`)
-  with `font-variant-numeric: tabular-nums`; body in the system sans.
+- **Type voices — use the real faces.** The product's fonts ship with
+  this skill, fully inlined: copy the contents of
+  `assets/engrams-fonts.css` (next to this SKILL.md) verbatim into the
+  page's `<style>`. It defines `"Saira"` (variable, 100-900) and
+  `"JetBrains Mono"` (variable, 100-800) as data URIs (~100 KB — fine
+  for a report; skip it only when the page must stay tiny, and then
+  keep the fallbacks). Stacks: display/headers
+  `"Saira", "Avenir Next Condensed", "Arial Narrow", system-ui,
+  sans-serif`; data, ids, and labels
+  `"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace` with
+  `font-variant-numeric: tabular-nums`; body in the system sans.
   Section labels are the instrument voice: mono or display caps,
   `letter-spacing: 0.1em`, muted ink.
 - **The logbook grammar**: hairline rules (1px `--border`) do the
