@@ -23,7 +23,7 @@ import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "@/componen
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
-import type { Session, ProfileSnapshotView } from "../lib/types";
+import type { Session, ProfileSnapshotView, IndexedEvent } from "../lib/types";
 
 // The session workspace (ADR 0065 follow-up). The transcript is the primary
 // left column; the live shell + browser live in a resizable companion pane on
@@ -64,6 +64,24 @@ function readPanePref(): WorkPanePref {
   } catch {
     return DEFAULT_PANE_PREF;
   }
+}
+
+/**
+ * True when the agent drove the browser AFTER `sinceMs` (a wall-clock ms
+ * reading taken when this session was opened).
+ *
+ * The SSE feed replays the whole durable log from idx 0, so the raw presence
+ * of a `browser_activity` event says nothing about NOW — it only says the
+ * agent browsed at some point. Only activity that lands while the human has
+ * the session open earns the pane.
+ *
+ * A malformed timestamp parses to NaN and compares false — no auto-open,
+ * which is the safe direction.
+ */
+export function hasLiveBrowserActivity(events: IndexedEvent[], sinceMs: number): boolean {
+  return events.some(
+    (ie) => ie.event.type === "browser_activity" && Date.parse(ie.event.at) > sinceMs,
+  );
 }
 
 function writePanePref(pref: WorkPanePref) {
@@ -184,13 +202,26 @@ export function SessionDetail() {
 
   // ADR 0097: the shared harness enriches a browser-driving Shell/Bash call
   // into browser_activity with the same tool id. Surface the shared Chrome on
-  // the first such event, then respect a human collapse for the rest of this
-  // page lifetime.
+  // the first such event that lands WHILE this page is open, then respect a
+  // human collapse for the rest of this page lifetime.
+  //
+  // Replayed history must never open the pane: the SSE feed replays the whole
+  // durable log from idx 0, so opening a session the agent browsed hours ago
+  // would otherwise pop the browser on every visit. The event's coordinator
+  // timestamp against the moment this session was opened is the boundary.
+  // Clock skew degrades in the safe direction — a browser clock that runs
+  // ahead only delays the auto-open to the next activity event (and `]` always
+  // works). The rail keeps this component mounted across session switches, so
+  // the boundary is keyed by session id, not by mount.
   const autoOpenedBrowserRef = useRef(false);
+  const openedAtRef = useRef<{ id: string; ms: number }>({ id, ms: Date.now() });
+  if (openedAtRef.current.id !== id) {
+    openedAtRef.current = { id, ms: Date.now() };
+    autoOpenedBrowserRef.current = false;
+  }
   useEffect(() => {
     if (!browserEnabled || autoOpenedBrowserRef.current) return;
-    const agentBootedBrowser = events.some((ie) => ie.event.type === "browser_activity");
-    if (agentBootedBrowser) {
+    if (hasLiveBrowserActivity(events, openedAtRef.current.ms)) {
       autoOpenedBrowserRef.current = true;
       openPane("browser");
     }
