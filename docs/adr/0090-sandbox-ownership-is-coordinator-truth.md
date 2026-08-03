@@ -259,3 +259,17 @@ ADR 0098 addendum of the same date) drives every resting Idle/Created
 session's Resume verb at quiescence — the dead-end-state class (safe forever,
 recoverable never) that motivated all of this is now nightly coverage, not
 review luck.
+
+## Closing addendum (2026-08-03, ADR 0110)
+
+ADR 0110 retired the quarantine machinery this document introduced: the
+`quarantined_survivors` heartbeat advert, the coordinator's evict
+ladder, its 3-try budget, and the #972 park-and-recover arm. The dirty
+file made them unnecessary. A failed reattach now recovers on the spot:
+the host flushes the file-backed backend, publishes to the store and
+the coordinator, and destroys the sandbox, so the session parks and
+resumes from the published manifest with no acked write lost.
+
+The ownership model itself stands unchanged: sandbox ownership is
+coordinator truth, the reconciler's coordinator-ask remains, and no
+roll or recovery may kill an owned VM on local evidence alone.

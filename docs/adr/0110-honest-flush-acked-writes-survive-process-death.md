@@ -1,6 +1,16 @@
 # ADR 0110: Honest writes — acked disk writes survive process death
 
-Status: Proposed (2026-08-02)
+Status: Accepted (2026-08-03)
+
+Commit chain — implementation (PR #973, branch `adr-0110-honest-flush`):
+the dirty-file tier, extent-scan recovery, hole punching, the ref
+sidecar (`8e08e9ed`), and the startup sweep (`c5811586`). Retirement
+(the follow-up PR, branch `adr-0110-retirement`): the simulator's
+exact-tag oracle (`eeda8f08`), the host-agent scaffolding deletion and
+the publish-then-destroy reattach recovery (`33d4f895`), the
+coordinator ladder and wire retirement (`fd8bc75a`), the cosim
+zero-rollback inversion (`a0c4e22e`), and this document's bookends.
+The retirement PR merges only after the rollout's soak gate holds.
 
 Terms used in this document:
 
@@ -257,16 +267,22 @@ so a swept file can never be wanted again.
 If step 2 fails (a kernel error, an identity mismatch): upload the
 dirty file's chunks, publish the manifest, destroy the VM, and let the
 next prompt resume from that manifest. **No acked write is lost.** A
-failed reattach becomes a normal park-and-resume, not a rollback.
+failed reattach becomes a normal park-and-resume, not a rollback. The
+destroy runs only after the coordinator acks the publish; any earlier
+failure keeps the VM, the file, and the sidecar in place and returns
+a loud error.
 
 ### Snapshots without a live disk
 
-The published base plus the dirty file fully describe the disk. So
-eviction can build its snapshot from host files alone. It no longer
-needs a live NBD device. This is what lets us delete
-`RefuseUntracked` — the code that refused to snapshot a survivor
-because the snapshot would have dropped its acked writes. There is
-nothing left to drop.
+The published base plus the dirty file fully describe the disk. A
+reattach failure therefore no longer needs a rescue ladder: the host
+flushes the recovered file, publishes, and destroys the sandbox, and
+the session resumes from that manifest (see "If step 2 fails" above).
+As built, the capture-time refusal (`RefuseUntracked`) stays as a loud
+backstop rather than being deleted: the state it guards is unreachable
+once reattach failures self-recover, but refusal is cheap and the
+alternative — a silent `disk_manifest=None` snapshot — is the #743
+corruption shape.
 
 ### The guest's view
 
@@ -400,22 +416,46 @@ Removed outright (≈1,800+ production lines):
 | The RAM dirty map and its lock choreography | `disk_daemon/backend.rs` |
 | The quarantine rescue ladder: the 3-try budget, the park-and-recover arm (#972), `quarantine_reap_unevictable` | `session_verbs.rs`, `idle_evictor.rs` |
 | The `quarantined_survivors` map, its heartbeat advertising, and the coordinator code that consumes it | `pooled_backend.rs`, `heartbeat.rs`, `host_http.rs`, `engram-protocol` |
-| `RefuseUntracked` / `CaptureDrainPlan` (the snapshot refusal) | `engram-host-core/src/survivor.rs` (whole file) |
 | The SIGTERM spool: the shutdown dump, the all-or-nothing adoption, the final-flush sequence (#971's hardening included) | `disk_daemon/spool.rs`, `runtime.rs` adoption arms |
-| The `VerifySeed` probe-read machinery | `runtime.rs` reattach path |
+| The `VerifySeed` probe-read machinery, and the `nbd_verify_on_read` FC test that proved it | `runtime.rs` reattach path, `tests/` |
 | The NBD slot's quarantine state and its state-machine arms | `disk_daemon/slot.rs` |
-| The "disk rolled back" event on the process-death path. The event, metric, and web card stay only for true node loss | `state.rs`, `session_verbs.rs`, `idle_evictor.rs`, `SystemMessage.tsx`, `buildMessages.ts` |
+| The retired metrics: `engram_nbd_spool_lineage_mismatch_total`, `engram_nbd_quarantine_rehydrate_recovered_total`, `engram_quarantine_stuck_total` | `metrics.rs` (both crates) |
+| `plan_shutdown`, `classify_survivor`, `admits_new_plane`, and the SIGTERM flush-budget knob (caller-less once the final flush died) | `engram-host-core/src/shutdown.rs` |
 
-Replaced: ~3,750 lines of recovery tests (`nbd_startup_recovery`,
-`nbd_shutdown_abandon_race`, `nbd_shutdown_final_flush`,
-`chain_rehydrate`, …) collapse into a small dirty-file suite (see
-Testing). Simplified: `rehydrate_sandbox` / `reattach_manifest` shrink
-to open-file → rebuild-bitmap → reconnect → lossless fallback.
+**As built (the retirement review corrected three rows):**
+
+- `survivor.rs` is NOT deleted whole. `plan_resume_attach` (the D4
+  resume guard) never belonged to this feature. And the capture-time
+  refusal (`plan_capture_disk_drain` / `RefuseUntracked`) STAYS as a
+  loud backstop: the state it refuses is unreachable once reattach
+  failures self-recover (below), but the alternative to refusal is a
+  silent `disk_manifest=None` snapshot — the #743 corruption shape.
+- The "disk rolled back" emitters were already gone before this ADR:
+  PR #972 removed the destroy arm. The retirement only corrected the
+  prose on the event, the metric, and the web card. All three stay,
+  reserved for true node loss.
+- Most of the old recovery tests pin machinery this ADR keeps.
+  `nbd_shutdown_abandon_race` (#224), `nbd_startup_recovery`
+  (ADR 0017), and `chain_rehydrate` (memory chain heads) stay. Only
+  `nbd_shutdown_final_flush` and `nbd_verify_on_read` died with their
+  features. The coverage replacement is the dirty-file suite plus the
+  simulator's exact-tag oracle (see Testing).
+
+**What replaces the rescue ladder** (the one piece of new behavior in
+the retirement): a failed reattach recovers on the spot. The recovery
+backend already holds every acked write (it was built from the dirty
+file), so the host flushes it, publishes to the store and the
+coordinator, requires an `Applied` ack, and destroys the sandbox. The
+session parks and resumes from that manifest. Any failure before the
+publish completes keeps the VM, the dirty file, and the sidecar in
+place and returns a loud error. No acked write is lost on either path.
 
 Unchanged: the kernel NBD survival work (ADR 0017), VM survival across
 restarts (ADR 0044 K2), the upload loop and manifest publish (now the
 node-death floor only), the coordinator session state machine,
-`dead_host` for true node loss.
+`dead_host` for true node loss, the gap-A classification barrier
+(`SlotClass::QuarantinedUnknown` — a different feature that shares the
+word), and the eviction-finalize quarantine (same).
 
 New code, in full: the file-backed dirty tier (~150-250 lines), the
 extent-scan recovery (~50), hole-punching after verified publishes
@@ -465,7 +505,15 @@ extent-scan recovery (~50), hole-punching after verified publishes
   rebuild and for hole-punch racing a concurrent write, on ext4.
 - **Simulator (DST/cosim):** the existing quarantine flows (ADR 0098
   Flow A/B) invert: a roll must produce zero "disk rolled back" events
-  and zero rewound event indexes.
+  and zero rewound event indexes. As built: the host simulator's
+  oracle #1 became exact (every chunk of a live backend must read back
+  its latest acked tag), every Linux run ends with a forced
+  crash-and-restart before quiescence, and the cosim pins the
+  zero-rollback roll. One follow-up stands recorded: neither
+  simulator's *rebuild* models the dirty file surviving a cosim roll
+  yet (the dst-host world does; the cosim does not), so the cosim's
+  gap-A test asserts classification and quiescence, not zero-loss
+  recovery.
 - **Firecracker integration (wired into CI per AGENTS.md):** the
   smallest possible proof — write, SIGKILL the host-agent, recover,
   read back. No throughput measurement.
@@ -488,11 +536,14 @@ extent-scan recovery (~50), hole-punching after verified publishes
    until publishes succeed again; a full disk turns into per-sandbox
    EIO, which degrades one guest at a time — better than the RAM
    map's OOM, but it must be visible before it happens).
-3. Delete the scaffolding (the table above) in one retirement PR
-   chain.
+3. Delete the scaffolding (the table above) in one retirement PR.
+   Done — the retirement PR carries the simulator inversion first,
+   then the host-agent and coordinator deletions, then this document.
+   It merges only after gate 2 holds.
 4. Flip this ADR to Accepted with the commit list. Add the closing
    addendum to ADR 0090 (quarantine retired). Mark ADR 0076
-   Superseded by this document.
+   Superseded by this document. Done in the retirement PR's final
+   commit.
 
 ## Relationship to other ADRs
 
