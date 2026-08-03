@@ -198,10 +198,15 @@ Decision — three replacing parts:
 
 If the disk never recovers (e.g. a de-configured kernel device), the
 quarantine-stuck alert routes an OPERATOR decision — an explicit destroy that
-accepts the loss — instead of an automatic one. `durability_rollback` events
-and `engram_durability_rollback_total` remain for the genuinely-lossy paths
-(real host death); on this ladder they no longer have an emitter, which is the
-point.
+accepts the loss — instead of an automatic one. With this change
+`SessionEvent::DurabilityRollback` and `engram_durability_rollback_total` are
+**emitter-less**: this ladder was their only producer. Both are retained
+deliberately — the event variant must keep decoding (the web timeline renders
+the historical incident rows, and the `rewind_session_to_cursor` exclusion
+keeps them surviving rewinds), and the counter name is the canonical one any
+future durability-promise-break path must emit, re-arming the "must be ~0"
+alert with its original meaning. Expected host-death rewinds are a different
+fact and stay on `session_rewound_events_total{cause=host_failure_recovery}`.
 
 ## Addendum (2026-07-31): the binding-disposition contract (#896)
 

@@ -359,10 +359,19 @@ pub const EVICTION_BUDGET_EXHAUSTED_TOTAL: &str = "engram_eviction_budget_exhaus
 /// Counter (ADR 0090, 2026-07-20 durability-rollback incident). A resume
 /// was forced past acked-but-unpublished guest writes — real, user-visible
 /// data loss. Pairs with the durable `durability_rollback` session_events
-/// row. MUST be ~0 — alert on ANY sustained rise. Since the 2026-08-02
-/// RCA the quarantine evict ladder no longer destroys (it parks — see
-/// [`QUARANTINE_STUCK_TOTAL`]), so any new increment means a NEW loss
-/// path, not the known ladder.
+/// row.
+///
+/// **EMITTER-LESS since the 2026-08-02 RCA** (PR #972): the quarantine
+/// evict ladder — the only emitter — no longer destroys (it parks; see
+/// [`QUARANTINE_STUCK_TOTAL`]), so nothing increments this today and the
+/// series exports a constant 0. It is retained deliberately, NOT armed:
+/// the `SessionEvent::DurabilityRollback` variant must keep decoding (the
+/// web timeline renders the historical incident rows), and this name is
+/// the canonical counter any FUTURE durability-promise-break path must
+/// emit — re-adding an emitter re-arms the "must be ~0" alert with its
+/// original meaning. Expected host-death rewinds are NOT this counter's
+/// domain; they are counted by `session_rewound_events_total` with
+/// `cause=host_failure_recovery`.
 pub const DURABILITY_ROLLBACK_TOTAL: &str = "engram_durability_rollback_total";
 
 /// Counter (2026-08-02 durability-rollback RCA). A quarantined survivor's
