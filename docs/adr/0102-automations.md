@@ -78,7 +78,14 @@ action =
 0063 B2 per-session override, stored on the action so every run of one
 automation launches the same harness: absent = inherit the profile's default,
 and a set `model`/`effort` must be an option id on the effective harness's
-descriptor (validated on save against the live catalog). GitHub's installed app is exposed to
+descriptor (validated on save against the live catalog). A save that sets
+`model` or `effort` also PINS the harness those ids belong to. A model id is
+meaningful only next to one harness, so an action naming a model but inheriting
+its harness is under-specified: switching the profile's harness later would
+orphan the id, and the launch path resolves an unknown id to no model env at
+all — a silently wrong model on an unattended run. Pinning gives the action the
+property a profile already has (ProfileService validates its whole triple on
+every save) without a second guard in ProfileService. GitHub's installed app is exposed to
 the dispatcher as the well-known system registration `github-app`; an
 automation bound to it uses the same registration/event matching path as a
 user-created webhook. The GitHub HTTP route remains responsible for its

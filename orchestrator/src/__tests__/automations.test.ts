@@ -351,6 +351,45 @@ describe("AutomationService", () => {
     expect(created.automation?.action?.action.value?.effort).toBeUndefined();
   });
 
+  // Regression: a model/effort id is only meaningful next to one harness. Saving
+  // one without a harness used to leave the action pointing at whatever harness
+  // the PROFILE happened to name; an admin who later switched that profile to
+  // another harness orphaned the id, and the launch path resolves an unknown id
+  // to no model env at all — a silently wrong model, months later. The save now
+  // pins the harness so the stored action cannot be orphaned.
+  test("a model-only or effort-only override pins the profile's harness onto the action", async () => {
+    const { automations } = clients({
+      getSession: session("admin", "admin"),
+      store: fakeStore(),
+      profiles: { getActive: async () => profile() },
+      harnessCatalog: catalog(),
+      now: () => NOW,
+    });
+    const withOverride = (override: { model?: string; effort?: string }) =>
+      automations.createAutomation({
+        ...cronRequest,
+        action: {
+          action: {
+            case: "createTask" as const,
+            value: { ...cronRequest.action.action.value, ...override },
+          },
+        },
+      });
+
+    const modelOnly = await withOverride({ model: "sonnet" });
+    expect(modelOnly.automation?.action?.action.value).toMatchObject({
+      harness: "claude",
+      model: "sonnet",
+    });
+
+    const effortOnly = await withOverride({ effort: "high" });
+    expect(effortOnly.automation?.action?.action.value).toMatchObject({
+      harness: "claude",
+      effort: "high",
+    });
+    expect(effortOnly.automation?.action?.action.value?.model).toBeUndefined();
+  });
+
   test("an automation with no override never reads the harness catalog", async () => {
     let reads = 0;
     const { automations } = clients({

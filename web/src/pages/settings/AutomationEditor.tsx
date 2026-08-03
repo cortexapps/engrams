@@ -895,7 +895,8 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
             />
             <FieldDescription>
               Every run of this automation uses this selection. A field left on the profile default
-              follows the profile.
+              follows the profile. A model or effort choice also pins the harness it belongs to, so
+              a later profile edit cannot silently change the model this automation runs.
             </FieldDescription>
           </Field>
         </CardContent>

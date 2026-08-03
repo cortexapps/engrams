@@ -388,45 +388,53 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
 
   /**
    * ADR 0063 B2: validate the automation's harness/model/effort override against
-   * the live catalog. The effective harness is the override, else the profile's
-   * default — model/effort are option ids on THAT harness's descriptor, so a
-   * combination the editor wouldn't offer never reaches the launch path (where
-   * an unknown id would silently fall back to the descriptor default months
-   * later). The catalog is read only when the automation actually overrides
-   * something; the profile's own selection was validated by ProfileService.
+   * the live catalog, returning the action with the harness those option ids
+   * belong to PINNED onto it.
+   *
+   * A model/effort id is only meaningful next to one harness, so an action that
+   * names a model but inherits its harness is under-specified: an admin who
+   * later switches the profile's harness would orphan the stored id, and the
+   * launch path resolves an unknown id to nothing (compileSessionCreateInput
+   * sets no model env), silently running the new harness's default months later.
+   * A profile can't drift this way because ProfileService validates its whole
+   * triple on every save; pinning gives the action the same property instead of
+   * a second guard in ProfileService that must stay in sync forever. Clearing
+   * the harness in the editor clears model/effort with it, so "follow the
+   * profile" stays reachable — it just cannot mean "keep a foreign model id".
+   *
+   * The catalog is read only when the automation overrides something; the
+   * profile's own selection was already validated by ProfileService.
    */
-  async function assertOverrideValid(
+  async function resolveOverride(
     action: CreateTaskAutomationAction,
     profileHarness: string,
-  ): Promise<void> {
+  ): Promise<CreateTaskAutomationAction> {
     if (
       action.harness === undefined
       && action.model === undefined
       && action.effort === undefined
     ) {
-      return;
+      return action;
     }
-    const effectiveHarness = action.harness ?? profileHarness;
+    const harness = action.harness ?? profileHarness;
     const { harnesses } = await harnessCatalog.listHarnesses({});
-    const descriptor = harnesses.find((h) => h.name === effectiveHarness)?.descriptor;
+    const descriptor = harnesses.find((h) => h.name === harness)?.descriptor;
     if (!descriptor) {
-      throw new ConnectError(
-        `harness "${effectiveHarness}" is not in the catalog`,
-        Code.InvalidArgument,
-      );
+      throw new ConnectError(`harness "${harness}" is not in the catalog`, Code.InvalidArgument);
     }
     if (action.model !== undefined && !(descriptor.models ?? []).some((m) => m.id === action.model)) {
       throw new ConnectError(
-        `model "${action.model}" is not valid for harness "${effectiveHarness}"`,
+        `model "${action.model}" is not valid for harness "${harness}"`,
         Code.InvalidArgument,
       );
     }
     if (action.effort !== undefined && !(descriptor.effort ?? []).some((e) => e.id === action.effort)) {
       throw new ConnectError(
-        `effort "${action.effort}" is not valid for harness "${effectiveHarness}"`,
+        `effort "${action.effort}" is not valid for harness "${harness}"`,
         Code.InvalidArgument,
       );
     }
+    return { ...action, harness };
   }
 
   async function validateInput(input: {
@@ -438,9 +446,9 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
   }): Promise<AutomationInput> {
     const name = requiredText(input.name, "name");
     const trigger = parseTrigger(input.trigger);
-    const action = parseAction(input.action);
+    const parsed = parseAction(input.action);
 
-    const profile = await profiles.getActive(action.profileId);
+    const profile = await profiles.getActive(parsed.profileId);
     if (!profile) {
       throw new ConnectError("action profile_id is not an active profile", Code.InvalidArgument);
     }
@@ -450,7 +458,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         Code.InvalidArgument,
       );
     }
-    await assertOverrideValid(action, profile.harness);
+    const action = await resolveOverride(parsed, profile.harness);
 
     try {
       validateAutomationTemplate(action.promptTemplate);
