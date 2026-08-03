@@ -2675,6 +2675,19 @@ mod tests {
         (backend, store, dir)
     }
 
+    fn test_cache(path: PathBuf) -> ChunkCache {
+        let mut cfg = ChunkCacheConfig::new(path);
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        ChunkCache::new(cfg)
+    }
+
+    /// Keep the dirty file when a test drops its backend.
+    async fn retain_dirty_path(backend: &ChunkedDiskBackend) -> PathBuf {
+        let mut tier = backend.dirty_tier.lock().await;
+        tier.remove_on_drop = false;
+        tier.path.clone()
+    }
+
     /// Synth helper: put a chunk of `byte` repeated `size` times
     /// into the store and return its hash. Lets tests build a base
     /// manifest with known content.
@@ -2710,9 +2723,8 @@ mod tests {
         recovery: Result<(), String>,
     }
 
-    /// Simulate process death and recovery without exposing the current
-    /// handoff mechanism to the tests. The file-backed phase will replace
-    /// this body with successor construction against the same dirty path.
+    /// Simulate process death and recover from the dirty file or the
+    /// pre-upgrade spool fallback.
     async fn survive_process_death(
         backend: ChunkedDiskBackend,
         context: &ProcessRecoveryContext,
@@ -2729,22 +2741,51 @@ mod tests {
             }
             state => state,
         };
-        let (exported_ref, exported_chunks) = backend.export_unflushed().await;
-        drop(interrupted_flush);
-        let recovery_data = match state {
-            ProcessDeathState::Intact => Ok((exported_ref, exported_chunks)),
-            ProcessDeathState::Malformed => Ok((
-                exported_ref,
-                vec![
-                    (0, vec![0x33; 16]),
-                    (7, vec![0x11; 4096]),
-                    (
-                        0,
-                        vec![0x22; context.manifest.chunk_size.as_u64() as usize * 2],
+        match state {
+            ProcessDeathState::Intact => {
+                let successor_ref = backend.manifest_ref().await;
+                let dirty_path = retain_dirty_path(&backend).await;
+                drop(interrupted_flush);
+                drop(backend);
+
+                let successor = ChunkedDiskBackend::from_manifest_with_dirty_file(
+                    successor_ref,
+                    &context.manifest,
+                    test_cache(
+                        context
+                            .cache_root
+                            .join(format!("process-recovery-{}", rand_suffix())),
                     ),
-                ],
-            )),
-            ProcessDeathState::Spool(crash_state) => {
+                    context.store.clone(),
+                    u64::MAX,
+                    dirty_path,
+                    DirtyFileOpenMode::Recover,
+                )
+                .unwrap();
+                ProcessRecoveryOutcome {
+                    backend: successor,
+                    recovery: Ok(()),
+                }
+            }
+            ProcessDeathState::Malformed | ProcessDeathState::Spool(_) => {
+                let (exported_ref, exported_chunks) = backend.export_unflushed().await;
+                let dirty_path = backend.dirty_tier.lock().await.path.clone();
+                let (spool_chunks, crash_state) = match state {
+                    ProcessDeathState::Malformed => (
+                        vec![
+                            (0, vec![0x33; 16]),
+                            (7, vec![0x11; 4096]),
+                            (
+                                1,
+                                vec![0x22; context.manifest.chunk_size.as_u64() as usize * 2],
+                            ),
+                        ],
+                        None,
+                    ),
+                    ProcessDeathState::Spool(crash_state) => (exported_chunks, Some(crash_state)),
+                    ProcessDeathState::Intact
+                    | ProcessDeathState::WriteAfterFlushStarted { .. } => unreachable!(),
+                };
                 let sid = engram_core::SandboxId::new();
                 let spool_root = tempfile::tempdir().unwrap();
                 let root = spool_root.path();
@@ -2754,33 +2795,42 @@ mod tests {
                     root,
                     sid,
                     exported_ref,
-                    &exported_chunks,
+                    &spool_chunks,
                 )
                 .await
                 .map_err(|error| error.to_string());
 
                 if written.is_ok() {
-                    match crash_state {
-                        SpoolCrashState::Pristine => {}
-                        SpoolCrashState::TornChunk => {
-                            std::fs::write(sandbox_dir.join("chunk-0.bin"), [0x11; 100]).unwrap();
-                        }
-                        SpoolCrashState::MissingMarker => {
-                            std::fs::remove_file(sandbox_dir.join("meta.json")).unwrap();
-                        }
-                        SpoolCrashState::MissingChunk => {
-                            std::fs::remove_file(sandbox_dir.join("chunk-2.bin")).unwrap();
-                        }
-                        SpoolCrashState::ForeignGarbage => {
-                            std::fs::write(sandbox_dir.join("chunk-tmp.swp"), b"editor droppings")
+                    if let Some(crash_state) = crash_state {
+                        match crash_state {
+                            SpoolCrashState::Pristine => {}
+                            SpoolCrashState::TornChunk => {
+                                std::fs::write(sandbox_dir.join("chunk-0.bin"), [0x11; 100])
+                                    .unwrap();
+                            }
+                            SpoolCrashState::MissingMarker => {
+                                std::fs::remove_file(sandbox_dir.join("meta.json")).unwrap();
+                            }
+                            SpoolCrashState::MissingChunk => {
+                                std::fs::remove_file(sandbox_dir.join("chunk-2.bin")).unwrap();
+                            }
+                            SpoolCrashState::ForeignGarbage => {
+                                std::fs::write(
+                                    sandbox_dir.join("chunk-tmp.swp"),
+                                    b"editor droppings",
+                                )
                                 .unwrap();
-                            std::fs::write(sandbox_dir.join("chunk-0.bin.partial"), b"torn tmp")
+                                std::fs::write(
+                                    sandbox_dir.join("chunk-0.bin.partial"),
+                                    b"torn tmp",
+                                )
                                 .unwrap();
+                            }
                         }
                     }
                 }
 
-                match written {
+                let recovery_data = match written {
                     Err(error) => Err(error),
                     Ok(_) => match spool::read_spool(&engram_host_core::TokioFs, root, sid).await {
                         Ok(Some((meta, chunks))) => Ok((
@@ -2793,41 +2843,42 @@ mod tests {
                         Ok(None) => Err("recovery state is incomplete".into()),
                         Err(error) => Err(error.to_string()),
                     },
+                };
+
+                std::fs::remove_file(dirty_path).unwrap();
+                drop(interrupted_flush);
+                drop(backend);
+
+                let successor_ref = recovery_data
+                    .as_ref()
+                    .map(|(manifest_ref, _)| *manifest_ref)
+                    .unwrap_or(exported_ref);
+                let successor = ChunkedDiskBackend::new(
+                    successor_ref,
+                    &context.manifest,
+                    test_cache(
+                        context
+                            .cache_root
+                            .join(format!("process-recovery-{}", rand_suffix())),
+                    ),
+                    context.store.clone(),
+                    u64::MAX,
+                )
+                .unwrap();
+                let recovery = match recovery_data {
+                    Ok((_manifest_ref, chunks)) => successor
+                        .adopt_unflushed(chunks)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error),
+                };
+                ProcessRecoveryOutcome {
+                    backend: successor,
+                    recovery,
                 }
             }
             ProcessDeathState::WriteAfterFlushStarted { .. } => unreachable!(),
-        };
-
-        let successor_ref = recovery_data
-            .as_ref()
-            .map(|(manifest_ref, _)| *manifest_ref)
-            .unwrap_or(exported_ref);
-        let mut cfg = ChunkCacheConfig::new(
-            context
-                .cache_root
-                .join(format!("process-recovery-{}", rand_suffix())),
-        );
-        cfg.budget_bytes = 64 * 1024 * 1024;
-        let successor = ChunkedDiskBackend::new(
-            successor_ref,
-            &context.manifest,
-            ChunkCache::new(cfg),
-            context.store.clone(),
-            u64::MAX,
-        )
-        .unwrap();
-        let recovery = match recovery_data {
-            Ok((_manifest_ref, chunks)) => successor
-                .adopt_unflushed(chunks)
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-            Err(error) => Err(error),
-        };
-
-        ProcessRecoveryOutcome {
-            backend: successor,
-            recovery,
         }
     }
 
@@ -2862,7 +2913,7 @@ mod tests {
     /// an earlier flush is in progress.
     #[tokio::test]
     async fn acked_writes_survive_process_death_across_backends() {
-        let chunk_size = 4096u64;
+        let chunk_size = 64 * 1024u64;
         let total = 3 * chunk_size;
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
@@ -2893,14 +2944,20 @@ mod tests {
             store,
         };
 
-        backend.write(0, &[0x11; 4096]).await.unwrap();
-        backend.write(2 * chunk_size, &[0x33; 4096]).await.unwrap();
+        backend
+            .write(0, &vec![0x11; chunk_size as usize])
+            .await
+            .unwrap();
+        backend
+            .write(2 * chunk_size, &vec![0x33; chunk_size as usize])
+            .await
+            .unwrap();
         let outcome = survive_process_death(
             backend,
             &context,
             ProcessDeathState::WriteAfterFlushStarted {
                 offset: 0,
-                bytes: vec![0x22; 4096],
+                bytes: vec![0x22; chunk_size as usize],
             },
         )
         .await;
@@ -3017,6 +3074,230 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// Recovery keeps writes in chunks that an interrupted flush claimed.
+    #[tokio::test]
+    async fn acked_writes_survive_death_with_claims_in_flight() {
+        let chunk_size = 64 * 1024u64;
+        let total = 3 * chunk_size;
+        let manifest = synth_manifest(total, chunk_size, vec![]);
+        let (backend, store, dir) = build_backend(&manifest).await;
+        let manifest_ref = backend.manifest_ref().await;
+
+        backend
+            .write(0, &vec![0x11; chunk_size as usize])
+            .await
+            .unwrap();
+        backend
+            .write(2 * chunk_size, &vec![0x33; chunk_size as usize])
+            .await
+            .unwrap();
+        let pending = backend.flush_local().await.unwrap();
+        backend
+            .write(chunk_size / 2, &vec![0x22; chunk_size as usize / 2])
+            .await
+            .unwrap();
+
+        let dirty_path = retain_dirty_path(&backend).await;
+        drop(pending);
+        drop(backend);
+
+        let successor = ChunkedDiskBackend::from_manifest_with_dirty_file(
+            manifest_ref,
+            &manifest,
+            test_cache(dir.path().join("claims-recovery-cache")),
+            store,
+            u64::MAX,
+            dirty_path,
+            DirtyFileOpenMode::Recover,
+        )
+        .unwrap();
+        let mut expected = vec![0; total as usize];
+        expected[..chunk_size as usize / 2].fill(0x11);
+        expected[chunk_size as usize / 2..chunk_size as usize].fill(0x22);
+        expected[(2 * chunk_size) as usize..].fill(0x33);
+
+        assert_eq!(successor.read(0, total).await.unwrap(), expected);
+    }
+
+    /// A verified publish removes dirty extents and keeps reads correct.
+    #[tokio::test]
+    async fn verified_publish_punches_holes_and_reads_stay_correct() {
+        let chunk_size = 64 * 1024u64;
+        let total = 2 * chunk_size;
+        let manifest = synth_manifest(total, chunk_size, vec![]);
+        let (backend, store, dir) = build_backend(&manifest).await;
+        let dirty_path = retain_dirty_path(&backend).await;
+        let mut expected = vec![0; total as usize];
+        expected[chunk_size as usize..].fill(0x5a);
+
+        backend
+            .write(chunk_size, &vec![0x5a; chunk_size as usize])
+            .await
+            .unwrap();
+        let outcome = backend.flush().await.unwrap();
+        assert_eq!(backend.read(0, total).await.unwrap(), expected);
+
+        let published = store.get_manifest(outcome.manifest_ref).await.unwrap();
+        drop(backend);
+        let successor = ChunkedDiskBackend::from_manifest_with_dirty_file(
+            outcome.manifest_ref,
+            &published,
+            test_cache(dir.path().join("punched-recovery-cache")),
+            store,
+            u64::MAX,
+            dirty_path,
+            DirtyFileOpenMode::Recover,
+        )
+        .unwrap();
+
+        assert_eq!(successor.dirty_chunks_count().await, 0);
+        assert_eq!(successor.read(0, total).await.unwrap(), expected);
+    }
+
+    /// A rewrite during upload stays dirty and is published by the next flush.
+    #[tokio::test]
+    async fn chunk_rewritten_during_upload_is_not_punched_and_reuploads() {
+        let chunk_size = 4096u64;
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![]);
+        let (backend, store, dir) = build_backend(&manifest).await;
+        let backend = Arc::new(backend);
+        let dirty_path = retain_dirty_path(&backend).await;
+
+        backend.write(0, &[0x11; 4096]).await.unwrap();
+        let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::PostUploadPrePublish);
+        let flush_task = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.flush().await })
+        };
+        arrived.notified().await;
+        backend.write(chunk_size / 2, &[0x22; 2048]).await.unwrap();
+        proceed.notify_one();
+        flush_task.await.unwrap().unwrap();
+
+        let mut expected = vec![0x11; chunk_size as usize];
+        expected[chunk_size as usize / 2..].fill(0x22);
+        assert_eq!(backend.read(0, chunk_size).await.unwrap(), expected);
+        assert_eq!(backend.dirty_chunks_count().await, 1);
+
+        let outcome = backend.flush().await.unwrap();
+        assert_eq!(outcome.chunks_flushed, 1);
+        assert_eq!(backend.read(0, chunk_size).await.unwrap(), expected);
+        let published = store.get_manifest(outcome.manifest_ref).await.unwrap();
+        drop(backend);
+
+        let successor = ChunkedDiskBackend::from_manifest_with_dirty_file(
+            outcome.manifest_ref,
+            &published,
+            test_cache(dir.path().join("rewrite-recovery-cache")),
+            store,
+            u64::MAX,
+            dirty_path,
+            DirtyFileOpenMode::Recover,
+        )
+        .unwrap();
+        assert_eq!(successor.dirty_chunks_count().await, 0);
+        assert_eq!(successor.read(0, chunk_size).await.unwrap(), expected);
+    }
+
+    /// A publish that omits uploaded data cannot remove the dirty extent.
+    #[tokio::test]
+    async fn publish_that_omits_a_chunk_never_punches() {
+        let chunk_size = 4096u64;
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let omit_next_manifest_read = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let blob: Arc<dyn BlobStorage> = Arc::new(OmitChunkOnManifestReadBlob {
+            inner: LocalBlobStorage::new(dir.path().join("blob")),
+            omit_next_manifest_read: omit_next_manifest_read.clone(),
+        });
+        let store = Arc::new(ChunkStore::new(blob));
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let backend = ChunkedDiskBackend::new(
+            manifest_ref,
+            &manifest,
+            test_cache(dir.path().join("cache")),
+            store.clone(),
+            u64::MAX,
+        )
+        .unwrap();
+        let expected = vec![0x6b; chunk_size as usize];
+        backend.write(0, &expected).await.unwrap();
+
+        omit_next_manifest_read.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            backend.flush().await,
+            Err(DiskBackendError::InvariantViolation(_))
+        ));
+        assert_eq!(backend.read(0, chunk_size).await.unwrap(), expected);
+
+        let dirty_path = retain_dirty_path(&backend).await;
+        let successor_ref = backend.manifest_ref().await;
+        drop(backend);
+        let successor = ChunkedDiskBackend::from_manifest_with_dirty_file(
+            successor_ref,
+            &manifest,
+            test_cache(dir.path().join("omitted-recovery-cache")),
+            store,
+            u64::MAX,
+            dirty_path,
+            DirtyFileOpenMode::Recover,
+        )
+        .unwrap();
+
+        assert_eq!(successor.dirty_chunks_count().await, 1);
+        assert_eq!(successor.read(0, chunk_size).await.unwrap(), expected);
+    }
+
+    /// Recovery marks the whole chunk for a partial allocated extent.
+    #[tokio::test]
+    async fn extent_scan_marks_partial_extents_as_whole_chunks() {
+        let chunk_size = 64 * 1024u64;
+        let total = 4 * chunk_size;
+        let manifest = synth_manifest(total, chunk_size, vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let dirty_path = dir.path().join("out-of-band-dirty.cache");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&dirty_path)
+            .unwrap();
+        file.set_len(total).unwrap();
+        let middle = 173usize;
+        let bytes = [0xa1, 0xb2, 0xc3, 0xd4, 0xe5];
+        write_all_at(
+            &file,
+            &bytes,
+            2 * chunk_size + u64::try_from(middle).unwrap(),
+        )
+        .unwrap();
+        drop(file);
+
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().join("blob")));
+        let store = Arc::new(ChunkStore::new(blob));
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let backend = ChunkedDiskBackend::from_manifest_with_dirty_file(
+            manifest_ref,
+            &manifest,
+            test_cache(dir.path().join("cache")),
+            store,
+            u64::MAX,
+            dirty_path,
+            DirtyFileOpenMode::Recover,
+        )
+        .unwrap();
+
+        assert_eq!(backend.dirty_chunks_count().await, 1);
+        let mut expected = vec![0; chunk_size as usize];
+        expected[middle..middle + bytes.len()].copy_from_slice(&bytes);
+        assert_eq!(
+            backend.read(2 * chunk_size, chunk_size).await.unwrap(),
+            expected
+        );
     }
 
     #[tokio::test]
@@ -4297,6 +4578,71 @@ mod tests {
         async fn delete(&self, key: &str) -> Result<(), engram_core::error::BlobError> {
             self.inner.delete(key).await
         }
+        async fn list_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<String>, engram_core::error::BlobError> {
+            self.inner.list_prefix(prefix).await
+        }
+    }
+
+    /// A blob store that omits one chunk from the next manifest read.
+    struct OmitChunkOnManifestReadBlob {
+        inner: LocalBlobStorage,
+        omit_next_manifest_read: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStorage for OmitChunkOnManifestReadBlob {
+        async fn put_streaming(
+            &self,
+            key: &str,
+            body: ByteStream,
+        ) -> Result<u64, engram_core::error::BlobError> {
+            self.inner.put_streaming(key, body).await
+        }
+
+        async fn get_streaming(
+            &self,
+            key: &str,
+        ) -> Result<ByteStream, engram_core::error::BlobError> {
+            if key.starts_with("manifests/")
+                && self
+                    .omit_next_manifest_read
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                let bytes = self.inner.get(key).await?;
+                let mut manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
+                    engram_core::error::BlobError::Protocol(format!(
+                        "test manifest decode failed: {error}"
+                    ))
+                })?;
+                manifest.chunks.pop().ok_or_else(|| {
+                    engram_core::error::BlobError::Protocol(
+                        "test manifest had no chunk to omit".into(),
+                    )
+                })?;
+                let bytes = serde_json::to_vec(&manifest).map_err(|error| {
+                    engram_core::error::BlobError::Protocol(format!(
+                        "test manifest encode failed: {error}"
+                    ))
+                })?;
+                return Ok(ByteStream::from_vec(bytes));
+            }
+            self.inner.get_streaming(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::BlobObjectMeta, engram_core::error::BlobError> {
+            self.inner.head(key).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), engram_core::error::BlobError> {
+            self.inner.delete(key).await
+        }
+
         async fn list_prefix(
             &self,
             prefix: &str,
