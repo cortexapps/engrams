@@ -69,5 +69,8 @@ pub struct ArtifactRow {
     pub media_type: String,
     pub size_bytes: i64,
     pub caption: Option<String>,
+    /// Sanitized guest-declared basename; `None` for artifacts shared
+    /// before file names rode the wire.
+    pub file_name: Option<String>,
     pub created_at: DateTime<Utc>,
 }

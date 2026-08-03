@@ -297,6 +297,7 @@ pub async fn process_upload(
             &media_type,
             size as i64,
             caption.as_deref(),
+            None,
         )
         .await
     {

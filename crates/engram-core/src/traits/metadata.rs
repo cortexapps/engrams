@@ -2076,9 +2076,11 @@ pub trait MetadataStore: Send + Sync {
     // ---- file artifacts (ADR 0026) ----
 
     /// Record a shared file artifact for a session. `id` is the
-    /// server-generated UUID that also names the blob key; the row
-    /// cascades on session delete. `caption` is untrusted text the
-    /// caller has already length-capped + control-char-stripped.
+    /// server-generated UUID that also names the blob key. Rows outlive
+    /// their session (no FK since migration 0110) — the cross-session
+    /// artifact registry references them by id. `caption` and
+    /// `file_name` are untrusted text the caller has already sanitized.
+    #[allow(clippy::too_many_arguments)]
     async fn insert_artifact(
         &self,
         id: uuid::Uuid,
@@ -2087,6 +2089,7 @@ pub trait MetadataStore: Send + Sync {
         media_type: &str,
         size_bytes: i64,
         caption: Option<&str>,
+        file_name: Option<&str>,
     ) -> Result<(), MetaError>;
 
     /// Fetch one artifact **scoped to its session** (so one session can

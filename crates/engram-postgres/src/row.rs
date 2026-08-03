@@ -319,6 +319,7 @@ pub(crate) fn artifact_from_row(row: &PgRow) -> Result<engram_core::types::Artif
         media_type: row.try_get("media_type").map_err(col_err)?,
         size_bytes: row.try_get("size_bytes").map_err(col_err)?,
         caption: row.try_get("caption").map_err(col_err)?,
+        file_name: row.try_get("file_name").map_err(col_err)?,
         created_at: row.try_get("created_at").map_err(col_err)?,
     })
 }

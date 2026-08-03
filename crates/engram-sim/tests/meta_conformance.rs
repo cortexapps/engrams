@@ -3098,6 +3098,91 @@ async fn list_active_sessions_projects_activity_clock(ctx: &Ctx) {
     assert_eq!(s.last_event_at, Some(event_at));
 }
 
+/// ADR 0026 artifacts: insert/get roundtrip (incl. `file_name`, added by
+/// migration 0110), session scoping, and usage aggregation.
+async fn artifact_insert_get_usage(ctx: &Ctx) {
+    let sid = ctx
+        .meta
+        .create_session(spec("test.invalid/artifacts:latest"))
+        .await
+        .unwrap();
+    let id = uuid::Uuid::from_u128(0xA1);
+    ctx.meta
+        .insert_artifact(
+            id,
+            sid,
+            "artifacts/k1",
+            "text/html",
+            42,
+            Some("cap"),
+            Some("report.html"),
+        )
+        .await
+        .unwrap();
+
+    let row = ctx.meta.get_artifact(sid, id).await.unwrap().unwrap();
+    assert_eq!(row.id, id);
+    assert_eq!(row.blob_key, "artifacts/k1");
+    assert_eq!(row.media_type, "text/html");
+    assert_eq!(row.size_bytes, 42);
+    assert_eq!(row.caption.as_deref(), Some("cap"));
+    assert_eq!(row.file_name.as_deref(), Some("report.html"));
+
+    // NULL caption + file_name round-trip as None.
+    let id2 = uuid::Uuid::from_u128(0xA2);
+    ctx.meta
+        .insert_artifact(id2, sid, "artifacts/k2", "image/png", 8, None, None)
+        .await
+        .unwrap();
+    let row2 = ctx.meta.get_artifact(sid, id2).await.unwrap().unwrap();
+    assert_eq!(row2.caption, None);
+    assert_eq!(row2.file_name, None);
+
+    // Session scoping: a valid id under the wrong session is None.
+    let other = ctx
+        .meta
+        .create_session(spec("test.invalid/artifacts-b:latest"))
+        .await
+        .unwrap();
+    assert!(ctx.meta.get_artifact(other, id).await.unwrap().is_none());
+
+    // A duplicate id is an error on both stores (PK).
+    let dup = ctx
+        .meta
+        .insert_artifact(id, sid, "artifacts/k1", "text/html", 42, None, None)
+        .await;
+    assert!(dup.is_err(), "duplicate artifact id must error");
+
+    // Usage aggregates count + bytes for the session only.
+    assert_eq!(ctx.meta.artifact_usage(sid).await.unwrap(), (2, 50));
+    assert_eq!(ctx.meta.artifact_usage(other).await.unwrap(), (0, 0));
+}
+
+/// Migration 0110 semantics: artifact rows have no FK to `sessions` —
+/// an insert for a session id with no sessions row succeeds and reads
+/// back (rows outlive their session; the cross-session registry
+/// references them by id).
+async fn artifact_outlives_sessions(ctx: &Ctx) {
+    let ghost = SessionId::from(uuid::Uuid::from_u128(0xDEAD));
+    let id = uuid::Uuid::from_u128(0xA3);
+    ctx.meta
+        .insert_artifact(
+            id,
+            ghost,
+            "artifacts/ghost",
+            "text/markdown",
+            7,
+            None,
+            Some("notes.md"),
+        )
+        .await
+        .unwrap();
+    let row = ctx.meta.get_artifact(ghost, id).await.unwrap().unwrap();
+    assert_eq!(row.media_type, "text/markdown");
+    assert_eq!(row.file_name.as_deref(), Some("notes.md"));
+    assert_eq!(ctx.meta.artifact_usage(ghost).await.unwrap(), (1, 7));
+}
+
 conformance!(
     t_rewind_excludes_coordinator_facts,
     super::rewind_excludes_coordinator_facts
@@ -3124,4 +3209,12 @@ conformance!(
 conformance!(
     t_list_active_sessions_activity_clock,
     super::list_active_sessions_projects_activity_clock
+);
+conformance!(
+    t_artifact_insert_get_usage,
+    super::artifact_insert_get_usage
+);
+conformance!(
+    t_artifact_outlives_sessions,
+    super::artifact_outlives_sessions
 );
