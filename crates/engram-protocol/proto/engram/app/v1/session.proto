@@ -626,6 +626,10 @@ message CreateArtifactFromPathRequest {
   string session_id = 1;
   string path = 2;
   optional string caption = 3;
+  // Skip the file_shared session event. The Artifact tool sets this so a
+  // publish does not ALSO drop a share card in the thread (the tool
+  // result carries the artifact URL).
+  bool suppress_event = 4;
 }
 
 message CreateArtifactFromPathResponse {

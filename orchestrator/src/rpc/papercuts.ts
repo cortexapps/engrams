@@ -1,12 +1,13 @@
 /** Orchestrator-native PapercutService. */
 
 import { ConnectError, Code } from "@connectrpc/connect";
-import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
+import type { ConnectRouter } from "@connectrpc/connect";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 
 import { PapercutService } from "../gen/engram/app/v1/papercut_pb.ts";
 import type { Papercut } from "../gen/engram/app/v1/papercut_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { requireUser } from "./require.ts";
 import { getDb } from "../db/client.ts";
 import {
   makePapercutStore,
@@ -34,17 +35,6 @@ interface ProfileSnapshotFields {
   icon: string;
 }
 
-function headersOf(ctx: HandlerContext): Headers {
-  return ctx.requestHeader;
-}
-
-async function requireUser(
-  ctx: HandlerContext,
-  getSession: GetSession,
-): Promise<void> {
-  const session = await getSession(headersOf(ctx));
-  if (!session) throw new ConnectError("unauthenticated", Code.Unauthenticated);
-}
 
 function toProto(
   row: PapercutRow,

@@ -48,6 +48,7 @@ import { registerOrgSecret } from "./rpc/org-secret.ts";
 import { registerMint } from "./rpc/mint.ts";
 import { registerApiKeys } from "./rpc/api-key.ts";
 import { registerIntegration } from "./rpc/integration.ts";
+import { registerArtifacts } from "./rpc/artifacts.ts";
 import { registerAutomations } from "./rpc/automations.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
@@ -222,6 +223,10 @@ const server = buildServer(
     // admin-authored triggers, render preview, run/sample history, and sealed
     // per-registration webhook secrets.
     registerAutomations(router);
+
+    // Native ArtifactService: the cross-session artifact registry (owner /
+    // org-shared / admin via the shared service layer). Before passthrough.
+    registerArtifacts(router);
 
     // Generic passthrough: forwards SessionService, FleetService, ImageService
     // to the control plane with per-method CASL authz gate (ADR 0051 Task 18).

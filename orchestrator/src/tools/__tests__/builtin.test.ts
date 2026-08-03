@@ -113,6 +113,7 @@ describe("built-in tools", () => {
     expect(manifest.map((tool) => tool.name)).toEqual([
       "ask_user_question",
       "exit_plan_mode",
+      "Artifact",
       "papercut",
     ]);
     expect(manifest[0]).toEqual({
@@ -169,6 +170,7 @@ describe("built-in tools", () => {
     expect(manifest.map((tool) => tool.name)).toEqual([
       "ask_user_question",
       "exit_plan_mode",
+      "Artifact",
       "papercut",
     ]);
     expect(manifest.find((tool) => tool.name === "papercut")).toMatchObject({
