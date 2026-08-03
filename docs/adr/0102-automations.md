@@ -280,9 +280,18 @@ secret behavior:
    the profile for unattended execution.
 
 Port exposure is the exception. Its ownership row requires a real user owner,
-and assigning an unattended public port to a fictitious identity would create a
-new auth model. V1 rejects any profile with `port_exposures` when an automation
-is saved or updated.
+and assigning an unattended port to a fictitious identity would create a new
+auth model. Automation runs therefore ignore a profile's `port_exposures`:
+`createSessionForExistingTask` (the automation path) does not auto-mint, only
+`createTaskWithSession` does. The profile itself stays valid, so one profile can
+serve both interactive tasks and automations. An admin who needs a preview link
+on an automation session exposes the port by hand
+(`POST /api/v1/sessions/:id/ports`) and owns the resulting row.
+
+> Divergence: this originally rejected any profile with `port_exposures` at
+> save time. That blocked profile reuse for no gain — the run path already
+> ignored the field — so the check was removed and the behavior documented in
+> the automation editor instead.
 
 ### 8. The public surface is two admin-gated Connect services
 

@@ -305,14 +305,15 @@ describe("AutomationService", () => {
     expect(response.automation?.nextFireAt).toBeTruthy();
   });
 
-  test("rejects profiles with port exposures before saving", async () => {
+  test("accepts a profile with port exposures — the run ignores them", async () => {
     const { automations } = clients({
       getSession: session("admin", "admin"),
       store: fakeStore(),
       profiles: { getActive: async () => profile([3000]) },
       now: () => NOW,
     });
-    await expectCode(automations.createAutomation(cronRequest), Code.InvalidArgument);
+    const response = await automations.createAutomation(cronRequest);
+    expect(response.automation?.id).toBeTruthy();
   });
 
   test("persists a harness/model/effort override and rejects ids the catalog lacks", async () => {

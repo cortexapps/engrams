@@ -881,7 +881,9 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
               </SelectContent>
             </Select>
             <FieldDescription>
-              V1 cannot use profiles with public port exposures; the server checks this on save.
+              If the profile declares port exposures, automation runs ignore them: an automation
+              session has no user owner to attribute a preview link to. An admin can still expose a
+              port by hand on a running automation session.
             </FieldDescription>
             {fieldError(errors, "profile")}
           </Field>

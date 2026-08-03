@@ -452,12 +452,12 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     if (!profile) {
       throw new ConnectError("action profile_id is not an active profile", Code.InvalidArgument);
     }
-    if (profile.portExposures.length > 0) {
-      throw new ConnectError(
-        "automation profiles cannot declare port_exposures because automation tasks have no user owner",
-        Code.InvalidArgument,
-      );
-    }
+    // A profile's port_exposures are ignored on the automation path, not a
+    // reason to reject the profile: an automation session has no user owner,
+    // and `port_exposure.owner_user_id` is NOT NULL. Only
+    // `createTaskWithSession` auto-mints; `createSessionForExistingTask` (the
+    // automation path) never does. An admin can still expose a port by hand on
+    // a live automation session via POST /api/v1/sessions/:id/ports.
     const action = await resolveOverride(parsed, profile.harness);
 
     try {
