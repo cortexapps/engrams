@@ -26,7 +26,6 @@
  * Deps are injectable for tests; real singletons are used when omitted.
  */
 
-import { timingSafeEqual } from "node:crypto";
 import net from "node:net";
 import { Duplex } from "node:stream";
 import type { Context, MiddlewareHandler } from "hono";
@@ -39,6 +38,7 @@ import {
 } from "../gen/engram/app/v1/session_pb.ts";
 import { portRelay as defaultPortRelay } from "../control-plane/client.ts";
 import { config } from "../config.ts";
+import { constantTimeEquals } from "../crypto/constant-time.ts";
 import { isValidSlug } from "../ports/slug.ts";
 import {
   makePortExposureStore,
@@ -98,12 +98,6 @@ export type PreviewAuth =
   | { ok: true; row: PortExposureRow }
   | { ok: false; status: 401 | 403 | 404 | 410 };
 
-function constantTimeEquals(a: string, b: string): boolean {
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return timingSafeEqual(ab, bb);
-}
 
 /**
  * Resolve + authorize a preview request. `now` is injectable for tests.
