@@ -1,0 +1,96 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+import "engram/app/v1/user.proto";
+
+// ArtifactService — the cross-session artifact registry (orchestrator-
+// NATIVE, never a coordinator passthrough; the registry tables live in
+// the orchestrator DB and authorization is CASL-scoped there).
+//
+// An artifact is a hosted, versioned HTML/Markdown document published
+// from a session via the Artifact tool. The stable page URL is
+// /artifacts/<id>; bytes are served by the HTTP route
+// GET /api/v1/artifacts/<id>[?v=N] (streaming; cookie or short-lived
+// token auth). Message names avoid session.proto's GetArtifact* family
+// (same package; those are the session-scoped byte stream).
+service ArtifactService {
+  rpc ListArtifacts(ListArtifactsRequest) returns (ListArtifactsResponse);
+  rpc GetArtifactRecord(GetArtifactRecordRequest) returns (GetArtifactRecordResponse);
+  rpc SetArtifactVisibility(SetArtifactVisibilityRequest) returns (SetArtifactVisibilityResponse);
+  rpc DeleteArtifact(DeleteArtifactRequest) returns (DeleteArtifactResponse);
+}
+
+message ArtifactVersionRecord {
+  int32 version = 1;
+  // Provenance: the session that published this version.
+  string session_id = 2;
+  optional string task_id = 3;
+  string media_type = 4;
+  uint64 size_bytes = 5;
+  string created_at = 6; // RFC 3339
+}
+
+message ArtifactRecord {
+  string id = 1;
+  string title = 2;
+  string file_name = 3;
+  // Null for rows whose owner account was deleted (admin-only visibility).
+  optional string owner_user_id = 4;
+  optional User created_by = 5;
+  // "private" (owner + admin) | "org" (any authenticated user).
+  string visibility = 6;
+  int32 current_version = 7;
+  // Media type / size of the current version.
+  string media_type = 8;
+  uint64 size_bytes = 9;
+  string created_at = 10;
+  string updated_at = 11;
+  // Short-lived tokened byte URL for the current version — usable from
+  // opaque-origin contexts (sandboxed iframes) where cookies do not ride.
+  string raw_url = 12;
+  // Version history, newest first. Populated by GetArtifactRecord;
+  // ListArtifacts leaves it empty.
+  repeated ArtifactVersionRecord versions = 13;
+}
+
+message ListArtifactsRequest {
+  // "" | "mine" | "shared" | "all". Empty = mine for a member, all for
+  // an admin (ListTasks defaulting). "shared" = org-visible artifacts
+  // from anyone. "all" is admin-only.
+  string scope = 1;
+  // 1-based page over the newest-first ordering. page_size 0 =
+  // unpaginated; clamped to 200 otherwise.
+  int32 page = 2;
+  int32 page_size = 3;
+}
+
+message ListArtifactsResponse {
+  repeated ArtifactRecord artifacts = 1;
+  int32 total_count = 2; // matches BEFORE pagination
+}
+
+message GetArtifactRecordRequest {
+  string id = 1;
+}
+
+message GetArtifactRecordResponse {
+  ArtifactRecord artifact = 1;
+}
+
+message SetArtifactVisibilityRequest {
+  string id = 1;
+  string visibility = 2; // "private" | "org"
+}
+
+message SetArtifactVisibilityResponse {
+  ArtifactRecord artifact = 1;
+}
+
+message DeleteArtifactRequest {
+  string id = 1;
+}
+
+message DeleteArtifactResponse {
+  bool deleted = 1;
+}

@@ -209,6 +209,7 @@ pub async fn process_upload(
     ext: &str,
     caption: Option<String>,
     file_name: Option<String>,
+    emit_event: bool,
 ) -> Result<SharedArtifact, UploadError> {
     // Pre-write quota check against existing usage.
     let (count, total) = state
@@ -328,21 +329,23 @@ pub async fn process_upload(
     }
 
     let id_str = artifact_id.simple().to_string();
-    if let Err(e) = state
-        .emit(
-            session,
-            SessionEvent::FileShared {
-                artifact_id: id_str.clone(),
-                media_type: media_type.clone(),
-                size_bytes: size,
-                caption,
-                file_name,
-                at: state.services.clock.now_utc(),
-            },
-        )
-        .await
-    {
-        tracing::warn!(session = %session, error = %e, "emit FileShared failed (artifact stored)");
+    if emit_event {
+        if let Err(e) = state
+            .emit(
+                session,
+                SessionEvent::FileShared {
+                    artifact_id: id_str.clone(),
+                    media_type: media_type.clone(),
+                    size_bytes: size,
+                    caption,
+                    file_name,
+                    at: state.services.clock.now_utc(),
+                },
+            )
+            .await
+        {
+            tracing::warn!(session = %session, error = %e, "emit FileShared failed (artifact stored)");
+        }
     }
 
     Ok(SharedArtifact {
@@ -387,6 +390,7 @@ async fn authorized_untrusted_upload(
         &ext.to_ascii_lowercase(),
         sanitize_caption(caption),
         sanitize_file_name(file_name),
+        true,
     )
     .await
     {
@@ -604,6 +608,7 @@ pub(crate) async fn create_artifact_from_path_core(
     session: SessionId,
     path: &str,
     caption: Option<String>,
+    suppress_event: bool,
 ) -> Result<SharedArtifact, ApiError> {
     crate::api::snapshot::ensure_active(state, session).await?;
     let sandbox_id = state.resolve_sandbox(session).await.ok_or_else(|| {
@@ -637,6 +642,7 @@ pub(crate) async fn create_artifact_from_path_core(
         &ext,
         sanitize_caption(caption),
         file_name,
+        !suppress_event,
     )
     .await?)
 }

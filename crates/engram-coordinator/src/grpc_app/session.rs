@@ -679,10 +679,15 @@ impl app::session_service_server::SessionService for AppSessionService {
         self.auth.check(&req)?;
         let r = req.into_inner();
         let id = parse_session_id(&r.session_id)?;
-        let artifact =
-            crate::api::upload::create_artifact_from_path_core(&self.state, id, &r.path, r.caption)
-                .await
-                .map_err(into_status)?;
+        let artifact = crate::api::upload::create_artifact_from_path_core(
+            &self.state,
+            id,
+            &r.path,
+            r.caption,
+            r.suppress_event,
+        )
+        .await
+        .map_err(into_status)?;
         Ok(Response::new(app::CreateArtifactFromPathResponse {
             artifact_id: artifact.artifact_id,
             media_type: artifact.media_type,
