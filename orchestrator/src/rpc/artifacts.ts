@@ -51,7 +51,9 @@ export interface ArtifactRpcDeps {
   now?: () => Date;
 }
 
-/** List page-size ceiling; 0 = unpaginated (small registries). */
+/** List page-size ceiling — also the default: an omitted page_size (proto
+ * 0) gets one full page, never the whole registry. The org-shared scope
+ * grows without bound, so there is no unpaginated path. */
 const MAX_PAGE_SIZE = 200;
 
 function versionToProto(
@@ -130,7 +132,7 @@ export function registerArtifacts(router: ConnectRouter, deps?: ArtifactRpcDeps)
   router.service(ArtifactService, {
     async listArtifacts(req, ctx) {
       const actor = await actorOf(ctx);
-      const pageSize = Math.min(Math.max(req.pageSize, 0), MAX_PAGE_SIZE);
+      const pageSize = req.pageSize > 0 ? Math.min(req.pageSize, MAX_PAGE_SIZE) : MAX_PAGE_SIZE;
       const { rows, totalCount } = await serviceOf().list(actor, {
         scope: req.scope,
         page: Math.max(req.page, 1),

@@ -59,8 +59,9 @@ message ListArtifactsRequest {
   // an admin (ListTasks defaulting). "shared" = org-visible artifacts
   // from anyone. "all" is admin-only.
   string scope = 1;
-  // 1-based page over the newest-first ordering. page_size 0 =
-  // unpaginated; clamped to 200 otherwise.
+  // 1-based page over the newest-first ordering. page_size is clamped
+  // to 200; 0 (the proto default) means one full page of 200 — there is
+  // no unpaginated path.
   int32 page = 2;
   int32 page_size = 3;
 }

@@ -106,9 +106,13 @@ function artifactRow(
   };
 }
 
-function fixedStore(rows: ArtifactWithVersions[]): ArtifactStore {
+function fixedStore(
+  rows: ArtifactWithVersions[],
+): ArtifactStore & { listCalls: Array<{ page: number; pageSize: number }> } {
   const byId = new Map(rows.map((r) => [r.id, r]));
+  const listCalls: Array<{ page: number; pageSize: number }> = [];
   return {
+    listCalls,
     async create() {
       throw new Error("unused");
     },
@@ -119,6 +123,7 @@ function fixedStore(rows: ArtifactWithVersions[]): ArtifactStore {
       return byId.get(id) ?? null;
     },
     async list(opts) {
+      listCalls.push({ page: opts.page, pageSize: opts.pageSize });
       let all = [...byId.values()];
       if (opts.ownerUserId !== undefined) all = all.filter((r) => r.ownerUserId === opts.ownerUserId);
       if (opts.visibility !== undefined) all = all.filter((r) => r.visibility === opts.visibility);
@@ -173,7 +178,7 @@ function clientFor(
       now: () => T0,
     });
   });
-  return createClient(ArtifactService, transport);
+  return { client: createClient(ArtifactService, transport), store };
 }
 
 describe("ArtifactService rpc", () => {
@@ -183,7 +188,7 @@ describe("ArtifactService rpc", () => {
   ];
 
   test("unauthenticated → Unauthenticated", async () => {
-    const client = clientFor(rows(), null);
+    const { client } = clientFor(rows(), null);
     await expect(client.listArtifacts({ scope: "", page: 0, pageSize: 0 })).rejects.toThrow(
       ConnectError,
     );
@@ -195,7 +200,7 @@ describe("ArtifactService rpc", () => {
   });
 
   test("list returns records with identity, raw_url, no versions", async () => {
-    const client = clientFor(rows(), { id: "alice" });
+    const { client } = clientFor(rows(), { id: "alice" });
     const resp = await client.listArtifacts({ scope: "", page: 0, pageSize: 0 });
     expect(resp.totalCount).toBe(2);
     const rec = resp.artifacts.find((a) => a.id === "a-1");
@@ -209,15 +214,27 @@ describe("ArtifactService rpc", () => {
     expect(verifyRawToken("a-1", token ?? "", T0)).toBe(true);
   });
 
+  test("an omitted page size defaults to one bounded page, never unpaginated", async () => {
+    const { client, store } = clientFor(rows(), { id: "alice" });
+    await client.listArtifacts({ scope: "", page: 0, pageSize: 0 });
+    await client.listArtifacts({ scope: "", page: 2, pageSize: 25 });
+    await client.listArtifacts({ scope: "", page: 1, pageSize: 9999 });
+    expect(store.listCalls).toEqual([
+      { page: 1, pageSize: 200 },
+      { page: 2, pageSize: 25 },
+      { page: 1, pageSize: 200 },
+    ]);
+  });
+
   test("get includes version history newest-first", async () => {
-    const client = clientFor(rows(), { id: "alice" });
+    const { client } = clientFor(rows(), { id: "alice" });
     const resp = await client.getArtifactRecord({ id: "a-1" });
     expect(resp.artifact?.versions.map((v) => v.version)).toEqual([2, 1]);
     expect(resp.artifact?.versions[0]?.sessionId).toBe("s-2");
   });
 
   test("member cannot read another's private artifact (NotFound)", async () => {
-    const client = clientFor(rows(), { id: "bob" });
+    const { client } = clientFor(rows(), { id: "bob" });
     try {
       await client.getArtifactRecord({ id: "a-1" });
       throw new Error("expected NotFound");
@@ -230,7 +247,7 @@ describe("ArtifactService rpc", () => {
   });
 
   test("share/unshare + delete ride the service layer", async () => {
-    const client = clientFor(rows(), { id: "alice" });
+    const { client } = clientFor(rows(), { id: "alice" });
     const shared = await client.setArtifactVisibility({ id: "a-1", visibility: "org" });
     expect(shared.artifact?.visibility).toBe("org");
     const del = await client.deleteArtifact({ id: "a-1" });

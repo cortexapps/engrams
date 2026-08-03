@@ -163,8 +163,9 @@ export type ListArtifactsRequest = Message<"engram.app.v1.ListArtifactsRequest">
   scope: string;
 
   /**
-   * 1-based page over the newest-first ordering. page_size 0 =
-   * unpaginated; clamped to 200 otherwise.
+   * 1-based page over the newest-first ordering. page_size is clamped
+   * to 200; 0 (the proto default) means one full page of 200 — there is
+   * no unpaginated path.
    *
    * @generated from field: int32 page = 2;
    */
