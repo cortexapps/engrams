@@ -60,6 +60,8 @@ bytes.workspace = true
 libc = "0.2"
 rustls.workspace = true
 sha2.workspace = true
+# Digest -> lowercase hex; sha2 0.11's Array has no LowerHex.
+hex.workspace = true
 chrono.workspace = true
 clap.workspace = true
 crc32c.workspace = true

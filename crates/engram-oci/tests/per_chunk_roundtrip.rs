@@ -116,7 +116,10 @@ async fn put_upload(
     let Some(digest) = q.get("digest").cloned() else {
         return (StatusCode::BAD_REQUEST, "missing digest").into_response();
     };
-    let actual = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(&buf));
+    let actual = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&buf))
+    );
     if actual != digest {
         return (StatusCode::BAD_REQUEST, "digest mismatch").into_response();
     }
@@ -155,7 +158,10 @@ async fn get_manifest(
     let Some((content_type, body)) = reg.manifests.lock().get(&tag).cloned() else {
         return (StatusCode::NOT_FOUND, "no such manifest").into_response();
     };
-    let digest = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(&body));
+    let digest = format!(
+        "sha256:{}",
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&body))
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header(http::header::CONTENT_TYPE, content_type)

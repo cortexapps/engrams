@@ -93,7 +93,7 @@ pub async fn register_harness(
     let squashfs = crate::squashfs::pack_dir(&dest)
         .map_err(|e| ApiError::Internal(format!("pack harness squashfs: {e}")))?;
     let squashfs_size_bytes = squashfs.len() as i64;
-    let squashfs_sha256 = format!("{:x}", Sha256::digest(&squashfs));
+    let squashfs_sha256 = hex::encode(Sha256::digest(&squashfs));
     state
         .services
         .blob

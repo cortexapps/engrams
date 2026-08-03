@@ -1050,7 +1050,7 @@ async fn untar_gz_to_dir(bytes: &[u8], dest: &Path) -> Result<(), OciError> {
 pub fn sha256_digest(bytes: &[u8]) -> Digest256 {
     let mut h = Sha256::new();
     h.update(bytes);
-    Digest256(format!("sha256:{:x}", h.finalize()))
+    Digest256(format!("sha256:{}", hex::encode(h.finalize())))
 }
 
 #[cfg(test)]

@@ -20,6 +20,8 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "time"] }
 tracing.workspace = true
 sha2.workspace = true
+# Digest -> lowercase hex; sha2 0.11's Array has no LowerHex.
+hex.workspace = true
 tar.workspace = true
 flate2.workspace = true
 oci-client = { version = "0.15", default-features = false, features = ["rustls-tls"] }

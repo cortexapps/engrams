@@ -300,7 +300,7 @@ impl OciClient {
             // appended), so this is the same whole-blob guarantee as a
             // single-shot verified pull.
             file.flush().await.map_err(OciError::Io)?;
-            let actual = format!("sha256:{:x}", hasher.finalize_reset());
+            let actual = format!("sha256:{}", hex::encode(hasher.finalize_reset()));
             if actual == digest {
                 return Ok(());
             }

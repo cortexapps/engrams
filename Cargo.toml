@@ -246,6 +246,11 @@ url = "2"
 async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 sha2 = "0.11"
+# sha2 0.11 returns `hybrid_array::Array` rather than
+# `generic_array::GenericArray`, and Array does not implement LowerHex — so
+# `format!("{:x}", digest)` no longer compiles. hex::encode replaces it and
+# emits the same lowercase hex, so every digest string is unchanged.
+hex = "0.4"
 
 # property-based testing (ADR 0099 H3/H4). Dev-dependency only; the
 # persisted `proptest-regressions/` seeds turn every counterexample into a

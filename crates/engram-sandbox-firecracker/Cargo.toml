@@ -44,6 +44,8 @@ rtnetlink.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true
+# Digest -> lowercase hex; sha2 0.11's Array has no LowerHex.
+hex.workspace = true
 engram-egress-proxy.workspace = true
 engram-storage-local.workspace = true
 # ADR 0080 phase 3b: `materialize_boot` runs the real materializer
