@@ -521,6 +521,32 @@ impl HostAgent {
                 });
             }
 
+            // 2026-08-02 durability-rollback RCA: the quarantined-survivor
+            // rehydrate retry loop. A survivor whose register-time
+            // rehydrate failed used to stay quarantined until the
+            // coordinator's evict ladder DESTROYED it (the rollback);
+            // now the host keeps re-attempting the re-serve, and the
+            // coordinator's parked quarantine op converges losslessly
+            // once a retry lands. The loop is a thin cadence wrapper;
+            // `retry_quarantined_rehydrates_once` is the run_once step
+            // (ADR 0098). Skips are cheap when the map is empty.
+            #[cfg(target_os = "linux")]
+            {
+                const QUARANTINE_REHYDRATE_RETRY_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_secs(30);
+                let pooled_for_rehydrate_retry = pooled.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(QUARANTINE_REHYDRATE_RETRY_INTERVAL);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        pooled_for_rehydrate_retry
+                            .retry_quarantined_rehydrates_once()
+                            .await;
+                    }
+                });
+            }
+
             // ADR 0045 C2: re-arm post-copy fences for sandboxes that
             // were mid-move across the host-agent restart. A DEST mid-
             // drain is reaped immediately (its drain state died with

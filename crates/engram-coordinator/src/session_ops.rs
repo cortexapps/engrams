@@ -61,6 +61,7 @@ const OP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const PENDING_ORPHAN_GRACE: Duration = Duration::from_secs(120);
 
 /// Verb-body outcome: what the executor does with the row.
+#[derive(Debug)]
 pub enum OpOutcome {
     /// Success — `done`.
     Done,
