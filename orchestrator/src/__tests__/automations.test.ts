@@ -10,7 +10,7 @@ import type {
   WebhookSampleRow,
 } from "../db/automations.ts";
 import type { ProfileRow } from "../db/profiles.ts";
-import type { HarnessCatalogClient } from "../rpc/task-create.ts";
+import type { HarnessOptionCatalog } from "../harness/catalog.ts";
 import {
   AutomationService,
   WebhookRegistrationService,
@@ -53,23 +53,14 @@ const profile = (portExposures: number[] = []): ProfileRow => ({
 
 /** Two-harness catalog: enough to prove the model/effort enums are validated
  *  against the EFFECTIVE harness, not whichever one is listed first. */
-const catalog = (): HarnessCatalogClient => ({
+const catalog = (): HarnessOptionCatalog => ({
   listHarnesses: async () => ({
     harnesses: [
       {
         name: "claude",
-        descriptor: {
-          models: [{ id: "opus", default: true, env: {} }, { id: "sonnet", default: false, env: {} }],
-          effort: [{ id: "high", default: true, env: {} }],
-        },
+        descriptor: { models: [{ id: "opus" }, { id: "sonnet" }], effort: [{ id: "high" }] },
       },
-      {
-        name: "codex",
-        descriptor: {
-          models: [{ id: "gpt", default: true, env: {} }],
-          effort: [],
-        },
-      },
+      { name: "codex", descriptor: { models: [{ id: "gpt" }], effort: [] } },
     ],
   }),
 });

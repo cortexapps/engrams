@@ -39,6 +39,11 @@ import {
   type MountCatalogClient,
 } from "../skills/catalog.ts";
 import {
+  assertHarnessTriple,
+  catalogOptionId,
+  type HarnessOptionCatalog,
+} from "../harness/catalog.ts";
+import {
   parseCapability,
   grantsCapability,
   loadRegistry,
@@ -65,18 +70,10 @@ export interface ImagesClient {
   }>;
 }
 
-/** Subset of HarnessCatalogService used here (ADR 0062/0063 catalog validation). */
-export interface HarnessCatalogClient {
-  listHarnesses(req: Record<string, never>): Promise<{
-    harnesses: Array<{
-      name: string;
-      descriptor?: {
-        models?: Array<{ id: string }>;
-        effort?: Array<{ id: string }>;
-      };
-    }>;
-  }>;
-}
+/** Subset of HarnessCatalogService used here (ADR 0062/0063 catalog validation).
+ *  The shape and the rule live in harness/catalog.ts, shared with
+ *  AutomationService so the two services validate one contract. */
+export type HarnessCatalogClient = HarnessOptionCatalog;
 
 export type GetSession = (
   headers: Headers,
@@ -249,12 +246,10 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
   }
 
   /**
-   * ADR 0062/0063: validate a profile's harness/model/effort against the live
-   * catalog. A profile ALWAYS names a concrete harness (no "inherit deployment
-   * default" — superseded) that must be registered; model/effort stay optional
-   * (null = the harness's own default), but a set id must exist in that harness's
-   * descriptor enum. The coordinator re-checks at session-create, but failing
-   * here keeps a profile from referencing something the editor wouldn't offer.
+   * ADR 0062/0063: the profile-specific half of harness validation. A profile
+   * ALWAYS names a concrete harness (no "inherit deployment default" —
+   * superseded); the catalog checks themselves are the shared rule in
+   * harness/catalog.ts.
    */
   async function assertHarnessValid(
     harness: string | null,
@@ -264,29 +259,8 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
     if (harness == null) {
       throw new ConnectError("a profile must select a harness", Code.InvalidArgument);
     }
-    const { harnesses } = await harnessCatalog.listHarnesses({});
-    const descriptor = harnesses.find((h) => h.name === harness)?.descriptor;
-    if (!descriptor) {
-      throw new ConnectError(`harness "${harness}" is not in the catalog`, Code.InvalidArgument);
-    }
-    if (model != null && !(descriptor.models ?? []).some((m) => m.id === model)) {
-      throw new ConnectError(
-        `model "${model}" is not valid for harness "${harness}"`,
-        Code.InvalidArgument,
-      );
-    }
-    if (effort != null && !(descriptor.effort ?? []).some((e) => e.id === effort)) {
-      throw new ConnectError(
-        `effort "${effort}" is not valid for harness "${harness}"`,
-        Code.InvalidArgument,
-      );
-    }
+    await assertHarnessTriple(harnessCatalog, { harness, model, effort });
     return harness;
-  }
-
-  /** Optional proto strings may arrive as ""; normalize catalog selections before validation. */
-  function catalogOptionId(value: string | undefined): string | null {
-    return value?.trim() || null;
   }
 
   /**

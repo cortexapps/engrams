@@ -47,7 +47,11 @@ import {
   harnessCatalog as defaultHarnessCatalog,
   orgSecret as defaultOrgSecret,
 } from "../control-plane/client.ts";
-import type { HarnessCatalogClient } from "./task-create.ts";
+import {
+  assertHarnessTriple,
+  catalogOptionId,
+  type HarnessOptionCatalog,
+} from "../harness/catalog.ts";
 import {
   AutomationTemplateError,
   buildAutomationTemplateContext,
@@ -71,7 +75,7 @@ export interface AutomationDeps {
   store?: AutomationStore;
   profiles?: Pick<ProfileStore, "getActive">;
   connectors?: CustomConnectorSource;
-  harnessCatalog?: HarnessCatalogClient;
+  harnessCatalog?: HarnessOptionCatalog;
   orgSecret?: OrgSecretClient;
   now?: () => Date;
   randomSecret?: () => string;
@@ -221,9 +225,10 @@ function parseTrigger(value: ProtoAutomationTrigger | undefined): AutomationTrig
   }
 }
 
-/** Optional catalog selections may arrive as ""; absent means "inherit". */
-function catalogOptionId(value: string | undefined): string | undefined {
-  return value?.trim() || undefined;
+/** The stored action omits a field to mean "inherit", so adapt the shared
+ *  ""-normalizing helper (which yields `null`) to that JSONB shape. */
+function actionOptionId(value: string | undefined): string | undefined {
+  return catalogOptionId(value) ?? undefined;
 }
 
 function parseAction(value: ProtoAutomationAction | undefined): AutomationAction {
@@ -232,9 +237,9 @@ function parseAction(value: ProtoAutomationAction | undefined): AutomationAction
   }
   const action = value.action.value;
   const titleTemplate = action.titleTemplate || undefined;
-  const harness = catalogOptionId(action.harness);
-  const model = catalogOptionId(action.model);
-  const effort = catalogOptionId(action.effort);
+  const harness = actionOptionId(action.harness);
+  const model = actionOptionId(action.model);
+  const effort = actionOptionId(action.effort);
   return {
     kind: "create_task",
     profileId: requiredText(action.profileId, "action profile_id"),
@@ -374,8 +379,8 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
   const store = deps?.store ?? makeAutomationStore(getDb());
   const profiles = deps?.profiles ?? makeProfileStore(getDb());
   const connectors = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
-  const harnessCatalog: HarnessCatalogClient =
-    deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
+  const harnessCatalog: HarnessOptionCatalog =
+    deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessOptionCatalog);
   const now = deps?.now ?? (() => new Date());
   const randomSecret =
     deps?.randomSecret ??
@@ -417,23 +422,11 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       return action;
     }
     const harness = action.harness ?? profileHarness;
-    const { harnesses } = await harnessCatalog.listHarnesses({});
-    const descriptor = harnesses.find((h) => h.name === harness)?.descriptor;
-    if (!descriptor) {
-      throw new ConnectError(`harness "${harness}" is not in the catalog`, Code.InvalidArgument);
-    }
-    if (action.model !== undefined && !(descriptor.models ?? []).some((m) => m.id === action.model)) {
-      throw new ConnectError(
-        `model "${action.model}" is not valid for harness "${harness}"`,
-        Code.InvalidArgument,
-      );
-    }
-    if (action.effort !== undefined && !(descriptor.effort ?? []).some((e) => e.id === action.effort)) {
-      throw new ConnectError(
-        `effort "${action.effort}" is not valid for harness "${harness}"`,
-        Code.InvalidArgument,
-      );
-    }
+    await assertHarnessTriple(harnessCatalog, {
+      harness,
+      ...(action.model !== undefined ? { model: action.model } : {}),
+      ...(action.effort !== undefined ? { effort: action.effort } : {}),
+    });
     return { ...action, harness };
   }
 
