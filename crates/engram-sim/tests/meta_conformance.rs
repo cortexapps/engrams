@@ -3024,6 +3024,80 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     assert_eq!(again.surviving_side_effects, Vec::<String>::new());
 }
 
+/// The two session clocks are independent, and both stores must move them
+/// on exactly the same triggers.
+///
+/// `last_active_at` is the STATE-MACHINE clock: stamped at create and by
+/// every `transition_session`. `last_event_at` is the ACTIVITY clock
+/// (migration 0068): `None` until the first event, then bumped by every
+/// `append_session_event`. Crossing them is a live bug in both directions —
+/// the eviction scanner keys its idempotency dedup on `last_active_at`
+/// staying frozen across an event append, and the orchestrator's task list
+/// orders on `last_event_at` NOT moving when a session merely changes state.
+async fn session_activity_clock_is_independent(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let created_at = ctx.clock.now_utc();
+    let id = meta.create_session(spec("conf:activity")).await.unwrap();
+
+    // A session that has not emitted an event has no activity clock — the
+    // orchestrator's fallback to `last_active_at` depends on the NULL.
+    let s = meta.get_session(id).await.unwrap();
+    assert_eq!(s.last_active_at, created_at);
+    assert_eq!(s.last_event_at, None, "no events yet ⇒ no activity clock");
+
+    // An event append bumps ONLY the activity clock.
+    ctx.clock.advance(Duration::from_secs(60));
+    let first_event_at = ctx.clock.now_utc();
+    meta.append_session_event(id, "agent_message", serde_json::json!({"text": "hi"}))
+        .await
+        .unwrap();
+    let s = meta.get_session(id).await.unwrap();
+    assert_eq!(s.last_event_at, Some(first_event_at));
+    assert_eq!(
+        s.last_active_at, created_at,
+        "an event append must NOT move the state-machine clock"
+    );
+
+    // A state transition bumps ONLY the state-machine clock. This is the
+    // ordering bug in the task list: the session did nothing new, yet
+    // `last_active_at` jumps ahead of its last real event.
+    ctx.clock.advance(Duration::from_secs(60));
+    let transition_at = ctx.clock.now_utc();
+    meta.transition_session(id, SessionState::Failed, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    let s = meta.get_session(id).await.unwrap();
+    assert_eq!(s.last_active_at, transition_at);
+    assert_eq!(
+        s.last_event_at,
+        Some(first_event_at),
+        "a state transition must NOT move the activity clock"
+    );
+}
+
+/// `list_active_sessions` feeds the app-facing session list, so it must
+/// project the activity clock — an unprojected column silently degrades the
+/// task ordering back to `last_active_at` instead of failing loudly.
+async fn list_active_sessions_projects_activity_clock(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta
+        .create_session(spec("conf:activity-list"))
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(30));
+    let event_at = ctx.clock.now_utc();
+    meta.append_session_event(id, "agent_message", serde_json::json!({"text": "hi"}))
+        .await
+        .unwrap();
+
+    let listed = meta.list_active_sessions().await.unwrap();
+    let s = listed
+        .iter()
+        .find(|s| s.id == id)
+        .expect("pending session is in the active set");
+    assert_eq!(s.last_event_at, Some(event_at));
+}
+
 conformance!(
     t_rewind_excludes_coordinator_facts,
     super::rewind_excludes_coordinator_facts
@@ -3042,4 +3116,12 @@ conformance!(t_snapshot_totals, super::snapshot_totals_aggregate);
 conformance!(
     t_stale_pending_reservation,
     super::stale_pending_reservation
+);
+conformance!(
+    t_session_activity_clock,
+    super::session_activity_clock_is_independent
+);
+conformance!(
+    t_list_active_sessions_activity_clock,
+    super::list_active_sessions_projects_activity_clock
 );

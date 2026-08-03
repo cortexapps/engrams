@@ -631,7 +631,22 @@ pub struct Session {
     #[serde(default)]
     pub mode: SessionMode,
     pub created_at: DateTime<Utc>,
+    /// State-machine clock: stamped by `transition_session` on EVERY status
+    /// flip and by session creation, so it answers "when did this session
+    /// last CHANGE STATE", not "when was it last doing something". The
+    /// eviction scanner keys its idempotency dedup on it precisely because
+    /// it stays frozen while a row sits in `Evicting` — don't repurpose it
+    /// as an activity signal. Use [`Self::last_event_at`] for that.
     pub last_active_at: DateTime<Utc>,
+    /// Activity clock (migration 0068): bumped by every
+    /// `append_session_event`, so it moves while the harness is actually
+    /// producing. `None` for rows that predate the migration and for a
+    /// session that has not emitted an event yet — read it as
+    /// `last_event_at.unwrap_or(last_active_at)`. Surfaced on the wire so
+    /// the orchestrator can order the task list by real activity rather
+    /// than by the last state transition.
+    #[serde(default)]
+    pub last_event_at: Option<DateTime<Utc>>,
     /// ADR 0016 Phase B: the host's last-published live disk
     /// manifest from the FlushScheduler. Updated by
     /// `MetadataStore::update_live_disk_manifest`; cleared by
@@ -1112,6 +1127,7 @@ mod tests {
             mode: SessionMode::DevVm,
             created_at: Utc::now(),
             last_active_at: Utc::now(),
+            last_event_at: Some(Utc::now()),
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,

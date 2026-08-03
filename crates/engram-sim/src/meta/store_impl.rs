@@ -163,6 +163,7 @@ impl MetadataStore for SimMetadataStore {
                     mode: spec.mode,
                     created_at: now,
                     last_active_at: now,
+                    last_event_at: None,
                     live_disk_manifest: None,
                     park_rung: 0,
                     parked_at: None,
@@ -181,7 +182,6 @@ impl MetadataStore for SimMetadataStore {
                 durable_head: None,
                 evac_attempts: 0,
                 evict_attempts: 0,
-                last_event_at: None,
                 updated_at: now,
             },
         );
@@ -289,6 +289,7 @@ impl MetadataStore for SimMetadataStore {
                     mode: ws.spec.mode,
                     created_at: now,
                     last_active_at: now,
+                    last_event_at: None,
                     live_disk_manifest: None,
                     park_rung: 0,
                     parked_at: None,
@@ -307,7 +308,6 @@ impl MetadataStore for SimMetadataStore {
                 durable_head: None,
                 evac_attempts: 0,
                 evict_attempts: 0,
-                last_event_at: None,
                 updated_at: now,
             },
         );
@@ -1068,7 +1068,7 @@ impl MetadataStore for SimMetadataStore {
             .ok_or(MetaError::NotFound)?;
         let idx = row.next_event_idx;
         row.next_event_idx += 1;
-        row.last_event_at = Some(now);
+        row.session.last_event_at = Some(now);
         row.updated_at = now;
         let recovery_epoch = row.recovery_epoch;
         db.session_events
@@ -1607,7 +1607,7 @@ impl MetadataStore for SimMetadataStore {
                 .expect("session row present under the same lock");
             let idx = row.next_event_idx;
             row.next_event_idx += 1;
-            row.last_event_at = Some(now);
+            row.session.last_event_at = Some(now);
             indices.push(idx);
             db.session_events
                 .entry(session_id)
@@ -2826,7 +2826,7 @@ impl MetadataStore for SimMetadataStore {
                 .expect("session row present under the same lock");
             let idx = r.next_event_idx;
             r.next_event_idx += 1;
-            r.last_event_at = Some(now);
+            r.session.last_event_at = Some(now);
             indices.push(idx);
             db.session_events
                 .entry(session_id)

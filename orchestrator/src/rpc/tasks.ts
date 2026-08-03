@@ -423,6 +423,34 @@ function buildUnattributedTask(sess: Session): Task {
   } as Task;
 }
 
+/**
+ * The task list's ordering key: when this task was last DOING something,
+ * newest first.
+ *
+ * Reads `session.lastEventAt` — the coordinator's activity clock, bumped on
+ * every session-event append — NOT `lastActiveAt`, which only moves on a
+ * state transition. `lastActiveAt` is the wrong key here twice over: it
+ * freezes at the instant a session went Active, so a session working for
+ * hours sinks down the list, and it is re-stamped by the Active → Evicting
+ * flip, so an idle-evicted session jumps to the top. The eviction scanner
+ * depends on that staleness for its idempotency key, so the fix is to read a
+ * different clock, not to bump `lastActiveAt` more often.
+ *
+ * Falls back to `lastActiveAt`, then to the task's own `createdAt`:
+ * `lastEventAt` is unset for rows predating migration 0068 and for a session
+ * that has not emitted an event yet, and a task with no session at all has
+ * neither.
+ */
+export function taskActivityAt(task: Task): number {
+  const session = task.sessions[0]?.session;
+  const at = session?.lastEventAt ?? session?.lastActiveAt ?? task.createdAt;
+  const parsed = Date.parse(at);
+  // A malformed timestamp must not poison the comparator into returning NaN
+  // (which makes Array.sort's ordering arbitrary for EVERY pair it touches,
+  // not just this row). Sink the bad row instead.
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
 /** Resolve { profileId } → snapshot for the given refs (one images call + one profile query). */
 export async function buildProfileMap(
   refs: Array<{ profileId: string | null }>,
@@ -811,11 +839,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         });
       }
 
-      filteredTasks.sort((a, b) => {
-        const aActiveAt = a.sessions[0]?.session?.lastActiveAt ?? a.createdAt;
-        const bActiveAt = b.sessions[0]?.session?.lastActiveAt ?? b.createdAt;
-        return Date.parse(bActiveAt) - Date.parse(aActiveAt);
-      });
+      filteredTasks.sort((a, b) => taskActivityAt(b) - taskActivityAt(a));
 
       const totalCount = filteredTasks.length;
       if (req.pageSize <= 0) {

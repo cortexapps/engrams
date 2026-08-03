@@ -352,6 +352,7 @@ mod tests {
             mode: engram_core::types::session::SessionMode::Agent,
             created_at: Utc::now() - chrono::Duration::seconds(30_000),
             last_active_at: Utc::now() - chrono::Duration::seconds(30_000),
+            last_event_at: None,
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
