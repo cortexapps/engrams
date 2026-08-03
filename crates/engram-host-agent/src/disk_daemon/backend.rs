@@ -499,6 +499,7 @@ impl Drop for DirtyFileTier {
     fn drop(&mut self) {
         if self.remove_on_drop {
             let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(ref_sidecar_path(&self.path));
         }
     }
 }
@@ -512,6 +513,49 @@ fn dirty_file_error(
         operation,
         path: path.to_path_buf(),
         source,
+    }
+}
+
+pub(crate) fn ref_sidecar_path(dirty_path: &Path) -> PathBuf {
+    dirty_path.with_extension("ref")
+}
+
+fn write_ref_sidecar(dirty_path: &Path, published: ManifestRef) -> std::io::Result<()> {
+    let sidecar = ref_sidecar_path(dirty_path);
+    let temporary = sidecar.with_extension("ref.tmp");
+    let bytes = serde_json::to_vec(&published).map_err(std::io::Error::other)?;
+    std::fs::write(&temporary, bytes)?;
+    // Rename survives process death without fsync. GCS covers node death.
+    std::fs::rename(temporary, sidecar)
+}
+
+/// Production reader is the Linux-only recovery path; tests read it
+/// on every platform.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn read_ref_sidecar(dirty_path: &Path) -> Option<ManifestRef> {
+    let bytes = std::fs::read(ref_sidecar_path(dirty_path)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Pick the recovery attach ref for a dirty-file survivor. The
+/// production caller is the Linux-only recovery path; tests run on
+/// every platform.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn resolve_recover_attach_ref(
+    coordinator: ManifestRef,
+    recorded: Option<ManifestRef>,
+) -> ManifestRef {
+    let Some(recorded) = recorded else {
+        return coordinator;
+    };
+    if recorded.manifest_id == coordinator.manifest_id {
+        ManifestRef {
+            manifest_id: coordinator.manifest_id,
+            version: recorded.version.max(coordinator.version),
+        }
+    } else {
+        // This sandbox writes the sidecar. A new ID is its private fork (ADR 0077).
+        recorded
     }
 }
 
@@ -1082,6 +1126,18 @@ impl ChunkedDiskBackend {
                     "sandbox dirty file already exists",
                 ),
             ));
+        }
+        let source_sidecar = ref_sidecar_path(&tier.path);
+        let target_sidecar = ref_sidecar_path(target);
+        match std::fs::rename(&source_sidecar, &target_sidecar) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                source = %source_sidecar.display(),
+                target = %target_sidecar.display(),
+                %error,
+                "could not move the dirty-file ref sidecar",
+            ),
         }
         std::fs::rename(&tier.path, target)
             .map_err(|source| dirty_file_error("rename", target, source))?;
@@ -2006,6 +2062,7 @@ impl ChunkedDiskBackend {
             // rehydrated backend can't distinguish shared-vs-private refs
             // and re-attaches unforked. The window is one flush interval.)
             let mut state = self.state.lock().await;
+            let mut published_fork_ref = None;
             if let Some(fork_id) = state.fork_identity {
                 let forked_ref = ManifestRef {
                     manifest_id: fork_id,
@@ -2035,6 +2092,7 @@ impl ChunkedDiskBackend {
                 self.store.put_manifest(forked_ref, &manifest).await?;
                 state.manifest_ref = forked_ref;
                 state.fork_identity = None;
+                published_fork_ref = Some(forked_ref);
                 tracing::info!(
                     manifest = %forked_ref,
                     "empty flush materialized the armed manifest fork (no dirty chunks)",
@@ -2046,6 +2104,16 @@ impl ChunkedDiskBackend {
                 bytes_uploaded: 0,
             };
             drop(state);
+            if let Some(forked_ref) = published_fork_ref {
+                let tier = self.dirty_tier.lock().await;
+                if let Err(error) = write_ref_sidecar(&tier.path, forked_ref) {
+                    tracing::warn!(
+                        path = %ref_sidecar_path(&tier.path).display(),
+                        %error,
+                        "could not record the empty-flush fork ref",
+                    );
+                }
+            }
             self.stamp_flush_completion();
             return Ok(out);
         }
@@ -2362,13 +2430,26 @@ impl ChunkedDiskBackend {
 
         {
             let mut tier = self.dirty_tier.lock().await;
+            // Recovery uses this ref. A punch without this record is unsafe.
+            let punch_safe = match write_ref_sidecar(&tier.path, new_ref) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %ref_sidecar_path(&tier.path).display(),
+                        %error,
+                        "could not record the published ref; dirty chunks stay local",
+                    );
+                    false
+                }
+            };
             for claim in &claims {
                 if tier.claimed.get(&claim.chunk_idx) != Some(&claim.generation) {
                     continue;
                 }
                 tier.claimed.remove(&claim.chunk_idx);
                 let unchanged = tier.generations.get(&claim.chunk_idx) == Some(&claim.generation)
-                    && !tier.dirty.contains(&claim.chunk_idx);
+                    && !tier.dirty.contains(&claim.chunk_idx)
+                    && punch_safe;
                 if unchanged {
                     let offset = claim.chunk_idx as u64 * chunk_size;
                     if let Err(source) =
@@ -2705,6 +2786,108 @@ mod tests {
     async fn put_chunk(store: &ChunkStore, byte: u8, size: usize) -> ChunkHash {
         let bytes = vec![byte; size];
         store.put_chunk(&bytes).await.unwrap()
+    }
+
+    #[test]
+    fn resolve_recover_attach_ref_uses_coordinator_without_sidecar() {
+        let coordinator = ManifestRef::new();
+
+        assert_eq!(resolve_recover_attach_ref(coordinator, None), coordinator);
+    }
+
+    #[test]
+    fn resolve_recover_attach_ref_uses_newer_sidecar_version() {
+        let base = ManifestRef::new();
+        let coordinator = ManifestRef {
+            manifest_id: base.manifest_id,
+            version: 3,
+        };
+        let recorded = ManifestRef {
+            manifest_id: base.manifest_id,
+            version: 5,
+        };
+
+        assert_eq!(
+            resolve_recover_attach_ref(coordinator, Some(recorded)),
+            recorded
+        );
+    }
+
+    #[test]
+    fn resolve_recover_attach_ref_uses_newer_coordinator_version() {
+        let base = ManifestRef::new();
+        let coordinator = ManifestRef {
+            manifest_id: base.manifest_id,
+            version: 5,
+        };
+        let recorded = ManifestRef {
+            manifest_id: base.manifest_id,
+            version: 3,
+        };
+
+        assert_eq!(
+            resolve_recover_attach_ref(coordinator, Some(recorded)),
+            coordinator
+        );
+    }
+
+    #[test]
+    fn resolve_recover_attach_ref_uses_sidecar_fork() {
+        let coordinator = ManifestRef::new();
+        let recorded = ManifestRef::new();
+        assert_ne!(recorded.manifest_id, coordinator.manifest_id);
+
+        assert_eq!(
+            resolve_recover_attach_ref(coordinator, Some(recorded)),
+            recorded
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_records_the_published_ref_sidecar() {
+        let chunk_size = 4096u64;
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![]);
+        let (backend, _store, _dir) = build_backend(&manifest).await;
+        let dirty_path = backend.dirty_tier.lock().await.path.clone();
+
+        backend.write(0, &[0x5a; 4096]).await.unwrap();
+        let outcome = backend.flush().await.unwrap();
+
+        assert_eq!(read_ref_sidecar(&dirty_path), Some(outcome.manifest_ref));
+    }
+
+    /// Recovery keeps a punched chunk when the coordinator ref is stale.
+    /// This test needs exact SEEK_DATA extents from ext4.
+    /// APFS reports flushed zero-fill as data.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn punched_chunk_survives_recovery_when_coordinator_ref_lags() {
+        let chunk_size = 64 * 1024u64;
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![]);
+        let (backend, store, dir) = build_backend(&manifest).await;
+        let stale_ref = backend.manifest_ref().await;
+        let acked = vec![0x5a; chunk_size as usize];
+
+        backend.write(0, &acked).await.unwrap();
+        let outcome = backend.flush().await.unwrap();
+        assert_ne!(outcome.manifest_ref, stale_ref);
+        let dirty_path = retain_dirty_path(&backend).await;
+        drop(backend);
+
+        let resolved_ref = resolve_recover_attach_ref(stale_ref, read_ref_sidecar(&dirty_path));
+        let published = store.get_manifest(resolved_ref).await.unwrap();
+        let successor = ChunkedDiskBackend::from_manifest_with_dirty_file(
+            resolved_ref,
+            &published,
+            test_cache(dir.path().join("sidecar-recovery-cache")),
+            store,
+            u64::MAX,
+            dirty_path,
+            DirtyFileOpenMode::Recover,
+        )
+        .unwrap();
+
+        assert_eq!(successor.read(0, chunk_size).await.unwrap(), acked);
     }
 
     struct ProcessRecoveryContext {

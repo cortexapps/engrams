@@ -8550,6 +8550,7 @@ impl SandboxBackend for PooledBackend {
                         "destroy could not remove the sandbox dirty file",
                     ),
                 }
+                let _ = fs::remove_file(crate::disk_daemon::backend::ref_sidecar_path(&path)).await;
             }
             // A destroyed sandbox's shutdown spool must not outlive it
             // (the sandbox_id will never rehydrate again; a leftover
@@ -9637,6 +9638,20 @@ impl PooledBackend {
         // spool seed still lands before RECONFIGURE releases guest I/O.
         let spool_root = self.shutdown_spool_root();
         let mut attach_ref = disk_manifest;
+        if dirty_file_exists {
+            attach_ref = crate::disk_daemon::backend::resolve_recover_attach_ref(
+                disk_manifest,
+                crate::disk_daemon::backend::read_ref_sidecar(&dirty_path),
+            );
+            if attach_ref != disk_manifest {
+                tracing::info!(
+                    %sandbox_id,
+                    coordinator_ref = %disk_manifest,
+                    attach_ref = %attach_ref,
+                    "predecessor published past the coordinator's ref, attaching at the recorded publish — store-ahead",
+                );
+            }
+        }
         let mut seed_dirty: Option<Vec<(usize, Vec<u8>)>> = None;
         if !dirty_file_exists {
             if let Some(root) = &spool_root {
