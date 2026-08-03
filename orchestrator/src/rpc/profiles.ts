@@ -56,7 +56,7 @@ import {
   resolveIntegrationGrants,
   type ResolvedIntegrationGrant,
 } from "../integrations/grants.ts";
-import { appendGooglePolicy } from "../integrations/google-policy.ts";
+import { validateGoogleGrants } from "../integrations/google-policy.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -320,13 +320,11 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
     registry: Map<string, Connector>,
     builtInToolCapabilities: Set<string>,
   ): void {
-    appendGooglePolicy({
-      network: { default: "deny", allow_hosts: [], allow_host_patterns: [] },
-      secrets: [],
-      injects: [],
-      observes: [],
-      google_adc: false,
-    }, resolved);
+    // Profile save validates grant SHAPE only. Connection STATE (enabled,
+    // endpoint membership) is enforced at session-create — editing a
+    // connection auto-disables it, and that must never block unrelated edits
+    // of every profile that grants it.
+    validateGoogleGrants(resolved);
     const capabilities = grantsToCapabilities(resolved);
     for (const c of capabilities) {
       if (c.startsWith("gcp:")) continue;

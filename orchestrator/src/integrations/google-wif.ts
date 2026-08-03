@@ -1,9 +1,10 @@
 /** Google Workload Identity Federation token broker (ADR 0109). */
 
-import { createSign } from "node:crypto";
+import { createPrivateKey, createSign, type KeyObject } from "node:crypto";
 
 import type { IntegrationOidcKeyStore } from "../db/integration-oidc-keys.ts";
 import type { GoogleCloudConnectionConfig } from "../db/integration-connections.ts";
+import { isDeniedGoogleHost } from "./google-credential-denylist.ts";
 
 const STS_URL = "https://sts.googleapis.com/v1/token";
 const IAM_CREDENTIALS_ORIGIN = "https://iamcredentials.googleapis.com";
@@ -45,6 +46,18 @@ export function googleOidcAudience(provider: string): string {
     : `//iam.googleapis.com/${provider.replace(/^\/+/, "")}`;
 }
 
+/**
+ * A full workload-identity provider resource.
+ *
+ * Google's own rule for a pool id and a provider id is 4-32 characters of
+ * lowercase letters, digits and hyphens, starting with a letter. The looser
+ * `[a-z0-9-]+` this used to allow accepted ids Google rejects — a one-character
+ * id, or one starting with a digit or a hyphen — so the connection stored
+ * cleanly and only failed later, during the operator's `gcloud` run.
+ */
+const WIF_PROVIDER_RESOURCE =
+  /^\/\/iam\.googleapis\.com\/projects\/[0-9]+\/locations\/global\/workloadIdentityPools\/[a-z][a-z0-9-]{3,31}\/providers\/[a-z][a-z0-9-]{3,31}$/;
+
 export function assertGoogleCloudConfig(value: Record<string, unknown>): GoogleCloudConnectionConfig {
   const allowedKeys = new Set(["workloadIdentityProvider", "serviceAccountEmail", "endpoints"]);
   const unknownKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
@@ -56,9 +69,18 @@ export function assertGoogleCloudConfig(value: Record<string, unknown>): GoogleC
   const endpoints = value.endpoints;
   if (
     typeof workloadIdentityProvider !== "string" ||
-    !/^\/\/iam\.googleapis\.com\/projects\/[0-9]+\/locations\/global\/workloadIdentityPools\/[a-z0-9-]+\/providers\/[a-z0-9-]+$/.test(workloadIdentityProvider)
+    !WIF_PROVIDER_RESOURCE.test(workloadIdentityProvider)
   ) {
     throw new Error("workload identity provider must be a full Google provider resource");
+  }
+  // Google reserves the `gcp-` prefix on both ids. A resource string carrying
+  // one can never be created, so accepting it here only defers the failure to
+  // the operator's `gcloud` run, after the connection is already stored.
+  const reserved = workloadIdentityProvider
+    .split("/")
+    .some((segment) => segment.startsWith("gcp-"));
+  if (reserved) {
+    throw new Error("Google reserves the `gcp-` prefix for pool and provider ids");
   }
   if (
     typeof serviceAccountEmail !== "string" ||
@@ -77,12 +99,7 @@ export function assertGoogleCloudConfig(value: Record<string, unknown>): GoogleC
     ) {
       throw new Error(`endpoint "${endpoint}" must be an exact hostname`);
     }
-    if (
-      endpoint === "sts.googleapis.com" ||
-      endpoint === "oauth2.googleapis.com" ||
-      endpoint === "accounts.google.com" ||
-      endpoint === "securetoken.googleapis.com"
-    ) {
+    if (isDeniedGoogleHost(endpoint)) {
       throw new Error(`credential exchange endpoint "${endpoint}" cannot be guest-accessible`);
     }
   }
@@ -93,6 +110,19 @@ export function makeGoogleWifBroker(deps: GoogleWifBrokerDeps) {
   const now = deps.now ?? (() => new Date());
   const randomId = deps.randomId ?? (() => crypto.randomUUID());
   const fetchFn = deps.fetch ?? fetch;
+  // Parse each signing key's PEM once per kid instead of on every mint. A
+  // deployment publishes at most a handful of kids (active + retiring), so
+  // reset the cache if it ever grows past that.
+  const keyObjects = new Map<string, KeyObject>();
+  function keyObjectFor(kid: string, privateKeyPem: string): KeyObject {
+    let cached = keyObjects.get(kid);
+    if (!cached) {
+      if (keyObjects.size >= 8) keyObjects.clear();
+      cached = createPrivateKey(privateKeyPem);
+      keyObjects.set(kid, cached);
+    }
+    return cached;
+  }
 
   async function mintSubjectToken(
     config: GoogleCloudConnectionConfig,
@@ -118,7 +148,7 @@ export function makeGoogleWifBroker(deps: GoogleWifBrokerDeps) {
     const signer = createSign("RSA-SHA256");
     signer.update(input);
     signer.end();
-    return `${input}.${signer.sign(key.privateKeyPem, "base64url")}`;
+    return `${input}.${signer.sign(keyObjectFor(key.kid, key.privateKeyPem), "base64url")}`;
   }
 
   async function exchange(

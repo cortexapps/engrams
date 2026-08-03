@@ -11,20 +11,10 @@ describe("deployment Google OIDC issuer", () => {
   });
 
   test("publishes exact discovery metadata and overlapping JWKS keys", async () => {
-    let ensuredActiveKey = false;
     const keys: IntegrationOidcKeyStore = {
-      async getOrCreateActive(now) {
-        expect(now).toEqual(new Date("2026-07-31T12:00:00Z"));
-        ensuredActiveKey = true;
-        return {
-          kid: "new",
-          privateKeyPem: "sealed",
-          publicJwk: { kty: "RSA", kid: "new" },
-          state: "active",
-          createdAt: new Date(1),
-          publishUntil: null,
-        };
-      },
+      // The public GET is read-only: the startup rotation driver owns key
+      // creation, so this store method must never run here.
+      async getOrCreateActive() { throw new Error("JWKS GET must not write"); },
       async rotate() { throw new Error("unused"); },
       async listPublished(now) {
         expect(now).toEqual(new Date("2026-07-31T12:00:00Z"));
@@ -55,6 +45,5 @@ describe("deployment Google OIDC issuer", () => {
     expect(await jwks.json()).toEqual({
       keys: [{ kty: "RSA", kid: "new" }, { kty: "RSA", kid: "old" }],
     });
-    expect(ensuredActiveKey).toBe(true);
   });
 });

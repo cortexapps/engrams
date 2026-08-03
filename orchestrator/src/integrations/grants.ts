@@ -1,8 +1,9 @@
 /** Connection-aware integration grant validation and policy projection (ADR 0109). */
 
 import { ConnectError, Code } from "@connectrpc/connect";
+import { createHash } from "node:crypto";
 
-import type { ProfileIntegrationGrant } from "../db/schema.ts";
+import type { IntegrationConnectionSnapshot, ProfileIntegrationGrant } from "../db/schema.ts";
 import type {
   IntegrationConnectionRow,
   IntegrationConnectionStore,
@@ -11,7 +12,7 @@ import type {
 const OPERATION_RE = /^[a-z][a-z0-9_.-]*(?::[a-z][a-z0-9_.-]*)*$/;
 
 /** Credential-producing Google operations remain blocked at every layer. */
-const FORBIDDEN_GOOGLE_OPERATIONS = new Set([
+export const FORBIDDEN_GOOGLE_OPERATIONS = new Set([
   "iam.serviceaccountkeys.create",
   "iam.generateaccesstoken",
   "iam.generateidtoken",
@@ -24,15 +25,86 @@ export interface ResolvedIntegrationGrant {
   connection: IntegrationConnectionRow;
 }
 
+/** The immutable authorization snapshot the hash covers. */
+export interface IntegrationSnapshot {
+  profileId: string | null;
+  integrationGrants: readonly ProfileIntegrationGrant[];
+  integrationConnections: readonly IntegrationConnectionSnapshot[];
+}
+
+/** Recursively sort object keys so the hash survives a JSONB round-trip
+ * (Postgres jsonb does not preserve object key order; arrays keep order). */
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([key, entry]) => [key, canonicalize(entry)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * Content-hash of a session's compiled authorization snapshot (ADR 0109).
+ * Persisted on `task_session` at create and emitted by the broker as the
+ * `engrams_profile_snapshot` OIDC claim, so an external audit log entry
+ * identifies the EXACT immutable authority that produced the credential.
+ * Deterministic across the JSONB round-trip (canonical key order).
+ */
+export function integrationSnapshotHash(snapshot: IntegrationSnapshot): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify(canonicalize({
+      profileId: snapshot.profileId,
+      integrationGrants: snapshot.integrationGrants,
+      integrationConnections: snapshot.integrationConnections,
+    })))
+    .digest("hex");
+  return `sha256:${digest}`;
+}
+
+/**
+ * Wrap a connection store with a per-request memo so one create resolves each
+ * connection id (and each provider default) at most once. Hand the SAME
+ * wrapper to every resolution step of a request; a fresh wrapper per request
+ * keeps rows from leaking across requests.
+ */
+export function withConnectionMemo(store: IntegrationConnectionStore): IntegrationConnectionStore {
+  const byId = new Map<string, IntegrationConnectionRow | null>();
+  const defaults = new Map<string, IntegrationConnectionRow | null>();
+  return {
+    ...store,
+    async get(id) {
+      if (!byId.has(id)) byId.set(id, await store.get(id));
+      return byId.get(id)!;
+    },
+    async getMany(ids) {
+      const missing = ids.filter((id) => !byId.has(id));
+      if (missing.length > 0) {
+        const rows = await store.getMany(missing);
+        const found = new Map(rows.map((row) => [row.id, row]));
+        for (const id of missing) byId.set(id, found.get(id) ?? null);
+      }
+      return ids
+        .map((id) => byId.get(id))
+        .filter((row): row is IntegrationConnectionRow => row != null);
+    },
+    async getDefault(provider) {
+      if (!defaults.has(provider)) defaults.set(provider, await store.getDefault(provider));
+      return defaults.get(provider)!;
+    },
+  };
+}
+
 export async function resolveIntegrationGrants(
   grants: readonly ProfileIntegrationGrant[],
   connections: IntegrationConnectionStore,
 ): Promise<ResolvedIntegrationGrant[]> {
   const uniqueIds = [...new Set(grants.map((grant) => grant.connectionId))];
-  const rows = await Promise.all(uniqueIds.map((id) => connections.get(id)));
-  const byId = new Map(
-    rows.filter((row): row is IntegrationConnectionRow => row != null).map((row) => [row.id, row]),
-  );
+  // ONE query for the whole grant set — not one per connection id.
+  const rows = uniqueIds.length > 0 ? await connections.getMany(uniqueIds) : [];
+  const byId = new Map(rows.map((row) => [row.id, row]));
 
   return grants.map((grant) => {
     const connection = byId.get(grant.connectionId);

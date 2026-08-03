@@ -32,6 +32,13 @@ WORKDIR /app/orchestrator
 COPY --from=deps /app/orchestrator/node_modules ./node_modules
 COPY orchestrator/ ./
 
+# The Google credential denylist is ONE checked-in table shared with the Rust
+# egress proxy, which is the enforcement point and owns the file (ADR 0109).
+# `src/integrations/google-credential-denylist.ts` imports it by a repo-relative
+# path, so the image has to keep that same relative layout.
+COPY crates/engram-egress-proxy/policy/google-credential-denylist.json \
+     /app/crates/engram-egress-proxy/policy/google-credential-denylist.json
+
 # The oven/bun image ships a non-root `bun` user (UID 1000). Run as it; the
 # chart hardens further (readOnlyRootFilesystem, drop ALL caps). Nothing here
 # writes to the image FS at runtime.

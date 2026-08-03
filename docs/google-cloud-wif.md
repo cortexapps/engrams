@@ -5,8 +5,12 @@ service-account key and it does not use the deployment VM identity.
 
 ## Requirements
 
-- The Engrams `BASE_URL` must be a public HTTPS origin. Google must be able to
-  read its OIDC discovery and JWKS endpoints.
+- `ORCHESTRATOR_PUBLIC_URL` must be a public HTTPS origin. Google must be able
+  to read its OIDC discovery and JWKS endpoints. (There is no `BASE_URL`
+  setting; the orchestrator reads this name.)
+- `ENGRAM_DEPLOYMENT_ID` identifies this deployment in the `engrams_organization`
+  claim. It defaults to the public hostname. A WIF attribute condition pins the
+  value, so treat it as immutable once a customer applies the setup.
 - Google-enabled sessions require a Firecracker or VZ host with the host egress
   proxy. The Process backend rejects them because it cannot intercept metadata.
 - Create one Google service account for each privilege set. A connection always
@@ -84,6 +88,23 @@ Use the WIF subject and connection attribute from the Google audit entry to
 correlate it with the Engrams session and connection audit fields. See Google's
 [product federation guide](https://docs.cloud.google.com/iam/docs/use-workload-identity-federation-to-let-customers-access-their-cloud-resources)
 and [WIF security guidance](https://docs.cloud.google.com/iam/docs/best-practices-for-using-workload-identity-federation).
+
+## Signing-key rotation
+
+The issuer signs each subject token with an RSA key it holds in the
+orchestrator database and publishes through JWKS. A rotation driver runs on the
+orchestrator: it creates the active key at startup, then retires a key at 90
+days and keeps the retiring key in JWKS for a further 7 days.
+
+The overlap window is what makes rotation safe. A token minted a moment before
+the change is still in flight when the new key becomes active, and Google
+resolves it by `kid` — so both keys must be published together for at least as
+long as a token can live. Nothing on the customer side changes: the pool reads
+JWKS at validation time.
+
+To rotate immediately (a suspected key compromise), call
+`POST /api/v1/admin/integrations/oidc/rotate`. The same overlap applies, so
+in-flight tokens keep validating.
 
 ## Guest behavior
 

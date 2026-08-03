@@ -60,7 +60,9 @@ import {
 import {
   defaultConnectionGrants,
   grantsToCapabilities,
+  integrationSnapshotHash,
   resolveIntegrationGrants,
+  withConnectionMemo,
 } from "../integrations/grants.ts";
 import { appendGooglePolicy } from "../integrations/google-policy.ts";
 
@@ -377,21 +379,19 @@ export async function compileSessionCreateInput(
     }
   }
   const registry = await loadRegistry(deps.connectors);
-  const resolvedProfileGrants = await resolveIntegrationGrants(
-    profile.integrationGrants,
-    deps.connections,
-  );
-  const profileCapabilities = grantsToCapabilities(resolvedProfileGrants);
+  // One memo per create: every grant-resolution step below reuses the rows the
+  // first step fetched, so a create resolves each connection id exactly once.
+  const connections = withConnectionMemo(deps.connections);
   const overrideGrants = await defaultConnectionGrants(
     opts.capabilityOverride ?? opts.extraCapabilities ?? [],
-    deps.connections,
+    connections,
   );
   const effectiveGrants = opts.capabilityOverride !== undefined
     ? overrideGrants
     : [...profile.integrationGrants, ...overrideGrants];
   const resolvedEffectiveGrants = await resolveIntegrationGrants(
     effectiveGrants,
-    deps.connections,
+    connections,
   );
   const disabledConnection = resolvedEffectiveGrants.find(({ connection }) => !connection.enabled);
   if (disabledConnection) {
@@ -405,9 +405,12 @@ export async function compileSessionCreateInput(
   // A capability override is the complete session authority and therefore
   // also owns its CLI/tool surface. Without one, preserve the narrower
   // profile-owned surface: extra integration grants do not add model tools.
+  // The profile-only resolution is LAZY: under an override it never runs (its
+  // result would be unused), and without one the memo makes it query-free
+  // (profile grants are a subset of the effective grants resolved above).
   const surfacedCapabilities = opts.capabilityOverride !== undefined
     ? capabilities
-    : profileCapabilities;
+    : grantsToCapabilities(await resolveIntegrationGrants(profile.integrationGrants, connections));
   const cliPlan = compileCliIntegrations(surfacedCapabilities, registry);
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
   const enabledCli = [
@@ -772,14 +775,21 @@ export async function createSessionForExistingTask(
       capabilities: sessionInput.capabilities ?? [],
       integrationGrants: sessionInput.integrationGrants ?? [],
       integrationConnections: sessionInput.integrationConnections ?? [],
+      integrationSnapshotHash: integrationSnapshotHash({
+        profileId: profile.id,
+        integrationGrants: sessionInput.integrationGrants ?? [],
+        integrationConnections: sessionInput.integrationConnections ?? [],
+      }),
       ...(integrationPrincipalId ? { integrationPrincipalId } : {}),
     });
   });
 
+  let createdSessionId: string | undefined;
   try {
     // When prompt is omitted (as it is for the finder), the session boots idle
     // so deterministic bootstrap can finish before SendPrompt wakes it.
     const created = await deps.sessions.createSession(sessionInput);
+    createdSessionId = created.sessionId;
     if (created.sessionId !== sessionId) {
       throw new Error("coordinator returned a different reserved session ID");
     }
@@ -789,19 +799,29 @@ export async function createSessionForExistingTask(
       });
     }
   } catch (err) {
+    // Compensation must never mask the original failure: guard every step and
+    // log what it could not undo. On an ID mismatch, the session that leaks is
+    // the one the coordinator ACTUALLY created, so delete that one.
     try {
-      await deps.sessions.deleteSession({ sessionId });
+      await deps.sessions.deleteSession({ sessionId: createdSessionId ?? sessionId });
     } catch (delErr) {
       log.error(
-        { sessionId, err: delErr },
-        "task-create: failed to delete reserved session after create failure",
+        { sessionId: createdSessionId ?? sessionId, err: delErr },
+        "task-create: failed to delete session after create failure",
       );
     }
-    await deps.db.transaction(async (tx) => {
-      await tx
-        .delete(taskSessionTable)
-        .where(and(eq(taskSessionTable.taskId, params.taskId), eq(taskSessionTable.sessionId, sessionId)));
-    });
+    try {
+      await deps.db.transaction(async (tx) => {
+        await tx
+          .delete(taskSessionTable)
+          .where(and(eq(taskSessionTable.taskId, params.taskId), eq(taskSessionTable.sessionId, sessionId)));
+      });
+    } catch (dbErr) {
+      log.error(
+        { taskId: params.taskId, sessionId, err: dbErr },
+        "task-create: failed to remove task_session after create failure — manual cleanup needed",
+      );
+    }
     throw err;
   }
 
@@ -898,6 +918,11 @@ export async function createTaskWithSession(
       capabilities: sessionInput.capabilities ?? [],
       integrationGrants: sessionInput.integrationGrants ?? [],
       integrationConnections: sessionInput.integrationConnections ?? [],
+      integrationSnapshotHash: integrationSnapshotHash({
+        profileId: profile.id,
+        integrationGrants: sessionInput.integrationGrants ?? [],
+        integrationConnections: sessionInput.integrationConnections ?? [],
+      }),
       integrationPrincipalId: params.ownerUserId,
     });
     if (params.slackThreadWorkflowId !== undefined) {
@@ -908,8 +933,10 @@ export async function createTaskWithSession(
     }
   });
 
+  let createdSessionId: string | undefined;
   try {
     const created = await deps.sessions.createSession(sessionInput);
+    createdSessionId = created.sessionId;
     if (created.sessionId !== sessionId) {
       throw new Error("coordinator returned a different reserved session ID");
     }
@@ -917,17 +944,30 @@ export async function createTaskWithSession(
       await tx.insert(sessionListenerTable).values({ sessionId });
     });
   } catch (err) {
+    // Compensation must never mask the original failure: guard every step and
+    // log what it could not undo. On an ID mismatch, the session that leaks is
+    // the one the coordinator ACTUALLY created, so delete that one.
     try {
-      await deps.sessions.deleteSession({ sessionId });
+      await deps.sessions.deleteSession({ sessionId: createdSessionId ?? sessionId });
     } catch (delErr) {
       log.error(
-        { sessionId, err: delErr },
-        "task-create: failed to delete reserved session after create failure",
+        { sessionId: createdSessionId ?? sessionId, err: delErr },
+        "task-create: failed to delete session after create failure",
       );
     }
-    await deps.db.transaction(async (tx) => {
-      await tx.delete(taskTable).where(eq(taskTable.id, taskId));
-    });
+    try {
+      await deps.db.transaction(async (tx) => {
+        // slack_session has no FK to the task model; the task delete cascades
+        // task_session only, so remove the Slack binding explicitly.
+        await tx.delete(slackSessionTable).where(eq(slackSessionTable.sessionId, sessionId));
+        await tx.delete(taskTable).where(eq(taskTable.id, taskId));
+      });
+    } catch (dbErr) {
+      log.error(
+        { taskId, sessionId, err: dbErr },
+        "task-create: failed to remove task records after create failure — manual cleanup needed",
+      );
+    }
     throw err;
   }
 

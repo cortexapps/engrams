@@ -7,6 +7,7 @@ import {
   googleOidcAudience,
   makeGoogleWifBroker,
 } from "../integrations/google-wif.ts";
+import { deniedGoogleHosts } from "../integrations/google-credential-denylist.ts";
 
 const PROVIDER =
   "//iam.googleapis.com/projects/123456/locations/global/" +
@@ -119,6 +120,36 @@ describe("Google WIF broker", () => {
     });
   });
 
+  test("applies Google's own rules to pool and provider ids", () => {
+    const resource = (pool: string, provider: string) =>
+      `//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/${pool}/providers/${provider}`;
+    const assertConfig = (workloadIdentityProvider: string) =>
+      assertGoogleCloudConfig({
+        workloadIdentityProvider,
+        serviceAccountEmail: "engram-reader@customer.iam.gserviceaccount.com",
+        endpoints: ["compute.googleapis.com"],
+      });
+
+    expect(() => assertConfig(resource("engrams", "engrams-dev"))).not.toThrow();
+
+    // 4-32 characters, starting with a letter. The old `[a-z0-9-]+` accepted
+    // ids Google rejects, so a connection stored cleanly and only failed later,
+    // during the operator's `gcloud` run.
+    for (const [pool, provider] of [
+      ["dev", "engrams-dev"],
+      ["engrams", "dev"],
+      ["1engrams", "engrams-dev"],
+      ["-engrams", "engrams-dev"],
+      ["engrams", "e".repeat(33)],
+    ] as const) {
+      expect(() => assertConfig(resource(pool, provider))).toThrow(/full Google provider resource/);
+    }
+
+    // Google reserves the `gcp-` prefix on both ids.
+    expect(() => assertConfig(resource("gcp-engrams", "engrams-dev"))).toThrow(/reserves/);
+    expect(() => assertConfig(resource("engrams", "gcp-dev"))).toThrow(/reserves/);
+  });
+
   test("accepts only non-secret WIF configuration", () => {
     expect(() => assertGoogleCloudConfig({
       workloadIdentityProvider: PROVIDER,
@@ -127,5 +158,31 @@ describe("Google WIF broker", () => {
       private_key: "must-not-be-accepted",
     })).toThrow(/unsupported fields/);
     expect(googleOidcAudience(PROVIDER)).toBe(PROVIDER);
+  });
+
+  test("refuses every credential exchange endpoint, mutual-TLS twins included", () => {
+    const reject = (endpoint: string) =>
+      expect(() => assertGoogleCloudConfig({
+        workloadIdentityProvider: PROVIDER,
+        serviceAccountEmail: "engram-reader@customer.iam.gserviceaccount.com",
+        endpoints: [endpoint],
+      })).toThrow(/cannot be guest-accessible/);
+
+    for (const host of deniedGoogleHosts) {
+      reject(host);
+      // Google serves every one of these at a mutual-TLS twin. The old
+      // exact-host list did not know the twins, which made it a complete
+      // bypass.
+      reject(host.replace(".", ".mtls."));
+      reject(host.toUpperCase());
+    }
+    // The proxy owns the table; this validator must read the same one.
+    expect(deniedGoogleHosts).toContain("iamcredentials.googleapis.com");
+
+    expect(() => assertGoogleCloudConfig({
+      workloadIdentityProvider: PROVIDER,
+      serviceAccountEmail: "engram-reader@customer.iam.gserviceaccount.com",
+      endpoints: ["compute.googleapis.com"],
+    })).not.toThrow();
   });
 });
