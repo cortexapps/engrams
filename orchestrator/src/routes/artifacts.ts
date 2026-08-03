@@ -30,6 +30,7 @@ import {
 } from "../control-plane/client.ts";
 import { makeGuard } from "./guard.ts";
 import type { GetSession, ResolveOwner } from "./guard.ts";
+import { artifactResponseHeaders } from "./artifact-headers.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -112,17 +113,13 @@ export function makeArtifactsRoute(deps?: ArtifactsDeps): Hono {
       throw err;
     }
 
-    // 4. Build response headers from metadata.
-    const headers: Record<string, string> = {
-      "Content-Type": metadata.mediaType || "application/octet-stream",
-    };
+    // 4. Build response headers from metadata (hardened set, ADR 0026).
+    const headers = artifactResponseHeaders(
+      metadata.mediaType,
+      metadata.fileName || undefined,
+    );
     if (metadata.sizeBytes > 0n) {
       headers["Content-Length"] = String(metadata.sizeBytes);
-    }
-    if (metadata.fileName) {
-      // Sanitise to ASCII only for the header value.
-      const safe = metadata.fileName.replace(/[^\x20-\x7E]/g, "_");
-      headers["Content-Disposition"] = `inline; filename="${safe}"`;
     }
 
     // 5. Stream the remaining chunk messages to the browser.
