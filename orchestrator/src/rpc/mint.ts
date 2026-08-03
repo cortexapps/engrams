@@ -10,11 +10,11 @@
  * Injectable deps (getSession, mint) for tests.
  */
 
-import { ConnectError, Code } from "@connectrpc/connect";
-import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
+import type { ConnectRouter } from "@connectrpc/connect";
 
 import { MintService, type MintKind } from "../gen/engram/app/v1/mint_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { requireAdmin } from "./require.ts";
 import { mint as defaultMint } from "../control-plane/client.ts";
 
 export type GetSession = (
@@ -31,13 +31,6 @@ export interface MintDeps {
   mint?: MintClient;
 }
 
-async function requireAdmin(ctx: HandlerContext, getSession: GetSession): Promise<void> {
-  const session = await getSession(ctx.requestHeader);
-  if (!session) throw new ConnectError("unauthenticated", Code.Unauthenticated);
-  if ((session.user.role ?? "user") !== "admin") {
-    throw new ConnectError("forbidden", Code.PermissionDenied);
-  }
-}
 
 export function registerMint(router: ConnectRouter, deps?: MintDeps): void {
   const getSession: GetSession =

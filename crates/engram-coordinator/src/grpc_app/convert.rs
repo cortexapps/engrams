@@ -40,6 +40,7 @@ pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session 
         mode,
         created_at,
         last_active_at,
+        last_event_at,
         live_disk_manifest: _, // Internal coord state (ADR 0016 Phase B); not on the wire shape.
         park_rung: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
         parked_at: _,          // Internal parking-ladder state (ADR 0074); not on the wire shape.
@@ -55,6 +56,7 @@ pub(crate) fn session_to_proto(s: &engram_core::types::Session) -> app::Session 
         // ISO-8601, matching the JSON wire (chrono's Serialize is RFC3339).
         created_at: created_at.to_rfc3339(),
         last_active_at: last_active_at.to_rfc3339(),
+        last_event_at: last_event_at.map(|t| t.to_rfc3339()),
         suggested_title: suggested_title.clone(),
     }
 }
@@ -986,6 +988,10 @@ mod tests {
             mode: SessionMode::DevVm,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            // Deliberately offset from `last_active_at` so a converter that
+            // crossed the two clocks fails this fixture instead of passing on
+            // two identical `Utc::now()` values.
+            last_event_at: Some(chrono::Utc::now() + chrono::Duration::seconds(61)),
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
@@ -1006,6 +1012,15 @@ mod tests {
         assert_eq!(p.mode, "dev_vm");
         assert_eq!(p.created_at, s.created_at.to_rfc3339());
         assert_eq!(p.last_active_at, s.last_active_at.to_rfc3339());
+        assert_eq!(p.last_event_at, Some(s.last_event_at.unwrap().to_rfc3339()));
+
+        // The activity clock is nullable on both sides — a session that has
+        // not emitted an event must cross as unset, not as an epoch string.
+        let never_evented = Session {
+            last_event_at: None,
+            ..populated_session()
+        };
+        assert_eq!(session_to_proto(&never_evented).last_event_at, None);
     }
 
     #[test]

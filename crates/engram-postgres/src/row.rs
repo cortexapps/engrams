@@ -67,6 +67,12 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
     // Session titles: suggested_title added in migration 0101. Missing-column-
     // tolerant so a SELECT that doesn't project it still decodes.
     let suggested_title: Option<String> = row.try_get("suggested_title").ok().flatten();
+    // Activity clock added in migration 0068 (nullable, no backfill).
+    // Missing-column-tolerant so a SELECT that doesn't project it still
+    // decodes — a consumer that needs it reads
+    // `last_event_at.unwrap_or(last_active_at)`, so an unprojected column
+    // degrades to the state-transition clock instead of a decode error.
+    let last_event_at: Option<DateTime<Utc>> = row.try_get("last_event_at").ok().flatten();
     Ok(Session {
         id: SessionId(id),
         status: parse_session_state(&status)?,
@@ -76,6 +82,7 @@ pub(crate) fn session_from_row(row: &PgRow) -> Result<Session, MetaError> {
         mode,
         created_at,
         last_active_at,
+        last_event_at,
         live_disk_manifest,
         park_rung,
         parked_at,
@@ -312,6 +319,7 @@ pub(crate) fn artifact_from_row(row: &PgRow) -> Result<engram_core::types::Artif
         media_type: row.try_get("media_type").map_err(col_err)?,
         size_bytes: row.try_get("size_bytes").map_err(col_err)?,
         caption: row.try_get("caption").map_err(col_err)?,
+        file_name: row.try_get("file_name").map_err(col_err)?,
         created_at: row.try_get("created_at").map_err(col_err)?,
     })
 }

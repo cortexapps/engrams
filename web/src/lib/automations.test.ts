@@ -42,7 +42,7 @@ describe("automation UI helpers", () => {
 
   it("places server validation messages beside actionable fields", () => {
     expect(automationErrorField("invalid cron expression")).toBe("schedule");
-    expect(automationErrorField("profile has port_exposures and cannot be used")).toBe("profile");
+    expect(automationErrorField("action profile_id is not an active profile")).toBe("profile");
     expect(automationErrorField("unknown filter in title template")).toBe("titleTemplate");
   });
 });

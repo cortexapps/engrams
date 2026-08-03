@@ -411,6 +411,7 @@ fn insert_after_abandon_stage_is_routed_to_abandon_in_place() {
     for stage in [
         ShutdownStage::Signaled,
         ShutdownStage::TasksAborted,
+        ShutdownStage::CaptureDrain,
         ShutdownStage::FinalFlush,
     ] {
         assert!(admits_new_plane(stage), "{stage:?} still admits new planes");

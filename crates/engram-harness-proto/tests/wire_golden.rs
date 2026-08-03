@@ -487,6 +487,16 @@ fn upload_op_golden_and_variant_indices() {
     };
     assert_golden("upload_op_share_file", &share);
     assert_variant_index(&share, 0, "UploadOp::ShareFile");
+
+    // Appended (trailing) variant — old agentd frames stay index 0.
+    let named = UploadOp::ShareFileNamed {
+        ext: "html".into(),
+        file_name: "report.html".into(),
+        caption: Some("the report".into()),
+        size_bytes: 2048,
+    };
+    assert_golden("upload_op_share_file_named", &named);
+    assert_variant_index(&named, 1, "UploadOp::ShareFileNamed");
 }
 
 #[test]
@@ -638,6 +648,15 @@ fn regen_golden() {
             ext: "png".into(),
             caption: Some("the dashboard after my change".into()),
             size_bytes: 4096,
+        },
+    );
+    write(
+        "upload_op_share_file_named",
+        &UploadOp::ShareFileNamed {
+            ext: "html".into(),
+            file_name: "report.html".into(),
+            caption: Some("the report".into()),
+            size_bytes: 2048,
         },
     );
 

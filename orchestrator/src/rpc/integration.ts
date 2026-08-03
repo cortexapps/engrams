@@ -12,11 +12,12 @@
  */
 
 import { ConnectError, Code } from "@connectrpc/connect";
-import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
+import type { ConnectRouter } from "@connectrpc/connect";
 
 import { IntegrationService } from "../gen/engram/app/v1/integration_pb.ts";
 import type { MintKind } from "../gen/engram/app/v1/mint_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { requireAdmin, requireUser } from "./require.ts";
 import { config } from "../config.ts";
 import { errorMessage } from "../log.ts";
 import { getDb } from "../db/client.ts";
@@ -113,19 +114,6 @@ export interface IntegrationDeps {
   providers?: ReadonlyMap<string, ConnectionProvider>;
 }
 
-async function requireAdmin(ctx: HandlerContext, getSession: GetSession): Promise<void> {
-  const session = await getSession(ctx.requestHeader);
-  if (!session) throw new ConnectError("unauthenticated", Code.Unauthenticated);
-  if ((session.user.role ?? "user") !== "admin") {
-    throw new ConnectError("forbidden", Code.PermissionDenied);
-  }
-}
-
-/** Member gate: any authenticated user (the provider catalog is member-readable). */
-async function requireUser(ctx: HandlerContext, getSession: GetSession): Promise<void> {
-  const session = await getSession(ctx.requestHeader);
-  if (!session) throw new ConnectError("unauthenticated", Code.Unauthenticated);
-}
 
 /** Built-in seed providers (read-only) — a custom connector may not shadow one. */
 function builtinProviders(): Set<string> {

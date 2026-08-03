@@ -3024,6 +3024,165 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     assert_eq!(again.surviving_side_effects, Vec::<String>::new());
 }
 
+/// The two session clocks are independent, and both stores must move them
+/// on exactly the same triggers.
+///
+/// `last_active_at` is the STATE-MACHINE clock: stamped at create and by
+/// every `transition_session`. `last_event_at` is the ACTIVITY clock
+/// (migration 0068): `None` until the first event, then bumped by every
+/// `append_session_event`. Crossing them is a live bug in both directions —
+/// the eviction scanner keys its idempotency dedup on `last_active_at`
+/// staying frozen across an event append, and the orchestrator's task list
+/// orders on `last_event_at` NOT moving when a session merely changes state.
+async fn session_activity_clock_is_independent(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let created_at = ctx.clock.now_utc();
+    let id = meta.create_session(spec("conf:activity")).await.unwrap();
+
+    // A session that has not emitted an event has no activity clock — the
+    // orchestrator's fallback to `last_active_at` depends on the NULL.
+    let s = meta.get_session(id).await.unwrap();
+    assert_eq!(s.last_active_at, created_at);
+    assert_eq!(s.last_event_at, None, "no events yet ⇒ no activity clock");
+
+    // An event append bumps ONLY the activity clock.
+    ctx.clock.advance(Duration::from_secs(60));
+    let first_event_at = ctx.clock.now_utc();
+    meta.append_session_event(id, "agent_message", serde_json::json!({"text": "hi"}))
+        .await
+        .unwrap();
+    let s = meta.get_session(id).await.unwrap();
+    assert_eq!(s.last_event_at, Some(first_event_at));
+    assert_eq!(
+        s.last_active_at, created_at,
+        "an event append must NOT move the state-machine clock"
+    );
+
+    // A state transition bumps ONLY the state-machine clock. This is the
+    // ordering bug in the task list: the session did nothing new, yet
+    // `last_active_at` jumps ahead of its last real event.
+    ctx.clock.advance(Duration::from_secs(60));
+    let transition_at = ctx.clock.now_utc();
+    meta.transition_session(id, SessionState::Failed, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    let s = meta.get_session(id).await.unwrap();
+    assert_eq!(s.last_active_at, transition_at);
+    assert_eq!(
+        s.last_event_at,
+        Some(first_event_at),
+        "a state transition must NOT move the activity clock"
+    );
+}
+
+/// `list_active_sessions` feeds the app-facing session list, so it must
+/// project the activity clock — an unprojected column silently degrades the
+/// task ordering back to `last_active_at` instead of failing loudly.
+async fn list_active_sessions_projects_activity_clock(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta
+        .create_session(spec("conf:activity-list"))
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(30));
+    let event_at = ctx.clock.now_utc();
+    meta.append_session_event(id, "agent_message", serde_json::json!({"text": "hi"}))
+        .await
+        .unwrap();
+
+    let listed = meta.list_active_sessions().await.unwrap();
+    let s = listed
+        .iter()
+        .find(|s| s.id == id)
+        .expect("pending session is in the active set");
+    assert_eq!(s.last_event_at, Some(event_at));
+}
+
+/// ADR 0026 artifacts: insert/get roundtrip (incl. `file_name`, added by
+/// migration 0110), session scoping, and usage aggregation.
+async fn artifact_insert_get_usage(ctx: &Ctx) {
+    let sid = ctx
+        .meta
+        .create_session(spec("test.invalid/artifacts:latest"))
+        .await
+        .unwrap();
+    let id = uuid::Uuid::from_u128(0xA1);
+    ctx.meta
+        .insert_artifact(
+            id,
+            sid,
+            "artifacts/k1",
+            "text/html",
+            42,
+            Some("cap"),
+            Some("report.html"),
+        )
+        .await
+        .unwrap();
+
+    let row = ctx.meta.get_artifact(sid, id).await.unwrap().unwrap();
+    assert_eq!(row.id, id);
+    assert_eq!(row.blob_key, "artifacts/k1");
+    assert_eq!(row.media_type, "text/html");
+    assert_eq!(row.size_bytes, 42);
+    assert_eq!(row.caption.as_deref(), Some("cap"));
+    assert_eq!(row.file_name.as_deref(), Some("report.html"));
+
+    // NULL caption + file_name round-trip as None.
+    let id2 = uuid::Uuid::from_u128(0xA2);
+    ctx.meta
+        .insert_artifact(id2, sid, "artifacts/k2", "image/png", 8, None, None)
+        .await
+        .unwrap();
+    let row2 = ctx.meta.get_artifact(sid, id2).await.unwrap().unwrap();
+    assert_eq!(row2.caption, None);
+    assert_eq!(row2.file_name, None);
+
+    // Session scoping: a valid id under the wrong session is None.
+    let other = ctx
+        .meta
+        .create_session(spec("test.invalid/artifacts-b:latest"))
+        .await
+        .unwrap();
+    assert!(ctx.meta.get_artifact(other, id).await.unwrap().is_none());
+
+    // A duplicate id is an error on both stores (PK).
+    let dup = ctx
+        .meta
+        .insert_artifact(id, sid, "artifacts/k1", "text/html", 42, None, None)
+        .await;
+    assert!(dup.is_err(), "duplicate artifact id must error");
+
+    // Usage aggregates count + bytes for the session only.
+    assert_eq!(ctx.meta.artifact_usage(sid).await.unwrap(), (2, 50));
+    assert_eq!(ctx.meta.artifact_usage(other).await.unwrap(), (0, 0));
+}
+
+/// Migration 0110 semantics: artifact rows have no FK to `sessions` —
+/// an insert for a session id with no sessions row succeeds and reads
+/// back (rows outlive their session; the cross-session registry
+/// references them by id).
+async fn artifact_outlives_sessions(ctx: &Ctx) {
+    let ghost = SessionId::from(uuid::Uuid::from_u128(0xDEAD));
+    let id = uuid::Uuid::from_u128(0xA3);
+    ctx.meta
+        .insert_artifact(
+            id,
+            ghost,
+            "artifacts/ghost",
+            "text/markdown",
+            7,
+            None,
+            Some("notes.md"),
+        )
+        .await
+        .unwrap();
+    let row = ctx.meta.get_artifact(ghost, id).await.unwrap().unwrap();
+    assert_eq!(row.media_type, "text/markdown");
+    assert_eq!(row.file_name.as_deref(), Some("notes.md"));
+    assert_eq!(ctx.meta.artifact_usage(ghost).await.unwrap(), (1, 7));
+}
+
 conformance!(
     t_rewind_excludes_coordinator_facts,
     super::rewind_excludes_coordinator_facts
@@ -3042,4 +3201,20 @@ conformance!(t_snapshot_totals, super::snapshot_totals_aggregate);
 conformance!(
     t_stale_pending_reservation,
     super::stale_pending_reservation
+);
+conformance!(
+    t_session_activity_clock,
+    super::session_activity_clock_is_independent
+);
+conformance!(
+    t_list_active_sessions_activity_clock,
+    super::list_active_sessions_projects_activity_clock
+);
+conformance!(
+    t_artifact_insert_get_usage,
+    super::artifact_insert_get_usage
+);
+conformance!(
+    t_artifact_outlives_sessions,
+    super::artifact_outlives_sessions
 );

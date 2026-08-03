@@ -467,7 +467,10 @@ impl CheckpointConfig {
     /// intentionally does NOT capture FC memory — surviving VMs are detached
     /// and reattached by the successor generation (ADR 0044 K2,
     /// [`crate::lib`]: "no SIGTERM-checkpoint pipeline"); only the disk is
-    /// flushed. So the timer bounds how much in-RAM progress an active session
+    /// flushed, new captures are refused (the quiesce gate in
+    /// `capture_phase`), and an in-flight capture is drained bounded (the
+    /// CaptureDrain ladder stage) so its consumed dirty bitmap never dies
+    /// with the process. So the timer bounds how much in-RAM progress an active session
     /// can lose to an *unplanned host crash* (its disk + harness transcript
     /// survive; a planned roll keeps the running VM). 10 min
     /// is "infrequent but sane", with far less per-session pause / capture-lock
@@ -558,6 +561,16 @@ pub async fn run_checkpoint_pass(
     backend: &Arc<crate::pooled_backend::PooledBackend>,
     cfg: &CheckpointConfig,
 ) {
+    // 2026-08-03 `chain_poisoned` alert: SIGTERM raised the capture
+    // quiesce — a capture started now would race the process teardown
+    // and poison its chain after FC consumed the dirty bitmap. Skip the
+    // whole pass (quietly: `capture_phase`'s own gate is the
+    // authoritative refusal; this early-out just avoids a WARN + dead-
+    // guest probe per sandbox on every tick of the shutdown window).
+    if backend.captures_quiesced() {
+        tracing::debug!("periodic checkpoint pass skipped: captures quiesced for shutdown");
+        return;
+    }
     let due = backend.checkpoint_candidates_adaptive(cfg);
     for (sandbox_id, session_id) in due {
         // ADR 0038 B1: skip if a capture is already in flight —

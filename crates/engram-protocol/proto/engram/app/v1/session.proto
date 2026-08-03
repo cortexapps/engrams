@@ -133,6 +133,13 @@ message Session {
   // (never user attribution/preference); the orchestrator reads it to build a
   // task's display title. Unset until the harness emits one.
   optional string suggested_title = 9;
+  // Activity clock: the time the newest session event landed. Unlike
+  // `last_active_at` — which only moves on a state transition, so it freezes
+  // while a session works and jumps on eviction — this bumps on every event
+  // append. The orchestrator orders the task list by it, falling back to
+  // `last_active_at` when unset (rows that predate migration 0068, and a
+  // session that has not emitted an event yet).
+  optional string last_event_at = 10;
 }
 
 message CreateSessionRequest {
@@ -619,6 +626,10 @@ message CreateArtifactFromPathRequest {
   string session_id = 1;
   string path = 2;
   optional string caption = 3;
+  // Skip the file_shared session event. The Artifact tool sets this so a
+  // publish does not ALSO drop a share card in the thread (the tool
+  // result carries the artifact URL).
+  bool suppress_event = 4;
 }
 
 message CreateArtifactFromPathResponse {

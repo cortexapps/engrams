@@ -774,6 +774,18 @@ pub struct PooledBackend {
     /// abandon contract exists only where NBD data planes do.
     #[cfg(target_os = "linux")]
     abandoning: Arc<std::sync::atomic::AtomicBool>,
+    /// 2026-08-03 `chain_poisoned` alert: SIGTERM capture quiesce. Raised
+    /// (SeqCst, never lowered) as the first act of the shutdown ladder.
+    /// `capture_phase` checks it under the capture lock, BEFORE the
+    /// write-ahead invalidate and the FC `PUT /snapshot/create` — i.e.
+    /// before anything is consumed — and refuses: a capture that starts
+    /// after SIGTERM walks straight into the runtime teardown, fails
+    /// mid-post-processing with the dirty bitmap already consumed, and
+    /// poisons its checkpoint chain (the surviving VM then pays a FULL
+    /// re-chunk under the successor). Captures already past the gate are
+    /// waited for by `drain_captures_for_shutdown`. Unlike `abandoning`
+    /// this is not Linux-gated — captures exist on every backend.
+    captures_quiesced: Arc<std::sync::atomic::AtomicBool>,
     /// Issue #225: the coord client + host id used to SYNCHRONOUSLY
     /// publish a survivor's freshly-flushed `live_disk_manifest`
     /// during the SIGTERM final-flush pass. The normal flush path
@@ -1970,6 +1982,7 @@ impl PooledBackend {
             migration_roles: Arc::new(DashMap::new()),
             #[cfg(target_os = "linux")]
             abandoning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            captures_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_manifest_publish: None,
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             host_fs: Arc::new(engram_host_core::TokioFs),
@@ -2093,6 +2106,67 @@ impl PooledBackend {
     /// and skips outright; the next tick retries regardless.
     pub fn capture_in_flight(&self, id: SandboxId) -> bool {
         self.capture_lock(id).try_lock().is_err()
+    }
+
+    /// 2026-08-03 `chain_poisoned` alert: refuse to START any new capture
+    /// from here on (see the `captures_quiesced` field doc). Called at
+    /// SIGTERM before the shutdown ladder; sticky for the process
+    /// lifetime.
+    pub fn quiesce_captures_for_shutdown(&self) {
+        self.captures_quiesced
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the SIGTERM capture quiesce is in effect. The periodic
+    /// driver skips its pass outright on `true`; `capture_phase` holds
+    /// the authoritative check under the capture lock.
+    pub fn captures_quiesced(&self) -> bool {
+        self.captures_quiesced
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The SIGTERM ladder's CaptureDrain stage: wait (bounded by
+    /// `deadline`, shared across all sandboxes) for every in-flight
+    /// capture to complete, so a diff capture that already consumed the
+    /// KVM dirty bitmap finishes its post-processing and persists its
+    /// chain-head record BEFORE the process exit cancels its tasks and
+    /// poisons the chain. Callers must raise the quiesce flag first —
+    /// a lock this drain acquires and releases would otherwise admit a
+    /// fresh capture into the teardown window. Returns the number of
+    /// stragglers (captures still running at the deadline); each will
+    /// poison its chain at exit, exactly as before this stage existed.
+    pub async fn drain_captures_for_shutdown(&self, deadline: std::time::Duration) -> usize {
+        let start = crate::time_source::metrics_now_tokio();
+        // Snapshot the lock set; the quiesce flag guarantees no NEW
+        // capture can begin, so entries added after this point are
+        // uncontended.
+        let locks: Vec<(SandboxId, Arc<tokio::sync::Mutex<()>>)> = self
+            .capture_locks
+            .iter()
+            .map(|e| (*e.key(), Arc::clone(e.value())))
+            .collect();
+        let mut stragglers = 0usize;
+        for (id, lock) in locks {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            match tokio::time::timeout(remaining, lock.lock()).await {
+                // Acquiring proves no capture holds the lock; release
+                // immediately (the quiesce flag keeps it that way).
+                Ok(_guard) => {}
+                Err(_) => {
+                    stragglers += 1;
+                    ::metrics::counter!(crate::metrics::CAPTURE_SHUTDOWN_STRAGGLER_TOTAL)
+                        .increment(1);
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        deadline_secs = deadline.as_secs_f64(),
+                        "capture still in flight at the shutdown capture-drain \
+                         deadline; process exit will poison its checkpoint chain \
+                         (next capture is a FULL snapshot)",
+                    );
+                }
+            }
+        }
+        stragglers
     }
 
     /// ADR 0028 Fix A: where un-acked durable checkpoint records live.
@@ -2313,6 +2387,21 @@ impl PooledBackend {
         let capture_guard = capture_lock.lock_owned().await;
         metrics::histogram!(crate::metrics::SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS)
             .record(lock_wait.elapsed().as_secs_f64());
+        // 2026-08-03 `chain_poisoned` alert: the SIGTERM capture-quiesce
+        // gate. Checked under the capture lock (so a capture queued
+        // behind the shutdown drain's acquire-and-release cannot slip
+        // past) and BEFORE the write-ahead invalidate below — nothing is
+        // consumed yet, so refusing here is free: the chain, its durable
+        // head record, and the guest all stay intact for the successor
+        // generation to capture.
+        if self.captures_quiesced() {
+            return Err(SandboxError::Snapshot(
+                "capture refused: host-agent is shutting down (SIGTERM capture \
+                 quiesce); nothing was consumed — the successor generation \
+                 captures next"
+                    .into(),
+            ));
+        }
         // Diff-mode when a checkpoint chain exists: same coherent
         // (memory, disk) capture contract, O(dirty set) cost. The
         // chain seeds on the first (Full) capture below — so an
@@ -10315,6 +10404,80 @@ mod tests {
 
         assert!(!overran);
         assert!(tasks.is_empty());
+    }
+
+    /// 2026-08-03 `chain_poisoned` alert regression: once the SIGTERM
+    /// capture quiesce is raised, `capture_phase` must refuse BEFORE the
+    /// write-ahead invalidate — the durable chain-head record (the
+    /// successor's rehydrate seed) survives the refusal, so the surviving
+    /// VM keeps its Diff-capable chain instead of paying a FULL re-chunk.
+    #[tokio::test]
+    async fn quiesced_capture_refuses_before_invalidating_the_chain_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
+        let pooled = PooledBackend::new(inner).with_checkpoint_dir(tmp.path().join("checkpoints"));
+        let id = SandboxId::new();
+
+        // A durable chain-head record, as a survivor's capture leaves it.
+        let store = pooled.chain_heads.as_ref().unwrap();
+        store
+            .persist(crate::checkpoint::ChainHeadRecord {
+                sandbox_id: id,
+                manifest_ref: engram_core::types::manifest::ManifestRef::new(),
+                session_id: None,
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        pooled.quiesce_captures_for_shutdown();
+        let err = match pooled.capture_phase(id).await {
+            Ok(_) => panic!("a quiesced capture must refuse"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("capture refused"),
+            "unexpected error: {err}"
+        );
+        // The refusal consumed nothing: the record is still the seed, and
+        // the capture lock was released.
+        assert!(
+            crate::checkpoint::ChainHeadRecord::load(store.dir(), id)
+                .await
+                .is_some(),
+            "the chain-head record must survive a quiesced-capture refusal",
+        );
+        assert!(!pooled.capture_in_flight(id));
+    }
+
+    /// The CaptureDrain ladder stage: an in-flight capture (a held
+    /// capture lock) past the deadline counts as a straggler; a released
+    /// lock drains clean.
+    #[tokio::test]
+    async fn shutdown_capture_drain_counts_stragglers_and_drains_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
+        let pooled = PooledBackend::new(inner);
+        pooled.quiesce_captures_for_shutdown();
+        let id = SandboxId::new();
+
+        // A capture in flight that outlives the deadline is a straggler.
+        let guard = pooled.capture_lock(id).lock_owned().await;
+        let stragglers = pooled
+            .drain_captures_for_shutdown(std::time::Duration::from_millis(50))
+            .await;
+        assert_eq!(stragglers, 1, "a held capture lock must count");
+
+        // A capture that completes (the lock releases) drains clean, and
+        // the drain leaves the lock free behind it.
+        drop(guard);
+        let stragglers = pooled
+            .drain_captures_for_shutdown(std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(stragglers, 0);
+        assert!(!pooled.capture_in_flight(id));
     }
 
     #[tokio::test]

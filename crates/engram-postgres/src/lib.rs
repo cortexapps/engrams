@@ -2156,7 +2156,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
-                   created_at, last_active_at,
+                   created_at, last_active_at, last_event_at,
                    live_disk_manifest_id, live_disk_manifest_version,
                    park_rung, parked_at, suggested_title
             FROM sessions WHERE id = $1
@@ -2306,7 +2306,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
-                   created_at, last_active_at,
+                   created_at, last_active_at, last_event_at,
                    live_disk_manifest_id, live_disk_manifest_version,
                    park_rung, parked_at,
                    suggested_title
@@ -4956,11 +4956,12 @@ impl MetadataStore for PostgresStore {
         media_type: &str,
         size_bytes: i64,
         caption: Option<&str>,
+        file_name: Option<&str>,
     ) -> Result<(), MetaError> {
         sqlx::query(
             r#"
-            INSERT INTO artifacts (id, session_id, blob_key, media_type, size_bytes, caption)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO artifacts (id, session_id, blob_key, media_type, size_bytes, caption, file_name)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             "#,
         )
         .bind(id)
@@ -4969,6 +4970,7 @@ impl MetadataStore for PostgresStore {
         .bind(media_type)
         .bind(size_bytes)
         .bind(caption)
+        .bind(file_name)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4984,7 +4986,7 @@ impl MetadataStore for PostgresStore {
         // blob key even with a guessed artifact id.
         let row = sqlx::query(
             r#"
-            SELECT id, blob_key, media_type, size_bytes, caption, created_at
+            SELECT id, blob_key, media_type, size_bytes, caption, file_name, created_at
               FROM artifacts
              WHERE id = $1 AND session_id = $2
             "#,

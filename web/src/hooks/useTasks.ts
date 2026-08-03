@@ -90,7 +90,14 @@ export function taskToSessionListItem(task: Task): SessionListItem {
     host_id: sess?.hostId ?? null,
     sandbox_id: sess?.sandboxId ?? null,
     created_at: sess?.createdAt ?? task.createdAt,
-    last_active_at: sess?.lastActiveAt ?? task.createdAt,
+    // The row's "last active" label must read the SAME clock the orchestrator
+    // ordered this list by (`taskActivityAt` in orchestrator/src/rpc/tasks.ts):
+    // the activity clock first, then the state-machine clock, then the task's
+    // own createdAt. Reading `lastActiveAt` here while the server sorts on
+    // `lastEventAt` would render a list ordered by one clock and labelled with
+    // another — a row stamped "2 months ago" sitting above one stamped
+    // "5 minutes ago".
+    last_active_at: sess?.lastEventAt ?? sess?.lastActiveAt ?? task.createdAt,
     owner_email: task.createdBy?.email ?? null,
     owner_name: task.createdBy?.name ?? null,
     owner_kind: task.createdByUserId == null ? "system" : null,

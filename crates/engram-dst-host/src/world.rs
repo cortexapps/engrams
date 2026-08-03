@@ -1477,7 +1477,9 @@ impl SimHost {
     /// (the process exits; the successor reattaches). A following `Restart` /
     /// `SpoolAdopt` recovers every acked write — oracle #1 holds either way.
     pub async fn sigterm(&mut self, env_value: Option<f64>) -> Result<(), String> {
-        let plan = engram_host_core::plan_shutdown(env_value);
+        // The sim models no captures, so the capture-drain budget (second
+        // arg) is left at its default; the CaptureDrain leg is a no-op here.
+        let plan = engram_host_core::plan_shutdown(env_value, None);
         let overrun = plan.flush_deadline < SIM_FLUSH_COST;
         for idx in 0..self.sandboxes.len() {
             let Some(backend) = self.sandboxes[idx].backend.clone() else {

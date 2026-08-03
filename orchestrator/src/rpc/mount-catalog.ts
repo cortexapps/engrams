@@ -12,11 +12,11 @@
  * Injectable deps (getSession, mountCatalog) for tests.
  */
 
-import { ConnectError, Code } from "@connectrpc/connect";
-import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
+import type { ConnectRouter } from "@connectrpc/connect";
 
 import { MountCatalogService } from "../gen/engram/app/v1/mount_catalog_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { requireAdmin, requireUser } from "./require.ts";
 import { mountCatalog as defaultMountCatalog } from "../control-plane/client.ts";
 import type { MountCatalogClient } from "../skills/catalog.ts";
 
@@ -29,22 +29,6 @@ export interface MountCatalogDeps {
   mountCatalog?: MountCatalogClient;
 }
 
-function headersOf(ctx: HandlerContext): Headers {
-  return ctx.requestHeader;
-}
-
-async function requireUser(
-  ctx: HandlerContext,
-  getSession: GetSession,
-): Promise<{ id: string; role: string }> {
-  const session = await getSession(headersOf(ctx));
-  if (!session) throw new ConnectError("unauthenticated", Code.Unauthenticated);
-  return { id: session.user.id, role: session.user.role ?? "user" };
-}
-
-function requireAdmin(user: { role: string }): void {
-  if (user.role !== "admin") throw new ConnectError("forbidden", Code.PermissionDenied);
-}
 
 export function registerMountCatalog(router: ConnectRouter, deps?: MountCatalogDeps): void {
   const getSession: GetSession =
@@ -71,8 +55,7 @@ export function registerMountCatalog(router: ConnectRouter, deps?: MountCatalogD
     // Admin-only. The owner is stamped from the authenticated session — the
     // request's `owner` is ignored, so the web can never spoof attribution.
     async registerSkill(req, ctx) {
-      const user = await requireUser(ctx, getSession);
-      requireAdmin(user);
+      const user = await requireAdmin(ctx, getSession);
       const resp = await catalog.registerSkill({
         name: req.name,
         description: req.description,
@@ -85,8 +68,7 @@ export function registerMountCatalog(router: ConnectRouter, deps?: MountCatalogD
     },
 
     async deleteSkill(req, ctx) {
-      const user = await requireUser(ctx, getSession);
-      requireAdmin(user);
+      await requireAdmin(ctx, getSession);
       const resp = await catalog.deleteSkill({ name: req.name });
       return { deleted: resp.deleted };
     },

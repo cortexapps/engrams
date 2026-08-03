@@ -125,9 +125,14 @@ async fn share_file_round_trips_over_vsock() {
                     return;
                 }
             };
-            let UploadOp::ShareFile {
-                ext, size_bytes, ..
-            } = header.op.clone();
+            let (ext, size_bytes) = match header.op.clone() {
+                UploadOp::ShareFile {
+                    ext, size_bytes, ..
+                }
+                | UploadOp::ShareFileNamed {
+                    ext, size_bytes, ..
+                } => (ext, size_bytes),
+            };
             let mut body = vec![0u8; size_bytes as usize];
             if let Err(e) = read_half.read_exact(&mut body).await {
                 eprintln!("upload sink: body read failed: {e}");

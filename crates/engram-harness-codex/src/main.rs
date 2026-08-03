@@ -12,15 +12,13 @@ use engram_harness_proto::{
 use engram_harness_sdk::browser_view;
 use engram_harness_sdk::parked::{ParkedCall, ParkedCallKind, ParkedCallStore};
 use engram_harness_sdk::questions::{Answers, Question, QuestionOption};
+use engram_harness_sdk::state::StateDir;
 use engram_harness_sdk::{emit, Channels, ConnectionConfig, QueuedPrompt};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, Mutex, Notify};
 
-const DEFAULT_CODEX_HOME: &str = "/workspace/.engrams/codex";
-const THREAD_ID_FILE: &str = "/workspace/.engrams/codex-thread-id";
-const PARKED_CALLS_FILE: &str = "/workspace/.engrams/codex-parked-calls.json";
 const MAX_SUMMARY: usize = 4096;
 const MAX_OAUTH_BUNDLE_BYTES: usize = 256 * 1024;
 const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
@@ -152,20 +150,27 @@ struct Cli {
     binding_epoch: u64,
     #[arg(long, env = "ENGRAM_CODEX_BIN")]
     codex_bin: Option<PathBuf>,
-    #[arg(long, env = "ENGRAM_CODEX_HOME", default_value = DEFAULT_CODEX_HOME)]
-    codex_home: PathBuf,
-    /// Test seam for per-session state. Production uses THREAD_ID_FILE.
-    #[arg(skip)]
-    thread_id_file: Option<PathBuf>,
+    /// Root of everything this harness keeps per session: `CODEX_HOME`, the
+    /// resumable thread id, the parked-call table, and the ADR 0107 mode
+    /// stamp (see `engram_harness_sdk::state`). Production takes the fixed
+    /// in-VM default; the dev Process backend points `ENGRAM_STATE_DIR` at its
+    /// own sandbox directory; every test injects a temp directory.
+    ///
+    /// One field, no fallback: a test that redirected only SOME of these still
+    /// wrote the rest into the live directory, which in a dogfooding session
+    /// is the running session's own state.
+    #[arg(
+        long,
+        env = "ENGRAM_STATE_DIR",
+        default_value = engram_harness_sdk::state::DEFAULT_STATE_DIR
+    )]
+    state_dir: PathBuf,
+    /// `CODEX_HOME` override for dev; defaults inside the state dir.
+    #[arg(long, env = "ENGRAM_CODEX_HOME")]
+    codex_home: Option<PathBuf>,
     /// Parsed once from ENGRAM_TOOLS by the harness entrypoint.
     #[arg(skip)]
     tool_manifest: ToolManifest,
-    /// Test seam for the durable correlation table.
-    #[arg(skip)]
-    parked_calls_file: Option<PathBuf>,
-    /// Test seam for the ADR 0107 session-mode stamp.
-    #[arg(skip)]
-    mode_stamp_file: Option<PathBuf>,
     /// Test-only service-account credential; production reads CODEX_API_KEY.
     #[arg(skip)]
     test_api_key: Option<String>,
@@ -175,22 +180,26 @@ struct Cli {
 }
 
 impl Cli {
-    fn thread_id_file(&self) -> &Path {
-        self.thread_id_file
-            .as_deref()
-            .unwrap_or_else(|| Path::new(THREAD_ID_FILE))
+    fn state(&self) -> StateDir {
+        StateDir::new(&self.state_dir)
     }
 
-    fn parked_calls_file(&self) -> &Path {
-        self.parked_calls_file
-            .as_deref()
-            .unwrap_or_else(|| Path::new(PARKED_CALLS_FILE))
+    fn codex_home(&self) -> PathBuf {
+        self.codex_home
+            .clone()
+            .unwrap_or_else(|| self.state().codex_home())
     }
 
-    fn mode_stamp_file(&self) -> &Path {
-        self.mode_stamp_file
-            .as_deref()
-            .unwrap_or_else(|| Path::new(engram_harness_sdk::mode_stamp::MODE_STAMP_FILE))
+    fn thread_id_file(&self) -> PathBuf {
+        self.state().codex_thread_id()
+    }
+
+    fn parked_calls_file(&self) -> PathBuf {
+        self.state().codex_parked_calls()
+    }
+
+    fn mode_stamp_file(&self) -> PathBuf {
+        self.state().mode_stamp()
     }
 }
 
@@ -615,6 +624,7 @@ impl AppServer {
         } else {
             None
         };
+        let codex_home = cli.codex_home();
         let oauth_home = if oauth.is_some() {
             let dir = tempfile::Builder::new()
                 .prefix("engram-codex-oauth-")
@@ -628,14 +638,14 @@ impl AppServer {
             }
             Some(dir)
         } else {
-            tokio::fs::create_dir_all(&cli.codex_home)
+            tokio::fs::create_dir_all(&codex_home)
                 .await
                 .map_err(|e| format!("create CODEX_HOME: {e}"))?;
             None
         };
         let runtime_home = oauth_home
             .as_ref()
-            .map_or_else(|| cli.codex_home.clone(), |dir| dir.path().to_path_buf());
+            .map_or(codex_home, |dir| dir.path().to_path_buf());
         ensure_skills_link(&runtime_home).await;
         let auth_path = runtime_home.join("auth.json");
         if let Some(oauth) = &oauth {
@@ -649,7 +659,7 @@ impl AppServer {
         let stderr = child.stderr.take().ok_or("app-server stderr unavailable")?;
         let mut server = Self {
             child,
-            mode_stamp_path: cli.mode_stamp_file().to_path_buf(),
+            mode_stamp_path: cli.mode_stamp_file(),
             stdin,
             lines: BufReader::new(stdout).lines(),
             next_id: 1,
@@ -715,7 +725,7 @@ impl AppServer {
             .ok_or("thread response missing result.thread.id")?
             .to_owned();
         server.persisted_prompts = persisted_prompts(&response);
-        persist_thread_id(cli.thread_id_file(), &server.thread_id).await?;
+        persist_thread_id(&cli.thread_id_file(), &server.thread_id).await?;
         if let Some(oauth) = oauth {
             server.oauth_watcher = Some(spawn_oauth_watcher(oauth, auth_path));
         }
@@ -2387,11 +2397,16 @@ done
         (script, record)
     }
 
-    fn test_cli(codex_bin: PathBuf, codex_home: PathBuf) -> Cli {
-        let parked_calls_file = codex_home
-            .parent()
-            .unwrap_or(&codex_home)
-            .join("parked-calls.json");
+    /// A `Cli` whose per-session state — `CODEX_HOME`, the thread id, the
+    /// parked-call table, the mode stamp — is confined to a fresh temp dir.
+    ///
+    /// Mandatory and per test: the production default is the LIVE state
+    /// directory of whatever session the suite runs in, and a shared temp path
+    /// leaks one test's resumable thread or latched mode into another's.
+    fn test_cli(codex_bin: PathBuf) -> Cli {
+        let state_dir =
+            std::env::temp_dir().join(format!("engram-codex-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir).expect("test state dir");
         Cli {
             connect: None,
             port: Some(1),
@@ -2399,13 +2414,9 @@ done
             sandbox_id: SandboxId::new(),
             binding_epoch: 1,
             codex_bin: Some(codex_bin),
-            codex_home,
-            thread_id_file: None,
+            state_dir,
+            codex_home: None,
             tool_manifest: manifest_from_env(),
-            parked_calls_file: Some(parked_calls_file),
-            mode_stamp_file: Some(
-                std::env::temp_dir().join(format!("codex-mode-stamp-{}", uuid::Uuid::new_v4())),
-            ),
             test_api_key: Some("test-api-key".into()),
             test_credential_control: None,
         }
@@ -2431,9 +2442,7 @@ done
     async fn fake_app_server_completes_one_prompt_turn() {
         let completed = r#"{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"turn-1","status":"completed"}}}"#;
         let (script, _) = write_fake_codex(&[completed]).await;
-        let base = script.parent().unwrap();
-        let mut cli = test_cli(script.clone(), base.join("home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let cli = test_cli(script.clone());
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let engine = tokio::spawn(run_engine(
@@ -2492,9 +2501,7 @@ done
         .unwrap();
         let endpoint = serve_one_oauth_fetch(payload).await;
         let (script, record) = write_fake_oauth_codex().await;
-        let base = script.parent().unwrap().to_path_buf();
-        let mut cli = test_cli(script, base.join("unused-home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let mut cli = test_cli(script);
         cli.test_api_key = None;
         cli.test_credential_control = Some(CredentialControl {
             session_id: cli.session_id,
@@ -2516,9 +2523,7 @@ done
     #[tokio::test]
     async fn initialize_enables_experimental_api() {
         let (script, record) = write_fake_codex(&[]).await;
-        let base = script.parent().unwrap().to_path_buf();
-        let mut cli = test_cli(script, base.join("home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let cli = test_cli(script);
         let mut server = AppServer::spawn(&cli, 1).await.unwrap();
 
         let requests = recorded_requests(&record).await;
@@ -2542,11 +2547,9 @@ done
         ]"#;
         std::env::set_var("ENGRAM_TOOLS", manifest);
         let (script, record) = write_fake_codex(&[]).await;
-        let base = script.parent().unwrap().to_path_buf();
-        let mut cli = test_cli(script, base.join("home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let cli = test_cli(script);
         if resume {
-            tokio::fs::write(cli.thread_id_file.as_ref().unwrap(), "existing-thread\n")
+            tokio::fs::write(cli.thread_id_file(), "existing-thread\n")
                 .await
                 .unwrap();
         }
@@ -2594,9 +2597,7 @@ done
     async fn deferred_dynamic_tool_call_emits_requested_then_parked_without_idle() {
         let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-1","tool":"save_memory","arguments":{"text":"remember this"},"threadId":"t1","turnId":"turn-1"}}"#;
         let (script, _) = write_fake_codex(&[tool_call]).await;
-        let base = script.parent().unwrap().to_path_buf();
-        let mut cli = test_cli(script, base.join("home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let mut cli = test_cli(script);
         cli.tool_manifest = parse_tool_manifest(
             r#"[{"name":"save_memory","description":"Save a memory","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{}}]"#,
         )
@@ -2654,9 +2655,7 @@ done
     #[tokio::test]
     async fn plan_mode_prompt_starts_a_read_only_turn_with_preamble() {
         let (script, record) = write_fake_codex(&[]).await;
-        let base = script.parent().unwrap().to_path_buf();
-        let mut cli = test_cli(script, base.join("home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let cli = test_cli(script);
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let engine = tokio::spawn(run_engine(
@@ -2708,14 +2707,12 @@ done
     async fn exit_plan_mode_outside_plan_mode_is_rejected_in_place() {
         let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-plan","tool":"exit_plan_mode","arguments":{"plan":"draft plan"},"threadId":"t1","turnId":"turn-1"}}"#;
         let (script, record) = write_fake_codex(&[tool_call]).await;
-        let base = script.parent().unwrap().to_path_buf();
-        let mut cli = test_cli(script, base.join("home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let mut cli = test_cli(script);
         cli.tool_manifest = parse_tool_manifest(
             r#"[{"name":"exit_plan_mode","description":"Present the plan","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{}}]"#,
         )
         .unwrap();
-        let parked_path = cli.parked_calls_file().to_path_buf();
+        let parked_path = cli.parked_calls_file();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let engine = tokio::spawn(run_engine(
@@ -2801,15 +2798,13 @@ done
     async fn plan_reject_starts_a_revision_turn_carrying_the_feedback() {
         let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-plan","tool":"exit_plan_mode","arguments":{"plan":"draft"},"threadId":"t1","turnId":"turn-1"}}"#;
         let (script, record) = write_fake_codex(&[tool_call]).await;
-        let base = script.parent().unwrap().to_path_buf();
-        let mut cli = test_cli(script, base.join("home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let mut cli = test_cli(script);
         cli.tool_manifest = parse_tool_manifest(
             r#"[{"name":"exit_plan_mode","description":"Present the plan","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{}}]"#,
         )
         .unwrap();
         // Latch plan mode so the call parks instead of being rejected in place.
-        engram_harness_sdk::mode_stamp::write_mode_stamp(cli.mode_stamp_file(), "plan").unwrap();
+        engram_harness_sdk::mode_stamp::write_mode_stamp(&cli.mode_stamp_file(), "plan").unwrap();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let engine = tokio::spawn(run_engine(
@@ -2916,9 +2911,7 @@ done
     async fn sync_dynamic_tool_call_emits_request_and_routes_result() {
         let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-1","tool":"save_memory","arguments":{"text":"remember this"},"threadId":"t1","turnId":"turn-1"}}"#;
         let (script, record) = write_fake_codex(&[tool_call]).await;
-        let base = script.parent().unwrap().to_path_buf();
-        let mut cli = test_cli(script, base.join("home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let mut cli = test_cli(script);
         cli.tool_manifest = parse_tool_manifest(
             r#"[{"name":"save_memory","description":"Save a memory","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{}}]"#,
         )
@@ -3011,11 +3004,9 @@ done
     async fn native_request_user_input_uses_generic_frames_and_is_parked_durably() {
         let question = r#"{"id":88,"method":"item/tool/requestUserInput","params":{"itemId":"question-1","threadId":"t1","turnId":"turn-1","questions":[{"id":"q1","question":"Deploy now?","header":"Deploy","multiSelect":false,"options":[{"label":"Yes","description":"Deploy it"}]}]}}"#;
         let (script, record) = write_fake_codex(&[question]).await;
-        let base = script.parent().unwrap().to_path_buf();
-        let mut cli = test_cli(script, base.join("home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let mut cli = test_cli(script);
         cli.tool_manifest = native_question_manifest();
-        let parked_path = cli.parked_calls_file().to_path_buf();
+        let parked_path = cli.parked_calls_file();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let engine = tokio::spawn(run_engine(
@@ -3121,9 +3112,7 @@ done
     async fn unbound_request_user_input_falls_back_to_generic_question_protocol() {
         let question = r#"{"id":88,"method":"item/tool/requestUserInput","params":{"itemId":"legacy-question","threadId":"t1","turnId":"turn-1","questions":[{"id":"q1","question":"Deploy now?","header":"Deploy","multiSelect":false,"options":[{"label":"Yes","description":"Deploy it"}]}]}}"#;
         let (script, record) = write_fake_codex(&[question]).await;
-        let base = script.parent().unwrap().to_path_buf();
-        let mut cli = test_cli(script, base.join("home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let mut cli = test_cli(script);
         cli.tool_manifest = Vec::new();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -3217,9 +3206,7 @@ done
     async fn shutdown_returns_promptly_while_dynamic_tool_call_is_parked() {
         let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-1","tool":"save_memory","arguments":{"text":"remember this"},"threadId":"t1","turnId":"turn-1"}}"#;
         let (script, _) = write_fake_codex(&[tool_call]).await;
-        let base = script.parent().unwrap().to_path_buf();
-        let mut cli = test_cli(script, base.join("home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let mut cli = test_cli(script);
         cli.tool_manifest = parse_tool_manifest(
             r#"[{"name":"save_memory","description":"Save a memory","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{}}]"#,
         )
@@ -3264,9 +3251,7 @@ done
     #[tokio::test]
     async fn native_question_result_after_app_server_crash_becomes_follow_up_user_message() {
         let (script, record) = write_crashing_question_fake().await;
-        let base = script.parent().unwrap().to_path_buf();
-        let mut cli = test_cli(script, base.join("home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let mut cli = test_cli(script);
         cli.tool_manifest = native_question_manifest();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(32);
@@ -3387,9 +3372,7 @@ done
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
         let (script, _) = write_fake_codex(&[]).await;
-        let base = script.parent().unwrap().to_path_buf();
-        let mut cli = test_cli(script, base.join("home"));
-        cli.thread_id_file = Some(base.join("thread-id"));
+        let cli = test_cli(script);
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let engine = tokio::spawn(run_engine(

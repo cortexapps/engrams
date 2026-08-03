@@ -668,10 +668,13 @@ bundles-squashfs:
     harness_tree="${ENGRAM_HARNESS_CLAUDE_TREE:-}"
     if [ -z "$harness_tree" ]; then
         # PINNED — keep in lockstep with ci.yml's bake-harness-claude-artifact
-        # and bundles-vz: 2.1.185 is the newest CLI that still offers
-        # AskUserQuestion headlessly (cortexapps/engrams#431); bump deliberately
-        # and re-verify AUQ.
-        CLAUDE_VERSION=2.1.185
+        # and bake-images.yml. Questions and plan approval ride the injected
+        # MCP tools (ask_user_question / exit_plan_mode) since the CLI removed
+        # the AskUserQuestion + ExitPlanMode built-ins from headless mode
+        # (cortexapps/engrams#431). Bump deliberately and re-verify the
+        # deferred-tool spine: defer parks the turn, `--resume` re-fires
+        # id-stable, and the MCP bridge serves the stash.
+        CLAUDE_VERSION=2.1.212
         case "$(uname -m)" in
             arm64 | aarch64) htarget=aarch64-unknown-linux-musl; carch=linux-arm64 ;;
             x86_64 | amd64)  htarget=x86_64-unknown-linux-musl;   carch=linux-x64  ;;

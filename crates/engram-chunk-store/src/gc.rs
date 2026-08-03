@@ -392,6 +392,7 @@ mod tests {
             _media_type: &str,
             _size_bytes: i64,
             _caption: Option<&str>,
+            _file_name: Option<&str>,
         ) -> Result<(), MetaError> {
             Ok(())
         }

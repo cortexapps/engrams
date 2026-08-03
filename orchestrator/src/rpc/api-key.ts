@@ -37,6 +37,7 @@ import { ApiKeyService } from "../gen/engram/app/v1/api_key_pb.ts";
 import type { ApiKeyMeta } from "../gen/engram/app/v1/api_key_pb.ts";
 import { auth } from "../auth/better-auth.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { requireAdmin } from "./require.ts";
 import { getDb } from "../db/client.ts";
 import { apikey, user } from "../db/schema.ts";
 
@@ -198,13 +199,6 @@ export interface ApiKeyDeps {
   backend?: ApiKeyBackend;
 }
 
-async function requireAdmin(ctx: HandlerContext, getSession: GetSession): Promise<void> {
-  const session = await getSession(ctx.requestHeader);
-  if (!session) throw new ConnectError("unauthenticated", Code.Unauthenticated);
-  if ((session.user.role ?? "user") !== "admin") {
-    throw new ConnectError("forbidden", Code.PermissionDenied);
-  }
-}
 
 /** Any authenticated HUMAN user (the CLI-key RPCs). A session resolved from a
  *  service-account key is rejected — a global key must not launder itself

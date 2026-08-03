@@ -12,11 +12,11 @@
  * Injectable deps (getSession, orgSecret) for tests.
  */
 
-import { ConnectError, Code } from "@connectrpc/connect";
-import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
+import type { ConnectRouter } from "@connectrpc/connect";
 
 import { OrgSecretService } from "../gen/engram/app/v1/org_secret_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { requireAdmin } from "./require.ts";
 import { orgSecret as defaultOrgSecret } from "../control-plane/client.ts";
 
 export type GetSession = (
@@ -43,13 +43,6 @@ export interface OrgSecretDeps {
   orgSecret?: OrgSecretClient;
 }
 
-async function requireAdmin(ctx: HandlerContext, getSession: GetSession): Promise<void> {
-  const session = await getSession(ctx.requestHeader);
-  if (!session) throw new ConnectError("unauthenticated", Code.Unauthenticated);
-  if ((session.user.role ?? "user") !== "admin") {
-    throw new ConnectError("forbidden", Code.PermissionDenied);
-  }
-}
 
 export function registerOrgSecret(router: ConnectRouter, deps?: OrgSecretDeps): void {
   const getSession: GetSession =

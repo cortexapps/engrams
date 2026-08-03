@@ -2,18 +2,21 @@
 //!
 //! Streams a shared file into `BlobStorage` under the GC-safe
 //! `artifacts/<session>/<id>` prefix, records an `artifacts` row, and
-//! emits a [`SessionEvent::FileShared`]. Two trust surfaces share the
+//! emits a [`SessionEvent::FileShared`]. Two surfaces share the
 //! [`process_upload`] core (the *caller* does auth):
 //!
-//! - **Untrusted** in-guest push (the `share-file` skill, a potentially
-//!   malicious agent): magic-byte image/video allowlist enforced. Reaches
-//!   here over vsock ([`handle_vsock_connection`]) or, in split mode, the
-//!   host-relayed [`upload_forward`] (`POST /api/hosts/upload`).
-//! - **Trusted** operator pull (`POST /sessions/:id/artifacts/from-path`,
-//!   Phase 7): any media type, no allowlist.
+//! - In-guest push (the `share-file` skill): reaches here over vsock
+//!   ([`handle_vsock_connection`]) or, in split mode, the host-relayed
+//!   [`upload_forward`] (`POST /api/hosts/upload`).
+//! - Operator pull (gRPC `CreateArtifactFromPath`): streams a `cat` of a
+//!   guest path.
 //!
-//! The serve endpoint `GET /sessions/:id/artifacts/:artifact_id` and the
-//! ProcessBackend loopback land in later phases.
+//! Any file type is accepted. The stored media type is stamped by
+//! [`resolve_media_type`]: magic-byte sniffing wins; a declared extension
+//! fills in only for types that have no magic bytes; everything else is
+//! `application/octet-stream`. The guest-supplied MIME is never trusted.
+//! The serve side (orchestrator `artifactResponseHeaders`) applies the
+//! MIME-agnostic hardening that makes attacker-controlled bytes safe.
 
 use axum::body::Body;
 use axum::extract::State;
@@ -43,17 +46,9 @@ const MAX_ARTIFACTS_PER_SESSION: i64 = 200;
 const MAX_ARTIFACT_TOTAL_BYTES_PER_SESSION: i64 = 2 * 1024 * 1024 * 1024;
 /// Captions are untrusted text; cap length and strip control chars.
 const MAX_CAPTION_CHARS: usize = 280;
-
-/// Whether the *upload authorization* layer should constrain the media
-/// type. The serve-side hardening is MIME-agnostic regardless.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Trust {
-    /// In-guest push from a potentially malicious agent — only
-    /// magic-byte-verified image/video is accepted.
-    Untrusted,
-    /// Operator pull of any file by path — any type accepted.
-    Trusted,
-}
+/// File names are untrusted text; cap length (a generous filesystem
+/// basename bound) and strip control chars + path separators.
+const MAX_FILE_NAME_CHARS: usize = 255;
 
 /// A stored artifact (the success of [`process_upload`]).
 pub struct SharedArtifact {
@@ -70,7 +65,7 @@ pub enum UploadError {
     Quota(String),
     /// Per-file size cap exceeded mid-stream (→ 413).
     TooLarge(String),
-    /// Disallowed media type on the untrusted path, or empty body (→ 400).
+    /// Empty body (→ 400).
     BadMedia(String),
     /// Storage / metadata / read failure (→ 500).
     Internal(String),
@@ -96,8 +91,8 @@ impl From<UploadError> for ApiError {
 }
 
 /// Detect a media type from leading magic bytes. Never trusts a
-/// guest-supplied MIME. Returns `None` for anything unrecognized
-/// (notably SVG/HTML, which are rejected on the untrusted path).
+/// guest-supplied MIME. Returns `None` for anything unrecognized;
+/// [`resolve_media_type`] then falls back to the declared extension.
 fn detect_media_type(b: &[u8]) -> Option<&'static str> {
     if b.len() >= 8 && b[..8] == [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'] {
         return Some("image/png");
@@ -120,8 +115,49 @@ fn detect_media_type(b: &[u8]) -> Option<&'static str> {
     None
 }
 
-fn is_media(media_type: &str) -> bool {
-    media_type.starts_with("image/") || media_type.starts_with("video/")
+/// Declared-extension MIME map for types that have no magic bytes.
+/// Extensions of *sniffable* types are deliberately absent: for those,
+/// matching bytes are the only way in ([`resolve_media_type`]).
+fn declared_media_type(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "html" | "htm" => "text/html",
+        "md" | "markdown" => "text/markdown",
+        "txt" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "xml" => "application/xml",
+        _ => return None,
+    })
+}
+
+/// Whether `ext` claims one of the sniffable image/video types.
+fn sniffable_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "mp4" | "webm" | "mov"
+    )
+}
+
+/// Stamp the stored media type — the single authority:
+/// 1. A sniff hit always wins.
+/// 2. A sniff miss with an extension that claims a sniffable type is
+///    `application/octet-stream` — a declared extension can never
+///    impersonate a type the sniffer knows.
+/// 3. Otherwise the declared-extension table fills in (markdown, HTML,
+///    … have no magic bytes).
+/// 4. Everything else is `application/octet-stream`.
+fn resolve_media_type(sniffed: Option<&'static str>, ext: &str) -> String {
+    if let Some(mt) = sniffed {
+        return mt.to_string();
+    }
+    if sniffable_ext(ext) {
+        return "application/octet-stream".to_string();
+    }
+    declared_media_type(ext)
+        .unwrap_or("application/octet-stream")
+        .to_string()
 }
 
 /// Strip control characters (incl. newlines, so a caption can't corrupt
@@ -139,10 +175,29 @@ fn sanitize_caption(caption: Option<String>) -> Option<String> {
     }
 }
 
-/// The shared core. `src` is the raw file body; `ext` is informational
-/// only (the persisted media type comes from sniffing). Streams into
-/// blob storage with a hard size cap + per-session byte budget, records
-/// the row, and emits the event. Auth is the caller's responsibility.
+/// Untrusted file names: keep only the final path component, strip
+/// control characters and path separators, cap the length. `None` /
+/// empty / dot-only → `None` (serving falls back to `<id>.<ext>`).
+fn sanitize_file_name(name: Option<String>) -> Option<String> {
+    let raw = name?;
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let s: String = base
+        .chars()
+        .filter(|ch| !ch.is_control() && *ch != '/' && *ch != '\\')
+        .take(MAX_FILE_NAME_CHARS)
+        .collect();
+    if s.is_empty() || s.chars().all(|c| c == '.') {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// The shared core. `src` is the raw file body; `ext` is the declared
+/// extension ([`resolve_media_type`] uses it only when sniffing finds
+/// nothing). Streams into blob storage with a hard size cap +
+/// per-session byte budget, records the row, and emits the event. Auth
+/// is the caller's responsibility.
 /// Sentinel embedded in the mid-stream cap-exceeded `BlobError` so the
 /// caller can map it back to a 413 (vs a generic 500 storage failure).
 const SIZE_CAP_SENTINEL: &str = "artifact exceeds size limit";
@@ -151,9 +206,10 @@ pub async fn process_upload(
     state: &SharedState,
     session: SessionId,
     mut src: ByteStream,
-    _ext: &str,
+    ext: &str,
     caption: Option<String>,
-    trust: Trust,
+    file_name: Option<String>,
+    emit_event: bool,
 ) -> Result<SharedArtifact, UploadError> {
     // Pre-write quota check against existing usage.
     let (count, total) = state
@@ -190,18 +246,7 @@ pub async fn process_upload(
     if prefix.is_empty() {
         return Err(UploadError::BadMedia("empty artifact body".into()));
     }
-    let media_type = match (trust, detect_media_type(&prefix)) {
-        (Trust::Untrusted, Some(mt)) if is_media(mt) => mt.to_string(),
-        (Trust::Untrusted, _) => {
-            return Err(UploadError::BadMedia(
-                "unsupported media type: only image (png/jpeg/gif/webp) and video \
-                 (mp4/webm) may be shared from the sandbox"
-                    .into(),
-            ))
-        }
-        (Trust::Trusted, Some(mt)) => mt.to_string(),
-        (Trust::Trusted, None) => "application/octet-stream".to_string(),
-    };
+    let media_type = resolve_media_type(detect_media_type(&prefix), ext);
 
     // Server-generated key — the guest never influences the storage path.
     let artifact_id = state.services.entropy.uuid();
@@ -275,6 +320,7 @@ pub async fn process_upload(
             &media_type,
             size as i64,
             caption.as_deref(),
+            file_name.as_deref(),
         )
         .await
     {
@@ -283,20 +329,23 @@ pub async fn process_upload(
     }
 
     let id_str = artifact_id.simple().to_string();
-    if let Err(e) = state
-        .emit(
-            session,
-            SessionEvent::FileShared {
-                artifact_id: id_str.clone(),
-                media_type: media_type.clone(),
-                size_bytes: size,
-                caption,
-                at: state.services.clock.now_utc(),
-            },
-        )
-        .await
-    {
-        tracing::warn!(session = %session, error = %e, "emit FileShared failed (artifact stored)");
+    if emit_event {
+        if let Err(e) = state
+            .emit(
+                session,
+                SessionEvent::FileShared {
+                    artifact_id: id_str.clone(),
+                    media_type: media_type.clone(),
+                    size_bytes: size,
+                    caption,
+                    file_name,
+                    at: state.services.clock.now_utc(),
+                },
+            )
+            .await
+        {
+            tracing::warn!(session = %session, error = %e, "emit FileShared failed (artifact stored)");
+        }
     }
 
     Ok(SharedArtifact {
@@ -325,14 +374,23 @@ async fn authorized_untrusted_upload(
             message: "invalid or missing upload token".into(),
         };
     }
-    let UploadOp::ShareFile { ext, caption, .. } = header.op;
+    let (ext, caption, file_name) = match header.op {
+        UploadOp::ShareFile { ext, caption, .. } => (ext, caption, None),
+        UploadOp::ShareFileNamed {
+            ext,
+            file_name,
+            caption,
+            ..
+        } => (ext, caption, Some(file_name)),
+    };
     match process_upload(
         state,
         header.session_id,
         body,
-        &ext,
+        &ext.to_ascii_lowercase(),
         sanitize_caption(caption),
-        Trust::Untrusted,
+        sanitize_file_name(file_name),
+        true,
     )
     .await
     {
@@ -390,8 +448,7 @@ pub async fn handle_vsock_connection(state: SharedState, stream: HarnessByteStre
             return;
         }
     };
-    let UploadOp::ShareFile { size_bytes, .. } = &header.op;
-    let body = reader_to_bytestream(read_half, *size_bytes);
+    let body = reader_to_bytestream(read_half, header.op.size_bytes());
     let resp = authorized_untrusted_upload(&state, header, body).await;
     if let Err(e) = write_msg(&mut write_half, &resp).await {
         tracing::debug!(error = %e, "upload vsock: response write failed");
@@ -502,9 +559,9 @@ pub struct ArtifactMeta {
 }
 
 /// gRPC `GetArtifact` core: resolve the (session-scoped) artifact row and
-/// open its blob stream. Mirrors `serve_artifact`'s lookup + the detected
-/// `Content-Type` / filename, minus the HTTP response framing (the gRPC
-/// handler re-chunks the `ByteStream` into proto frames).
+/// open its blob stream. The gRPC handler re-chunks the `ByteStream` into
+/// proto frames; the orchestrator byte route applies the HTTP framing +
+/// hardening headers.
 pub(crate) async fn get_artifact_core(
     state: &SharedState,
     session: SessionId,
@@ -528,7 +585,11 @@ pub(crate) async fn get_artifact_core(
             BlobError::NotFound => ApiError::NotFound("artifact blob missing".into()),
             other => ApiError::Internal(format!("read artifact blob: {other}")),
         })?;
-    let file_name = format!("{}.{}", aid.simple(), ext_for_media(&row.media_type));
+    // Prefer the stored (sanitized) basename; artifacts from before
+    // migration 0110 fall back to `<id>.<ext>`.
+    let file_name = row
+        .file_name
+        .unwrap_or_else(|| format!("{}.{}", aid.simple(), ext_for_media(&row.media_type)));
     Ok((
         ArtifactMeta {
             media_type: row.media_type,
@@ -539,14 +600,15 @@ pub(crate) async fn get_artifact_core(
     ))
 }
 
-/// gRPC `CreateArtifactFromPath` core: the trusted operator file pull.
-/// Extracted from `create_from_path` — auto-resume, stream `cat` of the
-/// guest path through the shared `process_upload` core (any media type).
+/// gRPC `CreateArtifactFromPath` core: the operator file pull —
+/// auto-resume, stream `cat` of the guest path through the shared
+/// `process_upload` core.
 pub(crate) async fn create_artifact_from_path_core(
     state: &SharedState,
     session: SessionId,
     path: &str,
     caption: Option<String>,
+    suppress_event: bool,
 ) -> Result<SharedArtifact, ApiError> {
     crate::api::snapshot::ensure_active(state, session).await?;
     let sandbox_id = state.resolve_sandbox(session).await.ok_or_else(|| {
@@ -572,19 +634,22 @@ pub(crate) async fn create_artifact_from_path_core(
         .await?;
     let body = exec_stdout_bytestream(stream.events);
     let ext = ext_from_path(path);
+    let file_name = sanitize_file_name(Some(path.to_string()));
     Ok(process_upload(
         state,
         session,
         body,
         &ext,
         sanitize_caption(caption),
-        Trust::Trusted,
+        file_name,
+        !suppress_event,
     )
     .await?)
 }
 
 /// File extension for a stored media type — used only for the
-/// `Content-Disposition` filename (not for sniffing). Unknown → `bin`.
+/// `Content-Disposition` filename (not for stamping; the inverse of
+/// [`detect_media_type`] + [`declared_media_type`]). Unknown → `bin`.
 fn ext_for_media(media_type: &str) -> &'static str {
     match media_type {
         "image/png" => "png",
@@ -593,6 +658,14 @@ fn ext_for_media(media_type: &str) -> &'static str {
         "image/webp" => "webp",
         "video/mp4" => "mp4",
         "video/webm" => "webm",
+        "text/html" => "html",
+        "text/markdown" => "md",
+        "text/plain" => "txt",
+        "text/csv" => "csv",
+        "application/json" => "json",
+        "image/svg+xml" => "svg",
+        "application/pdf" => "pdf",
+        "application/xml" => "xml",
         _ => "bin",
     }
 }
@@ -697,11 +770,86 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_media_signatures() {
-        // SVG / HTML / arbitrary text are not media.
+    fn sniffer_ignores_text_formats() {
+        // Text formats have no magic bytes; the declared-extension arm
+        // of resolve_media_type stamps them.
         assert_eq!(detect_media_type(b"<svg xmlns=\"http"), None);
         assert_eq!(detect_media_type(b"<!DOCTYPE html>."), None);
         assert_eq!(detect_media_type(b"#!/bin/sh\necho ."), None);
+    }
+
+    #[test]
+    fn resolve_sniff_hit_wins_over_extension() {
+        let png = detect_media_type(b"\x89PNG\r\n\x1a\n.....");
+        assert_eq!(resolve_media_type(png, "html"), "image/png");
+    }
+
+    #[test]
+    fn resolve_declared_extension_fills_in_for_text_formats() {
+        assert_eq!(resolve_media_type(None, "html"), "text/html");
+        assert_eq!(resolve_media_type(None, "htm"), "text/html");
+        assert_eq!(resolve_media_type(None, "md"), "text/markdown");
+        assert_eq!(resolve_media_type(None, "markdown"), "text/markdown");
+        assert_eq!(resolve_media_type(None, "txt"), "text/plain");
+        assert_eq!(resolve_media_type(None, "csv"), "text/csv");
+        assert_eq!(resolve_media_type(None, "json"), "application/json");
+        assert_eq!(resolve_media_type(None, "svg"), "image/svg+xml");
+        assert_eq!(resolve_media_type(None, "pdf"), "application/pdf");
+        assert_eq!(resolve_media_type(None, "xml"), "application/xml");
+    }
+
+    #[test]
+    fn resolve_extension_cannot_impersonate_a_sniffable_type() {
+        // A .png that is not a PNG must not be stamped image/png.
+        for ext in ["png", "jpg", "jpeg", "gif", "webp", "mp4", "webm", "mov"] {
+            assert_eq!(
+                resolve_media_type(None, ext),
+                "application/octet-stream",
+                "ext {ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_unknown_extension_is_octet_stream() {
+        assert_eq!(resolve_media_type(None, "exe"), "application/octet-stream");
+        assert_eq!(resolve_media_type(None, ""), "application/octet-stream");
+    }
+
+    #[test]
+    fn ext_for_media_inverts_the_stamp_table() {
+        for ext in ["html", "md", "txt", "csv", "json", "svg", "pdf", "xml"] {
+            let mt = declared_media_type(ext).unwrap();
+            // Canonical extension maps back to a declared extension of
+            // the same type (html/htm, md/markdown collapse).
+            assert_eq!(declared_media_type(ext_for_media(mt)), Some(mt));
+        }
+        assert_eq!(ext_for_media("application/octet-stream"), "bin");
+    }
+
+    #[test]
+    fn sanitize_file_name_keeps_basename_and_strips_control() {
+        assert_eq!(
+            sanitize_file_name(Some("/work/out/report.html".into())).as_deref(),
+            Some("report.html")
+        );
+        assert_eq!(
+            sanitize_file_name(Some("..\\..\\evil\\shot.png".into())).as_deref(),
+            Some("shot.png")
+        );
+        assert_eq!(
+            sanitize_file_name(Some("a\nb.txt".into())).as_deref(),
+            Some("ab.txt")
+        );
+        assert_eq!(sanitize_file_name(Some("..".into())), None);
+        assert_eq!(sanitize_file_name(Some("trailing/".into())), None);
+        assert_eq!(sanitize_file_name(Some(String::new())), None);
+        assert_eq!(sanitize_file_name(None), None);
+        let long = format!("{}.html", "x".repeat(400));
+        assert_eq!(
+            sanitize_file_name(Some(long)).unwrap().chars().count(),
+            MAX_FILE_NAME_CHARS
+        );
     }
 
     #[test]
