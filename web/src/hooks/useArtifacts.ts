@@ -10,10 +10,11 @@ import {
 
 export type ArtifactScope = "" | "mine" | "shared" | "all";
 
-/** The registry list for one scope. Unpaginated (the server clamps a
- * page to 200; registries are document libraries, not event streams). */
+/** The registry list for one scope — the newest full page (the server
+ * defaults an omitted page_size to its 200 cap; deeper history stays a
+ * follow-up if a registry ever outgrows it). */
 export function useArtifacts(scope: ArtifactScope = "") {
-  return useQuery(listArtifacts, { scope, page: 0, pageSize: 0 }, { staleTime: 15_000 });
+  return useQuery(listArtifacts, { scope, page: 1, pageSize: 0 }, { staleTime: 15_000 });
 }
 
 /** One artifact + its version history (and a fresh raw_url token). The

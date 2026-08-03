@@ -1,6 +1,7 @@
 import {
   Box,
   Database,
+  FileBox,
   Gauge,
   KeyRound,
   KeySquare,
@@ -49,6 +50,7 @@ interface Dest {
 // so "go to fleet" / "hosts" style typing still lands.
 const DESTS: Dest[] = [
   { to: "/sessions", label: "Tasks", icon: Layers, leader: "s" },
+  { to: "/artifacts", label: "Artifacts", icon: FileBox, leader: "a" },
   { to: "/operator", label: "Operator", icon: Gauge, admin: true, leader: "o" },
   { to: "/operator/fleet", label: "Fleet", icon: Server, admin: true, leader: "f" },
   { to: "/operator/storage", label: "Storage", icon: Database, admin: true },

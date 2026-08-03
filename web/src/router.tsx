@@ -35,6 +35,9 @@ import { ReviewsLayout } from "./pages/reviews/ReviewsLayout";
 import { ReviewDossier } from "./pages/reviews/ReviewDossier";
 import { OperatorLayout } from "./pages/operator/OperatorLayout";
 import { Overview } from "./pages/operator/Overview";
+import { ArtifactsLayout } from "./pages/artifacts/ArtifactsLayout";
+import { ArtifactsLibrary } from "./pages/artifacts/ArtifactsLibrary";
+import { ArtifactDetail } from "./pages/artifacts/ArtifactDetail";
 import { KaizenLayout } from "./pages/kaizen/KaizenLayout";
 import { Papercuts } from "./pages/kaizen/Papercuts";
 import { Fleet } from "./pages/Fleet";
@@ -227,6 +230,43 @@ const operatorRegistriesRoute = createRoute({
   component: RegistriesPanel,
 });
 
+// /artifacts — the cross-session document library, with a persistent rail
+// (the Reviews/Sessions content-rail shape). The detail page is a CHILD of
+// this layout at /artifacts/$artifactId, so the rail wraps it too. A
+// GitHub-style pretty suffix (/artifacts/<id>/<slug>) resolves to the same
+// page; the slug is ignored. `?v=N` selects an older version, `?scope=`
+// makes a filtered library view linkable.
+const artifactsLayoutRoute = createRoute({
+  getParentRoute: () => appLayoutRoute,
+  path: "/artifacts",
+  component: ArtifactsLayout,
+});
+const artifactsIndexRoute = createRoute({
+  getParentRoute: () => artifactsLayoutRoute,
+  path: "/",
+  validateSearch: (search: Record<string, unknown>): { scope?: "shared" | "all" } => {
+    const scope = search["scope"];
+    return scope === "shared" || scope === "all" ? { scope } : {};
+  },
+  component: ArtifactsLibrary,
+});
+const artifactVersionSearch = (search: Record<string, unknown>): { v?: number } => {
+  const v = Number(search["v"]);
+  return Number.isInteger(v) && v > 0 ? { v } : {};
+};
+const artifactDetailRoute = createRoute({
+  getParentRoute: () => artifactsLayoutRoute,
+  path: "$artifactId",
+  validateSearch: artifactVersionSearch,
+  component: ArtifactDetail,
+});
+const artifactDetailPrettyRoute = createRoute({
+  getParentRoute: () => artifactsLayoutRoute,
+  path: "$artifactId/$slug",
+  validateSearch: artifactVersionSearch,
+  component: ArtifactDetail,
+});
+
 // /kaizen layout route (second sidebar) ----------------------------------
 const kaizenLayoutRoute = createRoute({
   getParentRoute: () => appLayoutRoute,
@@ -379,6 +419,11 @@ export const routeTree = rootRoute.addChildren([
       sessionDetailRoute,
     ]),
     reviewsLayoutRoute.addChildren([reviewsIndexRoute, reviewDossierRoute]),
+    artifactsLayoutRoute.addChildren([
+      artifactsIndexRoute,
+      artifactDetailRoute,
+      artifactDetailPrettyRoute,
+    ]),
     operatorLayoutRoute.addChildren([
       operatorIndexRoute,
       operatorFleetRoute,
