@@ -632,20 +632,47 @@ pub struct UploadRequest {
 }
 
 /// The artifact operation requested. An enum for symmetry with
-/// [`ForgeOp`] and room for future ops (e.g. delete); v1 has one.
+/// [`ForgeOp`] and room for future ops (e.g. delete).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum UploadOp {
     /// Share a file that will surface in the session's conversation
     /// history. `ext` is the raw filename extension (no leading dot)
-    /// the guest derived — used only to pick a stored object suffix;
-    /// the coord re-derives the persisted media type by sniffing the
-    /// body's magic bytes and never trusts a guest-supplied MIME.
+    /// the guest derived. The coord stamps the persisted media type
+    /// (magic-byte sniff first, declared extension for types with no
+    /// magic bytes) and never trusts a guest-supplied MIME.
     /// `size_bytes` is the exact length of the raw body that follows.
+    ///
+    /// Legacy frame from agentd builds that predate file names on the
+    /// wire; new builds send [`UploadOp::ShareFileNamed`]. Kept
+    /// decodable forever (bincode variant index 0 — baked images roll
+    /// slowly).
     ShareFile {
         ext: String,
         caption: Option<String>,
         size_bytes: u64,
     },
+    /// [`UploadOp::ShareFile`] plus the file's basename (e.g.
+    /// `report.html`), so the artifact serves and displays under its
+    /// real name. Appended as bincode variant index 1 — old coords
+    /// reject it cleanly at decode; old guests keep sending variant 0.
+    ShareFileNamed {
+        ext: String,
+        file_name: String,
+        caption: Option<String>,
+        size_bytes: u64,
+    },
+}
+
+impl UploadOp {
+    /// Exact length of the raw body that follows the header frame —
+    /// the transports cap their body reads at this.
+    pub fn size_bytes(&self) -> u64 {
+        match self {
+            Self::ShareFile { size_bytes, .. } | Self::ShareFileNamed { size_bytes, .. } => {
+                *size_bytes
+            }
+        }
+    }
 }
 
 /// The host's reply to an [`UploadRequest`] (after the body stream).
@@ -907,6 +934,20 @@ mod tests {
         });
         round_trip(ForgeResponse::Error {
             message: "nope".into(),
+        });
+    }
+
+    #[test]
+    fn upload_named_round_trip() {
+        round_trip(UploadRequest {
+            session_id: SessionId::new(),
+            broker_token: "tok".into(),
+            op: UploadOp::ShareFileNamed {
+                ext: "html".into(),
+                file_name: "report.html".into(),
+                caption: None,
+                size_bytes: 2048,
+            },
         });
     }
 

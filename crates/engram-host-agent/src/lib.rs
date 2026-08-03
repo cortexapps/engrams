@@ -777,11 +777,10 @@ impl HostAgent {
                                 return;
                             }
                         };
-                    let engram_harness_proto::UploadOp::ShareFile { size_bytes, .. } = &header.op;
                     // Cap the body read at the declared size so the
                     // guest can't over-feed the relay; the coord also
                     // enforces MAX_ARTIFACT_BYTES while draining.
-                    let body = tokio::io::AsyncReadExt::take(read_half, *size_bytes);
+                    let body = tokio::io::AsyncReadExt::take(read_half, header.op.size_bytes());
                     let resp = match cc.upload_artifact(&header, body).await {
                         Ok(r) => r,
                         Err(e) => {

@@ -311,6 +311,9 @@ pub enum SessionEvent {
         media_type: String,
         size_bytes: u64,
         caption: Option<String>,
+        /// Sanitized guest-declared basename; `None` from legacy agentd
+        /// builds (serde-additive — old persisted events deserialize).
+        file_name: Option<String>,
         at: DateTime<Utc>,
     },
     /// ADR 0028 A.log: a rung-1 recovery rewound the live transcript

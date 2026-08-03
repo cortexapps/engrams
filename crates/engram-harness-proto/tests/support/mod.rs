@@ -262,18 +262,32 @@ pub fn forge_response() -> impl Strategy<Value = ForgeResponse> {
     ]
 }
 
-pub fn upload_request() -> impl Strategy<Value = UploadRequest> {
-    (session_id(), s(), s(), opt_s(), any::<u64>()).prop_map(
-        |(session_id, broker_token, ext, caption, size_bytes)| UploadRequest {
-            session_id,
-            broker_token,
-            op: UploadOp::ShareFile {
+pub fn upload_op() -> impl Strategy<Value = UploadOp> {
+    prop_oneof![
+        (s(), opt_s(), any::<u64>()).prop_map(|(ext, caption, size_bytes)| {
+            UploadOp::ShareFile {
                 ext,
                 caption,
                 size_bytes,
-            },
-        },
-    )
+            }
+        }),
+        (s(), s(), opt_s(), any::<u64>()).prop_map(|(ext, file_name, caption, size_bytes)| {
+            UploadOp::ShareFileNamed {
+                ext,
+                file_name,
+                caption,
+                size_bytes,
+            }
+        }),
+    ]
+}
+
+pub fn upload_request() -> impl Strategy<Value = UploadRequest> {
+    (session_id(), s(), upload_op()).prop_map(|(session_id, broker_token, op)| UploadRequest {
+        session_id,
+        broker_token,
+        op,
+    })
 }
 
 pub fn upload_response() -> impl Strategy<Value = UploadResponse> {
@@ -396,6 +410,7 @@ fn _exhaustiveness_forge_response(r: &ForgeResponse) {
 fn _exhaustiveness_upload_op(o: &UploadOp) {
     match o {
         UploadOp::ShareFile { .. } => {}
+        UploadOp::ShareFileNamed { .. } => {}
     }
 }
 

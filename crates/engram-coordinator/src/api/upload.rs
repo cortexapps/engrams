@@ -46,6 +46,9 @@ const MAX_ARTIFACTS_PER_SESSION: i64 = 200;
 const MAX_ARTIFACT_TOTAL_BYTES_PER_SESSION: i64 = 2 * 1024 * 1024 * 1024;
 /// Captions are untrusted text; cap length and strip control chars.
 const MAX_CAPTION_CHARS: usize = 280;
+/// File names are untrusted text; cap length (a generous filesystem
+/// basename bound) and strip control chars + path separators.
+const MAX_FILE_NAME_CHARS: usize = 255;
 
 /// A stored artifact (the success of [`process_upload`]).
 pub struct SharedArtifact {
@@ -172,6 +175,24 @@ fn sanitize_caption(caption: Option<String>) -> Option<String> {
     }
 }
 
+/// Untrusted file names: keep only the final path component, strip
+/// control characters and path separators, cap the length. `None` /
+/// empty / dot-only → `None` (serving falls back to `<id>.<ext>`).
+fn sanitize_file_name(name: Option<String>) -> Option<String> {
+    let raw = name?;
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let s: String = base
+        .chars()
+        .filter(|ch| !ch.is_control() && *ch != '/' && *ch != '\\')
+        .take(MAX_FILE_NAME_CHARS)
+        .collect();
+    if s.is_empty() || s.chars().all(|c| c == '.') {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// The shared core. `src` is the raw file body; `ext` is the declared
 /// extension ([`resolve_media_type`] uses it only when sniffing finds
 /// nothing). Streams into blob storage with a hard size cap +
@@ -187,6 +208,7 @@ pub async fn process_upload(
     mut src: ByteStream,
     ext: &str,
     caption: Option<String>,
+    file_name: Option<String>,
 ) -> Result<SharedArtifact, UploadError> {
     // Pre-write quota check against existing usage.
     let (count, total) = state
@@ -297,7 +319,7 @@ pub async fn process_upload(
             &media_type,
             size as i64,
             caption.as_deref(),
-            None,
+            file_name.as_deref(),
         )
         .await
     {
@@ -314,6 +336,7 @@ pub async fn process_upload(
                 media_type: media_type.clone(),
                 size_bytes: size,
                 caption,
+                file_name,
                 at: state.services.clock.now_utc(),
             },
         )
@@ -348,13 +371,22 @@ async fn authorized_untrusted_upload(
             message: "invalid or missing upload token".into(),
         };
     }
-    let UploadOp::ShareFile { ext, caption, .. } = header.op;
+    let (ext, caption, file_name) = match header.op {
+        UploadOp::ShareFile { ext, caption, .. } => (ext, caption, None),
+        UploadOp::ShareFileNamed {
+            ext,
+            file_name,
+            caption,
+            ..
+        } => (ext, caption, Some(file_name)),
+    };
     match process_upload(
         state,
         header.session_id,
         body,
         &ext.to_ascii_lowercase(),
         sanitize_caption(caption),
+        sanitize_file_name(file_name),
     )
     .await
     {
@@ -412,8 +444,7 @@ pub async fn handle_vsock_connection(state: SharedState, stream: HarnessByteStre
             return;
         }
     };
-    let UploadOp::ShareFile { size_bytes, .. } = &header.op;
-    let body = reader_to_bytestream(read_half, *size_bytes);
+    let body = reader_to_bytestream(read_half, header.op.size_bytes());
     let resp = authorized_untrusted_upload(&state, header, body).await;
     if let Err(e) = write_msg(&mut write_half, &resp).await {
         tracing::debug!(error = %e, "upload vsock: response write failed");
@@ -550,7 +581,11 @@ pub(crate) async fn get_artifact_core(
             BlobError::NotFound => ApiError::NotFound("artifact blob missing".into()),
             other => ApiError::Internal(format!("read artifact blob: {other}")),
         })?;
-    let file_name = format!("{}.{}", aid.simple(), ext_for_media(&row.media_type));
+    // Prefer the stored (sanitized) basename; artifacts from before
+    // migration 0110 fall back to `<id>.<ext>`.
+    let file_name = row
+        .file_name
+        .unwrap_or_else(|| format!("{}.{}", aid.simple(), ext_for_media(&row.media_type)));
     Ok((
         ArtifactMeta {
             media_type: row.media_type,
@@ -594,7 +629,16 @@ pub(crate) async fn create_artifact_from_path_core(
         .await?;
     let body = exec_stdout_bytestream(stream.events);
     let ext = ext_from_path(path);
-    Ok(process_upload(state, session, body, &ext, sanitize_caption(caption)).await?)
+    let file_name = sanitize_file_name(Some(path.to_string()));
+    Ok(process_upload(
+        state,
+        session,
+        body,
+        &ext,
+        sanitize_caption(caption),
+        file_name,
+    )
+    .await?)
 }
 
 /// File extension for a stored media type — used only for the
@@ -775,6 +819,31 @@ mod tests {
             assert_eq!(declared_media_type(ext_for_media(mt)), Some(mt));
         }
         assert_eq!(ext_for_media("application/octet-stream"), "bin");
+    }
+
+    #[test]
+    fn sanitize_file_name_keeps_basename_and_strips_control() {
+        assert_eq!(
+            sanitize_file_name(Some("/work/out/report.html".into())).as_deref(),
+            Some("report.html")
+        );
+        assert_eq!(
+            sanitize_file_name(Some("..\\..\\evil\\shot.png".into())).as_deref(),
+            Some("shot.png")
+        );
+        assert_eq!(
+            sanitize_file_name(Some("a\nb.txt".into())).as_deref(),
+            Some("ab.txt")
+        );
+        assert_eq!(sanitize_file_name(Some("..".into())), None);
+        assert_eq!(sanitize_file_name(Some("trailing/".into())), None);
+        assert_eq!(sanitize_file_name(Some(String::new())), None);
+        assert_eq!(sanitize_file_name(None), None);
+        let long = format!("{}.html", "x".repeat(400));
+        assert_eq!(
+            sanitize_file_name(Some(long)).unwrap().chars().count(),
+            MAX_FILE_NAME_CHARS
+        );
     }
 
     #[test]
