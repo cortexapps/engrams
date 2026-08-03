@@ -142,6 +142,7 @@ jobs:
       # now nothing on a PR consumed them, so a Dockerfile-only change ran no
       # lane at all and the gate passed on an unbuilt image.
       images: ${{ steps.lanes.outputs.images }}
+      dockerfiles: ${{ steps.lanes.outputs.dockerfiles }}
       images_matrix: ${{ steps.lanes.outputs.images_matrix }}
     steps:
       - uses: actions/checkout@v6
@@ -178,8 +179,13 @@ jobs:
           env GITHUB_OUTPUT=/tmp/lanes.env python3 \
             .github/scripts/detect-rebake-lanes.py --stdin \
             <<< 'docker/web.Dockerfile'
-          grep -qx 'images=true' /tmp/lanes.env
-          grep -qx 'images_matrix=\["web"\]' /tmp/lanes.env
+          grep -qxF 'images=true' /tmp/lanes.env
+          grep -qxF 'dockerfiles=true' /tmp/lanes.env
+          grep -qxF 'images_matrix=["web"]' /tmp/lanes.env
+          # ...and a NON-Dockerfile change must not trigger the image build.
+          env GITHUB_OUTPUT=/tmp/lanes-rs.env python3 \
+            .github/scripts/detect-rebake-lanes.py --stdin <<< 'Cargo.lock'
+          grep -qxF 'dockerfiles=false' /tmp/lanes-rs.env
 
   integrations-cli:
     name: integrations CLI bundle
@@ -2190,7 +2196,11 @@ jobs:
   build-images:
     name: build ${{ matrix.image }} image (no push)
     needs: detect
-    if: needs.detect.outputs.images == 'true' && needs.detect.outputs.images_matrix != '[]'
+    # Gated on `dockerfiles`, NOT the whole `images` lane. The lane also fires
+    # for any web/orchestrator/Cargo change, which would put three release
+    # image builds on every Rust PR for no signal `tests (linux)` does not
+    # already give. Only a build-instruction change needs this.
+    if: needs.detect.outputs.dockerfiles == 'true' && needs.detect.outputs.images_matrix != '[]'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     permissions:
