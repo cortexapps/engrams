@@ -41,9 +41,14 @@ export function GuardedDownload({
 }) {
   const [open, setOpen] = useState(false);
 
+  // A missing fileName must still FORCE a download: the empty string is
+  // the bare `download` attribute (browser derives a name), while an
+  // omitted attribute turns the anchor into plain navigation — and the
+  // server serves renderable types inline, so the click would replace
+  // the SPA with the raw bytes.
   if (mediaKind(mediaType) !== "binary") {
     return (
-      <a href={url} download={fileName} className={className} aria-label={ariaLabel}>
+      <a href={url} download={fileName ?? ""} className={className} aria-label={ariaLabel}>
         {children}
       </a>
     );
@@ -54,7 +59,7 @@ export function GuardedDownload({
     // dialog owned the click, so trigger it programmatically.
     const a = document.createElement("a");
     a.href = url;
-    if (fileName) a.download = fileName;
+    a.download = fileName ?? "";
     document.body.appendChild(a);
     a.click();
     a.remove();

@@ -18,6 +18,18 @@ test("renderable types pass straight through as a download anchor", () => {
   expect(anchor.getAttribute("download")).toBe("notes.md");
 });
 
+test("a missing fileName still forces a download, never inline navigation", () => {
+  // Renderable types serve Content-Disposition: inline — without the
+  // bare `download` attribute the click would replace the SPA with the
+  // raw bytes (review finding on the fileName-less share-card path).
+  render(
+    <GuardedDownload url="/api/v1/artifacts/a1" mediaType="image/png">
+      Download
+    </GuardedDownload>,
+  );
+  expect(screen.getByRole("link", { name: "Download" }).getAttribute("download")).toBe("");
+});
+
 test("binary downloads open the trust dialog instead of downloading", async () => {
   const user = userEvent.setup();
   render(
