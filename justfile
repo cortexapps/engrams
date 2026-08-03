@@ -77,6 +77,9 @@ test-pkg pkg *ARGS:
 # cargo tooling; `jq` is installed on demand — the fake-codex test scripts
 # shell out to it, and `rust:bookworm` doesn't ship it. `rust:bookworm`
 # tracks the latest stable, matching our pinned `channel = "stable"`.
+# `protoc` is installed too — every crate in the `engram-protocol`
+# dependency closure (engram-host-agent among them, which owns the
+# Linux-gated dirty-file recovery tests) fails its build script without it.
 # Example: `just test-linux engram-harness-claude`.
 test-linux pkg='engram-harness-claude' *ARGS:
     #!/usr/bin/env bash
@@ -101,7 +104,7 @@ test-linux pkg='engram-harness-claude' *ARGS:
                 -w /work \
                 -e CARGO_TARGET_DIR=/lxtarget \
                 rust:bookworm \
-                bash -c "command -v jq >/dev/null || (apt-get update -qq && apt-get install -y -qq jq); cargo test -p {{pkg}} {{ARGS}}" ;;
+                bash -c "command -v jq >/dev/null && command -v protoc >/dev/null || (apt-get update -qq && apt-get install -y -qq jq protobuf-compiler); cargo test -p {{pkg}} {{ARGS}}" ;;
         *)
             echo "unsupported host: $(uname -s)" >&2; exit 1 ;;
     esac
