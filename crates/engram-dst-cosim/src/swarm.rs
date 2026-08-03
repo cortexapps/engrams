@@ -409,11 +409,10 @@ impl CosimSwarm {
     /// convergence — every session terminal-or-stable, every device classified,
     /// within bounded rounds — and re-check the standing oracles.
     async fn quiesce(&mut self) -> Result<(), String> {
-        // Wave 7b (#784): heal the record-loss fault globally (the operator/runbook
-        // reconcile the `rehydrate-unknown-device` alert drives, applied to every
-        // survivor at quiescence like every other healed fault) so the rehydrate
-        // below re-serves every survivor. A quarantined slot MUST reach a terminal
-        // disposition (served or reaped) within bounded rounds, never wedge.
+        // Wave 7b (#784): heal the modeled record-loss fault globally, as with
+        // every other healed fault at quiescence. The rehydrate pass below then
+        // re-serves every survivor. A quarantined slot must reach a terminal
+        // disposition (served or reaped) within bounded rounds and must not wedge.
         self.sim.heal_all_records().await;
         // A fresh host generation with a clean rehydrate re-serves every
         // survivor whose session still reserves host memory.

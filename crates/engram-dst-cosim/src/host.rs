@@ -838,12 +838,6 @@ impl CosimHost {
         self.device.lose_record(id);
     }
 
-    /// The operator/runbook reconcile: restore `id`'s record so the next register
-    /// re-serves the reconnectable device with zero loss.
-    pub fn regain_record(&mut self, id: SandboxId) {
-        self.device.regain_record(id);
-    }
-
     /// Quiescence heal (Wave 7b): restore EVERY device's record — the record-loss
     /// fault is healed globally at quiescence exactly like every other fault
     /// (re-served survivors, drained finalizes), so the drain's rehydrate can
@@ -916,11 +910,6 @@ impl CosimHost {
     /// `QuarantinedUnknown` — a record-invisible live survivor (#769 gap A).
     pub fn quarantined_unknown(&self) -> Vec<SandboxId> {
         self.quarantined_unknown.iter().copied().collect()
-    }
-    /// The session a sandbox is bound to, as the HOST knows it — what the
-    /// real host-agent stamps into a `QuarantinedSurvivor` advertise.
-    pub fn session_of(&self, id: SandboxId) -> Option<SessionId> {
-        self.sandboxes.get(&id).and_then(|s| s.session_id)
     }
     /// Oracle read (Wave 7b): is `id` a record-invisible resident survivor —
     /// live, unserved, dead-owner, no record — the gap-A precondition the barrier

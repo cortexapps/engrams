@@ -4885,13 +4885,11 @@ impl MetadataStore for PostgresStore {
         // sibling exclusion lists compose into one `AND kind NOT IN (...)`
         // predicate rather than stacking separate `AND kind <>` clauses.
         //
-        // ADR 0090 (2026-07-20 durability-rollback incident): `durability_rollback`
-        // joins the exclusion set. It is the coordinator's own record that a
-        // quarantined-survivor destroy already rewound this session's disk to
-        // the last published manifest — a fact that stays true across the very
-        // rewind it warns about (the destroy happened; the writes are gone). It
-        // lands after the checkpoint cursor by construction, so tombstoning it
-        // would grey out the one durable, user-visible marker of the loss.
+        // `durability_rollback` records a disk rollback after true node loss.
+        // The host died with unpublished writes, and the session resumed from
+        // its durable floor. The fact stays true across that rewind. It lands
+        // after the checkpoint cursor, so tombstoning it would hide the durable,
+        // user-visible marker of the loss.
         let tombstoned = sqlx::query(
             r#"
             UPDATE session_events

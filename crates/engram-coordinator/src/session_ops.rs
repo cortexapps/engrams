@@ -788,9 +788,9 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     // + disk-drain requeue on the SHARED sandbox — which would then run
     // concurrently with the successor op (a retry's fresh capture, or a
     // Deliver/Resume against the same guest), corrupting snapshot
-    // quiescence. So `op_deadline` returns `None` for those verbs (they keep
-    // their own bounds — the ADR-0090 quarantine capture timeout, and the
-    // 180s reclaim on genuine executor death); Resume/CreateBoot leave only
+    // quiescence. So `op_deadline` returns `None` for those verbs. They keep
+    // their per-RPC bounds and the 180s reclaim on genuine executor death.
+    // Resume/CreateBoot leave only
     // an orphan-reaped half-restore or a reattach-idempotent half-spawn, and
     // Deliver/Destroy have no shared-sandbox cleanup, so those are bounded.
     // Stamp the attempt start on the injected clock: the requeue arms
@@ -953,8 +953,7 @@ fn backoff(attempts: i32) -> Duration {
 /// (Teleport), where dropping the host RPC spawns unfenced CaptureUnwind /
 /// abort cleanup on the shared sandbox that would race a successor op (see
 /// the cancellation-safety note in [`drive_one`]). Those verbs keep their
-/// existing bounds: the ADR-0090 quarantine capture timeout and the 180s
-/// reclaim on genuine executor death.
+/// per-RPC bounds and the 180s reclaim on genuine executor death.
 fn op_deadline(kind: OpKind) -> Option<Duration> {
     let deadline = match kind {
         // The worst legitimate case: restore (≤240s grpc) in the `restore`
@@ -971,8 +970,7 @@ fn op_deadline(kind: OpKind) -> Option<Duration> {
     };
     // Operators can pin a single global backstop (and tests set a short one)
     // via `ENGRAM_OP_DEADLINE_SECS` — applied only to deadline-eligible
-    // verbs, never to force one onto a cancel-unsafe verb. Mirrors the
-    // `ENGRAM_QUARANTINE_CAPTURE_TIMEOUT_SECS` knob.
+    // verbs, never to force one onto a cancel-unsafe verb.
     let deadline = std::env::var("ENGRAM_OP_DEADLINE_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())

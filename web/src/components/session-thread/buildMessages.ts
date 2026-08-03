@@ -137,10 +137,9 @@ export type SystemMarker =
       cause: "planned_relocation" | "host_failure_recovery" | "checkpoint_lag";
       at: string;
     }
-  // ADR 0090 (2026-07-20 durability-rollback incident): a quarantined-survivor
-  // eviction exhausted its budget; the coordinator destroyed the crippled VM
-  // and the next resume rewinds to the last published disk manifest, dropping
-  // guest writes acked-but-never-uploaded past it. A prominent warning marker.
+  // A true node loss rolled the guest disk back. The host died with unpublished
+  // writes, and the session resumed from its durable floor. This is a prominent
+  // warning marker.
   | {
       kind: "durability_rollback";
       manifest: string | null;
@@ -1021,8 +1020,8 @@ export function buildMessages(
         active = null;
         break;
 
-      // ADR 0090: the durability-rollback warning boundary. The next resume
-      // rewound the disk to `manifest`, dropping acked-but-unuploaded writes.
+      // A true node loss forced the session to resume from its durable disk
+      // floor. This warning marks the unpublished writes that were lost.
       case "durability_rollback":
         pushSystem(`dr:${idx}`, "guest disk was rolled back", {
           kind: "durability_rollback",

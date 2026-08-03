@@ -275,17 +275,15 @@ export type SessionEvent =
   // the task via the coordinator + the 1s ListTasks poll). Typed here so the
   // frame is a known kind, not an untyped passthrough.
   | { type: "title_suggested"; title: string; at: string }
-  // ADR 0090 (2026-07-20 durability-rollback incident): a quarantined-survivor
-  // eviction exhausted its retry budget, so the coordinator destroyed the
-  // crippled VM. The session's next resume rewinds to the last published disk
-  // manifest, silently dropping guest writes the host acked but never uploaded
-  // past it. Coordinator-authoritative — survives the very rewind it warns
-  // about. Rendered as a prominent warning marker in the timeline.
+  // A true node loss rolled the guest disk back. The host died with unpublished
+  // writes, and the session resumed from its durable floor. This
+  // coordinator-authoritative fact survives the rewind and renders as a
+  // prominent warning marker in the timeline.
   | {
       type: "durability_rollback";
       sandbox_id: string;
-      // The `<manifest_id, version>` the next resume rewinds to; null when the
-      // session never got a live disk publish (falls back to the snapshot).
+      // The `<manifest_id, version>` used as the durable floor after node loss;
+      // null when the session used its snapshot disk lineage.
       rewind_disk_manifest: { manifest_id: string; version: number } | null;
       reason: string;
       at: string;

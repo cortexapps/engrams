@@ -417,46 +417,9 @@ impl Cosim {
         }
     }
 
-    /// The ADR 0090 heartbeat advertise, against the REAL coordinator arm
-    /// (`quarantined_survivor_advertise_core`): the host reports every
-    /// quarantined survivor it still holds, exactly as prod's 5s heartbeat
-    /// does, and the coordinator reacts by enqueueing the keyed quarantine
-    /// `evict_local`. This is the seam the 2026-07-21 8174b7aa livelock
-    /// lived in — pre-extraction the cosim wrote host liveness straight to
-    /// the store and the advertise → enqueue → skip loop was invisible to
-    /// it. Returns how many survivors were advertised (0 = the advertise
-    /// source is gone; the loop is dead).
-    pub async fn advertise_quarantined(&mut self) -> usize {
-        let survivors: Vec<engram_protocol::heartbeat::QuarantinedSurvivor> = {
-            let host = self.world.host.lock().await;
-            host.quarantined_unknown()
-                .into_iter()
-                .filter_map(|sandbox_id| {
-                    host.session_of(sandbox_id).map(|session_id| {
-                        engram_protocol::heartbeat::QuarantinedSurvivor {
-                            sandbox_id,
-                            session_id,
-                        }
-                    })
-                })
-                .collect()
-        };
-        engram_coordinator::api::host_http::quarantined_survivor_advertise_core(
-            &self.world.state,
-            self.world.host_id,
-            &survivors,
-        )
-        .await;
-        self.log(format!("advertise_quarantined n={}", survivors.len()));
-        survivors.len()
-    }
-
-    /// Oracle read for op-quiescence (the 8174b7aa livelock class): the
-    /// TOTAL `session_ops` rows ever created for a session. Under a fixed
-    /// world state, repeated advertise/driver ticks must stop growing this —
-    /// unbounded growth is the enqueue → fast-skip → re-enqueue signature
-    /// (prod: ~43k rows in 2.5 days; the ADR 0093 423-row pileup is the
-    /// same class).
+    /// Oracle read for op quiescence: the total `session_ops` rows ever
+    /// created for a session. The count must stop growing under a fixed
+    /// world state.
     pub fn session_op_count(&self, session_id: SessionId) -> usize {
         self.world.meta.with_db(|db| {
             db.session_ops
@@ -464,25 +427,6 @@ impl Cosim {
                 .filter(|op| op.session_id == session_id)
                 .count()
         })
-    }
-
-    /// The operator/runbook reconcile the `rehydrate-unknown-device` alert
-    /// drives: restore the record of EVERY quarantined device so the drain's
-    /// register re-serves it. Ensures bounded convergence — a quarantined slot
-    /// reaches a terminal disposition rather than wedging forever.
-    pub async fn reconcile_quarantined(&mut self) {
-        let host = self.world.host.lock().await;
-        let quarantined = host.quarantined_unknown();
-        drop(host);
-        if quarantined.is_empty() {
-            return;
-        }
-        let mut host = self.world.host.lock().await;
-        for id in &quarantined {
-            host.regain_record(*id);
-        }
-        drop(host);
-        self.log(format!("reconcile_quarantined n={}", quarantined.len()));
     }
 
     /// Quiescence heal (Wave 7b): restore EVERY device's record — the record-loss

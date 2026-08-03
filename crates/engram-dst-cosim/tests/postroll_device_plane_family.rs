@@ -147,20 +147,18 @@ async fn unpause_gate_fires_on_a_disconnected_dead_guest_plane() {
 }
 
 /// Wave 7b (ADR 0098 §Phase 3, #784 layers 2–3 / #769 gap A) at the boundary:
-/// the startup CLASSIFICATION BARRIER. A survivor whose tracked records are LOST
-/// upstream (dropped from the coordinator listing AND its `ChainHeadRecord`
-/// gone) rolls with its FC guest still resident and holding the device. NEITHER
-/// rehydrate pass can re-serve it. The kernel-derived inventory reconciled
-/// against the (missing) records QUARANTINES the device — classified + alertable
-/// (`rehydrate-unknown-device`), left RECONNECTABLE — never skipped, never
-/// severed. The operator/runbook reconcile then re-serves it with zero loss.
+/// the startup classification barrier. A survivor whose tracked records are lost
+/// upstream rolls with its FC guest still resident and holding the device. The
+/// kernel-derived inventory classifies the device as `QuarantinedUnknown`. The
+/// device stays reconnectable and repeated rehydrate passes do not create
+/// coordinator operations.
 ///
 /// Distinguishes Wave 7b from #806: the raw R6 sweep PARKs a live holder but
 /// records nothing at the record level. Here the barrier CLASSIFIES it into
 /// `quarantined_unknown`. Fail-without: reverting the barrier leaves that set
 /// empty and the assertion below fails.
 #[tokio::test(start_paused = true)]
-async fn gap_a_record_invisible_survivor_is_quarantined_then_recovers_zero_loss() {
+async fn gap_a_record_invisible_survivor_is_classified_and_ops_quiesce() {
     let mut sim = Cosim::new(0x0784_000A).await;
     let session = sim.boot_session().await;
     let sandbox = sim.sandbox_of(session).await.expect("bound sandbox");
@@ -192,18 +190,23 @@ async fn gap_a_record_invisible_survivor_is_quarantined_then_recovers_zero_loss(
     sim.assert_no_severed_live_holder().await.unwrap();
     sim.assert_quarantine_reconnectable().await.unwrap();
 
-    // The operator/runbook reconcile the alert drives: restore the record; the
-    // next rehydrate re-serves the reconnectable device with zero loss.
-    sim.reconcile_quarantined().await;
-    sim.register_rehydrate(true).await;
-    assert!(
-        sim.served_by_current(session).await,
-        "the reconciled record let the reattach re-serve the quarantined device",
+    // Op-quiescence oracle: repeated register/rehydrate passes under the
+    // same world state must not create session operations.
+    let op_count = sim.session_op_count(session);
+    for _ in 0..4 {
+        sim.register_rehydrate(true).await;
+        sim.advance(5).await;
+    }
+    assert_eq!(
+        sim.session_op_count(session),
+        op_count,
+        "session_ops must stop growing under a fixed world state",
     );
     assert!(
-        sim.unpause(session).await,
-        "un-pause lands on the live re-served plane"
+        sim.quarantined_unknown().await.contains(&sandbox),
+        "the repeated passes must keep the record-invisible survivor classified",
     );
+    sim.assert_quarantine_reconnectable().await.unwrap();
     sim.assert_no_severed_live_holder().await.unwrap();
     sim.assert_slot_accounting().await.unwrap();
 }
