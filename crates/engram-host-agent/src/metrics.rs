@@ -487,3 +487,11 @@ pub const SPOOL_LINEAGE_MISMATCH_TOTAL: &str = "engram_nbd_spool_lineage_mismatc
 /// durability rollback started as exactly such a panic, silent in prod
 /// for 11 days. Alert on any increase.
 pub const SHUTDOWN_STAGE_PANIC_TOTAL: &str = "engram_host_shutdown_stage_panic_total";
+
+/// A quarantined survivor's disk was re-served by the rehydrate retry
+/// pass (2026-08-02 durability-rollback RCA) — the recovery that
+/// replaces the old destroy-on-exhaustion rollback. Informational;
+/// the paired failure signal is the coordinator's
+/// `engram_quarantine_stuck_total`.
+pub const QUARANTINE_REHYDRATE_RECOVERED_TOTAL: &str =
+    "engram_nbd_quarantine_rehydrate_recovered_total";

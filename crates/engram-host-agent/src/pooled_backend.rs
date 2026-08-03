@@ -402,6 +402,24 @@ impl Drop for CaptureUnwind {
     }
 }
 
+/// One quarantined survivor's record (2026-08-02 durability-rollback
+/// RCA): everything the rehydrate retry pass needs to re-attempt the
+/// failed re-serve, keyed by sandbox in `quarantined_survivors`. The
+/// retry-only fields are read by the Linux-gated retry pass; macOS
+/// builds see only the heartbeat accessor's `session_id` read.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Debug)]
+struct QuarantinedSurvivor {
+    session_id: SessionId,
+    /// The disk manifest ref the failed rehydrate attached from — the
+    /// coordinator's effective ref at register time. It cannot advance
+    /// while the disk is unserved (nothing publishes), so the retry
+    /// reuses it verbatim.
+    disk_manifest: engram_core::types::manifest::ManifestRef,
+    /// Retry attempts so far — log pacing only.
+    retry_attempts: u64,
+}
+
 /// Wraps an inner [`SandboxBackend`] (FC or VZ) with host-side
 /// resource resolution: image cache, chunk store, materialize-to-
 /// file, optional NBD daemon, optional egress proxy.
@@ -446,9 +464,12 @@ pub struct PooledBackend {
     session_bindings: Arc<DashMap<SandboxId, SessionId>>,
     /// ADR 0090: survivors whose NBD slot this generation quarantined
     /// (rehydrate `RECONFIGURE` failed). Advertised in every heartbeat
-    /// until the sandbox is destroyed; the coordinator drives
-    /// `evict_local → resume` off it.
-    quarantined_survivors: Arc<DashMap<SandboxId, SessionId>>,
+    /// until the sandbox is destroyed or the rehydrate retry pass
+    /// (2026-08-02 durability-rollback RCA) re-serves the disk; the
+    /// coordinator drives `evict_local → resume` off it. The record
+    /// carries what the retry needs: the manifest ref the failed
+    /// rehydrate used and an attempt counter for log pacing.
+    quarantined_survivors: Arc<DashMap<SandboxId, QuarantinedSurvivor>>,
     /// ADR 0091: guests whose control plane stopped answering (3/3
     /// socket probes refused after a checkpoint failure). Advertised in
     /// every heartbeat until cleared by a successful capture or destroy;
@@ -3438,16 +3459,97 @@ impl PooledBackend {
 
     /// ADR 0090: the survivors whose NBD slots this generation
     /// quarantined (rehydrate `RECONFIGURE` failed) — re-advertised in
-    /// every heartbeat until the sandbox is destroyed, so the
-    /// coordinator drives the `evict_local → resume` remediation.
+    /// every heartbeat until the sandbox is destroyed or the rehydrate
+    /// retry pass re-serves the disk, so the coordinator drives the
+    /// `evict_local → resume` remediation.
     pub fn quarantined_survivors(&self) -> Vec<engram_protocol::heartbeat::QuarantinedSurvivor> {
         self.quarantined_survivors
             .iter()
             .map(|e| engram_protocol::heartbeat::QuarantinedSurvivor {
                 sandbox_id: *e.key(),
-                session_id: *e.value(),
+                session_id: e.value().session_id,
             })
             .collect()
+    }
+
+    /// 2026-08-02 durability-rollback RCA: one retry pass over the
+    /// quarantined survivors — re-attempt the failed rehydrate for each,
+    /// via [`Self::rehydrate_sandbox`]'s parked-slot reclaim. The
+    /// timer loop in `lib.rs` is a thin wrapper; this is the `run_once`
+    /// step (ADR 0098). Returns how many survivors were recovered.
+    ///
+    /// A recovered survivor leaves `quarantined_survivors` (its
+    /// heartbeat advertise stops) and serves reads/writes again; the
+    /// coordinator's parked quarantine op then captures + relocates it
+    /// cleanly on its next slow-lane attempt, with zero rollback. A
+    /// failed retry re-parks the slot and stays advertised; retries are
+    /// logged quietly after the first (a permanently de-configured
+    /// device — kernel "not configured" — never recovers by
+    /// RECONFIGURE, and the loud signal for that is the coordinator's
+    /// quarantine-stuck alert, not a per-tick WARN here).
+    #[cfg(target_os = "linux")]
+    pub async fn retry_quarantined_rehydrates_once(&self) -> usize {
+        let survivors: Vec<(SandboxId, QuarantinedSurvivor)> = self
+            .quarantined_survivors
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        let mut recovered = 0usize;
+        for (sandbox_id, q) in survivors {
+            let attempt = q.retry_attempts.saturating_add(1);
+            match self
+                .rehydrate_sandbox(q.session_id, sandbox_id, q.disk_manifest)
+                .await
+            {
+                Ok(true) => {
+                    // rehydrate_sandbox removed the map entry on success.
+                    recovered += 1;
+                    ::metrics::counter!(crate::metrics::QUARANTINE_REHYDRATE_RECOVERED_TOTAL)
+                        .increment(1);
+                    tracing::info!(
+                        %sandbox_id,
+                        session_id = %q.session_id,
+                        attempt,
+                        "quarantined survivor RECOVERED by the rehydrate retry pass; \
+                         disk re-served, heartbeat advertise stops",
+                    );
+                }
+                Ok(false) => {
+                    // Structural skip (no pool / already served / no
+                    // device) — nothing to retry against; leave the
+                    // entry for the destroy path to clear.
+                    if let Some(mut e) = self.quarantined_survivors.get_mut(&sandbox_id) {
+                        e.retry_attempts = attempt;
+                    }
+                }
+                Err(e) => {
+                    if let Some(mut entry) = self.quarantined_survivors.get_mut(&sandbox_id) {
+                        entry.retry_attempts = attempt;
+                    }
+                    // First failure at WARN; then every 20th (≈10 min at
+                    // the 30s cadence) to keep a dead device from
+                    // flooding the log.
+                    if attempt == 1 || attempt % 20 == 0 {
+                        tracing::warn!(
+                            %sandbox_id,
+                            session_id = %q.session_id,
+                            attempt,
+                            error = %e,
+                            "quarantined-survivor rehydrate retry failed; will keep \
+                             retrying (slot re-parked, survivor still advertised)",
+                        );
+                    } else {
+                        tracing::debug!(
+                            %sandbox_id,
+                            attempt,
+                            error = %e,
+                            "quarantined-survivor rehydrate retry failed",
+                        );
+                    }
+                }
+            }
+        }
+        recovered
     }
 
     /// ADR 0091: record a control-plane-dead guest (checkpoint driver's
@@ -9406,18 +9508,32 @@ impl PooledBackend {
             );
             return Ok(false);
         };
-        let Some(slot) = pool.claim(&device).await else {
-            // Not in the free pool: either the device isn't part of
-            // this host's slot set, or something else already leased
-            // it — both mean re-serving here would fight another
-            // owner. Loud, because the survivor's disk stays dead.
-            tracing::warn!(
-                %sandbox_id,
-                device = %device.display(),
-                "rehydrate: survivor's NBD device could not be claimed from the slot \
-                 pool; its disk stays unserved (recover via evict_local → resume)",
-            );
-            return Ok(false);
+        // Register-time rehydrate claims the device from the pool; a
+        // RETRY (2026-08-02 durability-rollback RCA) finds it PARKED by
+        // its own earlier failure and reclaims it instead — the
+        // `Parked → Claimed` edge. Reclaim first: it is lock-cheap,
+        // and a parked device would spend `claim`'s full retry budget
+        // to conclude "reserved by someone" anyway.
+        let slot = match pool.reclaim_parked(&device) {
+            Some(slot) => slot,
+            None => match pool.claim(&device).await {
+                Some(slot) => slot,
+                None => {
+                    // Not parked and not in the free pool: either the
+                    // device isn't part of this host's slot set, or
+                    // something else already leased it — both mean
+                    // re-serving here would fight another owner. Loud,
+                    // because the survivor's disk stays dead.
+                    tracing::warn!(
+                        %sandbox_id,
+                        device = %device.display(),
+                        "rehydrate: survivor's NBD device could not be claimed from \
+                         the slot pool; its disk stays unserved (recover via \
+                         evict_local → resume)",
+                    );
+                    return Ok(false);
+                }
+            },
         };
 
         // Shutdown-spool peek (2026-07-16 RCA): if the predecessor
@@ -9533,8 +9649,20 @@ impl PooledBackend {
                 // survivor in every heartbeat so the coordinator actually
                 // DRIVES evict_local → resume (pre-fix, nothing consumed
                 // this WARN and the teardown reconciler's orphan path
-                // SIGKILLed the healthy VM ~60s later).
-                self.quarantined_survivors.insert(sandbox_id, session_id);
+                // SIGKILLed the healthy VM ~60s later). Preserve an
+                // existing record's retry counter: a failed RETRY lands
+                // here too, and resetting the counter would re-loudify
+                // its log pacing every attempt.
+                self.quarantined_survivors
+                    .entry(sandbox_id)
+                    .and_modify(|q| {
+                        q.disk_manifest = disk_manifest;
+                    })
+                    .or_insert(QuarantinedSurvivor {
+                        session_id,
+                        disk_manifest,
+                        retry_attempts: 0,
+                    });
                 return Err(SandboxError::Vm(
                     format!(
                         "rehydrate nbd reattach at {}: {e} \
@@ -9603,6 +9731,13 @@ impl PooledBackend {
                 }
             }
         }
+
+        // 2026-08-02 durability-rollback RCA: a successful (re-)serve
+        // clears the quarantine — the heartbeat stops advertising the
+        // survivor and the coordinator's parked quarantine op captures
+        // cleanly on its next attempt. No-op for the register-time
+        // first attempt (no entry exists yet).
+        self.quarantined_survivors.remove(&sandbox_id);
 
         tracing::info!(
             %session_id,

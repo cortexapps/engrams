@@ -161,6 +161,48 @@ This does not change the recovery *mechanism* — the write loss was always
 possible on this path; the addendum only makes it observable instead of silent.
 The deeper fix (bounding the acked-but-unuploaded window itself) remains the NBD
 acked-write-loss work, out of scope here.
+
+## Addendum (2026-08-02): exhaustion parks — the ladder never destroys a survivor with acked writes
+
+The 2026-07-20 addendum made the loss loud; the 2026-08-02 incident (11
+sessions rolled back across three fleet rolls, RCA'd to a SIGTERM-path panic
+that de-configured the survivors' NBD devices) retires the loss itself. The
+destroy-on-exhaustion arm was a guaranteed-fail loop: quarantine ⟺ no
+`nbd_sandboxes` entry ⟺ the host's capture refusal (`RefuseUntracked`), so
+every attempt failed deterministically and the third failure destroyed the
+only copy of the acked writes the refusal existed to protect.
+
+Decision — three replacing parts:
+
+1. **Exhaustion parks, never destroys.** Past `QUARANTINE_EVICT_MAX_ATTEMPTS`
+   the evict op returns `RetryAfter` on a slow cadence
+   (`QUARANTINE_STUCK_RETRY`) instead of destroying + settling `HostLost`
+   (`HostLost` *is* the rollback — the next resume rewinds unconditionally).
+   The op stays QUEUED, so the `adr0090-quarantine:*` idempotency key keeps
+   the 5s advertise deduped (the 8174b7aa op-flood cannot restart) and, being
+   not-due, it never head-of-line blocks the session lane. The stuck crossing
+   increments the alertable `engram_quarantine_stuck_total` exactly once. The
+   quarantined-`Parked` reap arm follows the same rule (its destroy was the
+   61a03b7e 93-event rewind); only `Created`/`Unreachable` — no user work ran
+   — keep the fast destroy that ends the advertise loop.
+2. **The host retries the rehydrate.** `rehydrate_sandbox` is no longer
+   register-time-only: a 30s retry pass re-attempts the re-serve for every
+   quarantined survivor (the slot FSM gains the `Parked → Claimed` reclaim
+   edge; a failed retry re-parks). On success the survivor leaves the
+   heartbeat advertise and the parked op's next attempt captures + relocates
+   with zero rollback — the `evict_local → resume` remediation this ADR
+   promised, now actually reachable.
+3. **The op is pinned to the advertised sandbox.** The slow lane can outlive
+   a relocation, so the quarantine payload carries `sandbox_id` and a stale
+   wake-up against a different (healthy) binding no-ops.
+
+If the disk never recovers (e.g. a de-configured kernel device), the
+quarantine-stuck alert routes an OPERATOR decision — an explicit destroy that
+accepts the loss — instead of an automatic one. `durability_rollback` events
+and `engram_durability_rollback_total` remain for the genuinely-lossy paths
+(real host death); on this ladder they no longer have an emitter, which is the
+point.
+
 ## Addendum (2026-07-31): the binding-disposition contract (#896)
 
 PR #896's review cycle exposed the structural gap this ADR left open: the
