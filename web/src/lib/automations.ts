@@ -57,8 +57,7 @@ export function automationErrorField(message: string): AutomationField {
   if (text.includes("cron") || text.includes("schedule")) return "schedule";
   if (text.includes("registration")) return "registration";
   if (text.includes("event")) return "events";
-  if (text.includes("port_exposure") || text.includes("port exposure") || text.includes("profile"))
-    return "profile";
+  if (text.includes("profile")) return "profile";
   if (text.includes("title")) return "titleTemplate";
   if (text.includes("template") || text.includes("prompt")) return "promptTemplate";
   if (text.includes("name")) return "name";
