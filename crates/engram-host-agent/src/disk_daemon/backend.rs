@@ -199,7 +199,7 @@ impl PendingDiskFlush {
 
     /// Return the bytes captured at the pause instant for eviction.
     /// Consumed claims stay in the tier's claimed map until sandbox
-    /// destroy. This matches the old `pending_uploads` lifecycle. Reads
+    /// destroy, so `unflushed_bytes()` keeps counting them. Reads
     /// continue to use the file because `contains()` includes claims.
     #[cfg(target_os = "linux")]
     pub(crate) fn into_chunks(self) -> Vec<(usize, ChunkHash, Bytes)> {

@@ -1100,7 +1100,7 @@ async fn reattach_manifest_inner(
                 // Verify-on-read (ADR 0098 P7 rider): prove the seeded acked
                 // bytes are readable at their offset through the backend the
                 // RECONFIGURE below is about to hand the kernel — a
-                // single-chunk probe (an in-RAM dirty-tier read), NOT a
+                // single-chunk probe (a dirty-tier read), NOT a
                 // full-disk scan (latency is non-negotiable). This step runs
                 // strictly BEFORE Reconfigure: the kernel releases the
                 // guest's parked I/O the instant it adopts our socket, so a

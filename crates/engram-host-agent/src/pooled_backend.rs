@@ -4335,9 +4335,9 @@ impl PooledBackend {
                 .collect();
             for (sandbox_id, backend) in stragglers {
                 // `unflushed_bytes`, not `dirty_bytes`: an aborted flush
-                // that got past its drain left the chunks in
-                // `pending_uploads` — just as un-uploaded, and exactly
-                // the bytes the spool is about to carry.
+                // that got past its claim left the chunks claimed in the
+                // dirty tier — just as un-uploaded, and exactly the
+                // bytes the spool is about to carry.
                 let unflushed = backend.unflushed_bytes().await;
                 // ADR 0098 P4: `is_straggler` is the pure deadline-overrun
                 // decision (still-dirty at the deadline ⇒ loud, the spool

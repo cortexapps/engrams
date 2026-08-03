@@ -1704,12 +1704,12 @@ impl HostAgent {
             #[cfg(target_os = "linux")]
             {
                 // Issue #225: BEFORE abandoning the data planes, run a
-                // bounded final disk-flush pass. NBD WRITEs are acked
-                // from the in-RAM dirty tier and only made durable on
-                // the FlushScheduler's ~30 s cadence; abandoning drops
-                // that tier, so without this pass a routine pod roll
-                // silently rolls a surviving guest's disk back by up to
-                // one cadence window of ACKED writes. The pass drains +
+                // bounded final disk-flush pass. ADR 0110 note: acked
+                // writes now survive process death in the per-sandbox
+                // dirty file, so this pass no longer guards against
+                // rollback — it keeps the published manifest fresh so
+                // the successor's recovery has less to upload. It
+                // retires per the ADR 0110 rollout. The pass drains +
                 // uploads each survivor's dirty chunks and synchronously
                 // republishes its live_disk_manifest so the successor
                 // rehydrates from the current ref. It is budgeted against

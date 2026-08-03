@@ -13,6 +13,14 @@
 //! (flush→publish→spool→adopt) never loses a write it took responsibility for
 //! — it does not claim omniscient recovery of every RAM-only ack.
 //!
+//! ADR 0110 note: the live backend now gives a STRONGER guarantee — every
+//! acked write survives process death in a per-sandbox dirty file. This
+//! oracle still models only the portable legs (publish + spool), so its
+//! "accepted, bounded loss" boundary describes the pre-0110 fallback path
+//! the simulator drives, not the live contract. The dirty-file guarantee is
+//! pinned by the behavioral tests in `engram-host-agent`; teaching this
+//! oracle the dirty-file leg is a follow-up in the ADR 0110 rollout.
+//!
 //! The ledger ([`AckedWriteLedger`]) is the oracle's memory. Per
 //! `(sandbox, chunk_idx)` it holds the LATEST acked tag AND the published-tier
 //! FLOOR (the highest tag a flush published to the durable/uploaded tier,

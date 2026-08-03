@@ -1,14 +1,15 @@
 //! Issue #225 regression: the SIGTERM path must FINAL-FLUSH every surviving
 //! NBD data plane's un-flushed dirty/pending writes BEFORE abandoning it.
 //!
-//! The hazard: NBD WRITEs are acked to the guest the instant the bytes land in
-//! the backend's in-RAM `dirty` tier; durability rides the FlushScheduler's
-//! ~30 s / 256 MiB cadence. A routine pod roll calls
+//! The original hazard (pre-ADR 0110): NBD WRITEs were acked the instant the
+//! bytes landed in the backend's in-RAM `dirty` tier; durability rode the
+//! FlushScheduler's ~30 s / 256 MiB cadence. A routine pod roll called
 //! `abandon_nbd_data_planes_for_shutdown` → `abandon_for_shutdown` →
-//! `drop(backend)`, discarding the `dirty` (+ `pending_uploads`) tier with NO
-//! final flush. The VM keeps running (the K2 contract), but the successor
-//! rehydrates from the last *published* `live_disk_manifest`, which predates
-//! the discarded writes — a silent rollback of acked guest I/O on a running VM.
+//! `drop(backend)`, discarding that tier with NO final flush — a silent
+//! rollback of acked guest I/O on a running VM. ADR 0110 closed the rollback
+//! hazard itself (acked writes survive in the per-sandbox dirty file); the
+//! final-flush pass remains in rollout stage 1 to keep the published
+//! `live_disk_manifest` fresh, and this test pins that it still runs.
 //!
 //! The fix adds `PooledBackend::flush_nbd_data_planes_for_shutdown`, run in the
 //! SIGTERM path BEFORE the abandon sweep: per surviving sandbox, under a hard
