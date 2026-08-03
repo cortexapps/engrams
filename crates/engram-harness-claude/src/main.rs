@@ -152,6 +152,55 @@ mod adapter {
             .filter(|tool| tool.native_bindings.claude.is_none())
     }
 
+    /// System-prompt guidance for injected tools that REPLACE removed CLI
+    /// built-ins. Claude >= 2.1.187 dropped `AskUserQuestion` and
+    /// `ExitPlanMode` from headless `--print` mode, but the model's training
+    /// (and, in plan mode, the CLI's own system reminder) still reaches for
+    /// those names — without this redirect the model calls a tool that does
+    /// not exist, or never finds the injected replacement. Derived from the
+    /// manifest so a session without a tool never advertises it.
+    fn injected_tool_guidance(manifest: &ToolManifest) -> Option<String> {
+        let mut lines: Vec<&str> = Vec::new();
+        if injected_tools(manifest).any(|tool| tool.name == "ask_user_question") {
+            lines.push(
+                "The built-in AskUserQuestion tool is not available here. To ask the user \
+                 a question, call the ask_user_question tool (mcp__engrams__ask_user_question); \
+                 load it with ToolSearch if it is not loaded. Its answers arrive as the tool \
+                 result.",
+            );
+        }
+        if injected_tools(manifest).any(|tool| tool.name == "exit_plan_mode") {
+            lines.push(
+                "The built-in ExitPlanMode tool is not available here. In plan mode, when \
+                 your plan is complete, call the exit_plan_mode tool \
+                 (mcp__engrams__exit_plan_mode) with the full plan as markdown, then wait \
+                 for the review decision. Where instructions mention ExitPlanMode, use \
+                 exit_plan_mode instead.",
+            );
+        }
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
+    }
+
+    /// Combine the harness-owned injected-tool guidance with the
+    /// orchestrator's ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0060) into the single
+    /// `--append-system-prompt` value.
+    fn compose_append_system_prompt(
+        guidance: Option<&str>,
+        external: Option<&str>,
+    ) -> Option<String> {
+        let external = external.filter(|p| !p.is_empty());
+        match (guidance, external) {
+            (Some(g), Some(e)) => Some(format!("{g}\n\n{e}")),
+            (Some(g), None) => Some(g.to_string()),
+            (None, Some(e)) => Some(e.to_string()),
+            (None, None) => None,
+        }
+    }
+
     /// Every `tool_use` name whose hook PARKS the turn — both spellings.
     ///
     /// Injected tools arrive as `mcp__engrams__<name>`, but a natively-bound
@@ -688,44 +737,6 @@ mod adapter {
                         ("ask_user_question".to_string(), ToolExecution::Deferred)
                     })
                 });
-            /// Take the stashed result this re-fire should consume.
-            ///
-            /// The exact `tool_use_id` is the normal key. But a respawned CLI
-            /// mints a NEW id for the same intent, so an id-keyed lookup misses
-            /// and the call parks a second time — session 5661c75f ended up
-            /// with two unresolvable `exit_plan_mode` rows: a duplicate review
-            /// card, an inflated revision count, and `awaiting_review` that can
-            /// never clear.
-            ///
-            /// So `exit_plan_mode` also matches by TOOL: at most one plan is
-            /// ever under review per session, and a plan drafted before the
-            /// reviewer's feedback arrived is exactly the plan that feedback is
-            /// about. AUQ deliberately does NOT retarget — its answers are keyed
-            /// to the questions that were asked, so delivering them to a
-            /// different call would be a mis-answer, and its generic fallback
-            /// already covers the abandoned re-fire.
-            async fn take_stashed_result(
-                results_in_hand: &mcp_server::ResultsInHand,
-                deferred_calls: &DeferredCalls,
-                tool_use_id: &str,
-                tool_name: &str,
-            ) -> Option<(String, String)> {
-                let mut results = results_in_hand.lock().await;
-                if let Some(result_json) = results.remove(tool_use_id) {
-                    return Some((tool_use_id.to_string(), result_json));
-                }
-                if tool_name != "exit_plan_mode" {
-                    return None;
-                }
-                let calls = deferred_calls.lock().await;
-                let stashed_id = results
-                    .keys()
-                    .find(|id| calls.get(*id).is_some_and(|c| c.tool_name == tool_name))
-                    .cloned()?;
-                let result_json = results.remove(&stashed_id)?;
-                Some((stashed_id, result_json))
-            }
-
             if let Some((tool_name, execution)) = native_binding {
                 let mut event = None;
                 let verdict = if execution == ToolExecution::Sync {
@@ -735,7 +746,7 @@ mod adapter {
                         "sync native binding is unsupported; allowing the built-in"
                     );
                     HookVerdict::Allow
-                } else if let Some((stashed_id, result_json)) = take_stashed_result(
+                } else if let Some((stashed_id, result_json)) = mcp_server::take_stashed_result(
                     &results_in_hand,
                     &deferred_calls,
                     &req.tool_use_id,
@@ -872,9 +883,19 @@ mod adapter {
             } else if let Some(name) = req.tool_name.strip_prefix("mcp__engrams__") {
                 match injected_tools(&manifest).find(|tool| tool.name == name) {
                     Some(tool) if tool.execution == ToolExecution::Sync => HookVerdict::Allow,
-                    Some(_) if results_in_hand.lock().await.contains_key(&req.tool_use_id) => {
+                    Some(_)
+                        if mcp_server::has_stashed_result(
+                            &results_in_hand,
+                            &deferred_calls,
+                            &req.tool_use_id,
+                            name,
+                        )
+                        .await =>
+                    {
                         // The hook must leave the stash intact: after allow,
-                        // Claude invokes the MCP bridge, which consumes it.
+                        // Claude invokes the MCP bridge, which consumes it
+                        // (including the exit_plan_mode by-tool retarget —
+                        // see `take_stashed_result`).
                         HookVerdict::Allow
                     }
                     Some(_) => {
@@ -1584,6 +1605,85 @@ mod adapter {
             serde_json::json!({})
         }
 
+        /// Take the stashed result a re-fire should consume.
+        ///
+        /// The exact `tool_use_id` is the normal key. But a respawned CLI
+        /// mints a NEW id for the same intent, so an id-keyed lookup misses
+        /// and the call parks a second time — session 5661c75f ended up
+        /// with two unresolvable `exit_plan_mode` rows: a duplicate review
+        /// card, an inflated revision count, and `awaiting_review` that can
+        /// never clear.
+        ///
+        /// So `exit_plan_mode` also matches by TOOL: at most one plan is
+        /// ever under review per session, and a plan drafted before the
+        /// reviewer's feedback arrived is exactly the plan that feedback is
+        /// about. AUQ deliberately does NOT retarget — its answers are keyed
+        /// to the questions that were asked, so delivering them to a
+        /// different call would be a mis-answer, and its generic fallback
+        /// already covers the abandoned re-fire.
+        pub async fn take_stashed_result(
+            results_in_hand: &ResultsInHand,
+            deferred_calls: &hook_server::DeferredCalls,
+            tool_use_id: &str,
+            tool_name: &str,
+        ) -> Option<(String, String)> {
+            let mut results = results_in_hand.lock().await;
+            if let Some(result_json) = results.remove(tool_use_id) {
+                return Some((tool_use_id.to_string(), result_json));
+            }
+            if tool_name != "exit_plan_mode" {
+                return None;
+            }
+            let calls = deferred_calls.lock().await;
+            let stashed_id = results
+                .keys()
+                .find(|id| calls.get(*id).is_some_and(|c| c.tool_name == tool_name))
+                .cloned()?;
+            let result_json = results.remove(&stashed_id)?;
+            Some((stashed_id, result_json))
+        }
+
+        /// Non-consuming twin of `take_stashed_result`, for the hook's
+        /// allow-or-defer decision: the hook must leave the stash intact so
+        /// the MCP bridge (which Claude invokes after the allow) can consume
+        /// it.
+        pub async fn has_stashed_result(
+            results_in_hand: &ResultsInHand,
+            deferred_calls: &hook_server::DeferredCalls,
+            tool_use_id: &str,
+            tool_name: &str,
+        ) -> bool {
+            let results = results_in_hand.lock().await;
+            if results.contains_key(tool_use_id) {
+                return true;
+            }
+            if tool_name != "exit_plan_mode" {
+                return false;
+            }
+            let calls = deferred_calls.lock().await;
+            results
+                .keys()
+                .any(|id| calls.get(id).is_some_and(|c| c.tool_name == tool_name))
+        }
+
+        /// Render a host result as what the model must READ, at the moment it
+        /// is served through the bridge. A rejected plan is an instruction,
+        /// not a data payload (ADR 0107: raw `{"decision":"reject"…}` made the
+        /// model narrate "submitted for review" and end the turn); everything
+        /// else passes through verbatim. The stash keeps the canonical JSON so
+        /// the engine's fallback delivery can still parse it.
+        pub fn render_result_for_model(tool_name: &str, result_json: String) -> String {
+            if tool_name == "exit_plan_mode" {
+                if let Some(decision) = engram_harness_sdk::plan::parse_plan_decision(&result_json)
+                {
+                    if !decision.approved() {
+                        return engram_harness_sdk::plan::changes_requested_message(&decision);
+                    }
+                }
+            }
+            result_json
+        }
+
         pub async fn serve(listener: UnixListener, state: State) {
             loop {
                 match listener.accept().await {
@@ -1625,10 +1725,35 @@ mod adapter {
             // and insertion nor be stashed while a sender is already parked.
             let rx = {
                 let mut parked = parked_calls.lock().await;
-                if let Some(result_json) = results_in_hand.lock().await.remove(&call_id) {
-                    deferred_calls.lock().await.remove(&call_id);
+                if let Some((stashed_id, result_json)) =
+                    take_stashed_result(&results_in_hand, &deferred_calls, &call_id, &request.name)
+                        .await
+                {
+                    let mut calls = deferred_calls.lock().await;
+                    calls.remove(&call_id);
+                    calls.remove(&stashed_id);
+                    drop(calls);
                     drop(parked);
-                    write_result(&mut w, result_json).await;
+                    if stashed_id != call_id {
+                        // The stash was keyed by an EARLIER call id (the
+                        // by-tool retarget in `take_stashed_result`); ack that
+                        // id explicitly, or its coordinator outbox row
+                        // redelivers forever — this serve produces a stream
+                        // tool_result only for `call_id`.
+                        emit(
+                            &evt_tx,
+                            HarnessEvent::ToolCallCompleted {
+                                run_id: current_run_id.lock().await.clone().unwrap_or_default(),
+                                tool_call_id: stashed_id,
+                                tool_name: request.name.clone(),
+                                ok: false,
+                                duration_ms: 0,
+                                result_summary: Some("changes requested".to_string()),
+                            },
+                        )
+                        .await;
+                    }
+                    write_result(&mut w, render_result_for_model(&request.name, result_json)).await;
                     return;
                 }
                 let (tx, rx) = oneshot::channel();
@@ -1642,14 +1767,16 @@ mod adapter {
                 HarnessEvent::ToolCallRequested {
                     run_id,
                     call_id: call_id.clone(),
-                    name: request.name,
+                    name: request.name.clone(),
                     args_json: request.args.to_string(),
                 },
             )
             .await;
 
             match rx.await {
-                Ok(result_json) => write_result(&mut w, result_json).await,
+                Ok(result_json) => {
+                    write_result(&mut w, render_result_for_model(&request.name, result_json)).await
+                }
                 Err(_) => tracing::debug!(%call_id, "parked MCP call was cancelled"),
             }
         }
@@ -2279,8 +2406,13 @@ mod adapter {
         let resume_id = read_claude_session_id(&state.claude_session_id()).await;
         // ADR 0060: ENGRAM_APPEND_SYSTEM_PROMPT (carried via harness_env) flavors
         // the agent's system prompt. Read per spawn — it is constant for the
-        // process, and a respawn must re-apply it.
-        let append_system_prompt = std::env::var("ENGRAM_APPEND_SYSTEM_PROMPT").ok();
+        // process, and a respawn must re-apply it. The harness prepends its
+        // own manifest-derived guidance for injected tools that replace
+        // removed CLI built-ins (AskUserQuestion, ExitPlanMode).
+        let append_system_prompt = compose_append_system_prompt(
+            injected_tool_guidance(&cli.tool_manifest).as_deref(),
+            std::env::var("ENGRAM_APPEND_SYSTEM_PROMPT").ok().as_deref(),
+        );
         // ADR 0107: the latched session mode. The STAMP (not process env,
         // which reverts to create-time values after evict/resume) decides
         // this process's permission mode; a mid-session mode directive that
@@ -3500,10 +3632,12 @@ mod adapter {
             settings_path.to_string_lossy().into_owned(),
         ];
         if mode == "plan" {
-            // ADR 0107: native plan mode — the CLI runs its own read-only
-            // planning discipline and calls ExitPlanMode, which the hook
-            // bridge defers onto the generic tool seam. The bridge also
-            // backstops write tools while the fire reports plan mode.
+            // ADR 0107: the CLI runs its own read-only planning discipline.
+            // The plan is presented through the injected exit_plan_mode MCP
+            // tool (the ExitPlanMode built-in is gone from headless CLIs
+            // >= 2.1.187; `injected_tool_guidance` redirects the model), and
+            // the hook bridge backstops write tools while the fire reports
+            // plan mode.
             argv.push("--permission-mode".into());
             argv.push("plan".into());
         }
@@ -4220,6 +4354,56 @@ mod adapter {
             }
         }
 
+        /// The headless CLI (>= 2.1.187) has no AskUserQuestion/ExitPlanMode
+        /// built-ins; the manifest-derived guidance redirects the model to the
+        /// injected replacements — and only for the tools this session
+        /// actually injects.
+        #[test]
+        fn injected_tool_guidance_covers_only_injected_replacements() {
+            let both = vec![
+                generic_tool("ask_user_question", ToolExecution::Deferred),
+                generic_tool("exit_plan_mode", ToolExecution::Deferred),
+                generic_tool("save_memory", ToolExecution::Sync),
+            ];
+            let text = injected_tool_guidance(&both).expect("guidance for both");
+            assert!(text.contains("mcp__engrams__ask_user_question"));
+            assert!(text.contains("mcp__engrams__exit_plan_mode"));
+
+            let question_only = vec![generic_tool("ask_user_question", ToolExecution::Deferred)];
+            let text = injected_tool_guidance(&question_only).expect("guidance for the question");
+            assert!(text.contains("mcp__engrams__ask_user_question"));
+            assert!(!text.contains("exit_plan_mode"));
+
+            // A natively-bound question (codex-style manifests never reach
+            // this harness, but a claude binding would) is NOT injected, so
+            // it gets no redirect.
+            assert!(injected_tool_guidance(&vec![native_question_tool()]).is_none());
+            assert!(injected_tool_guidance(&Vec::new()).is_none());
+            assert!(injected_tool_guidance(&vec![generic_tool(
+                "save_memory",
+                ToolExecution::Sync
+            )])
+            .is_none());
+        }
+
+        #[test]
+        fn append_system_prompt_composes_guidance_with_external() {
+            assert_eq!(
+                compose_append_system_prompt(Some("guide"), Some("slack")),
+                Some("guide\n\nslack".to_string())
+            );
+            assert_eq!(
+                compose_append_system_prompt(Some("guide"), Some("")),
+                Some("guide".to_string()),
+                "an empty external value is unset, not appended"
+            );
+            assert_eq!(
+                compose_append_system_prompt(None, Some("slack")),
+                Some("slack".to_string())
+            );
+            assert_eq!(compose_append_system_prompt(None, None), None);
+        }
+
         // ADR 0107: `plan` (and only `plan`) maps to the CLI's native
         // permission mode; the mode comes from the workspace stamp per spawn.
         #[test]
@@ -4473,6 +4657,7 @@ mod adapter {
             mcp_server::ResultsInHand,
             mcp_server::ParkedCalls,
             mpsc::Receiver<HarnessEvent>,
+            hook_server::DeferredCalls,
         ) {
             let sock = std::env::temp_dir()
                 .join(format!(
@@ -4495,19 +4680,27 @@ mod adapter {
                 mcp_server::State {
                     results_in_hand: results.clone(),
                     parked_calls: parked.clone(),
-                    deferred_calls: deferred,
+                    deferred_calls: deferred.clone(),
                     current_run_id: run_id.clone(),
                     evt_tx,
                 },
             ));
-            (sock, results, parked, evt_rx)
+            (sock, results, parked, evt_rx, deferred)
         }
 
         async fn fire_main_mcp_call(sock: impl AsRef<Path>, call_id: &str) -> Value {
+            fire_main_mcp_call_named(sock, call_id, "save_memory").await
+        }
+
+        async fn fire_main_mcp_call_named(
+            sock: impl AsRef<Path>,
+            call_id: &str,
+            name: &str,
+        ) -> Value {
             let stream = tokio::net::UnixStream::connect(sock).await.unwrap();
             let (r, mut w) = stream.into_split();
             let mut line = serde_json::to_vec(&serde_json::json!({
-                "name": "save_memory",
+                "name": name,
                 "args": {"text": "hello"},
                 "tool_use_id": call_id
             }))
@@ -4526,7 +4719,7 @@ mod adapter {
 
         #[tokio::test]
         async fn main_mcp_sync_call_parks_then_resolves_on_tool_result() {
-            let (sock, results, parked, mut evt_rx) = spawn_main_mcp_server().await;
+            let (sock, results, parked, mut evt_rx, _deferred) = spawn_main_mcp_server().await;
             let call_sock = sock.clone();
             let call =
                 tokio::spawn(async move { fire_main_mcp_call(&call_sock, "toolu_sync").await });
@@ -4567,7 +4760,7 @@ mod adapter {
 
         #[tokio::test]
         async fn main_mcp_refire_consumes_result_in_hand_immediately() {
-            let (sock, results, _parked, mut evt_rx) = spawn_main_mcp_server().await;
+            let (sock, results, _parked, mut evt_rx, _deferred) = spawn_main_mcp_server().await;
             results
                 .lock()
                 .await
@@ -4582,6 +4775,128 @@ mod adapter {
                 evt_rx.try_recv().is_err(),
                 "the re-fire must not emit a duplicate ToolCallRequested"
             );
+            let _ = tokio::fs::remove_file(sock).await;
+        }
+
+        /// ADR 0107 on the injected path: a rejected plan is an INSTRUCTION.
+        /// The stash keeps the canonical decision JSON; the serve converts.
+        #[tokio::test]
+        async fn main_mcp_serves_plan_reject_as_revision_instruction() {
+            let (sock, results, _parked, mut evt_rx, deferred) = spawn_main_mcp_server().await;
+            deferred.lock().await.insert(
+                "toolu_plan".into(),
+                hook_server::DeferredCall {
+                    run_id: "run-old".into(),
+                    tool_name: "exit_plan_mode".into(),
+                },
+            );
+            results.lock().await.insert(
+                "toolu_plan".into(),
+                r#"{"decision":"reject","feedback":"add tests"}"#.into(),
+            );
+            let response = fire_main_mcp_call_named(&sock, "toolu_plan", "exit_plan_mode").await;
+            let text = response["result_json"].as_str().unwrap();
+            assert!(text.contains("add tests"), "feedback rides: {text}");
+            assert!(
+                text.contains("call exit_plan_mode again"),
+                "the revision ask rides: {text}"
+            );
+            assert!(
+                !text.contains(r#"{"decision""#),
+                "raw decision JSON is not the message: {text}"
+            );
+            assert!(results.lock().await.is_empty(), "stash consumed");
+            assert!(deferred.lock().await.is_empty(), "ledger cleared");
+            assert!(
+                evt_rx.try_recv().is_err(),
+                "an exact-id serve needs no extra completion event"
+            );
+            let _ = tokio::fs::remove_file(sock).await;
+        }
+
+        /// The by-tool retarget on the injected path (session 5661c75f's
+        /// class): a respawned CLI minted a NEW id for the same plan, so the
+        /// exact-id lookup misses. The serve must consume the old stash, ack
+        /// the OLD call id (its outbox row would redeliver forever), and not
+        /// park a duplicate.
+        #[tokio::test]
+        async fn main_mcp_retargets_plan_stash_to_new_call_id_and_acks_old() {
+            let (sock, results, parked, mut evt_rx, deferred) = spawn_main_mcp_server().await;
+            deferred.lock().await.insert(
+                "toolu_old".into(),
+                hook_server::DeferredCall {
+                    run_id: "run-old".into(),
+                    tool_name: "exit_plan_mode".into(),
+                },
+            );
+            results.lock().await.insert(
+                "toolu_old".into(),
+                r#"{"decision":"reject","feedback":"tighten scope"}"#.into(),
+            );
+            let response = fire_main_mcp_call_named(&sock, "toolu_new", "exit_plan_mode").await;
+            let text = response["result_json"].as_str().unwrap();
+            assert!(text.contains("tighten scope"), "feedback rides: {text}");
+            match evt_rx.recv().await {
+                Some(HarnessEvent::ToolCallCompleted {
+                    tool_call_id,
+                    tool_name,
+                    ok,
+                    ..
+                }) => {
+                    assert_eq!(tool_call_id, "toolu_old");
+                    assert_eq!(tool_name, "exit_plan_mode");
+                    assert!(!ok, "changes-requested is not a success");
+                }
+                other => panic!("expected the old id's completion ack, got {other:?}"),
+            }
+            assert!(results.lock().await.is_empty(), "stash consumed");
+            assert!(deferred.lock().await.is_empty(), "ledger cleared");
+            assert!(parked.lock().await.is_empty(), "no duplicate park");
+            let _ = tokio::fs::remove_file(sock).await;
+        }
+
+        /// AUQ deliberately does NOT retarget (a mis-answer risk): a new id
+        /// with only a same-tool stash parks as a fresh request.
+        #[tokio::test]
+        async fn main_mcp_never_retargets_question_stash_to_a_new_id() {
+            let (sock, results, parked, mut evt_rx, deferred) = spawn_main_mcp_server().await;
+            deferred.lock().await.insert(
+                "toolu_q_old".into(),
+                hook_server::DeferredCall {
+                    run_id: "run-old".into(),
+                    tool_name: "ask_user_question".into(),
+                },
+            );
+            results
+                .lock()
+                .await
+                .insert("toolu_q_old".into(), r#"{"Pick":["red"]}"#.into());
+            let call_sock = sock.clone();
+            let call = tokio::spawn(async move {
+                fire_main_mcp_call_named(&call_sock, "toolu_q_new", "ask_user_question").await
+            });
+            match evt_rx.recv().await {
+                Some(HarnessEvent::ToolCallRequested { call_id, name, .. }) => {
+                    assert_eq!(call_id, "toolu_q_new");
+                    assert_eq!(name, "ask_user_question");
+                }
+                other => panic!("expected a fresh ToolCallRequested, got {other:?}"),
+            }
+            assert!(
+                results.lock().await.contains_key("toolu_q_old"),
+                "the old answer stash is untouched"
+            );
+            assert!(
+                mcp_server::route_tool_result(
+                    "toolu_q_new",
+                    r#"{"Pick":["blue"]}"#.into(),
+                    &parked,
+                    &results,
+                )
+                .await,
+                "the new call resolves only with its own answer"
+            );
+            assert_eq!(call.await.unwrap()["result_json"], r#"{"Pick":["blue"]}"#);
             let _ = tokio::fs::remove_file(sock).await;
         }
 
@@ -6628,6 +6943,47 @@ mod adapter {
             );
             assert!(pending.lock().await.is_empty());
             assert!(evt_rx.try_recv().is_err());
+            let _ = tokio::fs::remove_file(sock).await;
+        }
+
+        /// The hook half of the exit_plan_mode by-tool retarget: a NEW id
+        /// with only a same-tool stash must be allowed through to the MCP
+        /// bridge (which serves the retargeted stash), not deferred into a
+        /// duplicate plan card.
+        #[tokio::test]
+        async fn hook_allows_plan_refire_under_new_id_via_same_tool_stash() {
+            let manifest = vec![generic_tool("exit_plan_mode", ToolExecution::Deferred)];
+            let (sock, results, pending, mut evt_rx, _duplicates, _run_id) =
+                spawn_manifest_hook_server(manifest).await;
+            pending.lock().await.insert(
+                "toolu_old_plan".into(),
+                hook_server::DeferredCall {
+                    run_id: "run-old".into(),
+                    tool_name: "exit_plan_mode".into(),
+                },
+            );
+            results.lock().await.insert(
+                "toolu_old_plan".into(),
+                r#"{"decision":"reject","feedback":"split the phases"}"#.into(),
+            );
+            assert!(matches!(
+                hook_fire_named(
+                    &sock,
+                    "toolu_new_plan",
+                    "mcp__engrams__exit_plan_mode",
+                    serde_json::json!({"plan":"# revised"}),
+                )
+                .await,
+                hook_server::HookVerdict::Allow
+            ));
+            assert!(
+                results.lock().await.contains_key("toolu_old_plan"),
+                "the stash stays for the bridge to consume"
+            );
+            assert!(
+                evt_rx.try_recv().is_err(),
+                "no duplicate ToolCallRequested for the re-fire"
+            );
             let _ = tokio::fs::remove_file(sock).await;
         }
 
