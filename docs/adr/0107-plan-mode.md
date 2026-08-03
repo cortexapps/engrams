@@ -348,6 +348,28 @@ What changed for claude, relative to the table in §3:
   and end-to-end in a real VM. If the injected set grows large, switch to
   per-tool `_meta["anthropic/alwaysLoad"]` in the bridge's `tools/list` so
   only the built-in replacements stay resident.
+- **Approve now rides the stash→serve rail too (2026-08-03, follow-on fix).**
+  The §3 table's approve path was "engine-owned": flip the stamp, respawn, and
+  inject a fresh "your plan was approved" user turn + an explicit
+  `ToolCallCompleted` — deliberately NEVER stashing a result, because the
+  *native* `ExitPlanMode` does not re-fire on a default-mode resume (spike
+  finding 5). The INJECTED `exit_plan_mode` breaks that assumption: like every
+  deferred MCP tool it DOES re-fire id-stable on `--resume`. So the engine-owned
+  approve produced a **duplicate plan card** (the un-stashed re-fire got
+  re-deferred) and the session **parked instead of building** (session
+  f9222d41). Fix: approve is no longer special — it stashes its result and
+  flips the stamp to build, exactly like reject stashes and keeps plan; the
+  id-stable re-fire is served the rendered instruction. `render_result_for_model`
+  and the tier-2 `fallback_delivery_message` both now render a decision via the
+  shared `plan::decision_message` (approve → `APPROVED_MESSAGE` "implement it
+  now", reject → `changes_requested_message`). The engine-owned
+  `pending_plan_approvals` machinery and its startup branch are deleted.
+  Verified end-to-end in a real VM: approve → one `exit_plan_mode` request
+  (no duplicate), continuation turn writes the file, `run_completed`. The
+  lesson for the tests: the plan engine tests used the *native* binding, which
+  is precisely why the injected-path re-fire bug slipped through — they now use
+  the injected tool and assert the re-fire is allowed and served, not
+  re-deferred.
 
 The native-binding mechanism itself (manifest-driven, ADR 0089 §6) stays: the
 codex `requestUserInput` binding still uses it, and a future harness with a
