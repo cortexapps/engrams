@@ -1643,6 +1643,16 @@ impl HostAgent {
             // "not configured" and the survivors uncapturable.
             #[cfg(target_os = "linux")]
             disk_daemon::enter_shutdown_abandon_mode();
+            // 2026-08-03 `chain_poisoned` alert: quiesce captures with the
+            // same raise-first urgency. From here no capture may START —
+            // one that did would consume the KVM dirty bitmap and then die
+            // in the runtime teardown, poisoning its checkpoint chain (the
+            // surviving VM pays a FULL re-chunk under the successor). The
+            // periodic driver task is deliberately NOT aborted: an abort
+            // cancels an in-flight capture at an await point, which is the
+            // exact post-bitmap failure this quiesce exists to prevent.
+            // In-flight captures are drained (bounded) below instead.
+            pooled.quiesce_captures_for_shutdown();
             heartbeat_task.abort();
             if let Some(t) = grpc_task {
                 t.abort();
@@ -1711,7 +1721,33 @@ impl HostAgent {
                     std::env::var("ENGRAM_SHUTDOWN_FLUSH_BUDGET_SECS")
                         .ok()
                         .and_then(|v| v.parse::<f64>().ok()),
+                    std::env::var("ENGRAM_SHUTDOWN_CAPTURE_DRAIN_BUDGET_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<f64>().ok()),
                 );
+                // CaptureDrain stage (2026-08-03 `chain_poisoned` alert):
+                // wait — bounded — for any capture already past FC's
+                // snapshot create. Its post-processing (sparse re-chunk,
+                // upload, chain-head persist) must complete BEFORE this
+                // process exits, or the consumed dirty bitmap is
+                // unrecoverable and the chain poisons. Runs before the
+                // final flush: a capture holds its guest's pause/flush
+                // path, and the flush pass below wants quiesced planes.
+                // Unwind-isolated like the other rungs — a panic here must
+                // still reach the abandon sweep + spool export.
+                let stragglers = shutdown_stage_unwind_isolated(
+                    "capture_drain",
+                    pooled.drain_captures_for_shutdown(plan.capture_drain_deadline),
+                )
+                .await
+                .unwrap_or(0);
+                if stragglers > 0 {
+                    tracing::warn!(
+                        stragglers,
+                        "SIGTERM: captures still in flight at the capture-drain \
+                         deadline; their chains will poison at process exit",
+                    );
+                }
                 // 2026-08-02 durability-rollback RCA: the flush pass is
                 // best-effort GCS durability; the abandon sweep + spool
                 // export below are the survivors' correctness backstop. A
