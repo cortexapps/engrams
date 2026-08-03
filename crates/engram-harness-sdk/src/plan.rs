@@ -46,6 +46,25 @@ pub fn changes_requested_message(decision: &PlanDecision) -> String {
     )
 }
 
+/// What an APPROVED plan says to the model. Delivered as the `exit_plan_mode`
+/// tool result on the id-stable re-fire (the injected tool re-fires like any
+/// deferred MCP tool — unlike the old native binding), so it must be an
+/// imperative to build, not a bare "approved". Symmetric with
+/// `changes_requested_message`.
+pub const APPROVED_MESSAGE: &str =
+    "Your plan was approved. Implement it now, following the plan you presented.";
+
+/// Render an `exit_plan_mode` decision as the instruction the model reads, on
+/// every delivery path (the claude bridge serve on re-fire, the tier-2 fallback
+/// user message). Approve → build; reject → revise.
+pub fn decision_message(decision: &PlanDecision) -> String {
+    if decision.approved() {
+        APPROVED_MESSAGE.to_string()
+    } else {
+        changes_requested_message(decision)
+    }
+}
+
 pub fn parse_plan_decision(result_json: &str) -> Option<PlanDecision> {
     serde_json::from_str::<PlanDecision>(result_json)
         .ok()
@@ -74,5 +93,22 @@ mod tests {
     fn empty_feedback_gets_the_generic_ask() {
         let reject = parse_plan_decision(r#"{"decision":"reject","feedback":"  "}"#).unwrap();
         assert!(reject.reject_reason().contains("Revise the plan"));
+    }
+
+    #[test]
+    fn decision_message_is_build_for_approve_and_revise_for_reject() {
+        let approve = parse_plan_decision(r#"{"decision":"approve"}"#).unwrap();
+        let msg = decision_message(&approve);
+        assert_eq!(msg, APPROVED_MESSAGE);
+        assert!(msg.contains("Implement it now"), "approve → build: {msg}");
+
+        let reject =
+            parse_plan_decision(r#"{"decision":"reject","feedback":"add tests"}"#).unwrap();
+        let msg = decision_message(&reject);
+        assert!(msg.contains("add tests"));
+        assert!(
+            msg.contains("call exit_plan_mode again"),
+            "reject → revise: {msg}"
+        );
     }
 }

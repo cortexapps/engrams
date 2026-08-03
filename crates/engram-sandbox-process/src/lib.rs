@@ -830,6 +830,18 @@ async fn spawn_agent(
     // prepend the cwd-local bin dir so `engram-share`/`git-askpass` resolve.
     env.entry("HOME".into())
         .or_insert_with(|| cwd.join("root").to_string_lossy().into_owned());
+    // A harness derives its whole per-session state (sockets, generated agent
+    // config, resume stamps) from this root, whose default is the fixed in-VM
+    // path. This backend has no guest, so every sandbox on the host — and any
+    // engrams session the dev stack itself runs inside — would otherwise share
+    // that ONE directory: sandbox B unlinks and rebinds sandbox A's live hook
+    // socket. Root it in the sandbox dir, which is also what snapshot/restore
+    // carries.
+    // (`ENGRAM_STATE_DIR` is the harness-side contract —
+    // `engram_harness_sdk::state`; named here as a literal, like every other
+    // guest env this backend fills in.)
+    env.entry("ENGRAM_STATE_DIR".into())
+        .or_insert_with(|| cwd.join(".engrams").to_string_lossy().into_owned());
     let local_bin = cwd.join("usr/local/bin");
     let local_bin = local_bin.to_string_lossy();
     match env.get("PATH") {
@@ -1501,7 +1513,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_google_adc_without_metadata_interception() {
+    async fn rejects_metadata_delivery_without_interception() {
+        use engram_core::types::integration::MetadataFlavor;
         let (backend, _dir) = backend();
         let error = backend
             .notify_session_policy(SessionEgressPolicy {
@@ -1514,15 +1527,20 @@ mod tests {
                 secrets: Vec::new(),
                 injects: Vec::new(),
                 observes: Vec::new(),
-                google_adc: true,
+                metadata_flavor: Some(MetadataFlavor::Gce),
                 secret_mode: SecretMode::Broker,
             })
             .await
-            .expect_err("Process must reject Google ADC without metadata interception");
+            .expect_err("Process must reject a metadata flavor it cannot intercept");
 
-        assert!(error
-            .to_string()
-            .contains("requires host egress metadata interception"));
+        // The refusal names the flavor, so a second cloud's failure is not
+        // reported as Google's.
+        let message = error.to_string();
+        assert!(message.contains("Gce"), "{message}");
+        assert!(
+            message.contains("requires host egress interception"),
+            "{message}"
+        );
     }
 
     fn durable_exec(exec_id: &str, argv: &[&str]) -> ExecRequest {

@@ -60,9 +60,17 @@ import {
 import {
   defaultConnectionGrants,
   grantsToCapabilities,
+  integrationSnapshotHash,
   resolveIntegrationGrants,
+  withConnectionMemo,
 } from "../integrations/grants.ts";
-import { appendGooglePolicy } from "../integrations/google-policy.ts";
+import {
+  compileProviderPolicy,
+  providerCliSurfaces,
+  providerGuestBundles,
+  providerGuestEnv,
+  providerMetadataFlavor,
+} from "../integrations/providers/index.ts";
 
 const log = rootLog.child({ component: "task" });
 
@@ -377,21 +385,19 @@ export async function compileSessionCreateInput(
     }
   }
   const registry = await loadRegistry(deps.connectors);
-  const resolvedProfileGrants = await resolveIntegrationGrants(
-    profile.integrationGrants,
-    deps.connections,
-  );
-  const profileCapabilities = grantsToCapabilities(resolvedProfileGrants);
+  // One memo per create: every grant-resolution step below reuses the rows the
+  // first step fetched, so a create resolves each connection id exactly once.
+  const connections = withConnectionMemo(deps.connections);
   const overrideGrants = await defaultConnectionGrants(
     opts.capabilityOverride ?? opts.extraCapabilities ?? [],
-    deps.connections,
+    connections,
   );
   const effectiveGrants = opts.capabilityOverride !== undefined
     ? overrideGrants
     : [...profile.integrationGrants, ...overrideGrants];
   const resolvedEffectiveGrants = await resolveIntegrationGrants(
     effectiveGrants,
-    deps.connections,
+    connections,
   );
   const disabledConnection = resolvedEffectiveGrants.find(({ connection }) => !connection.enabled);
   if (disabledConnection) {
@@ -400,26 +406,24 @@ export async function compileSessionCreateInput(
       Code.FailedPrecondition,
     );
   }
-  const hasGoogleCloud = resolvedEffectiveGrants.some(({ connection }) => connection.provider === "gcp");
   const capabilities = grantsToCapabilities(resolvedEffectiveGrants);
   // A capability override is the complete session authority and therefore
   // also owns its CLI/tool surface. Without one, preserve the narrower
   // profile-owned surface: extra integration grants do not add model tools.
+  // The profile-only resolution is LAZY: under an override it never runs (its
+  // result would be unused), and without one the memo makes it query-free
+  // (profile grants are a subset of the effective grants resolved above).
   const surfacedCapabilities = opts.capabilityOverride !== undefined
     ? capabilities
-    : profileCapabilities;
+    : grantsToCapabilities(await resolveIntegrationGrants(profile.integrationGrants, connections));
   const cliPlan = compileCliIntegrations(surfacedCapabilities, registry);
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
+  // Connector-backed CLIs, then the ones a named connection makes usable. The
+  // second list comes from the provider registry, so a new provider surfaces
+  // its CLI without a branch here.
   const enabledCli = [
     ...cliPlan.enabled,
-    ...(hasGoogleCloud
-      ? [{
-          provider: "gcp",
-          displayName: "Google Cloud",
-          bins: ["gcloud"],
-          doc: "Use brokered metadata ADC. Do not log in or create credentials.",
-        }]
-      : []),
+    ...providerCliSurfaces(resolvedEffectiveGrants),
   ];
   if (enabledCli.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(enabledCli);
   const toolManifest = compileToolManifest(
@@ -459,18 +463,13 @@ export async function compileSessionCreateInput(
   // ADR 0097: the browser bundle carries a local image-observation tool. It
   // is harness-native (not a connector capability) and is enabled only when
   // the corresponding skill is mounted into this session.
-  if (hasGoogleCloud) {
-    harness.GCE_METADATA_HOST = "169.254.169.254";
-    harness.GCE_METADATA_IP = "169.254.169.254";
-    // The Cloud SDK uses GCE_METADATA_ROOT while google-auth uses
-    // GCE_METADATA_HOST. Point both clients at the session-local emulator.
-    harness.GCE_METADATA_ROOT = "169.254.169.254";
-    harness.CLOUDSDK_CORE_CHECK_GCE_METADATA = "true";
-  }
+  // Where a guest looks for each present provider's credential. The values
+  // come from the provider itself, so a new one needs no branch here.
+  Object.assign(harness, providerGuestEnv(resolvedEffectiveGrants));
   const selectedSkills = [...new Set([
     ...profile.skills,
     ...cliPlan.bundles,
-    ...(hasGoogleCloud ? ["integrations-cli"] : []),
+    ...providerGuestBundles(resolvedEffectiveGrants),
   ])];
   if (selectedSkills.includes("browser")) harness.ENGRAM_BROWSER_VIEW_ENABLED = "1";
   else delete harness.ENGRAM_BROWSER_VIEW_ENABLED;
@@ -508,8 +507,10 @@ export async function compileSessionCreateInput(
     };
     policy.secrets.push(secret);
   }
-  appendGooglePolicy(policy, resolvedEffectiveGrants);
-  policy.google_adc = hasGoogleCloud;
+  compileProviderPolicy(policy, resolvedEffectiveGrants);
+  // The host proxy serves a metadata endpoint only for a provider that
+  // delivers its credential that way.
+  policy.metadata_flavor = providerMetadataFlavor(resolvedEffectiveGrants) ?? null;
   // ADR 0063 B4: a programmatic task (cron / Slack / API) authenticates the
   // harness with the ORG credential, not a per-user token. The org-secret value
   // never leaves the coordinator (ADR 0057), so we can't read it here — instead
@@ -637,6 +638,11 @@ export interface CreateSessionForExistingTaskParams {
   prompt?: string;
   /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
   harnessMode?: string;
+  /** ADR 0063 B2: per-session override of the profile's harness / model / effort
+   *  (an automation's stored selection). Unset = the profile's default. */
+  harness?: string;
+  model?: string;
+  effort?: string;
   extraCapabilities?: readonly string[];
   capabilityOverride?: readonly string[];
   networkOverride?: ProfileNetwork;
@@ -734,6 +740,9 @@ export async function createSessionForExistingTask(
       ...(params.ownerUserId === undefined ? { programmatic: true } : {}),
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
       ...(params.harnessMode != null ? { harnessMode: params.harnessMode } : {}),
+      ...(params.harness != null ? { harness: params.harness } : {}),
+      ...(params.model != null ? { model: params.model } : {}),
+      ...(params.effort != null ? { effort: params.effort } : {}),
       ...(params.extraCapabilities ? { extraCapabilities: params.extraCapabilities } : {}),
       ...(params.capabilityOverride !== undefined
         ? { capabilityOverride: params.capabilityOverride }
@@ -764,14 +773,21 @@ export async function createSessionForExistingTask(
       capabilities: sessionInput.capabilities ?? [],
       integrationGrants: sessionInput.integrationGrants ?? [],
       integrationConnections: sessionInput.integrationConnections ?? [],
+      integrationSnapshotHash: integrationSnapshotHash({
+        profileId: profile.id,
+        integrationGrants: sessionInput.integrationGrants ?? [],
+        integrationConnections: sessionInput.integrationConnections ?? [],
+      }),
       ...(integrationPrincipalId ? { integrationPrincipalId } : {}),
     });
   });
 
+  let createdSessionId: string | undefined;
   try {
     // When prompt is omitted (as it is for the finder), the session boots idle
     // so deterministic bootstrap can finish before SendPrompt wakes it.
     const created = await deps.sessions.createSession(sessionInput);
+    createdSessionId = created.sessionId;
     if (created.sessionId !== sessionId) {
       throw new Error("coordinator returned a different reserved session ID");
     }
@@ -781,19 +797,29 @@ export async function createSessionForExistingTask(
       });
     }
   } catch (err) {
+    // Compensation must never mask the original failure: guard every step and
+    // log what it could not undo. On an ID mismatch, the session that leaks is
+    // the one the coordinator ACTUALLY created, so delete that one.
     try {
-      await deps.sessions.deleteSession({ sessionId });
+      await deps.sessions.deleteSession({ sessionId: createdSessionId ?? sessionId });
     } catch (delErr) {
       log.error(
-        { sessionId, err: delErr },
-        "task-create: failed to delete reserved session after create failure",
+        { sessionId: createdSessionId ?? sessionId, err: delErr },
+        "task-create: failed to delete session after create failure",
       );
     }
-    await deps.db.transaction(async (tx) => {
-      await tx
-        .delete(taskSessionTable)
-        .where(and(eq(taskSessionTable.taskId, params.taskId), eq(taskSessionTable.sessionId, sessionId)));
-    });
+    try {
+      await deps.db.transaction(async (tx) => {
+        await tx
+          .delete(taskSessionTable)
+          .where(and(eq(taskSessionTable.taskId, params.taskId), eq(taskSessionTable.sessionId, sessionId)));
+      });
+    } catch (dbErr) {
+      log.error(
+        { taskId: params.taskId, sessionId, err: dbErr },
+        "task-create: failed to remove task_session after create failure — manual cleanup needed",
+      );
+    }
     throw err;
   }
 
@@ -890,6 +916,11 @@ export async function createTaskWithSession(
       capabilities: sessionInput.capabilities ?? [],
       integrationGrants: sessionInput.integrationGrants ?? [],
       integrationConnections: sessionInput.integrationConnections ?? [],
+      integrationSnapshotHash: integrationSnapshotHash({
+        profileId: profile.id,
+        integrationGrants: sessionInput.integrationGrants ?? [],
+        integrationConnections: sessionInput.integrationConnections ?? [],
+      }),
       integrationPrincipalId: params.ownerUserId,
     });
     if (params.slackThreadWorkflowId !== undefined) {
@@ -900,8 +931,10 @@ export async function createTaskWithSession(
     }
   });
 
+  let createdSessionId: string | undefined;
   try {
     const created = await deps.sessions.createSession(sessionInput);
+    createdSessionId = created.sessionId;
     if (created.sessionId !== sessionId) {
       throw new Error("coordinator returned a different reserved session ID");
     }
@@ -909,17 +942,30 @@ export async function createTaskWithSession(
       await tx.insert(sessionListenerTable).values({ sessionId });
     });
   } catch (err) {
+    // Compensation must never mask the original failure: guard every step and
+    // log what it could not undo. On an ID mismatch, the session that leaks is
+    // the one the coordinator ACTUALLY created, so delete that one.
     try {
-      await deps.sessions.deleteSession({ sessionId });
+      await deps.sessions.deleteSession({ sessionId: createdSessionId ?? sessionId });
     } catch (delErr) {
       log.error(
-        { sessionId, err: delErr },
-        "task-create: failed to delete reserved session after create failure",
+        { sessionId: createdSessionId ?? sessionId, err: delErr },
+        "task-create: failed to delete session after create failure",
       );
     }
-    await deps.db.transaction(async (tx) => {
-      await tx.delete(taskTable).where(eq(taskTable.id, taskId));
-    });
+    try {
+      await deps.db.transaction(async (tx) => {
+        // slack_session has no FK to the task model; the task delete cascades
+        // task_session only, so remove the Slack binding explicitly.
+        await tx.delete(slackSessionTable).where(eq(slackSessionTable.sessionId, sessionId));
+        await tx.delete(taskTable).where(eq(taskTable.id, taskId));
+      });
+    } catch (dbErr) {
+      log.error(
+        { taskId, sessionId, err: dbErr },
+        "task-create: failed to remove task records after create failure — manual cleanup needed",
+      );
+    }
     throw err;
   }
 

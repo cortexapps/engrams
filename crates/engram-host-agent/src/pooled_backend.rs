@@ -402,6 +402,24 @@ impl Drop for CaptureUnwind {
     }
 }
 
+/// One quarantined survivor's record (2026-08-02 durability-rollback
+/// RCA): everything the rehydrate retry pass needs to re-attempt the
+/// failed re-serve, keyed by sandbox in `quarantined_survivors`. The
+/// retry-only fields are read by the Linux-gated retry pass; macOS
+/// builds see only the heartbeat accessor's `session_id` read.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Debug)]
+struct QuarantinedSurvivor {
+    session_id: SessionId,
+    /// The disk manifest ref the failed rehydrate attached from — the
+    /// coordinator's effective ref at register time. It cannot advance
+    /// while the disk is unserved (nothing publishes), so the retry
+    /// reuses it verbatim.
+    disk_manifest: engram_core::types::manifest::ManifestRef,
+    /// Retry attempts so far — log pacing only.
+    retry_attempts: u64,
+}
+
 /// Wraps an inner [`SandboxBackend`] (FC or VZ) with host-side
 /// resource resolution: image cache, chunk store, materialize-to-
 /// file, optional NBD daemon, optional egress proxy.
@@ -446,9 +464,12 @@ pub struct PooledBackend {
     session_bindings: Arc<DashMap<SandboxId, SessionId>>,
     /// ADR 0090: survivors whose NBD slot this generation quarantined
     /// (rehydrate `RECONFIGURE` failed). Advertised in every heartbeat
-    /// until the sandbox is destroyed; the coordinator drives
-    /// `evict_local → resume` off it.
-    quarantined_survivors: Arc<DashMap<SandboxId, SessionId>>,
+    /// until the sandbox is destroyed or the rehydrate retry pass
+    /// (2026-08-02 durability-rollback RCA) re-serves the disk; the
+    /// coordinator drives `evict_local → resume` off it. The record
+    /// carries what the retry needs: the manifest ref the failed
+    /// rehydrate used and an attempt counter for log pacing.
+    quarantined_survivors: Arc<DashMap<SandboxId, QuarantinedSurvivor>>,
     /// ADR 0091: guests whose control plane stopped answering (3/3
     /// socket probes refused after a checkpoint failure). Advertised in
     /// every heartbeat until cleared by a successful capture or destroy;
@@ -689,6 +710,18 @@ pub struct PooledBackend {
     /// abandon contract exists only where NBD data planes do.
     #[cfg(target_os = "linux")]
     abandoning: Arc<std::sync::atomic::AtomicBool>,
+    /// 2026-08-03 `chain_poisoned` alert: SIGTERM capture quiesce. Raised
+    /// (SeqCst, never lowered) as the first act of the shutdown ladder.
+    /// `capture_phase` checks it under the capture lock, BEFORE the
+    /// write-ahead invalidate and the FC `PUT /snapshot/create` — i.e.
+    /// before anything is consumed — and refuses: a capture that starts
+    /// after SIGTERM walks straight into the runtime teardown, fails
+    /// mid-post-processing with the dirty bitmap already consumed, and
+    /// poisons its checkpoint chain (the surviving VM then pays a FULL
+    /// re-chunk under the successor). Captures already past the gate are
+    /// waited for by `drain_captures_for_shutdown`. Unlike `abandoning`
+    /// this is not Linux-gated — captures exist on every backend.
+    captures_quiesced: Arc<std::sync::atomic::AtomicBool>,
     /// Issue #225: the coord client + host id used to SYNCHRONOUSLY
     /// publish a survivor's freshly-flushed `live_disk_manifest`
     /// during the SIGTERM final-flush pass. The normal flush path
@@ -1872,6 +1905,7 @@ impl PooledBackend {
             migration_roles: Arc::new(DashMap::new()),
             #[cfg(target_os = "linux")]
             abandoning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            captures_quiesced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_manifest_publish: None,
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             host_fs: Arc::new(engram_host_core::TokioFs),
@@ -1995,6 +2029,67 @@ impl PooledBackend {
     /// and skips outright; the next tick retries regardless.
     pub fn capture_in_flight(&self, id: SandboxId) -> bool {
         self.capture_lock(id).try_lock().is_err()
+    }
+
+    /// 2026-08-03 `chain_poisoned` alert: refuse to START any new capture
+    /// from here on (see the `captures_quiesced` field doc). Called at
+    /// SIGTERM before the shutdown ladder; sticky for the process
+    /// lifetime.
+    pub fn quiesce_captures_for_shutdown(&self) {
+        self.captures_quiesced
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the SIGTERM capture quiesce is in effect. The periodic
+    /// driver skips its pass outright on `true`; `capture_phase` holds
+    /// the authoritative check under the capture lock.
+    pub fn captures_quiesced(&self) -> bool {
+        self.captures_quiesced
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The SIGTERM ladder's CaptureDrain stage: wait (bounded by
+    /// `deadline`, shared across all sandboxes) for every in-flight
+    /// capture to complete, so a diff capture that already consumed the
+    /// KVM dirty bitmap finishes its post-processing and persists its
+    /// chain-head record BEFORE the process exit cancels its tasks and
+    /// poisons the chain. Callers must raise the quiesce flag first —
+    /// a lock this drain acquires and releases would otherwise admit a
+    /// fresh capture into the teardown window. Returns the number of
+    /// stragglers (captures still running at the deadline); each will
+    /// poison its chain at exit, exactly as before this stage existed.
+    pub async fn drain_captures_for_shutdown(&self, deadline: std::time::Duration) -> usize {
+        let start = crate::time_source::metrics_now_tokio();
+        // Snapshot the lock set; the quiesce flag guarantees no NEW
+        // capture can begin, so entries added after this point are
+        // uncontended.
+        let locks: Vec<(SandboxId, Arc<tokio::sync::Mutex<()>>)> = self
+            .capture_locks
+            .iter()
+            .map(|e| (*e.key(), Arc::clone(e.value())))
+            .collect();
+        let mut stragglers = 0usize;
+        for (id, lock) in locks {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            match tokio::time::timeout(remaining, lock.lock()).await {
+                // Acquiring proves no capture holds the lock; release
+                // immediately (the quiesce flag keeps it that way).
+                Ok(_guard) => {}
+                Err(_) => {
+                    stragglers += 1;
+                    ::metrics::counter!(crate::metrics::CAPTURE_SHUTDOWN_STRAGGLER_TOTAL)
+                        .increment(1);
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        deadline_secs = deadline.as_secs_f64(),
+                        "capture still in flight at the shutdown capture-drain \
+                         deadline; process exit will poison its checkpoint chain \
+                         (next capture is a FULL snapshot)",
+                    );
+                }
+            }
+        }
+        stragglers
     }
 
     /// ADR 0028 Fix A: where un-acked durable checkpoint records live.
@@ -2215,6 +2310,21 @@ impl PooledBackend {
         let capture_guard = capture_lock.lock_owned().await;
         metrics::histogram!(crate::metrics::SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS)
             .record(lock_wait.elapsed().as_secs_f64());
+        // 2026-08-03 `chain_poisoned` alert: the SIGTERM capture-quiesce
+        // gate. Checked under the capture lock (so a capture queued
+        // behind the shutdown drain's acquire-and-release cannot slip
+        // past) and BEFORE the write-ahead invalidate below — nothing is
+        // consumed yet, so refusing here is free: the chain, its durable
+        // head record, and the guest all stay intact for the successor
+        // generation to capture.
+        if self.captures_quiesced() {
+            return Err(SandboxError::Snapshot(
+                "capture refused: host-agent is shutting down (SIGTERM capture \
+                 quiesce); nothing was consumed — the successor generation \
+                 captures next"
+                    .into(),
+            ));
+        }
         // Diff-mode when a checkpoint chain exists: same coherent
         // (memory, disk) capture contract, O(dirty set) cost. The
         // chain seeds on the first (Full) capture below — so an
@@ -3438,16 +3548,97 @@ impl PooledBackend {
 
     /// ADR 0090: the survivors whose NBD slots this generation
     /// quarantined (rehydrate `RECONFIGURE` failed) — re-advertised in
-    /// every heartbeat until the sandbox is destroyed, so the
-    /// coordinator drives the `evict_local → resume` remediation.
+    /// every heartbeat until the sandbox is destroyed or the rehydrate
+    /// retry pass re-serves the disk, so the coordinator drives the
+    /// `evict_local → resume` remediation.
     pub fn quarantined_survivors(&self) -> Vec<engram_protocol::heartbeat::QuarantinedSurvivor> {
         self.quarantined_survivors
             .iter()
             .map(|e| engram_protocol::heartbeat::QuarantinedSurvivor {
                 sandbox_id: *e.key(),
-                session_id: *e.value(),
+                session_id: e.value().session_id,
             })
             .collect()
+    }
+
+    /// 2026-08-02 durability-rollback RCA: one retry pass over the
+    /// quarantined survivors — re-attempt the failed rehydrate for each,
+    /// via [`Self::rehydrate_sandbox`]'s parked-slot reclaim. The
+    /// timer loop in `lib.rs` is a thin wrapper; this is the `run_once`
+    /// step (ADR 0098). Returns how many survivors were recovered.
+    ///
+    /// A recovered survivor leaves `quarantined_survivors` (its
+    /// heartbeat advertise stops) and serves reads/writes again; the
+    /// coordinator's parked quarantine op then captures + relocates it
+    /// cleanly on its next slow-lane attempt, with zero rollback. A
+    /// failed retry re-parks the slot and stays advertised; retries are
+    /// logged quietly after the first (a permanently de-configured
+    /// device — kernel "not configured" — never recovers by
+    /// RECONFIGURE, and the loud signal for that is the coordinator's
+    /// quarantine-stuck alert, not a per-tick WARN here).
+    #[cfg(target_os = "linux")]
+    pub async fn retry_quarantined_rehydrates_once(&self) -> usize {
+        let survivors: Vec<(SandboxId, QuarantinedSurvivor)> = self
+            .quarantined_survivors
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        let mut recovered = 0usize;
+        for (sandbox_id, q) in survivors {
+            let attempt = q.retry_attempts.saturating_add(1);
+            match self
+                .rehydrate_sandbox(q.session_id, sandbox_id, q.disk_manifest)
+                .await
+            {
+                Ok(true) => {
+                    // rehydrate_sandbox removed the map entry on success.
+                    recovered += 1;
+                    ::metrics::counter!(crate::metrics::QUARANTINE_REHYDRATE_RECOVERED_TOTAL)
+                        .increment(1);
+                    tracing::info!(
+                        %sandbox_id,
+                        session_id = %q.session_id,
+                        attempt,
+                        "quarantined survivor RECOVERED by the rehydrate retry pass; \
+                         disk re-served, heartbeat advertise stops",
+                    );
+                }
+                Ok(false) => {
+                    // Structural skip (no pool / already served / no
+                    // device) — nothing to retry against; leave the
+                    // entry for the destroy path to clear.
+                    if let Some(mut e) = self.quarantined_survivors.get_mut(&sandbox_id) {
+                        e.retry_attempts = attempt;
+                    }
+                }
+                Err(e) => {
+                    if let Some(mut entry) = self.quarantined_survivors.get_mut(&sandbox_id) {
+                        entry.retry_attempts = attempt;
+                    }
+                    // First failure at WARN; then every 20th (≈10 min at
+                    // the 30s cadence) to keep a dead device from
+                    // flooding the log.
+                    if attempt == 1 || attempt % 20 == 0 {
+                        tracing::warn!(
+                            %sandbox_id,
+                            session_id = %q.session_id,
+                            attempt,
+                            error = %e,
+                            "quarantined-survivor rehydrate retry failed; will keep \
+                             retrying (slot re-parked, survivor still advertised)",
+                        );
+                    } else {
+                        tracing::debug!(
+                            %sandbox_id,
+                            attempt,
+                            error = %e,
+                            "quarantined-survivor rehydrate retry failed",
+                        );
+                    }
+                }
+            }
+        }
+        recovered
     }
 
     /// ADR 0091: record a control-plane-dead guest (checkpoint driver's
@@ -4067,17 +4258,21 @@ impl PooledBackend {
         // session binding + does the synchronous coord publish itself.
         // Budget the WHOLE fan-out against `deadline` — a single
         // tokio::time::timeout around the join handles the per-sandbox
-        // parallelism + the global cap in one place. The JoinHandles
-        // deliberately live OUTSIDE the timed future: on overrun the
-        // tasks must be ABORTED, not merely no-longer-awaited (see the
-        // overrun arm below).
+        // parallelism + the global cap in one place. The `JoinSet`
+        // deliberately lives OUTSIDE the timed future: on overrun the
+        // tasks must be ABORTED, not merely no-longer-awaited (see
+        // `join_all_within`'s overrun arm). A `JoinSet`, NOT a
+        // `Vec<JoinHandle>`: `join_next` removes each task as it
+        // completes, so the overrun arm can never re-poll a handle the
+        // timed join already consumed (2026-08-02 RCA, see
+        // `join_all_within`).
         let publish = self.shutdown_manifest_publish.clone();
         let session_bindings = self.session_bindings.clone();
-        let mut tasks = Vec::with_capacity(entries.len());
+        let mut tasks = tokio::task::JoinSet::new();
         for (sandbox_id, backend, device) in entries {
             let publish = publish.clone();
             let session_id = session_bindings.get(&sandbox_id).map(|e| *e);
-            tasks.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 // 2026-07-16 RCA: FC's drive is buffered host I/O with
                 // cache_type=Unsafe, so guest-acked writes can still be
                 // sitting in the HOST page cache for /dev/nbdN — a tier
@@ -4189,41 +4384,11 @@ impl PooledBackend {
                          covers a same-node successor",
                     ),
                 }
-            }));
+            });
         }
-        let join_all = async {
-            for t in tasks.iter_mut() {
-                let _ = t.await;
-            }
-        };
 
-        let overran = tokio::time::timeout(deadline, join_all).await.is_err();
+        let overran = Self::join_all_within(&mut tasks, deadline).await;
         if overran {
-            // Deadline overrun: ABORT the in-flight flush tasks and reap
-            // each one before returning, so the abandon sweep that runs
-            // next can never race a still-live flush. Dropping the join
-            // future alone left the tokio::spawn'd flushes running
-            // DETACHED (2026-07-21 session-af28cac4 RCA): a detached
-            // final flush rebased + published v368 while the sweep's
-            // spool export had already snapshotted the dirty tier and
-            // then stamped the spool with the pre-rebase v367 head — the
-            // successor refused the behind-stamped spool per the
-            // `shutdown-spool-lineage-mismatch` gate and rolled the live
-            // guest's acked writes back under it. Aborting is safe at
-            // every await point in the flush pipeline: the manifest-ref
-            // rebase precedes the pending-tier drop, so a killed flush
-            // at worst leaves chunks to be exported redundantly
-            // (content-addressed, idempotent) or a store-ahead manifest
-            // the adopt gate's `>=` arm already covers. The almost-done
-            // upload's progress is forfeit — acceptable: those bytes
-            // ride the spool instead, which is what the post-deadline
-            // grace headroom exists for.
-            for t in &tasks {
-                t.abort();
-            }
-            for t in tasks.iter_mut() {
-                let _ = t.await;
-            }
             // Some survivors were not GCS-flushed in time. This is not a
             // data-loss event: the abandon sweep that runs next exports
             // every still-dirty tier to the node-local shutdown spool
@@ -4259,6 +4424,56 @@ impl PooledBackend {
                 }
             }
         }
+    }
+
+    /// Await every flush task in `tasks` within `deadline`; return `true`
+    /// on overrun. On overrun, ABORT the still-running tasks and reap
+    /// each one before returning, so the abandon sweep that runs next
+    /// can never race a still-live flush. Dropping the join future
+    /// alone left the tokio::spawn'd flushes running DETACHED
+    /// (2026-07-21 session-af28cac4 RCA): a detached final flush
+    /// rebased + published v368 while the sweep's spool export had
+    /// already snapshotted the dirty tier and then stamped the spool
+    /// with the pre-rebase v367 head — the successor refused the
+    /// behind-stamped spool per the `shutdown-spool-lineage-mismatch`
+    /// gate and rolled the live guest's acked writes back under it.
+    /// Aborting is safe at every await point in the flush pipeline:
+    /// the manifest-ref rebase precedes the pending-tier drop, so a
+    /// killed flush at worst leaves chunks to be exported redundantly
+    /// (content-addressed, idempotent) or a store-ahead manifest the
+    /// adopt gate's `>=` arm already covers. The almost-done upload's
+    /// progress is forfeit — acceptable: those bytes ride the spool
+    /// instead, which is what the post-deadline grace headroom exists
+    /// for.
+    ///
+    /// A `JoinSet`, NOT a `Vec<JoinHandle>` (2026-08-02 durability-
+    /// rollback RCA): the old shape re-awaited EVERY handle in the
+    /// overrun arm, including the ones the timed join had already
+    /// polled to completion — and a completed `JoinHandle` PANICS on
+    /// its next poll ("JoinHandle polled after completion"). So a
+    /// deadline overrun with at least one finished flush panicked the
+    /// SIGTERM path between the flush pass and the abandon sweep:
+    /// process unwind ran `NbdHandle::Drop`'s netlink disconnect on
+    /// every survivor's live device, the shutdown-spool export never
+    /// ran, and the quarantined survivors came back uncapturable —
+    /// the coordinator destroyed them and 8 sessions rolled back past
+    /// acked writes. `JoinSet::join_next` REMOVES a task from the set
+    /// when it yields it, so no task can ever be polled twice.
+    //
+    // `any(..., test)`: the only src caller is the linux-gated flush
+    // pass, but the regression tests below must compile on macOS too.
+    #[cfg(any(target_os = "linux", test))]
+    async fn join_all_within(
+        tasks: &mut tokio::task::JoinSet<()>,
+        deadline: std::time::Duration,
+    ) -> bool {
+        let join_all = async { while tasks.join_next().await.is_some() {} };
+        if tokio::time::timeout(deadline, join_all).await.is_ok() {
+            return false;
+        }
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        true
     }
 
     /// ADR 0044 K2 graceful shutdown: abandon every live NBD data
@@ -9119,7 +9334,7 @@ impl SandboxBackend for PooledBackend {
         self.session_bindings.insert(sandbox_id, session_id);
 
         let Some(egress) = self.egress.as_ref() else {
-            if policy.google_adc {
+            if policy.metadata_flavor.is_some() {
                 return Err(SandboxError::InvalidSpec(
                     "Google ADC requires a host egress proxy".into(),
                 ));
@@ -9382,18 +9597,32 @@ impl PooledBackend {
             );
             return Ok(false);
         };
-        let Some(slot) = pool.claim(&device).await else {
-            // Not in the free pool: either the device isn't part of
-            // this host's slot set, or something else already leased
-            // it — both mean re-serving here would fight another
-            // owner. Loud, because the survivor's disk stays dead.
-            tracing::warn!(
-                %sandbox_id,
-                device = %device.display(),
-                "rehydrate: survivor's NBD device could not be claimed from the slot \
-                 pool; its disk stays unserved (recover via evict_local → resume)",
-            );
-            return Ok(false);
+        // Register-time rehydrate claims the device from the pool; a
+        // RETRY (2026-08-02 durability-rollback RCA) finds it PARKED by
+        // its own earlier failure and reclaims it instead — the
+        // `Parked → Claimed` edge. Reclaim first: it is lock-cheap,
+        // and a parked device would spend `claim`'s full retry budget
+        // to conclude "reserved by someone" anyway.
+        let slot = match pool.reclaim_parked(&device) {
+            Some(slot) => slot,
+            None => match pool.claim(&device).await {
+                Some(slot) => slot,
+                None => {
+                    // Not parked and not in the free pool: either the
+                    // device isn't part of this host's slot set, or
+                    // something else already leased it — both mean
+                    // re-serving here would fight another owner. Loud,
+                    // because the survivor's disk stays dead.
+                    tracing::warn!(
+                        %sandbox_id,
+                        device = %device.display(),
+                        "rehydrate: survivor's NBD device could not be claimed from \
+                         the slot pool; its disk stays unserved (recover via \
+                         evict_local → resume)",
+                    );
+                    return Ok(false);
+                }
+            },
         };
 
         // Shutdown-spool peek (2026-07-16 RCA): if the predecessor
@@ -9509,8 +9738,20 @@ impl PooledBackend {
                 // survivor in every heartbeat so the coordinator actually
                 // DRIVES evict_local → resume (pre-fix, nothing consumed
                 // this WARN and the teardown reconciler's orphan path
-                // SIGKILLed the healthy VM ~60s later).
-                self.quarantined_survivors.insert(sandbox_id, session_id);
+                // SIGKILLed the healthy VM ~60s later). Preserve an
+                // existing record's retry counter: a failed RETRY lands
+                // here too, and resetting the counter would re-loudify
+                // its log pacing every attempt.
+                self.quarantined_survivors
+                    .entry(sandbox_id)
+                    .and_modify(|q| {
+                        q.disk_manifest = disk_manifest;
+                    })
+                    .or_insert(QuarantinedSurvivor {
+                        session_id,
+                        disk_manifest,
+                        retry_attempts: 0,
+                    });
                 return Err(SandboxError::Vm(
                     format!(
                         "rehydrate nbd reattach at {}: {e} \
@@ -9579,6 +9820,13 @@ impl PooledBackend {
                 }
             }
         }
+
+        // 2026-08-02 durability-rollback RCA: a successful (re-)serve
+        // clears the quarantine — the heartbeat stops advertising the
+        // survivor and the coordinator's parked quarantine op captures
+        // cleanly on its next attempt. No-op for the register-time
+        // first attempt (no entry exists yet).
+        self.quarantined_survivors.remove(&sandbox_id);
 
         tracing::info!(
             %session_id,
@@ -9853,8 +10101,128 @@ mod tests {
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_sandbox_process::ProcessBackend;
 
+    /// 2026-08-02 durability-rollback RCA regression: a deadline overrun
+    /// with a MIX of already-completed and still-running flush tasks
+    /// must abort + reap the stragglers without re-polling the
+    /// completed ones. The old `Vec<JoinHandle>` shape re-awaited every
+    /// handle in the overrun arm and panicked ("JoinHandle polled after
+    /// completion"), unwinding the SIGTERM path before the abandon
+    /// sweep — the panic that destroyed 8 sessions' survivors. Paused
+    /// clock: the deadline elapses deterministically, no real sleeping.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_flush_join_overrun_with_completed_tasks_does_not_panic() {
+        let mut tasks = tokio::task::JoinSet::new();
+        // Completes immediately — the timed join reaps it, which is
+        // exactly the state that made the old overrun arm re-poll a
+        // consumed handle.
+        tasks.spawn(async {});
+        // Never completes — forces the deadline overrun.
+        tasks.spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        let overran =
+            PooledBackend::join_all_within(&mut tasks, std::time::Duration::from_secs(20)).await;
+
+        assert!(overran, "the pending task must trip the deadline");
+        assert!(
+            tasks.is_empty(),
+            "every task must be reaped before the abandon sweep runs",
+        );
+    }
+
+    /// The no-overrun path: all tasks finish inside the deadline, the
+    /// join reports no overrun, and the set is fully drained.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_flush_join_within_deadline_reports_no_overrun() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async {});
+        tasks.spawn(async {});
+
+        let overran =
+            PooledBackend::join_all_within(&mut tasks, std::time::Duration::from_secs(20)).await;
+
+        assert!(!overran);
+        assert!(tasks.is_empty());
+    }
+
+    /// 2026-08-03 `chain_poisoned` alert regression: once the SIGTERM
+    /// capture quiesce is raised, `capture_phase` must refuse BEFORE the
+    /// write-ahead invalidate — the durable chain-head record (the
+    /// successor's rehydrate seed) survives the refusal, so the surviving
+    /// VM keeps its Diff-capable chain instead of paying a FULL re-chunk.
     #[tokio::test]
-    async fn google_adc_requires_the_local_egress_proxy() {
+    async fn quiesced_capture_refuses_before_invalidating_the_chain_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
+        let pooled = PooledBackend::new(inner).with_checkpoint_dir(tmp.path().join("checkpoints"));
+        let id = SandboxId::new();
+
+        // A durable chain-head record, as a survivor's capture leaves it.
+        let store = pooled.chain_heads.as_ref().unwrap();
+        store
+            .persist(crate::checkpoint::ChainHeadRecord {
+                sandbox_id: id,
+                manifest_ref: engram_core::types::manifest::ManifestRef::new(),
+                session_id: None,
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        pooled.quiesce_captures_for_shutdown();
+        let err = match pooled.capture_phase(id).await {
+            Ok(_) => panic!("a quiesced capture must refuse"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("capture refused"),
+            "unexpected error: {err}"
+        );
+        // The refusal consumed nothing: the record is still the seed, and
+        // the capture lock was released.
+        assert!(
+            crate::checkpoint::ChainHeadRecord::load(store.dir(), id)
+                .await
+                .is_some(),
+            "the chain-head record must survive a quiesced-capture refusal",
+        );
+        assert!(!pooled.capture_in_flight(id));
+    }
+
+    /// The CaptureDrain ladder stage: an in-flight capture (a held
+    /// capture lock) past the deadline counts as a straggler; a released
+    /// lock drains clean.
+    #[tokio::test]
+    async fn shutdown_capture_drain_counts_stragglers_and_drains_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
+        let pooled = PooledBackend::new(inner);
+        pooled.quiesce_captures_for_shutdown();
+        let id = SandboxId::new();
+
+        // A capture in flight that outlives the deadline is a straggler.
+        let guard = pooled.capture_lock(id).lock_owned().await;
+        let stragglers = pooled
+            .drain_captures_for_shutdown(std::time::Duration::from_millis(50))
+            .await;
+        assert_eq!(stragglers, 1, "a held capture lock must count");
+
+        // A capture that completes (the lock releases) drains clean, and
+        // the drain leaves the lock free behind it.
+        drop(guard);
+        let stragglers = pooled
+            .drain_captures_for_shutdown(std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(stragglers, 0);
+        assert!(!pooled.capture_in_flight(id));
+    }
+
+    #[tokio::test]
+    async fn metadata_delivery_requires_the_local_egress_proxy() {
+        use engram_core::types::integration::MetadataFlavor;
         let tmp = tempfile::tempdir().unwrap();
         let inner: Arc<dyn SandboxBackend> =
             Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
@@ -9871,7 +10239,7 @@ mod tests {
                 secrets: Vec::new(),
                 injects: Vec::new(),
                 observes: Vec::new(),
-                google_adc: true,
+                metadata_flavor: Some(MetadataFlavor::Gce),
                 secret_mode: engram_core::types::image::SecretMode::Broker,
             })
             .await
@@ -10185,7 +10553,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            google_adc: false,
+            metadata_flavor: None,
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -10208,7 +10576,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            google_adc: false,
+            metadata_flavor: None,
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -13657,7 +14025,7 @@ mod tests {
                 secrets: Vec::new(),
                 injects: Vec::new(),
                 observes: Vec::new(),
-                google_adc: false,
+                metadata_flavor: None,
                 secret_mode: SecretMode::Literal,
             }
         }

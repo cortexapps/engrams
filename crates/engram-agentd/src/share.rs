@@ -9,10 +9,11 @@
 //! the result. The shared artifact surfaces in the session's
 //! conversation history (the web UI renders it inline).
 //!
-//! This is the *untrusted* surface: a potentially malicious agent can
-//! only share files the coord's magic-byte sniff verifies as image or
-//! video. We fail fast client-side on a non-media extension, but the
-//! coord is the authority — it never trusts a guest-supplied type.
+//! This is the *untrusted* surface: any file type may be shared, but
+//! the coord is the authority on the stored media type — it stamps it
+//! from magic bytes (falling back to the declared extension for types
+//! with no magic bytes) and never trusts a guest-supplied MIME. The
+//! serve side applies MIME-agnostic hardening.
 
 use std::{io::ErrorKind, process::ExitCode, time::Duration};
 
@@ -22,15 +23,6 @@ use engram_harness_proto::{
     UPLOAD_VSOCK_PORT,
 };
 use tokio::io::AsyncReadExt;
-
-/// Image/video extensions the helper will attempt (lower-cased, no
-/// leading dot). The coord re-validates by magic bytes; this is just a
-/// fast local reject so the agent gets a clear message without a round
-/// trip.
-const ALLOWED_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "webp", // images
-    "mp4", "webm", "mov", // video
-];
 
 /// Entry from `main`: `rest` is the argv after `share-file`. Builds a
 /// small runtime and runs one upload. On success prints a confirmation
@@ -65,18 +57,18 @@ async fn run_inner(rest: &[String]) -> Result<String, String> {
     let path = req_flag(rest, "--file")?;
     let caption = flag(rest, "--caption").filter(|s| !s.is_empty());
 
+    // Any file type is shareable; the extension only helps the coord
+    // stamp types that have no magic bytes (md, html, …).
     let ext = std::path::Path::new(&path)
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
-        .ok_or_else(|| format!("{path}: no file extension to derive a media type"))?;
-    if !ALLOWED_EXTS.contains(&ext.as_str()) {
-        return Err(format!(
-            "{path}: extension .{ext} is not a shareable image/video type \
-             (allowed: {})",
-            ALLOWED_EXTS.join(", ")
-        ));
-    }
+        .unwrap_or_default();
+    let file_name = std::path::Path::new(&path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{path}: no file name"))?;
 
     let meta = wait_for_file(&path).await?;
     if !meta.is_file() {
@@ -95,8 +87,9 @@ async fn run_inner(rest: &[String]) -> Result<String, String> {
     let req = UploadRequest {
         session_id,
         broker_token,
-        op: UploadOp::ShareFile {
+        op: UploadOp::ShareFileNamed {
             ext,
+            file_name,
             caption,
             size_bytes,
         },
@@ -198,14 +191,6 @@ mod tests {
         assert!(flag(&argv, "--missing").is_none());
         assert!(req_flag(&argv, "--file").is_ok());
         assert!(req_flag(&argv, "--nope").is_err());
-    }
-
-    #[test]
-    fn allowed_exts_cover_image_and_video() {
-        assert!(ALLOWED_EXTS.contains(&"png"));
-        assert!(ALLOWED_EXTS.contains(&"mp4"));
-        assert!(!ALLOWED_EXTS.contains(&"svg"));
-        assert!(!ALLOWED_EXTS.contains(&"html"));
     }
 
     #[tokio::test]

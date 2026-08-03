@@ -2,10 +2,11 @@
 
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError } from "@connectrpc/connect";
-import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
+import type { ConnectRouter } from "@connectrpc/connect";
 
 import { abilityFor } from "../authz/ability.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { requireUser } from "./require.ts";
 import { getDb } from "../db/client.ts";
 import {
   makeEnrollmentStore,
@@ -58,14 +59,6 @@ export interface ReviewDeps {
   randomUUID?: () => string;
 }
 
-async function requireUser(
-  ctx: HandlerContext,
-  getSession: GetSession,
-): Promise<{ id: string; role: string }> {
-  const session = await getSession(ctx.requestHeader);
-  if (!session) throw new ConnectError("unauthenticated", Code.Unauthenticated);
-  return { id: session.user.id, role: session.user.role ?? "user" };
-}
 
 function enrollmentToProto(row: EnrollmentRow): RepoEnrollment {
   return {

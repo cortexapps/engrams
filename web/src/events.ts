@@ -248,6 +248,8 @@ export type SessionEvent =
       media_type: string;
       size_bytes: number;
       caption: string | null;
+      // Sanitized guest-declared basename; absent from legacy events.
+      file_name?: string | null;
       at: string;
     }
   // ADR 0028 A.log: a rung-1 recovery rewound the live transcript to a

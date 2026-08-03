@@ -18,7 +18,15 @@
 
 import { AbilityBuilder, createMongoAbility, type MongoAbility } from "@casl/ability";
 
-export type Actions = "create" | "read" | "prompt" | "shell" | "delete" | "manage";
+export type Actions =
+  | "create"
+  | "read"
+  | "prompt"
+  | "shell"
+  | "delete"
+  | "update"
+  | "share"
+  | "manage";
 
 export type Subjects =
   | "Task"
@@ -29,11 +37,16 @@ export type Subjects =
   | "Review"
   | "Fleet"
   | "Registry"
+  | "Artifact"
   | "all";
 
 // Typed subject shapes — used with CASL's `subject()` helper.
 export type TaskSubject = { createdByUserId: string | null };
 export type SessionSubject = { createdByUserId: string | null };
+export type ArtifactSubject = {
+  ownerUserId: string | null;
+  visibility: string;
+};
 
 // We use `MongoAbility<[Actions, any]>` rather than the fully-typed
 // `MongoAbility<[Actions, Subjects]>` because CASL's `subject()` helper
@@ -83,6 +96,13 @@ export function abilityFor(user: AbilityUser): AppAbility {
   // read them, and re-run one (create a fresh pass) the same way they can
   // trigger a review by command; enrollment config stays admin-only.
   can(["read", "create"], "Review");
+
+  // Artifacts: owners hold every action on their own (read/update/
+  // share/delete via manage); an artifact shared with the org
+  // (visibility = "org") is readable by any member. The admin case
+  // rides manage("all") below — no per-call branching.
+  can("manage", "Artifact", { ownerUserId: user.id });
+  can("read", "Artifact", { visibility: "org" });
 
   // Admin override.
   if (user.role === "admin") can("manage", "all");

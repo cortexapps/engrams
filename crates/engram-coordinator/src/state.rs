@@ -311,6 +311,9 @@ pub enum SessionEvent {
         media_type: String,
         size_bytes: u64,
         caption: Option<String>,
+        /// Sanitized guest-declared basename; `None` from legacy agentd
+        /// builds (serde-additive — old persisted events deserialize).
+        file_name: Option<String>,
         at: DateTime<Utc>,
     },
     /// ADR 0028 A.log: a rung-1 recovery rewound the live transcript
@@ -2727,6 +2730,7 @@ pub(crate) mod tests {
             _: &str,
             _: i64,
             _: Option<&str>,
+            _: Option<&str>,
         ) -> Result<(), MetaError> {
             Ok(())
         }
@@ -3146,6 +3150,7 @@ pub(crate) mod tests {
             mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            last_event_at: None,
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
@@ -3251,6 +3256,7 @@ pub(crate) mod tests {
             mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            last_event_at: None,
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
@@ -3303,6 +3309,7 @@ pub(crate) mod tests {
             mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            last_event_at: None,
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
@@ -3331,6 +3338,7 @@ pub(crate) mod tests {
             mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            last_event_at: None,
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,

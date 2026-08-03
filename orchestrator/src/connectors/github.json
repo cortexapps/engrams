@@ -231,6 +231,10 @@
       "match": { "method": "DELETE", "path": "/repos/*/actions/*" }
     },
     {
+      "grants": ["workflows:write"],
+      "match": { "method": "PUT", "path": "/repos/*/contents/.github/workflows/*" }
+    },
+    {
       "grants": ["secrets:read"],
       "match": { "method": "GET", "path": "/repos/*/actions/secrets*" }
     },

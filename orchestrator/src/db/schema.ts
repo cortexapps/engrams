@@ -92,6 +92,11 @@ export const taskSession = pgTable(
     // snapshot. This makes broker audit records attributable without consulting
     // mutable workflow state.
     integrationPrincipalId: text("integration_principal_id"),
+    // ADR 0109: content-hash of the compiled authorization snapshot
+    // (profileId + grants + connections). The broker emits it as the
+    // `engrams_profile_snapshot` OIDC claim, so Google-side audit logs join
+    // back to THIS row. Null means a pre-hash row.
+    integrationSnapshotHash: text("integration_snapshot_hash"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => [
@@ -631,6 +636,11 @@ export interface CreateTaskAutomationAction {
   includeEventContext: boolean;
   /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
   harnessMode?: string;
+  /** ADR 0063 B2: override the profile's default harness / model / effort for
+   *  every session this automation launches. Absent = inherit the profile. */
+  harness?: string;
+  model?: string;
+  effort?: string;
 }
 
 export type AutomationAction = CreateTaskAutomationAction;
@@ -872,6 +882,59 @@ export const portExposure = pgTable(
     // List-by-session + cascade-on-session-delete (P2b/cleanup).
     index("port_exposure_session_idx").on(t.sessionId),
     index("port_exposure_owner_idx").on(t.ownerUserId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Artifacts — the cross-session registry behind /artifacts and the
+// Artifact tool. An artifact is a hosted, versioned HTML/Markdown
+// document published from a session; the coordinator holds only the
+// bytes (its `artifacts` rows, keyed by `coordArtifactId`), this tier
+// holds ownership, visibility, and version history. Rows are written
+// synchronously by the Artifact tool handler with the session owner's
+// user id in hand. `visibility` = "private" (owner + admin) | "org"
+// (any authenticated user). `sessionId` is a LOGICAL ref to the
+// control-plane session (different tier, no DB FK) — artifacts outlive
+// their source session (coordinator migration 0110 dropped that FK).
+// ---------------------------------------------------------------------------
+
+export const artifact = pgTable(
+  "artifact",
+  {
+    id: text("id").primaryKey(), // orchestrator-minted uuid
+    ownerUserId: text("owner_user_id").references(() => user.id, {
+      onDelete: "set null", // null = unattributed → admin-only
+    }),
+    title: text("title").notNull(),
+    fileName: text("file_name").notNull(),
+    visibility: text("visibility").notNull().default("private"), // "private" | "org"
+    currentVersion: integer("current_version").notNull(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  },
+  (t) => [
+    index("artifact_owner_idx").on(t.ownerUserId),
+    index("artifact_visibility_idx").on(t.visibility),
+  ],
+);
+
+export const artifactVersion = pgTable(
+  "artifact_version",
+  {
+    artifactId: text("artifact_id")
+      .notNull()
+      .references(() => artifact.id, { onDelete: "cascade" }),
+    version: integer("version").notNull(), // 1-based, append-only
+    sessionId: text("session_id").notNull(), // provenance + coordinator byte lookup
+    taskId: text("task_id"),
+    coordArtifactId: text("coord_artifact_id").notNull(), // coordinator artifacts.id
+    mediaType: text("media_type").notNull(),
+    sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.artifactId, t.version] }),
+    index("artifact_version_session_idx").on(t.sessionId),
   ],
 );
 

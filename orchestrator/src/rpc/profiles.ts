@@ -14,13 +14,14 @@
  */
 
 import { ConnectError, Code } from "@connectrpc/connect";
-import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
+import type { ConnectRouter } from "@connectrpc/connect";
 
 import { ProfileService } from "../gen/engram/app/v1/profile_pb.ts";
 import type { Profile } from "../gen/engram/app/v1/profile_pb.ts";
 
 import { abilityFor } from "../authz/ability.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { requireUser } from "./require.ts";
 import { getDb } from "../db/client.ts";
 import { makeProfileStore, type ProfileRow, type ProfileStore } from "../db/profiles.ts";
 import {
@@ -56,7 +57,10 @@ import {
   resolveIntegrationGrants,
   type ResolvedIntegrationGrant,
 } from "../integrations/grants.ts";
-import { appendGooglePolicy } from "../integrations/google-policy.ts";
+import {
+  isProviderCapability,
+  validateProviderGrants,
+} from "../integrations/providers/index.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -93,15 +97,6 @@ export interface ProfileDeps {
   connections?: IntegrationConnectionStore;
 }
 
-function headersOf(ctx: HandlerContext): Headers {
-  return ctx.requestHeader;
-}
-
-async function requireUser(ctx: HandlerContext, getSession: GetSession): Promise<{ id: string; role: string }> {
-  const session = await getSession(headersOf(ctx));
-  if (!session) throw new ConnectError("unauthenticated", Code.Unauthenticated);
-  return { id: session.user.id, role: session.user.role ?? "user" };
-}
 
 /** Map a ProfileRow to the proto Profile. env_vars included only when admin. */
 function toProto(row: ProfileRow, isAdmin: boolean): Profile {
@@ -320,16 +315,17 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
     registry: Map<string, Connector>,
     builtInToolCapabilities: Set<string>,
   ): void {
-    appendGooglePolicy({
-      network: { default: "deny", allow_hosts: [], allow_host_patterns: [] },
-      secrets: [],
-      injects: [],
-      observes: [],
-      google_adc: false,
-    }, resolved);
+    // Profile save validates grant SHAPE only. Connection STATE (enabled,
+    // endpoint membership) is enforced at session-create — editing a
+    // connection auto-disables it, and that must never block unrelated edits
+    // of every profile that grants it.
+    validateProviderGrants(resolved);
     const capabilities = grantsToCapabilities(resolved);
     for (const c of capabilities) {
-      if (c.startsWith("gcp:")) continue;
+      // A named-connection capability is authorized by its CONNECTION, not by a
+      // connector in the registry, so the "which connector grants this?" check
+      // below does not apply to it.
+      if (isProviderCapability(c)) continue;
       if (builtInToolCapabilities.has(c)) continue;
       const parsed = parseCapability(c);
       if (!parsed) {

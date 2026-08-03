@@ -8,13 +8,11 @@
 //! `--permission-mode` argv on respawn; codex: to choose per-turn params) and
 //! flips it when a plan decision changes the mode.
 //!
-//! Sits next to the other `/workspace/.engrams/` stamps (`claude-session-id`,
-//! `codex-thread-id`, `codex-parked-calls.json`).
+//! The path comes from [`crate::state::StateDir::mode_stamp`], next to the
+//! other per-session stamps (`claude-session-id`, `codex-thread-id`,
+//! `codex-parked-calls.json`).
 
 use std::path::Path;
-
-/// Default stamp path inside the guest.
-pub const MODE_STAMP_FILE: &str = "/workspace/.engrams/mode";
 
 /// The mode every session starts in when no directive ever arrived.
 pub const DEFAULT_MODE: &str = "default";

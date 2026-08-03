@@ -7,17 +7,14 @@ import {
   InfoIcon,
   MapIcon,
   RotateCcwIcon,
-  XIcon,
 } from "lucide-react";
-import { useState } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Text } from "@/components/ui/text";
-import { Button } from "@/components/ui/button";
-import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
 import { ProviderTile } from "@/components/integrations/ProviderTile";
 import { useProviderIdentity } from "../../hooks/useIntegrations";
-import { API_BASE } from "../../lib/base";
+import { mediaKind, sessionArtifactBytesUrl } from "../../lib/artifacts";
+import { ArtifactViewer } from "../artifacts/ArtifactViewer";
 import { fmtBytes, hms } from "../transcriptFmt";
 import type { SystemMarker } from "./buildMessages";
 import { PlanCard } from "./PlanCard";
@@ -333,10 +330,8 @@ function GenericAsset({ marker }: { marker: IntegrationAssetMarker }) {
 function Artifact({ marker }: { marker: Extract<SystemMarker, { kind: "artifact" }> }) {
   // Same-origin GET; the browser carries the auth cookie / dev proxy. No
   // bearer needed for a passive <img>/<video>.
-  const src = `${API_BASE}/sessions/${marker.sessionId}/artifacts/${marker.artifactId}`;
-  const isImage = marker.mediaType.startsWith("image/");
-  const isVideo = marker.mediaType.startsWith("video/");
-  const [lightboxOpen, setLightboxOpen] = useState(false);
+  const src = sessionArtifactBytesUrl(marker.sessionId, marker.artifactId);
+  const kind = mediaKind(marker.mediaType);
 
   return (
     <Card className="overflow-hidden py-0">
@@ -346,66 +341,36 @@ function Artifact({ marker }: { marker: Extract<SystemMarker, { kind: "artifact"
           <Text as="span" variant="label">
             shared file
           </Text>
+          {marker.fileName && (
+            <>
+              <span aria-hidden>·</span>
+              <span className="font-mono">{marker.fileName}</span>
+            </>
+          )}
           <span aria-hidden>·</span>
           <span className="font-mono">{marker.mediaType}</span>
           <span aria-hidden>·</span>
           <span className="tabular-nums">{fmtBytes(marker.sizeBytes)}</span>
-          <span className="ml-auto font-mono tabular-nums">{hms(marker.at)}</span>
+          {/* Every shared file — media included — is downloadable. */}
+          <a
+            href={src}
+            download
+            className="ml-auto flex items-center gap-1 transition-colors hover:text-foreground"
+            aria-label="Download file"
+          >
+            <DownloadIcon className="size-3.5" />
+            <span className="font-mono tabular-nums">{hms(marker.at)}</span>
+          </a>
         </div>
 
-        {isImage ? (
-          <>
-            <img
-              src={src}
-              alt={marker.caption ?? "shared image"}
-              className="w-auto max-h-[32rem] max-w-full self-start rounded-md border cursor-zoom-in"
-              onClick={() => setLightboxOpen(true)}
-            />
-            <Dialog open={lightboxOpen} onOpenChange={setLightboxOpen}>
-              <DialogContent
-                showCloseButton={false}
-                className="max-w-[min(95vw,900px)] p-0 gap-0 flex flex-col overflow-hidden"
-              >
-                <div className="flex shrink-0 items-center justify-between border-b px-3 py-2">
-                  <a
-                    href={src}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <ExternalLinkIcon className="size-3.5" />
-                    Open in new tab
-                  </a>
-                  <DialogClose asChild>
-                    <Button variant="ghost" size="icon" className="size-7">
-                      <XIcon className="size-4" />
-                      <span className="sr-only">Close</span>
-                    </Button>
-                  </DialogClose>
-                </div>
-                <div className="overflow-y-auto">
-                  <img src={src} alt={marker.caption ?? "shared image"} className="w-full" />
-                </div>
-                {marker.caption && (
-                  <p className="shrink-0 border-t px-3 py-2 text-sm">{marker.caption}</p>
-                )}
-              </DialogContent>
-            </Dialog>
-          </>
-        ) : isVideo ? (
-          // eslint-disable-next-line jsx-a11y/media-has-caption
-          <video
-            src={src}
-            controls
-            className="w-auto max-h-[32rem] max-w-full self-start rounded-md border"
+        {kind !== "binary" && (
+          <ArtifactViewer
+            url={src}
+            mediaType={marker.mediaType}
+            fileName={marker.fileName ?? undefined}
+            caption={marker.caption}
+            variant="inline"
           />
-        ) : (
-          <Button asChild variant="outline" size="sm" className="self-start">
-            <a href={src} download>
-              <DownloadIcon /> Download file
-            </a>
-          </Button>
         )}
 
         {/* Caption is untrusted text — rendered as auto-escaped JSX. */}

@@ -107,7 +107,14 @@ export interface Session {
   image: ImageRef;
   mode: SessionMode;
   created_at: string;
+  /** State-machine clock: moves only on a session state transition. */
   last_active_at: string;
+  /**
+   * Activity clock: when the newest session event landed. Absent for rows
+   * predating migration 0068 and for a session that has not emitted an event,
+   * so read it as `last_event_at ?? last_active_at`.
+   */
+  last_event_at?: string;
 }
 
 /** ADR 0053: profile identity snapshot, as surfaced on a session list row.

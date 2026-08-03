@@ -54,7 +54,7 @@ use engram_core::types::egress::{
     EgressInjectEntry, EgressObserveEntry, EgressSecretEntry, SessionEgressPolicy,
 };
 use engram_core::types::image::{NetworkDefault, NetworkPolicy, SecretMode};
-use engram_core::types::integration::CredentialMintSource;
+use engram_core::types::integration::{CredentialMintSource, MetadataFlavor};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::{
     AgentSpec, AuxBundleRef, AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec,
@@ -240,7 +240,7 @@ fn session_egress_policy() -> SessionEgressPolicy {
         secret_mode: SecretMode::Broker,
         // ADR 0109: the host exposes metadata-style ADC only for sessions
         // whose immutable launch policy enables Google Cloud.
-        google_adc: true,
+        metadata_flavor: Some(MetadataFlavor::Gce),
     }
 }
 
@@ -289,6 +289,41 @@ fn session_egress_policy_minted() -> SessionEgressPolicy {
                 fields: vec![("number".into(), "{number}".into())],
             }),
         }],
+        ..session_egress_policy()
+    }
+}
+
+/// ADR 0109: a Google Cloud policy. Distinct from the GitHub fixture above in
+/// the two ways that matter on this wire:
+///
+/// - the path glob carries the `segment-path:` prefix, which makes a `*` stop
+///   at `/` and excludes the query string. Google clients append transport
+///   parameters (`alt=json`, `pageSize`), while the permission boundary is the
+///   resource path — a plain glob here would either over-match a nested action
+///   or fail to match a real request. Nothing pinned that form before, so the
+///   prefix could be dropped or renamed with no golden to notice.
+/// - `mint_source` names the `gcp` provider, so the externally-tagged encoding
+///   that #931 fixed stays pinned for a second provider.
+fn session_egress_policy_google() -> SessionEgressPolicy {
+    SessionEgressPolicy {
+        network_allow_hosts: vec!["compute.googleapis.com".into()],
+        injects: vec![EgressInjectEntry {
+            secret: "ya29.minted".into(),
+            header_name: "authorization".into(),
+            header_template: "Bearer {}".into(),
+            allow_hosts: vec!["monitoring.googleapis.com".into()],
+            allow_host_patterns: vec![],
+            methods: vec!["GET".into()],
+            path_globs: vec!["segment-path:/v3/projects/*/timeSeries".into()],
+            graphql_operation: String::new(),
+            graphql_field: String::new(),
+            mint_source: Some(CredentialMintSource::Connection {
+                connection_id: "gcp-prod".into(),
+                provider: "gcp".into(),
+            }),
+            expires_at: Some(DateTime::from_timestamp(1_770_003_600, 0).unwrap()),
+        }],
+        metadata_flavor: Some(MetadataFlavor::Gce),
         ..session_egress_policy()
     }
 }
@@ -367,6 +402,10 @@ fn struct_payloads_golden() {
     assert_golden_no_eq(
         "session_egress_policy_minted",
         &session_egress_policy_minted(),
+    );
+    assert_golden_no_eq(
+        "session_egress_policy_google",
+        &session_egress_policy_google(),
     );
     assert_golden_no_eq("cow_state", &cow_state());
     assert_golden_no_eq(
@@ -543,8 +582,14 @@ fn wire_version_pinned() {
     // minted-inject policy failed host-side at boot (the engrams-review
     // outage, 2026-08-01). No existing golden changes bytes (the broken
     // `Some` shape never had one); the minted-policy golden is ADDED.
+    // 22 -> 23: ADR 0109 seam — `SessionEgressPolicy.google_adc` becomes
+    // `metadata_flavor: Option<MetadataFlavor>`. A field REPLACEMENT, not an
+    // addition, so a v22 host cannot decode a v23 policy: the roll is
+    // lockstep. All three session-egress-policy goldens were regenerated, and
+    // the `session_egress_policy_google` fixture now pins the `Some(Gce)`
+    // encoding beside the `None` case the other two carry.
     assert_eq!(
-        WIRE_VERSION, 22,
+        WIRE_VERSION, 23,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
@@ -584,6 +629,10 @@ fn regen_golden() {
     write(
         "session_egress_policy_minted",
         &session_egress_policy_minted(),
+    );
+    write(
+        "session_egress_policy_google",
+        &session_egress_policy_google(),
     );
     write("cow_state", &cow_state());
     write(

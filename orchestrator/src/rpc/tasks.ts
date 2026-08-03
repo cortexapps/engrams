@@ -48,7 +48,7 @@
  */
 
 import { ConnectError, Code } from "@connectrpc/connect";
-import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
+import type { ConnectRouter } from "@connectrpc/connect";
 import { subject } from "@casl/ability";
 import { and, eq, exists, ilike, inArray, isNull, or, type SQL } from "drizzle-orm";
 
@@ -59,7 +59,7 @@ import type { Session } from "../gen/engram/app/v1/session_pb.ts";
 import { log as rootLog } from "../log.ts";
 import { abilityFor } from "../authz/ability.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
-import { isServiceAccountEmail } from "./api-key.ts";
+import { requireUser } from "./require.ts";
 import { getDb } from "../db/client.ts";
 import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
 import {
@@ -175,33 +175,6 @@ export function searchPattern(q: string): string {
   return `%${q.replace(/[\\%_]/g, "\\$&")}%`;
 }
 
-/** Extract request headers from a HandlerContext as a plain Headers object. */
-function headersOf(ctx: HandlerContext): Headers {
-  return ctx.requestHeader;
-}
-
-/**
- * Resolve the caller's better-auth session from the request headers.
- * Throws Unauthenticated if the session is absent.
- */
-async function requireUser(
-  ctx: HandlerContext,
-  getSession: GetSession,
-): Promise<{ id: string; role: string; serviceAccount: boolean }> {
-  const session = await getSession(headersOf(ctx));
-  if (!session) {
-    throw new ConnectError("unauthenticated", Code.Unauthenticated);
-  }
-  return {
-    id: session.user.id,
-    role: session.user.role ?? "user",
-    // A global API key resolves to its service-account owner (ADR 0086) —
-    // a PROGRAMMATIC principal: it has no per-user harness token, so task
-    // compilation must take the org-credential path even for "chat" tasks
-    // (the CI create-session smoke failed "not logged in" without this).
-    serviceAccount: isServiceAccountEmail(session.user.email ?? ""),
-  };
-}
 
 /**
  * Map a control-plane session status string to a task status string.
@@ -423,6 +396,34 @@ function buildUnattributedTask(sess: Session): Task {
   } as Task;
 }
 
+/**
+ * The task list's ordering key: when this task was last DOING something,
+ * newest first.
+ *
+ * Reads `session.lastEventAt` — the coordinator's activity clock, bumped on
+ * every session-event append — NOT `lastActiveAt`, which only moves on a
+ * state transition. `lastActiveAt` is the wrong key here twice over: it
+ * freezes at the instant a session went Active, so a session working for
+ * hours sinks down the list, and it is re-stamped by the Active → Evicting
+ * flip, so an idle-evicted session jumps to the top. The eviction scanner
+ * depends on that staleness for its idempotency key, so the fix is to read a
+ * different clock, not to bump `lastActiveAt` more often.
+ *
+ * Falls back to `lastActiveAt`, then to the task's own `createdAt`:
+ * `lastEventAt` is unset for rows predating migration 0068 and for a session
+ * that has not emitted an event yet, and a task with no session at all has
+ * neither.
+ */
+export function taskActivityAt(task: Task): number {
+  const session = task.sessions[0]?.session;
+  const at = session?.lastEventAt ?? session?.lastActiveAt ?? task.createdAt;
+  const parsed = Date.parse(at);
+  // A malformed timestamp must not poison the comparator into returning NaN
+  // (which makes Array.sort's ordering arbitrary for EVERY pair it touches,
+  // not just this row). Sink the bad row instead.
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
 /** Resolve { profileId } → snapshot for the given refs (one images call + one profile query). */
 export async function buildProfileMap(
   refs: Array<{ profileId: string | null }>,
@@ -471,7 +472,9 @@ async function loadTask(
   profiles: ProfileStore,
   imagesClient: ImagesClient,
   users: UserIdentityStore,
-  pendingCalls: PendingToolCallStore = makePendingToolCallStore(),
+  // REQUIRED on purpose: a defaulted store here silently bypassed the injected
+  // one (#942's default-param trap).
+  pendingCalls: PendingToolCallStore,
 ): Promise<Task> {
   const db_ = db;
 
@@ -809,11 +812,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         });
       }
 
-      filteredTasks.sort((a, b) => {
-        const aActiveAt = a.sessions[0]?.session?.lastActiveAt ?? a.createdAt;
-        const bActiveAt = b.sessions[0]?.session?.lastActiveAt ?? b.createdAt;
-        return Date.parse(bActiveAt) - Date.parse(aActiveAt);
-      });
+      filteredTasks.sort((a, b) => taskActivityAt(b) - taskActivityAt(a));
 
       const totalCount = filteredTasks.length;
       if (req.pageSize <= 0) {

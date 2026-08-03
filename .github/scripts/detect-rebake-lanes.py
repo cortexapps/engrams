@@ -152,6 +152,14 @@ HOST_BASE_PATHS = ["deploy/packer/", "deploy/otel/"]
 # rebakes the orchestrator (and the other images in the matrix; that's the same
 # coarse behavior `web/` has always had).
 IMAGES_PATHS = ["docker/", "web/", "orchestrator/", "deploy/migrations/"] + BINARY_COMMON
+# The build INSTRUCTIONS, as opposed to the sources they copy in. Only a change
+# here can break an image in a way a native build does not already catch, so
+# only a change here needs the PR-time `build-images` lane: `tests (linux)`
+# already compiles every crate natively, and rebuilding the same code inside a
+# container on every Rust PR would add three release builds for no new signal.
+# (Residual risk kept deliberately: a dependency that installs on the runner but
+# not in the image's base still surfaces on main, as it does today.)
+DOCKERFILE_PATHS = ["docker/"]
 TF_HELM_PATHS = ["deploy/terraform/", "deploy/helm/"]
 # ADR 0027: the RO session bundles (skills / browser / …). A change here means
 # the bundle artifacts must be rebuilt + republished, and the FC-host image
@@ -220,7 +228,12 @@ CI_SELF_PATHS = [".github/workflows/ci.yml",
                  ".github/scripts/detect-rebake-lanes.py"]
 PROTO_PATHS = ["crates/engram-protocol/proto/", "buf.gen.yaml"]
 WEB_PATHS = ["web/"]
-ORCH_PATHS = ["orchestrator/"]
+# The Google credential denylist (ADR 0109) is one checked-in table shared by
+# the Rust egress proxy and the orchestrator's endpoint validator. It lives with
+# the proxy, so a cargo-closure change already runs the Rust lanes — this entry
+# makes the same edit run the orchestrator lane, which imports it.
+ORCH_PATHS = ["orchestrator/",
+              "crates/engram-egress-proxy/policy/google-credential-denylist.json"]
 # A lockfile/manifest/toolchain bump recompiles the whole workspace.
 RUST_COMMON = ["Cargo.lock", "Cargo.toml", "rust-toolchain.toml"]
 
@@ -330,6 +343,7 @@ def main():
     # narrower `node_assets` lane below so publish-node-assets actually rebakes.
     fc_fork = any_path(changed, FC_FORK_PATHS)
     images = bool(cc & cont) or any_path(changed, IMAGES_PATHS) or fc_fork
+    dockerfiles = any_path(changed, DOCKERFILE_PATHS)
     host_binaries = bool(cc & fc) or any_path(changed, HOST_BINARIES_PATHS)
     host_base = any_path(changed, HOST_BASE_PATHS)
     # Union — gates the publish-host-binaries job so the GHCR artifact exists
@@ -498,6 +512,7 @@ def main():
           f"test_host_sim={test_host_sim} test_cosim={test_cosim} "
           f"test_integrations_cli={test_integrations_cli}",
           file=sys.stderr)
+    print(f"-> dockerfiles={dockerfiles}", file=sys.stderr)
     print(f"-> images_matrix={images_matrix}", file=sys.stderr)
     print(f"-> e2e_matrix={e2e_matrix}", file=sys.stderr)
 
@@ -508,6 +523,7 @@ def main():
     if out:
         with open(out, "a") as f:
             f.write(f"images={b(images)}\n")
+            f.write(f"dockerfiles={b(dockerfiles)}\n")
             f.write(f"host_binaries={b(host_binaries)}\n")
             f.write(f"host_base={b(host_base)}\n")
             f.write(f"host_image={b(host_image)}\n")

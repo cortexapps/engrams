@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use engram_core::types::integration::CredentialMintSource;
+use engram_core::types::integration::{CredentialMintSource, MetadataFlavor};
 use engram_core::SessionId;
 use parking_lot::RwLock;
 
@@ -52,8 +52,8 @@ pub struct SessionState {
     /// emits an `IntegrationAsset` (the side-effect ⟹ event invariant). An
     /// observe-only host (no secret, no inject) is MITM'd purely to observe.
     pub observes: Vec<ObserveEntry>,
-    /// Serve the metadata-compatible Google ADC endpoint for this session.
-    pub google_adc: bool,
+    /// Which cloud metadata service the host serves for this session, if any.
+    pub metadata_flavor: Option<MetadataFlavor>,
 }
 
 #[derive(Clone, Debug)]
@@ -463,7 +463,17 @@ impl SessionState {
     /// and, when MITM, which secrets to substitute + which injections
     /// apply. A host with any matching secret OR injection is MITM'd;
     /// otherwise the `network_allow` list decides bypass vs reject.
+    ///
+    /// ADR 0109: a Google credential-exchange host is refused here, before any
+    /// TLS, so the refusal covers a **bypass** connection too. The
+    /// request-level check inside the intercept path never saw one, so a broad
+    /// `*.googleapis.com` network allow beside a narrow injection spliced STS
+    /// straight through — the guest could trade its session token for a
+    /// credential this proxy no longer bounds.
     pub fn decide(&self, hostname: &str) -> Decision<'_> {
+        if crate::google_denylist::denies_host(hostname) {
+            return Decision::Reject;
+        }
         let secrets: Vec<&SecretEntry> = self
             .secrets
             .iter()
@@ -481,12 +491,25 @@ impl SessionState {
             .collect();
         if !secrets.is_empty() || !injects.is_empty() || !observes.is_empty() {
             return Decision::Intercept {
+                foreign_placeholders: self.foreign_placeholders(hostname),
                 secrets,
                 injects,
                 observes,
             };
         }
         if self.allow_all || self.network_allow.matches(hostname) {
+            // A host that carries a credential-minting OPERATION rule cannot be
+            // spliced: the rule reads the request line, which only an
+            // intercepted connection produces. Interception with an empty
+            // policy relays the connection as before and lets the rule run.
+            if crate::google_denylist::requires_inspection(hostname) {
+                return Decision::Intercept {
+                    secrets: Vec::new(),
+                    injects: Vec::new(),
+                    observes: Vec::new(),
+                    foreign_placeholders: self.foreign_placeholders(hostname),
+                };
+            }
             Decision::Bypass
         } else {
             Decision::Reject
@@ -501,6 +524,24 @@ impl SessionState {
         self.secrets
             .iter()
             .map(|s| s.placeholder.as_str())
+            .collect()
+    }
+
+    /// Placeholders whose secret does NOT allow `hostname`. Seeing one of these
+    /// in a request to that host is a leak attempt, and the intercept path
+    /// closes the connection.
+    ///
+    /// This must be computed HERE, beside the narrowing that hides it: the
+    /// intercept path receives only host-matching secrets, so the leak scan it
+    /// used to run — "which of these secrets does this host disallow?" — asked
+    /// a question whose answer is always "none". The detector, and the e2e
+    /// fixture built on it, tested an empty set.
+    fn foreign_placeholders(&self, hostname: &str) -> Vec<&str> {
+        self.secrets
+            .iter()
+            .filter(|entry| !entry.allow.matches(hostname))
+            .map(|entry| entry.placeholder.as_str())
+            .filter(|placeholder| !placeholder.is_empty())
             .collect()
     }
 }
@@ -518,6 +559,8 @@ pub enum Decision<'a> {
         secrets: Vec<&'a SecretEntry>,
         injects: Vec<&'a InjectEntry>,
         observes: Vec<&'a ObserveEntry>,
+        /// Placeholders this host may NOT receive — the leak scan's needles.
+        foreign_placeholders: Vec<&'a str>,
     },
 }
 
@@ -572,7 +615,7 @@ mod tests {
                 fetchable: Some("$.resp.html_url".into()),
                 url_fallback: None,
             }],
-            google_adc: false,
+            metadata_flavor: None,
         }
     }
 
@@ -594,6 +637,7 @@ mod tests {
                 secrets,
                 injects,
                 observes,
+                ..
             } => {
                 assert!(secrets.is_empty());
                 assert_eq!(injects.len(), 1);
@@ -614,6 +658,7 @@ mod tests {
                 secrets,
                 injects,
                 observes,
+                ..
             } => {
                 assert!(secrets.is_empty());
                 assert!(injects.is_empty());
@@ -636,6 +681,59 @@ mod tests {
     #[test]
     fn decision_reject_when_neither_matches() {
         assert!(matches!(state().decide("api.evil.com"), Decision::Reject));
+    }
+
+    #[test]
+    fn a_credential_exchange_host_is_refused_even_when_the_network_allows_it() {
+        // ADR 0109 S5: a broad Google allow beside a narrow injection used to
+        // splice STS through, because the request-level denylist only ran on
+        // intercepted connections. Admission now refuses the host outright.
+        let mut s = state();
+        s.network_allow = HostList::from_manifest(&["*.googleapis.com".into()], &[]).unwrap();
+        for host in [
+            "sts.googleapis.com",
+            "sts.mtls.googleapis.com",
+            "oauth2.googleapis.com",
+            "iamcredentials.googleapis.com",
+        ] {
+            assert!(
+                matches!(s.decide(host), Decision::Reject),
+                "{host} must be refused",
+            );
+        }
+    }
+
+    #[test]
+    fn allow_all_does_not_reopen_a_credential_exchange_host() {
+        let mut s = state();
+        s.allow_all = true;
+        assert!(matches!(s.decide("sts.googleapis.com"), Decision::Reject));
+    }
+
+    #[test]
+    fn an_operation_gated_host_is_inspected_rather_than_spliced() {
+        // The credential-minting rules for these hosts read the request line,
+        // which only an intercepted connection produces.
+        let mut s = state();
+        s.network_allow = HostList::from_manifest(&["*.googleapis.com".into()], &[]).unwrap();
+        match s.decide("iam.googleapis.com") {
+            Decision::Intercept {
+                secrets,
+                injects,
+                observes,
+                ..
+            } => {
+                assert!(secrets.is_empty());
+                assert!(injects.is_empty());
+                assert!(observes.is_empty());
+            }
+            other => panic!("expected Intercept, got {other:?}"),
+        }
+        // A host with no operation rule keeps the cheaper splice.
+        assert!(matches!(
+            s.decide("storage.googleapis.com"),
+            Decision::Bypass
+        ));
     }
 
     #[test]

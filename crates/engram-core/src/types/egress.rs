@@ -15,14 +15,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::types::image::SecretMode;
-use crate::types::integration::CredentialMintSource;
+use crate::types::integration::{CredentialMintSource, MetadataFlavor};
 use crate::{SandboxId, SessionId};
 
 /// Per-session egress policy the host-agent's proxy registers
 /// against a session's `guest_ip`. Built by the coordinator from
 /// the image manifest + resolved secret bundle, shipped to the
 /// owning host over the WS, applied locally by the host-agent.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEgressPolicy {
     pub session_id: SessionId,
     pub sandbox_id: SandboxId,
@@ -57,10 +57,11 @@ pub struct SessionEgressPolicy {
     /// request's real response. `#[serde(default)]` so older policies decode.
     #[serde(default)]
     pub observes: Vec<EgressObserveEntry>,
-    /// Whether this session can use the host-side Google metadata-compatible
-    /// ADC endpoint. The endpoint returns only an opaque placeholder token.
+    /// Which cloud metadata service the host serves for this session, if any.
+    /// The endpoint returns only an opaque placeholder token; the proxy
+    /// substitutes the real credential on the wire.
     #[serde(default)]
-    pub google_adc: bool,
+    pub metadata_flavor: Option<MetadataFlavor>,
     /// Image's secret delivery mode. The proxy uses this to decide
     /// whether to MITM (`Broker`) or just SNI-filter (`Literal`).
     pub secret_mode: SecretMode,
@@ -70,7 +71,7 @@ pub struct SessionEgressPolicy {
 /// guest sees in its env (`engram_ph_<session>_<hash>`); the proxy
 /// replaces it with `real_value` in outbound HTTPS traffic when the
 /// destination SNI matches `allow_hosts` / `allow_host_patterns`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressSecretEntry {
     pub placeholder: String,
     pub real_value: String,
@@ -85,7 +86,7 @@ pub struct EgressSecretEntry {
 /// request policy (`methods` + `path_globs`), the proxy adds
 /// `header_name: <header_template with "{}" → secret>`. The guest never
 /// holds the secret. Empty `methods`/`path_globs` = any.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressInjectEntry {
     pub secret: String,
     pub header_name: String,
@@ -126,7 +127,7 @@ pub struct EgressInjectEntry {
 /// request policy (`methods` + `path_globs`), the proxy parses the response
 /// and emits an `IntegrationAsset` (`provider`/`asset_kind`/`surface`) built
 /// from `data` + `fetchable`, gated by `success_status_class`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressObserveEntry {
     pub allow_hosts: Vec<String>,
     pub allow_host_patterns: Vec<String>,

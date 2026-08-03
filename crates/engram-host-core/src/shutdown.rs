@@ -1,7 +1,8 @@
 //! The SIGTERM shutdown-ladder DECISIONS (ADR 0098 Phase 2, Flow A).
 //!
 //! When a host-agent pod receives SIGTERM it walks a **linear ladder**:
-//! abort the background tasks, run a bounded final disk-flush over the
+//! abort the background tasks, quiesce captures and drain (bounded) any
+//! capture still in flight, run a bounded final disk-flush over the
 //! surviving NBD data planes, abandon those planes (leaving the kernel-side
 //! devices alive for the successor), export any still-un-uploaded dirty tier
 //! to the node-local shutdown spool, and detach the microVMs. The 2026-07-16
@@ -33,10 +34,27 @@ use std::time::Duration;
 /// detach.
 pub const DEFAULT_FLUSH_BUDGET_SECS: f64 = 20.0;
 
+/// Default capture-drain budget (seconds) when
+/// `ENGRAM_SHUTDOWN_CAPTURE_DRAIN_BUDGET_SECS` is unset, unparseable, or
+/// non-positive. A diff capture in flight at SIGTERM has already consumed
+/// the KVM dirty bitmap; if the process exits under it, the runtime
+/// teardown cancels its post-processing tasks and the checkpoint chain is
+/// poisoned (2026-08-03 alert: `chain_poisoned` fired on every rollout
+/// wave that caught a capture mid-finalize). The drain waits for in-flight
+/// captures to complete so the chain-head record lands and the successor
+/// rehydrates a Diff-capable chain. 30 s covers the normal diff finalize
+/// (~1–6 s post-ADR-0101-Phase-A) with room for a slow upload; together
+/// with the 20 s flush budget it fits the DaemonSet's 120 s
+/// `terminationGracePeriodSeconds` with headroom. A Full re-chunk that
+/// outlives the budget is logged as a straggler and poisons at exit —
+/// same as today, now the rare case.
+pub const DEFAULT_CAPTURE_DRAIN_BUDGET_SECS: f64 = 30.0;
+
 /// The SIGTERM ladder's stages, in ladder order. Declaration order **is** the
 /// progression order (the derived [`Ord`] compares by it), so the ordering is
-/// auditable: `Signaled < TasksAborted < FinalFlush < Abandon < SpoolExport <
-/// Detached`. The ladder is strictly linear — there are no branches.
+/// auditable: `Signaled < TasksAborted < CaptureDrain < FinalFlush < Abandon <
+/// SpoolExport < Detached`. The ladder is strictly linear — there are no
+/// branches.
 ///
 /// The enum is wildcard-free at its use sites and has an explicit [`LADDER`]
 /// array, so a new stage is a compile error rather than a silent gap.
@@ -49,6 +67,12 @@ pub enum ShutdownStage {
     /// The background tasks (heartbeat, gRPC, registration/rehydrate) are
     /// aborted — the largest insert-after-sweep source is removed (#224).
     TasksAborted,
+    /// The bounded drain of in-flight captures. New captures were refused
+    /// from `Signaled` on (the quiesce flag); a capture already past FC's
+    /// `PUT /snapshot/create` has consumed the KVM dirty bitmap, so the
+    /// ladder waits for it here — killing it at process exit would poison
+    /// its checkpoint chain (2026-08-03 `chain_poisoned` alert).
+    CaptureDrain,
     /// The bounded final disk-flush pass over the surviving NBD data planes.
     FinalFlush,
     /// The terminal abandon sweep: raise `abandoning`, drain-twice, leave the
@@ -65,9 +89,10 @@ pub enum ShutdownStage {
 impl ShutdownStage {
     /// Every stage, in ladder order. A new [`ShutdownStage`] variant that is
     /// not added here is a compile error at the array literal.
-    pub const LADDER: [ShutdownStage; 6] = [
+    pub const LADDER: [ShutdownStage; 7] = [
         ShutdownStage::Signaled,
         ShutdownStage::TasksAborted,
+        ShutdownStage::CaptureDrain,
         ShutdownStage::FinalFlush,
         ShutdownStage::Abandon,
         ShutdownStage::SpoolExport,
@@ -111,6 +136,17 @@ pub fn flush_budget(env_value: Option<f64>) -> Duration {
     let secs = env_value
         .filter(|v| *v > 0.0)
         .unwrap_or(DEFAULT_FLUSH_BUDGET_SECS);
+    Duration::from_secs_f64(secs)
+}
+
+/// The capture-drain deadline for the [`CaptureDrain`](ShutdownStage::CaptureDrain)
+/// stage, from a pre-parsed `ENGRAM_SHUTDOWN_CAPTURE_DRAIN_BUDGET_SECS` value.
+/// Non-positive / absent ⇒ the default. Same pure parse-and-default shape as
+/// [`flush_budget`].
+pub fn capture_drain_budget(env_value: Option<f64>) -> Duration {
+    let secs = env_value
+        .filter(|v| *v > 0.0)
+        .unwrap_or(DEFAULT_CAPTURE_DRAIN_BUDGET_SECS);
     Duration::from_secs_f64(secs)
 }
 
@@ -173,6 +209,42 @@ pub fn is_straggler(dirty_bytes: u64) -> bool {
     dirty_bytes > 0
 }
 
+/// What an `NbdHandle` drop does with the KERNEL side of its device
+/// (2026-08-02 durability-rollback RCA).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NbdDropAction {
+    /// Normal operation: a dropped handle netlink-disconnects its device.
+    /// Correct for deliberate teardown (destroy), where the guest is gone
+    /// and the device must return to the pool.
+    Disconnect,
+    /// Shutdown is underway: leave the kernel config alive. Between SIGTERM
+    /// and process exit, a drop is never a deliberate survivor teardown —
+    /// the abandon sweep uses `abandon()` (which skips `Drop`) — so any
+    /// handle that reaches `Drop` in that window is unwind or teardown
+    /// collateral. A disconnect from that path de-configures a surviving
+    /// guest's live device: the successor's RECONFIGURE then meets "not
+    /// configured" and the survivor becomes an uncapturable quarantine
+    /// (2026-08-02: a panic between the flush pass and the abandon sweep
+    /// disconnected four survivors this way; the coordinator then
+    /// destroyed them past their acked writes).
+    LeaveKernelConfigured,
+}
+
+/// The pure drop decision: `shutdown_underway` is the terminal
+/// shutdown-abandon flag the driver raises at SIGTERM (before the
+/// background-task aborts — an aborted task's dropped locals can hold a
+/// live handle) and never lowers. A deliberate destroy that races the
+/// shutdown window leaves its device configured-but-unowned; the
+/// successor's startup stale-binding sweep reclaims exactly that state,
+/// so the conservative arm never leaks a device past one generation.
+pub fn nbd_drop_action(shutdown_underway: bool) -> NbdDropAction {
+    if shutdown_underway {
+        NbdDropAction::LeaveKernelConfigured
+    } else {
+        NbdDropAction::Disconnect
+    }
+}
+
 /// The auditable shutdown plan the driver executes: the deadline the
 /// final-flush fan-out is budgeted against, plus the (constant, linear)
 /// stage ladder. The survivor set is *not* part of the plan — the fan-out
@@ -180,19 +252,22 @@ pub fn is_straggler(dirty_bytes: u64) -> bool {
 /// arithmetic here is the deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShutdownPlan {
+    /// The capture-drain deadline (from the capture-drain budget).
+    pub capture_drain_deadline: Duration,
     /// The final-flush deadline (from the flush budget).
     pub flush_deadline: Duration,
 }
 
 impl ShutdownPlan {
     /// The ladder this plan is walked through, in order.
-    pub const LADDER: [ShutdownStage; 6] = ShutdownStage::LADDER;
+    pub const LADDER: [ShutdownStage; 7] = ShutdownStage::LADDER;
 }
 
-/// Build the shutdown plan from the pre-parsed budget env value.
-pub fn plan_shutdown(env_value: Option<f64>) -> ShutdownPlan {
+/// Build the shutdown plan from the pre-parsed budget env values.
+pub fn plan_shutdown(flush_env: Option<f64>, capture_drain_env: Option<f64>) -> ShutdownPlan {
     ShutdownPlan {
-        flush_deadline: flush_budget(env_value),
+        capture_drain_deadline: capture_drain_budget(capture_drain_env),
+        flush_deadline: flush_budget(flush_env),
     }
 }
 
@@ -224,12 +299,41 @@ mod tests {
     }
 
     #[test]
-    fn plan_shutdown_carries_the_budget_and_the_linear_ladder() {
+    fn capture_drain_budget_defaults_on_absent_or_non_positive() {
         assert_eq!(
-            plan_shutdown(Some(3.0)).flush_deadline,
-            Duration::from_secs(3)
+            capture_drain_budget(None),
+            Duration::from_secs_f64(DEFAULT_CAPTURE_DRAIN_BUDGET_SECS)
         );
+        assert_eq!(
+            capture_drain_budget(Some(0.0)),
+            Duration::from_secs_f64(DEFAULT_CAPTURE_DRAIN_BUDGET_SECS)
+        );
+        assert_eq!(
+            capture_drain_budget(Some(-1.0)),
+            Duration::from_secs_f64(DEFAULT_CAPTURE_DRAIN_BUDGET_SECS)
+        );
+        assert_eq!(
+            capture_drain_budget(Some(12.5)),
+            Duration::from_secs_f64(12.5)
+        );
+    }
+
+    #[test]
+    fn plan_shutdown_carries_the_budgets_and_the_linear_ladder() {
+        let plan = plan_shutdown(Some(3.0), Some(9.0));
+        assert_eq!(plan.flush_deadline, Duration::from_secs(3));
+        assert_eq!(plan.capture_drain_deadline, Duration::from_secs(9));
         assert_eq!(ShutdownPlan::LADDER, ShutdownStage::LADDER);
+    }
+
+    #[test]
+    fn nbd_drop_disconnects_only_outside_shutdown() {
+        // Normal operation: destroy teardown must disconnect.
+        assert_eq!(nbd_drop_action(false), NbdDropAction::Disconnect);
+        // Shutdown underway: every drop is unwind/teardown collateral — the
+        // kernel config must survive for the successor's RECONFIGURE
+        // (2026-08-02 durability-rollback RCA).
+        assert_eq!(nbd_drop_action(true), NbdDropAction::LeaveKernelConfigured);
     }
 
     #[test]
@@ -242,6 +346,14 @@ mod tests {
         assert_eq!(
             ShutdownStage::Signaled.next(),
             Some(ShutdownStage::TasksAborted)
+        );
+        assert_eq!(
+            ShutdownStage::TasksAborted.next(),
+            Some(ShutdownStage::CaptureDrain)
+        );
+        assert_eq!(
+            ShutdownStage::CaptureDrain.next(),
+            Some(ShutdownStage::FinalFlush)
         );
         assert_eq!(
             ShutdownStage::SpoolExport.next(),
@@ -260,6 +372,7 @@ mod tests {
         // insert must abandon-in-place.
         assert!(admits_new_plane(ShutdownStage::Signaled));
         assert!(admits_new_plane(ShutdownStage::TasksAborted));
+        assert!(admits_new_plane(ShutdownStage::CaptureDrain));
         assert!(admits_new_plane(ShutdownStage::FinalFlush));
         assert!(!admits_new_plane(ShutdownStage::Abandon));
         assert!(!admits_new_plane(ShutdownStage::SpoolExport));

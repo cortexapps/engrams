@@ -100,6 +100,7 @@ interface FakeSession {
   mode: string;
   createdAt: string;
   lastActiveAt: string;
+  lastEventAt?: string;
   hostId?: string;
   sandboxId?: string;
   suggestedTitle?: string;
@@ -565,6 +566,10 @@ const fakeConnections: IntegrationConnectionStore = {
     createdAt: new Date(0),
     updatedAt: new Date(0),
   }),
+  getMany: async (ids) => {
+    const rows = await Promise.all(ids.map((id) => fakeConnections.get(id)));
+    return rows.filter((row) => row != null);
+  },
   getDefault: async (provider) => fakeConnections.get(`default-${provider}`),
   create: async () => { throw new Error("unused"); },
   update: async () => { throw new Error("unused"); },
@@ -731,6 +736,7 @@ function listSessionRef(
     integrationGrants: null,
     integrationConnections: null,
     integrationPrincipalId: null,
+    integrationSnapshotHash: null,
     createdAt: new Date("2026-01-01T00:00:00.000Z"),
   };
 }
@@ -739,6 +745,7 @@ function liveSession(
   id: string,
   status: string,
   lastActiveAt: string,
+  lastEventAt?: string,
 ): FakeSession {
   return {
     id,
@@ -747,6 +754,7 @@ function liveSession(
     mode: "agent",
     createdAt: "2026-01-01T00:00:00.000Z",
     lastActiveAt,
+    lastEventAt,
   };
 }
 
@@ -945,7 +953,11 @@ describe("TaskService — ListTasks ADR 0087", () => {
     expect(twoUsers.totalCount).toBe(3);
   });
 
-  test("orders by session lastActiveAt with createdAt fallback", async () => {
+  test("falls back to lastActiveAt then createdAt when lastEventAt is unset", async () => {
+    // None of the list fixture's sessions carries a lastEventAt (a row
+    // predating migration 0068, or a session that has not emitted an event),
+    // so the order must degrade to the old lastActiveAt key — and to the
+    // task's own createdAt for the rows with no session at all.
     const resp = await makeListClient(ADMIN_ID, "admin").listTasks({ scope: "all" });
     expect(resp.tasks.map((task) => task.id)).toEqual([
       `unattributed-${LIST_ORPHAN_SESSION}`,
@@ -954,6 +966,46 @@ describe("TaskService — ListTasks ADR 0087", () => {
       LIST_MEMBER_TITLE,
       LIST_MEMBER_ID,
       LIST_SYSTEM,
+    ]);
+  });
+
+  test("orders by lastEventAt, so a working session outranks an evicted one", async () => {
+    // The ordering bug lastEventAt fixes. `working` has been Active for a
+    // month — its lastActiveAt is frozen at the Active flip, but events keep
+    // landing. `evicted` did nothing for a month, then the Active → Evicting
+    // flip re-stamped its lastActiveAt to now. On the lastActiveAt key
+    // `evicted` wins; on the activity clock `working` does.
+    const working = liveSession(
+      "sort-working",
+      "active",
+      "2026-01-01T00:00:00.000Z", // entered Active a month ago
+      "2026-02-01T00:00:00.000Z", // still emitting events
+    );
+    const evicted = liveSession(
+      "sort-evicted",
+      "idle",
+      "2026-01-20T00:00:00.000Z", // re-stamped by the eviction transition
+      "2026-01-02T00:00:00.000Z", // last real event, long before that
+    );
+    const client = makeListClient(
+      ADMIN_ID,
+      "admin",
+      {
+        tasks: [
+          listTaskRow("sort-task-working", ADMIN_ID, "2026-01-01T00:00:00.000Z"),
+          listTaskRow("sort-task-evicted", ADMIN_ID, "2026-01-01T00:00:00.000Z"),
+        ],
+        sessionRefs: [
+          listSessionRef("sort-task-working", working.id),
+          listSessionRef("sort-task-evicted", evicted.id),
+        ],
+      },
+      [working, evicted],
+    );
+    const resp = await client.listTasks({ scope: "all" });
+    expect(resp.tasks.map((task) => task.id)).toEqual([
+      "sort-task-working",
+      "sort-task-evicted",
     ]);
   });
 

@@ -1,6 +1,20 @@
 import { z } from "zod";
+import { ConnectError } from "@connectrpc/connect";
 
+import {
+  makeArtifactService,
+  type ArtifactService,
+} from "../artifacts/service.ts";
+import { config } from "../config.ts";
+import { sessions } from "../control-plane/client.ts";
+import {
+  collectArtifactBytes,
+  type ArtifactStreamClient,
+} from "../control-plane/artifact-fetch.ts";
+import { makeArtifactStore } from "../db/artifacts.ts";
+import type { ArtifactWithVersions } from "../db/artifacts.ts";
 import { makePapercutStore, type PapercutStore } from "../db/papercuts.ts";
+import { mintRawToken, rawArtifactPath } from "../crypto/raw-token.ts";
 import { tools, type ToolRegistry } from "./registry.ts";
 
 const QuestionOptionSchema = z.object({
@@ -31,7 +45,138 @@ export const PlanDecisionSchema = z.object({
 });
 
 export interface BuiltinToolDeps {
-  papercuts: PapercutStore;
+  papercuts?: PapercutStore;
+  /** The shared artifact service layer (defaults to the real store +
+   * coordinator pull client). */
+  artifacts?: ArtifactService;
+  /** Byte reader for get + include_content (defaults to the coordinator
+   * GetArtifact stream). */
+  artifactStream?: ArtifactStreamClient;
+  now?: () => Date;
+}
+
+// ---------------------------------------------------------------------------
+// The Artifact tool (single tool, action-discriminated — modeled on
+// Claude Code's Artifact tool)
+// ---------------------------------------------------------------------------
+
+// One flat object schema, NOT a discriminated union: the claude CLI
+// requires every MCP tool's inputSchema to be a top-level
+// `type: "object"` JSON Schema, and rejects the WHOLE tools/list when
+// one tool emits an `anyOf` (session 3acf9bd1 — every injected tool
+// vanished). Per-action requirements live in the refinement so a bad
+// call still names the missing field.
+const ArtifactActionSchema = z
+  .object({
+    action: z
+      .enum(["publish", "update", "list", "get", "share", "unshare"])
+      .describe("What to do"),
+    file_path: z
+      .string()
+      .optional()
+      .describe("publish/update: path of the HTML or Markdown file in this session"),
+    artifact_id: z
+      .string()
+      .optional()
+      .describe("update/get/share/unshare: the artifact id"),
+    title: z.string().optional().describe("Display title; defaults to the file name"),
+    scope: z
+      .enum(["mine", "shared"])
+      .optional()
+      .describe('list: "mine" (default) or "shared" (artifacts shared with the org)'),
+    version: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe("get: which version's content to read; defaults to the current one"),
+    include_content: z
+      .boolean()
+      .optional()
+      .describe(
+        "get: also return the artifact's source text inline (artifacts are " +
+          "HTML/Markdown; capped at 256 KiB) — the reliable way to read a " +
+          "version from inside a session",
+      ),
+  })
+  .superRefine((v, ctx) => {
+    const need = (field: "file_path" | "artifact_id") => {
+      if (v[field] === undefined || v[field] === "") {
+        ctx.addIssue({
+          code: "custom",
+          path: [field],
+          message: `required for action "${v.action}"`,
+        });
+      }
+    };
+    if (v.action === "publish" || v.action === "update") need("file_path");
+    if (v.action === "update" || v.action === "get" || v.action === "share" || v.action === "unshare") {
+      need("artifact_id");
+    }
+  });
+
+const ToolArtifactSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  file_name: z.string(),
+  media_type: z.string(),
+  size_bytes: z.number(),
+  visibility: z.string(),
+  current_version: z.number(),
+  url: z.string().describe("Stable page URL (share this)"),
+  raw_url: z.string().describe("Short-lived direct byte URL (fetch this)"),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+
+const ArtifactOutputSchema = z.object({
+  artifact: ToolArtifactSchema.optional(),
+  artifacts: z.array(ToolArtifactSchema).optional(),
+  total_count: z.number().optional(),
+  /** get + include_content: the requested version's source text. */
+  content: z.string().optional(),
+  content_version: z.number().optional(),
+});
+
+/** Inline-content ceiling: enough for any styled report (the inlined
+ * house fonts are ~100 KiB) without flooding the model's context. */
+const MAX_INLINE_CONTENT_BYTES = 256 * 1024;
+
+function defaultArtifactService(): ArtifactService {
+  return makeArtifactService({
+    store: makeArtifactStore(),
+    pull: sessions,
+  });
+}
+
+function toolArtifact(
+  row: {
+    id: string;
+    title: string;
+    fileName: string;
+    mediaType: string;
+    sizeBytes: number;
+    visibility: string;
+    currentVersion: number;
+    createdAt: Date;
+    updatedAt: Date;
+  },
+  now: Date,
+): z.input<typeof ToolArtifactSchema> {
+  const base = config.baseUrl.replace(/\/$/, "");
+  return {
+    id: row.id,
+    title: row.title,
+    file_name: row.fileName,
+    media_type: row.mediaType,
+    size_bytes: row.sizeBytes,
+    visibility: row.visibility,
+    current_version: row.currentVersion,
+    url: `${base}/artifacts/${row.id}`,
+    raw_url: `${base}${rawArtifactPath(row.id, mintRawToken(row.id, now))}`,
+    created_at: row.createdAt.toISOString(),
+    updated_at: row.updatedAt.toISOString(),
+  };
 }
 
 /** Register tools that every production session receives. */
@@ -39,9 +184,16 @@ export function registerBuiltinTools(
   registry: ToolRegistry = tools,
   deps?: BuiltinToolDeps,
 ): void {
+  // No claude binding: claude CLI >= 2.1.187 removed the AskUserQuestion
+  // built-in from headless `--print` mode, so claude receives this tool
+  // through the injected MCP path like any custom harness. The description
+  // must carry the affordance the built-in's training used to provide.
   registry.register({
     name: "ask_user_question",
-    description: "Ask the user one or more structured questions.",
+    description:
+      "Ask the user one or more structured questions and wait for their " +
+      "answers. Use this whenever you need a decision, clarification, or " +
+      "preference from the user before you continue.",
     input: QuestionsSchema,
     output: AnswersSchema,
     handling: "session",
@@ -51,14 +203,14 @@ export function registerBuiltinTools(
       web: "UserQuestionCard",
     },
     nativeBindings: {
-      claude: "AskUserQuestion",
       codex: "requestUserInput",
     },
   });
 
-  // ADR 0107. Native-bound to claude ExitPlanMode; deliberately NO codex
-  // binding — codex and custom harnesses receive it as an injected dynamic
-  // tool through the generic deferred path.
+  // ADR 0107. No native bindings: claude CLI >= 2.1.187 removed the
+  // ExitPlanMode built-in from headless `--print` mode (codex never had
+  // one), so every harness receives it as an injected tool through the
+  // generic deferred path.
   registry.register({
     name: "exit_plan_mode",
     description:
@@ -74,8 +226,129 @@ export function registerBuiltinTools(
       slack: "planEffect",
       web: "PlanCard",
     },
-    nativeBindings: {
-      claude: "ExitPlanMode",
+  });
+
+  // The single artifact tool (owner-scoped by construction: every action
+  // runs the shared service layer's CASL checks as the session's owner).
+  registry.register({
+    name: "Artifact",
+    description:
+      "Publish, update, and fetch hosted artifacts — versioned HTML or " +
+      "Markdown documents with a stable URL, visible across this user's " +
+      "sessions (sharing a file into the chat is separate: engram-share). " +
+      "Actions: publish {file_path, title?} creates a new artifact from a " +
+      "file in this session; update {artifact_id, file_path} publishes the " +
+      "next version at the same URL; list {scope?} and get {artifact_id, " +
+      "version?, include_content?} read the user's artifacts — pass " +
+      "include_content: true to receive a version's source text inline " +
+      "(the reliable way to read an artifact from inside a session; " +
+      "raw_url and url are for humans in browsers and may be unreachable " +
+      "from the session shell); share/unshare {artifact_id} toggle " +
+      "org-wide visibility. Only text/html and text/markdown may be " +
+      "published. " +
+      "BEFORE authoring an HTML artifact, read the artifact-design skill " +
+      "(mounted in this session when available) — it carries the design " +
+      "brief. Author HTML as a single self-contained file (inline CSS and " +
+      "JS; no external requests — pages are served inside an opaque-origin " +
+      "sandbox) and honor a ?theme=light|dark query parameter so the page " +
+      "matches the viewer's engrams theme.",
+    input: ArtifactActionSchema,
+    output: ArtifactOutputSchema,
+    handling: "handled",
+    execution: "sync",
+    handler: async (ctx, args) => {
+      const service = deps?.artifacts ?? defaultArtifactService();
+      const now = deps?.now ?? (() => new Date());
+      if (ctx.userId === undefined) {
+        return {
+          error: "this session has no owning user, so it cannot manage artifacts",
+        };
+      }
+      const actor = { id: ctx.userId, role: "user" };
+      // The schema's refinement guarantees these per-action; the guards
+      // keep the narrowing honest without assertions.
+      const filePath = args.file_path ?? "";
+      const artifactId = args.artifact_id ?? "";
+      try {
+        switch (args.action) {
+          case "publish": {
+            const row = await service.publish({
+              sessionId: ctx.sessionId,
+              taskId: ctx.taskId ?? null,
+              ownerUserId: ctx.userId,
+              filePath,
+              ...(args.title !== undefined ? { title: args.title } : {}),
+            });
+            return { artifact: toolArtifact(row, now()) };
+          }
+          case "update": {
+            const row = await service.update(actor, {
+              artifactId,
+              sessionId: ctx.sessionId,
+              taskId: ctx.taskId ?? null,
+              filePath,
+              ...(args.title !== undefined ? { title: args.title } : {}),
+            });
+            return { artifact: toolArtifact(row, now()) };
+          }
+          case "list": {
+            const { rows, totalCount } = await service.list(actor, {
+              scope: args.scope ?? "mine",
+              page: 1,
+              pageSize: 50,
+            });
+            const at = now();
+            return {
+              artifacts: rows.map((row) => toolArtifact(row, at)),
+              total_count: totalCount,
+            };
+          }
+          case "get": {
+            const row = await service.get(actor, artifactId);
+            const result: z.input<typeof ArtifactOutputSchema> = {
+              artifact: toolArtifact(row, now()),
+            };
+            if (args.include_content) {
+              // The reliable in-guest read: raw_url points at the
+              // browser-facing origin, which a sandbox may not reach
+              // (papercut, session c60ac26c) — so hand the source back
+              // through the tool instead.
+              const wanted = args.version ?? row.currentVersion;
+              const vrow = row.versions.find((v) => v.version === wanted);
+              if (!vrow) {
+                return { error: `artifact has no version ${wanted}` };
+              }
+              const stream = deps?.artifactStream ?? (sessions as ArtifactStreamClient);
+              const fetched = await collectArtifactBytes(
+                stream,
+                vrow.sessionId,
+                vrow.coordArtifactId,
+                { maxBytes: MAX_INLINE_CONTENT_BYTES },
+              );
+              result.content = new TextDecoder().decode(fetched.bytes);
+              result.content_version = wanted;
+            }
+            return result;
+          }
+          case "share":
+          case "unshare": {
+            const row = await service.setVisibility(
+              actor,
+              artifactId,
+              args.action === "share" ? "org" : "private",
+            );
+            return { artifact: toolArtifact(row, now()) };
+          }
+        }
+      } catch (error) {
+        const message =
+          error instanceof ConnectError
+            ? error.rawMessage
+            : error instanceof Error
+              ? error.message
+              : String(error);
+        return { error: message };
+      }
     },
   });
 

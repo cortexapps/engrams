@@ -29,6 +29,8 @@
  */
 
 import { readdirSync, readFileSync } from "node:fs";
+
+import type { ConnectionProvider } from "../integrations/providers/provider.ts";
 import { join } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -376,8 +378,17 @@ export interface IntegrationPolicyJson {
   // these). Mirrors engram_core::types::IntegrationPolicy.
   network: IntegrationNetworkJson;
   secrets: IntegrationSecretJson[];
-  google_adc: boolean;
+  /**
+   * Which cloud metadata service the host serves for the session, or null for
+   * none. Mirrors `engram_core::types::integration::MetadataFlavor` — a
+   * boolean here would have to grow a second field per cloud, and the proxy
+   * would then have to decide which one wins.
+   */
+  metadata_flavor: MetadataFlavor | null;
 }
+
+/** Keep in step with `MetadataFlavor` in engram-core. */
+export type MetadataFlavor = "gce";
 
 /** Profile-side inputs compiled into the policy's network + secrets (ADR 0057). */
 export interface SessionPolicyInputs {
@@ -409,7 +420,7 @@ export function policyHasContent(p: IntegrationPolicyJson): boolean {
     p.network.allow_hosts.length > 0 ||
     p.network.allow_host_patterns.length > 0 ||
     p.network.default === "allow" ||
-    p.google_adc
+    p.metadata_flavor !== null
   );
 }
 
@@ -1325,7 +1336,7 @@ export function compileIntegrationPolicy(
     allow_hosts: s.allowHosts ?? [],
     allow_host_patterns: s.allowHostPatterns ?? [],
   }));
-  return { injects, observes, network, secrets, google_adc: false };
+  return { injects, observes, network, secrets, metadata_flavor: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -1445,6 +1456,12 @@ export interface CatalogCapability {
   access: CatalogAccess;
   /** The asset kind this op surfaces, if any (e.g. `pull_request`). */
   asset?: string;
+  /** Operator-facing name, for a provider that serves its own operations. */
+  label?: string;
+  /** The exact host a curated operation calls. */
+  host?: string;
+  /** For a host-less operation, the endpoint kind that makes it usable. */
+  endpointRule?: "google-api" | "non-google-api";
 }
 
 /** Member-safe view of one connector — display identity + the powers it grants +
@@ -1456,6 +1473,12 @@ export interface ProviderCatalogEntry {
   credentialSource: "mint" | "inject";
   hosts: string[];
   capabilities: CatalogCapability[];
+  /**
+   * "singleton" — one org-wide credential slot; "named" — an administrator
+   * configures connections, each its own authority (ADR 0109). The web used to
+   * decide this by hard-coding the one provider it knew was named.
+   */
+  connectionModel: "singleton" | "named";
 }
 
 /** GET/HEAD/OPTIONS → read; otherwise write (a method-less op is conservatively write). */
@@ -1470,7 +1493,10 @@ function accessOf(method: string | undefined): CatalogAccess {
  * op for that action is kept), each tagged with its derived read/write access.
  * Sorted by provider.
  */
-export function buildProviderCatalog(registry: Map<string, Connector>): ProviderCatalogEntry[] {
+export function buildProviderCatalog(
+  registry: Map<string, Connector>,
+  providers: ReadonlyMap<string, ConnectionProvider>,
+): ProviderCatalogEntry[] {
   const entries: ProviderCatalogEntry[] = [];
   for (const connector of registry.values()) {
     const byAction = new Map<string, CatalogCapability>();
@@ -1498,6 +1524,38 @@ export function buildProviderCatalog(registry: Map<string, Connector>): Provider
       credentialSource: connector.credential.source,
       hosts: connector.hosts,
       capabilities: [...byAction.values()],
+      connectionModel: "singleton",
+    });
+  }
+  // A named-connection provider is not a connector: it has no org-wide
+  // credential and its operations come from its own catalog. Serving it here
+  // means the web renders every integration from ONE response, instead of
+  // pushing in a hand-written entry for the provider it happens to know.
+  for (const provider of providers.values()) {
+    entries.push({
+      provider: provider.key,
+      display: {
+        name: provider.displayName,
+        blurb: provider.blurb,
+        category: provider.category,
+        icon: { mono: defaultIconMono(provider.key), color: defaultIconColor(provider.key) },
+      },
+      credentialSource: "mint",
+      hosts: [
+        ...new Set(
+          provider.operations.describe
+            .map((operation) => operation.host)
+            .filter((host): host is string => host !== null),
+        ),
+      ],
+      capabilities: provider.operations.describe.map((operation) => ({
+        action: operation.action,
+        access: operation.access,
+        label: operation.label,
+        ...(operation.host ? { host: operation.host } : {}),
+        ...(operation.endpointRule ? { endpointRule: operation.endpointRule } : {}),
+      })),
+      connectionModel: "named",
     });
   }
   entries.sort((a, b) => a.provider.localeCompare(b.provider));

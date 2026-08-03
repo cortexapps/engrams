@@ -30,12 +30,18 @@ export function PowerSelector({
   view,
   isOn,
   onToggle,
+  labelFor = resourceLabel,
+  noteFor,
 }: {
   view: ConnectorView;
   /** Whether `provider:action` is currently granted. */
   isOn: (action: string) => boolean;
   /** Grant/revoke a single `provider:action`. */
   onToggle: (action: string, on: boolean) => void;
+  /** Curated label for a resource; defaults to the slug-derived label. */
+  labelFor?: (resource: string) => string;
+  /** Optional caution note beside a resource row (e.g. an orphaned grant). */
+  noteFor?: (resource: string) => string | undefined;
 }) {
   const [q, setQ] = useState("");
 
@@ -45,7 +51,7 @@ export function PowerSelector({
     const resource = resourceOf(cap.action);
     let g = byResource.get(resource);
     if (!g) {
-      g = { resource, label: resourceLabel(resource) };
+      g = { resource, label: labelFor(resource) };
       byResource.set(resource, g);
       groups.push(g);
     }
@@ -97,6 +103,7 @@ export function PowerSelector({
         {shown.map((g) => {
           const readOn = g.read ? isOn(g.read.action) : false;
           const writeOn = g.write ? isOn(g.write.action) : false;
+          const note = noteFor?.(g.resource);
           return (
             <div
               key={g.resource}
@@ -110,6 +117,7 @@ export function PowerSelector({
               >
                 {g.label}
               </span>
+              {note && <span className="text-[0.66rem] text-instrument-caution">{note}</span>}
               {g.asset && (
                 <span className="text-[0.66rem] text-muted-foreground">
                   {g.asset.replace(/_/g, " ")}

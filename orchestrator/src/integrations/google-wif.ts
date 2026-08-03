@@ -1,9 +1,10 @@
 /** Google Workload Identity Federation token broker (ADR 0109). */
 
-import { createSign } from "node:crypto";
+import { createPrivateKey, createSign, type KeyObject } from "node:crypto";
 
 import type { IntegrationOidcKeyStore } from "../db/integration-oidc-keys.ts";
 import type { GoogleCloudConnectionConfig } from "../db/integration-connections.ts";
+import { isDeniedGoogleHost } from "./google-credential-denylist.ts";
 
 const STS_URL = "https://sts.googleapis.com/v1/token";
 const IAM_CREDENTIALS_ORIGIN = "https://iamcredentials.googleapis.com";
@@ -45,6 +46,18 @@ export function googleOidcAudience(provider: string): string {
     : `//iam.googleapis.com/${provider.replace(/^\/+/, "")}`;
 }
 
+/**
+ * A full workload-identity provider resource.
+ *
+ * Google's own rule for a pool id and a provider id is 4-32 characters of
+ * lowercase letters, digits and hyphens, starting with a letter. The looser
+ * `[a-z0-9-]+` this used to allow accepted ids Google rejects — a one-character
+ * id, or one starting with a digit or a hyphen — so the connection stored
+ * cleanly and only failed later, during the operator's `gcloud` run.
+ */
+const WIF_PROVIDER_RESOURCE =
+  /^\/\/iam\.googleapis\.com\/projects\/[0-9]+\/locations\/global\/workloadIdentityPools\/[a-z][a-z0-9-]{3,31}\/providers\/[a-z][a-z0-9-]{3,31}$/;
+
 export function assertGoogleCloudConfig(value: Record<string, unknown>): GoogleCloudConnectionConfig {
   const allowedKeys = new Set(["workloadIdentityProvider", "serviceAccountEmail", "endpoints"]);
   const unknownKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
@@ -56,9 +69,18 @@ export function assertGoogleCloudConfig(value: Record<string, unknown>): GoogleC
   const endpoints = value.endpoints;
   if (
     typeof workloadIdentityProvider !== "string" ||
-    !/^\/\/iam\.googleapis\.com\/projects\/[0-9]+\/locations\/global\/workloadIdentityPools\/[a-z0-9-]+\/providers\/[a-z0-9-]+$/.test(workloadIdentityProvider)
+    !WIF_PROVIDER_RESOURCE.test(workloadIdentityProvider)
   ) {
     throw new Error("workload identity provider must be a full Google provider resource");
+  }
+  // Google reserves the `gcp-` prefix on both ids. A resource string carrying
+  // one can never be created, so accepting it here only defers the failure to
+  // the operator's `gcloud` run, after the connection is already stored.
+  const reserved = workloadIdentityProvider
+    .split("/")
+    .some((segment) => segment.startsWith("gcp-"));
+  if (reserved) {
+    throw new Error("Google reserves the `gcp-` prefix for pool and provider ids");
   }
   if (
     typeof serviceAccountEmail !== "string" ||
@@ -77,12 +99,7 @@ export function assertGoogleCloudConfig(value: Record<string, unknown>): GoogleC
     ) {
       throw new Error(`endpoint "${endpoint}" must be an exact hostname`);
     }
-    if (
-      endpoint === "sts.googleapis.com" ||
-      endpoint === "oauth2.googleapis.com" ||
-      endpoint === "accounts.google.com" ||
-      endpoint === "securetoken.googleapis.com"
-    ) {
+    if (isDeniedGoogleHost(endpoint)) {
       throw new Error(`credential exchange endpoint "${endpoint}" cannot be guest-accessible`);
     }
   }
@@ -93,6 +110,19 @@ export function makeGoogleWifBroker(deps: GoogleWifBrokerDeps) {
   const now = deps.now ?? (() => new Date());
   const randomId = deps.randomId ?? (() => crypto.randomUUID());
   const fetchFn = deps.fetch ?? fetch;
+  // Parse each signing key's PEM once per kid instead of on every mint. A
+  // deployment publishes at most a handful of kids (active + retiring), so
+  // reset the cache if it ever grows past that.
+  const keyObjects = new Map<string, KeyObject>();
+  function keyObjectFor(kid: string, privateKeyPem: string): KeyObject {
+    let cached = keyObjects.get(kid);
+    if (!cached) {
+      if (keyObjects.size >= 8) keyObjects.clear();
+      cached = createPrivateKey(privateKeyPem);
+      keyObjects.set(kid, cached);
+    }
+    return cached;
+  }
 
   async function mintSubjectToken(
     config: GoogleCloudConnectionConfig,
@@ -118,7 +148,7 @@ export function makeGoogleWifBroker(deps: GoogleWifBrokerDeps) {
     const signer = createSign("RSA-SHA256");
     signer.update(input);
     signer.end();
-    return `${input}.${signer.sign(key.privateKeyPem, "base64url")}`;
+    return `${input}.${signer.sign(keyObjectFor(key.kid, key.privateKeyPem), "base64url")}`;
   }
 
   async function exchange(
@@ -169,4 +199,90 @@ export function makeGoogleWifBroker(deps: GoogleWifBrokerDeps) {
   }
 
   return { mintSubjectToken, exchange };
+}
+
+/**
+ * The operator-facing setup document for one Google Cloud connection.
+ *
+ * It used to live in the Connect RPC handler, which made the RPC layer the
+ * only place that knew how to describe a provider. It belongs with the rest of
+ * the Google WIF knowledge, behind the provider seam.
+ */
+export function googleSetupDoc(
+  row: { id: string; config: Record<string, unknown> },
+  issuer: string,
+  deploymentId: string,
+): { audience: string; gcloudScript: string; terraform: string } {
+  const google = assertGoogleCloudConfig(row.config);
+  const match = google.workloadIdentityProvider.match(
+    /^\/\/iam\.googleapis\.com\/projects\/([0-9]+)\/locations\/global\/workloadIdentityPools\/([a-z0-9-]+)\/providers\/([a-z0-9-]+)$/,
+  );
+  if (!match) throw new Error("stored Google provider resource is invalid");
+  const [, projectNumber, poolId, providerId] = match;
+  // Terraform resource names are addresses, not labels: two connections in the
+  // same project used to emit `google_iam_workload_identity_pool.engrams`
+  // twice, so applying the second setup silently redefined the first. Derive
+  // the address from the provider id, which is already unique per connection.
+  const tfName = `engrams_${providerId!.replace(/-/g, "_")}`;
+  // `engrams_organization` carries the deployment id (the issuer URL already
+  // rides in `issuer_uri`, so pinning the URL again added nothing).
+  const condition =
+    `assertion.engrams_organization == '${deploymentId}' && ` +
+    `assertion.engrams_connection == '${row.id}'`;
+  const mapping =
+    "google.subject=assertion.sub," +
+    "attribute.engrams_organization=assertion.engrams_organization," +
+    "attribute.engrams_connection=assertion.engrams_connection";
+  const principalSet =
+    `principalSet://iam.googleapis.com/projects/${projectNumber}/locations/global/` +
+    `workloadIdentityPools/${poolId}/attribute.engrams_connection/${row.id}`;
+  return {
+    audience: google.workloadIdentityProvider,
+    // An operator pastes this into a shell. Without a shebang the lines run
+    // under whatever shell they happen to use, and without `set -euo pipefail`
+    // a failed pool creation is invisible: the next command runs anyway and the
+    // script "succeeds" with a half-built pool. Pool and provider creation are
+    // describe-then-create so re-running the setup — the normal thing to do
+    // after editing endpoints — is not an ALREADY_EXISTS error.
+    gcloudScript: [
+      `#!/usr/bin/env bash`,
+      `set -euo pipefail`,
+      ``,
+      `gcloud iam workload-identity-pools describe ${poolId} --location=global --project=${projectNumber} >/dev/null 2>&1 ||`,
+      `  gcloud iam workload-identity-pools create ${poolId} --location=global --project=${projectNumber}`,
+      ``,
+      `gcloud iam workload-identity-pools providers describe ${providerId} --location=global --workload-identity-pool=${poolId} --project=${projectNumber} >/dev/null 2>&1 ||`,
+      `  gcloud iam workload-identity-pools providers create-oidc ${providerId} --location=global --workload-identity-pool=${poolId} --project=${projectNumber} --issuer-uri=${issuer} --allowed-audiences=${google.workloadIdentityProvider} --attribute-mapping=${mapping} --attribute-condition=\"${condition}\"`,
+      ``,
+      `gcloud iam service-accounts add-iam-policy-binding ${google.serviceAccountEmail} --project=${projectNumber} --role=roles/iam.workloadIdentityUser --member=${principalSet}`,
+    ].join("\n"),
+    terraform: [
+      `resource "google_iam_workload_identity_pool" "${tfName}" {`,
+      `  project                   = "${projectNumber}"`,
+      `  workload_identity_pool_id = "${poolId}"`,
+      `}`,
+      ``,
+      `resource "google_iam_workload_identity_pool_provider" "${tfName}" {`,
+      `  project                            = "${projectNumber}"`,
+      `  workload_identity_pool_id          = google_iam_workload_identity_pool.${tfName}.workload_identity_pool_id`,
+      `  workload_identity_pool_provider_id = "${providerId}"`,
+      `  attribute_mapping = {`,
+      `    "google.subject"                 = "assertion.sub"`,
+      `    "attribute.engrams_organization" = "assertion.engrams_organization"`,
+      `    "attribute.engrams_connection"   = "assertion.engrams_connection"`,
+      `  }`,
+      `  attribute_condition = "${condition}"`,
+      `  oidc {`,
+      `    issuer_uri        = "${issuer}"`,
+      `    allowed_audiences = ["${google.workloadIdentityProvider}"]`,
+      `  }`,
+      `}`,
+      ``,
+      `resource "google_service_account_iam_member" "${tfName}" {`,
+      `  service_account_id = "projects/${projectNumber}/serviceAccounts/${google.serviceAccountEmail}"`,
+      `  role               = "roles/iam.workloadIdentityUser"`,
+      `  member             = "${principalSet}"`,
+      `}`,
+    ].join("\n"),
+  };
 }

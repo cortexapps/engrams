@@ -22,6 +22,9 @@ import hooksRoute from "./routes/hooks.ts";
 import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
 import { makeGoogleOidcRoute } from "./routes/google-oidc.ts";
 import { makeConnectionCredentialBrokerRoute } from "./routes/connection-credential-broker.ts";
+import { makeOidcKeyAdminRoute } from "./routes/oidc-key-admin.ts";
+import { startOidcKeyRotation } from "./integrations/oidc-key-rotation.ts";
+import { makeIntegrationOidcKeyStore } from "./db/integration-oidc-keys.ts";
 // Importing registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
@@ -45,6 +48,7 @@ import { registerOrgSecret } from "./rpc/org-secret.ts";
 import { registerMint } from "./rpc/mint.ts";
 import { registerApiKeys } from "./rpc/api-key.ts";
 import { registerIntegration } from "./rpc/integration.ts";
+import { registerArtifacts } from "./rpc/artifacts.ts";
 import { registerAutomations } from "./rpc/automations.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
@@ -118,8 +122,12 @@ app.route("/", authConfigRoute);
 // ADR 0109: public OIDC metadata for customer WIF providers. No session or
 // credential data is returned from these endpoints.
 app.route("/", makeGoogleOidcRoute());
-// Host-only broker endpoint. The control-plane bearer authenticates callers.
+// Host-only broker endpoint. The broker's own bearer authenticates callers
+// (CONNECTION_BROKER_BEARER; the coordinator sends
+// ENGRAM_CONNECTION_BROKER_BEARER).
 app.route("/", makeConnectionCredentialBrokerRoute());
+// Explicit admin trigger for OIDC signing-key rotation (ADR 0109).
+app.route("/", makeOidcKeyAdminRoute());
 // ADR 0051 Task 20: browser-native HTTP legs (SSE events, artifact bytes, /me/harness-env).
 app.route("/", eventsRoute);
 app.route("/", artifactsRoute);
@@ -216,6 +224,10 @@ const server = buildServer(
     // per-registration webhook secrets.
     registerAutomations(router);
 
+    // Native ArtifactService: the cross-session artifact registry (owner /
+    // org-shared / admin via the shared service layer). Before passthrough.
+    registerArtifacts(router);
+
     // Generic passthrough: forwards SessionService, FleetService, ImageService
     // to the control plane with per-method CASL authz gate (ADR 0051 Task 18).
     // ADR 0053 §3: a DisableImage pre-flight blocks disabling an image that
@@ -303,6 +315,11 @@ const listenerManager = makeProductionListenerManager();
 await listenerManager.start();
 const automationScheduler = makeProductionAutomationScheduler();
 await automationScheduler.start();
+// ADR 0109: scheduled OIDC signing-key rotation. The first step also creates
+// the active key, so the public JWKS GET stays read-only.
+const oidcKeyRotation = startOidcKeyRotation({
+  keys: makeIntegrationOidcKeyStore(getDb()),
+});
 
 server.listen(config.port, "0.0.0.0", () => {
   log.info({ port: config.port }, "orchestrator listening");
@@ -314,6 +331,7 @@ process.on("SIGTERM", () => {
   server.close(async (err) => {
     // Quiesce DBOS (stops queue/recovery loops, closes the system-DB pool)
     // after the HTTP server stops accepting connections.
+    oidcKeyRotation.stop();
     await automationScheduler.stop();
     await listenerManager.stop();
     await targetHydrator.stop();

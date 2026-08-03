@@ -610,8 +610,8 @@ impl app::session_service_server::SessionService for AppSessionService {
     //   first  → metadata { media_type, size_bytes, file_name }
     //   rest   → chunk bytes (64 KiB each)
     //
-    // The axum serve_artifact handler is unchanged; this shares
-    // get_artifact_core which returns the same ArtifactRow + ByteStream.
+    // Shares get_artifact_core with the orchestrator byte route (the
+    // retired axum serve_artifact handler's successor).
     //
     // Abort on client disconnect: the stream is a `BoxStream` pinned
     // inside tonic, which drops the future when the client disconnects.
@@ -679,10 +679,15 @@ impl app::session_service_server::SessionService for AppSessionService {
         self.auth.check(&req)?;
         let r = req.into_inner();
         let id = parse_session_id(&r.session_id)?;
-        let artifact =
-            crate::api::upload::create_artifact_from_path_core(&self.state, id, &r.path, r.caption)
-                .await
-                .map_err(into_status)?;
+        let artifact = crate::api::upload::create_artifact_from_path_core(
+            &self.state,
+            id,
+            &r.path,
+            r.caption,
+            r.suppress_event,
+        )
+        .await
+        .map_err(into_status)?;
         Ok(Response::new(app::CreateArtifactFromPathResponse {
             artifact_id: artifact.artifact_id,
             media_type: artifact.media_type,

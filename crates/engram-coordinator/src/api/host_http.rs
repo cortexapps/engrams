@@ -1723,12 +1723,18 @@ pub async fn quarantined_survivor_advertise_core(
                         "allow_park": false,
                         "nominated": false,
                         // Quarantine flavor: the survivor's disk is unserved, so
-                        // the evict verb bounds each capture attempt and, on
-                        // budget exhaustion, destroys the crippled VM + falls
-                        // back to HostLost (rewind-to-checkpoint is the designed
-                        // blast radius; an unbounded retry loop locking the
-                        // user out is not).
+                        // the evict verb bounds each capture attempt and, past
+                        // the fast-retry budget, parks the op on a slow retry
+                        // cadence until the host's rehydrate retry re-serves
+                        // the disk (2026-08-02 durability-rollback RCA — the
+                        // old exhaustion arm destroyed the VM and rewound past
+                        // acked writes).
                         "quarantine": true,
+                        // Pin the op to the advertised sandbox: the slow lane
+                        // can outlive a relocation, and a stale wake-up must
+                        // no-op instead of evicting the session's NEW, healthy
+                        // sandbox.
+                        "sandbox_id": q.sandbox_id,
                     }),
                     Some(&format!("adr0090-quarantine:{}", q.sandbox_id)),
                 )
@@ -1972,6 +1978,7 @@ mod tests {
             mode: SessionMode::Agent,
             created_at: chrono::Utc::now(),
             last_active_at: chrono::Utc::now(),
+            last_event_at: None,
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,

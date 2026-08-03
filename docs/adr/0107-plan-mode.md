@@ -297,7 +297,80 @@ One commit per phase. As-built divergences from the proposal:
 - Landlock availability in the FC guest kernel for codex `readOnly` turns
   (verify on the dev VM before leaning on the sandbox as the sole
   enforcement for codex).
-- Whether the pinned claude 2.1.185 can move forward once the ADR 0054 AUQ
-  regression is re-validated; plan mode does not depend on it either way.
 - Interactive Slack plan approval (needs a generic Slack presenter
   dispatcher; notification-with-link is the current scope).
+
+## Addendum (2026-08-03): claude moved to the injected path; pin raised to 2.1.212
+
+The claude pin question above is resolved. Claude >= 2.1.187 removed BOTH the
+`AskUserQuestion` and `ExitPlanMode` built-ins from headless `--print` mode
+(verified on 2.1.212: absent from the `system/init` tool list and not
+ToolSearch-loadable, in default and plan permission modes). So the claude
+native bindings for `ask_user_question` and `exit_plan_mode` were dropped from
+the registry, and claude now receives both tools through the injected MCP path
+— the uniform design this ADR already shipped for codex and custom harnesses.
+A 2.1.212 probe confirmed the deferred-tool spine is intact: `defer` parks the
+turn (`terminal_reason: tool_deferred`, the MCP server never sees the call),
+streaming `--resume` re-fires the pending call with the SAME `tool_use_id`,
+and the hook's `updatedInput` rewrite still lands.
+
+What changed for claude, relative to the table in §3:
+
+- **Reject** now serves through the MCP bridge on the id-stable re-fire: the
+  serve renders the stashed decision as `plan::changes_requested_message`
+  (an instruction, per the "rejection is an INSTRUCTION" lesson), never the
+  raw decision JSON. The `deny` + reason verdict only applied to the native
+  built-in; the tier-2 fallback (drain + fresh user message) is unchanged.
+- **The 5661c75f by-tool retarget** moved with the serve: a re-fired
+  `exit_plan_mode` under a NEW call id consumes the stashed same-tool
+  result, and the old id is acked with an explicit `ToolCallCompleted` so
+  its outbox row retires. AUQ still never retargets.
+- **Model guidance**: the CLI's headless plan-mode reminder still tells the
+  model to use `ExitPlanMode`/`AskUserQuestion` (upstream stale text), so
+  the harness appends a manifest-derived `--append-system-prompt` redirect
+  (`injected_tool_guidance`) naming `mcp__engrams__exit_plan_mode` /
+  `mcp__engrams__ask_user_question`. Composed with (never replacing) the
+  ADR 0060 `ENGRAM_APPEND_SYSTEM_PROMPT`.
+- **Tool discovery — `alwaysLoad` (2026-08-03, follow-on fix).** The first
+  cut had a robustness hole the native binding didn't: claude LAZY-loads MCP
+  tools (they must be `ToolSearch`-discovered before use), and an injected
+  tool that REPLACES a removed built-in is exactly the discovery the model
+  gets wrong — haiku searched `select:ask_user_question` (the bare name, not
+  the `mcp__engrams__` spelling), missed, and gave up asking as plain text
+  (session 03efe4f2, silent degradation). Two changes close it: (1) the
+  generated `mcp-config.json` sets `"alwaysLoad": true` on the `engrams`
+  server — the CLI's own opt-out of deferral ("all tools from this server are
+  always included in the prompt and never deferred"), so the tools are
+  resident and need no discovery, restoring the native binding's
+  always-present property; (2) the guidance leads with the full
+  `mcp__engrams__…` name and forbids the plain-text fallback. Verified with
+  the real CLI across haiku/sonnet/opus (9/9 direct calls, zero ToolSearch)
+  and end-to-end in a real VM. If the injected set grows large, switch to
+  per-tool `_meta["anthropic/alwaysLoad"]` in the bridge's `tools/list` so
+  only the built-in replacements stay resident.
+- **Approve now rides the stash→serve rail too (2026-08-03, follow-on fix).**
+  The §3 table's approve path was "engine-owned": flip the stamp, respawn, and
+  inject a fresh "your plan was approved" user turn + an explicit
+  `ToolCallCompleted` — deliberately NEVER stashing a result, because the
+  *native* `ExitPlanMode` does not re-fire on a default-mode resume (spike
+  finding 5). The INJECTED `exit_plan_mode` breaks that assumption: like every
+  deferred MCP tool it DOES re-fire id-stable on `--resume`. So the engine-owned
+  approve produced a **duplicate plan card** (the un-stashed re-fire got
+  re-deferred) and the session **parked instead of building** (session
+  f9222d41). Fix: approve is no longer special — it stashes its result and
+  flips the stamp to build, exactly like reject stashes and keeps plan; the
+  id-stable re-fire is served the rendered instruction. `render_result_for_model`
+  and the tier-2 `fallback_delivery_message` both now render a decision via the
+  shared `plan::decision_message` (approve → `APPROVED_MESSAGE` "implement it
+  now", reject → `changes_requested_message`). The engine-owned
+  `pending_plan_approvals` machinery and its startup branch are deleted.
+  Verified end-to-end in a real VM: approve → one `exit_plan_mode` request
+  (no duplicate), continuation turn writes the file, `run_completed`. The
+  lesson for the tests: the plan engine tests used the *native* binding, which
+  is precisely why the injected-path re-fire bug slipped through — they now use
+  the injected tool and assert the re-fire is allowed and served, not
+  re-deferred.
+
+The native-binding mechanism itself (manifest-driven, ADR 0089 §6) stays: the
+codex `requestUserInput` binding still uses it, and a future harness with a
+live built-in can bind again without new machinery.
