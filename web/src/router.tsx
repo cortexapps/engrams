@@ -38,6 +38,7 @@ import { Overview } from "./pages/operator/Overview";
 import { ArtifactsLayout } from "./pages/artifacts/ArtifactsLayout";
 import { ArtifactsLibrary } from "./pages/artifacts/ArtifactsLibrary";
 import { ArtifactDetail } from "./pages/artifacts/ArtifactDetail";
+import { ArtifactViewPage } from "./pages/artifacts/ArtifactViewPage";
 import { KaizenLayout } from "./pages/kaizen/KaizenLayout";
 import { Papercuts } from "./pages/kaizen/Papercuts";
 import { Fleet } from "./pages/Fleet";
@@ -266,6 +267,16 @@ const artifactDetailPrettyRoute = createRoute({
   validateSearch: artifactVersionSearch,
   component: ArtifactDetail,
 });
+// The chromeless standalone view (the detail page's popout target):
+// a sibling of the app shell so the rendered document owns the window —
+// no rail, no section chrome. Static "view" outranks the pretty $slug.
+const artifactViewRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/artifacts/$artifactId/view",
+  beforeLoad: requireAuth,
+  validateSearch: artifactVersionSearch,
+  component: ArtifactViewPage,
+});
 
 // /kaizen layout route (second sidebar) ----------------------------------
 const kaizenLayoutRoute = createRoute({
@@ -408,6 +419,8 @@ const automationEditRoute = createRoute({
 export const routeTree = rootRoute.addChildren([
   // /login — bare page, no app chrome
   loginRoute,
+  // Standalone artifact view — authenticated but chromeless (popout).
+  artifactViewRoute,
   // Authenticated app shell — all authenticated routes nested here
   appLayoutRoute.addChildren([
     indexRoute,

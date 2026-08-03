@@ -1,14 +1,15 @@
 import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { Check, Copy, DownloadIcon, ExternalLinkIcon, FileBox, Globe, Lock } from "lucide-react";
+import { Check, Copy, DownloadIcon, ExternalLinkIcon, FileBox } from "lucide-react";
 import { useState } from "react";
 
 import { useTheme } from "../../components/theme-provider";
 import { ArtifactViewer } from "../../components/artifacts/ArtifactViewer";
+import { ShareDialog } from "../../components/artifacts/ShareDialog";
 import { fmtBytes } from "../../components/transcriptFmt";
 import type { ArtifactRecord } from "../../gen/engram/app/v1/artifact_pb";
 import { subject } from "@casl/ability";
 
-import { useArtifact, useSetArtifactVisibility } from "../../hooks/useArtifacts";
+import { useArtifact } from "../../hooks/useArtifacts";
 import { useAuth } from "../../auth/AuthProvider";
 import { artifactBytesUrl, artifactPageUrl, mediaKind } from "../../lib/artifacts";
 import { errorMessage } from "../../lib/errors";
@@ -168,9 +169,7 @@ function ArtifactToolbar({
       visibility: artifact.visibility,
     }),
   );
-  const setVisibility = useSetArtifactVisibility();
   const [copied, setCopied] = useState(false);
-  const shared = artifact.visibility === "org";
 
   const copyLink = () => {
     const link = `${window.location.origin}${artifactPageUrl(artifact.id, artifact.title)}`;
@@ -208,29 +207,19 @@ function ArtifactToolbar({
         </Select>
       )}
 
-      {canShare && (
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={setVisibility.isPending}
-          onClick={() =>
-            setVisibility.mutate({
-              id: artifact.id,
-              visibility: shared ? "private" : "org",
-            })
-          }
-          aria-label={shared ? "Stop sharing with the org" : "Share with the org"}
-        >
-          {shared ? <Globe /> : <Lock />}
-          {shared ? "Org" : "Only you"}
-        </Button>
-      )}
-
       <Button variant="ghost" size="sm" onClick={copyLink} aria-label="Copy link">
         {copied ? <Check /> : <Copy />}
       </Button>
+      {/* Popout: the RENDERED standalone view (styled markdown / sandboxed
+          HTML with its own revision picker), not the raw bytes. */}
       <Button asChild variant="ghost" size="sm" aria-label="Open in new tab">
-        <a href={url} target="_blank" rel="noreferrer">
+        <a
+          href={`/artifacts/${encodeURIComponent(artifact.id)}/view${
+            version === artifact.currentVersion ? "" : `?v=${version}`
+          }`}
+          target="_blank"
+          rel="noreferrer"
+        >
           <ExternalLinkIcon />
         </a>
       </Button>
@@ -239,6 +228,8 @@ function ArtifactToolbar({
           <DownloadIcon />
         </a>
       </Button>
+
+      {canShare && <ShareDialog artifact={artifact} />}
     </div>
   );
 }
