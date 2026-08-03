@@ -33,6 +33,70 @@ page, a game, a tool the user will keep or share. When unsure: a
 well-composed page is never the wrong answer; an over-designed visual
 identity sometimes is.
 
+## The engrams house style — the default identity
+
+Artifacts live inside the engrams product, so product-adjacent
+documents — reports, dashboards, plans, analyses, anything the user
+reads in the engrams UI — wear the house identity by default. It makes
+them read as native and trustworthy. Depart from it only when the
+subject owns its own visual world (a game, a client-facing landing
+page, a piece whose brief names another brand) or the user asks — then
+the editorial process below takes over completely.
+
+The house language ("Mont Blanc logbook" — aged lab paper and petrol
+ink in light, racing-green-black and pale sage in dark, one lime
+accent):
+
+```css
+:root {
+  --radius: 0.5rem;                        /* precise, never pill-like */
+  --background: oklch(0.972 0.014 128);    /* lab paper */
+  --foreground: oklch(0.301 0.02 206);     /* petrol ink */
+  --card: oklch(0.992 0.006 128);          /* a clean sheet off the paper */
+  --primary: oklch(0.878 0.181 121);       /* Aston-F1 lime — a FILL only */
+  --primary-foreground: oklch(0.22 0.04 150);
+  --muted: oklch(0.945 0.018 128);
+  --muted-foreground: oklch(0.44 0.028 200);
+  --destructive: oklch(0.52 0.2 27);       /* the only red */
+  --border: oklch(0.885 0.018 128);        /* hairline rule */
+}
+:root[data-theme="dark"] {
+  --background: oklch(0.205 0.024 200);    /* racing-green-black */
+  --foreground: oklch(0.9 0.035 125);      /* pale sage ink */
+  --card: oklch(0.242 0.026 200);
+  --primary: oklch(0.85 0.18 121);         /* lime, luminous here */
+  --primary-foreground: oklch(0.2 0.03 150);
+  --muted: oklch(0.27 0.026 200);
+  --muted-foreground: oklch(0.73 0.03 125);
+  --destructive: oklch(0.65 0.2 25);
+  --border: oklch(0.9 0.035 125 / 12%);
+}
+```
+
+(Mirror the dark block under `@media (prefers-color-scheme: dark)` too,
+per the theme contract above.)
+
+House rules, in order of load-bearing:
+
+- **Lime is a fill, never light-mode text** — chartreuse on paper is
+  invisible. It carries one primary action, an active marker, a short
+  index-tab bar sitting on a rule. Status is never lime: good/warning/
+  critical keep their own quiet vocabulary; destructive is the only red.
+- **Type voices**: display/headers in a condensed grotesque, slightly
+  extended tracking (system stack: `"Saira", "Avenir Next Condensed",
+  "Arial Narrow", system-ui, sans-serif`); data, ids, and labels in
+  mono (`"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace`)
+  with `font-variant-numeric: tabular-nums`; body in the system sans.
+  Section labels are the instrument voice: mono or display caps,
+  `letter-spacing: 0.1em`, muted ink.
+- **The logbook grammar**: hairline rules (1px `--border`) do the
+  structural work — a ruled masthead with a short lime tab on the rule,
+  ruled table rows, a quote held by a single left rule. Square bullets.
+  Cards are quiet sheets (`--card`, hairline border, `--radius`), not
+  drop-shadowed panels.
+- **Restraint is the aesthetic**: generous whitespace, one accent
+  moment per view, no gradients, no emoji as structure.
+
 ## The engrams contract
 
 - **Fully self-contained, one file.** Inline all CSS and JS. No CDN
@@ -65,9 +129,11 @@ identity sometimes is.
 ## Fundamentals for every artifact
 
 **Ground it in the subject.** Pin one concrete subject, its audience,
-and the page's single job. The subject's own world — its materials,
-instruments, vernacular — is where distinctive choices come from. Build
-with real content throughout, never lorem.
+and the page's single job. Under the house style, the subject drives
+structure, copy, and data presentation; when you have deliberately left
+the house style, the subject's own world — its materials, instruments,
+vernacular — is also where palette and type come from. Build with real
+content throughout, never lorem.
 
 **Pair typefaces.** Typography carries the page even when the page
 isn't about typography. Keep running text near 65 characters wide; set
