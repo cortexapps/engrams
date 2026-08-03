@@ -48,9 +48,12 @@ experimental implementation and raw iteration history are preserved on the
   immediately before the generic tool start, carrying the same
   `tool_call_id`. It derives a safe fallback when the annotation is omitted.
 - Use `browser_activity` to open the Browser pane once on first agent activity
-  and to replace the raw shell card with a browser-specific presenter. Keep
-  the correlated generic `tool_call_completed` event as the source of truth
-  for success/failure, and never reopen after the user collapses the pane.
+  and to replace the raw shell card with a browser-specific presenter. Only
+  LIVE activity opens the pane — an event stamped after the human opened the
+  session. The SSE feed replays the whole durable log, so a session the agent
+  browsed earlier must not pop the browser open on every later visit. Keep the
+  correlated generic `tool_call_completed` event as the source of truth for
+  success/failure, and never reopen after the user collapses the pane.
 
 ## Evaluation findings
 
