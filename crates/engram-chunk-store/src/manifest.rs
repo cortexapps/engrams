@@ -615,4 +615,59 @@ mod tests {
         mem.kind = ManifestKind::Memory;
         assert_ne!(m.content_ref(), mem.content_ref());
     }
+
+    /// KNOWN-ANSWER test: `ChunkHash::of` is SHA-256, forever.
+    ///
+    /// A chunk's hash IS its address in the blob store. Every test above this
+    /// one is self-consistent — it hashes data and compares it to another hash
+    /// of the same data — so a `sha2` bump that changed the digest would keep
+    /// all of them green while orphaning every chunk already stored. The only
+    /// thing that catches that is a literal input pinned to a literal output.
+    ///
+    /// Vectors are the FIPS 180-4 examples, so this also fails if the input
+    /// framing (rather than the algorithm) ever changes.
+    #[test]
+    fn chunk_hash_is_sha256_of_the_bytes() {
+        assert_eq!(
+            ChunkHash::of(b"").to_hex(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+        assert_eq!(
+            ChunkHash::of(b"abc").to_hex(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+    }
+
+    /// KNOWN-ANSWER test: a manifest's content ref never moves.
+    ///
+    /// `content_ref` exists so a deterministic re-bake produces the SAME id —
+    /// the doc comment on it describes the bug where a random id made every
+    /// re-bake look like new content at every layer above. That guarantee is
+    /// only worth anything if the id is stable across releases, and the
+    /// deterministic/content-sensitive test above cannot see it move: same
+    /// input still equals itself, different inputs still differ.
+    ///
+    /// If this fails, `disk_manifest_content_ref` values already in Postgres
+    /// and in every published `bundle.json` no longer match what this code
+    /// computes. That is not a test to re-bless; it is a migration.
+    #[test]
+    fn content_ref_never_moves() {
+        let mut m = Manifest::empty(ManifestKind::Disk, 32 * 1024 * 1024);
+        m.chunks.push(ChunkRef {
+            offset: 0,
+            hash: ChunkHash::of(b"chunk-a"),
+        });
+        m.chunks.push(ChunkRef {
+            offset: 16 * 1024 * 1024,
+            hash: ChunkHash::of(b"chunk-b"),
+        });
+        m.total_bytes = 32 * 1024 * 1024;
+
+        let reference = m.content_ref();
+        assert_eq!(reference.version, 1);
+        assert_eq!(
+            reference.manifest_id.to_string(),
+            "c2c6e49e-264f-8d98-8f95-003dfd5b88ef"
+        );
+    }
 }
