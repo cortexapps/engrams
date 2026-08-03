@@ -56,6 +56,7 @@ mod adapter {
     };
     use engram_harness_sdk::browser_view;
     use engram_harness_sdk::questions::{Answers, Question};
+    use engram_harness_sdk::state::StateDir;
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
     use serde_json::Value;
@@ -66,22 +67,19 @@ mod adapter {
     use tokio::sync::{mpsc, Notify};
     use tokio::time::{timeout, Instant};
 
-    pub const CLAUDE_SESSION_ID_FILE: &str = "/workspace/.engrams/claude-session-id";
-
-    /// ADR 0054 Flavor B: the per-session hook↔harness unix socket and the
-    /// generated `--settings` file. Both live under `/workspace/.engrams`
-    /// (already per-session, like the claude session-id file), so the names
-    /// are fixed yet collision-free across sessions and correct on every
-    /// backend (FC / VZ / Process). The harness binds the socket
-    /// before spawning claude; the hook reaches it via `ENGRAM_HOOK_SOCK`.
-    pub const HOOK_SOCK_FILE: &str = "/workspace/.engrams/hook.sock";
-    pub const HOOK_SETTINGS_FILE: &str = "/workspace/.engrams/claude-settings.json";
-    /// Harness-owned logical cwd for Claude's Bash tool. Unlike the CLI's
-    /// private `/tmp/claude-*-cwd` tracker, this survives a Claude or harness
-    /// respawn in the session workspace.
-    pub const BASH_CWD_FILE: &str = "/workspace/.engrams/bash-cwd";
-    pub const MCP_CONFIG_FILE: &str = "/workspace/.engrams/mcp-config.json";
-    pub const MCP_SOCK_FILE: &str = "/workspace/.engrams/mcp.sock";
+    /// ADR 0054 Flavor B / ADR 0089: every per-session file this harness owns —
+    /// the hook↔harness and MCP sockets, the generated `--settings` and
+    /// `--mcp-config`, the resume stash, the Bash cwd tracker, and the ADR 0107
+    /// mode stamp — is derived from ONE root (`Cli::state_dir`), so redirecting
+    /// the root redirects all of them. The harness binds the sockets before
+    /// spawning claude; each bridge child re-derives the same paths from
+    /// `ENGRAM_STATE_DIR` / `ENGRAM_HOOK_SOCK` / `ENGRAM_MCP_SOCK`.
+    ///
+    /// See `engram_harness_sdk::state` for the names and for the dogfooding
+    /// failure a single root prevents.
+    fn state_dir(cli: &Cli) -> StateDir {
+        StateDir::new(&cli.state_dir)
+    }
 
     /// ADR 0089 P2: the orchestrator's model-facing tool manifest. The main
     /// harness parses `ENGRAM_TOOLS` once at startup and carries this typed
@@ -304,48 +302,29 @@ mod adapter {
         #[arg(long, env = "ENGRAM_CLAUDE_BIN")]
         pub claude_bin: Option<String>,
 
-        /// Override the hook socket bind path. Production always uses the
-        /// fixed per-session in-VM path (`HOOK_SOCK_FILE`); this is a test
-        /// seam so a `run_engine` test can bind an isolated socket and fire
-        /// hooks against it without colliding with the shared production
-        /// path (parallel tests, nextest's process-per-test). Not a CLI arg.
-        #[arg(skip)]
-        pub hook_sock_path: Option<String>,
-
-        /// Test seam for the long-lived MCP bridge socket. Production uses
-        /// `MCP_SOCK_FILE`; fake-engine tests bind an isolated temp path.
-        #[arg(skip)]
-        pub mcp_sock_path: Option<String>,
-
-        /// Test seam for the resumable-session-id stash. Production always
-        /// uses the fixed in-VM path (`CLAUDE_SESSION_ID_FILE`); parallel
-        /// engine tests each get an isolated temp path — a shared stash
-        /// leaks one test's resumable id into another's FIRST spawn, which
-        /// then boots `--resume` and derails the fake's choreography
-        /// (observed as a schedule-dependent suite-only failure).
-        #[arg(skip)]
-        pub session_id_file: Option<String>,
+        /// Root of everything this harness keeps per session: both sockets,
+        /// the generated claude config, the resume stash, the Bash cwd
+        /// tracker, and the mode stamp (see `state_dir`). Production takes the
+        /// fixed in-VM default; the dev Process backend, which runs harnesses
+        /// on a shared host, points `ENGRAM_STATE_DIR` at its own sandbox
+        /// directory; every test injects a temp directory.
+        ///
+        /// One field, no fallback: a test that redirected only the socket
+        /// still wrote the rest into the live directory, so `cargo nextest`
+        /// inside a dogfooding session unlinked that session's own sockets
+        /// and every deferred tool failed with "engrams hook bridge
+        /// unavailable" until the session was recreated.
+        #[arg(
+            long,
+            env = "ENGRAM_STATE_DIR",
+            default_value = engram_harness_sdk::state::DEFAULT_STATE_DIR
+        )]
+        pub state_dir: PathBuf,
 
         /// Parsed once from `ENGRAM_TOOLS` by the main harness process. Not a
         /// clap argument; tests inject a fixture directly.
         #[arg(skip)]
         pub tool_manifest: ToolManifest,
-
-        /// Test seam for the ADR 0107 session-mode stamp. Production always
-        /// uses the fixed in-VM path
-        /// (`engram_harness_sdk::mode_stamp::MODE_STAMP_FILE`); parallel
-        /// engine tests each get an isolated temp path.
-        #[arg(skip)]
-        pub mode_stamp_file: Option<String>,
-    }
-
-    /// The ADR 0107 session-mode stamp path (test seam aware).
-    fn mode_stamp_path(cli: &Cli) -> &Path {
-        Path::new(
-            cli.mode_stamp_file
-                .as_deref()
-                .unwrap_or(engram_harness_sdk::mode_stamp::MODE_STAMP_FILE),
-        )
     }
 
     /// Resolve the `claude` binary path. If the user supplied
@@ -981,7 +960,7 @@ mod adapter {
     /// stdout.
     pub mod hook_bridge {
         use super::hook_server::HookVerdict;
-        use super::{Answers, BufReader, Question, BASH_CWD_FILE};
+        use super::{Answers, BufReader, Question, StateDir};
         use std::path::{Path, PathBuf};
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixStream;
@@ -1023,11 +1002,13 @@ mod adapter {
                     .get("tool_input")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let cwd = tracked_bash_cwd(Path::new(BASH_CWD_FILE));
-                println!(
-                    "{}",
-                    bash_allow_output(&tool_input, &cwd, Path::new(BASH_CWD_FILE))
-                );
+                // Same root as the harness that spawned claude (ADR 0054:
+                // claude inherits `ENGRAM_STATE_DIR`, this hook inherits it
+                // from claude), so a redirected state dir stays coherent
+                // across the process boundary.
+                let tracker = StateDir::from_env().claude_bash_cwd();
+                let cwd = tracked_bash_cwd(&tracker);
+                println!("{}", bash_allow_output(&tool_input, &cwd, &tracker));
                 return std::process::ExitCode::SUCCESS;
             }
 
@@ -1351,10 +1332,11 @@ mod adapter {
     /// request/response.
     pub mod mcp_bridge {
         use super::{
-            browser_view, injected_tools, manifest_from_env, BufReader, ToolManifest, MCP_SOCK_FILE,
+            browser_view, injected_tools, manifest_from_env, BufReader, StateDir, ToolManifest,
         };
         use serde::{Deserialize, Serialize};
         use serde_json::Value;
+        use std::path::{Path, PathBuf};
         use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
         use tokio::net::UnixStream;
 
@@ -1373,8 +1355,10 @@ mod adapter {
 
         pub async fn run() -> std::process::ExitCode {
             let manifest = manifest_from_env();
-            let socket_path =
-                std::env::var("ENGRAM_MCP_SOCK").unwrap_or_else(|_| MCP_SOCK_FILE.to_string());
+            let socket_path = std::env::var_os("ENGRAM_MCP_SOCK")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| StateDir::from_env().mcp_sock());
             let mut lines = BufReader::new(tokio::io::stdin()).lines();
             let mut stdout = tokio::io::stdout();
             loop {
@@ -1415,7 +1399,7 @@ mod adapter {
         pub async fn handle_request(
             request: Value,
             manifest: &ToolManifest,
-            socket_path: &str,
+            socket_path: &Path,
         ) -> Option<Value> {
             let method = request.get("method").and_then(Value::as_str).unwrap_or("");
             // MCP lifecycle notifications (`notifications/initialized`,
@@ -1516,7 +1500,7 @@ mod adapter {
         }
 
         async fn round_trip(
-            socket_path: &str,
+            socket_path: &Path,
             name: &str,
             args: Value,
             tool_use_id: Option<&str>,
@@ -1718,7 +1702,7 @@ mod adapter {
     /// process exits but the host persists — a stale bind would otherwise
     /// `EADDRINUSE` the next harness.
     struct SockGuard {
-        path: String,
+        path: PathBuf,
         task: tokio::task::JoinHandle<()>,
     }
     impl Drop for SockGuard {
@@ -1734,7 +1718,7 @@ mod adapter {
     /// so the hook command is always the path of the running binary,
     /// correct across FC / VZ / Process (where `resolve_claude_bin`'s
     /// sibling layout — and thus this binary's path — varies).
-    async fn write_hook_settings() {
+    async fn write_hook_settings(state: &StateDir) {
         let self_exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "engram-harness-claude".to_string());
@@ -1746,11 +1730,11 @@ mod adapter {
                 }]
             }
         });
-        let _ = tokio::fs::create_dir_all("/workspace/.engrams").await;
-        if let Err(e) = initialize_bash_cwd().await {
+        let _ = tokio::fs::create_dir_all(state.root()).await;
+        if let Err(e) = initialize_bash_cwd(&state.claude_bash_cwd()).await {
             tracing::warn!(error = %e, "couldn't initialize harness Bash cwd tracker");
         }
-        if let Err(e) = tokio::fs::write(HOOK_SETTINGS_FILE, settings.to_string()).await {
+        if let Err(e) = tokio::fs::write(state.claude_settings(), settings.to_string()).await {
             tracing::warn!(error = %e, "couldn't write claude hook settings");
         }
     }
@@ -1758,8 +1742,8 @@ mod adapter {
     /// Seed the logical cwd once per session workspace. A valid existing
     /// tracker belongs to the current sandbox and survives harness / Claude
     /// respawns; an invalid or deleted path is repaired before spawn.
-    async fn initialize_bash_cwd() -> std::io::Result<()> {
-        let existing = tokio::fs::read_to_string(BASH_CWD_FILE)
+    async fn initialize_bash_cwd(tracker: &Path) -> std::io::Result<()> {
+        let existing = tokio::fs::read_to_string(tracker)
             .await
             .ok()
             .map(|raw| PathBuf::from(raw.trim_end_matches(['\r', '\n'])))
@@ -1771,7 +1755,7 @@ mod adapter {
             .ok()
             .filter(|path| path.is_absolute() && path.is_dir())
             .unwrap_or_else(|| PathBuf::from("/workspace"));
-        tokio::fs::write(BASH_CWD_FILE, format!("{}\n", cwd.display())).await
+        tokio::fs::write(tracker, format!("{}\n", cwd.display())).await
     }
 
     /// Write claude's strict MCP config when the manifest contains at least
@@ -1891,28 +1875,26 @@ mod adapter {
         // crash between the flip and the spawn falls back to outbox
         // redelivery (the stamp flip is idempotent).
         let mut pending_plan_approvals: Vec<String> = Vec::new();
-        write_hook_settings().await;
+        let state = state_dir(&cli);
+        write_hook_settings(&state).await;
         let self_exe =
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("engram-harness-claude"));
+        let mcp_config_file = state.claude_mcp_config();
         let mcp_config_path = match write_mcp_config(
-            Path::new(MCP_CONFIG_FILE),
+            &mcp_config_file,
             &cli.tool_manifest,
             &self_exe,
         )
         .await
         {
-            Ok(true) => Some(MCP_CONFIG_FILE),
+            Ok(true) => Some(mcp_config_file.as_path()),
             Ok(false) => None,
             Err(e) => {
                 tracing::error!(error = %e, "couldn't write claude MCP config; exposing no injected tools");
                 None
             }
         };
-        // Production: the fixed in-VM path. Tests may inject an isolated one.
-        let hook_sock_path = cli
-            .hook_sock_path
-            .clone()
-            .unwrap_or_else(|| HOOK_SOCK_FILE.to_string());
+        let hook_sock_path = state.hook_sock();
         let _ = tokio::fs::remove_file(&hook_sock_path).await; // clear a stale bind
         let _sock_guard = match tokio::net::UnixListener::bind(&hook_sock_path) {
             Ok(listener) => {
@@ -1939,10 +1921,7 @@ mod adapter {
                 None
             }
         };
-        let mcp_sock_path = cli
-            .mcp_sock_path
-            .clone()
-            .unwrap_or_else(|| MCP_SOCK_FILE.to_string());
+        let mcp_sock_path = state.mcp_sock();
         let _ = tokio::fs::remove_file(&mcp_sock_path).await;
         let _mcp_sock_guard = match tokio::net::UnixListener::bind(&mcp_sock_path) {
             Ok(listener) => {
@@ -2019,7 +1998,9 @@ mod adapter {
                         std::mem::take(&mut *g)
                     };
                     if !ids.is_empty() || !dup_ids.is_empty() {
-                        if let Some(sid) = read_claude_session_id(session_id_stash(&cli)).await {
+                        if let Some(sid) =
+                            read_claude_session_id(&state_dir(&cli).claude_session_id()).await
+                        {
                             match find_claude_transcript(&sid) {
                                 Some(tr) => {
                                     let res = tokio::task::spawn_blocking(move || {
@@ -2229,14 +2210,13 @@ mod adapter {
     /// Latch a prompt's mode directive at the moment its turn begins. Returns
     /// the mode the next turn must run under (the stamp, post-write).
     fn apply_prompt_mode(cli: &Cli, mode: Option<&str>) -> String {
+        let stamp = state_dir(cli).mode_stamp();
         if let Some(mode) = mode.filter(|m| !m.is_empty()) {
-            if let Err(e) =
-                engram_harness_sdk::mode_stamp::write_mode_stamp(mode_stamp_path(cli), mode)
-            {
+            if let Err(e) = engram_harness_sdk::mode_stamp::write_mode_stamp(&stamp, mode) {
                 tracing::warn!(error = %e, %mode, "mode stamp write failed");
             }
         }
-        engram_harness_sdk::mode_stamp::read_mode_stamp(mode_stamp_path(cli))
+        engram_harness_sdk::mode_stamp::read_mode_stamp(&stamp)
     }
 
     /// SIGINT a running `claude` child — the graceful "stop the current
@@ -2290,12 +2270,13 @@ mod adapter {
         // ADR 0107: approved plan call_ids to deliver as a synthesized build
         // turn at this spawn (see `run_engine`'s owner comment).
         pending_plan_approvals: &mut Vec<String>,
-        mcp_config_path: Option<&str>,
+        mcp_config_path: Option<&Path>,
     ) -> SessionOutcome {
         // A socket call outside a turn must carry the wire-mandated empty
         // run_id, never the previous turn's id.
         *current_run_id.lock().await = None;
-        let resume_id = read_claude_session_id(session_id_stash(cli)).await;
+        let state = state_dir(cli);
+        let resume_id = read_claude_session_id(&state.claude_session_id()).await;
         // ADR 0060: ENGRAM_APPEND_SYSTEM_PROMPT (carried via harness_env) flavors
         // the agent's system prompt. Read per spawn — it is constant for the
         // process, and a respawn must re-apply it.
@@ -2305,12 +2286,13 @@ mod adapter {
         // this process's permission mode; a mid-session mode directive that
         // disagrees with `process_mode` forces a clean respawn at the next
         // turn boundary so this read re-runs.
-        let process_mode = engram_harness_sdk::mode_stamp::read_mode_stamp(mode_stamp_path(cli));
+        let process_mode = engram_harness_sdk::mode_stamp::read_mode_stamp(&state.mode_stamp());
         let argv = build_claude_argv(
             &resume_id,
             append_system_prompt.as_deref(),
             mcp_config_path,
             &process_mode,
+            &state.claude_settings(),
         );
         tracing::info!(
             ?argv,
@@ -2341,19 +2323,19 @@ mod adapter {
             // `ENGRAM_HOOK_SOCK` (ADR 0054): claude inherits it and the
             // PreToolUse hook inherits it from claude (finding #7), so the
             // hook finds the per-session socket while the `--settings`
-            // artifact stays path-agnostic.
+            // artifact stays path-agnostic. `ENGRAM_STATE_DIR` carries the
+            // root itself, so a bridge child derives every other per-session
+            // path (the Bash cwd tracker) exactly as the harness does.
             .env("BASH_DEFAULT_TIMEOUT_MS", "1800000")
             .env("BASH_MAX_TIMEOUT_MS", "7200000")
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             .env("IS_SANDBOX", "1")
             .env(
-                "ENGRAM_HOOK_SOCK",
-                cli.hook_sock_path.as_deref().unwrap_or(HOOK_SOCK_FILE),
+                engram_harness_sdk::state::STATE_DIR_ENV,
+                state.root().as_os_str(),
             )
-            .env(
-                "ENGRAM_MCP_SOCK",
-                cli.mcp_sock_path.as_deref().unwrap_or(MCP_SOCK_FILE),
-            )
+            .env("ENGRAM_HOOK_SOCK", state.hook_sock().as_os_str())
+            .env("ENGRAM_MCP_SOCK", state.mcp_sock().as_os_str())
             // Held open for the whole session: we write one newline-
             // delimited `user` message per prompt and close it (drop) to
             // signal a clean drain on Shutdown.
@@ -2950,7 +2932,7 @@ mod adapter {
                                         deferred_calls.lock().await.remove(&call_id);
                                         if let Err(e) =
                                             engram_harness_sdk::mode_stamp::write_mode_stamp(
-                                                mode_stamp_path(cli),
+                                                &state_dir(cli).mode_stamp(),
                                                 engram_harness_sdk::mode_stamp::DEFAULT_MODE,
                                             )
                                         {
@@ -3485,13 +3467,15 @@ mod adapter {
     fn build_claude_argv(
         resume_id: &Option<String>,
         append_system_prompt: Option<&str>,
-        mcp_config_path: Option<&str>,
+        mcp_config_path: Option<&Path>,
         // ADR 0107: the latched session mode (from the workspace stamp, read
         // per spawn). `plan` maps to the CLI's native plan permission mode;
         // anything else adds no flag. Changing mode therefore = a clean
         // respawn with `--resume`, which the engine drives off stamp
         // mismatches.
         mode: &str,
+        // The generated hook settings, in the harness state dir.
+        settings_path: &Path,
     ) -> Vec<String> {
         let mut argv = vec![
             "--print".to_string(),
@@ -3513,7 +3497,7 @@ mod adapter {
             // ordinary tools — explicit and auditable, the VM is still the
             // safety boundary — and defers AskUserQuestion to the harness.
             "--settings".into(),
-            HOOK_SETTINGS_FILE.into(),
+            settings_path.to_string_lossy().into_owned(),
         ];
         if mode == "plan" {
             // ADR 0107: native plan mode — the CLI runs its own read-only
@@ -3529,7 +3513,7 @@ mod adapter {
         }
         if let Some(path) = mcp_config_path {
             argv.push("--mcp-config".into());
-            argv.push(path.to_string());
+            argv.push(path.to_string_lossy().into_owned());
             // Without strict mode claude merges the guest user's own MCP
             // configuration, exposing servers outside the orchestrator's
             // per-session manifest (ADR 0089 spike, Claude 2.1.207).
@@ -3547,13 +3531,7 @@ mod adapter {
         argv
     }
 
-    fn session_id_stash(cli: &Cli) -> &str {
-        cli.session_id_file
-            .as_deref()
-            .unwrap_or(CLAUDE_SESSION_ID_FILE)
-    }
-
-    async fn read_claude_session_id(path: &str) -> Option<String> {
+    async fn read_claude_session_id(path: &Path) -> Option<String> {
         match tokio::fs::read_to_string(path).await {
             Ok(s) => {
                 let trimmed = s.trim();
@@ -3567,8 +3545,8 @@ mod adapter {
         }
     }
 
-    async fn write_claude_session_id(path: &str, id: &str) {
-        if let Some(parent) = std::path::Path::new(path).parent() {
+    async fn write_claude_session_id(path: &Path, id: &str) {
+        if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
         if let Err(e) = tokio::fs::write(path, id).await {
@@ -3592,7 +3570,7 @@ mod adapter {
             return;
         }
         if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
-            write_claude_session_id(session_id_stash(cli), sid).await;
+            write_claude_session_id(&state_dir(cli).claude_session_id(), sid).await;
         }
     }
 
@@ -4203,6 +4181,12 @@ mod adapter {
         use std::pin::Pin;
         use std::task::{Context, Poll};
 
+        /// The generated hook settings path an argv test doesn't care about
+        /// (production derives it from the state dir).
+        fn test_settings() -> &'static Path {
+            Path::new("/tmp/engram-test-state/claude-settings.json")
+        }
+
         // ADR 0060: an external trigger flavors the agent's system prompt via
         // ENGRAM_APPEND_SYSTEM_PROMPT (rides harness_env). build_claude_argv
         // turns a set value into `--append-system-prompt <value>`.
@@ -4213,6 +4197,7 @@ mod adapter {
                 Some("You were triggered from a Slack thread."),
                 None,
                 "default",
+                test_settings(),
             );
             let pos = argv
                 .iter()
@@ -4227,7 +4212,7 @@ mod adapter {
         #[test]
         fn argv_omits_append_system_prompt_when_absent_or_empty() {
             for v in [None, Some("")] {
-                let argv = build_claude_argv(&None, v, None, "default");
+                let argv = build_claude_argv(&None, v, None, "default", test_settings());
                 assert!(
                     !argv.iter().any(|a| a == "--append-system-prompt"),
                     "flag must be absent for {v:?}",
@@ -4239,7 +4224,7 @@ mod adapter {
         // permission mode; the mode comes from the workspace stamp per spawn.
         #[test]
         fn argv_carries_permission_mode_plan_only_for_plan() {
-            let argv = build_claude_argv(&None, None, None, "plan");
+            let argv = build_claude_argv(&None, None, None, "plan", test_settings());
             let pos = argv
                 .iter()
                 .position(|a| a == "--permission-mode")
@@ -4247,7 +4232,7 @@ mod adapter {
             assert_eq!(argv.get(pos + 1).map(String::as_str), Some("plan"));
 
             for mode in ["default", "", "build"] {
-                let argv = build_claude_argv(&None, None, None, mode);
+                let argv = build_claude_argv(&None, None, None, mode, test_settings());
                 assert!(
                     !argv.iter().any(|a| a == "--permission-mode"),
                     "no permission-mode flag for {mode:?}",
@@ -4257,7 +4242,13 @@ mod adapter {
 
         #[test]
         fn argv_carries_strict_mcp_config_when_injected_tools_exist() {
-            let argv = build_claude_argv(&None, None, Some("/tmp/mcp-config.json"), "default");
+            let argv = build_claude_argv(
+                &None,
+                None,
+                Some(Path::new("/tmp/mcp-config.json")),
+                "default",
+                test_settings(),
+            );
             let pos = argv
                 .iter()
                 .position(|arg| arg == "--mcp-config")
@@ -4274,7 +4265,7 @@ mod adapter {
 
         #[test]
         fn argv_omits_mcp_flags_without_injected_tools() {
-            let argv = build_claude_argv(&None, None, None, "default");
+            let argv = build_claude_argv(&None, None, None, "default", test_settings());
             assert!(!argv.iter().any(|arg| arg == "--mcp-config"));
             assert!(!argv.iter().any(|arg| arg == "--strict-mcp-config"));
         }
@@ -4347,7 +4338,7 @@ mod adapter {
                     "params": {"protocolVersion": "2025-06-18"}
                 }),
                 &mcp_fixture_manifest(),
-                "/unused.sock",
+                Path::new("/unused.sock"),
             )
             .await
             .unwrap();
@@ -4363,7 +4354,7 @@ mod adapter {
             let response = mcp_bridge::handle_request(
                 serde_json::json!({"jsonrpc":"2.0","id":"list-1","method":"tools/list"}),
                 &mcp_fixture_manifest(),
-                "/unused.sock",
+                Path::new("/unused.sock"),
             )
             .await
             .unwrap();
@@ -4387,7 +4378,7 @@ mod adapter {
             let listed = mcp_bridge::handle_request(
                 serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
                 &manifest,
-                "/unused.sock",
+                Path::new("/unused.sock"),
             )
             .await
             .unwrap();
@@ -4404,7 +4395,7 @@ mod adapter {
                     "params":{"name":"browser_view","arguments":{}}
                 }),
                 &manifest,
-                "/unused.sock",
+                Path::new("/unused.sock"),
             )
             .await
             .unwrap();
@@ -4420,7 +4411,7 @@ mod adapter {
             let response = mcp_bridge::handle_request(
                 serde_json::json!({"jsonrpc":"2.0","id":9,"method":"no/such/method"}),
                 &mcp_fixture_manifest(),
-                "/unused.sock",
+                Path::new("/unused.sock"),
             )
             .await
             .unwrap();
@@ -4465,7 +4456,7 @@ mod adapter {
                     }
                 }),
                 &mcp_fixture_manifest(),
-                &sock,
+                Path::new(&sock),
             )
             .await
             .unwrap();
@@ -4512,7 +4503,7 @@ mod adapter {
             (sock, results, parked, evt_rx)
         }
 
-        async fn fire_main_mcp_call(sock: &str, call_id: &str) -> Value {
+        async fn fire_main_mcp_call(sock: impl AsRef<Path>, call_id: &str) -> Value {
             let stream = tokio::net::UnixStream::connect(sock).await.unwrap();
             let (r, mut w) = stream.into_split();
             let mut line = serde_json::to_vec(&serde_json::json!({
@@ -4858,8 +4849,9 @@ mod adapter {
             let path =
                 std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
             let mut body = String::from("#!/bin/sh\n");
-            // init has no session_id, so the engine's session-id persist
-            // (which would touch /workspace) stays a no-op in the test.
+            // init carries no session_id, so nothing is stashed and a respawn
+            // starts clean instead of `--resume`-ing a conversation this fake
+            // cannot replay. (State-dir isolation is `test_cli`'s job.)
             body.push_str("printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n");
             body.push_str("while IFS= read -r _line; do\n");
             for l in per_turn {
@@ -4938,7 +4930,120 @@ mod adapter {
             let _ = tokio::fs::remove_file(script).await;
         }
 
+        /// Every file the engine keeps per session lands in the injected state
+        /// dir — nothing derives a path any other way.
+        ///
+        /// The guard for a live-session failure: while only the two sockets
+        /// were redirectable, a `cargo nextest` run inside a dogfooding session
+        /// unlinked that session's own hook and MCP sockets and rewrote its
+        /// generated settings, so every deferred tool in it then answered
+        /// "engrams hook bridge unavailable". The listing assertion is
+        /// deliberate — a new per-session file must be named in `StateDir`
+        /// (and here), not written to a path of its own.
+        #[tokio::test]
+        async fn every_per_session_file_lands_in_the_injected_state_dir() {
+            let script = write_resumable_fake_claude("sid-state-dir").await;
+            let mut cli = test_cli(script.clone());
+            // An injected tool makes the engine write the MCP config too.
+            cli.tool_manifest = vec![generic_tool("save_memory", ToolExecution::Sync)];
+            let state = StateDir::new(&cli.state_dir);
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(16);
+            let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p-state-dir".into(),
+                    // A mode directive latches the ADR 0107 stamp.
+                    mode: Some("default".into()),
+                    text: "write your session state".into(),
+                })
+                .await
+                .unwrap();
+            let run_id = expect_run_started(&mut evt_rx).await;
+            assert_eq!(expect_run_completed(&mut evt_rx).await, run_id);
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // Asserted while the engine still runs: `SockGuard` unlinks both
+            // sockets when it returns.
+            let expected = [
+                state.claude_settings(),
+                state.claude_mcp_config(),
+                state.claude_bash_cwd(),
+                state.claude_session_id(),
+                state.mode_stamp(),
+                state.hook_sock(),
+                state.mcp_sock(),
+            ];
+            for path in &expected {
+                assert!(
+                    path.exists(),
+                    "{} is not in the injected state dir",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                tokio::fs::read_to_string(state.claude_session_id())
+                    .await
+                    .unwrap(),
+                "sid-state-dir"
+            );
+            let mut listed = Vec::new();
+            let mut entries = tokio::fs::read_dir(state.root()).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                listed.push(entry.path());
+            }
+            listed.sort();
+            let mut expected = expected.to_vec();
+            expected.sort();
+            assert_eq!(listed, expected, "unregistered per-session state file");
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine exits")
+                .expect("engine task does not panic");
+            let _ = tokio::fs::remove_file(script).await;
+        }
+
+        /// A fake claude whose `init` carries a session id, so the engine
+        /// persists a resume stash (the shared fake omits it).
+        async fn write_resumable_fake_claude(session_id: &str) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let path =
+                std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
+            let mut body = String::from("#!/bin/sh\n");
+            body.push_str(&format!(
+                "printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{session_id}\"}}'\n"
+            ));
+            body.push_str("while IFS= read -r _line; do\n");
+            body.push_str("  printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"completed\"}'\n");
+            body.push_str("done\n");
+            tokio::fs::write(&path, body).await.unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        /// A `Cli` whose per-session state is confined to a fresh temp dir.
+        ///
+        /// This is the ONLY state root any test gets, and it is mandatory:
+        /// the production default would put every socket, generated config,
+        /// stash, and stamp in the shared in-VM directory, so a test run
+        /// inside a live session (dogfooding) unlinked that session's own
+        /// hook and MCP sockets — its deferred tools then failed with
+        /// "engrams hook bridge unavailable" until it was recreated. Per test
+        /// (not per suite) so parallel engines cannot leak one test's
+        /// resumable id or latched mode into another's first spawn.
         fn test_cli(claude_bin: String) -> Cli {
+            let state_dir =
+                std::env::temp_dir().join(format!("engram-claude-state-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&state_dir).expect("test state dir");
             Cli {
                 connect: None,
                 vsock_host: Some(1),
@@ -4950,26 +5055,8 @@ mod adapter {
                 max_tool_call_secs: 600,
                 max_run_secs: 86_400,
                 claude_bin: Some(claude_bin),
-                hook_sock_path: None,
-                mcp_sock_path: None,
-                // Isolated per test: a shared stash leaks one test's
-                // resumable id into another's first spawn (--resume).
-                session_id_file: Some(
-                    std::env::temp_dir()
-                        .join(format!("claude-session-id-{}", uuid::Uuid::new_v4()))
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
+                state_dir,
                 tool_manifest: Vec::new(),
-                // Isolated per test for the same reason as session_id_file:
-                // a shared stamp leaks one test's latched mode into
-                // another's first spawn.
-                mode_stamp_file: Some(
-                    std::env::temp_dir()
-                        .join(format!("mode-stamp-{}", uuid::Uuid::new_v4()))
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
             }
         }
 
@@ -5977,7 +6064,7 @@ mod adapter {
         }
 
         async fn hook_fire_named(
-            sock: &str,
+            sock: impl AsRef<Path>,
             tool_use_id: &str,
             tool_name: &str,
             tool_input: Value,
@@ -6565,7 +6652,11 @@ mod adapter {
         /// (`tool_deferred`), and exits — the engine then respawns and its
         /// bootstrap re-announces the park. A default invocation just logs
         /// stdin lines (the build turn) and stays alive. Every invocation
-        /// appends its argv to `invocations` BEFORE touching anything else.
+        /// appends its argv to `invocations` BEFORE touching anything else, as
+        /// ONE line: `--append-system-prompt` carries the ambient
+        /// `ENGRAM_APPEND_SYSTEM_PROMPT`, which is multi-line in a real
+        /// session, so the newlines are folded out before the record is
+        /// written (both the line COUNT and the last-line read depend on it).
         async fn write_plan_flow_fake_claude(invocations: &Path, stdin_log: &Path) -> String {
             use std::os::unix::fs::PermissionsExt;
             let path =
@@ -6573,7 +6664,8 @@ mod adapter {
             let body = format!(
                 "#!/bin/sh\n\
                  trap 'exit 0' INT TERM\n\
-                 printf '%s\\n' \"$*\" >> '{invocations}'\n\
+                 printf '%s' \"$*\" | tr '\\n' ' ' >> '{invocations}'\n\
+                 printf '\\n' >> '{invocations}'\n\
                  printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\"}}'\n\
                  case \"$*\" in\n\
                  *'--permission-mode plan'*)\n\
@@ -6633,8 +6725,8 @@ mod adapter {
         /// queued prompt switches back to build.
         #[tokio::test]
         async fn applying_a_prompt_mode_latches_some_and_inherits_none() {
-            let (cli, _hook, _mcp) = deferred_engine_cli("/bin/true".into(), "apply-mode").await;
-            let stamp = std::path::PathBuf::from(cli.mode_stamp_file.clone().unwrap());
+            let (cli, _hook, _mcp) = deferred_engine_cli("/bin/true".into());
+            let stamp = StateDir::new(&cli.state_dir).mode_stamp();
 
             // No directive on a fresh session: the default, unchanged.
             assert_eq!(apply_prompt_mode(&cli, None), "default");
@@ -6663,9 +6755,9 @@ mod adapter {
             let invocations = std::env::temp_dir().join(format!("fake-claude-argv-{nonce}"));
             let stdin_log = std::env::temp_dir().join(format!("fake-claude-stdin-{nonce}"));
             let script = write_plan_flow_fake_claude(&invocations, &stdin_log).await;
-            let (mut cli, hook, _mcp) = deferred_engine_cli(script.clone(), "plan-approve").await;
+            let (mut cli, hook, _mcp) = deferred_engine_cli(script.clone());
             cli.tool_manifest = vec![native_plan_tool()];
-            let stamp = std::path::PathBuf::from(cli.mode_stamp_file.clone().unwrap());
+            let stamp = StateDir::new(&cli.state_dir).mode_stamp();
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let (evt_tx, mut evt_rx) = mpsc::channel(64);
             let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
@@ -6828,9 +6920,9 @@ mod adapter {
             let invocations = std::env::temp_dir().join(format!("fake-claude-argv-{nonce}"));
             let stdin_log = std::env::temp_dir().join(format!("fake-claude-stdin-{nonce}"));
             let script = write_plan_flow_fake_claude(&invocations, &stdin_log).await;
-            let (mut cli, hook, _mcp) = deferred_engine_cli(script.clone(), "plan-reject").await;
+            let (mut cli, hook, _mcp) = deferred_engine_cli(script.clone());
             cli.tool_manifest = vec![native_plan_tool()];
-            let stamp = std::path::PathBuf::from(cli.mode_stamp_file.clone().unwrap());
+            let stamp = StateDir::new(&cli.state_dir).mode_stamp();
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let (evt_tx, mut evt_rx) = mpsc::channel(64);
             let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
@@ -7018,7 +7110,8 @@ mod adapter {
                  if [ -f '{counter}' ]; then n=$(sed -n '1p' '{counter}'); fi\n\
                  n=$((n + 1))\n\
                  printf '%s\\n' \"$n\" > '{counter}'\n\
-                 printf '%s\\n' \"$*\" >> '{invocations}'\n\
+                 printf '%s' \"$*\" | tr '\\n' ' ' >> '{invocations}'\n\
+                 printf '\\n' >> '{invocations}'\n\
                  printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{session_id}\"}}'\n\
                  if [ \"$n\" -ge 2 ]; then\n\
                    printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-restored-refire\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_restored\",\"name\":\"mcp__engrams__save_memory\",\"input\":{{\"text\":\"remember\"}}}}]}}}}'\n\
@@ -7117,19 +7210,14 @@ mod adapter {
             path.to_string_lossy().into_owned()
         }
 
-        async fn deferred_engine_cli(script: String, call_id: &str) -> (Cli, String, String) {
-            let base = std::env::temp_dir().join(format!(
-                "engram-deferred-{call_id}-{}",
-                uuid::Uuid::new_v4()
-            ));
-            tokio::fs::create_dir_all(&base).await.unwrap();
-            let hook = base.join("hook.sock").to_string_lossy().into_owned();
-            let mcp = base.join("mcp.sock").to_string_lossy().into_owned();
+        /// An engine `Cli` with one deferred manifest tool, plus the two
+        /// sockets `run_engine` will bind — both inside the test's own state
+        /// dir, which is the only place any of its state can land.
+        fn deferred_engine_cli(script: String) -> (Cli, PathBuf, PathBuf) {
             let mut cli = test_cli(script);
-            cli.hook_sock_path = Some(hook.clone());
-            cli.mcp_sock_path = Some(mcp.clone());
             cli.tool_manifest = vec![generic_tool("save_memory", ToolExecution::Deferred)];
-            (cli, hook, mcp)
+            let state = StateDir::new(&cli.state_dir);
+            (cli, state.hook_sock(), state.mcp_sock())
         }
 
         #[tokio::test]
@@ -7137,7 +7225,7 @@ mod adapter {
             let counter =
                 std::env::temp_dir().join(format!("fake-claude-count-{}", uuid::Uuid::new_v4()));
             let script = write_deferred_refire_fake_claude(&counter).await;
-            let (cli, hook, mcp) = deferred_engine_cli(script.clone(), "refire").await;
+            let (cli, hook, mcp) = deferred_engine_cli(script.clone());
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let (evt_tx, mut evt_rx) = mpsc::channel(64);
             let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
@@ -7239,8 +7327,8 @@ mod adapter {
                 &session_id,
             )
             .await;
-            let (cli, hook, mcp) = deferred_engine_cli(script.clone(), "fresh-restore").await;
-            let stash = cli.session_id_file.clone().expect("test_cli sets a stash");
+            let (cli, hook, mcp) = deferred_engine_cli(script.clone());
+            let stash = StateDir::new(&cli.state_dir).claude_session_id();
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let (evt_tx, mut evt_rx) = mpsc::channel(64);
             let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
@@ -7355,7 +7443,7 @@ mod adapter {
             let counter =
                 std::env::temp_dir().join(format!("fake-claude-count-{}", uuid::Uuid::new_v4()));
             let script = write_deferred_alive_refire_fake_claude(&counter).await;
-            let (cli, hook, mcp) = deferred_engine_cli(script.clone(), "alive").await;
+            let (cli, hook, mcp) = deferred_engine_cli(script.clone());
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let (evt_tx, mut evt_rx) = mpsc::channel(64);
             let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
@@ -7452,7 +7540,7 @@ mod adapter {
             let counter = std::env::temp_dir().join(format!("fake-claude-count-{nonce}"));
             let captured = std::env::temp_dir().join(format!("fake-claude-fallback-{nonce}"));
             let script = write_native_question_fallback_fake_claude(&counter, &captured).await;
-            let (mut cli, hook, _mcp) = deferred_engine_cli(script.clone(), "fallback").await;
+            let (mut cli, hook, _mcp) = deferred_engine_cli(script.clone());
             cli.tool_manifest = vec![native_question_tool()];
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let (evt_tx, mut evt_rx) = mpsc::channel(64);
