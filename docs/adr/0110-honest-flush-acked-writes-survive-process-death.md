@@ -1,36 +1,44 @@
-# ADR 0110: Honest flush — acked disk writes survive process death
+# ADR 0110: Honest writes — acked disk writes survive process death
 
 Status: Proposed (2026-08-02)
 
 ## Summary, in plain English
 
-Every disk makes one promise. When a program says "flush," the disk must
-not answer "done" until the data is truly safe. Every filesystem is built
-on this promise. If the power dies, the filesystem loses only the data it
-never flushed. It recovers on its own. This is normal and safe.
+Every disk makes one promise. When a program asks it to make data safe,
+the disk must not answer "done" until the data is truly safe. Every
+filesystem is built on this promise. If the power dies, the filesystem
+loses only data it was never promised. It recovers on its own. This is
+normal and safe.
 
-Our disk server breaks this promise. When a guest VM says "flush," the
-server answers "done" and does nothing. The data stays in the server's
-process memory. We redeploy that process about 11 times a day. Each
+Our disk server breaks this promise. It acknowledges guest writes into
+its own process memory, and answers guest flushes with "done" while
+doing nothing. We redeploy that process about 11 times a day. Each
 deploy can destroy data the guest was told was safe.
 
 We built a large recovery apparatus to manage the damage: quarantine,
 retry ladders, a shutdown spool, a destroy-and-rewind arm, and a red
-"guest disk rolled back" card in the UI. All of it compensates for one
-dishonest ACK.
+"guest disk rolled back" card in the UI. All of it compensates for
+acked data living in process memory.
 
-The fix: keep the promise. On flush, write the dirty data to plain files
-on the node's local SSD, then answer "done." Files belong to the kernel,
-not to the process. A killed process loses nothing it wrote to a file.
-After this change, a host-agent death looks to the guest like a power
-cut on an honest disk — the exact event its filesystem is designed to
-survive. The recovery apparatus becomes deletable.
+The fix: the dirty tier stops being process memory. It becomes a plain
+sparse file on the node's local SSD, written through on every guest
+write. Files belong to the kernel, not to the process. A killed process
+loses nothing it wrote to a file. After this change, a host-agent death
+looks to the guest like a power cut on an honest disk — the exact event
+its filesystem is designed to survive. The recovery apparatus becomes
+deletable.
 
 ## Context
 
 ### The defect
 
-`crates/engram-host-agent/src/disk_daemon/runtime.rs:1509`:
+Two halves of one problem:
+
+1. Acked writes live only in process RAM.
+   `ChunkedDiskBackend.dirty` (`backend.rs:346`) is
+   `Arc<Mutex<HashMap<usize, Vec<u8>>>>` — the only copy of every acked
+   guest write between the 30s flush-scheduler uploads.
+2. FLUSH is a lie. `runtime.rs:1509`:
 
 ```rust
 // FLUSH: ack at the wire level but defer durable-flush to the
@@ -39,18 +47,16 @@ survive. The recovery apparatus becomes deletable.
 NbdCommand::Flush | NbdCommand::Trim => (NbdReply::ok(req.handle), None),
 ```
 
-The comment prices "honest flush" against the chunk store (GCS). That is
-a false choice. The third option — node-local NVMe — costs microseconds
-and was never considered. Acked writes live only in
-`ChunkedDiskBackend.dirty` (`backend.rs:346`), a RAM map inside the
-host-agent process, until the 30s flush scheduler uploads them.
+The comment prices honesty against the chunk store (GCS). That is a
+false choice. The third option — node-local disk — costs microseconds
+and was never considered.
 
-### The cost of the lie
+### The cost
 
 A host-agent pod roll kills the process. The kernel NBD device survives
-(ADR 0017's netlink work; guest I/O parks for 300s). The VM survives
-(ADR 0044 K2 VM-detach). Only the RAM dirty tier dies. Everything
-downstream exists to cope with that:
+(ADR 0017 netlink; guest I/O parks 300s). The VM survives (ADR 0044 K2
+VM-detach). Only the RAM dirty tier dies. Everything downstream copes
+with that:
 
 - 2026-08-02: 12 `durability_rollback` events in one day, in bursts of
   up to 5 sessions in 12 seconds, one burst per host-agent roll. 14
@@ -64,101 +70,126 @@ downstream exists to cope with that:
 - The latest round (#971 unwind-safe SIGTERM, #972 park-and-recover)
   landed 2026-08-02 — stopgaps that stop the destroy, not the loss.
 
-### Why the simpler-sounding fixes were rejected
+### Prior art
 
-- **Drain rolls (roll = evict everything):** makes every deploy slow and
-  interrupts active sessions. Rejected for the tradeoff.
-- **Out-of-process disk daemon (ADR 0076):** keeps the state alive by
-  keeping the process alive. Adds a supervised process per sandbox and
-  still loses everything on a daemon crash. Gated, now mooted.
+e2b (e2b-dev/infra) runs the same architecture — an in-process NBD
+server inside the node orchestrator, chunked lazy base images from
+GCS — and does not have this bug class. Their write cache
+(`block/cache.go`) is a file-backed `MAP_SHARED` mmap from block zero:
+every guest write lands in the kernel page cache at ACK time. They do
+not even negotiate `NBD_FLAG_SEND_FLUSH`, because a write-through cache
+has nothing left for FLUSH to add. This ADR adopts that primitive and
+keeps what e2b lacks: our VMs survive host-agent restarts (e2b SIGKILLs
+every orphaned Firecracker on startup — acceptable for disposable
+sandboxes, wrong for long-lived sessions).
+
+### Rejected alternatives
+
+- **Drain rolls (roll = evict everything):** slow deploys, interrupts
+  active sessions.
+- **Out-of-process disk daemon (ADR 0076):** keeps state alive by
+  keeping a process alive; still loses everything on a daemon crash.
+  Gated, now superseded.
 - **Sync flush to GCS:** ~100ms per guest fsync. Correctly rejected in
   the original comment.
+- **Flush-time journal (this ADR's first draft):** tmp-then-rename
+  chunk files written per guest FLUSH. Correct, but protects only
+  flushed writes and needs rename discipline, generation counters, and
+  compaction. Write-through makes all of that unnecessary.
 
 ## Decision
 
-**Rule: never acknowledge durability you do not have.** Concretely: an
-acked FLUSH means the covered writes are on node-local disk, outside
-the process, before the reply goes out.
+**Rule: an acked write is on a node-local file before the ack.** The
+dirty tier is a per-sandbox sparse file, written through with
+`pwrite(2)` on every NBD write. No acked byte ever exists only in
+process memory.
 
-**Scope of protection.** This defends against *process* death only —
-deploys, panics, SIGKILL, OOM. *Node* death remains covered by the
-existing 30s flush-to-GCS floor, unchanged. This split is what keeps
-the code small: all the hard parts of journal engineering (fsync
-ordering, torn-write recovery, barriers) exist to survive power loss
-without a backup. We have a backup. We only need the kernel's own
-guarantee: file data survives the death of the process that wrote it.
+**Scope of protection.** This defends against *process* death —
+deploys, panics, SIGKILL, OOM. Data written to a file lives in the
+kernel page cache the moment `pwrite` returns; the death of the writing
+process cannot touch it. *Node* death remains covered by the existing
+30s flush-to-GCS floor, unchanged. This split keeps the code small:
+fsync ordering, torn-write recovery, and write barriers exist to
+survive power loss without a backup. We have a backup (the chunk
+store). We only defend against the event that actually recurs — the
+process dying — and the kernel gives that defense away free.
 
 ## Design
 
-### The journal: a folder of chunk files
+### The dirty file
 
-Per sandbox, on the same hostPath volume the spool and chunk cache use:
+Per sandbox, on the same hostPath volume as the chunk cache:
 
 ```
-/var/lib/engram/journal/<sandbox_id>/
-    <chunk_index>            # complete chunk bytes, current version
-    .tmp-<chunk_index>-<n>   # in-progress write, ignored by recovery
+/var/lib/engram/dirty/<sandbox_id>.cache   # sparse, sized to the device
 ```
 
-No record framing. No custom format. One file per dirty chunk, always
-written as tmp-then-`rename(2)`. Rename is atomic: a reader sees the
-complete old version or the complete new version, never a torn file.
-Torn-write handling is inherited from the kernel, not written by us.
+Created (sparse, `ftruncate` to device size) at sandbox start. No
+format: byte offset N of the file is byte offset N of the device.
 
-### Write path
+### Data path
 
-1. `NBD_CMD_WRITE`: unchanged. Buffer into the RAM dirty map, ack.
-2. `NBD_CMD_FLUSH`: for each chunk dirtied since the last flush, write
-   its full bytes to a tmp file and rename into place. Then ack.
-   No fsync — the data is in the kernel page cache, which survives
-   process death. Writes land at memory speed.
-3. FUA-flagged writes: journal that chunk, then ack (same mechanism).
-4. `ENGRAM_JOURNAL_FSYNC=1` (default off): also fsync file + directory,
-   for kernel-panic paranoia. Not required for correctness; kernel
-   panic falls back to the GCS floor exactly like node death.
+1. `NBD_CMD_WRITE`: `pwrite` the bytes into the dirty file at the
+   request offset; set the covered chunks in the in-memory dirty
+   bitmap; ack. The RAM `HashMap` dirty tier is deleted. Page-cache
+   writes are memory-speed; ack latency is unchanged.
+2. `NBD_CMD_READ`: bitmap says dirty → `pread` the dirty file
+   (page cache, RAM-speed). Otherwise the base/chunk-store path,
+   unchanged.
+3. `NBD_CMD_FLUSH` / FUA: ack, unchanged — but now honest. There is no
+   process-volatile state for a flush to make safe; within our threat
+   model (process death), acked writes are already durable. (This is
+   e2b's reasoning for not negotiating FLUSH at all.)
+4. No fsync. `ENGRAM_DIRTY_FSYNC=1` (default off) fsyncs on FLUSH for
+   kernel-panic paranoia; a kernel panic otherwise falls back to the
+   GCS floor exactly like node death.
+5. I/O errors surface as `EIO` results from `pwrite`/`pread` and turn
+   into per-request NBD error replies — one sandbox degrades, the
+   host-agent lives. (We deliberately use file syscalls, not mmap:
+   e2b's mmap approach needs a SIGBUS-recovery guard, `RunFaultSafe`;
+   `pwrite` gives the same page-cache semantics with ordinary error
+   handling.)
 
-Each dirty chunk carries a generation counter (bumped on every write to
-it). The journal file records the generation it captured (xattr or a
-sidecar naming scheme — implementation's choice, it only gates cleanup).
+### Flush scheduler (unchanged cadence, new source)
 
-### Cleanup (compaction)
+The 30s / 256 MiB flush scheduler `pread`s dirty chunks from the file,
+uploads to the chunk store, and publishes the manifest — as today.
+After a durable publish it may `fallocate(PUNCH_HOLE)` ranges not
+re-dirtied since the drain, to bound file size. The re-dirtied check is
+an in-memory flag; losing it to a crash means re-uploading a chunk to a
+content-addressed store — harmless and idempotent. No generation
+counters, no compaction machinery.
 
-After the flush scheduler drains chunk `i` at generation `g` to the
-chunk store and the manifest publish succeeds, delete `journal/<sid>/i`
-only if its captured generation is ≤ `g`. A chunk re-dirtied after the
-drain keeps its newer journal file. The journal is therefore bounded by
-the un-uploaded window — the same ~256 MiB dirty threshold that already
-paces the flush scheduler.
-
-### Recovery path (replaces rehydrate forensics)
+### Recovery (replaces rehydrate forensics)
 
 Successor host-agent, per surviving sandbox:
 
-1. List `journal/<sandbox_id>/`. Load every chunk file into the dirty
-   tier, on top of the backend built from the last published manifest.
-   Ignore `.tmp-*` files (delete them).
+1. Open the dirty file. Rebuild the dirty bitmap with
+   `lseek(SEEK_DATA/SEEK_HOLE)` — allocated extents are the dirty set.
+   (Any extent overlapping a chunk marks the whole chunk dirty; the
+   over-approximation only costs a redundant idempotent upload.)
 2. `NBD_CMD_RECONFIGURE` the surviving `/dev/nbdN` with a fresh socket.
 3. Done. No spool adoption, no `VerifySeed` probe, no quarantine.
 
-If step 2 fails (netlink error, identifier mismatch): flush the loaded
-dirty tier to the chunk store, publish the manifest, destroy the VM,
-and let the next prompt resume from that manifest. **Zero acked loss.**
-Reattach failure degrades to a normal park/resume instead of a rollback.
+If step 2 fails (netlink error, identifier mismatch): flush the dirty
+file to the chunk store, publish the manifest, destroy the VM, and let
+the next prompt resume from that manifest. **Zero acked loss.**
+Reattach failure degrades to a normal park/resume instead of a
+rollback.
 
 ### Finalize without a data plane
 
-Because the journal + published base fully determine the disk, eviction
-finalize can build a capture manifest from host files alone — no live
-NBD device needed. This is what deletes `RefuseUntracked`: the refusal
-protected acked writes from a snapshot that would drop them; there is
-no longer anything to drop.
+The published base + the dirty file fully determine the disk, so
+eviction finalize can build a capture manifest from host files alone —
+no live NBD device needed. This is what deletes `RefuseUntracked`: the
+refusal protected acked writes from a snapshot that would drop them;
+there is no longer anything to drop.
 
 ### Guest contract
 
-Data the guest wrote but never flushed can still be lost on process
-death. That is the standard power-cut contract every journaling
-filesystem (ext4 in our guests) is designed for. We stop opting out of
-the guest's own safety scheme; we do not add a new one.
+Unchanged for the guest: it already assumes a disk that may lose
+nothing it acked. We now actually are one, across process death. Node
+death keeps power-cut semantics backed by the GCS floor, as today.
 
 ## What this deletes
 
@@ -166,6 +197,7 @@ Removed outright (≈1,800+ production LOC):
 
 | Code | Location |
 |---|---|
+| The RAM dirty tier (`dirty` HashMap) and its lock choreography | `disk_daemon/backend.rs` |
 | Quarantine evict ladder: `QUARANTINE_EVICT_MAX_ATTEMPTS`, `reap_quarantined_survivor`, the park-and-recover arm (#972), `quarantine_reap_unevictable` | `session_verbs.rs`, `idle_evictor.rs` |
 | `quarantined_survivors` map, heartbeat advertise, coordinator consumption | `pooled_backend.rs`, `heartbeat.rs`, `host_http.rs`, `engram-protocol` |
 | `RefuseUntracked` / `CaptureDrainPlan` | `engram-host-core/src/survivor.rs` (whole file) |
@@ -177,53 +209,65 @@ Removed outright (≈1,800+ production LOC):
 Replaced: ~3,750 lines of NBD-recovery integration tests
 (`nbd_startup_recovery`, `nbd_shutdown_abandon_race`,
 `nbd_shutdown_final_flush`, `chain_rehydrate`, …) collapse into a
-journal suite (see Testing). Simplified: `rehydrate_sandbox` /
-`reattach_manifest` shrink to load-folder → RECONFIGURE → lossless
-fallback.
+dirty-file suite (see Testing). Simplified: `rehydrate_sandbox` /
+`reattach_manifest` shrink to open-file → rebuild-bitmap →
+RECONFIGURE → lossless fallback.
 
 Unchanged: NBD netlink + dead-conn parking (ADR 0017), VM-detach and
 pidfd reattach (ADR 0044 K2), the flush scheduler and manifest publish
 (now the node-death floor only), the coordinator session FSM,
 `dead_host` for genuine node loss.
 
+New code, in full: the pwrite/pread dirty-file backend (~150-250
+lines), extent-scan bitmap rebuild (~50), hole-punch after publish
+(~30). No file format, no replay logic, no fsync ordering.
+
 ## Tradeoffs
 
-1. **Double-write.** Every dirty byte hits host NVMe twice (journal,
-   then chunk upload staging). Bounded by the dirty window; real
-   bandwidth and SSD wear, accepted.
-2. **Flush latency.** Guest fsync now pays a memcpy-speed journal write
-   for the chunks it dirtied. Typically sub-millisecond; a large burst
-   costs a few ms. Today's flush is instant because it is fake.
-3. **Kernel panic** (OS dies, disk intact) loses un-fsynced page cache
+1. **Double-write.** Every dirty byte hits host NVMe twice over its
+   life: kernel writeback of the dirty file, then the chunk upload
+   path. Bounded by the dirty window (hole-punched after each 30s
+   flush); real bandwidth and SSD wear, accepted. The kernel schedules
+   the writeback — no latency on the ack path.
+2. **Page-cache memory pressure.** Dirty-file pages count as page
+   cache, not process RSS. The kernel writes them back and reclaims
+   under pressure — better behavior than today's pinned HashMap RAM,
+   but different accounting; watch it during rollout.
+3. **Kernel panic** (OS dies, disk intact) loses un-synced page cache
    and falls back to the GCS floor — same as node death. Rare; the
-   `ENGRAM_JOURNAL_FSYNC` flag exists if we ever care.
+   `ENGRAM_DIRTY_FSYNC` flag exists if we ever care.
 4. **Node death is unchanged.** Up to ~30s of writes lost, as today.
    The rollback card keeps that case — where "host failure" is true.
-5. **New load-bearing file code.** Small and single-process, but it
-   must be tested with the full ADR 0099 H5 crash-state discipline.
+5. **Sparse-file semantics become load-bearing.** SEEK_DATA/SEEK_HOLE
+   and PUNCH_HOLE behavior on the hostPath filesystem (ext4) must be
+   covered by the test suite; both are old, stable ext4 features.
 
 ## Testing
 
-- **Crash-state (ADR 0099 H5):** externally construct every post-kill
-  journal state — tmp files at every stage, renamed-but-stale
-  generations, garbage siblings — and assert recovery loads exactly the
-  complete chunk set. No fail-points needed; the states are plain files.
-- **Property test:** random write/flush/kill schedules against a model
-  disk; after recovery, every acked-flushed byte reads back. Wildcard-
+- **Crash-state (ADR 0099 H5):** kill a live serve loop at random
+  points under a random write schedule (SIGKILL, no cooperation);
+  assert the successor's extent scan + pread reproduces every acked
+  write. States are plain files — externally constructible, no fail
+  points.
+- **Property test:** random write/flush/kill/recover schedules against
+  a model disk; after recovery, every acked byte reads back. Wildcard-
   free match over `NbdCommand` so a new command is a compile error.
+- **Extent semantics:** dedicated tests for SEEK_DATA/SEEK_HOLE
+  rebuild and PUNCH_HOLE-vs-write races on ext4.
 - **DST/cosim:** the existing quarantine flows (ADR 0098 Flow A/B)
   invert — assert a roll produces zero `durability_rollback` events and
   zero rewound event indexes.
-- **FC integration (CI-wired per AGENTS.md):** minimal write → flush →
-  SIGKILL host-agent → successor recovers → read back. Smallest data
-  that proves the property; no throughput measurement.
+- **FC integration (CI-wired per AGENTS.md):** minimal write → SIGKILL
+  host-agent → successor recovers → read back. Smallest data that
+  proves the property; no throughput measurement.
 
 ## Rollout
 
-1. Land the journal write path + recovery behind the existing reattach
+1. Land the dirty-file backend + recovery behind the existing reattach
    flow (scaffolding still present, now unexercised).
 2. Prove zero-rollback rolls in prod for one week of normal deploy
-   cadence (`engram_durability_rollback_total` flat).
+   cadence (`engram_durability_rollback_total` flat); watch page-cache
+   and NVMe-bandwidth metrics.
 3. Delete the scaffolding (the table above) in one retirement PR chain.
 4. Flip this ADR to Accepted with the commit list; add the terminal
    addendum to ADR 0090 (quarantine concept retired) and mark ADR 0076
@@ -231,8 +275,8 @@ pidfd reattach (ADR 0044 K2), the flush scheduler and manifest publish
 
 ## Relationship to other ADRs
 
-- **ADR 0007** (chunked-immutable storage): untouched; the journal is a
-  staging tier under it, not a replacement.
+- **ADR 0007** (chunked-immutable storage): untouched; the dirty file
+  is a staging tier under it, not a replacement.
 - **ADR 0017** (NBD lifecycle): its netlink survivability is what makes
   recovery a RECONFIGURE instead of a device rebuild. Kept.
 - **ADR 0028 / 0101** (eviction durability): the durable floor they
