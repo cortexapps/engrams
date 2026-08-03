@@ -3,26 +3,27 @@
 //! Maps NBD `(offset, length)` operations onto chunk-store
 //! operations. Per-fault read resolves to one chunk fetch (via the
 //! L1 NVMe cache); per-write copies the base chunk into a
-//! per-session in-memory dirty buffer and applies the write there.
+//! per-session sparse dirty file and applies the write there.
 //!
 //! Two key invariants the runtime depends on:
 //!
 //! 1. **Read-after-write** within a session sees the dirty bytes.
 //!    Writes don't go back to the chunk store on every NBD_CMD_WRITE
 //!    — that would explode object-storage cost. Dirty chunks live
-//!    in RAM until `flush()` is called (snapshot trigger).
+//!    in a sparse file until `flush()` uploads them.
 //! 2. **Base chunks are immutable.** The chunk store is content-
 //!    addressed; the daemon never PUTs an existing hash again.
 //!    Dirty chunks get rehashed at flush time; new hashes go up,
 //!    the manifest version ticks.
 //!
-//! Memory cost: 16 MiB per dirty chunk. A session that writes
-//! pseudorandomly across the whole 16 GiB rootfs would peak at
-//! 16 GiB resident — at that point the dirty buffer is the wrong
-//! shape anyway. Realistic Python/Node sessions touch < 100 MiB
-//! of fresh writes between snapshots; that's six dirty chunks.
+//! The file follows guest offsets. The in-memory dirty tier keeps
+//! only chunk indexes and generations.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -57,6 +58,8 @@ const DISK_FLUSH_UPLOAD_CONCURRENCY: usize = 32;
 /// read — modest, but on the same path. 8 mirrors the postcopy-drain bound.
 const DISK_READ_FETCH_CONCURRENCY: usize = 8;
 
+static DIRTY_FILE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Anything that can go wrong on the backend data plane.
 #[derive(Debug)]
 pub enum DiskBackendError {
@@ -68,6 +71,13 @@ pub enum DiskBackendError {
     InvalidManifest(String),
     /// Underlying chunk store / blob I/O failed.
     Chunk(engram_chunk_store::error::ChunkStoreError),
+    /// The per-sandbox dirty file could not be opened, read, written,
+    /// synced, scanned, moved, or punched.
+    DirtyFile {
+        operation: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// NBD offset + length lands past the end of the virtual disk.
     /// The kernel side shouldn't normally send these; if it does,
     /// the daemon replies EINVAL.
@@ -106,6 +116,11 @@ impl std::fmt::Display for DiskBackendError {
             Self::WrongKind(m) => write!(f, "wrong manifest kind: {m}"),
             Self::InvalidManifest(m) => write!(f, "invalid manifest: {m}"),
             Self::Chunk(e) => write!(f, "chunk store: {e}"),
+            Self::DirtyFile {
+                operation,
+                path,
+                source,
+            } => write!(f, "dirty file {operation} at {}: {source}", path.display()),
             Self::OutOfRange {
                 offset,
                 length,
@@ -155,17 +170,11 @@ pub struct DiskFlushOutcome {
     pub bytes_uploaded: u64,
 }
 
-/// ADR 0038 B3: handoff from `flush_local` (drain-under-pause) to
-/// `flush_upload` (upload-post-resume). Carries the drained
-/// `(chunk_idx, hash, bytes)` for each dirty chunk so `flush_upload`
-/// uploads **its own** bytes rather than re-reading the shared
-/// `pending_uploads` map. The bytes are ALSO mirrored into
-/// `pending_uploads` for read-survival during the flush window, but the
-/// upload no longer depends on that map — closing the drop where a
-/// concurrent flush cleared `pending_uploads[idx]` before this flush's
-/// upload read it, silently skipping the put while the manifest still
-/// referenced the (now never-uploaded) chunk. Empty `new_chunks` =
-/// nothing was dirty.
+/// ADR 0038 B3 handoff from `flush_local` to `flush_upload`.
+/// `new_chunks` is the exact disk state captured while `flush_local`
+/// holds the dirty-tier lock. Each claim records the generation for
+/// later release or hole punching. Empty `claims` means nothing was
+/// dirty.
 ///
 /// Issue #199: also carries the owned flush-pipeline guard acquired by
 /// `flush_local`, so the drain and the `flush_upload` that consumes this
@@ -177,36 +186,39 @@ pub struct DiskFlushOutcome {
 /// commit/abort).
 pub struct PendingDiskFlush {
     new_chunks: Vec<(usize, ChunkHash, Bytes)>,
+    claims: Vec<DirtyChunkClaim>,
     /// Held across the publish; see `ChunkedDiskBackend::flush_pipeline`.
     flush_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl PendingDiskFlush {
-    /// Issue #529: the eviction finalize flavor persists these drained
-    /// chunks to `<dest>/disk-pending/` BEFORE `snapshot_begin` returns
-    /// (durability boundary moves earlier), then re-reads them from disk
-    /// in the (possibly re-driven, possibly cross-process) background
-    /// finalize job — it never calls `flush_upload` on this handle
-    /// directly, so there's no live-backend rebase to preserve and
-    /// nothing left to serialize once these bytes are extracted. Consumes
-    /// `self`, dropping the flush-pipeline guard immediately.
-    ///
-    /// Its only caller is `PooledBackend::snapshot_begin`'s
-    /// `#[cfg(target_os = "linux")]` disk-pending block (NBD is
-    /// Linux-only) — `#[cfg]`'d rather than `#[allow(dead_code)]`'d so a
-    /// non-Linux build doesn't carry an unreachable-by-construction method.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn chunks(&self) -> &[(usize, ChunkHash, Bytes)] {
+        &self.new_chunks
+    }
+
+    /// Return the bytes captured at the pause instant for eviction.
+    /// Consumed claims stay in the tier's claimed map until sandbox
+    /// destroy. This matches the old `pending_uploads` lifecycle. Reads
+    /// continue to use the file because `contains()` includes claims.
     #[cfg(target_os = "linux")]
     pub(crate) fn into_chunks(self) -> Vec<(usize, ChunkHash, Bytes)> {
         self.new_chunks
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DirtyChunkClaim {
+    chunk_idx: usize,
+    generation: u64,
+}
+
 /// ADR 0045 C2 disk post-copy: the frozen source's sealed disk state
 /// — every chunk whose guest-visible content differs from the
-/// published base manifest (dirty buffer + pending-uploads tier),
+/// published base manifest (dirty and claimed file chunks),
 /// held as raw refcounted bytes. Never hashed, never uploaded; served
 /// by index over `MigrationFetch::DiskChunkAt` and dropped when the
-/// export retires (commit) or re-queued into `dirty` (abort).
+/// export retires (commit) or re-queued into the dirty set (abort).
 pub struct PostCopyDiskSeal {
     chunks: HashMap<usize, Bytes>,
 }
@@ -320,6 +332,250 @@ impl PositionalDiskManifest {
     }
 }
 
+/// Controls whether construction starts a new dirty file or recovers
+/// the allocated extents of an existing file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirtyFileOpenMode {
+    Truncate,
+    Recover,
+}
+
+/// File-backed guest divergence for one sandbox.
+///
+/// One async mutex protects this whole struct. Reads, writes, claims,
+/// requeues, and hole punches use this lock. No caller can observe a
+/// chunk between tier states, and a writer always bumps the generation
+/// before it releases the lock.
+struct DirtyFileTier {
+    file: File,
+    path: PathBuf,
+    /// Chunks that the next flush can claim.
+    dirty: HashSet<usize>,
+    /// Chunks owned by the active flush and their claim generations.
+    claimed: HashMap<usize, u64>,
+    /// The latest write generation for every chunk touched in this process.
+    generations: HashMap<usize, u64>,
+    fsync_on_write: bool,
+    /// Temporary constructor files are removed if attach fails.
+    remove_on_drop: bool,
+}
+
+impl DirtyFileTier {
+    fn open(
+        path: PathBuf,
+        total_bytes: u64,
+        chunk_size: u64,
+        mode: DirtyFileOpenMode,
+    ) -> Result<Self, DiskBackendError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|source| dirty_file_error("create parent", &path, source))?;
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        match mode {
+            DirtyFileOpenMode::Truncate => {
+                options.create(true).truncate(true);
+            }
+            DirtyFileOpenMode::Recover => {}
+        }
+        let file = options
+            .open(&path)
+            .map_err(|source| dirty_file_error("open", &path, source))?;
+        file.set_len(total_bytes)
+            .map_err(|source| dirty_file_error("set length", &path, source))?;
+        let mut tier = Self {
+            file,
+            path,
+            dirty: HashSet::new(),
+            claimed: HashMap::new(),
+            generations: HashMap::new(),
+            fsync_on_write: std::env::var("ENGRAM_DIRTY_FSYNC").as_deref() == Ok("1"),
+            remove_on_drop: mode == DirtyFileOpenMode::Truncate,
+        };
+        if mode == DirtyFileOpenMode::Recover {
+            tier.recover_extents(total_bytes, chunk_size)?;
+        }
+        Ok(tier)
+    }
+
+    fn recover_extents(
+        &mut self,
+        total_bytes: u64,
+        chunk_size: u64,
+    ) -> Result<(), DiskBackendError> {
+        let fd = self.file.as_raw_fd();
+        let mut offset = 0u64;
+        while offset < total_bytes {
+            // SAFETY: lseek reads extent metadata from a file descriptor
+            // that this tier owns. It does not access process memory.
+            let data = unsafe { libc::lseek(fd, offset as libc::off_t, libc::SEEK_DATA) };
+            if data < 0 {
+                let source = std::io::Error::last_os_error();
+                if source.raw_os_error() == Some(libc::ENXIO) {
+                    break;
+                }
+                return Err(dirty_file_error("scan data extent", &self.path, source));
+            }
+            // SAFETY: this uses the same owned descriptor and only reads
+            // filesystem extent metadata.
+            let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+            if hole < 0 {
+                return Err(dirty_file_error(
+                    "scan hole extent",
+                    &self.path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            let data = data as u64;
+            let hole = (hole as u64).min(total_bytes);
+            if hole > data {
+                let first = (data / chunk_size) as usize;
+                let last = ((hole - 1) / chunk_size) as usize;
+                for chunk_idx in first..=last {
+                    self.dirty.insert(chunk_idx);
+                    self.generations.insert(chunk_idx, 1);
+                }
+            }
+            offset = hole;
+        }
+        Ok(())
+    }
+
+    fn contains(&self, chunk_idx: usize) -> bool {
+        self.dirty.contains(&chunk_idx) || self.claimed.contains_key(&chunk_idx)
+    }
+
+    fn read_chunk(
+        &self,
+        chunk_idx: usize,
+        chunk_len: usize,
+        chunk_size: u64,
+    ) -> std::io::Result<Bytes> {
+        let mut bytes = vec![0u8; chunk_len];
+        read_exact_at(&self.file, &mut bytes, chunk_idx as u64 * chunk_size)?;
+        Ok(Bytes::from(bytes))
+    }
+
+    fn write_chunk(&self, chunk_idx: usize, bytes: &[u8], chunk_size: u64) -> std::io::Result<()> {
+        write_all_at(&self.file, bytes, chunk_idx as u64 * chunk_size)
+    }
+
+    fn bump_generation(&mut self, chunk_idx: usize) -> Result<u64, DiskBackendError> {
+        let generation = self.generations.entry(chunk_idx).or_default();
+        *generation = generation.checked_add(1).ok_or_else(|| {
+            DiskBackendError::InvariantViolation(format!(
+                "dirty generation overflow for chunk {chunk_idx}"
+            ))
+        })?;
+        Ok(*generation)
+    }
+
+    fn release_claims(&mut self, claims: &[DirtyChunkClaim]) {
+        for claim in claims {
+            if self.claimed.get(&claim.chunk_idx) == Some(&claim.generation) {
+                self.claimed.remove(&claim.chunk_idx);
+                self.dirty.insert(claim.chunk_idx);
+            }
+        }
+    }
+
+    fn allocated_chunks(&self) -> HashSet<usize> {
+        self.dirty
+            .iter()
+            .copied()
+            .chain(self.claimed.keys().copied())
+            .collect()
+    }
+}
+
+impl Drop for DirtyFileTier {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn dirty_file_error(
+    operation: &'static str,
+    path: &Path,
+    source: std::io::Error,
+) -> DiskBackendError {
+    DiskBackendError::DirtyFile {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let read = file.read_at(bytes, offset)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "dirty file ended before the requested chunk",
+            ));
+        }
+        offset += read as u64;
+        bytes = &mut bytes[read..];
+    }
+    Ok(())
+}
+
+fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let written = file.write_at(bytes, offset)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "dirty file write made no progress",
+            ));
+        }
+        offset += written as u64;
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn punch_hole(file: &File, offset: u64, length: u64) -> std::io::Result<()> {
+    // SAFETY: fallocate changes allocation metadata for an owned file
+    // descriptor. The offset and length are within the file size.
+    let result = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset as libc::off_t,
+            length as libc::off_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn punch_hole(file: &File, offset: u64, length: u64) -> std::io::Result<()> {
+    let mut request = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: offset as libc::off_t,
+        fp_length: length as libc::off_t,
+    };
+    // SAFETY: fcntl reads the initialized request and changes allocation
+    // metadata for an owned file descriptor.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &mut request) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Public data plane. One per FC sandbox.
 ///
 /// Cheap to clone via `Arc` — the runtime task and a (future)
@@ -341,16 +597,10 @@ pub struct ChunkedDiskBackend {
     /// full 16 MiB off the (pd-balanced) chunk-cache disk. `std::sync::Mutex`
     /// (not tokio) because every access is a brief, non-awaiting get/put.
     mem_cache: Arc<std::sync::Mutex<ChunkMemCache>>,
-    /// `chunk_idx -> dirty bytes`. Locked together so a concurrent
-    /// read + write of the same chunk doesn't see torn state.
-    dirty: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
-    /// ADR 0038 B3: chunks drained from `dirty` by `flush_local` (under
-    /// the FC pause) but not yet uploaded to GCS by `flush_upload`
-    /// (post-resume). `read_chunk` consults this tier between `dirty`
-    /// and `base`, so a just-drained chunk stays readable until its
-    /// upload lands + `base` is rebased — moving the multi-second GCS
-    /// upload off the frozen-guest path. `chunk_idx -> (hash, bytes)`.
-    pending_uploads: Arc<Mutex<HashMap<usize, (ChunkHash, Bytes)>>>,
+    /// The sparse dirty file and its chunk metadata. The lock is the
+    /// only dirty-tier lock. A claimed chunk stays readable from this
+    /// file until the manifest is rebased and cleanup punches its hole.
+    dirty_tier: Arc<Mutex<DirtyFileTier>>,
     /// Unix-millis timestamp of the last successful `flush()`
     /// completion. `0` = never flushed since construction (the
     /// sentinel the diagnostic surface renders as "never").
@@ -358,7 +608,7 @@ pub struct ChunkedDiskBackend {
     /// `flush()` after the new manifest is durably published.
     last_flush_unix_ms: Arc<AtomicI64>,
     /// ADR 0016 Phase B: when dirty bytes monotonically cross
-    /// `threshold_bytes` inside the dirty-lock, `ensure_dirty` pokes
+    /// `threshold_bytes` inside the dirty-tier lock, the writer pokes
     /// this Notify. The flush scheduler awaits `notified()` to wake
     /// out of its tick interval and trigger an early flush. Set to
     /// `u64::MAX` to disable threshold-driven wakeups (tests, or
@@ -372,10 +622,10 @@ pub struct ChunkedDiskBackend {
     /// commit (sandbox destroyed).
     migration_fence: std::sync::atomic::AtomicBool,
     /// Issue #199: serialize the ENTIRE flush pipeline
-    /// (`flush_local` drain → `flush_upload` GCS put → manifest
+    /// (`flush_local` claim → `flush_upload` GCS put → manifest
     /// rebuild/publish → `base` rebase) so two flushes can never run
     /// their upload/rebase phases concurrently. Without this only the
-    /// `dirty` drain was serialized, and whichever flush rebased LAST
+    /// dirty-set claim was serialized, and whichever flush rebased LAST
     /// won the published manifest + in-memory `base` regardless of data
     /// recency — an older flush's slow upload could finish after a newer
     /// flush published its chunk, overwriting it with the older hash and
@@ -390,8 +640,8 @@ pub struct ChunkedDiskBackend {
     /// `flush_local` + `flush_upload`.
     ///
     /// Lock order: this is the OUTERMOST flush-path lock. It is acquired
-    /// BEFORE `dirty` (in `flush_local`) and BEFORE `state`/`pending`
-    /// (in `flush_upload`); never the reverse. The per-sandbox
+    /// before `dirty_tier` in `flush_local` and before `state` in
+    /// `flush_upload`. The per-sandbox
     /// `capture_lock` (PooledBackend) sits ABOVE it — captures and
     /// migrations already serialize on that, and the scheduler `flush()`
     /// (which does not take `capture_lock`) serializes against them here.
@@ -670,6 +920,16 @@ impl ChunkMemCache {
     }
 }
 
+fn default_dirty_file_path(cache: &ChunkCache, manifest_ref: ManifestRef) -> PathBuf {
+    let sequence = DIRTY_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    cache.root().join("dirty").join(format!(
+        ".backend-{}-{}-{}-{sequence}.cache",
+        manifest_ref.manifest_id,
+        manifest_ref.version,
+        std::process::id()
+    ))
+}
+
 impl ChunkedDiskBackend {
     /// Build a backend rooted at `manifest_ref`. `cache` should be
     /// the host-agent's shared `ChunkCache` — that way base chunks
@@ -684,8 +944,36 @@ impl ChunkedDiskBackend {
         store: Arc<ChunkStore>,
         threshold_bytes: u64,
     ) -> Result<Self, DiskBackendError> {
+        let dirty_path = default_dirty_file_path(&cache, manifest_ref);
+        Self::from_blob_with_dirty_file(
+            manifest_ref,
+            cache,
+            store,
+            threshold_bytes,
+            dirty_path,
+            DirtyFileOpenMode::Truncate,
+        )
+        .await
+    }
+
+    pub(crate) async fn from_blob_with_dirty_file(
+        manifest_ref: ManifestRef,
+        cache: ChunkCache,
+        store: Arc<ChunkStore>,
+        threshold_bytes: u64,
+        dirty_path: PathBuf,
+        dirty_mode: DirtyFileOpenMode,
+    ) -> Result<Self, DiskBackendError> {
         let manifest = store.get_manifest(manifest_ref).await?;
-        Self::from_manifest(manifest_ref, &manifest, cache, store, threshold_bytes)
+        Self::from_manifest_with_dirty_file(
+            manifest_ref,
+            &manifest,
+            cache,
+            store,
+            threshold_bytes,
+            dirty_path,
+            dirty_mode,
+        )
     }
 
     /// ADR 0045 C1: construct from manifest CONTENT the caller already
@@ -699,9 +987,31 @@ impl ChunkedDiskBackend {
         store: Arc<ChunkStore>,
         threshold_bytes: u64,
     ) -> Result<Self, DiskBackendError> {
+        let dirty_path = default_dirty_file_path(&cache, manifest_ref);
+        Self::from_manifest_with_dirty_file(
+            manifest_ref,
+            manifest,
+            cache,
+            store,
+            threshold_bytes,
+            dirty_path,
+            DirtyFileOpenMode::Truncate,
+        )
+    }
+
+    pub(crate) fn from_manifest_with_dirty_file(
+        manifest_ref: ManifestRef,
+        manifest: &engram_chunk_store::Manifest,
+        cache: ChunkCache,
+        store: Arc<ChunkStore>,
+        threshold_bytes: u64,
+        dirty_path: PathBuf,
+        dirty_mode: DirtyFileOpenMode,
+    ) -> Result<Self, DiskBackendError> {
         let base = PositionalDiskManifest::from_manifest(manifest)?;
         let chunk_size = base.chunk_size;
         let total_bytes = base.total_bytes;
+        let dirty_tier = DirtyFileTier::open(dirty_path, total_bytes, chunk_size, dirty_mode)?;
         Ok(Self {
             state: Arc::new(Mutex::new(BackendState {
                 manifest_ref,
@@ -715,8 +1025,7 @@ impl ChunkedDiskBackend {
             mem_cache: Arc::new(std::sync::Mutex::new(ChunkMemCache::new(
                 DISK_CHUNK_MEM_BUDGET_BYTES,
             ))),
-            dirty: Arc::new(Mutex::new(HashMap::new())),
-            pending_uploads: Arc::new(Mutex::new(HashMap::new())),
+            dirty_tier: Arc::new(Mutex::new(dirty_tier)),
             last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
             threshold_notify: Arc::new(Notify::new()),
             migration_fence: std::sync::atomic::AtomicBool::new(false),
@@ -739,35 +1048,51 @@ impl ChunkedDiskBackend {
         store: Arc<ChunkStore>,
         threshold_bytes: u64,
     ) -> Result<Self, DiskBackendError> {
-        let base = PositionalDiskManifest::from_manifest(manifest)?;
-        let chunk_size = base.chunk_size;
-        let total_bytes = base.total_bytes;
-        Ok(Self {
-            state: Arc::new(Mutex::new(BackendState {
-                manifest_ref,
-                fork_identity: None,
-                base,
-            })),
-            chunk_size,
-            total_bytes,
-            cache,
-            store,
-            mem_cache: Arc::new(std::sync::Mutex::new(ChunkMemCache::new(
-                DISK_CHUNK_MEM_BUDGET_BYTES,
-            ))),
-            dirty: Arc::new(Mutex::new(HashMap::new())),
-            pending_uploads: Arc::new(Mutex::new(HashMap::new())),
-            last_flush_unix_ms: Arc::new(AtomicI64::new(0)),
-            threshold_notify: Arc::new(Notify::new()),
-            migration_fence: std::sync::atomic::AtomicBool::new(false),
-            flush_pipeline: Arc::new(tokio::sync::Mutex::new(())),
-            post_copy: Arc::new(std::sync::Mutex::new(None)),
-            threshold_bytes,
-            in_flight: Arc::new(InFlightTracker::new()),
-            operation_scope: crate::trace_scope::OperationScope::default(),
-            entropy: Arc::new(engram_core::traits::OsEntropy),
-            scheduler_seam: std::sync::Mutex::new(None),
-        })
+        Self::from_manifest(manifest_ref, manifest, cache, store, threshold_bytes)
+    }
+
+    /// Move a newly-created temporary file to its stable sandbox path.
+    /// The open descriptor stays valid across the rename.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn relocate_dirty_file(&self, target: &Path) -> Result<(), DiskBackendError> {
+        let mut tier = self.dirty_tier.lock().await;
+        if tier.path == target {
+            tier.remove_on_drop = false;
+            return Ok(());
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|source| dirty_file_error("create parent", target, source))?;
+        }
+        if target
+            .try_exists()
+            .map_err(|source| dirty_file_error("check destination", target, source))?
+        {
+            return Err(dirty_file_error(
+                "rename",
+                target,
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "sandbox dirty file already exists",
+                ),
+            ));
+        }
+        std::fs::rename(&tier.path, target)
+            .map_err(|source| dirty_file_error("rename", target, source))?;
+        tier.path = target.to_path_buf();
+        tier.remove_on_drop = false;
+        Ok(())
+    }
+
+    /// Keep an explicitly named stable file when the backend drops.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn retain_dirty_file(&self) {
+        self.dirty_tier.lock().await.remove_on_drop = false;
+    }
+
+    fn chunk_len(&self, chunk_idx: usize) -> u64 {
+        let start = chunk_idx as u64 * self.chunk_size;
+        self.chunk_size.min(self.total_bytes.saturating_sub(start))
     }
 
     /// ADR 0018 commit 12m: hand out a clone of the in-flight tracker
@@ -795,8 +1120,7 @@ impl ChunkedDiskBackend {
     /// `Notify` so the flush scheduler can park on `.notified()` and
     /// wake when dirty bytes cross the threshold mid-write. One
     /// permit max — multiple concurrent crossings collapse to one
-    /// flush, which is correct: a single flush drains the full
-    /// dirty buffer regardless of how many writers piled in.
+    /// flush, which is correct: one flush claims the full dirty set.
     pub fn threshold_notify(&self) -> Arc<Notify> {
         self.threshold_notify.clone()
     }
@@ -831,51 +1155,24 @@ impl ChunkedDiskBackend {
         self.state.lock().await.manifest_ref
     }
 
-    /// Number of dirty chunks currently buffered in RAM. ADR 0016
-    /// COW diagnostic — read by `PooledBackend::cow_state` for the
-    /// per-session/per-host endpoint. Locks `dirty` briefly; cheap
-    /// since the map is small (<< 1024 entries in realistic
-    /// workloads per the module docstring's analysis).
+    /// Number of chunks waiting for the next flush claim.
     pub async fn dirty_chunks_count(&self) -> usize {
-        self.dirty.lock().await.len()
+        self.dirty_tier.lock().await.dirty.len()
     }
 
-    /// Total bytes resident in the dirty buffer. Sum of the
-    /// per-chunk vec lengths under the same lock as
-    /// [`Self::dirty_chunks_count`]. Used by the COW diagnostic AND
-    /// (Phase B) the flush-scheduler threshold check.
+    /// Whole-chunk bytes waiting for the next flush claim.
     pub async fn dirty_bytes(&self) -> u64 {
-        self.dirty
-            .lock()
-            .await
-            .values()
-            .map(|v| v.len() as u64)
-            .sum()
+        let tier = self.dirty_tier.lock().await;
+        tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum()
     }
 
-    /// Total un-uploaded bytes across BOTH local tiers (dirty +
-    /// pending). The SIGTERM overrun straggler log uses this rather
-    /// than [`Self::dirty_bytes`]: an aborted final flush leaves its
-    /// drained chunks in `pending_uploads`, which are exactly as
-    /// un-uploaded as dirty ones. A chunk present in both tiers (a
-    /// guest re-write after a drain) is counted twice — acceptable for
-    /// a visibility log's upper bound, not for accounting.
+    /// Whole-chunk bytes that are dirty or owned by an active claim.
     pub async fn unflushed_bytes(&self) -> u64 {
-        let dirty: u64 = self
-            .dirty
-            .lock()
-            .await
-            .values()
-            .map(|v| v.len() as u64)
-            .sum();
-        let pending: u64 = self
-            .pending_uploads
-            .lock()
-            .await
-            .values()
-            .map(|(_hash, bytes)| bytes.len() as u64)
-            .sum();
-        dirty + pending
+        let tier = self.dirty_tier.lock().await;
+        tier.allocated_chunks()
+            .iter()
+            .map(|idx| self.chunk_len(*idx))
+            .sum()
     }
 
     /// Unix-millis timestamp of the most recent successful `flush()`
@@ -888,7 +1185,7 @@ impl ChunkedDiskBackend {
     }
 
     /// Read `length` bytes from `offset`. Fans out across chunk
-    /// boundaries; each chunk read serves from the dirty buffer
+    /// boundaries; each chunk read serves from the dirty file
     /// if present, otherwise fetches via the L1 cache.
     pub async fn read(&self, offset: u64, length: u64) -> Result<Bytes, DiskBackendError> {
         if offset.saturating_add(length) > self.total_bytes {
@@ -953,18 +1250,9 @@ impl ChunkedDiskBackend {
 
     /// Write `data` at `offset`. Idempotent on the same byte range
     /// — last writer wins. Materialises the affected chunks into
-    /// the dirty buffer on first touch (copy from base, then patch).
-    ///
-    /// ADR 0018 commit 12m: insert + patch happen under a single
-    /// dirty-lock acquisition. The pre-commit-12m shape used three
-    /// acquisitions (ensure_dirty's two + a re-acquire to patch),
-    /// which let `flush()` interleave between the last insert and
-    /// the patch — `dirty.get_mut(...).expect(...)` could panic AND
-    /// the patched bytes could land in the dirty map after flush's
-    /// drain, missing the published manifest. The cross-host evac
-    /// canary md5 mismatch surfaced this. The fetch of base bytes
-    /// (the slow part) still happens outside any lock; only the
-    /// insert-if-missing + patch are inside the critical section.
+    /// the dirty file on first touch (copy from base, then patch).
+    /// File writes and generation changes share one tier critical
+    /// section, so a flush claim cannot split a guest write.
     pub async fn write(&self, offset: u64, data: &[u8]) -> Result<(), DiskBackendError> {
         let length = data.len() as u64;
         if offset.saturating_add(length) > self.total_bytes {
@@ -994,16 +1282,17 @@ impl ChunkedDiskBackend {
             cursor += take_u64;
             src_off += take;
         }
+        let tier = self.dirty_tier.lock().await;
+        if tier.fsync_on_write {
+            tier.file
+                .sync_data()
+                .map_err(|source| dirty_file_error("sync write", &tier.path, source))?;
+        }
         Ok(())
     }
 
-    /// Patch one chunk's dirty buffer in a single critical section.
-    /// If the chunk isn't in the dirty map yet, fetch its base bytes
-    /// OUTSIDE the lock (slow, network), then take the dirty lock
-    /// ONCE and either (a) insert the prefetched base and patch in
-    /// place, or (b) patch the existing entry that a racing writer
-    /// installed while we were fetching. Either way the patch lands
-    /// atomically w.r.t. `flush()`'s drain.
+    /// Patch one chunk in the dirty file. A first write materializes
+    /// the full visible chunk before it applies the guest bytes.
     async fn write_chunk(
         &self,
         chunk_idx: usize,
@@ -1019,116 +1308,82 @@ impl ChunkedDiskBackend {
         if let Some(ov) = self.postcopy_overlay() {
             self.postcopy_materialize(&ov, chunk_idx).await?;
         }
-        // Cheap pre-check: if the chunk is already in dirty, skip
-        // the base fetch entirely. Holding the dirty lock briefly
-        // here is fine — a HashMap::contains_key is constant-time.
-        //
-        // Issue #204 lock order: like `read_chunk`, this path takes `dirty`
-        // and `pending` SEQUENTIALLY (each scoped guard released before the
-        // next is acquired) — never nested. `flush_local` nests
-        // pending⟶dirty; a `dirty`-then-`pending` nest here would invert it
-        // and could deadlock, so keep these acquisitions disjoint.
-        let already_present = self.dirty.lock().await.contains_key(&chunk_idx);
-        let prefetched_base: Option<Vec<u8>> = if already_present {
-            None
-        } else {
-            // The RMW base MUST honor the same tier order as
-            // `read_chunk`: pending BEFORE base. A flush drains
-            // dirty→pending and only rebases `base` after the upload
-            // lands (multi-second in prod), so a write arriving in
-            // that window would otherwise rebuild the chunk from the
-            // PRE-FLUSH base and silently drop everything the drain
-            // just captured — the teleport-canary "zeros where the
-            // session's data should be" corruption, reproduced by
-            // the two-host NBD e2e (an 8 MiB write crossing the
-            // flush threshold mid-stream loses its first wave).
-            let pending_bytes = self
-                .pending_uploads
-                .lock()
-                .await
-                .get(&chunk_idx)
-                .map(|(_hash, bytes)| bytes.to_vec());
-            if let Some(b) = pending_bytes {
-                Some(b)
-            } else {
-                // Fetch base bytes OUTSIDE the dirty lock. Another writer
-                // may insert the same chunk while we're awaiting the
-                // chunk-store fetch; we handle that under the lock below
-                // (the racing-writer branch).
-                let hash = self
-                    .state
-                    .lock()
-                    .await
-                    .base
-                    .chunks
-                    .get(chunk_idx)
-                    .copied()
-                    .flatten();
-                let base_bytes = match hash {
-                    Some(hash) => self.cache.get(hash, || self.store.get_chunk(hash)).await?,
-                    None => Bytes::from(vec![0u8; chunk_len]),
-                };
-                Some(base_bytes.to_vec())
-            }
-        };
-
-        // Single critical section: ensure entry exists, patch in
-        // place. `flush()` either runs entirely before this lock
-        // acquisition (drains an old dirty map, ticks the manifest,
-        // we then dirty a fresh chunk against the new base) OR runs
-        // entirely after (our patch lands in the dirty map before
-        // the drain, gets included in the published manifest).
-        // There's no in-between state where flush sees half a write.
-        let crossed = {
-            let mut dirty = self.dirty.lock().await;
-            let before: u64 = dirty.values().map(|v| v.len() as u64).sum();
-            let inserted_len = match dirty.entry(chunk_idx) {
-                std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    slot.get_mut()[intra..intra + payload.len()].copy_from_slice(payload);
-                    0u64
+        loop {
+            let observed_generation = {
+                let mut tier = self.dirty_tier.lock().await;
+                if tier.contains(chunk_idx) {
+                    let before: u64 = tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum();
+                    write_all_at(
+                        &tier.file,
+                        payload,
+                        chunk_idx as u64 * self.chunk_size + intra as u64,
+                    )
+                    .map_err(|source| dirty_file_error("write guest bytes", &tier.path, source))?;
+                    tier.bump_generation(chunk_idx)?;
+                    tier.dirty.insert(chunk_idx);
+                    let after: u64 = tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum();
+                    drop(tier);
+                    if before < self.threshold_bytes && after >= self.threshold_bytes {
+                        self.threshold_notify.notify_one();
+                    }
+                    return Ok(());
                 }
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    let mut buf = match prefetched_base {
-                        Some(b) => b,
-                        // Unreachable in practice: `already_present` was
-                        // false, so we definitely fetched a base above.
-                        // Bail out cleanly rather than panic if the
-                        // assumption ever changes.
-                        None => {
-                            return Err(DiskBackendError::InvariantViolation(
-                                "write_chunk: vacant entry with no prefetched base".into(),
-                            ))
-                        }
-                    };
-                    buf[intra..intra + payload.len()].copy_from_slice(payload);
-                    let len = buf.len() as u64;
-                    slot.insert(buf);
-                    len
-                }
+                tier.generations.get(&chunk_idx).copied().unwrap_or(0)
             };
-            let after = before + inserted_len;
-            before < self.threshold_bytes && after >= self.threshold_bytes
-        };
-        if crossed {
-            self.threshold_notify.notify_one();
+
+            // Fetch without the tier lock. The persistent generation lets
+            // us detect a write and flush that completed during this fetch.
+            let base = self.read_chunk(chunk_idx, chunk_len as u64).await?;
+            let mut tier = self.dirty_tier.lock().await;
+            if tier.contains(chunk_idx) {
+                let before: u64 = tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum();
+                write_all_at(
+                    &tier.file,
+                    payload,
+                    chunk_idx as u64 * self.chunk_size + intra as u64,
+                )
+                .map_err(|source| dirty_file_error("write guest bytes", &tier.path, source))?;
+                tier.bump_generation(chunk_idx)?;
+                tier.dirty.insert(chunk_idx);
+                let after: u64 = tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum();
+                drop(tier);
+                if before < self.threshold_bytes && after >= self.threshold_bytes {
+                    self.threshold_notify.notify_one();
+                }
+                return Ok(());
+            }
+            if tier.generations.get(&chunk_idx).copied().unwrap_or(0) != observed_generation {
+                drop(tier);
+                continue;
+            }
+            let before: u64 = tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum();
+            tier.write_chunk(chunk_idx, &base, self.chunk_size)
+                .map_err(|source| dirty_file_error("materialize chunk", &tier.path, source))?;
+            write_all_at(
+                &tier.file,
+                payload,
+                chunk_idx as u64 * self.chunk_size + intra as u64,
+            )
+            .map_err(|source| dirty_file_error("write guest bytes", &tier.path, source))?;
+            tier.bump_generation(chunk_idx)?;
+            tier.dirty.insert(chunk_idx);
+            let after: u64 = tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum();
+            drop(tier);
+            if before < self.threshold_bytes && after >= self.threshold_bytes {
+                self.threshold_notify.notify_one();
+            }
+            return Ok(());
         }
-        Ok(())
     }
 
     /// Shutdown-spool export (2026-07-16 session-85e0298a RCA): a
-    /// coherent snapshot of every un-uploaded chunk — the dirty tier
-    /// plus the drained-but-not-uploaded `pending_uploads` tier — and
+    /// coherent snapshot of every un-uploaded chunk — dirty or claimed — and
     /// the manifest ref they diverge from. Intended to run AFTER the
     /// serve loop is dead (SIGTERM abandon), when the tiers are frozen.
     ///
-    /// Copy order is the correctness argument against a concurrently
-    /// completing flush: dirty first, then pending (dirty wins a
-    /// same-index collision — it is strictly newer), then the manifest
-    /// ref LAST. A chunk that a racing flush moved out of both tiers
-    /// before we copied them was uploaded AND rebased, so the ref read
-    /// afterwards already covers it — nothing is ever missed, at worst
-    /// a chunk is exported redundantly (adoption re-uploads idempotent
-    /// content-addressed bytes).
+    /// The tier snapshot comes before the manifest ref. A chunk cleaned
+    /// before the snapshot is already in the base. A chunk cleaned after
+    /// the snapshot is exported redundantly, which is safe.
     ///
     /// The copy order buys SELF-consistency only, not consistency with
     /// the coordinator: a racing flush that rebases + publishes AFTER
@@ -1141,16 +1396,30 @@ impl ChunkedDiskBackend {
     /// `flush_nbd_data_planes_for_shutdown`); the copy order stays as
     /// defense-in-depth.
     pub async fn export_unflushed(&self) -> (ManifestRef, Vec<(usize, Vec<u8>)>) {
-        let mut chunks: HashMap<usize, Vec<u8>> = self.dirty.lock().await.clone();
+        let mut out = Vec::new();
         {
-            let pending = self.pending_uploads.lock().await;
-            for (idx, (_hash, bytes)) in pending.iter() {
-                chunks.entry(*idx).or_insert_with(|| bytes.to_vec());
+            let tier = self.dirty_tier.lock().await;
+            let mut indices: Vec<usize> = tier.allocated_chunks().into_iter().collect();
+            indices.sort_unstable();
+            for chunk_idx in indices {
+                match tier.read_chunk(
+                    chunk_idx,
+                    self.chunk_len(chunk_idx) as usize,
+                    self.chunk_size,
+                ) {
+                    Ok(bytes) => out.push((chunk_idx, bytes.to_vec())),
+                    Err(error) => {
+                        tracing::error!(
+                            path = %tier.path.display(),
+                            chunk = chunk_idx,
+                            %error,
+                            "shutdown export could not read a dirty-file chunk; the file stays in place for successor recovery",
+                        );
+                    }
+                }
             }
         }
         let manifest_ref = self.state.lock().await.manifest_ref;
-        let mut out: Vec<(usize, Vec<u8>)> = chunks.into_iter().collect();
-        out.sort_by_key(|(idx, _)| *idx);
         (manifest_ref, out)
     }
 
@@ -1183,10 +1452,15 @@ impl ChunkedDiskBackend {
         }
         let mut adopted = 0u64;
         {
-            let mut dirty = self.dirty.lock().await;
-            for (idx, data) in chunks {
+            let mut tier = self.dirty_tier.lock().await;
+            for (idx, data) in &chunks {
                 adopted += data.len() as u64;
-                dirty.insert(idx, data);
+                tier.write_chunk(*idx, data, self.chunk_size)
+                    .map_err(|source| dirty_file_error("adopt chunk", &tier.path, source))?;
+            }
+            for (idx, _) in chunks {
+                tier.bump_generation(idx)?;
+                tier.dirty.insert(idx);
             }
         }
         if adopted > 0 {
@@ -1199,7 +1473,7 @@ impl ChunkedDiskBackend {
     /// version. The new `ManifestRef` is the durability gate the
     /// snapshot path attaches to `SnapshotRecord.disk_manifest`.
     ///
-    /// After flush, the dirty buffer is cleared and reads of those
+    /// After flush, unchanged claims are punched from the file and reads
     /// regions go through the new manifest entries via the chunk
     /// cache like any other base chunk. The post-flush state is
     /// indistinguishable from "fresh session against the new
@@ -1260,76 +1534,65 @@ impl ChunkedDiskBackend {
     }
 
     /// ADR 0038 B3 — phase 1 (runs under the FC pause on the snapshot
-    /// path): drain the dirty buffer, hash each chunk locally, stash the
-    /// bytes in `pending_uploads`. NO network, NO `base` rebase — those
-    /// happen in `flush_upload` after the guest resumes, moving the
-    /// multi-second GCS upload off the frozen-guest path. The drain
-    /// still captures disk-at-the-pause-instant (ADR 0018 §12m).
+    /// path): capture and claim the current dirty set. Upload and base
+    /// rebase remain post-resume.
     pub async fn flush_local(&self) -> Result<PendingDiskFlush, DiskBackendError> {
-        // Issue #199: take the flush-pipeline guard BEFORE the `dirty`
-        // lock (lock order: flush_pipeline ⟶ dirty ⟶ state/pending) and
-        // hand it off inside the returned `PendingDiskFlush`, so the
+        // Issue #199: take the flush-pipeline guard before the dirty-tier
+        // lock and hand it off inside the returned `PendingDiskFlush`, so the
         // drain and the `flush_upload` that publishes its chunks are one
         // serialized critical section. Without this, a slow upload from
         // an EARLIER drain could publish/rebase after a LATER drain
         // already did, overwriting the newer chunk with the older hash.
         let flush_guard = self.flush_pipeline.clone().lock_owned().await;
-        // Issue #204: the dirty→pending handoff must be ATOMIC w.r.t.
-        // readers/writers. Acquire the `pending` lock BEFORE draining
-        // `dirty`, and hold BOTH across the drain+insert move, so a drained
-        // chunk is never absent from both tiers for any instant. The old
-        // code drained + dropped the dirty lock, then took `pending`
-        // separately — between those two acquisitions a chunk lived in NO
-        // tier: a concurrent `read_chunk` fell through to the stale `base`
-        // (transient stale read), and a concurrent `write_chunk` RMW'd from
-        // the stale base and re-inserted into `dirty`, permanently shadowing
-        // the just-drained bytes (silent lost write on the next publish).
-        //
-        // Lock order on the flush path: flush_pipeline ⟶ pending ⟶ dirty.
-        // This is safe against `read_chunk`/`write_chunk`, which take
-        // `dirty` and `pending` only SEQUENTIALLY (each released before the
-        // other is acquired) — they never NEST the two in any order — so
-        // there is no opposite-order nested acquisition to deadlock against.
-        let mut pending = self.pending_uploads.lock().await;
-        let mut dirty_guard = self.dirty.lock().await;
-        if dirty_guard.is_empty() {
+        let mut tier = self.dirty_tier.lock().await;
+        if tier.dirty.is_empty() {
             // Nothing to publish ⟹ nothing to serialize; release the
             // pipeline guard immediately (don't carry it through an
             // empty no-op flush_upload, which would needlessly block a
             // concurrent flush).
-            drop(dirty_guard);
-            drop(pending);
+            drop(tier);
             drop(flush_guard);
             return Ok(PendingDiskFlush {
                 new_chunks: Vec::new(),
+                claims: Vec::new(),
                 flush_guard: None,
             });
         }
-        let mut new_chunks: Vec<(usize, ChunkHash, Bytes)> = Vec::with_capacity(dirty_guard.len());
-        for (chunk_idx, bytes) in dirty_guard.drain() {
-            let bytes = Bytes::from(bytes);
-            // Local hash — identical to what `put_chunk` computes, so the
-            // manifest `flush_upload` builds is consistent with the
-            // bytes it uploads.
+        let mut indices: Vec<usize> = tier.dirty.iter().copied().collect();
+        indices.sort_unstable();
+        let mut claims = Vec::with_capacity(indices.len());
+        let mut new_chunks = Vec::with_capacity(indices.len());
+        for &chunk_idx in &indices {
+            let generation = tier.generations.get(&chunk_idx).copied().ok_or_else(|| {
+                DiskBackendError::InvariantViolation(format!(
+                    "dirty chunk {chunk_idx} has no generation"
+                ))
+            })?;
+            let bytes = tier
+                .read_chunk(
+                    chunk_idx,
+                    self.chunk_len(chunk_idx) as usize,
+                    self.chunk_size,
+                )
+                .map_err(|source| dirty_file_error("read dirty chunk", &tier.path, source))?;
             let hash = ChunkHash::of(&bytes);
-            // Mirror into the pending tier for read-survival during the
-            // flush window. `flush_upload` uploads from `new_chunks`'s own
-            // bytes (carried below), NOT from this shared map — so a
-            // concurrent flush clearing `pending[idx]` can't make us skip
-            // a put. Because we still hold the `dirty` lock here, the chunk
-            // is in `dirty` (until `drain` consumes it) and lands in
-            // `pending` under the same critical section — never in neither.
-            pending.insert(chunk_idx, (hash, bytes.clone()));
             new_chunks.push((chunk_idx, hash, bytes));
+            claims.push(DirtyChunkClaim {
+                chunk_idx,
+                generation,
+            });
         }
-        // Issue #204 seam point: fire while BOTH locks are still held,
-        // i.e. at the exact instant the pre-fix code left a chunk tier-less.
+        for claim in &claims {
+            tier.dirty.remove(&claim.chunk_idx);
+            tier.claimed.insert(claim.chunk_idx, claim.generation);
+        }
+        // The seam fires while the tier lock still protects the claim.
         self.fire_flush_seam(FlushSeamPoint::DirtyPendingHandoff)
             .await;
-        drop(dirty_guard);
-        drop(pending);
+        drop(tier);
         Ok(PendingDiskFlush {
             new_chunks,
+            claims,
             flush_guard: Some(flush_guard),
         })
     }
@@ -1369,16 +1632,14 @@ impl ChunkedDiskBackend {
     }
 
     /// ADR 0038 B3 — phase 2 (runs post-resume on the snapshot path):
-    /// upload the stashed chunks to GCS, then rebuild + publish the
-    /// manifest and rebase `base`. Keeping the rebase *after* the upload
-    /// preserves "a manifest someone restores from ⟹ its chunks are
-    /// durable" — the background scheduler reads `base`, so it never
-    /// references a not-yet-uploaded chunk. Uploaded entries are cleared
-    /// from `pending_uploads` on success (reads fall through to the now-
-    /// rebased `base`). A failed upload leaves them in `pending` — reads
-    /// stay correct; they're reclaimed on `destroy`.
+    /// upload the chunks captured by `flush_local` to GCS, then publish
+    /// the manifest and rebase `base`. Keeping the rebase *after* the
+    /// upload preserves "a manifest someone restores from ⟹ its chunks
+    /// are durable" — the background scheduler reads `base`, so it never
+    /// references a not-yet-uploaded chunk. A failed upload releases the
+    /// claims to the dirty set so the next flush retries them.
     /// ADR 0045 C1: the migration flavor of `flush_upload` — land the
-    /// drained chunks in the host-local NVMe cache ONLY (no GCS PUT on
+    /// claimed chunks in the host-local NVMe cache ONLY (no GCS PUT on
     /// the teleport pause path) and return the post-drain manifest
     /// WITHOUT publishing or rebasing. The manifest's chunks are
     /// reachable through the cache for the destination's pull; the
@@ -1386,8 +1647,7 @@ impl ChunkedDiskBackend {
     /// The source's own `state` is untouched: on commit the VM is
     /// destroyed; on abort call [`Self::requeue_pending`] first.
     ///
-    /// Returns `(manifest, new_hashes)` — `new_hashes` is the
-    /// pending-tier transfer set the destination must pull.
+    /// Returns `(manifest, new_hashes)` for the destination pull.
     pub async fn flush_to_local_cache(
         &self,
         pending: &PendingDiskFlush,
@@ -1443,26 +1703,21 @@ impl ChunkedDiskBackend {
         ))
     }
 
-    /// ADR 0045 C1 abort path: put the drained-but-never-uploaded
-    /// chunks back into `dirty` so the resumed guest's next flush
+    /// ADR 0045 C1 abort path: release the claimed chunks to the dirty
+    /// set so the resumed guest's next flush
     /// retries them (a newer guest write wins — same rule as the
     /// upload-failure re-queue). Idempotent.
     pub async fn requeue_pending(&self, pending: PendingDiskFlush) {
-        let mut dirty = self.dirty.lock().await;
-        for (idx, _hash, bytes) in pending.new_chunks {
-            dirty.entry(idx).or_insert_with(|| bytes.to_vec());
-        }
+        let mut tier = self.dirty_tier.lock().await;
+        tier.release_claims(&pending.claims);
     }
 
     /// ADR 0045 C2 disk post-copy — the SOURCE seal (runs under the
     /// FC pause; the blackout's disk leg). Snapshots every chunk whose
     /// guest-visible content is NOT reproducible from the published
-    /// base manifest: the dirty buffer (drained — zero-copy `Vec`→
-    /// `Bytes` moves; the guest is paused and `wait_idle`'d, and the
-    /// abort path re-queues) plus the pending-uploads tier (refcounted
-    /// `Bytes` clones — left in place; an in-flight pre-pause
-    /// `flush_upload` may still complete and clear them, which is
-    /// benign because the seal owns its own references). NO hashing,
+    /// base manifest: all dirty and claimed file chunks. The guest is
+    /// paused and `wait_idle` has completed. An in-flight upload can
+    /// still clean its claim because the seal owns its own bytes. NO hashing,
     /// NO cache writes, NO manifest mint — this is what deleted the
     /// 1.3 s re-chunk from the blackout.
     ///
@@ -1473,20 +1728,31 @@ impl ChunkedDiskBackend {
     /// chunks via cache/GCS; sealed indices override via the peer.
     /// `guest content == manifest ⊕ seal` at the freeze instant.
     pub async fn seal_for_postcopy(&self) -> (PostCopyDiskSeal, Manifest, ManifestRef) {
-        // Pending first (older tier), then dirty drained on top
-        // (newer wins — same precedence as `read_chunk`).
-        let mut chunks: HashMap<usize, Bytes> = self
-            .pending_uploads
-            .lock()
-            .await
-            .iter()
-            .map(|(idx, (_hash, bytes))| (*idx, bytes.clone()))
-            .collect();
+        let mut chunks = HashMap::new();
         {
-            let mut dirty = self.dirty.lock().await;
-            for (idx, buf) in dirty.drain() {
-                chunks.insert(idx, Bytes::from(buf));
+            let mut tier = self.dirty_tier.lock().await;
+            let mut indices: Vec<usize> = tier.allocated_chunks().into_iter().collect();
+            indices.sort_unstable();
+            for chunk_idx in indices {
+                match tier.read_chunk(
+                    chunk_idx,
+                    self.chunk_len(chunk_idx) as usize,
+                    self.chunk_size,
+                ) {
+                    Ok(bytes) => {
+                        chunks.insert(chunk_idx, bytes);
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            path = %tier.path.display(),
+                            chunk = chunk_idx,
+                            %error,
+                            "post-copy seal could not read a dirty-file chunk",
+                        );
+                    }
+                }
             }
+            tier.dirty.clear();
         }
         let state = self.state.lock().await;
         let chunk_size = self.chunk_size;
@@ -1521,9 +1787,25 @@ impl ChunkedDiskBackend {
     /// upload of identical bytes). Idempotent; `or_insert` so a newer
     /// guest write always wins.
     pub async fn requeue_postcopy_seal(&self, seal: &PostCopyDiskSeal) {
-        let mut dirty = self.dirty.lock().await;
+        let mut tier = self.dirty_tier.lock().await;
         for (idx, bytes) in &seal.chunks {
-            dirty.entry(*idx).or_insert_with(|| bytes.to_vec());
+            if tier.contains(*idx) {
+                continue;
+            }
+            if let Err(error) = tier.write_chunk(*idx, bytes, self.chunk_size) {
+                tracing::error!(
+                    path = %tier.path.display(),
+                    chunk = *idx,
+                    %error,
+                    "post-copy abort could not restore a dirty-file chunk",
+                );
+                continue;
+            }
+            if let Err(error) = tier.bump_generation(*idx) {
+                tracing::error!(chunk = *idx, %error, "post-copy abort generation failed");
+                continue;
+            }
+            tier.dirty.insert(*idx);
         }
     }
 
@@ -1610,16 +1892,22 @@ impl ChunkedDiskBackend {
             }
         };
         let installed = {
-            let mut dirty = self.dirty.lock().await;
-            match dirty.entry(chunk_idx) {
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(bytes.to_vec());
-                    bytes
-                }
-                // A concurrent materialize (drain vs. fault) or a
-                // guest write landed first — theirs is at least as
-                // new; serve it.
-                std::collections::hash_map::Entry::Occupied(e) => Bytes::copy_from_slice(e.get()),
+            let mut tier = self.dirty_tier.lock().await;
+            if tier.contains(chunk_idx) {
+                tier.read_chunk(
+                    chunk_idx,
+                    self.chunk_len(chunk_idx) as usize,
+                    self.chunk_size,
+                )
+                .map_err(|source| dirty_file_error("read post-copy chunk", &tier.path, source))?
+            } else {
+                tier.write_chunk(chunk_idx, &bytes, self.chunk_size)
+                    .map_err(|source| {
+                        dirty_file_error("write post-copy chunk", &tier.path, source)
+                    })?;
+                tier.bump_generation(chunk_idx)?;
+                tier.dirty.insert(chunk_idx);
+                bytes
             }
         };
         // Unseal AFTER the install: once unsealed, readers resolve via
@@ -1696,8 +1984,9 @@ impl ChunkedDiskBackend {
         // below, which also drop it). This is what makes the
         // drain→upload→publish→rebase one atomic critical section.
         let _flush_guard = pending.flush_guard;
+        let claims = pending.claims;
         let new_chunks = pending.new_chunks;
-        if new_chunks.is_empty() {
+        if claims.is_empty() {
             // Incident 2026-07-10 follow-up: an ARMED fork (ADR 0077 —
             // fresh restore off a SHARED base manifest) must still
             // materialize on an empty flush. The eviction capture records
@@ -1754,7 +2043,7 @@ impl ChunkedDiskBackend {
             self.stamp_flush_completion();
             return Ok(out);
         }
-        // Upload the stashed chunks to GCS — OFF the frozen-guest path.
+        // Upload the pause-time file snapshot outside the frozen-guest path.
         // ADR 0039 item #19: the per-chunk put dominates the flush
         // (~16 ms each), so awaiting one at a time made a large dirty
         // set (~1,936 chunks → ~32 s) the slow phase of an eviction.
@@ -1762,21 +2051,13 @@ impl ChunkedDiskBackend {
         // so they're order-independent — fan them out with bounded
         // `buffer_unordered`.
         //
-        // Each task uploads the bytes it carried out of `flush_local`,
-        // NOT a re-read of the shared `pending_uploads` map. The earlier
-        // shared-map lookup silently skipped (`Ok(())`) any chunk a
-        // *concurrent* flush had already cleared from `pending_uploads`,
-        // while the manifest rebuild below still referenced its hash —
-        // publishing a manifest pointing at a chunk nobody uploaded
-        // (prod incident: session 79b689e4, ~half its disk writes
-        // dropped → guest EIO). Uploading from `new_chunks`'s own bytes
-        // makes the put set exactly `new_chunks`, with no skips.
+        // Each task uploads the file bytes captured above. The manifest
+        // uses hashes from that same snapshot.
         //
         // ATOMICITY (durability invariant): `try_collect` aborts on the
-        // FIRST put error and the manifest rebuild runs ONLY after every
+        // first put error and the manifest rebuild runs only after every
         // put succeeds — a published manifest never references a
-        // not-yet-durable chunk. On failure we re-queue the drained bytes
-        // into `dirty` (a newer guest write wins) so the next checkpoint
+        // not-yet-durable chunk. On failure we release the claims so the next checkpoint
         // retries; nothing is lost and the previous snapshot stands. A
         // failed flush is a no-op, never a half-written snapshot.
         {
@@ -1841,17 +2122,8 @@ impl ChunkedDiskBackend {
                 .try_collect::<()>()
                 .await;
             if let Err(e) = upload {
-                // Atomic no-op. Re-queue the drained bytes into `dirty` so
-                // the next flush retries them — but only for an idx the
-                // guest hasn't rewritten since the drain (a newer dirty
-                // write supersedes our now-stale bytes). The bytes also
-                // remain in `pending_uploads`, so reads keep resolving
-                // locally (dirty → pending) rather than the un-rebased
-                // base. The manifest is NOT advanced.
-                let mut dirty = self.dirty.lock().await;
-                for (idx, _hash, bytes) in &new_chunks {
-                    dirty.entry(*idx).or_insert_with(|| bytes.to_vec());
-                }
+                let mut tier = self.dirty_tier.lock().await;
+                tier.release_claims(&claims);
                 tracing::warn!(
                     chunks = new_chunks.len(),
                     error = %e,
@@ -1884,20 +2156,16 @@ impl ChunkedDiskBackend {
         // exists to prevent). Re-check here, under the `state` lock and
         // immediately before the publish, so a fence raised any time
         // during our (multi-second) upload aborts the publish + rebase.
-        // The drained bytes are re-queued into `dirty` (a newer guest
-        // write wins — same rule as the upload-failure re-queue) and
-        // stay in `pending_uploads`, so reads keep resolving locally.
+        // The claims return to the dirty set, so reads stay file-backed.
         if self
             .migration_fence
             .load(std::sync::atomic::Ordering::SeqCst)
         {
             let manifest_ref = state.manifest_ref;
             drop(state);
-            let mut dirty = self.dirty.lock().await;
-            for (idx, _hash, bytes) in &new_chunks {
-                dirty.entry(*idx).or_insert_with(|| bytes.to_vec());
-            }
-            drop(dirty);
+            let mut tier = self.dirty_tier.lock().await;
+            tier.release_claims(&claims);
+            drop(tier);
             tracing::warn!(
                 chunks = new_chunks.len(),
                 "nbd disk flush_upload aborted: migration fence raised mid-upload; \
@@ -2005,12 +2273,15 @@ impl ChunkedDiskBackend {
                         // Sustained race; bail with the latest
                         // conflict surface so the caller sees the
                         // actual store-vs-attempt mismatch.
-                        return Err(engram_chunk_store::ChunkStoreError::VersionConflict {
+                        let error = engram_chunk_store::ChunkStoreError::VersionConflict {
                             latest,
                             attempted,
                             manifest_id,
-                        }
-                        .into());
+                        };
+                        drop(state);
+                        let mut tier = self.dirty_tier.lock().await;
+                        tier.release_claims(&claims);
+                        return Err(error.into());
                     }
                     let next = ManifestRef {
                         manifest_id,
@@ -2027,7 +2298,12 @@ impl ChunkedDiskBackend {
                     attempt_ref = next;
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(error) => {
+                    drop(state);
+                    let mut tier = self.dirty_tier.lock().await;
+                    tier.release_claims(&claims);
+                    return Err(error.into());
+                }
             }
         };
 
@@ -2037,6 +2313,33 @@ impl ChunkedDiskBackend {
         // retry above is the recovery. The `state` lock is deliberately
         // still held (a parked crash drops it with the task).
         self.fire_flush_seam(FlushSeamPoint::PreRebase).await;
+
+        // A publish result is not enough to delete local data. Read the
+        // manifest back and verify every uploaded chunk before cleanup.
+        let published = match self.store.get_manifest(new_ref).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                drop(state);
+                let mut tier = self.dirty_tier.lock().await;
+                tier.release_claims(&claims);
+                return Err(error.into());
+            }
+        };
+        let verified = new_chunks.iter().all(|(idx, hash, _)| {
+            let offset = *idx as u64 * chunk_size;
+            published
+                .chunks
+                .iter()
+                .any(|chunk| chunk.offset == offset && chunk.hash == *hash)
+        });
+        if !verified {
+            drop(state);
+            let mut tier = self.dirty_tier.lock().await;
+            tier.release_claims(&claims);
+            return Err(DiskBackendError::InvariantViolation(format!(
+                "published manifest {new_ref} did not contain every uploaded dirty chunk"
+            )));
+        }
 
         // Rebase: future reads of any chunk_idx we just rewrote
         // resolve to the NEW hash via the cache + store. Without
@@ -2051,18 +2354,30 @@ impl ChunkedDiskBackend {
         state.fork_identity = None;
         drop(state);
 
-        // ADR 0038 B3: chunks are now durable in GCS AND `base` is
-        // rebased to their hashes, so reads resolve through the cache/
-        // store — drop them from the pending tier.
         {
-            let mut pending = self.pending_uploads.lock().await;
-            for (idx, hash, _) in &new_chunks {
-                // Only drop OUR entry — a concurrent flush may have
-                // re-inserted a newer (not-yet-uploaded) write for this
-                // idx; clobbering it would lose read-survival for those
-                // bytes until the next flush.
-                if matches!(pending.get(idx), Some((h, _)) if h == hash) {
-                    pending.remove(idx);
+            let mut tier = self.dirty_tier.lock().await;
+            for claim in &claims {
+                if tier.claimed.get(&claim.chunk_idx) != Some(&claim.generation) {
+                    continue;
+                }
+                tier.claimed.remove(&claim.chunk_idx);
+                let unchanged = tier.generations.get(&claim.chunk_idx) == Some(&claim.generation)
+                    && !tier.dirty.contains(&claim.chunk_idx);
+                if unchanged {
+                    let offset = claim.chunk_idx as u64 * chunk_size;
+                    if let Err(source) =
+                        punch_hole(&tier.file, offset, self.chunk_len(claim.chunk_idx))
+                    {
+                        tier.dirty.insert(claim.chunk_idx);
+                        tracing::warn!(
+                            path = %tier.path.display(),
+                            chunk = claim.chunk_idx,
+                            error = %source,
+                            "could not punch a published dirty chunk; chunk remains dirty",
+                        );
+                    }
+                } else {
+                    tier.dirty.insert(claim.chunk_idx);
                 }
             }
         }
@@ -2097,31 +2412,14 @@ impl ChunkedDiskBackend {
         chunk_idx: usize,
         chunk_len: u64,
     ) -> Result<Bytes, DiskBackendError> {
-        // Dirty buffer wins. Hold the lock only long enough to
-        // clone the bytes; chunk reads are O(N) memcpy.
-        //
-        // Issue #204 lock order: this path consults `dirty` then `pending`
-        // SEQUENTIALLY — the `dirty` lock is released (end of this scope)
-        // BEFORE the `pending` lock is taken below. It must NEVER nest the
-        // two (hold `dirty` across the `pending` acquisition), because
-        // `flush_local` nests pending⟶dirty; a `dirty`-then-`pending` nest
-        // here would invert that order and risk deadlock.
+        // Dirty and claimed chunks stay in the same file. The tier lock
+        // keeps a read atomic with a write or a claim cleanup.
         {
-            let dirty = self.dirty.lock().await;
-            if let Some(buf) = dirty.get(&chunk_idx) {
-                return Ok(Bytes::copy_from_slice(buf));
-            }
-        }
-        // ADR 0038 B3: pending tier — a chunk drained by `flush_local`
-        // (under the FC pause) but not yet uploaded by `flush_upload`
-        // (post-resume). `base` isn't rebased until the upload lands, so
-        // without this a post-drain read would resolve the OLD `base`
-        // hash and serve stale bytes. (A post-resume re-write goes to
-        // `dirty`, checked above, so newest-wins ordering holds.)
-        {
-            let pending = self.pending_uploads.lock().await;
-            if let Some((_hash, bytes)) = pending.get(&chunk_idx) {
-                return Ok(bytes.clone());
+            let tier = self.dirty_tier.lock().await;
+            if tier.contains(chunk_idx) {
+                return tier
+                    .read_chunk(chunk_idx, chunk_len as usize, self.chunk_size)
+                    .map_err(|source| dirty_file_error("read guest chunk", &tier.path, source));
             }
         }
         // ADR 0045 C2 disk post-copy: a sealed chunk's truth lives on

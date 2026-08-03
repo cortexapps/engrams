@@ -58,6 +58,10 @@ fn nbd_state_none() -> NbdStateSlot {}
 /// save and load paths use the same fleet-tuned fan-out.
 const MEMORY_PREFETCH_CONCURRENCY: usize = 32;
 
+#[cfg(target_os = "linux")]
+static PENDING_DIRTY_FILE_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// The cloneable post-phase result future stored per sandbox by
 /// `snapshot_begin` / `migration_finish_restore` and consumed by
 /// `snapshot_wait`.
@@ -513,6 +517,8 @@ pub struct PooledBackend {
     /// When unset, `materialize_chunked_rootfs` goes straight to
     /// the store.
     chunk_cache: Option<ChunkCache>,
+    /// Root for stable `<sandbox_id>.cache` dirty files.
+    dirty_root: Option<PathBuf>,
     /// Single-flight gate: stops two concurrent `create()` calls
     /// from racing on the same manifest_id+version file. Held only
     /// for the materialize critical section, not the whole call.
@@ -1781,12 +1787,24 @@ impl PooledBackend {
             let publisher = self.live_manifest_publisher.clone();
             let flush_config = self.flush_config.clone();
             let abandoning = self.abandoning.clone();
+            let dirty_root = self
+                .resolved_dirty_root()
+                .expect("NBD state requires a dirty root");
             let join = tokio::spawn(async move {
                 let new_id = if fresh {
                     inner.restore_fresh(metadata, selected_mounts).await?
                 } else {
                     inner.restore(metadata).await?
                 };
+                state
+                    .backend
+                    .relocate_dirty_file(&dirty_root.join(format!("{new_id}.cache")))
+                    .await
+                    .map_err(|error| {
+                        SandboxError::Vm(
+                            format!("move restored sandbox dirty file into place: {error}").into(),
+                        )
+                    })?;
                 // ADR 0016 Phase B commit 5: post-restore wiring. The new
                 // sandbox_id is only known here; install it into
                 // `nbd_sandboxes` together with the FlushScheduler so the
@@ -1862,6 +1880,7 @@ impl PooledBackend {
             materialize_dir: None,
             bundle_dir,
             chunk_cache: None,
+            dirty_root: None,
             materialize_lock: Mutex::new(()),
             materialize_scratch: None,
             materialize_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -4548,6 +4567,35 @@ impl PooledBackend {
         self
     }
 
+    /// Set the root for stable per-sandbox dirty files.
+    pub fn with_dirty_root(mut self, root: PathBuf) -> Self {
+        self.dirty_root = Some(root);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resolved_dirty_root(&self) -> Option<PathBuf> {
+        self.dirty_root.clone().or_else(|| {
+            self.chunk_cache
+                .as_ref()
+                .map(|cache| cache.root().join("dirty"))
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dirty_file_path(&self, sandbox_id: SandboxId) -> Option<PathBuf> {
+        self.resolved_dirty_root()
+            .map(|root| root.join(format!("{sandbox_id}.cache")))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pending_dirty_file_path(&self) -> Option<PathBuf> {
+        let sequence =
+            PENDING_DIRTY_FILE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.resolved_dirty_root()
+            .map(|root| root.join(format!(".pending-{}-{sequence}.cache", std::process::id())))
+    }
+
     /// Attach an image cache. Calling this after `new()` lets
     /// `create()` resolve `spec.image_uri` to a cached on-disk path
     /// before forwarding to the inner backend.
@@ -4708,7 +4756,10 @@ impl PooledBackend {
             self.chunk_cache.as_ref(),
         ) {
             let store_arc = Arc::new(store.clone());
-            let state = crate::disk_daemon::attach_manifest(
+            let dirty_path = self
+                .pending_dirty_file_path()
+                .expect("chunk cache provides a default dirty root");
+            let state = crate::disk_daemon::runtime::attach_manifest_with_dirty_file(
                 manifest_ref,
                 cache.clone(),
                 store_arc,
@@ -4718,6 +4769,7 @@ impl PooledBackend {
                 // manifest — already a private id, so tick, don't fork.
                 /*fork_at_attach=*/
                 false,
+                dirty_path,
             )
             .await
             .map_err(|e| SandboxError::Vm(format!("rootfs-manifest NBD attach: {e}").into()))?;
@@ -4839,7 +4891,10 @@ impl PooledBackend {
                 e
             })?;
         let store_arc = Arc::new(effective_store);
-        let state = crate::disk_daemon::attach_manifest(
+        let dirty_path = self
+            .pending_dirty_file_path()
+            .expect("chunk cache provides a default dirty root");
+        let state = crate::disk_daemon::runtime::attach_manifest_with_dirty_file(
             bundle.disk_manifest,
             cache.clone(),
             store_arc,
@@ -4849,6 +4904,7 @@ impl PooledBackend {
             // fork the disk manifest to a private per-session id on first write.
             /*fork_at_attach=*/
             true,
+            dirty_path,
         )
         .await
         .map_err(|e| SandboxError::Vm(format!("nbd attach_manifest: {e}").into()))?;
@@ -6717,8 +6773,21 @@ impl SandboxBackend for PooledBackend {
                 let publisher = self.live_manifest_publisher.clone();
                 let flush_config = self.flush_config.clone();
                 let abandoning = self.abandoning.clone();
+                let dirty_root = self
+                    .resolved_dirty_root()
+                    .expect("NBD state requires a dirty root");
                 let join = tokio::spawn(async move {
                     let sandbox_id = inner.create(spec).await?;
+                    state
+                        .backend
+                        .relocate_dirty_file(&dirty_root.join(format!("{sandbox_id}.cache")))
+                        .await
+                        .map_err(|error| {
+                            SandboxError::Vm(
+                                format!("move created sandbox dirty file into place: {error}")
+                                    .into(),
+                            )
+                        })?;
                     state.install_flush_scheduler(sandbox_id, publisher, flush_config);
                     // ADR 0019: open the cold-boot operation window. The guest's
                     // rootfs/substrate ext4-mount page-ins (served by this NBD
@@ -6907,10 +6976,11 @@ impl SandboxBackend for PooledBackend {
                 let base_manifest = backend.manifest_ref().await;
                 let chunk_size = backend.chunk_size();
                 let total_bytes = backend.total_bytes();
-                let chunks = pending.into_chunks();
                 if let Err(e) =
-                    crate::eviction_finalize::persist_disk_pending_chunks(&dest, &chunks).await
+                    crate::eviction_finalize::persist_disk_pending_chunks(&dest, pending.chunks())
+                        .await
                 {
+                    backend.requeue_pending(pending).await;
                     // The guest was already resumed by `capture_phase`
                     // (its `inner.snapshot`/`snapshot_diff` brought it
                     // back) — defusing is correct, not a stuck-paused
@@ -6941,6 +7011,7 @@ impl SandboxBackend for PooledBackend {
                         "persist disk-pending chunks: {e}"
                     )));
                 }
+                let chunks = pending.into_chunks();
                 let record = Some(crate::eviction_finalize::DiskPendingRecord {
                     base_manifest,
                     chunk_size,
@@ -8468,6 +8539,18 @@ impl SandboxBackend for PooledBackend {
         #[cfg(target_os = "linux")]
         {
             let _ = self.nbd_sandboxes.remove(&id);
+            if let Some(path) = self.dirty_file_path(id) {
+                match fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => tracing::warn!(
+                        sandbox_id = %id,
+                        path = %path.display(),
+                        %error,
+                        "destroy could not remove the sandbox dirty file",
+                    ),
+                }
+            }
             // A destroyed sandbox's shutdown spool must not outlive it
             // (the sandbox_id will never rehydrate again; a leftover
             // spool is dead weight on the hostPath volume).
@@ -9536,86 +9619,106 @@ impl PooledBackend {
             },
         };
 
-        // Shutdown-spool peek (2026-07-16 RCA): if the predecessor
-        // generation died with acked-but-un-uploaded chunks, it left
-        // them spooled on the hostPath volume. Adopt them into the
-        // fresh backend (seeded BEFORE the RECONFIGURE releases the
-        // guest's parked I/O) instead of rolling the live guest's disk
-        // back to the last published manifest.
+        let dirty_path = self
+            .dirty_file_path(sandbox_id)
+            .expect("chunk cache provides a default dirty root");
+        let dirty_file_exists = dirty_path.try_exists().map_err(|error| {
+            SandboxError::Vm(
+                format!(
+                    "check survivor dirty file {}: {error}",
+                    dirty_path.display()
+                )
+                .into(),
+            )
+        })?;
+
+        // A dirty file is the primary seed. A pre-upgrade sandbox has no
+        // file, so it keeps the shutdown-spool fallback unchanged. The
+        // spool seed still lands before RECONFIGURE releases guest I/O.
         let spool_root = self.shutdown_spool_root();
         let mut attach_ref = disk_manifest;
         let mut seed_dirty: Option<Vec<(usize, Vec<u8>)>> = None;
-        if let Some(root) = &spool_root {
-            match crate::disk_daemon::spool::read_spool(self.host_fs.as_ref(), root, sandbox_id)
-                .await
-            {
-                Ok(Some((meta, chunks)))
-                    if meta.manifest_id == disk_manifest.manifest_id
-                        && meta.version >= disk_manifest.version =>
+        if !dirty_file_exists {
+            if let Some(root) = &spool_root {
+                match crate::disk_daemon::spool::read_spool(self.host_fs.as_ref(), root, sandbox_id)
+                    .await
                 {
-                    // meta.version can be AHEAD of coord's ref: the
-                    // predecessor uploaded chunks + manifest but died
-                    // before its coord publish landed. The manifest
-                    // object is already durable in the blob store
-                    // (upload precedes publish), so attach from the
-                    // spool's ref — the store-ahead recovery the flush
-                    // path's version-conflict retry also leans on.
-                    attach_ref = meta.manifest_ref();
-                    seed_dirty = Some(chunks);
-                }
-                Ok(Some((meta, _))) => {
-                    // A spool that disagrees with the reference lineage is
-                    // an invariant-class surprise, not routine: the spool
-                    // is written by the predecessor's OWN flush backend at
-                    // shutdown, and sandbox ids never recur — the expected
-                    // divergence is only version-behind (stale coord
-                    // publish), which the adopt arm above already covers.
-                    // The 2026-07-21 61a03b7e incident hit this arm with a
-                    // WRONG-KIND reference (the memory chain head) and
-                    // discarded real acked writes as "foreign". Keep the
-                    // spool ON DISK — it is the only copy of acked guest
-                    // data; a later correctly-referenced attach can still
-                    // adopt it, and an operator can inspect it.
-                    engram_core::soft_invariant!(
-                        "shutdown-spool-lineage-mismatch",
-                        false,
-                        "sandbox {}: shutdown-spool lineage {} disagrees with the \
+                    Ok(Some((meta, chunks)))
+                        if meta.manifest_id == disk_manifest.manifest_id
+                            && meta.version >= disk_manifest.version =>
+                    {
+                        // meta.version can be AHEAD of coord's ref: the
+                        // predecessor uploaded chunks + manifest but died
+                        // before its coord publish landed. The manifest
+                        // object is already durable in the blob store
+                        // (upload precedes publish), so attach from the
+                        // spool's ref — the store-ahead recovery the flush
+                        // path's version-conflict retry also leans on.
+                        attach_ref = meta.manifest_ref();
+                        seed_dirty = Some(chunks);
+                    }
+                    Ok(Some((meta, _))) => {
+                        // A spool that disagrees with the reference lineage is
+                        // an invariant-class surprise, not routine: the spool
+                        // is written by the predecessor's OWN flush backend at
+                        // shutdown, and sandbox ids never recur — the expected
+                        // divergence is only version-behind (stale coord
+                        // publish), which the adopt arm above already covers.
+                        // The 2026-07-21 61a03b7e incident hit this arm with a
+                        // WRONG-KIND reference (the memory chain head) and
+                        // discarded real acked writes as "foreign". Keep the
+                        // spool ON DISK — it is the only copy of acked guest
+                        // data; a later correctly-referenced attach can still
+                        // adopt it, and an operator can inspect it.
+                        engram_core::soft_invariant!(
+                            "shutdown-spool-lineage-mismatch",
+                            false,
+                            "sandbox {}: shutdown-spool lineage {} disagrees with the \
                          reference disk manifest {} — spool PRESERVED on disk, not \
                          adopted (it is the only copy of acked guest writes; a \
                          correctly-referenced attach can still adopt it, an \
                          operator can inspect it)",
-                        sandbox_id,
-                        meta.manifest_ref(),
-                        disk_manifest,
-                    );
-                    ::metrics::counter!(crate::metrics::SPOOL_LINEAGE_MISMATCH_TOTAL).increment(1);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::error!(
-                        %sandbox_id,
-                        error = %e,
-                        "shutdown spool unreadable; discarding — acked writes it \
-                         held are rolled back",
-                    );
-                    let _ = crate::disk_daemon::spool::discard_spool(
-                        self.host_fs.as_ref(),
-                        root,
-                        sandbox_id,
-                    )
-                    .await;
+                            sandbox_id,
+                            meta.manifest_ref(),
+                            disk_manifest,
+                        );
+                        ::metrics::counter!(crate::metrics::SPOOL_LINEAGE_MISMATCH_TOTAL)
+                            .increment(1);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            %sandbox_id,
+                            error = %e,
+                            "shutdown spool unreadable; discarding — acked writes it \
+                             held are rolled back",
+                        );
+                        let _ = crate::disk_daemon::spool::discard_spool(
+                            self.host_fs.as_ref(),
+                            root,
+                            sandbox_id,
+                        )
+                        .await;
+                    }
                 }
             }
         }
         let adopted_spool = seed_dirty.is_some();
 
         let store_arc = Arc::new(chunk_store.clone());
-        let mut state = match crate::disk_daemon::reattach_manifest(
+        let dirty_mode = if dirty_file_exists {
+            crate::disk_daemon::backend::DirtyFileOpenMode::Recover
+        } else {
+            crate::disk_daemon::backend::DirtyFileOpenMode::Truncate
+        };
+        let mut state = match crate::disk_daemon::runtime::reattach_manifest_with_dirty_file(
             attach_ref,
             chunk_cache.clone(),
             store_arc,
             slot,
             self.flush_config.dirty_threshold_bytes,
+            dirty_path,
+            dirty_mode,
             seed_dirty,
         )
         .await
@@ -9816,13 +9919,17 @@ impl PooledBackend {
         // would 404 on the provisional ref.
         let store_arc = Arc::new(chunk_store.clone());
         if let Some(inline) = self.inline_disk_manifests.get(&disk_ref) {
-            let state = crate::disk_daemon::attach_manifest_content(
+            let dirty_path = self
+                .pending_dirty_file_path()
+                .expect("chunk cache provides a default dirty root");
+            let state = crate::disk_daemon::runtime::attach_manifest_content_with_dirty_file(
                 disk_ref,
                 inline.value(),
                 chunk_cache.clone(),
                 store_arc,
                 pool,
                 self.flush_config.dirty_threshold_bytes,
+                dirty_path,
             )
             .await
             .map_err(|e| SandboxError::Snapshot(format!("nbd attach (migration): {e}")))?;
@@ -9853,13 +9960,17 @@ impl PooledBackend {
         // attaches a SHARED manifest and must fork a private lineage.
         // Hardcoding `false` here was the incident-2026-07-10 bug: every
         // base-restored session published onto the shared base chain.
-        let state = crate::disk_daemon::attach_manifest(
+        let dirty_path = self
+            .pending_dirty_file_path()
+            .expect("chunk cache provides a default dirty root");
+        let state = crate::disk_daemon::runtime::attach_manifest_with_dirty_file(
             disk_ref,
             chunk_cache.clone(),
             store_arc,
             pool,
             self.flush_config.dirty_threshold_bytes,
             fork_at_attach,
+            dirty_path,
         )
         .await
         .map_err(|e| SandboxError::Vm(format!("nbd attach_manifest (resume): {e}").into()))?;

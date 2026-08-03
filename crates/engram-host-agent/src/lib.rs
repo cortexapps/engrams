@@ -92,6 +92,8 @@ pub struct HostAgent {
     /// ADR 0007 #3a: NVMe-backed chunk cache. Optional; wired in
     /// production to amortise chunk reads across manifests.
     pub chunk_cache: Option<ChunkCache>,
+    /// Root for per-sandbox sparse dirty files.
+    pub dirty_root: Option<PathBuf>,
     /// ADR 0007 Phase 4: pool of `/dev/nbdN` device paths the
     /// daemon allocates from when serving chunked rootfs disks.
     /// `None` keeps the legacy materialize-to-file path active.
@@ -132,6 +134,7 @@ impl HostAgent {
             chunk_store: None,
             image_cache: None,
             chunk_cache: None,
+            dirty_root: None,
             nbd_pool: None,
             host_id: None,
             fc_for_reattach: None,
@@ -176,6 +179,12 @@ impl HostAgent {
     /// (canonical-base images, forks).
     pub fn with_chunk_cache(mut self, cache: ChunkCache) -> Self {
         self.chunk_cache = Some(cache);
+        self
+    }
+
+    /// Set the root for per-sandbox sparse dirty files.
+    pub fn with_dirty_root(mut self, root: PathBuf) -> Self {
+        self.dirty_root = Some(root);
         self
     }
 
@@ -291,6 +300,9 @@ impl HostAgent {
                 }
                 if let Some(cache) = self.chunk_cache.clone() {
                     p = p.with_chunk_cache(cache);
+                }
+                if let Some(root) = self.dirty_root.clone() {
+                    p = p.with_dirty_root(root);
                 }
                 if let Some(ic) = self.image_cache.clone() {
                     // ADR 0008 Phase 5: also feed the image cache's

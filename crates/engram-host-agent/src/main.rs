@@ -41,6 +41,14 @@ struct Cli {
     )]
     work_dir: PathBuf,
 
+    /// Root for per-sandbox sparse dirty files.
+    #[arg(
+        long,
+        env = "ENGRAM_DIRTY_ROOT",
+        default_value = "/var/lib/engram/dirty"
+    )]
+    dirty_root: PathBuf,
+
     /// Coordinator endpoint to dial via WebSocket.
     #[arg(long, env = "ENGRAM_COORDINATOR_ENDPOINT")]
     coordinator: Option<String>,
@@ -608,6 +616,7 @@ async fn main() -> Result<(), HostAgentError> {
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
         .with_chunk_store(chunk_store, materialize_dir)
         .with_chunk_cache(chunk_cache)
+        .with_dirty_root(cli.dirty_root.clone())
         .with_image_cache(image_cache)
         .with_host_id(host_id)
         .with_base_shm_protected(base_shm_protected);
