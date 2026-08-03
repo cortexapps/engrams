@@ -109,6 +109,7 @@ export type SystemMarker =
       mediaType: string;
       sizeBytes: number;
       caption: string | null;
+      fileName: string | null;
       at: string;
     }
   | { kind: "note"; role: AgentRole; at: string }
@@ -1001,6 +1002,7 @@ export function buildMessages(
           mediaType: ev.media_type,
           sizeBytes: ev.size_bytes,
           caption: ev.caption,
+          fileName: ev.file_name ?? null,
           at: ev.at,
         });
         break;

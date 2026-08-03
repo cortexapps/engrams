@@ -1,6 +1,8 @@
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+import { CodeBlock } from "./CodeBlock";
+
 // Render a completed assistant/system message as Markdown, styled
 // in-system (ADR 0030 §2g). LLMs emit Markdown; every serious AI UI
 // renders it. We map react-markdown's elements onto the notebook
@@ -43,9 +45,38 @@ const COMPONENTS: Components = {
   hr: () => <hr className="md-hr" />,
 };
 
-export function Markdown({ text }: { text: string }) {
+// Opt-in variant: fenced code blocks with a declared language get lazy
+// Shiki highlighting (CodeBlock). Chat transcripts keep the plain
+// COMPONENTS — highlighting every streamed message would cost a bundle
+// chunk + tokenization work the transcript doesn't need; document
+// surfaces (markdown artifacts) opt in.
+const HIGHLIGHT_COMPONENTS: Components = {
+  ...COMPONENTS,
+  code: ({ children, className, ...props }) => {
+    const lang = /language-(\w+)/.exec(className ?? "")?.[1];
+    if (lang && typeof children === "string") {
+      return <CodeBlock code={children.replace(/\n$/, "")} language={lang} />;
+    }
+    return (
+      <code className="md-code" {...props}>
+        {children}
+      </code>
+    );
+  },
+};
+
+export function Markdown({
+  text,
+  highlightCode = false,
+}: {
+  text: string;
+  highlightCode?: boolean;
+}) {
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={COMPONENTS}>
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={highlightCode ? HIGHLIGHT_COMPONENTS : COMPONENTS}
+    >
       {text}
     </ReactMarkdown>
   );
