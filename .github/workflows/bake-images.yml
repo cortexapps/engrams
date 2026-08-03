@@ -699,8 +699,10 @@ jobs:
       - name: Stage harness-claude tree
         run: |
           set -euo pipefail
-          # Keep CLAUDE_VERSION in lockstep with ci.yml's bake-harness-claude-artifact.
-          CLAUDE_VERSION=2.1.185
+          # Keep CLAUDE_VERSION in lockstep with ci.yml's
+          # bake-harness-claude-artifact and the justfile (see the pin
+          # rationale in ci.yml).
+          CLAUDE_VERSION=2.1.212
           # ADR 0080: agentd ships as bundle-agentd off this same musl build
           # (no image bake carries it anymore).
           cargo build --release --target x86_64-unknown-linux-musl \

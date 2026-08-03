@@ -39,9 +39,16 @@ export function registerBuiltinTools(
   registry: ToolRegistry = tools,
   deps?: BuiltinToolDeps,
 ): void {
+  // No claude binding: claude CLI >= 2.1.187 removed the AskUserQuestion
+  // built-in from headless `--print` mode, so claude receives this tool
+  // through the injected MCP path like any custom harness. The description
+  // must carry the affordance the built-in's training used to provide.
   registry.register({
     name: "ask_user_question",
-    description: "Ask the user one or more structured questions.",
+    description:
+      "Ask the user one or more structured questions and wait for their " +
+      "answers. Use this whenever you need a decision, clarification, or " +
+      "preference from the user before you continue.",
     input: QuestionsSchema,
     output: AnswersSchema,
     handling: "session",
@@ -51,14 +58,14 @@ export function registerBuiltinTools(
       web: "UserQuestionCard",
     },
     nativeBindings: {
-      claude: "AskUserQuestion",
       codex: "requestUserInput",
     },
   });
 
-  // ADR 0107. Native-bound to claude ExitPlanMode; deliberately NO codex
-  // binding — codex and custom harnesses receive it as an injected dynamic
-  // tool through the generic deferred path.
+  // ADR 0107. No native bindings: claude CLI >= 2.1.187 removed the
+  // ExitPlanMode built-in from headless `--print` mode (codex never had
+  // one), so every harness receives it as an injected tool through the
+  // generic deferred path.
   registry.register({
     name: "exit_plan_mode",
     description:
@@ -73,9 +80,6 @@ export function registerBuiltinTools(
     presenters: {
       slack: "planEffect",
       web: "PlanCard",
-    },
-    nativeBindings: {
-      claude: "ExitPlanMode",
     },
   });
 

@@ -45,8 +45,9 @@ describe("built-in tools", () => {
     expect(tool).toMatchObject({
       handling: "session",
       execution: "deferred",
+      // No claude binding: the CLI removed the AskUserQuestion built-in from
+      // headless mode, so claude gets this tool through the injected MCP path.
       nativeBindings: {
-        claude: "AskUserQuestion",
         codex: "requestUserInput",
       },
       presenters: {
@@ -54,6 +55,7 @@ describe("built-in tools", () => {
         web: "UserQuestionCard",
       },
     });
+    expect(tool!.nativeBindings?.claude).toBeUndefined();
     expect(tool!.input.parse({
       questions: [{
         question: "Deploy now?",
@@ -74,7 +76,7 @@ describe("built-in tools", () => {
     });
   });
 
-  test("registers exit_plan_mode as a deferred session tool with a claude-only binding", () => {
+  test("registers exit_plan_mode as a deferred session tool with no native bindings", () => {
     const registry = createToolRegistry();
     registerBuiltinTools(registry);
 
@@ -83,17 +85,14 @@ describe("built-in tools", () => {
     expect(tool).toMatchObject({
       handling: "session",
       execution: "deferred",
-      // Deliberately no codex binding (ADR 0107): codex and custom harnesses
-      // receive the tool through the injected dynamic-tool path.
-      nativeBindings: {
-        claude: "ExitPlanMode",
-      },
       presenters: {
         slack: "planEffect",
         web: "PlanCard",
       },
     });
-    expect(tool!.nativeBindings?.codex).toBeUndefined();
+    // No bindings at all (ADR 0107 + the headless built-in removals): every
+    // harness receives the tool through the injected deferred path.
+    expect(tool!.nativeBindings).toBeUndefined();
     expect(tool!.input.parse({ plan: "# Plan\n\n1. Do the thing." })).toEqual({
       plan: "# Plan\n\n1. Do the thing.",
     });
@@ -106,7 +105,7 @@ describe("built-in tools", () => {
     expect(() => tool!.input.parse({})).toThrow();
   });
 
-  test("emits both native bindings and the canonical input schema", () => {
+  test("emits the codex binding and the canonical input schema", () => {
     const registry = createToolRegistry();
     registerBuiltinTools(registry);
 
@@ -118,7 +117,10 @@ describe("built-in tools", () => {
     ]);
     expect(manifest[0]).toEqual({
       name: "ask_user_question",
-      description: "Ask the user one or more structured questions.",
+      description:
+        "Ask the user one or more structured questions and wait for their " +
+        "answers. Use this whenever you need a decision, clarification, or " +
+        "preference from the user before you continue.",
       inputSchema: {
         $schema: "https://json-schema.org/draft/2020-12/schema",
         type: "object",
@@ -154,7 +156,6 @@ describe("built-in tools", () => {
       },
       execution: "deferred",
       nativeBindings: {
-        claude: "AskUserQuestion",
         codex: "requestUserInput",
       },
     });

@@ -1219,12 +1219,16 @@ jobs:
       - name: Download Claude Code CLI (Linux x64)
         id: claude_cli
         run: |
-          # PINNED, not floating `latest`: claude >=2.1.187 removed AskUserQuestion
-          # from headless `--print` mode, which silently breaks ADR 0054 interactive
-          # questions in every baked image (cortexapps/engrams#431). 2.1.185 is the
-          # newest CLI that still offers the tool headlessly; bump deliberately and
-          # re-verify AUQ (the `system/init` tool list) before raising this.
-          CLAUDE_VERSION=2.1.185
+          # PINNED, not floating `latest` (cortexapps/engrams#431): claude
+          # >=2.1.187 removed the AskUserQuestion + ExitPlanMode built-ins from
+          # headless `--print` mode, so questions and plan approval ride the
+          # injected MCP tools (ask_user_question / exit_plan_mode) instead of
+          # native bindings. Bump deliberately and re-verify the deferred-tool
+          # spine against the new CLI: defer parks the turn
+          # (`terminal_reason: tool_deferred`), `--resume` re-fires id-stable,
+          # and the MCP bridge serves the stashed result. Keep in lockstep with
+          # the justfile and bake-images.yml.
+          CLAUDE_VERSION=2.1.212
           curl -fsSL --retry 3 \
             "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
             -o /tmp/claude
