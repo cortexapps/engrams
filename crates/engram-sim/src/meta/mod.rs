@@ -157,7 +157,6 @@ pub struct SessRow {
     pub durable_head: Option<SnapshotId>,
     pub evac_attempts: i32,
     pub evict_attempts: i32,
-    pub last_event_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
 }
 

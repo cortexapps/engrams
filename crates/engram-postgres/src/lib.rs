@@ -2156,7 +2156,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
-                   created_at, last_active_at,
+                   created_at, last_active_at, last_event_at,
                    live_disk_manifest_id, live_disk_manifest_version,
                    park_rung, parked_at, suggested_title
             FROM sessions WHERE id = $1
@@ -2306,7 +2306,7 @@ impl MetadataStore for PostgresStore {
             r#"
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
-                   created_at, last_active_at,
+                   created_at, last_active_at, last_event_at,
                    live_disk_manifest_id, live_disk_manifest_version,
                    park_rung, parked_at,
                    suggested_title
