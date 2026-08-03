@@ -464,24 +464,6 @@ impl Drop for CaptureUnwind {
     }
 }
 
-/// One quarantined survivor's record (2026-08-02 durability-rollback
-/// RCA): everything the rehydrate retry pass needs to re-attempt the
-/// failed re-serve, keyed by sandbox in `quarantined_survivors`. The
-/// retry-only fields are read by the Linux-gated retry pass; macOS
-/// builds see only the heartbeat accessor's `session_id` read.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-#[derive(Clone, Debug)]
-struct QuarantinedSurvivor {
-    session_id: SessionId,
-    /// The disk manifest ref the failed rehydrate attached from — the
-    /// coordinator's effective ref at register time. It cannot advance
-    /// while the disk is unserved (nothing publishes), so the retry
-    /// reuses it verbatim.
-    disk_manifest: engram_core::types::manifest::ManifestRef,
-    /// Retry attempts so far — log pacing only.
-    retry_attempts: u64,
-}
-
 /// Wraps an inner [`SandboxBackend`] (FC or VZ) with host-side
 /// resource resolution: image cache, chunk store, materialize-to-
 /// file, optional NBD daemon, optional egress proxy.
@@ -524,14 +506,6 @@ pub struct PooledBackend {
     /// is no longer an egress-only concern. `Arc` wrapping lets the
     /// publisher drain task and the destroy path share ownership.
     session_bindings: Arc<DashMap<SandboxId, SessionId>>,
-    /// ADR 0090: survivors whose NBD slot this generation quarantined
-    /// (rehydrate `RECONFIGURE` failed). Advertised in every heartbeat
-    /// until the sandbox is destroyed or the rehydrate retry pass
-    /// (2026-08-02 durability-rollback RCA) re-serves the disk; the
-    /// coordinator drives `evict_local → resume` off it. The record
-    /// carries what the retry needs: the manifest ref the failed
-    /// rehydrate used and an attempt counter for log pacing.
-    quarantined_survivors: Arc<DashMap<SandboxId, QuarantinedSurvivor>>,
     /// ADR 0091: guests whose control plane stopped answering (3/3
     /// socket probes refused after a checkpoint failure). Advertised in
     /// every heartbeat until cleared by a successful capture or destroy;
@@ -675,6 +649,13 @@ pub struct PooledBackend {
     /// PooledBackend's lifetime. `None` for the no-op publisher (no
     /// task to abort).
     live_manifest_publisher_handle: Option<crate::disk_daemon::LiveManifestPublisherHandle>,
+    /// The coordinator client and host identity for synchronous live-manifest
+    /// publishes. Reattach recovery must confirm this publish before it
+    /// destroys a survivor.
+    live_manifest_coord_publish: Option<(
+        Arc<dyn engram_host_core::CoordControlPlane>,
+        engram_core::HostId,
+    )>,
     /// ADR 0028 Fix A: root for checkpoint state — `rolling/` (the
     /// per-sandbox rolling memory images, diff-apply targets) and
     /// `records/` (durable per-checkpoint records awaiting coord
@@ -774,33 +755,16 @@ pub struct PooledBackend {
     /// abandon contract exists only where NBD data planes do.
     #[cfg(target_os = "linux")]
     abandoning: Arc<std::sync::atomic::AtomicBool>,
-    /// Issue #225: the coord client + host id used to SYNCHRONOUSLY
-    /// publish a survivor's freshly-flushed `live_disk_manifest`
-    /// during the SIGTERM final-flush pass. The normal flush path
-    /// publishes through the async `live_manifest_publisher`'s
-    /// coalescing drain task — but that task is aborted on process
-    /// exit, so a manifest queued during shutdown would never reach
-    /// coord and the successor would rehydrate from the stale ref.
-    /// The shutdown pass therefore POSTs directly here, before the
-    /// process exits. Set by `with_live_manifest_coord_publisher`
-    /// (the same wiring that builds the async publisher); `None` for
-    /// the no-op / test publishers, in which case the shutdown flush
-    /// still drains chunks to GCS but skips the coord publish.
-    shutdown_manifest_publish: Option<(
-        Arc<dyn engram_host_core::CoordControlPlane>,
-        engram_core::HostId,
-    )>,
     /// ADR 0098 D1: wall clock is an injected world input (record
     /// timestamps, the pause mark, the migration TTL). P8 closed the
     /// flow-extraction arc: every seam reaches its flow through its own
-    /// field (`clock`, `host_fs`, `shutdown_manifest_publish`,
-    /// `DeviceSync`/`NbdKernel` at their entry points) — the loose fields
+    /// field (`clock`, `host_fs`, and `NbdKernel` at its entry points) — the loose fields
     /// ARE the end state; `HostEffects::production` remains the sim's
     /// assembly point, not a prod indirection.
     clock: Arc<dyn engram_core::traits::Clock>,
     /// ADR 0098 P5: the durable-fs seam. Prod is [`TokioFs`]; Flow D's
-    /// durable records + the shutdown spool perform every fs op through
-    /// it (the host-internal simulator's `CrashFs` intercepts at op
+    /// durable records perform every fs operation through it (the
+    /// host-internal simulator's `CrashFs` intercepts at operation
     /// boundaries). Remaining loose-field seams consolidate into the
     /// full `HostEffects` bundle with the last flow-extraction PRs.
     host_fs: Arc<dyn engram_host_core::HostFs>,
@@ -1930,7 +1894,6 @@ impl PooledBackend {
             image_cache: None,
             egress: None,
             session_bindings: Arc::new(DashMap::new()),
-            quarantined_survivors: Arc::new(DashMap::new()),
             unreachable_guests: Arc::new(DashMap::new()),
             dead_probe_inflight: Arc::new(DashMap::new()),
             chunk_store: None,
@@ -1955,6 +1918,7 @@ impl PooledBackend {
             flush_config: crate::disk_daemon::FlushSchedulerConfig::from_env(),
             live_manifest_publisher: Arc::new(crate::disk_daemon::NoOpLiveManifestPublisher),
             live_manifest_publisher_handle: None,
+            live_manifest_coord_publish: None,
             checkpoint_dir: None,
             chain_heads: None,
             checkpoint_chains: Arc::new(DashMap::new()),
@@ -1970,7 +1934,6 @@ impl PooledBackend {
             migration_roles: Arc::new(DashMap::new()),
             #[cfg(target_os = "linux")]
             abandoning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            shutdown_manifest_publish: None,
             clock: Arc::new(engram_core::traits::SystemClock::new()),
             host_fs: Arc::new(engram_host_core::TokioFs),
         }
@@ -2505,27 +2468,10 @@ impl PooledBackend {
                 unwind.disk_backend = Some(backend);
                 unwind.disk_pending = Some(pending);
             } else {
-                // The 2026-07-17 corruption path (session 03e6535e): a
-                // sandbox with an NBD-backed rootfs but NO `nbd_sandboxes`
-                // entry is a post-pod-roll survivor whose in-pod NBD server
-                // died with the old host-agent and was never rehydrated
-                // (the #739 family). Silently skipping the drain here
-                // records a snapshot with `disk_manifest=None` +
-                // `recoverable=true` — dropping EVERY acked disk write of
-                // the session and poisoning its lineage (the next resume
-                // then boots onto a literal /dev/nbdN — see
-                // `prepare_resume_nbd_attach`'s D4 guard). The verdict is
-                // the pure `plan_capture_disk_drain` (ADR 0098 G2 — the
-                // survivor-invisibility family's capture leg, which the
-                // host simulator drives): refuse rather than skip; the
-                // error requeues the eviction op (redrive-safe). The skip
-                // stays correct for a legitimately non-NBD rootfs
-                // (macOS/dev/flat-file), which `rootfs_device` reports as
-                // `None`.
                 let rootfs_dev = self.inner.rootfs_device(id);
                 let rootfs_is_nbd = rootfs_dev
                     .as_ref()
-                    .is_some_and(|d| d.to_string_lossy().starts_with("/dev/nbd"));
+                    .is_some_and(|device| device.to_string_lossy().starts_with("/dev/nbd"));
                 if matches!(
                     engram_host_core::plan_capture_disk_drain(
                         false,
@@ -2534,14 +2480,13 @@ impl PooledBackend {
                     ),
                     engram_host_core::CaptureDrainPlan::RefuseUntracked
                 ) {
-                    let dev = rootfs_dev.expect("RefuseUntracked implies an nbd rootfs device");
+                    let device = rootfs_dev.expect("RefuseUntracked implies an NBD rootfs device");
                     return Err(SandboxError::Snapshot(format!(
                         "sandbox {id} has an NBD-backed rootfs ({}) but no nbd_sandboxes \
-                         entry — a post-roll survivor whose disk server is gone. Refusing to \
-                         snapshot with disk_manifest=None (would drop the session's acked \
-                         disk writes and poison its lineage); the session must be rehydrated \
-                         or evicted-locally first.",
-                        dev.display(),
+                         entry. Its survivor reattach recovery has not completed. Refusing \
+                         to capture with disk_manifest=None because that would omit acked \
+                         disk writes; the eviction operation will requeue.",
+                        device.display(),
                     )));
                 }
             }
@@ -3534,101 +3479,6 @@ impl PooledBackend {
         self.session_bindings.insert(sandbox_id, session_id);
     }
 
-    /// ADR 0090: the survivors whose NBD slots this generation
-    /// quarantined (rehydrate `RECONFIGURE` failed) — re-advertised in
-    /// every heartbeat until the sandbox is destroyed or the rehydrate
-    /// retry pass re-serves the disk, so the coordinator drives the
-    /// `evict_local → resume` remediation.
-    pub fn quarantined_survivors(&self) -> Vec<engram_protocol::heartbeat::QuarantinedSurvivor> {
-        self.quarantined_survivors
-            .iter()
-            .map(|e| engram_protocol::heartbeat::QuarantinedSurvivor {
-                sandbox_id: *e.key(),
-                session_id: e.value().session_id,
-            })
-            .collect()
-    }
-
-    /// 2026-08-02 durability-rollback RCA: one retry pass over the
-    /// quarantined survivors — re-attempt the failed rehydrate for each,
-    /// via [`Self::rehydrate_sandbox`]'s parked-slot reclaim. The
-    /// timer loop in `lib.rs` is a thin wrapper; this is the `run_once`
-    /// step (ADR 0098). Returns how many survivors were recovered.
-    ///
-    /// A recovered survivor leaves `quarantined_survivors` (its
-    /// heartbeat advertise stops) and serves reads/writes again; the
-    /// coordinator's parked quarantine op then captures + relocates it
-    /// cleanly on its next slow-lane attempt, with zero rollback. A
-    /// failed retry re-parks the slot and stays advertised; retries are
-    /// logged quietly after the first (a permanently de-configured
-    /// device — kernel "not configured" — never recovers by
-    /// RECONFIGURE, and the loud signal for that is the coordinator's
-    /// quarantine-stuck alert, not a per-tick WARN here).
-    #[cfg(target_os = "linux")]
-    pub async fn retry_quarantined_rehydrates_once(&self) -> usize {
-        let survivors: Vec<(SandboxId, QuarantinedSurvivor)> = self
-            .quarantined_survivors
-            .iter()
-            .map(|e| (*e.key(), e.value().clone()))
-            .collect();
-        let mut recovered = 0usize;
-        for (sandbox_id, q) in survivors {
-            let attempt = q.retry_attempts.saturating_add(1);
-            match self
-                .rehydrate_sandbox(q.session_id, sandbox_id, q.disk_manifest)
-                .await
-            {
-                Ok(true) => {
-                    // rehydrate_sandbox removed the map entry on success.
-                    recovered += 1;
-                    ::metrics::counter!(crate::metrics::QUARANTINE_REHYDRATE_RECOVERED_TOTAL)
-                        .increment(1);
-                    tracing::info!(
-                        %sandbox_id,
-                        session_id = %q.session_id,
-                        attempt,
-                        "quarantined survivor RECOVERED by the rehydrate retry pass; \
-                         disk re-served, heartbeat advertise stops",
-                    );
-                }
-                Ok(false) => {
-                    // Structural skip (no pool / already served / no
-                    // device) — nothing to retry against; leave the
-                    // entry for the destroy path to clear.
-                    if let Some(mut e) = self.quarantined_survivors.get_mut(&sandbox_id) {
-                        e.retry_attempts = attempt;
-                    }
-                }
-                Err(e) => {
-                    if let Some(mut entry) = self.quarantined_survivors.get_mut(&sandbox_id) {
-                        entry.retry_attempts = attempt;
-                    }
-                    // First failure at WARN; then every 20th (≈10 min at
-                    // the 30s cadence) to keep a dead device from
-                    // flooding the log.
-                    if attempt == 1 || attempt % 20 == 0 {
-                        tracing::warn!(
-                            %sandbox_id,
-                            session_id = %q.session_id,
-                            attempt,
-                            error = %e,
-                            "quarantined-survivor rehydrate retry failed; will keep \
-                             retrying (slot re-parked, survivor still advertised)",
-                        );
-                    } else {
-                        tracing::debug!(
-                            %sandbox_id,
-                            attempt,
-                            error = %e,
-                            "quarantined-survivor rehydrate retry failed",
-                        );
-                    }
-                }
-            }
-        }
-        recovered
-    }
-
     /// ADR 0091: record a control-plane-dead guest (checkpoint driver's
     /// 3/3-probe verdict). Re-advertised every heartbeat until cleared.
     pub fn mark_guest_unreachable(&self, sandbox_id: SandboxId, session_id: SessionId) {
@@ -3688,10 +3538,7 @@ impl PooledBackend {
     /// protocol (see the record's type doc): a record only exists if no
     /// FC snapshot create ran since the chain durably advanced, so
     /// seeding from it is exactly as sound as never having lost the
-    /// DashMap. NBD-quarantined survivors seed too — the disk plane's
-    /// health is orthogonal to the KVM dirty bitmap, and their
-    /// evict_local capture is precisely the one that must not be a
-    /// Full.
+    /// DashMap.
     pub async fn rehydrate_chain_heads(&self) {
         let Some(store) = self.chain_heads.clone() else {
             return;
@@ -3801,50 +3648,17 @@ impl PooledBackend {
         for (session_id, sandbox_id, _chain_head) in
             local_survivor_candidates(records, &live, &served)
         {
-            // The candidate's ChainHeadRecord names the MEMORY chain head
-            // — never attachable as a disk. The only local durable source
-            // of the survivor's chunked-DISK lineage is the predecessor's
-            // shutdown-spool marker (2026-07-21 61a03b7e incident: passing
-            // the chain head here failed the reattach on ManifestKind,
-            // quarantined the device, DISCARDED the spooled acked writes
-            // as "foreign lineage", and the quarantine ladder destroyed
-            // the healthy paused VM — a 93-event rewind). No spool → skip
-            // WITHOUT claiming the slot: the device stays kernel-connected
-            // and reconnectable, and the coordinator's list (or the next
-            // registration) owns the re-serve.
-            let disk_ref = match &self.shutdown_spool_root() {
-                Some(root) => {
-                    match crate::disk_daemon::spool::read_spool_meta(
-                        self.host_fs.as_ref(),
-                        root,
-                        sandbox_id,
-                    )
-                    .await
-                    {
-                        Ok(Some(meta)) => Some(meta.manifest_ref()),
-                        Ok(None) => None,
-                        Err(e) => {
-                            tracing::error!(
-                                %sandbox_id,
-                                %session_id,
-                                error = %e,
-                                "local survivor rehydrate: spool marker unreadable; \
-                                 skipping (device left reconnectable for the \
-                                 coordinator's list)",
-                            );
-                            failed += 1;
-                            continue;
-                        }
-                    }
-                }
-                None => None,
-            };
+            // The ChainHeadRecord names a memory manifest. The dirty-file ref
+            // sidecar is the local durable source for the disk lineage.
+            let disk_ref = self
+                .dirty_file_path(sandbox_id)
+                .and_then(|path| crate::disk_daemon::backend::read_ref_sidecar(&path));
             let Some(disk_ref) = disk_ref else {
                 tracing::warn!(
                     %sandbox_id,
                     %session_id,
-                    "local survivor rehydrate: no local disk lineage (no shutdown \
-                     spool) — skipping; the device stays reconnectable and the \
+                    "local survivor rehydrate: no dirty-file ref sidecar — skipping; \
+                     the device stays reconnectable and the \
                      coordinator's rehydrate list owns the re-serve",
                 );
                 continue;
@@ -3927,21 +3741,6 @@ impl PooledBackend {
                 record_devices.insert(dev);
             }
         }
-        // Devices this process itself PARKED (a failed rehydrate's
-        // `slot.quarantine()`) are tracked records too. The three sources
-        // above all resolve through the live FC entry (`rootfs_device`),
-        // which a concurrent sandbox destroy can vacate between the park and
-        // this barrier — 2026-07-21: a rehydrate-failed survivor whose
-        // session completed two seconds later was reported as an UNKNOWN
-        // device demanding an operator, when this very process had parked it
-        // on purpose moments earlier. The allocator's parked set is
-        // device-keyed, so it survives the FC entry vanishing.
-        if let Some(pool) = self.nbd_pool.as_ref() {
-            for dev in pool.parked_devices() {
-                record_devices.insert(dev);
-            }
-        }
-
         let classification =
             crate::disk_daemon::classify_startup_inventory(kernel, &record_devices);
 
@@ -4104,11 +3903,7 @@ impl PooledBackend {
             crate::disk_daemon::CoordLiveManifestPublisher::spawn(coord.clone(), host_id, resolver);
         self.live_manifest_publisher = publisher;
         self.live_manifest_publisher_handle = Some(handle);
-        // Issue #225: keep a direct handle to coord for the SIGTERM
-        // final-flush pass, which must publish synchronously (the
-        // async publisher's drain task is gone by the time the
-        // process exits).
-        self.shutdown_manifest_publish = Some((coord, host_id));
+        self.live_manifest_coord_publish = Some((coord, host_id));
         self
     }
 
@@ -4155,315 +3950,6 @@ impl PooledBackend {
         self.nbd_sandboxes.contains_key(&id)
     }
 
-    /// Test-only: clone the live `ChunkedDiskBackend` Arc for a
-    /// registered sandbox. Used by the issue-#225 SIGTERM-final-flush
-    /// regression test to drive a dirty write through the same backend
-    /// the shutdown pass flushes and then assert durability.
-    #[cfg(target_os = "linux")]
-    #[doc(hidden)]
-    pub fn __test_nbd_backend(
-        &self,
-        id: SandboxId,
-    ) -> Option<Arc<crate::disk_daemon::ChunkedDiskBackend>> {
-        self.nbd_sandboxes.get(&id).map(|e| e.backend.clone())
-    }
-
-    /// Test-only: bind a sandbox to a session in `session_bindings`,
-    /// the same index `notify_session_policy` / registration populate.
-    /// The issue-#225 test uses it so the shutdown flush can resolve a
-    /// session id for its (mock) coord publish.
-    #[cfg(target_os = "linux")]
-    #[doc(hidden)]
-    pub fn __test_bind_session(&self, sandbox_id: SandboxId, session_id: SessionId) {
-        self.session_bindings.insert(sandbox_id, session_id);
-    }
-
-    /// Issue #225: SIGTERM final-flush pass. NBD WRITEs are acked to
-    /// the guest the instant the bytes land in the backend's in-RAM
-    /// `dirty` tier; durability rides the FlushScheduler's ~30 s /
-    /// 256 MiB cadence. A routine pod roll abandons each data plane
-    /// (`abandon_for_shutdown` → `drop(backend)`) WITHOUT a final
-    /// flush, discarding up to one cadence-window of ACKED writes —
-    /// the VM keeps running (K2 contract) but the successor rehydrates
-    /// from the last *published* manifest, silently rolling the live
-    /// guest's disk back under it. This pass closes that window: per
-    /// surviving sandbox, in parallel and under a hard deadline, it
-    /// quiesces in-flight I/O (`wait_idle`) then runs a full `flush()`
-    /// (drain → GCS upload → manifest rebase) and SYNCHRONOUSLY
-    /// publishes the new `live_disk_manifest` to coord — so the
-    /// successor's existing rehydrate path picks up the current ref.
-    ///
-    /// MUST run BEFORE `abandon_nbd_data_planes_for_shutdown`: this
-    /// only flushes, it does not tear anything down, so the abandon
-    /// sweep still runs afterward to leave the kernel-side devices
-    /// alive for the successor. The whole pass is budgeted against
-    /// `deadline` (derived from the pod's `terminationGracePeriodSeconds`
-    /// minus headroom). Any sandbox not flushed within the budget has its
-    /// flush task ABORTED and reaped before this returns — never left
-    /// running detached, where it would race the abandon sweep's spool
-    /// export and stamp the spool with a stale manifest head (2026-07-21
-    /// session-af28cac4 RCA) — and is logged LOUDLY with its id + dirty
-    /// byte count so the (now bounded) GCS-durability gap is visible; it
-    /// is then abandoned dirty by the following sweep, which spools it.
-    ///
-    /// The synchronous coord publish is deliberate: the normal flush
-    /// path publishes via the async `live_manifest_publisher`, whose
-    /// coalescing drain task is aborted on process exit — a manifest
-    /// queued there during shutdown would never reach coord. When no
-    /// coord publisher is wired (`shutdown_manifest_publish` is `None`:
-    /// no-op / test publishers) the chunks are still durably uploaded
-    /// to GCS; only the coord publish is skipped.
-    #[cfg(target_os = "linux")]
-    pub async fn flush_nbd_data_planes_for_shutdown(&self, deadline: std::time::Duration) {
-        // The `DeviceSync` seam's `sync_device` method (ADR 0098 P4).
-        use engram_host_core::DeviceSync as _;
-        let entries: Vec<(
-            SandboxId,
-            Arc<crate::disk_daemon::ChunkedDiskBackend>,
-            std::path::PathBuf,
-        )> = self
-            .nbd_sandboxes
-            .iter()
-            .map(|e| {
-                (
-                    *e.key(),
-                    e.value().backend.clone(),
-                    e.value().device_path().to_path_buf(),
-                )
-            })
-            .collect();
-        if entries.is_empty() {
-            return;
-        }
-        let total = entries.len();
-        tracing::info!(
-            sandboxes = total,
-            deadline_secs = deadline.as_secs_f64(),
-            "SIGTERM: final disk-flush pass over surviving NBD data planes",
-        );
-
-        // Fan out one flush task per sandbox; each resolves the
-        // session binding + does the synchronous coord publish itself.
-        // Budget the WHOLE fan-out against `deadline` — a single
-        // tokio::time::timeout around the join handles the per-sandbox
-        // parallelism + the global cap in one place. The `JoinSet`
-        // deliberately lives OUTSIDE the timed future: on overrun the
-        // tasks must be ABORTED, not merely no-longer-awaited (see
-        // `join_all_within`'s overrun arm). A `JoinSet`, NOT a
-        // `Vec<JoinHandle>`: `join_next` removes each task as it
-        // completes, so the overrun arm can never re-poll a handle the
-        // timed join already consumed (2026-08-02 RCA, see
-        // `join_all_within`).
-        let publish = self.shutdown_manifest_publish.clone();
-        let session_bindings = self.session_bindings.clone();
-        let mut tasks = tokio::task::JoinSet::new();
-        for (sandbox_id, backend, device) in entries {
-            let publish = publish.clone();
-            let session_id = session_bindings.get(&sandbox_id).map(|e| *e);
-            tasks.spawn(async move {
-                // 2026-07-16 RCA: FC's drive is buffered host I/O with
-                // cache_type=Unsafe, so guest-acked writes can still be
-                // sitting in the HOST page cache for /dev/nbdN — a tier
-                // the dirty-map flush below never sees, and one the
-                // pod-handoff dead-connection window can silently drop
-                // (`lost async page write`). Force it down into the
-                // daemon's dirty tier NOW, while our serve loop is
-                // still alive to ack the writeback (the checkpoint path
-                // does the same). Routed through the DeviceSync seam
-                // (ADR 0098 P4) — a spawn_blocking open+sync_all; a
-                // join/sync failure is warn-and-proceed. O_DIRECT here
-                // is a no-op (see `device_sync`), so the sync path is
-                // unchanged.
-                if let Err(e) = crate::device_sync::HostDeviceSync
-                    .sync_device(&device)
-                    .await
-                {
-                    tracing::warn!(
-                        %sandbox_id,
-                        device = %device.display(),
-                        error = %e,
-                        "SIGTERM final flush: host page-cache sync of the NBD \
-                         device failed; proceeding (pages left behind will ride \
-                         the kernel's dead-conn parking to the successor)",
-                    );
-                }
-                // Quiesce the virtio → kernel-NBD → daemon pipeline so
-                // the flush captures the just-acked disk state, then
-                // drain + upload + rebase. `flush` no-ops (zero chunks)
-                // when the dirty tier is empty — cheap for quiescent
-                // survivors.
-                backend.wait_idle().await;
-                // ADR 0098 P4: the per-survivor disposition is the pure
-                // `classify_survivor` decision; the driver only sequences
-                // the effects off its verdict.
-                let bound_publish = publish.zip(session_id);
-                let outcome = match backend.flush().await {
-                    Ok(o) => o,
-                    Err(e) => {
-                        // FlushProbe::FlushError ⇒ RelyOnSpool: the abandon
-                        // sweep's spool export is the durability backstop.
-                        tracing::warn!(
-                            %sandbox_id,
-                            error = %e,
-                            "SIGTERM final flush failed; survivor's un-uploaded \
-                             writes ride the shutdown spool to the successor",
-                        );
-                        return;
-                    }
-                };
-                let action =
-                    engram_host_core::classify_survivor(engram_host_core::FlushProbe::Flushed {
-                        chunks_flushed: outcome.chunks_flushed,
-                        bound: bound_publish.is_some(),
-                    });
-                match action {
-                    // Already clean — nothing new to publish.
-                    engram_host_core::SurvivorAction::SkipClean => return,
-                    // Unreachable for a `Flushed` probe (only `FlushError`
-                    // maps to RelyOnSpool, and that returned above); keep
-                    // the arm so the match stays exhaustive.
-                    engram_host_core::SurvivorAction::RelyOnSpool => return,
-                    engram_host_core::SurvivorAction::DurableNoPublish
-                    | engram_host_core::SurvivorAction::Publish => {}
-                }
-                tracing::info!(
-                    %sandbox_id,
-                    chunks = outcome.chunks_flushed,
-                    bytes = outcome.bytes_uploaded,
-                    manifest_version = outcome.manifest_ref.version,
-                    "SIGTERM final flush uploaded survivor's dirty chunks",
-                );
-                // Synchronously publish so the successor rehydrates
-                // from the just-uploaded ref instead of the stale one.
-                let Some(((coord, host_id), session_id)) = bound_publish else {
-                    // DurableNoPublish: no coord wired, or the sandbox
-                    // isn't bound to a session yet (warm-pool /
-                    // pre-start_agent window). The chunks are durable in
-                    // GCS regardless; the publish is what we cannot do here.
-                    tracing::debug!(
-                        %sandbox_id,
-                        "SIGTERM final flush: chunks durable in GCS but no \
-                         coord publish (unbound sandbox or no publisher)",
-                    );
-                    return;
-                };
-                let req = engram_host_core::LiveManifestPublishRequest {
-                    session_id,
-                    sandbox_id,
-                    manifest_id: outcome.manifest_ref.manifest_id,
-                    manifest_version: outcome.manifest_ref.version,
-                };
-                match coord.publish_live_manifest(host_id, &req).await {
-                    Ok(_) => tracing::info!(
-                        %sandbox_id,
-                        %session_id,
-                        manifest_version = outcome.manifest_ref.version,
-                        "SIGTERM final flush: live_disk_manifest published to coord",
-                    ),
-                    // A publish failure falls back to the same RelyOnSpool
-                    // posture: the shutdown spool's store-ahead ref covers
-                    // a same-node successor.
-                    Err(e) => tracing::warn!(
-                        %sandbox_id,
-                        %session_id,
-                        error = %e,
-                        "SIGTERM final flush: chunks uploaded to GCS but coord \
-                         publish failed; the shutdown spool's store-ahead ref \
-                         covers a same-node successor",
-                    ),
-                }
-            });
-        }
-
-        let overran = Self::join_all_within(&mut tasks, deadline).await;
-        if overran {
-            // Some survivors were not GCS-flushed in time. This is not a
-            // data-loss event: the abandon sweep that runs next exports
-            // every still-dirty tier to the node-local shutdown spool
-            // (2026-07-16 RCA), and the successor adopts it. Log the
-            // stragglers so the GCS-side durability gap on this node
-            // stays visible.
-            // INVARIANT (see `nbd_sandboxes`): snapshot id+backend Arcs out
-            // of the map, then `.await` on the owned Arcs — never hold a
-            // DashMap guard across the `unflushed_bytes` await.
-            let stragglers: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = self
-                .nbd_sandboxes
-                .iter()
-                .map(|e| (*e.key(), e.value().backend.clone()))
-                .collect();
-            for (sandbox_id, backend) in stragglers {
-                // `unflushed_bytes`, not `dirty_bytes`: an aborted flush
-                // that got past its claim left the chunks claimed in the
-                // dirty tier — just as un-uploaded, and exactly the
-                // bytes the spool is about to carry.
-                let unflushed = backend.unflushed_bytes().await;
-                // ADR 0098 P4: `is_straggler` is the pure deadline-overrun
-                // decision (still-dirty at the deadline ⇒ loud, the spool
-                // catches it).
-                if engram_host_core::is_straggler(unflushed) {
-                    tracing::warn!(
-                        %sandbox_id,
-                        unflushed_bytes = unflushed,
-                        deadline_secs = deadline.as_secs_f64(),
-                        "SIGTERM final flush DEADLINE OVERRUN: survivor still has \
-                         un-uploaded (dirty + pending) bytes; the aborted flush's \
-                         work rides the shutdown spool for the successor to adopt",
-                    );
-                }
-            }
-        }
-    }
-
-    /// Await every flush task in `tasks` within `deadline`; return `true`
-    /// on overrun. On overrun, ABORT the still-running tasks and reap
-    /// each one before returning, so the abandon sweep that runs next
-    /// can never race a still-live flush. Dropping the join future
-    /// alone left the tokio::spawn'd flushes running DETACHED
-    /// (2026-07-21 session-af28cac4 RCA): a detached final flush
-    /// rebased + published v368 while the sweep's spool export had
-    /// already snapshotted the dirty tier and then stamped the spool
-    /// with the pre-rebase v367 head — the successor refused the
-    /// behind-stamped spool per the `shutdown-spool-lineage-mismatch`
-    /// gate and rolled the live guest's acked writes back under it.
-    /// Aborting is safe at every await point in the flush pipeline:
-    /// the manifest-ref rebase precedes the pending-tier drop, so a
-    /// killed flush at worst leaves chunks to be exported redundantly
-    /// (content-addressed, idempotent) or a store-ahead manifest the
-    /// adopt gate's `>=` arm already covers. The almost-done upload's
-    /// progress is forfeit — acceptable: those bytes ride the spool
-    /// instead, which is what the post-deadline grace headroom exists
-    /// for.
-    ///
-    /// A `JoinSet`, NOT a `Vec<JoinHandle>` (2026-08-02 durability-
-    /// rollback RCA): the old shape re-awaited EVERY handle in the
-    /// overrun arm, including the ones the timed join had already
-    /// polled to completion — and a completed `JoinHandle` PANICS on
-    /// its next poll ("JoinHandle polled after completion"). So a
-    /// deadline overrun with at least one finished flush panicked the
-    /// SIGTERM path between the flush pass and the abandon sweep:
-    /// process unwind ran `NbdHandle::Drop`'s netlink disconnect on
-    /// every survivor's live device, the shutdown-spool export never
-    /// ran, and the quarantined survivors came back uncapturable —
-    /// the coordinator destroyed them and 8 sessions rolled back past
-    /// acked writes. `JoinSet::join_next` REMOVES a task from the set
-    /// when it yields it, so no task can ever be polled twice.
-    //
-    // `any(..., test)`: the only src caller is the linux-gated flush
-    // pass, but the regression tests below must compile on macOS too.
-    #[cfg(any(target_os = "linux", test))]
-    async fn join_all_within(
-        tasks: &mut tokio::task::JoinSet<()>,
-        deadline: std::time::Duration,
-    ) -> bool {
-        let join_all = async { while tasks.join_next().await.is_some() {} };
-        if tokio::time::timeout(deadline, join_all).await.is_ok() {
-            return false;
-        }
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
-        true
-    }
-
     /// ADR 0044 K2 graceful shutdown: abandon every live NBD data
     /// plane WITHOUT disconnecting the kernel side, so surviving FC
     /// VMs keep their (parked) devices for the successor generation
@@ -4496,91 +3982,22 @@ impl PooledBackend {
         // one of the two drains below.
         self.abandoning
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Keep a backend Arc per abandoned sandbox: after the serve
-        // loop dies the dirty tier is FROZEN (later guest writes park
-        // in the kernel's dead-conn window for the successor to
-        // replay), which makes post-abandon the one race-free moment
-        // to export un-uploaded chunks to the shutdown spool
-        // (2026-07-16 session-85e0298a RCA — pre-spool, these acked
-        // writes died with the process and the successor rolled the
-        // live guest's disk back under it).
-        let mut frozen: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = Vec::new();
-        let drain = |frozen: &mut Vec<_>| {
+        let drain = || {
+            let mut abandoned = 0;
             let ids: Vec<_> = self.nbd_sandboxes.iter().map(|e| *e.key()).collect();
             for id in ids {
                 if let Some((_, state)) = self.nbd_sandboxes.remove(&id) {
-                    let backend = state.backend.clone();
                     state.abandon_for_shutdown();
-                    frozen.push((id, backend));
+                    abandoned += 1;
                 }
             }
+            abandoned
         };
-        drain(&mut frozen);
+        let mut abandoned = drain();
         // Belt-and-braces second pass: catches a state inserted
         // between the flag store and the first drain's snapshot.
-        drain(&mut frozen);
-        let abandoned = frozen.len();
-
-        let Some(spool_root) = self.shutdown_spool_root() else {
-            for (sandbox_id, backend) in &frozen {
-                let dirty = backend.dirty_bytes().await;
-                if dirty > 0 {
-                    tracing::error!(
-                        %sandbox_id,
-                        dirty_bytes = dirty,
-                        "shutdown abandon: un-uploaded dirty bytes and NO spool root \
-                         (checkpoint_dir unset); the successor will roll back these \
-                         acked guest writes",
-                    );
-                }
-            }
-            return abandoned;
-        };
-        for (sandbox_id, backend) in frozen {
-            let (manifest_ref, chunks) = backend.export_unflushed().await;
-            // Written even when `chunks` is empty: a zero-chunk spool still
-            // carries the manifest ref, which covers the flush-succeeded-but-
-            // coord-publish-failed shutdown — the chunks and manifest are
-            // durable in the blob store under a version coord never heard
-            // about, and the successor must attach from THAT ref (the spool's
-            // store-ahead rule), not roll back to coord's stale one.
-            match crate::disk_daemon::spool::write_spool(
-                self.host_fs.as_ref(),
-                &spool_root,
-                sandbox_id,
-                manifest_ref,
-                &chunks,
-            )
-            .await
-            {
-                Ok(bytes) => tracing::info!(
-                    %sandbox_id,
-                    chunks = chunks.len(),
-                    bytes,
-                    manifest = %manifest_ref,
-                    "shutdown abandon: un-uploaded dirty chunks preserved in the \
-                     local spool for the successor to adopt",
-                ),
-                Err(e) => tracing::error!(
-                    %sandbox_id,
-                    chunks = chunks.len(),
-                    error = %e,
-                    "shutdown abandon: SPOOL WRITE FAILED; the successor will roll \
-                     back these acked guest writes",
-                ),
-            }
-        }
+        abandoned += drain();
         abandoned
-    }
-
-    /// Node-local root for the shutdown spool (un-uploaded dirty
-    /// chunks handed from a dying host-agent generation to its
-    /// successor). Lives under `checkpoint_dir` — the same hostPath
-    /// volume the checkpoint chain records already rely on surviving
-    /// pod rolls. `None` ⟺ checkpointing is disabled (dev/tests).
-    #[cfg(target_os = "linux")]
-    fn shutdown_spool_root(&self) -> Option<std::path::PathBuf> {
-        self.checkpoint_dir.as_ref().map(|d| d.join("spool"))
     }
 
     /// Issue #224: whether the terminal shutdown-abandon mode is
@@ -8598,9 +8015,6 @@ impl SandboxBackend for PooledBackend {
         // population AND cleanup must be unconditional now that the
         // map is shared with the publisher.
         let removed_session = self.session_bindings.remove(&id).map(|(_, sid)| sid);
-        // ADR 0090: a destroyed survivor stops advertising quarantine —
-        // the evict_local remediation (or any destroy) closes the loop.
-        self.quarantined_survivors.remove(&id);
         self.unreachable_guests.remove(&id);
         if let Some(egress) = self.egress.as_ref() {
             if let Some(session_id) = removed_session {
@@ -8628,13 +8042,6 @@ impl SandboxBackend for PooledBackend {
                     ),
                 }
                 let _ = fs::remove_file(crate::disk_daemon::backend::ref_sidecar_path(&path)).await;
-            }
-            // A destroyed sandbox's shutdown spool must not outlive it
-            // (the sandbox_id will never rehydrate again; a leftover
-            // spool is dead weight on the hostPath volume).
-            if let Some(root) = self.shutdown_spool_root() {
-                let _ = crate::disk_daemon::spool::discard_spool(self.host_fs.as_ref(), &root, id)
-                    .await;
             }
         }
         // ADR 0016 Phase A: drop the COW diagnostic timestamp so
@@ -9647,6 +9054,22 @@ impl PooledBackend {
         sandbox_id: SandboxId,
         disk_manifest: engram_core::types::manifest::ManifestRef,
     ) -> Result<bool, SandboxError> {
+        self.rehydrate_sandbox_with_kernel(
+            session_id,
+            sandbox_id,
+            disk_manifest,
+            &crate::disk_daemon::HostNbdKernel,
+        )
+        .await
+    }
+
+    async fn rehydrate_sandbox_with_kernel(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        disk_manifest: engram_core::types::manifest::ManifestRef,
+        kernel: &dyn engram_host_core::NbdKernel,
+    ) -> Result<bool, SandboxError> {
         let (pool, chunk_store, chunk_cache) = match (
             self.nbd_pool.as_ref(),
             self.chunk_store.as_ref(),
@@ -9669,32 +9092,19 @@ impl PooledBackend {
             );
             return Ok(false);
         };
-        // Register-time rehydrate claims the device from the pool; a
-        // RETRY (2026-08-02 durability-rollback RCA) finds it PARKED by
-        // its own earlier failure and reclaims it instead — the
-        // `Parked → Claimed` edge. Reclaim first: it is lock-cheap,
-        // and a parked device would spend `claim`'s full retry budget
-        // to conclude "reserved by someone" anyway.
-        let slot = match pool.reclaim_parked(&device) {
+        let slot = match pool.claim(&device).await {
             Some(slot) => slot,
-            None => match pool.claim(&device).await {
-                Some(slot) => slot,
-                None => {
-                    // Not parked and not in the free pool: either the
-                    // device isn't part of this host's slot set, or
-                    // something else already leased it — both mean
-                    // re-serving here would fight another owner. Loud,
-                    // because the survivor's disk stays dead.
-                    tracing::warn!(
-                        %sandbox_id,
-                        device = %device.display(),
-                        "rehydrate: survivor's NBD device could not be claimed from \
-                         the slot pool; its disk stays unserved (recover via \
-                         evict_local → resume)",
-                    );
-                    return Ok(false);
-                }
-            },
+            None => {
+                // The device is outside the pool or another owner leased it.
+                // Re-serving it here would fight that owner.
+                tracing::warn!(
+                    %sandbox_id,
+                    device = %device.display(),
+                    "rehydrate: survivor's NBD device could not be claimed from \
+                     the slot pool; its disk stays unserved",
+                );
+                return Ok(false);
+            }
         };
 
         let dirty_path = self
@@ -9710,92 +9120,18 @@ impl PooledBackend {
             )
         })?;
 
-        // A dirty file is the primary seed. A pre-upgrade sandbox has no
-        // file, so it keeps the shutdown-spool fallback unchanged. The
-        // spool seed still lands before RECONFIGURE releases guest I/O.
-        let spool_root = self.shutdown_spool_root();
-        let mut attach_ref = disk_manifest;
-        if dirty_file_exists {
-            attach_ref = crate::disk_daemon::backend::resolve_recover_attach_ref(
-                disk_manifest,
-                crate::disk_daemon::backend::read_ref_sidecar(&dirty_path),
+        let attach_ref = crate::disk_daemon::backend::resolve_recover_attach_ref(
+            disk_manifest,
+            crate::disk_daemon::backend::read_ref_sidecar(&dirty_path),
+        );
+        if attach_ref != disk_manifest {
+            tracing::info!(
+                %sandbox_id,
+                coordinator_ref = %disk_manifest,
+                attach_ref = %attach_ref,
+                "predecessor published past the coordinator's ref, attaching at the recorded publish — store-ahead",
             );
-            if attach_ref != disk_manifest {
-                tracing::info!(
-                    %sandbox_id,
-                    coordinator_ref = %disk_manifest,
-                    attach_ref = %attach_ref,
-                    "predecessor published past the coordinator's ref, attaching at the recorded publish — store-ahead",
-                );
-            }
         }
-        let mut seed_dirty: Option<Vec<(usize, Vec<u8>)>> = None;
-        if !dirty_file_exists {
-            if let Some(root) = &spool_root {
-                match crate::disk_daemon::spool::read_spool(self.host_fs.as_ref(), root, sandbox_id)
-                    .await
-                {
-                    Ok(Some((meta, chunks)))
-                        if meta.manifest_id == disk_manifest.manifest_id
-                            && meta.version >= disk_manifest.version =>
-                    {
-                        // meta.version can be AHEAD of coord's ref: the
-                        // predecessor uploaded chunks + manifest but died
-                        // before its coord publish landed. The manifest
-                        // object is already durable in the blob store
-                        // (upload precedes publish), so attach from the
-                        // spool's ref — the store-ahead recovery the flush
-                        // path's version-conflict retry also leans on.
-                        attach_ref = meta.manifest_ref();
-                        seed_dirty = Some(chunks);
-                    }
-                    Ok(Some((meta, _))) => {
-                        // A spool that disagrees with the reference lineage is
-                        // an invariant-class surprise, not routine: the spool
-                        // is written by the predecessor's OWN flush backend at
-                        // shutdown, and sandbox ids never recur — the expected
-                        // divergence is only version-behind (stale coord
-                        // publish), which the adopt arm above already covers.
-                        // The 2026-07-21 61a03b7e incident hit this arm with a
-                        // WRONG-KIND reference (the memory chain head) and
-                        // discarded real acked writes as "foreign". Keep the
-                        // spool ON DISK — it is the only copy of acked guest
-                        // data; a later correctly-referenced attach can still
-                        // adopt it, and an operator can inspect it.
-                        engram_core::soft_invariant!(
-                            "shutdown-spool-lineage-mismatch",
-                            false,
-                            "sandbox {}: shutdown-spool lineage {} disagrees with the \
-                         reference disk manifest {} — spool PRESERVED on disk, not \
-                         adopted (it is the only copy of acked guest writes; a \
-                         correctly-referenced attach can still adopt it, an \
-                         operator can inspect it)",
-                            sandbox_id,
-                            meta.manifest_ref(),
-                            disk_manifest,
-                        );
-                        ::metrics::counter!(crate::metrics::SPOOL_LINEAGE_MISMATCH_TOTAL)
-                            .increment(1);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::error!(
-                            %sandbox_id,
-                            error = %e,
-                            "shutdown spool unreadable; discarding — acked writes it \
-                             held are rolled back",
-                        );
-                        let _ = crate::disk_daemon::spool::discard_spool(
-                            self.host_fs.as_ref(),
-                            root,
-                            sandbox_id,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-        let adopted_spool = seed_dirty.is_some();
 
         let store_arc = Arc::new(chunk_store.clone());
         let dirty_mode = if dirty_file_exists {
@@ -9809,64 +9145,139 @@ impl PooledBackend {
             store_arc,
             slot,
             self.flush_config.dirty_threshold_bytes,
-            dirty_path,
-            dirty_mode,
-            seed_dirty,
+            (dirty_path, dirty_mode),
+            kernel,
         )
         .await
         {
             Ok(state) => state,
-            Err((slot, e)) => {
-                // Reattach refused — a RECONFIGURE failure (a device
-                // configured by a pre-netlink host-agent generation, or an
-                // identifier mismatch), or the pre-RECONFIGURE verify-on-read
-                // finding the adopted spool bytes missing from the backend.
-                // The survivor's disk stays dead; the evict_local → resume
-                // ladder recovers the session.
-                //
-                // PARK the slot rather than letting it drop back into the
-                // general pool: the surviving FC may still hold an open fd
-                // to this exact /dev/nbdN, so releasing it would let the
-                // stale-binding sweep DISCONNECT it (immediate guest EIO)
-                // or hand it to an unrelated session. Quarantine keeps the
-                // reserved bit set so the device is unavailable to new
-                // claims until the session is recovered out-of-band.
-                tracing::warn!(
+            Err(crate::disk_daemon::runtime::ReattachManifestError::Build(error)) => {
+                tracing::error!(
                     %sandbox_id,
                     device = %device.display(),
-                    error = %e,
-                    "rehydrate reattach failed; parking the survivor's NBD slot \
-                     (quarantined, kept out of the pool) to protect a possibly-live \
-                     device; recover via evict_local → resume",
+                    %error,
+                    "rehydrate could not build the backend from the survivor dirty \
+                     file; the VM and file stay in place for recovery",
                 );
-                slot.quarantine();
-                // ADR 0090: don't just log the remediation — advertise the
-                // survivor in every heartbeat so the coordinator actually
-                // DRIVES evict_local → resume (pre-fix, nothing consumed
-                // this WARN and the teardown reconciler's orphan path
-                // SIGKILLed the healthy VM ~60s later). Preserve an
-                // existing record's retry counter: a failed RETRY lands
-                // here too, and resetting the counter would re-loudify
-                // its log pacing every attempt.
-                self.quarantined_survivors
-                    .entry(sandbox_id)
-                    .and_modify(|q| {
-                        q.disk_manifest = disk_manifest;
-                    })
-                    .or_insert(QuarantinedSurvivor {
-                        session_id,
-                        disk_manifest,
-                        retry_attempts: 0,
-                    });
                 return Err(SandboxError::Vm(
                     format!(
-                        "rehydrate nbd reattach at {}: {e} \
-                         (survivor disk unserved; slot quarantined; recover via \
-                         evict_local → resume)",
+                        "rehydrate backend build at {}: {error} (survivor and dirty file retained)",
                         device.display()
                     )
                     .into(),
                 ));
+            }
+            Err(crate::disk_daemon::runtime::ReattachManifestError::Reconfigure {
+                backend,
+                slot: _slot,
+                error,
+            }) => {
+                // ADR 0110: Publish the recovered dirty file before destroy.
+                // No map or capture lock is held; flush takes its own locks.
+                tracing::error!(
+                    %sandbox_id,
+                    %session_id,
+                    device = %device.display(),
+                    %error,
+                    "survivor reattach failed; flushing and publishing the recovered \
+                     disk before sandbox destroy",
+                );
+                let outcome = match backend.flush().await {
+                    Ok(outcome) => outcome,
+                    Err(flush_error) => {
+                        tracing::error!(
+                            %sandbox_id,
+                            %session_id,
+                            reattach_error = %error,
+                            %flush_error,
+                            "survivor reattach recovery flush FAILED; the VM, dirty \
+                             file, and ref sidecar stay in place",
+                        );
+                        return Err(SandboxError::Vm(
+                            format!(
+                                "rehydrate recovery flush after {error}: {flush_error} \
+                                 (survivor and dirty state retained)"
+                            )
+                            .into(),
+                        ));
+                    }
+                };
+                let Some((coord, host_id)) = self.live_manifest_coord_publish.as_ref() else {
+                    tracing::error!(
+                        %sandbox_id,
+                        %session_id,
+                        manifest = %outcome.manifest_ref,
+                        "survivor reattach recovery cannot publish to the coordinator; \
+                         the VM, dirty file, and ref sidecar stay in place",
+                    );
+                    return Err(SandboxError::Vm(
+                        "rehydrate recovery has no coordinator live-manifest publisher; \
+                         survivor and dirty state retained"
+                            .into(),
+                    ));
+                };
+                let request = engram_host_core::LiveManifestPublishRequest {
+                    session_id,
+                    sandbox_id,
+                    manifest_id: outcome.manifest_ref.manifest_id,
+                    manifest_version: outcome.manifest_ref.version,
+                };
+                let response = match coord.publish_live_manifest(*host_id, &request).await {
+                    Ok(response) => response,
+                    Err(publish_error) => {
+                        tracing::error!(
+                            %sandbox_id,
+                            %session_id,
+                            manifest = %outcome.manifest_ref,
+                            reattach_error = %error,
+                            %publish_error,
+                            "survivor reattach coordinator publish FAILED; the VM, dirty \
+                             file, and ref sidecar stay in place",
+                        );
+                        return Err(SandboxError::Vm(
+                            format!(
+                                "rehydrate recovery coordinator publish after {error}: \
+                                 {publish_error} (survivor and dirty state retained)"
+                            )
+                            .into(),
+                        ));
+                    }
+                };
+                if response.outcome != engram_host_core::LiveManifestPublishOutcome::Applied {
+                    tracing::error!(
+                        %sandbox_id,
+                        %session_id,
+                        manifest = %outcome.manifest_ref,
+                        "survivor reattach coordinator publish was stale; the VM, dirty \
+                         file, and ref sidecar stay in place",
+                    );
+                    return Err(SandboxError::Vm(
+                        "rehydrate recovery coordinator publish was stale; survivor and \
+                         dirty state retained"
+                            .into(),
+                    ));
+                }
+
+                tracing::error!(
+                    %sandbox_id,
+                    %session_id,
+                    manifest = %outcome.manifest_ref,
+                    chunks = outcome.chunks_flushed,
+                    bytes = outcome.bytes_uploaded,
+                    "survivor reattach recovery published the complete disk; destroying \
+                     the sandbox so normal park-and-resume can continue",
+                );
+                if let Err(destroy_error) = self.destroy(sandbox_id).await {
+                    tracing::error!(
+                        %sandbox_id,
+                        %session_id,
+                        manifest = %outcome.manifest_ref,
+                        %destroy_error,
+                        "survivor reattach recovery publish succeeded but sandbox destroy FAILED",
+                    );
+                    return Err(destroy_error);
+                }
+                return Ok(false);
             }
         };
 
@@ -9905,41 +9316,11 @@ impl PooledBackend {
         // 5163366 cold-create regression.
         self.session_bindings.insert(sandbox_id, session_id);
 
-        // The seeded chunks are now owned by the live dirty tier (and
-        // the scheduler installed above will upload them promptly);
-        // drop the spool so a LATER generation can't re-adopt stale
-        // bytes over a newer divergence.
-        if adopted_spool {
-            if let Some(root) = &spool_root {
-                if let Err(e) = crate::disk_daemon::spool::discard_spool(
-                    self.host_fs.as_ref(),
-                    root,
-                    sandbox_id,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        %sandbox_id,
-                        error = %e,
-                        "adopted shutdown spool could not be discarded",
-                    );
-                }
-            }
-        }
-
-        // 2026-08-02 durability-rollback RCA: a successful (re-)serve
-        // clears the quarantine — the heartbeat stops advertising the
-        // survivor and the coordinator's parked quarantine op captures
-        // cleanly on its next attempt. No-op for the register-time
-        // first attempt (no entry exists yet).
-        self.quarantined_survivors.remove(&sandbox_id);
-
         tracing::info!(
             %session_id,
             %sandbox_id,
             manifest = %attach_ref,
             device = %device.display(),
-            spool_adopted = adopted_spool,
             "rehydrated chunked-disk data plane (RECONFIGURE) for survivor sandbox",
         );
         Ok(true)
@@ -10270,49 +9651,353 @@ mod tests {
         );
     }
 
-    /// 2026-08-02 durability-rollback RCA regression: a deadline overrun
-    /// with a MIX of already-completed and still-running flush tasks
-    /// must abort + reap the stragglers without re-polling the
-    /// completed ones. The old `Vec<JoinHandle>` shape re-awaited every
-    /// handle in the overrun arm and panicked ("JoinHandle polled after
-    /// completion"), unwinding the SIGTERM path before the abandon
-    /// sweep — the panic that destroyed 8 sessions' survivors. Paused
-    /// clock: the deadline elapses deterministically, no real sleeping.
-    #[tokio::test(start_paused = true)]
-    async fn shutdown_flush_join_overrun_with_completed_tasks_does_not_panic() {
-        let mut tasks = tokio::task::JoinSet::new();
-        // Completes immediately — the timed join reaps it, which is
-        // exactly the state that made the old overrun arm re-poll a
-        // consumed handle.
-        tasks.spawn(async {});
-        // Never completes — forces the deadline overrun.
-        tasks.spawn(async {
-            std::future::pending::<()>().await;
+    #[cfg(target_os = "linux")]
+    struct ReattachRecoveryInner {
+        sandbox_id: SandboxId,
+        events: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+        destroyed: Arc<parking_lot::Mutex<Vec<SandboxId>>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_trait]
+    impl SandboxBackend for ReattachRecoveryInner {
+        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+
+        async fn exec_stream(
+            &self,
+            _: SandboxId,
+            _: ExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+
+        fn rootfs_device(&self, id: SandboxId) -> Option<PathBuf> {
+            (id == self.sandbox_id).then(|| PathBuf::from("/dev/nbd7"))
+        }
+
+        async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+
+        fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+            std::env::temp_dir().join(id.to_string())
+        }
+
+        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+
+        async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+            self.events.lock().push("destroy");
+            self.destroyed.lock().push(id);
+            Ok(())
+        }
+
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            Ok(vec![self.sandbox_id])
+        }
+
+        async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ReconfigureFails {
+        events: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_trait]
+    impl engram_host_core::NbdKernel for ReconfigureFails {
+        async fn connect(&self, _: engram_host_core::NbdConnectRequest<'_>) -> std::io::Result<()> {
+            unreachable!("survivor rehydrate does not connect a fresh device")
+        }
+
+        async fn reconfigure(
+            &self,
+            _: engram_host_core::NbdReconfigureRequest<'_>,
+        ) -> std::io::Result<()> {
+            self.events.lock().push("reconfigure");
+            Err(std::io::Error::other("injected RECONFIGURE failure"))
+        }
+
+        async fn disconnect(&self, _: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn backend_identifier(&self, _: &Path) -> Option<String> {
+            Some("test-survivor".into())
+        }
+
+        fn connected_devices(&self) -> Vec<engram_host_core::ConnectedDevice> {
+            Vec::new()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ReattachRecoveryCoord {
+        store: Arc<ChunkStore>,
+        fail_publish: bool,
+        events: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+        published: Arc<
+            parking_lot::Mutex<
+                Vec<(
+                    SessionId,
+                    SandboxId,
+                    engram_core::types::manifest::ManifestRef,
+                )>,
+            >,
+        >,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_trait]
+    impl engram_host_core::CoordControlPlane for ReattachRecoveryCoord {
+        async fn publish_live_manifest(
+            &self,
+            _: engram_core::HostId,
+            request: &engram_host_core::LiveManifestPublishRequest,
+        ) -> Result<engram_host_core::LiveManifestPublishResponse, engram_host_core::CoordError>
+        {
+            let manifest_ref = engram_core::types::manifest::ManifestRef {
+                manifest_id: request.manifest_id,
+                version: request.manifest_version,
+            };
+            let manifest = self
+                .store
+                .get_manifest(manifest_ref)
+                .await
+                .expect("the store publish must precede the coordinator publish");
+            assert!(
+                !manifest.chunks.is_empty(),
+                "the published manifest must contain the recovered dirty chunk"
+            );
+            self.events.lock().push("coordinator_publish");
+            self.published
+                .lock()
+                .push((request.session_id, request.sandbox_id, manifest_ref));
+            if self.fail_publish {
+                return Err(engram_host_core::CoordError::Transport(
+                    "injected coordinator outage".into(),
+                ));
+            }
+            Ok(engram_host_core::LiveManifestPublishResponse {
+                outcome: engram_host_core::LiveManifestPublishOutcome::Applied,
+            })
+        }
+
+        async fn sandbox_ownership(
+            &self,
+            _: engram_core::HostId,
+            _: SessionId,
+            _: SandboxId,
+        ) -> Result<bool, engram_host_core::CoordError> {
+            unreachable!("reattach recovery does not query ownership")
+        }
+
+        async fn sandbox_owner(
+            &self,
+            _: engram_core::HostId,
+            _: SandboxId,
+        ) -> Result<Option<SessionId>, engram_host_core::CoordError> {
+            unreachable!("reattach recovery does not query the owner")
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ReattachRecoveryFixture {
+        _temp: tempfile::TempDir,
+        pooled: PooledBackend,
+        kernel: ReconfigureFails,
+        store: Arc<ChunkStore>,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        dirty_path: PathBuf,
+        acked: Vec<u8>,
+        events: Arc<parking_lot::Mutex<Vec<&'static str>>>,
+        destroyed: Arc<parking_lot::Mutex<Vec<SandboxId>>>,
+        published: Arc<
+            parking_lot::Mutex<
+                Vec<(
+                    SessionId,
+                    SandboxId,
+                    engram_core::types::manifest::ManifestRef,
+                )>,
+            >,
+        >,
+        base_ref: engram_core::types::manifest::ManifestRef,
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn reattach_recovery_fixture(fail_publish: bool) -> ReattachRecoveryFixture {
+        use engram_chunk_store::manifest::{ChunkSize, ManifestKind};
+        use engram_chunk_store::{ChunkCacheConfig, Manifest};
+        use engram_storage_local::LocalBlobStorage;
+
+        let temp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> =
+            Arc::new(LocalBlobStorage::new(temp.path().join("blob")));
+        let chunk_store = ChunkStore::new(blob);
+        let store = Arc::new(chunk_store.clone());
+        let cache = ChunkCache::new(ChunkCacheConfig::new(temp.path().join("cache")));
+        let base_ref = engram_core::types::manifest::ManifestRef::new();
+        let manifest = Manifest {
+            schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Disk,
+            chunk_size: ChunkSize::bytes(4096),
+            total_bytes: 4096,
+            chunks: Vec::new(),
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        store.put_manifest(base_ref, &manifest).await.unwrap();
+
+        let session_id = SessionId::new();
+        let sandbox_id = SandboxId::new();
+        let dirty_root = temp.path().join("dirty");
+        let dirty_path = dirty_root.join(format!("{sandbox_id}.cache"));
+        let backend = crate::disk_daemon::ChunkedDiskBackend::from_manifest_with_dirty_file(
+            base_ref,
+            &manifest,
+            cache.clone(),
+            store.clone(),
+            u64::MAX,
+            dirty_path.clone(),
+            crate::disk_daemon::backend::DirtyFileOpenMode::Truncate,
+        )
+        .unwrap();
+        backend.retain_dirty_file().await;
+        let acked = vec![0x5a; 4096];
+        backend.write(0, &acked).await.unwrap();
+        drop(backend);
+
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let destroyed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let published = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let inner: Arc<dyn SandboxBackend> = Arc::new(ReattachRecoveryInner {
+            sandbox_id,
+            events: events.clone(),
+            destroyed: destroyed.clone(),
         });
+        let coord: Arc<dyn engram_host_core::CoordControlPlane> = Arc::new(ReattachRecoveryCoord {
+            store: store.clone(),
+            fail_publish,
+            events: events.clone(),
+            published: published.clone(),
+        });
+        let pool =
+            crate::disk_daemon::NbdSlotAllocator::from_paths(vec![PathBuf::from("/dev/nbd7")])
+                .unwrap();
+        let pooled = PooledBackend::new(inner)
+            .with_chunk_store(chunk_store, temp.path().join("materialized"))
+            .with_chunk_cache(cache)
+            .with_dirty_root(dirty_root)
+            .with_nbd_pool(pool)
+            .with_live_manifest_coord_publisher(coord, engram_core::HostId::new());
+        let kernel = ReconfigureFails {
+            events: events.clone(),
+        };
 
-        let overran =
-            PooledBackend::join_all_within(&mut tasks, std::time::Duration::from_secs(20)).await;
+        ReattachRecoveryFixture {
+            _temp: temp,
+            pooled,
+            kernel,
+            store,
+            session_id,
+            sandbox_id,
+            dirty_path,
+            acked,
+            events,
+            destroyed,
+            published,
+            base_ref,
+        }
+    }
 
-        assert!(overran, "the pending task must trip the deadline");
+    /// ADR 0110: a RECONFIGURE failure publishes the recovered dirty file
+    /// to the store and coordinator before the existing destroy path runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reattach_failure_publishes_then_destroys_the_survivor() {
+        let fixture = reattach_recovery_fixture(false).await;
+
+        let rehydrated = fixture
+            .pooled
+            .rehydrate_sandbox_with_kernel(
+                fixture.session_id,
+                fixture.sandbox_id,
+                fixture.base_ref,
+                &fixture.kernel,
+            )
+            .await
+            .expect("publish-and-destroy recovery must complete");
+
+        assert!(!rehydrated, "the destroyed survivor was not re-served");
+        assert_eq!(
+            fixture.events.lock().as_slice(),
+            ["reconfigure", "coordinator_publish", "destroy"],
+            "destroy must follow both manifest publishes"
+        );
+        assert_eq!(fixture.destroyed.lock().as_slice(), [fixture.sandbox_id]);
+        let published = fixture.published.lock().clone();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, fixture.session_id);
+        assert_eq!(published[0].1, fixture.sandbox_id);
+        let manifest = fixture.store.get_manifest(published[0].2).await.unwrap();
+        let chunk = fixture
+            .store
+            .get_chunk(manifest.chunks[0].hash)
+            .await
+            .unwrap();
+        assert_eq!(chunk.as_ref(), fixture.acked.as_slice());
         assert!(
-            tasks.is_empty(),
-            "every task must be reaped before the abandon sweep runs",
+            !fixture.dirty_path.exists(),
+            "destroy removes the dirty file"
+        );
+        assert!(
+            !crate::disk_daemon::backend::ref_sidecar_path(&fixture.dirty_path).exists(),
+            "destroy removes the ref sidecar"
         );
     }
 
-    /// The no-overrun path: all tasks finish inside the deadline, the
-    /// join reports no overrun, and the set is fully drained.
-    #[tokio::test(start_paused = true)]
-    async fn shutdown_flush_join_within_deadline_reports_no_overrun() {
-        let mut tasks = tokio::task::JoinSet::new();
-        tasks.spawn(async {});
-        tasks.spawn(async {});
+    /// A coordinator outage after the store publish must not destroy the VM
+    /// or remove the local recovery files.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reattach_publish_failure_retains_the_survivor_and_dirty_state() {
+        let fixture = reattach_recovery_fixture(true).await;
 
-        let overran =
-            PooledBackend::join_all_within(&mut tasks, std::time::Duration::from_secs(20)).await;
+        let error = fixture
+            .pooled
+            .rehydrate_sandbox_with_kernel(
+                fixture.session_id,
+                fixture.sandbox_id,
+                fixture.base_ref,
+                &fixture.kernel,
+            )
+            .await
+            .expect_err("a failed coordinator publish must keep the survivor");
 
-        assert!(!overran);
-        assert!(tasks.is_empty());
+        assert!(error.to_string().contains("coordinator publish"));
+        assert_eq!(
+            fixture.events.lock().as_slice(),
+            ["reconfigure", "coordinator_publish"]
+        );
+        assert!(fixture.destroyed.lock().is_empty());
+        assert!(fixture.dirty_path.exists(), "the dirty file must remain");
+        let recorded = crate::disk_daemon::backend::read_ref_sidecar(&fixture.dirty_path)
+            .expect("flush writes the ref sidecar before it punches the dirty file");
+        let manifest = fixture.store.get_manifest(recorded).await.unwrap();
+        let chunk = fixture
+            .store
+            .get_chunk(manifest.chunks[0].hash)
+            .await
+            .unwrap();
+        assert_eq!(chunk.as_ref(), fixture.acked.as_slice());
     }
 
     #[tokio::test]
@@ -13116,12 +12801,9 @@ mod tests {
         );
     }
 
-    /// D5 (2026-07-17 corruption path, session 03e6535e): a sandbox with an
-    /// NBD-backed rootfs but NO `nbd_sandboxes` entry is a post-pod-roll
-    /// survivor whose disk server is gone. Snapshotting it would silently
-    /// skip the disk drain and record `disk_manifest=None` — dropping the
-    /// session's acked disk writes. The capture must REFUSE. Linux-only:
-    /// the guard + `nbd_sandboxes` are `cfg(target_os = "linux")`.
+    /// D5 (2026-07-17 corruption path, session 03e6535e): a survivor whose
+    /// reattach recovery has not completed has an NBD rootfs but no
+    /// `nbd_sandboxes` entry. Capture must refuse and let eviction requeue.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn capture_refuses_an_untracked_nbd_rootfs_survivor() {
@@ -13186,8 +12868,8 @@ mod tests {
 
         let sandbox_id = SandboxId::new();
         pooled.session_bindings.insert(sandbox_id, SessionId::new());
-        // Deliberately do NOT insert into `nbd_sandboxes` — the survivor
-        // whose disk server died with the rolled pod.
+        // Do not insert into `nbd_sandboxes`. This is the loud backstop for
+        // a survivor whose reattach recovery has not completed.
 
         let err = pooled
             .snapshot(sandbox_id)
@@ -13200,6 +12882,10 @@ mod tests {
         assert!(
             format!("{err}").contains("nbd_sandboxes"),
             "the refusal explains the missing NBD tracking: {err}",
+        );
+        assert!(
+            format!("{err}").contains("eviction operation will requeue"),
+            "the refusal explains the redrive behavior: {err}",
         );
     }
 

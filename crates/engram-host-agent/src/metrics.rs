@@ -107,7 +107,6 @@ pub fn init(addr: SocketAddr) {
     // the alert must exist before the first firing, so the series must
     // too. (Same rationale as the coordinator's pre-registration.)
     ::metrics::counter!(CHECKPOINT_CHAIN_POISONED_TOTAL).absolute(0);
-    ::metrics::counter!(SPOOL_LINEAGE_MISMATCH_TOTAL).absolute(0);
     ::metrics::counter!(SHUTDOWN_STAGE_PANIC_TOTAL).absolute(0);
 }
 
@@ -470,28 +469,6 @@ pub const SWEEP_BLOCKED_LIVE_HOLDER_TOTAL: &str = "engram_nbd_sweep_blocked_live
 /// THIS is the reconcile finding a device it cannot account for at all.
 pub const REHYDRATE_UNKNOWN_DEVICE_TOTAL: &str = "engram_nbd_rehydrate_unknown_device_total";
 
-/// The rehydrate spool-adopt arm found a shutdown spool whose lineage disagrees
-/// with the reference disk manifest (fires alongside the
-/// `shutdown-spool-lineage-mismatch` soft-invariant). The spool is PRESERVED on
-/// disk but its acked writes are not served — the 2026-07-21 61a03b7e incident
-/// discarded such a spool because a wrong-kind reference (the MEMORY chain
-/// head) made a legitimate spool look foreign. Should stay at zero; non-zero
-/// means either a wrong-kind/wrong-lineage reference reached the attach path
-/// (a bug) or acked guest writes are sitting unserved (an operator must
-/// reconcile).
-pub const SPOOL_LINEAGE_MISMATCH_TOTAL: &str = "engram_nbd_spool_lineage_mismatch_total";
-
-/// A SIGTERM shutdown-ladder stage panicked and was unwind-isolated (the
-/// ladder continued to the abandon sweep + spool export). Should stay at
-/// zero; non-zero means a shutdown rung has a bug — the 2026-08-02
-/// durability rollback started as exactly such a panic, silent in prod
-/// for 11 days. Alert on any increase.
+/// A SIGTERM shutdown stage panicked and was isolated so VM detach could
+/// continue. This counter must stay at zero. Alert on any increase.
 pub const SHUTDOWN_STAGE_PANIC_TOTAL: &str = "engram_host_shutdown_stage_panic_total";
-
-/// A quarantined survivor's disk was re-served by the rehydrate retry
-/// pass (2026-08-02 durability-rollback RCA) — the recovery that
-/// replaces the old destroy-on-exhaustion rollback. Informational;
-/// the paired failure signal is the coordinator's
-/// `engram_quarantine_stuck_total`.
-pub const QUARANTINE_REHYDRATE_RECOVERED_TOTAL: &str =
-    "engram_nbd_quarantine_rehydrate_recovered_total";

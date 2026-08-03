@@ -27,9 +27,8 @@ pub struct HostEffects {
 
 impl HostEffects {
     /// Assemble a bundle from concrete seam impls. The production
-    /// constructor wires `SystemClock`/`OsEntropy` and the reqwest
-    /// `HttpCoordClient` / `TokioFs` / the host-agent's device+kernel
-    /// impls; the simulator wires its `Sim*` counterparts.
+    /// constructor accepts each concrete effect implementation. The simulator
+    /// wires its `Sim*` implementations.
     pub fn production(
         clock: Arc<dyn Clock>,
         entropy: Arc<dyn Entropy>,

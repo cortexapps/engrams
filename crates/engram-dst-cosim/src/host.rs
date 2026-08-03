@@ -2,7 +2,7 @@
 //!
 //! [`CosimHost`] models one host-agent process at the coordinator↔host
 //! boundary. Unlike [`engram_dst_host::SimHost`] — which owns a fixed slot
-//! id-space and drives the host's disk/spool/NBD oracles in isolation —
+//! id-space and drives the host's disk/dirty-file/NBD oracles in isolation —
 //! this host is keyed by the **coordinator-minted** sandbox/session ids
 //! (the coordinator owns the id-space at this boundary), and its job is to
 //! run the REAL host-agent lifecycle flows the coordinator's verbs trigger:

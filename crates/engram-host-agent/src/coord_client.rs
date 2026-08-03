@@ -592,8 +592,7 @@ pub struct HeartbeatRequest {
     /// heartbeat until `HeartbeatResponse.acked_capture_jobs` names them.
     #[serde(default)]
     pub capture_job_reports: Vec<engram_core::types::CaptureJobReport>,
-    /// ADR 0090: survivors whose NBD slot this generation quarantined —
-    /// re-advertised until destroyed; the coord drives evict_local.
+    /// Empty until this field and its coordinator consumer retire together.
     #[serde(default)]
     pub quarantined_survivors: Vec<engram_protocol::heartbeat::QuarantinedSurvivor>,
     /// ADR 0091: guests whose control plane stopped answering (the
@@ -806,6 +805,7 @@ mod tests {
             capabilities: Default::default(),
             harness_attached: Vec::new(),
             capture_job_reports: Vec::new(),
+            // This field retires with its coordinator consumer in the next commit.
             quarantined_survivors: Vec::new(),
             unreachable_guests: Vec::new(),
         };

@@ -86,14 +86,6 @@ pub enum DiskBackendError {
         length: u64,
         total: u64,
     },
-    /// A spool chunk failed the adoption shape check (past `total_bytes`
-    /// or wider than `chunk_size`). The adoption is refused ATOMICALLY —
-    /// adopting the well-shaped subset would silently roll back the
-    /// out-of-shape chunk's acked write (issue #810: the 2026-07-20 roll
-    /// served rolled-back base exactly this way, caught only by
-    /// verify-on-read). The caller parks the survivor; the spool stays
-    /// on disk for diagnosis/retry.
-    AdoptShape { chunk_idx: usize, len: usize },
     /// A resolver-fetched chunk's byte length does not match the manifest
     /// slice width — serving it would read out of bounds. Hash-valid but
     /// short/long blobs (manifest corruption, a bad flush) land here as a
@@ -133,12 +125,6 @@ impl std::fmt::Display for DiskBackendError {
             } => write!(
                 f,
                 "chunk {chunk_idx} length {actual} does not match manifest width {expected}"
-            ),
-            Self::AdoptShape { chunk_idx, len } => write!(
-                f,
-                "spool adoption refused: chunk {chunk_idx} (len {len}) is out of shape for this \
-                 backend — adopting a partial spool would silently roll back acked writes \
-                 (the 85e0298a class); the whole spool is rejected and preserved on disk"
             ),
             Self::InvariantViolation(m) => write!(f, "invariant violation: {m}"),
         }
@@ -1446,25 +1432,17 @@ impl ChunkedDiskBackend {
         }
     }
 
-    /// Shutdown-spool export (2026-07-16 session-85e0298a RCA): a
-    /// coherent snapshot of every un-uploaded chunk — dirty or claimed — and
-    /// the manifest ref they diverge from. Intended to run AFTER the
-    /// serve loop is dead (SIGTERM abandon), when the tiers are frozen.
+    /// Export every un-uploaded chunk, dirty or claimed, with the manifest
+    /// ref from which the chunks diverge. Capture and co-simulation use this
+    /// snapshot to model the current dirty-file state.
     ///
     /// The tier snapshot comes before the manifest ref. A chunk cleaned
     /// before the snapshot is already in the base. A chunk cleaned after
     /// the snapshot is exported redundantly, which is safe.
     ///
-    /// The copy order buys SELF-consistency only, not consistency with
-    /// the coordinator: a racing flush that rebases + publishes AFTER
-    /// our ref read leaves the export stamped one version BEHIND the
-    /// ref coord holds, and the successor's lineage gate refuses a
-    /// behind-stamped spool (2026-07-21 session-af28cac4 RCA — acked
-    /// writes rolled back under a live guest). The SIGTERM path
-    /// therefore aborts + reaps every in-flight final-flush task before
-    /// the abandon sweep calls this (see
-    /// `flush_nbd_data_planes_for_shutdown`); the copy order stays as
-    /// defense-in-depth.
+    /// The copy order provides a self-consistent snapshot. A chunk cleaned
+    /// after the snapshot can be exported again without harm because the
+    /// chunk store is content-addressed.
     pub async fn export_unflushed(&self) -> (ManifestRef, Vec<(usize, Vec<u8>)>) {
         let mut out = Vec::new();
         {
@@ -1483,7 +1461,7 @@ impl ChunkedDiskBackend {
                             path = %tier.path.display(),
                             chunk = chunk_idx,
                             %error,
-                            "shutdown export could not read a dirty-file chunk; the file stays in place for successor recovery",
+                            "dirty-file export could not read a chunk; the file stays in place for recovery",
                         );
                     }
                 }
@@ -1491,52 +1469,6 @@ impl ChunkedDiskBackend {
         }
         let manifest_ref = self.state.lock().await.manifest_ref;
         (manifest_ref, out)
-    }
-
-    /// Successor-side spool adoption: seed the dirty tier with the
-    /// predecessor's exported chunks so its acked-but-un-uploaded
-    /// writes survive the pod roll instead of being rolled back under
-    /// the live guest. Pokes the threshold notify so an installed
-    /// flush scheduler uploads promptly. Returns adopted bytes.
-    ///
-    /// ATOMIC: every chunk's shape is validated BEFORE anything lands in
-    /// the dirty tier, and one out-of-shape chunk rejects the whole
-    /// adoption (`AdoptShape`) with the tier untouched. The old behavior
-    /// (warn + skip the bad chunk, adopt the rest) silently rolled back
-    /// the skipped chunk's ACKED write — issue #810's trigger, surfaced
-    /// only by the verify-on-read last line. A spool from a different
-    /// lineage is still the CALLER's job to reject via the spool meta;
-    /// this is the last-line shape check, now loud instead of lossy.
-    pub async fn adopt_unflushed(
-        &self,
-        chunks: Vec<(usize, Vec<u8>)>,
-    ) -> Result<u64, DiskBackendError> {
-        for (idx, data) in &chunks {
-            let start = (*idx as u64).saturating_mul(self.chunk_size);
-            if start >= self.total_bytes || data.len() as u64 > self.chunk_size {
-                return Err(DiskBackendError::AdoptShape {
-                    chunk_idx: *idx,
-                    len: data.len(),
-                });
-            }
-        }
-        let mut adopted = 0u64;
-        {
-            let mut tier = self.dirty_tier.lock().await;
-            for (idx, data) in &chunks {
-                adopted += data.len() as u64;
-                tier.write_chunk(*idx, data, self.chunk_size)
-                    .map_err(|source| dirty_file_error("adopt chunk", &tier.path, source))?;
-            }
-            for (idx, _) in chunks {
-                tier.bump_generation(idx)?;
-                tier.dirty.insert(idx);
-            }
-        }
-        if adopted > 0 {
-            self.threshold_notify.notify_one();
-        }
-        Ok(adopted)
     }
 
     /// Flush dirty chunks to the chunk store and tick the manifest
@@ -2898,203 +2830,50 @@ mod tests {
         assert_eq!(successor.read(0, chunk_size).await.unwrap(), acked);
     }
 
+    #[cfg(target_os = "linux")]
     struct ProcessRecoveryContext {
         manifest: Manifest,
         cache_root: std::path::PathBuf,
         store: Arc<ChunkStore>,
     }
 
-    #[derive(Clone, Copy, Debug)]
-    enum SpoolCrashState {
-        Pristine,
-        TornChunk,
-        MissingMarker,
-        MissingChunk,
-        ForeignGarbage,
-    }
-
-    enum ProcessDeathState {
-        /// Dirty-file recovery needs exact extents (ext4), so these
-        /// two states are exercised on Linux only.
-        #[cfg(target_os = "linux")]
-        Intact,
-        #[cfg(target_os = "linux")]
-        WriteAfterFlushStarted {
-            offset: u64,
-            bytes: Vec<u8>,
-        },
-        Malformed,
-        Spool(SpoolCrashState),
-    }
-
+    #[cfg(target_os = "linux")]
     struct ProcessRecoveryOutcome {
         backend: ChunkedDiskBackend,
-        recovery: Result<(), String>,
     }
 
-    /// Simulate process death and recover from the dirty file or the
-    /// pre-upgrade spool fallback.
+    /// Simulate process death and recover from the dirty file. The death
+    /// lands mid-flush: a local flush claims the dirty set, then one more
+    /// write arrives before the process dies.
+    #[cfg(target_os = "linux")]
     async fn survive_process_death(
         backend: ChunkedDiskBackend,
         context: &ProcessRecoveryContext,
-        state: ProcessDeathState,
+        write_after_flush_started: (u64, Vec<u8>),
     ) -> ProcessRecoveryOutcome {
-        use crate::disk_daemon::spool;
+        let (offset, bytes) = write_after_flush_started;
+        let interrupted_flush = backend.flush_local().await.unwrap();
+        backend.write(offset, &bytes).await.unwrap();
+        let successor_ref = backend.manifest_ref().await;
+        let dirty_path = retain_dirty_path(&backend).await;
+        drop(interrupted_flush);
+        drop(backend);
 
-        #[cfg(target_os = "linux")]
-        let mut interrupted_flush = None;
-        #[cfg(target_os = "linux")]
-        let state = match state {
-            ProcessDeathState::WriteAfterFlushStarted { offset, bytes } => {
-                interrupted_flush = Some(backend.flush_local().await.unwrap());
-                backend.write(offset, &bytes).await.unwrap();
-                ProcessDeathState::Intact
-            }
-            state => state,
-        };
-        match state {
-            #[cfg(target_os = "linux")]
-            ProcessDeathState::Intact => {
-                let successor_ref = backend.manifest_ref().await;
-                let dirty_path = retain_dirty_path(&backend).await;
-                drop(interrupted_flush);
-                drop(backend);
-
-                let successor = ChunkedDiskBackend::from_manifest_with_dirty_file(
-                    successor_ref,
-                    &context.manifest,
-                    test_cache(
-                        context
-                            .cache_root
-                            .join(format!("process-recovery-{}", rand_suffix())),
-                    ),
-                    context.store.clone(),
-                    u64::MAX,
-                    dirty_path,
-                    DirtyFileOpenMode::Recover,
-                )
-                .unwrap();
-                ProcessRecoveryOutcome {
-                    backend: successor,
-                    recovery: Ok(()),
-                }
-            }
-            ProcessDeathState::Malformed | ProcessDeathState::Spool(_) => {
-                let (exported_ref, exported_chunks) = backend.export_unflushed().await;
-                let dirty_path = backend.dirty_tier.lock().await.path.clone();
-                let (spool_chunks, crash_state) = match state {
-                    ProcessDeathState::Malformed => (
-                        vec![
-                            (0, vec![0x33; 16]),
-                            (7, vec![0x11; 4096]),
-                            (
-                                1,
-                                vec![0x22; context.manifest.chunk_size.as_u64() as usize * 2],
-                            ),
-                        ],
-                        None,
-                    ),
-                    ProcessDeathState::Spool(crash_state) => (exported_chunks, Some(crash_state)),
-                    #[cfg(target_os = "linux")]
-                    ProcessDeathState::Intact
-                    | ProcessDeathState::WriteAfterFlushStarted { .. } => unreachable!(),
-                };
-                let sid = engram_core::SandboxId::new();
-                let spool_root = tempfile::tempdir().unwrap();
-                let root = spool_root.path();
-                let sandbox_dir = root.join(sid.to_string());
-                let written = spool::write_spool(
-                    &engram_host_core::TokioFs,
-                    root,
-                    sid,
-                    exported_ref,
-                    &spool_chunks,
-                )
-                .await
-                .map_err(|error| error.to_string());
-
-                if written.is_ok() {
-                    if let Some(crash_state) = crash_state {
-                        match crash_state {
-                            SpoolCrashState::Pristine => {}
-                            SpoolCrashState::TornChunk => {
-                                std::fs::write(sandbox_dir.join("chunk-0.bin"), [0x11; 100])
-                                    .unwrap();
-                            }
-                            SpoolCrashState::MissingMarker => {
-                                std::fs::remove_file(sandbox_dir.join("meta.json")).unwrap();
-                            }
-                            SpoolCrashState::MissingChunk => {
-                                std::fs::remove_file(sandbox_dir.join("chunk-2.bin")).unwrap();
-                            }
-                            SpoolCrashState::ForeignGarbage => {
-                                std::fs::write(
-                                    sandbox_dir.join("chunk-tmp.swp"),
-                                    b"editor droppings",
-                                )
-                                .unwrap();
-                                std::fs::write(
-                                    sandbox_dir.join("chunk-0.bin.partial"),
-                                    b"torn tmp",
-                                )
-                                .unwrap();
-                            }
-                        }
-                    }
-                }
-
-                let recovery_data = match written {
-                    Err(error) => Err(error),
-                    Ok(_) => match spool::read_spool(&engram_host_core::TokioFs, root, sid).await {
-                        Ok(Some((meta, chunks))) => Ok((
-                            ManifestRef {
-                                manifest_id: meta.manifest_id,
-                                version: meta.version,
-                            },
-                            chunks,
-                        )),
-                        Ok(None) => Err("recovery state is incomplete".into()),
-                        Err(error) => Err(error.to_string()),
-                    },
-                };
-
-                std::fs::remove_file(dirty_path).unwrap();
-                #[cfg(target_os = "linux")]
-                drop(interrupted_flush);
-                drop(backend);
-
-                let successor_ref = recovery_data
-                    .as_ref()
-                    .map(|(manifest_ref, _)| *manifest_ref)
-                    .unwrap_or(exported_ref);
-                let successor = ChunkedDiskBackend::new(
-                    successor_ref,
-                    &context.manifest,
-                    test_cache(
-                        context
-                            .cache_root
-                            .join(format!("process-recovery-{}", rand_suffix())),
-                    ),
-                    context.store.clone(),
-                    u64::MAX,
-                )
-                .unwrap();
-                let recovery = match recovery_data {
-                    Ok((_manifest_ref, chunks)) => successor
-                        .adopt_unflushed(chunks)
-                        .await
-                        .map(|_| ())
-                        .map_err(|error| error.to_string()),
-                    Err(error) => Err(error),
-                };
-                ProcessRecoveryOutcome {
-                    backend: successor,
-                    recovery,
-                }
-            }
-            #[cfg(target_os = "linux")]
-            ProcessDeathState::WriteAfterFlushStarted { .. } => unreachable!(),
-        }
+        let successor = ChunkedDiskBackend::from_manifest_with_dirty_file(
+            successor_ref,
+            &context.manifest,
+            test_cache(
+                context
+                    .cache_root
+                    .join(format!("process-recovery-{}", rand_suffix())),
+            ),
+            context.store.clone(),
+            u64::MAX,
+            dirty_path,
+            DirtyFileOpenMode::Recover,
+        )
+        .unwrap();
+        ProcessRecoveryOutcome { backend: successor }
     }
 
     #[tokio::test]
@@ -3171,128 +2950,13 @@ mod tests {
             .write(2 * chunk_size, &vec![0x33; chunk_size as usize])
             .await
             .unwrap();
-        let outcome = survive_process_death(
-            backend,
-            &context,
-            ProcessDeathState::WriteAfterFlushStarted {
-                offset: 0,
-                bytes: vec![0x22; chunk_size as usize],
-            },
-        )
-        .await;
-        outcome.recovery.unwrap();
-
+        let outcome =
+            survive_process_death(backend, &context, (0, vec![0x22; chunk_size as usize])).await;
         let mut expected = vec![0xaa; total as usize];
         expected[chunk_size as usize..(2 * chunk_size) as usize].fill(0xbb);
         expected[(2 * chunk_size) as usize..].fill(0x33);
         expected[..chunk_size as usize].fill(0x22);
         assert_eq!(outcome.backend.read(0, total).await.unwrap(), expected);
-    }
-
-    #[tokio::test]
-    async fn malformed_recovery_fails_loudly_and_atomically() {
-        let chunk_size = 4096u64;
-        let dir = tempfile::tempdir().unwrap();
-        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
-        let store = Arc::new(ChunkStore::new(blob));
-        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
-        let manifest = synth_manifest(chunk_size, chunk_size, vec![(0, h0)]);
-        let manifest_ref = ManifestRef::new();
-        store.put_manifest(manifest_ref, &manifest).await.unwrap();
-        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
-        cfg.budget_bytes = 64 * 1024 * 1024;
-        let backend = ChunkedDiskBackend::new(
-            manifest_ref,
-            &manifest,
-            ChunkCache::new(cfg),
-            store.clone(),
-            u64::MAX,
-        )
-        .unwrap();
-        let context = ProcessRecoveryContext {
-            manifest,
-            cache_root: dir.path().join("successor-cache"),
-            store,
-        };
-
-        let outcome = survive_process_death(backend, &context, ProcessDeathState::Malformed).await;
-        assert!(
-            outcome.recovery.is_err(),
-            "malformed recovery data must fail loudly"
-        );
-        assert_eq!(
-            outcome.backend.read(0, chunk_size).await.unwrap(),
-            vec![0xaa; chunk_size as usize],
-            "failed recovery must leave the base image unchanged"
-        );
-    }
-
-    /// ADR 0099 H5: each recoverable process-crash state reproduces the
-    /// complete acked disk. Every other state fails loudly.
-    #[tokio::test]
-    async fn acked_writes_never_silently_regress_across_process_crash_states() {
-        let chunk_size = 4096u64;
-        let total = 3 * chunk_size;
-        let dir = tempfile::tempdir().unwrap();
-        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
-        let store = Arc::new(ChunkStore::new(blob));
-        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
-        let h1 = put_chunk(&store, 0xbb, chunk_size as usize).await;
-        let h2 = put_chunk(&store, 0xcc, chunk_size as usize).await;
-        let manifest = synth_manifest(
-            total,
-            chunk_size,
-            vec![(0, h0), (chunk_size, h1), (2 * chunk_size, h2)],
-        );
-        let manifest_ref = ManifestRef::new();
-        store.put_manifest(manifest_ref, &manifest).await.unwrap();
-        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
-        cfg.budget_bytes = 64 * 1024 * 1024;
-        let context = ProcessRecoveryContext {
-            manifest: manifest.clone(),
-            cache_root: dir.path().join("successor-cache"),
-            store: store.clone(),
-        };
-        let mut expected = vec![0xaa; total as usize];
-        expected[chunk_size as usize..(2 * chunk_size) as usize].fill(0xbb);
-        expected[(2 * chunk_size) as usize..].fill(0x33);
-        expected[..chunk_size as usize].fill(0x11);
-
-        for (state, must_recover) in [
-            (SpoolCrashState::Pristine, true),
-            (SpoolCrashState::TornChunk, false),
-            (SpoolCrashState::MissingMarker, false),
-            (SpoolCrashState::MissingChunk, false),
-            (SpoolCrashState::ForeignGarbage, true),
-        ] {
-            let mut source_cfg =
-                ChunkCacheConfig::new(dir.path().join(format!("source-cache-{}", rand_suffix())));
-            source_cfg.budget_bytes = 64 * 1024 * 1024;
-            let source = ChunkedDiskBackend::new(
-                manifest_ref,
-                &manifest,
-                ChunkCache::new(source_cfg),
-                store.clone(),
-                u64::MAX,
-            )
-            .unwrap();
-            source.write(0, &[0x11; 4096]).await.unwrap();
-            source.write(2 * chunk_size, &[0x33; 4096]).await.unwrap();
-
-            let outcome =
-                survive_process_death(source, &context, ProcessDeathState::Spool(state)).await;
-            match outcome.recovery {
-                Ok(()) => assert_eq!(
-                    outcome.backend.read(0, total).await.unwrap(),
-                    expected,
-                    "recovery from {state:?} served stale or incomplete bytes"
-                ),
-                Err(error) => assert!(
-                    !must_recover,
-                    "recovery from {state:?} failed unexpectedly: {error}"
-                ),
-            }
-        }
     }
 
     /// Recovery keeps writes in chunks that an interrupted flush claimed.

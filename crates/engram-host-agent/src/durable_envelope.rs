@@ -1,40 +1,19 @@
-//! A content-hash envelope for the host-local durable JSON formats (ADR 0098
-//! Phase 3, R5 — the storage-fault model / "storage lies").
+//! A content-hash envelope for host-local durable JSON records (ADR 0098
+//! Phase 3, R5).
 //!
-//! `durable_record` (the `EvictionFinalizeRecord` / `CheckpointRecord` /
-//! `CaptureJobRecord` / `ChainHeadRecord` engine) and the shutdown-spool
-//! completeness marker are plain JSON. A byte-flip / bit-rot / lying fsync
-//! that leaves the JSON *syntactically valid* — a version bumped, a manifest
-//! ref altered, a stage advanced — is TRUSTED at load: the record parses, and
-//! a resume drives it as durable truth. That is the silent-corruption class
-//! this wave exists to close.
+//! A byte flip can leave JSON syntactically valid while it changes a version,
+//! a manifest ref, or a stage. The envelope wraps each record body in
+//! `{schema, content_hash, id, body}`:
 //!
-//! The envelope wraps the record body in `{schema, content_hash, id, body}`:
+//! - `content_hash` is a SHA-256 hash of the exact body bytes.
+//! - `id` binds the sealed bytes to the record path.
 //!
-//! * **`content_hash`** — sha256 over the EXACT `body` bytes. Catches bit-rot
-//!   and truncation: any mutation of the body fails the hash, so the corrupt
-//!   record is a LOUD reject (the caller's tolerant-skip / rollback arm),
-//!   never a trusted parse.
-//! * **`id`** — the record's identity (its filename stem for `durable_record`,
-//!   the `sandbox_id` for a spool). Verified against the id EXPECTED at the
-//!   path, so a MISDIRECTED read — a lying disk serving another slot's
-//!   validly-sealed bytes for this path — is caught (the hash alone cannot:
-//!   the other record is internally consistent).
+//! A hash or identity mismatch is a loud reject. The format is a clean break
+//! for host-local transient records. An old unwrapped record is malformed and
+//! can be derived again from the durable system state.
 //!
-//! This is a **clean-break format bump** (repo philosophy: no compat shim).
-//! These files are HOST-LOCAL transient state — written and read only by the
-//! same host's successor process through this crate's `load_all` / `read_spool`
-//! (no cross-host or cross-version reader; the coordinator holds PG rows, not
-//! these files), so an old un-enveloped file is simply rejected as malformed
-//! and re-derived. `schema` guards the format.
-//!
-//! **Residual (reported, NOT closed here):** a STALE read serving an EARLIER,
-//! validly-sealed version of the SAME id passes both checks — the envelope is
-//! internally consistent. Detecting that needs a monotonic write-generation
-//! bound cross-checked against durable state (a larger change; the spool's
-//! lineage version-gate partially covers it). The chunk-store manifest
-//! content-digest is a cross-system (GCS + coordinator) format and is likewise
-//! out of scope — see the PR body's design sketch.
+//! A stale read of an earlier valid version of the same id can still pass both
+//! checks. A monotonic generation bound would be necessary to detect it.
 
 use engram_chunk_store::ChunkHash;
 use serde::{Deserialize, Serialize};

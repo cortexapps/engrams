@@ -40,7 +40,6 @@ pub mod flush_scheduler;
 pub mod live_manifest_publisher;
 pub mod nbd;
 pub mod slot;
-pub mod spool;
 
 #[cfg(target_os = "linux")]
 pub mod nbd_kernel;

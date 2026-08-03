@@ -970,8 +970,6 @@ jobs:
             --test nbd_netlink_reconfigure \
             --test nbd_restore_cancel \
             --test nbd_shutdown_abandon_race \
-            --test nbd_shutdown_final_flush \
-            --test nbd_verify_on_read \
             --test nbd_proc_holder \
             --test nbd_connected_inventory \
             --run-ignored ignored-only \
