@@ -108,6 +108,7 @@ pub fn init(addr: SocketAddr) {
     // too. (Same rationale as the coordinator's pre-registration.)
     ::metrics::counter!(CHECKPOINT_CHAIN_POISONED_TOTAL).absolute(0);
     ::metrics::counter!(SPOOL_LINEAGE_MISMATCH_TOTAL).absolute(0);
+    ::metrics::counter!(SHUTDOWN_STAGE_PANIC_TOTAL).absolute(0);
 }
 
 // ─── metric name constants ────────────────────────────────────────
@@ -479,3 +480,10 @@ pub const REHYDRATE_UNKNOWN_DEVICE_TOTAL: &str = "engram_nbd_rehydrate_unknown_d
 /// (a bug) or acked guest writes are sitting unserved (an operator must
 /// reconcile).
 pub const SPOOL_LINEAGE_MISMATCH_TOTAL: &str = "engram_nbd_spool_lineage_mismatch_total";
+
+/// A SIGTERM shutdown-ladder stage panicked and was unwind-isolated (the
+/// ladder continued to the abandon sweep + spool export). Should stay at
+/// zero; non-zero means a shutdown rung has a bug — the 2026-08-02
+/// durability rollback started as exactly such a panic, silent in prod
+/// for 11 days. Alert on any increase.
+pub const SHUTDOWN_STAGE_PANIC_TOTAL: &str = "engram_host_shutdown_stage_panic_total";
