@@ -13,7 +13,8 @@
 //! better. VZ dev now pays full cold-boot (~1 s) per session;
 //! that's the explicit tradeoff.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -48,6 +49,63 @@ fn nbd_state_none() -> NbdStateSlot {
 }
 #[cfg(not(target_os = "linux"))]
 fn nbd_state_none() -> NbdStateSlot {}
+
+fn should_reap_dirty_entry(name: &str, live: &HashSet<SandboxId>) -> bool {
+    if name.starts_with(".pending-") {
+        return true;
+    }
+    let stem = name
+        .strip_suffix(".ref.tmp")
+        .or_else(|| name.strip_suffix(".cache"))
+        .or_else(|| name.strip_suffix(".ref"));
+    let Some(id) = stem.and_then(|stem| stem.parse::<SandboxId>().ok()) else {
+        return false;
+    };
+    !live.contains(&id)
+}
+
+fn sweep_dirty_root_at(root: &Path, live: &HashSet<SandboxId>) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(
+                path = %root.display(),
+                %error,
+                "dirty-root sweep could not read the directory",
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "dirty-root sweep could not read an entry");
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !should_reap_dirty_entry(name, live) {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                path = %path.display(),
+                "dirty-root sweep removed an unowned file",
+            ),
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                %error,
+                "dirty-root sweep could not remove a file",
+            ),
+        }
+    }
+}
 
 /// ADR 0039 item #19: bounded concurrency for the cold-restore memory
 /// chunk prefetch. Raised from 8 — single-stream GCS ~80 MB/s on the
@@ -4573,13 +4631,32 @@ impl PooledBackend {
         self
     }
 
-    #[cfg(target_os = "linux")]
     fn resolved_dirty_root(&self) -> Option<PathBuf> {
         self.dirty_root.clone().or_else(|| {
             self.chunk_cache
                 .as_ref()
                 .map(|cache| cache.root().join("dirty"))
         })
+    }
+
+    /// Run this after reattach and before coordinator registration.
+    /// The live set is complete, and no create or resume can race it.
+    /// Recovery only adopts files for VMs that survived reattach.
+    pub async fn sweep_dirty_root(&self) {
+        let Some(root) = self.resolved_dirty_root() else {
+            return;
+        };
+        let live: HashSet<SandboxId> = match self.inner.list().await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "dirty-root sweep: backend list failed; skipping",
+                );
+                return;
+            }
+        };
+        sweep_dirty_root_at(&root, &live);
     }
 
     #[cfg(target_os = "linux")]
@@ -10137,6 +10214,61 @@ mod tests {
     use crate::image_cache::ImageBundle;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_sandbox_process::ProcessBackend;
+
+    #[test]
+    fn dirty_sweep_classifies_entries_by_owner() {
+        let live_id = SandboxId::new();
+        let dead_id = SandboxId::new();
+        let live = HashSet::from([live_id]);
+
+        assert!(should_reap_dirty_entry(".pending-123-4.cache", &live));
+        assert!(!should_reap_dirty_entry(&format!("{live_id}.cache"), &live));
+        assert!(should_reap_dirty_entry(&format!("{dead_id}.cache"), &live));
+        assert!(should_reap_dirty_entry(&format!("{dead_id}.ref"), &live));
+        assert!(should_reap_dirty_entry(
+            &format!("{dead_id}.ref.tmp"),
+            &live
+        ));
+        assert!(!should_reap_dirty_entry("foo.txt", &live));
+        assert!(!should_reap_dirty_entry("not-a-uuid.cache", &live));
+    }
+
+    #[test]
+    fn dirty_sweep_removes_only_unowned_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let live_id = SandboxId::new();
+        let dead_id = SandboxId::new();
+        let live = HashSet::from([live_id]);
+        let names = [
+            format!("{live_id}.cache"),
+            format!("{live_id}.ref"),
+            format!("{dead_id}.cache"),
+            format!("{dead_id}.ref"),
+            format!("{dead_id}.ref.tmp"),
+            ".pending-123-4.cache".to_owned(),
+            "foo.txt".to_owned(),
+            "not-a-uuid.cache".to_owned(),
+        ];
+        for name in &names {
+            std::fs::write(dir.path().join(name), name).unwrap();
+        }
+
+        sweep_dirty_root_at(dir.path(), &live);
+
+        let remaining: HashSet<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(
+            remaining,
+            HashSet::from([
+                format!("{live_id}.cache"),
+                format!("{live_id}.ref"),
+                "foo.txt".to_owned(),
+                "not-a-uuid.cache".to_owned(),
+            ])
+        );
+    }
 
     /// 2026-08-02 durability-rollback RCA regression: a deadline overrun
     /// with a MIX of already-completed and still-running flush tasks

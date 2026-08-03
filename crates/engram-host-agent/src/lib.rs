@@ -356,6 +356,11 @@ impl HostAgent {
                 // (2026-07-13 incident: a survivor's evict capture ran
                 // 40+ minutes).
                 arc.rehydrate_chain_heads().await;
+                // ADR 0110: Reap files whose sandbox did not survive.
+                // Reap temporary files from dead processes.
+                // Run after reattach completes the live set.
+                // Run before registration can create or resume a sandbox.
+                arc.sweep_dirty_root().await;
                 arc
             };
             // ADR 0084 P1b: the capture-job executor + durable-record
