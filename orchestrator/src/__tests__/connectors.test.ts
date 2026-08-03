@@ -964,7 +964,7 @@ describe("buildProviderCatalog", () => {
   const reg = registryOf(datadogRaw, githubRaw); // datadog logs:read (GET); github issues:write (POST)
 
   test("derives a member-safe, secret-free catalog with read/write access", () => {
-    const cat = buildProviderCatalog(reg);
+    const cat = buildProviderCatalog(reg, new Map());
     expect(cat.map((e) => e.provider)).toEqual(["datadog", "github"]); // sorted
     const dd = cat.find((e) => e.provider === "datadog")!;
     expect(dd.credentialSource).toBe("inject");
@@ -978,7 +978,7 @@ describe("buildProviderCatalog", () => {
   });
 
   test("carries the asset kind for an asset-bearing op (from the on-disk seeds)", () => {
-    const cat = buildProviderCatalog(connectorRegistry());
+    const cat = buildProviderCatalog(connectorRegistry(), new Map());
     const gh = cat.find((e) => e.provider === "github")!;
     expect(gh.capabilities.find((c) => c.action === "pulls:write")).toEqual({
       action: "pulls:write",

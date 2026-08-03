@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use engram_core::types::integration::CredentialMintSource;
+use engram_core::types::integration::{CredentialMintSource, MetadataFlavor};
 use engram_core::SessionId;
 use parking_lot::RwLock;
 
@@ -52,8 +52,8 @@ pub struct SessionState {
     /// emits an `IntegrationAsset` (the side-effect ⟹ event invariant). An
     /// observe-only host (no secret, no inject) is MITM'd purely to observe.
     pub observes: Vec<ObserveEntry>,
-    /// Serve the metadata-compatible Google ADC endpoint for this session.
-    pub google_adc: bool,
+    /// Which cloud metadata service the host serves for this session, if any.
+    pub metadata_flavor: Option<MetadataFlavor>,
 }
 
 #[derive(Clone, Debug)]
@@ -615,7 +615,7 @@ mod tests {
                 fetchable: Some("$.resp.html_url".into()),
                 url_fallback: None,
             }],
-            google_adc: false,
+            metadata_flavor: None,
         }
     }
 

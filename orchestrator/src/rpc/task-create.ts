@@ -64,7 +64,13 @@ import {
   resolveIntegrationGrants,
   withConnectionMemo,
 } from "../integrations/grants.ts";
-import { appendGooglePolicy } from "../integrations/google-policy.ts";
+import {
+  compileProviderPolicy,
+  providerCliSurfaces,
+  providerGuestBundles,
+  providerGuestEnv,
+  providerMetadataFlavor,
+} from "../integrations/providers/index.ts";
 
 const log = rootLog.child({ component: "task" });
 
@@ -400,7 +406,6 @@ export async function compileSessionCreateInput(
       Code.FailedPrecondition,
     );
   }
-  const hasGoogleCloud = resolvedEffectiveGrants.some(({ connection }) => connection.provider === "gcp");
   const capabilities = grantsToCapabilities(resolvedEffectiveGrants);
   // A capability override is the complete session authority and therefore
   // also owns its CLI/tool surface. Without one, preserve the narrower
@@ -413,16 +418,12 @@ export async function compileSessionCreateInput(
     : grantsToCapabilities(await resolveIntegrationGrants(profile.integrationGrants, connections));
   const cliPlan = compileCliIntegrations(surfacedCapabilities, registry);
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
+  // Connector-backed CLIs, then the ones a named connection makes usable. The
+  // second list comes from the provider registry, so a new provider surfaces
+  // its CLI without a branch here.
   const enabledCli = [
     ...cliPlan.enabled,
-    ...(hasGoogleCloud
-      ? [{
-          provider: "gcp",
-          displayName: "Google Cloud",
-          bins: ["gcloud"],
-          doc: "Use brokered metadata ADC. Do not log in or create credentials.",
-        }]
-      : []),
+    ...providerCliSurfaces(resolvedEffectiveGrants),
   ];
   if (enabledCli.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(enabledCli);
   const toolManifest = compileToolManifest(
@@ -462,18 +463,13 @@ export async function compileSessionCreateInput(
   // ADR 0097: the browser bundle carries a local image-observation tool. It
   // is harness-native (not a connector capability) and is enabled only when
   // the corresponding skill is mounted into this session.
-  if (hasGoogleCloud) {
-    harness.GCE_METADATA_HOST = "169.254.169.254";
-    harness.GCE_METADATA_IP = "169.254.169.254";
-    // The Cloud SDK uses GCE_METADATA_ROOT while google-auth uses
-    // GCE_METADATA_HOST. Point both clients at the session-local emulator.
-    harness.GCE_METADATA_ROOT = "169.254.169.254";
-    harness.CLOUDSDK_CORE_CHECK_GCE_METADATA = "true";
-  }
+  // Where a guest looks for each present provider's credential. The values
+  // come from the provider itself, so a new one needs no branch here.
+  Object.assign(harness, providerGuestEnv(resolvedEffectiveGrants));
   const selectedSkills = [...new Set([
     ...profile.skills,
     ...cliPlan.bundles,
-    ...(hasGoogleCloud ? ["integrations-cli"] : []),
+    ...providerGuestBundles(resolvedEffectiveGrants),
   ])];
   if (selectedSkills.includes("browser")) harness.ENGRAM_BROWSER_VIEW_ENABLED = "1";
   else delete harness.ENGRAM_BROWSER_VIEW_ENABLED;
@@ -511,8 +507,10 @@ export async function compileSessionCreateInput(
     };
     policy.secrets.push(secret);
   }
-  appendGooglePolicy(policy, resolvedEffectiveGrants);
-  policy.google_adc = hasGoogleCloud;
+  compileProviderPolicy(policy, resolvedEffectiveGrants);
+  // The host proxy serves a metadata endpoint only for a provider that
+  // delivers its credential that way.
+  policy.metadata_flavor = providerMetadataFlavor(resolvedEffectiveGrants) ?? null;
   // ADR 0063 B4: a programmatic task (cron / Slack / API) authenticates the
   // harness with the ORG credential, not a per-user token. The org-secret value
   // never leaves the coordinator (ADR 0057), so we can't read it here — instead

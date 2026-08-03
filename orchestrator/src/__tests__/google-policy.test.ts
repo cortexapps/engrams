@@ -7,16 +7,14 @@ import {
   appendGooglePolicy,
   validateGoogleGrants,
   CURATED_GOOGLE_OPERATIONS,
+  FORBIDDEN_GOOGLE_OPERATIONS,
   GOOGLE_PASSTHROUGH_OPERATIONS,
 } from "../integrations/google-policy.ts";
-import {
-  FORBIDDEN_GOOGLE_OPERATIONS,
-  resolveIntegrationGrants,
-} from "../integrations/grants.ts";
+import { resolveIntegrationGrants } from "../integrations/grants.ts";
 import type { ResolvedIntegrationGrant } from "../integrations/grants.ts";
 
 function policy(): IntegrationPolicyJson {
-  return { network: { default: "deny", allow_hosts: [], allow_host_patterns: [] }, secrets: [], injects: [], observes: [], google_adc: false };
+  return { network: { default: "deny", allow_hosts: [], allow_host_patterns: [] }, secrets: [], injects: [], observes: [], metadata_flavor: null };
 }
 
 function grant(

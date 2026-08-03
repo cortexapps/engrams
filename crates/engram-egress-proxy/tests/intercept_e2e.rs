@@ -356,7 +356,7 @@ async fn violation_returned_when_placeholder_targets_disallowed_host() {
             fetchable: None,
             url_fallback: None,
         }],
-        google_adc: false,
+        metadata_flavor: None,
     };
     let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
     let proxy_task = tokio::spawn(async move {

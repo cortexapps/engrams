@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::types::integration::MetadataFlavor;
 use engram_core::types::sandbox::{
     AgentSpec, CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec,
 };
@@ -433,7 +434,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         secrets: vec![secret],
         injects: Vec::new(),
         observes: Vec::new(),
-        google_adc: true,
+        metadata_flavor: Some(MetadataFlavor::Gce),
     });
 
     // PID-1's env doesn't carry a PATH; child execs need one to

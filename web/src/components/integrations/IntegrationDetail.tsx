@@ -39,7 +39,6 @@ import { AccessTag, HostChip, StatusDot } from "./chips";
 import { ReplaceCredentialSheet } from "./ReplaceCredentialSheet";
 import { useConnectorViews, type ConnectorView } from "./useConnectorViews";
 import { GoogleCloudConnections } from "./GoogleCloudConnections";
-import { GOOGLE_CLOUD_PROVIDER } from "./googleCloud";
 
 export function IntegrationDetail() {
   const { provider } = useParams({ strict: false }) as { provider?: string };
@@ -69,7 +68,9 @@ export function IntegrationDetail() {
       </div>
     );
   }
-  if (view.provider === GOOGLE_CLOUD_PROVIDER) {
+  // A named-connection provider lists its connections instead of a single
+  // org-wide credential. The catalog says which model applies.
+  if (view.connectionModel === "named") {
     return (
       <div className="mx-auto flex max-w-3xl flex-col gap-4">
         <BackLink />

@@ -49,11 +49,33 @@ pub struct IntegrationPolicy {
     /// the proxy substitutes only on its `allow_hosts`.
     #[serde(default)]
     pub secrets: Vec<IntegrationSecret>,
-    /// Enable the session-local Google metadata-compatible ADC endpoint. The
-    /// host egress proxy serves the endpoint; the guest receives no Google
-    /// credential.
+    /// Which cloud metadata service the session-local endpoint should imitate,
+    /// or `None` for a session that needs none. The host egress proxy serves
+    /// the endpoint; the guest receives no cloud credential from it, only a
+    /// placeholder the proxy substitutes on the wire.
+    ///
+    /// `#[serde(default)]` so a policy stored before this field — including one
+    /// that set the old `google_adc` boolean — decodes as `None`. That is the
+    /// safe direction: the session keeps running and simply has no metadata
+    /// endpoint until it is created again.
     #[serde(default)]
-    pub google_adc: bool,
+    pub metadata_flavor: Option<MetadataFlavor>,
+}
+
+/// A cloud metadata service the host proxy can imitate for a session.
+///
+/// ADR 0109 shipped this as a `google_adc: bool` on the wire, which made
+/// "does this session need a metadata endpoint?" and "is it Google's?" the same
+/// question. A second provider would have had to add a second boolean, and the
+/// proxy would have had to decide which one wins. An enum makes the answer one
+/// value, and a wildcard-free `match` on it makes a new variant a compile error
+/// at every site that has to handle one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataFlavor {
+    /// Google Compute Engine's metadata server, which the Cloud SDK and every
+    /// Google auth library probe for Application Default Credentials.
+    Gce,
 }
 
 /// Host-side authority used to mint a short-lived credential for one inject.

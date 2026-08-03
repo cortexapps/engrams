@@ -15,6 +15,12 @@ import type { ResolvedIntegrationGrant } from "./grants.ts";
  */
 export interface GoogleOperationPolicy {
   host: string;
+  /** Operator-facing name. Served through the integration catalog, so the web
+   * does not keep its own copy of this table. */
+  label: string;
+  /** Whether granting this lets a session CHANGE something. Derived from the
+   * REST verbs below and asserted against them by the catalog-sync test. */
+  access: "read" | "write";
   /** REST surface: these methods bind to these path globs only. Resource
    * constraints narrow these paths. */
   rest: { methods: string[]; paths: string[] };
@@ -39,24 +45,32 @@ export interface GoogleOperationPolicy {
 export const CURATED_GOOGLE_OPERATIONS: Record<string, GoogleOperationPolicy> = {
   "compute.instances.get": {
     host: "compute.googleapis.com",
+    label: "Describe Compute Engine instances",
+    access: "read",
     rest: { methods: ["GET"], paths: ["/compute/v1/projects/*/zones/*/instances/*"] },
     grpcPaths: [],
     constraint: /^\/compute\/v1\/projects\/[^/]+\/zones\/[^/]+\/instances\/[^/]+$/,
   },
   "compute.instances.start": {
     host: "compute.googleapis.com",
+    label: "Start Compute Engine instances",
+    access: "write",
     rest: { methods: ["POST"], paths: ["/compute/v1/projects/*/zones/*/instances/*/start"] },
     grpcPaths: [],
     constraint: /^\/compute\/v1\/projects\/[^/]+\/zones\/[^/]+\/instances\/[^/]+\/start$/,
   },
   "compute.instances.stop": {
     host: "compute.googleapis.com",
+    label: "Stop Compute Engine instances",
+    access: "write",
     rest: { methods: ["POST"], paths: ["/compute/v1/projects/*/zones/*/instances/*/stop"] },
     grpcPaths: [],
     constraint: /^\/compute\/v1\/projects\/[^/]+\/zones\/[^/]+\/instances\/[^/]+\/stop$/,
   },
   "logging.entries.list": {
     host: "logging.googleapis.com",
+    label: "Read Cloud Logging entries",
+    access: "read",
     // The Logging REST list endpoint is POST by API design.
     rest: { methods: ["POST"], paths: ["/v2/entries:list"] },
     grpcPaths: ["/google.logging.v2.LoggingServiceV2/ListLogEntries"],
@@ -65,36 +79,48 @@ export const CURATED_GOOGLE_OPERATIONS: Record<string, GoogleOperationPolicy> = 
   },
   "trace.traces.list": {
     host: "cloudtrace.googleapis.com",
+    label: "List Cloud Trace traces",
+    access: "read",
     rest: { methods: ["GET"], paths: ["/v1/projects/*/traces"] },
     grpcPaths: [],
     constraint: /^\/v1\/projects\/[^/]+\/traces$/,
   },
   "trace.traces.get": {
     host: "cloudtrace.googleapis.com",
+    label: "Read Cloud Trace details",
+    access: "read",
     rest: { methods: ["GET"], paths: ["/v1/projects/*/traces/*"] },
     grpcPaths: [],
     constraint: /^\/v1\/projects\/[^/]+\/traces\/[^/]+$/,
   },
   "monitoring.metricdescriptors.list": {
     host: "monitoring.googleapis.com",
+    label: "List Cloud Monitoring metric descriptors",
+    access: "read",
     rest: { methods: ["GET"], paths: ["/v3/projects/*/metricDescriptors"] },
     grpcPaths: ["/google.monitoring.v3.MetricService/ListMetricDescriptors"],
     constraint: /^\/v3\/projects\/[^/]+\/metricDescriptors$/,
   },
   "monitoring.timeseries.list": {
     host: "monitoring.googleapis.com",
+    label: "Read Cloud Monitoring time series",
+    access: "read",
     rest: { methods: ["GET"], paths: ["/v3/projects/*/timeSeries"] },
     grpcPaths: ["/google.monitoring.v3.MetricService/ListTimeSeries"],
     constraint: /^\/v3\/projects\/[^/]+\/timeSeries$/,
   },
   "container.clusters.get": {
     host: "container.googleapis.com",
+    label: "Get GKE cluster credentials",
+    access: "read",
     rest: { methods: ["GET"], paths: ["/v1/projects/*/locations/*/clusters/*"] },
     grpcPaths: [],
     constraint: /^\/v1\/projects\/[^/]+\/locations\/[^/]+\/clusters\/[^/]+$/,
   },
   "iap.tunnel": {
     host: "tunnel.cloudproxy.app",
+    label: "Open IAP tunnels",
+    access: "write",
     // The IAP tunnel endpoint upgrades a GET and accepts POST control frames.
     // Both verbs address the same non-REST endpoint, so one entry is correct.
     rest: { methods: ["GET", "POST"], paths: ["/v4/connect*"] },
@@ -104,7 +130,45 @@ export const CURATED_GOOGLE_OPERATIONS: Record<string, GoogleOperationPolicy> = 
 };
 
 /** The broad pass-through operations that take free-form path constraints. */
+/**
+ * Credential-producing Google operations, refused at GRANT time.
+ *
+ * The egress proxy refuses the same surfaces again at request time from its own
+ * checked-in table (`crates/engram-egress-proxy/policy/`). Two independent
+ * enforcement points on purpose: this one keeps an unusable grant out of the
+ * database, and that one holds even if a grant somehow reaches a session.
+ */
+export const FORBIDDEN_GOOGLE_OPERATIONS: ReadonlySet<string> = new Set([
+  "iam.serviceaccountkeys.create",
+  "iam.generateaccesstoken",
+  "iam.generateidtoken",
+  "iam.signblob",
+  "iam.signjwt",
+]);
+
 export const GOOGLE_PASSTHROUGH_OPERATIONS = ["api.call", "gke.api.call"] as const;
+
+/**
+ * The two endpoint-driven operations. They have no fixed host — their reach is
+ * whatever the connection's endpoint list allows — so the catalog describes
+ * which KIND of endpoint each one needs, and the editor offers it only when
+ * the connection has one.
+ */
+export const GOOGLE_PASSTHROUGH_CATALOG: Record<
+  (typeof GOOGLE_PASSTHROUGH_OPERATIONS)[number],
+  { label: string; access: "read" | "write"; endpoint: "google-api" | "non-google-api" }
+> = {
+  "api.call": {
+    label: "Call configured Google APIs",
+    access: "write",
+    endpoint: "google-api",
+  },
+  "gke.api.call": {
+    label: "Call the configured GKE API server",
+    access: "write",
+    endpoint: "non-google-api",
+  },
+};
 
 function isPassthroughOperation(operation: string): boolean {
   return (GOOGLE_PASSTHROUGH_OPERATIONS as readonly string[]).includes(operation);
@@ -207,10 +271,12 @@ function matchersOverlap(a: IntegrationInjectJson, b: IntegrationInjectJson): bo
  * admin edits) never blocks unrelated edits of a granting profile. Connection
  * STATE (enabled, endpoint membership, config validity) is enforced at
  * session-create by `appendGooglePolicy`.
+ *
+ * Reached through the provider registry, which passes only the grants whose
+ * connection is Google — hence no provider test in the loop.
  */
 export function validateGoogleGrants(resolved: readonly ResolvedIntegrationGrant[]): void {
-  for (const { grant, connection } of resolved) {
-    if (connection.provider !== "gcp") continue;
+  for (const { grant } of resolved) {
     const curated = CURATED_GOOGLE_OPERATIONS[grant.operation];
     if (!curated && !isPassthroughOperation(grant.operation)) {
       throw new ConnectError(
@@ -239,7 +305,6 @@ export function appendGooglePolicy(
 ): void {
   validateGoogleGrants(resolved);
   for (const { grant, connection } of resolved) {
-    if (connection.provider !== "gcp") continue;
     if (!connection.enabled) {
       throw new ConnectError(
         `Google Cloud connection "${connection.alias}" is disabled`,

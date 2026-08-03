@@ -29,6 +29,7 @@ use std::collections::HashMap;
 
 use engram_core::traits::SessionFence;
 use engram_core::types::integration::CredentialMintSource;
+use engram_core::types::integration::MetadataFlavor;
 use engram_core::types::sandbox::AgentSpec;
 use engram_core::types::session::{SessionSpec, SessionState};
 use engram_core::types::BindingDisposition;
@@ -335,9 +336,9 @@ pub(crate) async fn boot_on_reserved_host(
         secrets: egress_secrets,
         injects,
         observes,
-        google_adc: integration_policy
+        metadata_flavor: integration_policy
             .as_ref()
-            .is_some_and(|policy| policy.google_adc),
+            .and_then(|policy| policy.metadata_flavor),
     };
     let egress_policy =
         assemble_egress_policy(state, session_id, sandbox_id, &network, resolved_policy).await;
@@ -420,9 +421,9 @@ pub(crate) async fn boot_on_reserved_host(
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            google_adc: integration_policy
+            metadata_flavor: integration_policy
                 .as_ref()
-                .is_some_and(|policy| policy.google_adc),
+                .and_then(|policy| policy.metadata_flavor),
             // ADR 0057: vestigial wire field; substitution is per-entry.
             secret_mode: engram_core::types::image::SecretMode::Broker,
         }
@@ -560,7 +561,7 @@ struct ResolvedEgressPolicy {
     secrets: Vec<engram_core::types::egress::EgressSecretEntry>,
     injects: Vec<engram_core::types::egress::EgressInjectEntry>,
     observes: Vec<engram_core::types::egress::EgressObserveEntry>,
-    google_adc: bool,
+    metadata_flavor: Option<MetadataFlavor>,
 }
 
 async fn assemble_egress_policy(
@@ -583,7 +584,7 @@ async fn assemble_egress_policy(
         secrets: resolved.secrets,
         injects: resolved.injects,
         observes: resolved.observes,
-        google_adc: resolved.google_adc,
+        metadata_flavor: resolved.metadata_flavor,
         // ADR 0057: per-secret mode replaces a session-level mode; the proxy
         // substitutes per `EgressSecretEntry`. Kept Broker for the (vestigial)
         // wire field — substitution is driven by the entries, not this flag.
@@ -642,7 +643,7 @@ pub(crate) fn assemble_capture_egress_policy(
         secrets: Vec::new(),
         injects: Vec::new(),
         observes: Vec::new(),
-        google_adc: false,
+        metadata_flavor: None,
         secret_mode: engram_core::types::image::SecretMode::Literal,
     })
 }

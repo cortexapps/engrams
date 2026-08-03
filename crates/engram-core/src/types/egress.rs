@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::types::image::SecretMode;
-use crate::types::integration::CredentialMintSource;
+use crate::types::integration::{CredentialMintSource, MetadataFlavor};
 use crate::{SandboxId, SessionId};
 
 /// Per-session egress policy the host-agent's proxy registers
@@ -57,10 +57,11 @@ pub struct SessionEgressPolicy {
     /// request's real response. `#[serde(default)]` so older policies decode.
     #[serde(default)]
     pub observes: Vec<EgressObserveEntry>,
-    /// Whether this session can use the host-side Google metadata-compatible
-    /// ADC endpoint. The endpoint returns only an opaque placeholder token.
+    /// Which cloud metadata service the host serves for this session, if any.
+    /// The endpoint returns only an opaque placeholder token; the proxy
+    /// substitutes the real credential on the wire.
     #[serde(default)]
-    pub google_adc: bool,
+    pub metadata_flavor: Option<MetadataFlavor>,
     /// Image's secret delivery mode. The proxy uses this to decide
     /// whether to MITM (`Broker`) or just SNI-filter (`Literal`).
     pub secret_mode: SecretMode,

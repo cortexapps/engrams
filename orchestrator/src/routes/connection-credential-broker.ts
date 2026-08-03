@@ -15,10 +15,29 @@ import {
   type ProfileIntegrationGrant,
 } from "../db/schema.ts";
 import { errorMessage, log as rootLog } from "../log.ts";
-import { assertGoogleCloudConfig, makeGoogleWifBroker } from "../integrations/google-wif.ts";
+import type { makeGoogleWifBroker } from "../integrations/google-wif.ts";
+import { makeGoogleProvider } from "../integrations/providers/google.ts";
+import {
+  connectionProviders,
+  makeConnectionProviders,
+  type ConnectionProvider,
+  type ProviderConnection,
+} from "../integrations/providers/index.ts";
 import { integrationSnapshotHash } from "../integrations/grants.ts";
 import { googleOidcIssuer } from "./google-oidc.ts";
 import { sessions as controlPlaneSessions } from "../control-plane/client.ts";
+
+/**
+ * The identity a credential acts as, for the audit record. Provider-supplied:
+ * the broker must not know that Google calls it a service account.
+ */
+function auditIdentity(
+  providers: ReadonlyMap<string, ConnectionProvider>,
+  connection: ProviderConnection | null | undefined,
+): string | undefined {
+  if (!connection) return undefined;
+  return providers.get(connection.provider)?.auditIdentity(connection);
+}
 
 interface BrokerRequest {
   sessionId: string;
@@ -85,6 +104,8 @@ export function makeConnectionCredentialBrokerRoute(deps: {
   /** Deployment identity emitted as the `engrams_organization` claim. */
   organizationId?: string;
   exchange?: ReturnType<typeof makeGoogleWifBroker>["exchange"];
+  /** Override the whole provider registry (a suite with its own providers). */
+  providers?: ReadonlyMap<string, ConnectionProvider>;
   sessions?: CredentialBrokerSessionStore;
   sessionStatus?: SessionStatusProbe;
 } = {}): Hono {
@@ -96,11 +117,12 @@ export function makeConnectionCredentialBrokerRoute(deps: {
   const now = deps.now ?? (() => new Date());
   const issuer = deps.issuer ?? googleOidcIssuer();
   const organizationId = deps.organizationId ?? config.deploymentId;
-  const exchange = deps.exchange ?? makeGoogleWifBroker({
-    keys: makeIntegrationOidcKeyStore(db),
-    issuer,
-    now,
-  }).exchange;
+  // Minting is the provider's job. The broker owns what is provider-NEUTRAL:
+  // authorization, session lifetime, the token cache, and the audit record.
+  const providers = deps.providers ??
+    (deps.exchange
+      ? makeConnectionProviders([makeGoogleProvider({ exchange: deps.exchange })])
+      : connectionProviders());
   const sessions = deps.sessions ?? {
     async get(sessionId: string): Promise<CredentialBrokerSession | null> {
       const rows = await db.select({
@@ -164,10 +186,10 @@ export function makeConnectionCredentialBrokerRoute(deps: {
         evictSession(request.sessionId);
         return c.json({ error: "forbidden" }, 403);
       }
-      if (connection.provider !== "gcp") {
+      const provider = providers.get(connection.provider);
+      if (!provider) {
         return c.json({ error: "connection provider does not support remote minting" }, 400);
       }
-      const google = assertGoogleCloudConfig(connection.config);
 
       const cacheKey = `${request.sessionId}:${request.connectionId}`;
       const requestTime = now();
@@ -185,13 +207,14 @@ export function makeConnectionCredentialBrokerRoute(deps: {
         token = undefined;
       }
       if (!token || token.expiresAt.getTime() - requestTime.getTime() < 60_000) {
-        token = await exchange(google, {
+        const minted = await provider.mint(connection, {
           sessionId: request.sessionId,
           organizationId,
           connectionId: request.connectionId,
           userId: principalId,
           profileSnapshotId,
         });
+        token = { accessToken: minted.token, expiresAt: minted.expiresAt };
         cache.set(cacheKey, token);
       }
       outcome = "allowed";
@@ -207,9 +230,7 @@ export function makeConnectionCredentialBrokerRoute(deps: {
         sessionId: request.sessionId,
         profileSnapshotId,
         connectionId: request.connectionId,
-        serviceAccount: connection?.provider === "gcp"
-          ? (connection.config.serviceAccountEmail as string | undefined)
-          : undefined,
+        identity: auditIdentity(providers, connection),
         outcome,
         error: errorMessage(error),
       }, "connection credential mint failed");
@@ -221,9 +242,7 @@ export function makeConnectionCredentialBrokerRoute(deps: {
           sessionId: request.sessionId,
           profileSnapshotId,
           connectionId: request.connectionId,
-          serviceAccount: connection?.provider === "gcp"
-            ? (connection.config.serviceAccountEmail as string | undefined)
-            : undefined,
+          identity: auditIdentity(providers, connection),
           outcome,
         }, "connection credential mint");
       }

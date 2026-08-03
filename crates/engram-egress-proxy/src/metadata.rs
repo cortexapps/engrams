@@ -1,14 +1,25 @@
-//! Session-scoped Google metadata-compatible ADC endpoint.
+//! Session-scoped cloud metadata endpoint.
 //!
-//! The endpoint returns only a fixed placeholder access token. Google API
-//! requests still pass through the normal egress policy, which overwrites the
-//! guest Authorization header with the host-held credential.
+//! A cloud SDK inside the guest looks for its credential on a well-known
+//! link-local address. The host answers there instead, with a fixed
+//! PLACEHOLDER token — the guest never holds a real credential. The request
+//! the guest then makes still passes through the normal egress policy, which
+//! replaces that placeholder with the host-held credential on the wire.
+//!
+//! Which service is imitated is a [`MetadataFlavor`], not a boolean. Address
+//! steering, the authorization check and the request framing are shared; a
+//! flavor supplies only `authorize` (what proves the caller expects THIS
+//! service) and `respond` (its attribute tree). The dispatch is a
+//! wildcard-free `match`, so a second cloud is a compile error here rather
+//! than a silently unserved session.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+use engram_core::types::integration::MetadataFlavor;
 
 use crate::Registry;
 
@@ -32,14 +43,22 @@ async fn serve_connection(
     peer: SocketAddr,
     registry: &Registry,
 ) -> std::io::Result<()> {
-    let authorized = match peer.ip() {
-        std::net::IpAddr::V4(ip) => session_allows_metadata(registry, ip),
-        std::net::IpAddr::V6(_) => false,
+    let flavor = match peer.ip() {
+        std::net::IpAddr::V4(ip) => session_metadata_flavor(registry, ip),
+        std::net::IpAddr::V6(_) => None,
     };
-    if !authorized {
-        write_response(&mut stream, "403 Forbidden", "text/plain", "forbidden").await?;
+    let Some(service) = flavor.map(service_for) else {
+        // No session, or a session that asked for no metadata service.
+        write_response(
+            &mut stream,
+            ("Metadata-Flavor", "Google"),
+            "403 Forbidden",
+            "text/plain",
+            "forbidden",
+        )
+        .await?;
         return stream.shutdown().await;
-    }
+    };
 
     let mut request = Vec::with_capacity(1024);
     while request.len() < MAX_REQUEST_BYTES {
@@ -58,39 +77,96 @@ async fn serve_connection(
     let mut request_line = lines.next().unwrap_or_default().split_ascii_whitespace();
     let method = request_line.next().unwrap_or_default();
     let target = request_line.next().unwrap_or_default();
-    let metadata_flavor = lines.any(|line| {
-        line.split_once(':').is_some_and(|(name, value)| {
-            name.eq_ignore_ascii_case("metadata-flavor") && value.trim() == "Google"
-        })
-    });
-    let (status, content_type, body) = response(method, target, metadata_flavor);
-    write_response(&mut stream, status, content_type, &body).await?;
+    let headers: Vec<(&str, &str)> = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim(), value.trim()))
+        .collect();
+    let (status, content_type, body) = respond(service, method, target, &headers);
+    write_response(
+        &mut stream,
+        service.response_header(),
+        status,
+        content_type,
+        &body,
+    )
+    .await?;
     stream.shutdown().await
 }
 
-fn session_allows_metadata(registry: &Registry, guest_ip: std::net::Ipv4Addr) -> bool {
-    registry
-        .lookup(guest_ip)
-        .is_some_and(|state| state.google_adc)
+/// The flavor this guest's session asked for, or `None` when it asked for none.
+fn session_metadata_flavor(
+    registry: &Registry,
+    guest_ip: std::net::Ipv4Addr,
+) -> Option<MetadataFlavor> {
+    registry.lookup(guest_ip)?.metadata_flavor
+}
+
+/// One cloud's metadata service.
+pub trait MetadataService: Send + Sync {
+    /// Does this request carry the proof-of-intent header the real service
+    /// demands? It is what stops a browser or a confused-deputy fetch from
+    /// reading the attribute tree.
+    fn authorize(&self, headers: &[(&str, &str)]) -> bool;
+
+    /// The header every response carries, so a client can tell it reached the
+    /// service it expected.
+    fn response_header(&self) -> (&'static str, &'static str);
+
+    /// Answer one authorized `GET` for `path` with `query`.
+    fn respond(&self, path: &str, query: &str) -> (&'static str, &'static str, String);
+}
+
+/// Resolve a flavor to its implementation.
+///
+/// Wildcard-free on purpose: a new [`MetadataFlavor`] variant must be given a
+/// service here or this does not compile.
+fn service_for(flavor: MetadataFlavor) -> &'static (dyn MetadataService + Send + Sync) {
+    match flavor {
+        MetadataFlavor::Gce => &GceMetadata,
+    }
+}
+
+/// Google Compute Engine's metadata server.
+struct GceMetadata;
+
+impl MetadataService for GceMetadata {
+    fn authorize(&self, headers: &[(&str, &str)]) -> bool {
+        headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("metadata-flavor") && *value == "Google")
+    }
+
+    fn response_header(&self) -> (&'static str, &'static str) {
+        ("Metadata-Flavor", "Google")
+    }
+
+    fn respond(&self, path: &str, query: &str) -> (&'static str, &'static str, String) {
+        gce_response(path, query)
+    }
 }
 
 async fn write_response(
     stream: &mut TcpStream,
+    service_header: (&str, &str),
     status: &str,
     content_type: &str,
     body: &str,
 ) -> std::io::Result<()> {
+    let (header_name, header_value) = service_header;
     let response = format!(
-        "HTTP/1.1 {status}\r\nMetadata-Flavor: Google\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\n{header_name}: {header_value}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len(),
     );
     stream.write_all(response.as_bytes()).await
 }
 
-fn response(
+/// The provider-neutral gate: read-only, and only for a caller that proved it
+/// meant to reach a metadata service.
+fn respond(
+    service: &(dyn MetadataService + Send + Sync),
     method: &str,
     target: &str,
-    metadata_flavor: bool,
+    headers: &[(&str, &str)],
 ) -> (&'static str, &'static str, String) {
     if method != "GET" {
         return (
@@ -99,16 +175,22 @@ fn response(
             "method not allowed".into(),
         );
     }
-    if !metadata_flavor {
+    if !service.authorize(headers) {
+        let (name, value) = service.response_header();
         return (
             "403 Forbidden",
             "text/plain",
-            "Metadata-Flavor: Google is required".into(),
+            format!("{name}: {value} is required"),
         );
     }
     let (path, query) = target
         .split_once('?')
         .map_or((target, ""), |(path, query)| (path, query));
+    service.respond(path, query)
+}
+
+/// Google Compute Engine's attribute tree.
+fn gce_response(path: &str, query: &str) -> (&'static str, &'static str, String) {
     let text = |value: &str| ("200 OK", "text/plain", value.to_string());
     match path {
         "/" | "/computeMetadata/v1/" => text("instance/\nproject/\n"),
@@ -164,6 +246,24 @@ mod tests {
     use crate::{HostList, SessionState};
     use engram_core::SessionId;
 
+    /// Drive the real dispatch: pick the service for a flavor, then run the
+    /// shared method/authorize gate. `flavored` says whether the caller sent
+    /// the proof-of-intent header the service demands.
+    fn response(
+        method: &str,
+        target: &str,
+        flavored: bool,
+    ) -> (&'static str, &'static str, String) {
+        let service = service_for(MetadataFlavor::Gce);
+        let (name, value) = service.response_header();
+        let headers: Vec<(&str, &str)> = if flavored {
+            vec![(name, value)]
+        } else {
+            Vec::new()
+        };
+        respond(service, method, target, &headers)
+    }
+
     #[test]
     fn token_is_only_a_placeholder() {
         let (_, content_type, body) = response(
@@ -174,6 +274,37 @@ mod tests {
         assert_eq!(content_type, "application/json");
         assert!(body.contains(PLACEHOLDER_TOKEN));
         assert!(!body.contains("ya29."));
+    }
+
+    #[test]
+    fn a_session_with_no_flavor_is_served_nothing() {
+        // The endpoint is per-session. A session that asked for no metadata
+        // service must not reach another flavor's attribute tree just because
+        // the listener is bound.
+        let registry = Registry::new();
+        let guest_ip: std::net::Ipv4Addr = "10.200.0.9".parse().unwrap();
+        assert!(session_metadata_flavor(&registry, guest_ip).is_none());
+    }
+
+    fn assert_service_is_well_formed(flavor: MetadataFlavor) {
+        let service = service_for(flavor);
+        let (name, value) = service.response_header();
+        assert!(!name.is_empty() && !value.is_empty(), "{flavor:?}");
+        // The proof-of-intent header is exactly the one the service names, and
+        // nothing else opens the attribute tree.
+        assert!(service.authorize(&[(name, value)]), "{flavor:?}");
+        assert!(!service.authorize(&[]), "{flavor:?}");
+        assert!(!service.authorize(&[(name, "wrong")]), "{flavor:?}");
+    }
+
+    #[test]
+    fn every_flavor_resolves_to_a_service_that_states_its_own_header() {
+        // Wildcard-free, like `service_for` itself: a new variant does not
+        // compile until it is asserted here, so this covers the whole set by
+        // construction rather than by a list someone has to remember to grow.
+        match MetadataFlavor::Gce {
+            MetadataFlavor::Gce => assert_service_is_well_formed(MetadataFlavor::Gce),
+        }
     }
 
     #[test]
@@ -237,7 +368,7 @@ mod tests {
     fn metadata_is_enabled_only_by_the_registered_session_policy() {
         let registry = Registry::new();
         let guest_ip = "10.200.0.2".parse().unwrap();
-        let state = |google_adc| SessionState {
+        let state = |metadata_flavor| SessionState {
             session_id: SessionId::new(),
             guest_ip,
             network_allow: HostList::empty(),
@@ -245,16 +376,17 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            google_adc,
+            metadata_flavor,
         };
-        registry.register(state(false));
-        assert!(!session_allows_metadata(&registry, guest_ip));
-        registry.register(state(true));
-        assert!(session_allows_metadata(&registry, guest_ip));
-        assert!(!session_allows_metadata(
-            &registry,
-            "10.200.0.6".parse().unwrap(),
-        ));
+        registry.register(state(None));
+        assert!(session_metadata_flavor(&registry, guest_ip).is_none());
+        registry.register(state(Some(MetadataFlavor::Gce)));
+        assert_eq!(
+            session_metadata_flavor(&registry, guest_ip),
+            Some(MetadataFlavor::Gce),
+        );
+        // An IP with no registered session gets nothing.
+        assert!(session_metadata_flavor(&registry, "10.200.0.6".parse().unwrap()).is_none());
     }
 
     #[tokio::test]
@@ -268,7 +400,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            google_adc: true,
+            metadata_flavor: Some(MetadataFlavor::Gce),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -315,7 +447,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            google_adc: true,
+            metadata_flavor: Some(MetadataFlavor::Gce),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

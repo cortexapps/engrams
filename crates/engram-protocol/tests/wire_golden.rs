@@ -54,7 +54,7 @@ use engram_core::types::egress::{
     EgressInjectEntry, EgressObserveEntry, EgressSecretEntry, SessionEgressPolicy,
 };
 use engram_core::types::image::{NetworkDefault, NetworkPolicy, SecretMode};
-use engram_core::types::integration::CredentialMintSource;
+use engram_core::types::integration::{CredentialMintSource, MetadataFlavor};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::{
     AgentSpec, AuxBundleRef, AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec,
@@ -240,7 +240,7 @@ fn session_egress_policy() -> SessionEgressPolicy {
         secret_mode: SecretMode::Broker,
         // ADR 0109: the host exposes metadata-style ADC only for sessions
         // whose immutable launch policy enables Google Cloud.
-        google_adc: true,
+        metadata_flavor: Some(MetadataFlavor::Gce),
     }
 }
 
@@ -323,7 +323,7 @@ fn session_egress_policy_google() -> SessionEgressPolicy {
             }),
             expires_at: Some(DateTime::from_timestamp(1_770_003_600, 0).unwrap()),
         }],
-        google_adc: true,
+        metadata_flavor: Some(MetadataFlavor::Gce),
         ..session_egress_policy()
     }
 }
@@ -582,8 +582,14 @@ fn wire_version_pinned() {
     // minted-inject policy failed host-side at boot (the engrams-review
     // outage, 2026-08-01). No existing golden changes bytes (the broken
     // `Some` shape never had one); the minted-policy golden is ADDED.
+    // 22 -> 23: ADR 0109 seam — `SessionEgressPolicy.google_adc` becomes
+    // `metadata_flavor: Option<MetadataFlavor>`. A field REPLACEMENT, not an
+    // addition, so a v22 host cannot decode a v23 policy: the roll is
+    // lockstep. All three session-egress-policy goldens were regenerated, and
+    // the `session_egress_policy_google` fixture now pins the `Some(Gce)`
+    // encoding beside the `None` case the other two carry.
     assert_eq!(
-        WIRE_VERSION, 22,
+        WIRE_VERSION, 23,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

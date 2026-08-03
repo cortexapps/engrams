@@ -56,7 +56,10 @@ import {
   resolveIntegrationGrants,
   type ResolvedIntegrationGrant,
 } from "../integrations/grants.ts";
-import { validateGoogleGrants } from "../integrations/google-policy.ts";
+import {
+  isProviderCapability,
+  validateProviderGrants,
+} from "../integrations/providers/index.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -324,10 +327,13 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
     // endpoint membership) is enforced at session-create — editing a
     // connection auto-disables it, and that must never block unrelated edits
     // of every profile that grants it.
-    validateGoogleGrants(resolved);
+    validateProviderGrants(resolved);
     const capabilities = grantsToCapabilities(resolved);
     for (const c of capabilities) {
-      if (c.startsWith("gcp:")) continue;
+      // A named-connection capability is authorized by its CONNECTION, not by a
+      // connector in the registry, so the "which connector grants this?" check
+      // below does not apply to it.
+      if (isProviderCapability(c)) continue;
       if (builtInToolCapabilities.has(c)) continue;
       const parsed = parseCapability(c);
       if (!parsed) {
