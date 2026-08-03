@@ -11,13 +11,10 @@
 
 use std::collections::HashMap;
 
-use engram_dst_host::{
-    decode_tag, invariants, synth_chunk, CrashFs, Profile, ScriptedResponse, Sim, SimHost,
-    CHUNK_SIZE, SIM_FINALIZE_MAX_ATTEMPTS,
-};
+#[cfg(target_os = "linux")]
+use engram_dst_host::SIM_FINALIZE_MAX_ATTEMPTS;
+use engram_dst_host::{invariants, synth_chunk, Profile, ScriptedResponse, Sim, SimHost};
 use engram_host_agent::disk_daemon::backend::FlushSeamPoint;
-use engram_host_agent::disk_daemon::spool;
-use engram_host_core::TokioFs;
 
 /// Drive one deterministic scenario host with `num` sandboxes.
 async fn scenario_host(seed: u64, num: usize) -> SimHost {
@@ -199,6 +196,7 @@ async fn failed_destroy_retries_next_tick() {
 /// VMs survive; the successor's reconcile loop rebuilds every binding from the
 /// coordinator and reaps nothing (the crash→restart→reconcile path that most
 /// resembles the 2026-07-11 incident).
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn crash_loses_bindings_then_reconcile_repairs_all_without_reaping() {
     let mut host = scenario_host(0, 3).await;
@@ -287,100 +285,65 @@ async fn stale_binding_sweep_never_double_claims_or_tears_a_live_binding() {
     }
 }
 
-// ───────────── Flow A incident seeds (ADR 0098 P4 — the SIGTERM ladder) ────
-//
-// The three historical SIGTERM-path hazards, each reproduced as a
-// deterministic scenario against the extracted ladder + the real
-// spool/rebuild machinery, then pinned as proof the acked-write oracle armed
-// over them.
+// ───────────── ADR 0110 dirty-file recovery seeds ─────────────
 
-/// #225 — the deadline overrun. A tiny final-flush budget overruns the
-/// deadline, so the final-flush leg is SKIPPED: every survivor is a straggler
-/// whose acked (un-published) dirty tier rides the shutdown spool — which is
-/// NOT deadline-bound and always completes. The successor adopts it and
-/// recovers every acked write. (The pre-spool code rolled these acked writes
-/// back by up to a cadence window — the corruption the spool closed.)
+/// Prove that acked writes survive process death without a flush.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
-async fn sigterm_tiny_budget_overrun_spools_stragglers_and_recovers_every_acked_write() {
-    let mut host = scenario_host(0, 3).await;
-    // Acked writes that the final flush would upload if the deadline allowed.
+async fn acked_unflushed_writes_survive_abrupt_death() {
+    let mut host = scenario_host(0x0110_0001, 2).await;
     host.guest_write(0, 1).await.unwrap();
-    host.guest_write(1, 2).await.unwrap();
-    host.guest_write(2, 3).await.unwrap();
-    assert!(host.ledger.len() >= 3);
+    host.guest_write(0, 6).await.unwrap();
+    host.guest_write(1, 3).await.unwrap();
 
-    // 1 ms budget → the plan_shutdown deadline is below SIM_FLUSH_COST → the
-    // final-flush leg overruns and is skipped; the spool is the ONLY copy.
-    host.sigterm(Some(0.001)).await.unwrap();
-    for slot in &host.sandboxes {
-        let spooled = spool::read_spool(&TokioFs, host.fs.spool_dir(), slot.sandbox_id)
-            .await
-            .unwrap();
-        assert!(
-            spooled.is_some_and(|(_, chunks)| !chunks.is_empty()),
-            "an overrun straggler must leave a complete, chunk-bearing spool",
-        );
-    }
-
-    // The successor restarts and adopts the spool → every acked write back.
+    host.crash_process().await.unwrap();
     host.restart().await.unwrap();
+
     invariants::check(&host)
         .await
         .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
     host.guest_read(0, 1).await.unwrap();
-    host.guest_read(1, 2).await.unwrap();
-    host.guest_read(2, 3).await.unwrap();
+    host.guest_read(0, 6).await.unwrap();
+    host.guest_read(1, 3).await.unwrap();
 }
 
-/// 85e0298a — the store-ahead recovery. The final flush uploads the chunks +
-/// a new manifest to the store (durable), but the coordinator publish ack is
-/// LOST — so coord's disk_manifest ref (the successor's rebuild ref) stays
-/// STALE at the base. The abandon-sweep spool export writes the store-ahead
-/// ref (zero-chunk, ref-only — spool.rs State 6). The successor MUST attach
-/// from the spool's ahead ref, never roll back to coord's stale one.
+/// Prove that a sidecar overrides a stale coordinator ref after store-ahead.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
-async fn store_ahead_lost_publish_ack_recovers_from_the_spool_ref_not_coords_stale_one() {
-    let mut host = scenario_host(0, 1).await;
+async fn store_ahead_publish_recovers_from_the_sidecar_not_coords_stale_ref() {
+    let mut host = scenario_host(0x0110_0002, 1).await;
     host.guest_write(0, 0).await.unwrap();
     host.guest_write(0, 4).await.unwrap();
 
-    // The final flush UPLOADS chunks + a v2 manifest to the store and advances
-    // the backend's version — but the coord publish is lost, so the durable
-    // pointer (`published_ref`, standing in for coord's ref) stays base-stale.
-    let backend = host.sandboxes[0].backend.clone().unwrap();
-    backend.flush().await.unwrap();
-    let store_ahead = backend.manifest_ref().await;
-    assert!(store_ahead.version > host.sandboxes[0].base_ref.version);
+    host.coord
+        .script(ScriptedResponse::Unreachable("sim: publish ack lost"));
+    let publish = host.flush_tick(0).await;
+    assert!(publish.is_err(), "the coordinator must not ack the publish");
+
+    let store_ahead = host.sandboxes[0]
+        .backend
+        .clone()
+        .unwrap()
+        .manifest_ref()
+        .await;
     assert!(
         host.sandboxes[0].published_ref.is_none(),
-        "the publish ack was lost — coord never learned the store-ahead ref",
+        "the coordinator ref must stay at the base manifest",
     );
+    assert!(store_ahead.version > host.sandboxes[0].base_ref.version);
 
-    // The abandon sweep exports the ref-only store-ahead spool.
-    host.spool_export(0).await.unwrap();
-    let sid = host.sandboxes[0].sandbox_id;
-    let (meta, chunks) = spool::read_spool(&TokioFs, host.fs.spool_dir(), sid)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        meta.manifest_ref(),
-        store_ahead,
-        "the spool carries the store-ahead ref coord never acked",
-    );
-    assert!(
-        chunks.is_empty(),
-        "ref-only spool: the chunks are already durable in the store",
-    );
-
-    // Crash + restart: the successor's rebuild ref is coord's stale base; the
-    // store-ahead rule attaches from the spool's ahead ref instead.
-    host.sandboxes[0].backend = None;
+    host.crash_process().await.unwrap();
     host.restart().await.unwrap();
+
+    let recovered = host.sandboxes[0]
+        .backend
+        .clone()
+        .unwrap()
+        .manifest_ref()
+        .await;
     assert_eq!(
-        host.sandboxes[0].published_ref,
-        Some(store_ahead),
-        "the successor adopts the store-ahead ref, never rolls back to the stale one",
+        recovered, store_ahead,
+        "recovery must attach from the sidecar ref",
     );
     invariants::check(&host)
         .await
@@ -389,234 +352,39 @@ async fn store_ahead_lost_publish_ack_recovers_from_the_spool_ref_not_coords_sta
     host.guest_read(0, 4).await.unwrap();
 }
 
-/// #224 — insert-after-sweep. Once the ladder raises the terminal `abandoning`
-/// flag (the [`Abandon`] stage), a late `create`/`rehydrate` completing in its
-/// multi-second await window must abandon-in-place, NEVER leave a live NBD
-/// data plane for process-exit `Drop` to netlink-disconnect the successor's
-/// device. The dst-host scheduler is run-step-to-completion (no true
-/// concurrent futures), and the literal insert races a `DashMap` holding a
-/// Linux-only `NbdHandle` — so the strongest deterministic version the
-/// portable surface allows is the extracted ORDERING CONTRACT: the pure
-/// `admits_new_plane` gate flips exactly at `Abandon` and never re-opens. The
-/// concrete drain-twice sweep + SeqCst flag + the `is_abandoning()` create-
-/// reject / rehydrate abandon-in-place branches stay in the driver and are
-/// owned by the FC lane.
-///
-/// [`Abandon`]: engram_host_core::ShutdownStage::Abandon
-#[test]
-fn insert_after_abandon_stage_is_routed_to_abandon_in_place() {
-    use engram_host_core::{admits_new_plane, ShutdownStage};
-
-    // Before Abandon, a completing insert may land its live data plane.
-    for stage in [
-        ShutdownStage::Signaled,
-        ShutdownStage::TasksAborted,
-        ShutdownStage::FinalFlush,
-    ] {
-        assert!(admits_new_plane(stage), "{stage:?} still admits new planes");
-    }
-    // From Abandon onward, a late insert MUST abandon-in-place.
-    for stage in [
-        ShutdownStage::Abandon,
-        ShutdownStage::SpoolExport,
-        ShutdownStage::Detached,
-    ] {
-        assert!(
-            !admits_new_plane(stage),
-            "{stage:?} must route a late insert to abandon-in-place",
-        );
-    }
-    // The gate flips exactly at the Abandon boundary and never re-opens.
-    let ladder = ShutdownStage::LADDER;
-    let first_closed = ladder
-        .iter()
-        .position(|s| !admits_new_plane(*s))
-        .expect("some stage closes the gate");
-    assert_eq!(ladder[first_closed], ShutdownStage::Abandon);
-    assert!(
-        ladder[first_closed..].iter().all(|s| !admits_new_plane(*s)),
-        "once closed, the gate stays closed for the rest of the ladder",
-    );
-}
-
-/// af28cac4 (2026-07-21) — the FIXED ordering, at every seam point. The
-/// SIGTERM deadline overruns while a REAL flush is IN FLIGHT (parked
-/// mid-pipeline); the fixed driver aborts + reaps it BEFORE the abandon
-/// sweep's spool export, so the spool is stamped AT the head and carries
-/// the newest acked writes (including the one written mid-shutdown at the
-/// prod seam). The successor adopts and recovers everything — asserted
-/// SHARPER than the tolerant floor oracle: the newest acked tag survives,
-/// not merely the published floor. The post-restart flush also exercises
-/// the PreRebase leftover (a store-ahead manifest the aborted flush
-/// published to the store) recovering through the REAL version-conflict
-/// retry.
+/// Prove that process death at each flush seam loses no acked write.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
-async fn sigterm_inflight_flush_abort_keeps_the_spool_adoptable_at_every_seam() {
-    for seam in 0..3u8 {
-        let mut host = scenario_host(0xAF28_0000 + seam as u64, 1).await;
-        host.sigterm_flush_parked(0, seam)
-            .await
-            .unwrap_or_else(|e| panic!("seam {seam}: {e}"));
+async fn crash_at_each_flush_seam_point_loses_nothing() {
+    let points = [
+        FlushSeamPoint::DirtyPendingHandoff,
+        FlushSeamPoint::PostUploadPrePublish,
+        FlushSeamPoint::PreRebase,
+    ];
+    for (index, point) in points.into_iter().enumerate() {
+        let mut host = scenario_host(0x0110_0100 + index as u64, 1).await;
+        host.guest_write(0, 2).await.unwrap();
+        host.guest_write(0, 5).await.unwrap();
+
+        let backend = host.sandboxes[0].backend.clone().unwrap();
+        let (arrived, proceed) = backend.arm_flush_seam(point);
+        let flush_backend = backend.clone();
+        let flush = tokio::spawn(async move { flush_backend.flush().await });
+        arrived.notified().await;
+        flush.abort();
+        let _ = flush.await;
+        drop(proceed);
+
+        host.crash_process().await.unwrap();
+        drop(backend);
         host.restart().await.unwrap();
+
         invariants::check(&host)
             .await
-            .unwrap_or_else(|v| panic!("seam {seam}: {} — {}", v.invariant, v.detail));
-        let latest = host
-            .ledger
-            .latest_by_chunk()
-            .get(&(0, 1))
-            .expect("chunk 1 was written")
-            .content_tag;
-        let backend = host.sandboxes[0].backend.clone().unwrap();
-        let bytes = backend.read(CHUNK_SIZE, CHUNK_SIZE).await.unwrap();
-        assert_eq!(
-            decode_tag(&bytes),
-            latest,
-            "seam {seam}: the successor must serve the NEWEST acked write, not a \
-             floor-rollback — the aborted-flush spool carries it",
-        );
-        host.guest_read(0, 1).await.unwrap();
-        // PreRebase leftovers (a store-ahead manifest nothing references)
-        // must not wedge the next flush: the version-conflict retry
-        // re-targets latest+1.
+            .unwrap_or_else(|v| panic!("{point:?}: {} — {}", v.invariant, v.detail));
+        host.guest_read(0, 2).await.unwrap();
+        host.guest_read(0, 5).await.unwrap();
         host.flush_tick(0).await.unwrap();
-        host.guest_read(0, 1).await.unwrap();
-    }
-}
-
-/// af28cac4 (2026-07-21) — the PRE-FIX interleaving, driven literally, is
-/// now representable AND self-catching. The abandon sweep's export runs
-/// while the final flush is parked post-upload/pre-publish; the flush then
-/// completes DETACHED past the deadline and its publish lands — the spool
-/// on disk is stamped one version BEHIND the durable pointer while holding
-/// the only copy of an acked write above the published floor. The
-/// successor's rebuild refuses the behind-stamped spool per the lineage
-/// gate, and the stale-refusal oracle must flag the refusal as the
-/// acked-write rollback it is (in prod: spool v367 vs published v368,
-/// 49 chunks / 822 MiB preserved-but-not-adopted under a live guest).
-#[tokio::test(start_paused = true)]
-async fn detached_flush_publish_after_spool_export_is_caught_at_rebuild() {
-    let mut host = scenario_host(0xAF28_CAC4, 1).await;
-
-    // A published floor: tag1 lands durably.
-    host.guest_write(0, 1).await.unwrap();
-    host.flush_tick(0).await.unwrap();
-
-    // tag2 dirty; the SIGTERM final flush drains it and parks pre-publish
-    // (the prod shape: a 318 MiB upload still in flight at the deadline).
-    host.guest_write(0, 1).await.unwrap();
-    let backend = host.sandboxes[0].backend.clone().unwrap();
-    let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::PostUploadPrePublish);
-    let flush = tokio::spawn({
-        let b = backend.clone();
-        async move { b.flush().await }
-    });
-    arrived.notified().await;
-
-    // The guest keeps writing during the shutdown window: tag3 is ACKED.
-    host.guest_write(0, 1).await.unwrap();
-    let tag3 = host
-        .ledger
-        .latest_by_chunk()
-        .get(&(0, 1))
-        .unwrap()
-        .content_tag;
-
-    // PRE-FIX ordering: the export runs while the flush is still parked —
-    // the spool carries tag3, stamped at the PRE-rebase head.
-    let stamped_at = backend.manifest_ref().await;
-    host.spool_export(0).await.unwrap();
-
-    // The detached task resumes past the deadline; rebase + publish land.
-    proceed.notify_one();
-    flush
-        .await
-        .expect("flush task join")
-        .expect("detached flush completes");
-    host.detached_flush_publish(0).await.unwrap();
-    let published = host.sandboxes[0].published_ref.unwrap();
-    assert!(
-        stamped_at.version < published.version,
-        "the incident state: the spool stamp ({stamped_at}) must be BEHIND the \
-         published ref ({published})",
-    );
-    let sid = host.sandboxes[0].sandbox_id;
-    let (meta, chunks) = spool::read_spool(&TokioFs, host.fs.spool_dir(), sid)
-        .await
-        .unwrap()
-        .expect("the behind-stamped spool is standing");
-    assert_eq!(meta.manifest_ref(), stamped_at);
-    assert!(
-        chunks
-            .iter()
-            .any(|(idx, bytes)| *idx == 1 && decode_tag(bytes) == tag3),
-        "the spool holds the only copy of acked tag3",
-    );
-
-    // The roll. The successor's rebuild refuses the behind-stamped spool —
-    // and the stale-refusal oracle catches that the refusal drops the only
-    // copy of acked tag3 (the floor is tag2).
-    host.sandboxes[0].backend = None;
-    let err = host
-        .restart()
-        .await
-        .expect_err("the rebuild must flag the af28cac4 rollback, not silently discard");
-    assert!(
-        err.contains("above the published floor"),
-        "unexpected rebuild error: {err}",
-    );
-}
-
-/// The op-boundary spool injector, exhaustively (P5, replacing the P4
-/// static-boundary version): the predecessor's spool write is cut at EVERY
-/// fs-op index of the real `write_spool` sequence by the `CrashFs` seam.
-/// The acked set is redundantly flush-published first, so whatever the cut
-/// leaves — the intact prior spool, no spool, a marker-less partial, or a
-/// complete rewrite — the REAL recovery (rebuild + tolerant `read_spool`)
-/// recovers EVERY acked write. The crash schedule is derived from the
-/// production op trace, never a parallel list (`crashpoint_coverage.rs`).
-#[tokio::test(start_paused = true)]
-async fn spool_cut_at_every_op_recovers_every_acked_write() {
-    // Derive the schedule length from one un-cut run of the same shape.
-    let probe = {
-        let mut host = scenario_host(0, 2).await;
-        host.guest_write(0, 0).await.unwrap();
-        let backend = host.sandboxes[0].backend.clone().unwrap();
-        let (exported_ref, chunks) = backend.export_unflushed().await;
-        let fs = CrashFs::recording();
-        spool::write_spool(
-            fs.as_ref(),
-            host.fs.spool_dir(),
-            host.sandboxes[0].sandbox_id,
-            exported_ref,
-            &chunks,
-        )
-        .await
-        .unwrap();
-        fs.trace().len()
-    };
-    assert!(probe > 0, "the probe run must trace a real op sequence");
-
-    for op_index in 0..=probe {
-        let mut host = scenario_host(0, 2).await;
-        // Acked writes at risk across the crash (sandbox 0 is the cut
-        // target; sandbox 1 proves uninvolved sandboxes ride through).
-        host.guest_write(0, 0).await.unwrap();
-        host.guest_write(1, 5).await.unwrap();
-
-        host.spool_crash_at(op_index)
-            .await
-            .unwrap_or_else(|e| panic!("spool_crash_at({op_index}): {e}"));
-        host.restart()
-            .await
-            .unwrap_or_else(|e| panic!("restart after cut {op_index}: {e}"));
-        invariants::check(&host)
-            .await
-            .unwrap_or_else(|v| panic!("cut {op_index}: {} — {}", v.invariant, v.detail));
-        // Every acked write recovers: the floor was raised to the acked tags
-        // before the cut, so the honest range pins the exact bytes.
-        host.guest_read(0, 0).await.unwrap();
-        host.guest_read(1, 5).await.unwrap();
     }
 }
 
@@ -627,6 +395,7 @@ async fn spool_cut_at_every_op_recovers_every_acked_write() {
 /// manifest, the terminal `EvictionFinal` record exists, the finalize record
 /// is gone, and the destroy was issued. A restart then rebuilds from the
 /// finalize-published ref and every acked write reads back exactly.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn finalize_completes_publishes_the_floor_and_destroys() {
     let mut host = scenario_host(0, 2).await;
@@ -677,6 +446,7 @@ async fn finalize_completes_publishes_the_floor_and_destroys() {
 /// attempt loop to completion. Oracle #6 (stage monotone + stage⇒fields)
 /// holds at every step; the terminal manifests and the raised floor are
 /// invariant to WHERE the crash landed (idempotent redrive).
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn finalize_crash_at_every_op_resumes_and_completes() {
     // A generous bound on the finalize pass's op count (the pass ends early
@@ -728,9 +498,9 @@ async fn finalize_crash_at_every_op_resumes_and_completes() {
 /// ENOENT class — the input that lives only in the staging dir), so every
 /// attempt's disk leg fails while the record machinery stays healthy.
 /// Attempts exhaust → the record lands in `finalize/failed/`, the
-/// idempotency map clears, and the honest floor stays at the PRIOR
-/// published tier (the bounded rollback the quarantine doc promises) — the
-/// oracle does not demand the un-published writes back.
+/// idempotency map clears. The coordinator ref stays at its prior value. The
+/// dirty file still keeps the newer acked write.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn finalize_quarantine_after_max_attempts_is_convergent() {
     let mut host = scenario_host(0, 2).await;
@@ -778,8 +548,7 @@ async fn finalize_quarantine_after_max_attempts_is_convergent() {
     invariants::check_finalize_convergence(&host)
         .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
 
-    // The honest floor: a restart rebuilds from the PRIOR published tier;
-    // the newer un-published write is the accepted bounded rollback.
+    // Recovery starts with the prior coordinator ref and scans the dirty file.
     host.restart().await.unwrap();
     assert_eq!(
         host.sandboxes[0].published_ref,
@@ -797,6 +566,7 @@ async fn finalize_quarantine_after_max_attempts_is_convergent() {
 /// no second record, no second job, no concurrent chain mutation (the real
 /// `pending_finalizes.get` guard at the entry). Completion releases it: a
 /// LATER begin on the (restarted) sandbox mints a fresh id.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn snapshot_begin_idempotent_under_pending_finalize() {
     let mut host = scenario_host(0, 2).await;
@@ -836,97 +606,8 @@ async fn snapshot_begin_idempotent_under_pending_finalize() {
         .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
 }
 
-// ─────────────── P4.5: oracle honesty — the honest-loss boundary ───────────
-//
-// The adversarial-review finding: the old oracle demanded EVERY restarted
-// acked write recover, which either never exercised the post-ack/pre-handoff
-// hard-crash window or would falsely demand recovery of a write prod genuinely
-// loses. The oracle now verifies the durability PIPELINE — a write is
-// required-recoverable IFF it had a durable handoff (flush published OR spool
-// captured) before the crash. These two seeds pin BOTH directions of that
-// boundary.
-
-/// The honest-loss direction: a guest write acked from the RAM dirty tier, then
-/// ABRUPT process death (SIGKILL / power loss) BEFORE any flush or spool. The
-/// write never had a durable handoff, so the successor's manifest legitimately
-/// rolls the chunk back to base — an accepted, bounded loss (ADR 0028). The
-/// honest oracle keys on the durable-handoff floor, so it recovers the floor
-/// (here: base) and does NOT cry wolf demanding the un-handed-off acked tag.
 #[tokio::test(start_paused = true)]
-async fn post_ack_pre_handoff_crash_is_honest_loss() {
-    // Deterministic pinned seed (only the entropy for ids; the scenario is
-    // hand-driven, not pick-driven).
-    let mut host = scenario_host(0xA55E_7717, 1).await;
-
-    // A single acked write with a distinctive tag — NO FlushTick, NO SpoolExport.
-    host.guest_write(0, 3).await.unwrap();
-    let acked = host
-        .ledger
-        .latest_by_chunk()
-        .get(&(0, 3))
-        .expect("the write is acked in the ledger")
-        .content_tag;
-    assert!(acked > 0, "a real, distinctive acked tag");
-    assert!(
-        host.ledger.handed_off_tag(0, 3).is_none(),
-        "no flush and no spool ⇒ the write never had a durable handoff",
-    );
-
-    // Abrupt death: the RAM dirty tier evaporates with NO shutdown spool.
-    host.abrupt_crash().await.unwrap();
-    // The successor rebuilds through the REAL recovery path (from_blob at the
-    // durable pointer + tolerant spool adopt — here no spool, pointer = base).
-    host.restart().await.unwrap();
-
-    // The chunk legitimately reads BASE — the acked (un-handed-off) write is
-    // gone, exactly as production loses it.
-    let backend = host.sandboxes[0].backend.clone().unwrap();
-    let got = decode_tag(&backend.read(3 * CHUNK_SIZE, CHUNK_SIZE).await.unwrap());
-    assert_eq!(
-        got, 0,
-        "the manifest rolled back to base — the write is lost"
-    );
-    assert_ne!(
-        got, acked,
-        "prod loses this write; the oracle must not fake recovery"
-    );
-
-    // The honest oracle reports NO violation on this accepted loss.
-    invariants::check(&host).await.unwrap_or_else(|v| {
-        panic!(
-            "the oracle cried wolf on an accepted loss: {} — {}",
-            v.invariant, v.detail
-        )
-    });
-
-    // The recoverable direction, in the SAME crash shape: a write that DID get a
-    // durable handoff (a flush) then abrupt-crashed MUST recover — the pipeline
-    // took responsibility for it.
-    host.guest_write(0, 4).await.unwrap();
-    let handed = host
-        .ledger
-        .latest_by_chunk()
-        .get(&(0, 4))
-        .unwrap()
-        .content_tag;
-    host.flush_tick(0).await.unwrap();
-    assert_eq!(
-        host.ledger.handed_off_tag(0, 4),
-        Some(handed),
-        "the flush published the write → its durable-handoff floor is recorded",
-    );
-    host.abrupt_crash().await.unwrap();
-    host.restart().await.unwrap();
-    let backend = host.sandboxes[0].backend.clone().unwrap();
-    let got = decode_tag(&backend.read(4 * CHUNK_SIZE, CHUNK_SIZE).await.unwrap());
-    assert_eq!(got, handed, "a handed-off write survives even abrupt death");
-    invariants::check(&host)
-        .await
-        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
-}
-
-#[tokio::test(start_paused = true)]
-async fn misdirected_read_in_range_tag_fires_the_membership_oracle() {
+async fn misdirected_read_fires_the_exact_tag_oracle() {
     let mut host = scenario_host(0xA55E_7718, 3).await;
     host.guest_write(0, 0).await.unwrap();
     host.guest_write(0, 1).await.unwrap();
@@ -944,7 +625,10 @@ async fn misdirected_read_in_range_tag_fires_the_membership_oracle() {
         .await
         .expect_err("the in-range tag belongs to another chunk");
     assert_eq!(violation.invariant, "acked-write-durability");
-    assert!(violation.detail.contains("never acked"), "{violation:?}");
+    assert!(
+        violation.detail.contains("latest acked tag"),
+        "{violation:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -977,6 +661,7 @@ async fn unflushed_acked_write_fires_the_quiescent_floor_oracle() {
 /// local pass re-serves the parked survivor's device the coord list missed;
 /// the stale sweep then skips it (served ⇒ claimed ⇒ not free-in-pool); the
 /// un-pause serves the correct acked bytes.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn park_roll_local_pass_reserves_survivor_sweep_skips_it_unpause_serves() {
     let mut host = scenario_host(0, 3).await;
@@ -989,8 +674,7 @@ async fn park_roll_local_pass_reserves_survivor_sweep_skips_it_unpause_serves() 
     assert!(host.sandboxes[0].parked);
     let gen_before = host.generation;
 
-    // The pod roll: spool the survivors, drop RAM, fresh generation. The parked
-    // VM stays resident; its kernel device is left bound to the dead generation.
+    // The roll drops process state. The VM and dirty file stay resident.
     host.crash_process().await.unwrap();
     assert_eq!(host.generation, gen_before + 1);
     assert!(
@@ -1052,6 +736,7 @@ async fn park_roll_local_pass_reserves_survivor_sweep_skips_it_unpause_serves() 
 /// live holder → the `severed-live-holder` oracle fires here (the old seed's
 /// disconnect returns). With the Park guard, `kernel_owner` survives, the oracle
 /// holds, and the re-serve is lossless.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn park_roll_ungated_live_holder_sweep_parks_then_reattach_reserves_zero_loss() {
     let mut host = scenario_host(0, 3).await;
@@ -1116,6 +801,7 @@ async fn park_roll_ungated_live_holder_sweep_parks_then_reattach_reserves_zero_l
 /// attempts a late un-pause onto that now-disconnected device, the un-pause
 /// data-plane gate is still the last line: it fails fast into `evict_local →
 /// resume` rather than serving a dead plane, and no oracle fires.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn park_roll_guest_gone_noholder_disconnect_legal_unpause_gate_still_guards() {
     let mut host = scenario_host(0, 3).await;
@@ -1169,6 +855,7 @@ async fn park_roll_guest_gone_noholder_disconnect_legal_unpause_gate_still_guard
 /// `quarantined_unknown.contains(..)` assertion below fails — the survivor was
 /// silently handled, not classified. With the barrier it is classified and the
 /// oracles hold.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn gap_a_record_invisible_survivor_is_quarantined_not_severed_then_recovers_zero_loss() {
     let mut host = scenario_host(0, 3).await;
@@ -1244,6 +931,7 @@ async fn gap_a_record_invisible_survivor_is_quarantined_not_severed_then_recover
 /// process parked on purpose. Fail-without: drop the parked-set term from
 /// `classify_startup`'s `has_record` and the first assertion fails (the
 /// pre-#828 behavior).
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn quarantine_parked_survivor_stays_tracked_never_unknown() {
     let mut host = scenario_host(0, 3).await;
@@ -1415,6 +1103,7 @@ eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9919204, 9_91
 /// never rehydrated) is REFUSED — never silently skipped into a
 /// manifestless snapshot. Rehydrating it (the error message's remediation)
 /// makes the capture drain normally.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn untracked_survivor_capture_refuses_never_a_manifestless_snapshot() {
     let mut host = scenario_host(0, 2).await;
@@ -1422,8 +1111,8 @@ async fn untracked_survivor_capture_refuses_never_a_manifestless_snapshot() {
     host.flush_tick(0).await.unwrap();
     host.guest_write(0, 1).await.unwrap(); // newer, un-published ack
 
-    // The roll: RAM dies, the VM stays resident, nothing rehydrates it.
-    host.abrupt_crash().await.unwrap();
+    // The roll drops the backend. The VM and dirty file stay resident.
+    host.crash_process().await.unwrap();
     assert!(host.sandboxes[0].backend.is_none());
 
     let outcome = host.snapshot_begin(0).await.unwrap();
@@ -1457,15 +1146,16 @@ async fn untracked_survivor_capture_refuses_never_a_manifestless_snapshot() {
 /// capture completes a finalize with disk_manifest=None (poisoned lineage;
 /// the floor stays where the last real flush put it), and the pre-#743
 /// resume boots FC onto the capture-time literal device (base content).
-/// The published-floor writes are gone from what the guest reads — the
-/// oracle MUST fire the 85e0298a/03e6535e below-floor violation.
+/// The acked write is absent from what the guest reads. The exact-tag oracle
+/// must report this fault.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn ungated_capture_and_resume_poison_the_lineage_and_the_oracle_catches_it() {
     let mut host = scenario_host(0, 2).await;
     host.guest_write(0, 2).await.unwrap();
     host.flush_tick(0).await.unwrap(); // floor raised over the acked write
 
-    host.abrupt_crash().await.unwrap();
+    host.crash_process().await.unwrap();
 
     // Pre-#743 capture: the silent skip records a disk-less finalize.
     let _poisoned = host.snapshot_begin_pre743(0).await.unwrap();
@@ -1480,15 +1170,14 @@ async fn ungated_capture_and_resume_poison_the_lineage_and_the_oracle_catches_it
     let outcome = host.resume_finalized(0, /*gated=*/ false).await.unwrap();
     assert_eq!(outcome, engram_dst_host::ResumeOutcome::BootedStaleLiteral);
 
-    // The oracle catches the corruption: the flushed (published-floor)
-    // write is below-floor gone from what the stale device serves.
+    // The oracle catches the stale value from the wrong device.
     let violation = invariants::check(&host)
         .await
         .expect_err("the acked-write oracle must catch the stale-literal boot");
     assert_eq!(violation.invariant, "acked-write-durability");
     assert!(
-        violation.detail.contains("rolled back below the floor"),
-        "the 03e6535e corruption is the below-floor class: {}",
+        violation.detail.contains("latest acked tag"),
+        "the 03e6535e corruption must fail the exact-tag check: {}",
         violation.detail,
     );
 }
@@ -1497,12 +1186,13 @@ async fn ungated_capture_and_resume_poison_the_lineage_and_the_oracle_catches_it
 /// manufactured (the capture gate bypassed), the resume gate refuses the
 /// stale literal — no boot, no corruption, oracles clean. The exact
 /// defense-in-depth shape of the 731df805 un-pause-gate seed.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn poisoned_snapshot_resume_gate_refuses_the_stale_literal() {
     let mut host = scenario_host(0, 2).await;
     host.guest_write(0, 3).await.unwrap();
     host.flush_tick(0).await.unwrap();
-    host.abrupt_crash().await.unwrap();
+    host.crash_process().await.unwrap();
 
     let _poisoned = host.snapshot_begin_pre743(0).await.unwrap();
     host.finalize_tick(0).await.unwrap();
@@ -1570,7 +1260,6 @@ async fn fence_raised_mid_upload_aborts_publish_and_requeues() {
 /// the device serves and the oracle would fire.
 #[tokio::test(start_paused = true)]
 async fn concurrent_flushes_serialize_never_reorder_publishes() {
-    use engram_host_agent::disk_daemon::backend::FlushSeamPoint;
     let mut host = scenario_host(0, 1).await;
     host.guest_write(0, 3).await.unwrap();
     let backend = host.sandboxes[0].backend.clone().unwrap();
@@ -1603,12 +1292,11 @@ async fn concurrent_flushes_serialize_never_reorder_publishes() {
 
 /// The pre-rebase store-ahead crash window: the process dies with a REAL
 /// flush parked between `put_manifest` and the rebase. The store holds a
-/// manifest nothing references; the floor never rose, so the successor's
-/// rollback is HONEST — and its next flush recovers through the REAL
-/// version-conflict retry (attempts the stale next-version, hits the
-/// conflict, re-targets latest+1).
+/// manifest that no coordinator ref names. The dirty file keeps the acked
+/// writes. The next flush also resolves the store version conflict.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
-async fn pre_rebase_crash_is_honest_and_the_conflict_retry_recovers() {
+async fn pre_rebase_crash_loses_nothing_and_the_conflict_retry_recovers() {
     let mut host = scenario_host(0, 2).await;
     // An earlier real flush establishes a floor the crash must not breach.
     host.guest_write(0, 4).await.unwrap();
@@ -1835,83 +1523,10 @@ async fn explicit_abort_after_state_served_is_legal_and_resumes() {
     assert_eq!(host.ledger.len(), before + 1);
 }
 
-// ───────────── R5: storage lies — seeded read corruption (Phase 3) ─────────
-//
-// The seam (`CrashFs::with_read_fault`) lies about the bytes a stored file
-// returns; `corrupt_spool_recovery` drives a spool rehydrate through it after
-// raising a redundant published floor. Whatever the lie — a bit-flip on the
-// meta marker or the first chunk — the recovery must DETECT it (the chunk
-// re-hash, or R5's meta content-hash envelope) or TOLERATE it (rebuild from
-// the floor), never a silent corrupt adopt. The oracle holds at every landing.
-
-/// The end-to-end swarm step, exhaustively over the meta marker AND the first
-/// chunk, at every byte offset the flip can land on. Each landing rehydrates
-/// through the lie and must leave the acked-write oracle clean.
-#[tokio::test(start_paused = true)]
-async fn corrupt_spool_recovery_never_silently_adopts_and_the_oracle_holds() {
-    for meta in [true, false] {
-        for offset in 0..48usize {
-            let mut host = scenario_host(0xB17E_0000 + offset as u64, 2).await;
-            host.corrupt_spool_recovery(1, meta, offset)
-                .await
-                .unwrap_or_else(|e| {
-                    panic!("corrupt_spool_recovery(meta={meta}, off={offset}): {e}")
-                });
-            invariants::check(&host).await.unwrap_or_else(|v| {
-                panic!("meta={meta} off={offset}: {} — {}", v.invariant, v.detail)
-            });
-            // The redundant floor always survives; sandbox 1 chunk 0 reads its
-            // flushed value (the un-published spooled write is a legitimate
-            // transient-spool loss when the lie forced a discard).
-            host.guest_read(1, 0).await.unwrap();
-        }
-    }
-}
-
-/// The sharp fail-without/pass-with pin at the recovery seam: a spool META
-/// bit-rot that stays a SYNTACTICALLY VALID `SpoolMeta` (a bumped version — the
-/// exact lie that defeats the rebuild's stale-spool lineage gate). R5's
-/// envelope makes `read_spool` reject it as a loud `checksum` rollback; WITHOUT
-/// the envelope the corrupt marker parses and is TRUSTED. This is the standing
-/// spool the sim's rehydrate reads, so the format-level rejection is what keeps
-/// `corrupt_spool_recovery` honest.
-#[tokio::test(start_paused = true)]
-async fn a_valid_but_corrupt_spool_marker_is_rejected_not_trusted() {
-    let mut host = scenario_host(0xB17E_5EED, 2).await;
-    // Establish a floor, then a standing spool holding a newer write.
-    host.guest_write(0, 0).await.unwrap();
-    host.flush_tick(0).await.unwrap();
-    host.guest_write(0, 1).await.unwrap();
-    host.spool_export(0).await.unwrap();
-    let sid = host.sandboxes[0].sandbox_id;
-    let meta_path = host.fs.spool_dir().join(sid.to_string()).join("meta.json");
-
-    // Rewrite the sealed marker's BODY (bump the version) without fixing the
-    // content hash — a perfect `SpoolMeta`, but a lie the envelope catches.
-    let mut env: serde_json::Value =
-        serde_json::from_slice(&tokio::fs::read(&meta_path).await.unwrap()).unwrap();
-    let mut meta: spool::SpoolMeta = serde_json::from_str(env["body"].as_str().unwrap()).unwrap();
-    meta.version += 500;
-    env["body"] = serde_json::Value::String(serde_json::to_string(&meta).unwrap());
-    tokio::fs::write(&meta_path, serde_json::to_vec(&env).unwrap())
-        .await
-        .unwrap();
-
-    let err = spool::read_spool(&TokioFs, host.fs.spool_dir(), sid)
-        .await
-        .expect_err("a bit-rotted-but-valid spool marker must be rejected, never trusted");
-    assert!(
-        err.to_string().contains("checksum"),
-        "the R5 envelope names the content-hash gap: {err}",
-    );
-}
-
 // ────────────── #898: the finalize durability claim + resume leg ──────────────
 //
-// The #897 laundering class through its PRODUCTION-shaped detection paths.
-// Pre-#897 the nightly seeds caught it only because destroyed sandboxes were
-// resurrected as survivors on Restart and tripped over their stale spools —
-// a recovery path production cannot take. This pin drives the honest pair:
+// The #897 laundering class uses its production-shaped detection paths.
+// This pin drives the exact pair:
 // the finalize-coverage oracle fires AT completion if the published manifest
 // omits a staged chunk, and `FinalizedResume` (the coordinator-driven
 // post-eviction resume) proves the resumed guest reads every acked write.
@@ -1920,6 +1535,7 @@ async fn a_valid_but_corrupt_spool_marker_is_rejected_not_trusted() {
 /// completed finalize must publish PAST it (never launder it), the destroyed
 /// slot must stay destroyed across restarts, and the finalized resume must
 /// serve every acked write.
+#[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn finalize_publishes_past_store_ahead_orphan_and_resume_covers_acked_writes() {
     let mut host = scenario_host(0, 1).await;
@@ -1965,16 +1581,11 @@ async fn finalize_publishes_past_store_ahead_orphan_and_resume_covers_acked_writ
 
     // The terminal-skip: the destroyed sandbox is NOT a survivor — no
     // recovery leg may rebuild it across a roll.
-    host.abrupt_crash().await.unwrap();
+    host.crash_process().await.unwrap();
     host.restart().await.unwrap();
     assert!(
         host.sandboxes[0].backend.is_none(),
         "a terminally-finalized sandbox must never be resurrected by restart",
-    );
-    host.spool_adopt(0).await.unwrap();
-    assert!(
-        host.sandboxes[0].backend.is_none(),
-        "spool adoption must not resurrect a terminally-finalized sandbox",
     );
 
     // The production recovery leg: the coordinator-driven finalized resume

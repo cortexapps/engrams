@@ -1,16 +1,10 @@
-//! The op-boundary crash injector (ADR 0098 P5) — the REAL `HostFs`
-//! interception that replaces P2–P4's externally-constructed post-crash
-//! states.
+//! The operation-boundary crash injector (ADR 0098 P5).
 //!
-//! [`CrashFs`] wraps the production [`TokioFs`] and gates every operation:
-//! each call appends its [`FsOp`] to a shared trace, and when a crash index
-//! is armed, the op at (and after) that index returns an error WITHOUT
-//! performing — so ops `0..k` ran for real and the on-disk state is exactly
-//! what a process death before op `k` leaves. Because the shipped
-//! `durable_record::persist` / `spool::write_spool` bodies themselves issue
-//! the ops through the seam, the crash-point list is **derived from the
-//! production op sequence by running it** — never a hand-maintained parallel
-//! table (`tests/crashpoint_coverage.rs` pins the derivation).
+//! [`CrashFs`] wraps [`TokioFs`] and gates every operation. Each call appends
+//! its [`FsOp`] to a trace. An armed cut returns an error at the selected
+//! operation and at each later operation. The earlier operations run through
+//! the production implementation. Durable record and finalize tests derive
+//! their crash schedule from this trace.
 //!
 //! The H5 composition contract still holds: ADR 0099 H5's static tests own
 //! byte-level torn states (a truncated file, a flipped bit); this seam owns
@@ -19,18 +13,10 @@
 //!
 //! # Storage lies (ADR 0098 Phase 3, R5 — the storage-fault model)
 //!
-//! P5's crash cut models a process death; it does not model a disk that
-//! LIES about the bytes it stored. R5 adds a seeded READ-corruption arm
-//! ([`ReadFault`]): the op at a chosen READ index returns corrupted bytes —
-//! a byte-flip (bit-rot), or a wholesale substitution of an earlier version's
-//! bytes (a stale read) or another path's bytes (a misdirected read). The
-//! corruption is **fully seeded and applied IN-POLL** (a pure transform of
-//! the bytes `TokioFs` returned, no real-I/O timing) so a seed replays
-//! byte-for-byte. This is what exercises the durable-format checksum gaps:
-//! `spool` re-hashes each CHUNK on adoption (so a corrupt chunk is caught),
-//! but `durable_record` and the spool META are unchecksummed JSON — a
-//! syntactically-valid corruption of those is TRUSTED until R5's envelope
-//! (`engram_host_agent::durable_envelope`) is added.
+//! P5's cut models process death. R5 also provides a seeded read-corruption
+//! arm ([`ReadFault`]). It can flip one byte or substitute selected bytes.
+//! The transform runs in the poll that reads the bytes. No I/O timing affects
+//! the result. Durable format tests use this arm to check their envelopes.
 
 use std::io;
 use std::path::{Path, PathBuf};

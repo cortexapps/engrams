@@ -23,17 +23,14 @@ pub const NUM_SANDBOXES: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
-    /// No crashes — pure guest workload + flush/spool machinery. The
-    /// durability baseline.
+    /// No crashes. This profile is the guest and flush baseline.
     Calm,
-    /// Adds process crash/restart interleavings on top of the workload.
+    /// Add Linux process death and recovery to the workload.
     Chaos,
 }
 
-/// The P2 step surface — all drivable TODAY with the portable components
-/// (`ChunkedDiskBackend` + the shutdown spool). P3+ extends this enum (Flow
-/// A–E extractions, crash-point injection); `tests/flow_coverage.rs` matches
-/// it wildcard-free so a new variant is a compile error, not a silent gap.
+/// The simulator step surface. `tests/flow_coverage.rs` matches it without a
+/// wildcard. A new variant is therefore a compile error in that test.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
     /// A guest write of a fresh content-tagged chunk (appends the ledger).
@@ -42,17 +39,9 @@ pub enum Step {
     GuestRead(usize, u64),
     /// A full flush: upload dirty, tick + publish the manifest.
     FlushTick(usize),
-    /// Export the un-uploaded tier to the shutdown spool.
-    SpoolExport(usize),
-    /// Successor spool adoption (race-free self-handoff).
-    SpoolAdopt(usize),
-    /// Orderly process crash: spool live sandboxes, then drop RAM backends.
+    /// Process death. The stable dirty files survive.
     CrashProcess,
-    /// ABRUPT process death (P4.5): drop RAM backends with NO shutdown spool —
-    /// the post-ack / pre-handoff loss window. An un-handed-off acked write is
-    /// legitimately lost; the honest oracle tolerates exactly that.
-    AbruptCrash,
-    /// Restart: rebuild backends from the surviving store + adopt spools.
+    /// Restart and recover each stable dirty file.
     Restart,
     /// Advance virtual time (fires due tokio timers).
     AdvanceTime(Duration),
@@ -66,20 +55,6 @@ pub enum Step {
     /// ownership (a terminal/idle/rebound session). Reconcile should reap it
     /// after the strike debounce.
     RevokeOwnership(usize),
-    /// Flow A (P4): drive the REAL extracted SIGTERM ladder. The payload is
-    /// the seeded `ENGRAM_SHUTDOWN_FLUSH_BUDGET_SECS` in MILLIseconds (`None`
-    /// = env unset); `u64` millis keeps [`Step`] `Eq` (an `f64` would not).
-    /// A tiny budget overruns the final-flush deadline → the #225 shape.
-    Sigterm(Option<u64>),
-    /// Flow A (af28cac4, 2026-07-21): the SIGTERM deadline overruns while
-    /// sandbox `.0`'s final flush is IN FLIGHT — a REAL `flush()` parked at
-    /// seam point `.1 % 3` — and the fixed driver ABORTS + reaps it before
-    /// the abandon sweep's spool export. [`Sigterm`](Step::Sigterm)'s binary
-    /// overrun (flush completes-before-export or never runs) cannot
-    /// represent this third state; the incident lived exactly there. The
-    /// step asserts the spool-coherence obligations inline (head unmoved,
-    /// spool stamp == head) at every seam point — the abort-safety sweep.
-    SigtermFlushParkedAt(usize, u8),
     /// Flow D (P5): begin an eviction finalize for sandbox `idx` — the sim
     /// analog of `snapshot_begin` (drain → stage → durable record → pause).
     /// Idempotent: a pending finalize re-observes the same snapshot id.
@@ -91,11 +66,6 @@ pub enum Step {
     /// cut at fs-op index `op`, then the process dies. Ops before the cut ran
     /// for real — the on-disk state is exactly a death at that boundary.
     FinalizeCrashAt(usize, usize),
-    /// P5 (replacing P4's post-hoc spool mangle): the predecessor's spool
-    /// write is cut at fs-op index `op` by the real seam (redundant with a
-    /// completed flush-publish), then the process dies. Every op index must
-    /// recover every acked write.
-    SpoolCrashAt(usize),
     /// Flow F (P6): the #204 interleaving — a REAL flush parked at the
     /// dirty→pending handoff races a guest read+write of the drained
     /// chunk. The read must never observe pre-drain stale base.
@@ -105,10 +75,9 @@ pub enum Step {
     /// publish must abort (manifest unmoved, dirty re-queued) and the
     /// post-heal flush publishes the re-queued writes.
     FlushFenceAbort(usize),
-    /// Flow F (P6): the store-ahead crash window — the process dies with
-    /// a REAL flush parked between `put_manifest` and the rebase. Honest
-    /// loss (the floor never rose); the successor's next flush recovers
-    /// via the version-conflict retry.
+    /// Flow F (P6): process death between `put_manifest` and rebase. The
+    /// dirty file keeps all acked writes. Recovery also handles the store
+    /// version conflict.
     FlushPreRebaseCrash(usize),
     /// Flow E (P8): open a migration export on sandbox `idx` — the guest
     /// freezes, a REAL export lands in the REAL registry (paused-clock
@@ -155,13 +124,6 @@ pub enum Step {
     /// Flow B (P7): release the oldest held spare lease (Claimed → Free),
     /// exercising the allocator's release path.
     SlotPopulateTick,
-    /// R5 (Phase 3, storage lies): rehydrate sandbox `.0` from a STANDING
-    /// spool whose bytes a seeded storage fault corrupts — `.1` selects the
-    /// META marker (`true`) vs the first CHUNK (`false`), byte-flipped at
-    /// offset `.2`. The recovery must DETECT the lie (the spool's per-chunk
-    /// re-hash, or R5's meta envelope) or TOLERATE it (the redundant published
-    /// floor) — never a silent corrupt adopt.
-    CorruptSpoolRecovery(usize, bool, usize),
     /// #898: resume a terminally-finalized (destroyed) sandbox from its
     /// finalize-published snapshot — the production-equivalent recovery
     /// path the coordinator drives after eviction, decided by the REAL
@@ -181,21 +143,15 @@ impl Step {
             Step::GuestWrite(..) => "GuestWrite",
             Step::GuestRead(..) => "GuestRead",
             Step::FlushTick(..) => "FlushTick",
-            Step::SpoolExport(..) => "SpoolExport",
-            Step::SpoolAdopt(..) => "SpoolAdopt",
             Step::CrashProcess => "CrashProcess",
-            Step::AbruptCrash => "AbruptCrash",
             Step::Restart => "Restart",
             Step::AdvanceTime(..) => "AdvanceTime",
             Step::ReconcileTick => "ReconcileTick",
             Step::DropLocalBinding(..) => "DropLocalBinding",
             Step::RevokeOwnership(..) => "RevokeOwnership",
-            Step::Sigterm(..) => "Sigterm",
-            Step::SigtermFlushParkedAt(..) => "SigtermFlushParkedAt",
             Step::SnapshotBegin(..) => "SnapshotBegin",
             Step::FinalizeTick(..) => "FinalizeTick",
             Step::FinalizeCrashAt(..) => "FinalizeCrashAt",
-            Step::SpoolCrashAt(..) => "SpoolCrashAt",
             Step::FlushHandoffRace(..) => "FlushHandoffRace",
             Step::FlushFenceAbort(..) => "FlushFenceAbort",
             Step::FlushPreRebaseCrash(..) => "FlushPreRebaseCrash",
@@ -212,38 +168,15 @@ impl Step {
             Step::LoseRecord(..) => "LoseRecord",
             Step::SlotClaim(..) => "SlotClaim",
             Step::SlotPopulateTick => "SlotPopulateTick",
-            Step::CorruptSpoolRecovery(..) => "CorruptSpoolRecovery",
             Step::FinalizedResume(..) => "FinalizedResume",
         }
     }
 }
 
-/// A seeded final-flush budget in milliseconds (`None` = env unset). The set
-/// spans below and above [`SIM_FLUSH_COST`](crate::world::SIM_FLUSH_COST) (1 s)
-/// so both the deadline-overrun (#225) and the clean-flush ladder paths are
-/// exercised; `Some(0)` is the non-positive-env case (`plan_shutdown` defaults
-/// it, no overrun).
-fn pick_budget_ms(rng: &mut ChaCha8Rng) -> Option<u64> {
-    match rng.random_range(0..6u32) {
-        0 => None,         // env unset → default 20 s → no overrun
-        1 => Some(0),      // non-positive → default 20 s → no overrun
-        2 => Some(1),      // 1 ms → OVERRUN (#225)
-        3 => Some(500),    // 0.5 s → OVERRUN (#225)
-        4 => Some(5_000),  // 5 s → completes
-        _ => Some(30_000), // 30 s → completes
-    }
-}
-
-/// A seeded fs-op cut index for the CrashFs injectors. `write_spool` over a
-/// full dirty set traces ~22 ops and a finalize pass ~30; 0..32 covers every
-/// boundary plus past-the-end (which completes, then dies) — all legitimate.
+/// Select an operation index for a `CrashFs` finalize cut.
+#[cfg(target_os = "linux")]
 fn pick_op_index(rng: &mut ChaCha8Rng) -> usize {
     rng.random_range(0..32usize)
-}
-
-/// Convert a seeded budget (millis) to the `plan_shutdown` env value (secs).
-fn budget_secs(ms: Option<u64>) -> Option<f64> {
-    ms.map(|ms| ms as f64 / 1000.0)
 }
 
 /// The run artifact — same shape as `engram-dst`'s `SimReport`. The
@@ -300,8 +233,8 @@ impl Sim {
 
     fn pick(&mut self) -> Step {
         let n = NUM_SANDBOXES;
-        // A crashed process must restart before doing anything else useful;
-        // bias hard toward Restart so the crash window stays bounded.
+        // A crashed Linux process must restart before other work can run.
+        #[cfg(target_os = "linux")]
         if self.crashed {
             let roll: u32 = self.rng.random_range(0..100);
             if roll < 80 {
@@ -328,14 +261,15 @@ impl Sim {
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
                 48..=57 => Step::FlushTick(self.rng.random_range(0..n)),
-                58..=63 => Step::SpoolExport(self.rng.random_range(0..n)),
-                64..=69 => Step::SpoolAdopt(self.rng.random_range(0..n)),
+                58..=63 => Step::FlushTick(self.rng.random_range(0..n)),
+                64..=69 => Step::GuestWrite(
+                    self.rng.random_range(0..n),
+                    self.rng.random_range(0..NUM_CHUNKS),
+                ),
                 70..=75 => Step::ReconcileTick,
                 76..=78 => Step::DropLocalBinding(self.rng.random_range(0..n)),
                 79..=80 => Step::RevokeOwnership(self.rng.random_range(0..n)),
-                // Sigterm is a GRACEFUL shutdown (the spool always completes),
-                // so it belongs in the calm durability baseline too.
-                81..=83 => Step::Sigterm(pick_budget_ms(&mut self.rng)),
+                81..=83 => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
                 // Flow B (P7): the slot/reattach lifecycle. All benign under
                 // the safe defaults — the oracles must hold every step.
                 84..=86 => Step::SlotClaim(self.rng.random_range(0..n)),
@@ -360,14 +294,8 @@ impl Sim {
                 104 => Step::MigrationTtlSweep,
                 105 => Step::MigrationCommit(self.rng.random_range(0..n)),
                 106 => Step::MigrationAbort(self.rng.random_range(0..n)),
-                // Flow A (af28cac4): the overrun-with-an-in-flight-flush
-                // SIGTERM. Graceful (abort + spool complete), so it belongs
-                // in the calm durability baseline like Sigterm.
-                107..=108 => {
-                    let idx = self.rng.random_range(0..n);
-                    let seam = self.rng.random_range(0..3u8);
-                    Step::SigtermFlushParkedAt(idx, seam)
-                }
+                107 => Step::FlushHandoffRace(self.rng.random_range(0..n)),
+                108 => Step::FlushFenceAbort(self.rng.random_range(0..n)),
                 // #898: the graceful post-eviction resume belongs in the calm
                 // baseline (begin → ticks → destroy → resume → reads verify).
                 // Carved from the tail AdvanceTime band, not a re-weight.
@@ -384,29 +312,55 @@ impl Sim {
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
                 33..=41 => Step::FlushTick(self.rng.random_range(0..n)),
-                42..=48 => Step::SpoolExport(self.rng.random_range(0..n)),
-                49..=55 => Step::SpoolAdopt(self.rng.random_range(0..n)),
+                42..=48 => Step::GuestWrite(
+                    self.rng.random_range(0..n),
+                    self.rng.random_range(0..NUM_CHUNKS),
+                ),
+                49..=55 => Step::FlushTick(self.rng.random_range(0..n)),
                 56..=62 => Step::ReconcileTick,
                 63..=65 => Step::DropLocalBinding(self.rng.random_range(0..n)),
                 66..=67 => Step::RevokeOwnership(self.rng.random_range(0..n)),
-                68..=72 => Step::CrashProcess,
-                // P4.5: abrupt death exercises the post-ack/pre-handoff loss
-                // window — the honest oracle must TOLERATE the resulting rolled-
-                // back un-handed-off writes (and still catch a lost handed-off
-                // one). Without this the hard-crash window is never explored.
-                73..=76 => Step::AbruptCrash,
-                77..=79 => Step::Restart,
-                80..=82 => Step::Sigterm(pick_budget_ms(&mut self.rng)),
-                // P5: the op-boundary crash injectors (CrashFs cuts).
-                83 => Step::SpoolCrashAt(pick_op_index(&mut self.rng)),
+                68..=76 => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        Step::CrashProcess
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Step::GuestWrite(
+                            self.rng.random_range(0..n),
+                            self.rng.random_range(0..NUM_CHUNKS),
+                        )
+                    }
+                }
+                77..=79 => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        Step::Restart
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30)))
+                    }
+                }
+                80..=83 => Step::ReconcileTick,
                 84 => {
-                    Step::FinalizeCrashAt(self.rng.random_range(0..n), pick_op_index(&mut self.rng))
+                    #[cfg(target_os = "linux")]
+                    {
+                        Step::FinalizeCrashAt(
+                            self.rng.random_range(0..n),
+                            pick_op_index(&mut self.rng),
+                        )
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Step::FinalizeTick(self.rng.random_range(0..n))
+                    }
                 }
                 // Flow D (P5): the finalize lifecycle under chaos.
                 85 => Step::SnapshotBegin(self.rng.random_range(0..n)),
                 86..=87 => Step::FinalizeTick(self.rng.random_range(0..n)),
-                // Flow B (P7): park → roll → rehydrate → sweep → un-pause. The
-                // roll comes from CrashProcess/AbruptCrash/Sigterm/the injectors.
+                // Flow B (P7): park, rehydrate, sweep, and unpause.
                 88..=89 => Step::SlotClaim(self.rng.random_range(0..n)),
                 90 => Step::SlotPopulateTick,
                 91..=92 => Step::Park(self.rng.random_range(0..n)),
@@ -416,7 +370,16 @@ impl Sim {
                 // Flow F (P6): the flush-pipeline interleavings.
                 97 => Step::FlushHandoffRace(self.rng.random_range(0..n)),
                 98 => Step::FlushFenceAbort(self.rng.random_range(0..n)),
-                99 => Step::FlushPreRebaseCrash(self.rng.random_range(0..n)),
+                99 => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        Step::FlushPreRebaseCrash(self.rng.random_range(0..n))
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Step::FlushFenceAbort(self.rng.random_range(0..n))
+                    }
+                }
                 // Flow E (P8): the migration lifecycle under chaos (crash
                 // steps above kill the RAM registry mid-export).
                 100..=101 => Step::MigrationBegin(self.rng.random_range(0..n)),
@@ -425,27 +388,13 @@ impl Sim {
                 104 => Step::MigrationTtlSweep,
                 105 => Step::MigrationCommit(self.rng.random_range(0..n)),
                 106 => Step::MigrationAbort(self.rng.random_range(0..n)),
-                // R5 (Phase 3, storage lies): a small-weight seeded storage
-                // fault on a spool rehydrate — 107 corrupts the META marker,
-                // 108 the first CHUNK. The idx + byte offset draw off the
-                // pick stream so the corruption is a pure function of the seed.
-                107..=108 => {
-                    let idx = self.rng.random_range(0..n);
-                    let offset = self.rng.random_range(0..64usize);
-                    Step::CorruptSpoolRecovery(idx, roll == 107, offset)
-                }
                 // Wave 7b (#784 layer 2): a small-weight record-loss fault so the
                 // gap-A family — a resident survivor invisible to the records —
                 // arises under the swarm and the barrier's severed-live-holder +
                 // quarantine oracles guard it every step.
-                109 => Step::LoseRecord(self.rng.random_range(0..n)),
-                // Flow A (af28cac4): the overrun-with-an-in-flight-flush
-                // SIGTERM, under chaos — the roll it models IS a crash step.
-                110..=111 => {
-                    let idx = self.rng.random_range(0..n);
-                    let seam = self.rng.random_range(0..3u8);
-                    Step::SigtermFlushParkedAt(idx, seam)
-                }
+                107..=109 => Step::LoseRecord(self.rng.random_range(0..n)),
+                110 => Step::FlushHandoffRace(self.rng.random_range(0..n)),
+                111 => Step::FlushFenceAbort(self.rng.random_range(0..n)),
                 // #898: the post-eviction resume under chaos — the crash
                 // steps above interleave rolls between destroy and resume.
                 // Carved from the tail AdvanceTime band, not a re-weight.
@@ -467,8 +416,6 @@ impl Sim {
             }
             Step::GuestRead(idx, c) => self.host.guest_read(idx, c).await?,
             Step::FlushTick(idx) => self.host.flush_tick(idx).await?,
-            Step::SpoolExport(idx) => self.host.spool_export(idx).await?,
-            Step::SpoolAdopt(idx) => self.host.spool_adopt(idx).await?,
             Step::CrashProcess => {
                 self.host.crash_process().await?;
                 // A fresh host-agent process starts with an empty strike
@@ -476,16 +423,14 @@ impl Sim {
                 self.reconcile_strikes.clear();
                 self.crashed = true;
             }
-            Step::AbruptCrash => {
-                self.host.abrupt_crash().await?;
-                // Same successor-process reset as any roll; RAM died, so bias
-                // toward Restart next.
-                self.reconcile_strikes.clear();
-                self.crashed = true;
-            }
             Step::Restart => {
-                self.host.restart().await?;
-                self.crashed = false;
+                #[cfg(target_os = "linux")]
+                {
+                    self.host.restart().await?;
+                    self.crashed = false;
+                }
+                #[cfg(not(target_os = "linux"))]
+                return Err("dirty-file recovery needs Linux extent semantics".to_string());
             }
             Step::AdvanceTime(d) => self.host.clock.advance(d).await,
             Step::ReconcileTick => {
@@ -495,31 +440,12 @@ impl Sim {
             }
             Step::DropLocalBinding(idx) => self.host.drop_local_binding(idx),
             Step::RevokeOwnership(idx) => self.host.revoke_ownership(idx),
-            Step::Sigterm(budget_ms) => {
-                self.host.sigterm(budget_secs(budget_ms)).await?;
-                // A fresh host-agent process starts with an empty strike
-                // ledger; RAM died, so bias toward Restart next.
-                self.reconcile_strikes.clear();
-                self.crashed = true;
-            }
-            Step::SigtermFlushParkedAt(idx, seam) => {
-                self.host.sigterm_flush_parked(idx, seam).await?;
-                // A SIGTERM either way (parked-flush or the fallback plain
-                // overrun ladder): RAM died, strikes reset, Restart next.
-                self.reconcile_strikes.clear();
-                self.crashed = true;
-            }
             Step::SnapshotBegin(idx) => {
                 let _ = self.host.snapshot_begin(idx).await?;
             }
             Step::FinalizeTick(idx) => self.host.finalize_tick(idx).await?,
             Step::FinalizeCrashAt(idx, op) => {
                 self.host.finalize_crash_at(idx, op).await?;
-                self.reconcile_strikes.clear();
-                self.crashed = true;
-            }
-            Step::SpoolCrashAt(op) => {
-                self.host.spool_crash_at(op).await?;
                 self.reconcile_strikes.clear();
                 self.crashed = true;
             }
@@ -552,12 +478,6 @@ impl Sim {
             Step::LoseRecord(idx) => self.host.lose_record(idx),
             Step::SlotClaim(idx) => self.host.slot_claim(idx).await,
             Step::SlotPopulateTick => self.host.slot_populate_tick(),
-            Step::CorruptSpoolRecovery(idx, meta, offset) => {
-                // A per-sandbox rehydrate (drop + rebuild through a corrupting
-                // read) — like SpoolAdopt, it leaves the sandbox live, so no
-                // whole-host crash/restart bias.
-                self.host.corrupt_spool_recovery(idx, meta, offset).await?;
-            }
             Step::FinalizedResume(idx) => {
                 // A dead host-agent serves no resume: the coordinator can only
                 // drive this against a live process (the crashed window's other
@@ -570,12 +490,9 @@ impl Sim {
         Ok(())
     }
 
-    /// Run `steps` picks, checking the oracle after every step, then quiesce
-    /// (a final orderly crash→restart), drain finalizes, drive one final REAL
-    /// flush per live sandbox, and require every surviving chunk's content
-    /// at-or-below the published floor. The durability property must hold
-    /// across a clean shutdown/recovery cycle, and no SURVIVING acked write
-    /// may remain never-flushed at quiescence.
+    /// Run selected steps and check the oracles after each step. Linux also
+    /// runs a final process death and recovery. The final flush must publish
+    /// every surviving acked write.
     pub async fn run(&mut self, steps: u64) -> Result<SimReport, String> {
         for _ in 0..steps {
             let step = self.pick();
@@ -588,10 +505,11 @@ impl Sim {
                 ));
             }
         }
-        // Quiesce: one clean crash→restart cycle, then the oracle must still
-        // recover every acked write.
-        self.execute(Step::CrashProcess).await?;
-        self.execute(Step::Restart).await?;
+        #[cfg(target_os = "linux")]
+        {
+            self.execute(Step::CrashProcess).await?;
+            self.execute(Step::Restart).await?;
+        }
         if let Err(v) = invariants::check(&self.host).await {
             return Err(format!("quiescence: {} — {}", v.invariant, v.detail));
         }
@@ -619,13 +537,13 @@ impl Sim {
                 v.invariant, v.detail
             ));
         }
-        // R1.5: the quiescence flush — drive one final REAL flush per live
-        // sandbox, then require every surviving chunk's content at-or-below
-        // (with oracle #1, exactly at) the published floor. This is what makes
-        // "bounded loss" a checked bound: any acked write still SURVIVING
-        // above the floor here was never flushed by anyone — a flush-pipeline
-        // liveness hole, not an accepted crash-window loss (a crash-lost
-        // write is already gone from the backend and stays accepted).
+        // End each open migration before the final flush. Linux process death
+        // already clears the registry. This also heals the macOS path, which
+        // does not run dirty-file recovery.
+        for idx in 0..NUM_SANDBOXES {
+            self.host.migration_abort(idx);
+        }
+        // The quiescence flush must publish the latest acked content.
         for idx in 0..NUM_SANDBOXES {
             self.execute(Step::FlushTick(idx)).await?;
         }

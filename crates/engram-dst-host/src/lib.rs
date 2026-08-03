@@ -1,145 +1,63 @@
-//! The host-internal deterministic simulator (ADR 0098 Phase 2, P2).
+//! The host-internal deterministic simulator (ADR 0098 and ADR 0110).
 //!
-//! `engram-dst-host` is the sibling of `engram-dst`: where that crate drives
-//! the real coordinator drivers over `engram-sim`, this one drives the
-//! PORTABLE host-agent machinery — `ChunkedDiskBackend` and the shutdown
-//! spool — over `engram-host-core`'s [`HostEffects`](engram_host_core::HostEffects)
-//! seams, on a per-run [`SimFs`] tempdir. It clones `engram-dst`'s
-//! determinism discipline exactly: a seeded `ChaCha8` pick stream forked
-//! from the world's `SimEntropy`, a current-thread paused-tokio runtime,
-//! run-step-to-completion scheduling, BTreeMap-ordered decisions, a
-//! [`SimReport`] the replay-diff test compares, and no banned time/entropy
-//! calls (see `clippy.toml`).
+//! This crate drives portable host-agent code over seeded world inputs. Each
+//! run uses a current-thread Tokio runtime with paused time. A seeded ChaCha8
+//! stream selects steps. Ordered collections make all decisions stable.
 //!
-//! **Hard boundary:** this crate does NOT depend on `engram-coordinator`.
+//! The disk model uses one stable dirty file for each sandbox. A guest write
+//! reaches this file before the backend returns. Linux process-death flows drop
+//! the backend and reopen the file in recovery mode. The sidecar selects a
+//! store-ahead manifest when the coordinator ref is stale. Oracle #1 requires
+//! every chunk to return its exact latest acked tag after recovery.
+//!
+//! The flows the scheduler drives, and where each came from:
+//!
+//! * **Flow C — reconcile (P3):** [`ReconcileTick`](Step::ReconcileTick) plus
+//!   the [`DropLocalBinding`](Step::DropLocalBinding) /
+//!   [`RevokeOwnership`](Step::RevokeOwnership) perturbations run the REAL
+//!   `reconcile_once` against the modeled reconcile world. Oracle #9 pins the
+//!   None-arm mis-reap fix. See [`reconcile`].
+//! * **Flow D — eviction finalize (P5):**
+//!   [`SnapshotBegin`](Step::SnapshotBegin) /
+//!   [`FinalizeTick`](Step::FinalizeTick) /
+//!   [`FinalizeCrashAt`](Step::FinalizeCrashAt) drive the REAL finalize legs.
+//!   [`CrashFs`] cuts `durable_record` and finalize file operations at seeded
+//!   op boundaries; the crash schedule derives from the production op
+//!   sequence (`tests/crashpoint_coverage.rs` pins the derivation). Oracles
+//!   #6 (stage monotone) and #8 (convergence at quiescence) guard it.
+//! * **Flow B — the slot/reattach device lifecycle (P7):**
+//!   [`SlotClaim`](Step::SlotClaim), [`Park`](Step::Park),
+//!   [`Unpause`](Step::Unpause), [`RegisterRehydrate`](Step::RegisterRehydrate),
+//!   [`StaleSweepTick`](Step::StaleSweepTick). Oracles #3 (slot accounting)
+//!   and #5 (single-device ownership, no severed live holder) guard it.
+//! * **Flow F — the flush-pipeline seam (P6):**
+//!   [`FlushHandoffRace`](Step::FlushHandoffRace) /
+//!   [`FlushFenceAbort`](Step::FlushFenceAbort) /
+//!   [`FlushPreRebaseCrash`](Step::FlushPreRebaseCrash) park a REAL `flush()`
+//!   at the three `FlushSeamPoint`s and interleave reads, writes, fences,
+//!   and process death against it.
+//! * **Flow E — migration (P8):** the `Migration*` steps run the REAL
+//!   `MigrationRegistry` over injected time. Oracle #7 pins the #216
+//!   decision table; oracle #2 pins plane accounting.
+//!
+//! **Hard boundary:** this crate does not depend on `engram-coordinator`.
 //! The coordinator and host simulators sit in disjoint cargo-dep closures so
 //! the CI detector runs each lane independently.
 //!
-//! # The step/oracle surface (P2)
-//!
-//! Steps: [`GuestWrite`](Step::GuestWrite) / [`GuestRead`](Step::GuestRead)
-//! (content-tag-stamped synthetic chunks + read-after-write),
-//! [`FlushTick`](Step::FlushTick), [`SpoolExport`](Step::SpoolExport) /
-//! [`SpoolAdopt`](Step::SpoolAdopt), [`CrashProcess`](Step::CrashProcess) /
-//! [`Restart`](Step::Restart), [`AdvanceTime`](Step::AdvanceTime). The single
-//! oracle is acked-write durability (see [`invariants`]).
-//!
-//! # P3 (Flow C — reconcile)
-//!
-//! P3 adds [`ReconcileTick`](Step::ReconcileTick) (+ the
-//! [`DropLocalBinding`](Step::DropLocalBinding) /
-//! [`RevokeOwnership`](Step::RevokeOwnership) perturbations), driving the REAL
-//! [`reconcile_once`](engram_host_agent::teardown_reconcile::reconcile_once)
-//! against a modelled reconcile world ([`reconcile`]) and the now-live
-//! adversarial [`ScriptedResponse`] queue. Oracle #9 (the None-arm mis-reap
-//! stays fixed) joins the invariant suite. See [`reconcile`].
-//!
-//! # P4 (Flow A — the SIGTERM ladder)
-//!
-//! P4 drives the REAL extracted shutdown ladder
-//! ([`engram_host_core::shutdown`]): the [`Sigterm`](Step::Sigterm) step runs
-//! `plan_shutdown`/`classify_survivor` over the sim host (a seeded budget
-//! below the modeled flush cost overruns → stragglers ride the spool, #225).
-//! The world-model `rebuild` gains the 85e0298a store-ahead rule (attach from
-//! the spool's ahead ref, never coord's stale one). The #224
-//! insert-after-sweep gate rides as the extracted ordering contract
-//! ([`admits_new_plane`](engram_host_core::admits_new_plane)); the literal
-//! `abandon_nbd_data_planes_for_shutdown` DashMap race stays FC-lane residue.
-//! (P4's static `CrashPoint` catalogue + post-hoc crash-state construction
-//! were superseded by P5's real seam interception — see below.)
-//!
-//! The af28cac4 wave (2026-07-21) closed [`Sigterm`](Step::Sigterm)'s
-//! fidelity gap: its overrun was BINARY (the final flush completes before
-//! the export, or never runs), which could not represent the incident's
-//! third state — the flush IN FLIGHT at the deadline, completing detached
-//! AFTER the spool export and stranding the spool's stamp behind the
-//! published ref. [`SigtermFlushParkedAt`](Step::SigtermFlushParkedAt)
-//! parks a REAL flush at a seeded P6 seam point, aborts + reaps it before
-//! the export (the fixed driver's contract), and asserts the
-//! spool-coherence obligations inline at every seam; `rebuild` gains the
-//! stale-refusal oracle (a refused same-lineage spool must never hold the
-//! only copy of an acked write above the published floor). The pre-fix
-//! interleaving is pinned self-catching by the
-//! `detached_flush_publish_after_spool_export_is_caught_at_rebuild` seed;
-//! the literal tokio task-detachment race stays FC-lane
-//! (`nbd_shutdown_final_flush.rs`).
-//!
-//! # P4.5 (oracle honesty — the durability pipeline, not omniscient recovery)
-//!
-//! The acked-write oracle ([`invariants`]) is sharpened from "every acked write
-//! recovers" to the honest range `[published_floor, latest_ack]`. The ledger
-//! tracks the published-tier FLOOR per chunk (raised only by a real
-//! [`FlushTick`](Step::FlushTick) / the SIGTERM ladder's publish leg, observed
-//! from the durable manifest): a PUBLISHED write must never roll back, but a
-//! write lost to abrupt death before it is published is an accepted, bounded
-//! loss. A shutdown-spool capture is a TRANSIENT handoff (the successor adopts
-//! it back into the volatile tier), so it does NOT raise the floor; spool
-//! recovery is asserted by the regression seeds that crash with a standing
-//! spool. The new [`AbruptCrash`](Step::AbruptCrash) step drops RAM with NO
-//! spool to exercise the post-ack/pre-publish window every prior crash
-//! primitive (all spool first) never reached — which is what surfaced that a
-//! sticky spool floor over-claims. See the regression seed
-//! `post_ack_pre_handoff_crash_is_honest_loss`.
-//!
-//! # P5 (Flow D — eviction finalize + the real `HostFs` interception)
-//!
-//! `durable_record` and the shutdown spool now perform every durable op
-//! through the injected [`HostFs`](engram_host_core::HostFs) seam, and
-//! [`CrashFs`] is the injector: it records the op trace and cuts at a seeded
-//! op index, so the crash schedule is DERIVED from the production op
-//! sequence by running it (`tests/crashpoint_coverage.rs` pins the
-//! derivation; the P2–P4 `CrashPoint`/`crash_state` machinery is retired).
-//! [`SnapshotBegin`](Step::SnapshotBegin) begins a REAL eviction finalize
-//! (drain → `persist_disk_pending_chunks` → the durable record, the VM
-//! paused for the duration); [`FinalizeTick`](Step::FinalizeTick) runs the
-//! REAL production loop body (`run_eviction_finalize_attempt`: legs +
-//! retry/quarantine verdict); [`FinalizeCrashAt`](Step::FinalizeCrashAt) and
-//! [`SpoolCrashAt`](Step::SpoolCrashAt) cut those flows mid-sequence and the
-//! restart resume leg re-drives from the persisted stage through the real
-//! `load_all`. A completed finalize's disk manifest is a durable publish —
-//! it raises the acked-write oracle's published floor; a quarantine leaves
-//! the floor at the prior tier (the honest bounded rollback). Oracles #6
-//! (`FinalizeStage` monotone + stage⇒fields, [`invariants`]) and #8
-//! (convergence at quiescence — every started finalize completes or
-//! quarantines within the attempts budget) join the suite.
-//!
-//! # P6 (Flow F — the flush scheduler seam)
-//!
-//! The P2-era test-only #204 handoff barrier generalized into the 3-point
-//! [`FlushSeamPoint`](engram_host_agent::disk_daemon::backend::FlushSeamPoint)
-//! seam (dirty→pending handoff / post-upload-pre-publish / pre-rebase),
-//! armed per-point on the REAL `ChunkedDiskBackend` at zero data-plane
-//! cost. Steps [`FlushHandoffRace`](Step::FlushHandoffRace) (#204: a read
-//! and a write race the parked handoff — never stale base, the racing
-//! write survives the floor), [`FlushFenceAbort`](Step::FlushFenceAbort)
-//! (#199: a fence raised mid-pipeline aborts the publish; dirty re-queues
-//! and re-publishes post-heal), and
-//! [`FlushPreRebaseCrash`](Step::FlushPreRebaseCrash) (death between
-//! `put_manifest` and the rebase — honest loss, and the successor's next
-//! flush recovers through the real version-conflict retry). The pinned
-//! seeds add the #199 ordering leg (two flushes serialize behind the
-//! pipeline guard, never publishing old-over-new).
-//!
-//! # P8 (Flow E — migration)
-//!
-//! The export TTL clock moved off raw `Instant` onto the injected
-//! `now_mono` (expiry DECIDES destroy/abort — decision-feeding time), so
-//! the paused clock drives the REAL `MigrationRegistry::expired()`. Steps
-//! [`MigrationBegin`](Step::MigrationBegin) (a REAL `MigrationExport` in
-//! the REAL registry; the guest freezes) /
-//! [`MigrationServeState`](Step::MigrationServeState) (the split-brain
-//! flag) / [`MigrationTouch`](Step::MigrationTouch) (the activity anchor) /
-//! [`MigrationTtlSweep`](Step::MigrationTtlSweep) (REAL `expired()` +
-//! `ttl_verdict` over the scriptable coordinator's ownership answer) /
-//! [`MigrationCommit`](Step::MigrationCommit) /
-//! [`MigrationAbort`](Step::MigrationAbort). Oracle #7 pins the #216
-//! decision table (`state_served` ⇒ never abort-unpause — a split-brain
-//! un-pause is structurally recorded and flagged); oracle #2 pins
-//! plane accounting (`migrating` ⟺ an open export, with a live backend —
-//! no frozen guest ever leaks without an export to end it). Seeds cover
-//! the #216 gap family: abort-in-place zero loss, served-stays-paused-
-//! then-destroys, activity-anchored expiry, unreachable-never-guesses,
-//! and the reattached-source verdict table.
+//! [`Step::ReconcileTick`]: scheduler::Step::ReconcileTick
+//! [`Step::DropLocalBinding`]: scheduler::Step::DropLocalBinding
+//! [`Step::RevokeOwnership`]: scheduler::Step::RevokeOwnership
+//! [`Step::SnapshotBegin`]: scheduler::Step::SnapshotBegin
+//! [`Step::FinalizeTick`]: scheduler::Step::FinalizeTick
+//! [`Step::FinalizeCrashAt`]: scheduler::Step::FinalizeCrashAt
+//! [`Step::SlotClaim`]: scheduler::Step::SlotClaim
+//! [`Step::Park`]: scheduler::Step::Park
+//! [`Step::Unpause`]: scheduler::Step::Unpause
+//! [`Step::RegisterRehydrate`]: scheduler::Step::RegisterRehydrate
+//! [`Step::StaleSweepTick`]: scheduler::Step::StaleSweepTick
+//! [`Step::FlushHandoffRace`]: scheduler::Step::FlushHandoffRace
+//! [`Step::FlushFenceAbort`]: scheduler::Step::FlushFenceAbort
+//! [`Step::FlushPreRebaseCrash`]: scheduler::Step::FlushPreRebaseCrash
 
 pub mod coord_stub;
 pub mod device_plane;

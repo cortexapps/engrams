@@ -333,9 +333,10 @@ impl PositionalDiskManifest {
 }
 
 /// Controls whether construction starts a new dirty file or recovers
-/// the allocated extents of an existing file.
+/// the allocated extents of an existing file. Deliberately public:
+/// `engram-dst-host` (a separate crate) selects the open mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DirtyFileOpenMode {
+pub enum DirtyFileOpenMode {
     Truncate,
     Recover,
 }
@@ -529,19 +530,21 @@ fn write_ref_sidecar(dirty_path: &Path, published: ManifestRef) -> std::io::Resu
     std::fs::rename(temporary, sidecar)
 }
 
-/// Production reader is the Linux-only recovery path; tests read it
-/// on every platform.
+/// The production reader is the Linux-only recovery path; tests read it
+/// on every platform. Deliberately public: `engram-dst-host` (a separate
+/// crate) mirrors the Linux recovery path.
 #[cfg(any(test, target_os = "linux"))]
-pub(crate) fn read_ref_sidecar(dirty_path: &Path) -> Option<ManifestRef> {
+pub fn read_ref_sidecar(dirty_path: &Path) -> Option<ManifestRef> {
     let bytes = std::fs::read(ref_sidecar_path(dirty_path)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Pick the recovery attach ref for a dirty-file survivor. The
-/// production caller is the Linux-only recovery path; tests run on
-/// every platform.
+/// Pick the recovery attach ref for a dirty-file survivor. The production
+/// caller is the Linux-only recovery path; tests run on every platform.
+/// Deliberately public: `engram-dst-host` (a separate crate) mirrors the
+/// Linux attach selection.
 #[cfg(any(test, target_os = "linux"))]
-pub(crate) fn resolve_recover_attach_ref(
+pub fn resolve_recover_attach_ref(
     coordinator: ManifestRef,
     recorded: Option<ManifestRef>,
 ) -> ManifestRef {
@@ -1006,7 +1009,10 @@ impl ChunkedDiskBackend {
         .await
     }
 
-    pub(crate) async fn from_blob_with_dirty_file(
+    /// [`from_blob`](Self::from_blob) with an explicit dirty-file path and
+    /// open mode. Deliberately public: `engram-dst-host` (a separate crate)
+    /// drives stable dirty files through it.
+    pub async fn from_blob_with_dirty_file(
         manifest_ref: ManifestRef,
         cache: ChunkCache,
         store: Arc<ChunkStore>,
@@ -1146,9 +1152,11 @@ impl ChunkedDiskBackend {
         Ok(())
     }
 
-    /// Keep an explicitly named stable file when the backend drops.
-    #[cfg(target_os = "linux")]
-    pub(crate) async fn retain_dirty_file(&self) {
+    /// Keep an explicitly named stable file when the backend drops. A pure
+    /// flag flip, so it carries no platform gate. Deliberately public:
+    /// `engram-dst-host` (a separate crate) models a process death by
+    /// dropping a retained backend.
+    pub async fn retain_dirty_file(&self) {
         self.dirty_tier.lock().await.remove_on_drop = false;
     }
 

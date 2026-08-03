@@ -1,30 +1,19 @@
-//! The simulated host world: the RAM/disk split and the acked-write ledger
-//! (ADR 0098 Phase 2, P2).
+//! The simulated host world and the acked-write ledger (ADR 0098 Phase 2).
 //!
-//! [`SimHost`] models one host-agent process. Its state is split exactly the
-//! way a real crash splits it:
+//! [`SimHost`] models one host-agent process. A process death splits its state
+//! in two parts.
 //!
-//! * **RAM (dies on [`CrashProcess`](crate::Step::CrashProcess))** — the
-//!   `Arc<ChunkedDiskBackend>` per sandbox. A backend's dirty tier is the
-//!   in-RAM home of guest-acked-but-un-uploaded writes; the whole point of
-//!   the 2026-07-16 session-85e0298a RCA is that this tier evaporates on a
-//!   crash unless the shutdown spool captured it first.
-//! * **Disk (survives)** — the per-run [`SimFs`] tempdir (records/finalize/
-//!   spool/chunks/cache) and the shared [`ChunkStore`] over
-//!   [`LocalBlobStorage`] (the GCS stand-in). Plus the durable per-sandbox
-//!   pointers (`base_ref`, last-published `published_ref`) the coordinator
-//!   would hold — modelled here as survivor state.
-//! * **Oracle memory (survives)** — the [`AckedWriteLedger`]: one append per
-//!   returned `write`, recording the `content_tag` and the manifest lineage
-//!   the write was acked against. This is what the durability oracle
-//!   ([`crate::invariants`]) replays against the rebuilt world after a crash.
+//! * Process memory contains each live `ChunkedDiskBackend`. Process death
+//!   drops these values.
+//! * Disk contains the stable dirty files, records, manifests, chunks, and
+//!   cache data. All of this state survives process death.
+//! * Oracle memory contains the [`AckedWriteLedger`]. It records each write
+//!   that the guest saw as complete.
 //!
-//! Guest writes are **content-tag-stamped synthetic chunks**: never real
-//! block data, just `tag.to_le_bytes()` tiled across the chunk, so a read
-//! decodes the tag back and the oracle can prove *which* acked write a
-//! recovered chunk carries. `tag = 0` is the base (never-written) content.
+//! Guest writes use synthetic chunks with content tags. A read decodes the
+//! tag and identifies the exact write. Tag zero is the base content.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
@@ -36,14 +25,20 @@ use engram_core::traits::{BlobStorage, Clock as _, Entropy as _};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::SnapshotId;
 use engram_core::{HostId, SandboxId, SessionId};
-use engram_host_agent::disk_daemon::backend::{ChunkedDiskBackend, FlushSeamPoint};
-use engram_host_agent::disk_daemon::{spool, NbdSlot, NbdSlotAllocator};
+#[cfg(target_os = "linux")]
+use engram_host_agent::disk_daemon::backend::{read_ref_sidecar, resolve_recover_attach_ref};
+use engram_host_agent::disk_daemon::backend::{
+    ChunkedDiskBackend, DirtyFileOpenMode, FlushSeamPoint,
+};
+use engram_host_agent::disk_daemon::{NbdSlot, NbdSlotAllocator};
 use engram_host_agent::eviction_finalize::{
     persist_disk_pending_chunks, run_eviction_finalize_attempt, DiskPendingRecord,
     EvictionFinalizeRecord, EvictionFinalizer, EvictionSandbox, FinalizeAttempt,
 };
 use engram_host_agent::migration::{self, MigrationExport, MigrationRegistry, TtlVerdict};
-use engram_host_core::{FinalizeStage, HostEffects, HostFs, LiveManifestPublishRequest};
+use engram_host_core::{
+    FinalizeStage, HostEffects, HostFs, LiveManifestPublishOutcome, LiveManifestPublishRequest,
+};
 use engram_sim::{SimClock, SimEntropy};
 use engram_storage_local::LocalBlobStorage;
 
@@ -60,16 +55,6 @@ use crate::simfs::SimFs;
 pub const CHUNK_SIZE: u64 = 4096;
 /// Chunks per sandbox disk → a 32 KiB disk; `chunk_idx` ranges `0..NUM_CHUNKS`.
 pub const NUM_CHUNKS: u64 = 8;
-
-/// The modeled virtual "cost" of the SIGTERM final-flush pass. A flush
-/// deadline (from `plan_shutdown`) below this can't complete the pass, so it
-/// overruns and every survivor is a straggler whose acked tier rides the
-/// (complete, not deadline-bound) shutdown spool to the successor — the #225
-/// deadline-overrun shape. Above it, the final flush completes and publishes.
-/// Paused-tokio makes the literal `tokio::time::timeout` a no-op in the sim,
-/// so the overrun is modeled at the extracted-plan level (the literal
-/// per-survivor timeout race is Linux/FC-lane residue).
-pub const SIM_FLUSH_COST: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Build the deterministic bytes for a chunk stamped with `content_tag`:
 /// `tag.to_le_bytes()` tiled across the whole chunk. The first 8 bytes are
@@ -101,54 +86,18 @@ pub struct LedgerEntry {
     pub chunk_idx: u64,
     /// The synthetic write's content tag.
     pub content_tag: u64,
-    /// The manifest lineage the write was acked against — recorded so a
-    /// future oracle can reason about lineage-gated spool adoption.
+    /// The manifest lineage at the time of the ack.
     pub lineage_at_ack: ManifestRef,
 }
 
-/// The append-only acked-write ledger — the oracle's durable memory. It
-/// survives a [`CrashProcess`](crate::Step::CrashProcess) (a real coordinator
-/// / an external observer remembers what the guest was told); the RAM
-/// backends do not.
-///
-/// It records two facts per chunk:
-/// * the **latest acked tag** (`log`) — what the guest was last told is
-///   written; and
-/// * the **durable-handoff floor** (`published_floor`) — the tag of the most
-///   recent write for that chunk that a flush PUBLISHED to the durable
-///   (uploaded) tier, i.e. that survives ANY subsequent crash, including
-///   abrupt process death.
-///
-/// The floor is the honest oracle's key (ADR 0098 P4.5). Two boundaries it
-/// makes precise:
-/// * A write acked from the RAM dirty tier but lost to abrupt process death
-///   BEFORE it is published is an accepted, bounded loss (bounded by the flush
-///   cadence + the periodic checkpoint, ADR 0028) — NOT a violation.
-/// * A **shutdown-spool capture is a TRANSIENT handoff, not a floor.** The
-///   spool preserves un-published writes across ONE orderly roll, but the
-///   successor's `rebuild` adopts the spool back into the *volatile* dirty tier
-///   and discards it — so the write is bounded by the next flush again. Baking
-///   a chunk-bearing spool into a sticky floor would falsely demand recovery of
-///   a write a later abrupt crash legitimately loses (the swarm found exactly
-///   this once `AbruptCrash` was added). The published tier is the ONLY
-///   permanent floor; spool RECOVERY is asserted by the dedicated regression
-///   seeds that crash with a STANDING spool, not by the standing-state oracle.
-///
-/// The oracle therefore tolerates any read that is a MEMBER of this chunk's
-/// acked-tag set (or the tag-0 base), bounded below by `published_floor`. It
-/// flags a read OLDER than the published floor (a published write rolled back),
-/// NEWER than the latest ack, or in-range but never acked for this chunk (a
-/// misdirected read).
+/// The append-only acked-write ledger is the oracle's durable memory. It
+/// survives [`CrashProcess`](crate::Step::CrashProcess). The latest tag for a
+/// chunk is the exact value that recovery must return. The published floor is
+/// used only by the quiescence check.
 #[derive(Default)]
 pub struct AckedWriteLedger {
     log: Vec<LedgerEntry>,
-    /// The published-tier floor per `(sandbox, chunk_idx)`: the highest tag a
-    /// flush has published to the durable/uploaded tier. Observed from the REAL
-    /// published manifest (never optimistically flagged), monotonic per chunk
-    /// (the published lineage only advances), and NEVER lowered — the published
-    /// tier is permanently durable. A later un-published write mints a new tag
-    /// that starts BELOW the acked value but does not move the floor until it is
-    /// itself flushed.
+    /// The highest published tag for each chunk.
     published_floor: BTreeMap<(usize, u64), u64>,
 }
 
@@ -179,22 +128,9 @@ impl AckedWriteLedger {
         *slot = (*slot).max(content_tag);
     }
 
-    /// The durable-handoff floor for a chunk: the highest tag a flush published,
-    /// or `None` if no write to this chunk was ever published (its acked writes
-    /// are all still RAM-only or spool-transient, droppable by abrupt death).
+    /// Get the highest published tag for a chunk.
     pub fn handed_off_tag(&self, sandbox: usize, chunk_idx: u64) -> Option<u64> {
         self.published_floor.get(&(sandbox, chunk_idx)).copied()
-    }
-
-    /// Every tag ever acked for `(sandbox, chunk_idx)` — the membership set
-    /// the oracle checks reads against (a read must be one of THESE, never
-    /// merely a numerically in-range tag minted for another chunk).
-    pub fn acked_tags(&self, sandbox: usize, chunk_idx: u64) -> BTreeSet<u64> {
-        self.log
-            .iter()
-            .filter(|e| e.sandbox == sandbox && e.chunk_idx == chunk_idx)
-            .map(|e| e.content_tag)
-            .collect()
     }
 
     /// The recoverable set: the LATEST acked tag per `(sandbox, chunk_idx)`
@@ -210,19 +146,16 @@ impl AckedWriteLedger {
     }
 }
 
-/// One sandbox's slot: the durable pointers survive; `backend` is the RAM
-/// tier that dies on crash.
+/// One sandbox slot. The dirty file and coordinator pointer survive process
+/// death. The backend value does not survive.
 pub struct SandboxSlot {
     pub sandbox_id: SandboxId,
     pub session_id: SessionId,
     /// The private base manifest the sandbox was created on (in the store).
     pub base_ref: ManifestRef,
-    /// The last flush-published manifest ref (durable survivor pointer). The
-    /// successor rebuilds `from_blob` at this (or `base_ref` if never
-    /// flushed).
+    /// The last manifest ref that the coordinator accepted.
     pub published_ref: Option<ManifestRef>,
-    /// The live backend — `None` after a crash, until a restart/adopt
-    /// rebuilds it.
+    /// The live backend. This is `None` after process death.
     pub backend: Option<Arc<ChunkedDiskBackend>>,
 
     // ── Flow B: the NBD slot/reattach device-serving model (ADR 0098 P7) ──
@@ -489,7 +422,16 @@ impl SimHost {
                 .put_manifest(base_ref, &manifest)
                 .await
                 .expect("seed base manifest");
-            let backend = build_backend(&store, fs.cache_dir(), i, base_ref).await;
+            let backend = build_backend(
+                &store,
+                fs.cache_dir(),
+                fs.dirty_dir(),
+                i,
+                sandbox_id,
+                base_ref,
+                DirtyFileOpenMode::Truncate,
+            )
+            .await;
             coord.set_owner(sandbox_id, session_id);
             // Flow C steady state: the sandbox is live, coord-owned, and
             // locally bound — reconcile is a no-op until something perturbs it.
@@ -607,8 +549,8 @@ impl SimHost {
     /// Is sandbox `idx` frozen under an in-flight eviction finalize? The
     /// prod capture lock excludes every concurrent lifecycle op for the
     /// whole finalize (the guest is paused; the VM is destroyed at
-    /// terminal) — the sim mirrors it by gating spool adoption and the
-    /// register-time re-serve on this (the swarm found the resurrection:
+    /// terminal) — the sim mirrors it by gating the register-time re-serve
+    /// on this (the swarm found the resurrection:
     /// a re-serve rebuilt a captured sandbox from the OLD published ref,
     /// then the finalize published a NEWER floor over it).
     fn finalize_pending(&self, idx: usize) -> bool {
@@ -663,18 +605,7 @@ impl SimHost {
         Ok(())
     }
 
-    /// Read a chunk back and, if the ledger has an acked tag for it, assert the
-    /// HONEST read property inline (the oracle re-checks every acked chunk each
-    /// step, but this gives a targeted read trace).
-    ///
-    /// A legitimate read-back is a tag actually acked for this chunk (or the
-    /// tag-0 base), bounded below by the published floor: the live newest
-    /// write, the permanent published floor (a recovery that dropped newer,
-    /// un-published writes — the accepted, bounded loss of ADR 0098 P4.5), or a
-    /// transiently-durable intermediate a standing spool adopted. A read older
-    /// than the published floor (a rolled-back durable write), newer than the
-    /// latest ack, or in-range but never acked for this chunk (misdirection) is
-    /// a durability-pipeline violation.
+    /// Read a chunk and compare it with the latest guest-acked value.
     pub async fn guest_read(&self, idx: usize, chunk_idx: u64) -> Result<(), String> {
         if idx >= self.sandboxes.len() || chunk_idx >= NUM_CHUNKS {
             return Ok(());
@@ -693,31 +624,17 @@ impl SimHost {
             .get(&(idx, chunk_idx))
             .map(|e| e.content_tag)
         {
-            // `0` = base content (never published).
-            let floor = self.ledger.handed_off_tag(idx, chunk_idx).unwrap_or(0);
-            let acked = self.ledger.acked_tags(idx, chunk_idx);
-            let member = got == 0 || acked.contains(&got);
-            if !member || got < floor {
-                let why = if got < floor {
-                    "a lost or rolled-back durable write"
-                } else if got > latest {
-                    "a read newer than the latest ack (a never-acked tag)"
-                } else {
-                    "an in-range tag never acked for this chunk (misdirection)"
-                };
+            if got != latest {
                 return Err(format!(
-                    "read-after-write: sandbox {idx} chunk {chunk_idx} read tag {got} not a \
-                     member of this chunk's acked set within [published_floor {floor}, \
-                     latest_ack {latest}] — {why}"
+                    "read-after-write: sandbox {idx} chunk {chunk_idx} read tag {got}, but the \
+                     latest acked tag is {latest}"
                 ));
             }
         }
         Ok(())
     }
 
-    /// A full flush: drain+upload dirty chunks, tick the manifest version,
-    /// advance `published_ref`, publish to the coordinator, and discard any
-    /// now-superseded spool. No-op on a crashed backend.
+    /// Upload dirty chunks and publish the new manifest ref.
     pub async fn flush_tick(&mut self, idx: usize) -> Result<(), String> {
         if idx >= self.sandboxes.len() || self.sandboxes[idx].migrating {
             return Ok(()); // the export's capture lock excludes flushes
@@ -732,44 +649,29 @@ impl SimHost {
         self.note_flush_published(idx).await
     }
 
-    /// The post-flush bookkeeping every flush-shaped step shares: adopt the
-    /// backend's (possibly advanced) manifest as the durable pointer,
-    /// observe the REAL published chunk set into the ledger floor, discard
-    /// the now-superseded spool, and tell the coordinator. Idempotent when
-    /// the flush was a no-op/abort (the manifest didn't move; re-marking
-    /// the same manifest is monotonic).
+    /// Record a completed backend flush and tell the coordinator.
     pub async fn note_flush_published(&mut self, idx: usize) -> Result<(), String> {
         let Some(backend) = self.sandboxes[idx].backend.clone() else {
             return Ok(());
         };
         let published = backend.manifest_ref().await;
-        self.sandboxes[idx].published_ref = Some(published);
-        // Durable handoff: observe the REAL published chunk set (read the
-        // manifest + its chunks back out of the store) and record each
-        // chunk's now-durable tag as the handoff floor — not an optimistic
-        // flag, but what actually landed in the durable tier.
+        // Read the manifest from the store before the simulator records it.
         self.mark_flush_published(idx, published).await?;
-        // The flush uploaded the current dirty tier; any spool predates it
-        // and is now superseded.
-        spool::discard_spool(
-            self.effects.fs.as_ref(),
-            self.fs.spool_dir(),
-            self.sandboxes[idx].sandbox_id,
-        )
-        .await
-        .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
-        // Tell the coordinator the survivor's disk moved (Flow A/D).
         let req = LiveManifestPublishRequest {
             session_id: self.sandboxes[idx].session_id,
             sandbox_id: self.sandboxes[idx].sandbox_id,
             manifest_id: published.manifest_id,
             manifest_version: published.version,
         };
-        self.effects
+        let response = self
+            .effects
             .coord
             .publish_live_manifest(self.host_id, &req)
             .await
             .map_err(|e| format!("publish sandbox {idx}: {e}"))?;
+        if response.outcome == LiveManifestPublishOutcome::Applied {
+            self.sandboxes[idx].published_ref = Some(published);
+        }
         Ok(())
     }
 
@@ -801,94 +703,10 @@ impl SimHost {
         Ok(())
     }
 
-    /// Write the shutdown spool for a live sandbox: export the un-uploaded
-    /// tier (dirty ∪ drained-pending) and durably spool it under the
-    /// sandbox's dir. Models the predecessor's SIGTERM spool leg.
-    ///
-    /// Note it does NOT raise the published floor: a chunk-bearing spool is a
-    /// TRANSIENT handoff (the successor adopts it back into the volatile dirty
-    /// tier and discards it — see [`AckedWriteLedger`]). Only a flush that
-    /// publishes to the durable tier moves the floor.
-    pub async fn spool_export(&self, idx: usize) -> Result<(), String> {
-        if idx >= self.sandboxes.len() {
-            return Ok(());
-        }
-        let Some(backend) = self.sandboxes[idx].backend.clone() else {
-            return Ok(());
-        };
-        let (exported_ref, chunks) = backend.export_unflushed().await;
-        spool::write_spool(
-            self.effects.fs.as_ref(),
-            self.fs.spool_dir(),
-            self.sandboxes[idx].sandbox_id,
-            exported_ref,
-            &chunks,
-        )
-        .await
-        .map_err(|e| format!("write_spool sandbox {idx}: {e}"))?;
-        Ok(())
-    }
-
-    /// Successor spool adoption. Race-free self-handoff (#721): first capture
-    /// the CURRENT live tier into the spool (so no un-exported acked write is
-    /// dropped), then rebuild a fresh backend at the durable ref and adopt
-    /// the spool into it — exactly the successor path, driven against the
-    /// same host.
-    pub async fn spool_adopt(&mut self, idx: usize) -> Result<(), String> {
-        if idx >= self.sandboxes.len()
-            || self.finalize_pending(idx)
-            || self.terminally_destroyed(idx)
-        {
-            return Ok(());
-        }
-        // Capture the live tier first — losslessness gate.
-        if self.sandboxes[idx].backend.is_some() {
-            self.spool_export(idx).await?;
-        }
-        self.rebuild(idx).await
-    }
-
-    /// An orderly process crash: run the shutdown spool for every live
-    /// sandbox (the shipped #712 machinery — spool the un-uploaded tier
-    /// before dying), THEN drop all RAM backends. P2 always completes the
-    /// spool (benign); P4's crash injector will cut at the [`CrashPoint`]s
-    /// BEFORE/DURING it, which is what makes the oracle discriminating.
-    ///
-    /// [`CrashPoint`]: crate::CrashPoint
+    /// Drop the process state. Stable dirty files survive this event.
+    /// Orderly and abrupt process deaths have the same disk result.
     pub async fn crash_process(&mut self) -> Result<(), String> {
-        for idx in 0..self.sandboxes.len() {
-            if self.sandboxes[idx].backend.is_some() {
-                self.spool_export(idx).await?;
-            }
-        }
-        // Flow C: the pooled/capture in-RAM tables (local bindings, migration
-        // roles, live captures) die with the process; the live FC set and the
-        // coordinator (a separate process) survive. The successor's reconcile
-        // loop rebuilds the bindings from the coordinator — the None-arm path.
-        // Flow B: a process death is a ROLL. Flow D: the in-flight finalize
-        // jobs + the pending map die; the durable records survive for resume.
-        self.die_abruptly();
-        Ok(())
-    }
-
-    /// ABRUPT process death (SIGKILL / power loss / OOM) — ADR 0098 P4.5. Drop
-    /// every RAM backend WITHOUT running the shutdown spool: the in-RAM dirty
-    /// tier (guest-acked-but-un-flushed-un-spooled writes) evaporates. This is
-    /// the **accepted, bounded loss** window — bounded by the flush cadence +
-    /// the periodic checkpoint (ADR 0028), NOT a durability violation. The
-    /// honest oracle keys on the durable-handoff floor, so a following
-    /// `Restart` legitimately rolls an un-handed-off acked write back to its
-    /// last flushed/spooled tag (or base) and no false "recovered" is claimed.
-    ///
-    /// The contrast with [`crash_process`](Self::crash_process): that models an
-    /// ORDERLY shutdown that completes the spool first (every acked write handed
-    /// off, so all recover). Only this variant exercises the post-ack /
-    /// pre-handoff window the pipeline is explicitly permitted to lose.
-    pub async fn abrupt_crash(&mut self) -> Result<(), String> {
-        // RAM dies — NO shutdown spool. Flow B: an abrupt death is still a
-        // ROLL (a fresh generation reattaches the surviving FC VMs / durable
-        // disk).
-        self.die_abruptly();
+        self.die_process();
         Ok(())
     }
 
@@ -964,11 +782,12 @@ impl SimHost {
                 device.display()
             ));
         };
-        // Rebuild the backend from the durable ref + adopt any spool (the
-        // seed-before-RECONFIGURE recovery leg). This is the recovery ARM the
-        // local-rehydrate pass adds to oracle #1's closure.
+        // Recover the stable dirty file before the device is served.
         if self.sandboxes[idx].backend.is_none() {
+            #[cfg(target_os = "linux")]
             self.rebuild(idx).await?;
+            #[cfg(not(target_os = "linux"))]
+            return Err("dirty-file recovery needs Linux extent semantics".to_string());
         }
         let g = self.generation;
         let s = &mut self.sandboxes[idx];
@@ -1229,15 +1048,8 @@ impl SimHost {
         sandbox_leases + self.spare_leases.len()
     }
 
-    /// Restart the process: bring up the sandboxes whose backend DIED — for
-    /// each, rebuild over the surviving store/tempdir (`from_blob` at the last
-    /// published/base ref, then adopt the shutdown spool). Only the PORTABLE
-    /// recovery legs; PooledBackend/reattach_pass recovery is out of P2 scope.
-    ///
-    /// A restart brings up only what is down: a sandbox whose backend is still
-    /// LIVE is left untouched (rebuilding it would drop its in-RAM dirty tier —
-    /// un-flushed, un-spooled acked writes — which a real restart, running only
-    /// after the process actually died, never does).
+    /// Restart the process and recover each surviving dirty file.
+    #[cfg(target_os = "linux")]
     pub async fn restart(&mut self) -> Result<(), String> {
         // Flow D resume FIRST (the real startup order: `resume_pending_finalizes`
         // runs before serving traffic): re-drive every durable finalize record
@@ -1272,6 +1084,7 @@ impl SimHost {
     /// The `PooledBackend::resume_pending_finalizes` analog: reload every
     /// durable `EvictionFinalizeRecord` (REAL torn-tolerant `load_all`
     /// through the fs seam) into the RAM maps for `FinalizeTick` to re-drive.
+    #[cfg(target_os = "linux")]
     async fn resume_finalizes(&mut self) {
         let finalizer = self.finalizer(self.effects.fs.clone());
         let records =
@@ -1292,172 +1105,26 @@ impl SimHost {
         }
     }
 
-    /// Rebuild one sandbox's backend from the surviving disk. Reads the spool
-    /// FIRST so two real recovery rules can pick the rebuild ref and adoption:
-    ///
-    /// * **Store-ahead (85e0298a).** A same-lineage spool ref that is AHEAD of
-    ///   the durable / coord pointer means the final flush uploaded a manifest
-    ///   the coordinator never acked (its publish was lost), so the successor
-    ///   MUST attach from the spool's ref — never roll back to coord's stale
-    ///   one. Mirrors `abandon_nbd_data_planes_for_shutdown`'s store-ahead
-    ///   comment + the spool's zero-chunk ref-only leg.
-    /// * **Tolerant rejection (H5).** A torn/spliced spool (`read_spool`
-    ///   `Err`) is a LOUD rollback at the real call site: discard it and
-    ///   rebuild from the durable pointer, NEVER adopt corrupt bytes (the
-    ///   spool's hard digest gate). The acked writes must then be covered by
-    ///   the published tier — the crash-injection contract that keeps the
-    ///   oracle unconditional. If they are NOT (a torn ONLY-copy spool, the
-    ///   documented residual-loss window), the oracle catches the loss.
-    ///
-    /// The lineage gate mirrors the real call site: a spool from a DIFFERENT
-    /// manifest lineage is a loud discard, never an adopt.
+    /// Rebuild one sandbox from its coordinator ref and dirty-file sidecar.
+    #[cfg(target_os = "linux")]
     async fn rebuild(&mut self, idx: usize) -> Result<(), String> {
-        self.rebuild_with(idx, self.effects.fs.clone()).await
-    }
-
-    /// [`rebuild`](Self::rebuild) over an EXPLICIT fs handle — the honest
-    /// `TokioFs` for the normal recovery legs, or a [`CrashFs`] armed with a
-    /// seeded read fault for the R5 storage-lie injection
-    /// ([`corrupt_spool_recovery`](Self::corrupt_spool_recovery)). Every spool
-    /// read/discard goes through `fs`, so a lie about the spool's bytes is
-    /// seen exactly where a real rehydrate would see it.
-    async fn rebuild_with(&mut self, idx: usize, fs: Arc<dyn HostFs>) -> Result<(), String> {
         let sandbox_id = self.sandboxes[idx].sandbox_id;
-        // Read the spool BEFORE picking the rebuild ref (store-ahead rule).
-        let spool = match spool::read_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id).await {
-            Ok(s) => s,
-            Err(_torn) => {
-                // Torn/spliced → discard + rebuild from the durable pointer.
-                spool::discard_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id)
-                    .await
-                    .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
-                None
-            }
-        };
-        let mut rebuild_ref = self.sandboxes[idx].rebuild_ref();
-        if let Some((meta, _)) = &spool {
-            let spool_ref = meta.manifest_ref();
-            if spool_ref.manifest_id == rebuild_ref.manifest_id
-                && spool_ref.version > rebuild_ref.version
-            {
-                // Store-ahead: attach from the spool's ref, adopt it as the
-                // durable pointer (coord's publish was lost).
-                rebuild_ref = spool_ref;
-                self.sandboxes[idx].published_ref = Some(spool_ref);
-            }
-        }
-        let backend = build_backend(&self.store, self.fs.cache_dir(), idx, rebuild_ref).await;
-        if let Some((meta, chunks)) = spool {
-            // The REAL call site's lineage gate (`rehydrate_sandbox`): adopt
-            // only a same-lineage spool at-or-ahead-of the durable pointer
-            // (`meta.version >= disk_manifest.version`); a STALE spool (an
-            // older divergence than the durable tier — e.g. an eviction
-            // finalize published past it) is a loud discard, never an adopt
-            // of old bytes over newer durable state. The swarm found the sim
-            // missing the version half of this gate once Flow D could
-            // advance the durable pointer past a standing spool.
-            let spool_ref = meta.manifest_ref();
-            if spool_ref.manifest_id == rebuild_ref.manifest_id
-                && spool_ref.version >= rebuild_ref.version
-            {
-                // #810: adoption is atomic-and-fallible in prod; the sim's
-                // spool chunks come from the REAL spool reader (shape-valid
-                // by construction), so a refusal here is a world-model bug —
-                // surface it as a rebuild failure, mirroring prod's park.
-                backend
-                    .adopt_unflushed(chunks)
-                    .await
-                    .map_err(|e| format!("sandbox {idx}: spool adoption refused: {e}"))?;
-            } else {
-                // Stale refusal (an older divergence than the durable tier).
-                // Refusing is only SAFE when
-                // the durable tier already covers every spooled write — true
-                // for a legitimately-superseded spool (a later flush /
-                // eviction finalize published past it) by tag monotonicity.
-                // A refused spool holding a tag ABOVE the published floor
-                // means a durable-manifest advance failed to cover a spooled
-                // write, and discarding it rolls an acked write back under the
-                // live guest. Loud, never a silent discard of the only newer
-                // copy.
-                for (chunk_idx, bytes) in &chunks {
-                    let tag = decode_tag(bytes);
-                    let floor = self
-                        .ledger
-                        .handed_off_tag(idx, *chunk_idx as u64)
-                        .unwrap_or(0);
-                    if tag > floor {
-                        return Err(format!(
-                            "sandbox {idx}: stale-refused spool (stamped {spool_ref}, durable \
-                             {rebuild_ref}) holds chunk {chunk_idx} tag {tag} above the \
-                             published floor {floor} — refusing it rolls back an acked write \
-                             whose only copy was the spool (a durable-manifest advance failed \
-                             to cover it)"
-                        ));
-                    }
-                }
-            }
-            // Adopted or stale: the spool is consumed either way.
-            spool::discard_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id)
-                .await
-                .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
-        }
+        let dirty_path = dirty_file_path(self.fs.dirty_dir(), sandbox_id);
+        let coordinator_ref = self.sandboxes[idx].rebuild_ref();
+        let resolved_ref =
+            resolve_recover_attach_ref(coordinator_ref, read_ref_sidecar(&dirty_path));
+        let backend = build_backend(
+            &self.store,
+            self.fs.cache_dir(),
+            self.fs.dirty_dir(),
+            idx,
+            sandbox_id,
+            resolved_ref,
+            DirtyFileOpenMode::Recover,
+        )
+        .await;
         self.sandboxes[idx].backend = Some(Arc::new(backend));
         Ok(())
-    }
-
-    /// R5 (ADR 0098 Phase 3, storage lies): rehydrate sandbox `idx` from a
-    /// STANDING shutdown spool whose bytes a seeded storage fault LIES about.
-    ///
-    /// The setup keeps the oracle honest by construction: a flush first raises
-    /// the durable published FLOOR over an acked write (a redundant copy that
-    /// survives any spool loss), then a newer, un-published write is captured
-    /// into a standing transient spool. The rebuild then reads that spool
-    /// through a [`CrashFs`] armed to corrupt read `on_read` — `meta` selects
-    /// the completeness marker (read #0) vs the first chunk (read #1) — with a
-    /// byte-flip at `offset`.
-    ///
-    /// Whatever the lie:
-    /// * a corrupt CHUNK fails `read_spool`'s per-chunk re-hash → loud discard;
-    /// * a corrupt META (once R5's envelope lands) fails the content hash →
-    ///   loud discard; before the envelope it is TRUSTED (the gap this wave
-    ///   exists for), but the setup's redundant floor keeps a trusted adopt of
-    ///   the SAME-lineage newer chunks at-or-above the floor;
-    /// * a lie that breaks the JSON → parse error → loud discard.
-    ///
-    /// A discard rebuilds from the published floor (the newer un-published
-    /// write is a legitimately-lost transient-spool write — oracle #1 keys on
-    /// the floor). So the step converges for the oracle EITHER way; it exists
-    /// to drive the detection machinery across the swarm's interleavings.
-    pub async fn corrupt_spool_recovery(
-        &mut self,
-        idx: usize,
-        meta: bool,
-        offset: usize,
-    ) -> Result<(), String> {
-        if idx >= self.sandboxes.len()
-            || self.finalize_pending(idx)
-            || self.sandboxes[idx].migrating
-        {
-            return Ok(());
-        }
-        if self.sandboxes[idx].backend.is_none() {
-            return Ok(());
-        }
-        // 1. A flushed write raises the durable floor (the redundant copy).
-        self.guest_write(idx, 0).await?;
-        self.flush_tick(idx).await?;
-        // 2. A newer, un-published write captured into a standing spool.
-        self.guest_write(idx, 1).await?;
-        self.spool_export(idx).await?;
-        // 3. The roll: RAM dies; the successor rehydrates from the (lied-about)
-        //    spool. read #0 = meta.json, read #1 = the first chunk file.
-        self.sandboxes[idx].backend = None;
-        let fault = crate::fs_crash::ReadFault {
-            on_read: if meta { 0 } else { 1 },
-            corruption: crate::fs_crash::ReadCorruption::FlipByte { offset },
-        };
-        let crash_fs = CrashFs::with_read_fault(fault);
-        self.rebuild_with(idx, crash_fs).await
     }
 
     /// The `/dev/nbdN`-shaped path a sandbox slot's device sync records
@@ -1465,219 +1132,6 @@ impl SimHost {
     /// stable path suffices).
     fn device_path(idx: usize) -> std::path::PathBuf {
         std::path::PathBuf::from(format!("/dev/nbd{idx}"))
-    }
-
-    /// Drive the REAL extracted SIGTERM ladder (ADR 0098 P4, Flow A) over the
-    /// sim host. `env_value` is the seeded `ENGRAM_SHUTDOWN_FLUSH_BUDGET_SECS`
-    /// (`None` = env unset). The pure
-    /// [`plan_shutdown`](engram_host_core::plan_shutdown) decides the deadline;
-    /// a deadline below [`SIM_FLUSH_COST`] OVERRUNS → the final-flush leg is
-    /// skipped and every survivor's dirty tier rides the (complete) spool
-    /// (#225). The abandon + spool-export leg always completes; then RAM dies
-    /// (the process exits; the successor reattaches). A following `Restart` /
-    /// `SpoolAdopt` recovers every acked write — oracle #1 holds either way.
-    pub async fn sigterm(&mut self, env_value: Option<f64>) -> Result<(), String> {
-        let plan = engram_host_core::plan_shutdown(env_value);
-        let overrun = plan.flush_deadline < SIM_FLUSH_COST;
-        for idx in 0..self.sandboxes.len() {
-            let Some(backend) = self.sandboxes[idx].backend.clone() else {
-                continue;
-            };
-            // FinalFlush stage: force the host page cache down (seam-recorded),
-            // then — unless the deadline overran — flush + classify + publish.
-            self.effects
-                .device
-                .sync_device(&Self::device_path(idx))
-                .await
-                .map_err(|e| format!("sigterm device sync sandbox {idx}: {e}"))?;
-            if !overrun {
-                let outcome = backend
-                    .flush()
-                    .await
-                    .map_err(|e| format!("sigterm flush sandbox {idx}: {e}"))?;
-                let action =
-                    engram_host_core::classify_survivor(engram_host_core::FlushProbe::Flushed {
-                        chunks_flushed: outcome.chunks_flushed,
-                        bound: true,
-                    });
-                if matches!(action, engram_host_core::SurvivorAction::Publish) {
-                    let published = backend.manifest_ref().await;
-                    self.sandboxes[idx].published_ref = Some(published);
-                    // Durable handoff via the published tier (the final-flush
-                    // leg completed, so these chunks are durable independent of
-                    // the spool that follows).
-                    self.mark_flush_published(idx, published).await?;
-                    let req = LiveManifestPublishRequest {
-                        session_id: self.sandboxes[idx].session_id,
-                        sandbox_id: self.sandboxes[idx].sandbox_id,
-                        manifest_id: published.manifest_id,
-                        manifest_version: published.version,
-                    };
-                    self.effects
-                        .coord
-                        .publish_live_manifest(self.host_id, &req)
-                        .await
-                        .map_err(|e| format!("sigterm publish sandbox {idx}: {e}"))?;
-                }
-            }
-            // Abandon + SpoolExport stage: always export the (still-dirty, if
-            // overrun) tier to the shutdown spool — not deadline-bound.
-            self.spool_export(idx).await?;
-        }
-        // Detached stage: RAM dies. Flow B: SIGTERM is a roll (the successor
-        // pidfd-reattaches).
-        self.die_abruptly();
-        Ok(())
-    }
-
-    /// The af28cac4 (2026-07-21) SIGTERM shape: the deadline overruns while
-    /// sandbox `idx`'s final flush is IN FLIGHT — a REAL `flush()` parked
-    /// mid-pipeline at the seeded seam point — and the FIXED driver ABORTS +
-    /// reaps it before the abandon sweep's spool export
-    /// (`flush_nbd_data_planes_for_shutdown`'s overrun arm). The [`sigterm`]
-    /// step's binary overrun (flush completes-before-export or never runs)
-    /// could not represent this third state; the incident lived exactly
-    /// there: pre-fix, the timeout only dropped the JOIN future, the
-    /// detached flush completed AFTER the export and published a version
-    /// the just-written spool's stamp predates, and the successor's lineage
-    /// gate refused the only copy of the acked writes.
-    ///
-    /// `seam % 3` selects the abort point — the abort-safety sweep: the fix's
-    /// argument is that an abort at ANY pipeline instant leaves the export
-    /// coherent, so every point must satisfy the same two obligations,
-    /// asserted inline:
-    /// * the abort left the manifest head unmoved (no post-deadline rebase);
-    /// * the exported spool's stamp equals the head — never behind.
-    ///
-    /// At [`FlushSeamPoint::PostUploadPrePublish`] (the prod point: a 318 MiB
-    /// upload mid-flight at the 20 s budget) the guest also keeps writing
-    /// mid-shutdown, as prod's did (dirty grew 318 → 822 MiB); the export
-    /// must carry that newest acked write. The ladder then completes (every
-    /// survivor spools, RAM dies) exactly like [`sigterm`]'s overrun arm; a
-    /// later `Restart` adopts the spools and the acked-write oracle checks
-    /// recovery. At [`FlushSeamPoint::PreRebase`] the aborted flush leaves a
-    /// store-ahead manifest; the successor's next flush recovers through the
-    /// REAL version-conflict retry.
-    ///
-    /// [`sigterm`]: Self::sigterm
-    pub async fn sigterm_flush_parked(&mut self, idx: usize, seam: u8) -> Result<(), String> {
-        // When the target can't park a flush (mid-finalize / migrating /
-        // crashed), fall back to the plain overrun ladder so the step is
-        // still a SIGTERM (the dispatcher marks the process crashed).
-        let parkable = idx < self.sandboxes.len()
-            && !self.finalize_pending(idx)
-            && !self.sandboxes[idx].migrating
-            && self.sandboxes[idx].backend.is_some();
-        if !parkable {
-            return self.sigterm(Some(0.5)).await; // 0.5 s < SIM_FLUSH_COST → overrun
-        }
-        let backend = self.sandboxes[idx].backend.clone().expect("guarded above");
-        // Guarantee a non-empty pipeline so the parked seam fires (chunk 1,
-        // like flush_fence_abort).
-        self.guest_write(idx, 1).await?;
-        if backend.dirty_bytes().await == 0 {
-            return self.sigterm(Some(0.5)).await;
-        }
-        let point = match seam % 3 {
-            0 => FlushSeamPoint::DirtyPendingHandoff,
-            1 => FlushSeamPoint::PostUploadPrePublish,
-            _ => FlushSeamPoint::PreRebase,
-        };
-        // The ladder's device-sync leg runs first (seam-recorded ordering).
-        self.effects
-            .device
-            .sync_device(&Self::device_path(idx))
-            .await
-            .map_err(|e| format!("sigterm parked device sync sandbox {idx}: {e}"))?;
-        let pre_ref = backend.manifest_ref().await;
-        let (arrived, proceed) = backend.arm_flush_seam(point);
-        let flush_backend = backend.clone();
-        let flush = tokio::spawn(async move { flush_backend.flush().await });
-        arrived.notified().await;
-        // The guest keeps writing during the shutdown window. Only at
-        // PostUploadPrePublish: the parked task holds no backend locks
-        // there (DirtyPendingHandoff holds dirty+pending, PreRebase holds
-        // state — an inline write could deadlock the single-threaded
-        // runtime against them).
-        if matches!(point, FlushSeamPoint::PostUploadPrePublish) {
-            self.guest_write(idx, 1).await?;
-        }
-        // Deadline overrun: the FIXED driver aborts + reaps the in-flight
-        // flush BEFORE the abandon sweep exports. Deterministic: the task
-        // is parked at the seam's Notify on a single-threaded runtime, so
-        // it never resumes past the park.
-        flush.abort();
-        let _ = flush.await;
-        drop(proceed);
-        // Obligation 1: no post-deadline rebase escaped the abort.
-        let head = backend.manifest_ref().await;
-        if head != pre_ref {
-            return Err(format!(
-                "sigterm parked-flush: sandbox {idx} manifest advanced {pre_ref} -> {head} \
-                 after the deadline abort — the af28cac4 detached-flush race"
-            ));
-        }
-        // Abandon + SpoolExport stage for every survivor (the ladder's
-        // always-runs leg).
-        for i in 0..self.sandboxes.len() {
-            self.spool_export(i).await?;
-        }
-        // Obligation 2: the target's spool stamp equals the head it
-        // diverges from — never behind. (The af28cac4 spool was stamped
-        // v367 under a published v368; the successor refused the only copy
-        // of the acked writes and rolled the live guest back.)
-        let (meta, _chunks) = spool::read_spool(
-            self.effects.fs.as_ref(),
-            self.fs.spool_dir(),
-            self.sandboxes[idx].sandbox_id,
-        )
-        .await
-        .map_err(|e| format!("sigterm parked-flush spool read sandbox {idx}: {e}"))?
-        .ok_or_else(|| format!("sigterm parked-flush: sandbox {idx} left no spool"))?;
-        if meta.manifest_ref() != head {
-            return Err(format!(
-                "sigterm parked-flush: sandbox {idx} spool stamped {} under head {head} — a \
-                 behind-stamped spool is refused at adoption and rolls back acked writes \
-                 (af28cac4)",
-                meta.manifest_ref(),
-            ));
-        }
-        // Detached stage: RAM dies (the roll); the successor restarts +
-        // adopts.
-        self.die_abruptly();
-        Ok(())
-    }
-
-    /// Seed-only: the PRE-FIX detached final-flush publish. Models the
-    /// 2026-07-21 af28cac4 hazard's second half — the flush task the timeout
-    /// left running detached completes AFTER the abandon sweep's spool
-    /// export and its coordinator publish LANDS: the durable pointer + the
-    /// ledger floor advance to the flush's manifest while the already-written
-    /// spool (stamped at the pre-flush head, holding newer acked writes)
-    /// stays on disk. Unlike [`note_flush_published`](Self::note_flush_published)
-    /// it does NOT discard the spool — the prod detached task never touched
-    /// the spool; discarding it here would erase exactly the stranded state
-    /// the regression seed exists to drive into `rebuild`'s stale-refusal
-    /// oracle.
-    pub async fn detached_flush_publish(&mut self, idx: usize) -> Result<(), String> {
-        let Some(backend) = self.sandboxes[idx].backend.clone() else {
-            return Ok(());
-        };
-        let published = backend.manifest_ref().await;
-        self.sandboxes[idx].published_ref = Some(published);
-        self.mark_flush_published(idx, published).await?;
-        let req = LiveManifestPublishRequest {
-            session_id: self.sandboxes[idx].session_id,
-            sandbox_id: self.sandboxes[idx].sandbox_id,
-            manifest_id: published.manifest_id,
-            manifest_version: published.version,
-        };
-        self.effects
-            .coord
-            .publish_live_manifest(self.host_id, &req)
-            .await
-            .map_err(|e| format!("detached publish sandbox {idx}: {e}"))?;
-        Ok(())
     }
 
     /// Build a REAL [`EvictionFinalizer`] over the sim's stores and the given
@@ -1759,8 +1213,7 @@ impl SimHost {
         tokio::fs::write(dest.join("manifest.json"), b"{}")
             .await
             .map_err(|e| format!("snapshot_begin manifest.json: {e}"))?;
-        // The capture disk drain: the un-uploaded tier moves from RAM to the
-        // node-durable disk-pending staging files via the REAL writer.
+        // The capture copies dirty-file content to durable staging.
         let (base_manifest, chunks) = backend.export_unflushed().await;
         let disk_chunks: Vec<(usize, ChunkHash, bytes::Bytes)> = chunks
             .iter()
@@ -1881,17 +1334,15 @@ impl SimHost {
         let plan = engram_host_core::plan_resume_attach(!poisoned, true, poisoned);
         match plan {
             engram_host_core::ResumeAttachPlan::Attach => {
-                // #898: a resume boots a FRESH sandbox from the finalize-
-                // published manifest (the coordinator-provided ref) — it
-                // never walks the survivor rehydrate path, so no spool read
-                // here. A standing spool belongs to the destroyed
-                // incarnation; later survivor rebuilds still meet it through
-                // the honest lineage/floor gate.
+                // A resume starts a new sandbox from the finalized manifest.
                 let backend = build_backend(
                     &self.store,
                     self.fs.cache_dir(),
+                    self.fs.dirty_dir(),
                     idx,
+                    self.sandboxes[idx].sandbox_id,
                     self.sandboxes[idx].rebuild_ref(),
+                    DirtyFileOpenMode::Truncate,
                 )
                 .await;
                 self.sandboxes[idx].backend = Some(Arc::new(backend));
@@ -1911,8 +1362,11 @@ impl SimHost {
                 let backend = build_backend(
                     &self.store,
                     self.fs.cache_dir(),
+                    self.fs.dirty_dir(),
                     idx,
+                    self.sandboxes[idx].sandbox_id,
                     self.sandboxes[idx].base_ref,
+                    DirtyFileOpenMode::Truncate,
                 )
                 .await;
                 self.sandboxes[idx].backend = Some(Arc::new(backend));
@@ -2041,64 +1495,7 @@ impl SimHost {
     pub async fn finalize_crash_at(&mut self, idx: usize, op_index: usize) -> Result<(), String> {
         let crash_fs = CrashFs::with_crash_at(Some(op_index));
         self.finalize_tick_with(idx, crash_fs).await?;
-        self.die_abruptly();
-        Ok(())
-    }
-
-    /// Spool crash injection (ADR 0098 P5, replacing P4's post-hoc mangle):
-    /// the predecessor's spool WRITE is cut at fs-op index `op_index` by the
-    /// real seam. Shape mirrors the P4 scenario: the acked tier is first
-    /// exported to a complete spool AND flush-published (redundant
-    /// durability, floor raised), then the spool is RE-written through a
-    /// [`CrashFs`] cut — leaving, per `op_index`: the intact prior spool
-    /// (cut before its `remove_dir`), no spool, a marker-less partial, or a
-    /// complete one. Every state must recover EVERY acked write via the
-    /// published tier + the tolerant `read_spool` (adoption, when it
-    /// happens, is tag-identical to the published set). Then the process
-    /// dies.
-    pub async fn spool_crash_at(&mut self, op_index: usize) -> Result<(), String> {
-        // Guarantee a chunk-bearing spool exists to cut.
-        if let Some(backend) = self.sandboxes[0].backend.clone() {
-            if backend.dirty_bytes().await == 0 {
-                self.guest_write(0, 0).await?;
-            }
-        }
-        let Some(backend) = self.sandboxes[0].backend.clone() else {
-            self.die_abruptly();
-            return Ok(());
-        };
-        let sandbox_id = self.sandboxes[0].sandbox_id;
-        // The pre-crash content: export the dirty set, spool it whole, then
-        // flush-publish the SAME set (floor raised; the spool is redundant).
-        let (exported_ref, chunks) = backend.export_unflushed().await;
-        spool::write_spool(
-            self.effects.fs.as_ref(),
-            self.fs.spool_dir(),
-            sandbox_id,
-            exported_ref,
-            &chunks,
-        )
-        .await
-        .map_err(|e| format!("spool_crash_at baseline spool: {e}"))?;
-        backend
-            .flush()
-            .await
-            .map_err(|e| format!("spool_crash_at flush: {e}"))?;
-        let published = backend.manifest_ref().await;
-        self.sandboxes[0].published_ref = Some(published);
-        self.mark_flush_published(0, published).await?;
-        // The cut re-write: the process dies at fs-op `op_index` of a real
-        // `write_spool` sequence. An error IS the crash landing.
-        let crash_fs = CrashFs::with_crash_at(Some(op_index));
-        let _ = spool::write_spool(
-            crash_fs.as_ref(),
-            self.fs.spool_dir(),
-            sandbox_id,
-            exported_ref,
-            &chunks,
-        )
-        .await;
-        self.die_abruptly();
+        self.die_process();
         Ok(())
     }
 
@@ -2237,30 +1634,24 @@ impl SimHost {
         self.note_flush_published(idx).await
     }
 
-    /// The pre-rebase store-ahead crash window as a seeded interleaving:
-    /// park a REAL `flush()` AFTER `put_manifest` succeeded but BEFORE the
-    /// rebase, then the process dies (the parked task is aborted — its
-    /// held locks drop with it). The store now holds a manifest nothing
-    /// references (85e0298a store-ahead); the durable pointer never
-    /// advanced and the ledger floor never rose, so the loss is HONEST,
-    /// and the successor's next flush recovers through the REAL
-    /// version-conflict retry (attempts the stale next-version, hits the
-    /// conflict, re-targets latest+1).
+    /// Park a flush after `put_manifest` and before rebase. Then kill the
+    /// process. The dirty file keeps every acked write. The next flush also
+    /// resolves the store version conflict.
     pub async fn flush_pre_rebase_crash(&mut self, idx: usize) -> Result<(), String> {
         if idx >= self.sandboxes.len()
             || self.finalize_pending(idx)
             || self.sandboxes[idx].migrating
         {
-            self.die_abruptly();
+            self.die_process();
             return Ok(());
         }
         let Some(backend) = self.sandboxes[idx].backend.clone() else {
-            self.die_abruptly();
+            self.die_process();
             return Ok(());
         };
         self.guest_write(idx, 2).await?;
         if backend.dirty_bytes().await == 0 {
-            self.die_abruptly();
+            self.die_process();
             return Ok(()); // an empty pipeline never reaches the parked seam
         }
         let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::PreRebase);
@@ -2273,7 +1664,7 @@ impl SimHost {
         flush.abort();
         let _ = flush.await;
         drop(proceed);
-        self.die_abruptly();
+        self.die_process();
         Ok(())
     }
 
@@ -2433,7 +1824,7 @@ impl SimHost {
     /// The common "process dies now" tail: RAM drops (backends, the
     /// in-flight finalize jobs, the pending-finalize idempotency map), the
     /// reconcile RAM dies, and the generation rolls.
-    fn die_abruptly(&mut self) {
+    fn die_process(&mut self) {
         for slot in &mut self.sandboxes {
             slot.backend = None;
             // The export registry is RAM: the frozen source's export dies
@@ -2456,17 +1847,33 @@ impl SimHost {
 async fn build_backend(
     store: &Arc<ChunkStore>,
     cache_root: &std::path::Path,
+    dirty_root: &std::path::Path,
     idx: usize,
+    sandbox_id: SandboxId,
     manifest_ref: ManifestRef,
+    dirty_mode: DirtyFileOpenMode,
 ) -> ChunkedDiskBackend {
     let mut cfg = ChunkCacheConfig::new(cache_root.join(format!("sandbox-{idx}")));
     cfg.budget_bytes = 64 * 1024 * 1024;
     let cache = ChunkCache::new(cfg);
     // `u64::MAX` threshold: the sim flushes explicitly (FlushTick), never via
     // the auto-threshold notify — no flush scheduler is installed.
-    ChunkedDiskBackend::from_blob(manifest_ref, cache, store.clone(), u64::MAX)
-        .await
-        .expect("build backend from base manifest")
+    let backend = ChunkedDiskBackend::from_blob_with_dirty_file(
+        manifest_ref,
+        cache,
+        store.clone(),
+        u64::MAX,
+        dirty_file_path(dirty_root, sandbox_id),
+        dirty_mode,
+    )
+    .await
+    .expect("build backend from base manifest");
+    backend.retain_dirty_file().await;
+    backend
+}
+
+fn dirty_file_path(dirty_root: &std::path::Path, sandbox_id: SandboxId) -> std::path::PathBuf {
+    dirty_root.join(format!("{sandbox_id}.cache"))
 }
 
 /// The private base manifest: `NUM_CHUNKS` positional entries, all deduped
