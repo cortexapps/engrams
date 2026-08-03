@@ -29,6 +29,8 @@
  */
 
 import { readdirSync, readFileSync } from "node:fs";
+
+import type { ConnectionProvider } from "../integrations/providers/provider.ts";
 import { join } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -305,20 +307,23 @@ export interface Connector {
 // ---------------------------------------------------------------------------
 
 /** One Plane-B injection, snake_case to match the Rust serde shape. */
+/** Externally-tagged to match the Rust serde shape — the enum also crosses
+ * the coord ↔ host bincode wire, which cannot decode a `kind`-tagged form. */
+export type CredentialMintSourceJson = {
+  connection: {
+    connection_id: string;
+    provider: string;
+  };
+};
+
 export interface IntegrationInjectJson {
   hosts: string[];
   header_name: string;
   header_template: string;
   /** Static-secret source (inject connectors). Empty for a mint entry. */
   secret_ref: string;
-  /**
-   * ADR 0056 amendment: when non-empty, the coordinator MINTS this inject's value
-   * via the IntegrationBroker for this provider (scoped to the session's caps)
-   * instead of resolving `secret_ref`. This is how a *mint* connector rides the
-   * same egress inject plane as a static-secret one; the token never enters the
-   * guest. Mutually exclusive with `secret_ref`.
-   */
-  mint_provider: string;
+  /** Host-side mint authority. `null` means a static `secret_ref` inject. */
+  mint_source: CredentialMintSourceJson | null;
   methods: string[];
   path_globs: string[];
   /** ADR 0059: GraphQL operation type for body-parsed gating ("query" |
@@ -373,7 +378,17 @@ export interface IntegrationPolicyJson {
   // these). Mirrors engram_core::types::IntegrationPolicy.
   network: IntegrationNetworkJson;
   secrets: IntegrationSecretJson[];
+  /**
+   * Which cloud metadata service the host serves for the session, or null for
+   * none. Mirrors `engram_core::types::integration::MetadataFlavor` — a
+   * boolean here would have to grow a second field per cloud, and the proxy
+   * would then have to decide which one wins.
+   */
+  metadata_flavor: MetadataFlavor | null;
 }
+
+/** Keep in step with `MetadataFlavor` in engram-core. */
+export type MetadataFlavor = "gce";
 
 /** Profile-side inputs compiled into the policy's network + secrets (ADR 0057). */
 export interface SessionPolicyInputs {
@@ -387,6 +402,15 @@ export interface SessionPolicyInputs {
   }>;
 }
 
+/** Connection-aware authority consumed by policy compilation. Keeping this
+ * tuple intact prevents two identities for one provider from being merged. */
+export interface IntegrationGrantSelection {
+  connectionId: string;
+  provider: string;
+  operation: string;
+  resourceConstraints: readonly string[];
+}
+
 /** Whether a compiled policy carries anything worth shipping on CreateSession. */
 export function policyHasContent(p: IntegrationPolicyJson): boolean {
   return (
@@ -395,7 +419,8 @@ export function policyHasContent(p: IntegrationPolicyJson): boolean {
     p.secrets.length > 0 ||
     p.network.allow_hosts.length > 0 ||
     p.network.allow_host_patterns.length > 0 ||
-    p.network.default === "allow"
+    p.network.default === "allow" ||
+    p.metadata_flavor !== null
   );
 }
 
@@ -1152,7 +1177,7 @@ export function grantsCapability(
 }
 
 /**
- * Compile a profile's bound capabilities → the per-session IntegrationPolicy.
+ * Compile structured connection grants → the per-session IntegrationPolicy.
  *
  * For each capability, activate the operations whose `grants` include its
  * `action`, and for each activated operation emit:
@@ -1167,7 +1192,7 @@ export function grantsCapability(
  * entries are deduped.
  */
 export function compileIntegrationPolicy(
-  capabilities: string[],
+  grants: readonly IntegrationGrantSelection[],
   registry: Map<string, Connector> = connectorRegistry(),
   inputs?: SessionPolicyInputs,
 ): IntegrationPolicyJson {
@@ -1178,13 +1203,11 @@ export function compileIntegrationPolicy(
   // ADR 0057: hosts opened by a granted power (folded into the egress allow-list
   // below — you must be able to REACH a host you inject a credential onto).
   const grantedHosts = new Set<string>();
-  for (const capStr of capabilities) {
-    const cap = parseCapability(capStr);
-    if (!cap) continue;
-    const connector = registry.get(cap.provider);
+  for (const grant of grants) {
+    const connector = registry.get(grant.provider);
     if (!connector) continue;
     for (const op of connector.operations) {
-      if (!op.grants.includes(cap.action)) continue;
+      if (!op.grants.includes(grant.operation)) continue;
       for (const h of connector.hosts) grantedHosts.add(h);
       // ADR 0059: a GraphQL op gates `POST <graphqlEndpoint>` and is body-matched
       // by (operation, field); a REST op gates by (method, path glob). The path
@@ -1214,7 +1237,7 @@ export function compileIntegrationPolicy(
             header_name: inj.header,
             header_template: inj.template ?? "{}",
             secret_ref: inj.secretRef,
-            mint_provider: "",
+            mint_source: null,
             methods,
             path_globs,
             graphql_operation,
@@ -1239,7 +1262,12 @@ export function compileIntegrationPolicy(
           header_name: "",
           header_template: "",
           secret_ref: "",
-          mint_provider: connector.provider,
+          mint_source: {
+            connection: {
+              connection_id: grant.connectionId,
+              provider: connector.provider,
+            },
+          },
           methods,
           path_globs,
           graphql_operation,
@@ -1308,7 +1336,7 @@ export function compileIntegrationPolicy(
     allow_hosts: s.allowHosts ?? [],
     allow_host_patterns: s.allowHostPatterns ?? [],
   }));
-  return { injects, observes, network, secrets };
+  return { injects, observes, network, secrets, metadata_flavor: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -1428,6 +1456,12 @@ export interface CatalogCapability {
   access: CatalogAccess;
   /** The asset kind this op surfaces, if any (e.g. `pull_request`). */
   asset?: string;
+  /** Operator-facing name, for a provider that serves its own operations. */
+  label?: string;
+  /** The exact host a curated operation calls. */
+  host?: string;
+  /** For a host-less operation, the endpoint kind that makes it usable. */
+  endpointRule?: "google-api" | "non-google-api";
 }
 
 /** Member-safe view of one connector — display identity + the powers it grants +
@@ -1439,6 +1473,12 @@ export interface ProviderCatalogEntry {
   credentialSource: "mint" | "inject";
   hosts: string[];
   capabilities: CatalogCapability[];
+  /**
+   * "singleton" — one org-wide credential slot; "named" — an administrator
+   * configures connections, each its own authority (ADR 0109). The web used to
+   * decide this by hard-coding the one provider it knew was named.
+   */
+  connectionModel: "singleton" | "named";
 }
 
 /** GET/HEAD/OPTIONS → read; otherwise write (a method-less op is conservatively write). */
@@ -1453,7 +1493,10 @@ function accessOf(method: string | undefined): CatalogAccess {
  * op for that action is kept), each tagged with its derived read/write access.
  * Sorted by provider.
  */
-export function buildProviderCatalog(registry: Map<string, Connector>): ProviderCatalogEntry[] {
+export function buildProviderCatalog(
+  registry: Map<string, Connector>,
+  providers: ReadonlyMap<string, ConnectionProvider>,
+): ProviderCatalogEntry[] {
   const entries: ProviderCatalogEntry[] = [];
   for (const connector of registry.values()) {
     const byAction = new Map<string, CatalogCapability>();
@@ -1481,6 +1524,38 @@ export function buildProviderCatalog(registry: Map<string, Connector>): Provider
       credentialSource: connector.credential.source,
       hosts: connector.hosts,
       capabilities: [...byAction.values()],
+      connectionModel: "singleton",
+    });
+  }
+  // A named-connection provider is not a connector: it has no org-wide
+  // credential and its operations come from its own catalog. Serving it here
+  // means the web renders every integration from ONE response, instead of
+  // pushing in a hand-written entry for the provider it happens to know.
+  for (const provider of providers.values()) {
+    entries.push({
+      provider: provider.key,
+      display: {
+        name: provider.displayName,
+        blurb: provider.blurb,
+        category: provider.category,
+        icon: { mono: defaultIconMono(provider.key), color: defaultIconColor(provider.key) },
+      },
+      credentialSource: "mint",
+      hosts: [
+        ...new Set(
+          provider.operations.describe
+            .map((operation) => operation.host)
+            .filter((host): host is string => host !== null),
+        ),
+      ],
+      capabilities: provider.operations.describe.map((operation) => ({
+        action: operation.action,
+        access: operation.access,
+        label: operation.label,
+        ...(operation.host ? { host: operation.host } : {}),
+        ...(operation.endpointRule ? { endpointRule: operation.endpointRule } : {}),
+      })),
+      connectionModel: "named",
     });
   }
   entries.sort((a, b) => a.provider.localeCompare(b.provider));

@@ -333,11 +333,31 @@ fn decide(registry: &Registry, guest_ip: Ipv4Addr, query: &Message) -> Decision 
     }
 }
 
+/// May the guest resolve this name?
+///
+/// This must answer the same question [`SessionState::decide`] answers for TCP,
+/// or a host the proxy is willing to intercept is one the guest cannot look up.
+/// A resolvable-but-refused name is fine (the connection is dropped); a
+/// reachable-but-unresolvable one is a broken integration.
+///
+/// So every source of reachability counts: the network allow-list, and any
+/// secret, injection or observe spec that names the host. Injections used to be
+/// missing, which only worked because a Google or Datadog host was ALSO in the
+/// network allow-list. ADR 0109 stopped adding a Google host there — a failed
+/// mint must leave nothing reachable — and that immediately made the inject
+/// hosts unresolvable.
+///
+/// A credential-exchange host is refused outright, matching `decide()`.
 fn name_allowed(state: &SessionState, qname: &str) -> bool {
+    if crate::google_denylist::denies_host(qname) {
+        return false;
+    }
     if state.allow_all || state.network_allow.matches(qname) {
         return true;
     }
     state.secrets.iter().any(|s| s.allow.matches(qname))
+        || state.injects.iter().any(|i| i.allow.matches(qname))
+        || state.observes.iter().any(|o| o.allow.matches(qname))
 }
 
 fn build_nxdomain(query: &Message) -> Message {
@@ -395,6 +415,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
+            metadata_flavor: None,
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -402,6 +423,63 @@ mod tests {
             decide(&reg, Ipv4Addr::new(10, 200, 0, 2), &q),
             Decision::Allow
         ));
+    }
+
+    #[test]
+    fn resolves_a_host_reachable_only_through_an_injection() {
+        // ADR 0109: a Google host is no longer added to the network allow-list
+        // — a failed mint must leave nothing reachable. Reachability rides the
+        // injection itself, so resolution has to follow it or the guest cannot
+        // look the host up at all.
+        let inject = crate::registry::InjectEntry {
+            header_name: "authorization".into(),
+            header_template: "Bearer {}".into(),
+            allow: HostList::from_manifest(&["compute.googleapis.com".into()], &[]).unwrap(),
+            policy: crate::registry::RequestPolicy::default(),
+            mint_source: None,
+            cred: crate::registry::RefreshableCred::new("token".into(), None),
+        };
+        let state = SessionState {
+            session_id: SessionId::new(),
+            guest_ip: Ipv4Addr::new(10, 200, 0, 2),
+            allow_all: false,
+            network_allow: HostList::from_manifest(&[], &[]).unwrap(),
+            secrets: Vec::new(),
+            injects: vec![inject],
+            observes: Vec::new(),
+            metadata_flavor: None,
+        };
+        let reg = registry_with(state);
+        let query = make_query("compute.googleapis.com.", RecordType::A);
+        assert!(matches!(
+            decide(&reg, Ipv4Addr::new(10, 200, 0, 2), &query),
+            Decision::Allow
+        ));
+    }
+
+    #[test]
+    fn refuses_to_resolve_a_credential_exchange_host() {
+        let state = SessionState {
+            session_id: SessionId::new(),
+            guest_ip: Ipv4Addr::new(10, 200, 0, 2),
+            allow_all: true,
+            network_allow: HostList::from_manifest(&[], &[]).unwrap(),
+            secrets: Vec::new(),
+            injects: Vec::new(),
+            observes: Vec::new(),
+            metadata_flavor: None,
+        };
+        let reg = registry_with(state);
+        for name in ["sts.googleapis.com.", "sts.mtls.googleapis.com."] {
+            let query = make_query(name, RecordType::A);
+            assert!(
+                matches!(
+                    decide(&reg, Ipv4Addr::new(10, 200, 0, 2), &query),
+                    Decision::Deny(DenyReason::NotInAllowList)
+                ),
+                "{name}",
+            );
+        }
     }
 
     #[test]
@@ -414,6 +492,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
+            metadata_flavor: None,
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -443,6 +522,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
+            metadata_flavor: None,
         };
         let reg = registry_with(state);
         let q = make_query("evil.example.com.", RecordType::A);
@@ -483,6 +563,7 @@ mod tests {
             }],
             injects: Vec::new(),
             observes: Vec::new(),
+            metadata_flavor: None,
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -533,6 +614,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
+            metadata_flavor: None,
         });
         let proxy_task = tokio::spawn(serve_udp(proxy_sock.clone(), registry, upstream_addr));
 
@@ -570,6 +652,7 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
+            metadata_flavor: None,
         });
         // Point upstream at an obviously-dead address so the test
         // can't accidentally succeed by hitting a real resolver.

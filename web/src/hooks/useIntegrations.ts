@@ -17,6 +17,13 @@ import {
   setMintCredential,
   uploadConnectorLogo,
   testConnector,
+  listConnections,
+  createConnection,
+  updateConnection,
+  deleteConnection,
+  testConnection,
+  setConnectionEnabled,
+  getGoogleCloudSetup,
 } from "../gen/engram/app/v1/integration-IntegrationService_connectquery";
 import { listMintKinds } from "../gen/engram/app/v1/mint-MintService_connectquery";
 import { fallbackIdentity, type ProviderIdentity } from "../lib/connectorModel";
@@ -93,6 +100,55 @@ export function useUploadConnectorLogo() {
  * credential before sealing; empty tests the stored one. Returns {ok, message}. */
 export function useTestConnector() {
   return useMutation(testConnector);
+}
+
+export function useIntegrationConnections() {
+  return useQuery(listConnections, {}, { staleTime: 10_000 });
+}
+
+function useInvalidateConnections() {
+  const qc = useQueryClient();
+  return () =>
+    qc.invalidateQueries({
+      queryKey: createConnectQueryKey({
+        schema: listConnections,
+        input: {},
+        cardinality: "finite",
+      }),
+    });
+}
+
+export function useCreateConnection() {
+  const invalidate = useInvalidateConnections();
+  return useMutation(createConnection, { onSuccess: invalidate });
+}
+
+export function useUpdateConnection() {
+  const invalidate = useInvalidateConnections();
+  return useMutation(updateConnection, { onSuccess: invalidate });
+}
+
+export function useDeleteConnection() {
+  const invalidate = useInvalidateConnections();
+  return useMutation(deleteConnection, { onSuccess: invalidate });
+}
+
+export function useTestConnection() {
+  const invalidate = useInvalidateConnections();
+  return useMutation(testConnection, { onSuccess: invalidate });
+}
+
+export function useSetConnectionEnabled() {
+  const invalidate = useInvalidateConnections();
+  return useMutation(setConnectionEnabled, { onSuccess: invalidate });
+}
+
+export function useGoogleCloudSetup(id: string) {
+  return useQuery(
+    getGoogleCloudSetup,
+    { id },
+    { enabled: id.length > 0, staleTime: Number.POSITIVE_INFINITY },
+  );
 }
 
 /**

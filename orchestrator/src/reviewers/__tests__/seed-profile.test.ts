@@ -5,6 +5,7 @@ import type {
   ProfileRow,
   ProfileStore,
 } from "../../db/profiles.ts";
+import type { IntegrationConnectionStore } from "../../db/integration-connections.ts";
 import { PR_REVIEW_CAPABILITY } from "../../tools/review.ts";
 import {
   PR_REVIEWER_DESIGNATION,
@@ -24,7 +25,11 @@ function profileRow(overrides: Partial<ProfileRow> = {}): ProfileRow {
     includeUserTokens: true,
     envVars: { EXISTING: "value" },
     skills: ["skills"],
-    capabilities: ["github:issues:write"],
+    integrationGrants: [{
+      connectionId: "default-github",
+      operation: "issues:write",
+      resourceConstraints: [],
+    }],
     network: { default: "allow", allowHosts: ["example.com"], allowHostPatterns: [] },
     secrets: [{ ref: "token", envVar: "TOKEN", mode: "literal", allowHosts: [], allowHostPatterns: [] }],
     isDefault: true,
@@ -104,6 +109,34 @@ function fakeStore(options: {
   };
 }
 
+function fakeConnections(): IntegrationConnectionStore {
+  const row = (provider: string) => ({
+    id: `default-${provider}`,
+    alias: `${provider}-default`,
+    provider,
+    displayName: `${provider} default`,
+    isDefault: true,
+    config: {},
+    enabled: true,
+    testedAt: new Date(0),
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  });
+  return {
+    list: async () => [],
+    get: async (id) => id.startsWith("default-") ? row(id.slice(8)) : null,
+    getMany: async (ids) =>
+      ids.filter((id) => id.startsWith("default-")).map((id) => row(id.slice(8))),
+    getDefault: async (provider) => row(provider),
+    create: async () => { throw new Error("unused"); },
+    update: async () => { throw new Error("unused"); },
+    delete: async () => { throw new Error("unused"); },
+    markTested: async () => { throw new Error("unused"); },
+    setEnabled: async () => { throw new Error("unused"); },
+    ensureDefault: async (provider) => row(provider),
+  };
+}
+
 function fakeLogger() {
   const info: string[] = [];
   const debug: Array<{ bindings: Record<string, unknown>; message: string }> = [];
@@ -129,7 +162,7 @@ describe("seedReviewerProfile", () => {
     const store = fakeStore();
     const logger = fakeLogger();
 
-    await seedReviewerProfile(store, logger.logger);
+    await seedReviewerProfile(store, fakeConnections(), logger.logger);
 
     expect(store.creates).toHaveLength(1);
     expect(store.creates[0]).toMatchObject({
@@ -140,7 +173,11 @@ describe("seedReviewerProfile", () => {
         harness: "claude",
         model: "sonnet",
         effort: "high",
-        capabilities: [PR_REVIEW_CAPABILITY],
+        integrationGrants: [{
+          connectionId: "default-engram",
+          operation: "pr_review",
+          resourceConstraints: [],
+        }],
         includeUserTokens: false,
         envVars: {},
         skills: ["skills"],
@@ -160,7 +197,7 @@ describe("seedReviewerProfile", () => {
     const store = fakeStore({ defaultProfile: null });
     const logger = fakeLogger();
 
-    await seedReviewerProfile(store, logger.logger);
+    await seedReviewerProfile(store, fakeConnections(), logger.logger);
 
     expect(store.creates).toEqual([]);
     expect(logger.info).toEqual([
@@ -172,8 +209,8 @@ describe("seedReviewerProfile", () => {
     const store = fakeStore();
     const logger = fakeLogger();
 
-    await seedReviewerProfile(store, logger.logger);
-    await seedReviewerProfile(store, logger.logger);
+    await seedReviewerProfile(store, fakeConnections(), logger.logger);
+    await seedReviewerProfile(store, fakeConnections(), logger.logger);
 
     expect(store.creates).toHaveLength(1);
   });
@@ -183,7 +220,7 @@ describe("seedReviewerProfile", () => {
     const store = fakeStore({ createError: uniqueViolation });
     const logger = fakeLogger();
 
-    await expect(seedReviewerProfile(store, logger.logger)).resolves.toBeUndefined();
+    await expect(seedReviewerProfile(store, fakeConnections(), logger.logger)).resolves.toBeUndefined();
     expect(logger.debug).toHaveLength(1);
     expect(logger.error).toEqual([]);
   });
@@ -193,7 +230,7 @@ describe("seedReviewerProfile", () => {
     const store = fakeStore({ createError });
     const logger = fakeLogger();
 
-    await expect(seedReviewerProfile(store, logger.logger)).rejects.toBe(createError);
+    await expect(seedReviewerProfile(store, fakeConnections(), logger.logger)).rejects.toBe(createError);
     expect(logger.error).toHaveLength(1);
     expect(logger.debug).toEqual([]);
   });

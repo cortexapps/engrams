@@ -508,6 +508,7 @@ async fn drive_harness(
         .send(engram_harness_proto::HarnessCommand::Prompt {
             prompt_id: uuid::Uuid::new_v4().to_string(),
             text: "say hi briefly".to_string(),
+            mode: None,
         })
         .await
         .expect("queue initial prompt over the wire");
@@ -714,6 +715,7 @@ async fn e2e_harness_cold_via_pooled_backend() {
         secrets: Vec::new(),
         injects: Vec::new(),
         observes: Vec::new(),
+        metadata_flavor: None,
     });
 
     drive_harness(&pooled, sandbox_id, session_id, &ca_pem, captured, cmd_tx).await;
@@ -810,6 +812,7 @@ async fn e2e_harness_warm_via_pooled_backend() {
         secrets: Vec::new(),
         injects: Vec::new(),
         observes: Vec::new(),
+        metadata_flavor: None,
     });
 
     drive_harness(&pooled, warm_id, session_id, &ca_pem, captured, cmd_tx).await;

@@ -633,6 +633,89 @@ describe("buildMessages — Phase 1b queued/optimistic greying", () => {
       id: "p1",
       content: [{ type: "text", text: "are you there?" }],
     });
+    // The inversion guard: the loop re-holds the late echo, but a consumed
+    // prompt_id must not ALSO render a trailing pending bubble (dup id crash).
+    expect(real(messages).filter((m) => m.id === "p1")).toHaveLength(1);
+  });
+
+  // ADR 0108 (held-echo UX): during a delivery gap (echo landed, no
+  // run_started yet, not queued) the user's message must be VISIBLE — a
+  // pending grey bubble with the delivering affordance — instead of the page
+  // showing "No activity yet" with the user's own prompt withheld.
+  test("an unconsumed, unqueued prompt_id echo renders as a pending 'delivering' bubble", () => {
+    const { messages, isRunning } = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "hello?",
+          prompt_id: "p1",
+          at: AT,
+        },
+      ]),
+      SID,
+      "active",
+    );
+    const user = real(messages).find((m) => m.role === "user");
+    expect(user).toMatchObject({
+      role: "user",
+      id: "p1",
+      content: [{ type: "text", text: "hello?" }],
+    });
+    expect(user?.metadata?.custom?.pending).toBe(true);
+    expect(user?.metadata?.custom?.delivering).toBe(true);
+    // A delivering prompt is awaited work — the composer shows the run state.
+    expect(isRunning).toBe(true);
+  });
+
+  test("the pending bubble transitions to normal (same id) once run_started consumes it", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "hello?",
+          prompt_id: "p1",
+          at: AT,
+        },
+        { type: "run_started", run_id: "r1", prompt_summary: null, prompt_id: "p1", at: AT2 },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const users = real(messages).filter((m) => m.role === "user");
+    // Exactly one bubble, keyed by prompt_id, no longer pending.
+    expect(users).toHaveLength(1);
+    expect(users[0]!.id).toBe("p1");
+    expect(users[0]!.metadata?.custom?.pending).toBeUndefined();
+    expect(users[0]!.metadata?.custom?.delivering).toBeUndefined();
+  });
+
+  test("a dequeued (recalled) echo still never renders", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u2",
+          role: "user",
+          text: "never mind",
+          prompt_id: "p2",
+          at: AT2,
+        },
+        { type: "prompt_queued", prompt_id: "p2", summary: "never mind", at: AT2 },
+        { type: "prompt_dequeued", prompt_id: "p2", at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    expect(messages.some((m) => m.id === "p2")).toBe(false);
   });
 });
 
@@ -1535,5 +1618,367 @@ describe("buildMessages — ADR 0054 Flavor A file changes", () => {
     const edit = tps.find((p) => p.toolCallId === "tf")!;
     expect(edit.toolName).toBe("Edit");
     expect(edit.isError).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR 0107: plan cards, mode markers, and the derived mode/pending state.
+// ---------------------------------------------------------------------------
+
+describe("buildMessages — ADR 0107 plan mode", () => {
+  const planRequested = (toolCallId: string, plan = "# The plan"): SessionEvent => ({
+    type: "tool_call_requested",
+    run_id: "r1",
+    tool_call_id: toolCallId,
+    name: "exit_plan_mode",
+    args_json: JSON.stringify({ plan }),
+    at: AT,
+  });
+
+  test("an unresolved plan renders a plan marker and reports pendingPlan", () => {
+    const { messages, pendingPlan, currentMode } = buildMessages(
+      indexed([
+        { type: "harness_mode_changed", mode: "plan", at: AT },
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        planRequested("t-plan"),
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const plan = messages
+      .map((m) => customMarker(m))
+      .find((mk): mk is Extract<SystemMarker, { kind: "plan" }> => mk?.kind === "plan");
+    expect(plan).toBeTruthy();
+    expect(plan!.plan).toBe("# The plan");
+    expect(plan!.revision).toBe(1);
+    expect(plan!.resolution).toBeNull();
+    expect(pendingPlan).toEqual({ toolCallId: "t-plan" });
+    expect(currentMode).toBe("plan");
+    // The mode directive renders its faint marker.
+    expect(messages.map((m) => customMarker(m)).some((mk) => mk?.kind === "mode")).toBe(true);
+  });
+
+  test("a resolved plan folds its decision, clears pendingPlan, and an approval flips the mode", () => {
+    const { messages, pendingPlan, currentMode } = buildMessages(
+      indexed([
+        { type: "harness_mode_changed", mode: "plan", at: AT },
+        planRequested("t-plan"),
+        {
+          type: "tool_result_submitted",
+          tool_call_id: "t-plan",
+          result_json: JSON.stringify({ decision: "approve" }),
+          at: AT2,
+        },
+        // The re-fire's completion is the card's receipt, not a tool row.
+        {
+          type: "tool_call_completed",
+          run_id: "r2",
+          tool_call_id: "t-plan",
+          tool_name: "exit_plan_mode",
+          ok: true,
+          duration_ms: 0,
+          result_summary: "approved",
+          at: AT2,
+        },
+      ]),
+      SID,
+      "idle",
+    );
+    const plan = messages
+      .map((m) => customMarker(m))
+      .find((mk): mk is Extract<SystemMarker, { kind: "plan" }> => mk?.kind === "plan");
+    expect(plan!.resolution).toEqual({ approved: true, feedback: null, at: AT2 });
+    expect(pendingPlan).toBeNull();
+    expect(currentMode).toBe("default");
+    // No stray completed tool row for the plan id.
+    const toolRows = messages.flatMap((m) =>
+      typeof m.content === "string"
+        ? []
+        : m.content.filter(
+            (p) => p.type === "tool-call" && "toolCallId" in p && p.toolCallId === "t-plan",
+          ),
+    );
+    expect(toolRows).toHaveLength(0);
+  });
+
+  test("reject keeps plan mode and revisions number sequentially", () => {
+    const { messages, pendingPlan, currentMode } = buildMessages(
+      [
+        { idx: 0, event: { type: "harness_mode_changed", mode: "plan", at: AT } },
+        { idx: 1, event: planRequested("t-plan-1", "# v1") },
+        {
+          idx: 2,
+          event: {
+            type: "tool_result_submitted",
+            tool_call_id: "t-plan-1",
+            result_json: JSON.stringify({ decision: "reject", feedback: "add tests" }),
+            at: AT2,
+          },
+        },
+        { idx: 3, event: planRequested("t-plan-2", "# v2") },
+      ],
+      SID,
+      "idle",
+    );
+    const plans = messages
+      .map((m) => customMarker(m))
+      .filter((mk): mk is Extract<SystemMarker, { kind: "plan" }> => mk?.kind === "plan");
+    expect(plans).toHaveLength(2);
+    expect(plans[0]!.revision).toBe(1);
+    expect(plans[0]!.resolution).toEqual({ approved: false, feedback: "add tests", at: AT2 });
+    expect(plans[1]!.revision).toBe(2);
+    expect(plans[1]!.resolution).toBeNull();
+    expect(pendingPlan).toEqual({ toolCallId: "t-plan-2" });
+    expect(currentMode).toBe("plan");
+  });
+
+  test("a terminal session never reports a pending plan", () => {
+    const { pendingPlan } = buildMessages(indexed([planRequested("t-plan")]), SID, "dead");
+    expect(pendingPlan).toBeNull();
+  });
+});
+
+describe("buildMessages — ADR 0107 out-of-mode plan attempt", () => {
+  test("an exit_plan_mode start with no generic request becomes a hint marker, not a tool row", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t-attempt",
+          tool_name: "exit_plan_mode",
+          args_summary: '{"plan":"a plan"}',
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "t-attempt",
+          tool_name: "exit_plan_mode",
+          ok: false,
+          duration_ms: 1,
+          result_summary: null,
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const attempt = messages.map((m) => customMarker(m)).find((mk) => mk?.kind === "plan_attempt");
+    expect(attempt).toBeTruthy();
+    const toolRows = messages.flatMap((m) =>
+      typeof m.content === "string"
+        ? []
+        : m.content.filter(
+            (p) => p.type === "tool-call" && "toolCallId" in p && p.toolCallId === "t-attempt",
+          ),
+    );
+    expect(toolRows).toHaveLength(0);
+  });
+
+  test("a REAL plan request still renders the card, never the attempt hint", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          name: "exit_plan_mode",
+          args_json: JSON.stringify({ plan: "# P" }),
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          tool_name: "exit_plan_mode",
+          args_summary: null,
+          at: AT,
+        },
+      ]),
+      SID,
+      "idle",
+    );
+    const kinds = messages.map((m) => customMarker(m)?.kind).filter(Boolean);
+    expect(kinds).toContain("plan");
+    expect(kinds).not.toContain("plan_attempt");
+    // The card IS the call. Its raw tool row must not also render: the
+    // matching completion is suppressed, so the row would spin on "Waiting
+    // for tool" forever next to a card the reviewer has already resolved.
+    const toolParts = messages.flatMap((m) =>
+      (Array.isArray(m.content) ? m.content : []).filter(
+        (part) => part.type === "tool-call" && part.toolCallId === "t-plan",
+      ),
+    );
+    expect(toolParts).toHaveLength(0);
+  });
+
+  // Session 4a70374e: the CLI called exit_plan_mode a SECOND time while the
+  // first call was already parked. The second start has no request behind it,
+  // which used to read as "the agent planned with plan mode off" — telling the
+  // user to turn on a chip that was already on.
+  test("a re-call while plan mode is ON is not an out-of-mode attempt", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "harness_mode_changed", mode: "plan", at: AT },
+        { type: "run_started", run_id: "r1", prompt_id: "p1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          name: "exit_plan_mode",
+          args_json: JSON.stringify({ plan: "# P" }),
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t-plan-2",
+          tool_name: "exit_plan_mode",
+          args_summary: null,
+          at: AT,
+        },
+      ]),
+      SID,
+      "active",
+    );
+    const kinds = messages.map((m) => customMarker(m)?.kind).filter(Boolean);
+    expect(kinds).toContain("plan");
+    expect(kinds).not.toContain("plan_attempt");
+  });
+
+  // Session 4a70374e: a plan card mid-run nulls `active`, so the next tool
+  // opened a NEW assistant bubble that `run_completed` never closed — its tool
+  // row span on "Waiting for tool: ToolSearch" beside a finished turn.
+  test("a completed run settles every bubble it produced, not just the last", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "harness_mode_changed", mode: "plan", at: AT },
+        { type: "run_started", run_id: "r1", prompt_id: "p1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          name: "exit_plan_mode",
+          args_json: JSON.stringify({ plan: "# P" }),
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t-ts",
+          tool_name: "ToolSearch",
+          args_summary: "{}",
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "t-ts",
+          tool_name: "ToolSearch",
+          ok: true,
+          duration_ms: 4,
+          result_summary: "",
+          at: AT,
+        },
+        // A second card moves `active` off the ToolSearch bubble, and the
+        // closing message opens a third — so run_completed would otherwise
+        // settle only that last one and leave the ToolSearch bubble spinning.
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan-b",
+          name: "exit_plan_mode",
+          args_json: JSON.stringify({ plan: "# P2" }),
+          at: AT,
+        },
+        {
+          type: "agent_message",
+          role: "assistant",
+          text: "done",
+          run_id: "r1",
+          message_id: "m1",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT },
+      ]),
+      SID,
+      "active",
+    );
+    const stillRunning = messages.filter(
+      (m) => m.role === "assistant" && m.status?.type === "running",
+    );
+    expect(stillRunning).toHaveLength(0);
+  });
+
+  // Session 3728924b: the codex adapter interrupts the read-only turn to hand
+  // off to the revision/build turn. Rendering that as red "interrupted" told
+  // the reviewer their approval had broken something.
+  test("a plan decision's handoff interrupt is not an interruption", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "harness_mode_changed", mode: "plan", at: AT },
+        { type: "run_started", run_id: "r1", prompt_id: "p1", prompt_summary: null, at: AT },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "here is the plan",
+          at: AT,
+        },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          name: "exit_plan_mode",
+          args_json: JSON.stringify({ plan: "P" }),
+          at: AT,
+        },
+        {
+          type: "tool_result_submitted",
+          tool_call_id: "t-plan",
+          result_json: JSON.stringify({ decision: "approve" }),
+          at: AT,
+        },
+        { type: "run_interrupted", run_id: "r1", at: AT2 },
+      ]),
+      SID,
+      "active",
+    );
+    const footers = messages
+      .map((m) => m.metadata?.custom?.run as RunFooter | undefined)
+      .filter(Boolean) as RunFooter[];
+    expect(footers.some((f) => f.interrupted)).toBe(false);
+    const cancelled = messages.filter(
+      (m) => m.status?.type === "incomplete" && m.status.reason === "cancelled",
+    );
+    expect(cancelled).toHaveLength(0);
+  });
+
+  // Session 676b367f: codex holds its app-server turn open across the park, so
+  // `runOpen` stayed true and the composer showed "working…" (with a live Stop)
+  // under a card asking the reviewer for a decision.
+  test("a session awaiting a plan decision is not running", () => {
+    const { isRunning } = buildMessages(
+      indexed([
+        { type: "harness_mode_changed", mode: "plan", at: AT },
+        { type: "run_started", run_id: "r1", prompt_id: "p1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          name: "exit_plan_mode",
+          args_json: JSON.stringify({ plan: "# P" }),
+          at: AT,
+        },
+      ]),
+      SID,
+      "active",
+    );
+    expect(isRunning).toBe(false);
   });
 });

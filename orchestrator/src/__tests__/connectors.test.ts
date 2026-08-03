@@ -14,7 +14,7 @@ import {
   parseCapability,
   grantsCapability,
   isGraphqlMatch,
-  compileIntegrationPolicy,
+  compileIntegrationPolicy as compileConnectionPolicy,
   compileCliIntegrations,
   INTEGRATIONS_CLI_BUNDLE,
   policyHasContent,
@@ -26,7 +26,27 @@ import {
   defaultDisplayName,
   defaultIconMono,
   type Connector,
+  type IntegrationGrantSelection,
+  type SessionPolicyInputs,
 } from "../connectors/registry.ts";
+
+function compileIntegrationPolicy(
+  capabilities: string[],
+  registry?: Map<string, Connector>,
+  inputs?: SessionPolicyInputs,
+) {
+  const grants: IntegrationGrantSelection[] = capabilities.flatMap((value) => {
+    const capability = parseCapability(value);
+    if (!capability) return [];
+    return [{
+      connectionId: `test-${capability.provider}`,
+      provider: capability.provider,
+      operation: capability.action,
+      resourceConstraints: capability.resource ? [capability.resource] : [],
+    }];
+  });
+  return compileConnectionPolicy(grants, registry, inputs);
+}
 
 const datadogRaw = {
   provider: "datadog",
@@ -406,7 +426,7 @@ describe("compileIntegrationPolicy", () => {
         header_name: "DD-API-KEY",
         header_template: "{}",
         secret_ref: "datadog-api-key",
-        mint_provider: "",
+        mint_source: null,
         methods: ["GET"],
         path_globs: ["/api/v2/logs/events*"],
         graphql_operation: "",
@@ -424,14 +444,19 @@ describe("compileIntegrationPolicy", () => {
   test("a mint capability compiles to a minted inject (ADR 0056 amendment)", () => {
     // A mint connector now rides the SAME egress inject plane as an inject one;
     // the coordinator resolves the value by minting (scoped to caps) instead of a
-    // static secret. The marker is `mint_provider` + an empty `secret_ref`.
+    // static secret. The typed mint source accompanies an empty `secret_ref`.
     const injects = compileIntegrationPolicy(["github:issues:write"], reg).injects;
     expect(injects).toHaveLength(1);
     // Gating + the mint marker are policy-owned; the header is filled
     // coordinator-side from the integration (scheme is the provider's), so it's
     // empty in the compiled policy.
     expect(injects[0]).toMatchObject({
-      mint_provider: "github",
+      mint_source: {
+        connection: {
+          connection_id: "test-github",
+          provider: "github",
+        },
+      },
       secret_ref: "",
       header_name: "",
       header_template: "",
@@ -544,7 +569,14 @@ describe("compileIntegrationPolicy — observes", () => {
     const policy = compileIntegrationPolicy(["github:issues:write"], reg);
     // mint now rides the inject plane too (ADR 0056 amendment), plus its observe.
     expect(policy.injects).toHaveLength(1);
-    expect(policy.injects[0]).toMatchObject({ mint_provider: "github" });
+    expect(policy.injects[0]).toMatchObject({
+      mint_source: {
+        connection: {
+          connection_id: "test-github",
+          provider: "github",
+        },
+      },
+    });
     expect(policy.observes).toEqual([
       {
         hosts: ["api.github.com"],
@@ -580,7 +612,12 @@ describe("compileIntegrationPolicy — GraphQL (ADR 0059)", () => {
     const policy = compileIntegrationPolicy(["github:pulls:write"], reg);
     const gql = policy.injects.find((i) => i.graphql_field === "mergePullRequest");
     expect(gql).toMatchObject({
-      mint_provider: "github",
+      mint_source: {
+        connection: {
+          connection_id: "test-github",
+          provider: "github",
+        },
+      },
       methods: ["POST"],
       path_globs: ["/graphql"],
       graphql_operation: "mutation",
@@ -655,7 +692,10 @@ describe("on-disk registry", () => {
     // endpoints AND the GraphQL createIssue/updateIssue/… mutations (ADR 0059); each
     // emits a minted inject for github.
     expect(policy.injects.length).toBeGreaterThan(0);
-    expect(policy.injects.every((i) => i.mint_provider === "github")).toBe(true);
+    expect(policy.injects.every((i) =>
+      i.mint_source?.connection.connection_id === "test-github" &&
+        i.mint_source.connection.provider === "github"
+    )).toBe(true);
     // Two issue assets are observed: the REST create (POST /repos/*/issues, gated by
     // the 2xx status) and the GraphQL createIssue mutation (gated by noGraphqlErrors).
     expect(policy.observes.every((o) => o.provider === "github" && o.asset_kind === "issue")).toBe(true);
@@ -924,7 +964,7 @@ describe("buildProviderCatalog", () => {
   const reg = registryOf(datadogRaw, githubRaw); // datadog logs:read (GET); github issues:write (POST)
 
   test("derives a member-safe, secret-free catalog with read/write access", () => {
-    const cat = buildProviderCatalog(reg);
+    const cat = buildProviderCatalog(reg, new Map());
     expect(cat.map((e) => e.provider)).toEqual(["datadog", "github"]); // sorted
     const dd = cat.find((e) => e.provider === "datadog")!;
     expect(dd.credentialSource).toBe("inject");
@@ -938,7 +978,7 @@ describe("buildProviderCatalog", () => {
   });
 
   test("carries the asset kind for an asset-bearing op (from the on-disk seeds)", () => {
-    const cat = buildProviderCatalog(connectorRegistry());
+    const cat = buildProviderCatalog(connectorRegistry(), new Map());
     const gh = cat.find((e) => e.provider === "github")!;
     expect(gh.capabilities.find((c) => c.action === "pulls:write")).toEqual({
       action: "pulls:write",

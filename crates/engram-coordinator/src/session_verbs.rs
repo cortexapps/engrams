@@ -383,14 +383,28 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
 /// loop by construction.
 const EVICT_MAX_ATTEMPTS: i32 = 20;
 
-/// Retry budget for the ADR 0090 quarantined-survivor flavor
+/// Fast-retry budget for the ADR 0090 quarantined-survivor flavor
 /// (`payload.quarantine`). The survivor's disk is unserved and its user
 /// already degraded — a capture that keeps failing (or timing out; the
-/// pipeline bounds each quarantine capture attempt) must converge to the
-/// rewind ladder in minutes, not spin the 20-attempt budget while the
-/// session lane stays locked (2026-07-13 incident: one wedged evict held
-/// the lane for ~50 minutes with the user's resume queued behind it).
+/// pipeline bounds each quarantine capture attempt) must leave the fast
+/// lane in minutes, not spin the 20-attempt budget while the session
+/// lane stays locked (2026-07-13 incident: one wedged evict held the
+/// lane for ~50 minutes with the user's resume queued behind it). Past
+/// this budget the op PARKS on the slow retry cadence below — it does
+/// NOT destroy the VM (2026-08-02 durability-rollback RCA: the old
+/// destroy-on-exhaustion arm rewound 11 sessions past acked writes).
 const QUARANTINE_EVICT_MAX_ATTEMPTS: i32 = 3;
+
+/// Slow-lane retry cadence for a stuck quarantined survivor. The op
+/// stays QUEUED with a future `not_before`, which (a) keeps the
+/// `adr0090-quarantine:*` idempotency key live so the host's 5s
+/// advertise dedupes to `Duplicate` (no 8174b7aa-style op flood), and
+/// (b) never head-of-line blocks the session lane (`op_claim_head`
+/// only sees due ops). Each wake-up re-runs the capture, which
+/// converges losslessly once the host's rehydrate retry pass re-serves
+/// the survivor's disk; until then each attempt fails fast against the
+/// host's snapshot refusal.
+const QUARANTINE_STUCK_RETRY: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// #810 finding 2 (the Evicting-convergence hole): on evict-budget
 /// exhaustion, which flavors MUST settle the session into `HostLost`?
@@ -403,125 +417,79 @@ const QUARANTINE_EVICT_MAX_ATTEMPTS: i32 = 3;
 /// - `nominated`: the eviction was the coordinator's own densification pick;
 ///   it cannot stay Active (it would just re-nominate forever) and there is no
 ///   durable snapshot to call it Idle — HostLost is the honest limbo.
-/// - `quarantine` (ADR 0090): the exhaustion arm has just DESTROYED the
-///   crippled survivor VM precisely so the straggler sweep can drive
-///   HostLost → Idle. Pre-#810 the flip was gated on `nominated` ALONE, so a
-///   non-nominated quarantine survivor (the #739/gap-A `evict_local` path)
-///   was destroyed and then stranded in `Evicting` forever (prod aac4efab,
-///   15+ min). It MUST settle to HostLost too.
+/// - `quarantine` (ADR 0090) no longer reaches this flip at all
+///   (2026-08-02 durability-rollback RCA): exhaustion parks the op on the
+///   slow retry lane instead of destroying the VM, so there is nothing to
+///   settle — the session keeps its (crippled, recoverable) sandbox. The
+///   pre-#810 stranding this flip fixed came from the destroy; no destroy,
+///   no strand.
 ///
 /// Any other flavor (a plain idle-evict that keeps failing) leaves the op
 /// terminally Failed and the session where it was — an operator-visible
 /// coord-side fault, not a settle that fabricates a lost host.
-const fn exhaustion_settles_host_lost(nominated: bool, quarantine: bool) -> bool {
-    nominated || quarantine
+const fn exhaustion_settles_host_lost(nominated: bool) -> bool {
+    nominated
 }
 
-/// ADR 0090 / 2026-07-20 durability-rollback incident: a quarantined
-/// survivor's eviction exhausted its retry budget. The session is now
-/// settling to `HostLost` (see the caller's `exhaustion_settles_host_lost`
-/// arm), which means the user's next resume UNCONDITIONALLY rewinds to the
-/// last published disk manifest — silently dropping any guest writes the
-/// host acked but never uploaded past it. **The rollback is decided here, at
-/// exhaustion, not at destroy time**: whether *this* attempt's `destroy`
-/// lands or the dead-host straggler sweep finishes the mechanics later, the
-/// data is already gone the moment we settle `HostLost`.
+/// ADR 0090 / 2026-08-02 durability-rollback RCA: a quarantined
+/// survivor's eviction exhausted its fast-retry budget. The old arm
+/// DESTROYED the VM and settled `HostLost` — which IS the rollback: the
+/// next resume unconditionally rewinds to the last published disk
+/// manifest, dropping every acked-but-unuploaded guest write past it
+/// (11 sessions between 07-22 and 08-02). The refusal that fails these
+/// attempts exists precisely to protect those writes; destroying on its
+/// third firing guaranteed the loss it prevented.
 ///
-/// So this makes the loss LOUD exactly once, at exhaustion, INDEPENDENT of
-/// the destroy outcome (PR #829 review finding): it appends a durable,
-/// coordinator-authoritative `durability_rollback` [`SessionEvent`]
-/// (surfaced on the web timeline and `engrams session log`, and excluded
-/// from `rewind_session_to_cursor`'s tombstone UPDATE so it outlives the
-/// very rewind it warns about) and bumps
-/// [`crate::metrics::DURABILITY_ROLLBACK_TOTAL`] for alerting — THEN attempts
-/// the destroy. Emitting before/independent of the destroy is what closes
-/// the silent-loss hole: a transient destroy failure that the sweep later
-/// completes would otherwise perform the exact rollback with only a
-/// `status_changed` to show for it (the sweep never re-invokes this reap).
-/// `evict_err` is the terminal eviction error, threaded into the log for
-/// forensics.
-async fn reap_quarantined_survivor(ctx: &OpCtx<'_>, evict_err: &crate::idle_evictor::EvictError) {
+/// New posture: **park, never destroy.** The VM (and the only copy of
+/// its un-uploaded acked writes) stays alive; the op returns
+/// [`OpOutcome::RetryAfter`] on the [`QUARANTINE_STUCK_RETRY`] cadence,
+/// staying QUEUED so the idempotency key keeps the host's 5s advertise
+/// deduped (no 8174b7aa-style livelock) without head-of-line blocking
+/// the lane (a not-due op is invisible to `op_claim_head`). Recovery is
+/// the host's rehydrate retry pass re-serving the disk, after which the
+/// next slow-lane attempt captures + relocates with ZERO loss.
+///
+/// The stuck crossing is made loud exactly once (at `attempts ==
+/// budget`): the alertable `QUARANTINE_STUCK_TOTAL` counter + a WARN.
+/// If the disk never recovers (e.g. a de-configured kernel device), the
+/// alert is the operator's cue — an explicit `session destroy` /
+/// host reboot is an OPERATOR decision accepting the loss, not an
+/// automatic ladder outcome.
+fn park_quarantined_survivor_stuck(
+    ctx: &OpCtx<'_>,
+    evict_err: &crate::idle_evictor::EvictError,
+) -> OpOutcome {
     let session_id = ctx.op.session_id;
-    let session = match ctx.state.services.meta.get_session(session_id).await {
-        Ok(s) => s,
-        Err(le) => {
-            tracing::warn!(
-                %session_id,
-                error = %le,
-                "quarantined-survivor exhaustion: session lookup failed",
-            );
-            return;
-        }
-    };
-    let Some(sandbox_id) = session.sandbox_id else {
-        return;
-    };
-
-    // Record the rollback FIRST — it is fact the instant the exhaustion arm
-    // settles HostLost, regardless of whether the destroy below or the later
-    // straggler sweep is what finishes the mechanics.
-    ::metrics::counter!(crate::metrics::DURABILITY_ROLLBACK_TOTAL).increment(1);
-    tracing::warn!(
-        %session_id,
-        %sandbox_id,
-        attempts = ctx.op.attempts,
-        rewind_disk_manifest = ?session.live_disk_manifest,
-        error = %evict_err,
-        "quarantined-survivor evict budget exhausted; session settling HostLost — the next \
-         resume rewinds to the last published disk manifest (VM destroy initiated; the \
-         dead-host straggler sweep finishes it either way); acked-but-unuploaded guest \
-         writes past it are LOST",
-    );
-    // Make the rollback durable + user-visible: a coordinator-fact event row
-    // alerting/UI/CLI can key on. One outcome-neutral reason string covers
-    // both the destroy-lands-here and sweep-finishes-it paths. `emit_fenced`
-    // no-ops (Ok(None)) if a successor re-claimed the lane — safe: that
-    // successor now owns the session's convergence.
-    let reason = format!(
-        "quarantined-survivor evict budget exhausted after {} attempts; VM destroy initiated \
-         — next resume rewinds to the last published disk manifest",
-        ctx.op.attempts
-    );
-    if let Err(ee) = ctx
-        .state
-        .emit_fenced(
-            session_id,
-            ctx.fence(),
-            SessionEvent::DurabilityRollback {
-                sandbox_id,
-                rewind_disk_manifest: session.live_disk_manifest,
-                reason,
-                at: ctx.state.services.clock.now_utc(),
-            },
-        )
-        .await
-    {
+    if ctx.op.attempts == QUARANTINE_EVICT_MAX_ATTEMPTS {
+        ::metrics::counter!(crate::metrics::QUARANTINE_STUCK_TOTAL).increment(1);
         tracing::warn!(
             %session_id,
-            error = %ee,
-            "durability_rollback event emit failed (rollback still happened)",
+            attempts = ctx.op.attempts,
+            error = %evict_err,
+            "quarantined-survivor evict exhausted its fast-retry budget; PARKING the op \
+             on the slow retry lane (VM preserved, acked writes preserved) — recovery is \
+             the host's rehydrate retry re-serving the disk; if this session stays stuck, \
+             an operator must intervene (the old arm destroyed the VM here and rewound \
+             past acked writes; 2026-08-02 RCA)",
         );
-    }
-
-    // Now attempt the destroy. A failure here is NOT a reprieve — the session
-    // still settles HostLost and the straggler sweep re-destroys + drives
-    // HostLost → Idle; we've already recorded the loss above, so the sweep
-    // completing it silently is fine.
-    if let Err(de) = ctx
-        .state
-        .services
-        .host
-        .destroy(sandbox_id, ctx.fence())
-        .await
-    {
-        tracing::warn!(
+    } else {
+        tracing::info!(
             %session_id,
-            %sandbox_id,
-            error = %de,
-            "quarantined-survivor destroy failed; the dead-host straggler sweep finishes \
-             the (already-recorded) rollback",
+            attempts = ctx.op.attempts,
+            error = %evict_err,
+            "stuck quarantined-survivor evict retried and still failing; staying on the \
+             slow retry lane",
         );
     }
+    OpOutcome::RetryAfter(
+        QUARANTINE_STUCK_RETRY,
+        format!(
+            "quarantined survivor unevictable after {} attempts; parked on the \
+             {}s retry lane awaiting disk re-serve: {evict_err}",
+            ctx.op.attempts,
+            QUARANTINE_STUCK_RETRY.as_secs(),
+        ),
+    )
 }
 
 /// The evict verb: the idle-eviction / drain pipeline
@@ -593,56 +561,52 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
         Err(e) => {
             // Retry budget: the attempt count lives on the op row (bumped
             // at every claim). Exhaustion falls back to HostLost for
-            // nominated (and — #810 finding 2 — quarantine) evictions —
-            // NOT Active (would re-nominate forever), NOT Idle (lies: no
-            // durable snapshot), NOT Dead (destroys a healthy runtime over
-            // a coord-side failure) — exactly the retired scanner's
-            // classification (ADR 0034). The one lane the dead-host
-            // straggler sweep re-drives is HostLost, so a settled-but-failed
-            // eviction MUST land there or it strands with no re-driver.
+            // nominated evictions — NOT Active (would re-nominate
+            // forever), NOT Idle (lies: no durable snapshot), NOT Dead
+            // (destroys a healthy runtime over a coord-side failure) —
+            // exactly the retired scanner's classification (ADR 0034).
+            // The one lane the dead-host straggler sweep re-drives is
+            // HostLost, so a settled-but-failed nominated eviction MUST
+            // land there or it strands with no re-driver.
             //
-            // Quarantine flavor (ADR 0090, 2026-07-13 incident): a smaller
-            // budget, and the fallback DESTROYS the sandbox first. The VM
-            // is structurally crippled (disk unserved, often egress-dead);
-            // "healthy runtime" doesn't apply, and only its death lets the
-            // dead_host's straggler sweep drives HostLost → Idle
-            // (recoverable) so
-            // the user's next prompt resumes from the last checkpoint.
-            // Without the destroy, the session stays Active-and-crippled,
-            // the host re-advertises the quarantine every 5s, and the
-            // whole loop restarts (the key isn't burned by a terminal op).
+            // Quarantine flavor (ADR 0090, 2026-08-02 durability-rollback
+            // RCA): a smaller fast budget, then the op PARKS on the slow
+            // retry lane — no destroy, no HostLost. The old arm destroyed
+            // the crippled VM here "so the straggler sweep drives
+            // HostLost → Idle", which rewound the session past its acked
+            // writes; the survivor's disk is recoverable (the host's
+            // rehydrate retry pass), so the honest posture is to wait
+            // loudly, preserving the VM. RetryAfter keeps the op QUEUED:
+            // the idempotency key stays live, so the host's 5s advertise
+            // dedupes (the "key isn't burned" livelock cannot restart)
+            // and the not-due op never blocks the session lane.
             let budget = if quarantine {
                 QUARANTINE_EVICT_MAX_ATTEMPTS
             } else {
                 EVICT_MAX_ATTEMPTS
             };
             if ctx.op.attempts >= budget {
-                ::metrics::counter!(crate::metrics::EVICTION_BUDGET_EXHAUSTED_TOTAL).increment(1);
                 if quarantine {
-                    reap_quarantined_survivor(ctx, &e).await;
+                    if ctx.op.attempts == QUARANTINE_EVICT_MAX_ATTEMPTS {
+                        ::metrics::counter!(crate::metrics::EVICTION_BUDGET_EXHAUSTED_TOTAL)
+                            .increment(1);
+                    }
+                    return park_quarantined_survivor_stuck(ctx, &e);
                 }
-                // #810 finding 2 (the Evicting-convergence hole): the HostLost
-                // fallback flip must fire for the QUARANTINE flavor too, not
-                // just `nominated`. The quarantine arm just above DESTROYED the
-                // crippled VM precisely so — per its own comment — "the dead-host
-                // straggler sweep drives HostLost → Idle". But that sweep only
-                // lists HostLost rows (`list_host_lost_sessions`). Pre-fix the
-                // flip was gated on `nominated` alone, so a NON-nominated
-                // quarantine survivor (the #739/gap-A parked-survivor path:
-                // `evict_local` enqueued from the host heartbeat with
-                // `nominated=false`, ADR 0090) exhausted its 3-attempt budget,
-                // was destroyed, and then STRANDED in `Evicting` with no
-                // re-driver — the sweep never lists it and nothing else re-drives
-                // an `Evicting` row (prod session aac4efab sat 15+ min). Flipping
-                // to HostLost on exhaustion for `nominated || quarantine` closes
-                // the hole: nominated flips WITHOUT a destroy (the runtime may be
-                // healthy — the straggler sweep's ask-the-host reconcile settles
-                // it), quarantine flips AFTER the destroy above, and BOTH land in
-                // the one lane the straggler sweep converges to
-                // Idle/recoverable. A fenced-out failure here (a successor
+                ::metrics::counter!(crate::metrics::EVICTION_BUDGET_EXHAUSTED_TOTAL).increment(1);
+                // #810 finding 2 (the Evicting-convergence hole): a
+                // settled-but-failed NOMINATED eviction must land in
+                // HostLost — the one lane the dead-host straggler sweep
+                // re-drives (`list_host_lost_sessions`) — or it strands in
+                // `Evicting` with no re-driver (prod aac4efab, 15+ min).
+                // The flip fires WITHOUT a destroy (the runtime may be
+                // healthy — the straggler sweep's ask-the-host reconcile
+                // settles it). A fenced-out failure here (a successor
                 // re-claimed the lane) is safe: the successor now owns the
-                // session's convergence. (See `exhaustion_settles_host_lost`.)
-                if exhaustion_settles_host_lost(nominated, quarantine) {
+                // session's convergence. (See `exhaustion_settles_host_lost`;
+                // the quarantine flavor returned above and never reaches
+                // this flip — 2026-08-02 RCA.)
+                if exhaustion_settles_host_lost(nominated) {
                     match crate::session_ops::transition_with_fence(
                         ctx.state,
                         ctx.op.session_id,
@@ -725,6 +689,35 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
     let id = ctx.op.session_id;
     if !ctx.step("drain").await {
         return OpOutcome::Failed("fenced at drain".into());
+    }
+    // One Deliver op owns the whole drain: this loop re-fetches
+    // `outbox_next_due` each pass, so any row a sibling was enqueued for
+    // is already ours. The shim's `op_pending_exists` guard is only
+    // ADVISORY (a racing wake slips duplicates through), and its "a
+    // duplicate finds no due rows and no-ops" assumption inverts when
+    // the head row is STUCK: every duplicate then churns the same
+    // failing forward. DST finding (ADR 0108 swarm, seed 33043259):
+    // duplicates accumulated against a hung host, and N≥3 Deliver ops —
+    // the one budget-less kind — mutually re-armed each other's capped
+    // backoff with their own deadline burns, an immortal claim cycle.
+    // Cancelling queued siblings on claim makes the invariant real:
+    // at most one Deliver op survives per session. Never lossy — the
+    // outbox rows are the durable state, and the shim's rescan
+    // re-enqueues if this op dies fenced mid-drain.
+    match state
+        .services
+        .meta
+        .op_cancel_queued(id, OpKind::Deliver)
+        .await
+    {
+        Ok(true) => {
+            tracing::debug!(session_id = %id, "deliver op: cancelled queued duplicate deliver ops");
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::debug!(session_id = %id, error = %e,
+                "deliver op: duplicate-sweep failed; continuing (duplicates only cost churn)");
+        }
     }
     loop {
         let row: OutboxRow = match state.services.meta.outbox_next_due(id).await {
@@ -879,10 +872,22 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
                 // Their scanners own the transition (evac resumer, queue
                 // scanner); the op retry keeps knocking.
                 other => {
-                    return OpOutcome::Retry(format!(
+                    let reason = format!(
                         "session is {} — not deliverable yet; its scanner owns recovery",
                         other.as_str()
-                    ));
+                    );
+                    // ADR 0108 A5: a boot in progress is a KNOWN, short
+                    // wait — fixed cadence, so the pre-Active deferrals
+                    // never inflate the backoff that paces post-Active
+                    // delivery (the 2026-07-31 40 s recovery cadence).
+                    // Every other state keeps the attempts-scaled
+                    // backoff: those waits are open-ended.
+                    return match other {
+                        SessionState::Pending | SessionState::Queued => {
+                            OpOutcome::RetryAfter(KNOWN_WAIT_RETRY, reason)
+                        }
+                        _ => OpOutcome::Retry(reason),
+                    };
                 }
             }
         }
@@ -901,45 +906,93 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
                 ::metrics::counter!(crate::metrics::OUTBOX_DELIVERED_TOTAL).increment(1);
                 // Loop to the next due row — one resume covers the batch.
             }
-            Err(reason) => {
-                // Defer the ROW (its `attempts`-scaled backoff is the
-                // durable redelivery state, unchanged from ADR 0073) and
-                // retry the OP: preserve order — never skip ahead of a
-                // stuck head.
+            Err(deferral) => {
+                // Defer the ROW and retry the OP: preserve order — never
+                // skip ahead of a stuck head. A known-wait deferral (ADR
+                // 0108 A4/A5) uses its fixed cadence for both; an
+                // unknown failure keeps the attempts-scaled backoff (the
+                // durable redelivery state, unchanged from ADR 0073).
                 tracing::debug!(
                     session_id = %id,
                     prompt_id = %row.prompt_id,
                     attempts = row.attempts,
-                    %reason,
+                    reason = %deferral.reason,
                     "deliver op: delivery deferred",
                 );
+                let row_delay = deferral
+                    .retry_after
+                    .unwrap_or_else(|| failure_backoff(row.attempts));
                 let _ = state
                     .services
                     .meta
-                    .outbox_defer(&row.prompt_id, failure_backoff(row.attempts))
+                    .outbox_defer(&row.prompt_id, row_delay)
                     .await;
                 ::metrics::counter!(crate::metrics::OUTBOX_DEFERRED_TOTAL).increment(1);
-                return OpOutcome::Retry(reason);
+                return match deferral.retry_after {
+                    Some(delay) => OpOutcome::RetryAfter(delay, deferral.reason),
+                    None => OpOutcome::Retry(deferral.reason),
+                };
             }
         }
     }
 }
 
-/// Forward one outbox row to the session's live sandbox. `Err(reason)` =
+/// ADR 0108 A4: window after a boot/resume completes in which a
+/// `send_prompt` `NotFound` means "the harness has not attached YET",
+/// not "the harness is gone". Sized above the observed attach lag
+/// (50–200 ms) with a wide margin; past the window, the destructive
+/// reattach is the correct remedy again.
+const ATTACH_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// ADR 0108 A5: fixed cadence for deferrals whose cause is KNOWN and
+/// short-lived (a boot in progress, the attach grace). Never
+/// attempts-scaled: the wait is not a failure, and an inflated attempts
+/// counter must not slow the retries that follow it.
+const KNOWN_WAIT_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A retryable delivery failure. `retry_after: Some(_)` = the cause is
+/// known and short-lived; the caller uses the fixed cadence for both the
+/// row and the op. `None` = unknown cause; attempts-scaled backoff.
+struct ForwardDeferral {
+    reason: String,
+    retry_after: Option<std::time::Duration>,
+}
+
+impl ForwardDeferral {
+    fn backoff(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            retry_after: None,
+        }
+    }
+}
+
+impl std::fmt::Display for ForwardDeferral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+/// Forward one outbox row to the session's live sandbox. `Err` =
 /// retryable (the caller defers the row + requeues the op); terminal
 /// sessions never reach here (the verb's dispatch drops their rows).
 async fn forward_outbox_row(
     ctx: &OpCtx<'_>,
     row: &engram_core::types::outbox::OutboxRow,
-) -> Result<(), String> {
+) -> Result<(), ForwardDeferral> {
     use engram_core::types::outbox::OutboxKind;
     use engram_core::SandboxError;
     let state = ctx.state;
-    if retire_legacy_answer_row(state, row).await? {
+    if retire_legacy_answer_row(state, row)
+        .await
+        .map_err(ForwardDeferral::backoff)?
+    {
         return Ok(());
     }
     let Some(sandbox_id) = state.resolve_sandbox(row.session_id).await else {
-        return Err("no live sandbox on an Active session".into());
+        return Err(ForwardDeferral::backoff(
+            "no live sandbox on an Active session",
+        ));
     };
 
     let forward = || async {
@@ -951,10 +1004,16 @@ async fn forward_outbox_row(
                     .and_then(|t| t.as_str())
                     .unwrap_or_default()
                     .to_string();
+                // ADR 0107: the optional mode directive riding this prompt.
+                let mode = row
+                    .payload
+                    .get("mode")
+                    .and_then(|m| m.as_str())
+                    .map(|m| m.to_string());
                 state
                     .services
                     .host
-                    .send_prompt(sandbox_id, row.prompt_id.clone(), text)
+                    .send_prompt(sandbox_id, row.prompt_id.clone(), text, mode)
                     .await
             }
             OutboxKind::Answer => unreachable!("legacy answer rows retire before forwarding"),
@@ -981,17 +1040,48 @@ async fn forward_outbox_row(
     };
 
     match forward().await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // Delivered — the attach question is settled for this
+            // binding; drop the grace stamp.
+            state.attach_grace.remove(&row.session_id);
+            Ok(())
+        }
         Err(SandboxError::NotFound) => {
-            // The VM is alive but no harness is attached: the genuine
-            // harness-unbound desync (harness process gone, VM alive — the
-            // e35ed1fa class). The harness will NOT come back on its own —
-            // its connection loop only re-dials when its established link
-            // drops or agentd SIGUSR1s it — so `start_agent` is the remedy,
-            // immediately. (A #594-era "wait for in-guest self-reattach"
-            // window here was wrong twice over: an ADR 0074 rung-2 un-pause
-            // keeps the vsock connection INTACT — delivery succeeds and this
-            // arm never runs — and a real desync has nothing to wait for.)
+            // ADR 0108 A4: inside the attach grace, `NotFound` means the
+            // harness has not dialed YET (boot/resume completed moments
+            // ago; the attach follows 50–200 ms later). Firing the
+            // reattach here SIGUSR1s the very harness that is mid-attach
+            // — the 2026-07-31 boot race. Defer on the fixed cadence;
+            // the attach-signal wake (A3) re-runs this op the moment the
+            // harness announces itself.
+            if let Some(stamp) = state.attach_grace.get(&row.session_id).map(|e| *e.value()) {
+                let age = state.services.clock.now_utc().signed_duration_since(stamp);
+                if age
+                    < chrono::Duration::from_std(ATTACH_GRACE)
+                        .expect("ATTACH_GRACE fits chrono::Duration")
+                {
+                    return Err(ForwardDeferral {
+                        reason: "harness not attached yet (attach grace); \
+                                 deferring without a reattach nudge"
+                            .into(),
+                        retry_after: Some(KNOWN_WAIT_RETRY),
+                    });
+                }
+                // Grace expired without an attach: fall through to the
+                // destructive remedy and drop the stale stamp.
+                state.attach_grace.remove(&row.session_id);
+            }
+            // The VM is alive but no harness is attached past the grace:
+            // the genuine harness-unbound desync (harness process gone,
+            // VM alive — the e35ed1fa class). The harness will NOT come
+            // back on its own — its connection loop only re-dials when
+            // its established link drops or agentd SIGUSR1s it — so
+            // `start_agent` is the remedy. (A #594-era "wait for
+            // in-guest self-reattach" window here was wrong for a real
+            // desync; ADR 0108's grace is different — it keys on a
+            // boot/resume that JUST completed, where the attach is
+            // provably in flight, and A1's handshake bounds guarantee
+            // the wait converges.)
             match crate::api::snapshot::reattach_harness_in_place(
                 state,
                 row.session_id,
@@ -1000,12 +1090,16 @@ async fn forward_outbox_row(
             )
             .await
             {
-                Ok(true) => Err("harness reattach issued (start_agent fallback)".into()),
-                Ok(false) => Err("session moved off the sandbox mid-delivery".into()),
-                Err(e) => Err(format!("reattach failed: {e}")),
+                Ok(true) => Err(ForwardDeferral::backoff(
+                    "harness reattach issued (start_agent fallback)",
+                )),
+                Ok(false) => Err(ForwardDeferral::backoff(
+                    "session moved off the sandbox mid-delivery",
+                )),
+                Err(e) => Err(ForwardDeferral::backoff(format!("reattach failed: {e}"))),
             }
         }
-        Err(e) => Err(format!("forward: {e}")),
+        Err(e) => Err(ForwardDeferral::backoff(format!("forward: {e}"))),
     }
 }
 
@@ -1375,26 +1469,19 @@ mod tests {
         }
     }
 
-    /// #810 finding 2 (the Evicting-convergence hole): the evict-budget
-    /// exhaustion arm must settle BOTH `nominated` and `quarantine` flavors
-    /// into `HostLost` — the one lane the dead-host straggler sweep re-drives.
-    /// The `(nominated=false, quarantine=true)` row is the regression: pre-#810
-    /// it was `false`, so a non-nominated quarantine survivor was destroyed and
-    /// then stranded in `Evicting` with no re-driver (prod aac4efab, 15+ min).
+    /// #810 finding 2, amended by the 2026-08-02 durability-rollback RCA:
+    /// only NOMINATED evictions settle `HostLost` on budget exhaustion.
+    /// The quarantine flavor no longer reaches the flip at all — it parks
+    /// on the slow retry lane instead of destroying, so there is no
+    /// destroyed VM for the straggler sweep to converge.
     #[test]
-    fn budget_exhaustion_settles_host_lost_for_nominated_or_quarantine() {
+    fn budget_exhaustion_settles_host_lost_for_nominated_only() {
         assert!(
-            exhaustion_settles_host_lost(true, false),
+            exhaustion_settles_host_lost(true),
             "a nominated eviction settles to HostLost (cannot stay Active)"
         );
         assert!(
-            exhaustion_settles_host_lost(false, true),
-            "#810 finding 2: a quarantine survivor is destroyed then MUST settle \
-             to HostLost, else it strands in Evicting"
-        );
-        assert!(exhaustion_settles_host_lost(true, true));
-        assert!(
-            !exhaustion_settles_host_lost(false, false),
+            !exhaustion_settles_host_lost(false),
             "a plain idle-evict that keeps failing is an operator-visible coord fault, \
              not a settle that fabricates a lost host"
         );
@@ -1405,13 +1492,13 @@ mod tests {
 
     /// Build an Evicting, quarantined session bound to a fresh sandbox on a
     /// fresh host with a published disk manifest, plus a claimed Evict op —
-    /// the shape [`reap_quarantined_survivor`] reads. When `route_destroy` is
-    /// true a fresh in-proc backend is registered under the session's host so
-    /// `destroy(sandbox_id)` SUCCEEDS; when false nothing is wired for that
-    /// sandbox, so the registry's `resolve_owner` fails and `destroy` errors
-    /// — exercising the transient-destroy-failure arm. Returns everything the
-    /// caller must keep alive (incl. the tempdirs) so the borrows in its
-    /// `OpCtx` stay valid.
+    /// the shape the exhaustion arm reads. When `route_destroy` is true a
+    /// fresh in-proc backend is registered under the session's host so a
+    /// `destroy(sandbox_id)` WOULD succeed — which lets the park test assert
+    /// "nothing was destroyed" against a fixture where destroying was
+    /// possible, not merely unroutable. Returns everything the caller must
+    /// keep alive (incl. the tempdirs) so the borrows in its `OpCtx` stay
+    /// valid.
     #[allow(clippy::type_complexity)]
     async fn reap_fixture(
         route_destroy: bool,
@@ -1484,101 +1571,47 @@ mod tests {
         (state, mini, op, sandbox_id, manifest, (local, backend_dir))
     }
 
-    /// Assert exactly one `durability_rollback` row landed carrying the
-    /// destroyed sandbox + the manifest the next resume rewinds to.
-    fn assert_one_durability_rollback(
-        mini: &crate::state::tests::MiniMeta,
-        manifest: engram_core::types::manifest::ManifestRef,
-    ) {
+    /// 2026-08-02 durability-rollback RCA regression: a quarantined
+    /// survivor's evict exhaustion must PARK the op — a non-terminal
+    /// `RetryAfter` on the slow cadence — and must not record a rollback
+    /// or move the session. The old arm destroyed the VM, emitted
+    /// `durability_rollback`, and settled `HostLost` here; every one of
+    /// those effects is now forbidden (the VM holds the only copy of the
+    /// acked writes, and the host's rehydrate retry can still recover it).
+    #[tokio::test]
+    async fn quarantine_exhaustion_parks_the_op_and_records_no_rollback() {
+        let (state, mini, op, _sandbox_id, _manifest, _keep) = reap_fixture(true).await;
+        let ctx = crate::session_ops::OpCtx {
+            state: &state,
+            op: &op,
+            epoch: op.epoch.unwrap(),
+        };
+        let err = crate::idle_evictor::EvictError::Meta("capture refused (disk unserved)".into());
+
+        let outcome = super::park_quarantined_survivor_stuck(&ctx, &err);
+
+        match outcome {
+            OpOutcome::RetryAfter(delay, msg) => {
+                assert_eq!(
+                    delay, QUARANTINE_STUCK_RETRY,
+                    "the park must use the slow-lane cadence",
+                );
+                assert!(
+                    msg.contains("parked"),
+                    "the requeue reason explains the park, got {msg:?}",
+                );
+            }
+            other => panic!("exhaustion must park (RetryAfter), got {other:?}"),
+        }
         let events = mini.events.lock();
-        let rows: Vec<_> = events
-            .iter()
-            .filter(|e| e.kind == "durability_rollback")
-            .collect();
-        assert_eq!(
-            rows.len(),
-            1,
-            "exactly one durability_rollback row (emitted once at exhaustion)",
-        );
-        let ev = rows[0];
-        assert_eq!(ev.payload["type"], "durability_rollback", "serde tag");
         assert!(
-            ev.payload["sandbox_id"].is_string(),
-            "carries the destroyed sandbox id, got {:?}",
-            ev.payload["sandbox_id"],
-        );
-        assert_eq!(
-            ev.payload["rewind_disk_manifest"]["manifest_id"],
-            serde_json::json!(manifest.manifest_id.to_string()),
-            "carries the manifest id the next resume rewinds to",
-        );
-        assert_eq!(
-            ev.payload["rewind_disk_manifest"]["version"],
-            serde_json::json!(REAP_MANIFEST_VERSION),
-            "carries the manifest version",
+            !events.iter().any(|e| e.kind == "durability_rollback"),
+            "no rollback is recorded — nothing was destroyed and nothing rewinds",
         );
         assert!(
-            ev.payload["reason"]
-                .as_str()
-                .unwrap()
-                .contains("budget exhausted"),
-            "reason explains the rollback, got {:?}",
-            ev.payload["reason"],
+            !events.iter().any(|e| e.kind == "status_changed"),
+            "the session stays where it was (no HostLost settle)",
         );
-    }
-
-    /// ADR 0090 / 2026-07-20 durability-rollback incident: when a
-    /// quarantined survivor's evict budget exhausts, the reap must leave a
-    /// durable, coordinator-authoritative `durability_rollback` event
-    /// carrying the sandbox + the disk manifest the next resume rewinds to —
-    /// so the silent acked-write loss is LOUD. Happy path: the destroy lands.
-    #[tokio::test]
-    async fn reap_quarantined_survivor_emits_durability_rollback_when_destroy_lands() {
-        let (state, mini, op, _sandbox_id, manifest, _keep) = reap_fixture(true).await;
-        let ctx = crate::session_ops::OpCtx {
-            state: &state,
-            op: &op,
-            epoch: op.epoch.unwrap(),
-        };
-        let err = crate::idle_evictor::EvictError::Meta("capture timed out".into());
-        super::reap_quarantined_survivor(&ctx, &err).await;
-        assert_one_durability_rollback(&mini, manifest);
-    }
-
-    /// PR #829 review finding: the rollback is decided at exhaustion, NOT at
-    /// destroy time — the session settles HostLost and the next resume
-    /// rewinds regardless of whether THIS destroy lands or the dead-host
-    /// straggler sweep finishes it later (the sweep never re-invokes the
-    /// reap). So a transient destroy failure must STILL emit the event +
-    /// counter exactly once, or the sweep completes the exact rollback with
-    /// only a `status_changed` to show for it (the original silent-loss bug).
-    #[tokio::test]
-    async fn reap_quarantined_survivor_still_emits_when_destroy_fails() {
-        let (state, mini, op, sandbox_id, manifest, _keep) = reap_fixture(false).await;
-        let ctx = crate::session_ops::OpCtx {
-            state: &state,
-            op: &op,
-            epoch: op.epoch.unwrap(),
-        };
-
-        // Precondition: the destroy this reap attempts genuinely fails (no
-        // backend is routable for this sandbox) — otherwise the test would
-        // pass vacuously against the happy path.
-        assert!(
-            state
-                .services
-                .host
-                .destroy(sandbox_id, ctx.fence())
-                .await
-                .is_err(),
-            "fixture must make destroy fail so this exercises the failure arm",
-        );
-
-        let err = crate::idle_evictor::EvictError::Meta("capture timed out".into());
-        super::reap_quarantined_survivor(&ctx, &err).await;
-
-        // The loss is recorded even though the destroy failed.
-        assert_one_durability_rollback(&mini, manifest);
     }
 
     /// Moved with `failure_backoff` from the retired `outbox_delivery`

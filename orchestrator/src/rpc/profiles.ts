@@ -27,6 +27,7 @@ import {
   DEFAULT_PROFILE_NETWORK,
   type ProfileNetwork,
   type ProfileSecret,
+  type ProfileIntegrationGrant,
 } from "../db/schema.ts";
 import {
   images as defaultImages,
@@ -46,6 +47,19 @@ import {
 } from "../connectors/registry.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { toolCapabilities as registeredToolCapabilities } from "../tools/registry.ts";
+import {
+  makeIntegrationConnectionStore,
+  type IntegrationConnectionStore,
+} from "../db/integration-connections.ts";
+import {
+  grantsToCapabilities,
+  resolveIntegrationGrants,
+  type ResolvedIntegrationGrant,
+} from "../integrations/grants.ts";
+import {
+  isProviderCapability,
+  validateProviderGrants,
+} from "../integrations/providers/index.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -79,6 +93,7 @@ export interface ProfileDeps {
   mountCatalog?: MountCatalogClient;
   connectors?: CustomConnectorSource;
   toolCapabilities?: Set<string>;
+  connections?: IntegrationConnectionStore;
 }
 
 function headersOf(ctx: HandlerContext): Headers {
@@ -104,9 +119,11 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     // ADR 0055: skills are not sensitive (they describe granted tooling), so
     // they are surfaced to members too — unlike env_vars.
     skills: row.skills,
-    // ADR 0056: capabilities likewise describe granted access (not secrets),
-    // so they are member-visible.
-    capabilities: row.capabilities,
+    integrationGrants: row.integrationGrants.map((grant) => ({
+      connectionId: grant.connectionId,
+      operation: grant.operation,
+      resourceConstraints: grant.resourceConstraints,
+    })),
     // ADR 0057: network + secrets describe access/config (the secret VALUES
     // live in the org store, never here), so they're member-visible like skills.
     network: row.network,
@@ -220,6 +237,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
   // (tests) doesn't throw. loadRegistry degrades to built-in seeds if the read
   // fails.
   const connectors: CustomConnectorSource = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
+  const connections = deps?.connections ?? makeIntegrationConnectionStore(getDb());
   // Resolve the production registry lazily: ProfileService is registered before
   // startup registers all built-in tools.
   const toolCapabilities = (): Set<string> =>
@@ -300,12 +318,22 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
    * re-validates authoritatively at session-create; rejecting here keeps a
    * profile from ever storing a grant no connector backs.
    */
-  function assertCapabilitiesValid(
-    capabilities: string[],
+  function assertResolvedGrantsValid(
+    resolved: ResolvedIntegrationGrant[],
     registry: Map<string, Connector>,
     builtInToolCapabilities: Set<string>,
   ): void {
+    // Profile save validates grant SHAPE only. Connection STATE (enabled,
+    // endpoint membership) is enforced at session-create — editing a
+    // connection auto-disables it, and that must never block unrelated edits
+    // of every profile that grants it.
+    validateProviderGrants(resolved);
+    const capabilities = grantsToCapabilities(resolved);
     for (const c of capabilities) {
+      // A named-connection capability is authorized by its CONNECTION, not by a
+      // connector in the registry, so the "which connector grants this?" check
+      // below does not apply to it.
+      if (isProviderCapability(c)) continue;
       if (builtInToolCapabilities.has(c)) continue;
       const parsed = parseCapability(c);
       if (!parsed) {
@@ -324,6 +352,20 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
     }
   }
 
+  function normalizeIntegrationGrants(
+    grants: ReadonlyArray<{
+      connectionId?: string;
+      operation?: string;
+      resourceConstraints?: string[];
+    }>,
+  ): ProfileIntegrationGrant[] {
+    return grants.map((grant) => ({
+      connectionId: (grant.connectionId ?? "").trim(),
+      operation: (grant.operation ?? "").trim(),
+      resourceConstraints: [...new Set(grant.resourceConstraints ?? [])].sort(),
+    }));
+  }
+
   router.service(ProfileService, {
     async listProfiles(req, ctx) {
       const user = await requireUser(ctx, getSession);
@@ -333,7 +375,9 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       // include_archived is admin-only; silently forced false for members.
       const includeArchived = isAdmin && req.includeArchived;
       const rows = await store.list({ includeArchived });
-      return { profiles: rows.map((r) => toProto(r, isAdmin)) };
+      return {
+        profiles: rows.map((row) => toProto(row, isAdmin)),
+      };
     },
 
     async getProfile(req, ctx) {
@@ -359,8 +403,10 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const effort = catalogOptionId(req.effort);
       const harness = await assertHarnessValid(catalogOptionId(req.harness), model, effort);
       await assertSkillsValid(req.skills ?? []);
-      assertCapabilitiesValid(
-        req.capabilities ?? [],
+      const integrationGrants = normalizeIntegrationGrants(req.integrationGrants ?? []);
+      const resolvedGrants = await resolveIntegrationGrants(integrationGrants, connections);
+      assertResolvedGrantsValid(
+        resolvedGrants,
         await loadRegistry(connectors),
         toolCapabilities(),
       );
@@ -379,7 +425,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         includeUserTokens: req.includeUserTokens,
         envVars: req.envVars ?? {},
         skills: req.skills ?? [],
-        capabilities: req.capabilities ?? [],
+        integrationGrants,
         network,
         secrets,
         isDefault: req.isDefault,
@@ -405,8 +451,10 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const effort = catalogOptionId(req.effort);
       const harness = await assertHarnessValid(catalogOptionId(req.harness), model, effort);
       await assertSkillsValid(req.skills ?? []);
-      assertCapabilitiesValid(
-        req.capabilities ?? [],
+      const integrationGrants = normalizeIntegrationGrants(req.integrationGrants ?? []);
+      const resolvedGrants = await resolveIntegrationGrants(integrationGrants, connections);
+      assertResolvedGrantsValid(
+        resolvedGrants,
         await loadRegistry(connectors),
         toolCapabilities(),
       );
@@ -425,7 +473,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         includeUserTokens: req.includeUserTokens,
         envVars: req.envVars ?? {},
         skills: req.skills ?? [],
-        capabilities: req.capabilities ?? [],
+        integrationGrants,
         network,
         secrets,
         isDefault: req.isDefault,

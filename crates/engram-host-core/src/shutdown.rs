@@ -173,6 +173,42 @@ pub fn is_straggler(dirty_bytes: u64) -> bool {
     dirty_bytes > 0
 }
 
+/// What an `NbdHandle` drop does with the KERNEL side of its device
+/// (2026-08-02 durability-rollback RCA).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NbdDropAction {
+    /// Normal operation: a dropped handle netlink-disconnects its device.
+    /// Correct for deliberate teardown (destroy), where the guest is gone
+    /// and the device must return to the pool.
+    Disconnect,
+    /// Shutdown is underway: leave the kernel config alive. Between SIGTERM
+    /// and process exit, a drop is never a deliberate survivor teardown —
+    /// the abandon sweep uses `abandon()` (which skips `Drop`) — so any
+    /// handle that reaches `Drop` in that window is unwind or teardown
+    /// collateral. A disconnect from that path de-configures a surviving
+    /// guest's live device: the successor's RECONFIGURE then meets "not
+    /// configured" and the survivor becomes an uncapturable quarantine
+    /// (2026-08-02: a panic between the flush pass and the abandon sweep
+    /// disconnected four survivors this way; the coordinator then
+    /// destroyed them past their acked writes).
+    LeaveKernelConfigured,
+}
+
+/// The pure drop decision: `shutdown_underway` is the terminal
+/// shutdown-abandon flag the driver raises at SIGTERM (before the
+/// background-task aborts — an aborted task's dropped locals can hold a
+/// live handle) and never lowers. A deliberate destroy that races the
+/// shutdown window leaves its device configured-but-unowned; the
+/// successor's startup stale-binding sweep reclaims exactly that state,
+/// so the conservative arm never leaks a device past one generation.
+pub fn nbd_drop_action(shutdown_underway: bool) -> NbdDropAction {
+    if shutdown_underway {
+        NbdDropAction::LeaveKernelConfigured
+    } else {
+        NbdDropAction::Disconnect
+    }
+}
+
 /// The auditable shutdown plan the driver executes: the deadline the
 /// final-flush fan-out is budgeted against, plus the (constant, linear)
 /// stage ladder. The survivor set is *not* part of the plan — the fan-out
@@ -230,6 +266,16 @@ mod tests {
             Duration::from_secs(3)
         );
         assert_eq!(ShutdownPlan::LADDER, ShutdownStage::LADDER);
+    }
+
+    #[test]
+    fn nbd_drop_disconnects_only_outside_shutdown() {
+        // Normal operation: destroy teardown must disconnect.
+        assert_eq!(nbd_drop_action(false), NbdDropAction::Disconnect);
+        // Shutdown underway: every drop is unwind/teardown collateral — the
+        // kernel config must survive for the successor's RECONFIGURE
+        // (2026-08-02 durability-rollback RCA).
+        assert_eq!(nbd_drop_action(true), NbdDropAction::LeaveKernelConfigured);
     }
 
     #[test]

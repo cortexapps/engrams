@@ -707,6 +707,7 @@ async fn create_session_unknown_image_is_invalid_argument() {
         .create_session(app::CreateSessionRequest {
             capabilities: Vec::new(),
             integration_policy_json: String::new(),
+            requested_session_id: None,
             selected_skills: Vec::new(),
             image_uri: "localhost:5001/never-enabled:warm".into(),
             mode: "agent".into(),
@@ -718,6 +719,7 @@ async fn create_session_unknown_image_is_invalid_argument() {
             // ADR 0062: unused — this create fails at the unknown-image lookup
             // before harness resolution.
             harness: None,
+            harness_mode: None,
         })
         .await
         .expect_err("non-enabled image must error");
@@ -1188,6 +1190,7 @@ async fn session_stream_events_replays_past_one_page() {
         .stream_events(app::StreamEventsRequest {
             session_id: sid.to_string(),
             since: None,
+            durable_only: false,
         })
         .await
         .expect("StreamEvents opens")

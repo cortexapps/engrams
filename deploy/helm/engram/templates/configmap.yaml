@@ -11,6 +11,10 @@ metadata:
 data:
   ENGRAM_MODE: {{ .Values.mode | quote }}
   ENGRAM_SANDBOX_BACKEND: {{ .Values.sandboxBackend | quote }}
+  # ADR 0109: host-only connection credential broker. This URL never enters a guest.
+  {{- if .Values.web.enabled }}
+  ENGRAM_ORCHESTRATOR_INTERNAL_URL: {{ printf "http://%s:%v" (include "engram.orchestrator.fullname" .) .Values.orchestrator.service.port | quote }}
+  {{- end }}
   ENGRAM_BLOB_BACKEND: {{ .Values.blob.backend | quote }}
   {{- if eq .Values.blob.backend "gcs" }}
   {{- if not .Values.blob.gcs.bucket }}

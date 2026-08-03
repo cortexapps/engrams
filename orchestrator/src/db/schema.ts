@@ -80,6 +80,23 @@ export const taskSession = pgTable(
     // these so an override is honored; NULL means a legacy row → fall back to
     // the profile's capabilities.
     capabilities: jsonb("capabilities").$type<string[]>(),
+    // ADR 0109: immutable connection/operation/resource authority used to
+    // authorize host-side credential refresh. This keeps the identity tied to
+    // the operation after the profile changes. Null means a pre-ADR row.
+    integrationGrants: jsonb("integration_grants").$type<ProfileIntegrationGrant[]>(),
+    // Immutable configured identities used by the grants above. Credential
+    // refresh reads this snapshot, not the mutable connection table.
+    integrationConnections: jsonb("integration_connections")
+      .$type<IntegrationConnectionSnapshot[]>(),
+    // Immutable user or automation principal that received this authorization
+    // snapshot. This makes broker audit records attributable without consulting
+    // mutable workflow state.
+    integrationPrincipalId: text("integration_principal_id"),
+    // ADR 0109: content-hash of the compiled authorization snapshot
+    // (profileId + grants + connections). The broker emits it as the
+    // `engrams_profile_snapshot` OIDC claim, so Google-side audit logs join
+    // back to THIS row. Null means a pre-hash row.
+    integrationSnapshotHash: text("integration_snapshot_hash"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => [
@@ -112,6 +129,15 @@ export const pendingToolCall = pgTable(
       t.toolCallId,
     ),
     index("pending_tool_calls_session_idx").on(t.sessionId),
+    // ADR 0107 (PR #927 review): the task list derives `awaiting_review` from
+    // "session-handled and unsubmitted" on every load, and this table is
+    // append-only (rows are marked, never deleted). Without a matching index
+    // that predicate seq-scans every tool call ever made, on a polled hot
+    // path. PARTIAL, so it stays the size of the currently-parked set rather
+    // than the history.
+    index("pending_tool_calls_awaiting_idx")
+      .on(t.sessionId)
+      .where(sql`${t.handling} = 'session' AND ${t.submittedAt} IS NULL`),
   ],
 );
 
@@ -505,6 +531,23 @@ export interface ProfileSecret {
   allowHostPatterns: string[];
 }
 
+/** ADR 0109: one named-connection grant. The connection fixes the provider
+ * identity; the operation and resource constraints stay associated with it. */
+export interface ProfileIntegrationGrant {
+  connectionId: string;
+  operation: string;
+  resourceConstraints: string[];
+}
+
+/** Immutable non-secret connection configuration stamped onto a session. */
+export interface IntegrationConnectionSnapshot {
+  id: string;
+  alias: string;
+  provider: string;
+  displayName: string;
+  config: Record<string, unknown>;
+}
+
 export const DEFAULT_PROFILE_NETWORK: ProfileNetwork = {
   default: "deny",
   allowHosts: [],
@@ -534,11 +577,13 @@ export const profile = pgTable(
     // ["skills", "browser"]). Resolved by the coordinator to reserved-slot
     // mounts at session create. Empty = base session (no skills).
     skills: jsonb("skills").$type<string[]>().notNull().default([]),
-    // ADR 0056: integration capabilities ("provider:action[@resource]") this
-    // profile's sessions are granted. Passed to the coordinator at session create
-    // (CreateSessionRequest.capabilities), which binds + (later) clamps. Empty =
-    // no third-party integration access.
-    capabilities: jsonb("capabilities").$type<string[]>().notNull().default([]),
+    // ADR 0109: structured integration authority. Unlike the retired flat
+    // capability array, this preserves which configured identity an operation
+    // uses and keeps its resource constraints attached.
+    integrationGrants: jsonb("integration_grants")
+      .$type<ProfileIntegrationGrant[]>()
+      .notNull()
+      .default([]),
     // ADR 0057: egress network allow-list (deny by default) + secrets this
     // profile's sessions get, lifted off the image manifest. Additive in B1;
     // compiled into the per-session SessionPolicy + consumed at boot in B2.
@@ -589,6 +634,13 @@ export interface CreateTaskAutomationAction {
   promptTemplate: string;
   titleTemplate?: string;
   includeEventContext: boolean;
+  /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
+  harnessMode?: string;
+  /** ADR 0063 B2: override the profile's default harness / model / effort for
+   *  every session this automation launches. Absent = inherit the profile. */
+  harness?: string;
+  model?: string;
+  effort?: string;
 }
 
 export type AutomationAction = CreateTaskAutomationAction;
@@ -724,6 +776,55 @@ export const connector = pgTable("connector", {
     .defaultNow()
     .$onUpdate(() => new Date()),
 });
+
+/** ADR 0109: one configured provider identity. Existing singleton providers
+ * receive an ordinary default connection; IDs never encode provider or
+ * migration state. Google Cloud config is non-secret. */
+export const integrationConnection = pgTable(
+  "integration_connection",
+  {
+    id: text("id").primaryKey(),
+    alias: text("alias").notNull().unique(),
+    provider: text("provider").notNull(),
+    displayName: text("display_name").notNull(),
+    isDefault: boolean("is_default").notNull().default(false),
+    config: jsonb("config").$type<Record<string, unknown>>().notNull().default({}),
+    enabled: boolean("enabled").notNull().default(false),
+    testedAt: timestamp("tested_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [
+    index("integration_connection_provider_idx").on(t.provider),
+    uniqueIndex("integration_connection_provider_default_unique")
+      .on(t.provider)
+      .where(sql`is_default`),
+  ],
+);
+
+/** KEK-sealed private keys for the deployment OIDC issuer (ADR 0109). */
+export const integrationOidcKey = pgTable(
+  "integration_oidc_key",
+  {
+    kid: text("kid").primaryKey(),
+    publicJwk: jsonb("public_jwk").$type<Record<string, unknown>>().notNull(),
+    wrappedDek: bytea("wrapped_dek").notNull(),
+    nonce: bytea("nonce").notNull(),
+    ciphertext: bytea("ciphertext").notNull(),
+    keyId: text("key_id").notNull(),
+    state: text("state").$type<"active" | "retiring">().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    publishUntil: timestamp("publish_until", { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex("integration_oidc_key_active_unique")
+      .on(t.state)
+      .where(sql`state = 'active'`),
+  ],
+);
 
 // ---------------------------------------------------------------------------
 // Connector logo (redesign): optional uploaded brand mark, keyed by provider.

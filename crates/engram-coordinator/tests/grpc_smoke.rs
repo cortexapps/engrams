@@ -132,6 +132,7 @@ async fn stream_events_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri: image_uri.clone(),
         mode: "dev_vm".to_string(),
@@ -143,6 +144,7 @@ async fn stream_events_smoke() {
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -160,6 +162,7 @@ async fn stream_events_smoke() {
     let mut stream_req = tonic::Request::new(app::StreamEventsRequest {
         session_id: session_id.clone(),
         since: None,
+        durable_only: false,
     });
     stream_req.set_timeout(rpc_timeout);
     let mut stream = client
@@ -205,6 +208,7 @@ async fn stream_events_smoke() {
     let mut reopen_req = tonic::Request::new(app::StreamEventsRequest {
         session_id: session_id.clone(),
         since: Some(last_idx),
+        durable_only: false,
     });
     reopen_req.set_timeout(rpc_timeout);
     let mut reopen_stream = client
@@ -279,6 +283,7 @@ async fn session_crud_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri: image_uri.clone(),
         mode: "dev_vm".to_string(),
@@ -290,6 +295,7 @@ async fn session_crud_smoke() {
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -404,6 +410,7 @@ async fn exec_streaming_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri: image_uri.clone(),
         mode: "dev_vm".into(),
@@ -415,6 +422,7 @@ async fn exec_streaming_smoke() {
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -534,6 +542,7 @@ async fn write_files_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri,
         mode: "dev_vm".into(),
@@ -543,6 +552,7 @@ async fn write_files_smoke() {
         oauth_credential: None,
         prompt_id: None,
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -613,6 +623,7 @@ async fn snapshot_evict_resume_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri: image_uri.clone(),
         mode: "dev_vm".into(),
@@ -624,6 +635,7 @@ async fn snapshot_evict_resume_smoke() {
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -752,6 +764,7 @@ async fn get_artifact_not_found_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri,
         mode: "dev_vm".into(),
@@ -763,6 +776,7 @@ async fn get_artifact_not_found_smoke() {
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -831,6 +845,7 @@ async fn shell_relay_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri,
         mode: "dev_vm".into(),
@@ -842,6 +857,7 @@ async fn shell_relay_smoke() {
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = session_client

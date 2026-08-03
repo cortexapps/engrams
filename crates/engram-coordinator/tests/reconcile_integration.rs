@@ -584,6 +584,7 @@ impl engram_core::traits::HostClient for ProbeBackend {
         _: SandboxId,
         _: String,
         _: String,
+        _mode: Option<String>,
     ) -> Result<(), engram_core::SandboxError> {
         unreachable!()
     }

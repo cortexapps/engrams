@@ -37,6 +37,77 @@ service IntegrationService {
   // credential to test before sealing (inject: the single value under any key;
   // mint: the field map); empty tests the stored credential.
   rpc TestConnector(TestConnectorRequest) returns (TestConnectorResponse);
+  // ADR 0109: configured credential instances. Existing providers expose an
+  // ordinary default connection; the first provider with user-created named
+  // connections is Google Cloud, whose config contains no private key.
+  rpc ListConnections(ListConnectionsRequest) returns (ListConnectionsResponse);
+  rpc CreateConnection(CreateConnectionRequest) returns (CreateConnectionResponse);
+  rpc UpdateConnection(UpdateConnectionRequest) returns (UpdateConnectionResponse);
+  rpc DeleteConnection(DeleteConnectionRequest) returns (DeleteConnectionResponse);
+  rpc TestConnection(TestConnectionRequest) returns (TestConnectionResponse);
+  rpc SetConnectionEnabled(SetConnectionEnabledRequest) returns (SetConnectionEnabledResponse);
+  rpc GetGoogleCloudSetup(GetGoogleCloudSetupRequest) returns (GetGoogleCloudSetupResponse);
+}
+
+message GoogleCloudConnectionConfig {
+  // Full provider resource:
+  // //iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+  string workload_identity_provider = 1;
+  string service_account_email = 2;
+  // Exact Google API hosts and explicit non-googleapis targets such as GKE API
+  // servers. Wildcards and URLs are rejected.
+  repeated string endpoints = 3;
+}
+
+message IntegrationConnection {
+  string id = 1;
+  string alias = 2;
+  string provider = 3;
+  string display_name = 4;
+  bool enabled = 5;
+  string tested_at = 6;
+  string created_at = 7;
+  string updated_at = 8;
+  GoogleCloudConnectionConfig google_cloud = 9;
+  bool is_default = 10;
+}
+
+message ListConnectionsRequest {}
+message ListConnectionsResponse { repeated IntegrationConnection connections = 1; }
+
+message CreateConnectionRequest {
+  string alias = 1;
+  string provider = 2;
+  string display_name = 3;
+  GoogleCloudConnectionConfig google_cloud = 4;
+}
+message CreateConnectionResponse { IntegrationConnection connection = 1; }
+
+message UpdateConnectionRequest {
+  string id = 1;
+  string alias = 2;
+  string display_name = 3;
+  GoogleCloudConnectionConfig google_cloud = 4;
+}
+message UpdateConnectionResponse { IntegrationConnection connection = 1; }
+
+message DeleteConnectionRequest { string id = 1; }
+message DeleteConnectionResponse { bool deleted = 1; }
+
+message TestConnectionRequest { string id = 1; }
+message TestConnectionResponse { bool ok = 1; string message = 2; }
+
+message SetConnectionEnabledRequest { string id = 1; bool enabled = 2; }
+message SetConnectionEnabledResponse { IntegrationConnection connection = 1; }
+
+message GetGoogleCloudSetupRequest { string id = 1; }
+message GetGoogleCloudSetupResponse {
+  string issuer = 1;
+  string audience = 2;
+  string subject_attribute = 3;
+  string connection_attribute = 4;
+  string gcloud_script = 5;
+  string terraform = 6;
 }
 
 message Connector {
@@ -102,6 +173,17 @@ message CatalogCapability {
   string action = 1;  // e.g. "issues:write"
   string access = 2;  // "read" | "write" (derived from the op's HTTP method)
   string asset = 3;   // asset kind this op surfaces, or "" when none
+  // ADR 0109 seam: operator-facing name. A named-connection provider serves
+  // its operation list here so the web renders from the SAME table the
+  // orchestrator compiles policy from — two hand-maintained copies drift, and
+  // the one the UI reads decides what an administrator can grant.
+  string label = 4;
+  // The exact host this operation calls; empty when its reach comes from the
+  // connection's own endpoint list instead.
+  string host = 5;
+  // For a host-less operation, the kind of endpoint that makes it usable:
+  // "google-api" | "non-google-api". Empty for a curated operation.
+  string endpoint_rule = 6;
 }
 
 message ProviderCatalogEntry {
@@ -110,6 +192,13 @@ message ProviderCatalogEntry {
   string credential_source = 3; // "mint" | "inject"
   repeated string hosts = 4;
   repeated CatalogCapability capabilities = 5;
+  // Stable opaque ID for the provider's existing singleton credential slot.
+  // New multi-connection surfaces list their instances separately.
+  string default_connection_id = 6;
+  // ADR 0109 seam: "singleton" (one org-wide credential slot) or "named" (an
+  // administrator configures connections, each its own authority). The web
+  // used to decide this by hard-coding the one provider it knew was named.
+  string connection_model = 7;
 }
 
 message GetIntegrationCatalogRequest {}

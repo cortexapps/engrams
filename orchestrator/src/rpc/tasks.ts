@@ -80,11 +80,16 @@ import {
 import type { ImagesClient } from "./profiles.ts";
 import type { CustomConnectorSource } from "../connectors/registry.ts";
 import {
+  makePendingToolCallStore,
+  type PendingToolCallStore,
+} from "../tools/pending-tool-calls.ts";
+import {
   createTaskWithSession,
   type Db,
   type HarnessCatalogClient,
 } from "./task-create.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
+import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 
 // Re-export ImagesClient so downstream modules (image-guard, tests) can import
 // it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
@@ -100,6 +105,7 @@ export type { Db } from "./task-create.ts";
 /** Subset of SessionService client used by TaskService. */
 export interface SessionsClient {
   createSession(req: {
+    requestedSessionId?: string;
     imageUri: string;
     mode: string;
     prompt?: string;
@@ -120,6 +126,9 @@ export interface SessionsClient {
     // on dyn_0 + execs (proto CreateSessionRequest.harness). Resolved from
     // session override ?? profile ?? deployment default.
     harness?: string;
+    // ADR 0107: session mode for the initial prompt (e.g. "plan"); the
+    // coordinator validates it against the harness descriptor's modes.
+    harnessMode?: string;
   }): Promise<{ sessionId: string; status: string; imageVersion: string; kind: string }>;
   listSessions(req: Record<string, never>): Promise<{ sessions: Array<{ session?: Session | undefined }> }>;
   getSession(req: { sessionId: string }): Promise<{ session?: Session | undefined }>;
@@ -150,8 +159,11 @@ export interface TaskDeps {
   portExposures?: PortExposureStore;
   /** Owner identity lookup for git attribution and task read enrichment. */
   users?: UserIdentityStore;
+  connections?: IntegrationConnectionStore;
   /** Register a session for stream-listener scanner discovery. */
   db?: Db;
+  /** ADR 0107: the pending-tool-call ledger, for the awaiting_review derivation. */
+  pendingCalls?: PendingToolCallStore;
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +299,7 @@ function buildTask(
   profileMap: Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string; skills: string[] }>,
   identityMap: Map<string, UserIdentity>,
   snapshots?: Array<{ taskId: string; suggestedTitle: string }>,
+  awaitingSessionIds?: ReadonlySet<string>,
 ): Task {
   // Derive status + the live harness title from the primary session (if available).
   let status = row.status;
@@ -295,6 +308,13 @@ function buildTask(
   if (primarySession) {
     const mapped = sessionStatusToTaskStatus(primarySession.status);
     if (mapped !== null) status = mapped;
+    // ADR 0107: a live session parked on an unsubmitted session-handled tool
+    // call (a plan awaiting review, an unanswered question) is WAITING ON THE
+    // USER — the contracted `awaiting_review` status, derived at read time
+    // like the rest (the row status stays untouched).
+    if (mapped === "working" && awaitingSessionIds?.has(primaryRef!.sessionId)) {
+      status = "awaiting_review";
+    }
   }
   const liveSuggested = primarySession?.suggestedTitle;
 
@@ -379,6 +399,18 @@ function persistTitleSnapshots(
  * sessions: single TaskSessionRef with role "primary"
  * createdAt: session.createdAt
  */
+/** ADR 0107: best-effort fetch of the sessions waiting on the user — the
+ *  attention affordance must never break the task list. */
+async function fetchAwaitingSessionIds(
+  pendingCalls: PendingToolCallStore,
+): Promise<ReadonlySet<string>> {
+  try {
+    return new Set(await pendingCalls.listSessionIdsWithPendingSessionCalls());
+  } catch {
+    return new Set();
+  }
+}
+
 function buildUnattributedTask(sess: Session): Task {
   const status = sessionStatusToTaskStatus(sess.status) ?? "open";
   return {
@@ -439,6 +471,9 @@ async function loadTask(
   profiles: ProfileStore,
   imagesClient: ImagesClient,
   users: UserIdentityStore,
+  // REQUIRED on purpose: a defaulted store here silently bypassed the injected
+  // one (#942's default-param trap).
+  pendingCalls: PendingToolCallStore,
 ): Promise<Task> {
   const db_ = db;
 
@@ -473,9 +508,10 @@ async function loadTask(
     }
   }
 
-  const [profileMap, identityMap] = await Promise.all([
+  const [profileMap, identityMap, awaitingSessionIds] = await Promise.all([
     buildProfileMap(sessionRefRows, profiles, imagesClient),
     users.getIdentities(taskRow.createdByUserId != null ? [taskRow.createdByUserId] : []),
+    fetchAwaitingSessionIds(pendingCalls),
   ]);
   const snapshots: Array<{ taskId: string; suggestedTitle: string }> = [];
   const task = buildTask(
@@ -485,6 +521,7 @@ async function loadTask(
     profileMap,
     identityMap,
     snapshots,
+    awaitingSessionIds,
   );
   persistTitleSnapshots(db_, snapshots);
   return task;
@@ -520,6 +557,14 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
   const resolveUsers = (): UserIdentityStore =>
     deps?.users ?? makeUserIdentityStore(getDbFn());
   const imagesClient: ImagesClient = deps?.images ?? (defaultImages as unknown as ImagesClient);
+  // Lazy like the other DB-backed stores (ADR 0107 attention derivation).
+  let pendingCallsStoreMemo: PendingToolCallStore | undefined;
+  const pendingCallsStore = {
+    listSessionIdsWithPendingSessionCalls: () => {
+      pendingCallsStoreMemo ??= deps?.pendingCalls ?? makePendingToolCallStore();
+      return pendingCallsStoreMemo.listSessionIdsWithPendingSessionCalls();
+    },
+  } as PendingToolCallStore;
   const harnessCatalogClient: HarnessCatalogClient =
     deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
   // Lazy default (see profiles.ts): touch getDb() only when a handler reads
@@ -559,6 +604,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           secrets: resolveSecrets(),
           portExposures: resolvePortExposures(),
           users: resolveUsers(),
+          ...(deps?.connections ? { connections: deps.connections } : {}),
           db: getDbFn(),
         },
         {
@@ -574,6 +620,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           ...(req.harness != null ? { harness: req.harness } : {}),
           ...(req.model != null ? { model: req.model } : {}),
           ...(req.effort != null ? { effort: req.effort } : {}),
+          ...(req.harnessMode != null ? { harnessMode: req.harnessMode } : {}),
         },
       );
 
@@ -584,6 +631,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         profiles,
         imagesClient,
         resolveUsers(),
+        pendingCallsStore,
       );
       return { task: loaded };
     },
@@ -713,6 +761,9 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         sessionMap.set(sess.id, sess);
       }
 
+      // ADR 0107: sessions parked on an unsubmitted session-handled call.
+      const awaitingSessionIds = await fetchAwaitingSessionIds(pendingCallsStore);
+
       // Filter task rows by ability (belt-and-braces under SQL scoping).
       const visibleTasks: Task[] = [];
       const snapshots: Array<{ taskId: string; suggestedTitle: string }> = [];
@@ -727,7 +778,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         }
         const refs = refsByTaskId.get(row.id) ?? [];
         visibleTasks.push(
-          buildTask(row, refs, sessionMap, profileMap, identityMap, snapshots),
+          buildTask(row, refs, sessionMap, profileMap, identityMap, snapshots, awaitingSessionIds),
         );
       }
       // Fire-and-forget the freshest harness titles onto the task rows (only
@@ -818,6 +869,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         profiles,
         imagesClient,
         resolveUsers(),
+        pendingCallsStore,
       );
       return { task: loaded };
     },
@@ -949,6 +1001,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         profiles,
         imagesClient,
         resolveUsers(),
+        pendingCallsStore,
       );
       return { task: loaded };
     },

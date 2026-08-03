@@ -10,7 +10,401 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/integration.proto.
  */
 export const file_engram_app_v1_integration: GenFile = /*@__PURE__*/
-  fileDesc("Ch9lbmdyYW0vYXBwL3YxL2ludGVncmF0aW9uLnByb3RvEg1lbmdyYW0uYXBwLnYxInsKCUNvbm5lY3RvchIQCghwcm92aWRlchgBIAEoCRITCgtjb25maWdfanNvbhgCIAEoCRIPCgdidWlsdGluGAMgASgIEhIKCmNyZWF0ZWRfYXQYBCABKAkSEgoKdXBkYXRlZF9hdBgFIAEoCRIOCgZzdGF0dXMYBiABKAkiFwoVTGlzdENvbm5lY3RvcnNSZXF1ZXN0IkYKFkxpc3RDb25uZWN0b3JzUmVzcG9uc2USLAoKY29ubmVjdG9ycxgBIAMoCzIYLmVuZ3JhbS5hcHAudjEuQ29ubmVjdG9yIi0KFlVwc2VydENvbm5lY3RvclJlcXVlc3QSEwoLY29uZmlnX2pzb24YASABKAkiRgoXVXBzZXJ0Q29ubmVjdG9yUmVzcG9uc2USKwoJY29ubmVjdG9yGAEgASgLMhguZW5ncmFtLmFwcC52MS5Db25uZWN0b3IiKgoWRGVsZXRlQ29ubmVjdG9yUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCSIqChdEZWxldGVDb25uZWN0b3JSZXNwb25zZRIPCgdkZWxldGVkGAEgASgIIjoKDUNvbm5lY3Rvckljb24SDAoEbW9ubxgBIAEoCRINCgVjb2xvchgCIAEoCRIMCgRsb2dvGAMgASgJIm0KEENvbm5lY3RvckRpc3BsYXkSDAoEbmFtZRgBIAEoCRIQCghjYXRlZ29yeRgCIAEoCRINCgVibHVyYhgDIAEoCRIqCgRpY29uGAQgASgLMhwuZW5ncmFtLmFwcC52MS5Db25uZWN0b3JJY29uIkIKEUNhdGFsb2dDYXBhYmlsaXR5Eg4KBmFjdGlvbhgBIAEoCRIOCgZhY2Nlc3MYAiABKAkSDQoFYXNzZXQYAyABKAkivAEKFFByb3ZpZGVyQ2F0YWxvZ0VudHJ5EhAKCHByb3ZpZGVyGAEgASgJEjAKB2Rpc3BsYXkYAiABKAsyHy5lbmdyYW0uYXBwLnYxLkNvbm5lY3RvckRpc3BsYXkSGQoRY3JlZGVudGlhbF9zb3VyY2UYAyABKAkSDQoFaG9zdHMYBCADKAkSNgoMY2FwYWJpbGl0aWVzGAUgAygLMiAuZW5ncmFtLmFwcC52MS5DYXRhbG9nQ2FwYWJpbGl0eSIeChxHZXRJbnRlZ3JhdGlvbkNhdGFsb2dSZXF1ZXN0IlcKHUdldEludGVncmF0aW9uQ2F0YWxvZ1Jlc3BvbnNlEjYKCXByb3ZpZGVycxgBIAMoCzIjLmVuZ3JhbS5hcHAudjEuUHJvdmlkZXJDYXRhbG9nRW50cnkirgEKGFNldE1pbnRDcmVkZW50aWFsUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCRIMCgRraW5kGAIgASgJEkMKBnZhbHVlcxgDIAMoCzIzLmVuZ3JhbS5hcHAudjEuU2V0TWludENyZWRlbnRpYWxSZXF1ZXN0LlZhbHVlc0VudHJ5Gi0KC1ZhbHVlc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiMQoZU2V0TWludENyZWRlbnRpYWxSZXNwb25zZRIUCgxzZWNyZXRfbmFtZXMYASADKAkiUAoaVXBsb2FkQ29ubmVjdG9yTG9nb1JlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkSDAoEZGF0YRgCIAEoDBISCgptZWRpYV90eXBlGAMgASgJIi8KG1VwbG9hZENvbm5lY3RvckxvZ29SZXNwb25zZRIQCghsb2dvX3VybBgBIAEoCSKoAQoUVGVzdENvbm5lY3RvclJlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkSSgoMZHJhZnRfdmFsdWVzGAIgAygLMjQuZW5ncmFtLmFwcC52MS5UZXN0Q29ubmVjdG9yUmVxdWVzdC5EcmFmdFZhbHVlc0VudHJ5GjIKEERyYWZ0VmFsdWVzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASI0ChVUZXN0Q29ubmVjdG9yUmVzcG9uc2USCgoCb2sYASABKAgSDwoHbWVzc2FnZRgCIAEoCTLdBQoSSW50ZWdyYXRpb25TZXJ2aWNlEl0KDkxpc3RDb25uZWN0b3JzEiQuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdG9yc1JlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkxpc3RDb25uZWN0b3JzUmVzcG9uc2USYAoPVXBzZXJ0Q29ubmVjdG9yEiUuZW5ncmFtLmFwcC52MS5VcHNlcnRDb25uZWN0b3JSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5VcHNlcnRDb25uZWN0b3JSZXNwb25zZRJgCg9EZWxldGVDb25uZWN0b3ISJS5lbmdyYW0uYXBwLnYxLkRlbGV0ZUNvbm5lY3RvclJlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLkRlbGV0ZUNvbm5lY3RvclJlc3BvbnNlEnIKFUdldEludGVncmF0aW9uQ2F0YWxvZxIrLmVuZ3JhbS5hcHAudjEuR2V0SW50ZWdyYXRpb25DYXRhbG9nUmVxdWVzdBosLmVuZ3JhbS5hcHAudjEuR2V0SW50ZWdyYXRpb25DYXRhbG9nUmVzcG9uc2USZgoRU2V0TWludENyZWRlbnRpYWwSJy5lbmdyYW0uYXBwLnYxLlNldE1pbnRDcmVkZW50aWFsUmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuU2V0TWludENyZWRlbnRpYWxSZXNwb25zZRJsChNVcGxvYWRDb25uZWN0b3JMb2dvEikuZW5ncmFtLmFwcC52MS5VcGxvYWRDb25uZWN0b3JMb2dvUmVxdWVzdBoqLmVuZ3JhbS5hcHAudjEuVXBsb2FkQ29ubmVjdG9yTG9nb1Jlc3BvbnNlEloKDVRlc3RDb25uZWN0b3ISIy5lbmdyYW0uYXBwLnYxLlRlc3RDb25uZWN0b3JSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5UZXN0Q29ubmVjdG9yUmVzcG9uc2ViBnByb3RvMw");
+  fileDesc("Ch9lbmdyYW0vYXBwL3YxL2ludGVncmF0aW9uLnByb3RvEg1lbmdyYW0uYXBwLnYxInMKG0dvb2dsZUNsb3VkQ29ubmVjdGlvbkNvbmZpZxIiChp3b3JrbG9hZF9pZGVudGl0eV9wcm92aWRlchgBIAEoCRIdChVzZXJ2aWNlX2FjY291bnRfZW1haWwYAiABKAkSEQoJZW5kcG9pbnRzGAMgAygJIvwBChVJbnRlZ3JhdGlvbkNvbm5lY3Rpb24SCgoCaWQYASABKAkSDQoFYWxpYXMYAiABKAkSEAoIcHJvdmlkZXIYAyABKAkSFAoMZGlzcGxheV9uYW1lGAQgASgJEg8KB2VuYWJsZWQYBSABKAgSEQoJdGVzdGVkX2F0GAYgASgJEhIKCmNyZWF0ZWRfYXQYByABKAkSEgoKdXBkYXRlZF9hdBgIIAEoCRJACgxnb29nbGVfY2xvdWQYCSABKAsyKi5lbmdyYW0uYXBwLnYxLkdvb2dsZUNsb3VkQ29ubmVjdGlvbkNvbmZpZxISCgppc19kZWZhdWx0GAogASgIIhgKFkxpc3RDb25uZWN0aW9uc1JlcXVlc3QiVAoXTGlzdENvbm5lY3Rpb25zUmVzcG9uc2USOQoLY29ubmVjdGlvbnMYASADKAsyJC5lbmdyYW0uYXBwLnYxLkludGVncmF0aW9uQ29ubmVjdGlvbiKSAQoXQ3JlYXRlQ29ubmVjdGlvblJlcXVlc3QSDQoFYWxpYXMYASABKAkSEAoIcHJvdmlkZXIYAiABKAkSFAoMZGlzcGxheV9uYW1lGAMgASgJEkAKDGdvb2dsZV9jbG91ZBgEIAEoCzIqLmVuZ3JhbS5hcHAudjEuR29vZ2xlQ2xvdWRDb25uZWN0aW9uQ29uZmlnIlQKGENyZWF0ZUNvbm5lY3Rpb25SZXNwb25zZRI4Cgpjb25uZWN0aW9uGAEgASgLMiQuZW5ncmFtLmFwcC52MS5JbnRlZ3JhdGlvbkNvbm5lY3Rpb24ijAEKF1VwZGF0ZUNvbm5lY3Rpb25SZXF1ZXN0EgoKAmlkGAEgASgJEg0KBWFsaWFzGAIgASgJEhQKDGRpc3BsYXlfbmFtZRgDIAEoCRJACgxnb29nbGVfY2xvdWQYBCABKAsyKi5lbmdyYW0uYXBwLnYxLkdvb2dsZUNsb3VkQ29ubmVjdGlvbkNvbmZpZyJUChhVcGRhdGVDb25uZWN0aW9uUmVzcG9uc2USOAoKY29ubmVjdGlvbhgBIAEoCzIkLmVuZ3JhbS5hcHAudjEuSW50ZWdyYXRpb25Db25uZWN0aW9uIiUKF0RlbGV0ZUNvbm5lY3Rpb25SZXF1ZXN0EgoKAmlkGAEgASgJIisKGERlbGV0ZUNvbm5lY3Rpb25SZXNwb25zZRIPCgdkZWxldGVkGAEgASgIIiMKFVRlc3RDb25uZWN0aW9uUmVxdWVzdBIKCgJpZBgBIAEoCSI1ChZUZXN0Q29ubmVjdGlvblJlc3BvbnNlEgoKAm9rGAEgASgIEg8KB21lc3NhZ2UYAiABKAkiOgobU2V0Q29ubmVjdGlvbkVuYWJsZWRSZXF1ZXN0EgoKAmlkGAEgASgJEg8KB2VuYWJsZWQYAiABKAgiWAocU2V0Q29ubmVjdGlvbkVuYWJsZWRSZXNwb25zZRI4Cgpjb25uZWN0aW9uGAEgASgLMiQuZW5ncmFtLmFwcC52MS5JbnRlZ3JhdGlvbkNvbm5lY3Rpb24iKAoaR2V0R29vZ2xlQ2xvdWRTZXR1cFJlcXVlc3QSCgoCaWQYASABKAkiogEKG0dldEdvb2dsZUNsb3VkU2V0dXBSZXNwb25zZRIOCgZpc3N1ZXIYASABKAkSEAoIYXVkaWVuY2UYAiABKAkSGQoRc3ViamVjdF9hdHRyaWJ1dGUYAyABKAkSHAoUY29ubmVjdGlvbl9hdHRyaWJ1dGUYBCABKAkSFQoNZ2Nsb3VkX3NjcmlwdBgFIAEoCRIRCgl0ZXJyYWZvcm0YBiABKAkiewoJQ29ubmVjdG9yEhAKCHByb3ZpZGVyGAEgASgJEhMKC2NvbmZpZ19qc29uGAIgASgJEg8KB2J1aWx0aW4YAyABKAgSEgoKY3JlYXRlZF9hdBgEIAEoCRISCgp1cGRhdGVkX2F0GAUgASgJEg4KBnN0YXR1cxgGIAEoCSIXChVMaXN0Q29ubmVjdG9yc1JlcXVlc3QiRgoWTGlzdENvbm5lY3RvcnNSZXNwb25zZRIsCgpjb25uZWN0b3JzGAEgAygLMhguZW5ncmFtLmFwcC52MS5Db25uZWN0b3IiLQoWVXBzZXJ0Q29ubmVjdG9yUmVxdWVzdBITCgtjb25maWdfanNvbhgBIAEoCSJGChdVcHNlcnRDb25uZWN0b3JSZXNwb25zZRIrCgljb25uZWN0b3IYASABKAsyGC5lbmdyYW0uYXBwLnYxLkNvbm5lY3RvciIqChZEZWxldGVDb25uZWN0b3JSZXF1ZXN0EhAKCHByb3ZpZGVyGAEgASgJIioKF0RlbGV0ZUNvbm5lY3RvclJlc3BvbnNlEg8KB2RlbGV0ZWQYASABKAgiOgoNQ29ubmVjdG9ySWNvbhIMCgRtb25vGAEgASgJEg0KBWNvbG9yGAIgASgJEgwKBGxvZ28YAyABKAkibQoQQ29ubmVjdG9yRGlzcGxheRIMCgRuYW1lGAEgASgJEhAKCGNhdGVnb3J5GAIgASgJEg0KBWJsdXJiGAMgASgJEioKBGljb24YBCABKAsyHC5lbmdyYW0uYXBwLnYxLkNvbm5lY3Rvckljb24idgoRQ2F0YWxvZ0NhcGFiaWxpdHkSDgoGYWN0aW9uGAEgASgJEg4KBmFjY2VzcxgCIAEoCRINCgVhc3NldBgDIAEoCRINCgVsYWJlbBgEIAEoCRIMCgRob3N0GAUgASgJEhUKDWVuZHBvaW50X3J1bGUYBiABKAki9QEKFFByb3ZpZGVyQ2F0YWxvZ0VudHJ5EhAKCHByb3ZpZGVyGAEgASgJEjAKB2Rpc3BsYXkYAiABKAsyHy5lbmdyYW0uYXBwLnYxLkNvbm5lY3RvckRpc3BsYXkSGQoRY3JlZGVudGlhbF9zb3VyY2UYAyABKAkSDQoFaG9zdHMYBCADKAkSNgoMY2FwYWJpbGl0aWVzGAUgAygLMiAuZW5ncmFtLmFwcC52MS5DYXRhbG9nQ2FwYWJpbGl0eRIdChVkZWZhdWx0X2Nvbm5lY3Rpb25faWQYBiABKAkSGAoQY29ubmVjdGlvbl9tb2RlbBgHIAEoCSIeChxHZXRJbnRlZ3JhdGlvbkNhdGFsb2dSZXF1ZXN0IlcKHUdldEludGVncmF0aW9uQ2F0YWxvZ1Jlc3BvbnNlEjYKCXByb3ZpZGVycxgBIAMoCzIjLmVuZ3JhbS5hcHAudjEuUHJvdmlkZXJDYXRhbG9nRW50cnkirgEKGFNldE1pbnRDcmVkZW50aWFsUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCRIMCgRraW5kGAIgASgJEkMKBnZhbHVlcxgDIAMoCzIzLmVuZ3JhbS5hcHAudjEuU2V0TWludENyZWRlbnRpYWxSZXF1ZXN0LlZhbHVlc0VudHJ5Gi0KC1ZhbHVlc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiMQoZU2V0TWludENyZWRlbnRpYWxSZXNwb25zZRIUCgxzZWNyZXRfbmFtZXMYASADKAkiUAoaVXBsb2FkQ29ubmVjdG9yTG9nb1JlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkSDAoEZGF0YRgCIAEoDBISCgptZWRpYV90eXBlGAMgASgJIi8KG1VwbG9hZENvbm5lY3RvckxvZ29SZXNwb25zZRIQCghsb2dvX3VybBgBIAEoCSKoAQoUVGVzdENvbm5lY3RvclJlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkSSgoMZHJhZnRfdmFsdWVzGAIgAygLMjQuZW5ncmFtLmFwcC52MS5UZXN0Q29ubmVjdG9yUmVxdWVzdC5EcmFmdFZhbHVlc0VudHJ5GjIKEERyYWZ0VmFsdWVzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASI0ChVUZXN0Q29ubmVjdG9yUmVzcG9uc2USCgoCb2sYASABKAgSDwoHbWVzc2FnZRgCIAEoCTKsCwoSSW50ZWdyYXRpb25TZXJ2aWNlEl0KDkxpc3RDb25uZWN0b3JzEiQuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdG9yc1JlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkxpc3RDb25uZWN0b3JzUmVzcG9uc2USYAoPVXBzZXJ0Q29ubmVjdG9yEiUuZW5ncmFtLmFwcC52MS5VcHNlcnRDb25uZWN0b3JSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5VcHNlcnRDb25uZWN0b3JSZXNwb25zZRJgCg9EZWxldGVDb25uZWN0b3ISJS5lbmdyYW0uYXBwLnYxLkRlbGV0ZUNvbm5lY3RvclJlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLkRlbGV0ZUNvbm5lY3RvclJlc3BvbnNlEnIKFUdldEludGVncmF0aW9uQ2F0YWxvZxIrLmVuZ3JhbS5hcHAudjEuR2V0SW50ZWdyYXRpb25DYXRhbG9nUmVxdWVzdBosLmVuZ3JhbS5hcHAudjEuR2V0SW50ZWdyYXRpb25DYXRhbG9nUmVzcG9uc2USZgoRU2V0TWludENyZWRlbnRpYWwSJy5lbmdyYW0uYXBwLnYxLlNldE1pbnRDcmVkZW50aWFsUmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuU2V0TWludENyZWRlbnRpYWxSZXNwb25zZRJsChNVcGxvYWRDb25uZWN0b3JMb2dvEikuZW5ncmFtLmFwcC52MS5VcGxvYWRDb25uZWN0b3JMb2dvUmVxdWVzdBoqLmVuZ3JhbS5hcHAudjEuVXBsb2FkQ29ubmVjdG9yTG9nb1Jlc3BvbnNlEloKDVRlc3RDb25uZWN0b3ISIy5lbmdyYW0uYXBwLnYxLlRlc3RDb25uZWN0b3JSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5UZXN0Q29ubmVjdG9yUmVzcG9uc2USYAoPTGlzdENvbm5lY3Rpb25zEiUuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdGlvbnNSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5MaXN0Q29ubmVjdGlvbnNSZXNwb25zZRJjChBDcmVhdGVDb25uZWN0aW9uEiYuZW5ncmFtLmFwcC52MS5DcmVhdGVDb25uZWN0aW9uUmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQ29ubmVjdGlvblJlc3BvbnNlEmMKEFVwZGF0ZUNvbm5lY3Rpb24SJi5lbmdyYW0uYXBwLnYxLlVwZGF0ZUNvbm5lY3Rpb25SZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5VcGRhdGVDb25uZWN0aW9uUmVzcG9uc2USYwoQRGVsZXRlQ29ubmVjdGlvbhImLmVuZ3JhbS5hcHAudjEuRGVsZXRlQ29ubmVjdGlvblJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLkRlbGV0ZUNvbm5lY3Rpb25SZXNwb25zZRJdCg5UZXN0Q29ubmVjdGlvbhIkLmVuZ3JhbS5hcHAudjEuVGVzdENvbm5lY3Rpb25SZXF1ZXN0GiUuZW5ncmFtLmFwcC52MS5UZXN0Q29ubmVjdGlvblJlc3BvbnNlEm8KFFNldENvbm5lY3Rpb25FbmFibGVkEiouZW5ncmFtLmFwcC52MS5TZXRDb25uZWN0aW9uRW5hYmxlZFJlcXVlc3QaKy5lbmdyYW0uYXBwLnYxLlNldENvbm5lY3Rpb25FbmFibGVkUmVzcG9uc2USbAoTR2V0R29vZ2xlQ2xvdWRTZXR1cBIpLmVuZ3JhbS5hcHAudjEuR2V0R29vZ2xlQ2xvdWRTZXR1cFJlcXVlc3QaKi5lbmdyYW0uYXBwLnYxLkdldEdvb2dsZUNsb3VkU2V0dXBSZXNwb25zZWIGcHJvdG8z");
+
+/**
+ * @generated from message engram.app.v1.GoogleCloudConnectionConfig
+ */
+export type GoogleCloudConnectionConfig = Message<"engram.app.v1.GoogleCloudConnectionConfig"> & {
+  /**
+   * Full provider resource:
+   * //iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+   *
+   * @generated from field: string workload_identity_provider = 1;
+   */
+  workloadIdentityProvider: string;
+
+  /**
+   * @generated from field: string service_account_email = 2;
+   */
+  serviceAccountEmail: string;
+
+  /**
+   * Exact Google API hosts and explicit non-googleapis targets such as GKE API
+   * servers. Wildcards and URLs are rejected.
+   *
+   * @generated from field: repeated string endpoints = 3;
+   */
+  endpoints: string[];
+};
+
+/**
+ * Describes the message engram.app.v1.GoogleCloudConnectionConfig.
+ * Use `create(GoogleCloudConnectionConfigSchema)` to create a new message.
+ */
+export const GoogleCloudConnectionConfigSchema: GenMessage<GoogleCloudConnectionConfig> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 0);
+
+/**
+ * @generated from message engram.app.v1.IntegrationConnection
+ */
+export type IntegrationConnection = Message<"engram.app.v1.IntegrationConnection"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+
+  /**
+   * @generated from field: string alias = 2;
+   */
+  alias: string;
+
+  /**
+   * @generated from field: string provider = 3;
+   */
+  provider: string;
+
+  /**
+   * @generated from field: string display_name = 4;
+   */
+  displayName: string;
+
+  /**
+   * @generated from field: bool enabled = 5;
+   */
+  enabled: boolean;
+
+  /**
+   * @generated from field: string tested_at = 6;
+   */
+  testedAt: string;
+
+  /**
+   * @generated from field: string created_at = 7;
+   */
+  createdAt: string;
+
+  /**
+   * @generated from field: string updated_at = 8;
+   */
+  updatedAt: string;
+
+  /**
+   * @generated from field: engram.app.v1.GoogleCloudConnectionConfig google_cloud = 9;
+   */
+  googleCloud?: GoogleCloudConnectionConfig;
+
+  /**
+   * @generated from field: bool is_default = 10;
+   */
+  isDefault: boolean;
+};
+
+/**
+ * Describes the message engram.app.v1.IntegrationConnection.
+ * Use `create(IntegrationConnectionSchema)` to create a new message.
+ */
+export const IntegrationConnectionSchema: GenMessage<IntegrationConnection> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 1);
+
+/**
+ * @generated from message engram.app.v1.ListConnectionsRequest
+ */
+export type ListConnectionsRequest = Message<"engram.app.v1.ListConnectionsRequest"> & {
+};
+
+/**
+ * Describes the message engram.app.v1.ListConnectionsRequest.
+ * Use `create(ListConnectionsRequestSchema)` to create a new message.
+ */
+export const ListConnectionsRequestSchema: GenMessage<ListConnectionsRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 2);
+
+/**
+ * @generated from message engram.app.v1.ListConnectionsResponse
+ */
+export type ListConnectionsResponse = Message<"engram.app.v1.ListConnectionsResponse"> & {
+  /**
+   * @generated from field: repeated engram.app.v1.IntegrationConnection connections = 1;
+   */
+  connections: IntegrationConnection[];
+};
+
+/**
+ * Describes the message engram.app.v1.ListConnectionsResponse.
+ * Use `create(ListConnectionsResponseSchema)` to create a new message.
+ */
+export const ListConnectionsResponseSchema: GenMessage<ListConnectionsResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 3);
+
+/**
+ * @generated from message engram.app.v1.CreateConnectionRequest
+ */
+export type CreateConnectionRequest = Message<"engram.app.v1.CreateConnectionRequest"> & {
+  /**
+   * @generated from field: string alias = 1;
+   */
+  alias: string;
+
+  /**
+   * @generated from field: string provider = 2;
+   */
+  provider: string;
+
+  /**
+   * @generated from field: string display_name = 3;
+   */
+  displayName: string;
+
+  /**
+   * @generated from field: engram.app.v1.GoogleCloudConnectionConfig google_cloud = 4;
+   */
+  googleCloud?: GoogleCloudConnectionConfig;
+};
+
+/**
+ * Describes the message engram.app.v1.CreateConnectionRequest.
+ * Use `create(CreateConnectionRequestSchema)` to create a new message.
+ */
+export const CreateConnectionRequestSchema: GenMessage<CreateConnectionRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 4);
+
+/**
+ * @generated from message engram.app.v1.CreateConnectionResponse
+ */
+export type CreateConnectionResponse = Message<"engram.app.v1.CreateConnectionResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.IntegrationConnection connection = 1;
+   */
+  connection?: IntegrationConnection;
+};
+
+/**
+ * Describes the message engram.app.v1.CreateConnectionResponse.
+ * Use `create(CreateConnectionResponseSchema)` to create a new message.
+ */
+export const CreateConnectionResponseSchema: GenMessage<CreateConnectionResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 5);
+
+/**
+ * @generated from message engram.app.v1.UpdateConnectionRequest
+ */
+export type UpdateConnectionRequest = Message<"engram.app.v1.UpdateConnectionRequest"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+
+  /**
+   * @generated from field: string alias = 2;
+   */
+  alias: string;
+
+  /**
+   * @generated from field: string display_name = 3;
+   */
+  displayName: string;
+
+  /**
+   * @generated from field: engram.app.v1.GoogleCloudConnectionConfig google_cloud = 4;
+   */
+  googleCloud?: GoogleCloudConnectionConfig;
+};
+
+/**
+ * Describes the message engram.app.v1.UpdateConnectionRequest.
+ * Use `create(UpdateConnectionRequestSchema)` to create a new message.
+ */
+export const UpdateConnectionRequestSchema: GenMessage<UpdateConnectionRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 6);
+
+/**
+ * @generated from message engram.app.v1.UpdateConnectionResponse
+ */
+export type UpdateConnectionResponse = Message<"engram.app.v1.UpdateConnectionResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.IntegrationConnection connection = 1;
+   */
+  connection?: IntegrationConnection;
+};
+
+/**
+ * Describes the message engram.app.v1.UpdateConnectionResponse.
+ * Use `create(UpdateConnectionResponseSchema)` to create a new message.
+ */
+export const UpdateConnectionResponseSchema: GenMessage<UpdateConnectionResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 7);
+
+/**
+ * @generated from message engram.app.v1.DeleteConnectionRequest
+ */
+export type DeleteConnectionRequest = Message<"engram.app.v1.DeleteConnectionRequest"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+};
+
+/**
+ * Describes the message engram.app.v1.DeleteConnectionRequest.
+ * Use `create(DeleteConnectionRequestSchema)` to create a new message.
+ */
+export const DeleteConnectionRequestSchema: GenMessage<DeleteConnectionRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 8);
+
+/**
+ * @generated from message engram.app.v1.DeleteConnectionResponse
+ */
+export type DeleteConnectionResponse = Message<"engram.app.v1.DeleteConnectionResponse"> & {
+  /**
+   * @generated from field: bool deleted = 1;
+   */
+  deleted: boolean;
+};
+
+/**
+ * Describes the message engram.app.v1.DeleteConnectionResponse.
+ * Use `create(DeleteConnectionResponseSchema)` to create a new message.
+ */
+export const DeleteConnectionResponseSchema: GenMessage<DeleteConnectionResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 9);
+
+/**
+ * @generated from message engram.app.v1.TestConnectionRequest
+ */
+export type TestConnectionRequest = Message<"engram.app.v1.TestConnectionRequest"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+};
+
+/**
+ * Describes the message engram.app.v1.TestConnectionRequest.
+ * Use `create(TestConnectionRequestSchema)` to create a new message.
+ */
+export const TestConnectionRequestSchema: GenMessage<TestConnectionRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 10);
+
+/**
+ * @generated from message engram.app.v1.TestConnectionResponse
+ */
+export type TestConnectionResponse = Message<"engram.app.v1.TestConnectionResponse"> & {
+  /**
+   * @generated from field: bool ok = 1;
+   */
+  ok: boolean;
+
+  /**
+   * @generated from field: string message = 2;
+   */
+  message: string;
+};
+
+/**
+ * Describes the message engram.app.v1.TestConnectionResponse.
+ * Use `create(TestConnectionResponseSchema)` to create a new message.
+ */
+export const TestConnectionResponseSchema: GenMessage<TestConnectionResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 11);
+
+/**
+ * @generated from message engram.app.v1.SetConnectionEnabledRequest
+ */
+export type SetConnectionEnabledRequest = Message<"engram.app.v1.SetConnectionEnabledRequest"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+
+  /**
+   * @generated from field: bool enabled = 2;
+   */
+  enabled: boolean;
+};
+
+/**
+ * Describes the message engram.app.v1.SetConnectionEnabledRequest.
+ * Use `create(SetConnectionEnabledRequestSchema)` to create a new message.
+ */
+export const SetConnectionEnabledRequestSchema: GenMessage<SetConnectionEnabledRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 12);
+
+/**
+ * @generated from message engram.app.v1.SetConnectionEnabledResponse
+ */
+export type SetConnectionEnabledResponse = Message<"engram.app.v1.SetConnectionEnabledResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.IntegrationConnection connection = 1;
+   */
+  connection?: IntegrationConnection;
+};
+
+/**
+ * Describes the message engram.app.v1.SetConnectionEnabledResponse.
+ * Use `create(SetConnectionEnabledResponseSchema)` to create a new message.
+ */
+export const SetConnectionEnabledResponseSchema: GenMessage<SetConnectionEnabledResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 13);
+
+/**
+ * @generated from message engram.app.v1.GetGoogleCloudSetupRequest
+ */
+export type GetGoogleCloudSetupRequest = Message<"engram.app.v1.GetGoogleCloudSetupRequest"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+};
+
+/**
+ * Describes the message engram.app.v1.GetGoogleCloudSetupRequest.
+ * Use `create(GetGoogleCloudSetupRequestSchema)` to create a new message.
+ */
+export const GetGoogleCloudSetupRequestSchema: GenMessage<GetGoogleCloudSetupRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 14);
+
+/**
+ * @generated from message engram.app.v1.GetGoogleCloudSetupResponse
+ */
+export type GetGoogleCloudSetupResponse = Message<"engram.app.v1.GetGoogleCloudSetupResponse"> & {
+  /**
+   * @generated from field: string issuer = 1;
+   */
+  issuer: string;
+
+  /**
+   * @generated from field: string audience = 2;
+   */
+  audience: string;
+
+  /**
+   * @generated from field: string subject_attribute = 3;
+   */
+  subjectAttribute: string;
+
+  /**
+   * @generated from field: string connection_attribute = 4;
+   */
+  connectionAttribute: string;
+
+  /**
+   * @generated from field: string gcloud_script = 5;
+   */
+  gcloudScript: string;
+
+  /**
+   * @generated from field: string terraform = 6;
+   */
+  terraform: string;
+};
+
+/**
+ * Describes the message engram.app.v1.GetGoogleCloudSetupResponse.
+ * Use `create(GetGoogleCloudSetupResponseSchema)` to create a new message.
+ */
+export const GetGoogleCloudSetupResponseSchema: GenMessage<GetGoogleCloudSetupResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_integration, 15);
 
 /**
  * @generated from message engram.app.v1.Connector
@@ -62,7 +456,7 @@ export type Connector = Message<"engram.app.v1.Connector"> & {
  * Use `create(ConnectorSchema)` to create a new message.
  */
 export const ConnectorSchema: GenMessage<Connector> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 0);
+  messageDesc(file_engram_app_v1_integration, 16);
 
 /**
  * @generated from message engram.app.v1.ListConnectorsRequest
@@ -75,7 +469,7 @@ export type ListConnectorsRequest = Message<"engram.app.v1.ListConnectorsRequest
  * Use `create(ListConnectorsRequestSchema)` to create a new message.
  */
 export const ListConnectorsRequestSchema: GenMessage<ListConnectorsRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 1);
+  messageDesc(file_engram_app_v1_integration, 17);
 
 /**
  * @generated from message engram.app.v1.ListConnectorsResponse
@@ -92,7 +486,7 @@ export type ListConnectorsResponse = Message<"engram.app.v1.ListConnectorsRespon
  * Use `create(ListConnectorsResponseSchema)` to create a new message.
  */
 export const ListConnectorsResponseSchema: GenMessage<ListConnectorsResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 2);
+  messageDesc(file_engram_app_v1_integration, 18);
 
 /**
  * @generated from message engram.app.v1.UpsertConnectorRequest
@@ -111,7 +505,7 @@ export type UpsertConnectorRequest = Message<"engram.app.v1.UpsertConnectorReque
  * Use `create(UpsertConnectorRequestSchema)` to create a new message.
  */
 export const UpsertConnectorRequestSchema: GenMessage<UpsertConnectorRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 3);
+  messageDesc(file_engram_app_v1_integration, 19);
 
 /**
  * @generated from message engram.app.v1.UpsertConnectorResponse
@@ -128,7 +522,7 @@ export type UpsertConnectorResponse = Message<"engram.app.v1.UpsertConnectorResp
  * Use `create(UpsertConnectorResponseSchema)` to create a new message.
  */
 export const UpsertConnectorResponseSchema: GenMessage<UpsertConnectorResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 4);
+  messageDesc(file_engram_app_v1_integration, 20);
 
 /**
  * @generated from message engram.app.v1.DeleteConnectorRequest
@@ -145,7 +539,7 @@ export type DeleteConnectorRequest = Message<"engram.app.v1.DeleteConnectorReque
  * Use `create(DeleteConnectorRequestSchema)` to create a new message.
  */
 export const DeleteConnectorRequestSchema: GenMessage<DeleteConnectorRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 5);
+  messageDesc(file_engram_app_v1_integration, 21);
 
 /**
  * @generated from message engram.app.v1.DeleteConnectorResponse
@@ -162,7 +556,7 @@ export type DeleteConnectorResponse = Message<"engram.app.v1.DeleteConnectorResp
  * Use `create(DeleteConnectorResponseSchema)` to create a new message.
  */
 export const DeleteConnectorResponseSchema: GenMessage<DeleteConnectorResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 6);
+  messageDesc(file_engram_app_v1_integration, 22);
 
 /**
  * Per-connector visual identity. `mono` + `color` are always set; `logo` is a
@@ -194,7 +588,7 @@ export type ConnectorIcon = Message<"engram.app.v1.ConnectorIcon"> & {
  * Use `create(ConnectorIconSchema)` to create a new message.
  */
 export const ConnectorIconSchema: GenMessage<ConnectorIcon> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 7);
+  messageDesc(file_engram_app_v1_integration, 23);
 
 /**
  * @generated from message engram.app.v1.ConnectorDisplay
@@ -226,7 +620,7 @@ export type ConnectorDisplay = Message<"engram.app.v1.ConnectorDisplay"> & {
  * Use `create(ConnectorDisplaySchema)` to create a new message.
  */
 export const ConnectorDisplaySchema: GenMessage<ConnectorDisplay> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 8);
+  messageDesc(file_engram_app_v1_integration, 24);
 
 /**
  * One grantable power, derived for display (the slug stays canonical).
@@ -254,6 +648,32 @@ export type CatalogCapability = Message<"engram.app.v1.CatalogCapability"> & {
    * @generated from field: string asset = 3;
    */
   asset: string;
+
+  /**
+   * ADR 0109 seam: operator-facing name. A named-connection provider serves
+   * its operation list here so the web renders from the SAME table the
+   * orchestrator compiles policy from — two hand-maintained copies drift, and
+   * the one the UI reads decides what an administrator can grant.
+   *
+   * @generated from field: string label = 4;
+   */
+  label: string;
+
+  /**
+   * The exact host this operation calls; empty when its reach comes from the
+   * connection's own endpoint list instead.
+   *
+   * @generated from field: string host = 5;
+   */
+  host: string;
+
+  /**
+   * For a host-less operation, the kind of endpoint that makes it usable:
+   * "google-api" | "non-google-api". Empty for a curated operation.
+   *
+   * @generated from field: string endpoint_rule = 6;
+   */
+  endpointRule: string;
 };
 
 /**
@@ -261,7 +681,7 @@ export type CatalogCapability = Message<"engram.app.v1.CatalogCapability"> & {
  * Use `create(CatalogCapabilitySchema)` to create a new message.
  */
 export const CatalogCapabilitySchema: GenMessage<CatalogCapability> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 9);
+  messageDesc(file_engram_app_v1_integration, 25);
 
 /**
  * @generated from message engram.app.v1.ProviderCatalogEntry
@@ -293,6 +713,23 @@ export type ProviderCatalogEntry = Message<"engram.app.v1.ProviderCatalogEntry">
    * @generated from field: repeated engram.app.v1.CatalogCapability capabilities = 5;
    */
   capabilities: CatalogCapability[];
+
+  /**
+   * Stable opaque ID for the provider's existing singleton credential slot.
+   * New multi-connection surfaces list their instances separately.
+   *
+   * @generated from field: string default_connection_id = 6;
+   */
+  defaultConnectionId: string;
+
+  /**
+   * ADR 0109 seam: "singleton" (one org-wide credential slot) or "named" (an
+   * administrator configures connections, each its own authority). The web
+   * used to decide this by hard-coding the one provider it knew was named.
+   *
+   * @generated from field: string connection_model = 7;
+   */
+  connectionModel: string;
 };
 
 /**
@@ -300,7 +737,7 @@ export type ProviderCatalogEntry = Message<"engram.app.v1.ProviderCatalogEntry">
  * Use `create(ProviderCatalogEntrySchema)` to create a new message.
  */
 export const ProviderCatalogEntrySchema: GenMessage<ProviderCatalogEntry> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 10);
+  messageDesc(file_engram_app_v1_integration, 26);
 
 /**
  * @generated from message engram.app.v1.GetIntegrationCatalogRequest
@@ -313,7 +750,7 @@ export type GetIntegrationCatalogRequest = Message<"engram.app.v1.GetIntegration
  * Use `create(GetIntegrationCatalogRequestSchema)` to create a new message.
  */
 export const GetIntegrationCatalogRequestSchema: GenMessage<GetIntegrationCatalogRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 11);
+  messageDesc(file_engram_app_v1_integration, 27);
 
 /**
  * @generated from message engram.app.v1.GetIntegrationCatalogResponse
@@ -330,7 +767,7 @@ export type GetIntegrationCatalogResponse = Message<"engram.app.v1.GetIntegratio
  * Use `create(GetIntegrationCatalogResponseSchema)` to create a new message.
  */
 export const GetIntegrationCatalogResponseSchema: GenMessage<GetIntegrationCatalogResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 12);
+  messageDesc(file_engram_app_v1_integration, 28);
 
 /**
  * @generated from message engram.app.v1.SetMintCredentialRequest
@@ -364,7 +801,7 @@ export type SetMintCredentialRequest = Message<"engram.app.v1.SetMintCredentialR
  * Use `create(SetMintCredentialRequestSchema)` to create a new message.
  */
 export const SetMintCredentialRequestSchema: GenMessage<SetMintCredentialRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 13);
+  messageDesc(file_engram_app_v1_integration, 29);
 
 /**
  * @generated from message engram.app.v1.SetMintCredentialResponse
@@ -383,7 +820,7 @@ export type SetMintCredentialResponse = Message<"engram.app.v1.SetMintCredential
  * Use `create(SetMintCredentialResponseSchema)` to create a new message.
  */
 export const SetMintCredentialResponseSchema: GenMessage<SetMintCredentialResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 14);
+  messageDesc(file_engram_app_v1_integration, 30);
 
 /**
  * @generated from message engram.app.v1.UploadConnectorLogoRequest
@@ -414,7 +851,7 @@ export type UploadConnectorLogoRequest = Message<"engram.app.v1.UploadConnectorL
  * Use `create(UploadConnectorLogoRequestSchema)` to create a new message.
  */
 export const UploadConnectorLogoRequestSchema: GenMessage<UploadConnectorLogoRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 15);
+  messageDesc(file_engram_app_v1_integration, 31);
 
 /**
  * @generated from message engram.app.v1.UploadConnectorLogoResponse
@@ -433,7 +870,7 @@ export type UploadConnectorLogoResponse = Message<"engram.app.v1.UploadConnector
  * Use `create(UploadConnectorLogoResponseSchema)` to create a new message.
  */
 export const UploadConnectorLogoResponseSchema: GenMessage<UploadConnectorLogoResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 16);
+  messageDesc(file_engram_app_v1_integration, 32);
 
 /**
  * @generated from message engram.app.v1.TestConnectorRequest
@@ -459,7 +896,7 @@ export type TestConnectorRequest = Message<"engram.app.v1.TestConnectorRequest">
  * Use `create(TestConnectorRequestSchema)` to create a new message.
  */
 export const TestConnectorRequestSchema: GenMessage<TestConnectorRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 17);
+  messageDesc(file_engram_app_v1_integration, 33);
 
 /**
  * @generated from message engram.app.v1.TestConnectorResponse
@@ -481,7 +918,7 @@ export type TestConnectorResponse = Message<"engram.app.v1.TestConnectorResponse
  * Use `create(TestConnectorResponseSchema)` to create a new message.
  */
 export const TestConnectorResponseSchema: GenMessage<TestConnectorResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration, 18);
+  messageDesc(file_engram_app_v1_integration, 34);
 
 /**
  * ADR 0057 C3: orchestrator-native connector catalog CRUD (Plane B). Connectors
@@ -577,6 +1014,66 @@ export const IntegrationService: GenService<{
     methodKind: "unary";
     input: typeof TestConnectorRequestSchema;
     output: typeof TestConnectorResponseSchema;
+  },
+  /**
+   * ADR 0109: configured credential instances. Existing providers expose an
+   * ordinary default connection; the first provider with user-created named
+   * connections is Google Cloud, whose config contains no private key.
+   *
+   * @generated from rpc engram.app.v1.IntegrationService.ListConnections
+   */
+  listConnections: {
+    methodKind: "unary";
+    input: typeof ListConnectionsRequestSchema;
+    output: typeof ListConnectionsResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.CreateConnection
+   */
+  createConnection: {
+    methodKind: "unary";
+    input: typeof CreateConnectionRequestSchema;
+    output: typeof CreateConnectionResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.UpdateConnection
+   */
+  updateConnection: {
+    methodKind: "unary";
+    input: typeof UpdateConnectionRequestSchema;
+    output: typeof UpdateConnectionResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.DeleteConnection
+   */
+  deleteConnection: {
+    methodKind: "unary";
+    input: typeof DeleteConnectionRequestSchema;
+    output: typeof DeleteConnectionResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.TestConnection
+   */
+  testConnection: {
+    methodKind: "unary";
+    input: typeof TestConnectionRequestSchema;
+    output: typeof TestConnectionResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.SetConnectionEnabled
+   */
+  setConnectionEnabled: {
+    methodKind: "unary";
+    input: typeof SetConnectionEnabledRequestSchema;
+    output: typeof SetConnectionEnabledResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.IntegrationService.GetGoogleCloudSetup
+   */
+  getGoogleCloudSetup: {
+    methodKind: "unary";
+    input: typeof GetGoogleCloudSetupRequestSchema;
+    output: typeof GetGoogleCloudSetupResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_integration, 0);

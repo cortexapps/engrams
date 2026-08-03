@@ -105,6 +105,9 @@ userfaultfd = { version = "0.9", features = ["linux5_13"] }
 
 [dev-dependencies]
 engram-uffd-handler.workspace = true
+# 2026-08-02 durability-rollback RCA: paused-clock (`start_paused`)
+# regression tests for the SIGTERM flush join's deadline-overrun arm.
+tokio = { workspace = true, features = ["test-util"] }
 # base_shm_gc tests backdate mtimes
 filetime = "0.2"
 engram-harness-noop.workspace = true

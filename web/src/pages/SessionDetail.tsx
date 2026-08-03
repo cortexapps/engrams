@@ -1,16 +1,33 @@
 import { useParams } from "@tanstack/react-router";
-import { Fragment, useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
-import { Activity, Code2, GitPullRequestArrow, Globe, Pencil, SquareTerminal } from "lucide-react";
+import {
+  Fragment,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+  type ReactNode,
+} from "react";
+import {
+  Activity,
+  Code2,
+  GitPullRequestArrow,
+  Globe,
+  Map,
+  Pencil,
+  SquareTerminal,
+} from "lucide-react";
 import type { ImperativePanelHandle } from "react-resizable-panels";
 import { useSession } from "../hooks/useSessions";
 import { useSessionEvents } from "../hooks/useSessionEvents";
+import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { StatusGlyph } from "../components/Glyph";
 import { SessionThread } from "../components/session-thread/SessionThread";
 import { PageHeading } from "../components/page-heading";
 import { TitleEditForm } from "./sessions/TitleEditForm";
 import { DeleteSessionButton } from "./sessions/DeleteSessionButton";
 import { WorkPane, type PaneTabId } from "../components/WorkPane";
-import { statusLabel } from "./sessions/session-format";
+import { shortId, statusLabel } from "./sessions/session-format";
 import { useTasks } from "../hooks/useTasks";
 import { useIsMobile } from "../hooks/use-mobile";
 import { ProfileChip } from "../components/profiles/ProfileChip";
@@ -254,6 +271,31 @@ export function SessionDetail() {
     />
   );
 
+  // ADR 0107: the Plan tab appears once the session has proposed a plan.
+  const hasPlan = useMemo(
+    () =>
+      events.some(
+        (e) => e.event.type === "tool_call_requested" && e.event.name === "exit_plan_mode",
+      ),
+    [events],
+  );
+
+  // ADR 0107: the session is waiting on the user (a plan review or an
+  // unanswered question) — the tab title picks up the ● prefix.
+  const needsAttention = useMemo(() => {
+    const submitted = new Set<string>();
+    for (const { event } of events) {
+      if (event.type === "tool_result_submitted") submitted.add(event.tool_call_id);
+    }
+    return events.some(
+      ({ event }) =>
+        event.type === "tool_call_requested" &&
+        (event.name === "exit_plan_mode" || event.name === "ask_user_question") &&
+        !submitted.has(event.tool_call_id),
+    );
+  }, [events]);
+  useDocumentTitle(needsAttention ? `\u25cf ${taskTitle ?? shortId(id)} — engrams` : null);
+
   const paneTabDefs: {
     id: PaneTabId;
     label: string;
@@ -262,6 +304,7 @@ export function SessionDetail() {
     { id: "shell", label: "Shell", icon: SquareTerminal },
     ...(browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
     ...(ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
+    ...(hasPlan ? [{ id: "plan", label: "Plan", icon: Map } as const] : []),
     { id: "side-effects", label: "Side effects", icon: GitPullRequestArrow },
     { id: "diagnostics", label: "Diagnostics", icon: Activity },
   ];
@@ -321,7 +364,14 @@ export function SessionDetail() {
             </div>
           }
         />
-        {session && <SessionVitals session={session} profile={profile} durability={durability} />}
+        {session && (
+          <SessionVitals
+            session={session}
+            profile={profile}
+            durability={durability}
+            needsAttention={needsAttention}
+          />
+        )}
       </div>
       <div className="min-h-0 flex-1 overflow-hidden">{transcript}</div>
     </div>
@@ -457,19 +507,29 @@ function SessionVitals({
   session,
   profile,
   durability,
+  needsAttention = false,
 }: {
   session: Session;
   profile: ProfileSnapshotView | null;
   durability: DurabilitySummary | null;
+  /** ADR 0107: a plan review or question is waiting on the user. */
+  needsAttention?: boolean;
 }) {
   const items: { key: string; node: ReactNode }[] = [
     {
       key: "status",
       node: (
         <span className="inline-flex items-center gap-1.5">
-          <StatusGlyph status={session.status} />
-          <span data-testid="session-status" className="font-medium text-foreground">
-            {statusLabel(session.status)}
+          <StatusGlyph status={session.status} attention={needsAttention} />
+          <span
+            data-testid="session-status"
+            className={
+              needsAttention ? "font-medium text-instrument-caution" : "font-medium text-foreground"
+            }
+          >
+            {needsAttention
+              ? `${statusLabel(session.status)} — waiting on you`
+              : statusLabel(session.status)}
           </span>
         </span>
       ),

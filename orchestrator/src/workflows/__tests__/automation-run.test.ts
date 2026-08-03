@@ -11,6 +11,7 @@ import {
   makeAutomationTaskCreator,
   type AutomationRunWorkflowInput,
   type AutomationStepRunner,
+  type PreparedAutomationRun,
 } from "../automation-run.ts";
 
 const NOW = new Date("2026-07-22T12:00:00Z");
@@ -22,7 +23,10 @@ const input: AutomationRunWorkflowInput = {
   receivedAt: NOW.toISOString(),
 };
 
-function automation(promptTemplate: string): AutomationRow {
+function automation(
+  promptTemplate: string,
+  override: { harness?: string; model?: string; effort?: string } = {},
+): AutomationRow {
   return {
     id: input.automationId,
     name: "Daily triage",
@@ -34,6 +38,7 @@ function automation(promptTemplate: string): AutomationRow {
       profileId: "profile-1",
       promptTemplate,
       includeEventContext: true,
+      ...override,
     },
     createdByUserId: "admin-1",
     nextFireAt: NOW,
@@ -62,9 +67,13 @@ function run(status = "pending"): AutomationRunRow {
   };
 }
 
-function fixture(promptTemplate = "Run at ${{ trigger.scheduled_for }}", status = "pending") {
+function fixture(
+  promptTemplate = "Run at ${{ trigger.scheduled_for }}",
+  status = "pending",
+  override: { harness?: string; model?: string; effort?: string } = {},
+) {
   let runRow = run(status);
-  const automationRow = automation(promptTemplate);
+  const automationRow = automation(promptTemplate, override);
   const store: AutomationWorkflowStore = {
     async ensureRun() {
       return runRow;
@@ -191,6 +200,51 @@ describe("AutomationRunWorkflow", () => {
     });
   });
 
+  test("the stored harness/model/effort override reaches the launch step", async () => {
+    const f = fixture("Run", "pending", { harness: "codex", model: "gpt", effort: "high" });
+    let prepared: PreparedAutomationRun | undefined;
+
+    await automationRunWorkflowImpl(input, {
+      store: f.store,
+      step: immediateSteps().step,
+      taskCreator: {
+        async create(_input, value) {
+          prepared = value;
+          return { taskId: "task-1", sessionId: "session-1" };
+        },
+      },
+    });
+
+    expect(prepared).toEqual({
+      profileId: "profile-1",
+      prompt: "Run",
+      title: null,
+      harness: "codex",
+      model: "gpt",
+      effort: "high",
+    });
+  });
+
+  test("an automation with no override prepares no harness selection", async () => {
+    const f = fixture("Run");
+    let prepared: PreparedAutomationRun | undefined;
+
+    await automationRunWorkflowImpl(input, {
+      store: f.store,
+      step: immediateSteps().step,
+      taskCreator: {
+        async create(_input, value) {
+          prepared = value;
+          return { taskId: "task-1", sessionId: "session-1" };
+        },
+      },
+    });
+
+    expect(prepared).not.toHaveProperty("harness");
+    expect(prepared).not.toHaveProperty("model");
+    expect(prepared).not.toHaveProperty("effort");
+  });
+
   test("a webhook run renders declarative connector aliases from its redacted payload", async () => {
     const webhookInput: AutomationRunWorkflowInput = {
       automationId: "automation-1",
@@ -278,6 +332,7 @@ describe("automation task creator", () => {
     expect(sessionInput).toEqual({
       taskId: "task-1",
       profileId: "profile-1",
+      integrationPrincipalId: "automation:automation-1",
       role: "primary",
       prompt: "Do the work",
       registerListener: true,
@@ -286,5 +341,31 @@ describe("automation task creator", () => {
     expect(sessionInput).not.toHaveProperty("dropProfileSecretsAndEnv");
     expect(sessionInput).not.toHaveProperty("capabilityOverride");
     expect(sessionInput).not.toHaveProperty("networkOverride");
+    expect(sessionInput).not.toHaveProperty("harness");
+    expect(sessionInput).not.toHaveProperty("model");
+    expect(sessionInput).not.toHaveProperty("effort");
+  });
+
+  test("forwards the prepared harness/model/effort to session create", async () => {
+    const f = fixture("Run");
+    let sessionInput: CreateSessionForExistingTaskParams | undefined;
+    const creator = makeAutomationTaskCreator({
+      store: f.store,
+      async createSessionForExistingTask(value) {
+        sessionInput = value;
+        return { sessionId: "session-1" };
+      },
+    });
+
+    await creator.create(input, {
+      profileId: "profile-1",
+      prompt: "Do the work",
+      title: null,
+      harness: "codex",
+      model: "gpt",
+      effort: "high",
+    });
+
+    expect(sessionInput).toMatchObject({ harness: "codex", model: "gpt", effort: "high" });
   });
 });

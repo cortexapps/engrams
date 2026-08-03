@@ -156,6 +156,7 @@ pub fn init(addr: SocketAddr) {
     // never seen. The alert must exist before the first firing, so the
     // series must too.
     ::metrics::counter!(DURABILITY_ROLLBACK_TOTAL).absolute(0);
+    ::metrics::counter!(QUARANTINE_STUCK_TOTAL).absolute(0);
 }
 
 // ─── metric name constants ────────────────────────────────────────
@@ -299,6 +300,11 @@ pub const EVICTION_PARK_DESCEND_TOTAL: &str = "engram_eviction_park_descend_tota
 /// belt-and-braces liveness alarm (was the desync watchdog's job).
 /// Alert on a sustained nonzero rate.
 pub const HARNESS_ATTACH_DISAGREEMENT_TOTAL: &str = "engram_harness_attach_disagreement_total";
+/// Counter (ADR 0108 A8). Sessions the heartbeat disagreement REPAIR
+/// re-drove: waiting outbox rows recalled to due + a Deliver op
+/// enqueued, for an Active session whose sandbox the host reports
+/// RUNNING with no attached harness (prod 7eddce62).
+pub const HARNESS_DESYNC_REDRIVEN_TOTAL: &str = "engram_harness_desync_redriven_total";
 /// Counter (ADR 0073). Rows terminally acked by a confirming event.
 pub const OUTBOX_ACKED_TOTAL: &str = "engram_outbox_acked_total";
 /// Counter (ADR 0073). Delivery attempts deferred to backoff.
@@ -350,15 +356,33 @@ pub const HARNESS_INPLACE_REATTACH_TOTAL: &str = "engram_harness_inplace_reattac
 /// snapshot pipeline is persistently failing for some session.
 pub const EVICTION_BUDGET_EXHAUSTED_TOTAL: &str = "engram_eviction_budget_exhausted_total";
 
-/// Counter (ADR 0090, 2026-07-20 durability-rollback incident). A
-/// quarantined-survivor eviction exhausted its retry budget, so the
-/// coordinator DESTROYED the crippled VM; the session's next resume then
-/// rewinds to the last published disk manifest, silently dropping any
-/// guest writes the host acked but never uploaded past it (the incident:
-/// 134/100/50 MiB tails). Pairs with the durable `durability_rollback`
-/// session_events row. MUST be ~0 — every increment is real, user-visible
-/// data loss, so alert on ANY sustained rise.
+/// Counter (ADR 0090, 2026-07-20 durability-rollback incident). A resume
+/// was forced past acked-but-unpublished guest writes — real, user-visible
+/// data loss. Pairs with the durable `durability_rollback` session_events
+/// row.
+///
+/// **EMITTER-LESS since the 2026-08-02 RCA** (PR #972): the quarantine
+/// evict ladder — the only emitter — no longer destroys (it parks; see
+/// [`QUARANTINE_STUCK_TOTAL`]), so nothing increments this today and the
+/// series exports a constant 0. It is retained deliberately, NOT armed:
+/// the `SessionEvent::DurabilityRollback` variant must keep decoding (the
+/// web timeline renders the historical incident rows), and this name is
+/// the canonical counter any FUTURE durability-promise-break path must
+/// emit — re-adding an emitter re-arms the "must be ~0" alert with its
+/// original meaning. Expected host-death rewinds are NOT this counter's
+/// domain; they are counted by `session_rewound_events_total` with
+/// `cause=host_failure_recovery`.
 pub const DURABILITY_ROLLBACK_TOTAL: &str = "engram_durability_rollback_total";
+
+/// Counter (2026-08-02 durability-rollback RCA). A quarantined survivor's
+/// eviction exhausted its fast-retry budget and the op PARKED on the slow
+/// retry lane — the VM and its acked writes are preserved, but the
+/// session is stalled until the host's rehydrate retry re-serves the disk
+/// or an operator intervenes. Alert on any increase: recovery is expected
+/// to be automatic within minutes; a session stuck longer needs a human
+/// (the runbook alternative used to be automatic VM destruction, i.e.
+/// data loss).
+pub const QUARANTINE_STUCK_TOTAL: &str = "engram_quarantine_stuck_total";
 
 /// Counter of session_events ROWS rolled back by rung-1 recovery rewinds
 /// (`apply_rung1_rewind`), labeled `cause` ∈ {planned_relocation,
@@ -573,3 +597,26 @@ pub const SESSION_RESUME_PLACEMENT_TOTAL: &str = "engram_session_resume_total";
 /// initial prompt (no `prompt_id`, no receipt row) never contributes a
 /// sample.
 pub const PROMPT_TO_RUN_STARTED_SECONDS: &str = "engram_prompt_to_run_started_seconds";
+
+/// Counter (ADR 0108). Operator interrupts forwarded to the harness,
+/// labeled `source` — who asked. The wire field is free-form, but the
+/// label value is normalized to a BOUNDED vocabulary (the cardinality
+/// convention above forbids unbounded label values from clients):
+/// `esc` / `stop-button` / `aui-cancel` / `unattributed` (empty source
+/// from an old client) / `other` (any unrecognized label — the paired
+/// `info!` log carries the raw value for forensics). Exists because a
+/// 2026-07-31 phantom interrupt (an ungated library Esc handler) was
+/// untraceable: the interrupt path logged and counted nothing.
+pub const INTERRUPTS_TOTAL: &str = "engram_interrupts_total";
+
+/// Normalize a wire `source` to the bounded `source` label vocabulary
+/// documented on [`INTERRUPTS_TOTAL`].
+pub fn interrupt_source_label(source: &str) -> &'static str {
+    match source {
+        "" => "unattributed",
+        "esc" => "esc",
+        "stop-button" => "stop-button",
+        "aui-cancel" => "aui-cancel",
+        _ => "other",
+    }
+}

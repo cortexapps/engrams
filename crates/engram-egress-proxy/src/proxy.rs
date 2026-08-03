@@ -55,6 +55,9 @@ pub struct ProxyConfig {
     /// channel. Production sets `Some(0.0.0.0:53)` and pairs it
     /// with iptables `REDIRECT VM→{udp,tcp}/53 → :53`.
     pub dns_bind_addr: Option<SocketAddr>,
+    /// Where the Google metadata-compatible ADC endpoint listens. `None`
+    /// disables it.
+    pub metadata_bind_addr: Option<SocketAddr>,
     /// Upstream resolver the DNS proxy forwards allowed queries to.
     /// Defaults to Cloudflare's 1.1.1.1:53.
     pub dns_upstream: SocketAddr,
@@ -68,6 +71,9 @@ pub struct ProxyConfig {
     /// expiry — the pre-WS4 behaviour). The host-agent wires this to its coord
     /// client; tests pass a stub.
     pub inject_refresher: Option<Arc<dyn InjectRefresher>>,
+    /// Extra trust roots for hermetic full-network tests. Production leaves
+    /// this empty and uses the built-in WebPKI roots.
+    pub upstream_test_roots: Option<rustls::RootCertStore>,
 }
 
 impl ProxyConfig {
@@ -86,11 +92,13 @@ impl ProxyConfig {
             // host-agent's `--egress-dns-port`. Iptables REDIRECTs
             // guest {udp,tcp}/53 to this port.
             dns_bind_addr: Some("0.0.0.0:5353".parse().expect("dns bind default parses")),
+            metadata_bind_addr: None,
             dns_upstream: dns::DEFAULT_UPSTREAM
                 .parse()
                 .expect("dns upstream default parses"),
             observe_sink: None,
             inject_refresher: None,
+            upstream_test_roots: None,
         }
     }
 }
@@ -104,7 +112,10 @@ pub struct Proxy {
 impl Proxy {
     pub fn new(cfg: ProxyConfig) -> Self {
         let server_cfg = intercept::build_server_config(cfg.mint.clone());
-        let client_cfg = intercept::build_client_config();
+        let client_cfg = cfg.upstream_test_roots.clone().map_or_else(
+            intercept::build_client_config,
+            intercept::build_client_config_with_roots,
+        );
         Self {
             cfg,
             server_cfg,
@@ -136,7 +147,13 @@ impl Proxy {
         } else {
             None
         };
-        Ok(Listeners { tcp, dns })
+        let metadata = match self.cfg.metadata_bind_addr {
+            Some(addr) => Some(TcpListener::bind(addr).await.inspect_err(|error| {
+                tracing::error!(%addr, %error, "metadata bind failed");
+            })?),
+            None => None,
+        };
+        Ok(Listeners { tcp, dns, metadata })
     }
 
     /// Run the accept loop forever on already-bound listeners. The DNS
@@ -144,7 +161,7 @@ impl Proxy {
     /// accept loop itself terminates (it shouldn't — accept errors are
     /// logged and retried).
     pub async fn serve(self, listeners: Listeners) {
-        let Listeners { tcp, dns } = listeners;
+        let Listeners { tcp, dns, metadata } = listeners;
         tracing::info!(addr = ?tcp.local_addr().ok(), "engram-egress-proxy listening");
 
         // The filtering DNS proxy: serve loops for the already-bound
@@ -162,6 +179,14 @@ impl Proxy {
             tokio::spawn(async move {
                 if let Err(e) = dns::serve_tcp(dns_tcp, registry_for_tcp, upstream).await {
                     tracing::error!(error = %e, "DNS/tcp serve loop ended");
+                }
+            });
+        }
+        if let Some(listener) = metadata {
+            let registry = self.cfg.registry.clone();
+            tokio::spawn(async move {
+                if let Err(error) = crate::metadata::serve(listener, registry).await {
+                    tracing::error!(%error, "metadata serve loop ended");
                 }
             });
         }
@@ -206,6 +231,7 @@ impl Proxy {
 pub struct Listeners {
     tcp: TcpListener,
     dns: Option<(Arc<UdpSocket>, TcpListener)>,
+    metadata: Option<TcpListener>,
 }
 
 impl Listeners {
@@ -290,19 +316,23 @@ async fn handle(
             secrets,
             injects,
             observes,
+            foreign_placeholders,
         } => {
             let result = intercept::run(
                 stream,
                 peeked,
-                &sni,
-                port,
                 resolver,
-                &secrets,
-                &injects,
-                &observes,
-                session.session_id,
-                observe_sink.as_ref(),
-                inject_refresher.as_deref(),
+                intercept::StreamContext {
+                    sni: &sni,
+                    port,
+                    secrets: &secrets,
+                    injects: &injects,
+                    observes: &observes,
+                    foreign_placeholders: &foreign_placeholders,
+                    session_id: session.session_id,
+                    sink: observe_sink.as_ref(),
+                    refresher: inject_refresher.as_deref(),
+                },
                 server_cfg,
                 client_cfg,
             )
@@ -337,6 +367,17 @@ async fn handle(
                         session_id = %session.session_id,
                         sni = %sni, reason,
                         "egress rejected — graphql operation not permitted by integration policy",
+                    );
+                    Ok(())
+                }
+                Err(intercept::InterceptError::CredentialRequestRejected { method, path }) => {
+                    tracing::warn!(
+                        session_id = %session.session_id,
+                        target = %sni,
+                        %method,
+                        %path,
+                        outcome = "denied",
+                        "egress rejected credential-producing Google API request",
                     );
                     Ok(())
                 }

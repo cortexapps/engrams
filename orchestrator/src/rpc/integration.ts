@@ -17,6 +17,8 @@ import type { ConnectRouter, HandlerContext } from "@connectrpc/connect";
 import { IntegrationService } from "../gen/engram/app/v1/integration_pb.ts";
 import type { MintKind } from "../gen/engram/app/v1/mint_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { config } from "../config.ts";
+import { errorMessage } from "../log.ts";
 import { getDb } from "../db/client.ts";
 import { makeConnectorStore, type ConnectorStore } from "../db/connectors.ts";
 import { makeConnectorLogoStore, type ConnectorLogoStore } from "../db/connector-logos.ts";
@@ -30,6 +32,23 @@ import {
   type Connector,
 } from "../connectors/registry.ts";
 import { orgSecret as defaultOrgSecret, mint as defaultMint } from "../control-plane/client.ts";
+import {
+  makeIntegrationConnectionStore,
+  type GoogleCloudConnectionConfig,
+  type IntegrationConnectionRow,
+  type IntegrationConnectionStore,
+} from "../db/integration-connections.ts";
+import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
+import { makeIntegrationOidcKeyStore } from "../db/integration-oidc-keys.ts";
+import { assertGoogleCloudConfig, makeGoogleWifBroker } from "../integrations/google-wif.ts";
+import {
+  connectionProvider,
+  connectionProviders,
+  makeConnectionProviders,
+  type ConnectionProvider,
+} from "../integrations/providers/index.ts";
+import { makeGoogleProvider } from "../integrations/providers/google.ts";
+import { googleOidcIssuer } from "../routes/google-oidc.ts";
 
 /** Logo upload cap — comfortably fits an SVG (KBs) or a square PNG at icon size. */
 const LOGO_MAX_BYTES = 512 * 1024;
@@ -83,6 +102,15 @@ export interface IntegrationDeps {
   connectorLogos?: ConnectorLogoStore;
   orgSecret?: OrgSecretAccess;
   mint?: MintAccess;
+  connections?: IntegrationConnectionStore;
+  profiles?: ProfileStore;
+  now?: () => Date;
+  googleExchange?: ReturnType<typeof makeGoogleWifBroker>["exchange"];
+  issuer?: string;
+  /** Deployment identity emitted as the `engrams_organization` claim. */
+  deploymentId?: string;
+  /** Override the whole provider registry (a suite with its own providers). */
+  providers?: ReadonlyMap<string, ConnectionProvider>;
 }
 
 async function requireAdmin(ctx: HandlerContext, getSession: GetSession): Promise<void> {
@@ -137,6 +165,121 @@ function statusOf(c: Connector, names: Set<string>, requiredByKind: Map<string, 
   return connectorStatus(c, names, required);
 }
 
+/**
+ * Where each provider's configuration sits on the wire.
+ *
+ * The proto carries a TYPED message per provider, not an opaque struct, so
+ * some mapping from a provider key to a wire field is unavoidable. This table
+ * is deliberately the ONLY place it exists: everything downstream — validation,
+ * policy compilation, minting, setup — goes through the provider itself.
+ */
+const PROTO_CONFIG_BY_PROVIDER: Record<string, ProtoConfigCodec> = {
+  gcp: {
+    read: (req) =>
+      req.googleCloud && {
+        workloadIdentityProvider: req.googleCloud.workloadIdentityProvider,
+        serviceAccountEmail: req.googleCloud.serviceAccountEmail,
+        endpoints: req.googleCloud.endpoints,
+      },
+    write: (config) => {
+      const google = assertGoogleCloudConfig(config);
+      return {
+        googleCloud: {
+          workloadIdentityProvider: google.workloadIdentityProvider,
+          serviceAccountEmail: google.serviceAccountEmail,
+          endpoints: google.endpoints,
+        },
+      };
+    },
+  },
+};
+
+interface ProtoConfigCodec {
+  read(req: { googleCloud?: GoogleCloudProtoConfig }): Record<string, unknown> | undefined;
+  write(config: Record<string, unknown>): { googleCloud?: GoogleCloudProtoConfig };
+}
+
+interface GoogleCloudProtoConfig {
+  workloadIdentityProvider: string;
+  serviceAccountEmail: string;
+  endpoints: string[];
+}
+
+/** Read a request's provider config off the wire and validate it. */
+function configFromProto(
+  provider: ConnectionProvider,
+  req: { googleCloud?: GoogleCloudProtoConfig },
+): Record<string, unknown> {
+  const raw = PROTO_CONFIG_BY_PROVIDER[provider.key]?.read(req);
+  if (!raw) {
+    throw new ConnectError(`${provider.key} config is required`, Code.InvalidArgument);
+  }
+  try {
+    return provider.validateConfig(raw);
+  } catch (error) {
+    throw new ConnectError(errorMessage(error), Code.InvalidArgument);
+  }
+}
+
+function connectionToProto(row: IntegrationConnectionRow) {
+  // A row whose provider is no longer registered still has to serialize — an
+  // operator must be able to SEE it in order to delete it.
+  const config = PROTO_CONFIG_BY_PROVIDER[row.provider]?.write(row.config) ?? {};
+  return {
+    id: row.id,
+    alias: row.alias,
+    provider: row.provider,
+    displayName: row.displayName,
+    isDefault: row.isDefault,
+    enabled: row.enabled,
+    testedAt: row.testedAt?.toISOString() ?? "",
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+    ...config,
+  };
+}
+
+function assertConnectionNames(alias: string, displayName: string): void {
+  if (!/^[a-z][a-z0-9-]{1,62}$/.test(alias)) {
+    throw new ConnectError("alias must use 2-63 lowercase letters, digits, or hyphens", Code.InvalidArgument);
+  }
+  if (!displayName.trim()) throw new ConnectError("display_name is required", Code.InvalidArgument);
+}
+
+
+/**
+ * The provider a request names, or a clear rejection.
+ *
+ * These RPCs used to hard-code `"gcp"`. A provider key that is not registered
+ * is an unknown provider, not a malformed request, so it reads as NotFound on
+ * a lookup and InvalidArgument on a create.
+ */
+function requireProviderIn(
+  providers: ReadonlyMap<string, ConnectionProvider>,
+  key: string,
+): ConnectionProvider {
+  const provider = providers.get(key);
+  if (!provider) {
+    throw new ConnectError(
+      `unknown connection provider "${key}"`,
+      Code.InvalidArgument,
+    );
+  }
+  return provider;
+}
+
+/** Load a connection row along with its provider, or NotFound. */
+async function requireConnectionIn(
+  providers: ReadonlyMap<string, ConnectionProvider>,
+  connections: IntegrationConnectionStore,
+  id: string,
+): Promise<{ row: IntegrationConnectionRow; provider: ConnectionProvider }> {
+  const row = await connections.get(id);
+  const provider = row ? providers.get(row.provider) : undefined;
+  if (!row || !provider) throw new ConnectError("connection not found", Code.NotFound);
+  return { row, provider };
+}
+
 export function registerIntegration(router: ConnectRouter, deps?: IntegrationDeps): void {
   const getSession: GetSession =
     deps?.getSession ??
@@ -145,6 +288,18 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
   const connectorLogos: ConnectorLogoStore = deps?.connectorLogos ?? makeConnectorLogoStore(getDb());
   const orgSecret: OrgSecretAccess = deps?.orgSecret ?? (defaultOrgSecret as unknown as OrgSecretAccess);
   const mint: MintAccess = deps?.mint ?? (defaultMint as unknown as MintAccess);
+  const connections = deps?.connections ?? makeIntegrationConnectionStore(getDb());
+  const profiles = deps?.profiles ?? makeProfileStore(getDb());
+  const now = deps?.now ?? (() => new Date());
+  const issuer = deps?.issuer ?? googleOidcIssuer();
+  const deploymentId = deps?.deploymentId ?? config.deploymentId;
+  // Tests inject a stub exchange; production takes the shared registry.
+  const providers = deps?.providers ??
+    (deps?.googleExchange
+      ? makeConnectionProviders([makeGoogleProvider({ exchange: deps.googleExchange })])
+      : connectionProviders());
+  const requireProvider = (key: string) => requireProviderIn(providers, key);
+  const requireConnection = (id: string) => requireConnectionIn(providers, connections, id);
 
   router.service(IntegrationService, {
     async listConnectors(_req, ctx) {
@@ -207,6 +362,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
         );
       }
       const row = await connectors.upsert(parsed.provider, raw);
+      await connections.ensureDefault(parsed.provider, `${parsed.display.name} (default)`);
       // The next loadRegistry() must see the new connector.
       invalidateRegistry();
       return {
@@ -244,23 +400,46 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       await requireUser(ctx, getSession);
       const registry = await loadRegistry(connectors);
       const withLogo = new Set(await connectorLogos.listProviders());
-      const providers = buildProviderCatalog(registry).map((e) => ({
-        provider: e.provider,
-        display: {
-          name: e.display.name,
-          category: e.display.category,
-          blurb: e.display.blurb,
-          icon: {
-            mono: e.display.icon.mono,
-            color: e.display.icon.color,
-            logo: withLogo.has(e.provider) ? logoUrl(e.provider) : "",
+      const entries = await Promise.all(buildProviderCatalog(registry, providers).map(async (e) => {
+        // A NAMED provider has no singleton credential slot — an administrator
+        // creates its connections, and `ListConnections` returns them. Only a
+        // singleton provider must have a default.
+        const defaultConnection = e.connectionModel === "named"
+          ? null
+          : await connections.getDefault(e.provider);
+        if (!defaultConnection && e.connectionModel !== "named") {
+          throw new ConnectError(
+            `default integration connection for "${e.provider}" is unavailable`,
+            Code.Internal,
+          );
+        }
+        return {
+          provider: e.provider,
+          display: {
+            name: e.display.name,
+            category: e.display.category,
+            blurb: e.display.blurb,
+            icon: {
+              mono: e.display.icon.mono,
+              color: e.display.icon.color,
+              logo: withLogo.has(e.provider) ? logoUrl(e.provider) : "",
+            },
           },
-        },
-        credentialSource: e.credentialSource,
-        hosts: e.hosts,
-        capabilities: e.capabilities.map((c) => ({ action: c.action, access: c.access, asset: c.asset ?? "" })),
+          credentialSource: e.credentialSource,
+          hosts: e.hosts,
+          capabilities: e.capabilities.map((c) => ({
+            action: c.action,
+            access: c.access,
+            asset: c.asset ?? "",
+            label: c.label ?? "",
+            host: c.host ?? "",
+            endpointRule: c.endpointRule ?? "",
+          })),
+          defaultConnectionId: defaultConnection?.id ?? "",
+          connectionModel: e.connectionModel,
+        };
       }));
-      return { providers };
+      return { providers: entries };
     },
 
     // Admin-only: seal a mint kind's fields as org secrets `<kind>.<field>` so
@@ -362,6 +541,111 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
             };
       const { ok, message } = await mint.runConnectorTest(spec);
       return { ok, message };
+    },
+
+    async listConnections(_req, ctx) {
+      await requireAdmin(ctx, getSession);
+      return { connections: (await connections.list()).map(connectionToProto) };
+    },
+
+    async createConnection(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const provider = requireProvider(req.provider);
+      provider.assertDeploymentReady?.({ issuer, deploymentId });
+      assertConnectionNames(req.alias, req.displayName);
+      const config = configFromProto(provider, req);
+      const row = await connections.create({
+        alias: req.alias,
+        provider: provider.key,
+        displayName: req.displayName.trim(),
+        config,
+      });
+      return { connection: connectionToProto(row) };
+    },
+
+    async updateConnection(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      assertConnectionNames(req.alias, req.displayName);
+      const { provider } = await requireConnection(req.id);
+      provider.assertDeploymentReady?.({ issuer, deploymentId });
+      const config = configFromProto(provider, req);
+      const row = await connections.update(req.id, {
+        alias: req.alias,
+        displayName: req.displayName.trim(),
+        config,
+      });
+      return { connection: connectionToProto(row!) };
+    },
+
+    async deleteConnection(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const connection = await connections.get(req.id);
+      if (connection?.isDefault) {
+        throw new ConnectError(
+          "a provider's default connection cannot be deleted",
+          Code.FailedPrecondition,
+        );
+      }
+      const referenced = (await profiles.list({ includeArchived: true })).some(
+        (profile) => profile.integrationGrants.some((grant) => grant.connectionId === req.id),
+      );
+      if (referenced) {
+        throw new ConnectError("connection is still granted to a profile", Code.FailedPrecondition);
+      }
+      return { deleted: await connections.delete(req.id) };
+    },
+
+    async testConnection(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const { row, provider } = await requireConnection(req.id);
+      provider.assertDeploymentReady?.({ issuer, deploymentId });
+      try {
+        // A real mint, discarded. Anything short of one leaves the operator to
+        // discover a broken trust policy when a session boots.
+        await provider.mint(row, {
+          sessionId: `connection-test:${row.id}`,
+          organizationId: deploymentId,
+          connectionId: row.id,
+          userId: "administrator",
+          profileSnapshotId: "connection-test",
+        });
+        await connections.markTested(row.id, now());
+        return { ok: true, message: "credential exchange and impersonation succeeded" };
+      } catch (error) {
+        return { ok: false, message: errorMessage(error) };
+      }
+    },
+
+    async setConnectionEnabled(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const current = await connections.get(req.id);
+      if (!current) throw new ConnectError("connection not found", Code.NotFound);
+      if (req.enabled) {
+        providers.get(current.provider)?.assertDeploymentReady?.({ issuer, deploymentId });
+      }
+      if (req.enabled && current.testedAt == null) {
+        throw new ConnectError(
+          "the connection must pass STS and impersonation tests before it can be enabled",
+          Code.FailedPrecondition,
+        );
+      }
+      const row = await connections.setEnabled(req.id, req.enabled);
+      return { connection: connectionToProto(row!) };
+    },
+
+    async getGoogleCloudSetup(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const { row, provider } = await requireConnection(req.id);
+      provider.assertDeploymentReady?.({ issuer, deploymentId });
+      const setup = provider.setupDoc(row, { issuer, deploymentId });
+      return {
+        issuer,
+        audience: setup.audience,
+        subjectAttribute: "google.subject=assertion.sub",
+        connectionAttribute: "attribute.engrams_connection=assertion.engrams_connection",
+        gcloudScript: setup.gcloudScript,
+        terraform: setup.terraform,
+      };
     },
   });
 }

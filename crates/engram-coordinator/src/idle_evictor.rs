@@ -286,6 +286,23 @@ async fn quarantine_reap_unevictable(
                 reason: "quarantined survivor owned by in-flight placement/relocation",
             })
         }
+        // 2026-08-02 durability-rollback RCA: `Parked` LEFT this destroy
+        // arm. A quarantined parked survivor's paused VM holds real user
+        // work newer than the last durable checkpoint — the 2026-07-21
+        // 61a03b7e incident destroyed exactly such a VM and rewound 93
+        // events. The disk is unserved but RECOVERABLE (the host's
+        // rehydrate retry pass), so the honest move is the same as the
+        // Active-flavor exhaustion: fail the attempt and let the op park
+        // on the slow retry lane. Once the disk is re-served the parked
+        // VM captures/descends normally; if it never recovers, the
+        // quarantine-stuck alert routes a HUMAN decision, not an
+        // automatic loss.
+        SessionState::Parked => Err(EvictError::Meta(
+            "quarantined PARKED survivor: capture impossible while the disk is \
+             unserved; preserving the paused VM (acked writes intact) — the op's \
+             slow retry lane re-attempts after the host's rehydrate retry"
+                .to_string(),
+        )),
         // The livelock class. `Created` is the ADR 0077 harness-failed
         // park (prod 8174b7aa: a resume's start_agent failed against the
         // crippled VM, parked at Created, and no evict could ever run);
@@ -294,15 +311,7 @@ async fn quarantine_reap_unevictable(
         // and settle HostLost — the one lane the dead-host straggler
         // sweep re-drives to Idle/recoverable; the next prompt resumes
         // from the last checkpoint (ADR 0090's designed blast radius).
-        //
-        // ADR 0101 C: `Parked` joins this arm — a quarantined survivor's
-        // disk is unserved, so the paused VM can neither wake usefully
-        // nor descend (capture needs the data plane). Unlike
-        // Created/Unreachable the session DID run user work; destroying
-        // it loses the un-captured tail, exactly a host-death loss —
-        // HostLost is the honest settle (recovery from the last
-        // published checkpoint, surfaced as CheckpointLag on resume).
-        SessionState::Created | SessionState::Unreachable | SessionState::Parked => {
+        SessionState::Created | SessionState::Unreachable => {
             if let Err(e) = state.services.host.destroy(sandbox_id, ctx.fence()).await {
                 // Leave the binding + state alone: the op's retry budget
                 // (and, on exhaustion, the verb's destroy-then-HostLost
@@ -312,42 +321,10 @@ async fn quarantine_reap_unevictable(
                     "quarantine reap: destroy of unevictable survivor failed: {e}"
                 )));
             }
-            // A destroyed PARKED survivor is real, user-visible data loss
-            // (the paused VM held user work newer than the last durable
-            // checkpoint) — the same fact the budget-exhaustion arm
-            // records (PR #829), and it must be exactly as loud here:
-            // counter + durable `durability_rollback` row, emitted the
-            // moment the destroy lands, independent of the status flip
-            // (2026-07-21 61a03b7e: this arm destroyed a healthy parked
-            // VM — 93 events rewound — with a single WARN as the only
-            // trace). Created/Unreachable stay quiet: the harness never
+            // Created/Unreachable stay quiet: the harness never
             // (re)started, so no user-visible work is being rolled back.
-            if session.status == SessionState::Parked {
-                ::metrics::counter!(crate::metrics::DURABILITY_ROLLBACK_TOTAL).increment(1);
-                tracing::error!(
-                    session_id = %session_id,
-                    %sandbox_id,
-                    rewind_disk_manifest = ?session.live_disk_manifest,
-                    "quarantined PARKED survivor destroyed — un-checkpointed user \
-                     work in the paused VM is LOST; the next resume rewinds to the \
-                     last durable checkpoint (CheckpointLag)",
-                );
-                let _ = state
-                    .emit_fenced(
-                        session_id,
-                        ctx.fence(),
-                        SessionEvent::DurabilityRollback {
-                            sandbox_id,
-                            rewind_disk_manifest: session.live_disk_manifest,
-                            reason: "quarantined parked survivor was unevictable \
-                                     (disk unserved); VM destroyed — resume rewinds \
-                                     to the last durable checkpoint"
-                                .to_string(),
-                            at: state.services.clock.now_utc(),
-                        },
-                    )
-                    .await;
-            }
+            // (The Parked arm — real user work — no longer destroys at
+            // all; see its arm above. 2026-08-02 RCA.)
             match crate::session_ops::transition_with_fence(
                 state,
                 session_id,
@@ -508,6 +485,34 @@ pub(crate) async fn run_evict_pipeline(
         .get("quarantine")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // 2026-08-02 durability-rollback RCA: a quarantine op is pinned to the
+    // ADVERTISED sandbox (`host_http` stamps it into the payload). The op
+    // can now outlive a relocation — the stuck park keeps it queued on a
+    // slow cadence — and a stale wake-up against the session's NEW,
+    // healthy sandbox must no-op, not evict it.
+    if quarantine {
+        let pinned = ctx
+            .op
+            .payload
+            .get("sandbox_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<uuid::Uuid>().ok())
+            .map(SandboxId::from);
+        if let Some(pinned) = pinned {
+            if session.sandbox_id != Some(pinned) {
+                tracing::info!(
+                    session_id = %session_id,
+                    pinned_sandbox = %pinned,
+                    current_sandbox = ?session.sandbox_id,
+                    "quarantine evict op no-ops: the session no longer binds the \
+                     advertised sandbox (relocated or destroyed)",
+                );
+                return Ok(EvictOutcome::Skipped {
+                    reason: "quarantined sandbox no longer bound to the session",
+                });
+            }
+        }
+    }
     if !entry_legal {
         // ADR 0090 (2026-07-21 livelock incident): a quarantine op must
         // never settle as a plain skip while the session still binds the
@@ -667,9 +672,13 @@ pub(crate) async fn run_evict_pipeline(
     if target_state == SessionState::Idle {
         // ADR 0074 rung 2 (parked-paused): if the host has memory
         // headroom, PAUSE the VM in place instead of snapshot+destroy.
-        // Frees CPU (not RAM), keeps the harness alive in RAM, and lets
-        // a returning user un-pause in <100ms rather than pay a full
-        // 12.2s-p50 rebuild. Under real memory pressure this branch is
+        // Frees CPU (not RAM) and lets a returning user un-pause in
+        // <100ms rather than pay a full 12.2s-p50 rebuild. The harness
+        // PROCESS stays in RAM, but the vsock link does NOT survive a
+        // long pause, and the hub can still advertise a stale handle
+        // at un-park — a forward then lands in a socket with no reader
+        // (prod 7eddce62). The ADR 0108 A8 attach-signal row recall +
+        // heartbeat disagreement repair bound that damage. Under real memory pressure this branch is
         // skipped and the full eviction below runs (rung 4). Only the
         // idle-evict path parks; drain/evac (Evacuating) always captures.
         // `allow_park == false` is the reaper's DESCENT path (already
@@ -2455,8 +2464,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -2686,8 +2698,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -2910,8 +2925,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -3237,8 +3255,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -4354,8 +4375,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -4623,8 +4647,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 

@@ -20,6 +20,11 @@ import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 import githubEventsRoute from "./routes/github-events.ts";
 import hooksRoute from "./routes/hooks.ts";
 import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
+import { makeGoogleOidcRoute } from "./routes/google-oidc.ts";
+import { makeConnectionCredentialBrokerRoute } from "./routes/connection-credential-broker.ts";
+import { makeOidcKeyAdminRoute } from "./routes/oidc-key-admin.ts";
+import { startOidcKeyRotation } from "./integrations/oidc-key-rotation.ts";
+import { makeIntegrationOidcKeyStore } from "./db/integration-oidc-keys.ts";
 // Importing registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
@@ -69,6 +74,9 @@ import { makeReviewStore } from "./db/reviews.ts";
 import { makeReviewTargetHydrationStore } from "./db/review-target-hydration.ts";
 import { makeEnrollmentStore } from "./db/enrollments.ts";
 import { makeProfileStore } from "./db/profiles.ts";
+import { makeIntegrationConnectionStore } from "./db/integration-connections.ts";
+import { makeConnectorStore } from "./db/connectors.ts";
+import { loadRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
 import { renderReviewer } from "./reviewers/render.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
@@ -110,6 +118,15 @@ app.route("/", authRoute);
 // Public auth posture for the SPA login page (which doors are open). Sits
 // alongside the better-auth mount; unauthenticated by design (pre-login).
 app.route("/", authConfigRoute);
+// ADR 0109: public OIDC metadata for customer WIF providers. No session or
+// credential data is returned from these endpoints.
+app.route("/", makeGoogleOidcRoute());
+// Host-only broker endpoint. The broker's own bearer authenticates callers
+// (CONNECTION_BROKER_BEARER; the coordinator sends
+// ENGRAM_CONNECTION_BROKER_BEARER).
+app.route("/", makeConnectionCredentialBrokerRoute());
+// Explicit admin trigger for OIDC signing-key rotation (ADR 0109).
+app.route("/", makeOidcKeyAdminRoute());
 // ADR 0051 Task 20: browser-native HTTP legs (SSE events, artifact bytes, /me/harness-env).
 app.route("/", eventsRoute);
 app.route("/", artifactsRoute);
@@ -247,7 +264,15 @@ setReviewIngressControlPlane(reviewControlPlane);
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
 registerReviewTools(tools, { reviews: makeReviewStore(getDb()) });
-void seedReviewerProfile(makeProfileStore(getDb()), log).catch((err) =>
+const integrationConnections = makeIntegrationConnectionStore(getDb());
+const configuredConnectors = await loadRegistry(makeConnectorStore(getDb()));
+await Promise.all([
+  ...[...configuredConnectors.values()].map((connector) =>
+    integrationConnections.ensureDefault(connector.provider, `${connector.display.name} (default)`),
+  ),
+  integrationConnections.ensureDefault("engram", "Engrams tools"),
+]);
+void seedReviewerProfile(makeProfileStore(getDb()), integrationConnections, log).catch((err) =>
   log.error({ err }, "reviewer profile seed failed"),
 );
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
@@ -285,6 +310,11 @@ const listenerManager = makeProductionListenerManager();
 await listenerManager.start();
 const automationScheduler = makeProductionAutomationScheduler();
 await automationScheduler.start();
+// ADR 0109: scheduled OIDC signing-key rotation. The first step also creates
+// the active key, so the public JWKS GET stays read-only.
+const oidcKeyRotation = startOidcKeyRotation({
+  keys: makeIntegrationOidcKeyStore(getDb()),
+});
 
 server.listen(config.port, "0.0.0.0", () => {
   log.info({ port: config.port }, "orchestrator listening");
@@ -296,6 +326,7 @@ process.on("SIGTERM", () => {
   server.close(async (err) => {
     // Quiesce DBOS (stops queue/recovery loops, closes the system-DB pool)
     // after the HTTP server stops accepting connections.
+    oidcKeyRotation.stop();
     await automationScheduler.stop();
     await listenerManager.stop();
     await targetHydrator.stop();

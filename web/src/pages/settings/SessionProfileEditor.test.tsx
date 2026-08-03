@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { SessionProfileEditor } from "./SessionProfileEditor";
 
 const profileHolder = vi.hoisted(() => ({ value: undefined as undefined | { profile: unknown } }));
@@ -46,11 +47,72 @@ vi.mock("../../hooks/useSkills", () => ({
   }),
   useUploadSkill: () => ({ mutateAsync: uploadSkill, isPending: false }),
 }));
-vi.mock("../../hooks/useOrgSecrets", () => ({ useOrgSecretNames: () => ({ data: [] }) }));
-// The editor derives its policy rail + connected-connector cards from the joined
-// catalog; mock it so the test needs no QueryClient/transport.
-vi.mock("../../components/integrations/useConnectorViews", () => ({
-  useConnectorViews: () => ({ views: [], isLoading: false, error: null }),
+const orgSecretNamesHolder = vi.hoisted(() => ({ value: [] as string[] }));
+vi.mock("../../hooks/useOrgSecrets", () => ({
+  useOrgSecretNames: () => ({ data: orgSecretNamesHolder.value }),
+}));
+const connectionsHolder = vi.hoisted(() => ({ value: [] as unknown[] }));
+vi.mock("../../hooks/useIntegrations", () => ({
+  useIntegrationConnections: () => ({ data: { connections: connectionsHolder.value } }),
+}));
+// The editor derives its policy rail, its connected-connector cards AND — since
+// the provider seam — the named-connection blocks from the joined catalog. Mock
+// only the hook, keeping the real helpers, and serve the Google entry the
+// catalog now returns instead of the entry the web used to synthesize.
+const GOOGLE_CATALOG_VIEW = {
+  provider: "gcp",
+  defaultConnectionId: "",
+  name: "Google Cloud",
+  category: "cloud",
+  blurb: "Call Google Cloud APIs with a short-lived, policy-bound credential.",
+  icon: { mono: "GC", color: "#4285f4" },
+  credentialSource: "mint" as const,
+  hosts: ["compute.googleapis.com", "logging.googleapis.com"],
+  capabilities: [
+    {
+      action: "compute.instances.get",
+      access: "read" as const,
+      label: "Describe Compute Engine instances",
+      host: "compute.googleapis.com",
+    },
+    {
+      action: "compute.instances.start",
+      access: "write" as const,
+      label: "Start Compute Engine instances",
+      host: "compute.googleapis.com",
+    },
+    {
+      action: "logging.entries.list",
+      access: "read" as const,
+      label: "Read Cloud Logging entries",
+      host: "logging.googleapis.com",
+    },
+    {
+      action: "api.call",
+      access: "write" as const,
+      label: "Call configured Google APIs",
+      endpointRule: "google-api" as const,
+    },
+    {
+      action: "gke.api.call",
+      access: "write" as const,
+      label: "Call the configured GKE API server",
+      endpointRule: "non-google-api" as const,
+    },
+  ],
+  status: "connected" as const,
+  builtin: true,
+  usedBy: 0,
+  usedByProfiles: [],
+  connectionModel: "named" as const,
+};
+vi.mock("../../components/integrations/useConnectorViews", async (orig) => ({
+  ...(await orig<object>()),
+  useConnectorViews: () => ({
+    views: [GOOGLE_CATALOG_VIEW],
+    isLoading: false,
+    error: null,
+  }),
 }));
 vi.mock("@tanstack/react-router", async (orig) => ({
   ...(await orig()),
@@ -67,6 +129,7 @@ vi.mock("@tanstack/react-router", async (orig) => ({
 beforeEach(() => {
   profileHolder.value = undefined;
   paramsHolder.value = {};
+  connectionsHolder.value = [];
   create.mockClear();
   update.mockClear();
   uploadSkill.mockClear();
@@ -96,6 +159,33 @@ describe("SessionProfileEditor (create)", () => {
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
     await waitFor(() => expect(create).toHaveBeenCalled());
     expect(create.mock.calls[0][0]).toMatchObject({ harness: "claude" });
+  });
+
+  // Regression: the collection editors have no registered input behind them, so
+  // they must ride useController. With a bare watch/setValue pair, react-hook-form
+  // kept ADDING a row (the array's length changed) but silently dropped an
+  // in-place edit — picking an org secret left `ref` empty, all the way to the
+  // wire. This drives the real path: add a row, pick a ref, save.
+  it("carries an org secret picked in a secret row through to the payload", async () => {
+    orgSecretNamesHolder.value = ["OPENROUTER_API_KEY", "DATADOG_API_KEY"];
+    const user = userEvent.setup();
+    render(<SessionProfileEditor mode="create" />);
+    fireEvent.change(screen.getByLabelText(/profile name/i), { target: { value: "Gateway" } });
+
+    await user.click(screen.getByRole("button", { name: /advanced/i }));
+    await user.click(screen.getByRole("button", { name: /add secret/i }));
+
+    await user.click(screen.getByRole("combobox", { name: "" }));
+    await user.click(await screen.findByText("OPENROUTER_API_KEY"));
+    fireEvent.change(screen.getByLabelText(/env var name/i), {
+      target: { value: "ANTHROPIC_AUTH_TOKEN" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0].secrets).toMatchObject([
+      { ref: "OPENROUTER_API_KEY", envVar: "ANTHROPIC_AUTH_TOKEN", mode: "broker" },
+    ]);
   });
 
   it("includes the deny-default network + extra allowed hosts in the payload (ADR 0057)", async () => {
@@ -194,6 +284,156 @@ describe("SessionProfileEditor (create)", () => {
     await waitFor(() => expect(uploadSkill).toHaveBeenCalled());
     expect(uploadSkill.mock.calls[0][0]).toMatchObject({ name: "my-skill" });
   });
+
+  it("opens the skill file chooser from the primary upload action", () => {
+    render(<SessionProfileEditor mode="create" />);
+    openAdvanced();
+    const fileInput = screen.getByTestId("skill-upload-file") as HTMLInputElement;
+    const openFileChooser = vi.spyOn(fileInput, "click");
+
+    expect(screen.getByText(/archive with skill\.md at its root/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /choose skill file/i }));
+
+    expect(openFileChooser).toHaveBeenCalledOnce();
+    expect(uploadSkill).not.toHaveBeenCalled();
+  });
+});
+
+// ADR 0109: the Google Cloud block grants per-connection operations.
+describe("SessionProfileEditor (Google Cloud connections)", () => {
+  const googleConnection = (overrides: Record<string, unknown> = {}) => ({
+    id: "gcp-1",
+    alias: "prod-observer",
+    provider: "gcp",
+    displayName: "Prod observer",
+    enabled: true,
+    testedAt: "2026-08-01T00:00:00Z",
+    createdAt: "",
+    updatedAt: "",
+    googleCloud: {
+      workloadIdentityProvider:
+        "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/engrams-prod",
+      serviceAccountEmail: "observer@customer.iam.gserviceaccount.com",
+      endpoints: ["logging.googleapis.com"],
+    },
+    ...overrides,
+  });
+
+  /** The PowerSelector row that carries an operation's curated label. */
+  const operationRow = (label: string) => {
+    const row = screen.getByText(label).closest("div");
+    if (!row) throw new Error(`no row for ${label}`);
+    return within(row);
+  };
+
+  it("offers only the operations the connection's endpoints enable (web-M4)", () => {
+    connectionsHolder.value = [googleConnection()];
+    render(<SessionProfileEditor mode="create" />);
+    expect(screen.getByText("Prod observer")).toBeTruthy();
+    // logging.googleapis.com enables the Logging read + the generic Google
+    // API call; it does not enable Compute or a GKE control-plane call.
+    expect(screen.getByText("Read Cloud Logging entries")).toBeTruthy();
+    expect(screen.getByText("Call configured Google APIs")).toBeTruthy();
+    expect(screen.queryByText("Describe Compute Engine instances")).toBeNull();
+    expect(screen.queryByText("Call the configured GKE API server")).toBeNull();
+  });
+
+  it("carries a toggled grant into the create payload", async () => {
+    connectionsHolder.value = [googleConnection()];
+    render(<SessionProfileEditor mode="create" />);
+    fireEvent.change(screen.getByLabelText(/profile name/i), {
+      target: { value: "Observer" },
+    });
+    fireEvent.click(
+      operationRow("Read Cloud Logging entries").getByRole("button", { name: /grant read/i }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0].integrationGrants).toEqual([
+      { connectionId: "gcp-1", operation: "logging.entries.list", resourceConstraints: [] },
+    ]);
+  });
+
+  // web-H1: a disabled connection must stay visible with working toggles.
+  // Editing endpoints auto-disables the connection, and a hidden grant
+  // blocked every unrelated save of the profile with no way to remove it.
+  it("renders a disabled connection with a badge and lets the grant be removed", async () => {
+    connectionsHolder.value = [googleConnection({ enabled: false })];
+    paramsHolder.value = { id: "p1" };
+    profileHolder.value = {
+      profile: {
+        id: "p1",
+        name: "Backend Agent",
+        description: "",
+        icon: "Bot",
+        imageId: "i1",
+        harness: "claude",
+        model: "opus",
+        effort: "high",
+        isDefault: false,
+        includeUserTokens: false,
+        envVars: {},
+        integrationGrants: [
+          { connectionId: "gcp-1", operation: "logging.entries.list", resourceConstraints: [] },
+        ],
+        skills: [],
+        network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
+        secrets: [],
+        portExposures: [],
+      },
+    };
+    render(<SessionProfileEditor mode="edit" />);
+    await screen.findByDisplayValue("Backend Agent");
+    expect(screen.getByText("Disabled")).toBeTruthy();
+    const pill = operationRow("Read Cloud Logging entries").getByRole("button", {
+      name: /granted read/i,
+    });
+    expect(pill.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(pill);
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(update).toHaveBeenCalledOnce());
+    expect(update.mock.calls[0][0].integrationGrants).toEqual([]);
+  });
+
+  // web-M4 companion: a grant whose endpoint was removed from the connection
+  // must stay visible (flagged) so it can be revoked.
+  it("keeps an orphaned grant visible and removable after an endpoint edit", async () => {
+    connectionsHolder.value = [googleConnection()];
+    paramsHolder.value = { id: "p1" };
+    profileHolder.value = {
+      profile: {
+        id: "p1",
+        name: "Backend Agent",
+        description: "",
+        icon: "Bot",
+        imageId: "i1",
+        harness: "claude",
+        model: "opus",
+        effort: "high",
+        isDefault: false,
+        includeUserTokens: false,
+        envVars: {},
+        integrationGrants: [
+          { connectionId: "gcp-1", operation: "compute.instances.get", resourceConstraints: [] },
+        ],
+        skills: [],
+        network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
+        secrets: [],
+        portExposures: [],
+      },
+    };
+    render(<SessionProfileEditor mode="edit" />);
+    await screen.findByDisplayValue("Backend Agent");
+    expect(screen.getByText(/not in this connection's allowed APIs/i)).toBeTruthy();
+    const pill = operationRow("Describe Compute Engine instances").getByRole("button", {
+      name: /granted read/i,
+    });
+    expect(pill.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(pill);
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(update).toHaveBeenCalledOnce());
+    expect(update.mock.calls[0][0].integrationGrants).toEqual([]);
+  });
 });
 
 describe("SessionProfileEditor (edit)", () => {
@@ -213,7 +453,13 @@ describe("SessionProfileEditor (edit)", () => {
         designation: "pr_reviewer",
         includeUserTokens: true,
         envVars: { ANTHROPIC_MODEL: "claude-x" },
-        capabilities: ["github:issues:read"],
+        integrationGrants: [
+          {
+            connectionId: "connection-github",
+            operation: "issues:read",
+            resourceConstraints: [],
+          },
+        ],
         skills: ["browser"],
         network: {
           default: "allow",
@@ -281,7 +527,13 @@ describe("SessionProfileEditor (edit)", () => {
       isDefault: true,
       includeUserTokens: true,
       envVars: { ANTHROPIC_MODEL: "claude-x" },
-      capabilities: ["github:issues:read"],
+      integrationGrants: [
+        {
+          connectionId: "connection-github",
+          operation: "issues:read",
+          resourceConstraints: [],
+        },
+      ],
       skills: ["browser"],
       network: {
         default: "allow",
@@ -320,7 +572,7 @@ describe("SessionProfileEditor (edit)", () => {
         designation: "pr_reviewer",
         includeUserTokens: false,
         envVars: {},
-        capabilities: [],
+        integrationGrants: [],
         skills: [],
         network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
         secrets: [],
@@ -352,7 +604,7 @@ describe("SessionProfileEditor (edit)", () => {
         isDefault: false,
         includeUserTokens: false,
         envVars: {},
-        capabilities: [],
+        integrationGrants: [],
         skills: [],
         network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
         secrets: [],

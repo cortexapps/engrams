@@ -48,6 +48,13 @@ import {
 } from "../db/schema.ts";
 import { eq, sql, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
+import { capabilityGrant } from "../integrations/grants.ts";
+
+function defaultGrant(capability: string) {
+  const provider = capability.slice(0, capability.indexOf(":"));
+  return capabilityGrant(capability, `default-${provider}`);
+}
+import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 
 // ---------------------------------------------------------------------------
 // DB gate (same pattern as db.test.ts)
@@ -132,9 +139,13 @@ function makeFakeSessions(opts: {
       if (opts.createShouldThrow) throw new Error("upstream create failed");
       const next = created.shift();
       if (!next) throw new Error("No more fake sessions in queue");
-      byId.set(next.id, next);
+      const sessionId = req.requestedSessionId ?? next.id;
+      // The coordinator honors the caller-reserved ID. Keep the queued object
+      // itself in the live map so tests can model later session mutations.
+      next.id = sessionId;
+      byId.set(sessionId, next);
       return {
-        sessionId: next.id,
+        sessionId,
         status: next.status,
         imageVersion: req.imageUri,
         kind: "user",
@@ -241,7 +252,7 @@ function makeFakeProfiles(opts?: {
     includeUserTokens: opts?.includeUserTokens ?? false,
     envVars: opts?.envVars ?? {},
     skills: opts?.skills ?? [],
-    capabilities: opts?.capabilities ?? [],
+    integrationGrants: (opts?.capabilities ?? []).map(defaultGrant),
     network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
     secrets: [],
     isDefault: false,
@@ -540,6 +551,33 @@ interface TestServer {
   close: () => Promise<void>;
 }
 
+const fakeConnections: IntegrationConnectionStore = {
+  list: async () => [],
+  get: async (id) => ({
+    id,
+    alias: id,
+    provider: id.startsWith("default-") ? id.slice(8) : "gcp",
+    displayName: id,
+    isDefault: id.startsWith("default-"),
+    config: {},
+    enabled: true,
+    testedAt: new Date(0),
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  }),
+  getMany: async (ids) => {
+    const rows = await Promise.all(ids.map((id) => fakeConnections.get(id)));
+    return rows.filter((row) => row != null);
+  },
+  getDefault: async (provider) => fakeConnections.get(`default-${provider}`),
+  create: async () => { throw new Error("unused"); },
+  update: async () => { throw new Error("unused"); },
+  delete: async () => { throw new Error("unused"); },
+  markTested: async () => { throw new Error("unused"); },
+  setEnabled: async () => { throw new Error("unused"); },
+  ensureDefault: async (provider) => (await fakeConnections.get(`default-${provider}`))!,
+};
+
 async function spawnServer(deps: TaskDeps): Promise<TestServer> {
   const app = new Hono();
   app.notFound((c) => c.json({ error: "not found" }, 404));
@@ -555,6 +593,7 @@ async function spawnServer(deps: TaskDeps): Promise<TestServer> {
     // harness's declared user_env, so default to a permissive token store; a
     // test overrides `secrets` to exercise the block or a specific token.
     secrets: makeSeededTokens(),
+    connections: fakeConnections,
     ...deps,
   };
   const srv = buildServer(app, (router) => {
@@ -693,6 +732,10 @@ function listSessionRef(
     role: "primary",
     profileId: null,
     capabilities: null,
+    integrationGrants: null,
+    integrationConnections: null,
+    integrationPrincipalId: null,
+    integrationSnapshotHash: null,
     createdAt: new Date("2026-01-01T00:00:00.000Z"),
   };
 }
@@ -1143,7 +1186,8 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
   let client: ReturnType<typeof makeClient>;
   let fakeSessions: ReturnType<typeof makeFakeSessions>;
   let createdTaskId: string;
-  const sessionId = `crud-sess-${Date.now()}`;
+  let sessionId = "";
+  const queuedSessionId = `crud-queued-${Date.now()}`;
   const db = dbReachable ? getDb() : null;
 
   beforeAll(async () => {
@@ -1164,7 +1208,7 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     fakeSessions = makeFakeSessions({
       created: [
         {
-          id: sessionId,
+          id: queuedSessionId,
           status: "active",
           image: "registry/img:latest",
           mode: "agent",
@@ -1209,17 +1253,18 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     });
 
     expect(resp.task).toBeDefined();
+    expect(resp.task!.sessions).toHaveLength(1);
+    createdTaskId = resp.task!.id;
+    sessionId = resp.task!.sessions[0]!.sessionId;
     expect(resp.task!.type).toBe("chat");
     expect(resp.task!.title).toBe("CRUD test task");
     // Status derived from session "active" → "working".
     expect(resp.task!.status).toBe("working");
-    expect(resp.task!.sessions).toHaveLength(1);
-    expect(resp.task!.sessions[0]!.sessionId).toBe(sessionId);
+    expect(fakeSessions.createReqs[0]!.requestedSessionId).toBeDefined();
+    expect(sessionId).toBe(fakeSessions.createReqs[0]!.requestedSessionId!);
     expect(resp.task!.sessions[0]!.role).toBe("primary");
     // Session should be denormalized.
     expect(resp.task!.sessions[0]!.session).toBeDefined();
-
-    createdTaskId = resp.task!.id;
   });
 
   test.skipIf(!dbReachable)("ListTasks → shows own task with live session state", async () => {
@@ -1301,12 +1346,11 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
 
 describe("TaskService — rename (UpdateTask)", () => {
   const RENAME_PROFILE = "rename-profile";
-  const sessionId = `rename-sess-${Date.now()}`;
   const db = dbReachable ? getDb() : null;
   // The live session object the fake returns — mutate `.suggestedTitle` to
   // simulate a harness AI-title landing.
   const liveSession: FakeSession = {
-    id: sessionId,
+    id: `rename-queued-${Date.now()}`,
     status: "active",
     image: "registry/img:latest",
     mode: "agent",
@@ -1354,7 +1398,10 @@ describe("TaskService — rename (UpdateTask)", () => {
     if (!dbReachable) return;
     if (taskId) await db!.delete(taskTable).where(eq(taskTable.id, taskId)).catch(() => {});
     // See the CRUD suite's afterAll: the session_listeners row isn't cascaded.
-    await db!.delete(sessionListenerTable).where(eq(sessionListenerTable.sessionId, sessionId)).catch(() => {});
+    await db!
+      .delete(sessionListenerTable)
+      .where(eq(sessionListenerTable.sessionId, liveSession.id))
+      .catch(() => {});
     await db!.delete(profileTable).where(eq(profileTable.id, RENAME_PROFILE)).catch(() => {});
     await srvA?.close();
   });
@@ -1579,13 +1626,13 @@ describe("TaskService — member scoping: orphan sessions excluded from member L
 });
 
 // ---------------------------------------------------------------------------
-// 6. Compensation path — upstream create OK + DB insert fails
+// 6. Authorization snapshot persistence fails before upstream create
 // ---------------------------------------------------------------------------
 
 const TX_ERROR_MESSAGE = "forced DB failure for compensation test";
 
-describe("TaskService — compensation: upstream OK + DB fail → DeleteSession called", () => {
-  test("DB insert failure triggers upstream DeleteSession", async () => {
+describe("TaskService — authorization snapshot persistence", () => {
+  test("DB insert failure prevents upstream session creation", async () => {
     const fakeSessionId = `comp-sess-${Date.now()}`;
     const fakeSessions = makeFakeSessions({
       created: [
@@ -1648,8 +1695,8 @@ describe("TaskService — compensation: upstream OK + DB fail → DeleteSession 
         throw new Error(`Unexpected error type: ${String(caughtErr)}`);
       }
 
-      // Compensation: upstream session should have been deleted.
-      expect(fakeSessions.deletedIds).toContain(fakeSessionId);
+      expect(fakeSessions.createReqs).toHaveLength(0);
+      expect(fakeSessions.deletedIds).toHaveLength(0);
     } finally {
       await srv.close();
     }
@@ -1836,7 +1883,7 @@ describe("TaskService — principal-authoritative harness credentials (ADR 0053/
           header_name: "DD-API-KEY",
           header_template: "{}",
           secret_ref: "datadog-api-key",
-          mint_provider: "",
+          mint_source: null,
           methods: ["GET"],
           path_globs: ["/api/v1/slo*"],
           graphql_operation: "",
@@ -1847,7 +1894,7 @@ describe("TaskService — principal-authoritative harness credentials (ADR 0053/
           header_name: "DD-APPLICATION-KEY",
           header_template: "{}",
           secret_ref: "datadog-app-key",
-          mint_provider: "",
+          mint_source: null,
           methods: ["GET"],
           path_globs: ["/api/v1/slo*"],
           graphql_operation: "",
@@ -1880,7 +1927,12 @@ describe("TaskService — principal-authoritative harness credentials (ADR 0053/
       // GraphQL mutations (ADR 0059); each a minted inject. The issue asset is
       // observed on both the REST create and the GraphQL createIssue mutation.
       expect(policy.injects.length).toBeGreaterThan(0);
-      expect(policy.injects.every((i: { mint_provider: string }) => i.mint_provider === "github")).toBe(true);
+      expect(policy.injects.every((i: {
+        mint_source: { connection: { connection_id: string; provider: string } } | null;
+      }) =>
+        i.mint_source?.connection.connection_id === "default-github" &&
+          i.mint_source.connection.provider === "github"
+      )).toBe(true);
       expect(policy.observes.length).toBeGreaterThan(0);
       expect(
         policy.observes.every(

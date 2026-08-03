@@ -43,7 +43,11 @@ import {
   loadRegistry,
   type WebhookAliasSpec,
 } from "../connectors/registry.ts";
-import { orgSecret as defaultOrgSecret } from "../control-plane/client.ts";
+import {
+  harnessCatalog as defaultHarnessCatalog,
+  orgSecret as defaultOrgSecret,
+} from "../control-plane/client.ts";
+import type { HarnessCatalogClient } from "./task-create.ts";
 import {
   AutomationTemplateError,
   buildAutomationTemplateContext,
@@ -67,6 +71,7 @@ export interface AutomationDeps {
   store?: AutomationStore;
   profiles?: Pick<ProfileStore, "getActive">;
   connectors?: CustomConnectorSource;
+  harnessCatalog?: HarnessCatalogClient;
   orgSecret?: OrgSecretClient;
   now?: () => Date;
   randomSecret?: () => string;
@@ -216,18 +221,30 @@ function parseTrigger(value: ProtoAutomationTrigger | undefined): AutomationTrig
   }
 }
 
+/** Optional catalog selections may arrive as ""; absent means "inherit". */
+function catalogOptionId(value: string | undefined): string | undefined {
+  return value?.trim() || undefined;
+}
+
 function parseAction(value: ProtoAutomationAction | undefined): AutomationAction {
   if (value?.action.case !== "createTask") {
     throw new ConnectError("create_task automation action is required", Code.InvalidArgument);
   }
   const action = value.action.value;
   const titleTemplate = action.titleTemplate || undefined;
+  const harness = catalogOptionId(action.harness);
+  const model = catalogOptionId(action.model);
+  const effort = catalogOptionId(action.effort);
   return {
     kind: "create_task",
     profileId: requiredText(action.profileId, "action profile_id"),
     promptTemplate: action.promptTemplate,
     ...(titleTemplate !== undefined ? { titleTemplate } : {}),
     includeEventContext: action.includeEventContext,
+    ...(action.harnessMode ? { harnessMode: action.harnessMode } : {}),
+    ...(harness !== undefined ? { harness } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(effort !== undefined ? { effort } : {}),
   };
 }
 
@@ -261,6 +278,10 @@ function protoAction(action: AutomationAction): ProtoAutomationAction {
         promptTemplate: action.promptTemplate,
         ...(action.titleTemplate !== undefined ? { titleTemplate: action.titleTemplate } : {}),
         includeEventContext: action.includeEventContext,
+        ...(action.harnessMode !== undefined ? { harnessMode: action.harnessMode } : {}),
+        ...(action.harness !== undefined ? { harness: action.harness } : {}),
+        ...(action.model !== undefined ? { model: action.model } : {}),
+        ...(action.effort !== undefined ? { effort: action.effort } : {}),
       },
     },
   });
@@ -353,6 +374,8 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
   const store = deps?.store ?? makeAutomationStore(getDb());
   const profiles = deps?.profiles ?? makeProfileStore(getDb());
   const connectors = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
+  const harnessCatalog: HarnessCatalogClient =
+    deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
   const now = deps?.now ?? (() => new Date());
   const randomSecret =
     deps?.randomSecret ??
@@ -363,6 +386,57 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       deleteSecret: (req) => defaultOrgSecret.deleteSecret(req),
     };
 
+  /**
+   * ADR 0063 B2: validate the automation's harness/model/effort override against
+   * the live catalog, returning the action with the harness those option ids
+   * belong to PINNED onto it.
+   *
+   * A model/effort id is only meaningful next to one harness, so an action that
+   * names a model but inherits its harness is under-specified: an admin who
+   * later switches the profile's harness would orphan the stored id, and the
+   * launch path resolves an unknown id to nothing (compileSessionCreateInput
+   * sets no model env), silently running the new harness's default months later.
+   * A profile can't drift this way because ProfileService validates its whole
+   * triple on every save; pinning gives the action the same property instead of
+   * a second guard in ProfileService that must stay in sync forever. Clearing
+   * the harness in the editor clears model/effort with it, so "follow the
+   * profile" stays reachable — it just cannot mean "keep a foreign model id".
+   *
+   * The catalog is read only when the automation overrides something; the
+   * profile's own selection was already validated by ProfileService.
+   */
+  async function resolveOverride(
+    action: CreateTaskAutomationAction,
+    profileHarness: string,
+  ): Promise<CreateTaskAutomationAction> {
+    if (
+      action.harness === undefined
+      && action.model === undefined
+      && action.effort === undefined
+    ) {
+      return action;
+    }
+    const harness = action.harness ?? profileHarness;
+    const { harnesses } = await harnessCatalog.listHarnesses({});
+    const descriptor = harnesses.find((h) => h.name === harness)?.descriptor;
+    if (!descriptor) {
+      throw new ConnectError(`harness "${harness}" is not in the catalog`, Code.InvalidArgument);
+    }
+    if (action.model !== undefined && !(descriptor.models ?? []).some((m) => m.id === action.model)) {
+      throw new ConnectError(
+        `model "${action.model}" is not valid for harness "${harness}"`,
+        Code.InvalidArgument,
+      );
+    }
+    if (action.effort !== undefined && !(descriptor.effort ?? []).some((e) => e.id === action.effort)) {
+      throw new ConnectError(
+        `effort "${action.effort}" is not valid for harness "${harness}"`,
+        Code.InvalidArgument,
+      );
+    }
+    return { ...action, harness };
+  }
+
   async function validateInput(input: {
     name: string;
     description: string;
@@ -372,9 +446,9 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
   }): Promise<AutomationInput> {
     const name = requiredText(input.name, "name");
     const trigger = parseTrigger(input.trigger);
-    const action = parseAction(input.action);
+    const parsed = parseAction(input.action);
 
-    const profile = await profiles.getActive(action.profileId);
+    const profile = await profiles.getActive(parsed.profileId);
     if (!profile) {
       throw new ConnectError("action profile_id is not an active profile", Code.InvalidArgument);
     }
@@ -384,6 +458,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         Code.InvalidArgument,
       );
     }
+    const action = await resolveOverride(parsed, profile.harness);
 
     try {
       validateAutomationTemplate(action.promptTemplate);

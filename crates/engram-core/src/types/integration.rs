@@ -49,6 +49,54 @@ pub struct IntegrationPolicy {
     /// the proxy substitutes only on its `allow_hosts`.
     #[serde(default)]
     pub secrets: Vec<IntegrationSecret>,
+    /// Which cloud metadata service the session-local endpoint should imitate,
+    /// or `None` for a session that needs none. The host egress proxy serves
+    /// the endpoint; the guest receives no cloud credential from it, only a
+    /// placeholder the proxy substitutes on the wire.
+    ///
+    /// `#[serde(default)]` so a policy stored before this field — including one
+    /// that set the old `google_adc` boolean — decodes as `None`. That is the
+    /// safe direction: the session keeps running and simply has no metadata
+    /// endpoint until it is created again.
+    #[serde(default)]
+    pub metadata_flavor: Option<MetadataFlavor>,
+}
+
+/// A cloud metadata service the host proxy can imitate for a session.
+///
+/// ADR 0109 shipped this as a `google_adc: bool` on the wire, which made
+/// "does this session need a metadata endpoint?" and "is it Google's?" the same
+/// question. A second provider would have had to add a second boolean, and the
+/// proxy would have had to decide which one wins. An enum makes the answer one
+/// value, and a wildcard-free `match` on it makes a new variant a compile error
+/// at every site that has to handle one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataFlavor {
+    /// Google Compute Engine's metadata server, which the Cloud SDK and every
+    /// Google auth library probe for Application Default Credentials.
+    Gce,
+}
+
+/// Host-side authority used to mint a short-lived credential for one inject.
+///
+/// Every source names the configured connection selected by the profile. The
+/// provider is explicit routing metadata; callers never infer it from the
+/// opaque connection ID. Neither field contains a credential.
+///
+/// Externally tagged (JSON `{"connection": {...}}`), NOT `#[serde(tag)]`:
+/// this enum rides `EgressInjectEntry.mint_source` on the coord ↔ host
+/// bincode wire, and bincode cannot DECODE an internally-tagged enum
+/// (`deserialize_any`) — the same footgun the `CaptureEnvValue` wire-strip
+/// pin in `wire_golden.rs` documents. Here a strip is not an option: the
+/// egress proxy needs the mint authority at refresh time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialMintSource {
+    Connection {
+        connection_id: String,
+        provider: String,
+    },
 }
 
 /// ADR 0057: one profile-defined secret the session injects. The value lives in
@@ -84,17 +132,15 @@ pub struct IntegrationInject {
     pub header_template: String,
     /// A `SecretStore` reference (e.g. `"datadog-api-key"`) the coordinator
     /// resolves to a value host-side. NEVER a secret value itself. Empty when
-    /// this is a `mint_provider` entry (the value is minted, not stored).
+    /// this is a `mint_source` entry (the value is minted, not stored).
     #[serde(default)]
     pub secret_ref: String,
-    /// ADR 0056 amendment: when non-empty, the inject value is **minted** — the
-    /// coordinator resolves it via the `IntegrationBroker` for this provider,
-    /// scoped to the session's bound capabilities, instead of from `secret_ref`.
-    /// This is how a *mint* provider (e.g. github) rides the same egress inject
-    /// plane as a static-secret (*inject*) provider; the scoped token never
-    /// enters the guest. Mutually exclusive with `secret_ref`. NEVER a value.
+    /// When present, the inject value is minted through the shared credential
+    /// broker instead of read from `secret_ref`. The source always names the
+    /// selected connection, including existing singleton providers.
+    /// Mutually exclusive with `secret_ref`. NEVER a value.
     #[serde(default)]
-    pub mint_provider: String,
+    pub mint_source: Option<CredentialMintSource>,
     /// Request shapes this injection gates + applies to. Empty = any.
     #[serde(default)]
     pub methods: Vec<String>,
@@ -251,7 +297,7 @@ mod tests {
                 header_name: "DD-API-KEY".into(),
                 header_template: "{}".into(),
                 secret_ref: "datadog-api-key".into(),
-                mint_provider: String::new(),
+                mint_source: None,
                 methods: vec!["GET".into()],
                 path_globs: vec!["/api/v2/logs*".into()],
                 graphql_operation: String::new(),
@@ -273,7 +319,10 @@ mod tests {
                 header_name: String::new(),
                 header_template: String::new(),
                 secret_ref: String::new(),
-                mint_provider: "github".into(),
+                mint_source: Some(CredentialMintSource::Connection {
+                    connection_id: "github-default".into(),
+                    provider: "github".into(),
+                }),
                 methods: vec!["POST".into()],
                 path_globs: vec!["/graphql".into()],
                 graphql_operation: "mutation".into(),

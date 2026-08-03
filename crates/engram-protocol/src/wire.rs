@@ -114,7 +114,24 @@ use serde::{Deserialize, Serialize};
 // CancelExec coord↔host RPC. Lockstep coord+host roll.
 // v20 (ADR 0103 review hardening): ExecFrame carries terminal refusals as
 // their own oneof variant instead of collapsing them into Exit(None).
-pub const WIRE_VERSION: u32 = 20;
+// v21 (ADR 0109): `SessionEgressPolicy.google_adc` tells the host whether
+// to expose the session-local Google metadata endpoint. Trailing bincode
+// field addition. Lockstep coordinator and host roll.
+// v22 (issue: engrams-review outage 2026-08-01): `CredentialMintSource`
+// becomes externally tagged. The internally-tagged form (#931) bincode-
+// ENCODED as a map but could never DECODE (`deserialize_any`), so every
+// `SessionEgressPolicy` carrying a minted inject failed host-side at
+// boot — no peer ever decoded the old `Some(mint_source)` bytes. The
+// bump makes the mixed-fleet posture explicit. Lockstep coord+host roll.
+// v23 (ADR 0109 seam): `SessionEgressPolicy.google_adc` becomes
+// `metadata_flavor: Option<MetadataFlavor>`. The boolean conflated "does
+// this session need a metadata endpoint?" with "is it Google's?", so a
+// second cloud would have needed a second boolean and the proxy would
+// have had to decide which one wins. The enum makes it one value, and a
+// wildcard-free match makes a new variant a compile error. Bincode field
+// REPLACEMENT (not an addition), so the roll is lockstep: a v22 host
+// cannot decode a v23 policy.
+pub const WIRE_VERSION: u32 = 23;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

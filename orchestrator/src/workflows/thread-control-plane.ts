@@ -58,6 +58,8 @@ export interface ThreadControlPlaneDeps {
   resolveUser?: (provider: string, externalUserId: string) => Promise<string | null>;
   /** The Drizzle DB the task-persist transaction runs on. Default = the pool. */
   db?: Db;
+  /** Injected session IDs keep the pre-boot authorization snapshot deterministic in tests. */
+  newSessionId?: () => string;
 }
 
 /** Build the production ThreadControlPlane; all deps injectable for tests. */
@@ -87,6 +89,7 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
           sessions,
           secrets,
           db,
+          ...(deps.newSessionId ? { newSessionId: deps.newSessionId } : {}),
         },
         {
           type: "slack_thread",

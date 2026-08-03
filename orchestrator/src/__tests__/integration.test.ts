@@ -18,6 +18,11 @@ import { registerIntegration } from "../rpc/integration.ts";
 import type { IntegrationDeps, GetSession, MintAccess, OrgSecretAccess } from "../rpc/integration.ts";
 import type { ConnectorStore, ConnectorRow } from "../db/connectors.ts";
 import type { ConnectorLogoStore } from "../db/connector-logos.ts";
+import type {
+  IntegrationConnectionRow,
+  IntegrationConnectionStore,
+} from "../db/integration-connections.ts";
+import type { ProfileStore } from "../db/profiles.ts";
 import { invalidateRegistry } from "../connectors/registry.ts";
 import { IntegrationService } from "../gen/engram/app/v1/integration_pb.ts";
 import type { MintKind } from "../gen/engram/app/v1/mint_pb.ts";
@@ -122,6 +127,97 @@ function fakeStore(seed: ConnectorRow[] = []): { store: ConnectorStore; rec: Rec
   return { store, rec };
 }
 
+function fakeConnectionStore(seed: IntegrationConnectionRow[] = []): IntegrationConnectionStore {
+  const rows = new Map(seed.map((row) => [row.id, row]));
+  let sequence = rows.size;
+  return {
+    async list() {
+      return [...rows.values()];
+    },
+    async get(id) {
+      return rows.get(id) ?? null;
+    },
+    async getMany(ids) {
+      return ids.map((id) => rows.get(id)).filter((row) => row != null);
+    },
+    async getDefault(provider) {
+      const existing = [...rows.values()].find((row) =>
+        row.provider === provider && row.isDefault
+      );
+      if (existing) return existing;
+      const now = new Date("2026-07-31T12:00:00Z");
+      const row: IntegrationConnectionRow = {
+        id: `default-${provider}`,
+        alias: `${provider}-default`,
+        provider,
+        displayName: `${provider} default`,
+        isDefault: true,
+        config: {},
+        enabled: true,
+        testedAt: new Date(0),
+        createdAt: now,
+        updatedAt: now,
+      };
+      rows.set(row.id, row);
+      return row;
+    },
+    async create(input) {
+      sequence += 1;
+      const now = new Date("2026-07-31T12:00:00Z");
+      const row: IntegrationConnectionRow = {
+        id: `connection-${sequence}`,
+        ...input,
+        isDefault: false,
+        enabled: false,
+        testedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      rows.set(row.id, row);
+      return row;
+    },
+    async update(id, input) {
+      const current = rows.get(id);
+      if (!current) return null;
+      const row = {
+        ...current,
+        ...input,
+        enabled: false,
+        testedAt: null,
+        updatedAt: new Date("2026-07-31T12:01:00Z"),
+      };
+      rows.set(id, row);
+      return row;
+    },
+    async delete(id) {
+      return rows.delete(id);
+    },
+    async markTested(id, testedAt) {
+      const current = rows.get(id);
+      if (!current) return null;
+      const row = { ...current, testedAt, updatedAt: testedAt };
+      rows.set(id, row);
+      return row;
+    },
+    async setEnabled(id, enabled) {
+      const current = rows.get(id);
+      if (!current) return null;
+      const row = { ...current, enabled };
+      rows.set(id, row);
+      return row;
+    },
+    async ensureDefault(provider) {
+      return (await this.getDefault(provider))!;
+    },
+  };
+}
+
+const noProfiles = {
+  async list() {
+    return [];
+  },
+} as unknown as ProfileStore;
+
 const CUSTOM = JSON.stringify({
   provider: "customco",
   protocol: "http",
@@ -134,8 +230,17 @@ async function spawn(deps: IntegrationDeps) {
   const app = new Hono();
   app.notFound((c) => c.json({ error: "not found" }, 404));
   // Default a fake logo store so tests that don't exercise logos never hit the
-  // real getDb() default (no DB in unit tests). An explicit dep overrides it.
-  const withDefaults: IntegrationDeps = { connectorLogos: fakeLogoStore().store, ...deps };
+  // real getDb() defaults (no DB in unit tests). Explicit deps override these.
+  const withDefaults: IntegrationDeps = {
+    connectorLogos: fakeLogoStore().store,
+    connections: fakeConnectionStore(),
+    profiles: noProfiles,
+    googleExchange: async () => ({
+      accessToken: "host-only-token",
+      expiresAt: new Date("2026-07-31T12:07:00Z"),
+    }),
+    ...deps,
+  };
   const srv = buildServer(app, (router) => registerIntegration(router, withDefaults));
   const url = await new Promise<string>((res) =>
     srv.listen(0, "127.0.0.1", () => res(`http://127.0.0.1:${(srv.address() as AddressInfo).port}`)),
@@ -170,10 +275,138 @@ describe("IntegrationService (native)", () => {
     const mem = await spawn({ getSession: makeGetSession("m"), connectors: fakeStore().store });
     try {
       await expectErr(mem.client.listConnectors({}), Code.PermissionDenied);
+      await expectErr(mem.client.listConnections({}), Code.PermissionDenied);
       await expectErr(mem.client.upsertConnector({ configJson: CUSTOM }), Code.PermissionDenied);
       await expectErr(mem.client.deleteConnector({ provider: "customco" }), Code.PermissionDenied);
     } finally {
       await mem.close();
+    }
+  });
+
+  test("Google Cloud connection requires a successful WIF test before enable", async () => {
+    const connections = fakeConnectionStore();
+    const exchanged: string[] = [];
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      connectors: fakeStore().store,
+      connections,
+      profiles: noProfiles,
+      issuer: "https://tenant.example/api/v1/integrations/google-cloud/oidc",
+      deploymentId: "tenant.example",
+      now: () => new Date("2026-07-31T12:02:00Z"),
+      googleExchange: async (_config, identity) => {
+        exchanged.push(identity.connectionId);
+        return { accessToken: "host-only-token", expiresAt: new Date("2026-07-31T12:07:00Z") };
+      },
+    });
+    try {
+      const created = await s.client.createConnection({
+        alias: "prod-readonly",
+        provider: "gcp",
+        displayName: "Production read only",
+        googleCloud: {
+          workloadIdentityProvider:
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/prod",
+          serviceAccountEmail: "engrams-reader@example-project.iam.gserviceaccount.com",
+          endpoints: ["compute.googleapis.com", "tunnel.cloudproxy.app"],
+        },
+      });
+      const id = created.connection!.id;
+      expect(created.connection!.enabled).toBe(false);
+      await expectErr(s.client.setConnectionEnabled({ id, enabled: true }), Code.FailedPrecondition);
+
+      const setup = await s.client.getGoogleCloudSetup({ id });
+      expect(setup.audience).toBe(
+        "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/prod",
+      );
+      expect(setup.terraform).toContain(`assertion.engrams_connection == '${id}'`);
+      // A-claims: the organization claim carries the DEPLOYMENT id, not the
+      // issuer URL (the URL already rides in issuer_uri).
+      expect(setup.terraform).toContain(
+        "assertion.engrams_organization == 'tenant.example'",
+      );
+      expect(setup.terraform).toContain(
+        'issuer_uri        = "https://tenant.example/api/v1/integrations/google-cloud/oidc"',
+      );
+      expect(setup.gcloudScript).toContain("roles/iam.workloadIdentityUser");
+      expect(setup.terraform).not.toContain("private_key");
+
+      // An operator pastes this into a shell. Without `set -euo pipefail` a
+      // failed pool creation is invisible — the next command runs anyway and
+      // the script "succeeds" with a half-built pool.
+      expect(setup.gcloudScript.startsWith("#!/usr/bin/env bash\nset -euo pipefail\n")).toBe(true);
+      // Re-running the setup is the normal thing to do after editing
+      // endpoints, so creation is describe-then-create rather than an
+      // ALREADY_EXISTS error.
+      expect(setup.gcloudScript).toContain("workload-identity-pools describe engrams");
+      expect(setup.gcloudScript).toContain("workload-identity-pools providers describe prod");
+
+      // Terraform resource names are ADDRESSES. Two connections in one project
+      // both emitted `...engrams`, so applying the second setup silently
+      // redefined the first. The address is derived from the provider id.
+      expect(setup.terraform).toContain('resource "google_iam_workload_identity_pool" "engrams_prod"');
+      expect(setup.terraform).toContain(
+        'workload_identity_pool_id          = google_iam_workload_identity_pool.engrams_prod.workload_identity_pool_id',
+      );
+      expect(setup.terraform).not.toContain('"google_iam_workload_identity_pool" "engrams"\n');
+
+      expect((await s.client.testConnection({ id })).ok).toBe(true);
+      expect(exchanged).toEqual([id]);
+      expect((await s.client.setConnectionEnabled({ id, enabled: true })).connection!.enabled).toBe(true);
+
+      const updated = await s.client.updateConnection({
+        id,
+        alias: "prod-readonly",
+        displayName: "Production read only",
+        googleCloud: created.connection!.googleCloud,
+      });
+      expect(updated.connection!.enabled).toBe(false);
+      expect(updated.connection!.testedAt).toBe("");
+      expect((await s.client.deleteConnection({ id })).deleted).toBe(true);
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("Google Cloud connections require a public HTTPS issuer", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      connectors: fakeStore().store,
+      issuer: "http://127.0.0.1:8787/api/v1/integrations/google-cloud/oidc",
+    });
+    try {
+      await expectErr(s.client.createConnection({
+        alias: "prod-readonly",
+        provider: "gcp",
+        displayName: "Production read only",
+        googleCloud: {
+          workloadIdentityProvider:
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/prod",
+          serviceAccountEmail: "engrams-reader@example-project.iam.gserviceaccount.com",
+          endpoints: ["compute.googleapis.com"],
+        },
+      }), Code.FailedPrecondition);
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("a provider default connection cannot be deleted", async () => {
+    const connections = fakeConnectionStore();
+    await connections.ensureDefault("github", "GitHub (default)");
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      connectors: fakeStore().store,
+      connections,
+      profiles: noProfiles,
+    });
+    try {
+      await expectErr(
+        s.client.deleteConnection({ id: "default-github" }),
+        Code.FailedPrecondition,
+      );
+    } finally {
+      await s.close();
     }
   });
 
@@ -201,13 +434,19 @@ describe("IntegrationService (native)", () => {
 
   test("UpsertConnector validates + stores a custom connector", async () => {
     const { store, rec } = fakeStore();
-    const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: store });
+    const connections = fakeConnectionStore();
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      connectors: store,
+      connections,
+    });
     try {
       const r = await s.client.upsertConnector({ configJson: CUSTOM });
       expect(rec.upserts).toHaveLength(1);
       expect(rec.upserts[0]!.provider).toBe("customco");
       expect(r.connector?.provider).toBe("customco");
       expect(r.connector?.builtin).toBe(false);
+      expect((await connections.getDefault("customco"))?.id).toBe("default-customco");
     } finally {
       await s.close();
     }
@@ -310,6 +549,7 @@ describe("GetIntegrationCatalog (member-readable)", () => {
       const r = await mem.client.getIntegrationCatalog({});
       const by = new Map(r.providers.map((p) => [p.provider, p]));
       expect(by.get("github")?.display?.name).toBe("GitHub");
+      expect(by.get("github")?.defaultConnectionId).toBe("default-github");
       expect(by.get("github")?.display?.icon?.mono).toBe("GH");
       expect(by.get("datadog")?.credentialSource).toBe("inject");
       const ghCaps = new Map(by.get("github")!.capabilities.map((c) => [c.action, c]));

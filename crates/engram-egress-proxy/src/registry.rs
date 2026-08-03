@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use engram_core::types::integration::{CredentialMintSource, MetadataFlavor};
 use engram_core::SessionId;
 use parking_lot::RwLock;
 
@@ -51,6 +52,8 @@ pub struct SessionState {
     /// emits an `IntegrationAsset` (the side-effect ⟹ event invariant). An
     /// observe-only host (no secret, no inject) is MITM'd purely to observe.
     pub observes: Vec<ObserveEntry>,
+    /// Which cloud metadata service the host serves for this session, if any.
+    pub metadata_flavor: Option<MetadataFlavor>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,8 +75,8 @@ pub struct SecretEntry {
 /// `header_name: <header_template with "{}" → secret>`. The secret lives
 /// only in this struct, on the host.
 ///
-/// WS4: the credential is *refreshable*. A minted entry (`mint_provider`
-/// non-empty) carries a short-lived credential (a GitHub App installation
+/// The credential is refreshable. A minted entry (`mint_source` present)
+/// carries a short-lived credential (a GitHub App installation
 /// token, ~1h TTL) that the proxy re-mints via its [`InjectRefresher`] seam
 /// near expiry — closing the campaign's reads-401/writes-succeed asymmetry
 /// where the boot-time inject token was minted ONCE and went stale ~1h later.
@@ -86,10 +89,10 @@ pub struct InjectEntry {
     pub allow: HostList,
     /// Request shapes this injection gates + applies to.
     pub policy: RequestPolicy,
-    /// WS4: the mint provider whose credential this injects (e.g. `"github"`),
-    /// or empty for a static/non-refreshable secret. Non-empty ⇒ the proxy
-    /// re-mints `cred` via the [`InjectRefresher`] near expiry.
-    pub mint_provider: String,
+    /// The typed provider or named-connection source for this credential.
+    /// `None` marks a static, non-refreshable secret. A source makes the proxy
+    /// re-mint `cred` through [`InjectRefresher`] near expiry.
+    pub mint_source: Option<CredentialMintSource>,
     /// WS4: the refreshable credential cell. [`Self::secret`] reads the current
     /// value; [`Self::refresh_if_stale`] re-mints it (single-flighted) when a
     /// near-expiry request arrives. The secret lives only here, on the host.
@@ -106,10 +109,13 @@ impl InjectEntry {
     /// re-mint it via `refresher`, single-flighted so concurrent connections
     /// re-mint at most once. On refresh failure the STALE secret is kept — a
     /// request under a stale token 401s (recoverable), whereas dropping the
-    /// request is not. A no-op for a static entry (empty `mint_provider`) or one
+    /// request is not. A no-op for a static entry (no `mint_source`) or one
     /// still comfortably inside its validity window.
     pub async fn refresh_if_stale(&self, session_id: SessionId, refresher: &dyn InjectRefresher) {
-        if self.mint_provider.is_empty() || self.cred.fresh_enough() {
+        let Some(mint_source) = &self.mint_source else {
+            return;
+        };
+        if self.cred.fresh_enough() {
             return;
         }
         // Single-flight: hold the async guard across the re-mint. Late arrivals
@@ -118,7 +124,7 @@ impl InjectEntry {
         if self.cred.fresh_enough() {
             return; // another connection refreshed while we waited
         }
-        match refresher.refresh(session_id, &self.mint_provider).await {
+        match refresher.refresh(session_id, mint_source).await {
             Some(fresh) => {
                 *self.cred.current.write() = CredState {
                     secret: fresh.secret,
@@ -126,7 +132,7 @@ impl InjectEntry {
                 };
             }
             None => tracing::warn!(
-                provider = %self.mint_provider,
+                source = ?mint_source,
                 %session_id,
                 "egress inject refresh failed; keeping the stale credential \
                  (a 401 is recoverable; a dropped request is not)",
@@ -183,9 +189,13 @@ impl RefreshableCred {
 /// the proxy AWAITS the fresh secret before injecting it.
 #[async_trait]
 pub trait InjectRefresher: Send + Sync {
-    /// Re-mint the credential for `mint_provider` on `session_id`. `None` ⇒ the
+    /// Re-mint the credential for `mint_source` on `session_id`. `None` means the
     /// refresh failed (the caller keeps the stale secret).
-    async fn refresh(&self, session_id: SessionId, mint_provider: &str) -> Option<RefreshedInject>;
+    async fn refresh(
+        &self,
+        session_id: SessionId,
+        mint_source: &CredentialMintSource,
+    ) -> Option<RefreshedInject>;
 }
 
 /// WS4: the result of an [`InjectRefresher::refresh`] — the fresh rendered header
@@ -277,8 +287,22 @@ impl RequestPolicy {
     }
 
     /// Glob path match over the whole path; empty `path_globs` = any path.
+    /// An internal `segment:` prefix makes each `*` stop at `/`.
+    /// `segment-path:` also excludes the query string from matching. Google
+    /// Cloud policies use the latter form because API clients add transport
+    /// parameters such as `alt=json`, while the permission boundary is the
+    /// resource path.
     pub fn path_matches(&self, path: &str) -> bool {
-        self.path_globs.is_empty() || self.path_globs.iter().any(|p| glob_match(p, path))
+        self.path_globs.is_empty()
+            || self.path_globs.iter().any(|pattern| {
+                if let Some(pattern) = pattern.strip_prefix("segment-path:") {
+                    segment_glob_match(pattern, path.split_once('?').map_or(path, |(path, _)| path))
+                } else if let Some(pattern) = pattern.strip_prefix("segment:") {
+                    segment_glob_match(pattern, path)
+                } else {
+                    glob_match(pattern, path)
+                }
+            })
     }
 }
 
@@ -287,6 +311,15 @@ impl RequestPolicy {
 /// recursion blow-up). `*` is the only metacharacter — connector match paths use
 /// nothing else.
 fn glob_match(pattern: &str, text: &str) -> bool {
+    glob_match_with(pattern, text, true)
+}
+
+/// Google resource-path glob: `*` matches within one `/`-delimited segment.
+fn segment_glob_match(pattern: &str, text: &str) -> bool {
+    glob_match_with(pattern, text, false)
+}
+
+fn glob_match_with(pattern: &str, text: &str, star_matches_slash: bool) -> bool {
     let p = pattern.as_bytes();
     let t = text.as_bytes();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -302,6 +335,9 @@ fn glob_match(pattern: &str, text: &str) -> bool {
             ti += 1;
         } else if let Some(s) = star {
             // Mismatch under a `*`: let the `*` swallow one more char of `text`.
+            if !star_matches_slash && t[star_ti] == b'/' {
+                return false;
+            }
             pi = s + 1;
             star_ti += 1;
             ti = star_ti;
@@ -427,7 +463,17 @@ impl SessionState {
     /// and, when MITM, which secrets to substitute + which injections
     /// apply. A host with any matching secret OR injection is MITM'd;
     /// otherwise the `network_allow` list decides bypass vs reject.
+    ///
+    /// ADR 0109: a Google credential-exchange host is refused here, before any
+    /// TLS, so the refusal covers a **bypass** connection too. The
+    /// request-level check inside the intercept path never saw one, so a broad
+    /// `*.googleapis.com` network allow beside a narrow injection spliced STS
+    /// straight through — the guest could trade its session token for a
+    /// credential this proxy no longer bounds.
     pub fn decide(&self, hostname: &str) -> Decision<'_> {
+        if crate::google_denylist::denies_host(hostname) {
+            return Decision::Reject;
+        }
         let secrets: Vec<&SecretEntry> = self
             .secrets
             .iter()
@@ -445,12 +491,25 @@ impl SessionState {
             .collect();
         if !secrets.is_empty() || !injects.is_empty() || !observes.is_empty() {
             return Decision::Intercept {
+                foreign_placeholders: self.foreign_placeholders(hostname),
                 secrets,
                 injects,
                 observes,
             };
         }
         if self.allow_all || self.network_allow.matches(hostname) {
+            // A host that carries a credential-minting OPERATION rule cannot be
+            // spliced: the rule reads the request line, which only an
+            // intercepted connection produces. Interception with an empty
+            // policy relays the connection as before and lets the rule run.
+            if crate::google_denylist::requires_inspection(hostname) {
+                return Decision::Intercept {
+                    secrets: Vec::new(),
+                    injects: Vec::new(),
+                    observes: Vec::new(),
+                    foreign_placeholders: self.foreign_placeholders(hostname),
+                };
+            }
             Decision::Bypass
         } else {
             Decision::Reject
@@ -465,6 +524,24 @@ impl SessionState {
         self.secrets
             .iter()
             .map(|s| s.placeholder.as_str())
+            .collect()
+    }
+
+    /// Placeholders whose secret does NOT allow `hostname`. Seeing one of these
+    /// in a request to that host is a leak attempt, and the intercept path
+    /// closes the connection.
+    ///
+    /// This must be computed HERE, beside the narrowing that hides it: the
+    /// intercept path receives only host-matching secrets, so the leak scan it
+    /// used to run — "which of these secrets does this host disallow?" — asked
+    /// a question whose answer is always "none". The detector, and the e2e
+    /// fixture built on it, tested an empty set.
+    fn foreign_placeholders(&self, hostname: &str) -> Vec<&str> {
+        self.secrets
+            .iter()
+            .filter(|entry| !entry.allow.matches(hostname))
+            .map(|entry| entry.placeholder.as_str())
+            .filter(|placeholder| !placeholder.is_empty())
             .collect()
     }
 }
@@ -482,6 +559,8 @@ pub enum Decision<'a> {
         secrets: Vec<&'a SecretEntry>,
         injects: Vec<&'a InjectEntry>,
         observes: Vec<&'a ObserveEntry>,
+        /// Placeholders this host may NOT receive — the leak scan's needles.
+        foreign_placeholders: Vec<&'a str>,
     },
 }
 
@@ -518,7 +597,7 @@ mod tests {
                     path_globs: vec!["/api/v2/logs*".into()],
                     graphql: None,
                 },
-                mint_provider: String::new(),
+                mint_source: None,
                 cred: RefreshableCred::new("dd-secret".into(), None),
             }],
             observes: vec![ObserveEntry {
@@ -536,6 +615,7 @@ mod tests {
                 fetchable: Some("$.resp.html_url".into()),
                 url_fallback: None,
             }],
+            metadata_flavor: None,
         }
     }
 
@@ -557,6 +637,7 @@ mod tests {
                 secrets,
                 injects,
                 observes,
+                ..
             } => {
                 assert!(secrets.is_empty());
                 assert_eq!(injects.len(), 1);
@@ -577,6 +658,7 @@ mod tests {
                 secrets,
                 injects,
                 observes,
+                ..
             } => {
                 assert!(secrets.is_empty());
                 assert!(injects.is_empty());
@@ -599,6 +681,59 @@ mod tests {
     #[test]
     fn decision_reject_when_neither_matches() {
         assert!(matches!(state().decide("api.evil.com"), Decision::Reject));
+    }
+
+    #[test]
+    fn a_credential_exchange_host_is_refused_even_when_the_network_allows_it() {
+        // ADR 0109 S5: a broad Google allow beside a narrow injection used to
+        // splice STS through, because the request-level denylist only ran on
+        // intercepted connections. Admission now refuses the host outright.
+        let mut s = state();
+        s.network_allow = HostList::from_manifest(&["*.googleapis.com".into()], &[]).unwrap();
+        for host in [
+            "sts.googleapis.com",
+            "sts.mtls.googleapis.com",
+            "oauth2.googleapis.com",
+            "iamcredentials.googleapis.com",
+        ] {
+            assert!(
+                matches!(s.decide(host), Decision::Reject),
+                "{host} must be refused",
+            );
+        }
+    }
+
+    #[test]
+    fn allow_all_does_not_reopen_a_credential_exchange_host() {
+        let mut s = state();
+        s.allow_all = true;
+        assert!(matches!(s.decide("sts.googleapis.com"), Decision::Reject));
+    }
+
+    #[test]
+    fn an_operation_gated_host_is_inspected_rather_than_spliced() {
+        // The credential-minting rules for these hosts read the request line,
+        // which only an intercepted connection produces.
+        let mut s = state();
+        s.network_allow = HostList::from_manifest(&["*.googleapis.com".into()], &[]).unwrap();
+        match s.decide("iam.googleapis.com") {
+            Decision::Intercept {
+                secrets,
+                injects,
+                observes,
+                ..
+            } => {
+                assert!(secrets.is_empty());
+                assert!(injects.is_empty());
+                assert!(observes.is_empty());
+            }
+            other => panic!("expected Intercept, got {other:?}"),
+        }
+        // A host with no operation rule keeps the cheaper splice.
+        assert!(matches!(
+            s.decide("storage.googleapis.com"),
+            Decision::Bypass
+        ));
     }
 
     #[test]
@@ -642,7 +777,11 @@ mod tests {
 
     #[async_trait]
     impl InjectRefresher for StubRefresher {
-        async fn refresh(&self, _s: SessionId, _p: &str) -> Option<RefreshedInject> {
+        async fn refresh(
+            &self,
+            _s: SessionId,
+            _source: &CredentialMintSource,
+        ) -> Option<RefreshedInject> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.result.clone()
         }
@@ -654,16 +793,19 @@ mod tests {
             header_template: "Bearer {}".into(),
             allow: HostList::from_manifest(&["api.github.com".into()], &[]).unwrap(),
             policy: RequestPolicy::default(),
-            mint_provider: "github".into(),
+            mint_source: Some(CredentialMintSource::Connection {
+                connection_id: "github-default".into(),
+                provider: "github".into(),
+            }),
             cred: RefreshableCred::new(secret.into(), expires_at),
         }
     }
 
     #[tokio::test]
     async fn static_entry_never_refreshes() {
-        // Empty mint_provider (a static secret) is a no-op even with a refresher.
+        // No mint source means a static secret, so refresh is a no-op.
         let e = InjectEntry {
-            mint_provider: String::new(),
+            mint_source: None,
             ..mint_entry("static", None)
         };
         let r = StubRefresher {
@@ -689,6 +831,48 @@ mod tests {
         e.refresh_if_stale(SessionId::new(), &r).await;
         assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(e.secret(), "current");
+    }
+
+    #[tokio::test]
+    async fn connection_entry_keeps_a_fresh_launch_time_credential() {
+        let e = InjectEntry {
+            mint_source: Some(CredentialMintSource::Connection {
+                connection_id: "connection-1".into(),
+                provider: "gcp".into(),
+            }),
+            ..mint_entry("current", Some(Utc::now() + Duration::hours(1)))
+        };
+        let r = StubRefresher {
+            calls: Default::default(),
+            result: Some(RefreshedInject {
+                secret: "revalidated".into(),
+                expires_at: Utc::now() + Duration::hours(1),
+            }),
+        };
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(e.secret(), "current");
+    }
+
+    #[tokio::test]
+    async fn connection_entry_uses_stale_credential_when_refresh_fails() {
+        let e = InjectEntry {
+            mint_source: Some(CredentialMintSource::Connection {
+                connection_id: "connection-1".into(),
+                provider: "gcp".into(),
+            }),
+            ..mint_entry(
+                "still-valid-but-disabled",
+                Some(Utc::now() + Duration::minutes(1)),
+            )
+        };
+        let r = StubRefresher {
+            calls: Default::default(),
+            result: None,
+        };
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(e.secret(), "still-valid-but-disabled");
     }
 
     #[tokio::test]
@@ -758,5 +942,27 @@ mod tests {
         // A bare `*` mid-pattern that must backtrack to a later literal.
         assert!(glob_match("/a/*/b", "/a/x/y/b"));
         assert!(!glob_match("/a/*/b", "/a/x/y/c"));
+
+        // Google resource patterns use segment globs. A resource wildcard must
+        // not authorize a nested action or subresource.
+        assert!(segment_glob_match(
+            "/compute/v1/projects/*/zones/*/instances/*",
+            "/compute/v1/projects/prod/zones/us-central1-a/instances/vm-1"
+        ));
+        assert!(!segment_glob_match(
+            "/compute/v1/projects/*/zones/*/instances/*",
+            "/compute/v1/projects/prod/zones/us-central1-a/instances/vm-1/start"
+        ));
+
+        let google = RequestPolicy {
+            path_globs: vec!["segment-path:/v3/projects/*/metricDescriptors".into()],
+            ..RequestPolicy::default()
+        };
+        assert!(google.path_matches(
+            "/v3/projects/cortex-internal-tooling/metricDescriptors?alt=json&pageSize=1"
+        ));
+        assert!(!google.path_matches(
+            "/v3/projects/cortex-internal-tooling/metricDescriptors/delete?alt=json"
+        ));
     }
 }

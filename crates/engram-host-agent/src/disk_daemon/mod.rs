@@ -70,6 +70,6 @@ pub use nbd_kernel::HostNbdKernel;
 #[cfg(target_os = "linux")]
 pub use runtime::{
     attach_manifest, attach_manifest_content, classify_startup_inventory, device_has_live_holder,
-    flush_block_device_cache, reattach, reattach_manifest, recover_stuck_nbd_devices, spawn,
-    NbdHandle, NbdRuntimeError, NbdSandboxState, NBD_BLOCK_SIZE,
+    enter_shutdown_abandon_mode, flush_block_device_cache, reattach, reattach_manifest,
+    recover_stuck_nbd_devices, spawn, NbdHandle, NbdRuntimeError, NbdSandboxState, NBD_BLOCK_SIZE,
 };

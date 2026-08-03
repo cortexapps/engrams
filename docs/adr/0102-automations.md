@@ -70,10 +70,22 @@ trigger =
 
 action =
   { kind: "create_task", profileId, promptTemplate,
-    titleTemplate?, includeEventContext }
+    titleTemplate?, includeEventContext,
+    harness?, model?, effort? }
 ```
 
-`includeEventContext` defaults to true. GitHub's installed app is exposed to
+`includeEventContext` defaults to true. `harness`/`model`/`effort` are the ADR
+0063 B2 per-session override, stored on the action so every run of one
+automation launches the same harness: absent = inherit the profile's default,
+and a set `model`/`effort` must be an option id on the effective harness's
+descriptor (validated on save against the live catalog). A save that sets
+`model` or `effort` also PINS the harness those ids belong to. A model id is
+meaningful only next to one harness, so an action naming a model but inheriting
+its harness is under-specified: switching the profile's harness later would
+orphan the id, and the launch path resolves an unknown id to no model env at
+all — a silently wrong model on an unattended run. Pinning gives the action the
+property a profile already has (ProfileService validates its whole triple on
+every save) without a second guard in ProfileService. GitHub's installed app is exposed to
 the dispatcher as the well-known system registration `github-app`; an
 automation bound to it uses the same registration/event matching path as a
 user-created webhook. The GitHub HTTP route remains responsible for its
@@ -259,9 +271,10 @@ secret behavior:
 1. Insert a task with `type = "automation"`, `createdByUserId = null`, and a
    source envelope containing provider `automation`, automation id, run id, and
    the redacted trigger reference.
-2. Call `createSessionForExistingTask` with no owner. Its existing optional-owner
-   branch selects the harness descriptor's programmatic **org credential** from
-   ADR 0063, never a user's personal token.
+2. Call `createSessionForExistingTask` with no owner, passing the action's
+   `harness`/`model`/`effort` when it overrides the profile. Its existing
+   optional-owner branch selects the harness descriptor's programmatic **org
+   credential** from ADR 0063, never a user's personal token.
 3. Keep the chosen profile's secrets, environment, capabilities, and network
    policy. This is not PR review's hardened drop: an admin explicitly selected
    the profile for unattended execution.
@@ -287,7 +300,7 @@ work. Both services use the existing session resolution and explicit admin role
 gate; ADR 0086 programmatic admin keys reach the same gate, not a parallel API.
 
 The v1 UI lives at `/settings/automations`: list/toggle, trigger and profile
-selection, prompt/title editor, event-context toggle, sample-backed variable
+selection, the shared harness/model/effort pickers, prompt/title editor, event-context toggle, sample-backed variable
 picker and preview, run history, and webhook-registration creation with the
 one-time secret display. It is intentionally an editor, not a visual workflow
 builder.

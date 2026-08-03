@@ -65,6 +65,29 @@ use super::slot::{NbdSlot, NbdSlotAllocator};
 /// page size on x86_64 and the chunk-aligned units we serve.
 pub const NBD_BLOCK_SIZE: u64 = 4096;
 
+/// Terminal shutdown-abandon mode (2026-08-02 durability-rollback RCA).
+/// Raised once at SIGTERM — BEFORE the background-task aborts, whose
+/// dropped locals can hold a live [`NbdHandle`] — and never lowered.
+/// While raised, [`NbdHandle`]'s `Drop` leaves the kernel device
+/// configured instead of netlink-disconnecting it: in the SIGTERM window
+/// a handle only reaches `Drop` via unwind or teardown collateral (the
+/// abandon sweep uses [`NbdHandle::abandon`], which skips `Drop`), and a
+/// disconnect from that path de-configures a surviving guest's live
+/// device — the successor's RECONFIGURE then meets "not configured" and
+/// the survivor becomes an uncapturable quarantine. The 2026-08-02 panic
+/// between the flush pass and the abandon sweep disconnected four
+/// survivors exactly this way. The decision itself is the pure
+/// [`engram_host_core::nbd_drop_action`]; this flag is its process-global
+/// input.
+static SHUTDOWN_ABANDON_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Raise the terminal shutdown-abandon mode. Called from the SIGTERM
+/// handler as its first act; there is deliberately no way to lower it.
+pub fn enter_shutdown_abandon_mode() {
+    SHUTDOWN_ABANDON_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Kernel-side NBD request timeout in seconds, set via
 /// `NBD_SET_TIMEOUT` during the startup dance.
 ///
@@ -222,6 +245,26 @@ impl Drop for NbdHandle {
         // invisible until the startup recovery (or reboot) frees it.
         if let Some(task) = self.serve_task.take() {
             task.abort();
+        }
+        // 2026-08-02 durability-rollback RCA: once shutdown is underway,
+        // a drop is unwind/teardown collateral, never a deliberate
+        // survivor teardown — leave the kernel config alive so the
+        // successor's RECONFIGURE finds a configured device (see
+        // `SHUTDOWN_ABANDON_MODE`).
+        match engram_host_core::nbd_drop_action(
+            SHUTDOWN_ABANDON_MODE.load(std::sync::atomic::Ordering::SeqCst),
+        ) {
+            engram_host_core::NbdDropAction::LeaveKernelConfigured => {
+                tracing::warn!(
+                    device = %self.nbd_device.display(),
+                    "NbdHandle dropped during shutdown-abandon mode; kernel \
+                     config left alive for the successor (no netlink \
+                     disconnect) — this drop bypassed the abandon sweep, \
+                     likely a panic unwind",
+                );
+                return;
+            }
+            engram_host_core::NbdDropAction::Disconnect => {}
         }
         let device_path = self.nbd_device.clone();
         let index = self.index;

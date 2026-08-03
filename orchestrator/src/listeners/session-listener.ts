@@ -373,8 +373,18 @@ export class SessionListener {
             frameSinceProbe = true; // re-arm decision deferred to the next firing
             deliveredFrame = true; // gates the backoff reset in the catch below
             if (frame.idx === undefined) {
-              lagged = true;
-              break;
+              // ADR 0108 B: `lagged` is the ONLY idx-less frame that means
+              // "reconnect and catch up". Any other idx-less frame is
+              // ephemeral (e.g. agent_message_chunk from a pre-durable_only
+              // coordinator under deploy skew): skip it and keep consuming.
+              // Treating every idx-less frame as lag reconnected ~5/s for
+              // the whole of every generation.
+              if (frame.kind === "lagged") {
+                lagged = true;
+                break;
+              }
+              issuePull();
+              continue;
             }
             if (frame.idx > lastSeen) lastSeen = frame.idx;
             if (frame.kind === "status_changed") {

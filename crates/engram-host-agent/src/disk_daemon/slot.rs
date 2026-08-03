@@ -245,15 +245,25 @@ impl SlotState {
     /// - `Claimed → Free` — the lease drops normally (`release` clears the
     ///   reserved bit).
     /// - `Claimed → Parked` — the lease is `quarantine()`d (bit stays set).
+    /// - `Parked → Claimed` — `reclaim_parked` hands the SAME device back
+    ///   out for a rehydrate retry (2026-08-02 durability-rollback RCA: a
+    ///   parked survivor previously had no recovery except VM destroy).
     ///
-    /// [`Parked`](SlotState::Parked) is terminal: only a process restart
-    /// clears the reserved bit. `Warm → Free` never happens (the populator
-    /// never un-warms a validated slot; it only advances to `Claimed`).
+    /// `Warm → Free` never happens (the populator never un-warms a
+    /// validated slot; it only advances to `Claimed`), and a parked slot
+    /// never reaches `Free`/`Warm` except through a successful reclaim's
+    /// normal lease life — the general pool can never re-hand-out a
+    /// possibly-live survivor device.
     pub fn can_transition_to(self, to: SlotState) -> bool {
         use SlotState::{Claimed, Free, Parked, Warm};
         matches!(
             (self, to),
-            (Free, Warm) | (Free, Claimed) | (Warm, Claimed) | (Claimed, Free) | (Claimed, Parked)
+            (Free, Warm)
+                | (Free, Claimed)
+                | (Warm, Claimed)
+                | (Claimed, Free)
+                | (Claimed, Parked)
+                | (Parked, Claimed)
         )
     }
 }
@@ -606,6 +616,34 @@ impl NbdSlotAllocator {
         None
     }
 
+    /// Re-claim a PARKED device for a rehydrate retry (2026-08-02
+    /// durability-rollback RCA; the `Parked → Claimed` edge). Only a
+    /// device previously parked by [`NbdSlot::quarantine`] is eligible:
+    /// its reserved bit is still set (parking never clears it), so the
+    /// handoff is pure bookkeeping — remove it from the parked set and
+    /// mint a fresh lease over the SAME slot. `None` if the device is
+    /// not currently parked (never parked, reclaimed by a concurrent
+    /// retry, or outside this pool).
+    ///
+    /// On a failed retry the caller `quarantine()`s the returned lease
+    /// again, which re-enters the parked set — the FSM cycles
+    /// `Parked → Claimed → Parked` without the reserved bit ever
+    /// clearing, so no other claimant can interleave.
+    pub fn reclaim_parked(self: &Arc<Self>, path: &Path) -> Option<NbdSlot> {
+        let slot = parse_nbd_index(path)?;
+        let mut parked = self.parked.lock().expect("parked set lock poisoned");
+        if !parked.remove(path) {
+            return None;
+        }
+        drop(parked);
+        Some(NbdSlot {
+            slot,
+            path: slot_path(slot),
+            allocator: self.clone(),
+            quarantined: false,
+        })
+    }
+
     /// Try to claim a SPECIFIC device that the caller believes to be
     /// free — the startup stale-binding sweep. Unlike [`Self::claim`]
     /// (which deliberately grabs busy survivor devices), this RESPECTS
@@ -808,8 +846,9 @@ mod tests {
     use std::time::Duration;
 
     /// ADR 0098 P7: the auditable slot FSM. The legal edges match the
-    /// allocator's concrete actions; `Parked` is terminal, and `Warm → Free`
-    /// (a populator un-warming a validated slot) is never legal.
+    /// allocator's concrete actions; `Warm → Free` (a populator un-warming
+    /// a validated slot) is never legal, and `Parked`'s only out-edge is
+    /// the rehydrate-retry reclaim (2026-08-02 durability-rollback RCA).
     #[test]
     fn slot_state_transition_table_matches_the_allocator() {
         use SlotState::{Claimed, Free, Parked, Warm};
@@ -819,6 +858,7 @@ mod tests {
             (Warm, Claimed),   // acquire pulls from the warm queue
             (Claimed, Free),   // normal lease drop → release
             (Claimed, Parked), // quarantine() a survivor's device
+            (Parked, Claimed), // reclaim_parked for a rehydrate retry
         ];
         for from in SlotState::ALL {
             for to in SlotState::ALL {
@@ -830,18 +870,46 @@ mod tests {
                 );
             }
         }
-        // Parked is terminal — no out-edge (only a process restart clears it).
-        assert!(
-            SlotState::ALL
-                .iter()
-                .all(|to| !Parked.can_transition_to(*to)),
-            "Parked must be terminal",
-        );
+        // A parked device can never reach the general pool directly — the
+        // only exit is a reclaim by the SAME survivor's retry.
+        assert!(!Parked.can_transition_to(Free), "parked never re-pools");
+        assert!(!Parked.can_transition_to(Warm), "parked never re-warms");
         // A warm slot never regresses to Free.
         assert!(
             !Warm.can_transition_to(Free),
             "the populator never un-warms"
         );
+    }
+
+    /// 2026-08-02 durability-rollback RCA: a parked (quarantined) device
+    /// must be reclaimable for a rehydrate retry, cycle back to Parked on
+    /// a failed retry, and stay invisible to the general pool throughout.
+    #[tokio::test]
+    async fn reclaim_parked_cycles_without_repooling() {
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::from([0u32])));
+        let pool = test_pool(1, 0, busy);
+        let dev = slot_path(0);
+
+        // Claim the survivor's device, then park it (failed rehydrate).
+        let slot = pool.claim(&dev).await.expect("claim survivor device");
+        slot.quarantine();
+        assert_eq!(pool.parked_devices(), vec![dev.clone()]);
+
+        // Reclaim for a retry: parked set drains, lease is live again.
+        let retry = pool.reclaim_parked(&dev).expect("reclaim parked device");
+        assert!(pool.parked_devices().is_empty());
+        // A concurrent second retry must lose (the set is drained).
+        assert!(pool.reclaim_parked(&dev).is_none());
+        // A never-parked device is not reclaimable.
+        assert!(pool.reclaim_parked(&slot_path(1)).is_none());
+
+        // Failed retry re-parks: back in the set, still out of the pool.
+        retry.quarantine();
+        assert_eq!(pool.parked_devices(), vec![dev.clone()]);
+        // The reserved bit never cleared across the cycle: a direct claim
+        // of the parked device must not hand it out from the free pool.
+        // (claim() falls through to its retry loop and times out.)
+        assert!(pool.try_claim(&dev).await.is_none());
     }
 
     /// Build a test pool over `0..n` with an injectable busy-set so the

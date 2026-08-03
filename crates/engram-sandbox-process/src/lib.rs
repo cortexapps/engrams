@@ -1458,6 +1458,9 @@ fn kill_exec_process_group(pgid: Option<u32>, exec_id: &str) -> Result<(), Sandb
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engram_core::types::egress::SessionEgressPolicy;
+    use engram_core::types::image::SecretMode;
+    use engram_core::SessionId;
     use std::fs;
 
     fn backend() -> (ProcessBackend, tempfile::TempDir) {
@@ -1495,6 +1498,37 @@ mod tests {
             stderr_offset: None,
             wake: None,
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_metadata_delivery_without_interception() {
+        use engram_core::types::integration::MetadataFlavor;
+        let (backend, _dir) = backend();
+        let error = backend
+            .notify_session_policy(SessionEgressPolicy {
+                session_id: SessionId::new(),
+                sandbox_id: SandboxId::new(),
+                guest_ip: std::net::Ipv4Addr::LOCALHOST,
+                network_allow_hosts: Vec::new(),
+                network_allow_host_patterns: Vec::new(),
+                allow_all: false,
+                secrets: Vec::new(),
+                injects: Vec::new(),
+                observes: Vec::new(),
+                metadata_flavor: Some(MetadataFlavor::Gce),
+                secret_mode: SecretMode::Broker,
+            })
+            .await
+            .expect_err("Process must reject a metadata flavor it cannot intercept");
+
+        // The refusal names the flavor, so a second cloud's failure is not
+        // reported as Google's.
+        let message = error.to_string();
+        assert!(message.contains("Gce"), "{message}");
+        assert!(
+            message.contains("requires host egress interception"),
+            "{message}"
+        );
     }
 
     fn durable_exec(exec_id: &str, argv: &[&str]) -> ExecRequest {
@@ -1741,17 +1775,21 @@ mod tests {
             )
             .await
             .unwrap();
+        // Wait for a PARSEABLE pid, not merely for the file to exist: `>`
+        // creates child.pid before `printf` writes to it, so an existence-only
+        // poll reads an empty file and panics with ParseIntError::Empty.
         let child_pid_path = b.cwd_for(id).join("child.pid");
+        let mut child_pid = None;
         for _ in 0..100 {
-            if child_pid_path.exists() {
+            child_pid = fs::read_to_string(&child_pid_path)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<i32>().ok());
+            if child_pid.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let child_pid = fs::read_to_string(&child_pid_path)
-            .expect("shell should publish its child pid")
-            .parse::<i32>()
-            .unwrap();
+        let child_pid = child_pid.expect("shell should publish its child pid");
 
         b.cancel_exec(id, "cancel-ticket".into()).await.unwrap();
         let (_, _, exit) =

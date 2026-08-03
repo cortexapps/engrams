@@ -202,7 +202,7 @@ async fn warm_path_redirects_through_proxy_with_correct_source_lookup() {
     });
 
     // ---- 2. Install the host iptables ruleset (Fix 1 lives here) ----
-    host_startup(Some(proxy_port), None, None)
+    host_startup(Some(proxy_port), None, None, None)
         .await
         .expect("host_startup");
 
@@ -248,6 +248,7 @@ async fn warm_path_redirects_through_proxy_with_correct_source_lookup() {
         secrets: vec![dummy_secret],
         injects: Vec::new(),
         observes: Vec::new(),
+        metadata_flavor: None,
     });
 
     // ---- 5. From inside the netns, dial TEST_DEST_IP:443 with a

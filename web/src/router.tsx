@@ -50,6 +50,7 @@ import { HarnessesPanel } from "./components/settings/HarnessesPanel";
 import { IntegrationsPanel } from "./components/settings/IntegrationsPanel";
 import { ReviewedReposPanel } from "./components/settings/ReviewedReposPanel";
 import { IntegrationDetail } from "./components/integrations/IntegrationDetail";
+import { GoogleCloudSetupPage } from "./components/integrations/GoogleCloudSetupPage";
 import { TokensPanel } from "./components/settings/TokensPanel";
 import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
@@ -318,6 +319,15 @@ const integrationDetailRoute = createRoute({
   beforeLoad: requireAdmin,
   component: IntegrationDetail,
 });
+// ADR 0109 seam: the setup page is per PROVIDER connection, not per Google
+// connection. The provider key rides the path so a second named-connection
+// provider needs no new route.
+const connectionSetupRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "integrations/$provider/$connectionId/setup",
+  beforeLoad: requireAdmin,
+  component: GoogleCloudSetupPage,
+});
 const profilesRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "profiles",
@@ -388,6 +398,7 @@ export const routeTree = rootRoute.addChildren([
       harnessesRoute,
       integrationsRoute,
       integrationDetailRoute,
+      connectionSetupRoute,
       reviewedReposRoute,
       profilesRoute,
       profilesNewRoute,

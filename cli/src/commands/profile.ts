@@ -8,6 +8,13 @@ import type { Clients } from "../client.ts";
 import { detail, failWith, printJson, table, truncate } from "../output.ts";
 import type { Profile } from "../gen/engram/app/v1/profile_pb.ts";
 
+function formatIntegrationGrant(grant: Profile["integrationGrants"][number]): string {
+  const operation = `${grant.connectionId}:${grant.operation}`;
+  return grant.resourceConstraints.length === 0
+    ? operation
+    : grant.resourceConstraints.map((resource) => `${operation}@${resource}`).join(", ");
+}
+
 function profileJson(p: Profile) {
   return {
     id: p.id,
@@ -15,7 +22,11 @@ function profileJson(p: Profile) {
     description: p.description,
     image_id: p.imageId,
     skills: p.skills,
-    capabilities: p.capabilities,
+    integration_grants: p.integrationGrants.map((grant) => ({
+      connection_id: grant.connectionId,
+      operation: grant.operation,
+      resource_constraints: grant.resourceConstraints,
+    })),
     archived: p.archived,
     is_default: p.isDefault,
     created_at: p.createdAt,
@@ -60,7 +71,7 @@ export async function get(c: Clients, id: string, json: boolean): Promise<void> 
     ["description", p.description],
     ["image_id", p.imageId],
     ["skills", p.skills.join(", ")],
-    ["capabilities", p.capabilities.join(", ")],
+    ["integration_grants", p.integrationGrants.map(formatIntegrationGrant).join(", ")],
     ["default", p.isDefault ? "yes" : undefined],
     ["created_at", p.createdAt],
   ]);

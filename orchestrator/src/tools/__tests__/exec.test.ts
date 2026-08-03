@@ -64,6 +64,7 @@ function fixture(options: {
       submittedAt: null,
       completedAt: null,
     }),
+    listSessionIdsWithPendingSessionCalls: async () => [],
     listUnsubmittedSessionCallsBefore: async () => [],
   };
   const completer: ToolCallCompleter = {

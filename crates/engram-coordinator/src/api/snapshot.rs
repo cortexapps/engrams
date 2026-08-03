@@ -64,6 +64,7 @@ fn placeholder_egress_policy(
         secrets: vec![],
         injects: vec![],
         observes: vec![],
+        metadata_flavor: None,
         secret_mode: engram_core::types::image::SecretMode::Broker,
     }
 }
@@ -122,6 +123,8 @@ pub(crate) async fn resolve_resume_agent_and_policy(
         id,
         session_env,
         b.config.workdir.clone(),
+        // Resume: the mode was validated when its prompt was accepted.
+        None,
     )
     .await
     .ok()

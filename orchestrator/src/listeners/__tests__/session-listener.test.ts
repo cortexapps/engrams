@@ -635,6 +635,43 @@ describe("SessionListener", () => {
     expect(rec.events.map((ev) => ev.idx)).toEqual([0n, 1n]);
   });
 
+  test("idx-less chunk frames interleaved with durable frames do not reconnect; the cursor ends at the last durable idx", async () => {
+    // ADR 0108 B: only kind === "lagged" takes the lag path. Ephemeral
+    // agent_message_chunk frames are idx-less too — an old coordinator
+    // ignores durableOnly and still sends them (deploy skew) — and they
+    // must be skipped in place. The pre-fix listener treated each as lag
+    // and reconnected ~5/s for the whole of every generation.
+    const rec = recordingConsumer();
+    const cursors = makeInMemoryCursorStore();
+    let opens = 0;
+    const chunk = (): WireEvent => ({
+      kind: "agent_message_chunk",
+      payloadJson: "{}",
+    });
+    const subject = await listener({
+      cursorStore: cursors,
+      openStream: async () => {
+        opens++;
+        return opened([
+          chunk(),
+          event(0n),
+          chunk(),
+          chunk(),
+          event(1n),
+          chunk(),
+          terminal(2n),
+        ]);
+      },
+    }, [rec.consumer], cursors);
+
+    await subject.run();
+
+    expect(opens).toBe(1); // no chunk closed the stream or forced a reconnect
+    expect(rec.events.map((ev) => ev.idx)).toEqual([0n, 1n]);
+    expect(rec.terminals).toEqual(["completed"]);
+    expect(await cursors.get("session-1", "consumer")).toBe(1n);
+  });
+
   test("terminal drains queues, calls onTerminal, marks terminal, releases, and exits", async () => {
     const rec = recordingConsumer();
     const base = await acquiredLease();
