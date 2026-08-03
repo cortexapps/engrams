@@ -1651,7 +1651,29 @@ async fn handle_request(
         }
         NbdCommand::Write => {
             let data = write_data.unwrap_or_default();
-            match backend.write(req.offset, &data).await {
+            // ADR 0110 rollout gate (tradeoff 1). `backend.write` now
+            // completes a `pwrite` into the dirty file BEFORE it acks,
+            // where the RAM map only touched memory. Under memory
+            // pressure the kernel can throttle that `pwrite` into
+            // writeback, which the RAM map never did — so this is the one
+            // latency the honesty newly puts on the guest's critical path.
+            //
+            // Two clock reads and one bucket increment, against a write
+            // that may materialize a whole 16 MiB chunk: the measurement
+            // is far below the noise floor of the thing it measures.
+            //
+            // `metrics_now` is the sanctioned monotonic carve-out for
+            // data-plane histograms (ADR 0098 D1); a raw `Instant::now`
+            // is a hard clippy error in this crate.
+            let started = crate::time_source::metrics_now();
+            let outcome = backend.write(req.offset, &data).await;
+            ::metrics::histogram!(
+                crate::metrics::NBD_WRITE_ACK_SECONDS,
+                "outcome" => if outcome.is_ok() { "ok" } else { "eio" },
+            )
+            .record(started.elapsed().as_secs_f64());
+            ::metrics::histogram!(crate::metrics::NBD_WRITE_BYTES).record(data.len() as f64);
+            match outcome {
                 Ok(()) => (NbdReply::ok(req.handle), None),
                 Err(e) => {
                     tracing::warn!(error = %e, "NBD write failed");

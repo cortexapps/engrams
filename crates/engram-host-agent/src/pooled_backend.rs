@@ -9886,6 +9886,30 @@ impl PooledBackend {
         }
         let adopted_spool = seed_dirty.is_some();
 
+        // ADR 0110's primary rollout gate. The old and the new recovery
+        // path are both silent when they succeed, so a clean roll proves
+        // nothing on its own — this names which one actually ran.
+        //
+        // Read the shape, not one sample. The FIRST roll after the upgrade
+        // reports `spool` for every survivor, because no sandbox had a
+        // dirty file when the old binary died. Those survivors get one on
+        // reattach (the Truncate arm below), so the roll AFTER that is the
+        // first real exercise of `dirty_file`. Over a week `dirty_file`
+        // must climb while `spool` falls to zero as pre-upgrade sandboxes
+        // age out. `spool` still climbing means dirty files are not
+        // surviving the roll, which is the ADR's whole premise failing.
+        ::metrics::counter!(
+            crate::metrics::REATTACH_SEED_TOTAL,
+            "source" => if dirty_file_exists {
+                "dirty_file"
+            } else if adopted_spool {
+                "spool"
+            } else {
+                "none"
+            },
+        )
+        .increment(1);
+
         let store_arc = Arc::new(chunk_store.clone());
         let dirty_mode = if dirty_file_exists {
             crate::disk_daemon::backend::DirtyFileOpenMode::Recover

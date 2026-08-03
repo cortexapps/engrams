@@ -340,6 +340,23 @@ pub(crate) enum DirtyFileOpenMode {
     Recover,
 }
 
+/// What one extent scan found (ADR 0110). Returned rather than measured
+/// in place so the caller owns the metrics, and so the recovery tests can
+/// assert the seeded set directly instead of inferring it from a
+/// read-back.
+///
+/// `bytes` is allocated extent, which is a whole number of chunks wide: a
+/// write materializes its entire chunk, so a 4 KiB guest write reports one
+/// chunk. That is the honest figure — it is what the file holds, and what
+/// a host-agent death before ADR 0110 would have destroyed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RecoveredExtents {
+    /// Chunks marked dirty by the scan.
+    pub(crate) chunks: usize,
+    /// Bytes of allocated extent the scan walked.
+    pub(crate) bytes: u64,
+}
+
 /// File-backed guest divergence for one sandbox.
 ///
 /// One async mutex protects this whole struct. Reads, writes, claims,
@@ -394,7 +411,37 @@ impl DirtyFileTier {
             remove_on_drop: mode == DirtyFileOpenMode::Truncate,
         };
         if mode == DirtyFileOpenMode::Recover {
-            tier.recover_extents(total_bytes, chunk_size)?;
+            // ADR 0110 rollout gate. The scan is the new recovery path, and
+            // when it works it is silent — exactly like the old path it
+            // replaces. Measure it here so "the roll was clean" can be told
+            // apart from "the feature never ran": the counter proves it
+            // ran, the bytes prove what it saved, the timer proves it did
+            // not stall the survivor's resume (this runs before RECONFIGURE
+            // releases guest I/O).
+            let started = crate::time_source::metrics_now();
+            let recovered = match tier.recover_extents(total_bytes, chunk_size) {
+                Ok(recovered) => recovered,
+                Err(error) => {
+                    ::metrics::counter!(
+                        crate::metrics::DIRTY_RECOVER_TOTAL,
+                        "outcome" => "scan_failed",
+                    )
+                    .increment(1);
+                    return Err(error);
+                }
+            };
+            ::metrics::counter!(crate::metrics::DIRTY_RECOVER_TOTAL, "outcome" => "ok")
+                .increment(1);
+            ::metrics::histogram!(crate::metrics::DIRTY_RECOVERED_BYTES)
+                .record(recovered.bytes as f64);
+            ::metrics::histogram!(crate::metrics::DIRTY_RECOVER_SECONDS)
+                .record(started.elapsed().as_secs_f64());
+            tracing::info!(
+                path = %tier.path.display(),
+                chunks = recovered.chunks,
+                bytes = recovered.bytes,
+                "dirty-file recovery seeded the dirty set from allocated extents",
+            );
         }
         Ok(tier)
     }
@@ -409,9 +456,10 @@ impl DirtyFileTier {
         &mut self,
         total_bytes: u64,
         chunk_size: u64,
-    ) -> Result<(), DiskBackendError> {
+    ) -> Result<RecoveredExtents, DiskBackendError> {
         let fd = self.file.as_raw_fd();
         let mut offset = 0u64;
+        let mut recovered_bytes = 0u64;
         while offset < total_bytes {
             // SAFETY: lseek reads extent metadata from a file descriptor
             // that this tier owns. It does not access process memory.
@@ -436,6 +484,7 @@ impl DirtyFileTier {
             let data = data as u64;
             let hole = (hole as u64).min(total_bytes);
             if hole > data {
+                recovered_bytes += hole - data;
                 let first = (data / chunk_size) as usize;
                 let last = ((hole - 1) / chunk_size) as usize;
                 for chunk_idx in first..=last {
@@ -445,7 +494,10 @@ impl DirtyFileTier {
             }
             offset = hole;
         }
-        Ok(())
+        Ok(RecoveredExtents {
+            chunks: self.dirty.len(),
+            bytes: recovered_bytes,
+        })
     }
 
     fn contains(&self, chunk_idx: usize) -> bool {
