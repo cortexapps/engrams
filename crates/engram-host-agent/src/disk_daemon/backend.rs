@@ -399,6 +399,12 @@ impl DirtyFileTier {
         Ok(tier)
     }
 
+    /// Rebuild the dirty set from the file's allocated extents.
+    ///
+    /// This scan needs a filesystem that reports exact extents, which
+    /// ext4 does. Production recovery runs only on Linux hosts. APFS
+    /// reports flushed zero-fill as data, so a scan there would mark
+    /// clean chunks dirty and serve zeros where base bytes belong.
     fn recover_extents(
         &mut self,
         total_bytes: u64,
@@ -2684,6 +2690,11 @@ mod tests {
     /// Keep the dirty file when a test drops its backend.
     async fn retain_dirty_path(backend: &ChunkedDiskBackend) -> PathBuf {
         let mut tier = backend.dirty_tier.lock().await;
+        // Sync so the successor's extent scan does not depend on
+        // writeback timing. Recovery needs exact extents, which ext4
+        // gives and APFS does not (it reports flushed zero-fill as
+        // data) — so the Recover-mode tests are Linux-gated.
+        tier.file.sync_all().unwrap();
         tier.remove_on_drop = false;
         tier.path.clone()
     }
@@ -2712,8 +2723,15 @@ mod tests {
     }
 
     enum ProcessDeathState {
+        /// Dirty-file recovery needs exact extents (ext4), so these
+        /// two states are exercised on Linux only.
+        #[cfg(target_os = "linux")]
         Intact,
-        WriteAfterFlushStarted { offset: u64, bytes: Vec<u8> },
+        #[cfg(target_os = "linux")]
+        WriteAfterFlushStarted {
+            offset: u64,
+            bytes: Vec<u8>,
+        },
         Malformed,
         Spool(SpoolCrashState),
     }
@@ -2732,7 +2750,9 @@ mod tests {
     ) -> ProcessRecoveryOutcome {
         use crate::disk_daemon::spool;
 
+        #[cfg(target_os = "linux")]
         let mut interrupted_flush = None;
+        #[cfg(target_os = "linux")]
         let state = match state {
             ProcessDeathState::WriteAfterFlushStarted { offset, bytes } => {
                 interrupted_flush = Some(backend.flush_local().await.unwrap());
@@ -2742,6 +2762,7 @@ mod tests {
             state => state,
         };
         match state {
+            #[cfg(target_os = "linux")]
             ProcessDeathState::Intact => {
                 let successor_ref = backend.manifest_ref().await;
                 let dirty_path = retain_dirty_path(&backend).await;
@@ -2783,6 +2804,7 @@ mod tests {
                         None,
                     ),
                     ProcessDeathState::Spool(crash_state) => (exported_chunks, Some(crash_state)),
+                    #[cfg(target_os = "linux")]
                     ProcessDeathState::Intact
                     | ProcessDeathState::WriteAfterFlushStarted { .. } => unreachable!(),
                 };
@@ -2846,6 +2868,7 @@ mod tests {
                 };
 
                 std::fs::remove_file(dirty_path).unwrap();
+                #[cfg(target_os = "linux")]
                 drop(interrupted_flush);
                 drop(backend);
 
@@ -2878,6 +2901,7 @@ mod tests {
                     recovery,
                 }
             }
+            #[cfg(target_os = "linux")]
             ProcessDeathState::WriteAfterFlushStarted { .. } => unreachable!(),
         }
     }
@@ -2911,6 +2935,10 @@ mod tests {
     /// 2026-07-16 session-85e0298a RCA: every acked write must remain
     /// readable after process death, including a write that lands while
     /// an earlier flush is in progress.
+    /// Needs exact SEEK_DATA extents (ext4). APFS reports flushed
+    /// zero-fill as data, so this test runs on Linux only (the CI
+    /// Linux lane and `just test-linux engram-host-agent`).
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn acked_writes_survive_process_death_across_backends() {
         let chunk_size = 64 * 1024u64;
@@ -3077,6 +3105,10 @@ mod tests {
     }
 
     /// Recovery keeps writes in chunks that an interrupted flush claimed.
+    /// Needs exact SEEK_DATA extents (ext4). APFS reports flushed
+    /// zero-fill as data, so this test runs on Linux only (the CI
+    /// Linux lane and `just test-linux engram-host-agent`).
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn acked_writes_survive_death_with_claims_in_flight() {
         let chunk_size = 64 * 1024u64;
@@ -3122,6 +3154,10 @@ mod tests {
     }
 
     /// A verified publish removes dirty extents and keeps reads correct.
+    /// Needs exact SEEK_DATA extents (ext4). APFS reports flushed
+    /// zero-fill as data, so this test runs on Linux only (the CI
+    /// Linux lane and `just test-linux engram-host-agent`).
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn verified_publish_punches_holes_and_reads_stay_correct() {
         let chunk_size = 64 * 1024u64;
@@ -3157,6 +3193,10 @@ mod tests {
     }
 
     /// A rewrite during upload stays dirty and is published by the next flush.
+    /// Needs exact SEEK_DATA extents (ext4). APFS reports flushed
+    /// zero-fill as data, so this test runs on Linux only (the CI
+    /// Linux lane and `just test-linux engram-host-agent`).
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn chunk_rewritten_during_upload_is_not_punched_and_reuploads() {
         let chunk_size = 4096u64;
@@ -3252,6 +3292,10 @@ mod tests {
     }
 
     /// Recovery marks the whole chunk for a partial allocated extent.
+    /// Needs exact SEEK_DATA extents (ext4). APFS reports flushed
+    /// zero-fill as data, so this test runs on Linux only (the CI
+    /// Linux lane and `just test-linux engram-host-agent`).
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn extent_scan_marks_partial_extents_as_whole_chunks() {
         let chunk_size = 64 * 1024u64;
@@ -3274,6 +3318,8 @@ mod tests {
             2 * chunk_size + u64::try_from(middle).unwrap(),
         )
         .unwrap();
+        // Same APFS rule as retain_dirty_path: flush before the scan.
+        file.sync_all().unwrap();
         drop(file);
 
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().join("blob")));
