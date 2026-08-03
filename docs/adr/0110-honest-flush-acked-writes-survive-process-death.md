@@ -160,6 +160,13 @@ an in-memory flag; losing it to a crash means re-uploading a chunk to a
 content-addressed store — harmless and idempotent. No generation
 counters, no compaction machinery.
 
+**One strict rule protects the file: never delete or hole-punch dirty
+data because a publish *said* it worked.** Before punching, fetch the
+published manifest back and check it really contains the covered
+chunks — the same verify-the-occupant discipline PR #897 established.
+A publish-layer bug then costs a redundant re-upload, never the data.
+(See incident E below for why this rule exists.)
+
 ### Recovery (replaces rehydrate forensics)
 
 Successor host-agent, per surviving sandbox:
@@ -190,6 +197,122 @@ there is no longer anything to drop.
 Unchanged for the guest: it already assumes a disk that may lose
 nothing it acked. We now actually are one, across process death. Node
 death keeps power-cut semantics backed by the GCS floor, as today.
+
+## Would this have prevented the real incidents?
+
+We replayed the four most recent fixes in this area against this
+design, step by step. Four are prevented. One (E) is only partly
+covered — it is flagged, not hidden, and the rule above closes it.
+
+### A. The 2026-08-02 roll cascade (this ADR's trigger)
+
+Today:
+
+1. A deploy replaces the host-agent pod.
+2. The old process dies. The RAM dirty tier dies with it.
+3. The new process cannot reattach some disks. It quarantines them.
+4. The coordinator tries to rescue each session 3 times. Every try
+   fails the same way, because quarantine is exactly the state the
+   rescue cannot handle.
+5. It gives up and destroys the VM. The next resume rewinds the disk.
+   12 sessions in one day; 2 lost real user work.
+
+With this ADR:
+
+1. A deploy replaces the host-agent pod.
+2. The old process dies. Every acked write is already in the dirty
+   file. Nothing of value dies with the process.
+3. The new process opens the file, rebuilds its map from the file's
+   extents, and reconnects the device.
+4. There is nothing to rescue. No quarantine, no destroy, no rewind,
+   no red card.
+
+**Verdict: prevented.**
+
+### B. PR #971 — a panic in the SIGTERM shutdown ladder
+
+The bug (now patched): shutdown ran a careful ladder — flush, then
+dump leftover RAM writes to the spool file, then detach. A panic in
+the middle skipped the dump AND disconnected every disk device on the
+way down. The RAM-only writes were gone, and the successor could not
+even reconfigure the devices.
+
+With this ADR: there is no shutdown ladder for disk data. There is
+nothing the dying process must do to keep writes safe — they are
+already in the file. A panic at shutdown has nothing left to break.
+Even a wrongly disconnected device only costs the reattach, and a
+failed reattach rebuilds from the file with zero loss.
+
+**Verdict: prevented — the failing code is deleted, not fixed.**
+
+### C. PR #972 — destroy after three failed rescues
+
+The bug (now patched): the rescue retry budget was built for flaky
+failures, but quarantine fails the same way every time. After 3 tries
+the exhaustion arm destroyed the VM — the only copy of the acked
+writes.
+
+With this ADR: the ladder, the budget, and the destroy arm are all in
+the deletion list. A stuck reattach has no clock on it — the data is
+safe on disk, so the system can retry calmly forever, or rebuild the
+session from the file with nothing lost.
+
+**Verdict: prevented — this PR's machinery is literally what gets
+deleted.**
+
+### D. PR #843 — session 61a03b7e, 93 events rewound
+
+The bugs (now patched):
+
+1. A session was parked. A pod roll landed 50 seconds later.
+2. A hand-written SQL list had never learned the new `parked` state,
+   so the successor was never told to reattach that session's disk.
+3. The host's local fallback then mixed up two manifest kinds (memory
+   vs disk), failed the reattach, and threw away the spool file — the
+   only durable copy of the disk writes — as "foreign lineage."
+4. Quarantine → destroy → the resume rewound 7 minutes and 93 events.
+
+With this ADR:
+
+1. Same park, same roll.
+2. The coordinator's list no longer matters for safety. Recovery finds
+   the dirty file by sandbox id on local disk. There is no manifest
+   lookup to get wrong and no lineage gate to wrongly refuse — those
+   concepts are gone from the recovery path.
+3. Reattach succeeds. Even if it did not, the file rebuilds the disk
+   with zero loss.
+
+**Verdict: prevented — one bug becomes harmless, the other becomes
+impossible.** Honest caveat: this ADR protects the *disk*. A parked
+VM whose *memory* has not yet settled to the durable floor (ADR 0101)
+can still lose conversation state if something destroys it. Under
+this design nothing needs to destroy it — but the memory floor itself
+is ADR 0101's domain, unchanged here.
+
+### E. PR #897 — a stale manifest published as the floor. NOT fully fixed — flagged.
+
+The bug (now patched): a flush crashed halfway — after durably writing
+its manifest to the store, before updating its own memory of it.
+Later, finalize hit a "someone already published my version" conflict
+and assumed, without looking, that the occupant was its own earlier
+work. It pinned the stale manifest as the published floor. The newest
+write's only copy sat in the spool file, and the version gate refused
+it as "old." (Caught by the nightly simulator — ten failing seeds —
+never confirmed in prod.)
+
+Why this ADR alone does not fix it: the manifest/publish layer stays
+(it is our node-death floor), so a bug there can still pin a wrong
+floor. What changes: the spool and its version gate are gone, and the
+newest write lives in the dirty file instead. The loss could only
+recur if cleanup deleted the dirty file while trusting a lying publish
+result. The rule in the Design section exists precisely to close this:
+verify the published manifest actually contains the data before
+punching it out of the file. With that rule, this class degrades from
+"data loss" to "redundant re-upload."
+
+**Verdict: the #897 fix (verify the occupant) stays load-bearing and
+is NOT in the deletion list; this ADR extends the same discipline to
+dirty-file cleanup.**
 
 ## What this deletes
 
@@ -241,6 +364,14 @@ lines), extent-scan bitmap rebuild (~50), hole-punch after publish
 5. **Sparse-file semantics become load-bearing.** SEEK_DATA/SEEK_HOLE
    and PUNCH_HOLE behavior on the hostPath filesystem (ext4) must be
    covered by the test suite; both are old, stable ext4 features.
+6. **This protects the disk, not guest memory.** A VM destroyed before
+   its memory settles to the durable floor (ADR 0101) can still rewind
+   conversation state. This design removes every *reason* to destroy
+   such a VM in a hurry — the disk is safe, so recovery has no clock —
+   but the memory floor itself is out of scope here.
+7. **Publish-layer bugs remain possible** (the #897 class). The
+   verify-before-punch rule bounds their cost to a redundant re-upload
+   instead of data loss. The nightly DST oracle that caught #897 stays.
 
 ## Testing
 
