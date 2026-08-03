@@ -109,6 +109,7 @@ pub fn init(addr: SocketAddr) {
     ::metrics::counter!(CHECKPOINT_CHAIN_POISONED_TOTAL).absolute(0);
     ::metrics::counter!(SPOOL_LINEAGE_MISMATCH_TOTAL).absolute(0);
     ::metrics::counter!(SHUTDOWN_STAGE_PANIC_TOTAL).absolute(0);
+    ::metrics::counter!(CAPTURE_SHUTDOWN_STRAGGLER_TOTAL).absolute(0);
 }
 
 // ─── metric name constants ────────────────────────────────────────
@@ -311,6 +312,15 @@ pub const CHECKPOINT_EPOCH_SECONDS: &str = "engram_checkpoint_epoch_seconds";
 /// increments mean the re-chunk/persist leg is unhealthy (find out why —
 /// Fulls are expensive) but never mean data loss.
 pub const CHECKPOINT_CHAIN_POISONED_TOTAL: &str = "engram_checkpoint_chain_poisoned_total";
+
+/// 2026-08-03 `chain_poisoned` alert: a capture was still in flight when
+/// the SIGTERM ladder's capture-drain deadline fired. The process exit
+/// that follows cancels the capture's post-processing and poisons its
+/// chain (a `CHECKPOINT_CHAIN_POISONED_TOTAL` increment with
+/// `failed_step="snapshot post-processing"`). Attributes shutdown-overrun
+/// poisons; a sustained rate means the drain budget is too small for the
+/// fleet's capture sizes.
+pub const CAPTURE_SHUTDOWN_STRAGGLER_TOTAL: &str = "engram_capture_shutdown_straggler_total";
 
 /// Issue #529: an `EvictionFinalizeRecord` (+ its `disk-pending/` chunk
 /// files, when the capture had a dirty disk tier) was durably persisted
