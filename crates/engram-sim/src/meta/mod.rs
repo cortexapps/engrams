@@ -213,6 +213,11 @@ pub struct SimDb {
         engram_core::types::oauth::OAuthCredentialKey,
         engram_core::types::oauth::SealedOAuthCredential,
     >,
+    /// Advisory refresh claims (PG: `oauth_credentials.refresh_claim_until`).
+    /// Kept beside the rows because the claim is store-internal scheduling
+    /// state, not part of the domain credential type.
+    pub oauth_refresh_claims:
+        std::collections::BTreeMap<engram_core::types::oauth::OAuthCredentialKey, DateTime<Utc>>,
     pub oauth_flows: std::collections::BTreeMap<uuid::Uuid, engram_core::types::oauth::OAuthFlow>,
     pub session_oauth_bindings:
         std::collections::BTreeMap<SessionId, engram_core::types::oauth::SessionOAuthBinding>,

@@ -680,9 +680,10 @@ rebuild it.
   off the connector now: the profile is the org default (`is_default`), and the
   system-prompt flavor is a constant on the Slack `CommunicationPolicy`. A connector
   can back many triggers, so a per-connector `trigger` facet would not generalize.
-- **Single-workspace for v1.** The connector resolves one `slack.bot_token`. Multi-
-  workspace (a per-`team_id` token) is a real future extension — the OAuth
-  `tokenSecretRef` is a single ref today.
+- **Single-workspace for v1.** *(Amended 2026-08-03: the single-`tokenSecretRef`
+  limitation is retired — connector OAuth tokens live in the ADR 0106 credential
+  store keyed by the integration-connection id, so a second workspace is a second
+  connection row plus a second credential row, no schema change.)*
 
 ## Security & authz
 

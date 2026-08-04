@@ -2330,6 +2330,7 @@ async fn oauth_credential_and_flow(ctx: &Ctx) {
             workspace_id: None,
             workspace_name: None,
         },
+        expires_at: None,
     };
 
     let first = ctx
@@ -2360,7 +2361,7 @@ async fn oauth_credential_and_flow(ctx: &Ctx) {
 
     let other_subject = ctx
         .meta
-        .list_oauth_credentials(OAuthSubjectKind::User, "user-b")
+        .list_oauth_credentials(OAuthSubjectKind::User, Some("user-b"))
         .await
         .unwrap();
     assert!(
@@ -2369,7 +2370,7 @@ async fn oauth_credential_and_flow(ctx: &Ctx) {
     );
     let listed = ctx
         .meta
-        .list_oauth_credentials(OAuthSubjectKind::User, "user-a")
+        .list_oauth_credentials(OAuthSubjectKind::User, Some("user-a"))
         .await
         .unwrap();
     assert_eq!(listed.len(), 1);
@@ -2498,11 +2499,378 @@ async fn oauth_credential_and_flow(ctx: &Ctx) {
     assert!(ctx.meta.get_oauth_flow(expires_id).await.unwrap().is_none());
 }
 
+/// ADR 0106 addendum (connector OAuth): refresh scheduling, advisory claims,
+/// the version-fenced broken mark, publish-clears-repair, and the unowned
+/// redirect-flow finish behave identically in PG and SimMeta.
+async fn oauth_refresh_scheduling(ctx: &Ctx) {
+    use engram_core::types::oauth::{
+        NewSealedOAuthCredential, OAuthAccountMetadata, OAuthCredentialKey, OAuthCredentialStatus,
+        OAuthFlow, OAuthFlowStatus, OAuthSubjectKind,
+    };
+
+    let key_for = |provider: &str| OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::Connector,
+        subject_id: "conn-default".into(),
+        provider: provider.into(),
+    };
+    let candidate = |key: &OAuthCredentialKey,
+                     expires_at: Option<chrono::DateTime<chrono::Utc>>| {
+        NewSealedOAuthCredential {
+            key: key.clone(),
+            wrapped_dek: vec![7; 32],
+            nonce: vec![7; 12],
+            ciphertext: vec![7; 8],
+            key_id: "test-kek".into(),
+            metadata: OAuthAccountMetadata {
+                account_id: "workspace-1".into(),
+                display_name: Some("Workspace".into()),
+                plan_type: None,
+                workspace_id: Some("workspace-1".into()),
+                workspace_name: Some("Acme".into()),
+            },
+            expires_at,
+        }
+    };
+
+    let now = ctx.clock.now_utc();
+    let linear = key_for("linear");
+    let slack = key_for("slack");
+    let later = key_for("later");
+    let user_key = OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::User,
+        subject_id: "user-a".into(),
+        provider: "openai-codex".into(),
+    };
+
+    // An expiring row, a non-expiring row, a row expiring later, and a row of
+    // a DIFFERENT subject kind that must never surface in a connector sweep.
+    let row = ctx
+        .meta
+        .put_oauth_credential(
+            candidate(&linear, Some(now + chrono::Duration::hours(1))),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.expires_at, Some(now + chrono::Duration::hours(1)));
+    assert_eq!(row.status(now), OAuthCredentialStatus::Connected);
+    ctx.meta
+        .put_oauth_credential(candidate(&slack, None), None)
+        .await
+        .unwrap();
+    ctx.meta
+        .put_oauth_credential(
+            candidate(&later, Some(now + chrono::Duration::hours(2))),
+            None,
+        )
+        .await
+        .unwrap();
+    ctx.meta
+        .put_oauth_credential(
+            candidate(&user_key, Some(now + chrono::Duration::hours(1))),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let horizon = now + chrono::Duration::hours(6);
+    let due = ctx
+        .meta
+        .list_oauth_credentials_due_for_refresh(OAuthSubjectKind::Connector, now, horizon, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        due.iter()
+            .map(|r| r.key.provider.as_str())
+            .collect::<Vec<_>>(),
+        vec!["linear", "later"],
+        "expiring connector rows only, ordered by expiry; non-expiring and \
+         other-kind rows never surface"
+    );
+    let limited = ctx
+        .meta
+        .list_oauth_credentials_due_for_refresh(OAuthSubjectKind::Connector, now, horizon, 1)
+        .await
+        .unwrap();
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].key.provider, "linear");
+
+    // Kind-wide listing (subject_id = None): every connector credential in one
+    // call — the status surface's read — and never another kind's rows.
+    let all_connector = ctx
+        .meta
+        .list_oauth_credentials(OAuthSubjectKind::Connector, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        all_connector
+            .iter()
+            .map(|r| r.key.provider.as_str())
+            .collect::<Vec<_>>(),
+        vec!["later", "linear", "slack"],
+        "ordered by subject then provider; the user-kind row never surfaces"
+    );
+
+    // Same-second expiries: the (expires_at, subject_id, provider) tie-break
+    // must pick the SAME subset under LIMIT on both stores. "aaa-first" ties
+    // with "linear" on expiry but sorts ahead by subject id.
+    let tied = OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::Connector,
+        subject_id: "aaa-first".into(),
+        provider: "zzz".into(),
+    };
+    ctx.meta
+        .put_oauth_credential(
+            candidate(&tied, Some(now + chrono::Duration::hours(1))),
+            None,
+        )
+        .await
+        .unwrap();
+    let tie_limited = ctx
+        .meta
+        .list_oauth_credentials_due_for_refresh(OAuthSubjectKind::Connector, now, horizon, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        tie_limited
+            .iter()
+            .map(|r| (r.key.subject_id.as_str(), r.key.provider.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("aaa-first", "zzz"), ("conn-default", "linear")],
+    );
+    ctx.meta
+        .revoke_oauth_credential(&tied, tie_limited[0].version)
+        .await
+        .unwrap();
+
+    // Advisory claim: first caller wins, second loses, a lapsed claim is
+    // retaken, and a claimed row leaves the due list until the claim lapses.
+    let until = now + chrono::Duration::minutes(5);
+    assert!(ctx
+        .meta
+        .claim_oauth_refresh(&linear, now, until)
+        .await
+        .unwrap());
+    assert!(!ctx
+        .meta
+        .claim_oauth_refresh(&linear, now, until)
+        .await
+        .unwrap());
+    let due = ctx
+        .meta
+        .list_oauth_credentials_due_for_refresh(OAuthSubjectKind::Connector, now, horizon, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        due.iter()
+            .map(|r| r.key.provider.as_str())
+            .collect::<Vec<_>>(),
+        vec!["later"]
+    );
+    ctx.clock.advance(Duration::from_secs(6 * 60));
+    let after_lapse = ctx.clock.now_utc();
+    assert!(ctx
+        .meta
+        .claim_oauth_refresh(
+            &linear,
+            after_lapse,
+            after_lapse + chrono::Duration::minutes(5)
+        )
+        .await
+        .unwrap());
+    assert!(matches!(
+        ctx.meta
+            .claim_oauth_refresh(&key_for("absent"), after_lapse, until)
+            .await,
+        Ok(false)
+    ));
+
+    // Version-fenced broken mark: a moved version means a concurrent refresh
+    // won — Conflict, reload the winner, never declare the row dead.
+    let winner = ctx
+        .meta
+        .put_oauth_credential(
+            candidate(&linear, Some(after_lapse + chrono::Duration::hours(24))),
+            Some(row.version),
+        )
+        .await
+        .unwrap();
+    assert_eq!(winner.version, row.version + 1);
+    assert!(matches!(
+        ctx.meta
+            .mark_oauth_credential_broken(&linear, row.version, "invalid_grant")
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+    assert!(matches!(
+        ctx.meta
+            .mark_oauth_credential_broken(&key_for("absent"), 1, "invalid_grant")
+            .await,
+        Err(MetaError::NotFound)
+    ));
+    let broken = ctx
+        .meta
+        .mark_oauth_credential_broken(&linear, winner.version, "invalid_grant")
+        .await
+        .unwrap();
+    assert_eq!(
+        broken.version, winner.version,
+        "the mark is not a bundle write"
+    );
+    assert!(broken.broken_at.is_some());
+    assert_eq!(broken.broken_reason.as_deref(), Some("invalid_grant"));
+    assert_eq!(
+        broken.status(ctx.clock.now_utc()),
+        OAuthCredentialStatus::Broken
+    );
+    assert!(matches!(
+        ctx.meta
+            .mark_oauth_credential_broken(&linear, winner.version, "invalid_grant")
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+
+    // Broken rows leave the due list AND refuse claims; a successful publish
+    // (reconnect) clears the mark and the claim in the same write.
+    let broken_now = ctx.clock.now_utc();
+    let due = ctx
+        .meta
+        .list_oauth_credentials_due_for_refresh(
+            OAuthSubjectKind::Connector,
+            broken_now,
+            broken_now + chrono::Duration::hours(48),
+            10,
+        )
+        .await
+        .unwrap();
+    assert!(!due.iter().any(|r| r.key.provider == "linear"));
+    assert!(!ctx
+        .meta
+        .claim_oauth_refresh(
+            &linear,
+            broken_now,
+            broken_now + chrono::Duration::minutes(5)
+        )
+        .await
+        .unwrap());
+    let repaired = ctx
+        .meta
+        .put_oauth_credential(
+            candidate(&linear, Some(broken_now + chrono::Duration::hours(24))),
+            Some(broken.version),
+        )
+        .await
+        .unwrap();
+    assert!(repaired.broken_at.is_none());
+    assert!(repaired.broken_reason.is_none());
+    assert_eq!(
+        repaired.status(broken_now),
+        OAuthCredentialStatus::Connected
+    );
+    assert!(ctx
+        .meta
+        .claim_oauth_refresh(
+            &linear,
+            broken_now,
+            broken_now + chrono::Duration::minutes(5)
+        )
+        .await
+        .unwrap());
+
+    // Unowned finish: any replica may complete a pending, unexpired redirect
+    // flow; the pending→terminal transition is the fence.
+    let flow_now = ctx.clock.now_utc();
+    let flow_id = uuid::Uuid::parse_str("10600000-0000-4000-8000-000000000011").unwrap();
+    ctx.meta
+        .create_oauth_flow(OAuthFlow {
+            id: flow_id,
+            key: linear.clone(),
+            owner_replica: "replica-a".into(),
+            lease_expires_at: flow_now + chrono::Duration::minutes(10),
+            expires_at: flow_now + chrono::Duration::minutes(10),
+            status: OAuthFlowStatus::Pending,
+            error_code: None,
+            created_at: flow_now,
+            updated_at: flow_now,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        ctx.meta
+            .finish_oauth_flow_unowned(flow_id, OAuthFlowStatus::Pending, None)
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+    // The pending flow is findable by key (redirect begin cancels stale
+    // attempts through this) and other keys see nothing.
+    let pending = ctx.meta.get_pending_oauth_flow(&linear).await.unwrap();
+    assert_eq!(pending.map(|f| f.id), Some(flow_id));
+    assert!(ctx
+        .meta
+        .get_pending_oauth_flow(&key_for("absent"))
+        .await
+        .unwrap()
+        .is_none());
+    ctx.meta
+        .finish_oauth_flow_unowned(flow_id, OAuthFlowStatus::Succeeded, None)
+        .await
+        .unwrap();
+    assert!(
+        ctx.meta
+            .get_pending_oauth_flow(&linear)
+            .await
+            .unwrap()
+            .is_none(),
+        "a finished flow is no longer pending"
+    );
+    assert!(matches!(
+        ctx.meta
+            .finish_oauth_flow_unowned(flow_id, OAuthFlowStatus::Cancelled, None)
+            .await,
+        Err(MetaError::Conflict(_)),
+    ));
+    assert!(matches!(
+        ctx.meta
+            .finish_oauth_flow_unowned(
+                uuid::Uuid::parse_str("10600000-0000-4000-8000-000000000012").unwrap(),
+                OAuthFlowStatus::Succeeded,
+                None,
+            )
+            .await,
+        Err(MetaError::NotFound)
+    ));
+
+    let expired_id = uuid::Uuid::parse_str("10600000-0000-4000-8000-000000000013").unwrap();
+    let expired_now = ctx.clock.now_utc();
+    ctx.meta
+        .create_oauth_flow(OAuthFlow {
+            id: expired_id,
+            key: key_for("slack"),
+            owner_replica: "replica-a".into(),
+            lease_expires_at: expired_now + chrono::Duration::minutes(10),
+            expires_at: expired_now + chrono::Duration::seconds(5),
+            status: OAuthFlowStatus::Pending,
+            error_code: None,
+            created_at: expired_now,
+            updated_at: expired_now,
+        })
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(6));
+    assert!(matches!(
+        ctx.meta
+            .finish_oauth_flow_unowned(expired_id, OAuthFlowStatus::Succeeded, None)
+            .await,
+        Err(MetaError::Conflict(_)),
+    ));
+}
+
 conformance!(t_broker_token_flow, super::broker_token_flow);
 conformance!(
     t_oauth_credential_and_flow,
     super::oauth_credential_and_flow
 );
+conformance!(t_oauth_refresh_scheduling, super::oauth_refresh_scheduling);
 conformance!(
     t_parked_lifecycle_and_eviction_settle,
     super::parked_lifecycle_and_eviction_settle

@@ -30,6 +30,24 @@ export const listCredentials = OAuthCredentialService.method.listCredentials;
 export const disconnect = OAuthCredentialService.method.disconnect;
 
 /**
+ * Authorization-code (redirect) flow family for connector subjects. The
+ * spec is derived from the connector's oauth facet by the orchestrator,
+ * which enforced host containment at the connector parse boundary; the
+ * coordinator re-checks shape only and is the sole tier that resolves the
+ * client-credential org secrets. The returned flow id doubles as the OAuth
+ * `state` parameter: the durable flow row is the CSRF state, valid on any
+ * replica.
+ *
+ * @generated from rpc engram.app.v1.OAuthCredentialService.BeginRedirectFlow
+ */
+export const beginRedirectFlow = OAuthCredentialService.method.beginRedirectFlow;
+
+/**
+ * @generated from rpc engram.app.v1.OAuthCredentialService.CompleteRedirectFlow
+ */
+export const completeRedirectFlow = OAuthCredentialService.method.completeRedirectFlow;
+
+/**
  * Internal credential-control operations. Callers must additionally present
  * the session's broker token; the coordinator derives subject/provider from
  * the session binding and never accepts them from the harness.

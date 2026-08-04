@@ -16,6 +16,7 @@
 
 import { loadRegistry, type Connector } from "../connectors/registry.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
+import { makeIntegrationConnectionStore } from "../db/integration-connections.ts";
 import { getDb } from "../db/client.ts";
 import { integrationOp as defaultIntegrationOp } from "../control-plane/client.ts";
 import { CredentialSpecSchema } from "../gen/engram/app/v1/integration_op_pb.ts";
@@ -31,6 +32,14 @@ export type IntegrationOpClient = Pick<
 export interface RunOpDeps {
   connectors?: { list(): Promise<ReadonlyArray<{ provider: string; config: unknown }>> };
   integrationOp?: IntegrationOpClient;
+  /** Resolve the provider's default connection id (the OAuth credential
+   * subject, ADR 0106 addendum). Overridable for tests. */
+  connectionIdFor?: (provider: string, displayName: string) => Promise<string>;
+}
+
+async function defaultConnectionIdFor(provider: string, displayName: string): Promise<string> {
+  const row = await makeIntegrationConnectionStore(getDb()).ensureDefault(provider, displayName);
+  return row.id;
 }
 
 /** A request to issue against an integration's host (the credential is added
@@ -53,19 +62,29 @@ export interface IntegrationOpResult {
 }
 
 /** Compile a connector's credential block into the wire CredentialSpec. The
- * coordinator is connector-agnostic — it resolves from exactly this. */
-function credentialSpec(c: Connector): MessageInitShape<typeof CredentialSpecSchema> {
+ * coordinator is connector-agnostic — it resolves from exactly this. An
+ * oauth-facet connector carries its sealed-store connection id (ADR 0106
+ * addendum): the coordinator resolves + refreshes the access token and Mode B
+ * returns it with a real `expires_at` for the SDK cache. */
+async function credentialSpec(
+  c: Connector,
+  deps?: RunOpDeps,
+): Promise<MessageInitShape<typeof CredentialSpecSchema>> {
   if (c.credential.source === "mint") {
     // The coordinator resolves the mint engine by PROVIDER id (not the kind).
     return { source: "mint", mintProvider: c.provider, injects: [] };
   }
+  const connectionIdFor = deps?.connectionIdFor ?? defaultConnectionIdFor;
   return {
     source: "inject",
     mintProvider: "",
+    oauthConnectionId: c.oauth
+      ? await connectionIdFor(c.provider, `${c.display.name} (default)`)
+      : "",
     injects: c.credential.injects.map((i) => ({
       header: i.header,
       template: i.template ?? "{}",
-      secretRef: i.secretRef,
+      secretRef: i.secretRef ?? "",
     })),
   };
 }
@@ -100,7 +119,7 @@ export async function runIntegrationOp(
     path: req.path,
     body,
     contentType: req.contentType ?? "",
-    credential: credentialSpec(c),
+    credential: await credentialSpec(c, deps),
   });
   return {
     status: resp.status,
@@ -122,7 +141,7 @@ export async function resolveIntegrationCredential(
   const c = await resolveConnector(provider, deps);
   const resp = await client.resolveIntegrationCredential({
     provider,
-    credential: credentialSpec(c),
+    credential: await credentialSpec(c, deps),
   });
   if (!resp.credential) throw new Error(`no credential resolved for "${provider}"`);
   return resp.credential;

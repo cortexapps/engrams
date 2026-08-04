@@ -12,6 +12,7 @@ use tonic::{Code, Request, Response, Status};
 
 use super::auth;
 use crate::oauth::{OAuthServiceError, MAX_OAUTH_BUNDLE_BYTES};
+use crate::oauth_redirect::{RedirectMetadataProbe, RedirectMetadataSpec, RedirectOauthSpec};
 use crate::state::SharedState;
 
 pub struct AppOAuthCredentialService {
@@ -61,11 +62,18 @@ fn flow_to_proto(flow: OAuthFlow) -> app::OAuthFlow {
     }
 }
 
-fn credential_to_proto(row: SealedOAuthCredential) -> app::OAuthCredentialMeta {
+fn credential_to_proto(
+    row: SealedOAuthCredential,
+    now: chrono::DateTime<chrono::Utc>,
+) -> app::OAuthCredentialMeta {
+    let status = row.status(now).as_str().to_string();
     app::OAuthCredentialMeta {
         provider: row.key.provider,
         version: row.version,
         connected: row.revoked_at.is_none(),
+        status,
+        expires_at: row.expires_at.map(|at| at.to_rfc3339()).unwrap_or_default(),
+        subject_id: row.key.subject_id,
         account: Some(app::OAuthAccountMetadata {
             display_name: row.metadata.display_name,
             plan_type: row.metadata.plan_type,
@@ -75,6 +83,33 @@ fn credential_to_proto(row: SealedOAuthCredential) -> app::OAuthCredentialMeta {
         created_at: row.created_at.to_rfc3339(),
         updated_at: row.updated_at.to_rfc3339(),
     }
+}
+
+fn redirect_spec_from_proto(
+    spec: Option<app::RedirectOauthSpec>,
+) -> Result<RedirectOauthSpec, &'static str> {
+    let spec = spec.ok_or("spec is required")?;
+    let metadata = spec.metadata.unwrap_or_default();
+    Ok(RedirectOauthSpec {
+        authorize_url: spec.authorize_url,
+        token_url: spec.token_url,
+        scopes: spec.scopes,
+        scope_delimiter: spec.scope_delimiter,
+        extra_authorize_params: spec.extra_authorize_params.into_iter().collect(),
+        client_id_ref: spec.client_id_ref,
+        client_secret_ref: spec.client_secret_ref,
+        pkce: spec.pkce,
+        metadata: RedirectMetadataSpec {
+            from_token_response: metadata.from_token_response.into_iter().collect(),
+            probe: metadata.probe.map(|probe| RedirectMetadataProbe {
+                method: probe.method,
+                host: probe.host,
+                path: probe.path,
+                body: probe.body,
+                map: probe.map.into_iter().collect(),
+            }),
+        },
+    })
 }
 
 fn oauth_status(error: OAuthServiceError) -> Status {
@@ -189,21 +224,90 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
         }))
     }
 
+    async fn begin_redirect_flow(
+        &self,
+        req: Request<app::BeginRedirectFlowRequest>,
+    ) -> Result<Response<app::BeginRedirectFlowResponse>, Status> {
+        self.auth.check(&req)?;
+        let req = req.into_inner();
+        let spec = redirect_spec_from_proto(req.spec).map_err(Status::invalid_argument)?;
+        let begun = self
+            .state
+            .oauth
+            .begin_redirect(
+                key(req.subject, req.provider).map_err(Status::invalid_argument)?,
+                &spec,
+                &req.redirect_uri,
+            )
+            .await
+            .map_err(oauth_status)?;
+        Ok(Response::new(app::BeginRedirectFlowResponse {
+            flow: Some(flow_to_proto(begun.flow)),
+            authorize_url: begun.authorize_url,
+        }))
+    }
+
+    async fn complete_redirect_flow(
+        &self,
+        req: Request<app::CompleteRedirectFlowRequest>,
+    ) -> Result<Response<app::CompleteRedirectFlowResponse>, Status> {
+        self.auth.check(&req)?;
+        let req = req.into_inner();
+        let spec = redirect_spec_from_proto(req.spec).map_err(Status::invalid_argument)?;
+        let flow_id = req
+            .flow_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("malformed flow id"))?;
+        let row = self
+            .state
+            .oauth
+            .complete_redirect(
+                key(req.subject, req.provider).map_err(Status::invalid_argument)?,
+                flow_id,
+                &req.code,
+                &req.redirect_uri,
+                &spec,
+            )
+            .await
+            .map_err(oauth_status)?;
+        Ok(Response::new(app::CompleteRedirectFlowResponse {
+            credential: Some(credential_to_proto(
+                row,
+                self.state.services.clock.now_utc(),
+            )),
+        }))
+    }
+
     async fn list_credentials(
         &self,
         req: Request<app::ListCredentialsRequest>,
     ) -> Result<Response<app::ListCredentialsResponse>, Status> {
         self.auth.check(&req)?;
-        let (kind, id) =
-            subject_from_proto(req.into_inner().subject).map_err(Status::invalid_argument)?;
+        // An EMPTY subject id lists every credential of the kind (the
+        // connector status surface); a set id scopes to one subject.
+        let subject = req
+            .into_inner()
+            .subject
+            .ok_or_else(|| Status::invalid_argument("subject is required"))?;
+        let kind = match app::OauthSubjectKind::try_from(subject.kind) {
+            Ok(app::OauthSubjectKind::User) => OAuthSubjectKind::User,
+            Ok(app::OauthSubjectKind::Connector) => OAuthSubjectKind::Connector,
+            Ok(app::OauthSubjectKind::Mcp) => OAuthSubjectKind::Mcp,
+            _ => return Err(Status::invalid_argument("subject kind is required")),
+        };
+        let id = subject.id.trim();
         let credentials = self
             .state
             .oauth
-            .list(kind, &id)
+            .list(kind, (!id.is_empty()).then_some(id))
             .await
             .map_err(oauth_status)?;
+        let now = self.state.services.clock.now_utc();
         Ok(Response::new(app::ListCredentialsResponse {
-            credentials: credentials.into_iter().map(credential_to_proto).collect(),
+            credentials: credentials
+                .into_iter()
+                .map(|row| credential_to_proto(row, now))
+                .collect(),
         }))
     }
 
@@ -223,7 +327,10 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             .await
             .map_err(oauth_status)?;
         Ok(Response::new(app::DisconnectResponse {
-            credential: Some(credential_to_proto(row)),
+            credential: Some(credential_to_proto(
+                row,
+                self.state.services.clock.now_utc(),
+            )),
         }))
     }
 

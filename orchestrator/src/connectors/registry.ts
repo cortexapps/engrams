@@ -38,10 +38,13 @@ import { join } from "node:path";
 // ---------------------------------------------------------------------------
 
 /** One injected auth header. `{}` in `template` is replaced by the resolved
- * secret value host-side (e.g. `"Bearer {}"`, default `"{}"`). */
+ * secret value host-side (e.g. `"Bearer {}"`, default `"{}"`). `secretRef` names
+ * the org secret for a static connector; on an oauth-facet connector it is
+ * ABSENT — the value is the connector's OAuth access token, resolved and
+ * refreshed from the coordinator's sealed credential store (ADR 0106 addendum). */
 export interface InjectHeader {
   header: string;
-  secretRef: string;
+  secretRef?: string;
   template?: string;
 }
 /** ADR 0058: a connector may inject ONE OR MORE headers. Most need one (e.g.
@@ -219,25 +222,42 @@ export interface CliFacet {
 export interface ConnectorTest {
   /** Probe path, must start with `/` (e.g. `/api/v1/dashboard`). */
   path: string;
+  /** Probe method; default GET. POST for GraphQL-only endpoints (Linear). */
+  method?: "GET" | "POST";
+  /** Probe request body (JSON), for POST probes. Bounded. */
+  body?: string;
 }
 
 /**
- * OAuth 2.0 authorization-code acquisition (the "Add to Slack" button). The
- * credential the connector injects (`credential.injects[*].secretRef`) is NOT
- * entered by hand — it's obtained by an admin consenting to an OAuth flow and
- * written to the org secret store as `tokenSecretRef`. The app's own credentials
- * (`clientIdRef` / `clientSecretRef`) are admin-entered org secrets (BYO app). The
- * coordinator (the only tier that can read org secrets) builds the authorize URL +
- * runs the code→token exchange; the orchestrator owns the browser redirect.
+ * OAuth 2.0 authorization-code acquisition (the "Add to Slack" button, "Connect
+ * Linear"). ADR 0106 addendum: an oauth-facet connector is **OAuth-only** — the
+ * obtained tokens (access AND rotating refresh) live in the coordinator's sealed
+ * credential store keyed by the connection, never as an org secret, and the
+ * platform refreshes them proactively. The app's own credentials (`clientIdRef` /
+ * `clientSecretRef`) remain admin-entered org secrets (BYO app). The coordinator
+ * (the only tier that can read org secrets) builds the authorize URL + runs the
+ * code→token exchange; the orchestrator owns the browser redirect, with the
+ * durable coordinator flow row as the CSRF state.
  *
- * `authorizeUrl` / `tokenUrl` hosts must be within the connector's `hosts` (the
- * same egress-trust boundary) so an admin-authored connector can't exfil the
- * client secret to an arbitrary host.
+ * `tokenUrl`'s host must be within the connector's `hosts` (the egress-trust
+ * boundary — it receives the client secret). `authorizeUrl` may instead sit on
+ * `acquisitionHosts`: hosts used only by the admin's browser redirect (e.g.
+ * Linear authorizes on `linear.app` while the API lives on `api.linear.app`),
+ * NEVER compiled into the session egress policy.
  */
 export interface OauthFacet {
   authorizeUrl: string;
+  /** Authorize-only hosts (browser redirect surface). Never opened to sessions. */
+  acquisitionHosts?: string[];
   tokenUrl: string;
   scopes: string[];
+  /** Scope-join delimiter; defaults to `,` (Slack, Linear). */
+  scopeDelimiter?: "," | " ";
+  /** Bounded provider extras appended to the authorize URL (e.g. Linear
+   * `actor: "app"`). Standard OAuth parameter names are rejected. */
+  extraAuthorizeParams?: Record<string, string>;
+  /** PKCE (S256). Off by default; confidential clients don't need it. */
+  pkce?: boolean;
   /** Org secret holding the OAuth app's client id (public, but admin-managed). */
   clientIdRef: string;
   /** Org secret holding the OAuth app's client secret. */
@@ -246,11 +266,28 @@ export interface OauthFacet {
    * inbound webhooks with one (ADR 0060 Slack triggers). Admin-entered like the client
    * creds; absent for providers without an inbound webhook surface. */
   signingSecretRef?: string;
-  /** Org secret the obtained access token is written to (the injected credential). */
-  tokenSecretRef: string;
-  /** Top-level field of the token response holding the access token (e.g.
-   * `access_token`; a leading `$.` is tolerated). */
-  tokenResponsePath: string;
+  /** Declarative account-metadata extraction — no per-provider server code. */
+  metadata?: OauthMetadataSpec;
+}
+
+/** Recognized metadata fields; `accountId` feeds account-switch rejection. */
+export type OauthMetadataField = "accountId" | "displayName" | "workspaceId" | "workspaceName";
+
+export interface OauthMetadataSpec {
+  /** Field → bounded dot-path into the token response JSON (Slack: `team.id`). */
+  fromTokenResponse?: Partial<Record<OauthMetadataField, string>>;
+  /** One bounded "who am I" request against a connector host, authenticated with
+   * the fresh access token (Linear: GraphQL `viewer`). */
+  probe?: OauthMetadataProbe;
+}
+
+export interface OauthMetadataProbe {
+  method?: "GET" | "POST";
+  /** Must be one of the connector's `hosts`; defaults to `hosts[0]`. */
+  host?: string;
+  path: string;
+  body?: string;
+  map: Partial<Record<OauthMetadataField, string>>;
 }
 
 export type WebhookVerificationScheme =
@@ -309,12 +346,23 @@ export interface Connector {
 /** One Plane-B injection, snake_case to match the Rust serde shape. */
 /** Externally-tagged to match the Rust serde shape — the enum also crosses
  * the coord ↔ host bincode wire, which cannot decode a `kind`-tagged form. */
-export type CredentialMintSourceJson = {
-  connection: {
-    connection_id: string;
-    provider: string;
-  };
-};
+/** The brokered-source union, snake_case + externally tagged to match the Rust
+ * serde shape (`CredentialMintSource`, wire v24). */
+export type CredentialMintSourceJson =
+  | {
+      connection: {
+        connection_id: string;
+        provider: string;
+      };
+    }
+  | {
+      /** ADR 0106 addendum: a connector OAuth token resolved from the sealed
+       * credential store (subject = the connection id), refreshed there. */
+      oauth_connector: {
+        connection_id: string;
+        provider: string;
+      };
+    };
 
 export interface IntegrationInjectJson {
   hosts: string[];
@@ -710,17 +758,54 @@ function parseCli(where: string, raw: unknown): CliFacet {
 }
 
 const MAX_OAUTH_SCOPES = 50;
+const MAX_OAUTH_EXTRA_PARAMS = 16;
+const MAX_OAUTH_PARAM_LENGTH = 200;
+const MAX_OAUTH_PROBE_BODY = 4096;
+const MAX_OAUTH_ACQUISITION_HOSTS = 4;
+const MAX_OAUTH_METADATA_PATH_SEGMENTS = 8;
 /** An org-secret ref: non-empty, no whitespace (matches the inject secretRef rule). */
 const SECRET_REF_RE = /^\S+$/;
+/** Parameters the flow machinery owns; a facet may not override them. */
+const RESERVED_OAUTH_PARAMS = new Set([
+  "client_id",
+  "client_secret",
+  "redirect_uri",
+  "state",
+  "scope",
+  "response_type",
+  "grant_type",
+  "code",
+  "code_challenge",
+  "code_challenge_method",
+  "code_verifier",
+]);
+const OAUTH_METADATA_FIELDS: ReadonlySet<string> = new Set([
+  "accountId",
+  "displayName",
+  "workspaceId",
+  "workspaceName",
+]);
+const OAUTH_METADATA_SEGMENT_RE = /^[A-Za-z0-9_]{1,64}$/;
 
-/** Validate the OAuth acquisition facet (admin-trust boundary). `hosts` is the
- * connector's host allow-list — the authorize/token URLs must resolve to one of
- * them, so an admin-authored connector can't ship the client secret elsewhere. */
+/** Validate the OAuth acquisition facet (admin-trust boundary). `tokenUrl` must
+ * resolve to one of the connector's `hosts` (it receives the client secret, so an
+ * admin-authored connector can't ship it elsewhere); `authorizeUrl` may instead
+ * sit on the facet's own `acquisitionHosts` — a browser-redirect surface that is
+ * never compiled into the session egress policy. */
 function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
   if (typeof raw !== "object" || raw === null) fail(where, '"oauth" must be an object');
   const o = raw as Record<string, unknown>;
 
-  const httpsUrlOnHost = (field: string, v: unknown): string => {
+  let acquisitionHosts: string[] | undefined;
+  if (o.acquisitionHosts !== undefined) {
+    acquisitionHosts = asStringArray(`${where} oauth`, "acquisitionHosts", o.acquisitionHosts);
+    if (acquisitionHosts.length > MAX_OAUTH_ACQUISITION_HOSTS) {
+      fail(where, `"oauth.acquisitionHosts" has ${acquisitionHosts.length} entries (max ${MAX_OAUTH_ACQUISITION_HOSTS})`);
+    }
+    for (const h of acquisitionHosts) assertHost(where, h);
+  }
+
+  const httpsUrlOn = (field: string, v: unknown, allowed: string[]): string => {
     if (typeof v !== "string" || !v) fail(where, `"oauth.${field}" must be a non-empty string`);
     if (/[\s\r\n]/.test(v as string)) fail(where, `"oauth.${field}" must not contain whitespace`);
     let url: URL;
@@ -730,14 +815,18 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
       return fail(where, `"oauth.${field}" must be a valid URL`);
     }
     if (url.protocol !== "https:") fail(where, `"oauth.${field}" must be an https URL`);
-    if (!hosts.includes(url.host)) {
-      fail(where, `"oauth.${field}" host "${url.host}" must be one of the connector's hosts (${hosts.join(", ")})`);
+    if (!allowed.includes(url.host)) {
+      fail(where, `"oauth.${field}" host "${url.host}" must be one of (${allowed.join(", ")})`);
     }
     return v as string;
   };
 
-  const authorizeUrl = httpsUrlOnHost("authorizeUrl", o.authorizeUrl);
-  const tokenUrl = httpsUrlOnHost("tokenUrl", o.tokenUrl);
+  const authorizeUrl = httpsUrlOn("authorizeUrl", o.authorizeUrl, [
+    ...hosts,
+    ...(acquisitionHosts ?? []),
+  ]);
+  // Strict: the token exchange carries the client secret.
+  const tokenUrl = httpsUrlOn("tokenUrl", o.tokenUrl, hosts);
 
   const scopes = asStringArray(`${where} oauth`, "scopes", o.scopes);
   if (scopes.length > MAX_OAUTH_SCOPES) fail(where, `"oauth.scopes" has ${scopes.length} entries (max ${MAX_OAUTH_SCOPES})`);
@@ -745,24 +834,140 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
     if (/[\s\r\n]/.test(s)) fail(where, `"oauth.scopes" entry "${s}" must not contain whitespace`);
   }
 
+  let scopeDelimiter: "," | " " | undefined;
+  if (o.scopeDelimiter !== undefined) {
+    if (o.scopeDelimiter !== "," && o.scopeDelimiter !== " ") {
+      fail(where, '"oauth.scopeDelimiter" must be "," or " "');
+    }
+    scopeDelimiter = o.scopeDelimiter;
+  }
+
+  let extraAuthorizeParams: Record<string, string> | undefined;
+  if (o.extraAuthorizeParams !== undefined) {
+    if (
+      typeof o.extraAuthorizeParams !== "object" ||
+      o.extraAuthorizeParams === null ||
+      Array.isArray(o.extraAuthorizeParams)
+    ) {
+      fail(where, '"oauth.extraAuthorizeParams" must be an object of param → value');
+    }
+    const entries = Object.entries(o.extraAuthorizeParams as Record<string, unknown>);
+    if (entries.length > MAX_OAUTH_EXTRA_PARAMS) {
+      fail(where, `"oauth.extraAuthorizeParams" has ${entries.length} entries (max ${MAX_OAUTH_EXTRA_PARAMS})`);
+    }
+    extraAuthorizeParams = {};
+    for (const [k, v] of entries) {
+      if (RESERVED_OAUTH_PARAMS.has(k)) fail(where, `"oauth.extraAuthorizeParams" key "${k}" is reserved`);
+      if (
+        !k ||
+        k.length > MAX_OAUTH_PARAM_LENGTH ||
+        typeof v !== "string" ||
+        v.length > MAX_OAUTH_PARAM_LENGTH ||
+        /[\x00-\x1f\x7f]/.test(k) ||
+        /[\x00-\x1f\x7f]/.test(v)
+      ) {
+        fail(where, '"oauth.extraAuthorizeParams" entries must be short, control-free strings');
+      }
+      extraAuthorizeParams[k] = v;
+    }
+  }
+
+  if (o.pkce !== undefined && typeof o.pkce !== "boolean") fail(where, '"oauth.pkce" must be a boolean');
+
   const secretRef = (field: string, v: unknown): string => {
     if (typeof v !== "string" || !SECRET_REF_RE.test(v)) {
       fail(where, `"oauth.${field}" must be a non-empty string with no whitespace`);
     }
     return v as string;
   };
+  if (o.tokenSecretRef !== undefined || o.tokenResponsePath !== undefined) {
+    fail(
+      where,
+      '"oauth.tokenSecretRef"/"oauth.tokenResponsePath" are retired: obtained tokens live in the sealed credential store, not org secrets',
+    );
+  }
+
+  const metadataMap = (
+    field: string,
+    v: unknown,
+  ): Partial<Record<OauthMetadataField, string>> => {
+    if (typeof v !== "object" || v === null || Array.isArray(v)) {
+      fail(where, `"oauth.${field}" must be an object of field → dot-path`);
+    }
+    const out: Partial<Record<OauthMetadataField, string>> = {};
+    for (const [k, path] of Object.entries(v as Record<string, unknown>)) {
+      if (!OAUTH_METADATA_FIELDS.has(k)) {
+        fail(where, `"oauth.${field}" key "${k}" is not a metadata field (${[...OAUTH_METADATA_FIELDS].join(", ")})`);
+      }
+      if (typeof path !== "string" || !path) fail(where, `"oauth.${field}.${k}" must be a non-empty dot-path`);
+      const segments = path.split(".");
+      if (segments.length > MAX_OAUTH_METADATA_PATH_SEGMENTS) {
+        fail(where, `"oauth.${field}.${k}" has too many path segments (max ${MAX_OAUTH_METADATA_PATH_SEGMENTS})`);
+      }
+      for (const seg of segments) {
+        if (!OAUTH_METADATA_SEGMENT_RE.test(seg) || UNSAFE_OBJECT_PATH_SEGMENTS.has(seg)) {
+          fail(where, `"oauth.${field}.${k}" segment "${seg}" is not allowed`);
+        }
+      }
+      out[k as OauthMetadataField] = path;
+    }
+    return out;
+  };
+
+  let metadata: OauthMetadataSpec | undefined;
+  if (o.metadata !== undefined) {
+    if (typeof o.metadata !== "object" || o.metadata === null) fail(where, '"oauth.metadata" must be an object');
+    const m = o.metadata as Record<string, unknown>;
+    metadata = {};
+    if (m.fromTokenResponse !== undefined) {
+      metadata.fromTokenResponse = metadataMap("metadata.fromTokenResponse", m.fromTokenResponse);
+    }
+    if (m.probe !== undefined) {
+      if (typeof m.probe !== "object" || m.probe === null) fail(where, '"oauth.metadata.probe" must be an object');
+      const p = m.probe as Record<string, unknown>;
+      if (p.method !== undefined && p.method !== "GET" && p.method !== "POST") {
+        fail(where, '"oauth.metadata.probe.method" must be "GET" or "POST"');
+      }
+      if (p.host !== undefined) {
+        if (typeof p.host !== "string" || !hosts.includes(p.host)) {
+          fail(where, `"oauth.metadata.probe.host" must be one of the connector's hosts (${hosts.join(", ")})`);
+        }
+      }
+      if (typeof p.path !== "string" || !p.path.startsWith("/") || p.path.length > MAX_OAUTH_PARAM_LENGTH) {
+        fail(where, '"oauth.metadata.probe.path" must be a short absolute path');
+      }
+      if (p.body !== undefined && (typeof p.body !== "string" || p.body.length > MAX_OAUTH_PROBE_BODY)) {
+        fail(where, '"oauth.metadata.probe.body" must be a bounded string');
+      }
+      const map = metadataMap("metadata.probe.map", p.map);
+      if (Object.keys(map).length === 0) fail(where, '"oauth.metadata.probe.map" must map at least one field');
+      metadata.probe = {
+        ...(p.method !== undefined ? { method: p.method as "GET" | "POST" } : {}),
+        ...(p.host !== undefined ? { host: p.host as string } : {}),
+        path: p.path,
+        ...(p.body !== undefined ? { body: p.body as string } : {}),
+        map,
+      };
+    }
+    if (metadata.fromTokenResponse === undefined && metadata.probe === undefined) {
+      fail(where, '"oauth.metadata" must declare fromTokenResponse and/or probe');
+    }
+  }
 
   return {
     authorizeUrl,
+    ...(acquisitionHosts !== undefined ? { acquisitionHosts } : {}),
     tokenUrl,
     scopes,
+    ...(scopeDelimiter !== undefined ? { scopeDelimiter } : {}),
+    ...(extraAuthorizeParams !== undefined ? { extraAuthorizeParams } : {}),
+    ...(o.pkce !== undefined ? { pkce: o.pkce as boolean } : {}),
     clientIdRef: secretRef("clientIdRef", o.clientIdRef),
     clientSecretRef: secretRef("clientSecretRef", o.clientSecretRef),
     ...(o.signingSecretRef !== undefined
       ? { signingSecretRef: secretRef("signingSecretRef", o.signingSecretRef) }
       : {}),
-    tokenSecretRef: secretRef("tokenSecretRef", o.tokenSecretRef),
-    tokenResponsePath: secretRef("tokenResponsePath", o.tokenResponsePath),
+    ...(metadata !== undefined ? { metadata } : {}),
   };
 }
 
@@ -891,14 +1096,22 @@ export function parseConnector(raw: unknown, where: string): Connector {
       const inj = raw as Record<string, unknown>;
       if (typeof inj.header !== "string" || !inj.header) fail(iw, '"header" must be a non-empty string');
       if (!HEADER_NAME_RE.test(inj.header)) fail(iw, `"header" "${inj.header}" is not a valid HTTP header name`);
-      if (typeof inj.secretRef !== "string" || !inj.secretRef) fail(iw, '"secretRef" must be a non-empty string');
-      if (/\s/.test(inj.secretRef)) fail(iw, '"secretRef" must not contain whitespace');
+      // Optional here; the oauth/static cross-check runs after the oauth
+      // facet parses (an oauth-facet connector must NOT carry one).
+      if (inj.secretRef !== undefined) {
+        if (typeof inj.secretRef !== "string" || !inj.secretRef) fail(iw, '"secretRef" must be a non-empty string');
+        if (/\s/.test(inj.secretRef)) fail(iw, '"secretRef" must not contain whitespace');
+      }
       if (inj.template !== undefined) {
         if (typeof inj.template !== "string") fail(iw, '"template" must be a string');
         if (/[\r\n]/.test(inj.template)) fail(iw, '"template" must not contain newlines');
         if (!inj.template.includes("{}")) fail(iw, '"template" must contain the "{}" value placeholder');
       }
-      return { header: inj.header, secretRef: inj.secretRef, ...(typeof inj.template === "string" ? { template: inj.template } : {}) };
+      return {
+        header: inj.header,
+        ...(typeof inj.secretRef === "string" ? { secretRef: inj.secretRef } : {}),
+        ...(typeof inj.template === "string" ? { template: inj.template } : {}),
+      };
     });
     credential = { source: "inject", injects };
   } else if (cred.source === "mint") {
@@ -1017,10 +1230,40 @@ export function parseConnector(raw: unknown, where: string): Connector {
     if (typeof t.path !== "string" || !t.path.startsWith("/")) {
       fail(where, '"test.path" must be a string starting with "/"');
     }
-    test = { path: t.path };
+    if (t.method !== undefined && t.method !== "GET" && t.method !== "POST") {
+      fail(where, '"test.method" must be "GET" or "POST"');
+    }
+    if (t.body !== undefined && (typeof t.body !== "string" || t.body.length > 4096)) {
+      fail(where, '"test.body" must be a bounded string');
+    }
+    test = {
+      path: t.path,
+      ...(t.method !== undefined ? { method: t.method as "GET" | "POST" } : {}),
+      ...(t.body !== undefined ? { body: t.body as string } : {}),
+    };
   }
 
   const oauth = o.oauth !== undefined ? parseOauth(where, o.oauth, hosts) : undefined;
+  // ADR 0106 addendum: oauth-facet connectors are OAuth-only. Exactly one
+  // inject header, carrying NO secretRef (the value is the store-resolved
+  // access token); static connectors require a secretRef on every header.
+  if (oauth !== undefined) {
+    if (credential.source !== "inject") {
+      fail(where, 'an "oauth" connector must use "credential.source": "inject"');
+    }
+    if (credential.injects.length !== 1) {
+      fail(where, 'an "oauth" connector must declare exactly one credential.injects entry');
+    }
+    if (credential.injects[0]!.secretRef !== undefined) {
+      fail(where, 'an "oauth" connector\'s inject must not carry a "secretRef" (the token lives in the credential store)');
+    }
+  } else if (credential.source === "inject") {
+    for (const [i, inj] of credential.injects.entries()) {
+      if (inj.secretRef === undefined) {
+        fail(where, `credential.injects[${i}] "secretRef" is required for a connector without an "oauth" facet`);
+      }
+    }
+  }
   const webhook = o.webhook !== undefined ? parseWebhookFacet(where, o.webhook) : undefined;
 
   // ADR 0059: the GraphQL endpoint (the single path GraphQL ops POST to). Required
@@ -1230,14 +1473,24 @@ export function compileIntegrationPolicy(
 
       if (connector.credential.source === "inject") {
         // One egress inject per declared header (most connectors have one; e.g.
-        // Datadog `pup` injects DD-API-KEY AND DD-APPLICATION-KEY).
+        // Datadog `pup` injects DD-API-KEY AND DD-APPLICATION-KEY). An
+        // oauth-facet connector's single header has no secretRef: the value is
+        // the store-resolved OAuth token, carried as a brokered source so the
+        // proxy's refresh rail keeps it fresh (ADR 0106 addendum).
         for (const inj of connector.credential.injects) {
           const entry: IntegrationInjectJson = {
             hosts: connector.hosts,
             header_name: inj.header,
             header_template: inj.template ?? "{}",
-            secret_ref: inj.secretRef,
-            mint_source: null,
+            secret_ref: inj.secretRef ?? "",
+            mint_source: connector.oauth
+              ? {
+                  oauth_connector: {
+                    connection_id: grant.connectionId,
+                    provider: connector.provider,
+                  },
+                }
+              : null,
             methods,
             path_globs,
             graphql_operation,
@@ -1422,13 +1675,25 @@ export function compileCliIntegrations(
 // Connected-status derivation + the member-safe provider catalog (redesign #1)
 // ---------------------------------------------------------------------------
 
-export type ConnectorStatus = "connected" | "available";
+export type ConnectorStatus = "connected" | "available" | "needs_reconnect";
+
+/** The coordinator's derived credential lifecycle for an OAuth connector
+ * (`OAuthCredentialMeta.status`). */
+export type OauthCredentialStatus = "connected" | "expired" | "broken" | "revoked";
 
 /**
- * Whether a connector's credential is configured (*connected*) or not yet
- * (*available*). Pure — the caller supplies the org-secret name set and, for a
- * mint connector, the org-secret names its mint kind requires:
- *   - inject → connected ⇔ the `secretRef` exists in the org secret store.
+ * Whether a connector's credential is configured (*connected*), not yet
+ * (*available*), or terminally rejected (*needs_reconnect*). Pure — the caller
+ * supplies the org-secret name set, mint requirements, and (for oauth-facet
+ * connectors) the coordinator's per-provider credential status:
+ *   - oauth  → status comes SOLELY from the sealed credential store. No row ⇒
+ *              available; broken/revoked/expired ⇒ needs_reconnect; connected ⇒
+ *              connected. `expired` is degraded, not transient: the scanner
+ *              refreshes max(30 min, 25% TTL) AHEAD of expiry, so a row only
+ *              reaches `expired` after hours of failed refreshes — guest
+ *              requests are 401ing by then. Self-healing: the row stays in
+ *              the due set; a successful refresh restores `connected`.
+ *   - inject → connected ⇔ every `secretRef` exists in the org secret store.
  *   - mint   → connected ⇔ every required mint field exists as an org secret
  *              (caller derives the names as `${kind}.${field}` from the
  *              coordinator's mint-kind registry). None given ⇒ available.
@@ -1437,10 +1702,17 @@ export function connectorStatus(
   connector: Connector,
   orgSecretNames: ReadonlySet<string>,
   requiredMintSecretNames: ReadonlyArray<string> = [],
+  oauthStatus?: OauthCredentialStatus,
 ): ConnectorStatus {
+  if (connector.oauth) {
+    if (oauthStatus === undefined) return "available";
+    return oauthStatus === "connected" ? "connected" : "needs_reconnect";
+  }
   if (connector.credential.source === "inject") {
     // Connected ⇔ every injected header's secret is present in the org store.
-    return connector.credential.injects.every((i) => orgSecretNames.has(i.secretRef)) ? "connected" : "available";
+    return connector.credential.injects.every((i) => i.secretRef !== undefined && orgSecretNames.has(i.secretRef))
+      ? "connected"
+      : "available";
   }
   if (requiredMintSecretNames.length === 0) return "available";
   return requiredMintSecretNames.every((n) => orgSecretNames.has(n)) ? "connected" : "available";

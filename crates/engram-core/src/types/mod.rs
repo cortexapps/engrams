@@ -5,6 +5,7 @@ pub mod capability;
 pub mod capture_job;
 pub mod capture_progress;
 pub mod catalog;
+pub mod connector_oauth;
 pub mod cow_state;
 pub mod egress;
 pub mod endpoints;

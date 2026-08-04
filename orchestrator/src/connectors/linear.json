@@ -4,28 +4,541 @@
   "display": {
     "name": "Linear",
     "category": "Issue tracking",
-    "blurb": "Query and mutate Linear issues, projects, teams, and comments through its GraphQL API — authenticated with a personal API key brokered at the egress proxy, never seen by the agent.",
-    "icon": { "mono": "LI", "color": "#5e6ad2" }
+    "blurb": "Query and mutate Linear issues, projects, teams, and comments through its GraphQL API — authenticated with the workspace's OAuth app token, brokered at the egress proxy and never seen by the agent.",
+    "icon": {
+      "mono": "LI",
+      "color": "#5e6ad2"
+    }
   },
   "credential": {
     "source": "inject",
     "injects": [
-      { "header": "Authorization", "secretRef": "linear.api_key" }
+      {
+        "header": "Authorization",
+        "template": "Bearer {}"
+      }
     ]
   },
-  "hosts": ["api.linear.app"],
-  "test": { "path": "/graphql" },
+  "hosts": [
+    "api.linear.app"
+  ],
+  "oauth": {
+    "authorizeUrl": "https://linear.app/oauth/authorize",
+    "acquisitionHosts": [
+      "linear.app"
+    ],
+    "tokenUrl": "https://api.linear.app/oauth/token",
+    "scopes": [
+      "read",
+      "write"
+    ],
+    "extraAuthorizeParams": {
+      "actor": "app"
+    },
+    "clientIdRef": "linear.client_id",
+    "clientSecretRef": "linear.client_secret",
+    "metadata": {
+      "probe": {
+        "method": "POST",
+        "path": "/graphql",
+        "body": "{\"query\":\"{ viewer { id name } }\"}",
+        "map": {
+          "accountId": "data.viewer.id",
+          "displayName": "data.viewer.name"
+        }
+      }
+    }
+  },
+  "test": {
+    "path": "/graphql",
+    "method": "POST",
+    "body": "{\"query\":\"{ viewer { id } }\"}"
+  },
   "operations": [
     {
-      "grants": ["linear:graphql"],
-      "match": { "method": "POST", "path": "/graphql" }
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "viewer"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "organization"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "teams"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "team"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "users"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "user"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "cycles"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "cycle"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "workflowStates"
+      }
+    },
+    {
+      "grants": [
+        "org:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "workflowState"
+      }
+    },
+    {
+      "grants": [
+        "issues:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "issues"
+      }
+    },
+    {
+      "grants": [
+        "issues:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "issue"
+      }
+    },
+    {
+      "grants": [
+        "issues:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "issueSearch"
+      }
+    },
+    {
+      "grants": [
+        "issues:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "comments"
+      }
+    },
+    {
+      "grants": [
+        "issues:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "comment"
+      }
+    },
+    {
+      "grants": [
+        "issues:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "attachments"
+      }
+    },
+    {
+      "grants": [
+        "issues:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "attachment"
+      }
+    },
+    {
+      "grants": [
+        "issues:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "issueLabels"
+      }
+    },
+    {
+      "grants": [
+        "issues:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "issueLabel"
+      }
+    },
+    {
+      "grants": [
+        "issues:write"
+      ],
+      "match": {
+        "operation": "mutation",
+        "field": "issueCreate"
+      },
+      "comment": "GraphQL asset parity (PR #904 rules): responses echo only the client's selection set, so every field is response-first with a $.vars fallback, and issue URLs/identifiers additionally derive from the returned URL.",
+      "asset": {
+        "kind": "issue",
+        "surface": "asset",
+        "success": {
+          "noGraphqlErrors": true
+        },
+        "data": {
+          "identifier": [
+            "$.resp.data.issueCreate.issue.identifier"
+          ],
+          "title": [
+            "$.resp.data.issueCreate.issue.title",
+            "$.vars.input.title",
+            "$.vars.title"
+          ],
+          "team_id": [
+            "$.vars.input.teamId",
+            "$.vars.teamId"
+          ]
+        },
+        "fetchable": {
+          "external": "$.resp.data.issueCreate.issue.url"
+        },
+        "urlFallback": {
+          "pattern": "https://linear.app/{workspace}/issue/{identifier}/{slug}",
+          "fields": {
+            "identifier": "{identifier}"
+          }
+        }
+      }
+    },
+    {
+      "grants": [
+        "issues:write"
+      ],
+      "match": {
+        "operation": "mutation",
+        "field": "issueUpdate"
+      },
+      "comment": "GraphQL asset parity (PR #904 rules): responses echo only the client's selection set, so every field is response-first with a $.vars fallback, and issue URLs/identifiers additionally derive from the returned URL.",
+      "asset": {
+        "kind": "issue",
+        "surface": "action",
+        "success": {
+          "noGraphqlErrors": true
+        },
+        "data": {
+          "identifier": [
+            "$.resp.data.issueUpdate.issue.identifier"
+          ],
+          "title": [
+            "$.resp.data.issueUpdate.issue.title",
+            "$.vars.input.title",
+            "$.vars.title"
+          ]
+        },
+        "fetchable": {
+          "external": "$.resp.data.issueUpdate.issue.url"
+        },
+        "urlFallback": {
+          "pattern": "https://linear.app/{workspace}/issue/{identifier}/{slug}",
+          "fields": {
+            "identifier": "{identifier}"
+          }
+        }
+      }
+    },
+    {
+      "grants": [
+        "issues:write"
+      ],
+      "match": {
+        "operation": "mutation",
+        "field": "issueArchive"
+      }
+    },
+    {
+      "grants": [
+        "issues:write"
+      ],
+      "match": {
+        "operation": "mutation",
+        "field": "issueUnarchive"
+      }
+    },
+    {
+      "grants": [
+        "issues:write"
+      ],
+      "match": {
+        "operation": "mutation",
+        "field": "commentCreate"
+      },
+      "comment": "GraphQL asset parity (PR #904 rules): responses echo only the client's selection set, so every field is response-first with a $.vars fallback, and issue URLs/identifiers additionally derive from the returned URL.",
+      "asset": {
+        "kind": "comment",
+        "surface": "action",
+        "success": {
+          "noGraphqlErrors": true
+        },
+        "data": {
+          "issue_id": [
+            "$.vars.input.issueId",
+            "$.vars.issueId"
+          ],
+          "issue_identifier": [
+            "$.resp.data.commentCreate.comment.issue.identifier"
+          ]
+        },
+        "fetchable": {
+          "external": "$.resp.data.commentCreate.comment.url"
+        }
+      }
+    },
+    {
+      "grants": [
+        "issues:write"
+      ],
+      "match": {
+        "operation": "mutation",
+        "field": "commentUpdate"
+      }
+    },
+    {
+      "grants": [
+        "issues:write"
+      ],
+      "match": {
+        "operation": "mutation",
+        "field": "attachmentCreate"
+      }
+    },
+    {
+      "grants": [
+        "issues:write"
+      ],
+      "match": {
+        "operation": "mutation",
+        "field": "attachmentLinkURL"
+      }
+    },
+    {
+      "grants": [
+        "issues:write"
+      ],
+      "match": {
+        "operation": "mutation",
+        "field": "issueLabelCreate"
+      }
+    },
+    {
+      "grants": [
+        "issues:write"
+      ],
+      "match": {
+        "operation": "mutation",
+        "field": "reactionCreate"
+      }
+    },
+    {
+      "grants": [
+        "projects:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "projects"
+      }
+    },
+    {
+      "grants": [
+        "projects:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "project"
+      }
+    },
+    {
+      "grants": [
+        "projects:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "projectUpdates"
+      }
+    },
+    {
+      "grants": [
+        "projects:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "projectUpdate"
+      }
+    },
+    {
+      "grants": [
+        "projects:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "initiatives"
+      }
+    },
+    {
+      "grants": [
+        "projects:read"
+      ],
+      "match": {
+        "operation": "query",
+        "field": "initiative"
+      }
+    },
+    {
+      "grants": [
+        "projects:write"
+      ],
+      "match": {
+        "operation": "mutation",
+        "field": "projectCreate"
+      },
+      "comment": "GraphQL asset parity (PR #904 rules): responses echo only the client's selection set, so every field is response-first with a $.vars fallback, and issue URLs/identifiers additionally derive from the returned URL.",
+      "asset": {
+        "kind": "project",
+        "surface": "asset",
+        "success": {
+          "noGraphqlErrors": true
+        },
+        "data": {
+          "name": [
+            "$.resp.data.projectCreate.project.name",
+            "$.vars.input.name",
+            "$.vars.name"
+          ]
+        },
+        "fetchable": {
+          "external": "$.resp.data.projectCreate.project.url"
+        }
+      }
+    },
+    {
+      "grants": [
+        "projects:write"
+      ],
+      "match": {
+        "operation": "mutation",
+        "field": "projectUpdate"
+      },
+      "comment": "GraphQL asset parity (PR #904 rules): responses echo only the client's selection set, so every field is response-first with a $.vars fallback, and issue URLs/identifiers additionally derive from the returned URL.",
+      "asset": {
+        "kind": "project",
+        "surface": "action",
+        "success": {
+          "noGraphqlErrors": true
+        },
+        "data": {
+          "name": [
+            "$.resp.data.projectUpdate.project.name",
+            "$.vars.input.name",
+            "$.vars.name"
+          ]
+        },
+        "fetchable": {
+          "external": "$.resp.data.projectUpdate.project.url"
+        }
+      }
+    },
+    {
+      "grants": [
+        "projects:write"
+      ],
+      "match": {
+        "operation": "mutation",
+        "field": "projectUpdateCreate"
+      },
+      "comment": "GraphQL asset parity (PR #904 rules): responses echo only the client's selection set, so every field is response-first with a $.vars fallback, and issue URLs/identifiers additionally derive from the returned URL.",
+      "asset": {
+        "kind": "project_update",
+        "surface": "asset",
+        "success": {
+          "noGraphqlErrors": true
+        },
+        "data": {
+          "project_id": [
+            "$.vars.input.projectId",
+            "$.vars.projectId"
+          ]
+        },
+        "fetchable": {
+          "external": "$.resp.data.projectUpdateCreate.projectUpdate.url"
+        }
+      }
     }
   ],
   "cli": {
-    "bins": ["linear"],
+    "bins": [
+      "linear"
+    ],
     "binSource": "bundled",
-    "dummyEnv": { "LINEAR_API_KEY": "x-engrams-managed" },
+    "dummyEnv": {
+      "LINEAR_API_KEY": "x-engrams-managed"
+    },
     "credentialDelivery": "inject",
-    "doc": "Use `linear` to query and mutate Linear from this session via its GraphQL API. Authentication is automatic: the egress proxy injects your Linear personal API key on requests to api.linear.app; `LINEAR_API_KEY` is a managed placeholder. Do NOT set a real key or run any login.\n\nLinear is a GraphQL-only API: ONE endpoint, POST https://api.linear.app/graphql. There is a SINGLE power, `linear:graphql`, which grants both reads and writes (queries and mutations) over that endpoint — read/write cannot be split by path on a GraphQL API.\n\nSubcommands (all run a GraphQL document):\n  linear whoami                       Current user (the `viewer` query) — a quick auth check.\n  linear teams                        List your teams (id, key, name).\n  linear issues [query]               Search issues by free text (first 25; id, identifier, title, state).\n  linear issue <id>                   Fetch one issue by id or identifier (e.g. ENG-123).\n  linear projects                     List projects (id, name, state).\n  linear comment <issueId> <text>     Add a comment to an issue (a mutation).\n  linear create <teamId> <title> [description]   Create an issue (a mutation).\n  linear query '<graphql>' [varsJSON] Run an arbitrary query or mutation. Pass variables as a JSON object string.\n  linear raw '<json-body>'            POST a raw GraphQL JSON body verbatim.\n\nExamples:\n  linear whoami\n  linear issues \"login bug\"\n  linear query 'query{ teams{ nodes{ id name } } }'\n  linear query 'mutation($t:String!){ issueCreate(input:{teamId:\"...\",title:$t}){ success issue{ identifier } } }' '{\"t\":\"New bug\"}'\n\nResponses are JSON of the form {\"data\":{...}} or {\"errors\":[...]}. GraphQL can return HTTP 200 with an `errors` array; a missing/invalid key yields HTTP 401 with extensions.type=authentication_error. All requests need the `linear:graphql` power."
-  }
+    "doc": "Use `linear` to query and mutate Linear from this session via its GraphQL API. Authentication is automatic: the egress proxy injects the workspace's Linear OAuth app token (actor=app — actions attribute to the workspace's agent app user) on requests to api.linear.app; `LINEAR_API_KEY` is a managed placeholder. Do NOT set a real key or run any login.\n\nLinear is a GraphQL-only API: ONE endpoint, POST https://api.linear.app/graphql. Powers gate the TOP-LEVEL GraphQL fields a request may select, by product area:\n  org:read        viewer, organization, team(s), user(s), cycle(s), workflowState(s)\n  issues:read     issue(s), issueSearch, comment(s), attachment(s), issueLabel(s)\n  issues:write    issueCreate/Update/Archive/Unarchive, commentCreate/Update, attachmentCreate, attachmentLinkURL, issueLabelCreate, reactionCreate\n  projects:read   project(s), projectUpdate(s), initiative(s)\n  projects:write  projectCreate, projectUpdate, projectUpdateCreate\nA request must have EVERY top-level field it selects covered by a granted power, or the proxy rejects it before it leaves the sandbox.\n\nSubcommands (all run a GraphQL document; the power each needs):\n  linear whoami                       Current identity (`viewer`) — org:read.\n  linear teams                        List your teams — org:read.\n  linear issues [query]               Search issues by free text — issues:read.\n  linear issue <id>                   Fetch one issue by id or identifier (e.g. ENG-123) — issues:read.\n  linear projects                     List projects — projects:read.\n  linear comment <issueId> <text>     Add a comment — issues:write.\n  linear create <teamId> <title> [description]   Create an issue — issues:write.\n  linear query '<graphql>' [varsJSON] Run an arbitrary query or mutation (covered fields only).\n  linear raw '<json-body>'            POST a raw GraphQL JSON body verbatim (covered fields only).\n\nExamples:\n  linear whoami\n  linear issues \"login bug\"\n  linear query 'query{ teams{ nodes{ id name } } }'\n  linear query 'mutation($t:String!){ issueCreate(input:{teamId:\"...\",title:$t}){ success issue{ identifier } } }' '{\"t\":\"New bug\"}'\n\nResponses are JSON of the form {\"data\":{...}} or {\"errors\":[...]}. GraphQL can return HTTP 200 with an `errors` array; a missing/invalid token yields HTTP 401 with extensions.type=authentication_error. A request selecting a field outside your granted powers is refused at the network boundary (not a Linear error)."
+  },
+  "graphqlEndpoint": "/graphql"
 }

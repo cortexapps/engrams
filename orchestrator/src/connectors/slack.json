@@ -5,168 +5,333 @@
     "name": "Slack",
     "category": "Communication",
     "blurb": "Post and manage messages, browse channels and history, react, pin, upload files, and read users — authenticated with a workspace bot token obtained via OAuth (\"Add to Slack\").",
-    "icon": { "mono": "SL", "color": "#611f69" }
+    "icon": {
+      "mono": "SL",
+      "color": "#611f69"
+    }
   },
   "credential": {
     "source": "inject",
     "injects": [
-      { "header": "Authorization", "template": "Bearer {}", "secretRef": "slack.bot_token" }
+      {
+        "header": "Authorization",
+        "template": "Bearer {}"
+      }
     ]
   },
   "webhook": {
     "verificationScheme": "slack_v0",
     "events": [
-      { "key": "app_mention", "displayName": "App mention" }
+      {
+        "key": "app_mention",
+        "displayName": "App mention"
+      }
     ],
     "aliases": [
-      { "path": "event.text", "alias": "message.text" },
-      { "path": "event.user", "alias": "actor.id" },
-      { "path": "event.channel", "alias": "channel.id" },
-      { "path": "event.ts", "alias": "message.timestamp" }
+      {
+        "path": "event.text",
+        "alias": "message.text"
+      },
+      {
+        "path": "event.user",
+        "alias": "actor.id"
+      },
+      {
+        "path": "event.channel",
+        "alias": "channel.id"
+      },
+      {
+        "path": "event.ts",
+        "alias": "message.timestamp"
+      }
     ]
   },
-  "hosts": ["slack.com"],
-  "test": { "path": "/api/auth.test" },
+  "hosts": [
+    "slack.com"
+  ],
+  "test": {
+    "path": "/api/auth.test"
+  },
   "operations": [
     {
-      "grants": ["chat:write"],
-      "match": { "path": "/api/chat.*" }
+      "grants": [
+        "chat:write"
+      ],
+      "match": {
+        "path": "/api/chat.*"
+      }
     },
     {
-      "grants": ["channels:read"],
-      "match": { "path": "/api/conversations.list" }
+      "grants": [
+        "channels:read"
+      ],
+      "match": {
+        "path": "/api/conversations.list"
+      }
     },
     {
-      "grants": ["channels:read"],
-      "match": { "path": "/api/conversations.info" }
+      "grants": [
+        "channels:read"
+      ],
+      "match": {
+        "path": "/api/conversations.info"
+      }
     },
     {
-      "grants": ["channels:read"],
-      "match": { "path": "/api/conversations.history" }
+      "grants": [
+        "channels:read"
+      ],
+      "match": {
+        "path": "/api/conversations.history"
+      }
     },
     {
-      "grants": ["channels:read"],
-      "match": { "path": "/api/conversations.replies" }
+      "grants": [
+        "channels:read"
+      ],
+      "match": {
+        "path": "/api/conversations.replies"
+      }
     },
     {
-      "grants": ["channels:read"],
-      "match": { "path": "/api/conversations.members" }
+      "grants": [
+        "channels:read"
+      ],
+      "match": {
+        "path": "/api/conversations.members"
+      }
     },
     {
-      "grants": ["channels:manage"],
-      "match": { "path": "/api/conversations.create" }
+      "grants": [
+        "channels:manage"
+      ],
+      "match": {
+        "path": "/api/conversations.create"
+      }
     },
     {
-      "grants": ["channels:manage"],
-      "match": { "path": "/api/conversations.invite" }
+      "grants": [
+        "channels:manage"
+      ],
+      "match": {
+        "path": "/api/conversations.invite"
+      }
     },
     {
-      "grants": ["channels:manage"],
-      "match": { "path": "/api/conversations.archive" }
+      "grants": [
+        "channels:manage"
+      ],
+      "match": {
+        "path": "/api/conversations.archive"
+      }
     },
     {
-      "grants": ["channels:manage"],
-      "match": { "path": "/api/conversations.rename" }
+      "grants": [
+        "channels:manage"
+      ],
+      "match": {
+        "path": "/api/conversations.rename"
+      }
     },
     {
-      "grants": ["channels:manage"],
-      "match": { "path": "/api/conversations.setTopic" }
+      "grants": [
+        "channels:manage"
+      ],
+      "match": {
+        "path": "/api/conversations.setTopic"
+      }
     },
     {
-      "grants": ["channels:manage"],
-      "match": { "path": "/api/conversations.setPurpose" }
+      "grants": [
+        "channels:manage"
+      ],
+      "match": {
+        "path": "/api/conversations.setPurpose"
+      }
     },
     {
-      "grants": ["channels:manage"],
-      "match": { "path": "/api/conversations.join" }
+      "grants": [
+        "channels:manage"
+      ],
+      "match": {
+        "path": "/api/conversations.join"
+      }
     },
     {
-      "grants": ["users:read"],
-      "match": { "path": "/api/users.*" }
+      "grants": [
+        "users:read"
+      ],
+      "match": {
+        "path": "/api/users.*"
+      }
     },
     {
-      "grants": ["files:read"],
-      "match": { "path": "/api/files.list" }
+      "grants": [
+        "files:read"
+      ],
+      "match": {
+        "path": "/api/files.list"
+      }
     },
     {
-      "grants": ["files:read"],
-      "match": { "path": "/api/files.info" }
+      "grants": [
+        "files:read"
+      ],
+      "match": {
+        "path": "/api/files.info"
+      }
     },
     {
-      "grants": ["files:write"],
-      "match": { "path": "/api/files.upload" }
+      "grants": [
+        "files:write"
+      ],
+      "match": {
+        "path": "/api/files.upload"
+      }
     },
     {
-      "grants": ["files:write"],
-      "match": { "path": "/api/files.getUploadURLExternal" }
+      "grants": [
+        "files:write"
+      ],
+      "match": {
+        "path": "/api/files.getUploadURLExternal"
+      }
     },
     {
-      "grants": ["files:write"],
-      "match": { "path": "/api/files.completeUploadExternal" }
+      "grants": [
+        "files:write"
+      ],
+      "match": {
+        "path": "/api/files.completeUploadExternal"
+      }
     },
     {
-      "grants": ["files:write"],
-      "match": { "path": "/api/files.delete" }
+      "grants": [
+        "files:write"
+      ],
+      "match": {
+        "path": "/api/files.delete"
+      }
     },
     {
-      "grants": ["reactions:read"],
-      "match": { "path": "/api/reactions.list" }
+      "grants": [
+        "reactions:read"
+      ],
+      "match": {
+        "path": "/api/reactions.list"
+      }
     },
     {
-      "grants": ["reactions:read"],
-      "match": { "path": "/api/reactions.get" }
+      "grants": [
+        "reactions:read"
+      ],
+      "match": {
+        "path": "/api/reactions.get"
+      }
     },
     {
-      "grants": ["reactions:write"],
-      "match": { "path": "/api/reactions.add" }
+      "grants": [
+        "reactions:write"
+      ],
+      "match": {
+        "path": "/api/reactions.add"
+      }
     },
     {
-      "grants": ["reactions:write"],
-      "match": { "path": "/api/reactions.remove" }
+      "grants": [
+        "reactions:write"
+      ],
+      "match": {
+        "path": "/api/reactions.remove"
+      }
     },
     {
-      "grants": ["pins:read"],
-      "match": { "path": "/api/pins.list" }
+      "grants": [
+        "pins:read"
+      ],
+      "match": {
+        "path": "/api/pins.list"
+      }
     },
     {
-      "grants": ["pins:write"],
-      "match": { "path": "/api/pins.add" }
+      "grants": [
+        "pins:write"
+      ],
+      "match": {
+        "path": "/api/pins.add"
+      }
     },
     {
-      "grants": ["pins:write"],
-      "match": { "path": "/api/pins.remove" }
+      "grants": [
+        "pins:write"
+      ],
+      "match": {
+        "path": "/api/pins.remove"
+      }
     },
     {
-      "grants": ["bookmarks:read"],
-      "match": { "path": "/api/bookmarks.list" }
+      "grants": [
+        "bookmarks:read"
+      ],
+      "match": {
+        "path": "/api/bookmarks.list"
+      }
     },
     {
-      "grants": ["bookmarks:write"],
-      "match": { "path": "/api/bookmarks.add" }
+      "grants": [
+        "bookmarks:write"
+      ],
+      "match": {
+        "path": "/api/bookmarks.add"
+      }
     },
     {
-      "grants": ["bookmarks:write"],
-      "match": { "path": "/api/bookmarks.edit" }
+      "grants": [
+        "bookmarks:write"
+      ],
+      "match": {
+        "path": "/api/bookmarks.edit"
+      }
     },
     {
-      "grants": ["bookmarks:write"],
-      "match": { "path": "/api/bookmarks.remove" }
+      "grants": [
+        "bookmarks:write"
+      ],
+      "match": {
+        "path": "/api/bookmarks.remove"
+      }
     },
     {
-      "grants": ["usergroups:read"],
-      "match": { "path": "/api/usergroups.*" }
+      "grants": [
+        "usergroups:read"
+      ],
+      "match": {
+        "path": "/api/usergroups.*"
+      }
     },
     {
-      "grants": ["views:write"],
-      "match": { "path": "/api/views.*" }
+      "grants": [
+        "views:write"
+      ],
+      "match": {
+        "path": "/api/views.*"
+      }
     },
     {
-      "grants": ["team:read"],
-      "match": { "path": "/api/team.info" }
+      "grants": [
+        "team:read"
+      ],
+      "match": {
+        "path": "/api/team.info"
+      }
     },
     {
-      "grants": ["team:read"],
-      "match": { "path": "/api/emoji.list" }
+      "grants": [
+        "team:read"
+      ],
+      "match": {
+        "path": "/api/emoji.list"
+      }
     },
     {
       "grants": [
@@ -186,13 +351,19 @@
         "views:write",
         "team:read"
       ],
-      "match": { "path": "/api/auth.test" }
+      "match": {
+        "path": "/api/auth.test"
+      }
     }
   ],
   "cli": {
-    "bins": ["slack"],
+    "bins": [
+      "slack"
+    ],
     "binSource": "bundled",
-    "dummyEnv": { "SLACK_TOKEN": "x-engrams-managed" },
+    "dummyEnv": {
+      "SLACK_TOKEN": "x-engrams-managed"
+    },
     "credentialDelivery": "inject",
     "doc": "Use `slack` to interact with Slack from this session — post and manage messages, browse channels and history, react, pin, upload files, and read users. Authentication is automatic: the egress proxy injects the workspace bot token on requests to slack.com; `SLACK_TOKEN` is a managed placeholder. Do NOT set a real token or run any login. Slack always replies HTTP 200 with JSON `{\"ok\":true,…}` or `{\"ok\":false,\"error\":…}`.\n\n<channel> is a channel ID (e.g. C0123456789) or #name; the bot must be in the channel (or the app needs chat:write.public).\n\nMessaging (needs `chat:write`):\n  slack post <channel> <text...>        Post a message (chat.postMessage)\n  slack reply <channel> <thread-ts> <text...>  Reply in a thread (chat.postMessage with thread_ts)\n  slack dm <user-id> <text...>          DM a user by ID\nReading channels (needs `channels:read`):\n  slack channels [field=value ...]      List conversations (conversations.list)\n  slack history <channel> [field=value] List recent messages (conversations.history)\n  slack replies <channel> <ts>          List a thread (conversations.replies)\nManaging channels (needs `channels:manage`): create/invite/archive/rename/join — via `slack api conversations.<method> …`.\nUsers (needs `users:read`):\n  slack users [field=value ...]         List members (users.list)\nFiles: `slack upload <channel> <file> [title]` needs `files:write`; `slack api files.list` needs `files:read`.\nReactions (needs `reactions:write`):\n  slack react <channel> <ts> <emoji>    Add a reaction (reactions.add)\nPins (needs `pins:write`):\n  slack pin <channel> <ts>              Pin a message (pins.add)\nIdentity: `slack whoami` (auth.test). Other Web API methods: `slack api <method> field=value …` (e.g. `slack api conversations.create name=proj-x`). Bookmarks (`bookmarks:*`), usergroups (`usergroups:read`), modals/App Home (`views:write`), and team/emoji (`team:read`) are reachable via `slack api`. A method whose power your profile didn't grant is denied at the network boundary, not authenticated."
   },
@@ -227,7 +398,12 @@
     "clientIdRef": "slack.client_id",
     "clientSecretRef": "slack.client_secret",
     "signingSecretRef": "slack.signing_secret",
-    "tokenSecretRef": "slack.bot_token",
-    "tokenResponsePath": "access_token"
+    "metadata": {
+      "fromTokenResponse": {
+        "accountId": "team.id",
+        "workspaceId": "team.id",
+        "workspaceName": "team.name"
+      }
+    }
   }
 }

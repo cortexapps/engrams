@@ -1,37 +1,40 @@
 /**
- * OAuth authorization-code acquisition for connectors with an `oauth` facet (e.g.
- * Slack "Add to Slack"). The orchestrator owns the browser redirect + CSRF state;
- * the coordinator (the only tier that can read/write org secrets) builds the
- * authorize URL and runs the code→token exchange, writing the access token.
+ * OAuth authorization-code acquisition for connectors with an `oauth` facet
+ * ("Add to Slack", "Connect Linear"). The orchestrator owns the browser
+ * redirect; the coordinator (the only tier that can read org secrets) builds
+ * the authorize URL, runs the code→token exchange, and seals the obtained
+ * tokens into its credential store (ADR 0106 addendum) — org secrets never
+ * hold an acquired token.
+ *
+ * CSRF state is the coordinator's durable flow row: `state` = the flow id,
+ * begun on any replica and completed on any other. No in-memory state.
  *
  *   GET /api/v1/integrations/:provider/oauth/authorize  (admin) → 302 to the IdP
  *   GET /api/v1/integrations/:provider/oauth/callback           → exchange + 302 back
  *
- * Generic over any oauth-facet connector — Slack is the first.
+ * Generic over any oauth-facet connector — Slack and Linear are the first.
  */
 
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
+import { ConnectError } from "@connectrpc/connect";
 import { getSessionFromHeaders } from "../auth/session.ts";
 import { abilityFor } from "../authz/ability.ts";
 import { config } from "../config.ts";
 import { loadRegistry } from "../connectors/registry.ts";
+import type { Connector } from "../connectors/registry.ts";
+import { redirectOauthSpec } from "../connectors/oauth-spec.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
+import { makeIntegrationConnectionStore } from "../db/integration-connections.ts";
 import { getDb } from "../db/client.ts";
-import { integrationOp as defaultIntegrationOp } from "../control-plane/client.ts";
+import { oauthCredential as defaultOauthCredential } from "../control-plane/client.ts";
+import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 
-type IntegrationOauthClient = Pick<
-  typeof defaultIntegrationOp,
-  "beginIntegrationOauth" | "completeIntegrationOauth"
+type OauthCredentialClient = Pick<
+  typeof defaultOauthCredential,
+  "beginRedirectFlow" | "completeRedirectFlow"
 >;
-
-interface PendingState {
-  provider: string;
-  userId: string;
-  /** epoch ms expiry. */
-  exp: number;
-}
 
 type GetSession = (
   headers: Headers,
@@ -39,29 +42,29 @@ type GetSession = (
 
 export interface IntegrationOauthDeps {
   connectors?: { list(): Promise<ReadonlyArray<{ provider: string; config: unknown }>> };
-  integrationOp?: IntegrationOauthClient;
+  oauthCredential?: OauthCredentialClient;
+  /** Resolve the provider's default connection row (the credential subject). */
+  connectionIdFor?: (provider: string, displayName: string) => Promise<string>;
   /** Override the admin-session lookup (tests). */
   getSession?: GetSession;
-  /** Override the CSRF state generator (tests). */
-  randomState?: () => string;
 }
-
-const STATE_TTL_MS = 10 * 60_000;
 
 export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
   const app = new Hono();
-  const integrationOp = deps?.integrationOp ?? defaultIntegrationOp;
+  const oauthCredential = deps?.oauthCredential ?? defaultOauthCredential;
   // Resolved lazily (per request) so constructing the default route doesn't touch
   // the DB at import time.
   const connectorSource = () => deps?.connectors ?? makeConnectorStore(getDb());
-  const randomState = deps?.randomState ?? (() => crypto.randomUUID());
-  const getSession: GetSession =
-    deps?.getSession ??
-    getSessionFromHeaders;
-
-  // In-memory CSRF state (single-instance). The callback also re-checks the admin
-  // session cookie, so this guards against cross-site request forgery, not auth.
-  const pending = new Map<string, PendingState>();
+  const connectionIdFor =
+    deps?.connectionIdFor ??
+    (async (provider: string, displayName: string) => {
+      const row = await makeIntegrationConnectionStore(getDb()).ensureDefault(
+        provider,
+        displayName,
+      );
+      return row.id;
+    });
+  const getSession: GetSession = deps?.getSession ?? getSessionFromHeaders;
 
   function redirectUri(provider: string): string {
     return `${config.baseUrl.replace(/\/$/, "")}/api/v1/integrations/${encodeURIComponent(provider)}/oauth/callback`;
@@ -75,13 +78,21 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
     return { id: session.user.id };
   }
 
-  async function oauthConnector(provider: string) {
+  async function oauthConnector(provider: string): Promise<Connector> {
     const registry = await loadRegistry(connectorSource());
     const conn = registry.get(provider);
     if (!conn?.oauth) {
       throw new HTTPException(404, { message: `connector "${provider}" has no OAuth flow` });
     }
-    return conn.oauth;
+    return conn;
+  }
+
+  async function subjectFor(connector: Connector) {
+    const id = await connectionIdFor(
+      connector.provider,
+      `${connector.display.name} (default)`,
+    );
+    return { kind: OauthSubjectKind.CONNECTOR, id };
   }
 
   // The browser lands back on the settings page with a connected/error flag.
@@ -92,23 +103,17 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
   }
 
   app.get("/api/v1/integrations/:provider/oauth/authorize", async (c) => {
-    const user = await requireAdmin(c.req.raw.headers);
+    await requireAdmin(c.req.raw.headers);
     const provider = c.req.param("provider");
-    const oauth = await oauthConnector(provider);
-
-    // Prune expired states, then mint a fresh one.
-    const now = Date.now();
-    for (const [k, v] of pending) if (v.exp < now) pending.delete(k);
-    const state = randomState();
-    pending.set(state, { provider, userId: user.id, exp: now + STATE_TTL_MS });
-
-    const { authorizeUrl } = await integrationOp.beginIntegrationOauth({
+    const connector = await oauthConnector(provider);
+    // Reconnect after revocation: force the provider's consent screen so a
+    // fresh grant is issued (providers ignore unknown params otherwise).
+    const force = c.req.query("force") === "1";
+    const { authorizeUrl } = await oauthCredential.beginRedirectFlow({
+      subject: await subjectFor(connector),
       provider,
-      authorizeUrl: oauth.authorizeUrl,
-      scopes: oauth.scopes,
-      clientIdRef: oauth.clientIdRef,
+      spec: redirectOauthSpec(connector, force ? { prompt: "consent" } : undefined),
       redirectUri: redirectUri(provider),
-      state,
     });
     return c.redirect(authorizeUrl);
   });
@@ -121,27 +126,25 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
     const code = c.req.query("code");
     const state = c.req.query("state");
     if (!code || !state) throw new HTTPException(400, { message: "missing code or state" });
-
-    const entry = pending.get(state);
-    pending.delete(state);
-    if (!entry || entry.provider !== provider || entry.exp < Date.now()) {
-      throw new HTTPException(403, { message: "invalid or expired OAuth state" });
-    }
-    // Defence in depth: the callback carries the admin's session cookie.
+    // The callback carries the admin's session cookie; the durable flow row
+    // (looked up by `state` coordinator-side) is the CSRF check.
     await requireAdmin(c.req.raw.headers);
 
-    const oauth = await oauthConnector(provider);
-    const res = await integrationOp.completeIntegrationOauth({
-      provider,
-      tokenUrl: oauth.tokenUrl,
-      clientIdRef: oauth.clientIdRef,
-      clientSecretRef: oauth.clientSecretRef,
-      redirectUri: redirectUri(provider),
-      code,
-      tokenSecretRef: oauth.tokenSecretRef,
-      tokenResponsePath: oauth.tokenResponsePath,
-    });
-    return finish(provider, res.ok, res.message, c);
+    const connector = await oauthConnector(provider);
+    try {
+      await oauthCredential.completeRedirectFlow({
+        subject: await subjectFor(connector),
+        provider,
+        flowId: state,
+        code,
+        redirectUri: redirectUri(provider),
+        spec: redirectOauthSpec(connector),
+      });
+      return finish(provider, true, "connected", c);
+    } catch (err) {
+      const message = err instanceof ConnectError ? err.rawMessage : "OAuth exchange failed";
+      return finish(provider, false, message, c);
+    }
   });
 
   return app;
