@@ -154,116 +154,112 @@ function SidebarProvider({
   );
 }
 
-type SidebarResizeHandleProps = {
-  /** The stored width in px, or null while the rail keeps its rem default. */
-  width: number | null;
-  min: number;
-  max: number;
-  /** Live update during a drag — cheap, not persisted. */
-  onWidthChange: (px: number) => void;
-  /** Flush the current width to storage (drag end / key up). */
-  onCommit: () => void;
-  /** Drop the stored width, back to the rem default. */
-  onReset: () => void;
-};
-
-/**
- * A rail's width is a personal, per-browser layout preference (like the theme
- * and the Enter-to-send toggle), so it lives in localStorage, not on the server.
- *
- * Returns `[style, handleProps]`: put `style` on the `SidebarProvider` that owns
- * the rail (it pins `--sidebar-width` for that subtree only, so widening one
- * section rail leaves the others alone) and spread `handleProps` onto a
- * `SidebarResizeHandle` inside the `Sidebar`.
- *
- * The width stays null until the first drag, so an untouched rail keeps the
- * rem-based default instead of being pinned to a guessed pixel equivalent.
- */
-function useSidebarWidth(
-  storageKey: string,
-  { min = SIDEBAR_WIDTH_MIN, max = SIDEBAR_WIDTH_MAX }: { min?: number; max?: number } = {},
-): [React.CSSProperties | undefined, SidebarResizeHandleProps] {
-  const clamp = React.useCallback(
-    (px: number) => Math.round(Math.min(max, Math.max(min, px))),
-    [min, max],
-  );
-
-  const [width, setWidth] = React.useState<number | null>(() => {
-    try {
-      const stored = Number(localStorage.getItem(storageKey));
-      // A missing or garbled value reads as 0/NaN — leave the var unset.
-      return Number.isFinite(stored) && stored > 0
-        ? Math.round(Math.min(max, Math.max(min, stored)))
-        : null;
-    } catch {
-      return null;
-    }
-  });
-  // Drag end has to persist the width the last pointermove produced, which is
-  // newer than the `width` any already-created callback closed over.
-  const latest = React.useRef(width);
-
-  const handle = React.useMemo<SidebarResizeHandleProps>(() => {
-    const write = (value: number | null) => {
-      try {
-        if (value === null) localStorage.removeItem(storageKey);
-        else localStorage.setItem(storageKey, String(value));
-      } catch {
-        /* private-mode / quota — keep the in-memory width */
-      }
-    };
-    return {
-      width,
-      min,
-      max,
-      onWidthChange: (px) => {
-        const next = clamp(px);
-        latest.current = next;
-        setWidth(next);
-      },
-      onCommit: () => write(latest.current),
-      onReset: () => {
-        latest.current = null;
-        setWidth(null);
-        write(null);
-      },
-    };
-  }, [width, min, max, clamp, storageKey]);
-
-  const style = React.useMemo(
-    () =>
-      width === null ? undefined : ({ "--sidebar-width": `${width}px` } as React.CSSProperties),
-    [width],
-  );
-
-  return [style, handle];
+function readStoredWidth(storageKey: string, min: number, max: number): number | null {
+  try {
+    const stored = Number(localStorage.getItem(storageKey));
+    // A missing or garbled value reads as 0/NaN — keep the rem default.
+    return Number.isFinite(stored) && stored > 0
+      ? Math.round(Math.min(max, Math.max(min, stored)))
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
- * The grab strip on a rail's trailing edge. Mount it as the last child of a
- * `Sidebar` (it positions itself against that box and measures it to find the
- * drag origin). Keyboard: ←/→ nudge, Shift for a coarse step, Home resets —
- * double-click resets too.
+ * The grab strip on a rail's trailing edge, for a `Sidebar` inside its own
+ * `SidebarProvider`. Mount it as the last child of that `Sidebar`; it finds both
+ * the rail (its parent, for the drag origin) and the provider wrapper that
+ * carries `--sidebar-width` from its own position in the tree.
+ *
+ * A rail's width is a personal, per-browser layout preference (like the theme
+ * and the Enter-to-send toggle), so it lives in localStorage, not on the server.
+ * Because the var is written on the OWN provider's wrapper, widening one section
+ * rail leaves the app nav and the sibling rails alone.
+ *
+ * Keyboard: ←/→ nudge, Shift for a coarse step, Home resets — double-click
+ * resets too.
+ *
+ * The whole width lives in this leaf, and a drag writes the CSS var straight to
+ * the DOM. React state holds only the COMMITTED width (for the drag origin,
+ * `aria-valuenow`, and persistence), so a pointermove costs one style write
+ * instead of re-rendering the section layout — which renders the rail list AND
+ * the route `Outlet`, i.e. the whole transcript.
  */
 function SidebarResizeHandle({
-  width,
-  min,
-  max,
-  onWidthChange,
-  onCommit,
-  onReset,
+  storageKey,
   label = "Resize sidebar",
+  min = SIDEBAR_WIDTH_MIN,
+  max = SIDEBAR_WIDTH_MAX,
   className,
-}: SidebarResizeHandleProps & { label?: string; className?: string }) {
+}: {
+  storageKey: string;
+  label?: string;
+  min?: number;
+  max?: number;
+  className?: string;
+}) {
   const ref = React.useRef<HTMLDivElement>(null);
   const drag = React.useRef<{ startX: number; startWidth: number } | null>(null);
   const [dragging, setDragging] = React.useState(false);
+  const [width, setWidth] = React.useState<number | null>(() =>
+    readStoredWidth(storageKey, min, max),
+  );
+  // Drag end persists the width the last pointermove produced, which is newer
+  // than the `width` this render closed over.
+  const latest = React.useRef(width);
+
+  // Writing the var on the provider wrapper (not on the rail) keeps ONE
+  // authority for the width and matches where the primitive declares it.
+  const apply = (px: number | null) => {
+    const wrapper = ref.current?.closest<HTMLElement>('[data-slot="sidebar-wrapper"]');
+    // A reset writes the primitive's default back rather than removing the
+    // property: the provider set it inline, so removing it would leave the rail
+    // with no width at all.
+    wrapper?.style.setProperty("--sidebar-width", px === null ? SIDEBAR_WIDTH : `${px}px`);
+  };
+
+  // Applies the restored width before the first paint, and re-applies after a
+  // commit (idempotent — the drag already wrote that value).
+  React.useLayoutEffect(() => {
+    apply(width);
+  }, [width]);
+
+  const persist = (px: number | null) => {
+    try {
+      if (px === null) localStorage.removeItem(storageKey);
+      else localStorage.setItem(storageKey, String(px));
+    } catch {
+      /* private-mode / quota — keep the in-memory width */
+    }
+  };
+
+  // Live, per-frame: DOM only, no render.
+  const resizeTo = (px: number) => {
+    const next = Math.round(Math.min(max, Math.max(min, px)));
+    latest.current = next;
+    apply(next);
+  };
+
+  const commit = () => {
+    setWidth(latest.current);
+    persist(latest.current);
+  };
+
+  const reset = () => {
+    latest.current = null;
+    setWidth(null);
+    persist(null);
+    // `setWidth(null)` is a no-op when the width is already null, so the layout
+    // effect would not fire; write the default back here too.
+    apply(null);
+  };
 
   // Before the first drag there is no stored px width, so read the rail's own
   // rendered width as the origin. A zero measurement means it is not laid out —
   // never a valid origin, so fall back to the floor.
   const baseWidth = () => {
-    if (width !== null) return width;
+    if (latest.current !== null) return latest.current;
     const measured = ref.current?.parentElement?.getBoundingClientRect().width ?? 0;
     return measured > 0 ? Math.round(measured) : min;
   };
@@ -281,7 +277,7 @@ function SidebarResizeHandle({
     drag.current = null;
     setDragging(false);
     setDragCursor(false);
-    onCommit();
+    commit();
   };
 
   return (
@@ -316,22 +312,25 @@ function SidebarResizeHandle({
       }}
       onPointerMove={(event) => {
         if (!drag.current) return;
-        onWidthChange(drag.current.startWidth + (event.clientX - drag.current.startX));
+        resizeTo(drag.current.startWidth + (event.clientX - drag.current.startX));
       }}
       // Capture is released implicitly on up/cancel; lostpointercapture is the
       // backstop for a pointer that disappears mid-drag.
       onPointerUp={endDrag}
       onPointerCancel={endDrag}
       onLostPointerCapture={endDrag}
-      onDoubleClick={onReset}
+      onDoubleClick={reset}
       onKeyDown={(event) => {
         const step = event.shiftKey ? SIDEBAR_WIDTH_STEP * 4 : SIDEBAR_WIDTH_STEP;
-        if (event.key === "ArrowLeft") onWidthChange(baseWidth() - step);
-        else if (event.key === "ArrowRight") onWidthChange(baseWidth() + step);
-        else if (event.key === "Home") onReset();
-        else return;
+        if (event.key === "ArrowLeft") resizeTo(baseWidth() - step);
+        else if (event.key === "ArrowRight") resizeTo(baseWidth() + step);
+        else if (event.key === "Home") {
+          reset();
+          event.preventDefault();
+          return;
+        } else return;
         event.preventDefault();
-        if (event.key !== "Home") onCommit();
+        commit();
       }}
     />
   );
@@ -890,5 +889,4 @@ export {
   SidebarSeparator,
   SidebarTrigger,
   useSidebar,
-  useSidebarWidth,
 };

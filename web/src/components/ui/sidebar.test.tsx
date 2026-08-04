@@ -1,13 +1,7 @@
 import { expect, test, beforeEach } from "vitest";
 import { render, act, fireEvent } from "@testing-library/react";
 import * as React from "react";
-import {
-  Sidebar,
-  SidebarProvider,
-  SidebarResizeHandle,
-  useSidebar,
-  useSidebarWidth,
-} from "@/components/ui/sidebar";
+import { Sidebar, SidebarProvider, SidebarResizeHandle, useSidebar } from "@/components/ui/sidebar";
 
 const STORAGE_KEY = "sidebar_state";
 
@@ -65,23 +59,20 @@ test("persists state to localStorage when toggled", () => {
   expect(localStorage.getItem(STORAGE_KEY)).toBe("true");
 });
 
-// --- useSidebarWidth / SidebarResizeHandle -------------------------------
+// --- SidebarResizeHandle -------------------------------------------------
 
 const WIDTH_KEY = "test_rail_width";
 
-function ResizableRail() {
-  const [style, handle] = useSidebarWidth(WIDTH_KEY);
-  return (
-    <SidebarProvider data-testid="wrapper" style={style}>
-      <Sidebar collapsible="none">
-        <SidebarResizeHandle {...handle} label="Resize rail" />
-      </Sidebar>
-    </SidebarProvider>
-  );
-}
-
+// A drag writes `--sidebar-width` straight to the provider wrapper, so these
+// tests read the var off that element rather than any React-owned style prop.
 function renderRail() {
-  const { getByTestId, getByRole } = render(<ResizableRail />);
+  const { getByTestId, getByRole } = render(
+    <SidebarProvider data-testid="wrapper">
+      <Sidebar collapsible="none">
+        <SidebarResizeHandle storageKey={WIDTH_KEY} label="Resize rail" />
+      </Sidebar>
+    </SidebarProvider>,
+  );
   return { wrapper: getByTestId("wrapper"), handle: getByRole("separator") };
 }
 
@@ -156,6 +147,41 @@ test("arrow keys nudge the width and persist it", () => {
 
 test("Home clears the stored width, back to the rem default", () => {
   localStorage.setItem(WIDTH_KEY, "300");
+  const { wrapper, handle } = renderRail();
+
+  act(() => fireEvent.keyDown(handle, { key: "Home" }));
+  expect(widthVar(wrapper)).toBe("16rem");
+  expect(localStorage.getItem(WIDTH_KEY)).toBeNull();
+});
+
+test("the live drag width goes to the DOM, never through React state", () => {
+  // Why this matters: a pointermove fires ~60x/sec, and React state for it would
+  // re-render whatever owns the width. In the real consumer that is
+  // SessionsLayout, which renders the task list AND the route Outlet — the whole
+  // transcript — per frame.
+  //
+  // `aria-valuenow` is the observable signature: it reads the COMMITTED state,
+  // so it MUST lag the var mid-drag. If it tracks the var, the live width is
+  // going through state again.
+  localStorage.setItem(WIDTH_KEY, "300");
+  const { wrapper, handle } = renderRail();
+
+  act(() => {
+    fireEvent.pointerDown(handle, { button: 0, pointerId: 1, clientX: 300 });
+    for (const x of [320, 340, 360, 380])
+      fireEvent.pointerMove(handle, { pointerId: 1, clientX: x });
+  });
+  expect(widthVar(wrapper)).toBe("380px");
+  expect(handle.getAttribute("aria-valuenow")).toBe("300");
+
+  act(() => fireEvent.pointerUp(handle, { pointerId: 1 }));
+  expect(handle.getAttribute("aria-valuenow")).toBe("380");
+  expect(localStorage.getItem(WIDTH_KEY)).toBe("380");
+});
+
+test("resetting an already-default rail keeps the default", () => {
+  // `setWidth(null)` bails out when the width is already null, so the layout
+  // effect never fires — the reset path has to write the default itself.
   const { wrapper, handle } = renderRail();
 
   act(() => fireEvent.keyDown(handle, { key: "Home" }));
