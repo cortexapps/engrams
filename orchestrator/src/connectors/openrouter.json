@@ -1,0 +1,24 @@
+{
+  "provider": "openrouter",
+  "protocol": "http",
+  "display": {
+    "name": "OpenRouter",
+    "category": "AI",
+    "blurb": "LLM inference through OpenRouter's unified API. Powers orchestrator-side auto-titling of sessions; grantable to sessions for chat completions.",
+    "icon": { "mono": "OR", "color": "#6467f2" }
+  },
+  "credential": {
+    "source": "inject",
+    "injects": [
+      { "header": "Authorization", "template": "Bearer {}", "secretRef": "openrouter.api_key" }
+    ]
+  },
+  "hosts": ["openrouter.ai"],
+  "test": { "path": "/api/v1/models" },
+  "operations": [
+    {
+      "grants": ["chat:write"],
+      "match": { "method": "POST", "path": "/api/v1/chat/completions" }
+    }
+  ]
+}

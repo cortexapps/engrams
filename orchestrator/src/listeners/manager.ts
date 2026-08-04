@@ -9,6 +9,7 @@ import { SessionListener } from "./session-listener.ts";
 import { makeProductionPrLinkConsumer } from "./pr-link-consumer.ts";
 import { makeProductionReviewConsumer } from "./review-consumer.ts";
 import { makeProductionSlackConsumer } from "./slack-consumer.ts";
+import { makeProductionTitleConsumer } from "./title-consumer.ts";
 import { makeProductionToolConsumer } from "./tool-consumer.ts";
 
 const log = rootLog.child({ component: "listener-manager" });
@@ -160,6 +161,7 @@ export function makeProductionListenerManager(): ListenerManager {
           makeProductionPrLinkConsumer(),
           makeProductionSlackConsumer(),
           makeProductionReviewConsumer(),
+          makeProductionTitleConsumer(),
         ],
         readPage: (id, after, signal) =>
           readSessionEventsBounded(id, after, undefined, signal),

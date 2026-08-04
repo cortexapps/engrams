@@ -126,8 +126,14 @@ describe("routeSessionEvent()", () => {
     });
   });
 
-  test("an agent_message with an unparseable payload → message with empty text", () => {
-    expect(routeSessionEvent(ev("agent_message", "not json"))).toEqual({ kind: "message", text: "" });
+  test("an agent_message with an unparseable payload → ignore", () => {
+    expect(routeSessionEvent(ev("agent_message", "not json"))).toEqual({ kind: "ignore" });
+  });
+
+  test("the user prompt echo never posts back to the thread → ignore", () => {
+    expect(
+      routeSessionEvent(ev("agent_message", '{"role":"user","text":"my own prompt"}')),
+    ).toEqual({ kind: "ignore" });
   });
 
   test("a question with an unparseable payload still routes (toolCallId undefined)", () => {
