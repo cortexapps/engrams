@@ -84,6 +84,60 @@ describe("foldReplies()", () => {
     expect(foldReplies([], "100.0", "BOT", undefined)).toEqual({ prompt: "", maxTs: "100.0" });
   });
 
+  test("a bot-authored ROOT is kept as context; other bot replies are still dropped", () => {
+    const out = foldReplies(
+      [
+        { ts: "100.0", bot_id: "B9", text: "ALERT: p99 latency over budget" },
+        { ts: "101.0", bot_id: "B1", text: "Started a session…" },
+        { ts: "102.0", user: "U1", text: "<@BOT> can you look into this?" },
+      ],
+      null,
+      "BOT",
+      "102.0",
+      "100.0", // the thread root
+    );
+    expect(out.prompt).toBe(
+      "<thread context>\nALERT: p99 latency over budget\n</thread context>\n\ncan you look into this?",
+    );
+    expect(out.maxTs).toBe("102.0");
+  });
+
+  test("an attachments-only root (empty text) folds the attachment content in", () => {
+    const out = foldReplies(
+      [
+        {
+          ts: "100.0",
+          bot_id: "B9",
+          text: "",
+          attachments: [{ title: "Deploy failed", text: "step `build` exited 1" }],
+        },
+        { ts: "101.0", user: "U1", text: "<@BOT> fix it" },
+      ],
+      null,
+      "BOT",
+      "101.0",
+      "100.0",
+    );
+    expect(out.prompt).toBe(
+      "<thread context>\nDeploy failed\nstep `build` exited 1\n</thread context>\n\nfix it",
+    );
+  });
+
+  test("a follow-up gather never re-delivers the root (it is behind the cursor)", () => {
+    const out = foldReplies(
+      [
+        { ts: "100.0", bot_id: "B9", text: "ALERT" },
+        { ts: "200.0", user: "U1", text: "<@BOT> also do X" },
+      ],
+      "150.0",
+      "BOT",
+      "200.0",
+      "100.0",
+    );
+    expect(out.prompt).toBe("also do X");
+    expect(out.maxTs).toBe("200.0");
+  });
+
   test("directive not among the replies → plain join, no wrapper (graceful fallback)", () => {
     const out = foldReplies(
       [
@@ -412,5 +466,18 @@ describe("makeSlackPolicy()", () => {
     expect(calls.replies[0].ts).toBe("100.0");
     expect(out.prompt).toBe("do the thing");
     expect(out.maxTs).toBe("100.0");
+  });
+
+  test("gatherThreadContext keeps a bot-authored root when the mention is a thread reply", async () => {
+    const { client } = fakeClient();
+    client.conversations.replies = async () => ({
+      messages: [
+        { ts: "100.0", bot_id: "B9", text: "ALERT: disk full" },
+        { ts: "101.0", user: "U1", text: "<@BOT> handle this" },
+      ],
+    });
+    const out = await policy(client).gatherThreadContext({ ...M, ts: "101.0" }, null);
+    expect(out.prompt).toBe("<thread context>\nALERT: disk full\n</thread context>\n\nhandle this");
+    expect(out.maxTs).toBe("101.0");
   });
 });
