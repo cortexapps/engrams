@@ -17,22 +17,10 @@ export const runIntegrationOp = IntegrationOpService.method.runIntegrationOp;
  * Resolve a connector's credential to its raw material so the orchestrator can
  * drive an off-the-shelf SDK. Returns a typed ResolvedCredential.
  *
+ * OAuth acquisition moved to OAuthCredentialService.Begin/CompleteRedirectFlow
+ * (ADR 0106 addendum): obtained tokens live in the sealed credential store
+ * with rotation + refresh, never as org secrets.
+ *
  * @generated from rpc engram.app.v1.IntegrationOpService.ResolveIntegrationCredential
  */
 export const resolveIntegrationCredential = IntegrationOpService.method.resolveIntegrationCredential;
-
-/**
- * OAuth 2.0 authorization-code acquisition (e.g. Slack "Add to Slack"). The
- * orchestrator owns the browser redirect + CSRF state; the coordinator — the
- * only tier that can read/write org secrets — builds the authorize URL from the
- * stored client id, and (on callback) runs the code->token exchange and writes
- * the obtained access token to the org store.
- *
- * @generated from rpc engram.app.v1.IntegrationOpService.BeginIntegrationOauth
- */
-export const beginIntegrationOauth = IntegrationOpService.method.beginIntegrationOauth;
-
-/**
- * @generated from rpc engram.app.v1.IntegrationOpService.CompleteIntegrationOauth
- */
-export const completeIntegrationOauth = IntegrationOpService.method.completeIntegrationOauth;

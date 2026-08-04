@@ -1,6 +1,8 @@
 /**
- * Slack integration (PR2): the OAuth facet parse boundary, the OAuth acquisition
- * route, and the @slack/web-api adapter on the generic SDK seam.
+ * Slack integration: the OAuth facet parse boundary (ADR 0106 addendum:
+ * OAuth-only connectors, sealed-store tokens), the OAuth acquisition route
+ * over the coordinator's redirect-flow RPCs, and the @slack/web-api adapter
+ * on the generic SDK seam.
  */
 
 import { expect, test, describe, beforeEach } from "bun:test";
@@ -14,6 +16,9 @@ import {
   ResolveIntegrationCredentialResponseSchema,
   ResolvedCredentialSchema,
 } from "../gen/engram/app/v1/integration_op_pb.ts";
+import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
+import type { BeginRedirectFlowRequest, CompleteRedirectFlowRequest } from "../gen/engram/app/v1/oauth_pb.ts";
+import { ConnectError, Code } from "@connectrpc/connect";
 
 const emptySource = { list: async () => [] };
 const adminSession = async () => ({ user: { id: "u1", role: "admin" } });
@@ -24,7 +29,9 @@ describe("oauth facet parse", () => {
   const base = {
     provider: "slack",
     protocol: "http",
-    credential: { source: "inject", injects: [{ header: "Authorization", template: "Bearer {}", secretRef: "slack.bot_token" }] },
+    // OAuth-only: the single inject carries NO secretRef — the value is the
+    // store-resolved access token.
+    credential: { source: "inject", injects: [{ header: "Authorization", template: "Bearer {}" }] },
     hosts: ["slack.com"],
     operations: [{ grants: ["chat:write"], match: { path: "/api/chat.*" } }],
   };
@@ -34,15 +41,20 @@ describe("oauth facet parse", () => {
     scopes: ["chat:write"],
     clientIdRef: "slack.client_id",
     clientSecretRef: "slack.client_secret",
-    tokenSecretRef: "slack.bot_token",
-    tokenResponsePath: "access_token",
   };
 
-  test("the built-in slack seed loads with an oauth facet", () => {
+  test("the built-in slack seed is OAuth-only with sealed-store metadata mapping", () => {
     const slack = connectorRegistry().get("slack");
     expect(slack).toBeDefined();
-    expect(slack?.oauth?.tokenSecretRef).toBe("slack.bot_token");
     expect(slack?.oauth?.scopes).toContain("chat:write");
+    // Tokens live in the credential store: no secretRef on the inject, and
+    // account identity maps declaratively off the token response.
+    expect(slack?.credential.source).toBe("inject");
+    if (slack?.credential.source === "inject") {
+      expect(slack.credential.injects[0]?.secretRef).toBeUndefined();
+    }
+    expect(slack?.oauth?.metadata?.fromTokenResponse?.accountId).toBe("team.id");
+    expect(slack?.oauth?.metadata?.fromTokenResponse?.workspaceName).toBe("team.name");
   });
 
   test("accepts a well-formed oauth facet", () => {
@@ -54,10 +66,113 @@ describe("oauth facet parse", () => {
     expect(() => parseConnector({ ...base, oauth: { ...oauth, tokenUrl: "http://slack.com/x" } }, "x")).toThrow(/https/);
   });
 
-  test("rejects an endpoint host outside the connector's hosts (anti-exfil)", () => {
+  test("rejects a token endpoint outside the connector's hosts (anti-exfil)", () => {
     expect(() =>
       parseConnector({ ...base, oauth: { ...oauth, tokenUrl: "https://evil.example.com/x" } }, "x"),
-    ).toThrow(/must be one of the connector's hosts/);
+    ).toThrow(/must be one of/);
+  });
+
+  test("acquisitionHosts admit the authorize URL only — never the token URL", () => {
+    const c = parseConnector(
+      {
+        ...base,
+        oauth: {
+          ...oauth,
+          acquisitionHosts: ["auth.slack.com"],
+          authorizeUrl: "https://auth.slack.com/authorize",
+        },
+      },
+      "x",
+    );
+    expect(c.oauth?.acquisitionHosts).toEqual(["auth.slack.com"]);
+    expect(() =>
+      parseConnector(
+        {
+          ...base,
+          oauth: {
+            ...oauth,
+            acquisitionHosts: ["auth.slack.com"],
+            tokenUrl: "https://auth.slack.com/token",
+          },
+        },
+        "x",
+      ),
+    ).toThrow(/must be one of/);
+  });
+
+  test("rejects the retired tokenSecretRef/tokenResponsePath fields", () => {
+    expect(() =>
+      parseConnector({ ...base, oauth: { ...oauth, tokenSecretRef: "slack.bot_token" } }, "x"),
+    ).toThrow(/retired/);
+    expect(() =>
+      parseConnector({ ...base, oauth: { ...oauth, tokenResponsePath: "access_token" } }, "x"),
+    ).toThrow(/retired/);
+  });
+
+  test("an oauth connector's inject must not carry a secretRef (OAuth-only)", () => {
+    const withRef = {
+      ...base,
+      credential: {
+        source: "inject",
+        injects: [{ header: "Authorization", template: "Bearer {}", secretRef: "slack.bot_token" }],
+      },
+    };
+    expect(() => parseConnector({ ...withRef, oauth }, "x")).toThrow(/must not carry/);
+  });
+
+  test("a connector WITHOUT an oauth facet still requires secretRef", () => {
+    const { credential: _omit, ...rest } = base;
+    expect(() =>
+      parseConnector(
+        {
+          ...rest,
+          credential: { source: "inject", injects: [{ header: "Authorization" }] },
+        },
+        "x",
+      ),
+    ).toThrow(/"secretRef" is required/);
+  });
+
+  test("rejects reserved extraAuthorizeParams and oversized maps", () => {
+    expect(() =>
+      parseConnector(
+        { ...base, oauth: { ...oauth, extraAuthorizeParams: { redirect_uri: "https://evil" } } },
+        "x",
+      ),
+    ).toThrow(/reserved/);
+    const c = parseConnector(
+      { ...base, oauth: { ...oauth, extraAuthorizeParams: { actor: "app" } } },
+      "x",
+    );
+    expect(c.oauth?.extraAuthorizeParams).toEqual({ actor: "app" });
+  });
+
+  test("metadata dot-paths are bounded and field-checked", () => {
+    expect(() =>
+      parseConnector(
+        { ...base, oauth: { ...oauth, metadata: { fromTokenResponse: { nonsense: "team.id" } } } },
+        "x",
+      ),
+    ).toThrow(/not a metadata field/);
+    expect(() =>
+      parseConnector(
+        { ...base, oauth: { ...oauth, metadata: { fromTokenResponse: { accountId: "__proto__.x" } } } },
+        "x",
+      ),
+    ).toThrow(/not allowed/);
+    const c = parseConnector(
+      {
+        ...base,
+        oauth: {
+          ...oauth,
+          metadata: {
+            probe: { method: "GET", path: "/api/auth.test", map: { accountId: "team_id" } },
+          },
+        },
+      },
+      "x",
+    );
+    expect(c.oauth?.metadata?.probe?.map.accountId).toBe("team_id");
   });
 
   test("rejects a missing secret ref", () => {
@@ -83,78 +198,128 @@ describe("oauth facet parse", () => {
   });
 });
 
-// ── The OAuth acquisition route ─────────────────────────────────────────────
+// ── The OAuth acquisition route (durable-flow CSRF, coordinator-side) ───────
 
-function fakeOauthClient() {
-  const calls: { begin: unknown[]; complete: unknown[] } = { begin: [], complete: [] };
+function fakeRedirectClient(opts?: { completeError?: ConnectError }) {
+  const calls: { begin: BeginRedirectFlowRequest[]; complete: CompleteRedirectFlowRequest[] } = {
+    begin: [],
+    complete: [],
+  };
   const client = {
-    beginIntegrationOauth: async (req: unknown) => {
+    beginRedirectFlow: async (req: BeginRedirectFlowRequest) => {
       calls.begin.push(req);
-      return { authorizeUrl: "https://slack.com/oauth/v2/authorize?client_id=c&state=s1" };
+      return {
+        flow: { id: "10600000-0000-4000-8000-0000000000aa" },
+        authorizeUrl:
+          "https://slack.com/oauth/v2/authorize?client_id=c&state=10600000-0000-4000-8000-0000000000aa",
+      };
     },
-    completeIntegrationOauth: async (req: unknown) => {
+    completeRedirectFlow: async (req: CompleteRedirectFlowRequest) => {
       calls.complete.push(req);
-      return { ok: true, message: "Connected slack" };
+      if (opts?.completeError) throw opts.completeError;
+      return { credential: { provider: "slack", connected: true } };
     },
   };
   return { client, calls };
 }
 
+const connectionIdFor = async () => "conn-slack-default";
+
 describe("integration oauth route", () => {
   beforeEach(() => invalidateRegistry());
 
-  test("authorize: admin → 302 to the IdP authorize URL", async () => {
-    const { client, calls } = fakeOauthClient();
+  test("authorize: admin → 302 to the coordinator-assembled authorize URL", async () => {
+    const { client, calls } = fakeRedirectClient();
     const app = makeIntegrationOauthRoute({
       connectors: emptySource,
-      integrationOp: client as never,
+      oauthCredential: client as never,
+      connectionIdFor,
       getSession: adminSession,
-      randomState: () => "s1",
     });
     const res = await app.request("/api/v1/integrations/slack/oauth/authorize");
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toContain("slack.com/oauth/v2/authorize");
     expect(calls.begin).toHaveLength(1);
+    const begin = calls.begin[0]!;
+    expect(begin.provider).toBe("slack");
+    expect(begin.subject?.kind).toBe(OauthSubjectKind.CONNECTOR);
+    expect(begin.subject?.id).toBe("conn-slack-default");
+    expect(begin.redirectUri).toContain("/api/v1/integrations/slack/oauth/callback");
+    expect(begin.spec?.tokenUrl).toBe("https://slack.com/api/oauth.v2.access");
+    expect(begin.spec?.clientSecretRef).toBe("slack.client_secret");
+    // The seed's metadata mapping rides the wire in snake_case.
+    expect(begin.spec?.metadata?.fromTokenResponse?.account_id).toBe("team.id");
+  });
+
+  test("authorize: force=1 appends prompt=consent (reconnect)", async () => {
+    const { client, calls } = fakeRedirectClient();
+    const app = makeIntegrationOauthRoute({
+      connectors: emptySource,
+      oauthCredential: client as never,
+      connectionIdFor,
+      getSession: adminSession,
+    });
+    await app.request("/api/v1/integrations/slack/oauth/authorize?force=1");
+    expect(calls.begin[0]!.spec?.extraAuthorizeParams?.prompt).toBe("consent");
   });
 
   test("authorize: non-admin → 403", async () => {
-    const { client } = fakeOauthClient();
+    const { client } = fakeRedirectClient();
     const app = makeIntegrationOauthRoute({
       connectors: emptySource,
-      integrationOp: client as never,
+      oauthCredential: client as never,
+      connectionIdFor,
       getSession: async () => ({ user: { id: "u2", role: "user" } }),
-      randomState: () => "s1",
     });
     const res = await app.request("/api/v1/integrations/slack/oauth/authorize");
     expect(res.status).toBe(403);
   });
 
-  test("callback: valid state → exchanges + 302 connected", async () => {
-    const { client, calls } = fakeOauthClient();
+  test("callback: completes the flow (state = flow id) → 302 connected", async () => {
+    const { client, calls } = fakeRedirectClient();
     const app = makeIntegrationOauthRoute({
       connectors: emptySource,
-      integrationOp: client as never,
+      oauthCredential: client as never,
+      connectionIdFor,
       getSession: adminSession,
-      randomState: () => "s1",
     });
-    // Register the state via authorize first.
-    await app.request("/api/v1/integrations/slack/oauth/authorize");
-    const res = await app.request("/api/v1/integrations/slack/oauth/callback?code=abc&state=s1");
+    const res = await app.request(
+      "/api/v1/integrations/slack/oauth/callback?code=abc&state=10600000-0000-4000-8000-0000000000aa",
+    );
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/settings/integrations/slack?connected=1");
     expect(calls.complete).toHaveLength(1);
+    const complete = calls.complete[0]!;
+    expect(complete.flowId).toBe("10600000-0000-4000-8000-0000000000aa");
+    expect(complete.code).toBe("abc");
+    expect(complete.subject?.id).toBe("conn-slack-default");
   });
 
-  test("callback: unknown state → 403, no exchange", async () => {
-    const { client, calls } = fakeOauthClient();
+  test("callback: a coordinator rejection (forged/expired state) → error redirect", async () => {
+    const { client } = fakeRedirectClient({
+      completeError: new ConnectError("OAuth resource not found", Code.NotFound),
+    });
     const app = makeIntegrationOauthRoute({
       connectors: emptySource,
-      integrationOp: client as never,
+      oauthCredential: client as never,
+      connectionIdFor,
       getSession: adminSession,
-      randomState: () => "s1",
     });
     const res = await app.request("/api/v1/integrations/slack/oauth/callback?code=abc&state=forged");
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toContain("error=");
+  });
+
+  test("callback: missing code/state → 400, no coordinator call", async () => {
+    const { client, calls } = fakeRedirectClient();
+    const app = makeIntegrationOauthRoute({
+      connectors: emptySource,
+      oauthCredential: client as never,
+      connectionIdFor,
+      getSession: adminSession,
+    });
+    const res = await app.request("/api/v1/integrations/slack/oauth/callback");
+    expect(res.status).toBe(400);
     expect(calls.complete).toHaveLength(0);
   });
 });

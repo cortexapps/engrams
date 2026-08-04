@@ -519,11 +519,14 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
               // ADR 0058: probe EVERY injected header. The web sends the drafted
               // values keyed by org-secret ref (`draft[secretRef]`); a header with
               // no draft falls back to its stored secret coordinator-side.
+              // An oauth-facet connector's inject has no secretRef; its test
+              // resolves the brokered credential coordinator-side (the empty
+              // ref makes the legacy static path report "not connected").
               injects: c.credential.injects.map((inj) => ({
                 header: inj.header,
                 template: inj.template ?? "{}",
-                secretRef: inj.secretRef,
-                draftSecret: draft[inj.secretRef] ?? "",
+                secretRef: inj.secretRef ?? "",
+                draftSecret: (inj.secretRef !== undefined ? draft[inj.secretRef] : "") ?? "",
               })),
               ...(testPath ? { testPath } : {}),
             };

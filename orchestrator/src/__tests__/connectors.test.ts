@@ -435,6 +435,41 @@ describe("compileIntegrationPolicy", () => {
     ]);
   });
 
+  test("an oauth-facet connector compiles to a brokered-source inject (ADR 0106 addendum)", () => {
+    const linearRaw = {
+      provider: "linear",
+      protocol: "http",
+      credential: { source: "inject", injects: [{ header: "Authorization", template: "Bearer {}" }] },
+      hosts: ["api.linear.app"],
+      oauth: {
+        authorizeUrl: "https://linear.app/oauth/authorize",
+        acquisitionHosts: ["linear.app"],
+        tokenUrl: "https://api.linear.app/oauth/token",
+        scopes: ["read", "write"],
+        clientIdRef: "linear.client_id",
+        clientSecretRef: "linear.client_secret",
+      },
+      operations: [{ grants: ["graphql"], match: { operation: "query", field: "viewer" } }],
+    };
+    const policy = compileIntegrationPolicy(["linear:graphql"], registryOf(linearRaw));
+    expect(policy.injects).toEqual([
+      {
+        hosts: ["api.linear.app"],
+        header_name: "Authorization",
+        header_template: "Bearer {}",
+        secret_ref: "",
+        mint_source: { oauth_connector: { connection_id: "test-linear", provider: "linear" } },
+        methods: ["POST"],
+        path_globs: ["/graphql"],
+        graphql_operation: "query",
+        graphql_field: "viewer",
+      },
+    ]);
+    // The acquisition host is a browser-redirect surface only: the session
+    // egress allow-list opens the API host, never linear.app.
+    expect(policy.network.allow_hosts).toEqual(["api.linear.app"]);
+  });
+
   test("the resource suffix is ignored for inject gating", () => {
     const a = compileIntegrationPolicy(["datadog:logs:read"], reg);
     const b = compileIntegrationPolicy(["datadog:logs:read@idx-1"], reg);
@@ -693,7 +728,9 @@ describe("on-disk registry", () => {
     // emits a minted inject for github.
     expect(policy.injects.length).toBeGreaterThan(0);
     expect(policy.injects.every((i) =>
-      i.mint_source?.connection.connection_id === "test-github" &&
+      i.mint_source != null &&
+        "connection" in i.mint_source &&
+        i.mint_source.connection.connection_id === "test-github" &&
         i.mint_source.connection.provider === "github"
     )).toBe(true);
     // Two issue assets are observed: the REST create (POST /repos/*/issues, gated by
