@@ -8,10 +8,12 @@
 # supply). There is NOTHING to log in to — do not set a real key or run any
 # `login`.
 #
-# Linear is a GraphQL-only API: ONE endpoint (POST /graphql). It has a SINGLE
-# power, `linear:graphql`, which grants both reads (queries) AND writes
-# (mutations) — read/write cannot be split by path on a GraphQL API. A request is
-# denied at the network boundary, not authenticated, if your profile lacks it.
+# Linear is a GraphQL-only API: ONE endpoint (POST /graphql). Powers gate the
+# TOP-LEVEL GraphQL fields a request may select, by product area (ADR 0059
+# body-parsed gating): org:read, issues:read, issues:write, projects:read,
+# projects:write. EVERY top-level field a document selects must be covered by
+# a granted power, or the proxy refuses the request at the network boundary —
+# it never reaches Linear.
 set -eu
 
 API="https://api.linear.app/graphql"
@@ -32,8 +34,11 @@ Usage:
   linear query <graphql> [varsJSON]      Run an arbitrary query/mutation
   linear raw <json-body>                 POST a raw GraphQL JSON body verbatim
 
-Linear is GraphQL-only: one endpoint, POST https://api.linear.app/graphql. All
-subcommands need the `linear:graphql` power. Responses are JSON {"data":{...}} or
+Linear is GraphQL-only: one endpoint, POST https://api.linear.app/graphql.
+Powers gate top-level fields by product area: whoami/teams need org:read;
+issues/issue need issues:read; comment/create need issues:write; projects
+needs projects:read; query/raw pass iff every selected top-level field is
+covered by a granted power. Responses are JSON {"data":{...}} or
 {"errors":[...]}; GraphQL can return HTTP 200 with an "errors" array.
 EOF
 }

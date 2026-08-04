@@ -1099,7 +1099,7 @@ describe("cli facet (ADR 0058)", () => {
     expect(plan.bundles).toEqual([INTEGRATIONS_CLI_BUNDLE]);
   });
 
-  test("the built-in linear seed is OAuth-only (actor=app) with a viewer probe", () => {
+  test("the built-in linear seed is OAuth-only (actor=app) with product-area GraphQL powers", () => {
     const linear = connectorRegistry().get("linear")!;
     // OAuth-only: no secretRef on the inject; Bearer template for the app token.
     expect(linear.credential.source).toBe("inject");
@@ -1112,18 +1112,52 @@ describe("cli facet (ADR 0058)", () => {
     expect(linear.oauth?.extraAuthorizeParams).toEqual({ actor: "app" });
     expect(linear.oauth?.metadata?.probe?.map.accountId).toBe("data.viewer.id");
     // The authorize host is acquisition-plane only: session egress never
-    // opens linear.app, and the compiled inject is brokered-source.
+    // opens linear.app.
     expect(linear.hosts).toEqual(["api.linear.app"]);
-    // The seed's action slug is "linear:graphql" (provider-prefixed since
-    // PR #434), so the full capability string carries the provider twice.
-    const policy = compileIntegrationPolicy(["linear:linear:graphql"]);
-    expect(policy.injects).toHaveLength(1);
-    expect(policy.injects[0]!.mint_source).toEqual({
-      oauth_connector: { connection_id: "test-linear", provider: "linear" },
-    });
-    expect(policy.injects[0]!.header_template).toBe("Bearer {}");
-    expect(policy.injects[0]!.methods).toEqual(["POST"]);
-    expect(policy.injects[0]!.path_globs).toEqual(["/graphql"]);
+
+    // GitHub-style product-area powers over body-parsed GraphQL matches
+    // (ADR 0059): every op is a (operation, field) gate, reads are queries,
+    // writes are mutations, and the areas partition the curated field set.
+    const powers = new Set(linear.operations.flatMap((op) => op.grants));
+    expect([...powers].sort()).toEqual([
+      "issues:read",
+      "issues:write",
+      "org:read",
+      "projects:read",
+      "projects:write",
+    ]);
+    for (const op of linear.operations) {
+      expect(op.match && isGraphqlMatch(op.match)).toBe(true);
+      if (op.match && isGraphqlMatch(op.match)) {
+        const write = op.grants[0]!.endsWith(":write");
+        expect(op.match.operation).toBe(write ? "mutation" : "query");
+      }
+    }
+    // `projectUpdate` is both a query (the ProjectUpdate entity) and a
+    // mutation (update a project) — distinct (operation, field) gates.
+    const projectUpdateOps = linear.operations.filter(
+      (op) => op.match && isGraphqlMatch(op.match) && op.match.field === "projectUpdate",
+    );
+    expect(projectUpdateOps.map((op) => op.grants[0]).sort()).toEqual([
+      "projects:read",
+      "projects:write",
+    ]);
+
+    // A granted area compiles to brokered-source injects gating exactly its
+    // fields on POST /graphql.
+    const policy = compileIntegrationPolicy(["linear:issues:write"]);
+    expect(policy.injects.length).toBeGreaterThan(0);
+    for (const inj of policy.injects) {
+      expect(inj.mint_source).toEqual({
+        oauth_connector: { connection_id: "test-linear", provider: "linear" },
+      });
+      expect(inj.header_template).toBe("Bearer {}");
+      expect(inj.methods).toEqual(["POST"]);
+      expect(inj.path_globs).toEqual(["/graphql"]);
+      expect(inj.graphql_operation).toBe("mutation");
+    }
+    expect(policy.injects.some((i) => i.graphql_field === "issueCreate")).toBe(true);
+    expect(policy.injects.some((i) => i.graphql_field === "issues")).toBe(false);
     expect(policy.network.allow_hosts).toEqual(["api.linear.app"]);
   });
 
