@@ -152,6 +152,10 @@ export interface RenderWithProvidersOptions extends Omit<RenderOptions, "wrapper
    * with empty success responses). Pass a custom transport for tests that
    * need to control TaskService/ImageService responses. */
   transport?: Transport;
+  /** Starting location of the throwaway memory history. Set it when the
+   * component reads the route (e.g. the sessions rail derives the open session
+   * id from the pathname). Defaults to "/". */
+  initialPath?: string;
 }
 
 export function renderWithProviders(
@@ -160,6 +164,7 @@ export function renderWithProviders(
     queryClient,
     principal = DEFAULT_PRINCIPAL,
     transport,
+    initialPath = "/",
     ...renderOptions
   }: RenderWithProvidersOptions = {},
 ) {
@@ -203,7 +208,7 @@ export function renderWithProviders(
 
   const router = createRouter({
     routeTree: rootRoute.addChildren([splatRoute]),
-    history: createMemoryHistory({ initialEntries: ["/"] }),
+    history: createMemoryHistory({ initialEntries: [initialPath] }),
     context: { auth: authValue },
   });
 
