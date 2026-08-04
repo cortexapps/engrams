@@ -10,8 +10,11 @@ WORKDIR /src
 # userfaultfd-sys's build.rs runs bindgen against <linux/userfaultfd.h>,
 # and bindgen needs libclang. Same pair host-agent.Dockerfile installs
 # for the same crate (ADR 0044 K2).
+# make: #1003 — tikv-jemalloc-sys (inherited through engram-host-agent's
+# Linux target deps) builds the vendored jemalloc with configure + make;
+# rust:slim ships a C compiler but no make.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev ca-certificates curl protobuf-compiler clang libclang-dev \
+    pkg-config libssl-dev ca-certificates curl protobuf-compiler clang libclang-dev make \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
 ARG TARGETARCH

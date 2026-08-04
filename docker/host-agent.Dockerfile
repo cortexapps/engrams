@@ -8,8 +8,10 @@ WORKDIR /src
 # userfaultfd-sys, whose build.rs runs bindgen against <linux/userfaultfd.h>,
 # and bindgen needs libclang. (Only needed in this builder stage; the slim
 # runtime image below doesn't carry them.)
+# make: #1003 — tikv-jemalloc-sys builds the vendored jemalloc with
+# configure + make; rust:slim ships a C compiler but no make.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev ca-certificates protobuf-compiler clang libclang-dev \
+    pkg-config libssl-dev ca-certificates protobuf-compiler clang libclang-dev make \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
