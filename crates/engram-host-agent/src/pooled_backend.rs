@@ -7158,10 +7158,19 @@ impl SandboxBackend for PooledBackend {
                 let base_manifest = backend.manifest_ref().await;
                 let chunk_size = backend.chunk_size();
                 let total_bytes = backend.total_bytes();
-                if let Err(e) =
-                    crate::eviction_finalize::persist_disk_pending_chunks(&dest, pending.chunks())
-                        .await
-                {
+                // Export (read frozen + hash) and persist share one
+                // failure arm: either way the pending requeues, the
+                // chain poisons, and the staging dir cleans up.
+                let exported_res = backend.export_pending_chunks(&pending).await;
+                let persist_res = match &exported_res {
+                    Ok(chunks) => {
+                        crate::eviction_finalize::persist_disk_pending_chunks(&dest, chunks)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                if let Err(e) = persist_res {
                     backend.requeue_pending(pending).await;
                     // The guest was already resumed by `capture_phase`
                     // (its `inner.snapshot`/`snapshot_diff` brought it
@@ -7193,7 +7202,8 @@ impl SandboxBackend for PooledBackend {
                         "persist disk-pending chunks: {e}"
                     )));
                 }
-                let chunks = pending.into_chunks();
+                drop(pending);
+                let chunks = exported_res.expect("persist_res checked above");
                 let record = Some(crate::eviction_finalize::DiskPendingRecord {
                     base_manifest,
                     chunk_size,

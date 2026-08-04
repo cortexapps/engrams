@@ -509,3 +509,125 @@ extent-scan recovery (~50), hole-punching after verified publishes
   in files.
 - **ADR 0090** (sandbox ownership): quarantine, its ladder, and the
   destroy arm retire. The ownership model itself stands.
+
+## Addendum (2026-08-04): the frozen-overlay flush
+
+Status: Proposed (this addendum). Refs #1003 (remediation ladder
+step 2), #996.
+
+### Why the copy-at-claim design has to go
+
+The #1003 heap profiles put numbers on `flush_local`'s copy-at-claim:
+the pause-phase claim copies EVERY dirty chunk into heap (16 MiB per
+chunk, uncapped — 176 MB mid-burst on an idle-ish host, gigabytes on a
+busy one), and the generation/claim/hole-punch machinery exists only
+to keep those heap copies coherent against concurrent guest writes.
+The copy is the coherence mechanism. Make the flushed bytes immutable
+*on disk* instead, and the copies — and the machinery — retire.
+
+### Design
+
+Two overlay files per session instead of one mutable dirty file:
+
+- **Active overlay** (`<sandbox>.dirty`): guest writes land here.
+  Tracked by a plain chunk-presence set. No generations.
+- **Frozen overlay** (`<sandbox>.dirty.frozen`): created by `rename(2)`
+  at `flush_local` — the freeze. Immutable by construction from that
+  instant: no writer ever holds it open for write again. A fresh
+  sparse active overlay replaces the renamed file. The freeze is two
+  metadata operations under the FC pause (rename + create), replacing
+  the full dirty-set heap copy AND the per-chunk sha256 that ran
+  under the pause.
+
+Pipeline:
+
+1. `flush_local` (pause phase): if a frozen overlay already exists
+   (prior flush still uploading, or a crash left one), the pipeline
+   guard guarantees no new freeze happens until it drains. Otherwise:
+   rename active → frozen, create a fresh sparse active, move the
+   presence set to the frozen side. O(1) time and memory.
+2. `flush_upload` (post-resume): stream chunks FROM the frozen file —
+   read, hash, put, drop, bounded by the upload concurrency (peak
+   heap = concurrency × chunk_size, today 32 × 16 MiB = 512 MiB,
+   further capped by ladder step 3's byte budget). Publish the
+   manifest, read it back, verify every uploaded chunk is present
+   (verify-before-delete), THEN unlink the frozen file whole. The
+   per-chunk hole punch retires.
+3. Guest writes during upload go to the fresh active overlay and
+   belong to the NEXT flush. A re-written chunk is simply present in
+   both files; reads prefer active (newer); the manifest chain
+   orders the two versions correctly across the two publishes.
+4. Failed upload / migration-fence abort: the frozen file simply
+   stays. The next flush re-enters step 2 against it first, then
+   freezes the active overlay for its own cycle. Claims-release
+   machinery retires — "release" is "the file is still there".
+
+Read path: active overlay → frozen overlay → base/cache. Two presence
+sets replace `dirty` + `claimed` + `generations`.
+
+### Crash recovery (folds in #996)
+
+Recovery (`DirtyFileOpenMode::Recover`) scans BOTH files' allocated
+extents. Rules:
+
+- **Partial extent ⇒ punch, never adopt** (#996 fix direction 2): a
+  chunk whose extent does not cover its full chunk length was a torn
+  first-touch materialize (base-copy + payload overlay is not
+  SIGKILL-atomic). Nothing in it was ever acked — the guest ack
+  happens after the full-chunk write completes — so dropping it is
+  honest, and the base path serves the committed bytes. Adopting it
+  (the pre-addendum behavior) zero-filled committed base bytes: the
+  silent-corruption class this ADR exists to eliminate.
+- A frozen overlay found at recovery re-enters the pipeline at step 2
+  (upload) on the first post-recovery flush. Its extents are
+  complete chunks by construction (freeze happens only after the
+  writes that populated it completed and the guest ack'd), but the
+  partial-extent rule applies to it defensively all the same.
+- The published-ref sidecar keeps its exact role: the recovery
+  baseline the successor chains from.
+
+### What this retires
+
+- The full-dirty-set heap copy in `flush_local` (the #1003 burst
+  contributor on the flush leg).
+- Pause-phase per-chunk sha256 (moves post-resume, amortized into the
+  upload stream).
+- `generations` (write-vs-claim coherence is by-construction now).
+- `claimed` + `release_claims` (failure handling = the file stays).
+- `punch_hole` on the flush path (verify-before-delete unlinks the
+  frozen file whole; punching survives only in the #996 recovery
+  rule's drop-partial-extent arm).
+
+### Testing (ADR 0099 H5)
+
+Crash-state tests externally construct every post-crash shape: torn
+materialize at every byte offset (partial extent in active), frozen
+file present with/without sidecar, frozen + active both populated,
+garbage sibling files. Assert: committed base bytes never read as
+zeros; a frozen file's chunks publish exactly once; a torn chunk is
+dropped, not adopted. The flush seams (ADR 0098 P6) pin the
+freeze/upload interleavings the generation machinery used to guard.
+
+### Metrics
+
+`engram_disk_flush_frozen_bytes` (size of each freeze),
+`engram_disk_flush_frozen_pending` (gauge: a frozen file is awaiting
+upload — nonzero across restarts means retries are happening),
+existing `DIRTY_RECOVER_*` metrics gain the two-file scan.
+
+#### Amendment (2026-08-04, from #1009 review): frozen generations
+
+The single-frozen-file design refused to freeze while an upload retry
+was pending — and the eviction/migration capture paths call
+`flush_local` ONCE under the FC pause as their coherence cut, so a
+refused freeze silently excluded the active overlay's acked writes
+from the capture (CRITICAL). The frozen overlay is therefore a
+GENERATION LIST (`<dirty>.frozen.<seq>`): `freeze()` is always
+permitted, one `flush_local` returns the union across every
+generation, and the upload reads each chunk from the newest
+generation holding it. Additionally: `freeze()` rolls back its rename
+if the fresh-active create fails, recovery creates the fresh active
+when it finds "active missing + frozen present" (the mid-freeze crash
+state), and `engram_disk_flush_frozen_pending` is an
+increment/decrement count (a per-session `set()` gauge was
+last-writer-wins across sessions).
