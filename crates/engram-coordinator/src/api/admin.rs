@@ -236,7 +236,9 @@ pub(crate) async fn evacuate_session_core(
                 .await
         }
     }
-    result.map_err(|e| ApiError::Internal(format!("evac pipeline: {e}")))?;
+    // Typed conversion (issue #1012): a wire-skewed source host mid-deploy
+    // must surface as a retryable 503, not an opaque 500.
+    result.map_err(ApiError::from)?;
 
     tracing::info!(
         %session_id,
