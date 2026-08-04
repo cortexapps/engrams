@@ -669,3 +669,117 @@ async fn invalid_grant_breaks_the_credential_and_reconnect_repairs_it() {
         .expect("repaired");
     assert_eq!(resolved.secret, "at-3");
 }
+
+#[tokio::test]
+async fn non_refreshable_expiring_token_breaks_at_expiry_not_before() {
+    let fx = fixture().await;
+    // A provider shape neither shipped connector produces but a custom
+    // connector can: an expiring access token with NO refresh token.
+    *fx.provider.token_response.lock() = json!({
+        "access_token": "at-noref",
+        "token_type": "Bearer",
+        "expires_in": 86400,
+    });
+    let sp = spec(&fx.host, false);
+    connected(&fx, &sp).await;
+
+    // Inside the margin but still valid: the sweep leaves it alone (skip,
+    // claim-bounded) and resolution still serves the working token.
+    fx.clock.advance(std::time::Duration::from_secs(19 * 3600));
+    let sweep = fx
+        .manager
+        .run_connector_refresh_once()
+        .await
+        .expect("sweep");
+    assert_eq!((sweep.skipped, sweep.broke), (1, 0), "{sweep:?}");
+    let resolved = fx
+        .manager
+        .resolve_connector_token(&linear_key())
+        .await
+        .expect("still valid");
+    assert_eq!(resolved.secret, "at-noref");
+
+    // Past expiry there is no repair path: the row breaks, leaves the due
+    // set, resolution stops serving the dead token, and the status maps to
+    // needs-reconnect instead of a "connected" lie.
+    fx.clock.advance(std::time::Duration::from_secs(6 * 3600));
+    let sweep = fx
+        .manager
+        .run_connector_refresh_once()
+        .await
+        .expect("sweep");
+    assert_eq!(sweep.broke, 1, "{sweep:?}");
+    let row = fx
+        .meta
+        .get_oauth_credential(&linear_key())
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(row.broken_reason.as_deref(), Some("no_refresh_token"));
+    assert!(fx
+        .manager
+        .resolve_connector_token(&linear_key())
+        .await
+        .is_err());
+    let idle = fx
+        .manager
+        .run_connector_refresh_once()
+        .await
+        .expect("sweep");
+    assert_eq!(idle.examined, 0, "broken rows leave the due set: {idle:?}");
+}
+
+#[tokio::test]
+async fn an_unsealable_row_does_not_abort_the_sweep() {
+    use engram_core::types::oauth::{NewSealedOAuthCredential, OAuthAccountMetadata};
+
+    let fx = fixture().await;
+    let sp = spec(&fx.host, false);
+    connected(&fx, &sp).await;
+
+    // A second connector row whose ciphertext cannot be opened, with the
+    // EARLIEST expiry so the ascending due order visits it first.
+    let corrupt_key = OAuthCredentialKey {
+        provider: "corruptco".into(),
+        ..linear_key()
+    };
+    fx.meta
+        .put_oauth_credential(
+            NewSealedOAuthCredential {
+                key: corrupt_key.clone(),
+                wrapped_dek: vec![1, 2, 3],
+                nonce: vec![0; 12],
+                ciphertext: vec![4, 5, 6],
+                key_id: "test:v1".into(),
+                metadata: OAuthAccountMetadata {
+                    account_id: "acct-corrupt".into(),
+                    display_name: None,
+                    plan_type: None,
+                    workspace_id: None,
+                    workspace_name: None,
+                },
+                expires_at: Some(fx.clock.now_utc() - chrono::Duration::hours(1)),
+            },
+            None,
+        )
+        .await
+        .expect("seed corrupt row");
+
+    // The healthy row is inside its margin; the corrupt row is due first.
+    // The sweep must skip the corrupt row and still refresh the healthy one.
+    *fx.provider.token_response.lock() = json!({
+        "access_token": "at-2",
+        "token_type": "Bearer",
+        "expires_in": 86400,
+        "refresh_token": "rt-2",
+    });
+    fx.clock.advance(std::time::Duration::from_secs(19 * 3600));
+    let sweep = fx
+        .manager
+        .run_connector_refresh_once()
+        .await
+        .expect("one bad row must not abort the batch");
+    assert_eq!((sweep.skipped, sweep.refreshed), (1, 1), "{sweep:?}");
+    let bundle = open_bundle(&fx, &linear_key()).await;
+    assert_eq!(bundle.access_token, "at-2");
+}

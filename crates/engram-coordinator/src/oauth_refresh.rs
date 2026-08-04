@@ -222,8 +222,21 @@ impl OAuthManager {
                 continue;
             }
             // The horizon is wider than any single bundle's margin; check
-            // the real margin after unsealing.
-            let payload = self.open(&row).await?;
+            // the real margin after unsealing. Any per-row defect skips THIS
+            // row only — one bad credential must not abort the batch behind
+            // it (the claim rate-limits re-examination to once per CLAIM_TTL).
+            let payload = match self.open(&row).await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::warn!(
+                        provider = %row.key.provider,
+                        code = error.code(),
+                        "connector OAuth bundle failed to unseal; skipping refresh"
+                    );
+                    sweep.skipped += 1;
+                    continue;
+                }
+            };
             let bundle = match ConnectorOAuthBundle::from_json(&payload) {
                 Ok(bundle) => bundle,
                 Err(error) => {
@@ -236,7 +249,43 @@ impl OAuthManager {
                     continue;
                 }
             };
-            if !bundle.refreshable() || !within_refresh_margin(&bundle, now) {
+            if !bundle.refreshable() {
+                // An expiring token WITHOUT a refresh token has no repair
+                // path. While it is still valid, leave it alone (the claim
+                // bounds re-checks until expiry). Once it is past expiry,
+                // mark it broken: it leaves the due set, resolution stops
+                // serving a dead token, and the admin sees needs-reconnect
+                // instead of a "connected" lie.
+                if bundle.expires_at.is_some_and(|at| at <= now) {
+                    match self
+                        .meta
+                        .mark_oauth_credential_broken(&row.key, row.version, "no_refresh_token")
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::warn!(
+                                provider = %row.key.provider,
+                                "connector OAuth token expired with no refresh token; reconnect required"
+                            );
+                            sweep.broke += 1;
+                        }
+                        // The version moved: a reconnect or refresh won.
+                        Err(engram_core::MetaError::Conflict(_)) => sweep.lost_races += 1,
+                        Err(error) => {
+                            tracing::warn!(
+                                provider = %row.key.provider,
+                                error = %error,
+                                "could not mark a non-refreshable expired credential broken"
+                            );
+                            sweep.transient_failures += 1;
+                        }
+                    }
+                } else {
+                    sweep.skipped += 1;
+                }
+                continue;
+            }
+            if !within_refresh_margin(&bundle, now) {
                 sweep.skipped += 1;
                 continue;
             }
