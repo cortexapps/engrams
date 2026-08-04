@@ -2019,7 +2019,7 @@ mod adapter {
         // ADR 0054 Part C: narrate-past message-ids to scrub from claude's
         // transcript at the next deferred-delivery resume. Owned here so it
         // survives a respawn (populated during the defer turn, drained at
-        // ResumeForDeferred).
+        // Condemned).
         let scrub_msg_ids: Arc<tokio::sync::Mutex<HashSet<String>>> =
             Arc::new(tokio::sync::Mutex::new(HashSet::new()));
         // `duplicate_deferred_ids` collects every suppressed #64389 duplicate's
@@ -2127,7 +2127,7 @@ mod adapter {
                 // claude; respawn with `--resume` like `Respawn`, but reset
                 // the fast-crash budget (proof of liveness) and never sleep.
                 // The deferred tool re-fires on startup and is answered.
-                SessionOutcome::ResumeForDeferred => {
+                SessionOutcome::Condemned => {
                     fast_crashes = 0;
                     // ADR 0054 Part C / ADR 0089: claude was intentionally
                     // SIGINT'd and is dead now → its transcript is quiescent and safe
@@ -2277,11 +2277,15 @@ mod adapter {
         Respawn,
         /// claude could not be spawned at all. Back off and retry.
         SpawnFailed,
-        /// An AUQ answer or generic deferred result is stashed before SIGINT so
-        /// the deferred tool re-fires id-stably on `--resume`. A sibling of
-        /// `Respawn` that is INTENTIONAL: no fast-crash backoff, no
-        /// abnormal-exit System message.
-        ResumeForDeferred,
+        /// The session loop deliberately retired this child — a deferred
+        /// result stashed for an id-stable re-fire, a mode change at the
+        /// consumption boundary, or a SIGINT-escalated interrupt. The
+        /// condemned-process contract: any child we signal never receives
+        /// another turn; the engine respawns `--resume` and the queued
+        /// work lands in the fresh process. A sibling of `Respawn` that is
+        /// INTENTIONAL: no fast-crash backoff, no abnormal-exit System
+        /// message.
+        Condemned,
     }
 
     /// The single in-flight turn, owned by the session loop. `run_id` is
@@ -2387,6 +2391,21 @@ mod adapter {
                 tracing::warn!(pid, error = %e, "SIGINT to claude child failed");
             }
         }
+    }
+
+    /// The condemned-process contract (prod 2026-08-03, session
+    /// aa0829b0): any child we SIGNAL never receives another turn. A
+    /// SIGINT'd claude may abort the turn, emit the abort `result`, and
+    /// exit much later on its own schedule — a turn dispatched into that
+    /// window dies mid-flight with exit code 0 and reads as a harness
+    /// crash. Condemning marks the child so the session loop closes out
+    /// and breaks to the reap instead of reusing it; the engine then
+    /// respawns `--resume` with zero backoff and the queued work lands in
+    /// the fresh process. This fn must stay the ONLY caller of
+    /// `sigint_child` on the session loop's paths.
+    fn condemn(condemned: &mut bool, child: &tokio::process::Child) {
+        *condemned = true;
+        sigint_child(child);
     }
 
     /// Run ONE persistent `claude` process: spawn it, hold its stdin
@@ -2542,8 +2561,8 @@ mod adapter {
         let mut interrupted_run: Option<String> = None;
         // Set when a deferred delivery intentionally SIGINT'd the child; the
         // reap path must NOT treat the exit as a crash and returns
-        // `ResumeForDeferred`.
-        let mut resuming_for_deferred = false;
+        // `Condemned`.
+        let mut condemned = false;
 
         // Phase 3: armed when a `control_request` interrupt is sent. If
         // claude doesn't honor it within the grace window (a build lacking
@@ -2700,9 +2719,14 @@ mod adapter {
                                         // this run (operator interrupt, or a
                                         // steering type-ahead) — disarm the
                                         // SIGINT-escalation deadline whatever
-                                        // the marker says; the process is
-                                        // STILL ALIVE and falls through to
-                                        // consume the next queued prompt.
+                                        // the marker says. A COOPERATIVE
+                                        // abort (control_request honored, no
+                                        // signal sent) leaves the process
+                                        // alive and it falls through to
+                                        // consume the next queued prompt; a
+                                        // CONDEMNED child (any signal sent)
+                                        // never does — the guard below breaks
+                                        // to the reap instead.
                                         interrupted_run = None;
                                         interrupt_deadline = None;
                                     }
@@ -2728,6 +2752,17 @@ mod adapter {
                                             },
                                         )
                                         .await;
+                                    }
+                                    if condemned {
+                                        // The condemned-process contract: a
+                                        // signaled child never receives
+                                        // another turn, even when it emits a
+                                        // result after the signal (claude
+                                        // 2.1.212 aborts-then-exits-later —
+                                        // the incident race). The turn is
+                                        // closed; break to the reap and let
+                                        // the engine respawn `--resume`.
+                                        break;
                                     }
                                     // If Claude narrate-past'd and abandoned the
                                     // deferred re-fire, deliver the still-stashed
@@ -2815,8 +2850,7 @@ mod adapter {
                                                     "mode change at consumption boundary: clean respawn"
                                                 );
                                                 pending.push_front(qp);
-                                                resuming_for_deferred = true;
-                                                sigint_child(&child);
+                                                condemn(&mut condemned, &child);
                                                 break;
                                             }
                                             Some(qp) => {
@@ -2974,8 +3008,7 @@ mod adapter {
                                         text,
                                         mode,
                                     });
-                                    resuming_for_deferred = true;
-                                    sigint_child(&child);
+                                    condemn(&mut condemned, &child);
                                     break;
                                 }
                                 // Idle: latch this prompt's mode, then start
@@ -3104,8 +3137,7 @@ mod adapter {
                                     known_deferred,
                                     "deferred or unowned tool result stashed; resuming for id-stable re-fire"
                                 );
-                                resuming_for_deferred = true;
-                                sigint_child(&child);
+                                condemn(&mut condemned, &child);
                                 break;
                             }
                         }
@@ -3179,6 +3211,7 @@ mod adapter {
                                     &child,
                                     &mut interrupted_run,
                                     &mut interrupt_deadline,
+                                    &mut condemned,
                                 )
                                 .await;
                             } else {
@@ -3250,6 +3283,7 @@ mod adapter {
                                     &child,
                                     &mut interrupted_run,
                                     &mut interrupt_deadline,
+                                    &mut condemned,
                                 )
                                 .await;
                             }
@@ -3258,14 +3292,27 @@ mod adapter {
                         && turn.is_some()
                     {
                         // Phase 3 fallback: the `control_request` interrupt
-                        // wasn't honored within grace (a claude build lacking
-                        // the control frame). Escalate to SIGINT — claude
-                        // exits, the reap reports RunInterrupted (interrupted_run
-                        // is set) and the engine respawns `--resume`. Disarm so
-                        // we don't re-fire; claude's stdout EOF breaks the loop.
-                        tracing::warn!("control_request interrupt not honored within grace; SIGINT escalation");
+                        // wasn't honored within grace (a wedged tool wait, or
+                        // a claude build lacking the frame). Escalate — and
+                        // CONDEMN: the old code disarmed and kept waiting,
+                        // assuming a SIGINT'd claude exits before saying
+                        // anything. claude 2.1.212 can abort the turn, emit
+                        // the abort `result`, and exit much later — and the
+                        // result handler then dispatched the next queued
+                        // prompt into the dying process (prod 2026-08-03,
+                        // session aa0829b0: "claude exited abnormally
+                        // mid-turn ... code 0"). Break straight to the reap:
+                        // `interrupted_run` is set, so the turn closes as
+                        // RunInterrupted and the engine respawns `--resume`
+                        // with zero backoff; the queued prompt lands in the
+                        // fresh process.
+                        tracing::warn!(
+                            "control_request interrupt not honored within grace; \
+                             SIGINT escalation — child condemned"
+                        );
                         interrupt_deadline = None;
-                        sigint_child(&child);
+                        condemn(&mut condemned, &child);
+                        break;
                     } else if shutting_down {
                         tracing::warn!("shutdown grace elapsed; killing claude");
                         let _ = child.start_kill();
@@ -3319,7 +3366,7 @@ mod adapter {
             } else if shutting_down {
                 // Grace expired mid-turn before claude could drain.
                 emit(evt_tx, HarnessEvent::RunCompleted { run_id, ok: false }).await;
-            } else if resuming_for_deferred {
+            } else if condemned {
                 // ADR 0089: a generic deferred result tore down a turn that was
                 // (defensively) still in flight — the deferred-tool turn
                 // normally already ended `tool_deferred` (so `turn` is
@@ -3358,11 +3405,11 @@ mod adapter {
 
         if shutting_down {
             SessionOutcome::Shutdown
-        } else if resuming_for_deferred {
+        } else if condemned {
             // Intentional deferred-delivery resume — checked before the
             // generic `Respawn` so it never trips fast-crash backoff or
             // reads as a crash.
-            SessionOutcome::ResumeForDeferred
+            SessionOutcome::Condemned
         } else {
             SessionOutcome::Respawn
         }
@@ -3552,6 +3599,7 @@ mod adapter {
         child: &tokio::process::Child,
         interrupted_run: &mut Option<String>,
         interrupt_deadline: &mut Option<Instant>,
+        condemned: &mut bool,
     ) {
         if interrupted_run.is_some() {
             tracing::debug!(%run_id, "interrupt already in flight; not re-sending");
@@ -3567,15 +3615,18 @@ mod adapter {
                         Some(Instant::now() + Duration::from_secs(INTERRUPT_GRACE_SECS));
                 }
                 Err(e) => {
-                    tracing::warn!(%run_id, error = %e, "control_request write failed; SIGINT fallback");
-                    sigint_child(child);
+                    // A signal is a condemnation — the result-marker path
+                    // must never dispatch into this child again (the same
+                    // rule as the grace escalation).
+                    tracing::warn!(%run_id, error = %e, "control_request write failed; SIGINT fallback — child condemned");
+                    condemn(condemned, child);
                 }
             },
             None => {
                 // stdin already closed (a Shutdown is draining) — fall
                 // back to SIGINT.
-                tracing::warn!(%run_id, "interrupt with no stdin; SIGINT fallback");
-                sigint_child(child);
+                tracing::warn!(%run_id, "interrupt with no stdin; SIGINT fallback — child condemned");
+                condemn(condemned, child);
             }
         }
     }
@@ -5775,6 +5826,177 @@ mod adapter {
             let _ = tokio::time::timeout(Duration::from_secs(5), engine).await;
             let _ = tokio::fs::remove_file(&script).await;
             let _ = tokio::fs::remove_file(&pidfile).await;
+        }
+
+        /// The incident fake (prod 2026-08-03, session aa0829b0): a claude
+        /// that IGNORES the `control_request` (forcing the grace escalation
+        /// to SIGINT), and on SIGINT emits the abort `result` but does NOT
+        /// exit — the abort-then-exit-later shape of claude 2.1.212. Every
+        /// launch appends `$$` to `invocations`; every stdin line is logged
+        /// to `<stdin_log>.<pid>` so the test can prove which generation a
+        /// prompt reached.
+        async fn write_condemned_incident_fake_claude(
+            invocations: &str,
+            stdin_log_prefix: &str,
+        ) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let path =
+                std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
+            let mut body = String::from("#!/bin/sh\n");
+            body.push_str(&format!("echo $$ >> '{invocations}'\n"));
+            body.push_str("printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n");
+            // SIGINT: emit the abort result, set the flag, STAY ALIVE.
+            body.push_str("got_int=\n");
+            body.push_str("trap 'printf \"%s\\n\" \"{\\\"type\\\":\\\"result\\\",\\\"subtype\\\":\\\"error_during_execution\\\",\\\"is_error\\\":true}\"; got_int=1' INT\n");
+            body.push_str("while :; do\n");
+            body.push_str("  if IFS= read -r line; then\n");
+            body.push_str(&format!("    echo \"$line\" >> '{stdin_log_prefix}'.$$\n"));
+            body.push_str("    case \"$line\" in\n");
+            body.push_str("      *control_request*) ;;\n");
+            body.push_str("      *)\n");
+            body.push_str("        printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"id\":\"m\",\"content\":[{\"type\":\"text\",\"text\":\"working\"}]}}'\n");
+            body.push_str("        ;;\n");
+            body.push_str("    esac\n");
+            body.push_str("  elif [ -n \"$got_int\" ]; then got_int=; continue;\n");
+            body.push_str("  else exit 0; fi\n");
+            body.push_str("done\n");
+            tokio::fs::write(&path, body).await.unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        /// The condemned-process contract, end to end (prod 2026-08-03,
+        /// session aa0829b0): an interrupt whose `control_request` is not
+        /// honored escalates to SIGINT — and from that signal on, the
+        /// child NEVER receives another turn, even though it emits an
+        /// abort `result` and lingers. The run closes as RunInterrupted
+        /// (no "harness/agent crash" System message), the engine respawns
+        /// `--resume`, and the queued prompt lands in the FRESH process.
+        /// Before the fix, the result handler re-trusted the signaled
+        /// child and dispatched the queued prompt into it; the child's
+        /// deferred exit then killed the turn ("claude exited abnormally
+        /// mid-turn — code 0").
+        #[tokio::test]
+        async fn sigint_escalation_condemns_the_child_never_redispatches() {
+            let invocations = temp_pidfile();
+            let stdin_log = temp_pidfile();
+            let script = write_condemned_incident_fake_claude(&invocations, &stdin_log).await;
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+            ));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p1".into(),
+                    text: "first".into(),
+                    mode: None,
+                })
+                .await
+                .unwrap();
+            let r1 = expect_run_started(&mut evt_rx).await;
+            expect_agent_message(&mut evt_rx, "working").await;
+
+            // The user interrupts, then queues the next prompt (the
+            // incident's "ok" steer).
+            cmd_tx.send(HarnessCommand::Interrupt).await.unwrap();
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p2".into(),
+                    text: "second".into(),
+                    mode: None,
+                })
+                .await
+                .unwrap();
+
+            // The control_request is ignored; the grace expires (8s);
+            // the escalation condemns + SIGINTs and breaks to the reap.
+            // Everything until the next RunStarted must be interrupt-
+            // shaped: RunInterrupted{r1} (+ Idle), and NEVER a System
+            // AgentMessage (the "harness/agent crash" misclassification)
+            // or a RunCompleted for r1.
+            let mut saw_interrupted = false;
+            let r2 = loop {
+                match tokio::time::timeout(Duration::from_secs(30), evt_rx.recv())
+                    .await
+                    .expect("event before timeout")
+                {
+                    Some(HarnessEvent::RunInterrupted { run_id }) => {
+                        assert_eq!(run_id, r1);
+                        saw_interrupted = true;
+                    }
+                    Some(HarnessEvent::Idle)
+                    | Some(HarnessEvent::PromptQueued { .. })
+                    | Some(HarnessEvent::PromptSteered { .. }) => {}
+                    Some(HarnessEvent::RunStarted { run_id, .. }) => break run_id,
+                    Some(HarnessEvent::AgentMessage { role, text, .. }) => {
+                        assert!(
+                            !matches!(role, AgentRole::System),
+                            "a condemned exit must never read as a crash: {text}",
+                        );
+                    }
+                    Some(HarnessEvent::RunCompleted { run_id, .. }) => {
+                        panic!("run {run_id} must close as interrupted, not completed");
+                    }
+                    other => panic!("unexpected event {other:?}"),
+                }
+            };
+            assert!(saw_interrupted, "the escalated interrupt closes run 1");
+            assert_ne!(r2, r1, "the queued prompt starts a fresh run");
+            expect_agent_message(&mut evt_rx, "working").await;
+
+            // The decisive assertions: a SECOND generation was spawned,
+            // and the queued prompt reached ONLY the fresh generation —
+            // the condemned child's stdin log never saw it.
+            let pids: Vec<String> = tokio::fs::read_to_string(&invocations)
+                .await
+                .unwrap()
+                .lines()
+                .map(|s| s.trim().to_string())
+                .collect();
+            assert_eq!(
+                pids.len(),
+                2,
+                "exactly one respawn: the condemned child was replaced",
+            );
+            let gen1_log = tokio::fs::read_to_string(format!("{stdin_log}.{}", pids[0]))
+                .await
+                .unwrap_or_default();
+            assert!(
+                gen1_log.contains("first"),
+                "generation 1 served the first prompt",
+            );
+            assert!(
+                !gen1_log.contains("second"),
+                "a signaled child must never receive another prompt",
+            );
+            let gen2_log = tokio::fs::read_to_string(format!("{stdin_log}.{}", pids[1]))
+                .await
+                .unwrap_or_default();
+            assert!(
+                gen2_log.contains("second"),
+                "the queued prompt lands in the fresh process",
+            );
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(10), engine).await;
+            let _ = tokio::fs::remove_file(&script).await;
+            let _ = tokio::fs::remove_file(&invocations).await;
+            for pid in pids {
+                let _ = tokio::fs::remove_file(format!("{stdin_log}.{pid}")).await;
+            }
         }
 
         // Phase 3 regression for session ba3ae8d5: interrupting WITH a queued
