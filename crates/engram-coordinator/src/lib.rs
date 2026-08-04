@@ -36,6 +36,7 @@ pub mod live_migration;
 pub mod metrics;
 pub mod oauth;
 pub mod oauth_redirect;
+pub mod oauth_refresh;
 pub mod org_secrets;
 pub mod outbox_delivery;
 pub mod pg_listener;
@@ -167,6 +168,7 @@ pub async fn run_with_registry_and_local(
     app.integrations = integrations;
     let state = Arc::new(app);
     crate::oauth::spawn_cleanup(state.oauth.clone(), state.subscribe_shutdown());
+    crate::oauth_refresh::spawn_connector_refresh(state.oauth.clone(), state.subscribe_shutdown());
     if let Some((host_id, backend)) = in_proc_local {
         state.register_local_host(host_id, backend);
     }

@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::SessionId;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OAuthSubjectKind {
     User,
@@ -41,7 +41,7 @@ impl std::str::FromStr for OAuthSubjectKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OAuthCredentialKey {
     pub subject_kind: OAuthSubjectKind,
     pub subject_id: String,

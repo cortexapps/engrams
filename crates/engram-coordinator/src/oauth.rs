@@ -97,6 +97,10 @@ pub struct OAuthManager {
     drivers: BTreeMap<String, Arc<dyn OAuthDriver>>,
     active: DashMap<uuid::Uuid, ActiveFlow>,
     concurrency: Arc<Semaphore>,
+    /// Per-key in-process single-flight for connector refresh: a burst of
+    /// resolvers refreshes once. Cross-replica dedup is the advisory claim
+    /// column; correctness is the version CAS.
+    pub(crate) refresh_flights: DashMap<OAuthCredentialKey, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl OAuthManager {
@@ -125,6 +129,7 @@ impl OAuthManager {
             drivers,
             active: DashMap::new(),
             concurrency: Arc::new(Semaphore::new(16)),
+            refresh_flights: DashMap::new(),
         })
     }
 
@@ -373,7 +378,7 @@ impl OAuthManager {
             .await
     }
 
-    async fn publish_bundle_at(
+    pub(crate) async fn publish_bundle_at(
         &self,
         key: &OAuthCredentialKey,
         bundle: ValidatedOAuthBundle,
@@ -403,7 +408,10 @@ impl OAuthManager {
         Ok(())
     }
 
-    async fn open(&self, row: &SealedOAuthCredential) -> Result<Vec<u8>, OAuthServiceError> {
+    pub(crate) async fn open(
+        &self,
+        row: &SealedOAuthCredential,
+    ) -> Result<Vec<u8>, OAuthServiceError> {
         let nonce: [u8; 12] = row
             .nonce
             .as_slice()

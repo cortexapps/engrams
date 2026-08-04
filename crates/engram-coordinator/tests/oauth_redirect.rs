@@ -467,3 +467,205 @@ async fn wrong_state_expired_flow_and_subject_mismatch_are_rejected() {
         "no provider call was made for any rejected completion"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Refresh machinery (scanner + resolve_connector_token) over the same fake
+// provider.
+// ---------------------------------------------------------------------------
+
+/// Connect, then hand back the flow-completion row for refresh tests.
+async fn connected(fx: &Fixture, sp: &RedirectOauthSpec) {
+    let begun = fx
+        .manager
+        .begin_redirect(linear_key(), sp, "https://cb.example.com/x")
+        .await
+        .expect("begin");
+    fx.manager
+        .complete_redirect(
+            linear_key(),
+            begun.flow.id,
+            "code-abc",
+            "https://cb.example.com/x",
+            sp,
+        )
+        .await
+        .expect("complete");
+    fx.provider.token_requests.lock().clear();
+}
+
+#[tokio::test]
+async fn scanner_refreshes_ahead_of_expiry_and_adopts_rotation() {
+    let fx = fixture().await;
+    let sp = spec(&fx.host, false);
+    connected(&fx, &sp).await;
+
+    // Outside the 6h margin of a 24h token: the sweep sees nothing due.
+    fx.clock.advance(std::time::Duration::from_secs(3600));
+    let idle = fx
+        .manager
+        .run_connector_refresh_once()
+        .await
+        .expect("sweep");
+    assert_eq!(idle.examined, 0, "23h of validity left; nothing due");
+
+    // Inside the margin: the sweep refreshes and adopts the ROTATED pair.
+    *fx.provider.token_response.lock() = json!({
+        "access_token": "at-2",
+        "token_type": "Bearer",
+        "expires_in": 86400,
+        "refresh_token": "rt-2",
+    });
+    fx.clock.advance(std::time::Duration::from_secs(18 * 3600));
+    let sweep = fx
+        .manager
+        .run_connector_refresh_once()
+        .await
+        .expect("sweep");
+    assert_eq!(sweep.refreshed, 1, "{sweep:?}");
+
+    let reqs = fx.provider.token_requests.lock().clone();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0]["grant_type"], "refresh_token");
+    assert_eq!(reqs[0]["refresh_token"], "rt-1");
+    assert_eq!(reqs[0]["client_id"], "client-123");
+
+    let bundle = open_bundle(&fx, &linear_key()).await;
+    assert_eq!(bundle.access_token, "at-2");
+    assert_eq!(bundle.refresh_token.as_deref(), Some("rt-2"));
+    assert_eq!(
+        bundle.expires_at,
+        Some(fx.clock.now_utc() + chrono::Duration::seconds(86400))
+    );
+    // The mirrored column moved with the bundle, so the next sweep is idle.
+    let again = fx
+        .manager
+        .run_connector_refresh_once()
+        .await
+        .expect("sweep");
+    assert_eq!(again.examined, 0, "{again:?}");
+}
+
+#[tokio::test]
+async fn resolve_is_readonly_outside_margin_and_refreshes_inline_inside() {
+    let fx = fixture().await;
+    let sp = spec(&fx.host, false);
+    connected(&fx, &sp).await;
+
+    let fresh = fx
+        .manager
+        .resolve_connector_token(&linear_key())
+        .await
+        .expect("resolve");
+    assert_eq!(fresh.secret, "at-1");
+    assert!(
+        fx.provider.token_requests.lock().is_empty(),
+        "no refresh outside the margin"
+    );
+
+    // A provider that does NOT rotate keeps the old refresh token.
+    *fx.provider.token_response.lock() = json!({
+        "access_token": "at-2",
+        "token_type": "Bearer",
+        "expires_in": 86400,
+    });
+    fx.clock.advance(std::time::Duration::from_secs(19 * 3600));
+    let refreshed = fx
+        .manager
+        .resolve_connector_token(&linear_key())
+        .await
+        .expect("resolve refreshes inline");
+    assert_eq!(refreshed.secret, "at-2");
+    assert_eq!(
+        fx.provider.token_requests.lock().len(),
+        1,
+        "exactly one inline refresh"
+    );
+    let bundle = open_bundle(&fx, &linear_key()).await;
+    assert_eq!(
+        bundle.refresh_token.as_deref(),
+        Some("rt-1"),
+        "non-rotating provider keeps the prior refresh token"
+    );
+}
+
+#[tokio::test]
+async fn resolve_serves_the_stale_token_on_transient_refresh_failure() {
+    let fx = fixture().await;
+    let sp = spec(&fx.host, false);
+    connected(&fx, &sp).await;
+
+    // A 200 with no access_token and no invalid_grant is a transient
+    // exchange failure (provider hiccup shape).
+    *fx.provider.token_response.lock() = json!({"error": "temporarily_unavailable"});
+    fx.clock.advance(std::time::Duration::from_secs(19 * 3600));
+    let stale = fx
+        .manager
+        .resolve_connector_token(&linear_key())
+        .await
+        .expect("stale token, not an error");
+    assert_eq!(stale.secret, "at-1");
+
+    let row = fx
+        .meta
+        .get_oauth_credential(&linear_key())
+        .await
+        .expect("get")
+        .expect("row");
+    assert!(
+        row.broken_at.is_none(),
+        "transient failure never marks broken"
+    );
+}
+
+#[tokio::test]
+async fn invalid_grant_breaks_the_credential_and_reconnect_repairs_it() {
+    let fx = fixture().await;
+    let sp = spec(&fx.host, false);
+    connected(&fx, &sp).await;
+
+    *fx.provider.token_response.lock() = json!({"error": "invalid_grant"});
+    fx.clock.advance(std::time::Duration::from_secs(19 * 3600));
+    let sweep = fx
+        .manager
+        .run_connector_refresh_once()
+        .await
+        .expect("sweep");
+    assert_eq!(sweep.broke, 1, "{sweep:?}");
+
+    let row = fx
+        .meta
+        .get_oauth_credential(&linear_key())
+        .await
+        .expect("get")
+        .expect("row");
+    assert!(row.broken_at.is_some());
+    assert_eq!(row.broken_reason.as_deref(), Some("invalid_grant"));
+    let err = fx
+        .manager
+        .resolve_connector_token(&linear_key())
+        .await
+        .expect_err("broken credential does not resolve");
+    assert!(format!("{err:?}").contains("Disconnected"), "{err:?}");
+    // Broken rows leave the sweep entirely.
+    let idle = fx
+        .manager
+        .run_connector_refresh_once()
+        .await
+        .expect("sweep");
+    assert_eq!(idle.examined, 0);
+
+    // Reconnect through a fresh flow clears the mark and resolves again.
+    *fx.provider.token_response.lock() = json!({
+        "access_token": "at-3",
+        "token_type": "Bearer",
+        "expires_in": 86400,
+        "refresh_token": "rt-3",
+    });
+    connected(&fx, &sp).await;
+    let resolved = fx
+        .manager
+        .resolve_connector_token(&linear_key())
+        .await
+        .expect("repaired");
+    assert_eq!(resolved.secret, "at-3");
+}
