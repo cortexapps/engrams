@@ -322,9 +322,16 @@ pub fn plan_step(i: StepInputs) -> StepAction {
 /// Result of one autoscale step.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AutoscaleStatus {
-    /// Queue/scale-up pressure, a scale-down wave, or stuck-roll remediation
-    /// is in flight. The reconcile loop must not start an image roll and
-    /// should requeue soon.
+    /// A scale-down wave is draining victims, or stuck-roll remediation
+    /// mutated the fleet this tick. The reconcile loop must not start an
+    /// image roll and should requeue soon.
+    ///
+    /// Deliberately NOT set for queue/scale-up pressure or for mere
+    /// stuck-roll debt (issue #1012): a roll is a reattach pod swap that
+    /// removes no capacity, one-roll-at-a-time is enforced by `plan_roll`'s
+    /// not-Ready arm, and the floor gate protects capacity. A queue starved
+    /// by wire skew is served BY the roll — blocking on it deadlocks the
+    /// fleet (the queue waits for the roll, the roll waits for the queue).
     pub blocks_roll: bool,
 }
 
@@ -727,9 +734,7 @@ pub async fn step(
     if !stuck_rolls.is_empty() {
         // Do not compete with queued creates for the replacement capacity.
         // Once the queue drains and the schedulable target is actually met,
-        // safely drain + remove the named broken node. Even if removal
-        // completes now, block the precomputed image-roll decision for this
-        // tick; the next reconcile must observe the new fleet first.
+        // safely drain + remove the named broken node.
         if demand.queued_sessions == 0 && current >= desired {
             let remaining = repair_stuck_rolls(&act, stuck_rolls).await;
             tracing::info!(
@@ -738,16 +743,26 @@ pub async fn step(
                 remaining,
                 "stuck-roll repair step"
             );
+            // Repair may have removed a named node this tick — block the
+            // precomputed image-roll decision; the next reconcile must
+            // observe the new fleet first.
+            return Ok(AutoscaleStatus { blocks_roll: true });
         }
-        return Ok(AutoscaleStatus { blocks_roll: true });
+        // Durable debt alone never blocks a roll (issue #1012): the stuck
+        // node's successor is not Ready, so `plan_roll` already yields
+        // WaitForReady, and when the queue is starved by wire skew the roll
+        // is the only thing that can serve it.
+        return Ok(AutoscaleStatus::default());
     }
 
     match action {
         StepAction::AbortAndGrow | StepAction::AbortOnly => {
-            // Queue/scale-up pressure owns the fleet this tick. Starting an
-            // image roll here would immediately take capacity back out while
-            // sessions are waiting or a new node is still joining.
-            Ok(AutoscaleStatus { blocks_roll: true })
+            // Queue/scale-up pressure aborts waves and grows the pool, but
+            // never suppresses image rolls (issue #1012): a roll removes no
+            // capacity (reattach pod swap, floor-gated), and a queue starved
+            // by wire skew is served BY the roll — blocking here deadlocks
+            // (queue waits for roll, roll waits for queue).
+            Ok(AutoscaleStatus::default())
         }
         StepAction::Hold => Ok(AutoscaleStatus::default()),
         StepAction::StartWave | StepAction::ContinueWave => {
@@ -941,6 +956,10 @@ mod tests {
         /// host_status call (popped front; empty → (0, 0)).
         enable_work: Mutex<HashMap<HostId, std::collections::VecDeque<(u32, u32)>>>,
         annotated: Mutex<Vec<String>>,
+        /// Returned by `list_hosts` (the wave planner's join input).
+        hosts: Mutex<Vec<HostLoad>>,
+        /// When set, `remove_node` fails — keeps a wave victim in flight.
+        fail_remove: Mutex<bool>,
     }
     impl Rec {
         fn push(&self, s: impl Into<String>) {
@@ -957,7 +976,7 @@ mod tests {
             Ok(*self.demand.lock().unwrap())
         }
         async fn list_hosts(&self) -> Result<Vec<HostLoad>, OperatorError> {
-            Ok(vec![])
+            Ok(self.hosts.lock().unwrap().clone())
         }
         async fn host_status(&self, host: HostId) -> Result<Option<HostStatus>, OperatorError> {
             let running = self
@@ -1045,6 +1064,11 @@ mod tests {
             _pool: &str,
             node: &str,
         ) -> Result<(), engram_core::BackendError> {
+            if *self.rec.fail_remove.lock().unwrap() {
+                return Err(engram_core::BackendError::Protocol(format!(
+                    "injected remove_node failure for {node}"
+                )));
+            }
             self.rec.push(format!("remove_node {node}"));
             Ok(())
         }
@@ -1130,7 +1154,10 @@ mod tests {
         .await
         .expect("autoscale step");
 
-        assert!(status.blocks_roll, "queue pressure must block image rolls");
+        assert!(
+            !status.blocks_roll,
+            "queue pressure / stuck debt must not block image rolls (issue #1012)"
+        );
         let log = rec.log();
         assert!(
             log.iter().any(|line| line == "set_size 4"),
@@ -1139,6 +1166,118 @@ mod tests {
         assert!(
             !log.iter().any(|line| line.starts_with("drain ")),
             "queued creates own replacement capacity before repair: {log:?}"
+        );
+    }
+
+    /// Issue #1012 regression: after a coord-first wire bump every host is
+    /// skew-excluded from placement, sessions queue, and the roll is the only
+    /// cure for the skew. Queue pressure (`AbortOnly` — nothing to grow) must
+    /// not block the roll, or the fleet deadlocks: the queue waits for the
+    /// roll, the roll waits for the queue.
+    #[tokio::test]
+    async fn skew_starved_queue_does_not_block_the_roll() {
+        let rec = Arc::new(Rec::default());
+        // Coordinator view mid-deploy: both hosts wire-skewed, so zero
+        // schedulable capacity and two queued creates that cannot place.
+        *rec.demand.lock().unwrap() = crate::scaler::FleetDemand {
+            schedulable_hosts: 0,
+            free_mib: 0,
+            total_mib: 0,
+            free_vcpus: 0,
+            total_vcpus: 0,
+            queued_sessions: 2,
+            queued_mib: 49_152,
+            queued_vcpus: 16,
+        };
+        let scaler = RecScaler { rec: rec.clone() };
+        let ticks = std::sync::atomic::AtomicU32::new(0);
+        // Both pods Ready but running stale images (they need the roll).
+        let stale = |node: &str| PodInfo {
+            host_image: "host:old".into(),
+            init_image: "assets:old".into(),
+            ..ready_pod(node)
+        };
+        let pods = vec![stale("a"), stale("b")];
+
+        let status = step(
+            &autoscale_spec(),
+            &scaler,
+            &ticks,
+            &NodeReadyTracker::default(),
+            &rec,
+            &rec,
+            FleetObservation {
+                pods: &pods,
+                roll_idle: false,
+                stuck_rolls: &[],
+            },
+        )
+        .await
+        .expect("autoscale step");
+
+        assert!(
+            !status.blocks_roll,
+            "a skew-starved queue must be served BY the roll, never block it"
+        );
+    }
+
+    /// The one thing that still blocks rolls: an in-flight scale-down wave
+    /// (its drains consume the receiving capacity a roll would also need).
+    #[tokio::test]
+    async fn in_flight_wave_still_blocks_the_roll() {
+        let rec = Arc::new(Rec::default());
+        // Fleet of 3 with enough free RAM that the cost-optimal target is 2 —
+        // the annotated victim's wave continues this tick.
+        *rec.demand.lock().unwrap() = crate::scaler::FleetDemand {
+            schedulable_hosts: 3,
+            free_mib: 180_000,
+            total_mib: 196_608,
+            free_vcpus: 100,
+            total_vcpus: 120,
+            ..crate::scaler::FleetDemand::default()
+        };
+        let load = |node: &str, cordoned: bool| HostLoad {
+            id: HostId::from_node_name(node),
+            cordoned,
+            running_sandboxes: 0,
+            reserved_mib: 0,
+            free_mib: 60_000,
+            reserved_vcpus: 0,
+            free_vcpus: 30,
+        };
+        *rec.hosts.lock().unwrap() = vec![
+            load("a", false),
+            load("b", false),
+            load("victim", true), // cordoned by the wave, pinned via annotation
+        ];
+        rec.annotated.lock().unwrap().push("victim".into());
+        // Transient removal failure keeps the victim in flight this tick.
+        *rec.fail_remove.lock().unwrap() = true;
+        let mut spec = autoscale_spec();
+        spec.autoscaling.as_mut().unwrap().scale_down = crate::scaler::ScaleDownMode::IdleOnly;
+        let scaler = RecScaler { rec: rec.clone() };
+        let ticks = std::sync::atomic::AtomicU32::new(0);
+        let pods = vec![ready_pod("a"), ready_pod("b"), ready_pod("victim")];
+
+        let status = step(
+            &spec,
+            &scaler,
+            &ticks,
+            &NodeReadyTracker::default(),
+            &rec,
+            &rec,
+            FleetObservation {
+                pods: &pods,
+                roll_idle: true,
+                stuck_rolls: &[],
+            },
+        )
+        .await
+        .expect("autoscale step");
+
+        assert!(
+            status.blocks_roll,
+            "an in-flight wave's drains must still block image rolls"
         );
     }
 
