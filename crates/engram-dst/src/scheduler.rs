@@ -837,6 +837,25 @@ impl Sim {
                         continue;
                     }
                     let now = state.services.clock.now_utc();
+                    // Stamp the event-log cursor with the same primitive
+                    // the production eviction/checkpoint writers use
+                    // (`latest_event_idx_at_or_before`). Production
+                    // anchors at the guest's `paused_at`; the sim world
+                    // has no pause phase, so its checkpoint instant `now`
+                    // IS the pause-equivalent moment. Without the stamp
+                    // the record carries `events_cursor: NULL`, every resume's
+                    // `apply_rung1_rewind` early-returns, and the entire
+                    // rewind path — the machinery behind
+                    // `recovered_from_checkpoint` — is invisible to the
+                    // swarm. With it, any post-cursor guest history at
+                    // resume time rolls back for real, and the
+                    // `user_input_never_rewound` oracle stands guard.
+                    let cursor = state
+                        .services
+                        .meta
+                        .latest_event_idx_at_or_before(sid, now)
+                        .await
+                        .unwrap_or(None);
                     let snap: engram_core::types::snapshot::SnapshotRecord =
                         serde_json::from_value(serde_json::json!({
                             "id": engram_core::SnapshotId::from(self.world.entropy.uuid()),
@@ -847,6 +866,7 @@ impl Sim {
                             "created_at": now,
                             "last_accessed_at": now,
                             "recoverable": true,
+                            "events_cursor": cursor,
                         }))
                         .expect("sim checkpoint row");
                     let _ = state.services.meta.record_snapshot(snap).await;
