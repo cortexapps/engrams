@@ -156,31 +156,47 @@ async function fetchStatusInputs(
   mint: MintAccess,
   oauthCredential: OauthCredentialAccess,
 ): Promise<StatusInputs> {
-  try {
-    const [secrets, mintKinds, oauthCreds] = await Promise.all([
-      orgSecret.listSecrets({}),
-      mint.listMintKinds({}),
+  // Each input degrades INDEPENDENTLY: a failing leg reports only its own
+  // connectors as "available" and never wipes the status the other legs
+  // resolved fine (mirroring loadRegistry's degrade policy, per leg).
+  const settle = async <T>(what: string, fallback: T, run: () => Promise<T>): Promise<T> => {
+    try {
+      return await run();
+    } catch (e) {
+      console.error(`integration: ${what} unavailable, degrading that status input — ${(e as Error).message}`);
+      return fallback;
+    }
+  };
+  const [names, requiredByKind, oauthByProvider] = await Promise.all([
+    settle("org-secret listing", new Set<string>(), async () => {
+      const secrets = await orgSecret.listSecrets({});
+      return new Set(secrets.secrets.map((s) => s.name));
+    }),
+    settle("mint-kind listing", new Map<string, string[]>(), async () => {
+      const mintKinds = await mint.listMintKinds({});
+      const byKind = new Map<string, string[]>();
+      for (const k of mintKinds.mintKinds) {
+        byKind.set(
+          k.kind,
+          k.fields.filter((f) => f.required).map((f) => `${k.kind}.${f.name}`),
+        );
+      }
+      return byKind;
+    }),
+    settle("OAuth credential listing", new Map<string, OauthCredentialStatus>(), async () => {
       // Kind-wide listing (empty subject id): every connector credential in
       // one call (ADR 0106 addendum).
-      oauthCredential.listCredentials({ subject: { kind: OauthSubjectKind.CONNECTOR, id: "" } }),
-    ]);
-    const names = new Set(secrets.secrets.map((s) => s.name));
-    const requiredByKind = new Map<string, string[]>();
-    for (const k of mintKinds.mintKinds) {
-      requiredByKind.set(
-        k.kind,
-        k.fields.filter((f) => f.required).map((f) => `${k.kind}.${f.name}`),
-      );
-    }
-    const oauthByProvider = new Map<string, OauthCredentialStatus>();
-    for (const cred of oauthCreds.credentials) {
-      oauthByProvider.set(cred.provider, cred.status as OauthCredentialStatus);
-    }
-    return { names, requiredByKind, oauthByProvider };
-  } catch (e) {
-    console.error(`integration: status inputs unavailable, reporting all connectors available — ${(e as Error).message}`);
-    return { names: new Set(), requiredByKind: new Map(), oauthByProvider: new Map() };
-  }
+      const oauthCreds = await oauthCredential.listCredentials({
+        subject: { kind: OauthSubjectKind.CONNECTOR, id: "" },
+      });
+      const byProvider = new Map<string, OauthCredentialStatus>();
+      for (const cred of oauthCreds.credentials) {
+        byProvider.set(cred.provider, cred.status as OauthCredentialStatus);
+      }
+      return byProvider;
+    }),
+  ]);
+  return { names, requiredByKind, oauthByProvider };
 }
 
 interface StatusInputs {

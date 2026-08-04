@@ -541,7 +541,10 @@ describe("IntegrationService — connector status (redesign)", () => {
     for (const [creds, expected] of [
       [[], "available"],
       [[{ provider: "slack", status: "connected" }], "connected"],
-      [[{ provider: "slack", status: "expired" }], "connected"],
+      // `expired` is degraded, not transient: the scanner refreshes hours
+      // AHEAD of expiry, so reaching it means refresh has been failing and
+      // guest requests are already 401ing — surface it.
+      [[{ provider: "slack", status: "expired" }], "needs_reconnect"],
       [[{ provider: "slack", status: "broken" }], "needs_reconnect"],
       [[{ provider: "slack", status: "revoked" }], "needs_reconnect"],
     ] as const) {
@@ -552,6 +555,30 @@ describe("IntegrationService — connector status (redesign)", () => {
       } finally {
         await s.close();
       }
+    }
+  });
+
+  test("a failing OAuth listing degrades ONLY oauth statuses, not inject/mint", async () => {
+    const failing: OauthCredentialAccess = {
+      async listCredentials() {
+        throw new Error("coordinator briefly unreachable");
+      },
+    };
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      connectors: fakeStore().store,
+      orgSecret: fakeOrgSecret(["datadog-api-key", "datadog-app-key"]).client,
+      mint: fakeMint(),
+      oauthCredential: failing,
+    });
+    try {
+      const by = new Map((await s.client.listConnectors({})).connectors.map((c) => [c.provider, c]));
+      // The inject connector's org secrets resolved fine — it stays connected.
+      expect(by.get("datadog")?.status).toBe("connected");
+      // Only the oauth-facet connector degrades to available.
+      expect(by.get("slack")?.status).toBe("available");
+    } finally {
+      await s.close();
     }
   });
 

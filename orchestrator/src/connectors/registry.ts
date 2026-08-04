@@ -1673,9 +1673,12 @@ export type OauthCredentialStatus = "connected" | "expired" | "broken" | "revoke
  * supplies the org-secret name set, mint requirements, and (for oauth-facet
  * connectors) the coordinator's per-provider credential status:
  *   - oauth  → status comes SOLELY from the sealed credential store. No row ⇒
- *              available; broken/revoked ⇒ needs_reconnect; connected/expired ⇒
- *              connected (transient expiry is the refresh scanner's to repair —
- *              hours before consumers would notice).
+ *              available; broken/revoked/expired ⇒ needs_reconnect; connected ⇒
+ *              connected. `expired` is degraded, not transient: the scanner
+ *              refreshes max(30 min, 25% TTL) AHEAD of expiry, so a row only
+ *              reaches `expired` after hours of failed refreshes — guest
+ *              requests are 401ing by then. Self-healing: the row stays in
+ *              the due set; a successful refresh restores `connected`.
  *   - inject → connected ⇔ every `secretRef` exists in the org secret store.
  *   - mint   → connected ⇔ every required mint field exists as an org secret
  *              (caller derives the names as `${kind}.${field}` from the
@@ -1689,7 +1692,7 @@ export function connectorStatus(
 ): ConnectorStatus {
   if (connector.oauth) {
     if (oauthStatus === undefined) return "available";
-    return oauthStatus === "broken" || oauthStatus === "revoked" ? "needs_reconnect" : "connected";
+    return oauthStatus === "connected" ? "connected" : "needs_reconnect";
   }
   if (connector.credential.source === "inject") {
     // Connected ⇔ every injected header's secret is present in the org store.
