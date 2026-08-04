@@ -250,6 +250,35 @@ impl BindingStore {
     /// the registry rebuild pass; unparseable files are skipped with a
     /// warn (only reachable via node death, where no VM survives to
     /// want them — the ADR 0110 reboot argument).
+    /// Reverse lookup: the binding record whose `sandbox_id` matches.
+    /// #1003 ladder 4: the spec-based re-serve pass maps a surviving
+    /// sandbox back to its session from host-local durable state (the
+    /// coordinator's rehydrate list can be wrong or incomplete).
+    /// Unparseable records are skipped with a warn — the pass treats a
+    /// missing mapping as "unserved" and surfaces it on the gauge.
+    pub fn find_by_sandbox(&self, sandbox_id: SandboxId) -> std::io::Result<Option<BindingRecord>> {
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            match std::fs::read(entry.path()).and_then(|b| {
+                serde_json::from_slice::<BindingRecord>(&b).map_err(std::io::Error::from)
+            }) {
+                Ok(record) if record.sandbox_id == sandbox_id => return Ok(Some(record)),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "skipping unparseable binding record in sandbox lookup",
+                    );
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub fn list_policies(
         &self,
     ) -> std::io::Result<Vec<engram_core::types::egress::SessionEgressPolicy>> {
