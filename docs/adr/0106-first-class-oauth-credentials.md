@@ -125,7 +125,7 @@ only in `oauth_credentials` under `subject_kind = 'connector'`.
   when a facet enables it, derives its verifier from
   HMAC(client secret, flow id) — nothing secret is persisted.
 - **Refresh is first-class** (Linear: 24 h access tokens, mandatory
-  rotating refresh tokens). Migration 0110 adds `expires_at` (outside
+  rotating refresh tokens). Migration 0111 adds `expires_at` (outside
   the ciphertext, for sweep scheduling and status without a KEK
   unwrap), an advisory `refresh_claim_until`, and `broken_at` /
   `broken_reason`. A background scanner (`run_once`/`spawn` split,
