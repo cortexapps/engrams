@@ -4,6 +4,7 @@ import { useState } from "react";
 
 import { useTheme } from "../../components/theme-provider";
 import { ArtifactViewer } from "../../components/artifacts/ArtifactViewer";
+import { GuardedDownload } from "../../components/artifacts/GuardedDownload";
 import { ShareDialog } from "../../components/artifacts/ShareDialog";
 import { fmtBytes } from "../../components/transcriptFmt";
 import type { ArtifactRecord } from "../../gen/engram/app/v1/artifact_pb";
@@ -14,7 +15,7 @@ import { useAuth } from "../../auth/AuthProvider";
 import { artifactBytesUrl, artifactPageUrl, mediaKind } from "../../lib/artifacts";
 import { errorMessage } from "../../lib/errors";
 import { PageHeading } from "@/components/page-heading";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import {
   Select,
   SelectContent,
@@ -223,11 +224,16 @@ function ArtifactToolbar({
           <ExternalLinkIcon />
         </a>
       </Button>
-      <Button asChild variant="ghost" size="sm" aria-label="Download">
-        <a href={url} download={artifact.fileName}>
-          <DownloadIcon />
-        </a>
-      </Button>
+      <GuardedDownload
+        url={url}
+        mediaType={artifact.mediaType}
+        fileName={artifact.fileName}
+        sizeBytes={Number(artifact.sizeBytes)}
+        className={buttonVariants({ variant: "ghost", size: "sm" })}
+        aria-label="Download"
+      >
+        <DownloadIcon />
+      </GuardedDownload>
 
       {canShare && <ShareDialog artifact={artifact} />}
     </div>

@@ -1,7 +1,8 @@
 {
   "kind": "skill",
   "skills": [
-    { "name": "share-file", "bins": ["bin/engram-share"] }
+    { "name": "share-file", "bins": ["bin/engram-share"] },
+    { "name": "artifact-design", "bins": [] }
   ],
   "provides_askpass": "bin/git-askpass"
 }
