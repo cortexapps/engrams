@@ -52,6 +52,7 @@ impl Oracles {
         self.epoch_monotonicity(world)?;
         sandbox_owners_agree(world)?;
         snapshot_safety(world)?;
+        user_input_never_rewound(world)?;
         self.attach_disagreement(world)?;
         Ok(())
     }
@@ -324,6 +325,44 @@ fn snapshot_safety(world: &SimWorld) -> Result<(), Violation> {
                         row.session.id, row.session.status
                     ),
                 });
+            }
+        }
+        Ok(())
+    })
+}
+
+/// USER INPUT IS NEVER GUEST HISTORY (prod 2026-08-03, session
+/// aa0829b0): the rung-1 rewind's positive-provenance tombstone
+/// predicate must never touch a user-authored row — the prompt echo
+/// (`agent_message` with role `user`), a deferred tool answer
+/// (`tool_result_submitted`), or an uploaded file (`file_shared`) —
+/// under ANY interleaving of prompts, checkpoints, evictions, and
+/// resumes. Checked every step, every seed. The rewind path is live in
+/// the swarm because `Step::HostCheckpoint` stamps `events_cursor`;
+/// the directed non-vacuity case in `tests/rewind_coverage.rs` proves
+/// genuine guest history still rolls back, so this oracle cannot pass
+/// vacuously.
+fn user_input_never_rewound(world: &SimWorld) -> Result<(), Violation> {
+    world.meta.with_db(|db| {
+        for (sid, events) in db.session_events.iter() {
+            for e in events {
+                if e.rewound_at.is_none() {
+                    continue;
+                }
+                let user_input = matches!(
+                    e.kind.as_str(),
+                    "tool_result_submitted" | "file_shared" | "prompt_received"
+                ) || (e.kind == "agent_message"
+                    && e.payload.get("role").and_then(|v| v.as_str()) == Some("user"));
+                if user_input {
+                    return Err(Violation {
+                        invariant: "user-input-never-rewound",
+                        detail: format!(
+                            "session {sid} idx {} kind {} was tombstoned by a rewind",
+                            e.idx, e.kind
+                        ),
+                    });
+                }
             }
         }
         Ok(())
