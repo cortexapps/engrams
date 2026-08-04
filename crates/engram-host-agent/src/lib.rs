@@ -974,6 +974,7 @@ impl HostAgent {
                 };
                 let cc = coord_client.clone();
                 let pooled_for_rehydrate = pooled.clone();
+                let work_dir_for_rehydrate = self.cfg.work_dir.clone();
                 registration_task = Some(tokio::spawn(async move {
                     let mut backoff = std::time::Duration::from_millis(500);
                     let cap = std::time::Duration::from_secs(30);
@@ -1051,6 +1052,42 @@ impl HostAgent {
                                              the coordinator's rehydrate list missed",
                                         );
                                     }
+                                    // #1003 ladder 4 — pass 3: spec-based
+                                    // re-serve for survivors BOTH passes
+                                    // missed (never-flushed sessions: no
+                                    // manifest in the coord row, no spool
+                                    // after SIGKILL). Lineage comes from
+                                    // sandbox.json, the session mapping
+                                    // from the binding record. Before this,
+                                    // such devices stayed RECONNECTABLE
+                                    // with no retry owner.
+                                    match crate::bindings::BindingStore::open(
+                                        work_dir_for_rehydrate.join("bindings"),
+                                    ) {
+                                        Ok(binding_reader) => {
+                                            let (spec_rehydrated, spec_failed, unserved) =
+                                                pooled_for_rehydrate
+                                                    .rehydrate_unserved_from_specs(
+                                                        &work_dir_for_rehydrate,
+                                                        &binding_reader,
+                                                    )
+                                                    .await;
+                                            if spec_rehydrated + spec_failed + unserved > 0 {
+                                                tracing::warn!(
+                                                    rehydrated = spec_rehydrated,
+                                                    failed = spec_failed,
+                                                    unserved,
+                                                    "spec-based rehydrate pass finished; \
+                                                     unserved>0 means a resident VM runs \
+                                                     without its disk served",
+                                                );
+                                            }
+                                        }
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            "spec-based rehydrate: binding store open failed",
+                                        ),
+                                    }
                                     // ADR 0044 K2: stale-binding sweep AFTER
                                     // the survivors have claimed their slots
                                     // — only still-free devices are probed,
@@ -1096,6 +1133,7 @@ impl HostAgent {
                                 #[cfg(not(target_os = "linux"))]
                                 {
                                     let _ = pooled_for_rehydrate;
+                                    let _ = &work_dir_for_rehydrate;
                                     if !resp.rehydrate_sandboxes.is_empty() {
                                         tracing::info!(
                                             count = resp.rehydrate_sandboxes.len(),
@@ -1954,10 +1992,20 @@ async fn rehydrate_survivors(
     let mut failed = 0usize;
     for entry in survivors {
         let (Some(mid), Some(ver)) = (entry.disk_manifest_id, entry.disk_manifest_version) else {
-            tracing::debug!(
+            // #1003 ladder 4: a never-flushed session's row has no
+            // manifest — the spec-based pass owns its re-serve. Loud,
+            // not debug!: this used to be the silent first hop of the
+            // nobody-owns-the-re-serve chain.
+            ::metrics::counter!(
+                "engram_nbd_rehydrate_skipped_total",
+                "reason" => "no_disk_manifest_on_row",
+            )
+            .increment(1);
+            tracing::warn!(
                 session_id = %entry.session_id,
                 sandbox_id = %entry.sandbox_id,
-                "rehydrate skipped: no disk manifest on the survivor row",
+                "rehydrate skipped: no disk manifest on the survivor row \
+                 (never-flushed session — the spec-based pass will re-serve)",
             );
             skipped += 1;
             continue;

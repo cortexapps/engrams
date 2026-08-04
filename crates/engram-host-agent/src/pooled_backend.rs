@@ -3972,6 +3972,122 @@ impl PooledBackend {
         (rehydrated, failed)
     }
 
+    /// #1003 ladder 4 — the spec-based re-serve pass (pass 3 of 3).
+    /// Every survivor the first two passes could not serve — the
+    /// coordinator's list had no disk manifest (a session that never
+    /// published its first flush) and there is no shutdown spool (a
+    /// SIGKILL writes none) — is still fully recoverable from
+    /// host-local durable state: `sandbox.json` records the lineage
+    /// the NBD daemon was serving (stamped at create), the binding
+    /// record maps the sandbox to its session, and Recover-mode dirty
+    /// open re-adopts the overlay files (frozen generations included).
+    /// Before this pass such devices stayed RECONNECTABLE with NO
+    /// retry owner — unbounded guest I/O stall (the #1003 incident's
+    /// 30+ minute gap).
+    ///
+    /// Returns `(rehydrated, failed, unserved_after)`.
+    #[cfg(target_os = "linux")]
+    pub async fn rehydrate_unserved_from_specs(
+        &self,
+        work_dir: &std::path::Path,
+        bindings: &crate::bindings::BindingStore,
+    ) -> (usize, usize, usize) {
+        let live: std::collections::HashSet<SandboxId> = match self.inner.list().await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "spec-based rehydrate: backend list failed; skipping",
+                );
+                return (0, 0, 0);
+            }
+        };
+        let mut rehydrated = 0usize;
+        let mut failed = 0usize;
+        for sandbox_id in &live {
+            if self.nbd_sandboxes.contains_key(sandbox_id) {
+                continue;
+            }
+            let started = crate::time_source::metrics_now();
+            let manifest_path = work_dir.join(sandbox_id.to_string()).join("sandbox.json");
+            let spec_ref =
+                engram_sandbox_firecracker::sandbox_manifest::read_manifest(&manifest_path)
+                    .ok()
+                    .and_then(|m| m.spec.rootfs_manifest);
+            let Some(disk_ref) = spec_ref else {
+                ::metrics::counter!(
+                    "engram_nbd_rehydrate_skipped_total",
+                    "reason" => "no_spec_lineage",
+                )
+                .increment(1);
+                tracing::warn!(
+                    %sandbox_id,
+                    "spec-based rehydrate: sandbox.json carries no rootfs lineage \
+                     (pre-stamp sandbox or non-NBD rootfs); device stays reconnectable",
+                );
+                failed += 1;
+                continue;
+            };
+            let session_id = match bindings.find_by_sandbox(*sandbox_id) {
+                Ok(Some(record)) => record.session_id,
+                Ok(None) => {
+                    ::metrics::counter!(
+                        "engram_nbd_rehydrate_skipped_total",
+                        "reason" => "no_binding",
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        %sandbox_id,
+                        "spec-based rehydrate: no binding record maps this survivor \
+                         to a session; device stays reconnectable",
+                    );
+                    failed += 1;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(%sandbox_id, error = %e, "spec-based rehydrate: binding scan failed");
+                    failed += 1;
+                    continue;
+                }
+            };
+            match self
+                .rehydrate_sandbox(session_id, *sandbox_id, disk_ref)
+                .await
+            {
+                Ok(true) => {
+                    ::metrics::histogram!("engram_nbd_reserve_seconds")
+                        .record(started.elapsed().as_secs_f64());
+                    tracing::warn!(
+                        %sandbox_id,
+                        %session_id,
+                        manifest = %disk_ref,
+                        "spec-based rehydrate: re-served a survivor BOTH earlier passes \
+                         missed (never-flushed session; lineage from sandbox.json)",
+                    );
+                    rehydrated += 1;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(
+                        %sandbox_id,
+                        %session_id,
+                        error = %e,
+                        "spec-based rehydrate failed; device stays reconnectable",
+                    );
+                    failed += 1;
+                }
+            }
+        }
+        let unserved = live
+            .iter()
+            .filter(|id| !self.nbd_sandboxes.contains_key(id))
+            .count();
+        // The durability alert feed: nonzero after ALL THREE passes
+        // means a resident VM is running without its disk served.
+        ::metrics::gauge!("engram_nbd_survivors_unserved").set(unserved as f64);
+        (rehydrated, failed, unserved)
+    }
+
     /// The Layer-2 kernel-derived inventory + Layer-3 classification barrier
     /// (ADR 0098 §Phase 3, Wave 7b, #784). Run AFTER the two rehydrate passes
     /// (coord-list + #739 local) and BEFORE the destructive stale-binding sweep:
@@ -6913,6 +7029,19 @@ impl SandboxBackend for PooledBackend {
                 // ADR 0021 P1.5: no harness substrate to build —
                 // the harness binary travels in the rootfs at the
                 // manifest-declared `[harness] exec` path.
+            }
+            // #1003 ladder 4: stamp the resolved chunked lineage into
+            // the spec BEFORE the sandbox manifest is written, so
+            // `sandbox.json` always records what the NBD daemon is
+            // serving. A survivor that never published a flush has no
+            // manifest anywhere else durable (no live ref in PG, no
+            // snapshot, no spool after a SIGKILL) — this stamp is what
+            // the spec-based re-serve pass recovers from.
+            #[cfg(target_os = "linux")]
+            if spec.rootfs_manifest.is_none() {
+                if let Some(state) = &pending_nbd_state {
+                    spec.rootfs_manifest = Some(state.backend.manifest_ref().await);
+                }
             }
 
             // `fc_boot` is emitted by the inner FC backend itself
