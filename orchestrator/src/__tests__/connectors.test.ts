@@ -1166,6 +1166,9 @@ describe("cli facet (ADR 0058)", () => {
     expect(issueCreate.surface).toBe("asset");
     expect(issueCreate.success_no_graphql_errors).toBe(true);
     expect(issueCreate.data).toContainEqual(["title", "$.vars.input.title"]);
+    // Flat-variable clients (the bundled CLI inlines the input literal and
+    // passes {"title": ...}) resolve through the second fallback.
+    expect(issueCreate.data).toContainEqual(["title", "$.vars.title"]);
     expect(issueCreate.fetchable).toBe("$.resp.data.issueCreate.issue.url");
     expect(issueCreate.url_fallback?.pattern).toBe(
       "https://linear.app/{workspace}/issue/{identifier}/{slug}",
