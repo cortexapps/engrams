@@ -774,24 +774,37 @@ pub(crate) async fn resolve_inject_entries(
             // auth scheme is the provider's, not hardcoded by the policy compiler.
             // The scoped credential never enters the guest.
             match mint_inject_header(state, session_id, mint_source, &caps).await {
-                Some((h, expires_at)) => engram_core::types::egress::EgressInjectEntry {
-                    secret: h.value,
-                    header_name: h.name,
-                    header_template: "{}".to_string(),
-                    allow_hosts: inj.hosts.clone(),
-                    allow_host_patterns: Vec::new(),
-                    methods: inj.methods.clone(),
-                    path_globs: inj.path_globs.clone(),
-                    // ADR 0059: the same minted token authorizes REST + GraphQL on
-                    // the provider's host; the GraphQL matcher rides through.
-                    graphql_operation: inj.graphql_operation.clone(),
-                    graphql_field: inj.graphql_field.clone(),
-                    // WS4: a minted entry is refreshable — the proxy re-mints via
-                    // its InjectRefresher near `expires_at` (this provider is the
-                    // one the refresh route re-runs the mint for).
-                    mint_source: Some(mint_source.clone()),
-                    expires_at: Some(expires_at),
-                },
+                Some((h, expires_at)) => {
+                    // Connection mints return a pre-rendered header (name +
+                    // full value; template collapses to "{}"). Connector
+                    // OAuth returns the RAW token: the policy's own header
+                    // name and template render around it, and a refresh only
+                    // has to supply a new raw token.
+                    let (header_name, header_template) = match mint_source {
+                        CredentialMintSource::Connection { .. } => (h.name, "{}".to_string()),
+                        CredentialMintSource::OauthConnector { .. } => {
+                            (inj.header_name.clone(), inj.header_template.clone())
+                        }
+                    };
+                    engram_core::types::egress::EgressInjectEntry {
+                        secret: h.value,
+                        header_name,
+                        header_template,
+                        allow_hosts: inj.hosts.clone(),
+                        allow_host_patterns: Vec::new(),
+                        methods: inj.methods.clone(),
+                        path_globs: inj.path_globs.clone(),
+                        // ADR 0059: the same minted token authorizes REST + GraphQL on
+                        // the provider's host; the GraphQL matcher rides through.
+                        graphql_operation: inj.graphql_operation.clone(),
+                        graphql_field: inj.graphql_field.clone(),
+                        // WS4: a minted entry is refreshable — the proxy re-mints via
+                        // its InjectRefresher near `expires_at` (this provider is the
+                        // one the refresh route re-runs the mint for).
+                        mint_source: Some(mint_source.clone()),
+                        expires_at: Some(expires_at),
+                    }
+                }
                 None => {
                     // Logged inside `mint_inject_header`.
                     continue;
@@ -861,10 +874,47 @@ async fn mint_inject_header(
     engram_core::traits::InjectHeader,
     chrono::DateTime<chrono::Utc>,
 )> {
-    let CredentialMintSource::Connection {
-        connection_id,
-        provider,
-    } = source;
+    let (connection_id, provider) = match source {
+        CredentialMintSource::Connection {
+            connection_id,
+            provider,
+        } => (connection_id, provider),
+        // ADR 0106 addendum: connector OAuth — resolve the sealed, refreshed
+        // access token. The raw token is the inject value; the entry's own
+        // header template renders around it.
+        CredentialMintSource::OauthConnector {
+            connection_id,
+            provider,
+        } => {
+            let key = engram_core::types::oauth::OAuthCredentialKey {
+                subject_kind: engram_core::types::oauth::OAuthSubjectKind::Connector,
+                subject_id: connection_id.clone(),
+                provider: provider.clone(),
+            };
+            return match state.oauth.resolve_connector_token(&key).await {
+                Ok(token) => Some((
+                    engram_core::traits::InjectHeader {
+                        name: String::new(),
+                        value: token.secret,
+                    },
+                    // A non-expiring bundle never needs a proxy re-ask; park
+                    // the refresh far out.
+                    token.expires_at.unwrap_or_else(|| {
+                        state.services.clock.now_utc() + chrono::Duration::days(3650)
+                    }),
+                )),
+                Err(error) => {
+                    tracing::warn!(
+                        %session_id,
+                        provider = %provider,
+                        code = error.code(),
+                        "connector OAuth token could not be resolved for inject"
+                    );
+                    None
+                }
+            };
+        }
+    };
     if provider == "gcp" {
         return mint_remote_connection_inject_header(session_id, connection_id).await;
     }

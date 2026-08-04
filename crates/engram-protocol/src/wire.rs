@@ -131,7 +131,13 @@ use serde::{Deserialize, Serialize};
 // wildcard-free match makes a new variant a compile error. Bincode field
 // REPLACEMENT (not an addition), so the roll is lockstep: a v22 host
 // cannot decode a v23 policy.
-pub const WIRE_VERSION: u32 = 23;
+// v24 (ADR 0106 addendum): `CredentialMintSource` gains the trailing
+// `OauthConnector` variant (connector OAuth tokens resolved from the sealed
+// credential store) on `SessionEgressPolicy` inject entries and the
+// host→coord inject/refresh route. Trailing-variant addition: every existing
+// encoding is unchanged, but a v23 host cannot decode a policy carrying the
+// new variant, so the roll is lockstep.
+pub const WIRE_VERSION: u32 = 24;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic
