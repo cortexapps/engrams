@@ -4535,6 +4535,23 @@ impl MetadataStore for SimMetadataStore {
         Ok(())
     }
 
+    async fn get_pending_oauth_flow(
+        &self,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+    ) -> Result<Option<engram_core::types::oauth::OAuthFlow>, MetaError> {
+        self.gate()?;
+        Ok(self
+            .db
+            .lock()
+            .oauth_flows
+            .values()
+            .find(|flow| {
+                flow.key == *key
+                    && flow.status == engram_core::types::oauth::OAuthFlowStatus::Pending
+            })
+            .cloned())
+    }
+
     async fn finish_oauth_flow_unowned(
         &self,
         id: uuid::Uuid,

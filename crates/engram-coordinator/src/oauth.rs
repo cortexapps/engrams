@@ -86,11 +86,14 @@ struct ActiveFlow {
 }
 
 pub struct OAuthManager {
-    meta: Arc<dyn MetadataStore>,
-    kek: Arc<dyn MasterKeyProvider>,
-    clock: Arc<dyn Clock>,
-    entropy: Arc<dyn Entropy>,
-    replica: String,
+    pub(crate) meta: Arc<dyn MetadataStore>,
+    pub(crate) kek: Arc<dyn MasterKeyProvider>,
+    pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) entropy: Arc<dyn Entropy>,
+    /// Org-secret resolution for connector redirect flows (client id/secret
+    /// refs). The coordinator is the only tier that reads these.
+    pub(crate) secrets: Arc<dyn engram_core::traits::SecretStore>,
+    pub(crate) replica: String,
     drivers: BTreeMap<String, Arc<dyn OAuthDriver>>,
     active: DashMap<uuid::Uuid, ActiveFlow>,
     concurrency: Arc<Semaphore>,
@@ -102,6 +105,7 @@ impl OAuthManager {
         kek: Arc<dyn MasterKeyProvider>,
         clock: Arc<dyn Clock>,
         entropy: Arc<dyn Entropy>,
+        secrets: Arc<dyn engram_core::traits::SecretStore>,
     ) -> Arc<Self> {
         let codex_bin = resolve_codex_bin();
         let driver: Arc<dyn OAuthDriver> = Arc::new(OpenAiCodexDriver { codex_bin });
@@ -116,6 +120,7 @@ impl OAuthManager {
             kek,
             clock,
             entropy,
+            secrets,
             replica,
             drivers,
             active: DashMap::new(),
@@ -351,7 +356,7 @@ impl OAuthManager {
             .await
     }
 
-    async fn publish_bundle(
+    pub(crate) async fn publish_bundle(
         &self,
         key: &OAuthCredentialKey,
         bundle: ValidatedOAuthBundle,
@@ -490,13 +495,15 @@ impl From<MetaError> for OAuthServiceError {
     }
 }
 
-fn validate_key(key: &OAuthCredentialKey) -> Result<(), OAuthServiceError> {
+pub(crate) fn validate_key(key: &OAuthCredentialKey) -> Result<(), OAuthServiceError> {
+    // Provider charset matches the connector-slug rule (`new_relic` carries
+    // an underscore).
     if key.subject_id.trim().is_empty()
         || key.provider.is_empty()
         || !key
             .provider
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     {
         return Err(OAuthServiceError::BadRequest(
             "invalid OAuth subject or provider".into(),

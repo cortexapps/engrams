@@ -1828,6 +1828,23 @@ impl MetadataStore for PostgresStore {
         }
     }
 
+    async fn get_pending_oauth_flow(
+        &self,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+    ) -> Result<Option<engram_core::types::oauth::OAuthFlow>, MetaError> {
+        sqlx::query(
+            "SELECT * FROM oauth_flows WHERE subject_kind=$1 AND subject_id=$2 AND provider=$3 AND status='pending'",
+        )
+        .bind(key.subject_kind.as_str())
+        .bind(&key.subject_id)
+        .bind(&key.provider)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?
+        .map(|row| oauth_flow_from_pg(&row))
+        .transpose()
+    }
+
     async fn finish_oauth_flow_unowned(
         &self,
         id: uuid::Uuid,

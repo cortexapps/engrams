@@ -1185,6 +1185,7 @@ dependencies = [
  "engram-testkit",
  "flate2",
  "futures",
+ "hmac",
  "http-body-util",
  "metrics",
  "metrics-exporter-prometheus",

@@ -2753,10 +2753,28 @@ async fn oauth_refresh_scheduling(ctx: &Ctx) {
             .await,
         Err(MetaError::Conflict(_))
     ));
+    // The pending flow is findable by key (redirect begin cancels stale
+    // attempts through this) and other keys see nothing.
+    let pending = ctx.meta.get_pending_oauth_flow(&linear).await.unwrap();
+    assert_eq!(pending.map(|f| f.id), Some(flow_id));
+    assert!(ctx
+        .meta
+        .get_pending_oauth_flow(&key_for("absent"))
+        .await
+        .unwrap()
+        .is_none());
     ctx.meta
         .finish_oauth_flow_unowned(flow_id, OAuthFlowStatus::Succeeded, None)
         .await
         .unwrap();
+    assert!(
+        ctx.meta
+            .get_pending_oauth_flow(&linear)
+            .await
+            .unwrap()
+            .is_none(),
+        "a finished flow is no longer pending"
+    );
     assert!(matches!(
         ctx.meta
             .finish_oauth_flow_unowned(flow_id, OAuthFlowStatus::Cancelled, None)

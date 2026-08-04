@@ -35,6 +35,7 @@ pub mod integrations;
 pub mod live_migration;
 pub mod metrics;
 pub mod oauth;
+pub mod oauth_redirect;
 pub mod org_secrets;
 pub mod outbox_delivery;
 pub mod pg_listener;

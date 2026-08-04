@@ -564,6 +564,17 @@ pub trait MetadataStore: Send + Sync {
         Err(MetaError::NotFound)
     }
 
+    /// The at-most-one pending flow for a subject+provider (the partial
+    /// unique index guarantees uniqueness). Redirect begin uses this to
+    /// cancel an abandoned attempt instead of stranding the admin behind
+    /// the one-pending constraint for the flow TTL.
+    async fn get_pending_oauth_flow(
+        &self,
+        _key: &crate::types::oauth::OAuthCredentialKey,
+    ) -> Result<Option<crate::types::oauth::OAuthFlow>, MetaError> {
+        Ok(None)
+    }
+
     /// Status-transition-fenced finish for redirect flows, which hold no live
     /// owner handle: any replica may finish a flow that is still pending and
     /// unexpired. The pending→terminal transition itself is the fence — two

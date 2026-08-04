@@ -929,6 +929,7 @@ impl AppState {
                 services.kek.clone(),
                 services.clock.clone(),
                 services.entropy.clone(),
+                services.secrets.clone(),
             ),
             cfg,
             services,

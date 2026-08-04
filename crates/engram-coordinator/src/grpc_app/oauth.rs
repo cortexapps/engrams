@@ -12,6 +12,7 @@ use tonic::{Code, Request, Response, Status};
 
 use super::auth;
 use crate::oauth::{OAuthServiceError, MAX_OAUTH_BUNDLE_BYTES};
+use crate::oauth_redirect::{RedirectMetadataProbe, RedirectMetadataSpec, RedirectOauthSpec};
 use crate::state::SharedState;
 
 pub struct AppOAuthCredentialService {
@@ -75,6 +76,33 @@ fn credential_to_proto(row: SealedOAuthCredential) -> app::OAuthCredentialMeta {
         created_at: row.created_at.to_rfc3339(),
         updated_at: row.updated_at.to_rfc3339(),
     }
+}
+
+fn redirect_spec_from_proto(
+    spec: Option<app::RedirectOauthSpec>,
+) -> Result<RedirectOauthSpec, &'static str> {
+    let spec = spec.ok_or("spec is required")?;
+    let metadata = spec.metadata.unwrap_or_default();
+    Ok(RedirectOauthSpec {
+        authorize_url: spec.authorize_url,
+        token_url: spec.token_url,
+        scopes: spec.scopes,
+        scope_delimiter: spec.scope_delimiter,
+        extra_authorize_params: spec.extra_authorize_params.into_iter().collect(),
+        client_id_ref: spec.client_id_ref,
+        client_secret_ref: spec.client_secret_ref,
+        pkce: spec.pkce,
+        metadata: RedirectMetadataSpec {
+            from_token_response: metadata.from_token_response.into_iter().collect(),
+            probe: metadata.probe.map(|probe| RedirectMetadataProbe {
+                method: probe.method,
+                host: probe.host,
+                path: probe.path,
+                body: probe.body,
+                map: probe.map.into_iter().collect(),
+            }),
+        },
+    })
 }
 
 fn oauth_status(error: OAuthServiceError) -> Status {
@@ -186,6 +214,57 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             .map_err(oauth_status)?;
         Ok(Response::new(app::CancelFlowResponse {
             flow: Some(flow_to_proto(flow)),
+        }))
+    }
+
+    async fn begin_redirect_flow(
+        &self,
+        req: Request<app::BeginRedirectFlowRequest>,
+    ) -> Result<Response<app::BeginRedirectFlowResponse>, Status> {
+        self.auth.check(&req)?;
+        let req = req.into_inner();
+        let spec = redirect_spec_from_proto(req.spec).map_err(Status::invalid_argument)?;
+        let begun = self
+            .state
+            .oauth
+            .begin_redirect(
+                key(req.subject, req.provider).map_err(Status::invalid_argument)?,
+                &spec,
+                &req.redirect_uri,
+            )
+            .await
+            .map_err(oauth_status)?;
+        Ok(Response::new(app::BeginRedirectFlowResponse {
+            flow: Some(flow_to_proto(begun.flow)),
+            authorize_url: begun.authorize_url,
+        }))
+    }
+
+    async fn complete_redirect_flow(
+        &self,
+        req: Request<app::CompleteRedirectFlowRequest>,
+    ) -> Result<Response<app::CompleteRedirectFlowResponse>, Status> {
+        self.auth.check(&req)?;
+        let req = req.into_inner();
+        let spec = redirect_spec_from_proto(req.spec).map_err(Status::invalid_argument)?;
+        let flow_id = req
+            .flow_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("malformed flow id"))?;
+        let row = self
+            .state
+            .oauth
+            .complete_redirect(
+                key(req.subject, req.provider).map_err(Status::invalid_argument)?,
+                flow_id,
+                &req.code,
+                &req.redirect_uri,
+                &spec,
+            )
+            .await
+            .map_err(oauth_status)?;
+        Ok(Response::new(app::CompleteRedirectFlowResponse {
+            credential: Some(credential_to_proto(row)),
         }))
     }
 
