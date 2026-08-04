@@ -699,22 +699,21 @@ describe("SessionListener", () => {
     expect(await base.tryAcquire("session-1", "owner-2", 30_000)).toBe(false);
   });
 
-  test("a session already in a terminal status finishes with the mapped outcome without reading the log", async () => {
+  test("a session already in a terminal status drains the log, then finishes with the mapped outcome", async () => {
     const rec = recordingConsumer();
     const base = await acquiredLease();
-    let reads = 0;
     const subject = await listener({
       leaseStore: base,
       fetchStatus: async () => "failed",
-      readPage: async () => {
-        reads++;
-        return page([], -1n);
-      },
+      // An undelivered suffix with NO terminal status_changed event (the
+      // reaped-dead shape) — it must reach the consumer before the terminal.
+      readPage: async (_sessionId, after) =>
+        after < 1n ? page([event(0n), event(1n)], 1n) : page([], after),
     }, [rec.consumer]);
 
     await subject.run();
 
-    expect(reads).toBe(0);
+    expect(rec.events.map((ev) => ev.idx)).toEqual([0n, 1n]);
     expect(rec.terminals).toEqual(["failed"]);
     expect(await base.listDesired()).toEqual([]);
   });
