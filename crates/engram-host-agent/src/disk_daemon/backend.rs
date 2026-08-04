@@ -171,9 +171,9 @@ pub struct DiskFlushOutcome {
 }
 
 /// ADR 0038 B3 handoff from `flush_local` to `flush_upload`.
-/// `new_chunks` is the exact disk state captured while `flush_local`
-/// holds the dirty-tier lock. Each claim records the generation for
-/// later release or hole punching. Empty `claims` means nothing was
+/// ADR 0110 addendum: carries the FROZEN overlay's chunk list (index +
+/// length), not bytes — `flush_upload` streams each chunk from the
+/// frozen file when it uploads it. Empty `chunks` means nothing was
 /// dirty.
 ///
 /// Issue #199: also carries the owned flush-pipeline guard acquired by
@@ -181,36 +181,20 @@ pub struct DiskFlushOutcome {
 /// handoff are ONE critical section — two flushes can no longer rebase
 /// out of order. The guard is `None` only for the empty/no-dirty
 /// shortcut (nothing to publish, so nothing to serialize). It releases
-/// when this struct is dropped (`flush_upload` consumes it by value;
-/// `requeue_pending` likewise; the migration export drops it on
-/// commit/abort).
+/// when this struct is dropped.
 pub struct PendingDiskFlush {
-    new_chunks: Vec<(usize, ChunkHash, Bytes)>,
-    claims: Vec<DirtyChunkClaim>,
+    /// Sorted `(chunk_idx, chunk_len)` of the frozen overlay.
+    chunks: Vec<(usize, u64)>,
     /// Held across the publish; see `ChunkedDiskBackend::flush_pipeline`.
     flush_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl PendingDiskFlush {
+    /// The frozen chunk list this flush will publish.
     #[cfg(target_os = "linux")]
-    pub(crate) fn chunks(&self) -> &[(usize, ChunkHash, Bytes)] {
-        &self.new_chunks
+    pub(crate) fn chunk_indices(&self) -> &[(usize, u64)] {
+        &self.chunks
     }
-
-    /// Return the bytes captured at the pause instant for eviction.
-    /// Consumed claims stay in the tier's claimed map until sandbox
-    /// destroy, so `unflushed_bytes()` keeps counting them. Reads
-    /// continue to use the file because `contains()` includes claims.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn into_chunks(self) -> Vec<(usize, ChunkHash, Bytes)> {
-        self.new_chunks
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct DirtyChunkClaim {
-    chunk_idx: usize,
-    generation: u64,
 }
 
 /// ADR 0045 C2 disk post-copy: the frozen source's sealed disk state
@@ -359,22 +343,36 @@ pub(crate) struct RecoveredExtents {
 
 /// File-backed guest divergence for one sandbox.
 ///
-/// One async mutex protects this whole struct. Reads, writes, claims,
-/// requeues, and hole punches use this lock. No caller can observe a
-/// chunk between tier states, and a writer always bumps the generation
-/// before it releases the lock.
+/// One async mutex protects this whole struct. Reads, writes,
+/// freezes, and frozen-file cleanup use this lock; no caller can
+/// observe a chunk between overlay states.
+///
+/// ADR 0110 addendum (frozen-overlay flush): TWO overlay files
+/// replace the one mutable dirty file + generation/claim machinery.
+/// Guest writes land in the ACTIVE overlay; `freeze()` renames it to
+/// the frozen path (immutable from that instant — no writer ever
+/// opens it again) and starts a fresh sparse active file. The flush
+/// uploads FROM the frozen file and unlinks it whole after
+/// verify-before-delete. Coherence against concurrent guest writes is
+/// by construction: they go to the new active file.
 struct DirtyFileTier {
-    file: File,
-    path: PathBuf,
-    /// Chunks that the next flush can claim.
-    dirty: HashSet<usize>,
-    /// Chunks owned by the active flush and their claim generations.
-    claimed: HashMap<usize, u64>,
-    /// The latest write generation for every chunk touched in this process.
-    generations: HashMap<usize, u64>,
+    active: OverlayFile,
+    /// The immutable pending-upload overlay. `Some` from `freeze()`
+    /// until the flush that published it unlinks it — or, after a
+    /// crash, from recovery until the first post-recovery flush
+    /// drains it.
+    frozen: Option<OverlayFile>,
     fsync_on_write: bool,
     /// Temporary constructor files are removed if attach fails.
     remove_on_drop: bool,
+}
+
+/// One sparse overlay file plus the chunk-presence set that says which
+/// chunks in it hold guest bytes.
+struct OverlayFile {
+    file: File,
+    path: PathBuf,
+    set: HashSet<usize>,
 }
 
 impl DirtyFileTier {
@@ -393,6 +391,10 @@ impl DirtyFileTier {
         match mode {
             DirtyFileOpenMode::Truncate => {
                 options.create(true).truncate(true);
+                // A fresh attach owns the whole namespace: a frozen
+                // file left by a PRIOR life at this path is not ours
+                // to upload (its session's lineage ended).
+                let _ = std::fs::remove_file(frozen_overlay_path(&path));
             }
             DirtyFileOpenMode::Recover => {}
         }
@@ -402,11 +404,12 @@ impl DirtyFileTier {
         file.set_len(total_bytes)
             .map_err(|source| dirty_file_error("set length", &path, source))?;
         let mut tier = Self {
-            file,
-            path,
-            dirty: HashSet::new(),
-            claimed: HashMap::new(),
-            generations: HashMap::new(),
+            active: OverlayFile {
+                file,
+                path,
+                set: HashSet::new(),
+            },
+            frozen: None,
             fsync_on_write: std::env::var("ENGRAM_DIRTY_FSYNC").as_deref() == Ok("1"),
             remove_on_drop: mode == DirtyFileOpenMode::Truncate,
         };
@@ -414,12 +417,9 @@ impl DirtyFileTier {
             // ADR 0110 rollout gate. The scan is the new recovery path, and
             // when it works it is silent — exactly like the old path it
             // replaces. Measure it here so "the roll was clean" can be told
-            // apart from "the feature never ran": the counter proves it
-            // ran, the bytes prove what it saved, the timer proves it did
-            // not stall the survivor's resume (this runs before RECONFIGURE
-            // releases guest I/O).
+            // apart from "the feature never ran".
             let started = crate::time_source::metrics_now();
-            let recovered = match tier.recover_extents(total_bytes, chunk_size) {
+            let recovered = match tier.recover_all(total_bytes, chunk_size) {
                 Ok(recovered) => recovered,
                 Err(error) => {
                     ::metrics::counter!(
@@ -437,121 +437,316 @@ impl DirtyFileTier {
             ::metrics::histogram!(crate::metrics::DIRTY_RECOVER_SECONDS)
                 .record(started.elapsed().as_secs_f64());
             tracing::info!(
-                path = %tier.path.display(),
+                path = %tier.active.path.display(),
                 chunks = recovered.chunks,
                 bytes = recovered.bytes,
-                "dirty-file recovery seeded the dirty set from allocated extents",
+                frozen_pending = tier.frozen.is_some(),
+                "dirty-file recovery seeded the overlay sets from allocated extents",
             );
         }
         Ok(tier)
     }
 
-    /// Rebuild the dirty set from the file's allocated extents.
-    ///
-    /// This scan needs a filesystem that reports exact extents, which
-    /// ext4 does. Production recovery runs only on Linux hosts. APFS
-    /// reports flushed zero-fill as data, so a scan there would mark
-    /// clean chunks dirty and serve zeros where base bytes belong.
-    fn recover_extents(
+    /// Recover the active overlay's extents, and adopt a frozen
+    /// overlay if the previous life left one (a flush that claimed but
+    /// never finished publishing — its chunks re-enter the pipeline on
+    /// the first post-recovery flush).
+    fn recover_all(
         &mut self,
         total_bytes: u64,
         chunk_size: u64,
     ) -> Result<RecoveredExtents, DiskBackendError> {
-        let fd = self.file.as_raw_fd();
-        let mut offset = 0u64;
-        let mut recovered_bytes = 0u64;
-        while offset < total_bytes {
-            // SAFETY: lseek reads extent metadata from a file descriptor
-            // that this tier owns. It does not access process memory.
-            let data = unsafe { libc::lseek(fd, offset as libc::off_t, libc::SEEK_DATA) };
-            if data < 0 {
-                let source = std::io::Error::last_os_error();
-                if source.raw_os_error() == Some(libc::ENXIO) {
-                    break;
-                }
-                return Err(dirty_file_error("scan data extent", &self.path, source));
+        let mut recovered = recover_overlay_extents(&mut self.active, total_bytes, chunk_size)?;
+        let frozen_path = frozen_overlay_path(&self.active.path);
+        if frozen_path.exists() {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&frozen_path)
+                .map_err(|source| dirty_file_error("open frozen", &frozen_path, source))?;
+            let mut frozen = OverlayFile {
+                file,
+                path: frozen_path,
+                set: HashSet::new(),
+            };
+            let frozen_recovered = recover_overlay_extents(&mut frozen, total_bytes, chunk_size)?;
+            recovered.chunks += frozen_recovered.chunks;
+            recovered.bytes += frozen_recovered.bytes;
+            if frozen.set.is_empty() {
+                // Nothing survived the scan (all-partial, or empty) —
+                // an empty frozen file is retired on the spot.
+                let _ = std::fs::remove_file(&frozen.path);
+            } else {
+                ::metrics::gauge!(FROZEN_PENDING_GAUGE).set(1.0);
+                self.frozen = Some(frozen);
             }
-            // SAFETY: this uses the same owned descriptor and only reads
-            // filesystem extent metadata.
-            let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
-            if hole < 0 {
-                return Err(dirty_file_error(
-                    "scan hole extent",
-                    &self.path,
-                    std::io::Error::last_os_error(),
-                ));
-            }
-            let data = data as u64;
-            let hole = (hole as u64).min(total_bytes);
-            if hole > data {
-                recovered_bytes += hole - data;
-                let first = (data / chunk_size) as usize;
-                let last = ((hole - 1) / chunk_size) as usize;
-                for chunk_idx in first..=last {
-                    self.dirty.insert(chunk_idx);
-                    self.generations.insert(chunk_idx, 1);
-                }
-            }
-            offset = hole;
         }
-        Ok(RecoveredExtents {
-            chunks: self.dirty.len(),
-            bytes: recovered_bytes,
-        })
+        Ok(recovered)
+    }
+
+    /// The freeze (ADR 0110 addendum): rename the active overlay to
+    /// the frozen path and start a fresh sparse active file. Two
+    /// metadata operations — no byte copies, no hashing. The renamed
+    /// file's descriptor stays valid, so frozen reads keep using it.
+    /// Caller guarantees `frozen.is_none()` (the flush pipeline guard
+    /// serializes freezes against drains).
+    fn freeze(&mut self, total_bytes: u64) -> Result<(), DiskBackendError> {
+        debug_assert!(
+            self.frozen.is_none(),
+            "freeze() with a frozen overlay pending"
+        );
+        let frozen_path = frozen_overlay_path(&self.active.path);
+        std::fs::rename(&self.active.path, &frozen_path)
+            .map_err(|source| dirty_file_error("freeze rename", &self.active.path, source))?;
+        let active_path = self.active.path.clone();
+        let fresh = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&active_path)
+            .map_err(|source| dirty_file_error("create fresh active", &active_path, source))?;
+        fresh
+            .set_len(total_bytes)
+            .map_err(|source| dirty_file_error("set fresh length", &active_path, source))?;
+        let old_active = std::mem::replace(
+            &mut self.active,
+            OverlayFile {
+                file: fresh,
+                path: active_path,
+                set: HashSet::new(),
+            },
+        );
+        let frozen_bytes: u64 = 0; // stamped by the caller (needs chunk lens)
+        let _ = frozen_bytes;
+        self.frozen = Some(OverlayFile {
+            file: old_active.file,
+            path: frozen_path,
+            set: old_active.set,
+        });
+        ::metrics::gauge!(FROZEN_PENDING_GAUGE).set(1.0);
+        Ok(())
+    }
+
+    /// Verify-before-delete's delete: the published frozen overlay is
+    /// unlinked whole. Replaces per-chunk hole punching.
+    fn unlink_frozen(&mut self) {
+        if let Some(frozen) = self.frozen.take() {
+            if let Err(error) = std::fs::remove_file(&frozen.path) {
+                // Not a durability problem (the chunks are published);
+                // the orphan is re-adopted by the next recovery or
+                // swept with the sandbox dir.
+                tracing::warn!(
+                    path = %frozen.path.display(),
+                    %error,
+                    "could not unlink the published frozen overlay",
+                );
+            }
+            ::metrics::gauge!(FROZEN_PENDING_GAUGE).set(0.0);
+        }
     }
 
     fn contains(&self, chunk_idx: usize) -> bool {
-        self.dirty.contains(&chunk_idx) || self.claimed.contains_key(&chunk_idx)
+        self.active.set.contains(&chunk_idx)
+            || self
+                .frozen
+                .as_ref()
+                .is_some_and(|f| f.set.contains(&chunk_idx))
     }
 
-    fn read_chunk(
+    /// Read one chunk, preferring the active overlay (newer bytes).
+    /// `None` if the chunk is in neither overlay.
+    fn read_overlay_chunk(
         &self,
         chunk_idx: usize,
         chunk_len: usize,
         chunk_size: u64,
-    ) -> std::io::Result<Bytes> {
-        let mut bytes = vec![0u8; chunk_len];
-        read_exact_at(&self.file, &mut bytes, chunk_idx as u64 * chunk_size)?;
-        Ok(Bytes::from(bytes))
+    ) -> Option<std::io::Result<Bytes>> {
+        let source = if self.active.set.contains(&chunk_idx) {
+            &self.active
+        } else {
+            self.frozen
+                .as_ref()
+                .filter(|f| f.set.contains(&chunk_idx))?
+        };
+        Some(read_chunk_from(
+            &source.file,
+            chunk_idx,
+            chunk_len,
+            chunk_size,
+        ))
+    }
+
+    /// Read one chunk from the FROZEN overlay (the flush-upload path).
+    fn read_frozen_chunk(
+        &self,
+        chunk_idx: usize,
+        chunk_len: usize,
+        chunk_size: u64,
+    ) -> Result<Bytes, DiskBackendError> {
+        let frozen = self.frozen.as_ref().ok_or_else(|| {
+            DiskBackendError::InvariantViolation(format!(
+                "flush read of chunk {chunk_idx} with no frozen overlay"
+            ))
+        })?;
+        if !frozen.set.contains(&chunk_idx) {
+            return Err(DiskBackendError::InvariantViolation(format!(
+                "flush read of chunk {chunk_idx} not present in the frozen overlay"
+            )));
+        }
+        read_chunk_from(&frozen.file, chunk_idx, chunk_len, chunk_size)
+            .map_err(|source| dirty_file_error("read frozen chunk", &frozen.path, source))
     }
 
     fn write_chunk(&self, chunk_idx: usize, bytes: &[u8], chunk_size: u64) -> std::io::Result<()> {
-        write_all_at(&self.file, bytes, chunk_idx as u64 * chunk_size)
-    }
-
-    fn bump_generation(&mut self, chunk_idx: usize) -> Result<u64, DiskBackendError> {
-        let generation = self.generations.entry(chunk_idx).or_default();
-        *generation = generation.checked_add(1).ok_or_else(|| {
-            DiskBackendError::InvariantViolation(format!(
-                "dirty generation overflow for chunk {chunk_idx}"
-            ))
-        })?;
-        Ok(*generation)
-    }
-
-    fn release_claims(&mut self, claims: &[DirtyChunkClaim]) {
-        for claim in claims {
-            if self.claimed.get(&claim.chunk_idx) == Some(&claim.generation) {
-                self.claimed.remove(&claim.chunk_idx);
-                self.dirty.insert(claim.chunk_idx);
-            }
-        }
+        write_all_at(&self.active.file, bytes, chunk_idx as u64 * chunk_size)
     }
 
     fn allocated_chunks(&self) -> HashSet<usize> {
-        self.dirty
-            .iter()
-            .copied()
-            .chain(self.claimed.keys().copied())
-            .collect()
+        let mut set = self.active.set.clone();
+        if let Some(frozen) = &self.frozen {
+            set.extend(frozen.set.iter().copied());
+        }
+        set
     }
 }
+
+/// Rebuild an overlay's chunk-presence set from its allocated extents,
+/// with the #996 completeness rule: **a partial extent is punched,
+/// never adopted**. A chunk whose allocated coverage is less than its
+/// full length was a torn first-touch materialize (base-copy + payload
+/// overlay is not SIGKILL-atomic); nothing in it was ever acked, so
+/// dropping it is honest — adopting it would serve hole-zeros where
+/// committed base bytes belong (the silent-corruption class ADR 0110
+/// exists to eliminate).
+///
+/// The scan needs a filesystem that reports exact extents, which ext4
+/// does. Production recovery runs only on Linux hosts. APFS reports
+/// flushed zero-fill as data, so a scan there would mark clean chunks
+/// dirty and serve zeros where base bytes belong.
+fn recover_overlay_extents(
+    overlay: &mut OverlayFile,
+    total_bytes: u64,
+    chunk_size: u64,
+) -> Result<RecoveredExtents, DiskBackendError> {
+    let fd = overlay.file.as_raw_fd();
+    let mut extents: Vec<(u64, u64)> = Vec::new();
+    let mut offset = 0u64;
+    while offset < total_bytes {
+        // SAFETY: lseek reads extent metadata from a file descriptor
+        // that this overlay owns. It does not access process memory.
+        let data = unsafe { libc::lseek(fd, offset as libc::off_t, libc::SEEK_DATA) };
+        if data < 0 {
+            let source = std::io::Error::last_os_error();
+            if source.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            return Err(dirty_file_error("scan data extent", &overlay.path, source));
+        }
+        // SAFETY: this uses the same owned descriptor and only reads
+        // filesystem extent metadata.
+        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(dirty_file_error(
+                "scan hole extent",
+                &overlay.path,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let data = data as u64;
+        let hole = (hole as u64).min(total_bytes);
+        if hole > data {
+            extents.push((data, hole));
+        }
+        offset = hole;
+    }
+    // Per-chunk coverage: adopt only fully-allocated chunks.
+    let mut recovered_bytes = 0u64;
+    let mut candidate_chunks: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for &(start, end) in &extents {
+        let first = (start / chunk_size) as usize;
+        let last = ((end - 1) / chunk_size) as usize;
+        candidate_chunks.extend(first..=last);
+    }
+    for chunk_idx in candidate_chunks {
+        let chunk_start = chunk_idx as u64 * chunk_size;
+        let chunk_end = std::cmp::min(chunk_start + chunk_size, total_bytes);
+        let chunk_len = chunk_end - chunk_start;
+        let covered: u64 = extents
+            .iter()
+            .map(|&(s, e)| {
+                let s = s.max(chunk_start);
+                let e = e.min(chunk_end);
+                e.saturating_sub(s)
+            })
+            .sum();
+        if covered == chunk_len {
+            overlay.set.insert(chunk_idx);
+            recovered_bytes += chunk_len;
+        } else {
+            // #996: torn materialize — drop, never adopt.
+            ::metrics::counter!(
+                crate::metrics::DIRTY_RECOVER_TOTAL,
+                "outcome" => "torn_chunk_dropped",
+            )
+            .increment(1);
+            tracing::warn!(
+                path = %overlay.path.display(),
+                chunk = chunk_idx,
+                covered,
+                chunk_len,
+                "recovery dropped a partially-allocated chunk (torn materialize, #996); \
+                 the base path serves its committed bytes",
+            );
+            if let Err(error) = punch_hole(&overlay.file, chunk_start, chunk_len) {
+                // The partial extent stays allocated but is NOT
+                // adopted into the set, so it is never read or
+                // flushed — punching is disk hygiene, not correctness.
+                tracing::warn!(
+                    path = %overlay.path.display(),
+                    chunk = chunk_idx,
+                    %error,
+                    "could not punch a torn chunk's partial extent",
+                );
+            }
+        }
+    }
+    Ok(RecoveredExtents {
+        chunks: overlay.set.len(),
+        bytes: recovered_bytes,
+    })
+}
+
+fn read_chunk_from(
+    file: &File,
+    chunk_idx: usize,
+    chunk_len: usize,
+    chunk_size: u64,
+) -> std::io::Result<Bytes> {
+    let mut bytes = vec![0u8; chunk_len];
+    read_exact_at(file, &mut bytes, chunk_idx as u64 * chunk_size)?;
+    Ok(Bytes::from(bytes))
+}
+
+/// `<dirty>.frozen` — the immutable pending-upload overlay's path.
+pub(crate) fn frozen_overlay_path(dirty_path: &Path) -> PathBuf {
+    let mut p = dirty_path.as_os_str().to_os_string();
+    p.push(".frozen");
+    PathBuf::from(p)
+}
+
+/// Gauge: 1 while a frozen overlay awaits upload. Nonzero across
+/// scrapes means uploads are failing and retrying.
+const FROZEN_PENDING_GAUGE: &str = "engram_disk_flush_frozen_pending";
 
 impl Drop for DirtyFileTier {
     fn drop(&mut self) {
         if self.remove_on_drop {
-            let _ = std::fs::remove_file(&self.path);
-            let _ = std::fs::remove_file(ref_sidecar_path(&self.path));
+            let _ = std::fs::remove_file(&self.active.path);
+            let _ = std::fs::remove_file(ref_sidecar_path(&self.active.path));
+            if let Some(frozen) = &self.frozen {
+                let _ = std::fs::remove_file(&frozen.path);
+            }
         }
     }
 }
@@ -1269,18 +1464,18 @@ impl ChunkedDiskBackend {
         self.state.lock().await.manifest_ref
     }
 
-    /// Number of chunks waiting for the next flush claim.
+    /// Number of chunks waiting for the next freeze.
     pub async fn dirty_chunks_count(&self) -> usize {
-        self.dirty_tier.lock().await.dirty.len()
+        self.dirty_tier.lock().await.active.set.len()
     }
 
-    /// Whole-chunk bytes waiting for the next flush claim.
+    /// Whole-chunk bytes waiting for the next freeze.
     pub async fn dirty_bytes(&self) -> u64 {
         let tier = self.dirty_tier.lock().await;
-        tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum()
+        tier.active.set.iter().map(|idx| self.chunk_len(*idx)).sum()
     }
 
-    /// Whole-chunk bytes that are dirty or owned by an active claim.
+    /// Whole-chunk bytes in either overlay (active + frozen).
     pub async fn unflushed_bytes(&self) -> u64 {
         let tier = self.dirty_tier.lock().await;
         tier.allocated_chunks()
@@ -1398,9 +1593,10 @@ impl ChunkedDiskBackend {
         }
         let tier = self.dirty_tier.lock().await;
         if tier.fsync_on_write {
-            tier.file
+            tier.active
+                .file
                 .sync_data()
-                .map_err(|source| dirty_file_error("sync write", &tier.path, source))?;
+                .map_err(|source| dirty_file_error("sync write", &tier.active.path, source))?;
         }
         Ok(())
     }
@@ -1417,77 +1613,90 @@ impl ChunkedDiskBackend {
         // ADR 0045 C2 disk post-copy: a partial write to a SEALED
         // chunk must RMW against the peer's content (the source's
         // dirty bytes), never against `base`'s pre-divergence hash.
-        // Materialize first — the bytes land in `dirty`, so the
-        // normal flow below finds them via the pre-check.
+        // Materialize first — the bytes land in the active overlay, so
+        // the normal flow below finds them via the pre-check.
         if let Some(ov) = self.postcopy_overlay() {
             self.postcopy_materialize(&ov, chunk_idx).await?;
         }
+        // ADR 0110 addendum: three cases, each resolved under one tier
+        // lock hold —
+        //  1. chunk in the ACTIVE overlay: overlay the payload in place.
+        //  2. chunk only in the FROZEN overlay: seed the active copy
+        //     FROM the frozen bytes (not base — frozen is newer), then
+        //     overlay. The frozen file is immutable, so the seed read
+        //     needs no coherence dance.
+        //  3. chunk in neither: fetch the base chunk without the lock,
+        //     re-check on re-lock (a racer may have materialized
+        //     meanwhile), materialize + overlay.
+        // The generation counters the old design carried are gone: they
+        // kept the pause-time HEAP copies coherent against these
+        // writes, and the frozen file makes that true by construction.
         loop {
-            let observed_generation = {
+            {
                 let mut tier = self.dirty_tier.lock().await;
-                if tier.contains(chunk_idx) {
-                    let before: u64 = tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum();
+                if tier.active.set.contains(&chunk_idx) {
                     write_all_at(
-                        &tier.file,
+                        &tier.active.file,
                         payload,
                         chunk_idx as u64 * self.chunk_size + intra as u64,
                     )
-                    .map_err(|source| dirty_file_error("write guest bytes", &tier.path, source))?;
-                    tier.bump_generation(chunk_idx)?;
-                    tier.dirty.insert(chunk_idx);
-                    let after: u64 = tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum();
-                    drop(tier);
-                    if before < self.threshold_bytes && after >= self.threshold_bytes {
-                        self.threshold_notify.notify_one();
-                    }
+                    .map_err(|source| {
+                        dirty_file_error("write guest bytes", &tier.active.path, source)
+                    })?;
                     return Ok(());
                 }
-                tier.generations.get(&chunk_idx).copied().unwrap_or(0)
-            };
+                let frozen_seed = tier
+                    .frozen
+                    .as_ref()
+                    .filter(|f| f.set.contains(&chunk_idx))
+                    .map(|f| read_chunk_from(&f.file, chunk_idx, chunk_len, self.chunk_size));
+                if let Some(read) = frozen_seed {
+                    let seed = read.map_err(|source| {
+                        dirty_file_error("seed active from frozen", &tier.active.path, source)
+                    })?;
+                    self.materialize_and_overlay(&mut tier, chunk_idx, &seed, intra, payload)?;
+                    return Ok(());
+                }
+            }
 
-            // Fetch without the tier lock. The persistent generation lets
-            // us detect a write and flush that completed during this fetch.
+            // Case 3: fetch base without the tier lock; re-check after.
             let base = self.read_chunk(chunk_idx, chunk_len as u64).await?;
             let mut tier = self.dirty_tier.lock().await;
             if tier.contains(chunk_idx) {
-                let before: u64 = tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum();
-                write_all_at(
-                    &tier.file,
-                    payload,
-                    chunk_idx as u64 * self.chunk_size + intra as u64,
-                )
-                .map_err(|source| dirty_file_error("write guest bytes", &tier.path, source))?;
-                tier.bump_generation(chunk_idx)?;
-                tier.dirty.insert(chunk_idx);
-                let after: u64 = tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum();
-                drop(tier);
-                if before < self.threshold_bytes && after >= self.threshold_bytes {
-                    self.threshold_notify.notify_one();
-                }
-                return Ok(());
-            }
-            if tier.generations.get(&chunk_idx).copied().unwrap_or(0) != observed_generation {
                 drop(tier);
                 continue;
             }
-            let before: u64 = tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum();
-            tier.write_chunk(chunk_idx, &base, self.chunk_size)
-                .map_err(|source| dirty_file_error("materialize chunk", &tier.path, source))?;
-            write_all_at(
-                &tier.file,
-                payload,
-                chunk_idx as u64 * self.chunk_size + intra as u64,
-            )
-            .map_err(|source| dirty_file_error("write guest bytes", &tier.path, source))?;
-            tier.bump_generation(chunk_idx)?;
-            tier.dirty.insert(chunk_idx);
-            let after: u64 = tier.dirty.iter().map(|idx| self.chunk_len(*idx)).sum();
-            drop(tier);
-            if before < self.threshold_bytes && after >= self.threshold_bytes {
-                self.threshold_notify.notify_one();
-            }
+            self.materialize_and_overlay(&mut tier, chunk_idx, &base, intra, payload)?;
             return Ok(());
         }
+    }
+
+    /// Write a full seed chunk into the active overlay, apply the guest
+    /// payload on top, and mark the chunk present — one tier critical
+    /// section. Fires the flush-threshold notify on crossing.
+    fn materialize_and_overlay(
+        &self,
+        tier: &mut DirtyFileTier,
+        chunk_idx: usize,
+        seed: &[u8],
+        intra: usize,
+        payload: &[u8],
+    ) -> Result<(), DiskBackendError> {
+        let before: u64 = tier.active.set.iter().map(|idx| self.chunk_len(*idx)).sum();
+        tier.write_chunk(chunk_idx, seed, self.chunk_size)
+            .map_err(|source| dirty_file_error("materialize chunk", &tier.active.path, source))?;
+        write_all_at(
+            &tier.active.file,
+            payload,
+            chunk_idx as u64 * self.chunk_size + intra as u64,
+        )
+        .map_err(|source| dirty_file_error("write guest bytes", &tier.active.path, source))?;
+        tier.active.set.insert(chunk_idx);
+        let after: u64 = tier.active.set.iter().map(|idx| self.chunk_len(*idx)).sum();
+        if before < self.threshold_bytes && after >= self.threshold_bytes {
+            self.threshold_notify.notify_one();
+        }
+        Ok(())
     }
 
     /// Shutdown-spool export (2026-07-16 session-85e0298a RCA): a
@@ -1516,20 +1725,21 @@ impl ChunkedDiskBackend {
             let mut indices: Vec<usize> = tier.allocated_chunks().into_iter().collect();
             indices.sort_unstable();
             for chunk_idx in indices {
-                match tier.read_chunk(
+                match tier.read_overlay_chunk(
                     chunk_idx,
                     self.chunk_len(chunk_idx) as usize,
                     self.chunk_size,
                 ) {
-                    Ok(bytes) => out.push((chunk_idx, bytes.to_vec())),
-                    Err(error) => {
+                    Some(Ok(bytes)) => out.push((chunk_idx, bytes.to_vec())),
+                    Some(Err(error)) => {
                         tracing::error!(
-                            path = %tier.path.display(),
+                            path = %tier.active.path.display(),
                             chunk = chunk_idx,
                             %error,
-                            "shutdown export could not read a dirty-file chunk; the file stays in place for successor recovery",
+                            "shutdown export could not read an overlay chunk; the files stay in place for successor recovery",
                         );
                     }
+                    None => {}
                 }
             }
         }
@@ -1570,11 +1780,10 @@ impl ChunkedDiskBackend {
             for (idx, data) in &chunks {
                 adopted += data.len() as u64;
                 tier.write_chunk(*idx, data, self.chunk_size)
-                    .map_err(|source| dirty_file_error("adopt chunk", &tier.path, source))?;
+                    .map_err(|source| dirty_file_error("adopt chunk", &tier.active.path, source))?;
             }
             for (idx, _) in chunks {
-                tier.bump_generation(idx)?;
-                tier.dirty.insert(idx);
+                tier.active.set.insert(idx);
             }
         }
         if adopted > 0 {
@@ -1587,9 +1796,9 @@ impl ChunkedDiskBackend {
     /// version. The new `ManifestRef` is the durability gate the
     /// snapshot path attaches to `SnapshotRecord.disk_manifest`.
     ///
-    /// After flush, unchanged claims are punched from the file and reads
-    /// regions go through the new manifest entries via the chunk
-    /// cache like any other base chunk. The post-flush state is
+    /// After flush, the published frozen overlay is unlinked whole and
+    /// reads of its chunks go through the new manifest entries via the
+    /// chunk cache like any other base chunk. The post-flush state is
     /// indistinguishable from "fresh session against the new
     /// manifest version."
     /// Full synchronous flush = `flush_local` + `flush_upload` back to
@@ -1653,60 +1862,43 @@ impl ChunkedDiskBackend {
     pub async fn flush_local(&self) -> Result<PendingDiskFlush, DiskBackendError> {
         // Issue #199: take the flush-pipeline guard before the dirty-tier
         // lock and hand it off inside the returned `PendingDiskFlush`, so the
-        // drain and the `flush_upload` that publishes its chunks are one
-        // serialized critical section. Without this, a slow upload from
-        // an EARLIER drain could publish/rebase after a LATER drain
-        // already did, overwriting the newer chunk with the older hash.
+        // freeze and the `flush_upload` that publishes its chunks are one
+        // serialized critical section.
         let flush_guard = self.flush_pipeline.clone().lock_owned().await;
         let mut tier = self.dirty_tier.lock().await;
-        if tier.dirty.is_empty() {
-            // Nothing to publish ⟹ nothing to serialize; release the
-            // pipeline guard immediately (don't carry it through an
-            // empty no-op flush_upload, which would needlessly block a
-            // concurrent flush).
-            drop(tier);
-            drop(flush_guard);
-            return Ok(PendingDiskFlush {
-                new_chunks: Vec::new(),
-                claims: Vec::new(),
-                flush_guard: None,
-            });
+        // A frozen overlay already pending (a prior upload failed or a
+        // crash left one recovered): drain IT this cycle. The active
+        // overlay keeps accumulating and freezes on a later flush —
+        // publishing older data first keeps the manifest chain ordered.
+        if tier.frozen.is_none() {
+            if tier.active.set.is_empty() {
+                drop(tier);
+                drop(flush_guard);
+                return Ok(PendingDiskFlush {
+                    chunks: Vec::new(),
+                    flush_guard: None,
+                });
+            }
+            // The freeze (ADR 0110 addendum): rename + fresh sparse
+            // active. O(1) under the FC pause — no byte copies, no
+            // hashing (both moved to the post-resume upload stream).
+            tier.freeze(self.total_bytes)?;
         }
-        let mut indices: Vec<usize> = tier.dirty.iter().copied().collect();
-        indices.sort_unstable();
-        let mut claims = Vec::with_capacity(indices.len());
-        let mut new_chunks = Vec::with_capacity(indices.len());
-        for &chunk_idx in &indices {
-            let generation = tier.generations.get(&chunk_idx).copied().ok_or_else(|| {
-                DiskBackendError::InvariantViolation(format!(
-                    "dirty chunk {chunk_idx} has no generation"
-                ))
-            })?;
-            let bytes = tier
-                .read_chunk(
-                    chunk_idx,
-                    self.chunk_len(chunk_idx) as usize,
-                    self.chunk_size,
-                )
-                .map_err(|source| dirty_file_error("read dirty chunk", &tier.path, source))?;
-            let hash = ChunkHash::of(&bytes);
-            new_chunks.push((chunk_idx, hash, bytes));
-            claims.push(DirtyChunkClaim {
-                chunk_idx,
-                generation,
-            });
-        }
-        for claim in &claims {
-            tier.dirty.remove(&claim.chunk_idx);
-            tier.claimed.insert(claim.chunk_idx, claim.generation);
-        }
-        // The seam fires while the tier lock still protects the claim.
+        let frozen = tier.frozen.as_ref().expect("frozen present after freeze");
+        let mut chunks: Vec<(usize, u64)> = frozen
+            .set
+            .iter()
+            .map(|&idx| (idx, self.chunk_len(idx)))
+            .collect();
+        chunks.sort_unstable_by_key(|(idx, _)| *idx);
+        ::metrics::histogram!("engram_disk_flush_frozen_bytes")
+            .record(chunks.iter().map(|(_, len)| *len as f64).sum::<f64>());
+        // The seam fires while the tier lock still protects the freeze.
         self.fire_flush_seam(FlushSeamPoint::DirtyPendingHandoff)
             .await;
         drop(tier);
         Ok(PendingDiskFlush {
-            new_chunks,
-            claims,
+            chunks,
             flush_guard: Some(flush_guard),
         })
     }
@@ -1767,14 +1959,21 @@ impl ChunkedDiskBackend {
         pending: &PendingDiskFlush,
     ) -> Result<(Manifest, Vec<ChunkHash>), DiskBackendError> {
         let chunk_size = self.chunk_size;
-        let mut new_hashes = Vec::with_capacity(pending.new_chunks.len());
-        for (_idx, hash, bytes) in &pending.new_chunks {
+        let mut new_hashes = Vec::with_capacity(pending.chunks.len());
+        let mut hashed: Vec<(usize, ChunkHash)> = Vec::with_capacity(pending.chunks.len());
+        for &(chunk_idx, chunk_len) in &pending.chunks {
+            let bytes = {
+                let tier = self.dirty_tier.lock().await;
+                tier.read_frozen_chunk(chunk_idx, chunk_len as usize, chunk_size)?
+            };
+            let hash = ChunkHash::of(&bytes);
             // No per-write sweep — batch-closing sweep below.
             self.cache
-                .put_no_evict(*hash, bytes)
+                .put_no_evict(hash, &bytes)
                 .await
                 .map_err(DiskBackendError::Chunk)?;
-            new_hashes.push(*hash);
+            new_hashes.push(hash);
+            hashed.push((chunk_idx, hash));
         }
         self.cache.sweep().await.map_err(DiskBackendError::Chunk)?;
         let state = self.state.lock().await;
@@ -1790,7 +1989,7 @@ impl ChunkedDiskBackend {
                 })
             })
             .collect();
-        for (idx, hash, _bytes) in &pending.new_chunks {
+        for (idx, hash) in &hashed {
             let offset = (*idx as u64) * chunk_size;
             if let Some(existing) = chunks.iter_mut().find(|c| c.offset == offset) {
                 existing.hash = *hash;
@@ -1817,13 +2016,11 @@ impl ChunkedDiskBackend {
         ))
     }
 
-    /// ADR 0045 C1 abort path: release the claimed chunks to the dirty
-    /// set so the resumed guest's next flush
-    /// retries them (a newer guest write wins — same rule as the
-    /// upload-failure re-queue). Idempotent.
+    /// ADR 0045 C1 abort path. ADR 0110 addendum: nothing to release —
+    /// the frozen overlay is still on disk and the next flush re-drains
+    /// it. Consuming the pending drops the pipeline guard. Idempotent.
     pub async fn requeue_pending(&self, pending: PendingDiskFlush) {
-        let mut tier = self.dirty_tier.lock().await;
-        tier.release_claims(&pending.claims);
+        drop(pending);
     }
 
     /// ADR 0045 C2 disk post-copy — the SOURCE seal (runs under the
@@ -1844,29 +2041,36 @@ impl ChunkedDiskBackend {
     pub async fn seal_for_postcopy(&self) -> (PostCopyDiskSeal, Manifest, ManifestRef) {
         let mut chunks = HashMap::new();
         {
-            let mut tier = self.dirty_tier.lock().await;
+            let tier = self.dirty_tier.lock().await;
             let mut indices: Vec<usize> = tier.allocated_chunks().into_iter().collect();
             indices.sort_unstable();
             for chunk_idx in indices {
-                match tier.read_chunk(
+                match tier.read_overlay_chunk(
                     chunk_idx,
                     self.chunk_len(chunk_idx) as usize,
                     self.chunk_size,
                 ) {
-                    Ok(bytes) => {
+                    Some(Ok(bytes)) => {
                         chunks.insert(chunk_idx, bytes);
                     }
-                    Err(error) => {
+                    Some(Err(error)) => {
                         tracing::error!(
-                            path = %tier.path.display(),
+                            path = %tier.active.path.display(),
                             chunk = chunk_idx,
                             %error,
-                            "post-copy seal could not read a dirty-file chunk",
+                            "post-copy seal could not read an overlay chunk",
                         );
                     }
+                    None => {}
                 }
             }
-            tier.dirty.clear();
+            // ADR 0110 addendum: nothing to clear. The old design
+            // cleared `dirty` because the seal's HEAP copies became
+            // the owner of those bytes; here the overlay files keep
+            // owning them. The migration fence blocks flushes while
+            // the seal is out, commit destroys the VM, and abort finds
+            // every byte exactly where it was — the abort requeue is a
+            // defensive re-adopt, normally a no-op.
         }
         let state = self.state.lock().await;
         let chunk_size = self.chunk_size;
@@ -1908,18 +2112,14 @@ impl ChunkedDiskBackend {
             }
             if let Err(error) = tier.write_chunk(*idx, bytes, self.chunk_size) {
                 tracing::error!(
-                    path = %tier.path.display(),
+                    path = %tier.active.path.display(),
                     chunk = *idx,
                     %error,
-                    "post-copy abort could not restore a dirty-file chunk",
+                    "post-copy abort could not restore an overlay chunk",
                 );
                 continue;
             }
-            if let Err(error) = tier.bump_generation(*idx) {
-                tracing::error!(chunk = *idx, %error, "post-copy abort generation failed");
-                continue;
-            }
-            tier.dirty.insert(*idx);
+            tier.active.set.insert(*idx);
         }
     }
 
@@ -2007,21 +2207,22 @@ impl ChunkedDiskBackend {
         };
         let installed = {
             let mut tier = self.dirty_tier.lock().await;
-            if tier.contains(chunk_idx) {
-                tier.read_chunk(
-                    chunk_idx,
-                    self.chunk_len(chunk_idx) as usize,
-                    self.chunk_size,
-                )
-                .map_err(|source| dirty_file_error("read post-copy chunk", &tier.path, source))?
-            } else {
-                tier.write_chunk(chunk_idx, &bytes, self.chunk_size)
-                    .map_err(|source| {
-                        dirty_file_error("write post-copy chunk", &tier.path, source)
-                    })?;
-                tier.bump_generation(chunk_idx)?;
-                tier.dirty.insert(chunk_idx);
-                bytes
+            match tier.read_overlay_chunk(
+                chunk_idx,
+                self.chunk_len(chunk_idx) as usize,
+                self.chunk_size,
+            ) {
+                Some(read) => read.map_err(|source| {
+                    dirty_file_error("read post-copy chunk", &tier.active.path, source)
+                })?,
+                None => {
+                    tier.write_chunk(chunk_idx, &bytes, self.chunk_size)
+                        .map_err(|source| {
+                            dirty_file_error("write post-copy chunk", &tier.active.path, source)
+                        })?;
+                    tier.active.set.insert(chunk_idx);
+                    bytes
+                }
             }
         };
         // Unseal AFTER the install: once unsealed, readers resolve via
@@ -2098,9 +2299,8 @@ impl ChunkedDiskBackend {
         // below, which also drop it). This is what makes the
         // drain→upload→publish→rebase one atomic critical section.
         let _flush_guard = pending.flush_guard;
-        let claims = pending.claims;
-        let new_chunks = pending.new_chunks;
-        if claims.is_empty() {
+        let frozen_chunks = pending.chunks;
+        if frozen_chunks.is_empty() {
             // Incident 2026-07-10 follow-up: an ARMED fork (ADR 0077 —
             // fresh restore off a SHARED base manifest) must still
             // materialize on an empty flush. The eviction capture records
@@ -2158,9 +2358,9 @@ impl ChunkedDiskBackend {
             drop(state);
             if let Some(forked_ref) = published_fork_ref {
                 let tier = self.dirty_tier.lock().await;
-                if let Err(error) = write_ref_sidecar(&tier.path, forked_ref) {
+                if let Err(error) = write_ref_sidecar(&tier.active.path, forked_ref) {
                     tracing::warn!(
-                        path = %ref_sidecar_path(&tier.path).display(),
+                        path = %ref_sidecar_path(&tier.active.path).display(),
                         %error,
                         "could not record the empty-flush fork ref",
                     );
@@ -2169,33 +2369,41 @@ impl ChunkedDiskBackend {
             self.stamp_flush_completion();
             return Ok(out);
         }
-        // Upload the pause-time file snapshot outside the frozen-guest path.
-        // ADR 0039 item #19: the per-chunk put dominates the flush
-        // (~16 ms each), so awaiting one at a time made a large dirty
-        // set (~1,936 chunks → ~32 s) the slow phase of an eviction.
-        // Puts are content-addressed/idempotent and keyed by chunk_idx,
-        // so they're order-independent — fan them out with bounded
-        // `buffer_unordered`.
+        // Upload FROM the frozen overlay, outside the paused-guest path.
+        // ADR 0110 addendum: each task reads its chunk from the frozen
+        // file, hashes it, and puts it — peak heap is bounded by the
+        // upload concurrency (not the dirty-set size, the #1003 burst
+        // shape this design retires). The frozen file is immutable, so
+        // the read needs no coherence machinery; the tier lock is held
+        // only for the duration of one 16 MiB pread.
         //
-        // Each task uploads the file bytes captured above. The manifest
-        // uses hashes from that same snapshot.
+        // ADR 0039 item #19: puts are content-addressed/idempotent and
+        // order-independent — fan out with bounded `buffer_unordered`.
         //
         // ATOMICITY (durability invariant): `try_collect` aborts on the
-        // first put error and the manifest rebuild runs only after every
+        // first error and the manifest rebuild runs only after every
         // put succeeds — a published manifest never references a
-        // not-yet-durable chunk. On failure we release the claims so the next checkpoint
-        // retries; nothing is lost and the previous snapshot stands. A
-        // failed flush is a no-op, never a half-written snapshot.
-        {
+        // not-yet-durable chunk. On failure the frozen overlay simply
+        // STAYS; the next flush re-drains it. A failed flush is a
+        // no-op, never a half-written snapshot.
+        let new_chunks: Vec<(usize, ChunkHash, u64)> = {
             use futures::stream::{self, StreamExt, TryStreamExt};
             let op = self.operation_scope.current();
             let cache = &self.cache;
-            let upload = stream::iter(new_chunks.iter().cloned())
-                .map(|(chunk_idx, hash, bytes)| {
+            let upload = stream::iter(frozen_chunks.iter().copied())
+                .map(|(chunk_idx, chunk_len)| {
                     let store = &self.store;
                     let op = op.clone();
                     async move {
-                        let size = bytes.len() as u64;
+                        let bytes = {
+                            let tier = self.dirty_tier.lock().await;
+                            tier.read_frozen_chunk(
+                                chunk_idx,
+                                chunk_len as usize,
+                                self.chunk_size,
+                            )?
+                        };
+                        let hash = ChunkHash::of(&bytes);
                         // ADR 0019: span each dirty-chunk upload under an
                         // active operation so this (now post-resume)
                         // flush still shows in the op's trace.
@@ -2210,7 +2418,7 @@ impl ChunkedDiskBackend {
                                         "chunk.flush",
                                         op = op.kind,
                                         chunk = chunk_idx,
-                                        bytes = size,
+                                        bytes = chunk_len,
                                     )
                                 });
                                 tracing::Instrument::instrument(put, span).await?;
@@ -2221,18 +2429,9 @@ impl ChunkedDiskBackend {
                         }
                         // ADR 0039 (sticky-everywhere): write-through to
                         // the local cache so the flushing host keeps its
-                        // OWN just-uploaded chunks. Rides the backend's
-                        // explicit cache handle: the store's internal
-                        // write-through (ADR 0078 move 5) only fires when
-                        // the store was built with a cache wired — prod
-                        // wiring, but not a structural guarantee (cache
-                        // and store travel separately into this backend).
-                        // Prod double-writes 16 MiB per chunk as a result;
-                        // collapsing to one cache identity is substrated
-                        // (ADR 0076) territory, not this PR's. Best-effort:
-                        // the chunk is durable in GCS, so a cache-write
-                        // failure is a missed optimization, never
-                        // incorrect (reads fall back).
+                        // OWN just-uploaded chunks. Best-effort: the chunk
+                        // is durable in GCS, so a cache-write failure is a
+                        // missed optimization, never incorrect.
                         if let Err(e) = cache.put(hash, &bytes).await {
                             tracing::warn!(
                                 chunk = chunk_idx,
@@ -2241,23 +2440,24 @@ impl ChunkedDiskBackend {
                                 "flush write-through to local cache failed (chunk durable in GCS; reads fall back)",
                             );
                         }
-                        Ok::<_, DiskBackendError>(())
+                        Ok::<_, DiskBackendError>((chunk_idx, hash, chunk_len))
                     }
                 })
                 .buffer_unordered(DISK_FLUSH_UPLOAD_CONCURRENCY)
-                .try_collect::<()>()
+                .try_collect::<Vec<_>>()
                 .await;
-            if let Err(e) = upload {
-                let mut tier = self.dirty_tier.lock().await;
-                tier.release_claims(&claims);
-                tracing::warn!(
-                    chunks = new_chunks.len(),
-                    error = %e,
-                    "nbd disk flush_upload failed; manifest NOT advanced, dirty re-queued (no partial snapshot)",
-                );
-                return Err(e);
+            match upload {
+                Ok(chunks) => chunks,
+                Err(e) => {
+                    tracing::warn!(
+                        chunks = frozen_chunks.len(),
+                        error = %e,
+                        "nbd disk flush_upload failed; manifest NOT advanced, frozen overlay retained for retry (no partial snapshot)",
+                    );
+                    return Err(e);
+                }
             }
-        }
+        };
 
         // Issue #199 seam point: every put is durable; the fence re-check
         // and the publish are still ahead — a fence raised while parked
@@ -2289,13 +2489,10 @@ impl ChunkedDiskBackend {
         {
             let manifest_ref = state.manifest_ref;
             drop(state);
-            let mut tier = self.dirty_tier.lock().await;
-            tier.release_claims(&claims);
-            drop(tier);
             tracing::warn!(
                 chunks = new_chunks.len(),
                 "nbd disk flush_upload aborted: migration fence raised mid-upload; \
-                 manifest NOT advanced, dirty re-queued (issue #199)",
+                 manifest NOT advanced, frozen overlay retained (issue #199)",
             );
             return Ok(DiskFlushOutcome {
                 manifest_ref,
@@ -2316,7 +2513,7 @@ impl ChunkedDiskBackend {
             })
             .collect();
         let mut bytes_uploaded = 0u64;
-        for (idx, hash, bytes) in &new_chunks {
+        for (idx, hash, len) in &new_chunks {
             // Replace the existing entry if one was there; insert
             // otherwise. Linear scan because the chunks list is
             // small (<< 1024 entries for typical disks).
@@ -2329,7 +2526,7 @@ impl ChunkedDiskBackend {
                     hash: *hash,
                 });
             }
-            bytes_uploaded += bytes.len() as u64;
+            bytes_uploaded += len;
         }
         chunks.sort_by_key(|c| c.offset);
         let new_manifest = Manifest {
@@ -2405,8 +2602,6 @@ impl ChunkedDiskBackend {
                             manifest_id,
                         };
                         drop(state);
-                        let mut tier = self.dirty_tier.lock().await;
-                        tier.release_claims(&claims);
                         return Err(error.into());
                     }
                     let next = ManifestRef {
@@ -2426,8 +2621,6 @@ impl ChunkedDiskBackend {
                 }
                 Err(error) => {
                     drop(state);
-                    let mut tier = self.dirty_tier.lock().await;
-                    tier.release_claims(&claims);
                     return Err(error.into());
                 }
             }
@@ -2446,8 +2639,6 @@ impl ChunkedDiskBackend {
             Ok(manifest) => manifest,
             Err(error) => {
                 drop(state);
-                let mut tier = self.dirty_tier.lock().await;
-                tier.release_claims(&claims);
                 return Err(error.into());
             }
         };
@@ -2460,8 +2651,6 @@ impl ChunkedDiskBackend {
         });
         if !verified {
             drop(state);
-            let mut tier = self.dirty_tier.lock().await;
-            tier.release_claims(&claims);
             return Err(DiskBackendError::InvariantViolation(format!(
                 "published manifest {new_ref} did not contain every uploaded dirty chunk"
             )));
@@ -2482,41 +2671,30 @@ impl ChunkedDiskBackend {
 
         {
             let mut tier = self.dirty_tier.lock().await;
-            // Recovery uses this ref. A punch without this record is unsafe.
-            let punch_safe = match write_ref_sidecar(&tier.path, new_ref) {
-                Ok(()) => true,
+            // Recovery uses this ref: the successor chains from it. A
+            // frozen-file delete without this record would strand a
+            // recovered survivor on a pre-publish baseline.
+            match write_ref_sidecar(&tier.active.path, new_ref) {
+                Ok(()) => {
+                    // Verify-before-delete: the manifest read-back above
+                    // confirmed every uploaded chunk — the frozen
+                    // overlay's content is durably published, so the
+                    // file retires whole. (Replaces per-chunk hole
+                    // punching; chunks rewritten during the upload live
+                    // in the ACTIVE overlay and belong to the next
+                    // flush.)
+                    tier.unlink_frozen();
+                }
                 Err(error) => {
+                    // Keep the frozen file: recovery would otherwise
+                    // chain from a stale ref with its bytes gone. The
+                    // next flush re-drains it (idempotent puts, and the
+                    // version-conflict retry absorbs the re-publish).
                     tracing::warn!(
-                        path = %ref_sidecar_path(&tier.path).display(),
+                        path = %ref_sidecar_path(&tier.active.path).display(),
                         %error,
-                        "could not record the published ref; dirty chunks stay local",
+                        "could not record the published ref; frozen overlay retained",
                     );
-                    false
-                }
-            };
-            for claim in &claims {
-                if tier.claimed.get(&claim.chunk_idx) != Some(&claim.generation) {
-                    continue;
-                }
-                tier.claimed.remove(&claim.chunk_idx);
-                let unchanged = tier.generations.get(&claim.chunk_idx) == Some(&claim.generation)
-                    && !tier.dirty.contains(&claim.chunk_idx)
-                    && punch_safe;
-                if unchanged {
-                    let offset = claim.chunk_idx as u64 * chunk_size;
-                    if let Err(source) =
-                        punch_hole(&tier.file, offset, self.chunk_len(claim.chunk_idx))
-                    {
-                        tier.dirty.insert(claim.chunk_idx);
-                        tracing::warn!(
-                            path = %tier.path.display(),
-                            chunk = claim.chunk_idx,
-                            error = %source,
-                            "could not punch a published dirty chunk; chunk remains dirty",
-                        );
-                    }
-                } else {
-                    tier.dirty.insert(claim.chunk_idx);
                 }
             }
         }
@@ -2551,14 +2729,17 @@ impl ChunkedDiskBackend {
         chunk_idx: usize,
         chunk_len: u64,
     ) -> Result<Bytes, DiskBackendError> {
-        // Dirty and claimed chunks stay in the same file. The tier lock
-        // keeps a read atomic with a write or a claim cleanup.
+        // Overlay chunks first: active (newest guest bytes) wins over
+        // frozen (pending upload). The tier lock keeps a read atomic
+        // with a write or a freeze.
         {
             let tier = self.dirty_tier.lock().await;
-            if tier.contains(chunk_idx) {
-                return tier
-                    .read_chunk(chunk_idx, chunk_len as usize, self.chunk_size)
-                    .map_err(|source| dirty_file_error("read guest chunk", &tier.path, source));
+            if let Some(read) =
+                tier.read_overlay_chunk(chunk_idx, chunk_len as usize, self.chunk_size)
+            {
+                return read.map_err(|source| {
+                    dirty_file_error("read guest chunk", &tier.active.path, source)
+                });
             }
         }
         // ADR 0045 C2 disk post-copy: a sealed chunk's truth lives on
@@ -2827,9 +3008,12 @@ mod tests {
         // writeback timing. Recovery needs exact extents, which ext4
         // gives and APFS does not (it reports flushed zero-fill as
         // data) — so the Recover-mode tests are Linux-gated.
-        tier.file.sync_all().unwrap();
+        tier.active.file.sync_all().unwrap();
+        if let Some(frozen) = &tier.frozen {
+            frozen.file.sync_all().unwrap();
+        }
         tier.remove_on_drop = false;
-        tier.path.clone()
+        tier.active.path.clone()
     }
 
     /// Synth helper: put a chunk of `byte` repeated `size` times
@@ -2900,7 +3084,7 @@ mod tests {
         let chunk_size = 4096u64;
         let manifest = synth_manifest(chunk_size, chunk_size, vec![]);
         let (backend, _store, _dir) = build_backend(&manifest).await;
-        let dirty_path = backend.dirty_tier.lock().await.path.clone();
+        let dirty_path = backend.dirty_tier.lock().await.active.path.clone();
 
         backend.write(0, &[0x5a; 4096]).await.unwrap();
         let outcome = backend.flush().await.unwrap();
@@ -3025,7 +3209,7 @@ mod tests {
             }
             ProcessDeathState::Malformed | ProcessDeathState::Spool(_) => {
                 let (exported_ref, exported_chunks) = backend.export_unflushed().await;
-                let dirty_path = backend.dirty_tier.lock().await.path.clone();
+                let dirty_path = backend.dirty_tier.lock().await.active.path.clone();
                 let (spool_chunks, crash_state) = match state {
                     ProcessDeathState::Malformed => (
                         vec![
@@ -3476,9 +3660,10 @@ mod tests {
         assert_eq!(successor.read(0, chunk_size).await.unwrap(), expected);
     }
 
-    /// A publish that omits uploaded data cannot remove the dirty extent.
+    /// A publish that omits uploaded data cannot delete the frozen
+    /// overlay (verify-before-delete, ADR 0110 addendum).
     #[tokio::test]
-    async fn publish_that_omits_a_chunk_never_punches() {
+    async fn publish_that_omits_a_chunk_never_deletes_the_frozen_overlay() {
         let chunk_size = 4096u64;
         let manifest = synth_manifest(chunk_size, chunk_size, vec![]);
         let dir = tempfile::tempdir().unwrap();
@@ -3522,21 +3707,39 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(successor.dirty_chunks_count().await, 1);
+        // The failed flush left the chunk in the FROZEN overlay (the
+        // freeze happened; the verify refused the delete), so the
+        // active dirty set is empty — but the bytes are unflushed,
+        // recovered, and served, and the next flush re-drains them.
+        assert_eq!(successor.dirty_chunks_count().await, 0);
+        assert_eq!(successor.unflushed_bytes().await, chunk_size);
         assert_eq!(successor.read(0, chunk_size).await.unwrap(), expected);
+        let retried = successor.flush().await.unwrap();
+        assert_eq!(retried.chunks_flushed, 1);
+        assert_eq!(successor.unflushed_bytes().await, 0);
     }
 
-    /// Recovery marks the whole chunk for a partial allocated extent.
-    /// Needs exact SEEK_DATA extents (ext4). APFS reports flushed
-    /// zero-fill as data, so this test runs on Linux only (the CI
-    /// Linux lane and `just test-linux engram-host-agent`).
+    /// #996: recovery DROPS a partially-allocated chunk (torn
+    /// first-touch materialize) instead of adopting it — adopting
+    /// zero-fills committed base bytes. A fully-allocated chunk is
+    /// still adopted. Needs exact SEEK_DATA extents (ext4). APFS
+    /// reports flushed zero-fill as data, so this test runs on Linux
+    /// only (the CI Linux lane and `just test-linux engram-host-agent`).
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn extent_scan_marks_partial_extents_as_whole_chunks() {
+    async fn extent_scan_drops_torn_chunks_and_adopts_complete_ones() {
         let chunk_size = 64 * 1024u64;
         let total = 4 * chunk_size;
-        let manifest = synth_manifest(total, chunk_size, vec![]);
         let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().join("blob")));
+        let store = Arc::new(ChunkStore::new(blob));
+        // Chunk 2 has COMMITTED base content — the bytes #996's torn
+        // materialize must never zero-fill.
+        let h2 = put_chunk(&store, 0x77, chunk_size as usize).await;
+        let manifest = synth_manifest(total, chunk_size, vec![(2 * chunk_size, h2)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+
         let dirty_path = dir.path().join("out-of-band-dirty.cache");
         let file = OpenOptions::new()
             .read(true)
@@ -3545,22 +3748,21 @@ mod tests {
             .open(&dirty_path)
             .unwrap();
         file.set_len(total).unwrap();
+        // Torn materialize of chunk 2: only 5 bytes of the 64 KiB
+        // chunk ever hit the file before the SIGKILL.
         let middle = 173usize;
-        let bytes = [0xa1, 0xb2, 0xc3, 0xd4, 0xe5];
+        let torn = [0xa1, 0xb2, 0xc3, 0xd4, 0xe5];
         write_all_at(
             &file,
-            &bytes,
+            &torn,
             2 * chunk_size + u64::try_from(middle).unwrap(),
         )
         .unwrap();
-        // Same APFS rule as retain_dirty_path: flush before the scan.
+        // Chunk 1: a COMPLETE materialized chunk — must be adopted.
+        write_all_at(&file, &vec![0x42; chunk_size as usize], chunk_size).unwrap();
         file.sync_all().unwrap();
         drop(file);
 
-        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().join("blob")));
-        let store = Arc::new(ChunkStore::new(blob));
-        let manifest_ref = ManifestRef::new();
-        store.put_manifest(manifest_ref, &manifest).await.unwrap();
         let backend = ChunkedDiskBackend::from_manifest_with_dirty_file(
             manifest_ref,
             &manifest,
@@ -3572,12 +3774,19 @@ mod tests {
         )
         .unwrap();
 
+        // The complete chunk is adopted; the torn one is dropped.
         assert_eq!(backend.dirty_chunks_count().await, 1);
-        let mut expected = vec![0; chunk_size as usize];
-        expected[middle..middle + bytes.len()].copy_from_slice(&bytes);
+        assert_eq!(
+            backend.read(chunk_size, chunk_size).await.unwrap(),
+            vec![0x42; chunk_size as usize],
+            "a fully-allocated chunk is adopted",
+        );
+        // The #996 assertion: committed base bytes, NOT zeros (and not
+        // the torn fragment — nothing in it was ever acked).
         assert_eq!(
             backend.read(2 * chunk_size, chunk_size).await.unwrap(),
-            expected
+            vec![0x77; chunk_size as usize],
+            "a torn chunk is dropped; the base serves its committed bytes",
         );
     }
 
@@ -4154,6 +4363,112 @@ mod tests {
         let bytes = backend.read(0, 32).await.unwrap();
         assert!(bytes[..16].iter().all(|b| *b == 0xcc));
         assert!(bytes[16..].iter().all(|b| *b == 0xaa));
+    }
+
+    /// ADR 0110 addendum: a failed upload retains the frozen overlay;
+    /// the next flush drains IT first, and writes made meanwhile ride
+    /// the flush after that. No claims, no requeue — the file is the
+    /// retry state.
+    #[tokio::test]
+    async fn failed_upload_retains_frozen_overlay_and_next_flush_drains_it() {
+        let chunk_size = 4096u64;
+        let manifest = synth_manifest(2 * chunk_size, chunk_size, vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let fail_puts = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let blob: Arc<dyn BlobStorage> = Arc::new(FailChunkPutsBlob {
+            inner: LocalBlobStorage::new(dir.path().join("blob")),
+            fail_puts: fail_puts.clone(),
+        });
+        let store = Arc::new(ChunkStore::new(blob));
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let backend = ChunkedDiskBackend::new(
+            manifest_ref,
+            &manifest,
+            test_cache(dir.path().join("cache")),
+            store.clone(),
+            u64::MAX,
+        )
+        .unwrap();
+
+        backend.write(0, &[0x11; 4096]).await.unwrap();
+        fail_puts.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(backend.flush().await.is_err(), "puts are failing");
+        // The frozen overlay holds the claimed chunk; the active set is
+        // empty; the bytes still serve.
+        assert_eq!(backend.dirty_chunks_count().await, 0);
+        assert_eq!(backend.unflushed_bytes().await, chunk_size);
+        assert_eq!(backend.read(0, chunk_size).await.unwrap(), vec![0x11; 4096]);
+
+        // Guest keeps writing (a different chunk) while the frozen
+        // overlay awaits retry.
+        backend.write(chunk_size, &[0x22; 4096]).await.unwrap();
+
+        fail_puts.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Retry drains the FROZEN overlay (chunk 0 only).
+        let first = backend.flush().await.unwrap();
+        assert_eq!(first.chunks_flushed, 1);
+        // The interim write flushes on the next cycle.
+        let second = backend.flush().await.unwrap();
+        assert_eq!(second.chunks_flushed, 1);
+        assert!(second.manifest_ref.version > first.manifest_ref.version);
+        assert_eq!(backend.unflushed_bytes().await, 0);
+        let published = store.get_manifest(second.manifest_ref).await.unwrap();
+        assert_eq!(published.chunks.len(), 2);
+        assert_eq!(backend.read(0, 2 * chunk_size).await.unwrap(), {
+            let mut v = vec![0x11; 4096];
+            v.extend_from_slice(&[0x22; 4096]);
+            v
+        });
+    }
+
+    /// Chunk puts fail while `fail_puts` is set; manifests pass through.
+    struct FailChunkPutsBlob {
+        inner: LocalBlobStorage,
+        fail_puts: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStorage for FailChunkPutsBlob {
+        async fn put_streaming(
+            &self,
+            key: &str,
+            body: ByteStream,
+        ) -> Result<u64, engram_core::error::BlobError> {
+            if key.starts_with("chunks/")
+                && self.fail_puts.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(engram_core::error::BlobError::Protocol(
+                    "injected chunk put failure".into(),
+                ));
+            }
+            self.inner.put_streaming(key, body).await
+        }
+
+        async fn get_streaming(
+            &self,
+            key: &str,
+        ) -> Result<ByteStream, engram_core::error::BlobError> {
+            self.inner.get_streaming(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<engram_core::traits::BlobObjectMeta, engram_core::error::BlobError> {
+            self.inner.head(key).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), engram_core::error::BlobError> {
+            self.inner.delete(key).await
+        }
+
+        async fn list_prefix(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<String>, engram_core::error::BlobError> {
+            self.inner.list_prefix(prefix).await
+        }
     }
 
     #[tokio::test]
