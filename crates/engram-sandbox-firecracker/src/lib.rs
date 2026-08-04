@@ -4547,6 +4547,13 @@ impl ExecRedial {
 
 const DURABLE_EXEC_SKEW: &str = "ENGRAM_DURABLE_EXEC_VERSION_SKEW";
 
+/// How many consecutive transport EOFs with no frame in between the durable
+/// exec reader tolerates before it ends without Exit. This bounds the
+/// reconnect loop against a guest that accepts a dial and closes it before
+/// one frame arrives; past the cap, the caller's fresh RPC (same ticket)
+/// owns the retry with its own pacing.
+const MAX_DEAD_RECONNECT_CYCLES: u32 = 3;
+
 #[derive(serde::Deserialize, serde::Serialize)]
 struct LegacyWireExecRequest {
     command: Vec<String>,
@@ -4622,6 +4629,13 @@ async fn cancel_exec_roundtrip(mut io: BoxExecIo, exec_id: &str) -> Result<(), S
 /// probe has succeeded. Every generation must begin with a matching `Started`
 /// frame.
 ///
+/// Reconnects ask attach-or-start until the first `Started` proves the guest
+/// journaled the command; after that proof they ask attach-only, so a lost
+/// journal entry refuses loudly instead of running the command twice.
+/// Consecutive reconnects that deliver no frame are bounded by
+/// [`MAX_DEAD_RECONNECT_CYCLES`]; past the cap the stream ends without Exit,
+/// which the coordinator surfaces as retryable with the same ticket.
+///
 /// Production enters through `SandboxBackend::exec_stream`; this is public
 /// only so `engram-dst-cosim` can pair the real reader with real agentd and
 /// exercise checkpoint severance/re-attach at their shared boundary.
@@ -4666,9 +4680,21 @@ pub async fn drive_exec_protocol(
         let exec_id = reader_exec_id;
         let mut durable_capable = durable_capable;
         let mut expect_started = durable_capable;
+        // The guest proves the journal entry exists the first time it sends
+        // `Started`. Until then a reconnect must ask attach-or-start: the
+        // request may have died before agentd journaled it, and attach-only
+        // would be refused as a "second command" when zero commands ran.
+        let mut journal_proven = false;
+        // Consecutive EOFs with no frame delivered in between. Bounded by
+        // MAX_DEAD_RECONNECT_CYCLES so a connectable-but-instantly-closing
+        // guest cannot spin this loop forever.
+        let mut dead_cycles = 0u32;
         loop {
             let msg = match read_msg::<_, WireExecEvent>(&mut io).await {
-                Ok(msg) => msg,
+                Ok(msg) => {
+                    dead_cycles = 0;
+                    msg
+                }
                 Err(error) if !durable_capable => {
                     // A legacy agent or a degraded journal has no safe retry.
                     // A retry could run the command twice.
@@ -4696,6 +4722,31 @@ pub async fn drive_exec_protocol(
                         );
                         return;
                     };
+                    if tx.is_closed() {
+                        // The consumer dropped the stream; no frame can be
+                        // observed anymore. Do not keep dialing the guest.
+                        tracing::debug!(
+                            %sandbox_id,
+                            %exec_id,
+                            "durable exec consumer gone; ending reader without reconnect",
+                        );
+                        return;
+                    }
+                    dead_cycles += 1;
+                    if dead_cycles > MAX_DEAD_RECONNECT_CYCLES {
+                        // The journal stays authoritative. End without Exit
+                        // so the caller's fresh RPC owns the retry pacing.
+                        tracing::warn!(
+                            %sandbox_id,
+                            %exec_id,
+                            stdout_offset,
+                            stderr_offset,
+                            dead_cycles,
+                            %error,
+                            "durable exec made no progress across consecutive reconnects; ending without Exit",
+                        );
+                        return;
+                    }
                     let mut next = match connector.reconnect_after_eof().await {
                         Ok(next) => next,
                         Err(reconnect_error) => {
@@ -4713,8 +4764,13 @@ pub async fn drive_exec_protocol(
                             return;
                         }
                     };
-                    let attach =
-                        agent_exec_request(&cmd, &exec_id, stdout_offset, stderr_offset, true);
+                    let attach = agent_exec_request(
+                        &cmd,
+                        &exec_id,
+                        stdout_offset,
+                        stderr_offset,
+                        journal_proven,
+                    );
                     if let Err(write_error) = write_msg(&mut next, &attach).await {
                         // A failed write did not reach a journal verdict. A
                         // fresh caller can safely retry the deduped attach.
@@ -4770,6 +4826,7 @@ pub async fn drive_exec_protocol(
                     }
                     durable_capable = true;
                     expect_started = false;
+                    journal_proven = true;
                 }
                 WireExecEvent::Degraded(reason) => {
                     durable_capable = false;
@@ -7889,6 +7946,147 @@ mod tests {
         ));
         assert!(events.next().await.is_none());
         reattached.await.unwrap();
+    }
+
+    /// PR #963 review: the first connection can die before agentd journals
+    /// the command (the muxer accept-then-close race in `connect_fc_vsock`).
+    /// The reconnect must ask attach-or-start — attach-only would be refused
+    /// as a "second command" and the exec would silently never run.
+    #[tokio::test]
+    async fn exec_reader_eof_before_started_reattaches_with_attach_or_start() {
+        use futures_util::StreamExt;
+
+        let (host_end, mut first_guest) = tokio::io::duplex(4096);
+        let (reattach_host, mut reattach_guest) = tokio::io::duplex(4096);
+        let exec_id = "exec-preborn-eof";
+        let req = ExecRequest {
+            command: vec!["true".into()],
+            stdin: None,
+            env: HashMap::new(),
+            workdir: None,
+            timeout: None,
+            exec_id: Some(exec_id.into()),
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+        };
+        let stream = drive_exec_protocol(
+            SandboxId::new(),
+            Box::new(host_end),
+            req,
+            true,
+            Some(ExecRedial::provided({
+                let connection = Arc::new(tokio::sync::Mutex::new(Some(
+                    Box::new(reattach_host) as BoxExecIo
+                )));
+                move || {
+                    let connection = connection.clone();
+                    async move {
+                        connection.lock().await.take().ok_or_else(|| {
+                            vm_err("test durable exec redial connection already consumed")
+                        })
+                    }
+                }
+            })),
+        )
+        .await
+        .unwrap();
+
+        // The guest accepts and dies before journaling: no Started frame.
+        let _first: WireRequest = read_msg(&mut first_guest).await.unwrap();
+        drop(first_guest);
+
+        let request: WireRequest = read_msg(&mut reattach_guest).await.unwrap();
+        assert!(
+            matches!(
+                request,
+                WireRequest::Exec(WireExecRequest {
+                    exec_id: Some(ref id),
+                    stdout_offset: Some(0),
+                    stderr_offset: Some(0),
+                    attach_only: false,
+                    ..
+                }) if id == exec_id
+            ),
+            "a reconnect before Started must ask attach-or-start, got {request:?}"
+        );
+        write_msg(&mut reattach_guest, &WireExecEvent::Started(exec_id.into()))
+            .await
+            .unwrap();
+        write_msg(&mut reattach_guest, &WireExecEvent::Exit(Some(0)))
+            .await
+            .unwrap();
+
+        let mut events = stream.events;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), events.next()).await,
+            Ok(Some(ExecEvent::Exit(Some(0))))
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), events.next()).await,
+            Ok(None)
+        ));
+    }
+
+    /// PR #963 review: a guest that accepts every dial but closes before one
+    /// frame must not spin the reader forever. After
+    /// `MAX_DEAD_RECONNECT_CYCLES` zero-progress reconnects the stream ends
+    /// without Exit (retryable upstream; the journal keeps the answer).
+    #[tokio::test]
+    async fn exec_reader_bounds_zero_progress_reconnects() {
+        use futures_util::StreamExt;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let dials = Arc::new(AtomicU32::new(0));
+        let (host_end, mut first_guest) = tokio::io::duplex(4096);
+        let req = ExecRequest {
+            command: vec!["true".into()],
+            stdin: None,
+            env: HashMap::new(),
+            workdir: None,
+            timeout: None,
+            exec_id: Some("exec-dead-cycles".into()),
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+        };
+        let stream = drive_exec_protocol(
+            SandboxId::new(),
+            Box::new(host_end),
+            req,
+            true,
+            Some(ExecRedial::provided({
+                let dials = dials.clone();
+                move || {
+                    let dials = dials.clone();
+                    async move {
+                        dials.fetch_add(1, Ordering::SeqCst);
+                        let (host, mut guest) = tokio::io::duplex(4096);
+                        tokio::spawn(async move {
+                            // Accept, drain the attach request, close before
+                            // delivering one frame.
+                            let _ = read_msg::<_, WireRequest>(&mut guest).await;
+                        });
+                        Ok(Box::new(host) as BoxExecIo)
+                    }
+                }
+            })),
+        )
+        .await
+        .unwrap();
+
+        let _first: WireRequest = read_msg(&mut first_guest).await.unwrap();
+        drop(first_guest);
+
+        let mut events = stream.events;
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_secs(5), events.next()).await,
+                Ok(None)
+            ),
+            "stream must end without Exit, not wedge or fabricate a terminal"
+        );
+        assert_eq!(dials.load(Ordering::SeqCst), MAX_DEAD_RECONNECT_CYCLES);
     }
 
     #[tokio::test]
