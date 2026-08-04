@@ -202,6 +202,29 @@ pub fn read_proc_comm(pid: u32) -> Option<String> {
     Some(raw.trim_end_matches('\n').to_string())
 }
 
+/// Read the process state char from `/proc/<pid>/stat` (field 3).
+/// The state follows the last `)` — comm (field 2) may itself
+/// contain parens, so parse from the right. `None` = no such
+/// process / unreadable.
+pub fn read_proc_state(pid: u32) -> Option<char> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    raw.rsplit(')')
+        .next()
+        .and_then(|rest| rest.trim_start().chars().next())
+}
+
+/// A zombie is dead for every liveness purpose: it can never run
+/// again and holds nothing but the pid slot, which only its PARENT
+/// can clear. Crucially `kill(pid, 0)` still returns 0 for one —
+/// any liveness check built on `kill(0)` or on `/proc/<pid>`
+/// existence (starttime/comm reads) MUST also consult this, or a
+/// force-killed FC whose `Child` handle we still hold un-`wait()`ed
+/// reads as alive forever (issue #1012: heartbeats advertised a
+/// ghost sandbox until the host-agent was restarted).
+pub fn is_zombie(pid: u32) -> bool {
+    read_proc_state(pid) == Some('Z')
+}
+
 /// Errors from manifest read/write paths. Distinct from
 /// `SandboxError` so the caller decides whether a write failure
 /// should fail `create()` or just log + degrade to "no reattach

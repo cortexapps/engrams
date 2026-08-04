@@ -70,11 +70,16 @@ fn test_spec() -> SandboxSpec {
 /// genuinely alive for as long as the test runs, verifiable via the
 /// exact `/proc` reads `probe_sandbox` itself uses.
 fn write_manifest_pointing_at_self(work_dir: &std::path::Path, id: SandboxId) {
-    let self_pid = std::process::id();
-    let start_time_jiffies = sandbox_manifest::read_proc_start_time_jiffies(self_pid)
-        .expect("must be able to read our own /proc/self/stat on Linux");
-    let comm = sandbox_manifest::read_proc_comm(self_pid)
-        .expect("must be able to read our own /proc/self/comm on Linux");
+    write_manifest_pointing_at(work_dir, id, std::process::id());
+}
+
+/// Same, for an arbitrary live (or zombie — `/proc` stays readable
+/// until the parent reaps) pid.
+fn write_manifest_pointing_at(work_dir: &std::path::Path, id: SandboxId, pid: u32) {
+    let start_time_jiffies = sandbox_manifest::read_proc_start_time_jiffies(pid)
+        .expect("must be able to read the pid's /proc stat on Linux");
+    let comm = sandbox_manifest::read_proc_comm(pid)
+        .expect("must be able to read the pid's /proc comm on Linux");
     let manifest = SandboxManifest {
         schema_version: sandbox_manifest::SCHEMA_VERSION,
         sandbox_id: id,
@@ -82,7 +87,7 @@ fn write_manifest_pointing_at_self(work_dir: &std::path::Path, id: SandboxId) {
         spec: test_spec(),
         firecracker: FirecrackerProcessRecord {
             process: ProcessRecord {
-                pid: self_pid,
+                pid,
                 start_time_jiffies,
                 comm,
             },
@@ -172,5 +177,55 @@ async fn probe_sandbox_after_manifest_removed_is_the_honest_negative() {
         !after.process_alive,
         "no manifest to verify against falls back to known_to_backend (false) — \
          the honest negative, not a stale 'maybe alive'"
+    );
+}
+
+/// Issue #1012 regression: a killed-but-unreaped child (its parent holds
+/// the un-`wait()`ed `Child`, as `LiveSandbox` does) keeps `/proc/<pid>`
+/// readable, so the three-axis identity check STILL MATCHES — but the
+/// process is a zombie and can never run again. `process_alive` must be
+/// false, or every probe consumer (heartbeat reconcile, the #777
+/// straggler defer, ADR 0068 `flip_missing` rescue) defers forever to a
+/// ghost VM.
+#[tokio::test]
+#[ignore = "Linux-only (reads /proc); run with --ignored"]
+async fn probe_sandbox_reports_zombie_with_matching_identity_as_dead() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let backend = FirecrackerBackend::new(
+        work.path(),
+        FirecrackerConfig::with_kernel("/nonexistent/kernel"),
+    );
+    let id = SandboxId::new();
+
+    // A real child whose identity we record while it is alive…
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id().expect("child has pid");
+    write_manifest_pointing_at(work.path(), id, pid);
+
+    // …then SIGKILL it WITHOUT `wait()`ing: `child` stays held, so the
+    // pid is a zombie of this test process — identity axes still match.
+    // SAFETY: SIGKILL on a child pid we just spawned.
+    let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    assert_eq!(rc, 0, "SIGKILL the sleep child");
+    // The kernel flips the state to Z asynchronously; wait for it so the
+    // test asserts the probe's classification, not the kill's latency.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while sandbox_manifest::read_proc_state(pid) != Some('Z') {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child never reached zombie state"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let probe = backend.probe_sandbox(id).await.expect("probe zombie");
+    // Reap before asserting so a failure doesn't leak the zombie.
+    let _ = child.wait().await;
+    assert!(
+        !probe.process_alive,
+        "a zombie with a matching three-axis identity must probe dead (issue #1012)"
     );
 }
