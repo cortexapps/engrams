@@ -59,6 +59,13 @@ pub enum Step {
     /// Flow C (P3): one REAL `reconcile_once` tick against the reconcile
     /// world, over the sim-owned strike ledger.
     ReconcileTick,
+    /// #1003 ladder 2b (from the #1009 review): arm/disarm the scripted
+    /// chunk-PUT fault on the blob tier (the GCS-outage stand-in). While
+    /// armed, FlushTick's upload leg fails deterministically and frozen
+    /// overlay generations accumulate — composing with GuestWrite and
+    /// SnapshotBegin reaches the capture-with-pending-frozen
+    /// interleaving whose acked-write loss the swarm was blind to.
+    ArmPutFaults(bool),
     /// Flow C perturbation: drop reconcile slot `idx`'s LOCAL binding (the ADR
     /// 0090 survivor). The next `ReconcileTick` must repair it, never reap.
     DropLocalBinding(usize),
@@ -188,6 +195,7 @@ impl Step {
             Step::Restart => "Restart",
             Step::AdvanceTime(..) => "AdvanceTime",
             Step::ReconcileTick => "ReconcileTick",
+            Step::ArmPutFaults(..) => "ArmPutFaults",
             Step::DropLocalBinding(..) => "DropLocalBinding",
             Step::RevokeOwnership(..) => "RevokeOwnership",
             Step::Sigterm(..) => "Sigterm",
@@ -450,6 +458,11 @@ impl Sim {
                 // steps above interleave rolls between destroy and resume.
                 // Carved from the tail AdvanceTime band, not a re-weight.
                 112 => Step::FinalizedResume(self.rng.random_range(0..n)),
+                // #1003 2b: the PUT-fault arm/disarm toggle. Carved from
+                // the tail AdvanceTime band, not a re-weight. Disarm is
+                // twice as likely as arm so fault windows stay bounded
+                // and the drained-converged end state remains reachable.
+                113 => Step::ArmPutFaults(self.rng.random_range(0..3u8) == 0),
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
         }
@@ -488,6 +501,11 @@ impl Sim {
                 self.crashed = false;
             }
             Step::AdvanceTime(d) => self.host.clock.advance(d).await,
+            Step::ArmPutFaults(on) => {
+                self.host
+                    .put_faults
+                    .store(on, std::sync::atomic::Ordering::SeqCst);
+            }
             Step::ReconcileTick => {
                 self.host
                     .reconcile_tick(&mut self.reconcile_strikes)
@@ -579,6 +597,12 @@ impl Sim {
     pub async fn run(&mut self, steps: u64) -> Result<SimReport, String> {
         for _ in 0..steps {
             let step = self.pick();
+            // #1003 2b: every step is TOTAL under the scripted PUT fault —
+            // each fault-observing step models the outage inline (frozen
+            // generations retained, nothing published, crash legs still
+            // crash). A step error is therefore always a real violation;
+            // a blanket marker-swallow here would hide a half-executed
+            // step from the oracles (the never-acked-tag class).
             self.execute(step).await?;
             self.report.steps_run += 1;
             if let Err(v) = invariants::check(&self.host).await {
@@ -589,7 +613,12 @@ impl Sim {
             }
         }
         // Quiesce: one clean crash→restart cycle, then the oracle must still
-        // recover every acked write.
+        // recover every acked write. Faults heal first — the quiescence
+        // contract drives a final REAL flush per sandbox, which mirrors
+        // the post-restart honest-TokioFs rule for CrashFs cuts.
+        self.host
+            .put_faults
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.execute(Step::CrashProcess).await?;
         self.execute(Step::Restart).await?;
         if let Err(v) = invariants::check(&self.host).await {

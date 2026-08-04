@@ -1992,3 +1992,59 @@ async fn finalize_publishes_past_store_ahead_orphan_and_resume_covers_acked_writ
         .await
         .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
 }
+
+// ─────────── #1003 ladder 2b: upload-fault × eviction capture ───────────
+//
+// The #1009 review's CRITICAL: with a frozen overlay pending from a failed
+// upload, the capture path's single flush_local drained only the frozen set
+// and silently excluded the active overlay's acked writes from the eviction
+// snapshot — silent acked-write loss. The swarm ran green on that commit
+// because nothing composed a chunk-PUT fault with SnapshotBegin; this pins
+// the composition directly (the randomized reach rides Step::ArmPutFaults
+// in the chaos menu).
+#[tokio::test(start_paused = true)]
+async fn upload_fault_then_eviction_capture_preserves_active_writes() {
+    let mut host = SimHost::new(0xF057, 2).await;
+
+    // Acked write lands, then the blob tier starts failing puts
+    // (GCS-outage stand-in): the flush freezes but cannot publish.
+    host.guest_write(0, 0).await.unwrap();
+    host.put_faults
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = host.flush_tick(0).await; // upload leg fails; frozen gen retained
+    invariants::check(&host).await.unwrap();
+
+    // The guest keeps writing while the fault window is open: chunk 0 is
+    // SUPERSEDED in the active overlay and chunk 1 is new — both acked.
+    host.guest_write(0, 0).await.unwrap();
+    host.guest_write(0, 1).await.unwrap();
+
+    // Fault clears; the eviction capture's ONE flush_local is the
+    // coherence cut. Pre-fix it exported only the stale frozen chunk 0.
+    host.put_faults
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let outcome = host.snapshot_begin(0).await.unwrap();
+    assert!(
+        matches!(outcome, engram_dst_host::CaptureOutcome::Began(..)),
+        "capture must begin cleanly, got {outcome:?}",
+    );
+    // Drive the finalize to completion (destroys the VM), then resume.
+    for _ in 0..16 {
+        let _ = host.finalize_tick(0).await;
+    }
+    invariants::check(&host).await.unwrap();
+    let resume = host.resume_finalized(0, false).await.unwrap();
+    assert!(
+        matches!(resume, engram_dst_host::ResumeOutcome::Attached),
+        "finalized session must attach from its snapshot, got {resume:?}",
+    );
+
+    // Oracle #1, plus the direct read-back: every acked write — the
+    // superseded chunk 0 AND the post-freeze chunk 1 — must be the
+    // resumed disk's content (guest_read verifies bytes against the
+    // acked-write ledger). Pre-fix, chunk 0 read back the STALE frozen
+    // bytes and chunk 1 was absent entirely.
+    invariants::check(&host).await.unwrap();
+    host.guest_read(0, 0).await.unwrap();
+    host.guest_read(0, 1).await.unwrap();
+}
