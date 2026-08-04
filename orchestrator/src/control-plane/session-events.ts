@@ -99,7 +99,7 @@ export interface WireEvent {
 export function curateWireEvent(ev: WireEvent): CuratedEvent | undefined {
   if (ev.idx === undefined) return undefined;
   if (ev.kind === "agent_message") {
-    return parseAssistantText(ev.payloadJson) === undefined
+    return parseAgentMessage(ev.payloadJson) === undefined
       ? undefined
       : { idx: ev.idx, kind: ev.kind, payloadJson: ev.payloadJson };
   }
@@ -154,12 +154,15 @@ export async function readSessionEventsBounded(
       continue; // a control signal, never forwarded as content
     }
     if (ev.kind === "agent_message") {
-      const text = parseAssistantText(ev.payloadJson);
-      if (text !== undefined) {
-        lastAssistantText = text; // keep the latest, for the closing summary
-        // Forward the assistant's text to the thread as content (the workflow
-        // coalesces consecutive ones into one per-turn message). Only the
-        // assistant role — the prompt echo (`user`) and system notes never post.
+      const msg = parseAgentMessage(ev.payloadJson);
+      if (msg !== undefined) {
+        if (msg.role === "assistant") {
+          lastAssistantText = msg.text; // keep the latest, for the closing summary
+        }
+        // Forward the assistant's turns and the user prompt echo as content.
+        // Consumers pick their role: the Slack workflow posts only assistant
+        // text (communication-policy.ts), the title consumer reads only the
+        // user echo. System notes never forward.
         const curatedEvent = curateWireEvent(ev);
         if (curatedEvent) events.push(curatedEvent);
       }
@@ -171,12 +174,17 @@ export async function readSessionEventsBounded(
   return { events, nextAfter: nextAfterIdx, terminal, lastAssistantText };
 }
 
-/** Extract the text of an `agent_message` payload iff it is from the assistant
- *  (the prompt echo rides `role:"user"`, system notes `role:"system"`). */
-function parseAssistantText(payloadJson: string): string | undefined {
+/** Parse an `agent_message` payload into the two roles the reverse channel
+ *  forwards: the assistant's turns and the user prompt echo (the title
+ *  consumer reads the latter). System notes and malformed payloads → undefined. */
+function parseAgentMessage(
+  payloadJson: string,
+): { role: "assistant" | "user"; text: string } | undefined {
   try {
     const p = JSON.parse(payloadJson) as { role?: unknown; text?: unknown };
-    return p?.role === "assistant" && typeof p.text === "string" ? p.text : undefined;
+    return (p?.role === "assistant" || p?.role === "user") && typeof p.text === "string"
+      ? { role: p.role, text: p.text }
+      : undefined;
   } catch {
     return undefined;
   }

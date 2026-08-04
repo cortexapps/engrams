@@ -251,6 +251,18 @@ export class SessionListener {
               { sessionId: this.#deps.sessionId, status },
               "session status is already terminal",
             );
+            // Drain the log before finishing: an adopted already-terminal
+            // session may hold an undelivered suffix (the listener was down
+            // when the session died), or deliberately reset cursors for a
+            // replay. Finishing without reading would drop those events for
+            // ever. The probe itself still does its real job — it prevents a
+            // stream dial that can never deliver (a reaped "dead" session
+            // writes no terminal status_changed event for catch-up to see).
+            const drained = await this.#catchUp();
+            log.info(
+              { sessionId: this.#deps.sessionId, eventCount: drained.eventCount },
+              "terminal-session log drained",
+            );
             await this.#finishTerminal(outcome);
             return;
           }

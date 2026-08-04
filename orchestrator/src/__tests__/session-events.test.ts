@@ -185,17 +185,18 @@ describe("readSessionEventsBounded()", () => {
     });
   });
 
-  // Assistant text is now forwarded to the thread as content (coalesced into a
-  // per-turn message downstream). agent_message stays OUT of CURATED_KINDS — it
-  // is forwarded only for the assistant role, via the reader's special branch.
-  describe("assistant message forwarding", () => {
+  // Assistant text and the user prompt echo are forwarded as content (the
+  // Slack workflow posts only assistant text; the title consumer reads only
+  // the user echo). agent_message stays OUT of CURATED_KINDS — it is forwarded
+  // only for those two roles, via the reader's special branch.
+  describe("agent message forwarding", () => {
     const am = (idx: bigint, role: string, text: string): WireEvent => ({
       idx,
       kind: "agent_message",
       payloadJson: JSON.stringify({ role, text }),
     });
 
-    test("forwards assistant agent_message events as curated content (idx + payload)", async () => {
+    test("forwards assistant and user agent_message events; drops system notes", async () => {
       const page: WireEvent[] = [
         { idx: 0n, kind: "run_started", payloadJson: "{}" },
         am(1n, "assistant", "working on it"),
@@ -208,8 +209,13 @@ describe("readSessionEventsBounded()", () => {
         "run_started",
         "agent_message",
         "agent_message",
+        "agent_message",
       ]);
-      expect(out.events.filter((e) => e.kind === "agent_message").map((e) => e.idx)).toEqual([1n, 4n]);
+      expect(out.events.filter((e) => e.kind === "agent_message").map((e) => e.idx)).toEqual([
+        1n,
+        2n,
+        4n,
+      ]);
     });
 
     test("a malformed assistant agent_message is neither forwarded nor crashes", async () => {

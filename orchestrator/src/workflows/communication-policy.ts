@@ -139,8 +139,13 @@ export function routeSessionEvent(
     case "integration_asset":
     case "file_shared":
       return { kind: "asset" };
-    case "agent_message":
-      return { kind: "message", text: parseMessageText(ev.payloadJson) };
+    case "agent_message": {
+      // Only the assistant's turns post to the thread. Curation also forwards
+      // the user prompt echo (`role:"user"`, for the title consumer) — posting
+      // it here would echo the user's own words back at them.
+      const text = parseAssistantMessageText(ev.payloadJson);
+      return text === undefined ? { kind: "ignore" } : { kind: "message", text };
+    }
     case "run_started":
       return { kind: "working" };
     case "run_completed":
@@ -195,14 +200,14 @@ function parseGenericQuestionResult(payloadJson: string): string | undefined {
   }
 }
 
-/** Extract the assistant text from an `agent_message` payload (empty if absent
- *  or unparseable — the event still routes, it just renders nothing). */
-function parseMessageText(payloadJson: string): string {
+/** Extract the assistant text from an `agent_message` payload; undefined for
+ *  other roles (the user prompt echo, system notes) and unparseable payloads. */
+function parseAssistantMessageText(payloadJson: string): string | undefined {
   try {
-    const t: unknown = (JSON.parse(payloadJson) as { text?: unknown })?.text;
-    return typeof t === "string" ? t : "";
+    const p = JSON.parse(payloadJson) as { role?: unknown; text?: unknown };
+    return p?.role === "assistant" && typeof p.text === "string" ? p.text : undefined;
   } catch {
-    return "";
+    return undefined;
   }
 }
 
