@@ -4376,8 +4376,90 @@ impl MetadataStore for SimMetadataStore {
             created_at,
             updated_at: now,
             revoked_at: None,
+            expires_at: credential.expires_at,
+            broken_at: None,
+            broken_reason: None,
         };
+        // Publishing a validated bundle IS the repair: broken/claim state
+        // clears on every successful write (PG mirrors this in the UPDATE).
+        db.oauth_refresh_claims.remove(&credential.key);
         db.oauth_credentials.insert(credential.key, row.clone());
+        Ok(row)
+    }
+
+    async fn list_oauth_credentials_due_for_refresh(
+        &self,
+        kind: engram_core::types::oauth::OAuthSubjectKind,
+        now: chrono::DateTime<chrono::Utc>,
+        due_before: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<Vec<engram_core::types::oauth::SealedOAuthCredential>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        let mut due: Vec<_> = db
+            .oauth_credentials
+            .values()
+            .filter(|row| {
+                row.key.subject_kind == kind
+                    && row.expires_at.is_some_and(|at| at <= due_before)
+                    && row.revoked_at.is_none()
+                    && row.broken_at.is_none()
+                    && db
+                        .oauth_refresh_claims
+                        .get(&row.key)
+                        .is_none_or(|until| *until < now)
+            })
+            .cloned()
+            .collect();
+        due.sort_by_key(|row| row.expires_at);
+        due.truncate(usize::try_from(limit).unwrap_or(0));
+        Ok(due)
+    }
+
+    async fn claim_oauth_refresh(
+        &self,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+        now: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        let claimable = db.oauth_credentials.get(key).is_some_and(|row| {
+            row.revoked_at.is_none()
+                && row.broken_at.is_none()
+                && db
+                    .oauth_refresh_claims
+                    .get(key)
+                    .is_none_or(|existing| *existing < now)
+        });
+        if claimable {
+            db.oauth_refresh_claims.insert(key.clone(), until);
+        }
+        Ok(claimable)
+    }
+
+    async fn mark_oauth_credential_broken(
+        &self,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+        expected_version: i64,
+        reason: &str,
+    ) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let Some(row) = db.oauth_credentials.get_mut(key) else {
+            return Err(MetaError::NotFound);
+        };
+        if row.version != expected_version || row.revoked_at.is_some() || row.broken_at.is_some() {
+            return Err(MetaError::Conflict(
+                "OAuth credential version moved; reload the winner".into(),
+            ));
+        }
+        row.broken_at = Some(now);
+        row.broken_reason = Some(reason.to_owned());
+        row.updated_at = now;
+        let row = row.clone();
+        db.oauth_refresh_claims.remove(key);
         Ok(row)
     }
 
@@ -4445,6 +4527,36 @@ impl MetadataStore for SimMetadataStore {
         {
             return Err(MetaError::Conflict(
                 "OAuth flow owner lease or status changed".into(),
+            ));
+        }
+        flow.status = status;
+        flow.error_code = error_code.map(ToOwned::to_owned);
+        flow.updated_at = now;
+        Ok(())
+    }
+
+    async fn finish_oauth_flow_unowned(
+        &self,
+        id: uuid::Uuid,
+        status: engram_core::types::oauth::OAuthFlowStatus,
+        error_code: Option<&str>,
+    ) -> Result<(), MetaError> {
+        self.gate()?;
+        if !status.is_terminal() {
+            return Err(MetaError::Conflict(
+                "flow finish status must be terminal".into(),
+            ));
+        }
+        let now = self.now();
+        let mut db = self.db.lock();
+        let Some(flow) = db.oauth_flows.get_mut(&id) else {
+            return Err(MetaError::NotFound);
+        };
+        if flow.status != engram_core::types::oauth::OAuthFlowStatus::Pending
+            || flow.expires_at <= now
+        {
+            return Err(MetaError::Conflict(
+                "OAuth flow is no longer pending or has expired".into(),
             ));
         }
         flow.status = status;

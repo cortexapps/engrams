@@ -564,6 +564,61 @@ pub trait MetadataStore: Send + Sync {
         Err(MetaError::NotFound)
     }
 
+    /// Status-transition-fenced finish for redirect flows, which hold no live
+    /// owner handle: any replica may finish a flow that is still pending and
+    /// unexpired. The pending→terminal transition itself is the fence — two
+    /// racing callbacks cannot both succeed.
+    async fn finish_oauth_flow_unowned(
+        &self,
+        _id: uuid::Uuid,
+        _status: crate::types::oauth::OAuthFlowStatus,
+        _error_code: Option<&str>,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::NotFound)
+    }
+
+    /// Refresh-scanner work query: unrevoked, unbroken credentials of `kind`
+    /// whose `expires_at` is at or before `due_before` and whose refresh claim
+    /// is absent or lapsed at `now`. Ordered by `expires_at` ascending.
+    async fn list_oauth_credentials_due_for_refresh(
+        &self,
+        _kind: crate::types::oauth::OAuthSubjectKind,
+        _now: chrono::DateTime<chrono::Utc>,
+        _due_before: chrono::DateTime<chrono::Utc>,
+        _limit: i64,
+    ) -> Result<Vec<crate::types::oauth::SealedOAuthCredential>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Advisory cross-replica refresh claim: succeeds iff the credential
+    /// exists, is unrevoked/unbroken, and its claim is absent or lapsed at
+    /// `now`. Returns whether THIS caller took the claim. The version CAS on
+    /// `put_oauth_credential` remains the correctness fence; the claim only
+    /// suppresses duplicate provider calls.
+    async fn claim_oauth_refresh(
+        &self,
+        _key: &crate::types::oauth::OAuthCredentialKey,
+        _now: chrono::DateTime<chrono::Utc>,
+        _until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        Ok(false)
+    }
+
+    /// Version-fenced terminal-failure mark: records that the provider
+    /// rejected refresh outright (e.g. `invalid_grant`). Fails with Conflict
+    /// when the version moved — a concurrent refresh won and the caller must
+    /// reload the winner instead of declaring the credential dead. The sealed
+    /// bundle is left untouched; a successful `put_oauth_credential` clears
+    /// the mark.
+    async fn mark_oauth_credential_broken(
+        &self,
+        _key: &crate::types::oauth::OAuthCredentialKey,
+        _expected_version: i64,
+        _reason: &str,
+    ) -> Result<crate::types::oauth::SealedOAuthCredential, MetaError> {
+        Err(MetaError::NotFound)
+    }
+
     /// Deterministic cleanup step: marks pending expired/owner-lost flows and
     /// deletes terminal rows beyond `delete_before`.
     async fn cleanup_oauth_flows(

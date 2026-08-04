@@ -50,6 +50,9 @@ impl OAuthDriverError {
 pub struct ValidatedOAuthBundle {
     pub payload: Vec<u8>,
     pub metadata: OAuthAccountMetadata,
+    /// Access-token expiry when the driver knows it (redirect drivers over
+    /// expiring providers); `None` for opaque device-flow caches.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[async_trait]
@@ -387,6 +390,7 @@ impl OAuthManager {
                     ciphertext: sealed.ciphertext,
                     key_id: sealed.key_id,
                     metadata: bundle.metadata,
+                    expires_at: bundle.expires_at,
                 },
                 expected_version,
             )
@@ -747,6 +751,7 @@ impl CodexAppServer {
                 workspace_id: None,
                 workspace_name: None,
             },
+            expires_at: None,
         })
     }
 

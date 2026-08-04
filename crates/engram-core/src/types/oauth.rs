@@ -80,9 +80,55 @@ pub struct SealedOAuthCredential {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Access-token expiry duplicated outside the ciphertext for refresh
+    /// scheduling and status derivation. `None` for non-expiring bundles.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Set when the provider terminally rejected a refresh; the sealed bundle
+    /// stays intact and a fresh authorization flow clears it.
+    pub broken_at: Option<DateTime<Utc>>,
+    pub broken_reason: Option<String>,
+}
+
+impl SealedOAuthCredential {
+    /// Derived, client-safe lifecycle status. `expired` means past
+    /// `expires_at` and not yet repaired by refresh — with the refresh
+    /// scanner running it indicates refresh has been failing transiently.
+    pub fn status(&self, now: DateTime<Utc>) -> OAuthCredentialStatus {
+        if self.revoked_at.is_some() {
+            OAuthCredentialStatus::Revoked
+        } else if self.broken_at.is_some() {
+            OAuthCredentialStatus::Broken
+        } else if self.expires_at.is_some_and(|at| at <= now) {
+            OAuthCredentialStatus::Expired
+        } else {
+            OAuthCredentialStatus::Connected
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthCredentialStatus {
+    Connected,
+    Expired,
+    Broken,
+    Revoked,
+}
+
+impl OAuthCredentialStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Expired => "expired",
+            Self::Broken => "broken",
+            Self::Revoked => "revoked",
+        }
+    }
 }
 
 /// Envelope supplied to a CAS write. The store owns version/timestamps.
+/// A successful write always clears broken/claim state: publishing a
+/// validated bundle IS the repair.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewSealedOAuthCredential {
     pub key: OAuthCredentialKey,
@@ -91,6 +137,8 @@ pub struct NewSealedOAuthCredential {
     pub ciphertext: Vec<u8>,
     pub key_id: String,
     pub metadata: OAuthAccountMetadata,
+    /// Access-token expiry of the sealed bundle, if the provider expires it.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
