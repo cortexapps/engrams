@@ -2041,6 +2041,14 @@ impl ChunkedDiskBackend {
         (arrived, proceed)
     }
 
+    /// Disarm any armed flush seam without firing it. For the driver's
+    /// fault paths: a flush killed BEFORE its armed point never consumes
+    /// the seam, and a leaked armed seam parks the NEXT flush forever
+    /// (its `proceed` holder is gone).
+    pub fn disarm_flush_seam(&self) {
+        *self.scheduler_seam.lock().unwrap() = None;
+    }
+
     /// Fire the seam if one is armed at `point` — park until `proceed`.
     /// A seam armed at a DIFFERENT point stays armed untouched.
     async fn fire_flush_seam(&self, point: FlushSeamPoint) {
@@ -2144,8 +2152,13 @@ impl ChunkedDiskBackend {
     /// staging dir and uploads after VM destroy. Heap cost is the
     /// frozen set's size, same as the pre-addendum pause copies on
     /// this path only; ladder step 3's budget bounds it next.
-    #[cfg(target_os = "linux")]
-    pub(crate) async fn export_pending_chunks(
+    ///
+    /// `pub` and cross-platform (not just the Linux pooled-backend
+    /// caller): `engram-dst-host`'s capture step drives the REAL
+    /// `flush_local` → `export_pending_chunks` chain — the same
+    /// primitives as prod's coherence cut, so a cut that drops acked
+    /// bytes is visible to the swarm's oracles.
+    pub async fn export_pending_chunks(
         &self,
         pending: &PendingDiskFlush,
     ) -> Result<Vec<(usize, ChunkHash, Bytes)>, DiskBackendError> {

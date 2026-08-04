@@ -378,6 +378,27 @@ pub struct SimHost {
     /// touch a `SandboxSlot`.
     pub reconcile: Arc<SimReconcileBackend>,
     pub ledger: AckedWriteLedger,
+    /// #1003 2b: the capture cut's durability claim, keyed by slot. At
+    /// `snapshot_begin` (the drain instant) the guest-visible
+    /// un-uploaded content — the overlay union, per chunk — is claimed
+    /// by the capture: the VM is destroyed on the snapshot's strength,
+    /// so a finalize that COMPLETES with a published disk manifest is a
+    /// durable handoff of exactly this set and promotes it into the
+    /// ledger's published floor. Without the claim, a capture that
+    /// silently drops surviving acked bytes (the #1009 review's
+    /// CRITICAL) publishes only what it kept, the floor rises only that
+    /// far, and the oracle tolerates the loss as if it were an
+    /// abrupt-death bounded loss. Dropped on quarantine and on a
+    /// poisoned (manifest-less) completion — those paths never claim
+    /// durability for the drain.
+    capture_cut_acks: std::collections::BTreeMap<usize, Vec<(u64, u64)>>,
+    /// #1003 ladder 2b (from the #1009 review): scripted PUT-fault arm
+    /// for the blob tier. While set, every chunk put errors — the
+    /// upload leg of a flush fails deterministically, retaining the
+    /// frozen overlay. Composed with GuestWrite + SnapshotBegin this
+    /// reaches the capture-with-pending-frozen interleaving whose
+    /// acked-write loss the swarm was blind to.
+    pub put_faults: Arc<std::sync::atomic::AtomicBool>,
     /// Monotonic content-tag source. Advances only on writes, so the id a
     /// given step mints is a pure function of the step sequence (seed).
     next_tag: u64,
@@ -443,6 +464,49 @@ pub struct SimHost {
     pub quarantined_unknown: std::collections::BTreeSet<SandboxId>,
 }
 
+/// #1003 2b: await an armed flush seam, tolerating a flush that dies
+/// BEFORE reaching it (an armed PUT fault kills the upload leg under
+/// post-upload seams — `arrived` would never fire and the step would
+/// hang). `Ok(Some(handle))` = parked at the seam as arranged;
+/// `Ok(None)` = the flush failed first with the scripted fault (a
+/// legitimate modeled outage — frozen generations retained); any other
+/// completion is a wiring error.
+async fn seam_or_fault(
+    arrived: &tokio::sync::Notify,
+    flush: tokio::task::JoinHandle<
+        Result<
+            engram_host_agent::disk_daemon::DiskFlushOutcome,
+            engram_host_agent::disk_daemon::DiskBackendError,
+        >,
+    >,
+) -> Result<
+    Option<
+        std::pin::Pin<
+            Box<
+                tokio::task::JoinHandle<
+                    Result<
+                        engram_host_agent::disk_daemon::DiskFlushOutcome,
+                        engram_host_agent::disk_daemon::DiskBackendError,
+                    >,
+                >,
+            >,
+        >,
+    >,
+    String,
+> {
+    let mut flush = Box::pin(flush);
+    tokio::select! {
+        biased;
+        _ = arrived.notified() => Ok(Some(flush)),
+        res = &mut flush => match res {
+            Ok(Err(e)) if e.to_string().contains("scripted chunk put fault") => Ok(None),
+            Ok(Err(e)) => Err(format!("flush failed pre-seam: {e}")),
+            Ok(Ok(_)) => Err("flush completed without reaching the armed seam".into()),
+            Err(join) => Err(format!("flush task died: {join}")),
+        },
+    }
+}
+
 impl SimHost {
     /// Build a host with `num_sandboxes` sandboxes, each on its own private
     /// base manifest (so flushes version a private lineage — no shared-base
@@ -452,8 +516,11 @@ impl SimHost {
         let clock = SimClock::new();
         let entropy = Arc::new(SimEntropy::seeded(seed));
         let fs = SimFs::new().expect("sim tempdir");
-        let blob: Arc<dyn BlobStorage> =
-            Arc::new(LocalBlobStorage::new(fs.chunks_dir().to_path_buf()));
+        let put_faults = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let blob: Arc<dyn BlobStorage> = Arc::new(FaultablePutStorage {
+            inner: LocalBlobStorage::new(fs.chunks_dir().to_path_buf()),
+            armed: put_faults.clone(),
+        });
         let store = Arc::new(ChunkStore::new(blob));
         let coord = Arc::new(SimCoordClient::new());
         let reconcile = Arc::new(SimReconcileBackend::new());
@@ -534,6 +601,8 @@ impl SimHost {
             sandboxes,
             reconcile,
             ledger: AckedWriteLedger::default(),
+            capture_cut_acks: std::collections::BTreeMap::new(),
+            put_faults,
             next_tag: 0,
             generation,
             nbd_pool,
@@ -717,11 +786,14 @@ impl SimHost {
         let Some(backend) = self.sandboxes[idx].backend.clone() else {
             return Ok(());
         };
-        backend
-            .flush()
-            .await
-            .map_err(|e| format!("flush sandbox {idx}: {e}"))?;
-        self.note_flush_published(idx).await
+        match backend.flush().await {
+            Ok(_) => self.note_flush_published(idx).await,
+            // The scripted PUT fault: the modeled outage — dirty retained
+            // in frozen generations, nothing published, retried once the
+            // fault window closes.
+            Err(e) if e.to_string().contains("scripted chunk put fault") => Ok(()),
+            Err(e) => Err(format!("flush sandbox {idx}: {e}")),
+        }
     }
 
     /// The post-flush bookkeeping every flush-shaped step shares: adopt the
@@ -1485,10 +1557,18 @@ impl SimHost {
                 .await
                 .map_err(|e| format!("sigterm device sync sandbox {idx}: {e}"))?;
             if !overrun {
-                let outcome = backend
-                    .flush()
-                    .await
-                    .map_err(|e| format!("sigterm flush sandbox {idx}: {e}"))?;
+                let outcome = match backend.flush().await {
+                    Ok(o) => Some(o),
+                    // The scripted PUT fault killed the final flush: the
+                    // ladder continues exactly like the overrun arm — the
+                    // spool export below carries the still-dirty tier.
+                    Err(e) if e.to_string().contains("scripted chunk put fault") => None,
+                    Err(e) => return Err(format!("sigterm flush sandbox {idx}: {e}")),
+                };
+                let Some(outcome) = outcome else {
+                    self.spool_export(idx).await?;
+                    continue;
+                };
                 let action =
                     engram_host_core::classify_survivor(engram_host_core::FlushProbe::Flushed {
                         chunks_flushed: outcome.chunks_flushed,
@@ -1587,7 +1667,19 @@ impl SimHost {
         let (arrived, proceed) = backend.arm_flush_seam(point);
         let flush_backend = backend.clone();
         let flush = tokio::spawn(async move { flush_backend.flush().await });
-        arrived.notified().await;
+        let Some(flush) = seam_or_fault(&arrived, flush).await? else {
+            backend.disarm_flush_seam();
+            // The scripted PUT fault killed the flush before the seam:
+            // the SIGTERM still happened. Complete the ladder exactly
+            // like the overrun arm — every survivor spools (the dirty
+            // tier rides the complete spool) and RAM dies; the parked
+            // interleaving simply did not occur this draw.
+            for i in 0..self.sandboxes.len() {
+                self.spool_export(i).await?;
+            }
+            self.die_abruptly();
+            return Ok(());
+        };
         // The guest keeps writing during the shutdown window. Only at
         // PostUploadPrePublish: the parked task holds no backend locks
         // there (DirtyPendingHandoff holds dirty+pending, PreRebase holds
@@ -1753,13 +1845,38 @@ impl SimHost {
         tokio::fs::write(dest.join("manifest.json"), b"{}")
             .await
             .map_err(|e| format!("snapshot_begin manifest.json: {e}"))?;
-        // The capture disk drain: the un-uploaded tier moves from RAM to the
-        // node-durable disk-pending staging files via the REAL writer.
-        let (base_manifest, chunks) = backend.export_unflushed().await;
-        let disk_chunks: Vec<(usize, ChunkHash, bytes::Bytes)> = chunks
+        // The capture disk drain — EXACTLY prod's coherence cut (the
+        // pooled-backend eviction leg): ONE `flush_local` under the
+        // pause, then `export_pending_chunks` reads the pending set
+        // from the frozen overlay into the node-durable disk-pending
+        // staging files via the REAL writer. #1003 2b: modeling this
+        // drain with the spool primitive (`export_unflushed`'s
+        // omniscient overlay union) kept the swarm blind to the #1009
+        // CRITICAL — the union stayed correct even while the real
+        // cut's pending set dropped the active overlay.
+        backend.wait_idle().await;
+        // The cut's durability claim, read from the OVERLAY UNION (the
+        // guest-visible un-uploaded content) at this paused instant.
+        // Not from the omniscient ledger — a write acked and then
+        // legitimately lost to an earlier abrupt crash must not be
+        // claimed. And not from the drain's own pending set — a cut
+        // that DROPS surviving bytes (the #1009 CRITICAL) must
+        // under-publish the claim, not shrink it.
+        let (_, cut_chunks) = backend.export_unflushed().await;
+        let cut: Vec<(u64, u64)> = cut_chunks
             .iter()
-            .map(|(i, b)| (*i, ChunkHash::of(b), bytes::Bytes::from(b.clone())))
+            .map(|(chunk_idx, bytes)| (*chunk_idx as u64, decode_tag(bytes)))
             .collect();
+        let pending = backend
+            .flush_local()
+            .await
+            .map_err(|e| format!("snapshot_begin capture drain sandbox {idx}: {e}"))?;
+        let base_manifest = backend.manifest_ref().await;
+        let disk_chunks: Vec<(usize, ChunkHash, bytes::Bytes)> = backend
+            .export_pending_chunks(&pending)
+            .await
+            .map_err(|e| format!("snapshot_begin export sandbox {idx}: {e}"))?;
+        drop(pending);
         persist_disk_pending_chunks(&dest, &disk_chunks)
             .await
             .map_err(|e| format!("persist_disk_pending_chunks: {e}"))?;
@@ -1797,6 +1914,7 @@ impl SimHost {
         // The VM is paused for the whole finalize (and destroyed at its
         // terminal); the guest can no longer reach the data plane.
         self.sandboxes[idx].backend = None;
+        self.capture_cut_acks.insert(idx, cut);
         Ok(CaptureOutcome::Began(snapshot_id))
     }
 
@@ -1966,11 +2084,27 @@ impl SimHost {
                         .await?;
                     self.sandboxes[idx].published_ref = Some(published);
                     self.mark_flush_published(idx, published).await?;
+                    // The capture cut's durability claim comes due: the VM
+                    // is destroyed on this publish, so every write acked
+                    // before the cut is now floor-durable. A capture that
+                    // dropped acked bytes (the #1009 review's CRITICAL)
+                    // published less than the claim — the next read of the
+                    // lost chunk lands below the floor and oracle #1 fires.
+                    if let Some(cut) = self.capture_cut_acks.remove(&idx) {
+                        for (chunk_idx, tag) in cut {
+                            self.ledger.mark_published(idx, chunk_idx, tag);
+                        }
+                    }
+                } else {
+                    // A manifest-less (poisoned) completion never claimed
+                    // durability for the drain.
+                    self.capture_cut_acks.remove(&idx);
                 }
             }
             FinalizeAttempt::Quarantined => {
                 // The honest floor stays at the prior published tier; the
                 // staging inputs are freed and nothing re-drives the record.
+                self.capture_cut_acks.remove(&idx);
             }
             FinalizeAttempt::RetryAfter(_backoff) => {
                 self.in_flight.insert(idx, record);
@@ -2074,10 +2208,19 @@ impl SimHost {
         )
         .await
         .map_err(|e| format!("spool_crash_at baseline spool: {e}"))?;
-        backend
-            .flush()
-            .await
-            .map_err(|e| format!("spool_crash_at flush: {e}"))?;
+        match backend.flush().await {
+            Ok(_) => {}
+            // The scripted PUT fault killed the flush-publish: the P4
+            // redundant-durability shape is unreachable this draw. The
+            // process still dies with the standing COMPLETE spool (the
+            // only copy of the acked writes — a legitimate crash shape
+            // the adopt leg recovers); the cut re-write is skipped.
+            Err(e) if e.to_string().contains("scripted chunk put fault") => {
+                self.die_abruptly();
+                return Ok(());
+            }
+            Err(e) => return Err(format!("spool_crash_at flush: {e}")),
+        }
         let published = backend.manifest_ref().await;
         self.sandboxes[0].published_ref = Some(published);
         self.mark_flush_published(0, published).await?;
@@ -2132,7 +2275,13 @@ impl SimHost {
         let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::DirtyPendingHandoff);
         let flush_backend = backend.clone();
         let flush = tokio::spawn(async move { flush_backend.flush().await });
-        arrived.notified().await;
+        let Some(flush) = seam_or_fault(&arrived, flush).await? else {
+            backend.disarm_flush_seam();
+            // The scripted PUT fault killed the flush before the seam:
+            // the interleaving this step exercises did not occur this
+            // draw. Frozen generations are retained; benign no-op.
+            return Ok(());
+        };
 
         // The racing pair. The write's tag is minted BEFORE the spawn so
         // the id stream stays a pure function of the step sequence; its
@@ -2148,10 +2297,7 @@ impl SimHost {
         tokio::task::yield_now().await;
         proceed.notify_one();
 
-        let flush_outcome = flush
-            .await
-            .map_err(|e| format!("flush task join: {e}"))?
-            .map_err(|e| format!("handoff-race flush sandbox {idx}: {e}"))?;
+        let flush_outcome = flush.await.map_err(|e| format!("flush task join: {e}"))?;
         let read_bytes = read
             .await
             .map_err(|e| format!("read task join: {e}"))?
@@ -2160,8 +2306,10 @@ impl SimHost {
             .await
             .map_err(|e| format!("write task join: {e}"))?
             .map_err(|e| format!("handoff-race write sandbox {idx}: {e}"))?;
-        let _ = flush_outcome;
-        // The racing write is now acked.
+        // The racing write is now acked — recorded BEFORE the flush outcome
+        // is inspected, because the write landed in the world regardless of
+        // how the flush ends (a scripted PUT fault killing the upload leg
+        // must not un-record a landed ack — the never-acked-tag class).
         let lineage = backend.manifest_ref().await;
         self.ledger.record(LedgerEntry {
             sandbox: idx,
@@ -2169,6 +2317,14 @@ impl SimHost {
             content_tag: racing_tag,
             lineage_at_ack: lineage,
         });
+        let published = match flush_outcome {
+            Ok(_) => true,
+            // The scripted PUT fault killed the upload leg after the
+            // handoff: the modeled outage — frozen generations retained,
+            // nothing published, the racing pair still completed.
+            Err(e) if e.to_string().contains("scripted chunk put fault") => false,
+            Err(e) => return Err(format!("handoff-race flush sandbox {idx}: {e}")),
+        };
         // The racing read observed either the drained content or the
         // racing write — NEVER anything older (the #204 stale-base gap).
         let got = decode_tag(&read_bytes);
@@ -2177,7 +2333,10 @@ impl SimHost {
                 "flush handoff race: read tag {got}, expected the drained                  {drained_tag} or the racing {racing_tag} — the #204                  tier-less stale-base gap"
             ));
         }
-        self.note_flush_published(idx).await
+        if published {
+            self.note_flush_published(idx).await?;
+        }
+        Ok(())
     }
 
     /// #199's fence leg as a seeded interleaving: park a REAL `flush()`
@@ -2205,7 +2364,13 @@ impl SimHost {
         let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::PostUploadPrePublish);
         let flush_backend = backend.clone();
         let flush = tokio::spawn(async move { flush_backend.flush().await });
-        arrived.notified().await;
+        let Some(flush) = seam_or_fault(&arrived, flush).await? else {
+            backend.disarm_flush_seam();
+            // The scripted PUT fault killed the flush before the seam:
+            // the interleaving this step exercises did not occur this
+            // draw. Frozen generations are retained; benign no-op.
+            return Ok(());
+        };
         // The #199 hazard: the fence rises while the flush is mid-pipeline.
         backend.set_migration_fence(true);
         proceed.notify_one();
@@ -2260,7 +2425,14 @@ impl SimHost {
         let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::PreRebase);
         let flush_backend = backend.clone();
         let flush = tokio::spawn(async move { flush_backend.flush().await });
-        arrived.notified().await;
+        let Some(flush) = seam_or_fault(&arrived, flush).await? else {
+            backend.disarm_flush_seam();
+            // The scripted PUT fault killed the flush before the seam:
+            // the crash this step models still happens — the process
+            // dies with the failed flush's frozen generations retained.
+            self.die_abruptly();
+            return Ok(());
+        };
         // The crash: the parked flush dies mid-instant. Abort is
         // deterministic here — the task is parked at the seam's Notify on
         // a single-threaded runtime, so it never resumes past the park.
@@ -2480,5 +2652,55 @@ fn base_manifest(base_hash: ChunkHash) -> Manifest {
         parent: None,
         working_set_trace: None,
         annotations: Default::default(),
+    }
+}
+
+/// #1003 ladder 2b: the blob tier with a scripted PUT fault arm.
+/// While `armed`, chunk puts fail with a deterministic error (the
+/// GCS-outage stand-in); manifests and reads pass through untouched,
+/// mirroring the real outage shape that retains frozen overlays.
+struct FaultablePutStorage {
+    inner: LocalBlobStorage,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl BlobStorage for FaultablePutStorage {
+    async fn put_streaming(
+        &self,
+        key: &str,
+        body: engram_core::traits::ByteStream,
+    ) -> Result<u64, engram_core::error::BlobError> {
+        if key.starts_with("chunks/") && self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(engram_core::error::BlobError::Protocol(
+                "dst: scripted chunk put fault".into(),
+            ));
+        }
+        self.inner.put_streaming(key, body).await
+    }
+
+    async fn get_streaming(
+        &self,
+        key: &str,
+    ) -> Result<engram_core::traits::ByteStream, engram_core::error::BlobError> {
+        self.inner.get_streaming(key).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<engram_core::traits::BlobObjectMeta, engram_core::error::BlobError> {
+        self.inner.head(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), engram_core::error::BlobError> {
+        self.inner.delete(key).await
+    }
+
+    async fn list_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<String>, engram_core::error::BlobError> {
+        self.inner.list_prefix(prefix).await
     }
 }
