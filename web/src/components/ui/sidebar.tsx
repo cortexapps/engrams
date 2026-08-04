@@ -25,6 +25,12 @@ const SIDEBAR_WIDTH_MOBILE = "18rem";
 const SIDEBAR_WIDTH_ICON = "3rem";
 const SIDEBAR_KEYBOARD_SHORTCUT = "b";
 
+// Drag-to-resize bounds for a user-widened rail. The floor keeps a task row
+// readable; the ceiling keeps the content column dominant.
+const SIDEBAR_WIDTH_MIN = 200;
+const SIDEBAR_WIDTH_MAX = 560;
+const SIDEBAR_WIDTH_STEP = 16;
+
 type SidebarContextProps = {
   state: "expanded" | "collapsed";
   open: boolean;
@@ -148,6 +154,188 @@ function SidebarProvider({
   );
 }
 
+function readStoredWidth(storageKey: string, min: number, max: number): number | null {
+  try {
+    const stored = Number(localStorage.getItem(storageKey));
+    // A missing or garbled value reads as 0/NaN — keep the rem default.
+    return Number.isFinite(stored) && stored > 0
+      ? Math.round(Math.min(max, Math.max(min, stored)))
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The grab strip on a rail's trailing edge, for a `Sidebar` inside its own
+ * `SidebarProvider`. Mount it as the last child of that `Sidebar`; it finds both
+ * the rail (its parent, for the drag origin) and the provider wrapper that
+ * carries `--sidebar-width` from its own position in the tree.
+ *
+ * A rail's width is a personal, per-browser layout preference (like the theme
+ * and the Enter-to-send toggle), so it lives in localStorage, not on the server.
+ * Because the var is written on the OWN provider's wrapper, widening one section
+ * rail leaves the app nav and the sibling rails alone.
+ *
+ * Keyboard: ←/→ nudge, Shift for a coarse step, Home resets — double-click
+ * resets too.
+ *
+ * The whole width lives in this leaf, and a drag writes the CSS var straight to
+ * the DOM. React state holds only the COMMITTED width (for the drag origin,
+ * `aria-valuenow`, and persistence), so a pointermove costs one style write
+ * instead of re-rendering the section layout — which renders the rail list AND
+ * the route `Outlet`, i.e. the whole transcript.
+ */
+function SidebarResizeHandle({
+  storageKey,
+  label = "Resize sidebar",
+  min = SIDEBAR_WIDTH_MIN,
+  max = SIDEBAR_WIDTH_MAX,
+  className,
+}: {
+  storageKey: string;
+  label?: string;
+  min?: number;
+  max?: number;
+  className?: string;
+}) {
+  const ref = React.useRef<HTMLDivElement>(null);
+  const drag = React.useRef<{ startX: number; startWidth: number } | null>(null);
+  const [dragging, setDragging] = React.useState(false);
+  const [width, setWidth] = React.useState<number | null>(() =>
+    readStoredWidth(storageKey, min, max),
+  );
+  // Drag end persists the width the last pointermove produced, which is newer
+  // than the `width` this render closed over.
+  const latest = React.useRef(width);
+
+  // Writing the var on the provider wrapper (not on the rail) keeps ONE
+  // authority for the width and matches where the primitive declares it.
+  const apply = (px: number | null) => {
+    const wrapper = ref.current?.closest<HTMLElement>('[data-slot="sidebar-wrapper"]');
+    // A reset writes the primitive's default back rather than removing the
+    // property: the provider set it inline, so removing it would leave the rail
+    // with no width at all.
+    wrapper?.style.setProperty("--sidebar-width", px === null ? SIDEBAR_WIDTH : `${px}px`);
+  };
+
+  // Applies the restored width before the first paint, and re-applies after a
+  // commit (idempotent — the drag already wrote that value).
+  React.useLayoutEffect(() => {
+    apply(width);
+  }, [width]);
+
+  const persist = (px: number | null) => {
+    try {
+      if (px === null) localStorage.removeItem(storageKey);
+      else localStorage.setItem(storageKey, String(px));
+    } catch {
+      /* private-mode / quota — keep the in-memory width */
+    }
+  };
+
+  // Live, per-frame: DOM only, no render.
+  const resizeTo = (px: number) => {
+    const next = Math.round(Math.min(max, Math.max(min, px)));
+    latest.current = next;
+    apply(next);
+  };
+
+  const commit = () => {
+    setWidth(latest.current);
+    persist(latest.current);
+  };
+
+  const reset = () => {
+    latest.current = null;
+    setWidth(null);
+    persist(null);
+    // `setWidth(null)` is a no-op when the width is already null, so the layout
+    // effect would not fire; write the default back here too.
+    apply(null);
+  };
+
+  // Before the first drag there is no stored px width, so read the rail's own
+  // rendered width as the origin. A zero measurement means it is not laid out —
+  // never a valid origin, so fall back to the floor.
+  const baseWidth = () => {
+    if (latest.current !== null) return latest.current;
+    const measured = ref.current?.parentElement?.getBoundingClientRect().width ?? 0;
+    return measured > 0 ? Math.round(measured) : min;
+  };
+
+  // The pointer spends the whole drag off this 8px strip, so the resize cursor
+  // and the selection mute have to be document-wide until it is released.
+  const setDragCursor = (on: boolean) => {
+    document.body.style.cursor = on ? "col-resize" : "";
+    document.body.style.userSelect = on ? "none" : "";
+  };
+  React.useEffect(() => () => setDragCursor(false), []);
+
+  const endDrag = () => {
+    if (!drag.current) return;
+    drag.current = null;
+    setDragging(false);
+    setDragCursor(false);
+    commit();
+  };
+
+  return (
+    <div
+      ref={ref}
+      data-slot="sidebar-resize-handle"
+      data-dragging={dragging ? "true" : undefined}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={label}
+      aria-valuenow={width ?? undefined}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      tabIndex={0}
+      // Straddles the rail's border so the hairline itself is the grab target;
+      // the ::after line lifts to the accent on hover/focus/drag, the same
+      // "accent marks the live thing" grammar as ResizableHandle.
+      className={cn(
+        "absolute inset-y-0 -right-1 z-20 hidden w-2 cursor-col-resize touch-none select-none md:block",
+        "after:absolute after:inset-y-0 after:left-1/2 after:w-px after:-translate-x-1/2 after:transition-colors",
+        "hover:after:bg-sidebar-ring focus-visible:outline-none focus-visible:after:bg-sidebar-ring",
+        "data-[dragging=true]:after:bg-sidebar-ring",
+        className,
+      )}
+      onPointerDown={(event) => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        drag.current = { startX: event.clientX, startWidth: baseWidth() };
+        event.currentTarget.setPointerCapture(event.pointerId);
+        setDragging(true);
+        setDragCursor(true);
+      }}
+      onPointerMove={(event) => {
+        if (!drag.current) return;
+        resizeTo(drag.current.startWidth + (event.clientX - drag.current.startX));
+      }}
+      // Capture is released implicitly on up/cancel; lostpointercapture is the
+      // backstop for a pointer that disappears mid-drag.
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onLostPointerCapture={endDrag}
+      onDoubleClick={reset}
+      onKeyDown={(event) => {
+        const step = event.shiftKey ? SIDEBAR_WIDTH_STEP * 4 : SIDEBAR_WIDTH_STEP;
+        if (event.key === "ArrowLeft") resizeTo(baseWidth() - step);
+        else if (event.key === "ArrowRight") resizeTo(baseWidth() + step);
+        else if (event.key === "Home") {
+          reset();
+          event.preventDefault();
+          return;
+        } else return;
+        event.preventDefault();
+        commit();
+      }}
+    />
+  );
+}
+
 function Sidebar({
   side = "left",
   variant = "sidebar",
@@ -167,7 +355,8 @@ function Sidebar({
       <div
         data-slot="sidebar"
         className={cn(
-          "flex h-full w-(--sidebar-width) flex-col bg-sidebar text-sidebar-foreground",
+          // `relative` anchors an optional SidebarResizeHandle to this edge.
+          "relative flex h-full w-(--sidebar-width) flex-col bg-sidebar text-sidebar-foreground",
           className,
         )}
         {...props}
@@ -696,6 +885,7 @@ export {
   SidebarMenuSubItem,
   SidebarProvider,
   SidebarRail,
+  SidebarResizeHandle,
   SidebarSeparator,
   SidebarTrigger,
   useSidebar,

@@ -1,7 +1,7 @@
 import { Layers, ListChecks, SquarePlus } from "lucide-react";
 import { Link, Outlet, useRouterState, type LinkProps } from "@tanstack/react-router";
 import { useIsAdmin } from "../../auth/AuthProvider";
-import { Sidebar, SidebarProvider } from "@/components/ui/sidebar";
+import { Sidebar, SidebarProvider, SidebarResizeHandle } from "@/components/ui/sidebar";
 import type { NavItem } from "@/components/nav";
 import { SessionsRail } from "./SessionsRail";
 import { cn } from "@/lib/utils";
@@ -12,6 +12,10 @@ import { cn } from "@/lib/utils";
 // moves the rail's highlight instead of swapping the whole layout. The outlet
 // is layout-neutral: each child owns its padding/scroll (the list pages pad +
 // scroll; the detail page fills the height with its own panes).
+// A long task title needs more room than a nav rail does, so the rail is
+// drag-resizable and remembers the width per browser.
+const RAIL_WIDTH_STORAGE_KEY = "engrams.sessionsRailWidth";
+
 export function SessionsLayout() {
   const isAdmin = useIsAdmin();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
@@ -54,9 +58,13 @@ export function SessionsLayout() {
       {/* desktop (md+): the persistent sessions rail */}
       <Sidebar
         collapsible="none"
-        className="sidebar-section hidden border-r border-sidebar-border md:flex"
+        className="sidebar-section hidden shrink-0 border-r border-sidebar-border md:flex"
       >
         <SessionsRail />
+        {/* Owns the whole width preference itself: a drag writes the CSS var to
+            the DOM, so it never re-renders this layout — which renders the rail
+            list AND the route Outlet (the transcript). */}
+        <SidebarResizeHandle storageKey={RAIL_WIDTH_STORAGE_KEY} label="Resize task list" />
       </Sidebar>
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         {/* mobile (<md): horizontal scope strip — the rail is desktop-only, and
