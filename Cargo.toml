@@ -185,6 +185,12 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-r
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
+# #1003: jemalloc for the host-agent — mid-size buffer churn through
+# musl mallocng retains ~48 MiB groups; jemalloc adds predictable decay
+# AND the sampling heap profiler that names allocation sites in prod.
+tikv-jemallocator = { version = "0.6", features = ["profiling", "stats"] }
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+jemalloc_pprof = { version = "0.8", features = ["symbolize"] }
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 # OpenTelemetry distributed tracing (ADR 0019). Opt-in at runtime via
 # OTEL_EXPORTER_OTLP_ENDPOINT; deps are compiled in but inert when unset.

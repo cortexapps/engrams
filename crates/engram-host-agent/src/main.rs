@@ -2,6 +2,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+
+// #1003: jemalloc as the global allocator on Linux (prod is
+// musl-static, and musl mallocng retained 23 GB of ~48 MiB groups
+// under chunk-buffer churn). The exported `_rjem_malloc_conf` bakes
+// the profiler defaults in: sampled at ~512 KiB (`lg_prof_sample:19`,
+// negligible overhead), active from boot. Override at deploy with the
+// `_RJEM_MALLOC_CONF` env if a roll ever needs it off.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(target_os = "linux")]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 use engram_cloud_static::StaticCloud;
 use engram_core::traits::SandboxBackend;
 use engram_host_agent::{HostAgent, HostAgentConfig, HostAgentError};
@@ -250,6 +265,12 @@ async fn main() -> Result<(), HostAgentError> {
     // (k8s ServiceMonitor scrapes it); binding early means metrics are
     // available as soon as the process is up.
     engram_host_agent::metrics::init(cli.metrics_addr);
+
+    // #1003: SIGUSR2 → symbolized pprof heap dump; allocator stats as
+    // Prometheus gauges every 30 s. Dumps land in the work_dir (the
+    // node volume — survives the OOM kill the dump is usually for).
+    #[cfg(target_os = "linux")]
+    engram_host_agent::heap_profile::spawn(cli.work_dir.clone());
 
     // ADR 0013: resolve the gRPC listen + advertise addrs.
     //
