@@ -364,6 +364,11 @@ struct DirtyFileTier {
     /// Monotonic freeze sequence (recovery resumes past the highest
     /// on-disk suffix).
     frozen_seq: u64,
+    /// Set when a freeze double-fault left no active file (review
+    /// finding, #1009): the tier refuses writes and freezes so acked
+    /// bytes can never land in (or corrupt) an orphaned inode; a
+    /// process restart recovers via `open(Recover)`.
+    poisoned: bool,
     fsync_on_write: bool,
     /// Temporary constructor files are removed if attach fails.
     remove_on_drop: bool,
@@ -426,6 +431,7 @@ impl DirtyFileTier {
             },
             frozen: Vec::new(),
             frozen_seq: 0,
+            poisoned: false,
             fsync_on_write: std::env::var("ENGRAM_DIRTY_FSYNC").as_deref() == Ok("1"),
             remove_on_drop: mode == DirtyFileOpenMode::Truncate,
         };
@@ -510,6 +516,11 @@ impl DirtyFileTier {
     /// tier never points at a nonexistent active file (review
     /// finding, #1009).
     fn freeze(&mut self, total_bytes: u64) -> Result<(), DiskBackendError> {
+        if self.poisoned {
+            return Err(DiskBackendError::InvariantViolation(
+                "dirty tier poisoned by a freeze double-fault; restart recovers".into(),
+            ));
+        }
         let seq = self.frozen_seq + 1;
         let frozen_path = frozen_generation_path(&self.active.path, seq);
         std::fs::rename(&self.active.path, &frozen_path)
@@ -528,14 +539,42 @@ impl DirtyFileTier {
                 // Roll the rename back; the flush fails cleanly and
                 // every byte is where it was.
                 if let Err(undo) = std::fs::rename(&frozen_path, &active_path) {
-                    // Rename-back failing too (the disk is very sick):
-                    // leave the frozen file for recovery — the missing-
-                    // active arm of `open(Recover)` adopts it.
+                    // Double fault (disk very sick). Review finding
+                    // (#1009, MEDIUM): do NOT leave the in-memory tier
+                    // pointing at the vanished active path — the stale
+                    // fd aliases the inode now living at the FROZEN
+                    // path, so a later guest write through it would
+                    // corrupt the immutable generation. Adopt disk
+                    // truth: track the renamed file as a frozen
+                    // generation and POISON the tier — writes and
+                    // freezes fail loudly (never acked into an
+                    // orphan), and a process restart recovers via the
+                    // missing-active arm of `open(Recover)`.
                     tracing::error!(
                         path = %frozen_path.display(),
                         error = %undo,
-                        "freeze rollback rename failed; frozen generation left for recovery",
+                        "freeze rollback rename failed; adopting the generation and \
+                         poisoning the tier (restart recovers)",
                     );
+                    self.frozen_seq = seq;
+                    let moved_set = std::mem::take(&mut self.active.set);
+                    // A dup handle for the frozen entry; the original
+                    // fd stays with `active` but is never written
+                    // again (poisoned).
+                    if let Ok(dup) = self.active.file.try_clone() {
+                        self.frozen.push(OverlayFile {
+                            file: dup,
+                            path: frozen_path,
+                            set: moved_set,
+                        });
+                        ::metrics::gauge!(FROZEN_PENDING_GAUGE).increment(1.0);
+                    }
+                    self.poisoned = true;
+                    return Err(dirty_file_error(
+                        "create fresh active (tier poisoned)",
+                        &active_path,
+                        source,
+                    ));
                 }
                 return Err(dirty_file_error(
                     "create fresh active",
@@ -633,6 +672,11 @@ impl DirtyFileTier {
     }
 
     fn write_chunk(&self, chunk_idx: usize, bytes: &[u8], chunk_size: u64) -> std::io::Result<()> {
+        if self.poisoned {
+            return Err(std::io::Error::other(
+                "dirty tier poisoned by a freeze double-fault; restart recovers",
+            ));
+        }
         write_all_at(&self.active.file, bytes, chunk_idx as u64 * chunk_size)
     }
 
@@ -800,6 +844,14 @@ const FROZEN_PENDING_GAUGE: &str = "engram_disk_flush_frozen_pending";
 
 impl Drop for DirtyFileTier {
     fn drop(&mut self) {
+        // Review finding (#1009, LOW): generations discarded WITHOUT
+        // publishing (eviction capture, migration export, teardown)
+        // must release their gauge increments, or the pending count
+        // ratchets up over a host's lifetime and the stuck-upload
+        // alert it feeds reads permanently nonzero.
+        if !self.frozen.is_empty() {
+            ::metrics::gauge!(FROZEN_PENDING_GAUGE).decrement(self.frozen.len() as f64);
+        }
         if self.remove_on_drop {
             let _ = std::fs::remove_file(&self.active.path);
             let _ = std::fs::remove_file(ref_sidecar_path(&self.active.path));
