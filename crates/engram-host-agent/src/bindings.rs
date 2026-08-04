@@ -228,11 +228,20 @@ impl BindingStore {
             policy.session_id,
             std::process::id(),
         ));
-        std::fs::write(&tmp, serde_json::to_vec(policy)?)?;
-        #[cfg(unix)]
+        // The temp file is BORN 0600 (review finding on #992): creating
+        // at the umask and tightening afterward leaves a window where
+        // the resolved secrets are group/world-readable.
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            use std::io::Write as _;
+            let mut open = std::fs::OpenOptions::new();
+            open.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                open.mode(0o600);
+            }
+            let mut f = open.open(&tmp)?;
+            f.write_all(&serde_json::to_vec(policy)?)?;
         }
         std::fs::rename(&tmp, &final_path)?;
         Ok(())
