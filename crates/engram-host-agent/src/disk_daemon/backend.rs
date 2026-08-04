@@ -1353,7 +1353,7 @@ impl ChunkedDiskBackend {
     #[cfg(target_os = "linux")]
     pub(crate) async fn relocate_dirty_file(&self, target: &Path) -> Result<(), DiskBackendError> {
         let mut tier = self.dirty_tier.lock().await;
-        if tier.path == target {
+        if tier.active.path == target {
             tier.remove_on_drop = false;
             return Ok(());
         }
@@ -1374,7 +1374,7 @@ impl ChunkedDiskBackend {
                 ),
             ));
         }
-        let source_sidecar = ref_sidecar_path(&tier.path);
+        let source_sidecar = ref_sidecar_path(&tier.active.path);
         let target_sidecar = ref_sidecar_path(target);
         match std::fs::rename(&source_sidecar, &target_sidecar) {
             Ok(()) => {}
@@ -1386,9 +1386,17 @@ impl ChunkedDiskBackend {
                 "could not move the dirty-file ref sidecar",
             ),
         }
-        std::fs::rename(&tier.path, target)
+        std::fs::rename(&tier.active.path, target)
             .map_err(|source| dirty_file_error("rename", target, source))?;
-        tier.path = target.to_path_buf();
+        // A pending frozen overlay moves with its session (its path
+        // derives from the active path).
+        if let Some(frozen) = &mut tier.frozen {
+            let frozen_target = frozen_overlay_path(target);
+            std::fs::rename(&frozen.path, &frozen_target)
+                .map_err(|source| dirty_file_error("rename frozen", &frozen_target, source))?;
+            frozen.path = frozen_target;
+        }
+        tier.active.path = target.to_path_buf();
         tier.remove_on_drop = false;
         Ok(())
     }
@@ -2014,6 +2022,26 @@ impl ChunkedDiskBackend {
             },
             new_hashes,
         ))
+    }
+
+    /// Eviction handoff (ADR 0101): materialize the pending flush's
+    /// chunks as bytes — read from the frozen overlay + hashed — for
+    /// the finalize state machine, which persists them into its own
+    /// staging dir and uploads after VM destroy. Heap cost is the
+    /// frozen set's size, same as the pre-addendum pause copies on
+    /// this path only; ladder step 3's budget bounds it next.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn export_pending_chunks(
+        &self,
+        pending: &PendingDiskFlush,
+    ) -> Result<Vec<(usize, ChunkHash, Bytes)>, DiskBackendError> {
+        let tier = self.dirty_tier.lock().await;
+        let mut out = Vec::with_capacity(pending.chunks.len());
+        for &(chunk_idx, chunk_len) in &pending.chunks {
+            let bytes = tier.read_frozen_chunk(chunk_idx, chunk_len as usize, self.chunk_size)?;
+            out.push((chunk_idx, ChunkHash::of(&bytes), bytes));
+        }
+        Ok(out)
     }
 
     /// ADR 0045 C1 abort path. ADR 0110 addendum: nothing to release —
