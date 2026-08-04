@@ -1123,15 +1123,11 @@ dependencies = [
 name = "engram-cloud-gcp"
 version = "0.1.0"
 dependencies = [
- "async-stream",
  "async-trait",
- "chrono",
  "engram-core",
- "futures",
  "reqwest",
  "serde",
  "serde_json",
- "tokio",
  "tracing",
  "workspace-hack",
 ]

@@ -206,28 +206,6 @@ pub fn init(addr: SocketAddr) {
 /// engram_sandbox_boot_seconds_bucket[5m])))`.
 pub const SANDBOX_BOOT_SECONDS: &str = "engram_sandbox_boot_seconds";
 
-/// Counter. Sandboxes the host has been asked to create, labelled
-/// by `outcome` (`success` / `invalid_spec` / `image_pull_failed`
-/// / `fc_error`).
-pub const SANDBOX_CREATE_TOTAL: &str = "engram_sandbox_create_total";
-
-/// Gauge. Live sandboxes on this host. Should match
-/// `running_sandboxes` in the heartbeat payload.
-pub const SANDBOXES_RUNNING: &str = "engram_sandboxes_running";
-
-/// Histogram. Bytes pulled from the OCI registry per session,
-/// labelled by `cache` (`hit` / `miss`). Hit-rate gives us a read
-/// on whether chunk caching is paying off.
-pub const OCI_PULL_BYTES: &str = "engram_oci_pull_bytes";
-
-/// ADR 0014 issue #4: gauge of free disk on the host's work_dir
-/// (where snapshot dirs land). Sampled on each idle-evict tick.
-/// Drops below `ENGRAM_IDLE_EVICT_DISK_FLOOR_BYTES` → idle-evict
-/// pauses pushing candidates, the
-/// `engram_host_idle_evict_disk_pressure_holds_total` counter
-/// increments, and ops can page on the cross-over before disk fills.
-pub const HOST_DISK_FREE_BYTES: &str = "engram_host_disk_free_bytes";
-
 /// ADR 0070: gauge of `fs_free - fs_total * ENGRAM_KUBELET_EVICT_PCT/100`
 /// on the host's `work_dir` mount — how far free disk sits above the
 /// kubelet's ephemeral-storage hard-eviction line. Sampled every
@@ -252,13 +230,6 @@ pub const HOST_DISK_HEADROOM_TO_KUBELET_BYTES: &str = "engram_host_disk_headroom
 /// more machinery around it.
 pub const HOST_BASE_MEMFILE_BYTES: &str = "engram_host_base_memfile_bytes";
 
-/// ADR 0014 issue #4: counter incremented each time the idle-evict
-/// tick observes free disk below the floor and skips pushing
-/// candidates. Sustained increments mean a snowballing snapshot
-/// writer (or some other on-disk leak) is winning the race.
-pub const IDLE_EVICT_DISK_PRESSURE_HOLDS_TOTAL: &str =
-    "engram_host_idle_evict_disk_pressure_holds_total";
-
 /// Tier 1 (pressure-aware idle eviction): gauge of free physical RAM as a
 /// percent of `MemTotal`, sampled each idle-evict tick when
 /// `ENGRAM_IDLE_EVICT_PRESSURE_AWARE` is on. Below
@@ -266,14 +237,6 @@ pub const IDLE_EVICT_DISK_PRESSURE_HOLDS_TOTAL: &str =
 /// for reclamation; above it they stay resident. Alarm on a sustained
 /// approach to the floor.
 pub const HOST_MEM_FREE_PCT: &str = "engram_host_mem_free_pct";
-
-/// Tier 1 (pressure-aware idle eviction): counter incremented by the
-/// number of soft-idle sandboxes the host *declined* to nominate this tick
-/// because free RAM was above the floor (no memory pressure). The win
-/// signal — sustained increments mean warm VMs are being kept resident
-/// (and their next resume is instant) instead of churned through
-/// snapshot+cold-resume. Hard-idle nominations are never counted here.
-pub const IDLE_EVICT_KEPT_RESIDENT_TOTAL: &str = "engram_host_idle_evict_kept_resident_total";
 
 /// ADR 0022 Option A: gauges of summed guest memory across this host's
 /// live FC sandboxes, sampled each heartbeat tick from

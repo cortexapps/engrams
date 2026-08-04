@@ -113,10 +113,6 @@ pub struct PinSet {
 }
 
 impl PinSet {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn contains(&self, hash: &ChunkHash) -> bool {
         self.chunks.contains(hash)
     }
@@ -127,18 +123,6 @@ impl PinSet {
 
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &ChunkHash> {
-        self.chunks.iter()
-    }
-
-    /// Direct insert — bypasses manifest fetch. Used by tests; the
-    /// sweep orchestrator (commit 4) reaches for this when it
-    /// wants to add a chunk to the pin set without re-fetching a
-    /// manifest it already enumerated.
-    pub fn insert(&mut self, hash: ChunkHash) -> bool {
-        self.chunks.insert(hash)
     }
 
     /// Union over the four pin-set sources. See module docs.

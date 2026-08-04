@@ -3,20 +3,11 @@
 //! switches the transport to tonic+gRPC; the wire format is in
 //! `engram-protocol`.
 
-use std::time::Duration;
-
 use chrono::Utc;
 use engram_core::SandboxId;
-use engram_protocol::{Heartbeat, HeartbeatAck, HostCapacityReport};
+use engram_protocol::{Heartbeat, HostCapacityReport};
 
 use crate::resource::CapacitySnapshot;
-
-/// Trait the coordinator implements. Phase 1 a single-process binary
-/// implements this directly; Phase 3 a tonic client wraps it.
-#[async_trait::async_trait]
-pub trait HeartbeatSink: Send + Sync {
-    async fn send(&self, hb: Heartbeat) -> HeartbeatAck;
-}
 
 // ADR 0098 D1 carve-out: this is the in-process (`--mode=all`) heartbeat
 // builder, exercised only by this module's tests; the production HTTP
@@ -56,10 +47,6 @@ pub fn build_heartbeat(
         // In-process path has no NBD rehydrate, so nothing quarantines.
         quarantined_survivors: Vec::new(),
     }
-}
-
-pub fn default_interval() -> Duration {
-    Duration::from_secs(5)
 }
 
 #[cfg(test)]

@@ -186,10 +186,6 @@ impl OutputTail {
         v.extend_from_slice(b);
         String::from_utf8_lossy(&v).into_owned()
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
-    }
 }
 
 impl Default for OutputTail {

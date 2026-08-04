@@ -299,18 +299,6 @@ impl FirecrackerClient {
         self.put("/snapshot/create", &body).await
     }
 
-    /// Restore from `paths` with file-backed memory. Returns once the
-    /// VM is fully running again (`resume_vm: true`).
-    ///
-    /// File mode synchronously reads `mem_path` into the guest's
-    /// address space — fine for dev/test loops but slow for fast
-    /// eviction-resume. Use [`Self::load_snapshot_uffd`] in
-    /// production-grade resume paths.
-    pub async fn load_snapshot(&self, paths: &SnapshotPaths) -> Result<(), SandboxError> {
-        self.load_snapshot_inner(paths, /*resume_vm=*/ true, /*track=*/ false, None)
-            .await
-    }
-
     /// Load a snapshot into a paused VM. Caller is responsible for
     /// the eventual `patch_vm_state(Resumed)`. Used by the ADR 0014
     /// option-D restore path where a `patch_drive` happens between
@@ -362,53 +350,6 @@ impl FirecrackerClient {
             }),
         };
         self.put("/snapshot/load", &body).await
-    }
-
-    /// Restore with UFFD-backed memory. `state_path` is the snapshot
-    /// state file; `uffd_uds_path` points at the *already-listening*
-    /// `engram-uffd-handler` UDS — Firecracker connects to it during
-    /// this call, hands the kernel-side UFFD over SCM_RIGHTS, and
-    /// resumes the guest. Pages stream in lazily on guest fault.
-    ///
-    /// The caller is responsible for spawning the handler (and
-    /// keeping it alive for the VM's lifetime) before invoking this.
-    pub async fn load_snapshot_uffd(
-        &self,
-        state_path: &Path,
-        uffd_uds_path: &Path,
-    ) -> Result<(), SandboxError> {
-        self.load_snapshot_uffd_inner(
-            state_path,
-            uffd_uds_path,
-            /*resume_vm=*/ true,
-            false,
-            None,
-            None,
-        )
-        .await
-    }
-
-    /// UFFD-backed load that leaves the VM paused. Caller must
-    /// follow up with `patch_vm_state(Resumed)`. Used by the ADR
-    /// 0014 option-D restore path so the host can `patch_drive` on
-    /// the harness substrate between load and resume — kernel
-    /// hasn't started executing yet, so the patch redirects the
-    /// next read of /dev/vdb to the session's harness ext4 instead
-    /// of the bake-time stub.
-    pub async fn load_snapshot_uffd_paused(
-        &self,
-        state_path: &Path,
-        uffd_uds_path: &Path,
-    ) -> Result<(), SandboxError> {
-        self.load_snapshot_uffd_inner(
-            state_path,
-            uffd_uds_path,
-            /*resume_vm=*/ false,
-            false,
-            None,
-            None,
-        )
-        .await
     }
 
     /// UFFD-backed load with explicit `resume_vm` /

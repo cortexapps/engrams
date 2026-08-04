@@ -121,34 +121,7 @@ pub enum Step {
     AdvanceTime(u64),
 }
 
-impl Step {
-    pub fn coverage_name(&self) -> &'static str {
-        match self {
-            Step::BootSession => "BootSession",
-            Step::GuestWork(..) => "GuestWork",
-            Step::PeriodicCheckpoint(..) => "PeriodicCheckpoint",
-            Step::EvictToIdle(..) => "EvictToIdle",
-            Step::Resume(..) => "Resume",
-            Step::Park(..) => "Park",
-            Step::Unpause(..) => "Unpause",
-            Step::Roll => "Roll",
-            Step::RegisterRehydrate(..) => "RegisterRehydrate",
-            Step::StaleSweep => "StaleSweep",
-            Step::KillGuest(..) => "KillGuest",
-            Step::LoseRecord(..) => "LoseRecord",
-            Step::ReconcileTick(..) => "ReconcileTick",
-            Step::StragglerSweep => "StragglerSweep",
-            Step::DropHostBinding(..) => "DropHostBinding",
-            Step::ForceHostLost(..) => "ForceHostLost",
-            Step::ForceTerminal(..) => "ForceTerminal",
-            Step::FinalizePending => "FinalizePending",
-            Step::SlotClaim => "SlotClaim",
-            Step::SlotPopulate => "SlotPopulate",
-            Step::IdleDetector => "IdleDetector",
-            Step::AdvanceTime(..) => "AdvanceTime",
-        }
-    }
-}
+impl Step {}
 
 /// The maximum live sessions in the small world (the state-space bound).
 pub const MAX_SESSIONS: usize = 3;
@@ -508,8 +481,3 @@ pub struct SeedOutcome {
     pub result: Result<SwarmReport, String>,
     pub trace: Vec<String>,
 }
-
-/// The coarse-time advance the quiescence drain uses — well past every
-/// decision threshold (the straggler sweep's 60 s min-age), so a sub-millisecond
-/// fs-I/O auto-advance can never tip a boundary (determinism, audit items 6–8).
-pub const QUIESCE_ADVANCE_SECS: u64 = 120;

@@ -234,13 +234,7 @@ pub struct Listeners {
     metadata: Option<TcpListener>,
 }
 
-impl Listeners {
-    /// The address the 443 listener actually bound (useful when the
-    /// config asked for an ephemeral port).
-    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.tcp.local_addr()
-    }
-}
+impl Listeners {}
 
 #[allow(clippy::too_many_arguments)]
 async fn handle(

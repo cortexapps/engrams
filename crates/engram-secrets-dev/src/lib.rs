@@ -26,7 +26,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use engram_core::traits::{SecretContext, SecretStore};
@@ -61,18 +60,6 @@ impl InMemorySecretStore {
         Self {
             secrets: RwLock::new(map),
         }
-    }
-
-    pub fn insert(&self, name: impl Into<String>, value: impl Into<String>) {
-        self.secrets.write().insert(name.into(), value.into());
-    }
-
-    pub fn remove(&self, name: &str) {
-        self.secrets.write().remove(name);
-    }
-
-    pub fn arc(self) -> Arc<dyn SecretStore> {
-        Arc::new(self)
     }
 }
 
@@ -116,13 +103,6 @@ impl EnvSecretStore {
         Self {
             prefix: None,
             getter: Box::new(|k| std::env::var(k).ok()),
-        }
-    }
-
-    pub fn with_prefix(prefix: impl Into<String>) -> Self {
-        Self {
-            prefix: Some(prefix.into()),
-            ..Self::new()
         }
     }
 

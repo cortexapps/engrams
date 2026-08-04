@@ -59,7 +59,6 @@ impl std::error::Error for BaseShmError {}
 #[derive(Debug)]
 pub struct BaseShm {
     file: File,
-    path: PathBuf,
     total_bytes: u64,
     /// Sorted, non-overlapping `[start, end)` byte ranges holding data
     /// (vs holes). `None` until the first `is_populated` probe builds it
@@ -103,14 +102,9 @@ impl BaseShm {
         }
         Ok(Self {
             file,
-            path: path.to_path_buf(),
             total_bytes,
             data_ranges: std::sync::Mutex::new(None),
         })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Is `[offset, offset+len)` fully populated (no holes)?

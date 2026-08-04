@@ -224,12 +224,11 @@ pub struct PostCopyDiskSeal {
 }
 
 impl PostCopyDiskSeal {
+    // Callers only ever count sealed chunks (metrics/logs); nothing
+    // branches on emptiness.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.chunks.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.chunks.is_empty()
     }
 
     /// Sorted sealed chunk indices (the wire descriptor).
@@ -1237,14 +1236,6 @@ impl ChunkedDiskBackend {
     /// flush, which is correct: one flush claims the full dirty set.
     pub fn threshold_notify(&self) -> Arc<Notify> {
         self.threshold_notify.clone()
-    }
-
-    /// Current threshold in bytes. Pinned at construction; reported
-    /// by the COW state RPC if we want it visible to operators
-    /// later (not wired into the RPC schema today, but stable to
-    /// expose).
-    pub fn threshold_bytes(&self) -> u64 {
-        self.threshold_bytes
     }
 
     /// Bytes per chunk. NBD reads / writes that span chunk boundaries

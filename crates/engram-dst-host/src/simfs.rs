@@ -26,8 +26,6 @@ use tempfile::TempDir;
 /// this — the disk survives a process crash; only the RAM backends die.
 pub struct SimFs {
     root: TempDir,
-    records: PathBuf,
-    finalize: PathBuf,
     spool: PathBuf,
     chunks: PathBuf,
     cache: PathBuf,
@@ -50,8 +48,6 @@ impl SimFs {
         }
         Ok(Self {
             root,
-            records,
-            finalize,
             spool,
             chunks,
             cache,
@@ -61,16 +57,6 @@ impl SimFs {
     /// The tempdir root (for wiring [`HostEffects`](engram_host_core::HostEffects)).
     pub fn root(&self) -> &Path {
         self.root.path()
-    }
-
-    /// `records/` — durable_record's `persist`/`load_all` directory.
-    pub fn records_dir(&self) -> &Path {
-        &self.records
-    }
-
-    /// `finalize/` — eviction_finalize's durable records.
-    pub fn finalize_dir(&self) -> &Path {
-        &self.finalize
     }
 
     /// `spool/` — the shutdown-spool root (`<spool>/<sandbox_id>/…`).

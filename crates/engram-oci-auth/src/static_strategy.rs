@@ -24,11 +24,6 @@ pub struct StaticStrategy {
 }
 
 impl StaticStrategy {
-    /// Construct from already-decrypted creds. Useful for testing.
-    pub fn from_creds(creds: BasicCreds) -> Self {
-        Self { creds }
-    }
-
     /// Construct by unsealing a `RegistryAuthSpec::Static` row's
     /// cipher fields under the deployment KEK. Errors propagate up
     /// so the resolver surfaces "wrong KEK / corrupted ciphertext"

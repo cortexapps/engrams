@@ -812,18 +812,6 @@ async fn persist_memory_bump(
     Ok(())
 }
 
-/// One sleep-free pass over the legs — `pub` so the host-internal
-/// simulator drives the REAL leg bodies step-by-step (ADR 0098 P5); the
-/// backoff/quarantine verdict between passes is
-/// [`engram_host_core::plan_finalize_retry`], which the sim consults the
-/// same way [`run_eviction_finalize`] does.
-pub async fn run_eviction_finalize_once(
-    f: &EvictionFinalizer,
-    record: &mut EvictionFinalizeRecord,
-) -> Result<(), SandboxError> {
-    run_eviction_finalize_once_hot(f, record, None).await
-}
-
 /// ADR 0101 A: the disk and memory legs are independent idempotent
 /// publishes — overlap them when both are still pending. The durable
 /// ladder (`Captured → DiskUploaded → MemoryChunked`) is preserved by

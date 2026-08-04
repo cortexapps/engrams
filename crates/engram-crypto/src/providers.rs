@@ -132,7 +132,6 @@ impl MasterKeyProvider for EnvVarKeyProvider {
 /// against a customer-managed key. Wired when needed; today returns
 /// errors, mirroring the `engram-secrets-gcp` stub pattern.
 pub struct GcpKmsProvider {
-    key_resource: String,
     key_id: String,
 }
 
@@ -145,14 +144,7 @@ impl GcpKmsProvider {
             return Err(CryptoError::Provider("empty GCP KMS resource path".into()));
         }
         let key_id = format!("gcp-kms:{key_resource}");
-        Ok(Self {
-            key_resource,
-            key_id,
-        })
-    }
-
-    pub fn resource(&self) -> &str {
-        &self.key_resource
+        Ok(Self { key_id })
     }
 }
 

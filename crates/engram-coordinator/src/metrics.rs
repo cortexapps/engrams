@@ -216,12 +216,6 @@ pub const COORD_BOOT_OVERLAP_SECONDS: &str = "engram_coord_boot_overlap_seconds"
 /// `harness_failed`).
 pub const SESSION_CREATE_TOTAL: &str = "engram_session_create_total";
 
-/// Gauge. Live `Active` session count, scraped from the in-memory
-/// registry on each tick. Use as a sanity check against
-/// `SESSION_CREATE_TOTAL{outcome="success"}` cumulative minus
-/// terminated.
-pub const SESSIONS_ACTIVE: &str = "engram_sessions_active";
-
 /// Gauge. Hosts the coord has live heartbeats from (the in-memory
 /// `host_registry`). Should equal the count of `ready` rows in
 /// Postgres for the slice of time both views are consistent.
@@ -340,15 +334,6 @@ pub const EVICTION_NOMINATED_TOTAL: &str = "engram_eviction_nominated_total";
 // gone — the evict op finishes the instant the session is Idle and the
 // host-owned finalize lands the row via the heartbeat reconcile. Its
 // `EVICTION_FINALIZE_ROW_WAIT_TIMEOUT_TOTAL` counter went with it.
-
-/// Counter (ADR 0034 Track A). In-place harness reattaches the desync
-/// watchdog issued when `rehandshake` returned `NotFound` (the harness vsock
-/// is dead but the FC VM is alive): re-issuing the resume `start_agent` drives
-/// agentd's reattach/respawn arm (SIGUSR1 a live-but-wedged harness, or respawn
-/// an exited one) without a snapshot/destroy/restore. A successful one re-emits
-/// `Idle` and the session leaves the flagged set; persistent failure still
-/// escalates to the eviction lane.
-pub const HARNESS_INPLACE_REATTACH_TOTAL: &str = "engram_harness_inplace_reattach_total";
 
 /// Counter (ADR 0034). Eviction scanner gave up after the retry
 /// budget (20 attempts ≈ 3 min) and fell the session back to

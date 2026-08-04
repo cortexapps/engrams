@@ -74,10 +74,6 @@ impl ExecJournal {
         }
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     pub async fn attach_or_start(
         &self,
         exec_id: &str,

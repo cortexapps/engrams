@@ -60,7 +60,6 @@ pub mod proxy_port;
 pub mod proxy_shell;
 pub mod ram_ledger;
 pub mod resource;
-pub mod snapshot;
 pub mod teardown_reconcile;
 mod time_source;
 pub mod trace_scope;

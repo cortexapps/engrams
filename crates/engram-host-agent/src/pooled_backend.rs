@@ -668,6 +668,9 @@ pub struct PooledBackend {
     /// [`crate::disk_daemon::NoOpLiveManifestPublisher`] in
     /// commit 2; commit 4 wires the real coord-bound publisher via
     /// [`Self::with_live_manifest_coord_publisher`].
+    // Read only by the linux NBD/flush-scheduler paths; macOS (VZ
+    // parity) builds construct but never read it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     flush_config: crate::disk_daemon::FlushSchedulerConfig,
     live_manifest_publisher: Arc<dyn crate::disk_daemon::LiveManifestPublisher>,
     /// Owns the drain task spawned by the live-manifest publisher.
@@ -4155,15 +4158,6 @@ impl PooledBackend {
         Ok(metadata)
     }
 
-    /// Override the default Phase B flush scheduler config. The
-    /// production host-agent leaves this at `from_env()`; tests use
-    /// this to disable the scheduler entirely (`enabled = false`)
-    /// or tighten the interval to drive deterministic test cases.
-    pub fn with_flush_config(mut self, config: crate::disk_daemon::FlushSchedulerConfig) -> Self {
-        self.flush_config = config;
-        self
-    }
-
     /// ADR 0016 Phase B commit 4: build a coord-bound publisher
     /// using the host-agent's `HttpCoordClient` and the freshly-wrapped
     /// `session_bindings` map. The publisher spawns its own drain
@@ -4198,19 +4192,6 @@ impl PooledBackend {
         // async publisher's drain task is gone by the time the
         // process exits).
         self.shutdown_manifest_publish = Some((coord, host_id));
-        self
-    }
-
-    /// Test hook: inject an arbitrary [`LiveManifestPublisher`]
-    /// (e.g. a recording mock). Production wiring uses
-    /// [`Self::with_live_manifest_coord_publisher`].
-    #[cfg(test)]
-    pub fn with_live_manifest_publisher(
-        mut self,
-        publisher: Arc<dyn crate::disk_daemon::LiveManifestPublisher>,
-    ) -> Self {
-        self.live_manifest_publisher = publisher;
-        self.live_manifest_publisher_handle = None;
         self
     }
 

@@ -230,10 +230,6 @@ impl ProcessBackend {
         }
     }
 
-    pub fn work_dir(&self) -> &Path {
-        &self.work_dir
-    }
-
     fn cwd_for(&self, id: SandboxId) -> PathBuf {
         self.work_dir.join(id.to_string())
     }

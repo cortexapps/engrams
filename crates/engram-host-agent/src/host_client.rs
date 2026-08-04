@@ -68,18 +68,6 @@ impl LocalHostClient {
         ));
         Self::new(sandbox, hub)
     }
-
-    /// Borrow the inner sandbox backend. Used by callers that legitimately
-    /// need the local `SandboxBackend` surface (the host-agent's
-    /// startup live-attach pass, in-process snapshot path helpers).
-    /// Coord-side code goes through the `HostClient` trait instead.
-    pub fn sandbox(&self) -> &Arc<dyn SandboxBackend> {
-        &self.sandbox
-    }
-
-    pub fn harness_hub(&self) -> &Arc<HarnessHub> {
-        &self.harness_hub
-    }
 }
 
 #[async_trait]

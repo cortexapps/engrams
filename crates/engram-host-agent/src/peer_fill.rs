@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use engram_chunk_store::cache::{ChunkCache, CHUNK_FILL_BYTES_TOTAL, CHUNK_FILL_TOTAL};
 use engram_chunk_store::manifest::ChunkHash;
 use engram_protocol::grpc::{PeerChunkFrame, PeerChunkGetRequest};
@@ -457,113 +456,6 @@ async fn pull_shard(
         }
     }
     stats
-}
-
-// ---------------------------------------------------------------------
-// Fault-time binding (resume tail)
-// ---------------------------------------------------------------------
-
-/// A live "this session's divergence has a peer" binding, consulted by
-/// the resume fault-time populate closures (ADR 0095 §Resume). One
-/// bounded dial on first use; any failure flips it lost for good (the
-/// session-scoped one-dial contract) and every later fault goes
-/// straight to GCS. Fault-time singles land through
-/// `ChunkCache::get_with_source`'s verifying populate — at one chunk
-/// per fault the sha256 is noise, so these do NOT ride the
-/// unverified-origin path.
-pub struct PeerBinding {
-    addr: String,
-    scope: PeerChunkScope,
-    health: Arc<PeerHealth>,
-    client: tokio::sync::Mutex<Option<GrpcHostClient>>,
-    lost: std::sync::atomic::AtomicBool,
-}
-
-impl PeerBinding {
-    pub fn new(addr: String, scope: PeerChunkScope, health: Arc<PeerHealth>) -> Arc<Self> {
-        Arc::new(Self {
-            addr,
-            scope,
-            health,
-            client: tokio::sync::Mutex::new(None),
-            lost: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    fn mark_lost(&self) {
-        self.lost.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.health.mark_lost(&self.addr);
-    }
-
-    /// Fetch one chunk from the bound peer. `None` ⇒ caller falls to
-    /// GCS (miss, backpressure, or peer lost — misses and backpressure
-    /// do NOT poison the binding; transport faults do).
-    pub async fn fetch_one(&self, hash: ChunkHash) -> Option<Bytes> {
-        use futures::StreamExt;
-        if self.lost.load(std::sync::atomic::Ordering::Relaxed) || self.health.is_lost(&self.addr) {
-            return None;
-        }
-        let mut guard = self.client.lock().await;
-        if guard.is_none() {
-            let endpoint = match peer_endpoint(&self.addr) {
-                Ok(e) => e,
-                Err(_) => {
-                    self.mark_lost();
-                    return None;
-                }
-            };
-            match endpoint.connect().await {
-                Ok(ch) => *guard = Some(GrpcHostClient::new(ch)),
-                Err(e) => {
-                    tracing::warn!(addr = %self.addr, error = %e,
-                        "peer binding: dial failed — fault-time tier off for this session");
-                    metrics::counter!("engram_peer_dial_total", "outcome" => "timeout")
-                        .increment(1);
-                    self.mark_lost();
-                    return None;
-                }
-            }
-        }
-        let client = guard.as_ref().expect("just ensured").clone();
-        drop(guard);
-        let mut stream = match client
-            .peer_chunk_get(vec![*hash.as_bytes()], self.scope.clone())
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                if matches!(&e, engram_core::SandboxError::LimitExceeded(_)) {
-                    return None; // backpressure — this fault goes to GCS
-                }
-                self.mark_lost();
-                return None;
-            }
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        while let Some(frame) = stream.next().await {
-            let frame = match frame {
-                Ok(f) => f,
-                Err(_) => {
-                    self.mark_lost();
-                    return None;
-                }
-            };
-            if frame.missing {
-                return None;
-            }
-            if crc32c::crc32c(&frame.data) != frame.crc32c {
-                self.mark_lost();
-                return None;
-            }
-            buf.extend_from_slice(&frame.data);
-            if frame.last {
-                return Some(Bytes::from(buf));
-            }
-        }
-        // Stream ended without a `last` frame — transport fault.
-        self.mark_lost();
-        None
-    }
 }
 
 /// Parse + validate a `PeerChunkGetRequest`'s hashes (32-byte each).

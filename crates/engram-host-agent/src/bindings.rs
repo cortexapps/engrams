@@ -19,7 +19,6 @@
 //! fine. Node death loses the directory — that is the PG re-bind
 //! path's job, not ours (ADR 0073 §Consequences).
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -277,29 +276,6 @@ impl BindingStore {
         Ok(out)
     }
 
-    /// All records currently on disk. Used by the host-agent at
-    /// startup for logging/metrics parity (the records themselves are
-    /// the rebind — nothing needs replaying into memory).
-    pub fn list(&self) -> std::io::Result<HashMap<SessionId, BindingRecord>> {
-        let mut out = HashMap::new();
-        for entry in std::fs::read_dir(&self.dir)? {
-            let entry = entry?;
-            if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            // Skip torn temp files and records we can't parse; they
-            // can only cause UnknownBinding, never a wrong accept.
-            if let Ok(bytes) = std::fs::read(entry.path()) {
-                if let Ok(record) = serde_json::from_slice::<BindingRecord>(&bytes) {
-                    if record.schema_version == BINDING_SCHEMA_VERSION {
-                        out.insert(record.session_id, record);
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-
     fn write_atomic(&self, record: &BindingRecord) -> std::io::Result<()> {
         let final_path = self.path_for(record.session_id);
         // Writer-unique temp name (PR #437's lesson: fixed temp names
@@ -314,18 +290,6 @@ impl BindingStore {
         std::fs::rename(&tmp, &final_path)?;
         Ok(())
     }
-}
-
-/// In-memory store for tests and the coordinator's replay-only hub
-/// (which never validates an attach). Backed by a tempdir so the
-/// production code path is exercised unchanged.
-#[cfg(test)]
-pub fn ephemeral() -> BindingStore {
-    let dir = std::env::temp_dir().join(format!(
-        "engram-bindings-{}",
-        crate::time_source::unique_path_token()
-    ));
-    BindingStore::open(dir).expect("ephemeral binding store")
 }
 
 #[cfg(test)]

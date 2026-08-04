@@ -143,20 +143,6 @@ impl DevicePlane {
         }
     }
 
-    /// Claim `device` on the current-generation pool and register a fresh slot
-    /// for `id`, served + owned by this generation. Used at sandbox creation.
-    pub async fn create_slot(&mut self, id: SandboxId, device: PathBuf) -> Result<(), String> {
-        let lease = self.nbd_pool.claim(&device).await.ok_or_else(|| {
-            format!(
-                "create_slot: claim of {} failed (not free?)",
-                device.display()
-            )
-        })?;
-        let slot = DeviceSlot::fresh(device, lease, self.generation);
-        self.slots.insert(id, slot);
-        Ok(())
-    }
-
     /// Insert a slot whose device lease was ALREADY claimed off this plane's
     /// pool (the concurrency split some hosts need: claim the device with a
     /// cloned `nbd_pool` handle OUTSIDE a lock, then commit the slot under a
@@ -258,18 +244,6 @@ impl DevicePlane {
     pub fn lose_record(&mut self, id: SandboxId) {
         if let Some(slot) = self.slots.get_mut(&id) {
             slot.record_present = false;
-        }
-    }
-
-    /// PR #828: model THIS generation's rehydrate failing for `id`'s device and
-    /// parking it (`slot.quarantine()` → the allocator's parked set). The
-    /// parked device is a TRACKED record for the classification barrier even
-    /// if every FC-derived record source subsequently vanishes (the 2026-07-21
-    /// false `rehydrate-unknown-device` alarm: a concurrent sandbox destroy
-    /// vacated `rootfs_device` between the park and the barrier).
-    pub fn quarantine_park(&mut self, id: SandboxId) {
-        if let Some(slot) = self.slots.get_mut(&id) {
-            slot.quarantine_parked = true;
         }
     }
 

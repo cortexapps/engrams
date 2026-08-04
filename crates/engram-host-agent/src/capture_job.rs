@@ -67,10 +67,6 @@ pub struct CaptureJobRecord {
 }
 
 impl CaptureJobRecord {
-    pub fn path_in(dir: &Path, id: CaptureJobId) -> PathBuf {
-        crate::durable_record::record_path(dir, id)
-    }
-
     /// Durably persist (write + fsync via rename) into `dir`. Not yet
     /// behind the fs seam — the capture-job flow extracts in a later P
     /// (the seam lands with the flows that cross it).

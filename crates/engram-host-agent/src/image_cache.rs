@@ -88,10 +88,6 @@ impl ImageCache {
         })
     }
 
-    pub fn root(&self) -> &Path {
-        &self.inner.root
-    }
-
     /// Clone of the inner `OciClient`. Useful for callers that need
     /// to reuse the same auth resolver for additional OCI verbs
     /// outside the cache's pull surface — e.g. ADR 0008 Phase 5's
@@ -263,25 +259,6 @@ impl ImageCache {
 
     fn lookup(&self, map: &Mutex<UriMap>, uri: &str) -> Option<String> {
         map.lock().entries.get(uri).cloned()
-    }
-
-    /// ADR 0015 M5: drop the `uri → digest` mapping so the next
-    /// `ensure_image(uri)` call re-pulls from the registry. Used by
-    /// the prefetch supervisor when the cached digest doesn't match
-    /// the digest the coord advertised in `enabled_images` — the
-    /// registry has rotated under the same tag (a common pattern
-    /// for `:warm-<sha>` re-pushes). The on-disk artifacts at
-    /// `images/sha256/<old>/` are left alone — touch-based LRU
-    /// handles eventual eviction; an immediate delete would race
-    /// any in-flight session still consuming the old digest.
-    pub async fn invalidate_uri(&self, uri: &str) {
-        let path = self.inner.root.join("images/by-uri.json");
-        let snapshot = {
-            let mut m = self.inner.image_map.lock();
-            m.entries.remove(uri);
-            m.clone()
-        };
-        let _ = persist_uri_map(&path, &snapshot);
     }
 
     /// Pre-plant a `(uri, digest)` association in the image map.

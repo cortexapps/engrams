@@ -99,11 +99,6 @@ impl SimCoordClient {
     pub fn script(&self, resp: ScriptedResponse) {
         self.inner.lock().scripted.push_back(resp);
     }
-
-    /// The recorded publish log (for oracle/test assertions).
-    pub fn publishes(&self) -> Vec<RecordedPublish> {
-        self.inner.lock().publishes.clone()
-    }
 }
 
 #[async_trait]

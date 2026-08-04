@@ -835,9 +835,6 @@ impl CosimHost {
     }
 
     // ── Device-plane oracle/read accessors ──
-    pub fn device_generation(&self) -> u32 {
-        self.device.generation
-    }
     pub fn is_parked(&self, id: SandboxId) -> bool {
         self.device.is_parked(id)
     }
@@ -881,15 +878,6 @@ impl CosimHost {
     /// real host-agent stamps into a `QuarantinedSurvivor` advertise.
     pub fn session_of(&self, id: SandboxId) -> Option<SessionId> {
         self.sandboxes.get(&id).and_then(|s| s.session_id)
-    }
-    /// Oracle read (Wave 7b): is `id` a record-invisible resident survivor —
-    /// live, unserved, dead-owner, no record — the gap-A precondition the barrier
-    /// must have QUARANTINED (never left unclassified)?
-    pub fn is_record_invisible_survivor(&self, id: SandboxId) -> bool {
-        self.device.is_resident_survivor(id)
-            && !self.device.served_by_current(id)
-            && self.device.guest_holds_device(id)
-            && !self.device.record_present(id)
     }
 
     /// A unit of guest work: write one real content-tagged chunk (advancing

@@ -134,11 +134,6 @@ impl TieredChunkResolver {
     ) -> Self {
         Self { tiers, write_back }
     }
-
-    /// Number of configured tiers. Useful for tests and metrics.
-    pub fn tier_count(&self) -> usize {
-        self.tiers.len()
-    }
 }
 
 #[async_trait]
