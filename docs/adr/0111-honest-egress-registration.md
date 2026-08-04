@@ -1,6 +1,11 @@
 # ADR 0111: Honest egress registration — applied policies survive process death
 
-Status: Proposed
+Status: Accepted (2026-08-03)
+
+Commit chain: the ADR and the implementation + retirement land in one
+PR (#992, branch `honest-egress-registration`, based on main after
+ADR 0110's #973; ADR 0110's own retirement PR #987 lands
+independently).
 
 Terms used in this document:
 
