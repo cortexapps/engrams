@@ -172,16 +172,19 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
 
     // ADR 0044 K4 + ADR 0048: autoscale the node pool from coordinator demand
     // (scale-up via set_size; scale-down via the teleport-packed wave). A fresh
-    // wave only starts when the image roll is quiescent (`roll_idle`); an
-    // in-flight wave, queue/grow pressure, or stuck-roll repair blocks new
-    // rolls (returned in `blocks_roll`). Best-effort — a coord hiccup
-    // shouldn't wedge the controller.
+    // wave only starts when the image roll is quiescent (`roll_idle`). Only an
+    // in-flight wave's drains (or a stuck-roll repair that mutated the fleet
+    // this tick) block new rolls (`blocks_roll`) — queue/grow pressure and
+    // stuck-roll debt never do (issue #1012): a roll is a reattach pod swap
+    // that removes no capacity, and a queue starved by wire skew can only be
+    // served BY the roll, so blocking on it deadlocks the fleet. Best-effort —
+    // a coord hiccup shouldn't wedge the controller.
     let roll_idle = matches!(decision, RollDecision::UpToDate { .. });
     let blocks_roll = match run_autoscale(spec, &ctx, &pods, roll_idle, &stuck_rolls).await {
         Ok(status) => status.blocks_roll,
         Err(e) => {
             tracing::warn!(error = %e, "autoscale step failed; continuing");
-            !stuck_rolls.is_empty()
+            false
         }
     };
 
