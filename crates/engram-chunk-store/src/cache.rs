@@ -619,7 +619,7 @@ struct CacheInner {
     /// writers (the UFFD handler, ADR 0070) still land chunks the
     /// index can't see; the periodic [`ChunkCache::sweep`] re-walks
     /// and reconciles, bounding drift to one sweep interval.
-    index: Mutex<Option<CacheIndex>>,
+    index: Mutex<IndexState>,
     /// #1003: single-sweeper gate. Sweep cost used to compound the
     /// other way too: on a big cache a sweep outlived the write-path
     /// debounce window, so sweeps piled up concurrently (the burst
@@ -638,6 +638,40 @@ struct CacheIndex {
     entries: HashMap<ChunkHash, IndexEntry>,
     /// Maintained sum of `entries[*].size`.
     total_bytes: u64,
+}
+
+impl CacheIndex {
+    fn apply(&mut self, op: PendingOp) {
+        match op {
+            PendingOp::Insert(hash, entry) => {
+                if let Some(prev) = self.entries.insert(hash, entry) {
+                    self.total_bytes = self.total_bytes.saturating_sub(prev.size);
+                }
+                self.total_bytes += entry.size;
+            }
+            PendingOp::Remove(hash) => {
+                if let Some(prev) = self.entries.remove(&hash) {
+                    self.total_bytes = self.total_bytes.saturating_sub(prev.size);
+                }
+            }
+        }
+    }
+}
+
+/// Index lifecycle. `Pending` covers boot until the first walk lands:
+/// in-process populates/unlinks are BUFFERED as ops and replayed onto
+/// the walk result when it installs — a put that races the in-flight
+/// walk (walk already passed its prefix dir) would otherwise be
+/// tracked by neither side and stay invisible until the next
+/// reconcile, exactly the capture-storm window the budget must see.
+enum IndexState {
+    Pending(Vec<PendingOp>),
+    Ready(CacheIndex),
+}
+
+enum PendingOp {
+    Insert(ChunkHash, IndexEntry),
+    Remove(ChunkHash),
 }
 
 #[derive(Clone, Copy)]
@@ -662,7 +696,7 @@ impl ChunkCache {
                 last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
                 co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
                 scrub_tx: Mutex::new(None),
-                index: Mutex::new(None),
+                index: Mutex::new(IndexState::Pending(Vec::new())),
                 sweep_gate: tokio::sync::Mutex::new(()),
             }),
         }
@@ -692,7 +726,7 @@ impl ChunkCache {
                 last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
                 co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
                 scrub_tx: Mutex::new(None),
-                index: Mutex::new(None),
+                index: Mutex::new(IndexState::Pending(Vec::new())),
                 sweep_gate: tokio::sync::Mutex::new(()),
             }),
         }
@@ -1269,24 +1303,20 @@ impl ChunkCache {
     /// only remaining full-walk path; everything per-write reads the
     /// index ([`Self::evict_with_index`]).
     pub async fn sweep(&self) -> Result<()> {
+        // ADR 0070: single-evictor — a non-evicting process (the UFFD
+        // handler) must not pay the reconcile walk either. Checked
+        // BEFORE the walk, preserving the old evict_to_budget's
+        // early-return semantics.
+        if !self.inner.config.eviction_enabled {
+            tracing::debug!("chunk cache sweep skipped: eviction_enabled=false on this cache");
+            return Ok(());
+        }
         let _gate = self.inner.sweep_gate.lock().await;
         let started = crate::time_source::metrics_now();
         let entries = self.list_entries().await?;
         metrics::histogram!("engram_chunk_cache_sweep_seconds", "kind" => "walk")
             .record(started.elapsed().as_secs_f64());
-        let rebuilt = Self::index_from_entries(&entries);
-        {
-            let mut guard = self.inner.index.lock();
-            if let Some(prev) = guard.as_ref() {
-                // |walk truth − maintained index|. Persistent large drift
-                // means an unaccounted writer; transient small drift is
-                // normal (puts racing the walk, UFFD landings since the
-                // last reconcile).
-                let drift = rebuilt.total_bytes.abs_diff(prev.total_bytes);
-                metrics::gauge!("engram_chunk_cache_index_drift_bytes").set(drift as f64);
-            }
-            *guard = Some(rebuilt);
-        }
+        self.index_install(&entries);
         self.evict_with_index().await
     }
 
@@ -1613,6 +1643,13 @@ impl ChunkCache {
                 )
                 .is_ok()
         {
+            if matches!(&*self.inner.index.lock(), IndexState::Pending(_)) {
+                // First sweep since boot: build off-path (see
+                // spawn_index_build) instead of stalling this write —
+                // and this task may be a singleflight leader.
+                self.spawn_index_build();
+                return Ok(());
+            }
             let Ok(_gate) = self.inner.sweep_gate.try_lock() else {
                 return Ok(());
             };
@@ -1641,13 +1678,18 @@ impl ChunkCache {
             tracing::debug!("chunk cache sweep skipped: eviction_enabled=false on this cache");
             return Ok(());
         }
-        self.ensure_index().await?;
         let sweep_started = crate::time_source::metrics_now();
 
         let pinned = self.inner.pinned.lock().clone();
         let (cache_total, pinned_bytes) = {
             let guard = self.inner.index.lock();
-            let idx = guard.as_ref().expect("ensure_index built the index above");
+            // Not built yet (first sweep after boot, build in flight in
+            // the background) — nothing to enforce against; the build's
+            // own tail sweep and the periodic reconcile backstop this
+            // window.
+            let IndexState::Ready(idx) = &*guard else {
+                return Ok(());
+            };
             // ADR 0070: pins are a floor, not a bug — computed BEFORE
             // deciding how much to free, and gauged even when the sweep
             // is otherwise a no-op (dashboards and the pins-over-budget
@@ -1733,10 +1775,11 @@ impl ChunkCache {
             // sort and unlink outside it — the unlink loop awaits.
             let mut candidates: Vec<(i64, ChunkHash, u64)> = {
                 let guard = self.inner.index.lock();
-                guard
-                    .as_ref()
-                    .expect("ensure_index built the index above")
-                    .entries
+                let IndexState::Ready(idx) = &*guard else {
+                    // Ready above; nothing transitions Ready → Pending.
+                    return Ok(());
+                };
+                idx.entries
                     .iter()
                     .filter(|(hash, _)| !pinned.contains_key(*hash))
                     .map(|(hash, e)| (e.populated_ms, *hash, e.size))
@@ -1773,20 +1816,40 @@ impl ChunkCache {
         Ok(())
     }
 
-    /// Build the index from one directory walk if this is the first
-    /// sweep since process start. Every later sweep reads the
-    /// maintained index; only [`ChunkCache::sweep`] re-walks.
-    async fn ensure_index(&self) -> Result<()> {
-        if self.inner.index.lock().is_some() {
-            return Ok(());
-        }
-        let started = crate::time_source::metrics_now();
-        let entries = self.list_entries().await?;
-        metrics::histogram!("engram_chunk_cache_sweep_seconds", "kind" => "walk")
-            .record(started.elapsed().as_secs_f64());
-        let built = Self::index_from_entries(&entries);
-        *self.inner.index.lock() = Some(built);
-        Ok(())
+    /// Build the index from one directory walk, OFF the write path.
+    /// The first populate-path sweep after boot lands here: at prod
+    /// scale the walk is seconds-to-tens-of-seconds (516k files,
+    /// spawn_blocking per stat, cold dentry cache right after a pod
+    /// roll), and the triggering task can be a get-miss populate
+    /// holding a singleflight leader slot on a restore path — it must
+    /// never pay the walk inline. The spawned task serializes on the
+    /// sweep gate, rechecks (a racing reconcile may have built the
+    /// index first), builds, then runs one enforcement sweep so the
+    /// budget takes effect the moment the index exists.
+    fn spawn_index_build(&self) {
+        let cache = self.clone();
+        tokio::spawn(async move {
+            let _gate = cache.inner.sweep_gate.lock().await;
+            if matches!(&*cache.inner.index.lock(), IndexState::Ready(_)) {
+                return;
+            }
+            let started = crate::time_source::metrics_now();
+            match cache.list_entries().await {
+                Ok(entries) => {
+                    metrics::histogram!("engram_chunk_cache_sweep_seconds", "kind" => "walk")
+                        .record(started.elapsed().as_secs_f64());
+                    cache.index_install(&entries);
+                    if let Err(e) = cache.evict_with_index().await {
+                        tracing::warn!(error = %e, "post-build chunk cache sweep failed");
+                    }
+                }
+                Err(e) => {
+                    // Next debounce winner re-spawns; the periodic
+                    // reconcile builds it regardless.
+                    tracing::warn!(error = %e, "chunk cache index build walk failed");
+                }
+            }
+        });
     }
 
     fn index_from_entries(entries: &[CacheEntry]) -> CacheIndex {
@@ -1813,31 +1876,55 @@ impl ChunkCache {
         }
     }
 
-    /// Record an in-process populate in the index. No-op until the
-    /// first sweep builds the index (the build's walk sees the file on
-    /// disk instead). Overwrites (same hash re-populated) adjust the
-    /// total by the size delta.
+    /// Record an in-process populate in the index — applied directly
+    /// when the index is `Ready`, buffered as a pending op while the
+    /// first walk is still in flight. Overwrites (same hash
+    /// re-populated) adjust the total by the size delta.
     fn index_insert(&self, hash: ChunkHash, size: u64) {
-        let mut guard = self.inner.index.lock();
-        let Some(idx) = guard.as_mut() else { return };
         let populated_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        if let Some(prev) = idx.entries.insert(hash, IndexEntry { size, populated_ms }) {
-            idx.total_bytes = idx.total_bytes.saturating_sub(prev.size);
+        let entry = IndexEntry { size, populated_ms };
+        match &mut *self.inner.index.lock() {
+            IndexState::Pending(ops) => ops.push(PendingOp::Insert(hash, entry)),
+            IndexState::Ready(idx) => idx.apply(PendingOp::Insert(hash, entry)),
         }
-        idx.total_bytes += size;
     }
 
     /// Record an in-process unlink (eviction, scrub-delete, test
-    /// helper) in the index. No-op until the index is built.
+    /// helper) in the index; buffered while the first walk is in
+    /// flight, same as inserts.
     fn index_remove(&self, hash: ChunkHash) {
-        let mut guard = self.inner.index.lock();
-        let Some(idx) = guard.as_mut() else { return };
-        if let Some(prev) = idx.entries.remove(&hash) {
-            idx.total_bytes = idx.total_bytes.saturating_sub(prev.size);
+        match &mut *self.inner.index.lock() {
+            IndexState::Pending(ops) => ops.push(PendingOp::Remove(hash)),
+            IndexState::Ready(idx) => idx.apply(PendingOp::Remove(hash)),
         }
+    }
+
+    /// Install a completed walk: replay any ops buffered while the
+    /// walk ran (they postdate the walk's view of each directory), and
+    /// gauge drift when replacing an earlier `Ready` index (the
+    /// reconcile case).
+    fn index_install(&self, entries: &[CacheEntry]) {
+        let mut built = Self::index_from_entries(entries);
+        let mut guard = self.inner.index.lock();
+        match &mut *guard {
+            IndexState::Pending(ops) => {
+                for op in ops.drain(..) {
+                    built.apply(op);
+                }
+            }
+            IndexState::Ready(prev) => {
+                // |walk truth − maintained index|. Persistent large
+                // drift means an unaccounted writer; transient small
+                // drift is normal (puts racing the walk, UFFD landings
+                // since the last reconcile).
+                let drift = built.total_bytes.abs_diff(prev.total_bytes);
+                metrics::gauge!("engram_chunk_cache_index_drift_bytes").set(drift as f64);
+            }
+        }
+        *guard = IndexState::Ready(built);
     }
 
     async fn list_entries(&self) -> Result<Vec<CacheEntry>> {
@@ -2168,6 +2255,12 @@ mod tests {
             },
             0.0,
         );
+        // Build the index up front (instant on an empty tempdir) so
+        // populate-path sweeps enforce inline — the steady state every
+        // test after the first minute of a process's life runs in. The
+        // deferred-build window itself is covered by
+        // `first_populate_defers_the_build_then_enforces`.
+        cache.sweep().await.unwrap();
         (cache, store, blob_dir, cache_dir)
     }
 
@@ -3512,6 +3605,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn first_populate_defers_the_build_then_enforces() {
+        // A fresh cache (no index yet): the first populate-path sweep
+        // must NOT walk inline — it spawns the build off-path and
+        // returns. Enforcement then lands once the background build
+        // completes (eventually-consistent; poll with a deadline).
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: 15,
+                sweep_debounce_ms: 0,
+                eviction_enabled: true,
+            },
+            0.0,
+        );
+        let a = b"aaaaaaaaaa";
+        let b = b"bbbbbbbbbb";
+        let (ha, hb) = (ChunkHash::of(a), ChunkHash::of(b));
+        cache.put(ha, a).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // 20 bytes against a 15-byte ceiling. The put itself must not
+        // block on a walk; the spawned build + its tail sweep evict.
+        cache.put(hb, b).await.unwrap();
+
+        let deadline = tokio::time::Duration::from_secs(5);
+        let evicted = tokio::time::timeout(deadline, async {
+            while cache.contains(ha).await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            evicted.is_ok(),
+            "background index build must complete and enforce the ceiling",
+        );
+        assert!(cache.contains(hb).await, "newest chunk survives");
+    }
+
     // ---- ChunkCacheConfig::SWEEP_INTERVAL_ENV_VAR precedence ----
 
     #[test]
@@ -3606,6 +3738,10 @@ mod tests {
             },
             1.0,
         );
+        // Build the index (instant on the empty dir) so the post-put
+        // sweep enforces inline rather than deferring to the
+        // background build.
+        cache.sweep().await.unwrap();
         let a = b"aaaaaaaaaa";
         let ha = store.put_chunk(a).await.unwrap();
         cache.put(ha, a).await.unwrap();
@@ -3635,6 +3771,10 @@ mod tests {
             },
             1.0,
         );
+        // Build the index up front so the put-path sweeps run inline
+        // (without this the test passes vacuously — no sweep, nothing
+        // could have evicted the chunk anyway).
+        cache.sweep().await.unwrap();
         let a = b"aaaaaaaaaa";
         let ha = store.put_chunk(a).await.unwrap();
         cache.put(ha, a).await.unwrap();
