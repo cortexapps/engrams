@@ -208,6 +208,25 @@ impl From<SandboxError> for ApiError {
     }
 }
 
+/// Issue #1012: the evict/evacuate pipeline's failures keep their typed
+/// classification. Stringifying an [`EvictError`] into `Internal` turned
+/// the wire-skew arm above into an opaque, non-retryable 500 exactly when
+/// a rolling deploy made "retry shortly" the correct answer.
+impl From<crate::idle_evictor::EvictError> for ApiError {
+    fn from(e: crate::idle_evictor::EvictError) -> Self {
+        use crate::idle_evictor::EvictError;
+        match e {
+            // Rides the SandboxError mapping (WireSkew/Unavailable → 503,
+            // NotFound → 404, …). The variant's own message already names
+            // the failing leg ("wire_version skew: …").
+            EvictError::Sandbox(se) => se.into(),
+            // Io/Meta are genuinely internal; their Display carries the
+            // "idle evict io/meta:" context.
+            other => Self::Internal(other.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +339,31 @@ mod tests {
         let api = ApiError::BadGateway("exec stream truncated".into());
         assert_eq!(api.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(api.slug(), "bad_gateway");
+    }
+
+    #[test]
+    fn evict_error_keeps_the_sandbox_classification() {
+        use crate::idle_evictor::EvictError;
+        // Issue #1012: `engrams host evacuate` against a wire-skewed source
+        // host returned an opaque 500 ("evac pipeline: …") mid-deploy. The
+        // typed path must ride the SandboxError arms: skew → retryable 503.
+        let api: ApiError = EvictError::Sandbox(SandboxError::WireSkew {
+            host: 23,
+            coord: 24,
+        })
+        .into();
+        assert_eq!(api.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(api.slug(), "unavailable");
+        assert!(api.message().contains("23") && api.message().contains("24"));
+
+        // Unavailable hosts stay retryable through the same path…
+        let api: ApiError =
+            EvictError::Sandbox(SandboxError::Unavailable("dial timeout".into())).into();
+        assert_eq!(api.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // …while Io/Meta remain genuinely internal.
+        let api: ApiError = EvictError::Meta("row vanished".into()).into();
+        assert_eq!(api.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(api.message().contains("idle evict meta"));
     }
 }
