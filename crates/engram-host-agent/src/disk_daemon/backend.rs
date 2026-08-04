@@ -189,14 +189,6 @@ pub struct PendingDiskFlush {
     flush_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
-impl PendingDiskFlush {
-    /// The frozen chunk list this flush will publish.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn chunk_indices(&self) -> &[(usize, u64)] {
-        &self.chunks
-    }
-}
-
 /// ADR 0045 C2 disk post-copy: the frozen source's sealed disk state
 /// — every chunk whose guest-visible content differs from the
 /// published base manifest (dirty and claimed file chunks),
