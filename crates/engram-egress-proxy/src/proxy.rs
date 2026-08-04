@@ -234,8 +234,6 @@ pub struct Listeners {
     metadata: Option<TcpListener>,
 }
 
-impl Listeners {}
-
 #[allow(clippy::too_many_arguments)]
 async fn handle(
     mut stream: TcpStream,

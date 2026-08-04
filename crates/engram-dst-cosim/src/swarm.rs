@@ -121,8 +121,6 @@ pub enum Step {
     AdvanceTime(u64),
 }
 
-impl Step {}
-
 /// The maximum live sessions in the small world (the state-space bound).
 pub const MAX_SESSIONS: usize = 3;
 

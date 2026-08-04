@@ -326,8 +326,6 @@ impl HarnessDescriptor {
     }
 }
 
-impl HarnessOption {}
-
 fn validate_options(field: &str, opts: &[HarnessOption], auth: &HarnessAuth) -> Result<(), String> {
     let mut seen: HashSet<&str> = HashSet::new();
     let mut defaults = 0usize;
