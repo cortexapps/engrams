@@ -1297,6 +1297,34 @@ pub trait MetadataStore: Send + Sync {
         Ok(idx)
     }
 
+    /// Idempotent accept: append `events` (in order) and insert the
+    /// outbox row in ONE transaction, keyed on the row's `prompt_id`.
+    /// A retry of an already-accepted prompt (same `prompt_id`, same
+    /// command) appends NOTHING and returns `Ok(None)` — the fix for
+    /// the duplicate user-echo rows a client/orchestrator retry used
+    /// to write (PR #556 review finding #3). A `prompt_id` collision
+    /// with a DIFFERENT command is `Err(Conflict)`. Atomicity also
+    /// guarantees the echo's `idx` precedes any `run_started` the
+    /// delivery causes: the row and its events become visible at the
+    /// same commit. The default composes non-atomically for simple
+    /// mock stores only.
+    async fn append_events_with_outbox_idempotent(
+        &self,
+        session_id: SessionId,
+        events: &[(String, serde_json::Value)],
+        outbox: &crate::types::outbox::OutboxRow,
+    ) -> Result<Option<Vec<i64>>, MetaError> {
+        let mut idxs = Vec::with_capacity(events.len());
+        for (kind, payload) in events {
+            idxs.push(
+                self.append_session_event(session_id, kind, payload.clone())
+                    .await?,
+            );
+        }
+        self.outbox_enqueue(outbox).await?;
+        Ok(Some(idxs))
+    }
+
     /// Sessions with at least one due, un-acked row (`acked_at IS NULL
     /// AND not_before <= now()`). The delivery driver fans out from
     /// this set. Default (mocks): empty.

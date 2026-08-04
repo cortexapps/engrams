@@ -3266,6 +3266,120 @@ impl MetadataStore for PostgresStore {
         Ok(idx)
     }
 
+    async fn append_events_with_outbox_idempotent(
+        &self,
+        session_id: SessionId,
+        events: &[(String, serde_json::Value)],
+        outbox: &engram_core::types::outbox::OutboxRow,
+    ) -> Result<Option<Vec<i64>>, MetaError> {
+        if outbox.session_id != session_id {
+            return Err(MetaError::Serialization(
+                "event/outbox session ids do not match".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO session_outbox
+                (prompt_id, session_id, kind, payload, created_at, not_before)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (prompt_id) DO NOTHING
+            RETURNING prompt_id
+            "#,
+        )
+        .bind(&outbox.prompt_id)
+        .bind(session_id.as_uuid())
+        .bind(outbox.kind.as_str())
+        .bind(&outbox.payload)
+        .bind(outbox.created_at)
+        .bind(outbox.not_before)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .is_some();
+
+        if !inserted {
+            // A retry of the SAME command is the designed no-op; a
+            // prompt_id claimed by a DIFFERENT command is corruption.
+            let existing = sqlx::query(
+                "SELECT session_id, kind, payload FROM session_outbox WHERE prompt_id = $1",
+            )
+            .bind(&outbox.prompt_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| {
+                MetaError::Conflict(format!(
+                    "outbox id {} disappeared during accept",
+                    outbox.prompt_id
+                ))
+            })?;
+            let existing_session: uuid::Uuid = existing.try_get("session_id").map_err(db_err)?;
+            let existing_kind: String = existing.try_get("kind").map_err(db_err)?;
+            if existing_session != session_id.as_uuid() || existing_kind != outbox.kind.as_str() {
+                return Err(MetaError::Conflict(format!(
+                    "outbox id {} belongs to another command",
+                    outbox.prompt_id
+                )));
+            }
+            tx.rollback().await.map_err(db_err)?;
+            return Ok(None);
+        }
+
+        let mut idxs = Vec::with_capacity(events.len());
+        for (kind, payload) in events {
+            let event = sqlx::query(
+                r#"
+                WITH next AS (
+                    UPDATE sessions
+                       SET next_event_idx = next_event_idx + 1,
+                           updated_at = $4,
+                           last_event_at = $4
+                     WHERE id = $1
+                 RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
+                ),
+                inserted AS (
+                    INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch, created_at)
+                    SELECT $1, allocated_idx, $2, $3, recovery_epoch, $4 FROM next
+                    RETURNING idx
+                )
+                SELECT idx FROM inserted
+                "#,
+            )
+            .bind(session_id.as_uuid())
+            .bind(kind)
+            .bind(payload)
+            .bind(self.clock.now_utc())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .ok_or(MetaError::NotFound)?;
+            idxs.push(event.try_get::<i64, _>("idx").map_err(db_err)?);
+        }
+
+        // Notifications fire at commit: replicas see the events and the
+        // outbox row together, so delivery can never observe the row
+        // without its echo (the ADR 0052 echo-before-run_started
+        // ordering, now transactional instead of sequenced).
+        for idx in &idxs {
+            sqlx::query("SELECT pg_notify('session_events', $1)")
+                .bind(
+                    serde_json::json!({ "session_id": session_id.to_string(), "idx": idx })
+                        .to_string(),
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        }
+        sqlx::query("SELECT pg_notify('session_outbox', $1)")
+            .bind(session_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(Some(idxs))
+    }
+
     async fn outbox_due_sessions(&self) -> Result<Vec<SessionId>, MetaError> {
         let rows = sqlx::query(
             "SELECT DISTINCT session_id FROM session_outbox
@@ -4778,12 +4892,14 @@ impl MetadataStore for PostgresStore {
         // rolled-back span that the rewind CANNOT undo. We surface
         // them rather than hide them (the deliberate at-least-once
         // posture). Detect the kinds that touched the world.
+        // `file_shared` left this detector when it left the rewindable
+        // set (user input survives the rewind, so the event itself
+        // stays visible — a "still exists" note would be redundant).
         let side_effect_rows = sqlx::query(
             r#"
             SELECT kind, payload FROM session_events
              WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
-               AND (kind = 'file_shared'
-                    OR (kind = 'integration_asset' AND payload->>'surface' = 'asset'))
+               AND kind = 'integration_asset' AND payload->>'surface' = 'asset'
              ORDER BY idx
             "#,
         )
@@ -4832,76 +4948,54 @@ impl MetadataStore for PostgresStore {
                             }
                         }
                     }
-                    "file_shared" => format!(
-                        "A file was shared and still exists: {}",
-                        payload
-                            .get("caption")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| payload.get("artifact_id").and_then(|v| v.as_str()))
-                            .unwrap_or("(artifact)"),
-                    ),
                     _ => return None,
                 })
             })
             .collect();
 
         // Tombstone the rolled-back span (audit-preserving) and count it.
-        // Issue #529: exclude coordinator-fact kinds — `status_changed`,
-        // `snapshot_taken`, `evicted`, `resumed`, `resume_started`,
-        // `recovered_from_checkpoint`.
-        // Those are control-plane bookkeeping the coordinator itself
-        // appended around the eviction/resume boundary; they stay true
-        // regardless of what the guest remembers, so rewinding them was
-        // what made every clean evict→resume "roll back" (median 4
-        // events) even with nothing lost. Everything guest-derived
-        // (run_*, agent_message*, tool_call_*, exec_*, stdout/stderr,
-        // user_question, question_answered, file_changed, file_shared,
-        // integration_asset, …) still rewinds.
         //
-        // ADR 0091: `harness_idle` and ADR 0089's `harness_parked` join
-        // the exclusion list. They are the idle detector's nomination
-        // inputs — either "the harness finished its turn and is waiting"
-        // or "the open turn is waiting only on deferred external work" —
-        // facts that stay true across a clean evict/resume (the resumed
-        // session remains idle or parked until the next prompt/result),
-        // and they land after the eviction checkpoint's cursor by
-        // construction (waiting marker → 5 min TTL → capture cut at pause
-        // time). Rewinding them made EVERY clean cycle report
-        // `rolled_back: 1` under a `host_failure_recovery` banner
-        // (2026-07-11 campaign, every observed resume). With them
-        // excluded, a clean resume tombstones nothing and
-        // `apply_rung1_rewind`'s zero-rows early-return emits no
-        // recovery event at all — the honest outcome.
+        // The predicate is POSITIVE: it names the guest-history kinds
+        // the rewind MAY touch — the closed set the harness sink and
+        // the exec API produce, whose truth lives in guest state the
+        // checkpoint does not cover. Everything else survives BY
+        // DEFAULT: coordinator facts (status_changed, snapshot_taken,
+        // evicted, resumed, resume_started, recovered_from_checkpoint,
+        // durability_rollback — issue #529), stable harness waiting
+        // markers (harness_idle / harness_parked — ADR 0091/0089),
+        // user intent (prompt_received — issue #527;
+        // harness_mode_changed — ADR 0107), user INPUT (the
+        // agent_message user echo, tool_result_submitted, file_shared
+        // — prod 2026-08-03: a prompt sent to an idle session raced
+        // the un-park rewind and was tombstoned, reading as a
+        // "checkpoint/restore crash"), and any kind added in the
+        // future. The old NOT IN list had the opposite default — every
+        // new non-guest kind was silently rewindable until someone
+        // remembered to exclude it, and #529, ADR 0091, #527, ADR 0107
+        // and the 2026-08-03 incident were each that default firing.
         //
-        // Issue #527 Phase 1: `prompt_received` is ALSO excluded here — it
-        // is a coordinator-authoritative fact ("the user asked at time T")
-        // that stays true across a guest-state rewind (the resume rewinds
-        // the HARNESS's view of the world, not whether the user sent the
-        // prompt). Without this exclusion, every resume-with-rollback would
-        // tombstone the receipt row and inflate `rolled_back` by one,
-        // masking the real signal this issue exists to measure.
-        //
-        // Per issue #527's Guardrails merge-coordination note: the two
-        // sibling exclusion lists compose into one `AND kind NOT IN (...)`
-        // predicate rather than stacking separate `AND kind <>` clauses.
-        //
-        // ADR 0090 (2026-07-20 durability-rollback incident): `durability_rollback`
-        // joins the exclusion set. It is the coordinator's own record that a
-        // quarantined-survivor destroy already rewound this session's disk to
-        // the last published manifest — a fact that stays true across the very
-        // rewind it warns about (the destroy happened; the writes are gone). It
-        // lands after the checkpoint cursor by construction, so tombstoning it
-        // would grey out the one durable, user-visible marker of the loss.
+        // `agent_message` is the one kind with mixed provenance: the
+        // harness's assistant/system messages are guest history; the
+        // user echo is input. A row with no role survives (uncertainty
+        // never destroys). Keep this predicate in lockstep with
+        // `SimMetadataStore::rewind_session_to_cursor` (ADR 0098 D4:
+        // any change here needs the conformance case extended in the
+        // same PR).
         let tombstoned = sqlx::query(
             r#"
             UPDATE session_events
                SET rewound_at = $3
              WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
-               AND kind NOT IN (
-                   'status_changed', 'snapshot_taken', 'evicted',
-                   'resumed', 'resume_started', 'recovered_from_checkpoint',
-                   'prompt_received', 'harness_idle', 'harness_parked',
-                   'durability_rollback', 'harness_mode_changed'
+               AND (
+                   kind IN (
+                       'run_started', 'run_completed', 'run_interrupted',
+                       'tool_call_started', 'tool_call_completed', 'tool_call_requested',
+                       'browser_activity',
+                       'prompt_queued', 'prompt_edited', 'prompt_dequeued', 'prompt_steered',
+                       'file_changed', 'title_suggested', 'integration_asset',
+                       'exec_started', 'exec_completed', 'stdout', 'stderr'
+                   )
+                   OR (kind = 'agent_message' AND payload->>'role' <> 'user')
                )
             "#,
         )

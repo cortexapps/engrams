@@ -3008,6 +3008,50 @@ impl MetadataStore for SimMetadataStore {
         Ok(idx)
     }
 
+    async fn append_events_with_outbox_idempotent(
+        &self,
+        session_id: SessionId,
+        events: &[(String, serde_json::Value)],
+        row: &engram_core::types::outbox::OutboxRow,
+    ) -> Result<Option<Vec<i64>>, MetaError> {
+        // Faithful mirror of the PG impl: a retry of the SAME command
+        // (existing prompt_id, matching identity) appends NOTHING and
+        // returns Ok(None); a prompt_id claimed by a DIFFERENT command
+        // is Conflict. Only a fresh insert appends the events.
+        self.gate()?;
+        if row.session_id != session_id {
+            return Err(MetaError::Serialization(
+                "outbox row session_id mismatch".into(),
+            ));
+        }
+        {
+            let mut db = self.db.lock();
+            match db.outbox.get(&row.prompt_id) {
+                None => {
+                    db.outbox.insert(row.prompt_id.clone(), row.clone());
+                }
+                Some(existing) => {
+                    if existing.session_id != row.session_id || existing.kind != row.kind {
+                        return Err(MetaError::Conflict(format!(
+                            "outbox id {} belongs to another command",
+                            row.prompt_id
+                        )));
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+        let mut idxs = Vec::with_capacity(events.len());
+        for (kind, payload) in events {
+            idxs.push(
+                self.append_session_event(session_id, kind, payload.clone())
+                    .await?,
+            );
+        }
+        self.notify("session_outbox", session_id.to_string());
+        Ok(Some(idxs))
+    }
+
     /// Only mutable pre-delivery.
     async fn outbox_update_prompt_text(
         &self,
@@ -4026,38 +4070,52 @@ impl MetadataStore for SimMetadataStore {
     ) -> Result<engram_core::types::event::RewindSummary, MetaError> {
         // Faithful mirror of `PostgresStore::rewind_session_to_cursor`
         // (crates/engram-postgres): detect surviving side-effects in the
-        // rolled-back span, tombstone every NON-excluded live event past
-        // the cursor, and — only if anything actually rewound — bump the
-        // recovery epoch. The excluded-kind list and the side-effect line
-        // text MUST match the SQL exactly; the conformance suite
+        // rolled-back span, tombstone every GUEST-HISTORY event past the
+        // cursor (a positive list — everything else survives by
+        // default), and — only if anything actually rewound — bump the
+        // recovery epoch. The guest-history list and the side-effect
+        // line text MUST match the SQL exactly; the conformance suite
         // (engram-sim/tests) runs the same scenario against both stores.
         // ADR 0098 D4 conformance rule: this method changed from a panic
         // stub to a real impl in the PR that added `resume_started` to the
-        // exclusion set.
+        // old exclusion set.
         self.gate()?;
         let now = self.now();
         let mut db = self.db.lock();
 
-        // Coordinator-fact kinds that survive a rewind (mirror the PG
-        // `AND kind NOT IN (...)` predicate — keep in lockstep).
-        // ADR 0090: `durability_rollback` is a coordinator fact recording a
-        // completed quarantined-survivor disk rewind — it survives the rewind
-        // it warns about, so it joins the exclusion set (PG parity).
-        const EXCLUDED: &[&str] = &[
-            "status_changed",
-            "snapshot_taken",
-            "evicted",
-            "resumed",
-            "resume_started",
-            "recovered_from_checkpoint",
-            "prompt_received",
-            "harness_idle",
-            "harness_parked",
-            "durability_rollback",
-            // ADR 0107: a mode directive is user intent, not guest state — it
-            // stays true across a rewind (PG parity).
-            "harness_mode_changed",
+        // The guest-history kinds the rewind MAY touch (mirror the PG
+        // positive `kind IN (...)` predicate — keep in lockstep).
+        // Everything NOT in this set survives by default: coordinator
+        // facts, stable waiting markers, user intent, user input, and
+        // any kind added in the future. `agent_message` is handled
+        // below with the role predicate (assistant/system = guest
+        // history; the user echo = input; no role = survives).
+        const GUEST_HISTORY: &[&str] = &[
+            "run_started",
+            "run_completed",
+            "run_interrupted",
+            "tool_call_started",
+            "tool_call_completed",
+            "tool_call_requested",
+            "browser_activity",
+            "prompt_queued",
+            "prompt_edited",
+            "prompt_dequeued",
+            "prompt_steered",
+            "file_changed",
+            "title_suggested",
+            "integration_asset",
+            "exec_started",
+            "exec_completed",
+            "stdout",
+            "stderr",
         ];
+        fn is_guest_history(kind: &str, payload: &serde_json::Value) -> bool {
+            GUEST_HISTORY.contains(&kind)
+                || (kind == "agent_message"
+                    && payload.get("role").and_then(|v| v.as_str()) != Some("user")
+                    && payload.get("role").and_then(|v| v.as_str()).is_some())
+        }
 
         let (tombstoned, surviving_side_effects) = {
             let Some(events) = db.session_events.get_mut(&session_id) else {
@@ -4108,15 +4166,9 @@ impl MetadataStore for SimMetadataStore {
                             }
                         });
                     }
-                    "file_shared" => {
-                        let detail = e
-                            .payload
-                            .get("caption")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| e.payload.get("artifact_id").and_then(|v| v.as_str()))
-                            .unwrap_or("(artifact)");
-                        surviving.push(format!("A file was shared and still exists: {detail}"));
-                    }
+                    // `file_shared` is user input now — it survives the
+                    // rewind, so the event itself stays visible and a
+                    // "still exists" note would be redundant (PG parity).
                     _ => {}
                 }
             }
@@ -4126,7 +4178,7 @@ impl MetadataStore for SimMetadataStore {
             for e in events.iter_mut() {
                 if e.idx > events_cursor
                     && e.rewound_at.is_none()
-                    && !EXCLUDED.contains(&e.kind.as_str())
+                    && is_guest_history(&e.kind, &e.payload)
                 {
                     e.rewound_at = Some(now);
                     n += 1;

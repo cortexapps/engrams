@@ -1058,6 +1058,46 @@ impl AppState {
         Ok(idx)
     }
 
+    /// Idempotent prompt accept: persist the accept-time events (the
+    /// `prompt_received` receipt, the user echo, an optional
+    /// `harness_mode_changed`) and the outbox row in ONE metadata
+    /// transaction keyed on `prompt_id`, then publish the committed
+    /// events on the live bus. A retry of an already-accepted prompt
+    /// persists and publishes NOTHING (`Ok(None)`) — the duplicate
+    /// user-echo fix (PR #556 review finding #3).
+    pub async fn emit_prompt_accept(
+        &self,
+        session: SessionId,
+        events: Vec<SessionEvent>,
+        outbox: &engram_core::types::outbox::OutboxRow,
+    ) -> Result<Option<()>, crate::error::ApiError> {
+        let mut kinds_payloads = Vec::with_capacity(events.len());
+        for event in &events {
+            let payload = serde_json::to_value(event)
+                .map_err(|e| crate::error::ApiError::Internal(format!("event serialize: {e}")))?;
+            kinds_payloads.push((event.kind().to_string(), payload));
+        }
+        let Some(idxs) = self
+            .services
+            .meta
+            .append_events_with_outbox_idempotent(session, &kinds_payloads, outbox)
+            .await?
+        else {
+            return Ok(None);
+        };
+        for (idx, event) in idxs.into_iter().zip(events) {
+            self.events.publish(
+                session,
+                IndexedEvent {
+                    idx,
+                    event,
+                    ephemeral: false,
+                },
+            );
+        }
+        Ok(Some(()))
+    }
+
     /// Persist an event and the durable command it announces in one metadata
     /// transaction, then publish the committed event on the live bus.
     pub async fn emit_with_outbox(

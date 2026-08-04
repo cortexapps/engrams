@@ -2910,9 +2910,13 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     meta.append_session_event(id, "resume_started", serde_json::json!({}))
         .await
         .unwrap();
-    meta.append_session_event(id, "agent_message", serde_json::json!({"text": "hi"}))
-        .await
-        .unwrap();
+    meta.append_session_event(
+        id,
+        "agent_message",
+        serde_json::json!({"role": "assistant", "text": "hi"}),
+    )
+    .await
+    .unwrap();
     meta.append_session_event(
         id,
         "integration_asset",
@@ -2963,43 +2967,38 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     // Rewind everything after the anchor.
     let summary = meta.rewind_session_to_cursor(id, cursor).await.unwrap();
 
-    // Only the guest-derived events roll back (agent_message,
-    // integration_asset, tool_call_started, file_shared = 4); the
+    // Only the guest-history events roll back (the assistant
+    // agent_message, integration_asset, tool_call_started = 3). The
     // coordinator facts (prompt_received, resume_started, harness_idle,
-    // harness_mode_changed, durability_rollback) + the anchor
-    // status_changed survive.
-    assert_eq!(summary.rolled_back, 4, "rolled_back count");
+    // harness_mode_changed, durability_rollback), the anchor
+    // status_changed, AND user input (file_shared) survive — the
+    // positive-provenance predicate defaults to keep.
+    assert_eq!(summary.rolled_back, 3, "rolled_back count");
     assert_eq!(summary.through_idx, cursor, "through_idx is the cursor");
     assert_eq!(summary.recovery_epoch, 1, "epoch bumped once");
     assert_eq!(
         summary.surviving_side_effects,
-        vec![
-            "A forge pull_request was produced and still exists: PR #5".to_string(),
-            "A file was shared and still exists: my notes".to_string(),
-        ],
-        "surviving side-effects, in idx order",
+        vec!["A forge pull_request was produced and still exists: PR #5".to_string()],
+        "surviving side-effects: only the tombstoned integration asset — \
+         file_shared survives the rewind, so its event stays visible and \
+         needs no note",
     );
 
-    // Per-event tombstone state must agree across stores: excluded kinds
-    // stay live (rewound_at None), rewindable kinds are tombstoned.
+    // Per-event tombstone state must agree across stores: only
+    // guest-history kinds are tombstoned; everything else stays live.
     let events = meta
         .list_session_events_since(id, cursor, 1000)
         .await
         .unwrap();
     for e in &events {
-        let excluded = matches!(
+        let guest_history = matches!(
             e.kind.as_str(),
-            "prompt_received"
-                | "resume_started"
-                | "harness_idle"
-                | "status_changed"
-                | "durability_rollback"
-                | "harness_mode_changed"
+            "agent_message" | "integration_asset" | "tool_call_started"
         );
         assert_eq!(
-            e.rewound_at.is_none(),
-            excluded,
-            "kind {} rewound_at (excluded={excluded})",
+            e.rewound_at.is_some(),
+            guest_history,
+            "kind {} rewound_at (guest_history={guest_history})",
             e.kind
         );
     }
@@ -3183,9 +3182,186 @@ async fn artifact_outlives_sessions(ctx: &Ctx) {
     assert_eq!(ctx.meta.artifact_usage(ghost).await.unwrap(), (1, 7));
 }
 
+/// Prod 2026-08-03 (session aa0829b0, 12 sessions/14d): a prompt sent
+/// to an idle session was appended before the un-park resume ran its
+/// rung-1 rewind, and the rewind tombstoned the user's own message —
+/// surfacing as a spurious `recovered_from_checkpoint{checkpoint_lag,
+/// rolled_back: 1}`. The positive-provenance predicate makes user
+/// input un-tombstoneable by construction: the race is benign at every
+/// interleaving, and a clean idle resume (nothing but input past the
+/// cursor) rolls back ZERO rows — so `apply_rung1_rewind` emits no
+/// recovery event at all. Genuine lag (guest rows past the cursor)
+/// must still count and still fire — non-vacuity is asserted here too.
+async fn rewind_never_tombstones_user_input(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta
+        .create_session(spec("conf:rewind-input"))
+        .await
+        .unwrap();
+
+    let cursor = meta
+        .append_session_event(id, "status_changed", serde_json::json!({"to": "idle"}))
+        .await
+        .unwrap();
+
+    // The incident shape: ONLY user input lands past the cursor (the
+    // prompt echo, a deferred tool answer, an uploaded file) plus an
+    // unknown future kind — nothing the guest produced.
+    meta.append_session_event(
+        id,
+        "agent_message",
+        serde_json::json!({"role": "user", "text": "ok resume"}),
+    )
+    .await
+    .unwrap();
+    meta.append_session_event(
+        id,
+        "tool_result_submitted",
+        serde_json::json!({"tool_call_id": "t1", "result_json": "{}"}),
+    )
+    .await
+    .unwrap();
+    meta.append_session_event(
+        id,
+        "file_shared",
+        serde_json::json!({"caption": "spec.pdf", "artifact_id": "art9"}),
+    )
+    .await
+    .unwrap();
+    meta.append_session_event(id, "some_future_kind", serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // A clean idle resume: zero rows tombstoned, zero epoch bump, and
+    // therefore (in the coordinator) zero recovery events emitted.
+    let summary = meta.rewind_session_to_cursor(id, cursor).await.unwrap();
+    assert_eq!(summary.rolled_back, 0, "user input never rolls back");
+    assert_eq!(summary.recovery_epoch, 0, "no-op rewind bumps nothing");
+    let events = meta
+        .list_session_events_since(id, cursor, 1000)
+        .await
+        .unwrap();
+    assert!(
+        events.iter().all(|e| e.rewound_at.is_none()),
+        "no row past the cursor was tombstoned",
+    );
+
+    // Non-vacuity: with GENUINE guest history past the cursor, the
+    // rewind still counts exactly the guest rows — user input still
+    // survives alongside them.
+    meta.append_session_event(id, "run_started", serde_json::json!({"run_id": "r1"}))
+        .await
+        .unwrap();
+    meta.append_session_event(
+        id,
+        "agent_message",
+        serde_json::json!({"role": "assistant", "text": "working…"}),
+    )
+    .await
+    .unwrap();
+    let summary = meta.rewind_session_to_cursor(id, cursor).await.unwrap();
+    assert_eq!(
+        summary.rolled_back, 2,
+        "genuine guest history still counts (run_started + assistant message)",
+    );
+    assert_eq!(summary.recovery_epoch, 1, "genuine lag bumps the epoch");
+    let events = meta
+        .list_session_events_since(id, cursor, 1000)
+        .await
+        .unwrap();
+    for e in &events {
+        let guest_history = matches!(e.kind.as_str(), "run_started")
+            || (e.kind == "agent_message"
+                && e.payload.get("role").and_then(|v| v.as_str()) == Some("assistant"));
+        assert_eq!(
+            e.rewound_at.is_some(),
+            guest_history,
+            "kind {} (payload {:?}) tombstone state",
+            e.kind,
+            e.payload,
+        );
+    }
+}
+
 conformance!(
     t_rewind_excludes_coordinator_facts,
     super::rewind_excludes_coordinator_facts
+);
+conformance!(
+    t_rewind_never_tombstones_user_input,
+    super::rewind_never_tombstones_user_input
+);
+
+/// The idempotent prompt accept (PR #556 finding #3): a retry with the
+/// same `prompt_id` appends NOTHING — no duplicate receipt, no
+/// duplicate user echo — and a `prompt_id` claimed by a different
+/// command is a Conflict.
+async fn prompt_accept_is_idempotent_on_prompt_id(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta.create_session(spec("conf:accept")).await.unwrap();
+    let now = ctx.clock.now_utc();
+
+    let row = engram_core::types::outbox::OutboxRow {
+        prompt_id: "p-accept-1".into(),
+        session_id: id,
+        kind: engram_core::types::outbox::OutboxKind::Prompt,
+        payload: serde_json::json!({"text": "hello"}),
+        created_at: now,
+        attempts: 0,
+        not_before: now,
+        delivered_at: None,
+        acked_at: None,
+    };
+    let events = vec![
+        (
+            "prompt_received".to_string(),
+            serde_json::json!({"prompt_id": "p-accept-1"}),
+        ),
+        (
+            "agent_message".to_string(),
+            serde_json::json!({"role": "user", "text": "hello", "prompt_id": "p-accept-1"}),
+        ),
+    ];
+
+    // Fresh accept: both events append, in order, and the row exists.
+    let idxs = meta
+        .append_events_with_outbox_idempotent(id, &events, &row)
+        .await
+        .unwrap()
+        .expect("fresh accept appends");
+    assert_eq!(idxs.len(), 2, "one idx per event");
+    assert!(idxs[0] < idxs[1], "events append in order");
+    let after_first = meta.list_session_events_since(id, -1, 1000).await.unwrap();
+
+    // Retry (same prompt_id, same command): appends NOTHING.
+    let retry = meta
+        .append_events_with_outbox_idempotent(id, &events, &row)
+        .await
+        .unwrap();
+    assert!(retry.is_none(), "retry is the designed no-op");
+    let after_retry = meta.list_session_events_since(id, -1, 1000).await.unwrap();
+    assert_eq!(
+        after_first.len(),
+        after_retry.len(),
+        "a retry appends no duplicate receipt/echo rows",
+    );
+
+    // Same prompt_id, DIFFERENT command: corruption, not idempotency.
+    let mut stolen = row.clone();
+    stolen.kind = engram_core::types::outbox::OutboxKind::ToolResult;
+    let err = meta
+        .append_events_with_outbox_idempotent(id, &events, &stolen)
+        .await
+        .expect_err("a different command on the same prompt_id must conflict");
+    assert!(
+        matches!(err, engram_core::error::MetaError::Conflict(_)),
+        "got {err:?}",
+    );
+}
+
+conformance!(
+    t_prompt_accept_is_idempotent_on_prompt_id,
+    super::prompt_accept_is_idempotent_on_prompt_id
 );
 conformance!(
     t_list_session_events_pages,
