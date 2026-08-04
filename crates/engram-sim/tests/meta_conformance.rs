@@ -3357,6 +3357,27 @@ async fn prompt_accept_is_idempotent_on_prompt_id(ctx: &Ctx) {
         matches!(err, engram_core::error::MetaError::Conflict(_)),
         "got {err:?}",
     );
+
+    // Same prompt_id, same kind, DIFFERENT payload (text/mode): the
+    // payload is part of the command identity — a divergent re-send
+    // conflicts loudly instead of silently dropping the new text
+    // (review finding on #993).
+    let mut divergent = row.clone();
+    divergent.payload = serde_json::json!({"text": "something else entirely"});
+    let err = meta
+        .append_events_with_outbox_idempotent(id, &events, &divergent)
+        .await
+        .expect_err("a divergent payload on the same prompt_id must conflict");
+    assert!(
+        matches!(err, engram_core::error::MetaError::Conflict(_)),
+        "got {err:?}",
+    );
+    let after_divergent = meta.list_session_events_since(id, -1, 1000).await.unwrap();
+    assert_eq!(
+        after_first.len(),
+        after_divergent.len(),
+        "a rejected divergent re-send appends nothing",
+    );
 }
 
 conformance!(
