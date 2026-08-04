@@ -90,6 +90,66 @@ pub fn init(addr: SocketAddr) {
             epoch_bytes_buckets,
         )
         .expect("install epoch-bytes histogram buckets");
+    // ADR 0110: the write ack is the one latency the dirty file newly puts
+    // on the guest's critical path, and it lives three decimal places
+    // below everything else this exporter measures. A `pwrite` into page
+    // cache returns in tens of microseconds; the default `_seconds`
+    // buckets start at 5 ms, so every healthy sample would land in the
+    // first bucket and p99 would report "fast" no matter what happened.
+    // The top of the range covers the two known slow paths: a 16 MiB
+    // chunk materializing on first touch, and writeback throttling under
+    // memory pressure (ADR 0110 tradeoff 1).
+    let write_ack_buckets = &[
+        0.000_01, 0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05,
+        0.1, 0.25, 0.5, 1.0, 5.0,
+    ];
+    builder = builder
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(NBD_WRITE_ACK_SECONDS.to_string()),
+            write_ack_buckets,
+        )
+        .expect("install write-ack histogram buckets");
+    // One NBD request spans 4 KiB (NBD_BLOCK_SIZE) to 32 MiB
+    // (MAX_REQUEST_PAYLOAD_BYTES). Without explicit buckets a histogram
+    // renders as a Prometheus summary, whose per-host quantiles cannot be
+    // aggregated across the fleet — the same trap the epoch-bytes comment
+    // above records.
+    const KIB: f64 = 1024.0;
+    let write_bytes_buckets = &[
+        4.0 * KIB,
+        16.0 * KIB,
+        64.0 * KIB,
+        128.0 * KIB,
+        512.0 * KIB,
+        MIB,
+        4.0 * MIB,
+        16.0 * MIB,
+        32.0 * MIB,
+    ];
+    builder = builder
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(NBD_WRITE_BYTES.to_string()),
+            write_bytes_buckets,
+        )
+        .expect("install write-bytes histogram buckets");
+    // Recovered bytes span one 16 MiB chunk to a whole unpublished
+    // divergence. The 0 bucket splits out clean-shutdown recoveries that
+    // had nothing left to save from the ones that rescued real writes.
+    let recovered_bytes_buckets = &[
+        0.0,
+        16.0 * MIB,
+        64.0 * MIB,
+        256.0 * MIB,
+        1024.0 * MIB,
+        4096.0 * MIB,
+        16384.0 * MIB,
+    ];
+    builder = builder
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(DIRTY_RECOVERED_BYTES.to_string()),
+            recovered_bytes_buckets,
+        )
+        .expect("install recovered-bytes histogram buckets");
 
     match builder.install() {
         Ok(()) => {
@@ -108,6 +168,9 @@ pub fn init(addr: SocketAddr) {
     // too. (Same rationale as the coordinator's pre-registration.)
     ::metrics::counter!(CHECKPOINT_CHAIN_POISONED_TOTAL).absolute(0);
     ::metrics::counter!(SPOOL_LINEAGE_MISMATCH_TOTAL).absolute(0);
+    // ADR 0110: a failed extent scan fails the reattach. Pre-register so
+    // the alert policy can exist before the first firing.
+    ::metrics::counter!(DIRTY_RECOVER_TOTAL, "outcome" => "scan_failed").absolute(0);
     ::metrics::counter!(SHUTDOWN_STAGE_PANIC_TOTAL).absolute(0);
     ::metrics::counter!(CAPTURE_SHUTDOWN_STRAGGLER_TOTAL).absolute(0);
 }
@@ -505,3 +568,77 @@ pub const SHUTDOWN_STAGE_PANIC_TOTAL: &str = "engram_host_shutdown_stage_panic_t
 /// `engram_quarantine_stuck_total`.
 pub const QUARANTINE_REHYDRATE_RECOVERED_TOTAL: &str =
     "engram_nbd_quarantine_rehydrate_recovered_total";
+
+// ─── ADR 0110 rollout gates ───────────────────────────────────────
+//
+// The dirty file made the write path honest. These four metrics are how
+// the rollout is judged; `docs/adr/0110-…md` §Rollout names them. Two
+// of them answer "is the new path live", one answers "what did it save",
+// one answers "did the honesty cost latency".
+
+/// Counter. Which source seeded a survivor's dirty tier on reattach.
+/// Labels: `source` ∈
+/// - `dirty_file` — the ADR 0110 path. The file outlived the process and
+///   the extent scan rebuilt the dirty set.
+/// - `spool` — the pre-0110 fallback. A sandbox created before the
+///   upgrade has no dirty file, so the shutdown spool seeds it.
+/// - `none` — no dirty file and no adoptable spool. Correct for a
+///   sandbox with nothing unpublished; suspicious in a burst.
+///
+/// **This is the primary rollout gate.** Absence of errors cannot prove
+/// the new path runs, because the OLD path is also silent when it works.
+/// The first roll after the upgrade reports `spool` for every survivor
+/// (no file existed yet); the roll AFTER that is the first real exercise
+/// of `dirty_file`. Read as
+/// `sum by (source) (increase(engram_nbd_reattach_seed_total[1w]))` —
+/// `dirty_file` must climb and `spool` must fall to zero as pre-upgrade
+/// sandboxes age out. `spool` still rising after a week means dirty
+/// files are not surviving the roll, which is the whole premise failing.
+pub const REATTACH_SEED_TOTAL: &str = "engram_nbd_reattach_seed_total";
+
+/// Counter. Extent-scan recoveries, labelled `outcome` ∈ {`ok`,
+/// `scan_failed`}. Pairs with [`DIRTY_RECOVERED_BYTES`]: this counts how
+/// OFTEN the new recovery ran, that measures how MUCH it saved.
+/// `scan_failed` means `SEEK_DATA`/`SEEK_HOLE` errored — the reattach
+/// fails and the survivor rides the evict → resume ladder. Alert on any.
+pub const DIRTY_RECOVER_TOTAL: &str = "engram_nbd_dirty_recover_total";
+
+/// Histogram. Bytes of allocated extent one extent scan recovered —
+/// acked guest writes that a host-agent death would previously have
+/// destroyed. This is the ADR's central claim expressed as a number, so
+/// it is the evidence for the retirement PR: a week of non-zero samples
+/// is proof the write-through path did real work. The `0` bucket splits
+/// out the clean-shutdown recoveries that had nothing left to save.
+pub const DIRTY_RECOVERED_BYTES: &str = "engram_nbd_dirty_recovered_bytes";
+
+/// Histogram. Seconds one extent scan took. The scan is a synchronous
+/// `lseek` loop that runs on the reattach critical path, BEFORE
+/// RECONFIGURE releases guest I/O — so a slow scan delays a survivor's
+/// resume and is felt by the user. Default `_seconds` buckets are right
+/// here: a fast scan collapsing into the 5 ms bucket is fine, because
+/// the only question this answers is how bad the slow tail gets.
+pub const DIRTY_RECOVER_SECONDS: &str = "engram_nbd_dirty_recover_seconds";
+
+/// Histogram. Seconds from an NBD WRITE reaching the backend to the
+/// backend acking it, labelled `outcome` ∈ {`ok`, `eio`}.
+///
+/// ADR 0110 put a `pwrite` in front of every ack where the RAM map had
+/// none, and tradeoff 1 in the ADR is that under memory pressure the
+/// kernel can throttle that `pwrite` into writeback. This is the one
+/// latency the design newly places on the guest's critical path, and
+/// nothing measured it before.
+///
+/// It carries explicit microsecond-scale buckets (see `init`). The
+/// default `_seconds` buckets start at 5 ms, but a `pwrite` into page
+/// cache lands in tens of microseconds — every healthy sample would
+/// collapse into one bucket and p99 would read "fast" forever.
+///
+/// Read WITH [`NBD_WRITE_BYTES`]: a p99 rise means nothing on its own,
+/// because a workload shift to bigger writes moves it too. A 16 MiB
+/// chunk materializing on first touch is the expected slow tail.
+pub const NBD_WRITE_ACK_SECONDS: &str = "engram_nbd_write_ack_seconds";
+
+/// Histogram. Bytes per NBD WRITE request. The normalizer for
+/// [`NBD_WRITE_ACK_SECONDS`] — it separates "slower because larger"
+/// from "slower because the kernel throttled writeback".
+pub const NBD_WRITE_BYTES: &str = "engram_nbd_write_bytes";

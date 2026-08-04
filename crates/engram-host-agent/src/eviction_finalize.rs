@@ -45,7 +45,7 @@
 //!
 //! The issue sketched a bifurcated disk leg: a "live path" that reuses
 //! `ChunkedDiskBackend::flush_upload` (preserving its rebase of the live
-//! backend's `state`/`pending_uploads`) when the NBD data plane still
+//! backend's `state` and dirty-tier claims) when the NBD data plane still
 //! exists, and a "redrive path" that reconstructs the manifest from the
 //! persisted bytes when it doesn't. This implementation always uses the
 //! reconstruction path: the eviction flavor destroys the sandbox
@@ -416,7 +416,7 @@ async fn publish_manifest_collision_safe(
 /// Publish a disk manifest by layering `chunks` onto `base_manifest`,
 /// with retry-on-version-conflict — the redrive-safe equivalent of
 /// `ChunkedDiskBackend::flush_upload`'s manifest rebuild, minus the live
-/// backend's `state`/`pending_uploads` rebase (see the module-level
+/// backend's `state`/dirty-tier rebase (see the module-level
 /// deviation note: unobservable once the sandbox is destroyed).
 async fn publish_disk_manifest(
     chunk_store: &ChunkStore,

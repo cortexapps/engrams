@@ -621,6 +621,11 @@ impl ChunkCache {
         }
     }
 
+    /// Root directory used by this cache.
+    pub fn root(&self) -> &Path {
+        &self.inner.config.root
+    }
+
     /// Test/explicit constructor that sets the free-space floor directly,
     /// bypassing env resolution. Used by unit tests that need a
     /// deterministic floor independent of the host disk's fill level —
