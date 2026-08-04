@@ -102,6 +102,14 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 # linux5_13: `RegisterMode::MINOR` — the exact ioctl mode the probe
 # exercises.
 userfaultfd = { version = "0.9", features = ["linux5_13"] }
+# #1003: jemalloc as the global allocator (prod is musl-static; musl
+# mallocng retained 23 GB of ~48 MiB groups under chunk-buffer churn)
+# + the sampled heap profiler (SIGUSR2 → pprof dump) + allocator
+# stats exported as first-class Prometheus gauges. Linux-gated the
+# same way as userfaultfd so macOS dev builds stay allocator-default.
+tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
+jemalloc_pprof = { workspace = true }
 
 [dev-dependencies]
 engram-uffd-handler.workspace = true

@@ -47,6 +47,8 @@ pub mod peer_fill;
 pub mod session_epochs;
 pub mod substrate_server;
 pub use host_client::LocalHostClient;
+#[cfg(target_os = "linux")]
+pub mod heap_profile;
 pub mod heartbeat;
 pub mod idle_evictor;
 pub mod image_cache;
