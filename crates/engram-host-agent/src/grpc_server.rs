@@ -25,8 +25,8 @@ use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer}
 use engram_protocol::grpc::proxy_port_message::Body as ProxyPortBody;
 use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
-    ApplyEgressPolicyRequest, BindHarnessSessionRequest, BrowserPortResponse, CancelExecRequest,
-    CowStateAllResponse, CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
+    BindHarnessSessionRequest, BrowserPortResponse, CancelExecRequest, CowStateAllResponse,
+    CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
     DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty,
     ExecExit, ExecFrame, ExecStartRequest, FencedSandboxRequest, GuestIpResponse, IdePortResponse,
     InterruptHarnessRequest, ListSandboxesResponse, MaterializeImageDone, MaterializeImageEvent,
@@ -1059,19 +1059,6 @@ impl HostService for HostServiceImpl {
         }
         .instrument(span)
         .await
-    }
-
-    async fn apply_egress_policy(
-        &self,
-        req: Request<ApplyEgressPolicyRequest>,
-    ) -> Result<Response<Empty>, Status> {
-        check_wire_version(&req)?;
-        let policy = decode_bincode(&req.into_inner().policy_bincode, "SessionEgressPolicy")?;
-        self.inner
-            .apply_egress_policy(policy)
-            .await
-            .map_err(sandbox_to_status)?;
-        Ok(Response::new(Empty {}))
     }
 
     async fn start_browser(

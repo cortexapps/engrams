@@ -931,12 +931,6 @@ mod tests {
         ) -> Result<(), SandboxError> {
             unimplemented!()
         }
-        async fn apply_egress_policy(
-            &self,
-            _policy: SessionEgressPolicy,
-        ) -> Result<(), SandboxError> {
-            unimplemented!()
-        }
         async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
             unimplemented!()
         }

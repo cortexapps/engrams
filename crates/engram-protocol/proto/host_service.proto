@@ -149,11 +149,6 @@ service HostService {
   // arrive first on the same connection" frame-ordering invariant.
   rpc StartAgent(StartAgentRequest) returns (Empty);
 
-  // Apply an egress policy without spawning an agent (no-agent
-  // sessions still need their proxy allowlist populated). The
-  // standalone companion to StartAgent's bundled form.
-  rpc ApplyEgressPolicy(ApplyEgressPolicyRequest) returns (Empty);
-
   // ADR 0065: bring up / tear down the ephemeral in-guest browser stack
   // (Xvfb + x11vnc + headful chromium). StartBrowser is idempotent and returns
   // the RFB port; the coordinator's EnsureBrowser calls it, and the snapshot /
@@ -703,11 +698,6 @@ message StartAgentRequest {
   // ADR 0079: (session_id, fencing_epoch) — see `FencedSandboxRequest`.
   bytes session_id = 4;      // 16-byte session UUID; ignored when fencing_epoch == 0
   uint64 fencing_epoch = 5;  // 0 = unfenced interim caller
-}
-
-message ApplyEgressPolicyRequest {
-  // bincode-encoded `engram_core::types::egress::SessionEgressPolicy`.
-  bytes policy_bincode = 1;
 }
 
 // --- ReapMaterializeDir ---

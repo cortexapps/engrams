@@ -9,8 +9,7 @@
 //! existing dispatch path (HostRegistry → Arc<dyn HostClient>)
 //! drops a `GrpcHostClient` in where the WS RemoteHostClient used
 //! to live. ADR 0013's bundled `start_agent(id, agent, policy)`
-//! is one gRPC RPC; `apply_egress_policy` is the no-agent
-//! companion.
+//! is one gRPC RPC.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -35,7 +34,7 @@ use crate::grpc::host_service_client::HostServiceClient;
 use crate::grpc::proxy_port_message::Body as ProxyPortBody;
 use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
-    ApplyEgressPolicyRequest, BindHarnessSessionRequest, CancelExecRequest, CreateSandboxRequest,
+    BindHarnessSessionRequest, CancelExecRequest, CreateSandboxRequest,
     DequeueHarnessQueuedPromptRequest, EditHarnessQueuedPromptRequest, Empty, ExecStartRequest,
     FencedSandboxRequest, GuestIpResponse, InterruptHarnessRequest, MaterializeImageRequest,
     MigrationExportRef, MigrationFetchRequest, MigrationItem, PeerChunkFrame, PeerChunkGetRequest,
@@ -910,9 +909,8 @@ impl GrpcHostClient {
 
     /// Bundled `start_agent` (ADR 0013 atomicity): the host applies
     /// the egress policy to its proxy registry BEFORE spawning the
-    /// agent process. Caller must always pass a policy — the
-    /// no-agent / no-policy case routes through `apply_egress_policy`
-    /// instead.
+    /// agent process, and persists it beside the binding record
+    /// (ADR 0111) before acking. Caller must always pass a policy.
     pub async fn start_agent(
         &self,
         sandbox_id: SandboxId,
@@ -939,24 +937,6 @@ impl GrpcHostClient {
         self.inner
             .clone()
             .start_agent(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?;
-        Ok(())
-    }
-
-    /// Apply a SessionEgressPolicy without spawning an agent. The
-    /// companion to `start_agent`'s bundled form for no-agent
-    /// sessions.
-    pub async fn apply_egress_policy(
-        &self,
-        policy: SessionEgressPolicy,
-    ) -> Result<(), SandboxError> {
-        let req = ApplyEgressPolicyRequest {
-            policy_bincode: encode_bincode(&policy, "SessionEgressPolicy")?,
-        };
-        self.inner
-            .clone()
-            .apply_egress_policy(req)
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
@@ -1684,10 +1664,6 @@ impl HostClient for GrpcHostClient {
         fence: SessionFence,
     ) -> Result<(), SandboxError> {
         Self::start_agent(self, id, agent, policy, fence).await
-    }
-
-    async fn apply_egress_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
-        Self::apply_egress_policy(self, policy).await
     }
 
     async fn guest_ip(&self, id: SandboxId) -> Option<Ipv4Addr> {

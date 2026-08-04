@@ -544,13 +544,6 @@ mod tests {
             unreachable!("exec-core tests never start agents")
         }
 
-        async fn apply_egress_policy(
-            &self,
-            _policy: SessionEgressPolicy,
-        ) -> Result<(), SandboxError> {
-            unreachable!("exec-core tests never apply egress policy")
-        }
-
         async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
             None
         }

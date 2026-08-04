@@ -699,12 +699,6 @@ mod tests {
         ) -> Result<(), SandboxError> {
             unreachable!("evac primitive does not call start_agent")
         }
-        async fn apply_egress_policy(
-            &self,
-            _policy: engram_core::types::egress::SessionEgressPolicy,
-        ) -> Result<(), SandboxError> {
-            unreachable!()
-        }
         async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
             None
         }

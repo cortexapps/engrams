@@ -2441,12 +2441,6 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.start_agent(id, agent, policy, fence).await
             }
-            async fn apply_egress_policy(
-                &self,
-                policy: engram_core::types::egress::SessionEgressPolicy,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.apply_egress_policy(policy).await
-            }
             async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
@@ -2676,12 +2670,6 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.start_agent(id, agent, policy, fence).await
             }
-            async fn apply_egress_policy(
-                &self,
-                policy: engram_core::types::egress::SessionEgressPolicy,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.apply_egress_policy(policy).await
-            }
             async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
@@ -2903,12 +2891,6 @@ mod tests {
                 fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.start_agent(id, agent, policy, fence).await
-            }
-            async fn apply_egress_policy(
-                &self,
-                policy: engram_core::types::egress::SessionEgressPolicy,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.apply_egress_policy(policy).await
             }
             async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
@@ -3235,12 +3217,6 @@ mod tests {
                 fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.start_agent(id, agent, policy, fence).await
-            }
-            async fn apply_egress_policy(
-                &self,
-                policy: engram_core::types::egress::SessionEgressPolicy,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.apply_egress_policy(policy).await
             }
             async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
@@ -4359,12 +4335,6 @@ mod tests {
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.start_agent(id, agent, policy, fence).await
             }
-            async fn apply_egress_policy(
-                &self,
-                policy: engram_core::types::egress::SessionEgressPolicy,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.apply_egress_policy(policy).await
-            }
             async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await
             }
@@ -4631,12 +4601,6 @@ mod tests {
                 fence: SessionFence,
             ) -> Result<(), engram_core::SandboxError> {
                 self.inner.start_agent(id, agent, policy, fence).await
-            }
-            async fn apply_egress_policy(
-                &self,
-                policy: engram_core::types::egress::SessionEgressPolicy,
-            ) -> Result<(), engram_core::SandboxError> {
-                self.inner.apply_egress_policy(policy).await
             }
             async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
                 self.inner.guest_ip(id).await

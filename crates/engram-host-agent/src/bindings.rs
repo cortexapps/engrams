@@ -111,6 +111,15 @@ impl BindingStore {
         self.dir.join(format!("{session_id}.json"))
     }
 
+    /// ADR 0111: the applied egress policy lives beside the binding
+    /// record (`<session_id>.egress`), not inside it — `bind` callers
+    /// do not carry a policy, and the policy writer must never race
+    /// the record's monotonic-epoch logic. Extension is NOT `.json`
+    /// so [`BindingStore::list`] never parses these files.
+    fn policy_path_for(&self, session_id: SessionId) -> PathBuf {
+        self.dir.join(format!("{session_id}.egress"))
+    }
+
     /// Record (or refresh) the binding for `session_id`. Monotonic in
     /// `binding_epoch`: a lower epoch is refused `Stale`. An
     /// EQUAL-epoch write may re-point the sandbox — that is the live
@@ -185,13 +194,87 @@ impl BindingStore {
     /// Remove the record, returning what it was. Called on
     /// unbind/destroy so a late dial from the torn-down generation
     /// gets `UnknownBinding` (transient) rather than routing anywhere.
+    /// The persisted egress policy shares the record's lifecycle and
+    /// is removed with it (ADR 0111).
     pub fn unbind(&self, session_id: SessionId) -> std::io::Result<Option<BindingRecord>> {
         let prior = self.read(session_id).unwrap_or(None);
+        if let Err(e) = std::fs::remove_file(self.policy_path_for(session_id)) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%session_id, error = %e, "remove persisted egress policy failed");
+            }
+        }
         match std::fs::remove_file(self.path_for(session_id)) {
             Ok(()) => Ok(prior),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// ADR 0111: persist the applied egress policy so a restarted
+    /// host-agent rebuilds its proxy registry from a local read. Full
+    /// replace per apply — the same semantics as the in-memory
+    /// `Registry::register`. Written BEFORE the `start_agent` ack, so
+    /// an acked policy is on the node by the time any caller can
+    /// observe it. Mode 0600: the file carries resolved secrets (the
+    /// posture ADR 0111 states; the same disk already holds them in
+    /// the sandbox spec sidecar).
+    pub fn store_policy(
+        &self,
+        policy: &engram_core::types::egress::SessionEgressPolicy,
+    ) -> std::io::Result<()> {
+        let final_path = self.policy_path_for(policy.session_id);
+        let tmp = self.dir.join(format!(
+            ".{}.{}.egress.tmp",
+            policy.session_id,
+            std::process::id(),
+        ));
+        // The temp file is BORN 0600 (review finding on #992): creating
+        // at the umask and tightening afterward leaves a window where
+        // the resolved secrets are group/world-readable.
+        {
+            use std::io::Write as _;
+            let mut open = std::fs::OpenOptions::new();
+            open.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                open.mode(0o600);
+            }
+            let mut f = open.open(&tmp)?;
+            f.write_all(&serde_json::to_vec(policy)?)?;
+        }
+        std::fs::rename(&tmp, &final_path)?;
+        Ok(())
+    }
+
+    /// Every persisted egress policy on disk. Read once at startup by
+    /// the registry rebuild pass; unparseable files are skipped with a
+    /// warn (only reachable via node death, where no VM survives to
+    /// want them — the ADR 0110 reboot argument).
+    pub fn list_policies(
+        &self,
+    ) -> std::io::Result<Vec<engram_core::types::egress::SessionEgressPolicy>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|e| e.to_str()) != Some("egress") {
+                continue;
+            }
+            match std::fs::read(entry.path()).and_then(|bytes| {
+                serde_json::from_slice::<engram_core::types::egress::SessionEgressPolicy>(&bytes)
+                    .map_err(std::io::Error::from)
+            }) {
+                Ok(policy) => out.push(policy),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "skipping unparseable persisted egress policy",
+                    );
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// All records currently on disk. Used by the host-agent at
@@ -319,5 +402,95 @@ mod tests {
         let sid = SessionId::new();
         std::fs::write(s.path_for(sid), b"{not json").expect("write garbage");
         assert!(s.read(sid).is_err());
+    }
+
+    fn policy_for(
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+    ) -> engram_core::types::egress::SessionEgressPolicy {
+        engram_core::types::egress::SessionEgressPolicy {
+            session_id,
+            sandbox_id,
+            guest_ip: std::net::Ipv4Addr::new(10, 200, 0, 2),
+            network_allow_hosts: vec!["api.anthropic.com".into()],
+            network_allow_host_patterns: Vec::new(),
+            allow_all: false,
+            secrets: Vec::new(),
+            injects: Vec::new(),
+            observes: Vec::new(),
+            metadata_flavor: None,
+            secret_mode: engram_core::types::image::SecretMode::Broker,
+        }
+    }
+
+    // ADR 0111: the persisted policy round-trips VERBATIM through a
+    // fresh store on the same directory — the restart shape. The
+    // rebuild pass replays exactly these bytes into the registry.
+    #[test]
+    fn policy_persists_across_a_fresh_store_open() {
+        let s = store();
+        let (sid, sbx) = (SessionId::new(), SandboxId::new());
+        let policy = policy_for(sid, sbx);
+        s.store_policy(&policy).expect("store policy");
+        let reopened = BindingStore::open(s.dir.clone()).expect("reopen");
+        let listed = reopened.list_policies().expect("list");
+        assert_eq!(listed, vec![policy]);
+    }
+
+    // ADR 0111: a re-apply is a full replace (the same semantics as
+    // the in-memory `Registry::register`).
+    #[test]
+    fn policy_store_is_full_replace() {
+        let s = store();
+        let (sid, sbx) = (SessionId::new(), SandboxId::new());
+        s.store_policy(&policy_for(sid, sbx)).expect("first");
+        let mut updated = policy_for(sid, sbx);
+        updated.network_allow_hosts = vec!["github.com".into()];
+        s.store_policy(&updated).expect("replace");
+        assert_eq!(s.list_policies().expect("list"), vec![updated]);
+    }
+
+    // ADR 0111: the policy shares the binding record's lifecycle —
+    // unbind removes both.
+    #[test]
+    fn unbind_removes_the_persisted_policy() {
+        let s = store();
+        let (sid, sbx) = (SessionId::new(), SandboxId::new());
+        s.bind(sid, sbx, 1).expect("bind");
+        s.store_policy(&policy_for(sid, sbx)).expect("store policy");
+        s.unbind(sid).expect("unbind");
+        assert!(s.list_policies().expect("list").is_empty());
+        assert!(!s.policy_path_for(sid).exists());
+    }
+
+    // A torn/garbage policy file is skipped with a warn, never a
+    // panic and never a wrong registration (node-death shape; no VM
+    // survives to want it).
+    #[test]
+    fn garbage_policy_file_is_skipped_not_fatal() {
+        let s = store();
+        let (sid, sbx) = (SessionId::new(), SandboxId::new());
+        s.store_policy(&policy_for(sid, sbx)).expect("store good");
+        std::fs::write(s.dir.join(format!("{}.egress", SessionId::new())), b"{torn")
+            .expect("write garbage");
+        let listed = s.list_policies().expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, sid);
+    }
+
+    // Resolved secrets ride the file; it must not be group/world
+    // readable (the ADR 0111 posture).
+    #[cfg(unix)]
+    #[test]
+    fn policy_file_mode_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = store();
+        let (sid, sbx) = (SessionId::new(), SandboxId::new());
+        s.store_policy(&policy_for(sid, sbx)).expect("store");
+        let mode = std::fs::metadata(s.policy_path_for(sid))
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
