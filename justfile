@@ -674,8 +674,9 @@ pull-kernel:
 # them in instead of mounting a squashfs. `skills` is a plain copy;
 # `integrations-cli`/`browser`/`ide` need Docker (glibc builds) and are
 # best-effort — skip them and only skills get wired (no browser/IDE tooling in
-# dev). Re-run after editing a skill.
-bundles:
+# dev). Re-run after editing a skill. Depends on dev-link-shared so a fresh
+# worktree stages into the shared store, never a divergent local dir.
+bundles: dev-link-shared
     deploy/bundles/skills/build.sh --stage var/bundles/skills
     deploy/bundles/integrations-cli/build.sh --stage var/bundles/integrations-cli \
         || echo "integrations-cli bundle skipped (needs Docker) — dev sessions get no integration CLIs"
@@ -700,8 +701,10 @@ bundles:
 # (the Docker bundles each cost a container + apt-get + several downloads, paid
 # on every Tilt trigger before this). Run with ENGRAM_BUNDLES_FORCE=1 to ignore
 # the cache — the fingerprint covers tracked files and pinned versions, not the
-# floating apt/base-image layers the Docker bundles pull.
-bundles-squashfs:
+# floating apt/base-image layers the Docker bundles pull. Depends on
+# dev-link-shared so a fresh worktree builds into (and reuses) the shared
+# content-addressed store, never a divergent local dir.
+bundles-squashfs: dev-link-shared
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p var/shared
