@@ -153,7 +153,14 @@ http = "1"
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"] }
 # JWT / JWKS verification for the auth seam (ADR 0031): OIDC ID-token
 # validation and the forward-auth signed-assertion (GCP IAP etc.) path.
-jsonwebtoken = "10"
+# jsonwebtoken 10 dropped its built-in ring backend: a crypto provider is now an
+# explicit feature choice, and picking neither panics at the first sign/verify.
+# `rust_crypto` over `aws_lc_rs` because we only mint RS256 GitHub App JWTs, and
+# it keeps the tree free of aws-lc-sys — a cmake+nasm C/asm build we would have to
+# carry through the musl cross-compile lane. It also leaves rustls's own provider
+# selection (pinned to `ring` below) untouched; enabling a second rustls provider
+# is what makes oci-client 0.17 panic on #34.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 # grpc
 tonic = "0.12"
