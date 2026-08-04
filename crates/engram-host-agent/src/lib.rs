@@ -726,6 +726,18 @@ impl HostAgent {
                 std::sync::Arc::new(move |stream| sink_hub.accept_via_session_lookup(stream));
             pooled.set_harness_sink(sink);
 
+            // ADR 0111: rebuild the egress registry from the policies
+            // persisted beside the binding records. The reattach pass
+            // above re-adopted the surviving VMs; without this, their
+            // guests have no egress until the next resume (the registry
+            // died with the previous process).
+            match harness_hub.persisted_egress_policies() {
+                Ok(policies) => pooled.rebuild_egress_from_policies(policies).await,
+                Err(e) => {
+                    tracing::warn!(error = %e, "list persisted egress policies failed");
+                }
+            }
+
             // ADR 0023 split-mode forge forwarding. The forge sink can't
             // live on the host (it needs the coord's GitForge + broker
             // map), so — exactly like the harness event forwarding above

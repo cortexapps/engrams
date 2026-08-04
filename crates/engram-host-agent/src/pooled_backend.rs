@@ -4728,6 +4728,41 @@ impl PooledBackend {
         })
     }
 
+    /// ADR 0111: rebuild the egress registry from the policies the
+    /// previous process persisted beside its binding records. Run
+    /// after reattach (the live set is complete) and before
+    /// coordinator registration. Policies whose sandbox did not
+    /// survive are skipped — they are inert and are removed with
+    /// their binding at unbind. Recovery is a local read: no
+    /// coordinator round-trip, no retries.
+    pub async fn rebuild_egress_from_policies(
+        &self,
+        policies: Vec<engram_core::types::egress::SessionEgressPolicy>,
+    ) {
+        use engram_core::traits::sandbox::SandboxBackend as _;
+        let live: std::collections::HashSet<SandboxId> =
+            self.list().await.unwrap_or_default().into_iter().collect();
+        for policy in policies {
+            if !live.contains(&policy.sandbox_id) {
+                continue;
+            }
+            let (session_id, sandbox_id) = (policy.session_id, policy.sandbox_id);
+            match self.notify_session_policy(policy).await {
+                Ok(()) => tracing::info!(
+                    %session_id,
+                    %sandbox_id,
+                    "egress registry rebuilt from persisted policy (ADR 0111)",
+                ),
+                Err(e) => tracing::warn!(
+                    %session_id,
+                    %sandbox_id,
+                    error = %e,
+                    "egress registry rebuild failed for survivor",
+                ),
+            }
+        }
+    }
+
     /// Run this after reattach and before coordinator registration.
     /// The live set is complete, and no create or resume can race it.
     /// Recovery only adopts files for VMs that survived reattach.
@@ -14403,6 +14438,110 @@ mod tests {
             assert!(
                 !state.network_allow.matches("a.example"),
                 "re-applied policy must replace the prior allow-list, not union it",
+            );
+        }
+
+        /// An inner backend whose `list()` reports a fixed survivor
+        /// set — the post-reattach live set of a restarted host-agent.
+        struct FixedListInner(Vec<SandboxId>);
+        #[async_trait]
+        impl SandboxBackend for FixedListInner {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
+                PathBuf::new()
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        /// ADR 0111: the registry a host-agent restart wiped is
+        /// rebuilt from the policies the previous process persisted
+        /// beside its binding records — a local read, no coordinator.
+        /// (Prod 2026-08-03, session 51fc6af7: the in-RAM registry
+        /// died with a DaemonSet roll and the coordinator-side re-push
+        /// could not rebuild it, stranding a healthy VM egress-less.)
+        #[tokio::test]
+        async fn restart_rebuilds_egress_registry_from_persisted_policies() {
+            let bindings_dir = tempfile::tempdir().expect("tempdir");
+            let session_id = SessionId::new();
+            let sandbox_id = SandboxId::new();
+            let guest_ip = Ipv4Addr::new(10, 200, 0, 7);
+
+            // Generation A: policy applied and persisted (the
+            // start_agent path), then the process "dies" — its
+            // registry (egress_a) simply goes away.
+            {
+                let (egress_a, _ca_a) = spawn_test_egress().await;
+                let pooled_a = PooledBackend::new(Arc::new(NoopInner) as Arc<dyn SandboxBackend>)
+                    .with_egress(Arc::new(egress_a));
+                let policy = policy_for(session_id, sandbox_id, guest_ip, &["api.anthropic.com"]);
+                pooled_a
+                    .notify_session_policy(policy.clone())
+                    .await
+                    .expect("gen A applies");
+                let store = crate::bindings::BindingStore::open(bindings_dir.path())
+                    .expect("open bindings");
+                store.store_policy(&policy).expect("persist policy");
+            }
+
+            // A second persisted policy whose sandbox did NOT survive
+            // the roll — it must not be registered.
+            let dead_policy = policy_for(
+                SessionId::new(),
+                SandboxId::new(),
+                Ipv4Addr::new(10, 200, 0, 9),
+                &["github.com"],
+            );
+            crate::bindings::BindingStore::open(bindings_dir.path())
+                .expect("open bindings")
+                .store_policy(&dead_policy)
+                .expect("persist dead policy");
+
+            // Generation B: fresh registry, fresh store over the same
+            // directory, reattach reported one survivor.
+            let (egress_b, _ca_b) = spawn_test_egress().await;
+            let registry_b = egress_b.registry.clone();
+            let pooled_b = PooledBackend::new(
+                Arc::new(FixedListInner(vec![sandbox_id])) as Arc<dyn SandboxBackend>
+            )
+            .with_egress(Arc::new(egress_b));
+            assert!(
+                registry_b.lookup(guest_ip).is_none(),
+                "pre-condition: the restarted registry is empty",
+            );
+            let policies = crate::bindings::BindingStore::open(bindings_dir.path())
+                .expect("open bindings")
+                .list_policies()
+                .expect("list policies");
+            pooled_b.rebuild_egress_from_policies(policies).await;
+
+            let state = registry_b
+                .lookup(guest_ip)
+                .expect("survivor guest resolves after rebuild");
+            assert_eq!(state.session_id, session_id);
+            assert!(state.network_allow.matches("api.anthropic.com"));
+            assert!(
+                registry_b.lookup(dead_policy.guest_ip).is_none(),
+                "a policy whose sandbox did not survive must not register",
             );
         }
     }

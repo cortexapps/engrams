@@ -108,13 +108,11 @@ pub(crate) async fn resolve_policy_secrets(
 ) -> (
     HashMap<String, String>,
     Vec<engram_core::types::egress::EgressSecretEntry>,
-    usize,
 ) {
     let mut env: HashMap<String, String> = HashMap::new();
     let mut entries: Vec<engram_core::types::egress::EgressSecretEntry> = Vec::new();
-    let mut transient_failures = 0usize;
     let Some(policy) = policy else {
-        return (env, entries, transient_failures);
+        return (env, entries);
     };
     let resolved = futures::future::join_all(policy.secrets.iter().map(|s| async move {
         let result =
@@ -134,13 +132,12 @@ pub(crate) async fn resolve_policy_secrets(
             Err(e) => {
                 tracing::warn!(secret_ref = %s.secret_ref, error = %e,
                     "policy secret resolution failed; skipping");
-                transient_failures += 1;
                 continue;
             }
         };
         install_policy_secret(&mut env, &mut entries, s, value, session);
     }
-    (env, entries, transient_failures)
+    (env, entries)
 }
 
 /// Resolve a persisted policy/capture ref through both supported lookup shapes:
@@ -152,6 +149,14 @@ pub(crate) async fn resolve_explicit_secret_ref(
     secret_ref: &str,
     required: bool,
 ) -> Result<Option<String>, engram_core::SecretError> {
+    // An empty ref is persistent config state ("not configured"), not
+    // a lookup to attempt: the GCP backend would render it as
+    // `projects/<p>/secrets//versions/latest` and 400 on every call
+    // (prod 2026-08-03, session 51fc6af7 — 77 such entries made a
+    // deterministic defect look transient).
+    if secret_ref.trim().is_empty() {
+        return Ok(None);
+    }
     let schema = engram_core::types::image::SecretSchema {
         r#ref: Some(secret_ref.to_string()),
         required,
@@ -297,7 +302,7 @@ pub(crate) async fn resume_manifest_bundle(
     // placeholders (env var + session id) match the egress entries the proxy
     // gets, so broker substitution authenticates after resume.
     let policy = load_session_policy(state, session.id).await;
-    let (policy_secret_env, _egress, _failures) =
+    let (policy_secret_env, _egress) =
         resolve_policy_secrets(state, policy.as_ref(), &secret_ctx, session.id).await;
     let mut env: HashMap<String, String> = config.env.clone();
     env.extend(policy_secret_env);
@@ -421,75 +426,21 @@ fn stamp_committer_env(cfg: &crate::config::CoordinatorConfig, env: &mut HashMap
 ///
 /// Async only because of `host.guest_ip`. Pure assembly delegated to
 /// [`assemble_resume_egress_policy`] for testability.
+/// Build the egress policy for a resume. Lossy by design: a
+/// resolution failure degrades to a reduced policy (the session must
+/// come up; the user is present to retry, and the mint refresh seam
+/// re-mints stale entries on first use). `None` = no guest IP for
+/// this sandbox (yet). ADR 0111 removed the strict survivor face:
+/// the host persists every APPLIED policy beside its binding record
+/// and rebuilds its registry locally, so no post-restart rebuild
+/// happens on the coordinator at all.
 pub(crate) async fn build_resume_egress_policy(
     state: &SharedState,
     session_id: SessionId,
     sandbox_id: engram_core::SandboxId,
     image: &str,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
-    // Lossy face: resolution failures degrade to a reduced policy (the
-    // session must come up; the user is present to retry). The survivor
-    // re-push uses the STRICT face below instead.
-    build_resume_egress_policy_core(state, session_id, sandbox_id, image)
-        .await
-        .policy
-}
-
-/// STRICT face for the survivor egress re-push (host register handler):
-/// `Err` on anything plausibly transient — the persisted-policy LOOKUP
-/// failing, a secret-store error, a failed mint, a capabilities lookup
-/// error under a mint entry — so the caller's bounded retry loop actually
-/// retries instead of registering a silently-reduced policy against a
-/// HEALTHY running session (adversarial-review finding on the 2026-07-13
-/// incident fix: apply-of-incomplete-policy reads as success and
-/// suppresses every remaining retry). `Ok(None)` = no guest IP yet (also
-/// retryable, softly). A PARSE failure of the persisted policy stays the
-/// lossy "no policy" posture — re-reading won't fix persisted bytes.
-pub(crate) async fn build_survivor_egress_policy(
-    state: &SharedState,
-    session_id: SessionId,
-    sandbox_id: engram_core::SandboxId,
-    image: &str,
-) -> Result<Option<engram_core::types::egress::SessionEgressPolicy>, String> {
-    if let Err(e) = state
-        .services
-        .meta
-        .get_session_integration_policy(session_id)
-        .await
-    {
-        return Err(format!("session policy lookup failed: {e}"));
-    }
-    let built = build_resume_egress_policy_core(state, session_id, sandbox_id, image).await;
-    if built.resolution_failures > 0 {
-        return Err(format!(
-            "{} resolution failure(s) while rebuilding the egress policy",
-            built.resolution_failures,
-        ));
-    }
-    Ok(built.policy)
-}
-
-struct BuiltEgressPolicy {
-    /// `None` = no guest IP for this sandbox (yet).
-    policy: Option<engram_core::types::egress::SessionEgressPolicy>,
-    /// Plausibly-transient resolution failures encountered while
-    /// building (secret store / mint / capabilities) — the policy, if
-    /// present, is REDUCED by this many entries.
-    resolution_failures: usize,
-}
-
-async fn build_resume_egress_policy_core(
-    state: &SharedState,
-    session_id: SessionId,
-    sandbox_id: engram_core::SandboxId,
-    image: &str,
-) -> BuiltEgressPolicy {
-    let Some(guest_ip) = state.services.host.guest_ip(sandbox_id).await else {
-        return BuiltEgressPolicy {
-            policy: None,
-            resolution_failures: 0,
-        };
-    };
+    let guest_ip = state.services.host.guest_ip(sandbox_id).await?;
     // ADR 0057: re-read the persisted session policy once → network + secrets +
     // injects (resolved host-side) + observes (pure), so a resumed session
     // re-derives its whole egress policy on the new host (same as create).
@@ -499,29 +450,26 @@ async fn build_resume_egress_policy_core(
         repo,
         image_tag: tag,
     };
-    let (_policy_env, egress_secrets, secret_failures) =
+    let (_policy_env, egress_secrets) =
         resolve_policy_secrets(state, policy.as_ref(), &secret_ctx, session_id).await;
     let network = policy
         .as_ref()
         .map(|p| p.network.clone())
         .unwrap_or_default();
-    let (injects, inject_failures) =
+    let injects =
         crate::session_boot::resolve_inject_entries(state, session_id, policy.as_ref(), image)
             .await;
     let observes = crate::session_boot::build_observe_entries(policy.as_ref());
-    BuiltEgressPolicy {
-        policy: Some(assemble_resume_egress_policy(
-            session_id,
-            sandbox_id,
-            guest_ip,
-            egress_secrets,
-            &network,
-            injects,
-            observes,
-            policy.as_ref().and_then(|policy| policy.metadata_flavor),
-        )),
-        resolution_failures: secret_failures + inject_failures,
-    }
+    Some(assemble_resume_egress_policy(
+        session_id,
+        sandbox_id,
+        guest_ip,
+        egress_secrets,
+        &network,
+        injects,
+        observes,
+        policy.as_ref().and_then(|policy| policy.metadata_flavor),
+    ))
 }
 
 /// Pure synchronous assembly path for the resume egress policy.
@@ -1480,7 +1428,7 @@ async fn prepare_inner(
         repo: &image_repo,
         image_tag: &image_tag,
     };
-    let (policy_secret_env, egress_secrets, _failures) =
+    let (policy_secret_env, egress_secrets) =
         resolve_policy_secrets(state, integration_policy.as_ref(), &secret_ctx, session_id).await;
 
     let spec = SessionSpec {
@@ -2274,6 +2222,39 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(value.as_deref(), Some("resolved-value"));
+    }
+
+    struct PanicStore;
+
+    #[async_trait::async_trait]
+    impl engram_core::traits::SecretStore for PanicStore {
+        async fn get(
+            &self,
+            _ctx: &SecretContext<'_>,
+            name: &str,
+            _schema: &engram_core::types::SecretSchema,
+        ) -> Result<Option<String>, engram_core::SecretError> {
+            panic!("an empty ref must never reach the secret store (got {name:?})");
+        }
+    }
+
+    /// Prod 2026-08-03 (session 51fc6af7): an empty `secret_ref`
+    /// reached the GCP backend as `projects/<p>/secrets//versions/latest`
+    /// and 400'd on every call — a persistent config defect that read
+    /// as a transient failure. An empty ref is "not configured": it
+    /// resolves to `None` with ZERO store calls.
+    #[tokio::test]
+    async fn empty_secret_ref_is_not_configured_never_a_store_call() {
+        let ctx = SecretContext {
+            repo: "cortexapps/engrams",
+            image_tag: "dogfood",
+        };
+        for empty in ["", "   ", "\t"] {
+            let value = resolve_explicit_secret_ref(&PanicStore, &ctx, empty, false)
+                .await
+                .unwrap();
+            assert_eq!(value, None);
+        }
     }
 
     /// ADR 0055: memory is purely the image's `suggested_memory_mib` (or the

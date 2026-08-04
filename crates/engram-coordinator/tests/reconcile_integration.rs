@@ -568,12 +568,6 @@ impl engram_core::traits::HostClient for ProbeBackend {
     ) -> Result<(), engram_core::SandboxError> {
         unreachable!()
     }
-    async fn apply_egress_policy(
-        &self,
-        _: engram_core::types::egress::SessionEgressPolicy,
-    ) -> Result<(), engram_core::SandboxError> {
-        unreachable!()
-    }
     async fn guest_ip(&self, _: SandboxId) -> Option<std::net::Ipv4Addr> {
         unreachable!()
     }

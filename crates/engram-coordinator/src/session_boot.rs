@@ -267,10 +267,7 @@ pub(crate) async fn boot_on_reserved_host(
         if let Some(a) = agent.as_mut() {
             crate::api::sessions::inject_harness_env(state, session_id, &mut a.env).await;
         }
-        let (injects, _failures) =
-            resolve_inject_entries(state, session_id, integration_policy.as_ref(), &image_ref)
-                .await;
-        injects
+        resolve_inject_entries(state, session_id, integration_policy.as_ref(), &image_ref).await
     };
     // Issue #535 correction: neither `coord_prepare` nor `coord_finalize`
     // covers this join itself — `coord_finalize` only starts once it
@@ -705,22 +702,38 @@ pub(crate) fn build_observe_entries(
 /// or guest. A ref that doesn't resolve is skipped + logged (the connector
 /// gates the request regardless, but without a credential it would fail
 /// upstream — so we drop it rather than inject an empty header).
-/// The second tuple element counts resolution FAILURES (secret-store
-/// errors, failed mints, a capabilities lookup error under a mint entry —
-/// not `Ok(None)` unresolvable refs, which are persistent config state).
-/// Boot/resume callers deliberately ignore it (lossy-by-design); the
-/// survivor egress re-push retries on any failure rather than applying an
-/// incomplete policy (adversarial-review finding, 2026-07-13 incident fix).
+/// Lossy by design: a resolution failure (secret-store error, failed
+/// mint, a capabilities lookup error under a mint entry) skips that
+/// entry and the session boots with a reduced policy — the user is
+/// present to retry, and the mint refresh seam repairs stale entries
+/// on first use. Structurally invalid entries (no `mint_source` AND an
+/// empty `secret_ref` — the "mutually exclusive" invariant on
+/// `IntegrationInject` violated) are persistent config state: they are
+/// skipped before any store call and reported once, aggregated, not
+/// per-entry (prod 2026-08-03: 77 such entries logged 77 WARNs per
+/// resume and starved the retry machinery built for transients).
 pub(crate) async fn resolve_inject_entries(
     state: &SharedState,
     session_id: SessionId,
     integration_policy: Option<&engram_core::types::IntegrationPolicy>,
     image: &str,
-) -> (Vec<engram_core::types::egress::EgressInjectEntry>, usize) {
-    let mut failures = 0usize;
+) -> Vec<engram_core::types::egress::EgressInjectEntry> {
     let Some(policy) = integration_policy else {
-        return (Vec::new(), failures);
+        return Vec::new();
     };
+    let structurally_invalid = policy
+        .injects
+        .iter()
+        .filter(|i| i.mint_source.is_none() && i.secret_ref.trim().is_empty())
+        .count();
+    if structurally_invalid > 0 {
+        tracing::warn!(
+            %session_id,
+            entries = structurally_invalid,
+            "integration policy carries inject entries with neither a \
+             mint_source nor a secret_ref; skipping them (policy-shape defect)",
+        );
+    }
     let (repo, image_tag) = {
         let (r, t) = engram_core::types::session::split_image_ref(image);
         (r.to_string(), t.to_string())
@@ -740,11 +753,8 @@ pub(crate) async fn resolve_inject_entries(
         {
             Ok(c) => c,
             Err(e) => {
-                // A mint under empty caps mints a wrongly-scoped token —
-                // count the lookup failure so a strict caller retries.
                 tracing::warn!(%session_id, error = %e,
                     "capabilities lookup failed under a mint inject; minting unscoped");
-                failures += 1;
                 Vec::new()
             }
         }
@@ -753,6 +763,11 @@ pub(crate) async fn resolve_inject_entries(
     };
     let mut out = Vec::with_capacity(policy.injects.len());
     for inj in &policy.injects {
+        if inj.mint_source.is_none() && inj.secret_ref.trim().is_empty() {
+            // Structurally invalid — aggregated warn above; never a
+            // store call (an empty ref can resolve to nothing).
+            continue;
+        }
         let entry = if let Some(mint_source) = &inj.mint_source {
             // Minted: the GATING is policy-owned (this entry's hosts/methods/paths),
             // but the HEADER (name + rendered value) is the integration's — so the
@@ -778,9 +793,7 @@ pub(crate) async fn resolve_inject_entries(
                     expires_at: Some(expires_at),
                 },
                 None => {
-                    // Logged inside; could be a transient mint-provider
-                    // failure — count for strict callers.
-                    failures += 1;
+                    // Logged inside `mint_inject_header`.
                     continue;
                 }
             }
@@ -807,7 +820,6 @@ pub(crate) async fn resolve_inject_entries(
                         secret_ref = %inj.secret_ref, error = %e,
                         "integration inject secret_ref resolution failed; skipping injection",
                     );
-                    failures += 1;
                     continue;
                 }
             };
@@ -829,7 +841,7 @@ pub(crate) async fn resolve_inject_entries(
         };
         out.push(entry);
     }
-    (out, failures)
+    out
 }
 
 /// ADR 0056 amendment: resolve a connection's egress inject header — mint a

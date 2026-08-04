@@ -924,6 +924,7 @@ jobs:
             --test pagemap_scanner \
             --test eviction_finalize_redrive \
             --test chain_rehydrate \
+            --test egress_survives_roll \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

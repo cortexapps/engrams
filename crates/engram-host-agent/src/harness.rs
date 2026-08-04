@@ -178,6 +178,25 @@ impl HarnessHub {
             .map(|_| ())
     }
 
+    /// ADR 0111: persist the applied egress policy beside the binding
+    /// record, so a restarted host-agent rebuilds its proxy registry
+    /// from a local read. Called on the `start_agent` path AFTER the
+    /// in-memory registration succeeds and BEFORE the ack returns.
+    pub fn persist_egress_policy(
+        &self,
+        policy: &engram_core::types::egress::SessionEgressPolicy,
+    ) -> std::io::Result<()> {
+        self.inner.bindings.store_policy(policy)
+    }
+
+    /// ADR 0111: every persisted egress policy, for the startup
+    /// registry rebuild pass.
+    pub fn persisted_egress_policies(
+        &self,
+    ) -> std::io::Result<Vec<engram_core::types::egress::SessionEgressPolicy>> {
+        self.inner.bindings.list_policies()
+    }
+
     /// Drop the durable binding. Called from `destroy()` paths so a
     /// late dial from the torn-down generation gets `UnknownBinding`
     /// (transient) instead of routing anywhere.

@@ -211,10 +211,6 @@ impl HostClient for CosimHostClient {
         }
     }
 
-    async fn apply_egress_policy(&self, _policy: SessionEgressPolicy) -> Result<(), SandboxError> {
-        Ok(())
-    }
-
     async fn guest_ip(&self, _id: SandboxId) -> Option<Ipv4Addr> {
         None
     }

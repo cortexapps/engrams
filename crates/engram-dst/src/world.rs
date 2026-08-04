@@ -894,11 +894,6 @@ impl HostClient for SimHostClient {
         Ok(id)
     }
 
-    async fn apply_egress_policy(&self, _policy: SessionEgressPolicy) -> Result<(), SandboxError> {
-        self.maybe_hang().await;
-        Ok(())
-    }
-
     async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
         None
     }

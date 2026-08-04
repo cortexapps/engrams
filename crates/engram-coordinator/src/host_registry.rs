@@ -761,14 +761,6 @@ impl HostClient for HostRegistry {
         backend.probe_sandbox(id).await
     }
 
-    async fn apply_egress_policy(
-        &self,
-        policy: engram_core::types::egress::SessionEgressPolicy,
-    ) -> Result<(), SandboxError> {
-        let (_, backend) = self.resolve_owner(policy.sandbox_id).await?;
-        backend.apply_egress_policy(policy).await
-    }
-
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         // Aggregate across all connected hosts. Errors from any one
         // host are surfaced; partial results aren't reported in 3a.

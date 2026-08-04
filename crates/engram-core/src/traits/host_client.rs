@@ -395,14 +395,6 @@ pub trait HostClient: Send + Sync {
         fence: SessionFence,
     ) -> Result<(), SandboxError>;
 
-    /// Apply an egress policy to the host's local proxy registry
-    /// without spawning an agent. The companion to `start_agent`'s
-    /// bundled form, for sessions that don't carry a harness but
-    /// can still emit outbound traffic via raw `/exec`. Idempotent:
-    /// the host's egress registry keys on
-    /// `(session_id, sandbox_id, guest_ip)` and upserts.
-    async fn apply_egress_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError>;
-
     async fn guest_ip(&self, id: SandboxId) -> Option<std::net::Ipv4Addr>;
 
     // ---- harness routing ----

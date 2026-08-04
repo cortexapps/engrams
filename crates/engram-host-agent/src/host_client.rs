@@ -334,12 +334,17 @@ impl HostClient for LocalHostClient {
         // proxy registry is live before the agent process spawns and
         // tries to dial out. Both ops touch the inner SandboxBackend
         // in-proc; local memory ordering carries the invariant.
-        self.sandbox.notify_session_policy(policy).await?;
+        self.sandbox.notify_session_policy(policy.clone()).await?;
+        // ADR 0111: the acked policy is on the node before the ack.
+        // A restarted host-agent rebuilds its registry from this file
+        // (the reattach-adjacent rebuild pass) with zero coordinator
+        // involvement. A persist failure fails the start loudly — an
+        // ack whose policy would not survive a roll is the dishonest
+        // contract this record exists to remove.
+        self.harness_hub
+            .persist_egress_policy(&policy)
+            .map_err(|e| SandboxError::InvalidSpec(format!("persist egress policy: {e}")))?;
         self.sandbox.start_agent(id, agent).await
-    }
-
-    async fn apply_egress_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
-        self.sandbox.notify_session_policy(policy).await
     }
 
     async fn guest_ip(&self, id: SandboxId) -> Option<std::net::Ipv4Addr> {
