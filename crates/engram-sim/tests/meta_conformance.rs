@@ -2611,6 +2611,38 @@ async fn oauth_refresh_scheduling(ctx: &Ctx) {
         "ordered by subject then provider; the user-kind row never surfaces"
     );
 
+    // Same-second expiries: the (expires_at, subject_id, provider) tie-break
+    // must pick the SAME subset under LIMIT on both stores. "aaa-first" ties
+    // with "linear" on expiry but sorts ahead by subject id.
+    let tied = OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::Connector,
+        subject_id: "aaa-first".into(),
+        provider: "zzz".into(),
+    };
+    ctx.meta
+        .put_oauth_credential(
+            candidate(&tied, Some(now + chrono::Duration::hours(1))),
+            None,
+        )
+        .await
+        .unwrap();
+    let tie_limited = ctx
+        .meta
+        .list_oauth_credentials_due_for_refresh(OAuthSubjectKind::Connector, now, horizon, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        tie_limited
+            .iter()
+            .map(|r| (r.key.subject_id.as_str(), r.key.provider.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("aaa-first", "zzz"), ("conn-default", "linear")],
+    );
+    ctx.meta
+        .revoke_oauth_credential(&tied, tie_limited[0].version)
+        .await
+        .unwrap();
+
     // Advisory claim: first caller wins, second loses, a lapsed claim is
     // retaken, and a claimed row leaves the due list until the claim lapses.
     let until = now + chrono::Duration::minutes(5);

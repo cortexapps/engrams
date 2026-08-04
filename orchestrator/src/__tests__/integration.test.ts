@@ -60,12 +60,12 @@ function fakeOauthCredential(creds: Array<{ provider: string; status: string }> 
 }
 
 /** Capture RunIntegrationOp requests (the connector test rides Mode A now). */
-function fakeIntegrationOp(status = 200) {
+function fakeIntegrationOp(status = 200, body: unknown = { ok: true }) {
   const calls: Array<Record<string, unknown>> = [];
   const client: IntegrationOpAccess = {
     async runIntegrationOp(req) {
       calls.push(req as unknown as Record<string, unknown>);
-      return { status };
+      return { status, body: new TextEncoder().encode(JSON.stringify(body)) };
     },
   };
   return { client, calls };
@@ -829,6 +829,23 @@ describe("TestConnector", () => {
           ],
         },
       });
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("a 200 body-auth failure (Slack ok:false) reports a rejected credential", async () => {
+    const op = fakeIntegrationOp(200, { ok: false, error: "invalid_auth" });
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      connectors: fakeStore().store,
+      mint: fakeMint(),
+      integrationOp: op.client,
+    });
+    try {
+      const r = await s.client.testConnector({ provider: "datadog", draftValues: {} });
+      expect(r.ok).toBe(false);
+      expect(r.message).toContain("invalid_auth");
     } finally {
       await s.close();
     }

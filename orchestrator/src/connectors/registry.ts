@@ -222,6 +222,10 @@ export interface CliFacet {
 export interface ConnectorTest {
   /** Probe path, must start with `/` (e.g. `/api/v1/dashboard`). */
   path: string;
+  /** Probe method; default GET. POST for GraphQL-only endpoints (Linear). */
+  method?: "GET" | "POST";
+  /** Probe request body (JSON), for POST probes. Bounded. */
+  body?: string;
 }
 
 /**
@@ -1226,7 +1230,17 @@ export function parseConnector(raw: unknown, where: string): Connector {
     if (typeof t.path !== "string" || !t.path.startsWith("/")) {
       fail(where, '"test.path" must be a string starting with "/"');
     }
-    test = { path: t.path };
+    if (t.method !== undefined && t.method !== "GET" && t.method !== "POST") {
+      fail(where, '"test.method" must be "GET" or "POST"');
+    }
+    if (t.body !== undefined && (typeof t.body !== "string" || t.body.length > 4096)) {
+      fail(where, '"test.body" must be a bounded string');
+    }
+    test = {
+      path: t.path,
+      ...(t.method !== undefined ? { method: t.method as "GET" | "POST" } : {}),
+      ...(t.body !== undefined ? { body: t.body as string } : {}),
+    };
   }
 
   const oauth = o.oauth !== undefined ? parseOauth(where, o.oauth, hosts) : undefined;

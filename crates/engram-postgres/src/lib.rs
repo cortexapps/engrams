@@ -1907,7 +1907,7 @@ impl MetadataStore for PostgresStore {
               AND expires_at IS NOT NULL AND expires_at <= $2
               AND revoked_at IS NULL AND broken_at IS NULL
               AND (refresh_claim_until IS NULL OR refresh_claim_until < $3)
-            ORDER BY expires_at ASC
+            ORDER BY expires_at ASC, subject_id, provider
             LIMIT $4
             "#,
         )

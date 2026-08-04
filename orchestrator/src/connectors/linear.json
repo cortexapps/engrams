@@ -50,7 +50,9 @@
     }
   },
   "test": {
-    "path": "/graphql"
+    "path": "/graphql",
+    "method": "POST",
+    "body": "{\"query\":\"{ viewer { id } }\"}"
   },
   "operations": [
     {

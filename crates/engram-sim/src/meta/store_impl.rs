@@ -4411,7 +4411,15 @@ impl MetadataStore for SimMetadataStore {
             })
             .cloned()
             .collect();
-        due.sort_by_key(|row| row.expires_at);
+        // Tie-break matches PG's ORDER BY exactly — same-second expiries must
+        // pick the same subset under LIMIT on both stores (ADR 0098 D4).
+        due.sort_by(|a, b| {
+            (a.expires_at, &a.key.subject_id, &a.key.provider).cmp(&(
+                b.expires_at,
+                &b.key.subject_id,
+                &b.key.provider,
+            ))
+        });
         due.truncate(usize::try_from(limit).unwrap_or(0));
         Ok(due)
     }

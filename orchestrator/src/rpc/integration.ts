@@ -117,7 +117,7 @@ export interface IntegrationOpAccess {
       mintKind: string;
       mintDraftFields: Record<string, string>;
     };
-  }): Promise<{ status: number }>;
+  }): Promise<{ status: number; body: Uint8Array }>;
 }
 
 export interface IntegrationDeps {
@@ -565,7 +565,10 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       // ADR 0058: an honest probe path (default `/`). Datadog's `/`
       // 307-redirects to a public page so any credential "passes" — it points
       // `test.path` at an endpoint that 401/403s without every injected header.
+      // A GraphQL-only endpoint (Linear) declares a POST probe with a body.
       const testPath = c.test?.path ?? "/";
+      const testMethod = c.test?.method ?? "GET";
+      const testBody = c.test?.body ?? "";
       const credential =
         c.credential.source === "mint"
           ? {
@@ -598,14 +601,33 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
         const resp = await integrationOp.runIntegrationOp({
           provider: req.provider,
           host,
-          method: "GET",
+          method: testMethod,
           path: testPath,
-          body: new Uint8Array(),
-          contentType: "",
+          body: testBody ? new TextEncoder().encode(testBody) : new Uint8Array(),
+          contentType: testBody ? "application/json" : "",
           credential,
         });
         if (resp.status === 401 || resp.status === 403) {
           return { ok: false, message: `${host} rejected the credential (HTTP ${resp.status})` };
+        }
+        // Body-auth providers (Slack) signal failure INSIDE a 200:
+        // {"ok":false,"error":"invalid_auth"}. Judge the body, not just the
+        // status, when the response parses as JSON with an explicit ok:false.
+        try {
+          const parsed: unknown = JSON.parse(new TextDecoder().decode(resp.body));
+          if (
+            typeof parsed === "object" &&
+            parsed !== null &&
+            (parsed as Record<string, unknown>).ok === false
+          ) {
+            const err = (parsed as Record<string, unknown>).error;
+            return {
+              ok: false,
+              message: `${host} rejected the credential (${typeof err === "string" ? err : "ok:false"})`,
+            };
+          }
+        } catch {
+          // Not JSON — the status verdict stands.
         }
         return { ok: true, message: `Reached ${host} · HTTP ${resp.status} · credential accepted` };
       } catch (err) {

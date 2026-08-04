@@ -132,7 +132,24 @@ impl InjectEntry {
                     secret: fresh.secret,
                     expires_at: Some(fresh.expires_at),
                 };
-                *self.cred.failure_backoff_until.write() = None;
+                // A connector-OAuth resolve serves the STALE token on a
+                // transient provider failure rather than erroring (the
+                // coordinator's stale-on-transient contract), so a `Some`
+                // reply is not proof of a fresh credential. If what came
+                // back is still inside the re-mint window, arm the backoff
+                // anyway — otherwise every guest request would repeat the
+                // coordinator round-trip for the whole outage window.
+                if self.cred.fresh_enough() {
+                    *self.cred.failure_backoff_until.write() = None;
+                } else {
+                    *self.cred.failure_backoff_until.write() =
+                        Some(crate::time_source::wall_now() + REFRESH_FAILURE_BACKOFF);
+                    tracing::warn!(
+                        source = ?mint_source,
+                        %session_id,
+                        "egress inject refresh returned a still-stale credential; backing off",
+                    );
+                }
             }
             None => {
                 *self.cred.failure_backoff_until.write() =
@@ -852,6 +869,51 @@ mod tests {
         e.refresh_if_stale(SessionId::new(), &r).await;
         assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(e.secret(), "current");
+    }
+
+    #[tokio::test]
+    async fn stale_on_transient_some_reply_still_arms_the_backoff() {
+        // The coordinator's connector-OAuth resolve returns Some(STALE token)
+        // on a transient provider failure. That must arm the backoff exactly
+        // like a None reply, or every guest request repeats the coordinator
+        // round-trip for the whole outage window.
+        let e = InjectEntry {
+            mint_source: Some(CredentialMintSource::OauthConnector {
+                connection_id: "linear-default".into(),
+                provider: "linear".into(),
+            }),
+            ..mint_entry("stale-token", Some(Utc::now() - Duration::minutes(1)))
+        };
+        let r = StubRefresher {
+            calls: Default::default(),
+            // "Refreshed" value is the same stale token with its old expiry —
+            // still inside the re-mint window.
+            result: Some(RefreshedInject {
+                secret: "stale-token".into(),
+                expires_at: Utc::now() - Duration::minutes(1),
+            }),
+        };
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        assert_eq!(
+            r.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second request is suppressed by the backoff"
+        );
+        assert!(e.cred.failure_backoff_until.read().is_some());
+
+        // Once the provider recovers, a genuinely fresh reply clears it.
+        *e.cred.failure_backoff_until.write() = Some(Utc::now() - Duration::seconds(1));
+        let ok = StubRefresher {
+            calls: Default::default(),
+            result: Some(RefreshedInject {
+                secret: "fresh-token".into(),
+                expires_at: Utc::now() + Duration::hours(24),
+            }),
+        };
+        e.refresh_if_stale(SessionId::new(), &ok).await;
+        assert_eq!(e.secret(), "fresh-token");
+        assert!(e.cred.failure_backoff_until.read().is_none());
     }
 
     #[tokio::test]
