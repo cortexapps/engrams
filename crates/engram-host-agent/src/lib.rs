@@ -246,10 +246,12 @@ impl HostAgent {
         // they leak. Non-FC backends register no `fc_for_reattach` and
         // clean-slate (VZ/process don't survive a host-agent restart).
         let mut reattached_roles: Vec<(SandboxId, migration::MigrationRole)> = Vec::new();
+        let mut reattach_ran = false;
         if let Some(fc) = self.fc_for_reattach.as_ref() {
             match live_attach::reattach_pass(&self.cfg.work_dir, fc).await {
                 Ok(report) => {
                     tracing::info!("{}", report.summary());
+                    reattach_ran = true;
                     // ADR 0045 C2: sandboxes that were mid-post-copy when
                     // the previous generation died; the fences re-arm
                     // once the pooled backend exists below.
@@ -260,6 +262,41 @@ impl HostAgent {
                         error = %e,
                         "live-attach pass failed; continuing with clean-slate startup"
                     );
+                }
+            }
+        } else {
+            // Non-FC backends clean-slate on restart — no VM survives,
+            // so every uuid entry in the work_dir is residue.
+            reattach_ran = true;
+        }
+        // Residue sweep: jail dirs, vsock sockets, and canonical entries
+        // whose sandbox did not survive. Runs after the reattach pass
+        // fixes the live set and before coordinator registration can
+        // create or resume anything (the ADR 0110 sweep ordering).
+        // Skipped when the reattach pass itself FAILED — an incomplete
+        // live set must never widen the sweep.
+        if reattach_ran {
+            let live: std::collections::HashSet<SandboxId> = self
+                .sandbox
+                .list()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            match live_attach::sweep_dead_sandbox_residue(&self.cfg.work_dir, &live) {
+                Ok(report) => {
+                    if report.jail_dirs + report.vsock_files + report.canonical_entries > 0 {
+                        tracing::info!(
+                            jail_dirs = report.jail_dirs,
+                            vsock_files = report.vsock_files,
+                            canonical_entries = report.canonical_entries,
+                            live = live.len(),
+                            "swept dead sandbox residue",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "dead-sandbox residue sweep failed");
                 }
             }
         }
