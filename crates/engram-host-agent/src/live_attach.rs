@@ -48,8 +48,12 @@ pub enum ReattachOutcome {
         reason: String,
     },
     /// The manifest itself was malformed or referenced a schema we
-    /// don't support. Treated the same as orphaned — drop the
-    /// manifest, let reconcile clean up the session row.
+    /// don't support. When the recorded process identities are still
+    /// recoverable from the raw JSON (the schema-bump case), the arm
+    /// reaps them and removes the jail dir like the orphan arm; when
+    /// they are not (garbage bytes), the dir and manifest stay in
+    /// place as the maybe-running VM's only on-disk handle. Reconcile
+    /// cleans up the session row either way.
     Malformed {
         manifest_path: PathBuf,
         reason: String,
@@ -154,21 +158,47 @@ pub async fn reattach_pass(
         ) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!(
-                    path = %manifest_path.display(),
-                    error = %e,
-                    "reattach pass: malformed manifest; removing the jail dir + falling through to orphan-reap"
-                );
-                // The WHOLE dir, not just the manifest: a manifest-less
-                // jail dir is invisible to every later pass (this loop
-                // iterates `*/sandbox.json`) and leaked until node
-                // replacement.
-                if let Some(jail_dir) = manifest_path.parent() {
-                    if let Err(rm) = std::fs::remove_dir_all(jail_dir) {
+                // Review finding on #1001: a malformed manifest can
+                // front a STILL-RUNNING VM — the reachable case is a
+                // SCHEMA_VERSION bump, where every detached survivor's
+                // manifest parses as JSON but rejects on the version
+                // field. Reap the recorded processes first (the same
+                // identity-checked kill the orphan arm does), extracted
+                // leniently from the raw JSON, then remove the whole
+                // dir. When even the pid is unrecoverable (garbage
+                // bytes — manifests are written atomically, so this is
+                // node-corruption territory), keep the dir AND the
+                // manifest: an unkillable maybe-running VM must retain
+                // its on-disk handle for ops, and the residue sweep
+                // deliberately never touches a dir that still has a
+                // sandbox.json.
+                match extract_process_records(&manifest_path) {
+                    Some(records) => {
                         tracing::warn!(
-                            path = %jail_dir.display(),
-                            error = %rm,
-                            "reattach pass: removing malformed jail dir failed",
+                            path = %manifest_path.display(),
+                            error = %e,
+                            "reattach pass: malformed manifest; reaping recorded processes + removing the jail dir"
+                        );
+                        for (pid, start_jiffies, what) in records {
+                            reap_orphan_if_alive(pid, start_jiffies, what);
+                        }
+                        if let Some(jail_dir) = manifest_path.parent() {
+                            if let Err(rm) = std::fs::remove_dir_all(jail_dir) {
+                                tracing::warn!(
+                                    path = %jail_dir.display(),
+                                    error = %rm,
+                                    "reattach pass: removing malformed jail dir failed",
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            path = %manifest_path.display(),
+                            error = %e,
+                            "reattach pass: manifest unreadable and process records \
+                             unrecoverable; leaving the jail dir in place for ops \
+                             (a recorded VM may still be running)"
                         );
                     }
                 }
@@ -244,6 +274,30 @@ pub async fn reattach_pass(
     Ok(report)
 }
 
+/// Leniently extract the recorded `(pid, start_time_jiffies, role)`
+/// pairs from a manifest that failed strict parsing. A schema-version
+/// mismatch (the reachable malformed case: a SCHEMA_VERSION bump over
+/// detached survivors) still deserializes as JSON, so the process
+/// identities the orphan reap needs are recoverable even when the
+/// typed read is not. `None` = not even the pid is trustworthy
+/// (garbage bytes) — the caller must NOT delete the VM's on-disk
+/// handles.
+fn extract_process_records(manifest_path: &Path) -> Option<Vec<(u32, u64, &'static str)>> {
+    let raw = std::fs::read(manifest_path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let proc_of = |v: &serde_json::Value| -> Option<(u32, u64)> {
+        let pid = v.get("pid")?.as_u64()?;
+        let start = v.get("start_time_jiffies")?.as_u64()?;
+        Some((u32::try_from(pid).ok()?, start))
+    };
+    let fc = proc_of(value.get("firecracker")?.get("process")?)?;
+    let mut out = vec![(fc.0, fc.1, "firecracker")];
+    if let Some(uffd) = value.get("uffd_handler").and_then(proc_of) {
+        out.push((uffd.0, uffd.1, "uffd-handler"));
+    }
+    Some(out)
+}
+
 /// What [`sweep_dead_sandbox_residue`] removed, for the startup log.
 #[derive(Debug, Default)]
 pub struct ResidueSweepReport {
@@ -286,6 +340,16 @@ pub fn sweep_dead_sandbox_residue(
             if live.contains(&id) {
                 continue;
             }
+            // A dir that still carries a sandbox.json is the reattach
+            // pass's jurisdiction, never the sweep's: the pass either
+            // adopted it (live), or reaped-and-removed it, or
+            // DELIBERATELY kept it because the manifest was garbage and
+            // a recorded VM may still be running with this dir as its
+            // only on-disk handle (review finding on #1001). The sweep
+            // removes only manifest-less residue.
+            if entry.path().join("sandbox.json").exists() {
+                continue;
+            }
             match std::fs::remove_dir_all(entry.path()) {
                 Ok(()) => {
                     report.jail_dirs += 1;
@@ -306,6 +370,11 @@ pub fn sweep_dead_sandbox_residue(
                 continue;
             };
             if live.contains(&id) {
+                continue;
+            }
+            // Same jurisdiction rule as the dir arm: a kept jail dir
+            // (garbage manifest, maybe-running VM) keeps its sockets.
+            if work_dir.join(id.to_string()).join("sandbox.json").exists() {
                 continue;
             }
             match std::fs::remove_file(entry.path()) {
@@ -453,7 +522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_manifest_is_deleted_and_reported() {
+    async fn garbage_manifest_keeps_the_jail_dir_for_ops() {
         let tmp = tempfile::tempdir().unwrap();
         let backend = fc_backend(tmp.path());
         let sandbox_dir = tmp.path().join("00000000-0000-0000-0000-000000000001");
@@ -466,10 +535,50 @@ mod tests {
         assert!(report.orphaned.is_empty());
         assert_eq!(report.malformed.len(), 1);
         assert!(
+            sandbox_dir.exists() && manifest_path.exists(),
+            "garbage bytes = process records unrecoverable: a maybe-running \
+             VM must keep its only on-disk handle (review finding on #1001)"
+        );
+    }
+
+    /// The reachable malformed case (review finding on #1001): a
+    /// SCHEMA_VERSION bump makes every detached survivor's manifest
+    /// parse as JSON but fail the typed read. The recorded processes
+    /// are reaped (identity-checked — a dead/recycled pid is a no-op)
+    /// and only then is the jail dir removed.
+    #[tokio::test]
+    async fn schema_mismatch_manifest_reaps_then_removes_the_jail_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = fc_backend(tmp.path());
+        let sandbox_id = engram_core::SandboxId::new();
+        let sandbox_dir = tmp.path().join(sandbox_id.to_string());
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        let manifest_path = sandbox_dir.join("sandbox.json");
+        // Valid JSON with the process records present, wrong schema.
+        std::fs::write(
+            &manifest_path,
+            serde_json::json!({
+                "schema_version": SCHEMA_VERSION + 999,
+                "sandbox_id": sandbox_id,
+                "backend": BACKEND_FIRECRACKER,
+                "firecracker": {
+                    "process": {
+                        "pid": 16_000_001u32,
+                        "start_time_jiffies": 42u64,
+                        "comm": "firecracker",
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let report = reattach_pass(tmp.path(), &backend).await.unwrap();
+        assert_eq!(report.malformed.len(), 1);
+        assert!(
             !sandbox_dir.exists(),
-            "the WHOLE malformed jail dir must be removed — a manifest-less \
-             dir is invisible to every later pass and leaks until node \
-             replacement"
+            "with recoverable process records the arm reaps (dead pid = \
+             no-op) and removes the whole dir"
         );
     }
 
@@ -559,6 +668,14 @@ mod tests {
             engram_sandbox_firecracker::paths::canonical_entries_for(tmp.path(), dead_sock_id);
         std::fs::create_dir_all(canonical[0].parent().unwrap()).unwrap();
         std::fs::write(&canonical[0], b"dev").unwrap();
+        // A dead-id dir that still carries a sandbox.json is the
+        // reattach pass's jurisdiction (garbage-manifest kept-dir case)
+        // — the sweep must not touch it, nor its sockets.
+        let kept_id = engram_core::SandboxId::new();
+        let kept_dir = tmp.path().join(kept_id.to_string());
+        std::fs::create_dir_all(&kept_dir).unwrap();
+        std::fs::write(kept_dir.join("sandbox.json"), b"{ garbage ").unwrap();
+        std::fs::write(tmp.path().join(format!("{kept_id}.vsock")), b"").unwrap();
         // Foreign (non-uuid) residents must never be touched.
         std::fs::create_dir_all(tmp.path().join("chunk-cache")).unwrap();
         std::fs::create_dir_all(tmp.path().join("bindings")).unwrap();
@@ -589,6 +706,11 @@ mod tests {
             tmp.path().join("chunk-cache").exists()
                 && tmp.path().join("bindings/keep.json").exists(),
             "non-uuid residents untouched"
+        );
+        assert!(
+            kept_dir.exists() && tmp.path().join(format!("{kept_id}.vsock")).exists(),
+            "a manifest-bearing dir and its sockets are the reattach \
+             pass's jurisdiction, never the sweep's"
         );
     }
 }
