@@ -1,7 +1,12 @@
 import { Layers, ListChecks, SquarePlus } from "lucide-react";
 import { Link, Outlet, useRouterState, type LinkProps } from "@tanstack/react-router";
 import { useIsAdmin } from "../../auth/AuthProvider";
-import { Sidebar, SidebarProvider } from "@/components/ui/sidebar";
+import {
+  Sidebar,
+  SidebarProvider,
+  SidebarResizeHandle,
+  useSidebarWidth,
+} from "@/components/ui/sidebar";
 import type { NavItem } from "@/components/nav";
 import { SessionsRail } from "./SessionsRail";
 import { cn } from "@/lib/utils";
@@ -12,8 +17,13 @@ import { cn } from "@/lib/utils";
 // moves the rail's highlight instead of swapping the whole layout. The outlet
 // is layout-neutral: each child owns its padding/scroll (the list pages pad +
 // scroll; the detail page fills the height with its own panes).
+// A long task title needs more room than a nav rail does, so the rail is
+// drag-resizable and remembers the width per browser.
+const RAIL_WIDTH_STORAGE_KEY = "engrams.sessionsRailWidth";
+
 export function SessionsLayout() {
   const isAdmin = useIsAdmin();
+  const [railStyle, railHandle] = useSidebarWidth(RAIL_WIDTH_STORAGE_KEY);
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const seg = pathname.startsWith("/sessions/") ? pathname.split("/")[2] : undefined;
   // `list` and `all` are section pages (the full tables), not a transcript — the
@@ -50,13 +60,14 @@ export function SessionsLayout() {
     // which is `md:hidden`), so BOTH rails stay fixed with their own internal
     // scroll and only the content column scrolls — for the list views and the
     // transcript alike. `min-h-0` neutralises the provider's base `min-h-svh`.
-    <SidebarProvider className="h-[calc(100svh-3rem)] min-h-0 md:h-svh">
+    <SidebarProvider className="h-[calc(100svh-3rem)] min-h-0 md:h-svh" style={railStyle}>
       {/* desktop (md+): the persistent sessions rail */}
       <Sidebar
         collapsible="none"
-        className="sidebar-section hidden border-r border-sidebar-border md:flex"
+        className="sidebar-section hidden shrink-0 border-r border-sidebar-border md:flex"
       >
         <SessionsRail />
+        <SidebarResizeHandle {...railHandle} label="Resize task list" />
       </Sidebar>
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         {/* mobile (<md): horizontal scope strip — the rail is desktop-only, and
