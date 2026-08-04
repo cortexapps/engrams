@@ -109,20 +109,22 @@ impl InjectEntry {
     /// re-mint it via `refresher`, single-flighted so concurrent connections
     /// re-mint at most once. On refresh failure the STALE secret is kept — a
     /// request under a stale token 401s (recoverable), whereas dropping the
-    /// request is not. A no-op for a static entry (no `mint_source`) or one
-    /// still comfortably inside its validity window.
+    /// request is not — and further attempts back off briefly so a dead
+    /// credential (e.g. a revoked connector OAuth grant) doesn't turn every
+    /// guest request into a coordinator round-trip. A no-op for a static
+    /// entry (no `mint_source`) or one still inside its validity window.
     pub async fn refresh_if_stale(&self, session_id: SessionId, refresher: &dyn InjectRefresher) {
         let Some(mint_source) = &self.mint_source else {
             return;
         };
-        if self.cred.fresh_enough() {
+        if self.cred.fresh_enough() || self.cred.in_failure_backoff() {
             return;
         }
         // Single-flight: hold the async guard across the re-mint. Late arrivals
         // block here, then re-check and observe the freshly-minted value.
         let _guard = self.cred.refreshing.lock().await;
-        if self.cred.fresh_enough() {
-            return; // another connection refreshed while we waited
+        if self.cred.fresh_enough() || self.cred.in_failure_backoff() {
+            return; // another connection refreshed (or failed) while we waited
         }
         match refresher.refresh(session_id, mint_source).await {
             Some(fresh) => {
@@ -130,16 +132,26 @@ impl InjectEntry {
                     secret: fresh.secret,
                     expires_at: Some(fresh.expires_at),
                 };
+                *self.cred.failure_backoff_until.write() = None;
             }
-            None => tracing::warn!(
-                source = ?mint_source,
-                %session_id,
-                "egress inject refresh failed; keeping the stale credential \
-                 (a 401 is recoverable; a dropped request is not)",
-            ),
+            None => {
+                *self.cred.failure_backoff_until.write() =
+                    Some(crate::time_source::wall_now() + REFRESH_FAILURE_BACKOFF);
+                tracing::warn!(
+                    source = ?mint_source,
+                    %session_id,
+                    "egress inject refresh failed; keeping the stale credential \
+                     (a 401 is recoverable; a dropped request is not)",
+                );
+            }
         }
     }
 }
+
+/// How long a failed refresh suppresses re-attempts. Long enough that a dead
+/// credential doesn't spam the coordinator on every guest request, short
+/// enough that a transient coordinator blip recovers within a minute.
+const REFRESH_FAILURE_BACKOFF: Duration = Duration::seconds(45);
 
 /// WS4: the mutable, single-flighted credential behind an [`InjectEntry`]. Reads
 /// (`secret`) take a short `parking_lot` read lock; a refresh holds the async
@@ -148,6 +160,8 @@ impl InjectEntry {
 pub struct RefreshableCred {
     current: RwLock<CredState>,
     refreshing: tokio::sync::Mutex<()>,
+    /// Set after a failed refresh; attempts are suppressed until it passes.
+    failure_backoff_until: RwLock<Option<DateTime<Utc>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -163,7 +177,14 @@ impl RefreshableCred {
         Arc::new(Self {
             current: RwLock::new(CredState { secret, expires_at }),
             refreshing: tokio::sync::Mutex::new(()),
+            failure_backoff_until: RwLock::new(None),
         })
+    }
+
+    fn in_failure_backoff(&self) -> bool {
+        self.failure_backoff_until
+            .read()
+            .is_some_and(|until| crate::time_source::wall_now() < until)
     }
 
     fn secret(&self) -> String {
@@ -831,6 +852,37 @@ mod tests {
         e.refresh_if_stale(SessionId::new(), &r).await;
         assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(e.secret(), "current");
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_backs_off_then_retries_after_lapse() {
+        let e = mint_entry("stale", Some(Utc::now() + Duration::minutes(1)));
+        let r = StubRefresher {
+            calls: Default::default(),
+            result: None,
+        };
+        // First attempt fails and arms the backoff; the immediate second
+        // attempt is suppressed — a dead credential doesn't turn every guest
+        // request into a coordinator round-trip.
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(e.cred.failure_backoff_until.read().is_some());
+
+        // Once the backoff lapses, the next request retries; a success clears
+        // the backoff state.
+        *e.cred.failure_backoff_until.write() = Some(Utc::now() - Duration::seconds(1));
+        let ok = StubRefresher {
+            calls: Default::default(),
+            result: Some(RefreshedInject {
+                secret: "recovered".into(),
+                expires_at: Utc::now() + Duration::hours(1),
+            }),
+        };
+        e.refresh_if_stale(SessionId::new(), &ok).await;
+        assert_eq!(ok.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(e.secret(), "recovered");
+        assert!(e.cred.failure_backoff_until.read().is_none());
     }
 
     #[tokio::test]
