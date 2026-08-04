@@ -39,6 +39,11 @@ message OpInject {
   string header = 1;      // header name (default Authorization)
   string template = 2;    // "Bearer {}" / "{}" — {} is substituted with the secret
   string secret_ref = 3;  // org secret to resolve
+  // Connect-sheet "Test" before save: a drafted value overriding the stored
+  // secret for THIS request only. Never persisted; rejected on
+  // ResolveIntegrationCredential (drafts never come back as a resolved
+  // credential).
+  string draft_secret = 4;
 }
 
 // How to resolve a connector's credential. Built by the orchestrator from the
@@ -47,6 +52,16 @@ message CredentialSpec {
   string source = 1;             // "inject" | "mint"
   repeated OpInject injects = 2; // inject source: one or more headers
   string mint_provider = 3;      // mint source: provider id for the mint engine
+  // ADR 0106 addendum: when set, the inject value is the connector's OAuth
+  // access token from the sealed credential store (subject = this connection
+  // id, provider = the request's provider) — refreshed coordinator-side. The
+  // single inject entry carries the header name + template.
+  string oauth_connection_id = 4;
+  // Draft mint test (connect sheet, was MintService.RunConnectorTest): build
+  // the mint engine from these fields instead of the stored org secrets.
+  // `mint_kind` selects the builder. Rejected on ResolveIntegrationCredential.
+  string mint_kind = 5;
+  map<string, string> mint_draft_fields = 6;
 }
 
 message RunIntegrationOpRequest {

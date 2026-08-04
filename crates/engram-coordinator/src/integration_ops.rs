@@ -3,8 +3,9 @@
 //! resolved coordinator-side (KEK-unseal / mint) and either used to make the call
 //! here (`run_integration_op`, Mode A — secret never leaves the coordinator) or
 //! handed back to the orchestrator (`resolve_integration_credential`, Mode B — for
-//! an off-the-shelf SDK). Mirrors `grpc_app::mint::run_connector_test`, generalized
-//! from a benign GET to an arbitrary request.
+//! an off-the-shelf SDK). Subsumes the retired `MintService.RunConnectorTest`:
+//! the connect sheet's "Test" is a `RunIntegrationOp` GET whose spec carries
+//! draft overrides.
 //!
 //! Kept out of `grpc_app/` on purpose: the auth-convention test there counts one
 //! `self.auth.check` per `async fn`, so the helper async fns live here and the RPC
@@ -43,7 +44,7 @@ pub async fn run_integration_op(
     let mut builder = http.request(method, &url);
 
     let spec = req.credential.unwrap_or_default();
-    builder = apply_credential(state, &spec, builder).await?;
+    builder = apply_credential(state, &req.provider, &spec, builder).await?;
 
     if !req.body.is_empty() {
         let ct = if req.content_type.is_empty() {
@@ -99,6 +100,28 @@ pub async fn resolve_integration_credential(
         "integration credential resolved to the orchestrator (Mode B)"
     );
     let spec = req.credential.unwrap_or_default();
+    // Drafts are a connect-sheet test affordance; they never come back as a
+    // resolved credential.
+    if !spec.mint_draft_fields.is_empty() || spec.injects.iter().any(|i| !i.draft_secret.is_empty())
+    {
+        return Err("draft credentials cannot be resolved to the orchestrator".to_string());
+    }
+
+    // ADR 0106 addendum: an oauth-facet connector's credential is the sealed,
+    // coordinator-refreshed access token. Real `expires_at` rides back so the
+    // orchestrator's SDK cache re-resolves on time.
+    if !spec.oauth_connection_id.is_empty() {
+        let token = resolve_oauth_token(state, &req.provider, &spec.oauth_connection_id).await?;
+        return Ok(app::ResolvedCredential {
+            cred: Some(app::resolved_credential::Cred::Bearer(app::BearerCred {
+                token: token.secret,
+            })),
+            expires_at: token
+                .expires_at
+                .map(|at| at.to_rfc3339())
+                .unwrap_or_default(),
+        });
+    }
 
     if spec.source == "mint" {
         let scoped = mint_scoped(state, &spec.mint_provider).await?;
@@ -137,19 +160,70 @@ pub async fn resolve_integration_credential(
     })
 }
 
-/// Attach the resolved credential to an outbound request builder. For inject, apply
-/// every declared header (templated); for mint, attach the provider's own header.
+/// Resolve a connector-OAuth token from the sealed store (ADR 0106 addendum).
+async fn resolve_oauth_token(
+    state: &SharedState,
+    provider: &str,
+    connection_id: &str,
+) -> Result<crate::oauth_refresh::ResolvedConnectorToken, String> {
+    let key = engram_core::types::oauth::OAuthCredentialKey {
+        subject_kind: engram_core::types::oauth::OAuthSubjectKind::Connector,
+        subject_id: connection_id.to_string(),
+        provider: provider.to_string(),
+    };
+    state
+        .oauth
+        .resolve_connector_token(&key)
+        .await
+        .map_err(|e| format!("connector OAuth credential unavailable: {}", e.code()))
+}
+
+/// Attach the resolved credential to an outbound request builder. For inject,
+/// apply every declared header (templated, draft override honored); for mint,
+/// attach the provider's own header (draft fields build a probe engine); for a
+/// connector-OAuth spec, render the store-resolved access token.
 async fn apply_credential(
     state: &SharedState,
+    provider: &str,
     spec: &app::CredentialSpec,
     builder: reqwest::RequestBuilder,
 ) -> Result<reqwest::RequestBuilder, String> {
+    if !spec.oauth_connection_id.is_empty() {
+        let token = resolve_oauth_token(state, provider, &spec.oauth_connection_id).await?;
+        let (header_name, template) = spec
+            .injects
+            .first()
+            .map(|inj| (inj.header.as_str(), inj.template.as_str()))
+            .unwrap_or(("", ""));
+        let header_name = if header_name.is_empty() {
+            "Authorization"
+        } else {
+            header_name
+        };
+        let template = if template.is_empty() {
+            "Bearer {}"
+        } else {
+            template
+        };
+        return Ok(builder.header(header_name, template.replace("{}", &token.secret)));
+    }
     if spec.source == "mint" {
-        let engine = state
-            .integrations
-            .resolve(&spec.mint_provider, &state.services.secrets)
-            .await
-            .ok_or_else(|| "mint credentials are not configured".to_string())?;
+        // Draft fields (the connect sheet's pre-save "Test") build a one-shot
+        // engine from the mint-kind registry; otherwise resolve the stored one.
+        let engine = if !spec.mint_draft_fields.is_empty() {
+            let desc = crate::integrations::mint_kind_registry()
+                .into_iter()
+                .find(|d| d.kind == spec.mint_kind)
+                .ok_or_else(|| format!("unknown mint kind {:?}", spec.mint_kind))?;
+            (desc.build)(&spec.mint_draft_fields)
+                .map_err(|e| format!("invalid credentials: {e}"))?
+        } else {
+            state
+                .integrations
+                .resolve(&spec.mint_provider, &state.services.secrets)
+                .await
+                .ok_or_else(|| "mint credentials are not configured".to_string())?
+        };
         let hint = CredentialHint {
             served_host: None,
             owner: None,
@@ -168,7 +242,11 @@ async fn apply_credential(
     }
     let mut b = builder;
     for inj in &spec.injects {
-        let value = resolve_secret(state, &inj.secret_ref).await?;
+        let value = if !inj.draft_secret.is_empty() {
+            inj.draft_secret.clone()
+        } else {
+            resolve_secret(state, &inj.secret_ref).await?
+        };
         let header_name = if inj.header.is_empty() {
             "Authorization"
         } else {

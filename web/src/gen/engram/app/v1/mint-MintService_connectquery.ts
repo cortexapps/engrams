@@ -7,17 +7,10 @@ import { MintService } from "./mint_pb";
 /**
  * List every built-in mint kind the coordinator can build (e.g. github_app).
  *
+ * Connector testing moved to IntegrationOpService.RunIntegrationOp (its
+ * acknowledged generalization): the spec carries draft overrides and the
+ * orchestrator derives accepted/rejected from the upstream status.
+ *
  * @generated from rpc engram.app.v1.MintService.ListMintKinds
  */
 export const listMintKinds = MintService.method.listMintKinds;
-
-/**
- * Test an integration credential: resolve it (from the org store, or a
- * just-entered draft) and make ONE benign authenticated GET to the host,
- * reporting whether the credential was accepted. The orchestrator (which owns
- * the connector registry) supplies the resolved spec; the coordinator is the
- * only tier that can unseal secrets + run the mint engine. Admin-gated there.
- *
- * @generated from rpc engram.app.v1.MintService.RunConnectorTest
- */
-export const runConnectorTest = MintService.method.runConnectorTest;

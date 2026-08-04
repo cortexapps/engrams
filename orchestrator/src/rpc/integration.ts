@@ -32,7 +32,11 @@ import {
   connectorStatus,
   type Connector,
 } from "../connectors/registry.ts";
-import { orgSecret as defaultOrgSecret, mint as defaultMint } from "../control-plane/client.ts";
+import {
+  orgSecret as defaultOrgSecret,
+  mint as defaultMint,
+  integrationOp as defaultIntegrationOp,
+} from "../control-plane/client.ts";
 import {
   makeIntegrationConnectionStore,
   type GoogleCloudConnectionConfig,
@@ -79,22 +83,31 @@ export interface OrgSecretAccess {
   listSecrets(req: Record<string, never>): Promise<{ secrets: Array<{ name: string }> }>;
   putSecret(req: { name: string; value: string }): Promise<unknown>;
 }
-/** Resolved connector test spec sent to the coordinator (mirrors RunConnectorTestRequest). */
-export interface RunConnectorTestSpec {
-  provider: string;
-  host: string;
-  source: string;
-  /** inject source: every header the connector injects (ADR 0058). */
-  injects?: Array<{ header: string; template: string; secretRef: string; draftSecret: string }>;
-  kind?: string;
-  draftFields?: Record<string, string>;
-  /** ADR 0058: probe path (`https://{host}{testPath}`); default `/` coord-side. */
-  testPath?: string;
-}
-/** The slice of the coordinator MintService this service reads/calls. */
+/** The slice of the coordinator MintService this service reads. */
 export interface MintAccess {
   listMintKinds(req: Record<string, never>): Promise<{ mintKinds: MintKind[] }>;
-  runConnectorTest(req: RunConnectorTestSpec): Promise<{ ok: boolean; message: string }>;
+}
+/** The slice of IntegrationOpService the connector test rides (its
+ * generalization subsumed the retired MintService.RunConnectorTest): one
+ * benign authenticated GET; the spec carries draft overrides and, for an
+ * oauth-facet connector, the sealed-store connection id. */
+export interface IntegrationOpAccess {
+  runIntegrationOp(req: {
+    provider: string;
+    host: string;
+    method: string;
+    path: string;
+    body: Uint8Array;
+    contentType: string;
+    credential: {
+      source: string;
+      injects: Array<{ header: string; template: string; secretRef: string; draftSecret: string }>;
+      mintProvider: string;
+      oauthConnectionId: string;
+      mintKind: string;
+      mintDraftFields: Record<string, string>;
+    };
+  }): Promise<{ status: number }>;
 }
 
 export interface IntegrationDeps {
@@ -103,6 +116,7 @@ export interface IntegrationDeps {
   connectorLogos?: ConnectorLogoStore;
   orgSecret?: OrgSecretAccess;
   mint?: MintAccess;
+  integrationOp?: IntegrationOpAccess;
   connections?: IntegrationConnectionStore;
   profiles?: ProfileStore;
   now?: () => Date;
@@ -276,7 +290,11 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
   const connectorLogos: ConnectorLogoStore = deps?.connectorLogos ?? makeConnectorLogoStore(getDb());
   const orgSecret: OrgSecretAccess = deps?.orgSecret ?? (defaultOrgSecret as unknown as OrgSecretAccess);
   const mint: MintAccess = deps?.mint ?? (defaultMint as unknown as MintAccess);
+  const integrationOp: IntegrationOpAccess = deps?.integrationOp ?? defaultIntegrationOp;
   const connections = deps?.connections ?? makeIntegrationConnectionStore(getDb());
+  // The credential subject for an oauth-facet connector (ADR 0106 addendum).
+  const connectionIdFor = async (provider: string, displayName: string) =>
+    (await connections.ensureDefault(provider, displayName)).id;
   const profiles = deps?.profiles ?? makeProfileStore(getDb());
   const now = deps?.now ?? (() => new Date());
   const issuer = deps?.issuer ?? googleOidcIssuer();
@@ -486,10 +504,11 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       return { logoUrl: logoUrl(req.provider) };
     },
 
-    // Admin-only: test a connector's credential. Build the resolved spec from the
-    // registry (host + inject header/template/secretRef OR mint kind, ± draft)
-    // and delegate the unseal/mint + benign GET to the coordinator. A failed test
-    // is `{ ok: false, message }`, not an RPC error.
+    // Admin-only: test a connector's credential — one benign authenticated GET
+    // through RunIntegrationOp (which subsumed MintService.RunConnectorTest).
+    // The spec carries draft overrides (the connect sheet's pre-save "Test");
+    // an oauth-facet connector tests its sealed-store token. A failed test is
+    // `{ ok: false, message }`, not an RPC error.
     async testConnector(req, ctx) {
       await requireAdmin(ctx, getSession);
       const registry = await loadRegistry(connectors);
@@ -498,40 +517,56 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       const host = c.hosts[0];
       if (!host) throw new ConnectError(`connector "${req.provider}" has no host`, Code.InvalidArgument);
       const draft = req.draftValues ?? {};
-      // ADR 0058: an honest probe path (default `/` coord-side). Datadog's `/`
+      // ADR 0058: an honest probe path (default `/`). Datadog's `/`
       // 307-redirects to a public page so any credential "passes" — it points
       // `test.path` at an endpoint that 401/403s without every injected header.
-      const testPath = c.test?.path;
-      const spec: RunConnectorTestSpec =
+      const testPath = c.test?.path ?? "/";
+      const credential =
         c.credential.source === "mint"
           ? {
-              provider: req.provider,
-              host,
               source: "mint",
-              kind: c.credential.mint.kind,
-              draftFields: draft,
-              ...(testPath ? { testPath } : {}),
+              injects: [],
+              mintProvider: c.provider,
+              oauthConnectionId: "",
+              mintKind: c.credential.mint.kind,
+              mintDraftFields: draft,
             }
           : {
-              provider: req.provider,
-              host,
               source: "inject",
-              // ADR 0058: probe EVERY injected header. The web sends the drafted
-              // values keyed by org-secret ref (`draft[secretRef]`); a header with
-              // no draft falls back to its stored secret coordinator-side.
-              // An oauth-facet connector's inject has no secretRef; its test
-              // resolves the brokered credential coordinator-side (the empty
-              // ref makes the legacy static path report "not connected").
+              // ADR 0058: probe EVERY injected header. The web sends drafted
+              // values keyed by org-secret ref; a header with no draft falls
+              // back to its stored secret coordinator-side.
               injects: c.credential.injects.map((inj) => ({
                 header: inj.header,
                 template: inj.template ?? "{}",
                 secretRef: inj.secretRef ?? "",
                 draftSecret: (inj.secretRef !== undefined ? draft[inj.secretRef] : "") ?? "",
               })),
-              ...(testPath ? { testPath } : {}),
+              mintProvider: "",
+              oauthConnectionId: c.oauth
+                ? await connectionIdFor(c.provider, `${c.display.name} (default)`)
+                : "",
+              mintKind: "",
+              mintDraftFields: {},
             };
-      const { ok, message } = await mint.runConnectorTest(spec);
-      return { ok, message };
+      try {
+        const resp = await integrationOp.runIntegrationOp({
+          provider: req.provider,
+          host,
+          method: "GET",
+          path: testPath,
+          body: new Uint8Array(),
+          contentType: "",
+          credential,
+        });
+        if (resp.status === 401 || resp.status === 403) {
+          return { ok: false, message: `${host} rejected the credential (HTTP ${resp.status})` };
+        }
+        return { ok: true, message: `Reached ${host} · HTTP ${resp.status} · credential accepted` };
+      } catch (err) {
+        const message = err instanceof ConnectError ? err.rawMessage : String(err);
+        return { ok: false, message };
+      }
     },
 
     async listConnections(_req, ctx) {

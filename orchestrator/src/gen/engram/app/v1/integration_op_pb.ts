@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/integration_op.proto.
  */
 export const file_engram_app_v1_integration_op: GenFile = /*@__PURE__*/
-  fileDesc("CiJlbmdyYW0vYXBwL3YxL2ludGVncmF0aW9uX29wLnByb3RvEg1lbmdyYW0uYXBwLnYxIkAKCE9wSW5qZWN0Eg4KBmhlYWRlchgBIAEoCRIQCgh0ZW1wbGF0ZRgCIAEoCRISCgpzZWNyZXRfcmVmGAMgASgJImEKDkNyZWRlbnRpYWxTcGVjEg4KBnNvdXJjZRgBIAEoCRIoCgdpbmplY3RzGAIgAygLMhcuZW5ncmFtLmFwcC52MS5PcEluamVjdBIVCg1taW50X3Byb3ZpZGVyGAMgASgJIq4BChdSdW5JbnRlZ3JhdGlvbk9wUmVxdWVzdBIQCghwcm92aWRlchgBIAEoCRIMCgRob3N0GAIgASgJEg4KBm1ldGhvZBgDIAEoCRIMCgRwYXRoGAQgASgJEgwKBGJvZHkYBSABKAwSFAoMY29udGVudF90eXBlGAYgASgJEjEKCmNyZWRlbnRpYWwYByABKAsyHS5lbmdyYW0uYXBwLnYxLkNyZWRlbnRpYWxTcGVjImEKGFJ1bkludGVncmF0aW9uT3BSZXNwb25zZRIOCgZzdGF0dXMYASABKA0SDAoEYm9keRgCIAEoDBIUCgxjb250ZW50X3R5cGUYAyABKAkSEQoJdHJ1bmNhdGVkGAQgASgIImoKI1Jlc29sdmVJbnRlZ3JhdGlvbkNyZWRlbnRpYWxSZXF1ZXN0EhAKCHByb3ZpZGVyGAEgASgJEjEKCmNyZWRlbnRpYWwYAiABKAsyHS5lbmdyYW0uYXBwLnYxLkNyZWRlbnRpYWxTcGVjIuUBChJSZXNvbHZlZENyZWRlbnRpYWwSKwoGYmVhcmVyGAEgASgLMhkuZW5ncmFtLmFwcC52MS5CZWFyZXJDcmVkSAASKQoFYmFzaWMYAiABKAsyGC5lbmdyYW0uYXBwLnYxLkJhc2ljQ3JlZEgAEi0KB2hlYWRlcnMYAyABKAsyGi5lbmdyYW0uYXBwLnYxLkhlYWRlcnNDcmVkSAASLAoHYXdzX3N0cxgEIAEoCzIZLmVuZ3JhbS5hcHAudjEuQXdzU3RzQ3JlZEgAEhIKCmV4cGlyZXNfYXQYCiABKAlCBgoEY3JlZCIbCgpCZWFyZXJDcmVkEg0KBXRva2VuGAEgASgJIi8KCUJhc2ljQ3JlZBIQCgh1c2VybmFtZRgBIAEoCRIQCghwYXNzd29yZBgCIAEoCSJ0CgtIZWFkZXJzQ3JlZBI2CgZ2YWx1ZXMYASADKAsyJi5lbmdyYW0uYXBwLnYxLkhlYWRlcnNDcmVkLlZhbHVlc0VudHJ5Gi0KC1ZhbHVlc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEiVQoKQXdzU3RzQ3JlZBIVCg1hY2Nlc3Nfa2V5X2lkGAEgASgJEhkKEXNlY3JldF9hY2Nlc3Nfa2V5GAIgASgJEhUKDXNlc3Npb25fdG9rZW4YAyABKAkiXQokUmVzb2x2ZUludGVncmF0aW9uQ3JlZGVudGlhbFJlc3BvbnNlEjUKCmNyZWRlbnRpYWwYASABKAsyIS5lbmdyYW0uYXBwLnYxLlJlc29sdmVkQ3JlZGVudGlhbDKFAgoUSW50ZWdyYXRpb25PcFNlcnZpY2USYwoQUnVuSW50ZWdyYXRpb25PcBImLmVuZ3JhbS5hcHAudjEuUnVuSW50ZWdyYXRpb25PcFJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLlJ1bkludGVncmF0aW9uT3BSZXNwb25zZRKHAQocUmVzb2x2ZUludGVncmF0aW9uQ3JlZGVudGlhbBIyLmVuZ3JhbS5hcHAudjEuUmVzb2x2ZUludGVncmF0aW9uQ3JlZGVudGlhbFJlcXVlc3QaMy5lbmdyYW0uYXBwLnYxLlJlc29sdmVJbnRlZ3JhdGlvbkNyZWRlbnRpYWxSZXNwb25zZWIGcHJvdG8z");
+  fileDesc("CiJlbmdyYW0vYXBwL3YxL2ludGVncmF0aW9uX29wLnByb3RvEg1lbmdyYW0uYXBwLnYxIlYKCE9wSW5qZWN0Eg4KBmhlYWRlchgBIAEoCRIQCgh0ZW1wbGF0ZRgCIAEoCRISCgpzZWNyZXRfcmVmGAMgASgJEhQKDGRyYWZ0X3NlY3JldBgEIAEoCSKYAgoOQ3JlZGVudGlhbFNwZWMSDgoGc291cmNlGAEgASgJEigKB2luamVjdHMYAiADKAsyFy5lbmdyYW0uYXBwLnYxLk9wSW5qZWN0EhUKDW1pbnRfcHJvdmlkZXIYAyABKAkSGwoTb2F1dGhfY29ubmVjdGlvbl9pZBgEIAEoCRIRCgltaW50X2tpbmQYBSABKAkSTQoRbWludF9kcmFmdF9maWVsZHMYBiADKAsyMi5lbmdyYW0uYXBwLnYxLkNyZWRlbnRpYWxTcGVjLk1pbnREcmFmdEZpZWxkc0VudHJ5GjYKFE1pbnREcmFmdEZpZWxkc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEirgEKF1J1bkludGVncmF0aW9uT3BSZXF1ZXN0EhAKCHByb3ZpZGVyGAEgASgJEgwKBGhvc3QYAiABKAkSDgoGbWV0aG9kGAMgASgJEgwKBHBhdGgYBCABKAkSDAoEYm9keRgFIAEoDBIUCgxjb250ZW50X3R5cGUYBiABKAkSMQoKY3JlZGVudGlhbBgHIAEoCzIdLmVuZ3JhbS5hcHAudjEuQ3JlZGVudGlhbFNwZWMiYQoYUnVuSW50ZWdyYXRpb25PcFJlc3BvbnNlEg4KBnN0YXR1cxgBIAEoDRIMCgRib2R5GAIgASgMEhQKDGNvbnRlbnRfdHlwZRgDIAEoCRIRCgl0cnVuY2F0ZWQYBCABKAgiagojUmVzb2x2ZUludGVncmF0aW9uQ3JlZGVudGlhbFJlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkSMQoKY3JlZGVudGlhbBgCIAEoCzIdLmVuZ3JhbS5hcHAudjEuQ3JlZGVudGlhbFNwZWMi5QEKElJlc29sdmVkQ3JlZGVudGlhbBIrCgZiZWFyZXIYASABKAsyGS5lbmdyYW0uYXBwLnYxLkJlYXJlckNyZWRIABIpCgViYXNpYxgCIAEoCzIYLmVuZ3JhbS5hcHAudjEuQmFzaWNDcmVkSAASLQoHaGVhZGVycxgDIAEoCzIaLmVuZ3JhbS5hcHAudjEuSGVhZGVyc0NyZWRIABIsCgdhd3Nfc3RzGAQgASgLMhkuZW5ncmFtLmFwcC52MS5Bd3NTdHNDcmVkSAASEgoKZXhwaXJlc19hdBgKIAEoCUIGCgRjcmVkIhsKCkJlYXJlckNyZWQSDQoFdG9rZW4YASABKAkiLwoJQmFzaWNDcmVkEhAKCHVzZXJuYW1lGAEgASgJEhAKCHBhc3N3b3JkGAIgASgJInQKC0hlYWRlcnNDcmVkEjYKBnZhbHVlcxgBIAMoCzImLmVuZ3JhbS5hcHAudjEuSGVhZGVyc0NyZWQuVmFsdWVzRW50cnkaLQoLVmFsdWVzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASJVCgpBd3NTdHNDcmVkEhUKDWFjY2Vzc19rZXlfaWQYASABKAkSGQoRc2VjcmV0X2FjY2Vzc19rZXkYAiABKAkSFQoNc2Vzc2lvbl90b2tlbhgDIAEoCSJdCiRSZXNvbHZlSW50ZWdyYXRpb25DcmVkZW50aWFsUmVzcG9uc2USNQoKY3JlZGVudGlhbBgBIAEoCzIhLmVuZ3JhbS5hcHAudjEuUmVzb2x2ZWRDcmVkZW50aWFsMoUCChRJbnRlZ3JhdGlvbk9wU2VydmljZRJjChBSdW5JbnRlZ3JhdGlvbk9wEiYuZW5ncmFtLmFwcC52MS5SdW5JbnRlZ3JhdGlvbk9wUmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuUnVuSW50ZWdyYXRpb25PcFJlc3BvbnNlEocBChxSZXNvbHZlSW50ZWdyYXRpb25DcmVkZW50aWFsEjIuZW5ncmFtLmFwcC52MS5SZXNvbHZlSW50ZWdyYXRpb25DcmVkZW50aWFsUmVxdWVzdBozLmVuZ3JhbS5hcHAudjEuUmVzb2x2ZUludGVncmF0aW9uQ3JlZGVudGlhbFJlc3BvbnNlYgZwcm90bzM");
 
 /**
  * One header a connector injects, resolved from an org secret coordinator-side.
@@ -40,6 +40,16 @@ export type OpInject = Message<"engram.app.v1.OpInject"> & {
    * @generated from field: string secret_ref = 3;
    */
   secretRef: string;
+
+  /**
+   * Connect-sheet "Test" before save: a drafted value overriding the stored
+   * secret for THIS request only. Never persisted; rejected on
+   * ResolveIntegrationCredential (drafts never come back as a resolved
+   * credential).
+   *
+   * @generated from field: string draft_secret = 4;
+   */
+  draftSecret: string;
 };
 
 /**
@@ -76,6 +86,30 @@ export type CredentialSpec = Message<"engram.app.v1.CredentialSpec"> & {
    * @generated from field: string mint_provider = 3;
    */
   mintProvider: string;
+
+  /**
+   * ADR 0106 addendum: when set, the inject value is the connector's OAuth
+   * access token from the sealed credential store (subject = this connection
+   * id, provider = the request's provider) — refreshed coordinator-side. The
+   * single inject entry carries the header name + template.
+   *
+   * @generated from field: string oauth_connection_id = 4;
+   */
+  oauthConnectionId: string;
+
+  /**
+   * Draft mint test (connect sheet, was MintService.RunConnectorTest): build
+   * the mint engine from these fields instead of the stored org secrets.
+   * `mint_kind` selects the builder. Rejected on ResolveIntegrationCredential.
+   *
+   * @generated from field: string mint_kind = 5;
+   */
+  mintKind: string;
+
+  /**
+   * @generated from field: map<string, string> mint_draft_fields = 6;
+   */
+  mintDraftFields: { [key: string]: string };
 };
 
 /**

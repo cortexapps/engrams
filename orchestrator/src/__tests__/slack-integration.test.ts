@@ -343,7 +343,11 @@ describe("slack SDK adapter", () => {
       resolveIntegrationCredential: async () =>
         create(ResolveIntegrationCredentialResponseSchema, { credential }),
     };
-    const client = await getSlackClient({ connectors: emptySource, integrationOp: integrationOp as never });
+    const client = await getSlackClient({
+      connectors: emptySource,
+      integrationOp: integrationOp as never,
+      connectionIdFor: async () => "conn-slack-default",
+    });
     expect(client.token).toBe("xoxb-TEST");
     expect(typeof client.chat.postMessage).toBe("function");
   });
