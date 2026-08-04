@@ -289,7 +289,13 @@ hickory-proto = { version = "0.24", default-features = false, features = ["tokio
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
+# Keep the symbol table (drop only DWARF): #1003 — the SIGUSR2 heap
+# profiler symbolizes in-process from the running binary's symtab, and a
+# `strip = "symbols"` release ships pprof dumps as raw addresses. The
+# bake is not bit-reproducible outside its runner, so offline
+# symbolization against a rebuilt binary is not an option. Costs ~10 MB
+# of image size per Rust binary.
+strip = "debuginfo"
 
 # Trim third-party debug info to line tables only. Our own crates keep
 # full debug info (jump-to-def in IDEs, locals in lldb) — workspace
