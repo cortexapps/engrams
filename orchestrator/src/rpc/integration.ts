@@ -31,12 +31,15 @@ import {
   buildProviderCatalog,
   connectorStatus,
   type Connector,
+  type OauthCredentialStatus,
 } from "../connectors/registry.ts";
 import {
   orgSecret as defaultOrgSecret,
   mint as defaultMint,
   integrationOp as defaultIntegrationOp,
+  oauthCredential as defaultOauthCredential,
 } from "../control-plane/client.ts";
+import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import {
   makeIntegrationConnectionStore,
   type GoogleCloudConnectionConfig,
@@ -87,6 +90,13 @@ export interface OrgSecretAccess {
 export interface MintAccess {
   listMintKinds(req: Record<string, never>): Promise<{ mintKinds: MintKind[] }>;
 }
+/** The slice of OAuthCredentialService the status surface reads: a kind-wide
+ * listing of connector credentials (empty subject id). */
+export interface OauthCredentialAccess {
+  listCredentials(req: {
+    subject: { kind: OauthSubjectKind; id: string };
+  }): Promise<{ credentials: Array<{ provider: string; status: string }> }>;
+}
 /** The slice of IntegrationOpService the connector test rides (its
  * generalization subsumed the retired MintService.RunConnectorTest): one
  * benign authenticated GET; the spec carries draft overrides and, for an
@@ -117,6 +127,7 @@ export interface IntegrationDeps {
   orgSecret?: OrgSecretAccess;
   mint?: MintAccess;
   integrationOp?: IntegrationOpAccess;
+  oauthCredential?: OauthCredentialAccess;
   connections?: IntegrationConnectionStore;
   profiles?: ProfileStore;
   now?: () => Date;
@@ -143,9 +154,16 @@ function builtinProviders(): Set<string> {
 async function fetchStatusInputs(
   orgSecret: OrgSecretAccess,
   mint: MintAccess,
-): Promise<{ names: Set<string>; requiredByKind: Map<string, string[]> }> {
+  oauthCredential: OauthCredentialAccess,
+): Promise<StatusInputs> {
   try {
-    const [secrets, mintKinds] = await Promise.all([orgSecret.listSecrets({}), mint.listMintKinds({})]);
+    const [secrets, mintKinds, oauthCreds] = await Promise.all([
+      orgSecret.listSecrets({}),
+      mint.listMintKinds({}),
+      // Kind-wide listing (empty subject id): every connector credential in
+      // one call (ADR 0106 addendum).
+      oauthCredential.listCredentials({ subject: { kind: OauthSubjectKind.CONNECTOR, id: "" } }),
+    ]);
     const names = new Set(secrets.secrets.map((s) => s.name));
     const requiredByKind = new Map<string, string[]>();
     for (const k of mintKinds.mintKinds) {
@@ -154,17 +172,27 @@ async function fetchStatusInputs(
         k.fields.filter((f) => f.required).map((f) => `${k.kind}.${f.name}`),
       );
     }
-    return { names, requiredByKind };
+    const oauthByProvider = new Map<string, OauthCredentialStatus>();
+    for (const cred of oauthCreds.credentials) {
+      oauthByProvider.set(cred.provider, cred.status as OauthCredentialStatus);
+    }
+    return { names, requiredByKind, oauthByProvider };
   } catch (e) {
     console.error(`integration: status inputs unavailable, reporting all connectors available — ${(e as Error).message}`);
-    return { names: new Set(), requiredByKind: new Map() };
+    return { names: new Set(), requiredByKind: new Map(), oauthByProvider: new Map() };
   }
 }
 
-/** Derive a connector's connected/available status from the prefetched inputs. */
-function statusOf(c: Connector, names: Set<string>, requiredByKind: Map<string, string[]>): string {
-  const required = c.credential.source === "mint" ? (requiredByKind.get(c.credential.mint.kind) ?? []) : [];
-  return connectorStatus(c, names, required);
+interface StatusInputs {
+  names: Set<string>;
+  requiredByKind: Map<string, string[]>;
+  oauthByProvider: Map<string, OauthCredentialStatus>;
+}
+
+/** Derive a connector's status from the prefetched inputs. */
+function statusOf(c: Connector, inputs: StatusInputs): string {
+  const required = c.credential.source === "mint" ? (inputs.requiredByKind.get(c.credential.mint.kind) ?? []) : [];
+  return connectorStatus(c, inputs.names, required, inputs.oauthByProvider.get(c.provider));
 }
 
 /**
@@ -291,6 +319,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
   const orgSecret: OrgSecretAccess = deps?.orgSecret ?? (defaultOrgSecret as unknown as OrgSecretAccess);
   const mint: MintAccess = deps?.mint ?? (defaultMint as unknown as MintAccess);
   const integrationOp: IntegrationOpAccess = deps?.integrationOp ?? defaultIntegrationOp;
+  const oauthCredential: OauthCredentialAccess = deps?.oauthCredential ?? defaultOauthCredential;
   const connections = deps?.connections ?? makeIntegrationConnectionStore(getDb());
   // The credential subject for an oauth-facet connector (ADR 0106 addendum).
   const connectionIdFor = async (provider: string, displayName: string) =>
@@ -310,7 +339,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
   router.service(IntegrationService, {
     async listConnectors(_req, ctx) {
       await requireAdmin(ctx, getSession);
-      const { names, requiredByKind } = await fetchStatusInputs(orgSecret, mint);
+      const statusInputs = await fetchStatusInputs(orgSecret, mint, oauthCredential);
       // Built-in file seeds (read-only) first; then admin-authored DB rows,
       // dropping any that collide with a seed (writes reject collisions, so this
       // is the defensive belt — built-in always wins).
@@ -321,7 +350,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
         builtin: true,
         createdAt: "",
         updatedAt: "",
-        status: statusOf(c, names, requiredByKind),
+        status: statusOf(c, statusInputs),
       }));
       const custom = (await connectors.list())
         .filter((r) => !seeds.has(r.provider))
@@ -340,7 +369,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
             builtin: false,
             createdAt: r.createdAt.toISOString(),
             updatedAt: r.updatedAt.toISOString(),
-            status: parsed ? statusOf(parsed, names, requiredByKind) : "available",
+            status: parsed ? statusOf(parsed, statusInputs) : "available",
           };
         });
       return { connectors: [...builtins, ...custom] };

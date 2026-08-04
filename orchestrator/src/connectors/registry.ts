@@ -1661,13 +1661,22 @@ export function compileCliIntegrations(
 // Connected-status derivation + the member-safe provider catalog (redesign #1)
 // ---------------------------------------------------------------------------
 
-export type ConnectorStatus = "connected" | "available";
+export type ConnectorStatus = "connected" | "available" | "needs_reconnect";
+
+/** The coordinator's derived credential lifecycle for an OAuth connector
+ * (`OAuthCredentialMeta.status`). */
+export type OauthCredentialStatus = "connected" | "expired" | "broken" | "revoked";
 
 /**
- * Whether a connector's credential is configured (*connected*) or not yet
- * (*available*). Pure — the caller supplies the org-secret name set and, for a
- * mint connector, the org-secret names its mint kind requires:
- *   - inject → connected ⇔ the `secretRef` exists in the org secret store.
+ * Whether a connector's credential is configured (*connected*), not yet
+ * (*available*), or terminally rejected (*needs_reconnect*). Pure — the caller
+ * supplies the org-secret name set, mint requirements, and (for oauth-facet
+ * connectors) the coordinator's per-provider credential status:
+ *   - oauth  → status comes SOLELY from the sealed credential store. No row ⇒
+ *              available; broken/revoked ⇒ needs_reconnect; connected/expired ⇒
+ *              connected (transient expiry is the refresh scanner's to repair —
+ *              hours before consumers would notice).
+ *   - inject → connected ⇔ every `secretRef` exists in the org secret store.
  *   - mint   → connected ⇔ every required mint field exists as an org secret
  *              (caller derives the names as `${kind}.${field}` from the
  *              coordinator's mint-kind registry). None given ⇒ available.
@@ -1676,12 +1685,11 @@ export function connectorStatus(
   connector: Connector,
   orgSecretNames: ReadonlySet<string>,
   requiredMintSecretNames: ReadonlyArray<string> = [],
+  oauthStatus?: OauthCredentialStatus,
 ): ConnectorStatus {
   if (connector.oauth) {
-    // ADR 0106 addendum: an oauth connector's token lives in the sealed
-    // credential store, not org secrets; its status comes from the store
-    // (wired in the status surface below via `oauthProviderStatus`).
-    return "available";
+    if (oauthStatus === undefined) return "available";
+    return oauthStatus === "broken" || oauthStatus === "revoked" ? "needs_reconnect" : "connected";
   }
   if (connector.credential.source === "inject") {
     // Connected ⇔ every injected header's secret is present in the org store.

@@ -49,8 +49,10 @@ export function IntegrationsPanel() {
   };
 
   const shown = views.filter(match);
-  const connected = shown.filter((v) => v.status === "connected");
-  const available = shown.filter((v) => v.status !== "connected");
+  // needs_reconnect is a CONFIGURED connector whose refresh was terminally
+  // rejected — it belongs with the connected group, flagged for action.
+  const connected = shown.filter((v) => v.status !== "available");
+  const available = shown.filter((v) => v.status === "available");
   const connectView = connect ? views.find((v) => v.provider === connect) : undefined;
 
   return (

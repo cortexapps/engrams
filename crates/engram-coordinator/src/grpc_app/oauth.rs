@@ -62,11 +62,18 @@ fn flow_to_proto(flow: OAuthFlow) -> app::OAuthFlow {
     }
 }
 
-fn credential_to_proto(row: SealedOAuthCredential) -> app::OAuthCredentialMeta {
+fn credential_to_proto(
+    row: SealedOAuthCredential,
+    now: chrono::DateTime<chrono::Utc>,
+) -> app::OAuthCredentialMeta {
+    let status = row.status(now).as_str().to_string();
     app::OAuthCredentialMeta {
         provider: row.key.provider,
         version: row.version,
         connected: row.revoked_at.is_none(),
+        status,
+        expires_at: row.expires_at.map(|at| at.to_rfc3339()).unwrap_or_default(),
+        subject_id: row.key.subject_id,
         account: Some(app::OAuthAccountMetadata {
             display_name: row.metadata.display_name,
             plan_type: row.metadata.plan_type,
@@ -264,7 +271,10 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             .await
             .map_err(oauth_status)?;
         Ok(Response::new(app::CompleteRedirectFlowResponse {
-            credential: Some(credential_to_proto(row)),
+            credential: Some(credential_to_proto(
+                row,
+                self.state.services.clock.now_utc(),
+            )),
         }))
     }
 
@@ -273,16 +283,31 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
         req: Request<app::ListCredentialsRequest>,
     ) -> Result<Response<app::ListCredentialsResponse>, Status> {
         self.auth.check(&req)?;
-        let (kind, id) =
-            subject_from_proto(req.into_inner().subject).map_err(Status::invalid_argument)?;
+        // An EMPTY subject id lists every credential of the kind (the
+        // connector status surface); a set id scopes to one subject.
+        let subject = req
+            .into_inner()
+            .subject
+            .ok_or_else(|| Status::invalid_argument("subject is required"))?;
+        let kind = match app::OauthSubjectKind::try_from(subject.kind) {
+            Ok(app::OauthSubjectKind::User) => OAuthSubjectKind::User,
+            Ok(app::OauthSubjectKind::Connector) => OAuthSubjectKind::Connector,
+            Ok(app::OauthSubjectKind::Mcp) => OAuthSubjectKind::Mcp,
+            _ => return Err(Status::invalid_argument("subject kind is required")),
+        };
+        let id = subject.id.trim();
         let credentials = self
             .state
             .oauth
-            .list(kind, &id)
+            .list(kind, (!id.is_empty()).then_some(id))
             .await
             .map_err(oauth_status)?;
+        let now = self.state.services.clock.now_utc();
         Ok(Response::new(app::ListCredentialsResponse {
-            credentials: credentials.into_iter().map(credential_to_proto).collect(),
+            credentials: credentials
+                .into_iter()
+                .map(|row| credential_to_proto(row, now))
+                .collect(),
         }))
     }
 
@@ -302,7 +327,10 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             .await
             .map_err(oauth_status)?;
         Ok(Response::new(app::DisconnectResponse {
-            credential: Some(credential_to_proto(row)),
+            credential: Some(credential_to_proto(
+                row,
+                self.state.services.clock.now_utc(),
+            )),
         }))
     }
 

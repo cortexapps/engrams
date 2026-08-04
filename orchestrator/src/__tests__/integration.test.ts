@@ -15,7 +15,7 @@ import type { AddressInfo } from "node:net";
 
 import { buildServer } from "../server.ts";
 import { registerIntegration } from "../rpc/integration.ts";
-import type { IntegrationDeps, GetSession, IntegrationOpAccess, MintAccess, OrgSecretAccess } from "../rpc/integration.ts";
+import type { IntegrationDeps, GetSession, IntegrationOpAccess, MintAccess, OauthCredentialAccess, OrgSecretAccess } from "../rpc/integration.ts";
 import type { ConnectorStore, ConnectorRow } from "../db/connectors.ts";
 import type { ConnectorLogoStore } from "../db/connector-logos.ts";
 import type {
@@ -46,6 +46,15 @@ function fakeMint(): MintAccess {
   return {
     async listMintKinds() {
       return { mintKinds: [GITHUB_MINT_KIND] };
+    },
+  };
+}
+
+/** Kind-wide connector-credential listing (the oauth status input). */
+function fakeOauthCredential(creds: Array<{ provider: string; status: string }> = []): OauthCredentialAccess {
+  return {
+    async listCredentials() {
+      return { credentials: creds };
     },
   };
 }
@@ -504,11 +513,15 @@ describe("IntegrationService (native)", () => {
 });
 
 describe("IntegrationService — connector status (redesign)", () => {
-  const adminDeps = (names: string[]): IntegrationDeps => ({
+  const adminDeps = (
+    names: string[],
+    oauthCreds: Array<{ provider: string; status: string }> = [],
+  ): IntegrationDeps => ({
     getSession: makeGetSession("a", "admin"),
     connectors: fakeStore().store,
     orgSecret: fakeOrgSecret(names).client,
     mint: fakeMint(),
+    oauthCredential: fakeOauthCredential(oauthCreds),
   });
 
   test("inject connected ⇔ secretRef present; mint connected ⇔ all required fields present", async () => {
@@ -519,6 +532,26 @@ describe("IntegrationService — connector status (redesign)", () => {
       expect(by.get("github")?.status).toBe("connected"); // both mint fields present
     } finally {
       await s.close();
+    }
+  });
+
+  test("an oauth connector's status comes from the sealed store (ADR 0106 addendum)", async () => {
+    // No credential row -> available; a connected row -> connected; a broken
+    // row (refresh terminally rejected) -> needs_reconnect.
+    for (const [creds, expected] of [
+      [[], "available"],
+      [[{ provider: "slack", status: "connected" }], "connected"],
+      [[{ provider: "slack", status: "expired" }], "connected"],
+      [[{ provider: "slack", status: "broken" }], "needs_reconnect"],
+      [[{ provider: "slack", status: "revoked" }], "needs_reconnect"],
+    ] as const) {
+      const s = await spawn(adminDeps([], [...creds]));
+      try {
+        const by = new Map((await s.client.listConnectors({})).connectors.map((c) => [c.provider, c]));
+        expect(by.get("slack")?.status).toBe(expected);
+      } finally {
+        await s.close();
+      }
     }
   });
 

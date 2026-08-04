@@ -90,8 +90,18 @@ message OAuthCredentialMeta {
   OAuthAccountMetadata account = 4;
   string created_at = 5;
   string updated_at = 6;
+  // Derived lifecycle: "connected" | "expired" | "broken" | "revoked".
+  // "broken" means the provider terminally rejected refresh — reconnect.
+  string status = 7;
+  // Access-token expiry (RFC3339) when the provider expires it; "" otherwise.
+  string expires_at = 8;
+  // The credential's subject id (e.g. the integration-connection id for
+  // connector subjects). Useful on kind-wide listings.
+  string subject_id = 9;
 }
 
+// `subject.id` may be EMPTY to list every credential of `subject.kind` —
+// the connector status surface reads all connector credentials in one call.
 message ListCredentialsRequest { OAuthSubject subject = 1; }
 message ListCredentialsResponse { repeated OAuthCredentialMeta credentials = 1; }
 

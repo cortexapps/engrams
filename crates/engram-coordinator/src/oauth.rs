@@ -280,10 +280,12 @@ impl OAuthManager {
         self.get_flow(subject, id).await
     }
 
+    /// `subject_id = None` lists every credential of the kind (the connector
+    /// status surface reads all connector credentials in one call).
     pub async fn list(
         &self,
         kind: OAuthSubjectKind,
-        subject_id: &str,
+        subject_id: Option<&str>,
     ) -> Result<Vec<SealedOAuthCredential>, OAuthServiceError> {
         Ok(self.meta.list_oauth_credentials(kind, subject_id).await?)
     }

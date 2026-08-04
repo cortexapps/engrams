@@ -1617,10 +1617,14 @@ impl MetadataStore for PostgresStore {
     async fn list_oauth_credentials(
         &self,
         subject_kind: engram_core::types::oauth::OAuthSubjectKind,
-        subject_id: &str,
+        subject_id: Option<&str>,
     ) -> Result<Vec<engram_core::types::oauth::SealedOAuthCredential>, MetaError> {
         sqlx::query(
-            "SELECT * FROM oauth_credentials WHERE subject_kind=$1 AND subject_id=$2 ORDER BY provider",
+            r#"
+            SELECT * FROM oauth_credentials
+            WHERE subject_kind=$1 AND ($2::text IS NULL OR subject_id=$2)
+            ORDER BY subject_id, provider
+            "#,
         )
         .bind(subject_kind.as_str())
         .bind(subject_id)

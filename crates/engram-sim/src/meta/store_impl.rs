@@ -3473,7 +3473,7 @@ impl MetadataStore for SimMetadataStore {
     async fn list_oauth_credentials(
         &self,
         subject_kind: engram_core::types::oauth::OAuthSubjectKind,
-        subject_id: &str,
+        subject_id: Option<&str>,
     ) -> Result<Vec<engram_core::types::oauth::SealedOAuthCredential>, MetaError> {
         self.gate()?;
         Ok(self
@@ -3483,7 +3483,7 @@ impl MetadataStore for SimMetadataStore {
             .values()
             .filter(|credential| {
                 credential.key.subject_kind == subject_kind
-                    && credential.key.subject_id == subject_id
+                    && subject_id.is_none_or(|id| credential.key.subject_id == id)
             })
             .cloned()
             .collect())

@@ -510,10 +510,12 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
+    /// `subject_id = None` lists every credential of the kind (the connector
+    /// status surface); `Some(id)` scopes to one subject (a user's roster).
     async fn list_oauth_credentials(
         &self,
         _subject_kind: crate::types::oauth::OAuthSubjectKind,
-        _subject_id: &str,
+        _subject_id: Option<&str>,
     ) -> Result<Vec<crate::types::oauth::SealedOAuthCredential>, MetaError> {
         Ok(Vec::new())
     }

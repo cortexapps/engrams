@@ -179,8 +179,8 @@ export function OAuthConnectSheet({
 
           <p className="flex gap-2 text-[0.74rem] text-muted-foreground">
             <InfoIcon className="mt-0.5 size-3.5 shrink-0" />
-            The client id + secret are sealed in the org secret store; the obtained access token is
-            stored as the connector's injected credential.
+            The client id + secret are sealed in the org secret store; the obtained tokens are
+            sealed in the server-side credential store and refreshed automatically.
           </p>
 
           {error && <p className="text-sm text-destructive">{error}</p>}

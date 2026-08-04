@@ -2361,7 +2361,7 @@ async fn oauth_credential_and_flow(ctx: &Ctx) {
 
     let other_subject = ctx
         .meta
-        .list_oauth_credentials(OAuthSubjectKind::User, "user-b")
+        .list_oauth_credentials(OAuthSubjectKind::User, Some("user-b"))
         .await
         .unwrap();
     assert!(
@@ -2370,7 +2370,7 @@ async fn oauth_credential_and_flow(ctx: &Ctx) {
     );
     let listed = ctx
         .meta
-        .list_oauth_credentials(OAuthSubjectKind::User, "user-a")
+        .list_oauth_credentials(OAuthSubjectKind::User, Some("user-a"))
         .await
         .unwrap();
     assert_eq!(listed.len(), 1);
@@ -2594,6 +2594,22 @@ async fn oauth_refresh_scheduling(ctx: &Ctx) {
         .unwrap();
     assert_eq!(limited.len(), 1);
     assert_eq!(limited[0].key.provider, "linear");
+
+    // Kind-wide listing (subject_id = None): every connector credential in one
+    // call — the status surface's read — and never another kind's rows.
+    let all_connector = ctx
+        .meta
+        .list_oauth_credentials(OAuthSubjectKind::Connector, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        all_connector
+            .iter()
+            .map(|r| r.key.provider.as_str())
+            .collect::<Vec<_>>(),
+        vec!["later", "linear", "slack"],
+        "ordered by subject then provider; the user-kind row never surfaces"
+    );
 
     // Advisory claim: first caller wins, second loses, a lapsed claim is
     // retaken, and a claimed row leaves the due list until the claim lapses.
