@@ -67,48 +67,13 @@ pub(crate) async fn send_prompt_core(
     };
     let now = state.services.clock.now_utc();
 
-    // Issue #527 Phase 1: the durable "the user asked at time T" receipt —
-    // the FIRST PG write of this function, before the auto-resume below.
-    // The auto-resume can take tens to hundreds of seconds (a cold FC
-    // restore); without a receipt written before it starts, the earliest
-    // durable trace of "the user asked for something" post-dates the
-    // resume, and every prompt→first-token latency number becomes a lower
-    // bound reconstructed from the `idle→created` transition. This event
-    // is coordinator-authoritative and stays true across a guest-state
-    // rewind (the user genuinely did send the prompt), so
-    // `rewind_session_to_cursor` excludes `prompt_received` from its
-    // tombstone UPDATE. Best-effort like the user-echo emit below: an emit
-    // failure logs + proceeds — we never 500 the caller over telemetry.
-    //
-    // PR #556 review finding #3: this write lands BEFORE any request
-    // validation below (session state, mid-move HOLD), so a subsequently
-    // rejected `SendPrompt` still leaves a permanent receipt row, and a
-    // client retry of a *retryable* rejection (e.g. the mid-move HOLD's
-    // documented Conflict) that reuses the same `prompt_id` writes a
-    // second one. This is spec-inherited from issue #527's emit-before-
-    // resume + `DESC LIMIT 1` design, not a regression introduced here —
-    // `prompt_received_seconds_ago`'s `ORDER BY idx DESC LIMIT 1` anchors
-    // on the LAST attempt, undercounting latency for the retried case.
-    // Deduplicating retries (or switching to `ASC LIMIT 1` to anchor on
-    // the user-perceived first ask) is left to a follow-up — out of scope
-    // for Phase 1, which only needed *a* durable receipt to exist.
-    if let Err(e) = state
-        .emit(
-            id,
-            SessionEvent::PromptReceived {
-                prompt_id: prompt_id.clone(),
-                at: now,
-            },
-        )
-        .await
-    {
-        tracing::warn!(session_id = %id, error = %e, "emit prompt_received event failed");
-    }
-
     // ADR 0073: gate on terminal state only. NOT on Idle — an idle
     // session is exactly what the delivery driver resumes behind this
     // enqueue. Dead/Completed/Failed can never consume the prompt, so
-    // reject now rather than letting a row rot.
+    // reject now rather than letting a row rot. Gating BEFORE the
+    // accept write also means a rejected SendPrompt leaves no orphan
+    // receipt row (the pre-idempotency behavior PR #556 finding #3
+    // documented).
     let session = state.services.meta.get_session(id).await?;
     if session.status.is_terminal() {
         return Err(ApiError::Gone(format!(
@@ -119,65 +84,46 @@ pub(crate) async fn send_prompt_core(
 
     let prompt_text = text;
 
-    // Record the user's prompt in the session event log BEFORE the outbox
-    // row exists. The harness adapter never echoes the prompt back through
-    // Claude's stream-json output — it only translates the *assistant*
-    // response — so without this entry the user's turn is invisible to
-    // subscribers.
+    // The accept-time events, appended atomically WITH the outbox row
+    // and idempotently on `prompt_id` (a client/orchestrator retry
+    // appends nothing — the duplicate-echo fix, PR #556 finding #3):
     //
-    // ORDER MATTERS: delivery makes the harness start the run and emit
-    // `run_started`, appended to this same log. The web transcript
-    // (buildMessages) HOLDS a `prompt_id` user echo and only renders it when
-    // it reaches the consuming `run_started{prompt_id}` (ADR 0052 type-ahead).
-    // Emitting before the enqueue guarantees the echo's `idx` precedes its
-    // `run_started` BY CONSTRUCTION — delivery cannot begin until the row
-    // exists, and the row is inserted after this emit. (Pre-0067 this
-    // ordering leaned on the synchronous forward; prod session 68c70a65.)
+    // - `prompt_received` (issue #527): the durable "the user asked at
+    //   time T" receipt, written before the auto-resume below can
+    //   spend tens of seconds on a cold restore.
+    // - the user echo: the harness adapter never echoes the prompt
+    //   back through the assistant stream, so without this row the
+    //   user's turn is invisible to subscribers. The web dedupes its
+    //   optimistic bubble against the `prompt_id` tag (ADR 0052).
+    // - `harness_mode_changed` (ADR 0107), when a mode rides along.
     //
-    // Best-effort: an emit failure logs + proceeds (the prompt still
-    // delivers); we never 500 the caller over a missing echo.
-    if let Err(e) = state
-        .emit(
-            id,
-            SessionEvent::HarnessAgentMessage {
-                run_id: String::new(),
-                message_id: format!("user-{}", state.services.entropy.uuid()),
-                role: AgentRole::User,
-                text: prompt_text.clone(),
-                // Phase 1b: tag the user-echo with the client prompt_id so
-                // the web dedupes its optimistic bubble against this event
-                // (the double-render fix) instead of rendering both.
-                prompt_id: Some(prompt_id.clone()),
-                at: now,
-            },
-        )
-        .await
-    {
-        tracing::warn!(session_id = %id, error = %e, "emit user prompt event failed");
-    }
-
-    // ADR 0107: the durable "the user selected mode M" fact — emitted only
-    // after validation, before the outbox row, so the mode marker's idx
-    // precedes the run it applies to. Coordinator-authoritative (excluded
-    // from rewind tombstoning). Best-effort like the receipts above.
+    // ORDER MATTERS: delivery makes the harness emit
+    // `run_started{prompt_id}` into this same log, and the web
+    // transcript holds the echo until that arrives. The single
+    // transaction makes the echo's idx precede its `run_started` BY
+    // CONSTRUCTION — the outbox row and the echo become visible at
+    // the same commit, so delivery cannot begin first. (Pre-0067 this
+    // leaned on the synchronous forward; prod session 68c70a65.)
+    let mut events = vec![
+        SessionEvent::PromptReceived {
+            prompt_id: prompt_id.clone(),
+            at: now,
+        },
+        SessionEvent::HarnessAgentMessage {
+            run_id: String::new(),
+            message_id: format!("user-{}", state.services.entropy.uuid()),
+            role: AgentRole::User,
+            text: prompt_text.clone(),
+            prompt_id: Some(prompt_id.clone()),
+            at: now,
+        },
+    ];
     if let Some(mode) = &harness_mode {
-        if let Err(e) = state
-            .emit(
-                id,
-                SessionEvent::HarnessModeChanged {
-                    mode: mode.clone(),
-                    at: now,
-                },
-            )
-            .await
-        {
-            tracing::warn!(session_id = %id, error = %e, "emit harness_mode_changed failed");
-        }
+        events.push(SessionEvent::HarnessModeChanged {
+            mode: mode.clone(),
+            at: now,
+        });
     }
-
-    // The durable enqueue. From here the command cannot be lost: the
-    // delivery driver forwards it (resuming the session first if needed)
-    // and redelivers until the harness's confirming event acks the row.
     let payload = match &harness_mode {
         Some(mode) => serde_json::json!({ "text": prompt_text, "mode": mode }),
         None => serde_json::json!({ "text": prompt_text }),
@@ -193,12 +139,22 @@ pub(crate) async fn send_prompt_core(
         delivered_at: None,
         acked_at: None,
     };
-    state
-        .services
-        .meta
-        .outbox_enqueue(&row)
+    // The durable accept. From here the command cannot be lost: the
+    // delivery driver forwards it (resuming the session first if
+    // needed) and redelivers until the harness's confirming event acks
+    // the row.
+    if state
+        .emit_prompt_accept(id, events, &row)
         .await
-        .map_err(|e| ApiError::Internal(format!("enqueue prompt: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("accept prompt: {e}")))?
+        .is_none()
+    {
+        tracing::debug!(
+            session_id = %id,
+            prompt_id,
+            "duplicate SendPrompt (same prompt_id); accept is idempotent — nudging delivery only",
+        );
+    }
     // ADR 0079: enqueue the Deliver op directly (no wake hop for first
     // delivery); the shim's NOTIFY/poll loop owns redelivery.
     crate::outbox_delivery::enqueue_deliver_op(state, id).await;
@@ -383,26 +339,27 @@ mod tests {
     /// unconditionally up front rather than being contingent on a successful
     /// delivery.
     #[tokio::test]
-    async fn prompt_received_is_recorded_even_when_auto_resume_fails_outright() {
+    async fn prompt_received_is_recorded_before_any_auto_resume_runs() {
+        // The idempotent accept writes the receipt + echo atomically at
+        // accept time, BEFORE the delivery driver's auto-resume can
+        // spend tens of seconds on a cold restore (issue #527). The
+        // delivery machinery never runs in this unit harness — the
+        // receipt must exist anyway.
         let id = SessionId::new();
-        let (state, mini, _local) = build_state_for_session(dead_session(id));
+        let (state, mini, _local) = build_state_for_session(idle_session(id));
 
-        let err = send_prompt_core(&state, id, String::new(), "hello".into(), None)
+        send_prompt_core(&state, id, String::new(), "hello".into(), None)
             .await
-            .expect_err("a Dead session cannot auto-resume");
-        assert!(
-            matches!(err, ApiError::Gone(_)),
-            "expected the Dead-session Gone mapping, got {err:?}",
-        );
+            .expect("an idle session accepts the prompt");
 
         let events = mini.events.lock();
         assert_eq!(
             events.len(),
-            1,
-            "prompt_received must be recorded even though auto-resume (and \
-             therefore the user-echo + delivery) never ran",
+            2,
+            "the accept records the receipt + the user echo, nothing else",
         );
         assert_eq!(events[0].kind, "prompt_received");
+        assert_eq!(events[1].kind, "agent_message");
         let recorded_prompt_id = events[0].payload["prompt_id"]
             .as_str()
             .expect("prompt_id string field");
@@ -412,20 +369,43 @@ mod tests {
         );
     }
 
+    /// A rejected SendPrompt (terminal session → Gone) leaves NO durable
+    /// trace: no receipt, no echo, no outbox row. (The terminal gate
+    /// precedes the accept write — the pre-idempotency behavior that
+    /// left orphan receipt rows for rejected prompts is gone.)
+    #[tokio::test]
+    async fn rejected_prompt_leaves_no_receipt() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(dead_session(id));
+
+        let err = send_prompt_core(&state, id, String::new(), "hello".into(), None)
+            .await
+            .expect_err("a Dead session cannot accept a prompt");
+        assert!(
+            matches!(err, ApiError::Gone(_)),
+            "expected the Dead-session Gone mapping, got {err:?}",
+        );
+        assert!(
+            mini.events.lock().is_empty(),
+            "a rejected prompt writes nothing",
+        );
+    }
+
     /// A caller-supplied `prompt_id` (the web's client-minted id) is carried
     /// verbatim into the receipt — not re-minted — so it joins cleanly
     /// against the same id's `run_started` event.
     #[tokio::test]
     async fn prompt_received_carries_the_caller_supplied_prompt_id() {
         let id = SessionId::new();
-        let (state, mini, _local) = build_state_for_session(dead_session(id));
+        let (state, mini, _local) = build_state_for_session(idle_session(id));
 
         let _ = send_prompt_core(&state, id, "client-pid-42".into(), "hello".into(), None).await;
 
         let events = mini.events.lock();
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2, "receipt + echo");
         assert_eq!(events[0].kind, "prompt_received");
         assert_eq!(events[0].payload["prompt_id"], "client-pid-42");
+        assert_eq!(events[1].payload["prompt_id"], "client-pid-42");
     }
 
     // -- ADR 0107: harness_mode validation + event + payload ------------

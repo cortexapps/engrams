@@ -402,7 +402,7 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
         .append_session_event(
             session_id,
             "agent_message",
-            serde_json::json!({"text": "before"}),
+            serde_json::json!({"role": "assistant", "text": "before"}),
         )
         .await
         .expect("append e0");
@@ -410,7 +410,7 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
     meta.append_session_event(
         session_id,
         "agent_message",
-        serde_json::json!({"text": "after"}),
+        serde_json::json!({"role": "assistant", "text": "after"}),
     )
     .await
     .expect("append e1");
@@ -466,7 +466,7 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
         .append_session_event(
             session_id,
             "agent_message",
-            serde_json::json!({"text": "resumed"}),
+            serde_json::json!({"role": "assistant", "text": "resumed"}),
         )
         .await
         .expect("append post-rewind");
@@ -534,7 +534,7 @@ async fn rewind_is_kind_scoped_to_guest_derived_events() {
         .append_session_event(
             session_id,
             "agent_message",
-            serde_json::json!({"text": "before eviction"}),
+            serde_json::json!({"role": "assistant", "text": "before eviction"}),
         )
         .await
         .expect("append e0");
@@ -582,7 +582,7 @@ async fn rewind_is_kind_scoped_to_guest_derived_events() {
     meta.append_session_event(
         session_id,
         "agent_message",
-        serde_json::json!({"text": "guest replay candidate"}),
+        serde_json::json!({"role": "assistant", "text": "guest replay candidate"}),
     )
     .await
     .expect("append guest event");
@@ -641,7 +641,7 @@ async fn rewind_excludes_prompt_received_from_tombstone_and_rolled_back_count() 
         .append_session_event(
             session_id,
             "agent_message",
-            serde_json::json!({"text": "before"}),
+            serde_json::json!({"role": "assistant", "text": "before"}),
         )
         .await
         .expect("append e0");
@@ -661,7 +661,7 @@ async fn rewind_excludes_prompt_received_from_tombstone_and_rolled_back_count() 
     meta.append_session_event(
         session_id,
         "agent_message",
-        serde_json::json!({"text": "after"}),
+        serde_json::json!({"role": "assistant", "text": "after"}),
     )
     .await
     .expect("append e1");
