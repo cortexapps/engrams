@@ -1401,6 +1401,13 @@ impl FirecrackerBackend {
                 live: live_comm,
             });
         }
+        // A zombie passes both axes above (`/proc` stays readable until
+        // the parent reaps) but can never run again — reattaching to one
+        // would adopt a ghost (#1012). The API-socket probe below would
+        // also catch it, but classify honestly: the process is gone.
+        if sandbox_manifest::is_zombie(fc.process.pid) {
+            return Err(ReattachError::PidGone(fc.process.pid));
+        }
 
         // FC API liveness probe. The client crate exposes only
         // mutating endpoints — we just need a "is the socket alive?"
@@ -1498,6 +1505,7 @@ impl FirecrackerBackend {
             let live_comm = sandbox_manifest::read_proc_comm(uffd.pid);
             if live_start == Some(uffd.start_time_jiffies)
                 && live_comm.as_deref() == Some(uffd.comm.as_str())
+                && !sandbox_manifest::is_zombie(uffd.pid)
             {
                 Some(uffd.pid)
             } else {
@@ -4226,18 +4234,6 @@ async fn kill_fc(child: &mut Option<Child>, pid: Option<u32>, id: SandboxId) {
 /// fresh processes, whose killed reattachees are reaped by init and
 /// exit via plain ESRCH.
 async fn wait_for_pid_death(pid: u32, timeout: Duration) -> std::io::Result<()> {
-    fn is_zombie(pid: u32) -> bool {
-        // State char follows the last `)` in /proc/<pid>/stat (comm may
-        // itself contain parens).
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|s| {
-                s.rsplit(')')
-                    .next()
-                    .and_then(|rest| rest.trim_start().chars().next())
-            })
-            .is_some_and(|state| state == 'Z')
-    }
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         // SAFETY: kill(pid, 0) inspects-but-doesn't-mutate; see
@@ -4248,7 +4244,7 @@ async fn wait_for_pid_death(pid: u32, timeout: Duration) -> std::io::Result<()> 
             if errno == libc::ESRCH {
                 return Ok(());
             }
-        } else if is_zombie(pid) {
+        } else if sandbox_manifest::is_zombie(pid) {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -4317,7 +4313,12 @@ async fn read_smaps_rollup_pss_rss(pid: u32) -> Option<(u64, u64)> {
 /// Polling vs `child.wait()`: `wait()` requires `&mut Child`, which
 /// can't be shared with the existing destroy path. Polling is simpler
 /// and has acceptable latency (1s detection + 15s reconcile grace =
-/// ~16s session-loss visibility, vs minutes-to-forever today).
+/// ~16s session-loss visibility, vs minutes-to-forever today). The
+/// price of polling an OWNED child is the zombie case: until destroy
+/// runs `Child::wait`, a dead child stays a zombie for which
+/// `kill(pid, 0)` still returns 0 — so the poll must also read the
+/// `/proc/<pid>/stat` state char (issue #1012, where force-killed FC
+/// VMs heartbeat-advertised as running until the host-agent restarted).
 ///
 /// Polling vs pidfd_open: pidfd is more accurate (immune to PID
 /// recycling) but requires Linux 5.3+. We use pidfd for Phase 6's
@@ -4357,23 +4358,43 @@ fn spawn_process_supervisor<V, F, Fut>(
             // existence-check signal: returns 0 if a process with the
             // given pid exists AND the caller could signal it,
             // errno=ESRCH if not. No side effects, no UB.
+            //
+            // `kill(0)` alone is NOT enough for OWNED children: we hold
+            // each spawned `Child` un-`wait()`ed until destroy (ADR 0044
+            // K2 dropped kill_on_drop), so an externally-killed FC stays
+            // a zombie — for which `kill(0)` still returns 0. Without
+            // the state check the supervisor loops forever and the
+            // heartbeat advertises the ghost until the host-agent
+            // restarts (issue #1012). The prune arm's teardown runs
+            // `Child::wait` via `wait_for_fc_exit`, which finally reaps
+            // the zombie. (Reattached pids have no owned `Child`; init
+            // reaps them and they exit via plain ESRCH.)
             let rc = unsafe { libc::kill(pid as i32, 0) };
-            if rc == 0 {
+            if rc == 0 && !sandbox_manifest::is_zombie(pid) {
                 continue;
             }
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            if errno != libc::ESRCH {
-                // EPERM or some other unexpected error — log and
-                // bail. EPERM here would mean the pid was recycled
-                // to a process we can no longer signal; treat that
-                // as effectively gone.
+            if rc == 0 {
                 tracing::warn!(
                     %sandbox_id,
                     %pid,
                     role,
-                    errno,
-                    "process supervisor: kill(0) returned non-ESRCH error; treating as gone"
+                    "process supervisor: pid is a zombie (killed but unreaped); treating as dead"
                 );
+            } else {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno != libc::ESRCH {
+                    // EPERM or some other unexpected error — log and
+                    // bail. EPERM here would mean the pid was recycled
+                    // to a process we can no longer signal; treat that
+                    // as effectively gone.
+                    tracing::warn!(
+                        %sandbox_id,
+                        %pid,
+                        role,
+                        errno,
+                        "process supervisor: kill(0) returned non-ESRCH error; treating as gone"
+                    );
+                }
             }
             // Process exited unexpectedly (kernel OOM, segfault,
             // manual kill, etc.) — destroy() would have removed
@@ -5492,10 +5513,16 @@ impl SandboxBackend for FirecrackerBackend {
         let process_alive = match sandbox_manifest::read_manifest(&manifest_path) {
             Ok(manifest) => {
                 let rec = &manifest.firecracker.process;
+                // Three-axis identity — AND not a zombie: `/proc` keeps
+                // stat/comm readable for a killed-but-unreaped child, so
+                // without the state check a ghost probes "alive" and every
+                // consumer (heartbeat reconcile, straggler defer, ADR 0068
+                // rescue) defers to a VM that can never run again (#1012).
                 sandbox_manifest::read_proc_start_time_jiffies(rec.pid)
                     == Some(rec.start_time_jiffies)
                     && sandbox_manifest::read_proc_comm(rec.pid).as_deref()
                         == Some(rec.comm.as_str())
+                    && !sandbox_manifest::is_zombie(rec.pid)
             }
             // No manifest on disk (never written, or already deleted at
             // the start of `destroy()`) — nothing to independently
@@ -8461,6 +8488,53 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("supervisor did not prune within 3s of pid death");
+    }
+
+    /// Issue #1012 regression: an OWNED child killed externally stays a
+    /// ZOMBIE (we hold its un-`wait()`ed `Child` — exactly `LiveSandbox`'s
+    /// shape post-ADR-0044-K2), and `kill(pid, 0)` still returns 0 for a
+    /// zombie. The supervisor must consult the `/proc` state char and
+    /// prune anyway — in the incident, two force-killed FC VMs
+    /// heartbeat-advertised `running_sandboxes_count=1` forever and
+    /// wedged the fleet operator's drain gate until a pod restart.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn supervisor_prunes_zombie_of_owned_unwaited_child() {
+        let sandboxes: Arc<DashMap<SandboxId, ()>> = Arc::new(DashMap::new());
+        let id = SandboxId::new();
+        sandboxes.insert(id, ());
+
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("child has pid");
+
+        spawn_process_supervisor(sandboxes.clone(), id, pid, "test-sleep", |_id, ()| async {});
+
+        // Kill EXTERNALLY and do NOT `wait()` — `child` stays held, so
+        // the pid remains a zombie of this test process for the whole
+        // assertion window (the exact incident shape).
+        // SAFETY: SIGKILL on a child pid we just spawned.
+        let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        assert_eq!(rc, 0, "SIGKILL the sleep child");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut pruned = false;
+        while std::time::Instant::now() < deadline {
+            if !sandboxes.contains_key(&id) {
+                pruned = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Reap the zombie before asserting so a failure doesn't leak it.
+        let _ = child.wait().await;
+        assert!(
+            pruned,
+            "supervisor must prune a zombie child within 3s — kill(pid, 0) \
+             alone reads a zombie as alive (issue #1012)"
+        );
     }
 
     /// If the entry is already removed (e.g. destroy() got there
