@@ -59,15 +59,6 @@ impl Transport {
             Self::Vsock => "vsock",
         }
     }
-
-    /// Parse a CLI flag value (case-insensitive). Used by
-    /// `engram-cli image build --transport=...`.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s.to_ascii_lowercase().as_str() {
-            "vsock" => Ok(Self::Vsock),
-            other => Err(format!("invalid transport: {other} (expected vsock)")),
-        }
-    }
 }
 
 /// Where the init shim lands inside the rootfs (relative to root).

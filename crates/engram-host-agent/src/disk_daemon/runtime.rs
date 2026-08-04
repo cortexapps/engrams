@@ -208,12 +208,6 @@ pub struct NbdHandle {
 }
 
 impl NbdHandle {
-    /// The path the daemon is bound to. Pass this as FC's
-    /// `path_on_host` for the rootfs drive.
-    pub fn device_path(&self) -> &Path {
-        &self.nbd_device
-    }
-
     /// Kill the serve loop WITHOUT disconnecting the kernel config —
     /// the device stays configured with a dead connection, exactly
     /// what the kernel observes when the whole host-agent process
@@ -866,27 +860,6 @@ pub(crate) async fn attach_manifest_with_dirty_file(
     if fork_at_attach {
         backend.fork_manifest_identity().await;
     }
-    attach_backend(backend, slot_pool, &backend_id).await
-}
-
-/// ADR 0045 C1: attach from manifest CONTENT delivered inline (a
-/// migration destination's not-yet-durable disk manifest).
-pub async fn attach_manifest_content(
-    disk_manifest_ref: engram_core::types::manifest::ManifestRef,
-    manifest: &engram_chunk_store::Manifest,
-    cache: engram_chunk_store::cache::ChunkCache,
-    store: Arc<engram_chunk_store::ChunkStore>,
-    slot_pool: &Arc<NbdSlotAllocator>,
-    threshold_bytes: u64,
-) -> Result<NbdSandboxState, NbdRuntimeError> {
-    let backend_id = disk_manifest_ref.manifest_id.to_string();
-    let backend = ChunkedDiskBackend::from_manifest(
-        disk_manifest_ref,
-        manifest,
-        cache,
-        store,
-        threshold_bytes,
-    )?;
     attach_backend(backend, slot_pool, &backend_id).await
 }
 

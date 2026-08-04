@@ -31,10 +31,6 @@ use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{protocol::CloseFrame, Message};
 
-/// The port `ttyd` binds on inside every engram guest. Pinned by
-/// `engram_rootfs_materializer::DEFAULT_INIT_SHIM`. Tests override via
-/// [`open_shell_tunnel_at`].
-pub const TTYD_PORT: u16 = 7681;
 /// Mirrors coord/api/shell.rs:148 — the pre-rewrite budget. ttyd
 /// binds on :7681 a few seconds after kernel boot on a freshly
 /// warm-restored sandbox, so we retry connection-refused for ~8 s

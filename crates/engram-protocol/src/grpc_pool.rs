@@ -66,14 +66,6 @@ impl GrpcHostPool {
         }
     }
 
-    /// Override keepalive interval. Useful in tests with tighter
-    /// failure-detection windows.
-    pub fn with_keepalive(mut self, interval: Duration, timeout: Duration) -> Self {
-        self.keepalive_interval = interval;
-        self.keepalive_timeout = timeout;
-        self
-    }
-
     /// Idempotent warm-up: ensure a `Channel` exists for `host_id`
     /// and that the underlying TCP+H2 handshake is in flight or
     /// complete.

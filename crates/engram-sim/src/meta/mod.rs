@@ -87,11 +87,6 @@ impl SimMetadataStore {
         self.outage.store(on, Ordering::SeqCst);
     }
 
-    /// Drain the recorded would-be `pg_notify` events.
-    pub fn drain_notifications(&self) -> Vec<SimNotify> {
-        self.notifications.lock().drain(..).collect()
-    }
-
     /// Direct read access for invariant checkers (D5+). Callers must be
     /// synchronous and must not re-enter the store while holding this.
     pub fn with_db<R>(&self, f: impl FnOnce(&SimDb) -> R) -> R {

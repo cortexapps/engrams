@@ -281,11 +281,6 @@ impl HarnessDescriptor {
         self.models.iter().find(|o| o.id == id)
     }
 
-    /// The effort option with this id, if any.
-    pub fn effort(&self, id: &str) -> Option<&HarnessOption> {
-        self.effort.iter().find(|o| o.id == id)
-    }
-
     /// The mode with this id, if any (ADR 0107).
     pub fn mode(&self, id: &str) -> Option<&HarnessMode> {
         self.modes.iter().find(|m| m.id == id)
@@ -328,13 +323,6 @@ impl HarnessDescriptor {
     /// `/opt/engram/dyn/0/<name>/` to form `argv[0]` (ADR 0062 §3).
     pub fn exec_path(&self) -> &str {
         self.exec.as_deref().unwrap_or(Self::DEFAULT_EXEC)
-    }
-}
-
-impl HarnessOption {
-    /// Display label, falling back to the option id.
-    pub fn display_label(&self) -> &str {
-        self.label.as_deref().unwrap_or(&self.id)
     }
 }
 

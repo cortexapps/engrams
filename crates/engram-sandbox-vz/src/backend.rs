@@ -248,14 +248,6 @@ impl VzBackend {
         self
     }
 
-    pub fn work_dir(&self) -> &Path {
-        &self.work_dir
-    }
-
-    pub fn config(&self) -> &VzConfig {
-        &self.cfg
-    }
-
     fn vsock_uds_path_for(&self, id: SandboxId) -> PathBuf {
         // vsock UDS bind paths are capped at SUN_LEN (~104B on macOS). `work_dir`
         // can be deep (a git-worktree checkout, a long $HOME), and the per-port

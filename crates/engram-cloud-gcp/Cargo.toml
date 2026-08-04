@@ -4,20 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "GCP CloudBackend (GCE metadata-server preemption polling). Phase 4 stub."
+description = "GCP cloud integrations (GKE node-pool scaler)."
 
 [lints]
 workspace = true
 
 [dependencies]
 engram-core.workspace = true
-async-stream.workspace = true
 async-trait.workspace = true
-chrono.workspace = true
-futures.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }

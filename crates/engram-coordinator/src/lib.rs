@@ -118,30 +118,6 @@ pub struct Services {
     pub entropy: Arc<dyn engram_core::traits::Entropy>,
 }
 
-/// Bootstrap the axum server. Returns once the bind future yields.
-pub async fn run(cfg: CoordinatorConfig, services: Services) -> Result<(), CoordinatorError> {
-    let registry = Arc::new(HostRegistry::new(services.meta.clone()));
-    run_with_registry(cfg, services, registry).await
-}
-
-/// Variant of [`run`] that takes an externally-built [`HostRegistry`].
-/// `main.rs` uses this so it can pre-register a local backend in
-/// `--mode=all` before any HTTP routes accept traffic.
-pub async fn run_with_registry(
-    cfg: CoordinatorConfig,
-    services: Services,
-    host_registry: Arc<HostRegistry>,
-) -> Result<(), CoordinatorError> {
-    run_with_registry_and_local(
-        cfg,
-        services,
-        host_registry,
-        None,
-        crate::integrations::IntegrationBroker::new(),
-    )
-    .await
-}
-
 /// Variant of [`run_with_registry`] that also accepts a local VMM
 /// backend to register as an in-process host. Used by `--mode=all`:
 /// the backend is wrapped in a `LocalHostClient` that shares the

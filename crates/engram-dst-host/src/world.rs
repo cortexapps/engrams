@@ -158,12 +158,11 @@ impl AckedWriteLedger {
         self.log.push(entry);
     }
 
+    // Oracles only compare ledger lengths; nothing branches on
+    // emptiness.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.log.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.log.is_empty()
     }
 
     /// Raise `(sandbox, chunk_idx)`'s published floor to `content_tag` — the tag
@@ -549,13 +548,6 @@ impl SimHost {
             split_brain_unpauses: Vec::new(),
             quarantined_unknown: std::collections::BTreeSet::new(),
         }
-    }
-
-    /// The number of sandboxes seeded into the reconcile world (== the disk
-    /// sandbox count). A stable index space `0..num` for the perturbation
-    /// steps.
-    pub fn num_sandboxes(&self) -> usize {
-        self.sandboxes.len()
     }
 
     /// The sandbox/session ids for reconcile-world slot `idx` (the same ids

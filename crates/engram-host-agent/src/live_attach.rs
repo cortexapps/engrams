@@ -28,7 +28,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use engram_core::traits::SandboxBackend;
 use engram_core::SandboxId;
 
 /// Per-sandbox outcome of the reattach pass. Aggregated into
@@ -433,46 +432,6 @@ fn reap_orphan_if_alive(pid: u32, manifest_start_jiffies: u64, what: &str) {
             "orphan-reap: process gone or recycled; not signalling"
         );
     }
-}
-
-/// Trait-level entry point that takes any `SandboxBackend` and
-/// no-ops for non-FC backends. Used by `lib::run` so it can call
-/// `reattach_pass_any(&work_dir, &sandbox)` without inspecting the
-/// backend type itself.
-pub async fn reattach_pass_any(
-    work_dir: &Path,
-    backend: &Arc<dyn SandboxBackend>,
-) -> std::io::Result<ReattachReport> {
-    if let Some(fc) = downcast_to_fc(backend) {
-        reattach_pass(work_dir, &fc).await
-    } else {
-        tracing::debug!(
-            "reattach pass: backend is not Firecracker; skipping (VZ/process don't \
-             support reattach across host-agent restart; clean-slate startup)"
-        );
-        Ok(ReattachReport::default())
-    }
-}
-
-/// Attempts an Arc<dyn SandboxBackend> → Arc<FirecrackerBackend>
-/// downcast. The trait isn't `Any` so we can't use `Arc::downcast`
-/// directly; instead we go through a per-crate accessor pattern
-/// that's set up in lib::run via the concrete-typed wiring. For
-/// now, return None — Phase 6's host-agent integration plumbs the
-/// concrete FC backend through a separate channel.
-fn downcast_to_fc(
-    _backend: &Arc<dyn SandboxBackend>,
-) -> Option<Arc<engram_sandbox_firecracker::FirecrackerBackend>> {
-    // We can't downcast through `dyn SandboxBackend` (the trait
-    // doesn't extend `Any`). Phase 6's host-agent wiring instead
-    // passes a typed `Option<Arc<FirecrackerBackend>>` directly via
-    // a side channel (see `HostAgent` builder). This function
-    // exists as a placeholder for a future trait method
-    // `fn as_firecracker(&self) -> Option<&FirecrackerBackend>`
-    // that we'd add only if we wanted backends to expose reattach
-    // through the trait — but the current ADR scope keeps reattach
-    // FC-specific.
-    None
 }
 
 #[cfg(test)]

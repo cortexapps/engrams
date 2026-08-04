@@ -423,13 +423,6 @@ impl OciClient {
         })
     }
 
-    /// Round-trip token for the suppress-unused-warning. Useful when
-    /// embedding `OciClient` in a service that may not exercise it on
-    /// some code paths.
-    pub fn inner(&self) -> &Client {
-        &self.inner
-    }
-
     /// Prime the cached client's bearer-token cache for **push**
     /// operations against `uri`'s registry/repo. Call once per push
     /// run before [`Self::blob_exists`] / [`Self::push_chunk_blob`] /

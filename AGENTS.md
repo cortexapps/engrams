@@ -82,6 +82,14 @@ Firecracker path; VZ exists to exercise that path on macOS, not to fork it.
   (`bun run typecheck` / `bun test`).
 - Gotchas: `SQLX_OFFLINE=true` in CI — keep the `.sqlx/` query cache in sync. **Doc-tests
   are intentionally out of scope** — don't add `cargo test --doc`.
+- **Dead-public audit** (occasional, not in CI): `hawk.toml` configures
+  [astral-sh/hawk](https://github.com/astral-sh/hawk), which finds unused / over-public
+  `pub` items. Run it with hawk's own pinned toolchain (`cargo +<pin> hawk check`), once
+  per cfg world — host (macOS) and `--target aarch64-unknown-linux-musl` (inside
+  `nix develop`, for the bindgen kernel headers) — and only act on findings present in
+  **both** runs; a single-platform finding usually has consumers behind the other
+  platform's `cfg`. Hawk does not see `#[cfg(test)]` consumers: confirm each deletion
+  with `cargo check --workspace --all-targets` on both targets.
 
 ## CI
 

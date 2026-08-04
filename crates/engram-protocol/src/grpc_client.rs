@@ -40,12 +40,12 @@ use crate::grpc::{
     MigrationExportRef, MigrationFetchRequest, MigrationItem, PeerChunkFrame, PeerChunkGetRequest,
     ProxyPortData, ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose,
     ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
-    ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, SendHarnessToolResultRequest, StartAgentRequest,
-    UnbindHarnessSessionRequest, WriteFilesRequest,
+    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
+    SendHarnessToolResultRequest, StartAgentRequest, UnbindHarnessSessionRequest,
+    WriteFilesRequest,
 };
 
-use crate::wire::{WireExecRequest, WireReapStats, WireWriteFilesRequest, WireWriteFilesResponse};
+use crate::wire::{WireExecRequest, WireWriteFilesRequest, WireWriteFilesResponse};
 
 /// ADR 0095: why a peer-chunk pull wants its hashes — the wire `scope`
 /// oneof on [`PeerChunkGetRequest`]. Observability + serve-side rate
@@ -1060,28 +1060,6 @@ impl GrpcHostClient {
             &resp.manifest_ref_bincode,
             "ManifestRef",
         )?))
-    }
-
-    pub async fn reap_materialize_dir(
-        &self,
-        min_age_secs: u64,
-        live_disk_manifest_ids: Vec<uuid::Uuid>,
-    ) -> Result<WireReapStats, SandboxError> {
-        let req = ReapMaterializeDirRequest {
-            min_age_secs,
-            live_disk_manifest_ids: live_disk_manifest_ids
-                .into_iter()
-                .map(|u| u.as_bytes().to_vec())
-                .collect(),
-        };
-        let resp = self
-            .inner
-            .clone()
-            .reap_materialize_dir(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?
-            .into_inner();
-        decode_bincode(&resp.stats_bincode, "WireReapStats")
     }
 
     /// Server-streaming exec. The first frame is `started` (carries

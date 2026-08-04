@@ -60,14 +60,11 @@ pub struct GuestVma {
 
 impl GuestVma {
     /// Length in bytes.
+    // No caller needs an emptiness probe; a zero-length VMA cannot
+    // come out of /proc/<pid>/maps parsing.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u64 {
         self.end - self.start
-    }
-
-    /// True iff the VMA covers zero bytes (degenerate; never produced by
-    /// the maps parser, but keeps clippy's `len-without-is-empty` honest).
-    pub fn is_empty(&self) -> bool {
-        self.start == self.end
     }
 }
 

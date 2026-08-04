@@ -81,12 +81,6 @@ impl CowStateCache {
         }
     }
 
-    /// Override the clock (ADR 0098 D1 simulation seam).
-    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = clock;
-        self
-    }
-
     /// Fetch the cached records for `host_id`, refreshing via
     /// `refresh` if the slot is empty or stale. `refresh` is only
     /// invoked when we hold the slot's lock, so concurrent callers

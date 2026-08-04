@@ -68,10 +68,6 @@ impl OciChunkIndex {
         Self::default()
     }
 
-    pub fn with_entries(entries: HashMap<ChunkHash, OciBlobLocator>) -> Self {
-        Self { entries }
-    }
-
     pub fn insert(&mut self, hash: ChunkHash, loc: OciBlobLocator) -> Option<OciBlobLocator> {
         self.entries.insert(hash, loc)
     }
@@ -110,14 +106,6 @@ impl OciChunkResolver {
             image_uri,
             index,
         }
-    }
-
-    pub fn image_uri(&self) -> &str {
-        &self.image_uri
-    }
-
-    pub fn index(&self) -> &OciChunkIndex {
-        &self.index
     }
 }
 

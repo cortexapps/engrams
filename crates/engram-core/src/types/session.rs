@@ -196,21 +196,6 @@ impl SessionState {
         matches!(self, Self::Failed | Self::Completed | Self::Dead)
     }
 
-    /// "Live" = what `MetadataStore::list_active_sessions` returns:
-    /// every non-terminal state except `HostLost` (limbo pending the
-    /// reconciler; its bindings are stale by definition). Must stay
-    /// in sync with the `status IN (...)` list in the Postgres impl —
-    /// in particular every state that can carry a live `sandbox_id`
-    /// binding (`Evicting` included) must be live, or the coord's
-    /// startup `repopulate_routing` strands the session after a pod
-    /// roll. Mock stores filter with this so they can't drift.
-    pub fn is_live(&self) -> bool {
-        // `Queued` is excluded alongside `HostLost`: it has no sandbox
-        // binding to rehydrate (host_id NULL), and the queue scanner
-        // finds it via its own FIFO query, not `list_active_sessions`.
-        !self.is_terminal() && !matches!(self, Self::HostLost | Self::Queued)
-    }
-
     /// Single source of truth for legal transitions. Per ADR 0015 M2
     /// + ADR 0018 commit 12 (Evacuating) + ADR 0034 (Evicting):
     ///

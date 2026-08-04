@@ -87,10 +87,6 @@ pub struct CheckpointRecord {
 }
 
 impl CheckpointRecord {
-    pub fn path_in(dir: &Path, id: SnapshotId) -> PathBuf {
-        crate::durable_record::record_path(dir, id)
-    }
-
     /// Durably persist (write + fsync via rename) into `dir`, through the
     /// injected fs seam (ADR 0098 P5 — Flow D's terminal record crosses
     /// it; other flows pass [`TokioFs`]).

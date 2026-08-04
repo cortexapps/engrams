@@ -92,9 +92,6 @@ pub enum ConnPurpose {
     Drain,
 }
 
-/// Default TCP port for the source host-agent's page-server listener.
-pub const DEFAULT_PEER_PORT: u16 = 9102;
-
 /// Maximum size of one framed message (16 MiB — a 512 KiB chunk plus
 /// envelope fits with room; same cap discipline as the agentd proto).
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;

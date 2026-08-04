@@ -161,11 +161,6 @@ impl Cosim {
         self.log("idle_detector");
     }
 
-    pub async fn idle_evictor(&mut self) {
-        let _ = engram_coordinator::idle_evictor::scanner_run_once(&self.world.state).await;
-        self.log("idle_evictor");
-    }
-
     /// Drive every session with a due op (the SessionOps loop body).
     pub async fn drive_ops(&mut self) {
         let due = self.world.meta.op_due_sessions().await.unwrap_or_default();
@@ -734,11 +729,6 @@ impl Cosim {
         }
     }
 
-    /// The host's current device-plane generation.
-    pub async fn device_generation(&self) -> u32 {
-        self.world.host.lock().await.device_generation()
-    }
-
     /// Sandboxes the sweep PARKed because a live guest held the device (#806).
     pub async fn sweep_parked_live(&self) -> Vec<SandboxId> {
         self.world.host.lock().await.sweep_parked_live()
@@ -954,23 +944,6 @@ impl Cosim {
         self.world
             .meta
             .with_db(|db| db.sessions.get(&session_id).map(|r| r.session.status))
-    }
-
-    /// Debug dump of a session's latest op (kind/state/step/attempts/error).
-    pub async fn op_debug(&self, session_id: SessionId) -> String {
-        self.world.meta.with_db(|db| {
-            db.session_ops
-                .values()
-                .filter(|o| o.session_id == session_id)
-                .max_by_key(|o| o.id)
-                .map(|o| {
-                    format!(
-                        "{:?}/{:?} step={:?} attempts={} err={:?}",
-                        o.kind, o.state, o.step, o.attempts, o.error
-                    )
-                })
-                .unwrap_or_else(|| "<no op>".into())
-        })
     }
 
     /// The coordinator's currently-bound sandbox for a session.

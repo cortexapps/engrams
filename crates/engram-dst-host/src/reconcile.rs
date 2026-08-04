@@ -89,16 +89,6 @@ impl SimReconcileBackend {
         self.inner.lock().local_bindings.remove(&id);
     }
 
-    /// Mark a sandbox as carrying a migration role (exempt).
-    pub fn set_migration_role(&self, id: SandboxId) {
-        self.inner.lock().migration_roles.insert(id);
-    }
-
-    /// Mark a sandbox as a live base-capture VM (exempt).
-    pub fn set_live_capture(&self, id: SandboxId) {
-        self.inner.lock().live_captures.insert(id);
-    }
-
     /// Arm a one-shot destroy failure for the next reap.
     pub fn fail_next_destroy(&self) {
         self.inner.lock().fail_next_destroy = true;
@@ -133,11 +123,6 @@ impl SimReconcileBackend {
     /// The binding-repair log (oracle/test read).
     pub fn binding_repairs(&self) -> Vec<(SandboxId, SessionId)> {
         self.inner.lock().binding_repairs.clone()
-    }
-
-    /// Snapshot of the currently-live sandboxes (deterministic order).
-    pub fn live_ids(&self) -> Vec<SandboxId> {
-        self.inner.lock().live.iter().copied().collect()
     }
 }
 

@@ -133,14 +133,6 @@ pub async fn api_prompt(state: &SharedState, session_id: SessionId, prompt_id: &
     session_service(state).send_prompt(req).await.is_ok()
 }
 
-/// gRPC `resume` (handler-direct).
-pub async fn api_resume(state: &SharedState, session_id: SessionId) -> bool {
-    let req = grpc_req(app::ResumeRequest {
-        session_id: session_id.to_string(),
-    });
-    session_service(state).resume(req).await.is_ok()
-}
-
 /// gRPC `delete_session` (handler-direct). `true` iff destroy was acked.
 pub async fn api_delete(state: &SharedState, session_id: SessionId) -> bool {
     let req = grpc_req(app::DeleteSessionRequest {

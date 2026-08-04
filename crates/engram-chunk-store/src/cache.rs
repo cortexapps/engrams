@@ -1168,14 +1168,6 @@ impl ChunkCache {
         self.inner.pinned.lock().contains_key(&hash)
     }
 
-    /// Whether this cache instance will ever unlink a chunk file (ADR
-    /// 0067's single-evictor switch). Diagnostic / test accessor — used
-    /// by `engram-uffd-handler`'s constructor test to assert the handler
-    /// always builds an eviction-disabled cache.
-    pub fn eviction_enabled(&self) -> bool {
-        self.inner.config.eviction_enabled
-    }
-
     /// True if local NVMe currently has this chunk. Cheap stat;
     /// doesn't load bytes.
     pub async fn contains(&self, hash: ChunkHash) -> bool {

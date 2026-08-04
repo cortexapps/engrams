@@ -685,12 +685,6 @@ impl SessionEventBus {
             false
         }
     }
-
-    /// Number of currently-known sessions with at least one historical
-    /// publish or subscribe. Intended for diagnostics / `/healthz`.
-    pub fn active_sessions(&self) -> usize {
-        self.channels.len()
-    }
 }
 
 impl Default for SessionEventBus {
@@ -963,13 +957,6 @@ impl AppState {
     /// handler before axum drains. Idempotent.
     pub fn trigger_shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
-    }
-
-    /// Where to write per-session snapshot directories on local disk.
-    /// Per-host scratch under `cfg.local_path`; not durable across host
-    /// loss. Cross-host durability for sessions is git, not snapshots.
-    pub fn snapshot_dir(&self) -> std::path::PathBuf {
-        self.cfg.local_path.join("snapshots")
     }
 
     /// Resolve the live sandbox bound to `session` from Postgres

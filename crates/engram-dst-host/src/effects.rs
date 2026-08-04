@@ -42,10 +42,6 @@ impl SeamLog {
     pub fn record(&self, e: SeamEvent) {
         self.events.lock().push(e);
     }
-
-    pub fn events(&self) -> Vec<SeamEvent> {
-        self.events.lock().clone()
-    }
 }
 
 /// [`NbdKernel`] as ordering-recorded no-ops. `connect`/`reconfigure`/

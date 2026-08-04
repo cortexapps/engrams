@@ -1203,10 +1203,6 @@ impl FirecrackerBackend {
         .map_err(SandboxError::from)
     }
 
-    pub fn work_dir(&self) -> &Path {
-        &self.work_dir
-    }
-
     /// Issue #198: the teardown callback handed to every
     /// `spawn_process_supervisor`. When a supervisor wins the prune race
     /// (its watched FC or uffd pid died and it removed the map entry), it
@@ -1256,51 +1252,6 @@ impl FirecrackerBackend {
     /// Used by the host agent for inspection / heartbeat reporting.
     pub fn snapshot_state(&self, id: SandboxId) -> Option<SandboxState> {
         self.sandboxes.get(&id).map(|r| r.state.clone())
-    }
-
-    /// ADR 0009 §6 path 2: restore from a local NVMe checkpoint
-    /// while preserving the original `sandbox_id`. Unlike the
-    /// standard `SandboxBackend::restore` (which always allocates a
-    /// fresh sandbox_id — appropriate for cross-host migration),
-    /// this variant keeps the caller-supplied id so the coord's
-    /// session_id → sandbox_id routing survives a graceful host
-    /// reboot. The on-disk artifacts at
-    /// `<work_dir>/snapshots/<snapshot_id>/` (written by the
-    /// SIGTERM checkpoint pipeline in Phase 7) are read directly.
-    pub async fn restore_as_sandbox_id(
-        &self,
-        sandbox_id: SandboxId,
-        snapshot_id: SnapshotId,
-    ) -> Result<(), SandboxError> {
-        let src = self.snapshot_dir_for(snapshot_id);
-        let manifest_bytes = tokio::fs::read(src.join("manifest.json"))
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("read manifest: {e}")))?;
-        let manifest: FcSnapshotManifest = serde_json::from_slice(&manifest_bytes)
-            .map_err(|e| SandboxError::Snapshot(format!("manifest parse: {e}")))?;
-        if manifest.format.as_str() != MANIFEST_FORMAT_FC {
-            return Err(SandboxError::Snapshot(format!(
-                "manifest format {:?} is not 'fc' — cross-VMM restore not supported",
-                manifest.format,
-            )));
-        }
-        let jail_dir = self.work_dir.join(sandbox_id.to_string());
-        // Same-id reattach after a graceful host reboot: resume
-        // semantics — the session keeps its pinned bundle generations,
-        // and the memory backend follows `restore_mode` (resume).
-        self.restore_in_jail(
-            sandbox_id,
-            &jail_dir,
-            &src,
-            &manifest,
-            /*swap_aux_to_current=*/ false,
-            /*selected_mounts=*/ Vec::new(),
-            self.effective_restore_mode(/*fresh=*/ false),
-            // Reattach has no coordinator metadata; canonical falls back
-            // to the session ref (unshared but correct — rare path).
-            None,
-        )
-        .await
     }
 
     /// The effective memory backend for one restore (ADR 0045 D3).

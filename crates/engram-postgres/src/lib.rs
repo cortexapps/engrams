@@ -85,14 +85,6 @@ impl PostgresStore {
         })
     }
 
-    pub fn from_pool(pool: PgPool) -> Self {
-        Self {
-            pool,
-            clock: Arc::new(SystemClock::new()),
-            entropy: Arc::new(OsEntropy),
-        }
-    }
-
     /// Inject a [`Clock`] (ADR 0098 D3/D4). Production takes the default
     /// [`SystemClock`]; the D4 conformance suite and time-controlled
     /// live-PG tests pass a fake so SQL-bound time is deterministic.
