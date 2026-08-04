@@ -3310,7 +3310,9 @@ mod adapter {
                             "control_request interrupt not honored within grace; \
                              SIGINT escalation — child condemned"
                         );
-                        interrupt_deadline = None;
+                        // No `interrupt_deadline` disarm needed: the break
+                        // leaves the loop, and the deadline is per-child
+                        // state that dies with it.
                         condemn(&mut condemned, &child);
                         break;
                     } else if shutting_down {
