@@ -22,6 +22,13 @@ layer: how to build, test, and the conventions we hold.
   + web). Backend is **auto-detected** (`deploy/dev/detect-backend.sh`, ADR 0024):
   `/dev/kvm` → Firecracker, macOS+arm64 → VZ, else → Process. Tilt UI at `:10350`.
   `just dev-down` to stop. First-time: `just bootstrap` (KEK) then `just pull-kernel`.
+- **Git worktrees share one dev identity.** The dev Postgres/GCS are machine-global, so
+  the KEK and baked bundles live with the PRIMARY checkout (found via
+  `git rev-parse --git-common-dir`): `just bootstrap` writes the KEK to the shared
+  `.env` (and strips any KEK from a worktree-local one), Tilt reads shared-then-local
+  (local wins for overrides like `ENGRAM_SANDBOX_BACKEND`), and `just dev-link-shared`
+  (run at Tilt parse time) symlinks `var/shared` + `var/bundles` to the primary
+  checkout's — no per-worktree re-bake, no broken sealed keys.
 - `just check` — **the pre-commit gate**: `cargo fmt --check`, `cargo clippy -D warnings`,
   `cargo hakari verify`, `cargo nextest run --workspace`. Run before every commit; CI
   enforces the same. (After adding/removing workspace deps, run `just hakari`.)
