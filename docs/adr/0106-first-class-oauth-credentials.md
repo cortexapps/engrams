@@ -96,3 +96,59 @@ metadata; a live Enterprise smoke is recorded when a workspace is available.
 
 - [OpenAI Codex authentication](https://developers.openai.com/codex/auth)
 - [Codex app-server authentication](https://developers.openai.com/codex/app-server#auth-endpoints)
+
+## Addendum: connector subjects and the redirect flow family (2026-08-03)
+
+Connector OAuth moved onto this store, as the Consequences section
+invited. The org-secret token arm of the old
+`Begin/CompleteIntegrationOauth` path is retired; obtained tokens live
+only in `oauth_credentials` under `subject_kind = 'connector'`.
+
+- **Subject id = the integration-connection id** (ADR 0109's default
+  connection row). A second workspace later is a second connection row
+  plus a second credential row — no schema change. The coordinator keeps
+  treating subject ids as opaque.
+- **The redirect (authorization-code) flow family** sits beside the
+  device-code driver, not inside it. One spec-driven driver
+  (`oauth_redirect.rs`) serves every oauth-facet connector: the facet
+  arrives over the wire as a `RedirectOauthSpec`; host containment stays
+  at the orchestrator's connector parse boundary (the token URL must sit
+  on the connector's hosts; the authorize URL may sit on
+  `acquisitionHosts`, a browser-only surface never compiled into session
+  egress). Account metadata is declarative: dot-paths over the token
+  response and/or one bounded identity probe.
+- **The durable `oauth_flows` row is the redirect CSRF state.** The
+  `state` parameter is the flow id (injected-entropy UUID); a flow
+  begins on one replica and completes on any other
+  (`finish_oauth_flow_unowned` fences on the pending→terminal
+  transition). The orchestrator's in-memory state map is deleted. PKCE,
+  when a facet enables it, derives its verifier from
+  HMAC(client secret, flow id) — nothing secret is persisted.
+- **Refresh is first-class** (Linear: 24 h access tokens, mandatory
+  rotating refresh tokens). Migration 0110 adds `expires_at` (outside
+  the ciphertext, for sweep scheduling and status without a KEK
+  unwrap), an advisory `refresh_claim_until`, and `broken_at` /
+  `broken_reason`. A background scanner (`run_once`/`spawn` split,
+  injected clock) refreshes at max(30 min, 25 % of TTL) ahead of
+  expiry; `resolve_connector_token` is the single delivery seam
+  (session boot, the egress refresh route, Mode A/B) with an inline
+  single-flighted backstop that serves the stale token on transient
+  failure. The CAS-loser rule is load-bearing under rotation: a version
+  that moved means a concurrent refresh won — reload the winner; only
+  `invalid_grant` with the version unchanged marks the credential
+  broken, and a fresh authorization flow repairs it. The refresh spec
+  (token URL + client-credential refs, not secrets) is sealed inside
+  the bundle so the scanner needs no connector-catalog access; a stale
+  spec self-heals on reconnect.
+- **Delivery** rides the existing brokered-credential rail:
+  `CredentialMintSource` gained the trailing `OauthConnector` variant
+  (wire v24). Unlike `Connection` mints, the entry keeps its real
+  header template with the raw token as the secret. ADR 0111's
+  host-local `.egress` file therefore persists a resolved access token
+  on the node — the same exposure class as the sandbox spec sidecar,
+  bounded by the 24 h TTL, and re-minted through the refresh seam on
+  first use after a host-agent restart.
+- `ListCredentials` widened (an empty subject id lists a whole kind)
+  instead of gaining a sibling RPC, and `OAuthCredentialMeta` now
+  carries the derived status (`connected|expired|broken|revoked`) that
+  the connector UI maps to connected / needs-reconnect.
