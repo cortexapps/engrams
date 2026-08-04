@@ -614,3 +614,20 @@ freeze/upload interleavings the generation machinery used to guard.
 `engram_disk_flush_frozen_pending` (gauge: a frozen file is awaiting
 upload — nonzero across restarts means retries are happening),
 existing `DIRTY_RECOVER_*` metrics gain the two-file scan.
+
+#### Amendment (2026-08-04, from #1009 review): frozen generations
+
+The single-frozen-file design refused to freeze while an upload retry
+was pending — and the eviction/migration capture paths call
+`flush_local` ONCE under the FC pause as their coherence cut, so a
+refused freeze silently excluded the active overlay's acked writes
+from the capture (CRITICAL). The frozen overlay is therefore a
+GENERATION LIST (`<dirty>.frozen.<seq>`): `freeze()` is always
+permitted, one `flush_local` returns the union across every
+generation, and the upload reads each chunk from the newest
+generation holding it. Additionally: `freeze()` rolls back its rename
+if the fresh-active create fails, recovery creates the fresh active
+when it finds "active missing + frozen present" (the mid-freeze crash
+state), and `engram_disk_flush_frozen_pending` is an
+increment/decrement count (a per-session `set()` gauge was
+last-writer-wins across sessions).

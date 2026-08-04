@@ -349,11 +349,21 @@ pub(crate) struct RecoveredExtents {
 /// by construction: they go to the new active file.
 struct DirtyFileTier {
     active: OverlayFile,
-    /// The immutable pending-upload overlay. `Some` from `freeze()`
-    /// until the flush that published it unlinks it — or, after a
-    /// crash, from recovery until the first post-recovery flush
-    /// drains it.
-    frozen: Option<OverlayFile>,
+    /// Immutable pending-upload overlays, oldest first. A freeze
+    /// appends a generation (`<dirty>.frozen.<seq>`); the flush that
+    /// publishes drains and unlinks ALL of them. Multiple generations
+    /// exist only while uploads fail (each flush interval freezes the
+    /// writes made since the last attempt) — bounded by outage
+    /// duration, drained in one successful cycle. Review finding
+    /// (#1009): `freeze()` must ALWAYS be possible, because the
+    /// eviction/migration capture paths call `flush_local` ONCE under
+    /// the FC pause as their coherence cut — a freeze refused because
+    /// one was already pending silently excluded the active overlay's
+    /// acked writes from the capture.
+    frozen: Vec<OverlayFile>,
+    /// Monotonic freeze sequence (recovery resumes past the highest
+    /// on-disk suffix).
+    frozen_seq: u64,
     fsync_on_write: bool,
     /// Temporary constructor files are removed if attach fails.
     remove_on_drop: bool,
@@ -383,12 +393,25 @@ impl DirtyFileTier {
         match mode {
             DirtyFileOpenMode::Truncate => {
                 options.create(true).truncate(true);
-                // A fresh attach owns the whole namespace: a frozen
-                // file left by a PRIOR life at this path is not ours
-                // to upload (its session's lineage ended).
-                let _ = std::fs::remove_file(frozen_overlay_path(&path));
+                // A fresh attach owns the whole namespace: frozen
+                // files left by a PRIOR life at this path are not ours
+                // to upload (that session's lineage ended).
+                for stale in list_frozen_overlays(&path) {
+                    let _ = std::fs::remove_file(stale.1);
+                }
             }
             DirtyFileOpenMode::Recover => {}
+        }
+        // Review finding (#1009, HIGH): a crash between freeze's
+        // rename and its fresh-active create leaves "active missing,
+        // frozen present". Recovery must not ENOENT past the frozen
+        // bytes — create the fresh sparse active the freeze would
+        // have created iff a frozen sibling proves that state.
+        if mode == DirtyFileOpenMode::Recover
+            && !path.exists()
+            && !list_frozen_overlays(&path).is_empty()
+        {
+            options.create(true);
         }
         let file = options
             .open(&path)
@@ -401,7 +424,8 @@ impl DirtyFileTier {
                 path,
                 set: HashSet::new(),
             },
-            frozen: None,
+            frozen: Vec::new(),
+            frozen_seq: 0,
             fsync_on_write: std::env::var("ENGRAM_DIRTY_FSYNC").as_deref() == Ok("1"),
             remove_on_drop: mode == DirtyFileOpenMode::Truncate,
         };
@@ -432,25 +456,24 @@ impl DirtyFileTier {
                 path = %tier.active.path.display(),
                 chunks = recovered.chunks,
                 bytes = recovered.bytes,
-                frozen_pending = tier.frozen.is_some(),
+                frozen_pending = tier.frozen.len(),
                 "dirty-file recovery seeded the overlay sets from allocated extents",
             );
         }
         Ok(tier)
     }
 
-    /// Recover the active overlay's extents, and adopt a frozen
-    /// overlay if the previous life left one (a flush that claimed but
-    /// never finished publishing — its chunks re-enter the pipeline on
-    /// the first post-recovery flush).
+    /// Recover the active overlay's extents, and adopt every frozen
+    /// generation the previous life left (flushes that claimed but
+    /// never finished publishing — they re-enter the pipeline on the
+    /// first post-recovery flush).
     fn recover_all(
         &mut self,
         total_bytes: u64,
         chunk_size: u64,
     ) -> Result<RecoveredExtents, DiskBackendError> {
         let mut recovered = recover_overlay_extents(&mut self.active, total_bytes, chunk_size)?;
-        let frozen_path = frozen_overlay_path(&self.active.path);
-        if frozen_path.exists() {
+        for (seq, frozen_path) in list_frozen_overlays(&self.active.path) {
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -464,30 +487,31 @@ impl DirtyFileTier {
             let frozen_recovered = recover_overlay_extents(&mut frozen, total_bytes, chunk_size)?;
             recovered.chunks += frozen_recovered.chunks;
             recovered.bytes += frozen_recovered.bytes;
+            self.frozen_seq = self.frozen_seq.max(seq);
             if frozen.set.is_empty() {
                 // Nothing survived the scan (all-partial, or empty) —
                 // an empty frozen file is retired on the spot.
                 let _ = std::fs::remove_file(&frozen.path);
             } else {
-                ::metrics::gauge!(FROZEN_PENDING_GAUGE).set(1.0);
-                self.frozen = Some(frozen);
+                ::metrics::gauge!(FROZEN_PENDING_GAUGE).increment(1.0);
+                self.frozen.push(frozen);
             }
         }
         Ok(recovered)
     }
 
     /// The freeze (ADR 0110 addendum): rename the active overlay to
-    /// the frozen path and start a fresh sparse active file. Two
-    /// metadata operations — no byte copies, no hashing. The renamed
-    /// file's descriptor stays valid, so frozen reads keep using it.
-    /// Caller guarantees `frozen.is_none()` (the flush pipeline guard
-    /// serializes freezes against drains).
+    /// the next frozen-generation path and start a fresh sparse
+    /// active file. Two metadata operations — no byte copies, no
+    /// hashing. ALWAYS permitted (generations stack while uploads
+    /// fail), so a single capture-path `flush_local` under the FC
+    /// pause always gets the active overlay into the pending set.
+    /// If the fresh-active create fails, the rename ROLLS BACK so the
+    /// tier never points at a nonexistent active file (review
+    /// finding, #1009).
     fn freeze(&mut self, total_bytes: u64) -> Result<(), DiskBackendError> {
-        debug_assert!(
-            self.frozen.is_none(),
-            "freeze() with a frozen overlay pending"
-        );
-        let frozen_path = frozen_overlay_path(&self.active.path);
+        let seq = self.frozen_seq + 1;
+        let frozen_path = frozen_generation_path(&self.active.path, seq);
         std::fs::rename(&self.active.path, &frozen_path)
             .map_err(|source| dirty_file_error("freeze rename", &self.active.path, source))?;
         let active_path = self.active.path.clone();
@@ -497,10 +521,30 @@ impl DirtyFileTier {
             .create(true)
             .truncate(true)
             .open(&active_path)
-            .map_err(|source| dirty_file_error("create fresh active", &active_path, source))?;
-        fresh
-            .set_len(total_bytes)
-            .map_err(|source| dirty_file_error("set fresh length", &active_path, source))?;
+            .and_then(|f| f.set_len(total_bytes).map(|()| f));
+        let fresh = match fresh {
+            Ok(f) => f,
+            Err(source) => {
+                // Roll the rename back; the flush fails cleanly and
+                // every byte is where it was.
+                if let Err(undo) = std::fs::rename(&frozen_path, &active_path) {
+                    // Rename-back failing too (the disk is very sick):
+                    // leave the frozen file for recovery — the missing-
+                    // active arm of `open(Recover)` adopts it.
+                    tracing::error!(
+                        path = %frozen_path.display(),
+                        error = %undo,
+                        "freeze rollback rename failed; frozen generation left for recovery",
+                    );
+                }
+                return Err(dirty_file_error(
+                    "create fresh active",
+                    &active_path,
+                    source,
+                ));
+            }
+        };
+        self.frozen_seq = seq;
         let old_active = std::mem::replace(
             &mut self.active,
             OverlayFile {
@@ -509,21 +553,19 @@ impl DirtyFileTier {
                 set: HashSet::new(),
             },
         );
-        let frozen_bytes: u64 = 0; // stamped by the caller (needs chunk lens)
-        let _ = frozen_bytes;
-        self.frozen = Some(OverlayFile {
+        self.frozen.push(OverlayFile {
             file: old_active.file,
             path: frozen_path,
             set: old_active.set,
         });
-        ::metrics::gauge!(FROZEN_PENDING_GAUGE).set(1.0);
+        ::metrics::gauge!(FROZEN_PENDING_GAUGE).increment(1.0);
         Ok(())
     }
 
-    /// Verify-before-delete's delete: the published frozen overlay is
-    /// unlinked whole. Replaces per-chunk hole punching.
+    /// Verify-before-delete's delete: every published frozen
+    /// generation is unlinked whole. Replaces per-chunk hole punching.
     fn unlink_frozen(&mut self) {
-        if let Some(frozen) = self.frozen.take() {
+        for frozen in self.frozen.drain(..) {
             if let Err(error) = std::fs::remove_file(&frozen.path) {
                 // Not a durability problem (the chunks are published);
                 // the orphan is re-adopted by the next recovery or
@@ -531,23 +573,28 @@ impl DirtyFileTier {
                 tracing::warn!(
                     path = %frozen.path.display(),
                     %error,
-                    "could not unlink the published frozen overlay",
+                    "could not unlink a published frozen overlay",
                 );
             }
-            ::metrics::gauge!(FROZEN_PENDING_GAUGE).set(0.0);
+            ::metrics::gauge!(FROZEN_PENDING_GAUGE).decrement(1.0);
         }
     }
 
     fn contains(&self, chunk_idx: usize) -> bool {
         self.active.set.contains(&chunk_idx)
-            || self
-                .frozen
-                .as_ref()
-                .is_some_and(|f| f.set.contains(&chunk_idx))
+            || self.frozen.iter().any(|f| f.set.contains(&chunk_idx))
     }
 
-    /// Read one chunk, preferring the active overlay (newer bytes).
-    /// `None` if the chunk is in neither overlay.
+    /// The newest frozen generation holding `chunk_idx`, if any.
+    fn newest_frozen_with(&self, chunk_idx: usize) -> Option<&OverlayFile> {
+        self.frozen
+            .iter()
+            .rev()
+            .find(|f| f.set.contains(&chunk_idx))
+    }
+
+    /// Read one chunk, preferring the active overlay, then frozen
+    /// generations newest-first. `None` if no overlay holds it.
     fn read_overlay_chunk(
         &self,
         chunk_idx: usize,
@@ -557,9 +604,7 @@ impl DirtyFileTier {
         let source = if self.active.set.contains(&chunk_idx) {
             &self.active
         } else {
-            self.frozen
-                .as_ref()
-                .filter(|f| f.set.contains(&chunk_idx))?
+            self.newest_frozen_with(chunk_idx)?
         };
         Some(read_chunk_from(
             &source.file,
@@ -569,23 +614,20 @@ impl DirtyFileTier {
         ))
     }
 
-    /// Read one chunk from the FROZEN overlay (the flush-upload path).
+    /// Read one chunk from the frozen overlays (the flush-upload
+    /// path): the NEWEST generation holding it wins — an older
+    /// generation's copy is superseded data.
     fn read_frozen_chunk(
         &self,
         chunk_idx: usize,
         chunk_len: usize,
         chunk_size: u64,
     ) -> Result<Bytes, DiskBackendError> {
-        let frozen = self.frozen.as_ref().ok_or_else(|| {
+        let frozen = self.newest_frozen_with(chunk_idx).ok_or_else(|| {
             DiskBackendError::InvariantViolation(format!(
-                "flush read of chunk {chunk_idx} with no frozen overlay"
+                "flush read of chunk {chunk_idx} not present in any frozen overlay"
             ))
         })?;
-        if !frozen.set.contains(&chunk_idx) {
-            return Err(DiskBackendError::InvariantViolation(format!(
-                "flush read of chunk {chunk_idx} not present in the frozen overlay"
-            )));
-        }
         read_chunk_from(&frozen.file, chunk_idx, chunk_len, chunk_size)
             .map_err(|source| dirty_file_error("read frozen chunk", &frozen.path, source))
     }
@@ -596,7 +638,7 @@ impl DirtyFileTier {
 
     fn allocated_chunks(&self) -> HashSet<usize> {
         let mut set = self.active.set.clone();
-        if let Some(frozen) = &self.frozen {
+        for frozen in &self.frozen {
             set.extend(frozen.set.iter().copied());
         }
         set
@@ -720,11 +762,36 @@ fn read_chunk_from(
     Ok(Bytes::from(bytes))
 }
 
-/// `<dirty>.frozen` — the immutable pending-upload overlay's path.
-pub(crate) fn frozen_overlay_path(dirty_path: &Path) -> PathBuf {
+/// `<dirty>.frozen.<seq>` — one immutable pending-upload generation.
+pub(crate) fn frozen_generation_path(dirty_path: &Path, seq: u64) -> PathBuf {
     let mut p = dirty_path.as_os_str().to_os_string();
-    p.push(".frozen");
+    p.push(format!(".frozen.{seq}"));
     PathBuf::from(p)
+}
+
+/// Every on-disk frozen generation for `dirty_path`, sorted oldest
+/// (lowest seq) first.
+pub(crate) fn list_frozen_overlays(dirty_path: &Path) -> Vec<(u64, PathBuf)> {
+    let Some(parent) = dirty_path.parent() else {
+        return Vec::new();
+    };
+    let Some(base) = dirty_path.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{base}.frozen.");
+    let mut out: Vec<(u64, PathBuf)> = std::fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let seq: u64 = name.strip_prefix(&prefix)?.parse().ok()?;
+            Some((seq, entry.path()))
+        })
+        .collect();
+    out.sort_unstable_by_key(|(seq, _)| *seq);
+    out
 }
 
 /// Gauge: 1 while a frozen overlay awaits upload. Nonzero across
@@ -736,7 +803,7 @@ impl Drop for DirtyFileTier {
         if self.remove_on_drop {
             let _ = std::fs::remove_file(&self.active.path);
             let _ = std::fs::remove_file(ref_sidecar_path(&self.active.path));
-            if let Some(frozen) = &self.frozen {
+            for frozen in &self.frozen {
                 let _ = std::fs::remove_file(&frozen.path);
             }
         }
@@ -1380,10 +1447,20 @@ impl ChunkedDiskBackend {
         }
         std::fs::rename(&tier.active.path, target)
             .map_err(|source| dirty_file_error("rename", target, source))?;
-        // A pending frozen overlay moves with its session (its path
-        // derives from the active path).
-        if let Some(frozen) = &mut tier.frozen {
-            let frozen_target = frozen_overlay_path(target);
+        // Pending frozen generations move with their session (their
+        // paths derive from the active path); sequence numbers are
+        // preserved via the same suffix parse recovery uses.
+        for frozen in &mut tier.frozen {
+            let Some(seq) = frozen
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.rsplit('.').next())
+                .and_then(|s| s.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let frozen_target = frozen_generation_path(target, seq);
             std::fs::rename(&frozen.path, &frozen_target)
                 .map_err(|source| dirty_file_error("rename frozen", &frozen_target, source))?;
             frozen.path = frozen_target;
@@ -1646,9 +1723,7 @@ impl ChunkedDiskBackend {
                     return Ok(());
                 }
                 let frozen_seed = tier
-                    .frozen
-                    .as_ref()
-                    .filter(|f| f.set.contains(&chunk_idx))
+                    .newest_frozen_with(chunk_idx)
                     .map(|f| read_chunk_from(&f.file, chunk_idx, chunk_len, self.chunk_size));
                 if let Some(read) = frozen_seed {
                     let seed = read.map_err(|source| {
@@ -1866,29 +1941,33 @@ impl ChunkedDiskBackend {
         // serialized critical section.
         let flush_guard = self.flush_pipeline.clone().lock_owned().await;
         let mut tier = self.dirty_tier.lock().await;
-        // A frozen overlay already pending (a prior upload failed or a
-        // crash left one recovered): drain IT this cycle. The active
-        // overlay keeps accumulating and freezes on a later flush —
-        // publishing older data first keeps the manifest chain ordered.
-        if tier.frozen.is_none() {
-            if tier.active.set.is_empty() {
-                drop(tier);
-                drop(flush_guard);
-                return Ok(PendingDiskFlush {
-                    chunks: Vec::new(),
-                    flush_guard: None,
-                });
-            }
-            // The freeze (ADR 0110 addendum): rename + fresh sparse
-            // active. O(1) under the FC pause — no byte copies, no
-            // hashing (both moved to the post-resume upload stream).
+        // Review finding (#1009, CRITICAL): the capture paths
+        // (eviction snapshot_begin, migration export) call flush_local
+        // ONCE under the FC pause as their coherence cut — so a
+        // non-empty active overlay must ALWAYS freeze, even when
+        // earlier generations are still pending from failed uploads.
+        // The pending set is the UNION across every generation; the
+        // upload reads each chunk from the newest generation holding
+        // it, so superseded copies never publish.
+        if !tier.active.set.is_empty() {
             tier.freeze(self.total_bytes)?;
         }
-        let frozen = tier.frozen.as_ref().expect("frozen present after freeze");
-        let mut chunks: Vec<(usize, u64)> = frozen
-            .set
+        if tier.frozen.is_empty() {
+            drop(tier);
+            drop(flush_guard);
+            return Ok(PendingDiskFlush {
+                chunks: Vec::new(),
+                flush_guard: None,
+            });
+        }
+        let union: HashSet<usize> = tier
+            .frozen
             .iter()
-            .map(|&idx| (idx, self.chunk_len(idx)))
+            .flat_map(|f| f.set.iter().copied())
+            .collect();
+        let mut chunks: Vec<(usize, u64)> = union
+            .into_iter()
+            .map(|idx| (idx, self.chunk_len(idx)))
             .collect();
         chunks.sort_unstable_by_key(|(idx, _)| *idx);
         ::metrics::histogram!("engram_disk_flush_frozen_bytes")
@@ -3029,7 +3108,7 @@ mod tests {
         // gives and APFS does not (it reports flushed zero-fill as
         // data) — so the Recover-mode tests are Linux-gated.
         tier.active.file.sync_all().unwrap();
-        if let Some(frozen) = &tier.frozen {
+        for frozen in &tier.frozen {
             frozen.file.sync_all().unwrap();
         }
         tier.remove_on_drop = false;
@@ -4425,21 +4504,121 @@ mod tests {
         backend.write(chunk_size, &[0x22; 4096]).await.unwrap();
 
         fail_puts.store(false, std::sync::atomic::Ordering::SeqCst);
-        // Retry drains the FROZEN overlay (chunk 0 only).
+        // Retry freezes the interim write as a second generation and
+        // drains the UNION — one flush publishes everything pending.
         let first = backend.flush().await.unwrap();
-        assert_eq!(first.chunks_flushed, 1);
-        // The interim write flushes on the next cycle.
-        let second = backend.flush().await.unwrap();
-        assert_eq!(second.chunks_flushed, 1);
-        assert!(second.manifest_ref.version > first.manifest_ref.version);
+        assert_eq!(first.chunks_flushed, 2);
         assert_eq!(backend.unflushed_bytes().await, 0);
-        let published = store.get_manifest(second.manifest_ref).await.unwrap();
+        let published = store.get_manifest(first.manifest_ref).await.unwrap();
         assert_eq!(published.chunks.len(), 2);
         assert_eq!(backend.read(0, 2 * chunk_size).await.unwrap(), {
             let mut v = vec![0x11; 4096];
             v.extend_from_slice(&[0x22; 4096]);
             v
         });
+    }
+
+    /// Review finding (#1009, CRITICAL): a single `flush_local` —
+    /// the eviction/migration capture cut, called once under the FC
+    /// pause — must capture the ACTIVE overlay even when a frozen
+    /// generation is already pending from a failed upload. The old
+    /// behavior drained only the stale frozen set, silently dropping
+    /// the active overlay's acked writes from the capture.
+    #[tokio::test]
+    async fn capture_flush_with_pending_frozen_includes_active_writes() {
+        let chunk_size = 4096u64;
+        let manifest = synth_manifest(2 * chunk_size, chunk_size, vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let fail_puts = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let blob: Arc<dyn BlobStorage> = Arc::new(FailChunkPutsBlob {
+            inner: LocalBlobStorage::new(dir.path().join("blob")),
+            fail_puts: fail_puts.clone(),
+        });
+        let store = Arc::new(ChunkStore::new(blob));
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let backend = ChunkedDiskBackend::new(
+            manifest_ref,
+            &manifest,
+            test_cache(dir.path().join("cache")),
+            store.clone(),
+            u64::MAX,
+        )
+        .unwrap();
+
+        // Chunk 0 = A freezes, upload fails, generation retained.
+        backend.write(0, &[0x0a; 4096]).await.unwrap();
+        fail_puts.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(backend.flush().await.is_err());
+        fail_puts.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // Guest keeps writing: chunk 0 = B (supersedes the frozen A)
+        // and chunk 1 (new) land in the active overlay, acked.
+        backend.write(0, &[0x0b; 4096]).await.unwrap();
+        backend.write(chunk_size, &[0x0c; 4096]).await.unwrap();
+
+        // The capture cut: ONE flush_local. Its pending set must be
+        // the union — both chunks — and the upload must publish the
+        // NEWEST bytes for chunk 0.
+        let pending = backend.flush_local().await.unwrap();
+        let exported: Vec<usize> = pending.chunks.iter().map(|(idx, _)| *idx).collect();
+        assert_eq!(exported, vec![0, 1], "capture must union frozen + active");
+        let outcome = backend.flush_upload(pending).await.unwrap();
+        assert_eq!(outcome.chunks_flushed, 2);
+        assert_eq!(backend.unflushed_bytes().await, 0);
+        let published = store.get_manifest(outcome.manifest_ref).await.unwrap();
+        let chunk0 = published.chunks.iter().find(|c| c.offset == 0).unwrap();
+        let bytes0 = store.get_chunk(chunk0.hash).await.unwrap();
+        assert_eq!(
+            &bytes0[..],
+            &[0x0b; 4096][..],
+            "the newest generation's bytes must win the publish",
+        );
+    }
+
+    /// Review finding (#1009, HIGH): a crash between freeze's rename
+    /// and its fresh-active create leaves "active missing, frozen
+    /// present". Recovery must create the fresh active and adopt the
+    /// frozen bytes instead of failing the attach with ENOENT.
+    #[tokio::test]
+    async fn recovery_tolerates_missing_active_with_frozen_present() {
+        let chunk_size = 4096u64;
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().join("blob")));
+        let store = Arc::new(ChunkStore::new(blob));
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+
+        // Externally construct the post-crash state (ADR 0099 H5): a
+        // fully-written frozen generation, NO active file.
+        let dirty_path = dir.path().join("crashed.dirty");
+        let frozen_path = frozen_generation_path(&dirty_path, 3);
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&frozen_path)
+            .unwrap();
+        f.set_len(chunk_size).unwrap();
+        write_all_at(&f, &[0x5c; 4096], 0).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let backend = ChunkedDiskBackend::from_manifest_with_dirty_file(
+            manifest_ref,
+            &manifest,
+            test_cache(dir.path().join("cache")),
+            store,
+            u64::MAX,
+            dirty_path,
+            DirtyFileOpenMode::Recover,
+        )
+        .expect("recovery must tolerate a missing active file");
+
+        assert_eq!(backend.read(0, chunk_size).await.unwrap(), vec![0x5c; 4096]);
+        let outcome = backend.flush().await.unwrap();
+        assert_eq!(outcome.chunks_flushed, 1, "recovered frozen bytes publish");
     }
 
     /// Chunk puts fail while `fail_puts` is set; manifests pass through.
