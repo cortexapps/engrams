@@ -21,17 +21,23 @@
 //!   fuller than the free-space floor (default: keep ~20% free) — or,
 //!   when total cached bytes exceed the absolute ceiling (disk-derived
 //!   by default; see [`ChunkCacheConfig::from_env_or_default`], ADR
-//!   0067) — the oldest chunks get unlinked. "Oldest" is by file
-//!   modification time, i.e. *populate* time: reads do NOT touch mtime
-//!   (and atime is not consulted), so this is FIFO by first-write, not
-//!   true LRU-by-access. Hot chunks are protected explicitly instead —
-//!   by the refcounted pin set (an enabled image's base manifest is
-//!   pinned resident), not by recency. Cheap; doesn't require a separate
-//!   in-memory metadata store. The free-space floor is re-checked via
-//!   `statvfs(2)` on every sweep, so the cache yields disk to the
-//!   snapshots and checkpoints that share the work_dir mount rather than
-//!   racing them to ENOSPC (the prod incident where a 200 GiB byte-budget
-//!   never tripped on a ~98 GiB FC host).
+//!   0067) — the oldest chunks get unlinked. "Oldest" is by *populate*
+//!   time: reads do NOT touch recency, so this is FIFO by first-write,
+//!   not true LRU-by-access. Hot chunks are protected explicitly
+//!   instead — by the refcounted pin set (an enabled image's base
+//!   manifest is pinned resident), not by recency. Sweeps run against
+//!   an **in-memory index** (hash → size + populate time, built from
+//!   one walk on the first sweep, maintained by every populate/unlink
+//!   thereafter): #1003 — walking a 516k-file cache per sweep
+//!   materialized ~200 MB of listing per pass and cost 100-500 ms, and
+//!   concurrent sweeps compounded into multi-GB heap bursts. Only the
+//!   periodic [`ChunkCache::sweep`] still walks the directory, to
+//!   reconcile drift from out-of-process writers (the UFFD handler).
+//!   The free-space floor is re-checked via `statvfs(2)` on every
+//!   sweep, so the cache yields disk to the snapshots and checkpoints
+//!   that share the work_dir mount rather than racing them to ENOSPC
+//!   (the prod incident where a 200 GiB byte-budget never tripped on a
+//!   ~98 GiB FC host).
 //! - **Periodic enforcement**: eviction runs both on the populate path
 //!   (debounced, see `write_local`) AND on an independent timer
 //!   ([`ChunkCache::spawn_sweeper`]) — a host under disk pressure from
@@ -602,6 +608,45 @@ struct CacheInner {
     /// still lands unverified chunks correctly — the markers are
     /// durable and a later scrubber's boot scan picks them up).
     scrub_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<ChunkHash>>>,
+    /// #1003: in-memory eviction index — hash → (size, populate time),
+    /// plus a maintained byte total. Built from ONE directory walk on
+    /// the first sweep, then updated by every in-process populate and
+    /// eviction. Budget sweeps read THIS instead of re-walking the
+    /// cache root: on the incident host (516k files / 442 GB) each
+    /// walk materialized ~200 MB of `Vec<CacheEntry>` + `PathBuf`s and
+    /// cost 100-500 ms, and the capture path ran it per chunk written
+    /// — the multi-GB heap bursts behind the OOM loop. Out-of-process
+    /// writers (the UFFD handler, ADR 0070) still land chunks the
+    /// index can't see; the periodic [`ChunkCache::sweep`] re-walks
+    /// and reconciles, bounding drift to one sweep interval.
+    index: Mutex<Option<CacheIndex>>,
+    /// #1003: single-sweeper gate. Sweep cost used to compound the
+    /// other way too: on a big cache a sweep outlived the write-path
+    /// debounce window, so sweeps piled up concurrently (the burst
+    /// profile showed ~10 listings live at once). The populate path
+    /// `try_lock`s this and SKIPS if a sweep is already running (the
+    /// running sweep enforces the same budget); the periodic
+    /// reconcile waits its turn.
+    sweep_gate: tokio::sync::Mutex<()>,
+}
+
+/// #1003: the in-memory mirror of the cache directory that budget
+/// sweeps run against. No `PathBuf` per entry — paths derive from the
+/// hash on demand (`path_for`), which is exactly the allocation the
+/// on-disk walk paid per entry per sweep.
+struct CacheIndex {
+    entries: HashMap<ChunkHash, IndexEntry>,
+    /// Maintained sum of `entries[*].size`.
+    total_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct IndexEntry {
+    size: u64,
+    /// Populate time, unix millis. Eviction is FIFO by populate time
+    /// (reads do not touch recency — see the module doc); ties are
+    /// broken by hash for determinism.
+    populated_ms: i64,
 }
 
 impl ChunkCache {
@@ -617,6 +662,8 @@ impl ChunkCache {
                 last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
                 co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
                 scrub_tx: Mutex::new(None),
+                index: Mutex::new(None),
+                sweep_gate: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -645,6 +692,8 @@ impl ChunkCache {
                 last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
                 co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
                 scrub_tx: Mutex::new(None),
+                index: Mutex::new(None),
+                sweep_gate: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -720,13 +769,17 @@ impl ChunkCache {
     /// (ADR 0075 pin-integrity-under-pressure) need a deterministic
     /// trigger.
     pub async fn sweep_for_test(&self) {
-        if let Err(e) = self.evict_to_budget().await {
+        // The reconciling variant: tests drop/create files on disk
+        // directly, so a test sweep must see disk truth, not the
+        // in-memory index.
+        if let Err(e) = self.sweep().await {
             panic!("test sweep failed: {e}");
         }
     }
 
     pub fn evict_on_disk_for_test(&self, hash: ChunkHash) {
         let _ = std::fs::remove_file(self.path_for(hash));
+        self.index_remove(hash);
     }
 
     /// Get a chunk's bytes. Local NVMe first; on miss, the
@@ -1203,13 +1256,38 @@ impl ChunkCache {
             fs::create_dir_all(parent).await?;
         }
         write_atomic(&target, bytes).await?;
+        self.index_insert(hash, bytes.len() as u64);
         Ok(())
     }
 
-    /// One eviction sweep — the batch-closing pair of
-    /// [`Self::put_no_evict`].
+    /// One RECONCILING eviction sweep — the batch-closing pair of
+    /// [`Self::put_no_evict`], and what the periodic
+    /// [`Self::spawn_sweeper`] runs. Re-walks the cache directory,
+    /// rebuilds the in-memory index from disk truth (out-of-process
+    /// writers — the UFFD handler, ADR 0070 — land chunks the index
+    /// can't see), gauges the drift, then enforces the budget. The
+    /// only remaining full-walk path; everything per-write reads the
+    /// index ([`Self::evict_with_index`]).
     pub async fn sweep(&self) -> Result<()> {
-        self.evict_to_budget().await
+        let _gate = self.inner.sweep_gate.lock().await;
+        let started = crate::time_source::metrics_now();
+        let entries = self.list_entries().await?;
+        metrics::histogram!("engram_chunk_cache_sweep_seconds", "kind" => "walk")
+            .record(started.elapsed().as_secs_f64());
+        let rebuilt = Self::index_from_entries(&entries);
+        {
+            let mut guard = self.inner.index.lock();
+            if let Some(prev) = guard.as_ref() {
+                // |walk truth − maintained index|. Persistent large drift
+                // means an unaccounted writer; transient small drift is
+                // normal (puts racing the walk, UFFD landings since the
+                // last reconcile).
+                let drift = rebuilt.total_bytes.abs_diff(prev.total_bytes);
+                metrics::gauge!("engram_chunk_cache_index_drift_bytes").set(drift as f64);
+            }
+            *guard = Some(rebuilt);
+        }
+        self.evict_with_index().await
     }
 
     /// ADR 0095: land peer-pulled bytes WITHOUT the sha256
@@ -1243,6 +1321,7 @@ impl ChunkCache {
         // leaving unhashed bytes unmarked).
         write_atomic(&self.marker_path_for(hash), b"").await?;
         write_atomic(&target, bytes).await?;
+        self.index_insert(hash, bytes.len() as u64);
         if let Some(tx) = self.inner.scrub_tx.lock().as_ref() {
             let _ = tx.send(hash);
         }
@@ -1341,6 +1420,9 @@ impl ChunkCache {
             Ok(Some(b)) => b,
             _ => {
                 let _ = fs::remove_file(&marker).await;
+                // The chunk file is gone (evicted mid-queue or a crashed
+                // landing) — drop any stale index entry with it.
+                self.index_remove(hash);
                 metrics::counter!("engram_chunk_scrub_total", "outcome" => "missing").increment(1);
                 return 0;
             }
@@ -1353,6 +1435,7 @@ impl ChunkCache {
             // bytes must never linger unmarked). Next read misses and
             // refetches from GCS through the verifying populate.
             let _ = fs::remove_file(self.path_for(hash)).await;
+            self.index_remove(hash);
             let _ = fs::remove_file(&marker).await;
             metrics::counter!("engram_chunk_scrub_total", "outcome" => "corrupt").increment(1);
             tracing::error!(
@@ -1498,17 +1581,18 @@ impl ChunkCache {
         // when the out-of-process UFFD handler caches the same hash into
         // this shared cache_root concurrently (see `write_atomic`).
         write_atomic(&target, bytes).await?;
+        self.index_insert(hash, bytes.len() as u64);
 
         // Best-effort eviction sweep, DEBOUNCED to at most once per
-        // interval across all writers. The previous per-write sweep
-        // (full two-level readdir + statvfs) cost 100-500 ms per
-        // populate on a loaded cache and sat under EVERY miss-path
-        // consumer — UFFD fault serving, parallel prefetch, the
-        // migration source's fetch fallback — compounding into the
-        // 25-115 s post-teleport tails (ADR 0045 C1; #184 fixed only
-        // the explicit put() callers). Budget enforcement still
-        // happens within the interval, which is plenty: the budget is
-        // a soft ceiling probed against a multi-GB cache.
+        // interval across all writers, and SKIPPED outright if a sweep
+        // is already running (#1003: on a 516k-file cache the walk-based
+        // sweep outlived the debounce window, so sweeps piled up
+        // concurrently — ~10 directory listings live at once in the
+        // burst profile; the running sweep enforces the same budget, so
+        // piling on buys nothing). The sweep itself now reads the
+        // in-memory index — the per-write full readdir (100-500 ms per
+        // populate on a loaded cache, ADR 0045 C1 / #184) is gone; only
+        // the periodic [`Self::sweep`] walks the directory.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -1529,38 +1613,58 @@ impl ChunkCache {
                 )
                 .is_ok()
         {
-            self.evict_to_budget().await?;
+            let Ok(_gate) = self.inner.sweep_gate.try_lock() else {
+                return Ok(());
+            };
+            self.evict_with_index().await?;
         }
         Ok(())
     }
 
-    /// Walk the cache directory, total bytes, LRU-evict until both the
-    /// optional absolute ceiling and the dynamic free-space floor are
-    /// satisfied. Skips pinned hashes; remembers what it evicted (for
-    /// the thrash metric).
+    /// #1003: the budget sweep, driven by the in-memory index. Totals
+    /// come from [`CacheIndex`], not a directory walk; eviction unlinks
+    /// oldest-populated-first and updates the index as it goes. The
+    /// free-space floor is still re-probed via `statvfs(2)` on every
+    /// sweep — a snapshot/checkpoint that filled the shared mount since
+    /// the last sweep makes *this* sweep evict more, even though the
+    /// cache itself didn't grow.
     ///
-    /// The free-space floor is re-probed via `statvfs(2)` here, on every
-    /// sweep — so a snapshot/checkpoint that filled the shared mount
-    /// since the last sweep makes *this* sweep evict more, even though
-    /// the cache itself didn't grow. That's the whole point: the cache
-    /// yields disk dynamically rather than holding a fixed slice.
-    async fn evict_to_budget(&self) -> Result<()> {
+    /// Caller MUST hold `sweep_gate` — the populate path `try_lock`s
+    /// (skip-if-busy), the reconcile path locks (wait).
+    async fn evict_with_index(&self) -> Result<()> {
         // ADR 0070: single-evictor switch. A cache with eviction disabled
-        // never unlinks (populate — write_local's atomic write — already
-        // happened by the time write_local calls this). Skip the walk
-        // entirely: this process (the UFFD handler) isn't the owner of
-        // the cache's size/pin gauges either — the host-agent's own
-        // sweeper, over the same directory, is the source of truth.
+        // never unlinks (populate already happened by the time the write
+        // path gets here). This process (the UFFD handler) isn't the
+        // owner of the cache's size/pin gauges either — the host-agent's
+        // own sweeper, over the same directory, is the source of truth.
         if !self.inner.config.eviction_enabled {
             tracing::debug!("chunk cache sweep skipped: eviction_enabled=false on this cache");
             return Ok(());
         }
-        let mut entries = self.list_entries().await?;
-        let cache_total: u64 = entries.iter().map(|e| e.size).sum();
+        self.ensure_index().await?;
+        let sweep_started = crate::time_source::metrics_now();
+
+        let pinned = self.inner.pinned.lock().clone();
+        let (cache_total, pinned_bytes) = {
+            let guard = self.inner.index.lock();
+            let idx = guard.as_ref().expect("ensure_index built the index above");
+            // ADR 0070: pins are a floor, not a bug — computed BEFORE
+            // deciding how much to free, and gauged even when the sweep
+            // is otherwise a no-op (dashboards and the pins-over-budget
+            // alarm stay live with zero eviction pressure this tick).
+            // O(pins) map lookups, not a scan of the whole cache.
+            let pinned_bytes: u64 = pinned
+                .keys()
+                .filter_map(|h| idx.entries.get(h))
+                .map(|e| e.size)
+                .sum();
+            (idx.total_bytes, pinned_bytes)
+        };
         // ADR 0014 M1.15: snapshot of current cache size at every
         // budget check. Cheap; the metric is read by the dashboard,
         // not the hot path.
         metrics::gauge!("engram_chunk_cache_size_bytes").set(cache_total as f64);
+        metrics::gauge!("engram_chunk_cache_pinned_bytes").set(pinned_bytes as f64);
 
         // How tight is the disk right now? `None` ⇒ probe failed; we
         // fail soft to "no floor pressure" (the ceiling, if any, still
@@ -1591,18 +1695,6 @@ impl ChunkCache {
         metrics::gauge!("engram_chunk_cache_co_tenant_reserved_bytes").set(reserved as f64);
         let ceiling = ceiling.map(|c| c.saturating_sub(reserved));
 
-        // ADR 0070: pins are a floor, not a bug. Compute what's
-        // unevictable BEFORE deciding how much to free, and gauge it
-        // regardless of whether a sweep is otherwise a no-op — dashboards
-        // and the pins-over-budget alarm must stay live even with zero
-        // eviction pressure this tick.
-        let pinned = self.inner.pinned.lock().clone();
-        let pinned_bytes: u64 = entries
-            .iter()
-            .filter(|e| pinned.contains_key(&e.hash))
-            .map(|e| e.size)
-            .sum();
-        metrics::gauge!("engram_chunk_cache_pinned_bytes").set(pinned_bytes as f64);
         // 0 is the "no ceiling configured" sentinel here (u64::MAX would
         // render as a meaningless huge gauge value) — mirrors the "0 =
         // disabled" convention other env knobs in this codebase use.
@@ -1635,39 +1727,117 @@ impl ChunkCache {
         }
 
         let mut over = bytes_to_free(cache_total, ceiling, self.inner.free_floor_pct, fs);
-        if over == 0 {
+        if over > 0 {
+            // Oldest populate time first; skip pinned (any refcount > 0).
+            // Snapshot (populated_ms, hash, size) triples under the lock,
+            // sort and unlink outside it — the unlink loop awaits.
+            let mut candidates: Vec<(i64, ChunkHash, u64)> = {
+                let guard = self.inner.index.lock();
+                guard
+                    .as_ref()
+                    .expect("ensure_index built the index above")
+                    .entries
+                    .iter()
+                    .filter(|(hash, _)| !pinned.contains_key(*hash))
+                    .map(|(hash, e)| (e.populated_ms, *hash, e.size))
+                    .collect()
+            };
+            candidates.sort_unstable_by_key(|(ms, _, _)| *ms);
+            for (_, hash, size) in candidates {
+                if over == 0 {
+                    break;
+                }
+                let _ = fs::remove_file(self.path_for(hash)).await;
+                self.index_remove(hash);
+                over = over.saturating_sub(size);
+                // ADR 0039 #16: track what we evicted so a later remote miss
+                // for it can be counted as refetch-after-evict thrash.
+                self.inner.evicted_ring.lock().insert(hash);
+                // ADR 0014 M1.15: per-chunk LRU eviction counter.
+                // Operators watch the rate to know if the budget is
+                // too small for the working set.
+                metrics::counter!(
+                    "engram_chunk_cache_evictions_total",
+                    "reason" => "lru",
+                )
+                .increment(1);
+                tracing::trace!(
+                    hash = %hash,
+                    bytes = size,
+                    "evicted from chunk cache",
+                );
+            }
+        }
+        metrics::histogram!("engram_chunk_cache_sweep_seconds", "kind" => "index")
+            .record(sweep_started.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    /// Build the index from one directory walk if this is the first
+    /// sweep since process start. Every later sweep reads the
+    /// maintained index; only [`ChunkCache::sweep`] re-walks.
+    async fn ensure_index(&self) -> Result<()> {
+        if self.inner.index.lock().is_some() {
             return Ok(());
         }
+        let started = crate::time_source::metrics_now();
+        let entries = self.list_entries().await?;
+        metrics::histogram!("engram_chunk_cache_sweep_seconds", "kind" => "walk")
+            .record(started.elapsed().as_secs_f64());
+        let built = Self::index_from_entries(&entries);
+        *self.inner.index.lock() = Some(built);
+        Ok(())
+    }
 
-        // Oldest mtime first; skip pinned (any refcount > 0).
-        entries.sort_by_key(|e| e.mtime);
-        for entry in entries {
-            if over == 0 {
-                break;
-            }
-            if pinned.contains_key(&entry.hash) {
-                continue;
-            }
-            let _ = fs::remove_file(&entry.path).await;
-            over = over.saturating_sub(entry.size);
-            // ADR 0039 #16: track what we evicted so a later remote miss
-            // for it can be counted as refetch-after-evict thrash.
-            self.inner.evicted_ring.lock().insert(entry.hash);
-            // ADR 0014 M1.15: per-chunk LRU eviction counter.
-            // Operators watch the rate to know if the budget is
-            // too small for the working set.
-            metrics::counter!(
-                "engram_chunk_cache_evictions_total",
-                "reason" => "lru",
-            )
-            .increment(1);
-            tracing::trace!(
-                hash = %entry.hash,
-                bytes = entry.size,
-                "evicted from chunk cache",
+    fn index_from_entries(entries: &[CacheEntry]) -> CacheIndex {
+        let mut map = HashMap::with_capacity(entries.len());
+        let mut total_bytes = 0u64;
+        for e in entries {
+            let populated_ms = e
+                .mtime
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            total_bytes += e.size;
+            map.insert(
+                e.hash,
+                IndexEntry {
+                    size: e.size,
+                    populated_ms,
+                },
             );
         }
-        Ok(())
+        CacheIndex {
+            entries: map,
+            total_bytes,
+        }
+    }
+
+    /// Record an in-process populate in the index. No-op until the
+    /// first sweep builds the index (the build's walk sees the file on
+    /// disk instead). Overwrites (same hash re-populated) adjust the
+    /// total by the size delta.
+    fn index_insert(&self, hash: ChunkHash, size: u64) {
+        let mut guard = self.inner.index.lock();
+        let Some(idx) = guard.as_mut() else { return };
+        let populated_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if let Some(prev) = idx.entries.insert(hash, IndexEntry { size, populated_ms }) {
+            idx.total_bytes = idx.total_bytes.saturating_sub(prev.size);
+        }
+        idx.total_bytes += size;
+    }
+
+    /// Record an in-process unlink (eviction, scrub-delete, test
+    /// helper) in the index. No-op until the index is built.
+    fn index_remove(&self, hash: ChunkHash) {
+        let mut guard = self.inner.index.lock();
+        let Some(idx) = guard.as_mut() else { return };
+        if let Some(prev) = idx.entries.remove(&hash) {
+            idx.total_bytes = idx.total_bytes.saturating_sub(prev.size);
+        }
     }
 
     async fn list_entries(&self) -> Result<Vec<CacheEntry>> {
@@ -1731,7 +1901,6 @@ impl ChunkCache {
                     Err(e) if vanished(&e) => continue,
                     Err(e) => return Err(e.into()),
                 };
-                let path = file.path();
                 match file.file_type().await {
                     Ok(t) if t.is_file() => {}
                     Ok(_) => continue,
@@ -1755,7 +1924,6 @@ impl ChunkCache {
                 };
                 out.push(CacheEntry {
                     hash,
-                    path,
                     size: meta.len(),
                     mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
                 });
@@ -1812,7 +1980,6 @@ fn unique_tmp_path(target: &Path) -> PathBuf {
 #[derive(Debug)]
 struct CacheEntry {
     hash: ChunkHash,
-    path: PathBuf,
     size: u64,
     mtime: std::time::SystemTime,
 }
@@ -3227,6 +3394,122 @@ mod tests {
             .await
             .expect("interval=0 must return promptly, not hang")
             .expect("sweeper task must not panic");
+    }
+
+    // ---- #1003: index-driven sweeps ----
+
+    #[tokio::test]
+    async fn populate_path_sweep_evicts_through_the_index() {
+        // Three 10-byte chunks against a 25-byte ceiling, populated via
+        // `put` (the write_local path, debounce 0 ⇒ every write sweeps).
+        // The sweeps run against the in-memory index — the oldest chunk
+        // must go, the newest must stay, purely through index-tracked
+        // populates and evictions.
+        let (cache, _store, _b, _c) = setup(25).await;
+        let a = b"aaaaaaaaaa";
+        let b = b"bbbbbbbbbb";
+        let c = b"cccccccccc";
+        let (ha, hb, hc) = (ChunkHash::of(a), ChunkHash::of(b), ChunkHash::of(c));
+        cache.put(ha, a).await.unwrap();
+        // Distinct populate times: eviction orders by populated_ms
+        // (millisecond resolution).
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        cache.put(hb, b).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        cache.put(hc, c).await.unwrap();
+
+        assert!(
+            !cache.contains(ha).await,
+            "oldest chunk must be evicted by the index-driven populate-path sweep",
+        );
+        assert!(cache.contains(hc).await, "newest chunk must survive");
+    }
+
+    #[tokio::test]
+    async fn reconcile_sweep_sees_out_of_band_writes() {
+        // A chunk landed by ANOTHER process (the UFFD handler shares the
+        // cache root, ADR 0070) is invisible to this process's index.
+        // The reconciling sweep() must re-walk, adopt it, and enforce
+        // the budget against it.
+        let (cache, _store, _b, _c) = setup(15).await;
+        // Build the index first (any sweep builds it).
+        cache.sweep().await.unwrap();
+
+        // Out-of-band landing: bytes written straight to the target
+        // path, bypassing every ChunkCache API.
+        let a = b"aaaaaaaaaa";
+        let b = b"bbbbbbbbbb";
+        let (ha, hb) = (ChunkHash::of(a), ChunkHash::of(b));
+        let target = cache.on_disk_path(ha);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, a).unwrap();
+        // Backdate it a minute so "oldest" is deterministic — populate
+        // times carry millisecond resolution, and two writes in the
+        // same millisecond tie (arbitrary eviction order).
+        let f = std::fs::File::options().write(true).open(&target).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .unwrap();
+
+        // In-process populate of a second chunk: 20 bytes total now on
+        // disk against a 15-byte ceiling, but the index only knows 10 —
+        // the index-driven sweep sees no pressure and evicts nothing.
+        cache.put(hb, b).await.unwrap();
+        assert!(cache.contains(ha).await);
+        assert!(cache.contains(hb).await);
+
+        // The reconcile re-walks: both chunks visible, 20 > 15, oldest
+        // (the out-of-band one) goes.
+        cache.sweep().await.unwrap();
+        assert!(
+            !cache.contains(ha).await,
+            "reconcile must adopt the out-of-band chunk and evict it under ceiling pressure",
+        );
+        assert!(
+            cache.contains(hb).await,
+            "in-index chunk within budget survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_does_not_double_count_a_repopulated_hash() {
+        // Ceiling exactly one chunk. Re-populating the SAME hash must
+        // overwrite its index entry (size delta accounting), not add a
+        // second copy — a double-counted total would push the sweep
+        // over ceiling and evict the only chunk.
+        let (cache, _store, _b, _c) = setup(10).await;
+        let a = b"aaaaaaaaaa";
+        let ha = ChunkHash::of(a);
+        cache.put(ha, a).await.unwrap();
+        cache.put(ha, a).await.unwrap();
+        cache.put(ha, a).await.unwrap();
+        assert!(
+            cache.contains(ha).await,
+            "re-populating one in-budget hash must not inflate the index total and self-evict",
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_updates_the_index_total() {
+        // After the sweep evicts down to budget, the index total must
+        // reflect the eviction — a later sweep with no new writes sees
+        // no pressure and evicts nothing further.
+        let (cache, _store, _b, _c) = setup(15).await;
+        let a = b"aaaaaaaaaa";
+        let b = b"bbbbbbbbbb";
+        let (ha, hb) = (ChunkHash::of(a), ChunkHash::of(b));
+        cache.put(ha, a).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        cache.put(hb, b).await.unwrap();
+        assert!(!cache.contains(ha).await, "over-ceiling: oldest evicted");
+        assert!(cache.contains(hb).await);
+
+        // A stale (not-decremented) total would read 20 > 15 here and
+        // evict the survivor too.
+        cache.sweep().await.unwrap();
+        assert!(
+            cache.contains(hb).await,
+            "post-eviction sweep must see the decremented total and keep the survivor",
+        );
     }
 
     // ---- ChunkCacheConfig::SWEEP_INTERVAL_ENV_VAR precedence ----
