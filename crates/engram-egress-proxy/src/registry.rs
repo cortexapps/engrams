@@ -834,6 +834,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_connector_entry_refreshes_near_expiry_with_the_raw_token() {
+        // ADR 0106 addendum: an OauthConnector entry rides the same refresh
+        // rail; the refreshed value is the RAW token and the entry's own
+        // template re-renders around it.
+        let e = InjectEntry {
+            mint_source: Some(CredentialMintSource::OauthConnector {
+                connection_id: "linear-default".into(),
+                provider: "linear".into(),
+            }),
+            ..mint_entry("stale-token", Some(Utc::now() + Duration::minutes(1)))
+        };
+        let r = StubRefresher {
+            calls: Default::default(),
+            result: Some(RefreshedInject {
+                secret: "fresh-token".into(),
+                expires_at: Utc::now() + Duration::hours(24),
+            }),
+        };
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(e.secret(), "fresh-token");
+        assert_eq!(
+            e.header_template.replace("{}", &e.secret()),
+            "Bearer fresh-token"
+        );
+    }
+
+    #[tokio::test]
     async fn connection_entry_keeps_a_fresh_launch_time_credential() {
         let e = InjectEntry {
             mint_source: Some(CredentialMintSource::Connection {
