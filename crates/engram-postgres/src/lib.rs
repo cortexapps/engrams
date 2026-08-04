@@ -1531,7 +1531,8 @@ impl MetadataStore for PostgresStore {
                 UPDATE oauth_credentials SET
                     wrapped_dek = $4, nonce = $5, ciphertext = $6, key_id = $7,
                     account_metadata = $8, version = version + 1,
-                    updated_at = $9, revoked_at = NULL
+                    updated_at = $9, revoked_at = NULL, expires_at = $11,
+                    refresh_claim_until = NULL, broken_at = NULL, broken_reason = NULL
                 WHERE subject_kind = $1 AND subject_id = $2 AND provider = $3
                   AND version = $10
                 RETURNING *
@@ -1547,6 +1548,7 @@ impl MetadataStore for PostgresStore {
             .bind(metadata)
             .bind(now)
             .bind(expected)
+            .bind(credential.expires_at)
             .fetch_optional(&self.pool)
             .await
             .map_err(db_err)?
@@ -1556,8 +1558,8 @@ impl MetadataStore for PostgresStore {
                 INSERT INTO oauth_credentials (
                     subject_kind, subject_id, provider, wrapped_dek, nonce,
                     ciphertext, key_id, account_metadata, version, created_at,
-                    updated_at, revoked_at
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$9,NULL)
+                    updated_at, revoked_at, expires_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$9,NULL,$10)
                 ON CONFLICT (subject_kind, subject_id, provider) DO NOTHING
                 RETURNING *
                 "#,
@@ -1571,6 +1573,7 @@ impl MetadataStore for PostgresStore {
             .bind(&credential.key_id)
             .bind(metadata)
             .bind(now)
+            .bind(credential.expires_at)
             .fetch_optional(&self.pool)
             .await
             .map_err(db_err)?
@@ -1606,10 +1609,14 @@ impl MetadataStore for PostgresStore {
     async fn list_oauth_credentials(
         &self,
         subject_kind: engram_core::types::oauth::OAuthSubjectKind,
-        subject_id: &str,
+        subject_id: Option<&str>,
     ) -> Result<Vec<engram_core::types::oauth::SealedOAuthCredential>, MetaError> {
         sqlx::query(
-            "SELECT * FROM oauth_credentials WHERE subject_kind=$1 AND subject_id=$2 ORDER BY provider",
+            r#"
+            SELECT * FROM oauth_credentials
+            WHERE subject_kind=$1 AND ($2::text IS NULL OR subject_id=$2)
+            ORDER BY subject_id, provider
+            "#,
         )
         .bind(subject_kind.as_str())
         .bind(subject_id)
@@ -1813,6 +1820,170 @@ impl MetadataStore for PostgresStore {
                 ))
             } else {
                 Err(MetaError::NotFound)
+            }
+        }
+    }
+
+    async fn get_pending_oauth_flow(
+        &self,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+    ) -> Result<Option<engram_core::types::oauth::OAuthFlow>, MetaError> {
+        sqlx::query(
+            "SELECT * FROM oauth_flows WHERE subject_kind=$1 AND subject_id=$2 AND provider=$3 AND status='pending'",
+        )
+        .bind(key.subject_kind.as_str())
+        .bind(&key.subject_id)
+        .bind(&key.provider)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?
+        .map(|row| oauth_flow_from_pg(&row))
+        .transpose()
+    }
+
+    async fn finish_oauth_flow_unowned(
+        &self,
+        id: uuid::Uuid,
+        status: engram_core::types::oauth::OAuthFlowStatus,
+        error_code: Option<&str>,
+    ) -> Result<(), MetaError> {
+        if !status.is_terminal() {
+            return Err(MetaError::Conflict(
+                "flow finish status must be terminal".into(),
+            ));
+        }
+        let now = self.clock.now_utc();
+        let updated = sqlx::query(
+            r#"
+            UPDATE oauth_flows SET status=$2, error_code=$3, updated_at=$4
+            WHERE id=$1 AND status='pending' AND expires_at > $4
+            "#,
+        )
+        .bind(id)
+        .bind(status.as_str())
+        .bind(error_code)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if updated.rows_affected() == 1 {
+            Ok(())
+        } else {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM oauth_flows WHERE id=$1)")
+                    .bind(id)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(db_err)?;
+            if exists {
+                Err(MetaError::Conflict(
+                    "OAuth flow is no longer pending or has expired".into(),
+                ))
+            } else {
+                Err(MetaError::NotFound)
+            }
+        }
+    }
+
+    async fn list_oauth_credentials_due_for_refresh(
+        &self,
+        kind: engram_core::types::oauth::OAuthSubjectKind,
+        now: chrono::DateTime<chrono::Utc>,
+        due_before: chrono::DateTime<chrono::Utc>,
+        limit: i64,
+    ) -> Result<Vec<engram_core::types::oauth::SealedOAuthCredential>, MetaError> {
+        sqlx::query(
+            r#"
+            SELECT * FROM oauth_credentials
+            WHERE subject_kind = $1
+              AND expires_at IS NOT NULL AND expires_at <= $2
+              AND revoked_at IS NULL AND broken_at IS NULL
+              AND (refresh_claim_until IS NULL OR refresh_claim_until < $3)
+            ORDER BY expires_at ASC, subject_id, provider
+            LIMIT $4
+            "#,
+        )
+        .bind(kind.as_str())
+        .bind(due_before)
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?
+        .iter()
+        .map(oauth_credential_from_pg)
+        .collect()
+    }
+
+    async fn claim_oauth_refresh(
+        &self,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+        now: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE oauth_credentials SET refresh_claim_until = $5
+            WHERE subject_kind=$1 AND subject_id=$2 AND provider=$3
+              AND revoked_at IS NULL AND broken_at IS NULL
+              AND (refresh_claim_until IS NULL OR refresh_claim_until < $4)
+            "#,
+        )
+        .bind(key.subject_kind.as_str())
+        .bind(&key.subject_id)
+        .bind(&key.provider)
+        .bind(now)
+        .bind(until)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn mark_oauth_credential_broken(
+        &self,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+        expected_version: i64,
+        reason: &str,
+    ) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+        let now = self.clock.now_utc();
+        let row = sqlx::query(
+            r#"
+            UPDATE oauth_credentials SET
+                broken_at=$5, broken_reason=$6, refresh_claim_until=NULL, updated_at=$5
+            WHERE subject_kind=$1 AND subject_id=$2 AND provider=$3
+              AND version=$4 AND revoked_at IS NULL AND broken_at IS NULL
+            RETURNING *
+            "#,
+        )
+        .bind(key.subject_kind.as_str())
+        .bind(&key.subject_id)
+        .bind(&key.provider)
+        .bind(expected_version)
+        .bind(now)
+        .bind(reason)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match row {
+            Some(row) => oauth_credential_from_pg(&row),
+            None => {
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM oauth_credentials WHERE subject_kind=$1 AND subject_id=$2 AND provider=$3)",
+                )
+                .bind(key.subject_kind.as_str())
+                .bind(&key.subject_id)
+                .bind(&key.provider)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db_err)?;
+                if exists {
+                    Err(MetaError::Conflict(
+                        "OAuth credential version moved; reload the winner".into(),
+                    ))
+                } else {
+                    Err(MetaError::NotFound)
+                }
             }
         }
     }
@@ -8578,6 +8749,9 @@ fn oauth_credential_from_pg(
         created_at: row.try_get("created_at").map_err(db_err)?,
         updated_at: row.try_get("updated_at").map_err(db_err)?,
         revoked_at: row.try_get("revoked_at").map_err(db_err)?,
+        expires_at: row.try_get("expires_at").map_err(db_err)?,
+        broken_at: row.try_get("broken_at").map_err(db_err)?,
+        broken_reason: row.try_get("broken_reason").map_err(db_err)?,
     })
 }
 

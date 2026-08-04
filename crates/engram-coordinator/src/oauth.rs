@@ -50,6 +50,9 @@ impl OAuthDriverError {
 pub struct ValidatedOAuthBundle {
     pub payload: Vec<u8>,
     pub metadata: OAuthAccountMetadata,
+    /// Access-token expiry when the driver knows it (redirect drivers over
+    /// expiring providers); `None` for opaque device-flow caches.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[async_trait]
@@ -83,14 +86,21 @@ struct ActiveFlow {
 }
 
 pub struct OAuthManager {
-    meta: Arc<dyn MetadataStore>,
-    kek: Arc<dyn MasterKeyProvider>,
-    clock: Arc<dyn Clock>,
-    entropy: Arc<dyn Entropy>,
-    replica: String,
+    pub(crate) meta: Arc<dyn MetadataStore>,
+    pub(crate) kek: Arc<dyn MasterKeyProvider>,
+    pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) entropy: Arc<dyn Entropy>,
+    /// Org-secret resolution for connector redirect flows (client id/secret
+    /// refs). The coordinator is the only tier that reads these.
+    pub(crate) secrets: Arc<dyn engram_core::traits::SecretStore>,
+    pub(crate) replica: String,
     drivers: BTreeMap<String, Arc<dyn OAuthDriver>>,
     active: DashMap<uuid::Uuid, ActiveFlow>,
     concurrency: Arc<Semaphore>,
+    /// Per-key in-process single-flight for connector refresh: a burst of
+    /// resolvers refreshes once. Cross-replica dedup is the advisory claim
+    /// column; correctness is the version CAS.
+    pub(crate) refresh_flights: DashMap<OAuthCredentialKey, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl OAuthManager {
@@ -99,6 +109,7 @@ impl OAuthManager {
         kek: Arc<dyn MasterKeyProvider>,
         clock: Arc<dyn Clock>,
         entropy: Arc<dyn Entropy>,
+        secrets: Arc<dyn engram_core::traits::SecretStore>,
     ) -> Arc<Self> {
         let codex_bin = resolve_codex_bin();
         let driver: Arc<dyn OAuthDriver> = Arc::new(OpenAiCodexDriver { codex_bin });
@@ -113,10 +124,12 @@ impl OAuthManager {
             kek,
             clock,
             entropy,
+            secrets,
             replica,
             drivers,
             active: DashMap::new(),
             concurrency: Arc::new(Semaphore::new(16)),
+            refresh_flights: DashMap::new(),
         })
     }
 
@@ -267,10 +280,12 @@ impl OAuthManager {
         self.get_flow(subject, id).await
     }
 
+    /// `subject_id = None` lists every credential of the kind (the connector
+    /// status surface reads all connector credentials in one call).
     pub async fn list(
         &self,
         kind: OAuthSubjectKind,
-        subject_id: &str,
+        subject_id: Option<&str>,
     ) -> Result<Vec<SealedOAuthCredential>, OAuthServiceError> {
         Ok(self.meta.list_oauth_credentials(kind, subject_id).await?)
     }
@@ -348,7 +363,7 @@ impl OAuthManager {
             .await
     }
 
-    async fn publish_bundle(
+    pub(crate) async fn publish_bundle(
         &self,
         key: &OAuthCredentialKey,
         bundle: ValidatedOAuthBundle,
@@ -365,7 +380,7 @@ impl OAuthManager {
             .await
     }
 
-    async fn publish_bundle_at(
+    pub(crate) async fn publish_bundle_at(
         &self,
         key: &OAuthCredentialKey,
         bundle: ValidatedOAuthBundle,
@@ -387,6 +402,7 @@ impl OAuthManager {
                     ciphertext: sealed.ciphertext,
                     key_id: sealed.key_id,
                     metadata: bundle.metadata,
+                    expires_at: bundle.expires_at,
                 },
                 expected_version,
             )
@@ -394,7 +410,10 @@ impl OAuthManager {
         Ok(())
     }
 
-    async fn open(&self, row: &SealedOAuthCredential) -> Result<Vec<u8>, OAuthServiceError> {
+    pub(crate) async fn open(
+        &self,
+        row: &SealedOAuthCredential,
+    ) -> Result<Vec<u8>, OAuthServiceError> {
         let nonce: [u8; 12] = row
             .nonce
             .as_slice()
@@ -486,13 +505,15 @@ impl From<MetaError> for OAuthServiceError {
     }
 }
 
-fn validate_key(key: &OAuthCredentialKey) -> Result<(), OAuthServiceError> {
+pub(crate) fn validate_key(key: &OAuthCredentialKey) -> Result<(), OAuthServiceError> {
+    // Provider charset matches the connector-slug rule (`new_relic` carries
+    // an underscore).
     if key.subject_id.trim().is_empty()
         || key.provider.is_empty()
         || !key
             .provider
             .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     {
         return Err(OAuthServiceError::BadRequest(
             "invalid OAuth subject or provider".into(),
@@ -747,6 +768,7 @@ impl CodexAppServer {
                 workspace_id: None,
                 workspace_name: None,
             },
+            expires_at: None,
         })
     }
 

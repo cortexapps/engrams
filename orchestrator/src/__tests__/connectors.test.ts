@@ -435,6 +435,41 @@ describe("compileIntegrationPolicy", () => {
     ]);
   });
 
+  test("an oauth-facet connector compiles to a brokered-source inject (ADR 0106 addendum)", () => {
+    const linearRaw = {
+      provider: "linear",
+      protocol: "http",
+      credential: { source: "inject", injects: [{ header: "Authorization", template: "Bearer {}" }] },
+      hosts: ["api.linear.app"],
+      oauth: {
+        authorizeUrl: "https://linear.app/oauth/authorize",
+        acquisitionHosts: ["linear.app"],
+        tokenUrl: "https://api.linear.app/oauth/token",
+        scopes: ["read", "write"],
+        clientIdRef: "linear.client_id",
+        clientSecretRef: "linear.client_secret",
+      },
+      operations: [{ grants: ["graphql"], match: { operation: "query", field: "viewer" } }],
+    };
+    const policy = compileIntegrationPolicy(["linear:graphql"], registryOf(linearRaw));
+    expect(policy.injects).toEqual([
+      {
+        hosts: ["api.linear.app"],
+        header_name: "Authorization",
+        header_template: "Bearer {}",
+        secret_ref: "",
+        mint_source: { oauth_connector: { connection_id: "test-linear", provider: "linear" } },
+        methods: ["POST"],
+        path_globs: ["/graphql"],
+        graphql_operation: "query",
+        graphql_field: "viewer",
+      },
+    ]);
+    // The acquisition host is a browser-redirect surface only: the session
+    // egress allow-list opens the API host, never linear.app.
+    expect(policy.network.allow_hosts).toEqual(["api.linear.app"]);
+  });
+
   test("the resource suffix is ignored for inject gating", () => {
     const a = compileIntegrationPolicy(["datadog:logs:read"], reg);
     const b = compileIntegrationPolicy(["datadog:logs:read@idx-1"], reg);
@@ -693,7 +728,9 @@ describe("on-disk registry", () => {
     // emits a minted inject for github.
     expect(policy.injects.length).toBeGreaterThan(0);
     expect(policy.injects.every((i) =>
-      i.mint_source?.connection.connection_id === "test-github" &&
+      i.mint_source != null &&
+        "connection" in i.mint_source &&
+        i.mint_source.connection.connection_id === "test-github" &&
         i.mint_source.connection.provider === "github"
     )).toBe(true);
     // Two issue assets are observed: the REST create (POST /repos/*/issues, gated by
@@ -1060,6 +1097,91 @@ describe("cli facet (ADR 0058)", () => {
       GH_TOKEN: "x-engrams-managed",
     });
     expect(plan.bundles).toEqual([INTEGRATIONS_CLI_BUNDLE]);
+  });
+
+  test("the built-in linear seed is OAuth-only (actor=app) with product-area GraphQL powers", () => {
+    const linear = connectorRegistry().get("linear")!;
+    // OAuth-only: no secretRef on the inject; Bearer template for the app token.
+    expect(linear.credential.source).toBe("inject");
+    if (linear.credential.source === "inject") {
+      expect(linear.credential.injects).toEqual([{ header: "Authorization", template: "Bearer {}" }]);
+    }
+    expect(linear.oauth?.tokenUrl).toBe("https://api.linear.app/oauth/token");
+    expect(linear.oauth?.acquisitionHosts).toEqual(["linear.app"]);
+    expect(linear.oauth?.scopes).toEqual(["read", "write"]);
+    expect(linear.oauth?.extraAuthorizeParams).toEqual({ actor: "app" });
+    expect(linear.oauth?.metadata?.probe?.map.accountId).toBe("data.viewer.id");
+    // The authorize host is acquisition-plane only: session egress never
+    // opens linear.app.
+    expect(linear.hosts).toEqual(["api.linear.app"]);
+
+    // GitHub-style product-area powers over body-parsed GraphQL matches
+    // (ADR 0059): every op is a (operation, field) gate, reads are queries,
+    // writes are mutations, and the areas partition the curated field set.
+    const powers = new Set(linear.operations.flatMap((op) => op.grants));
+    expect([...powers].sort()).toEqual([
+      "issues:read",
+      "issues:write",
+      "org:read",
+      "projects:read",
+      "projects:write",
+    ]);
+    for (const op of linear.operations) {
+      expect(op.match && isGraphqlMatch(op.match)).toBe(true);
+      if (op.match && isGraphqlMatch(op.match)) {
+        const write = op.grants[0]!.endsWith(":write");
+        expect(op.match.operation).toBe(write ? "mutation" : "query");
+      }
+    }
+    // `projectUpdate` is both a query (the ProjectUpdate entity) and a
+    // mutation (update a project) — distinct (operation, field) gates.
+    const projectUpdateOps = linear.operations.filter(
+      (op) => op.match && isGraphqlMatch(op.match) && op.match.field === "projectUpdate",
+    );
+    expect(projectUpdateOps.map((op) => op.grants[0]).sort()).toEqual([
+      "projects:read",
+      "projects:write",
+    ]);
+
+    // A granted area compiles to brokered-source injects gating exactly its
+    // fields on POST /graphql.
+    const policy = compileIntegrationPolicy(["linear:issues:write"]);
+    expect(policy.injects.length).toBeGreaterThan(0);
+    for (const inj of policy.injects) {
+      expect(inj.mint_source).toEqual({
+        oauth_connector: { connection_id: "test-linear", provider: "linear" },
+      });
+      expect(inj.header_template).toBe("Bearer {}");
+      expect(inj.methods).toEqual(["POST"]);
+      expect(inj.path_globs).toEqual(["/graphql"]);
+      expect(inj.graphql_operation).toBe("mutation");
+    }
+    // Write mutations observe as assets/actions (GraphQL asset-parity
+    // rules: response-first data with $.vars fallbacks; issue identifiers
+    // additionally derive from the returned URL).
+    const observes = new Map(policy.observes.map((o) => [o.graphql_field, o]));
+    const issueCreate = observes.get("issueCreate")!;
+    expect(issueCreate.provider).toBe("linear");
+    expect(issueCreate.asset_kind).toBe("issue");
+    expect(issueCreate.surface).toBe("asset");
+    expect(issueCreate.success_no_graphql_errors).toBe(true);
+    expect(issueCreate.data).toContainEqual(["title", "$.vars.input.title"]);
+    // Flat-variable clients (the bundled CLI inlines the input literal and
+    // passes {"title": ...}) resolve through the second fallback.
+    expect(issueCreate.data).toContainEqual(["title", "$.vars.title"]);
+    expect(issueCreate.fetchable).toBe("$.resp.data.issueCreate.issue.url");
+    expect(issueCreate.url_fallback?.pattern).toBe(
+      "https://linear.app/{workspace}/issue/{identifier}/{slug}",
+    );
+    expect(observes.get("issueUpdate")?.surface).toBe("action");
+    expect(observes.get("commentCreate")?.surface).toBe("action");
+    // Reads observe nothing.
+    const readPolicy = compileIntegrationPolicy(["linear:issues:read"]);
+    expect(readPolicy.observes).toEqual([]);
+    expect(policy.injects.some((i) => i.graphql_field === "issueCreate")).toBe(true);
+
+    expect(policy.injects.some((i) => i.graphql_field === "issues")).toBe(false);
+    expect(policy.network.allow_hosts).toEqual(["api.linear.app"]);
   });
 
   test("the built-in slack seed ships the slack CLI + an auth.test gate", () => {

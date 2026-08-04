@@ -328,6 +328,34 @@ fn session_egress_policy_google() -> SessionEgressPolicy {
     }
 }
 
+/// Wire v24 (ADR 0106 addendum): a policy whose inject rides the
+/// `OauthConnector` mint source — a connector OAuth access token resolved
+/// from the coordinator's sealed store. Unlike `Connection` mints the entry
+/// keeps its REAL header template (`Bearer {}`) with the raw token as the
+/// secret, so a refresh only supplies a new raw token. Pins the trailing
+/// variant's encoding (index 1) inside a fully-populated entry.
+fn session_egress_policy_oauth() -> SessionEgressPolicy {
+    SessionEgressPolicy {
+        injects: vec![EgressInjectEntry {
+            secret: "linear-access-token".into(),
+            header_name: "Authorization".into(),
+            header_template: "Bearer {}".into(),
+            allow_hosts: vec!["api.linear.app".into()],
+            allow_host_patterns: vec![],
+            methods: vec!["POST".into()],
+            path_globs: vec!["/graphql".into()],
+            graphql_operation: String::new(),
+            graphql_field: String::new(),
+            mint_source: Some(CredentialMintSource::OauthConnector {
+                connection_id: "linear-default".into(),
+                provider: "linear".into(),
+            }),
+            expires_at: Some(DateTime::from_timestamp(1_770_003_600, 0).unwrap()),
+        }],
+        ..session_egress_policy()
+    }
+}
+
 fn cow_state() -> CowState {
     CowState {
         disk_manifest: fixed_manifest_ref(0x40, 7),
@@ -407,6 +435,10 @@ fn struct_payloads_golden() {
         "session_egress_policy_google",
         &session_egress_policy_google(),
     );
+    assert_golden_no_eq(
+        "session_egress_policy_oauth",
+        &session_egress_policy_oauth(),
+    );
     assert_golden_no_eq("cow_state", &cow_state());
     assert_golden_no_eq(
         "cow_state_record",
@@ -460,6 +492,14 @@ fn nested_enum_variant_indices() {
         },
         0,
         "CredentialMintSource::Connection",
+    );
+    assert_variant_index(
+        &CredentialMintSource::OauthConnector {
+            connection_id: "linear-default".into(),
+            provider: "linear".into(),
+        },
+        1,
+        "CredentialMintSource::OauthConnector",
     );
 
     assert_golden("network_default_allow", &NetworkDefault::Allow);
@@ -588,8 +628,12 @@ fn wire_version_pinned() {
     // lockstep. All three session-egress-policy goldens were regenerated, and
     // the `session_egress_policy_google` fixture now pins the `Some(Gce)`
     // encoding beside the `None` case the other two carry.
+    // 23 -> 24: ADR 0106 addendum — `CredentialMintSource` gains the TRAILING
+    // `OauthConnector` variant (connector OAuth on the inject rail). Existing
+    // goldens keep their bytes (trailing-variant addition); the oauth-policy
+    // golden is ADDED and the variant index is pinned at 1.
     assert_eq!(
-        WIRE_VERSION, 23,
+        WIRE_VERSION, 24,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
@@ -633,6 +677,10 @@ fn regen_golden() {
     write(
         "session_egress_policy_google",
         &session_egress_policy_google(),
+    );
+    write(
+        "session_egress_policy_oauth",
+        &session_egress_policy_oauth(),
     );
     write("cow_state", &cow_state());
     write(

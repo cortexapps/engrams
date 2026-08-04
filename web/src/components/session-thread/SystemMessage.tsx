@@ -211,6 +211,7 @@ function IntegrationAsset({ marker }: { marker: IntegrationAssetMarker }) {
   // pull_request is GitHub-shaped regardless of the provider id minting it
   // (the legacy "forge" name and the current "github" both map here).
   if (marker.assetKind === "pull_request") return <PullRequestCard marker={marker} />;
+  if (marker.assetKind === "issue") return <IssueCard marker={marker} />;
   return <GenericAsset marker={marker} />;
 }
 
@@ -275,6 +276,53 @@ function PullRequestCard({ marker }: { marker: IntegrationAssetMarker }) {
               {baseBranch}
             </Badge>
           </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// Built-in renderer for `issue` across providers: GitHub-shaped data carries
+// `repo` + `number`, Linear-shaped data carries `identifier` (ENG-331). The
+// reference renders in the header row and the title is the linked headline —
+// the same layout as the pull-request card.
+function IssueCard({ marker }: { marker: IntegrationAssetMarker }) {
+  const identity = useProviderIdentity(marker.provider);
+  const url = marker.fetchable?.kind === "external" ? marker.fetchable.url : undefined;
+  const repo = dataStr(marker.data, "repo");
+  const number = dataNum(marker.data, "number");
+  const identifier = dataStr(marker.data, "identifier");
+  const reference =
+    repo != null && number != null ? `${repo} #${number}` : (identifier ?? undefined);
+  const title = dataStr(marker.data, "title") ?? reference ?? "issue";
+  return (
+    <Card className="py-0">
+      <CardContent className="flex flex-col gap-1.5 p-4">
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <ProviderTile {...identity.icon} name={identity.name} size={16} />
+          <Text as="span" variant="label">
+            issue
+          </Text>
+          {reference != null && title !== reference && (
+            <>
+              <span aria-hidden>·</span>
+              <span className="font-mono">{reference}</span>
+            </>
+          )}
+          <span className="ml-auto font-mono tabular-nums">{hms(marker.at)}</span>
+        </div>
+        {url ? (
+          <a
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            className="group inline-flex items-baseline gap-1 text-base font-medium hover:underline"
+          >
+            {title}
+            <ExternalLinkIcon className="size-3.5 shrink-0 self-center text-muted-foreground" />
+          </a>
+        ) : (
+          <span className="text-base font-medium">{title}</span>
         )}
       </CardContent>
     </Card>

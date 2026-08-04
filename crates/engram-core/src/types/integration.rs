@@ -97,6 +97,16 @@ pub enum CredentialMintSource {
         connection_id: String,
         provider: String,
     },
+    /// ADR 0106 addendum: the inject value is a connector OAuth access token
+    /// resolved from the coordinator's sealed credential store (subject =
+    /// the connection id) and proactively refreshed there. Unlike
+    /// `Connection` mints, the entry keeps its real header template and the
+    /// resolved value is the RAW token. NEVER a value. New variant appended
+    /// (bincode variant indexes are the wire): wire v24.
+    OauthConnector {
+        connection_id: String,
+        provider: String,
+    },
 }
 
 /// ADR 0057: one profile-defined secret the session injects. The value lives in
@@ -506,5 +516,43 @@ mod tests {
         assert_eq!(merged.network.allow_hosts, vec!["api.anthropic.com"]);
         assert!(merged.injects.is_empty());
         assert!(merged.secrets.is_empty());
+    }
+
+    /// Wire v24: the brokered-source union decodes both arms from JSON (the
+    /// persisted `integration_policy_json` shape) and old policies with the
+    /// pre-v24 `connection` arm keep decoding.
+    #[test]
+    fn credential_mint_source_json_compat() {
+        let old = r#"{"connection":{"connection_id":"github-default","provider":"github"}}"#;
+        let decoded: CredentialMintSource = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            decoded,
+            CredentialMintSource::Connection {
+                connection_id: "github-default".into(),
+                provider: "github".into(),
+            }
+        );
+
+        let oauth = CredentialMintSource::OauthConnector {
+            connection_id: "linear-default".into(),
+            provider: "linear".into(),
+        };
+        let json = serde_json::to_string(&oauth).unwrap();
+        assert_eq!(
+            json, r#"{"oauth_connector":{"connection_id":"linear-default","provider":"linear"}}"#,
+            "externally tagged, snake_case (the bincode-decodable form #931 requires)"
+        );
+        assert_eq!(
+            serde_json::from_str::<CredentialMintSource>(&json).unwrap(),
+            oauth
+        );
+
+        // An inject entry without a mint_source (every pre-existing static
+        // policy) still defaults to None.
+        let entry: IntegrationInject = serde_json::from_str(
+            r#"{"hosts":["api.linear.app"],"header_name":"Authorization","header_template":"{}"}"#,
+        )
+        .unwrap();
+        assert_eq!(entry.mint_source, None);
     }
 }

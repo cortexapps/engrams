@@ -42,7 +42,7 @@ export interface ConnectorView {
   credentialSource: "mint" | "inject";
   hosts: string[];
   capabilities: ConnectorCapabilityView[];
-  status: "connected" | "available";
+  status: "connected" | "available" | "needs_reconnect";
   builtin: boolean;
   /** How many profiles grant ≥1 of this provider's powers. */
   usedBy: number;
@@ -131,7 +131,9 @@ export function useConnectorViews(): ConnectorViewsResult {
           : "available"
         : row?.status === "connected"
           ? "connected"
-          : "available",
+          : row?.status === "needs_reconnect"
+            ? "needs_reconnect"
+            : "available",
       builtin: named ? true : (row?.builtin ?? false),
       usedBy: used.length,
       usedByProfiles: used.map((p) => ({ id: p.id, name: p.name, icon: p.icon })),

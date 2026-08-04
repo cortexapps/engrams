@@ -46,6 +46,8 @@ export function ProviderCard({
         </div>
         {connected ? (
           <StatusDot tone="nominal" label="connected" />
+        ) : view.status === "needs_reconnect" ? (
+          <StatusDot tone="caution" label="reconnect" />
         ) : (
           <span className="font-display text-[0.56rem] font-semibold tracking-[0.08em] text-muted-foreground/80 uppercase">
             {view.builtin ? "built-in" : view.credentialSource}

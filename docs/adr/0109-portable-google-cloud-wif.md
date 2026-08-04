@@ -140,6 +140,10 @@ headers.
 - WIF audit subjects can be correlated with engrams session audit records.
 - Kubernetes RBAC, database credentials, product API keys, and Google IAM remain
   separate authorization systems.
+- *(Amended 2026-08-03, ADR 0106 addendum:)* connection rows additionally serve
+  as the OAuth credential **subjects** for oauth-facet connectors
+  (`oauth_credentials.subject_id` = the connection id). The rows themselves
+  still never carry a credential.
 
 ## Phasing
 

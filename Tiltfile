@@ -66,9 +66,31 @@ def read_env_file(path):
 # that forced a kill-Tilt-and-restart). `just bootstrap` generates the
 # KEK on first run and no-ops if present, so run it HERE, at parse time,
 # ahead of the read — not as a runtime resource.
+#
+# Git worktrees share one dev identity (the dev Postgres/GCS are
+# machine-global, so sealed data must unseal from every worktree):
+# `bootstrap` targets the PRIMARY checkout's .env, `dev-link-shared`
+# symlinks var/shared + var/bundles there, and the env read below is a
+# two-layer merge — the shared .env first, the worktree-local .env on
+# top (local wins for overrides; the KEK only ever lives in the shared
+# file, which bootstrap enforces). In the primary checkout the shared
+# root IS the repo root, so all of this collapses to the old behavior.
 local('just bootstrap', echo_off=True, quiet=True)
+local('just dev-link-shared', echo_off=True, quiet=True)
 
-env_file = read_env_file('.env')
+_shared_root = str(local(
+    'cd "$(git rev-parse --git-common-dir)/.." && pwd',
+    echo_off=True, quiet=True,
+)).strip()
+
+def merged_env_file():
+    merged = {}
+    if _shared_root and _shared_root != os.path.abspath('.'):
+        merged.update(read_env_file(os.path.join(_shared_root, '.env')))
+    merged.update(read_env_file('.env'))
+    return merged
+
+env_file = merged_env_file()
 
 def env_or(key, default):
     """Look up a value: .env first, then process env, then default."""

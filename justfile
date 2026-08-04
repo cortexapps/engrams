@@ -143,23 +143,103 @@ trace-down:
     docker compose -f deploy/docker-compose.dev.yml stop jaeger
 
 # Generate a 32-byte master key (KEK) for envelope-encrypted
-# registry credentials and write it into `.env` for direnv/`just`
-# to pick up. Idempotent: if `.env` already has ENGRAM_KEK_MASTER_KEY
-# set, leaves it alone. Run once per dev box.
+# registry credentials and write it into the SHARED `.env` — the primary
+# checkout's, discovered via `git rev-parse --git-common-dir`. All git
+# worktrees of one clone share it, because the dev Postgres/GCS are
+# machine-global: data sealed under one KEK must unseal from every
+# worktree. In the primary checkout the shared file IS `./.env`, so
+# behavior there is unchanged. Idempotent. A worktree-local `.env` keeps
+# working for overrides (backend, kernel paths, ...) but may never carry
+# a KEK — bootstrap strips one (adopting it into the shared file when
+# the shared file lacks a KEK; discarding it loudly otherwise, since
+# sealed state lives under the shared KEK).
 bootstrap:
-    @set -e; \
-    [ -f .env ] || touch .env ; \
-    if grep -q '^ENGRAM_KEK_MASTER_KEY=' .env 2>/dev/null; then \
-        echo "ENGRAM_KEK_MASTER_KEY already present in .env — leaving as-is" ; \
-    else \
-        if command -v openssl >/dev/null 2>&1; then \
-            KEY=$(openssl rand -base64 32) ; \
-        else \
-            KEY=$(head -c 32 /dev/urandom | base64) ; \
-        fi ; \
-        printf 'ENGRAM_KEK_MASTER_KEY=%s\n' "$KEY" >> .env ; \
-        echo "wrote ENGRAM_KEK_MASTER_KEY to .env (32 random bytes, base64)" ; \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    shared="$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"
+    env_file="$shared/.env"
+    [ -f "$env_file" ] || touch "$env_file"
+    in_worktree=0
+    [ "$shared" != "$(pwd)" ] && in_worktree=1
+    local_kek=""
+    if [ "$in_worktree" = 1 ] && [ -f .env ]; then
+        local_kek="$(grep '^ENGRAM_KEK_MASTER_KEY=' .env | head -1 || true)"
     fi
+    if grep -q '^ENGRAM_KEK_MASTER_KEY=' "$env_file"; then
+        echo "ENGRAM_KEK_MASTER_KEY already present in $env_file — leaving as-is"
+    elif [ -n "$local_kek" ]; then
+        # First shared-aware run of a clone whose only KEK lives in a
+        # worktree: adopt it rather than minting a competing one.
+        printf '%s\n' "$local_kek" >> "$env_file"
+        echo "adopted the worktree's ENGRAM_KEK_MASTER_KEY into $env_file"
+    else
+        if command -v openssl >/dev/null 2>&1; then
+            KEY=$(openssl rand -base64 32)
+        else
+            KEY=$(head -c 32 /dev/urandom | base64)
+        fi
+        printf 'ENGRAM_KEK_MASTER_KEY=%s\n' "$KEY" >> "$env_file"
+        echo "wrote ENGRAM_KEK_MASTER_KEY to $env_file (32 random bytes, base64)"
+    fi
+    if [ -n "$local_kek" ]; then
+        shared_kek="$(grep '^ENGRAM_KEK_MASTER_KEY=' "$env_file" | head -1)"
+        if [ "$local_kek" != "$shared_kek" ]; then
+            echo "WARNING: worktree .env carried a DIFFERENT KEK than $env_file — discarding it (sealed dev data lives under the shared KEK)" >&2
+        fi
+        grep -v '^ENGRAM_KEK_MASTER_KEY=' .env > .env.tmp && mv .env.tmp .env
+        echo "stripped ENGRAM_KEK_MASTER_KEY from the worktree .env (the shared file owns it)"
+    fi
+
+# Point this worktree's `var/shared` (content-addressed bundle store +
+# stamp) and `var/bundles` (unpacked Process-backend trees) at the
+# primary checkout's, so every worktree reuses the same baked bundles
+# and build cache instead of re-baking from scratch. A no-op in the
+# primary checkout. Existing real dirs are adopted: content-addressed
+# files merge in (identical names are identical bytes), then the dir is
+# replaced by a symlink. Safe concurrently — only one tilt stack can run
+# at a time (machine-global compose ports).
+dev-link-shared:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    shared="$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"
+    if [ "$shared" = "$(pwd)" ]; then
+        exit 0
+    fi
+    mkdir -p var
+    for d in shared bundles; do
+        tgt="$shared/var/$d"
+        loc="var/$d"
+        mkdir -p "$tgt"
+        if [ -L "$loc" ]; then
+            if [ "$(readlink "$loc")" != "$tgt" ]; then
+                rm "$loc"
+                ln -s "$tgt" "$loc"
+            fi
+            continue
+        fi
+        if [ -d "$loc" ]; then
+            # Adopt: merge content-addressed artifacts + cache fingerprints,
+            # keep the shared copy on any name collision, drop the rest
+            # (everything under var/ is regenerable).
+            shopt -s nullglob dotglob
+            for f in "$loc"/*; do
+                base="$(basename "$f")"
+                if [ "$base" = ".fingerprints" ] && [ -d "$f" ]; then
+                    mkdir -p "$tgt/.fingerprints"
+                    for fp in "$f"/*; do
+                        mv -n "$fp" "$tgt/.fingerprints/" 2>/dev/null || true
+                    done
+                elif [ -f "$f" ]; then
+                    mv -n "$f" "$tgt/" 2>/dev/null || true
+                fi
+            done
+            shopt -u nullglob dotglob
+            rm -rf "$loc"
+            echo "adopted $loc into $tgt"
+        fi
+        ln -s "$tgt" "$loc"
+        echo "linked $loc -> $tgt"
+    done
 
 # psql into the dev Postgres.
 psql:
@@ -594,8 +674,9 @@ pull-kernel:
 # them in instead of mounting a squashfs. `skills` is a plain copy;
 # `integrations-cli`/`browser`/`ide` need Docker (glibc builds) and are
 # best-effort — skip them and only skills get wired (no browser/IDE tooling in
-# dev). Re-run after editing a skill.
-bundles:
+# dev). Re-run after editing a skill. Depends on dev-link-shared so a fresh
+# worktree stages into the shared store, never a divergent local dir.
+bundles: dev-link-shared
     deploy/bundles/skills/build.sh --stage var/bundles/skills
     deploy/bundles/integrations-cli/build.sh --stage var/bundles/integrations-cli \
         || echo "integrations-cli bundle skipped (needs Docker) — dev sessions get no integration CLIs"
@@ -620,8 +701,10 @@ bundles:
 # (the Docker bundles each cost a container + apt-get + several downloads, paid
 # on every Tilt trigger before this). Run with ENGRAM_BUNDLES_FORCE=1 to ignore
 # the cache — the fingerprint covers tracked files and pinned versions, not the
-# floating apt/base-image layers the Docker bundles pull.
-bundles-squashfs:
+# floating apt/base-image layers the Docker bundles pull. Depends on
+# dev-link-shared so a fresh worktree builds into (and reuses) the shared
+# content-addressed store, never a divergent local dir.
+bundles-squashfs: dev-link-shared
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p var/shared

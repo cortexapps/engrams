@@ -252,6 +252,7 @@ url = "2"
 async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 sha2 = "0.10"
+hmac = "0.12"
 
 # property-based testing (ADR 0099 H3/H4). Dev-dependency only; the
 # persisted `proptest-regressions/` seeds turn every counterexample into a

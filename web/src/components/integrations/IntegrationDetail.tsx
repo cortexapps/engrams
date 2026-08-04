@@ -151,6 +151,9 @@ function DetailBody({ view }: { view: ConnectorView }) {
                 {view.name}
               </h1>
               {view.status === "connected" && <StatusDot tone="nominal" label="connected" />}
+              {view.status === "needs_reconnect" && (
+                <StatusDot tone="caution" label="reconnect required" />
+              )}
             </div>
             <div className="mt-1 flex items-center gap-2.5 text-sm text-muted-foreground">
               <Text variant="label" tone="muted" className="text-[0.56rem]">
@@ -159,6 +162,21 @@ function DetailBody({ view }: { view: ConnectorView }) {
               <span>· {view.builtin ? "built-in" : "custom"}</span>
             </div>
           </div>
+          {view.status === "needs_reconnect" && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                // The provider revoked or rotated away our grant: run a fresh
+                // consent flow (force re-approval) and CAS-replace the sealed
+                // credential.
+                window.location.href = `/api/v1/integrations/${encodeURIComponent(view.provider)}/oauth/authorize?force=1`;
+              }}
+            >
+              <RotateCcwIcon className="size-3.5" />
+              Reconnect
+            </Button>
+          )}
           <Button variant="outline" size="sm" onClick={runTest} disabled={test.isPending}>
             {test.isPending ? (
               <>
@@ -224,8 +242,11 @@ function DetailBody({ view }: { view: ConnectorView }) {
             ) : (
               <div className="mt-1.5 flex flex-col gap-0.5 font-mono text-xs text-muted-foreground">
                 {(cfg?.injects ?? []).map((inj) => (
-                  <div key={inj.secretRef}>
-                    org secret · {inj.secretRef} · header {inj.header}: {inj.template}
+                  <div key={inj.header}>
+                    {inj.secretRef
+                      ? `org secret · ${inj.secretRef} · `
+                      : "server-brokered OAuth token · "}
+                    header {inj.header}: {inj.template}
                   </div>
                 ))}
               </div>

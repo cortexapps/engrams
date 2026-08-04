@@ -3,8 +3,9 @@
 //! resolved coordinator-side (KEK-unseal / mint) and either used to make the call
 //! here (`run_integration_op`, Mode A — secret never leaves the coordinator) or
 //! handed back to the orchestrator (`resolve_integration_credential`, Mode B — for
-//! an off-the-shelf SDK). Mirrors `grpc_app::mint::run_connector_test`, generalized
-//! from a benign GET to an arbitrary request.
+//! an off-the-shelf SDK). Subsumes the retired `MintService.RunConnectorTest`:
+//! the connect sheet's "Test" is a `RunIntegrationOp` GET whose spec carries
+//! draft overrides.
 //!
 //! Kept out of `grpc_app/` on purpose: the auth-convention test there counts one
 //! `self.auth.check` per `async fn`, so the helper async fns live here and the RPC
@@ -43,7 +44,7 @@ pub async fn run_integration_op(
     let mut builder = http.request(method, &url);
 
     let spec = req.credential.unwrap_or_default();
-    builder = apply_credential(state, &spec, builder).await?;
+    builder = apply_credential(state, &req.provider, &spec, builder).await?;
 
     if !req.body.is_empty() {
         let ct = if req.content_type.is_empty() {
@@ -99,6 +100,28 @@ pub async fn resolve_integration_credential(
         "integration credential resolved to the orchestrator (Mode B)"
     );
     let spec = req.credential.unwrap_or_default();
+    // Drafts are a connect-sheet test affordance; they never come back as a
+    // resolved credential.
+    if !spec.mint_draft_fields.is_empty() || spec.injects.iter().any(|i| !i.draft_secret.is_empty())
+    {
+        return Err("draft credentials cannot be resolved to the orchestrator".to_string());
+    }
+
+    // ADR 0106 addendum: an oauth-facet connector's credential is the sealed,
+    // coordinator-refreshed access token. Real `expires_at` rides back so the
+    // orchestrator's SDK cache re-resolves on time.
+    if !spec.oauth_connection_id.is_empty() {
+        let token = resolve_oauth_token(state, &req.provider, &spec.oauth_connection_id).await?;
+        return Ok(app::ResolvedCredential {
+            cred: Some(app::resolved_credential::Cred::Bearer(app::BearerCred {
+                token: token.secret,
+            })),
+            expires_at: token
+                .expires_at
+                .map(|at| at.to_rfc3339())
+                .unwrap_or_default(),
+        });
+    }
 
     if spec.source == "mint" {
         let scoped = mint_scoped(state, &spec.mint_provider).await?;
@@ -137,19 +160,70 @@ pub async fn resolve_integration_credential(
     })
 }
 
-/// Attach the resolved credential to an outbound request builder. For inject, apply
-/// every declared header (templated); for mint, attach the provider's own header.
+/// Resolve a connector-OAuth token from the sealed store (ADR 0106 addendum).
+async fn resolve_oauth_token(
+    state: &SharedState,
+    provider: &str,
+    connection_id: &str,
+) -> Result<crate::oauth_refresh::ResolvedConnectorToken, String> {
+    let key = engram_core::types::oauth::OAuthCredentialKey {
+        subject_kind: engram_core::types::oauth::OAuthSubjectKind::Connector,
+        subject_id: connection_id.to_string(),
+        provider: provider.to_string(),
+    };
+    state
+        .oauth
+        .resolve_connector_token(&key)
+        .await
+        .map_err(|e| format!("connector OAuth credential unavailable: {}", e.code()))
+}
+
+/// Attach the resolved credential to an outbound request builder. For inject,
+/// apply every declared header (templated, draft override honored); for mint,
+/// attach the provider's own header (draft fields build a probe engine); for a
+/// connector-OAuth spec, render the store-resolved access token.
 async fn apply_credential(
     state: &SharedState,
+    provider: &str,
     spec: &app::CredentialSpec,
     builder: reqwest::RequestBuilder,
 ) -> Result<reqwest::RequestBuilder, String> {
+    if !spec.oauth_connection_id.is_empty() {
+        let token = resolve_oauth_token(state, provider, &spec.oauth_connection_id).await?;
+        let (header_name, template) = spec
+            .injects
+            .first()
+            .map(|inj| (inj.header.as_str(), inj.template.as_str()))
+            .unwrap_or(("", ""));
+        let header_name = if header_name.is_empty() {
+            "Authorization"
+        } else {
+            header_name
+        };
+        let template = if template.is_empty() {
+            "Bearer {}"
+        } else {
+            template
+        };
+        return Ok(builder.header(header_name, template.replace("{}", &token.secret)));
+    }
     if spec.source == "mint" {
-        let engine = state
-            .integrations
-            .resolve(&spec.mint_provider, &state.services.secrets)
-            .await
-            .ok_or_else(|| "mint credentials are not configured".to_string())?;
+        // Draft fields (the connect sheet's pre-save "Test") build a one-shot
+        // engine from the mint-kind registry; otherwise resolve the stored one.
+        let engine = if !spec.mint_draft_fields.is_empty() {
+            let desc = crate::integrations::mint_kind_registry()
+                .into_iter()
+                .find(|d| d.kind == spec.mint_kind)
+                .ok_or_else(|| format!("unknown mint kind {:?}", spec.mint_kind))?;
+            (desc.build)(&spec.mint_draft_fields)
+                .map_err(|e| format!("invalid credentials: {e}"))?
+        } else {
+            state
+                .integrations
+                .resolve(&spec.mint_provider, &state.services.secrets)
+                .await
+                .ok_or_else(|| "mint credentials are not configured".to_string())?
+        };
         let hint = CredentialHint {
             served_host: None,
             owner: None,
@@ -168,7 +242,11 @@ async fn apply_credential(
     }
     let mut b = builder;
     for inj in &spec.injects {
-        let value = resolve_secret(state, &inj.secret_ref).await?;
+        let value = if !inj.draft_secret.is_empty() {
+            inj.draft_secret.clone()
+        } else {
+            resolve_secret(state, &inj.secret_ref).await?
+        };
         let header_name = if inj.header.is_empty() {
             "Authorization"
         } else {
@@ -200,101 +278,6 @@ async fn mint_scoped(state: &SharedState, provider: &str) -> Result<ScopedCreden
         .mint_credential(&[], &hint)
         .await
         .map_err(|e| format!("could not mint a token: {e}"))
-}
-
-/// Build a full OAuth authorize URL from the stored client id + the orchestrator's
-/// redirect/state. The coordinator is the only tier that can read the client-id org
-/// secret, so the URL is assembled here.
-pub async fn begin_integration_oauth(
-    state: &SharedState,
-    req: app::BeginIntegrationOauthRequest,
-) -> Result<String, String> {
-    let client_id = resolve_secret(state, &req.client_id_ref).await?;
-    let mut url = reqwest::Url::parse(&req.authorize_url)
-        .map_err(|e| format!("invalid authorize_url: {e}"))?;
-    {
-        let mut q = url.query_pairs_mut();
-        q.append_pair("client_id", &client_id);
-        q.append_pair("redirect_uri", &req.redirect_uri);
-        q.append_pair("state", &req.state);
-        if !req.scopes.is_empty() {
-            // Slack bot scopes are comma-delimited (the common form for OAuth v2).
-            // A provider needing space-delimited scopes would add a facet field.
-            q.append_pair("scope", &req.scopes.join(","));
-        }
-    }
-    Ok(url.to_string())
-}
-
-/// Exchange an authorization code for an access token and write it to the org
-/// store. Reads the client id + secret (org secrets); the token never returns to
-/// the caller. A provider that 200s with an error body (Slack: `{"ok":false}`) is
-/// caught by the missing/empty token field.
-pub async fn complete_integration_oauth(
-    state: &SharedState,
-    req: app::CompleteIntegrationOauthRequest,
-) -> Result<(bool, String), String> {
-    let client_id = resolve_secret(state, &req.client_id_ref).await?;
-    let client_secret = resolve_secret(state, &req.client_secret_ref).await?;
-    let http = reqwest::Client::builder()
-        .user_agent("engram-integration-oauth")
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
-    let form = [
-        ("client_id", client_id.as_str()),
-        ("client_secret", client_secret.as_str()),
-        ("code", req.code.as_str()),
-        ("redirect_uri", req.redirect_uri.as_str()),
-        ("grant_type", "authorization_code"),
-    ];
-    let resp = http
-        .post(&req.token_url)
-        .form(&form)
-        .send()
-        .await
-        .map_err(|e| format!("token exchange request failed: {e}"))?;
-    let status = resp.status().as_u16();
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("token response was not JSON: {e}"))?;
-    // Provider-agnostic extraction: the configured top-level field (a leading
-    // "$." is tolerated).
-    let field = req.token_response_path.trim_start_matches("$.");
-    let token = json.get(field).and_then(|v| v.as_str()).unwrap_or("");
-    if token.is_empty() {
-        let err = json
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("no access token in response");
-        return Ok((
-            false,
-            format!("OAuth exchange failed (HTTP {status}): {err}"),
-        ));
-    }
-    let sealed = crate::org_secrets::seal_org_secret(
-        &*state.services.kek,
-        &req.token_secret_ref,
-        token.as_bytes(),
-    )
-    .await
-    .map_err(|e| format!("seal token: {e}"))?;
-    state
-        .services
-        .meta
-        .upsert_org_secret(sealed)
-        .await
-        .map_err(|e| format!("store token: {e}"))?;
-    tracing::info!(
-        provider = %req.provider,
-        secret = %req.token_secret_ref,
-        "OAuth access token acquired and stored"
-    );
-    Ok((
-        true,
-        format!("Connected {} — access token stored", req.provider),
-    ))
 }
 
 /// Resolve one org secret by name (KEK-unseal via the composed SecretStore).

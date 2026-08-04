@@ -10,160 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/integration_op.proto.
  */
 export const file_engram_app_v1_integration_op: GenFile = /*@__PURE__*/
-  fileDesc("CiJlbmdyYW0vYXBwL3YxL2ludGVncmF0aW9uX29wLnByb3RvEg1lbmdyYW0uYXBwLnYxIpMBChxCZWdpbkludGVncmF0aW9uT2F1dGhSZXF1ZXN0EhAKCHByb3ZpZGVyGAEgASgJEhUKDWF1dGhvcml6ZV91cmwYAiABKAkSDgoGc2NvcGVzGAMgAygJEhUKDWNsaWVudF9pZF9yZWYYBCABKAkSFAoMcmVkaXJlY3RfdXJpGAUgASgJEg0KBXN0YXRlGAYgASgJIjYKHUJlZ2luSW50ZWdyYXRpb25PYXV0aFJlc3BvbnNlEhUKDWF1dGhvcml6ZV91cmwYASABKAki0wEKH0NvbXBsZXRlSW50ZWdyYXRpb25PYXV0aFJlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkSEQoJdG9rZW5fdXJsGAIgASgJEhUKDWNsaWVudF9pZF9yZWYYAyABKAkSGQoRY2xpZW50X3NlY3JldF9yZWYYBCABKAkSFAoMcmVkaXJlY3RfdXJpGAUgASgJEgwKBGNvZGUYBiABKAkSGAoQdG9rZW5fc2VjcmV0X3JlZhgHIAEoCRIbChN0b2tlbl9yZXNwb25zZV9wYXRoGAggASgJIj8KIENvbXBsZXRlSW50ZWdyYXRpb25PYXV0aFJlc3BvbnNlEgoKAm9rGAEgASgIEg8KB21lc3NhZ2UYAiABKAkiQAoIT3BJbmplY3QSDgoGaGVhZGVyGAEgASgJEhAKCHRlbXBsYXRlGAIgASgJEhIKCnNlY3JldF9yZWYYAyABKAkiYQoOQ3JlZGVudGlhbFNwZWMSDgoGc291cmNlGAEgASgJEigKB2luamVjdHMYAiADKAsyFy5lbmdyYW0uYXBwLnYxLk9wSW5qZWN0EhUKDW1pbnRfcHJvdmlkZXIYAyABKAkirgEKF1J1bkludGVncmF0aW9uT3BSZXF1ZXN0EhAKCHByb3ZpZGVyGAEgASgJEgwKBGhvc3QYAiABKAkSDgoGbWV0aG9kGAMgASgJEgwKBHBhdGgYBCABKAkSDAoEYm9keRgFIAEoDBIUCgxjb250ZW50X3R5cGUYBiABKAkSMQoKY3JlZGVudGlhbBgHIAEoCzIdLmVuZ3JhbS5hcHAudjEuQ3JlZGVudGlhbFNwZWMiYQoYUnVuSW50ZWdyYXRpb25PcFJlc3BvbnNlEg4KBnN0YXR1cxgBIAEoDRIMCgRib2R5GAIgASgMEhQKDGNvbnRlbnRfdHlwZRgDIAEoCRIRCgl0cnVuY2F0ZWQYBCABKAgiagojUmVzb2x2ZUludGVncmF0aW9uQ3JlZGVudGlhbFJlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkSMQoKY3JlZGVudGlhbBgCIAEoCzIdLmVuZ3JhbS5hcHAudjEuQ3JlZGVudGlhbFNwZWMi5QEKElJlc29sdmVkQ3JlZGVudGlhbBIrCgZiZWFyZXIYASABKAsyGS5lbmdyYW0uYXBwLnYxLkJlYXJlckNyZWRIABIpCgViYXNpYxgCIAEoCzIYLmVuZ3JhbS5hcHAudjEuQmFzaWNDcmVkSAASLQoHaGVhZGVycxgDIAEoCzIaLmVuZ3JhbS5hcHAudjEuSGVhZGVyc0NyZWRIABIsCgdhd3Nfc3RzGAQgASgLMhkuZW5ncmFtLmFwcC52MS5Bd3NTdHNDcmVkSAASEgoKZXhwaXJlc19hdBgKIAEoCUIGCgRjcmVkIhsKCkJlYXJlckNyZWQSDQoFdG9rZW4YASABKAkiLwoJQmFzaWNDcmVkEhAKCHVzZXJuYW1lGAEgASgJEhAKCHBhc3N3b3JkGAIgASgJInQKC0hlYWRlcnNDcmVkEjYKBnZhbHVlcxgBIAMoCzImLmVuZ3JhbS5hcHAudjEuSGVhZGVyc0NyZWQuVmFsdWVzRW50cnkaLQoLVmFsdWVzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASJVCgpBd3NTdHNDcmVkEhUKDWFjY2Vzc19rZXlfaWQYASABKAkSGQoRc2VjcmV0X2FjY2Vzc19rZXkYAiABKAkSFQoNc2Vzc2lvbl90b2tlbhgDIAEoCSJdCiRSZXNvbHZlSW50ZWdyYXRpb25DcmVkZW50aWFsUmVzcG9uc2USNQoKY3JlZGVudGlhbBgBIAEoCzIhLmVuZ3JhbS5hcHAudjEuUmVzb2x2ZWRDcmVkZW50aWFsMvYDChRJbnRlZ3JhdGlvbk9wU2VydmljZRJjChBSdW5JbnRlZ3JhdGlvbk9wEiYuZW5ncmFtLmFwcC52MS5SdW5JbnRlZ3JhdGlvbk9wUmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuUnVuSW50ZWdyYXRpb25PcFJlc3BvbnNlEocBChxSZXNvbHZlSW50ZWdyYXRpb25DcmVkZW50aWFsEjIuZW5ncmFtLmFwcC52MS5SZXNvbHZlSW50ZWdyYXRpb25DcmVkZW50aWFsUmVxdWVzdBozLmVuZ3JhbS5hcHAudjEuUmVzb2x2ZUludGVncmF0aW9uQ3JlZGVudGlhbFJlc3BvbnNlEnIKFUJlZ2luSW50ZWdyYXRpb25PYXV0aBIrLmVuZ3JhbS5hcHAudjEuQmVnaW5JbnRlZ3JhdGlvbk9hdXRoUmVxdWVzdBosLmVuZ3JhbS5hcHAudjEuQmVnaW5JbnRlZ3JhdGlvbk9hdXRoUmVzcG9uc2USewoYQ29tcGxldGVJbnRlZ3JhdGlvbk9hdXRoEi4uZW5ncmFtLmFwcC52MS5Db21wbGV0ZUludGVncmF0aW9uT2F1dGhSZXF1ZXN0Gi8uZW5ncmFtLmFwcC52MS5Db21wbGV0ZUludGVncmF0aW9uT2F1dGhSZXNwb25zZWIGcHJvdG8z");
-
-/**
- * @generated from message engram.app.v1.BeginIntegrationOauthRequest
- */
-export type BeginIntegrationOauthRequest = Message<"engram.app.v1.BeginIntegrationOauthRequest"> & {
-  /**
-   * @generated from field: string provider = 1;
-   */
-  provider: string;
-
-  /**
-   * base authorize endpoint (host validated in the connector)
-   *
-   * @generated from field: string authorize_url = 2;
-   */
-  authorizeUrl: string;
-
-  /**
-   * @generated from field: repeated string scopes = 3;
-   */
-  scopes: string[];
-
-  /**
-   * org secret holding the OAuth app's client id
-   *
-   * @generated from field: string client_id_ref = 4;
-   */
-  clientIdRef: string;
-
-  /**
-   * the orchestrator's callback URL
-   *
-   * @generated from field: string redirect_uri = 5;
-   */
-  redirectUri: string;
-
-  /**
-   * CSRF state (orchestrator-generated)
-   *
-   * @generated from field: string state = 6;
-   */
-  state: string;
-};
-
-/**
- * Describes the message engram.app.v1.BeginIntegrationOauthRequest.
- * Use `create(BeginIntegrationOauthRequestSchema)` to create a new message.
- */
-export const BeginIntegrationOauthRequestSchema: GenMessage<BeginIntegrationOauthRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 0);
-
-/**
- * @generated from message engram.app.v1.BeginIntegrationOauthResponse
- */
-export type BeginIntegrationOauthResponse = Message<"engram.app.v1.BeginIntegrationOauthResponse"> & {
-  /**
-   * full URL: base + client_id + scope + redirect_uri + state
-   *
-   * @generated from field: string authorize_url = 1;
-   */
-  authorizeUrl: string;
-};
-
-/**
- * Describes the message engram.app.v1.BeginIntegrationOauthResponse.
- * Use `create(BeginIntegrationOauthResponseSchema)` to create a new message.
- */
-export const BeginIntegrationOauthResponseSchema: GenMessage<BeginIntegrationOauthResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 1);
-
-/**
- * @generated from message engram.app.v1.CompleteIntegrationOauthRequest
- */
-export type CompleteIntegrationOauthRequest = Message<"engram.app.v1.CompleteIntegrationOauthRequest"> & {
-  /**
-   * @generated from field: string provider = 1;
-   */
-  provider: string;
-
-  /**
-   * token endpoint (host validated in the connector)
-   *
-   * @generated from field: string token_url = 2;
-   */
-  tokenUrl: string;
-
-  /**
-   * @generated from field: string client_id_ref = 3;
-   */
-  clientIdRef: string;
-
-  /**
-   * @generated from field: string client_secret_ref = 4;
-   */
-  clientSecretRef: string;
-
-  /**
-   * must match the authorize step
-   *
-   * @generated from field: string redirect_uri = 5;
-   */
-  redirectUri: string;
-
-  /**
-   * the authorization code from the callback
-   *
-   * @generated from field: string code = 6;
-   */
-  code: string;
-
-  /**
-   * org secret to write the obtained access token to
-   *
-   * @generated from field: string token_secret_ref = 7;
-   */
-  tokenSecretRef: string;
-
-  /**
-   * top-level field holding the token (e.g. access_token)
-   *
-   * @generated from field: string token_response_path = 8;
-   */
-  tokenResponsePath: string;
-};
-
-/**
- * Describes the message engram.app.v1.CompleteIntegrationOauthRequest.
- * Use `create(CompleteIntegrationOauthRequestSchema)` to create a new message.
- */
-export const CompleteIntegrationOauthRequestSchema: GenMessage<CompleteIntegrationOauthRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 2);
-
-/**
- * @generated from message engram.app.v1.CompleteIntegrationOauthResponse
- */
-export type CompleteIntegrationOauthResponse = Message<"engram.app.v1.CompleteIntegrationOauthResponse"> & {
-  /**
-   * @generated from field: bool ok = 1;
-   */
-  ok: boolean;
-
-  /**
-   * @generated from field: string message = 2;
-   */
-  message: string;
-};
-
-/**
- * Describes the message engram.app.v1.CompleteIntegrationOauthResponse.
- * Use `create(CompleteIntegrationOauthResponseSchema)` to create a new message.
- */
-export const CompleteIntegrationOauthResponseSchema: GenMessage<CompleteIntegrationOauthResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 3);
+  fileDesc("CiJlbmdyYW0vYXBwL3YxL2ludGVncmF0aW9uX29wLnByb3RvEg1lbmdyYW0uYXBwLnYxIlYKCE9wSW5qZWN0Eg4KBmhlYWRlchgBIAEoCRIQCgh0ZW1wbGF0ZRgCIAEoCRISCgpzZWNyZXRfcmVmGAMgASgJEhQKDGRyYWZ0X3NlY3JldBgEIAEoCSKYAgoOQ3JlZGVudGlhbFNwZWMSDgoGc291cmNlGAEgASgJEigKB2luamVjdHMYAiADKAsyFy5lbmdyYW0uYXBwLnYxLk9wSW5qZWN0EhUKDW1pbnRfcHJvdmlkZXIYAyABKAkSGwoTb2F1dGhfY29ubmVjdGlvbl9pZBgEIAEoCRIRCgltaW50X2tpbmQYBSABKAkSTQoRbWludF9kcmFmdF9maWVsZHMYBiADKAsyMi5lbmdyYW0uYXBwLnYxLkNyZWRlbnRpYWxTcGVjLk1pbnREcmFmdEZpZWxkc0VudHJ5GjYKFE1pbnREcmFmdEZpZWxkc0VudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAEirgEKF1J1bkludGVncmF0aW9uT3BSZXF1ZXN0EhAKCHByb3ZpZGVyGAEgASgJEgwKBGhvc3QYAiABKAkSDgoGbWV0aG9kGAMgASgJEgwKBHBhdGgYBCABKAkSDAoEYm9keRgFIAEoDBIUCgxjb250ZW50X3R5cGUYBiABKAkSMQoKY3JlZGVudGlhbBgHIAEoCzIdLmVuZ3JhbS5hcHAudjEuQ3JlZGVudGlhbFNwZWMiYQoYUnVuSW50ZWdyYXRpb25PcFJlc3BvbnNlEg4KBnN0YXR1cxgBIAEoDRIMCgRib2R5GAIgASgMEhQKDGNvbnRlbnRfdHlwZRgDIAEoCRIRCgl0cnVuY2F0ZWQYBCABKAgiagojUmVzb2x2ZUludGVncmF0aW9uQ3JlZGVudGlhbFJlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkSMQoKY3JlZGVudGlhbBgCIAEoCzIdLmVuZ3JhbS5hcHAudjEuQ3JlZGVudGlhbFNwZWMi5QEKElJlc29sdmVkQ3JlZGVudGlhbBIrCgZiZWFyZXIYASABKAsyGS5lbmdyYW0uYXBwLnYxLkJlYXJlckNyZWRIABIpCgViYXNpYxgCIAEoCzIYLmVuZ3JhbS5hcHAudjEuQmFzaWNDcmVkSAASLQoHaGVhZGVycxgDIAEoCzIaLmVuZ3JhbS5hcHAudjEuSGVhZGVyc0NyZWRIABIsCgdhd3Nfc3RzGAQgASgLMhkuZW5ncmFtLmFwcC52MS5Bd3NTdHNDcmVkSAASEgoKZXhwaXJlc19hdBgKIAEoCUIGCgRjcmVkIhsKCkJlYXJlckNyZWQSDQoFdG9rZW4YASABKAkiLwoJQmFzaWNDcmVkEhAKCHVzZXJuYW1lGAEgASgJEhAKCHBhc3N3b3JkGAIgASgJInQKC0hlYWRlcnNDcmVkEjYKBnZhbHVlcxgBIAMoCzImLmVuZ3JhbS5hcHAudjEuSGVhZGVyc0NyZWQuVmFsdWVzRW50cnkaLQoLVmFsdWVzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASJVCgpBd3NTdHNDcmVkEhUKDWFjY2Vzc19rZXlfaWQYASABKAkSGQoRc2VjcmV0X2FjY2Vzc19rZXkYAiABKAkSFQoNc2Vzc2lvbl90b2tlbhgDIAEoCSJdCiRSZXNvbHZlSW50ZWdyYXRpb25DcmVkZW50aWFsUmVzcG9uc2USNQoKY3JlZGVudGlhbBgBIAEoCzIhLmVuZ3JhbS5hcHAudjEuUmVzb2x2ZWRDcmVkZW50aWFsMoUCChRJbnRlZ3JhdGlvbk9wU2VydmljZRJjChBSdW5JbnRlZ3JhdGlvbk9wEiYuZW5ncmFtLmFwcC52MS5SdW5JbnRlZ3JhdGlvbk9wUmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuUnVuSW50ZWdyYXRpb25PcFJlc3BvbnNlEocBChxSZXNvbHZlSW50ZWdyYXRpb25DcmVkZW50aWFsEjIuZW5ncmFtLmFwcC52MS5SZXNvbHZlSW50ZWdyYXRpb25DcmVkZW50aWFsUmVxdWVzdBozLmVuZ3JhbS5hcHAudjEuUmVzb2x2ZUludGVncmF0aW9uQ3JlZGVudGlhbFJlc3BvbnNlYgZwcm90bzM");
 
 /**
  * One header a connector injects, resolved from an org secret coordinator-side.
@@ -193,6 +40,16 @@ export type OpInject = Message<"engram.app.v1.OpInject"> & {
    * @generated from field: string secret_ref = 3;
    */
   secretRef: string;
+
+  /**
+   * Connect-sheet "Test" before save: a drafted value overriding the stored
+   * secret for THIS request only. Never persisted; rejected on
+   * ResolveIntegrationCredential (drafts never come back as a resolved
+   * credential).
+   *
+   * @generated from field: string draft_secret = 4;
+   */
+  draftSecret: string;
 };
 
 /**
@@ -200,7 +57,7 @@ export type OpInject = Message<"engram.app.v1.OpInject"> & {
  * Use `create(OpInjectSchema)` to create a new message.
  */
 export const OpInjectSchema: GenMessage<OpInject> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 4);
+  messageDesc(file_engram_app_v1_integration_op, 0);
 
 /**
  * How to resolve a connector's credential. Built by the orchestrator from the
@@ -229,6 +86,30 @@ export type CredentialSpec = Message<"engram.app.v1.CredentialSpec"> & {
    * @generated from field: string mint_provider = 3;
    */
   mintProvider: string;
+
+  /**
+   * ADR 0106 addendum: when set, the inject value is the connector's OAuth
+   * access token from the sealed credential store (subject = this connection
+   * id, provider = the request's provider) — refreshed coordinator-side. The
+   * single inject entry carries the header name + template.
+   *
+   * @generated from field: string oauth_connection_id = 4;
+   */
+  oauthConnectionId: string;
+
+  /**
+   * Draft mint test (connect sheet, was MintService.RunConnectorTest): build
+   * the mint engine from these fields instead of the stored org secrets.
+   * `mint_kind` selects the builder. Rejected on ResolveIntegrationCredential.
+   *
+   * @generated from field: string mint_kind = 5;
+   */
+  mintKind: string;
+
+  /**
+   * @generated from field: map<string, string> mint_draft_fields = 6;
+   */
+  mintDraftFields: { [key: string]: string };
 };
 
 /**
@@ -236,7 +117,7 @@ export type CredentialSpec = Message<"engram.app.v1.CredentialSpec"> & {
  * Use `create(CredentialSpecSchema)` to create a new message.
  */
 export const CredentialSpecSchema: GenMessage<CredentialSpec> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 5);
+  messageDesc(file_engram_app_v1_integration_op, 1);
 
 /**
  * @generated from message engram.app.v1.RunIntegrationOpRequest
@@ -295,7 +176,7 @@ export type RunIntegrationOpRequest = Message<"engram.app.v1.RunIntegrationOpReq
  * Use `create(RunIntegrationOpRequestSchema)` to create a new message.
  */
 export const RunIntegrationOpRequestSchema: GenMessage<RunIntegrationOpRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 6);
+  messageDesc(file_engram_app_v1_integration_op, 2);
 
 /**
  * @generated from message engram.app.v1.RunIntegrationOpResponse
@@ -335,7 +216,7 @@ export type RunIntegrationOpResponse = Message<"engram.app.v1.RunIntegrationOpRe
  * Use `create(RunIntegrationOpResponseSchema)` to create a new message.
  */
 export const RunIntegrationOpResponseSchema: GenMessage<RunIntegrationOpResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 7);
+  messageDesc(file_engram_app_v1_integration_op, 3);
 
 /**
  * @generated from message engram.app.v1.ResolveIntegrationCredentialRequest
@@ -359,7 +240,7 @@ export type ResolveIntegrationCredentialRequest = Message<"engram.app.v1.Resolve
  * Use `create(ResolveIntegrationCredentialRequestSchema)` to create a new message.
  */
 export const ResolveIntegrationCredentialRequestSchema: GenMessage<ResolveIntegrationCredentialRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 8);
+  messageDesc(file_engram_app_v1_integration_op, 4);
 
 /**
  * The raw credential material, shaped so a single-token SDK gets a string and a
@@ -419,7 +300,7 @@ export type ResolvedCredential = Message<"engram.app.v1.ResolvedCredential"> & {
  * Use `create(ResolvedCredentialSchema)` to create a new message.
  */
 export const ResolvedCredentialSchema: GenMessage<ResolvedCredential> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 9);
+  messageDesc(file_engram_app_v1_integration_op, 5);
 
 /**
  * @generated from message engram.app.v1.BearerCred
@@ -438,7 +319,7 @@ export type BearerCred = Message<"engram.app.v1.BearerCred"> & {
  * Use `create(BearerCredSchema)` to create a new message.
  */
 export const BearerCredSchema: GenMessage<BearerCred> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 10);
+  messageDesc(file_engram_app_v1_integration_op, 6);
 
 /**
  * @generated from message engram.app.v1.BasicCred
@@ -460,7 +341,7 @@ export type BasicCred = Message<"engram.app.v1.BasicCred"> & {
  * Use `create(BasicCredSchema)` to create a new message.
  */
 export const BasicCredSchema: GenMessage<BasicCred> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 11);
+  messageDesc(file_engram_app_v1_integration_op, 7);
 
 /**
  * @generated from message engram.app.v1.HeadersCred
@@ -480,7 +361,7 @@ export type HeadersCred = Message<"engram.app.v1.HeadersCred"> & {
  * Use `create(HeadersCredSchema)` to create a new message.
  */
 export const HeadersCredSchema: GenMessage<HeadersCred> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 12);
+  messageDesc(file_engram_app_v1_integration_op, 8);
 
 /**
  * @generated from message engram.app.v1.AwsStsCred
@@ -507,7 +388,7 @@ export type AwsStsCred = Message<"engram.app.v1.AwsStsCred"> & {
  * Use `create(AwsStsCredSchema)` to create a new message.
  */
 export const AwsStsCredSchema: GenMessage<AwsStsCred> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 13);
+  messageDesc(file_engram_app_v1_integration_op, 9);
 
 /**
  * @generated from message engram.app.v1.ResolveIntegrationCredentialResponse
@@ -524,7 +405,7 @@ export type ResolveIntegrationCredentialResponse = Message<"engram.app.v1.Resolv
  * Use `create(ResolveIntegrationCredentialResponseSchema)` to create a new message.
  */
 export const ResolveIntegrationCredentialResponseSchema: GenMessage<ResolveIntegrationCredentialResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_integration_op, 14);
+  messageDesc(file_engram_app_v1_integration_op, 10);
 
 /**
  * Server-side integration invocation, sessionless (the "IntegrationOp" seam).
@@ -563,34 +444,16 @@ export const IntegrationOpService: GenService<{
    * Resolve a connector's credential to its raw material so the orchestrator can
    * drive an off-the-shelf SDK. Returns a typed ResolvedCredential.
    *
+   * OAuth acquisition moved to OAuthCredentialService.Begin/CompleteRedirectFlow
+   * (ADR 0106 addendum): obtained tokens live in the sealed credential store
+   * with rotation + refresh, never as org secrets.
+   *
    * @generated from rpc engram.app.v1.IntegrationOpService.ResolveIntegrationCredential
    */
   resolveIntegrationCredential: {
     methodKind: "unary";
     input: typeof ResolveIntegrationCredentialRequestSchema;
     output: typeof ResolveIntegrationCredentialResponseSchema;
-  },
-  /**
-   * OAuth 2.0 authorization-code acquisition (e.g. Slack "Add to Slack"). The
-   * orchestrator owns the browser redirect + CSRF state; the coordinator — the
-   * only tier that can read/write org secrets — builds the authorize URL from the
-   * stored client id, and (on callback) runs the code->token exchange and writes
-   * the obtained access token to the org store.
-   *
-   * @generated from rpc engram.app.v1.IntegrationOpService.BeginIntegrationOauth
-   */
-  beginIntegrationOauth: {
-    methodKind: "unary";
-    input: typeof BeginIntegrationOauthRequestSchema;
-    output: typeof BeginIntegrationOauthResponseSchema;
-  },
-  /**
-   * @generated from rpc engram.app.v1.IntegrationOpService.CompleteIntegrationOauth
-   */
-  completeIntegrationOauth: {
-    methodKind: "unary";
-    input: typeof CompleteIntegrationOauthRequestSchema;
-    output: typeof CompleteIntegrationOauthResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_integration_op, 0);

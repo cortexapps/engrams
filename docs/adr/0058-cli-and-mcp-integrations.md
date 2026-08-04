@@ -68,7 +68,10 @@ OAuth-only holdouts are a minority (Slack, Notion, GitLab).
 
 Crucially for engrams: a **remote MCP server is just another HTTPS host**, so the *existing
 inject rail already authenticates it* — point the guest's MCP config at the URL with **no
-token**, and the proxy injects `Authorization` host-side. We never hold or refresh OAuth.
+token**, and the proxy injects `Authorization` host-side. *(Amended 2026-08-03, ADR 0106
+addendum: for oauth-facet connectors the platform now DOES acquire, hold — KEK-sealed in
+the ADR 0106 credential store — and proactively refresh tokens; org secrets no longer
+store acquired tokens. BYO client id/secret/signing-secret remain org secrets.)*
 
 But there is a deeper, engrams-specific prior: **ADR 0027 already chose CLI over MCP**
 (§"Why not an MCP server"). MCP couples to the harness; `.mcp.json` is cwd-relative and

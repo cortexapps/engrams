@@ -117,12 +117,26 @@ pub fn credential_mint_source() -> impl Strategy<Value = CredentialMintSource> {
                     },
                 )
                 .boxed(),
+            CredentialMintSource::OauthConnector { .. } => (s(), s())
+                .prop_map(
+                    |(connection_id, provider)| CredentialMintSource::OauthConnector {
+                        connection_id,
+                        provider,
+                    },
+                )
+                .boxed(),
         }
     }
-    shapes(CredentialMintSource::Connection {
-        connection_id: String::new(),
-        provider: String::new(),
-    })
+    prop_oneof![
+        shapes(CredentialMintSource::Connection {
+            connection_id: String::new(),
+            provider: String::new(),
+        }),
+        shapes(CredentialMintSource::OauthConnector {
+            connection_id: String::new(),
+            provider: String::new(),
+        }),
+    ]
 }
 
 /// Path globs cover all three matcher forms the proxy understands, including

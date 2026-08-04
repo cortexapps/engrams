@@ -48,33 +48,4 @@ impl app::integration_op_service_server::IntegrationOpService for AppIntegration
             credential: Some(credential),
         }))
     }
-
-    async fn begin_integration_oauth(
-        &self,
-        req: Request<app::BeginIntegrationOauthRequest>,
-    ) -> Result<Response<app::BeginIntegrationOauthResponse>, Status> {
-        self.auth.check(&req)?;
-        let authorize_url =
-            crate::integration_ops::begin_integration_oauth(&self.state, req.into_inner())
-                .await
-                .map_err(Status::failed_precondition)?;
-        Ok(Response::new(app::BeginIntegrationOauthResponse {
-            authorize_url,
-        }))
-    }
-
-    async fn complete_integration_oauth(
-        &self,
-        req: Request<app::CompleteIntegrationOauthRequest>,
-    ) -> Result<Response<app::CompleteIntegrationOauthResponse>, Status> {
-        self.auth.check(&req)?;
-        let (ok, message) =
-            crate::integration_ops::complete_integration_oauth(&self.state, req.into_inner())
-                .await
-                .map_err(Status::failed_precondition)?;
-        Ok(Response::new(app::CompleteIntegrationOauthResponse {
-            ok,
-            message,
-        }))
-    }
 }

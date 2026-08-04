@@ -361,6 +361,7 @@ export function appendGooglePolicy(
         const conflict = policy.injects.find((candidate) =>
           candidate.hosts.includes(host) &&
           candidate.mint_source != null &&
+          "connection" in candidate.mint_source &&
           candidate.mint_source.connection.connection_id !== connection.id &&
           matchersOverlap(candidate, entry)
         );

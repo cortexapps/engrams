@@ -15,7 +15,7 @@ import type { AddressInfo } from "node:net";
 
 import { buildServer } from "../server.ts";
 import { registerIntegration } from "../rpc/integration.ts";
-import type { IntegrationDeps, GetSession, MintAccess, OrgSecretAccess } from "../rpc/integration.ts";
+import type { IntegrationDeps, GetSession, IntegrationOpAccess, MintAccess, OauthCredentialAccess, OrgSecretAccess } from "../rpc/integration.ts";
 import type { ConnectorStore, ConnectorRow } from "../db/connectors.ts";
 import type { ConnectorLogoStore } from "../db/connector-logos.ts";
 import type {
@@ -42,15 +42,33 @@ const GITHUB_MINT_KIND = {
   ],
 } as unknown as MintKind;
 
-function fakeMint(onTest?: (spec: unknown) => { ok: boolean; message: string }): MintAccess {
+function fakeMint(): MintAccess {
   return {
     async listMintKinds() {
       return { mintKinds: [GITHUB_MINT_KIND] };
     },
-    async runConnectorTest(spec) {
-      return onTest?.(spec) ?? { ok: true, message: "ok" };
+  };
+}
+
+/** Kind-wide connector-credential listing (the oauth status input). */
+function fakeOauthCredential(creds: Array<{ provider: string; status: string }> = []): OauthCredentialAccess {
+  return {
+    async listCredentials() {
+      return { credentials: creds };
     },
   };
+}
+
+/** Capture RunIntegrationOp requests (the connector test rides Mode A now). */
+function fakeIntegrationOp(status = 200, body: unknown = { ok: true }) {
+  const calls: Array<Record<string, unknown>> = [];
+  const client: IntegrationOpAccess = {
+    async runIntegrationOp(req) {
+      calls.push(req as unknown as Record<string, unknown>);
+      return { status, body: new TextEncoder().encode(JSON.stringify(body)) };
+    },
+  };
+  return { client, calls };
 }
 
 function fakeOrgSecret(names: string[] = []) {
@@ -495,11 +513,15 @@ describe("IntegrationService (native)", () => {
 });
 
 describe("IntegrationService — connector status (redesign)", () => {
-  const adminDeps = (names: string[]): IntegrationDeps => ({
+  const adminDeps = (
+    names: string[],
+    oauthCreds: Array<{ provider: string; status: string }> = [],
+  ): IntegrationDeps => ({
     getSession: makeGetSession("a", "admin"),
     connectors: fakeStore().store,
     orgSecret: fakeOrgSecret(names).client,
     mint: fakeMint(),
+    oauthCredential: fakeOauthCredential(oauthCreds),
   });
 
   test("inject connected ⇔ secretRef present; mint connected ⇔ all required fields present", async () => {
@@ -508,6 +530,53 @@ describe("IntegrationService — connector status (redesign)", () => {
       const by = new Map((await s.client.listConnectors({})).connectors.map((c) => [c.provider, c]));
       expect(by.get("datadog")?.status).toBe("connected"); // both inject secretRefs present
       expect(by.get("github")?.status).toBe("connected"); // both mint fields present
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("an oauth connector's status comes from the sealed store (ADR 0106 addendum)", async () => {
+    // No credential row -> available; a connected row -> connected; a broken
+    // row (refresh terminally rejected) -> needs_reconnect.
+    for (const [creds, expected] of [
+      [[], "available"],
+      [[{ provider: "slack", status: "connected" }], "connected"],
+      // `expired` is degraded, not transient: the scanner refreshes hours
+      // AHEAD of expiry, so reaching it means refresh has been failing and
+      // guest requests are already 401ing — surface it.
+      [[{ provider: "slack", status: "expired" }], "needs_reconnect"],
+      [[{ provider: "slack", status: "broken" }], "needs_reconnect"],
+      [[{ provider: "slack", status: "revoked" }], "needs_reconnect"],
+    ] as const) {
+      const s = await spawn(adminDeps([], [...creds]));
+      try {
+        const by = new Map((await s.client.listConnectors({})).connectors.map((c) => [c.provider, c]));
+        expect(by.get("slack")?.status).toBe(expected);
+      } finally {
+        await s.close();
+      }
+    }
+  });
+
+  test("a failing OAuth listing degrades ONLY oauth statuses, not inject/mint", async () => {
+    const failing: OauthCredentialAccess = {
+      async listCredentials() {
+        throw new Error("coordinator briefly unreachable");
+      },
+    };
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      connectors: fakeStore().store,
+      orgSecret: fakeOrgSecret(["datadog-api-key", "datadog-app-key"]).client,
+      mint: fakeMint(),
+      oauthCredential: failing,
+    });
+    try {
+      const by = new Map((await s.client.listConnectors({})).connectors.map((c) => [c.provider, c]));
+      // The inject connector's org secrets resolved fine — it stays connected.
+      expect(by.get("datadog")?.status).toBe("connected");
+      // Only the oauth-facet connector degrades to available.
+      expect(by.get("slack")?.status).toBe("available");
     } finally {
       await s.close();
     }
@@ -725,14 +794,12 @@ describe("TestConnector", () => {
   });
 
   test("builds the inject spec with ALL headers, drafts keyed by secret ref (ADR 0058)", async () => {
-    let captured: Record<string, unknown> | undefined;
+    const op = fakeIntegrationOp();
     const s = await spawn({
       getSession: makeGetSession("a", "admin"),
       connectors: fakeStore().store,
-      mint: fakeMint((spec) => {
-        captured = spec as Record<string, unknown>;
-        return { ok: true, message: "Reached api.datadoghq.com" };
-      }),
+      mint: fakeMint(),
+      integrationOp: op.client,
     });
     try {
       const r = await s.client.testConnector({
@@ -744,40 +811,79 @@ describe("TestConnector", () => {
       // ADR 0058: EVERY injected header is probed; drafts keyed by org-secret ref.
       // The probe targets the connector's `test.path` (Datadog's `/` 307s to a
       // public page, so the test must hit an endpoint that needs both keys).
-      expect(captured).toMatchObject({
+      expect(op.calls[0]).toMatchObject({
         provider: "datadog",
         host: "api.datadoghq.com",
-        source: "inject",
-        testPath: "/api/v1/dashboard",
-        injects: [
-          { header: "DD-API-KEY", template: "{}", secretRef: "datadog-api-key", draftSecret: "dd-key" },
-          {
-            header: "DD-APPLICATION-KEY",
-            template: "{}",
-            secretRef: "datadog-app-key",
-            draftSecret: "dd-app",
-          },
-        ],
+        method: "GET",
+        path: "/api/v1/dashboard",
+        credential: {
+          source: "inject",
+          injects: [
+            { header: "DD-API-KEY", template: "{}", secretRef: "datadog-api-key", draftSecret: "dd-key" },
+            {
+              header: "DD-APPLICATION-KEY",
+              template: "{}",
+              secretRef: "datadog-app-key",
+              draftSecret: "dd-app",
+            },
+          ],
+        },
       });
     } finally {
       await s.close();
     }
   });
 
-  test("builds the mint spec (kind + draft fields) from the registry", async () => {
-    let captured: Record<string, unknown> | undefined;
+  test("a 200 body-auth failure (Slack ok:false) reports a rejected credential", async () => {
+    const op = fakeIntegrationOp(200, { ok: false, error: "invalid_auth" });
     const s = await spawn({
       getSession: makeGetSession("a", "admin"),
       connectors: fakeStore().store,
-      mint: fakeMint((spec) => {
-        captured = spec as Record<string, unknown>;
-        return { ok: true, message: "Minted" };
-      }),
+      mint: fakeMint(),
+      integrationOp: op.client,
+    });
+    try {
+      const r = await s.client.testConnector({ provider: "datadog", draftValues: {} });
+      expect(r.ok).toBe(false);
+      expect(r.message).toContain("invalid_auth");
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("a 401 from the host reports a rejected credential", async () => {
+    const op = fakeIntegrationOp(401);
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      connectors: fakeStore().store,
+      mint: fakeMint(),
+      integrationOp: op.client,
+    });
+    try {
+      const r = await s.client.testConnector({ provider: "datadog", draftValues: {} });
+      expect(r.ok).toBe(false);
+      expect(r.message).toContain("rejected the credential");
+    } finally {
+      await s.close();
+    }
+  });
+
+  test("builds the mint spec (kind + draft fields) from the registry", async () => {
+    const op = fakeIntegrationOp();
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      connectors: fakeStore().store,
+      mint: fakeMint(),
+      integrationOp: op.client,
     });
     try {
       await s.client.testConnector({ provider: "github", draftValues: { app_id: "1357924" } });
-      expect(captured).toMatchObject({ provider: "github", source: "mint", kind: "github_app" });
-      expect((captured!.draftFields as Record<string, string>).app_id).toBe("1357924");
+      expect(op.calls[0]).toMatchObject({
+        provider: "github",
+        credential: { source: "mint", mintKind: "github_app" },
+      });
+      const cred = op.calls[0]!.credential as Record<string, unknown>;
+      expect((cred.mintDraftFields as Record<string, string>).app_id).toBe("1357924");
     } finally {
       await s.close();
     }

@@ -53,6 +53,9 @@ export interface SlackReply {
   user?: string;
   bot_id?: string;
   text?: string;
+  /** Legacy attachments — bot/app posts often carry their content here with an
+   *  empty top-level `text` (alerts, GitHub, workflow posts). */
+  attachments?: { title?: string; text?: string; fallback?: string }[];
 }
 
 /** The Slack WebClient surface this policy uses — a structural subset so a fake
@@ -107,13 +110,15 @@ export interface SlackPolicyDeps {
 /**
  * Fold a page of thread replies into the session prompt + the new cursor. Pure.
  * The cursor (`maxTs`) advances past EVERY reply seen — including the bot's own
- * — so the next gather never re-reads; only HUMAN message text feeds the prompt
- * (the agent must never be prompted with its own posts). `since` is exclusive:
- * `conversations.replies(oldest=)` is inclusive, so the boundary message is
- * dropped here.
+ * — so the next gather never re-reads. Bot-authored replies never feed the
+ * prompt (the agent must not be prompted with its own posts) — EXCEPT the
+ * thread ROOT (`rootTs`): it is the subject of the thread, so a bot-authored
+ * root (an alert, a workflow post, another app) stays in as context. `since`
+ * is exclusive: `conversations.replies(oldest=)` is inclusive, so the boundary
+ * message is dropped here.
  *
  * Shape: the triggering @mention (identified by `triggerTs`) is the directive
- * and goes at the BOTTOM; every other human message is prior thread context,
+ * and goes at the BOTTOM; every other kept message is prior thread context,
  * wrapped in `<thread context>…</thread context>` above it. With no other
  * messages the prompt is just the directive (no wrapper). If `triggerTs` matches
  * nothing in this page (the mention wasn't returned), fall back to a plain join.
@@ -123,37 +128,54 @@ export function foldReplies(
   since: string | null,
   botUserId?: string,
   triggerTs?: string,
+  rootTs?: string,
 ): { prompt: string; maxTs: string } {
   let maxTs = since ?? "0";
-  const human: { ts: string; text: string }[] = [];
+  const kept: { ts: string; text: string }[] = [];
   for (const msg of messages) {
     const ts = msg.ts ?? "";
     if (since && num(ts) <= num(since)) continue; // already delivered
     if (num(ts) > num(maxTs)) maxTs = ts; // advance past everything seen
-    if (msg.bot_id || (botUserId && msg.user === botUserId)) continue; // never our own
-    const text = stripMentions(msg.text ?? "", botUserId).trim();
-    if (text) human.push({ ts, text });
+    const isRoot = rootTs !== undefined && ts === rootTs;
+    if (!isRoot && (msg.bot_id || (botUserId && msg.user === botUserId))) continue;
+    const text = stripMentions(replyText(msg), botUserId).trim();
+    if (text) kept.push({ ts, text });
   }
 
-  const idx = triggerTs ? human.findIndex((h) => h.ts === triggerTs) : -1;
+  const idx = triggerTs ? kept.findIndex((h) => h.ts === triggerTs) : -1;
   if (idx === -1) {
     // No identified directive — emit the messages plainly, no wrapper.
-    return { prompt: human.map((h) => h.text).join("\n\n"), maxTs };
+    return { prompt: kept.map((h) => h.text).join("\n\n"), maxTs };
   }
-  const context = human.filter((_, i) => i !== idx).map((h) => h.text);
-  const directive = human[idx].text;
+  const context = kept.filter((_, i) => i !== idx).map((h) => h.text);
+  const directive = kept[idx].text;
   const prompt = context.length
     ? `<thread context>\n${context.join("\n")}\n</thread context>\n\n${directive}`
     : directive;
   return { prompt, maxTs };
 }
 
+/** A message's prompt text. Bot/app posts often put their content in legacy
+ *  `attachments` and leave `text` empty — fold those in only then, so link
+ *  unfurls (attachments alongside real text) never add noise. */
+function replyText(msg: SlackReply): string {
+  if (msg.text?.trim()) return msg.text;
+  const parts: string[] = [];
+  for (const a of msg.attachments ?? []) {
+    const body = [a.title, a.text].filter((s) => s?.trim()).join("\n") || a.fallback || "";
+    if (body.trim()) parts.push(body);
+  }
+  return parts.join("\n");
+}
+
 const num = (ts: string): number => Number.parseFloat(ts) || 0;
 
-/** Strip the bot's `<@id>` mention (or all mentions when the id is unknown). */
+/** Strip the bot's `<@id>` mention (or all mentions when the id is unknown).
+ *  Collapses runs of spaces/tabs (the hole a removed mention leaves) but keeps
+ *  newlines — multi-line messages must reach the prompt intact. */
 function stripMentions(text: string, botUserId?: string): string {
   const re = botUserId ? new RegExp(`<@${botUserId}(\\|[^>]*)?>`, "g") : /<@[^>]+>/g;
-  return text.replace(re, " ").replace(/\s+/g, " ");
+  return text.replace(re, " ").replace(/[^\S\n]+/g, " ");
 }
 
 /** The slice of a `file_shared` event payload the upload path reads. */
@@ -388,9 +410,10 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
         ...(since ? { oldest: since } : {}),
       });
       // m.ts is the triggering @mention — the directive; everything else in the
-      // thread is context (wrapped). For a follow-up the workflow passes the new
-      // mention, so its ts is the directive for that turn.
-      return foldReplies(res.messages ?? [], since, botUserId, m.ts);
+      // thread is context (wrapped), INCLUDING a bot-authored root. For a
+      // follow-up the workflow passes the new mention, so its ts is the
+      // directive for that turn (the root is behind the cursor by then).
+      return foldReplies(res.messages ?? [], since, botUserId, m.ts, m.threadRoot);
     },
   };
 }

@@ -144,6 +144,32 @@ describe("SessionThread", () => {
     expect(screen.getByText("x/y #7")).toBeTruthy();
   });
 
+  test("a linear issue asset renders the title headline with the identifier reference", async () => {
+    renderWithProviders(
+      <SessionThread
+        sessionId="s1"
+        status="idle"
+        events={indexed([
+          {
+            type: "integration_asset",
+            provider: "linear",
+            asset_kind: "issue",
+            surface: "asset",
+            data: { identifier: "ENG-331", title: "Fix login flakiness", team_id: "t1" },
+            fetchable: { kind: "external", url: "https://linear.app/acme/issue/ENG-331/fix" },
+            at: AT,
+          },
+          { type: "harness_idle", at: AT2 },
+        ])}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText("Fix login flakiness")).toBeTruthy());
+    expect(screen.getByText("issue")).toBeTruthy();
+    expect(screen.getByText("ENG-331")).toBeTruthy();
+    // Title-less captures (a client that selected nothing) fall back to the
+    // identifier as the headline rather than a bare key/value dump.
+  });
+
   test("a snapshot renders a durability marker", async () => {
     renderWithProviders(
       <SessionThread
