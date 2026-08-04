@@ -18,7 +18,7 @@
 //!   terminal destroy);
 //! * **durable exec** → the REAL Firecracker host reader and REAL agentd
 //!   journal handler over per-sandbox duplex connections; checkpoint steps
-//!   fake only vsock's silent `TRANSPORT_RESET`;
+//!   quietly sever the modeled vsock transport;
 //! * **teardown-reconcile** → the REAL
 //!   [`reconcile_once`](engram_host_agent::teardown_reconcile::reconcile_once)
 //!   over [`CosimReconcileBackend`].
@@ -44,9 +44,7 @@
 //! lockstep with the disk world).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -79,7 +77,6 @@ use engram_host_core::{FinalizeStage, HostFs, TokioFs};
 use engram_sandbox_firecracker::BoxExecIo;
 use engram_sim::{SimClock, SimEntropy};
 use parking_lot::Mutex;
-use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 
 /// Disk geometry — small on purpose (the oracle asserts a boundary
 /// property, not throughput).
@@ -248,20 +245,24 @@ struct CosimSandbox {
 }
 
 /// Per-sandbox guest exec state. Every connection runs the real agentd
-/// handler; only the vsock transport itself is modeled.
+/// handler. Only the vsock transport is modeled.
+///
+/// Production snapshot capture gives the host no EOF. A gate holds each
+/// severed pipe open to model that silence. Only [`engram_sandbox_firecracker::EpochSeveredStream`]
+/// can convert the silence to EOF. A natural guest close still gives the
+/// host a real EOF through the gate.
 struct CosimExecPlane {
     journal: Arc<ExecJournal>,
     supervisor: Arc<HarnessSupervisor>,
     cacerts: Arc<CaCertInstaller>,
     epoch: tokio::sync::watch::Sender<u64>,
-    guest_connections: Vec<tokio::task::AbortHandle>,
+    connection_tasks: Vec<tokio::task::AbortHandle>,
     severances: u64,
     connections_opened: u64,
 }
 
 impl CosimExecPlane {
     fn new(root: std::path::PathBuf) -> Self {
-        let (epoch, _receiver) = tokio::sync::watch::channel(0);
         Self {
             journal: Arc::new(ExecJournal::new(root.join("journal"))),
             supervisor: HarnessSupervisor::new(),
@@ -269,8 +270,8 @@ impl CosimExecPlane {
                 bundle: root.join("cacerts/ca-bundle"),
                 extra_cert: root.join("cacerts/engram.crt"),
             })),
-            epoch,
-            guest_connections: Vec::new(),
+            epoch: tokio::sync::watch::channel(0).0,
+            connection_tasks: Vec::new(),
             severances: 0,
             connections_opened: 0,
         }
@@ -315,32 +316,53 @@ impl CosimExecPlane {
     }
 
     fn connect(&mut self) -> BoxExecIo {
-        let (host, guest) = tokio::io::duplex(64 * 1024);
-        let task = tokio::spawn(serve_connection_with_journal(
-            guest,
+        let (driver_end, mut gate_a) = tokio::io::duplex(64 * 1024);
+        let (mut gate_b, guest_end) = tokio::io::duplex(64 * 1024);
+        let guest_task = tokio::spawn(serve_connection_with_journal(
+            guest_end,
             None,
             self.supervisor.clone(),
             self.cacerts.clone(),
             self.journal.clone(),
         ));
-        self.guest_connections.push(task.abort_handle());
-        // Dropping the JoinHandle detaches the real handler. The abort handle
-        // remains the checkpoint's guest-side TRANSPORT_RESET control.
-        drop(task);
-        self.connections_opened += 1;
-        Box::new(SilentHostExecIo::new(host))
-    }
+        self.connection_tasks.push(guest_task.abort_handle());
+        // Dropping the join handle detaches the real handler. Drop keeps its
+        // abort handle for cleanup.
+        drop(guest_task);
 
-    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.epoch.subscribe()
+        let mut rx = self.epoch.subscribe();
+        let born = *rx.borrow();
+        let gate_task = tokio::spawn(async move {
+            let severed = tokio::select! {
+                _ = tokio::io::copy_bidirectional(&mut gate_a, &mut gate_b) => false,
+                changed = rx.wait_for(|epoch| *epoch > born) => {
+                    // Drop the borrowed watch value before this task parks.
+                    drop(changed);
+                    true
+                }
+            };
+            if severed {
+                // A checkpoint severed this connection. Firecracker sends
+                // no FIN or RST to the host. Hold both pipe ends open so
+                // the driver stays silent. Only EpochSeveredStream can
+                // convert this silence to EOF.
+                std::future::pending::<()>().await;
+            }
+        });
+        self.connection_tasks.push(gate_task.abort_handle());
+        // A severed gate can stay parked. Drop keeps its abort handle.
+        drop(gate_task);
+
+        self.connections_opened += 1;
+        Box::new(engram_sandbox_firecracker::EpochSeveredStream::new(
+            driver_end,
+            self.epoch.subscribe(),
+        ))
     }
 
     fn sever(&mut self) {
-        for connection in self.guest_connections.drain(..) {
-            connection.abort();
-        }
-        self.severances += 1;
         self.epoch.send_modify(|epoch| *epoch += 1);
+        self.severances += 1;
     }
 
     fn counters(&self) -> (u64, u64) {
@@ -350,69 +372,9 @@ impl CosimExecPlane {
 
 impl Drop for CosimExecPlane {
     fn drop(&mut self) {
-        for connection in self.guest_connections.drain(..) {
-            connection.abort();
+        for task in self.connection_tasks.drain(..) {
+            task.abort();
         }
-    }
-}
-
-/// Firecracker's muxer never forwards guest TRANSPORT_RESET as host EOF.
-/// Tokio's duplex normally would, so this wrapper converts peer EOF into a
-/// permanently pending read. The host reader can only escape via its epoch
-/// watch, exactly matching the production failure shape.
-struct SilentHostExecIo {
-    inner: DuplexStream,
-    peer_dropped: bool,
-}
-
-impl SilentHostExecIo {
-    fn new(inner: DuplexStream) -> Self {
-        Self {
-            inner,
-            peer_dropped: false,
-        }
-    }
-}
-
-impl AsyncRead for SilentHostExecIo {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        if this.peer_dropped {
-            return Poll::Pending;
-        }
-        let filled = buf.filled().len();
-        match Pin::new(&mut this.inner).poll_read(cx, buf) {
-            Poll::Ready(Ok(())) if buf.filled().len() == filled => {
-                this.peer_dropped = true;
-                Poll::Pending
-            }
-            result => result,
-        }
-    }
-}
-
-impl AsyncWrite for SilentHostExecIo {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
@@ -642,21 +604,19 @@ impl CosimHost {
         self.sandboxes.get(&sandbox_id).map(|s| s.cursor)
     }
 
-    /// Authorize at most one wrapper spawn, open the first real agentd
-    /// connection, and subscribe the real host reader to this sandbox's
-    /// snapshot epoch.
+    /// Authorize at most one wrapper spawn and open the first real agentd
+    /// connection.
     pub async fn start_exec_transport(
         &mut self,
         sandbox_id: SandboxId,
         cmd: &ExecRequest,
-    ) -> Result<(BoxExecIo, tokio::sync::watch::Receiver<u64>), SandboxError> {
+    ) -> Result<BoxExecIo, SandboxError> {
         let sandbox = self
             .sandboxes
             .get_mut(&sandbox_id)
             .ok_or(SandboxError::NotFound)?;
         sandbox.exec.authorize_start(cmd).await?;
-        let epoch = sandbox.exec.subscribe();
-        Ok((sandbox.exec.connect(), epoch))
+        Ok(sandbox.exec.connect())
     }
 
     /// Open a fresh real agentd handler on the sandbox's surviving journal.
@@ -670,8 +630,8 @@ impl CosimHost {
             .ok_or(SandboxError::NotFound)
     }
 
-    /// Model snapshot `TRANSPORT_RESET`: the guest forgets every connection,
-    /// the host endpoints remain silent, and the epoch wakes host readers.
+    /// Model snapshot `TRANSPORT_RESET`. The gate keeps the host side silent.
+    /// The epoch wrapper converts that silence to EOF.
     pub fn sever_exec_transports(&mut self, sandbox_id: SandboxId) {
         if let Some(sandbox) = self.sandboxes.get_mut(&sandbox_id) {
             sandbox.exec.sever();
@@ -990,9 +950,8 @@ impl CosimHost {
         };
 
         // The eviction/manual capture path reaches the same Firecracker
-        // `prepare_save` hook as a periodic checkpoint: every live guest
-        // connection is forgotten without host EOF and the epoch advances
-        // even though the journal itself survives on the guest disk.
+        // `prepare_save` hook as a periodic checkpoint. Every live guest
+        // connection ends, but the journal survives on the guest disk.
         self.sever_exec_transports(sandbox_id);
 
         let snapshot_id = SnapshotId::from(self.entropy.uuid());

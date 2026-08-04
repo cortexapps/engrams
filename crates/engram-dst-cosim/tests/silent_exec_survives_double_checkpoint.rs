@@ -1,18 +1,17 @@
 //! ADR 0103 failure-matrix row 12, guest half: the reference consumer is a
 //! non-tty `git clone`, which prints NOTHING until it finishes. A silent
-//! exec gives the epoch race no output to prove liveness with — the reader
-//! is parked in `read_msg` for the entire run — so checkpoint severance
-//! during silence is the pure form of the incident. Two back-to-back
-//! checkpoints sever two consecutive connections; the driver must re-attach
-//! each time and deliver the real exit with exactly one spawn and zero
-//! fabricated output.
+//! exec gives the reader no output to prove liveness with. The reader stays
+//! in `read_msg` for the entire run. Two back-to-back checkpoints end two
+//! consecutive connections. The driver must re-attach each time and deliver
+//! the real exit with exactly one spawn and no fabricated output.
 //!
 //! Same composition discipline as `checkpoint_severs_exec_mid_stream`: real
 //! coordinator `exec_stream_core`, real FC protocol driver, real agentd
-//! journal handler; only the severed vsock transport is modeled. Real Tokio
-//! time (real subprocess I/O); FIFOs order every step — the only polling is
-//! a wedge-bounded wait on the transport counters between the re-attach and
-//! the second checkpoint.
+//! journal handler. Only the severed vsock transport is modeled. Its gate
+//! stays silent after each checkpoint. The production epoch wrapper converts
+//! that silence to EOF. The test uses real Tokio time for real subprocess I/O.
+//! FIFOs order every step. The only polling is a wedge-bounded wait on the
+//! transport counters between the re-attach and the second checkpoint.
 
 use std::collections::HashMap;
 use std::time::Duration;
