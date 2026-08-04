@@ -3300,7 +3300,11 @@ impl MetadataStore for PostgresStore {
 
         if !inserted {
             // A retry of the SAME command is the designed no-op; a
-            // prompt_id claimed by a DIFFERENT command is corruption.
+            // prompt_id claimed by a DIFFERENT command — including the
+            // same kind with different text/mode (review finding on
+            // #993: payload must be part of the identity, as it is in
+            // `append_session_event_and_outbox`) — is a Conflict, never
+            // a silent drop.
             let existing = sqlx::query(
                 "SELECT session_id, kind, payload FROM session_outbox WHERE prompt_id = $1",
             )
@@ -3316,7 +3320,12 @@ impl MetadataStore for PostgresStore {
             })?;
             let existing_session: uuid::Uuid = existing.try_get("session_id").map_err(db_err)?;
             let existing_kind: String = existing.try_get("kind").map_err(db_err)?;
-            if existing_session != session_id.as_uuid() || existing_kind != outbox.kind.as_str() {
+            let existing_payload: serde_json::Value =
+                existing.try_get("payload").map_err(db_err)?;
+            if existing_session != session_id.as_uuid()
+                || existing_kind != outbox.kind.as_str()
+                || existing_payload != outbox.payload
+            {
                 return Err(MetaError::Conflict(format!(
                     "outbox id {} belongs to another command",
                     outbox.prompt_id
