@@ -837,10 +837,13 @@ impl Sim {
                         continue;
                     }
                     let now = state.services.clock.now_utc();
-                    // Stamp the event-log cursor exactly as the production
-                    // eviction/checkpoint writers do (idle_evictor.rs's
-                    // `latest_event_idx_at_or_before`). Without it the
-                    // record carries `events_cursor: NULL`, every resume's
+                    // Stamp the event-log cursor with the same primitive
+                    // the production eviction/checkpoint writers use
+                    // (`latest_event_idx_at_or_before`). Production
+                    // anchors at the guest's `paused_at`; the sim world
+                    // has no pause phase, so its checkpoint instant `now`
+                    // IS the pause-equivalent moment. Without the stamp
+                    // the record carries `events_cursor: NULL`, every resume's
                     // `apply_rung1_rewind` early-returns, and the entire
                     // rewind path — the machinery behind
                     // `recovered_from_checkpoint` — is invisible to the

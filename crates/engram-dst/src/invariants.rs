@@ -333,11 +333,11 @@ fn snapshot_safety(world: &SimWorld) -> Result<(), Violation> {
 
 /// USER INPUT IS NEVER GUEST HISTORY (prod 2026-08-03, session
 /// aa0829b0): the rung-1 rewind's positive-provenance tombstone
-/// predicate must never touch a user-authored row — the prompt echo
-/// (`agent_message` with role `user`), a deferred tool answer
-/// (`tool_result_submitted`), or an uploaded file (`file_shared`) —
-/// under ANY interleaving of prompts, checkpoints, evictions, and
-/// resumes. Checked every step, every seed. The rewind path is live in
+/// predicate must never touch a user-authored row — the receipt
+/// (`prompt_received`), the prompt echo (`agent_message` with role
+/// `user`), a deferred tool answer (`tool_result_submitted`), or an
+/// uploaded file (`file_shared`) — under ANY interleaving of prompts,
+/// checkpoints, evictions, and resumes. Checked every step, every seed. The rewind path is live in
 /// the swarm because `Step::HostCheckpoint` stamps `events_cursor`;
 /// the directed non-vacuity case in `tests/rewind_coverage.rs` proves
 /// genuine guest history still rolls back, so this oracle cannot pass
