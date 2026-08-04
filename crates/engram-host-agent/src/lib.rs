@@ -92,6 +92,8 @@ pub struct HostAgent {
     /// ADR 0007 #3a: NVMe-backed chunk cache. Optional; wired in
     /// production to amortise chunk reads across manifests.
     pub chunk_cache: Option<ChunkCache>,
+    /// Root for per-sandbox sparse dirty files.
+    pub dirty_root: Option<PathBuf>,
     /// ADR 0007 Phase 4: pool of `/dev/nbdN` device paths the
     /// daemon allocates from when serving chunked rootfs disks.
     /// `None` keeps the legacy materialize-to-file path active.
@@ -132,6 +134,7 @@ impl HostAgent {
             chunk_store: None,
             image_cache: None,
             chunk_cache: None,
+            dirty_root: None,
             nbd_pool: None,
             host_id: None,
             fc_for_reattach: None,
@@ -176,6 +179,12 @@ impl HostAgent {
     /// (canonical-base images, forks).
     pub fn with_chunk_cache(mut self, cache: ChunkCache) -> Self {
         self.chunk_cache = Some(cache);
+        self
+    }
+
+    /// Set the root for per-sandbox sparse dirty files.
+    pub fn with_dirty_root(mut self, root: PathBuf) -> Self {
+        self.dirty_root = Some(root);
         self
     }
 
@@ -292,6 +301,9 @@ impl HostAgent {
                 if let Some(cache) = self.chunk_cache.clone() {
                     p = p.with_chunk_cache(cache);
                 }
+                if let Some(root) = self.dirty_root.clone() {
+                    p = p.with_dirty_root(root);
+                }
                 if let Some(ic) = self.image_cache.clone() {
                     // ADR 0008 Phase 5: also feed the image cache's
                     // OciClient into the pooled backend so chunked-
@@ -344,6 +356,11 @@ impl HostAgent {
                 // (2026-07-13 incident: a survivor's evict capture ran
                 // 40+ minutes).
                 arc.rehydrate_chain_heads().await;
+                // ADR 0110: Reap files whose sandbox did not survive.
+                // Reap temporary files from dead processes.
+                // Run after reattach completes the live set.
+                // Run before registration can create or resume a sandbox.
+                arc.sweep_dirty_root().await;
                 arc
             };
             // ADR 0084 P1b: the capture-job executor + durable-record
@@ -1701,12 +1718,12 @@ impl HostAgent {
             #[cfg(target_os = "linux")]
             {
                 // Issue #225: BEFORE abandoning the data planes, run a
-                // bounded final disk-flush pass. NBD WRITEs are acked
-                // from the in-RAM dirty tier and only made durable on
-                // the FlushScheduler's ~30 s cadence; abandoning drops
-                // that tier, so without this pass a routine pod roll
-                // silently rolls a surviving guest's disk back by up to
-                // one cadence window of ACKED writes. The pass drains +
+                // bounded final disk-flush pass. ADR 0110 note: acked
+                // writes now survive process death in the per-sandbox
+                // dirty file, so this pass no longer guards against
+                // rollback — it keeps the published manifest fresh so
+                // the successor's recovery has less to upload. It
+                // retires per the ADR 0110 rollout. The pass drains +
                 // uploads each survivor's dirty chunks and synchronously
                 // republishes its live_disk_manifest so the successor
                 // rehydrates from the current ref. It is budgeted against

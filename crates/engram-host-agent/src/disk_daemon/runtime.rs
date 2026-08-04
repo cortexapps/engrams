@@ -52,7 +52,7 @@ use tokio::task::JoinHandle as TokioJoinHandle;
 
 use engram_host_core::{NbdConnectRequest, NbdKernel, NbdReconfigureRequest};
 
-use super::backend::{ChunkedDiskBackend, DiskBackendError, InFlightGuard};
+use super::backend::{ChunkedDiskBackend, DirtyFileOpenMode, DiskBackendError, InFlightGuard};
 use super::nbd::{
     NbdCommand, NbdReply, NbdRequest, MAX_REQUEST_PAYLOAD_BYTES, REPLY_HEADER_LEN,
     REQUEST_HEADER_LEN,
@@ -844,6 +844,31 @@ pub async fn attach_manifest(
     attach_backend(backend, slot_pool, &backend_id).await
 }
 
+pub(crate) async fn attach_manifest_with_dirty_file(
+    disk_manifest_ref: engram_core::types::manifest::ManifestRef,
+    cache: engram_chunk_store::cache::ChunkCache,
+    store: Arc<engram_chunk_store::ChunkStore>,
+    slot_pool: &Arc<NbdSlotAllocator>,
+    threshold_bytes: u64,
+    fork_at_attach: bool,
+    dirty_path: PathBuf,
+) -> Result<NbdSandboxState, NbdRuntimeError> {
+    let backend_id = disk_manifest_ref.manifest_id.to_string();
+    let backend = ChunkedDiskBackend::from_blob_with_dirty_file(
+        disk_manifest_ref,
+        cache,
+        store,
+        threshold_bytes,
+        dirty_path,
+        DirtyFileOpenMode::Truncate,
+    )
+    .await?;
+    if fork_at_attach {
+        backend.fork_manifest_identity().await;
+    }
+    attach_backend(backend, slot_pool, &backend_id).await
+}
+
 /// ADR 0045 C1: attach from manifest CONTENT delivered inline (a
 /// migration destination's not-yet-durable disk manifest).
 pub async fn attach_manifest_content(
@@ -861,6 +886,28 @@ pub async fn attach_manifest_content(
         cache,
         store,
         threshold_bytes,
+    )?;
+    attach_backend(backend, slot_pool, &backend_id).await
+}
+
+pub(crate) async fn attach_manifest_content_with_dirty_file(
+    disk_manifest_ref: engram_core::types::manifest::ManifestRef,
+    manifest: &engram_chunk_store::Manifest,
+    cache: engram_chunk_store::cache::ChunkCache,
+    store: Arc<engram_chunk_store::ChunkStore>,
+    slot_pool: &Arc<NbdSlotAllocator>,
+    threshold_bytes: u64,
+    dirty_path: PathBuf,
+) -> Result<NbdSandboxState, NbdRuntimeError> {
+    let backend_id = disk_manifest_ref.manifest_id.to_string();
+    let backend = ChunkedDiskBackend::from_manifest_with_dirty_file(
+        disk_manifest_ref,
+        manifest,
+        cache,
+        store,
+        threshold_bytes,
+        dirty_path,
+        DirtyFileOpenMode::Truncate,
     )?;
     attach_backend(backend, slot_pool, &backend_id).await
 }
@@ -890,6 +937,54 @@ pub async fn reattach_manifest(
     store: Arc<engram_chunk_store::ChunkStore>,
     slot: NbdSlot,
     threshold_bytes: u64,
+    seed_dirty: Option<Vec<(usize, Vec<u8>)>>,
+) -> Result<NbdSandboxState, (NbdSlot, NbdRuntimeError)> {
+    reattach_manifest_inner(
+        disk_manifest_ref,
+        cache,
+        store,
+        slot,
+        threshold_bytes,
+        None,
+        seed_dirty,
+    )
+    .await
+}
+
+/// This structure groups the stable dirty file inputs for reattachment.
+pub(crate) struct DirtyTierSpec {
+    pub(crate) path: PathBuf,
+    pub(crate) mode: DirtyFileOpenMode,
+    pub(crate) seed: Option<Vec<(usize, Vec<u8>)>>,
+}
+
+pub(crate) async fn reattach_manifest_with_dirty_file(
+    disk_manifest_ref: engram_core::types::manifest::ManifestRef,
+    cache: engram_chunk_store::cache::ChunkCache,
+    store: Arc<engram_chunk_store::ChunkStore>,
+    slot: NbdSlot,
+    threshold_bytes: u64,
+    dirty_tier: DirtyTierSpec,
+) -> Result<NbdSandboxState, (NbdSlot, NbdRuntimeError)> {
+    reattach_manifest_inner(
+        disk_manifest_ref,
+        cache,
+        store,
+        slot,
+        threshold_bytes,
+        Some((dirty_tier.path, dirty_tier.mode)),
+        dirty_tier.seed,
+    )
+    .await
+}
+
+async fn reattach_manifest_inner(
+    disk_manifest_ref: engram_core::types::manifest::ManifestRef,
+    cache: engram_chunk_store::cache::ChunkCache,
+    store: Arc<engram_chunk_store::ChunkStore>,
+    slot: NbdSlot,
+    threshold_bytes: u64,
+    dirty_file: Option<(PathBuf, DirtyFileOpenMode)>,
     // Shutdown-spool adoption (2026-07-16 RCA): the predecessor
     // generation's acked-but-un-uploaded chunks, to seed the fresh
     // backend's dirty tier. MUST be seeded before the RECONFIGURE
@@ -931,12 +1026,32 @@ pub async fn reattach_manifest(
              rehydrate ref's manifest id",
         );
     }
-    let backend =
-        match ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await
-        {
-            Ok(b) => Arc::new(b),
-            Err(e) => return Err((slot, e.into())),
-        };
+    let stable_dirty_file = dirty_file.is_some();
+    let backend_result = match dirty_file {
+        Some((path, mode)) => {
+            ChunkedDiskBackend::from_blob_with_dirty_file(
+                disk_manifest_ref,
+                cache,
+                store,
+                threshold_bytes,
+                path,
+                mode,
+            )
+            .await
+        }
+        None => {
+            ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await
+        }
+    };
+    let backend = match backend_result {
+        Ok(backend) => {
+            if stable_dirty_file {
+                backend.retain_dirty_file().await;
+            }
+            Arc::new(backend)
+        }
+        Err(e) => return Err((slot, e.into())),
+    };
     // Verify-on-read probe target (ADR 0098 P7 rider): the first seeded chunk,
     // captured BEFORE `adopt_unflushed` consumes the seed vec. `None` unless a
     // spool was adopted (and non-empty), so a clean rehydrate pays nothing.
@@ -990,7 +1105,7 @@ pub async fn reattach_manifest(
                 // Verify-on-read (ADR 0098 P7 rider): prove the seeded acked
                 // bytes are readable at their offset through the backend the
                 // RECONFIGURE below is about to hand the kernel — a
-                // single-chunk probe (an in-RAM dirty-tier read), NOT a
+                // single-chunk probe (a dirty-tier read), NOT a
                 // full-disk scan (latency is non-negotiable). This step runs
                 // strictly BEFORE Reconfigure: the kernel releases the
                 // guest's parked I/O the instant it adopts our socket, so a
@@ -1536,7 +1651,29 @@ async fn handle_request(
         }
         NbdCommand::Write => {
             let data = write_data.unwrap_or_default();
-            match backend.write(req.offset, &data).await {
+            // ADR 0110 rollout gate (tradeoff 1). `backend.write` now
+            // completes a `pwrite` into the dirty file BEFORE it acks,
+            // where the RAM map only touched memory. Under memory
+            // pressure the kernel can throttle that `pwrite` into
+            // writeback, which the RAM map never did — so this is the one
+            // latency the honesty newly puts on the guest's critical path.
+            //
+            // Two clock reads and one bucket increment, against a write
+            // that may materialize a whole 16 MiB chunk: the measurement
+            // is far below the noise floor of the thing it measures.
+            //
+            // `metrics_now` is the sanctioned monotonic carve-out for
+            // data-plane histograms (ADR 0098 D1); a raw `Instant::now`
+            // is a hard clippy error in this crate.
+            let started = crate::time_source::metrics_now();
+            let outcome = backend.write(req.offset, &data).await;
+            ::metrics::histogram!(
+                crate::metrics::NBD_WRITE_ACK_SECONDS,
+                "outcome" => if outcome.is_ok() { "ok" } else { "eio" },
+            )
+            .record(started.elapsed().as_secs_f64());
+            ::metrics::histogram!(crate::metrics::NBD_WRITE_BYTES).record(data.len() as f64);
+            match outcome {
                 Ok(()) => (NbdReply::ok(req.handle), None),
                 Err(e) => {
                     tracing::warn!(error = %e, "NBD write failed");
@@ -1544,11 +1681,9 @@ async fn handle_request(
                 }
             }
         }
-        // FLUSH: ack at the wire level but defer durable-flush to the
-        // snapshot path (inline per-FLUSH flush-to-chunk-store would
-        // multiply object-storage cost ~100×; we trade strict-FUA for
-        // cost). TRIM: accept (so the kernel keeps offering trim) but
-        // no-op. Both as in the legacy serial loop.
+        // Acked writes already survive process death in the dirty file.
+        // FLUSH has no more work to do. Periodic uploads cover node death.
+        // TRIM remains a no-op so the kernel can keep offering it.
         NbdCommand::Flush | NbdCommand::Trim => (NbdReply::ok(req.handle), None),
         // Handled in the reader before dispatch; unreachable here.
         NbdCommand::Disconnect => (NbdReply::ok(req.handle), None),

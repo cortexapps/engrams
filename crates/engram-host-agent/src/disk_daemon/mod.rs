@@ -16,7 +16,7 @@
 //!   thing then start the VM." Production parity with Replit /
 //!   Modal style sandboxing.
 //! - **Per-session write isolation.** Writes hit the daemon's
-//!   in-memory dirty-chunk buffer; the base chunks in the chunk
+//!   sparse dirty file; the base chunks in the chunk
 //!   store stay immutable. Two sessions of the same image share
 //!   the base chunks via the local NVMe cache and only diverge in
 //!   their respective daemons.
@@ -30,7 +30,7 @@
 //!   target-agnostic, unit-testable on macOS dev.
 //! - [`backend`] — `ChunkedDiskBackend` data plane: maps NBD offset/
 //!   length to chunk operations. Pure Rust; the per-chunk
-//!   read-fetch / write-into-dirty-buffer logic lives here.
+//!   read-fetch / write-into-dirty-file logic lives here.
 //! - `runtime` (Linux-only) — the NBD server loop + the kernel
 //!   `/dev/nbdN` orchestration (loaded on demand via
 //!   `engram_host_agent::disk_daemon::runtime::spawn`).

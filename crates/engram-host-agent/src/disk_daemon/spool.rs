@@ -1,14 +1,20 @@
 //! Shutdown spool for un-uploaded dirty disk chunks.
 //!
-//! 2026-07-16 session-85e0298a corruption RCA: NBD WRITEs are acked to
-//! the guest from the backend's in-RAM dirty tier; durability rides the
-//! FlushScheduler's ~30 s cadence plus a bounded SIGTERM final-flush
-//! pass. When that pass overran its budget, the dirty tier died with
-//! the process and the successor rehydrated from the last *published*
-//! manifest — silently rolling a live guest's disk back by hundreds of
-//! MiB of ACKED writes (ext4 discovered it minutes later as corrupt
-//! bitmaps / `Structure needs cleaning`; 9 such overruns fleet-wide in
-//! the preceding week).
+//! ADR 0110 status: acked writes now land in a per-sandbox dirty FILE
+//! that survives process death, and `rehydrate_sandbox` seeds from that
+//! file when it exists. The spool remains only as the recovery seed for
+//! a sandbox whose predecessor ran a pre-0110 host-agent (no dirty
+//! file on disk). It retires per the ADR 0110 rollout plan.
+//!
+//! 2026-07-16 session-85e0298a corruption RCA (the world this was built
+//! for): NBD WRITEs were acked to the guest from the backend's in-RAM
+//! dirty tier; durability rode the FlushScheduler's ~30 s cadence plus
+//! a bounded SIGTERM final-flush pass. When that pass overran its
+//! budget, the dirty tier died with the process and the successor
+//! rehydrated from the last *published* manifest — silently rolling a
+//! live guest's disk back by hundreds of MiB of ACKED writes (ext4
+//! discovered it minutes later as corrupt bitmaps / `Structure needs
+//! cleaning`; 9 such overruns fleet-wide in the preceding week).
 //!
 //! The spool closes that window: at shutdown, after the data planes are
 //! abandoned (serve loops dead, so the tier is frozen and later guest
