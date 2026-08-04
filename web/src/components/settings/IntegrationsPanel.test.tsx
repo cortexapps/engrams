@@ -373,12 +373,23 @@ describe("IntegrationsPanel (marketplace)", () => {
       await screen.findByRole("heading", { name: "Set up Production read only" }),
     ).toBeTruthy();
     expect(screen.queryByText(/gcloud iam workload-identity-pools create/)).toBeNull();
-    await waitFor(() => {
-      const terraformCode = container.querySelector(
-        'code[data-language="terraform"][data-highlighted="true"]',
-      );
-      expect(terraformCode?.textContent).toContain("google_iam_workload_identity_pool");
-    });
+    // The FIRST highlight in the worker is expensive: shiki's JS regex engine
+    // compiles the terraform grammar and tokenizes the generated config. Measured
+    // ~190ms in isolation, against ~2ms for the shellscript wait below once the
+    // engine is warm. `waitFor`'s 1s default leaves only ~5x headroom, and a
+    // contended full-suite run eats it (this timed out on 2026-08-04, then passed
+    // alone and on rerun). Pre-resolving the React.lazy chunk does NOT help —
+    // measured 193ms without the warm import vs 201ms with it — so the budget,
+    // not the import, is what needs fixing.
+    await waitFor(
+      () => {
+        const terraformCode = container.querySelector(
+          'code[data-language="terraform"][data-highlighted="true"]',
+        );
+        expect(terraformCode?.textContent).toContain("google_iam_workload_identity_pool");
+      },
+      { timeout: 5000 },
+    );
 
     await user.click(screen.getByRole("tab", { name: /gcloud/i }));
     await waitFor(() => {
