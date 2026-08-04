@@ -3031,7 +3031,13 @@ impl MetadataStore for SimMetadataStore {
                     db.outbox.insert(row.prompt_id.clone(), row.clone());
                 }
                 Some(existing) => {
-                    if existing.session_id != row.session_id || existing.kind != row.kind {
+                    // Payload is part of the command identity (review
+                    // finding on #993, PG parity): a reused prompt_id
+                    // with different text/mode conflicts, never drops.
+                    if existing.session_id != row.session_id
+                        || existing.kind != row.kind
+                        || existing.payload != row.payload
+                    {
                         return Err(MetaError::Conflict(format!(
                             "outbox id {} belongs to another command",
                             row.prompt_id
