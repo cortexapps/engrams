@@ -231,6 +231,35 @@
       "match": {
         "operation": "mutation",
         "field": "issueCreate"
+      },
+      "comment": "GraphQL asset parity (PR #904 rules): responses echo only the client's selection set, so every field is response-first with a $.vars fallback, and issue URLs/identifiers additionally derive from the returned URL.",
+      "asset": {
+        "kind": "issue",
+        "surface": "asset",
+        "success": {
+          "noGraphqlErrors": true
+        },
+        "data": {
+          "identifier": [
+            "$.resp.data.issueCreate.issue.identifier"
+          ],
+          "title": [
+            "$.resp.data.issueCreate.issue.title",
+            "$.vars.input.title"
+          ],
+          "team_id": [
+            "$.vars.input.teamId"
+          ]
+        },
+        "fetchable": {
+          "external": "$.resp.data.issueCreate.issue.url"
+        },
+        "urlFallback": {
+          "pattern": "https://linear.app/{workspace}/issue/{identifier}/{slug}",
+          "fields": {
+            "identifier": "{identifier}"
+          }
+        }
       }
     },
     {
@@ -240,6 +269,32 @@
       "match": {
         "operation": "mutation",
         "field": "issueUpdate"
+      },
+      "comment": "GraphQL asset parity (PR #904 rules): responses echo only the client's selection set, so every field is response-first with a $.vars fallback, and issue URLs/identifiers additionally derive from the returned URL.",
+      "asset": {
+        "kind": "issue",
+        "surface": "action",
+        "success": {
+          "noGraphqlErrors": true
+        },
+        "data": {
+          "identifier": [
+            "$.resp.data.issueUpdate.issue.identifier"
+          ],
+          "title": [
+            "$.resp.data.issueUpdate.issue.title",
+            "$.vars.input.title"
+          ]
+        },
+        "fetchable": {
+          "external": "$.resp.data.issueUpdate.issue.url"
+        },
+        "urlFallback": {
+          "pattern": "https://linear.app/{workspace}/issue/{identifier}/{slug}",
+          "fields": {
+            "identifier": "{identifier}"
+          }
+        }
       }
     },
     {
@@ -267,6 +322,25 @@
       "match": {
         "operation": "mutation",
         "field": "commentCreate"
+      },
+      "comment": "GraphQL asset parity (PR #904 rules): responses echo only the client's selection set, so every field is response-first with a $.vars fallback, and issue URLs/identifiers additionally derive from the returned URL.",
+      "asset": {
+        "kind": "comment",
+        "surface": "action",
+        "success": {
+          "noGraphqlErrors": true
+        },
+        "data": {
+          "issue_id": [
+            "$.vars.input.issueId"
+          ],
+          "issue_identifier": [
+            "$.resp.data.commentCreate.comment.issue.identifier"
+          ]
+        },
+        "fetchable": {
+          "external": "$.resp.data.commentCreate.comment.url"
+        }
       }
     },
     {
@@ -375,6 +449,23 @@
       "match": {
         "operation": "mutation",
         "field": "projectCreate"
+      },
+      "comment": "GraphQL asset parity (PR #904 rules): responses echo only the client's selection set, so every field is response-first with a $.vars fallback, and issue URLs/identifiers additionally derive from the returned URL.",
+      "asset": {
+        "kind": "project",
+        "surface": "asset",
+        "success": {
+          "noGraphqlErrors": true
+        },
+        "data": {
+          "name": [
+            "$.resp.data.projectCreate.project.name",
+            "$.vars.input.name"
+          ]
+        },
+        "fetchable": {
+          "external": "$.resp.data.projectCreate.project.url"
+        }
       }
     },
     {
@@ -384,6 +475,23 @@
       "match": {
         "operation": "mutation",
         "field": "projectUpdate"
+      },
+      "comment": "GraphQL asset parity (PR #904 rules): responses echo only the client's selection set, so every field is response-first with a $.vars fallback, and issue URLs/identifiers additionally derive from the returned URL.",
+      "asset": {
+        "kind": "project",
+        "surface": "action",
+        "success": {
+          "noGraphqlErrors": true
+        },
+        "data": {
+          "name": [
+            "$.resp.data.projectUpdate.project.name",
+            "$.vars.input.name"
+          ]
+        },
+        "fetchable": {
+          "external": "$.resp.data.projectUpdate.project.url"
+        }
       }
     },
     {
@@ -393,6 +501,22 @@
       "match": {
         "operation": "mutation",
         "field": "projectUpdateCreate"
+      },
+      "comment": "GraphQL asset parity (PR #904 rules): responses echo only the client's selection set, so every field is response-first with a $.vars fallback, and issue URLs/identifiers additionally derive from the returned URL.",
+      "asset": {
+        "kind": "project_update",
+        "surface": "asset",
+        "success": {
+          "noGraphqlErrors": true
+        },
+        "data": {
+          "project_id": [
+            "$.vars.input.projectId"
+          ]
+        },
+        "fetchable": {
+          "external": "$.resp.data.projectUpdateCreate.projectUpdate.url"
+        }
       }
     }
   ],

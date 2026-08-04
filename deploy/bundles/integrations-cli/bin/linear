@@ -113,7 +113,7 @@ comment)
     text="$*"
     [ -n "$text" ] || { echo "usage: linear comment <issueId> <text...>" >&2; exit 2; }
     vars=$(printf '{"issueId":%s,"body":%s}' "$(json_str "$issue")" "$(json_str "$text")")
-    gql 'mutation Comment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } } }' "$vars"
+    gql 'mutation Comment($issueId: String!, $body: String!) { commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id url } } }' "$vars"
     ;;
 create)
     team="${1:?usage: linear create <teamId> <title> [description]}"

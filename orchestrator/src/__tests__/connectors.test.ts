@@ -1156,7 +1156,27 @@ describe("cli facet (ADR 0058)", () => {
       expect(inj.path_globs).toEqual(["/graphql"]);
       expect(inj.graphql_operation).toBe("mutation");
     }
+    // Write mutations observe as assets/actions (GraphQL asset-parity
+    // rules: response-first data with $.vars fallbacks; issue identifiers
+    // additionally derive from the returned URL).
+    const observes = new Map(policy.observes.map((o) => [o.graphql_field, o]));
+    const issueCreate = observes.get("issueCreate")!;
+    expect(issueCreate.provider).toBe("linear");
+    expect(issueCreate.asset_kind).toBe("issue");
+    expect(issueCreate.surface).toBe("asset");
+    expect(issueCreate.success_no_graphql_errors).toBe(true);
+    expect(issueCreate.data).toContainEqual(["title", "$.vars.input.title"]);
+    expect(issueCreate.fetchable).toBe("$.resp.data.issueCreate.issue.url");
+    expect(issueCreate.url_fallback?.pattern).toBe(
+      "https://linear.app/{workspace}/issue/{identifier}/{slug}",
+    );
+    expect(observes.get("issueUpdate")?.surface).toBe("action");
+    expect(observes.get("commentCreate")?.surface).toBe("action");
+    // Reads observe nothing.
+    const readPolicy = compileIntegrationPolicy(["linear:issues:read"]);
+    expect(readPolicy.observes).toEqual([]);
     expect(policy.injects.some((i) => i.graphql_field === "issueCreate")).toBe(true);
+
     expect(policy.injects.some((i) => i.graphql_field === "issues")).toBe(false);
     expect(policy.network.allow_hosts).toEqual(["api.linear.app"]);
   });
