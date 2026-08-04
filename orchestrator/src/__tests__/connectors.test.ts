@@ -1099,6 +1099,34 @@ describe("cli facet (ADR 0058)", () => {
     expect(plan.bundles).toEqual([INTEGRATIONS_CLI_BUNDLE]);
   });
 
+  test("the built-in linear seed is OAuth-only (actor=app) with a viewer probe", () => {
+    const linear = connectorRegistry().get("linear")!;
+    // OAuth-only: no secretRef on the inject; Bearer template for the app token.
+    expect(linear.credential.source).toBe("inject");
+    if (linear.credential.source === "inject") {
+      expect(linear.credential.injects).toEqual([{ header: "Authorization", template: "Bearer {}" }]);
+    }
+    expect(linear.oauth?.tokenUrl).toBe("https://api.linear.app/oauth/token");
+    expect(linear.oauth?.acquisitionHosts).toEqual(["linear.app"]);
+    expect(linear.oauth?.scopes).toEqual(["read", "write"]);
+    expect(linear.oauth?.extraAuthorizeParams).toEqual({ actor: "app" });
+    expect(linear.oauth?.metadata?.probe?.map.accountId).toBe("data.viewer.id");
+    // The authorize host is acquisition-plane only: session egress never
+    // opens linear.app, and the compiled inject is brokered-source.
+    expect(linear.hosts).toEqual(["api.linear.app"]);
+    // The seed's action slug is "linear:graphql" (provider-prefixed since
+    // PR #434), so the full capability string carries the provider twice.
+    const policy = compileIntegrationPolicy(["linear:linear:graphql"]);
+    expect(policy.injects).toHaveLength(1);
+    expect(policy.injects[0]!.mint_source).toEqual({
+      oauth_connector: { connection_id: "test-linear", provider: "linear" },
+    });
+    expect(policy.injects[0]!.header_template).toBe("Bearer {}");
+    expect(policy.injects[0]!.methods).toEqual(["POST"]);
+    expect(policy.injects[0]!.path_globs).toEqual(["/graphql"]);
+    expect(policy.network.allow_hosts).toEqual(["api.linear.app"]);
+  });
+
   test("the built-in slack seed ships the slack CLI + an auth.test gate", () => {
     const slack = connectorRegistry().get("slack")!;
     expect(slack.cli?.bins).toEqual(["slack"]);

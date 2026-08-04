@@ -1,18 +1,17 @@
 #!/bin/sh
 # engrams Linear CLI — a thin wrapper over the Linear GraphQL API.
 #
-# Auth is brokered (ADR 0056/0057): this carries only the `LINEAR_API_KEY`
-# placeholder; the egress proxy injects the real, capability-scoped personal API
-# key on every request to api.linear.app (and strips any value you supply). There
-# is NOTHING to log in to — do not set a real key or run any `login`.
+# Auth is brokered (ADR 0056/0057 + the 0106 addendum): this carries only the
+# `LINEAR_API_KEY` placeholder; the egress proxy overwrites the Authorization
+# header with the workspace's Linear OAuth app token (actor=app, refreshed
+# server-side) on every request to api.linear.app (and strips any value you
+# supply). There is NOTHING to log in to — do not set a real key or run any
+# `login`.
 #
 # Linear is a GraphQL-only API: ONE endpoint (POST /graphql). It has a SINGLE
 # power, `linear:graphql`, which grants both reads (queries) AND writes
 # (mutations) — read/write cannot be split by path on a GraphQL API. A request is
 # denied at the network boundary, not authenticated, if your profile lacks it.
-#
-# The personal API key is sent as a RAW Authorization header (no "Bearer" prefix);
-# OAuth would use Bearer, but engrams brokers a personal key.
 set -eu
 
 API="https://api.linear.app/graphql"
