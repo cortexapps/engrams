@@ -20,9 +20,24 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "time"] }
 tracing.workspace = true
 sha2.workspace = true
+# Only for installing ring as the process CryptoProvider in
+# `OciClient::new` — see the comment there.
+rustls.workspace = true
 tar.workspace = true
 flate2.workspace = true
-oci-client = { version = "0.15", default-features = false, features = ["rustls-tls"] }
+# No oci-client TLS feature on purpose. 0.17's `rustls-tls` enables
+# `reqwest/rustls` (which turns on rustls's aws-lc-rs provider) and
+# `jsonwebtoken/aws_lc_rs` — either one puts a second crypto provider in
+# a tree the workspace pins to ring, and rustls then panics at runtime on
+# provider ambiguity. `reqwest13` below supplies the TLS stack instead.
+oci-client = { version = "0.17", default-features = false }
+# Feature steer for oci-client's reqwest (0.13 — a different major than
+# the workspace's 0.12, so it needs its own TLS enablement). Never import
+# this: `rustls-no-provider` switches the shared rustls node to "use the
+# one provider the workspace enables" — ring — and keeps provider choice
+# a compile-time fact. jsonwebtoken's backend arrives the same way, by
+# unification with the workspace's `rust_crypto` selection.
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 parking_lot.workspace = true
 reqwest.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }

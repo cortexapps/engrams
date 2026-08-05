@@ -96,9 +96,13 @@ impl OciClient {
                     .manifests
                     .iter()
                     .find(|e| {
-                        e.platform
-                            .as_ref()
-                            .is_some_and(|p| p.os == os && p.architecture == architecture)
+                        // oci-spec 0.9 made these typed enums. `From<&str>`
+                        // maps an unrecognized value to `Other(..)`, so
+                        // equality still matches exactly what the index
+                        // declares.
+                        e.platform.as_ref().is_some_and(|p| {
+                            p.os == os.into() && p.architecture == architecture.into()
+                        })
                     })
                     .ok_or_else(|| {
                         let available: Vec<String> = index
