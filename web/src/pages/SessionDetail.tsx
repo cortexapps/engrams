@@ -133,12 +133,14 @@ export function SessionDetail() {
   // ADR 0063 B2 echo: the orchestrator persists the EFFECTIVE selection
   // (override ?? profile ?? catalog default) on the task at create time.
   // Unset on tasks that pre-date the echo columns; "" (proto3 unset) = absent.
-  const selection = {
-    harness: task?.harness || undefined,
-    model: task?.model || undefined,
-    effort: task?.effort || undefined,
-  };
-  const effectiveSelection = Object.values(selection).some(Boolean) ? selection : null;
+  const effectiveSelection =
+    task?.harness || task?.model || task?.effort
+      ? {
+          harness: task.harness || undefined,
+          model: task.model || undefined,
+          effort: task.effort || undefined,
+        }
+      : null;
   const { events, streamingText } = useSessionEvents(id);
 
   // The in-guest browser (Xvfb + VNC, ADR 0065) is an optional capability,

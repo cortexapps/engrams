@@ -47,6 +47,16 @@ export function countChange(change: FileChange): { additions: number; deletions:
   return { additions, deletions };
 }
 
+export function totalCounts(rollups: FileChangeRollup[]): { additions: number; deletions: number } {
+  let additions = 0;
+  let deletions = 0;
+  for (const rollup of rollups) {
+    additions += rollup.additions;
+    deletions += rollup.deletions;
+  }
+  return { additions, deletions };
+}
+
 export function extractFileChanges(events: IndexedEvent[]): FileChangeRollup[] {
   const rollups: FileChangeRollup[] = [];
   const byPath = new Map<string, FileChangeRollup>();

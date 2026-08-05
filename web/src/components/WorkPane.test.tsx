@@ -222,13 +222,13 @@ describe("WorkPane", () => {
 });
 
 describe("stripLayout", () => {
-  // 5 views, first 3 primary (overview/browser/ide).
+  // 5 views, first 3 primary (overview/browser/ide), 30px icon-only tabs.
   const labeled = [60, 70, 50, 60, 60];
-  const icons = [30, 30, 30, 30, 30];
+  const ICON = 30;
   const PRIMARY = 3;
 
   test("keeps every label when the labeled set fits", () => {
-    expect(stripLayout(labeled, icons, 30, 2, 310, PRIMARY)).toEqual({
+    expect(stripLayout(labeled, ICON, 30, 2, 310, PRIMARY)).toEqual({
       count: 5,
       iconOnly: false,
     });
@@ -236,7 +236,7 @@ describe("stripLayout", () => {
 
   test("sheds labeled extras into More down to the primary core", () => {
     // More(30) + 62 + 72 + 52 = 216 — three labeled tabs fit, two overflow.
-    expect(stripLayout(labeled, icons, 30, 2, 230, PRIMARY)).toEqual({
+    expect(stripLayout(labeled, ICON, 30, 2, 230, PRIMARY)).toEqual({
       count: 3,
       iconOnly: false,
     });
@@ -244,7 +244,7 @@ describe("stripLayout", () => {
 
   test("drops to icons only when the labeled core no longer fits", () => {
     // Two labeled tabs fit (< 3 primaries) but all five icons do.
-    expect(stripLayout(labeled, icons, 30, 2, 170, PRIMARY)).toEqual({
+    expect(stripLayout(labeled, ICON, 30, 2, 170, PRIMARY)).toEqual({
       count: 5,
       iconOnly: true,
     });
@@ -252,17 +252,17 @@ describe("stripLayout", () => {
 
   test("collapses the icon suffix behind the More trigger", () => {
     // More(30) + 32 + 32 = 94; the third icon would need 126.
-    expect(stripLayout(labeled, icons, 30, 2, 100, PRIMARY)).toEqual({
+    expect(stripLayout(labeled, ICON, 30, 2, 100, PRIMARY)).toEqual({
       count: 2,
       iconOnly: true,
     });
   });
 
   test("keeps at least one tab visible", () => {
-    expect(stripLayout(labeled, icons, 30, 2, 10, PRIMARY)).toEqual({ count: 1, iconOnly: true });
+    expect(stripLayout(labeled, ICON, 30, 2, 10, PRIMARY)).toEqual({ count: 1, iconOnly: true });
   });
 
   test("returns every labeled tab for layout-free measurements", () => {
-    expect(stripLayout([0, 0, 0], [0, 0, 0], 0, 0, 0, 1)).toEqual({ count: 3, iconOnly: false });
+    expect(stripLayout([0, 0, 0], 0, 0, 0, 0, 1)).toEqual({ count: 3, iconOnly: false });
   });
 });

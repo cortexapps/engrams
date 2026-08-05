@@ -78,10 +78,11 @@ function fittingPrefix(widths: number[], moreWidth: number, gapPx: number, avail
 
 /** Widest-first strip layout, in three stages: every tab labeled → a labeled
  *  prefix + More, shrinking no further than the first `primaryCount` tabs
- *  (Overview/Browser/IDE) → icon-only tabs, again as many as fit + More. */
+ *  (Overview/Browser/IDE) → icon-only tabs, again as many as fit + More.
+ *  Icon-only tabs all share one width, so a single `iconWidth` measures them. */
 export function stripLayout(
   labeledWidths: number[],
-  iconWidths: number[],
+  iconWidth: number,
   moreWidth: number,
   gapPx: number,
   available: number,
@@ -99,6 +100,7 @@ export function stripLayout(
   const labeledCount = fittingPrefix(labeledWidths, moreWidth, gapPx, available);
   if (labeledCount >= primaryCount) return { count: labeledCount, iconOnly: false };
 
+  const iconWidths = Array<number>(all).fill(iconWidth);
   if (fitsAll(iconWidths, gapPx, available)) return { count: all, iconOnly: true };
   return {
     count: Math.max(1, fittingPrefix(iconWidths, moreWidth, gapPx, available)),
@@ -261,19 +263,25 @@ export function WorkPane({
     if (!strip || !measurement) return;
 
     const measure = () => {
-      // The measurement row holds the labeled set, then the icon-only set,
+      // The measurement row holds the labeled set, then one icon-only tab,
       // then the More trigger — sliced back apart by position here.
       const children = Array.from(measurement.children) as HTMLElement[];
       const more = children.pop();
-      if (!more || children.length % 2 !== 0) return;
-      const half = children.length / 2;
+      const icon = children.pop();
+      if (!more || !icon) return;
       const width = (el: HTMLElement) => el.getBoundingClientRect().width;
-      const labeledWidths = children.slice(0, half).map(width);
-      const iconWidths = children.slice(half).map(width);
+      const labeledWidths = children.map(width);
       const style = getComputedStyle(measurement);
       const gapPx = Number.parseFloat(style.columnGap || style.gap) || 0;
       setLayout(
-        stripLayout(labeledWidths, iconWidths, width(more), gapPx, strip.clientWidth, primaryCount),
+        stripLayout(
+          labeledWidths,
+          width(icon),
+          width(more),
+          gapPx,
+          strip.clientWidth,
+          primaryCount,
+        ),
       );
     };
 
@@ -331,17 +339,9 @@ export function WorkPane({
                 <span>{view.label}</span>
               </Button>
             ))}
-            {views.map((view) => (
-              <Button
-                key={`icon-${view.id}`}
-                variant="ghost"
-                size="sm"
-                className={TAB_CLASS_NAME}
-                tabIndex={-1}
-              >
-                <view.icon />
-              </Button>
-            ))}
+            <Button variant="ghost" size="sm" className={TAB_CLASS_NAME} tabIndex={-1}>
+              <PanelsTopLeft />
+            </Button>
             <Button variant="ghost" size="sm" className={TAB_CLASS_NAME} tabIndex={-1}>
               <MoreHorizontal />
             </Button>

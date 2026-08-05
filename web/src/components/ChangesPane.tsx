@@ -3,23 +3,13 @@ import { ChevronDownIcon, FileDiffIcon } from "lucide-react";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 import type { IndexedEvent } from "../events";
-import { beforeAfter, extractFileChanges } from "./session-thread/fileChanges";
+import { beforeAfter, extractFileChanges, totalCounts } from "./session-thread/fileChanges";
 
 const PierreDiff = lazy(() => import("./session-thread/PierreDiff"));
 
 export function ChangesPane({ events }: { events: IndexedEvent[] }) {
   const files = useMemo(() => extractFileChanges(events), [events]);
-  const totals = useMemo(
-    () =>
-      files.reduce(
-        (sum, file) => ({
-          additions: sum.additions + file.additions,
-          deletions: sum.deletions + file.deletions,
-        }),
-        { additions: 0, deletions: 0 },
-      ),
-    [files],
-  );
+  const totals = totalCounts(files);
 
   if (files.length === 0) {
     return (
@@ -72,11 +62,11 @@ export function ChangesPane({ events }: { events: IndexedEvent[] }) {
               />
             </CollapsibleTrigger>
             <CollapsibleContent>
-              {file.changes.map((entry, index) => {
+              {file.changes.map((entry) => {
                 const { before, after } = beforeAfter(entry.change);
                 return (
                   <div
-                    key={`${entry.toolCallId}-${index}`}
+                    key={entry.toolCallId}
                     className="max-h-[32rem] overflow-auto border-t text-xs"
                   >
                     <Suspense

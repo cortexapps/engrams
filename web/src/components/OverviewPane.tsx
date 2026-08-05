@@ -15,7 +15,7 @@ import { statusLabel } from "../pages/sessions/session-format";
 import { StatusGlyph } from "./Glyph";
 import { ExposedPortsSection } from "./ports/ExposedPortsSection";
 import { ProfileChip } from "./profiles/ProfileChip";
-import { extractFileChanges } from "./session-thread/fileChanges";
+import { extractFileChanges, totalCounts } from "./session-thread/fileChanges";
 
 export interface OverviewSelection {
   harness?: string;
@@ -43,17 +43,7 @@ export function OverviewPane({
   onShowChanges,
 }: OverviewPaneProps) {
   const files = useMemo(() => extractFileChanges(events), [events]);
-  const totals = useMemo(
-    () =>
-      files.reduce(
-        (sum, file) => ({
-          additions: sum.additions + file.additions,
-          deletions: sum.deletions + file.deletions,
-        }),
-        { additions: 0, deletions: 0 },
-      ),
-    [files],
-  );
+  const totals = totalCounts(files);
   const { data } = usePrRefs(taskId, sessionId);
   const prRefs = data?.prRefs ?? [];
   const selectionLabel = selection
