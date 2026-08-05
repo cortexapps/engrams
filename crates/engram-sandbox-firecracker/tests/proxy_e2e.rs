@@ -43,8 +43,8 @@ use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use parking_lot::Mutex;
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
-    SanType,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -103,7 +103,9 @@ async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> (SocketAddr, rustls::Ro
     };
     params.subject_alt_names = vec![SanType::DnsName(TEST_HOST.try_into().unwrap())];
     let kp = KeyPair::generate().unwrap();
-    let cert = params.signed_by(&kp, &ca_cert, &ca_key).unwrap();
+    let cert = params
+        .signed_by(&kp, &Issuer::from_params(&ca_params, &ca_key))
+        .unwrap();
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let ca_der = CertificateDer::from(ca_cert.der().to_vec());
     let key_der: PrivateKeyDer<'static> =

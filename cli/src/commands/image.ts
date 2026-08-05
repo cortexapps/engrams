@@ -8,7 +8,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { parse as parseToml } from "smol-toml";
+import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 
 import type { Clients } from "../client.ts";
 import { detail, fail, failWith, printJson, table, truncate } from "../output.ts";
@@ -188,6 +188,73 @@ export async function pollJob(c: Clients, jobId: string, json: boolean): Promise
 }
 
 // ---- image verbs ----------------------------------------------------------
+
+/** Drop keys whose value is undefined so smol-toml can serialize the object. */
+function compact<T extends Record<string, unknown>>(o: T): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined));
+}
+
+/**
+ * Print an enabled image's LIVE stored config (the enabled_images row — the
+ * source of truth the UI edits) as image-config TOML. The output round-trips
+ * through `enable --config` / `update --config`, so this is the backup and
+ * disaster-recovery path now that repos no longer keep a config file.
+ */
+export async function config(c: Clients, uri: string, json: boolean): Promise<void> {
+  const resp = await c.image.listEnabledImages({}).catch(failWith);
+  const img = resp.images.find((i) => i.imageUri === uri);
+  if (!img) fail(`no enabled image with uri ${uri}`);
+  const cfg = img.config;
+  if (!cfg) fail(`enabled image ${uri} has no stored config`);
+  const out = compact({
+    name: cfg.name,
+    description: cfg.description,
+    env: Object.keys(cfg.env).length > 0 ? cfg.env : undefined,
+    workdir: cfg.workdir,
+    resources: cfg.resources
+      ? compact({
+          suggested_memory_mib: cfg.resources.suggestedMemoryMib,
+          suggested_vcpus: cfg.resources.suggestedVcpus,
+          suggested_disk_gib: cfg.resources.suggestedDiskGib,
+        })
+      : undefined,
+    warm: cfg.warm
+      ? compact({
+          command: cfg.warm.command,
+          timeout_secs:
+            cfg.warm.timeoutSecs !== undefined ? Number(cfg.warm.timeoutSecs) : undefined,
+          workdir: cfg.warm.workdir,
+          env: cfg.warm.env.length > 0
+            ? cfg.warm.env.map((e) =>
+                compact({
+                  name: e.name,
+                  value: e.value.case === "literal" ? e.value.value : undefined,
+                  secret_ref: e.value.case === "secretRef" ? e.value.value : undefined,
+                }),
+              )
+            : undefined,
+          network: cfg.warm.network
+            ? compact({
+                default: cfg.warm.network.default,
+                allow_hosts:
+                  cfg.warm.network.allowHosts.length > 0
+                    ? cfg.warm.network.allowHosts
+                    : undefined,
+                allow_host_patterns:
+                  cfg.warm.network.allowHostPatterns.length > 0
+                    ? cfg.warm.network.allowHostPatterns
+                    : undefined,
+              })
+            : undefined,
+        })
+      : undefined,
+  });
+  if (json) {
+    printJson(out);
+    return;
+  }
+  console.log(stringifyToml(out));
+}
 
 export async function list(c: Clients, json: boolean): Promise<void> {
   const resp = await c.image.listEnabledImages({}).catch(failWith);

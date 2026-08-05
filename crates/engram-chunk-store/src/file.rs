@@ -347,6 +347,28 @@ impl ChunkStore {
         let mut by_offset: BTreeMap<u64, ChunkRef> =
             prev.chunks.iter().map(|c| (c.offset, c.clone())).collect();
 
+        // One PUT per distinct hash per batch (2026-08-04 chain-poison
+        // alert): different dirty chunks can rebuild to the SAME
+        // content — a moved buffer, a repeated fill — and this phase
+        // then issued one unchecked PUT per occurrence. GCS caps
+        // mutations of one object at ~1/s, so the concurrent duplicate
+        // CREATEs 429'd, the capture failed after FC consumed the dirty
+        // bitmap, and the chain was poisoned. First claimant uploads;
+        // siblings skip. A skipped sibling cannot outrun its leader:
+        // the manifest publishes only after `try_collect` returns,
+        // which awaits every task, the leader included.
+        //
+        // Pre-seeding with the prev manifest's hashes extends the
+        // `unchanged` skip below from "matches its own prev chunk" to
+        // "matches ANY prev chunk": prev published ⇒ every chunk it
+        // references is durable (ADR 0007 publish-after-chunks — the
+        // same ordering the carried-over refs already lean on), so
+        // content that moved between offsets re-uploads nothing and,
+        // crucially, never re-CREATEs a durable object (each re-CREATE
+        // is a mutation that counts against the same ~1/s cap).
+        let claimed: parking_lot::Mutex<std::collections::HashSet<crate::manifest::ChunkHash>> =
+            parking_lot::Mutex::new(prev.chunks.iter().map(|c| c.hash).collect());
+
         // ADR 0039 item #19: each dirty chunk is independent — its
         // result depends only on its prev content (fetched by hash,
         // order-free) and the diff bytes that fall inside it. Drive the
@@ -382,6 +404,7 @@ impl ChunkStore {
                 let store = self.clone();
                 let diff_path = diff_path.to_path_buf();
                 let local_sink = local_sink.cloned();
+                let claimed = &claimed;
                 async move {
                     let mut slice = vec![0u8; want];
 
@@ -458,12 +481,24 @@ impl ChunkStore {
                                     "mode" => "sparse", "outcome" => "unchanged"
                                 )
                                 .increment(1);
+                            } else if !claimed.lock().insert(hash) {
+                                // A batch sibling already uploaded (or is
+                                // uploading) this exact content, or a prev
+                                // chunk at another offset already made it
+                                // durable. Either way the PUT would be a
+                                // duplicate mutation of a write-once object
+                                // — the 429 shape above.
+                                metrics::counter!(
+                                    "engram_chunk_put_total",
+                                    "mode" => "sparse", "outcome" => "deduped"
+                                )
+                                .increment(1);
                             } else {
-                                // Changed content is new by construction
-                                // (the hash moved), so the dedup HEAD would
-                                // always miss — unchecked PUT, the ADR 0078
-                                // move-5 posture the NBD flush path already
-                                // uses.
+                                // Content no prior chunk and no batch
+                                // sibling carries — new to this chain, so
+                                // the dedup HEAD would almost always miss:
+                                // unchecked PUT, the ADR 0078 move-5
+                                // posture the NBD flush path already uses.
                                 store.put_chunk_unchecked_prehashed(hash, &slice).await?;
                             }
                             hash
@@ -872,6 +907,107 @@ mod tests {
             &data[cs as usize..],
             "the changed chunk's bytes are durably fetchable",
         );
+    }
+
+    /// 2026-08-04 chain-poison alert: distinct dirty chunks that rebuild
+    /// to IDENTICAL new content upload ONCE. Every occurrence past the
+    /// first was a duplicate CREATE of the same write-once object, and
+    /// GCS's ~1/s per-object mutation cap 429'd the siblings — failing
+    /// the capture after the dirty bitmap was consumed and poisoning
+    /// the chain.
+    #[tokio::test]
+    async fn sparse_rechunk_uploads_duplicate_new_content_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().join("blob")));
+        let counting = crate::test_support::CountingBlob::wrap(inner);
+        let s = ChunkStore::new(counting.clone());
+
+        let cs = 4096u64;
+        // Three distinct chunks; the diff rewrites chunks 1 AND 2 to
+        // the same new content.
+        let mut data = vec![1u8; (3 * cs) as usize];
+        data[cs as usize..(2 * cs) as usize].fill(2);
+        data[(2 * cs) as usize..].fill(3);
+        let src = dir.path().join("mem.bin");
+        fs::write(&src, &data).await.unwrap();
+        let prev = s
+            .chunk_file(&src, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+
+        data[cs as usize..].fill(9);
+        let diff = dir.path().join("mem.diff");
+        fs::write(&diff, &data).await.unwrap();
+
+        let puts_before = counting.put_count();
+        let next = s
+            .update_for_dirty_ranges_sparse(&prev, &diff, &[(cs, 2 * cs)])
+            .await
+            .unwrap();
+        assert_eq!(
+            counting.put_count() - puts_before,
+            1,
+            "identical rebuilt content uploads exactly once",
+        );
+        let h1 = next.chunks.iter().find(|c| c.offset == cs).unwrap().hash;
+        let h2 = next
+            .chunks
+            .iter()
+            .find(|c| c.offset == 2 * cs)
+            .unwrap()
+            .hash;
+        assert_eq!(h1, h2, "both offsets reference the shared chunk");
+        let out = dir.path().join("out.bin");
+        s.materialize_to_file(&next, &out).await.unwrap();
+        assert_eq!(fs::read(&out).await.unwrap(), data);
+    }
+
+    /// Content that MOVED between offsets — a dirty chunk rebuilt to a
+    /// DIFFERENT prev chunk's content — re-uploads nothing: the prev
+    /// manifest published, so every chunk it references is durable
+    /// (ADR 0007), and a re-CREATE would count against the same
+    /// per-object mutation cap the duplicate-content case trips.
+    #[tokio::test]
+    async fn sparse_rechunk_skips_put_for_content_moved_from_another_prev_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().join("blob")));
+        let counting = crate::test_support::CountingBlob::wrap(inner);
+        let s = ChunkStore::new(counting.clone());
+
+        let cs = 4096u64;
+        let mut data = vec![1u8; (2 * cs) as usize];
+        data[cs as usize..].fill(2);
+        let src = dir.path().join("mem.bin");
+        fs::write(&src, &data).await.unwrap();
+        let prev = s
+            .chunk_file(&src, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+        let prev_chunk0 = prev.chunks.iter().find(|c| c.offset == 0).unwrap().hash;
+
+        // "memmove": chunk 1 now carries chunk 0's exact content.
+        data[cs as usize..].fill(1);
+        let diff = dir.path().join("mem.diff");
+        fs::write(&diff, &data).await.unwrap();
+
+        let puts_before = counting.put_count();
+        let next = s
+            .update_for_dirty_ranges_sparse(&prev, &diff, &[(cs, cs)])
+            .await
+            .unwrap();
+        assert_eq!(
+            counting.put_count(),
+            puts_before,
+            "moved content is durable via the prev manifest — no re-upload",
+        );
+        let next_chunk1 = next.chunks.iter().find(|c| c.offset == cs).unwrap().hash;
+        assert_eq!(
+            next_chunk1, prev_chunk0,
+            "the moved chunk references the existing durable object",
+        );
+        let out = dir.path().join("out.bin");
+        s.materialize_to_file(&next, &out).await.unwrap();
+        assert_eq!(fs::read(&out).await.unwrap(), data);
     }
 
     /// `ChunkFileStats` accounting matches the manifest the same call

@@ -45,7 +45,15 @@ export function PageHeading({
       {showRule && (
         <span aria-hidden className="absolute -bottom-px left-0 h-0.5 w-10 bg-primary" />
       )}
-      <div className="space-y-1">
+      {/* The title column, sized so a long title never breaks the band:
+          `min-w-0` drops the min-content floor (a flex item won't shrink below
+          it by default, so a title a caller renders `truncate` — hence
+          nowrap — would run off the edge and take its own controls with it);
+          `basis-80 grow` decouples the wrap decision from the title length, so
+          the actions stay on the title's baseline on a wide band and only drop
+          to a second row when the band itself is narrower than the 20rem the
+          title asks for (a phone). */}
+      <div className="min-w-0 grow basis-80 space-y-1">
         {eyebrow && (
           <Text variant="label" tone="muted">
             {eyebrow}

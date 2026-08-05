@@ -161,19 +161,24 @@ impl ChunkStore {
             return Ok(hash);
         }
         let bytes = Bytes::copy_from_slice(body);
-        {
+        let put_result = {
             // Budget the PUT body only — the HEAD above and the local
             // warm below stay unbudgeted.
             let _permit = match &self.upload_budget {
                 Some(b) => Some(b.acquire().await),
                 None => None,
             };
-            let _ = self.inner.put(&key, bytes).await?;
+            self.inner.put(&key, bytes).await
+        };
+        match put_result {
+            Ok(_) => {
+                metrics::counter!("engram_chunk_put_total", "mode" => "checked", "outcome" => "uploaded")
+                    .increment(1);
+                tracing::trace!(hash = %hash, bytes = body.len(), "chunk PUT");
+            }
+            Err(e) => self.resolve_failed_put(hash, &key, "checked", e).await?,
         }
         self.warm_local(hash, body).await;
-        metrics::counter!("engram_chunk_put_total", "mode" => "checked", "outcome" => "uploaded")
-            .increment(1);
-        tracing::trace!(hash = %hash, bytes = body.len(), "chunk PUT");
         Ok(hash)
     }
 
@@ -207,18 +212,61 @@ impl ChunkStore {
     ) -> Result<()> {
         let key = hash.storage_key();
         let bytes = Bytes::copy_from_slice(body);
-        {
+        let put_result = {
             let _permit = match &self.upload_budget {
                 Some(b) => Some(b.acquire().await),
                 None => None,
             };
-            let _ = self.inner.put(&key, bytes).await?;
+            self.inner.put(&key, bytes).await
+        };
+        match put_result {
+            Ok(_) => {
+                metrics::counter!("engram_chunk_put_total", "mode" => "unchecked", "outcome" => "uploaded")
+                    .increment(1);
+                tracing::trace!(hash = %hash, bytes = body.len(), "chunk PUT (unchecked)");
+            }
+            Err(e) => self.resolve_failed_put(hash, &key, "unchecked", e).await?,
         }
         self.warm_local(hash, body).await;
-        metrics::counter!("engram_chunk_put_total", "mode" => "unchecked", "outcome" => "uploaded")
-            .increment(1);
-        tracing::trace!(hash = %hash, bytes = body.len(), "chunk PUT (unchecked)");
         Ok(())
+    }
+
+    /// Last resort for a failed chunk PUT: chunk keys are
+    /// content-addressed and write-once, so "the object exists" IS
+    /// success — some writer (a concurrent duplicate in this process,
+    /// another host, an earlier attempt whose response was lost)
+    /// landed these exact bytes. The 2026-08-04 chain-poison alert was
+    /// this shape: concurrent same-content PUTs tripped GCS's
+    /// per-object mutation-rate cap (~1/s) and the retry ladder's
+    /// backoff sat entirely inside the window — while the object was
+    /// durable the whole time. One HEAD, spent only on the
+    /// already-failed path; if the HEAD fails or the object is absent,
+    /// the original put error surfaces.
+    async fn resolve_failed_put(
+        &self,
+        hash: ChunkHash,
+        key: &str,
+        mode: &'static str,
+        err: engram_core::error::BlobError,
+    ) -> Result<()> {
+        match self.inner.exists(key).await {
+            Ok(true) => {
+                metrics::counter!(
+                    "engram_chunk_put_total",
+                    "mode" => mode, "outcome" => "rescued_existing"
+                )
+                .increment(1);
+                tracing::warn!(
+                    hash = %hash,
+                    error = %err,
+                    "chunk PUT failed but the object exists — write-once \
+                     content-addressed key, so a concurrent writer already \
+                     landed these bytes; treating the put as success",
+                );
+                Ok(())
+            }
+            _ => Err(err.into()),
+        }
     }
 
     /// Write-through the local cache (if wired): the host that produced
@@ -772,6 +820,66 @@ mod tests {
         assert!(
             counting.exists_count() >= 2,
             "put_chunk keeps its dedup HEAD on every call",
+        );
+    }
+
+    // ---- 2026-08-04 chain-poison alert: failed-PUT exists() resolve ----
+
+    use engram_testkit::storage::{
+        FaultPlan, FaultyBlobStorage, InjectedError, KeyMatch, PutFault, PutFaultKind, When,
+    };
+
+    fn always_fail_puts() -> FaultPlan {
+        FaultPlan::new().with_put(PutFault {
+            key: KeyMatch::Any,
+            when: When::Always,
+            kind: PutFaultKind::FailBeforeWrite(InjectedError::Sdk(
+                "simulated per-object mutation rate limit (gcs429)".into(),
+            )),
+        })
+    }
+
+    /// A PUT that fails while the object is already durable (a
+    /// concurrent same-content writer landed it — the GCS per-object
+    /// mutation-429 shape) resolves as success: chunk keys are
+    /// write-once, so existence IS success.
+    #[tokio::test]
+    async fn failed_put_resolves_as_success_when_object_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let body = b"landed by a concurrent duplicate writer";
+        let hash = ChunkHash::of(body);
+        // The "concurrent writer": the object is durable before our put.
+        inner
+            .put(&hash.storage_key(), Bytes::copy_from_slice(body))
+            .await
+            .unwrap();
+        let (faulty, _counters) = FaultyBlobStorage::arc(inner, always_fail_puts());
+        let s = ChunkStore::new(faulty);
+        let h = s
+            .put_chunk_unchecked(body)
+            .await
+            .expect("existing object resolves the failed put");
+        assert_eq!(h, hash);
+        assert_eq!(&s.get_chunk(h).await.unwrap()[..], body);
+    }
+
+    /// When the object is genuinely absent, the original put error
+    /// surfaces — the resolve is strictly "existence proves success",
+    /// never "swallow the failure".
+    #[tokio::test]
+    async fn failed_put_with_absent_object_surfaces_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let (faulty, _counters) = FaultyBlobStorage::arc(inner, always_fail_puts());
+        let s = ChunkStore::new(faulty);
+        let err = s
+            .put_chunk_unchecked(b"never landed anywhere")
+            .await
+            .expect_err("no durable object to resolve against");
+        assert!(
+            matches!(err, ChunkStoreError::Blob(_)),
+            "the original blob error surfaces, got {err:?}",
         );
     }
 }

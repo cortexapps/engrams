@@ -329,7 +329,11 @@ export function SessionDetail() {
               />
             ) : (
               <span className="group/title inline-flex max-w-full items-center gap-2">
-                <span className="truncate">{taskTitle ?? id}</span>
+                {/* Truncation is lossy, so the full title stays reachable as a
+                    native tooltip. */}
+                <span className="min-w-0 truncate" title={taskTitle ?? id}>
+                  {taskTitle ?? id}
+                </span>
                 {taskId && (
                   <Button
                     type="button"
