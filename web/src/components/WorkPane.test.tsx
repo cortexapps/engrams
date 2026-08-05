@@ -31,6 +31,7 @@ const baseProps: WorkPaneProps = {
   session: undefined,
   events: [],
   profile: null,
+  selection: null,
   isAdmin: false,
   open: true,
   tab: "overview",
@@ -71,50 +72,93 @@ function planEvent(): IndexedEvent {
 }
 
 describe("WorkPane", () => {
-  test("shows a static current-view label in the panel header", () => {
+  test("shows primary views in priority order", () => {
+    renderPane({ browserEnabled: true, ideEnabled: true });
+
+    const tabs = ["overview", "browser", "ide"].map((id) => screen.getByTestId(`pane-tab-${id}`));
+    expect(tabs.map((tab) => tab.getAttribute("aria-label"))).toEqual([
+      "Overview",
+      "Browser",
+      "IDE",
+    ]);
+    expect(tabs[0].getAttribute("aria-pressed")).toBe("true");
+  });
+
+  test("promotes the active overflow view and demotes it after a primary switch", () => {
+    const { rerender } = renderPane({ tab: "shell", browserEnabled: true });
+
+    expect(screen.getByTestId("pane-tab-shell").getAttribute("aria-pressed")).toBe("true");
+
+    rerender(<WorkPane {...baseProps} tab="browser" browserEnabled />);
+    expect(screen.queryByTestId("pane-tab-shell")).toBeNull();
+    expect(screen.getByTestId("pane-tab-browser").getAttribute("aria-pressed")).toBe("true");
+  });
+
+  test("checks the promoted view in the More menu", async () => {
     renderPane({ tab: "shell" });
+    await userEvent.click(screen.getByTestId("pane-more-menu"));
 
-    expect(screen.getByTestId("pane-current-view").textContent).toContain("Shell");
-    expect(screen.queryByTestId("pane-view-menu")).toBeNull();
+    expect(
+      screen.getByRole("menuitemcheckbox", { name: "Shell" }).getAttribute("aria-checked"),
+    ).toBe("true");
   });
 
-  test("shows the labeled view menu in an overlay header", () => {
-    renderPane({ variant: "overlay" });
-
-    expect(screen.getByTestId("pane-view-menu").textContent).toContain("Overview");
-    expect(screen.queryByTestId("pane-current-view")).toBeNull();
-  });
-
-  test("lists every available view in the overlay menu", async () => {
+  test("lists available overflow views in the More menu", async () => {
     renderPane({
-      variant: "overlay",
       events: [fileChanged()],
       browserEnabled: true,
       ideEnabled: true,
       isAdmin: true,
     });
-    await userEvent.click(screen.getByTestId("pane-view-menu"));
+    await userEvent.click(screen.getByTestId("pane-more-menu"));
 
-    for (const label of ["Overview", "Changes", "Shell", "Browser", "IDE", "Diagnostics"]) {
+    for (const label of ["Changes", "Shell", "Diagnostics"]) {
       expect(screen.getByRole("menuitemcheckbox", { name: label })).toBeTruthy();
     }
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Browser" })).toBeNull();
+    expect(screen.queryByRole("menuitemcheckbox", { name: "IDE" })).toBeNull();
   });
 
   test("omits unavailable Changes and Diagnostics menu items", async () => {
-    renderPane({ variant: "overlay" });
-    await userEvent.click(screen.getByTestId("pane-view-menu"));
+    renderPane();
+    await userEvent.click(screen.getByTestId("pane-more-menu"));
 
     expect(screen.queryByRole("menuitemcheckbox", { name: "Changes" })).toBeNull();
     expect(screen.queryByRole("menuitemcheckbox", { name: "Diagnostics" })).toBeNull();
   });
 
-  test("selecting an overlay menu item changes the view", async () => {
+  test("selecting a More menu item changes the view", async () => {
     const onTabChange = vi.fn();
-    renderPane({ variant: "overlay", onTabChange });
-    await userEvent.click(screen.getByTestId("pane-view-menu"));
+    renderPane({ onTabChange });
+    await userEvent.click(screen.getByTestId("pane-more-menu"));
     await userEvent.click(screen.getByRole("menuitemcheckbox", { name: "Shell" }));
 
     expect(onTabChange).toHaveBeenCalledWith("shell");
+  });
+
+  test("provides every hidden non-active view to the compact More menu", async () => {
+    renderPane({
+      tab: "shell",
+      events: [fileChanged()],
+      browserEnabled: true,
+      ideEnabled: true,
+      isAdmin: true,
+    });
+    await userEvent.click(screen.getByTestId("pane-more-menu-compact"));
+
+    for (const label of ["Overview", "Changes", "Browser", "IDE", "Diagnostics"]) {
+      expect(screen.getByRole("menuitemcheckbox", { name: label })).toBeTruthy();
+    }
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Shell" })).toBeNull();
+  });
+
+  test("uses the same priority header in the overlay", () => {
+    renderPane({ variant: "overlay", browserEnabled: true });
+
+    expect(screen.getByTestId("pane-tab-overview")).toBeTruthy();
+    expect(screen.getByTestId("pane-tab-browser")).toBeTruthy();
+    expect(screen.getByTestId("pane-more-menu")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Close pane" })).toBeTruthy();
   });
 
   test("keeps the work dock visible on every open view", () => {
@@ -131,7 +175,7 @@ describe("WorkPane", () => {
     renderPane({ tab: "tasks" as PaneTabId, onTabChange });
 
     expect(screen.getByTestId("overview-pane")).toBeTruthy();
-    expect(screen.getByTestId("pane-current-view").textContent).toContain("Overview");
+    expect(screen.getByTestId("pane-tab-overview").getAttribute("aria-pressed")).toBe("true");
     expect(onTabChange).not.toHaveBeenCalled();
   });
 });

@@ -97,8 +97,8 @@ export function IdePane({ sessionId }: IdePaneProps) {
   const message = errorMessage ?? "IDE unavailable";
 
   return (
-    <section className="flex h-full min-h-0 flex-col p-4">
-      <div className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-card">
+    <section className="flex h-full min-h-0 flex-col">
+      <div className="relative min-h-0 flex-1 overflow-hidden">
         {ideReady && (
           <iframe
             ref={iframeRef}

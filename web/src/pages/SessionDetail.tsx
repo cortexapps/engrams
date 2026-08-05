@@ -1,33 +1,23 @@
 import { useParams } from "@tanstack/react-router";
-import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Pencil } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { PanelsTopLeft, Pencil } from "lucide-react";
 import type { ImperativePanelHandle } from "react-resizable-panels";
 import { useSession } from "../hooks/useSessions";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { StatusGlyph } from "../components/Glyph";
 import { SessionThread } from "../components/session-thread/SessionThread";
-import { PageHeading } from "../components/page-heading";
 import { TitleEditForm } from "./sessions/TitleEditForm";
 import { DeleteSessionButton } from "./sessions/DeleteSessionButton";
-import { PaneViewMenu, paneViewDefs, WorkPane, type PaneTabId } from "../components/WorkPane";
+import { WorkPane, type PaneTabId } from "../components/WorkPane";
 import { shortId, statusLabel } from "./sessions/session-format";
 import { useTasks } from "../hooks/useTasks";
-import { extractFileChanges } from "../components/session-thread/fileChanges";
 import { useIsMobile } from "../hooks/use-mobile";
 import { useIsAdmin } from "../auth/AuthProvider";
-import { ProfileChip } from "../components/profiles/ProfileChip";
-import {
-  DurabilityReadout,
-  useDurabilitySummary,
-  type DurabilitySummary,
-} from "../components/SessionDiagnostics";
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "@/components/ui/resizable";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
-import { Separator } from "@/components/ui/separator";
-import { cn } from "@/lib/utils";
-import type { Session, ProfileSnapshotView, IndexedEvent } from "../lib/types";
+import type { ProfileSnapshotView, IndexedEvent } from "../lib/types";
 
 // The session workspace (ADR 0065 follow-up). The transcript is the primary
 // left column; the live shell + browser live in a resizable companion pane on
@@ -35,10 +25,8 @@ import type { Session, ProfileSnapshotView, IndexedEvent } from "../lib/types";
 // Diagnostics + the raw event log moved into that pane too. On phones the pane
 // opens as a right-side overlay sheet rather than a split.
 //
-// The pane ALWAYS starts collapsed and its contents mount lazily — a shell/VNC
-// socket only opens once the developer actually opens that view. Open-state is
-// deliberately not persisted; only the last view + width are remembered so a
-// reopen lands where they left it.
+// The pane starts open on desktop and closed in the mobile sheet. Open-state is
+// deliberately not persisted; only the last view + width are remembered.
 
 const PANE_PREF_KEY = "engram.workpane";
 type WorkPanePref = { tab: PaneTabId; size: number };
@@ -142,11 +130,16 @@ export function SessionDetail() {
         skills: profileSnap.skills,
       }
     : null;
+  // ADR 0063 B2 echo: the orchestrator persists the EFFECTIVE selection
+  // (override ?? profile ?? catalog default) on the task at create time.
+  // Unset on tasks that pre-date the echo columns; "" (proto3 unset) = absent.
+  const selection = {
+    harness: task?.harness || undefined,
+    model: task?.model || undefined,
+    effort: task?.effort || undefined,
+  };
+  const effectiveSelection = Object.values(selection).some(Boolean) ? selection : null;
   const { events, streamingText } = useSessionEvents(id);
-  // One poll per session, shared by React Query with the Diagnostics drawer's
-  // gauges; null until the session resolves (and whenever there's nothing
-  // calming to say).
-  const durability = useDurabilitySummary(id, session?.status);
 
   // The in-guest browser (Xvfb + VNC, ADR 0065) is an optional capability,
   // present iff the session's profile selected the `browser` skill bundle. We
@@ -155,15 +148,12 @@ export function SessionDetail() {
   // The in-guest IDE (code-server, ADR 0085) is the same shape of optional
   // capability, gated on the `ide` skill.
   const ideEnabled = (profile?.skills ?? []).includes("ide");
-  const hasChanges = useMemo(() => extractFileChanges(events).length > 0, [events]);
   const isAdmin = useIsAdmin();
-  const paneViews = paneViewDefs({ browserEnabled, ideEnabled, hasChanges, isAdmin });
 
   const isMobile = useIsMobile();
   const prefRef = useRef<WorkPanePref>(readPanePref());
-  // Always start collapsed — open-state isn't persisted, so nothing inside the
-  // pane mounts (and no socket opens) until the developer opens it.
-  const [paneOpen, setPaneOpen] = useState(false);
+  // Desktop starts open at the preferred split. The mobile sheet stays closed.
+  const [paneOpen, setPaneOpen] = useState(!isMobile);
   const [paneTab, setPaneTab] = useState<PaneTabId>(prefRef.current.tab);
   // Desktop only: the pane fills the work area (transcript panel collapsed).
   const [expanded, setExpanded] = useState(false);
@@ -171,6 +161,15 @@ export function SessionDetail() {
   const paneRef = useRef<ImperativePanelHandle>(null);
   const transcriptRef = useRef<ImperativePanelHandle>(null);
   const paneSizeRef = useRef(prefRef.current.size);
+
+  // useIsMobile resolves after the first browser render. Close the sheet when
+  // the layout enters mobile; later user opens do not rerun this effect.
+  useEffect(() => {
+    if (isMobile) {
+      setPaneOpen(false);
+      setExpanded(false);
+    }
+  }, [isMobile]);
 
   // Fall back to the home view if the browser/IDE capability disappears (an
   // admin drops the skill and useTasks refetches) while that view is active,
@@ -183,7 +182,7 @@ export function SessionDetail() {
   }, [paneTab, ideEnabled]);
 
   // Persist the last-viewed tab (width is persisted from onLayout). Open-state
-  // is intentionally not stored — the pane always starts collapsed.
+  // is intentionally not stored.
   useEffect(() => {
     writePanePref({ tab: paneTab, size: paneSizeRef.current });
   }, [paneTab]);
@@ -196,9 +195,7 @@ export function SessionDetail() {
     // branch and then disappear when the mobile sheet mounts.
     setPaneOpen(true);
     if (!isMobile) {
-      // resize() un-collapses to an explicit width — reliable even on a fresh
-      // load that started collapsed (expand() would only restore a remembered
-      // size, which doesn't exist yet).
+      // resize() un-collapses to the preferred width after a user collapse.
       paneRef.current?.resize(paneSizeRef.current);
     }
   };
@@ -209,12 +206,6 @@ export function SessionDetail() {
     if (!isMobile) {
       paneRef.current?.collapse();
     }
-  };
-
-  const selectPaneView = (tab: PaneTabId) => {
-    if (!paneOpen) openPane(tab);
-    else if (paneTab === tab) collapsePane();
-    else setPaneTab(tab);
   };
 
   const toggleExpand = () => {
@@ -292,93 +283,67 @@ export function SessionDetail() {
   }, [events]);
   useDocumentTitle(needsAttention ? `\u25cf ${taskTitle ?? shortId(id)} — engrams` : null);
 
-  // The masthead spans the transcript and work pane. Its labeled view switcher
-  // stays visible when either panel collapses and replaces the old edge rail.
+  // The slim masthead spans the transcript and work pane. View switching stays
+  // in the work pane header so this row only carries session identity.
   const masthead = (
-    <div className="shrink-0 px-6 pt-6 pb-4">
-      <PageHeading
-        eyebrow="task"
-        title={
-          editingTitle && taskId ? (
-            <TitleEditForm
-              taskId={taskId}
-              initial={taskTitle ?? ""}
-              isCustom={titleIsCustom}
-              onDone={() => setEditingTitle(false)}
-              inputClassName="h-9 text-lg"
-              className="max-w-xl"
-            />
-          ) : (
-            <span className="group/title inline-flex max-w-full items-center gap-2">
-              {/* Truncation is lossy, so the full title stays reachable as a
-                  native tooltip. */}
-              <span className="min-w-0 truncate" title={taskTitle ?? id}>
-                {taskTitle ?? id}
-              </span>
-              {taskId && (
-                <Button
-                  type="button"
-                  size="icon-xs"
-                  variant="ghost"
-                  onClick={() => setEditingTitle(true)}
-                  aria-label="Rename session"
-                  title="Rename"
-                  className="shrink-0 opacity-0 transition-opacity group-hover/title:opacity-100 focus-visible:opacity-100"
-                >
-                  <Pencil />
-                </Button>
-              )}
+    <header className="flex h-12 shrink-0 items-center gap-2 border-b px-4">
+      <div className="flex min-w-0 flex-1 items-center gap-2">
+        {session && (
+          <span
+            className="shrink-0 text-xs"
+            aria-label={statusLabel(session.status)}
+            title={statusLabel(session.status)}
+            data-testid="session-status-glyph"
+          >
+            <StatusGlyph status={session.status} attention={needsAttention} />
+          </span>
+        )}
+        {editingTitle && taskId ? (
+          <TitleEditForm
+            taskId={taskId}
+            initial={taskTitle ?? ""}
+            isCustom={titleIsCustom}
+            onDone={() => setEditingTitle(false)}
+            inputClassName="h-8 text-base"
+            className="max-w-xl flex-1"
+          />
+        ) : (
+          <div className="group/title flex min-w-0 items-center gap-1">
+            {/* Truncation is lossy, so the full title stays reachable as a
+                native tooltip. */}
+            <span
+              className="min-w-0 truncate text-base font-medium"
+              title={taskTitle ?? id}
+              data-testid="session-title"
+            >
+              {taskTitle ?? id}
             </span>
-          )
-        }
-        // A named session reads as prose; the raw-id fallback stays in the
-        // lab-readout mono voice.
-        titleVariant={taskTitle ? "display" : "mono"}
-        showRule={false}
-        actions={
-          <div className="flex items-center gap-2">
-            <div className="hidden items-center gap-1 lg:flex" data-testid="masthead-pane-switcher">
-              {paneViews.map((view) => {
-                const pressed = paneOpen && paneTab === view.id;
-                return (
-                  <Button
-                    key={view.id}
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    aria-pressed={pressed}
-                    data-testid={`masthead-pane-${view.id}`}
-                    className={cn(pressed && "bg-accent text-foreground")}
-                    onClick={() => selectPaneView(view.id)}
-                  >
-                    <view.icon />
-                    {view.label}
-                  </Button>
-                );
-              })}
-            </div>
-            <div className="lg:hidden">
-              <PaneViewMenu
-                views={paneViews}
-                activeTab={paneOpen ? paneTab : null}
-                onSelect={selectPaneView}
-              />
-            </div>
-            {/* Only attributed sessions have a task to delete; synthetic
-                admin rows (taskId null) hide the control. */}
-            {taskId && <DeleteSessionButton taskId={taskId} title={taskTitle} />}
+            {taskId && (
+              <Button
+                type="button"
+                size="icon-xs"
+                variant="ghost"
+                onClick={() => setEditingTitle(true)}
+                aria-label="Rename session"
+                title="Rename"
+                className="shrink-0 opacity-0 transition-opacity group-hover/title:opacity-100 focus-visible:opacity-100"
+              >
+                <Pencil />
+              </Button>
+            )}
           </div>
-        }
-      />
-      {session && (
-        <SessionVitals
-          session={session}
-          profile={profile}
-          durability={durability}
-          needsAttention={needsAttention}
-        />
+        )}
+      </div>
+      {isMobile && (
+        <Button type="button" variant="outline" size="sm" onClick={() => openPane()}>
+          <PanelsTopLeft />
+          Panel
+        </Button>
       )}
-    </div>
+      {/* Only attributed sessions have a task to delete; synthetic admin rows
+          (taskId null) hide the control. */}
+      {taskId && <DeleteSessionButton taskId={taskId} title={taskTitle} />}
+    </header>
   );
 
   const leftColumn = (
@@ -407,6 +372,7 @@ export function SessionDetail() {
                   session={session}
                   events={events}
                   profile={profile}
+                  selection={effectiveSelection}
                   isAdmin={isAdmin}
                   open={paneOpen}
                   tab={paneTab}
@@ -440,7 +406,7 @@ export function SessionDetail() {
               collapsible
               collapsedSize={0}
               minSize={30}
-              defaultSize={100}
+              defaultSize={100 - paneSizeRef.current}
               onCollapse={() => setExpanded(true)}
               onExpand={() => setExpanded(false)}
               className="min-w-0"
@@ -457,7 +423,7 @@ export function SessionDetail() {
               collapsible
               collapsedSize={0}
               minSize={24}
-              defaultSize={0}
+              defaultSize={paneSizeRef.current}
               onCollapse={() => {
                 setExpanded(false);
                 setPaneOpen(false);
@@ -471,6 +437,7 @@ export function SessionDetail() {
                 session={session}
                 events={events}
                 profile={profile}
+                selection={effectiveSelection}
                 isAdmin={isAdmin}
                 open={paneOpen}
                 tab={paneTab}
@@ -486,76 +453,6 @@ export function SessionDetail() {
           </ResizablePanelGroup>
         )}
       </div>
-    </div>
-  );
-}
-
-// The masthead vitals strip — the only session metadata a developer needs at a
-// glance: lifecycle status (glyph + word), the profile this launched from
-// (ADR 0053, the dense inline chip with its image on hover), and the calm
-// durability telltale. Items render only when present and are divided by a
-// hairline Separator, so the strip never trails a dangling divider.
-function SessionVitals({
-  session,
-  profile,
-  durability,
-  needsAttention = false,
-}: {
-  session: Session;
-  profile: ProfileSnapshotView | null;
-  durability: DurabilitySummary | null;
-  /** ADR 0107: a plan review or question is waiting on the user. */
-  needsAttention?: boolean;
-}) {
-  const items: { key: string; node: ReactNode }[] = [
-    {
-      key: "status",
-      node: (
-        <span className="inline-flex items-center gap-1.5">
-          <StatusGlyph status={session.status} attention={needsAttention} />
-          <span
-            data-testid="session-status"
-            className={
-              needsAttention ? "font-medium text-instrument-caution" : "font-medium text-foreground"
-            }
-          >
-            {needsAttention
-              ? `${statusLabel(session.status)} — waiting on you`
-              : statusLabel(session.status)}
-          </span>
-        </span>
-      ),
-    },
-    ...(profile
-      ? [
-          {
-            key: "profile",
-            node: (
-              <ProfileChip
-                profile={profile}
-                fallbackImage={session.image}
-                disclosure="tooltip"
-                className="max-w-full text-foreground"
-              />
-            ),
-          },
-        ]
-      : []),
-    ...(durability
-      ? [{ key: "durability", node: <DurabilityReadout summary={durability} /> }]
-      : []),
-  ];
-
-  return (
-    <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-sm text-muted-foreground">
-      {items.map((item, i) => (
-        <Fragment key={item.key}>
-          {i > 0 && (
-            <Separator orientation="vertical" className="data-[orientation=vertical]:h-4" />
-          )}
-          {item.node}
-        </Fragment>
-      ))}
     </div>
   );
 }

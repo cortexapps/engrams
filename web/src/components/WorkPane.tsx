@@ -6,6 +6,7 @@ import {
   Globe,
   Maximize2,
   Minimize2,
+  MoreHorizontal,
   PanelRightClose,
   PanelsTopLeft,
   SquareTerminal,
@@ -16,7 +17,7 @@ import { TerminalPane } from "./TerminalPane";
 import { BrowserPane } from "./BrowserPane";
 import { ChangesPane } from "./ChangesPane";
 import { IdePane } from "./IdePane";
-import { OverviewPane } from "./OverviewPane";
+import { OverviewPane, type OverviewSelection } from "./OverviewPane";
 import { DiagnosticsPanel } from "./SessionDiagnostics";
 import { WorkDock } from "./WorkDock";
 import { extractFileChanges } from "./session-thread/fileChanges";
@@ -27,18 +28,16 @@ import {
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { textVariants } from "@/components/ui/text";
 import { cn } from "@/lib/utils";
 import type { IndexedEvent, ProfileSnapshotView, Session } from "../lib/types";
 
 // The Devin-style work pane: the shell + browser, lifted out of the transcript
 // into a companion surface so the conversation and the live view sit side by
-// side instead of hiding each other. View switching lives in the session
-// masthead (SessionDetail) — the pane's own header carries only the current
-// view label (or the PaneViewMenu in the mobile overlay, which covers the
-// masthead) and the window controls. The body keeps every live pane mounted
-// (display:none swap) so the ttyd / VNC / iframe sockets survive view
-// switches — the same keep-mounted contract the panes rely on, now owned here.
+// side instead of hiding each other. The pane header keeps primary views
+// visible and moves secondary views into an overflow menu. The body keeps
+// every live pane mounted (display:none swap) so the ttyd / VNC / iframe
+// sockets survive view switches — the same keep-mounted contract the panes
+// rely on, now owned here.
 //
 // It renders identically inside the desktop resizable panel (`variant="panel"`,
 // with expand-to-fill) and the mobile overlay sheet (`variant="overlay"`, where
@@ -52,40 +51,93 @@ export interface PaneViewDef {
   icon: ComponentType<{ className?: string }>;
 }
 
+export interface PaneViewGroups {
+  primary: PaneViewDef[];
+  overflow: PaneViewDef[];
+}
+
 export function paneViewDefs(opts: {
   browserEnabled: boolean;
   ideEnabled: boolean;
   hasChanges: boolean;
   isAdmin: boolean;
-}): PaneViewDef[] {
-  return [
-    { id: "overview", label: "Overview", icon: PanelsTopLeft },
-    ...(opts.hasChanges ? [{ id: "changes", label: "Changes", icon: FileDiff } as const] : []),
-    { id: "shell", label: "Shell", icon: SquareTerminal },
-    ...(opts.browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
-    ...(opts.ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
-    ...(opts.isAdmin ? [{ id: "diagnostics", label: "Diagnostics", icon: Activity } as const] : []),
-  ];
+}): PaneViewGroups {
+  return {
+    primary: [
+      { id: "overview", label: "Overview", icon: PanelsTopLeft },
+      ...(opts.browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
+      ...(opts.ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
+    ],
+    overflow: [
+      ...(opts.hasChanges ? [{ id: "changes", label: "Changes", icon: FileDiff } as const] : []),
+      { id: "shell", label: "Shell", icon: SquareTerminal },
+      ...(opts.isAdmin
+        ? [{ id: "diagnostics", label: "Diagnostics", icon: Activity } as const]
+        : []),
+    ],
+  };
 }
 
-export function PaneViewMenu({
+function PaneTab({
+  view,
+  active,
+  onSelect,
+  responsive,
+}: {
+  view: PaneViewDef;
+  active: boolean;
+  onSelect: (id: PaneTabId) => void;
+  responsive?: boolean;
+}) {
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      className={cn(
+        "h-8 shrink-0 gap-1.5 px-2 text-muted-foreground",
+        active && "bg-accent text-foreground",
+        responsive && "@max-[20rem]/workpane:hidden",
+      )}
+      aria-label={view.label}
+      aria-pressed={active}
+      title={view.label}
+      data-testid={`pane-tab-${view.id}`}
+      onClick={() => onSelect(view.id)}
+    >
+      <view.icon />
+      <span className="@max-[34rem]/workpane:hidden">{view.label}</span>
+    </Button>
+  );
+}
+
+function MoreViewsMenu({
   views,
   activeTab,
   onSelect,
+  compact = false,
 }: {
   views: PaneViewDef[];
   activeTab: PaneTabId | null;
   onSelect: (id: PaneTabId) => void;
+  compact?: boolean;
 }) {
-  const activeView = views.find((view) => view.id === activeTab);
-  const TriggerIcon = activeView?.icon ?? PanelsTopLeft;
-
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="outline" size="sm" data-testid="pane-view-menu">
-          <TriggerIcon />
-          {activeView?.label ?? "Panel"}
+        <Button
+          variant="ghost"
+          size="sm"
+          className={cn(
+            "h-8 shrink-0 gap-1.5 px-2 text-muted-foreground",
+            activeTab && "bg-accent text-foreground",
+          )}
+          aria-label="More views"
+          aria-pressed={activeTab !== null}
+          title="More views"
+          data-testid={compact ? "pane-more-menu-compact" : "pane-more-menu"}
+        >
+          <MoreHorizontal />
+          <span className="@max-[34rem]/workpane:hidden">More</span>
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start">
@@ -114,6 +166,8 @@ export interface WorkPaneProps {
   events: IndexedEvent[];
   /** The profile snapshot from the owning session row. */
   profile: ProfileSnapshotView | null;
+  /** Effective harness, model, and effort for the owning task. */
+  selection: OverviewSelection | null;
   /** Whether the viewer can open the operator diagnostics view. */
   isAdmin: boolean;
   /**
@@ -141,6 +195,7 @@ export function WorkPane({
   session,
   events,
   profile,
+  selection,
   isAdmin,
   open,
   tab,
@@ -153,9 +208,11 @@ export function WorkPane({
   onToggleExpand,
 }: WorkPaneProps) {
   const hasChanges = useMemo(() => extractFileChanges(events).length > 0, [events]);
-  const views = paneViewDefs({ browserEnabled, ideEnabled, hasChanges, isAdmin });
+  const viewGroups = paneViewDefs({ browserEnabled, ideEnabled, hasChanges, isAdmin });
+  const views = [...viewGroups.primary, ...viewGroups.overflow];
   const effectiveTab = views.some((view) => view.id === tab) ? tab : "overview";
-  const activeView = views.find((view) => view.id === effectiveTab)!;
+  const promotedView = viewGroups.overflow.find((view) => view.id === effectiveTab);
+  const compactMenuViews = views.filter((view) => view.id !== effectiveTab);
 
   // Lazy-mount each live pane the first time it's viewed *while the pane is
   // open*, then keep it mounted for the life of the WorkPane (hidden via
@@ -172,23 +229,38 @@ export function WorkPane({
   }, [effectiveTab, open]);
 
   return (
-    <section className="flex h-full min-h-0 flex-col bg-background" aria-label="Work pane">
-      <header className="flex h-11 shrink-0 items-stretch justify-between gap-2 border-b pr-1.5 pl-3">
-        {variant === "overlay" ? (
-          <div className="flex min-w-0 items-center self-center">
-            <PaneViewMenu views={views} activeTab={effectiveTab} onSelect={onTabChange} />
+    <section
+      className="@container/workpane flex h-full min-h-0 flex-col bg-background"
+      aria-label="Work pane"
+    >
+      <header className="flex h-11 shrink-0 items-center justify-between gap-1 border-b px-1.5">
+        <div className="flex min-w-0 items-center gap-0.5">
+          {viewGroups.primary.map((view) => (
+            <PaneTab
+              key={view.id}
+              view={view}
+              active={view.id === effectiveTab}
+              onSelect={onTabChange}
+              responsive={view.id !== "overview"}
+            />
+          ))}
+          {promotedView && <PaneTab view={promotedView} active onSelect={onTabChange} responsive />}
+          <div className="@max-[20rem]/workpane:hidden">
+            <MoreViewsMenu
+              views={viewGroups.overflow}
+              activeTab={promotedView?.id ?? null}
+              onSelect={onTabChange}
+            />
           </div>
-        ) : (
-          <div
-            className="flex min-w-0 items-center gap-1.5 self-center text-muted-foreground"
-            data-testid="pane-current-view"
-          >
-            <activeView.icon className="size-3.5 shrink-0" />
-            <span className={cn(textVariants({ variant: "label", tone: "muted" }), "truncate")}>
-              {activeView.label}
-            </span>
+          <div className="hidden @max-[20rem]/workpane:block">
+            <MoreViewsMenu
+              views={compactMenuViews}
+              activeTab={effectiveTab === "overview" ? null : effectiveTab}
+              onSelect={onTabChange}
+              compact
+            />
           </div>
-        )}
+        </div>
 
         <div className="flex shrink-0 items-center gap-0.5 self-center">
           {variant === "panel" && onToggleExpand && (
@@ -251,6 +323,7 @@ export function WorkPane({
               session={session}
               events={events}
               profile={profile}
+              selection={selection}
               onShowChanges={() => onTabChange("changes")}
             />
           </div>

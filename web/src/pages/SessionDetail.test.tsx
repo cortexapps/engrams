@@ -1,15 +1,20 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
+
+const testState = vi.hoisted(() => ({
+  session: null as Record<string, unknown> | null,
+  tasks: [] as Record<string, unknown>[],
+  isMobile: false,
+}));
 
 vi.mock("@tanstack/react-router", () => ({
   useParams: () => ({ id: "session-1" }),
 }));
 vi.mock("../hooks/useSessions", () => ({
-  useSession: () => ({ data: undefined }),
+  useSession: () => ({ data: testState.session ?? undefined }),
 }));
 vi.mock("../hooks/useTasks", () => ({
-  useTasks: () => ({ data: { tasks: [] } }),
+  useTasks: () => ({ data: { tasks: testState.tasks } }),
 }));
 vi.mock("../hooks/useSessionEvents", () => ({
   useSessionEvents: () => ({ events: [], streamingText: "" }),
@@ -18,7 +23,7 @@ vi.mock("../hooks/useDocumentTitle", () => ({
   useDocumentTitle: () => {},
 }));
 vi.mock("../hooks/use-mobile", () => ({
-  useIsMobile: () => false,
+  useIsMobile: () => testState.isMobile,
 }));
 vi.mock("../auth/AuthProvider", () => ({
   useIsAdmin: () => false,
@@ -38,14 +43,18 @@ vi.mock("@/components/ui/resizable", async () => {
   const React = await import("react");
   const ResizablePanel = React.forwardRef<
     { collapse: () => void; expand: () => void; resize: () => void },
-    { children?: React.ReactNode }
-  >(function MockResizablePanel({ children }, ref) {
+    { children?: React.ReactNode; id?: string; defaultSize?: number }
+  >(function MockResizablePanel({ children, id, defaultSize }, ref) {
     React.useImperativeHandle(ref, () => ({
       collapse: () => {},
       expand: () => {},
       resize: () => {},
     }));
-    return <div data-testid="resizable-panel">{children}</div>;
+    return (
+      <div data-testid={`resizable-panel-${id}`} data-default-size={defaultSize}>
+        {children}
+      </div>
+    );
   });
   return {
     ResizablePanelGroup: ({ children }: { children?: React.ReactNode }) => (
@@ -59,8 +68,13 @@ vi.mock("../components/WorkPane", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../components/WorkPane")>();
   return {
     ...actual,
-    WorkPane: ({ open, tab }: { open: boolean; tab: string }) => (
-      <div data-testid="work-pane" data-open={String(open)} data-tab={tab} />
+    WorkPane: ({ open, tab, selection }: { open: boolean; tab: string; selection: unknown }) => (
+      <div
+        data-testid="work-pane"
+        data-open={String(open)}
+        data-tab={tab}
+        data-selection={JSON.stringify(selection)}
+      />
     ),
   };
 });
@@ -68,7 +82,43 @@ vi.mock("../components/WorkPane", async (importOriginal) => {
 import { hasLiveBrowserActivity, paneTabFromStored, SessionDetail } from "./SessionDetail";
 import type { IndexedEvent } from "../lib/types";
 
-beforeEach(() => localStorage.clear());
+beforeEach(() => {
+  localStorage.clear();
+  testState.isMobile = false;
+  testState.session = {
+    id: "session-1",
+    user_id: "user-1",
+    status: "active",
+    host_id: "host-1",
+    sandbox_id: "sandbox-1",
+    image: "registry.example.com/engrams/base:latest",
+    mode: "agent",
+    created_at: "2026-08-05T12:00:00.000Z",
+    last_active_at: "2026-08-05T12:00:00.000Z",
+  };
+  testState.tasks = [
+    {
+      id: "task-1",
+      title: "Build the pane",
+      titleIsCustom: true,
+      harness: "task-harness",
+      model: "task-model",
+      sessions: [
+        {
+          sessionId: "session-1",
+          profile: {
+            id: "profile-1",
+            name: "Builder",
+            icon: "bot",
+            archived: false,
+            imageUri: "registry.example.com/engrams/base:latest",
+            skills: [],
+          },
+        },
+      ],
+    },
+  ];
+});
 afterEach(cleanup);
 
 // The Browser pane auto-opens on agent browser activity (ADR 0097), but the
@@ -144,26 +194,41 @@ describe("paneTabFromStored", () => {
   });
 });
 
-describe("SessionDetail pane switcher", () => {
-  test("renders labeled masthead buttons and no edge rail", () => {
+describe("SessionDetail workspace", () => {
+  test("renders the slim masthead without an eyebrow, vitals, or desktop switcher", () => {
     render(<SessionDetail />);
 
-    expect(screen.getByTestId("masthead-pane-overview").getAttribute("aria-pressed")).toBe("false");
-    expect(screen.getByTestId("masthead-pane-shell").getAttribute("aria-pressed")).toBe("false");
+    expect(screen.getByTestId("session-title").className).toContain("text-base");
+    expect(screen.getByTestId("session-title").className).toContain("font-medium");
+    expect(screen.getByTestId("session-status-glyph").getAttribute("aria-label")).toBe("active");
+    expect(screen.queryByText(/^task$/i)).toBeNull();
+    expect(screen.queryByTestId("session-status")).toBeNull();
+    expect(screen.queryByTestId("masthead-pane-switcher")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Panel" })).toBeNull();
     expect(screen.queryByLabelText("Open work pane")).toBeNull();
   });
 
-  test("opens a selected view and collapses it when selected again", async () => {
+  test("opens the desktop pane at Overview with the preferred split", () => {
     render(<SessionDetail />);
-    const shell = screen.getByTestId("masthead-pane-shell");
 
-    await userEvent.click(shell);
-    expect(shell.getAttribute("aria-pressed")).toBe("true");
     expect(screen.getByTestId("work-pane").getAttribute("data-open")).toBe("true");
-    expect(screen.getByTestId("work-pane").getAttribute("data-tab")).toBe("shell");
+    expect(screen.getByTestId("work-pane").getAttribute("data-tab")).toBe("overview");
+    expect(screen.getByTestId("resizable-panel-transcript").getAttribute("data-default-size")).toBe(
+      "58",
+    );
+    expect(screen.getByTestId("resizable-panel-workpane").getAttribute("data-default-size")).toBe(
+      "42",
+    );
+  });
 
-    await userEvent.click(shell);
-    expect(shell.getAttribute("aria-pressed")).toBe("false");
-    expect(screen.getByTestId("work-pane").getAttribute("data-open")).toBe("false");
+  // The orchestrator persists the EFFECTIVE selection on the task at create
+  // time; the client shows what the task carries and never re-derives it.
+  test("passes the task's persisted selection through to the pane", () => {
+    render(<SessionDetail />);
+
+    expect(JSON.parse(screen.getByTestId("work-pane").dataset.selection ?? "null")).toEqual({
+      harness: "task-harness",
+      model: "task-model",
+    });
   });
 });

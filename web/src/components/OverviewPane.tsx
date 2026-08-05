@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import {
+  BotIcon,
   ExternalLinkIcon,
   FileDiffIcon,
   GitPullRequestArrowIcon,
@@ -10,9 +11,17 @@ import { Badge } from "@/components/ui/badge";
 import { usePrRefs } from "../hooks/usePrRefs";
 import type { IndexedEvent } from "../events";
 import type { ProfileSnapshotView, Session } from "../lib/types";
+import { statusLabel } from "../pages/sessions/session-format";
+import { StatusGlyph } from "./Glyph";
 import { ExposedPortsSection } from "./ports/ExposedPortsSection";
 import { ProfileChip } from "./profiles/ProfileChip";
 import { extractFileChanges } from "./session-thread/fileChanges";
+
+export interface OverviewSelection {
+  harness?: string;
+  model?: string;
+  effort?: string;
+}
 
 export interface OverviewPaneProps {
   sessionId: string;
@@ -20,6 +29,7 @@ export interface OverviewPaneProps {
   session: Session | undefined;
   events: IndexedEvent[];
   profile: ProfileSnapshotView | null;
+  selection: OverviewSelection | null;
   onShowChanges: () => void;
 }
 
@@ -29,6 +39,7 @@ export function OverviewPane({
   session,
   events,
   profile,
+  selection,
   onShowChanges,
 }: OverviewPaneProps) {
   const files = useMemo(() => extractFileChanges(events), [events]);
@@ -45,6 +56,9 @@ export function OverviewPane({
   );
   const { data } = usePrRefs(taskId, sessionId);
   const prRefs = data?.prRefs ?? [];
+  const selectionLabel = selection
+    ? [selection.harness, selection.model, selection.effort].filter(Boolean).join(" · ")
+    : "";
 
   if (!session) return null;
 
@@ -54,13 +68,32 @@ export function OverviewPane({
         <div className="flex items-start gap-3 px-4 py-3">
           <PackageIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
           <div className="min-w-0 flex-1 space-y-2">
-            {profile && <ProfileChip profile={profile} />}
-            <div className="flex min-w-0 flex-wrap items-center gap-2">
-              <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
-                {session.image}
-              </span>
-              <Badge variant="secondary">{session.mode}</Badge>
+            {/* The dense inline chip: the image URI stays behind its hover
+                disclosure. The mode badge appears only off the default —
+                "agent" on every row is noise. */}
+            {profile ? (
+              <div className="flex min-w-0 items-center gap-2 text-sm">
+                <ProfileChip profile={profile} className="min-w-0" />
+                {session.mode !== "agent" && <Badge variant="secondary">{session.mode}</Badge>}
+              </div>
+            ) : (
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">
+                  {session.image}
+                </span>
+                {session.mode !== "agent" && <Badge variant="secondary">{session.mode}</Badge>}
+              </div>
+            )}
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <StatusGlyph status={session.status} />
+              <span>{statusLabel(session.status)}</span>
             </div>
+            {selectionLabel && (
+              <div className="flex min-w-0 items-center gap-2 font-mono text-xs text-muted-foreground">
+                <BotIcon className="size-3.5 shrink-0" />
+                <span className="truncate">{selectionLabel}</span>
+              </div>
+            )}
             {profile && profile.skills.length > 0 && (
               <div className="flex flex-wrap gap-1.5">
                 {profile.skills.map((skill) => (

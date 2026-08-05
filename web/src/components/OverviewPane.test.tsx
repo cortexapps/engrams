@@ -5,8 +5,8 @@ import { createRouterTransport } from "@connectrpc/connect";
 import { PrRefService } from "../gen/engram/app/v1/pr_ref_pb";
 import { renderWithProviders } from "../test-utils";
 import type { IndexedEvent } from "../events";
-import type { Session } from "../lib/types";
-import { OverviewPane } from "./OverviewPane";
+import type { ProfileSnapshotView, Session } from "../lib/types";
+import { OverviewPane, type OverviewSelection } from "./OverviewPane";
 
 vi.mock("./ports/ExposedPortsSection", () => ({
   ExposedPortsSection: () => <div data-testid="ports" />,
@@ -61,6 +61,8 @@ function renderPane(
   onShowChanges = vi.fn(),
   taskId: string | null = "task-1",
   sessionId = "session-1",
+  profile: ProfileSnapshotView | null = null,
+  selection: OverviewSelection | null = null,
 ) {
   const { requests, transport } = transportWithPrs(hasPr);
   renderWithProviders(
@@ -69,7 +71,8 @@ function renderPane(
       taskId={taskId}
       session={session}
       events={events}
-      profile={null}
+      profile={profile}
+      selection={selection}
       onShowChanges={onShowChanges}
     />,
     { transport },
@@ -126,5 +129,34 @@ describe("OverviewPane", () => {
 
     await userEvent.click(await screen.findByRole("button", { name: /1 file changed/ }));
     expect(onShowChanges).toHaveBeenCalledOnce();
+  });
+
+  test("shows the effective selection and session status", async () => {
+    renderPane([], false, vi.fn(), "task-1", "session-1", null, {
+      harness: "claude",
+      model: "opus-5",
+      effort: "high",
+    });
+
+    expect(await screen.findByText("claude · opus-5 · high")).toBeTruthy();
+    expect(screen.getByText("active")).toBeTruthy();
+  });
+
+  test("hides the image URI behind the profile hover card", async () => {
+    const profile: ProfileSnapshotView = {
+      id: "profile-1",
+      name: "Reviewer",
+      icon: "bot",
+      archived: false,
+      imageUri: session.image,
+      skills: [],
+    };
+
+    renderPane([], false, vi.fn(), "task-1", "session-1", profile);
+
+    // The dense inline chip shows the name; the image URI stays inside the
+    // hover disclosure, never inline.
+    expect(await screen.findByText("Reviewer")).toBeTruthy();
+    expect(screen.queryByText(session.image)).toBeNull();
   });
 });
