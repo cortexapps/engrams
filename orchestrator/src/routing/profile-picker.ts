@@ -36,8 +36,9 @@ import { log as rootLog } from "../log.ts";
 const log = rootLog.child({ component: "profile-picker" });
 
 const PICKER_MODEL = "deepseek/deepseek-v4-flash";
-/** Hard budget on the model call; past it the picker degrades to ask_user. */
-const PICK_TIMEOUT_MS = 5_000;
+/** Hard budget on the model call; past it the picker degrades to ask_user.
+ *  Sized for 3 total attempts: the SDK's backoff runs them at ~0s/2s/6s. */
+const PICK_TIMEOUT_MS = 10_000;
 /** Bound on the message text sent to the model. */
 const PROMPT_SLICE_CHARS = 2_000;
 /** Recent tasks per histogram. */
@@ -323,10 +324,9 @@ export function makeProfilePicker(deps: ProductionPickerDeps = {}): ProfilePicke
         system: PICKER_SYSTEM_PROMPT,
         prompt: promptText,
         abortSignal: AbortSignal.timeout(PICK_TIMEOUT_MS),
-        // One retry (~2s in) fits the 5s budget and absorbs a transient
-        // upstream 429; the abort signal still bounds the total. More
-        // retries would blow the budget — the ask_user fallback covers it.
-        maxRetries: 1,
+        // 3 total attempts absorb upstream 429 bursts; the abort signal
+        // bounds the total and the ask_user fallback covers the rest.
+        maxRetries: 2,
       });
       return object;
     },
