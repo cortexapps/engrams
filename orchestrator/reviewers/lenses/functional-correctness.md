@@ -40,6 +40,8 @@ hostile inputs.
 - Behavior differences you cannot tie to an input: "might behave
   differently" without the input that shows it.
 - Missing features the PR never claimed to implement.
+- Edge cases whose only trigger needs preconditions the system never
+  produces — name the concrete input a real caller sends, or drop it.
 
 ## Reasoning policy
 
@@ -47,10 +49,13 @@ Trace execution, don't pattern-match. Pick the concrete input that takes the
 new branch, walk it through, and compare against what the function's callers
 and its old behavior promise. When a contract changed, enumerate the callers
 (search, don't sample) and check each one. The strongest finding names the
-exact input and the exact wrong output.
+exact input and the exact wrong output. Every finding names its
+trigger-likelihood class. When several wrong outputs share one cause (one
+inverted condition feeding many branches, one contract change breaking many
+callers), report the cause once and list the effects.
 
 ## Writing policy
 
 WHAT: input → actual behavior → expected behavior, in one sentence. WHEN: who
 hits it — every call, or a specific edge — and the concrete input or state that
-produces the wrong result.
+produces the wrong result, ending with `Trigger likelihood: <class>`.

@@ -105,6 +105,7 @@ function reviewStore(
     }),
     updateReviewPassContext: async () => true,
     getReview: async () => reviewDetail(),
+    listPriorPasses: async () => [],
     updateReviewStatus: async () => true,
     updateFindingState: async () => {},
     finalizeReview: async () => true,
@@ -279,6 +280,7 @@ const githubPoster: GithubReviewPoster = {
     },
   }),
   alreadyPosted: async () => false,
+  listReviewComments: async () => [],
   upsertStatusComment: async () => ({ commentId: "status-comment" }),
   postReview: async () => ({
     posted: true,

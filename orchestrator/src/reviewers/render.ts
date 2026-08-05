@@ -67,15 +67,19 @@ const FINDER_TOOL_CONTRACT = [
   "  **is** real.",
   "- `title` (string, required) — one-line summary.",
   "- `body_md` (string, required) — WHAT / WHEN: what the problem is, in one",
-  "  sentence, and when the issue can be hit, explained clearly.",
+  "  sentence, and when the issue can be hit, explained clearly. WHEN ends with",
+  "  `Trigger likelihood: <routine|plausible-fault|compound-fault|operator-misuse>`.",
   "- `suggested_fix` (string, optional) — a concrete fix only when it is clear",
-  "  from code you read.",
+  "  from code you read. For a structural finding, sketch the structural fix —",
+  "  never a per-instance point patch.",
   "- `evidence` (string[], required) — the files you actually read to reach this",
-  "  finding. A finding about a file not in this list is invalid.",
+  "  finding. A finding about a file not in this list is invalid; a subagent's",
+  "  report is a lead, not evidence.",
   "",
-  "Severity and confidence are different questions. A data-loss bug you are",
-  "unsure about is `critical` severity with `low` confidence — never average",
-  "them into `medium`.",
+  "Severity and confidence are different questions. Severity is the impact",
+  "under the plausible trigger you named — never under a rarer one — and",
+  "confidence is how sure you are the finding is real. Never average the two",
+  "into `medium`.",
   "",
   "**`finder_done`** — call once, after every finding is submitted:",
   "",
@@ -92,14 +96,17 @@ const VERIFIER_TOOL_CONTRACT = [
   "- `finding_id` (string, required) — the candidate's id, from the list in your",
   "  prompt / `candidates.json`.",
   "- `verdict` (`\"confirmed\"` | `\"refuted\"`, required) — `confirmed` only when you",
-  "  traced the failure yourself and can name what triggers it; `refuted` when you",
-  "  found the guard the finder missed, or could not reproduce the reasoning from",
-  "  the code.",
+  "  traced the failure yourself, the trigger is plausible (or the repo demands",
+  "  that paranoia), and the category lens does not exclude it; `refuted` when",
+  "  the code disproves it, or it fails the staleness, duplicate, reachability,",
+  "  or lens-bar gate.",
   "- `confidence` (`\"high\"` | `\"medium\"` | `\"low\"`, required) — how sure you are of",
   "  your verdict.",
   "- `reasoning` (string, required) — the specific code evidence (file and",
-  "  behavior) behind the verdict. A verdict argued only from the finding's own",
-  "  text is invalid.",
+  "  behavior) behind the verdict. A gate refutation starts with its tag —",
+  "  `stale:`, `duplicate:`, or `below-bar:` — and its justification. A verdict",
+  "  argued only from the finding's own text is invalid, except `duplicate:`,",
+  "  which cites the prior finding.",
 ].join("\n");
 
 function loadMarkdown(relativePath: string): string {
@@ -172,13 +179,13 @@ export function renderReviewer(opts: RenderReviewerOptions): RenderedReviewerFil
     },
   ];
 
-  if (opts.role === "finder") {
-    for (const category of categories) {
-      files.push({
-        path: join(REVIEW_GUEST_DIR, "lenses", `${category}.md`),
-        content: loadMarkdown(join("lenses", `${category}.md`)),
-      });
-    }
+  // Both roles get the lens files: the finder hunts with them, and the
+  // verifier enforces each lens's "Do not report" bar on the candidates.
+  for (const category of categories) {
+    files.push({
+      path: join(REVIEW_GUEST_DIR, "lenses", `${category}.md`),
+      content: loadMarkdown(join("lenses", `${category}.md`)),
+    });
   }
 
   return files;

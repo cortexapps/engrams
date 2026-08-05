@@ -108,6 +108,7 @@ const reviewPostingNoops = {
   setReviewSessionId: async () => {},
   recordEvent: async () => {},
   claimTargetId: async () => null,
+  listPriorPasses: async () => [],
   upsertTarget: async () => ({ id: "target-1" }),
   beginReviewPass: async () => ({
     kind: "created" as const,
@@ -335,6 +336,7 @@ describe("ReviewControlPlane", () => {
       githubPoster: {
         fetchPrContext: async () => ({ headSha: "h", baseSha: "b", pr: NO_PR_CONTEXT }),
         alreadyPosted: async () => false,
+        listReviewComments: async () => [],
         postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
         async upsertStatusComment(input) {
           upserts.push({
@@ -395,6 +397,7 @@ describe("ReviewControlPlane", () => {
       githubPoster: {
         fetchPrContext: async () => ({ headSha: "h", baseSha: "b", pr: NO_PR_CONTEXT }),
         alreadyPosted: async () => false,
+        listReviewComments: async () => [],
         postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
         upsertStatusComment: async () => { throw new Error("GitHub down"); },
       },
@@ -802,14 +805,22 @@ describe("ReviewControlPlane", () => {
       wake: true,
     });
     const files = sessions.writeCalls[0]?.files ?? [];
+    // The verifier gets the lens files too — it enforces each lens's
+    // "Do not report" bar on the candidates.
     expect(files.map((file) => file.path)).toEqual([
       "/workspace/.review/verifier.md",
+      "/workspace/.review/lenses/security-privacy.md",
+      "/workspace/.review/lenses/stability-availability.md",
+      "/workspace/.review/lenses/data-integrity-integration.md",
+      "/workspace/.review/lenses/functional-correctness.md",
+      "/workspace/.review/lenses/performance-scalability.md",
+      "/workspace/.review/lenses/maintainability-quality.md",
       "/workspace/.review/candidates.json",
     ]);
     expect(new TextDecoder().decode(files[0]?.content)).toContain(
       "You are the verifier",
     );
-    expect(JSON.parse(new TextDecoder().decode(files[1]?.content))).toEqual([{
+    expect(JSON.parse(new TextDecoder().decode(files.at(-1)?.content))).toEqual([{
       id: "candidate-1",
       path: "orchestrator/src/workflows/pr-review.ts",
       start_line: 42,
@@ -822,6 +833,148 @@ describe("ReviewControlPlane", () => {
       body_md: "The second terminal event bypasses verification.",
       evidence: ["orchestrator/src/workflows/pr-review.ts"],
     }]);
+  });
+
+  test("stages prior-round findings and matched author replies for a re-review", async () => {
+    const sessions = fakeSessions();
+    const priorPass = {
+      reviewId: "review-0",
+      headSha: "f".repeat(40),
+      trigger: "opened",
+      status: "posted",
+      createdAt: new Date("2026-07-16T00:00:00Z"),
+      findings: [{ ...finding("prior-1"), state: "posted" }],
+    };
+    const cp = makeReviewControlPlane({
+      sessions,
+      reviews: {
+        ...reviewStoreStub,
+        listPriorPasses: async () => [priorPass],
+      },
+      githubPoster: {
+        fetchPrContext: async () => ({ headSha: "h", baseSha: "b", pr: NO_PR_CONTEXT }),
+        alreadyPosted: async () => false,
+        // A root comment whose first line quotes the finding title, plus the
+        // author's reply threaded onto it — the reply must ride along, matched
+        // to the finding by that title.
+        listReviewComments: async () => [
+          {
+            id: "900",
+            inReplyToId: null,
+            authorLogin: "engrams-agent[bot]",
+            body: "**🎯 Functional Correctness · HIGH — Retry skips a phase**\n\nWHAT: …",
+            path: "orchestrator/src/workflows/pr-review.ts",
+          },
+          {
+            id: "901",
+            inReplyToId: "900",
+            authorLogin: "octocat",
+            body: "Declining this one — the retry is fenced upstream.",
+            path: "orchestrator/src/workflows/pr-review.ts",
+          },
+          {
+            id: "902",
+            inReplyToId: "899",
+            authorLogin: "octocat",
+            body: "Reply to a non-finding thread; must not ride along.",
+            path: null,
+          },
+        ],
+        postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
+        upsertStatusComment: async () => ({ commentId: "status-1" }),
+      },
+    });
+
+    await cp.bootstrapFinderSession("finder-session", {
+      reviewId: active.id,
+      repo: active.repo,
+      headSha: active.headSha,
+      enabledCategories: ["functional-correctness"],
+    });
+
+    const files = sessions.writeCalls[0]?.files ?? [];
+    expect(files.map((file) => file.path)).toEqual([
+      "/workspace/.review/finder.md",
+      "/workspace/.review/lenses/functional-correctness.md",
+      "/workspace/.review/prior-findings.json",
+    ]);
+    const staged = JSON.parse(new TextDecoder().decode(files.at(-1)?.content));
+    expect(staged.prior_passes).toEqual([{
+      review_id: "review-0",
+      head_sha: priorPass.headSha,
+      trigger: "opened",
+      status: "posted",
+      created_at: "2026-07-16T00:00:00.000Z",
+      findings: [{
+        title: "Retry skips a phase",
+        path: "orchestrator/src/workflows/pr-review.ts",
+        start_line: 42,
+        end_line: 45,
+        category: "functional-correctness",
+        severity: "high",
+        confidence: "medium",
+        state: "posted",
+        verdict_reason: null,
+        body_md: "The second terminal event bypasses verification.",
+      }],
+    }]);
+    expect(staged.author_replies).toEqual([{
+      finding_title: "Retry skips a phase",
+      author: "octocat",
+      body: "Declining this one — the retry is fenced upstream.",
+    }]);
+  });
+
+  test("a failing GitHub reply fetch degrades the prior context to DB-only", async () => {
+    const sessions = fakeSessions();
+    const cp = makeReviewControlPlane({
+      sessions,
+      reviews: {
+        ...reviewStoreStub,
+        listPriorPasses: async () => [{
+          reviewId: "review-0",
+          headSha: "f".repeat(40),
+          trigger: "opened",
+          status: "posted",
+          createdAt: new Date("2026-07-16T00:00:00Z"),
+          findings: [finding("prior-1")],
+        }],
+      },
+      githubPoster: {
+        fetchPrContext: async () => ({ headSha: "h", baseSha: "b", pr: NO_PR_CONTEXT }),
+        alreadyPosted: async () => false,
+        listReviewComments: async () => { throw new Error("GitHub down"); },
+        postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
+        upsertStatusComment: async () => ({ commentId: "status-1" }),
+      },
+    });
+
+    await cp.bootstrapFinderSession("finder-session", {
+      reviewId: active.id,
+      repo: active.repo,
+      headSha: active.headSha,
+      enabledCategories: ["functional-correctness"],
+    });
+
+    const files = sessions.writeCalls[0]?.files ?? [];
+    const staged = JSON.parse(new TextDecoder().decode(files.at(-1)?.content));
+    expect(staged.prior_passes).toHaveLength(1);
+    expect(staged.author_replies).toEqual([]);
+  });
+
+  test("a first review stages no prior-findings file", async () => {
+    const sessions = fakeSessions();
+    const cp = makeReviewControlPlane({ sessions, reviews: reviewStoreStub });
+
+    await cp.bootstrapFinderSession("finder-session", {
+      reviewId: active.id,
+      repo: active.repo,
+      headSha: active.headSha,
+      enabledCategories: ["functional-correctness"],
+    });
+
+    const paths = sessions.writeCalls[0]?.files.map((file) => file.path) ?? [];
+    expect(paths).not.toContain("/workspace/.review/prior-findings.json");
   });
 
   test("sends the stable finder prompt and marks the review finding", async () => {
@@ -897,6 +1050,91 @@ describe("ReviewControlPlane", () => {
     // never on the base-branch head the phantom-deletion bug came from.
     expect(sessions.promptCalls[0]?.text).toContain(`${mergeBase}...${headSha}`);
     expect(sessions.promptCalls[0]?.text).not.toContain(baseBranchHead);
+  });
+
+  test("a synchronize re-review scopes the finder to the delta since the last posted head", async () => {
+    const lastPostedHead = "c".repeat(40);
+    const sessions = fakeSessions();
+    const cp = makeReviewControlPlane({
+      sessions,
+      reviews: {
+        ...reviewPostingNoops,
+        getReview: async () => ({
+          review: { ...active, trigger: "synchronize" },
+          findings: [],
+          verdicts: [],
+        }),
+        listPriorPasses: async () => [
+          // Newest first: a failed pass must not become the delta anchor —
+          // only the last POSTED head was actually seen by the author.
+          {
+            reviewId: "review-failed",
+            headSha: "d".repeat(40),
+            trigger: "synchronize",
+            status: "failed",
+            createdAt: new Date("2026-07-17T02:00:00Z"),
+            findings: [],
+          },
+          {
+            reviewId: "review-0",
+            headSha: lastPostedHead,
+            trigger: "opened",
+            status: "posted",
+            createdAt: new Date("2026-07-17T01:00:00Z"),
+            findings: [],
+          },
+        ],
+        updateReviewStatus: async () => true,
+      },
+    });
+
+    await cp.sendFinderPrompt("finder-session", {
+      reviewId: active.id,
+      repo: active.repo,
+      prNumber: active.prNumber,
+      headSha: active.headSha,
+      baseSha: "",
+    });
+
+    const text = sessions.promptCalls[0]?.text ?? "";
+    expect(text).toContain("automatic re-review");
+    expect(text).toContain(`git diff ${lastPostedHead}...${active.headSha}`);
+    expect(text).not.toContain("d".repeat(40));
+    expect(text).toContain("/workspace/.review/prior-findings.json");
+  });
+
+  test("a human trigger keeps the full range even when prior passes exist", async () => {
+    const sessions = fakeSessions();
+    const cp = makeReviewControlPlane({
+      sessions,
+      reviews: {
+        ...reviewPostingNoops,
+        // `active` carries trigger "opened" — a human-owned trigger.
+        getReview: async () => detail(),
+        listPriorPasses: async () => [{
+          reviewId: "review-0",
+          headSha: "c".repeat(40),
+          trigger: "opened",
+          status: "posted",
+          createdAt: new Date("2026-07-17T01:00:00Z"),
+          findings: [],
+        }],
+        updateReviewStatus: async () => true,
+      },
+    });
+
+    await cp.sendFinderPrompt("finder-session", {
+      reviewId: active.id,
+      repo: active.repo,
+      prNumber: active.prNumber,
+      headSha: active.headSha,
+      baseSha: "",
+    });
+
+    const text = sessions.promptCalls[0]?.text ?? "";
+    expect(text).not.toContain("automatic re-review");
+    // The prior-round context still rides along for a human-triggered pass.
+    expect(text).toContain("/workspace/.review/prior-findings.json");
   });
 
   test("a retry finder session gets a DISTINCT prompt id", async () => {
@@ -1001,6 +1239,7 @@ describe("ReviewControlPlane", () => {
         pr: NO_PR_CONTEXT,
       }),
       alreadyPosted: async () => false,
+      listReviewComments: async () => [],
       upsertStatusComment: async () => ({ commentId: "status-1" }),
       async postReview(input) {
         posted.push(input);
@@ -1103,6 +1342,7 @@ describe("ReviewControlPlane", () => {
           pr: NO_PR_CONTEXT,
         }),
         alreadyPosted: async () => true,
+        listReviewComments: async () => [],
         upsertStatusComment: async () => ({ commentId: "status-1" }),
         postReview: async () => {
           postCalls++;
@@ -1148,6 +1388,7 @@ describe("ReviewControlPlane", () => {
           return { headSha: "live-head", baseSha: "live-base", pr: NO_PR_CONTEXT };
         },
         alreadyPosted: async () => false,
+        listReviewComments: async () => [],
         upsertStatusComment: async () => ({ commentId: "status-1" }),
         async postReview(input) {
           postedCommit = input.commitId;

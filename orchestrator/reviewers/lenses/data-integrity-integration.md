@@ -46,9 +46,16 @@ Follow one datum end to end: written where, read where, transformed how, and
 what happens to in-flight or already-stored values when this change deploys.
 For every multi-write sequence ask "what if it stops here?" line by line.
 For every contract change, find the other side and read it — the bug is
-almost never on the side that changed.
+almost never on the side that changed. Every finding names its
+trigger-likelihood class, and argues it: a single crash at one point is a
+`plausible-fault`; a crash that must land inside the recovery of another
+fault is `compound-fault`, and passes only on surfaces the repo's own
+guidance hardens to that level. When several corruption paths share one
+cause (one non-atomic sequence, one missing conflict key), report the cause
+once and list the paths.
 
 ## Writing policy
 
 WHAT: which data becomes wrong. WHEN: the operation, ordering, or failure that
-triggers the corruption, and whether it is detectable after the fact.
+triggers the corruption, and whether it is detectable after the fact, ending
+with `Trigger likelihood: <class>`.

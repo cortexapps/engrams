@@ -127,6 +127,9 @@ function makeStore(
     async updateReviewPassContext() {
       return true;
     },
+    async listPriorPasses() {
+      return [];
+    },
     async getReview(id) {
       return detail?.review.id === id ? detail : null;
     },

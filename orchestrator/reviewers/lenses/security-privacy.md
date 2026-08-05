@@ -43,11 +43,13 @@ Trace the data, don't pattern-match the API name. Establish: where does the
 attacker-controlled value enter, which trust boundary should stop it, and
 why does it fail to on this path. Name the actor: who can reach this code,
 with what privileges? If you cannot articulate who the attacker is and what
-they gain, it is not a security finding.
+they gain, it is not a security finding. Every finding names its
+trigger-likelihood class; for this lens the attacker's reach decides it — a
+sink any request hits is `routine` even when exploitation is rare.
 
 ## Writing policy
 
 WHAT: the sink and the unvalidated source in one sentence. WHEN: the request or
 input that reaches the sink, and what the attacker gains (read what? write
-what? act as whom?). Never write proof-of-concept exploit payloads into the
-finding.
+what? act as whom?), ending with `Trigger likelihood: <class>`. Never write
+proof-of-concept exploit payloads into the finding.
