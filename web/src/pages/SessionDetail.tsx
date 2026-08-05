@@ -1,23 +1,6 @@
 import { useParams } from "@tanstack/react-router";
-import {
-  Fragment,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ComponentType,
-  type ReactNode,
-} from "react";
-import {
-  Activity,
-  Code2,
-  GitPullRequestArrow,
-  Globe,
-  ListTodo,
-  Map,
-  Pencil,
-  SquareTerminal,
-} from "lucide-react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Pencil } from "lucide-react";
 import type { ImperativePanelHandle } from "react-resizable-panels";
 import { useSession } from "../hooks/useSessions";
 import { useSessionEvents } from "../hooks/useSessionEvents";
@@ -27,11 +10,12 @@ import { SessionThread } from "../components/session-thread/SessionThread";
 import { PageHeading } from "../components/page-heading";
 import { TitleEditForm } from "./sessions/TitleEditForm";
 import { DeleteSessionButton } from "./sessions/DeleteSessionButton";
-import { WorkPane, type PaneTabId } from "../components/WorkPane";
+import { PaneViewMenu, paneViewDefs, WorkPane, type PaneTabId } from "../components/WorkPane";
 import { shortId, statusLabel } from "./sessions/session-format";
 import { useTasks } from "../hooks/useTasks";
-import { sessionHasAgentTasks } from "../components/session-thread/agentTasks";
+import { extractFileChanges } from "../components/session-thread/fileChanges";
 import { useIsMobile } from "../hooks/use-mobile";
+import { useIsAdmin } from "../auth/AuthProvider";
 import { ProfileChip } from "../components/profiles/ProfileChip";
 import {
   DurabilityReadout,
@@ -42,6 +26,7 @@ import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "@/componen
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import { cn } from "@/lib/utils";
 import type { Session, ProfileSnapshotView, IndexedEvent } from "../lib/types";
 
 // The session workspace (ADR 0065 follow-up). The transcript is the primary
@@ -57,22 +42,30 @@ import type { Session, ProfileSnapshotView, IndexedEvent } from "../lib/types";
 
 const PANE_PREF_KEY = "engram.workpane";
 type WorkPanePref = { tab: PaneTabId; size: number };
-const DEFAULT_PANE_PREF: WorkPanePref = { tab: "shell", size: 42 };
+const DEFAULT_PANE_PREF: WorkPanePref = { tab: "overview", size: 42 };
+
+export function paneTabFromStored(value: unknown): PaneTabId {
+  switch (value) {
+    case "overview":
+    case "changes":
+    case "shell":
+    case "browser":
+    case "ide":
+    case "diagnostics":
+      return value;
+    default:
+      return "overview";
+  }
+}
 
 function readPanePref(): WorkPanePref {
   try {
     const raw = localStorage.getItem(PANE_PREF_KEY);
     if (!raw) return DEFAULT_PANE_PREF;
-    const p = JSON.parse(raw) as Partial<WorkPanePref>;
+    const p = JSON.parse(raw) as { tab?: unknown; size?: unknown };
     return {
-      tab:
-        p.tab === "browser" ||
-        p.tab === "ide" ||
-        p.tab === "tasks" ||
-        p.tab === "side-effects" ||
-        p.tab === "diagnostics"
-          ? p.tab
-          : "shell",
+      // Old Plan, Tasks, and Side effects preferences now open the home view.
+      tab: paneTabFromStored(p.tab),
       // Clamp within [pane minSize, 100 − transcript minSize] so a restored
       // width never collides with either panel's floor (react-resizable-panels
       // would otherwise clamp it and warn).
@@ -162,6 +155,9 @@ export function SessionDetail() {
   // The in-guest IDE (code-server, ADR 0085) is the same shape of optional
   // capability, gated on the `ide` skill.
   const ideEnabled = (profile?.skills ?? []).includes("ide");
+  const hasChanges = useMemo(() => extractFileChanges(events).length > 0, [events]);
+  const isAdmin = useIsAdmin();
+  const paneViews = paneViewDefs({ browserEnabled, ideEnabled, hasChanges, isAdmin });
 
   const isMobile = useIsMobile();
   const prefRef = useRef<WorkPanePref>(readPanePref());
@@ -176,14 +172,14 @@ export function SessionDetail() {
   const transcriptRef = useRef<ImperativePanelHandle>(null);
   const paneSizeRef = useRef(prefRef.current.size);
 
-  // Fall back to the shell view if the browser/IDE capability disappears (an
+  // Fall back to the home view if the browser/IDE capability disappears (an
   // admin drops the skill and useTasks refetches) while that view is active,
   // so we never point at an absent tab.
   useEffect(() => {
-    if (paneTab === "browser" && !browserEnabled) setPaneTab("shell");
+    if (paneTab === "browser" && !browserEnabled) setPaneTab("overview");
   }, [paneTab, browserEnabled]);
   useEffect(() => {
-    if (paneTab === "ide" && !ideEnabled) setPaneTab("shell");
+    if (paneTab === "ide" && !ideEnabled) setPaneTab("overview");
   }, [paneTab, ideEnabled]);
 
   // Persist the last-viewed tab (width is persisted from onLayout). Open-state
@@ -213,6 +209,12 @@ export function SessionDetail() {
     if (!isMobile) {
       paneRef.current?.collapse();
     }
+  };
+
+  const selectPaneView = (tab: PaneTabId) => {
+    if (!paneOpen) openPane(tab);
+    else if (paneTab === tab) collapsePane();
+    else setPaneTab(tab);
   };
 
   const toggleExpand = () => {
@@ -274,19 +276,6 @@ export function SessionDetail() {
     />
   );
 
-  // ADR 0107: the Plan tab appears once the session has proposed a plan.
-  const hasPlan = useMemo(
-    () =>
-      events.some(
-        (e) => e.event.type === "tool_call_requested" && e.event.name === "exit_plan_mode",
-      ),
-    [events],
-  );
-
-  // The Tasks tab appears once the agent has created a task (same gating as
-  // WorkPane's own strip).
-  const hasTasks = useMemo(() => sessionHasAgentTasks(events), [events]);
-
   // ADR 0107: the session is waiting on the user (a plan review or an
   // unanswered question) — the tab title picks up the ● prefix.
   const needsAttention = useMemo(() => {
@@ -303,122 +292,134 @@ export function SessionDetail() {
   }, [events]);
   useDocumentTitle(needsAttention ? `\u25cf ${taskTitle ?? shortId(id)} — engrams` : null);
 
-  const paneTabDefs: {
-    id: PaneTabId;
-    label: string;
-    icon: ComponentType<{ className?: string }>;
-  }[] = [
-    { id: "shell", label: "Shell", icon: SquareTerminal },
-    ...(browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
-    ...(ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
-    ...(hasPlan ? [{ id: "plan", label: "Plan", icon: Map } as const] : []),
-    ...(hasTasks ? [{ id: "tasks", label: "Tasks", icon: ListTodo } as const] : []),
-    { id: "side-effects", label: "Side effects", icon: GitPullRequestArrow },
-    { id: "diagnostics", label: "Diagnostics", icon: Activity },
-  ];
+  // The masthead spans the transcript and work pane. Its labeled view switcher
+  // stays visible when either panel collapses and replaces the old edge rail.
+  const masthead = (
+    <div className="shrink-0 px-6 pt-6 pb-4">
+      <PageHeading
+        eyebrow="task"
+        title={
+          editingTitle && taskId ? (
+            <TitleEditForm
+              taskId={taskId}
+              initial={taskTitle ?? ""}
+              isCustom={titleIsCustom}
+              onDone={() => setEditingTitle(false)}
+              inputClassName="h-9 text-lg"
+              className="max-w-xl"
+            />
+          ) : (
+            <span className="group/title inline-flex max-w-full items-center gap-2">
+              {/* Truncation is lossy, so the full title stays reachable as a
+                  native tooltip. */}
+              <span className="min-w-0 truncate" title={taskTitle ?? id}>
+                {taskTitle ?? id}
+              </span>
+              {taskId && (
+                <Button
+                  type="button"
+                  size="icon-xs"
+                  variant="ghost"
+                  onClick={() => setEditingTitle(true)}
+                  aria-label="Rename session"
+                  title="Rename"
+                  className="shrink-0 opacity-0 transition-opacity group-hover/title:opacity-100 focus-visible:opacity-100"
+                >
+                  <Pencil />
+                </Button>
+              )}
+            </span>
+          )
+        }
+        // A named session reads as prose; the raw-id fallback stays in the
+        // lab-readout mono voice.
+        titleVariant={taskTitle ? "display" : "mono"}
+        showRule={false}
+        actions={
+          <div className="flex items-center gap-2">
+            <div className="hidden items-center gap-1 lg:flex" data-testid="masthead-pane-switcher">
+              {paneViews.map((view) => {
+                const pressed = paneOpen && paneTab === view.id;
+                return (
+                  <Button
+                    key={view.id}
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    aria-pressed={pressed}
+                    data-testid={`masthead-pane-${view.id}`}
+                    className={cn(pressed && "bg-accent text-foreground")}
+                    onClick={() => selectPaneView(view.id)}
+                  >
+                    <view.icon />
+                    {view.label}
+                  </Button>
+                );
+              })}
+            </div>
+            <div className="lg:hidden">
+              <PaneViewMenu
+                views={paneViews}
+                activeTab={paneOpen ? paneTab : null}
+                onSelect={selectPaneView}
+              />
+            </div>
+            {/* Only attributed sessions have a task to delete; synthetic
+                admin rows (taskId null) hide the control. */}
+            {taskId && <DeleteSessionButton taskId={taskId} title={taskTitle} />}
+          </div>
+        }
+      />
+      {session && (
+        <SessionVitals
+          session={session}
+          profile={profile}
+          durability={durability}
+          needsAttention={needsAttention}
+        />
+      )}
+    </div>
+  );
 
-  // The transcript column: its own masthead (task id + vitals) over the thread.
-  // The work pane sits beside it at full height, so the masthead lives here
-  // rather than spanning the width above both.
   const leftColumn = (
     <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-      <div className="shrink-0 px-6 pt-6 pb-4">
-        <PageHeading
-          eyebrow="task"
-          title={
-            editingTitle && taskId ? (
-              <TitleEditForm
-                taskId={taskId}
-                initial={taskTitle ?? ""}
-                isCustom={titleIsCustom}
-                onDone={() => setEditingTitle(false)}
-                inputClassName="h-9 text-lg"
-                className="max-w-xl"
-              />
-            ) : (
-              <span className="group/title inline-flex max-w-full items-center gap-2">
-                {/* Truncation is lossy, so the full title stays reachable as a
-                    native tooltip. */}
-                <span className="min-w-0 truncate" title={taskTitle ?? id}>
-                  {taskTitle ?? id}
-                </span>
-                {taskId && (
-                  <Button
-                    type="button"
-                    size="icon-xs"
-                    variant="ghost"
-                    onClick={() => setEditingTitle(true)}
-                    aria-label="Rename session"
-                    title="Rename"
-                    className="shrink-0 opacity-0 transition-opacity group-hover/title:opacity-100 focus-visible:opacity-100"
-                  >
-                    <Pencil />
-                  </Button>
-                )}
-              </span>
-            )
-          }
-          // A named session reads as prose; the raw-id fallback stays in the
-          // lab-readout mono voice.
-          titleVariant={taskTitle ? "display" : "mono"}
-          showRule={false}
-          actions={
-            <div className="flex items-center gap-2">
-              {/* Desktop reopens the pane via the edge rail; phones have no
-                  rail, so they get an explicit button. */}
-              <Button variant="outline" size="sm" className="md:hidden" onClick={() => openPane()}>
-                <SquareTerminal />
-                Panel
-              </Button>
-              {/* Only attributed sessions have a task to delete; synthetic
-                  admin rows (taskId null) hide the control. */}
-              {taskId && <DeleteSessionButton taskId={taskId} title={taskTitle} />}
-            </div>
-          }
-        />
-        {session && (
-          <SessionVitals
-            session={session}
-            profile={profile}
-            durability={durability}
-            needsAttention={needsAttention}
-          />
-        )}
-      </div>
       <div className="min-h-0 flex-1 overflow-hidden">{transcript}</div>
     </div>
   );
 
   return (
-    <div className="flex min-h-0 flex-1 overflow-hidden">
-      {isMobile ? (
-        <>
-          {leftColumn}
-          <Sheet open={paneOpen} onOpenChange={(o) => !o && collapsePane()}>
-            <SheetContent
-              side="right"
-              showCloseButton={false}
-              className="w-full gap-0 p-0 sm:max-w-xl"
-            >
-              <SheetTitle className="sr-only">Session work pane</SheetTitle>
-              <WorkPane
-                sessionId={id}
-                taskId={taskId}
-                session={session}
-                events={events}
-                open={paneOpen}
-                tab={paneTab}
-                onTabChange={setPaneTab}
-                browserEnabled={browserEnabled}
-                ideEnabled={ideEnabled}
-                onCollapse={collapsePane}
-                variant="overlay"
-              />
-            </SheetContent>
-          </Sheet>
-        </>
-      ) : (
-        <>
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      {masthead}
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        {isMobile ? (
+          <>
+            {leftColumn}
+            <Sheet open={paneOpen} onOpenChange={(o) => !o && collapsePane()}>
+              <SheetContent
+                side="right"
+                showCloseButton={false}
+                className="w-full gap-0 p-0 sm:max-w-xl"
+              >
+                <SheetTitle className="sr-only">Session work pane</SheetTitle>
+                <WorkPane
+                  sessionId={id}
+                  taskId={taskId}
+                  session={session}
+                  events={events}
+                  profile={profile}
+                  isAdmin={isAdmin}
+                  open={paneOpen}
+                  tab={paneTab}
+                  onTabChange={setPaneTab}
+                  browserEnabled={browserEnabled}
+                  ideEnabled={ideEnabled}
+                  onCollapse={collapsePane}
+                  variant="overlay"
+                />
+              </SheetContent>
+            </Sheet>
+          </>
+        ) : (
           <ResizablePanelGroup
             direction="horizontal"
             className="min-h-0 flex-1"
@@ -469,6 +470,8 @@ export function SessionDetail() {
                 taskId={taskId}
                 session={session}
                 events={events}
+                profile={profile}
+                isAdmin={isAdmin}
                 open={paneOpen}
                 tab={paneTab}
                 onTabChange={setPaneTab}
@@ -481,31 +484,8 @@ export function SessionDetail() {
               />
             </ResizablePanel>
           </ResizablePanelGroup>
-
-          {/* Collapsed edge rail — the Devin-style reopen affordance, full
-              height. Each glyph opens the pane straight to that view. */}
-          {!paneOpen && (
-            <div
-              className="flex w-9 shrink-0 flex-col items-center gap-1 border-l bg-background py-2"
-              aria-label="Open work pane"
-            >
-              {paneTabDefs.map((t) => (
-                <Button
-                  key={t.id}
-                  variant="ghost"
-                  size="icon"
-                  className="size-7 text-muted-foreground hover:text-foreground"
-                  title={`Open ${t.label}`}
-                  aria-label={`Open ${t.label}`}
-                  onClick={() => openPane(t.id)}
-                >
-                  <t.icon />
-                </Button>
-              ))}
-            </div>
-          )}
-        </>
-      )}
+        )}
+      </div>
     </div>
   );
 }
