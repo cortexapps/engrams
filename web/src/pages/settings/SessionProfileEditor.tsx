@@ -33,7 +33,12 @@ import {
   TagIcon,
 } from "lucide-react";
 
-import { useProfile, useCreateProfile, useUpdateProfile } from "../../hooks/useProfiles";
+import {
+  useProfile,
+  useCreateProfile,
+  useUpdateProfile,
+  useDiscoverProfileRepos,
+} from "../../hooks/useProfiles";
 import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
 import { useSkills, useUploadSkill } from "../../hooks/useSkills";
@@ -90,6 +95,12 @@ const linesOf = (text: string) =>
 
 const optionId = (value: string | null | undefined): string | null => value?.trim() || null;
 
+/** One repo row in the draft — the wire shape minus the server-derived parse. */
+export interface RepoRow {
+  path: string;
+  remoteUrl: string;
+}
+
 const schema = z.object({
   name: z.string().trim().min(1, "Name the profile first"),
   description: z.string(),
@@ -110,6 +121,7 @@ const schema = z.object({
       resourceConstraints: z.array(z.string()),
     }),
   ),
+  repos: z.array(z.custom<RepoRow>()),
   envRows: z.array(z.custom<EnvRow>()),
   networkDefault: z.enum(["deny", "allow"]),
   allowHostsText: z.string(),
@@ -182,6 +194,7 @@ const EMPTY: ProfileFormValues = {
   includeUserTokens: false,
   skills: [],
   integrationGrants: [],
+  repos: [],
   envRows: [],
   networkDefault: "deny",
   allowHostsText: "",
@@ -221,6 +234,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const [skills, setSkills] = useFieldValue(control, "skills");
   const [envRows, setEnvRows] = useFieldValue(control, "envRows");
   const [secretRows, setSecretRows] = useFieldValue(control, "secretRows");
+  const [repoRows, setRepoRows] = useFieldValue(control, "repos");
   const [portExposures, setPortExposures] = useFieldValue(control, "portExposures");
   // Derived, never stored: capabilities follow from the granted integrations.
   const capabilities = defaultCapabilitiesForGrants(integrationGrants, views);
@@ -258,6 +272,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
         operation: grant.operation,
         resourceConstraints: [...grant.resourceConstraints],
       })),
+      repos: (p.repos ?? []).map((r) => ({ path: r.path, remoteUrl: r.remoteUrl })),
       envRows: mapToEnvRows(p.envVars),
       networkDefault: p.network?.default === "allow" ? "allow" : "deny",
       allowHostsText: (p.network?.allowHosts ?? []).join("\n"),
@@ -397,6 +412,9 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
         allowHostPatterns: linesOf(vals.allowPatternsText),
       },
       secrets: secretRowsToWire(vals.secretRows),
+      repos: vals.repos
+        .map((r) => ({ path: r.path.trim(), remoteUrl: r.remoteUrl.trim() }))
+        .filter((r) => r.path !== ""),
       portExposures: vals.portExposures,
     };
     const designationValue = vals.designation ? "pr_reviewer" : "";
@@ -911,6 +929,14 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
             )}
           </Section>
 
+          <Section
+            icon={<TagIcon className="size-4" />}
+            title="Repositories"
+            sub="Git checkouts this profile's image contains. Routing uses these to match a request to the right codebase — add them by hand, or scan the image."
+          >
+            <ReposSection repos={repoRows} setRepos={setRepoRows} profileId={editingId} />
+          </Section>
+
           {/* advanced — a disclosure card, de-emphasized beneath the spine */}
           <Card className="gap-0 py-0">
             <button
@@ -1004,6 +1030,139 @@ function Section({
       </CardHeader>
       <CardContent>{children}</CardContent>
     </Card>
+  );
+}
+
+/**
+ * Repo list editor + autodiscovery. Discovery boots a short-lived session from
+ * the profile's image server-side, so it needs a SAVED profile (disabled in
+ * create mode) and takes tens of seconds. Results land as candidates the user
+ * adds explicitly — nothing is saved until the form is.
+ */
+function ReposSection({
+  repos,
+  setRepos,
+  profileId,
+}: {
+  repos: RepoRow[];
+  setRepos: (r: RepoRow[]) => void;
+  profileId: string | undefined;
+}) {
+  const discover = useDiscoverProfileRepos();
+  const [candidates, setCandidates] = useState<{ path: string; remoteUrl: string }[] | null>(null);
+
+  const setRow = (i: number, patch: Partial<RepoRow>) =>
+    setRepos(repos.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  const hasPath = (path: string) => repos.some((r) => r.path === path);
+
+  const runDiscovery = async () => {
+    if (!profileId) return;
+    setCandidates(null);
+    try {
+      const resp = await discover.mutateAsync({ profileId });
+      // Primary remote = origin when present, else the first listed.
+      setCandidates(
+        resp.repos.map((r) => ({
+          path: r.path,
+          remoteUrl: (r.remotes.find((m) => m.name === "origin") ?? r.remotes[0])?.url ?? "",
+        })),
+      );
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      {repos.length === 0 && (
+        <Text variant="body" className="text-[0.8rem]">
+          No repositories configured.
+        </Text>
+      )}
+      {repos.map((r, i) => (
+        <div key={i} className="flex items-center gap-2">
+          <Input
+            value={r.path}
+            onChange={(e) => setRow(i, { path: e.target.value })}
+            placeholder="/workspace/my-repo"
+            aria-label={`Repo path ${i + 1}`}
+            className="font-mono text-sm"
+          />
+          <Input
+            value={r.remoteUrl}
+            onChange={(e) => setRow(i, { remoteUrl: e.target.value })}
+            placeholder="git@github.com:org/repo.git (optional)"
+            aria-label={`Repo remote ${i + 1}`}
+            className="font-mono text-sm"
+          />
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => setRepos(repos.filter((_, j) => j !== i))}
+          >
+            Remove
+          </Button>
+        </div>
+      ))}
+      <div className="flex items-center gap-2">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => setRepos([...repos, { path: "", remoteUrl: "" }])}
+        >
+          <PlusIcon className="size-3.5" /> Add repo
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={!profileId || discover.isPending}
+          onClick={runDiscovery}
+          data-testid="repo-autodiscover"
+        >
+          {discover.isPending ? "Scanning image… (about a minute)" : "Autodiscover"}
+        </Button>
+        {!profileId && (
+          <Text variant="body" className="text-[0.76rem]">
+            Save the profile first to scan its image.
+          </Text>
+        )}
+      </div>
+      {candidates !== null && (
+        <div className="rounded-md border p-3" data-testid="repo-candidates">
+          <Text variant="label" className="text-[0.8rem]">
+            Found {candidates.length} {candidates.length === 1 ? "checkout" : "checkouts"}
+          </Text>
+          {candidates.length === 0 && (
+            <Text variant="body" className="mt-1 text-[0.78rem]">
+              No git checkouts in the image's workspace roots.
+            </Text>
+          )}
+          <div className="mt-2 flex flex-col gap-1.5">
+            {candidates.map((c) => (
+              <div key={c.path} className="flex items-center gap-2 text-[0.82rem]">
+                <span className="font-mono">{c.path}</span>
+                {c.remoteUrl && (
+                  <span className="truncate font-mono text-muted-foreground">{c.remoteUrl}</span>
+                )}
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="ml-auto"
+                  disabled={hasPath(c.path)}
+                  onClick={() => setRepos([...repos, { path: c.path, remoteUrl: c.remoteUrl }])}
+                >
+                  {hasPath(c.path) ? "Added" : "Add"}
+                </Button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 

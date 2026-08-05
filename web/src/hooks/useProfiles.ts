@@ -6,6 +6,7 @@ import {
   createProfile,
   updateProfile,
   deleteProfile,
+  discoverProfileRepos,
 } from "../gen/engram/app/v1/profile-ProfileService_connectquery";
 
 /** Active profiles (the picker menu). Admins can pass includeArchived. */
@@ -49,4 +50,10 @@ export function useUpdateProfile() {
 export function useDeleteProfile() {
   const invalidate = useInvalidateProfiles();
   return useMutation(deleteProfile, { onSuccess: invalidate });
+}
+
+/** Scan the profile's image for git checkouts (boots a short-lived session —
+ *  expect tens of seconds). Read-only; saving the picks is a normal update. */
+export function useDiscoverProfileRepos() {
+  return useMutation(discoverProfileRepos);
 }
