@@ -10,6 +10,7 @@ import {
   normalizeRepos,
   parseDiscoverOutput,
   parseGitRemote,
+  stripRemoteCredentials,
 } from "../profile-repos.ts";
 
 describe("parseGitRemote", () => {
@@ -43,7 +44,37 @@ describe("parseGitRemote", () => {
   });
 });
 
+describe("stripRemoteCredentials", () => {
+  test("http(s) userinfo strips whether token-as-user or user:pass", () => {
+    expect(stripRemoteCredentials("https://ghp_secret@github.com/o/r.git")).toBe(
+      "https://github.com/o/r.git",
+    );
+    expect(
+      stripRemoteCredentials("https://x-access-token:ghp_secret@github.com/o/r.git"),
+    ).toBe("https://github.com/o/r.git");
+  });
+
+  test("structural ssh/scp identities survive; ssh passwords strip", () => {
+    expect(stripRemoteCredentials("git@github.com:o/r.git")).toBe("git@github.com:o/r.git");
+    expect(stripRemoteCredentials("ssh://git@github.com/o/r.git")).toBe(
+      "ssh://git@github.com/o/r.git",
+    );
+    expect(stripRemoteCredentials("ssh://user:pass@github.com/o/r.git")).toBe(
+      "ssh://github.com/o/r.git",
+    );
+  });
+});
+
 describe("normalizeRepos", () => {
+  test("scrubs credential-bearing remote URLs before persisting", () => {
+    const [repo] = normalizeRepos([
+      { path: "/w/r", remoteUrl: "https://x-access-token:ghp_secret@github.com/o/r.git" },
+    ]);
+    expect(repo.remoteUrl).toBe("https://github.com/o/r.git");
+    expect(JSON.stringify(repo)).not.toContain("ghp_secret");
+    expect(repo.remote).toEqual({ host: "github.com", owner: "o", name: "r" });
+  });
+
   test("trims, re-parses the remote server-side, and dedupes by path", () => {
     const out = normalizeRepos([
       { path: " /workspace/engrams ", remoteUrl: " git@github.com:cortexapps/engrams.git " },
@@ -108,6 +139,14 @@ describe("parseDiscoverOutput", () => {
         remotes: [{ name: "origin", url: "https://internal.example/x", parsed: null }],
       },
     ]);
+  });
+
+  test("scrubs credential-bearing remotes from the discover response", () => {
+    const out = parseDiscoverOutput(
+      "REPO /w/r\nREMOTE origin\thttps://oauth2:glpat_secret@gitlab.com/g/p.git (fetch)",
+    );
+    expect(out[0].remotes[0].url).toBe("https://gitlab.com/g/p.git");
+    expect(JSON.stringify(out)).not.toContain("glpat_secret");
   });
 
   test("is tolerant: junk lines, orphan remotes, and empty output", () => {

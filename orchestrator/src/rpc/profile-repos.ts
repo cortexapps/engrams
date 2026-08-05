@@ -41,6 +41,22 @@ export interface DiscoveredRepo {
 }
 
 /**
+ * Remove the userinfo component from a remote URL — `remoteUrl` is persisted
+ * and member-visible, so it must never carry a credential. In http(s) URLs
+ * ANY userinfo is a credential (tokens ride as the username:
+ * `https://ghp_xxx@github.com/...`). In ssh:// URLs the conventional `git@`
+ * is structural — only a password-bearing userinfo (`user:pass@`) strips.
+ * scp-style forms (`git@host:path`) cannot carry a password; unchanged.
+ */
+export function stripRemoteCredentials(url: string): string {
+  const web = /^((?:https?|git):\/\/)([^@/]+)@(.+)$/.exec(url);
+  if (web) return web[1] + web[3];
+  const ssh = /^(ssh:\/\/)([^@/]+)@(.+)$/.exec(url);
+  if (ssh && ssh[2].includes(":")) return ssh[1] + ssh[3];
+  return url;
+}
+
+/**
  * Parse a git remote URL to its forge identity, or null when it doesn't
  * look like a forge remote. Handles:
  *   https://host/owner/name(.git)   (also http, and deeper group paths)
@@ -92,7 +108,7 @@ export function normalizeRepos(
   const out: ProfileRepo[] = [];
   for (const r of repos) {
     const path = (r.path ?? "").trim();
-    const remoteUrl = (r.remoteUrl ?? "").trim();
+    const remoteUrl = stripRemoteCredentials((r.remoteUrl ?? "").trim());
     if (!path) throw new Error("repo path is required");
     if (path.length > MAX_PATH_CHARS) throw new Error(`repo path exceeds ${MAX_PATH_CHARS} chars`);
     if (remoteUrl.length > MAX_URL_CHARS) {
@@ -130,7 +146,10 @@ export function parseDiscoverOutput(stdout: string): DiscoveredRepo[] {
       const tab = body.indexOf("\t");
       if (tab <= 0) continue;
       const name = body.slice(0, tab).trim();
-      const url = body.slice(tab + 1).trim();
+      // Scrub BEFORE the value exists anywhere: the discover response feeds
+      // the editor's candidate pre-fill, so a token-bearing in-guest remote
+      // must not survive even in transit.
+      const url = stripRemoteCredentials(body.slice(tab + 1).trim());
       if (!name || !url) continue;
       const key = `${name}\0${url}`;
       if (seenRemotes.has(key)) continue;
