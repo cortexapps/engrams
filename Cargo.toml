@@ -163,13 +163,13 @@ tokio-tungstenite = { version = "0.21", default-features = false, features = ["c
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 # grpc
-tonic = "0.12"
-tonic-build = "0.12"
+tonic = "0.14"
+tonic-build = "0.14"
 # gRPC server reflection for the coordinator's network-private app-gRPC
 # surface (grpcurl introspection). v0.12 matches the tonic 0.12 line.
-tonic-reflection = "0.12"
+tonic-reflection = "0.14"
 prost = "0.13"
-prost-types = "0.13"
+prost-types = "0.14"
 
 # data
 serde = { version = "1", features = ["derive"] }
