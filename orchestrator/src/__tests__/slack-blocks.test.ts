@@ -310,13 +310,34 @@ describe("profile picker blocks — build/parse round-trip", () => {
     { id: "p2", name: "Infra", description: "" },
   ];
 
-  test("the built select's selection parses back to a profile_choice", () => {
+  /** The radio group (≤10 profiles) or select (>10) carrying ACTION_PROFILE. */
+  function pickerControl(blocks: unknown[]) {
+    for (const b of blocks as {
+      block_id?: string;
+      elements?: { action_id?: string; options?: unknown[] }[];
+      accessory?: { action_id?: string; options?: unknown[] };
+    }[]) {
+      const radio = b.elements?.find((e) => e.action_id === ACTION_PROFILE);
+      if (radio) return { blockId: b.block_id, control: radio, kind: "radio_buttons" };
+      if (b.accessory?.action_id === ACTION_PROFILE) {
+        return { blockId: b.block_id, control: b.accessory, kind: "static_select" };
+      }
+    }
+    return undefined;
+  }
+
+  test("≤10 profiles render as radio buttons with per-option descriptions; a pick parses back", () => {
     const blocks = buildProfilePickerBlocks(ROUTE, "U1", "Ev7", OPTIONS);
-    const select = blocks.find(
-      (b) => (b as { accessory?: { action_id?: string } }).accessory?.action_id === ACTION_PROFILE,
-    ) as { block_id: string; accessory: { options: { value: string; text: { text: string } }[] } };
-    expect(select).toBeDefined();
-    expect(select.accessory.options.map((o) => o.value)).toEqual(["p1", "p2"]);
+    const picker = pickerControl(blocks);
+    expect(picker?.kind).toBe("radio_buttons");
+    const opts = picker!.control.options as {
+      value: string;
+      text: { text: string };
+      description?: { text: string };
+    }[];
+    expect(opts.map((o) => o.value)).toEqual(["p1", "p2"]);
+    expect(opts[0].description?.text).toBe("The backend workspace");
+    expect(opts[1].description).toBeUndefined(); // empty description → no field
 
     // Simulate Slack's block_actions payload for picking the second option.
     const parsed = parseInteractivity(
@@ -326,7 +347,7 @@ describe("profile picker blocks — build/parse round-trip", () => {
         actions: [
           {
             action_id: ACTION_PROFILE,
-            block_id: select.block_id,
+            block_id: picker!.blockId,
             selected_option: { value: "p2", text: { type: "plain_text", text: "Infra" } },
           },
         ],
@@ -342,7 +363,55 @@ describe("profile picker blocks — build/parse round-trip", () => {
     });
   });
 
-  test("a select action without metadata or selection is ignored", () => {
+  test("radio descriptions trim at a word boundary within Slack's 75-char cap", () => {
+    const long = "word ".repeat(40).trim(); // 199 chars — must trim, never mid-word
+    const blocks = buildProfilePickerBlocks(ROUTE, "U1", "Ev7", [
+      { id: "p1", name: "Backend", description: long },
+    ]);
+    const opts = pickerControl(blocks)!.control.options as { description?: { text: string } }[];
+    const desc = opts[0].description!.text;
+    expect(desc.startsWith("word ")).toBe(true);
+    expect(desc.endsWith("word…")).toBe(true);
+    expect(desc.length).toBeLessThanOrEqual(75);
+  });
+
+  test(">10 profiles degrade to a static_select with context-line descriptions", () => {
+    const many = Array.from({ length: 11 }, (_, i) => ({
+      id: `p${i}`,
+      name: `Profile ${i}`,
+      description: `Purpose ${i}`,
+    }));
+    const blocks = buildProfilePickerBlocks(ROUTE, "U1", "Ev7", many);
+    const picker = pickerControl(blocks);
+    expect(picker?.kind).toBe("static_select");
+    expect((picker!.control.options as unknown[]).length).toBe(11);
+    const context = blocks.filter((b) => (b as { type?: string }).type === "context") as {
+      elements: { text: string }[];
+    }[];
+    // 11 lines chunked under Slack's 10-elements-per-context cap.
+    expect(context.map((c) => c.elements.length)).toEqual([10, 1]);
+    expect(context[0].elements[0].text).toBe("*Profile 0* — Purpose 0");
+
+    const parsed = parseInteractivity(
+      JSON.stringify({
+        type: "block_actions",
+        user: { id: "U1" },
+        actions: [
+          {
+            action_id: ACTION_PROFILE,
+            block_id: picker!.blockId,
+            selected_option: { value: "p3", text: { type: "plain_text", text: "Profile 3" } },
+          },
+        ],
+      }),
+    );
+    expect(parsed).toMatchObject({
+      kind: "profile_choice",
+      choice: { profileId: "p3", profileName: "Profile 3" },
+    });
+  });
+
+  test("a picker action without metadata or selection is ignored", () => {
     const noBlockId = parseInteractivity(
       JSON.stringify({
         type: "block_actions",
@@ -359,22 +428,6 @@ describe("profile picker blocks — build/parse round-trip", () => {
       }),
     );
     expect(noSelection).toEqual({ kind: "ignore" });
-  });
-
-  test("descriptions render as muted context lines, trimmed at a word boundary", () => {
-    const long = "word ".repeat(40).trim(); // 199 chars — must trim, never mid-word
-    const blocks = buildProfilePickerBlocks(ROUTE, "U1", "Ev7", [
-      { id: "p1", name: "Backend", description: long },
-      { id: "p2", name: "Bare", description: "" },
-    ]);
-    const context = blocks.find((b) => (b as { type?: string }).type === "context") as {
-      elements: { text: string }[];
-    };
-    expect(context.elements).toHaveLength(2);
-    expect(context.elements[0].text.startsWith("*Backend* — word")).toBe(true);
-    expect(context.elements[0].text.endsWith("word…")).toBe(true);
-    expect(context.elements[0].text.length).toBeLessThanOrEqual("*Backend* — ".length + 111);
-    expect(context.elements[1].text).toBe("*Bare*");
   });
 
   test("the chosen-state block names the profile", () => {

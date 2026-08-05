@@ -422,7 +422,9 @@ export function buildQuestionBlocks(route: ThreadRoute, parsed: ParsedUserQuesti
   return blocks;
 }
 
-/** Slack caps a context block at 10 elements. */
+/** Slack caps a radio_buttons group at 10 options and a context block at 10
+ *  elements. */
+const RADIO_OPTIONS_MAX = 10;
 const CONTEXT_ELEMENTS_MAX = 10;
 
 /** Trim to `n` chars at a word boundary (a mid-word cut reads as a glitch). */
@@ -434,13 +436,15 @@ function truncateWords(s: string, n: number): string {
 }
 
 /**
- * Build the profile-picker message: the question with the `static_select` as
- * its accessory (one visual unit), then the candidate descriptions as muted
- * small-type context lines — not a bold bullet wall. Select options carry the
- * profile ids (a Slack select option cannot carry a description); the route,
- * the mentioning user, and the per-ask nonce ride the `block_id` (an option
- * value caps at 75 chars). First selection wins — the interactivity route
- * dedupes on the nonce and the workflow ignores late picks.
+ * Build the profile-picker message. Up to 10 profiles render as ONE
+ * `radio_buttons` group — the only Block Kit control whose options natively
+ * carry a muted per-option description, so the control IS the card list and
+ * one click decides. Past 10 (Slack's radio cap) it degrades to a
+ * `static_select` with the descriptions as context lines. Either way the
+ * option value is the profile id, and the route, the mentioning user, and
+ * the per-ask nonce ride the containing block's `block_id` (an option value
+ * caps at 75 chars). First selection wins — the interactivity route dedupes
+ * on the nonce and the workflow ignores late picks.
  */
 export function buildProfilePickerBlocks(
   route: ThreadRoute,
@@ -449,14 +453,41 @@ export function buildProfilePickerBlocks(
   options: ProfileOption[],
 ): KnownBlock[] {
   const meta: PickerMeta = { r: route, u: expectedUser, n: nonce };
+  const questionText = "*Which profile should handle this?*\nPick one to start the session.";
+
+  if (options.length <= RADIO_OPTIONS_MAX) {
+    return [
+      section(questionText),
+      {
+        type: "actions",
+        block_id: JSON.stringify(meta),
+        elements: [
+          {
+            type: "radio_buttons",
+            action_id: ACTION_PROFILE,
+            options: options.map((o) => ({
+              text: { type: "plain_text" as const, text: truncate(o.name, 75) },
+              value: o.id,
+              ...(o.description
+                ? {
+                    description: {
+                      type: "plain_text" as const,
+                      text: truncateWords(o.description, 75),
+                    },
+                  }
+                : {}),
+            })),
+          },
+        ],
+      },
+    ];
+  }
+
   const blocks: KnownBlock[] = [
     {
       type: "section",
       block_id: JSON.stringify(meta),
-      text: {
-        type: "mrkdwn",
-        text: "*Which profile should handle this?*\nPick one to start the session.",
-      },
+      text: { type: "mrkdwn", text: questionText },
       accessory: {
         type: "static_select",
         action_id: ACTION_PROFILE,
