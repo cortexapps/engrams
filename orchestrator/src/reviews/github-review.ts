@@ -47,6 +47,16 @@ export interface UpsertStatusCommentInput {
   body: string;
 }
 
+/** One inline review comment on a pull request, replies included. */
+export interface PrReviewComment {
+  id: string;
+  /** The parent comment when this one is a thread reply; null for a root. */
+  inReplyToId: string | null;
+  authorLogin: string;
+  body: string;
+  path: string | null;
+}
+
 export interface GithubReviewPoster {
   /** The heads a pass pins itself to, plus the PR context recorded on the
    *  review record. The SHAs are load-bearing and throw when absent; `pr` is
@@ -57,6 +67,9 @@ export interface GithubReviewPoster {
     pr: PrContext;
   }>;
   alreadyPosted(repo: string, prNumber: number, reviewId: string): Promise<boolean>;
+  /** Every inline review comment on the pull request, replies included —
+   *  the author-response context a re-review round reads. Read-only. */
+  listReviewComments(repo: string, prNumber: number): Promise<PrReviewComment[]>;
   postReview(input: PostReviewInput): Promise<PostReviewResult>;
   /** Post (or edit, when `commentId` is given) the sticky status comment and
    *  return the live comment id. A PATCH against a comment that has since been
@@ -125,6 +138,10 @@ const CATEGORY_LABELS: Readonly<Record<string, string>> = {
 };
 const REVIEWS_PER_PAGE = 100;
 const MAX_REVIEW_PAGES = 50;
+const COMMENTS_PER_PAGE = 100;
+// Comments are advisory context for re-review rounds, so an enormous thread
+// truncates instead of failing the bootstrap that reads it.
+const MAX_COMMENT_PAGES = 10;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -415,6 +432,47 @@ export function makeGithubReviewPoster(
       throw new Error(
         `list pull request reviews exceeded ${MAX_REVIEW_PAGES} pages`,
       );
+    },
+
+    async listReviewComments(repo, prNumber) {
+      const comments: PrReviewComment[] = [];
+      for (let page = 1; page <= MAX_COMMENT_PAGES; page++) {
+        const response = await runOp("github", {
+          method: "GET",
+          path:
+            `/repos/${repo}/pulls/${prNumber}/comments?per_page=${COMMENTS_PER_PAGE}&page=${page}`,
+          contentType: "application/json",
+        });
+        if (response.status < 200 || response.status >= 300) {
+          throw responseError("list pull request review comments", response);
+        }
+        const value = parseJson(response, "list pull request review comments");
+        if (!Array.isArray(value)) {
+          throw new Error(
+            "list pull request review comments returned a non-array response",
+          );
+        }
+        for (const item of value) {
+          if (!isObject(item)) continue;
+          const id = item["id"];
+          if (typeof id !== "string" && typeof id !== "number") continue;
+          const inReplyTo = item["in_reply_to_id"];
+          const user = item["user"];
+          comments.push({
+            id: String(id),
+            inReplyToId: typeof inReplyTo === "string" || typeof inReplyTo === "number"
+              ? String(inReplyTo)
+              : null,
+            authorLogin: isObject(user) && typeof user["login"] === "string"
+              ? user["login"]
+              : "",
+            body: typeof item["body"] === "string" ? item["body"] : "",
+            path: typeof item["path"] === "string" ? item["path"] : null,
+          });
+        }
+        if (value.length < COMMENTS_PER_PAGE) break;
+      }
+      return comments;
     },
 
     async postReview(input) {

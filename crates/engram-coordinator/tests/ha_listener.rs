@@ -290,8 +290,7 @@ async fn serve(
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
-    let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
-        .expect("tcp incoming from listener");
+    let incoming = tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
     let handle = tokio::spawn(async move {
         let _ = engram_coordinator::grpc_app::server(state)
             .serve_with_incoming(incoming)

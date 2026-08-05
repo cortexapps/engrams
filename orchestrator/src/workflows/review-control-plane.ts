@@ -18,6 +18,7 @@ import {
   makeReviewStore,
   type BeginReviewPassInput,
   type BeginReviewPassResult,
+  type PriorReviewPass,
   type ReviewDetail,
   type ReviewStore,
   type UpdateReviewPassContextInput,
@@ -222,6 +223,7 @@ interface ReviewControlPlaneStore extends Pick<
   | "beginReviewPass"
   | "updateReviewPassContext"
   | "getReview"
+  | "listPriorPasses"
   | "updateReviewStatus"
   | "updateFindingState"
   | "finalizeReview"
@@ -322,6 +324,17 @@ const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const SHA_RE = /^[0-9a-fA-F]{7,40}$/;
 const BOOTSTRAP_CLONE_DEADLINE_MS = 5 * 60_000;
 const MERGE_BASE_DEADLINE_MS = 60_000;
+
+// Cross-round context (prior-findings.json): how many earlier passes ride
+// along, and how much of each finding body / author reply survives the clip.
+const PRIOR_PASS_LIMIT = 10;
+const PRIOR_TEXT_MAX = 1500;
+const PRIOR_FINDINGS_PATH = "/workspace/.review/prior-findings.json";
+
+function clipPriorText(text: string): string {
+  if (text.length <= PRIOR_TEXT_MAX) return text;
+  return `${text.slice(0, PRIOR_TEXT_MAX)}…`;
+}
 
 // Security clamp: reviewer workers may read only the reviewed repo, while the
 // orchestrator remains the sole GitHub writer. Direct clone/codeload hosts are
@@ -563,6 +576,93 @@ export function makeReviewControlPlane(
       log.error({ sessionId, err }, "review worker cleanup failed");
     }
   };
+  // Cross-round review context: everything earlier passes of this pull request
+  // reported, with verdict reasons and the author's inline replies. Best-effort
+  // by construction — a re-review must still run when the history read or
+  // GitHub fails, so every failure degrades to "no context file", never a
+  // throw. Returns null on a first review, which is the common case.
+  const buildPriorFindingsFile = async (
+    reviewId: string,
+  ): Promise<{ path: string; content: string } | null> => {
+    try {
+      const detail = await reviews().getReview(reviewId);
+      if (!detail) return null;
+      const { targetId, repo, prNumber } = detail.review;
+      const passes: PriorReviewPass[] = await reviews().listPriorPasses(targetId, {
+        excludeReviewId: reviewId,
+        limit: PRIOR_PASS_LIMIT,
+      });
+      if (passes.length === 0) return null;
+
+      const priorTitles = new Set(
+        passes.flatMap((pass) => pass.findings.map((finding) => finding.title)),
+      );
+      // Author replies live only on GitHub. A posted finding carries no thread
+      // id, so a reply is matched to its finding through the parent comment's
+      // first line, which quotes the finding title verbatim.
+      const authorReplies: Array<{
+        finding_title: string;
+        author: string;
+        body: string;
+      }> = [];
+      try {
+        const comments = await githubPoster.listReviewComments(repo, prNumber);
+        const roots = new Map(comments.map((comment) => [comment.id, comment]));
+        for (const comment of comments) {
+          if (comment.inReplyToId === null) continue;
+          const parent = roots.get(comment.inReplyToId);
+          if (!parent) continue;
+          const firstLine = parent.body.split("\n", 1)[0] ?? "";
+          const title = [...priorTitles].find((candidate) =>
+            candidate !== "" && firstLine.includes(candidate)
+          );
+          if (title === undefined) continue;
+          authorReplies.push({
+            finding_title: title,
+            author: comment.authorLogin,
+            body: clipPriorText(comment.body),
+          });
+        }
+      } catch (err) {
+        log.warn(
+          { reviewId, repo, prNumber, err },
+          "prior-review reply fetch failed; staging DB context only (best-effort)",
+        );
+      }
+
+      const payload = {
+        pull_request: prNumber,
+        current_review_id: reviewId,
+        prior_passes: passes.map((pass) => ({
+          review_id: pass.reviewId,
+          head_sha: pass.headSha,
+          trigger: pass.trigger,
+          status: pass.status,
+          created_at: pass.createdAt.toISOString(),
+          findings: pass.findings.map((finding) => ({
+            title: finding.title,
+            path: finding.path,
+            start_line: finding.startLine,
+            end_line: finding.endLine,
+            category: finding.category,
+            severity: finding.severity,
+            confidence: finding.confidence,
+            state: finding.state,
+            verdict_reason: finding.verdictReason,
+            body_md: clipPriorText(finding.bodyMd),
+          })),
+        })),
+        author_replies: authorReplies,
+      };
+      return { path: PRIOR_FINDINGS_PATH, content: JSON.stringify(payload) };
+    } catch (err) {
+      log.warn(
+        { reviewId, err },
+        "prior-findings context build failed; reviewing without it (best-effort)",
+      );
+      return null;
+    }
+  };
   const createExistingSession = deps.createSessionForExistingTask ?? ((params) => {
     const database = db();
     return createSessionForExistingTask(
@@ -773,13 +873,17 @@ export function makeReviewControlPlane(
       );
 
       const encoder = new TextEncoder();
-      const files = renderReviewer({
-        role: "finder",
-        ...(input.enabledCategories ? { enabledCategories: input.enabledCategories } : {}),
-        ...(input.orgInstructions !== undefined
-          ? { orgInstructions: input.orgInstructions }
-          : {}),
-      }).map((file) => ({
+      const priorFindings = await buildPriorFindingsFile(input.reviewId);
+      const files = [
+        ...renderReviewer({
+          role: "finder",
+          ...(input.enabledCategories ? { enabledCategories: input.enabledCategories } : {}),
+          ...(input.orgInstructions !== undefined
+            ? { orgInstructions: input.orgInstructions }
+            : {}),
+        }),
+        ...(priorFindings ? [priorFindings] : []),
+      ].map((file) => ({
         path: file.path,
         content: encoder.encode(file.content),
         mode: 0o644,
@@ -816,10 +920,54 @@ export function makeReviewControlPlane(
       const range = mergeBase !== ""
         ? `${mergeBase}...${input.headSha}`
         : "the PR diff";
+
+      // Re-review scoping: an automation pass after a push reviews the DELTA
+      // since the last posted review, not the whole PR again. Full re-reviews
+      // re-derive the same findings, re-post duplicates, and flag the rework
+      // the previous round caused — the audited treadmill. Human triggers keep
+      // the full range. Best-effort: a failed context read only widens the
+      // scope back to the full PR.
+      let lastReviewedHead = "";
+      let hasPriorPasses = false;
+      try {
+        const detail = await reviews().getReview(input.reviewId);
+        if (detail) {
+          const passes = await reviews().listPriorPasses(detail.review.targetId, {
+            excludeReviewId: input.reviewId,
+            limit: PRIOR_PASS_LIMIT,
+          });
+          hasPriorPasses = passes.length > 0;
+          if (detail.review.trigger === "synchronize") {
+            const lastPosted = passes.find((pass) =>
+              pass.status === "posted"
+              && SHA_RE.test(pass.headSha)
+              && pass.headSha !== input.headSha
+            );
+            lastReviewedHead = lastPosted?.headSha ?? "";
+          }
+        }
+      } catch (err) {
+        log.warn(
+          { reviewId: input.reviewId, err },
+          "re-review scoping read failed; reviewing the full range (best-effort)",
+        );
+      }
+
       const prompt = [
         `Review ${input.repo} pull request #${input.prNumber}.`,
         `Analyze ${range} in /workspace/${name}.`,
         ...(mergeBase !== "" ? [`base_sha is ${mergeBase} (the merge base).`] : []),
+        ...(lastReviewedHead !== ""
+          ? [
+              `This is an automatic re-review after a push. The last posted review examined ${lastReviewedHead}.`,
+              `Report new findings only from the changes since it: \`git diff ${lastReviewedHead}...${input.headSha}\`. The full range is context, not new review surface. If that commit is absent from the clone (force-push), fall back to the full range.`,
+            ]
+          : []),
+        ...(hasPriorPasses
+          ? [
+              `Earlier review rounds for this pull request are recorded at ${PRIOR_FINDINGS_PATH} (when present) — read them before reviewing.`,
+            ]
+          : []),
         "Read /workspace/.review/finder.md and follow its instructions before reviewing.",
         ...(input.focus?.trim() ? [`Focus directive: ${input.focus.trim()}`] : []),
         "Report findings only through the provided review tools; do not edit files or push changes.",
@@ -921,6 +1069,7 @@ export function makeReviewControlPlane(
         }));
 
       const encoder = new TextEncoder();
+      const priorFindings = await buildPriorFindingsFile(input.reviewId);
       const files = [
         ...renderReviewer({
           role: "verifier",
@@ -933,6 +1082,7 @@ export function makeReviewControlPlane(
           path: "/workspace/.review/candidates.json",
           content: JSON.stringify(candidates),
         },
+        ...(priorFindings ? [priorFindings] : []),
       ].map((file) => ({
         path: file.path,
         content: encoder.encode(file.content),

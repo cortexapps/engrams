@@ -217,7 +217,7 @@ async fn per_chunk_artifact_push_pull_roundtrip() {
     for (c, d) in chunks.iter().zip(&digests) {
         if !client.blob_exists(&uri, d).await.expect("HEAD") {
             client
-                .push_chunk_blob(&uri, d, c)
+                .push_chunk_blob(&uri, d, *c)
                 .await
                 .expect("push chunk");
             pushed += 1;

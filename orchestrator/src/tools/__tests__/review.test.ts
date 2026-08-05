@@ -108,6 +108,9 @@ function fakeReviewStore(options: {
     async updateReviewPassContext() {
       return true;
     },
+    async listPriorPasses() {
+      return [];
+    },
     async getReview() {
       return detail;
     },
