@@ -16,7 +16,7 @@ chrono.workspace = true
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-jsonwebtoken = "9"
+jsonwebtoken.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
