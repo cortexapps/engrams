@@ -14,9 +14,8 @@ import {
   groupPartByType,
   MessagePrimitive,
   ThreadPrimitive,
+  useAui,
   useAuiState,
-  useComposer,
-  useComposerRuntime,
 } from "@assistant-ui/react";
 import type { ToolCallMessagePartComponent } from "@assistant-ui/react";
 import {
@@ -358,8 +357,8 @@ const Composer: FC = () => {
   } = useComposerActions();
   const planMode = mode === "plan";
   const isRunning = useAuiState((s) => s.thread.isRunning);
-  const composer = useComposerRuntime();
-  const text = useComposer((c) => c.text);
+  const composer = useAui().composer;
+  const text = useAuiState((s) => s.composer.text);
   const isEmpty = text.trim().length === 0;
   // Slack-style toggle: when on, plain ↵ sends and ⇧↵ is the newline. See
   // useEnterToSend + the composer settings toggle in ProfilePanel.
@@ -461,8 +460,8 @@ const Composer: FC = () => {
 const ComposerAction: FC = () => {
   const { submit, interrupt, sendBlocked } = useComposerActions();
   const isRunning = useAuiState((s) => s.thread.isRunning);
-  const composer = useComposerRuntime();
-  const text = useComposer((c) => c.text);
+  const composer = useAui().composer;
+  const text = useAuiState((s) => s.composer.text);
   const isEmpty = text.trim().length === 0;
   const [enterToSend] = useEnterToSend();
   // The button mirrors the active send chord: ↵ on its own vs ⌘↵.
