@@ -343,6 +343,14 @@
     },
     {
       "grants": ["pulls:write"],
+      "match": { "operation": "mutation", "field": "enqueuePullRequest" }
+    },
+    {
+      "grants": ["pulls:write"],
+      "match": { "operation": "mutation", "field": "dequeuePullRequest" }
+    },
+    {
+      "grants": ["pulls:write"],
       "match": { "operation": "mutation", "field": "closePullRequest" }
     },
     {
