@@ -35,13 +35,7 @@ import { log as rootLog } from "../log.ts";
 
 const log = rootLog.child({ component: "profile-picker" });
 
-/** Google-served flash tier: first-party capacity, no shared-pool 429s (the
- *  deepseek flash pool on Fireworks rate-limits under contention and
- *  OpenRouter passes that 429 through without model fallback). */
-const PICKER_MODEL = "google/gemini-3.5-flash-lite";
-/** Same-request fallbacks, tried in order by OpenRouter if the primary's
- *  providers fail. */
-const PICKER_FALLBACK_MODELS = ["deepseek/deepseek-v4-flash"];
+const PICKER_MODEL = "deepseek/deepseek-v4-flash";
 /** Hard budget on the model call; past it the picker degrades to ask_user. */
 const PICK_TIMEOUT_MS = 5_000;
 /** Bound on the message text sent to the model. */
@@ -328,7 +322,6 @@ export function makeProfilePicker(deps: ProductionPickerDeps = {}): ProfilePicke
         schema: pickSchema,
         system: PICKER_SYSTEM_PROMPT,
         prompt: promptText,
-        providerOptions: { openrouter: { models: PICKER_FALLBACK_MODELS } },
         abortSignal: AbortSignal.timeout(PICK_TIMEOUT_MS),
         // One retry (~2s in) fits the 5s budget and absorbs a transient
         // upstream 429; the abort signal still bounds the total. More
