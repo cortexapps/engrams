@@ -33,15 +33,16 @@ function makeApp() {
   return { app, calls };
 }
 
-/** A profile option-button block_actions payload, as Slack sends it. */
+/** A profile-select block_actions payload, as Slack sends it. */
 function profileSelectPayload(clicker: string) {
   return {
     type: "block_actions",
     user: { id: clicker },
     actions: [
       {
-        action_id: `${ACTION_PROFILE}:1`,
-        value: JSON.stringify({ p: "profile-2", pn: "Infra", r: ROUTE, u: "U1", n: "Ev0" }),
+        action_id: ACTION_PROFILE,
+        block_id: JSON.stringify({ r: ROUTE, u: "U1", n: "Ev0" }),
+        selected_option: { value: "profile-2", text: { type: "plain_text", text: "Infra" } },
       },
     ],
   };
@@ -137,12 +138,14 @@ describe("POST /api/v1/integrations/slack/interactivity", () => {
     expect(calls.profileChoices).toHaveLength(0);
   });
 
-  test("a profile pick with a malformed button value is ignored", async () => {
+  test("a profile pick with malformed block metadata is ignored", async () => {
     const { app, calls } = makeApp();
     const res = await postSigned(app, {
       type: "block_actions",
       user: { id: "U1" },
-      actions: [{ action_id: `${ACTION_PROFILE}:0`, value: "not-json" }],
+      actions: [
+        { action_id: ACTION_PROFILE, block_id: "not-json", selected_option: { value: "p" } },
+      ],
     });
     expect(res.status).toBe(200);
     expect(calls.profileChoices).toHaveLength(0);

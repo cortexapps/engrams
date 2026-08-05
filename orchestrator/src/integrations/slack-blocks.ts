@@ -39,15 +39,8 @@ function isAnswerAction(id: string | undefined): boolean {
 }
 /** "Answer…" button that opens the modal for a multi/multi-question ask. */
 export const ACTION_OPEN = "auq_open";
-/** Profile-picker option button (routing `ask_user` fallback). Like
- *  `auq_answer`, concrete buttons carry a per-option index suffix
- *  (`profile_select:<i>`) for Slack action_id uniqueness. */
+/** The profile-picker dropdown (routing `ask_user` fallback). */
 export const ACTION_PROFILE = "profile_select";
-
-/** True for any profile option button action_id — bare or suffixed. */
-function isProfileAction(id: string | undefined): boolean {
-  return id === ACTION_PROFILE || (id?.startsWith(`${ACTION_PROFILE}:`) ?? false);
-}
 /** The answer modal's `callback_id`. */
 export const CALLBACK_SUBMIT = "auq_submit";
 /** The input element's `action_id` inside each modal question block. */
@@ -141,8 +134,8 @@ export function parseInteractivity(payloadJson: string): InteractivityAction {
   }
 
   if (p.type === "block_actions") {
-    const profile = p.actions?.find((a) => isProfileAction(a.action_id));
-    if (profile) return parseProfileChoice(profile.value, p.user?.id ?? "");
+    const select = p.actions?.find((a) => a.action_id === ACTION_PROFILE);
+    if (select) return parseProfileChoice(select, p.user?.id ?? "");
     const action = p.actions?.find(
       (a) => isAnswerAction(a.action_id) || a.action_id === ACTION_OPEN,
     );
@@ -208,11 +201,9 @@ function selectedLabels(state: ViewStateValue | undefined): string[] {
   return single ? [single] : [];
 }
 
-/** The carried value of a profile option button — the AUQ answer-button
- *  pattern: everything the interactivity endpoint needs rides the value. */
-interface ProfileValue {
-  p: string; // profile id
-  pn: string; // profile display name (for the resolved-message update)
+/** What rides the profile picker's `block_id` (a select option value caps at
+ *  75 chars — too small for the route — while a block_id allows 255). */
+interface PickerMeta {
   r: ThreadRoute;
   /** The mentioning Slack user — the only one who may pick. */
   u: string;
@@ -220,21 +211,29 @@ interface ProfileValue {
   n: string;
 }
 
-/** Classify a profile option button click. Malformed values → ignore. */
-function parseProfileChoice(value: string | undefined, clicker: string): InteractivityAction {
-  if (!value) return { kind: "ignore" };
+/** Classify a profile-select interaction. The option value is the profile id;
+ *  the display name rides the option text. Malformed metadata → ignore. */
+function parseProfileChoice(
+  action: {
+    block_id?: string;
+    selected_option?: { value?: string; text?: { text?: string } };
+  },
+  clicker: string,
+): InteractivityAction {
+  const profileId = action.selected_option?.value;
+  if (!profileId || !action.block_id) return { kind: "ignore" };
   try {
-    const v = JSON.parse(value) as ProfileValue;
-    if (typeof v.p !== "string" || !v.p || !v.r || typeof v.u !== "string" || typeof v.n !== "string") {
+    const meta = JSON.parse(action.block_id) as PickerMeta;
+    if (!meta.r || typeof meta.u !== "string" || typeof meta.n !== "string") {
       return { kind: "ignore" };
     }
     return {
       kind: "profile_choice",
-      choice: { profileId: v.p, profileName: typeof v.pn === "string" ? v.pn : "" },
-      route: v.r,
-      expectedUser: v.u,
+      choice: { profileId, profileName: action.selected_option?.text?.text ?? "" },
+      route: meta.r,
+      expectedUser: meta.u,
       clicker,
-      nonce: v.n,
+      nonce: meta.n,
     };
   } catch {
     return { kind: "ignore" };
@@ -423,15 +422,29 @@ export function buildQuestionBlocks(route: ThreadRoute, parsed: ParsedUserQuesti
   return blocks;
 }
 
+/** Slack caps a radio_buttons group at 10 options and a context block at 10
+ *  elements. */
+const RADIO_OPTIONS_MAX = 10;
+const CONTEXT_ELEMENTS_MAX = 10;
+
+/** Trim to `n` chars at a word boundary (a mid-word cut reads as a glitch). */
+function truncateWords(s: string, n: number): string {
+  if (s.length <= n) return s;
+  const cut = s.slice(0, n - 1);
+  const atSpace = cut.lastIndexOf(" ");
+  return (atSpace > n / 2 ? cut.slice(0, atSpace) : cut) + "…";
+}
+
 /**
- * Build the profile-picker message in the AskUserQuestion visual language
- * (product consistency): a question section, then one option button per
- * profile — the same shape `buildQuestionBlocks` renders for an inline
- * single-select ask. Each button's value carries everything the
- * interactivity endpoint needs (profile, route, mentioning user, per-ask
- * nonce), exactly like an `auq_answer` button. First selection wins — the
- * interactivity route dedupes on the nonce and the workflow ignores late
- * picks.
+ * Build the profile-picker message. Up to 10 profiles render as ONE
+ * `radio_buttons` group — the only Block Kit control whose options natively
+ * carry a muted per-option description, so the control IS the card list and
+ * one click decides. Past 10 (Slack's radio cap) it degrades to a
+ * `static_select` with the descriptions as context lines. Either way the
+ * option value is the profile id, and the route, the mentioning user, and
+ * the per-ask nonce ride the containing block's `block_id` (an option value
+ * caps at 75 chars). First selection wins — the interactivity route dedupes
+ * on the nonce and the workflow ignores late picks.
  */
 export function buildProfilePickerBlocks(
   route: ThreadRoute,
@@ -439,27 +452,68 @@ export function buildProfilePickerBlocks(
   nonce: string,
   options: ProfileOption[],
 ): KnownBlock[] {
-  return [
-    section("*Which profile should handle this?*\nPick one to start the session."),
+  const meta: PickerMeta = { r: route, u: expectedUser, n: nonce };
+  const questionText = "*Which profile should handle this?*\nPick one to start the session.";
+
+  if (options.length <= RADIO_OPTIONS_MAX) {
+    return [
+      section(questionText),
+      {
+        type: "actions",
+        block_id: JSON.stringify(meta),
+        elements: [
+          {
+            type: "radio_buttons",
+            action_id: ACTION_PROFILE,
+            options: options.map((o) => ({
+              text: { type: "plain_text" as const, text: truncate(o.name, 75) },
+              value: o.id,
+              ...(o.description
+                ? {
+                    description: {
+                      type: "plain_text" as const,
+                      text: truncateWords(o.description, 75),
+                    },
+                  }
+                : {}),
+            })),
+          },
+        ],
+      },
+    ];
+  }
+
+  const blocks: KnownBlock[] = [
     {
-      type: "actions",
-      elements: options.map((o, i) => {
-        const value: ProfileValue = {
-          p: o.id,
-          pn: truncate(o.name, 75),
-          r: route,
-          u: expectedUser,
-          n: nonce,
-        };
-        return {
-          type: "button",
-          action_id: `${ACTION_PROFILE}:${i}`,
+      type: "section",
+      block_id: JSON.stringify(meta),
+      text: { type: "mrkdwn", text: questionText },
+      accessory: {
+        type: "static_select",
+        action_id: ACTION_PROFILE,
+        placeholder: { type: "plain_text", text: "Choose a profile" },
+        options: options.map((o) => ({
           text: { type: "plain_text", text: truncate(o.name, 75) },
-          value: JSON.stringify(value),
-        };
-      }),
+          value: o.id,
+        })),
+      },
     },
   ];
+  const lines = options.map((o) =>
+    o.description
+      ? `*${truncate(o.name, 75)}* — ${truncateWords(o.description, 110)}`
+      : `*${truncate(o.name, 75)}*`,
+  );
+  for (let i = 0; i < lines.length; i += CONTEXT_ELEMENTS_MAX) {
+    blocks.push({
+      type: "context",
+      elements: lines.slice(i, i + CONTEXT_ELEMENTS_MAX).map((text) => ({
+        type: "mrkdwn",
+        text,
+      })),
+    });
+  }
+  return blocks;
 }
 
 /** The resolved picker message (replaces the live one via chat.update). */
