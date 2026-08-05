@@ -422,12 +422,25 @@ export function buildQuestionBlocks(route: ThreadRoute, parsed: ParsedUserQuesti
   return blocks;
 }
 
+/** Slack caps a context block at 10 elements. */
+const CONTEXT_ELEMENTS_MAX = 10;
+
+/** Trim to `n` chars at a word boundary (a mid-word cut reads as a glitch). */
+function truncateWords(s: string, n: number): string {
+  if (s.length <= n) return s;
+  const cut = s.slice(0, n - 1);
+  const atSpace = cut.lastIndexOf(" ");
+  return (atSpace > n / 2 ? cut.slice(0, atSpace) : cut) + "…";
+}
+
 /**
- * Build the profile-picker message: the candidate profiles (name + description
- * lines) and a `static_select` whose options carry profile ids. The route,
- * the mentioning user, and the per-ask nonce ride the `block_id` (a select
- * option value caps at 75 chars). First selection wins — the interactivity
- * route dedupes on the nonce and the workflow ignores late picks.
+ * Build the profile-picker message: the question with the `static_select` as
+ * its accessory (one visual unit), then the candidate descriptions as muted
+ * small-type context lines — not a bold bullet wall. Select options carry the
+ * profile ids (a Slack select option cannot carry a description); the route,
+ * the mentioning user, and the per-ask nonce ride the `block_id` (an option
+ * value caps at 75 chars). First selection wins — the interactivity route
+ * dedupes on the nonce and the workflow ignores late picks.
  */
 export function buildProfilePickerBlocks(
   route: ThreadRoute,
@@ -436,15 +449,14 @@ export function buildProfilePickerBlocks(
   options: ProfileOption[],
 ): KnownBlock[] {
   const meta: PickerMeta = { r: route, u: expectedUser, n: nonce };
-  const lines = options
-    .map((o) => `• *${truncate(o.name, 75)}*${o.description ? ` — ${truncate(o.description, 150)}` : ""}`)
-    .join("\n");
-  return [
-    section(`Which profile should handle this?\n${lines}`),
+  const blocks: KnownBlock[] = [
     {
       type: "section",
       block_id: JSON.stringify(meta),
-      text: { type: "mrkdwn", text: "Pick one to start the session:" },
+      text: {
+        type: "mrkdwn",
+        text: "*Which profile should handle this?*\nPick one to start the session.",
+      },
       accessory: {
         type: "static_select",
         action_id: ACTION_PROFILE,
@@ -456,6 +468,21 @@ export function buildProfilePickerBlocks(
       },
     },
   ];
+  const lines = options.map((o) =>
+    o.description
+      ? `*${truncate(o.name, 75)}* — ${truncateWords(o.description, 110)}`
+      : `*${truncate(o.name, 75)}*`,
+  );
+  for (let i = 0; i < lines.length; i += CONTEXT_ELEMENTS_MAX) {
+    blocks.push({
+      type: "context",
+      elements: lines.slice(i, i + CONTEXT_ELEMENTS_MAX).map((text) => ({
+        type: "mrkdwn",
+        text,
+      })),
+    });
+  }
+  return blocks;
 }
 
 /** The resolved picker message (replaces the live one via chat.update). */

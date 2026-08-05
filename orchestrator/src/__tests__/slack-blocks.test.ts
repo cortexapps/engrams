@@ -361,6 +361,22 @@ describe("profile picker blocks — build/parse round-trip", () => {
     expect(noSelection).toEqual({ kind: "ignore" });
   });
 
+  test("descriptions render as muted context lines, trimmed at a word boundary", () => {
+    const long = "word ".repeat(40).trim(); // 199 chars — must trim, never mid-word
+    const blocks = buildProfilePickerBlocks(ROUTE, "U1", "Ev7", [
+      { id: "p1", name: "Backend", description: long },
+      { id: "p2", name: "Bare", description: "" },
+    ]);
+    const context = blocks.find((b) => (b as { type?: string }).type === "context") as {
+      elements: { text: string }[];
+    };
+    expect(context.elements).toHaveLength(2);
+    expect(context.elements[0].text.startsWith("*Backend* — word")).toBe(true);
+    expect(context.elements[0].text.endsWith("word…")).toBe(true);
+    expect(context.elements[0].text.length).toBeLessThanOrEqual("*Backend* — ".length + 111);
+    expect(context.elements[1].text).toBe("*Bare*");
+  });
+
   test("the chosen-state block names the profile", () => {
     const [block] = buildProfileChosenBlocks("Backend");
     expect(JSON.stringify(block)).toContain("Backend");
