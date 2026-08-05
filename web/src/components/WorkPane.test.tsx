@@ -29,6 +29,8 @@ describe("WorkPane side effects", () => {
         open
         tab="side-effects"
         onTabChange={() => {}}
+        processesTailId={null}
+        onProcessesTail={() => {}}
         browserEnabled={false}
         ideEnabled={false}
         onCollapse={() => {}}

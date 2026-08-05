@@ -13,6 +13,7 @@ import {
   Code2,
   GitPullRequestArrow,
   Globe,
+  ListTree,
   Map,
   Pencil,
   SquareTerminal,
@@ -27,6 +28,10 @@ import { PageHeading } from "../components/page-heading";
 import { TitleEditForm } from "./sessions/TitleEditForm";
 import { DeleteSessionButton } from "./sessions/DeleteSessionButton";
 import { WorkPane, type PaneTabId } from "../components/WorkPane";
+import {
+  WorkPaneActionsContext,
+  type WorkPaneActions,
+} from "../components/session-thread/work-pane-actions";
 import { shortId, statusLabel } from "./sessions/session-format";
 import { useTasks } from "../hooks/useTasks";
 import { useIsMobile } from "../hooks/use-mobile";
@@ -64,6 +69,7 @@ function readPanePref(): WorkPanePref {
     const p = JSON.parse(raw) as Partial<WorkPanePref>;
     return {
       tab:
+        p.tab === "processes" ||
         p.tab === "browser" ||
         p.tab === "ide" ||
         p.tab === "side-effects" ||
@@ -166,6 +172,9 @@ export function SessionDetail() {
   // pane mounts (and no socket opens) until the developer opens it.
   const [paneOpen, setPaneOpen] = useState(false);
   const [paneTab, setPaneTab] = useState<PaneTabId>(prefRef.current.tab);
+  // Which Bash call the Processes view is tailing (null = its command list).
+  // A card's Tail action sets it via work-pane-actions.
+  const [processesTailId, setProcessesTailId] = useState<string | null>(null);
   // Desktop only: the pane fills the work area (transcript panel collapsed).
   const [expanded, setExpanded] = useState(false);
 
@@ -216,6 +225,20 @@ export function SessionDetail() {
     if (expanded) transcriptRef.current?.expand();
     else transcriptRef.current?.collapse();
   };
+
+  // Transcript cards (the Bash Tail action) open the Processes view through
+  // this context so the thread stays ignorant of pane mechanics.
+  const workPaneActions = useMemo<WorkPaneActions>(
+    () => ({
+      openProcesses: (toolCallId?: string) => {
+        setProcessesTailId(toolCallId ?? null);
+        openPane("processes");
+      },
+    }),
+    // openPane reads refs + isMobile; isMobile is its only reactive input.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [isMobile],
+  );
 
   // ADR 0097: the shared harness enriches a browser-driving Shell/Bash call
   // into browser_activity with the same tool id. Surface the shared Chrome on
@@ -302,6 +325,7 @@ export function SessionDetail() {
     icon: ComponentType<{ className?: string }>;
   }[] = [
     { id: "shell", label: "Shell", icon: SquareTerminal },
+    { id: "processes", label: "Processes", icon: ListTree },
     ...(browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
     ...(ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
     ...(hasPlan ? [{ id: "plan", label: "Plan", icon: Map } as const] : []),
@@ -378,123 +402,129 @@ export function SessionDetail() {
   );
 
   return (
-    <div className="flex min-h-0 flex-1 overflow-hidden">
-      {isMobile ? (
-        <>
-          {leftColumn}
-          <Sheet open={paneOpen} onOpenChange={(o) => !o && collapsePane()}>
-            <SheetContent
-              side="right"
-              showCloseButton={false}
-              className="w-full gap-0 p-0 sm:max-w-xl"
-            >
-              <SheetTitle className="sr-only">Session work pane</SheetTitle>
-              <WorkPane
-                sessionId={id}
-                taskId={taskId}
-                session={session}
-                events={events}
-                open={paneOpen}
-                tab={paneTab}
-                onTabChange={setPaneTab}
-                browserEnabled={browserEnabled}
-                ideEnabled={ideEnabled}
-                onCollapse={collapsePane}
-                variant="overlay"
-              />
-            </SheetContent>
-          </Sheet>
-        </>
-      ) : (
-        <>
-          <ResizablePanelGroup
-            direction="horizontal"
-            className="min-h-0 flex-1"
-            onLayout={(sizes) => {
-              // Only remember the split when both panels are genuinely open —
-              // skip collapsed (0) and fullscreen (transcript 0) so neither
-              // clobbers the preferred width.
-              if (sizes[0] > 1 && sizes[1] > 1) {
-                paneSizeRef.current = sizes[1];
-                writePanePref({ tab: paneTab, size: sizes[1] });
-              }
-            }}
-          >
-            <ResizablePanel
-              id="transcript"
-              order={1}
-              ref={transcriptRef}
-              collapsible
-              collapsedSize={0}
-              minSize={30}
-              defaultSize={100}
-              onCollapse={() => setExpanded(true)}
-              onExpand={() => setExpanded(false)}
-              className="min-w-0"
-            >
-              {leftColumn}
-            </ResizablePanel>
-
-            <ResizableHandle className={paneOpen ? "" : "hidden"} />
-
-            <ResizablePanel
-              id="workpane"
-              order={2}
-              ref={paneRef}
-              collapsible
-              collapsedSize={0}
-              minSize={24}
-              defaultSize={0}
-              onCollapse={() => {
-                setExpanded(false);
-                setPaneOpen(false);
+    <WorkPaneActionsContext.Provider value={workPaneActions}>
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        {isMobile ? (
+          <>
+            {leftColumn}
+            <Sheet open={paneOpen} onOpenChange={(o) => !o && collapsePane()}>
+              <SheetContent
+                side="right"
+                showCloseButton={false}
+                className="w-full gap-0 p-0 sm:max-w-xl"
+              >
+                <SheetTitle className="sr-only">Session work pane</SheetTitle>
+                <WorkPane
+                  sessionId={id}
+                  taskId={taskId}
+                  session={session}
+                  events={events}
+                  open={paneOpen}
+                  tab={paneTab}
+                  onTabChange={setPaneTab}
+                  processesTailId={processesTailId}
+                  onProcessesTail={setProcessesTailId}
+                  browserEnabled={browserEnabled}
+                  ideEnabled={ideEnabled}
+                  onCollapse={collapsePane}
+                  variant="overlay"
+                />
+              </SheetContent>
+            </Sheet>
+          </>
+        ) : (
+          <>
+            <ResizablePanelGroup
+              direction="horizontal"
+              className="min-h-0 flex-1"
+              onLayout={(sizes) => {
+                // Only remember the split when both panels are genuinely open —
+                // skip collapsed (0) and fullscreen (transcript 0) so neither
+                // clobbers the preferred width.
+                if (sizes[0] > 1 && sizes[1] > 1) {
+                  paneSizeRef.current = sizes[1];
+                  writePanePref({ tab: paneTab, size: sizes[1] });
+                }
               }}
-              onExpand={() => setPaneOpen(true)}
-              className="min-w-0 overflow-hidden"
             >
-              <WorkPane
-                sessionId={id}
-                taskId={taskId}
-                session={session}
-                events={events}
-                open={paneOpen}
-                tab={paneTab}
-                onTabChange={setPaneTab}
-                browserEnabled={browserEnabled}
-                ideEnabled={ideEnabled}
-                onCollapse={collapsePane}
-                variant="panel"
-                expanded={expanded}
-                onToggleExpand={toggleExpand}
-              />
-            </ResizablePanel>
-          </ResizablePanelGroup>
+              <ResizablePanel
+                id="transcript"
+                order={1}
+                ref={transcriptRef}
+                collapsible
+                collapsedSize={0}
+                minSize={30}
+                defaultSize={100}
+                onCollapse={() => setExpanded(true)}
+                onExpand={() => setExpanded(false)}
+                className="min-w-0"
+              >
+                {leftColumn}
+              </ResizablePanel>
 
-          {/* Collapsed edge rail — the Devin-style reopen affordance, full
+              <ResizableHandle className={paneOpen ? "" : "hidden"} />
+
+              <ResizablePanel
+                id="workpane"
+                order={2}
+                ref={paneRef}
+                collapsible
+                collapsedSize={0}
+                minSize={24}
+                defaultSize={0}
+                onCollapse={() => {
+                  setExpanded(false);
+                  setPaneOpen(false);
+                }}
+                onExpand={() => setPaneOpen(true)}
+                className="min-w-0 overflow-hidden"
+              >
+                <WorkPane
+                  sessionId={id}
+                  taskId={taskId}
+                  session={session}
+                  events={events}
+                  open={paneOpen}
+                  tab={paneTab}
+                  onTabChange={setPaneTab}
+                  processesTailId={processesTailId}
+                  onProcessesTail={setProcessesTailId}
+                  browserEnabled={browserEnabled}
+                  ideEnabled={ideEnabled}
+                  onCollapse={collapsePane}
+                  variant="panel"
+                  expanded={expanded}
+                  onToggleExpand={toggleExpand}
+                />
+              </ResizablePanel>
+            </ResizablePanelGroup>
+
+            {/* Collapsed edge rail — the Devin-style reopen affordance, full
               height. Each glyph opens the pane straight to that view. */}
-          {!paneOpen && (
-            <div
-              className="flex w-9 shrink-0 flex-col items-center gap-1 border-l bg-background py-2"
-              aria-label="Open work pane"
-            >
-              {paneTabDefs.map((t) => (
-                <Button
-                  key={t.id}
-                  variant="ghost"
-                  size="icon"
-                  className="size-7 text-muted-foreground hover:text-foreground"
-                  title={`Open ${t.label}`}
-                  aria-label={`Open ${t.label}`}
-                  onClick={() => openPane(t.id)}
-                >
-                  <t.icon />
-                </Button>
-              ))}
-            </div>
-          )}
-        </>
-      )}
-    </div>
+            {!paneOpen && (
+              <div
+                className="flex w-9 shrink-0 flex-col items-center gap-1 border-l bg-background py-2"
+                aria-label="Open work pane"
+              >
+                {paneTabDefs.map((t) => (
+                  <Button
+                    key={t.id}
+                    variant="ghost"
+                    size="icon"
+                    className="size-7 text-muted-foreground hover:text-foreground"
+                    title={`Open ${t.label}`}
+                    aria-label={`Open ${t.label}`}
+                    onClick={() => openPane(t.id)}
+                  >
+                    <t.icon />
+                  </Button>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </WorkPaneActionsContext.Provider>
   );
 }
 

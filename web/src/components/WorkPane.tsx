@@ -4,6 +4,7 @@ import {
   Code2,
   GitPullRequestArrow,
   Globe,
+  ListTree,
   Map,
   Maximize2,
   Minimize2,
@@ -13,6 +14,7 @@ import {
 } from "lucide-react";
 
 import { TerminalPane } from "./TerminalPane";
+import { ProcessesPane } from "./ProcessesPane";
 import { BrowserPane } from "./BrowserPane";
 import { IdePane } from "./IdePane";
 import { DiagnosticsPanel } from "./SessionDiagnostics";
@@ -34,7 +36,14 @@ import type { IndexedEvent, Session } from "../lib/types";
 // with expand-to-fill) and the mobile overlay sheet (`variant="overlay"`, where
 // collapse means "close the sheet").
 
-export type PaneTabId = "shell" | "browser" | "ide" | "plan" | "side-effects" | "diagnostics";
+export type PaneTabId =
+  | "shell"
+  | "processes"
+  | "browser"
+  | "ide"
+  | "plan"
+  | "side-effects"
+  | "diagnostics";
 
 interface PaneTabDef {
   id: PaneTabId;
@@ -43,6 +52,7 @@ interface PaneTabDef {
 }
 
 const SHELL_TAB: PaneTabDef = { id: "shell", label: "Shell", icon: SquareTerminal };
+const PROCESSES_TAB: PaneTabDef = { id: "processes", label: "Processes", icon: ListTree };
 const BROWSER_TAB: PaneTabDef = { id: "browser", label: "Browser", icon: Globe };
 const IDE_TAB: PaneTabDef = { id: "ide", label: "IDE", icon: Code2 };
 const SIDE_EFFECTS_TAB: PaneTabDef = {
@@ -70,6 +80,13 @@ export interface WorkPaneProps {
   open: boolean;
   tab: PaneTabId;
   onTabChange: (tab: PaneTabId) => void;
+  /**
+   * The Bash tool_call_id the Processes view is tailing, or null for its
+   * command list. Owned by SessionDetail so a card's Tail action and the
+   * pane's own list stay one state.
+   */
+  processesTailId: string | null;
+  onProcessesTail: (toolCallId: string | null) => void;
   browserEnabled: boolean;
   ideEnabled: boolean;
   /** Hide the pane (panel: collapse the panel; overlay: close the sheet). */
@@ -88,6 +105,8 @@ export function WorkPane({
   open,
   tab,
   onTabChange,
+  processesTailId,
+  onProcessesTail,
   browserEnabled,
   ideEnabled,
   onCollapse,
@@ -107,6 +126,7 @@ export function WorkPane({
   );
   const tabs = [
     SHELL_TAB,
+    PROCESSES_TAB,
     ...(browserEnabled ? [BROWSER_TAB] : []),
     ...(ideEnabled ? [IDE_TAB] : []),
     ...(hasPlan ? [PLAN_TAB] : []),
@@ -119,11 +139,13 @@ export function WorkPane({
   // display:none on tab switch / collapse) so its socket survives. Gating on
   // `open` is what keeps a collapsed pane from silently opening a shell.
   const [shellEverActive, setShellEverActive] = useState(false);
+  const [processesEverActive, setProcessesEverActive] = useState(false);
   const [browserEverActive, setBrowserEverActive] = useState(false);
   const [ideEverActive, setIdeEverActive] = useState(false);
   useEffect(() => {
     if (!open) return;
     if (tab === "shell") setShellEverActive(true);
+    if (tab === "processes") setProcessesEverActive(true);
     if (tab === "browser") setBrowserEverActive(true);
     if (tab === "ide") setIdeEverActive(true);
   }, [open, tab]);
@@ -188,6 +210,19 @@ export function WorkPane({
         {shellEverActive && (
           <div className="absolute inset-0" style={{ display: tab === "shell" ? "block" : "none" }}>
             <TerminalPane sessionId={sessionId} />
+          </div>
+        )}
+        {processesEverActive && (
+          <div
+            className="absolute inset-0"
+            style={{ display: tab === "processes" ? "block" : "none" }}
+          >
+            <ProcessesPane
+              sessionId={sessionId}
+              events={events}
+              tailId={processesTailId}
+              onTail={onProcessesTail}
+            />
           </div>
         )}
         {browserEnabled && browserEverActive && (

@@ -30,6 +30,7 @@ import {
 } from "lucide-react";
 import type { FC } from "react";
 import { ShellToolPart } from "@/components/session-thread/ShellToolPart";
+import { BashToolPart } from "@/components/session-thread/BashToolPart";
 import { FileChangePart } from "@/components/session-thread/FileChangePart";
 import { BrowserActivityPart } from "@/components/session-thread/BrowserActivityPart";
 import { SystemMessage } from "@/components/session-thread/SystemMessage";
@@ -209,11 +210,13 @@ const AssistantMessage: FC = () => {
                   const Tool: ToolCallMessagePartComponent =
                     part.toolName === SHELL_TOOL
                       ? ShellToolPart
-                      : part.toolName === BROWSER_ACTIVITY_TOOL
-                        ? BrowserActivityPart
-                        : part.toolName === FILE_CHANGE_TOOL
-                          ? FileChangePart
-                          : ToolFallback;
+                      : part.toolName === "Bash"
+                        ? BashToolPart
+                        : part.toolName === BROWSER_ACTIVITY_TOOL
+                          ? BrowserActivityPart
+                          : part.toolName === FILE_CHANGE_TOOL
+                            ? FileChangePart
+                            : ToolFallback;
                   return <Tool {...part} />;
                 }
                 case "indicator":

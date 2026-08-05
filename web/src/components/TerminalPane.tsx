@@ -31,6 +31,13 @@ import { PaneStatus } from "./PaneStatus";
 
 export interface TerminalPaneProps {
   sessionId: string;
+  /**
+   * Command typed into the shell (with a newline) as soon as the socket
+   * opens — the Processes/tail view is this pane plus a bootstrap. Changing
+   * it tears the socket down and reconnects into a fresh shell, so a new
+   * tail target never fights the previous command for the terminal.
+   */
+  bootstrap?: string;
 }
 
 const ttyClient = {
@@ -113,7 +120,7 @@ function loadGhostty(): Promise<typeof import("ghostty-web")> {
   return ghosttyModulePromise;
 }
 
-export function TerminalPane({ sessionId }: TerminalPaneProps) {
+export function TerminalPane({ sessionId, bootstrap }: TerminalPaneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<"loading" | "connecting" | "connected" | "closed" | "error">(
     "loading",
@@ -218,6 +225,9 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
         const rows = term?.rows ?? 24;
         try {
           localWs.send(JSON.stringify({ AuthToken: "", columns: cols, rows }));
+          // The pty buffers input sent before the shell prints its prompt,
+          // so the bootstrap can ride directly behind the auth frame.
+          if (bootstrap) localWs.send(ttyClient.INPUT + bootstrap + "\n");
         } catch {
           // ignore — close handler will surface the failure
         }
@@ -329,7 +339,7 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
         // ignore
       }
     };
-  }, [sessionId, reconnectKey]);
+  }, [sessionId, bootstrap, reconnectKey]);
 
   const caption = status === "loading" ? "loading terminal renderer…" : "opening shell…";
   const message =
