@@ -129,6 +129,19 @@ describe("WorkPane", () => {
     );
   }
 
+  test("sheds non-core labeled tabs into More before dropping any label", async () => {
+    // 220px: Overview/Browser/IDE fit labeled next to More; Shell overflows.
+    mockNarrowStrip(220);
+    renderPane({ browserEnabled: true, ideEnabled: true });
+
+    for (const id of ["overview", "browser", "ide"]) {
+      expect(screen.getByTestId(`pane-tab-${id}`).querySelector("span")).toBeTruthy();
+    }
+    expect(screen.queryByTestId("pane-tab-shell")).toBeNull();
+    await userEvent.click(screen.getByTestId("pane-more-menu"));
+    expect(screen.getByRole("menuitem", { name: "Shell" })).toBeTruthy();
+  });
+
   test("drops labels when the labeled set stops fitting", () => {
     // 3 views: labeled needs 184px, icon-only needs 94px — 120px → icons, no More.
     mockNarrowStrip(120);
@@ -209,27 +222,47 @@ describe("WorkPane", () => {
 });
 
 describe("stripLayout", () => {
-  const labeled = [60, 70, 50];
-  const icons = [30, 30, 30];
+  // 5 views, first 3 primary (overview/browser/ide).
+  const labeled = [60, 70, 50, 60, 60];
+  const icons = [30, 30, 30, 30, 30];
+  const PRIMARY = 3;
 
-  test("keeps labels when every labeled tab fits", () => {
-    expect(stripLayout(labeled, icons, 30, 2, 184)).toEqual({ count: 3, iconOnly: false });
+  test("keeps every label when the labeled set fits", () => {
+    expect(stripLayout(labeled, icons, 30, 2, 310, PRIMARY)).toEqual({
+      count: 5,
+      iconOnly: false,
+    });
   });
 
-  test("drops to icons when labels overflow but icons fit", () => {
-    expect(stripLayout(labeled, icons, 30, 2, 100)).toEqual({ count: 3, iconOnly: true });
+  test("sheds labeled extras into More down to the primary core", () => {
+    // More(30) + 62 + 72 + 52 = 216 — three labeled tabs fit, two overflow.
+    expect(stripLayout(labeled, icons, 30, 2, 230, PRIMARY)).toEqual({
+      count: 3,
+      iconOnly: false,
+    });
+  });
+
+  test("drops to icons only when the labeled core no longer fits", () => {
+    // Two labeled tabs fit (< 3 primaries) but all five icons do.
+    expect(stripLayout(labeled, icons, 30, 2, 170, PRIMARY)).toEqual({
+      count: 5,
+      iconOnly: true,
+    });
   });
 
   test("collapses the icon suffix behind the More trigger", () => {
-    // 70px: More(30) + gap+icon(32) fits once; the second icon would need 134.
-    expect(stripLayout(labeled, icons, 30, 2, 70)).toEqual({ count: 1, iconOnly: true });
+    // More(30) + 32 + 32 = 94; the third icon would need 126.
+    expect(stripLayout(labeled, icons, 30, 2, 100, PRIMARY)).toEqual({
+      count: 2,
+      iconOnly: true,
+    });
   });
 
   test("keeps at least one tab visible", () => {
-    expect(stripLayout(labeled, icons, 30, 2, 10)).toEqual({ count: 1, iconOnly: true });
+    expect(stripLayout(labeled, icons, 30, 2, 10, PRIMARY)).toEqual({ count: 1, iconOnly: true });
   });
 
   test("returns every labeled tab for layout-free measurements", () => {
-    expect(stripLayout([0, 0, 0], [0, 0, 0], 0, 0, 0)).toEqual({ count: 3, iconOnly: false });
+    expect(stripLayout([0, 0, 0], [0, 0, 0], 0, 0, 0, 1)).toEqual({ count: 3, iconOnly: false });
   });
 });

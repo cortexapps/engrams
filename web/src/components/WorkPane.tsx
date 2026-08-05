@@ -65,14 +65,27 @@ function fitsAll(widths: number[], gapPx: number, available: number): boolean {
   return total + gapPx * (widths.length - 1) <= available;
 }
 
-/** Widest-first strip layout: every tab labeled → every tab icon-only → an
- *  icon-only prefix plus the More menu for the remainder. */
+function fittingPrefix(widths: number[], moreWidth: number, gapPx: number, available: number) {
+  let used = moreWidth;
+  let count = 0;
+  for (const width of widths) {
+    if (used + gapPx + width > available) break;
+    used += gapPx + width;
+    count += 1;
+  }
+  return count;
+}
+
+/** Widest-first strip layout, in three stages: every tab labeled → a labeled
+ *  prefix + More, shrinking no further than the first `primaryCount` tabs
+ *  (Overview/Browser/IDE) → icon-only tabs, again as many as fit + More. */
 export function stripLayout(
   labeledWidths: number[],
   iconWidths: number[],
   moreWidth: number,
   gapPx: number,
   available: number,
+  primaryCount: number,
 ): StripLayout {
   const all = labeledWidths.length;
   if (all === 0) return { count: 0, iconOnly: false };
@@ -82,16 +95,15 @@ export function stripLayout(
   // The More trigger renders only when something overflows — don't reserve
   // room for it while everything fits, or one tab would collapse for no reason.
   if (fitsAll(labeledWidths, gapPx, available)) return { count: all, iconOnly: false };
-  if (fitsAll(iconWidths, gapPx, available)) return { count: all, iconOnly: true };
 
-  let used = moreWidth;
-  let count = 0;
-  for (const width of iconWidths) {
-    if (used + gapPx + width > available) break;
-    used += gapPx + width;
-    count += 1;
-  }
-  return { count: Math.max(1, count), iconOnly: true };
+  const labeledCount = fittingPrefix(labeledWidths, moreWidth, gapPx, available);
+  if (labeledCount >= primaryCount) return { count: labeledCount, iconOnly: false };
+
+  if (fitsAll(iconWidths, gapPx, available)) return { count: all, iconOnly: true };
+  return {
+    count: Math.max(1, fittingPrefix(iconWidths, moreWidth, gapPx, available)),
+    iconOnly: true,
+  };
 }
 
 /** Every available view in strip priority order: the fitting prefix renders
@@ -234,6 +246,10 @@ export function WorkPane({
   const hasChanges = useMemo(() => extractFileChanges(events).length > 0, [events]);
   const views = paneViewDefs({ browserEnabled, ideEnabled, hasChanges, isAdmin });
   const effectiveTab = views.some((view) => view.id === tab) ? tab : "overview";
+  // The labeled stage never collapses past these — the always-on core.
+  const primaryCount = views.filter((view) =>
+    ["overview", "browser", "ide"].includes(view.id),
+  ).length;
   const measurementKey = views.map((view) => view.id).join("|");
   const stripRef = useRef<HTMLDivElement>(null);
   const measurementRef = useRef<HTMLDivElement>(null);
@@ -256,7 +272,9 @@ export function WorkPane({
       const iconWidths = children.slice(half).map(width);
       const style = getComputedStyle(measurement);
       const gapPx = Number.parseFloat(style.columnGap || style.gap) || 0;
-      setLayout(stripLayout(labeledWidths, iconWidths, width(more), gapPx, strip.clientWidth));
+      setLayout(
+        stripLayout(labeledWidths, iconWidths, width(more), gapPx, strip.clientWidth, primaryCount),
+      );
     };
 
     measure();
