@@ -109,11 +109,13 @@ const PICKER_SYSTEM_PROMPT = `You route an incoming Slack request to one of an o
 
 You receive the Slack message (with thread context), a capability card for each profile, and two usage histograms: which profiles this channel and this user used recently.
 
+Weigh the evidence in this order:
+1. Match the message against the capability cards. When the message clearly belongs to one profile's described purpose, route there — even if the histograms favor another profile. History often predates newer profiles, so a strong content match on a low-history profile beats a high count elsewhere.
+2. Use the histograms only to break ties: between profiles that fit the message comparably, or for a generic message that fits any profile.
+
 Decide:
 - "route" when one profile is the right handler. Rank all profiles, best first.
-- "ask_user" when the user explicitly asks to choose a profile (for example "which profile", "ask me which"), or when after using every signal two or more profiles remain equally plausible. Rank the profiles by plausibility anyway.
-
-Commit when the signals agree. A lopsided channel histogram is strong evidence: if this channel almost always uses one profile and the message fits it, route there. Use "ask_user" only for genuine ambiguity — it interrupts the user.
+- "ask_user" when the user explicitly asks to choose a profile (for example "which profile", "ask me which"), or when no card clearly fits and the histograms do not break the tie. Rank the profiles by plausibility anyway. Use "ask_user" only for genuine ambiguity — it interrupts the user.
 
 Return JSON: {"decision": "route" | "ask_user", "ranked": [profile ids, best first], "reason": one short sentence}.
 Use only profile ids from the provided cards.`;
