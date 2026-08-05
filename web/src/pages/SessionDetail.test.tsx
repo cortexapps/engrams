@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 const testState = vi.hoisted(() => ({
   session: null as Record<string, unknown> | null,
@@ -43,12 +44,20 @@ vi.mock("@/components/ui/resizable", async () => {
   const React = await import("react");
   const ResizablePanel = React.forwardRef<
     { collapse: () => void; expand: () => void; resize: () => void },
-    { children?: React.ReactNode; id?: string; defaultSize?: number }
-  >(function MockResizablePanel({ children, id, defaultSize }, ref) {
+    {
+      children?: React.ReactNode;
+      id?: string;
+      defaultSize?: number;
+      onCollapse?: () => void;
+      onExpand?: () => void;
+    }
+  >(function MockResizablePanel({ children, id, defaultSize, onCollapse, onExpand }, ref) {
+    // The imperative handle mirrors the real library's callback contract:
+    // collapse() fires onCollapse, expand()/resize() fire onExpand.
     React.useImperativeHandle(ref, () => ({
-      collapse: () => {},
-      expand: () => {},
-      resize: () => {},
+      collapse: () => onCollapse?.(),
+      expand: () => onExpand?.(),
+      resize: () => onExpand?.(),
     }));
     return (
       <div data-testid={`resizable-panel-${id}`} data-default-size={defaultSize}>
@@ -68,13 +77,27 @@ vi.mock("../components/WorkPane", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../components/WorkPane")>();
   return {
     ...actual,
-    WorkPane: ({ open, tab, selection }: { open: boolean; tab: string; selection: unknown }) => (
+    WorkPane: ({
+      open,
+      tab,
+      selection,
+      onCollapse,
+    }: {
+      open: boolean;
+      tab: string;
+      selection: unknown;
+      onCollapse: () => void;
+    }) => (
       <div
         data-testid="work-pane"
         data-open={String(open)}
         data-tab={tab}
         data-selection={JSON.stringify(selection)}
-      />
+      >
+        <button type="button" onClick={onCollapse}>
+          Collapse pane
+        </button>
+      </div>
     ),
   };
 });
@@ -219,6 +242,20 @@ describe("SessionDetail workspace", () => {
     expect(screen.getByTestId("resizable-panel-workpane").getAttribute("data-default-size")).toBe(
       "42",
     );
+  });
+
+  // The switcher lives inside the pane, so a closed pane has no control of
+  // its own — the masthead Panel button must appear as the way back in.
+  test("offers the Panel button after a collapse and reopens from it", async () => {
+    render(<SessionDetail />);
+
+    expect(screen.queryByRole("button", { name: /Panel/ })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Collapse pane" }));
+    expect(screen.getByTestId("work-pane").getAttribute("data-open")).toBe("false");
+
+    await userEvent.click(screen.getByRole("button", { name: /Panel/ }));
+    expect(screen.getByTestId("work-pane").getAttribute("data-open")).toBe("true");
+    expect(screen.queryByRole("button", { name: /Panel/ })).toBeNull();
   });
 
   // The orchestrator persists the EFFECTIVE selection on the task at create

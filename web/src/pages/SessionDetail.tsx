@@ -336,7 +336,10 @@ export function SessionDetail() {
           </div>
         )}
       </div>
-      {isMobile && (
+      {/* The switcher lives in the pane header, so a closed pane has no
+          affordance of its own — this button is the way back in. Mobile
+          always shows it (the sheet starts closed). */}
+      {(isMobile || !paneOpen) && (
         <Button type="button" variant="outline" size="sm" onClick={() => openPane()}>
           <PanelsTopLeft />
           Panel
