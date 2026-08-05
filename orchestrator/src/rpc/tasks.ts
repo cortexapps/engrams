@@ -266,6 +266,9 @@ function buildTask(
     createdByUserId: string | null;
     source: unknown;
     createdAt: Date;
+    harness: string | null;
+    model: string | null;
+    effort: string | null;
   },
   sessionRefs: Array<{ sessionId: string; role: string | null; profileId: string | null }>,
   sessionMap: Map<string, Session>,
@@ -338,6 +341,11 @@ function buildTask(
     sourceJson: JSON.stringify(row.source ?? {}),
     sessions,
     createdAt: row.createdAt.toISOString(),
+    // ADR 0063 B2 echo: the effective selection persisted at create time.
+    // Null on rows that pre-date the columns → unset on the wire.
+    ...(row.harness != null ? { harness: row.harness } : {}),
+    ...(row.model != null ? { model: row.model } : {}),
+    ...(row.effort != null ? { effort: row.effort } : {}),
   } as Task;
 }
 

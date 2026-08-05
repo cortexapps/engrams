@@ -89,6 +89,13 @@ message Task {
   // server-side. Unset for unattributed/automation rows (no creator) or when
   // the corresponding better-auth user row is gone.
   optional User created_by = 10;
+  // ADR 0063 B2 echo: the EFFECTIVE harness / model / effort this task's
+  // sessions run with, resolved at create time (per-task override ?? profile
+  // default ?? catalog default) and persisted on the task row. Unset on tasks
+  // created before the columns existed.
+  optional string harness = 11;
+  optional string model = 12;
+  optional string effort = 13;
 }
 
 message TaskSessionRef {
