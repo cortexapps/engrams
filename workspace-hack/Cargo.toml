@@ -44,6 +44,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "ser
 idna = { version = "1" }
 indexmap = { version = "2", features = ["serde"] }
 ipnet = { version = "2" }
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
@@ -72,6 +73,7 @@ serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "raw_value"] }
 sha2 = { version = "0.10", features = ["oid"] }
+signature = { version = "2", default-features = false, features = ["digest", "rand_core", "std"] }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
@@ -92,6 +94,7 @@ tower = { version = "0.5", default-features = false, features = ["balance", "buf
 tower-http = { version = "0.6", features = ["auth", "cors", "map-response-body", "trace"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
+typenum = { version = "1", default-features = false, features = ["const-generics"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 winnow = { version = "1" }
 zeroize = { version = "1" }
@@ -155,6 +158,7 @@ toml_datetime = { version = "1", features = ["serde"] }
 toml_parser = { version = "1" }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
+typenum = { version = "1", default-features = false, features = ["const-generics"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 winnow = { version = "1" }
 zeroize = { version = "1" }
@@ -212,6 +216,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["webpki
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ring = { version = "0.17", features = ["std"] }
 rustix = { version = "1", features = ["fs"] }
+security-framework-sys = { version = "2" }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 tower-http = { version = "0.6", default-features = false, features = ["follow-redirect"] }
 
@@ -229,6 +234,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["webpki
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 ring = { version = "0.17", features = ["std"] }
 rustix = { version = "1", features = ["fs"] }
+security-framework-sys = { version = "2" }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 tower-http = { version = "0.6", default-features = false, features = ["follow-redirect"] }
 

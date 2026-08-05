@@ -144,6 +144,15 @@ impl BlobRetryConfig {
 
 impl OciClient {
     pub fn new(auth: Arc<dyn RegistryAuthResolver>) -> Self {
+        // oci-client 0.17's reqwest (0.13, `rustls-no-provider` — see
+        // Cargo.toml) refuses to build until a process-level rustls
+        // CryptoProvider is installed; it does not fall back to the
+        // compiled-in provider. The workspace compiles exactly ONE
+        // provider (ring — aws-lc-rs is not in the lockfile), so this
+        // install cannot pick a wrong provider and cannot race a
+        // different one: a second install of the same provider is the
+        // only possible "error", hence the ignored Result.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         // Two cached inner clients, one per protocol. They MUST be
         // cached on the struct rather than rebuilt per call: the
         // bearer-token cache lives inside `Client`, so a fresh client
@@ -569,13 +578,13 @@ impl OciClient {
         &self,
         uri: &str,
         digest: &str,
-        bytes: &[u8],
+        bytes: impl Into<bytes::Bytes>,
     ) -> Result<(), OciError> {
         let reference: Reference = uri
             .parse()
             .map_err(|e: oci_client::ParseError| OciError::InvalidUri(format!("{uri}: {e}")))?;
         let client = self.client_for(&reference);
-        self.push_blob_reauth(client, &reference, bytes, digest)
+        self.push_blob_reauth(client, &reference, bytes.into(), digest)
             .await
     }
 
@@ -584,14 +593,17 @@ impl OciClient {
     /// large images. `oci-client`'s `apply_auth` only reads its
     /// token cache (it never re-mints), so expiry must be handled
     /// at this layer.
+    ///
+    /// Takes `Bytes` because oci-client 0.17's `push_blob` does; the
+    /// `clone()` for the retry is a refcount bump, not a buffer copy.
     async fn push_blob_reauth(
         &self,
         client: &Client,
         reference: &Reference,
-        bytes: &[u8],
+        bytes: bytes::Bytes,
         digest: &str,
     ) -> Result<(), OciError> {
-        match client.push_blob(reference, bytes, digest).await {
+        match client.push_blob(reference, bytes.clone(), digest).await {
             Ok(_) => Ok(()),
             Err(oci_client::errors::OciDistributionError::UnauthorizedError { .. }) => {
                 let auth = self.auth_for(reference).await?;
@@ -633,21 +645,22 @@ impl OciClient {
 
         // Push the small layers + config as blobs, collecting
         // descriptors as we go.
+        // The layer Vecs move into `Bytes` (an allocation reuse, not a
+        // copy — `ChunkedImageLayers` is owned), so size/digest come
+        // out before the move.
         let mut descriptors = Vec::with_capacity(2 + chunks.len());
         for (bytes, media_type) in [
-            (&layers.bundle_json, ENGRAM_BUNDLE_MEDIA_TYPE),
-            (
-                &layers.disk_bootstrap_json,
-                ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE,
-            ),
+            (layers.bundle_json, ENGRAM_BUNDLE_MEDIA_TYPE),
+            (layers.disk_bootstrap_json, ENGRAM_BOOTSTRAP_DISK_MEDIA_TYPE),
         ] {
-            let digest = sha256_digest(bytes);
-            self.push_blob_reauth(client, &reference, bytes, digest.as_str())
+            let digest = sha256_digest(&bytes);
+            let size = bytes.len() as i64;
+            self.push_blob_reauth(client, &reference, bytes.into(), digest.as_str())
                 .await?;
             descriptors.push(OciDescriptor {
                 media_type: media_type.to_string(),
                 digest: digest.0,
-                size: bytes.len() as i64,
+                size,
                 ..Default::default()
             });
         }
@@ -661,10 +674,11 @@ impl OciClient {
         }
 
         let config_digest = sha256_digest(&layers.config_json);
+        let config_size = layers.config_json.len() as i64;
         self.push_blob_reauth(
             client,
             &reference,
-            &layers.config_json,
+            layers.config_json.into(),
             config_digest.as_str(),
         )
         .await?;
@@ -674,7 +688,7 @@ impl OciClient {
             config: OciDescriptor {
                 media_type: ENGRAM_IMAGE_CONFIG_MEDIA_TYPE.to_string(),
                 digest: config_digest.0,
-                size: layers.config_json.len() as i64,
+                size: config_size,
                 ..Default::default()
             },
             layers: descriptors,

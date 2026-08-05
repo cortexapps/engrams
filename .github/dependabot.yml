@@ -44,6 +44,21 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
+        # The grpc group below owns these at every update level; without
+        # the exclude a tonic MINOR would match both groups and land
+        # wherever Dependabot's first-match ordering puts it.
+        exclude-patterns: ["tonic", "tonic-*", "prost", "prost-*"]
+      # Exception to the majors-arrive-individually rule: the tonic/prost
+      # family is version-locked to itself (tonic 0.14 codegen emits code
+      # that only compiles against prost 0.14 and the tonic 0.14 runtime).
+      # Individual major PRs for these crates can NEVER go green — see
+      # #25 / #26 / #29 — so "one crate at a time" is not a reviewable
+      # unit here, it is an unbuildable one. Grouping majors for exactly
+      # this family keeps them one PR without weakening the rule anywhere
+      # else.
+      grpc:
+        patterns: ["tonic", "tonic-*", "prost", "prost-*"]
+        update-types: ["major", "minor", "patch"]
 
   # Frontend (pnpm) ---------------------------------------------------------
   # Dependabot reads pnpm-lock.yaml directly via the `npm` ecosystem.
