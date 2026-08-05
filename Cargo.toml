@@ -280,7 +280,6 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "ring",
 rustls-pemfile = "2"
 webpki-roots = "1"
 tls-parser = "0.12"
-nom = "7"
 socket2 = "0.6"
 # GraphQL request-body parsing for egress gating (ADR 0059). Strict,
 # all-or-nothing parser (a clean typed AST or a hard error) — deliberately
