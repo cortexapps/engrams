@@ -51,62 +51,76 @@ export interface PaneViewDef {
   icon: ComponentType<{ className?: string }>;
 }
 
-export interface PaneViewGroups {
-  primary: PaneViewDef[];
-  overflow: PaneViewDef[];
-}
-
 const TAB_CLASS_NAME = "h-8 shrink-0 gap-1.5 px-2 text-muted-foreground";
 
-export function visibleTabCount(
-  tabWidths: number[],
+export interface StripLayout {
+  /** Number of tabs rendered in the strip; the rest live in the More menu. */
+  count: number;
+  /** Tabs drop their labels once the labeled set stops fitting. */
+  iconOnly: boolean;
+}
+
+function fitsAll(widths: number[], gapPx: number, available: number): boolean {
+  const total = widths.reduce((sum, width) => sum + width, 0);
+  return total + gapPx * (widths.length - 1) <= available;
+}
+
+/** Widest-first strip layout: every tab labeled → every tab icon-only → an
+ *  icon-only prefix plus the More menu for the remainder. */
+export function stripLayout(
+  labeledWidths: number[],
+  iconWidths: number[],
   moreWidth: number,
   gapPx: number,
   available: number,
-): number {
-  if (tabWidths.length === 0) return 0;
+): StripLayout {
+  const all = labeledWidths.length;
+  if (all === 0) return { count: 0, iconOnly: false };
   // jsdom has no layout engine, so zero-width measurements keep every tab visible.
-  if (tabWidths.every((width) => width === 0)) return tabWidths.length;
+  if (labeledWidths.every((width) => width === 0)) return { count: all, iconOnly: false };
+
+  // The More trigger renders only when something overflows — don't reserve
+  // room for it while everything fits, or one tab would collapse for no reason.
+  if (fitsAll(labeledWidths, gapPx, available)) return { count: all, iconOnly: false };
+  if (fitsAll(iconWidths, gapPx, available)) return { count: all, iconOnly: true };
 
   let used = moreWidth;
   let count = 0;
-  for (const width of tabWidths) {
+  for (const width of iconWidths) {
     if (used + gapPx + width > available) break;
     used += gapPx + width;
     count += 1;
   }
-  return Math.max(1, count);
+  return { count: Math.max(1, count), iconOnly: true };
 }
 
+/** Every available view in strip priority order: the fitting prefix renders
+ *  as labeled tabs, the remainder lives in the More menu. */
 export function paneViewDefs(opts: {
   browserEnabled: boolean;
   ideEnabled: boolean;
   hasChanges: boolean;
   isAdmin: boolean;
-}): PaneViewGroups {
-  return {
-    primary: [
-      { id: "overview", label: "Overview", icon: PanelsTopLeft },
-      ...(opts.browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
-      ...(opts.ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
-    ],
-    overflow: [
-      ...(opts.hasChanges ? [{ id: "changes", label: "Changes", icon: FileDiff } as const] : []),
-      { id: "shell", label: "Shell", icon: SquareTerminal },
-      ...(opts.isAdmin
-        ? [{ id: "diagnostics", label: "Diagnostics", icon: Activity } as const]
-        : []),
-    ],
-  };
+}): PaneViewDef[] {
+  return [
+    { id: "overview", label: "Overview", icon: PanelsTopLeft },
+    ...(opts.browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
+    ...(opts.ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
+    ...(opts.hasChanges ? [{ id: "changes", label: "Changes", icon: FileDiff } as const] : []),
+    { id: "shell", label: "Shell", icon: SquareTerminal },
+    ...(opts.isAdmin ? [{ id: "diagnostics", label: "Diagnostics", icon: Activity } as const] : []),
+  ];
 }
 
 function PaneTab({
   view,
   active,
+  iconOnly,
   onSelect,
 }: {
   view: PaneViewDef;
   active: boolean;
+  iconOnly: boolean;
   onSelect: (id: PaneTabId) => void;
 }) {
   return (
@@ -121,7 +135,7 @@ function PaneTab({
       onClick={() => onSelect(view.id)}
     >
       <view.icon />
-      <span>{view.label}</span>
+      {!iconOnly && <span>{view.label}</span>}
     </Button>
   );
 }
@@ -218,17 +232,12 @@ export function WorkPane({
   onToggleExpand,
 }: WorkPaneProps) {
   const hasChanges = useMemo(() => extractFileChanges(events).length > 0, [events]);
-  const viewGroups = paneViewDefs({ browserEnabled, ideEnabled, hasChanges, isAdmin });
-  const views = [...viewGroups.primary, ...viewGroups.overflow];
+  const views = paneViewDefs({ browserEnabled, ideEnabled, hasChanges, isAdmin });
   const effectiveTab = views.some((view) => view.id === tab) ? tab : "overview";
-  const promotedView = viewGroups.overflow.find((view) => view.id === effectiveTab);
-  const candidateTabs = promotedView ? [...viewGroups.primary, promotedView] : viewGroups.primary;
-  const measurementKey = `${views.map((view) => view.id).join("|")}:${candidateTabs
-    .map((view) => view.id)
-    .join("|")}`;
+  const measurementKey = views.map((view) => view.id).join("|");
   const stripRef = useRef<HTMLDivElement>(null);
   const measurementRef = useRef<HTMLDivElement>(null);
-  const [fittingCount, setFittingCount] = useState(candidateTabs.length);
+  const [layout, setLayout] = useState<StripLayout>({ count: views.length, iconOnly: false });
 
   useLayoutEffect(() => {
     const strip = stripRef.current;
@@ -236,14 +245,18 @@ export function WorkPane({
     if (!strip || !measurement) return;
 
     const measure = () => {
+      // The measurement row holds the labeled set, then the icon-only set,
+      // then the More trigger — sliced back apart by position here.
       const children = Array.from(measurement.children) as HTMLElement[];
       const more = children.pop();
-      if (!more) return;
-      const tabWidths = children.map((child) => child.getBoundingClientRect().width);
-      const moreWidth = more.getBoundingClientRect().width;
+      if (!more || children.length % 2 !== 0) return;
+      const half = children.length / 2;
+      const width = (el: HTMLElement) => el.getBoundingClientRect().width;
+      const labeledWidths = children.slice(0, half).map(width);
+      const iconWidths = children.slice(half).map(width);
       const style = getComputedStyle(measurement);
       const gapPx = Number.parseFloat(style.columnGap || style.gap) || 0;
-      setFittingCount(visibleTabCount(tabWidths, moreWidth, gapPx, strip.clientWidth));
+      setLayout(stripLayout(labeledWidths, iconWidths, width(more), gapPx, strip.clientWidth));
     };
 
     measure();
@@ -252,21 +265,18 @@ export function WorkPane({
     return () => observer.disconnect();
   }, [measurementKey]);
 
-  const prefixCount = Math.min(fittingCount, candidateTabs.length);
-  let visibleTabs = candidateTabs.slice(0, prefixCount);
-  const activeCandidateIndex = candidateTabs.findIndex((view) => view.id === effectiveTab);
-  if (activeCandidateIndex >= prefixCount) {
+  const prefixCount = Math.min(layout.count, views.length);
+  let visibleTabs = views.slice(0, prefixCount);
+  const activeIndex = views.findIndex((view) => view.id === effectiveTab);
+  if (activeIndex >= prefixCount) {
     // Keep the active view visible by replacing the last fitting tab after Overview.
     visibleTabs =
       visibleTabs.length === 1
-        ? [...visibleTabs, candidateTabs[activeCandidateIndex]]
-        : [...visibleTabs.slice(0, -1), candidateTabs[activeCandidateIndex]];
+        ? [...visibleTabs, views[activeIndex]]
+        : [...visibleTabs.slice(0, -1), views[activeIndex]];
   }
   const visibleIds = new Set(visibleTabs.map((view) => view.id));
-  const menuViews = [
-    ...candidateTabs.filter((view) => !visibleIds.has(view.id)),
-    ...viewGroups.overflow.filter((view) => view.id !== promotedView?.id),
-  ];
+  const menuViews = views.filter((view) => !visibleIds.has(view.id));
 
   // Lazy-mount each live pane the first time it's viewed *while the pane is
   // open*, then keep it mounted for the life of the WorkPane (hidden via
@@ -291,9 +301,9 @@ export function WorkPane({
             className="pointer-events-none invisible absolute flex items-center gap-0.5"
             aria-hidden
           >
-            {candidateTabs.map((view) => (
+            {views.map((view) => (
               <Button
-                key={view.id}
+                key={`labeled-${view.id}`}
                 variant="ghost"
                 size="sm"
                 className={TAB_CLASS_NAME}
@@ -301,6 +311,17 @@ export function WorkPane({
               >
                 <view.icon />
                 <span>{view.label}</span>
+              </Button>
+            ))}
+            {views.map((view) => (
+              <Button
+                key={`icon-${view.id}`}
+                variant="ghost"
+                size="sm"
+                className={TAB_CLASS_NAME}
+                tabIndex={-1}
+              >
+                <view.icon />
               </Button>
             ))}
             <Button variant="ghost" size="sm" className={TAB_CLASS_NAME} tabIndex={-1}>
@@ -312,6 +333,7 @@ export function WorkPane({
               key={view.id}
               view={view}
               active={view.id === effectiveTab}
+              iconOnly={layout.iconOnly}
               onSelect={onTabChange}
             />
           ))}
