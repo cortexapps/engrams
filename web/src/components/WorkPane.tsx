@@ -4,6 +4,7 @@ import {
   Code2,
   GitPullRequestArrow,
   Globe,
+  ListTodo,
   Map,
   Maximize2,
   Minimize2,
@@ -17,6 +18,8 @@ import { BrowserPane } from "./BrowserPane";
 import { IdePane } from "./IdePane";
 import { DiagnosticsPanel } from "./SessionDiagnostics";
 import { PlanPane } from "./PlanPane";
+import { TasksPane } from "./TasksPane";
+import { sessionHasAgentTasks } from "./session-thread/agentTasks";
 import { SideEffectsPanel } from "./SideEffectsPanel";
 import { Button } from "@/components/ui/button";
 import { textVariants } from "@/components/ui/text";
@@ -34,7 +37,14 @@ import type { IndexedEvent, Session } from "../lib/types";
 // with expand-to-fill) and the mobile overlay sheet (`variant="overlay"`, where
 // collapse means "close the sheet").
 
-export type PaneTabId = "shell" | "browser" | "ide" | "plan" | "side-effects" | "diagnostics";
+export type PaneTabId =
+  | "shell"
+  | "browser"
+  | "ide"
+  | "plan"
+  | "tasks"
+  | "side-effects"
+  | "diagnostics";
 
 interface PaneTabDef {
   id: PaneTabId;
@@ -52,6 +62,7 @@ const SIDE_EFFECTS_TAB: PaneTabDef = {
 };
 const DIAGNOSTICS_TAB: PaneTabDef = { id: "diagnostics", label: "Diagnostics", icon: Activity };
 const PLAN_TAB: PaneTabDef = { id: "plan", label: "Plan", icon: Map };
+const TASKS_TAB: PaneTabDef = { id: "tasks", label: "Tasks", icon: ListTodo };
 
 export interface WorkPaneProps {
   sessionId: string;
@@ -105,11 +116,15 @@ export function WorkPane({
       ),
     [events],
   );
+  // The Tasks tab appears once the agent has created a task — the same
+  // event-derived gating as the Plan tab.
+  const hasTasks = useMemo(() => sessionHasAgentTasks(events), [events]);
   const tabs = [
     SHELL_TAB,
     ...(browserEnabled ? [BROWSER_TAB] : []),
     ...(ideEnabled ? [IDE_TAB] : []),
     ...(hasPlan ? [PLAN_TAB] : []),
+    ...(hasTasks ? [TASKS_TAB] : []),
     SIDE_EFFECTS_TAB,
     DIAGNOSTICS_TAB,
   ];
@@ -216,6 +231,13 @@ export function WorkPane({
         {open && tab === "plan" && (
           <div className="absolute inset-0 overflow-hidden">
             <PlanPane events={events} />
+          </div>
+        )}
+        {/* Agent task checklist — no socket, mount on view only (the
+            Diagnostics contract). */}
+        {open && tab === "tasks" && (
+          <div className="absolute inset-0 overflow-hidden">
+            <TasksPane events={events} />
           </div>
         )}
         {open && tab === "side-effects" && (

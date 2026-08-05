@@ -6,6 +6,7 @@ import type {
   SessionState,
   UserQuestion,
 } from "../../lib/types";
+import { isTaskToolName, taskCallDisplays } from "./agentTasks";
 
 // Session statuses that mean "no turn is in flight" — the authoritative
 // signal that overrides the event stream. A session evicted/terminated
@@ -82,6 +83,14 @@ export const BROWSER_ACTIVITY_TOOL = "engram.browserActivity";
 export interface BrowserActivityArgs {
   intent: string;
 }
+
+/** Synthetic presenter for the agent's task-list bookkeeping (Claude Code's
+ *  TaskCreate/TaskUpdate). Rendered as a compact checklist row (TaskToolPart)
+ *  instead of the generic JSON card; args carry a `TaskCallDisplay` resolved
+ *  by the agentTasks fold (an update names its target task even though its
+ *  own args only carry the id). The part keeps its real tool_call_id so
+ *  generic completion correlates as usual. */
+export const TASK_TOOL = "engram.task";
 
 /** Payload carried in a system message's `metadata.custom.marker` — the
  *  harness-register events that aren't agent messages. */
@@ -518,6 +527,10 @@ export function buildMessages(
   // failed edit emits NO file_changed and keeps its generic (error) card.
   const fileChangesByToolCallId = new Map<string, FileChangeArgs>();
   const browserActivityByToolCallId = new Map<string, BrowserActivityArgs>();
+  // Task-list bookkeeping calls re-render as compact checklist rows. The fold
+  // runs its own pre-scan (it needs completions to resolve guest-assigned
+  // task ids), so this is one call, not per-event work.
+  const taskDisplaysByToolCallId = taskCallDisplays(events);
   // prod session 68c70a65: a `prompt_id` user echo is HELD and rendered at its
   // consuming `run_started{prompt_id}` (below). That relies on the echo being
   // seen BEFORE its run_started — true when the coordinator appends the echo
@@ -725,6 +738,12 @@ export function buildMessages(
         // correlates as usual. No file_changed (e.g. a failed edit) → generic.
         const fc = fileChangesByToolCallId.get(ev.tool_call_id);
         const browserActivity = browserActivityByToolCallId.get(ev.tool_call_id);
+        // Task bookkeeping re-renders as a compact checklist row. Gate on the
+        // tool NAME, not just map presence — a colliding id from another tool
+        // must never hijack its card.
+        const taskDisplay = isTaskToolName(ev.tool_name)
+          ? taskDisplaysByToolCallId.get(ev.tool_call_id)
+          : undefined;
         const part: ToolPart = fc
           ? {
               type: "tool-call",
@@ -741,13 +760,21 @@ export function buildMessages(
                 args: browserActivity as unknown as Record<string, unknown>,
                 argsText: browserActivity.intent,
               }
-            : {
-                type: "tool-call",
-                toolCallId: ev.tool_call_id,
-                toolName: ev.tool_name,
-                args: parseArgs(ev.args_summary),
-                argsText: ev.args_summary ?? "",
-              };
+            : taskDisplay
+              ? {
+                  type: "tool-call",
+                  toolCallId: ev.tool_call_id,
+                  toolName: TASK_TOOL,
+                  args: taskDisplay as unknown as Record<string, unknown>,
+                  argsText: taskDisplay.subject ?? "",
+                }
+              : {
+                  type: "tool-call",
+                  toolCallId: ev.tool_call_id,
+                  toolName: ev.tool_name,
+                  args: parseArgs(ev.args_summary),
+                  argsText: ev.args_summary ?? "",
+                };
         a.content.push(part);
         if (submittedResults.has(ev.tool_call_id)) {
           part.result = submittedResults.get(ev.tool_call_id);
