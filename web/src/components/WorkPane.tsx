@@ -1,80 +1,216 @@
-import { useEffect, useMemo, useState, type ComponentType } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import {
   Activity,
   Code2,
-  GitPullRequestArrow,
+  FileDiff,
   Globe,
-  ListTodo,
-  Map,
   Maximize2,
   Minimize2,
+  MoreHorizontal,
   PanelRightClose,
+  PanelsTopLeft,
   SquareTerminal,
   X,
 } from "lucide-react";
 
 import { TerminalPane } from "./TerminalPane";
 import { BrowserPane } from "./BrowserPane";
+import { ChangesPane } from "./ChangesPane";
 import { IdePane } from "./IdePane";
+import { OverviewPane, type OverviewSelection } from "./OverviewPane";
 import { DiagnosticsPanel } from "./SessionDiagnostics";
-import { PlanPane } from "./PlanPane";
-import { TasksPane } from "./TasksPane";
-import { sessionHasAgentTasks } from "./session-thread/agentTasks";
-import { SideEffectsPanel } from "./SideEffectsPanel";
+import { WorkDock } from "./WorkDock";
+import { extractFileChanges } from "./session-thread/fileChanges";
 import { Button } from "@/components/ui/button";
-import { textVariants } from "@/components/ui/text";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import type { IndexedEvent, Session } from "../lib/types";
+import type { IndexedEvent, ProfileSnapshotView, Session } from "../lib/types";
 
 // The Devin-style work pane: the shell + browser, lifted out of the transcript
 // into a companion surface so the conversation and the live view sit side by
-// side instead of hiding each other. Its own header carries the tab strip and
-// the window controls; the body keeps BOTH panes mounted (display:none swap) so
-// the ttyd / VNC sockets survive tab switches — the same keep-mounted contract
-// the panes rely on, now owned here.
+// side instead of hiding each other. The pane header keeps primary views
+// visible and moves secondary views into an overflow menu. The body keeps
+// every live pane mounted (display:none swap) so the ttyd / VNC / iframe
+// sockets survive view switches — the same keep-mounted contract the panes
+// rely on, now owned here.
 //
 // It renders identically inside the desktop resizable panel (`variant="panel"`,
 // with expand-to-fill) and the mobile overlay sheet (`variant="overlay"`, where
 // collapse means "close the sheet").
 
-export type PaneTabId =
-  | "shell"
-  | "browser"
-  | "ide"
-  | "plan"
-  | "tasks"
-  | "side-effects"
-  | "diagnostics";
+export type PaneTabId = "overview" | "changes" | "shell" | "browser" | "ide" | "diagnostics";
 
-interface PaneTabDef {
+export interface PaneViewDef {
   id: PaneTabId;
   label: string;
   icon: ComponentType<{ className?: string }>;
 }
 
-const SHELL_TAB: PaneTabDef = { id: "shell", label: "Shell", icon: SquareTerminal };
-const BROWSER_TAB: PaneTabDef = { id: "browser", label: "Browser", icon: Globe };
-const IDE_TAB: PaneTabDef = { id: "ide", label: "IDE", icon: Code2 };
-const SIDE_EFFECTS_TAB: PaneTabDef = {
-  id: "side-effects",
-  label: "Side effects",
-  icon: GitPullRequestArrow,
-};
-const DIAGNOSTICS_TAB: PaneTabDef = { id: "diagnostics", label: "Diagnostics", icon: Activity };
-const PLAN_TAB: PaneTabDef = { id: "plan", label: "Plan", icon: Map };
-const TASKS_TAB: PaneTabDef = { id: "tasks", label: "Tasks", icon: ListTodo };
+const TAB_CLASS_NAME = "h-8 shrink-0 gap-1.5 px-2 text-muted-foreground";
+
+export interface StripLayout {
+  /** Number of tabs rendered in the strip; the rest live in the More menu. */
+  count: number;
+  /** Tabs drop their labels once the labeled set stops fitting. */
+  iconOnly: boolean;
+}
+
+function fitsAll(widths: number[], gapPx: number, available: number): boolean {
+  const total = widths.reduce((sum, width) => sum + width, 0);
+  return total + gapPx * (widths.length - 1) <= available;
+}
+
+function fittingPrefix(widths: number[], moreWidth: number, gapPx: number, available: number) {
+  let used = moreWidth;
+  let count = 0;
+  for (const width of widths) {
+    if (used + gapPx + width > available) break;
+    used += gapPx + width;
+    count += 1;
+  }
+  return count;
+}
+
+/** Widest-first strip layout, in three stages: every tab labeled → a labeled
+ *  prefix + More, shrinking no further than the first `primaryCount` tabs
+ *  (Overview/Browser/IDE) → icon-only tabs, again as many as fit + More.
+ *  Icon-only tabs all share one width, so a single `iconWidth` measures them. */
+export function stripLayout(
+  labeledWidths: number[],
+  iconWidth: number,
+  moreWidth: number,
+  gapPx: number,
+  available: number,
+  primaryCount: number,
+): StripLayout {
+  const all = labeledWidths.length;
+  if (all === 0) return { count: 0, iconOnly: false };
+  // jsdom has no layout engine, so zero-width measurements keep every tab visible.
+  if (labeledWidths.every((width) => width === 0)) return { count: all, iconOnly: false };
+
+  // The More trigger renders only when something overflows — don't reserve
+  // room for it while everything fits, or one tab would collapse for no reason.
+  if (fitsAll(labeledWidths, gapPx, available)) return { count: all, iconOnly: false };
+
+  const labeledCount = fittingPrefix(labeledWidths, moreWidth, gapPx, available);
+  if (labeledCount >= primaryCount) return { count: labeledCount, iconOnly: false };
+
+  const iconWidths = Array<number>(all).fill(iconWidth);
+  if (fitsAll(iconWidths, gapPx, available)) return { count: all, iconOnly: true };
+  return {
+    count: Math.max(1, fittingPrefix(iconWidths, moreWidth, gapPx, available)),
+    iconOnly: true,
+  };
+}
+
+/** Every available view in strip priority order: the fitting prefix renders
+ *  as labeled tabs, the remainder lives in the More menu. */
+export function paneViewDefs(opts: {
+  browserEnabled: boolean;
+  ideEnabled: boolean;
+  hasChanges: boolean;
+  isAdmin: boolean;
+}): PaneViewDef[] {
+  return [
+    { id: "overview", label: "Overview", icon: PanelsTopLeft },
+    ...(opts.browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
+    ...(opts.ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
+    ...(opts.hasChanges ? [{ id: "changes", label: "Changes", icon: FileDiff } as const] : []),
+    { id: "shell", label: "Shell", icon: SquareTerminal },
+    ...(opts.isAdmin ? [{ id: "diagnostics", label: "Diagnostics", icon: Activity } as const] : []),
+  ];
+}
+
+function PaneTab({
+  view,
+  active,
+  iconOnly,
+  onSelect,
+}: {
+  view: PaneViewDef;
+  active: boolean;
+  iconOnly: boolean;
+  onSelect: (id: PaneTabId) => void;
+}) {
+  return (
+    <Button
+      variant="ghost"
+      size="sm"
+      className={cn(TAB_CLASS_NAME, active && "bg-accent text-foreground")}
+      aria-label={view.label}
+      aria-pressed={active}
+      title={view.label}
+      data-testid={`pane-tab-${view.id}`}
+      onClick={() => onSelect(view.id)}
+    >
+      <view.icon />
+      {!iconOnly && <span>{view.label}</span>}
+    </Button>
+  );
+}
+
+function MoreViewsMenu({
+  views,
+  activeTab,
+  onSelect,
+}: {
+  views: PaneViewDef[];
+  activeTab: PaneTabId | null;
+  onSelect: (id: PaneTabId) => void;
+}) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="sm"
+          className={cn(TAB_CLASS_NAME, activeTab && "bg-accent text-foreground")}
+          aria-label="More views"
+          aria-pressed={activeTab !== null}
+          title="More views"
+          data-testid="pane-more-menu"
+        >
+          <MoreHorizontal />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start">
+        {views.map((view) => (
+          <DropdownMenuItem
+            key={view.id}
+            className={cn(view.id === activeTab && "bg-accent text-foreground")}
+            onSelect={() => onSelect(view.id)}
+          >
+            <view.icon />
+            <span>{view.label}</span>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
 
 export interface WorkPaneProps {
   sessionId: string;
   /** Owning task resolved by SessionDetail; null for orphan sessions. */
   taskId: string | null;
-  /** The session row, for the Diagnostics view. May be undefined while loading. */
+  /** The session row, for the Overview and Diagnostics views. */
   session: Session | undefined;
-  /** The event stream, for the Diagnostics raw log. */
+  /** The event stream for summaries, changes, the work dock, and diagnostics. */
   events: IndexedEvent[];
+  /** The profile snapshot from the owning session row. */
+  profile: ProfileSnapshotView | null;
+  /** Effective harness, model, and effort for the owning task. */
+  selection: OverviewSelection | null;
+  /** Whether the viewer can open the operator diagnostics view. */
+  isAdmin: boolean;
   /**
    * Whether the pane is actually open (visible). The pane stays MOUNTED while
-   * collapsed so the shell/browser sockets survive — but nothing inside is
+   * collapsed so the shell/browser/IDE sockets survive — but nothing inside is
    * mounted until it's first opened, so we never open a socket the user hasn't
    * asked for.
    */
@@ -96,6 +232,9 @@ export function WorkPane({
   taskId,
   session,
   events,
+  profile,
+  selection,
+  isAdmin,
   open,
   tab,
   onTabChange,
@@ -106,28 +245,64 @@ export function WorkPane({
   expanded = false,
   onToggleExpand,
 }: WorkPaneProps) {
-  // ADR 0107: the Plan tab appears once the session has proposed a plan —
-  // derived here (not threaded from SessionDetail) so the expanded strip and
-  // the collapsed edge rail can never disagree again.
-  const hasPlan = useMemo(
-    () =>
-      events.some(
-        (e) => e.event.type === "tool_call_requested" && e.event.name === "exit_plan_mode",
-      ),
-    [events],
-  );
-  // The Tasks tab appears once the agent has created a task — the same
-  // event-derived gating as the Plan tab.
-  const hasTasks = useMemo(() => sessionHasAgentTasks(events), [events]);
-  const tabs = [
-    SHELL_TAB,
-    ...(browserEnabled ? [BROWSER_TAB] : []),
-    ...(ideEnabled ? [IDE_TAB] : []),
-    ...(hasPlan ? [PLAN_TAB] : []),
-    ...(hasTasks ? [TASKS_TAB] : []),
-    SIDE_EFFECTS_TAB,
-    DIAGNOSTICS_TAB,
-  ];
+  const hasChanges = useMemo(() => extractFileChanges(events).length > 0, [events]);
+  const views = paneViewDefs({ browserEnabled, ideEnabled, hasChanges, isAdmin });
+  const effectiveTab = views.some((view) => view.id === tab) ? tab : "overview";
+  // The labeled stage never collapses past these — the always-on core.
+  const primaryCount = views.filter((view) =>
+    ["overview", "browser", "ide"].includes(view.id),
+  ).length;
+  const measurementKey = views.map((view) => view.id).join("|");
+  const stripRef = useRef<HTMLDivElement>(null);
+  const measurementRef = useRef<HTMLDivElement>(null);
+  const [layout, setLayout] = useState<StripLayout>({ count: views.length, iconOnly: false });
+
+  useLayoutEffect(() => {
+    const strip = stripRef.current;
+    const measurement = measurementRef.current;
+    if (!strip || !measurement) return;
+
+    const measure = () => {
+      // The measurement row holds the labeled set, then one icon-only tab,
+      // then the More trigger — sliced back apart by position here.
+      const children = Array.from(measurement.children) as HTMLElement[];
+      const more = children.pop();
+      const icon = children.pop();
+      if (!more || !icon) return;
+      const width = (el: HTMLElement) => el.getBoundingClientRect().width;
+      const labeledWidths = children.map(width);
+      const style = getComputedStyle(measurement);
+      const gapPx = Number.parseFloat(style.columnGap || style.gap) || 0;
+      setLayout(
+        stripLayout(
+          labeledWidths,
+          width(icon),
+          width(more),
+          gapPx,
+          strip.clientWidth,
+          primaryCount,
+        ),
+      );
+    };
+
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(strip);
+    return () => observer.disconnect();
+  }, [measurementKey]);
+
+  const prefixCount = Math.min(layout.count, views.length);
+  let visibleTabs = views.slice(0, prefixCount);
+  const activeIndex = views.findIndex((view) => view.id === effectiveTab);
+  if (activeIndex >= prefixCount) {
+    // Keep the active view visible by replacing the last fitting tab after Overview.
+    visibleTabs =
+      visibleTabs.length === 1
+        ? [...visibleTabs, views[activeIndex]]
+        : [...visibleTabs.slice(0, -1), views[activeIndex]];
+  }
+  const visibleIds = new Set(visibleTabs.map((view) => view.id));
+  const menuViews = views.filter((view) => !visibleIds.has(view.id));
 
   // Lazy-mount each live pane the first time it's viewed *while the pane is
   // open*, then keep it mounted for the life of the WorkPane (hidden via
@@ -138,42 +313,58 @@ export function WorkPane({
   const [ideEverActive, setIdeEverActive] = useState(false);
   useEffect(() => {
     if (!open) return;
-    if (tab === "shell") setShellEverActive(true);
-    if (tab === "browser") setBrowserEverActive(true);
-    if (tab === "ide") setIdeEverActive(true);
-  }, [open, tab]);
+    if (effectiveTab === "shell") setShellEverActive(true);
+    if (effectiveTab === "browser") setBrowserEverActive(true);
+    if (effectiveTab === "ide") setIdeEverActive(true);
+  }, [effectiveTab, open]);
 
   return (
     <section className="flex h-full min-h-0 flex-col bg-background" aria-label="Work pane">
-      <header className="flex h-11 shrink-0 items-stretch justify-between gap-2 border-b pr-1.5 pl-3">
-        <div role="tablist" aria-label="Work pane views" className="flex items-stretch gap-4">
-          {tabs.map((t) => {
-            const isActive = t.id === tab;
-            return (
-              <button
-                key={t.id}
-                type="button"
-                role="tab"
-                aria-selected={isActive}
-                data-testid={`pane-tab-${t.id}`}
-                onClick={() => onTabChange(t.id)}
-                className={cn(
-                  "-mb-px flex items-center gap-1.5 border-b-2 transition-colors",
-                  isActive
-                    ? "border-primary text-foreground"
-                    : "border-transparent text-muted-foreground hover:text-foreground",
-                )}
+      <header className="flex h-11 shrink-0 items-center justify-between gap-1 border-b px-1.5">
+        <div ref={stripRef} className="relative flex min-w-0 flex-1 items-center gap-0.5">
+          <div
+            ref={measurementRef}
+            className="pointer-events-none invisible absolute flex items-center gap-0.5"
+            aria-hidden
+          >
+            {views.map((view) => (
+              <Button
+                key={`labeled-${view.id}`}
+                variant="ghost"
+                size="sm"
+                className={TAB_CLASS_NAME}
+                tabIndex={-1}
               >
-                <t.icon className="size-3.5" />
-                <span className={cn(textVariants({ variant: "label" }), "text-[0.66rem]")}>
-                  {t.label}
-                </span>
-              </button>
-            );
-          })}
+                <view.icon />
+                <span>{view.label}</span>
+              </Button>
+            ))}
+            <Button variant="ghost" size="sm" className={TAB_CLASS_NAME} tabIndex={-1}>
+              <PanelsTopLeft />
+            </Button>
+            <Button variant="ghost" size="sm" className={TAB_CLASS_NAME} tabIndex={-1}>
+              <MoreHorizontal />
+            </Button>
+          </div>
+          {visibleTabs.map((view) => (
+            <PaneTab
+              key={view.id}
+              view={view}
+              active={view.id === effectiveTab}
+              iconOnly={layout.iconOnly}
+              onSelect={onTabChange}
+            />
+          ))}
+          {menuViews.length > 0 && (
+            <MoreViewsMenu
+              views={menuViews}
+              activeTab={menuViews.some((view) => view.id === effectiveTab) ? effectiveTab : null}
+              onSelect={onTabChange}
+            />
+          )}
         </div>
 
-        <div className="flex items-center gap-0.5 self-center">
+        <div className="flex shrink-0 items-center gap-0.5 self-center">
           {variant === "panel" && onToggleExpand && (
             <Button
               variant="ghost"
@@ -201,51 +392,57 @@ export function WorkPane({
 
       <div className="relative min-h-0 flex-1">
         {shellEverActive && (
-          <div className="absolute inset-0" style={{ display: tab === "shell" ? "block" : "none" }}>
+          <div
+            className="absolute inset-0"
+            style={{ display: effectiveTab === "shell" ? "block" : "none" }}
+          >
             <TerminalPane sessionId={sessionId} />
           </div>
         )}
         {browserEnabled && browserEverActive && (
           <div
             className="absolute inset-0"
-            style={{ display: tab === "browser" ? "block" : "none" }}
+            style={{ display: effectiveTab === "browser" ? "block" : "none" }}
           >
             <BrowserPane sessionId={sessionId} />
           </div>
         )}
         {ideEnabled && ideEverActive && (
-          <div className="absolute inset-0" style={{ display: tab === "ide" ? "block" : "none" }}>
+          <div
+            className="absolute inset-0"
+            style={{ display: effectiveTab === "ide" ? "block" : "none" }}
+          >
             <IdePane sessionId={sessionId} />
           </div>
         )}
-        {/* Diagnostics holds no live socket, so it mounts only while open + on
-            its tab — no keep-mounted contract to honour, and no polling while
-            the pane is collapsed. */}
-        {open && tab === "diagnostics" && (
+        {/* Information views hold no live socket, so they mount only while
+            open and selected. They do no work while the pane is collapsed. */}
+        {open && effectiveTab === "overview" && (
+          <div className="absolute inset-0 overflow-hidden">
+            <OverviewPane
+              sessionId={sessionId}
+              taskId={taskId}
+              session={session}
+              events={events}
+              profile={profile}
+              selection={selection}
+              onShowChanges={() => onTabChange("changes")}
+            />
+          </div>
+        )}
+        {open && effectiveTab === "changes" && (
+          <div className="absolute inset-0 overflow-hidden">
+            <ChangesPane events={events} />
+          </div>
+        )}
+        {open && effectiveTab === "diagnostics" && (
           <div className="absolute inset-0 overflow-hidden">
             <DiagnosticsPanel session={session} sessionId={sessionId} events={events} />
           </div>
         )}
-        {/* ADR 0107: read-only plan reading surface — no socket, mount on
-            view only (the Diagnostics contract). */}
-        {open && tab === "plan" && (
-          <div className="absolute inset-0 overflow-hidden">
-            <PlanPane events={events} />
-          </div>
-        )}
-        {/* Agent task checklist — no socket, mount on view only (the
-            Diagnostics contract). */}
-        {open && tab === "tasks" && (
-          <div className="absolute inset-0 overflow-hidden">
-            <TasksPane events={events} />
-          </div>
-        )}
-        {open && tab === "side-effects" && (
-          <div className="absolute inset-0 overflow-hidden">
-            <SideEffectsPanel taskId={taskId} sessionId={sessionId} />
-          </div>
-        )}
       </div>
+
+      {open && <WorkDock events={events} />}
     </section>
   );
 }

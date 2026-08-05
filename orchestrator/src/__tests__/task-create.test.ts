@@ -1060,6 +1060,10 @@ describe("createTaskWithSession", () => {
       createdByUserId: "user-1",
       status: "open",
       source: { provider: "slack", team: "T1" },
+      // ADR 0063 B2 echo: the RESOLVED selection rides the task row.
+      harness: "claude",
+      model: "opus",
+      effort: "high",
     });
     expect(records[1]).toMatchObject({
       sessionId: "sess-1",

@@ -1,7 +1,148 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
-import { hasLiveBrowserActivity } from "./SessionDetail";
+const testState = vi.hoisted(() => ({
+  session: null as Record<string, unknown> | null,
+  tasks: [] as Record<string, unknown>[],
+  isMobile: false,
+}));
+
+vi.mock("@tanstack/react-router", () => ({
+  useParams: () => ({ id: "session-1" }),
+}));
+vi.mock("../hooks/useSessions", () => ({
+  useSession: () => ({ data: testState.session ?? undefined }),
+}));
+vi.mock("../hooks/useTasks", () => ({
+  useTasks: () => ({ data: { tasks: testState.tasks } }),
+}));
+vi.mock("../hooks/useSessionEvents", () => ({
+  useSessionEvents: () => ({ events: [], streamingText: "" }),
+}));
+vi.mock("../hooks/useDocumentTitle", () => ({
+  useDocumentTitle: () => {},
+}));
+vi.mock("../hooks/use-mobile", () => ({
+  useIsMobile: () => testState.isMobile,
+}));
+vi.mock("../auth/AuthProvider", () => ({
+  useIsAdmin: () => false,
+}));
+vi.mock("../components/session-thread/SessionThread", () => ({
+  SessionThread: () => <div data-testid="session-thread" />,
+}));
+vi.mock("../components/SessionDiagnostics", () => ({
+  DiagnosticsPanel: () => null,
+  DurabilityReadout: () => null,
+  useDurabilitySummary: () => null,
+}));
+vi.mock("./sessions/DeleteSessionButton", () => ({
+  DeleteSessionButton: () => <button type="button">Delete session</button>,
+}));
+vi.mock("@/components/ui/resizable", async () => {
+  const React = await import("react");
+  const ResizablePanel = React.forwardRef<
+    { collapse: () => void; expand: () => void; resize: () => void },
+    {
+      children?: React.ReactNode;
+      id?: string;
+      defaultSize?: number;
+      onCollapse?: () => void;
+      onExpand?: () => void;
+    }
+  >(function MockResizablePanel({ children, id, defaultSize, onCollapse, onExpand }, ref) {
+    // The imperative handle mirrors the real library's callback contract:
+    // collapse() fires onCollapse, expand()/resize() fire onExpand.
+    React.useImperativeHandle(ref, () => ({
+      collapse: () => onCollapse?.(),
+      expand: () => onExpand?.(),
+      resize: () => onExpand?.(),
+    }));
+    return (
+      <div data-testid={`resizable-panel-${id}`} data-default-size={defaultSize}>
+        {children}
+      </div>
+    );
+  });
+  return {
+    ResizablePanelGroup: ({ children }: { children?: React.ReactNode }) => (
+      <div data-testid="resizable-panel-group">{children}</div>
+    ),
+    ResizablePanel,
+    ResizableHandle: () => <div data-testid="resizable-handle" />,
+  };
+});
+vi.mock("../components/WorkPane", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../components/WorkPane")>();
+  return {
+    ...actual,
+    WorkPane: ({
+      open,
+      tab,
+      selection,
+      onCollapse,
+    }: {
+      open: boolean;
+      tab: string;
+      selection: unknown;
+      onCollapse: () => void;
+    }) => (
+      <div
+        data-testid="work-pane"
+        data-open={String(open)}
+        data-tab={tab}
+        data-selection={JSON.stringify(selection)}
+      >
+        <button type="button" onClick={onCollapse}>
+          Collapse pane
+        </button>
+      </div>
+    ),
+  };
+});
+
+import { hasLiveBrowserActivity, paneTabFromStored, SessionDetail } from "./SessionDetail";
 import type { IndexedEvent } from "../lib/types";
+
+beforeEach(() => {
+  localStorage.clear();
+  testState.isMobile = false;
+  testState.session = {
+    id: "session-1",
+    user_id: "user-1",
+    status: "active",
+    host_id: "host-1",
+    sandbox_id: "sandbox-1",
+    image: "registry.example.com/engrams/base:latest",
+    mode: "agent",
+    created_at: "2026-08-05T12:00:00.000Z",
+    last_active_at: "2026-08-05T12:00:00.000Z",
+  };
+  testState.tasks = [
+    {
+      id: "task-1",
+      title: "Build the pane",
+      titleIsCustom: true,
+      harness: "task-harness",
+      model: "task-model",
+      sessions: [
+        {
+          sessionId: "session-1",
+          profile: {
+            id: "profile-1",
+            name: "Builder",
+            icon: "bot",
+            archived: false,
+            imageUri: "registry.example.com/engrams/base:latest",
+            skills: [],
+          },
+        },
+      ],
+    },
+  ];
+});
+afterEach(cleanup);
 
 // The Browser pane auto-opens on agent browser activity (ADR 0097), but the
 // SSE feed replays the whole durable log on every visit. These cases pin the
@@ -60,5 +201,71 @@ describe("hasLiveBrowserActivity", () => {
 
   test("is false on an empty log", () => {
     expect(hasLiveBrowserActivity([], OPENED_AT)).toBe(false);
+  });
+});
+
+describe("paneTabFromStored", () => {
+  test("keeps current pane view ids", () => {
+    expect(paneTabFromStored("changes")).toBe("changes");
+    expect(paneTabFromStored("shell")).toBe("shell");
+  });
+
+  test("maps retired and unknown pane ids to the overview", () => {
+    for (const value of ["plan", "tasks", "side-effects", "events", null]) {
+      expect(paneTabFromStored(value)).toBe("overview");
+    }
+  });
+});
+
+describe("SessionDetail workspace", () => {
+  test("renders the slim masthead without an eyebrow, vitals, or desktop switcher", () => {
+    render(<SessionDetail />);
+
+    expect(screen.getByTestId("session-title").className).toContain("text-base");
+    expect(screen.getByTestId("session-title").className).toContain("font-medium");
+    expect(screen.getByTestId("session-status-glyph").getAttribute("aria-label")).toBe("active");
+    expect(screen.queryByText(/^task$/i)).toBeNull();
+    expect(screen.queryByTestId("session-status")).toBeNull();
+    expect(screen.queryByTestId("masthead-pane-switcher")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Panel" })).toBeNull();
+    expect(screen.queryByLabelText("Open work pane")).toBeNull();
+  });
+
+  test("opens the desktop pane at Overview with the preferred split", () => {
+    render(<SessionDetail />);
+
+    expect(screen.getByTestId("work-pane").getAttribute("data-open")).toBe("true");
+    expect(screen.getByTestId("work-pane").getAttribute("data-tab")).toBe("overview");
+    expect(screen.getByTestId("resizable-panel-transcript").getAttribute("data-default-size")).toBe(
+      "58",
+    );
+    expect(screen.getByTestId("resizable-panel-workpane").getAttribute("data-default-size")).toBe(
+      "42",
+    );
+  });
+
+  // The switcher lives inside the pane, so a closed pane has no control of
+  // its own — the masthead Panel button must appear as the way back in.
+  test("offers the Panel button after a collapse and reopens from it", async () => {
+    render(<SessionDetail />);
+
+    expect(screen.queryByRole("button", { name: /Panel/ })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Collapse pane" }));
+    expect(screen.getByTestId("work-pane").getAttribute("data-open")).toBe("false");
+
+    await userEvent.click(screen.getByRole("button", { name: /Panel/ }));
+    expect(screen.getByTestId("work-pane").getAttribute("data-open")).toBe("true");
+    expect(screen.queryByRole("button", { name: /Panel/ })).toBeNull();
+  });
+
+  // The orchestrator persists the EFFECTIVE selection on the task at create
+  // time; the client shows what the task carries and never re-derives it.
+  test("passes the task's persisted selection through to the pane", () => {
+    render(<SessionDetail />);
+
+    expect(JSON.parse(screen.getByTestId("work-pane").dataset.selection ?? "null")).toEqual({
+      harness: "task-harness",
+      model: "task-model",
+    });
   });
 });

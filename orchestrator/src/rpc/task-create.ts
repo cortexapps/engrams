@@ -120,6 +120,11 @@ export interface SessionCreateInput {
    *  + execs (the proto `CreateSessionRequest.harness`). Resolved from the
    *  per-session override ?? profile ?? deployment default. */
   harness?: string;
+  /** ADR 0063 B2 echo: the resolved model/effort catalog option ids. They only
+   *  ride the task row for display — the coordinator learns them via the
+   *  compiled harness env, never via these fields. */
+  model?: string;
+  effort?: string;
   /** ADR 0106: provider + opaque owner only; never contains OAuth bytes. */
   oauthCredential?: {
     subject: { kind: OauthSubjectKind; id: string };
@@ -538,6 +543,8 @@ export async function compileSessionCreateInput(
     imageUri: image.imageUri,
     mode: "agent",
     harness: selectedHarness,
+    ...(modelId != null ? { model: modelId } : {}),
+    ...(effortId != null ? { effort: effortId } : {}),
     ...(opts.prompt != null ? { prompt: opts.prompt } : {}),
     ...(opts.harnessMode != null ? { harnessMode: opts.harnessMode } : {}),
     ...(harnessEnv != null ? { harnessEnv } : {}),
@@ -907,6 +914,11 @@ export async function createTaskWithSession(
       status: "open",
       createdByUserId: params.ownerUserId,
       source: params.source ?? {},
+      // ADR 0063 B2 echo: persist the EFFECTIVE selection (already resolved by
+      // compileSessionCreateInput) so reads can show what this task runs with.
+      harness: sessionInput.harness ?? null,
+      model: sessionInput.model ?? null,
+      effort: sessionInput.effort ?? null,
     });
     await tx.insert(taskSessionTable).values({
       taskId,

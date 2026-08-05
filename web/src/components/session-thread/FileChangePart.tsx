@@ -1,10 +1,10 @@
-import { diffLines, parsePatch } from "diff";
 import { ChevronDownIcon, FileDiffIcon } from "lucide-react";
 import { lazy, Suspense, useMemo } from "react";
 import type { ToolCallMessagePartProps } from "@assistant-ui/react";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 import type { FileChangeArgs } from "./buildMessages";
+import { beforeAfter, countChange } from "./fileChanges";
 
 // ADR 0054 Flavor A: renders an `engram.fileChange` tool part — a
 // Write/Edit/MultiEdit the harness confirmed succeeded (`file_changed`),
@@ -16,51 +16,16 @@ import type { FileChangeArgs } from "./buildMessages";
 
 const PierreDiff = lazy(() => import("./PierreDiff"));
 
-/** Reconstruct before/after contents from a FileChange for diffing. A write
- *  is empty → content (all additions); an edit is the joined hunks. */
-export function beforeAfter(change: FileChangeArgs["change"]): { before: string; after: string } {
-  if (change.write) return { before: "", after: change.write.content };
-  if (change.edit) {
-    const hunks = change.edit.hunks;
-    return {
-      before: hunks.map((h) => h.old).join("\n"),
-      after: hunks.map((h) => h.new).join("\n"),
-    };
-  }
-  if (change.patch) {
-    const parsed = parsePatch(change.patch.unified_diff)[0];
-    if (!parsed) return { before: "", after: "" };
-    const before: string[] = [];
-    const after: string[] = [];
-    for (const hunk of parsed.hunks) {
-      for (const line of hunk.lines) {
-        if (line.startsWith("\\ No newline")) continue;
-        const marker = line[0];
-        const text = line.slice(1);
-        if (marker !== "+") before.push(text);
-        if (marker !== "-") after.push(text);
-      }
-    }
-    return { before: before.join("\n"), after: after.join("\n") };
-  }
-  return { before: "", after: "" };
-}
-
 export function FileChangePart({ args }: ToolCallMessagePartProps<FileChangeArgs, unknown>) {
   const path = args?.path ?? "";
   const { before, after } = useMemo(
     () => (args ? beforeAfter(args.change) : { before: "", after: "" }),
     [args],
   );
-  const { additions, deletions } = useMemo(() => {
-    let additions = 0;
-    let deletions = 0;
-    for (const part of diffLines(before, after)) {
-      if (part.added) additions += part.count ?? 0;
-      else if (part.removed) deletions += part.count ?? 0;
-    }
-    return { additions, deletions };
-  }, [before, after]);
+  const { additions, deletions } = useMemo(
+    () => (args ? countChange(args.change) : { additions: 0, deletions: 0 }),
+    [args],
+  );
 
   return (
     <Collapsible className="w-full rounded-lg border bg-card/40">

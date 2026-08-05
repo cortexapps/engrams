@@ -338,8 +338,8 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
       : `shell connection closed${errorMessage ? ` — ${errorMessage}` : ""}`;
 
   return (
-    <section className="flex h-full min-h-0 flex-col p-4">
-      <div className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-card">
+    <section className="flex h-full min-h-0 flex-col">
+      <div className="relative min-h-0 flex-1 overflow-hidden">
         <div ref={containerRef} className="absolute inset-0 px-3 py-2" />
         <PaneStatus
           phase={status}

@@ -58,6 +58,12 @@ export const task = pgTable("task", {
   createdByUserId: text("created_by_user_id"), // better-auth user id; null = automation (future)
   source: jsonb("source"), // type-specific trigger ref
   workflowRunId: text("workflow_run_id"), // DBOS run — null for chat (ADR §4)
+  // ADR 0063 B2 echo: the EFFECTIVE harness/model/effort this task's sessions
+  // run with, resolved at create time (override ?? profile ?? catalog default)
+  // and persisted so reads can show it. Null on rows that pre-date the columns.
+  harness: text("harness"),
+  model: text("model"),
+  effort: text("effort"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 },

@@ -5,7 +5,8 @@
 
 import { afterEach, describe, expect, test } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import { beforeAfter, FileChangePart } from "./FileChangePart";
+import { FileChangePart } from "./FileChangePart";
+import { beforeAfter } from "./fileChanges";
 import type { FileChangeArgs } from "./buildMessages";
 
 afterEach(cleanup);

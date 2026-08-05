@@ -714,6 +714,9 @@ function listTaskRow(
     createdByUserId,
     source: {},
     workflowRunId: null,
+    harness: null,
+    model: null,
+    effort: null,
     createdAt: at,
     updatedAt: at,
   };

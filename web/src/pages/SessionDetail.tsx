@@ -1,48 +1,23 @@
 import { useParams } from "@tanstack/react-router";
-import {
-  Fragment,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ComponentType,
-  type ReactNode,
-} from "react";
-import {
-  Activity,
-  Code2,
-  GitPullRequestArrow,
-  Globe,
-  ListTodo,
-  Map,
-  Pencil,
-  SquareTerminal,
-} from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { PanelsTopLeft, Pencil } from "lucide-react";
 import type { ImperativePanelHandle } from "react-resizable-panels";
 import { useSession } from "../hooks/useSessions";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { StatusGlyph } from "../components/Glyph";
 import { SessionThread } from "../components/session-thread/SessionThread";
-import { PageHeading } from "../components/page-heading";
 import { TitleEditForm } from "./sessions/TitleEditForm";
 import { DeleteSessionButton } from "./sessions/DeleteSessionButton";
 import { WorkPane, type PaneTabId } from "../components/WorkPane";
 import { shortId, statusLabel } from "./sessions/session-format";
 import { useTasks } from "../hooks/useTasks";
-import { sessionHasAgentTasks } from "../components/session-thread/agentTasks";
 import { useIsMobile } from "../hooks/use-mobile";
-import { ProfileChip } from "../components/profiles/ProfileChip";
-import {
-  DurabilityReadout,
-  useDurabilitySummary,
-  type DurabilitySummary,
-} from "../components/SessionDiagnostics";
+import { useIsAdmin } from "../auth/AuthProvider";
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "@/components/ui/resizable";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
-import { Separator } from "@/components/ui/separator";
-import type { Session, ProfileSnapshotView, IndexedEvent } from "../lib/types";
+import type { ProfileSnapshotView, IndexedEvent } from "../lib/types";
 
 // The session workspace (ADR 0065 follow-up). The transcript is the primary
 // left column; the live shell + browser live in a resizable companion pane on
@@ -50,29 +25,35 @@ import type { Session, ProfileSnapshotView, IndexedEvent } from "../lib/types";
 // Diagnostics + the raw event log moved into that pane too. On phones the pane
 // opens as a right-side overlay sheet rather than a split.
 //
-// The pane ALWAYS starts collapsed and its contents mount lazily — a shell/VNC
-// socket only opens once the developer actually opens that view. Open-state is
-// deliberately not persisted; only the last view + width are remembered so a
-// reopen lands where they left it.
+// The pane starts open on desktop and closed in the mobile sheet. Open-state is
+// deliberately not persisted; only the last view + width are remembered.
 
 const PANE_PREF_KEY = "engram.workpane";
 type WorkPanePref = { tab: PaneTabId; size: number };
-const DEFAULT_PANE_PREF: WorkPanePref = { tab: "shell", size: 42 };
+const DEFAULT_PANE_PREF: WorkPanePref = { tab: "overview", size: 42 };
+
+export function paneTabFromStored(value: unknown): PaneTabId {
+  switch (value) {
+    case "overview":
+    case "changes":
+    case "shell":
+    case "browser":
+    case "ide":
+    case "diagnostics":
+      return value;
+    default:
+      return "overview";
+  }
+}
 
 function readPanePref(): WorkPanePref {
   try {
     const raw = localStorage.getItem(PANE_PREF_KEY);
     if (!raw) return DEFAULT_PANE_PREF;
-    const p = JSON.parse(raw) as Partial<WorkPanePref>;
+    const p = JSON.parse(raw) as { tab?: unknown; size?: unknown };
     return {
-      tab:
-        p.tab === "browser" ||
-        p.tab === "ide" ||
-        p.tab === "tasks" ||
-        p.tab === "side-effects" ||
-        p.tab === "diagnostics"
-          ? p.tab
-          : "shell",
+      // Old Plan, Tasks, and Side effects preferences now open the home view.
+      tab: paneTabFromStored(p.tab),
       // Clamp within [pane minSize, 100 − transcript minSize] so a restored
       // width never collides with either panel's floor (react-resizable-panels
       // would otherwise clamp it and warn).
@@ -149,11 +130,18 @@ export function SessionDetail() {
         skills: profileSnap.skills,
       }
     : null;
+  // ADR 0063 B2 echo: the orchestrator persists the EFFECTIVE selection
+  // (override ?? profile ?? catalog default) on the task at create time.
+  // Unset on tasks that pre-date the echo columns; "" (proto3 unset) = absent.
+  const effectiveSelection =
+    task?.harness || task?.model || task?.effort
+      ? {
+          harness: task.harness || undefined,
+          model: task.model || undefined,
+          effort: task.effort || undefined,
+        }
+      : null;
   const { events, streamingText } = useSessionEvents(id);
-  // One poll per session, shared by React Query with the Diagnostics drawer's
-  // gauges; null until the session resolves (and whenever there's nothing
-  // calming to say).
-  const durability = useDurabilitySummary(id, session?.status);
 
   // The in-guest browser (Xvfb + VNC, ADR 0065) is an optional capability,
   // present iff the session's profile selected the `browser` skill bundle. We
@@ -162,12 +150,12 @@ export function SessionDetail() {
   // The in-guest IDE (code-server, ADR 0085) is the same shape of optional
   // capability, gated on the `ide` skill.
   const ideEnabled = (profile?.skills ?? []).includes("ide");
+  const isAdmin = useIsAdmin();
 
   const isMobile = useIsMobile();
   const prefRef = useRef<WorkPanePref>(readPanePref());
-  // Always start collapsed — open-state isn't persisted, so nothing inside the
-  // pane mounts (and no socket opens) until the developer opens it.
-  const [paneOpen, setPaneOpen] = useState(false);
+  // Desktop starts open at the preferred split. The mobile sheet stays closed.
+  const [paneOpen, setPaneOpen] = useState(!isMobile);
   const [paneTab, setPaneTab] = useState<PaneTabId>(prefRef.current.tab);
   // Desktop only: the pane fills the work area (transcript panel collapsed).
   const [expanded, setExpanded] = useState(false);
@@ -176,18 +164,27 @@ export function SessionDetail() {
   const transcriptRef = useRef<ImperativePanelHandle>(null);
   const paneSizeRef = useRef(prefRef.current.size);
 
-  // Fall back to the shell view if the browser/IDE capability disappears (an
+  // useIsMobile resolves after the first browser render. Close the sheet when
+  // the layout enters mobile; later user opens do not rerun this effect.
+  useEffect(() => {
+    if (isMobile) {
+      setPaneOpen(false);
+      setExpanded(false);
+    }
+  }, [isMobile]);
+
+  // Fall back to the home view if the browser/IDE capability disappears (an
   // admin drops the skill and useTasks refetches) while that view is active,
   // so we never point at an absent tab.
   useEffect(() => {
-    if (paneTab === "browser" && !browserEnabled) setPaneTab("shell");
+    if (paneTab === "browser" && !browserEnabled) setPaneTab("overview");
   }, [paneTab, browserEnabled]);
   useEffect(() => {
-    if (paneTab === "ide" && !ideEnabled) setPaneTab("shell");
+    if (paneTab === "ide" && !ideEnabled) setPaneTab("overview");
   }, [paneTab, ideEnabled]);
 
   // Persist the last-viewed tab (width is persisted from onLayout). Open-state
-  // is intentionally not stored — the pane always starts collapsed.
+  // is intentionally not stored.
   useEffect(() => {
     writePanePref({ tab: paneTab, size: paneSizeRef.current });
   }, [paneTab]);
@@ -200,9 +197,7 @@ export function SessionDetail() {
     // branch and then disappear when the mobile sheet mounts.
     setPaneOpen(true);
     if (!isMobile) {
-      // resize() un-collapses to an explicit width — reliable even on a fresh
-      // load that started collapsed (expand() would only restore a remembered
-      // size, which doesn't exist yet).
+      // resize() un-collapses to the preferred width after a user collapse.
       paneRef.current?.resize(paneSizeRef.current);
     }
   };
@@ -274,19 +269,6 @@ export function SessionDetail() {
     />
   );
 
-  // ADR 0107: the Plan tab appears once the session has proposed a plan.
-  const hasPlan = useMemo(
-    () =>
-      events.some(
-        (e) => e.event.type === "tool_call_requested" && e.event.name === "exit_plan_mode",
-      ),
-    [events],
-  );
-
-  // The Tasks tab appears once the agent has created a task (same gating as
-  // WorkPane's own strip).
-  const hasTasks = useMemo(() => sessionHasAgentTasks(events), [events]);
-
   // ADR 0107: the session is waiting on the user (a plan review or an
   // unanswered question) — the tab title picks up the ● prefix.
   const needsAttention = useMemo(() => {
@@ -303,122 +285,112 @@ export function SessionDetail() {
   }, [events]);
   useDocumentTitle(needsAttention ? `\u25cf ${taskTitle ?? shortId(id)} — engrams` : null);
 
-  const paneTabDefs: {
-    id: PaneTabId;
-    label: string;
-    icon: ComponentType<{ className?: string }>;
-  }[] = [
-    { id: "shell", label: "Shell", icon: SquareTerminal },
-    ...(browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
-    ...(ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
-    ...(hasPlan ? [{ id: "plan", label: "Plan", icon: Map } as const] : []),
-    ...(hasTasks ? [{ id: "tasks", label: "Tasks", icon: ListTodo } as const] : []),
-    { id: "side-effects", label: "Side effects", icon: GitPullRequestArrow },
-    { id: "diagnostics", label: "Diagnostics", icon: Activity },
-  ];
-
-  // The transcript column: its own masthead (task id + vitals) over the thread.
-  // The work pane sits beside it at full height, so the masthead lives here
-  // rather than spanning the width above both.
-  const leftColumn = (
-    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-      <div className="shrink-0 px-6 pt-6 pb-4">
-        <PageHeading
-          eyebrow="task"
-          title={
-            editingTitle && taskId ? (
-              <TitleEditForm
-                taskId={taskId}
-                initial={taskTitle ?? ""}
-                isCustom={titleIsCustom}
-                onDone={() => setEditingTitle(false)}
-                inputClassName="h-9 text-lg"
-                className="max-w-xl"
-              />
-            ) : (
-              <span className="group/title inline-flex max-w-full items-center gap-2">
-                {/* Truncation is lossy, so the full title stays reachable as a
-                    native tooltip. */}
-                <span className="min-w-0 truncate" title={taskTitle ?? id}>
-                  {taskTitle ?? id}
-                </span>
-                {taskId && (
-                  <Button
-                    type="button"
-                    size="icon-xs"
-                    variant="ghost"
-                    onClick={() => setEditingTitle(true)}
-                    aria-label="Rename session"
-                    title="Rename"
-                    className="shrink-0 opacity-0 transition-opacity group-hover/title:opacity-100 focus-visible:opacity-100"
-                  >
-                    <Pencil />
-                  </Button>
-                )}
-              </span>
-            )
-          }
-          // A named session reads as prose; the raw-id fallback stays in the
-          // lab-readout mono voice.
-          titleVariant={taskTitle ? "display" : "mono"}
-          showRule={false}
-          actions={
-            <div className="flex items-center gap-2">
-              {/* Desktop reopens the pane via the edge rail; phones have no
-                  rail, so they get an explicit button. */}
-              <Button variant="outline" size="sm" className="md:hidden" onClick={() => openPane()}>
-                <SquareTerminal />
-                Panel
-              </Button>
-              {/* Only attributed sessions have a task to delete; synthetic
-                  admin rows (taskId null) hide the control. */}
-              {taskId && <DeleteSessionButton taskId={taskId} title={taskTitle} />}
-            </div>
-          }
-        />
+  // The slim masthead spans the transcript and work pane. View switching stays
+  // in the work pane header so this row only carries session identity.
+  const masthead = (
+    <header className="flex h-12 shrink-0 items-center gap-2 border-b px-4">
+      <div className="flex min-w-0 flex-1 items-center gap-2">
         {session && (
-          <SessionVitals
-            session={session}
-            profile={profile}
-            durability={durability}
-            needsAttention={needsAttention}
+          <span
+            className="shrink-0 text-xs"
+            aria-label={statusLabel(session.status)}
+            title={statusLabel(session.status)}
+            data-testid="session-status-glyph"
+          >
+            <StatusGlyph status={session.status} attention={needsAttention} />
+          </span>
+        )}
+        {editingTitle && taskId ? (
+          <TitleEditForm
+            taskId={taskId}
+            initial={taskTitle ?? ""}
+            isCustom={titleIsCustom}
+            onDone={() => setEditingTitle(false)}
+            inputClassName="h-8 text-base"
+            className="max-w-xl flex-1"
           />
+        ) : (
+          <div className="group/title flex min-w-0 items-center gap-1">
+            {/* Truncation is lossy, so the full title stays reachable as a
+                native tooltip. */}
+            <span
+              className="min-w-0 truncate text-base font-medium"
+              title={taskTitle ?? id}
+              data-testid="session-title"
+            >
+              {taskTitle ?? id}
+            </span>
+            {taskId && (
+              <Button
+                type="button"
+                size="icon-xs"
+                variant="ghost"
+                onClick={() => setEditingTitle(true)}
+                aria-label="Rename session"
+                title="Rename"
+                className="shrink-0 opacity-0 transition-opacity group-hover/title:opacity-100 focus-visible:opacity-100"
+              >
+                <Pencil />
+              </Button>
+            )}
+          </div>
         )}
       </div>
+      {/* The switcher lives in the pane header, so a closed pane has no
+          affordance of its own — this button is the way back in. Mobile
+          always shows it (the sheet starts closed). */}
+      {(isMobile || !paneOpen) && (
+        <Button type="button" variant="outline" size="sm" onClick={() => openPane()}>
+          <PanelsTopLeft />
+          Panel
+        </Button>
+      )}
+      {/* Only attributed sessions have a task to delete; synthetic admin rows
+          (taskId null) hide the control. */}
+      {taskId && <DeleteSessionButton taskId={taskId} title={taskTitle} />}
+    </header>
+  );
+
+  const leftColumn = (
+    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       <div className="min-h-0 flex-1 overflow-hidden">{transcript}</div>
     </div>
   );
 
   return (
-    <div className="flex min-h-0 flex-1 overflow-hidden">
-      {isMobile ? (
-        <>
-          {leftColumn}
-          <Sheet open={paneOpen} onOpenChange={(o) => !o && collapsePane()}>
-            <SheetContent
-              side="right"
-              showCloseButton={false}
-              className="w-full gap-0 p-0 sm:max-w-xl"
-            >
-              <SheetTitle className="sr-only">Session work pane</SheetTitle>
-              <WorkPane
-                sessionId={id}
-                taskId={taskId}
-                session={session}
-                events={events}
-                open={paneOpen}
-                tab={paneTab}
-                onTabChange={setPaneTab}
-                browserEnabled={browserEnabled}
-                ideEnabled={ideEnabled}
-                onCollapse={collapsePane}
-                variant="overlay"
-              />
-            </SheetContent>
-          </Sheet>
-        </>
-      ) : (
-        <>
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      {masthead}
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        {isMobile ? (
+          <>
+            {leftColumn}
+            <Sheet open={paneOpen} onOpenChange={(o) => !o && collapsePane()}>
+              <SheetContent
+                side="right"
+                showCloseButton={false}
+                className="w-full gap-0 p-0 sm:max-w-xl"
+              >
+                <SheetTitle className="sr-only">Session work pane</SheetTitle>
+                <WorkPane
+                  sessionId={id}
+                  taskId={taskId}
+                  session={session}
+                  events={events}
+                  profile={profile}
+                  selection={effectiveSelection}
+                  isAdmin={isAdmin}
+                  open={paneOpen}
+                  tab={paneTab}
+                  onTabChange={setPaneTab}
+                  browserEnabled={browserEnabled}
+                  ideEnabled={ideEnabled}
+                  onCollapse={collapsePane}
+                  variant="overlay"
+                />
+              </SheetContent>
+            </Sheet>
+          </>
+        ) : (
           <ResizablePanelGroup
             direction="horizontal"
             className="min-h-0 flex-1"
@@ -439,7 +411,7 @@ export function SessionDetail() {
               collapsible
               collapsedSize={0}
               minSize={30}
-              defaultSize={100}
+              defaultSize={100 - paneSizeRef.current}
               onCollapse={() => setExpanded(true)}
               onExpand={() => setExpanded(false)}
               className="min-w-0"
@@ -456,7 +428,7 @@ export function SessionDetail() {
               collapsible
               collapsedSize={0}
               minSize={24}
-              defaultSize={0}
+              defaultSize={paneSizeRef.current}
               onCollapse={() => {
                 setExpanded(false);
                 setPaneOpen(false);
@@ -469,6 +441,9 @@ export function SessionDetail() {
                 taskId={taskId}
                 session={session}
                 events={events}
+                profile={profile}
+                selection={effectiveSelection}
+                isAdmin={isAdmin}
                 open={paneOpen}
                 tab={paneTab}
                 onTabChange={setPaneTab}
@@ -481,101 +456,8 @@ export function SessionDetail() {
               />
             </ResizablePanel>
           </ResizablePanelGroup>
-
-          {/* Collapsed edge rail — the Devin-style reopen affordance, full
-              height. Each glyph opens the pane straight to that view. */}
-          {!paneOpen && (
-            <div
-              className="flex w-9 shrink-0 flex-col items-center gap-1 border-l bg-background py-2"
-              aria-label="Open work pane"
-            >
-              {paneTabDefs.map((t) => (
-                <Button
-                  key={t.id}
-                  variant="ghost"
-                  size="icon"
-                  className="size-7 text-muted-foreground hover:text-foreground"
-                  title={`Open ${t.label}`}
-                  aria-label={`Open ${t.label}`}
-                  onClick={() => openPane(t.id)}
-                >
-                  <t.icon />
-                </Button>
-              ))}
-            </div>
-          )}
-        </>
-      )}
-    </div>
-  );
-}
-
-// The masthead vitals strip — the only session metadata a developer needs at a
-// glance: lifecycle status (glyph + word), the profile this launched from
-// (ADR 0053, the dense inline chip with its image on hover), and the calm
-// durability telltale. Items render only when present and are divided by a
-// hairline Separator, so the strip never trails a dangling divider.
-function SessionVitals({
-  session,
-  profile,
-  durability,
-  needsAttention = false,
-}: {
-  session: Session;
-  profile: ProfileSnapshotView | null;
-  durability: DurabilitySummary | null;
-  /** ADR 0107: a plan review or question is waiting on the user. */
-  needsAttention?: boolean;
-}) {
-  const items: { key: string; node: ReactNode }[] = [
-    {
-      key: "status",
-      node: (
-        <span className="inline-flex items-center gap-1.5">
-          <StatusGlyph status={session.status} attention={needsAttention} />
-          <span
-            data-testid="session-status"
-            className={
-              needsAttention ? "font-medium text-instrument-caution" : "font-medium text-foreground"
-            }
-          >
-            {needsAttention
-              ? `${statusLabel(session.status)} — waiting on you`
-              : statusLabel(session.status)}
-          </span>
-        </span>
-      ),
-    },
-    ...(profile
-      ? [
-          {
-            key: "profile",
-            node: (
-              <ProfileChip
-                profile={profile}
-                fallbackImage={session.image}
-                disclosure="tooltip"
-                className="max-w-full text-foreground"
-              />
-            ),
-          },
-        ]
-      : []),
-    ...(durability
-      ? [{ key: "durability", node: <DurabilityReadout summary={durability} /> }]
-      : []),
-  ];
-
-  return (
-    <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-sm text-muted-foreground">
-      {items.map((item, i) => (
-        <Fragment key={item.key}>
-          {i > 0 && (
-            <Separator orientation="vertical" className="data-[orientation=vertical]:h-4" />
-          )}
-          {item.node}
-        </Fragment>
-      ))}
+        )}
+      </div>
     </div>
   );
 }

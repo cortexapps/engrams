@@ -10,7 +10,6 @@ import { relativeTime } from "../pages/sessions/session-format";
 import { SessionCowState } from "./CowState";
 import { DurabilityTimeline } from "./DurabilityTimeline";
 import { MetricRow } from "./MetricRow";
-import { ExposedPortsSection } from "./ports/ExposedPortsSection";
 import { Button } from "@/components/ui/button";
 import { Text } from "@/components/ui/text";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -246,14 +245,6 @@ export function DiagnosticsPanel({
             </dl>
           </section>
         )}
-
-        {/* ADR 0064: live-host port exposures. (Relocates into the ADR-0065
-            BROWSER tab / side pane over time; here for now.) The liveness probe
-            is gated on Active. */}
-        <section className="border-t pt-4">
-          <SectionLabel>ports</SectionLabel>
-          <ExposedPortsSection sessionId={sessionId} active={session?.status === "active"} />
-        </section>
 
         {/* Admin live-ops — self-gating (admin + Active only), so a non-admin
             sees a clean read-only ledger above and nothing here. */}
