@@ -7,7 +7,7 @@
 #
 #   docker buildx build -f docker/web.Dockerfile -t engram/web:dev .
 
-FROM node:20-alpine AS builder
+FROM node:25-alpine AS builder
 WORKDIR /src
 
 # Enable pnpm via corepack. Pin to the same major as CI (pnpm v9)
@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 COPY web/ ./
 RUN pnpm build
 
-FROM nginx:1.27-alpine
+FROM nginx:1.31-alpine
 # Drop the upstream default config — the chart provides it via
 # ConfigMap mount (deploy/helm/engram/templates/web-configmap.yaml).
 # Keeping it would leave a stale 80/SPA-only fallback inside the

@@ -13,7 +13,7 @@
 # with docker/node-assets-fetch.sh (pinned FC release + the engram guest
 # kernel GH release asset + the bundle-*:main OCI artifacts). busybox gives
 # the chart's init container a /bin/sh + cp + cmp for the idempotent copy.
-FROM busybox:1.36
+FROM busybox:1.38
 COPY firecracker /assets/firecracker
 COPY vmlinux /assets/vmlinux
 # ADR 0027: the skills/browser squashfs + current.json stamp the host-agent
