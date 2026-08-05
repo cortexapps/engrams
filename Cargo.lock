@@ -1373,7 +1373,6 @@ dependencies = [
  "hex",
  "hickory-proto",
  "http",
- "nom",
  "parking_lot",
  "rcgen",
  "rustls",

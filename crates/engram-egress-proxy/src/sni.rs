@@ -66,7 +66,7 @@ where
                     }
                     return Err(PeekError::NoSni);
                 }
-                Err(nom::Err::Incomplete(_)) => {
+                Err(tls_parser::Err::Incomplete(_)) => {
                     // Need more bytes; fall through to the read loop.
                 }
                 Err(_) => return Err(PeekError::MalformedClientHello),
