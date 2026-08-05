@@ -21,10 +21,16 @@ export async function seedReviewerProfile(
 ): Promise<void> {
   if (await store.getByDesignation(PR_REVIEWER_DESIGNATION)) return;
 
-  const defaultProfile = await store.getDefault();
-  if (!defaultProfile) {
+  // Template off the newest active human-managed profile — its image/harness
+  // choices are the org's current working setup. (There is no org default
+  // profile; Slack routing picks per message.)
+  const candidates = await store.list({ includeArchived: false });
+  const templateProfile = candidates
+    .filter((p) => p.designation == null)
+    .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
+  if (!templateProfile) {
     log.info(
-      "reviewer profile not seeded: configure an org default profile first, then it seeds on next boot (or designate one manually)",
+      "reviewer profile not seeded: create a profile first, then it seeds on next boot (or designate one manually)",
     );
     return;
   }
@@ -40,10 +46,10 @@ export async function seedReviewerProfile(
         description:
           "engrams code reviewer for pull requests (ADR 0100). Repoint the image/model as needed; do not delete.",
         icon: "ScanSearch",
-        imageId: defaultProfile.imageId,
-        harness: defaultProfile.harness,
-        model: defaultProfile.model,
-        effort: defaultProfile.effort,
+        imageId: templateProfile.imageId,
+        harness: templateProfile.harness,
+        model: templateProfile.model,
+        effort: templateProfile.effort,
         includeUserTokens: false,
         envVars: {},
         // The "skills" bundle ships the git-askpass helper
@@ -54,7 +60,6 @@ export async function seedReviewerProfile(
         integrationGrants: [capabilityGrant(PR_REVIEW_CAPABILITY, engramsConnection.id)],
         network: DEFAULT_PROFILE_NETWORK,
         secrets: [],
-        isDefault: false,
         portExposures: [],
       },
       PR_REVIEWER_DESIGNATION,

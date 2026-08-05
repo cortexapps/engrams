@@ -14,11 +14,11 @@ import {
 
 function profileRow(overrides: Partial<ProfileRow> = {}): ProfileRow {
   return {
-    id: "default-profile",
-    name: "Default",
+    id: "template-profile",
+    name: "Template",
     description: "",
     icon: "Bot",
-    imageId: "default-image",
+    imageId: "template-image",
     harness: "claude",
     model: "sonnet",
     effort: "high",
@@ -32,7 +32,6 @@ function profileRow(overrides: Partial<ProfileRow> = {}): ProfileRow {
     }],
     network: { default: "allow", allowHosts: ["example.com"], allowHostPatterns: [] },
     secrets: [{ ref: "token", envVar: "TOKEN", mode: "literal", allowHosts: [], allowHostPatterns: [] }],
-    isDefault: true,
     portExposures: [3000],
     designation: null,
     createdAt: new Date(0),
@@ -43,33 +42,30 @@ function profileRow(overrides: Partial<ProfileRow> = {}): ProfileRow {
 }
 
 function fakeStore(options: {
-  defaultProfile?: ProfileRow | null;
+  templateProfile?: ProfileRow | null;
   createError?: unknown;
 } = {}): ProfileStore & {
   creates: Array<{ input: ProfileInput; designation: string | null }>;
 } {
-  const defaultProfile = options.defaultProfile === undefined
+  const templateProfile = options.templateProfile === undefined
     ? profileRow()
-    : options.defaultProfile;
+    : options.templateProfile;
   let designatedProfile: ProfileRow | null = null;
   const creates: Array<{ input: ProfileInput; designation: string | null }> = [];
 
   return {
     creates,
     async list({ includeArchived }) {
-      return [defaultProfile, designatedProfile]
+      return [templateProfile, designatedProfile]
         .filter((row): row is ProfileRow => row != null)
         .filter((row) => includeArchived || row.deletedAt == null);
     },
     async get(id) {
-      return [defaultProfile, designatedProfile].find((row) => row?.id === id) ?? null;
+      return [templateProfile, designatedProfile].find((row) => row?.id === id) ?? null;
     },
     async getActive(id) {
-      return [defaultProfile, designatedProfile]
+      return [templateProfile, designatedProfile]
         .find((row) => row?.id === id && row.deletedAt == null) ?? null;
-    },
-    async getDefault() {
-      return defaultProfile?.deletedAt == null ? defaultProfile : null;
     },
     async getByDesignation(designation) {
       return designatedProfile?.designation === designation && designatedProfile.deletedAt == null
@@ -77,7 +73,7 @@ function fakeStore(options: {
         : null;
     },
     async getByIds(ids) {
-      return [defaultProfile, designatedProfile]
+      return [templateProfile, designatedProfile]
         .filter((row): row is ProfileRow => row != null && ids.includes(row.id));
     },
     async create(input, designation) {
@@ -158,7 +154,7 @@ function fakeLogger() {
 }
 
 describe("seedReviewerProfile", () => {
-  test("creates a designated reviewer by cloning the default's runtime selections", async () => {
+  test("creates a designated reviewer by cloning the template's runtime selections", async () => {
     const store = fakeStore();
     const logger = fakeLogger();
 
@@ -169,7 +165,7 @@ describe("seedReviewerProfile", () => {
       designation: PR_REVIEWER_DESIGNATION,
       input: {
         name: "PR Reviewer",
-        imageId: "default-image",
+        imageId: "template-image",
         harness: "claude",
         model: "sonnet",
         effort: "high",
@@ -183,7 +179,6 @@ describe("seedReviewerProfile", () => {
         skills: ["skills"],
         secrets: [],
         portExposures: [],
-        isDefault: false,
       },
     });
     expect(store.creates[0]?.input.network).toEqual({
@@ -193,15 +188,15 @@ describe("seedReviewerProfile", () => {
     });
   });
 
-  test("skips with an informational log when no default exists", async () => {
-    const store = fakeStore({ defaultProfile: null });
+  test("skips with an informational log when no template profile exists", async () => {
+    const store = fakeStore({ templateProfile: null });
     const logger = fakeLogger();
 
     await seedReviewerProfile(store, fakeConnections(), logger.logger);
 
     expect(store.creates).toEqual([]);
     expect(logger.info).toEqual([
-      "reviewer profile not seeded: configure an org default profile first, then it seeds on next boot (or designate one manually)",
+      "reviewer profile not seeded: create a profile first, then it seeds on next boot (or designate one manually)",
     ]);
   });
 

@@ -203,23 +203,12 @@ describe("SessionProfileEditor (create)", () => {
     });
   });
 
-  it("toggling Default includes is_default in the create payload (ADR 0060)", async () => {
-    render(<SessionProfileEditor mode="create" />);
-    fireEvent.change(screen.getByLabelText(/profile name/i), {
-      target: { value: "Default Agent" },
-    });
-    fireEvent.click(screen.getByLabelText(/default profile/i));
-    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
-    await waitFor(() => expect(create).toHaveBeenCalled());
-    expect(create.mock.calls[0][0]).toMatchObject({ isDefault: true });
-  });
-
-  it("leaves is_default false when the toggle is untouched", async () => {
+  it("sends an empty designation when the reviewer toggle is untouched", async () => {
     render(<SessionProfileEditor mode="create" />);
     fireEvent.change(screen.getByLabelText(/profile name/i), { target: { value: "Plain Agent" } });
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
     await waitFor(() => expect(create).toHaveBeenCalled());
-    expect(create.mock.calls[0][0]).toMatchObject({ isDefault: false, designation: "" });
+    expect(create.mock.calls[0][0]).toMatchObject({ designation: "" });
   });
 
   it("maps the PR reviewer toggle to the reviewer designation", async () => {
@@ -370,7 +359,6 @@ describe("SessionProfileEditor (Google Cloud connections)", () => {
         harness: "claude",
         model: "opus",
         effort: "high",
-        isDefault: false,
         includeUserTokens: false,
         envVars: {},
         integrationGrants: [
@@ -410,7 +398,6 @@ describe("SessionProfileEditor (Google Cloud connections)", () => {
         harness: "claude",
         model: "opus",
         effort: "high",
-        isDefault: false,
         includeUserTokens: false,
         envVars: {},
         integrationGrants: [
@@ -449,7 +436,6 @@ describe("SessionProfileEditor (edit)", () => {
         harness: "claude",
         model: "opus",
         effort: "high",
-        isDefault: true,
         designation: "pr_reviewer",
         includeUserTokens: true,
         envVars: { ANTHROPIC_MODEL: "claude-x" },
@@ -488,7 +474,6 @@ describe("SessionProfileEditor (edit)", () => {
     });
     expect(screen.getByTestId("icon-picker").textContent).toContain("Server");
     expect(screen.getByTestId("image-select").textContent).toContain("registry/api:latest");
-    expect(screen.getByLabelText(/default profile/i).getAttribute("data-state")).toBe("checked");
     expect(screen.getByLabelText(/pr reviewer profile/i).getAttribute("data-state")).toBe(
       "checked",
     );
@@ -524,7 +509,6 @@ describe("SessionProfileEditor (edit)", () => {
       harness: "claude",
       model: "opus",
       effort: "high",
-      isDefault: true,
       includeUserTokens: true,
       envVars: { ANTHROPIC_MODEL: "claude-x" },
       integrationGrants: [
@@ -568,7 +552,6 @@ describe("SessionProfileEditor (edit)", () => {
         harness: "claude",
         model: "opus",
         effort: "high",
-        isDefault: false,
         designation: "pr_reviewer",
         includeUserTokens: false,
         envVars: {},
@@ -601,7 +584,6 @@ describe("SessionProfileEditor (edit)", () => {
         harness: "claude",
         model: "",
         effort: "",
-        isDefault: false,
         includeUserTokens: false,
         envVars: {},
         integrationGrants: [],

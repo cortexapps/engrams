@@ -17,7 +17,8 @@
 
 import type { ModalView, KnownBlock } from "@slack/types";
 
-import type { SourceAnswer } from "../workflows/thread-inbox.ts";
+import type { SourceAnswer, SourceProfileChoice } from "../workflows/thread-inbox.ts";
+import type { ProfileOption } from "../routing/profile-picker.ts";
 import { AnswersSchema, QuestionsSchema } from "../tools/builtin.ts";
 import type {
   AssetSummary,
@@ -38,6 +39,8 @@ function isAnswerAction(id: string | undefined): boolean {
 }
 /** "Answer…" button that opens the modal for a multi/multi-question ask. */
 export const ACTION_OPEN = "auq_open";
+/** The profile-picker dropdown (routing `ask_user` fallback). */
+export const ACTION_PROFILE = "profile_select";
 /** The answer modal's `callback_id`. */
 export const CALLBACK_SUBMIT = "auq_submit";
 /** The input element's `action_id` inside each modal question block. */
@@ -69,6 +72,17 @@ export interface CompactQuestion {
 export type InteractivityAction =
   | { kind: "answer"; answer: SourceAnswer; route: ThreadRoute }
   | { kind: "open_modal"; triggerId: string; view: ModalView }
+  | {
+      kind: "profile_choice";
+      choice: SourceProfileChoice;
+      route: ThreadRoute;
+      /** The Slack user who may pick (the mentioning user). */
+      expectedUser: string;
+      /** The Slack user who clicked. */
+      clicker: string;
+      /** Per-ask dedupe token (the mention's event id). */
+      nonce: string;
+    }
   | { kind: "ignore" };
 
 /** The carried value of an inline single-select option button. */
@@ -100,7 +114,13 @@ export function parseInteractivity(payloadJson: string): InteractivityAction {
   let p: {
     type?: string;
     trigger_id?: string;
-    actions?: { action_id?: string; value?: string }[];
+    user?: { id?: string };
+    actions?: {
+      action_id?: string;
+      value?: string;
+      block_id?: string;
+      selected_option?: { value?: string; text?: { text?: string } };
+    }[];
     view?: {
       callback_id?: string;
       private_metadata?: string;
@@ -114,6 +134,8 @@ export function parseInteractivity(payloadJson: string): InteractivityAction {
   }
 
   if (p.type === "block_actions") {
+    const select = p.actions?.find((a) => a.action_id === ACTION_PROFILE);
+    if (select) return parseProfileChoice(select, p.user?.id ?? "");
     const action = p.actions?.find(
       (a) => isAnswerAction(a.action_id) || a.action_id === ACTION_OPEN,
     );
@@ -177,6 +199,45 @@ function selectedLabels(state: ViewStateValue | undefined): string[] {
   }
   const single = state.selected_option?.value;
   return single ? [single] : [];
+}
+
+/** What rides the profile picker's `block_id` (a select option value caps at
+ *  75 chars — too small for the route — while a block_id allows 255). */
+interface PickerMeta {
+  r: ThreadRoute;
+  /** The mentioning Slack user — the only one who may pick. */
+  u: string;
+  /** Per-ask dedupe token (the mention's event id). */
+  n: string;
+}
+
+/** Classify a profile-select interaction. The option value is the profile id;
+ *  the display name rides the option text. Malformed metadata → ignore. */
+function parseProfileChoice(
+  action: {
+    block_id?: string;
+    selected_option?: { value?: string; text?: { text?: string } };
+  },
+  clicker: string,
+): InteractivityAction {
+  const profileId = action.selected_option?.value;
+  if (!profileId || !action.block_id) return { kind: "ignore" };
+  try {
+    const meta = JSON.parse(action.block_id) as PickerMeta;
+    if (!meta.r || typeof meta.u !== "string" || typeof meta.n !== "string") {
+      return { kind: "ignore" };
+    }
+    return {
+      kind: "profile_choice",
+      choice: { profileId, profileName: action.selected_option?.text?.text ?? "" },
+      route: meta.r,
+      expectedUser: meta.u,
+      clicker,
+      nonce: meta.n,
+    };
+  } catch {
+    return { kind: "ignore" };
+  }
 }
 
 /**
@@ -359,6 +420,47 @@ export function buildQuestionBlocks(route: ThreadRoute, parsed: ParsedUserQuesti
     });
   }
   return blocks;
+}
+
+/**
+ * Build the profile-picker message: the candidate profiles (name + description
+ * lines) and a `static_select` whose options carry profile ids. The route,
+ * the mentioning user, and the per-ask nonce ride the `block_id` (a select
+ * option value caps at 75 chars). First selection wins — the interactivity
+ * route dedupes on the nonce and the workflow ignores late picks.
+ */
+export function buildProfilePickerBlocks(
+  route: ThreadRoute,
+  expectedUser: string,
+  nonce: string,
+  options: ProfileOption[],
+): KnownBlock[] {
+  const meta: PickerMeta = { r: route, u: expectedUser, n: nonce };
+  const lines = options
+    .map((o) => `• *${truncate(o.name, 75)}*${o.description ? ` — ${truncate(o.description, 150)}` : ""}`)
+    .join("\n");
+  return [
+    section(`Which profile should handle this?\n${lines}`),
+    {
+      type: "section",
+      block_id: JSON.stringify(meta),
+      text: { type: "mrkdwn", text: "Pick one to start the session:" },
+      accessory: {
+        type: "static_select",
+        action_id: ACTION_PROFILE,
+        placeholder: { type: "plain_text", text: "Choose a profile" },
+        options: options.map((o) => ({
+          text: { type: "plain_text", text: truncate(o.name, 75) },
+          value: o.id,
+        })),
+      },
+    },
+  ];
+}
+
+/** The resolved picker message (replaces the live one via chat.update). */
+export function buildProfileChosenBlocks(profileName: string): KnownBlock[] {
+  return [section(`✓ Running with *${truncate(profileName, 75)}*`)];
 }
 
 /** Slack's hard per-section `text` cap; we split below it to never trip

@@ -44,6 +44,8 @@ const mention = (ts: string, eventId: string): SourceMention => ({
 function recordingPolicy() {
   const calls: Record<string, unknown[][]> = {
     onPickup: [],
+    onProfileChoice: [],
+    onProfileChosen: [],
     onDeliveryError: [],
     onNeutralClose: [],
     onWorking: [],
@@ -62,6 +64,11 @@ function recordingPolicy() {
   const pol: CommunicationPolicy = {
     systemPromptAppend: "x",
     onPickup: async (m) => void calls.onPickup.push([m]),
+    onProfileChoice: async (m, options) => {
+      calls.onProfileChoice.push([m, options]);
+      return "picker-ts";
+    },
+    onProfileChosen: async (m, ref, name) => void calls.onProfileChosen.push([m, ref, name]),
     onStarted: async () => {},
     onWorking: async (m) => void calls.onWorking.push([m]),
     onIdle: async (m) => void calls.onIdle.push([m]),
@@ -98,7 +105,10 @@ function recordingControlPlane() {
   };
   const cp: ThreadControlPlane & { sendPromptImpl: () => Promise<void>; answerImpl: () => Promise<void> } = {
     resolveUser: async () => "u1",
-    getDefaultProfile: async () => ({ id: "p1" }),
+    pickProfile: async () => ({
+      decision: "route",
+      profile: { id: "p1", name: "P1", description: "" },
+    }),
     createTask: async () => SESSION,
     sendPrompt: async (sessionId, prompt, promptId) => {
       calls.sendPrompt.push([sessionId, prompt, promptId]);
@@ -232,6 +242,25 @@ describe("handleInbound() — answer", () => {
     expect(cpCalls.completeToolCall).toEqual([["s1", "tc", { "Ship?": ["Yes"] }]]);
   });
 
+});
+
+describe("handleInbound() — profile choice after the session is live", () => {
+  test("a late dropdown click is a no-op: no delivery, cursor unchanged", async () => {
+    const { pol, calls } = recordingPolicy();
+    const { cp, calls: cpCalls } = recordingControlPlane();
+    const st = freshState(mention("100.0", "Ev0"));
+    const msg: ThreadInbox = {
+      kind: "trigger_profile_choice",
+      choice: { profileId: "p2", profileName: "P2" },
+    };
+
+    const next = await handleInbound(STEP, pol, cp, SESSION, st, "180.0", msg);
+
+    expect(next).toBe("180.0");
+    expect(cpCalls.sendPrompt).toHaveLength(0);
+    expect(calls.onProfileChosen).toHaveLength(0);
+    expect(calls.onDeliveryError).toHaveLength(0);
+  });
 });
 
 describe("handleInbound() — session event", () => {

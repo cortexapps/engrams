@@ -86,7 +86,6 @@ function makeFakeStore(seed: ProfileRow[] = []): ProfileStore {
     },
     async get(id) { return rows.get(id) ?? null; },
     async getActive(id) { const r = rows.get(id); return r && r.deletedAt == null ? r : null; },
-    async getDefault() { return [...rows.values()].find((r) => r.isDefault && r.deletedAt == null) ?? null; },
     async getByDesignation(designation) {
       return [...rows.values()].find((r) => r.designation === designation && r.deletedAt == null) ?? null;
     },
@@ -163,7 +162,6 @@ const archived: ProfileRow = {
   harness: "claude", model: null, effort: null,
   includeUserTokens: false, envVars: { K: "V" }, skills: [], integrationGrants: [], createdAt: new Date(0), updatedAt: new Date(0),
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] }, secrets: [],
-  isDefault: false,
   portExposures: [],
   designation: null,
   deletedAt: new Date(0),

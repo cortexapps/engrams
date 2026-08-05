@@ -37,10 +37,18 @@ export interface SourceAnswer {
   answers: Record<string, string[]>;
 }
 
+/** A human profile choice from the source's dropdown picker — the answer to an
+ *  `ask_user` routing decision, before any session exists. */
+export interface SourceProfileChoice {
+  profileId: string;
+  profileName: string;
+}
+
 /** Everything the thread workflow can receive, tagged by origin. `outcome`
  * classifies the terminal state (success / failure / neutral). */
 export type ThreadInbox =
   | { kind: "session_event"; event: CuratedEvent }
   | { kind: "session_terminal"; outcome: TerminalOutcome }
   | { kind: "trigger_mention"; mention: SourceMention }
-  | { kind: "trigger_answer"; answer: SourceAnswer };
+  | { kind: "trigger_answer"; answer: SourceAnswer }
+  | { kind: "trigger_profile_choice"; choice: SourceProfileChoice };

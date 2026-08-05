@@ -18,8 +18,11 @@ import {
   buildAnsweredBlocks,
   buildClosingBlocks,
   buildMessageBlocks,
+  buildProfilePickerBlocks,
+  buildProfileChosenBlocks,
   ACTION_ANSWER,
   ACTION_OPEN,
+  ACTION_PROFILE,
   CALLBACK_SUBMIT,
   MODAL_ACTION,
   type CompactQuestion,
@@ -298,6 +301,69 @@ describe("buildMessageBlocks()", () => {
 
   test("empty text → no blocks", () => {
     expect(buildMessageBlocks("")).toEqual([]);
+  });
+});
+
+describe("profile picker blocks — build/parse round-trip", () => {
+  const OPTIONS = [
+    { id: "p1", name: "Backend", description: "The backend workspace" },
+    { id: "p2", name: "Infra", description: "" },
+  ];
+
+  test("the built select's selection parses back to a profile_choice", () => {
+    const blocks = buildProfilePickerBlocks(ROUTE, "U1", "Ev7", OPTIONS);
+    const select = blocks.find(
+      (b) => (b as { accessory?: { action_id?: string } }).accessory?.action_id === ACTION_PROFILE,
+    ) as { block_id: string; accessory: { options: { value: string; text: { text: string } }[] } };
+    expect(select).toBeDefined();
+    expect(select.accessory.options.map((o) => o.value)).toEqual(["p1", "p2"]);
+
+    // Simulate Slack's block_actions payload for picking the second option.
+    const parsed = parseInteractivity(
+      JSON.stringify({
+        type: "block_actions",
+        user: { id: "U1" },
+        actions: [
+          {
+            action_id: ACTION_PROFILE,
+            block_id: select.block_id,
+            selected_option: { value: "p2", text: { type: "plain_text", text: "Infra" } },
+          },
+        ],
+      }),
+    );
+    expect(parsed).toEqual({
+      kind: "profile_choice",
+      choice: { profileId: "p2", profileName: "Infra" },
+      route: ROUTE,
+      expectedUser: "U1",
+      clicker: "U1",
+      nonce: "Ev7",
+    });
+  });
+
+  test("a select action without metadata or selection is ignored", () => {
+    const noBlockId = parseInteractivity(
+      JSON.stringify({
+        type: "block_actions",
+        user: { id: "U1" },
+        actions: [{ action_id: ACTION_PROFILE, selected_option: { value: "p1" } }],
+      }),
+    );
+    expect(noBlockId).toEqual({ kind: "ignore" });
+    const noSelection = parseInteractivity(
+      JSON.stringify({
+        type: "block_actions",
+        user: { id: "U1" },
+        actions: [{ action_id: ACTION_PROFILE, block_id: JSON.stringify({ r: ROUTE, u: "U1", n: "e" }) }],
+      }),
+    );
+    expect(noSelection).toEqual({ kind: "ignore" });
+  });
+
+  test("the chosen-state block names the profile", () => {
+    const [block] = buildProfileChosenBlocks("Backend");
+    expect(JSON.stringify(block)).toContain("Backend");
   });
 });
 

@@ -26,7 +26,12 @@ import { log as rootLog } from "../log.ts";
 import { getSlackClient, getSlackSigningSecret } from "../integrations/slack.ts";
 import { parseInteractivity, type ThreadRoute } from "../integrations/slack-blocks.ts";
 import { threadHash, selectThreadWorkflowId } from "../workflows/thread-workflow-id.ts";
-import { THREAD_TOPIC, type ThreadInbox, type SourceAnswer } from "../workflows/thread-inbox.ts";
+import {
+  THREAD_TOPIC,
+  type ThreadInbox,
+  type SourceAnswer,
+  type SourceProfileChoice,
+} from "../workflows/thread-inbox.ts";
 
 /** DBOS statuses a workflow can't re-run from → that epoch is done (Invariant 4). */
 const TERMINAL_WF = new Set(["SUCCESS", "ERROR", "MAX_RECOVERY_ATTEMPTS_EXCEEDED", "CANCELLED"]);
@@ -36,6 +41,13 @@ export interface SlackInteractivityDeps {
   /** Deliver an answer to the live thread workflow. Default = workflow-id
    *  selection + DBOS.send (idempotent on tool_call_id). */
   deliverAnswer?: (route: ThreadRoute, answer: SourceAnswer) => Promise<void>;
+  /** Deliver a profile-dropdown pick. Default = workflow-id selection +
+   *  DBOS.send (idempotent on the ask's nonce — first selection wins). */
+  deliverProfileChoice?: (
+    route: ThreadRoute,
+    choice: SourceProfileChoice,
+    nonce: string,
+  ) => Promise<void>;
   /** Open the answer modal. Default = Slack `views.open`. */
   openModal?: (triggerId: string, view: ModalView) => Promise<void>;
 }
@@ -58,6 +70,28 @@ async function defaultDeliverAnswer(route: ThreadRoute, answer: SourceAnswer): P
   );
 }
 
+/** Default profile-choice delivery: same routing as an answer; the idempotency
+ *  key is the ask's nonce, so only the FIRST selection reaches the workflow. */
+async function defaultDeliverProfileChoice(
+  route: ThreadRoute,
+  choice: SourceProfileChoice,
+  nonce: string,
+): Promise<void> {
+  const workflowId = await selectThreadWorkflowId(
+    threadHash(route.team, route.channel, route.threadRoot),
+    async (id) => {
+      const status = await DBOS.getWorkflowStatus(id);
+      return status != null && TERMINAL_WF.has(status.status);
+    },
+  );
+  await DBOS.send<ThreadInbox>(
+    workflowId,
+    { kind: "trigger_profile_choice", choice },
+    THREAD_TOPIC,
+    `slack-profile:${nonce}`,
+  );
+}
+
 async function defaultOpenModal(triggerId: string, view: ModalView): Promise<void> {
   const client = await getSlackClient();
   await client.views.open({ trigger_id: triggerId, view });
@@ -68,6 +102,7 @@ const log = rootLog.child({ component: "slack" });
 export function makeSlackInteractivityRoute(deps: SlackInteractivityDeps = {}): Hono {
   const signingSecret = deps.signingSecret ?? getSlackSigningSecret;
   const deliverAnswer = deps.deliverAnswer ?? defaultDeliverAnswer;
+  const deliverProfileChoice = deps.deliverProfileChoice ?? defaultDeliverProfileChoice;
   const openModal = deps.openModal ?? defaultOpenModal;
   const app = new Hono();
 
@@ -89,6 +124,18 @@ export function makeSlackInteractivityRoute(deps: SlackInteractivityDeps = {}): 
       case "answer":
         log.info({ toolCallId: action.answer.toolCallId }, "slack: answer received");
         await deliverAnswer(action.route, action.answer);
+        return c.body(null, 200);
+      case "profile_choice":
+        // Only the mentioning user decides which profile serves their request.
+        if (action.clicker !== action.expectedUser) {
+          log.info(
+            { clicker: action.clicker, expected: action.expectedUser },
+            "slack: profile pick from a non-requesting user — ignored",
+          );
+          return c.body(null, 200);
+        }
+        log.info({ profileId: action.choice.profileId }, "slack: profile pick received");
+        await deliverProfileChoice(action.route, action.choice, action.nonce);
         return c.body(null, 200);
       case "open_modal":
         log.info("slack: opening answer modal");

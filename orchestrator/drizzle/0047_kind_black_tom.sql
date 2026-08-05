@@ -1,0 +1,2 @@
+CREATE INDEX "task_slack_channel_created_idx" ON "task" USING btree ((source->>'team'),(source->>'channel'),"created_at" DESC NULLS LAST) WHERE source->>'provider' = 'slack';--> statement-breakpoint
+ALTER TABLE "profile" DROP COLUMN "is_default";

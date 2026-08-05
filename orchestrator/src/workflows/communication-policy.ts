@@ -14,6 +14,7 @@
  */
 
 import type { CuratedEvent } from "../control-plane/session-events.ts";
+import type { ProfileOption } from "../routing/profile-picker.ts";
 import { AnswersSchema, QuestionsSchema } from "../tools/builtin.ts";
 import type { SourceMention } from "./thread-inbox.ts";
 
@@ -51,6 +52,12 @@ export interface CommunicationPolicy {
 
   /** The trigger was picked up (Slack: 👀 on the mention). */
   onPickup(m: SourceMention): Promise<void>;
+  /** Routing needs the user: render the profile dropdown (Slack: a
+   *  static_select message in the thread); return the provider message ref. */
+  onProfileChoice(m: SourceMention, options: ProfileOption[]): Promise<string>;
+  /** A profile was chosen (by the user or a re-evaluation); `ref` is the value
+   *  `onProfileChoice` returned — update that message to the resolved state. */
+  onProfileChosen(m: SourceMention, ref: string, profileName: string): Promise<void>;
   /** The session started (Slack: a link message into the thread). */
   onStarted(m: SourceMention, session: StartedSession): Promise<void>;
   /** A run began on `m`'s turn — the agent is working (Slack: ⏳ on the message). */

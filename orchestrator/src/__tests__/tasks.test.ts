@@ -256,7 +256,6 @@ function makeFakeProfiles(opts?: {
     integrationGrants: (opts?.capabilities ?? []).map(defaultGrant),
     network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
     secrets: [],
-    isDefault: false,
     portExposures: opts?.portExposures ?? [],
     designation: null,
     createdAt: new Date(0),
@@ -274,9 +273,6 @@ function makeFakeProfiles(opts?: {
     async getActive(id) {
       const r = rows.get(id);
       return r && !r.deletedAt ? r : null;
-    },
-    async getDefault() {
-      return [...rows.values()].find((r) => r.isDefault && !r.deletedAt) ?? null;
     },
     async getByDesignation(designation) {
       return [...rows.values()].find((r) => r.designation === designation && !r.deletedAt) ?? null;

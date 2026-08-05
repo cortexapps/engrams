@@ -28,7 +28,6 @@ function profileJson(p: Profile) {
       resource_constraints: grant.resourceConstraints,
     })),
     archived: p.archived,
-    is_default: p.isDefault,
     created_at: p.createdAt,
     updated_at: p.updatedAt,
   };
@@ -72,7 +71,6 @@ export async function get(c: Clients, id: string, json: boolean): Promise<void> 
     ["image_id", p.imageId],
     ["skills", p.skills.join(", ")],
     ["integration_grants", p.integrationGrants.map(formatIntegrationGrant).join(", ")],
-    ["default", p.isDefault ? "yes" : undefined],
     ["created_at", p.createdAt],
   ]);
 }

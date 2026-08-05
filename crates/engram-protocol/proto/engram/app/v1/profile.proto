@@ -51,10 +51,7 @@ message Profile {
   // org secret store by `ref` (the value lives there, never here). Lifted from
   // the image manifest onto the profile; B2 consumes it at boot.
   repeated ProfileSecret secrets = 14;
-  // ADR 0060: the org default profile — a trigger (no UI to pick one) launches
-  // its session with this. At most one active default (the store clears the
-  // prior when one is set).
-  bool is_default = 15;
+  reserved 15; // was is_default; Slack routing picks a profile per message.
   // ADR 0062/0063: the default harness (a HarnessCatalogService catalog
   // name) plus default model/effort (catalog option ids) for this
   // profile's sessions. Empty = inherit (deployment-default harness; the
@@ -147,8 +144,7 @@ message CreateProfileRequest {
   // ADR 0057: see Profile.network / Profile.secrets.
   ProfileNetwork network = 9;
   repeated ProfileSecret secrets = 10;
-  // ADR 0060: mark this the org default (clears any prior default).
-  bool is_default = 11;
+  reserved 11; // was is_default.
   // ADR 0062/0063: default harness / model / effort (see Profile).
   optional string harness = 12;
   optional string model = 13;
@@ -178,8 +174,7 @@ message UpdateProfileRequest {
   // ADR 0057: see Profile.network / Profile.secrets.
   ProfileNetwork network = 10;
   repeated ProfileSecret secrets = 11;
-  // ADR 0060: mark this the org default (clears any prior default).
-  bool is_default = 12;
+  reserved 12; // was is_default.
   // ADR 0062/0063: default harness / model / effort (see Profile).
   optional string harness = 13;
   optional string model = 14;
