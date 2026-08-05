@@ -68,6 +68,54 @@ function finding(overrides: Partial<ReviewFindingRow> = {}): ReviewFindingRow {
 }
 
 describe("GithubReviewPoster", () => {
+  test("listReviewComments pages, tolerates junk entries, and keeps thread links", async () => {
+    const fullPage = Array.from({ length: 100 }, (_, index) => ({
+      id: index + 1,
+      user: { login: "engrams-agent[bot]" },
+      body: `finding ${index + 1}`,
+      path: "src/index.ts",
+    }));
+    const fake = fakeRunOp([
+      response(200, fullPage),
+      response(200, [
+        { id: 101, in_reply_to_id: 1, user: { login: "octocat" }, body: "reply" },
+        "junk-entry",
+        { body: "no id — dropped" },
+      ]),
+    ]);
+    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+
+    const comments = await poster.listReviewComments("openai/engrams", 100);
+
+    expect(fake.calls.map((call) => call.request.path)).toEqual([
+      "/repos/openai/engrams/pulls/100/comments?per_page=100&page=1",
+      "/repos/openai/engrams/pulls/100/comments?per_page=100&page=2",
+    ]);
+    expect(comments).toHaveLength(101);
+    expect(comments[0]).toEqual({
+      id: "1",
+      inReplyToId: null,
+      authorLogin: "engrams-agent[bot]",
+      body: "finding 1",
+      path: "src/index.ts",
+    });
+    expect(comments.at(-1)).toEqual({
+      id: "101",
+      inReplyToId: "1",
+      authorLogin: "octocat",
+      body: "reply",
+      path: null,
+    });
+  });
+
+  test("listReviewComments surfaces a GitHub failure with its status", async () => {
+    const fake = fakeRunOp([response(502, { message: "bad gateway" })]);
+    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+
+    await expect(poster.listReviewComments("openai/engrams", 100))
+      .rejects.toThrow(/list pull request review comments failed with GitHub status 502/);
+  });
+
   test("fetchPrContext decodes the byte response and reads head/base SHAs", async () => {
     const fake = fakeRunOp([
       response(200, { head: { sha: "head-sha" }, base: { sha: "base-sha" } }),

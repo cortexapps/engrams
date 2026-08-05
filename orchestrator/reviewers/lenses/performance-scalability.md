@@ -44,11 +44,13 @@ sessions), and how cost grows with it. State the shape: "this is O(rows ×
 queries) where it was O(1) queries". Check whether the path is hot — a
 request path, a per-item worker, a reconcile loop — by reading who calls
 it and how often; a slow path that runs once a day is a non-finding. Do not
-claim database behavior without reading the schema/index definitions.
+claim database behavior without reading the schema/index definitions. Every
+finding names its trigger-likelihood class; here the growth variable and the
+hot path are what make a trigger `routine`.
 
 ## Writing policy
 
 WHAT: the operation and its growth variable in one sentence ("one query per
 session in the list handler"). WHEN: the scale at which it hurts, using the
 system's own numbers when visible (table already has a per-row consumer,
-loop runs per request).
+loop runs per request), ending with `Trigger likelihood: <class>`.

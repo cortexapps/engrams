@@ -31,17 +31,21 @@ describe("renderReviewer", () => {
     expect(files).toMatchSnapshot();
   });
 
-  test("renders a verifier without lens files", () => {
+  test("renders a verifier with its lens files", () => {
+    // The verifier enforces each lens's "Do not report" bar on candidates, so
+    // it gets the same lens files as the finder.
     const files = renderReviewer({
       role: "verifier",
       enabledCategories: REVIEW_CATEGORIES,
       orgInstructions: ORG_INSTRUCTIONS,
     });
 
-    expect(files).toHaveLength(1);
+    expect(files).toHaveLength(7);
     expect(files[0]?.path).toBe(`${REVIEW_GUEST_DIR}/verifier.md`);
-    expect(files[0]?.content).not.toContain("{{");
-    expect(files.some((file) => file.path.includes("/lenses/"))).toBe(false);
+    expect(
+      files.slice(1).every((file) => file.path.includes("/lenses/")),
+    ).toBe(true);
+    for (const file of files) expect(file.content).not.toContain("{{");
     expect(files).toMatchSnapshot();
   });
 

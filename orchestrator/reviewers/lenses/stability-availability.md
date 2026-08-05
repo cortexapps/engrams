@@ -35,6 +35,15 @@ down".
 - "Add a try/catch" on paths where the surrounding framework already
   converts exceptions into handled failures — verify what the caller does
   first.
+- Failure scenarios that need two or more independent rare faults to line
+  up (a crash inside the failure handler of another crash; a disk fault
+  during the rollback of a disk fault) — UNLESS the surface is a durability
+  or crash-recovery format the repo's own guidance explicitly hardens. One
+  plausible fault is the ordinary bar.
+- Defects whose entire blast radius is a log message, a metric, or an alert
+  label. Bundle observability polish into one `low` finding at most —
+  unless the silence masks a failure the code otherwise handles
+  incorrectly.
 - Hypothetical load concerns with no bound broken — "this could be slow" is
   the performance lens, and needs a scenario there too.
 - Missing logging or metrics, unless the silence hides a failure the code
@@ -46,10 +55,15 @@ Ask "what happens when this fails?" of every fallible call the diff touches,
 and answer it by reading the caller, not by assuming a supervisor exists.
 For concurrency claims, name the two operations and the interleaving —
 "not thread-safe" without an interleaving is a guess. For leaks, trace the
-release: who frees this, and does that line run on the error path?
+release: who frees this, and does that line run on the error path? Every
+finding names its trigger-likelihood class, and the severity is rated for
+that trigger, not for a rarer one. When several failure sites share one
+structural cause (the same re-armed race, the same missing guard pattern),
+report the cause once and list the sites.
 
 ## Writing policy
 
 WHAT: the failure in one sentence ("a timeout here leaves the lock held").
 WHEN: the trigger and its blast radius — one request, one worker, or the
-whole process, and whether it recovers.
+whole process, and whether it recovers — ending with
+`Trigger likelihood: <class>`.

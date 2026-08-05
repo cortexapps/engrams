@@ -8,6 +8,7 @@ import {
   gte,
   inArray,
   isNull,
+  ne,
   or,
   sql,
 } from "drizzle-orm";
@@ -196,6 +197,17 @@ export interface ReviewDetail {
   verdicts: ReviewVerdictRow[];
 }
 
+/** One earlier pass of the same target, with everything it reported — the
+ *  cross-round context a re-review reads (prior-findings.json). */
+export interface PriorReviewPass {
+  reviewId: string;
+  headSha: string;
+  trigger: string;
+  status: string;
+  createdAt: Date;
+  findings: ReviewFindingRow[];
+}
+
 export interface ReviewEventRow {
   id: string;
   reviewId: string;
@@ -243,6 +255,13 @@ export interface ReviewStore {
     input: UpdateReviewPassContextInput,
   ): Promise<boolean>;
   getReview(id: string): Promise<ReviewDetail | null>;
+  /** Earlier passes of the same target, newest first, excluding the given
+   *  pass. Findings ride along so a re-review knows what was already
+   *  reported, refuted, or posted. */
+  listPriorPasses(
+    targetId: string,
+    opts: { excludeReviewId: string; limit: number },
+  ): Promise<PriorReviewPass[]>;
   listReviews(opts: { repo?: string }): Promise<ReviewListRow[]>;
   getActiveReviewForTask(taskId: string): Promise<ReviewRow | null>;
   getActiveReviewForTarget(targetId: string): Promise<ReviewRow | null>;
@@ -697,6 +716,48 @@ export function makeReviewStore(
         findings: findings.map(toFindingRow),
         verdicts: verdicts.map(toVerdictRow),
       };
+    },
+
+    async listPriorPasses(targetId, { excludeReviewId, limit }) {
+      const passes = await db
+        .select({
+          id: reviewTable.id,
+          headSha: reviewTable.headSha,
+          trigger: reviewTable.trigger,
+          status: reviewTable.status,
+          createdAt: reviewTable.createdAt,
+        })
+        .from(reviewTable)
+        .where(
+          and(
+            eq(reviewTable.targetId, targetId),
+            ne(reviewTable.id, excludeReviewId),
+          ),
+        )
+        .orderBy(desc(reviewTable.createdAt))
+        .limit(limit);
+      if (passes.length === 0) return [];
+
+      const findings = await db
+        .select()
+        .from(findingTable)
+        .where(inArray(findingTable.reviewId, passes.map((pass) => pass.id)))
+        .orderBy(findingTable.createdAt);
+      const byReview = new Map<string, ReviewFindingRow[]>();
+      for (const row of findings) {
+        const list = byReview.get(row.reviewId) ?? [];
+        list.push(toFindingRow(row));
+        byReview.set(row.reviewId, list);
+      }
+
+      return passes.map((pass) => ({
+        reviewId: pass.id,
+        headSha: pass.headSha,
+        trigger: pass.trigger,
+        status: pass.status,
+        createdAt: pass.createdAt,
+        findings: byReview.get(pass.id) ?? [],
+      }));
     },
 
     async listReviews({ repo }) {
