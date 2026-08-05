@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { IndexedEvent, SessionEvent } from "../events";
-import { WorkPane, type PaneTabId, type WorkPaneProps } from "./WorkPane";
+import { visibleTabCount, WorkPane, type PaneTabId, type WorkPaneProps } from "./WorkPane";
 
 vi.mock("./OverviewPane", () => ({
   OverviewPane: () => <div data-testid="overview-pane">Overview content</div>,
@@ -23,7 +23,10 @@ vi.mock("./SessionDiagnostics", () => ({
   DiagnosticsPanel: () => <div data-testid="diagnostics-pane">Diagnostics content</div>,
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 const baseProps: WorkPaneProps = {
   sessionId: "session-1",
@@ -94,13 +97,25 @@ describe("WorkPane", () => {
     expect(screen.getByTestId("pane-tab-browser").getAttribute("aria-pressed")).toBe("true");
   });
 
-  test("checks the promoted view in the More menu", async () => {
-    renderPane({ tab: "shell" });
-    await userEvent.click(screen.getByTestId("pane-more-menu"));
+  test("swaps the active view into a fitting prefix", async () => {
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return this.querySelector('[aria-hidden="true"]') ? 180 : 0;
+      },
+    );
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        return DOMRect.fromRect({ width: this.textContent?.trim() === "More" ? 48 : 60 });
+      },
+    );
 
-    expect(
-      screen.getByRole("menuitemcheckbox", { name: "Shell" }).getAttribute("aria-checked"),
-    ).toBe("true");
+    renderPane({ tab: "ide", browserEnabled: true, ideEnabled: true });
+
+    expect(screen.getByTestId("pane-tab-overview")).toBeTruthy();
+    expect(screen.queryByTestId("pane-tab-browser")).toBeNull();
+    expect(screen.getByTestId("pane-tab-ide").getAttribute("aria-pressed")).toBe("true");
+    await userEvent.click(screen.getByTestId("pane-more-menu"));
+    expect(screen.getByRole("menuitem", { name: "Browser" })).toBeTruthy();
   });
 
   test("lists available overflow views in the More menu", async () => {
@@ -113,43 +128,30 @@ describe("WorkPane", () => {
     await userEvent.click(screen.getByTestId("pane-more-menu"));
 
     for (const label of ["Changes", "Shell", "Diagnostics"]) {
-      expect(screen.getByRole("menuitemcheckbox", { name: label })).toBeTruthy();
+      expect(screen.getByRole("menuitem", { name: label })).toBeTruthy();
     }
-    expect(screen.queryByRole("menuitemcheckbox", { name: "Browser" })).toBeNull();
-    expect(screen.queryByRole("menuitemcheckbox", { name: "IDE" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Browser" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "IDE" })).toBeNull();
+    const shellItem = screen.getByRole("menuitem", { name: "Shell" });
+    expect(shellItem.className.split(" ")).toContain("px-2");
+    expect(shellItem.className.split(" ")).not.toContain("pl-8");
   });
 
   test("omits unavailable Changes and Diagnostics menu items", async () => {
     renderPane();
     await userEvent.click(screen.getByTestId("pane-more-menu"));
 
-    expect(screen.queryByRole("menuitemcheckbox", { name: "Changes" })).toBeNull();
-    expect(screen.queryByRole("menuitemcheckbox", { name: "Diagnostics" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Changes" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Diagnostics" })).toBeNull();
   });
 
   test("selecting a More menu item changes the view", async () => {
     const onTabChange = vi.fn();
     renderPane({ onTabChange });
     await userEvent.click(screen.getByTestId("pane-more-menu"));
-    await userEvent.click(screen.getByRole("menuitemcheckbox", { name: "Shell" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "Shell" }));
 
     expect(onTabChange).toHaveBeenCalledWith("shell");
-  });
-
-  test("provides every hidden non-active view to the compact More menu", async () => {
-    renderPane({
-      tab: "shell",
-      events: [fileChanged()],
-      browserEnabled: true,
-      ideEnabled: true,
-      isAdmin: true,
-    });
-    await userEvent.click(screen.getByTestId("pane-more-menu-compact"));
-
-    for (const label of ["Overview", "Changes", "Browser", "IDE", "Diagnostics"]) {
-      expect(screen.getByRole("menuitemcheckbox", { name: label })).toBeTruthy();
-    }
-    expect(screen.queryByRole("menuitemcheckbox", { name: "Shell" })).toBeNull();
   });
 
   test("uses the same priority header in the overlay", () => {
@@ -177,5 +179,23 @@ describe("WorkPane", () => {
     expect(screen.getByTestId("overview-pane")).toBeTruthy();
     expect(screen.getByTestId("pane-tab-overview").getAttribute("aria-pressed")).toBe("true");
     expect(onTabChange).not.toHaveBeenCalled();
+  });
+});
+
+describe("visibleTabCount", () => {
+  test("returns every tab when they fit", () => {
+    expect(visibleTabCount([60, 70, 50], 48, 2, 234)).toBe(3);
+  });
+
+  test("returns the fitting prefix", () => {
+    expect(visibleTabCount([60, 70, 50], 48, 2, 184)).toBe(2);
+  });
+
+  test("keeps at least one tab visible", () => {
+    expect(visibleTabCount([60, 70], 48, 2, 20)).toBe(1);
+  });
+
+  test("returns every tab for layout-free measurements", () => {
+    expect(visibleTabCount([0, 0, 0], 0, 0, 0)).toBe(3);
   });
 });

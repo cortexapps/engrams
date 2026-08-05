@@ -94,15 +94,6 @@ export function OverviewPane({
                 <span className="truncate">{selectionLabel}</span>
               </div>
             )}
-            {profile && profile.skills.length > 0 && (
-              <div className="flex flex-wrap gap-1.5">
-                {profile.skills.map((skill) => (
-                  <Badge key={skill} variant="outline" className="px-1.5 py-0 text-[11px]">
-                    {skill}
-                  </Badge>
-                ))}
-              </div>
-            )}
           </div>
         </div>
 

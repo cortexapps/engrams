@@ -142,14 +142,14 @@ describe("OverviewPane", () => {
     expect(screen.getByText("active")).toBeTruthy();
   });
 
-  test("hides the image URI behind the profile hover card", async () => {
+  test("hides the image URI and profile skill badges", async () => {
     const profile: ProfileSnapshotView = {
       id: "profile-1",
       name: "Reviewer",
       icon: "bot",
       archived: false,
       imageUri: session.image,
-      skills: [],
+      skills: ["browser", "ide"],
     };
 
     renderPane([], false, vi.fn(), "task-1", "session-1", profile);
@@ -158,5 +158,7 @@ describe("OverviewPane", () => {
     // hover disclosure, never inline.
     expect(await screen.findByText("Reviewer")).toBeTruthy();
     expect(screen.queryByText(session.image)).toBeNull();
+    expect(screen.queryByText("browser")).toBeNull();
+    expect(screen.queryByText("ide")).toBeNull();
   });
 });

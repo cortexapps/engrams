@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ComponentType } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import {
   Activity,
   Code2,
@@ -24,8 +24,8 @@ import { extractFileChanges } from "./session-thread/fileChanges";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
-  DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
@@ -56,6 +56,28 @@ export interface PaneViewGroups {
   overflow: PaneViewDef[];
 }
 
+const TAB_CLASS_NAME = "h-8 shrink-0 gap-1.5 px-2 text-muted-foreground";
+
+export function visibleTabCount(
+  tabWidths: number[],
+  moreWidth: number,
+  gapPx: number,
+  available: number,
+): number {
+  if (tabWidths.length === 0) return 0;
+  // jsdom has no layout engine, so zero-width measurements keep every tab visible.
+  if (tabWidths.every((width) => width === 0)) return tabWidths.length;
+
+  let used = moreWidth;
+  let count = 0;
+  for (const width of tabWidths) {
+    if (used + gapPx + width > available) break;
+    used += gapPx + width;
+    count += 1;
+  }
+  return Math.max(1, count);
+}
+
 export function paneViewDefs(opts: {
   browserEnabled: boolean;
   ideEnabled: boolean;
@@ -82,22 +104,16 @@ function PaneTab({
   view,
   active,
   onSelect,
-  responsive,
 }: {
   view: PaneViewDef;
   active: boolean;
   onSelect: (id: PaneTabId) => void;
-  responsive?: boolean;
 }) {
   return (
     <Button
       variant="ghost"
       size="sm"
-      className={cn(
-        "h-8 shrink-0 gap-1.5 px-2 text-muted-foreground",
-        active && "bg-accent text-foreground",
-        responsive && "@max-[20rem]/workpane:hidden",
-      )}
+      className={cn(TAB_CLASS_NAME, active && "bg-accent text-foreground")}
       aria-label={view.label}
       aria-pressed={active}
       title={view.label}
@@ -105,7 +121,7 @@ function PaneTab({
       onClick={() => onSelect(view.id)}
     >
       <view.icon />
-      <span className="@max-[34rem]/workpane:hidden">{view.label}</span>
+      <span>{view.label}</span>
     </Button>
   );
 }
@@ -114,12 +130,10 @@ function MoreViewsMenu({
   views,
   activeTab,
   onSelect,
-  compact = false,
 }: {
   views: PaneViewDef[];
   activeTab: PaneTabId | null;
   onSelect: (id: PaneTabId) => void;
-  compact?: boolean;
 }) {
   return (
     <DropdownMenu>
@@ -127,29 +141,25 @@ function MoreViewsMenu({
         <Button
           variant="ghost"
           size="sm"
-          className={cn(
-            "h-8 shrink-0 gap-1.5 px-2 text-muted-foreground",
-            activeTab && "bg-accent text-foreground",
-          )}
+          className={cn(TAB_CLASS_NAME, activeTab && "bg-accent text-foreground")}
           aria-label="More views"
           aria-pressed={activeTab !== null}
           title="More views"
-          data-testid={compact ? "pane-more-menu-compact" : "pane-more-menu"}
+          data-testid="pane-more-menu"
         >
           <MoreHorizontal />
-          <span className="@max-[34rem]/workpane:hidden">More</span>
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start">
         {views.map((view) => (
-          <DropdownMenuCheckboxItem
+          <DropdownMenuItem
             key={view.id}
-            checked={view.id === activeTab}
-            onCheckedChange={() => onSelect(view.id)}
+            className={cn(view.id === activeTab && "bg-accent text-foreground")}
+            onSelect={() => onSelect(view.id)}
           >
             <view.icon />
             <span>{view.label}</span>
-          </DropdownMenuCheckboxItem>
+          </DropdownMenuItem>
         ))}
       </DropdownMenuContent>
     </DropdownMenu>
@@ -212,7 +222,51 @@ export function WorkPane({
   const views = [...viewGroups.primary, ...viewGroups.overflow];
   const effectiveTab = views.some((view) => view.id === tab) ? tab : "overview";
   const promotedView = viewGroups.overflow.find((view) => view.id === effectiveTab);
-  const compactMenuViews = views.filter((view) => view.id !== effectiveTab);
+  const candidateTabs = promotedView ? [...viewGroups.primary, promotedView] : viewGroups.primary;
+  const measurementKey = `${views.map((view) => view.id).join("|")}:${candidateTabs
+    .map((view) => view.id)
+    .join("|")}`;
+  const stripRef = useRef<HTMLDivElement>(null);
+  const measurementRef = useRef<HTMLDivElement>(null);
+  const [fittingCount, setFittingCount] = useState(candidateTabs.length);
+
+  useLayoutEffect(() => {
+    const strip = stripRef.current;
+    const measurement = measurementRef.current;
+    if (!strip || !measurement) return;
+
+    const measure = () => {
+      const children = Array.from(measurement.children) as HTMLElement[];
+      const more = children.pop();
+      if (!more) return;
+      const tabWidths = children.map((child) => child.getBoundingClientRect().width);
+      const moreWidth = more.getBoundingClientRect().width;
+      const style = getComputedStyle(measurement);
+      const gapPx = Number.parseFloat(style.columnGap || style.gap) || 0;
+      setFittingCount(visibleTabCount(tabWidths, moreWidth, gapPx, strip.clientWidth));
+    };
+
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(strip);
+    return () => observer.disconnect();
+  }, [measurementKey]);
+
+  const prefixCount = Math.min(fittingCount, candidateTabs.length);
+  let visibleTabs = candidateTabs.slice(0, prefixCount);
+  const activeCandidateIndex = candidateTabs.findIndex((view) => view.id === effectiveTab);
+  if (activeCandidateIndex >= prefixCount) {
+    // Keep the active view visible by replacing the last fitting tab after Overview.
+    visibleTabs =
+      visibleTabs.length === 1
+        ? [...visibleTabs, candidateTabs[activeCandidateIndex]]
+        : [...visibleTabs.slice(0, -1), candidateTabs[activeCandidateIndex]];
+  }
+  const visibleIds = new Set(visibleTabs.map((view) => view.id));
+  const menuViews = [
+    ...candidateTabs.filter((view) => !visibleIds.has(view.id)),
+    ...viewGroups.overflow.filter((view) => view.id !== promotedView?.id),
+  ];
 
   // Lazy-mount each live pane the first time it's viewed *while the pane is
   // open*, then keep it mounted for the life of the WorkPane (hidden via
@@ -229,37 +283,45 @@ export function WorkPane({
   }, [effectiveTab, open]);
 
   return (
-    <section
-      className="@container/workpane flex h-full min-h-0 flex-col bg-background"
-      aria-label="Work pane"
-    >
+    <section className="flex h-full min-h-0 flex-col bg-background" aria-label="Work pane">
       <header className="flex h-11 shrink-0 items-center justify-between gap-1 border-b px-1.5">
-        <div className="flex min-w-0 items-center gap-0.5">
-          {viewGroups.primary.map((view) => (
+        <div ref={stripRef} className="relative flex min-w-0 flex-1 items-center gap-0.5">
+          <div
+            ref={measurementRef}
+            className="pointer-events-none invisible absolute flex items-center gap-0.5"
+            aria-hidden
+          >
+            {candidateTabs.map((view) => (
+              <Button
+                key={view.id}
+                variant="ghost"
+                size="sm"
+                className={TAB_CLASS_NAME}
+                tabIndex={-1}
+              >
+                <view.icon />
+                <span>{view.label}</span>
+              </Button>
+            ))}
+            <Button variant="ghost" size="sm" className={TAB_CLASS_NAME} tabIndex={-1}>
+              <MoreHorizontal />
+            </Button>
+          </div>
+          {visibleTabs.map((view) => (
             <PaneTab
               key={view.id}
               view={view}
               active={view.id === effectiveTab}
               onSelect={onTabChange}
-              responsive={view.id !== "overview"}
             />
           ))}
-          {promotedView && <PaneTab view={promotedView} active onSelect={onTabChange} responsive />}
-          <div className="@max-[20rem]/workpane:hidden">
+          {menuViews.length > 0 && (
             <MoreViewsMenu
-              views={viewGroups.overflow}
-              activeTab={promotedView?.id ?? null}
+              views={menuViews}
+              activeTab={menuViews.some((view) => view.id === effectiveTab) ? effectiveTab : null}
               onSelect={onTabChange}
             />
-          </div>
-          <div className="hidden @max-[20rem]/workpane:block">
-            <MoreViewsMenu
-              views={compactMenuViews}
-              activeTab={effectiveTab === "overview" ? null : effectiveTab}
-              onSelect={onTabChange}
-              compact
-            />
-          </div>
+          )}
         </div>
 
         <div className="flex shrink-0 items-center gap-0.5 self-center">
