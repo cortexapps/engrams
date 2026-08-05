@@ -202,6 +202,14 @@ imageCmd
     return image.enable(clients(), o.uri, o.config, !o.wait, json);
   });
 imageCmd
+  .command("config")
+  .description("print an enabled image's live stored config as image-config TOML")
+  .requiredOption("--uri <uri>", "full OCI URI of an enabled image")
+  .action((o: { uri: string }) => {
+    const { clients, json } = ctx();
+    return image.config(clients(), o.uri, json);
+  });
+imageCmd
   .command("update")
   .description("edit an enabled image's config (full replace)")
   .requiredOption("--uri <uri>", "full OCI URI of an already-enabled image")

@@ -29,7 +29,6 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tls-parser.workspace = true
-nom.workspace = true
 socket2.workspace = true
 async-graphql-parser.workspace = true
 tokio.workspace = true
