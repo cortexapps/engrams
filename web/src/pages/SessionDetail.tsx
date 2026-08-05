@@ -13,6 +13,7 @@ import {
   Code2,
   GitPullRequestArrow,
   Globe,
+  ListTodo,
   Map,
   Pencil,
   SquareTerminal,
@@ -29,6 +30,7 @@ import { DeleteSessionButton } from "./sessions/DeleteSessionButton";
 import { WorkPane, type PaneTabId } from "../components/WorkPane";
 import { shortId, statusLabel } from "./sessions/session-format";
 import { useTasks } from "../hooks/useTasks";
+import { sessionHasAgentTasks } from "../components/session-thread/agentTasks";
 import { useIsMobile } from "../hooks/use-mobile";
 import { ProfileChip } from "../components/profiles/ProfileChip";
 import {
@@ -66,6 +68,7 @@ function readPanePref(): WorkPanePref {
       tab:
         p.tab === "browser" ||
         p.tab === "ide" ||
+        p.tab === "tasks" ||
         p.tab === "side-effects" ||
         p.tab === "diagnostics"
           ? p.tab
@@ -280,6 +283,10 @@ export function SessionDetail() {
     [events],
   );
 
+  // The Tasks tab appears once the agent has created a task (same gating as
+  // WorkPane's own strip).
+  const hasTasks = useMemo(() => sessionHasAgentTasks(events), [events]);
+
   // ADR 0107: the session is waiting on the user (a plan review or an
   // unanswered question) — the tab title picks up the ● prefix.
   const needsAttention = useMemo(() => {
@@ -305,6 +312,7 @@ export function SessionDetail() {
     ...(browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
     ...(ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
     ...(hasPlan ? [{ id: "plan", label: "Plan", icon: Map } as const] : []),
+    ...(hasTasks ? [{ id: "tasks", label: "Tasks", icon: ListTodo } as const] : []),
     { id: "side-effects", label: "Side effects", icon: GitPullRequestArrow },
     { id: "diagnostics", label: "Diagnostics", icon: Activity },
   ];

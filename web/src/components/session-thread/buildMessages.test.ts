@@ -9,6 +9,7 @@ import {
   buildMessages,
   FILE_CHANGE_TOOL,
   SHELL_TOOL,
+  TASK_TOOL,
   type FileChangeArgs,
   type RunFooter,
   type SystemMarker,
@@ -1618,6 +1619,73 @@ describe("buildMessages — ADR 0054 Flavor A file changes", () => {
     const edit = tps.find((p) => p.toolCallId === "tf")!;
     expect(edit.toolName).toBe("Edit");
     expect(edit.isError).toBe(true);
+  });
+});
+
+describe("buildMessages — agent task bookkeeping (TASK_TOOL swap)", () => {
+  const parts = (messages: ReturnType<typeof buildMessages>["messages"]) =>
+    real(messages).flatMap((m) =>
+      ((m.content as ReadonlyArray<{ type: string }>) ?? []).filter((p) => p.type === "tool-call"),
+    ) as Array<{ toolName?: string; toolCallId?: string; args?: Record<string, unknown> }>;
+
+  test("TaskCreate/TaskUpdate render as compact task parts with the resolved subject", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "tc",
+          tool_name: "TaskCreate",
+          args_summary: '{"subject":"Fix the bug","description":"…"}',
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "tc",
+          tool_name: "",
+          ok: true,
+          duration_ms: 1,
+          result_summary: "Task #1 created successfully: Fix the bug",
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "tu",
+          tool_name: "TaskUpdate",
+          // The update's own args carry only the id — the subject must come
+          // from the fold's correlation with the create result.
+          args_summary: '{"taskId":"1","status":"in_progress"}',
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "tu",
+          tool_name: "",
+          ok: true,
+          duration_ms: 1,
+          result_summary: "Updated task #1 status",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const tps = parts(messages);
+    expect(tps.some((p) => p.toolName === "TaskCreate")).toBe(false);
+    expect(tps.some((p) => p.toolName === "TaskUpdate")).toBe(false);
+    expect(tps.find((p) => p.toolCallId === "tc")).toMatchObject({
+      toolName: TASK_TOOL,
+      args: { action: "create", subject: "Fix the bug", status: null },
+    });
+    expect(tps.find((p) => p.toolCallId === "tu")).toMatchObject({
+      toolName: TASK_TOOL,
+      args: { action: "update", subject: "Fix the bug", status: "in_progress" },
+    });
   });
 });
 
