@@ -27,6 +27,16 @@ export const createProfile = ProfileService.method.createProfile;
 export const updateProfile = ProfileService.method.updateProfile;
 
 /**
+ * Boot a short-lived session from the profile's image, scan it for git
+ * checkouts (`.git` dirs and worktree `.git` files) and their remotes, and
+ * tear the session down. Admin-only; the caller picks which results to save
+ * onto `Profile.repos` via UpdateProfile.
+ *
+ * @generated from rpc engram.app.v1.ProfileService.DiscoverProfileRepos
+ */
+export const discoverProfileRepos = ProfileService.method.discoverProfileRepos;
+
+/**
  * Soft delete — sets deleted_at (ADR §4).
  *
  * @generated from rpc engram.app.v1.ProfileService.DeleteProfile

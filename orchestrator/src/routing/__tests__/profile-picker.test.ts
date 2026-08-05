@@ -23,6 +23,7 @@ const card = (id: string, name: string, over: Partial<ProfileCard> = {}): Profil
   id,
   name,
   description: `${name} profile`,
+  repos: [],
   skills: [],
   connectorProviders: [],
   allowHosts: [],

@@ -60,6 +60,7 @@ export async function seedReviewerProfile(
         integrationGrants: [capabilityGrant(PR_REVIEW_CAPABILITY, engramsConnection.id)],
         network: DEFAULT_PROFILE_NETWORK,
         secrets: [],
+        repos: [],
         portExposures: [],
       },
       PR_REVIEWER_DESIGNATION,

@@ -552,6 +552,22 @@ export interface ProfileIntegrationGrant {
   resourceConstraints: string[];
 }
 
+/** A parsed forge remote — enough to join against the GitHub integration. */
+export interface ProfileRepoRemote {
+  host: string; // e.g. "github.com"
+  owner: string;
+  name: string;
+}
+
+/** One git checkout inside the profile's image — explicit, user-controlled
+ * config (set by hand or via repo autodiscovery). The Slack routing picker
+ * feeds these into its capability cards. */
+export interface ProfileRepo {
+  path: string; // in-guest checkout path
+  remoteUrl: string; // primary remote URL as configured, "" if none
+  remote: ProfileRepoRemote | null; // parsed identity when the URL parses
+}
+
 /** Immutable non-secret connection configuration stamped onto a session. */
 export interface IntegrationConnectionSnapshot {
   id: string;
@@ -602,6 +618,9 @@ export const profile = pgTable(
     // compiled into the per-session SessionPolicy + consumed at boot in B2.
     network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
     secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
+    // Git repositories this profile's image contains — explicit, user-managed
+    // (by hand or via DiscoverProfileRepos). Fed to the routing picker's cards.
+    repos: jsonb("repos").$type<ProfileRepo[]>().notNull().default([]),
     // ADR 0064: guest ports auto-exposed (private) for every session from this
     // profile. The orchestrator mints one private port_exposure per declared port
     // at session create (best-effort). Empty = no auto-exposed ports.

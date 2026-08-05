@@ -162,6 +162,7 @@ const archived: ProfileRow = {
   harness: "claude", model: null, effort: null,
   includeUserTokens: false, envVars: { K: "V" }, skills: [], integrationGrants: [], createdAt: new Date(0), updatedAt: new Date(0),
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] }, secrets: [],
+  repos: [],
   portExposures: [],
   designation: null,
   deletedAt: new Date(0),
@@ -215,6 +216,63 @@ describe("ProfileService — auth + field filtering", () => {
         Code.InvalidArgument,
       );
     } finally { await s.close(); }
+  });
+
+  test("admin CreateProfile stores repos with a server-side remote parse", async () => {
+    const s = await spawn({ getSession: makeGetSession("a", "admin"), store: makeFakeStore(), images: fakeImages(["img-1"]) });
+    try {
+      const r = await s.client.createProfile({
+        name: "Repo", description: "", icon: "Bot", imageId: "img-1", harness: "claude",
+        includeUserTokens: false, envVars: {},
+        repos: [{ path: "/workspace/engrams", remoteUrl: "git@github.com:cortexapps/engrams.git" }],
+      });
+      expect(r.profile!.repos).toEqual([
+        {
+          $typeName: "engram.app.v1.ProfileRepo",
+          path: "/workspace/engrams",
+          remoteUrl: "git@github.com:cortexapps/engrams.git",
+          remote: {
+            $typeName: "engram.app.v1.ProfileRepoRemote",
+            host: "github.com", owner: "cortexapps", name: "engrams",
+          },
+        },
+      ]);
+    } finally { await s.close(); }
+  });
+
+  test("member DiscoverProfileRepos → PermissionDenied; admin gets mapped candidates", async () => {
+    const store = makeFakeStore([active]);
+    const discovered = [
+      {
+        path: "/workspace/engrams",
+        remotes: [
+          {
+            name: "origin",
+            url: "https://github.com/cortexapps/engrams.git",
+            parsed: { host: "github.com", owner: "cortexapps", name: "engrams" },
+          },
+        ],
+      },
+    ];
+    const member = await spawn({
+      getSession: makeGetSession("m"), store, images: fakeImages(["img-1"]),
+      discoverRepos: async () => discovered,
+    });
+    try {
+      await expectErr(member.client.discoverProfileRepos({ profileId: active.id }), Code.PermissionDenied);
+    } finally { await member.close(); }
+
+    const admin = await spawn({
+      getSession: makeGetSession("a", "admin"), store, images: fakeImages(["img-1"]),
+      discoverRepos: async () => discovered,
+    });
+    try {
+      await expectErr(admin.client.discoverProfileRepos({ profileId: "ghost" }), Code.NotFound);
+      const r = await admin.client.discoverProfileRepos({ profileId: active.id });
+      expect(r.repos).toHaveLength(1);
+      expect(r.repos[0].path).toBe("/workspace/engrams");
+      expect(r.repos[0].remotes[0].parsed?.owner).toBe("cortexapps");
+    } finally { await admin.close(); }
   });
 
   test("admin CreateProfile happy path returns archived=false + env_vars", async () => {

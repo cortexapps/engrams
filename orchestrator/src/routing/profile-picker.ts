@@ -62,6 +62,9 @@ export interface ProfileCard extends ProfileOption {
   allowHosts: string[];
   /** Env var NAMES only — values never leave the store. */
   envVarNames: string[];
+  /** Git checkouts in the image — "owner/name" when the remote parses, the
+   *  in-guest path otherwise. Strong routing signal ("which codebase"). */
+  repos: string[];
 }
 
 export type ProfilePick =
@@ -107,7 +110,7 @@ const pickSchema = z.object({
 
 const PICKER_SYSTEM_PROMPT = `You route an incoming Slack request to one of an organization's agent profiles. A profile is a workspace configuration: what tools, integrations, and network access its sessions get.
 
-You receive the Slack message (with thread context), a capability card for each profile, and two usage histograms: which profiles this channel and this user used recently.
+You receive the Slack message (with thread context), a capability card for each profile (its purpose, the git repositories its workspace contains, skills, integrations, and network reach), and two usage histograms: which profiles this channel and this user used recently.
 
 Weigh the evidence in this order:
 1. Match the message against the capability cards. When the message clearly belongs to one profile's described purpose, route there — even if the histograms favor another profile. History often predates newer profiles, so a strong content match on a low-history profile beats a high count elsewhere.
@@ -142,6 +145,7 @@ export function buildPickerPrompt(
         id: c.id,
         name: c.name,
         description: c.description,
+        repos: c.repos,
         skills: c.skills,
         integrations: c.connectorProviders,
         networkAllowHosts: c.allowHosts,
@@ -271,6 +275,9 @@ export function makeProfilePicker(deps: ProductionPickerDeps = {}): ProfilePicke
           id: r.id,
           name: r.name,
           description: r.description,
+          repos: r.repos.map((repo) =>
+            repo.remote ? `${repo.remote.owner}/${repo.remote.name}` : repo.path,
+          ),
           skills: r.skills,
           connectorProviders: [
             ...new Set(

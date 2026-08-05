@@ -256,6 +256,7 @@ function makeFakeProfiles(opts?: {
     integrationGrants: (opts?.capabilities ?? []).map(defaultGrant),
     network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
     secrets: [],
+    repos: [],
     portExposures: opts?.portExposures ?? [],
     designation: null,
     createdAt: new Date(0),

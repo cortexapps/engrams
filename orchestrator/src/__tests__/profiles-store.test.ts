@@ -21,6 +21,7 @@ const baseInput = {
   integrationGrants: [],
   network: { default: "deny" as const, allowHosts: [], allowHostPatterns: [] },
   secrets: [],
+  repos: [],
   portExposures: [],
 };
 
@@ -116,6 +117,7 @@ describe("ProfileStore", () => {
       ],
       network: { default: "deny" as const, allowHosts: [], allowHostPatterns: [] },
       secrets: [],
+      repos: [],
       portExposures: [3000, 8080],
     };
     const created = await store.create(input);
