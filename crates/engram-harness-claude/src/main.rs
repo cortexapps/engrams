@@ -1048,7 +1048,17 @@ mod adapter {
                 // across the process boundary.
                 let tracker = StateDir::from_env().claude_bash_cwd();
                 let cwd = tracked_bash_cwd(&tracker);
-                println!("{}", bash_allow_output(&tool_input, &cwd, &tracker));
+                let tool_use_id = v.get("tool_use_id").and_then(|s| s.as_str()).unwrap_or("");
+                println!(
+                    "{}",
+                    bash_allow_output(
+                        &tool_input,
+                        &cwd,
+                        &tracker,
+                        tool_use_id,
+                        Path::new(BASH_TAIL_DIR),
+                    )
+                );
                 return std::process::ExitCode::SUCCESS;
             }
 
@@ -1215,6 +1225,27 @@ mod adapter {
                 .unwrap_or_else(|| PathBuf::from("/workspace"))
         }
 
+        /// Directory where every Bash tool call leaves a `<tool_use_id>.log`
+        /// (combined stdout+stderr) and `<tool_use_id>.pid` (a tee pid —
+        /// alive while ANY writer, including orphaned background children,
+        /// still holds the command's output). The web UI derives the same
+        /// paths from the event's `tool_call_id` to tail a running command
+        /// over the shell channel — the string is a contract, change both
+        /// together.
+        pub(super) const BASH_TAIL_DIR: &str = "/tmp/engram-bash";
+
+        /// The tool_use_id reduced to filename-safe characters, so generated
+        /// shell text can never smuggle quoting past `shell_quote_str`. Empty
+        /// (or fully filtered) ids disable teeing for that call.
+        fn tail_file_id(tool_use_id: &str) -> Option<String> {
+            let id: String = tool_use_id
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                .take(128)
+                .collect();
+            (!id.is_empty()).then_some(id)
+        }
+
         /// Return Claude's PreToolUse `allow` response with a Bash command
         /// rooted in the harness-owned logical cwd. Foreground calls record
         /// their final physical cwd on normal return and retain an EXIT-trap
@@ -1222,10 +1253,19 @@ mod adapter {
         /// the normal path means a command's own EXIT trap cannot suppress cwd
         /// continuity. Background calls inherit the snapshot but cannot race
         /// to move the foreground session later.
+        ///
+        /// When `tool_use_id` is known, the wrapper first records `$$` in a
+        /// pidfile and tees stdout/stderr (kept separate for the tool result)
+        /// into one append-mode log under `tail_dir`, so the web UI can tail
+        /// a live command. Redirections never change exit status, so the cwd
+        /// and status machinery below is unaffected. The block is fully
+        /// guarded: an unwritable `tail_dir` degrades to no teeing.
         pub(super) fn bash_allow_output(
             tool_input: &serde_json::Value,
             cwd: &Path,
             tracker: &Path,
+            tool_use_id: &str,
+            tail_dir: &Path,
         ) -> serde_json::Value {
             let mut updated_input = tool_input.clone();
             let Some(map) = updated_input.as_object_mut() else {
@@ -1244,7 +1284,30 @@ mod adapter {
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
 
-            let mut wrapped = format!("cd -- {} && {{\n", shell_quote(cwd));
+            let mut wrapped = String::new();
+            if let Some(tail_id) = tail_file_id(tool_use_id) {
+                let dir = shell_quote(tail_dir);
+                let log = shell_quote(&tail_dir.join(format!("{tail_id}.log")));
+                let pid = shell_quote(&tail_dir.join(format!("{tail_id}.pid")));
+                // ponytail: logs are unbounded (they mirror what claude
+                // already reads) and pruned by age only; add a size cap in
+                // the tee pipeline if a runaway command ever fills the disk.
+                //
+                // The pidfile records the LAST tee ($! after the exec, i.e.
+                // the stderr one), not the shell ($$). The tees live exactly
+                // as long as anything still holds the command's output — the
+                // shell OR a background child it orphaned (`perl x.pl &`) —
+                // so the web's `tail --pid` follows orphans live and exits
+                // when the last writer is gone, not when the shell exits.
+                wrapped.push_str(&format!(
+                    "if mkdir -p -- {dir} 2>/dev/null; then\n\
+                     find {dir} -type f -mmin +720 -delete 2>/dev/null\n\
+                     exec > >(tee -a -- {log}) 2> >(tee -a -- {log} >&2)\n\
+                     printf '%s\\n' \"$!\" >| {pid}\n\
+                     fi\n"
+                ));
+            }
+            wrapped.push_str(&format!("cd -- {} && {{\n", shell_quote(cwd)));
             let record_cwd = format!("pwd -P >| {}", shell_quote(tracker));
             if !background {
                 wrapped.push_str(&format!("trap {} EXIT\n", shell_quote_str(&record_cwd)));
@@ -6767,27 +6830,54 @@ mod adapter {
                 "description": "exercise cwd",
                 "timeout": 1234,
             });
-            let output = hook_bridge::bash_allow_output(&foreground, cwd, tracker);
+            let tail_dir = Path::new("/tmp/engram-bash");
+            let output =
+                hook_bridge::bash_allow_output(&foreground, cwd, tracker, "toolu_01AB", tail_dir);
             let updated = &output["hookSpecificOutput"]["updatedInput"];
             let command = updated["command"].as_str().unwrap();
             assert_eq!(updated["description"], "exercise cwd");
             assert_eq!(updated["timeout"], 1234);
-            assert!(command.starts_with("cd -- '/workspace/repo with '\"'\"'quote'\"'\"'' && {\n"));
+            assert!(command.starts_with("if mkdir -p -- '/tmp/engram-bash'"));
+            assert!(command.contains("printf '%s\\n' \"$!\" >| '/tmp/engram-bash/toolu_01AB.pid'"));
+            assert!(command.contains("exec > >(tee -a -- '/tmp/engram-bash/toolu_01AB.log')"));
+            assert!(command.contains("cd -- '/workspace/repo with '\"'\"'quote'\"'\"'' && {\n"));
             assert!(command.contains("trap "));
             assert!(command.contains("pwd -P >| "));
             assert!(command.contains("/workspace/.engrams/bash-cwd"));
             assert!(command.contains("cd nested && false\n__engrams_bash_status=$?\n"));
             assert!(command.ends_with("exit \"$__engrams_bash_status\"\n}"));
 
+            // A missing tool_use_id (and one that sanitizes to nothing) must
+            // disable teeing, not emit a wrapper with an empty filename.
+            for hostile in ["", "$(rm -rf /)'"] {
+                let output =
+                    hook_bridge::bash_allow_output(&foreground, cwd, tracker, hostile, tail_dir);
+                let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+                    .as_str()
+                    .unwrap();
+                if hostile.is_empty() {
+                    assert!(command.starts_with("cd -- "), "no tee block: {command}");
+                } else {
+                    // Hostile chars are filtered, survivors ("rmrf") name the file.
+                    assert!(!command.contains("$("), "quoting must be inert: {command}");
+                }
+                assert!(!command.contains("''.log"), "empty filename: {command}");
+            }
+
             let background = serde_json::json!({
                 "command": "pwd",
                 "run_in_background": true,
             });
-            let output = hook_bridge::bash_allow_output(&background, cwd, tracker);
+            let output =
+                hook_bridge::bash_allow_output(&background, cwd, tracker, "toolu_01AB", tail_dir);
             let command = output["hookSpecificOutput"]["updatedInput"]["command"]
                 .as_str()
                 .unwrap();
-            assert!(command.starts_with("cd -- "));
+            assert!(command.starts_with("if mkdir -p -- "));
+            assert!(
+                command.contains("tee -a "),
+                "background calls tee too: {command}"
+            );
             assert!(!command.contains("trap "));
             assert!(!command.contains("bash-cwd"));
         }
@@ -6818,7 +6908,7 @@ mod adapter {
 
             let run = |input: serde_json::Value| {
                 let cwd = hook_bridge::tracked_bash_cwd(&tracker);
-                let output = hook_bridge::bash_allow_output(&input, &cwd, &tracker);
+                let output = hook_bridge::bash_allow_output(&input, &cwd, &tracker, "", &base);
                 let command = output["hookSpecificOutput"]["updatedInput"]["command"]
                     .as_str()
                     .unwrap();
@@ -6883,7 +6973,7 @@ mod adapter {
                     marker.display()
                 ),
             });
-            let output = hook_bridge::bash_allow_output(&input, &base, &tracker);
+            let output = hook_bridge::bash_allow_output(&input, &base, &tracker, "", &base);
             let command = output["hookSpecificOutput"]["updatedInput"]["command"]
                 .as_str()
                 .unwrap();
@@ -6900,6 +6990,89 @@ mod adapter {
                 child.to_string_lossy(),
                 "the command's EXIT trap must not suppress cwd persistence"
             );
+
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+
+        #[test]
+        fn bash_hook_tees_output_and_records_pid_without_changing_the_result() {
+            let base =
+                std::env::temp_dir().join(format!("engram-bash-tail-{}", uuid::Uuid::new_v4()));
+            let tail_dir = base.join("tail");
+            let tracker = base.join("bash-cwd");
+            std::fs::create_dir_all(&base).unwrap();
+
+            let input = serde_json::json!({
+                "command": "echo out-line; echo err-line >&2; exit 7",
+            });
+            let output =
+                hook_bridge::bash_allow_output(&input, &base, &tracker, "toolu_tail", &tail_dir);
+            let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+                .as_str()
+                .unwrap();
+            let result = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(command)
+                .output()
+                .unwrap();
+
+            // The tool result the CLI sees is unchanged: streams stay
+            // separate and the exit status survives the redirections.
+            assert_eq!(result.status.code(), Some(7));
+            assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "out-line");
+            assert_eq!(String::from_utf8_lossy(&result.stderr).trim(), "err-line");
+
+            // Both streams land in the combined log; the pidfile holds a tee
+            // pid. tee may outlive the shell by a flush, so poll briefly
+            // rather than assert instantly.
+            let log = tail_dir.join("toolu_tail.log");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                if text.contains("out-line") && text.contains("err-line") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "log never filled: {text:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let pid: String = std::fs::read_to_string(tail_dir.join("toolu_tail.pid")).unwrap();
+            assert!(pid.trim().parse::<u32>().is_ok(), "pidfile: {pid:?}");
+
+            // A background child orphaned by the shell keeps the tee alive
+            // and its late output still lands in the log — the property that
+            // lets the web tail a `perl x.pl &` after the tool call returns.
+            let input = serde_json::json!({
+                "command": "( sleep 0.2; echo late-line ) & exit 0",
+            });
+            let output =
+                hook_bridge::bash_allow_output(&input, &base, &tracker, "toolu_orphan", &tail_dir);
+            let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+                .as_str()
+                .unwrap();
+            let result = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(command)
+                .output()
+                .unwrap();
+            assert_eq!(result.status.code(), Some(0));
+            let log = tail_dir.join("toolu_orphan.log");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .contains("late-line")
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "orphan output never landed in the log"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
 
             std::fs::remove_dir_all(&base).unwrap();
         }
