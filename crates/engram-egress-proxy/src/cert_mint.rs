@@ -73,18 +73,15 @@ impl CertMint {
 
         let leaf_kp =
             KeyPair::generate().map_err(|e| MintError::Rcgen(format!("leaf keygen: {e}")))?;
-        // Reload the CA's certificate from its persisted PEM. The CA
-        // keeps its KeyPair + Params (regenerable cert), but rcgen's
-        // sign API takes a `&Certificate` value, not `&Params` — so
-        // we materialize the CA cert here. This is cheap.
-        let ca_cert = self
+        // Derive the issuer from the CA's persisted PEM — the same bytes the
+        // guest trusts — so the leaf's issuer DN always matches the delivered
+        // cert's subject DN. Cheap: one PEM parse, no signing.
+        let issuer = self
             .ca
-            .params
-            .clone()
-            .self_signed(&self.ca.key_pair)
-            .map_err(|e| MintError::Rcgen(format!("ca self-sign for issuer: {e}")))?;
+            .issuer()
+            .map_err(|e| MintError::Rcgen(format!("ca issuer: {e}")))?;
         let leaf = params
-            .signed_by(&leaf_kp, &ca_cert, &self.ca.key_pair)
+            .signed_by(&leaf_kp, &issuer)
             .map_err(|e| MintError::Rcgen(format!("leaf sign: {e}")))?;
 
         let leaf_der = leaf.der().to_vec();
