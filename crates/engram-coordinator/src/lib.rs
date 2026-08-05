@@ -400,11 +400,11 @@ pub async fn run_with_registry_and_local(
         let grpc_listener = tokio::net::TcpListener::bind(cfg.app_grpc_addr)
             .await
             .map_err(CoordinatorError::Io)?;
+        // tonic 0.14: `from_listener(listener, nodelay, keepalive)` became an
+        // infallible `From` + builder setters. Same settings as before:
+        // nodelay on, keepalive at the default (None).
         let incoming =
-            tonic::transport::server::TcpIncoming::from_listener(grpc_listener, true, None)
-                .map_err(|e| {
-                    CoordinatorError::Config(format!("app gRPC listener setup failed: {e}"))
-                })?;
+            tonic::transport::server::TcpIncoming::from(grpc_listener).with_nodelay(Some(true));
         tracing::info!(addr = %cfg.app_grpc_addr, "app gRPC server listening");
         let serve = grpc_app::server(state.clone())
             .serve_with_incoming_shutdown(incoming, shutdown_signal());

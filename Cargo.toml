@@ -155,14 +155,22 @@ tokio-tungstenite = { version = "0.21", default-features = false, features = ["c
 # validation and the forward-auth signed-assertion (GCP IAP etc.) path.
 jsonwebtoken = "9"
 
-# grpc
-tonic = "0.12"
-tonic-build = "0.12"
+# grpc — the tonic/prost family is version-locked to itself (0.14
+# codegen only compiles against the 0.14 runtime + derives), so
+# Dependabot moves it as one group (`grpc` in dependabot.yml).
+# tonic 0.14 split prost support out of the core crates: tonic-prost
+# is the runtime codec the generated code references, and
+# tonic-prost-build owns `configure()`/`compile_protos()` (tonic-build
+# alone no longer generates prost bindings, so we no longer depend on
+# it directly).
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
 # gRPC server reflection for the coordinator's network-private app-gRPC
-# surface (grpcurl introspection). v0.12 matches the tonic 0.12 line.
-tonic-reflection = "0.12"
-prost = "0.13"
-prost-types = "0.13"
+# surface (grpcurl introspection). v0.14 matches the tonic 0.14 line.
+tonic-reflection = "0.14"
+prost = "0.14"
+prost-types = "0.14"
 
 # data
 serde = { version = "1", features = ["derive"] }

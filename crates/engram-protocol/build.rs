@@ -8,7 +8,7 @@
 //!   (ADR 0051 §3) and the coordinator must not accrete task concepts.
 //!
 //! Reruns the codegen only when the proto files themselves change — the
-//! `tonic-build` defaults already do this via cargo's
+//! `tonic-prost-build` defaults already do this via cargo's
 //! `rerun-if-changed` directive on the protos we pass.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // loaded back via `include_bytes!` in `src/app.rs`.
     let descriptor_path =
         std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("engram_app_descriptor.bin");
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
         .file_descriptor_set_path(&descriptor_path)
