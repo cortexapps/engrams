@@ -66,7 +66,14 @@ export const task = pgTable("task", {
   effort: text("effort"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
-});
+},
+(t) => [
+  // The profile picker's channel histogram: last-N Slack tasks per (team,
+  // channel), newest first.
+  index("task_slack_channel_created_idx")
+    .on(sql`(source->>'team')`, sql`(source->>'channel')`, t.createdAt.desc())
+    .where(sql`source->>'provider' = 'slack'`),
+]);
 
 export const taskSession = pgTable(
   "task_session",
@@ -595,10 +602,6 @@ export const profile = pgTable(
     // compiled into the per-session SessionPolicy + consumed at boot in B2.
     network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
     secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
-    // ADR 0060: the org's default profile — a trigger (no UI to pick one) launches
-    // its session with this. At most one active default; the store clears the
-    // prior when one is set.
-    isDefault: boolean("is_default").notNull().default(false),
     // ADR 0064: guest ports auto-exposed (private) for every session from this
     // profile. The orchestrator mints one private port_exposure per declared port
     // at session create (best-effort). Empty = no auto-exposed ports.

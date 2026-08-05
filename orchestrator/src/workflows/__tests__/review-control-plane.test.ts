@@ -168,7 +168,6 @@ const reviewerProfile = (id: string): ProfileRow => ({
   }],
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
-  isDefault: false,
   portExposures: [],
   designation: "pr_reviewer",
   createdAt: new Date(0),

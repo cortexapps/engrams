@@ -32,7 +32,6 @@ const profileRow = (): ProfileRow => ({
   integrationGrants: [],
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
-  isDefault: true,
   portExposures: [],
   designation: null,
   createdAt: new Date(0),
@@ -43,8 +42,15 @@ const profileRow = (): ProfileRow => ({
 const fakeProfiles = (): ProfileStore =>
   ({
     getActive: async (id: string) => (id === "default-profile" ? profileRow() : null),
-    getDefault: async () => profileRow(),
   }) as unknown as ProfileStore;
+
+/** A scripted picker — production wiring is exercised by the picker's own tests. */
+const fakePicker = () => ({
+  pick: async () => ({
+    decision: "route" as const,
+    profile: { id: "default-profile", name: "Default", description: "" },
+  }),
+});
 
 const fakeImages = (): ImagesClient =>
   ({ listEnabledImages: async () => ({ images: [{ id: "img-1", imageUri: "uri-1" }] }) }) as unknown as ImagesClient;
@@ -81,6 +87,7 @@ describe("makeThreadControlPlane", () => {
 
     const cp = makeThreadControlPlane({
       profiles: fakeProfiles(),
+      picker: fakePicker(),
       images: fakeImages(),
       connectors: { list: async () => [] },
       harnessCatalog: fakeHarnessCatalog(),
@@ -123,10 +130,11 @@ describe("makeThreadControlPlane", () => {
     expect(started.webUrl).toContain("/sessions/sess-1");
   });
 
-  test("getDefaultProfile + resolveUser delegate to their seams", async () => {
+  test("pickProfile + resolveUser delegate to their seams", async () => {
     const completed: unknown[][] = [];
     const cp = makeThreadControlPlane({
       profiles: fakeProfiles(),
+      picker: fakePicker(),
       images: fakeImages(),
       connectors: { list: async () => [] },
       harnessCatalog: fakeHarnessCatalog(),
@@ -143,7 +151,16 @@ describe("makeThreadControlPlane", () => {
       },
     });
 
-    expect((await cp.getDefaultProfile())?.id).toBe("default-profile");
+    const pick = await cp.pickProfile({
+      team: "T1",
+      channel: "C1",
+      ownerUserId: "user-7",
+      prompt: "hello",
+    });
+    expect(pick).toEqual({
+      decision: "route",
+      profile: { id: "default-profile", name: "Default", description: "" },
+    });
     expect(await cp.resolveUser("slack", "U1")).toBe("user-7");
     await cp.completeToolCall("s", "tc", { "Ship?": ["Yes"] });
     expect(completed).toEqual([["s", "tc", { "Ship?": ["Yes"] }]]);

@@ -22,6 +22,8 @@ import {
   buildAssetLine,
   buildClosingBlocks,
   buildMessageBlocks,
+  buildProfilePickerBlocks,
+  buildProfileChosenBlocks,
 } from "./slack-blocks.ts";
 import { summarizeAsset, type CommunicationPolicy, type StartedSession } from "../workflows/communication-policy.ts";
 import type { SourceMention } from "../workflows/thread-inbox.ts";
@@ -277,6 +279,28 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
     systemPromptAppend: SYSTEM_PROMPT_APPEND,
 
     onPickup: (m) => react(m, "eyes"),
+
+    async onProfileChoice(m, options) {
+      log.info(
+        { channel: m.channel, thread: m.threadRoot, options: options.length },
+        "slack: asking the user to pick a profile",
+      );
+      // The mentioning user (m.user) is the only one whose pick is accepted;
+      // the mention's eventId dedupes the ask (first selection wins).
+      const blocks = buildProfilePickerBlocks(route(m), m.user, m.eventId, options);
+      return post(m, "Which profile should handle this?", blocks);
+    },
+
+    async onProfileChosen(m, ref, profileName) {
+      const text = `Running with ${profileName}`;
+      const blocks = buildProfileChosenBlocks(profileName);
+      if (ref) {
+        const c = await getClient();
+        await c.chat.update({ channel: m.channel, ts: ref, text, blocks });
+      } else {
+        await post(m, text, blocks);
+      }
+    },
 
     async onStarted(m, session) {
       log.info({ channel: m.channel, thread: m.threadRoot, sessionId: session.id }, "slack: session started");

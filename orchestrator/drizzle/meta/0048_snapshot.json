@@ -1,6 +1,6 @@
 {
-  "id": "7c7ea1f8-c1a9-4514-8628-f40d934f46ae",
-  "prevId": "59b0d63b-a80e-458d-9d03-ddc25cf49bf1",
+  "id": "a8eaaa6a-99a4-4864-b6cb-58f395b8fe97",
+  "prevId": "7c7ea1f8-c1a9-4514-8628-f40d934f46ae",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -3159,6 +3159,24 @@
         },
         "workflow_run_id": {
           "name": "workflow_run_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "harness": {
+          "name": "harness",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "model": {
+          "name": "model",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "effort": {
+          "name": "effort",
           "type": "text",
           "primaryKey": false,
           "notNull": false

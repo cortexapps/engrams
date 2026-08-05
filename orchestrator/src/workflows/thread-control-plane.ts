@@ -34,6 +34,7 @@ import { resolveEngramsUser } from "../integrations/slack-identity.ts";
 import type { CustomConnectorSource } from "../connectors/registry.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
 import { config } from "../config.ts";
+import { makeProfilePicker, type ProfilePicker } from "../routing/profile-picker.ts";
 import type { ThreadControlPlane } from "./slack-thread.ts";
 import { tools as defaultToolRegistry, type ToolRegistry } from "../tools/registry.ts";
 
@@ -56,6 +57,8 @@ export interface ThreadControlPlaneDeps {
   sessions?: ThreadSessionsClient;
   toolRegistry?: Pick<ToolRegistry, "complete">;
   resolveUser?: (provider: string, externalUserId: string) => Promise<string | null>;
+  /** The routing decision (LLM over capability cards + histograms). */
+  picker?: ProfilePicker;
   /** The Drizzle DB the task-persist transaction runs on. Default = the pool. */
   db?: Db;
   /** Injected session IDs keep the pre-boot authorization snapshot deterministic in tests. */
@@ -74,10 +77,11 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
   const toolRegistry = deps.toolRegistry ?? defaultToolRegistry;
   const resolveUser = deps.resolveUser ?? resolveEngramsUser;
   const db = deps.db ?? getDb();
+  const picker = deps.picker ?? makeProfilePicker({ profiles });
 
   return {
     resolveUser: (provider, externalUserId) => resolveUser(provider, externalUserId),
-    getDefaultProfile: () => profiles.getDefault(),
+    pickProfile: (input) => picker.pick(input),
 
     async createTask(input) {
       const { sessionId } = await createTaskWithSession(
