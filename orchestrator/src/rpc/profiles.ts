@@ -120,9 +120,6 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     // live in the org store, never here), so they're member-visible like skills.
     network: row.network,
     secrets: row.secrets,
-    // ADR 0060: the org default profile (member-visible — describes selection,
-    // not a secret).
-    isDefault: row.isDefault,
     // ADR 0062/0063: default harness/model/effort — member-visible (they
     // describe a selection, not a secret).
     harness: row.harness ?? undefined,
@@ -420,7 +417,6 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         integrationGrants,
         network,
         secrets,
-        isDefault: req.isDefault,
         harness,
         model,
         effort,
@@ -468,7 +464,6 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         integrationGrants,
         network,
         secrets,
-        isDefault: req.isDefault,
         harness,
         model,
         effort,

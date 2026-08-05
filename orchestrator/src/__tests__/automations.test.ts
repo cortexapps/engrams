@@ -43,7 +43,6 @@ const profile = (portExposures: number[] = []): ProfileRow => ({
   integrationGrants: [],
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
-  isDefault: false,
   portExposures,
   designation: null,
   createdAt: NOW,

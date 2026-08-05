@@ -9,14 +9,17 @@
  * real Slack policy + control-plane client; tests inject fakes).
  *
  * Shape: the first `recv` is the initial @mention; ack pickup, resolve the
- * engrams user (unlinked → fail), pick the org default profile, gather the
- * thread into a prompt, create the task (carrying the policy's constant system
- * prompt), ack started, bind the session listener, then a single recv
- * loop multiplexes session events ∪ trigger events off `THREAD_TOPIC`:
+ * engrams user (unlinked → fail), gather the thread into a prompt, PICK the
+ * profile (an LLM routes on capability cards + usage histograms; `ask_user`
+ * renders a dropdown and waits durably for `trigger_profile_choice`), create
+ * the task (carrying the policy's constant system prompt), ack started, bind
+ * the session listener, then a single recv loop multiplexes session events ∪
+ * trigger events off `THREAD_TOPIC`:
  *   - session_event   → route to the policy (question/answer-update/asset)
  *   - session_terminal → closing summary (ok) or failure, then exit
  *   - trigger_mention  → gather NEW context, SendPrompt (idempotent prompt_id)
  *   - trigger_answer   → CompleteToolCall (generic); legacy cards get an upgrade notice
+ *   - trigger_profile_choice → resolves a pending profile ask (ignored once live)
  *
  * `questionTs` (tool_call_id → posted-question ref) is plain workflow-local
  * state: it is rebuilt deterministically on replay from the checkpointed
@@ -35,6 +38,7 @@ import {
   type StartedSession,
 } from "./communication-policy.ts";
 import { THREAD_TOPIC, type ThreadInbox, type SourceMention } from "./thread-inbox.ts";
+import type { PickInput, ProfileOption, ProfilePick } from "../routing/profile-picker.ts";
 
 const log = rootLog.child({ component: "slack" });
 
@@ -55,8 +59,9 @@ export interface CreateTaskInput {
 export interface ThreadControlPlane {
   /** Map a provider user to an engrams user id (email match); null = unlinked. */
   resolveUser(provider: string, externalUserId: string): Promise<string | null>;
-  /** The org's `is_default` profile, or null if none is configured. */
-  getDefaultProfile(): Promise<{ id: string } | null>;
+  /** Route the mention to a profile (LLM over capability cards + histograms).
+   *  `ask_user` carries the ranked dropdown options; `none` = no profiles. */
+  pickProfile(input: PickInput): Promise<ProfilePick>;
   /** Create the task (and its primary session) the thread drives — the same
    *  create path as a UI chat task; never a bare session (ADR 0060). */
   createTask(input: CreateTaskInput): Promise<StartedSession>;
@@ -96,8 +101,7 @@ const RECV_TIMEOUT_S = 3_600;
 
 const NO_USER_MSG =
   "You don't have a user in engrams — log in first, then try again.";
-const NO_PROFILE_MSG =
-  "No default profile is configured — set one in engrams first.";
+const NO_PROFILES_MSG = "No profiles are configured — create one in engrams first.";
 const CREATE_FAIL_MSG = "Couldn't start a session for this request.";
 const SESSION_FAILED_MSG = "The session ended in failure.";
 // A neutral close: the sandbox was reclaimed (host roll / `host_lost` / dev-stack
@@ -137,22 +141,61 @@ async function slackThreadWorkflowImpl(): Promise<void> {
 
   // Everything up to (and including) the session create is FATAL-on-failure:
   // there is no session to keep alive yet, so any throw — or an unresolved user
-  // / missing default profile — ends the thread with an actionable ❌. (A throw
+  // / zero configured profiles — ends the thread with an actionable ❌. (A throw
   // here used to escape the workflow uncaught, leaving only the 👀 and silence.)
+  // `mention` is the mention driving the pre-session phase — it advances if new
+  // mentions arrive while a profile ask is pending.
   let session: StartedSession;
+  let mention = m;
   let ctx0: { prompt: string; maxTs: string };
   try {
-    const userId = await step(() => cp.resolveUser("slack", m.user), "resolveUser");
+    const userId = await step(() => cp.resolveUser("slack", mention.user), "resolveUser");
     if (!userId) {
-      await step(() => pol.onFail(m, NO_USER_MSG), "onFail");
+      await step(() => pol.onFail(mention, NO_USER_MSG), "onFail");
       return;
     }
-    const profile = await step(() => cp.getDefaultProfile(), "getDefaultProfile");
-    if (!profile) {
-      await step(() => pol.onFail(m, NO_PROFILE_MSG), "onFail");
+    ctx0 = await step(() => pol.gatherThreadContext(mention, null), "gatherThreadContext");
+    const pickInput = (prompt: string): PickInput => ({
+      team: m.team,
+      channel: m.channel,
+      ownerUserId: userId,
+      prompt,
+    });
+    let pick = await step(() => cp.pickProfile(pickInput(ctx0.prompt)), "pickProfile");
+    if (pick.decision === "none") {
+      await step(() => pol.onFail(mention, NO_PROFILES_MSG), "onFail");
       return;
     }
-    ctx0 = await step(() => pol.gatherThreadContext(m, null), "gatherThreadContext");
+    let profile: ProfileOption;
+    if (pick.decision === "route") {
+      profile = pick.profile;
+    } else {
+      // ask_user: post the dropdown and wait durably — a human decision was
+      // requested (explicitly, or the model abstained), so there is no
+      // auto-start timeout. A new mention while waiting re-evaluates (the
+      // extra context may be decisive); a decisive re-pick resolves the ask.
+      let options = pick.options;
+      const pickerRef = await step(() => pol.onProfileChoice(mention, options), "onProfileChoice");
+      let chosen: ProfileOption | undefined;
+      while (!chosen) {
+        const msg = await DBOS.recv<ThreadInbox>(THREAD_TOPIC, RECV_TIMEOUT_S);
+        if (msg === null) continue; // idle — keep waiting for the pick
+        if (msg.kind === "trigger_profile_choice") {
+          // Accept only an offered option — a stale/foreign id is ignored.
+          chosen = options.find((o) => o.id === msg.choice.profileId);
+        } else if (msg.kind === "trigger_mention") {
+          await step(() => pol.onPickup(msg.mention), "onPickup").catch(() => {});
+          mention = msg.mention;
+          ctx0 = await step(() => pol.gatherThreadContext(mention, null), "gatherThreadContext");
+          const re = await step(() => cp.pickProfile(pickInput(ctx0.prompt)), "pickProfile");
+          if (re.decision === "route") chosen = re.profile;
+          else if (re.decision === "ask_user") options = re.options;
+        }
+        // session_* / trigger_answer: impossible before a session exists — drop.
+      }
+      await step(() => pol.onProfileChosen(mention, pickerRef, chosen.name), "onProfileChosen");
+      profile = chosen;
+    }
     session = await step(
       () =>
         cp.createTask({
@@ -174,11 +217,11 @@ async function slackThreadWorkflowImpl(): Promise<void> {
     // Surface WHY it failed — this path used to swallow the cause, leaving only
     // the generic "Couldn't start a session" with no way to diagnose.
     log.error({ channel: m.channel, thread: m.threadRoot, err }, "slack: failed to start session");
-    await step(() => pol.onFail(m, CREATE_FAIL_MSG), "onFail");
+    await step(() => pol.onFail(mention, CREATE_FAIL_MSG), "onFail");
     return;
   }
 
-  await step(() => pol.onStarted(m, session), "onStarted");
+  await step(() => pol.onStarted(mention, session), "onStarted");
 
   // 2) Drain loop — one recv multiplexes session events ∪ trigger events.
   // `st` is plain workflow-local render state, rebuilt deterministically on
@@ -192,7 +235,7 @@ async function slackThreadWorkflowImpl(): Promise<void> {
     assets: [],
     bubble: null,
     lastAssistantText: null,
-    currentMention: m,
+    currentMention: mention,
   };
   let lastTs = ctx0.maxTs;
 
@@ -287,6 +330,10 @@ export async function handleInbound(
         return lastTs; // cursor unchanged: those messages were NOT delivered
       }
     }
+    case "trigger_profile_choice":
+      // The session is already live — the routing decision was made; a late
+      // dropdown click has nothing left to resolve.
+      return lastTs;
     case "trigger_answer": {
       const via = st.questionProtocols.get(msg.answer.toolCallId) ?? "legacy";
       if (via === "legacy") {

@@ -85,7 +85,6 @@ function profileRow(overrides: Partial<ProfileRow> = {}): ProfileRow {
     integrationGrants: [],
     network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
     secrets: [],
-    isDefault: false,
     portExposures: [],
     designation: null,
     createdAt: new Date(0),
@@ -107,9 +106,6 @@ function makeProfiles(seed: ProfileRow[]): ProfileStore {
     async getActive(id) {
       const row = rows.get(id);
       return row && row.deletedAt == null ? row : null;
-    },
-    async getDefault() {
-      return [...rows.values()].find((row) => row.isDefault && row.deletedAt == null) ?? null;
     },
     async getByDesignation(designation) {
       return [...rows.values()].find((row) => row.designation === designation && row.deletedAt == null) ?? null;
