@@ -652,6 +652,29 @@ impl DirtyFileTier {
         ))
     }
 
+    /// Ranged sibling of [`Self::read_overlay_chunk`]: pread exactly
+    /// `intra..intra+take` from the newest overlay holding the chunk.
+    /// Sound because overlay presence is whole-chunk by construction —
+    /// the write path materializes the full base chunk before patching
+    /// (and recovery punches partial extents, #996), so every byte of a
+    /// present chunk is real data.
+    fn read_overlay_range(
+        &self,
+        chunk_idx: usize,
+        intra: usize,
+        take: usize,
+        chunk_size: u64,
+    ) -> Option<std::io::Result<Bytes>> {
+        let source = if self.active.set.contains(&chunk_idx) {
+            &self.active
+        } else {
+            self.newest_frozen_with(chunk_idx)?
+        };
+        let mut bytes = vec![0u8; take];
+        let offset = chunk_idx as u64 * chunk_size + intra as u64;
+        Some(read_exact_at(&source.file, &mut bytes, offset).map(|()| Bytes::from(bytes)))
+    }
+
     /// Read one chunk from the frozen overlays (the flush-upload
     /// path): the NEWEST generation holding it wins — an older
     /// generation's copy is superseded data.
@@ -1654,25 +1677,29 @@ impl ChunkedDiskBackend {
         // trips a higher-ranked-lifetime `Send` error in the spawned handler.
         let fetches: Vec<_> = descriptors
             .iter()
-            .map(|&(chunk_idx, read_len, _, _)| self.read_chunk(chunk_idx, read_len))
+            .map(|&(chunk_idx, read_len, intra, take)| {
+                self.read_chunk_range(chunk_idx, read_len, intra, take)
+            })
             .collect();
         let fetched: Vec<Bytes> = stream::iter(fetches)
             .buffered(DISK_READ_FETCH_CONCURRENCY)
             .try_collect()
             .await?;
 
+        // Each ranged fetch returns exactly `take` bytes (the range paths
+        // pread that many; the whole-chunk fallbacks slice before
+        // returning), so reassembly is pure concatenation.
         let mut out = Vec::with_capacity(length as usize);
-        for (&(chunk_idx, read_len, intra, take), chunk_bytes) in
-            descriptors.iter().zip(fetched.iter())
+        for (&(chunk_idx, read_len, _, take), chunk_bytes) in descriptors.iter().zip(fetched.iter())
         {
-            let slice = chunk_bytes.get(intra..intra + take).ok_or_else(|| {
-                DiskBackendError::ShortChunk {
+            if chunk_bytes.len() != take {
+                return Err(DiskBackendError::ShortChunk {
                     chunk_idx,
                     expected: read_len,
                     actual: chunk_bytes.len(),
-                }
-            })?;
-            out.extend_from_slice(slice);
+                });
+            }
+            out.extend_from_slice(chunk_bytes);
         }
         Ok(Bytes::from(out))
     }
@@ -2879,6 +2906,107 @@ impl ChunkedDiskBackend {
     /// otherwise via the L1 cache + chunk store. `chunk_len` is the
     /// chunk's full byte size (might be < `chunk_size` for the
     /// final chunk of a non-aligned disk).
+    /// Ranged read of one chunk: serve exactly `intra..intra+take`
+    /// without materializing the full 16 MiB chunk when a tier can pread
+    /// the range directly (overlay files; NVMe-resident base chunks).
+    /// This is the whole point of the 2026-08 read-path work: the
+    /// whole-chunk materialize turned a cold 4 KiB guest read into a
+    /// 16 MiB NVMe read + alloc (~9 ms measured); the ranged pread
+    /// serves it in one round trip.
+    ///
+    /// Falls back to the whole-chunk [`Self::read_chunk`] wherever fetch
+    /// or install semantics matter — post-copy (demand-fetch must
+    /// install into the dirty tier), a blob-tier miss (populate +
+    /// verify), a cache file of unexpected length — and when the request
+    /// already spans the whole chunk, where the mem-LRU + populate path
+    /// is the better amortization.
+    async fn read_chunk_range(
+        &self,
+        chunk_idx: usize,
+        chunk_len: u64,
+        intra: usize,
+        take: usize,
+    ) -> Result<Bytes, DiskBackendError> {
+        let whole = intra == 0 && take as u64 == chunk_len;
+        if whole || self.postcopy_overlay().is_some() {
+            let bytes = self.read_chunk(chunk_idx, chunk_len).await?;
+            if whole {
+                return Ok(bytes);
+            }
+            return bytes
+                .get(intra..intra + take)
+                .map(|s| bytes.slice_ref(s))
+                .ok_or(DiskBackendError::ShortChunk {
+                    chunk_idx,
+                    expected: chunk_len,
+                    actual: bytes.len(),
+                });
+        }
+        // Overlay tier first, same precedence as `read_chunk` (the tier
+        // lock keeps the read atomic with a write or a freeze).
+        {
+            let tier = self.dirty_tier.lock().await;
+            if let Some(read) = tier.read_overlay_range(chunk_idx, intra, take, self.chunk_size) {
+                return read.map_err(|source| {
+                    dirty_file_error("read guest chunk range", &tier.active.path, source)
+                });
+            }
+        }
+        let hash = self
+            .state
+            .lock()
+            .await
+            .base
+            .chunks
+            .get(chunk_idx)
+            .copied()
+            .flatten();
+        let Some(hash) = hash else {
+            // Zero-filled hole — the manifest had no entry here.
+            return Ok(Bytes::from(vec![0u8; take]));
+        };
+        // A whole chunk already in the mem LRU serves the slice for free.
+        if let Some(bytes) = self.mem_cache.lock().unwrap().get(&hash) {
+            return bytes
+                .get(intra..intra + take)
+                .map(|s| bytes.slice_ref(s))
+                .ok_or(DiskBackendError::ShortChunk {
+                    chunk_idx,
+                    expected: chunk_len,
+                    actual: bytes.len(),
+                });
+        }
+        // NVMe-resident: pread just the range. Deliberately does NOT
+        // insert into the mem LRU (there is no whole chunk to insert);
+        // repeat reads ride the host page cache instead.
+        if let Some(bytes) = self.cache.read_range(hash, chunk_len, intra as u64, take) {
+            if let Some(op) = self.operation_scope.current() {
+                op.span.in_scope(|| {
+                    let _e = tracing::info_span!(
+                        "chunk.fetch",
+                        op = op.kind,
+                        chunk = chunk_idx,
+                        bytes = take as u64,
+                        tier = "nvme_range",
+                    )
+                    .entered();
+                });
+            }
+            return Ok(bytes);
+        }
+        // Blob-tier miss (or the file vanished / had the wrong length):
+        // the whole-chunk path owns fetch, verification and populate.
+        let bytes = self.read_chunk(chunk_idx, chunk_len).await?;
+        bytes
+            .get(intra..intra + take)
+            .map(|s| bytes.slice_ref(s))
+            .ok_or(DiskBackendError::ShortChunk {
+                chunk_idx,
+                expected: chunk_len,
+                actual: bytes.len(),
+            })
+    }
+
     async fn read_chunk(
         &self,
         chunk_idx: usize,
@@ -3943,6 +4071,159 @@ mod tests {
             vec![0x77; chunk_size as usize],
             "a torn chunk is dropped; the base serves its committed bytes",
         );
+    }
+
+    /// Not a correctness test — a mechanism microbenchmark for the
+    /// 2026-08 read-path work, kept out of CI (`#[ignore]`). Run with
+    /// `cargo nextest run -p engram-host-agent -E 'test(bench_ranged)'
+    /// --run-ignored all --no-capture`. Compares a cold sub-chunk read
+    /// (the ranged pread path) against a whole-chunk read (which is
+    /// also what EVERY cold read cost before this change, regardless
+    /// of requested size). Excludes the virtio/NBD legs — absolute
+    /// numbers come from the rig; this isolates the materialize cost.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_ranged_vs_whole_chunk_cold_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 16 * 1024 * 1024u64;
+        let chunks = 48usize;
+        let total = chunk_size * chunks as u64;
+        let mut entries = Vec::new();
+        for i in 0..chunks {
+            let h = put_chunk(&store, i as u8, chunk_size as usize).await;
+            entries.push((i as u64 * chunk_size, h));
+        }
+        let manifest = synth_manifest(total, chunk_size, entries);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 4 * 1024 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        // Pin every chunk, as the image-prefetch supervisor does for
+        // enabled images: on a dev machine below the free-space floor
+        // the sweep would otherwise evict each chunk right after its
+        // populate and the bench would measure blob re-fetches.
+        cache.pin_all(manifest.chunks.iter().map(|c| c.hash));
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
+
+        // Populate the NVMe-cache tier for every chunk (one whole read
+        // each), so the benchmark measures serve, not blob fetch.
+        for i in 0..chunks {
+            backend
+                .read(i as u64 * chunk_size, chunk_size)
+                .await
+                .unwrap();
+        }
+
+        let bench = |label: &'static str, times: Vec<f64>| {
+            let mut t = times;
+            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = t.len();
+            println!(
+                "{label}: n={n} p50={:.0}us p90={:.0}us max={:.0}us",
+                t[n / 2] * 1e6,
+                t[(n as f64 * 0.9) as usize] * 1e6,
+                t[n - 1] * 1e6
+            );
+        };
+
+        // Ranged 4 KiB reads, one per chunk (mem LRU capacity is far
+        // below 48 chunks' worth after populate, so most are served by
+        // the on-disk file — the new pread path).
+        let mut ranged = Vec::new();
+        for i in 0..chunks {
+            let off = i as u64 * chunk_size + 8192;
+            let t0 = std::time::Instant::now();
+            let b = backend.read(off, 4096).await.unwrap();
+            ranged.push(t0.elapsed().as_secs_f64());
+            assert_eq!(b.len(), 4096);
+        }
+        bench("ranged_4k", ranged);
+
+        // Whole-chunk reads — the old cost of ANY cold read.
+        let mut whole = Vec::new();
+        for i in 0..chunks {
+            let t0 = std::time::Instant::now();
+            let b = backend
+                .read(i as u64 * chunk_size, chunk_size)
+                .await
+                .unwrap();
+            whole.push(t0.elapsed().as_secs_f64());
+            assert_eq!(b.len(), chunk_size as usize);
+        }
+        bench("whole_16m", whole);
+    }
+
+    #[tokio::test]
+    async fn sub_chunk_ranged_reads_match_whole_read_slices() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let total = 8192u64;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let h1 = put_chunk(&store, 0xbb, chunk_size as usize).await;
+        let manifest = synth_manifest(total, chunk_size, vec![(0, h0), (chunk_size, h1)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
+
+        // Whole read once (this also populates the NVMe cache), then
+        // ranged sub-reads must byte-match its slices — including ranges
+        // that straddle the chunk boundary and a dirty-overlay chunk.
+        let whole = backend.read(0, total).await.unwrap();
+        for (off, len) in [
+            (0u64, 512usize),
+            (1000, 96),
+            (4000, 200),
+            (4096, 512),
+            (8000, 192),
+        ] {
+            let ranged = backend.read(off, len as u64).await.unwrap();
+            assert_eq!(
+                &whole[off as usize..off as usize + len],
+                &ranged[..],
+                "range mismatch at offset {off} len {len}"
+            );
+        }
+
+        // Dirty a byte range in chunk 0; ranged reads must see overlay
+        // bytes through the ranged overlay path.
+        backend.write(100, &[0xcc; 50]).await.unwrap();
+        let ranged = backend.read(96, 64).await.unwrap();
+        assert!(ranged[4..54].iter().all(|b| *b == 0xcc));
+        assert_eq!(ranged[0..4], [0xaa; 4]);
+        assert_eq!(ranged[54..], [0xaa; 10]);
+    }
+
+    #[tokio::test]
+    async fn ranged_read_of_hole_returns_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let total = 8192u64;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        // Chunk 1 is a manifest hole.
+        let manifest = synth_manifest(total, chunk_size, vec![(0, h0)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
+
+        let bytes = backend.read(chunk_size + 100, 200).await.unwrap();
+        assert_eq!(bytes.len(), 200);
+        assert!(bytes.iter().all(|b| *b == 0));
     }
 
     #[tokio::test]
