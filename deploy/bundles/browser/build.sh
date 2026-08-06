@@ -61,8 +61,15 @@ build_tree() {
         # patchelf rewrites PT_INTERP/DT_RPATH on every bundled ELF (issue
         # #569) so the bundle carries its own loader instead of depending on
         # the one the base image ships.
+        # Fonts (see the fonts.conf step below for the full rationale):
+        # liberation is metric-compatible with Arial/Times/Courier, which real
+        # sites request by name — keep it. The noto-* set is what stops tofu:
+        # core covers Cyrillic/Greek/Arabic/Hebrew/Devanagari/Thai and more,
+        # cjk covers Chinese/Japanese/Korean, color-emoji covers emoji. Without
+        # them the browser renders boxes on a large fraction of the real web.
         apt-get install -y -qq --no-install-recommends \
-            xvfb x11vnc openbox fonts-liberation ca-certificates \
+            xvfb x11vnc openbox ca-certificates \
+            fonts-liberation fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji \
             x11-xkb-utils xkb-data util-linux curl xz-utils patchelf
 
         # Chromium is PINNED, installed from a snapshot.debian.org timestamp —
@@ -223,7 +230,28 @@ build_tree() {
         [ -x /out/bin/setpriv ] \
             || { echo "FATAL: setpriv missing — the browser can not drop privileges" >&2; exit 1; }
 
-        cp /usr/share/fonts/truetype/liberation/*.ttf /out/fonts/ 2>/dev/null || true
+        # Collect every installed face, not just liberation ttf: noto ships
+        # under several dirs and as .otf/.ttc (NotoSansCJK is a collection),
+        # so an extension- or dir-specific copy would silently drop exactly
+        # the coverage we installed the packages for. Flatten into fonts/ —
+        # fonts.conf scans that one dir.
+        find /usr/share/fonts -type f \
+            \( -name "*.ttf" -o -name "*.otf" -o -name "*.ttc" -o -name "*.otc" \) \
+            -exec cp -n {} /out/fonts/ \;
+        # The old copy ended in `|| true`, so a packaging move that emptied the
+        # source dir would have shipped a fontless bundle silently. Assert
+        # instead: liberation for metric compatibility, CJK and emoji because
+        # they are the coverage most likely to be dropped by a repackaging.
+        font_count="$(find /out/fonts -type f | wc -l)"
+        [ "$font_count" -ge 100 ] \
+            || { echo "FATAL: only $font_count fonts collected (expected >=100)" >&2; exit 1; }
+        ls /out/fonts | grep -qi liberation \
+            || { echo "FATAL: liberation faces missing from the bundle" >&2; exit 1; }
+        ls /out/fonts | grep -qi "NotoSansCJK" \
+            || { echo "FATAL: Noto CJK missing — the browser would render tofu for CJK" >&2; exit 1; }
+        ls /out/fonts | grep -qi "NotoColorEmoji" \
+            || { echo "FATAL: Noto Color Emoji missing — the browser would render tofu for emoji" >&2; exit 1; }
+        echo "fonts collected: $font_count faces"
         cat > /out/fonts.conf <<"FONTS"
 <?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
