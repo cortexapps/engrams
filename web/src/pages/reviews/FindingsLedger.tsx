@@ -1,17 +1,14 @@
-import { useState } from "react";
-import {
-  ChevronDown,
-  ChevronRight,
-  Code2,
-  MessageSquare,
-  ShieldCheck,
-  ShieldX,
-} from "lucide-react";
+import { ChevronRight, Code2, MessageSquare, ShieldCheck } from "lucide-react";
 
 import type { Review, ReviewFinding, ReviewVerdict } from "../../gen/engram/app/v1/review_pb";
 import { Markdown } from "../../components/Markdown";
 import { Text } from "@/components/ui/text";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { cn } from "@/lib/utils";
+import { Sep } from "./Sep";
 import { groupByOutcome, type JudgedFinding, type Outcome } from "./review-findings";
 import { blobUrl, isActive, severityTone, threadUrl } from "./review-format";
 
@@ -23,9 +20,10 @@ import { blobUrl, isActive, severityTone, threadUrl } from "./review-format";
  * meaning four different things, so the reason is derived and named here rather
  * than collapsed into "shown here only" (ADR 0100).
  *
- * The group IS the verification status, which is why no card repeats it as a
- * badge: everything under "Posted to the pull request" was confirmed, everything
- * under "Refuted by the verifier" was not.
+ * The group IS the verification status, which is why nothing inside repeats it:
+ * everything under "Posted to the pull request" was confirmed, everything under
+ * "Refuted by the verifier" was not. The verifier's block therefore carries only
+ * what the group cannot — its confidence and its reasoning.
  */
 const GROUP_COPY: Record<Outcome, { heading: string; note?: string }> = {
   posted: {
@@ -33,25 +31,25 @@ const GROUP_COPY: Record<Outcome, { heading: string; note?: string }> = {
   },
   unresolved: {
     heading: "No decision yet",
-    note: "Confirmed and anchored, but this pass never reached the posting gate — so nothing has been decided about them either way.",
+    note: "This pass never reached the posting gate.",
   },
   unverified: {
     heading: "Not verified",
     // Tense-neutral on purpose: on a live pass "never judged" would be a lie
     // about a verifier that simply hasn't got there yet.
-    note: "An unverified finding never posts — the verifier’s silence counts as low confidence, not as agreement.",
+    note: "An unverified finding never posts.",
   },
   no_anchor: {
     heading: "No line to anchor to",
-    note: "Confirmed, but about a file rather than a line — nowhere to hang an inline comment.",
+    note: "About a file, not a line — nowhere to hang a comment.",
   },
   over_cap: {
     heading: "Over the comment cap",
-    note: "Confirmed and anchored, but a pass posts at most ten inline comments.",
+    note: "A pass posts at most ten inline comments.",
   },
   refuted: {
     heading: "Refuted by the verifier",
-    note: "The verifier traced these and couldn’t reproduce the failure.",
+    note: "The verifier traced these and could not reproduce them.",
   },
 };
 
@@ -129,63 +127,51 @@ function OutcomeSection({
   autoOpen: number;
 }) {
   const collapsible = outcome === "refuted";
-  const [open, setOpen] = useState(!collapsible);
   const copy = GROUP_COPY[outcome];
-  const Chevron = open ? ChevronDown : ChevronRight;
 
   // Sentence case at body weight, not a tracked uppercase label: five outcome
   // groups in eyebrow caps turns the findings into a stack of section banners
-  // with the actual findings hiding between them. It is still an h2 — the group IS
-  // the reason a finding didn't post, so it has to be reachable by heading.
-  const heading = (
-    <>
-      <Text as="h2" variant="body" className="text-sm font-medium">
-        {copy.heading}
-      </Text>
-      <span className="ml-auto shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
-        {collapsible ? `${items.length} of ${total}` : items.length}
-      </span>
-    </>
-  );
-
+  // with the actual findings hiding between them. It is still an h2 — the group
+  // IS the reason a finding didn't post, so it has to be reachable by heading —
+  // and the button lives INSIDE the heading, which is the disclosure pattern
+  // that keeps both the outline and a valid content model.
   return (
-    <div className="flex flex-col gap-2">
-      {/* Sticky, because the heading is the only place the outcome is stated: a
-          card scrolled away from it can no longer say why it didn't reach the PR. */}
-      <div className="sticky top-0 z-10 -mx-1 bg-background/95 px-1 py-1 backdrop-blur-sm">
-        {collapsible ? (
-          <button
-            type="button"
-            onClick={() => setOpen((v) => !v)}
-            aria-expanded={open}
-            className="flex w-full items-baseline gap-1.5 rounded-md text-left outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <Chevron className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-            {heading}
-          </button>
-        ) : (
-          <div className="flex items-baseline gap-1.5">{heading}</div>
-        )}
+    <Collapsible defaultOpen={!collapsible} className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        {/* A rank above the card titles beneath it. At the cards' own size and
+            weight the heading divided nothing — it read as one more finding. */}
+        <Text as="h2" variant="heading" className="min-w-0 font-semibold">
+          <CollapsibleTrigger className="group flex items-center gap-1.5 rounded-md text-left outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring">
+            <ChevronRight
+              className="size-3.5 shrink-0 text-muted-foreground transition-transform duration-150 group-data-[state=open]:rotate-90 motion-reduce:transition-none"
+              aria-hidden
+            />
+            {copy.heading}
+          </CollapsibleTrigger>
+        </Text>
+        {/* Beside the heading, not flung to the far edge: a lone figure 700px
+            from the words it counts belongs to nothing. */}
+        <Badge variant="secondary" className="font-mono font-normal tabular-nums">
+          {collapsible ? `${items.length} of ${total}` : items.length}
+        </Badge>
       </div>
 
-      {open && (
-        <>
-          {copy.note && <p className="text-xs text-muted-foreground">{copy.note}</p>}
-          <ul className="flex flex-col gap-2">
-            {items.map((item, i) => (
-              <li key={item.finding.id}>
-                <FindingCard
-                  review={review}
-                  finding={item.finding}
-                  verdict={item.verdict}
-                  defaultOpen={i < autoOpen}
-                />
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
-    </div>
+      <CollapsibleContent className="flex flex-col gap-2">
+        {copy.note && <p className="text-xs text-muted-foreground">{copy.note}</p>}
+        <ul className="flex flex-col gap-2">
+          {items.map((item, i) => (
+            <li key={item.finding.id}>
+              <FindingCard
+                review={review}
+                finding={item.finding}
+                verdict={item.verdict}
+                defaultOpen={i < autoOpen}
+              />
+            </li>
+          ))}
+        </ul>
+      </CollapsibleContent>
+    </Collapsible>
   );
 }
 
@@ -210,11 +196,13 @@ const CATEGORY_LABELS: Record<string, string> = {
  * One finding, collapsed to what a reader scans by and opening to what they read.
  *
  * A body runs to twenty lines of prose and the cap is 200 findings, so rendering
- * every body is the wall of text this page used to be. Collapsed, the severity
- * aligns into a column and the titles form a list; open, the finder's claim is the
- * body and the verifier's ruling is a separate attributed block below it — never
- * blended, because reading them as one paragraph is what made the old panel
- * untrustworthy. You couldn't tell which of them was making a given assertion.
+ * every body at once is a wall of text.
+ *
+ * Everything in the card shares ONE left edge: the title leads and severity
+ * rides the meta line under it, where the dots still stack into a scannable
+ * column. Severity in its own leading column would push the title a third of the
+ * way across the card while the body still began at the card's own padding, so a
+ * claim and its own heading would have no line to read down.
  */
 function FindingCard({
   review,
@@ -227,138 +215,154 @@ function FindingCard({
   verdict: ReviewVerdict | undefined;
   defaultOpen: boolean;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
-  const [showEvidence, setShowEvidence] = useState(false);
-  const Chevron = open ? ChevronDown : ChevronRight;
   const thread = threadUrl(review, finding);
 
   return (
-    <article className="overflow-hidden rounded-lg border bg-card">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        aria-expanded={open}
-        className="flex w-full items-start gap-2.5 px-3 py-2.5 text-left outline-none transition-colors hover:bg-accent/40 focus-visible:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
-      >
-        <Chevron className="mt-0.5 size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-        {/* A dot in the severity's tone, then the word in ink, in a fixed column.
-            No pill, so a low finding can't shout as loudly as a critical one; and
-            the tone stays on the dot because amber as text measures 2.7:1 on
-            paper — the word carries the meaning, so the colour is redundant. */}
-        <span className="mt-[0.15rem] flex w-[5.25rem] shrink-0 items-center gap-1.5">
-          <span
-            aria-hidden
-            className="size-1.5 shrink-0 rounded-full"
-            style={{ backgroundColor: severityTone(finding.severity) }}
-          />
-          <Text variant="label" className="text-foreground">
-            {finding.severity}
-          </Text>
-        </span>
-        <span className="flex min-w-0 flex-col gap-0.5">
-          <span className="text-sm font-medium">{finding.title}</span>
+    <Collapsible defaultOpen={defaultOpen} asChild>
+      {/* Stock `Card`, run dense: the component owns the edge, the radius and
+          the ground, and the overrides only retire its article-sized padding. */}
+      <Card className="gap-0 overflow-hidden py-0">
+        <CollapsibleTrigger className="group flex w-full flex-col gap-1 px-3 py-2.5 text-left outline-none transition-colors hover:bg-accent/40 focus-visible:bg-accent/40 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset">
+          <span className="flex w-full items-start gap-2">
+            <span className="min-w-0 flex-1 text-sm font-medium">{finding.title}</span>
+            <ChevronRight
+              className="mt-0.5 size-3.5 shrink-0 text-muted-foreground transition-transform duration-150 group-data-[state=open]:rotate-90 motion-reduce:transition-none"
+              aria-hidden
+            />
+          </span>
+          {/* A dot in the severity's tone, then the word in ink. No pill, so a
+              low finding can't shout as loudly as a critical one; and the tone
+              stays on the dot because amber as text measures 2.7:1 on paper —
+              the word carries the meaning, so the colour is redundant. */}
           <span className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs text-muted-foreground">
+            <span className="flex items-center gap-1.5 text-foreground">
+              <span
+                aria-hidden
+                className="size-1.5 shrink-0 rounded-full"
+                style={{ backgroundColor: severityTone(finding.severity) }}
+              />
+              {finding.severity}
+            </span>
+            <Sep />
             <span className="font-mono">{anchorOf(finding)}</span>
-            <span aria-hidden className="text-muted-foreground/40">
-              ·
-            </span>
+            <Sep />
             <span>{CATEGORY_LABELS[finding.category] ?? finding.category}</span>
-            <span aria-hidden className="text-muted-foreground/40">
-              ·
-            </span>
+            <Sep />
             {/* Severity is impact if real; confidence is how sure the finder is
                 that it IS real. Two axes, so both are stated. */}
             <span>{finding.confidence} confidence</span>
           </span>
-        </span>
-      </button>
+        </CollapsibleTrigger>
 
-      {open && (
-        <div className="flex flex-col gap-3 px-3 pb-3">
-          {finding.bodyMd && (
-            // Held to a reading measure: the column is wide enough for code
-            // blocks, which is far too wide for twenty lines of prose. The
-            // finder's claim is the substance here, so it is ink, not muted.
-            <div className="max-w-[70ch] text-sm leading-relaxed">
-              <Markdown text={finding.bodyMd} />
-            </div>
-          )}
-
-          {/* Deciding whether a finding is real means looking at the code, and
-              acting on it means the thread it became. Both were a manual hunt on
-              GitHub until now. The blob link is pinned to the SHA the pass read —
-              the branch has moved on, and lines that have shifted are worse than
-              no link. */}
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
-            <a
-              href={blobUrl(review, finding)}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1 text-muted-foreground underline decoration-current/40 underline-offset-4 transition-colors hover:text-foreground"
-            >
-              <Code2 className="size-3" aria-hidden />
-              View the code
-            </a>
-            {thread && (
-              <a
-                href={thread}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1 text-muted-foreground underline decoration-current/40 underline-offset-4 transition-colors hover:text-foreground"
-              >
-                <MessageSquare className="size-3" aria-hidden />
-                Open the thread
-              </a>
+        <CollapsibleContent>
+          <CardContent className="flex flex-col gap-3 px-3 pt-1 pb-3">
+            {finding.bodyMd && (
+              // Held to a reading measure: the column is wide enough for code
+              // blocks, which is far too wide for twenty lines of prose. The
+              // finder's claim is the substance here, so it is ink, not muted.
+              <div className="max-w-[70ch] text-sm leading-relaxed">
+                <Markdown text={finding.bodyMd} />
+              </div>
             )}
-            {finding.resolution && (
-              // The strongest post-hoc trust signal the product has: what the
-              // author actually did about it.
-              <span className="text-muted-foreground">Author {finding.resolution} this</span>
+
+            {finding.suggestedFix && (
+              <div>
+                <Text variant="label" tone="muted" className="mb-1 block">
+                  Suggested fix
+                </Text>
+                {/* GitHub receives this as a committable suggestion block, so it
+                    is replacement code and renders as code here too. */}
+                <pre className="overflow-x-auto rounded-md border bg-muted px-3 py-2 font-mono text-[0.8rem]">
+                  {finding.suggestedFix}
+                </pre>
+              </div>
             )}
-          </div>
 
-          {finding.suggestedFix && (
-            <div>
-              <Text variant="label" tone="muted" className="mb-1 block">
-                Suggested fix
-              </Text>
-              {/* GitHub receives this as a committable suggestion block, so it is
-                  replacement code and renders as code here too. */}
-              <pre className="overflow-x-auto rounded-md border bg-muted px-3 py-2 font-mono text-[0.8rem]">
-                {finding.suggestedFix}
-              </pre>
-            </div>
-          )}
+            {finding.evidence.length > 0 && <Evidence paths={finding.evidence} />}
 
-          {finding.evidence.length > 0 && (
-            <div>
-              <button
-                type="button"
-                onClick={() => setShowEvidence((v) => !v)}
-                aria-expanded={showEvidence}
-                className="rounded-md text-xs text-muted-foreground underline decoration-current/40 underline-offset-4 outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                {/* The evidence gate: a finding about a file the finder never read
-                    is invalid, so this list is the claim's receipt. */}
-                {showEvidence ? "Hide" : "Show"} the {finding.evidence.length}{" "}
-                {finding.evidence.length === 1 ? "file" : "files"} the finder read
-              </button>
-              {showEvidence && (
-                <ul className="mt-1 space-y-0.5">
-                  {finding.evidence.map((path) => (
-                    <li key={path} className="font-mono text-xs text-muted-foreground">
-                      {path}
-                    </li>
-                  ))}
-                </ul>
+            {/* Only when the verifier said something. Its own ground is for
+                reasoning; a box holding "Verifier · medium confidence" and
+                nothing else is a container built for three words. */}
+            {verdict?.reasoning && <VerdictBlock verdict={verdict} />}
+
+            {/* Deciding whether a finding is real means looking at the code, and
+                acting on it means the thread it became. Both were a manual hunt
+                on GitHub until now. The blob link is pinned to the SHA the pass
+                read — the branch has moved on, and lines that have shifted are
+                worse than no link. */}
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+              <CardLink href={blobUrl(review, finding)} icon={Code2}>
+                View the code
+              </CardLink>
+              {thread && (
+                <CardLink href={thread} icon={MessageSquare}>
+                  Open the thread
+                </CardLink>
+              )}
+              {verdict && !verdict.reasoning && (
+                <span className="text-muted-foreground">
+                  Verifier · {verdict.confidence} confidence
+                </span>
+              )}
+              {finding.resolution && (
+                // The strongest post-hoc trust signal the product has: what the
+                // author actually did about it.
+                <Badge variant="secondary" className="font-normal text-muted-foreground">
+                  Author {finding.resolution} this
+                </Badge>
               )}
             </div>
-          )}
-        </div>
-      )}
+          </CardContent>
+        </CollapsibleContent>
+      </Card>
+    </Collapsible>
+  );
+}
 
-      {open && verdict && <VerdictBlock verdict={verdict} />}
-    </article>
+function CardLink({
+  href,
+  icon: Icon,
+  children,
+}: {
+  href: string;
+  icon: typeof Code2;
+  children: React.ReactNode;
+}) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      className="inline-flex items-center gap-1 text-muted-foreground underline decoration-current/40 underline-offset-4 transition-colors hover:text-foreground"
+    >
+      <Icon className="size-3" aria-hidden />
+      {children}
+    </a>
+  );
+}
+
+/** The evidence gate: a finding about a file the finder never read is invalid,
+ *  so this list is the claim's receipt. */
+function Evidence({ paths }: { paths: readonly string[] }) {
+  return (
+    <Collapsible>
+      <CollapsibleTrigger className="group flex items-center gap-1 rounded-md text-xs text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring">
+        <ChevronRight
+          className="size-3 transition-transform duration-150 group-data-[state=open]:rotate-90 motion-reduce:transition-none"
+          aria-hidden
+        />
+        {paths.length} {paths.length === 1 ? "file" : "files"} the finder read
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <ul className="mt-1 space-y-0.5 pl-4">
+          {paths.map((path) => (
+            <li key={path} className="font-mono text-xs text-muted-foreground">
+              {path}
+            </li>
+          ))}
+        </ul>
+      </CollapsibleContent>
+    </Collapsible>
   );
 }
 
@@ -366,33 +370,29 @@ function FindingCard({
  * The verifier's ruling — a separate voice on its own ground, attributed, with its
  * own confidence. Its reasoning must cite code it actually read, so this is the
  * part a reader weighs when deciding whether to act.
+ *
+ * It does NOT repeat the verdict: the group heading already says whether these
+ * findings were confirmed or refuted, and a band across every card restating it
+ * was three-quarters of the noise in the old ledger. What only the verifier can
+ * tell you is how sure it was, and why.
  */
 function VerdictBlock({ verdict }: { verdict: ReviewVerdict }) {
   const confirmed = verdict.verdict === "confirmed";
-  const Icon = confirmed ? ShieldCheck : ShieldX;
   return (
-    <div className="flex gap-2 border-t bg-muted/40 px-3 py-2">
-      <Icon
-        className="mt-0.5 size-3.5 shrink-0"
-        style={{
-          color: confirmed ? "var(--instrument-nominal)" : "var(--muted-foreground)",
-        }}
+    <div className="flex gap-2 rounded-md border bg-muted/40 px-3 py-2">
+      <ShieldCheck
+        className={cn("mt-0.5 size-3.5 shrink-0", !confirmed && "opacity-50")}
+        style={{ color: confirmed ? "var(--instrument-nominal)" : "var(--muted-foreground)" }}
         aria-hidden
       />
       <div className="flex min-w-0 flex-col gap-0.5">
-        <span className="text-sm font-medium">
-          Verifier {confirmed ? "confirmed" : "refuted"} this
-          <span className="font-normal text-muted-foreground">
-            {" "}
-            · {verdict.confidence} confidence
-          </span>
+        <span className="text-xs text-muted-foreground">
+          Verifier · {verdict.confidence} confidence
         </span>
         {/* The trust artifact — it must cite code the verifier actually read —
             so it is set at body size, not as the smallest text on the page. */}
         {verdict.reasoning && (
-          <p className="max-w-[70ch] text-sm leading-relaxed text-muted-foreground">
-            {verdict.reasoning}
-          </p>
+          <p className="max-w-[70ch] text-sm leading-relaxed">{verdict.reasoning}</p>
         )}
       </div>
     </div>

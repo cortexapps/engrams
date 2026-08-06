@@ -20,6 +20,7 @@ import { errorMessage } from "../../lib/errors";
 import { relativeTime } from "../sessions/session-format";
 import { Text } from "@/components/ui/text";
 import { Button } from "@/components/ui/button";
+import { Card, CardFooter } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import {
@@ -31,11 +32,12 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { ReviewStage } from "./ReviewGlyph";
+import { Dot, Sep } from "./Sep";
 import { PassState } from "./PassState";
 import { FindingsLedger } from "./FindingsLedger";
 import { ReviewTranscriptPane, roleSession, type WorkerRole } from "./ReviewTranscriptPane";
 import { groupByPr, groupOf } from "./review-groups";
-import { judgeFindings, keptRatio, type JudgedFinding } from "./review-findings";
+import { judgeFindings } from "./review-findings";
 import {
   diffSummary,
   failureReason,
@@ -117,13 +119,7 @@ export function ReviewDossier() {
         </div>
 
         <div className="flex flex-col gap-5">
-          <PassLine
-            passes={passes}
-            pass={review}
-            judged={judged}
-            detail={detail}
-            onOpenSessions={setRole}
-          />
+          <PassLine passes={passes} pass={review} detail={detail} onOpenSessions={setRole} />
           <FindingsLedger review={review} judged={judged} loading={detail.isPending} />
         </div>
       </Frame>
@@ -300,47 +296,41 @@ function PrMeta({ review }: { review: Review }) {
   return (
     <p className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-xs text-muted-foreground">
       {facts.map(([key, node], i) => (
-        <span key={key} className="flex items-baseline gap-2">
-          {i > 0 && (
-            <span aria-hidden className="select-none text-muted-foreground/40">
-              ·
-            </span>
-          )}
+        <Dot key={key} show={i > 0}>
           {node}
-        </span>
+        </Dot>
       ))}
     </p>
   );
 }
 
 /**
- * The selected pass, in one line — but a line with a rank, not a run of six
- * equally weighted tokens.
+ * The selected pass, as one object rather than a run of floating tokens.
  *
- * Four groups, in order of what a reader needs: **what happened** as the row's
- * headline, **which pass** in a bordered control so its boundary is visible,
- * **when and how long** as a quiet mono readout, and **the two ways in** as a
- * grouped pair on the right. The stage sits outside the switcher on purpose:
- * "Failed" is not part of choosing a pass, and folding it into the trigger was
- * what made the whole strip read as one undifferentiated token stream.
+ * The strip is a card because everything in it is about THIS pass, and the
+ * heading above it is about the pull request. Without that boundary the page
+ * opened with five unbounded rows — a back link, a title, a fact run, a control
+ * run, and two loose sentences — and a reader had nothing to tell them where one
+ * subject ended and the next began.
+ *
+ * Inside, four groups in order of what a reader needs: **what happened** as the
+ * row's headline, **which pass** in a bordered control, **when and how long** as
+ * a quiet mono readout, and **the way into the workers** on the right. The stage
+ * sits outside the switcher on purpose: "Failed" is not part of choosing a pass.
  */
 function PassLine({
   passes,
   pass,
-  judged,
   detail,
   onOpenSessions,
 }: {
   passes: Review[];
   pass: Review;
-  judged: JudgedFinding[];
   detail: ReturnType<typeof useReview>;
   onOpenSessions: (role: WorkerRole) => void;
 }) {
   const now = useNow();
   const at = reviewCreatedAt(pass);
-  const ratio = keptRatio(judged);
-  const live = isActive(pass);
   // A reviewer session is owned by nobody — `insertReviewTask` stores
   // `createdByUserId: null` — and session reads are owner-scoped, so only an
   // admin can actually open one. Asking the ability the real question rather
@@ -366,9 +356,11 @@ function PassLine({
   const duration = passDuration(events);
   const lone = passes.length === 1;
 
+  const notes = failure || superseded;
+
   return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+    <Card className="gap-0 py-0">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2">
         {/* 1. What it is doing, or what it did — and the log behind it. State and
             activity are one idea at two zoom levels, and a terminal pass's state is
             literally the last line of its own log, so they are one control. */}
@@ -406,50 +398,32 @@ function PassLine({
         )}
       </div>
 
-      {/* Why it ended badly, in the reading flow rather than inside the activity
-          popover behind a control labelled by duration. Without it an operator
-          cannot tell an infrastructure failure (re-run helps) from one about their
-          own PR (it won't). */}
-      {failure && <p className="text-sm">{failure}</p>}
+      {/* Whatever the strip cannot say in a token, on its own ground below the
+          rule — still inside the card, because both facts are about this pass. */}
+      {notes && (
+        <CardFooter className="flex flex-col items-start gap-1 border-t px-3 py-2 text-sm">
+          {/* Why it ended badly, in the reading flow rather than inside the
+              activity popover behind a control labelled by duration. Without it
+              an operator cannot tell an infrastructure failure (re-run helps)
+              from one about their own PR (it won't). */}
+          {failure && <p>{failure}</p>}
 
-      {/* Stated only when the verifier actually killed something. A pass with
-          nothing refuted has no ratio worth reading, and the findings below carry
-          their own counts. Deliberately silent about what "stands": an unverified
-          finding never posts, so counting it as surviving would overstate. */}
-      {!live && ratio.refuted > 0 && (
-        <p className="text-sm text-muted-foreground">
-          The verifier refuted {ratio.refuted} of {ratio.total}.
-        </p>
+          {superseded && (
+            <p className="text-muted-foreground">
+              A newer pass ran
+              {supersededAt ? ` ${relativeTime(supersededAt.toISOString(), now)} ago` : ""}.{" "}
+              <Link
+                to="/reviews/$id"
+                params={{ id: superseded.id }}
+                className="text-foreground underline decoration-border underline-offset-4"
+              >
+                Open it
+              </Link>
+            </p>
+          )}
+        </CardFooter>
       )}
-
-      {superseded && (
-        <p className="text-sm text-muted-foreground">
-          A newer pass ran
-          {supersededAt ? ` ${relativeTime(supersededAt.toISOString(), now)} ago` : ""}.{" "}
-          <Link
-            to="/reviews/$id"
-            params={{ id: superseded.id }}
-            className="text-foreground underline decoration-border underline-offset-4"
-          >
-            Open it
-          </Link>
-        </p>
-      )}
-    </div>
-  );
-}
-
-/** A leading interpunct, so a readout can drop segments without stranding one. */
-function Dot({ show, children }: { show: boolean; children: React.ReactNode }) {
-  return (
-    <span className="flex items-baseline gap-2">
-      {show && (
-        <span aria-hidden className="select-none text-muted-foreground/40">
-          ·
-        </span>
-      )}
-      {children}
-    </span>
+    </Card>
   );
 }
 
@@ -480,9 +454,7 @@ function PassSwitcher({ passes, pass, now }: { passes: Review[]; pass: Review; n
           <span className="font-mono text-xs tabular-nums" title={pass.headSha}>
             {shortSha(pass.headSha)}
           </span>
-          <span aria-hidden className="text-muted-foreground/40">
-            ·
-          </span>
+          <Sep />
           <span className="text-xs text-muted-foreground">
             pass {ordinal(pass)} of {passes.length}
           </span>

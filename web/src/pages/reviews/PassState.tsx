@@ -86,12 +86,10 @@ export function PassState({
               <LivePulse />
             </>
           ) : (
-            <>
-              <ReviewStage status={review.status} />
-              <span className="font-mono text-xs font-normal tabular-nums text-muted-foreground">
-                {events.length}
-              </span>
-            </>
+            // The stage, and nothing else. A bare event count beside it read as
+            // an unlabelled figure — "Posted 5" says nothing to anyone who does
+            // not already know the log has five entries. It belongs in the log.
+            <ReviewStage status={review.status} />
           )}
           <ChevronDown className="size-3.5 text-muted-foreground" aria-hidden />
         </Button>
@@ -101,9 +99,10 @@ export function PassState({
           <Text variant="label" tone="muted">
             Activity
           </Text>
-          {duration && (
-            <span className="font-mono text-xs tabular-nums text-muted-foreground">{duration}</span>
-          )}
+          <span className="font-mono text-xs tabular-nums text-muted-foreground">
+            {events.length} {events.length === 1 ? "step" : "steps"}
+            {duration ? ` · ${duration}` : ""}
+          </span>
         </div>
         <ol className="flex flex-col gap-1.5 p-2">
           {events.map((event, i) => {

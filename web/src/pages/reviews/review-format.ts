@@ -1,5 +1,16 @@
 import { timestampDate } from "@bufbuild/protobuf/wkt";
-import { AtSign, CircleDot, RotateCcw, Terminal, Zap, type LucideIcon } from "lucide-react";
+import {
+  AtSign,
+  CircleDot,
+  GitMerge,
+  GitPullRequest,
+  GitPullRequestClosed,
+  GitPullRequestDraft,
+  RotateCcw,
+  Terminal,
+  Zap,
+  type LucideIcon,
+} from "lucide-react";
 
 import type { Review, ReviewEvent, ReviewFinding } from "../../gen/engram/app/v1/review_pb";
 
@@ -269,6 +280,54 @@ export function severityTone(severity: string): string {
     default:
       return "var(--muted-foreground)";
   }
+}
+
+/**
+ * The four severities as four DISTINGUISHABLE tints, for the stacked bar on the
+ * ledger row.
+ *
+ * `severityTone` cannot do this job: it paints critical and high with the same
+ * token, which is honest beside a word ("2 high" says which one it is) and
+ * useless inside a bar, where two adjacent segments of one hue read as a single
+ * block. So the ramp interpolates the two instrument tokens rather than
+ * introducing a colour: critical is the critical token, medium is caution, high
+ * is the step between them, and low is quiet ink.
+ *
+ * The bar is redundant by construction — segments always run critical to low,
+ * and the count beside it carries the numbers for anyone the hue fails.
+ */
+export const SEVERITY_BAR_TONE: Record<Severity, string> = {
+  critical: "var(--instrument-critical)",
+  high: "color-mix(in oklch, var(--instrument-critical) 58%, var(--instrument-caution))",
+  medium: "var(--instrument-caution)",
+  low: "color-mix(in oklch, var(--muted-foreground) 55%, transparent)",
+};
+
+/**
+ * The pull request's own state, as the shape every developer already reads.
+ *
+ * Colour is deliberately not part of it. GitHub's purple-merge/green-open coding
+ * is GitHub's palette, not this one, and the row already spends its colour on
+ * the pass's stage — which is the row's actual subject. The shape carries the
+ * state and the word goes to assistive tech.
+ *
+ * Undefined for a state that was never captured — older records predate the
+ * field, and a guessed "Open" would be a claim we cannot make.
+ */
+export const PR_STATES: Record<string, { label: string; icon: LucideIcon } | undefined> = {
+  open: { label: "Open", icon: GitPullRequest },
+  draft: { label: "Draft", icon: GitPullRequestDraft },
+  merged: { label: "Merged", icon: GitMerge },
+  closed: { label: "Closed", icon: GitPullRequestClosed },
+};
+
+/** `+12 −4`, the size of the diff this pass read. Undefined when neither side
+ *  was captured; a lone `+12` is still worth showing. */
+export function diffShort(review: Review): string | undefined {
+  const parts: string[] = [];
+  if (review.additions != null) parts.push(`+${review.additions}`);
+  if (review.deletions != null) parts.push(`−${review.deletions}`);
+  return parts.length > 0 ? parts.join(" ") : undefined;
 }
 
 /** Per-severity counts as `[label, count]`, dropping the zeroes. */
