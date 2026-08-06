@@ -119,6 +119,12 @@ pub struct FirecrackerProcessRecord {
     /// actually has open, not one recomputed off the live id (ADR 0018
     /// commit 12o). Mirrors `SandboxState::rootfs_canonical`.
     pub rootfs_canonical: PathBuf,
+    /// ADR 0112: the swap drive's embedded `path_on_host`, same
+    /// contract as `rootfs_canonical`. `None` when the spec has no
+    /// swap; `serde(default)` covers manifests written before the
+    /// field landed.
+    #[serde(default)]
+    pub swap_canonical: Option<PathBuf>,
     /// FC vsock CID for this sandbox. Coordinator-side `harness_dial`
     /// reads it to wire the guest's harness-back-dial; reattach
     /// rehydrates the per-sandbox `next_cid` allocator state.
@@ -354,6 +360,7 @@ mod tests {
                 api_socket: PathBuf::from("/tmp/fc.sock"),
                 vsock_uds_base: PathBuf::from("/tmp/sb.vsock"),
                 rootfs_canonical: PathBuf::from("/tmp/rootfs/sb.dev"),
+                swap_canonical: None,
                 vsock_cid: 3,
             },
             network: None,

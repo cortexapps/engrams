@@ -141,6 +141,12 @@ pub struct SandboxState {
     /// `vsock_uds_path`, which is immutable post-load (PUT /vsock 400)
     /// and so MUST carry the embedded path forward.
     pub rootfs_canonical: PathBuf,
+    /// ADR 0112: the swap drive's `path_on_host` as embedded in this
+    /// VM's `state.bin` — same lineage-anchored contract as
+    /// `rootfs_canonical` (cold create: `swap/<own_id>.swap`; restore:
+    /// the ancestor's path, since the drive is re-pointed by symlink,
+    /// never by `patch_drive`). `None` when the spec has no swap.
+    pub swap_canonical: Option<PathBuf>,
 }
 
 /// Reserved vsock port `engram-agentd` listens on inside the guest.
@@ -994,6 +1000,14 @@ struct FcSnapshotManifest {
     /// source sandbox booted without a harness substrate.
     #[serde(default)]
     source_harness_canonical: Option<PathBuf>,
+    /// ADR 0112: same shape, for the ephemeral swap drive. `None` if
+    /// the source sandbox booted without swap (`spec.swap_mib` absent).
+    /// Unlike rootfs/harness the receiver never re-materializes the
+    /// SOURCE's bytes at this path — it points the symlink at its own
+    /// FRESH sparse file (swap contents are discarded at capture by
+    /// contract; the guest ran `swapoff` before the pause).
+    #[serde(default)]
+    source_swap_canonical: Option<PathBuf>,
     /// The exact `vsock.uds_path` the source VM had open at capture,
     /// as embedded in state.bin. LINEAGE METADATA ONLY since the
     /// vsock re-key: restores pass the fork's `vsock_override` keyed
@@ -1558,6 +1572,8 @@ impl FirecrackerBackend {
             // ancestor's path for a restore. Carry it forward so a
             // re-snapshot after restart still stamps the embedded path.
             rootfs_canonical: fc.rootfs_canonical.clone(),
+            // ADR 0112: same carry-forward for the swap drive.
+            swap_canonical: fc.swap_canonical.clone(),
         };
         // Reattach: agentd was already up when the previous host-
         // agent generation tracked it, so the readiness watch starts
@@ -2531,6 +2547,43 @@ impl FirecrackerBackend {
             .await?;
         }
 
+        // ADR 0112: the ephemeral swap drive — a sparse per-sandbox
+        // backing file behind a canonical symlink, exactly the rootfs
+        // shape: `state.bin` embeds the canonical, so every restore can
+        // re-point it at ITS OWN fresh file before `load_snapshot`
+        // opens it. The device must exist here (base capture) because
+        // FC restore only reconfigures devices already in the model.
+        // The backing file is unlinked after InstanceStart (FC holds
+        // the fd) — see the post-start block below.
+        let swap_backing = match spec.swap_mib.filter(|m| *m > 0) {
+            Some(swap_mib) => {
+                let backing = paths::swap_backing(&self.work_dir, sandbox_id);
+                create_sparse_swap_backing(&backing, swap_mib).await?;
+                let canonical = paths::swap_canonical(&self.work_dir, sandbox_id);
+                paths::install_symlink(&canonical, &backing)
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Vm(
+                            format!(
+                                "install swap canonical symlink {} -> {}: {e}",
+                                canonical.display(),
+                                backing.display()
+                            )
+                            .into(),
+                        )
+                    })?;
+                api.put_drive(&DriveConfig {
+                    drive_id: "swap".into(),
+                    path_on_host: canonical.to_string_lossy().into_owned(),
+                    is_root_device: false,
+                    is_read_only: false,
+                })
+                .await?;
+                Some(backing)
+            }
+            None => None,
+        };
+
         // virtio-net: bind FC to the TAP we provisioned above. The
         // TAP already has the host-side gateway IP and is admin-up,
         // so FC just opens it and bridges the virtio-net frontend
@@ -2587,6 +2640,23 @@ impl FirecrackerBackend {
 
         api.put_action(ActionType::InstanceStart).await?;
 
+        // ADR 0112: FC holds the swap backing fd (drives open at PUT /
+        // start) — unlink it now so the bytes live only in an anonymous
+        // inode the kernel reclaims at FC exit. No orphan file, no
+        // sweeper, and the plaintext-at-rest window is the attach
+        // itself. Best-effort: a failed unlink leaves a file the next
+        // create of this id would truncate; log and continue.
+        let has_swap = swap_backing.is_some();
+        if let Some(backing) = swap_backing {
+            if let Err(e) = tokio::fs::remove_file(&backing).await {
+                tracing::warn!(
+                    backing = %backing.display(),
+                    error = %e,
+                    "swap backing unlink-after-attach failed; file remains until destroy",
+                );
+            }
+        }
+
         let state = SandboxState {
             spec,
             firecracker_socket: socket,
@@ -2597,6 +2667,8 @@ impl FirecrackerBackend {
             // own id-keyed canonical (the `put_drive` above used it as
             // `path_on_host`), so the embedded path == own id.
             rootfs_canonical,
+            // Same contract for the swap drive (ADR 0112).
+            swap_canonical: has_swap.then(|| paths::swap_canonical(&self.work_dir, sandbox_id)),
         };
         // ADR 0009 §4: spawn a supervisor that watches for unexpected
         // FC process exit (kernel OOM, segfault, manual kill) and
@@ -3389,6 +3461,54 @@ impl FirecrackerBackend {
             }
             _ => None,
         };
+        // ADR 0112: the swap drive rides the same shape — a FRESH sparse
+        // backing file per restore (swap contents are discarded at
+        // capture by contract; the guest re-runs mkswap at bind), with
+        // the state.bin-embedded source canonical re-pointed at it under
+        // its own per-source-path lock across the load. Acquired strictly
+        // AFTER the rootfs guard above (fixed order — no deadlock).
+        // A restore failure past this point tears the file down via the
+        // unlink below never running + destroy's canonical cleanup; the
+        // backing itself is unlinked as soon as the load returns.
+        let swap_restore = match (
+            manifest.source_swap_canonical.as_ref(),
+            live_spec.swap_mib.filter(|m| *m > 0),
+        ) {
+            (Some(src), Some(swap_mib)) => {
+                let backing = paths::swap_backing(&self.work_dir, sandbox_id);
+                create_sparse_swap_backing(&backing, swap_mib).await?;
+                let guard = source_canonical_lock(src).lock_owned().await;
+                if let Some(parent) = src.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                        vm_err(format!(
+                            "create source swap canonical parent {}: {e}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+                paths::install_symlink(src, &backing).await.map_err(|e| {
+                    vm_err(format!(
+                        "restore source swap canonical symlink {} -> {}: {e}",
+                        src.display(),
+                        backing.display()
+                    ))
+                })?;
+                Some((guard, backing))
+            }
+            (None, Some(_)) => {
+                // Structurally unreachable: `swap_mib` and the canonical
+                // ride the SAME sidecar — a spec with swap always came
+                // from a capture that stamped the path. Refuse loudly
+                // rather than resume a guest whose swap device points at
+                // stale bytes.
+                return Err(SandboxError::Snapshot(
+                    "sidecar has swap_mib but no source_swap_canonical — \
+                     refusing to restore onto an unanchored swap device"
+                        .into(),
+                ));
+            }
+            _ => None,
+        };
         let load_result: Result<(), SandboxError> = async {
             match &uffd_leg {
                 None => {
@@ -3511,6 +3631,22 @@ impl FirecrackerBackend {
         // FC has opened the rootfs fd (load returned); the shared path is free
         // for the next same-base restore. Release before the post-load work.
         drop(_src_canon_guard);
+        // ADR 0112: same for the swap drive — release the shared canonical,
+        // then unlink the fresh backing (FC holds the fd; the bytes live in
+        // an anonymous inode until FC exits). Unlink even on a failed load:
+        // the file has no value outside this residence. Best-effort.
+        if let Some((guard, backing)) = swap_restore {
+            drop(guard);
+            if let Err(e) = tokio::fs::remove_file(&backing).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        backing = %backing.display(),
+                        error = %e,
+                        "swap backing unlink-after-load failed; file remains until destroy",
+                    );
+                }
+            }
+        }
 
         let uffd_handler: Option<Child> = match load_result {
             Ok(()) => uffd_leg.map(|(handler, _uds)| handler),
@@ -3588,6 +3724,10 @@ impl FirecrackerBackend {
                 .source_rootfs_canonical
                 .clone()
                 .unwrap_or_else(|| paths::rootfs_canonical(&self.work_dir, sandbox_id)),
+            // ADR 0112: same inherit-the-embedded-path contract for the
+            // swap drive; the symlink at that path was re-pointed at
+            // OUR fresh backing file before the load.
+            swap_canonical: manifest.source_swap_canonical.clone(),
         };
         // ADR 0009 §4: supervisor watches restored FC + (optional)
         // UFFD handler. The UFFD handler is critical — if it dies
@@ -3770,6 +3910,36 @@ fn describe_agentd_rpc_recv_failure(e: &std::io::Error) -> String {
     } else {
         e.to_string()
     }
+}
+
+/// ADR 0112: create (or truncate) the sparse backing file for the
+/// ephemeral swap drive, `ftruncate`d to exactly `swap_mib` MiB — the
+/// virtio device size IS the per-sandbox disk cap (a guest cannot
+/// allocate past the device end). 0600: the file holds guest memory in
+/// plaintext for the short window before unlink-after-attach.
+async fn create_sparse_swap_backing(
+    path: &std::path::Path,
+    swap_mib: u32,
+) -> Result<(), SandboxError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.set_len(u64::from(swap_mib) * 1024 * 1024)
+    })
+    .await
+    .map_err(|e| SandboxError::Vm(format!("swap backing create join: {e}").into()))?
+    .map_err(|e| SandboxError::Vm(format!("create swap backing: {e}").into()))
 }
 
 /// #567: the FC vsock CONNECT handshake for the ADR-0066 port relay
@@ -4074,6 +4244,7 @@ fn persist_sandbox_manifest(
             api_socket: state.firecracker_socket.clone(),
             vsock_uds_base: state.vsock_uds_path.clone(),
             rootfs_canonical: state.rootfs_canonical.clone(),
+            swap_canonical: state.swap_canonical.clone(),
             vsock_cid: state.vsock_cid,
         },
         network,
@@ -6710,6 +6881,7 @@ impl FirecrackerBackend {
             trace_lineage_id: None,
             source_rootfs_canonical,
             source_harness_canonical: None,
+            source_swap_canonical: live.state.swap_canonical.clone(),
             source_vsock_canonical: Some(live.state.vsock_uds_path.clone()),
         };
         serde_json::to_vec_pretty(&manifest)
@@ -6770,7 +6942,14 @@ impl FirecrackerBackend {
     ) -> Result<SnapshotMetadata, SandboxError> {
         // Read sandbox state under the dashmap guard, drop guard before
         // any await so we don't hold the read lock across an HTTP call.
-        let (socket, spec, net_snapshot, live_rootfs_canonical, live_vsock_uds) = {
+        let (
+            socket,
+            spec,
+            net_snapshot,
+            live_rootfs_canonical,
+            live_swap_canonical,
+            live_vsock_uds,
+        ) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             // Cold-path sandboxes carry `net`; M1.16 warm-restored
             // sandboxes carry `netns` with the same TAP name + CIDR
@@ -6796,6 +6975,7 @@ impl FirecrackerBackend {
                 live.state.spec.clone(),
                 net_snapshot,
                 live.state.rootfs_canonical.clone(),
+                live.state.swap_canonical.clone(),
                 live.state.vsock_uds_path.clone(),
             )
         };
@@ -6873,6 +7053,11 @@ impl FirecrackerBackend {
         // (ADR 0018 §12p) — so its embedded `path_on_host` tracks the
         // ADR 0021 P1.5: harness drive retired — nothing to anchor.
         let source_harness_canonical: Option<PathBuf> = None;
+        // ADR 0112: the swap drive is never re-pointed (restore installs
+        // the symlink at the EMBEDDED path), so the live state's carried
+        // canonical is exactly what state.bin has open — same 12o
+        // contract as rootfs.
+        let source_swap_canonical = live_swap_canonical;
         let source_vsock_canonical = Some(live_vsock_uds);
         // ADR 0014 sec-hardening: `spec.env` carries session secrets
         // (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, etc.) verbatim
@@ -6901,6 +7086,7 @@ impl FirecrackerBackend {
             // trace via `--prefault-trace <hint>`. Set from FC
             // config; falls back to None when not wired.
             trace_host_hint: self.config.host_id,
+            source_swap_canonical,
             // Tier 2 (resume-prefault fix): patched to the session id by the
             // host-agent at snapshot-finish (session-agnostic here).
             trace_lineage_id: None,
@@ -7535,6 +7721,7 @@ mod tests {
             trace_host_hint: None,
             trace_lineage_id: None,
             source_rootfs_canonical: None,
+            source_swap_canonical: None,
             source_harness_canonical: None,
             source_vsock_canonical: None,
         };
@@ -8848,6 +9035,7 @@ mod tests {
                     vsock_cid: 3,
                     vsock_uds_path: be.work_dir.join(id.to_string()).join("vsock.sock"),
                     rootfs_canonical: be.work_dir.join(id.to_string()).join("rootfs.ext4"),
+                    swap_canonical: None,
                 },
                 child: None,
                 fc_pid: None,
@@ -8918,6 +9106,7 @@ mod tests {
             vsock_cid: 3,
             vsock_uds_path: PathBuf::new(),
             rootfs_canonical: PathBuf::new(),
+            swap_canonical: None,
         };
 
         let running_id = SandboxId::new();
@@ -9085,6 +9274,7 @@ mod tests {
                     vsock_cid: 3,
                     vsock_uds_path: jail_dir.join("vsock.sock"),
                     rootfs_canonical: jail_dir.join("rootfs.ext4"),
+                    swap_canonical: None,
                 },
                 child: Some(child),
                 fc_pid: Some(fc_pid),
