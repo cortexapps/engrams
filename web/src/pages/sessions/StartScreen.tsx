@@ -52,7 +52,6 @@ import { isSubmitKey, useEnterToSend } from "../../hooks/useEnterToSend";
 import { catalogToViews } from "../../components/integrations/useConnectorViews";
 import { ProviderTile } from "../../components/integrations/ProviderTile";
 import { ProfileIcon } from "../../components/profiles/ProfileIcon";
-import { ProfileChip } from "../../components/profiles/ProfileChip";
 import { StatusGlyph } from "../../components/Glyph";
 import { humanizeAction } from "../../lib/connectorModel";
 import { derivePolicy, type DerivedPolicy } from "../../lib/profilePolicy";
@@ -114,7 +113,16 @@ export function StartScreen() {
   const { data: harnesses } = useHarnessCatalog(true);
   const { data: harnessEnvVars } = useHarnessEnv(true);
   const { data: credentials } = useCredentials(true);
-  const { data: taskList } = useTasksAsSessionList({ scope: "mine", pageSize: 25 });
+  // `order: "recency"` — the DEFAULT list order bands live work onto page one,
+  // which is right for a task list and wrong here: with 25 live or idle tasks a
+  // task you finished five minutes ago never enters the window, so the one list
+  // meant for re-entry cannot show the thing you just left. (It also seeds the
+  // default profile below, which would pick from the same skewed window.)
+  const { data: taskList } = useTasksAsSessionList({
+    scope: "mine",
+    pageSize: 25,
+    order: "recency",
+  });
   const createTaskMutation = useMutation(createTask, {
     onSuccess: () =>
       qc.invalidateQueries({
@@ -672,8 +680,13 @@ function PolicyReceipt({
 }
 
 // Re-entry, not a data grid: the few most-recent tasks in the same vocabulary as
-// the rail (glyph + short id + profile + age), each a link into that session.
-// The full table is one click away.
+// the rail (glyph + name + profile + age), each a link into that session. The
+// full table is one click away.
+//
+// The name is the TITLE, exactly as the rail and the task list show it: this is
+// the list meant to get you back into yesterday's work, so it must not be the
+// one place a task has no name. The id stays on the row's tooltip, and an
+// untitled task still falls back to it.
 function RecentTasks({ rows }: { rows: SessionListItem[] }) {
   const now = useNow();
   if (rows.length === 0) {
@@ -711,12 +724,17 @@ function RecentTasks({ rows }: { rows: SessionListItem[] }) {
               <span className="inline-flex w-3 shrink-0 justify-center text-[0.7rem] leading-none">
                 <StatusGlyph status={s.status} />
               </span>
-              <span className="shrink-0 font-mono text-sm">{shortId(s.id)}</span>
-              <ProfileChip
-                profile={s.profile}
-                fallbackImage={s.image}
-                className="min-w-0 text-xs"
-              />
+              {/* The name, and nothing else. The profile was here too, which on
+                  a five-row re-entry list is a column of the same word — you
+                  came back for the task, not for what it runs on. */}
+              <span
+                className={cn(
+                  "min-w-0 flex-1 truncate text-sm",
+                  s.title ? "font-medium" : "font-mono",
+                )}
+              >
+                {s.title ?? shortId(s.id)}
+              </span>
               <span className="ml-auto shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
                 {relativeTime(s.last_active_at, now)}
               </span>
