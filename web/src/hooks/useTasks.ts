@@ -14,7 +14,7 @@ import {
   listTasks,
   updateTask,
 } from "../gen/engram/app/v1/task-TaskService_connectquery";
-import type { SessionListItem } from "../lib/types";
+import { UNKNOWN_STATE, type ListRowState, type SessionListItem } from "../lib/types";
 import type { Task } from "../gen/engram/app/v1/task_pb";
 import { authClient } from "../lib/auth-client";
 
@@ -25,6 +25,9 @@ export interface TaskListParams {
   createdByUserIds?: string[];
   page?: number;
   pageSize?: number;
+  /** "" (default) bands live work onto page one; "recency" returns the newest
+   *  first whatever their state. See `order` on ListTasksRequest. */
+  order?: "" | "recency";
 }
 
 const TRANSITIONAL_TASK_STATES = new Set([
@@ -64,7 +67,12 @@ export function pollIntervalFor(tasks: readonly Task[] | undefined): number {
  *
  * `createdByUserId` is preserved in `user_id` for filtering and authorization;
  * owner labels ride the Task row from the server-side identity join. */
-export function taskToSessionListItem(task: Task): SessionListItem {
+export function taskToSessionListItem(
+  task: Task,
+  /** The INVERSE of `sessionStateUnavailable` on the response. False means the
+   *  control plane did not answer, so an absent session is UNKNOWN, not gone. */
+  sessionStateAvailable = true,
+): SessionListItem {
   const ref = task.sessions[0];
   const sess = ref?.session;
   const snap = ref?.profile;
@@ -80,7 +88,20 @@ export function taskToSessionListItem(task: Task): SessionListItem {
     title: task.title ?? null,
     titleIsCustom: task.titleIsCustom,
     // Session proto fields are strings (proto3 generated TS), matching SessionState/SessionMode.
-    status: (sess?.status ?? "pending") as SessionListItem["status"],
+    //
+    // A ref carrying a session id but NO session means the control plane no
+    // longer has it: the sandbox was collected, which is `dead`. NOT `pending`,
+    // the very first state of the lifecycle — that would draw a task reaped
+    // months ago as if it were about to start, and band it under "Working".
+    // Only a task with no reference at all is genuinely pending.
+    //
+    // Unless the control plane never answered, in which case EVERY session is
+    // absent and none of them is dead — `unknown`, and the surfaces stop
+    // banding. Mirrors `displayState` in orchestrator/src/rpc/tasks.ts, which
+    // makes the same call for the state filter and the list ordering; keep the
+    // two in lockstep.
+    status: (sess?.status ??
+      (!ref ? "pending" : sessionStateAvailable ? "dead" : UNKNOWN_STATE)) as ListRowState,
     needsAttention: task.status === "awaiting_review",
     image: sess?.image ?? "",
     mode: (sess?.mode ?? "agent") as SessionListItem["mode"],
@@ -210,6 +231,8 @@ export function useAdminUsersMap(isAdmin: boolean) {
 interface InfiniteSessionListResult {
   data: SessionListItem[] | undefined;
   totalCount: number | undefined;
+  /** False when any loaded page came back without live session state. */
+  sessionStateAvailable: boolean;
   hasNextPage: boolean;
   isFetchingNextPage: boolean;
   fetchNextPage: ReturnType<typeof useInfiniteQuery>["fetchNextPage"];
@@ -253,8 +276,12 @@ export function useTasksInfiniteAsSessionList(
   const seen = new Set<string>();
   // Live reordering can move the same task across page boundaries between
   // fetches, so keep the first occurrence to preserve server display order.
+  // Per PAGE, not per response: a poll refetches every loaded page, so one of
+  // them can come back without live state while the others have it.
   const data = query.data?.pages
-    .flatMap((page) => page.tasks.map(taskToSessionListItem))
+    .flatMap((page) =>
+      page.tasks.map((task) => taskToSessionListItem(task, !page.sessionStateUnavailable)),
+    )
     .filter((item) => {
       if (seen.has(item.id)) return false;
       seen.add(item.id);
@@ -265,6 +292,9 @@ export function useTasksInfiniteAsSessionList(
   return {
     data,
     totalCount: lastPage?.totalCount,
+    // One bad page is enough: the surfaces stop banding rather than band a
+    // list where some rows have live state and some are silently unknown.
+    sessionStateAvailable: (query.data?.pages ?? []).every((page) => !page.sessionStateUnavailable),
     hasNextPage: query.hasNextPage,
     isFetchingNextPage: query.isFetchingNextPage,
     fetchNextPage: query.fetchNextPage,
@@ -277,13 +307,16 @@ export function useTasksInfiniteAsSessionList(
 export function useTasksAsSessionList(params?: TaskListParams): {
   data: SessionListItem[] | undefined;
   totalCount: number | undefined;
+  sessionStateAvailable: boolean;
   isPending: boolean;
   error: unknown;
 } {
   const { data, isPending, error } = useTasks(params);
+  const available = !data?.sessionStateUnavailable;
   return {
-    data: data?.tasks.map(taskToSessionListItem),
+    data: data?.tasks.map((task) => taskToSessionListItem(task, available)),
     totalCount: data?.totalCount,
+    sessionStateAvailable: available,
     isPending,
     error,
   };

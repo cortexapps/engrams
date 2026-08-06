@@ -5,7 +5,9 @@ Status: Accepted
 Commit chain: cf65dd78 (ADR) → b9b32b32 (ListTasks filters + pagination) →
 df74b6ff (web surfaces + composite FilterBar) → 93b7cba0 (rev 3: search into
 the Drizzle where-clause) → fd1a7e35 (rev 4: infinite scroll, clamp 200→1000)
-→ 54c2d936 (rev 5: pinned list chrome + virtualized rows).
+→ 54c2d936 (rev 5: pinned list chrome + virtualized rows)
+→ rev 7 (band ordering, `order`, and `session_state_unavailable` — this
+revision; see "Rev 7" below).
 
 As-built divergences from the original proposal: search moved from in-memory
 into SQL once it was clear only the synthetic unattributed rows genuinely need
@@ -65,24 +67,81 @@ message ListTasksRequest {
   // no owner filter.
   repeated string created_by_user_ids = 3;
   // Live session-state filter (e.g. "active", "idle", "dead"). A task matches
-  // when its DISPLAY state — primary session's live status, or "pending" when
-  // no live session is known — is in the set. Empty = no filter.
+  // when its DISPLAY state is in the set: the primary session's live status,
+  // "pending" when the task has no session at all, or (rev 7) "dead" when its
+  // session is gone from the control plane. Empty = no filter. Nothing matches
+  // while session state is unavailable — see rev 7.
   repeated string states = 4;
-  // 1-based page over the filtered, most-recently-active-first ordering.
+  // 1-based page over the filtered ordering.
   // page_size 0 = unpaginated (legacy callers); clamped to 1000 otherwise
   // (raised from 200 in rev 4: the web paginates by a growing page_size,
   // and a low clamp would silently stall its infinite scroll).
   int32 page = 5;
   int32 page_size = 6;
+  // rev 7. "" = band first, then recency inside the band. "recency" = strict
+  // most-recently-active-first.
+  string order = 7;
 }
 message ListTasksResponse {
   repeated Task tasks = 1;
   int32 total_count = 2; // matches BEFORE pagination
+  // rev 7. True when the control plane did not answer, so no task on this
+  // response carries live session state.
+  bool session_state_unavailable = 3;
 }
 ```
 
-An empty request is bit-for-bit today's behavior, so existing callers (CLI
-`task list`, web Fleet / operator Overview) are untouched.
+An empty request was bit-for-bit the pre-ADR behavior, so existing callers (CLI
+`task list`, web Fleet / operator Overview) were untouched. **Rev 7 changes
+that**: an empty request now bands before it pages. The rows and the total are
+the same; their order is not. A caller that needs the old strict recency asks
+for `order: "recency"`.
+
+### Rev 7 — band ordering, and the difference between gone and unknown
+
+Three changes, one cause: the list is PAGED, and both its order and its notion
+of "no session" were answering the wrong question.
+
+**Band before recency (default).** Ordering by activity alone made "is anything
+running?" a question about which page you fetched. An org whose tasks are 90%
+finished — the steady state, because work ends and history accumulates — buries
+its live tasks somewhere in page four. `taskBandRank` sorts attention (ADR 0107
+`awaiting_review`) → working → idle → terminal, then recency inside the band.
+The web rail draws the same four bands as headers (`useRailSessions.RailBand`);
+the two must stay in lockstep.
+
+**`order = "recency"` for the callers that mean it.** The start screen's
+"Recent" list wants the newest few whatever their state. Under band order a
+task finished five minutes ago is paged out behind every live one, and
+re-sorting the page the caller was handed cannot recover a row that never made
+the window. So it is a request field, not a client-side sort.
+
+**`session_state_unavailable` — gone is not unknown.** `ListSessions` is backed
+by the coordinator's `list_active_sessions`, which returns the reserving states
+plus `idle` and deliberately drops `host_lost` and every terminal row. So a
+referenced session missing from the reply normally means the sandbox was
+collected: display state `dead`. But `rpc/tasks.ts` also catches an upstream
+failure and serves the list with an EMPTY session set — under which the same
+rule condemns every task at once. Combined with a rail that collapses its
+Finished band by default, one failed request emptied a caller's task list.
+
+The response now says which case it is. When the flag is set: no task carries
+live state, the display state is `unknown` (not a `SessionState` — it is the
+absence of one), NOTHING matches a `states` filter, and the server falls back
+to plain recency because every band rank would be identical anyway. The web
+mirrors it — one unlabelled group, nothing collapsible, and a line saying why.
+
+The field is stated in the NEGATIVE deliberately. proto3 defaults a bool to
+false, so the absent field has to mean "nothing is wrong"; named positively, a
+new client reading an old server would decide the control plane was down and
+drop every list to its degraded shape.
+
+**`sessions[0]` is now the primary ref, by construction.** The refs query has no
+`ORDER BY`, and a PR review keeps its torn-down `finder` ref before adding a
+live `verifier` ref to the same task. Whichever row Postgres returned first
+became the task's representative — so a running review could report `dead`.
+`buildTask` now orders refs explicitly: `role == "primary"`, then any ref whose
+session is live, then newest, then session id for stability.
 
 ### Where each filter runs (the SQL / in-memory split)
 

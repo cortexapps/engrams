@@ -78,6 +78,20 @@ export type SessionState =
   | "failed"
   | "dead";
 
+/**
+ * A LIST row's state, which is the lifecycle plus one thing the lifecycle
+ * cannot express: we asked and nobody answered.
+ *
+ * `unknown` is not a state a session is ever IN. It appears when ListTasks
+ * comes back with `sessionStateAvailable: false` — the orchestrator could not
+ * reach the control plane, so no row on that response carries live state. It
+ * is deliberately outside `SessionState` so nothing can mistake it for a
+ * lifecycle position, and so every consumer has to decide what it draws.
+ */
+export type ListRowState = SessionState | "unknown";
+
+export const UNKNOWN_STATE = "unknown" satisfies ListRowState;
+
 // Stage B1 wire shape: a session's image is now a flat OCI URI
 // (`<host>[:port]/<repo>:<tag>`). The earlier discriminated
 // `{ kind, repo, tag }` shape is gone — the backend resolves the
@@ -133,7 +147,11 @@ export interface ProfileSnapshotView {
 
 /** ADR 0031: a session list row — the session plus the owner's identity
  * (present only in the admin "all" view; `null` in the "mine" view). */
-export interface SessionListItem extends Session {
+export interface SessionListItem extends Omit<Session, "status"> {
+  /** Widened from `Session`: a list row can also be `unknown` (see
+   *  `ListRowState`). A single fetched session never is — you asked for that
+   *  one by id and got an answer or an error. */
+  status: ListRowState;
   owner_email: string | null;
   owner_name: string | null;
   /** ADR 0107: the owning task derived `awaiting_review` — the session is
