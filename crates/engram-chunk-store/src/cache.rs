@@ -768,6 +768,51 @@ impl ChunkCache {
         self.path_for(hash).try_exists().unwrap_or(false)
     }
 
+    /// Read `len` bytes at `offset` from a resident chunk's file WITHOUT
+    /// materializing the whole chunk. `None` = not servable from disk
+    /// (absent, evicted mid-read, wrong length, or short read) — the
+    /// caller falls back to the whole-chunk `get` path, which carries
+    /// the fetch/validation semantics.
+    ///
+    /// Why this is sound against the cache's own machinery:
+    /// - Populate is atomic temp+rename (module doc), so a file visible
+    ///   at the content-addressed path is complete and verified — there
+    ///   is no torn-write window to race.
+    /// - Reads do not touch recency by design (the cache is
+    ///   FIFO-by-first-write; see the module doc), so bypassing `get`
+    ///   loses no eviction signal.
+    /// - An eviction unlink between `open` and `read` just makes the
+    ///   pread hit a still-open fd — POSIX keeps the data readable until
+    ///   the fd closes, and content-addressing keeps it the RIGHT data.
+    ///
+    /// `expected_len` is the manifest's chunk width: a file of any other
+    /// size is treated as not-resident rather than served, mirroring the
+    /// `ShortChunk` validation on the whole-chunk path.
+    pub fn read_range(
+        &self,
+        hash: ChunkHash,
+        expected_len: u64,
+        offset: u64,
+        len: usize,
+    ) -> Option<Bytes> {
+        let file = std::fs::File::open(self.path_for(hash)).ok()?;
+        if file.metadata().ok()?.len() != expected_len {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            file.read_exact_at(&mut buf, offset).ok()?;
+            Some(Bytes::from(buf))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (file, offset);
+            None
+        }
+    }
+
     /// ADR 0075: the on-disk path for a resident chunk. Public so the
     /// substrate populate server can open + fd-pass a chunk it just
     /// populated; the layout is the shared `reader::chunk_path`, so
