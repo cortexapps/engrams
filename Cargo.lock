@@ -405,6 +405,7 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -7546,7 +7547,7 @@ name = "workspace-hack"
 version = "0.1.0"
 dependencies = [
  "axum 0.7.9",
- "axum-core 0.4.5",
+ "axum-core 0.5.6",
  "base64 0.22.1",
  "bitflags",
  "byteorder",
