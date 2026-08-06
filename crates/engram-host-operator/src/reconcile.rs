@@ -65,7 +65,11 @@ pub struct Ctx {
 }
 
 const STEADY_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
-const AUTOSCALE_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+// The single operator has no direct Postgres access or demand event stream.
+// One GetFleetDemand call performs three fleet-scale reads (hosts, active
+// reservations, and queued demand); one call per second keeps scale-up
+// detection near-immediate without putting the controller on the DB boundary.
+const AUTOSCALE_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
 fn steady_reconcile_interval(autoscaling_enabled: bool) -> Duration {
     if autoscaling_enabled {
@@ -736,7 +740,7 @@ mod tests {
 
     #[test]
     fn autoscaling_uses_the_fast_steady_reconcile_interval() {
-        assert_eq!(steady_reconcile_interval(true), Duration::from_secs(10));
+        assert_eq!(steady_reconcile_interval(true), Duration::from_secs(1));
         assert_eq!(steady_reconcile_interval(false), Duration::from_secs(60));
     }
 
