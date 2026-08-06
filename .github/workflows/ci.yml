@@ -598,7 +598,12 @@ jobs:
           version: 9
       - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          # Newest active-LTS line. Node 20 went EOL 2026-04-30, and jsdom 30
+          # (the vitest DOM environment) needs `^22.22.2 || ^24.15.0 || >=26`
+          # because undici 8 calls `worker_threads.markAsUncloneable`, which
+          # Node 20 does not have. Track even majors only — odd ones are
+          # Current-only and never become LTS.
+          node-version: 24
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
 
