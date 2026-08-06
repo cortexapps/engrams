@@ -524,6 +524,11 @@ pub const SWEEP_BLOCKED_LIVE_HOLDER_TOTAL: &str = "engram_nbd_sweep_blocked_live
 /// THIS is the reconcile finding a device it cannot account for at all.
 pub const REHYDRATE_UNKNOWN_DEVICE_TOTAL: &str = "engram_nbd_rehydrate_unknown_device_total";
 
+/// Gauge, label `state` = `capacity` | `free` | `warm` | `in_use` |
+/// `parked`. This makes the NBD ceiling and its real high-water pressure
+/// visible before a deployment changes `nbds_max` again.
+pub const NBD_SLOTS: &str = "engram_nbd_slots";
+
 /// The rehydrate spool-adopt arm found a shutdown spool whose lineage disagrees
 /// with the reference disk manifest (fires alongside the
 /// `shutdown-spool-lineage-mismatch` soft-invariant). The spool is PRESERVED on
