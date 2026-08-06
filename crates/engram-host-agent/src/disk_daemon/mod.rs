@@ -62,7 +62,8 @@ pub use live_manifest_publisher::{
 };
 pub use nbd::{NbdCommand, NbdReply, NbdRequest, NbdWireError, NBD_REPLY_MAGIC, NBD_REQUEST_MAGIC};
 pub use slot::{
-    build_from_kernel as build_nbd_pool_from_kernel, NbdSlot, NbdSlotAllocator, SlotState,
+    build_from_kernel as build_nbd_pool_from_kernel, NbdSlot, NbdSlotAllocator, NbdSlotCounts,
+    SlotState,
 };
 
 #[cfg(target_os = "linux")]

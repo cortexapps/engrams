@@ -120,6 +120,7 @@ async fn vsock_delivers_after_plain_pause_resume() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
     let sandbox_id = backend.create(spec).await.expect("create");
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");

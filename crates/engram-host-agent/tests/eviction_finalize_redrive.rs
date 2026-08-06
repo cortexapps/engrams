@@ -204,6 +204,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
     let sandbox = pooled_a.create(spec).await.expect("create");

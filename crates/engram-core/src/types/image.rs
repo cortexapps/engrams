@@ -254,6 +254,18 @@ impl ImageConfig {
         self.resources.suggested_vcpus.unwrap_or(DEFAULT_VCPUS)
     }
 
+    /// ADR 0112: resolved guest swap size (MiB) for an image. 0 ⇒ no
+    /// swap device (the default — swap is opt-in via
+    /// `suggested_swap_mib`). Unlike memory this never falls back to a
+    /// non-zero default, and it does NOT need the capture/restore
+    /// compute-identically dance: the value is captured into the
+    /// sidecar's `SandboxSpec` and restore reads the recorded copy, so
+    /// the device geometry cannot skew. Enable-time validation
+    /// ([`ImageConfig::validate`]) bounds it at the guest's memory.
+    pub fn resolved_swap_mib(&self) -> u32 {
+        self.resources.suggested_swap_mib.unwrap_or(0)
+    }
+
     /// The effective per-image config: this admin-authored config with
     /// the image's Dockerfile-derived [`OciRuntimeDefaults`] folded in
     /// as **defaults** — the admin config always wins:
@@ -292,6 +304,19 @@ impl ImageConfig {
                  reserves it against the host CPU budget)"
                     .into(),
             );
+        }
+        // ADR 0112: a swap device larger than the guest's memory is
+        // always a misconfiguration — the capture-time `swapoff` must
+        // page everything back into RAM, so swap > memory can never
+        // fully disarm. Reject at the user-facing boundary instead of
+        // silently capping.
+        if self.resolved_swap_mib() > self.resolved_memory_mib() {
+            return Err(format!(
+                "config `[resources] suggested_swap_mib` ({}) exceeds the guest's memory \
+                 ({} MiB) — swap must fit back into RAM at capture (ADR 0112)",
+                self.resolved_swap_mib(),
+                self.resolved_memory_mib(),
+            ));
         }
         if let Some(warm) = &self.warm {
             warm.validate()?;
@@ -432,11 +457,69 @@ pub struct ResourceHints {
     /// changes the disk manifest, so a bump takes effect on the next
     /// refresh/enable (re-capture), not on live sessions.
     pub suggested_disk_gib: Option<u32>,
+    /// ADR 0112: size of the guest's ephemeral swap device in MiB.
+    /// Absent or 0 ⇒ no swap device — nothing changes for the image.
+    /// Opting in attaches a host-file-backed RW drive whose contents
+    /// are discarded at every capture (`swapoff` runs before the
+    /// pause), so the value also bounds the worst-case capture-time
+    /// page-back-in. [`recommended_swap_mib`] gives the default sizing
+    /// formula; enable-time validation rejects a value larger than the
+    /// guest's memory (a `swapoff` that can never complete). Like
+    /// memory, the device geometry is frozen into the base snapshot's
+    /// `state.bin`, so a change takes effect on re-capture.
+    pub suggested_swap_mib: Option<u32>,
+}
+
+/// ADR 0112: the recommended swap size for a guest with `memory_mib`
+/// of RAM — `clamp(memory/4, 1 GiB, 8 GiB)`. RAM/4 bounds three things
+/// at once: the worst-case `swapoff` page-back-in at capture, the
+/// worst-case host disk footprint, and the degree of overcommit worth
+/// papering over before a bigger guest is the honest fix. Tooling that
+/// suggests a value uses this; [`ResourceHints::suggested_swap_mib`]
+/// always wins when set.
+pub fn recommended_swap_mib(memory_mib: u32) -> u32 {
+    (memory_mib / 4).clamp(1024, 8192)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR 0112 sizing: swap is opt-in (absent/0 ⇒ off), the
+    /// recommended formula is clamp(mem/4, 1 GiB, 8 GiB), and
+    /// enable-time validation rejects swap > memory.
+    #[test]
+    fn swap_sizing_resolves_and_validates() {
+        let mk = |mem: Option<u32>, swap: Option<u32>| ImageConfig {
+            name: "x".into(),
+            resources: ResourceHints {
+                suggested_memory_mib: mem,
+                suggested_vcpus: Some(2),
+                suggested_disk_gib: None,
+                suggested_swap_mib: swap,
+            },
+            ..ImageConfig::default()
+        };
+
+        // Opt-in semantics.
+        assert_eq!(mk(Some(24576), None).resolved_swap_mib(), 0);
+        assert_eq!(mk(Some(24576), Some(0)).resolved_swap_mib(), 0);
+        assert_eq!(mk(Some(24576), Some(6144)).resolved_swap_mib(), 6144);
+
+        // The recommended formula: mem/4 clamped to [1 GiB, 8 GiB].
+        assert_eq!(recommended_swap_mib(24576), 6144); // dev-brain
+        assert_eq!(recommended_swap_mib(2048), 1024); // floor
+        assert_eq!(recommended_swap_mib(65536), 8192); // ceiling
+        assert_eq!(recommended_swap_mib(DEFAULT_MEMORY_MIB), 1024);
+
+        // Validation: swap must fit back into RAM at capture.
+        assert!(mk(Some(4096), Some(4096)).validate().is_ok());
+        let err = mk(Some(4096), Some(4097)).validate().unwrap_err();
+        assert!(err.contains("suggested_swap_mib"), "got: {err}");
+        // The memory default applies when memory is unset.
+        assert!(mk(None, Some(DEFAULT_MEMORY_MIB + 1)).validate().is_err());
+        assert!(mk(None, Some(1024)).validate().is_ok());
+    }
 
     #[test]
     fn config_parses_minimal_toml() {

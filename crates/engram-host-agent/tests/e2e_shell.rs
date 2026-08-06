@@ -290,6 +290,7 @@ async fn e2e_shell_cold_via_pooled_backend() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
     let sandbox_id = pooled.create(spec).await.expect("create");
 
@@ -353,6 +354,7 @@ async fn e2e_shell_warm_via_pooled_backend() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
 
     // ---- Cold create + wait for VM to be ready ----

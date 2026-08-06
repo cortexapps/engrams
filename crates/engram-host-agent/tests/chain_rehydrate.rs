@@ -194,6 +194,7 @@ async fn survivor_chain_rehydrates_across_a_roll_and_torn_captures_fall_back_to_
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
     let sandbox = pooled_a.create(spec).await.expect("create");

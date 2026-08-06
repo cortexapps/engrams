@@ -669,6 +669,7 @@ pub(crate) fn image_config_to_proto(
             suggested_memory_mib: c.resources.suggested_memory_mib,
             suggested_vcpus: c.resources.suggested_vcpus,
             suggested_disk_gib: c.resources.suggested_disk_gib,
+            suggested_swap_mib: c.resources.suggested_swap_mib,
         }),
         warm: c.warm.as_ref().map(|w| app::ImageWarmConfig {
             command: w.command.clone(),
@@ -693,6 +694,7 @@ pub(crate) fn image_config_from_proto(
             suggested_memory_mib: r.suggested_memory_mib,
             suggested_vcpus: r.suggested_vcpus,
             suggested_disk_gib: r.suggested_disk_gib,
+            suggested_swap_mib: r.suggested_swap_mib,
         });
     let warm = match &c.warm {
         Some(w) => Some(engram_core::types::image::WarmConfig {

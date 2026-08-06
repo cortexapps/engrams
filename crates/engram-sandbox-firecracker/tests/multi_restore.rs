@@ -81,6 +81,7 @@ async fn serial_restore_from_one_canonical_n_times() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: Vec::new(),
+        swap_mib: None,
     };
 
     // Step 1: Create source + let it settle + snapshot + destroy.
@@ -174,6 +175,7 @@ async fn concurrent_restores_from_one_snapshot_rekey_vsock() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: Vec::new(),
+        swap_mib: None,
     };
 
     let source_id = backend.create(spec).await.expect("create source");
@@ -277,6 +279,7 @@ async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: Vec::new(),
+        swap_mib: None,
     };
 
     let source_id = backend.create(spec).await.expect("create source");

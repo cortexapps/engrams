@@ -137,7 +137,11 @@ use serde::{Deserialize, Serialize};
 // host→coord inject/refresh route. Trailing-variant addition: every existing
 // encoding is unchanged, but a v23 host cannot decode a policy carrying the
 // new variant, so the roll is lockstep.
-pub const WIRE_VERSION: u32 = 24;
+// v25 (ADR 0112): `SandboxSpec.swap_mib` — the guest's ephemeral swap
+// device size, opt-in per image. Trailing bincode field addition on the
+// create/spec wire (and the JSON sidecar, which is serde-defaulted), so
+// the roll is lockstep: a v24 host cannot decode a v25 create spec.
+pub const WIRE_VERSION: u32 = 25;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic
