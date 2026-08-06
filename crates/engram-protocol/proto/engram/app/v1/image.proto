@@ -90,6 +90,10 @@ message ImageResources {
   // the host CPU budget.
   optional uint32 suggested_vcpus = 2;
   optional uint32 suggested_disk_gib = 3;
+  // ADR 0112: ephemeral guest swap size. Absent/0 = no swap device.
+  // Bounded at enable time by the guest's memory; takes effect on
+  // re-capture (the device geometry is frozen in the base snapshot).
+  optional uint32 suggested_swap_mib = 4;
 }
 
 // Mirrors engram_core::types::image::WarmConfig (ADR 0080: absorbs the

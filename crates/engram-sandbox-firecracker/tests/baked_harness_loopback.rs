@@ -156,6 +156,7 @@ async fn baked_noop_harness_emits_run_started() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
     let sandbox_id = backend.create(spec).await.expect("create sandbox");
 

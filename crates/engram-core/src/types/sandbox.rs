@@ -109,6 +109,20 @@ pub struct SandboxSpec {
     /// stay in lockstep (an empty `Vec` still encodes as length 0).
     #[serde(default)]
     pub aux_ro_drives: Vec<AuxRoDrive>,
+    /// ADR 0112: size (MiB) of the guest's ephemeral swap device.
+    /// `None`/`Some(0)` ⇒ no swap drive is attached. The FC backend
+    /// attaches a host-file-backed RW drive of exactly this size at
+    /// base-snapshot capture and `patch_drive`s a fresh sparse file
+    /// over it in every restore's paused window — contents are
+    /// discarded at capture, never persisted, never in a manifest.
+    ///
+    /// Restore reads this from the snapshot sidecar's recorded spec
+    /// (the device geometry is frozen in `state.bin`), so capture and
+    /// restore cannot skew. `#[serde(default)]` covers pre-0112
+    /// sidecar JSON; the coord ↔ host bincode wire is a lockstep roll
+    /// per the clean-break norm above.
+    #[serde(default)]
+    pub swap_mib: Option<u32>,
 }
 
 /// A read-only mount the host attaches to the guest as an additional
@@ -617,6 +631,7 @@ mod tests {
             workdir: None,
             network: NetworkPolicy::default(),
             aux_ro_drives: drives,
+            swap_mib: None,
         }
     }
 
@@ -644,6 +659,19 @@ mod tests {
         let back: SandboxSpec = serde_json::from_str(&json).expect("json decode");
         assert_eq!(back.aux_ro_drives, spec.aux_ro_drives);
 
+        // ADR 0112: `swap_mib` rides both encodings (wire v25). Pin the
+        // `Some` form — `None` is covered by every other literal here.
+        let swap_spec = SandboxSpec {
+            swap_mib: Some(6144),
+            ..spec_with_aux_drives(vec![])
+        };
+        let bytes = bincode::serialize(&swap_spec).expect("bincode encode swap");
+        let back: SandboxSpec = bincode::deserialize(&bytes).expect("bincode decode swap");
+        assert_eq!(back.swap_mib, Some(6144));
+        let json = serde_json::to_string(&swap_spec).expect("json encode swap");
+        let back: SandboxSpec = serde_json::from_str(&json).expect("json decode swap");
+        assert_eq!(back.swap_mib, Some(6144));
+
         // Empty is the common case (no bundles attached) — must encode as
         // a zero-length vec and decode cleanly.
         let bytes =
@@ -669,6 +697,8 @@ mod tests {
         }"#;
         let spec: SandboxSpec = serde_json::from_str(legacy).expect("legacy json decode");
         assert!(spec.aux_ro_drives.is_empty());
+        // ADR 0112: pre-swap sidecars decode with no swap device.
+        assert_eq!(spec.swap_mib, None);
     }
 
     #[test]

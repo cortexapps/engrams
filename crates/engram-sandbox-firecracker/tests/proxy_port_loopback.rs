@@ -151,6 +151,7 @@ async fn port_relay_reaches_guest_loopback_without_hol_blocking() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
     let sandbox_id = backend.create(spec).await.expect("create sandbox");
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");

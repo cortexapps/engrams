@@ -674,6 +674,7 @@ impl SandboxBackend for ProcessBackend {
                     workdir: None,
                     network: Default::default(),
                     aux_ro_drives: Vec::new(),
+                    swap_mib: None,
                 };
                 self.sandboxes.insert(id, SandboxState::new(spec, cwd));
                 return Ok(id);
@@ -725,6 +726,7 @@ impl SandboxBackend for ProcessBackend {
             workdir: None,
             network: Default::default(),
             aux_ro_drives: Vec::new(),
+            swap_mib: None,
         };
         self.sandboxes.insert(id, SandboxState::new(spec, cwd));
         Ok(id)
@@ -1491,6 +1493,7 @@ mod tests {
             workdir: None,
             network: Default::default(),
             aux_ro_drives: Vec::new(),
+            swap_mib: None,
         }
     }
 

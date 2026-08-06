@@ -62,6 +62,7 @@ fn test_spec() -> SandboxSpec {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: Vec::new(),
+        swap_mib: None,
     }
 }
 

@@ -153,6 +153,7 @@ async fn agentd_rolls_via_bundle_without_recapture() {
         // Symbolic — the backend must resolve it to the staged `agentd`
         // stamp key (the capture-path resolution this test pins).
         aux_ro_drives: vec![AuxRoDrive::reserved_slot(AuxRoDrive::AGENTD_SLOT_INDEX)],
+        swap_mib: None,
     };
     let original = backend.create(spec).await.expect("create");
 

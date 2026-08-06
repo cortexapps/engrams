@@ -66,6 +66,7 @@ async fn snapshot_then_restore_round_trips_microvm() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: Vec::new(),
+        swap_mib: None,
     };
 
     // Step 1: create
@@ -186,6 +187,7 @@ async fn balloon_inflate_shrinks_full_memory_dump() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: Vec::new(),
+        swap_mib: None,
     };
     let id = backend.create(spec).await.expect("create");
     let _ = common::wait_for_log_contains(

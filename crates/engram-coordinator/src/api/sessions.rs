@@ -48,6 +48,9 @@ pub(crate) fn cold_boot_spec(
         .resources
         .suggested_disk_gib
         .unwrap_or(DEFAULT_DISK_GIB);
+    // ADR 0112: swap is opt-in per image; 0 stays `None` so backends
+    // and old sidecars see "no swap device" identically.
+    let swap_mib = config.resolved_swap_mib();
 
     // ADR 0055: capture reserves a fixed pool of dynamic-mount slots, each
     // carrying the sentinel. Per-session creates `patch_drive` the selected
@@ -72,6 +75,7 @@ pub(crate) fn cold_boot_spec(
         workdir: None,
         network,
         aux_ro_drives,
+        swap_mib: (swap_mib > 0).then_some(swap_mib),
     }
 }
 

@@ -2223,6 +2223,7 @@ pub(crate) mod tests {
             workdir: None,
             network: Default::default(),
             aux_ro_drives: Vec::new(),
+            swap_mib: None,
         };
         let sb = state.services.host.create(spec).await.expect("create");
         mini.session.lock().sandbox_id = Some(sb);

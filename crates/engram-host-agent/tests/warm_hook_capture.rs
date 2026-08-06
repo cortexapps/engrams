@@ -365,6 +365,7 @@ impl TestEnv {
             workdir: None,
             network: Default::default(),
             aux_ro_drives: vec![self.staged.agentd_slot()],
+            swap_mib: None,
         }
     }
 }

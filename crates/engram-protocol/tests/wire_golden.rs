@@ -175,6 +175,10 @@ fn sandbox_spec() -> SandboxSpec {
             sha256: Some("a".repeat(64)),
             ..AuxRoDrive::reserved_slot(0)
         }],
+        // ADR 0112 (wire v25): pin the `Some` encoding — the `None`
+        // arm is a single 0 byte and is covered by the legacy-decode
+        // test in engram-core.
+        swap_mib: Some(6144),
     }
 }
 
@@ -632,8 +636,12 @@ fn wire_version_pinned() {
     // `OauthConnector` variant (connector OAuth on the inject rail). Existing
     // goldens keep their bytes (trailing-variant addition); the oauth-policy
     // golden is ADDED and the variant index is pinned at 1.
+    // 24 -> 25: ADR 0112 — `SandboxSpec` gains the TRAILING `swap_mib`
+    // field (ephemeral guest swap size). Only `sandbox_spec.bin` changed
+    // bytes (the fixture pins `Some(6144)`); every other golden embeds no
+    // spec and kept its bytes. Lockstep coord+host roll.
     assert_eq!(
-        WIRE_VERSION, 24,
+        WIRE_VERSION, 25,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

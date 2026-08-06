@@ -226,6 +226,7 @@ async fn two_host_live_teleport_preserves_post_checkpoint_state() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
     let vm = host_a.pooled.create(spec).await.expect("create on A");
     let _ = exec(&host_a.pooled, vm, "true").await;
@@ -659,6 +660,7 @@ async fn two_host_live_teleport_held_stdin_pipe_survives() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
     let vm = host_a.pooled.create(spec).await.expect("create on A");
     let _ = exec(&host_a.pooled, vm, "true").await;
@@ -974,6 +976,7 @@ async fn two_host_teleport_nbd_rootfs_survives_source_destroy() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
     let vm = host_a.pooled.create(spec).await.expect("create on A");
     let _ = exec(&host_a.pooled, vm, "true").await;
@@ -1163,6 +1166,7 @@ async fn two_host_kill_source_mid_pull_fails_clean_on_dest() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
     let vm = host_a.pooled.create(spec).await.expect("create on A");
     let _ = exec(&host_a.pooled, vm, "true").await;

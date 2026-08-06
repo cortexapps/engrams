@@ -238,6 +238,7 @@ async fn drain_wave_teleports_every_session_off_host_a() {
             workdir: None,
             network: Default::default(),
             aux_ro_drives: vec![staged.agentd_slot()],
+            swap_mib: None,
         };
         let vm = host_a.pooled.create(spec).await.expect("create on A");
         let _ = exec(&host_a.pooled, vm, "true").await;
