@@ -7,12 +7,16 @@
 #
 #   docker buildx build -f docker/web.Dockerfile -t engram/web:dev .
 
-FROM node:20-alpine AS builder
+FROM node:24-alpine AS builder
 WORKDIR /src
 
-# Enable pnpm via corepack. Pin to the same major as CI (pnpm v9)
-# so local + CI builds match.
-RUN corepack enable && corepack prepare pnpm@9 --activate
+# pnpm v9, matching the CI web lane (pnpm/action-setup version 9 in
+# .github/workflows/ci.yml) so local + CI builds agree.
+#
+# Installed directly rather than through corepack: Node stopped shipping
+# corepack in v25 (nodejs/node#57617), so `corepack enable` is a dead end
+# — it would break again at the next even LTS. npm is in the base image.
+RUN npm install -g pnpm@9
 
 # Lockfile first so the install layer stays warm across source edits.
 COPY web/package.json web/pnpm-lock.yaml ./
@@ -24,7 +28,7 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 COPY web/ ./
 RUN pnpm build
 
-FROM nginx:1.27-alpine
+FROM nginx:1.31-alpine
 # Drop the upstream default config — the chart provides it via
 # ConfigMap mount (deploy/helm/engram/templates/web-configmap.yaml).
 # Keeping it would leave a stale 80/SPA-only fallback inside the
