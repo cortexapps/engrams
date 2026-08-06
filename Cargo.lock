@@ -1076,7 +1076,6 @@ version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
- "powerfmt",
  "serde_core",
 ]
 
@@ -7572,6 +7571,7 @@ dependencies = [
  "futures-util",
  "generic-array",
  "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "hashbrown 0.15.5",
  "hyper",
  "hyper-rustls",
@@ -7625,6 +7625,7 @@ dependencies = [
  "sqlx-postgres",
  "subtle",
  "syn 2.0.117",
+ "syn 3.0.3",
  "thiserror 2.0.19",
  "time",
  "time-macros",
