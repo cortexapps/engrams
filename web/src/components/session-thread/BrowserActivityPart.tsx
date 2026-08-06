@@ -31,7 +31,7 @@ export function BrowserActivityPart({
         ) : (
           <CheckCircle2Icon
             aria-label="Browser action completed"
-            className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
+            className="size-3.5 shrink-0 text-instrument-nominal-ink"
           />
         )}
       </div>

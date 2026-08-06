@@ -83,10 +83,7 @@ export function Overview() {
 
   return (
     <div className="space-y-8">
-      <PageHeading
-        title="Operator"
-        description="Fleet capacity and storage durability at a glance."
-      />
+      <PageHeading title="Operator" />
 
       <VerdictBanner verdict={verdict} />
 

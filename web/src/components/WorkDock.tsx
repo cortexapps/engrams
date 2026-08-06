@@ -20,12 +20,15 @@ const STATUS_ORDER: Record<AgentTaskStatus, number> = {
 function StatusIcon({ status }: { status: AgentTaskStatus }) {
   switch (status) {
     case "in_progress":
-      return <CircleDotIcon aria-label="In progress" className="size-4 shrink-0 text-primary" />;
+      // `ring` is the app's established "this is running" tone (see Glyph's
+      // toneFor) — racing green on paper, lime on the dark ground. `primary`
+      // would have said "this is a thing you can click".
+      return <CircleDotIcon aria-label="In progress" className="size-4 shrink-0 text-ring" />;
     case "completed":
       return (
         <CircleCheckIcon
           aria-label="Completed"
-          className="size-4 shrink-0 text-emerald-600 dark:text-emerald-400"
+          className="size-4 shrink-0 text-instrument-nominal-ink"
         />
       );
     default:
@@ -155,9 +158,9 @@ export function WorkDock({ events }: { events: IndexedEvent[] }) {
         className="flex h-10 w-full shrink-0 items-center gap-2 border-t px-4 text-left text-sm hover:bg-accent/50"
       >
         {inProgress ? (
-          <CircleDotIcon className="size-4 shrink-0 animate-pulse text-primary" />
+          <CircleDotIcon className="size-4 shrink-0 animate-pulse text-ring" />
         ) : allTasksCompleted ? (
-          <CircleCheckIcon className="size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+          <CircleCheckIcon className="size-4 shrink-0 text-instrument-nominal-ink" />
         ) : (
           <CircleDashedIcon className="size-4 shrink-0 text-muted-foreground" />
         )}

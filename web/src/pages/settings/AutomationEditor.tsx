@@ -617,8 +617,6 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
     <div className="space-y-6">
       <PageHeading
         title={mode === "create" ? "New automation" : draft.name || "Automation"}
-        eyebrow="Org · Automations"
-        description="Define one trigger and the exact session launch it produces. Preview templates against real redacted events before saving."
         actions={
           <>
             <Button asChild variant="outline" size="sm">

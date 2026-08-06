@@ -7,7 +7,7 @@ import { useArtifacts, type ArtifactScope } from "../../hooks/useArtifacts";
 import { errorMessage } from "../../lib/errors";
 import { ArtifactCard } from "./ArtifactCard";
 import { PageHeading } from "@/components/page-heading";
-import { TabRow } from "@/components/TabRow";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Text } from "@/components/ui/text";
@@ -46,29 +46,32 @@ export function ArtifactsLibrary() {
 
   return (
     <div className="flex-1 overflow-y-auto p-4 md:p-6">
-      <PageHeading
-        title="Artifacts"
-        description="Documents your agents published — versioned, hosted, shareable."
-        showRule={false}
-      />
-      <TabRow
-        tabs={tabs}
-        active={scope}
-        onChange={(id) =>
-          navigate({
-            to: "/artifacts",
-            search: id === "mine" ? {} : { scope: id },
-          })
-        }
-        right={data ? `${data.totalCount} total` : undefined}
-      />
+      <PageHeading title="Artifacts" count={data ? `${data.totalCount}` : undefined} />
 
-      <div className="mb-4 max-w-xs">
+      {/* Scope and filter sit on one line: both narrow what the grid below
+          shows, so they belong together rather than stacked as two bands. */}
+      <div className="mt-5 mb-4 flex flex-wrap items-center gap-3">
+        <Tabs
+          value={scope}
+          onValueChange={(value) => {
+            const id = value as ScopeTab;
+            navigate({ to: "/artifacts", search: id === "mine" ? {} : { scope: id } });
+          }}
+        >
+          <TabsList aria-label="Artifact scope">
+            {tabs.map((t) => (
+              <TabsTrigger key={t.id} value={t.id} className="px-3">
+                {t.label}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </Tabs>
         <Input
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
           placeholder="Filter by title, file, type…"
           aria-label="Filter artifacts"
+          className="max-w-xs"
         />
       </div>
 

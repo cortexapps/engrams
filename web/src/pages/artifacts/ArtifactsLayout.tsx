@@ -14,14 +14,10 @@ import { Sidebar, SidebarProvider } from "@/components/ui/sidebar";
 export function ArtifactsLayout() {
   return (
     <SidebarProvider className="h-[calc(100svh-3rem)] min-h-0 md:h-svh">
-      <Sidebar
-        collapsible="none"
-        className="sidebar-section hidden border-r border-sidebar-border md:flex"
-        aria-label="Artifacts"
-      >
+      <Sidebar collapsible="none" className="sidebar-section hidden md:flex" aria-label="Artifacts">
         <ArtifactsRail />
       </Sidebar>
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <div className="section-sheet flex min-w-0 flex-1 flex-col">
         <Outlet />
       </div>
     </SidebarProvider>

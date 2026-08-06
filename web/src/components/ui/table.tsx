@@ -57,9 +57,8 @@ function TableHead({ className, ...props }: React.ComponentProps<"th">) {
     <th
       data-slot="table-head"
       className={cn(
-        // Ledger column labels: the instrument-label voice (Saira tracked
-        // caps), recessed — same role as the stat captions and section
-        // eyebrows, so it shares the Text `label` variant definition.
+        // Column labels: the shared label voice, recessed — the same role as a
+        // stat caption, so it shares the Text `label` variant definition.
         textVariants({ variant: "label", tone: "muted" }),
         "h-9 px-2 text-left align-middle whitespace-nowrap [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]",
         className,

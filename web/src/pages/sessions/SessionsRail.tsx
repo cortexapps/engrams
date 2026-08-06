@@ -183,7 +183,7 @@ export function SessionsRail() {
                                     showNum ? "opacity-100" : "opacity-0",
                                   )}
                                 >
-                                  <Badge className="min-w-5 justify-center rounded-md px-1.5 py-1 font-display font-semibold leading-none tabular-nums bg-sidebar-primary text-sidebar-primary-foreground">
+                                  <Badge className="min-w-5 justify-center rounded-md px-1.5 py-1 font-semibold leading-none tabular-nums bg-sidebar-primary text-sidebar-primary-foreground">
                                     {i + 1}
                                   </Badge>
                                 </span>

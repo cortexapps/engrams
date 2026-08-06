@@ -65,16 +65,13 @@ export function OperatorLayout() {
   return (
     <SidebarProvider className="min-h-0 flex-1">
       {/* desktop (md+): vertical second sidebar */}
-      <Sidebar
-        collapsible="none"
-        className="sidebar-section hidden border-r border-sidebar-border md:flex"
-      >
+      <Sidebar collapsible="none" className="sidebar-section hidden md:flex">
         <SidebarContent>
           {group("Telemetry", TELEMETRY)}
           {group("Config", CONFIG)}
         </SidebarContent>
       </Sidebar>
-      <div className="flex flex-1 flex-col overflow-auto">
+      <div className="section-sheet flex flex-1 flex-col overflow-y-auto">
         {/* mobile (<md): horizontal nav strip */}
         <nav className="flex gap-1 overflow-x-auto border-b p-2 md:hidden">
           {items.map((it) => (

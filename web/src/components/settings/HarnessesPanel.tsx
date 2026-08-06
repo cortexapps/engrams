@@ -50,12 +50,12 @@ export function HarnessesPanel() {
     <div className="space-y-6">
       <PageHeading
         title="Harnesses"
-        description="The agent harnesses sessions run. A profile picks a default harness, model, and effort; sessions override at launch. Configure each harness's required org credential here."
+        count={harnesses.length || undefined}
         actions={<RegisterDialog />}
       />
 
       {error && (
-        <p className="text-sm text-destructive">could not load harnesses — {String(error)}</p>
+        <p className="text-sm text-destructive">Could not load harnesses — {String(error)}</p>
       )}
 
       {isLoading ? (
@@ -152,7 +152,7 @@ function HarnessCard({ harness }: { harness: HarnessSummary }) {
         )}
 
         {del.error && (
-          <p className="text-xs text-destructive">could not remove — {String(del.error)}</p>
+          <p className="text-xs text-destructive">Could not remove — {String(del.error)}</p>
         )}
       </CardContent>
     </Card>

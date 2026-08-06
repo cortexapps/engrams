@@ -52,7 +52,7 @@ function Meter({
         : "—";
   return (
     <div className="flex items-center gap-3" title={`${label}: ${shown}%`}>
-      <span className="w-10 shrink-0 font-mono text-[0.66rem] uppercase tracking-wide text-muted-foreground">
+      <span className="w-10 shrink-0 text-[0.72rem] font-medium text-muted-foreground">
         {label}
       </span>
       <Progress value={shown} className="h-2" indicatorClassName={cn(hot && "bg-destructive")} />
@@ -80,7 +80,24 @@ export function Fleet() {
 
   return (
     <div className="space-y-6">
-      <PageHeading title="Fleet" description="Firecracker hosts and capacity." />
+      {/* The reconciler's state is a live reading, so it rides the masthead as
+          a readout rather than trailing the page as a sentence. */}
+      <PageHeading
+        title="Fleet"
+        count={h.length ? `${h.length} host${h.length === 1 ? "" : "s"}` : undefined}
+        actions={
+          <span className="flex items-center gap-2 text-sm text-muted-foreground">
+            <span
+              aria-hidden
+              className={cn(
+                "size-2 rounded-full",
+                anyDraining ? "bg-instrument-caution" : "bg-instrument-nominal",
+              )}
+            />
+            {anyDraining ? "Reconciler rebalancing" : "Reconciler steady"}
+          </span>
+        }
+      />
 
       <StatReadout
         className="sm:grid-cols-3"
@@ -92,10 +109,11 @@ export function Fleet() {
       />
 
       {h.length === 0 ? (
-        <p className="text-sm text-muted-foreground">
-          No hosts have registered yet. Hosts appear here once they boot and complete their first
-          heartbeat.
-        </p>
+        <div className="rounded-lg border border-dashed p-8 text-center">
+          <p className="text-sm text-muted-foreground">
+            No hosts registered. A host appears here after its first heartbeat.
+          </p>
+        </div>
       ) : (
         <div className="space-y-3">
           {h.map((host) => (
@@ -109,14 +127,6 @@ export function Fleet() {
           ))}
         </div>
       )}
-
-      <p className="text-sm text-muted-foreground">
-        Reconciler{" "}
-        {anyDraining
-          ? "rebalancing — draining host, migrating sandboxes"
-          : "steady — desired state matches observed"}
-        .
-      </p>
     </div>
   );
 }
@@ -206,13 +216,18 @@ function HostCard({
       </CardHeader>
       <CardContent className="space-y-3">
         {host.running_sandboxes === 0 ? (
-          <p className="text-sm italic text-muted-foreground">no sandboxes</p>
+          <p className="text-sm text-muted-foreground">No sandboxes.</p>
         ) : (
           <div className="flex flex-wrap gap-1" aria-label={`${host.running_sandboxes} sandboxes`}>
             {Array.from({ length: host.running_sandboxes }, (_, i) => (
               <span
                 key={i}
-                className={`size-3 ${i < live ? "bg-primary" : "bg-muted-foreground/40"}`}
+                className={cn(
+                  "size-2.5 rounded-[3px]",
+                  // Running sandboxes take the app's "active" tone, not lime —
+                  // these are status, and lime means something you can do.
+                  i < live ? "bg-ring" : "bg-muted-foreground/35",
+                )}
               />
             ))}
           </div>

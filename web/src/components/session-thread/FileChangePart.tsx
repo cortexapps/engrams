@@ -33,12 +33,12 @@ export function FileChangePart({ args }: ToolCallMessagePartProps<FileChangeArgs
         <FileDiffIcon className="size-3.5 shrink-0 text-muted-foreground" />
         <span className="min-w-0 flex-1 truncate font-mono text-foreground">{path}</span>
         {additions > 0 && (
-          <span className="shrink-0 font-mono text-xs tabular-nums text-emerald-600 dark:text-emerald-400">
+          <span className="shrink-0 font-mono text-xs tabular-nums text-instrument-nominal-ink">
             +{additions}
           </span>
         )}
         {deletions > 0 && (
-          <span className="shrink-0 font-mono text-xs tabular-nums text-red-600 dark:text-red-400">
+          <span className="shrink-0 font-mono text-xs tabular-nums text-instrument-critical-ink">
             −{deletions}
           </span>
         )}

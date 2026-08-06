@@ -5,61 +5,68 @@
 @custom-variant dark (&:is(.dark *));
 
 /* ------------------------------------------------------------------
- * "Mont Blanc logbook" — engineering-logbook identity, heritage voice.
+ * "The page on the cover" — see web/DESIGN.md for the full system.
  *
- *   A German-precise / British-elegant hybrid. Light is the primary
- *   brand voice: aged celadon ledger paper (genuine green chroma, NOT
- *   a timid warm-white) under deep petrol fountain-pen ink, with a
- *   faint ruled grid doing the structural work. Committed, not
- *   Restrained — the green sheet carries the surface.
+ *   The chrome is one continuous bottle-green cover. The work is a
+ *   celadon sheet lifted off it. Nothing else is lit.
  *
- *   Dark is the equal twin: the notebook closed at night — a near-black
- *   racing-green ground (the ink hue gone deep), pale sage ink, the
- *   same grid, the accent gone luminous. Contrast is verified AA in
- *   both themes.
+ *   Five planes, deepest to lightest, and every one of them is the same
+ *   green stock at a different value — no plane is neutral grey:
  *
- *   The accent is Aston-F1 LIME — but lime is a FILL, not light-mode
- *   text (chartreuse on celadon is invisible). So it carries primary
- *   buttons (lime fill + dark-green ink), the active nav item and ring
- *   on the dark sidebar, and the selection wash. On light grounds the
- *   focus ring falls back to a visible racing green; links use ink.
- *   Lime is reserved strictly for interactive accent — never for
- *   status (lifecycle keeps its glyph+text vocabulary). Destructive is
- *   the only red now. Corners gently rounded — exact, never pill-like.
+ *     --sidebar        the destinations rail, the outermost chrome
+ *     --shell          the ground the sheets float on; the section rail
+ *                      shares it, so rail and ground read as one backing
+ *     --pane           the work pane, a reference surface
+ *     --background     the thread / page — the lightest, forward plane
+ *     --card           a clean sheet raised off the page
+ *
+ *   Ink is petrol on paper, pale sage at night. The accent is Aston-F1
+ *   LIME and it means one thing: this is the action. Lime is a FILL,
+ *   never light-mode text (chartreuse on celadon is invisible), and
+ *   never a status — lifecycle keeps its own glyph + text vocabulary.
+ *
+ *   Structure is graphite: 12px corners, one system sans, low-contrast
+ *   rules. Saira is retired — --font-display now points at the sans
+ *   stack, so the token survives while the tracked-caps voice does not.
  * ------------------------------------------------------------------ */
 :root {
-  --radius: 0.5rem; /* gently rounded — precise, not hard-cornered, not pill */
+  --radius: 0.75rem; /* 12px — the graphite corner */
 
-  --background: oklch(0.972 0.014 128); /* lab paper — a whisper of green, not celadon */
+  --background: oklch(0.964 0.013 128); /* lab paper — a whisper of green */
   --foreground: oklch(0.301 0.02 206); /* petrol ink (#223133) */
-  --card: oklch(0.992 0.006 128); /* a clean sheet raised off the paper */
+  --card: oklch(0.995 0.005 128); /* a clean sheet raised off the paper */
   --card-foreground: oklch(0.301 0.02 206);
-  --popover: oklch(0.992 0.006 128);
+  --popover: oklch(0.997 0.004 128);
   --popover-foreground: oklch(0.301 0.02 206);
   --primary: oklch(0.878 0.181 121); /* Aston-F1 lime — a FILL only */
   --primary-foreground: oklch(0.22 0.04 150); /* deep racing-green ink on lime */
-  --secondary: oklch(0.945 0.018 128); /* soft sage fill, recessed from the paper */
+  --secondary: oklch(0.938 0.016 128); /* soft sage fill, recessed from the paper */
   --secondary-foreground: oklch(0.33 0.018 206);
-  --muted: oklch(0.945 0.018 128);
-  --muted-foreground: oklch(0.44 0.028 200); /* ink-faded — AA on paper */
-  --accent: oklch(0.955 0.022 128); /* faint hover wash */
-  --accent-foreground: oklch(0.33 0.018 206);
-  --destructive: oklch(0.52 0.2 27); /* signal red — now the only red */
-  --border: oklch(0.885 0.018 128); /* hairline rule */
-  --input: oklch(0.885 0.018 128);
+  --muted: oklch(0.94 0.015 128);
+  --muted-foreground: oklch(0.43 0.026 200); /* ink-faded — 5.9:1 on paper */
+  --accent: oklch(0.948 0.018 128); /* faint hover wash */
+  --accent-foreground: oklch(0.3 0.018 206);
+  --destructive: oklch(0.52 0.2 27); /* signal red — the only red */
+  --border: oklch(0.898 0.013 128); /* hairline rule */
+  --input: oklch(0.885 0.014 128);
   --ring: oklch(0.55 0.15 132); /* racing green — lime is invisible on paper */
 
-  /* The cover is the drama: a deep bottle-green spine against the celadon
-     content (the Mont Blanc move), not another pale-green panel. Sage ink,
-     claret active marker — the dark sidebar reads like the dark theme even
-     in light mode, which is the point. */
-  --sidebar: oklch(0.32 0.05 190); /* deep bottle-green spine */
+  /* The ground the sheets float on. The section rail is cut from it too, so
+     the two read as one continuous backing rather than two panels. */
+  --shell: oklch(0.315 0.045 190);
+  /* The work pane sits a step BACK from the thread, never in front — a
+     reference surface next to the sheet you are actually working on. */
+  --pane: oklch(0.934 0.018 128);
+
+  /* The destinations rail is the deepest surface in the app and never
+     changes. It is the outside of the cover. */
+  --sidebar: oklch(0.222 0.038 190);
   --sidebar-foreground: oklch(0.93 0.03 125); /* sage ink on the cover */
   --sidebar-primary: oklch(0.878 0.181 121); /* lime — active nav item on the dark cover */
   --sidebar-primary-foreground: oklch(0.18 0.02 200);
-  --sidebar-accent: oklch(0.38 0.052 190); /* raised green — hover/active wash */
-  --sidebar-accent-foreground: oklch(0.95 0.025 120);
-  --sidebar-border: oklch(0.93 0.03 125 / 14%);
+  --sidebar-accent: oklch(0.378 0.048 190); /* raised green — hover/active wash */
+  --sidebar-accent-foreground: oklch(0.96 0.025 120);
+  --sidebar-border: oklch(0.93 0.03 125 / 12%);
   --sidebar-ring: oklch(0.8 0.16 121); /* lime — visible on the dark spine */
 
   /* Carbon-fibre twill, woven over the green spine and fading upward. Built
@@ -78,6 +85,15 @@
   --instrument-caution: oklch(0.7 0.155 71); /* amber */
   --instrument-critical: oklch(0.55 0.21 27); /* instrument red ≈ destructive */
 
+  /* The same three signals, dark enough to be TEXT. The tokens above are
+     GRAPHIC colours — dots, gauge arcs, meter fills — which need 3:1 and are
+     tuned to stay vivid at 6px. As text on paper they measure 3.34 / 2.48 /
+     4.88, so two of the three fail. Anything that colours a word or a figure
+     (a diff count, a status label) uses these instead. */
+  --instrument-nominal-ink: oklch(0.52 0.14 150);
+  --instrument-caution-ink: oklch(0.5 0.13 71);
+  --instrument-critical-ink: oklch(0.52 0.2 27);
+
   /* Logomark terminal node — the verdigris endpoint of the engram trace. Paper-era
      dark value for light grounds; the dark theme overrides to a brighter teal so it
      reads against the deep green-black background. */
@@ -85,32 +101,45 @@
 }
 
 .dark {
-  --background: oklch(0.205 0.024 200); /* racing-green-black — the ink gone deep */
+  --background: oklch(0.216 0.024 200); /* racing-green-black — the ink gone deep */
   --foreground: oklch(0.9 0.035 125); /* pale sage ink */
-  --card: oklch(0.242 0.026 200);
+  --card: oklch(0.252 0.026 200);
   --card-foreground: oklch(0.9 0.035 125);
-  --popover: oklch(0.242 0.026 200);
+  --popover: oklch(0.264 0.026 200);
   --popover-foreground: oklch(0.9 0.035 125);
   --primary: oklch(0.85 0.18 121); /* Aston-F1 lime — luminous on green-black */
   --primary-foreground: oklch(0.2 0.03 150);
-  --secondary: oklch(0.27 0.026 200);
+  --secondary: oklch(0.278 0.026 200);
   --secondary-foreground: oklch(0.9 0.035 125);
-  --muted: oklch(0.27 0.026 200);
-  --muted-foreground: oklch(0.73 0.03 125); /* sage-faded — AA on green-black */
-  --accent: oklch(0.29 0.028 200);
-  --accent-foreground: oklch(0.9 0.035 125);
+  --muted: oklch(0.276 0.026 200);
+  --muted-foreground: oklch(0.752 0.03 125); /* sage-faded — 7.0:1 on green-black */
+  --accent: oklch(0.3 0.028 200);
+  --accent-foreground: oklch(0.92 0.035 125);
   --destructive: oklch(0.65 0.2 25);
-  --border: oklch(0.9 0.035 125 / 12%);
-  --input: oklch(0.9 0.035 125 / 16%);
+  --border: oklch(0.9 0.035 125 / 10%);
+  --input: oklch(0.9 0.035 125 / 14%);
   --ring: oklch(0.8 0.16 121); /* lime — pops on the dark ground */
 
-  --sidebar: oklch(0.175 0.024 200); /* notebook cover — darker than content */
-  --sidebar-foreground: oklch(0.9 0.035 125);
+  /* The ladder holds at night, but the rungs are much closer together, and
+     that is a hard constraint rather than a choice: the page sits at #0b1d1e,
+     which leaves about ELEVEN sRGB levels underneath it for the pane, the
+     shell, and the rail. Push the rail far enough down to match the light
+     theme's 0.093 rail-to-rail step and it renders #000506 — black, with the
+     bottle-green identity gone. So the dark theme spends what value it has and
+     lets a hairline carry the rest (see `.sidebar-section` below).
+     Judge these steps in OKLCH lightness, never in WCAG ratio: the ratio's
+     +0.05 flare term compresses everything near black, so two planes a plainly
+     visible 0.05 L apart still report ~1.06:1. */
+  --shell: oklch(0.185 0.022 200);
+  --pane: oklch(0.205 0.023 200); /* between the shell and the page, as in light */
+
+  --sidebar: oklch(0.145 0.02 200); /* the outside of the cover */
+  --sidebar-foreground: oklch(0.88 0.033 125);
   --sidebar-primary: oklch(0.85 0.18 121);
   --sidebar-primary-foreground: oklch(0.2 0.03 150);
-  --sidebar-accent: oklch(0.27 0.026 200);
-  --sidebar-accent-foreground: oklch(0.9 0.035 125);
-  --sidebar-border: oklch(0.9 0.035 125 / 9%);
+  --sidebar-accent: oklch(0.262 0.026 200);
+  --sidebar-accent-foreground: oklch(0.94 0.035 125);
+  --sidebar-border: oklch(0.9 0.035 125 / 8%);
   --sidebar-ring: oklch(0.8 0.16 121);
 
   --carbon-thread: oklch(0 0 0 / 0.22);
@@ -122,24 +151,137 @@
   --instrument-caution: oklch(0.8 0.15 75);
   --instrument-critical: oklch(0.66 0.2 25);
 
+  --instrument-nominal-ink: oklch(0.78 0.16 150);
+  --instrument-caution-ink: oklch(0.83 0.14 75);
+  --instrument-critical-ink: oklch(0.74 0.19 25);
+
   --mark-terminal: oklch(0.7 0.085 178); /* #5EB09E — brighter verdigris on dark ground */
 }
 
-/* The section rail (the second sidebar) is one step lighter than the primary
-   spine, so the boundary between them reads as depth, not a seam — which is
-   why the primary rail draws no divider line. Overriding the --sidebar* tokens
-   on this scope re-tones the bg AND its hover/active wash together, so the
-   active item stays legible against the lighter ground. */
+/* The section rail (the second sidebar) is cut from --shell, the same ground
+   the content sheet floats on. That is the point: the rail does not read as a
+   third panel, it reads as more of the cover showing through beside the sheet.
+   Overriding the --sidebar* tokens on this scope re-tones the fill AND its
+   hover/active wash together, so the active item stays legible.
+
+   The left edge is the one boundary in the app with no gutter and no shadow —
+   two rails, touching. In light mode the 0.093 lightness step carries it
+   alone; in dark mode there is no room for a step that big (see --shell), so
+   this hairline is what makes the two rails read as two. It is deliberately
+   the only divider left in the shell. */
 .sidebar-section {
-  --sidebar: oklch(0.385 0.052 190);
-  --sidebar-accent: oklch(0.46 0.055 190);
+  --sidebar: var(--shell);
+  --sidebar-accent: oklch(0.398 0.049 190);
   --sidebar-accent-foreground: oklch(0.96 0.025 120);
-  --sidebar-border: oklch(0.93 0.03 125 / 12%);
+  --sidebar-border: oklch(0.93 0.03 125 / 11%);
+  border-left: 1px solid oklch(0.93 0.03 125 / 10%);
 }
 .dark .sidebar-section {
-  --sidebar: oklch(0.235 0.026 200);
-  --sidebar-accent: oklch(0.305 0.028 200);
-  --sidebar-border: oklch(0.9 0.035 125 / 10%);
+  --sidebar-accent: oklch(0.256 0.026 200);
+  --sidebar-border: oklch(0.9 0.035 125 / 8%);
+}
+
+/* ── The lift ───────────────────────────────────────────────────────────
+   The one elevation in the app, and it means one thing: this surface is the
+   work. Two layers — a tight contact shadow that seats the sheet on the cover,
+   and a wide soft cast that raises it. Both carry a downward offset, because a
+   zero-offset shadow reads as a glow rather than as height. The hairline is a
+   light TOP edge, the way a raised surface catches the light in the room; that
+   edge is what actually sells the lift, more than the shadow does. */
+.work-sheet {
+  box-shadow:
+    0 1px 2px oklch(0 0 0 / 0.16),
+    0 10px 30px -8px oklch(0 0 0 / 0.3);
+}
+.dark .work-sheet {
+  box-shadow:
+    0 1px 2px oklch(0 0 0 / 0.4),
+    0 12px 34px -10px oklch(0 0 0 / 0.6);
+  border-top-color: oklch(1 0 0 / 0.09);
+}
+
+/* Every section's content region is one of these: the page, raised off the
+   cover. The 8px gutter is what makes the lift readable — a shadow with
+   nothing to fall onto is just a dark edge. The gutter also replaces the
+   divider line the section rail used to draw, so the rail and the sheet are
+   separated by space rather than by a rule. */
+.section-sheet {
+  margin: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background-color: var(--background);
+  overflow: hidden;
+  box-shadow:
+    0 1px 2px oklch(0 0 0 / 0.16),
+    0 10px 30px -8px oklch(0 0 0 / 0.3);
+}
+.dark .section-sheet {
+  box-shadow:
+    0 1px 2px oklch(0 0 0 / 0.4),
+    0 12px 34px -10px oklch(0 0 0 / 0.6);
+  border-top-color: oklch(1 0 0 / 0.09);
+}
+
+/* ── The work pane's material ───────────────────────────────────────────
+   The pane beside a session thread is cut from the COVER, not from the page.
+   In light mode that puts dark chrome on both sides of the bright thread, so
+   the thread is unmistakably the subject. Because it inverts the ink, the pane
+   re-declares its whole token set rather than only its background — a scoped
+   theme, the same technique `.sidebar-section` uses above. */
+.work-pane {
+  --pane: oklch(0.365 0.046 190);
+  /* Three separate steps, because they kept collapsing into one: the tab TRACK
+     recesses below the pane, the CARD raises above it, and the ACTIVE tab
+     (which shadcn paints with --background) lifts furthest. */
+  --muted: oklch(0.322 0.043 190);
+  --background: oklch(0.512 0.053 190);
+  --card: oklch(0.415 0.05 190);
+  --foreground: oklch(0.945 0.028 125);
+  --card-foreground: oklch(0.945 0.028 125);
+  --popover: oklch(0.415 0.05 190);
+  --popover-foreground: oklch(0.945 0.028 125);
+  --muted-foreground: oklch(0.845 0.031 125);
+  --accent: oklch(0.475 0.052 190);
+  --accent-foreground: oklch(0.96 0.025 120);
+  --secondary: oklch(0.455 0.051 190);
+  --secondary-foreground: oklch(0.955 0.025 120);
+  --border: oklch(0.93 0.03 125 / 15%);
+  --input: oklch(0.93 0.03 125 / 18%);
+  --ring: oklch(0.8 0.16 121);
+  /* Status hues lift for the dark ground. These are small mono figures — diff
+     counts, health telltales — so they must clear 4.5:1 against GREEN, and
+     against the CARD specifically, which is the lightest ground any of this
+     text lands on. Clearing the pane alone is not enough. Red moves furthest
+     (0.52 → 0.85) because a paper-era signal red is the one status hue that
+     goes muddy on a green ground rather than merely dim. */
+  --instrument-nominal: oklch(0.82 0.16 148);
+  --instrument-caution: oklch(0.84 0.14 75);
+  --instrument-critical: oklch(0.85 0.13 25);
+  /* On the cover the graphic and the text values converge: the ground is dark
+     in BOTH themes here, so one set clears 4.5:1 for text and 3:1 for dots. */
+  --instrument-nominal-ink: oklch(0.82 0.16 148);
+  --instrument-caution-ink: oklch(0.84 0.14 75);
+  --instrument-critical-ink: oklch(0.85 0.13 25);
+  --destructive: oklch(0.85 0.13 25);
+  color: var(--foreground);
+}
+
+/* At night both sides are already dark, so the pane does not take a cover tone
+   at all — it simply keeps the dark theme's own `--pane`. That has to be
+   restated here rather than inherited: `.work-pane` above sets the LIGHT cover
+   value unconditionally, and a `.dark` page still matches that selector, so
+   dropping this line paints the dark pane in the light theme's bottle green.
+   Keep this value equal to `--pane` in `.dark`.
+   The rest of the block is the pane's INTERNAL ladder, rebuilt against its own
+   ground: track below the pane, card above it, active tab highest. */
+.dark .work-pane {
+  --pane: oklch(0.205 0.023 200);
+  --muted: oklch(0.178 0.022 200);
+  --card: oklch(0.245 0.026 200);
+  --popover: oklch(0.245 0.026 200);
+  --accent: oklch(0.275 0.027 200);
+  --background: oklch(0.29 0.028 200);
+  --border: oklch(0.9 0.035 125 / 9%);
 }
 
 @theme inline {
@@ -170,18 +312,27 @@
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
 
+  --color-shell: var(--shell);
+  --color-pane: var(--pane);
+
   --color-instrument-nominal: var(--instrument-nominal);
   --color-instrument-caution: var(--instrument-caution);
   --color-instrument-critical: var(--instrument-critical);
 
-  /* Three-font system. Sans is the invisible workhorse (chrome, labels, body);
-     Saira is the display/identity voice (page titles, the primary action
-     button) — squared and technical, with a racing edge from width + tracked
-     caps; mono is the lab readout (IDs, digests, timestamps, code, labels). */
+  --color-instrument-nominal-ink: var(--instrument-nominal-ink);
+  --color-instrument-caution-ink: var(--instrument-caution-ink);
+  --color-instrument-critical-ink: var(--instrument-critical-ink);
+
+  /* Two fonts, not three. Sans carries everything a person reads; mono means
+     machine data — an id, a digest, a timestamp, a byte count, code. Saira and
+     its `--font-display` token are GONE, not aliased: the racing read came from
+     tracked caps on every label, and tracked caps everywhere is not an
+     identity, it is noise. A dead alias would let the voice creep back one call
+     site at a time, so `font-display` is now an unknown utility and fails
+     visibly. Hierarchy comes from size and weight. */
   --font-sans:
     system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji",
     "Segoe UI Emoji", sans-serif;
-  --font-display: "Saira Variable", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
 
   --radius-sm: calc(var(--radius) - 4px);
@@ -190,9 +341,9 @@
   --radius-xl: calc(var(--radius) + 4px);
 }
 
-/* The instrument-label voice now lives in the Text component's `label`
-   variant (components/ui/text.tsx) — Saira tracked caps, the single source of
-   truth for every label across the app. */
+/* The label voice lives in the Text component's `label` variant
+   (components/ui/text.tsx) — the single source of truth for every label,
+   table header, and tab across the app. */
 
 @layer base {
   * {
@@ -266,7 +417,6 @@
    ruled code block, and a quote held by a single hairline rule rather than a
    coloured bar. */
 .md-h {
-  font-family: var(--font-display);
   font-weight: 600;
   letter-spacing: -0.01em;
   line-height: 1.3;

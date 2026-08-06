@@ -29,8 +29,8 @@ export function ChangesPane({ events }: { events: IndexedEvent[] }) {
           {files.length} {files.length === 1 ? "file" : "files"} changed
         </span>
         <span className="flex items-center gap-2 font-mono tabular-nums">
-          <span className="text-emerald-600 dark:text-emerald-400">+{totals.additions}</span>
-          <span className="text-red-600 dark:text-red-400">−{totals.deletions}</span>
+          <span className="text-instrument-nominal-ink">+{totals.additions}</span>
+          <span className="text-instrument-critical-ink">−{totals.deletions}</span>
         </span>
       </div>
       <div className="min-h-0 flex-1 space-y-2 overflow-auto p-3">
@@ -40,12 +40,12 @@ export function ChangesPane({ events }: { events: IndexedEvent[] }) {
               <FileDiffIcon className="size-3.5 shrink-0 text-muted-foreground" />
               <span className="min-w-0 flex-1 truncate font-mono text-foreground">{file.path}</span>
               {file.additions > 0 && (
-                <span className="shrink-0 font-mono text-xs tabular-nums text-emerald-600 dark:text-emerald-400">
+                <span className="shrink-0 font-mono text-xs tabular-nums text-instrument-nominal-ink">
                   +{file.additions}
                 </span>
               )}
               {file.deletions > 0 && (
-                <span className="shrink-0 font-mono text-xs tabular-nums text-red-600 dark:text-red-400">
+                <span className="shrink-0 font-mono text-xs tabular-nums text-instrument-critical-ink">
                   −{file.deletions}
                 </span>
               )}

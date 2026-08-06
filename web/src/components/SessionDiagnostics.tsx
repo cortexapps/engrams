@@ -274,7 +274,8 @@ function RawEvents({ events }: { events: IndexedEvent[] }) {
           style={{ gridTemplateColumns: "4ch min-content 1fr" }}
         >
           <span className="tabular-nums text-muted-foreground/70">{e.idx}</span>
-          <span className="text-[0.64rem] uppercase tracking-[0.12em]">{e.event.type}</span>
+          {/* An event type is a wire identifier, so it reads as machine data. */}
+          <span className="font-mono text-[0.7rem]">{e.event.type}</span>
           <span className="truncate text-foreground/80" title={JSON.stringify(e.event)}>
             {summarizeRaw(e.event)}
           </span>

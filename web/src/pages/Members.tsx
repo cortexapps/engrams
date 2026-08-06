@@ -110,7 +110,7 @@ export function Members() {
     <div className="space-y-6">
       <PageHeading
         title="Members"
-        description={`${users.length} people · ${admins} admins · ${disabled} disabled`}
+        count={`${users.length} · ${admins} admin${admins === 1 ? "" : "s"}${disabled ? ` · ${disabled} disabled` : ""}`}
       />
       <Table>
         <TableHeader>

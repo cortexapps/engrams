@@ -92,7 +92,7 @@ export function AllSessions() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-6 p-4 md:p-6">
-      <PageHeading title="All tasks" description="Every task across the fleet, owner-attributed." />
+      <PageHeading title="All tasks" />
 
       <div className="flex flex-wrap items-center gap-2">
         <Input

@@ -75,7 +75,7 @@ export function OAuthConnectSheet({
         <header className="flex items-center gap-3 border-b p-5">
           <ProviderTile {...view.icon} name={view.name} size={40} />
           <div className="min-w-0 flex-1">
-            <div className="font-display text-[1.05rem] font-semibold">Connect {view.name}</div>
+            <div className="text-[1.05rem] font-semibold">Connect {view.name}</div>
             <div className="text-xs text-muted-foreground">{view.category}</div>
           </div>
         </header>

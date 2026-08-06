@@ -132,9 +132,7 @@ const ThreadMessage: FC = () => {
 
 const ThreadEmpty: FC = () => {
   return (
-    <div className="my-12 text-center font-display text-sm text-muted-foreground italic">
-      No activity yet.
-    </div>
+    <div className="my-12 text-center text-sm text-muted-foreground italic">No activity yet.</div>
   );
 };
 

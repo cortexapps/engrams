@@ -147,9 +147,7 @@ function DetailBody({ view }: { view: ConnectorView }) {
           <ProviderTile {...view.icon} name={view.name} size={52} />
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2.5">
-              <h1 className="font-display text-2xl font-semibold [font-stretch:108%]">
-                {view.name}
-              </h1>
+              <h1 className="text-2xl font-semibold">{view.name}</h1>
               {view.status === "connected" && <StatusDot tone="nominal" label="connected" />}
               {view.status === "needs_reconnect" && (
                 <StatusDot tone="caution" label="reconnect required" />

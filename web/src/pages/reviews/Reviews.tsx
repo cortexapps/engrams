@@ -98,11 +98,7 @@ export function Reviews() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-auto p-4 md:p-6">
-      <PageHeading
-        title="Reviews"
-        eyebrow="Pull requests"
-        description="Every pull request engrams has reviewed. Open one to see what the finder reported, what the verifier made of it, and what reached the PR."
-      />
+      <PageHeading title="Reviews" />
 
       <div className="flex flex-wrap items-center gap-2">
         <Input

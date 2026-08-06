@@ -45,11 +45,7 @@ export function MySessions() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-6 p-4 md:p-6">
-      <PageHeading
-        title="My tasks"
-        description="Bounded units of agent work: launch, watch, resume."
-        actions={newTask}
-      />
+      <PageHeading title="My tasks" count={sessions?.length || undefined} actions={newTask} />
 
       <Input
         value={search}

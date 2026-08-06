@@ -2,68 +2,55 @@ import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { Text } from "@/components/ui/text";
 
-// The logbook masthead. Every page opens on the same note: a Saira title
-// (the display voice, slightly extended for the racing read), an optional
-// sans description, and a hairline rule closing the header band — the ruled
-// line at the top of a notebook page. A short lime bar sits on that rule like
-// an index tab — the accent's one appearance on the header.
-// Actions sit opposite the title on the same baseline.
+// Every page opens the same way: the page's name, what there is of it, and
+// what you can do here. Nothing else.
 //
-// `eyebrow` adds a small Saira-caps kicker above the title, for pages that
-// name their subject (a session, a host). `titleVariant="mono"` swaps the
-// display voice for the lab-readout voice when the title IS machine data (an
-// id, a digest) rather than prose — the same masthead frame, honest type.
+// Three things used to live here and no longer do:
+//
+//   - The eyebrow ("Kaizen · Agent feedback"). A tracked-caps kicker over
+//     every title is not a system, it is a tic. The rail already says which
+//     section you are in.
+//   - The description ("Documents your agents published — versioned, hosted,
+//     shareable."). A sentence explaining a page to someone already on it.
+//     If a page needs explaining, the page is wrong.
+//   - The hairline rule and its lime index tab. The content below the
+//     masthead — a tab row, a table, a card grid — draws its own top edge,
+//     so the rule was a second line a few pixels away from a real one.
+//
+// `count` is what replaced the description: the one fact a list page owes you
+// before you scroll. `titleVariant="mono"` swaps to the machine-data voice
+// when the title IS an id or a digest rather than prose.
 export function PageHeading({
   title,
-  eyebrow,
-  description,
+  count,
   actions,
   titleVariant = "display",
-  showRule = true,
   className,
 }: {
   title: ReactNode;
-  eyebrow?: ReactNode;
-  description?: ReactNode;
+  /** A short readout of what this page holds — "8 documents", "24 hosts". */
+  count?: ReactNode;
   actions?: ReactNode;
   titleVariant?: "display" | "mono";
-  /** The closing hairline + lime index-tab under the header band. On by
-   * default; pass `false` when the next element already owns a rule (e.g. a tab
-   * row) so the masthead doesn't stack two lines a few pixels apart and strand
-   * whatever sits between them. */
-  showRule?: boolean;
   className?: string;
 }) {
   return (
     <div
-      className={cn(
-        "relative flex flex-wrap items-end justify-between gap-x-6 gap-y-3",
-        showRule && "border-b pb-4",
-        className,
-      )}
+      className={cn("flex flex-wrap items-center justify-between gap-x-6 gap-y-3", className)}
+      data-slot="page-heading"
     >
-      {showRule && (
-        <span aria-hidden className="absolute -bottom-px left-0 h-0.5 w-10 bg-primary" />
-      )}
-      {/* The title column, sized so a long title never breaks the band:
-          `min-w-0` drops the min-content floor (a flex item won't shrink below
-          it by default, so a title a caller renders `truncate` — hence
-          nowrap — would run off the edge and take its own controls with it);
-          `basis-80 grow` decouples the wrap decision from the title length, so
-          the actions stay on the title's baseline on a wide band and only drop
-          to a second row when the band itself is narrower than the 20rem the
-          title asks for (a phone). */}
-      <div className="min-w-0 grow basis-80 space-y-1">
-        {eyebrow && (
-          <Text variant="label" tone="muted">
-            {eyebrow}
-          </Text>
-        )}
+      {/* `min-w-0` drops the min-content floor so a long title truncates
+          instead of pushing its own controls off the edge; `basis-80 grow`
+          keeps the actions on the title's baseline until the band itself is
+          narrower than the title asks for (a phone). */}
+      <div className="flex min-w-0 grow basis-80 items-center gap-3">
         <Text as="h1" variant={titleVariant === "mono" ? "displayMono" : "display"}>
           {title}
         </Text>
-        {description && (
-          <p className="max-w-prose text-sm text-muted-foreground text-pretty">{description}</p>
+        {count && (
+          <span className="shrink-0 rounded-full bg-secondary px-2 py-0.5 font-mono text-xs tabular-nums text-muted-foreground">
+            {count}
+          </span>
         )}
       </div>
       {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}

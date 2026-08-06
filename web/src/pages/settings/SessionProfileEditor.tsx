@@ -493,7 +493,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                         aria-label="Profile name"
                         aria-invalid={fieldState.invalid}
                         placeholder="Backend Agent"
-                        className="font-display text-base font-semibold"
+                        className="text-base font-semibold"
                       />
                       {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
                     </Field>

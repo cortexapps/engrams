@@ -70,19 +70,14 @@ export function ReviewedReposPanel() {
 
   return (
     <div className="space-y-6">
-      <PageHeading
-        title="Reviewed repos"
-        eyebrow="Pull requests"
-        description="Repositories engrams reviews. A repo must be enrolled here — pull-request events from repos that aren’t listed are ignored."
-        actions={<EnrollDialog profiles={profiles} />}
-      />
+      <PageHeading title="Reviewed repos" actions={<EnrollDialog profiles={profiles} />} />
 
       {!hasReviewerProfile && (
         <div
           role="alert"
-          className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm"
+          className="flex items-start gap-2 rounded-lg border border-instrument-caution/40 bg-instrument-caution/10 p-3 text-sm"
         >
-          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600" aria-hidden />
+          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-instrument-caution" aria-hidden />
           <span>
             No profile is designated the <code className="font-mono">pr_reviewer</code>. Reviews on
             repos without a profile override will fail. Set the “PR reviewer” toggle on a profile
@@ -93,7 +88,7 @@ export function ReviewedReposPanel() {
 
       {error && (
         <p className="text-sm text-destructive">
-          could not load enrollments — {errorMessage(error)}
+          Could not load enrollments — {errorMessage(error)}
         </p>
       )}
 
@@ -176,7 +171,7 @@ function EnrollmentRow({ row, profiles }: { row: RepoEnrollment; profiles: Profi
         </div>
         {remove.error && (
           <p className="mt-1 text-right text-xs text-destructive">
-            could not remove — {errorMessage(remove.error)}
+            Could not remove — {errorMessage(remove.error)}
           </p>
         )}
       </TableCell>

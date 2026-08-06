@@ -430,8 +430,11 @@ describe("Review dossier", () => {
     // The sheet mounts on the finder and offers the way out to the full page.
     const full = await screen.findByRole("link", { name: /Full session/i });
     expect(full.getAttribute("href")).toContain("/sessions/finder-sess-1");
-    expect(screen.getByRole("button", { name: "Finder" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Verifier" })).toBeTruthy();
+    // The role switcher is stock shadcn Tabs now, so the triggers carry
+    // role="tab" — the correct ARIA for a tablist, and what a screen reader
+    // announces. The old hand-rolled buttons only ever reported "button".
+    expect(screen.getByRole("tab", { name: "Finder" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "Verifier" })).toBeTruthy();
   });
 
   it("switches the sheet between the finder and the verifier", async () => {
@@ -441,7 +444,7 @@ describe("Review dossier", () => {
     await user.click(await screen.findByRole("button", { name: "Sessions" }));
     await screen.findByRole("link", { name: /Full session/i });
 
-    await user.click(screen.getByRole("button", { name: "Verifier" }));
+    await user.click(screen.getByRole("tab", { name: "Verifier" }));
     expect(screen.getByRole("link", { name: /Full session/i }).getAttribute("href")).toContain(
       "/sessions/verifier-sess-1",
     );

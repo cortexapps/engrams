@@ -35,7 +35,7 @@ export function PaneStatus({ phase, caption, message, onReconnect }: PaneStatusP
       {busy ? (
         <div className="flex flex-col items-center gap-3.5">
           <EngramMark size={56} mode="loop" title={caption} />
-          <p className="font-display text-[0.92rem] text-muted-foreground italic">{caption}</p>
+          <p className="text-[0.92rem] text-muted-foreground italic">{caption}</p>
         </div>
       ) : (
         <div className="flex max-w-xs flex-col items-center gap-3">
@@ -45,7 +45,7 @@ export function PaneStatus({ phase, caption, message, onReconnect }: PaneStatusP
               "text-pretty",
               phase === "error"
                 ? "font-mono text-[0.78rem] text-destructive"
-                : "font-display text-[0.92rem] text-muted-foreground italic",
+                : "text-[0.92rem] text-muted-foreground italic",
             )}
           >
             {message ?? (phase === "error" ? "unavailable" : "connection closed")}

@@ -133,7 +133,7 @@ export function ConnectSheet({
         <header className="flex items-center gap-3 border-b p-5">
           <ProviderTile {...view.icon} name={view.name} size={40} />
           <div className="min-w-0 flex-1">
-            <div className="font-display text-[1.05rem] font-semibold">Connect {view.name}</div>
+            <div className="text-[1.05rem] font-semibold">Connect {view.name}</div>
             <div className="text-xs text-muted-foreground">{view.category}</div>
           </div>
         </header>
@@ -193,8 +193,8 @@ export function ConnectSheet({
                       <span className="flex items-baseline gap-2">
                         <Text variant="label">{f.label}</Text>
                         {f.required && (
-                          <span className="font-display text-[0.6rem] tracking-[0.08em] text-instrument-caution">
-                            REQUIRED
+                          <span className="text-[0.7rem] text-instrument-caution-ink">
+                            Required
                           </span>
                         )}
                       </span>

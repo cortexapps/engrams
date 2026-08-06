@@ -18,7 +18,7 @@ export function AccessTag({ access, className }: { access: Access; className?: s
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-display text-[0.6rem] font-semibold tracking-[0.07em] uppercase",
+        "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[0.7rem] font-medium capitalize",
         write
           ? "border-instrument-caution/50 bg-instrument-caution/12 text-foreground"
           : "border-border bg-secondary text-muted-foreground",
@@ -80,9 +80,7 @@ export function StatusDot({
     <span className={cn("inline-flex items-center gap-1.5", className)}>
       <span className={cn("size-1.5 rounded-full", dot)} aria-hidden />
       {label && (
-        <span className="font-display text-[0.6rem] font-semibold tracking-[0.08em] text-muted-foreground uppercase">
-          {label}
-        </span>
+        <span className="text-[0.7rem] font-medium capitalize text-muted-foreground">{label}</span>
       )}
     </span>
   );

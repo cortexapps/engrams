@@ -86,29 +86,30 @@ function ArtifactBody({
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="shrink-0 px-4 pt-4 md:px-6">
         <PageHeading
-          eyebrow={`artifact · ${kind}`}
           title={artifact.title}
-          description={
-            <span className="font-mono text-xs">
-              {artifact.fileName} · {versionRow?.mediaType ?? artifact.mediaType} ·{" "}
-              {fmtBytes(Number(versionRow?.sizeBytes ?? artifact.sizeBytes))}
-              {artifact.createdBy && <> · {artifact.createdBy.name || artifact.createdBy.email}</>}
-              {versionRow?.sessionId && (
-                <>
-                  {" · from "}
-                  <Link
-                    to="/sessions/$id"
-                    params={{ id: versionRow.sessionId }}
-                    className="underline-offset-2 hover:underline"
-                  >
-                    session {versionRow.sessionId.slice(0, 8)}
-                  </Link>
-                </>
-              )}
-            </span>
-          }
+          count={`v${version}`}
           actions={<ArtifactToolbar artifact={artifact} version={version} url={cookieUrl} />}
         />
+        {/* This line is the document's own facts, not a description of the
+            page — file, type, size, who published it, and the session it came
+            from. Mono because every field of it is machine data. */}
+        <p className="mt-1.5 font-mono text-xs text-muted-foreground">
+          {artifact.fileName} · {versionRow?.mediaType ?? artifact.mediaType} ·{" "}
+          {fmtBytes(Number(versionRow?.sizeBytes ?? artifact.sizeBytes))}
+          {artifact.createdBy && <> · {artifact.createdBy.name || artifact.createdBy.email}</>}
+          {versionRow?.sessionId && (
+            <>
+              {" · from "}
+              <Link
+                to="/sessions/$id"
+                params={{ id: versionRow.sessionId }}
+                className="underline-offset-2 hover:underline"
+              >
+                session {versionRow.sessionId.slice(0, 8)}
+              </Link>
+            </>
+          )}
+        </p>
         {!isCurrent && (
           <div className="mt-2 rounded-md border border-instrument-caution/40 bg-muted/40 px-3 py-1.5">
             <Text as="span" variant="label" tone="muted">
