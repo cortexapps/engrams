@@ -29,6 +29,7 @@ pub mod refresh;
 pub mod remount;
 pub mod share;
 pub mod shell;
+pub mod tuning;
 // `pub` so the `engram-agentd` binary (main.rs) shares this one module rather
 // than recompiling its own copy — the bin's readiness dial reads
 // `time_source::metrics_now`, and a second `mod time_source` in main.rs would
