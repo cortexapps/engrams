@@ -1,8 +1,7 @@
 {{/*
-Helpers for the host-fleet chart. Two DaemonSets — `node-prep` and
-`host-agent` — share a release identity and differ on
-`app.kubernetes.io/component`. Names follow `{release}-host-agent` /
-`{release}-node-prep`.
+Helpers for the host-fleet chart. The host-agent DaemonSet owns node
+preparation as its first init container, so host setup and asset staging
+have one ordered lifecycle.
 */}}
 
 {{- define "hostfleet.fullname" -}}
@@ -41,21 +40,6 @@ app.kubernetes.io/component: host-agent
 app.kubernetes.io/name: {{ .Chart.Name }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: host-agent
-{{- end -}}
-
-{{- define "hostfleet.nodePrep.fullname" -}}
-{{- printf "%s-node-prep" (include "hostfleet.fullname" .) | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-
-{{- define "hostfleet.nodePrep.labels" -}}
-{{ include "hostfleet.labels" . }}
-app.kubernetes.io/component: node-prep
-{{- end -}}
-
-{{- define "hostfleet.nodePrep.selectorLabels" -}}
-app.kubernetes.io/name: {{ .Chart.Name }}
-app.kubernetes.io/instance: {{ .Release.Name }}
-app.kubernetes.io/component: node-prep
 {{- end -}}
 
 {{- define "hostfleet.serviceAccountName" -}}

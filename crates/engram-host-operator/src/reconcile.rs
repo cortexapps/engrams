@@ -29,6 +29,7 @@ use crate::crd::{HostFleet, HostFleetSpec};
 use crate::error::OperatorError;
 
 const HOST_AGENT_CONTAINER: &str = "host-agent";
+const NODE_PREP_CONTAINER: &str = "node-prep";
 const STAGE_ASSETS_CONTAINER: &str = "stage-node-assets";
 
 /// Marks a node whose cordon the OPERATOR set for a K3 image roll (stamped in
@@ -90,6 +91,17 @@ pub struct PodInfo {
     pub host_image: String,
     pub init_image: String,
     pub ready: bool,
+    pub startup: PodStartupTimes,
+}
+
+/// Wall-clock phase boundaries reported by Kubernetes container status.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PodStartupTimes {
+    pub node_prep_started: Option<std::time::SystemTime>,
+    pub node_prep_finished: Option<std::time::SystemTime>,
+    pub assets_started: Option<std::time::SystemTime>,
+    pub assets_finished: Option<std::time::SystemTime>,
+    pub host_agent_started: Option<std::time::SystemTime>,
 }
 
 impl PodInfo {
@@ -611,12 +623,45 @@ fn pod_info(p: Pod) -> PodInfo {
                 .and_then(|c| c.image.clone())
         })
         .unwrap_or_default();
+    let terminated_times = |container: &str| {
+        p.status
+            .as_ref()
+            .and_then(|s| s.init_container_statuses.as_ref())
+            .and_then(|statuses| statuses.iter().find(|s| s.name == container))
+            .and_then(|s| s.state.as_ref())
+            .and_then(|s| s.terminated.as_ref())
+            .map(|s| {
+                (
+                    s.started_at.clone().map(|t| t.0.into()),
+                    s.finished_at.clone().map(|t| t.0.into()),
+                )
+            })
+            .unwrap_or_default()
+    };
+    let (node_prep_started, node_prep_finished) = terminated_times(NODE_PREP_CONTAINER);
+    let (assets_started, assets_finished) = terminated_times(STAGE_ASSETS_CONTAINER);
+    let host_agent_started = p
+        .status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .and_then(|statuses| statuses.iter().find(|s| s.name == HOST_AGENT_CONTAINER))
+        .and_then(|s| s.state.as_ref())
+        .and_then(|s| s.running.as_ref())
+        .and_then(|s| s.started_at.clone())
+        .map(|t| t.0.into());
     PodInfo {
         name,
         node,
         host_image,
         init_image,
         ready: pod_ready(&p),
+        startup: PodStartupTimes {
+            node_prep_started,
+            node_prep_finished,
+            assets_started,
+            assets_finished,
+            host_agent_started,
+        },
     }
 }
 
@@ -981,6 +1026,7 @@ mod tests {
             host_image: host_image.into(),
             init_image: init_image.into(),
             ready,
+            startup: PodStartupTimes::default(),
         }
     }
 

@@ -118,6 +118,15 @@ pub trait NodeOps: Send + Sync {
     ) -> Result<Option<std::time::SystemTime>, OperatorError> {
         Ok(None)
     }
+
+    /// The Node's first current Ready transition. A missing condition skips
+    /// only the phases that depend on it.
+    async fn node_ready_at(
+        &self,
+        _node: &str,
+    ) -> Result<Option<std::time::SystemTime>, OperatorError> {
+        Ok(None)
+    }
 }
 
 /// Live K8s implementation of [`NodeOps`].
@@ -192,6 +201,25 @@ impl NodeOps for K8sNodeOps<'_> {
             .and_then(|n| n.metadata.creation_timestamp.clone())
             .map(|t| t.0.into()))
     }
+
+    async fn node_ready_at(
+        &self,
+        node: &str,
+    ) -> Result<Option<std::time::SystemTime>, OperatorError> {
+        Ok(self
+            .managed_nodes
+            .iter()
+            .find(|n| n.metadata.name.as_deref() == Some(node))
+            .and_then(|n| n.status.as_ref())
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|conditions| {
+                conditions
+                    .iter()
+                    .find(|c| c.type_ == "Ready" && c.status == "True")
+            })
+            .and_then(|c| c.last_transition_time.clone())
+            .map(|t| t.0.into()))
+    }
 }
 
 /// Cross-tick memory for the node-ready histogram: the set of host ids
@@ -199,7 +227,15 @@ impl NodeOps for K8sNodeOps<'_> {
 /// first observation — the first tick seeds the set WITHOUT emitting, so
 /// an operator restart never reports pre-existing hosts as fresh joins.
 #[derive(Default)]
-pub struct NodeReadyTracker(std::sync::Mutex<Option<std::collections::HashSet<HostId>>>);
+pub struct NodeReadyTracker(std::sync::Mutex<NodeReadyState>);
+
+#[derive(Default)]
+struct NodeReadyState {
+    registered: Option<std::collections::HashSet<HostId>>,
+    pod_nodes: Option<std::collections::HashSet<String>>,
+    pending_scale_requests: std::collections::VecDeque<std::time::SystemTime>,
+    scale_request_by_node: HashMap<String, std::time::SystemTime>,
+}
 
 impl NodeReadyTracker {
     /// One observation of the registered-host set. Returns the hosts that
@@ -209,9 +245,9 @@ impl NodeReadyTracker {
     /// split out from the async emission for direct unit testing.
     fn observe(&self, registered: std::collections::HashSet<HostId>) -> Vec<HostId> {
         let mut guard = self.0.lock().expect("node-ready tracker poisoned");
-        match guard.as_mut() {
+        match guard.registered.as_mut() {
             None => {
-                *guard = Some(registered);
+                guard.registered = Some(registered);
                 Vec::new()
             }
             Some(seen) => {
@@ -220,6 +256,43 @@ impl NodeReadyTracker {
                 fresh
             }
         }
+    }
+
+    fn observe_pods(&self, pods: &[PodInfo]) {
+        let mut current: std::collections::HashSet<String> =
+            pods.iter().map(|p| p.node.clone()).collect();
+        let mut guard = self.0.lock().expect("node-ready tracker poisoned");
+        let Some(previous) = guard.pod_nodes.as_ref() else {
+            guard.pod_nodes = Some(current);
+            return;
+        };
+        let mut fresh: Vec<String> = current.difference(previous).cloned().collect();
+        fresh.sort();
+        for node in fresh {
+            if let Some(requested_at) = guard.pending_scale_requests.pop_front() {
+                guard.scale_request_by_node.insert(node, requested_at);
+            }
+        }
+        guard
+            .scale_request_by_node
+            .retain(|node, _| current.contains(node));
+        guard.pod_nodes = Some(std::mem::take(&mut current));
+    }
+
+    fn record_grow(&self, physical: u32, target: u32, requested_at: std::time::SystemTime) {
+        let mut guard = self.0.lock().expect("node-ready tracker poisoned");
+        let planned = physical.saturating_add(guard.pending_scale_requests.len() as u32);
+        for _ in planned..target {
+            guard.pending_scale_requests.push_back(requested_at);
+        }
+    }
+
+    fn take_scale_request(&self, node: &str) -> Option<std::time::SystemTime> {
+        self.0
+            .lock()
+            .expect("node-ready tracker poisoned")
+            .scale_request_by_node
+            .remove(node)
     }
 }
 
@@ -279,6 +352,7 @@ async fn track_node_ready(
     pods: &[PodInfo],
     hosts: &[HostLoad],
 ) {
+    tracker.observe_pods(pods);
     // The lock is confined to `observe` — never held across the async
     // Node lookups below.
     let fresh = tracker.observe(hosts.iter().map(|h| h.id).collect());
@@ -289,19 +363,80 @@ async fn track_node_ready(
         else {
             continue;
         };
-        match nodes.node_created_at(&pod.node).await {
-            Ok(Some(created)) => {
-                if let Ok(age) = crate::time_source::metrics_wall_now().duration_since(created) {
-                    ::metrics::histogram!(crate::metrics::NODE_READY_SECONDS)
-                        .record(age.as_secs_f64());
-                    tracing::info!(node = %pod.node, %host, age_secs = age.as_secs(),
-                        "node bring-up complete: host registered");
-                }
-            }
-            Ok(None) => {}
+        let registered_at = crate::time_source::metrics_wall_now();
+        let scale_requested_at = tracker.take_scale_request(&pod.node);
+        let created_at = match nodes.node_created_at(&pod.node).await {
+            Ok(value) => value,
             Err(e) => {
                 tracing::warn!(node = %pod.node, error = %e,
-                    "node-ready sample skipped: Node lookup failed");
+                    "node-created timestamp unavailable");
+                None
+            }
+        };
+        let ready_at = match nodes.node_ready_at(&pod.node).await {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(node = %pod.node, error = %e,
+                    "node-ready timestamp unavailable");
+                None
+            }
+        };
+        let record = |phase: &'static str,
+                      start: Option<std::time::SystemTime>,
+                      end: Option<std::time::SystemTime>| {
+            if let (Some(start), Some(end)) = (start, end) {
+                if let Ok(elapsed) = end.duration_since(start) {
+                    ::metrics::histogram!(crate::metrics::NODE_BOOTSTRAP_PHASE_SECONDS, "phase" => phase)
+                        .record(elapsed.as_secs_f64());
+                }
+            }
+        };
+        record(
+            "scale_request_to_node_created",
+            scale_requested_at,
+            created_at,
+        );
+        record("node_created_to_ready", created_at, ready_at);
+        record(
+            "ready_to_node_prep",
+            ready_at,
+            pod.startup.node_prep_started,
+        );
+        record(
+            "node_prep",
+            pod.startup.node_prep_started,
+            pod.startup.node_prep_finished,
+        );
+        record(
+            "node_prep_to_assets",
+            pod.startup.node_prep_finished,
+            pod.startup.assets_started,
+        );
+        record(
+            "stage_node_assets",
+            pod.startup.assets_started,
+            pod.startup.assets_finished,
+        );
+        record(
+            "assets_to_host_agent",
+            pod.startup.assets_finished,
+            pod.startup.host_agent_started,
+        );
+        record(
+            "host_agent_to_registered",
+            pod.startup.host_agent_started,
+            Some(registered_at),
+        );
+        record(
+            "scale_request_to_registered",
+            scale_requested_at,
+            Some(registered_at),
+        );
+        if let Some(created) = created_at {
+            if let Ok(age) = registered_at.duration_since(created) {
+                ::metrics::histogram!(crate::metrics::NODE_READY_SECONDS).record(age.as_secs_f64());
+                tracing::info!(node = %pod.node, %host, age_secs = age.as_secs(),
+                    "node bring-up complete: host registered");
             }
         }
     }
@@ -760,7 +895,9 @@ pub async fn step(
         abort_wave(&act, &annotated).await;
     }
     if grow_target > physical {
+        let requested_at = crate::time_source::metrics_wall_now();
         scaler.set_size(&a.node_pool, grow_target).await?;
+        node_ready.record_grow(physical, grow_target, requested_at);
         ::metrics::counter!(crate::metrics::AUTOSCALE_GROWS_TOTAL).increment(1);
         tracing::info!(
             node_pool=%a.node_pool,
@@ -874,6 +1011,37 @@ mod tests {
         assert!(t.observe([a].into_iter().collect()).is_empty());
         // …and a same-named node rejoining is a fresh bring-up again.
         assert_eq!(t.observe([a, b].into_iter().collect()), vec![b]);
+    }
+
+    #[test]
+    fn node_ready_tracker_pairs_each_grow_with_one_new_pod() {
+        fn pod(node: &str) -> PodInfo {
+            PodInfo {
+                name: format!("pod-{node}"),
+                node: node.into(),
+                host_image: "host:new".into(),
+                init_image: "assets:new".into(),
+                ready: true,
+                startup: crate::reconcile::PodStartupTimes::default(),
+            }
+        }
+
+        let tracker = NodeReadyTracker::default();
+        tracker.observe_pods(&[pod("a")]);
+        let requested_at = std::time::UNIX_EPOCH + Duration::from_secs(100);
+        tracker.record_grow(1, 2, requested_at);
+        // The one-second reconcile can reassert the same target many times.
+        // It must not create duplicate pending samples.
+        tracker.record_grow(1, 2, requested_at + Duration::from_secs(1));
+        tracker.observe_pods(&[pod("a"), pod("b")]);
+        assert_eq!(tracker.take_scale_request("b"), Some(requested_at));
+        assert_eq!(tracker.take_scale_request("b"), None);
+
+        tracker.observe_pods(&[pod("a")]);
+        let second = requested_at + Duration::from_secs(60);
+        tracker.record_grow(1, 2, second);
+        tracker.observe_pods(&[pod("a"), pod("c")]);
+        assert_eq!(tracker.take_scale_request("c"), Some(second));
     }
 
     #[test]
@@ -1174,6 +1342,7 @@ mod tests {
             host_image: "host:new".into(),
             init_image: "assets:new".into(),
             ready: true,
+            startup: crate::reconcile::PodStartupTimes::default(),
         }
     }
 
@@ -1469,6 +1638,7 @@ mod tests {
                 host_image: "i".into(),
                 init_image: "n".into(),
                 ready: true,
+                startup: crate::reconcile::PodStartupTimes::default(),
             }
         }
         fn load(node: &str, cordoned: bool) -> HostLoad {
