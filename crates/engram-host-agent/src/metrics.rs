@@ -334,6 +334,21 @@ pub const SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS: &str = "engram_snapshot_capture_lo
 /// after deploy would mean the skip path isn't exercised.
 pub const CHECKPOINT_SKIPPED_TOTAL: &str = "engram_checkpoint_skipped_total";
 
+/// ADR 0112 D3: counter of pre-capture swap disarms refused, labeled
+/// by capture flavor (`terminal` / `periodic`). Periodic refusals are
+/// the designed degradation under memory pressure (the continuously
+/// flushed disk is that tick's checkpoint); a SUSTAINED rate is the
+/// operator signal "this image is under-sized — raise
+/// `suggested_memory_mib`". Terminal refusals mean an eviction could
+/// not capture memory and requeued — rare, alarm-worthy.
+pub const SWAP_DISARM_REFUSED_TOTAL: &str = "engram_swap_disarm_refused_total";
+
+/// ADR 0112 D3: histogram of successful pre-capture swap disarm
+/// duration (meminfo probe + `swapoff -a` page-back-in). Steady state
+/// is one exec round trip (≈0 used swap); the tail scales with used
+/// swap, bounded by the RAM/4 device size.
+pub const SWAP_DISARM_SECONDS: &str = "engram_swap_disarm_seconds";
+
 /// ADR 0101 B: dirty bytes one diff epoch carried (the adaptive
 /// controller aims this at `ENGRAM_CHECKPOINT_TARGET_EPOCH_MB`) and the
 /// epoch's wall-clock length. Together they surface the controller's

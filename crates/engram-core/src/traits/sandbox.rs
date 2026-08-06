@@ -870,6 +870,16 @@ pub trait SandboxBackend: Send + Sync {
         None
     }
 
+    /// ADR 0112: the sandbox's ephemeral-swap size (`spec.swap_mib`),
+    /// when a swap drive was attached at create/restore. Gates the
+    /// capture-time swap disarm/re-arm protocol. Default `None` is
+    /// LOAD-BEARING for backends whose `exec` is not guest-isolated
+    /// (Process runs commands on the host — a host `swapoff -a` must
+    /// be structurally unreachable).
+    fn swap_mib(&self, _id: SandboxId) -> Option<u32> {
+        None
+    }
+
     /// ADR 0045 C2: compose the restore sidecar from LIVE sandbox
     /// state (the presetup's pre-pause package; byte-identical to the
     /// capture-time sidecar by construction).
