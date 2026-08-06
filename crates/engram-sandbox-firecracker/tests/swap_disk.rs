@@ -190,6 +190,22 @@ async fn swap_drive_boots_writable_and_restores_fresh() {
         .destroy(restored_id)
         .await
         .expect("destroy restored");
+
+    // Property 4 (review finding on #1051): destroy leaves NOTHING in
+    // the swap dir — canonical symlinks removed by the teardown loop,
+    // and the `.img` arm covers a backing whose unlink-after-attach
+    // had failed (none here, but the teardown must tolerate both).
+    let leftovers: Vec<_> = std::fs::read_dir(&swap_dir)
+        .map(|it| {
+            it.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        leftovers.is_empty(),
+        "swap dir must be empty after both destroys: {leftovers:?}",
+    );
 }
 
 /// Parse the probe output into the single expected writable non-vda

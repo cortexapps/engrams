@@ -2553,12 +2553,16 @@ impl FirecrackerBackend {
         // re-point it at ITS OWN fresh file before `load_snapshot`
         // opens it. The device must exist here (base capture) because
         // FC restore only reconfigures devices already in the model.
-        // The backing file is unlinked after InstanceStart (FC holds
-        // the fd) — see the post-start block below.
+        // The backing rides a `SwapBackingGuard` from creation: any `?`
+        // between here and the deliberate post-`InstanceStart` unlink
+        // reclaims the file on drop instead of orphaning it (`swap/` is
+        // a sibling of the jail dir, so the error handlers' jail
+        // removal never reaches it — review finding on #1051).
         let swap_backing = match spec.swap_mib.filter(|m| *m > 0) {
             Some(swap_mib) => {
                 let backing = paths::swap_backing(&self.work_dir, sandbox_id);
                 create_sparse_swap_backing(&backing, swap_mib).await?;
+                let guard = SwapBackingGuard::new(backing.clone());
                 let canonical = paths::swap_canonical(&self.work_dir, sandbox_id);
                 paths::install_symlink(&canonical, &backing)
                     .await
@@ -2579,7 +2583,7 @@ impl FirecrackerBackend {
                     is_read_only: false,
                 })
                 .await?;
-                Some(backing)
+                Some(guard)
             }
             None => None,
         };
@@ -2642,19 +2646,12 @@ impl FirecrackerBackend {
 
         // ADR 0112: FC holds the swap backing fd (drives open at PUT /
         // start) — unlink it now so the bytes live only in an anonymous
-        // inode the kernel reclaims at FC exit. No orphan file, no
-        // sweeper, and the plaintext-at-rest window is the attach
-        // itself. Best-effort: a failed unlink leaves a file the next
-        // create of this id would truncate; log and continue.
+        // inode the kernel reclaims at FC exit. A failed unlink is
+        // reclaimed by `destroy_teardown` or the startup residue sweep
+        // (ids are never reused, so nothing else ever would).
         let has_swap = swap_backing.is_some();
-        if let Some(backing) = swap_backing {
-            if let Err(e) = tokio::fs::remove_file(&backing).await {
-                tracing::warn!(
-                    backing = %backing.display(),
-                    error = %e,
-                    "swap backing unlink-after-attach failed; file remains until destroy",
-                );
-            }
+        if let Some(mut guard) = swap_backing {
+            guard.unlink_now();
         }
 
         let state = SandboxState {
@@ -3477,6 +3474,10 @@ impl FirecrackerBackend {
             (Some(src), Some(swap_mib)) => {
                 let backing = paths::swap_backing(&self.work_dir, sandbox_id);
                 create_sparse_swap_backing(&backing, swap_mib).await?;
+                // Drop-guard from creation: any `?` below (or between
+                // here and the post-load unlink) reclaims the file
+                // instead of orphaning it (review finding on #1051).
+                let backing_guard = SwapBackingGuard::new(backing.clone());
                 let guard = source_canonical_lock(src).lock_owned().await;
                 if let Some(parent) = src.parent() {
                     tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -3493,7 +3494,7 @@ impl FirecrackerBackend {
                         backing.display()
                     ))
                 })?;
-                Some((guard, backing))
+                Some((guard, backing_guard))
             }
             (None, Some(_)) => {
                 // Structurally unreachable: `swap_mib` and the canonical
@@ -3634,18 +3635,11 @@ impl FirecrackerBackend {
         // ADR 0112: same for the swap drive — release the shared canonical,
         // then unlink the fresh backing (FC holds the fd; the bytes live in
         // an anonymous inode until FC exits). Unlink even on a failed load:
-        // the file has no value outside this residence. Best-effort.
-        if let Some((guard, backing)) = swap_restore {
+        // the file has no value outside this residence. A failed unlink is
+        // reclaimed by `destroy_teardown` or the startup residue sweep.
+        if let Some((guard, mut backing_guard)) = swap_restore {
             drop(guard);
-            if let Err(e) = tokio::fs::remove_file(&backing).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        backing = %backing.display(),
-                        error = %e,
-                        "swap backing unlink-after-load failed; file remains until destroy",
-                    );
-                }
-            }
+            backing_guard.unlink_now();
         }
 
         let uffd_handler: Option<Child> = match load_result {
@@ -3909,6 +3903,56 @@ fn describe_agentd_rpc_recv_failure(e: &std::io::Error) -> String {
         )
     } else {
         e.to_string()
+    }
+}
+
+/// ADR 0112: drop-guard for the swap backing file. Unlinks on drop
+/// unless [`Self::unlink_now`] already ran — so every early return
+/// (`?`) between backing creation and the deliberate
+/// unlink-after-attach reclaims the file instead of orphaning it
+/// (review finding on #1051: TAP/vsock/InstanceStart failures land
+/// between the two, and the create/restore error handlers only remove
+/// the jail dir, which `swap/` is a sibling of). Sync `remove_file`:
+/// O(1) on a sparse inode, and Drop can't await.
+struct SwapBackingGuard {
+    path: Option<PathBuf>,
+}
+
+impl SwapBackingGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    /// The deliberate unlink-after-attach: FC holds the fd, so from
+    /// here the bytes live in an anonymous inode the kernel reclaims
+    /// at FC exit. A failed unlink leaves the file for
+    /// `destroy_teardown` (which removes it explicitly) or the
+    /// startup residue sweep — sandbox ids are never reused, so no
+    /// later create reclaims it implicitly.
+    fn unlink_now(&mut self) {
+        self.reclaim("unlink-after-attach");
+    }
+
+    fn reclaim(&mut self, when: &str) {
+        let Some(path) = self.path.take() else { return };
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                backing = %path.display(),
+                error = %e,
+                "swap backing {when} unlink failed; destroy_teardown / the \
+                 startup residue sweep reclaims it",
+            ),
+        }
+    }
+}
+
+impl Drop for SwapBackingGuard {
+    fn drop(&mut self) {
+        // Reached only on an early-return path (success paths already
+        // took the path via `unlink_now`).
+        self.reclaim("aborted create/restore");
     }
 }
 
@@ -6799,6 +6843,13 @@ async fn destroy_teardown(
         // not the target.
         let _ = tokio::fs::remove_file(&entry).await;
     }
+    // ADR 0112: the swap BACKING (`swap/<id>.img`, the symlink's
+    // target). Normally already an anonymous inode
+    // (unlink-after-attach), so this is NotFound; it exists only when
+    // that unlink failed — and then it holds guest swap bytes in
+    // plaintext, so this removal is the reclamation the failure log
+    // points at (review finding on #1051).
+    let _ = tokio::fs::remove_file(paths::swap_backing(&work_dir, id)).await;
 
     let jail_dir = work_dir.join(id.to_string());
     if let Err(e) = tokio::fs::remove_dir_all(&jail_dir).await {

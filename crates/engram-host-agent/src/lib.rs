@@ -286,11 +286,17 @@ impl HostAgent {
                 .collect();
             match live_attach::sweep_dead_sandbox_residue(&self.cfg.work_dir, &live) {
                 Ok(report) => {
-                    if report.jail_dirs + report.vsock_files + report.canonical_entries > 0 {
+                    if report.jail_dirs
+                        + report.vsock_files
+                        + report.canonical_entries
+                        + report.swap_backings
+                        > 0
+                    {
                         tracing::info!(
                             jail_dirs = report.jail_dirs,
                             vsock_files = report.vsock_files,
                             canonical_entries = report.canonical_entries,
+                            swap_backings = report.swap_backings,
                             live = live.len(),
                             "swept dead sandbox residue",
                         );
