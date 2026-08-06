@@ -1,0 +1,67 @@
+#!/bin/sh
+# ADR 0065 browser bundle: standalone chromium entry point.
+#
+# The bundle has always had exactly one working entry point — bin/engram-browser,
+# which brings up the SHARED browser (Xvfb + openbox + headful chrome + x11vnc)
+# that a human watches over VNC and the agent drives over CDP (ADR 0097). That
+# script also performs the two setup steps every bundled binary depends on:
+#
+#   1. points /tmp/engram-browser-bundle at the bundle root — build.sh patchelf's
+#      every ELF's PT_INTERP + DT_RPATH to that FIXED absolute path (issue #569),
+#      and the kernel execs the interpreter recorded in the ELF, so this cannot
+#      be steered by LD_LIBRARY_PATH at run time;
+#   2. exports FONTCONFIG_FILE so chromium uses the bundled Liberation faces.
+#
+# bin/playwright-cli sidesteps both by connectOverCDP-ing to the chrome that
+# engram-browser already started. That left a third, legitimate use case with no
+# entry point at all: a TEST RUNNER launching its own headless chromium via
+# `executablePath` (vitest/playwright/puppeteer). Those callers reach for
+# chrome/chrome — the conventional path, and exactly what playwright expects —
+# and get two failures:
+#
+#   - exit 127, reported by the shell as "cannot execute: required file not
+#     found". Deeply misleading: the file is present; its INTERPRETER is not.
+#   - silently wrong fonts, because FONTCONFIG_FILE was never exported. No error
+#     at all — just screenshots that diverge from CI for invisible reasons.
+#
+# This script is that missing entry point. mount.json lists it in the top-level
+# `bins`, so agentd symlinks it to /usr/local/bin/engram-chromium in every
+# session where the browser bundle is mounted. No Xvfb, no VNC, no CDP — just a
+# correctly-linked, font-equipped chromium that behaves like any other browser
+# binary you hand to a test runner.
+#
+# `exec` is required, not stylistic: playwright drives chromium over inherited
+# fds (--remote-debugging-pipe), so an intermediate shell process would break the
+# pipe protocol.
+set -eu
+
+here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
+
+BIN="$here/chrome/chrome"
+[ -x "$BIN" ] || {
+    echo "engram-chromium: no chromium at $BIN (is this the browser bundle?)" >&2
+    exit 127
+}
+
+# Must match bin/engram-browser and build.sh byte for byte: the path is compiled
+# into the ELFs at build time, so both sides have to agree on the literal
+# string. Re-pointing is safe when engram-browser is already running — it
+# resolves to this same bundle root.
+BUNDLE_LINK=/tmp/engram-browser-bundle
+if [ "$(readlink -- "$BUNDLE_LINK" 2>/dev/null)" != "$here" ]; then
+    ln -sfn "$here" "$BUNDLE_LINK" 2>/dev/null || {
+        echo "engram-chromium: cannot point $BUNDLE_LINK at $here (stale symlink owned by another uid, or /tmp not writable?)" >&2
+        exit 1
+    }
+fi
+
+# Bundled fontconfig, so rendering matches the shared browser and CI rather than
+# whatever font set the base image happens to carry (a leaner base carries none,
+# and text renders as tofu).
+[ -f "$here/fonts.conf" ] && export FONTCONFIG_FILE="$here/fonts.conf"
+
+# Deliberately NO LD_LIBRARY_PATH: the patched binaries find lib/ via their own
+# DT_RPATH through BUNDLE_LINK, and a global one would poison the base image's
+# libc for every helper process the caller shells out to (issue #569 — this is
+# how `timeout` and /bin/sh used to crash on glibc-mismatched bases).
+exec "$BIN" "$@"

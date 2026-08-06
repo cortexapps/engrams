@@ -51,6 +51,7 @@ build_tree() {
     docker run --name "$cname" \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         -v "$here/bin/engram-browser:/launcher:ro" \
+        -v "$here/bin/engram-chromium:/chromium-launcher:ro" \
         -v "$here/skills:/skills-src:ro" \
         debian:bookworm-slim bash -euo pipefail -c '
         export DEBIAN_FRONTEND=noninteractive
@@ -139,6 +140,14 @@ build_tree() {
             || { echo "FATAL: flock (util-linux) not found — --ensure cannot serialize bring-ups" >&2; exit 1; }
         cp -L "$flock_bin" /out/bin/flock
         cp /launcher /out/bin/engram-browser
+        # Standalone chromium entry point: the ONLY supported way to launch the
+        # bundled browser without the shared Xvfb/VNC stack (a test runner
+        # handing playwright/puppeteer an executablePath). It performs the same
+        # BUNDLE_LINK + FONTCONFIG_FILE setup engram-browser does — without
+        # which chrome/chrome dies exit 127 on the patched PT_INTERP and
+        # renders with the base image fonts. See bin/engram-chromium.
+        # (No raw apostrophes in this block — see the NB above.)
+        cp /chromium-launcher /out/bin/engram-chromium
         chmod 0755 /out/bin/*
 
         # Collect every .so dep of the binaries into /out/lib so the bundle is
@@ -489,10 +498,15 @@ WRAP
     # empty /out, or docker cp copied nothing. Assert the launcher landed so a
     # broken build errors here instead of shipping a silently empty bundle that
     # still packs + stamps.
-    [ -x "$dest/bin/engram-browser" ] || {
-        echo "FATAL: $dest/bin/engram-browser missing after build — the container tree did not reach the host." >&2
-        exit 1
-    }
+    # Assert EVERY bin mount.json declares: a missing one is only a run-time
+    # warning in the guest (engram-session-bundles skips it), so a silently
+    # incomplete bundle would otherwise pack, stamp and ship.
+    for b in engram-browser engram-chromium playwright-cli; do
+        [ -x "$dest/bin/$b" ] || {
+            echo "FATAL: $dest/bin/$b missing after build — the container tree did not reach the host." >&2
+            exit 1
+        }
+    done
 }
 
 if [[ "${1:-}" == "--stage" ]]; then
