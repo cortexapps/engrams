@@ -462,6 +462,18 @@ pub struct NbdSlotAllocator {
     parked: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
 }
 
+/// One consistent-enough snapshot of the allocator's bounded slot states.
+/// The populator can move one slot while this is sampled, so consumers must
+/// use these as operational gauges, not as a transactional invariant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NbdSlotCounts {
+    pub capacity: usize,
+    pub free: usize,
+    pub warm: usize,
+    pub in_use: usize,
+    pub parked: usize,
+}
+
 impl std::fmt::Debug for NbdSlotAllocator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NbdSlotAllocator")
@@ -719,6 +731,22 @@ impl NbdSlotAllocator {
     /// Count of pre-validated slots currently sitting warm. Telemetry.
     pub async fn warm_count(&self) -> usize {
         self.warm.lock().await.len()
+    }
+
+    /// Current allocator state for low-cardinality host telemetry.
+    pub async fn slot_counts(&self) -> NbdSlotCounts {
+        let inner = self.inner.lock().await;
+        let warm = self.warm.lock().await.len();
+        let parked = self.parked.lock().expect("parked set lock poisoned").len();
+        let free = self.capacity.saturating_sub(inner.reserved_count);
+        let in_use = inner.reserved_count.saturating_sub(warm + parked);
+        NbdSlotCounts {
+            capacity: self.capacity,
+            free,
+            warm,
+            in_use,
+            parked,
+        }
     }
 
     /// Devices parked by [`NbdSlot::quarantine`] this process lifetime.
@@ -985,6 +1013,37 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(pool.warm_count().await, 4);
         assert_eq!(pool.capacity(), 16);
+    }
+
+    #[tokio::test]
+    async fn slot_counts_distinguish_warm_claimed_and_parked() {
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let pool = test_pool(4, 4, busy);
+        wait_warm(&pool, 4).await;
+        assert_eq!(
+            pool.slot_counts().await,
+            NbdSlotCounts {
+                capacity: 4,
+                free: 0,
+                warm: 4,
+                in_use: 0,
+                parked: 0,
+            }
+        );
+
+        let claimed = pool.acquire().await;
+        assert_eq!(pool.slot_counts().await.in_use, 1);
+        claimed.quarantine();
+        assert_eq!(
+            pool.slot_counts().await,
+            NbdSlotCounts {
+                capacity: 4,
+                free: 0,
+                warm: 3,
+                in_use: 0,
+                parked: 1,
+            }
+        );
     }
 
     #[tokio::test]
