@@ -6,8 +6,8 @@ description: |
   nested-virt node — that owns /dev/kvm, /dev/nbdN, taps and iptables
   and fans out N Firecracker microVMs as children (K8s schedules the
   daemon, NOT the sessions; the coordinator schedules sessions itself).
-  A node-prep DaemonSet handles the host-OS setup (kernel modules,
-  sysctls) that Packer used to bake. An optional rollout operator (K3)
+  A node-prep init container handles the host-OS setup (kernel modules,
+  sysctls) before assets are staged. An optional rollout operator (K3)
   drives drain-gated, node-by-node host-agent rollouts from a HostFleet
   CR. Requires nodes with /dev/kvm + cgroup v2; on managed K8s that
   means a metal SKU or explicit nested-virt (Intel-only today — see
