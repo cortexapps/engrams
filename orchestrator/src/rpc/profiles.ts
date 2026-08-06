@@ -61,6 +61,13 @@ import {
   isProviderCapability,
   validateProviderGrants,
 } from "../integrations/providers/index.ts";
+import { normalizeRepos, type DiscoveredRepo } from "./profile-repos.ts";
+import {
+  discoverProfileRepos as runRepoDiscovery,
+  DiscoverReposError,
+  type DiscoverReposDeps,
+} from "./profile-discover.ts";
+import { sessions as defaultSessions } from "../control-plane/client.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -95,6 +102,8 @@ export interface ProfileDeps {
   connectors?: CustomConnectorSource;
   toolCapabilities?: Set<string>;
   connections?: IntegrationConnectionStore;
+  /** Repo autodiscovery flow (boot → scan → tear down); injectable for tests. */
+  discoverRepos?: (profileId: string) => Promise<DiscoveredRepo[]>;
 }
 
 
@@ -120,6 +129,12 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     // live in the org store, never here), so they're member-visible like skills.
     network: row.network,
     secrets: row.secrets,
+    // Git checkouts in the image — member-visible config, like skills.
+    repos: row.repos.map((r) => ({
+      path: r.path,
+      remoteUrl: r.remoteUrl,
+      remote: r.remote ?? undefined,
+    })),
     // ADR 0062/0063: default harness/model/effort — member-visible (they
     // describe a selection, not a secret).
     harness: row.harness ?? undefined,
@@ -154,6 +169,17 @@ function normalizeNetwork(
     allowHosts: n.allowHosts ?? [],
     allowHostPatterns: n.allowHostPatterns ?? [],
   };
+}
+
+/** Map + validate proto repos to the stored shape; InvalidArgument on bad input. */
+function normalizeReposChecked(
+  repos: ReadonlyArray<{ path?: string; remoteUrl?: string }>,
+): ReturnType<typeof normalizeRepos> {
+  try {
+    return normalizeRepos(repos);
+  } catch (err) {
+    throw new ConnectError(err instanceof Error ? err.message : "invalid repos", Code.InvalidArgument);
+  }
 }
 
 /** ADR 0057: map proto secrets to the stored shape (mode coerced to broker|literal). */
@@ -231,6 +257,27 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
   // startup registers all built-in tools.
   const toolCapabilities = (): Set<string> =>
     deps?.toolCapabilities ?? registeredToolCapabilities();
+  const discoverRepos =
+    deps?.discoverRepos ??
+    ((profileId: string) => {
+      const db = getDb();
+      const discoverDeps: DiscoverReposDeps = {
+        db,
+        profiles: store,
+        images,
+        connectors,
+        // The compile path needs the RICHER catalog view (auth env vars), so
+        // the default wiring binds the production client, not the narrow
+        // validation-only dep. Tests inject `discoverRepos` wholesale.
+        harnessCatalog: defaultHarnessCatalog as unknown as DiscoverReposDeps["harnessCatalog"],
+        connections,
+        // The probe boots ownerless (programmatic credentials); user tokens
+        // are never resolved.
+        secrets: { get: async () => null, getAll: async () => ({}) },
+        sessions: defaultSessions as unknown as DiscoverReposDeps["sessions"],
+      };
+      return runRepoDiscovery(discoverDeps, profileId);
+    });
 
   /** Validate image_id against the live catalog; throw InvalidArgument if absent. */
   async function assertImageEnabled(imageId: string): Promise<void> {
@@ -417,6 +464,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         integrationGrants,
         network,
         secrets,
+        repos: normalizeReposChecked(req.repos ?? []),
         harness,
         model,
         effort,
@@ -464,6 +512,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         integrationGrants,
         network,
         secrets,
+        repos: normalizeReposChecked(req.repos ?? []),
         harness,
         model,
         effort,
@@ -475,6 +524,37 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         row = (await store.get(req.id)) ?? row;
       }
       return { profile: toProto(row, true) };
+    },
+
+    async discoverProfileRepos(req, ctx) {
+      const user = await requireUser(ctx, getSession);
+      const ability = abilityFor(user);
+      if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
+      if (!req.profileId) throw new ConnectError("profile_id is required", Code.InvalidArgument);
+      if (!(await store.getActive(req.profileId))) {
+        throw new ConnectError("profile not found or archived", Code.NotFound);
+      }
+      let discovered: DiscoveredRepo[];
+      try {
+        discovered = await discoverRepos(req.profileId);
+      } catch (err) {
+        if (err instanceof DiscoverReposError) {
+          // Boot/scan failures are environmental (no capacity, image broken) —
+          // retryable, with the operator-actionable cause carried through.
+          throw new ConnectError(err.message, Code.Unavailable);
+        }
+        throw err;
+      }
+      return {
+        repos: discovered.map((r) => ({
+          path: r.path,
+          remotes: r.remotes.map((m) => ({
+            name: m.name,
+            url: m.url,
+            parsed: m.parsed ?? undefined,
+          })),
+        })),
+      };
     },
 
     async deleteProfile(req, ctx) {

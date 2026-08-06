@@ -13,6 +13,11 @@ service ProfileService {
   rpc GetProfile(GetProfileRequest) returns (GetProfileResponse);
   rpc CreateProfile(CreateProfileRequest) returns (CreateProfileResponse);
   rpc UpdateProfile(UpdateProfileRequest) returns (UpdateProfileResponse);
+  // Boot a short-lived session from the profile's image, scan it for git
+  // checkouts (`.git` dirs and worktree `.git` files) and their remotes, and
+  // tear the session down. Admin-only; the caller picks which results to save
+  // onto `Profile.repos` via UpdateProfile.
+  rpc DiscoverProfileRepos(DiscoverProfileReposRequest) returns (DiscoverProfileReposResponse);
   // Soft delete — sets deleted_at (ADR §4).
   rpc DeleteProfile(DeleteProfileRequest) returns (DeleteProfileResponse);
 }
@@ -69,6 +74,45 @@ message Profile {
   // ADR 0109: named connection + operation + resource authority. The
   // connection fixes the provider identity used by the session.
   repeated ProfileIntegrationGrant integration_grants = 21;
+  // Git repositories this profile's image contains — explicit, user-controlled
+  // config (set by hand or via DiscoverProfileRepos). The Slack routing picker
+  // feeds these into its capability cards.
+  repeated ProfileRepo repos = 22;
+}
+
+// One git checkout inside the profile's image. `remote` is the parsed identity
+// of the primary remote when it parses (e.g. a github.com URL); null otherwise.
+message ProfileRepo {
+  string path = 1; // in-guest checkout path
+  string remote_url = 2; // primary remote URL as configured, "" if none
+  optional ProfileRepoRemote remote = 3;
+}
+
+// A parsed forge remote — enough to join against the GitHub integration.
+message ProfileRepoRemote {
+  string host = 1; // e.g. "github.com"
+  string owner = 2;
+  string name = 3;
+}
+
+message DiscoverProfileReposRequest {
+  string profile_id = 1;
+}
+
+// One discovered checkout, with every remote found (a repo can have several).
+message DiscoveredRepo {
+  string path = 1;
+  repeated DiscoveredRemote remotes = 2;
+}
+
+message DiscoveredRemote {
+  string name = 1; // git remote name, e.g. "origin"
+  string url = 2;
+  optional ProfileRepoRemote parsed = 3;
+}
+
+message DiscoverProfileReposResponse {
+  repeated DiscoveredRepo repos = 1;
 }
 
 message ProfileIntegrationGrant {
@@ -154,6 +198,7 @@ message CreateProfileRequest {
   // ADR 0100: system-role marker (see Profile.designation). Admin-only.
   optional string designation = 16;
   repeated ProfileIntegrationGrant integration_grants = 17;
+  repeated ProfileRepo repos = 18;
 }
 
 message CreateProfileResponse {
@@ -184,6 +229,7 @@ message UpdateProfileRequest {
   // ADR 0100: system-role marker (see Profile.designation). Admin-only.
   optional string designation = 17;
   repeated ProfileIntegrationGrant integration_grants = 18;
+  repeated ProfileRepo repos = 19;
 }
 
 message UpdateProfileResponse {

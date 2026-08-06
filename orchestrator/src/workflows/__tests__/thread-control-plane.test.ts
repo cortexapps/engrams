@@ -32,6 +32,7 @@ const profileRow = (): ProfileRow => ({
   integrationGrants: [],
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
+  repos: [],
   portExposures: [],
   designation: null,
   createdAt: new Date(0),

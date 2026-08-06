@@ -85,6 +85,7 @@ function profileRow(overrides: Partial<ProfileRow> = {}): ProfileRow {
     integrationGrants: [],
     network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
     secrets: [],
+    repos: [],
     portExposures: [],
     designation: null,
     createdAt: new Date(0),

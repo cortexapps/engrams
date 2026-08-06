@@ -7,10 +7,21 @@ const profileHolder = vi.hoisted(() => ({ value: undefined as undefined | { prof
 const paramsHolder = vi.hoisted(() => ({ value: {} as { id?: string } }));
 const create = vi.hoisted(() => vi.fn().mockResolvedValue({ profile: { id: "new" } }));
 const update = vi.hoisted(() => vi.fn().mockResolvedValue({ profile: { id: "p1" } }));
+const discover = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({
+    repos: [
+      {
+        path: "/workspace/engrams",
+        remotes: [{ name: "origin", url: "git@github.com:cortexapps/engrams.git" }],
+      },
+    ],
+  }),
+);
 vi.mock("../../hooks/useProfiles", () => ({
   useProfile: () => ({ data: profileHolder.value, isPending: false }),
   useCreateProfile: () => ({ mutateAsync: create, isPending: false }),
   useUpdateProfile: () => ({ mutateAsync: update, isPending: false }),
+  useDiscoverProfileRepos: () => ({ mutateAsync: discover, isPending: false }),
 }));
 vi.mock("../../hooks/useEnabledImages", () => ({
   useEnabledImages: () => ({
@@ -132,6 +143,7 @@ beforeEach(() => {
   connectionsHolder.value = [];
   create.mockClear();
   update.mockClear();
+  discover.mockClear();
   uploadSkill.mockClear();
 });
 
@@ -570,6 +582,44 @@ describe("SessionProfileEditor (edit)", () => {
     await waitFor(() => expect(update).toHaveBeenCalledOnce());
     // The toggle was flipped from on→off, so designation is sent as "" (clear).
     expect(update.mock.calls[0][0].designation).toBe("");
+  });
+
+  it("autodiscovers repos and saves an added candidate", async () => {
+    paramsHolder.value = { id: "p1" };
+    profileHolder.value = {
+      profile: {
+        id: "p1",
+        name: "Repo Agent",
+        description: "",
+        icon: "Bot",
+        imageId: "i1",
+        harness: "claude",
+        model: null,
+        effort: null,
+        includeUserTokens: false,
+        envVars: {},
+        integrationGrants: [],
+        skills: [],
+        network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
+        secrets: [],
+        repos: [],
+        portExposures: [],
+      },
+    };
+    render(<SessionProfileEditor mode="edit" />);
+    await screen.findByDisplayValue("Repo Agent");
+
+    fireEvent.click(screen.getByTestId("repo-autodiscover"));
+    await screen.findByTestId("repo-candidates");
+    expect(discover).toHaveBeenCalledWith({ profileId: "p1" });
+    // The origin remote is preselected as the candidate's remote URL.
+    fireEvent.click(screen.getByRole("button", { name: /^add$/i }));
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(update).toHaveBeenCalledOnce());
+    expect(update.mock.calls[0][0].repos).toEqual([
+      { path: "/workspace/engrams", remoteUrl: "git@github.com:cortexapps/engrams.git" },
+    ]);
   });
 
   it("normalizes legacy blank model and effort values on save", async () => {

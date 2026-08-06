@@ -13,6 +13,7 @@ import {
   profile as profileTable,
   DEFAULT_PROFILE_NETWORK,
   type ProfileNetwork,
+  type ProfileRepo,
   type ProfileSecret,
   type ProfileIntegrationGrant,
 } from "./schema.ts";
@@ -38,6 +39,8 @@ export interface ProfileRow {
   // ADR 0057: profile-defined egress allow-list + injected secrets.
   network: ProfileNetwork;
   secrets: ProfileSecret[];
+  // Git checkouts inside the image (user-managed; picker card input).
+  repos: ProfileRepo[];
   // ADR 0064: guest ports auto-exposed (private) for every session from this profile.
   portExposures: number[];
   designation: string | null;
@@ -62,6 +65,7 @@ export interface ProfileInput {
   integrationGrants: ProfileIntegrationGrant[];
   network: ProfileNetwork;
   secrets: ProfileSecret[];
+  repos: ProfileRepo[];
   portExposures: number[];
 }
 
@@ -102,6 +106,7 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     integrationGrants: (r.integrationGrants ?? []) as ProfileIntegrationGrant[],
     network: (r.network ?? DEFAULT_PROFILE_NETWORK) as ProfileNetwork,
     secrets: (r.secrets ?? []) as ProfileSecret[],
+    repos: (r.repos ?? []) as ProfileRepo[],
     portExposures: (r.portExposures ?? []) as number[],
     designation: r.designation ?? null,
     createdAt: r.createdAt,

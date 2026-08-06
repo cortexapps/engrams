@@ -1,0 +1,1 @@
+ALTER TABLE "profile" ADD COLUMN "repos" jsonb DEFAULT '[]'::jsonb NOT NULL;

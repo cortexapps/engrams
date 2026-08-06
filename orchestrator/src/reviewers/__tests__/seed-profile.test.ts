@@ -32,6 +32,7 @@ function profileRow(overrides: Partial<ProfileRow> = {}): ProfileRow {
     }],
     network: { default: "allow", allowHosts: ["example.com"], allowHostPatterns: [] },
     secrets: [{ ref: "token", envVar: "TOKEN", mode: "literal", allowHosts: [], allowHostPatterns: [] }],
+    repos: [],
     portExposures: [3000],
     designation: null,
     createdAt: new Date(0),
