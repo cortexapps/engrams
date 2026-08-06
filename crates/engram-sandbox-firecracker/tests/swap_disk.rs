@@ -191,20 +191,27 @@ async fn swap_drive_boots_writable_and_restores_fresh() {
         .await
         .expect("destroy restored");
 
-    // Property 4 (review finding on #1051): destroy leaves NOTHING in
-    // the swap dir — canonical symlinks removed by the teardown loop,
-    // and the `.img` arm covers a backing whose unlink-after-attach
-    // had failed (none here, but the teardown must tolerate both).
-    let leftovers: Vec<_> = std::fs::read_dir(&swap_dir)
+    // Property 4 (review finding on #1051): destroy leaves no `.img`
+    // BACKING in the swap dir — that's the leak class (plaintext guest
+    // swap bytes). The SOURCE canonical symlink (`swap/<ancestor>.swap`,
+    // re-installed by the restore at the state.bin-embedded path) is
+    // deliberately allowed to remain: it is shared by every same-base
+    // descendant — removing it at one descendant's destroy would race a
+    // sibling restore between symlink-install and FC's open (the ADR
+    // 0048 class) — exactly the rootfs source-canonical lifecycle. The
+    // startup residue sweep reaps it with the lineage's other canonical
+    // entries once the ids are dead.
+    let leaked_backings: Vec<_> = std::fs::read_dir(&swap_dir)
         .map(|it| {
             it.flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".img"))
                 .collect()
         })
         .unwrap_or_default();
     assert!(
-        leftovers.is_empty(),
-        "swap dir must be empty after both destroys: {leftovers:?}",
+        leaked_backings.is_empty(),
+        "no swap backing may survive destroy: {leaked_backings:?}",
     );
 }
 
