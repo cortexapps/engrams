@@ -69,8 +69,8 @@ disallowed_methods = "deny"
 # kubernetes — ADR 0044 K3 host-fleet rollout operator (engram-host-operator).
 # rustls (not openssl) to match reqwest's TLS choice; "latest" k8s-openapi
 # feature since the operator is the sole consumer.
-kube = { version = "0.99", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
-k8s-openapi = { version = "0.24", features = ["latest"] }
+kube = { version = "4.2", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
+k8s-openapi = { version = "0.28", features = ["latest"] }
 # ADR 0045 C2: peer page-channel payload compression. Pure Rust on
 # purpose — the uffd-handler's musl build must not grow a C dep.
 lz4_flex = "0.14"
