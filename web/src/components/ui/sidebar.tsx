@@ -292,13 +292,16 @@ function SidebarResizeHandle({
       aria-valuemin={min}
       aria-valuemax={max}
       tabIndex={0}
-      // Straddles the rail's border so the hairline itself is the grab target;
-      // the ::after line lifts to the accent on hover/focus/drag, the same
-      // "accent marks the live thing" grammar as ResizableHandle.
+      // The same control as `ResizableHandle`, which splits the panes on the
+      // other side of the page: nothing at rest, a lime pill under the pointer,
+      // solid while dragging. Keep the two in step — one page must not carry
+      // two different-looking drag handles. The tone is the rail's own ring
+      // rather than `--primary`: the pill straddles the rail's edge, and that
+      // lime is the one tuned to stay legible on the dark spine.
       className={cn(
         "absolute inset-y-0 -right-1 z-20 hidden w-2 cursor-col-resize touch-none select-none md:block",
-        "after:absolute after:inset-y-0 after:left-1/2 after:w-px after:-translate-x-1/2 after:transition-colors",
-        "hover:after:bg-sidebar-ring focus-visible:outline-none focus-visible:after:bg-sidebar-ring",
+        "after:absolute after:inset-y-0 after:left-1/2 after:w-2 after:-translate-x-1/2 after:rounded-full after:transition-colors",
+        "hover:after:bg-sidebar-ring/60 focus-visible:outline-none focus-visible:after:bg-sidebar-ring",
         "data-[dragging=true]:after:bg-sidebar-ring",
         className,
       )}

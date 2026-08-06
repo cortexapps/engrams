@@ -17,7 +17,6 @@ import { useIsAdmin } from "../auth/AuthProvider";
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "@/components/ui/resizable";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
 import type { ProfileSnapshotView, IndexedEvent } from "../lib/types";
 
 // The session workspace (ADR 0065 follow-up). The transcript is the primary
@@ -426,16 +425,10 @@ export function SessionDetail() {
               {leftColumn}
             </ResizablePanel>
 
-            {/* The handle IS the gutter between the two sheets: transparent at
-                rest so the cover shows through, a lime pill while you drag. */}
-            <ResizableHandle
-              className={cn(
-                "w-2 bg-transparent after:w-2",
-                "data-[resize-handle-state=hover]:bg-transparent data-[resize-handle-state=drag]:bg-transparent",
-                "after:rounded-full after:transition-colors hover:after:bg-primary/60 data-[resize-handle-state=drag]:after:bg-primary",
-                paneOpen ? "" : "hidden",
-              )}
-            />
+            {/* The gutter between the two sheets. The pill is the component's
+                own look now — it was spelled out here, which left the rail's
+                handle on the other side of the page looking like a hairline. */}
+            <ResizableHandle className={paneOpen ? undefined : "hidden"} />
 
             <ResizablePanel
               id="workpane"
