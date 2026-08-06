@@ -113,8 +113,9 @@ pub struct AutoscalingSpec {
     #[serde(default)]
     pub scale_down: crate::scaler::ScaleDownMode,
     /// ADR 0045 Phase E: shed only after the scale-down decision holds for
-    /// this many consecutive reconciles (anti-flap hysteresis — scale up fast,
-    /// scale down slow). Pairs with the cold-node cost of re-adding a node.
+    /// this many minute-sized ticks (anti-flap hysteresis — scale up fast,
+    /// scale down slow). The time-sized tick keeps this stable when the
+    /// scale-up reconcile interval changes.
     #[serde(default = "default_scale_down_hysteresis")]
     pub scale_down_hysteresis_ticks: u32,
     /// ADR 0048: the most victim nodes a single scale-down WAVE may target.

@@ -86,9 +86,10 @@ spec:
                   scaleDownHysteresisTicks:
                     default: 3
                     description: "ADR 0045 Phase E: shed only after the scale-down\
-                      \ decision holds for this many consecutive reconciles (anti-flap\
-                      \ hysteresis \u2014 scale up fast, scale down slow). Pairs with\
-                      \ the cold-node cost of re-adding a node."
+                      \ decision holds for this many minute-sized ticks (anti-flap\
+                      \ hysteresis \u2014 scale up fast, scale down slow). The time-sized\
+                      \ tick keeps this stable when the scale-up reconcile interval\
+                      \ changes."
                     format: uint32
                     minimum: 0.0
                     type: integer

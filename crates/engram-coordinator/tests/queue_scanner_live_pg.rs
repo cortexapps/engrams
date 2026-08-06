@@ -168,32 +168,40 @@ async fn seed_ready_host(
     .expect("upsert host");
     meta.touch_host_heartbeat(
         id,
-        HostHeartbeat {
-            status: HostStatus::Ready,
-            capacity: HostCapacity {
-                total_gb: 0,
-                used_gb: 0,
-                total_mib: allocatable_mib,
-                used_mib: 0,
-                running_sandboxes: 0,
-            },
-            utilization: HostUtilization {
-                allocatable_mib,
-                ..HostUtilization::default()
-            },
-            ready_images: ready_images.to_vec(),
-            current_bundles: Vec::new(),
-            total_vcpus,
-            // Issue #229: report the coordinator's wire version so the
-            // placement filter keeps this seeded host schedulable.
-            wire_version: engram_protocol::WIRE_VERSION,
-            stages_images: false,
-            capabilities: engram_core::types::host::HostCapabilities::default(),
-        },
+        ready_heartbeat(allocatable_mib, total_vcpus, ready_images),
     )
     .await
     .expect("heartbeat host");
     id
+}
+
+fn ready_heartbeat(
+    allocatable_mib: u64,
+    total_vcpus: u32,
+    ready_images: &[String],
+) -> HostHeartbeat {
+    HostHeartbeat {
+        status: HostStatus::Ready,
+        capacity: HostCapacity {
+            total_gb: 0,
+            used_gb: 0,
+            total_mib: allocatable_mib,
+            used_mib: 0,
+            running_sandboxes: 0,
+        },
+        utilization: HostUtilization {
+            allocatable_mib,
+            ..HostUtilization::default()
+        },
+        ready_images: ready_images.to_vec(),
+        current_bundles: Vec::new(),
+        total_vcpus,
+        // Issue #229: report the coordinator's wire version so the placement
+        // filter keeps this seeded host schedulable.
+        wire_version: engram_protocol::WIRE_VERSION,
+        stages_images: false,
+        capabilities: engram_core::types::host::HostCapabilities::default(),
+    }
 }
 
 /// Seeds a live `enabled_images` row for `image_uri` with a freshly
@@ -922,11 +930,13 @@ async fn notify_placement_changed_fires_at_every_site() {
     enqueue(&meta, sid, spec(), 4096, 2).await;
     wait_for_reason(&mut listener, "enqueued").await;
 
-    // 2. upsert_host → "host_upserted".
+    // 2. upsert_host → "host_upserted", then its first real scheduling
+    //    heartbeat → "host_schedulability_changed". Registration carries a
+    //    zeroed capacity/image vector, so both wakes are required: the first
+    //    exposes the host row and the second makes it placeable.
     let host = seed_ready_host(&meta, 16_384, 8, &[]).await;
-    // `seed_ready_host` calls upsert_host then touch_host_heartbeat;
-    // only the former fires this NOTIFY.
     wait_for_reason(&mut listener, "host_upserted").await;
+    wait_for_reason(&mut listener, "host_schedulability_changed").await;
 
     // 3. set_host_cordoned(false) → "host_uncordoned" (cordon itself does
     //    NOT notify — only the uncordon direction does).
@@ -952,7 +962,7 @@ async fn notify_placement_changed_fires_at_every_site() {
     let sid2 = SessionId::new();
     enqueue(&meta, sid2, spec(), 4096, 2).await;
     wait_for_reason(&mut listener, "enqueued").await;
-    // `place_queued_session` is NOT a notify site (only the 5 sites in
+    // `place_queued_session` is NOT a notify site (only the sites in
     // `notify_placement_changed`'s doc comment are), so no drain needed here.
     meta.place_queued_session(sid2, 4096, 2, &[host], 0)
         .await
@@ -963,6 +973,46 @@ async fn notify_placement_changed_fires_at_every_site() {
         .await
         .expect("delete pending");
     wait_for_reason(&mut listener, "pending_deleted").await;
+}
+
+/// A steady heartbeat must not wake every coordinator replica's queue scanner.
+/// The positive test above pins the first scheduling-vector wake; this negative
+/// twin pins the low-cardinality boundary after the vector is unchanged.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn steady_host_heartbeat_does_not_notify_placement_changed() {
+    let Some((meta, database_url)) = connect().await else {
+        return;
+    };
+    let mut listener = sqlx::postgres::PgListener::connect(&database_url)
+        .await
+        .expect("listener connect");
+    listener
+        .listen("placement_changed")
+        .await
+        .expect("listen placement_changed");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let host = seed_ready_host(&meta, 16_384, 8, &[]).await;
+    for expected in ["host_upserted", "host_schedulability_changed"] {
+        let notification = tokio::time::timeout(Duration::from_secs(10), listener.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {expected}"))
+            .expect("listener stayed open");
+        assert_eq!(notification.payload(), expected);
+    }
+
+    meta.touch_host_heartbeat(host, ready_heartbeat(16_384, 8, &[]))
+        .await
+        .expect("steady heartbeat");
+    match tokio::time::timeout(Duration::from_secs(1), listener.recv()).await {
+        Err(_) => {}
+        Ok(Ok(n)) => panic!(
+            "steady heartbeat must not fire placement_changed, got {:?}",
+            n.payload()
+        ),
+        Ok(Err(e)) => panic!("listener died: {e}"),
+    }
 }
 
 /// Issue #537/PR #559 (T6): the negative twin of

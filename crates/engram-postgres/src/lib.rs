@@ -155,9 +155,10 @@ impl PostgresStore {
     }
 
     /// ADR 0048 (queue fairness): best-effort wake for `queue_scanner`,
-    /// fired at every discrete placement-feasibility event (a reservation
-    /// freed, a `pending` reservation released, a host (re)registered or
-    /// uncordoned, a session freshly enqueued). The scanner LISTENs on
+    /// fired for every discrete placement-feasibility event. These events
+    /// include a freed reservation, a released `pending` reservation, a host
+    /// registration, a changed host scheduling vector, an uncordoned host,
+    /// and a newly queued session. The scanner LISTENs on
     /// `placement_changed` and retries immediately instead of waiting for
     /// its fallback poll (`ENGRAM_QUEUE_POLL_SECS`). Mirrors the
     /// `org_secret_changed` precedent above: best-effort `let _ =`, the
@@ -4153,7 +4154,7 @@ impl MetadataStore for PostgresStore {
         // ADR 0068: this tick's re-probed capability vector.
         let capabilities = serde_json::to_value(&hb.capabilities)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
-        let n = sqlx::query(
+        let placement_changed = sqlx::query_scalar::<_, bool>(
             // Issue #230: `dead` is terminal w.r.t. heartbeats — see
             // `HostStatus::can_transition_to`. The dead-host sweep
             // (`mark_host_dead_and_orphan_sessions`) marks a partitioned
@@ -4168,8 +4169,15 @@ impl MetadataStore for PostgresStore {
             // = ready). `ready`↔`draining` stay heartbeat-overridable:
             // `draining` is the agent's own preStop flag and a host that
             // finished/aborted its drain legitimately reports ready again.
-            r#"UPDATE hosts
-                  SET status = CASE WHEN status = 'dead' THEN 'dead' ELSE $2 END,
+            r#"WITH previous AS MATERIALIZED (
+                    SELECT status, allocatable_mib, ready_images, total_vcpus,
+                           wire_version, capabilities
+                      FROM hosts
+                     WHERE id = $1
+                     FOR UPDATE
+                )
+                UPDATE hosts
+                  SET status = CASE WHEN hosts.status = 'dead' THEN 'dead' ELSE $2 END,
                       capacity_total_mib = $3,
                       capacity_used_mib = $4,
                       running_sandboxes_count = $5,
@@ -4190,7 +4198,17 @@ impl MetadataStore for PostgresStore {
                       stages_images = $20,
                       last_heartbeat_at = $21,
                       updated_at = $21
-                WHERE id = $1"#,
+                 FROM previous
+                WHERE hosts.id = $1
+                RETURNING previous.status <> 'dead' AND (
+                    previous.status IS DISTINCT FROM
+                        CASE WHEN previous.status = 'dead' THEN 'dead' ELSE $2 END
+                    OR (COALESCE(previous.allocatable_mib, 0) = 0 AND $11::bigint > 0)
+                    OR previous.ready_images IS DISTINCT FROM $12::jsonb
+                    OR previous.total_vcpus IS DISTINCT FROM $14::int
+                    OR previous.wire_version IS DISTINCT FROM $15::int
+                    OR previous.capabilities IS DISTINCT FROM $19::jsonb
+                )"#,
         )
         .bind(id.as_uuid())
         .bind(hb.status.as_str())
@@ -4215,12 +4233,19 @@ impl MetadataStore for PostgresStore {
         .bind(capabilities)
         .bind(hb.stages_images)
         .bind(self.clock.now_utc())
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .map_err(db_err)?
-        .rows_affected();
-        if n == 0 {
+        .map_err(db_err)?;
+        let Some(placement_changed) = placement_changed else {
             return Err(MetaError::NotFound);
+        };
+        if placement_changed {
+            // Registration wakes the queue before the host has its real
+            // scheduling vector. Wake again when the first heartbeat supplies
+            // capacity or when a later heartbeat changes an eligibility axis
+            // such as image readiness. Steady heartbeats stay silent.
+            self.notify_placement_changed("host_schedulability_changed")
+                .await;
         }
         Ok(())
     }

@@ -35,7 +35,6 @@
 //! against recording mocks without a cluster or a coordinator.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -220,6 +219,52 @@ impl NodeReadyTracker {
                 fresh
             }
         }
+    }
+}
+
+/// Minute-based scale-down hysteresis, independent of reconcile frequency.
+///
+/// Scale-up needs a short reconcile interval, but making the controller poll
+/// faster must not also make scale-down more aggressive. The CRD keeps its
+/// existing `scaleDownHysteresisTicks` surface; one tick is explicitly one
+/// minute instead of one reconcile. The first observation counts as tick 1,
+/// matching the old 60-second reconcile behavior.
+#[derive(Default)]
+pub struct ScaleDownHysteresis(std::sync::Mutex<ScaleDownHysteresisState>);
+
+#[derive(Default)]
+struct ScaleDownHysteresisState {
+    ticks: u32,
+    last_tick: Option<tokio::time::Instant>,
+}
+
+const SCALE_DOWN_HYSTERESIS_TICK: Duration = Duration::from_secs(60);
+
+impl ScaleDownHysteresis {
+    fn observe(&self, target: bool) -> u32 {
+        self.observe_at(target, crate::time_source::metrics_now_tokio())
+    }
+
+    fn observe_at(&self, target: bool, now: tokio::time::Instant) -> u32 {
+        let mut state = self.0.lock().expect("scale-down hysteresis poisoned");
+        if !target {
+            *state = ScaleDownHysteresisState::default();
+            return 0;
+        }
+
+        match state.last_tick {
+            None => {
+                state.ticks = 1;
+                state.last_tick = Some(now);
+            }
+            Some(last) => {
+                if now.duration_since(last) >= SCALE_DOWN_HYSTERESIS_TICK {
+                    state.ticks = state.ticks.saturating_add(1);
+                    state.last_tick = Some(now);
+                }
+            }
+        }
+        state.ticks
     }
 }
 
@@ -609,7 +654,7 @@ async fn gate_drain(
 pub async fn step(
     spec: &HostFleetSpec,
     scaler: &dyn NodePoolScaler,
-    scaledown_ticks: &std::sync::atomic::AtomicU32,
+    scaledown_hysteresis: &ScaleDownHysteresis,
     node_ready: &NodeReadyTracker,
     coord: &dyn CoordApi,
     nodes: &dyn NodeOps,
@@ -670,13 +715,8 @@ pub async fn step(
         && demand.queued_sessions == 0
         && stuck_rolls.is_empty()
         && desired <= physical;
-    let hysteresis_ready = if scale_down_target && !wave_in_flight {
-        let ticks = scaledown_ticks.fetch_add(1, Ordering::Relaxed) + 1;
-        ticks >= a.scale_down_hysteresis_ticks.max(1)
-    } else {
-        scaledown_ticks.store(0, Ordering::Relaxed);
-        false
-    };
+    let hysteresis_ticks = scaledown_hysteresis.observe(scale_down_target && !wave_in_flight);
+    let hysteresis_ready = hysteresis_ticks >= a.scale_down_hysteresis_ticks.max(1);
 
     let action = plan_step(StepInputs {
         desired,
@@ -833,6 +873,21 @@ mod tests {
         assert!(t.observe([a].into_iter().collect()).is_empty());
         // …and a same-named node rejoining is a fresh bring-up again.
         assert_eq!(t.observe([a, b].into_iter().collect()), vec![b]);
+    }
+
+    #[test]
+    fn scale_down_hysteresis_uses_minute_ticks_not_reconcile_count() {
+        let h = ScaleDownHysteresis::default();
+        let start = crate::time_source::metrics_now_tokio();
+
+        assert_eq!(h.observe_at(true, start), 1);
+        assert_eq!(h.observe_at(true, start + Duration::from_secs(10)), 1);
+        assert_eq!(h.observe_at(true, start + Duration::from_secs(59)), 1);
+        assert_eq!(h.observe_at(true, start + Duration::from_secs(60)), 2);
+        assert_eq!(h.observe_at(true, start + Duration::from_secs(180)), 3);
+
+        assert_eq!(h.observe_at(false, start + Duration::from_secs(181)), 0);
+        assert_eq!(h.observe_at(true, start + Duration::from_secs(182)), 1);
     }
 
     #[test]
@@ -1135,13 +1190,13 @@ mod tests {
             queued_vcpus: 8,
         };
         let scaler = RecScaler { rec: rec.clone() };
-        let ticks = std::sync::atomic::AtomicU32::new(0);
+        let hysteresis = ScaleDownHysteresis::default();
         let pods = vec![ready_pod("a"), ready_pod("b"), ready_pod("stuck")];
 
         let status = step(
             &autoscale_spec(),
             &scaler,
-            &ticks,
+            &hysteresis,
             &NodeReadyTracker::default(),
             &rec,
             &rec,
@@ -1190,7 +1245,7 @@ mod tests {
             queued_vcpus: 16,
         };
         let scaler = RecScaler { rec: rec.clone() };
-        let ticks = std::sync::atomic::AtomicU32::new(0);
+        let hysteresis = ScaleDownHysteresis::default();
         // Both pods Ready but running stale images (they need the roll).
         let stale = |node: &str| PodInfo {
             host_image: "host:old".into(),
@@ -1202,7 +1257,7 @@ mod tests {
         let status = step(
             &autoscale_spec(),
             &scaler,
-            &ticks,
+            &hysteresis,
             &NodeReadyTracker::default(),
             &rec,
             &rec,
@@ -1256,13 +1311,13 @@ mod tests {
         let mut spec = autoscale_spec();
         spec.autoscaling.as_mut().unwrap().scale_down = crate::scaler::ScaleDownMode::IdleOnly;
         let scaler = RecScaler { rec: rec.clone() };
-        let ticks = std::sync::atomic::AtomicU32::new(0);
+        let hysteresis = ScaleDownHysteresis::default();
         let pods = vec![ready_pod("a"), ready_pod("b"), ready_pod("victim")];
 
         let status = step(
             &spec,
             &scaler,
-            &ticks,
+            &hysteresis,
             &NodeReadyTracker::default(),
             &rec,
             &rec,
@@ -1293,7 +1348,7 @@ mod tests {
             ..crate::scaler::FleetDemand::default()
         };
         let scaler = RecScaler { rec: rec.clone() };
-        let ticks = std::sync::atomic::AtomicU32::new(0);
+        let hysteresis = ScaleDownHysteresis::default();
         let pods = vec![
             ready_pod("a"),
             ready_pod("b"),
@@ -1304,7 +1359,7 @@ mod tests {
         let status = step(
             &autoscale_spec(),
             &scaler,
-            &ticks,
+            &hysteresis,
             &NodeReadyTracker::default(),
             &rec,
             &rec,

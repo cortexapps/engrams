@@ -12,7 +12,6 @@
 //! snapshot-rehome rewind). Drain/evac is reserved for actual node removal
 //! (see [`gate_drain`]).
 
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,12 +56,23 @@ pub struct Ctx {
     pub client: Client,
     /// ADR 0044 K4: actuates node-pool size changes. `NoopScaler` by default.
     pub scaler: Arc<dyn NodePoolScaler>,
-    /// ADR 0045 Phase E: consecutive reconciles the scale-down decision has
-    /// held, for anti-flap hysteresis. Reset to 0 on any hold/scale-up tick.
-    pub scaledown_ticks: AtomicU32,
+    /// ADR 0045 Phase E: minute-based scale-down hysteresis. This is
+    /// deliberately independent of the faster scale-up reconcile interval.
+    pub scaledown_hysteresis: crate::autoscale::ScaleDownHysteresis,
     /// Cross-tick memory for the `engram_node_ready_seconds` bring-up
     /// histogram (hosts already seen registered with the coordinator).
     pub node_ready: crate::autoscale::NodeReadyTracker,
+}
+
+const STEADY_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const AUTOSCALE_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+
+fn steady_reconcile_interval(autoscaling_enabled: bool) -> Duration {
+    if autoscaling_enabled {
+        AUTOSCALE_RECONCILE_INTERVAL
+    } else {
+        STEADY_RECONCILE_INTERVAL
+    }
 }
 
 /// A host-agent pod distilled to the fields the planner needs.
@@ -194,7 +204,9 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
         return Ok(Action::requeue(Duration::from_secs(10)));
     }
     match decision {
-        RollDecision::UpToDate { .. } => Ok(Action::requeue(Duration::from_secs(60))),
+        RollDecision::UpToDate { .. } => Ok(Action::requeue(steady_reconcile_interval(
+            spec.autoscaling.is_some(),
+        ))),
         RollDecision::WaitForReady => Ok(Action::requeue(Duration::from_secs(10))),
         RollDecision::BlockedByFloor {
             schedulable, floor, ..
@@ -242,7 +254,7 @@ async fn run_autoscale(
     crate::autoscale::step(
         spec,
         ctx.scaler.as_ref(),
-        &ctx.scaledown_ticks,
+        &ctx.scaledown_hysteresis,
         &ctx.node_ready,
         &coord,
         &nodes,
@@ -721,6 +733,12 @@ pub(crate) fn coord_token() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autoscaling_uses_the_fast_steady_reconcile_interval() {
+        assert_eq!(steady_reconcile_interval(true), Duration::from_secs(10));
+        assert_eq!(steady_reconcile_interval(false), Duration::from_secs(60));
+    }
 
     /// Minimal CoordApi mock for [`gate_enable_work`]: scripted
     /// `host_status` responses, popped per call (empty → idle host).
