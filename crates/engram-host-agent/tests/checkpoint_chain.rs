@@ -144,6 +144,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
     let sandbox = pooled.create(spec).await.expect("create");

@@ -404,6 +404,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
     let sandbox_id = backend.create(spec).await.expect("create");
     // Poll for guest_endpoints — the in-VM agent takes a few seconds to

@@ -839,6 +839,7 @@ fn update_base_config() -> app::ImageConfig {
             suggested_memory_mib: None,
             suggested_vcpus: Some(1),
             suggested_disk_gib: None,
+            suggested_swap_mib: None,
         }),
         warm: None,
     }

@@ -11042,6 +11042,7 @@ mod tests {
             workdir: None,
             network: Default::default(),
             aux_ro_drives: Vec::new(),
+            swap_mib: None,
         }
     }
 
@@ -14075,6 +14076,7 @@ mod tests {
             workdir: None,
             network: Default::default(),
             aux_ro_drives: Vec::new(),
+            swap_mib: None,
         };
         spec.image_uri = Some("test:1".into());
         let _id = pooled.create(spec).await.unwrap();

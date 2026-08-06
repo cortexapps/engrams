@@ -31,7 +31,12 @@ pub fn init(addr: SocketAddr) {
             metrics_exporter_prometheus::Matcher::Full(NODE_READY_SECONDS.to_string()),
             node_ready_buckets,
         )
-        .expect("install node-ready histogram buckets");
+        .expect("install node-ready histogram buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(NODE_BOOTSTRAP_PHASE_SECONDS.to_string()),
+            node_ready_buckets,
+        )
+        .expect("install node-bootstrap phase histogram buckets");
 
     match builder.install() {
         Ok(()) => {
@@ -120,3 +125,9 @@ pub const ROLL_NODES_TOTAL: &str = "engram_roll_nodes_total";
 /// `autoscale.rs`; hosts already present at operator boot are seeded
 /// silently, so an operator restart never emits stale samples.
 pub const NODE_READY_SECONDS: &str = "engram_node_ready_seconds";
+
+/// Histogram, label `phase`: bounded cold-node bootstrap phases derived from
+/// the scale request, Kubernetes Node conditions, container status, and the
+/// coordinator registration edge. `scale_request_to_registered` is the user
+/// wait; the other phases explain that total.
+pub const NODE_BOOTSTRAP_PHASE_SECONDS: &str = "engram_node_bootstrap_phase_seconds";

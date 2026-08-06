@@ -306,6 +306,10 @@ const enableImageSchema = z
       .string()
       .trim()
       .regex(/^(?:[1-9]\d*)?$/, "disk must be a positive integer (GiB)"),
+    swapMib: z
+      .string()
+      .trim()
+      .regex(/^(?:[1-9]\d*)?$/, "swap must be a positive integer (MiB)"),
     warmCommand: z.string(),
     warmTimeoutSecs: z
       .string()
@@ -340,6 +344,7 @@ function formDefaults(image?: EnabledImageSummary): EnableImageValues {
     vcpus: image?.suggested_vcpus != null ? String(image.suggested_vcpus) : "2",
     memoryMib: image?.suggested_memory_mib != null ? String(image.suggested_memory_mib) : "",
     diskGib: image?.suggested_disk_gib != null ? String(image.suggested_disk_gib) : "",
+    swapMib: image?.suggested_swap_mib != null ? String(image.suggested_swap_mib) : "",
     warmCommand: (image?.warm_command ?? []).join(" "),
     warmTimeoutSecs: image?.warm_timeout_secs != null ? String(image.warm_timeout_secs) : "",
     warmWorkdir: image?.warm_workdir ?? "",
@@ -391,6 +396,7 @@ function buildConfig(data: EnableImageValues): ImageConfig {
       suggestedVcpus: Number(data.vcpus),
       suggestedMemoryMib: data.memoryMib ? Number(data.memoryMib) : undefined,
       suggestedDiskGib: data.diskGib ? Number(data.diskGib) : undefined,
+      suggestedSwapMib: data.swapMib ? Number(data.swapMib) : undefined,
     }),
     // Empty command = no [warm] hook (the schema already rejects warm env
     // without a command; timeout/workdir/network ride the block too).
@@ -890,6 +896,25 @@ function EnableImageDialog({
                       min={1}
                       step={1}
                       placeholder="16"
+                      aria-invalid={fieldState.invalid}
+                    />
+                    {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                  </Field>
+                )}
+              />
+              <Controller
+                name="swapMib"
+                control={form.control}
+                render={({ field, fieldState }) => (
+                  <Field data-invalid={fieldState.invalid}>
+                    <FieldLabel htmlFor={field.name}>Swap MiB</FieldLabel>
+                    <Input
+                      {...field}
+                      id={field.name}
+                      type="number"
+                      min={1}
+                      step={1}
+                      placeholder="0 (off)"
                       aria-invalid={fieldState.invalid}
                     />
                     {fieldState.invalid && <FieldError errors={[fieldState.error]} />}

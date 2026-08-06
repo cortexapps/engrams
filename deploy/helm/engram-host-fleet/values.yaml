@@ -174,7 +174,9 @@ storage:
   # bytes: the dedicated disk still fills, and the budget above (not
   # this) is the mechanism that keeps the fleet off the kubelet's
   # eviction line. Nodepool provisioning of the devices themselves (e.g.
-  # a Terraform local-SSD flag) is out of scope for this chart. NOTE:
+  # a Terraform local-SSD flag) is out of scope for this chart. Node prep
+  # runs as the first host-agent init container, before Kubernetes binds
+  # this path into stage-node-assets. NOTE:
   # local-SSD data does NOT survive node deletion/recreation — everything
   # under workDirHostPath must be (and is) reconstructible: the chunk
   # cache refills from the blob store, bundles are re-staged by the
@@ -187,9 +189,8 @@ nbd:
   # with `nbdsMax` devices (`modprobe nbd nbds_max=<N>`); the host-agent
   # sizes its slot pool from the kernel's nbds_max (capped at this same
   # value) and keeps `warmSlots` pre-validated slots ready for an O(1)
-  # `acquire()`. Total is overridable per deployment — a dense fleet
-  # (engrams-internal) runs nbdsMax: 4096. Set nbdsMax: 0 to disable NBD
-  # (materialize-to-file fallback).
+  # `acquire()`. Total is overridable per deployment. Set nbdsMax: 0 to
+  # disable NBD (materialize-to-file fallback).
   nbdsMax: 64
   warmSlots: 64
 

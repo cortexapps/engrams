@@ -357,6 +357,7 @@ fn test_cold_boot_spec() -> SandboxSpec {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: Vec::new(),
+        swap_mib: None,
     }
 }
 

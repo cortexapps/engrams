@@ -1369,6 +1369,7 @@ impl HostAgent {
             let coord_for_heartbeat = coord_client.clone();
             let harness_hub_for_heartbeat = harness_hub.clone();
             let pooled_for_heartbeat = pooled.clone();
+            let nbd_pool_for_heartbeat = pooled.nbd_pool();
             let capture_jobs_for_heartbeat = capture_jobs.clone();
             let host_addr_for_heartbeat = self.cfg.grpc_advertise_addr.clone();
             let readiness_for_heartbeat = readiness.clone();
@@ -1423,6 +1424,19 @@ impl HostAgent {
                         }
                     };
                     let running_count = running_sandboxes.len() as u32;
+                    if let Some(pool) = &nbd_pool_for_heartbeat {
+                        let slots = pool.slot_counts().await;
+                        for (state, count) in [
+                            ("capacity", slots.capacity),
+                            ("free", slots.free),
+                            ("warm", slots.warm),
+                            ("in_use", slots.in_use),
+                            ("parked", slots.parked),
+                        ] {
+                            ::metrics::gauge!(crate::metrics::NBD_SLOTS, "state" => state)
+                                .set(count as f64);
+                        }
+                    }
                     // ADR 0022 Option A: sample summed guest PSS/RSS across
                     // this host's live FC sandboxes — the density signal
                     // (Σpss/Σrss → ~1.0 under UFFD private copies, < 1.0 as

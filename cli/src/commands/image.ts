@@ -30,6 +30,7 @@ interface ConfigToml {
     suggested_memory_mib?: number;
     suggested_vcpus?: number;
     suggested_disk_gib?: number;
+    suggested_swap_mib?: number;
   };
   warm?: {
     command?: string[];
@@ -67,6 +68,7 @@ export function loadImageConfig(path: string): ImageConfigInit {
       suggestedMemoryMib: c.resources?.suggested_memory_mib,
       suggestedVcpus: c.resources?.suggested_vcpus,
       suggestedDiskGib: c.resources?.suggested_disk_gib,
+      suggestedSwapMib: c.resources?.suggested_swap_mib,
     },
     warm: c.warm
       ? {
@@ -216,6 +218,7 @@ export async function config(c: Clients, uri: string, json: boolean): Promise<vo
           suggested_memory_mib: cfg.resources.suggestedMemoryMib,
           suggested_vcpus: cfg.resources.suggestedVcpus,
           suggested_disk_gib: cfg.resources.suggestedDiskGib,
+          suggested_swap_mib: cfg.resources.suggestedSwapMib,
         })
       : undefined,
     warm: cfg.warm
