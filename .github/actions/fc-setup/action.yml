@@ -106,7 +106,13 @@ runs:
         sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" /usr/local/bin/firecracker
         firecracker --version
 
-    - uses: oras-project/setup-oras@v1
+    # Pinned CLI version: setup-oras v2 changed its default from oras
+    # 1.3.0 to 1.3.1, and this action shares the `oras pull` path with
+    # bake-images.yml. Pin so the tool moves on purpose, not as a
+    # side effect of an action bump.
+    - uses: oras-project/setup-oras@v2
+      with:
+        version: 1.3.0
 
     # ADR 0045 Phase B: stage both binaries for the stock<->fork
     # snapshot-compat test (`stock_fork_snapshot_compat`). Stock = the
@@ -142,7 +148,7 @@ runs:
     # total). Without the cache, every CI run pays a ~19 min
     # download from `spec.ccfc.min` (Firecracker's S3 bucket).
     #
-    # On Blacksmith runners, actions/cache@v4 transparently uses
+    # On Blacksmith runners, actions/cache@v6 transparently uses
     # Blacksmith's colocated cache — see
     # https://docs.blacksmith.sh/github-actions-runners/blacksmith-cache.
     # No useblacksmith/* fork needed (those are archived). The
@@ -152,7 +158,7 @@ runs:
     # re-fetch on top of the prior artifacts (the fetch script is
     # idempotent per-file) instead of a full cold download.
     - name: Cache FC kernel + rootfs artifacts
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/.cache/engram-fc-test
         key: fc-test-artifacts-${{ hashFiles('crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh') }}

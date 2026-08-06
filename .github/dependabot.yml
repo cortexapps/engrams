@@ -18,7 +18,15 @@ updates:
   # version ships a breaking change we want a PR with the diff, not
   # silent drift.
   - package-ecosystem: "github-actions"
-    directory: "/"
+    # `directory: "/"` scans only `.github/workflows/*`. Local composite
+    # actions under `.github/actions/**` are a separate directory as far as
+    # Dependabot is concerned (dependabot-core #4178, #6704, #7495), so a
+    # bare "/" left `fc-setup/action.yml` pinned to setup-oras@v1 and
+    # actions/cache@v4 while the workflows moved to v2/v6 — a silent skew in
+    # the `oras pull` path that fc-setup and bake-images.yml share.
+    directories:
+      - "/"
+      - "/.github/actions/*"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
@@ -44,10 +52,13 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
-        # The grpc group below owns these at every update level; without
-        # the exclude a tonic MINOR would match both groups and land
-        # wherever Dependabot's first-match ordering puts it.
-        exclude-patterns: ["tonic", "tonic-*", "prost", "prost-*"]
+        # The grpc and rustcrypto-digest groups below own these at every
+        # update level; without the exclude a tonic MINOR would match both
+        # groups and land wherever Dependabot's first-match ordering puts
+        # it. Same for sha2/hmac: a lone sha2 patch landing here would
+        # split the digest-generation pair that must move together.
+        exclude-patterns:
+          ["tonic", "tonic-*", "prost", "prost-*", "sha2", "hmac", "digest"]
       # Exception to the majors-arrive-individually rule: the tonic/prost
       # family is version-locked to itself (tonic 0.14 codegen emits code
       # that only compiles against prost 0.14 and the tonic 0.14 runtime).
@@ -58,6 +69,24 @@ updates:
       # else.
       grpc:
         patterns: ["tonic", "tonic-*", "prost", "prost-*"]
+        update-types: ["major", "minor", "patch"]
+      # Same exception, same reason, different family. sha2 and hmac are
+      # version-locked to each other through the `digest`/`crypto-common`
+      # generation they share: sha2 0.11 and hmac 0.13 both want digest
+      # 0.11, while sha2 0.10 and hmac 0.12 both want digest 0.10. Mixing
+      # generations does not compile, because `Hmac<Sha256>` needs its
+      # `Sha256` to implement the *same* digest crate's traits:
+      #
+      #   sha2 0.11 + hmac 0.12 -> error[E0599]: `new_from_slice` exists for
+      #     `CoreWrapper<HmacCore<Sha256>>` but its trait bounds were not
+      #     satisfied  (crates/engram-coordinator/src/oauth_redirect.rs)
+      #
+      # So neither #10 (sha2 0.11) nor #1031 (hmac 0.13) can EVER go green
+      # on its own — the pair is the smallest buildable review unit, exactly
+      # like tonic/prost above. Grouping majors here keeps them one PR
+      # without weakening the majors-arrive-individually rule elsewhere.
+      rustcrypto-digest:
+        patterns: ["sha2", "hmac", "digest"]
         update-types: ["major", "minor", "patch"]
 
   # Frontend (pnpm) ---------------------------------------------------------
@@ -87,3 +116,13 @@ updates:
     groups:
       docker-base:
         patterns: ["*"]
+    ignore:
+      # Only even Node majors ever become LTS; odd ones are Current-only and
+      # go EOL about 7 months after release. Dependabot proposed
+      # `node:25-alpine` in #130 — a line that was ALREADY EOL (2026-06-01)
+      # on the day the PR was opened, and the release that stopped shipping
+      # `corepack` (nodejs/node#57617), which is what web.Dockerfile used to
+      # install pnpm. So it could not have built either. Skip odd majors; the
+      # even ones (26, 28, …) still arrive normally.
+      - dependency-name: "node"
+        versions: ["25.x", "27.x", "29.x", "31.x", "33.x"]
