@@ -72,14 +72,15 @@
 //!
 //! `spawn` parks on a shared [`tokio::sync::Notify`] that `pg_listener`
 //! fires on every `placement_changed` NOTIFY — emitted by `engram-postgres`
-//! at every discrete placement-feasibility event (a reservation freed, a
-//! `pending` reservation released, a host (re)registered or uncordoned, a
-//! session freshly enqueued; see `PostgresStore::notify_placement_changed`).
+//! for every discrete placement-feasibility event. These events include a
+//! freed reservation, a released `pending` reservation, a host registration,
+//! a changed host scheduling vector, an uncordoned host, and a newly queued
+//! session. See `PostgresStore::notify_placement_changed`.
 //! `ENGRAM_QUEUE_POLL_SECS` (default 30) is now only the fallback for a
-//! dropped NOTIFY, a `draining → ready` flip (arrives via heartbeat, which
-//! deliberately gets no NOTIFY of its own — a per-heartbeat NOTIFY would be
-//! a busy-loop), or allocatable drift. `ENGRAM_QUEUE_RETRY_SECS` (default
-//! 5) is a one-shot re-arm: a sweep that errored a placement attempt
+//! dropped NOTIFY, clock-driven TTL transitions, or positive allocatable
+//! drift. Heartbeats notify only when a discrete scheduling axis changes;
+//! steady heartbeats do not cause a busy-loop. `ENGRAM_QUEUE_RETRY_SECS`
+//! (default 5) is a one-shot re-arm: a sweep that errored a placement attempt
 //! schedules a short retry so transient PG/candidates failures keep the
 //! old ≤5s retry latency instead of waiting for the 30s fallback (boot
 //! failures retry on the create_boot op row, not here — ADR 0079).

@@ -132,6 +132,24 @@ pub fn init(addr: SocketAddr) {
             write_bytes_buckets,
         )
         .expect("install write-bytes histogram buckets");
+    // The read side reuses the write-ack bucket boundaries so the two
+    // distributions compare bucket-for-bucket. The measured landmarks all
+    // have a boundary near them: the ~90 µs serve floor (vCPU kept busy)
+    // sits in (50 µs, 100 µs], the ~195 µs typical qd=1 round trip in
+    // (100 µs, 250 µs], and the 8–9 ms first-touch whole-chunk
+    // materialization in (5 ms, 10 ms].
+    builder = builder
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(NBD_READ_SECONDS.to_string()),
+            write_ack_buckets,
+        )
+        .expect("install read histogram buckets");
+    builder = builder
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(NBD_READ_BYTES.to_string()),
+            write_bytes_buckets,
+        )
+        .expect("install read-bytes histogram buckets");
     // Recovered bytes span one 16 MiB chunk to a whole unpublished
     // divergence. The 0 bucket splits out clean-shutdown recoveries that
     // had nothing left to save from the ones that rescued real writes.
@@ -605,3 +623,22 @@ pub const NBD_WRITE_ACK_SECONDS: &str = "engram_nbd_write_ack_seconds";
 /// [`NBD_WRITE_ACK_SECONDS`] — it separates "slower because larger"
 /// from "slower because the kernel throttled writeback".
 pub const NBD_WRITE_BYTES: &str = "engram_nbd_write_bytes";
+
+/// Histogram, label `outcome` (`ok`/`eio`). Wall time of one NBD READ,
+/// from dispatch to the backend's reply bytes — the guest-visible serve
+/// latency of the chunked rootfs, minus the virtio/kernel-NBD legs.
+///
+/// This is the north star for the cold-start read-path work (2026-08:
+/// a first `gradlew help` is ~47k dependency-chained reads at qd≈1, so
+/// wall time = this distribution × chain length). p50 tracks the serve
+/// floor; the p90+ tail tracks first-touch whole-chunk materialization.
+/// Recorded ONCE per NBD request — a read spanning several chunks must
+/// not observe per chunk, both for cost and to keep the distribution
+/// per-request.
+pub const NBD_READ_SECONDS: &str = "engram_nbd_read_seconds";
+
+/// Histogram. Bytes per NBD READ request. The normalizer for
+/// [`NBD_READ_SECONDS`] — guest readahead changes shift the request-size
+/// mix, which moves the latency histogram without the path itself
+/// changing speed.
+pub const NBD_READ_BYTES: &str = "engram_nbd_read_bytes";

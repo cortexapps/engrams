@@ -1,6 +1,6 @@
 {
   "kind": "skill",
-  "bins": ["bin/engram-browser"],
+  "bins": ["bin/engram-browser", "bin/engram-chromium"],
   "skills": [
     { "name": "browser", "bins": ["bin/playwright-cli"] }
   ]

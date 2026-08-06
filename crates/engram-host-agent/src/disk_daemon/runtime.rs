@@ -1614,7 +1614,22 @@ async fn handle_request(
             // chunk surfaces as `Err` → EIO in bounded time. The kernel
             // NBD_SET_TIMEOUT (see `spawn`) backstops a wedged daemon that
             // never replies at all.
-            match backend.read(req.offset, req.length as u64).await {
+            //
+            // Same noise-floor argument as the write ack below, at a
+            // hotter rate: reads burst to ~76k/s per session, so the
+            // labels stay `&'static str` (no per-op alloc) and the
+            // observation happens ONCE here per NBD request — never
+            // inside the per-chunk loop `backend.read` runs for
+            // fragmented requests.
+            let started = crate::time_source::metrics_now();
+            let outcome = backend.read(req.offset, req.length as u64).await;
+            ::metrics::histogram!(
+                crate::metrics::NBD_READ_SECONDS,
+                "outcome" => if outcome.is_ok() { "ok" } else { "eio" },
+            )
+            .record(started.elapsed().as_secs_f64());
+            ::metrics::histogram!(crate::metrics::NBD_READ_BYTES).record(req.length as f64);
+            match outcome {
                 Ok(bytes) => (NbdReply::ok(req.handle), Some(bytes)),
                 Err(e) => {
                     tracing::warn!(error = %e, "NBD read failed");

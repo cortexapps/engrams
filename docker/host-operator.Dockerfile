@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # ADR 0044 K3: the host-fleet rollout operator — a plain controller binary
 # (K8s API + coordinator HTTP, rustls, no privileged surface).
-FROM rust:1.95-slim AS builder
+FROM rust:1.96-slim AS builder
 WORKDIR /src
 # protobuf-compiler/pkg-config aren't needed by the operator's own closure
 # (rustls, no -sys C deps), but keep the builder consistent with the other

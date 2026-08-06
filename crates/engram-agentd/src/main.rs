@@ -338,6 +338,11 @@ async fn run(args: Args) -> std::io::Result<()> {
     // PTP device. Must run inside the runtime — it spawns the tick loop.
     engram_agentd::clock::init();
 
+    // Readahead tuning for the chunked-NBD virtio disks (see `tuning`).
+    // Runs before the harness so the base-snapshot capture freezes the
+    // setting into every restored session.
+    engram_agentd::tuning::apply_block_readahead();
+
     let token = args.token.clone();
     if token.is_some() {
         tracing::info!("first-frame token auth enabled");
