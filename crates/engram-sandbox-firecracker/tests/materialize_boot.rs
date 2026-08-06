@@ -404,6 +404,7 @@ async fn materialize_and_boot() {
         // Symbolic agentd slot — resolved against the staged bundle
         // stamp, mounted + exec'd by the shim the materializer injected.
         aux_ro_drives: vec![AuxRoDrive::reserved_slot(AuxRoDrive::AGENTD_SLOT_INDEX)],
+        swap_mib: None,
     };
     let id = backend.create(spec).await.expect("create");
 

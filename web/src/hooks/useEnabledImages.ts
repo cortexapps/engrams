@@ -23,6 +23,7 @@ function protoImageToLegacy(img: ProtoEnabledImageSummary): EnabledImageSummary 
     suggested_vcpus: img.config?.resources?.suggestedVcpus ?? null,
     suggested_memory_mib: img.config?.resources?.suggestedMemoryMib ?? null,
     suggested_disk_gib: img.config?.resources?.suggestedDiskGib ?? null,
+    suggested_swap_mib: img.config?.resources?.suggestedSwapMib ?? null,
     warm_command: img.config?.warm?.command ?? [],
     // uint64 on the wire; any plausible hook timeout fits a JS number, and
     // the edit form round-trips it back through BigInt() losslessly.

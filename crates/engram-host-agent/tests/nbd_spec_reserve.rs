@@ -166,6 +166,7 @@ async fn never_flushed_survivor_is_reserved_from_spec_and_binding() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: Vec::new(),
+        swap_mib: None,
     };
     sandbox_manifest::write_manifest(
         &sandbox_dir.join("sandbox.json"),

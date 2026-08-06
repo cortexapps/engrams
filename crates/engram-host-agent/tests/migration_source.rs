@@ -152,6 +152,7 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: vec![staged.agentd_slot()],
+        swap_mib: None,
     };
     let vm = pooled.create(spec.clone()).await.expect("create vm");
 

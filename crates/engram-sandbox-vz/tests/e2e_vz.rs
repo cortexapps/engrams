@@ -168,6 +168,7 @@ fn spec(rootfs: &Path) -> SandboxSpec {
             AuxRoDrive::reserved_slot(AuxRoDrive::AGENTD_SLOT_INDEX),
             AuxRoDrive::reserved_slot(AuxRoDrive::GUEST_TOOLS_SLOT_INDEX),
         ],
+        swap_mib: None,
     }
 }
 

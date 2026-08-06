@@ -79,6 +79,7 @@ async fn round_trip(
         workdir: None,
         network: Default::default(),
         aux_ro_drives: Vec::new(),
+        swap_mib: None,
     };
 
     // Create + snapshot with the first binary.

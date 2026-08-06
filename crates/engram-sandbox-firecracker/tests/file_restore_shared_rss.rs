@@ -164,6 +164,7 @@ async fn file_backend_siblings_share_clean_pages() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: Vec::new(),
+        swap_mib: None,
     };
     let source = backend.create(spec).await.expect("create");
     wait_for_fill(work.path(), &source).await;
@@ -321,6 +322,7 @@ async fn file_backend_base_create_shares_residency_memfile() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: Vec::new(),
+        swap_mib: None,
     };
     let source = backend.create(spec).await.expect("create");
     wait_for_fill(work.path(), &source).await;
@@ -515,6 +517,7 @@ async fn substrate_base_create_density_and_latency_parity() {
         workdir: None,
         network: Default::default(),
         aux_ro_drives: Vec::new(),
+        swap_mib: None,
     };
     let source = backend.create(spec).await.expect("create");
     wait_for_fill(work.path(), &source).await;

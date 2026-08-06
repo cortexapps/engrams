@@ -509,6 +509,7 @@ mod tests {
             suggested_memory_mib: mem,
             suggested_vcpus: Some(2),
             suggested_disk_gib: Some(10),
+            suggested_swap_mib: None,
         }
     }
 

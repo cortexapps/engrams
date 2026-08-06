@@ -450,6 +450,9 @@ export interface EnabledImageSummary {
   suggested_vcpus: number | null;
   suggested_memory_mib: number | null;
   suggested_disk_gib: number | null;
+  /** `config.resources.suggested_swap_mib` — ADR 0112 ephemeral guest
+   * swap; null/0 = no swap device. */
+  suggested_swap_mib: number | null;
   /** `config.warm.command` argv; empty when the image has no warm hook. */
   warm_command: string[];
   /** `config.warm.timeout_secs` (proto uint64, safe as a number for any

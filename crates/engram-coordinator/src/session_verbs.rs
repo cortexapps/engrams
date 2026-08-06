@@ -1760,6 +1760,7 @@ mod tests {
             workdir: None,
             network: Default::default(),
             aux_ro_drives: Vec::new(),
+            swap_mib: None,
         };
         let sandbox_id = state.services.host.create(spec).await.unwrap();
         state

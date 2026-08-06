@@ -84,6 +84,7 @@ async fn generated_session_has_skills_and_browser_tooling() {
         // Dev staging is spec-independent, but pass reserved slots through to
         // mirror what coord capture records (ADR 0055 sentinel device model).
         aux_ro_drives: (0..2).map(AuxRoDrive::reserved_slot).collect(),
+        swap_mib: None,
     };
     let id = backend.create(spec).await.expect("create session");
 
