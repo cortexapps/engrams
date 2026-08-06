@@ -7,7 +7,7 @@
 #
 #   docker buildx build -f docker/web.Dockerfile -t engram/web:dev .
 
-FROM node:24-alpine AS builder
+FROM node:25-alpine AS builder
 WORKDIR /src
 
 # pnpm v9, matching the CI web lane (pnpm/action-setup version 9 in
