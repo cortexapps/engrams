@@ -121,12 +121,15 @@ pub trait NodeOps: Send + Sync {
 }
 
 /// Live K8s implementation of [`NodeOps`].
-pub struct K8sNodeOps {
+pub struct K8sNodeOps<'a> {
     pub client: Client,
+    /// One label-scoped, cacheable snapshot shared by all node reads in this
+    /// reconcile. Writes still go directly to the API server.
+    pub managed_nodes: &'a [Node],
 }
 
 #[async_trait]
-impl NodeOps for K8sNodeOps {
+impl NodeOps for K8sNodeOps<'_> {
     async fn set_unschedulable(&self, node: &str, val: bool) -> Result<(), OperatorError> {
         let nodes: Api<Node> = Api::all(self.client.clone());
         let patch = serde_json::json!({ "spec": { "unschedulable": val } });
@@ -153,12 +156,10 @@ impl NodeOps for K8sNodeOps {
     }
 
     async fn annotated_victims(&self, fleet: &str) -> Result<Vec<String>, OperatorError> {
-        use kube::api::ListParams;
         use kube::ResourceExt;
-        let nodes: Api<Node> = Api::all(self.client.clone());
-        let list = nodes.list(&ListParams::default()).await?;
-        Ok(list
-            .into_iter()
+        Ok(self
+            .managed_nodes
+            .iter()
             .filter(|n| {
                 n.annotations()
                     .get(VICTIM_ANNOTATION)
@@ -184,11 +185,11 @@ impl NodeOps for K8sNodeOps {
         &self,
         node: &str,
     ) -> Result<Option<std::time::SystemTime>, OperatorError> {
-        let nodes: Api<Node> = Api::all(self.client.clone());
-        Ok(nodes
-            .get_opt(node)
-            .await?
-            .and_then(|n| n.metadata.creation_timestamp)
+        Ok(self
+            .managed_nodes
+            .iter()
+            .find(|n| n.metadata.name.as_deref() == Some(node))
+            .and_then(|n| n.metadata.creation_timestamp.clone())
             .map(|t| t.0.into()))
     }
 }

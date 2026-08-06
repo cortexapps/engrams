@@ -67,8 +67,11 @@ pub struct Ctx {
 const STEADY_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 // The single operator has no direct Postgres access or demand event stream.
 // One GetFleetDemand call performs three fleet-scale reads (hosts, active
-// reservations, and queued demand); one call per second keeps scale-up
-// detection near-immediate without putting the controller on the DB boundary.
+// reservations, and queued demand). The K8s side performs one Node LIST per
+// tick, scoped to the DaemonSet's node selector and served with
+// resourceVersion=0 cache semantics. One tick per second keeps scale-up
+// detection near-immediate without putting either control plane on a costly
+// full-cluster read path.
 const AUTOSCALE_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
 fn steady_reconcile_interval(autoscaling_enabled: bool) -> Duration {
@@ -159,11 +162,15 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
 
     // 2. List the DaemonSet's pods.
     let pods = list_ds_pods(client, &spec.daemon_set.namespace, &ds).await?;
+    // All node-based reconciliation consumes one shared snapshot. The label
+    // selector prevents this fast autoscaling tick from listing unrelated
+    // cluster nodes; resourceVersion=0 lets the apiserver serve its cache.
+    let managed_nodes = list_managed_nodes(client, &ds).await?;
 
     // 2b. Release any roll-cordon whose roll already completed (the operator
     //     was replaced, or the successor gate timed out, between cordon and
     //     uncordon). Best-effort — a coord hiccup shouldn't wedge the loop.
-    if let Err(e) = converge_roll_cordons(client, spec, &pods).await {
+    if let Err(e) = converge_roll_cordons(client, spec, &pods, &managed_nodes).await {
         tracing::warn!(error = %e, "roll-cordon convergence failed; continuing");
     }
 
@@ -173,7 +180,7 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
     // drain/remove them safely. With autoscaling disabled, the marker still
     // blocks the destructive retry loop and leaves a crisp operator signal.
     let recovery_key = roll_recovery_key(spec);
-    let stuck_rolls = list_roll_stuck_nodes(client, recovery_key).await?;
+    let stuck_rolls = roll_stuck_nodes(&managed_nodes, recovery_key);
 
     // 3. Plan.
     let decision = plan_roll(
@@ -194,13 +201,14 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
     // served BY the roll, so blocking on it deadlocks the fleet. Best-effort —
     // a coord hiccup shouldn't wedge the controller.
     let roll_idle = matches!(decision, RollDecision::UpToDate { .. });
-    let blocks_roll = match run_autoscale(spec, &ctx, &pods, roll_idle, &stuck_rolls).await {
-        Ok(status) => status.blocks_roll,
-        Err(e) => {
-            tracing::warn!(error = %e, "autoscale step failed; continuing");
-            false
-        }
-    };
+    let blocks_roll =
+        match run_autoscale(spec, &ctx, &pods, &managed_nodes, roll_idle, &stuck_rolls).await {
+            Ok(status) => status.blocks_roll,
+            Err(e) => {
+                tracing::warn!(error = %e, "autoscale step failed; continuing");
+                false
+            }
+        };
 
     // 4. Act. An in-flight scale-down wave takes precedence over image rolls
     //    (the wave's drains are consuming receiving capacity) — requeue soon.
@@ -237,6 +245,7 @@ async fn run_autoscale(
     spec: &HostFleetSpec,
     ctx: &Ctx,
     pods: &[PodInfo],
+    managed_nodes: &[Node],
     roll_idle: bool,
     stuck_rolls: &[String],
 ) -> Result<crate::autoscale::AutoscaleStatus, OperatorError> {
@@ -254,6 +263,7 @@ async fn run_autoscale(
     let coord = CoordClient::new(spec.coordinator_url.clone(), coord_token());
     let nodes = crate::autoscale::K8sNodeOps {
         client: ctx.client.clone(),
+        managed_nodes,
     };
     crate::autoscale::step(
         spec,
@@ -543,6 +553,37 @@ async fn list_ds_pods(
     Ok(list.into_iter().map(pod_info).collect())
 }
 
+/// List only the Nodes eligible for this DaemonSet. `resourceVersion=0`
+/// permits an apiserver watch cache response: this runs on the one-second
+/// scale-up tick, so it must not force a consistent cluster-wide etcd read.
+async fn list_managed_nodes(client: &Client, ds: &DaemonSet) -> Result<Vec<Node>, OperatorError> {
+    let params = managed_node_list_params(ds)?;
+    let nodes: Api<Node> = Api::all(client.clone());
+    Ok(nodes.list(&params).await?.into_iter().collect())
+}
+
+fn managed_node_list_params(ds: &DaemonSet) -> Result<ListParams, OperatorError> {
+    let selector = ds
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|s| s.node_selector.as_ref())
+        .filter(|selector| !selector.is_empty())
+        .map(|selector| {
+            selector
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .ok_or_else(|| {
+            OperatorError::Invalid(
+                "host-agent DaemonSet must have a nodeSelector for scoped Node reads".into(),
+            )
+        })?;
+    Ok(ListParams::default().labels(&selector).match_any())
+}
+
 fn pod_info(p: Pod) -> PodInfo {
     let name = p.name_any();
     let node = p
@@ -634,22 +675,16 @@ async fn set_node_roll_stuck(
     Ok(())
 }
 
-async fn list_roll_stuck_nodes(
-    client: &Client,
-    recovery_key: &str,
-) -> Result<Vec<String>, OperatorError> {
-    let nodes: Api<Node> = Api::all(client.clone());
-    Ok(nodes
-        .list(&ListParams::default())
-        .await?
-        .into_iter()
+fn roll_stuck_nodes(nodes: &[Node], recovery_key: &str) -> Vec<String> {
+    nodes
+        .iter()
         .filter(|node| {
             node.annotations()
                 .get(ROLL_STUCK_ANNOTATION)
                 .is_some_and(|value| value == recovery_key)
         })
         .map(|node| node.name_any())
-        .collect())
+        .collect()
 }
 
 /// Release both durable image-roll markers and the K8s cordon in one patch.
@@ -702,12 +737,10 @@ async fn converge_roll_cordons(
     client: &Client,
     spec: &HostFleetSpec,
     pods: &[PodInfo],
+    nodes: &[Node],
 ) -> Result<(), OperatorError> {
-    let nodes: Api<Node> = Api::all(client.clone());
     let marked: Vec<String> = nodes
-        .list(&ListParams::default())
-        .await?
-        .into_iter()
+        .iter()
         .filter(|n| n.annotations().contains_key(ROLL_CORDON_ANNOTATION))
         .map(|n| n.name_any())
         .collect();
@@ -742,6 +775,57 @@ mod tests {
     fn autoscaling_uses_the_fast_steady_reconcile_interval() {
         assert_eq!(steady_reconcile_interval(true), Duration::from_secs(1));
         assert_eq!(steady_reconcile_interval(false), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn fast_tick_node_list_is_scoped_and_cacheable() {
+        let ds: DaemonSet = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "hf-host-agent" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "host-agent" } },
+                "template": {
+                    "metadata": { "labels": { "app": "host-agent" } },
+                    "spec": {
+                        "nodeSelector": {
+                            "engram.io/kvm": "true",
+                            "topology.kubernetes.io/zone": "us-west2-a"
+                        },
+                        "containers": [{ "name": "host-agent", "image": "host-agent:test" }]
+                    }
+                }
+            }
+        }))
+        .expect("DaemonSet fixture");
+
+        let params = managed_node_list_params(&ds).expect("managed Node list params");
+        assert_eq!(
+            params.label_selector.as_deref(),
+            Some("engram.io/kvm=true,topology.kubernetes.io/zone=us-west2-a")
+        );
+        assert_eq!(params.resource_version.as_deref(), Some("0"));
+        assert!(params.version_match.is_some());
+    }
+
+    #[test]
+    fn fast_tick_refuses_an_unscoped_node_list() {
+        let ds: DaemonSet = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "hf-host-agent" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "host-agent" } },
+                "template": {
+                    "metadata": { "labels": { "app": "host-agent" } },
+                    "spec": {
+                        "containers": [{ "name": "host-agent", "image": "host-agent:test" }]
+                    }
+                }
+            }
+        }))
+        .expect("DaemonSet fixture");
+
+        let error = managed_node_list_params(&ds).expect_err("missing nodeSelector must fail");
+        assert!(error
+            .to_string()
+            .contains("must have a nodeSelector for scoped Node reads"));
     }
 
     /// Minimal CoordApi mock for [`gate_enable_work`]: scripted
