@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import type { SessionState } from "../lib/types";
+import type { ListRowState } from "../lib/types";
 
 // Status glyphs in the margin — these stand in for colored dots. The
 // shape carries the meaning, not the color.
@@ -18,7 +18,7 @@ import type { SessionState } from "../lib/types";
 // exists → /resume; no snapshot → going Dead shortly).
 
 export interface GlyphProps {
-  status: SessionState;
+  status: ListRowState;
   /** Override beat (e.g. event ticker doesn't pulse). */
   beat?: boolean;
   /** ADR 0107: the session is waiting on the USER (a plan awaiting review,
@@ -48,7 +48,7 @@ export function StatusGlyph({ status, beat = true, attention = false }: GlyphPro
   );
 }
 
-function glyphFor(status: SessionState): string {
+function glyphFor(status: ListRowState): string {
   switch (status) {
     case "pending":
     case "queued":
@@ -75,10 +75,14 @@ function glyphFor(status: SessionState): string {
       return "!";
     case "dead":
       return "✕";
+    // We asked and nobody answered. A hollow square is not on the lifecycle
+    // ramp (○ ◐ ● ◌ ✓ ✕), so it cannot be misread as a position on it.
+    case "unknown":
+      return "▫";
   }
 }
 
-function toneFor(status: SessionState): string {
+function toneFor(status: ListRowState): string {
   switch (status) {
     case "active":
       return "var(--ring)"; // racing green on paper, lime on the dark ground
@@ -95,6 +99,8 @@ function toneFor(status: SessionState): string {
     case "evacuating":
     case "completed":
     case "dead":
+    // Not a fault — we simply do not know. Quiet, never destructive.
+    case "unknown":
       return "var(--muted-foreground)";
     case "unreachable":
     case "host_lost":
