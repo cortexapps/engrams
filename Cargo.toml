@@ -206,7 +206,7 @@ metrics = "0.24"
 tikv-jemallocator = { version = "0.6", features = ["profiling", "stats"] }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 jemalloc_pprof = { version = "0.8", features = ["symbolize"] }
-metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 # OpenTelemetry distributed tracing (ADR 0019). Opt-in at runtime via
 # OTEL_EXPORTER_OTLP_ENDPOINT; deps are compiled in but inert when unset.
 # The 0.28 / tracing-opentelemetry 0.29 set is a known-compatible pairing
