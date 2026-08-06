@@ -51,6 +51,7 @@ build_tree() {
     docker run --name "$cname" \
         -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
         -v "$here/bin/engram-browser:/launcher:ro" \
+        -v "$here/bin/engram-chromium:/chromium-launcher:ro" \
         -v "$here/skills:/skills-src:ro" \
         debian:bookworm-slim bash -euo pipefail -c '
         export DEBIAN_FRONTEND=noninteractive
@@ -60,8 +61,15 @@ build_tree() {
         # patchelf rewrites PT_INTERP/DT_RPATH on every bundled ELF (issue
         # #569) so the bundle carries its own loader instead of depending on
         # the one the base image ships.
+        # Fonts (see the fonts.conf step below for the full rationale):
+        # liberation is metric-compatible with Arial/Times/Courier, which real
+        # sites request by name — keep it. The noto-* set is what stops tofu:
+        # core covers Cyrillic/Greek/Arabic/Hebrew/Devanagari/Thai and more,
+        # cjk covers Chinese/Japanese/Korean, color-emoji covers emoji. Without
+        # them the browser renders boxes on a large fraction of the real web.
         apt-get install -y -qq --no-install-recommends \
-            xvfb x11vnc openbox fonts-liberation ca-certificates \
+            xvfb x11vnc openbox ca-certificates \
+            fonts-liberation fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji \
             x11-xkb-utils xkb-data util-linux curl xz-utils patchelf
 
         # Chromium is PINNED, installed from a snapshot.debian.org timestamp —
@@ -139,6 +147,14 @@ build_tree() {
             || { echo "FATAL: flock (util-linux) not found — --ensure cannot serialize bring-ups" >&2; exit 1; }
         cp -L "$flock_bin" /out/bin/flock
         cp /launcher /out/bin/engram-browser
+        # Standalone chromium entry point: the ONLY supported way to launch the
+        # bundled browser without the shared Xvfb/VNC stack (a test runner
+        # handing playwright/puppeteer an executablePath). It performs the same
+        # BUNDLE_LINK + FONTCONFIG_FILE setup engram-browser does — without
+        # which chrome/chrome dies exit 127 on the patched PT_INTERP and
+        # renders with the base image fonts. See bin/engram-chromium.
+        # (No raw apostrophes in this block — see the NB above.)
+        cp /chromium-launcher /out/bin/engram-chromium
         chmod 0755 /out/bin/*
 
         # Collect every .so dep of the binaries into /out/lib so the bundle is
@@ -214,7 +230,28 @@ build_tree() {
         [ -x /out/bin/setpriv ] \
             || { echo "FATAL: setpriv missing — the browser can not drop privileges" >&2; exit 1; }
 
-        cp /usr/share/fonts/truetype/liberation/*.ttf /out/fonts/ 2>/dev/null || true
+        # Collect every installed face, not just liberation ttf: noto ships
+        # under several dirs and as .otf/.ttc (NotoSansCJK is a collection),
+        # so an extension- or dir-specific copy would silently drop exactly
+        # the coverage we installed the packages for. Flatten into fonts/ —
+        # fonts.conf scans that one dir.
+        find /usr/share/fonts -type f \
+            \( -name "*.ttf" -o -name "*.otf" -o -name "*.ttc" -o -name "*.otc" \) \
+            -exec cp -n {} /out/fonts/ \;
+        # The old copy ended in `|| true`, so a packaging move that emptied the
+        # source dir would have shipped a fontless bundle silently. Assert
+        # instead: liberation for metric compatibility, CJK and emoji because
+        # they are the coverage most likely to be dropped by a repackaging.
+        font_count="$(find /out/fonts -type f | wc -l)"
+        [ "$font_count" -ge 100 ] \
+            || { echo "FATAL: only $font_count fonts collected (expected >=100)" >&2; exit 1; }
+        ls /out/fonts | grep -qi liberation \
+            || { echo "FATAL: liberation faces missing from the bundle" >&2; exit 1; }
+        ls /out/fonts | grep -qi "NotoSansCJK" \
+            || { echo "FATAL: Noto CJK missing — the browser would render tofu for CJK" >&2; exit 1; }
+        ls /out/fonts | grep -qi "NotoColorEmoji" \
+            || { echo "FATAL: Noto Color Emoji missing — the browser would render tofu for emoji" >&2; exit 1; }
+        echo "fonts collected: $font_count faces"
         cat > /out/fonts.conf <<"FONTS"
 <?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
@@ -489,10 +526,15 @@ WRAP
     # empty /out, or docker cp copied nothing. Assert the launcher landed so a
     # broken build errors here instead of shipping a silently empty bundle that
     # still packs + stamps.
-    [ -x "$dest/bin/engram-browser" ] || {
-        echo "FATAL: $dest/bin/engram-browser missing after build — the container tree did not reach the host." >&2
-        exit 1
-    }
+    # Assert EVERY bin mount.json declares: a missing one is only a run-time
+    # warning in the guest (engram-session-bundles skips it), so a silently
+    # incomplete bundle would otherwise pack, stamp and ship.
+    for b in engram-browser engram-chromium playwright-cli; do
+        [ -x "$dest/bin/$b" ] || {
+            echo "FATAL: $dest/bin/$b missing after build — the container tree did not reach the host." >&2
+            exit 1
+        }
+    done
 }
 
 if [[ "${1:-}" == "--stage" ]]; then
