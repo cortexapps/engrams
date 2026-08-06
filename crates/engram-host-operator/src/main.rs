@@ -77,7 +77,7 @@ async fn main() -> Result<(), OperatorError> {
     let ctx = Arc::new(Ctx {
         client: client.clone(),
         scaler: node_scaler,
-        scaledown_ticks: std::sync::atomic::AtomicU32::new(0),
+        scaledown_hysteresis: crate::autoscale::ScaleDownHysteresis::default(),
         node_ready: crate::autoscale::NodeReadyTracker::default(),
     });
 

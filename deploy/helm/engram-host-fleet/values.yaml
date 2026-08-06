@@ -346,6 +346,6 @@ operator:
     # fully-idle hosts; aggressive teleport-packs live sessions off the
     # least-loaded hosts. The wave is bounded by the two caps below.
     scaleDown: "off"
-    scaleDownHysteresisTicks: 3  # enter scale-down only after N agreeing ticks
+    scaleDownHysteresisTicks: 3  # enter scale-down after N agreeing minute ticks
     maxShedPerWave: 1            # most victim nodes per wave
     maxConcurrentDrains: 1       # most victims drained at once within a tick
