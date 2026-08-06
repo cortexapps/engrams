@@ -205,21 +205,30 @@
    nothing to fall onto is just a dark edge. The gutter also replaces the
    divider line the section rail used to draw, so the rail and the sheet are
    separated by space rather than by a rule. */
-.section-sheet {
-  margin: 0.5rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background-color: var(--background);
-  overflow: hidden;
-  box-shadow:
-    0 1px 2px oklch(0 0 0 / 0.16),
-    0 10px 30px -8px oklch(0 0 0 / 0.3);
-}
-.dark .section-sheet {
-  box-shadow:
-    0 1px 2px oklch(0 0 0 / 0.4),
-    0 12px 34px -10px oklch(0 0 0 / 0.6);
-  border-top-color: oklch(1 0 0 / 0.09);
+/* `@layer components` so a utility on the element still WINS. Unlayered, this
+   rule outranks every Tailwind utility no matter how specific — that is how
+   the cascade orders unlayered against layered — and `overflow: hidden` here
+   silently beat the `overflow-y-auto` the settings, operator, and kaizen
+   layouts put on their own sheet. Those pages could not scroll.
+   The clip stays the default: a sheet with rounded corners has to clip, and
+   the layouts whose CHILD scrolls (reviews, artifacts) rely on it. */
+@layer components {
+  .section-sheet {
+    margin: 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background-color: var(--background);
+    overflow: hidden;
+    box-shadow:
+      0 1px 2px oklch(0 0 0 / 0.16),
+      0 10px 30px -8px oklch(0 0 0 / 0.3);
+  }
+  .dark .section-sheet {
+    box-shadow:
+      0 1px 2px oklch(0 0 0 / 0.4),
+      0 12px 34px -10px oklch(0 0 0 / 0.6);
+    border-top-color: oklch(1 0 0 / 0.09);
+  }
 }
 
 /* ── The work pane's material ───────────────────────────────────────────

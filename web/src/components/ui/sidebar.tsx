@@ -550,7 +550,17 @@ function SidebarContent({ className, ...props }: React.ComponentProps<"div">) {
       data-slot="sidebar-content"
       data-sidebar="content"
       className={cn(
-        "flex min-h-0 flex-1 flex-col gap-2 overflow-auto group-data-[collapsible=icon]:overflow-hidden",
+        // `scrollbar-gutter: stable` reserves the gutter whether or not the
+        // scrollbar is there. Without it, a rail that grows past its own height
+        // — expanding a group, a task arriving — takes the scrollbar's width
+        // out of the content and every row jumps sideways.
+        //
+        // Released again in icon mode. `overflow: hidden` is still a scroll
+        // container, so the gutter survives it — and where scrollbars are
+        // classic rather than overlay that is ~15px out of a 3rem rail, enough
+        // to clip the 2rem menu buttons it collapses to.
+        "flex min-h-0 flex-1 flex-col gap-2 overflow-auto [scrollbar-gutter:stable]",
+        "group-data-[collapsible=icon]:overflow-hidden group-data-[collapsible=icon]:[scrollbar-gutter:auto]",
         className,
       )}
       {...props}
