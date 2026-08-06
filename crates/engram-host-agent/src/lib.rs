@@ -1543,7 +1543,12 @@ impl HostAgent {
                             kind: r.kind,
                         })
                         .collect();
-                    let utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
+                    let mut utilization = util_probe.sample(&util_work_dir, &ram_snapshot);
+                    // ADR 0112 D5: committed swap + the dirty-file walk —
+                    // publishes the chunk-cache co-tenant reserves and
+                    // returns the heartbeat's committed term.
+                    utilization.committed_swap_mib =
+                        pooled_for_heartbeat.publish_disk_co_tenants().await;
                     // ADR 0068: re-run every probe this tick. Cheap
                     // (statfs/stat/one TCP connect/a memfd-backed uffd
                     // self-test; the FC binary version is cached after

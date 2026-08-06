@@ -439,6 +439,8 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         util_base_shm_mib,
         util_parked_pss_mib,
         util_running_pss_mib,
+        // ADR 0112: the committed-swap admission term.
+        util_committed_swap_mib,
         // ADR 0088: in-flight enable work (the operator's roll/drain gates).
         live_materializes,
         live_capture_jobs,
@@ -456,6 +458,7 @@ pub(crate) fn host_view_to_proto(v: &crate::api::hosts::HostView) -> app::HostVi
         util_disk_used_mib: *util_disk_used_mib,
         util_mem_total_mib: *util_mem_total_mib,
         util_mem_used_mib: *util_mem_used_mib,
+        util_committed_swap_mib: *util_committed_swap_mib,
         util_cpu_pct: *util_cpu_pct,
         last_heartbeat_at: last_heartbeat_at.to_rfc3339(),
         cordoned: *cordoned,

@@ -64,6 +64,33 @@ fn should_reap_dirty_entry(name: &str, live: &HashSet<SandboxId>) -> bool {
     !live.contains(&id)
 }
 
+/// ADR 0112 D5: allocated (on-disk) bytes of every regular file
+/// directly under `root` — `st_blocks × 512`, so sparse files (the
+/// ADR 0110 dirty files, hole-punched after publish) charge what they
+/// actually consume. Non-recursive by design: both consumers are flat
+/// directories. Missing dir / unreadable entries count 0 (telemetry
+/// must never fail the heartbeat).
+fn allocated_bytes_under(root: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::MetadataExt::blocks(&m) * 512
+            }
+            #[cfg(not(unix))]
+            {
+                m.len()
+            }
+        })
+        .sum()
+}
+
 fn sweep_dirty_root_at(root: &Path, live: &HashSet<SandboxId>) {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -5197,6 +5224,47 @@ impl PooledBackend {
         }
     }
 
+    /// ADR 0112 D5: publish the two disk co-tenant terms this backend
+    /// owns and return the heartbeat's `committed_swap_mib`. Called
+    /// once per heartbeat tick, best-effort throughout:
+    ///
+    /// - `swap-committed` = Σ `swap_mib` over live sandboxes. COMMITTED,
+    ///   not walked — the backing inodes are anonymous after
+    ///   unlink-after-attach (statvfs sees their blocks in aggregate;
+    ///   no path walk can). Committed ≥ allocated always, so the
+    ///   cache reserve stays conservative.
+    /// - `dirty-files` = allocated (`st_blocks`) bytes under the ADR
+    ///   0110 dirty root — previously entirely unbudgeted (that ADR's
+    ///   own open rollout risk); now the cache budget shrinks as they
+    ///   grow instead of discovering the pressure a sweep late.
+    ///
+    /// Both also land as gauges for attribution on the shared mount.
+    pub async fn publish_disk_co_tenants(&self) -> u64 {
+        let committed_swap_mib: u64 = match self.inner.list().await {
+            Ok(ids) => ids
+                .into_iter()
+                .filter_map(|id| self.inner.swap_mib(id))
+                .map(u64::from)
+                .sum(),
+            Err(error) => {
+                tracing::warn!(%error, "co-tenant publish: backend list failed; reporting 0");
+                0
+            }
+        };
+        let dirty_bytes: u64 = self
+            .resolved_dirty_root()
+            .map(|root| allocated_bytes_under(&root))
+            .unwrap_or(0);
+        if let Some(cache) = &self.chunk_cache {
+            cache.set_co_tenant_reserved("swap-committed", committed_swap_mib * 1024 * 1024);
+            cache.set_co_tenant_reserved("dirty-files", dirty_bytes);
+        }
+        metrics::gauge!(crate::metrics::HOST_COMMITTED_SWAP_BYTES)
+            .set((committed_swap_mib * 1024 * 1024) as f64);
+        metrics::gauge!(crate::metrics::HOST_DIRTY_FILES_BYTES).set(dirty_bytes as f64);
+        committed_swap_mib
+    }
+
     /// Run this after reattach and before coordinator registration.
     /// The live set is complete, and no create or resume can race it.
     /// Recovery only adopts files for VMs that survived reattach.
@@ -7859,6 +7927,18 @@ impl SandboxBackend for PooledBackend {
         if self.inner.post_copy_source_view(id).is_none() {
             return Err(SandboxError::InvalidSpec(
                 "not a substrate sandbox (no base mapping) — use snapshot-rehome".into(),
+            ));
+        }
+        // ADR 0112 D7: a swap-armed guest cannot post-copy teleport —
+        // the guest never pauses long enough to `swapoff`, and moving
+        // the swap device's bytes would persist exactly what the ADR
+        // promises never to persist. Refused HERE (the live spec is
+        // the authoritative swap source; an image row can drift) and
+        // pre-freeze, so nothing is consumed. Snapshot-rehome runs
+        // `capture_phase` — the disarm — and is already correct.
+        if self.sandbox_swap_mib(id).is_some() {
+            return Err(SandboxError::InvalidSpec(
+                "guest runs with ephemeral swap (ADR 0112) — use snapshot-rehome".into(),
             ));
         }
 

@@ -123,6 +123,7 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let util_mem_total_mib: i64 = row.try_get("util_mem_total_mib").map_err(col_err)?;
     let util_mem_used_mib: i64 = row.try_get("util_mem_used_mib").map_err(col_err)?;
     let util_cpu_pct: f32 = row.try_get("util_cpu_pct").map_err(col_err)?;
+    let util_committed_swap_mib: i64 = row.try_get("util_committed_swap_mib").map_err(col_err)?;
     let util_allocatable_mib: i64 = row.try_get("allocatable_mib").map_err(col_err)?;
     // Issue #540 (host RAM ledger attribution, migration 0078).
     // `base_shm_pending_mib` has no PG column (transient host-local
@@ -172,6 +173,7 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         utilization: HostUtilization {
             disk_total_mib: util_disk_total_mib.max(0) as u64,
             disk_used_mib: util_disk_used_mib.max(0) as u64,
+            committed_swap_mib: util_committed_swap_mib.max(0) as u64,
             mem_total_mib: util_mem_total_mib.max(0) as u64,
             mem_used_mib: util_mem_used_mib.max(0) as u64,
             allocatable_mib: util_allocatable_mib.max(0) as u64,

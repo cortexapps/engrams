@@ -4108,6 +4108,7 @@ impl MetadataStore for PostgresStore {
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
+                   util_committed_swap_mib,
                    ready_images, current_bundles,
                    cordoned, total_vcpus, wire_version, stages_images, capabilities,
                    last_heartbeat_at, status, host_addr
@@ -4197,6 +4198,7 @@ impl MetadataStore for PostgresStore {
                       capabilities = $19,
                       stages_images = $20,
                       last_heartbeat_at = $21,
+                      util_committed_swap_mib = $22,
                       updated_at = $21
                  FROM previous
                 WHERE hosts.id = $1
@@ -4233,6 +4235,7 @@ impl MetadataStore for PostgresStore {
         .bind(capabilities)
         .bind(hb.stages_images)
         .bind(self.clock.now_utc())
+        .bind(hb.utilization.committed_swap_mib as i64)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4285,6 +4288,7 @@ impl MetadataStore for PostgresStore {
                    util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
                    allocatable_mib,
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
+                   util_committed_swap_mib,
                    ready_images, current_bundles,
                    cordoned, total_vcpus, wire_version, stages_images, capabilities,
                    last_heartbeat_at, status, host_addr

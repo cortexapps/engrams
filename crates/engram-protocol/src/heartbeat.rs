@@ -328,6 +328,8 @@ mod tests {
         original.utilization = engram_core::types::host::HostUtilization {
             disk_total_mib: 102_400,
             disk_used_mib: 81_920,
+            // ADR 0112: the committed-swap admission term.
+            committed_swap_mib: 12_288,
             mem_total_mib: 32_768,
             mem_used_mib: 9_001,
             allocatable_mib: 23_767,
@@ -342,6 +344,7 @@ mod tests {
         let back: Heartbeat = serde_json::from_str(&json).unwrap();
         assert_eq!(back.utilization.disk_total_mib, 102_400);
         assert_eq!(back.utilization.disk_used_mib, 81_920);
+        assert_eq!(back.utilization.committed_swap_mib, 12_288);
         assert_eq!(back.utilization.mem_total_mib, 32_768);
         assert_eq!(back.utilization.mem_used_mib, 9_001);
         assert_eq!(back.utilization.allocatable_mib, 23_767);
