@@ -7,9 +7,8 @@ import { cn } from "@/lib/utils";
 // Stock shadcn, with one deliberate change: the focus ring is 2px, not 3px.
 // A 3px ring reads as a halo on a 12px corner.
 //
-// Every variant is sentence case in the sans face. The filled variants used to
-// wear tracked caps in a display font, which made "New session" shout at the
-// same volume as the page title next to it. A button says what it does.
+// Every variant is sentence case in the sans face, filled ones included: a
+// button says what it does at the volume of the page it sits on.
 const buttonVariants = cva(
   "inline-flex shrink-0 items-center justify-center gap-2 rounded-md text-sm font-medium whitespace-nowrap transition-all outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60 disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
   {

@@ -3,23 +3,13 @@ import { cn } from "@/lib/utils";
 import { Text } from "@/components/ui/text";
 
 // Every page opens the same way: the page's name, what there is of it, and
-// what you can do here. Nothing else.
+// what you can do here. Nothing else — no kicker over the title, no sentence
+// explaining a page to someone already standing on it, no closing rule (the
+// content below draws its own top edge).
 //
-// Three things used to live here and no longer do:
-//
-//   - The eyebrow ("Kaizen · Agent feedback"). A tracked-caps kicker over
-//     every title is not a system, it is a tic. The rail already says which
-//     section you are in.
-//   - The description ("Documents your agents published — versioned, hosted,
-//     shareable."). A sentence explaining a page to someone already on it.
-//     If a page needs explaining, the page is wrong.
-//   - The hairline rule and its lime index tab. The content below the
-//     masthead — a tab row, a table, a card grid — draws its own top edge,
-//     so the rule was a second line a few pixels away from a real one.
-//
-// `count` is what replaced the description: the one fact a list page owes you
-// before you scroll. `titleVariant="mono"` swaps to the machine-data voice
-// when the title IS an id or a digest rather than prose.
+// `count` is the one fact a list page owes you before you scroll.
+// `titleVariant="mono"` swaps to the machine-data voice when the title IS an id
+// or a digest rather than prose.
 export function PageHeading({
   title,
   count,

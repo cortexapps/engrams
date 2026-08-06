@@ -8,11 +8,9 @@ import { cn } from "@/lib/utils";
 //   variant — the typographic ROLE (what font/size/weight/tracking).
 //   tone    — the COLOR role (which ink token).
 //
-// `label` used to be tracked caps in a display font, applied to every table
-// header, tab, and caption in the app. Tracked caps are a stress voice: they
-// work on one thing per page and turn to noise on twenty. The label is now a
-// small, semibold, sentence-case caption. It reads faster, it wraps honestly,
-// and it stops competing with the figure it labels.
+// `label` is a small, semibold, sentence-case caption — every table header,
+// tab, and section caption in the app. NOT tracked caps: caps are a stress
+// voice that works on one thing per page and turns to noise on twenty.
 //
 // `stat` is its partner: oversized tabular mono for the figure. The
 // variant/tone split is the whole point of the gauge — a dark mono number

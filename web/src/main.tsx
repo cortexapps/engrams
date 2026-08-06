@@ -3,9 +3,7 @@
 // available to anything using `--font-mono` (code, IDs, tabular numbers).
 import "@fontsource-variable/jetbrains-mono/wght.css";
 import "@fontsource-variable/jetbrains-mono/wght-italic.css";
-// Saira is retired — the app is one system sans plus mono. Nothing to import:
-// system-ui costs no bytes and is the face the reader's OS already renders
-// every other interface in.
+// The sans face is system-ui, so there is nothing to import for it.
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { ThemeProvider } from "./components/theme-provider";
