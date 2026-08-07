@@ -13,6 +13,7 @@
 //! leaves trust them all.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -137,7 +138,7 @@ impl CoordCloudSqlConnector {
         // bind-then-drop TCP reservation can be stolen by another session
         // before the child binds, which can cross-connect two tenants.
         let socket_dir = cloud_sql_socket_dir()?;
-        let socket_path = socket_dir.path().join(&config.instance);
+        let socket_path = cloud_sql_postgres_socket_path(socket_dir.path(), &config.instance);
 
         let binary = std::env::var_os("ENGRAM_CLOUD_SQL_PROXY")
             .unwrap_or_else(|| "/usr/local/bin/cloud-sql-proxy".into());
@@ -254,6 +255,10 @@ fn cloud_sql_socket_dir() -> std::io::Result<tempfile::TempDir> {
     tempfile::Builder::new()
         .prefix("engram-cloud-sql-")
         .tempdir()
+}
+
+fn cloud_sql_postgres_socket_path(socket_dir: &Path, instance: &str) -> PathBuf {
+    socket_dir.join(instance).join(".s.PGSQL.5432")
 }
 
 async fn collect_stderr_tail(mut stderr: tokio::process::ChildStderr) -> Vec<u8> {
@@ -592,6 +597,25 @@ mod tests {
         let first = cloud_sql_socket_dir().unwrap();
         let second = cloud_sql_socket_dir().unwrap();
         assert_ne!(first.path(), second.path());
+    }
+
+    #[tokio::test]
+    async fn cloud_sql_relay_connects_to_the_postgres_proxy_socket() {
+        // macOS limits Unix socket paths to 103 bytes. Use the system's short
+        // temp alias so this proxy-layout regression also runs in macOS CI.
+        let socket_dir = tempfile::Builder::new()
+            .prefix("csql-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let instance = "test-project:test-region:test-instance";
+        let instance_dir = socket_dir.path().join(instance);
+        std::fs::create_dir(&instance_dir).unwrap();
+        let proxy_socket = instance_dir.join(".s.PGSQL.5432");
+        let _listener = tokio::net::UnixListener::bind(&proxy_socket).unwrap();
+
+        UnixStream::connect(cloud_sql_postgres_socket_path(socket_dir.path(), instance))
+            .await
+            .unwrap();
     }
 
     #[test]
