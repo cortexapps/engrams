@@ -303,6 +303,9 @@ pub struct ResidueSweepReport {
     pub jail_dirs: usize,
     pub vsock_files: usize,
     pub canonical_entries: usize,
+    /// ADR 0112: leaked `swap/<id>.img` backings reclaimed (the design
+    /// is unlink-after-attach, so any present at startup is a leak).
+    pub swap_backings: usize,
 }
 
 /// Remove the on-disk residue of sandboxes with no surviving VM: uuid
@@ -398,6 +401,43 @@ pub fn sweep_dead_sandbox_residue(
                     path = %path.display(),
                     error = %e,
                     "residue sweep: removing dead canonical entry failed",
+                ),
+            }
+        }
+    }
+    // ADR 0112: leaked swap BACKING files (`<work_dir>/swap/<id>.img`).
+    // The design is unlink-after-attach, so any `.img` present at
+    // startup is a leak: an aborted create/restore whose process died
+    // before the drop-guard ran, or a failed unlink whose sandbox never
+    // reached destroy. Removal is safe even for a LIVE sandbox — a
+    // running FC holds the fd (that is the whole unlink-after-attach
+    // contract), so this just completes the unlink it was owed; the
+    // sweep runs at startup before any create can be mid-flight. Only
+    // `<uuid>.img` names are touched; the `.swap` canonical symlinks
+    // stay owned by the dead_ids loop above / destroy.
+    let swap_dir = work_dir.join("swap");
+    if let Ok(entries) = std::fs::read_dir(&swap_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(stem) = name.strip_suffix(".img") else {
+                continue;
+            };
+            if stem.parse::<SandboxId>().is_err() {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {
+                    report.swap_backings += 1;
+                    tracing::info!(
+                        path = %entry.path().display(),
+                        "residue sweep: reclaimed leaked swap backing",
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    path = %entry.path().display(),
+                    error = %e,
+                    "residue sweep: removing leaked swap backing failed",
                 ),
             }
         }
@@ -579,6 +619,7 @@ mod tests {
                 api_socket: tmp.path().join("nonexistent.sock"),
                 vsock_uds_base: tmp.path().join("nonexistent.vsock"),
                 rootfs_canonical: tmp.path().join("rootfs/nonexistent.dev"),
+                swap_canonical: None,
                 vsock_cid: 3,
             },
             network: None,
@@ -640,6 +681,19 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("chunk-cache")).unwrap();
         std::fs::create_dir_all(tmp.path().join("bindings")).unwrap();
         std::fs::write(tmp.path().join("bindings/keep.json"), b"{}").unwrap();
+        // ADR 0112: leaked swap backings. Design is unlink-after-attach,
+        // so ANY .img at startup is a leak — a dead sandbox's (aborted
+        // create) and a LIVE one's (failed unlink; FC holds the fd, so
+        // removal just completes the unlink it was owed). A non-uuid
+        // .img is foreign and stays.
+        let swap_dir = tmp.path().join("swap");
+        std::fs::create_dir_all(&swap_dir).unwrap();
+        std::fs::write(swap_dir.join(format!("{dead_sock_id}.img")), b"x").unwrap();
+        std::fs::write(swap_dir.join(format!("{live_id}.img")), b"x").unwrap();
+        std::fs::write(swap_dir.join("not-a-uuid.img"), b"x").unwrap();
+        // The canonical `.swap` symlink entries are the dead_ids loop's
+        // jurisdiction, not the .img pass's.
+        std::fs::write(swap_dir.join(format!("{live_id}.swap")), b"link").unwrap();
 
         let live = std::collections::HashSet::from([live_id]);
         let report = sweep_dead_sandbox_residue(tmp.path(), &live).unwrap();
@@ -647,6 +701,10 @@ mod tests {
         assert_eq!(report.jail_dirs, 1);
         assert_eq!(report.vsock_files, 2);
         assert_eq!(report.canonical_entries, 1);
+        assert_eq!(
+            report.swap_backings, 2,
+            "dead AND live leaked .img reclaimed"
+        );
         assert!(!dead_dir.exists(), "dead jail dir removed");
         assert!(
             !tmp.path().join(format!("{dead_sock_id}.vsock")).exists()
@@ -671,6 +729,20 @@ mod tests {
             kept_dir.exists() && tmp.path().join(format!("{kept_id}.vsock")).exists(),
             "a manifest-bearing dir and its sockets are the reattach \
              pass's jurisdiction, never the sweep's"
+        );
+        assert!(
+            !swap_dir.join(format!("{dead_sock_id}.img")).exists()
+                && !swap_dir.join(format!("{live_id}.img")).exists(),
+            "leaked swap backings reclaimed regardless of liveness \
+             (a live FC holds the fd — unlink-after-attach's contract)"
+        );
+        assert!(
+            swap_dir.join("not-a-uuid.img").exists(),
+            "foreign .img untouched"
+        );
+        assert!(
+            swap_dir.join(format!("{live_id}.swap")).exists(),
+            "live canonical .swap entry untouched by the .img pass"
         );
     }
 }

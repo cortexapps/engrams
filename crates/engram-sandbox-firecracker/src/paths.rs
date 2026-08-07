@@ -80,21 +80,45 @@ pub fn harness_canonical(work_dir: &Path, sandbox_id: SandboxId) -> PathBuf {
     work_dir.join("harness").join(format!("{sandbox_id}.ext4"))
 }
 
+/// ADR 0112: `<work_dir>/swap/<sandbox_id>.swap` — canonical symlink
+/// for the ephemeral swap drive, same shape as [`rootfs_canonical`]:
+/// `state.bin` embeds this path, and every restore re-points it at
+/// its OWN fresh backing file (under the per-source-path lock) before
+/// `load_snapshot` opens it. Present only when the spec has
+/// `swap_mib > 0`.
+pub fn swap_canonical(work_dir: &Path, sandbox_id: SandboxId) -> PathBuf {
+    work_dir.join("swap").join(format!("{sandbox_id}.swap"))
+}
+
+/// ADR 0112: the per-residence sparse backing file the swap canonical
+/// points at. Unlinked as soon as FC holds its fd (the bytes then live
+/// in an anonymous inode the kernel reclaims at FC exit — no at-rest
+/// artifact, no orphan sweep), so this path is dangling for most of a
+/// sandbox's life by design.
+pub fn swap_backing(work_dir: &Path, sandbox_id: SandboxId) -> PathBuf {
+    work_dir.join("swap").join(format!("{sandbox_id}.img"))
+}
+
 /// Parent dirs that must exist before [`install_symlink`] can land
 /// the canonical-path entries. Idempotent — `create_dir_all` is
 /// the right primitive at the callsite.
-pub fn canonical_parent_dirs(work_dir: &Path) -> [PathBuf; 2] {
-    [work_dir.join("rootfs"), work_dir.join("harness")]
+pub fn canonical_parent_dirs(work_dir: &Path) -> [PathBuf; 3] {
+    [
+        work_dir.join("rootfs"),
+        work_dir.join("harness"),
+        work_dir.join("swap"),
+    ]
 }
 
 /// The canonical-path entries owned by this sandbox (rootfs +
-/// harness). `destroy()` should `remove_file` each one — they're
+/// harness + swap). `destroy()` should `remove_file` each one — they're
 /// symlinks, not directories, so a single `remove_file` is enough
 /// and a `NotFound` is benign (caller didn't have one of them).
-pub fn canonical_entries_for(work_dir: &Path, sandbox_id: SandboxId) -> [PathBuf; 2] {
+pub fn canonical_entries_for(work_dir: &Path, sandbox_id: SandboxId) -> [PathBuf; 3] {
     [
         rootfs_canonical(work_dir, sandbox_id),
         harness_canonical(work_dir, sandbox_id),
+        swap_canonical(work_dir, sandbox_id),
     ]
 }
 

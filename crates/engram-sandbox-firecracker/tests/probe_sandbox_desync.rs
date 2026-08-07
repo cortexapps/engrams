@@ -95,6 +95,7 @@ fn write_manifest_pointing_at(work_dir: &std::path::Path, id: SandboxId, pid: u3
             api_socket: work_dir.join("fc.sock"),
             vsock_uds_base: work_dir.join("sb.vsock"),
             rootfs_canonical: work_dir.join("rootfs.dev"),
+            swap_canonical: None,
             vsock_cid: 3,
         },
         network: None,
