@@ -16,6 +16,7 @@
 //! duration), so a one-shot sync wouldn't survive an idle→resume cycle;
 //! hence the per-spawn + periodic discipline.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -43,6 +44,11 @@ struct ClockSync {
     /// present (non-FC backends / dev hosts / tests) — then every op is a
     /// no-op and the guest clock is left untouched.
     phc: Option<UnixClock>,
+    /// Latched "the PHC stopped answering" state, so a persistent read
+    /// failure logs on the way in and on the way out instead of once per
+    /// [`TICK`]. See [`ClockSync::step_if_needed`] for why the transition
+    /// — not the steady state — is the thing worth a log line.
+    phc_degraded: AtomicBool,
 }
 
 impl ClockSync {
@@ -55,17 +61,28 @@ impl ClockSync {
         let phc = match UnixClock::open(PTP_DEVICE) {
             Ok(c) => Some(c),
             Err(e) => {
-                tracing::info!(
+                // WARN, not INFO: on FC this device is supposed to exist,
+                // and without it the guest keeps whatever `CLOCK_REALTIME`
+                // the snapshot froze — which silently breaks every TLS
+                // handshake once the guest falls behind an upstream cert's
+                // `notBefore`. The host-pushed `StepClock` is the backstop
+                // (see `step_to`), but a guest that lost self-drive must
+                // still be visible in its own log.
+                tracing::warn!(
                     device = PTP_DEVICE,
                     error = ?e,
-                    "no PTP host clock; guest clock sync disabled"
+                    "no PTP host clock; guest clock self-sync disabled — \
+                     clock corrections now depend entirely on the host's StepClock push"
                 );
                 None
             }
         };
         #[cfg(not(target_os = "linux"))]
         let phc: Option<UnixClock> = None;
-        Self { phc }
+        Self {
+            phc,
+            phc_degraded: AtomicBool::new(false),
+        }
     }
 
     fn step_if_needed(&self) {
@@ -75,10 +92,25 @@ impl ClockSync {
         let host = match phc.now() {
             Ok(t) => t,
             Err(e) => {
-                tracing::debug!(error = ?e, "read PTP host clock failed");
+                // A device that opened but stopped answering is the shape
+                // that stranded prod: the clock quietly stops tracking the
+                // host and nothing says so. Log the TRANSITION at WARN —
+                // the read is retried every TICK, so logging each failure
+                // would emit 6/min forever and bury itself.
+                if !self.phc_degraded.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        device = PTP_DEVICE,
+                        error = ?e,
+                        "PTP host clock stopped answering; guest clock is no longer \
+                         tracking the host until this recovers"
+                    );
+                }
                 return;
             }
         };
+        if self.phc_degraded.swap(false, Ordering::Relaxed) {
+            tracing::warn!(device = PTP_DEVICE, "PTP host clock recovered");
+        }
         let sys = match UnixClock::CLOCK_REALTIME.now() {
             Ok(t) => t,
             Err(e) => {
@@ -131,6 +163,8 @@ pub fn init() {
     let enabled = cs.phc.is_some();
     let _ = CLOCK.set(cs);
     if !enabled {
+        // `ClockSync::new` already warned with the open error on Linux; on
+        // other targets there is no device to open and nothing to say.
         return;
     }
     sync_now(); // correct immediately on boot / first restore
@@ -160,14 +194,21 @@ pub fn sync_now() {
 }
 
 /// ADR 0096 D7: step `CLOCK_REALTIME` to a host-supplied wall clock —
-/// the host-pushed analogue of [`sync_now`] for guests with NO PTP
-/// device (VZ). A warm-restored VZ guest wakes with its clock frozen at
-/// save time; the host sends `WireRequest::StepClock` with its own
-/// `CLOCK_REALTIME` right after resume. Same policy as the PTP path:
-/// step only past [`STEP_THRESHOLD_NANOS`]. Returns the applied offset
-/// in nanos, `None` when under threshold (or on non-Linux, where
-/// there's no clock to step). Orthogonal to the periodic PTP tick —
-/// this is a one-shot push, nothing to re-arm.
+/// the host-pushed analogue of [`sync_now`]. A warm-restored VZ guest
+/// wakes with its clock frozen at save time and has no PTP device at
+/// all; the host sends `WireRequest::StepClock` with its own
+/// `CLOCK_REALTIME` right after resume.
+///
+/// FC sends it as well, once per `start_agent` — the PTP self-drive
+/// above is an optimization (it re-corrects continuously, for free),
+/// but it is not something the host can verify, so the host asserts the
+/// time itself before the harness starts. Both paths are idempotent and
+/// share the [`STEP_THRESHOLD_NANOS`] policy, so whichever runs second
+/// is a no-op.
+///
+/// Returns the applied offset in nanos, `None` when under threshold (or
+/// on non-Linux, where there's no clock to step). Orthogonal to the
+/// periodic PTP tick — this is a one-shot push, nothing to re-arm.
 pub fn step_to(host_unix_nanos: i64) -> Option<i64> {
     #[cfg(target_os = "linux")]
     {

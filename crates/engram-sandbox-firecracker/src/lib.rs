@@ -6392,6 +6392,11 @@ impl SandboxBackend for FirecrackerBackend {
             live.state.vsock_uds_path.clone()
         };
 
+        // Assert the guest's wall clock BEFORE the harness child exists, so
+        // it starts on a correct clock. See `step_guest_clock` for why the
+        // host pushes instead of trusting the guest's own PTP sync.
+        self.step_guest_clock(id, &vsock_uds_path).await;
+
         // ADR 0021 P1.4: no harness drive — argv points at a path
         // inside the rootfs (the image manifest's `[harness] exec`).
         // The `harness_substrate` / `harness_pack_uri` plumbing on
@@ -6895,6 +6900,152 @@ async fn destroy_teardown(
 /// (Nothing in the sidecar changes across the freeze, so the two are
 /// byte-identical by construction.)
 impl FirecrackerBackend {
+    /// Push the host's wall clock into the guest, once per `start_agent`.
+    ///
+    /// FC freezes `CLOCK_REALTIME` at capture, so every sandbox restored
+    /// from a base snapshot wakes up at the snapshot's age behind real
+    /// time. agentd corrects itself from the KVM PTP device
+    /// (`engram_agentd::clock`), and for a long time that was the whole
+    /// mechanism — the host sent nothing and assumed the guest would sort
+    /// itself out.
+    ///
+    /// That assumption is unverifiable from the host, and it failed
+    /// silently in prod on 2026-08-07: the fleet moved to a new node
+    /// pool, guests restored from the 17-day-old `demo:latest` base
+    /// snapshot could no longer read a PHC there, and agentd's sync
+    /// became a permanent no-op. Nothing logged, nothing alerted; the
+    /// symptom surfaced 20 s later and three layers away as
+    /// `SSL certificate is not yet valid` from the agent, because a guest
+    /// 17 days in the past rejects any upstream cert issued since. Every
+    /// review session failed for twelve hours.
+    ///
+    /// So the host asserts the time instead of hoping for it. It costs
+    /// one vsock round trip (sub-millisecond on a responsive guest)
+    /// against a cold boot measured in seconds, it is idempotent with the
+    /// PTP path (both apply the same 2 s threshold, so whichever runs
+    /// second no-ops), and it makes the correction observable: the
+    /// applied offset is logged and recorded on
+    /// `engram_guest_clock_step_seconds` (documented in the host-agent's
+    /// metrics registry, like every other metric this crate emits), so
+    /// "this image's snapshot is drifting" is now a graph rather than an
+    /// outage.
+    ///
+    /// Best-effort by construction, NOT fail-closed: agentd builds older
+    /// than the `StepClock` variant cannot decode the frame, and failing
+    /// the handshake on them would brick exactly the stale-snapshot
+    /// population this exists to rescue. A failure is loud instead.
+    async fn step_guest_clock(&self, id: SandboxId, vsock_uds_path: &Path) {
+        /// Metric name, documented alongside every other host metric in
+        /// the host-agent's `metrics` registry. A literal here for the
+        /// same reason `engram_sandbox_boot_seconds` is one: the registry
+        /// crate depends on this one, not the other way round.
+        const GUEST_CLOCK_STEP_SECONDS: &str = "engram_guest_clock_step_seconds";
+        /// Total budget. A guest still paging in over NBD can be slow to
+        /// accept; a wedged one must not hold up the handshake, which has
+        /// its own (much larger) retry ladder to spend.
+        const CLOCK_PUSH_BUDGET: Duration = Duration::from_secs(5);
+        /// Attempts inside the budget. `connect_fc_vsock` can hit the FC
+        /// vsock-muxer settle race right after `load_snapshot` (see
+        /// `start_agent`), which presents as an early EOF and clears on a
+        /// reconnect a few ms later.
+        const CLOCK_PUSH_ATTEMPTS: u32 = 3;
+
+        let unix_nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_nanos() as i64,
+            // Pre-1970 host clock: nothing useful to push.
+            Err(_) => return,
+        };
+        let req = engram_agentd::WireRequest::StepClock { unix_nanos };
+
+        let deadline = tokio::time::Instant::now() + CLOCK_PUSH_BUDGET;
+        let mut last_err: Option<String> = None;
+        for attempt in 1..=CLOCK_PUSH_ATTEMPTS {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let inner = async {
+                let mut conn =
+                    Self::connect_fc_vsock(&self.sandboxes, id, vsock_uds_path, ENGRAM_AGENTD_PORT)
+                        .await
+                        .map_err(|e| format!("connect: {e}"))?;
+                engram_agentd::write_msg(&mut conn, &req)
+                    .await
+                    .map_err(|e| format!("write StepClock: {e}"))?;
+                engram_agentd::read_msg(&mut conn)
+                    .await
+                    .map_err(|e| format!("read StepClock response: {e}"))
+            };
+            match tokio::time::timeout(remaining, inner).await {
+                Ok(Ok(engram_agentd::WireResponse::ClockStepped {
+                    applied_offset_nanos,
+                })) => {
+                    let offset_secs = applied_offset_nanos.map(|n| n / 1_000_000_000).unwrap_or(0);
+                    metrics::histogram!(
+                        GUEST_CLOCK_STEP_SECONDS,
+                        "outcome" => "stepped",
+                    )
+                    // Absolute: the interesting quantity is "how far off
+                    // was it", and a sign would split the histogram across
+                    // two tails for one question.
+                    .record((offset_secs as f64).abs());
+                    if applied_offset_nanos.is_some() {
+                        // Above the 2 s threshold means the guest was NOT
+                        // tracking the host on its own. Expected on a warm
+                        // restore; a large or growing offset is the stale-
+                        // substrate signal the 2026-08-07 outage lacked.
+                        tracing::info!(
+                            sandbox_id = %id,
+                            offset_secs,
+                            attempt,
+                            "stepped guest clock to host wall time",
+                        );
+                    } else {
+                        tracing::debug!(
+                            sandbox_id = %id,
+                            "guest clock already within threshold of host wall time",
+                        );
+                    }
+                    return;
+                }
+                Ok(Ok(other)) => {
+                    // A well-formed reply to a different question: an
+                    // agentd whose wire predates `StepClock`. Terminal —
+                    // retrying cannot change the peer's build.
+                    metrics::histogram!(
+                        GUEST_CLOCK_STEP_SECONDS,
+                        "outcome" => "unsupported",
+                    )
+                    .record(0.0);
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        ?other,
+                        "unexpected reply to StepClock (agentd predates the verb?) — \
+                         guest clock is whatever the snapshot froze",
+                    );
+                    return;
+                }
+                Ok(Err(e)) => last_err = Some(e),
+                Err(_) => last_err = Some(format!("timed out after {CLOCK_PUSH_BUDGET:?}")),
+            }
+            if attempt < CLOCK_PUSH_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        metrics::histogram!(
+            GUEST_CLOCK_STEP_SECONDS,
+            "outcome" => "failed",
+        )
+        .record(0.0);
+        tracing::warn!(
+            sandbox_id = %id,
+            error = last_err.unwrap_or_else(|| "no attempt ran".to_string()),
+            attempts = CLOCK_PUSH_ATTEMPTS,
+            "could not push host wall clock into guest — if its PTP sync is also \
+             dead the guest will run at its snapshot's age and fail TLS",
+        );
+    }
+
     /// Issue #540 / epic-parking-ladder seam: flip the RAM-ledger `parked`
     /// bit for `id`. **No `SandboxBackend` trait method wraps this** —
     /// the ladder's park/unpark ops own the transition that calls it;
