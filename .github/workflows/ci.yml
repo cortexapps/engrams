@@ -878,6 +878,7 @@ jobs:
             --test agentd_bundle_reexec \
             --test materialize_boot \
             --test baked_harness_loopback \
+            --test guest_clock_step \
             --test forge_loopback \
             --test upload_loopback \
             --test proxy_port_loopback \

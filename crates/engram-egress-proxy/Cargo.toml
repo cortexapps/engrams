@@ -22,6 +22,7 @@ futures-util.workspace = true
 chrono.workspace = true
 parking_lot.workspace = true
 rcgen.workspace = true
+time.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 webpki-roots.workspace = true
@@ -40,5 +41,8 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 [dev-dependencies]
 tempfile = "3"
 hex.workspace = true
+# Reads back the DER a mint produced, so the validity window is asserted
+# on the actual certificate rather than on the code that computes it.
+x509-parser = "0.18"
 async-trait.workspace = true
 chrono.workspace = true

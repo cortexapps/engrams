@@ -376,11 +376,22 @@ pub enum WireRequest {
     /// save time and has NO `/dev/ptp0` (KVM-PTP is a KVM paravirt
     /// device), so agentd's self-driven PTP sync is a permanent no-op
     /// there — the host pushes the time instead, right after resume.
-    /// FC never sends this (its guests re-step from the PHC on the
-    /// periodic tick + pre-spawn sync). The guest steps only when the
-    /// offset exceeds the same 2s threshold the PTP path uses. (Sent
-    /// to an older baked agentd, the decode fails and the host's step
-    /// degrades to best-effort/logged — same posture as `Sync`.)
+    ///
+    /// **FC sends this too**, on every `start_agent`. It used to rely
+    /// solely on the guest re-stepping itself from the PHC, which made
+    /// a correct clock contingent on a guest-side device probe the host
+    /// could not see fail. On 2026-08-07 that contingency broke prod:
+    /// the fleet moved to a node pool whose hosts the 17-day-old
+    /// `demo:latest` substrate could not read a PHC on, every sandbox
+    /// restored from it ran ~17 days behind, and all 19 review sessions
+    /// died on `SSL certificate is not yet valid` against upstreams
+    /// whose certs were issued after the snapshot. The host always
+    /// knows the true time; it should assert it rather than hope.
+    ///
+    /// The guest steps only when the offset exceeds the same 2s
+    /// threshold the PTP path uses. (Sent to an older baked agentd, the
+    /// decode fails and the host's step degrades to best-effort/logged
+    /// — same posture as `Sync`.)
     /// Appended last: see the APPEND-ONLY note above.
     StepClock {
         /// Host `CLOCK_REALTIME` at send, in Unix nanoseconds.

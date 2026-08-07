@@ -224,6 +224,30 @@ pub fn init(addr: SocketAddr) {
 /// engram_sandbox_boot_seconds_bucket[5m])))`.
 pub const SANDBOX_BOOT_SECONDS: &str = "engram_sandbox_boot_seconds";
 
+/// Histogram of the ABSOLUTE wall-clock offset (seconds) the host had to
+/// push into a guest at `start_agent`, emitted by
+/// `FirecrackerBackend::step_guest_clock`.
+///
+/// FC freezes `CLOCK_REALTIME` at snapshot capture, so a restored guest
+/// starts however old its base snapshot is. agentd normally re-steps
+/// itself from the KVM PTP device; this metric records what the HOST had
+/// to correct, which is the part the host can actually verify.
+///
+/// - `outcome`: `stepped` (round trip succeeded; the recorded value is
+///   the applied offset, `0` when the guest was already inside the 2 s
+///   threshold), `unsupported` (agentd's wire predates `StepClock`),
+///   `failed` (no round trip inside the budget). The last two record
+///   `0` — they carry no offset, only their own count.
+///
+/// **What to alarm on.** A `stepped` p99 that climbs with an image's
+/// snapshot age means that image's guests have lost PTP self-sync and
+/// are running purely on this push; a sustained non-zero `unsupported`
+/// or `failed` rate means guests are running on an UNCORRECTED clock,
+/// which surfaces far away and much later as TLS failures against any
+/// upstream whose certificate was issued after the snapshot
+/// (`SSL certificate is not yet valid` — the 2026-08-07 review outage).
+pub const GUEST_CLOCK_STEP_SECONDS: &str = "engram_guest_clock_step_seconds";
+
 /// ADR 0070: gauge of `fs_free - fs_total * ENGRAM_KUBELET_EVICT_PCT/100`
 /// on the host's `work_dir` mount — how far free disk sits above the
 /// kubelet's ephemeral-storage hard-eviction line. Sampled every
