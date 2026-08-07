@@ -6,7 +6,6 @@ import json
 import select
 import socket
 import threading
-import urllib.parse
 
 GATEWAY = ("169.254.169.254", 80)
 MAX_HEADER = 16 * 1024
@@ -28,8 +27,17 @@ def request(method: str, target: str) -> tuple[socket.socket, bytes]:
     header, body = response.split(b"\r\n\r\n", 1)
     status = header.split(b"\r\n", 1)[0]
     if b" 200 " not in status:
+        while len(body) < MAX_HEADER:
+            chunk = upstream.recv(min(4096, MAX_HEADER - len(body)))
+            if not chunk:
+                break
+            body += chunk
         upstream.close()
-        raise RuntimeError(status.decode("ascii", "replace"))
+        detail = body.decode("utf-8", "replace").strip()
+        message = status.decode("ascii", "replace")
+        if detail:
+            message = f"{message}: {detail}"
+        raise RuntimeError(message)
     return upstream, body
 
 
@@ -53,8 +61,7 @@ def list_tunnels() -> None:
 
 def relay(client: socket.socket, tunnel: str) -> None:
     try:
-        target = urllib.parse.quote(tunnel, safe="-")
-        upstream, buffered = request("CONNECT", f"/_engrams/v1/tunnels/{target}")
+        upstream, buffered = request("CONNECT", f"/_engrams/v1/tunnels/{tunnel}")
         if buffered:
             client.sendall(buffered)
         sockets = [client, upstream]
@@ -82,7 +89,8 @@ def relay(client: socket.socket, tunnel: str) -> None:
 def open_tunnel(tunnel: str, address: str, port: int) -> None:
     if address not in ("127.0.0.1", "::1", "localhost"):
         raise ValueError("--address must be loopback")
-    with socket.create_server((address, port), reuse_port=False) as listener:
+    family = socket.AF_INET6 if address == "::1" else socket.AF_INET
+    with socket.create_server((address, port), family=family, reuse_port=False) as listener:
         print(f"Tunnel {tunnel} is available at {address}:{port}", flush=True)
         while True:
             client, _ = listener.accept()

@@ -60,7 +60,6 @@ export interface MintIdentity {
   profileSnapshotId: string;
 }
 
-/** Fixed credential uses. Providers map these to checked-in OAuth scopes. */
 /** Provider-owned fixed credential use. It is never an OAuth scope. */
 export type CredentialPurpose = string;
 

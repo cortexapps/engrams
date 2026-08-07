@@ -55,7 +55,8 @@ Then expose the selected tunnel on guest loopback:
 engram-tunnel open CONNECTION_ALIAS --port 5445
 ```
 
-Then connect with the IAM database user and require TLS:
+Then connect with the IAM database user. The loopback leg does not use TLS; the
+host encrypts the upstream leg:
 
 ```bash
 PGSSLMODE=disable PGAPPNAME="engrams-$ENGRAM_SESSION_ID" \

@@ -720,9 +720,13 @@ const PURGEABLE_PROXY_COMMENTS: &[&str] = &[
     "engram-proxy-input",
     "engram-proxy-dns-input",
     "engram-guest-gateway-input",
+    // Upgrade-only names from the metadata-specific listener. Keep them so an
+    // in-place host-agent roll removes rules installed by the previous build.
+    "engram-proxy-metadata-input",
     "engram-proxy-redirect",
     "engram-dns-redirect",
     "engram-guest-gateway-redirect",
+    "engram-metadata-redirect",
     "engram-guest-otlp-input",
 ];
 
@@ -1842,6 +1846,12 @@ mod tests {
         assert!(lines.contains("--to-port 13338"));
         assert!(lines.contains("--dport 13338 -j ACCEPT"));
         assert!(!lines.contains("-p tcp --dport 80 -j REDIRECT"));
+    }
+
+    #[test]
+    fn purge_list_retains_metadata_listener_upgrade_names() {
+        assert!(PURGEABLE_PROXY_COMMENTS.contains(&"engram-proxy-metadata-input"));
+        assert!(PURGEABLE_PROXY_COMMENTS.contains(&"engram-metadata-redirect"));
     }
 
     #[test]

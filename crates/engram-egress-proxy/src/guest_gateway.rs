@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +20,7 @@ use engram_core::SessionId;
 use crate::{Registry, SessionState};
 
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
+const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 pub const PLACEHOLDER_TOKEN: &str = "engram_google_token_placeholder";
 pub const GCE_METADATA_SERVICE_KIND: &str = "gcp.gce_metadata";
 
@@ -30,6 +32,7 @@ pub trait TunnelConnector: Send + Sync {
     async fn relay(
         &self,
         downstream: TcpStream,
+        initial_data: Vec<u8>,
         session_id: SessionId,
         tunnel: SessionTunnel,
     ) -> std::io::Result<()>;
@@ -99,7 +102,13 @@ pub async fn serve(
     gateway: Arc<GuestGatewayRegistry>,
 ) -> std::io::Result<()> {
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                tracing::warn!(%error, "guest gateway accept failed; retrying");
+                continue;
+            }
+        };
         let registry = registry.clone();
         let gateway = gateway.clone();
         tokio::spawn(async move {
@@ -133,18 +142,7 @@ async fn serve_connection(
         return stream.shutdown().await;
     };
 
-    let mut request = Vec::with_capacity(1024);
-    while request.len() < MAX_REQUEST_BYTES {
-        let mut chunk = [0_u8; 1024];
-        let read = stream.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(());
-        }
-        request.extend_from_slice(&chunk[..read]);
-        if request.windows(4).any(|value| value == b"\r\n\r\n") {
-            break;
-        }
-    }
+    let (request, initial_data) = read_request_header(&mut stream, REQUEST_HEADER_TIMEOUT).await?;
     let request = String::from_utf8_lossy(&request);
     let mut lines = request.lines();
     let mut request_line = lines.next().unwrap_or_default().split_ascii_whitespace();
@@ -212,7 +210,23 @@ async fn serve_connection(
             .await?;
             return stream.shutdown().await;
         };
-        return connector.relay(stream, session.session_id, tunnel).await;
+        let tunnel_id = tunnel.id.clone();
+        let connector_kind = tunnel.connector.clone();
+        if let Err(error) = connector
+            .relay(stream, initial_data, session.session_id, tunnel)
+            .await
+        {
+            tracing::warn!(
+                %peer,
+                session_id = %session.session_id,
+                %tunnel_id,
+                %connector_kind,
+                %error,
+                "guest tunnel relay failed",
+            );
+            return Err(error);
+        }
+        return Ok(());
     }
 
     let Some(service) = session
@@ -241,6 +255,43 @@ async fn serve_connection(
     )
     .await?;
     stream.shutdown().await
+}
+
+async fn read_request_header(
+    stream: &mut TcpStream,
+    timeout: Duration,
+) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    tokio::time::timeout(timeout, async {
+        let mut request = Vec::with_capacity(1024);
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "guest gateway connection closed before the request header",
+                ));
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(end) = request.windows(4).position(|value| value == b"\r\n\r\n") {
+                let initial_data = request.split_off(end + 4);
+                return Ok((request, initial_data));
+            }
+            if request.len() >= MAX_REQUEST_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "guest gateway request header is too large",
+                ));
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "guest gateway request header timed out",
+        )
+    })?
 }
 
 fn authorized_tunnel(
@@ -405,6 +456,32 @@ mod tests {
     use crate::{HostList, SessionState};
     use engram_core::types::integration::GuestService;
     use engram_core::SessionId;
+
+    struct CapturingConnector {
+        received: Arc<parking_lot::Mutex<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl TunnelConnector for CapturingConnector {
+        fn kind(&self) -> &'static str {
+            "test.capture"
+        }
+
+        async fn relay(
+            &self,
+            mut downstream: TcpStream,
+            initial_data: Vec<u8>,
+            _session_id: SessionId,
+            _tunnel: SessionTunnel,
+        ) -> std::io::Result<()> {
+            let mut received = initial_data;
+            downstream.read_to_end(&mut received).await?;
+            *self.received.lock() = received;
+            downstream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\nEngram-Gateway: 1\r\n\r\n")
+                .await
+        }
+    }
 
     fn gateway_registry() -> GuestGatewayRegistry {
         GuestGatewayRegistry::new(
@@ -643,6 +720,68 @@ mod tests {
         assert!(!response.contains("customer:region:prod"));
         assert!(!response.contains("reader@customer.iam"));
         assert!(!response.contains("secret-connection-id"));
+    }
+
+    #[tokio::test]
+    async fn request_header_read_times_out_on_a_silent_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(address).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let error = read_request_header(&mut server, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn connect_preserves_bytes_coalesced_after_the_request_header() {
+        let registry = Arc::new(Registry::new());
+        registry.register(SessionState {
+            session_id: SessionId::new(),
+            guest_ip: std::net::Ipv4Addr::LOCALHOST,
+            network_allow: HostList::empty(),
+            allow_all: false,
+            secrets: Vec::new(),
+            injects: Vec::new(),
+            observes: Vec::new(),
+            guest_services: Vec::new(),
+            tunnels: vec![SessionTunnel {
+                id: "capture".into(),
+                connector: "test.capture".into(),
+                config_json: "{}".into(),
+                mint_source: None,
+            }],
+        });
+        let received = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let gateway = Arc::new(GuestGatewayRegistry::new(
+            std::iter::empty::<Arc<dyn GuestServiceAdapter>>(),
+            [Arc::new(CapturingConnector {
+                received: received.clone(),
+            }) as Arc<dyn TunnelConnector>],
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            serve_connection(stream, peer, &registry, &gateway)
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                b"CONNECT /_engrams/v1/tunnels/capture HTTP/1.1\r\nEngram-Gateway: 1\r\n\r\npostgres-startup",
+            )
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server.await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 Connection Established\r\n"));
+        assert_eq!(&*received.lock(), b"postgres-startup");
     }
 
     #[test]

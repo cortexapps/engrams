@@ -328,12 +328,15 @@ a purpose or a scope.
 
 Cloud SQL is the first connector. The guest `engram-tunnel` helper listens on
 loopback and sends an authenticated `CONNECT` for the connection alias. The host
-resolves the exact compiled tunnel, and the Cloud SQL connector validates its
-instance and database user. It then mints only the fixed `sqlservice.admin` and
-`sqlservice.login` scopes, starts the pinned Cloud SQL Auth Proxy on host
-loopback for one connection, and relays bytes. Tokens stay in host process
-memory and child-process environment. They never appear in arguments, logs,
-policy JSON, guest environment, or guest files.
+resolves the exact compiled tunnel, and the Cloud SQL connector shape-checks its
+configuration. It then mints only the fixed `sqlservice.admin` and
+`sqlservice.login` scopes, starts the pinned Cloud SQL Auth Proxy with automatic
+IAM authentication for one connection, and relays PostgreSQL bytes without
+parsing the startup message. Cloud SQL rejects a login when the OAuth token
+principal does not match the requested IAM database user. This check prevents a
+guest from naming a different IAM user. Tokens stay in host process memory and
+child-process environment. They never appear in arguments, logs, policy JSON,
+guest environment, or guest files.
 
 The first release supports PostgreSQL over a public Cloud SQL IP only. Each
 Google Cloud connection names at most one instance and uses its configured
