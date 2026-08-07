@@ -245,6 +245,7 @@ fn session_egress_policy() -> SessionEgressPolicy {
         // ADR 0109: the host exposes metadata-style ADC only for sessions
         // whose immutable launch policy enables Google Cloud.
         metadata_flavor: Some(MetadataFlavor::Gce),
+        cloud_sql_tunnels: vec![],
     }
 }
 
@@ -328,6 +329,14 @@ fn session_egress_policy_google() -> SessionEgressPolicy {
             expires_at: Some(DateTime::from_timestamp(1_770_003_600, 0).unwrap()),
         }],
         metadata_flavor: Some(MetadataFlavor::Gce),
+        cloud_sql_tunnels: vec![engram_core::types::integration::CloudSqlTunnel {
+            instance: "customer:us-central1:prod".into(),
+            database_user: "reader@customer.iam".into(),
+            mint_source: CredentialMintSource::Connection {
+                connection_id: "gcp-prod".into(),
+                provider: "gcp".into(),
+            },
+        }],
         ..session_egress_policy()
     }
 }
@@ -640,8 +649,11 @@ fn wire_version_pinned() {
     // field (ephemeral guest swap size). Only `sandbox_spec.bin` changed
     // bytes (the fixture pins `Some(6144)`); every other golden embeds no
     // spec and kept its bytes. Lockstep coord+host roll.
+    // 25 -> 26: ADR 0109 Cloud SQL addendum — `SessionEgressPolicy` gains the
+    // TRAILING exact Cloud SQL tunnel authorities. All session-policy goldens
+    // were regenerated; the Google fixture pins a populated tunnel.
     assert_eq!(
-        WIRE_VERSION, 25,
+        WIRE_VERSION, 26,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

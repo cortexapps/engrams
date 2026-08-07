@@ -316,6 +316,7 @@ pub fn session_egress_policy() -> impl Strategy<Value = SessionEgressPolicy> {
                 injects,
                 observes,
                 metadata_flavor,
+                cloud_sql_tunnels: Vec::new(),
                 secret_mode,
             },
         )

@@ -293,3 +293,35 @@ HTTP/2 leg — the one a real Google gRPC call takes — had never been exercise
 end to end; it now has two tests through `intercept::run` with ALPN on both
 legs, and a live gRPC smoke is the remaining verification before the next
 deploy.
+
+## Addendum: Cloud SQL PostgreSQL with automatic IAM authentication
+
+Cloud SQL uses the same WIF identity but cannot use the HTTP header-injection
+path. Automatic IAM database authentication uses an OAuth login token as the
+PostgreSQL password. The guest must never receive that token. A session can
+therefore grant `cloudsql.postgres.connect` for one exact instance connection
+name stored on its Google Cloud connection. The compiled policy carries that
+instance, the derived database user, and the immutable connection mint source.
+It carries no credential.
+
+The guest helper listens on loopback and sends an authenticated `CONNECT` to
+the session-local metadata address. The host verifies the source guest and the
+exact instance against its session registry. It then mints only the fixed
+`sqlservice.admin` and `sqlservice.login` scopes, starts the pinned Cloud SQL
+Auth Proxy on host loopback for one connection, and relays bytes. Tokens stay
+in host process memory and child-process environment. They never appear in
+arguments, logs, policy JSON, guest environment, or guest files.
+
+The first release supports PostgreSQL over a public Cloud SQL IP only. Each
+Google Cloud connection names at most one instance and uses its configured
+service account as the database IAM principal. The service account needs an
+exact-instance `roles/cloudsql.client` and `roles/cloudsql.instanceUser` IAM
+binding. PostgreSQL grants are the read-only security boundary: operators must
+grant that IAM database user only `CONNECT`, `USAGE`, and `SELECT`, and must set
+safe defaults such as a read-only transaction and statement timeout. Engrams
+does not claim that SQL text inspection can enforce read-only access.
+
+Per-session and per-human attribution remains in Engrams audit events and the
+PostgreSQL `application_name`. Cloud SQL sees the configured service account.
+A distinct database principal per human requires user-scoped connections and
+is outside this addendum.

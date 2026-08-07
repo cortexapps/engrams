@@ -141,7 +141,10 @@ use serde::{Deserialize, Serialize};
 // device size, opt-in per image. Trailing bincode field addition on the
 // create/spec wire (and the JSON sidecar, which is serde-defaulted), so
 // the roll is lockstep: a v24 host cannot decode a v25 create spec.
-pub const WIRE_VERSION: u32 = 25;
+// v26 (ADR 0109 Cloud SQL addendum): `SessionEgressPolicy` gains exact
+// host-side Cloud SQL tunnel authorities. Trailing bincode field addition;
+// coordinator and host roll in lockstep.
+pub const WIRE_VERSION: u32 = 26;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

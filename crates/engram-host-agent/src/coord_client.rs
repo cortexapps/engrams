@@ -263,6 +263,7 @@ impl HttpCoordClient {
         let builder = self.http.post(&url);
         let req = RefreshInjectRequest {
             mint_source: mint_source.clone(),
+            purpose: engram_core::types::integration::CredentialPurpose::Api,
         };
         let resp = self
             .auth(builder, &req)
@@ -270,6 +271,29 @@ impl HttpCoordClient {
             .await
             .map_err(|e| CoordError::Transport(e.to_string()))?;
         decode_json(resp, "refresh_inject").await
+    }
+
+    /// Mint a raw host-only credential for one fixed connection purpose.
+    pub async fn mint_connection_credential(
+        &self,
+        host_id: HostId,
+        session_id: SessionId,
+        mint_source: &engram_core::types::integration::CredentialMintSource,
+        purpose: engram_core::types::integration::CredentialPurpose,
+    ) -> Result<RefreshInjectResponse, CoordError> {
+        let url = self.endpoint(&format!(
+            "/hosts/{host_id}/sessions/{session_id}/inject/refresh"
+        ));
+        let req = RefreshInjectRequest {
+            mint_source: mint_source.clone(),
+            purpose,
+        };
+        let resp = self
+            .auth(self.http.post(&url), &req)
+            .send()
+            .await
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
+        decode_json(resp, "mint_connection_credential").await
     }
 
     /// POST /api/v1/hosts/forge
@@ -704,6 +728,7 @@ pub struct IdleEvictionCandidatesResponse {
 #[derive(Serialize)]
 pub struct RefreshInjectRequest {
     pub mint_source: engram_core::types::integration::CredentialMintSource,
+    pub purpose: engram_core::types::integration::CredentialPurpose,
 }
 
 /// WS4: the coord's re-minted inject credential — the fresh rendered header

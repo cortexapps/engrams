@@ -412,6 +412,7 @@ mod tests {
             injects: Vec::new(),
             observes: Vec::new(),
             metadata_flavor: None,
+            cloud_sql_tunnels: Vec::new(),
             secret_mode: engram_core::types::image::SecretMode::Broker,
         }
     }

@@ -28,7 +28,8 @@
         "bin/figma",
         "bin/discord",
         "bin/shopify",
-        "bin/gcloud"
+        "bin/gcloud",
+        "bin/engram-cloud-sql-proxy"
       ],
       "requires_env": "ENGRAM_CLI_INTEGRATIONS"
     }

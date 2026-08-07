@@ -71,6 +71,8 @@ pub struct ProxyConfig {
     /// expiry — the pre-WS4 behaviour). The host-agent wires this to its coord
     /// client; tests pass a stub.
     pub inject_refresher: Option<Arc<dyn InjectRefresher>>,
+    /// Host-only Cloud SQL connector for the metadata `CONNECT` endpoint.
+    pub cloud_sql_connector: Option<Arc<dyn crate::metadata::CloudSqlConnector>>,
     /// Extra trust roots for hermetic full-network tests. Production leaves
     /// this empty and uses the built-in WebPKI roots.
     pub upstream_test_roots: Option<rustls::RootCertStore>,
@@ -98,6 +100,7 @@ impl ProxyConfig {
                 .expect("dns upstream default parses"),
             observe_sink: None,
             inject_refresher: None,
+            cloud_sql_connector: None,
             upstream_test_roots: None,
         }
     }
@@ -184,8 +187,11 @@ impl Proxy {
         }
         if let Some(listener) = metadata {
             let registry = self.cfg.registry.clone();
+            let cloud_sql_connector = self.cfg.cloud_sql_connector.clone();
             tokio::spawn(async move {
-                if let Err(error) = crate::metadata::serve(listener, registry).await {
+                if let Err(error) =
+                    crate::metadata::serve(listener, registry, cloud_sql_connector).await
+                {
                     tracing::error!(%error, "metadata serve loop ended");
                 }
             });

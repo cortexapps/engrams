@@ -45,7 +45,7 @@ async fn spawn_egress(dir: &Path) -> HostEgress {
         engram_egress_proxy::LocalDiskCaSource::new(dir.join("egress-ca")),
     );
     let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    HostEgress::spawn(source, bind, None, None, None, None)
+    HostEgress::spawn(source, bind, None, None, None, None, None)
         .await
         .expect("spawn egress")
 }
@@ -157,6 +157,7 @@ async fn survivor_keeps_egress_across_a_host_agent_roll() {
         injects: Vec::new(),
         observes: Vec::new(),
         metadata_flavor: None,
+        cloud_sql_tunnels: Vec::new(),
         secret_mode: engram_core::types::image::SecretMode::Broker,
     };
     pooled_a

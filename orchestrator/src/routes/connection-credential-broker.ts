@@ -21,6 +21,7 @@ import {
   connectionProviders,
   makeConnectionProviders,
   type ConnectionProvider,
+  type CredentialPurpose,
   type ProviderConnection,
 } from "../integrations/providers/index.ts";
 import { integrationSnapshotHash } from "../integrations/grants.ts";
@@ -42,7 +43,14 @@ function auditIdentity(
 interface BrokerRequest {
   sessionId: string;
   connectionId: string;
+  purpose?: CredentialPurpose;
 }
+
+const CREDENTIAL_PURPOSES = new Set<CredentialPurpose>([
+  "api",
+  "cloud_sql_admin",
+  "cloud_sql_login",
+]);
 
 interface CachedToken {
   accessToken: string;
@@ -160,13 +168,20 @@ export function makeConnectionCredentialBrokerRoute(deps: {
     if (!request.sessionId || !request.connectionId) {
       return c.json({ error: "sessionId and connectionId are required" }, 400);
     }
+    const purpose = request.purpose ?? "api";
+    if (!CREDENTIAL_PURPOSES.has(purpose)) {
+      return c.json({ error: "unsupported credential purpose" }, 400);
+    }
 
     const session = await sessions.get(request.sessionId);
     const grants = (session?.integrationGrants ?? []) as ProfileIntegrationGrant[];
     const connections = (session?.integrationConnections ?? []) as IntegrationConnectionSnapshot[];
     const connection = connections.find((candidate) => candidate.id === request.connectionId);
     const principalId = session?.principalId ?? session?.userId ?? "automation";
-    const granted = grants.some((grant) => grant.connectionId === request.connectionId);
+    const granted = grants.some((grant) =>
+      grant.connectionId === request.connectionId &&
+      (purpose === "api" || grant.operation === "cloudsql.postgres.connect")
+    );
     const profileSnapshotId = session === null ? "none" : integrationSnapshotHash({
       profileId: session.profileId,
       integrationGrants: grants,
@@ -190,8 +205,14 @@ export function makeConnectionCredentialBrokerRoute(deps: {
       if (!provider) {
         return c.json({ error: "connection provider does not support remote minting" }, 400);
       }
+      if (
+        purpose !== "api" &&
+        !provider.credentialPurposes?.includes(purpose)
+      ) {
+        return c.json({ error: "connection provider does not support credential purpose" }, 400);
+      }
 
-      const cacheKey = `${request.sessionId}:${request.connectionId}`;
+      const cacheKey = `${request.sessionId}:${request.connectionId}:${purpose}`;
       const requestTime = now();
       // Amortized upkeep: expire the requested key inline; sweep the rest at
       // most once per interval (session end evicts eagerly above).
@@ -213,7 +234,7 @@ export function makeConnectionCredentialBrokerRoute(deps: {
           connectionId: request.connectionId,
           userId: principalId,
           profileSnapshotId,
-        });
+        }, purpose);
         token = { accessToken: minted.token, expiresAt: minted.expiresAt };
         cache.set(cacheKey, token);
       }
@@ -231,6 +252,7 @@ export function makeConnectionCredentialBrokerRoute(deps: {
         profileSnapshotId,
         connectionId: request.connectionId,
         identity: auditIdentity(providers, connection),
+        purpose,
         outcome,
         error: errorMessage(error),
       }, "connection credential mint failed");
@@ -243,6 +265,7 @@ export function makeConnectionCredentialBrokerRoute(deps: {
           profileSnapshotId,
           connectionId: request.connectionId,
           identity: auditIdentity(providers, connection),
+          purpose,
           outcome,
         }, "connection credential mint");
       }

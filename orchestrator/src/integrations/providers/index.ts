@@ -24,6 +24,7 @@ import type { IntegrationPolicyJson } from "../../connectors/registry.ts";
 
 export type {
   ConnectionProvider,
+  CredentialPurpose,
   MintIdentity,
   MintedCredential,
   ProviderConnection,
@@ -59,7 +60,7 @@ let cached: ReadonlyMap<string, ConnectionProvider> | undefined;
 export function connectionProviders(): ReadonlyMap<string, ConnectionProvider> {
   cached ??= makeConnectionProviders([
     makeGoogleProvider({
-      exchange: (config, identity) => googleBroker().exchange(config, identity),
+      exchange: (config, identity, scopes) => googleBroker().exchange(config, identity, scopes),
     }),
   ]);
   return cached;

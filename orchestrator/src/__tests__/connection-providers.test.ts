@@ -114,6 +114,7 @@ function emptyPolicy(): IntegrationPolicyJson {
     injects: [],
     observes: [],
     metadata_flavor: null,
+    cloud_sql_tunnels: [],
   };
 }
 

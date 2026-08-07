@@ -211,8 +211,10 @@ const isGoogleApiHost = (host: string) => host.endsWith(".googleapis.com");
 export function operationsForEndpoints(
   capabilities: readonly ConnectorCapabilityView[],
   endpoints: readonly string[],
+  cloudSqlPostgresEnabled = false,
 ): ConnectorCapabilityView[] {
   return capabilities.filter((capability) => {
+    if (capability.action === "cloudsql.postgres.connect") return cloudSqlPostgresEnabled;
     if (capability.endpointRule === "google-api") return endpoints.some(isGoogleApiHost);
     if (capability.endpointRule === "non-google-api") {
       return endpoints.some((host) => !isGoogleApiHost(host));

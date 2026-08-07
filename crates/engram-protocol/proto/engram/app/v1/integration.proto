@@ -57,6 +57,9 @@ message GoogleCloudConnectionConfig {
   // Exact Google API hosts and explicit non-googleapis targets such as GKE API
   // servers. Wildcards and URLs are rejected.
   repeated string endpoints = 3;
+  // Optional exact PostgreSQL instance connection name: project:region:instance.
+  // The guest can open only this target through the host Cloud SQL tunnel.
+  string cloud_sql_postgres_instance = 4;
 }
 
 message IntegrationConnection {

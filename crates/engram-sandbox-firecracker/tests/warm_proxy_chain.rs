@@ -249,6 +249,7 @@ async fn warm_path_redirects_through_proxy_with_correct_source_lookup() {
         injects: Vec::new(),
         observes: Vec::new(),
         metadata_flavor: None,
+        cloud_sql_tunnels: Vec::new(),
     });
 
     // ---- 5. From inside the netns, dial TEST_DEST_IP:443 with a

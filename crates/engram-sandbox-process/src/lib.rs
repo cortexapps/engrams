@@ -1527,6 +1527,7 @@ mod tests {
                 injects: Vec::new(),
                 observes: Vec::new(),
                 metadata_flavor: Some(MetadataFlavor::Gce),
+                cloud_sql_tunnels: Vec::new(),
                 secret_mode: SecretMode::Broker,
             })
             .await

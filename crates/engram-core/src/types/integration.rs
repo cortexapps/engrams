@@ -60,6 +60,31 @@ pub struct IntegrationPolicy {
     /// endpoint until it is created again.
     #[serde(default)]
     pub metadata_flavor: Option<MetadataFlavor>,
+    /// Exact Cloud SQL instances the host may connect for this session.
+    /// This carries mint authority, never an OAuth token.
+    #[serde(default)]
+    pub cloud_sql_tunnels: Vec<CloudSqlTunnel>,
+}
+
+/// One exact PostgreSQL Cloud SQL tunnel compiled from a connection grant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSqlTunnel {
+    /// Google instance connection name: `project:region:instance`.
+    pub instance: String,
+    /// PostgreSQL IAM login name derived from the configured service account.
+    pub database_user: String,
+    /// Immutable authority for the two scoped OAuth tokens the host needs.
+    pub mint_source: CredentialMintSource,
+}
+
+/// A fixed credential use. Callers cannot supply arbitrary OAuth scopes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialPurpose {
+    #[default]
+    Api,
+    CloudSqlAdmin,
+    CloudSqlLogin,
 }
 
 /// A cloud metadata service the host proxy can imitate for a session.

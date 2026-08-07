@@ -433,6 +433,16 @@ export interface IntegrationPolicyJson {
    * would then have to decide which one wins.
    */
   metadata_flavor: MetadataFlavor | null;
+  /** Exact host-side Cloud SQL tunnels. These contain authority, not tokens. */
+  cloud_sql_tunnels: CloudSqlTunnelJson[];
+}
+
+export interface CloudSqlTunnelJson {
+  instance: string;
+  database_user: string;
+  mint_source: {
+    connection: { connection_id: string; provider: string };
+  };
 }
 
 /** Keep in step with `MetadataFlavor` in engram-core. */
@@ -468,7 +478,8 @@ export function policyHasContent(p: IntegrationPolicyJson): boolean {
     p.network.allow_hosts.length > 0 ||
     p.network.allow_host_patterns.length > 0 ||
     p.network.default === "allow" ||
-    p.metadata_flavor !== null
+    p.metadata_flavor !== null ||
+    p.cloud_sql_tunnels.length > 0
   );
 }
 
@@ -1589,7 +1600,7 @@ export function compileIntegrationPolicy(
     allow_hosts: s.allowHosts ?? [],
     allow_host_patterns: s.allowHostPatterns ?? [],
   }));
-  return { injects, observes, network, secrets, metadata_flavor: null };
+  return { injects, observes, network, secrets, metadata_flavor: null, cloud_sql_tunnels: [] };
 }
 
 // ---------------------------------------------------------------------------

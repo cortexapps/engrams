@@ -65,6 +65,7 @@ fn placeholder_egress_policy(
         injects: vec![],
         observes: vec![],
         metadata_flavor: None,
+        cloud_sql_tunnels: vec![],
         secret_mode: engram_core::types::image::SecretMode::Broker,
     }
 }

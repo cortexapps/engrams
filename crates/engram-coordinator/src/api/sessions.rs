@@ -473,6 +473,10 @@ pub(crate) async fn build_resume_egress_policy(
         injects,
         observes,
         policy.as_ref().and_then(|policy| policy.metadata_flavor),
+        policy
+            .as_ref()
+            .map(|policy| policy.cloud_sql_tunnels.clone())
+            .unwrap_or_default(),
     ))
 }
 
@@ -492,6 +496,7 @@ pub(crate) fn assemble_resume_egress_policy(
     injects: Vec<engram_core::types::egress::EgressInjectEntry>,
     observes: Vec<engram_core::types::egress::EgressObserveEntry>,
     metadata_flavor: Option<MetadataFlavor>,
+    cloud_sql_tunnels: Vec<engram_core::types::integration::CloudSqlTunnel>,
 ) -> engram_core::types::egress::SessionEgressPolicy {
     engram_core::types::egress::SessionEgressPolicy {
         session_id,
@@ -511,6 +516,7 @@ pub(crate) fn assemble_resume_egress_policy(
         // resumed session keeps emitting assets on the new host.
         observes,
         metadata_flavor,
+        cloud_sql_tunnels,
         // ADR 0057: per-secret mode; the proxy substitutes per entry. Vestigial.
         secret_mode: engram_core::types::image::SecretMode::Broker,
     }
@@ -2472,6 +2478,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             None,
+            Vec::new(),
         );
 
         // Real IP, not UNSPECIFIED.
@@ -2508,6 +2515,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             None,
+            Vec::new(),
         );
         assert_eq!(policy.guest_ip, guest_ip);
         assert!(policy.network_allow_hosts.is_empty());

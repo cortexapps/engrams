@@ -43,6 +43,7 @@ pub use resolver::{
 pub use ca::{Ca, CaError, CaSource, EnvCaSource, LocalDiskCaSource};
 pub use cert_mint::{CertMint, MintError};
 pub use graphql::{parse_request_body as parse_graphql_request, ParsedGraphql};
+pub use metadata::CloudSqlConnector;
 pub use observe::{ObserveSink, ObservedAsset, UrlFallback};
 pub use policy::{HostList, HostSpec, ParseError as PolicyParseError};
 pub use registry::{

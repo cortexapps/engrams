@@ -16,22 +16,45 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use engram_core::types::integration::MetadataFlavor;
+use engram_core::types::integration::{CloudSqlTunnel, MetadataFlavor};
+use engram_core::SessionId;
 
-use crate::Registry;
+use crate::{Registry, SessionState};
 
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
 pub const PLACEHOLDER_TOKEN: &str = "engram_google_token_placeholder";
 
-pub async fn serve(listener: TcpListener, registry: Arc<Registry>) -> std::io::Result<()> {
+/// Host implementation for an authorized Cloud SQL byte stream.
+///
+/// It owns the downstream stream so it can send `200 Connection Established`
+/// only after its host-local proxy is ready, then clean up that process after
+/// the database client disconnects.
+#[async_trait]
+pub trait CloudSqlConnector: Send + Sync {
+    async fn relay(
+        &self,
+        downstream: TcpStream,
+        session_id: SessionId,
+        tunnel: CloudSqlTunnel,
+    ) -> std::io::Result<()>;
+}
+
+pub async fn serve(
+    listener: TcpListener,
+    registry: Arc<Registry>,
+    cloud_sql_connector: Option<Arc<dyn CloudSqlConnector>>,
+) -> std::io::Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let registry = registry.clone();
+        let cloud_sql_connector = cloud_sql_connector.clone();
         tokio::spawn(async move {
-            if let Err(error) = serve_connection(stream, peer, &registry).await {
+            if let Err(error) = serve_connection(stream, peer, &registry, cloud_sql_connector).await
+            {
                 tracing::debug!(%peer, %error, "metadata connection ended with error");
             }
         });
@@ -42,13 +65,14 @@ async fn serve_connection(
     mut stream: TcpStream,
     peer: SocketAddr,
     registry: &Registry,
+    cloud_sql_connector: Option<Arc<dyn CloudSqlConnector>>,
 ) -> std::io::Result<()> {
-    let flavor = match peer.ip() {
-        std::net::IpAddr::V4(ip) => session_metadata_flavor(registry, ip),
+    let session = match peer.ip() {
+        std::net::IpAddr::V4(ip) => registry.lookup(ip),
         std::net::IpAddr::V6(_) => None,
     };
-    let Some(service) = flavor.map(service_for) else {
-        // No session, or a session that asked for no metadata service.
+    let Some(session) = session else {
+        // No registered session owns this guest address.
         write_response(
             &mut stream,
             ("Metadata-Flavor", "Google"),
@@ -81,6 +105,43 @@ async fn serve_connection(
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.trim(), value.trim()))
         .collect();
+    if method == "CONNECT" && target.starts_with("/_engrams/v1/cloud-sql/") {
+        let Some(tunnel) = authorized_cloud_sql_tunnel(&session, target, &headers) else {
+            write_response(
+                &mut stream,
+                ("Metadata-Flavor", "Google"),
+                "403 Forbidden",
+                "text/plain",
+                "forbidden",
+            )
+            .await?;
+            return stream.shutdown().await;
+        };
+        let Some(connector) = cloud_sql_connector else {
+            write_response(
+                &mut stream,
+                ("Metadata-Flavor", "Google"),
+                "503 Service Unavailable",
+                "text/plain",
+                "Cloud SQL tunnel is unavailable",
+            )
+            .await?;
+            return stream.shutdown().await;
+        };
+        return connector.relay(stream, session.session_id, tunnel).await;
+    }
+
+    let Some(service) = session.metadata_flavor.map(service_for) else {
+        write_response(
+            &mut stream,
+            ("Metadata-Flavor", "Google"),
+            "403 Forbidden",
+            "text/plain",
+            "forbidden",
+        )
+        .await?;
+        return stream.shutdown().await;
+    };
     let (status, content_type, body) = respond(service, method, target, &headers);
     write_response(
         &mut stream,
@@ -93,7 +154,27 @@ async fn serve_connection(
     stream.shutdown().await
 }
 
+fn authorized_cloud_sql_tunnel(
+    session: &SessionState,
+    target: &str,
+    headers: &[(&str, &str)],
+) -> Option<CloudSqlTunnel> {
+    let authorized = headers
+        .iter()
+        .any(|(name, value)| name.eq_ignore_ascii_case("metadata-flavor") && *value == "Google");
+    if !authorized {
+        return None;
+    }
+    let instance = target.strip_prefix("/_engrams/v1/cloud-sql/")?;
+    session
+        .cloud_sql_tunnels
+        .iter()
+        .find(|candidate| candidate.instance == instance)
+        .cloned()
+}
+
 /// The flavor this guest's session asked for, or `None` when it asked for none.
+#[cfg(test)]
 fn session_metadata_flavor(
     registry: &Registry,
     guest_ip: std::net::Ipv4Addr,
@@ -377,6 +458,7 @@ mod tests {
             injects: Vec::new(),
             observes: Vec::new(),
             metadata_flavor,
+            cloud_sql_tunnels: Vec::new(),
         };
         registry.register(state(None));
         assert!(session_metadata_flavor(&registry, guest_ip).is_none());
@@ -401,13 +483,14 @@ mod tests {
             injects: Vec::new(),
             observes: Vec::new(),
             metadata_flavor: Some(MetadataFlavor::Gce),
+            cloud_sql_tunnels: Vec::new(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let registry_for_server = registry.clone();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            serve_connection(stream, peer, &registry_for_server)
+            serve_connection(stream, peer, &registry_for_server, None)
                 .await
                 .unwrap();
         });
@@ -426,6 +509,53 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response.contains(PLACEHOLDER_TOKEN));
         assert!(!response.contains("ya29."));
+    }
+
+    #[test]
+    fn cloud_sql_connect_requires_the_exact_compiled_instance() {
+        use engram_core::types::integration::CredentialMintSource;
+
+        let session = SessionState {
+            session_id: SessionId::new(),
+            guest_ip: std::net::Ipv4Addr::LOCALHOST,
+            network_allow: HostList::empty(),
+            allow_all: false,
+            secrets: Vec::new(),
+            injects: Vec::new(),
+            observes: Vec::new(),
+            metadata_flavor: Some(MetadataFlavor::Gce),
+            cloud_sql_tunnels: vec![CloudSqlTunnel {
+                instance: "customer:us-central1:prod".into(),
+                database_user: "reader@customer.iam".into(),
+                mint_source: CredentialMintSource::Connection {
+                    connection_id: "gcp-prod".into(),
+                    provider: "gcp".into(),
+                },
+            }],
+        };
+        let good = [("Metadata-Flavor", "Google")];
+        assert!(authorized_cloud_sql_tunnel(
+            &session,
+            "/_engrams/v1/cloud-sql/customer:us-central1:other",
+            &good,
+        )
+        .is_none());
+        assert!(authorized_cloud_sql_tunnel(
+            &session,
+            "/_engrams/v1/cloud-sql/customer:us-central1:prod",
+            &[],
+        )
+        .is_none());
+        assert_eq!(
+            authorized_cloud_sql_tunnel(
+                &session,
+                "/_engrams/v1/cloud-sql/customer:us-central1:prod",
+                &good,
+            )
+            .unwrap()
+            .instance,
+            "customer:us-central1:prod"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -448,10 +578,11 @@ mod tests {
             injects: Vec::new(),
             observes: Vec::new(),
             metadata_flavor: Some(MetadataFlavor::Gce),
+            cloud_sql_tunnels: Vec::new(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve(listener, registry));
+        let server = tokio::spawn(serve(listener, registry, None));
         let config = tempfile::tempdir().unwrap();
         let config_path = config.path().to_path_buf();
         let command_config_path = config_path.clone();

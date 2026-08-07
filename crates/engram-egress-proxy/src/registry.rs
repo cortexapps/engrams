@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use engram_core::types::integration::{CredentialMintSource, MetadataFlavor};
+use engram_core::types::integration::{CloudSqlTunnel, CredentialMintSource, MetadataFlavor};
 use engram_core::SessionId;
 use parking_lot::RwLock;
 
@@ -54,6 +54,8 @@ pub struct SessionState {
     pub observes: Vec<ObserveEntry>,
     /// Which cloud metadata service the host serves for this session, if any.
     pub metadata_flavor: Option<MetadataFlavor>,
+    /// Exact host-side Cloud SQL tunnels compiled for this session.
+    pub cloud_sql_tunnels: Vec<CloudSqlTunnel>,
 }
 
 #[derive(Clone, Debug)]
@@ -654,6 +656,7 @@ mod tests {
                 url_fallback: None,
             }],
             metadata_flavor: None,
+            cloud_sql_tunnels: Vec::new(),
         }
     }
 

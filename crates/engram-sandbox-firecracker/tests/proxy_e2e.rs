@@ -438,6 +438,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         injects: Vec::new(),
         observes: Vec::new(),
         metadata_flavor: Some(MetadataFlavor::Gce),
+        cloud_sql_tunnels: Vec::new(),
     });
 
     // PID-1's env doesn't carry a PATH; child execs need one to

@@ -39,3 +39,27 @@ calls to anything else are denied at the network boundary.
   account key in — all three are refused, and none is needed. The metadata
   endpoint holds no project, so pass `--project` (or set
   `CLOUDSDK_CORE_PROJECT`) when a command needs one.
+
+## Cloud SQL PostgreSQL
+
+If `engrams-integrations` lists Cloud SQL, start the credential-free local
+relay for the exact instance configured on the connection:
+
+```bash
+engram-cloud-sql-proxy --instance PROJECT:REGION:INSTANCE --port 5445
+```
+
+Then connect with the IAM database user and require TLS:
+
+```bash
+PGSSLMODE=disable PGAPPNAME="engrams-$ENGRAM_SESSION_ID" \
+  psql --host 127.0.0.1 --port 5445 --username SERVICE_ACCOUNT_NAME@PROJECT_ID.iam --dbname DATABASE
+```
+
+Do not supply a password. The loopback leg is local to the guest; the host Cloud
+SQL Auth Proxy encrypts the upstream leg with TLS. The host performs automatic
+IAM authentication. The
+instance must have `cloudsql.iam_authentication=on`. The database role controls
+whether the session is read-only; do not rely on SQL
+text inspection. Prefer a role with only `CONNECT`, schema `USAGE`, and table
+`SELECT`, plus `default_transaction_read_only=on` and a statement timeout.

@@ -771,7 +771,11 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                   const googleCapabilities: ConnectorCapabilityView[] =
                     capabilitiesByProvider.get(connection.provider) ?? [];
                   const endpoints = connection.googleCloud?.endpoints ?? [];
-                  const offered = operationsForEndpoints(googleCapabilities, endpoints);
+                  const offered = operationsForEndpoints(
+                    googleCapabilities,
+                    endpoints,
+                    Boolean(connection.googleCloud?.cloudSqlPostgresInstance),
+                  );
                   const offeredActions = new Set(offered.map(({ action }) => action));
                   const grantedActions = new Set(
                     integrationGrants

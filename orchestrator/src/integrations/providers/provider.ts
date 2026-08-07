@@ -60,6 +60,9 @@ export interface MintIdentity {
   profileSnapshotId: string;
 }
 
+/** Fixed credential uses. Providers map these to checked-in OAuth scopes. */
+export type CredentialPurpose = "api" | "cloud_sql_admin" | "cloud_sql_login";
+
 /** The operator-facing setup document for one connection. */
 export interface ProviderSetupDoc {
   /** The token audience the provider's trust policy must accept. */
@@ -136,6 +139,8 @@ export interface ConnectionProvider {
   readonly category: string;
   readonly cli: ProviderCliSurface;
   readonly operations: ProviderOperationCatalog;
+  /** Non-default host-only credential uses this provider supports. */
+  readonly credentialPurposes?: readonly Exclude<CredentialPurpose, "api">[];
 
   /**
    * Validate and normalize a stored config. Throws on anything invalid,
@@ -166,6 +171,7 @@ export interface ConnectionProvider {
   mint(
     connection: ProviderConnection,
     identity: MintIdentity,
+    purpose?: CredentialPurpose,
   ): Promise<MintedCredential>;
 
   /** What the operator has to configure on their side. */

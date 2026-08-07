@@ -633,6 +633,8 @@ async fn main() -> Result<(), HostAgentError> {
     // token; capture them here too (before `cfg` moves into `HostAgent`).
     let refresh_coord_url = observe_coord_url.clone();
     let refresh_token = cfg.coordinator_token.clone();
+    let cloud_sql_coord_url = observe_coord_url.clone();
+    let cloud_sql_token = cfg.coordinator_token.clone();
 
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
         .with_chunk_store(chunk_store, materialize_dir)
@@ -701,7 +703,22 @@ async fn main() -> Result<(), HostAgentError> {
             engram_host_agent::coord_client::HttpCoordClient::new(refresh_coord_url, refresh_token),
             host_id,
         ));
-    match build_host_egress(&cli, Some(observe_sink), Some(inject_refresher)).await {
+    let cloud_sql_connector: Arc<dyn engram_egress_proxy::CloudSqlConnector> =
+        Arc::new(engram_host_agent::egress::CoordCloudSqlConnector::new(
+            engram_host_agent::coord_client::HttpCoordClient::new(
+                cloud_sql_coord_url,
+                cloud_sql_token,
+            ),
+            host_id,
+        ));
+    match build_host_egress(
+        &cli,
+        Some(observe_sink),
+        Some(inject_refresher),
+        Some(cloud_sql_connector),
+    )
+    .await
+    {
         Ok(egress) => agent = agent.with_egress(Arc::new(egress)),
         Err(e) => {
             tracing::error!(error = %e, "egress proxy spawn failed; aborting (egress filtering is mandatory)");
@@ -724,6 +741,7 @@ async fn build_host_egress(
     cli: &Cli,
     observe_sink: Option<engram_egress_proxy::ObserveSink>,
     inject_refresher: Option<Arc<dyn engram_egress_proxy::InjectRefresher>>,
+    cloud_sql_connector: Option<Arc<dyn engram_egress_proxy::CloudSqlConnector>>,
 ) -> Result<engram_host_agent::egress::HostEgress, String> {
     use std::sync::Arc;
     // Port 0 would bind an ephemeral port while the iptables REDIRECT
@@ -784,6 +802,7 @@ async fn build_host_egress(
         Some(metadata_bind),
         observe_sink,
         inject_refresher,
+        cloud_sql_connector,
     )
     .await
     .map_err(|e| e.to_string())

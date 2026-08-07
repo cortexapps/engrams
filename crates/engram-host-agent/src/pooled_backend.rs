@@ -10062,7 +10062,7 @@ impl SandboxBackend for PooledBackend {
         self.session_bindings.insert(sandbox_id, session_id);
 
         let Some(egress) = self.egress.as_ref() else {
-            if policy.metadata_flavor.is_some() {
+            if policy.metadata_flavor.is_some() || !policy.cloud_sql_tunnels.is_empty() {
                 return Err(SandboxError::InvalidSpec(
                     "Google ADC requires a host egress proxy".into(),
                 ));
@@ -11091,6 +11091,7 @@ mod tests {
                 injects: Vec::new(),
                 observes: Vec::new(),
                 metadata_flavor: Some(MetadataFlavor::Gce),
+                cloud_sql_tunnels: Vec::new(),
                 secret_mode: engram_core::types::image::SecretMode::Broker,
             })
             .await
@@ -11405,6 +11406,7 @@ mod tests {
             injects: Vec::new(),
             observes: Vec::new(),
             metadata_flavor: None,
+            cloud_sql_tunnels: Vec::new(),
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -11428,6 +11430,7 @@ mod tests {
             injects: Vec::new(),
             observes: Vec::new(),
             metadata_flavor: None,
+            cloud_sql_tunnels: Vec::new(),
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -14856,7 +14859,7 @@ mod tests {
             // registry, and a fixed DNS port would collide across the
             // parallel suite now that a bind failure is fatal (ADR 0083).
             let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let egress = HostEgress::spawn(source, bind, None, None, None, None)
+            let egress = HostEgress::spawn(source, bind, None, None, None, None, None)
                 .await
                 .expect("spawn egress");
             (egress, dir)
@@ -14879,6 +14882,7 @@ mod tests {
                 injects: Vec::new(),
                 observes: Vec::new(),
                 metadata_flavor: None,
+                cloud_sql_tunnels: Vec::new(),
                 secret_mode: SecretMode::Literal,
             }
         }

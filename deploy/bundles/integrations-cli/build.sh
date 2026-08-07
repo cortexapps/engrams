@@ -181,6 +181,10 @@ build_tree() {
     chmod 0755 "$dest/bin/engrams-integrations"
     cp "$here/bin/gcloud" "$dest/bin/gcloud"
     chmod 0755 "$dest/bin/gcloud"
+    cp "$here/bin/engram-cloud-sql-proxy" "$dest/bin/engram-cloud-sql-proxy"
+    chmod 0755 "$dest/bin/engram-cloud-sql-proxy"
+    mkdir -p "$dest/libexec"
+    cp "$here/libexec/engram_cloud_sql_proxy.py" "$dest/libexec/"
     # The Slack CLI is a committed POSIX-sh + curl wrapper (no fetched binary):
     # auth is brokered, so it just calls the Slack Web API and the proxy injects
     # the bot token host-side.

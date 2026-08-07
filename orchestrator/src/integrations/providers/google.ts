@@ -19,12 +19,14 @@ import {
   FORBIDDEN_GOOGLE_OPERATIONS,
   GOOGLE_PASSTHROUGH_CATALOG,
   GOOGLE_PASSTHROUGH_OPERATIONS,
+  CLOUD_SQL_POSTGRES_CONNECT,
   appendGooglePolicy,
   validateGoogleGrants,
 } from "../google-policy.ts";
-import { assertGoogleCloudConfig, googleSetupDoc } from "../google-wif.ts";
+import { assertGoogleCloudConfig, GOOGLE_OAUTH_SCOPES, googleSetupDoc } from "../google-wif.ts";
 import type {
   ConnectionProvider,
+  CredentialPurpose,
   MintIdentity,
   MintedCredential,
   ProviderConnection,
@@ -37,6 +39,7 @@ export interface GoogleProviderDeps {
   exchange(
     config: ReturnType<typeof assertGoogleCloudConfig>,
     identity: MintIdentity,
+    scopes?: readonly string[],
   ): Promise<{ accessToken: string; expiresAt: Date }>;
 }
 
@@ -48,14 +51,21 @@ export function makeGoogleProvider(deps: GoogleProviderDeps): ConnectionProvider
     category: "cloud",
     cli: {
       displayName: "Google Cloud",
-      bins: ["gcloud"],
-      doc: "Use brokered metadata ADC. Do not log in or create credentials.",
+      bins: ["gcloud", "engram-cloud-sql-proxy"],
+      doc: "Use brokered metadata ADC. For Cloud SQL, start engram-cloud-sql-proxy. Do not log in or create credentials.",
     },
     operations: {
-      curated: Object.keys(CURATED_GOOGLE_OPERATIONS),
+      curated: [...Object.keys(CURATED_GOOGLE_OPERATIONS), CLOUD_SQL_POSTGRES_CONNECT],
       passthrough: [...GOOGLE_PASSTHROUGH_OPERATIONS],
       forbidden: FORBIDDEN_GOOGLE_OPERATIONS,
       describe: [
+        {
+          action: CLOUD_SQL_POSTGRES_CONNECT,
+          label: "Connect to Cloud SQL PostgreSQL (database role controls access)",
+          access: "write",
+          host: null,
+          endpointRule: null,
+        },
         ...Object.entries(CURATED_GOOGLE_OPERATIONS).map(([action, policy]) => ({
           action,
           label: policy.label,
@@ -72,6 +82,7 @@ export function makeGoogleProvider(deps: GoogleProviderDeps): ConnectionProvider
         })),
       ],
     },
+    credentialPurposes: ["cloud_sql_admin", "cloud_sql_login"],
     // Google delivers its credential through a metadata service, so a session
     // holding one of these connections needs the host-side endpoint.
     metadataFlavor: "gce",
@@ -103,9 +114,13 @@ export function makeGoogleProvider(deps: GoogleProviderDeps): ConnectionProvider
     async mint(
       connection: ProviderConnection,
       identity: MintIdentity,
+      purpose: CredentialPurpose = "api",
     ): Promise<MintedCredential> {
       const config = assertGoogleCloudConfig(connection.config);
-      const token = await deps.exchange(config, identity);
+      if (purpose !== "api" && !config.cloudSqlPostgresInstance) {
+        throw new Error("Cloud SQL credential requested without a configured instance");
+      }
+      const token = await deps.exchange(config, identity, [GOOGLE_OAUTH_SCOPES[purpose]]);
       return { kind: "bearer", token: token.accessToken, expiresAt: token.expiresAt };
     },
 
