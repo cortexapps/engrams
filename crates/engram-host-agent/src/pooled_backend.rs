@@ -1410,9 +1410,18 @@ impl PooledBackend {
             }
             engram_host_core::SwapDisarmPlan::Disarm { used_kb } => used_kb,
         };
+        // NOT `swapoff -a`: busybox's `-a` reads /etc/fstab ONLY — on a
+        // guest whose swap was armed by explicit `swapon /dev/vdX`
+        // (ours always is) it exits 1 on a missing fstab and, worse,
+        // silently disarms NOTHING when an fstab exists. Enumerate
+        // /proc/swaps and disarm each entry explicitly, then VERIFY the
+        // table is empty — the exit code now proves the invariant
+        // in-guest instead of trusting a userland's `-a` semantics.
         self.exec_capture_stdout(
             id,
-            "swapoff -a",
+            "for d in $(awk 'NR>1{print $1}' /proc/swaps); do \
+                 swapoff \"$d\" || exit 1; done && \
+             [ \"$(awk 'NR>1' /proc/swaps | wc -l)\" -eq 0 ]",
             std::time::Duration::from_secs(300),
             "swap-disarm swapoff",
         )
