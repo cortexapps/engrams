@@ -53,12 +53,12 @@ export function SecretsPanel() {
     <div className="space-y-6">
       <PageHeading
         title="Org secrets"
-        description="The admin-managed secret store. Values are sealed under the deployment key the moment you save them, never returned to the browser. A profile or connector references a secret by its name."
+        count={rows.length || undefined}
         actions={<SecretDialog />}
       />
 
       {error && (
-        <p className="text-sm text-destructive">could not load secrets — {String(error)}</p>
+        <p className="text-sm text-destructive">Could not load secrets — {String(error)}</p>
       )}
 
       {isLoading ? (
@@ -133,7 +133,7 @@ function SecretRow({ row }: { row: OrgSecretMeta }) {
         </div>
         {del.error && (
           <p className="mt-1 text-right text-xs text-destructive">
-            could not remove — {String(del.error)}
+            Could not remove — {String(del.error)}
           </p>
         )}
       </TableCell>

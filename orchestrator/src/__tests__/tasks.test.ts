@@ -25,7 +25,13 @@ import { Hono } from "hono";
 import type { AddressInfo } from "node:net";
 
 import { buildServer } from "../server.ts";
-import { registerTasks, buildProfileMap, searchPattern, effectiveTitle } from "../rpc/tasks.ts";
+import {
+  registerTasks,
+  buildProfileMap,
+  searchPattern,
+  effectiveTitle,
+  taskActivityAt,
+} from "../rpc/tasks.ts";
 import type { TaskDeps, SessionsClient, Db, GetSession, ImagesClient } from "../rpc/tasks.ts";
 import type { HarnessCatalogClient } from "../rpc/task-create.ts";
 import type { UserSecretStore } from "../db/user-secrets.ts";
@@ -117,6 +123,8 @@ function makeFakeSessions(opts: {
   created?: FakeSession[];
   existing?: FakeSession[];
   createShouldThrow?: boolean;
+  /** Model a control-plane outage: ListSessions rejects. */
+  listShouldThrow?: boolean;
 }): SessionsClient & {
   deletedIds: string[];
   createCallCount: number;
@@ -153,6 +161,7 @@ function makeFakeSessions(opts: {
       };
     },
     async listSessions(_req) {
+      if (opts.listShouldThrow) throw new Error("control plane unreachable");
       return {
         sessions: Array.from(byId.values()).map((s) => ({ session: s as unknown as Session })),
       };
@@ -726,18 +735,20 @@ function listTaskRow(
 function listSessionRef(
   taskId: string,
   sessionId: string,
+  role: string | null = "primary",
+  createdAt = "2026-01-01T00:00:00.000Z",
 ): typeof taskSessionTable.$inferSelect {
   return {
     taskId,
     sessionId,
-    role: "primary",
+    role,
     profileId: null,
     capabilities: null,
     integrationGrants: null,
     integrationConnections: null,
     integrationPrincipalId: null,
     integrationSnapshotHash: null,
-    createdAt: new Date("2026-01-01T00:00:00.000Z"),
+    createdAt: new Date(createdAt),
   };
 }
 
@@ -799,11 +810,12 @@ function makeListClient(
   role: "user" | "admin",
   fixture: ListDbFixture = listFixture,
   sessions: FakeSession[] = listLiveSessions,
+  listShouldThrow = false,
 ): ReturnType<typeof makeClient> {
   const transport = createRouterTransport((router) => {
     registerTasks(router, {
       getSession: makeGetSession(userId, role),
-      sessions: makeFakeSessions({ existing: sessions }),
+      sessions: makeFakeSessions({ existing: sessions, listShouldThrow }),
       profiles: makeFakeProfiles(),
       images: fakeImages(),
       users: listUsers,
@@ -933,10 +945,12 @@ describe("TaskService — ListTasks ADR 0087", () => {
       scope: "all",
       createdByUserIds: [MEMBER_A, "system"],
     });
+    // Band before recency: LIST_SYSTEM is active and LIST_MEMBER_TITLE is
+    // idle, so the running one leads even though it is four months older.
     expect(memberAndSystem.tasks.map((task) => task.id)).toEqual([
       `unattributed-${LIST_ORPHAN_SESSION}`,
-      LIST_MEMBER_TITLE,
       LIST_SYSTEM,
+      LIST_MEMBER_TITLE,
     ]);
     expect(memberAndSystem.totalCount).toBe(3);
 
@@ -958,15 +972,173 @@ describe("TaskService — ListTasks ADR 0087", () => {
     // predating migration 0068, or a session that has not emitted an event),
     // so the order must degrade to the old lastActiveAt key — and to the
     // task's own createdAt for the rows with no session at all.
+    //
+    // The fallback is observable INSIDE a band: the four working rows below
+    // are ordered 06-01, 05-01, 04-01 (a task with no session, on its own
+    // createdAt), 01-01. The idle and dead rows follow because of their band,
+    // not their clock.
     const resp = await makeListClient(ADMIN_ID, "admin").listTasks({ scope: "all" });
     expect(resp.tasks.map((task) => task.id)).toEqual([
       `unattributed-${LIST_ORPHAN_SESSION}`,
       LIST_ADMIN_ACTIVE,
       LIST_ADMIN_PENDING,
+      LIST_SYSTEM,
+      LIST_MEMBER_TITLE,
+      LIST_MEMBER_ID,
+    ]);
+  });
+
+  // The list is paged, so ordering by recency alone made "is anything running?"
+  // a question about which page you fetched — in an org whose work is mostly
+  // finished (the steady state), the live tasks sink past the first page.
+  test("bands before recency, so live work leads the first page", async () => {
+    const resp = await makeListClient(ADMIN_ID, "admin").listTasks({ scope: "all" });
+    // active/pending → working, parked/idle → idle, everything terminal last.
+    expect(resp.tasks.map((task) => task.sessions[0]?.session?.status ?? "none")).toEqual([
+      "active",
+      "active",
+      "none",
+      "active",
+      "idle",
+      "dead",
+    ]);
+  });
+
+  // A ref whose session the control plane no longer returns means the sandbox
+  // was collected. Calling it `pending` claimed the opposite end of the
+  // lifecycle, and the rail banded a months-dead task under "Working".
+  test("a task whose session is gone filters as dead, not pending", async () => {
+    const client = makeListClient(ADMIN_ID, "admin", listFixture, [
+      // Every live session dropped: the control plane returns nothing.
+      liveSession(LIST_ORPHAN_SESSION, "active", "2026-06-01T00:00:00.000Z"),
+    ]);
+
+    const dead = await client.listTasks({ scope: "all", states: ["dead"] });
+    expect(dead.tasks.map((task) => task.id)).toEqual([
+      LIST_ADMIN_ACTIVE,
       LIST_MEMBER_TITLE,
       LIST_MEMBER_ID,
       LIST_SYSTEM,
     ]);
+
+    // Only the task that never had a session reference is pending.
+    const pending = await client.listTasks({ scope: "all", states: ["pending"] });
+    expect(pending.tasks.map((task) => task.id)).toEqual([LIST_ADMIN_PENDING]);
+    // The control plane answered, so the absences above are real collections.
+    expect(dead.sessionStateUnavailable).toBe(false);
+  });
+
+  // The failure this guards: ListSessions is backed by `list_active_sessions`,
+  // so "not in the reply" normally means collected. When the control plane does
+  // not reply AT ALL the same emptiness would condemn every task at once — and
+  // with Finished collapsed by default the caller's rail would look empty.
+  describe("control plane unreachable", () => {
+    const outage = () => makeListClient(ADMIN_ID, "admin", listFixture, listLiveSessions, true);
+
+    test("says so rather than reporting every task dead", async () => {
+      const resp = await outage().listTasks({ scope: "all" });
+
+      expect(resp.sessionStateUnavailable).toBe(true);
+      // Every REAL task row is still listed — a task list with no live state is
+      // still useful. The synthetic `unattributed-*` row is the one absence:
+      // it exists only because a live session had no task, so with no session
+      // list there is nothing to synthesise it from.
+      expect(resp.tasks.map((task) => task.id).sort()).toEqual(
+        [LIST_ADMIN_ACTIVE, LIST_ADMIN_PENDING, LIST_MEMBER_ID, LIST_MEMBER_TITLE, LIST_SYSTEM].sort(),
+      );
+      expect(resp.tasks.every((task) => task.sessions[0]?.session === undefined)).toBe(true);
+    });
+
+    test("no task filters as dead, because none is known to be", async () => {
+      const client = outage();
+      expect((await client.listTasks({ scope: "all", states: ["dead"] })).tasks).toEqual([]);
+      expect((await client.listTasks({ scope: "all", states: ["active"] })).tasks).toEqual([]);
+      // A task with no session reference is still pending — that is our own row.
+      expect(
+        (await client.listTasks({ scope: "all", states: ["pending"] })).tasks.map((t) => t.id),
+      ).toEqual([LIST_ADMIN_PENDING]);
+    });
+
+    test("falls back to plain recency, because the bands would be invented", async () => {
+      const resp = await outage().listTasks({ scope: "all" });
+      const byRecency = [...resp.tasks].sort((a, b) => taskActivityAt(b) - taskActivityAt(a));
+      expect(resp.tasks.map((t) => t.id)).toEqual(byRecency.map((t) => t.id));
+    });
+  });
+
+  // A PR review keeps its `finder` ref after that session is torn down, then
+  // adds a live `verifier` ref to the SAME task. The refs query has no
+  // ORDER BY, so `sessions[0]` is whatever Postgres returns first — and with
+  // the finder first the task reports `dead` while it is actively reviewing,
+  // landing in a Finished band that is collapsed by default.
+  describe("a multi-session task is represented by its live session", () => {
+    const REVIEW_TASK = "list-review-task";
+    // Deliberately finder-first, and neither ref is `primary`.
+    const reviewFixture: ListDbFixture = {
+      tasks: [listTaskRow(REVIEW_TASK, ADMIN_ID, "2026-06-01T00:00:00.000Z")],
+      sessionRefs: [
+        listSessionRef(REVIEW_TASK, "review-finder", "finder", "2026-06-01T00:00:00.000Z"),
+        listSessionRef(REVIEW_TASK, "review-verifier", "verifier", "2026-06-02T00:00:00.000Z"),
+      ],
+    };
+    // The finder is gone; only the verifier is still running.
+    const onlyVerifier = [liveSession("review-verifier", "active", "2026-06-02T00:00:00.000Z")];
+
+    test("leads with the live ref, not the torn-down one", async () => {
+      const resp = await makeListClient(
+        ADMIN_ID,
+        "admin",
+        reviewFixture,
+        onlyVerifier,
+      ).listTasks({ scope: "mine" });
+
+      const task = resp.tasks.find((t) => t.id === REVIEW_TASK)!;
+      expect(task.sessions[0]?.sessionId).toBe("review-verifier");
+      expect(task.sessions[0]?.session?.status).toBe("active");
+      // Both refs survive — only the order changed.
+      expect(task.sessions.map((ref) => ref.sessionId)).toEqual([
+        "review-verifier",
+        "review-finder",
+      ]);
+    });
+
+    test("so it filters as active and never as dead", async () => {
+      const client = makeListClient(ADMIN_ID, "admin", reviewFixture, onlyVerifier);
+      expect((await client.listTasks({ scope: "mine", states: ["active"] })).tasks.length).toBe(1);
+      expect((await client.listTasks({ scope: "mine", states: ["dead"] })).tasks).toEqual([]);
+    });
+
+    test("an explicit primary ref outranks a live one", async () => {
+      const withPrimary: ListDbFixture = {
+        tasks: reviewFixture.tasks,
+        sessionRefs: [
+          // Newer AND live, but not the primary.
+          listSessionRef(REVIEW_TASK, "review-verifier", "verifier", "2026-06-02T00:00:00.000Z"),
+          listSessionRef(REVIEW_TASK, "review-primary", "primary", "2026-06-01T00:00:00.000Z"),
+        ],
+      };
+      const resp = await makeListClient(ADMIN_ID, "admin", withPrimary, onlyVerifier).listTasks({
+        scope: "mine",
+      });
+      expect(resp.tasks[0]?.sessions[0]?.sessionId).toBe("review-primary");
+    });
+  });
+
+  // Band order buries a just-finished task behind every live one, so a caller
+  // that wants "the newest few, whatever they are" has to say so — re-sorting
+  // the page it was handed cannot recover a row that never made the window.
+  test("order=recency returns strict recency, not bands", async () => {
+    const client = makeListClient(ADMIN_ID, "admin");
+    const banded = await client.listTasks({ scope: "all" });
+    const recent = await client.listTasks({ scope: "all", order: "recency" });
+
+    expect(recent.tasks.map((t) => t.id)).not.toEqual(banded.tasks.map((t) => t.id));
+    const byRecency = [...recent.tasks].sort((a, b) => taskActivityAt(b) - taskActivityAt(a));
+    expect(recent.tasks.map((t) => t.id)).toEqual(byRecency.map((t) => t.id));
+    // The set is identical; only the order moved.
+    expect([...recent.tasks.map((t) => t.id)].sort()).toEqual(
+      [...banded.tasks.map((t) => t.id)].sort(),
+    );
   });
 
   test("orders by lastEventAt, so a working session outranks an evicted one", async () => {

@@ -28,31 +28,42 @@ export function Storage() {
 
   return (
     <div className="space-y-6">
-      <PageHeading
-        title="Storage"
-        description="Content-addressed chunk store, snapshots, and copy-on-write durability."
-      />
+      <PageHeading title="Storage" />
 
       <StatReadout className="sm:grid-cols-3 lg:grid-cols-6" items={rollups} />
 
       <div>
         <div className="mb-2 flex items-baseline justify-between">
           <Text as="h2" variant="label" tone="muted">
-            Durability ledger · per-sandbox copy-on-write
+            Durability ledger
           </Text>
           <span className="font-mono text-xs tabular-nums text-muted-foreground">
             {rows.length}
           </span>
         </div>
+        {/* The three domain terms below used to be defined in a paragraph under
+            the table. A definition belongs where the question is asked, so each
+            one now rides its own column header. */}
         <Table>
           <TableHeader>
             <TableRow>
               <TableHead>Session</TableHead>
               <TableHead>Host</TableHead>
-              <TableHead className="text-right">Dirty</TableHead>
-              <TableHead className="text-right">Unflushed</TableHead>
-              <TableHead>Base locality</TableHead>
-              <TableHead className="text-right">RPO</TableHead>
+              <TableHead
+                className="text-right"
+                title="Chunks written since the last flush to the content-addressed store."
+              >
+                Dirty
+              </TableHead>
+              <TableHead className="text-right" title="Bytes not yet flushed to the chunk store.">
+                Unflushed
+              </TableHead>
+              <TableHead title="Share of this sandbox's base chunks resident on its own host.">
+                Base locality
+              </TableHead>
+              <TableHead className="text-right" title="Time since the last flush.">
+                RPO
+              </TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -73,11 +84,6 @@ export function Storage() {
             )}
           </TableBody>
         </Table>
-        <p className="mt-3 max-w-prose text-sm text-muted-foreground">
-          Dirty chunks flush to the content-addressed store on the snapshot cadence; base locality
-          is the share of a sandbox’s base chunks resident on its host. RPO is time since the last
-          flush.
-        </p>
       </div>
     </div>
   );

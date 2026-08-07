@@ -67,7 +67,13 @@ export function CommandMenu() {
   const requestComposerFocus = useKeyboardUi((s) => s.requestComposerFocus);
   const navigate = useNavigate();
   const isAdmin = useIsAdmin();
-  const { rows, isPending, error } = useRailSessions();
+  // Both lists, deliberately: the menu SEARCHES everything loaded (that is
+  // what a command menu is for), but a ⌥N badge may only appear on a row the
+  // keymap can actually reach. `useSessionJumpKeys` navigates `visibleRows`,
+  // so a row inside a collapsed band has no number — printing one would
+  // advertise a shortcut that opens a different task.
+  const { rows, visibleRows, isPending, error } = useRailSessions();
+  const jumpNumbers = new Map(visibleRows.map((row, i) => [row.id, i + 1]));
 
   // Close the palette first, then run — so focus restores from the palette
   // before a navigation paints or the New Session dialog grabs the focus trap.
@@ -115,7 +121,7 @@ export function CommandMenu() {
                   Couldn’t load tasks.
                 </CommandItem>
               ) : (
-                rows.map((r, i) => (
+                rows.map((r) => (
                   <CommandItem
                     key={r.id}
                     value={`task ${shortId(r.id)} ${stripImageHost(r.image)} ${r.id}`}
@@ -132,14 +138,17 @@ export function CommandMenu() {
                         {stripImageHost(r.image)}
                       </span>
                     </span>
-                    {i < 9 && (
-                      <CommandShortcut>
-                        <KbdGroup>
-                          <Kbd>{ALT_LABEL}</Kbd>
-                          <Kbd>{i + 1}</Kbd>
-                        </KbdGroup>
-                      </CommandShortcut>
-                    )}
+                    {(() => {
+                      const n = jumpNumbers.get(r.id);
+                      return n !== undefined && n <= 9 ? (
+                        <CommandShortcut>
+                          <KbdGroup>
+                            <Kbd>{ALT_LABEL}</Kbd>
+                            <Kbd>{n}</Kbd>
+                          </KbdGroup>
+                        </CommandShortcut>
+                      ) : null;
+                    })()}
                   </CommandItem>
                 ))
               )}

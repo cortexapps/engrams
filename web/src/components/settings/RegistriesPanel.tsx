@@ -64,12 +64,12 @@ export function RegistriesPanel() {
     <div className="space-y-6">
       <PageHeading
         title="Registries"
-        description="Docker registries for image pulls. Passwords are sealed at rest, never returned to the browser."
+        count={rows.length || undefined}
         actions={<AddRegistryDialog />}
       />
 
       {error && (
-        <p className="text-sm text-destructive">could not load registries — {String(error)}</p>
+        <p className="text-sm text-destructive">Could not load registries — {String(error)}</p>
       )}
 
       {isLoading ? (
@@ -149,7 +149,7 @@ function RegistryRow({ row }: { row: RegistryCredentialSummary }) {
         </div>
         {del.error && (
           <p className="mt-1 text-right text-xs text-destructive">
-            could not remove — {String(del.error)}
+            Could not remove — {String(del.error)}
           </p>
         )}
       </TableCell>

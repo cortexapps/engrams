@@ -16,7 +16,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/task.proto.
  */
 export const file_engram_app_v1_task: GenFile = /*@__PURE__*/
-  fileDesc("ChhlbmdyYW0vYXBwL3YxL3Rhc2sucHJvdG8SDWVuZ3JhbS5hcHAudjEikAIKEUNyZWF0ZVRhc2tSZXF1ZXN0EgwKBHR5cGUYASABKAkSEwoGcHJvbXB0GAMgASgJSACIAQESEgoFdGl0bGUYBCABKAlIAYgBARISCgpwcm9maWxlX2lkGAUgASgJEhQKB2hhcm5lc3MYBiABKAlIAogBARISCgVtb2RlbBgHIAEoCUgDiAEBEhMKBmVmZm9ydBgIIAEoCUgEiAEBEhkKDGhhcm5lc3NfbW9kZRgJIAEoCUgFiAEBQgkKB19wcm9tcHRCCAoGX3RpdGxlQgoKCF9oYXJuZXNzQggKBl9tb2RlbEIJCgdfZWZmb3J0Qg8KDV9oYXJuZXNzX21vZGVKBAgCEANSCWltYWdlX3VyaSI3ChJDcmVhdGVUYXNrUmVzcG9uc2USIQoEdGFzaxgBIAEoCzITLmVuZ3JhbS5hcHAudjEuVGFzayKWAwoEVGFzaxIKCgJpZBgBIAEoCRIMCgR0eXBlGAIgASgJEhIKBXRpdGxlGAMgASgJSACIAQESDgoGc3RhdHVzGAQgASgJEh8KEmNyZWF0ZWRfYnlfdXNlcl9pZBgFIAEoCUgBiAEBEhMKC3NvdXJjZV9qc29uGAYgASgJEi8KCHNlc3Npb25zGAcgAygLMh0uZW5ncmFtLmFwcC52MS5UYXNrU2Vzc2lvblJlZhISCgpjcmVhdGVkX2F0GAggASgJEhcKD3RpdGxlX2lzX2N1c3RvbRgJIAEoCBIsCgpjcmVhdGVkX2J5GAogASgLMhMuZW5ncmFtLmFwcC52MS5Vc2VySAKIAQESFAoHaGFybmVzcxgLIAEoCUgDiAEBEhIKBW1vZGVsGAwgASgJSASIAQESEwoGZWZmb3J0GA0gASgJSAWIAQFCCAoGX3RpdGxlQhUKE19jcmVhdGVkX2J5X3VzZXJfaWRCDQoLX2NyZWF0ZWRfYnlCCgoIX2hhcm5lc3NCCAoGX21vZGVsQgkKB19lZmZvcnQivAEKDlRhc2tTZXNzaW9uUmVmEhIKCnNlc3Npb25faWQYASABKAkSEQoEcm9sZRgCIAEoCUgAiAEBEiwKB3Nlc3Npb24YAyABKAsyFi5lbmdyYW0uYXBwLnYxLlNlc3Npb25IAYgBARI0Cgdwcm9maWxlGAQgASgLMh4uZW5ncmFtLmFwcC52MS5Qcm9maWxlU25hcHNob3RIAogBAUIHCgVfcm9sZUIKCghfc2Vzc2lvbkIKCghfcHJvZmlsZSJ/ChBMaXN0VGFza3NSZXF1ZXN0Eg0KBXNjb3BlGAEgASgJEg4KBnNlYXJjaBgCIAEoCRIbChNjcmVhdGVkX2J5X3VzZXJfaWRzGAMgAygJEg4KBnN0YXRlcxgEIAMoCRIMCgRwYWdlGAUgASgFEhEKCXBhZ2Vfc2l6ZRgGIAEoBSJMChFMaXN0VGFza3NSZXNwb25zZRIiCgV0YXNrcxgBIAMoCzITLmVuZ3JhbS5hcHAudjEuVGFzaxITCgt0b3RhbF9jb3VudBgCIAEoBSIhCg5HZXRUYXNrUmVxdWVzdBIPCgd0YXNrX2lkGAEgASgJIjQKD0dldFRhc2tSZXNwb25zZRIhCgR0YXNrGAEgASgLMhMuZW5ncmFtLmFwcC52MS5UYXNrIiQKEURlbGV0ZVRhc2tSZXF1ZXN0Eg8KB3Rhc2tfaWQYASABKAkiFAoSRGVsZXRlVGFza1Jlc3BvbnNlIkIKEVVwZGF0ZVRhc2tSZXF1ZXN0Eg8KB3Rhc2tfaWQYASABKAkSEgoFdGl0bGUYAiABKAlIAIgBAUIICgZfdGl0bGUiNwoSVXBkYXRlVGFza1Jlc3BvbnNlEiEKBHRhc2sYASABKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2syoAMKC1Rhc2tTZXJ2aWNlElEKCkNyZWF0ZVRhc2sSIC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVRhc2tSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5DcmVhdGVUYXNrUmVzcG9uc2USTgoJTGlzdFRhc2tzEh8uZW5ncmFtLmFwcC52MS5MaXN0VGFza3NSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5MaXN0VGFza3NSZXNwb25zZRJICgdHZXRUYXNrEh0uZW5ncmFtLmFwcC52MS5HZXRUYXNrUmVxdWVzdBoeLmVuZ3JhbS5hcHAudjEuR2V0VGFza1Jlc3BvbnNlElEKCkRlbGV0ZVRhc2sSIC5lbmdyYW0uYXBwLnYxLkRlbGV0ZVRhc2tSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5EZWxldGVUYXNrUmVzcG9uc2USUQoKVXBkYXRlVGFzaxIgLmVuZ3JhbS5hcHAudjEuVXBkYXRlVGFza1JlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLlVwZGF0ZVRhc2tSZXNwb25zZWIGcHJvdG8z", [file_engram_app_v1_session, file_engram_app_v1_profile, file_engram_app_v1_user]);
+  fileDesc("ChhlbmdyYW0vYXBwL3YxL3Rhc2sucHJvdG8SDWVuZ3JhbS5hcHAudjEikAIKEUNyZWF0ZVRhc2tSZXF1ZXN0EgwKBHR5cGUYASABKAkSEwoGcHJvbXB0GAMgASgJSACIAQESEgoFdGl0bGUYBCABKAlIAYgBARISCgpwcm9maWxlX2lkGAUgASgJEhQKB2hhcm5lc3MYBiABKAlIAogBARISCgVtb2RlbBgHIAEoCUgDiAEBEhMKBmVmZm9ydBgIIAEoCUgEiAEBEhkKDGhhcm5lc3NfbW9kZRgJIAEoCUgFiAEBQgkKB19wcm9tcHRCCAoGX3RpdGxlQgoKCF9oYXJuZXNzQggKBl9tb2RlbEIJCgdfZWZmb3J0Qg8KDV9oYXJuZXNzX21vZGVKBAgCEANSCWltYWdlX3VyaSI3ChJDcmVhdGVUYXNrUmVzcG9uc2USIQoEdGFzaxgBIAEoCzITLmVuZ3JhbS5hcHAudjEuVGFzayKWAwoEVGFzaxIKCgJpZBgBIAEoCRIMCgR0eXBlGAIgASgJEhIKBXRpdGxlGAMgASgJSACIAQESDgoGc3RhdHVzGAQgASgJEh8KEmNyZWF0ZWRfYnlfdXNlcl9pZBgFIAEoCUgBiAEBEhMKC3NvdXJjZV9qc29uGAYgASgJEi8KCHNlc3Npb25zGAcgAygLMh0uZW5ncmFtLmFwcC52MS5UYXNrU2Vzc2lvblJlZhISCgpjcmVhdGVkX2F0GAggASgJEhcKD3RpdGxlX2lzX2N1c3RvbRgJIAEoCBIsCgpjcmVhdGVkX2J5GAogASgLMhMuZW5ncmFtLmFwcC52MS5Vc2VySAKIAQESFAoHaGFybmVzcxgLIAEoCUgDiAEBEhIKBW1vZGVsGAwgASgJSASIAQESEwoGZWZmb3J0GA0gASgJSAWIAQFCCAoGX3RpdGxlQhUKE19jcmVhdGVkX2J5X3VzZXJfaWRCDQoLX2NyZWF0ZWRfYnlCCgoIX2hhcm5lc3NCCAoGX21vZGVsQgkKB19lZmZvcnQivAEKDlRhc2tTZXNzaW9uUmVmEhIKCnNlc3Npb25faWQYASABKAkSEQoEcm9sZRgCIAEoCUgAiAEBEiwKB3Nlc3Npb24YAyABKAsyFi5lbmdyYW0uYXBwLnYxLlNlc3Npb25IAYgBARI0Cgdwcm9maWxlGAQgASgLMh4uZW5ncmFtLmFwcC52MS5Qcm9maWxlU25hcHNob3RIAogBAUIHCgVfcm9sZUIKCghfc2Vzc2lvbkIKCghfcHJvZmlsZSKOAQoQTGlzdFRhc2tzUmVxdWVzdBINCgVzY29wZRgBIAEoCRIOCgZzZWFyY2gYAiABKAkSGwoTY3JlYXRlZF9ieV91c2VyX2lkcxgDIAMoCRIOCgZzdGF0ZXMYBCADKAkSDAoEcGFnZRgFIAEoBRIRCglwYWdlX3NpemUYBiABKAUSDQoFb3JkZXIYByABKAkibwoRTGlzdFRhc2tzUmVzcG9uc2USIgoFdGFza3MYASADKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2sSEwoLdG90YWxfY291bnQYAiABKAUSIQoZc2Vzc2lvbl9zdGF0ZV91bmF2YWlsYWJsZRgDIAEoCCIhCg5HZXRUYXNrUmVxdWVzdBIPCgd0YXNrX2lkGAEgASgJIjQKD0dldFRhc2tSZXNwb25zZRIhCgR0YXNrGAEgASgLMhMuZW5ncmFtLmFwcC52MS5UYXNrIiQKEURlbGV0ZVRhc2tSZXF1ZXN0Eg8KB3Rhc2tfaWQYASABKAkiFAoSRGVsZXRlVGFza1Jlc3BvbnNlIkIKEVVwZGF0ZVRhc2tSZXF1ZXN0Eg8KB3Rhc2tfaWQYASABKAkSEgoFdGl0bGUYAiABKAlIAIgBAUIICgZfdGl0bGUiNwoSVXBkYXRlVGFza1Jlc3BvbnNlEiEKBHRhc2sYASABKAsyEy5lbmdyYW0uYXBwLnYxLlRhc2syoAMKC1Rhc2tTZXJ2aWNlElEKCkNyZWF0ZVRhc2sSIC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVRhc2tSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5DcmVhdGVUYXNrUmVzcG9uc2USTgoJTGlzdFRhc2tzEh8uZW5ncmFtLmFwcC52MS5MaXN0VGFza3NSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5MaXN0VGFza3NSZXNwb25zZRJICgdHZXRUYXNrEh0uZW5ncmFtLmFwcC52MS5HZXRUYXNrUmVxdWVzdBoeLmVuZ3JhbS5hcHAudjEuR2V0VGFza1Jlc3BvbnNlElEKCkRlbGV0ZVRhc2sSIC5lbmdyYW0uYXBwLnYxLkRlbGV0ZVRhc2tSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5EZWxldGVUYXNrUmVzcG9uc2USUQoKVXBkYXRlVGFzaxIgLmVuZ3JhbS5hcHAudjEuVXBkYXRlVGFza1JlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLlVwZGF0ZVRhc2tSZXNwb25zZWIGcHJvdG8z", [file_engram_app_v1_session, file_engram_app_v1_profile, file_engram_app_v1_user]);
 
 /**
  * @generated from message engram.app.v1.CreateTaskRequest
@@ -276,15 +276,18 @@ export type ListTasksRequest = Message<"engram.app.v1.ListTasksRequest"> & {
 
   /**
    * Live session-state filter (e.g. "active", "idle", "dead"). A task matches
-   * when its DISPLAY state — primary session's live status, or "pending" when
-   * no live session is known — is in the set. Empty = no filter.
+   * when its DISPLAY state — the primary session's live status, "pending" when
+   * the task has no session at all, or "dead" when its session is gone from the
+   * control plane — is in the set. Empty = no filter. Nothing matches while
+   * session state is unavailable: the server will not guess a state to filter
+   * on (see session_state_available on the response).
    *
    * @generated from field: repeated string states = 4;
    */
   states: string[];
 
   /**
-   * 1-based page over the filtered, most-recently-active-first ordering.
+   * 1-based page over the filtered ordering.
    * page_size 0 = unpaginated (legacy callers); clamped to 1000 otherwise.
    *
    * @generated from field: int32 page = 5;
@@ -295,6 +298,19 @@ export type ListTasksRequest = Message<"engram.app.v1.ListTasksRequest"> & {
    * @generated from field: int32 page_size = 6;
    */
   pageSize: number;
+
+  /**
+   * "" (default) = band first, then recency inside the band: everything that
+   * needs a person, then everything working, then everything asleep, then
+   * history. This is what a task LIST wants — page one holds the live work.
+   * "recency" = strict most-recently-active-first, for a caller that wants the
+   * newest few whatever their state (the start screen's "Recent"). Under band
+   * order a just-finished task is paged out behind every live one, so a
+   * recency caller must say so rather than re-sorting the page it was given.
+   *
+   * @generated from field: string order = 7;
+   */
+  order: string;
 };
 
 /**
@@ -319,6 +335,22 @@ export type ListTasksResponse = Message<"engram.app.v1.ListTasksResponse"> & {
    * @generated from field: int32 total_count = 2;
    */
   totalCount: number;
+
+  /**
+   * True when the control plane did not answer, so NO task on this response
+   * carries live session state. A task whose `session` is unset is then simply
+   * unknown — it has NOT been collected, and a client must not band, filter, or
+   * draw it as terminal. False on every healthy response, including one where
+   * individual sessions are genuinely gone.
+   *
+   * Stated in the NEGATIVE on purpose. proto3 defaults a bool to false, so the
+   * absent field has to mean "nothing is wrong": a new client reading an old
+   * server's response would otherwise decide the control plane was down and
+   * drop every list to its degraded shape.
+   *
+   * @generated from field: bool session_state_unavailable = 3;
+   */
+  sessionStateUnavailable: boolean;
 };
 
 /**

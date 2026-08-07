@@ -45,11 +45,10 @@ export function MySessions() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-6 p-4 md:p-6">
-      <PageHeading
-        title="My tasks"
-        description="Bounded units of agent work: launch, watch, resume."
-        actions={newTask}
-      />
+      {/* `total`, not the loaded length: the footer already says
+          "50 of 120 tasks", and a masthead that climbed as you scrolled
+          disagreed with it on every page but the last. */}
+      <PageHeading title="My tasks" count={total || undefined} actions={newTask} />
 
       <Input
         value={search}

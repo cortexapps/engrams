@@ -20,12 +20,12 @@ export function ReviewsLayout() {
           came to read, and the ledger already lists every PR. */}
       <Sidebar
         collapsible="none"
-        className="sidebar-section hidden border-r border-sidebar-border md:flex"
+        className="sidebar-section hidden md:flex"
         aria-label="Reviewed pull requests"
       >
         <ReviewsRail />
       </Sidebar>
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <div className="section-sheet flex min-w-0 flex-1 flex-col">
         <Outlet />
       </div>
     </SidebarProvider>

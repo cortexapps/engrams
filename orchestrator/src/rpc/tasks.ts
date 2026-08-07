@@ -255,6 +255,51 @@ export function effectiveTitle(
  * the orchestrator already performs. Only pushed on an actual change, so steady
  * state produces no writes.
  */
+/** One `task_session` row, as the read paths carry it. `createdAt` is the
+ *  tiebreak that makes the primary choice stable across requests. */
+interface SessionRef {
+  sessionId: string;
+  role: string | null;
+  profileId: string | null;
+  createdAt?: Date;
+}
+
+/**
+ * Put the ref that REPRESENTS the task first.
+ *
+ * `task.sessions[0]` is the primary session everywhere downstream — the state
+ * filter, the band, the activity clock, and the row the web draws. The refs
+ * query has no ORDER BY, so without this the representative is whatever
+ * Postgres happened to return first.
+ *
+ * That is not hypothetical on a multi-session task. A PR review keeps its
+ * `finder` ref after the finder session is torn down, then adds a live
+ * `verifier` ref to the SAME task. Lead with the finder and the task reports
+ * `dead` while it is actively reviewing — and lands in a Finished band that is
+ * collapsed by default, so a running review vanishes from the rail.
+ *
+ * The order of preference: the ref explicitly marked `primary`, then any ref
+ * whose session is still live, then the newest ref. The last step is what makes
+ * the result stable rather than merely usually-right — every task ends up with
+ * the same representative on every request.
+ */
+function orderByPrimary(
+  refs: readonly SessionRef[],
+  sessionMap: Map<string, Session>,
+): SessionRef[] {
+  const rank = (ref: SessionRef): number => {
+    if (ref.role === "primary") return 0;
+    if (sessionMap.has(ref.sessionId)) return 1;
+    return 2;
+  };
+  return [...refs].sort(
+    (a, b) =>
+      rank(a) - rank(b) ||
+      (b.createdAt?.getTime() ?? 0) - (a.createdAt?.getTime() ?? 0) ||
+      a.sessionId.localeCompare(b.sessionId),
+  );
+}
+
 function buildTask(
   row: {
     id: string;
@@ -270,7 +315,7 @@ function buildTask(
     model: string | null;
     effort: string | null;
   },
-  sessionRefs: Array<{ sessionId: string; role: string | null; profileId: string | null }>,
+  sessionRefs: readonly SessionRef[],
   sessionMap: Map<string, Session>,
   profileMap: Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string; skills: string[] }>,
   identityMap: Map<string, UserIdentity>,
@@ -279,7 +324,8 @@ function buildTask(
 ): Task {
   // Derive status + the live harness title from the primary session (if available).
   let status = row.status;
-  const primaryRef = sessionRefs.find((r) => r.role === "primary") ?? sessionRefs[0];
+  const ordered = orderByPrimary(sessionRefs, sessionMap);
+  const primaryRef = ordered[0];
   const primarySession = primaryRef ? sessionMap.get(primaryRef.sessionId) : undefined;
   if (primarySession) {
     const mapped = sessionStatusToTaskStatus(primarySession.status);
@@ -311,7 +357,9 @@ function buildTask(
     ? identityMap.get(row.createdByUserId)
     : undefined;
 
-  const sessions: TaskSessionRef[] = sessionRefs.map((ref) => {
+  // ORDERED, so `sessions[0]` is the primary for every consumer — the state
+  // filter, the band, the activity clock, and the web row.
+  const sessions: TaskSessionRef[] = ordered.map((ref) => {
     const liveSession = sessionMap.get(ref.sessionId);
     const snap = ref.profileId != null ? profileMap.get(ref.profileId) : undefined;
     return {
@@ -422,6 +470,69 @@ function buildUnattributedTask(sess: Session): Task {
  * that has not emitted an event yet, and a task with no session at all has
  * neither.
  */
+/**
+ * The band a task sorts into, ahead of its activity clock.
+ *
+ * The list is paged, so ordering by activity alone makes "what is running" a
+ * property of which page you fetched: an org whose tasks are 90% finished (the
+ * steady state — work ends, history accumulates) buries its two live tasks
+ * somewhere in page four. Banding first means page one holds everything that
+ * needs a person, then everything working, then everything asleep, and history
+ * fills whatever room is left and pages on from there.
+ *
+ * The web rail draws these same bands as headers (`useRailSessions.RailBand`).
+ * The two lists must agree — keep them in lockstep.
+ */
+const BAND_RANK: Record<string, number> = {
+  // Asleep: a snapshot (`idle`) or a paused VM (`parked`).
+  parked: 2,
+  idle: 2,
+  // Over.
+  host_lost: 3,
+  completed: 3,
+  failed: 3,
+  dead: 3,
+};
+
+function taskBandRank(task: Task, available: boolean): number {
+  // Waiting on the user, whatever its sandbox is doing (ADR 0107). This one
+  // survives an outage: it is our own task row, not the control plane's.
+  if (task.status === "awaiting_review") return 0;
+  // Everything else is live work — including the states where the platform is
+  // moving the sandbox around (evacuating, evicting, unreachable).
+  return BAND_RANK[displayState(task, available)] ?? 1;
+}
+
+/** No live state for this task, and no honest guess available. Never a real
+ *  `SessionState` — nothing bands, filters, or renders it as a lifecycle. */
+export const UNKNOWN_STATE = "unknown";
+
+/**
+ * The session state the UI shows for a task.
+ *
+ * Absence of a session means two different things, and conflating them is a
+ * bug we have already shipped once in each direction:
+ *
+ *   - `available` — the control plane answered, and this session was not in the
+ *     reply. `ListSessions` is backed by `list_active_sessions`, which returns
+ *     the reserving states plus `idle` and deliberately drops `host_lost` and
+ *     every terminal row. So the sandbox is gone: `dead`. NOT `pending`, which
+ *     would claim a task reaped months ago is about to start.
+ *   - `!available` — the control plane did not answer at all, so EVERY session
+ *     is absent. Calling them dead would bury a whole account's live work in
+ *     the collapsed Finished band on one failed request. We know nothing:
+ *     `UNKNOWN_STATE`.
+ *
+ * A task with no session reference at all is genuinely `pending` either way —
+ * nothing has been created for it yet, which is a fact about our own rows.
+ */
+export function displayState(task: Task, available = true): string {
+  const ref = task.sessions[0];
+  if (!ref) return "pending";
+  if (ref.session) return ref.session.status;
+  return available ? "dead" : UNKNOWN_STATE;
+}
+
 export function taskActivityAt(task: Task): number {
   const session = task.sessions[0]?.session;
   const at = session?.lastEventAt ?? session?.lastActiveAt ?? task.createdAt;
@@ -736,13 +847,15 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         : await db.select().from(taskSessionTable);
 
       // Group session refs by taskId.
-      const refsByTaskId = new Map<
-        string,
-        Array<{ sessionId: string; role: string | null; profileId: string | null }>
-      >();
+      const refsByTaskId = new Map<string, SessionRef[]>();
       for (const ref of sessionRefRows) {
         const existing = refsByTaskId.get(ref.taskId) ?? [];
-        existing.push({ sessionId: ref.sessionId, role: ref.role, profileId: ref.profileId });
+        existing.push({
+          sessionId: ref.sessionId,
+          role: ref.role,
+          profileId: ref.profileId,
+          createdAt: ref.createdAt,
+        });
         refsByTaskId.set(ref.taskId, existing);
       }
 
@@ -753,15 +866,21 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       const knownSessionIds = new Set(sessionRefRows.map((r) => r.sessionId));
 
       // Fetch all live sessions from control plane once.
+      // `sessionStateUnavailable` is the whole point of the try/catch: serving
+      // a task list with no live state is a graceful degrade, but only if the
+      // client is TOLD the state is missing. Silently treating an empty reply
+      // as "every session was collected" turns one failed request into a whole
+      // account of dead tasks.
       let allSessions: Session[] = [];
+      let sessionStateUnavailable = false;
       try {
         const resp = await sessionsClient.listSessions({});
         allSessions = resp.sessions
           .map((item) => item.session)
           .filter((s): s is Session => s != null);
       } catch {
-        // Upstream unavailable — serve with no live session state.
         allSessions = [];
+        sessionStateUnavailable = true;
       }
 
       // Build a map of sessionId → Session for join lookups.
@@ -814,17 +933,27 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
 
       if (req.states.length > 0) {
         const states = new Set(req.states);
-        filteredTasks = filteredTasks.filter((task) => {
-          const displayState = task.sessions[0]?.session?.status ?? "pending";
-          return states.has(displayState);
-        });
+        filteredTasks = filteredTasks.filter((task) =>
+          states.has(displayState(task, !sessionStateUnavailable)),
+        );
       }
 
-      filteredTasks.sort((a, b) => taskActivityAt(b) - taskActivityAt(a));
+      // Recency alone made "is anything running?" a question about which page
+      // you had fetched, so the default bands first. Two callers opt out: one
+      // that asked for `recency` (the start screen wants the newest few
+      // whatever their state), and an outage — with no live state every task
+      // would rank the same, so the bands are a fiction and recency is all we
+      // honestly have.
+      const banded = req.order !== "recency" && !sessionStateUnavailable;
+      filteredTasks.sort((a, b) =>
+        banded
+          ? taskBandRank(a, true) - taskBandRank(b, true) || taskActivityAt(b) - taskActivityAt(a)
+          : taskActivityAt(b) - taskActivityAt(a),
+      );
 
       const totalCount = filteredTasks.length;
       if (req.pageSize <= 0) {
-        return { tasks: filteredTasks, totalCount };
+        return { tasks: filteredTasks, totalCount, sessionStateUnavailable };
       }
 
       const pageSize = Math.min(req.pageSize, 1000);
@@ -833,6 +962,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       return {
         tasks: filteredTasks.slice(offset, offset + pageSize),
         totalCount,
+        sessionStateUnavailable,
       };
     },
 

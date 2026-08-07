@@ -225,7 +225,9 @@ describe("Reviews ledger", () => {
 
     // Two review rows over one PR collapse to a single entry…
     expect(await screen.findByText("Bump quinn-proto from 0.11.14 to 0.11.16")).toBeTruthy();
-    expect(screen.getByText("1 of 1 pull requests")).toBeTruthy();
+    // The count lives in the masthead chip, and only says "of" once a filter
+    // narrows the list.
+    expect(screen.getByText("1 pull request")).toBeTruthy();
     // …and it reports the newer pass's stage, not the older one's.
     expect(screen.getByText("Verifying")).toBeTruthy();
     expect(screen.getByText("2 passes")).toBeTruthy();
@@ -263,9 +265,63 @@ describe("Reviews ledger", () => {
     ];
     renderWithProviders(<Reviews />);
 
-    expect(await screen.findByText("2 of 2 pull requests")).toBeTruthy();
+    expect(await screen.findByText("2 pull requests")).toBeTruthy();
     expect(screen.getByText("Trim the firecracker CI lane")).toBeTruthy();
     expect(screen.getByText("3 passes")).toBeTruthy();
+  });
+
+  // A review is about somebody's change: whose it is, what state that change is
+  // in, and how big it is all decide whether a reader opens the row.
+  it("carries the pull request's state, author and size on the row", async () => {
+    renderWithProviders(<Reviews />);
+
+    expect(await screen.findByText("dependabot[bot]")).toBeTruthy();
+    expect(screen.getByText("+12 −4")).toBeTruthy();
+    // The state is a shape, so the word goes to assistive tech only.
+    expect(screen.getByText("Open pull request")).toBeTruthy();
+  });
+
+  // The bar is aria-hidden and the count beside it is a bare figure, so the
+  // breakdown the four chips used to spell out has to be announced somewhere.
+  it("announces the severity breakdown the bar draws", async () => {
+    renderWithProviders(<Reviews />);
+
+    expect(await screen.findByText(/findings: 1 high/)).toBeTruthy();
+  });
+
+  // "no findings" on a pass that has not read the diff yet is a false statement
+  // about the code, not a summary of it.
+  it("says nothing about findings until a pass has looked", async () => {
+    const noCounts = { critical: 0, high: 0, medium: 0, low: 0, total: 0 };
+    view.others = [
+      {
+        ...newerPass,
+        id: "review-5",
+        targetId: "target-300",
+        prNumber: 300,
+        prTitle: "Still reading the diff",
+        status: "finding",
+        active: true,
+        findingCounts: noCounts,
+        createdAt: { seconds: 4000n, nanos: 0 },
+      },
+      {
+        ...newerPass,
+        id: "review-6",
+        targetId: "target-301",
+        prNumber: 301,
+        prTitle: "Nothing to report",
+        status: "posted",
+        active: false,
+        findingCounts: noCounts,
+        createdAt: { seconds: 3900n, nanos: 0 },
+      },
+    ];
+    renderWithProviders(<Reviews />);
+
+    // Only the finished pass claims zero. The running one stays silent.
+    await screen.findByText("Still reading the diff");
+    expect(screen.getAllByText("none")).toHaveLength(1);
   });
 
   it("falls back to the PR number when no title was captured", async () => {
@@ -334,8 +390,10 @@ describe("Review dossier", () => {
     // The leading group is small, so it arrives open — no clicks for the common case.
     expect(await screen.findByText("Unchecked value reaches the caller")).toBeTruthy();
     expect(screen.getByText("The validated value is dropped.")).toBeTruthy();
-    // The verifier is attributed, and carries its own confidence.
-    expect(screen.getByText(/Verifier confirmed this/)).toBeTruthy();
+    // The verifier is attributed, and carries its own confidence. It does NOT
+    // restate the verdict: the group heading above already says these were
+    // confirmed, and a band repeating it on every card was most of the noise.
+    expect(screen.getByText(/Verifier · high confidence/)).toBeTruthy();
     expect(screen.getByText("Reproduced from the diff.")).toBeTruthy();
   });
 
@@ -375,11 +433,16 @@ describe("Review dossier", () => {
     expect(await screen.findByText("src/validate.ts")).toBeTruthy();
   });
 
-  it("states the ratio only when the verifier killed something", async () => {
+  // 3 findings, 1 refuted. The refuted group's own count carries that, so the
+  // sentence that used to restate it above the ledger is gone. Deliberately
+  // silent about what "stands": an unverified finding never posts, so counting
+  // it as surviving would overstate.
+  it("counts the refuted findings against the whole pass", async () => {
     renderWithProviders(<ReviewDossier />);
-    // 3 findings, 1 refuted. Deliberately silent about what "stands": an
-    // unverified finding never posts, so counting it as surviving would overstate.
-    expect(await screen.findByText("The verifier refuted 1 of 3.")).toBeTruthy();
+
+    await screen.findByText("Refuted by the verifier");
+    expect(screen.getByText("1 of 3")).toBeTruthy();
+    expect(screen.queryByText(/The verifier refuted/)).toBeNull();
   });
 
   it("says why there is nothing to show instead of drawing an empty box", async () => {
@@ -399,13 +462,15 @@ describe("Review dossier", () => {
 
     expect(screen.queryByText("Cloning repository")).toBeNull();
     const control = await screen.findByRole("button", { name: /Posted — show the activity log/i });
-    // The terminal state, plus the step count behind it.
+    // The terminal state, and only that. A bare "4" beside it was an unlabelled
+    // figure; the step count belongs to the log it counts.
     expect(control.textContent).toMatch(/Posted/);
-    expect(control.textContent).toMatch(/4/);
+    expect(control.textContent).not.toMatch(/4/);
 
     await user.click(control);
     expect(await screen.findByText("Cloning repository")).toBeTruthy();
     expect(screen.getByText("Reviewing changes")).toBeTruthy();
+    expect(screen.getByText(/4 steps/)).toBeTruthy();
   });
 
   // Live, the step says more than the stage word does: "Reviewing changes" beats
@@ -430,8 +495,11 @@ describe("Review dossier", () => {
     // The sheet mounts on the finder and offers the way out to the full page.
     const full = await screen.findByRole("link", { name: /Full session/i });
     expect(full.getAttribute("href")).toContain("/sessions/finder-sess-1");
-    expect(screen.getByRole("button", { name: "Finder" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Verifier" })).toBeTruthy();
+    // The role switcher is stock shadcn Tabs now, so the triggers carry
+    // role="tab" — the correct ARIA for a tablist, and what a screen reader
+    // announces. The old hand-rolled buttons only ever reported "button".
+    expect(screen.getByRole("tab", { name: "Finder" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "Verifier" })).toBeTruthy();
   });
 
   it("switches the sheet between the finder and the verifier", async () => {
@@ -441,7 +509,7 @@ describe("Review dossier", () => {
     await user.click(await screen.findByRole("button", { name: "Sessions" }));
     await screen.findByRole("link", { name: /Full session/i });
 
-    await user.click(screen.getByRole("button", { name: "Verifier" }));
+    await user.click(screen.getByRole("tab", { name: "Verifier" }));
     expect(screen.getByRole("link", { name: /Full session/i }).getAttribute("href")).toContain(
       "/sessions/verifier-sess-1",
     );

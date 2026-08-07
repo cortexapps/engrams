@@ -37,9 +37,7 @@ export function ProviderCard({
       <div className="flex items-start gap-3">
         <ProviderTile {...view.icon} name={view.name} size={42} />
         <div className="min-w-0 flex-1">
-          <div className="font-display text-[0.98rem] font-semibold [font-stretch:108%]">
-            {view.name}
-          </div>
+          <div className="text-[0.98rem] font-semibold">{view.name}</div>
           <Text variant="label" tone="muted" className="text-[0.56rem]">
             {view.category}
           </Text>
@@ -49,7 +47,7 @@ export function ProviderCard({
         ) : view.status === "needs_reconnect" ? (
           <StatusDot tone="caution" label="reconnect" />
         ) : (
-          <span className="font-display text-[0.56rem] font-semibold tracking-[0.08em] text-muted-foreground/80 uppercase">
+          <span className="text-[0.7rem] font-medium capitalize text-muted-foreground">
             {view.builtin ? "built-in" : view.credentialSource}
           </span>
         )}

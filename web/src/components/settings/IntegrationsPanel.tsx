@@ -59,8 +59,6 @@ export function IntegrationsPanel() {
     <div className="space-y-6">
       <PageHeading
         title="Integrations"
-        eyebrow="Org · Connectors"
-        description="Connect a provider once; its powers become grantable to any profile. Sessions reach only what a granted power requires — credentials stay brokered or minted, never copied into the sandbox."
         actions={
           <Button variant="outline" size="sm" onClick={() => setCustom(true)}>
             <PlusIcon className="size-3.5" />
@@ -83,7 +81,7 @@ export function IntegrationsPanel() {
       </div>
 
       {error != null && (
-        <p className="text-sm text-destructive">could not load integrations — {String(error)}</p>
+        <p className="text-sm text-destructive">Could not load integrations — {String(error)}</p>
       )}
 
       {isLoading ? (

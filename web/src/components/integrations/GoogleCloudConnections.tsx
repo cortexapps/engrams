@@ -490,7 +490,7 @@ export function GoogleCloudEndpointDialog({
             value={endpointSelection.custom}
             onChange={endpointSelection.setCustom}
           />
-          <p className="rounded-md border border-amber-500/30 bg-amber-500/[0.07] p-3 text-xs text-muted-foreground">
+          <p className="rounded-md border border-instrument-caution/30 bg-instrument-caution/[0.07] p-3 text-xs text-muted-foreground">
             Saving disables this connection and clears its test result. Test and enable it again
             before you launch a new session. Existing sessions keep their stamped configuration.
           </p>

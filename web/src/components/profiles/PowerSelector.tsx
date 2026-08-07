@@ -84,7 +84,7 @@ export function PowerSelector({
         </Text>
         <button
           type="button"
-          className="font-display text-[0.64rem] font-semibold tracking-[0.06em] text-primary uppercase"
+          className="text-xs font-semibold text-foreground underline underline-offset-4 decoration-border hover:decoration-current"
           onClick={() => reads.forEach((c) => onToggle(c.action, true))}
         >
           All reads
@@ -92,7 +92,7 @@ export function PowerSelector({
         {granted > 0 && (
           <button
             type="button"
-            className="font-display text-[0.64rem] font-semibold tracking-[0.06em] text-primary uppercase"
+            className="text-xs font-semibold text-foreground underline underline-offset-4 decoration-border hover:decoration-current"
             onClick={() => view.capabilities.forEach((c) => onToggle(c.action, false))}
           >
             Clear
@@ -174,7 +174,7 @@ function AccessPill({
       aria-pressed={on}
       aria-label={`${on ? "Granted" : "Grant"} ${label.toLowerCase()}`}
       className={cn(
-        "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-display text-[0.6rem] font-semibold tracking-[0.07em] uppercase transition-colors",
+        "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[0.7rem] font-medium capitalize transition-colors",
         on
           ? write
             ? "border-instrument-caution/55 bg-instrument-caution/15 text-foreground"

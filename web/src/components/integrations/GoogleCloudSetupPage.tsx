@@ -82,9 +82,7 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
           </span>
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
-              <h1 className="font-display text-2xl font-semibold [font-stretch:108%]">
-                Set up {connection.displayName}
-              </h1>
+              <h1 className="text-2xl font-semibold">Set up {connection.displayName}</h1>
               <Badge variant={enabled ? "default" : "secondary"}>
                 {enabled ? "Enabled" : tested ? "Tested" : "Setup required"}
               </Badge>
@@ -99,9 +97,7 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
       <div className="grid min-w-0 gap-5 lg:grid-cols-[18rem_minmax(0,1fr)]">
         <aside className="space-y-4">
           <section className="rounded-lg border bg-card p-4">
-            <h2 className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">
-              Progress
-            </h2>
+            <h2 className="text-xs font-semibold text-muted-foreground">Progress</h2>
             <ol className="mt-4 space-y-4">
               <ProgressStep complete title="Connection created" detail={connection.alias} />
               <ProgressStep
@@ -121,9 +117,7 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
 
           <section className="rounded-lg border bg-card p-4">
             <div className="flex items-center justify-between gap-3">
-              <h2 className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">
-                Connection boundary
-              </h2>
+              <h2 className="text-xs font-semibold text-muted-foreground">Connection boundary</h2>
               <Button variant="ghost" size="sm" onClick={() => setEditingEndpoints(true)}>
                 Edit APIs
               </Button>

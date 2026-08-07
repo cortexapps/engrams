@@ -125,35 +125,3 @@ export function groupByOutcome(judged: readonly JudgedFinding[]): OutcomeGroup[]
     items: groups.get(outcome)!.sort(bySeverityThenConfidence),
   }));
 }
-
-/**
- * The trust signal: how much of what the finder reported survived the verifier.
- * `kept` counts everything still standing — posted or visible here only — which
- * is the honest denominator for "should I believe this pass".
- */
-export interface KeptRatio {
-  kept: number;
-  total: number;
-  refuted: number;
-  posted: number;
-}
-
-export function keptRatio(judged: readonly JudgedFinding[]): KeptRatio {
-  let refuted = 0;
-  let posted = 0;
-  for (const item of judged) {
-    if (item.outcome === "refuted") refuted++;
-    if (item.outcome === "posted") posted++;
-  }
-  return { kept: judged.length - refuted, total: judged.length, refuted, posted };
-}
-
-/**
- * A pass that never reached posting leaves every finding at `candidate` — only
- * `postReviewResults` advances them. So a failed or still-running pass shows
- * candidates, and calling those "not posted, over the cap" would be a lie about
- * why. Callers use this to say "not judged yet" instead.
- */
-export function isUnresolvedPass(review: Review): boolean {
-  return review.status !== "posted";
-}

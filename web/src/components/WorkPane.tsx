@@ -51,7 +51,12 @@ export interface PaneViewDef {
   icon: ComponentType<{ className?: string }>;
 }
 
-const TAB_CLASS_NAME = "h-8 shrink-0 gap-1.5 px-2 text-muted-foreground";
+// The tab always shows its icon — that is what survives the icon-only stage,
+// and it is what the eye finds before it reads a word. The active tab is named
+// by FILL, not by a rule: on the cover the pill is two clear steps above the
+// pane, which reads at a glance where a 2px underline does not.
+const TAB_CLASS_NAME = "h-8 shrink-0 gap-1.5 px-2 text-muted-foreground hover:text-foreground";
+const TAB_ACTIVE_CLASS_NAME = "bg-accent text-foreground shadow-xs hover:bg-accent";
 
 export interface StripLayout {
   /** Number of tabs rendered in the strip; the rest live in the More menu. */
@@ -141,7 +146,7 @@ function PaneTab({
     <Button
       variant="ghost"
       size="sm"
-      className={cn(TAB_CLASS_NAME, active && "bg-accent text-foreground")}
+      className={cn(TAB_CLASS_NAME, active && TAB_ACTIVE_CLASS_NAME)}
       aria-label={view.label}
       aria-pressed={active}
       title={view.label}
@@ -169,7 +174,7 @@ function MoreViewsMenu({
         <Button
           variant="ghost"
           size="sm"
-          className={cn(TAB_CLASS_NAME, activeTab && "bg-accent text-foreground")}
+          className={cn(TAB_CLASS_NAME, activeTab && TAB_ACTIVE_CLASS_NAME)}
           aria-label="More views"
           aria-pressed={activeTab !== null}
           title="More views"
@@ -319,7 +324,18 @@ export function WorkPane({
   }, [effectiveTab, open]);
 
   return (
-    <section className="flex h-full min-h-0 flex-col bg-background" aria-label="Work pane">
+    // `work-pane` re-tones this whole subtree to the cover (see index.css): the
+    // pane is cut from the chrome rather than from the page, so in light mode
+    // the bright thread is flanked by dark chrome and is plainly the subject.
+    // The panel variant is a lifted sheet of its own; the overlay variant fills
+    // a sheet that already has its own edges.
+    <section
+      className={cn(
+        "work-pane flex h-full min-h-0 flex-col bg-pane",
+        variant === "panel" && "work-sheet overflow-hidden rounded-xl border",
+      )}
+      aria-label="Work pane"
+    >
       <header className="flex h-11 shrink-0 items-center justify-between gap-1 border-b px-1.5">
         <div ref={stripRef} className="relative flex min-w-0 flex-1 items-center gap-0.5">
           <div

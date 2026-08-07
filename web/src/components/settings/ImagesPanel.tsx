@@ -97,11 +97,7 @@ export function ImagesPanel() {
 
   return (
     <div className="space-y-6">
-      <PageHeading
-        title="Images"
-        description="OCI URIs tasks may reference. The manifest is cached on enable; refresh when tags move."
-        actions={<EnableImageDialog />}
-      />
+      <PageHeading title="Images" actions={<EnableImageDialog />} />
 
       {visibleJobs.length > 0 && (
         <ul className="space-y-2 mb-6">
@@ -121,7 +117,7 @@ export function ImagesPanel() {
 
       {error && (
         <p className="text-sm text-destructive">
-          could not load enabled images — {errorMessage(error)}
+          Could not load enabled images — {errorMessage(error)}
         </p>
       )}
 
@@ -247,12 +243,12 @@ function ImageRow({ row }: { row: EnabledImageSummary }) {
         </div>
         {refresh.error && (
           <p className="mt-1 text-right text-xs text-destructive">
-            could not refresh — {errorMessage(refresh.error)}
+            Could not refresh — {errorMessage(refresh.error)}
           </p>
         )}
         {del.error && (
           <p className="mt-1 text-right text-xs text-destructive">
-            could not disable — {errorMessage(del.error)}
+            Could not disable — {errorMessage(del.error)}
           </p>
         )}
       </TableCell>
@@ -1278,7 +1274,7 @@ function StageTimeline({
   }
   return (
     <div className="flex flex-wrap items-center gap-x-1 gap-y-0.5 text-xs text-muted-foreground">
-      <span className="uppercase tracking-wide text-[10px]">{label}</span>
+      <span className="text-[0.7rem] font-medium">{label}</span>
       {stages.map((s, i) => {
         const open = s.ended_at === null;
         const d = stageDurationMs(s);

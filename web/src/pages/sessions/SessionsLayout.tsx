@@ -56,17 +56,20 @@ export function SessionsLayout() {
     // transcript alike. `min-h-0` neutralises the provider's base `min-h-svh`.
     <SidebarProvider className="h-[calc(100svh-3rem)] min-h-0 md:h-svh">
       {/* desktop (md+): the persistent sessions rail */}
-      <Sidebar
-        collapsible="none"
-        className="sidebar-section hidden shrink-0 border-r border-sidebar-border md:flex"
-      >
+      <Sidebar collapsible="none" className="sidebar-section hidden shrink-0 md:flex">
         <SessionsRail />
         {/* Owns the whole width preference itself: a drag writes the CSS var to
             the DOM, so it never re-renders this layout — which renders the rail
             list AND the route Outlet (the transcript). */}
         <SidebarResizeHandle storageKey={RAIL_WIDTH_STORAGE_KEY} label="Resize task list" />
       </Sidebar>
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      {/* The list views are one page, so they lift as one sheet. A transcript
+          is two working surfaces — the thread and the work pane — so it builds
+          its own pair of sheets and this container stays a plain region on the
+          cover. */}
+      <div
+        className={cn("flex min-w-0 flex-1 flex-col overflow-hidden", !onDetail && "section-sheet")}
+      >
         {/* mobile (<md): horizontal scope strip — the rail is desktop-only, and
             we hide it inside a transcript so it doesn't crowd the detail view. */}
         {!onDetail && (

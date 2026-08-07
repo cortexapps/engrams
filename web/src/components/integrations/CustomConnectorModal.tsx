@@ -773,9 +773,7 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
                   {...(logoUrl ? { logo: logoUrl } : {})}
                   size={28}
                 />
-                <span className="font-display text-sm font-semibold">
-                  {name.trim() || "Provider"}
-                </span>
+                <span className="text-sm font-semibold">{name.trim() || "Provider"}</span>
               </span>
               <span className="h-5 w-px bg-border" />
               <span className="inline-flex items-center gap-2 text-sm">

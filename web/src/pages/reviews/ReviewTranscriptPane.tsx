@@ -8,7 +8,7 @@ import { SessionThread } from "../../components/session-thread/SessionThread";
 import { StatusGlyph } from "../../components/Glyph";
 import { statusLabel } from "../sessions/session-format";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 export type WorkerRole = "finder" | "verifier";
 
@@ -55,26 +55,18 @@ export function ReviewTranscriptPane({
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="flex shrink-0 items-center gap-1 border-b px-2 py-1.5">
-        {/* Typeset tabs rather than a segmented control: two roles, and the
-            active one is named by weight plus a lime rule, matching TabRow. */}
-        <nav className="flex items-baseline gap-3" aria-label="Worker session">
-          {roles.map((r) => (
-            <button
-              key={r}
-              type="button"
-              onClick={() => onChangeRole(r)}
-              aria-current={r === role ? "true" : undefined}
-              className={cn(
-                "border-b-2 pb-1 font-display text-[0.7rem] font-medium uppercase tracking-[0.1em] transition-colors",
-                r === role
-                  ? "border-primary text-foreground"
-                  : "border-transparent text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {ROLE_LABEL[r]}
-            </button>
-          ))}
-        </nav>
+        {/* Stock shadcn Tabs. Two roles, so the segmented pill is the right
+            control — and it is the same tab component every other surface in
+            the app now uses. */}
+        <Tabs value={role} onValueChange={(v) => onChangeRole(v as WorkerRole)}>
+          <TabsList aria-label="Worker session" className="h-8">
+            {roles.map((r) => (
+              <TabsTrigger key={r} value={r} className="px-3 text-xs">
+                {ROLE_LABEL[r]}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </Tabs>
 
         <div className="ml-auto flex items-center gap-1">
           {sessionId && (

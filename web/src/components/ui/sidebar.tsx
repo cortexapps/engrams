@@ -292,13 +292,16 @@ function SidebarResizeHandle({
       aria-valuemin={min}
       aria-valuemax={max}
       tabIndex={0}
-      // Straddles the rail's border so the hairline itself is the grab target;
-      // the ::after line lifts to the accent on hover/focus/drag, the same
-      // "accent marks the live thing" grammar as ResizableHandle.
+      // The same control as `ResizableHandle`, which splits the panes on the
+      // other side of the page: nothing at rest, a lime pill under the pointer,
+      // solid while dragging. Keep the two in step — one page must not carry
+      // two different-looking drag handles. The tone is the rail's own ring
+      // rather than `--primary`: the pill straddles the rail's edge, and that
+      // lime is the one tuned to stay legible on the dark spine.
       className={cn(
         "absolute inset-y-0 -right-1 z-20 hidden w-2 cursor-col-resize touch-none select-none md:block",
-        "after:absolute after:inset-y-0 after:left-1/2 after:w-px after:-translate-x-1/2 after:transition-colors",
-        "hover:after:bg-sidebar-ring focus-visible:outline-none focus-visible:after:bg-sidebar-ring",
+        "after:absolute after:inset-y-0 after:left-1/2 after:w-2 after:-translate-x-1/2 after:rounded-full after:transition-colors",
+        "hover:after:bg-sidebar-ring/60 focus-visible:outline-none focus-visible:after:bg-sidebar-ring",
         "data-[dragging=true]:after:bg-sidebar-ring",
         className,
       )}
@@ -550,7 +553,17 @@ function SidebarContent({ className, ...props }: React.ComponentProps<"div">) {
       data-slot="sidebar-content"
       data-sidebar="content"
       className={cn(
-        "flex min-h-0 flex-1 flex-col gap-2 overflow-auto group-data-[collapsible=icon]:overflow-hidden",
+        // `scrollbar-gutter: stable` reserves the gutter whether or not the
+        // scrollbar is there. Without it, a rail that grows past its own height
+        // — expanding a group, a task arriving — takes the scrollbar's width
+        // out of the content and every row jumps sideways.
+        //
+        // Released again in icon mode. `overflow: hidden` is still a scroll
+        // container, so the gutter survives it — and where scrollbars are
+        // classic rather than overlay that is ~15px out of a 3rem rail, enough
+        // to clip the 2rem menu buttons it collapses to.
+        "flex min-h-0 flex-1 flex-col gap-2 overflow-auto [scrollbar-gutter:stable]",
+        "group-data-[collapsible=icon]:overflow-hidden group-data-[collapsible=icon]:[scrollbar-gutter:auto]",
         className,
       )}
       {...props}
@@ -581,8 +594,8 @@ function SidebarGroupLabel({
       data-slot="sidebar-group-label"
       data-sidebar="group-label"
       className={cn(
-        // The instrument-label voice (Saira tracked caps), toned to the dark
-        // spine. Same label vocabulary as table headers / stat captions.
+        // The shared label voice, toned to the dark cover. Same vocabulary as
+        // table headers and stat captions.
         textVariants({ variant: "label" }),
         "flex h-8 shrink-0 items-center rounded-md px-2 text-sidebar-foreground/70 ring-sidebar-ring outline-hidden transition-[margin,opacity] duration-200 ease-linear focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
         "group-data-[collapsible=icon]:-mt-8 group-data-[collapsible=icon]:opacity-0",

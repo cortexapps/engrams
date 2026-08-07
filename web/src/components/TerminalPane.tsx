@@ -139,7 +139,7 @@ export function TerminalPane({ sessionId }: TerminalPaneProps) {
       } catch (e) {
         if (!disposed) {
           setStatus("error");
-          setErrorMessage(`failed to load terminal renderer: ${e}`);
+          setErrorMessage(`Failed to load terminal renderer: ${e}`);
         }
         return;
       }

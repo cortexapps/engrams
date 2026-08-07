@@ -8,33 +8,30 @@ import { cn } from "@/lib/utils";
 //   variant — the typographic ROLE (what font/size/weight/tracking).
 //   tone    — the COLOR role (which ink token).
 //
-// `label` is the instrument-label voice: Saira (the display font) in tracked
-// caps, NOT uppercased mono. That's what carries the racing identity at the
-// label layer and frees mono to mean "machine data". Weight is 500, not 600 —
-// a caption should recede beneath the figure it labels, not compete with it.
-// Tracking is em-based so one value holds across the 0.62–0.72rem label range.
+// `label` is a small, semibold, sentence-case caption — every table header,
+// tab, and section caption in the app. NOT tracked caps: caps are a stress
+// voice that works on one thing per page and turns to noise on twenty.
 //
 // `stat` is its partner: oversized tabular mono for the figure. The
 // variant/tone split is the whole point of the gauge — a dark mono number
-// (tone=default) under a quiet Saira caption (variant=label, tone=muted).
+// (tone=default) under a quiet caption (variant=label, tone=muted).
 const textVariants = cva("", {
   variants: {
     variant: {
       // Page-title masthead voice (the PageHeading h1 lives here).
-      display:
-        "font-display text-3xl leading-tight font-semibold tracking-tight text-balance [font-stretch:108%]",
+      display: "text-2xl leading-tight font-semibold tracking-tight text-balance",
       // The masthead title when the page's subject IS machine data (a session
       // id, a digest): the mono lab-readout voice. NOT tracking-tight — negative
       // spacing on a long hex id runs the glyphs together (worse on the dark
       // ground); monospace wants its native advance, so tracking stays normal
       // and the size sits a notch below `display` so a 36-char id reads as a
       // legible title, not a cramped wall.
-      displayMono: "font-mono text-xl leading-tight tracking-normal",
-      heading: "font-display text-lg leading-snug font-semibold tracking-tight",
+      displayMono: "font-mono text-lg leading-tight tracking-normal",
+      heading: "text-base leading-snug font-semibold tracking-tight",
       body: "text-sm leading-relaxed",
-      // Instrument label / eyebrow / table header / tab. Callers set color via
-      // `tone` and may override size; the default 0.7rem fits most labels.
-      label: "font-display text-[0.7rem] leading-none font-medium tracking-[0.1em] uppercase",
+      // Section caption / table header / tab. Callers set color via `tone` and
+      // may override size.
+      label: "text-xs leading-none font-semibold",
       // The figure in a gauge: big, aligned, machine.
       stat: "font-mono text-2xl leading-none tabular-nums",
       code: "font-mono text-[0.8rem]",

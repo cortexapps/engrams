@@ -214,8 +214,6 @@ export function Papercuts() {
     <div className="flex flex-col gap-6">
       <PageHeading
         title="Papercuts"
-        eyebrow="Kaizen · Agent feedback"
-        description="Small frictions agents encounter while working, collected so they can be fixed deliberately."
         actions={
           <label htmlFor="show-archived-papercuts" className="flex items-center gap-2 text-sm">
             <Switch

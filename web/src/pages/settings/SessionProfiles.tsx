@@ -113,7 +113,7 @@ function Row({
       </span>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <span className="font-display text-base font-semibold">{p.name}</span>
+          <span className="text-base font-semibold">{p.name}</span>
           {p.archived && <Badge variant="secondary">archived</Badge>}
         </div>
         <div className="truncate text-[0.82rem] text-muted-foreground">{p.description}</div>
@@ -240,8 +240,7 @@ export function SessionProfiles() {
     <div className="flex flex-col gap-6">
       <PageHeading
         title="Profiles"
-        eyebrow="Org · Session starting points"
-        description="A profile is a ready-made launch: an image plus the powers, network, and credentials its sessions get. Developers pick one and go."
+        count={active.length || undefined}
         actions={
           <Button asChild size="sm">
             <Link to="/settings/profiles/new">

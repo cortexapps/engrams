@@ -54,7 +54,7 @@ export function BrowserPane({ sessionId }: BrowserPaneProps) {
       } catch (e) {
         if (!disposed) {
           setStatus("error");
-          setErrorMessage(`failed to load browser viewer: ${e}`);
+          setErrorMessage(`Failed to load browser viewer: ${e}`);
         }
         return;
       }

@@ -10,7 +10,7 @@ import { Gauge, type Tone, type Zone } from "../../components/gauge";
 import { Text } from "@/components/ui/text";
 import { cn } from "@/lib/utils";
 import { deriveHealthMetrics, operatorIssues, type HealthMetrics } from "../../operator-health";
-import { RESIDENT_SESSION_STATES, type SessionListItem } from "../../lib/types";
+import { RESIDENT_SESSION_STATES, UNKNOWN_STATE, type SessionListItem } from "../../lib/types";
 
 // The Operator cockpit: a read-only instrument cluster that answers "is the
 // platform healthy?" in one read, then hands off to the detail surfaces. The
@@ -53,8 +53,10 @@ export function Overview() {
   // Resident = the VM exists and holds host RAM (parked/paused included) —
   // an Active-only count read "0 live sandboxes" on a fleet full of parked
   // VMs (status-set audit finding 8).
-  const liveSandboxes = s.filter((x: SessionListItem) =>
-    RESIDENT_SESSION_STATES.has(x.status),
+  // An `unknown` row (the control plane did not answer) is not counted as
+  // resident: we cannot claim a VM holds RAM when we could not ask.
+  const liveSandboxes = s.filter(
+    (x: SessionListItem) => x.status !== UNKNOWN_STATE && RESIDENT_SESSION_STATES.has(x.status),
   ).length;
   const gcPending = storage?.gc_pending ?? 0;
 
@@ -83,10 +85,7 @@ export function Overview() {
 
   return (
     <div className="space-y-8">
-      <PageHeading
-        title="Operator"
-        description="Fleet capacity and storage durability at a glance."
-      />
+      <PageHeading title="Operator" />
 
       <VerdictBanner verdict={verdict} />
 

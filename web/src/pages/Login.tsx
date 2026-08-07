@@ -96,9 +96,7 @@ export function Login() {
         {/* Identity mark */}
         <div className="flex flex-col items-center gap-2">
           <EngramMark size={48} mode="static" />
-          <span className="font-display text-sm font-semibold tracking-widest text-muted-foreground uppercase">
-            engrams
-          </span>
+          <span className="text-base font-semibold tracking-tight">engrams</span>
         </div>
 
         {authConfig === undefined ? (

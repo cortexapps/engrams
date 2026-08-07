@@ -138,9 +138,7 @@ function AutomationRow({
         className="group min-w-0 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
       >
         <div className="flex flex-wrap items-center gap-2">
-          <span className="font-display text-base font-semibold group-hover:underline">
-            {automation.name}
-          </span>
+          <span className="text-base font-semibold group-hover:underline">{automation.name}</span>
           <StatusBadge status={runs.data?.runs[0]?.status ?? ""} />
         </div>
         {automation.description && (
@@ -497,8 +495,6 @@ export function Automations() {
     <div className="space-y-8">
       <PageHeading
         title="Automations"
-        eyebrow="Org · Unattended launches"
-        description="Turn schedules and verified webhook events into sessions. Each automation stays inspectable: one trigger, one profile, one rendered prompt."
         actions={
           <Button asChild size="sm">
             <Link to="/settings/automations/new">
@@ -512,7 +508,7 @@ export function Automations() {
       <section className="space-y-3" aria-labelledby="automation-list-heading">
         <div className="flex items-center gap-2">
           <RadioTowerIcon className="size-4 text-muted-foreground" />
-          <h2 id="automation-list-heading" className="font-display font-semibold">
+          <h2 id="automation-list-heading" className="font-semibold">
             Active automations
           </h2>
           <span className="font-mono text-xs text-muted-foreground">
@@ -553,7 +549,7 @@ export function Automations() {
           <div>
             <div className="flex items-center gap-2">
               <WebhookIcon className="size-4 text-muted-foreground" />
-              <h2 id="webhook-list-heading" className="font-display font-semibold">
+              <h2 id="webhook-list-heading" className="font-semibold">
                 Webhook registrations
               </h2>
             </div>

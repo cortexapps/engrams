@@ -122,18 +122,40 @@ message ListTasksRequest {
   // for unattributed rows. OR within the field; empty = no owner filter.
   repeated string created_by_user_ids = 3;
   // Live session-state filter (e.g. "active", "idle", "dead"). A task matches
-  // when its DISPLAY state — primary session's live status, or "pending" when
-  // no live session is known — is in the set. Empty = no filter.
+  // when its DISPLAY state — the primary session's live status, "pending" when
+  // the task has no session at all, or "dead" when its session is gone from the
+  // control plane — is in the set. Empty = no filter. Nothing matches while
+  // session state is unavailable: the server will not guess a state to filter
+  // on (see session_state_available on the response).
   repeated string states = 4;
-  // 1-based page over the filtered, most-recently-active-first ordering.
+  // 1-based page over the filtered ordering.
   // page_size 0 = unpaginated (legacy callers); clamped to 1000 otherwise.
   int32 page = 5;
   int32 page_size = 6;
+  // "" (default) = band first, then recency inside the band: everything that
+  // needs a person, then everything working, then everything asleep, then
+  // history. This is what a task LIST wants — page one holds the live work.
+  // "recency" = strict most-recently-active-first, for a caller that wants the
+  // newest few whatever their state (the start screen's "Recent"). Under band
+  // order a just-finished task is paged out behind every live one, so a
+  // recency caller must say so rather than re-sorting the page it was given.
+  string order = 7;
 }
 
 message ListTasksResponse {
   repeated Task tasks = 1;
   int32 total_count = 2; // matches BEFORE pagination
+  // True when the control plane did not answer, so NO task on this response
+  // carries live session state. A task whose `session` is unset is then simply
+  // unknown — it has NOT been collected, and a client must not band, filter, or
+  // draw it as terminal. False on every healthy response, including one where
+  // individual sessions are genuinely gone.
+  //
+  // Stated in the NEGATIVE on purpose. proto3 defaults a bool to false, so the
+  // absent field has to mean "nothing is wrong": a new client reading an old
+  // server's response would otherwise decide the control plane was down and
+  // drop every list to its degraded shape.
+  bool session_state_unavailable = 3;
 }
 
 message GetTaskRequest {

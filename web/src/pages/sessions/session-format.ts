@@ -1,4 +1,4 @@
-import type { SessionState } from "../../lib/types";
+import type { ListRowState } from "../../lib/types";
 
 export function shortId(id: string): string {
   return id.length <= 12 ? id : `${id.slice(0, 8)}…`;
@@ -28,6 +28,6 @@ export function compareSessions(a: Sortable, b: Sortable): number {
 // values; humanize the underscores so the column reads as language, not code.
 // The glyph (components/Glyph.tsx) carries tone/shape; this carries the word —
 // together they are the product's status vocabulary (glyph + text label).
-export function statusLabel(s: SessionState): string {
+export function statusLabel(s: ListRowState): string {
   return s.replace(/_/g, " ");
 }

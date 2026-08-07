@@ -285,8 +285,10 @@ export function SessionDetail() {
   }, [events]);
   useDocumentTitle(needsAttention ? `\u25cf ${taskTitle ?? shortId(id)} — engrams` : null);
 
-  // The slim masthead spans the transcript and work pane. View switching stays
-  // in the work pane header so this row only carries session identity.
+  // The masthead is the thread sheet's own header, not a band spanning both
+  // surfaces — the thread and the work pane are two separate sheets now, and a
+  // header bridging them would glue them back together. View switching stays in
+  // the work pane header, so this row only carries session identity.
   const masthead = (
     <header className="flex h-12 shrink-0 items-center gap-2 border-b px-4">
       <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -351,15 +353,19 @@ export function SessionDetail() {
     </header>
   );
 
+  // The thread sheet: the conversation is the subject of this page, so it is
+  // the lightest, most raised surface on screen. It carries its own masthead.
   const leftColumn = (
-    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+    <div className="work-sheet flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border bg-background">
+      {masthead}
       <div className="min-h-0 flex-1 overflow-hidden">{transcript}</div>
     </div>
   );
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      {masthead}
+    // The 8px gutter is the cover showing between the two sheets. Without it
+    // the shadows have nothing to fall onto and the lift disappears.
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-2">
       <div className="flex min-h-0 flex-1 overflow-hidden">
         {isMobile ? (
           <>
@@ -419,7 +425,10 @@ export function SessionDetail() {
               {leftColumn}
             </ResizablePanel>
 
-            <ResizableHandle className={paneOpen ? "" : "hidden"} />
+            {/* The gutter between the two sheets. The pill is the component's
+                own look now — it was spelled out here, which left the rail's
+                handle on the other side of the page looking like a hairline. */}
+            <ResizableHandle className={paneOpen ? undefined : "hidden"} />
 
             <ResizablePanel
               id="workpane"

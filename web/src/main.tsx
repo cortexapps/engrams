@@ -3,13 +3,7 @@
 // available to anything using `--font-mono` (code, IDs, tabular numbers).
 import "@fontsource-variable/jetbrains-mono/wght.css";
 import "@fontsource-variable/jetbrains-mono/wght-italic.css";
-// Saira is the display voice — page/section titles and the primary action
-// button. A squared, technical grotesque with an aerospace lineage; the
-// "speed" read comes from Saira plus treatment (a touch of width on titles,
-// tracked caps on the primary button), not a literal racing wordmark. Import
-// the weight AND width axes so titles can take a subtle Aston-style extension.
-import "@fontsource-variable/saira/wght.css";
-import "@fontsource-variable/saira/wdth.css";
+// The sans face is system-ui, so there is nothing to import for it.
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { ThemeProvider } from "./components/theme-provider";

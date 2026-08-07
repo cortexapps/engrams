@@ -27,8 +27,12 @@ export function RootLayout() {
     // own `overflow-auto` container is what actually scrolls.
     <SidebarProvider className="h-svh overflow-hidden">
       <MainSidebar />
-      <SidebarInset className="min-h-0 overflow-hidden">
-        <header className="flex h-12 shrink-0 items-center border-b px-3 md:hidden">
+      {/* The inset is the GROUND, not a page: every section lifts its own
+          content sheet off it (`.section-sheet`), and the section rail is cut
+          from this same tone, so rail and gutter read as one continuous cover
+          with the page floating on top. */}
+      <SidebarInset className="min-h-0 overflow-hidden bg-shell">
+        <header className="flex h-12 shrink-0 items-center border-b border-sidebar-border px-3 text-sidebar-foreground md:hidden">
           <SidebarTrigger className="-ml-1" />
         </header>
         <div className="flex min-h-0 flex-1 flex-col">

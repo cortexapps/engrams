@@ -22,7 +22,10 @@ import { useKeyboardUi, useAnyKeyboardModalOpen } from "./store";
 
 export function useSessionJumpKeys(): void {
   const navigate = useNavigate();
-  const { rows, openId } = useRailSessions();
+  // The VISIBLE rows: a number the rail cannot draw must not be a jump target,
+  // and ⌥[ / ⌥] cycles through the list a reader can see. Rows inside a
+  // collapsed band stay reachable through the command menu and the task list.
+  const { visibleRows: rows, openId } = useRailSessions();
   const setJumpHeld = useKeyboardUi((s) => s.setJumpHeld);
   const blocked = useAnyKeyboardModalOpen();
 

@@ -5,12 +5,13 @@ import * as ResizablePrimitive from "react-resizable-panels";
 import { cn } from "@/lib/utils";
 
 // Thin wrapper over react-resizable-panels in the Aston-racing voice: the
-// divider is a hairline (--border) that lifts to the lime accent on hover/drag
-// — the same "the accent marks the live thing" grammar as the tab underline.
-// A wider invisible hit-area (::after) makes the 1px line comfortable to grab
-// without drawing a fat rule. `ResizablePanel` spreads `ref` straight through
-// (React 19: ref is a prop), so callers can drive collapse()/expand() via an
-// ImperativePanelHandle.
+// handle IS the gutter between two surfaces — nothing at rest, so the cover
+// shows through, and a lime pill under the pointer. The same grammar as
+// `SidebarResizeHandle`, which resizes a rail by hand rather than through this
+// library; a drag handle should not look like two different controls depending
+// on which edge of the page it sits on.
+// `ResizablePanel` spreads `ref` straight through (React 19: ref is a prop), so
+// callers can drive collapse()/expand() via an ImperativePanelHandle.
 
 function ResizablePanelGroup({
   className,
@@ -37,11 +38,10 @@ function ResizableHandle({
     <ResizablePrimitive.PanelResizeHandle
       data-slot="resizable-handle"
       className={cn(
-        "relative flex w-px shrink-0 items-stretch bg-border transition-colors",
-        // the grab zone reaches past the hairline on both sides
-        "after:absolute after:inset-y-0 after:left-1/2 after:w-3 after:-translate-x-1/2",
-        "focus-visible:outline-none data-[resize-handle-state=hover]:bg-primary data-[resize-handle-state=drag]:bg-primary",
-        "focus-visible:bg-primary",
+        "relative flex w-2 shrink-0 items-stretch bg-transparent",
+        "after:absolute after:inset-y-0 after:left-1/2 after:w-2 after:-translate-x-1/2 after:rounded-full after:transition-colors",
+        "focus-visible:outline-none hover:after:bg-primary/60 focus-visible:after:bg-primary",
+        "data-[resize-handle-state=drag]:after:bg-primary",
         className,
       )}
       {...props}

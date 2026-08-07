@@ -63,11 +63,11 @@ export function ApiKeysPanel() {
     <div className="space-y-6">
       <PageHeading
         title="API keys"
-        description="Programmatic credentials for CI and scripts. Each key acts with its assigned role — the same RBAC as a signed-in user. The key value is shown once at creation and never again."
+        count={rows.length || undefined}
         actions={<CreateKeyDialog />}
       />
 
-      {error && <p className="text-sm text-destructive">could not load keys — {String(error)}</p>}
+      {error && <p className="text-sm text-destructive">Could not load keys — {String(error)}</p>}
 
       {isLoading ? (
         <p className="py-6 text-sm text-muted-foreground">Loading…</p>
@@ -158,7 +158,7 @@ function KeyRow({ row }: { row: ApiKeyMeta }) {
         </div>
         {revoke.error && (
           <p className="mt-1 text-right text-xs text-destructive">
-            could not revoke — {String(revoke.error)}
+            Could not revoke — {String(revoke.error)}
           </p>
         )}
       </TableCell>

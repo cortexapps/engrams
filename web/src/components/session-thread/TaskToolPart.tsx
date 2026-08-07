@@ -33,11 +33,13 @@ function meaning(args: TaskCallDisplay | undefined): {
   }
   switch (args?.status) {
     case "in_progress":
-      return { Icon: CircleDotIcon, iconClass: "text-primary", verb: "started", done: false };
+      // `ring` is the running tone across the app (Glyph's toneFor); lime is
+      // reserved for things you can act on.
+      return { Icon: CircleDotIcon, iconClass: "text-ring", verb: "started", done: false };
     case "completed":
       return {
         Icon: CircleCheckIcon,
-        iconClass: "text-emerald-600 dark:text-emerald-400",
+        iconClass: "text-instrument-nominal-ink",
         verb: "completed",
         done: true,
       };

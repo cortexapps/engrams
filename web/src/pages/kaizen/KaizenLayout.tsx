@@ -21,10 +21,7 @@ export function KaizenLayout() {
 
   return (
     <SidebarProvider className="min-h-0 flex-1">
-      <Sidebar
-        collapsible="none"
-        className="sidebar-section hidden border-r border-sidebar-border md:flex"
-      >
+      <Sidebar collapsible="none" className="sidebar-section hidden md:flex">
         <SidebarContent>
           <SidebarGroup>
             <SidebarGroupLabel>Kaizen</SidebarGroupLabel>
@@ -46,7 +43,7 @@ export function KaizenLayout() {
         </SidebarContent>
       </Sidebar>
 
-      <div className="flex flex-1 flex-col overflow-auto">
+      <div className="section-sheet flex flex-1 flex-col overflow-y-auto">
         <nav className="flex gap-1 overflow-x-auto border-b p-2 md:hidden">
           {ITEMS.map((item) => (
             <Link

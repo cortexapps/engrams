@@ -114,9 +114,7 @@ export function ReplaceCredentialSheet({
         <header className="flex items-center gap-3 border-b p-5">
           <ProviderTile {...view.icon} name={view.name} size={38} />
           <div className="min-w-0 flex-1">
-            <div className="font-display text-[1.02rem] font-semibold">
-              Replace {view.name} credential
-            </div>
+            <div className="text-[1.02rem] font-semibold">Replace {view.name} credential</div>
             <div className="text-xs text-muted-foreground">
               {isMint
                 ? "Rotate the minted credentials"
