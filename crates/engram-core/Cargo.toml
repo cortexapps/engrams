@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 # HostId::from_node_name seeds a deterministic id from the K8s node name.
 sha2.workspace = true
+hex.workspace = true
 # tokio brought in solely for the AsyncRead+AsyncWrite traits in the
 # HarnessSink type alias. No runtime dependency.
 tokio.workspace = true

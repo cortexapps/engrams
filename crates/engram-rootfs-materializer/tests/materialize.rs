@@ -41,7 +41,7 @@ struct Registry {
 }
 
 fn sha256_of(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", sha2::Sha256::digest(bytes))
+    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
 }
 
 impl Registry {

@@ -410,7 +410,7 @@ pub fn cold_base_content_key(
     })
     .expect("KeyInput has no non-serializable fields");
     let digest = Sha256::digest(&bytes);
-    format!("{digest:x}")
+    hex::encode(digest)
 }
 
 /// The `cold_bases` row (ADR 0084 section B): a content-keyed,

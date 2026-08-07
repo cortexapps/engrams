@@ -268,6 +268,12 @@ async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 sha2 = "0.11"
 hmac = "0.13"
+# Hex-encodes digest output. sha2 0.11 / digest 0.11 swapped `generic-array`
+# for `hybrid-array`, whose `Array` does not implement `LowerHex`, so the
+# `format!("{digest:x}")` that digest 0.10 allowed no longer compiles.
+# `hex::encode` is the direct replacement and is lowercase, which the
+# "sha256:"-prefixed strings compared against OCI registry digests require.
+hex = "0.4"
 
 # property-based testing (ADR 0099 H3/H4). Dev-dependency only; the
 # persisted `proptest-regressions/` seeds turn every counterexample into a

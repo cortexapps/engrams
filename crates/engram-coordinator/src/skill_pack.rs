@@ -144,7 +144,7 @@ pub fn pack_skill(name: &str, payload: &[u8], bins: &[String]) -> Result<PackedS
         .map_err(|e| PackError::Internal(format!("write mount.json: {e}")))?;
 
     let squashfs = mksquashfs(root)?;
-    let sha256 = format!("{:x}", Sha256::digest(&squashfs));
+    let sha256 = hex::encode(Sha256::digest(&squashfs));
     let size_bytes = squashfs.len() as i64;
     Ok(PackedSkill {
         squashfs,
