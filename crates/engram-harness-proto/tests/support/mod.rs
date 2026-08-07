@@ -145,6 +145,7 @@ pub fn harness_event() -> impl Strategy<Value = HarnessEvent> {
                 intent,
             }
         }),
+        Just(HarnessEvent::Busy),
     ]
 }
 
@@ -336,6 +337,7 @@ fn _exhaustiveness_harness_event(e: &HarnessEvent) {
         HarnessEvent::ToolCallRequested { .. } => {}
         HarnessEvent::Parked => {}
         HarnessEvent::BrowserActivity { .. } => {}
+        HarnessEvent::Busy => {}
     }
 }
 

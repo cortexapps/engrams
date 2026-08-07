@@ -331,6 +331,7 @@ fn harness_event_golden_and_variant_indices() {
     assert_golden("event_tool_call_requested", &ev_tool_call_requested());
     assert_golden("event_parked", &HarnessEvent::Parked);
     assert_golden("event_browser_activity", &ev_browser_activity());
+    assert_golden("event_busy", &HarnessEvent::Busy);
 
     assert_variant_index(&ev_run_started(), 0, "HarnessEvent::RunStarted");
     assert_variant_index(&ev_agent_message(), 1, "HarnessEvent::AgentMessage");
@@ -367,6 +368,7 @@ fn harness_event_golden_and_variant_indices() {
     );
     assert_variant_index(&HarnessEvent::Parked, 15, "HarnessEvent::Parked");
     assert_variant_index(&ev_browser_activity(), 16, "HarnessEvent::BrowserActivity");
+    assert_variant_index(&HarnessEvent::Busy, 17, "HarnessEvent::Busy");
 }
 
 #[test]
@@ -598,6 +600,7 @@ fn regen_golden() {
     write("event_tool_call_requested", &ev_tool_call_requested());
     write("event_parked", &HarnessEvent::Parked);
     write("event_browser_activity", &ev_browser_activity());
+    write("event_busy", &HarnessEvent::Busy);
 
     write("agent_role_assistant", &AgentRole::Assistant);
     write("agent_role_user", &AgentRole::User);
