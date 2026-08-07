@@ -1594,12 +1594,14 @@ dependencies = [
  "sha2 0.11.0",
  "socket2 0.6.5",
  "tempfile",
+ "time",
  "tls-parser",
  "tokio",
  "tokio-rustls",
  "tracing",
  "webpki-roots 1.0.9",
  "workspace-hack",
+ "x509-parser",
 ]
 
 [[package]]
