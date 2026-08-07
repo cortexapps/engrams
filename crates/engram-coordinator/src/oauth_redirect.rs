@@ -28,7 +28,9 @@ use engram_core::types::oauth::{
     OAuthAccountMetadata, OAuthCredentialKey, OAuthFlow, OAuthFlowStatus, SealedOAuthCredential,
 };
 use engram_core::types::SecretSchema;
-use hmac::{Hmac, Mac};
+// digest 0.11 moved `new_from_slice` off `Mac` and onto `KeyInit`, so the
+// keyed constructor needs that trait in scope as well as `Mac` itself.
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 

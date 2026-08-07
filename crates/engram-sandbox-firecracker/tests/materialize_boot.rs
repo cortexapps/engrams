@@ -57,7 +57,7 @@ struct Registry {
 
 impl Registry {
     fn add_blob(&self, bytes: Vec<u8>) -> (String, u64) {
-        let digest = format!("sha256:{:x}", sha2::Sha256::digest(&bytes));
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&bytes)));
         let size = bytes.len() as u64;
         self.blobs.lock().insert(digest.clone(), Bytes::from(bytes));
         (digest, size)
@@ -100,7 +100,7 @@ async fn get_manifest(
     let Some((content_type, body)) = reg.manifests.lock().get(&reference).cloned() else {
         return (StatusCode::NOT_FOUND, "no such manifest").into_response();
     };
-    let digest = format!("sha256:{:x}", sha2::Sha256::digest(&body));
+    let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&body)));
     Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, content_type)

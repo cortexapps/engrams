@@ -37,5 +37,6 @@ http.workspace = true
 parking_lot.workspace = true
 proptest.workspace = true
 sha2.workspace = true
+hex.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net"] }

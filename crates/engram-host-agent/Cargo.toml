@@ -60,6 +60,7 @@ bytes.workspace = true
 libc = "0.2"
 rustls.workspace = true
 sha2.workspace = true
+hex.workspace = true
 chrono.workspace = true
 clap.workspace = true
 crc32c.workspace = true

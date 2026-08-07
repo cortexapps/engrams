@@ -283,7 +283,7 @@ impl BundleStore {
             .await
             .map_err(|e| SandboxError::Snapshot(format!("bundle materialize: flush: {e}")))?;
         drop(file);
-        let got = format!("{:x}", hasher.finalize());
+        let got = hex::encode(hasher.finalize());
         if got != r.sha256 {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(SandboxError::Snapshot(format!(
@@ -316,7 +316,7 @@ mod tests {
     use engram_storage_local::LocalBlobStorage;
 
     fn sha_of(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
+        hex::encode(Sha256::digest(bytes))
     }
 
     fn store(tmp: &tempfile::TempDir) -> BundleStore {
@@ -526,7 +526,7 @@ mod tests {
             use sha2::Digest;
             let mut h = sha2::Sha256::new();
             h.update(&body);
-            format!("{:x}", h.finalize())
+            hex::encode(h.finalize())
         };
         let staged = staged_dir.path().join(format!("{sha}.squashfs"));
         let pin = vec![AuxBundleRef {
