@@ -29,6 +29,7 @@ pub mod refresh;
 pub mod remount;
 pub mod share;
 pub mod shell;
+pub mod swap;
 pub mod tuning;
 // `pub` so the `engram-agentd` binary (main.rs) shares this one module rather
 // than recompiling its own copy — the bin's readiness dial reads

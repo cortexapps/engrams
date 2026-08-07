@@ -25,11 +25,24 @@ use std::path::Path;
 /// well under one 16 MiB chunk and cannot drag in neighbouring chunks.
 const READ_AHEAD_KB: &str = "4096";
 
+/// ADR 0112: the swap device's readahead. Swap-in is random 4 KiB
+/// against fast host-file backing — the 4 MiB window is sized for the
+/// rootfs's serial classloading chains, and #1044's profiling showed
+/// large readahead INVERTS under reclaim pressure, which is the only
+/// regime the swap device ever serves. Kernel default, not zero:
+/// block readahead barely matters here, it just must not be 4 MiB.
+const SWAP_READ_AHEAD_KB: &str = "128";
+
 /// Set `read_ahead_kb` on every virtio block device. Best-effort by
 /// design: a missing sysfs tree (non-Linux backends, tests) or an
 /// unwritable file logs and moves on — tuning must never block agent
 /// bring-up.
+///
+/// ADR 0112 carve-out: the swap drive (the only writable non-vda
+/// disk, see `swap::find_swap_device`) gets [`SWAP_READ_AHEAD_KB`]
+/// instead of the rootfs window.
 pub fn apply_block_readahead() {
+    let swap_dev = crate::swap::find_swap_device(Path::new("/sys/block"));
     let Ok(entries) = std::fs::read_dir("/sys/block") else {
         return;
     };
@@ -39,13 +52,18 @@ pub fn apply_block_readahead() {
         if !dev.starts_with("vd") {
             continue;
         }
-        apply_one(&entry.path().join("queue/read_ahead_kb"), dev);
+        let value = if swap_dev.as_deref() == Some(dev) {
+            SWAP_READ_AHEAD_KB
+        } else {
+            READ_AHEAD_KB
+        };
+        apply_one(&entry.path().join("queue/read_ahead_kb"), dev, value);
     }
 }
 
-fn apply_one(path: &Path, dev: &str) {
-    match std::fs::write(path, READ_AHEAD_KB) {
-        Ok(()) => tracing::info!(dev, read_ahead_kb = READ_AHEAD_KB, "block readahead set"),
+fn apply_one(path: &Path, dev: &str, value: &str) {
+    match std::fs::write(path, value) {
+        Ok(()) => tracing::info!(dev, read_ahead_kb = value, "block readahead set"),
         Err(error) => tracing::warn!(dev, %error, "block readahead not applied"),
     }
 }

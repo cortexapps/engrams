@@ -136,14 +136,57 @@ async fn swap_drive_boots_writable_and_restores_fresh() {
         "swap device size mismatch (probe: {probe_out})",
     );
 
+    // Phase 3: agentd armed the device at boot (mkswap + swapon) and
+    // the readahead carve-out applied — swap gets 128 KiB while the
+    // rootfs keeps the 4 MiB chunked-NBD window.
+    let dev = swap_dev.0.clone();
+    let swaps = exec_ok(
+        &backend,
+        original_id,
+        "cat /proc/swaps",
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        swaps.contains(&format!("/dev/{dev}")),
+        "agentd did not arm swap at boot; /proc/swaps:\n{swaps}",
+    );
+    let ra = exec_ok(
+        &backend,
+        original_id,
+        &format!("cat /sys/block/{dev}/queue/read_ahead_kb /sys/block/vda/queue/read_ahead_kb"),
+        Duration::from_secs(10),
+    )
+    .await;
+    let ra: Vec<&str> = ra.split_whitespace().collect();
+    assert_eq!(
+        ra,
+        vec!["128", "4096"],
+        "readahead carve-out mismatch (swap, rootfs)",
+    );
+    let swappiness = exec_ok(
+        &backend,
+        original_id,
+        "cat /proc/sys/vm/swappiness",
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(swappiness.trim(), "100", "vm.swappiness not applied");
+
     // Write a marker into the swap device, prove it reads back live.
-    let dev = swap_dev.0;
+    // agentd armed the device at boot, and an ACTIVE swap area holds
+    // the kernel's exclusive bdev claim — a write open would EBUSY.
+    // Disarm first (what a real capture does — the phase-4 protocol)
+    // and leave it off, so the snapshot below carries no swap state
+    // and the marker is purely device-content lineage. No stderr
+    // redirects: a failing dd must surface its reason in the panic.
     let marked = exec_ok(
         &backend,
         original_id,
         &format!(
-            "printf SWAPMARK | dd of=/dev/{dev} conv=notrunc 2>/dev/null && \
-             dd if=/dev/{dev} bs=8 count=1 2>/dev/null"
+            "swapoff /dev/{dev} && \
+             printf SWAPMARK | dd of=/dev/{dev} conv=notrunc && \
+             dd if=/dev/{dev} bs=8 count=1"
         ),
         Duration::from_secs(10),
     )
