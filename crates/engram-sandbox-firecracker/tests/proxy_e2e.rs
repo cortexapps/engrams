@@ -557,7 +557,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         "placeholder must not survive into the upstream payload; got: {body}",
     );
     assert!(
-        stdout.contains(engram_egress_proxy::metadata::PLACEHOLDER_TOKEN),
+        stdout.contains(engram_egress_proxy::guest_gateway::PLACEHOLDER_TOKEN),
         "guest metadata discovery should receive only the placeholder token; got: {stdout}",
     );
     assert_eq!(
