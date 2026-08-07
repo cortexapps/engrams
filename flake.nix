@@ -52,7 +52,11 @@
             protobuf                # protoc, for tonic-build when grpc lands
             llvmPackages.libclang   # bindgen for userfaultfd-sys (Linux only,
                                     # but harmless on macOS)
-            nodejs_22               # web SPA dev server (`just web` -> vite)
+            nodejs_24               # web SPA dev server (`just web` -> vite).
+                                    # Keep this major in step with the web CI
+                                    # lane (.github/workflows/ci.yml) and
+                                    # docker/web.Dockerfile — see the note
+                                    # beside `setup-node` in that workflow.
             pnpm                    # workspace package manager for web/
             # ADR 0055 P2: mksquashfs packs an uploaded skill dir into a
             # content-addressed RO squashfs at registration (the coordinator's

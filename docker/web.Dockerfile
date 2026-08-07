@@ -7,6 +7,8 @@
 #
 #   docker buildx build -f docker/web.Dockerfile -t engram/web:dev .
 
+# Keep this major in step with the web CI lane (.github/workflows/ci.yml)
+# and flake.nix — see the note beside `setup-node` in that workflow.
 FROM node:24-alpine AS builder
 WORKDIR /src
 
