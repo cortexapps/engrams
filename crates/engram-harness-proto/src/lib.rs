@@ -262,9 +262,13 @@ pub enum HarnessEvent {
     RunInterrupted { run_id: String },
     /// Explicit "I'm awaiting user input." Engram's idle-eviction
     /// soft TTL fires N seconds after this. Adapters MUST emit it
-    /// after every `RunCompleted`; emitting redundantly (no run in
-    /// between) just resets the soft timer, which is fine but
-    /// wasteful — don't do it.
+    /// after every `RunCompleted` — UNLESS background subagents are
+    /// still in flight: the session is not idle then (the VM itself is
+    /// doing the work, and evicting it would freeze that work and
+    /// orphan the completion notification), so the adapter holds the
+    /// announcement and emits it when the last subagent drains.
+    /// Emitting redundantly (no run in between) just resets the soft
+    /// timer, which is fine but wasteful — don't do it.
     Idle,
     // ── Phase 1b: queued/steered prompts (ADR 0052). APPENDED after
     //    `Idle` so existing bincode variant indices (RunStarted=0 …

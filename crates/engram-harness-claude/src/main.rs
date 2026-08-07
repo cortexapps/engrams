@@ -2578,6 +2578,19 @@ mod adapter {
         // the running turn is never touched.
         let mut steer_deadline: Option<Instant> = None;
 
+        // In-flight background subagents, from the CLI's
+        // `background_tasks_changed` inventory (`local_agent` entries only —
+        // see `detect_background_agents`). While non-zero the session is NOT
+        // idle: the subagents run inside this VM, and an idle/parked
+        // announcement would nominate it for eviction — a parked VM can
+        // never deliver the completion notification that wakes the model
+        // (the whole point of running them). Turn-end announcements are held
+        // instead; the newest session event stays `run_completed`, which the
+        // idle detector's soft TTL ignores, and the hard TTL remains the
+        // wedged-subagent backstop. Per-process by construction: background
+        // tasks die with the claude process, so a respawn starts back at 0.
+        let mut bg_agents: usize = 0;
+
         // ADR 0089: if a deferred result is stashed, claude
         // WILL re-fire the tool on this `--resume` startup (id-stable, no
         // stdin — findings #9/#12). Establish a CONTINUATION turn (fresh
@@ -2660,6 +2673,47 @@ mod adapter {
                     match line {
                         Ok(Some(line)) => {
                             maybe_stash_session_id(&line, cli).await;
+                            if let Some(n) = detect_background_agents(&line) {
+                                if n == 0
+                                    && bg_agents > 0
+                                    && turn.is_none()
+                                    && pending.is_empty()
+                                {
+                                    // The last subagent drained while no turn
+                                    // was open. The CLI re-invokes the model
+                                    // right after this (its wake-up gets a
+                                    // continuation turn below, whose end
+                                    // announces normally) — but if that
+                                    // wake-up never comes, THIS announcement
+                                    // is the guarantee the session returns to
+                                    // evictability. A redundant Idle merely
+                                    // resets the soft timer (proto contract).
+                                    let parked = !deferred_calls.lock().await.is_empty();
+                                    emit(
+                                        evt_tx,
+                                        if parked {
+                                            HarnessEvent::Parked
+                                        } else {
+                                            HarnessEvent::Idle
+                                        },
+                                    )
+                                    .await;
+                                }
+                                bg_agents = n;
+                            }
+                            // A main-loop message with no turn open is the
+                            // CLI re-invoking the model on a background-task
+                            // notification (probed: no user prompt precedes
+                            // it). Give it a CONTINUATION turn so its output
+                            // lands in the transcript instead of the
+                            // outside-any-turn discard, and so its result
+                            // marker runs the normal turn-end announcement.
+                            // Subagent-internal lines (`parent_tool_use_id`
+                            // set) never open one.
+                            if turn.is_none() && is_main_loop_message(&line) {
+                                turn =
+                                    Some(start_continuation_turn(evt_tx, cli, current_run_id).await);
+                            }
                             if let Some(marker) = detect_result_marker(&line) {
                                 // Explicit turn-end. Close the in-flight
                                 // run, then run the next queued prompt
@@ -2884,15 +2938,36 @@ mod adapter {
                                                 }
                                             }
                                             None => {
-                                                emit(
-                                                    evt_tx,
-                                                    if tool_deferred {
-                                                        HarnessEvent::Parked
-                                                    } else {
-                                                        HarnessEvent::Idle
-                                                    },
-                                                )
-                                                .await
+                                                if bg_agents > 0 {
+                                                    // Background subagents still
+                                                    // run inside this VM — the
+                                                    // session is neither idle nor
+                                                    // parked (either announcement
+                                                    // makes it an eviction
+                                                    // candidate, and a parked VM
+                                                    // can never deliver the
+                                                    // completion notification
+                                                    // that wakes the model).
+                                                    // Announce nothing; the
+                                                    // drain/wake-up path above
+                                                    // announces when they finish.
+                                                    tracing::info!(
+                                                        bg_agents,
+                                                        "turn ended with background \
+                                                         subagents in flight; holding \
+                                                         idle announcement"
+                                                    );
+                                                } else {
+                                                    emit(
+                                                        evt_tx,
+                                                        if tool_deferred {
+                                                            HarnessEvent::Parked
+                                                        } else {
+                                                            HarnessEvent::Idle
+                                                        },
+                                                    )
+                                                    .await
+                                                }
                                             }
                                         }
                                     }
@@ -3254,9 +3329,11 @@ mod adapter {
                 }
                 // A fresh connection attached: re-announce `Idle` iff idle
                 // so the host re-arms its soft TTL. A mid-turn reattach
-                // emits none.
+                // emits none — and neither does one mid-background-subagent
+                // (the session is busy; re-announcing Idle would re-arm the
+                // very eviction the turn-end hold prevented).
                 _ = reattach.notified() => {
-                    if turn.is_none() {
+                    if turn.is_none() && bg_agents == 0 {
                         emit(evt_tx, HarnessEvent::Idle).await;
                     }
                 }
@@ -3943,6 +4020,55 @@ mod adapter {
                 .and_then(|s| s.as_str())
                 .map(str::to_string),
         })
+    }
+
+    /// The CLI's `system`/`background_tasks_changed` line carries its FULL
+    /// background-task inventory. Returns the count of `local_agent`
+    /// entries — background subagents, whose lifetime is bounded and whose
+    /// completion re-invokes the model. `local_bash` entries are
+    /// deliberately NOT counted: a background shell can be a never-exiting
+    /// dev server, and holding the idle announcement on one would pin the
+    /// session resident until the hard TTL. (Observed wire shape, not a
+    /// documented contract — pinned by tests below; if a future CLI stops
+    /// emitting it, this returns `None` forever and the harness degrades
+    /// to today's announce-idle-immediately behavior.)
+    pub fn detect_background_agents(line: &str) -> Option<usize> {
+        if !line.contains("\"subtype\":\"background_tasks_changed\"") {
+            return None;
+        }
+        let v: Value = serde_json::from_str(line).ok()?;
+        if v.get("type")?.as_str()? != "system"
+            || v.get("subtype")?.as_str()? != "background_tasks_changed"
+        {
+            return None;
+        }
+        Some(
+            v.get("tasks")?
+                .as_array()?
+                .iter()
+                .filter(|t| t.get("task_type").and_then(|s| s.as_str()) == Some("local_agent"))
+                .count(),
+        )
+    }
+
+    /// True when a stream line is a MAIN-LOOP model message: an
+    /// `assistant`/`user` line whose top-level `parent_tool_use_id` is
+    /// null/absent. When a background task completes, the CLI re-invokes
+    /// the model with no user prompt; arriving outside any turn, these are
+    /// the wake-up's content and earn a continuation turn. Subagent-internal
+    /// lines carry `parent_tool_use_id` (headless docs, "Follow subagent
+    /// messages") and never open a turn. `stream_event` chunk lines are
+    /// deliberately excluded — chunks are ephemeral by contract, and a
+    /// complete-message trigger can never mistake a trailing flush for a
+    /// wake-up.
+    pub fn is_main_loop_message(line: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        matches!(
+            v.get("type").and_then(|s| s.as_str()),
+            Some("assistant" | "user")
+        ) && v.get("parent_tool_use_id").is_none_or(Value::is_null)
     }
 
     /// Human-readable hint for the common fatal signals, so an operator
@@ -5255,6 +5381,209 @@ mod adapter {
                 Some(HarnessEvent::AgentMessage { text, .. }) => assert_eq!(text, want),
                 other => panic!("expected AgentMessage, got {other:?}"),
             }
+        }
+
+        /// Like `write_persistent_fake_claude`, but after the first turn's
+        /// lines it emits `wakeup` lines UNPROMPTED (no stdin read between) —
+        /// the shape of the CLI re-invoking the model when a background task
+        /// completes.
+        async fn write_wakeup_fake_claude(turn: &[&str], wakeup: &[&str]) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let path =
+                std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
+            let mut body = String::from("#!/bin/sh\n");
+            body.push_str("printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n");
+            body.push_str("IFS= read -r _line\n");
+            for l in turn {
+                body.push_str(&format!("  printf '%s\\n' '{l}'\n"));
+            }
+            body.push_str("sleep 0.2\n");
+            for l in wakeup {
+                body.push_str(&format!("  printf '%s\\n' '{l}'\n"));
+            }
+            body.push_str("while IFS= read -r _line; do :; done\n");
+            tokio::fs::write(&path, body).await.unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        const BG_ONE_AGENT: &str = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","task_type":"local_agent","description":"probe"}]}"#;
+        const BG_DRAINED: &str =
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#;
+
+        async fn expect_silence(rx: &mut mpsc::Receiver<HarnessEvent>, why: &str) {
+            match tokio::time::timeout(Duration::from_millis(400), rx.recv()).await {
+                Err(_) => {}
+                Ok(ev) => panic!("expected no event ({why}), got {ev:?}"),
+            }
+        }
+
+        /// A turn that ends while a background subagent runs must announce
+        /// NOTHING — not Idle, not Parked (either makes the session an
+        /// eviction candidate, and a parked VM can never deliver the
+        /// completion notification). A reattach during that window must
+        /// stay quiet too (it re-announces Idle otherwise).
+        #[tokio::test]
+        async fn turn_end_with_background_subagents_holds_idle() {
+            let script = write_persistent_fake_claude(&[
+                r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"launched"}]}}"#,
+                BG_ONE_AGENT,
+                r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed"}"#,
+            ])
+            .await;
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(16);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+            ));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p-bg-hold".into(),
+                    text: "launch a subagent".into(),
+                    mode: None,
+                })
+                .await
+                .unwrap();
+            let run_id = expect_run_started(&mut evt_rx).await;
+            expect_agent_message(&mut evt_rx, "launched").await;
+            assert_eq!(expect_run_completed(&mut evt_rx).await, run_id);
+            expect_silence(&mut evt_rx, "idle held while subagent in flight").await;
+            reattach.notify_one();
+            expect_silence(&mut evt_rx, "reattach re-announce held too").await;
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine exits")
+                .expect("engine task does not panic");
+            let _ = tokio::fs::remove_file(script).await;
+        }
+
+        /// The CLI's unprompted wake-up (background subagent completed) gets
+        /// a CONTINUATION turn: drain announces Idle (the never-woke
+        /// guarantee), the wake-up's messages land as transcript events
+        /// bracketed by RunStarted (no prompt_id) / RunCompleted, and the
+        /// turn-end announcement fires normally with the inventory empty.
+        #[tokio::test]
+        async fn background_wakeup_gets_continuation_turn_and_idle_returns() {
+            let script = write_wakeup_fake_claude(
+                &[
+                    r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"launched"}]}}"#,
+                    BG_ONE_AGENT,
+                    r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed"}"#,
+                ],
+                &[
+                    BG_DRAINED,
+                    r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"NOTIFIED"}]}}"#,
+                    r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed"}"#,
+                ],
+            )
+            .await;
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(16);
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                Arc::new(Notify::new()),
+                evt_tx,
+            ));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p-bg-wake".into(),
+                    text: "launch a subagent".into(),
+                    mode: None,
+                })
+                .await
+                .unwrap();
+            let run_id = expect_run_started(&mut evt_rx).await;
+            expect_agent_message(&mut evt_rx, "launched").await;
+            assert_eq!(expect_run_completed(&mut evt_rx).await, run_id);
+            // Drain-first order: the inventory empties before the wake-up's
+            // first message, so the never-woke guarantee Idle fires here.
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            // The wake-up: a continuation turn with NO prompt_id.
+            match evt_rx.recv().await {
+                Some(HarnessEvent::RunStarted { prompt_id, .. }) => {
+                    assert_eq!(prompt_id, None, "wake-up turn has no user prompt")
+                }
+                other => panic!("expected continuation RunStarted, got {other:?}"),
+            }
+            expect_agent_message(&mut evt_rx, "NOTIFIED").await;
+            expect_run_completed(&mut evt_rx).await;
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine exits")
+                .expect("engine task does not panic");
+            let _ = tokio::fs::remove_file(script).await;
+        }
+
+        /// Subagent-internal lines (`parent_tool_use_id` set) arriving
+        /// outside any turn must NOT open a continuation turn — they are the
+        /// subagent's own chatter, not the main loop waking up.
+        #[tokio::test]
+        async fn tagged_subagent_lines_never_open_a_turn() {
+            let script = write_wakeup_fake_claude(
+                &[
+                    r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"launched"}]}}"#,
+                    BG_ONE_AGENT,
+                    r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed"}"#,
+                ],
+                &[
+                    r#"{"type":"assistant","message":{"id":"m3","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{}}]},"parent_tool_use_id":"toolu_parent"}"#,
+                ],
+            )
+            .await;
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(16);
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                Arc::new(Notify::new()),
+                evt_tx,
+            ));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p-bg-tagged".into(),
+                    text: "launch a subagent".into(),
+                    mode: None,
+                })
+                .await
+                .unwrap();
+            let run_id = expect_run_started(&mut evt_rx).await;
+            expect_agent_message(&mut evt_rx, "launched").await;
+            assert_eq!(expect_run_completed(&mut evt_rx).await, run_id);
+            expect_silence(&mut evt_rx, "tagged line must not start a turn").await;
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine exits")
+                .expect("engine task does not panic");
+            let _ = tokio::fs::remove_file(script).await;
         }
 
         #[tokio::test]
@@ -8643,6 +8972,56 @@ mod tests {
         // Absent (older CLI / non-AUQ paths) → None.
         let bare = r#"{"type":"result","subtype":"success","is_error":false}"#;
         assert_eq!(detect_result_marker(bare).unwrap().terminal_reason, None);
+    }
+
+    /// Pins the OBSERVED `background_tasks_changed` wire shape (probed
+    /// 2026-08-06 against the harness argv; the event is undocumented).
+    /// The lines are verbatim probe captures. If a future CLI changes the
+    /// shape, this fails loudly instead of the harness silently reverting
+    /// to announce-idle-immediately.
+    #[test]
+    fn background_agent_inventory_counts_local_agents_only() {
+        let agent = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a9e33c94e91b3d1b5","task_type":"local_agent","description":"Sleep then output done"}],"uuid":"d3ae041e-47fd-4d0f-add6-0f13a50f6b2f","session_id":"45fff78d-5f35-497a-88e0-80eb21600a2e"}"#;
+        assert_eq!(detect_background_agents(agent), Some(1));
+        let drained = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"9b1482bc-3149-4371-8318-6f56b4397b81","session_id":"45fff78d-5f35-497a-88e0-80eb21600a2e"}"#;
+        assert_eq!(detect_background_agents(drained), Some(0));
+        // A background SHELL never counts: it can be a never-exiting dev
+        // server, and holding the idle announcement on it would pin the
+        // session resident until the hard TTL.
+        let bash = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bw9ttimtt","task_type":"local_bash","description":"Sleep 20 seconds in background"}],"uuid":"eb30b242-265e-4fec-8928-cf7368376864","session_id":"816f8b56-7307-4175-b4a5-89c453bbc577"}"#;
+        assert_eq!(detect_background_agents(bash), Some(0));
+        // Lifecycle lines are NOT inventory lines.
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"a9e33c94e91b3d1b5","task_type":"local_agent"}"#;
+        assert_eq!(detect_background_agents(started), None);
+        assert_eq!(detect_background_agents(r#"{"type":"assistant"}"#), None);
+    }
+
+    /// The continuation-turn trigger: complete main-loop messages only.
+    /// Subagent-tagged lines (`parent_tool_use_id`, headless docs "Follow
+    /// subagent messages"), system/result/stream_event lines, and non-JSON
+    /// must never open a turn.
+    #[test]
+    fn main_loop_message_excludes_tagged_and_non_message_lines() {
+        assert!(is_main_loop_message(
+            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"NOTIFIED"}]},"session_id":"s"}"#
+        ));
+        assert!(is_main_loop_message(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1"}]},"parent_tool_use_id":null}"#
+        ));
+        // Verbatim-shaped subagent line from the probe: tagged → never.
+        assert!(!is_main_loop_message(
+            r#"{"type":"assistant","message":{"id":"m2","content":[]},"parent_tool_use_id":"toolu_01TUxcDgGE8cPe7wZ2B1sKbm"}"#
+        ));
+        assert!(!is_main_loop_message(
+            r#"{"type":"system","subtype":"init"}"#
+        ));
+        assert!(!is_main_loop_message(
+            r#"{"type":"result","subtype":"success","is_error":false}"#
+        ));
+        assert!(!is_main_loop_message(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta"}}"#
+        ));
+        assert!(!is_main_loop_message("not json"));
     }
 
     #[test]
