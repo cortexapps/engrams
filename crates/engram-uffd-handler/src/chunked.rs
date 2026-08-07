@@ -277,6 +277,58 @@ impl ChunkedMemoryBackend {
     /// chunks are already resident in the host NVMe cache, so the
     /// fill path never needs the store for them. The canonical (image
     /// base) manifest is always durable and store-resolved.
+    /// ADR 0045 D4 fail-open (#1066): build with the supplied canonical,
+    /// and when the canonical/session manifests disagree on layout
+    /// (guest resized since capture, FC snapshot cutover, ...), retry
+    /// with `canonical == session` — the documented pre-D4 fallback.
+    /// The session's own manifest describes its complete memory image,
+    /// so the fallback is a full-fidelity restore; it only forgoes
+    /// shared-base density the mismatched session could never use.
+    /// Returns `(backend, fell_back)`; the caller MUST drop the
+    /// template-keyed base shm when `fell_back` is true — that file is
+    /// sized for the canonical layout and is invalid for this session.
+    pub async fn build_with_canonical_fallback(
+        canonical_ref: engram_core::types::manifest::ManifestRef,
+        session_ref: engram_core::types::manifest::ManifestRef,
+        session_manifest_json: Option<&Path>,
+        blob: Arc<dyn BlobStorage>,
+        cache_root: &Path,
+        populate: Option<std::sync::Arc<crate::populate_client::PopulateClient>>,
+    ) -> Result<(Self, bool), ChunkedBackendError> {
+        match Self::from_blob_with_session_json(
+            canonical_ref,
+            session_ref,
+            session_manifest_json,
+            blob.clone(),
+            cache_root,
+            populate.clone(),
+        )
+        .await
+        {
+            Ok(b) => Ok((b, false)),
+            Err(ChunkedBackendError::Mismatch(m)) if canonical_ref != session_ref => {
+                tracing::warn!(
+                    mismatch = %m,
+                    canonical = %canonical_ref,
+                    session = %session_ref,
+                    "canonical/session manifest mismatch; failing open to \
+                     canonical == session (session-keyed restore, no shared base)",
+                );
+                Self::from_blob_with_session_json(
+                    session_ref,
+                    session_ref,
+                    session_manifest_json,
+                    blob,
+                    cache_root,
+                    populate,
+                )
+                .await
+                .map(|b| (b, true))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn from_blob_with_session_json(
         canonical_ref: engram_core::types::manifest::ManifestRef,
         session_ref: engram_core::types::manifest::ManifestRef,
@@ -466,6 +518,112 @@ impl ChunkedMemoryBackend {
                 _ => None,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use engram_chunk_store::manifest::{ChunkRef, ManifestRef, MANIFEST_SCHEMA_VERSION};
+    use engram_chunk_store::{ChunkSize, ChunkStore};
+    use engram_storage_local::LocalBlobStorage;
+
+    fn mem_manifest(total_bytes: u64, chunk_size: u64, tag: u8) -> Manifest {
+        let n = total_bytes / chunk_size;
+        let chunks = (0..n)
+            .map(|i| ChunkRef {
+                offset: i * chunk_size,
+                hash: ChunkHash::of(&[tag, i as u8]),
+            })
+            .collect();
+        Manifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Memory,
+            chunk_size: ChunkSize::bytes(chunk_size),
+            total_bytes,
+            chunks,
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        }
+    }
+
+    async fn put(store: &ChunkStore, m: &Manifest) -> ManifestRef {
+        let r = ManifestRef::new();
+        store.put_manifest(r, m).await.unwrap();
+        r
+    }
+
+    /// #1066: a session whose layout predates a guest resize must fail
+    /// open to canonical == session instead of exiting — the loop that
+    /// stranded parked sessions for hours.
+    #[tokio::test]
+    async fn mismatched_canonical_falls_back_to_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = ChunkStore::new(blob.clone());
+        // Canonical: 8 MiB "template"; session: 4 MiB "old era".
+        let canonical = put(&store, &mem_manifest(8 << 20, 1 << 20, 0xca)).await;
+        let session = put(&store, &mem_manifest(4 << 20, 1 << 20, 0x5e)).await;
+
+        let (backend, fell_back) = ChunkedMemoryBackend::build_with_canonical_fallback(
+            canonical,
+            session,
+            None,
+            blob,
+            &dir.path().join("cache"),
+            None,
+        )
+        .await
+        .expect("fallback must succeed");
+        assert!(
+            fell_back,
+            "mismatch must trigger the session-canonical fallback"
+        );
+        assert_eq!(backend.total_bytes(), 4 << 20, "layout is the SESSION's");
+    }
+
+    /// Matching layouts keep the shared-base pairing (no fallback).
+    #[tokio::test]
+    async fn matching_canonical_does_not_fall_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = ChunkStore::new(blob.clone());
+        let canonical = put(&store, &mem_manifest(4 << 20, 1 << 20, 0xca)).await;
+        let session = put(&store, &mem_manifest(4 << 20, 1 << 20, 0x5e)).await;
+
+        let (_backend, fell_back) = ChunkedMemoryBackend::build_with_canonical_fallback(
+            canonical,
+            session,
+            None,
+            blob,
+            &dir.path().join("cache"),
+            None,
+        )
+        .await
+        .expect("matching layouts build");
+        assert!(!fell_back);
+    }
+
+    /// A mismatch with canonical == session has no fallback to take —
+    /// it must still bail loud (structurally impossible pairing).
+    #[tokio::test]
+    async fn identical_refs_never_loop_on_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = ChunkStore::new(blob.clone());
+        let session = put(&store, &mem_manifest(4 << 20, 1 << 20, 0x5e)).await;
+        let (_b, fell_back) = ChunkedMemoryBackend::build_with_canonical_fallback(
+            session,
+            session,
+            None,
+            blob,
+            &dir.path().join("cache"),
+            None,
+        )
+        .await
+        .expect("self-pairing builds");
+        assert!(!fell_back);
     }
 }
 

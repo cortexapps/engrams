@@ -489,7 +489,7 @@ mod linux {
             None => None,
         };
 
-        let backend = ChunkedMemoryBackend::from_blob_with_session_json(
+        let (backend, canonical_fell_back) = ChunkedMemoryBackend::build_with_canonical_fallback(
             args.canonical_manifest,
             args.session_manifest,
             args.session_manifest_json.as_deref(),
@@ -628,7 +628,17 @@ mod linux {
         // before run_listener binds the UDS. The host-agent orders FC's
         // load (which open(O_RDONLY)s + mmaps this file) after the socket
         // appears, so the file is always fully sized by then.
-        let base_shm = match args.base_shm.as_ref() {
+        // #1066: the base shm file is keyed and SIZED by the canonical
+        // template. When the backend fell back to canonical == session,
+        // pairing this session with the template's shm would be exactly
+        // the layout mismatch the fallback just avoided — run without a
+        // shared base instead (pre-D4 behavior; COPY-served pages).
+        let base_shm_arg = if canonical_fell_back {
+            None
+        } else {
+            args.base_shm.as_ref()
+        };
+        let base_shm = match base_shm_arg {
             Some(path) => {
                 let b = engram_uffd_handler::base_shm::BaseShm::open(path, backend.total_bytes())
                     .map_err(|e| format!("base shm: {e}"))?;
