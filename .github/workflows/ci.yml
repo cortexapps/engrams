@@ -596,9 +596,18 @@ jobs:
       - uses: pnpm/action-setup@v6
         with:
           version: 9
+      # Node 24 ("Krypton") is the newest LTS line: LTS since 2025-10-28,
+      # maintenance 2026-10-20, EOL 2028-04-30. Only even majors ever go LTS.
+      #
+      # This major is pinned in THREE places that must move together:
+      #   - here (the web lane)
+      #   - docker/web.Dockerfile   (`FROM node:<major>-alpine`)
+      #   - flake.nix               (`nodejs_<major>`, the `nix develop` shell)
+      # They had drifted to 20 / 24 / 22 respectively; Node 20 went EOL
+      # 2026-04-30, so CI was building on an unsupported runtime.
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
 
