@@ -213,6 +213,15 @@ pub enum SessionEvent {
     HarnessParked {
         at: DateTime<Utc>,
     },
+    /// No run is in flight but background subagents still run inside the
+    /// VM. NOT eviction-eligible (the idle detector soft-matches only
+    /// `harness_idle`/`harness_parked`); it IS an ADR 0108 attach signal
+    /// like both of them. Follows the `HarnessParked` client precedent:
+    /// persisted, not in the web subscription list or the orchestrator
+    /// frame taxonomy.
+    HarnessBusy {
+        at: DateTime<Utc>,
+    },
     /// Phase 1b: a prompt arrived while a run was in flight and was
     /// queued (type-ahead / steering). The harness owns the queue; the
     /// web renders this as a greyed, editable composer item keyed on
@@ -482,6 +491,7 @@ impl SessionEvent {
             Self::HarnessRunInterrupted { .. } => "run_interrupted",
             Self::HarnessIdle { .. } => "harness_idle",
             Self::HarnessParked { .. } => "harness_parked",
+            Self::HarnessBusy { .. } => "harness_busy",
             Self::HarnessPromptQueued { .. } => "prompt_queued",
             Self::HarnessPromptEdited { .. } => "prompt_edited",
             Self::HarnessPromptDequeued { .. } => "prompt_dequeued",
@@ -582,6 +592,7 @@ impl SessionEvent {
             HarnessEvent::RunInterrupted { run_id } => Self::HarnessRunInterrupted { run_id, at },
             HarnessEvent::Idle => Self::HarnessIdle { at },
             HarnessEvent::Parked => Self::HarnessParked { at },
+            HarnessEvent::Busy => Self::HarnessBusy { at },
             HarnessEvent::PromptQueued { prompt_id, summary } => Self::HarnessPromptQueued {
                 prompt_id,
                 summary,
@@ -1247,10 +1258,11 @@ fn harness_event_sink(
     outbox_wake: Arc<tokio::sync::Notify>,
 ) -> EventSink {
     // Per-session cache of the most-recent forwarded event kind. Used
-    // to drop a `harness_idle` or `harness_parked` that would land
-    // back-to-back with the same kind: harnesses re-announce their
-    // waiting state on reconnect, so an evict/resume cycle would
-    // otherwise append a redundant marker to the log on every cycle.
+    // to drop a `harness_idle` / `harness_parked` / `harness_busy` that
+    // would land back-to-back with the same kind: harnesses re-announce
+    // their waiting state on reconnect, so an evict/resume cycle (or a
+    // checkpoint-severed vsock reattach mid-subagent) would otherwise
+    // append a redundant marker to the log on every cycle.
     let last_kind: Arc<DashMap<SessionId, &'static str>> = Arc::new(DashMap::new());
     Arc::new(move |session_id, _sandbox_id, ev| {
         let events = events.clone();
@@ -1310,7 +1322,7 @@ fn harness_event_sink(
                     None
                 };
 
-            // ADR 0108 A3: an Idle/Parked announcement is the ATTACH
+            // ADR 0108 A3: an Idle/Parked/Busy announcement is the ATTACH
             // signal — the harness (re)announced its waiting state on a
             // live connection. Wake any backed-off Deliver op now:
             // delivery keys on the attach, never on a boot milestone or
@@ -1320,7 +1332,7 @@ fn harness_event_sink(
             // below: a re-announce after a reattach is exactly the
             // signal the incident waited 41 s for, and it is exactly
             // the shape the dedupe drops from the log.
-            if matches!(kind, "harness_idle" | "harness_parked") {
+            if matches!(kind, "harness_idle" | "harness_parked" | "harness_busy") {
                 // ADR 0108 A8: a harness that just announced Idle can
                 // take a prompt NOW — a row waiting out ACK_TIMEOUT
                 // from a forward into a dead link has no reason to
@@ -1358,7 +1370,7 @@ fn harness_event_sink(
             // upstream TTL bookkeeping in HarnessHub::reader_loop
             // already saw the event, so suppressing it here only
             // affects the persisted log + SSE bus.
-            if matches!(kind, "harness_idle" | "harness_parked")
+            if matches!(kind, "harness_idle" | "harness_parked" | "harness_busy")
                 && last_kind
                     .get(&session_id)
                     .map(|v| *v == kind)

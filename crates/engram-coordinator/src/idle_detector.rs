@@ -439,6 +439,26 @@ mod tests {
         );
     }
 
+    /// `harness_busy` (background subagents in flight) must NEVER
+    /// soft-nominate — that is the entire point of the kind. The hard
+    /// TTL still applies as the wedged-subagent backstop.
+    #[test]
+    fn busy_never_soft_fires_hard_still_applies() {
+        let now = Utc::now();
+        assert_eq!(
+            classify(&cfg(), &cand(now, 301, Some("harness_busy"), None), now),
+            None
+        );
+        assert_eq!(
+            classify(&cfg(), &cand(now, 20_000, Some("harness_busy"), None), now),
+            None
+        );
+        assert_eq!(
+            classify(&cfg(), &cand(now, 28_801, Some("harness_busy"), None), now),
+            Some(IdleKind::Hard)
+        );
+    }
+
     #[test]
     fn hard_fires_on_any_kind_past_hard_ttl() {
         let now = Utc::now();

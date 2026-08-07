@@ -251,24 +251,28 @@ pub enum HarnessEvent {
         result_summary: Option<String>,
     },
     /// Run finished cleanly (or failed terminally). After this, the
-    /// adapter MUST emit `Idle` to mark "awaiting user input."
+    /// adapter MUST emit exactly one waiting-state announcement:
+    /// `Idle`, `Parked`, or — when background subagents are still in
+    /// flight — `Busy`.
     RunCompleted { run_id: String, ok: bool },
     /// ADR 0030: the in-flight run was stopped by an operator
     /// interrupt (the adapter SIGINT'd its current child in response
     /// to `HarnessCommand::Interrupt`). Distinct from a clean/failed
     /// `RunCompleted` so the transcript can show an "interrupted"
     /// marker. Like `RunCompleted`, the adapter MUST follow this with
-    /// `Idle` — the session stays alive and the next prompt resumes it.
+    /// a waiting-state announcement (`Idle`, or `Busy` when background
+    /// subagents survive the interrupt) — the session stays alive and
+    /// the next prompt resumes it.
     RunInterrupted { run_id: String },
     /// Explicit "I'm awaiting user input." Engram's idle-eviction
     /// soft TTL fires N seconds after this. Adapters MUST emit it
     /// after every `RunCompleted` — UNLESS background subagents are
     /// still in flight: the session is not idle then (the VM itself is
     /// doing the work, and evicting it would freeze that work and
-    /// orphan the completion notification), so the adapter holds the
-    /// announcement and emits it when the last subagent drains.
-    /// Emitting redundantly (no run in between) just resets the soft
-    /// timer, which is fine but wasteful — don't do it.
+    /// orphan the completion notification), so the adapter announces
+    /// `Busy` instead and emits `Idle`/`Parked` when the last subagent
+    /// drains. Emitting redundantly (no run in between) just resets
+    /// the soft timer, which is fine but wasteful — don't do it.
     Idle,
     // ── Phase 1b: queued/steered prompts (ADR 0052). APPENDED after
     //    `Idle` so existing bincode variant indices (RunStarted=0 …
@@ -373,6 +377,21 @@ pub enum HarnessEvent {
         tool_call_id: String,
         intent: String,
     },
+    // ── Background subagents. APPENDED after `BrowserActivity` so existing
+    //    bincode variant indices never shift (… BrowserActivity=16,
+    //    Busy=17) — see tests/wire_golden.rs.
+    /// Explicit "no run is in flight, but the session is NOT waiting":
+    /// background subagents still run inside the VM. The idle detector's
+    /// soft TTL ignores this kind (only `harness_idle`/`harness_parked`
+    /// nominate), so the session stays resident while they work; the hard
+    /// TTL remains the wedged-subagent backstop. The coordinator treats it
+    /// as an ADR 0108 attach signal exactly like `Idle`/`Parked` — a
+    /// reattaching harness mid-subagent re-announces `Busy`, and durable
+    /// prompt delivery wakes without waiting out ACK_TIMEOUT. Follows the
+    /// `Parked` client precedent: persisted to the log, not in the web
+    /// subscription list or the orchestrator frame taxonomy (surfaces
+    /// adopt it when they render subagent status).
+    Busy,
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -410,6 +429,7 @@ impl HarnessEvent {
             Self::ToolCallRequested { .. } => "tool_call_requested",
             Self::Idle => "harness_idle",
             Self::Parked => "harness_parked",
+            Self::Busy => "harness_busy",
             Self::BrowserActivity { .. } => "browser_activity",
         }
     }
@@ -875,6 +895,7 @@ mod tests {
             run_id: "r1".into(),
         }));
         round_trip(HarnessFrame::Event(HarnessEvent::Idle));
+        round_trip(HarnessFrame::Event(HarnessEvent::Busy));
         round_trip(HarnessFrame::Event(HarnessEvent::TitleSuggested {
             title: "Fix the flaky test".into(),
         }));
@@ -1089,6 +1110,7 @@ mod tests {
         );
         assert_eq!(HarnessEvent::Idle.kind(), "harness_idle");
         assert_eq!(HarnessEvent::Parked.kind(), "harness_parked");
+        assert_eq!(HarnessEvent::Busy.kind(), "harness_busy");
         assert_eq!(
             HarnessEvent::BrowserActivity {
                 run_id: "r".into(),

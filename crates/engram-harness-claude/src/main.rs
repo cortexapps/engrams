@@ -2948,15 +2948,22 @@ mod adapter {
                                                     // can never deliver the
                                                     // completion notification
                                                     // that wakes the model).
-                                                    // Announce nothing; the
-                                                    // drain/wake-up path above
-                                                    // announces when they finish.
+                                                    // Announce Busy: the idle
+                                                    // detector ignores it, the
+                                                    // coordinator treats it as
+                                                    // the ADR 0108 attach
+                                                    // signal, and the drain/
+                                                    // wake-up path announces
+                                                    // Idle/Parked when the
+                                                    // subagents finish.
                                                     tracing::info!(
                                                         bg_agents,
                                                         "turn ended with background \
-                                                         subagents in flight; holding \
-                                                         idle announcement"
+                                                         subagents in flight; \
+                                                         announcing busy"
                                                     );
+                                                    emit(evt_tx, HarnessEvent::Busy)
+                                                        .await
                                                 } else {
                                                     emit(
                                                         evt_tx,
@@ -3327,14 +3334,25 @@ mod adapter {
                         }
                     }
                 }
-                // A fresh connection attached: re-announce `Idle` iff idle
-                // so the host re-arms its soft TTL. A mid-turn reattach
-                // emits none — and neither does one mid-background-subagent
-                // (the session is busy; re-announcing Idle would re-arm the
-                // very eviction the turn-end hold prevented).
+                // A fresh connection attached: re-announce the waiting state
+                // so the host re-arms its soft TTL — `Idle` iff idle, `Busy`
+                // iff between turns with background subagents in flight
+                // (re-announcing Idle there would re-arm the very eviction
+                // the turn-end Busy prevented, and announcing NOTHING would
+                // drop the ADR 0108 attach signal that wakes durable prompt
+                // delivery — checkpoint-severed vsock reattaches are routine
+                // mid-subagent). A mid-turn reattach emits none.
                 _ = reattach.notified() => {
-                    if turn.is_none() && bg_agents == 0 {
-                        emit(evt_tx, HarnessEvent::Idle).await;
+                    if turn.is_none() {
+                        emit(
+                            evt_tx,
+                            if bg_agents > 0 {
+                                HarnessEvent::Busy
+                            } else {
+                                HarnessEvent::Idle
+                            },
+                        )
+                        .await;
                     }
                 }
                 _ = &mut sleeper => {
@@ -5421,12 +5439,12 @@ mod adapter {
         }
 
         /// A turn that ends while a background subagent runs must announce
-        /// NOTHING — not Idle, not Parked (either makes the session an
+        /// `Busy` — never Idle or Parked (either makes the session an
         /// eviction candidate, and a parked VM can never deliver the
-        /// completion notification). A reattach during that window must
-        /// stay quiet too (it re-announces Idle otherwise).
+        /// completion notification). A reattach during that window
+        /// re-announces `Busy` (the ADR 0108 attach signal), never Idle.
         #[tokio::test]
-        async fn turn_end_with_background_subagents_holds_idle() {
+        async fn turn_end_with_background_subagents_announces_busy() {
             let script = write_persistent_fake_claude(&[
                 r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"launched"}]}}"#,
                 BG_ONE_AGENT,
@@ -5455,9 +5473,17 @@ mod adapter {
             let run_id = expect_run_started(&mut evt_rx).await;
             expect_agent_message(&mut evt_rx, "launched").await;
             assert_eq!(expect_run_completed(&mut evt_rx).await, run_id);
-            expect_silence(&mut evt_rx, "idle held while subagent in flight").await;
+            assert!(
+                matches!(evt_rx.recv().await, Some(HarnessEvent::Busy)),
+                "turn end with subagents in flight announces Busy",
+            );
+            expect_silence(&mut evt_rx, "no Idle/Parked after the Busy").await;
             reattach.notify_one();
-            expect_silence(&mut evt_rx, "reattach re-announce held too").await;
+            assert!(
+                matches!(evt_rx.recv().await, Some(HarnessEvent::Busy)),
+                "reattach mid-subagent re-announces Busy (attach signal)",
+            );
+            expect_silence(&mut evt_rx, "no Idle after the reattach Busy").await;
 
             cmd_tx
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
@@ -5511,6 +5537,7 @@ mod adapter {
             let run_id = expect_run_started(&mut evt_rx).await;
             expect_agent_message(&mut evt_rx, "launched").await;
             assert_eq!(expect_run_completed(&mut evt_rx).await, run_id);
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Busy)));
             // Drain-first order: the inventory empties before the wake-up's
             // first message, so the never-woke guarantee Idle fires here.
             assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
@@ -5573,6 +5600,7 @@ mod adapter {
             let run_id = expect_run_started(&mut evt_rx).await;
             expect_agent_message(&mut evt_rx, "launched").await;
             assert_eq!(expect_run_completed(&mut evt_rx).await, run_id);
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Busy)));
             expect_silence(&mut evt_rx, "tagged line must not start a turn").await;
 
             cmd_tx
