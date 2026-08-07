@@ -509,3 +509,60 @@ swap resolved to "off" everywhere until Phase 5's canary.
 6. **VZ parity.** Sparse RW swap disk in the VZ backend (near-identical
    mechanism); agentd and capture logic are shared already. `just vz-test`
    coverage mirroring the FC test.
+
+## Implementation notes (divergences and accepted risks, 2026-08-06)
+
+The phases above landed as PRs #1050–#1055. Divergences from the
+proposal, plus the accepted risks an adversarial review made explicit —
+appended per the bookend norm, the original body stands.
+
+1. **No `SnapshotMetadata.swap_size_mib`.** The FC sidecar persists the
+   full `SandboxSpec`, so restore reads the recorded `swap_mib` —
+   capture and restore cannot skew, and a second copy would only be a
+   disagreement channel.
+2. **Restore re-points the drive by symlink-under-lock** (the rootfs
+   ADR 0048 pattern), not `patch_drive` in the paused window. No
+   pause-window work at all.
+3. **Periodic refusal = skip + counter.** The continuously-flushed disk
+   IS that tick's checkpoint; no new disk-only record type exists.
+4. **Terminal refusal = typed error + requeue in v1.** Sustained
+   refusal escalates through the existing eviction quarantine ladder to
+   destroy + rung-2 disk recovery — the disk-only eviction by another
+   road. A clean dedicated leg (drain disk, skip memory, record
+   disk-only) is REQUIRED BEFORE BROAD ROLLOUT; the single-image canary
+   accepts the ladder path. Terminal refusal needs an actively
+   thrashing guest at eviction time, which idle-eviction targets
+   rarely are.
+5. **The disarm→pause window is an accepted risk within the guest-root
+   trust model.** Between the pre-pause `swapoff` and the pause the
+   guest runs live, and a root process inside it could re-arm swap and
+   have swap PTEs captured — corrupting ITS OWN next restore. This is
+   deliberate self-harm with blast radius confined to that guest, in
+   the same class as the equally-available `dd of=/dev/vda` over its
+   own rootfs lineage: guests hold root by design (dev-brain runs
+   Docker in-guest, which needs CAP_SYS_ADMIN, so a capability drop is
+   not available as a mitigation). No tenant or host boundary is
+   involved. Accepted; not enforced.
+6. **The teleport guard is HOST-side** (`migration_presetup` refuses
+   with the existing `InvalidSpec` → snapshot-rehome semantics). The
+   live sandbox spec is the authoritative swap source; an image row can
+   drift after capture.
+7. **D5's placement term is committed-aware, not prospective.** The
+   floor subtracts the heartbeat-reported committed swap of EXISTING
+   sandboxes; the incoming session's own `swap_mib` is not yet part of
+   admission, and concurrent placements can stack within one heartbeat
+   interval. Bounded (swap ≤ mem/4, memory is hard-reserved), but the
+   original "reservation-safe" phrasing overstated v1. Prospective
+   reservation (thread `resolved_swap_mib` through `ScheduleContext`)
+   is the recorded follow-up, sized by canary overcommit data.
+8. **Kill-switch semantics.** `ENGRAM_GUEST_SWAP=off` rides the
+   spawn-delivered session/image env (built from the CURRENT config at
+   bind time), reaching every session at its NEXT BIND with no
+   re-capture — and actively disarming an armed guest. It is not
+   instant: a session that never re-binds keeps swap until captured or
+   re-bound. agentd's process env (frozen into the base snapshot) is a
+   boot-time fallback only and cannot reach existing guests by itself.
+9. **The disarm decision is pure** (`engram_host_core::plan_swap_disarm`
+   beside `plan_capture_disk_drain` — ADR 0098 discipline), and the
+   re-arm is cancellation-safe (a drop-guard fires the `swapon` on
+   every capture exit, not just success).

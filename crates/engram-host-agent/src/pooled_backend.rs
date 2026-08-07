@@ -482,6 +482,72 @@ struct QuarantinedSurvivor {
     retry_attempts: u64,
 }
 
+pub(crate) use engram_host_core::SwapDisarmPolicy;
+
+/// ADR 0112 D3: outcome of a successful pre-capture swap disarm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwapDisarm {
+    /// No swap device / never armed — nothing to do, nothing to re-arm.
+    NoSwap,
+    /// `swapoff` completed; the capture must re-arm after the guest
+    /// resumes.
+    Disarmed,
+}
+
+/// ADR 0112 D3: sentinel prefix on the refusal error. Callers
+/// (`run_checkpoint_pass`, the coordinator's eviction redrive) match
+/// it to tell "expected degradation under memory pressure" from a
+/// broken capture.
+pub(crate) const SWAP_DISARM_REFUSED: &str = "swap-disarm-refused:";
+
+/// ADR 0112 D3 (adversarial-review finding): cancellation-safe swap
+/// re-arm. Constructed right after a successful disarm; every exit
+/// from the capture — success, error `?`, or a dropped future — fires
+/// the detached best-effort `swapon` exactly once, so a transient
+/// capture failure never strands a live guest swapless. Holds a
+/// STRONG backend Arc for its short window (disarm→snapshot) so the
+/// Drop path can still spawn during teardown races.
+struct SwapRearmGuard {
+    target: Option<(Arc<PooledBackend>, SandboxId)>,
+}
+
+impl SwapRearmGuard {
+    fn new(backend: Option<Arc<PooledBackend>>, id: SandboxId) -> Self {
+        Self {
+            target: backend.map(|b| (b, id)),
+        }
+    }
+
+    /// True when a disarm happened but no self_ref was installed —
+    /// the only configuration where the guard cannot protect (warned
+    /// at the construction site).
+    fn is_disarmed_without_target(&self) -> bool {
+        self.target.is_none()
+    }
+
+    /// The success path's explicit fire (same instant the pre-guard
+    /// code re-armed). Idempotent with Drop via `take()`.
+    fn fire_now(&mut self) {
+        if let Some((backend, id)) = self.target.take() {
+            backend.spawn_swap_rearm(id);
+        }
+    }
+}
+
+impl Drop for SwapRearmGuard {
+    fn drop(&mut self) {
+        // Reached only when `fire_now` didn't run — an error or
+        // cancellation between disarm and the capture's success tail.
+        if let Some((backend, id)) = self.target.take() {
+            tracing::info!(
+                sandbox_id = %id,
+                "capture exited early after swap disarm; re-arming the live guest",
+            );
+            backend.spawn_swap_rearm(id);
+        }
+    }
+}
+
 /// Wraps an inner [`SandboxBackend`] (FC or VZ) with host-side
 /// resource resolution: image cache, chunk store, materialize-to-
 /// file, optional NBD daemon, optional egress proxy.
@@ -1198,6 +1264,209 @@ impl PooledBackend {
         Err(SandboxError::Snapshot(
             "pre-capture guest sync: exec stream ended without an exit status".into(),
         ))
+    }
+
+    /// ADR 0112: run a short command in the guest and collect its
+    /// stdout. `sh -c` for busybox/full-image PATH parity, bounded by
+    /// `timeout`, error on nonzero exit. The swap disarm/re-arm legs
+    /// use this; keep it small (stdout is buffered whole).
+    async fn exec_capture_stdout(
+        &self,
+        id: SandboxId,
+        script: &str,
+        timeout: std::time::Duration,
+        what: &str,
+    ) -> Result<String, SandboxError> {
+        use engram_core::types::sandbox::ExecEvent;
+        use futures::StreamExt;
+        let req = ExecRequest {
+            command: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            stdin: None,
+            env: std::collections::HashMap::new(),
+            workdir: None,
+            timeout: Some(timeout),
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+        };
+        let stream = self
+            .exec_stream(id, req)
+            .await
+            .map_err(|e| SandboxError::Snapshot(format!("{what}: exec: {e}")))?;
+        let mut events = stream.events;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        while let Some(ev) = events.next().await {
+            match ev {
+                ExecEvent::Stdout(b) => stdout.extend_from_slice(&b),
+                ExecEvent::Stderr(b) => stderr.extend_from_slice(&b),
+                ExecEvent::Exit(Some(0)) => {
+                    return Ok(String::from_utf8_lossy(&stdout).into_owned())
+                }
+                ExecEvent::Exit(status) => {
+                    return Err(SandboxError::Snapshot(format!(
+                        "{what}: exited {status:?} (stderr: {})",
+                        String::from_utf8_lossy(&stderr),
+                    )));
+                }
+                ExecEvent::Refused(reason) => {
+                    return Err(SandboxError::Snapshot(format!(
+                        "{what}: exec refused: {reason}"
+                    )));
+                }
+            }
+        }
+        Err(SandboxError::Snapshot(format!(
+            "{what}: exec stream ended without an exit status"
+        )))
+    }
+
+    /// ADR 0112: the spec gate for the capture-time swap protocol.
+    /// `None`/0 ⇒ no swap device was ever attached, so the
+    /// disarm/re-arm legs are skipped entirely. The trait default is
+    /// `None`, which structurally confines the protocol to backends
+    /// that opt in (FC) — the Process backend's `exec` runs commands
+    /// ON THE HOST, where a `swapoff -a` would be catastrophic.
+    fn sandbox_swap_mib(&self, id: SandboxId) -> Option<u32> {
+        self.inner.swap_mib(id).filter(|m| *m > 0)
+    }
+
+    /// ADR 0112 D3: disarm guest swap ahead of a memory capture — the
+    /// core invariant is that NO restorable memory image contains swap
+    /// PTEs (restore pairs the image with a fresh zero-filled device;
+    /// live swap state pointing into it is silent corruption, worse
+    /// than ADR 0028 Defect B). Runs while the guest is live, so it
+    /// extends capture wall-time, never the guest-visible pause.
+    ///
+    /// Guarded, not unconditional — the DECISION is the pure
+    /// [`engram_host_core::plan_swap_disarm`] (unit-tested, simulator-
+    /// drivable): refuse when the page-back-in can't fit, and above
+    /// the used-swap ceiling for the periodic flavor. A swapoff that
+    /// FAILS also errors: capture must never proceed with swap
+    /// possibly armed.
+    ///
+    /// In the healthy steady state (swappiness tuned, RAM sized right)
+    /// swap used is ≈0 and this is one exec round trip.
+    async fn swap_disarm(
+        &self,
+        id: SandboxId,
+        policy: SwapDisarmPolicy,
+    ) -> Result<SwapDisarm, SandboxError> {
+        if self.sandbox_swap_mib(id).is_none() {
+            return Ok(SwapDisarm::NoSwap);
+        }
+        let started = crate::time_source::metrics_now();
+        let meminfo = self
+            .exec_capture_stdout(
+                id,
+                "cat /proc/meminfo",
+                std::time::Duration::from_secs(30),
+                "swap-disarm meminfo probe",
+            )
+            .await?;
+        let field = |name: &str| -> Option<u64> {
+            meminfo.lines().find_map(|l| {
+                l.strip_prefix(name)?
+                    .trim_start_matches(':')
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+        };
+        let (Some(total), Some(free), Some(available)) =
+            (field("SwapTotal"), field("SwapFree"), field("MemAvailable"))
+        else {
+            return Err(SandboxError::Snapshot(format!(
+                "swap-disarm: /proc/meminfo missing Swap/MemAvailable fields:\n{meminfo}"
+            )));
+        };
+        let used_kb = match engram_host_core::plan_swap_disarm(total, free, available, policy) {
+            engram_host_core::SwapDisarmPlan::NoSwap => {
+                // Device attached but never armed (kill switch, arm
+                // failure) — nothing to disarm.
+                return Ok(SwapDisarm::NoSwap);
+            }
+            engram_host_core::SwapDisarmPlan::Refuse {
+                used_kb,
+                mem_available_kb,
+                reason,
+            } => {
+                metrics::counter!(
+                    crate::metrics::SWAP_DISARM_REFUSED_TOTAL,
+                    "flavor" => policy.label(),
+                )
+                .increment(1);
+                // TOCTOU note: usage can grow between the probe and a
+                // swapoff; the plan's margin absorbs it, and a swapoff
+                // that still can't fit fails loudly rather than OOMing.
+                return Err(SandboxError::Snapshot(format!(
+                    "{SWAP_DISARM_REFUSED} {} (used_kb={used_kb} \
+                     mem_available_kb={mem_available_kb} flavor={})",
+                    reason.as_str(),
+                    policy.label(),
+                )));
+            }
+            engram_host_core::SwapDisarmPlan::Disarm { used_kb } => used_kb,
+        };
+        // NOT `swapoff -a`: busybox's `-a` reads /etc/fstab ONLY — on a
+        // guest whose swap was armed by explicit `swapon /dev/vdX`
+        // (ours always is) it exits 1 on a missing fstab and, worse,
+        // silently disarms NOTHING when an fstab exists. Enumerate
+        // /proc/swaps and disarm each entry explicitly, then VERIFY the
+        // table is empty — the exit code now proves the invariant
+        // in-guest instead of trusting a userland's `-a` semantics.
+        self.exec_capture_stdout(
+            id,
+            "for d in $(awk 'NR>1{print $1}' /proc/swaps); do \
+                 swapoff \"$d\" || exit 1; done && \
+             [ \"$(awk 'NR>1' /proc/swaps | wc -l)\" -eq 0 ]",
+            std::time::Duration::from_secs(300),
+            "swap-disarm swapoff",
+        )
+        .await?;
+        metrics::histogram!(crate::metrics::SWAP_DISARM_SECONDS)
+            .record(started.elapsed().as_secs_f64());
+        tracing::info!(
+            sandbox_id = %id,
+            used_kb,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "guest swap disarmed for capture",
+        );
+        Ok(SwapDisarm::Disarmed)
+    }
+
+    /// ADR 0112 D3: re-arm guest swap after the memory capture
+    /// returned and the guest is running again. Detached + best-effort:
+    /// a guest left swapless is safe (pre-0112 behavior), logged, and
+    /// the next bind re-arms fully. No `mkswap` — the signature
+    /// survives `swapoff` within a residence.
+    /// See [`SwapRearmGuard`] — the cancellation-safe wrapper every
+    /// capture flavor holds across the disarm→snapshot window.
+    fn spawn_swap_rearm(self: &Arc<Self>, id: SandboxId) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let script = "for d in /sys/block/vd*; do n=$(basename $d); \
+                          [ \"$n\" != vda ] && [ \"$(cat $d/ro)\" = 0 ] && \
+                          swapon /dev/$n; done";
+            match this
+                .exec_capture_stdout(
+                    id,
+                    script,
+                    std::time::Duration::from_secs(30),
+                    "swap re-arm",
+                )
+                .await
+            {
+                Ok(_) => tracing::info!(sandbox_id = %id, "guest swap re-armed after capture"),
+                Err(e) => tracing::warn!(
+                    sandbox_id = %id,
+                    error = %e,
+                    "guest swap re-arm failed; guest runs swapless until next bind",
+                ),
+            }
+        });
     }
 
     /// Run an image's capture-time `[warm]` hook ([`WarmConfig`]) in the
@@ -2221,7 +2490,7 @@ impl PooledBackend {
         &self,
         id: SandboxId,
     ) -> Result<DeferredSnapshot, SandboxError> {
-        let (capture_guard, cap) = self.capture_phase(id).await?;
+        let (capture_guard, cap) = self.capture_phase(id, SwapDisarmPolicy::Terminal).await?;
         self.spawn_trace_publish(id);
         let finisher = self.finisher();
         Ok(DeferredSnapshot {
@@ -2381,6 +2650,7 @@ impl PooledBackend {
     async fn capture_phase(
         &self,
         id: SandboxId,
+        swap_policy: SwapDisarmPolicy,
     ) -> Result<(tokio::sync::OwnedMutexGuard<()>, SnapshotCapture), SandboxError> {
         let capture_lock = self.capture_lock(id);
         // ADR 0038 B0: time the lock wait — the gridlock signal. With
@@ -2404,6 +2674,43 @@ impl PooledBackend {
                  captures next"
                     .into(),
             ));
+        }
+        // ADR 0112 D3: disarm guest swap BEFORE the write-ahead chain
+        // invalidate below — a refusal (or a failed swapoff) exits with
+        // NOTHING consumed: the chain head, the dirty bitmap, and the
+        // guest all stay intact, and the caller's redrive retries. The
+        // guest is live during the swapoff, so the cost lands on
+        // capture wall-time, never the guest-visible pause. Skipped
+        // entirely (`NoSwap`) for sandboxes without a swap device —
+        // the `swap_mib` trait gate keeps this off Process/VZ execs.
+        match self.inner.wait_agent_ready(id).await {
+            Ok(()) | Err(SandboxError::InvalidSpec(_)) => {}
+            Err(e) => {
+                return Err(SandboxError::Snapshot(format!(
+                    "wait_agent_ready before swap disarm: {e}"
+                )))
+            }
+        }
+        let swap_disarm = self.swap_disarm(id, swap_policy).await?;
+        // ADR 0112 (adversarial-review finding): the re-arm must be
+        // CANCELLATION-SAFE, not success-path-only. A snapshot error,
+        // an early `?`, or a dropped future after a successful swapoff
+        // would otherwise leave a LIVE guest swapless — back to the
+        // OOM-prone behavior this feature exists to fix — until its
+        // next bind. The guard spawns the re-arm on drop; the success
+        // path fires it explicitly at the same point it always did.
+        let mut swap_rearm = SwapRearmGuard::new(
+            (swap_disarm == SwapDisarm::Disarmed)
+                .then(|| self.self_ref.get().and_then(std::sync::Weak::upgrade))
+                .flatten(),
+            id,
+        );
+        if swap_disarm == SwapDisarm::Disarmed && swap_rearm.is_disarmed_without_target() {
+            tracing::warn!(
+                sandbox_id = %id,
+                "swap re-arm guard has no self_ref (test harness?); a capture \
+                 failure leaves the guest swapless until next bind",
+            );
         }
         // Diff-mode when a checkpoint chain exists: same coherent
         // (memory, disk) capture contract, O(dirty set) cost. The
@@ -2684,6 +2991,12 @@ impl PooledBackend {
             }
         };
         let dest = self.inner.snapshot_path_for(metadata.id);
+        // ADR 0112 D3: the capture returned and the guest is running —
+        // re-arm swap (detached, best-effort; the memory image just
+        // captured contains NO swap state, which was the whole point).
+        // The guard also fires on every error/cancellation path above,
+        // so a failed capture never strands a live guest swapless.
+        swap_rearm.fire_now();
         // `create_res` was Ok ⟹ `inner.snapshot`/`snapshot_diff` brought
         // the guest back running. The guard rides into `SnapshotCapture`
         // (still armed) so the cancellation gap in `snapshot_begin` and
@@ -4269,9 +4582,33 @@ impl PooledBackend {
         id: SandboxId,
     ) -> Result<SnapshotMetadata, SandboxError> {
         use engram_core::traits::SandboxBackend as _;
-        let metadata = self.snapshot(id).await?;
+        // ADR 0112: Periodic swap-disarm policy — a deeply-swapped
+        // guest REFUSES the memory checkpoint (typed, nothing
+        // consumed) instead of paging GiBs back per 30 s tick; the
+        // continuously-flushed disk is that tick's durability.
+        let metadata = self
+            .snapshot_with_swap_policy(id, SwapDisarmPolicy::Periodic)
+            .await?;
         let _ = self.commit_snapshot(id).await;
         Ok(metadata)
+    }
+
+    /// ADR 0045 D5 composed capture with an explicit ADR 0112 swap
+    /// policy: capture, then run the post phase inline holding the
+    /// capture lock (the periodic-checkpoint and drain flavor;
+    /// eviction uses snapshot_begin/snapshot_wait).
+    pub(crate) async fn snapshot_with_swap_policy(
+        &self,
+        id: SandboxId,
+        swap_policy: SwapDisarmPolicy,
+    ) -> Result<SnapshotMetadata, SandboxError> {
+        let (_capture_guard, cap) = self.capture_phase(id, swap_policy).await?;
+        // Lift the per-jail working-set trace into the blob store under the
+        // session-canonical key so the next resume prefaults it (#517 keyed
+        // the replay; the handler can't publish it itself — SIGKILLed on
+        // destroy). Detached + best-effort; never blocks the capture.
+        self.spawn_trace_publish(id);
+        self.finisher().finish(id, cap).await
     }
 
     /// ADR 0016 Phase B commit 4: build a coord-bound publisher
@@ -7196,16 +7533,11 @@ impl SandboxBackend for PooledBackend {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        // ADR 0045 D5: composed form — capture, then run the post phase
-        // inline holding the capture lock (the periodic-checkpoint and
-        // drain flavor; eviction uses snapshot_begin/snapshot_wait).
-        let (_capture_guard, cap) = self.capture_phase(id).await?;
-        // Lift the per-jail working-set trace into the blob store under the
-        // session-canonical key so the next resume prefaults it (#517 keyed
-        // the replay; the handler can't publish it itself — SIGKILLed on
-        // destroy). Detached + best-effort; never blocks the capture.
-        self.spawn_trace_publish(id);
-        self.finisher().finish(id, cap).await
+        // ADR 0112: trait callers are the drain / operator / base-bake
+        // flavors — Terminal disarm. The periodic checkpoint reaches
+        // the same pipeline through `snapshot_with_swap_policy`.
+        self.snapshot_with_swap_policy(id, SwapDisarmPolicy::Terminal)
+            .await
     }
 
     /// ADR 0045 D5 (rewritten for issue #529): the eviction flavor. Runs
@@ -7253,7 +7585,7 @@ impl SandboxBackend for PooledBackend {
             ));
         };
 
-        let (capture_guard, cap) = self.capture_phase(id).await?;
+        let (capture_guard, cap) = self.capture_phase(id, SwapDisarmPolicy::Terminal).await?;
         // Publish the working-set trace for the next resume's prefault (see
         // `spawn_trace_publish`); detached, never blocks the eviction.
         self.spawn_trace_publish(id);
@@ -10611,7 +10943,7 @@ mod tests {
             .unwrap();
 
         pooled.quiesce_captures_for_shutdown();
-        let err = match pooled.capture_phase(id).await {
+        let err = match pooled.capture_phase(id, SwapDisarmPolicy::Terminal).await {
             Ok(_) => panic!("a quiesced capture must refuse"),
             Err(e) => e,
         };

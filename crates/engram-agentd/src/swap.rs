@@ -80,9 +80,27 @@ pub fn arm_at_bind(env: &std::collections::HashMap<String, String>) {
     let bind_off = env.get(GUEST_SWAP_ENV).map(String::as_str);
     let process_off = std::env::var(GUEST_SWAP_ENV).ok();
     if switched_off(bind_off) || switched_off(process_off.as_deref()) {
-        tracing::info!("guest swap disabled via {GUEST_SWAP_ENV}=off; disarming if armed");
-        if !run_logged("swapoff", &["-a"]) {
-            tracing::warn!("kill-switch swapoff failed; swap may remain armed until retry");
+        // Explicit device, NOT `swapoff -a`: busybox's `-a` reads
+        // /etc/fstab only — it errors on a missing fstab and silently
+        // disarms nothing when one exists, since our swap is armed by
+        // explicit `swapon /dev/vdX`, never an fstab entry.
+        match find_swap_device(Path::new("/sys/block")) {
+            Some(dev) if swap_is_active(Path::new("/proc/swaps"), &dev) == Some(true) => {
+                tracing::info!(
+                    dev,
+                    "guest swap disabled via {GUEST_SWAP_ENV}=off; disarming",
+                );
+                let node = format!("/dev/{dev}");
+                if !run_logged("swapoff", &[&node]) {
+                    tracing::warn!(
+                        dev,
+                        "kill-switch swapoff failed; swap may remain armed until retry",
+                    );
+                }
+            }
+            _ => tracing::info!(
+                "guest swap disabled via {GUEST_SWAP_ENV}=off; nothing armed to disarm",
+            ),
         }
         return;
     }

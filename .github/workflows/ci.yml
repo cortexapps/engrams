@@ -926,6 +926,7 @@ jobs:
             --test eviction_finalize_redrive \
             --test chain_rehydrate \
             --test egress_survives_roll \
+            --test swap_capture \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

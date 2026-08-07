@@ -44,6 +44,7 @@ pub mod reattach;
 pub mod shutdown;
 pub mod startup;
 pub mod survivor;
+pub mod swap;
 
 pub use checkpoint::checkpoint_tail_admits_publish;
 pub use coord::{
@@ -67,6 +68,7 @@ pub use startup::{
 pub use survivor::{
     plan_capture_disk_drain, plan_resume_attach, CaptureDrainPlan, ResumeAttachPlan,
 };
+pub use swap::{plan_swap_disarm, SwapDisarmPlan, SwapDisarmPolicy, SwapRefuseReason};
 
 pub use shutdown::{
     admits_new_plane, classify_survivor, flush_budget, is_straggler, nbd_drop_action,

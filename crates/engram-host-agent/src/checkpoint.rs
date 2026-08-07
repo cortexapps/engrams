@@ -596,6 +596,26 @@ pub async fn run_checkpoint_pass(
                 );
             }
             Err(e) => {
+                // ADR 0112 D3: a swap-disarm refusal is the DESIGNED
+                // degradation, not a failure — the guest is deep in
+                // swap and paging it back per tick would thrash. Its
+                // disk stays durable on the continuous flush (that IS
+                // this tick's checkpoint; recovery = rung 2). Counted
+                // (`engram_swap_disarm_refused_total{flavor=periodic}`
+                // inside the disarm) — a sustained rate means the
+                // image is under-sized. Skip the dead-guest probe:
+                // the guest answered the meminfo exec, it is alive.
+                if e.to_string()
+                    .contains(crate::pooled_backend::SWAP_DISARM_REFUSED)
+                {
+                    tracing::info!(
+                        %sandbox_id,
+                        %session_id,
+                        error = %e,
+                        "periodic checkpoint degraded to disk-only (swap disarm refused)",
+                    );
+                    continue;
+                }
                 tracing::warn!(
                     %sandbox_id,
                     %session_id,
