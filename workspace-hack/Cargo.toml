@@ -23,7 +23,7 @@ bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
-der = { version = "0.7", default-features = false, features = ["oid", "pem", "std"] }
+der = { version = "0.8", default-features = false, features = ["oid", "pem", "std"] }
 deranged = { version = "0.5", features = ["serde"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
