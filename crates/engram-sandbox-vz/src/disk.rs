@@ -159,6 +159,41 @@ pub(crate) fn per_sandbox_rootfs_path(
     work_dir.join(format!("{sandbox_id}.rootfs.ext4"))
 }
 
+/// ADR 0112: the per-residence sparse swap backing file, sibling of the
+/// rootfs clone. FRESH every create/restore (swap contents are
+/// discarded at capture by contract); removed with the rootfs at
+/// destroy.
+pub(crate) fn per_sandbox_swap_path(
+    work_dir: &Path,
+    sandbox_id: engram_core::types::ids::SandboxId,
+) -> std::path::PathBuf {
+    work_dir.join(format!("{sandbox_id}.swap.img"))
+}
+
+/// ADR 0112: create (truncate) the sparse swap backing, sized to
+/// exactly `swap_mib` — the virtio device size IS the per-sandbox cap.
+pub(crate) async fn create_sparse_swap(path: &Path, swap_mib: u32) -> Result<(), std::io::Error> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        // 0600, never the ambient umask (adversarial-review finding):
+        // unlike FC's unlinked-after-attach backing, this file keeps
+        // its name for the VM's whole lifetime and holds guest memory
+        // in plaintext — the FC implementation sets the same mode.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.set_len(u64::from(swap_mib) * 1024 * 1024)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
 /// Filename of the rootfs clone inside a snapshot directory.
 /// Sibling to `manifest.json`. The snapshot's rootfs replaces the
 /// previous (broken) `state.bin` — we don't save VZ memory state

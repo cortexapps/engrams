@@ -341,6 +341,23 @@ impl VzBackend {
     /// backend. Lives under `<work_dir>/snapshots/<id>/` rather
     /// than the per-sandbox dir, so destroy(sandbox) doesn't
     /// take its snapshots with it.
+    /// ADR 0112: create the per-residence sparse swap backing when the
+    /// size is non-zero; returns the path for `VmConfig::with_swap_path`.
+    async fn prepare_swap_backing(
+        &self,
+        sandbox_id: SandboxId,
+        swap_mib: Option<u32>,
+    ) -> Result<Option<PathBuf>, SandboxError> {
+        let Some(mib) = swap_mib.filter(|m| *m > 0) else {
+            return Ok(None);
+        };
+        let path = crate::disk::per_sandbox_swap_path(&self.work_dir, sandbox_id);
+        crate::disk::create_sparse_swap(&path, mib)
+            .await
+            .map_err(|e| SandboxError::Vm(format!("create swap backing: {e}").into()))?;
+        Ok(Some(path))
+    }
+
     fn snapshot_dir_for(&self, snapshot_id: SnapshotId) -> PathBuf {
         self.work_dir
             .join("snapshots")
@@ -538,12 +555,19 @@ impl VzBackend {
         rootfs_path: &Path,
         spec: &SandboxSpec,
     ) -> Result<SandboxId, SandboxError> {
+        // ADR 0112: the warm-restore config must match the SAVED device
+        // shape, so the swap drive rides the warm block's recorded size
+        // (never a recompute from today's spec). Contents are a FRESH
+        // zero-filled file — safe because capture disarmed swap (the
+        // pooled backend's capture_phase ran swapoff before the save).
+        let swap_path = self.prepare_swap_backing(new_id, w.swap_mib).await?;
         let vm_cfg = VmConfig::new(
             self.cfg.kernel_path.clone(),
             rootfs_path.to_path_buf(),
             w.memory_mib,
             w.vcpus,
         )
+        .with_swap_path(swap_path)
         .with_aux_ro_drives(w.aux_ro_drives.clone(), self.cfg.bundle_dir.clone())
         // Gate-checked equal to the saved cmdline.
         .with_egress_ports(self.cfg.egress_ports)
@@ -694,12 +718,16 @@ impl VzBackend {
         // is a new machine (and fresh MACs keep the many-sessions-from-
         // one-base case collision-free). Warm restores inherit instead.
         let (machine_identifier, mac_address) = mint_vm_identity();
+        // ADR 0112: cold restores get a fresh sparse swap backing too —
+        // the guest re-runs agentd's boot arm (mkswap + swapon).
+        let swap_path = self.prepare_swap_backing(new_id, spec.swap_mib).await?;
         let vm_cfg = VmConfig::new(
             self.cfg.kernel_path.clone(),
             rootfs_path.clone(),
             memory_mib,
             vcpus,
         )
+        .with_swap_path(swap_path)
         .with_aux_ro_drives(spec.aux_ro_drives.clone(), self.cfg.bundle_dir.clone())
         .with_egress_ports(self.cfg.egress_ports)
         .with_machine_identifier(machine_identifier.clone())
@@ -1062,12 +1090,15 @@ impl SandboxBackend for VzBackend {
         // ADR 0096 D7: fresh pinned identity for this VM.
         let (machine_identifier, mac_address) = mint_vm_identity();
         let resolved_aux_ro_drives = aux_ro_drives.clone();
+        // ADR 0112: a fresh sparse swap backing per residence.
+        let swap_path = self.prepare_swap_backing(id, spec.swap_mib).await?;
         let vm_cfg = VmConfig::new(
             self.cfg.kernel_path.clone(),
             rootfs_path.clone(),
             memory_mib,
             vcpus,
         )
+        .with_swap_path(swap_path)
         // ADR 0061: attach this spec's skill bundles. During base-snapshot
         // capture these are sentinel placeholders (sha = None) and attach
         // nothing (except the agentd slot, resolved above); a plain
@@ -1395,6 +1426,8 @@ impl SandboxBackend for VzBackend {
         } else {
             self.cfg.default_vcpus
         };
+        // ADR 0112: the saved device shape includes the swap drive.
+        let swap_mib_for_warm = spec.swap_mib.filter(|m| *m > 0);
 
         // Flush the guest filesystem BEFORE pausing + cloning. The clone
         // captures only on-disk state (cold-boot restore, no memory image),
@@ -1468,6 +1501,9 @@ impl SandboxBackend for VzBackend {
                     aux_ro_drives: resolved_aux.clone(),
                     memory_mib,
                     vcpus,
+                    // ADR 0112: the saved device shape includes the swap
+                    // drive; restores re-attach a fresh file of this size.
+                    swap_mib: swap_mib_for_warm,
                 }),
                 Err(e) => {
                     tracing::warn!(
@@ -1600,6 +1636,10 @@ impl SandboxBackend for VzBackend {
         // sandbox with a fresh UUID still gets its own clone, so
         // we just log and move on. Persistent state lives in
         // snapshot directories, not here.
+        // ADR 0112: the swap backing is a per-sandbox sibling — remove it
+        // with the rootfs clone (NotFound is benign: no-swap sandboxes).
+        let _ =
+            tokio::fs::remove_file(crate::disk::per_sandbox_swap_path(&self.work_dir, id)).await;
         if let Err(e) = tokio::fs::remove_file(&state.rootfs_path).await {
             tracing::debug!(
                 error = %e,
@@ -1612,6 +1652,16 @@ impl SandboxBackend for VzBackend {
         // ObjC retains.
         drop(state);
         Ok(())
+    }
+
+    /// ADR 0112: the live spec's swap size — gates the pooled backend's
+    /// capture-time disarm/re-arm. Load-bearing on VZ despite its
+    /// dev-only role: the ADR 0096 WARM snapshot saves guest memory, so
+    /// a swap-armed VZ guest captured without the disarm would restore
+    /// with swap PTEs over a fresh zero-filled backing — the same
+    /// corruption class the FC path guards against.
+    fn swap_mib(&self, id: SandboxId) -> Option<u32> {
+        self.sandboxes.get(&id)?.spec.swap_mib
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {

@@ -266,6 +266,82 @@ async fn await_agent(backend: &VzBackend, id: SandboxId) {
     }
 }
 
+/// ADR 0112 VZ parity: a spec with `swap_mib` boots with exactly one
+/// writable non-vda virtio disk of that size, agentd arms it at boot
+/// (mkswap + swapon + vm.swappiness), and destroy removes the backing
+/// file. Mirrors the FC `swap_disk` assertions on the VZ attach path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
+async fn e2e_vz_swap_drive_arms() {
+    let env = match vz_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("workdir");
+    let backend = backend(&env, work.path(), false);
+
+    let mut s = spec(&env.rootfs);
+    s.swap_mib = Some(64);
+    let id = backend.create(s).await.expect("create with swap");
+    await_agent(&backend, id).await;
+
+    // Exactly one writable non-vda disk, sized 64 MiB (131072 sectors).
+    let (out, code) = exec(
+        &backend,
+        id,
+        "for d in /sys/block/vd*; do echo \"$(basename $d) $(cat $d/ro) $(cat $d/size)\"; done",
+    )
+    .await;
+    assert_eq!(code, Some(0), "probe exit; out={out}");
+    let writable: Vec<&str> = out
+        .lines()
+        .filter(|l| {
+            let mut it = l.split_whitespace();
+            let (name, ro) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
+            name != "vda" && ro == "0"
+        })
+        .collect();
+    assert_eq!(writable.len(), 1, "one writable non-vda disk: {out}");
+    assert!(
+        writable[0].ends_with(" 131072"),
+        "swap device size (sectors): {out}",
+    );
+
+    // agentd armed it at boot (may lag agent-up by a beat — poll).
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (swaps, code) = exec(&backend, id, "cat /proc/swaps").await;
+        if code == Some(0) && swaps.contains("/dev/vd") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agentd never armed swap; /proc/swaps: {swaps}",
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let (swappiness, _) = exec(&backend, id, "cat /proc/sys/vm/swappiness").await;
+    assert_eq!(swappiness.trim(), "100", "vm.swappiness applied");
+
+    // Destroy removes the per-sandbox backing file (the backend's
+    // work_dir is `<work>/sb` — see `backend()` above). Unlike FC's
+    // unlinked-after-attach backing this file keeps its name for the
+    // VM's lifetime, so its mode must be 0600 regardless of umask —
+    // it holds guest memory in plaintext.
+    let swap_backing = work.path().join("sb").join(format!("{id}.swap.img"));
+    assert!(swap_backing.exists(), "backing exists while running");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&swap_backing)
+            .expect("backing metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "swap backing must be private");
+    }
+    backend.destroy(id).await.expect("destroy");
+    assert!(!swap_backing.exists(), "backing removed at destroy");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
 async fn e2e_vz_lifecycle() {

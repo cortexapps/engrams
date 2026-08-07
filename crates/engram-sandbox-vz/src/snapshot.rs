@@ -103,6 +103,11 @@ pub(crate) struct WarmMachineState {
     /// mismatched config.
     pub(crate) memory_mib: u32,
     pub(crate) vcpus: u32,
+    /// ADR 0112: the saved VM's swap-drive size (device shape is part
+    /// of the restore-equality contract). `None` = no swap drive.
+    /// `serde(default)` for warm blocks written before the field.
+    #[serde(default)]
+    pub(crate) swap_mib: Option<u32>,
 }
 
 impl VzSnapshotManifest {
@@ -261,6 +266,7 @@ mod tests {
             aux_ro_drives: vec![],
             memory_mib: 1024,
             vcpus: 2,
+            swap_mib: Some(64),
         };
         let m = VzSnapshotManifest::new(SandboxId::new(), fake_spec(), Some(warm));
         let bytes = serde_json::to_vec(&m).unwrap();
@@ -270,6 +276,7 @@ mod tests {
         assert_eq!(w.mac_address, "0a:00:00:00:00:01");
         assert_eq!(w.memory_mib, 1024);
         assert_eq!(w.vcpus, 2);
+        assert_eq!(w.swap_mib, Some(64), "ADR 0112: swap shape survives");
     }
 
     #[tokio::test]

@@ -45,6 +45,11 @@ pub(crate) struct VmConfig {
     /// drives. Only entries with `sha256 = Some` attach (sentinels are
     /// skipped); attach order is `/dev/vdb`, `/dev/vdc`, …
     pub aux_ro_drives: Vec<AuxRoDrive>,
+    /// ADR 0112: per-residence sparse backing file for the guest's
+    /// ephemeral swap drive. Attached LAST (after the aux slots) as a
+    /// read-write virtio-blk image — the guest identifies it as the
+    /// only writable non-vda disk, same as FC. `None` = no swap.
+    pub swap_path: Option<std::path::PathBuf>,
     /// Directory the bundle payloads live in (`<sha>.squashfs`).
     pub bundle_dir: std::path::PathBuf,
     /// ADR 0096 spike: pin the `VZGenericMachineIdentifier` (its
@@ -110,6 +115,7 @@ impl VmConfig {
                              quiet init=/sbin/engram-init ip=dhcp"
                 .into(),
             aux_ro_drives: Vec::new(),
+            swap_path: None,
             bundle_dir: std::path::PathBuf::new(),
             machine_identifier: None,
             mac_address: None,
@@ -146,6 +152,12 @@ impl VmConfig {
 
     /// ADR 0061: attach these skill bundles (resolved `AuxRoDrive`s) from
     /// `bundle_dir`. Sentinels (`sha256 = None`) are skipped at attach.
+    /// ADR 0112: attach an ephemeral swap backing file.
+    pub fn with_swap_path(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.swap_path = path;
+        self
+    }
+
     pub fn with_aux_ro_drives(
         mut self,
         drives: Vec<AuxRoDrive>,
@@ -769,6 +781,27 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
                 VZDiskImageStorageDeviceAttachment::alloc(),
                 &url,
                 true, // read-only
+            )
+            .map_err(|err| VzError::AttachmentFailed(ns_error_message(&err)))?;
+            let att_super: Retained<objc2_virtualization::VZStorageDeviceAttachment> =
+                Retained::cast_unchecked(att);
+            let dev = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                VZVirtioBlockDeviceConfiguration::alloc(),
+                &att_super,
+            );
+            storage.push(Retained::cast_unchecked(dev));
+        }
+
+        // ADR 0112: the ephemeral swap drive, last so the aux slots'
+        // attach-order indexing is untouched. Read-write; the guest's
+        // agentd finds it as the only writable non-vda disk and arms it
+        // (mkswap + swapon) — identical contract to the FC backend.
+        if let Some(swap_path) = &cfg.swap_path {
+            let url = nsurl_for_path(swap_path);
+            let att = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                VZDiskImageStorageDeviceAttachment::alloc(),
+                &url,
+                false,
             )
             .map_err(|err| VzError::AttachmentFailed(ns_error_message(&err)))?;
             let att_super: Retained<objc2_virtualization::VZStorageDeviceAttachment> =
