@@ -130,6 +130,14 @@ pub struct HostUtilization {
     pub disk_total_mib: u64,
     #[serde(default)]
     pub disk_used_mib: u64,
+    /// ADR 0112: Σ `swap_mib` over this host's live sandboxes — the
+    /// worst case the ephemeral swap files can allocate on the work_dir
+    /// mount. COMMITTED, not walked: after unlink-after-attach the
+    /// backing inodes are anonymous (visible to statvfs in aggregate,
+    /// invisible to any path walk). Placement subtracts it from free
+    /// disk before the floor test so admission is reservation-safe.
+    #[serde(default)]
+    pub committed_swap_mib: u64,
     /// Physical RAM: MemTotal and (MemTotal − MemAvailable) from
     /// `/proc/meminfo`. Zero on non-Linux (no `/proc`).
     #[serde(default)]

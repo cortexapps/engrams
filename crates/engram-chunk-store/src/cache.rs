@@ -602,6 +602,11 @@ struct CacheInner {
     /// never aims to fill space a co-tenant needs. 0 (the default) ⇒
     /// today's behavior.
     co_tenant_reserved: std::sync::atomic::AtomicU64,
+    /// ADR 0112: the per-source breakdown behind `co_tenant_reserved`
+    /// (`memfiles`, `swap-committed`, `dirty-files`). The atomic above
+    /// stays the sweep's cheap read; this map exists so multiple
+    /// writers can't clobber each other's terms.
+    co_tenant_sources: Mutex<std::collections::HashMap<&'static str, u64>>,
     /// ADR 0095: live feed from [`ChunkCache::put_unverified_no_evict`]
     /// to the background scrubber. `None` until
     /// [`ChunkCache::spawn_scrubber`] runs (a cache without a scrubber
@@ -695,6 +700,7 @@ impl ChunkCache {
                 evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
                 last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
                 co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
+                co_tenant_sources: Mutex::new(std::collections::HashMap::new()),
                 scrub_tx: Mutex::new(None),
                 index: Mutex::new(IndexState::Pending(Vec::new())),
                 sweep_gate: tokio::sync::Mutex::new(()),
@@ -725,6 +731,7 @@ impl ChunkCache {
                 evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
                 last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
                 co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
+                co_tenant_sources: Mutex::new(std::collections::HashMap::new()),
                 scrub_tx: Mutex::new(None),
                 index: Mutex::new(IndexState::Pending(Vec::new())),
                 sweep_gate: tokio::sync::Mutex::new(()),
@@ -732,15 +739,38 @@ impl ChunkCache {
         }
     }
 
-    /// ADR 0092: record how many allocated bytes co-tenant consumers
-    /// (files on this cache's filesystem the sweeper cannot evict — the
-    /// per-image base memfiles) currently hold. The next sweep subtracts
-    /// this from the absolute ceiling, so growth in a co-tenant converts
-    /// into cache eviction pressure instead of disk overshoot. Callers
-    /// re-publish their current total whenever it changes (the
-    /// image-prefetch supervisor does so every reconcile tick);
-    /// last-write-wins, single logical writer.
-    pub fn set_co_tenant_reserved(&self, bytes: u64) {
+    /// ADR 0092 / ADR 0112: record how many allocated bytes one NAMED
+    /// co-tenant consumer (files on this cache's filesystem the sweeper
+    /// cannot evict) currently holds; the stored reserve is the SUM
+    /// across sources. The next sweep subtracts that sum from the
+    /// absolute ceiling, so co-tenant growth converts into cache
+    /// eviction pressure instead of disk overshoot. Each caller
+    /// re-publishes its own current total whenever it changes
+    /// (last-write-wins PER SOURCE): the image-prefetch supervisor
+    /// publishes `memfiles` every reconcile tick; the host-agent
+    /// heartbeat publishes `swap-committed` (ADR 0112 — the sum of
+    /// attached swap-device sizes; the backing inodes are anonymous
+    /// after unlink-after-attach, so committed, not walked) and
+    /// `dirty-files` (ADR 0110's per-sandbox dirty files, previously
+    /// unbudgeted).
+    ///
+    /// Was a single scalar with one writer; ADR 0112 made it
+    /// multi-source because a second unconditional `set` caller would
+    /// have silently clobbered the memfile term.
+    pub fn set_co_tenant_reserved(&self, source: &'static str, bytes: u64) {
+        // The aggregate store happens INSIDE the source-map critical
+        // section (adversarial-review finding): computing the sum under
+        // the lock but storing after release lets two publishers
+        // interleave so an OLDER total lands last, silently
+        // under-reserving until the next publish. The atomic stays the
+        // sweep's lock-free read; the lock orders the writers.
+        let mut sources = self.inner.co_tenant_sources.lock();
+        sources.insert(source, bytes);
+        let total: u64 = sources.values().sum();
+        self.set_co_tenant_total(total);
+    }
+
+    fn set_co_tenant_total(&self, bytes: u64) {
         self.inner
             .co_tenant_reserved
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
@@ -2566,13 +2596,13 @@ mod tests {
 
         // A 10-byte co-tenant reserve → effective ceiling 20 → the LRU
         // chunk goes.
-        cache.set_co_tenant_reserved(10);
+        cache.set_co_tenant_reserved("test", 10);
         cache.sweep().await.unwrap();
         assert!(!cache.contains(ha).await, "a must yield to the reserve");
         assert!(cache.contains(hb).await && cache.contains(hc).await);
 
         // Reserve released → 20/30 → no further eviction pressure.
-        cache.set_co_tenant_reserved(0);
+        cache.set_co_tenant_reserved("test", 0);
         cache.sweep().await.unwrap();
         assert!(cache.contains(hb).await && cache.contains(hc).await);
     }
@@ -2592,7 +2622,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         cache.put(hb, b).await.unwrap();
 
-        cache.set_co_tenant_reserved(1_000_000);
+        cache.set_co_tenant_reserved("test", 1_000_000);
         cache.sweep().await.unwrap();
         assert!(
             cache.contains(ha).await,

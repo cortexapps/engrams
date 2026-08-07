@@ -164,6 +164,12 @@ pub async fn migrate_session_live(
     let Some(sandbox_id) = session.sandbox_id else {
         return Err(MigrateError::Fatal("no bound sandbox".into()));
     };
+    // ADR 0112 D7: swap-armed guests cannot post-copy teleport. The
+    // guard lives HOST-side in `migration_presetup` (the live sandbox
+    // spec is the authoritative swap source — an image row can drift
+    // after capture); its `InvalidSpec` surfaces here as `Unsupported`
+    // and callers fall back to snapshot-rehome, whose `capture_phase`
+    // runs the swap disarm and is already correct.
     // ADR 0079: the op-log claim (kind = teleport) is the per-session
     // exclusion — one running op per session. Claim-or-give-up; if this
     // pod dies mid-move the reclaim sweep re-claims the row and the

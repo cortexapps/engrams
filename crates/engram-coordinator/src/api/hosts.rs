@@ -74,6 +74,9 @@ pub struct HostView {
     /// post-migration heartbeat.
     pub util_disk_total_mib: u64,
     pub util_disk_used_mib: u64,
+    /// ADR 0112: committed ephemeral-swap bytes (MiB) — Σ swap_mib over
+    /// the host's live sandboxes; placement subtracts it from free disk.
+    pub util_committed_swap_mib: u64,
     pub util_mem_total_mib: u64,
     pub util_mem_used_mib: u64,
     pub util_cpu_pct: f32,
@@ -153,6 +156,7 @@ impl HostView {
             ready_image_digests,
             util_disk_total_mib: row.utilization.disk_total_mib,
             util_disk_used_mib: row.utilization.disk_used_mib,
+            util_committed_swap_mib: row.utilization.committed_swap_mib,
             util_mem_total_mib: row.utilization.mem_total_mib,
             util_mem_used_mib: row.utilization.mem_used_mib,
             util_cpu_pct: row.utilization.cpu_pct,

@@ -1218,10 +1218,18 @@ fn host_disk_floor_ok(h: &HostRecord) -> bool {
     if h.utilization.disk_total_mib == 0 {
         return true;
     }
+    // ADR 0112 D5: subtract the host's COMMITTED swap (Σ swap_mib over
+    // its live sandboxes) before the floor test — the backing files
+    // are sparse, so `disk_used_mib` (statvfs) reflects only what
+    // guests have swapped so far; the committed remainder is spoken
+    // for and must not be handed to a new placement. Conservative by
+    // design: already-allocated swap blocks appear in BOTH terms, so
+    // this can only under-report free space, never over-report.
     let free_disk_mib = h
         .utilization
         .disk_total_mib
-        .saturating_sub(h.utilization.disk_used_mib);
+        .saturating_sub(h.utilization.disk_used_mib)
+        .saturating_sub(h.utilization.committed_swap_mib);
     free_disk_mib >= host_disk_cache_floor_mib()
 }
 

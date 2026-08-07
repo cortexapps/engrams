@@ -1781,6 +1781,37 @@ async fn host_lifecycle(ctx: &Ctx) {
     };
     meta.touch_host_heartbeat(h1, hb).await.unwrap();
     assert_eq!(meta.host_status(h1).await.unwrap(), Some(HostStatus::Dead));
+
+    // ADR 0112 (D4 conformance for the util_committed_swap_mib column):
+    // the heartbeat's committed-swap term round-trips into the host
+    // read on BOTH stores — placement's floor math depends on it.
+    let util = engram_core::types::host::HostUtilization {
+        disk_total_mib: 400_000,
+        disk_used_mib: 100_000,
+        committed_swap_mib: 12_288,
+        ..Default::default()
+    };
+    let hb2 = HostHeartbeat {
+        status: HostStatus::Ready,
+        capacity: host_record(h2, "conf-h2", now).capacity,
+        utilization: util,
+        ready_images: Vec::new(),
+        current_bundles: Vec::new(),
+        total_vcpus: 16,
+        wire_version: 1,
+        stages_images: false,
+        capabilities: Default::default(),
+    };
+    meta.touch_host_heartbeat(h2, hb2).await.unwrap();
+    let h2_row = meta
+        .list_active_hosts()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|h| h.id == h2)
+        .expect("h2 active");
+    assert_eq!(h2_row.utilization.committed_swap_mib, 12_288);
+    assert_eq!(h2_row.utilization.disk_used_mib, 100_000);
 }
 
 /// placement_no_fit_details: per-host fit verdicts with the shared

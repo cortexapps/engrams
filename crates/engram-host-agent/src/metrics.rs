@@ -349,6 +349,17 @@ pub const SWAP_DISARM_REFUSED_TOTAL: &str = "engram_swap_disarm_refused_total";
 /// swap, bounded by the RAM/4 device size.
 pub const SWAP_DISARM_SECONDS: &str = "engram_swap_disarm_seconds";
 
+/// ADR 0112 D5: Σ `swap_mib` over live sandboxes, in bytes — the worst
+/// case ephemeral swap can allocate on the work_dir mount (the backing
+/// inodes are anonymous, so committed is the only honest attribution).
+/// Also fed into the chunk cache's co-tenant reserve and the heartbeat.
+pub const HOST_COMMITTED_SWAP_BYTES: &str = "engram_host_committed_swap_bytes";
+
+/// ADR 0112 D5 (closing ADR 0110's open accounting gap): allocated
+/// bytes under the dirty root — the per-sandbox dirty files' real
+/// footprint on the shared mount, fed into the co-tenant reserve.
+pub const HOST_DIRTY_FILES_BYTES: &str = "engram_host_dirty_files_bytes";
+
 /// ADR 0101 B: dirty bytes one diff epoch carried (the adaptive
 /// controller aims this at `ENGRAM_CHECKPOINT_TARGET_EPOCH_MB`) and the
 /// epoch's wall-clock length. Together they surface the controller's

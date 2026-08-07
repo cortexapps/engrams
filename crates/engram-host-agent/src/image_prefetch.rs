@@ -784,7 +784,7 @@ async fn reconcile(
     // cache yields the space instead of racing the memfiles to the
     // kubelet eviction line (the 2026-07-14 w8wq DiskPressure incident:
     // a warm at-budget cache + 40 GB of unbudgeted memfiles).
-    chunk_cache.set_co_tenant_reserved(memfile_bytes);
+    chunk_cache.set_co_tenant_reserved("memfiles", memfile_bytes);
 }
 
 /// Allocated (on-disk) bytes of a file: `st_blocks × 512` on unix, so a
