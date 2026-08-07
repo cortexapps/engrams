@@ -185,6 +185,7 @@ async fn never_flushed_survivor_is_reserved_from_spec_and_binding() {
                 vsock_uds_base: sandbox_dir.join("vsock"),
                 vsock_cid: 3,
                 rootfs_canonical: sandbox_dir.join("rootfs.ext4"),
+                swap_canonical: None,
             },
             network: None,
             netns: None,

@@ -883,6 +883,7 @@ jobs:
             --test vmstate_only_snapshot \
             --test substrate_kernel_capabilities \
             --test substrate_uffd_base \
+            --test swap_disk \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=4
