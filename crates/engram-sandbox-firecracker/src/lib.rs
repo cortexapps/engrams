@@ -2257,8 +2257,25 @@ impl FirecrackerBackend {
         {
             let _ = child.kill().await;
             let log_tail = read_tail(&log_path, 4096).await.unwrap_or_default();
+            // #1066: keep the full multi-line tail in the HOST log — a
+            // gRPC status message rides the `grpc-message` HTTP/2 header,
+            // which cannot carry raw newlines, so the tail below must be
+            // flattened to survive the wire (the original \n-joined form
+            // reached the coordinator as just the first line, hiding the
+            // handler's actual error for a full diagnostic cycle).
+            tracing::error!(
+                gate = %spawn_gate.display(),
+                error = %e,
+                log_tail = %log_tail,
+                "uffd handler failed to start",
+            );
+            let flat_tail = if log_tail.is_empty() {
+                "<empty>".to_string()
+            } else {
+                log_tail.split('\n').collect::<Vec<_>>().join(" | ")
+            };
             return Err(vm_err(format!(
-                "uffd handler did not open {}: {e}\n--- handler log ---\n{log_tail}",
+                "uffd handler did not open {}: {e} | handler log: {flat_tail}",
                 spawn_gate.display()
             )));
         }
