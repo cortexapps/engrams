@@ -55,7 +55,7 @@ num-integer = { version = "0.1", default-features = false, features = ["i128", "
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
-phf_shared = { version = "0.11" }
+phf_shared = { version = "0.14" }
 pkcs8 = { version = "0.10", default-features = false, features = ["pem", "std"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 prost = { version = "0.14" }
@@ -127,7 +127,7 @@ memchr = { version = "2" }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
-phf_shared = { version = "0.11" }
+phf_shared = { version = "0.14" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 proc-macro2 = { version = "1" }
 prost = { version = "0.14" }
