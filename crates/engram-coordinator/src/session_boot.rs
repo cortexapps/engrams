@@ -29,7 +29,7 @@ use std::collections::HashMap;
 
 use engram_core::traits::SessionFence;
 use engram_core::types::integration::CredentialMintSource;
-use engram_core::types::integration::MetadataFlavor;
+use engram_core::types::integration::GuestService;
 use engram_core::types::sandbox::AgentSpec;
 use engram_core::types::session::{SessionSpec, SessionState};
 use engram_core::types::BindingDisposition;
@@ -333,12 +333,13 @@ pub(crate) async fn boot_on_reserved_host(
         secrets: egress_secrets,
         injects,
         observes,
-        metadata_flavor: integration_policy
+        guest_services: integration_policy
             .as_ref()
-            .and_then(|policy| policy.metadata_flavor),
-        cloud_sql_tunnels: integration_policy
+            .map(|policy| policy.guest_services.clone())
+            .unwrap_or_default(),
+        tunnels: integration_policy
             .as_ref()
-            .map(|policy| policy.cloud_sql_tunnels.clone())
+            .map(|policy| policy.tunnels.clone())
             .unwrap_or_default(),
     };
     let egress_policy =
@@ -422,10 +423,11 @@ pub(crate) async fn boot_on_reserved_host(
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: integration_policy
+            guest_services: integration_policy
                 .as_ref()
-                .and_then(|policy| policy.metadata_flavor),
-            cloud_sql_tunnels: Vec::new(),
+                .map(|policy| policy.guest_services.clone())
+                .unwrap_or_default(),
+            tunnels: Vec::new(),
             // ADR 0057: vestigial wire field; substitution is per-entry.
             secret_mode: engram_core::types::image::SecretMode::Broker,
         }
@@ -563,8 +565,8 @@ struct ResolvedEgressPolicy {
     secrets: Vec<engram_core::types::egress::EgressSecretEntry>,
     injects: Vec<engram_core::types::egress::EgressInjectEntry>,
     observes: Vec<engram_core::types::egress::EgressObserveEntry>,
-    metadata_flavor: Option<MetadataFlavor>,
-    cloud_sql_tunnels: Vec<engram_core::types::integration::CloudSqlTunnel>,
+    guest_services: Vec<GuestService>,
+    tunnels: Vec<engram_core::types::integration::SessionTunnel>,
 }
 
 async fn assemble_egress_policy(
@@ -587,8 +589,8 @@ async fn assemble_egress_policy(
         secrets: resolved.secrets,
         injects: resolved.injects,
         observes: resolved.observes,
-        metadata_flavor: resolved.metadata_flavor,
-        cloud_sql_tunnels: resolved.cloud_sql_tunnels,
+        guest_services: resolved.guest_services,
+        tunnels: resolved.tunnels,
         // ADR 0057: per-secret mode replaces a session-level mode; the proxy
         // substitutes per `EgressSecretEntry`. Kept Broker for the (vestigial)
         // wire field — substitution is driven by the entries, not this flag.
@@ -647,8 +649,8 @@ pub(crate) fn assemble_capture_egress_policy(
         secrets: Vec::new(),
         injects: Vec::new(),
         observes: Vec::new(),
-        metadata_flavor: None,
-        cloud_sql_tunnels: Vec::new(),
+        guest_services: Vec::new(),
+        tunnels: Vec::new(),
         secret_mode: engram_core::types::image::SecretMode::Literal,
     })
 }
@@ -1018,7 +1020,7 @@ async fn mint_remote_connection_inject_header(
     let (token, expires_at) = mint_remote_connection_credential(
         session_id,
         connection_id,
-        engram_core::types::integration::CredentialPurpose::Api,
+        engram_core::types::integration::CredentialPurpose::api(),
     )
     .await?;
     Some((

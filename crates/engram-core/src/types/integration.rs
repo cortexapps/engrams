@@ -49,58 +49,73 @@ pub struct IntegrationPolicy {
     /// the proxy substitutes only on its `allow_hosts`.
     #[serde(default)]
     pub secrets: Vec<IntegrationSecret>,
-    /// Which cloud metadata service the session-local endpoint should imitate,
-    /// or `None` for a session that needs none. The host egress proxy serves
-    /// the endpoint; the guest receives no cloud credential from it, only a
-    /// placeholder the proxy substitutes on the wire.
-    ///
-    /// `#[serde(default)]` so a policy stored before this field — including one
-    /// that set the old `google_adc` boolean — decodes as `None`. That is the
-    /// safe direction: the session keeps running and simply has no metadata
-    /// endpoint until it is created again.
+    /// Compatibility services mounted on the session-scoped guest gateway.
+    /// Native Engrams services, such as tunnels, are selected by their own
+    /// policy entries and use the same transport.
     #[serde(default)]
-    pub metadata_flavor: Option<MetadataFlavor>,
-    /// Exact Cloud SQL instances the host may connect for this session.
-    /// This carries mint authority, never an OAuth token.
+    pub guest_services: Vec<GuestService>,
+    /// Host-authorized byte-stream tunnels available to this session. Connector
+    /// configuration and mint authority cross the wire, never a credential.
     #[serde(default)]
-    pub cloud_sql_tunnels: Vec<CloudSqlTunnel>,
+    pub tunnels: Vec<SessionTunnel>,
 }
 
-/// One exact PostgreSQL Cloud SQL tunnel compiled from a connection grant.
+/// One session-local host tunnel. Shared layers route only by `id` and
+/// `connector`; the registered connector owns and validates `config_json`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloudSqlTunnel {
-    /// Google instance connection name: `project:region:instance`.
-    pub instance: String,
-    /// PostgreSQL IAM login name derived from the configured service account.
-    pub database_user: String,
-    /// Immutable authority for the two scoped OAuth tokens the host needs.
-    pub mint_source: CredentialMintSource,
+pub struct SessionTunnel {
+    /// Stable session-local name. It identifies policy, not a network target.
+    pub id: String,
+    /// Registered host connector kind, for example `gcp.cloud_sql`.
+    pub connector: String,
+    /// Connector-owned JSON. The host connector must reject unknown fields.
+    pub config_json: String,
+    /// Immutable authority a connector may use for its fixed credential uses.
+    /// `None` supports tunnels, such as a direct approved TCP target, that do
+    /// not need a brokered credential.
+    #[serde(default)]
+    pub mint_source: Option<CredentialMintSource>,
 }
 
-/// A fixed credential use. Callers cannot supply arbitrary OAuth scopes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialPurpose {
-    #[default]
-    Api,
-    CloudSqlAdmin,
-    CloudSqlLogin,
+/// A provider-owned credential use. The provider registry maps this name to
+/// fixed scopes and authorizing operations; callers cannot supply OAuth scopes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CredentialPurpose(String);
+
+impl CredentialPurpose {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn api() -> Self {
+        Self::new("api")
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-/// A cloud metadata service the host proxy can imitate for a session.
-///
-/// ADR 0109 shipped this as a `google_adc: bool` on the wire, which made
-/// "does this session need a metadata endpoint?" and "is it Google's?" the same
-/// question. A second provider would have had to add a second boolean, and the
-/// proxy would have had to decide which one wins. An enum makes the answer one
-/// value, and a wildcard-free `match` on it makes a new variant a compile error
-/// at every site that has to handle one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MetadataFlavor {
-    /// Google Compute Engine's metadata server, which the Cloud SDK and every
-    /// Google auth library probe for Application Default Credentials.
-    Gce,
+impl Default for CredentialPurpose {
+    fn default() -> Self {
+        Self::api()
+    }
+}
+
+/// A registered compatibility service mounted on the guest gateway.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GuestService(String);
+
+impl GuestService {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Host-side authority used to mint a short-lived credential for one inject.

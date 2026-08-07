@@ -13,6 +13,19 @@ export const GOOGLE_OAUTH_SCOPES = {
   cloud_sql_admin: "https://www.googleapis.com/auth/sqlservice.admin",
   cloud_sql_login: "https://www.googleapis.com/auth/sqlservice.login",
 } as const;
+
+export function googleOAuthScope(purpose: string): string {
+  switch (purpose) {
+    case "api":
+      return GOOGLE_OAUTH_SCOPES.api;
+    case "cloud_sql_admin":
+      return GOOGLE_OAUTH_SCOPES.cloud_sql_admin;
+    case "cloud_sql_login":
+      return GOOGLE_OAUTH_SCOPES.cloud_sql_login;
+    default:
+      throw new Error(`unsupported Google credential purpose "${purpose}"`);
+  }
+}
 const SUBJECT_TOKEN_LIFETIME_SECONDS = 300;
 // The host proxy refreshes minted credentials five minutes before expiry.
 // Keep the Google access token short-lived but longer than that refresh window,

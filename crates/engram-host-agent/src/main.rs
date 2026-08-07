@@ -156,10 +156,11 @@ struct Cli {
     #[arg(long, env = "ENGRAM_EGRESS_DNS_PORT", default_value_t = 5353)]
     egress_dns_port: u16,
 
-    /// TCP port for the session-scoped Google metadata-compatible ADC
-    /// endpoint. Firecracker and VZ steer 169.254.169.254:80 here.
-    #[arg(long, env = "ENGRAM_EGRESS_METADATA_PORT", default_value_t = 13338)]
-    egress_metadata_port: u16,
+    /// TCP port for session-scoped host services. Firecracker and VZ steer
+    /// 169.254.169.254:80 here. Compatibility metadata adapters and native
+    /// tunnel routes share this gateway.
+    #[arg(long, env = "ENGRAM_GUEST_GATEWAY_PORT", default_value_t = 13338)]
+    guest_gateway_port: u16,
 
     /// Where the host-agent loads the deployment-wide egress-proxy
     /// CA from. Production uses `gcp-secret-manager` with Workload
@@ -396,7 +397,7 @@ async fn main() -> Result<(), HostAgentError> {
             // and the proxy's DNS listener can never drift. Defaults to 5353.
             fc_cfg.egress_proxy_port = Some(cli.egress_proxy_port);
             fc_cfg.egress_dns_port = Some(cli.egress_dns_port);
-            fc_cfg.egress_metadata_port = Some(cli.egress_metadata_port);
+            fc_cfg.guest_gateway_port = Some(cli.guest_gateway_port);
             // ADR 0014 follow-up: pin CPUID to a Cascade Lake baseline
             // so warm snapshots stay portable across the bake-host CPU
             // (AMD on Blacksmith runners) vs the prod-host CPU (Intel
@@ -504,7 +505,7 @@ async fn main() -> Result<(), HostAgentError> {
                     .with_egress_ports(
                         cli.egress_proxy_port,
                         cli.egress_dns_port,
-                        cli.egress_metadata_port,
+                        cli.guest_gateway_port,
                     );
                 fc_for_reattach = None;
                 // ADR 0007: attach the chunk store so `snapshot()` chunks
@@ -703,7 +704,7 @@ async fn main() -> Result<(), HostAgentError> {
             engram_host_agent::coord_client::HttpCoordClient::new(refresh_coord_url, refresh_token),
             host_id,
         ));
-    let cloud_sql_connector: Arc<dyn engram_egress_proxy::CloudSqlConnector> =
+    let cloud_sql_connector: Arc<dyn engram_egress_proxy::TunnelConnector> =
         Arc::new(engram_host_agent::egress::CoordCloudSqlConnector::new(
             engram_host_agent::coord_client::HttpCoordClient::new(
                 cloud_sql_coord_url,
@@ -715,7 +716,11 @@ async fn main() -> Result<(), HostAgentError> {
         &cli,
         Some(observe_sink),
         Some(inject_refresher),
-        Some(cloud_sql_connector),
+        Arc::new(engram_egress_proxy::GuestGatewayRegistry::new(
+            [Arc::new(engram_egress_proxy::GceMetadataService)
+                as Arc<dyn engram_egress_proxy::GuestServiceAdapter>],
+            [cloud_sql_connector],
+        )),
     )
     .await
     {
@@ -741,7 +746,7 @@ async fn build_host_egress(
     cli: &Cli,
     observe_sink: Option<engram_egress_proxy::ObserveSink>,
     inject_refresher: Option<Arc<dyn engram_egress_proxy::InjectRefresher>>,
-    cloud_sql_connector: Option<Arc<dyn engram_egress_proxy::CloudSqlConnector>>,
+    guest_gateway: Arc<engram_egress_proxy::GuestGatewayRegistry>,
 ) -> Result<engram_host_agent::egress::HostEgress, String> {
     use std::sync::Arc;
     // Port 0 would bind an ephemeral port while the iptables REDIRECT
@@ -749,12 +754,12 @@ async fn build_host_egress(
     // and every guest gets ConnectionRefused, the exact split-brain the
     // fail-closed bind (ADR 0083) exists to kill. There is no `0 = off`
     // sentinel (egress is mandatory, issue #240), so reject it here.
-    if cli.egress_proxy_port == 0 || cli.egress_dns_port == 0 || cli.egress_metadata_port == 0 {
+    if cli.egress_proxy_port == 0 || cli.egress_dns_port == 0 || cli.guest_gateway_port == 0 {
         return Err(format!(
-            "egress ports must be non-zero (got proxy={}, dns={}, metadata={}): the iptables \
+            "egress ports must be non-zero (got proxy={}, dns={}, guest_gateway={}): the iptables \
              REDIRECT targets the configured port, so an ephemeral (0) bind \
-             leaves :443/:53 redirected at a dead port",
-            cli.egress_proxy_port, cli.egress_dns_port, cli.egress_metadata_port,
+             leaves :443/:53 or the guest gateway redirected at a dead port",
+            cli.egress_proxy_port, cli.egress_dns_port, cli.guest_gateway_port,
         ));
     }
     let source: Arc<dyn engram_egress_proxy::CaSource> = match cli.ca_source {
@@ -792,17 +797,17 @@ async fn build_host_egress(
     let dns_bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_dns_port)
         .parse()
         .map_err(|e| format!("parse dns bind addr: {e}"))?;
-    let metadata_bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_metadata_port)
+    let guest_gateway_bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.guest_gateway_port)
         .parse()
-        .map_err(|e| format!("parse metadata bind addr: {e}"))?;
+        .map_err(|e| format!("parse guest gateway bind addr: {e}"))?;
     engram_host_agent::egress::HostEgress::spawn(
         source,
         bind,
         Some(dns_bind),
-        Some(metadata_bind),
+        Some(guest_gateway_bind),
         observe_sink,
         inject_refresher,
-        cloud_sql_connector,
+        guest_gateway,
     )
     .await
     .map_err(|e| e.to_string())

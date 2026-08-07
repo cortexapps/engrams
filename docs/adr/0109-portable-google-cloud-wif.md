@@ -250,13 +250,13 @@ Three seams close it. `ConnectionProvider` in the orchestrator carries config
 validation, the operation catalog, grant validation, policy compilation,
 minting, the setup document, and the guest environment a credential needs to be
 findable; the registry hands each provider only its OWN grants, so the Google
-functions dropped their internal provider filters. `MetadataFlavor` replaces
-`google_adc: bool` on the wire, because that boolean conflated "does this
-session need a metadata endpoint?" with "is it Google's?"; the proxy resolves a
-flavor to a `MetadataService` through a wildcard-free `match`, so a second cloud
-is a compile error rather than a silently unserved session. And the integration
-catalog serves named-connection providers, so the web renders from the same
-table the orchestrator compiles policy from instead of a hand-maintained copy.
+functions dropped their internal provider filters. The session-scoped guest
+gateway replaces the Google-specific metadata listener. A `guest_services` set
+selects registered compatibility adapters such as GCE metadata, and native
+Engrams routes use the same source-authenticated endpoint. An unregistered
+service fails closed. The integration catalog serves named-connection
+providers, so the web renders from the same table the orchestrator compiles
+policy from instead of a hand-maintained copy.
 
 ### Lessons
 
@@ -304,13 +304,36 @@ name stored on its Google Cloud connection. The compiled policy carries that
 instance, the derived database user, and the immutable connection mint source.
 It carries no credential.
 
-The guest helper listens on loopback and sends an authenticated `CONNECT` to
-the session-local metadata address. The host verifies the source guest and the
-exact instance against its session registry. It then mints only the fixed
-`sqlservice.admin` and `sqlservice.login` scopes, starts the pinned Cloud SQL
-Auth Proxy on host loopback for one connection, and relays bytes. Tokens stay
-in host process memory and child-process environment. They never appear in
-arguments, logs, policy JSON, guest environment, or guest files.
+This use case also exposes a missing platform seam. The egress proxy could
+filter HTTP and emulate one cloud metadata service, but it had no generic way
+to expose a session-authorized byte stream. Hard-coding Cloud SQL routing into
+that listener would repeat the gap for RDS, private control planes, and approved
+direct TCP targets.
+
+The metadata listener is therefore a generic guest gateway at the existing
+link-local address. It authenticates the guest by source address before it
+routes any request. Compatibility services, starting with GCE metadata, retain
+their native paths and proof-of-intent headers. Native Engrams routes require
+an `Engram-Gateway` header. They can list only the opaque tunnel ids and
+connector kinds authorized for the session, and they can open one tunnel by
+exact id. The generic layer does not parse a destination, accept a host or port
+from the guest, or know how a connector authenticates.
+
+Each compiled tunnel names a registered host connector and carries strictly
+validated, connector-owned configuration. Mint authority is optional: an IAM
+connector can use a connection-bound authority, while a future approved direct
+TCP connector does not need one. Credential purposes are provider-owned names
+that map to fixed OAuth scopes and authorizing operations. A guest cannot send
+a purpose or a scope.
+
+Cloud SQL is the first connector. The guest `engram-tunnel` helper listens on
+loopback and sends an authenticated `CONNECT` for the connection alias. The host
+resolves the exact compiled tunnel, and the Cloud SQL connector validates its
+instance and database user. It then mints only the fixed `sqlservice.admin` and
+`sqlservice.login` scopes, starts the pinned Cloud SQL Auth Proxy on host
+loopback for one connection, and relays bytes. Tokens stay in host process
+memory and child-process environment. They never appear in arguments, logs,
+policy JSON, guest environment, or guest files.
 
 The first release supports PostgreSQL over a public Cloud SQL IP only. Each
 Google Cloud connection names at most one instance and uses its configured

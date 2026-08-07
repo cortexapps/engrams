@@ -61,7 +61,8 @@ export interface MintIdentity {
 }
 
 /** Fixed credential uses. Providers map these to checked-in OAuth scopes. */
-export type CredentialPurpose = "api" | "cloud_sql_admin" | "cloud_sql_login";
+/** Provider-owned fixed credential use. It is never an OAuth scope. */
+export type CredentialPurpose = string;
 
 /** The operator-facing setup document for one connection. */
 export interface ProviderSetupDoc {
@@ -139,8 +140,11 @@ export interface ConnectionProvider {
   readonly category: string;
   readonly cli: ProviderCliSurface;
   readonly operations: ProviderOperationCatalog;
-  /** Non-default host-only credential uses this provider supports. */
-  readonly credentialPurposes?: readonly Exclude<CredentialPurpose, "api">[];
+  /**
+   * Non-default host-only credential uses and the operations that authorize
+   * each one. The broker rejects every purpose absent from this map.
+   */
+  readonly credentialPurposes?: Readonly<Record<string, readonly string[]>>;
 
   /**
    * Validate and normalize a stored config. Throws on anything invalid,
@@ -187,12 +191,8 @@ export interface ConnectionProvider {
    */
   assertDeploymentReady?(context: ProviderSetupContext): void | never;
 
-  /**
-   * Which guest metadata service this provider's credential is delivered
-   * through, if any. `undefined` means the credential rides only the egress
-   * proxy's header injection.
-   */
-  readonly metadataFlavor?: "gce";
+  /** Compatibility services this provider mounts on the guest gateway. */
+  readonly guestServices?: readonly import("../../connectors/registry.ts").GuestService[];
 
   /**
    * Environment a guest needs in order to FIND this provider's credential.

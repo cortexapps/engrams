@@ -7,6 +7,7 @@ import { assertGoogleCloudConfig } from "./google-wif.ts";
 import type { ResolvedIntegrationGrant } from "./grants.ts";
 
 export const CLOUD_SQL_POSTGRES_CONNECT = "cloudsql.postgres.connect";
+export const CLOUD_SQL_TUNNEL_CONNECTOR = "gcp.cloud_sql";
 
 /**
  * One curated operation's egress surface. The proxy matches `methods` and
@@ -330,19 +331,27 @@ export function appendGooglePolicy(
           Code.FailedPrecondition,
         );
       }
-      const existing = policy.cloud_sql_tunnels.find((entry) =>
-        entry.instance === config.cloudSqlPostgresInstance
-      );
-      if (existing && existing.mint_source.connection.connection_id !== connection.id) {
+      const tunnelConfig = JSON.stringify({
+        instance: config.cloudSqlPostgresInstance,
+        database_user: config.serviceAccountEmail.replace(/\.gserviceaccount\.com$/, ""),
+      });
+      const existing = policy.tunnels.find((entry) => entry.id === connection.alias);
+      if (
+        existing &&
+        (existing.connector !== CLOUD_SQL_TUNNEL_CONNECTOR ||
+          existing.config_json !== tunnelConfig ||
+          existing.mint_source?.connection.connection_id !== connection.id)
+      ) {
         throw new ConnectError(
-          `Google Cloud grants select conflicting credentials for ${config.cloudSqlPostgresInstance}`,
+          `integration grants define conflicting tunnel "${connection.alias}"`,
           Code.InvalidArgument,
         );
       }
       if (!existing) {
-        policy.cloud_sql_tunnels.push({
-          instance: config.cloudSqlPostgresInstance,
-          database_user: config.serviceAccountEmail.replace(/\.gserviceaccount\.com$/, ""),
+        policy.tunnels.push({
+          id: connection.alias,
+          connector: CLOUD_SQL_TUNNEL_CONNECTOR,
+          config_json: tunnelConfig,
           mint_source: {
             connection: {
               connection_id: connection.id,

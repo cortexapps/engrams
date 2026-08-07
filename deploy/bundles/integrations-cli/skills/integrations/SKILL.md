@@ -42,11 +42,17 @@ calls to anything else are denied at the network boundary.
 
 ## Cloud SQL PostgreSQL
 
-If `engrams-integrations` lists Cloud SQL, start the credential-free local
-relay for the exact instance configured on the connection:
+If `engrams-integrations` lists Cloud SQL, inspect the session-local tunnel
+names. They are connection aliases, not network destinations:
 
 ```bash
-engram-cloud-sql-proxy --instance PROJECT:REGION:INSTANCE --port 5445
+engram-tunnel list
+```
+
+Then expose the selected tunnel on guest loopback:
+
+```bash
+engram-tunnel open CONNECTION_ALIAS --port 5445
 ```
 
 Then connect with the IAM database user and require TLS:

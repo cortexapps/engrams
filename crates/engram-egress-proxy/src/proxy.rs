@@ -55,9 +55,8 @@ pub struct ProxyConfig {
     /// channel. Production sets `Some(0.0.0.0:53)` and pairs it
     /// with iptables `REDIRECT VM→{udp,tcp}/53 → :53`.
     pub dns_bind_addr: Option<SocketAddr>,
-    /// Where the Google metadata-compatible ADC endpoint listens. `None`
-    /// disables it.
-    pub metadata_bind_addr: Option<SocketAddr>,
+    /// Where the session-scoped guest gateway listens. `None` disables it.
+    pub guest_gateway_bind_addr: Option<SocketAddr>,
     /// Upstream resolver the DNS proxy forwards allowed queries to.
     /// Defaults to Cloudflare's 1.1.1.1:53.
     pub dns_upstream: SocketAddr,
@@ -71,8 +70,8 @@ pub struct ProxyConfig {
     /// expiry — the pre-WS4 behaviour). The host-agent wires this to its coord
     /// client; tests pass a stub.
     pub inject_refresher: Option<Arc<dyn InjectRefresher>>,
-    /// Host-only Cloud SQL connector for the metadata `CONNECT` endpoint.
-    pub cloud_sql_connector: Option<Arc<dyn crate::metadata::CloudSqlConnector>>,
+    /// Trusted host implementations for compatibility services and tunnels.
+    pub guest_gateway: Arc<crate::guest_gateway::GuestGatewayRegistry>,
     /// Extra trust roots for hermetic full-network tests. Production leaves
     /// this empty and uses the built-in WebPKI roots.
     pub upstream_test_roots: Option<rustls::RootCertStore>,
@@ -94,13 +93,13 @@ impl ProxyConfig {
             // host-agent's `--egress-dns-port`. Iptables REDIRECTs
             // guest {udp,tcp}/53 to this port.
             dns_bind_addr: Some("0.0.0.0:5353".parse().expect("dns bind default parses")),
-            metadata_bind_addr: None,
+            guest_gateway_bind_addr: None,
             dns_upstream: dns::DEFAULT_UPSTREAM
                 .parse()
                 .expect("dns upstream default parses"),
             observe_sink: None,
             inject_refresher: None,
-            cloud_sql_connector: None,
+            guest_gateway: Arc::new(crate::guest_gateway::GuestGatewayRegistry::default()),
             upstream_test_roots: None,
         }
     }
@@ -150,13 +149,17 @@ impl Proxy {
         } else {
             None
         };
-        let metadata = match self.cfg.metadata_bind_addr {
+        let guest_gateway = match self.cfg.guest_gateway_bind_addr {
             Some(addr) => Some(TcpListener::bind(addr).await.inspect_err(|error| {
-                tracing::error!(%addr, %error, "metadata bind failed");
+                tracing::error!(%addr, %error, "guest gateway bind failed");
             })?),
             None => None,
         };
-        Ok(Listeners { tcp, dns, metadata })
+        Ok(Listeners {
+            tcp,
+            dns,
+            guest_gateway,
+        })
     }
 
     /// Run the accept loop forever on already-bound listeners. The DNS
@@ -164,7 +167,11 @@ impl Proxy {
     /// accept loop itself terminates (it shouldn't — accept errors are
     /// logged and retried).
     pub async fn serve(self, listeners: Listeners) {
-        let Listeners { tcp, dns, metadata } = listeners;
+        let Listeners {
+            tcp,
+            dns,
+            guest_gateway,
+        } = listeners;
         tracing::info!(addr = ?tcp.local_addr().ok(), "engram-egress-proxy listening");
 
         // The filtering DNS proxy: serve loops for the already-bound
@@ -185,14 +192,12 @@ impl Proxy {
                 }
             });
         }
-        if let Some(listener) = metadata {
+        if let Some(listener) = guest_gateway {
             let registry = self.cfg.registry.clone();
-            let cloud_sql_connector = self.cfg.cloud_sql_connector.clone();
+            let gateway = self.cfg.guest_gateway.clone();
             tokio::spawn(async move {
-                if let Err(error) =
-                    crate::metadata::serve(listener, registry, cloud_sql_connector).await
-                {
-                    tracing::error!(%error, "metadata serve loop ended");
+                if let Err(error) = crate::guest_gateway::serve(listener, registry, gateway).await {
+                    tracing::error!(%error, "guest gateway serve loop ended");
                 }
             });
         }
@@ -237,7 +242,7 @@ impl Proxy {
 pub struct Listeners {
     tcp: TcpListener,
     dns: Option<(Arc<UdpSocket>, TcpListener)>,
-    metadata: Option<TcpListener>,
+    guest_gateway: Option<TcpListener>,
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -46,11 +46,7 @@ interface BrokerRequest {
   purpose?: CredentialPurpose;
 }
 
-const CREDENTIAL_PURPOSES = new Set<CredentialPurpose>([
-  "api",
-  "cloud_sql_admin",
-  "cloud_sql_login",
-]);
+const CREDENTIAL_PURPOSE_RE = /^[a-z][a-z0-9_.-]{0,63}$/;
 
 interface CachedToken {
   accessToken: string;
@@ -169,7 +165,7 @@ export function makeConnectionCredentialBrokerRoute(deps: {
       return c.json({ error: "sessionId and connectionId are required" }, 400);
     }
     const purpose = request.purpose ?? "api";
-    if (!CREDENTIAL_PURPOSES.has(purpose)) {
+    if (!CREDENTIAL_PURPOSE_RE.test(purpose)) {
       return c.json({ error: "unsupported credential purpose" }, 400);
     }
 
@@ -178,10 +174,6 @@ export function makeConnectionCredentialBrokerRoute(deps: {
     const connections = (session?.integrationConnections ?? []) as IntegrationConnectionSnapshot[];
     const connection = connections.find((candidate) => candidate.id === request.connectionId);
     const principalId = session?.principalId ?? session?.userId ?? "automation";
-    const granted = grants.some((grant) =>
-      grant.connectionId === request.connectionId &&
-      (purpose === "api" || grant.operation === "cloudsql.postgres.connect")
-    );
     const profileSnapshotId = session === null ? "none" : integrationSnapshotHash({
       profileId: session.profileId,
       integrationGrants: grants,
@@ -190,7 +182,24 @@ export function makeConnectionCredentialBrokerRoute(deps: {
 
     let outcome = "denied";
     try {
-      if (!session || !connection || !granted) {
+      if (!session || !connection) {
+        return c.json({ error: "forbidden" }, 403);
+      }
+      const provider = providers.get(connection.provider);
+      if (!provider) {
+        return c.json({ error: "connection provider does not support remote minting" }, 400);
+      }
+      const authorizingOperations = purpose === "api"
+        ? null
+        : provider.credentialPurposes?.[purpose];
+      if (purpose !== "api" && !authorizingOperations) {
+        return c.json({ error: "connection provider does not support credential purpose" }, 400);
+      }
+      const granted = grants.some((grant) =>
+        grant.connectionId === request.connectionId &&
+        (purpose === "api" || authorizingOperations!.includes(grant.operation))
+      );
+      if (!granted) {
         return c.json({ error: "forbidden" }, 403);
       }
       // O6: the snapshot row outlives the session. Authorization is bounded by
@@ -201,17 +210,6 @@ export function makeConnectionCredentialBrokerRoute(deps: {
         evictSession(request.sessionId);
         return c.json({ error: "forbidden" }, 403);
       }
-      const provider = providers.get(connection.provider);
-      if (!provider) {
-        return c.json({ error: "connection provider does not support remote minting" }, 400);
-      }
-      if (
-        purpose !== "api" &&
-        !provider.credentialPurposes?.includes(purpose)
-      ) {
-        return c.json({ error: "connection provider does not support credential purpose" }, 400);
-      }
-
       const cacheKey = `${request.sessionId}:${request.connectionId}:${purpose}`;
       const requestTime = now();
       // Amortized upkeep: expire the requested key inline; sweep the rest at

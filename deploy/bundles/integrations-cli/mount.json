@@ -29,7 +29,7 @@
         "bin/discord",
         "bin/shopify",
         "bin/gcloud",
-        "bin/engram-cloud-sql-proxy"
+        "bin/engram-tunnel"
       ],
       "requires_env": "ENGRAM_CLI_INTEGRATIONS"
     }

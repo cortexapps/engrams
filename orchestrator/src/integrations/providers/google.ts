@@ -23,7 +23,7 @@ import {
   appendGooglePolicy,
   validateGoogleGrants,
 } from "../google-policy.ts";
-import { assertGoogleCloudConfig, GOOGLE_OAUTH_SCOPES, googleSetupDoc } from "../google-wif.ts";
+import { assertGoogleCloudConfig, googleOAuthScope, googleSetupDoc } from "../google-wif.ts";
 import type {
   ConnectionProvider,
   CredentialPurpose,
@@ -51,8 +51,8 @@ export function makeGoogleProvider(deps: GoogleProviderDeps): ConnectionProvider
     category: "cloud",
     cli: {
       displayName: "Google Cloud",
-      bins: ["gcloud", "engram-cloud-sql-proxy"],
-      doc: "Use brokered metadata ADC. For Cloud SQL, start engram-cloud-sql-proxy. Do not log in or create credentials.",
+      bins: ["gcloud", "engram-tunnel"],
+      doc: "Use brokered metadata ADC. For Cloud SQL, start engram-tunnel. Do not log in or create credentials.",
     },
     operations: {
       curated: [...Object.keys(CURATED_GOOGLE_OPERATIONS), CLOUD_SQL_POSTGRES_CONNECT],
@@ -82,10 +82,13 @@ export function makeGoogleProvider(deps: GoogleProviderDeps): ConnectionProvider
         })),
       ],
     },
-    credentialPurposes: ["cloud_sql_admin", "cloud_sql_login"],
+    credentialPurposes: {
+      cloud_sql_admin: [CLOUD_SQL_POSTGRES_CONNECT],
+      cloud_sql_login: [CLOUD_SQL_POSTGRES_CONNECT],
+    },
     // Google delivers its credential through a metadata service, so a session
     // holding one of these connections needs the host-side endpoint.
-    metadataFlavor: "gce",
+    guestServices: ["gcp.gce_metadata"],
     guestEnv: {
       // The Cloud SDK reads GCE_METADATA_ROOT while google-auth reads
       // GCE_METADATA_HOST. Point every client at the session-local emulator.
@@ -120,7 +123,7 @@ export function makeGoogleProvider(deps: GoogleProviderDeps): ConnectionProvider
       if (purpose !== "api" && !config.cloudSqlPostgresInstance) {
         throw new Error("Cloud SQL credential requested without a configured instance");
       }
-      const token = await deps.exchange(config, identity, [GOOGLE_OAUTH_SCOPES[purpose]]);
+      const token = await deps.exchange(config, identity, [googleOAuthScope(purpose)]);
       return { kind: "bearer", token: token.accessToken, expiresAt: token.expiresAt };
     },
 

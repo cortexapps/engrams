@@ -10062,7 +10062,7 @@ impl SandboxBackend for PooledBackend {
         self.session_bindings.insert(sandbox_id, session_id);
 
         let Some(egress) = self.egress.as_ref() else {
-            if policy.metadata_flavor.is_some() || !policy.cloud_sql_tunnels.is_empty() {
+            if !policy.guest_services.is_empty() || !policy.tunnels.is_empty() {
                 return Err(SandboxError::InvalidSpec(
                     "Google ADC requires a host egress proxy".into(),
                 ));
@@ -11073,7 +11073,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_delivery_requires_the_local_egress_proxy() {
-        use engram_core::types::integration::MetadataFlavor;
+        use engram_core::types::integration::GuestService;
         let tmp = tempfile::tempdir().unwrap();
         let inner: Arc<dyn SandboxBackend> =
             Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
@@ -11090,8 +11090,8 @@ mod tests {
                 secrets: Vec::new(),
                 injects: Vec::new(),
                 observes: Vec::new(),
-                metadata_flavor: Some(MetadataFlavor::Gce),
-                cloud_sql_tunnels: Vec::new(),
+                guest_services: vec![GuestService::new("gcp.gce_metadata")],
+                tunnels: Vec::new(),
                 secret_mode: engram_core::types::image::SecretMode::Broker,
             })
             .await
@@ -11405,8 +11405,8 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: None,
-            cloud_sql_tunnels: Vec::new(),
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -11429,8 +11429,8 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: None,
-            cloud_sql_tunnels: Vec::new(),
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -14859,9 +14859,17 @@ mod tests {
             // registry, and a fixed DNS port would collide across the
             // parallel suite now that a bind failure is fatal (ADR 0083).
             let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let egress = HostEgress::spawn(source, bind, None, None, None, None, None)
-                .await
-                .expect("spawn egress");
+            let egress = HostEgress::spawn(
+                source,
+                bind,
+                None,
+                None,
+                None,
+                None,
+                Arc::new(engram_egress_proxy::GuestGatewayRegistry::default()),
+            )
+            .await
+            .expect("spawn egress");
             (egress, dir)
         }
 
@@ -14881,8 +14889,8 @@ mod tests {
                 secrets: Vec::new(),
                 injects: Vec::new(),
                 observes: Vec::new(),
-                metadata_flavor: None,
-                cloud_sql_tunnels: Vec::new(),
+                guest_services: Vec::new(),
+                tunnels: Vec::new(),
                 secret_mode: SecretMode::Literal,
             }
         }

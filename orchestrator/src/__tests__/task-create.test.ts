@@ -678,7 +678,7 @@ describe("compileSessionCreateInput", () => {
     expect(input.harnessEnv?.CLOUDSDK_CORE_CHECK_GCE_METADATA).toBe("true");
     expect(input.harnessEnv?.ENGRAM_CLI_INTEGRATIONS).toContain('"provider":"gcp"');
     expect(input.harnessEnv?.ENGRAM_CLI_INTEGRATIONS).toContain(
-      '"bins":["gcloud","engram-cloud-sql-proxy"]',
+      '"bins":["gcloud","engram-tunnel"]',
     );
     expect(input.integrationConnections).toEqual([{
       id: "connection-gcp",

@@ -282,6 +282,10 @@ pub fn tap_name_for(sandbox_id: SandboxId) -> String {
 /// matching the default in `engram-egress-proxy::ProxyConfig::new`
 /// (chosen to avoid the systemd-resolved bind on 127.0.0.53:53).
 ///
+/// `guest_gateway_port`: where the session-scoped host service gateway is
+/// bound. Guest traffic to 169.254.169.254:80 is redirected there. Native
+/// tunnel routes and compatibility metadata adapters share this listener.
+///
 /// `guest_otel_port`: ADR 0019 / #526 phase 2 (in-guest OTLP export).
 /// When the host is configured with a guest-reachable collector
 /// endpoint (`ENGRAM_GUEST_OTEL_ENDPOINT` → `engram_otel=` on the
@@ -299,7 +303,7 @@ pub fn tap_name_for(sandbox_id: SandboxId) -> String {
 pub fn host_startup_lines(
     proxy_port: Option<u16>,
     dns_port: Option<u16>,
-    metadata_port: Option<u16>,
+    guest_gateway_port: Option<u16>,
     guest_otel_port: Option<u16>,
 ) -> Vec<String> {
     let dns_port = dns_port.unwrap_or(DEFAULT_DNS_PORT);
@@ -375,10 +379,10 @@ pub fn host_startup_lines(
             "-I INPUT 1 -s {pool} -p tcp --dport {dns_port} -j ACCEPT \
              -m comment --comment engram-proxy-dns-input",
         ));
-        if let Some(metadata_port) = metadata_port {
+        if let Some(guest_gateway_port) = guest_gateway_port {
             out.push(format!(
-                "-I INPUT 1 -s {pool} -p tcp --dport {metadata_port} -j ACCEPT \
-                 -m comment --comment engram-proxy-metadata-input",
+                "-I INPUT 1 -s {pool} -p tcp --dport {guest_gateway_port} -j ACCEPT \
+                 -m comment --comment engram-guest-gateway-input",
             ));
         }
     }
@@ -432,20 +436,21 @@ pub fn host_startup_lines(
              -j REDIRECT --to-port {port} \
              -m comment --comment engram-proxy-redirect",
         ));
-        if let Some(metadata_port) = metadata_port {
+        if let Some(guest_gateway_port) = guest_gateway_port {
             // GKE nodes install a metadata-concealment DNAT near the top of
             // PREROUTING before the host-agent starts. Appending these rules
             // lets that broader rule capture 169.254.169.254:80 first, so the
-            // guest sees GKE's 403 instead of the session-scoped ADC endpoint.
+            // guest sees GKE's 403 instead of the session-scoped gateway.
             // Insert our interface-specific redirects at the head of the
             // chain. They affect only Engrams VM traffic and must win before
-            // any platform metadata rule.
+            // any platform metadata rule. The destination remains the standard
+            // link-local metadata address so existing cloud SDKs need no shim.
             for interface in ["tap-engr-+", "vh-engr-+"] {
                 out.push(format!(
                     "-t nat -I PREROUTING 1 -i {interface} -p tcp \
                      -d 169.254.169.254 --dport 80 \
-                     -j REDIRECT --to-port {metadata_port} \
-                     -m comment --comment engram-metadata-redirect",
+                     -j REDIRECT --to-port {guest_gateway_port} \
+                     -m comment --comment engram-guest-gateway-redirect",
                 ));
             }
         }
@@ -625,7 +630,7 @@ async fn run_iptables(line: &str) -> Result<(), NetError> {
 pub async fn host_startup(
     proxy_port: Option<u16>,
     dns_port: Option<u16>,
-    metadata_port: Option<u16>,
+    guest_gateway_port: Option<u16>,
     guest_otel_port: Option<u16>,
 ) -> Result<(), NetError> {
     if let Err(e) = tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await {
@@ -666,7 +671,7 @@ pub async fn host_startup(
     // never touch the FORWARD egress-deny) makes host_startup declarative:
     // the final ruleset depends only on the current args, not on history.
     purge_engram_proxy_rules().await;
-    for line in host_startup_lines(proxy_port, dns_port, metadata_port, guest_otel_port) {
+    for line in host_startup_lines(proxy_port, dns_port, guest_gateway_port, guest_otel_port) {
         // Idempotency check: replace the leading `-A`/`-I` with `-C`
         // (or skip altogether for non-rule meta commands like
         // create-chain — none of our lines do that today). Order:
@@ -714,10 +719,10 @@ pub fn otel_endpoint_port(endpoint: &str) -> Option<u16> {
 const PURGEABLE_PROXY_COMMENTS: &[&str] = &[
     "engram-proxy-input",
     "engram-proxy-dns-input",
-    "engram-proxy-metadata-input",
+    "engram-guest-gateway-input",
     "engram-proxy-redirect",
     "engram-dns-redirect",
-    "engram-metadata-redirect",
+    "engram-guest-gateway-redirect",
     "engram-guest-otlp-input",
 ];
 
@@ -1397,7 +1402,7 @@ pub async fn reattach_netns_name(_netns_name: &str, _fc_pid: u32) -> Result<(), 
 pub async fn host_startup(
     _proxy_port: Option<u16>,
     _dns_port: Option<u16>,
-    _metadata_port: Option<u16>,
+    _guest_gateway_port: Option<u16>,
     _guest_otel_port: Option<u16>,
 ) -> Result<(), NetError> {
     Err(NetError::Spawn(
@@ -1828,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn host_startup_inserts_metadata_redirects_ahead_of_platform_rules() {
+    fn host_startup_inserts_guest_gateway_redirects_ahead_of_platform_rules() {
         let lines = host_startup_lines(Some(8443), Some(5353), Some(13338), None).join("\n");
         assert!(lines
             .contains("-t nat -I PREROUTING 1 -i tap-engr-+ -p tcp -d 169.254.169.254 --dport 80"));
@@ -1840,7 +1845,7 @@ mod tests {
     }
 
     #[test]
-    fn check_form_handles_inserted_metadata_redirects() {
+    fn check_form_handles_inserted_guest_gateway_redirects() {
         let rule = "-t nat -I PREROUTING 1 -i tap-engr-+ -p tcp \
                     -d 169.254.169.254 --dport 80 \
                     -j REDIRECT --to-port 13338";

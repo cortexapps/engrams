@@ -426,27 +426,27 @@ export interface IntegrationPolicyJson {
   // these). Mirrors engram_core::types::IntegrationPolicy.
   network: IntegrationNetworkJson;
   secrets: IntegrationSecretJson[];
-  /**
-   * Which cloud metadata service the host serves for the session, or null for
-   * none. Mirrors `engram_core::types::integration::MetadataFlavor` — a
-   * boolean here would have to grow a second field per cloud, and the proxy
-   * would then have to decide which one wins.
-   */
-  metadata_flavor: MetadataFlavor | null;
-  /** Exact host-side Cloud SQL tunnels. These contain authority, not tokens. */
-  cloud_sql_tunnels: CloudSqlTunnelJson[];
+  /** Compatibility services mounted on the session-scoped guest gateway. */
+  guest_services: GuestService[];
+  /** Host-side byte-stream tunnels. These can contain authority, never tokens. */
+  tunnels: SessionTunnelJson[];
 }
 
-export interface CloudSqlTunnelJson {
-  instance: string;
-  database_user: string;
+export interface SessionTunnelJson {
+  /** Stable session-local policy name, not a destination. */
+  id: string;
+  /** Registered host connector kind. */
+  connector: string;
+  /** Connector-owned JSON that the host validates strictly. */
+  config_json: string;
+  /** Optional broker authority for connectors that need a short-lived credential. */
   mint_source: {
     connection: { connection_id: string; provider: string };
-  };
+  } | null;
 }
 
-/** Keep in step with `MetadataFlavor` in engram-core. */
-export type MetadataFlavor = "gce";
+/** Registered host compatibility-service kind. */
+export type GuestService = string;
 
 /** Profile-side inputs compiled into the policy's network + secrets (ADR 0057). */
 export interface SessionPolicyInputs {
@@ -478,8 +478,8 @@ export function policyHasContent(p: IntegrationPolicyJson): boolean {
     p.network.allow_hosts.length > 0 ||
     p.network.allow_host_patterns.length > 0 ||
     p.network.default === "allow" ||
-    p.metadata_flavor !== null ||
-    p.cloud_sql_tunnels.length > 0
+    p.guest_services.length > 0 ||
+    p.tunnels.length > 0
   );
 }
 
@@ -1600,7 +1600,7 @@ export function compileIntegrationPolicy(
     allow_hosts: s.allowHosts ?? [],
     allow_host_patterns: s.allowHostPatterns ?? [],
   }));
-  return { injects, observes, network, secrets, metadata_flavor: null, cloud_sql_tunnels: [] };
+  return { injects, observes, network, secrets, guest_services: [], tunnels: [] };
 }
 
 // ---------------------------------------------------------------------------

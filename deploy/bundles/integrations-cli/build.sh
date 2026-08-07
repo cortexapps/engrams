@@ -21,6 +21,7 @@
 #   bin/stripe                fetched static Go binary (Stripe CLI)
 #   bin/pup                   fetched glibc Rust binary (Datadog CLI for agents)
 #   bin/gcloud                wrapper for the pinned Google Cloud CLI archive
+#   bin/engram-tunnel         guest client for session-authorized host tunnels
 #   bin/<provider>            committed POSIX-sh + curl connector wrappers (linear,
 #                             jira, sentry, pd, … — brokered auth, copied in)
 #   bin/engrams-integrations  the discovery helper (committed; copied in)
@@ -181,10 +182,10 @@ build_tree() {
     chmod 0755 "$dest/bin/engrams-integrations"
     cp "$here/bin/gcloud" "$dest/bin/gcloud"
     chmod 0755 "$dest/bin/gcloud"
-    cp "$here/bin/engram-cloud-sql-proxy" "$dest/bin/engram-cloud-sql-proxy"
-    chmod 0755 "$dest/bin/engram-cloud-sql-proxy"
+    cp "$here/bin/engram-tunnel" "$dest/bin/engram-tunnel"
+    chmod 0755 "$dest/bin/engram-tunnel"
     mkdir -p "$dest/libexec"
-    cp "$here/libexec/engram_cloud_sql_proxy.py" "$dest/libexec/"
+    cp "$here/libexec/engram_tunnel.py" "$dest/libexec/"
     # The Slack CLI is a committed POSIX-sh + curl wrapper (no fetched binary):
     # auth is brokered, so it just calls the Slack Web API and the proxy injects
     # the bot token host-side.

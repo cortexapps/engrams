@@ -1,18 +1,11 @@
-//! Session-scoped cloud metadata endpoint.
+//! Session-scoped host services on one guest-reachable link-local endpoint.
 //!
-//! A cloud SDK inside the guest looks for its credential on a well-known
-//! link-local address. The host answers there instead, with a fixed
-//! PLACEHOLDER token — the guest never holds a real credential. The request
-//! the guest then makes still passes through the normal egress policy, which
-//! replaces that placeholder with the host-held credential on the wire.
-//!
-//! Which service is imitated is a [`MetadataFlavor`], not a boolean. Address
-//! steering, the authorization check and the request framing are shared; a
-//! flavor supplies only `authorize` (what proves the caller expects THIS
-//! service) and `respond` (its attribute tree). The dispatch is a
-//! wildcard-free `match`, so a second cloud is a compile error here rather
-//! than a silently unserved session.
+//! The gateway authenticates a caller by its registered guest source address,
+//! parses one bounded HTTP request, and routes it to a trusted built-in service.
+//! Native Engrams routes use `/_engrams/v1/`; compatibility adapters keep the
+//! paths and proof-of-intent headers expected by an existing cloud SDK.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -20,42 +13,98 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use engram_core::types::integration::{CloudSqlTunnel, MetadataFlavor};
+use engram_core::types::integration::SessionTunnel;
 use engram_core::SessionId;
 
 use crate::{Registry, SessionState};
 
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
 pub const PLACEHOLDER_TOKEN: &str = "engram_google_token_placeholder";
+pub const GCE_METADATA_SERVICE_KIND: &str = "gcp.gce_metadata";
 
-/// Host implementation for an authorized Cloud SQL byte stream.
-///
-/// It owns the downstream stream so it can send `200 Connection Established`
-/// only after its host-local proxy is ready, then clean up that process after
-/// the database client disconnects.
+/// A registered host implementation for one tunnel connector kind.
 #[async_trait]
-pub trait CloudSqlConnector: Send + Sync {
+pub trait TunnelConnector: Send + Sync {
+    fn kind(&self) -> &'static str;
+
     async fn relay(
         &self,
         downstream: TcpStream,
         session_id: SessionId,
-        tunnel: CloudSqlTunnel,
+        tunnel: SessionTunnel,
     ) -> std::io::Result<()>;
+}
+
+/// One registered compatibility adapter on the guest gateway.
+pub trait GuestServiceAdapter: Send + Sync {
+    fn kind(&self) -> &'static str;
+
+    /// Whether this compatibility adapter owns the request path.
+    fn matches(&self, path: &str) -> bool;
+
+    /// Does this request carry the proof-of-intent header the real service
+    /// demands? It is what stops a browser or a confused-deputy fetch from
+    /// reading the service.
+    fn authorize(&self, headers: &[(&str, &str)]) -> bool;
+
+    /// The header every response carries, so a client can tell it reached the
+    /// service it expected.
+    fn response_header(&self) -> (&'static str, &'static str);
+
+    /// Answer one authorized `GET` for `path` with `query`.
+    fn respond(&self, path: &str, query: &str) -> (&'static str, &'static str, String);
+}
+
+/// Trusted host implementations for the guest gateway. Session policy can
+/// select a registered kind, but it cannot add code or replace an adapter.
+#[derive(Default)]
+pub struct GuestGatewayRegistry {
+    services: HashMap<String, Arc<dyn GuestServiceAdapter>>,
+    tunnels: HashMap<String, Arc<dyn TunnelConnector>>,
+}
+
+impl GuestGatewayRegistry {
+    pub fn new(
+        services: impl IntoIterator<Item = Arc<dyn GuestServiceAdapter>>,
+        connectors: impl IntoIterator<Item = Arc<dyn TunnelConnector>>,
+    ) -> Self {
+        let mut service_map = HashMap::new();
+        for service in services {
+            let previous = service_map.insert(service.kind().to_string(), service);
+            assert!(previous.is_none(), "duplicate guest service kind");
+        }
+        let mut tunnel_map = HashMap::new();
+        for connector in connectors {
+            let previous = tunnel_map.insert(connector.kind().to_string(), connector);
+            assert!(previous.is_none(), "duplicate tunnel connector kind");
+        }
+        Self {
+            services: service_map,
+            tunnels: tunnel_map,
+        }
+    }
+
+    fn service(&self, kind: &str) -> Option<Arc<dyn GuestServiceAdapter>> {
+        self.services.get(kind).cloned()
+    }
+
+    fn tunnel(&self, kind: &str) -> Option<Arc<dyn TunnelConnector>> {
+        self.tunnels.get(kind).cloned()
+    }
 }
 
 pub async fn serve(
     listener: TcpListener,
     registry: Arc<Registry>,
-    cloud_sql_connector: Option<Arc<dyn CloudSqlConnector>>,
+    gateway: Arc<GuestGatewayRegistry>,
 ) -> std::io::Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let registry = registry.clone();
-        let cloud_sql_connector = cloud_sql_connector.clone();
+        let gateway = gateway.clone();
         tokio::spawn(async move {
-            if let Err(error) = serve_connection(stream, peer, &registry, cloud_sql_connector).await
-            {
-                tracing::debug!(%peer, %error, "metadata connection ended with error");
+            if let Err(error) = serve_connection(stream, peer, &registry, &gateway).await {
+                tracing::debug!(%peer, %error, "guest gateway connection ended with error");
             }
         });
     }
@@ -65,7 +114,7 @@ async fn serve_connection(
     mut stream: TcpStream,
     peer: SocketAddr,
     registry: &Registry,
-    cloud_sql_connector: Option<Arc<dyn CloudSqlConnector>>,
+    gateway: &GuestGatewayRegistry,
 ) -> std::io::Result<()> {
     let session = match peer.ip() {
         std::net::IpAddr::V4(ip) => registry.lookup(ip),
@@ -75,7 +124,7 @@ async fn serve_connection(
         // No registered session owns this guest address.
         write_response(
             &mut stream,
-            ("Metadata-Flavor", "Google"),
+            ("Engram-Gateway", "1"),
             "403 Forbidden",
             "text/plain",
             "forbidden",
@@ -105,11 +154,46 @@ async fn serve_connection(
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.trim(), value.trim()))
         .collect();
-    if method == "CONNECT" && target.starts_with("/_engrams/v1/cloud-sql/") {
-        let Some(tunnel) = authorized_cloud_sql_tunnel(&session, target, &headers) else {
+    if method == "GET" && target == "/_engrams/v1/tunnels" {
+        if !authorized_native_request(&headers) {
             write_response(
                 &mut stream,
-                ("Metadata-Flavor", "Google"),
+                ("Engram-Gateway", "1"),
+                "403 Forbidden",
+                "text/plain",
+                "forbidden",
+            )
+            .await?;
+            return stream.shutdown().await;
+        }
+        let body = serde_json::to_string(
+            &session
+                .tunnels
+                .iter()
+                .map(|tunnel| {
+                    serde_json::json!({
+                        "id": tunnel.id,
+                        "connector": tunnel.connector,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("tunnel summary is JSON-serializable");
+        write_response(
+            &mut stream,
+            ("Engram-Gateway", "1"),
+            "200 OK",
+            "application/json",
+            &body,
+        )
+        .await?;
+        return stream.shutdown().await;
+    }
+    if method == "CONNECT" && target.starts_with("/_engrams/v1/tunnels/") {
+        let Some(tunnel) = authorized_tunnel(&session, target, &headers) else {
+            write_response(
+                &mut stream,
+                ("Engram-Gateway", "1"),
                 "403 Forbidden",
                 "text/plain",
                 "forbidden",
@@ -117,13 +201,13 @@ async fn serve_connection(
             .await?;
             return stream.shutdown().await;
         };
-        let Some(connector) = cloud_sql_connector else {
+        let Some(connector) = gateway.tunnel(&tunnel.connector) else {
             write_response(
                 &mut stream,
-                ("Metadata-Flavor", "Google"),
+                ("Engram-Gateway", "1"),
                 "503 Service Unavailable",
                 "text/plain",
-                "Cloud SQL tunnel is unavailable",
+                "tunnel connector is unavailable",
             )
             .await?;
             return stream.shutdown().await;
@@ -131,10 +215,15 @@ async fn serve_connection(
         return connector.relay(stream, session.session_id, tunnel).await;
     }
 
-    let Some(service) = session.metadata_flavor.map(service_for) else {
+    let Some(service) = session
+        .guest_services
+        .iter()
+        .filter_map(|service| gateway.service(service.as_str()))
+        .find(|service| service.matches(target))
+    else {
         write_response(
             &mut stream,
-            ("Metadata-Flavor", "Google"),
+            ("Engram-Gateway", "1"),
             "403 Forbidden",
             "text/plain",
             "forbidden",
@@ -142,7 +231,7 @@ async fn serve_connection(
         .await?;
         return stream.shutdown().await;
     };
-    let (status, content_type, body) = respond(service, method, target, &headers);
+    let (status, content_type, body) = respond(service.as_ref(), method, target, &headers);
     write_response(
         &mut stream,
         service.response_header(),
@@ -154,63 +243,52 @@ async fn serve_connection(
     stream.shutdown().await
 }
 
-fn authorized_cloud_sql_tunnel(
+fn authorized_tunnel(
     session: &SessionState,
     target: &str,
     headers: &[(&str, &str)],
-) -> Option<CloudSqlTunnel> {
-    let authorized = headers
-        .iter()
-        .any(|(name, value)| name.eq_ignore_ascii_case("metadata-flavor") && *value == "Google");
-    if !authorized {
+) -> Option<SessionTunnel> {
+    if !authorized_native_request(headers) {
         return None;
     }
-    let instance = target.strip_prefix("/_engrams/v1/cloud-sql/")?;
+    let id = target.strip_prefix("/_engrams/v1/tunnels/")?;
     session
-        .cloud_sql_tunnels
+        .tunnels
         .iter()
-        .find(|candidate| candidate.instance == instance)
+        .find(|candidate| candidate.id == id)
         .cloned()
 }
 
-/// The flavor this guest's session asked for, or `None` when it asked for none.
+fn authorized_native_request(headers: &[(&str, &str)]) -> bool {
+    headers
+        .iter()
+        .any(|(name, value)| name.eq_ignore_ascii_case("engram-gateway") && *value == "1")
+}
+
+/// The compatibility services this guest's session asked for.
 #[cfg(test)]
-fn session_metadata_flavor(
+fn session_guest_services(
     registry: &Registry,
     guest_ip: std::net::Ipv4Addr,
-) -> Option<MetadataFlavor> {
-    registry.lookup(guest_ip)?.metadata_flavor
-}
-
-/// One cloud's metadata service.
-pub trait MetadataService: Send + Sync {
-    /// Does this request carry the proof-of-intent header the real service
-    /// demands? It is what stops a browser or a confused-deputy fetch from
-    /// reading the attribute tree.
-    fn authorize(&self, headers: &[(&str, &str)]) -> bool;
-
-    /// The header every response carries, so a client can tell it reached the
-    /// service it expected.
-    fn response_header(&self) -> (&'static str, &'static str);
-
-    /// Answer one authorized `GET` for `path` with `query`.
-    fn respond(&self, path: &str, query: &str) -> (&'static str, &'static str, String);
-}
-
-/// Resolve a flavor to its implementation.
-///
-/// Wildcard-free on purpose: a new [`MetadataFlavor`] variant must be given a
-/// service here or this does not compile.
-fn service_for(flavor: MetadataFlavor) -> &'static (dyn MetadataService + Send + Sync) {
-    match flavor {
-        MetadataFlavor::Gce => &GceMetadata,
-    }
+) -> Vec<engram_core::types::integration::GuestService> {
+    registry
+        .lookup(guest_ip)
+        .map(|session| session.guest_services.clone())
+        .unwrap_or_default()
 }
 
 /// Google Compute Engine's metadata server.
-struct GceMetadata;
+pub struct GceMetadataService;
 
-impl MetadataService for GceMetadata {
+impl GuestServiceAdapter for GceMetadataService {
+    fn kind(&self) -> &'static str {
+        GCE_METADATA_SERVICE_KIND
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        path == "/" || path.starts_with("/computeMetadata/")
+    }
+
     fn authorize(&self, headers: &[(&str, &str)]) -> bool {
         headers
             .iter()
@@ -244,7 +322,7 @@ async fn write_response(
 /// The provider-neutral gate: read-only, and only for a caller that proved it
 /// meant to reach a metadata service.
 fn respond(
-    service: &(dyn MetadataService + Send + Sync),
+    service: &(dyn GuestServiceAdapter + Send + Sync),
     method: &str,
     target: &str,
     headers: &[(&str, &str)],
@@ -325,9 +403,17 @@ fn gce_response(path: &str, query: &str) -> (&'static str, &'static str, String)
 mod tests {
     use super::*;
     use crate::{HostList, SessionState};
+    use engram_core::types::integration::GuestService;
     use engram_core::SessionId;
 
-    /// Drive the real dispatch: pick the service for a flavor, then run the
+    fn gateway_registry() -> GuestGatewayRegistry {
+        GuestGatewayRegistry::new(
+            [Arc::new(GceMetadataService) as Arc<dyn GuestServiceAdapter>],
+            std::iter::empty::<Arc<dyn TunnelConnector>>(),
+        )
+    }
+
+    /// Drive the real dispatch: pick the compatibility service, then run the
     /// shared method/authorize gate. `flavored` says whether the caller sent
     /// the proof-of-intent header the service demands.
     fn response(
@@ -335,14 +421,14 @@ mod tests {
         target: &str,
         flavored: bool,
     ) -> (&'static str, &'static str, String) {
-        let service = service_for(MetadataFlavor::Gce);
+        let service = GceMetadataService;
         let (name, value) = service.response_header();
         let headers: Vec<(&str, &str)> = if flavored {
             vec![(name, value)]
         } else {
             Vec::new()
         };
-        respond(service, method, target, &headers)
+        respond(&service, method, target, &headers)
     }
 
     #[test]
@@ -358,34 +444,31 @@ mod tests {
     }
 
     #[test]
-    fn a_session_with_no_flavor_is_served_nothing() {
+    fn a_session_with_no_compatibility_service_is_served_nothing() {
         // The endpoint is per-session. A session that asked for no metadata
-        // service must not reach another flavor's attribute tree just because
+        // service must not reach another service's attribute tree just because
         // the listener is bound.
         let registry = Registry::new();
         let guest_ip: std::net::Ipv4Addr = "10.200.0.9".parse().unwrap();
-        assert!(session_metadata_flavor(&registry, guest_ip).is_none());
+        assert!(session_guest_services(&registry, guest_ip).is_empty());
     }
 
-    fn assert_service_is_well_formed(flavor: MetadataFlavor) {
-        let service = service_for(flavor);
+    fn assert_service_is_well_formed(service: &dyn GuestServiceAdapter) {
         let (name, value) = service.response_header();
-        assert!(!name.is_empty() && !value.is_empty(), "{flavor:?}");
+        assert!(!name.is_empty() && !value.is_empty(), "{}", service.kind());
         // The proof-of-intent header is exactly the one the service names, and
         // nothing else opens the attribute tree.
-        assert!(service.authorize(&[(name, value)]), "{flavor:?}");
-        assert!(!service.authorize(&[]), "{flavor:?}");
-        assert!(!service.authorize(&[(name, "wrong")]), "{flavor:?}");
+        assert!(service.authorize(&[(name, value)]), "{}", service.kind());
+        assert!(!service.authorize(&[]), "{}", service.kind());
+        assert!(!service.authorize(&[(name, "wrong")]), "{}", service.kind());
     }
 
     #[test]
-    fn every_flavor_resolves_to_a_service_that_states_its_own_header() {
-        // Wildcard-free, like `service_for` itself: a new variant does not
-        // compile until it is asserted here, so this covers the whole set by
-        // construction rather than by a list someone has to remember to grow.
-        match MetadataFlavor::Gce {
-            MetadataFlavor::Gce => assert_service_is_well_formed(MetadataFlavor::Gce),
-        }
+    fn registered_compatibility_service_states_its_own_header() {
+        let gateway = gateway_registry();
+        let service = gateway.service(GCE_METADATA_SERVICE_KIND).unwrap();
+        assert_service_is_well_formed(service.as_ref());
+        assert!(gateway.service("unknown.service").is_none());
     }
 
     #[test]
@@ -449,7 +532,7 @@ mod tests {
     fn metadata_is_enabled_only_by_the_registered_session_policy() {
         let registry = Registry::new();
         let guest_ip = "10.200.0.2".parse().unwrap();
-        let state = |metadata_flavor| SessionState {
+        let state = |guest_services| SessionState {
             session_id: SessionId::new(),
             guest_ip,
             network_allow: HostList::empty(),
@@ -457,18 +540,18 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor,
-            cloud_sql_tunnels: Vec::new(),
+            guest_services,
+            tunnels: Vec::new(),
         };
-        registry.register(state(None));
-        assert!(session_metadata_flavor(&registry, guest_ip).is_none());
-        registry.register(state(Some(MetadataFlavor::Gce)));
+        registry.register(state(Vec::new()));
+        assert!(session_guest_services(&registry, guest_ip).is_empty());
+        registry.register(state(vec![GuestService::new("gcp.gce_metadata")]));
         assert_eq!(
-            session_metadata_flavor(&registry, guest_ip),
-            Some(MetadataFlavor::Gce),
+            session_guest_services(&registry, guest_ip),
+            vec![GuestService::new("gcp.gce_metadata")],
         );
         // An IP with no registered session gets nothing.
-        assert!(session_metadata_flavor(&registry, "10.200.0.6".parse().unwrap()).is_none());
+        assert!(session_guest_services(&registry, "10.200.0.6".parse().unwrap()).is_empty());
     }
 
     #[tokio::test]
@@ -482,15 +565,15 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: Some(MetadataFlavor::Gce),
-            cloud_sql_tunnels: Vec::new(),
+            guest_services: vec![GuestService::new("gcp.gce_metadata")],
+            tunnels: Vec::new(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let registry_for_server = registry.clone();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            serve_connection(stream, peer, &registry_for_server, None)
+            serve_connection(stream, peer, &registry_for_server, &gateway_registry())
                 .await
                 .unwrap();
         });
@@ -511,8 +594,59 @@ mod tests {
         assert!(!response.contains("ya29."));
     }
 
+    #[tokio::test]
+    async fn tunnel_listing_exposes_only_opaque_ids_and_connector_kinds() {
+        use engram_core::types::integration::CredentialMintSource;
+
+        let registry = Arc::new(Registry::new());
+        registry.register(SessionState {
+            session_id: SessionId::new(),
+            guest_ip: std::net::Ipv4Addr::LOCALHOST,
+            network_allow: HostList::empty(),
+            allow_all: false,
+            secrets: Vec::new(),
+            injects: Vec::new(),
+            observes: Vec::new(),
+            guest_services: Vec::new(),
+            tunnels: vec![SessionTunnel {
+                id: "prod-readonly".into(),
+                connector: "gcp.cloud_sql".into(),
+                config_json:
+                    r#"{"instance":"customer:region:prod","database_user":"reader@customer.iam"}"#
+                        .into(),
+                mint_source: Some(CredentialMintSource::Connection {
+                    connection_id: "secret-connection-id".into(),
+                    provider: "gcp".into(),
+                }),
+            }],
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            serve_connection(stream, peer, &registry, &GuestGatewayRegistry::default())
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET /_engrams/v1/tunnels HTTP/1.1\r\nEngram-Gateway: 1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.contains(r#""id":"prod-readonly""#));
+        assert!(response.contains(r#""connector":"gcp.cloud_sql""#));
+        assert!(!response.contains("customer:region:prod"));
+        assert!(!response.contains("reader@customer.iam"));
+        assert!(!response.contains("secret-connection-id"));
+    }
+
     #[test]
-    fn cloud_sql_connect_requires_the_exact_compiled_instance() {
+    fn tunnel_connect_requires_the_exact_compiled_id() {
         use engram_core::types::integration::CredentialMintSource;
 
         let session = SessionState {
@@ -523,38 +657,25 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: Some(MetadataFlavor::Gce),
-            cloud_sql_tunnels: vec![CloudSqlTunnel {
-                instance: "customer:us-central1:prod".into(),
-                database_user: "reader@customer.iam".into(),
-                mint_source: CredentialMintSource::Connection {
+            guest_services: vec![GuestService::new("gcp.gce_metadata")],
+            tunnels: vec![SessionTunnel {
+                id: "prod-readonly".into(),
+                connector: "gcp.cloud_sql".into(),
+                config_json: "{}".into(),
+                mint_source: Some(CredentialMintSource::Connection {
                     connection_id: "gcp-prod".into(),
                     provider: "gcp".into(),
-                },
+                }),
             }],
         };
-        let good = [("Metadata-Flavor", "Google")];
-        assert!(authorized_cloud_sql_tunnel(
-            &session,
-            "/_engrams/v1/cloud-sql/customer:us-central1:other",
-            &good,
-        )
-        .is_none());
-        assert!(authorized_cloud_sql_tunnel(
-            &session,
-            "/_engrams/v1/cloud-sql/customer:us-central1:prod",
-            &[],
-        )
-        .is_none());
+        let good = [("Engram-Gateway", "1")];
+        assert!(authorized_tunnel(&session, "/_engrams/v1/tunnels/other", &good,).is_none());
+        assert!(authorized_tunnel(&session, "/_engrams/v1/tunnels/prod-readonly", &[],).is_none());
         assert_eq!(
-            authorized_cloud_sql_tunnel(
-                &session,
-                "/_engrams/v1/cloud-sql/customer:us-central1:prod",
-                &good,
-            )
-            .unwrap()
-            .instance,
-            "customer:us-central1:prod"
+            authorized_tunnel(&session, "/_engrams/v1/tunnels/prod-readonly", &good,)
+                .unwrap()
+                .id,
+            "prod-readonly"
         );
     }
 
@@ -577,12 +698,12 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: Some(MetadataFlavor::Gce),
-            cloud_sql_tunnels: Vec::new(),
+            guest_services: vec![GuestService::new("gcp.gce_metadata")],
+            tunnels: Vec::new(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve(listener, registry, None));
+        let server = tokio::spawn(serve(listener, registry, Arc::new(gateway_registry())));
         let config = tempfile::tempdir().unwrap();
         let config_path = config.path().to_path_buf();
         let command_config_path = config_path.clone();

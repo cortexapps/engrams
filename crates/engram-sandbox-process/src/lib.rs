@@ -1512,8 +1512,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_metadata_delivery_without_interception() {
-        use engram_core::types::integration::MetadataFlavor;
+    async fn rejects_guest_gateway_services_without_a_gateway() {
+        use engram_core::types::integration::GuestService;
         let (backend, _dir) = backend();
         let error = backend
             .notify_session_policy(SessionEgressPolicy {
@@ -1526,19 +1526,16 @@ mod tests {
                 secrets: Vec::new(),
                 injects: Vec::new(),
                 observes: Vec::new(),
-                metadata_flavor: Some(MetadataFlavor::Gce),
-                cloud_sql_tunnels: Vec::new(),
+                guest_services: vec![GuestService::new("gcp.gce_metadata")],
+                tunnels: Vec::new(),
                 secret_mode: SecretMode::Broker,
             })
             .await
-            .expect_err("Process must reject a metadata flavor it cannot intercept");
+            .expect_err("Process must reject a guest service it cannot expose");
 
-        // The refusal names the flavor, so a second cloud's failure is not
-        // reported as Google's.
         let message = error.to_string();
-        assert!(message.contains("Gce"), "{message}");
         assert!(
-            message.contains("requires host egress interception"),
+            message.contains("require a session-scoped guest gateway"),
             "{message}"
         );
     }

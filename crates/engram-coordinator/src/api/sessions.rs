@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use engram_core::traits::{SecretContext, SessionFence};
 use engram_core::types::image::ImageConfig;
-use engram_core::types::integration::MetadataFlavor;
+use engram_core::types::integration::GuestService;
 use engram_core::types::session::{split_image_ref, ImageRef, SessionMode};
 use engram_core::types::BindingDisposition;
 use engram_core::types::{Session, SessionSpec, SessionState};
@@ -472,10 +472,13 @@ pub(crate) async fn build_resume_egress_policy(
         &network,
         injects,
         observes,
-        policy.as_ref().and_then(|policy| policy.metadata_flavor),
         policy
             .as_ref()
-            .map(|policy| policy.cloud_sql_tunnels.clone())
+            .map(|policy| policy.guest_services.clone())
+            .unwrap_or_default(),
+        policy
+            .as_ref()
+            .map(|policy| policy.tunnels.clone())
             .unwrap_or_default(),
     ))
 }
@@ -495,8 +498,8 @@ pub(crate) fn assemble_resume_egress_policy(
     network: &engram_core::types::image::NetworkPolicy,
     injects: Vec<engram_core::types::egress::EgressInjectEntry>,
     observes: Vec<engram_core::types::egress::EgressObserveEntry>,
-    metadata_flavor: Option<MetadataFlavor>,
-    cloud_sql_tunnels: Vec<engram_core::types::integration::CloudSqlTunnel>,
+    guest_services: Vec<GuestService>,
+    tunnels: Vec<engram_core::types::integration::SessionTunnel>,
 ) -> engram_core::types::egress::SessionEgressPolicy {
     engram_core::types::egress::SessionEgressPolicy {
         session_id,
@@ -515,8 +518,8 @@ pub(crate) fn assemble_resume_egress_policy(
         // ADR 0056 (Phase 4): observe specs (from the persisted policy), so a
         // resumed session keeps emitting assets on the new host.
         observes,
-        metadata_flavor,
-        cloud_sql_tunnels,
+        guest_services,
+        tunnels,
         // ADR 0057: per-secret mode; the proxy substitutes per entry. Vestigial.
         secret_mode: engram_core::types::image::SecretMode::Broker,
     }
@@ -2477,7 +2480,7 @@ mod tests {
             &network,
             Vec::new(),
             Vec::new(),
-            None,
+            Vec::new(),
             Vec::new(),
         );
 
@@ -2514,7 +2517,7 @@ mod tests {
             &NetworkPolicy::default(),
             Vec::new(),
             Vec::new(),
-            None,
+            Vec::new(),
             Vec::new(),
         );
         assert_eq!(policy.guest_ip, guest_ip);

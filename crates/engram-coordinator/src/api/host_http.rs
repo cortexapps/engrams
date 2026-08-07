@@ -1485,40 +1485,34 @@ pub async fn refresh_inject(
     Path((host_id, session_id)): Path<(HostId, SessionId)>,
     Json(req): Json<RefreshInjectRequest>,
 ) -> Result<Json<RefreshInjectResponse>, ApiError> {
-    let (header_name, secret, expires_at) = match (&req.mint_source, req.purpose) {
-        (
-            engram_core::types::integration::CredentialMintSource::Connection {
-                connection_id, ..
-            },
-            purpose @ (engram_core::types::integration::CredentialPurpose::CloudSqlAdmin
-            | engram_core::types::integration::CredentialPurpose::CloudSqlLogin),
-        ) => {
-            let (token, expires_at) = crate::session_boot::mint_remote_connection_credential(
-                session_id,
-                connection_id,
-                purpose,
-            )
-            .await
-            .ok_or_else(|| ApiError::Internal("Cloud SQL credential could not be minted".into()))?;
-            (String::new(), token, expires_at)
-        }
-        (_, engram_core::types::integration::CredentialPurpose::Api) => {
-            let (header, expires_at) =
-                crate::session_boot::refresh_inject_header(&state, session_id, &req.mint_source)
-                    .await
-                    .ok_or_else(|| {
-                        ApiError::Internal(format!(
-                            "inject refresh for {:?} on session {session_id} could not be minted",
-                            req.mint_source
-                        ))
-                    })?;
-            (header.name, header.value, expires_at)
-        }
-        _ => {
-            return Err(ApiError::BadRequest(
-                "credential purpose is invalid for source".into(),
-            ))
-        }
+    let (header_name, secret, expires_at) = if req.purpose.as_str() == "api" {
+        let (header, expires_at) =
+            crate::session_boot::refresh_inject_header(&state, session_id, &req.mint_source)
+                .await
+                .ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "inject refresh for {:?} on session {session_id} could not be minted",
+                        req.mint_source
+                    ))
+                })?;
+        (header.name, header.value, expires_at)
+    } else if let engram_core::types::integration::CredentialMintSource::Connection {
+        connection_id,
+        ..
+    } = &req.mint_source
+    {
+        let (token, expires_at) = crate::session_boot::mint_remote_connection_credential(
+            session_id,
+            connection_id,
+            req.purpose.clone(),
+        )
+        .await
+        .ok_or_else(|| ApiError::Internal("host credential could not be minted".into()))?;
+        (String::new(), token, expires_at)
+    } else {
+        return Err(ApiError::BadRequest(
+            "credential purpose is invalid for source".into(),
+        ));
     };
     tracing::debug!(
         %host_id,

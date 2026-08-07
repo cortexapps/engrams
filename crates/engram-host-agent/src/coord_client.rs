@@ -263,7 +263,7 @@ impl HttpCoordClient {
         let builder = self.http.post(&url);
         let req = RefreshInjectRequest {
             mint_source: mint_source.clone(),
-            purpose: engram_core::types::integration::CredentialPurpose::Api,
+            purpose: engram_core::types::integration::CredentialPurpose::api(),
         };
         let resp = self
             .auth(builder, &req)

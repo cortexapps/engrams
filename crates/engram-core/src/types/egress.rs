@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::types::image::SecretMode;
-use crate::types::integration::{CloudSqlTunnel, CredentialMintSource, MetadataFlavor};
+use crate::types::integration::{CredentialMintSource, GuestService, SessionTunnel};
 use crate::{SandboxId, SessionId};
 
 /// Per-session egress policy the host-agent's proxy registers
@@ -57,14 +57,12 @@ pub struct SessionEgressPolicy {
     /// request's real response. `#[serde(default)]` so older policies decode.
     #[serde(default)]
     pub observes: Vec<EgressObserveEntry>,
-    /// Which cloud metadata service the host serves for this session, if any.
-    /// The endpoint returns only an opaque placeholder token; the proxy
-    /// substitutes the real credential on the wire.
+    /// Compatibility services mounted on the session-scoped guest gateway.
     #[serde(default)]
-    pub metadata_flavor: Option<MetadataFlavor>,
-    /// Exact host-side Cloud SQL tunnels. No credential value crosses this wire.
+    pub guest_services: Vec<GuestService>,
+    /// Exact host-side tunnels. No credential value crosses this wire.
     #[serde(default)]
-    pub cloud_sql_tunnels: Vec<CloudSqlTunnel>,
+    pub tunnels: Vec<SessionTunnel>,
     /// Image's secret delivery mode. The proxy uses this to decide
     /// whether to MITM (`Broker`) or just SNI-filter (`Literal`).
     pub secret_mode: SecretMode,

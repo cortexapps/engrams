@@ -15,7 +15,7 @@ import { resolveIntegrationGrants } from "../integrations/grants.ts";
 import type { ResolvedIntegrationGrant } from "../integrations/grants.ts";
 
 function policy(): IntegrationPolicyJson {
-  return { network: { default: "deny", allow_hosts: [], allow_host_patterns: [] }, secrets: [], injects: [], observes: [], metadata_flavor: null, cloud_sql_tunnels: [] };
+  return { network: { default: "deny", allow_hosts: [], allow_host_patterns: [] }, secrets: [], injects: [], observes: [], guest_services: [], tunnels: [] };
 }
 
 function grant(
@@ -53,9 +53,13 @@ describe("Google egress policy", () => {
     appendGooglePolicy(output, [resolved]);
 
     expect(output.injects).toEqual([]);
-    expect(output.cloud_sql_tunnels).toEqual([{
-      instance: "customer:us-central1:prod",
-      database_user: "reader@customer.iam",
+    expect(output.tunnels).toEqual([{
+      id: "prod-readonly",
+      connector: "gcp.cloud_sql",
+      config_json: JSON.stringify({
+        instance: "customer:us-central1:prod",
+        database_user: "reader@customer.iam",
+      }),
       mint_source: {
         connection: { connection_id: "connection-1", provider: "gcp" },
       },

@@ -54,7 +54,7 @@ use engram_core::types::egress::{
     EgressInjectEntry, EgressObserveEntry, EgressSecretEntry, SessionEgressPolicy,
 };
 use engram_core::types::image::{NetworkDefault, NetworkPolicy, SecretMode};
-use engram_core::types::integration::{CredentialMintSource, MetadataFlavor};
+use engram_core::types::integration::{CredentialMintSource, GuestService};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::{
     AgentSpec, AuxBundleRef, AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec,
@@ -244,8 +244,8 @@ fn session_egress_policy() -> SessionEgressPolicy {
         secret_mode: SecretMode::Broker,
         // ADR 0109: the host exposes metadata-style ADC only for sessions
         // whose immutable launch policy enables Google Cloud.
-        metadata_flavor: Some(MetadataFlavor::Gce),
-        cloud_sql_tunnels: vec![],
+        guest_services: vec![GuestService::new("gcp.gce_metadata")],
+        tunnels: vec![],
     }
 }
 
@@ -328,14 +328,17 @@ fn session_egress_policy_google() -> SessionEgressPolicy {
             }),
             expires_at: Some(DateTime::from_timestamp(1_770_003_600, 0).unwrap()),
         }],
-        metadata_flavor: Some(MetadataFlavor::Gce),
-        cloud_sql_tunnels: vec![engram_core::types::integration::CloudSqlTunnel {
-            instance: "customer:us-central1:prod".into(),
-            database_user: "reader@customer.iam".into(),
-            mint_source: CredentialMintSource::Connection {
+        guest_services: vec![GuestService::new("gcp.gce_metadata")],
+        tunnels: vec![engram_core::types::integration::SessionTunnel {
+            id: "prod-readonly".into(),
+            connector: "gcp.cloud_sql".into(),
+            config_json:
+                r#"{"instance":"customer:us-central1:prod","database_user":"reader@customer.iam"}"#
+                    .into(),
+            mint_source: Some(CredentialMintSource::Connection {
                 connection_id: "gcp-prod".into(),
                 provider: "gcp".into(),
-            },
+            }),
         }],
         ..session_egress_policy()
     }
@@ -635,11 +638,11 @@ fn wire_version_pinned() {
     // minted-inject policy failed host-side at boot (the engrams-review
     // outage, 2026-08-01). No existing golden changes bytes (the broken
     // `Some` shape never had one); the minted-policy golden is ADDED.
-    // 22 -> 23: ADR 0109 seam — `SessionEgressPolicy.google_adc` becomes
+    // 22 -> 23: ADR 0109 seam — `SessionEgressPolicy.google_adc` became
     // `metadata_flavor: Option<MetadataFlavor>`. A field REPLACEMENT, not an
     // addition, so a v22 host cannot decode a v23 policy: the roll is
     // lockstep. All three session-egress-policy goldens were regenerated, and
-    // the `session_egress_policy_google` fixture now pins the `Some(Gce)`
+    // the `session_egress_policy_google` fixture pinned the `Some(Gce)`
     // encoding beside the `None` case the other two carry.
     // 23 -> 24: ADR 0106 addendum — `CredentialMintSource` gains the TRAILING
     // `OauthConnector` variant (connector OAuth on the inject rail). Existing
@@ -649,9 +652,11 @@ fn wire_version_pinned() {
     // field (ephemeral guest swap size). Only `sandbox_spec.bin` changed
     // bytes (the fixture pins `Some(6144)`); every other golden embeds no
     // spec and kept its bytes. Lockstep coord+host roll.
-    // 25 -> 26: ADR 0109 Cloud SQL addendum — `SessionEgressPolicy` gains the
-    // TRAILING exact Cloud SQL tunnel authorities. All session-policy goldens
-    // were regenerated; the Google fixture pins a populated tunnel.
+    // 25 -> 26: ADR 0109 Cloud SQL addendum — the metadata listener becomes a
+    // generic guest gateway. `metadata_flavor` becomes registered
+    // `guest_services`, and `SessionEgressPolicy` gains generic tunnel entries.
+    // All session-policy goldens were regenerated; the Google fixture pins a
+    // service and a populated tunnel.
     assert_eq!(
         WIRE_VERSION, 26,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
