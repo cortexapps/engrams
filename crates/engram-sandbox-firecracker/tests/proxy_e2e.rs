@@ -324,6 +324,11 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     proxy_cfg.upstream_test_roots = Some(upstream_test_roots);
     proxy_cfg.guest_gateway_bind_addr =
         Some(format!("0.0.0.0:{guest_gateway_port}").parse().unwrap());
+    proxy_cfg.guest_gateway = Arc::new(engram_egress_proxy::GuestGatewayRegistry::new(
+        [Arc::new(engram_egress_proxy::GceMetadataService)
+            as Arc<dyn engram_egress_proxy::GuestServiceAdapter>],
+        std::iter::empty::<Arc<dyn engram_egress_proxy::TunnelConnector>>(),
+    ));
     let proxy = engram_egress_proxy::Proxy::new(proxy_cfg);
     // Bind synchronously (ADR 0083) — the listener is up before serve
     // spawns, so no sleep-to-wait-for-bind is needed.
