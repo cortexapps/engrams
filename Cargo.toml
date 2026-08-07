@@ -79,7 +79,7 @@ lz4_flex = "0.14"
 # sha256 of the payload was ~1.2 ms per serve, the dominant encode leg).
 blake3 = "1"
 # schemars is required by kube's CustomResource derive (CRD schema gen).
-schemars = "0.8"
+schemars = "1.2"
 # internal
 engram-core = { path = "crates/engram-core" }
 engram-protocol = { path = "crates/engram-protocol" }
