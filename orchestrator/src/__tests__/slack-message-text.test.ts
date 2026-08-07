@@ -187,6 +187,31 @@ describe("replyText()", () => {
     ).toBe("look at this\n[file: trace.png image/png https://files.slack.com/t.png]");
   });
 
+  // Surfaces are never compared against each other. An earlier cut deduped
+  // parts by substring containment on a link-stripped key, which collapsed
+  // distinct items: a digest's second link vanished because it shared a label
+  // with the first, and a short body was swallowed by a longer one.
+  test("a digest keeps every item when items share a link label", () => {
+    expect(
+      replyText({
+        text: "",
+        attachments: [
+          { title: "Ticket", title_link: "https://linear.app/a/PFR-1" },
+          { title: "Ticket", title_link: "https://linear.app/a/PFR-2" },
+        ],
+      }),
+    ).toBe("<https://linear.app/a/PFR-1|Ticket>\n<https://linear.app/a/PFR-2|Ticket>");
+  });
+
+  test("an item is kept even when another item's words contain it", () => {
+    expect(
+      replyText({
+        text: "",
+        attachments: [{ text: "Fix bug" }, { text: "Fix bug in parser" }],
+      }),
+    ).toBe("Fix bug\nFix bug in parser");
+  });
+
   test("a blocks-only post with no `text` fallback still reaches the prompt", () => {
     // The old rule dropped this message entirely. Inline runs each land on
     // their own line and emoji/mention runs are lost — degraded, but present.

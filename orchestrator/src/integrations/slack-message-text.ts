@@ -7,11 +7,16 @@
  * as `text` and the ticket itself in an attachment.
  *
  * So this reads EVERY surface. It never rules a surface decorative; the agent,
- * not this module, judges what matters. The one thing dropped is literal
- * repetition, which Slack's own contract creates: `text` is the declared
- * fallback for `blocks`, and an attachment's `fallback` is the declared
- * stand-in for that attachment's body, so the same words legitimately arrive
- * twice.
+ * not this module, judges what matters.
+ *
+ * It also never compares one surface against another. Two attachments that read
+ * alike are two items, not a repetition — a digest that posts the same link
+ * label with a different URL per item must keep every item. The ONLY content
+ * dropped is a surface restating its own declared fallback, which Slack's
+ * contract creates: `text` is the declared fallback for `blocks`, and an
+ * attachment's `fallback` is the stand-in for that attachment's body. That
+ * comparison is always between a surface and its own stand-in, never across
+ * two independent pieces of content.
  */
 
 import type { ConversationsRepliesResponse } from "@slack/web-api";
@@ -44,30 +49,20 @@ const nonEmpty = (s: string | undefined): s is string => !!s && !!s.trim();
 
 /** Render every content surface of one message, in document order. */
 export function replyText(msg: SlackReply): string {
-  const parts: string[] = [];
-  add(parts, msg.text ?? "");
-  add(parts, renderBlocks(msg.blocks, msg.text ?? ""));
-  for (const a of msg.attachments ?? []) add(parts, renderAttachment(a));
-  for (const f of msg.files ?? []) add(parts, renderFile(f));
-  return parts.join("\n");
+  return [
+    msg.text ?? "",
+    renderBlocks(msg.blocks, msg.text ?? ""),
+    ...(msg.attachments ?? []).map(renderAttachment),
+    ...(msg.files ?? []).map(renderFile),
+  ]
+    .map((part) => part.trim())
+    .filter(nonEmpty)
+    .join("\n");
 }
 
-/** Append a part unless another already contains it verbatim (normalized). On
- *  overlap the LONGER part wins: it is the superset, so nothing is lost. */
-function add(parts: string[], part: string): void {
-  const text = part.trim();
-  const key = normalize(text);
-  if (!key) return;
-  const dup = parts.findIndex((p) => {
-    const k = normalize(p);
-    return k.includes(key) || key.includes(k);
-  });
-  if (dup === -1) parts.push(text);
-  else if (key.length > normalize(parts[dup]).length) parts[dup] = text;
-}
-
-/** Compare-only form: unwrap Slack links, drop mrkdwn styling, fold whitespace
- *  and case, so two surfaces rendering the same words normalize alike. */
+/** Compare-only form, used ONLY to match a surface against its own declared
+ *  fallback: unwrap Slack links, drop mrkdwn styling, fold whitespace and case,
+ *  so the two renderings of the same words compare alike. */
 function normalize(text: string): string {
   return text
     .replace(/<([^>|]+)\|([^>]*)>/g, "$2") // <url|label> → label
