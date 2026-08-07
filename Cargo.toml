@@ -209,9 +209,12 @@ jemalloc_pprof = { version = "0.8", features = ["symbolize"] }
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 # OpenTelemetry distributed tracing (ADR 0019). Opt-in at runtime via
 # OTEL_EXPORTER_OTLP_ENDPOINT; deps are compiled in but inert when unset.
-# The 0.32 / tracing-opentelemetry 0.33 set is a known-compatible pairing
-# (tracing-opentelemetry runs one minor ahead of the core it targets) and
-# uses tonic 0.14 (matching our gRPC stack).
+# The whole family is version-locked and moves as one group
+# (`opentelemetry` in dependabot.yml): the SDK and exporter pin an exact
+# `opentelemetry` core minor, and tracing-opentelemetry runs one minor
+# ahead of the core it targets (0.33 -> core 0.32). The 0.32 set uses
+# tonic 0.14, matching our gRPC stack since #1024 — which is also what
+# retires the second tonic the 0.28 set was keeping in the graph.
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace"] }
