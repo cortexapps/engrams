@@ -284,7 +284,7 @@ proptest = "1"
 # seed-stable, documented stream layout (the standard DST choice); the
 # master seed forks per-component streams so adding a consumer doesn't
 # shift every other stream.
-rand = { version = "0.9", default-features = false, features = ["std"] }
+rand = { version = "0.10", default-features = false, features = ["std"] }
 rand_chacha = "0.9"
 
 # tls + cert mint (host-side egress proxy)
