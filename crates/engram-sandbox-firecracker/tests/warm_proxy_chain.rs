@@ -248,7 +248,8 @@ async fn warm_path_redirects_through_proxy_with_correct_source_lookup() {
         secrets: vec![dummy_secret],
         injects: Vec::new(),
         observes: Vec::new(),
-        metadata_flavor: None,
+        guest_services: Vec::new(),
+        tunnels: Vec::new(),
     });
 
     // ---- 5. From inside the netns, dial TEST_DEST_IP:443 with a

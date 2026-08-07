@@ -142,6 +142,14 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
                   ))}
                 </dd>
               </div>
+              {connection.googleCloud?.cloudSqlPostgresInstance && (
+                <div>
+                  <dt className="text-muted-foreground">Cloud SQL PostgreSQL</dt>
+                  <dd className="mt-1 break-all font-mono">
+                    {connection.googleCloud.cloudSqlPostgresInstance}
+                  </dd>
+                </div>
+              )}
             </dl>
           </section>
         </aside>

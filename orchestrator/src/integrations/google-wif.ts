@@ -8,7 +8,24 @@ import { isDeniedGoogleHost } from "./google-credential-denylist.ts";
 
 const STS_URL = "https://sts.googleapis.com/v1/token";
 const IAM_CREDENTIALS_ORIGIN = "https://iamcredentials.googleapis.com";
-const CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
+export const GOOGLE_OAUTH_SCOPES = {
+  api: "https://www.googleapis.com/auth/cloud-platform",
+  cloud_sql_admin: "https://www.googleapis.com/auth/sqlservice.admin",
+  cloud_sql_login: "https://www.googleapis.com/auth/sqlservice.login",
+} as const;
+
+export function googleOAuthScope(purpose: string): string {
+  switch (purpose) {
+    case "api":
+      return GOOGLE_OAUTH_SCOPES.api;
+    case "cloud_sql_admin":
+      return GOOGLE_OAUTH_SCOPES.cloud_sql_admin;
+    case "cloud_sql_login":
+      return GOOGLE_OAUTH_SCOPES.cloud_sql_login;
+    default:
+      throw new Error(`unsupported Google credential purpose "${purpose}"`);
+  }
+}
 const SUBJECT_TOKEN_LIFETIME_SECONDS = 300;
 // The host proxy refreshes minted credentials five minutes before expiry.
 // Keep the Google access token short-lived but longer than that refresh window,
@@ -59,7 +76,12 @@ const WIF_PROVIDER_RESOURCE =
   /^\/\/iam\.googleapis\.com\/projects\/[0-9]+\/locations\/global\/workloadIdentityPools\/[a-z][a-z0-9-]{3,31}\/providers\/[a-z][a-z0-9-]{3,31}$/;
 
 export function assertGoogleCloudConfig(value: Record<string, unknown>): GoogleCloudConnectionConfig {
-  const allowedKeys = new Set(["workloadIdentityProvider", "serviceAccountEmail", "endpoints"]);
+  const allowedKeys = new Set([
+    "workloadIdentityProvider",
+    "serviceAccountEmail",
+    "endpoints",
+    "cloudSqlPostgresInstance",
+  ]);
   const unknownKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
   if (unknownKeys.length > 0) {
     throw new Error(`Google Cloud config contains unsupported fields: ${unknownKeys.join(", ")}`);
@@ -67,6 +89,7 @@ export function assertGoogleCloudConfig(value: Record<string, unknown>): GoogleC
   const workloadIdentityProvider = value.workloadIdentityProvider;
   const serviceAccountEmail = value.serviceAccountEmail;
   const endpoints = value.endpoints;
+  const cloudSqlPostgresInstance = value.cloudSqlPostgresInstance;
   if (
     typeof workloadIdentityProvider !== "string" ||
     !WIF_PROVIDER_RESOURCE.test(workloadIdentityProvider)
@@ -103,7 +126,21 @@ export function assertGoogleCloudConfig(value: Record<string, unknown>): GoogleC
       throw new Error(`credential exchange endpoint "${endpoint}" cannot be guest-accessible`);
     }
   }
-  return { workloadIdentityProvider, serviceAccountEmail, endpoints: normalized };
+  if (
+    cloudSqlPostgresInstance !== undefined &&
+    (typeof cloudSqlPostgresInstance !== "string" ||
+      !/^[a-z][a-z0-9-]{4,28}[a-z0-9]:[a-z0-9-]{1,64}:[a-z][a-z0-9-]{0,96}$/.test(
+        cloudSqlPostgresInstance,
+      ))
+  ) {
+    throw new Error("Cloud SQL PostgreSQL instance must be project:region:instance");
+  }
+  return {
+    workloadIdentityProvider,
+    serviceAccountEmail,
+    endpoints: normalized,
+    ...(cloudSqlPostgresInstance ? { cloudSqlPostgresInstance } : {}),
+  };
 }
 
 export function makeGoogleWifBroker(deps: GoogleWifBrokerDeps) {
@@ -154,6 +191,7 @@ export function makeGoogleWifBroker(deps: GoogleWifBrokerDeps) {
   async function exchange(
     config: GoogleCloudConnectionConfig,
     identity: WifIdentity,
+    scopes: readonly string[] = [GOOGLE_OAUTH_SCOPES.api],
   ): Promise<GoogleAccessToken> {
     const subjectToken = await mintSubjectToken(config, identity);
     const stsResponse = await fetchFn(STS_URL, {
@@ -163,7 +201,7 @@ export function makeGoogleWifBroker(deps: GoogleWifBrokerDeps) {
         audience: googleOidcAudience(config.workloadIdentityProvider),
         grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
         requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
-        scope: CLOUD_PLATFORM_SCOPE,
+        scope: GOOGLE_OAUTH_SCOPES.api,
         subject_token_type: "urn:ietf:params:oauth:token-type:jwt",
         subject_token: subjectToken,
       }),
@@ -184,7 +222,7 @@ export function makeGoogleWifBroker(deps: GoogleWifBrokerDeps) {
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        scope: [CLOUD_PLATFORM_SCOPE],
+        scope: [...scopes],
         lifetime: `${ACCESS_TOKEN_LIFETIME_SECONDS}s`,
       }),
     });
@@ -236,6 +274,61 @@ export function googleSetupDoc(
   const principalSet =
     `principalSet://iam.googleapis.com/projects/${projectNumber}/locations/global/` +
     `workloadIdentityPools/${poolId}/attribute.engrams_connection/${row.id}`;
+  const cloudSql = google.cloudSqlPostgresInstance?.split(":");
+  const cloudSqlProject = cloudSql?.[0];
+  const cloudSqlInstance = cloudSql?.[2];
+  const cloudSqlCondition = cloudSqlProject && cloudSqlInstance
+    ? `resource.name == 'projects/${cloudSqlProject}/instances/${cloudSqlInstance}' && resource.service == 'sqladmin.googleapis.com'`
+    : undefined;
+  const cloudSqlDatabaseUser = google.serviceAccountEmail.replace(/\.gserviceaccount\.com$/, "");
+  const gcloudCloudSql = cloudSqlCondition
+    ? [
+        ``,
+        `# Cloud SQL transport and automatic IAM database login, limited to one instance.`,
+        `# First enable the cloudsql.iam_authentication database flag without replacing`,
+        `# any existing flags on the instance. Restart it if Google requires one.`,
+        `for role in roles/cloudsql.client roles/cloudsql.instanceUser; do`,
+        `  gcloud projects add-iam-policy-binding ${cloudSqlProject} --member=serviceAccount:${google.serviceAccountEmail} --role="$role" --condition="expression=${cloudSqlCondition},title=engrams-${row.id}"`,
+        `done`,
+        ``,
+        `gcloud sql users create ${cloudSqlDatabaseUser} --project=${cloudSqlProject} --instance=${cloudSqlInstance} --type=cloud_iam_service_account`,
+        ``,
+        `# Grant this database user only CONNECT, schema USAGE, and table SELECT.`,
+        `# Set default_transaction_read_only=on and a statement_timeout as defense`,
+        `# in depth. PostgreSQL grants enforce read-only access.`,
+      ]
+    : [];
+  const terraformCloudSql = cloudSqlCondition
+    ? [
+        ``,
+        `resource "google_project_iam_member" "${tfName}_cloud_sql_client" {`,
+        `  project = "${cloudSqlProject}"`,
+        `  role    = "roles/cloudsql.client"`,
+        `  member  = "serviceAccount:${google.serviceAccountEmail}"`,
+        `  condition {`,
+        `    title      = "engrams-${row.id}"`,
+        `    expression = "${cloudSqlCondition}"`,
+        `  }`,
+        `}`,
+        ``,
+        `resource "google_project_iam_member" "${tfName}_cloud_sql_instance_user" {`,
+        `  project = "${cloudSqlProject}"`,
+        `  role    = "roles/cloudsql.instanceUser"`,
+        `  member  = "serviceAccount:${google.serviceAccountEmail}"`,
+        `  condition {`,
+        `    title      = "engrams-${row.id}"`,
+        `    expression = "${cloudSqlCondition}"`,
+        `  }`,
+        `}`,
+        ``,
+        `resource "google_sql_user" "${tfName}_database_user" {`,
+        `  project  = "${cloudSqlProject}"`,
+        `  instance = "${cloudSqlInstance}"`,
+        `  name     = "${cloudSqlDatabaseUser}"`,
+        `  type     = "CLOUD_IAM_SERVICE_ACCOUNT"`,
+        `}`,
+      ]
+    : [];
   return {
     audience: google.workloadIdentityProvider,
     // An operator pastes this into a shell. Without a shebang the lines run
@@ -255,6 +348,7 @@ export function googleSetupDoc(
       `  gcloud iam workload-identity-pools providers create-oidc ${providerId} --location=global --workload-identity-pool=${poolId} --project=${projectNumber} --issuer-uri=${issuer} --allowed-audiences=${google.workloadIdentityProvider} --attribute-mapping=${mapping} --attribute-condition=\"${condition}\"`,
       ``,
       `gcloud iam service-accounts add-iam-policy-binding ${google.serviceAccountEmail} --project=${projectNumber} --role=roles/iam.workloadIdentityUser --member=${principalSet}`,
+      ...gcloudCloudSql,
     ].join("\n"),
     terraform: [
       `resource "google_iam_workload_identity_pool" "${tfName}" {`,
@@ -283,6 +377,7 @@ export function googleSetupDoc(
       `  role               = "roles/iam.workloadIdentityUser"`,
       `  member             = "${principalSet}"`,
       `}`,
+      ...terraformCloudSql,
     ].join("\n"),
   };
 }

@@ -9,12 +9,13 @@ import {
   CURATED_GOOGLE_OPERATIONS,
   FORBIDDEN_GOOGLE_OPERATIONS,
   GOOGLE_PASSTHROUGH_OPERATIONS,
+  CLOUD_SQL_POSTGRES_CONNECT,
 } from "../integrations/google-policy.ts";
 import { resolveIntegrationGrants } from "../integrations/grants.ts";
 import type { ResolvedIntegrationGrant } from "../integrations/grants.ts";
 
 function policy(): IntegrationPolicyJson {
-  return { network: { default: "deny", allow_hosts: [], allow_host_patterns: [] }, secrets: [], injects: [], observes: [], metadata_flavor: null };
+  return { network: { default: "deny", allow_hosts: [], allow_host_patterns: [] }, secrets: [], injects: [], observes: [], guest_services: [], tunnels: [] };
 }
 
 function grant(
@@ -44,6 +45,37 @@ function grant(
 }
 
 describe("Google egress policy", () => {
+  test("compiles one exact Cloud SQL tunnel without a credential value", () => {
+    const resolved = grant(CLOUD_SQL_POSTGRES_CONNECT, [], []);
+    resolved.connection.config.cloudSqlPostgresInstance = "customer:us-central1:prod";
+    const output = policy();
+
+    appendGooglePolicy(output, [resolved]);
+
+    expect(output.injects).toEqual([]);
+    expect(output.tunnels).toEqual([{
+      id: "prod-readonly",
+      connector: "gcp.cloud_sql",
+      config_json: JSON.stringify({
+        instance: "customer:us-central1:prod",
+        database_user: "reader@customer.iam",
+      }),
+      mint_source: {
+        connection: { connection_id: "connection-1", provider: "gcp" },
+      },
+    }]);
+    expect(JSON.stringify(output)).not.toContain("ya29");
+  });
+
+  test("Cloud SQL requires a configured instance and rejects grant constraints", () => {
+    expect(() => appendGooglePolicy(policy(), [grant(CLOUD_SQL_POSTGRES_CONNECT, [], [])]))
+      .toThrow(/has no Cloud SQL PostgreSQL instance/);
+    expect(() => validateGoogleGrants([grant(
+      CLOUD_SQL_POSTGRES_CONNECT,
+      ["projects/customer/instances/prod"],
+      [],
+    )])).toThrow(/does not accept resource constraints/);
+  });
   test("credential-producing operations cannot be granted", async () => {
     const connection = grant("compute.instances.get").connection;
     const store: IntegrationConnectionStore = {

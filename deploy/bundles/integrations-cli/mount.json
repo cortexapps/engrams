@@ -28,7 +28,8 @@
         "bin/figma",
         "bin/discord",
         "bin/shopify",
-        "bin/gcloud"
+        "bin/gcloud",
+        "bin/engram-tunnel"
       ],
       "requires_env": "ENGRAM_CLI_INTEGRATIONS"
     }

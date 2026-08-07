@@ -98,7 +98,7 @@ use engram_core::types::egress::{
     EgressInjectEntry, EgressObserveEntry, EgressSecretEntry, SessionEgressPolicy,
 };
 use engram_core::types::image::SecretMode;
-use engram_core::types::integration::{CredentialMintSource, MetadataFlavor, ObserveUrlFallback};
+use engram_core::types::integration::{CredentialMintSource, GuestService, ObserveUrlFallback};
 use engram_core::{SandboxId, SessionId};
 
 /// Every shape a `CredentialMintSource` can take.
@@ -258,18 +258,15 @@ fn egress_observe_entry() -> impl Strategy<Value = EgressObserveEntry> {
         )
 }
 
-/// Every metadata flavor, plus the "none" case.
-///
-/// The `match` is wildcard-free: a second cloud's flavor must be added here or
-/// this does not compile, so the round-trip corpus cannot quietly stop covering
-/// one.
-pub fn metadata_flavor() -> impl Strategy<Value = Option<MetadataFlavor>> {
-    fn shapes(sample: MetadataFlavor) -> BoxedStrategy<MetadataFlavor> {
-        match sample {
-            MetadataFlavor::Gce => Just(MetadataFlavor::Gce).boxed(),
-        }
-    }
-    proptest::option::of(shapes(MetadataFlavor::Gce))
+/// Registered guest services, including the empty set.
+pub fn guest_services() -> impl Strategy<Value = Vec<GuestService>> {
+    proptest::collection::vec(
+        prop_oneof![
+            Just(GuestService::new("gcp.gce_metadata")),
+            Just(GuestService::new("test.service")),
+        ],
+        0..3,
+    )
 }
 
 fn secret_mode() -> impl Strategy<Value = SecretMode> {
@@ -297,14 +294,14 @@ pub fn session_egress_policy() -> impl Strategy<Value = SessionEgressPolicy> {
             proptest::collection::vec(egress_inject_entry(), 0..2),
             proptest::collection::vec(egress_observe_entry(), 0..2),
         ),
-        (metadata_flavor(), secret_mode()),
+        (guest_services(), secret_mode()),
     )
         .prop_map(
             |(
                 (session, sandbox, ip),
                 (network_allow_hosts, network_allow_host_patterns, allow_all),
                 (secrets, injects, observes),
-                (metadata_flavor, secret_mode),
+                (guest_services, secret_mode),
             )| SessionEgressPolicy {
                 session_id: SessionId::from(uuid::Uuid::from_u128(session)),
                 sandbox_id: SandboxId::from(uuid::Uuid::from_u128(sandbox)),
@@ -315,7 +312,8 @@ pub fn session_egress_policy() -> impl Strategy<Value = SessionEgressPolicy> {
                 secrets,
                 injects,
                 observes,
-                metadata_flavor,
+                guest_services,
+                tunnels: Vec::new(),
                 secret_mode,
             },
         )

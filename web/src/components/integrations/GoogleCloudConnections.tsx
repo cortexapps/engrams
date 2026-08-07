@@ -82,6 +82,8 @@ const isValidWifId = (value: string) => WIF_ID_PATTERN.test(value) && !value.sta
 const ALIAS_PATTERN = /^[a-z][a-z0-9-]{1,62}$/;
 const PROJECT_NUMBER_PATTERN = /^[0-9]+$/;
 const HOST_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+const CLOUD_SQL_INSTANCE_PATTERN =
+  /^[a-z][a-z0-9-]{4,28}[a-z0-9]:[a-z0-9-]{1,64}:[a-z][a-z0-9-]{0,96}$/;
 
 const splitHosts = (value: string) =>
   value
@@ -207,6 +209,7 @@ export function GoogleCloudConnectDialog({
   const [aliasEdited, setAliasEdited] = useState(false);
   const [projectNumber, setProjectNumber] = useState("");
   const [serviceAccount, setServiceAccount] = useState("");
+  const [cloudSqlInstance, setCloudSqlInstance] = useState("");
   const endpointSelection = useEndpointSelection();
   const [poolId, setPoolId] = useState("engrams");
   const [providerId, setProviderId] = useState("");
@@ -219,6 +222,7 @@ export function GoogleCloudConnectDialog({
     setAliasEdited(false);
     setProjectNumber("");
     setServiceAccount("");
+    setCloudSqlInstance("");
     endpointSelection.clear();
     setPoolId("engrams");
     setProviderId("");
@@ -247,7 +251,8 @@ export function GoogleCloudConnectDialog({
     isValidWifId(poolId) &&
     isValidWifId(providerId) &&
     serviceAccount.trim().length > 0 &&
-    endpoints.length > 0 &&
+    (endpoints.length > 0 || cloudSqlInstance.length > 0) &&
+    (cloudSqlInstance.length === 0 || CLOUD_SQL_INSTANCE_PATTERN.test(cloudSqlInstance)) &&
     endpointSelection.customValid;
 
   const add = async () => {
@@ -264,6 +269,7 @@ export function GoogleCloudConnectDialog({
             `workloadIdentityPools/${poolId}/providers/${providerId}`,
           serviceAccountEmail: serviceAccount.trim(),
           endpoints,
+          cloudSqlPostgresInstance: cloudSqlInstance,
         },
       });
       if (!response.connection) return;
@@ -334,6 +340,20 @@ export function GoogleCloudConnectDialog({
                   />
                   <p className="mt-1.5 text-xs text-muted-foreground">
                     Google IAM roles on this account control what sessions may do.
+                  </p>
+                </Field>
+              </div>
+              <div className="sm:col-span-2">
+                <Field label="Cloud SQL PostgreSQL instance (optional)">
+                  <Input
+                    aria-label="Cloud SQL PostgreSQL instance"
+                    value={cloudSqlInstance}
+                    onChange={(event) => setCloudSqlInstance(event.target.value.trim())}
+                    placeholder="project-id:us-central1:production"
+                  />
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    One exact public-IP instance. The database IAM role must enforce read-only
+                    access.
                   </p>
                 </Field>
               </div>
@@ -430,17 +450,23 @@ export function GoogleCloudEndpointDialog({
 }) {
   const update = useUpdateConnection();
   const endpointSelection = useEndpointSelection();
+  const [cloudSqlInstance, setCloudSqlInstance] = useState("");
   const { initialize } = endpointSelection;
 
   const storedEndpoints = connection.googleCloud?.endpoints;
   useEffect(() => {
     if (!open) return;
     initialize(storedEndpoints ?? []);
-  }, [storedEndpoints, open, initialize]);
+    setCloudSqlInstance(connection.googleCloud?.cloudSqlPostgresInstance ?? "");
+  }, [storedEndpoints, connection.googleCloud?.cloudSqlPostgresInstance, open, initialize]);
 
   const { endpoints } = endpointSelection;
   const google = connection.googleCloud;
-  const formValid = Boolean(google) && endpoints.length > 0 && endpointSelection.customValid;
+  const formValid =
+    Boolean(google) &&
+    (endpoints.length > 0 || cloudSqlInstance.length > 0) &&
+    endpointSelection.customValid &&
+    (cloudSqlInstance.length === 0 || CLOUD_SQL_INSTANCE_PATTERN.test(cloudSqlInstance));
 
   const save = async () => {
     if (!google) return;
@@ -455,6 +481,7 @@ export function GoogleCloudEndpointDialog({
           workloadIdentityProvider: google.workloadIdentityProvider,
           serviceAccountEmail: google.serviceAccountEmail,
           endpoints,
+          cloudSqlPostgresInstance: cloudSqlInstance,
         },
       });
     } catch {
@@ -475,9 +502,9 @@ export function GoogleCloudEndpointDialog({
     >
       <DialogContent className="max-h-[90vh] max-w-3xl overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>Edit allowed Google Cloud APIs</DialogTitle>
+          <DialogTitle>Edit Google Cloud boundary</DialogTitle>
           <DialogDescription>
-            Limit new sessions to the exact service endpoints that this connection needs.
+            Limit new sessions to exact service endpoints and one exact Cloud SQL instance.
           </DialogDescription>
         </DialogHeader>
 
@@ -490,6 +517,14 @@ export function GoogleCloudEndpointDialog({
             value={endpointSelection.custom}
             onChange={endpointSelection.setCustom}
           />
+          <Field label="Cloud SQL PostgreSQL instance (optional)">
+            <Input
+              aria-label="Cloud SQL PostgreSQL instance"
+              value={cloudSqlInstance}
+              onChange={(event) => setCloudSqlInstance(event.target.value.trim())}
+              placeholder="project-id:us-central1:production"
+            />
+          </Field>
           <p className="rounded-md border border-instrument-caution/30 bg-instrument-caution/[0.07] p-3 text-xs text-muted-foreground">
             Saving disables this connection and clears its test result. Test and enable it again
             before you launch a new session. Existing sessions keep their stamped configuration.
@@ -502,7 +537,7 @@ export function GoogleCloudEndpointDialog({
             Cancel
           </Button>
           <Button disabled={update.isPending || !formValid} onClick={() => void save()}>
-            Save API changes
+            Save boundary
           </Button>
         </DialogFooter>
       </DialogContent>

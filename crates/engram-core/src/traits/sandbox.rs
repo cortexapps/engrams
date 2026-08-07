@@ -233,19 +233,14 @@ pub trait SandboxBackend: Send + Sync {
     /// `RemoteSandboxBackend` forwards via the existing WS as a
     /// `NotifyKind::SessionEgressPolicy`. Local backends apply the
     /// policy in-process (used by `--mode=all`). The default rejects a
-    /// policy that needs metadata interception because backends without
-    /// an egress proxy cannot stop a guest from reaching a deployment's
-    /// real metadata service. Other policies remain a no-op for Process
-    /// and in-test fixtures. ADR 0006 and ADR 0109.
+    /// policy that needs the guest gateway because such a backend cannot
+    /// authenticate or intercept the guest caller. Other policies remain a
+    /// no-op for Process and in-test fixtures. ADR 0006 and ADR 0109.
     async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
-        // Fail closed for ANY metadata flavor, not just Google's. A backend
-        // with no egress proxy cannot stop a guest from reaching the
-        // deployment's REAL metadata service, so serving a session that
-        // expects an intercepted one would hand it the host's identity.
-        if let Some(flavor) = policy.metadata_flavor {
-            return Err(SandboxError::InvalidSpec(format!(
-                "{flavor:?} metadata requires host egress interception"
-            )));
+        if !policy.guest_services.is_empty() || !policy.tunnels.is_empty() {
+            return Err(SandboxError::InvalidSpec(
+                "guest services and tunnels require a session-scoped guest gateway".to_string(),
+            ));
         }
         Ok(())
     }

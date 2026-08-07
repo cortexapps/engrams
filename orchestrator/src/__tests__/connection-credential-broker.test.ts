@@ -17,6 +17,7 @@ const connection = {
       "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
     serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
     endpoints: ["compute.googleapis.com"],
+    cloudSqlPostgresInstance: "customer:us-central1:prod",
   },
 };
 
@@ -53,6 +54,50 @@ const body = { sessionId: "session-1", connectionId: "connection-1" };
 const path = "/internal/v1/integrations/credentials/mint";
 
 describe("named-connection credential broker", () => {
+  test("Cloud SQL scopes require the Cloud SQL grant and cache separately", async () => {
+    const denied = makeConnectionCredentialBrokerRoute({
+      db: {} as never,
+      bearer: "broker-secret",
+      sessions: sessionStore(),
+      sessionStatus: async () => "active",
+      exchange: async () => { throw new Error("must not mint"); },
+    });
+    expect((await denied.request(path, post({ ...body, purpose: "cloud_sql_login" }))).status)
+      .toBe(403);
+
+    const sessions = sessionStore();
+    const originalGet = sessions.get.bind(sessions);
+    sessions.get = async (sessionId) => {
+      const session = await originalGet(sessionId);
+      if (session) {
+        session.integrationGrants = [{
+          connectionId: "connection-1",
+          operation: "cloudsql.postgres.connect",
+          resourceConstraints: [],
+        }];
+      }
+      return session;
+    };
+    const captured: string[][] = [];
+    const app = makeConnectionCredentialBrokerRoute({
+      db: {} as never,
+      bearer: "broker-secret",
+      sessions,
+      sessionStatus: async () => "active",
+      now: () => new Date("2026-07-31T12:00:00Z"),
+      exchange: async (_config, _identity, scopes = []) => {
+        captured.push([...scopes]);
+        return { accessToken: `token-${captured.length}`, expiresAt: new Date("2026-07-31T13:00:00Z") };
+      },
+    });
+    expect((await app.request(path, post({ ...body, purpose: "cloud_sql_admin" }))).status).toBe(200);
+    expect((await app.request(path, post({ ...body, purpose: "cloud_sql_login" }))).status).toBe(200);
+    expect(captured).toEqual([
+      ["https://www.googleapis.com/auth/sqlservice.admin"],
+      ["https://www.googleapis.com/auth/sqlservice.login"],
+    ]);
+  });
+
   test("mints from the immutable session snapshot and caches by session and connection", async () => {
     let exchanges = 0;
     const exchangedPrincipals: string[] = [];

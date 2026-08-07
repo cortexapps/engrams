@@ -24,6 +24,7 @@ import type { IntegrationPolicyJson } from "../../connectors/registry.ts";
 
 export type {
   ConnectionProvider,
+  CredentialPurpose,
   MintIdentity,
   MintedCredential,
   ProviderConnection,
@@ -59,7 +60,7 @@ let cached: ReadonlyMap<string, ConnectionProvider> | undefined;
 export function connectionProviders(): ReadonlyMap<string, ConnectionProvider> {
   cached ??= makeConnectionProviders([
     makeGoogleProvider({
-      exchange: (config, identity) => googleBroker().exchange(config, identity),
+      exchange: (config, identity, scopes) => googleBroker().exchange(config, identity, scopes),
     }),
   ]);
   return cached;
@@ -150,15 +151,16 @@ export function providerCliSurfaces(
     }));
 }
 
-/** Does any of these connections deliver its credential through a metadata service? */
-export function providerMetadataFlavor(
+/** Compatibility services required by the providers present in this session. */
+export function providerGuestServices(
   resolved: readonly ResolvedIntegrationGrant[],
   registry: ReadonlyMap<string, ConnectionProvider> = connectionProviders(),
-): "gce" | undefined {
+): import("../../connectors/registry.ts").GuestService[] {
+  const services = new Set<import("../../connectors/registry.ts").GuestService>();
   for (const [provider] of byProvider(resolved, registry)) {
-    if (provider.metadataFlavor) return provider.metadataFlavor;
+    for (const service of provider.guestServices ?? []) services.add(service);
   }
-  return undefined;
+  return [...services];
 }
 
 /** Guest environment every present provider needs, merged in registry order. */

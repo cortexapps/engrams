@@ -411,7 +411,8 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: None,
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
             secret_mode: engram_core::types::image::SecretMode::Broker,
         }
     }

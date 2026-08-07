@@ -10062,9 +10062,9 @@ impl SandboxBackend for PooledBackend {
         self.session_bindings.insert(sandbox_id, session_id);
 
         let Some(egress) = self.egress.as_ref() else {
-            if policy.metadata_flavor.is_some() {
+            if !policy.guest_services.is_empty() || !policy.tunnels.is_empty() {
                 return Err(SandboxError::InvalidSpec(
-                    "Google ADC requires a host egress proxy".into(),
+                    "guest services and tunnels require a host egress proxy".into(),
                 ));
             }
             // No proxy attached — egress is unfiltered. The
@@ -11072,31 +11072,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_delivery_requires_the_local_egress_proxy() {
-        use engram_core::types::integration::MetadataFlavor;
+    async fn guest_services_and_tunnels_require_the_local_egress_proxy() {
+        use engram_core::types::integration::{GuestService, SessionTunnel};
         let tmp = tempfile::tempdir().unwrap();
         let inner: Arc<dyn SandboxBackend> =
             Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
         let pooled = PooledBackend::new(inner);
 
-        let error = pooled
-            .notify_session_policy(SessionEgressPolicy {
-                session_id: SessionId::new(),
-                sandbox_id: SandboxId::new(),
-                guest_ip: std::net::Ipv4Addr::LOCALHOST,
-                network_allow_hosts: Vec::new(),
-                network_allow_host_patterns: Vec::new(),
-                allow_all: false,
-                secrets: Vec::new(),
-                injects: Vec::new(),
-                observes: Vec::new(),
-                metadata_flavor: Some(MetadataFlavor::Gce),
-                secret_mode: engram_core::types::image::SecretMode::Broker,
-            })
-            .await
-            .expect_err("Google ADC must fail closed without an egress proxy");
+        let cases = [
+            (vec![GuestService::new("gcp.gce_metadata")], Vec::new()),
+            (
+                Vec::new(),
+                vec![SessionTunnel {
+                    id: "prod-readonly".into(),
+                    connector: "gcp.cloud_sql".into(),
+                    config_json: "{}".into(),
+                    mint_source: None,
+                }],
+            ),
+        ];
+        for (guest_services, tunnels) in cases {
+            let error = pooled
+                .notify_session_policy(SessionEgressPolicy {
+                    session_id: SessionId::new(),
+                    sandbox_id: SandboxId::new(),
+                    guest_ip: std::net::Ipv4Addr::LOCALHOST,
+                    network_allow_hosts: Vec::new(),
+                    network_allow_host_patterns: Vec::new(),
+                    allow_all: false,
+                    secrets: Vec::new(),
+                    injects: Vec::new(),
+                    observes: Vec::new(),
+                    guest_services,
+                    tunnels,
+                    secret_mode: engram_core::types::image::SecretMode::Broker,
+                })
+                .await
+                .expect_err("guest gateway features must fail closed without an egress proxy");
 
-        assert!(error.to_string().contains("requires a host egress proxy"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("guest services and tunnels require a host egress proxy"),
+                "{error}",
+            );
+        }
     }
 
     /// ADR 0101 B: the adaptive candidacy glue over the pacing maps —
@@ -11404,7 +11424,8 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: None,
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -11427,7 +11448,8 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: None,
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -14856,9 +14878,17 @@ mod tests {
             // registry, and a fixed DNS port would collide across the
             // parallel suite now that a bind failure is fatal (ADR 0083).
             let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let egress = HostEgress::spawn(source, bind, None, None, None, None)
-                .await
-                .expect("spawn egress");
+            let egress = HostEgress::spawn(
+                source,
+                bind,
+                None,
+                None,
+                None,
+                None,
+                Arc::new(engram_egress_proxy::GuestGatewayRegistry::default()),
+            )
+            .await
+            .expect("spawn egress");
             (egress, dir)
         }
 
@@ -14878,7 +14908,8 @@ mod tests {
                 secrets: Vec::new(),
                 injects: Vec::new(),
                 observes: Vec::new(),
-                metadata_flavor: None,
+                guest_services: Vec::new(),
+                tunnels: Vec::new(),
                 secret_mode: SecretMode::Literal,
             }
         }

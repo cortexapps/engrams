@@ -210,7 +210,7 @@ jobs:
         run: |
           export PATH="$PWD/var/integrations-cli/bin:$PATH"
           cargo test -p engram-egress-proxy \
-            metadata::tests::installed_gcloud_can_use_the_metadata_endpoint_as_adc \
+            guest_gateway::tests::installed_gcloud_can_use_the_metadata_endpoint_as_adc \
             -- --exact
 
   lint:

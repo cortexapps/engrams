@@ -422,12 +422,12 @@ describe("IntegrationsPanel (marketplace)", () => {
     const user = userEvent.setup();
 
     await user.click(await screen.findByRole("button", { name: /edit apis/i }));
-    expect(screen.getByRole("heading", { name: /edit allowed google cloud apis/i })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /edit google cloud boundary/i })).toBeTruthy();
     expect(
       (screen.getByLabelText(/other allowed api hostnames/i) as HTMLTextAreaElement).value,
     ).toBe("private-gke.example.com");
     await user.click(screen.getByRole("checkbox", { name: /cloud monitoring/i }));
-    await user.click(screen.getByRole("button", { name: /save api changes/i }));
+    await user.click(screen.getByRole("button", { name: /save boundary/i }));
 
     await waitFor(() => expect(connectionUpdates).toHaveLength(1));
     expect(connectionUpdates[0]).toEqual({

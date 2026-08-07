@@ -272,8 +272,8 @@ for dev in /dev/vd*; do
 done
 mark bundles_mounted
 # ADR 0096 D6: SOFT egress steering on VZ. The VZ backend passes
-# ENGRAM_EGRESS=<proxy_port>:<dns_port>:<metadata_port> on the kernel cmdline (env
-# form, so the kernel hands it to PID 1); FC never sets it — its
+# ENGRAM_EGRESS=<proxy_port>:<dns_port>:<guest_gateway_port> on the kernel
+# cmdline (env form, so the kernel hands it to PID 1); FC never sets it — its
 # REDIRECT lives host-side in the netns. When present, DNAT guest
 # tcp/443 and {udp,tcp}/53 to the egress proxy on the NAT gateway,
 # so the ADR 0006/0056 proxy plane (SNI dial, CA, inject/observe,
@@ -305,13 +305,13 @@ if [ -n "${ENGRAM_EGRESS:-}" ]; then
             ep="${ENGRAM_EGRESS%%:*}"
             egress_rest="${ENGRAM_EGRESS#*:}"
             ed="${egress_rest%%:*}"
-            em="${ENGRAM_EGRESS##*:}"
+            eg="${ENGRAM_EGRESS##*:}"
             if iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination "$gw:$ep" 2>/dev/null \
                && iptables -t nat -A OUTPUT -p udp --dport 53 -j DNAT --to-destination "$gw:$ed" 2>/dev/null \
                && iptables -t nat -A OUTPUT -p tcp --dport 53 -j DNAT --to-destination "$gw:$ed" 2>/dev/null \
-               && iptables -t nat -A OUTPUT -p tcp -d 169.254.169.254 --dport 80 -j DNAT --to-destination "$gw:$em" 2>/dev/null; then
+               && iptables -t nat -A OUTPUT -p tcp -d 169.254.169.254 --dport 80 -j DNAT --to-destination "$gw:$eg" 2>/dev/null; then
                 egress_ok=1
-                echo "engram-init: egress steering active -> $gw:$ep (443) / $gw:$ed (53) / $gw:$em (metadata)" >&2
+                echo "engram-init: egress steering active -> $gw:$ep (443) / $gw:$ed (53) / $gw:$eg (guest gateway)" >&2
             fi
         fi
     fi
@@ -559,9 +559,9 @@ mod tests {
     #[test]
     fn init_shim_routes_only_link_local_metadata_to_the_host_emulator() {
         assert!(DEFAULT_INIT_SHIM.contains("egress_rest=\"${ENGRAM_EGRESS#*:}\""));
-        assert!(DEFAULT_INIT_SHIM.contains("em=\"${ENGRAM_EGRESS##*:}\""));
+        assert!(DEFAULT_INIT_SHIM.contains("eg=\"${ENGRAM_EGRESS##*:}\""));
         assert!(DEFAULT_INIT_SHIM
-            .contains("-d 169.254.169.254 --dport 80 -j DNAT --to-destination \"$gw:$em\""));
+            .contains("-d 169.254.169.254 --dport 80 -j DNAT --to-destination \"$gw:$eg\""));
         assert!(!DEFAULT_INIT_SHIM.contains("-p tcp --dport 80 -j DNAT"));
     }
 

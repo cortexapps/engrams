@@ -16,7 +16,7 @@ import {
   providerCliSurfaces,
   providerGuestBundles,
   providerGuestEnv,
-  providerMetadataFlavor,
+  providerGuestServices,
   validateProviderGrants,
   type ConnectionProvider,
   type ProviderConnection,
@@ -113,7 +113,8 @@ function emptyPolicy(): IntegrationPolicyJson {
     secrets: [],
     injects: [],
     observes: [],
-    metadata_flavor: null,
+    guest_services: [],
+    tunnels: [],
   };
 }
 
@@ -158,8 +159,10 @@ describe("connection provider seam", () => {
       connection: { connection_id: "acme-1", provider: "acme" },
     });
     // The metadata endpoint is Google's delivery mechanism, not everyone's.
-    expect(providerMetadataFlavor([grant("acme", "acme.widgets.list")], registry)).toBeUndefined();
-    expect(providerMetadataFlavor([grant("gcp", "logging.entries.list")], registry)).toBe("gce");
+    expect(providerGuestServices([grant("acme", "acme.widgets.list")], registry)).toEqual([]);
+    expect(providerGuestServices([grant("gcp", "logging.entries.list")], registry)).toEqual([
+      "gcp.gce_metadata",
+    ]);
   });
 
   test("validates grant shape per provider without touching connection state", () => {

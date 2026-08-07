@@ -5,6 +5,7 @@ import type { IntegrationOidcKeyStore } from "../db/integration-oidc-keys.ts";
 import {
   assertGoogleCloudConfig,
   googleOidcAudience,
+  googleSetupDoc,
   makeGoogleWifBroker,
 } from "../integrations/google-wif.ts";
 import { deniedGoogleHosts } from "../integrations/google-credential-denylist.ts";
@@ -36,6 +37,30 @@ function decodePart(token: string, index: number): Record<string, unknown> {
 }
 
 describe("Google WIF broker", () => {
+  test("Cloud SQL setup limits IAM roles to the configured instance", () => {
+    const setup = googleSetupDoc({
+      id: "connection-1",
+      config: {
+        workloadIdentityProvider: PROVIDER,
+        serviceAccountEmail: "engram-reader@customer.iam.gserviceaccount.com",
+        endpoints: [],
+        cloudSqlPostgresInstance: "customer:us-central1:prod",
+      },
+    }, "https://tenant.example/oidc", "tenant-1");
+
+    for (const role of ["roles/cloudsql.client", "roles/cloudsql.instanceUser"]) {
+      expect(setup.gcloudScript).toContain(role);
+      expect(setup.terraform).toContain(role);
+    }
+    expect(setup.gcloudScript).toContain(
+      "resource.name == 'projects/customer/instances/prod'",
+    );
+    expect(setup.gcloudScript).toContain(
+      "gcloud sql users create engram-reader@customer.iam",
+    );
+    expect(setup.terraform).toContain('type     = "CLOUD_IAM_SERVICE_ACCOUNT"');
+  });
+
   test("mints immutable, exact-audience claims with injected time and entropy", async () => {
     const broker = makeGoogleWifBroker({
       keys: signingKeys(),
@@ -158,6 +183,18 @@ describe("Google WIF broker", () => {
       private_key: "must-not-be-accepted",
     })).toThrow(/unsupported fields/);
     expect(googleOidcAudience(PROVIDER)).toBe(PROVIDER);
+    expect(assertGoogleCloudConfig({
+      workloadIdentityProvider: PROVIDER,
+      serviceAccountEmail: "engram-reader@customer.iam.gserviceaccount.com",
+      endpoints: [],
+      cloudSqlPostgresInstance: "customer:us-central1:prod",
+    }).cloudSqlPostgresInstance).toBe("customer:us-central1:prod");
+    expect(() => assertGoogleCloudConfig({
+      workloadIdentityProvider: PROVIDER,
+      serviceAccountEmail: "engram-reader@customer.iam.gserviceaccount.com",
+      endpoints: [],
+      cloudSqlPostgresInstance: "https://sqladmin.googleapis.com",
+    })).toThrow(/project:region:instance/);
   });
 
   test("refuses every credential exchange endpoint, mutual-TLS twins included", () => {

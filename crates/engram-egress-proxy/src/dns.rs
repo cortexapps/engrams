@@ -415,7 +415,8 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: None,
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -447,7 +448,8 @@ mod tests {
             secrets: Vec::new(),
             injects: vec![inject],
             observes: Vec::new(),
-            metadata_flavor: None,
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
         };
         let reg = registry_with(state);
         let query = make_query("compute.googleapis.com.", RecordType::A);
@@ -467,7 +469,8 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: None,
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
         };
         let reg = registry_with(state);
         for name in ["sts.googleapis.com.", "sts.mtls.googleapis.com."] {
@@ -492,7 +495,8 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: None,
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -522,7 +526,8 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: None,
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
         };
         let reg = registry_with(state);
         let q = make_query("evil.example.com.", RecordType::A);
@@ -563,7 +568,8 @@ mod tests {
             }],
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: None,
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -614,7 +620,8 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: None,
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
         });
         let proxy_task = tokio::spawn(serve_udp(proxy_sock.clone(), registry, upstream_addr));
 
@@ -652,7 +659,8 @@ mod tests {
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
-            metadata_flavor: None,
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
         });
         // Point upstream at an obviously-dead address so the test
         // can't accidentally succeed by hitting a real resolver.

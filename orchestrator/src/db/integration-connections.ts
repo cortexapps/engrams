@@ -9,6 +9,8 @@ export interface GoogleCloudConnectionConfig {
   workloadIdentityProvider: string;
   serviceAccountEmail: string;
   endpoints: string[];
+  /** Exact public-IP PostgreSQL instance exposed through the host tunnel. */
+  cloudSqlPostgresInstance?: string;
 }
 
 export interface IntegrationConnectionRow {

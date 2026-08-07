@@ -13,14 +13,19 @@
 //! leaves trust them all.
 
 use std::net::SocketAddr;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use engram_core::types::integration::{CredentialPurpose, SessionTunnel};
 use engram_core::{HostId, SessionId};
 use engram_egress_proxy::{
-    CaSource, CertMint, InjectRefresher, Listeners, Proxy, ProxyConfig, RefreshedInject, Registry,
+    CaSource, CertMint, GuestGatewayRegistry, InjectRefresher, Listeners, Proxy, ProxyConfig,
+    RefreshedInject, Registry, TunnelConnector,
 };
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpStream, UnixStream};
 
 use crate::coord_client::HttpCoordClient;
 
@@ -63,6 +68,232 @@ impl InjectRefresher for CoordInjectRefresher {
             }
         }
     }
+}
+
+/// Starts one host-local Cloud SQL Auth Proxy per guest database connection.
+/// OAuth tokens are passed only through the child environment.
+pub struct CoordCloudSqlConnector {
+    coord: HttpCoordClient,
+    host_id: HostId,
+}
+
+const CLOUD_SQL_CONNECTOR_KIND: &str = "gcp.cloud_sql";
+const CLOUD_SQL_STDERR_TAIL_BYTES: usize = 8 * 1024;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloudSqlTunnelConfig {
+    instance: String,
+    database_user: String,
+}
+
+impl CoordCloudSqlConnector {
+    pub fn new(coord: HttpCoordClient, host_id: HostId) -> Self {
+        Self { coord, host_id }
+    }
+
+    async fn token(
+        &self,
+        session_id: SessionId,
+        tunnel: &SessionTunnel,
+        purpose: CredentialPurpose,
+    ) -> std::io::Result<String> {
+        let mint_source = tunnel.mint_source.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Cloud SQL tunnel has no credential mint source",
+            )
+        })?;
+        self.coord
+            .mint_connection_credential(self.host_id, session_id, mint_source, purpose)
+            .await
+            .map(|response| response.secret)
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    }
+
+    async fn relay_inner(
+        &self,
+        downstream: &mut TcpStream,
+        initial_data: Vec<u8>,
+        session_id: SessionId,
+        tunnel: SessionTunnel,
+        established: &mut bool,
+    ) -> std::io::Result<()> {
+        let config: CloudSqlTunnelConfig = serde_json::from_str(&tunnel.config_json)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let (api_token, login_token) = tokio::try_join!(
+            self.token(
+                session_id,
+                &tunnel,
+                CredentialPurpose::new("cloud_sql_admin")
+            ),
+            self.token(
+                session_id,
+                &tunnel,
+                CredentialPurpose::new("cloud_sql_login")
+            ),
+        )?;
+        // A private directory gives each relay its own socket namespace. A
+        // bind-then-drop TCP reservation can be stolen by another session
+        // before the child binds, which can cross-connect two tenants.
+        let socket_dir = cloud_sql_socket_dir()?;
+        let socket_path = socket_dir.path().join(&config.instance);
+
+        let binary = std::env::var_os("ENGRAM_CLOUD_SQL_PROXY")
+            .unwrap_or_else(|| "/usr/local/bin/cloud-sql-proxy".into());
+        let mut child = tokio::process::Command::new(binary)
+            .arg(&config.instance)
+            .arg("--auto-iam-authn")
+            .arg(format!("--unix-socket={}", socket_dir.path().display()))
+            .arg("--max-connections=1")
+            // Do not inherit host-agent credentials or deployment secrets.
+            .env_clear()
+            .env("CSQL_PROXY_TOKEN", api_token)
+            .env("CSQL_PROXY_LOGIN_TOKEN", login_token)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let stderr = child
+            .stderr
+            .take()
+            .expect("stderr was configured as a pipe");
+        let stderr_task = tokio::spawn(collect_stderr_tail(stderr));
+
+        let mut upstream = None;
+        let mut last_connect_error = None;
+        for _ in 0..100 {
+            if let Some(status) = child.try_wait()? {
+                let stderr = stderr_task.await.unwrap_or_default();
+                return Err(std::io::Error::other(format!(
+                    "Cloud SQL Auth Proxy exited before accepting a connection: {status}{}",
+                    stderr_context(&stderr),
+                )));
+            }
+            match UnixStream::connect(&socket_path).await {
+                Ok(stream) => {
+                    upstream = Some(stream);
+                    break;
+                }
+                Err(error) => {
+                    last_connect_error = Some(error);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        let Some(mut upstream) = upstream else {
+            let _ = child.kill().await;
+            let stderr = stderr_task.await.unwrap_or_default();
+            let connect_context = last_connect_error
+                .map(|error| format!("; last socket error: {error}"))
+                .unwrap_or_default();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "Cloud SQL Auth Proxy did not become ready{connect_context}{}",
+                    stderr_context(&stderr),
+                ),
+            ));
+        };
+
+        downstream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\nEngram-Gateway: 1\r\n\r\n")
+            .await?;
+        *established = true;
+        if !initial_data.is_empty() {
+            upstream.write_all(&initial_data).await?;
+        }
+        tracing::info!(
+            %session_id,
+            tunnel_id = %tunnel.id,
+            instance = %config.instance,
+            database_user = %config.database_user,
+            "authorized session tunnel",
+        );
+        let relay_result = tokio::io::copy_bidirectional(downstream, &mut upstream).await;
+        let _ = child.kill().await;
+        let _ = stderr_task.await;
+        relay_result.map(|_| ())
+    }
+}
+
+#[async_trait]
+impl TunnelConnector for CoordCloudSqlConnector {
+    fn kind(&self) -> &'static str {
+        CLOUD_SQL_CONNECTOR_KIND
+    }
+
+    async fn relay(
+        &self,
+        mut downstream: TcpStream,
+        initial_data: Vec<u8>,
+        session_id: SessionId,
+        tunnel: SessionTunnel,
+    ) -> std::io::Result<()> {
+        let mut established = false;
+        let result = self
+            .relay_inner(
+                &mut downstream,
+                initial_data,
+                session_id,
+                tunnel,
+                &mut established,
+            )
+            .await;
+        if let Err(error) = &result {
+            if !established {
+                let _ = write_tunnel_failure(&mut downstream, error).await;
+            }
+        }
+        result
+    }
+}
+
+fn cloud_sql_socket_dir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix("engram-cloud-sql-")
+        .tempdir()
+}
+
+async fn collect_stderr_tail(mut stderr: tokio::process::ChildStderr) -> Vec<u8> {
+    let mut tail = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        match stderr.read(&mut chunk).await {
+            Ok(0) | Err(_) => return tail,
+            Ok(read) => append_tail(&mut tail, &chunk[..read]),
+        }
+    }
+}
+
+fn append_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
+    tail.extend_from_slice(chunk);
+    if tail.len() > CLOUD_SQL_STDERR_TAIL_BYTES {
+        tail.drain(..tail.len() - CLOUD_SQL_STDERR_TAIL_BYTES);
+    }
+}
+
+fn stderr_context(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!("; stderr: {stderr}")
+    }
+}
+
+async fn write_tunnel_failure(
+    downstream: &mut (impl AsyncWrite + Unpin),
+    error: &std::io::Error,
+) -> std::io::Result<()> {
+    let body = format!("Cloud SQL tunnel failed: {error}\n");
+    let response = format!(
+        "HTTP/1.1 502 Bad Gateway\r\nEngram-Gateway: 1\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    downstream.write_all(response.as_bytes()).await
 }
 
 /// Per-host egress-proxy handle. Holds the registry (mutated as
@@ -128,9 +359,10 @@ impl HostEgress {
         ca_source: Arc<dyn CaSource>,
         bind_addr: SocketAddr,
         dns_bind_addr: Option<SocketAddr>,
-        metadata_bind_addr: Option<SocketAddr>,
+        guest_gateway_bind_addr: Option<SocketAddr>,
         observe_sink: Option<engram_egress_proxy::ObserveSink>,
         inject_refresher: Option<Arc<dyn InjectRefresher>>,
+        guest_gateway: Arc<GuestGatewayRegistry>,
     ) -> Result<Self, EgressError> {
         let ca = ca_source.load().await.map_err(EgressError::Ca)?;
         let ca_cert_pem = ca.cert_pem.clone();
@@ -147,9 +379,10 @@ impl HostEgress {
 
         let mut proxy_cfg = ProxyConfig::new(bind_addr, registry.clone(), mint);
         proxy_cfg.dns_bind_addr = dns_bind_addr;
-        proxy_cfg.metadata_bind_addr = metadata_bind_addr;
+        proxy_cfg.guest_gateway_bind_addr = guest_gateway_bind_addr;
         proxy_cfg.observe_sink = observe_sink;
         proxy_cfg.inject_refresher = inject_refresher;
+        proxy_cfg.guest_gateway = guest_gateway;
         let proxy = Proxy::new(proxy_cfg);
 
         let listeners = bind_with_retry(&proxy).await.map_err(EgressError::Bind)?;
@@ -337,7 +570,8 @@ pub fn register_policy(
         secrets,
         injects,
         observes,
-        metadata_flavor: policy.metadata_flavor,
+        guest_services: policy.guest_services,
+        tunnels: policy.tunnels,
     });
     Ok(())
 }
@@ -349,8 +583,38 @@ mod tests {
     use super::*;
     use engram_core::types::egress::{EgressInjectEntry, EgressObserveEntry, SessionEgressPolicy};
     use engram_core::types::image::SecretMode;
+    use engram_core::types::integration::{CredentialMintSource, SessionTunnel};
     use engram_core::{SandboxId, SessionId};
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn cloud_sql_relays_get_distinct_socket_namespaces() {
+        let first = cloud_sql_socket_dir().unwrap();
+        let second = cloud_sql_socket_dir().unwrap();
+        assert_ne!(first.path(), second.path());
+    }
+
+    #[test]
+    fn cloud_sql_stderr_tail_is_bounded_and_keeps_the_newest_bytes() {
+        let mut tail = Vec::new();
+        append_tail(&mut tail, &vec![b'a'; CLOUD_SQL_STDERR_TAIL_BYTES]);
+        append_tail(&mut tail, b"diagnostic");
+        assert_eq!(tail.len(), CLOUD_SQL_STDERR_TAIL_BYTES);
+        assert!(tail.ends_with(b"diagnostic"));
+    }
+
+    #[tokio::test]
+    async fn cloud_sql_setup_failure_returns_an_actionable_bad_gateway() {
+        let (mut downstream, mut client) = tokio::io::duplex(4096);
+        let error = std::io::Error::other("invalid instance");
+        write_tunnel_failure(&mut downstream, &error).await.unwrap();
+        drop(downstream);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(response.contains("Cloud SQL tunnel failed: invalid instance\n"));
+    }
 
     /// ADR 0056 (B′): `register_policy` translates a wire `EgressInjectEntry`
     /// (secret already resolved by the coordinator) into the proxy's
@@ -442,13 +706,23 @@ mod tests {
                         }),
                     },
                 ],
-                metadata_flavor: None,
+                guest_services: Vec::new(),
+                tunnels: vec![SessionTunnel {
+                    id: "prod-readonly".into(),
+                    connector: "gcp.cloud_sql".into(),
+                    config_json: r#"{"instance":"customer:us-central1:prod","database_user":"reader@customer.iam"}"#.into(),
+                    mint_source: Some(CredentialMintSource::Connection {
+                        connection_id: "gcp-prod".into(),
+                        provider: "gcp".into(),
+                    }),
+                }],
                 secret_mode: SecretMode::Broker,
             },
         )
         .expect("register");
 
         let state = registry.lookup(guest_ip).expect("session registered");
+        assert_eq!(state.tunnels[0].id, "prod-readonly");
         assert_eq!(state.injects.len(), 2);
         let inj = &state.injects[0];
         assert_eq!(inj.secret(), "dd-secret");

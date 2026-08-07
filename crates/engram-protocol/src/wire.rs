@@ -123,7 +123,7 @@ use serde::{Deserialize, Serialize};
 // `SessionEgressPolicy` carrying a minted inject failed host-side at
 // boot — no peer ever decoded the old `Some(mint_source)` bytes. The
 // bump makes the mixed-fleet posture explicit. Lockstep coord+host roll.
-// v23 (ADR 0109 seam): `SessionEgressPolicy.google_adc` becomes
+// v23 (ADR 0109 seam): `SessionEgressPolicy.google_adc` became
 // `metadata_flavor: Option<MetadataFlavor>`. The boolean conflated "does
 // this session need a metadata endpoint?" with "is it Google's?", so a
 // second cloud would have needed a second boolean and the proxy would
@@ -141,7 +141,14 @@ use serde::{Deserialize, Serialize};
 // device size, opt-in per image. Trailing bincode field addition on the
 // create/spec wire (and the JSON sidecar, which is serde-defaulted), so
 // the roll is lockstep: a v24 host cannot decode a v25 create spec.
-pub const WIRE_VERSION: u32 = 25;
+// v26 (ADR 0109 Cloud SQL addendum): the metadata listener becomes a
+// session-scoped guest gateway. `metadata_flavor` becomes the extensible
+// `guest_services` set, and `SessionEgressPolicy` gains provider-neutral
+// tunnels selected by an opaque id and a registered host connector. A
+// credential purpose becomes a provider-owned string, and tunnel mint
+// authority is optional. Bincode field replacement and addition; coordinator
+// and host roll in lockstep.
+pub const WIRE_VERSION: u32 = 26;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

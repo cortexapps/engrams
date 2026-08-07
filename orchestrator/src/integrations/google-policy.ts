@@ -6,6 +6,9 @@ import type { IntegrationInjectJson, IntegrationPolicyJson } from "../connectors
 import { assertGoogleCloudConfig } from "./google-wif.ts";
 import type { ResolvedIntegrationGrant } from "./grants.ts";
 
+export const CLOUD_SQL_POSTGRES_CONNECT = "cloudsql.postgres.connect";
+export const CLOUD_SQL_TUNNEL_CONNECTOR = "gcp.cloud_sql";
+
 /**
  * One curated operation's egress surface. The proxy matches `methods` and
  * `path_globs` independently INSIDE one inject entry, so the REST paths and
@@ -277,6 +280,15 @@ function matchersOverlap(a: IntegrationInjectJson, b: IntegrationInjectJson): bo
  */
 export function validateGoogleGrants(resolved: readonly ResolvedIntegrationGrant[]): void {
   for (const { grant } of resolved) {
+    if (grant.operation === CLOUD_SQL_POSTGRES_CONNECT) {
+      if (grant.resourceConstraints.length > 0) {
+        throw new ConnectError(
+          `${CLOUD_SQL_POSTGRES_CONNECT} does not accept resource constraints`,
+          Code.InvalidArgument,
+        );
+      }
+      continue;
+    }
     const curated = CURATED_GOOGLE_OPERATIONS[grant.operation];
     if (!curated && !isPassthroughOperation(grant.operation)) {
       throw new ConnectError(
@@ -312,6 +324,44 @@ export function appendGooglePolicy(
       );
     }
     const config = assertGoogleCloudConfig(connection.config);
+    if (grant.operation === CLOUD_SQL_POSTGRES_CONNECT) {
+      if (!config.cloudSqlPostgresInstance) {
+        throw new ConnectError(
+          `Google Cloud connection "${connection.alias}" has no Cloud SQL PostgreSQL instance`,
+          Code.FailedPrecondition,
+        );
+      }
+      const tunnelConfig = JSON.stringify({
+        instance: config.cloudSqlPostgresInstance,
+        database_user: config.serviceAccountEmail.replace(/\.gserviceaccount\.com$/, ""),
+      });
+      const existing = policy.tunnels.find((entry) => entry.id === connection.alias);
+      if (
+        existing &&
+        (existing.connector !== CLOUD_SQL_TUNNEL_CONNECTOR ||
+          existing.config_json !== tunnelConfig ||
+          existing.mint_source?.connection.connection_id !== connection.id)
+      ) {
+        throw new ConnectError(
+          `integration grants define conflicting tunnel "${connection.alias}"`,
+          Code.InvalidArgument,
+        );
+      }
+      if (!existing) {
+        policy.tunnels.push({
+          id: connection.alias,
+          connector: CLOUD_SQL_TUNNEL_CONNECTOR,
+          config_json: tunnelConfig,
+          mint_source: {
+            connection: {
+              connection_id: connection.id,
+              provider: connection.provider,
+            },
+          },
+        });
+      }
+      continue;
+    }
     const curated = CURATED_GOOGLE_OPERATIONS[grant.operation];
     const hosts = curated ? [curated.host] : config.endpoints;
     if (curated && !config.endpoints.includes(curated.host)) {

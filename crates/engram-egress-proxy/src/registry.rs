@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use engram_core::types::integration::{CredentialMintSource, MetadataFlavor};
+use engram_core::types::integration::{CredentialMintSource, GuestService, SessionTunnel};
 use engram_core::SessionId;
 use parking_lot::RwLock;
 
@@ -52,8 +52,10 @@ pub struct SessionState {
     /// emits an `IntegrationAsset` (the side-effect ⟹ event invariant). An
     /// observe-only host (no secret, no inject) is MITM'd purely to observe.
     pub observes: Vec<ObserveEntry>,
-    /// Which cloud metadata service the host serves for this session, if any.
-    pub metadata_flavor: Option<MetadataFlavor>,
+    /// Compatibility services mounted on this session's guest gateway.
+    pub guest_services: Vec<GuestService>,
+    /// Exact host-side tunnels compiled for this session.
+    pub tunnels: Vec<SessionTunnel>,
 }
 
 #[derive(Clone, Debug)]
@@ -653,7 +655,8 @@ mod tests {
                 fetchable: Some("$.resp.html_url".into()),
                 url_fallback: None,
             }],
-            metadata_flavor: None,
+            guest_services: Vec::new(),
+            tunnels: Vec::new(),
         }
     }
 

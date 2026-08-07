@@ -64,7 +64,8 @@ fn placeholder_egress_policy(
         secrets: vec![],
         injects: vec![],
         observes: vec![],
-        metadata_flavor: None,
+        guest_services: Vec::new(),
+        tunnels: vec![],
         secret_mode: engram_core::types::image::SecretMode::Broker,
     }
 }

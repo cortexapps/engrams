@@ -1455,6 +1455,8 @@ pub async fn integration_asset_ingest(
 pub struct RefreshInjectRequest {
     /// Immutable host-side authority stored on the inject entry at boot.
     pub mint_source: engram_core::types::integration::CredentialMintSource,
+    #[serde(default)]
+    pub purpose: engram_core::types::integration::CredentialPurpose,
 }
 
 #[derive(Serialize)]
@@ -1483,25 +1485,46 @@ pub async fn refresh_inject(
     Path((host_id, session_id)): Path<(HostId, SessionId)>,
     Json(req): Json<RefreshInjectRequest>,
 ) -> Result<Json<RefreshInjectResponse>, ApiError> {
-    let (header, expires_at) =
-        crate::session_boot::refresh_inject_header(&state, session_id, &req.mint_source)
-            .await
-            .ok_or_else(|| {
-                ApiError::Internal(format!(
-                    "inject refresh for {:?} on session {session_id} could not be minted",
-                    req.mint_source
-                ))
-            })?;
+    let (header_name, secret, expires_at) = if req.purpose.as_str() == "api" {
+        let (header, expires_at) =
+            crate::session_boot::refresh_inject_header(&state, session_id, &req.mint_source)
+                .await
+                .ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "inject refresh for {:?} on session {session_id} could not be minted",
+                        req.mint_source
+                    ))
+                })?;
+        (header.name, header.value, expires_at)
+    } else if let engram_core::types::integration::CredentialMintSource::Connection {
+        connection_id,
+        ..
+    } = &req.mint_source
+    {
+        let (token, expires_at) = crate::session_boot::mint_remote_connection_credential(
+            session_id,
+            connection_id,
+            req.purpose.clone(),
+        )
+        .await
+        .ok_or_else(|| ApiError::Internal("host credential could not be minted".into()))?;
+        (String::new(), token, expires_at)
+    } else {
+        return Err(ApiError::BadRequest(
+            "credential purpose is invalid for source".into(),
+        ));
+    };
     tracing::debug!(
         %host_id,
         %session_id,
         source = ?req.mint_source,
+        purpose = ?req.purpose,
         %expires_at,
-        "re-minted egress inject credential for the proxy",
+        "minted host-side connection credential",
     );
     Ok(Json(RefreshInjectResponse {
-        header_name: header.name,
-        secret: header.value,
+        header_name,
+        secret,
         expires_at,
     }))
 }

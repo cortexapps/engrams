@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
-use engram_core::types::integration::MetadataFlavor;
+use engram_core::types::integration::GuestService;
 use engram_core::types::sandbox::{
     AgentSpec, CpuLimit, DiskLimit, ExecRequest, MemoryLimit, SandboxSpec,
 };
@@ -149,7 +149,7 @@ async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> (SocketAddr, rustls::Ro
 
 /// Model the metadata-concealment listener that GKE installs before the
 /// host-agent starts. Production returned this exact response when its broader
-/// PREROUTING rule won before the Engrams metadata redirect.
+/// PREROUTING rule won before the Engrams guest gateway redirect.
 async fn fake_platform_metadata(hits: Arc<AtomicUsize>) -> SocketAddr {
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -317,12 +317,18 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         Arc::new(engram_egress_proxy::StaticResolver::new().with(TEST_HOST, upstream_addr));
 
     let proxy_port: u16 = 19443;
-    let metadata_port: u16 = 19338;
+    let guest_gateway_port: u16 = 19338;
     let proxy_bind: SocketAddr = format!("0.0.0.0:{proxy_port}").parse().unwrap();
     let mut proxy_cfg = engram_egress_proxy::ProxyConfig::new(proxy_bind, registry.clone(), mint);
     proxy_cfg.resolver = resolver;
     proxy_cfg.upstream_test_roots = Some(upstream_test_roots);
-    proxy_cfg.metadata_bind_addr = Some(format!("0.0.0.0:{metadata_port}").parse().unwrap());
+    proxy_cfg.guest_gateway_bind_addr =
+        Some(format!("0.0.0.0:{guest_gateway_port}").parse().unwrap());
+    proxy_cfg.guest_gateway = Arc::new(engram_egress_proxy::GuestGatewayRegistry::new(
+        [Arc::new(engram_egress_proxy::GceMetadataService)
+            as Arc<dyn engram_egress_proxy::GuestServiceAdapter>],
+        std::iter::empty::<Arc<dyn engram_egress_proxy::TunnelConnector>>(),
+    ));
     let proxy = engram_egress_proxy::Proxy::new(proxy_cfg);
     // Bind synchronously (ADR 0083) — the listener is up before serve
     // spawns, so no sleep-to-wait-for-bind is needed.
@@ -384,7 +390,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = Some("10.200.0.0".parse().unwrap());
     cfg.egress_proxy_port = Some(proxy_port);
-    cfg.egress_metadata_port = Some(metadata_port);
+    cfg.guest_gateway_port = Some(guest_gateway_port);
     let backend = Arc::new(FirecrackerBackend::new(work.path(), cfg));
     backend.host_startup().await.expect("host_startup");
 
@@ -437,7 +443,8 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         secrets: vec![secret],
         injects: Vec::new(),
         observes: Vec::new(),
-        metadata_flavor: Some(MetadataFlavor::Gce),
+        guest_services: vec![GuestService::new("gcp.gce_metadata")],
+        tunnels: Vec::new(),
     });
 
     // PID-1's env doesn't carry a PATH; child execs need one to
@@ -555,7 +562,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         "placeholder must not survive into the upstream payload; got: {body}",
     );
     assert!(
-        stdout.contains(engram_egress_proxy::metadata::PLACEHOLDER_TOKEN),
+        stdout.contains(engram_egress_proxy::guest_gateway::PLACEHOLDER_TOKEN),
         "guest metadata discovery should receive only the placeholder token; got: {stdout}",
     );
     assert_eq!(

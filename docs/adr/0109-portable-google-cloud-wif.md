@@ -250,13 +250,13 @@ Three seams close it. `ConnectionProvider` in the orchestrator carries config
 validation, the operation catalog, grant validation, policy compilation,
 minting, the setup document, and the guest environment a credential needs to be
 findable; the registry hands each provider only its OWN grants, so the Google
-functions dropped their internal provider filters. `MetadataFlavor` replaces
-`google_adc: bool` on the wire, because that boolean conflated "does this
-session need a metadata endpoint?" with "is it Google's?"; the proxy resolves a
-flavor to a `MetadataService` through a wildcard-free `match`, so a second cloud
-is a compile error rather than a silently unserved session. And the integration
-catalog serves named-connection providers, so the web renders from the same
-table the orchestrator compiles policy from instead of a hand-maintained copy.
+functions dropped their internal provider filters. The session-scoped guest
+gateway replaces the Google-specific metadata listener. A `guest_services` set
+selects registered compatibility adapters such as GCE metadata, and native
+Engrams routes use the same source-authenticated endpoint. An unregistered
+service fails closed. The integration catalog serves named-connection
+providers, so the web renders from the same table the orchestrator compiles
+policy from instead of a hand-maintained copy.
 
 ### Lessons
 
@@ -293,3 +293,61 @@ HTTP/2 leg — the one a real Google gRPC call takes — had never been exercise
 end to end; it now has two tests through `intercept::run` with ALPN on both
 legs, and a live gRPC smoke is the remaining verification before the next
 deploy.
+
+## Addendum: Cloud SQL PostgreSQL with automatic IAM authentication
+
+Cloud SQL uses the same WIF identity but cannot use the HTTP header-injection
+path. Automatic IAM database authentication uses an OAuth login token as the
+PostgreSQL password. The guest must never receive that token. A session can
+therefore grant `cloudsql.postgres.connect` for one exact instance connection
+name stored on its Google Cloud connection. The compiled policy carries that
+instance, the derived database user, and the immutable connection mint source.
+It carries no credential.
+
+This use case also exposes a missing platform seam. The egress proxy could
+filter HTTP and emulate one cloud metadata service, but it had no generic way
+to expose a session-authorized byte stream. Hard-coding Cloud SQL routing into
+that listener would repeat the gap for RDS, private control planes, and approved
+direct TCP targets.
+
+The metadata listener is therefore a generic guest gateway at the existing
+link-local address. It authenticates the guest by source address before it
+routes any request. Compatibility services, starting with GCE metadata, retain
+their native paths and proof-of-intent headers. Native Engrams routes require
+an `Engram-Gateway` header. They can list only the opaque tunnel ids and
+connector kinds authorized for the session, and they can open one tunnel by
+exact id. The generic layer does not parse a destination, accept a host or port
+from the guest, or know how a connector authenticates.
+
+Each compiled tunnel names a registered host connector and carries strictly
+validated, connector-owned configuration. Mint authority is optional: an IAM
+connector can use a connection-bound authority, while a future approved direct
+TCP connector does not need one. Credential purposes are provider-owned names
+that map to fixed OAuth scopes and authorizing operations. A guest cannot send
+a purpose or a scope.
+
+Cloud SQL is the first connector. The guest `engram-tunnel` helper listens on
+loopback and sends an authenticated `CONNECT` for the connection alias. The host
+resolves the exact compiled tunnel, and the Cloud SQL connector shape-checks its
+configuration. It then mints only the fixed `sqlservice.admin` and
+`sqlservice.login` scopes, starts the pinned Cloud SQL Auth Proxy with automatic
+IAM authentication for one connection, and relays PostgreSQL bytes without
+parsing the startup message. Cloud SQL rejects a login when the OAuth token
+principal does not match the requested IAM database user. This check prevents a
+guest from naming a different IAM user. Tokens stay in host process memory and
+child-process environment. They never appear in arguments, logs, policy JSON,
+guest environment, or guest files.
+
+The first release supports PostgreSQL over a public Cloud SQL IP only. Each
+Google Cloud connection names at most one instance and uses its configured
+service account as the database IAM principal. The service account needs an
+exact-instance `roles/cloudsql.client` and `roles/cloudsql.instanceUser` IAM
+binding. PostgreSQL grants are the read-only security boundary: operators must
+grant that IAM database user only `CONNECT`, `USAGE`, and `SELECT`, and must set
+safe defaults such as a read-only transaction and statement timeout. Engrams
+does not claim that SQL text inspection can enforce read-only access.
+
+Per-session and per-human attribution remains in Engrams audit events and the
+PostgreSQL `application_name`. Cloud SQL sees the configured service account.
+A distinct database principal per human requires user-scoped connections and
+is outside this addendum.

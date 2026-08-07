@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+here="$(dirname "$(readlink -f "$0")")"
+exec "$here/../python/bin/python3" "$here/../libexec/engram_tunnel.py" "$@"

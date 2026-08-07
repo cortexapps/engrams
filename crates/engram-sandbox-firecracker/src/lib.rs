@@ -529,9 +529,9 @@ pub struct FirecrackerConfig {
     /// (test/dev only; that lane now applies a plain FORWARD
     /// default-deny with no public-resolver ACCEPT — issue #240).
     pub egress_dns_port: Option<u16>,
-    /// TCP port for the Google metadata-compatible ADC listener. Iptables
-    /// redirects guest 169.254.169.254:80 to this port.
-    pub egress_metadata_port: Option<u16>,
+    /// TCP port for the session-scoped guest gateway. Iptables redirects guest
+    /// 169.254.169.254:80 here for native services and compatibility adapters.
+    pub guest_gateway_port: Option<u16>,
     /// ADR 0007 Phase 5: this host's stable `HostId`. Stamped on
     /// the FC sidecar JSON at snapshot time (so cross-host restore
     /// knows which host's working-set trace to prefault) AND
@@ -787,7 +787,7 @@ impl FirecrackerConfig {
             net_pool: Some("10.200.0.0".parse().unwrap()),
             egress_proxy_port: None,
             egress_dns_port: None,
-            egress_metadata_port: None,
+            guest_gateway_port: None,
             kernel_image_path: kernel_image_path.into(),
             default_boot_args: "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init"
                 .into(),
@@ -1210,7 +1210,7 @@ impl FirecrackerBackend {
         net::host_startup(
             self.config.egress_proxy_port,
             self.config.egress_dns_port,
-            self.config.egress_metadata_port,
+            self.config.guest_gateway_port,
             guest_otel_port,
         )
         .await
@@ -7500,7 +7500,7 @@ mod tests {
             net_pool: None,
             egress_proxy_port: None,
             egress_dns_port: None,
-            egress_metadata_port: None,
+            guest_gateway_port: None,
             host_id: None,
             uffd_cache_root: None,
             uffd_substrate_sock: None,

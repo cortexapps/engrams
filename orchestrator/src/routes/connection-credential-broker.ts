@@ -21,6 +21,7 @@ import {
   connectionProviders,
   makeConnectionProviders,
   type ConnectionProvider,
+  type CredentialPurpose,
   type ProviderConnection,
 } from "../integrations/providers/index.ts";
 import { integrationSnapshotHash } from "../integrations/grants.ts";
@@ -42,7 +43,10 @@ function auditIdentity(
 interface BrokerRequest {
   sessionId: string;
   connectionId: string;
+  purpose?: CredentialPurpose;
 }
+
+const CREDENTIAL_PURPOSE_RE = /^[a-z][a-z0-9_.-]{0,63}$/;
 
 interface CachedToken {
   accessToken: string;
@@ -160,13 +164,16 @@ export function makeConnectionCredentialBrokerRoute(deps: {
     if (!request.sessionId || !request.connectionId) {
       return c.json({ error: "sessionId and connectionId are required" }, 400);
     }
+    const purpose = request.purpose ?? "api";
+    if (!CREDENTIAL_PURPOSE_RE.test(purpose)) {
+      return c.json({ error: "unsupported credential purpose" }, 400);
+    }
 
     const session = await sessions.get(request.sessionId);
     const grants = (session?.integrationGrants ?? []) as ProfileIntegrationGrant[];
     const connections = (session?.integrationConnections ?? []) as IntegrationConnectionSnapshot[];
     const connection = connections.find((candidate) => candidate.id === request.connectionId);
     const principalId = session?.principalId ?? session?.userId ?? "automation";
-    const granted = grants.some((grant) => grant.connectionId === request.connectionId);
     const profileSnapshotId = session === null ? "none" : integrationSnapshotHash({
       profileId: session.profileId,
       integrationGrants: grants,
@@ -175,7 +182,24 @@ export function makeConnectionCredentialBrokerRoute(deps: {
 
     let outcome = "denied";
     try {
-      if (!session || !connection || !granted) {
+      if (!session || !connection) {
+        return c.json({ error: "forbidden" }, 403);
+      }
+      const provider = providers.get(connection.provider);
+      if (!provider) {
+        return c.json({ error: "connection provider does not support remote minting" }, 400);
+      }
+      const authorizingOperations = purpose === "api"
+        ? null
+        : provider.credentialPurposes?.[purpose];
+      if (purpose !== "api" && !authorizingOperations) {
+        return c.json({ error: "connection provider does not support credential purpose" }, 400);
+      }
+      const granted = grants.some((grant) =>
+        grant.connectionId === request.connectionId &&
+        (purpose === "api" || authorizingOperations!.includes(grant.operation))
+      );
+      if (!granted) {
         return c.json({ error: "forbidden" }, 403);
       }
       // O6: the snapshot row outlives the session. Authorization is bounded by
@@ -186,12 +210,7 @@ export function makeConnectionCredentialBrokerRoute(deps: {
         evictSession(request.sessionId);
         return c.json({ error: "forbidden" }, 403);
       }
-      const provider = providers.get(connection.provider);
-      if (!provider) {
-        return c.json({ error: "connection provider does not support remote minting" }, 400);
-      }
-
-      const cacheKey = `${request.sessionId}:${request.connectionId}`;
+      const cacheKey = `${request.sessionId}:${request.connectionId}:${purpose}`;
       const requestTime = now();
       // Amortized upkeep: expire the requested key inline; sweep the rest at
       // most once per interval (session end evicts eagerly above).
@@ -213,7 +232,7 @@ export function makeConnectionCredentialBrokerRoute(deps: {
           connectionId: request.connectionId,
           userId: principalId,
           profileSnapshotId,
-        });
+        }, purpose);
         token = { accessToken: minted.token, expiresAt: minted.expiresAt };
         cache.set(cacheKey, token);
       }
@@ -231,6 +250,7 @@ export function makeConnectionCredentialBrokerRoute(deps: {
         profileSnapshotId,
         connectionId: request.connectionId,
         identity: auditIdentity(providers, connection),
+        purpose,
         outcome,
         error: errorMessage(error),
       }, "connection credential mint failed");
@@ -243,6 +263,7 @@ export function makeConnectionCredentialBrokerRoute(deps: {
           profileSnapshotId,
           connectionId: request.connectionId,
           identity: auditIdentity(providers, connection),
+          purpose,
           outcome,
         }, "connection credential mint");
       }

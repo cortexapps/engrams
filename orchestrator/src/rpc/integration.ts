@@ -226,6 +226,7 @@ const PROTO_CONFIG_BY_PROVIDER: Record<string, ProtoConfigCodec> = {
         workloadIdentityProvider: req.googleCloud.workloadIdentityProvider,
         serviceAccountEmail: req.googleCloud.serviceAccountEmail,
         endpoints: req.googleCloud.endpoints,
+        cloudSqlPostgresInstance: req.googleCloud.cloudSqlPostgresInstance || undefined,
       },
     write: (config) => {
       const google = assertGoogleCloudConfig(config);
@@ -234,6 +235,7 @@ const PROTO_CONFIG_BY_PROVIDER: Record<string, ProtoConfigCodec> = {
           workloadIdentityProvider: google.workloadIdentityProvider,
           serviceAccountEmail: google.serviceAccountEmail,
           endpoints: google.endpoints,
+          cloudSqlPostgresInstance: google.cloudSqlPostgresInstance ?? "",
         },
       };
     },
@@ -249,6 +251,7 @@ interface GoogleCloudProtoConfig {
   workloadIdentityProvider: string;
   serviceAccountEmail: string;
   endpoints: string[];
+  cloudSqlPostgresInstance: string;
 }
 
 /** Read a request's provider config off the wire and validate it. */
