@@ -42,35 +42,48 @@ vi.mock("./sessions/DeleteSessionButton", () => ({
 }));
 vi.mock("@/components/ui/resizable", async () => {
   const React = await import("react");
-  const ResizablePanel = React.forwardRef<
-    { collapse: () => void; expand: () => void; resize: () => void },
-    {
-      children?: React.ReactNode;
-      id?: string;
-      defaultSize?: number;
-      onCollapse?: () => void;
-      onExpand?: () => void;
-    }
-  >(function MockResizablePanel({ children, id, defaultSize, onCollapse, onExpand }, ref) {
-    // The imperative handle mirrors the real library's callback contract:
-    // collapse() fires onCollapse, expand()/resize() fire onExpand.
-    React.useImperativeHandle(ref, () => ({
-      collapse: () => onCollapse?.(),
-      expand: () => onExpand?.(),
-      resize: () => onExpand?.(),
+  type PanelSize = { asPercentage: number; inPixels: number };
+  const size = (pct: number): PanelSize => ({ asPercentage: pct, inPixels: pct * 10 });
+  // v4 removed onCollapse/onExpand and takes the handle through a `panelRef`
+  // PROP rather than `ref`. The mock mirrors that contract exactly, so a call
+  // site that reverts to the v2 shape fails here instead of passing against a
+  // library API that no longer exists.
+  function MockResizablePanel({
+    children,
+    id,
+    defaultSize,
+    onResize,
+    panelRef,
+  }: {
+    children?: React.ReactNode;
+    id?: string;
+    defaultSize?: number;
+    onResize?: (s: PanelSize, id: string | undefined, prev: PanelSize | undefined) => void;
+    panelRef?: React.Ref<{
+      collapse: () => void;
+      expand: () => void;
+      resize: (s: number | string) => void;
+    } | null>;
+  }) {
+    const open = defaultSize ?? 42;
+    React.useImperativeHandle(panelRef, () => ({
+      collapse: () => onResize?.(size(0), id, size(open)),
+      expand: () => onResize?.(size(open), id, size(0)),
+      resize: () => onResize?.(size(open), id, size(0)),
     }));
     return (
       <div data-testid={`resizable-panel-${id}`} data-default-size={defaultSize}>
         {children}
       </div>
     );
-  });
+  }
   return {
     ResizablePanelGroup: ({ children }: { children?: React.ReactNode }) => (
       <div data-testid="resizable-panel-group">{children}</div>
     ),
-    ResizablePanel,
+    ResizablePanel: MockResizablePanel,
     ResizableHandle: () => <div data-testid="resizable-handle" />,
+    percentSize: (value: number) => String(value),
   };
 });
 vi.mock("../components/WorkPane", async (importOriginal) => {

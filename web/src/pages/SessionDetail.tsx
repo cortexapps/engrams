@@ -1,7 +1,7 @@
 import { useParams } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { PanelsTopLeft, Pencil } from "lucide-react";
-import type { ImperativePanelHandle } from "react-resizable-panels";
+import type { PanelImperativeHandle } from "react-resizable-panels";
 import { useSession } from "../hooks/useSessions";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
@@ -14,7 +14,12 @@ import { shortId, statusLabel } from "./sessions/session-format";
 import { useTasks } from "../hooks/useTasks";
 import { useIsMobile } from "../hooks/use-mobile";
 import { useIsAdmin } from "../auth/AuthProvider";
-import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "@/components/ui/resizable";
+import {
+  ResizablePanelGroup,
+  ResizablePanel,
+  ResizableHandle,
+  percentSize,
+} from "@/components/ui/resizable";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
 import type { ProfileSnapshotView, IndexedEvent } from "../lib/types";
@@ -160,8 +165,8 @@ export function SessionDetail() {
   // Desktop only: the pane fills the work area (transcript panel collapsed).
   const [expanded, setExpanded] = useState(false);
 
-  const paneRef = useRef<ImperativePanelHandle>(null);
-  const transcriptRef = useRef<ImperativePanelHandle>(null);
+  const paneRef = useRef<PanelImperativeHandle>(null);
+  const transcriptRef = useRef<PanelImperativeHandle>(null);
   const paneSizeRef = useRef(prefRef.current.size);
 
   // useIsMobile resolves after the first browser render. Close the sheet when
@@ -198,7 +203,9 @@ export function SessionDetail() {
     setPaneOpen(true);
     if (!isMobile) {
       // resize() un-collapses to the preferred width after a user collapse.
-      paneRef.current?.resize(paneSizeRef.current);
+      // The imperative API reads a bare number as PIXELS in v4, and the stored
+      // width is a percentage — so it has to go through percentSize().
+      paneRef.current?.resize(percentSize(paneSizeRef.current));
     }
   };
 
@@ -398,28 +405,40 @@ export function SessionDetail() {
           </>
         ) : (
           <ResizablePanelGroup
-            direction="horizontal"
+            orientation="horizontal"
             className="min-h-0 flex-1"
-            onLayout={(sizes) => {
+            // v4 hands back a map of panel id to percentage rather than an
+            // ordered array. `onLayoutChanged` (past tense) fires once the
+            // pointer is released instead of on every drag frame, which is
+            // what upstream recommends for writing to a storage API — so the
+            // preference is no longer rewritten dozens of times per drag.
+            onLayoutChanged={(layout) => {
+              const transcript = layout.transcript;
+              const workpane = layout.workpane;
               // Only remember the split when both panels are genuinely open —
               // skip collapsed (0) and fullscreen (transcript 0) so neither
               // clobbers the preferred width.
-              if (sizes[0] > 1 && sizes[1] > 1) {
-                paneSizeRef.current = sizes[1];
-                writePanePref({ tab: paneTab, size: sizes[1] });
+              if (transcript > 1 && workpane > 1) {
+                paneSizeRef.current = workpane;
+                writePanePref({ tab: paneTab, size: workpane });
               }
             }}
           >
             <ResizablePanel
               id="transcript"
-              order={1}
-              ref={transcriptRef}
+              panelRef={transcriptRef}
               collapsible
               collapsedSize={0}
               minSize={30}
               defaultSize={100 - paneSizeRef.current}
-              onCollapse={() => setExpanded(true)}
-              onExpand={() => setExpanded(false)}
+              // v4 removed onCollapse/onExpand; the collapse edge is derived
+              // from the resize callback instead. `prev === undefined` is the
+              // initial mount, which is not a transition.
+              onResize={(size, _id, prev) => {
+                if (prev === undefined) return;
+                if (size.asPercentage === 0 && prev.asPercentage !== 0) setExpanded(true);
+                else if (size.asPercentage !== 0 && prev.asPercentage === 0) setExpanded(false);
+              }}
               className="min-w-0"
             >
               {leftColumn}
@@ -432,17 +451,20 @@ export function SessionDetail() {
 
             <ResizablePanel
               id="workpane"
-              order={2}
-              ref={paneRef}
+              panelRef={paneRef}
               collapsible
               collapsedSize={0}
               minSize={24}
               defaultSize={paneSizeRef.current}
-              onCollapse={() => {
-                setExpanded(false);
-                setPaneOpen(false);
+              onResize={(size, _id, prev) => {
+                if (prev === undefined) return;
+                if (size.asPercentage === 0 && prev.asPercentage !== 0) {
+                  setExpanded(false);
+                  setPaneOpen(false);
+                } else if (size.asPercentage !== 0 && prev.asPercentage === 0) {
+                  setPaneOpen(true);
+                }
               }}
-              onExpand={() => setPaneOpen(true)}
               className="min-w-0 overflow-hidden"
             >
               <WorkPane
