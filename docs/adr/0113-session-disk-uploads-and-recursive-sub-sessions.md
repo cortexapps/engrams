@@ -42,10 +42,13 @@ atomically. A retry with the same upload UUID, name, length, and digest succeeds
 without changing the file. Different content for an existing canonical path
 fails. A reader never observes a partial file.
 
-`CopyFiles` keeps each canonical path unchanged. It streams bytes from the
-source guest through the source host, coordinator, target host, and target
-guest. It does not use object storage and does not buffer the whole file. The
-coordinator resumes a parked destination before it starts a transfer.
+`ReadFile` and `CopyFiles` accept any normalized absolute guest file path.
+`/tmp/uploads` is a composer convention, not a file-transfer policy. This lets
+an agent copy a file that it created elsewhere on its disk to a child session.
+`CopyFiles` keeps each source path unchanged. It streams bytes from the source
+guest through the source host, coordinator, target host, and target guest. It
+does not use object storage and does not buffer the whole file. The coordinator
+resumes a parked destination before it starts a transfer.
 
 The composer stores ordered text and upload tokens. A token renders as a chip
 but serializes as its literal canonical path. Send stays disabled until every

@@ -3,8 +3,8 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 
 export const MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
-export const CANONICAL_UPLOAD_PATH =
-  /^\/tmp\/uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/[A-Za-z0-9._-]{1,255}$/;
+export const CANONICAL_UPLOAD_PATH_SOURCE = String.raw`\/tmp\/uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/[A-Za-z0-9._-]{1,255}`;
+export const CANONICAL_UPLOAD_PATH = new RegExp(`^${CANONICAL_UPLOAD_PATH_SOURCE}$`);
 
 export type UploadStatus = "pending" | "hashing" | "uploading" | "uploaded" | "error";
 
@@ -72,47 +72,51 @@ async function uploadFile(
   update({ status: "hashing", progress: 0, error: undefined });
   const digest = await hashFile(token.file, (progress) => update({ progress: progress * 0.2 }));
   update({ status: "uploading", sha256: digest, progress: 0.2 });
-  let sent = 0;
-  const source = token.file.stream().getReader();
-  const body = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      const result = await source.read();
-      if (result.done) {
-        controller.close();
-        return;
-      }
-      sent += result.value.byteLength;
-      update({
-        progress: 0.2 + 0.8 * (token.file!.size === 0 ? 1 : sent / token.file!.size),
-      });
-      controller.enqueue(result.value);
-    },
-    cancel(reason) {
-      void source.cancel(reason);
-    },
-  });
-  const init: RequestInit & { duplex: "half" } = {
-    method: "POST",
-    body,
-    duplex: "half",
-    credentials: "include",
-    headers: {
-      "content-type": "application/octet-stream",
-      "x-upload-size": String(token.file.size),
-      "x-upload-sha256": digest,
-    },
-  };
-  const response = await fetch(
-    `/api/v1/sessions/${encodeURIComponent(sessionId)}/uploads?upload_id=${encodeURIComponent(token.id)}&file_name=${encodeURIComponent(token.name)}`,
-    init,
-  );
-  const payload = (await response.json()) as {
+  const payload = await new Promise<{
     path?: string;
     size_bytes?: number;
     sha256?: string;
     error?: string;
-  };
-  if (!response.ok || payload.path !== token.path || payload.sha256 !== digest) {
+    status: number;
+  }>((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open(
+      "POST",
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/uploads?upload_id=${encodeURIComponent(token.id)}&file_name=${encodeURIComponent(token.name)}`,
+    );
+    request.withCredentials = true;
+    request.setRequestHeader("content-type", "application/octet-stream");
+    request.setRequestHeader("x-upload-size", String(token.file!.size));
+    request.setRequestHeader("x-upload-sha256", digest);
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return;
+      update({ progress: 0.2 + 0.8 * (event.total === 0 ? 1 : event.loaded / event.total) });
+    };
+    request.onerror = () => reject(new Error("upload connection failed"));
+    request.onabort = () => reject(new Error("upload cancelled"));
+    request.onload = () => {
+      try {
+        resolve({
+          ...(JSON.parse(request.responseText) as {
+            path?: string;
+            size_bytes?: number;
+            sha256?: string;
+            error?: string;
+          }),
+          status: request.status,
+        });
+      } catch {
+        reject(new Error(`upload returned HTTP ${request.status}`));
+      }
+    };
+    request.send(token.file);
+  });
+  if (
+    payload.status < 200 ||
+    payload.status >= 300 ||
+    payload.path !== token.path ||
+    payload.sha256 !== digest
+  ) {
     throw new Error(payload.error ?? "upload verification failed");
   }
   return {
@@ -126,8 +130,12 @@ async function uploadFile(
 }
 
 export function serializeComposer(text: string, tokens: readonly UploadToken[]): string {
-  const paths = tokens.map((token) => token.path);
-  return [text.trim(), ...paths].filter(Boolean).join("\n");
+  let serialized = text.trim();
+  for (const token of tokens) {
+    if (serialized.includes(token.path)) continue;
+    serialized = [serialized, token.path].filter(Boolean).join("\n");
+  }
+  return serialized;
 }
 
 export function useSessionUploads(sessionId?: string) {
@@ -165,6 +173,7 @@ export function useSessionUploads(sessionId?: string) {
       if (sessionId) {
         for (const token of added) void runUpload(sessionId, token).catch(() => {});
       }
+      return added;
     },
     [runUpload, sessionId],
   );

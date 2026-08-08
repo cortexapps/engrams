@@ -187,7 +187,7 @@ describe("built-in tools", () => {
     }
   });
 
-  test("coordination schemas enforce names, upload paths, cursors, and wait limits", () => {
+  test("coordination schemas enforce names, guest paths, cursors, and wait limits", () => {
     const registry = createToolRegistry();
     registerBuiltinTools(registry);
 
@@ -204,6 +204,14 @@ describe("built-in tools", () => {
         file_paths: [path],
       }),
     ).toMatchObject({ task_name: "api-tests", file_paths: [path] });
+    expect(
+      spawn.input.parse({
+        task_name: "map-1",
+        message: "Sum the numbers",
+        idempotency_key: "spawn-map-1",
+        file_paths: ["/tmp/numbers.txt", "/workspace/map input.txt"],
+      }),
+    ).toMatchObject({ file_paths: ["/tmp/numbers.txt", "/workspace/map input.txt"] });
     expect(() =>
       spawn.input.parse({
         task_name: "../sibling",
@@ -216,7 +224,15 @@ describe("built-in tools", () => {
         task_name: "safe",
         message: "escape",
         idempotency_key: "spawn-3",
-        file_paths: ["/tmp/uploads/../secret"],
+        file_paths: ["/tmp/../secret"],
+      }),
+    ).toThrow();
+    expect(() =>
+      spawn.input.parse({
+        task_name: "safe",
+        message: "relative",
+        idempotency_key: "spawn-4",
+        file_paths: ["tmp/numbers.txt"],
       }),
     ).toThrow();
     expect(

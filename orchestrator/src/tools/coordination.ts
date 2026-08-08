@@ -37,18 +37,29 @@ const TaskName = z
   .regex(/^[a-z0-9][a-z0-9_-]{0,63}$/, "must match [a-z0-9][a-z0-9_-]{0,63}");
 const IdempotencyKey = z.string().min(1).max(200);
 const TaskPath = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}(\/[a-z0-9][a-z0-9_-]{0,63})*$/);
-const CanonicalPath = z
+const GuestFilePath = z
   .string()
-  .regex(
-    /^\/tmp\/uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/[A-Za-z0-9._-]{1,255}$/,
-    "must be a canonical /tmp/uploads/<uuid>/<name> path",
+  .min(2)
+  .max(4096)
+  .refine(
+    (path) =>
+      path.startsWith("/") &&
+      !path.includes("\0") &&
+      path
+        .slice(1)
+        .split("/")
+        .every((component) => component !== "" && component !== "." && component !== ".."),
+    "must be a normalized absolute guest file path",
+  )
+  .describe(
+    "A normalized absolute path to a file in the caller session, such as /tmp/results.json",
   );
 
 const SpawnInput = z.object({
   task_name: TaskName,
   message: z.string().min(1),
   idempotency_key: IdempotencyKey,
-  file_paths: z.array(CanonicalPath).optional(),
+  file_paths: z.array(GuestFilePath).optional(),
   harness_override: z.string().min(1).optional(),
   model_override: z.string().min(1).optional(),
   effort_override: z.string().min(1).optional(),
@@ -58,7 +69,7 @@ const SendInput = z.object({
   session_id: z.string().uuid(),
   message: z.string().min(1),
   idempotency_key: IdempotencyKey,
-  file_paths: z.array(CanonicalPath).optional(),
+  file_paths: z.array(GuestFilePath).optional(),
 });
 
 const SessionEventSchema = z.object({
@@ -445,7 +456,7 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
   registry.register({
     name: "spawn_session",
     description:
-      "Spawn a named child session. Optional file_paths are copied from this session at the same paths before the message is sent.",
+      "Spawn a named child session. Optional file_paths may name files anywhere in this session and are copied to the same absolute paths before the message is sent.",
     input: SpawnInput,
     output: z.object({ session_id: z.string(), canonical_task_name: z.string() }),
     handling: "handled",
@@ -592,7 +603,7 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
   registry.register({
     name: "send_session_message",
     description:
-      "Send a message to a descendant session. Files are copied at the same paths before the normal prompt path accepts the message.",
+      "Send a message to a descendant session. Optional file_paths may name files anywhere in this session and are copied to the same absolute paths before the normal prompt path accepts the message.",
     input: SendInput,
     output: z.object({ session_id: z.string(), accepted: z.boolean() }),
     handling: "handled",

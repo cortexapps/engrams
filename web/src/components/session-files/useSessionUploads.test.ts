@@ -43,5 +43,8 @@ describe("session upload composer tokens", () => {
     expect(serializeComposer("Review these files", tokens)).toBe(
       `Review these files\n${tokens[0]!.path}\n${tokens[1]!.path}`,
     );
+    expect(serializeComposer(`Review ${tokens[0]!.path} first`, tokens)).toBe(
+      `Review ${tokens[0]!.path} first\n${tokens[1]!.path}`,
+    );
   });
 });

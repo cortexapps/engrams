@@ -48,7 +48,7 @@ export interface ComposerActions {
   /** ADR 0107: a proposed plan is awaiting the user's review. */
   planPending: boolean;
   uploads: readonly UploadToken[];
-  addFiles: (files: FileList | readonly File[]) => void;
+  addFiles: (files: FileList | readonly File[]) => UploadToken[];
   addCanonicalPath: (path: string) => boolean;
   removeUpload: (id: string) => void;
   retryUpload: (id: string) => Promise<void>;
@@ -66,7 +66,7 @@ export const ComposerActionsContext = createContext<ComposerActions>({
   setMode: () => {},
   planPending: false,
   uploads: [],
-  addFiles: () => {},
+  addFiles: () => [],
   addCanonicalPath: () => false,
   removeUpload: () => {},
   retryUpload: async () => {},

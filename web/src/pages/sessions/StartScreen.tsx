@@ -11,7 +11,7 @@
  * the rest of the app does.
  */
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useWindowHeight } from "@react-hook/window-size";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
@@ -59,7 +59,6 @@ import { derivePolicy, type DerivedPolicy } from "../../lib/profilePolicy";
 import { compareSessions, relativeTime, shortId } from "./session-format";
 import type { SessionListItem } from "../../lib/types";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
 import { Text } from "@/components/ui/text";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -76,7 +75,11 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
-import { UploadTray } from "../../components/session-files/UploadTray";
+import { UploadButton } from "../../components/session-files/UploadButton";
+import {
+  InlineUploadComposer,
+  type InlineUploadComposerHandle,
+} from "../../components/session-files/InlineUploadComposer";
 import {
   serializeComposer,
   useSessionUploads,
@@ -295,7 +298,7 @@ export function StartScreen() {
 
   // Composer focus: on mount, and whenever the keymap (`c` / ⌘K "start task")
   // bumps the nonce after navigating here.
-  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const composerRef = useRef<InlineUploadComposerHandle>(null);
   const focusNonce = useKeyboardUi((s) => s.composerFocusNonce);
   const [enterToSend] = useEnterToSend();
   useEffect(() => {
@@ -322,7 +325,7 @@ export function StartScreen() {
     setTopPad(Math.max(0, (scroll.clientHeight - section.offsetHeight) / 2));
   }, [windowHeight, profilesPending, profiles.length, recent.length]);
 
-  const onComposerKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  const onComposerKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (isSubmitKey(e, enterToSend)) {
       e.preventDefault();
       void launch();
@@ -389,29 +392,24 @@ export function StartScreen() {
             onDragOver={(event) => event.preventDefault()}
             onDrop={(event) => {
               event.preventDefault();
-              if (event.dataTransfer.files.length > 0) uploads.addFiles(event.dataTransfer.files);
+              if (event.dataTransfer.files.length > 0) {
+                composerRef.current?.addFiles(event.dataTransfer.files);
+              }
             }}
           >
-            {uploads.tokens.length > 0 && (
-              <div className="px-2.5 pt-2">
-                <UploadTray
-                  tokens={uploads.tokens}
-                  onFiles={uploads.addFiles}
-                  onRemove={uploads.remove}
-                  onRetry={(id) => void uploads.retry(id)}
-                  disabled={createTaskMutation.isPending}
-                />
-              </div>
-            )}
-            <Textarea
+            <InlineUploadComposer
               ref={composerRef}
               value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
+              tokens={uploads.tokens}
+              onChange={setPrompt}
+              onFiles={uploads.addFiles}
+              onCanonicalPath={uploads.addCanonicalPath}
+              onRemove={uploads.remove}
+              onRetry={(id) => void uploads.retry(id)}
               onKeyDown={onComposerKeyDown}
-              rows={3}
-              aria-label="Task"
+              ariaLabel="Task"
               placeholder="Fix the flaky billing-gateway integration test and open a PR."
-              className="max-h-[calc(10lh+1.125rem)] min-h-[5.25rem] resize-none overflow-y-auto border-0 bg-transparent px-4 pt-3.5 pb-1 text-[0.95rem] leading-relaxed shadow-none focus-visible:ring-0 md:text-[0.95rem] dark:bg-transparent"
+              className="max-h-[calc(10lh+1.125rem)] min-h-[5.25rem] px-4 pt-3.5 pb-1 text-[0.95rem] leading-relaxed md:text-[0.95rem]"
             />
             {/* When the composer is at least @md wide (28rem), controls sit on
                 the left and Launch is pinned right, bottom-aligned so it's level
@@ -422,15 +420,10 @@ export function StartScreen() {
                 viewport, since the sidebar/task-list steal width independently. */}
             <div className="flex flex-col gap-2 px-2.5 pt-1 pb-2.5 @md/composer:flex-row @md/composer:items-end">
               <div className="flex flex-wrap items-center gap-2 @md/composer:min-w-0 @md/composer:flex-1">
-                {uploads.tokens.length === 0 && (
-                  <UploadTray
-                    tokens={[]}
-                    onFiles={uploads.addFiles}
-                    onRemove={uploads.remove}
-                    onRetry={(id) => void uploads.retry(id)}
-                    disabled={createTaskMutation.isPending}
-                  />
-                )}
+                <UploadButton
+                  onFiles={(files) => composerRef.current?.addFiles(files)}
+                  disabled={createTaskMutation.isPending}
+                />
                 <ProfileSwitcher
                   profiles={profiles}
                   selected={selected}

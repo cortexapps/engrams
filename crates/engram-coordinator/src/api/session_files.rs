@@ -42,31 +42,39 @@ pub(crate) fn canonical_upload_path(upload_id: &str, file_name: &str) -> Result<
     Ok(format!("{UPLOAD_ROOT}/{upload_id}/{file_name}"))
 }
 
-pub(crate) fn validate_canonical_path(path: &str) -> Result<(), ApiError> {
-    let remainder = path
-        .strip_prefix("/tmp/uploads/")
-        .ok_or_else(|| ApiError::BadRequest("path must be under /tmp/uploads".into()))?;
-    let mut parts = remainder.split('/');
-    let upload_id = parts
-        .next()
-        .ok_or_else(|| ApiError::BadRequest("path is missing upload_id".into()))?;
-    let file_name = parts
-        .next()
-        .ok_or_else(|| ApiError::BadRequest("path is missing file name".into()))?;
-    if parts.next().is_some() {
+pub(crate) fn validate_guest_file_path(path: &str) -> Result<(), ApiError> {
+    if path.len() > 4096 || !path.starts_with('/') || path == "/" || path.contains('\0') {
         return Err(ApiError::BadRequest(
-            "path must contain one upload directory and one file name".into(),
+            "path must be a normalized absolute guest file path".into(),
         ));
     }
+    if path[1..]
+        .split('/')
+        .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(ApiError::BadRequest(
+            "path must be a normalized absolute guest file path".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_upload_path(path: &str) -> Result<(), ApiError> {
+    let remainder = path
+        .strip_prefix(&format!("{UPLOAD_ROOT}/"))
+        .ok_or_else(|| ApiError::BadRequest("upload path must be under /tmp/uploads".into()))?;
+    let (upload_id, file_name) = remainder
+        .split_once('/')
+        .ok_or_else(|| ApiError::BadRequest("upload path is incomplete".into()))?;
     let expected = canonical_upload_path(upload_id, file_name)?;
     if expected != path {
-        return Err(ApiError::BadRequest("path is not canonical".into()));
+        return Err(ApiError::BadRequest("upload path is not canonical".into()));
     }
     Ok(())
 }
 
 fn validate_spec(spec: &SessionFileSpec) -> Result<(), ApiError> {
-    validate_canonical_path(&spec.path)?;
+    validate_canonical_upload_path(&spec.path)?;
     if spec.size_bytes > MAX_SESSION_FILE_BYTES {
         return Err(ApiError::PayloadTooLarge(format!(
             "file exceeds {MAX_SESSION_FILE_BYTES} bytes"
@@ -117,7 +125,7 @@ pub(crate) async fn read_file_core(
     session_id: SessionId,
     path: String,
 ) -> Result<(SessionFileMetadata, SessionFileStream), ApiError> {
-    validate_canonical_path(&path)?;
+    validate_guest_file_path(&path)?;
     let sandbox_id = active_sandbox(state, session_id).await?;
     state
         .services
@@ -137,7 +145,7 @@ pub(crate) async fn copy_files_core(
         return Err(ApiError::BadRequest("paths must not be empty".into()));
     }
     for path in &paths {
-        validate_canonical_path(path)?;
+        validate_guest_file_path(path)?;
     }
     // Resume both ends before the first byte moves. In particular, the target
     // must be active before the caller is allowed to send its prompt.
@@ -217,14 +225,40 @@ mod tests {
     }
 
     #[test]
-    fn rejects_traversal_and_noncanonical_paths() {
+    fn accepts_normalized_absolute_guest_file_paths() {
+        for path in [
+            "/tmp/numbers.txt",
+            "/workspace/results/map output.json",
+            "/tmp/uploads/019fe2ff-0464-75f3-bb20-a8c1844579b9/file.txt",
+        ] {
+            assert!(validate_guest_file_path(path).is_ok(), "rejected {path}");
+        }
+    }
+
+    #[test]
+    fn rejects_relative_and_non_normalized_guest_file_paths() {
         for path in [
             "/tmp/uploads/019fe2ff-0464-75f3-bb20-a8c1844579b9/../secret",
+            "/tmp//numbers.txt",
+            "/tmp/./numbers.txt",
+            "tmp/numbers.txt",
+            "/",
+        ] {
+            assert!(validate_guest_file_path(path).is_err(), "accepted {path}");
+        }
+    }
+
+    #[test]
+    fn browser_upload_paths_remain_canonical() {
+        for path in [
+            "/tmp/numbers.txt",
             "/tmp/uploads/not-a-uuid/file",
             "/tmp/uploads/019fe2ff-0464-75f3-bb20-a8c1844579b9/a/b",
-            "/etc/passwd",
         ] {
-            assert!(validate_canonical_path(path).is_err(), "accepted {path}");
+            assert!(
+                validate_canonical_upload_path(path).is_err(),
+                "accepted {path}"
+            );
         }
     }
 }
