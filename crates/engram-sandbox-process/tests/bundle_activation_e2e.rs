@@ -2,8 +2,9 @@
 //! browser tooling.
 //!
 //! Drives the real session-generation path on the dev `ProcessBackend`
-//! (`create` → `start_agent`) with the RO bundles staged, and asserts the
-//! produced session directory contains everything a harness discovers:
+//! (`restore_base_for_session` → `start_agent`) with the RO bundles staged.
+//! It asserts that the produced session directory contains everything a
+//! harness discovers:
 //! the `~/.claude/skills` tree (share-file always; browser when its bundle is
 //! present), and the browser/share wrappers on PATH + `/etc/gitconfig`. This is
 //! the cross-cutting check that the engine
@@ -17,9 +18,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use engram_core::traits::sandbox::SandboxBackend;
-use engram_core::types::sandbox::{
-    AgentSpec, AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec,
-};
+use engram_core::types::sandbox::{AgentSpec, AuxRoDrive};
+use engram_core::types::{SnapshotId, SnapshotMetadata};
 use engram_sandbox_process::ProcessBackend;
 
 fn write_exec(path: &Path, body: &str) {
@@ -33,7 +33,7 @@ fn write_exec(path: &Path, body: &str) {
 }
 
 /// Build fake skills + browser bundle trees mirroring `deploy/bundles/*`.
-fn stage_fake_bundles(skills: &Path, browser: &Path) {
+fn stage_fake_bundles(skills: &Path, browser: &Path, harness: &Path) {
     write_exec(&skills.join("bin/engram-share"), "#!/bin/sh\n");
     write_exec(&skills.join("bin/git-askpass"), "#!/bin/sh\n");
     std::fs::create_dir_all(skills.join("skills/share-file")).unwrap();
@@ -52,6 +52,8 @@ fn stage_fake_bundles(skills: &Path, browser: &Path) {
         r#"{"kind":"skill","skills":[{"name":"browser","bins":["bin/playwright-cli"]}]}"#,
     )
     .unwrap();
+
+    write_exec(&harness.join("harness"), "#!/bin/sh\ntouch harness-ran\n");
 }
 
 #[tokio::test]
@@ -59,40 +61,72 @@ async fn generated_session_has_skills_and_browser_tooling() {
     let tmp = tempfile::tempdir().unwrap();
     let skills_dir = tmp.path().join("bundles/skills");
     let browser_dir = tmp.path().join("bundles/browser");
-    stage_fake_bundles(&skills_dir, &browser_dir);
+    let harness_dir = tmp.path().join("bundles/harness-claude");
+    stage_fake_bundles(&skills_dir, &browser_dir, &harness_dir);
+    std::fs::write(
+        tmp.path().join("bundles/current.json"),
+        r#"{"skills":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","browser":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","harness-claude":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}"#,
+    )
+    .unwrap();
 
-    // Point ProcessBackend's dev staging at the fake bundles. Safe: edition
+    // Point ProcessBackend's dev catalog at the fake bundles. Safe: edition
     // 2021 `set_var` isn't unsafe, and this is the only test in the binary.
-    std::env::set_var("ENGRAM_SKILLS_BUNDLE_DIR", &skills_dir);
-    std::env::set_var("ENGRAM_BROWSER_BUNDLE_DIR", &browser_dir);
+    std::env::set_var("ENGRAM_BUNDLE_DIR", tmp.path().join("bundles"));
 
     let work = tmp.path().join("work");
     let backend = ProcessBackend::new(&work);
 
-    let spec = SandboxSpec {
-        image: "test".into(),
-        rootfs_source: None,
-        image_uri: None,
-        rootfs_manifest: None,
-        cpu: CpuLimit { vcpus: 1 },
-        memory: MemoryLimit { max_mib: 256 },
-        disk: DiskLimit { max_gib: 1 },
-        ttl: None,
-        env: HashMap::new(),
-        workdir: None,
-        network: Default::default(),
-        // Dev staging is spec-independent, but pass reserved slots through to
-        // mirror what coord capture records (ADR 0055 sentinel device model).
-        aux_ro_drives: (0..2).map(AuxRoDrive::reserved_slot).collect(),
-        swap_mib: None,
-    };
-    let id = backend.create(spec).await.expect("create session");
+    let selected_mounts = vec![
+        AuxRoDrive {
+            drive_id: AuxRoDrive::slot_drive_id(AuxRoDrive::HARNESS_SLOT_INDEX),
+            guest_mount: AuxRoDrive::slot_guest_mount(AuxRoDrive::HARNESS_SLOT_INDEX),
+            fs_type: "squashfs".into(),
+            sha256: Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into()),
+        },
+        AuxRoDrive {
+            drive_id: AuxRoDrive::slot_drive_id(AuxRoDrive::FIRST_SKILL_SLOT_INDEX),
+            guest_mount: AuxRoDrive::slot_guest_mount(AuxRoDrive::FIRST_SKILL_SLOT_INDEX),
+            fs_type: "squashfs".into(),
+            sha256: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+        },
+        AuxRoDrive {
+            drive_id: AuxRoDrive::slot_drive_id(AuxRoDrive::FIRST_SKILL_SLOT_INDEX + 1),
+            guest_mount: AuxRoDrive::slot_guest_mount(AuxRoDrive::FIRST_SKILL_SLOT_INDEX + 1),
+            fs_type: "squashfs".into(),
+            sha256: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+        },
+    ];
+    let id = backend
+        .restore_base_for_session(
+            SnapshotMetadata {
+                id: SnapshotId::new(),
+                size_bytes: 0,
+                created_at: chrono::DateTime::UNIX_EPOCH,
+                image_version: "dev.local/process:latest".into(),
+                disk_manifest: None,
+                memory_manifest: None,
+                base_memory_manifest: None,
+                migration_source: None,
+                source_sandbox_id: None,
+                state_blob_key: None,
+                sidecar_blob_key: None,
+                rootfs_blob_key: None,
+                working_set_blob_key: None,
+                aux_bundles: Vec::new(),
+                paused_at: None,
+                peer_hints: Vec::new(),
+            },
+            HashMap::new(),
+            selected_mounts,
+        )
+        .await
+        .expect("restore metadata-only Process image");
 
     // A forge-bound session: the broker token rides AgentSpec.env (per-spawn),
     // which is exactly where the activation gate must look for it.
     let agent = AgentSpec {
         binding_epoch: 1,
-        argv: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+        argv: vec!["/opt/engram/dyn/0/harness".into()],
         env: HashMap::from_iter([("ENGRAM_FORGE_TOKEN".into(), "tok".into())]),
         session_env: HashMap::new(),
         host_ca_pem: None,
@@ -101,6 +135,16 @@ async fn generated_session_has_skills_and_browser_tooling() {
 
     // The generated session directory.
     let cwd = work.join(id.to_string());
+    for _ in 0..50 {
+        if cwd.join("harness-ran").exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        cwd.join("harness-ran").exists(),
+        "guest-absolute harness path was not translated to the Process sandbox root",
+    );
 
     // Skills discovery: ~/.claude/skills -> ~/.agents/skills, populated.
     assert!(
@@ -142,7 +186,8 @@ async fn generated_session_has_skills_and_browser_tooling() {
     );
 
     // The bundle mounts themselves are symlinked under the session cwd at the
-    // ADR 0055 reserved-slot paths (skills -> dyn/0, browser -> dyn/1).
+    // ADR 0055 reserved-slot paths (0-2 are harness/agentd/guest-tools).
     assert!(cwd.join("opt/engram/dyn/0").is_symlink());
-    assert!(cwd.join("opt/engram/dyn/1").is_symlink());
+    assert!(cwd.join("opt/engram/dyn/3").is_symlink());
+    assert!(cwd.join("opt/engram/dyn/4").is_symlink());
 }

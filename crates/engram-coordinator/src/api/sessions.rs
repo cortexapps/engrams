@@ -1266,10 +1266,11 @@ async fn resolve_selected_skills(
 /// create, pinned to the fleet's current `guest-tools` generation. Carries
 /// engrams-owned in-guest tooling (today: the static `ttyd` agentd's
 /// `shell.rs` spawns for the SHELL tab) so session images no longer bake it.
-/// `None` (with a LOUD warn) when no host reports one — soft like agentd:
-/// the Process fleet stages no bundles at all, and a session without the
-/// mount degrades to whatever `ttyd` the image itself carries (agentd warns
-/// again at StartShell when it falls back), never to a failed create.
+/// `None` (with a LOUD warn) when no host reports one — soft like agentd.
+/// The dev Process fleet stages only harness and skill bundles, so a session
+/// without this mount degrades to whatever `ttyd` the image itself carries
+/// (agentd warns again at StartShell when it falls back), never to a failed
+/// create.
 async fn resolve_guest_tools_mount(
     state: &SharedState,
 ) -> Result<Option<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
@@ -1558,15 +1559,15 @@ async fn prepare_inner(
     // host compares this pin against the snapshot's and only when they
     // differ does the captured agentd re-exec (RefreshAgent), so an agentd
     // roll reaches new sessions with zero recapture and zero steady-state
-    // latency. `None` (bundle-less fleet: Process dev, mid-bring-up) keeps
-    // the snapshot's pinned generation.
+    // latency. `None` (Process dev, or a fleet mid-bring-up) keeps the
+    // snapshot's pinned generation.
     if let Some(mount) = resolve_agentd_mount(state).await? {
         selected_mounts.push(mount);
     }
     // ADR 0080 §D: pin the fleet's current guest-tools generation (ttyd) to
     // its reserved slot (`dyn_2`) — same paused-window patch_drive path as
-    // skills, soft like agentd (a bundle-less fleet warns and the SHELL tab
-    // relies on an image-baked ttyd).
+    // skills, soft like agentd (a fleet without guest-tools warns and the
+    // SHELL tab relies on an image-baked ttyd).
     if let Some(mount) = resolve_guest_tools_mount(state).await? {
         selected_mounts.push(mount);
     }

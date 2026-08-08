@@ -388,6 +388,11 @@ coord_env = {
 # on a virt-less box is exactly the sanctioned dev case, so opt in here.
 if sandbox_backend == 'process':
     coord_env['ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND'] = '1'
+    # The Linux dev-engrams image runs the nested stack in Process mode. Give
+    # its synthetic host the unpacked bundle stamp and seed one metadata-only
+    # image that this backend can restore without OCI materialization.
+    coord_env['ENGRAM_BUNDLE_DIR'] = os.path.abspath('var/bundles')
+    coord_env['ENGRAM_PROCESS_DEV_BOOTSTRAP'] = '1'
 
 if fc_colima_profile:
     # ADR 0082: the fc-dev VM has a ~19 GiB rootfs, smaller than the
@@ -414,6 +419,10 @@ elif needs_codesign:
 else:
     coord_serve_cmd = 'cargo run -p engram-coordinator'
 
+coord_resource_deps = ['postgres', 'registry', 'jaeger']
+if sandbox_backend == 'process':
+    coord_resource_deps.append('bundles')
+
 local_resource('coordinator',
     serve_cmd=coord_serve_cmd,
     serve_env=coord_env,
@@ -421,7 +430,7 @@ local_resource('coordinator',
     # contact the emulator or bucket. Keep the control plane available when
     # fake-gcs-server/seed-buckets is unhealthy; only blob-using operations
     # need those resources. Bundles independently gate the host-agent below.
-    resource_deps=['postgres', 'registry', 'jaeger'],
+    resource_deps=coord_resource_deps,
     # Tilt's HTTP probe opens a fresh loopback TCP connection per
     # tick AND issues an HTTP request that makes the server log it.
     # On macOS the closed sockets sit in TIME_WAIT for 2*MSL=30s
@@ -838,6 +847,30 @@ if dev_split:
         deps=['deploy/bundles'],
         trigger_mode=_bundles_trigger,
         labels=['setup'])
+else:
+    # ProcessBackend executes harnesses as Linux host subprocesses and symlinks
+    # unpacked bundle trees into their selected dyn slots. Build these before
+    # the coordinator registers its synthetic host so the first catalog read
+    # already contains Claude Code, Codex, and the core skills bundle.
+    local_resource('bundles',
+        cmd='just bundles-process',
+        deps=[
+            'Cargo.toml',
+            'Cargo.lock',
+            'workspace-hack',
+            'deploy/dev/stage-process-bundles.sh',
+            'deploy/bundles/skills',
+            'deploy/harness-claude',
+            'deploy/harness-codex',
+            'crates/engram-core',
+            'crates/engram-harness-claude',
+            'crates/engram-harness-codex',
+            'crates/engram-harness-proto',
+            'crates/engram-harness-sdk',
+            'crates/engram-transport',
+        ],
+        trigger_mode=TRIGGER_MODE_AUTO,
+        labels=['setup'])
 
 # The egress proxy is MANDATORY (issue #240): it's the only path a guest
 # reaches the network, and `0` is NOT an "off" sentinel — host_startup still
@@ -969,6 +1002,10 @@ orchestrator_env = {
     # so live scenario A/C verification works against the local stack.
     'ENGRAM_DEV_TOOLS': '1',
 }
+if sandbox_backend == 'process':
+    # The nested dev-engrams stack gets one documented local-only login. The
+    # seed resource still enforces the role directly for pre-existing rows.
+    orchestrator_env['ORCHESTRATOR_ADMIN_EMAILS'] = 'dev@engrams.local'
 
 skip_web = env_or('ENGRAM_SKIP_WEB', '') in ('1', 'true', 'yes')
 
@@ -1022,6 +1059,22 @@ local_resource('dev-api-key',
     resource_deps=['orchestrator-migrate'],
     labels=['setup'])
 
+if sandbox_backend == 'process':
+    # Seed the browser user and one profile per built-in harness only after
+    # Better Auth is listening. The profiles reference the metadata-only image
+    # that the coordinator seeds before its own readiness probe passes.
+    local_resource('process-dev-bootstrap',
+        cmd=(
+            'cd orchestrator && ' +
+            'ORCHESTRATOR_DATABASE_URL=' + orchestrator_db_url + ' ' +
+            'ORCHESTRATOR_URL=http://127.0.0.1:8787 ' +
+            'ORCHESTRATOR_PUBLIC_URL=http://localhost:5173 ' +
+            'bun scripts/seed-process-dev.ts'
+        ),
+        deps=['orchestrator/scripts/seed-process-dev.ts'],
+        resource_deps=['orchestrator'],
+        labels=['setup'])
+
 # ----------------------------------------------------------------
 # Web SPA (vite dev server).
 #
@@ -1038,9 +1091,12 @@ local_resource('dev-api-key',
 # ----------------------------------------------------------------
 
 if not skip_web:
+    web_resource_deps = ['orchestrator']
+    if sandbox_backend == 'process':
+        web_resource_deps.append('process-dev-bootstrap')
     local_resource('web',
         serve_cmd='cd web && pnpm install --silent && pnpm dev --strictPort',
-        resource_deps=['orchestrator'],
+        resource_deps=web_resource_deps,
         # See the coordinator probe above — same loopback port-pool
         # constraint applies to vite.
         readiness_probe=probe(
