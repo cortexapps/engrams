@@ -1430,6 +1430,15 @@ async fn serve_at(
     // The kernel holds its own reference now.
     drop(kernel_side);
 
+    // Register the served device on the backend so every capture
+    // (`ChunkedDiskBackend::flush_local`) syncs the HOST page cache
+    // for /dev/nbdN down into the dirty tier before it freezes. Both
+    // modes register — a RECONFIGUREd survivor captures too.
+    backend.register_host_device(
+        nbd_device.to_path_buf(),
+        Arc::new(crate::device_sync::HostDeviceSync),
+    );
+
     // 3. Spawn the tokio serve task on the server-side socket.
     let stream = TokioUnixStream::from_std(server_side)?;
     let serve_task = tokio::spawn(serve_loop(backend, stream));
@@ -1737,6 +1746,62 @@ mod tests {
         // Non-positive pids are never a real process.
         assert!(!pid_is_alive(0));
         assert!(!pid_is_alive(-1));
+    }
+
+    /// The serve choke point must register the served device on the
+    /// backend: `flush_local`'s pre-freeze sync (the torn-publish
+    /// guard) is a no-op for an unregistered backend, so an attach
+    /// path that skips registration silently reverts every capture to
+    /// unsynced. Both CONNECT and RECONFIGURE run through `serve_at`;
+    /// this pins the registration at that choke point. (The
+    /// registered-device ⇒ synced-capture half of the chain is pinned
+    /// behaviorally by the `backend.rs` flush tests.)
+    #[tokio::test]
+    async fn serve_at_registers_the_device_for_capture_syncs() {
+        struct FakeKernel;
+
+        #[async_trait::async_trait]
+        impl engram_host_core::NbdKernel for FakeKernel {
+            async fn connect(
+                &self,
+                _req: engram_host_core::NbdConnectRequest<'_>,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            async fn reconfigure(
+                &self,
+                _req: engram_host_core::NbdReconfigureRequest<'_>,
+            ) -> io::Result<()> {
+                Ok(())
+            }
+            async fn disconnect(&self, _device: &Path) -> io::Result<()> {
+                Ok(())
+            }
+            fn backend_identifier(&self, _device: &Path) -> Option<String> {
+                None
+            }
+            fn connected_devices(&self) -> Vec<engram_host_core::ConnectedDevice> {
+                Vec::new()
+            }
+        }
+
+        let (backend, _dir) = three_chunk_backend().await;
+        let backend = Arc::new(backend);
+        assert_eq!(backend.registered_host_device(), None);
+
+        let device = PathBuf::from("/dev/nbd7");
+        let handle = serve_at(
+            backend.clone(),
+            &device,
+            "test-backend",
+            ConnectMode::Connect,
+            &FakeKernel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(backend.registered_host_device(), Some(device));
+        // Skip Drop's real netlink disconnect.
+        handle.abandon();
     }
 
     /// Build a 28-byte NBD request header (no payload), flags = 0.
