@@ -1,9 +1,10 @@
 /**
  * Slack CommunicationPolicy (ADR 0060 P2.10) — the v1 provider-mechanics impl
- * behind the SlackThreadWorkflow's policy seam. Pure Block Kit shaping lives in
- * slack-blocks.ts; this module is the thin layer that drives the Slack WebClient
- * (reactions, posts, updates, thread reads). Every method is invoked by the
- * framework as a checkpointed DBOS step, so it runs once per effect.
+ * behind the SlackThreadWorkflow's policy seam. Outbound Block Kit shaping lives
+ * in slack-blocks.ts and inbound message rendering in slack-message-text.ts;
+ * this module is the thin layer that drives the Slack WebClient (reactions,
+ * posts, updates, thread reads). Every method is invoked by the framework as a
+ * checkpointed DBOS step, so it runs once per effect.
  *
  * The Slack client is injected (default = the authed WebClient from slack.ts),
  * which keeps the policy — including the thread→prompt fold — unit-testable
@@ -14,6 +15,7 @@ import type { KnownBlock } from "@slack/types";
 
 import { log as rootLog } from "../log.ts";
 import { getSlackClient } from "./slack.ts";
+import { replyText, type SlackReply } from "./slack-message-text.ts";
 import {
   parseUserQuestion,
   parseQuestionAnswers,
@@ -48,17 +50,6 @@ Italics are underlines surrounding text like _this_.`;
  *  a link to the session instead, so the orchestrator never buffers a huge blob
  *  in memory just to forward it. */
 const MAX_SLACK_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MiB
-
-/** A reply in a Slack thread (the subset the prompt fold reads). */
-export interface SlackReply {
-  ts?: string;
-  user?: string;
-  bot_id?: string;
-  text?: string;
-  /** Legacy attachments — bot/app posts often carry their content here with an
-   *  empty top-level `text` (alerts, GitHub, workflow posts). */
-  attachments?: { title?: string; text?: string; fallback?: string }[];
-}
 
 /** The Slack WebClient surface this policy uses — a structural subset so a fake
  *  satisfies it in tests (the real WebClient does too). */
@@ -117,7 +108,8 @@ export interface SlackPolicyDeps {
  * thread ROOT (`rootTs`): it is the subject of the thread, so a bot-authored
  * root (an alert, a workflow post, another app) stays in as context. `since`
  * is exclusive: `conversations.replies(oldest=)` is inclusive, so the boundary
- * message is dropped here.
+ * message is dropped here. Each kept message contributes ALL of its content —
+ * `replyText` reads text, blocks, attachments, and files alike.
  *
  * Shape: the triggering @mention (identified by `triggerTs`) is the directive
  * and goes at the BOTTOM; every other kept message is prior thread context,
@@ -155,19 +147,6 @@ export function foldReplies(
     ? `<thread context>\n${context.join("\n")}\n</thread context>\n\n${directive}`
     : directive;
   return { prompt, maxTs };
-}
-
-/** A message's prompt text. Bot/app posts often put their content in legacy
- *  `attachments` and leave `text` empty — fold those in only then, so link
- *  unfurls (attachments alongside real text) never add noise. */
-function replyText(msg: SlackReply): string {
-  if (msg.text?.trim()) return msg.text;
-  const parts: string[] = [];
-  for (const a of msg.attachments ?? []) {
-    const body = [a.title, a.text].filter((s) => s?.trim()).join("\n") || a.fallback || "";
-    if (body.trim()) parts.push(body);
-  }
-  return parts.join("\n");
 }
 
 const num = (ts: string): number => Number.parseFloat(ts) || 0;
