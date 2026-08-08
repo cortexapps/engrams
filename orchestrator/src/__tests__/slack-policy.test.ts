@@ -480,4 +480,37 @@ describe("makeSlackPolicy()", () => {
     expect(out.prompt).toBe("<thread context>\nALERT: disk full\n</thread context>\n\nhandle this");
     expect(out.maxTs).toBe("101.0");
   });
+
+  // Regression, session 77c65873 (2026-08-07): the root was a Linear app post
+  // whose `text` is a one-line summary and whose ticket sits in an attachment.
+  // The fold read `text` only, so the session was asked "is this true?" about a
+  // ticket it never saw. The whole root must reach the prompt.
+  test("gatherThreadContext keeps an app root's attachment payload, not just its summary line", async () => {
+    const { client } = fakeClient();
+    client.conversations.replies = async () => ({
+      messages: [
+        {
+          ts: "100.0",
+          bot_id: "B9",
+          text: "Madison Unell added an issue to the Product Feedback team",
+          attachments: [
+            {
+              title: "PFR-412 Session loses the ticket body",
+              title_link: "https://linear.app/acme/issue/PFR-412",
+              text: "Starting a session from a Linear unfurl gives the agent no ticket.",
+            },
+          ],
+        },
+        { ts: "101.0", user: "U1", text: "<@BOT> is this true? could you take a look" },
+      ],
+    });
+    const out = await policy(client).gatherThreadContext({ ...M, ts: "101.0" }, null);
+    expect(out.prompt).toBe(
+      "<thread context>\n" +
+        "Madison Unell added an issue to the Product Feedback team\n" +
+        "<https://linear.app/acme/issue/PFR-412|PFR-412 Session loses the ticket body>\n" +
+        "Starting a session from a Linear unfurl gives the agent no ticket.\n" +
+        "</thread context>\n\nis this true? could you take a look",
+    );
+  });
 });
