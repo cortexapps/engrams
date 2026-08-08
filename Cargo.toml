@@ -69,8 +69,8 @@ disallowed_methods = "deny"
 # kubernetes — ADR 0044 K3 host-fleet rollout operator (engram-host-operator).
 # rustls (not openssl) to match reqwest's TLS choice; "latest" k8s-openapi
 # feature since the operator is the sole consumer.
-kube = { version = "0.99", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
-k8s-openapi = { version = "0.24", features = ["latest"] }
+kube = { version = "4.2", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
+k8s-openapi = { version = "0.28", features = ["latest"] }
 # ADR 0045 C2: peer page-channel payload compression. Pure Rust on
 # purpose — the uffd-handler's musl build must not grow a C dep.
 lz4_flex = "0.14"
@@ -79,7 +79,11 @@ lz4_flex = "0.14"
 # sha256 of the payload was ~1.2 ms per serve, the dominant encode leg).
 blake3 = "1"
 # schemars is required by kube's CustomResource derive (CRD schema gen).
-schemars = "0.8"
+# Version-locked to kube: kube 2.0 moved from schemars 0.8 to 1.0, and
+# kube-derive 4.2 emits `schemars::generate::*` / `schemars::transform::*`,
+# which are 1.x module paths. Moving kube without moving this fails in the
+# derive macro, not at a call site.
+schemars = "1.2"
 # internal
 engram-core = { path = "crates/engram-core" }
 engram-protocol = { path = "crates/engram-protocol" }
