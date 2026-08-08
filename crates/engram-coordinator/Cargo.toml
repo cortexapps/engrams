@@ -64,7 +64,6 @@ sqlx.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
-tokio-tungstenite.workspace = true
 tonic.workspace = true
 tonic-reflection.workspace = true
 tower.workspace = true
