@@ -269,101 +269,22 @@ fn parse_kek_choice(s: &str) -> Result<KekChoice, String> {
     }
 }
 
-const PROCESS_DEV_IMAGE_ID: &str = "00000000-0000-4000-8000-000000000001";
-const PROCESS_DEV_SNAPSHOT_ID: &str = "00000000-0000-4000-8000-000000000002";
-const PROCESS_DEV_MANIFEST_ID: &str = "00000000-0000-4000-8000-000000000004";
-const PROCESS_DEV_IMAGE_URI: &str = "dev.local/process:latest";
-const PROCESS_DEV_MANIFEST_DIGEST: &str = "process-dev";
+fn parse_process_ready_images(value: &str) -> Vec<String> {
+    let mut images = value
+        .split(',')
+        .map(str::trim)
+        .filter(|image| !image.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    images.sort_unstable();
+    images.dedup();
+    images
+}
 
-/// Seed the metadata-only image that makes a fresh Process-mode Tilt stack
-/// immediately usable. The ProcessBackend restores it as an empty host
-/// directory, so no OCI materialize/capture job or chunk payload exists.
-/// Explicitly gated by `ENGRAM_PROCESS_DEV_BOOTSTRAP=1` in the Tiltfile.
-async fn seed_process_dev_image(
-    pg: &PostgresStore,
-    clock: &dyn engram_core::traits::Clock,
-) -> Result<(), CoordinatorError> {
-    use engram_core::traits::MetadataStore;
-    use engram_core::types::image::{ImageConfig, ResourceHints};
-    use engram_core::types::manifest::ManifestRef;
-    use engram_core::types::{EnabledImage, SnapshotId, SnapshotRecord};
-
-    let now = clock.now_utc();
-    let snapshot_id: SnapshotId = PROCESS_DEV_SNAPSHOT_ID
-        .parse()
-        .map_err(|e| CoordinatorError::Config(format!("invalid Process dev snapshot id: {e}")))?;
-    let manifest_id = PROCESS_DEV_MANIFEST_ID
-        .parse()
-        .map_err(|e| CoordinatorError::Config(format!("invalid Process dev manifest id: {e}")))?;
-    let disk_manifest = ManifestRef {
-        manifest_id,
-        version: 0,
-    };
-    MetadataStore::record_snapshot(
-        pg,
-        SnapshotRecord {
-            id: snapshot_id,
-            session_id: None,
-            host_id: None,
-            image_version: PROCESS_DEV_IMAGE_URI.into(),
-            size_bytes: 0,
-            created_at: now,
-            last_accessed_at: now,
-            // The schema requires the enabled-image denormalization below,
-            // but Process restore never reads chunk storage.
-            disk_manifest: None,
-            memory_manifest: None,
-            recoverable: false,
-            aux_bundles: Vec::new(),
-            events_cursor: None,
-            fc_snapshot_version: None,
-        },
+fn process_ready_images() -> Vec<String> {
+    parse_process_ready_images(
+        &std::env::var("ENGRAM_PROCESS_READY_IMAGE_DIGESTS").unwrap_or_default(),
     )
-    .await
-    .map_err(|e| CoordinatorError::Config(format!("seed Process dev snapshot: {e}")))?;
-
-    let image_id = PROCESS_DEV_IMAGE_ID
-        .parse()
-        .map_err(|e| CoordinatorError::Config(format!("invalid Process dev image id: {e}")))?;
-    MetadataStore::upsert_enabled_image(
-        pg,
-        EnabledImage {
-            id: image_id,
-            image_uri: PROCESS_DEV_IMAGE_URI.into(),
-            image_config: ImageConfig {
-                name: "Process dev harness smoke".into(),
-                description: Some(
-                    "Metadata-only local image for Claude Code and Codex harness tests".into(),
-                ),
-                env: Default::default(),
-                workdir: None,
-                resources: ResourceHints {
-                    suggested_memory_mib: Some(1024),
-                    suggested_vcpus: Some(1),
-                    suggested_disk_gib: Some(1),
-                    suggested_swap_mib: None,
-                },
-                warm: None,
-            },
-            oci_defaults: Default::default(),
-            manifest_digest: PROCESS_DEV_MANIFEST_DIGEST.into(),
-            disk_manifest: None,
-            base_snapshot_id: Some(snapshot_id),
-            base_snapshot_disk_manifest: Some(disk_manifest),
-            base_snapshot_memory_manifest: None,
-            last_refreshed_at: now,
-            created_at: now,
-            updated_at: None,
-            soft_deleted_at: None,
-        },
-    )
-    .await
-    .map_err(|e| CoordinatorError::Config(format!("seed Process dev image: {e}")))?;
-    tracing::info!(
-        image_uri = PROCESS_DEV_IMAGE_URI,
-        "seeded Process dev image"
-    );
-    Ok(())
 }
 
 #[tokio::main]
@@ -593,12 +514,7 @@ async fn main() -> Result<(), CoordinatorError> {
         ));
         let local_backend: Arc<dyn SandboxBackend> = process_backend.clone();
         let process_current_bundles = engram_sandbox_process::ProcessBackend::current_bundles();
-        let process_ready_images =
-            if std::env::var("ENGRAM_PROCESS_DEV_BOOTSTRAP").as_deref() == Ok("1") {
-                vec![PROCESS_DEV_MANIFEST_DIGEST.to_string()]
-            } else {
-                Vec::new()
-            };
+        let process_ready_images = process_ready_images();
         // Use a stable HostId for `--mode=all` so a coordinator
         // restart picks up the same `hosts` row (FK-safe — sessions
         // / snapshots inserted in a prior run still reference a valid
@@ -655,9 +571,6 @@ async fn main() -> Result<(), CoordinatorError> {
             return Err(CoordinatorError::Config(format!(
                 "register in-process host in postgres: {e}"
             )));
-        }
-        if std::env::var("ENGRAM_PROCESS_DEV_BOOTSTRAP").as_deref() == Ok("1") {
-            seed_process_dev_image(&pg, clock.as_ref()).await?;
         }
         // Keep the row's `last_heartbeat_at` fresh so the dead-host
         // detector doesn't reap our own in-process host. The
@@ -814,4 +727,17 @@ async fn main() -> Result<(), CoordinatorError> {
         integrations,
     )
     .await
+}
+
+#[cfg(test)]
+mod process_ready_image_tests {
+    use super::parse_process_ready_images;
+
+    #[test]
+    fn parses_sorted_unique_image_digests() {
+        assert_eq!(
+            parse_process_ready_images(" image-b, image-a,,image-b "),
+            ["image-a", "image-b"]
+        );
+    }
 }

@@ -388,11 +388,11 @@ coord_env = {
 # on a virt-less box is exactly the sanctioned dev case, so opt in here.
 if sandbox_backend == 'process':
     coord_env['ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND'] = '1'
-    # The Linux dev-engrams image runs the nested stack in Process mode. Give
-    # its synthetic host the unpacked bundle stamp and seed one metadata-only
-    # image that this backend can restore without OCI materialization.
+    # ProcessBackend reads bundles directly from the staged host directory.
+    # An embedding dev image may advertise metadata-only image digests that it
+    # seeds through its own bootstrap hook.
     coord_env['ENGRAM_BUNDLE_DIR'] = os.path.abspath('var/bundles')
-    coord_env['ENGRAM_PROCESS_DEV_BOOTSTRAP'] = '1'
+    coord_env['ENGRAM_PROCESS_READY_IMAGE_DIGESTS'] = env_or('ENGRAM_PROCESS_READY_IMAGE_DIGESTS', '')
 
 if fc_colima_profile:
     # ADR 0082: the fc-dev VM has a ~19 GiB rootfs, smaller than the
@@ -1002,10 +1002,9 @@ orchestrator_env = {
     # so live scenario A/C verification works against the local stack.
     'ENGRAM_DEV_TOOLS': '1',
 }
-if sandbox_backend == 'process':
-    # The nested dev-engrams stack gets one documented local-only login. The
-    # seed resource still enforces the role directly for pre-existing rows.
-    orchestrator_env['ORCHESTRATOR_ADMIN_EMAILS'] = 'dev@engrams.local'
+admin_emails = env_or('ORCHESTRATOR_ADMIN_EMAILS', '')
+if admin_emails:
+    orchestrator_env['ORCHESTRATOR_ADMIN_EMAILS'] = admin_emails
 
 skip_web = env_or('ENGRAM_SKIP_WEB', '') in ('1', 'true', 'yes')
 
@@ -1059,19 +1058,13 @@ local_resource('dev-api-key',
     resource_deps=['orchestrator-migrate'],
     labels=['setup'])
 
-if sandbox_backend == 'process':
-    # Seed the browser user and one profile per built-in harness only after
-    # Better Auth is listening. The profiles reference the metadata-only image
-    # that the coordinator seeds before its own readiness probe passes.
+process_bootstrap_command = env_or('ENGRAM_PROCESS_BOOTSTRAP_COMMAND', '')
+if sandbox_backend == 'process' and process_bootstrap_command:
+    # Embedding images may install a local-only bootstrap command. Keep all
+    # deployment-specific users, credentials, images, and profiles outside the
+    # OSS tree. Run it only after Better Auth and the coordinator are ready.
     local_resource('process-dev-bootstrap',
-        cmd=(
-            'cd orchestrator && ' +
-            'ORCHESTRATOR_DATABASE_URL=' + orchestrator_db_url + ' ' +
-            'ORCHESTRATOR_URL=http://127.0.0.1:8787 ' +
-            'ORCHESTRATOR_PUBLIC_URL=http://localhost:5173 ' +
-            'bun scripts/seed-process-dev.ts'
-        ),
-        deps=['orchestrator/scripts/seed-process-dev.ts'],
+        cmd=process_bootstrap_command,
         resource_deps=['orchestrator'],
         labels=['setup'])
 
@@ -1092,7 +1085,7 @@ if sandbox_backend == 'process':
 
 if not skip_web:
     web_resource_deps = ['orchestrator']
-    if sandbox_backend == 'process':
+    if sandbox_backend == 'process' and process_bootstrap_command:
         web_resource_deps.append('process-dev-bootstrap')
     local_resource('web',
         serve_cmd='cd web && pnpm install --silent && pnpm dev --strictPort',
