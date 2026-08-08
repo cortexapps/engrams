@@ -30,8 +30,10 @@ layer: how to build, test, and the conventions we hold.
   (run at Tilt parse time) symlinks `var/shared` + `var/bundles` to the primary
   checkout's — no per-worktree re-bake, no broken sealed keys.
 - `just check` — **the pre-commit gate**: `cargo fmt --check`, `cargo clippy -D warnings`,
-  `cargo hakari verify`, `cargo nextest run --workspace`. Run before every commit; CI
-  enforces the same. (After adding/removing workspace deps, run `just hakari`.)
+  `cargo hakari generate --diff`, `cargo nextest run --workspace`. Run before every commit;
+  CI enforces the same. (After adding/removing workspace deps, run `just hakari`.)
+  **`workspace-hack/Cargo.toml` is generated** — never hand-edit it and never bump a
+  version inside it; `generate --diff` fails unless it matches `cargo hakari generate`.
 - `just test [args]` / `cargo nextest run -p <crate>` — fast inner-loop tests.
 - `just vz-codesign` / `just vz-test` — macOS VZ tests (need the virtualization entitlement).
 - `just bake-demo`, `just integration-test`, `just integration-session` — local stack smokes.
