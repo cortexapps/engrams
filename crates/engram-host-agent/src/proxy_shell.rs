@@ -357,13 +357,73 @@ mod tests {
     /// dial_ip → ws://{dial_ip}:{port}/ws connect + handshake +
     /// pump path. Doubles as the cold-path regression for the
     /// connection-refused retry.
+    ///
+    /// The fake ttyd answers the handshake by hand so it can **echo the `tty`
+    /// subprotocol**. tungstenite 0.24 validates the negotiation that 0.21
+    /// ignored: a client that offered `Sec-WebSocket-Protocol` and gets a
+    /// response without one fails with `SubProtocol error: Server sent no
+    /// subprotocol`. Real ttyd echoes it, so the 0.21 server here was the
+    /// unrealistic side of the pair.
+    ///
+    /// Written out rather than using `accept_hdr_async` because that callback
+    /// must return `Result<Response, ErrorResponse>`, and `ErrorResponse` is
+    /// 136 bytes — `clippy::result_large_err` (denied workspace-wide) rejects
+    /// it, and the type belongs to the library so it cannot be boxed. Spelling
+    /// the 101 out is also the clearer fake: it shows exactly what ttyd sends
+    /// back, which is what this test is about.
     #[tokio::test]
     async fn open_shell_tunnel_at_connects_and_round_trips() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (offered_tx, offered_rx) = tokio::sync::oneshot::channel();
         let _server = tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(sock).await.unwrap();
+            let (mut sock, _) = listener.accept().await.unwrap();
+
+            // Read the client handshake up to the header terminator.
+            let mut req = Vec::new();
+            let mut byte = [0u8; 1];
+            while !req.ends_with(b"\r\n\r\n") {
+                if sock.read_exact(&mut byte).await.is_err() {
+                    break;
+                }
+                req.push(byte[0]);
+            }
+            // Header NAMES are case-insensitive; the values are not — the
+            // base64 key must come back byte-for-byte or the client rejects
+            // the derived Sec-WebSocket-Accept.
+            let req = String::from_utf8_lossy(&req).into_owned();
+            let header = |name: &str| {
+                req.lines().find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case(name)
+                        .then(|| v.trim().to_owned())
+                })
+            };
+            let key = header("sec-websocket-key").expect("client must send a websocket key");
+            let offered = header("sec-websocket-protocol");
+            let _ = offered_tx.send(offered.clone());
+
+            // Mirror ttyd: 101 confirming the subprotocol the client asked for.
+            let mut resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+                 Connection: Upgrade\r\n\
+                 Upgrade: websocket\r\n\
+                 Sec-WebSocket-Accept: {}\r\n",
+                derive_accept_key(key.as_bytes())
+            );
+            if let Some(proto) = &offered {
+                resp.push_str(&format!("Sec-WebSocket-Protocol: {proto}\r\n"));
+            }
+            resp.push_str("\r\n");
+            sock.write_all(resp.as_bytes()).await.unwrap();
+
+            let mut ws =
+                tokio_tungstenite::WebSocketStream::from_raw_socket(sock, Role::Server, None).await;
             use futures::SinkExt;
             use futures::StreamExt;
             use tokio_tungstenite::tungstenite::Message;
@@ -377,6 +437,15 @@ mod tests {
         open_shell_tunnel_at(addr.ip().to_string(), addr.port(), ends)
             .await
             .expect("open tunnel");
+
+        // The cold path must keep OFFERING the subprotocol ttyd requires.
+        // Without this the test could be made green by dropping the header
+        // from the request, which is the one fix that would break real ttyd.
+        assert_eq!(
+            offered_rx.await.unwrap().as_deref(),
+            Some("tty"),
+            "cold dial must offer the `tty` subprotocol"
+        );
 
         let ShellTunnel {
             outbound,
