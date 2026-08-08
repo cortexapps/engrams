@@ -42,6 +42,8 @@ import {
 } from "@/components/session-thread/buildMessages";
 import { useSessionStatus } from "@/components/session-thread/session-status";
 import { useComposerActions } from "@/components/session-thread/composer-actions";
+import { UploadTray } from "@/components/session-files/UploadTray";
+import { UploadPathText } from "@/components/session-files/UploadPathText";
 import { isSubmitKey, useEnterToSend } from "@/hooks/useEnterToSend";
 import { ModeChip } from "@/components/ModeChip";
 import type { SessionState } from "@/lib/types";
@@ -274,7 +276,7 @@ const UserMessage: FC = () => {
       className="animate-in fade-in slide-in-from-bottom-1 flex justify-end duration-150"
     >
       <div className="max-w-[80%] rounded-2xl bg-muted px-4 py-2.5 text-foreground wrap-break-word">
-        <MessagePrimitive.Parts />
+        <MessagePrimitive.Parts components={{ Text: UploadPathText }} />
       </div>
     </MessagePrimitive.Root>
   );
@@ -360,12 +362,17 @@ const Composer: FC = () => {
     mode,
     setMode,
     planPending,
+    uploads,
+    addFiles,
+    addCanonicalPath,
+    removeUpload,
+    retryUpload,
   } = useComposerActions();
   const planMode = mode === "plan";
   const isRunning = useAuiState((s) => s.thread.isRunning);
   const composer = useAui().composer;
   const text = useAuiState((s) => s.composer.text);
-  const isEmpty = text.trim().length === 0;
+  const isEmpty = text.trim().length === 0 && uploads.length === 0;
   // Slack-style toggle: when on, plain ↵ sends and ⇧↵ is the newline. See
   // useEnterToSend + the composer settings toggle in ProfilePanel.
   const [enterToSend] = useEnterToSend();
@@ -389,9 +396,25 @@ const Composer: FC = () => {
   const hintLine = hints.length ? hints.join(" · ") : hint;
 
   return (
-    <ComposerPrimitive.Root className="relative flex w-full flex-col gap-1.5">
+    <ComposerPrimitive.Root
+      className="relative flex w-full flex-col gap-1.5"
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={(event) => {
+        event.preventDefault();
+        if (event.dataTransfer.files.length > 0) addFiles(event.dataTransfer.files);
+      }}
+    >
       <QueuedRail items={queued} onRemove={removeQueued} />
-      <div className="flex w-full items-end gap-2 rounded-2xl border bg-background p-2 transition-shadow focus-within:ring-2 focus-within:ring-ring/20">
+      <div className="flex w-full flex-wrap items-end gap-2 rounded-2xl border bg-background p-2 transition-shadow focus-within:ring-2 focus-within:ring-ring/20">
+        <div className="w-full">
+          <UploadTray
+            tokens={uploads}
+            onFiles={addFiles}
+            onRemove={removeUpload}
+            onRetry={(id) => void retryUpload(id)}
+            disabled={sendBlocked}
+          />
+        </div>
         <ComposerPrimitive.Input
           // Default (Enter-to-send on, like Claude desktop): plain ↵ submits,
           // ⇧↵ is the newline. With the preference off it reverts to the
@@ -414,11 +437,15 @@ const Composer: FC = () => {
           className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground/80"
           rows={1}
           aria-label="Message input"
+          onPaste={(event) => {
+            const value = event.clipboardData.getData("text/plain").trim();
+            if (addCanonicalPath(value)) event.preventDefault();
+          }}
           onKeyDown={(e) => {
             if (isSubmitKey(e, enterToSend)) {
               e.preventDefault();
               const t = text.trim();
-              if (t && !sendBlocked) {
+              if ((t || uploads.length > 0) && !sendBlocked) {
                 submit(t);
                 composer.setText("");
               }
@@ -464,11 +491,11 @@ const Composer: FC = () => {
 };
 
 const ComposerAction: FC = () => {
-  const { submit, interrupt, sendBlocked } = useComposerActions();
+  const { submit, interrupt, sendBlocked, uploads } = useComposerActions();
   const isRunning = useAuiState((s) => s.thread.isRunning);
   const composer = useAui().composer;
   const text = useAuiState((s) => s.composer.text);
-  const isEmpty = text.trim().length === 0;
+  const isEmpty = text.trim().length === 0 && uploads.length === 0;
   const [enterToSend] = useEnterToSend();
   // The button mirrors the active send chord: ↵ on its own vs ⌘↵.
   const sendChord = enterToSend ? "↵" : "⌘↵";

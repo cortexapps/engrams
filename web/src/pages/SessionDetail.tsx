@@ -7,11 +7,12 @@ import { useSessionEvents } from "../hooks/useSessionEvents";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { StatusGlyph } from "../components/Glyph";
 import { SessionThread } from "../components/session-thread/SessionThread";
+import { ChildTaskTree } from "../components/session-thread/ChildTaskTree";
 import { TitleEditForm } from "./sessions/TitleEditForm";
 import { DeleteSessionButton } from "./sessions/DeleteSessionButton";
 import { WorkPane, type PaneTabId } from "../components/WorkPane";
 import { shortId, statusLabel } from "./sessions/session-format";
-import { useTasks } from "../hooks/useTasks";
+import { useTask, useTasks } from "../hooks/useTasks";
 import { useIsMobile } from "../hooks/use-mobile";
 import { useIsAdmin } from "../auth/AuthProvider";
 import {
@@ -117,6 +118,7 @@ export function SessionDetail() {
   const task = tasksData?.tasks.find((t) => t.sessions.some((r) => r.sessionId === id));
   // Synthetic `unattributed-*` admin rows have no real task and can't be renamed.
   const taskId = task && !task.id.startsWith("unattributed-") ? task.id : null;
+  const { data: taskDetails } = useTask(task?.parentTaskId ? null : taskId);
   const taskTitle = task?.title ?? null;
   const titleIsCustom = task?.titleIsCustom ?? false;
   const [editingTitle, setEditingTitle] = useState(false);
@@ -365,6 +367,7 @@ export function SessionDetail() {
   const leftColumn = (
     <div className="work-sheet flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-xl border bg-background">
       {masthead}
+      <ChildTaskTree descendants={taskDetails?.descendants ?? []} />
       <div className="min-h-0 flex-1 overflow-hidden">{transcript}</div>
     </div>
   );

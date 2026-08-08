@@ -23,6 +23,7 @@ prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
 # The generated code references tonic_prost::ProstCodec (tonic 0.14
 # moved the prost codec out of the core crate).

@@ -18,11 +18,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bytes::Bytes;
 use engram_agentd::exec_journal::ExecJournal;
 use engram_agentd::{serve_connection_with_journal, HarnessSupervisor};
 use engram_core::types::ids::SandboxId;
-use engram_core::types::sandbox::{ExecRequest, WriteFileSpec};
+use engram_core::types::sandbox::{ExecRequest, SessionFileSpec, SessionFileStream, WriteFileSpec};
 use engram_sandbox_firecracker::FirecrackerBackend;
+use futures::{stream, StreamExt};
+use sha2::{Digest, Sha256};
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
@@ -128,6 +131,47 @@ async fn write_files_via_agent_socket_reports_each_file_result() {
     assert!(results[1].ok, "second write failed: {:?}", results[1]);
     assert_eq!(tokio::fs::read(&written).await.unwrap(), b"staged");
 
+    agent.abort();
+}
+
+#[tokio::test]
+async fn session_file_stream_exceeds_old_unary_limit_and_round_trips_exactly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("agent.sock");
+    let agent = spawn_test_agent(socket.clone()).await;
+    let destination = dir.path().join("large-upload.bin");
+    let path = destination.to_string_lossy().into_owned();
+    let expected = vec![0xa5; 3 * 1024 * 1024 + 1];
+    let sha256 = Sha256::digest(&expected)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let chunks = expected
+        .chunks(64 * 1024)
+        .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+        .collect::<Vec<_>>();
+    FirecrackerBackend::upload_file_via_agent_socket(
+        &socket,
+        SessionFileSpec {
+            path: path.clone(),
+            size_bytes: expected.len() as u64,
+            sha256: sha256.clone(),
+        },
+        Box::pin(stream::iter(chunks)) as SessionFileStream,
+    )
+    .await
+    .expect("stream upload");
+
+    let (metadata, mut stream) = FirecrackerBackend::read_file_via_agent_socket(&socket, path)
+        .await
+        .expect("stream read");
+    let mut actual = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        actual.extend_from_slice(&chunk.expect("read chunk"));
+    }
+    assert_eq!(metadata.size_bytes, expected.len() as u64);
+    assert_eq!(metadata.sha256, sha256);
+    assert_eq!(actual, expected);
     agent.abort();
 }
 

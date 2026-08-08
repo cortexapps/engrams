@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use engram_agentd::proto::{
     AgentReady, SpawnHarnessRequest, WireDownloadResponse, WireExecEvent, WireExecRequest,
-    WireHandshake, WireHandshakeAck, WireRequest, WireResponse, WireStatResponse,
+    WireFileChunk, WireHandshake, WireHandshakeAck, WireRequest, WireResponse, WireStatResponse,
 };
 use proptest::prelude::*;
 
@@ -131,6 +131,14 @@ pub fn wire_request() -> impl Strategy<Value = WireRequest> {
         Just(WireRequest::StopIde),
         any::<i64>().prop_map(|unix_nanos| WireRequest::StepClock { unix_nanos }),
         s().prop_map(|exec_id| WireRequest::CancelExec { exec_id }),
+        (s(), any::<u64>(), s()).prop_map(|(path, size_bytes, sha256)| {
+            WireRequest::UploadStream {
+                path,
+                size_bytes,
+                sha256,
+            }
+        }),
+        s().prop_map(|path| WireRequest::DownloadStream { path }),
     ]
 }
 
@@ -177,7 +185,17 @@ pub fn wire_response() -> impl Strategy<Value = WireResponse> {
             }
         }),
         Just(WireResponse::ExecCancelled),
+        (any::<u64>(), s()).prop_map(|(size_bytes, sha256)| {
+            WireResponse::UploadStreamOk { size_bytes, sha256 }
+        }),
+        (any::<u64>(), s()).prop_map(|(size_bytes, sha256)| {
+            WireResponse::DownloadStreamReady { size_bytes, sha256 }
+        }),
     ]
+}
+
+pub fn wire_file_chunk() -> impl Strategy<Value = WireFileChunk> {
+    small_bytes().prop_map(|bytes| WireFileChunk { bytes })
 }
 
 pub fn wire_handshake() -> impl Strategy<Value = WireHandshake> {
@@ -235,6 +253,8 @@ fn _exhaustiveness_wire_request(r: &WireRequest) {
         WireRequest::StopIde => {}
         WireRequest::StepClock { .. } => {}
         WireRequest::CancelExec { .. } => {}
+        WireRequest::UploadStream { .. } => {}
+        WireRequest::DownloadStream { .. } => {}
     }
 }
 
@@ -257,6 +277,8 @@ fn _exhaustiveness_wire_response(r: &WireResponse) {
         WireResponse::IdeStopped => {}
         WireResponse::ClockStepped { .. } => {}
         WireResponse::ExecCancelled => {}
+        WireResponse::UploadStreamOk { .. } => {}
+        WireResponse::DownloadStreamReady { .. } => {}
     }
 }
 

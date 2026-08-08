@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 bincode.workspace = true
+bytes.workspace = true
 # Guest clock discipline: step CLOCK_REALTIME to the host KVM PTP clock
 # (/dev/ptp0) after snapshot/restore (see `clock`). Safe API — no unsafe.
 clock-steering.workspace = true
@@ -26,6 +27,7 @@ engram-transport.workspace = true
 # SessionId for the in-guest `forge-*` client subcommands.
 engram-harness-proto.workspace = true
 engram-core.workspace = true
+futures.workspace = true
 # ADR 0027: activate RO skill/browser bundles into the harness discovery paths.
 engram-session-bundles.workspace = true
 serde.workspace = true
@@ -35,6 +37,8 @@ serde_json.workspace = true
 # was getting it only through feature unification, which is why the
 # otel 0.32 graph change made it disappear.
 tokio = { workspace = true, features = ["io-std"] }
+sha2.workspace = true
+tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 engram-telemetry.workspace = true

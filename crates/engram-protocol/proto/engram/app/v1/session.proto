@@ -41,6 +41,11 @@ service SessionService {
   // ADR 0100: stage a batch of files inside a running session without
   // embedding content in a shell command. Each file reports its own result.
   rpc WriteFiles(WriteFilesRequest) returns (WriteFilesResponse);
+  // ADR 0113: bounded-memory session file transfer. The orchestrator serves
+  // these through dedicated authenticated HTTP routes.
+  rpc UploadFile(stream UploadFileRequest) returns (UploadFileResponse);
+  rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
+  rpc CopyFiles(CopyFilesRequest) returns (CopyFilesResponse);
   rpc GetLog(GetLogRequest) returns (GetLogResponse);
   rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
   // ADR 0065: bring up the ephemeral in-guest browser stack (x11vnc + headful
@@ -403,6 +408,63 @@ message WriteFileResult {
 
 message WriteFilesResponse {
   repeated WriteFileResult results = 1;
+}
+
+message UploadFileMetadata {
+  string session_id = 1;
+  string upload_id = 2;
+  string file_name = 3;
+  uint64 size_bytes = 4;
+  // Lower-case hexadecimal SHA-256 digest.
+  string sha256 = 5;
+}
+
+message UploadFileRequest {
+  oneof frame {
+    UploadFileMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message UploadFileResponse {
+  string path = 1;
+  uint64 size_bytes = 2;
+  string sha256 = 3;
+}
+
+message ReadFileRequest {
+  string session_id = 1;
+  string path = 2;
+}
+
+message ReadFileMetadata {
+  string path = 1;
+  uint64 size_bytes = 2;
+  string sha256 = 3;
+  string file_name = 4;
+}
+
+message ReadFileResponse {
+  oneof frame {
+    ReadFileMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message CopyFilesRequest {
+  string source_session_id = 1;
+  string target_session_id = 2;
+  repeated string paths = 3;
+}
+
+message CopyFileResult {
+  string path = 1;
+  uint64 size_bytes = 2;
+  string sha256 = 3;
+}
+
+message CopyFilesResponse {
+  repeated CopyFileResult files = 1;
 }
 
 // engram_core::types::ExecEvent is authoritative for the stream body:

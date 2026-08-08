@@ -25,8 +25,8 @@ use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::SandboxProbe;
 use engram_core::types::sandbox::{
-    AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec, WriteFileResult,
-    WriteFileSpec,
+    AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec, SessionFileMetadata,
+    SessionFileSpec, SessionFileStream, WriteFileResult, WriteFileSpec,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
@@ -1349,6 +1349,41 @@ impl SandboxBackend for VzBackend {
             results.push(result);
         }
         Ok(results)
+    }
+
+    async fn upload_file(
+        &self,
+        id: SandboxId,
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        let agent_uds = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            port_uds_path(&live.vsock_uds_path, ENGRAM_AGENTD_PORT)
+        };
+        let connection = UnixStream::connect(&agent_uds).await.map_err(|error| {
+            SandboxError::Vm(
+                format!("connect engram-agentd UDS {}: {error}", agent_uds.display()).into(),
+            )
+        })?;
+        engram_agentd::file_transfer::upload_file(connection, spec, bytes).await
+    }
+
+    async fn read_file(
+        &self,
+        id: SandboxId,
+        path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        let agent_uds = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            port_uds_path(&live.vsock_uds_path, ENGRAM_AGENTD_PORT)
+        };
+        let connection = UnixStream::connect(&agent_uds).await.map_err(|error| {
+            SandboxError::Vm(
+                format!("connect engram-agentd UDS {}: {error}", agent_uds.display()).into(),
+            )
+        })?;
+        engram_agentd::file_transfer::read_file(connection, path).await
     }
 
     /// ADR 0066 Phase 2: dial the in-guest agentd relay on `port` (the

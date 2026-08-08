@@ -14,7 +14,7 @@
 
 use engram_agentd::proto::{
     AgentReady, SpawnHarnessRequest, WireDownloadResponse, WireExecEvent, WireExecRequest,
-    WireHandshake, WireHandshakeAck, WireRequest, WireResponse, WireStatResponse,
+    WireFileChunk, WireHandshake, WireHandshakeAck, WireRequest, WireResponse, WireStatResponse,
 };
 use proptest::prelude::*;
 
@@ -86,3 +86,8 @@ roundtrip!(
     support::wire_handshake_ack()
 );
 roundtrip!(agent_ready_roundtrips, AgentReady, support::agent_ready());
+roundtrip!(
+    wire_file_chunk_roundtrips,
+    WireFileChunk,
+    support::wire_file_chunk()
+);

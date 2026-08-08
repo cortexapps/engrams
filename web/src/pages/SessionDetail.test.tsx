@@ -16,6 +16,7 @@ vi.mock("../hooks/useSessions", () => ({
 }));
 vi.mock("../hooks/useTasks", () => ({
   useTasks: () => ({ data: { tasks: testState.tasks } }),
+  useTask: () => ({ data: undefined }),
 }));
 vi.mock("../hooks/useSessionEvents", () => ({
   useSessionEvents: () => ({ events: [], streamingText: "" }),

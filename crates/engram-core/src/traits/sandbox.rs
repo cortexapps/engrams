@@ -15,7 +15,7 @@ use crate::types::ids::SandboxId;
 use crate::types::image::WarmConfig;
 use crate::types::sandbox::{
     AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
-    WriteFileResult, WriteFileSpec,
+    SessionFileMetadata, SessionFileSpec, SessionFileStream, WriteFileResult, WriteFileSpec,
 };
 use crate::types::snapshot::SnapshotMetadata;
 
@@ -314,6 +314,30 @@ pub trait SandboxBackend: Send + Sync {
     ) -> Result<Vec<WriteFileResult>, SandboxError> {
         Err(SandboxError::Unsupported(
             "this backend doesn't support `write_files` yet".into(),
+        ))
+    }
+
+    /// Stream one file into the sandbox and publish it atomically after its
+    /// declared length and SHA-256 match (ADR 0113).
+    async fn upload_file(
+        &self,
+        _id: SandboxId,
+        _spec: SessionFileSpec,
+        _bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        Err(SandboxError::Unsupported(
+            "this backend doesn't support `upload_file` yet".into(),
+        ))
+    }
+
+    /// Open one verified session file as a bounded-memory byte stream.
+    async fn read_file(
+        &self,
+        _id: SandboxId,
+        _path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        Err(SandboxError::Unsupported(
+            "this backend doesn't support `read_file` yet".into(),
         ))
     }
 

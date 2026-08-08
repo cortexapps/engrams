@@ -19,6 +19,8 @@ import { SessionStatusContext } from "./session-status";
 import { ComposerActionsContext, type InterruptSource } from "./composer-actions";
 import { QuestionActionsContext } from "./question-actions";
 import type { IndexedEvent, SessionState } from "../../lib/types";
+import { serializeComposer, useSessionUploads } from "../session-files/useSessionUploads";
+import { SessionFileContext } from "../session-files/UploadPathText";
 
 // The transcript tab, on assistant-ui. The session's SSE event stream is the
 // single source of truth: `buildMessages` reduces it to the assistant-ui
@@ -66,6 +68,7 @@ export function SessionThread({
   status,
   streamingText = "",
 }: SessionThreadProps) {
+  const uploads = useSessionUploads(sessionId);
   const {
     messages: serverMessages,
     isRunning,
@@ -217,7 +220,8 @@ export function SessionThread({
   // mutation response before SSE delivery. On failure the card returns to its form.
   const [answeredToolCallIds, setAnsweredToolCallIds] = useState<Set<string>>(new Set());
 
-  const sendBlocked = status ? SEND_BLOCKED.has(status) : false;
+  const sessionSendBlocked = status ? SEND_BLOCKED.has(status) : false;
+  const sendBlocked = sessionSendBlocked || !uploads.ready;
 
   // ADR 0107: the generic deferred-tool completion — questions and plan
   // decisions ride the same CompleteToolCall + optimistic set.
@@ -280,7 +284,7 @@ export function SessionThread({
 
   const submit = useCallback(
     (raw: string) => {
-      const text = raw.trim();
+      const text = serializeComposer(raw, uploads.tokens);
       if (!text) return;
       const promptId = crypto.randomUUID();
       // `queued` is the client's optimistic guess (was a run in flight when we
@@ -293,13 +297,14 @@ export function SessionThread({
       setModeOverride(null);
       sendPromptMutation
         .mutateAsync({ sessionId, text, promptId, ...(harnessMode ? { harnessMode } : {}) })
+        .then(() => uploads.clear())
         .catch((err) => {
           // Send failed: drop the optimistic entry so it isn't stuck.
           setPending((p) => p.filter((e) => e.promptId !== promptId));
           console.warn("sendPrompt failed", err);
         });
     },
-    [sessionId, sendPromptMutation, isRunning, modeOverride, currentMode],
+    [sessionId, sendPromptMutation, isRunning, modeOverride, currentMode, uploads],
   );
 
   // Cancel a specific queued message (the rail's × button): dequeue it server-
@@ -358,31 +363,38 @@ export function SessionThread({
   });
 
   return (
-    <AssistantRuntimeProvider runtime={runtime}>
-      <SessionStatusContext.Provider value={status}>
-        <ComposerActionsContext.Provider
-          value={{
-            submit,
-            interrupt,
-            sendBlocked,
-            canRecall: queue.length > 0,
-            recall: recallQueued,
-            queued: railItems,
-            removeQueued,
-            mode: composerMode,
-            setMode,
-            planPending: pendingPlan != null,
-          }}
-        >
-          <QuestionActionsContext.Provider
-            value={{ submitAnswer, completeTool, answeredToolCallIds, sendBlocked }}
+    <SessionFileContext.Provider value={sessionId}>
+      <AssistantRuntimeProvider runtime={runtime}>
+        <SessionStatusContext.Provider value={status}>
+          <ComposerActionsContext.Provider
+            value={{
+              submit,
+              interrupt,
+              sendBlocked,
+              canRecall: queue.length > 0,
+              recall: recallQueued,
+              queued: railItems,
+              removeQueued,
+              mode: composerMode,
+              setMode,
+              planPending: pendingPlan != null,
+              uploads: uploads.tokens,
+              addFiles: uploads.addFiles,
+              addCanonicalPath: uploads.addCanonicalPath,
+              removeUpload: uploads.remove,
+              retryUpload: uploads.retry,
+            }}
           >
-            <TooltipProvider>
-              <Thread />
-            </TooltipProvider>
-          </QuestionActionsContext.Provider>
-        </ComposerActionsContext.Provider>
-      </SessionStatusContext.Provider>
-    </AssistantRuntimeProvider>
+            <QuestionActionsContext.Provider
+              value={{ submitAnswer, completeTool, answeredToolCallIds, sendBlocked }}
+            >
+              <TooltipProvider>
+                <Thread />
+              </TooltipProvider>
+            </QuestionActionsContext.Provider>
+          </ComposerActionsContext.Provider>
+        </SessionStatusContext.Provider>
+      </AssistantRuntimeProvider>
+    </SessionFileContext.Provider>
   );
 }

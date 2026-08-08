@@ -727,6 +727,12 @@ function listTaskRow(
     harness: null,
     model: null,
     effort: null,
+    parentTaskId: null,
+    rootTaskId: id,
+    localTaskName: null,
+    canonicalTaskName: null,
+    spawningSessionId: null,
+    launchPolicy: null,
     createdAt: at,
     updatedAt: at,
   };

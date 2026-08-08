@@ -8,6 +8,8 @@
  *   - TaskService            native implementation (Task 19)
  *   - StreamEvents           dedicated Hono SSE route (Task 20)
  *   - GetArtifact            dedicated Hono byte-streaming route (Task 20)
+ *   - UploadFile / ReadFile / CopyFiles
+ *                            dedicated authenticated routes (ADR 0113)
  *
  * SessionService.StreamEvents and SessionService.GetArtifact are excluded
  * from the SessionService forwarding list — their filtering is applied here
@@ -27,6 +29,9 @@ import type { PassthroughSpec } from "./passthrough.ts";
 const SESSION_EXCLUDED: ReadonlySet<string> = new Set([
   "StreamEvents", // Hono SSE route (Task 20)
   "GetArtifact",  // Hono byte-stream route (Task 20)
+  "UploadFile", // Hono upload route (ADR 0113)
+  "ReadFile", // Hono download route (ADR 0113)
+  "CopyFiles", // server-only coordination primitive (ADR 0113)
 ]);
 
 /**

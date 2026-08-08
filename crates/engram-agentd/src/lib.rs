@@ -18,6 +18,7 @@ pub mod browser;
 pub mod cacerts;
 pub mod clock;
 pub mod exec_journal;
+pub mod file_transfer;
 pub mod forge;
 pub mod handler;
 pub mod harness_supervisor;

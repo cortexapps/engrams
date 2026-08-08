@@ -887,6 +887,7 @@ jobs:
             --test reattach_detach \
             --test snapshot \
             --test snapshot_uffd \
+            --test exec \
             --test exec_real_vm \
             --test agentd_bundle_reexec \
             --test materialize_boot \

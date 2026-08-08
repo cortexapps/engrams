@@ -195,6 +195,9 @@ service HostService {
   // ADR 0100: write a batch of files through the existing in-guest agentd
   // Upload verb. Per-file failures are carried in the response payload.
   rpc WriteFiles(WriteFilesRequest) returns (WriteFilesResponse);
+  // ADR 0113: bounded-memory session file transfer.
+  rpc UploadFile(stream HostUploadFileRequest) returns (HostUploadFileResponse);
+  rpc ReadFile(HostReadFileRequest) returns (stream HostReadFileResponse);
 
   // ---- streaming ----
   rpc ExecStart(ExecStartRequest) returns (stream ExecFrame);
@@ -727,6 +730,44 @@ message WriteFilesRequest {
 message WriteFilesResponse {
   // bincode-encoded `engram_protocol::wire::WireWriteFilesResponse`.
   bytes response_bincode = 1;
+}
+
+message HostUploadFileMetadata {
+  bytes sandbox_id = 1; // 16-byte UUID
+  string path = 2;
+  uint64 size_bytes = 3;
+  string sha256 = 4;
+}
+
+message HostUploadFileRequest {
+  oneof frame {
+    HostUploadFileMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message HostUploadFileResponse {
+  string path = 1;
+  uint64 size_bytes = 2;
+  string sha256 = 3;
+}
+
+message HostReadFileRequest {
+  bytes sandbox_id = 1; // 16-byte UUID
+  string path = 2;
+}
+
+message HostReadFileMetadata {
+  string path = 1;
+  uint64 size_bytes = 2;
+  string sha256 = 3;
+}
+
+message HostReadFileResponse {
+  oneof frame {
+    HostReadFileMetadata metadata = 1;
+    bytes chunk = 2;
+  }
 }
 
 // --- ExecStart (server-streaming) ---

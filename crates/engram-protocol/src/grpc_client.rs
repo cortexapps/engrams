@@ -18,7 +18,7 @@ use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
-    WriteFileResult, WriteFileSpec,
+    SessionFileMetadata, SessionFileSpec, SessionFileStream, WriteFileResult, WriteFileSpec,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
@@ -36,13 +36,13 @@ use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
     BindHarnessSessionRequest, CancelExecRequest, CreateSandboxRequest,
     DequeueHarnessQueuedPromptRequest, EditHarnessQueuedPromptRequest, Empty, ExecStartRequest,
-    FencedSandboxRequest, GuestIpResponse, InterruptHarnessRequest, MaterializeImageRequest,
-    MigrationExportRef, MigrationFetchRequest, MigrationItem, PeerChunkFrame, PeerChunkGetRequest,
-    ProxyPortData, ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose,
-    ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
-    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    SendHarnessToolResultRequest, StartAgentRequest, UnbindHarnessSessionRequest,
-    WriteFilesRequest,
+    FencedSandboxRequest, GuestIpResponse, HostReadFileRequest, HostUploadFileMetadata,
+    HostUploadFileRequest, InterruptHarnessRequest, MaterializeImageRequest, MigrationExportRef,
+    MigrationFetchRequest, MigrationItem, PeerChunkFrame, PeerChunkGetRequest, ProxyPortData,
+    ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
+    ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText, RestoreBaseForSessionRequest,
+    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, SendHarnessToolResultRequest,
+    StartAgentRequest, UnbindHarnessSessionRequest, WriteFilesRequest,
 };
 
 use crate::wire::{WireExecRequest, WireWriteFilesRequest, WireWriteFilesResponse};
@@ -1207,6 +1207,117 @@ impl GrpcHostClient {
         Ok(wire.into_engine())
     }
 
+    pub async fn upload_file(
+        &self,
+        sandbox_id: SandboxId,
+        spec: SessionFileSpec,
+        mut bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        use futures::StreamExt;
+        let metadata = HostUploadFileRequest {
+            frame: Some(crate::grpc::host_upload_file_request::Frame::Metadata(
+                HostUploadFileMetadata {
+                    sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+                    path: spec.path,
+                    size_bytes: spec.size_bytes,
+                    sha256: spec.sha256,
+                },
+            )),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            if tx.send(metadata).await.is_err() {
+                return;
+            }
+            while let Some(item) = bytes.next().await {
+                match item {
+                    Ok(chunk) => {
+                        if tx
+                            .send(HostUploadFileRequest {
+                                frame: Some(crate::grpc::host_upload_file_request::Frame::Chunk(
+                                    chunk.to_vec(),
+                                )),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "upload source stream failed");
+                        return;
+                    }
+                }
+            }
+        });
+        let response = self
+            .inner
+            .clone()
+            .upload_file(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        Ok(SessionFileMetadata {
+            path: response.path,
+            size_bytes: response.size_bytes,
+            sha256: response.sha256,
+        })
+    }
+
+    pub async fn read_file(
+        &self,
+        sandbox_id: SandboxId,
+        path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        use futures::StreamExt;
+        let mut inbound = self
+            .inner
+            .clone()
+            .read_file(HostReadFileRequest {
+                sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+                path,
+            })
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        let first = inbound
+            .next()
+            .await
+            .ok_or_else(|| SandboxError::Unavailable("read stream ended before metadata".into()))?
+            .map_err(grpc_to_sandbox_err)?;
+        let metadata = match first.frame {
+            Some(crate::grpc::host_read_file_response::Frame::Metadata(metadata)) => {
+                SessionFileMetadata {
+                    path: metadata.path,
+                    size_bytes: metadata.size_bytes,
+                    sha256: metadata.sha256,
+                }
+            }
+            _ => {
+                return Err(SandboxError::Unavailable(
+                    "read stream did not start with metadata".into(),
+                ))
+            }
+        };
+        let body = async_stream::stream! {
+            while let Some(item) = inbound.next().await {
+                match item {
+                    Ok(response) => match response.frame {
+                        Some(crate::grpc::host_read_file_response::Frame::Chunk(chunk)) => {
+                            yield Ok(Bytes::from(chunk));
+                        }
+                        _ => yield Err(SandboxError::Unavailable(
+                            "read stream repeated metadata".into(),
+                        )),
+                    },
+                    Err(error) => yield Err(grpc_to_sandbox_err(error)),
+                }
+            }
+        };
+        Ok((metadata, Box::pin(body)))
+    }
+
     /// ADR 0014 issue #6: open a bidi ProxyShell stream to the host.
     /// Sends the initial frame carrying `sandbox_id`, then returns a
     /// `ShellTunnel` whose channels the caller bridges to the
@@ -1492,6 +1603,23 @@ impl HostClient for GrpcHostClient {
         files: Vec<WriteFileSpec>,
     ) -> Result<Vec<WriteFileResult>, SandboxError> {
         Self::write_files(self, id, files).await
+    }
+
+    async fn upload_file(
+        &self,
+        id: SandboxId,
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        Self::upload_file(self, id, spec, bytes).await
+    }
+
+    async fn read_file(
+        &self,
+        id: SandboxId,
+        path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        Self::read_file(self, id, path).await
     }
 
     async fn snapshot(

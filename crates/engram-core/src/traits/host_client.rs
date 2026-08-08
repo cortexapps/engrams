@@ -28,8 +28,8 @@ use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::port::PortTunnel;
 use crate::types::sandbox::{
-    AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec, WriteFileResult,
-    WriteFileSpec,
+    AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec, SessionFileMetadata,
+    SessionFileSpec, SessionFileStream, WriteFileResult, WriteFileSpec,
 };
 use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
@@ -161,6 +161,27 @@ pub trait HostClient: Send + Sync {
     ) -> Result<Vec<WriteFileResult>, SandboxError> {
         Err(SandboxError::Unsupported(
             "this host doesn't support `write_files` yet".into(),
+        ))
+    }
+
+    async fn upload_file(
+        &self,
+        _id: SandboxId,
+        _spec: SessionFileSpec,
+        _bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        Err(SandboxError::Unsupported(
+            "this host doesn't support `upload_file` yet".into(),
+        ))
+    }
+
+    async fn read_file(
+        &self,
+        _id: SandboxId,
+        _path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        Err(SandboxError::Unsupported(
+            "this host doesn't support `read_file` yet".into(),
         ))
     }
 

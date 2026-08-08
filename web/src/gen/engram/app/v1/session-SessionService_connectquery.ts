@@ -84,6 +84,11 @@ export const cancelExec = SessionService.method.cancelExec;
 export const writeFiles = SessionService.method.writeFiles;
 
 /**
+ * @generated from rpc engram.app.v1.SessionService.CopyFiles
+ */
+export const copyFiles = SessionService.method.copyFiles;
+
+/**
  * @generated from rpc engram.app.v1.SessionService.GetLog
  */
 export const getLog = SessionService.method.getLog;

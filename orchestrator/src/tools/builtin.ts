@@ -1,10 +1,7 @@
 import { z } from "zod";
 import { ConnectError } from "@connectrpc/connect";
 
-import {
-  makeArtifactService,
-  type ArtifactService,
-} from "../artifacts/service.ts";
+import { makeArtifactService, type ArtifactService } from "../artifacts/service.ts";
 import { config } from "../config.ts";
 import { sessions } from "../control-plane/client.ts";
 import {
@@ -16,6 +13,7 @@ import type { ArtifactWithVersions } from "../db/artifacts.ts";
 import { makePapercutStore, type PapercutStore } from "../db/papercuts.ts";
 import { mintRawToken, rawArtifactPath } from "../crypto/raw-token.ts";
 import { tools, type ToolRegistry } from "./registry.ts";
+import { registerCoordinationTools } from "./coordination.ts";
 
 const QuestionOptionSchema = z.object({
   label: z.string(),
@@ -68,17 +66,12 @@ export interface BuiltinToolDeps {
 // call still names the missing field.
 const ArtifactActionSchema = z
   .object({
-    action: z
-      .enum(["publish", "update", "list", "get", "share", "unshare"])
-      .describe("What to do"),
+    action: z.enum(["publish", "update", "list", "get", "share", "unshare"]).describe("What to do"),
     file_path: z
       .string()
       .optional()
       .describe("publish/update: path of the HTML or Markdown file in this session"),
-    artifact_id: z
-      .string()
-      .optional()
-      .describe("update/get/share/unshare: the artifact id"),
+    artifact_id: z.string().optional().describe("update/get/share/unshare: the artifact id"),
     title: z.string().optional().describe("Display title; defaults to the file name"),
     scope: z
       .enum(["mine", "shared"])
@@ -110,7 +103,12 @@ const ArtifactActionSchema = z
       }
     };
     if (v.action === "publish" || v.action === "update") need("file_path");
-    if (v.action === "update" || v.action === "get" || v.action === "share" || v.action === "unshare") {
+    if (
+      v.action === "update" ||
+      v.action === "get" ||
+      v.action === "share" ||
+      v.action === "unshare"
+    ) {
       need("artifact_id");
     }
   });
@@ -180,10 +178,7 @@ function toolArtifact(
 }
 
 /** Register tools that every production session receives. */
-export function registerBuiltinTools(
-  registry: ToolRegistry = tools,
-  deps?: BuiltinToolDeps,
-): void {
+export function registerBuiltinTools(registry: ToolRegistry = tools, deps?: BuiltinToolDeps): void {
   // No claude binding: claude CLI >= 2.1.187 removed the AskUserQuestion
   // built-in from headless `--print` mode, so claude receives this tool
   // through the injected MCP path like any custom harness. The description
@@ -360,9 +355,9 @@ export function registerBuiltinTools(
       "environment quirk you had to work around). One short call, then continue your main task.",
     input: z.object({
       summary: z.string().describe("One-line summary of the friction"),
-      description: z.string().describe(
-        "What was painful, what you tried, and what would have helped",
-      ),
+      description: z
+        .string()
+        .describe("What was painful, what you tried, and what would have helped"),
       category: z.enum(["tooling", "environment", "docs", "workflow", "other"]),
       severity: z.enum(["low", "medium", "high"]).optional(),
       tags: z.array(z.string()).optional(),
@@ -386,4 +381,6 @@ export function registerBuiltinTools(
       return { logged: true, id };
     },
   });
+
+  registerCoordinationTools(registry);
 }

@@ -159,11 +159,21 @@ const fakeConnections = (): IntegrationConnectionStore => {
       return rows.filter((row) => row != null);
     },
     getDefault: async (provider) => store.get(`default-${provider}`),
-    create: async () => { throw new Error("unused"); },
-    update: async () => { throw new Error("unused"); },
-    delete: async () => { throw new Error("unused"); },
-    markTested: async () => { throw new Error("unused"); },
-    setEnabled: async () => { throw new Error("unused"); },
+    create: async () => {
+      throw new Error("unused");
+    },
+    update: async () => {
+      throw new Error("unused");
+    },
+    delete: async () => {
+      throw new Error("unused");
+    },
+    markTested: async () => {
+      throw new Error("unused");
+    },
+    setEnabled: async () => {
+      throw new Error("unused");
+    },
     ensureDefault: async (provider) => (await store.get(`default-${provider}`))!,
   };
   return store;
@@ -306,7 +316,10 @@ describe("compileSessionCreateInput", () => {
       harnessCatalog: {
         listHarnesses: async () => ({
           harnesses: [
-            { name: "claude", descriptor: { auth: { userEnv: "OPENCODE_TOKEN" }, models: [], effort: [] } },
+            {
+              name: "claude",
+              descriptor: { auth: { userEnv: "OPENCODE_TOKEN" }, models: [], effort: [] },
+            },
           ],
         }),
       },
@@ -325,7 +338,11 @@ describe("compileSessionCreateInput", () => {
     // Slack mention email-matched to a real engrams user rides that user's
     // token exactly like the chat UI. (Under the old `type === "chat"` gate,
     // Slack session e721311e booted credential-less — "Not logged in".)
-    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {});
+    const inp = await compileSessionCreateInput(
+      profile({ includeUserTokens: true }),
+      deps("tok"),
+      {},
+    );
     expect(inp.harnessEnv?.[USER_ENV]).toBe("tok");
     const policy = inp.integrationPolicyJson
       ? (JSON.parse(inp.integrationPolicyJson) as { secrets?: Array<{ env_var: string }> })
@@ -365,18 +382,20 @@ describe("compileSessionCreateInput", () => {
       ...deps(null),
       harnessCatalog: {
         listHarnesses: async () => ({
-          harnesses: [{
-            name: "codex",
-            descriptor: {
-              label: "Codex",
-              auth: {
-                userOauth: { provider: "openai-codex", delivery: 1 },
-                orgEnv: "CODEX_API_KEY",
+          harnesses: [
+            {
+              name: "codex",
+              descriptor: {
+                label: "Codex",
+                auth: {
+                  userOauth: { provider: "openai-codex", delivery: 1 },
+                  orgEnv: "CODEX_API_KEY",
+                },
+                models: [],
+                effort: [],
               },
-              models: [],
-              effort: [],
             },
-          }],
+          ],
         }),
       },
       hasOAuthCredential: async (provider) => provider === "openai-codex",
@@ -399,18 +418,20 @@ describe("compileSessionCreateInput", () => {
       ...deps(null),
       harnessCatalog: {
         listHarnesses: async () => ({
-          harnesses: [{
-            name: "codex",
-            descriptor: {
-              label: "Codex",
-              auth: {
-                userOauth: { provider: "openai-codex", delivery: 1 },
-                orgEnv: "CODEX_API_KEY",
+          harnesses: [
+            {
+              name: "codex",
+              descriptor: {
+                label: "Codex",
+                auth: {
+                  userOauth: { provider: "openai-codex", delivery: 1 },
+                  orgEnv: "CODEX_API_KEY",
+                },
+                models: [],
+                effort: [],
               },
-              models: [],
-              effort: [],
             },
-          }],
+          ],
         }),
       },
       hasOAuthCredential: async () => false,
@@ -423,11 +444,9 @@ describe("compileSessionCreateInput", () => {
       compileSessionCreateInput(profile({ harness: "codex" }), codexDeps),
     ).rejects.toThrow(/Settings → Credentials/);
 
-    const serviceInput = await compileSessionCreateInput(
-      profile({ harness: "codex" }),
-      codexDeps,
-      { programmatic: true },
-    );
+    const serviceInput = await compileSessionCreateInput(profile({ harness: "codex" }), codexDeps, {
+      programmatic: true,
+    });
     expect(serviceInput.oauthCredential).toBeUndefined();
     const policy = JSON.parse(serviceInput.integrationPolicyJson!) as {
       secrets?: Array<{ env_var: string }>;
@@ -441,7 +460,9 @@ describe("compileSessionCreateInput", () => {
   });
 
   test("throws if the profile image is no longer enabled", async () => {
-    await expect(compileSessionCreateInput(profile(), deps(null, []))).rejects.toThrow(/no longer enabled/);
+    await expect(compileSessionCreateInput(profile(), deps(null, []))).rejects.toThrow(
+      /no longer enabled/,
+    );
   });
 
   // ADR 0063 B2: harness / model / effort resolution + env mapping.
@@ -455,13 +476,18 @@ describe("compileSessionCreateInput", () => {
   });
 
   test("profile default harness/model resolve when no override", async () => {
-    const inp = await compileSessionCreateInput(profile({ harness: "claude", model: "sonnet" }), deps());
+    const inp = await compileSessionCreateInput(
+      profile({ harness: "claude", model: "sonnet" }),
+      deps(),
+    );
     expect(inp.harness).toBe("claude");
     expect(inp.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
   });
 
   test("per-session model override beats the profile default", async () => {
-    const inp = await compileSessionCreateInput(profile({ model: "opus" }), deps(), { model: "sonnet" });
+    const inp = await compileSessionCreateInput(profile({ model: "opus" }), deps(), {
+      model: "sonnet",
+    });
     expect(inp.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
   });
 
@@ -624,6 +650,29 @@ describe("compileSessionCreateInput", () => {
     expect(manifest.map((tool) => tool.name)).toEqual(["always_available", "save_memory"]);
   });
 
+  test("child manifests omit human-interaction tools but retain coordination tools", async () => {
+    const toolRegistry = createToolRegistry();
+    for (const name of ["ask_user_question", "exit_plan_mode", "spawn_session"]) {
+      toolRegistry.register({
+        name,
+        description: name,
+        input: z.object({}),
+        output: z.object({ ok: z.boolean() }),
+        handling: "handled",
+        execution: "sync",
+        handler: async () => ({ ok: true }),
+      });
+    }
+
+    const inp = await compileSessionCreateInput(
+      profile(),
+      { ...deps(), toolRegistry },
+      { excludeHumanInteractionTools: true },
+    );
+    const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
+    expect(manifest.map((tool) => tool.name)).toEqual(["spawn_session"]);
+  });
+
   test("omits ENGRAM_TOOLS when no registered tool matches the profile", async () => {
     const toolRegistry = createToolRegistry();
     toolRegistry.register({
@@ -662,11 +711,13 @@ describe("compileSessionCreateInput", () => {
     });
     const input = await compileSessionCreateInput(
       profile({
-        integrationGrants: [{
-          connectionId: "connection-gcp",
-          operation: "compute.instances.get",
-          resourceConstraints: [],
-        }],
+        integrationGrants: [
+          {
+            connectionId: "connection-gcp",
+            operation: "compute.instances.get",
+            resourceConstraints: [],
+          },
+        ],
       }),
       { ...deps(), connections },
     );
@@ -680,13 +731,15 @@ describe("compileSessionCreateInput", () => {
     expect(input.harnessEnv?.ENGRAM_CLI_INTEGRATIONS).toContain(
       '"bins":["gcloud","engram-tunnel"]',
     );
-    expect(input.integrationConnections).toEqual([{
-      id: "connection-gcp",
-      alias: "dev-vm",
-      provider: "gcp",
-      displayName: "Dev VM",
-      config: expect.any(Object),
-    }]);
+    expect(input.integrationConnections).toEqual([
+      {
+        id: "connection-gcp",
+        alias: "dev-vm",
+        provider: "gcp",
+        displayName: "Dev VM",
+        config: expect.any(Object),
+      },
+    ]);
   });
 
   test("a disabled connection cannot be stamped into a new session", async () => {
@@ -694,16 +747,20 @@ describe("compileSessionCreateInput", () => {
     const get = connections.get;
     connections.get = async (id) => ({ ...(await get(id))!, enabled: false });
 
-    await expect(compileSessionCreateInput(
-      profile({
-        integrationGrants: [{
-          connectionId: "connection-gcp",
-          operation: "compute.instances.get",
-          resourceConstraints: [],
-        }],
-      }),
-      { ...deps(), connections },
-    )).rejects.toThrow('integration connection "connection-gcp" is disabled');
+    await expect(
+      compileSessionCreateInput(
+        profile({
+          integrationGrants: [
+            {
+              connectionId: "connection-gcp",
+              operation: "compute.instances.get",
+              resourceConstraints: [],
+            },
+          ],
+        }),
+        { ...deps(), connections },
+      ),
+    ).rejects.toThrow('integration connection "connection-gcp" is disabled');
   });
 
   test("extra capabilities widen integration grants but never the tool manifest", async () => {
@@ -742,10 +799,13 @@ describe("compileSessionCreateInput", () => {
         mint_source: { connection: { connection_id: string; provider: string } } | null;
       }>;
     };
-    expect(policy.injects?.some((entry) =>
-      entry.mint_source?.connection.connection_id === "default-github" &&
-        entry.mint_source.connection.provider === "github"
-    )).toBe(true);
+    expect(
+      policy.injects?.some(
+        (entry) =>
+          entry.mint_source?.connection.connection_id === "default-github" &&
+          entry.mint_source.connection.provider === "github",
+      ),
+    ).toBe(true);
     const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
     expect(manifest.map((tool) => tool.name)).toEqual(["review_tool"]);
   });
@@ -786,18 +846,19 @@ describe("compileSessionCreateInput", () => {
     store.get = async (id) => (id === "missing-connection" ? null : baseGet(id));
 
     const brokenProfile = profile({
-      integrationGrants: [{
-        connectionId: "missing-connection",
-        operation: "pr_review",
-        resourceConstraints: [],
-      }],
+      integrationGrants: [
+        {
+          connectionId: "missing-connection",
+          operation: "pr_review",
+          resourceConstraints: [],
+        },
+      ],
     });
 
     // Without an override the broken profile grant fails the create.
-    await expect(compileSessionCreateInput(
-      brokenProfile,
-      { ...deps(), connections: store },
-    )).rejects.toThrow(/does not exist/);
+    await expect(
+      compileSessionCreateInput(brokenProfile, { ...deps(), connections: store }),
+    ).rejects.toThrow(/does not exist/);
 
     // An override replaces the session authority; the unused profile grants
     // are never resolved, so the create succeeds.
@@ -842,13 +903,15 @@ describe("compileSessionCreateInput", () => {
           allowHosts: ["profile.example.com"],
           allowHostPatterns: ["*.profile.example.com"],
         },
-        secrets: [{
-          ref: "PROFILE_PAT",
-          envVar: "PROFILE_PAT",
-          mode: "literal",
-          allowHosts: ["github.com"],
-          allowHostPatterns: [],
-        }],
+        secrets: [
+          {
+            ref: "PROFILE_PAT",
+            envVar: "PROFILE_PAT",
+            mode: "literal",
+            allowHosts: ["github.com"],
+            allowHostPatterns: [],
+          },
+        ],
         envVars: {
           PROFILE_ONLY: "must-drop",
           ANTHROPIC_MODEL: "stale-profile-model",
@@ -898,7 +961,9 @@ describe("compileSessionCreateInput", () => {
 // ---------------------------------------------------------------------------
 
 const fakeProfiles = (active = true, over: Partial<ProfileRow> = {}): ProfileStore =>
-  ({ getActive: async (id: string) => (active && id === "p1" ? profile(over) : null) }) as unknown as ProfileStore;
+  ({
+    getActive: async (id: string) => (active && id === "p1" ? profile(over) : null),
+  }) as unknown as ProfileStore;
 
 /** A full PortExposureStore fake that records createOrGet inputs and can be made
  *  to throw for a given port (to exercise the best-effort path). */
@@ -1012,7 +1077,9 @@ const createDeps = (
   } = {},
 ): CreateTaskDeps => ({
   profiles: fakeProfiles(opts.active ?? true, opts.profileOver ?? {}),
-  images: { listEnabledImages: async () => ({ images: [{ id: "img-1", imageUri: "uri-1" }] }) } as unknown as ImagesClient,
+  images: {
+    listEnabledImages: async () => ({ images: [{ id: "img-1", imageUri: "uri-1" }] }),
+  } as unknown as ImagesClient,
   connectors: { list: async () => [] },
   connections: fakeConnections(),
   harnessCatalog: fakeHarnessCatalog(),
@@ -1031,10 +1098,11 @@ const createDeps = (
 describe("createTaskWithSession", () => {
   test("writes the per-session listener row in the task transaction", async () => {
     const records: Record<string, unknown>[] = [];
-    await createTaskWithSession(
-      createDeps(fakeSessions(), recordingDb(records)),
-      { type: "chat", ownerUserId: "user-1", profileId: "p1" },
-    );
+    await createTaskWithSession(createDeps(fakeSessions(), recordingDb(records)), {
+      type: "chat",
+      ownerUserId: "user-1",
+      profileId: "p1",
+    });
 
     expect(records[2]).toEqual({ sessionId: "sess-1" });
   });
@@ -1054,9 +1122,10 @@ describe("createTaskWithSession", () => {
 
     expect(out.sessionId).toBe("sess-1");
     expect(typeof out.taskId).toBe("string");
-    expect((sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(
-      `be concise\n\n${BASE_SYSTEM_PROMPT}`,
-    );
+    expect(
+      (sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv
+        ?.ENGRAM_APPEND_SYSTEM_PROMPT,
+    ).toBe(`be concise\n\n${BASE_SYSTEM_PROMPT}`);
     // records[0] = task, records[1] = primary task_session.
     expect(records[0]).toMatchObject({
       type: "slack_thread",
@@ -1087,6 +1156,22 @@ describe("createTaskWithSession", () => {
     });
     expect(records[0]!.source).toEqual({});
     expect(records[0]!.title).toBeNull();
+  });
+
+  test("deferred initial prompt still titles the task but boots the session promptlessly", async () => {
+    const records: Record<string, unknown>[] = [];
+    const sessions = fakeSessions();
+    await createTaskWithSession(createDeps(sessions, recordingDb(records)), {
+      type: "chat",
+      ownerUserId: "u",
+      profileId: "p1",
+      prompt: "Review the uploaded design",
+      deferInitialPrompt: true,
+    });
+    expect(records[0]!.title).toBe("Review the uploaded design");
+    const request = sessions.createReqs[0] as { prompt?: string; harnessMode?: string };
+    expect(request.prompt).toBeUndefined();
+    expect(request.harnessMode).toBeUndefined();
   });
 
   test("throws NotFound for a missing/archived profile and creates no session", async () => {
@@ -1150,10 +1235,11 @@ describe("createTaskWithSession", () => {
     };
     const deletes: string[] = [];
     await expect(
-      createTaskWithSession(
-        createDeps(sessions, recordingDb([], false, undefined, { deletes })),
-        { type: "chat", ownerUserId: "u", profileId: "p1" },
-      ),
+      createTaskWithSession(createDeps(sessions, recordingDb([], false, undefined, { deletes })), {
+        type: "chat",
+        ownerUserId: "u",
+        profileId: "p1",
+      }),
     ).rejects.toThrow(/different reserved session ID/);
     expect(sessions.deletedIds).toEqual(["sess-OTHER"]);
     expect(deletes).toEqual(["slack_session", "task"]);
@@ -1168,15 +1254,12 @@ describe("createTaskWithSession", () => {
     };
     const deletes: string[] = [];
     await expect(
-      createTaskWithSession(
-        createDeps(sessions, recordingDb([], false, undefined, { deletes })),
-        {
-          type: "slack_thread",
-          ownerUserId: "u",
-          profileId: "p1",
-          slackThreadWorkflowId: "thread-wf-1",
-        },
-      ),
+      createTaskWithSession(createDeps(sessions, recordingDb([], false, undefined, { deletes })), {
+        type: "slack_thread",
+        ownerUserId: "u",
+        profileId: "p1",
+        slackThreadWorkflowId: "thread-wf-1",
+      }),
     ).rejects.toThrow(/boot boom/);
     expect(sessions.deletedIds).toEqual(["sess-1"]);
     expect(deletes).toEqual(["slack_session", "task"]);
@@ -1217,7 +1300,11 @@ describe("createTaskWithSession", () => {
       ownerUserId: "user-1",
       visibility: "private",
     });
-    expect(ports.calls[1]).toMatchObject({ port: 8080, visibility: "private", ownerUserId: "user-1" });
+    expect(ports.calls[1]).toMatchObject({
+      port: 8080,
+      visibility: "private",
+      ownerUserId: "user-1",
+    });
   });
 
   test("does NOT mint when the profile declares no portExposures", async () => {
@@ -1237,12 +1324,14 @@ describe("createTaskWithSession", () => {
     await createTaskWithSession(
       createDeps(sessions, recordingDb([]), {
         users: fakeUsers(async (id) =>
-          id === "user-1" ? { name: "Ada", email: "ada@example.com" } : null
+          id === "user-1" ? { name: "Ada", email: "ada@example.com" } : null,
         ),
       }),
       { type: "chat", ownerUserId: "user-1", profileId: "p1" },
     );
-    expect((sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv).toMatchObject({
+    expect(
+      (sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv,
+    ).toMatchObject({
       ENGRAM_USER_NAME: "Ada",
       ENGRAM_USER_EMAIL: "ada@example.com",
     });
@@ -1299,15 +1388,12 @@ describe("createSessionForExistingTask", () => {
   test("stamps an explicit automation principal into the integration snapshot", async () => {
     const sessions = fakeSessions();
     const records: Record<string, unknown>[] = [];
-    await createSessionForExistingTask(
-      createDeps(sessions, recordingDb(records)),
-      {
-        taskId: "task-existing",
-        profileId: "p1",
-        role: "primary",
-        integrationPrincipalId: "automation:nightly",
-      },
-    );
+    await createSessionForExistingTask(createDeps(sessions, recordingDb(records)), {
+      taskId: "task-existing",
+      profileId: "p1",
+      role: "primary",
+      integrationPrincipalId: "automation:nightly",
+    });
     expect(sessions.createReqs).toHaveLength(1);
     expect(records[0]?.integrationPrincipalId).toBe("automation:nightly");
   });
@@ -1316,41 +1402,44 @@ describe("createSessionForExistingTask", () => {
     const records: Record<string, unknown>[] = [];
     const sessions = fakeSessions();
 
-    const out = await createSessionForExistingTask(
-      createDeps(sessions, recordingDb(records)),
-      {
-        taskId: "task-existing",
-        profileId: "p1",
-        role: "finder",
-        extraCapabilities: ["github:contents:read@openai/engrams"],
-        appendSystemPrompt: "finder system prompt",
-      },
-    );
+    const out = await createSessionForExistingTask(createDeps(sessions, recordingDb(records)), {
+      taskId: "task-existing",
+      profileId: "p1",
+      role: "finder",
+      extraCapabilities: ["github:contents:read@openai/engrams"],
+      appendSystemPrompt: "finder system prompt",
+    });
 
     expect(out).toEqual({ sessionId: "sess-1" });
     // The effective granted set (profile caps + extras) is persisted on the
     // task_session so the tool-exec gate honors it — the profile itself has no
     // capabilities here, yet the session carries the extra grant.
-    expect(records).toEqual([{
-      taskId: "task-existing",
-      sessionId: "sess-1",
-      role: "finder",
-      profileId: "p1",
-      capabilities: ["github:contents:read@openai/engrams"],
-      integrationGrants: [{
-        connectionId: "default-github",
-        operation: "contents:read",
-        resourceConstraints: ["openai/engrams"],
-      }],
-      integrationConnections: [{
-        id: "default-github",
-        alias: "default-github",
-        provider: "github",
-        displayName: "github",
-        config: {},
-      }],
-      integrationSnapshotHash: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
-    }]);
+    expect(records).toEqual([
+      {
+        taskId: "task-existing",
+        sessionId: "sess-1",
+        role: "finder",
+        profileId: "p1",
+        capabilities: ["github:contents:read@openai/engrams"],
+        integrationGrants: [
+          {
+            connectionId: "default-github",
+            operation: "contents:read",
+            resourceConstraints: ["openai/engrams"],
+          },
+        ],
+        integrationConnections: [
+          {
+            id: "default-github",
+            alias: "default-github",
+            provider: "github",
+            displayName: "github",
+            config: {},
+          },
+        ],
+        integrationSnapshotHash: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+      },
+    ]);
     const request = sessions.createReqs[0] as {
       prompt?: string;
       capabilities?: string[];
@@ -1366,15 +1455,12 @@ describe("createSessionForExistingTask", () => {
   test("registers the listener in the same transaction when requested", async () => {
     const records: Record<string, unknown>[] = [];
 
-    await createSessionForExistingTask(
-      createDeps(fakeSessions(), recordingDb(records)),
-      {
-        taskId: "task-existing",
-        profileId: "p1",
-        role: "verifier",
-        registerListener: true,
-      },
-    );
+    await createSessionForExistingTask(createDeps(fakeSessions(), recordingDb(records)), {
+      taskId: "task-existing",
+      profileId: "p1",
+      role: "verifier",
+      registerListener: true,
+    });
 
     expect(records).toEqual([
       {
@@ -1404,23 +1490,22 @@ describe("createSessionForExistingTask", () => {
             allowHosts: ["profile.example.com"],
             allowHostPatterns: [],
           },
-          secrets: [{
-            ref: "PROFILE_PAT",
-            envVar: "PROFILE_PAT",
-            mode: "literal",
-            allowHosts: ["github.com"],
-            allowHostPatterns: [],
-          }],
+          secrets: [
+            {
+              ref: "PROFILE_PAT",
+              envVar: "PROFILE_PAT",
+              mode: "literal",
+              allowHosts: ["github.com"],
+              allowHostPatterns: [],
+            },
+          ],
         },
       }),
       {
         taskId: "task-existing",
         profileId: "p1",
         role: "finder",
-        capabilityOverride: [
-          "engram:pr_review",
-          "github:contents:read@openai/engrams",
-        ],
+        capabilityOverride: ["engram:pr_review", "github:contents:read@openai/engrams"],
         networkOverride: {
           default: "deny",
           allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
@@ -1485,15 +1570,14 @@ describe("createSessionForExistingTask", () => {
 
   test("compensates when requested listener registration fails", async () => {
     const sessions = fakeSessions();
-    await expect(createSessionForExistingTask(
-      createDeps(sessions, recordingDb([], false, 2)),
-      {
+    await expect(
+      createSessionForExistingTask(createDeps(sessions, recordingDb([], false, 2)), {
         taskId: "task-existing",
         profileId: "p1",
         role: "verifier",
         registerListener: true,
-      },
-    )).rejects.toThrow(/insert boom/);
+      }),
+    ).rejects.toThrow(/insert boom/);
     expect(sessions.deletedIds).toEqual(["sess-1"]);
   });
 
@@ -1504,10 +1588,12 @@ describe("createSessionForExistingTask", () => {
       return { sessionId: "sess-OTHER" };
     };
     const deletes: string[] = [];
-    await expect(createSessionForExistingTask(
-      createDeps(sessions, recordingDb([], false, undefined, { deletes })),
-      { taskId: "task-existing", profileId: "p1", role: "finder" },
-    )).rejects.toThrow(/different reserved session ID/);
+    await expect(
+      createSessionForExistingTask(
+        createDeps(sessions, recordingDb([], false, undefined, { deletes })),
+        { taskId: "task-existing", profileId: "p1", role: "finder" },
+      ),
+    ).rejects.toThrow(/different reserved session ID/);
     expect(sessions.deletedIds).toEqual(["sess-OTHER"]);
     expect(deletes).toEqual(["task_session"]);
   });
@@ -1517,18 +1603,23 @@ describe("createSessionForExistingTask", () => {
     sessions.createSession = async () => {
       throw new Error("boot boom");
     };
-    await expect(createSessionForExistingTask(
-      createDeps(sessions, recordingDb([], false, undefined, { failOnDelete: true })),
-      { taskId: "task-existing", profileId: "p1", role: "finder" },
-    )).rejects.toThrow(/boot boom/);
+    await expect(
+      createSessionForExistingTask(
+        createDeps(sessions, recordingDb([], false, undefined, { failOnDelete: true })),
+        { taskId: "task-existing", profileId: "p1", role: "finder" },
+      ),
+    ).rejects.toThrow(/boot boom/);
   });
 
   test("does not start a session when task_session persistence fails", async () => {
     const sessions = fakeSessions();
-    await expect(createSessionForExistingTask(
-      createDeps(sessions, recordingDb([], true)),
-      { taskId: "task-existing", profileId: "p1", role: "finder" },
-    )).rejects.toThrow(/db boom/);
+    await expect(
+      createSessionForExistingTask(createDeps(sessions, recordingDb([], true)), {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "finder",
+      }),
+    ).rejects.toThrow(/db boom/);
     expect(sessions.createReqs).toHaveLength(0);
     expect(sessions.deletedIds).toEqual([]);
   });

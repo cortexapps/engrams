@@ -59,6 +59,9 @@ message CreateTaskRequest {
   // through to CreateSessionRequest.harness_mode; validated against the
   // selected harness's descriptor modes.
   optional string harness_mode = 9;
+  // ADR 0113: create the task and primary session without sending the prompt.
+  // The prompt still supplies the initial task title.
+  bool defer_initial_prompt = 10;
 }
 
 message CreateTaskResponse {
@@ -96,6 +99,12 @@ message Task {
   optional string harness = 11;
   optional string model = 12;
   optional string effort = 13;
+  optional string parent_task_id = 14;
+  optional string root_task_id = 15;
+  optional string local_task_name = 16;
+  optional string canonical_task_name = 17;
+  optional string spawning_session_id = 18;
+  repeated Task descendants = 19;
 }
 
 message TaskSessionRef {

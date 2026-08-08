@@ -91,7 +91,7 @@ use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AuxBundleRef, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
-    WriteFileResult, WriteFileSpec,
+    SessionFileMetadata, SessionFileSpec, SessionFileStream, WriteFileResult, WriteFileSpec,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
@@ -1725,6 +1725,32 @@ impl FirecrackerBackend {
             results.push(result);
         }
         Ok(results)
+    }
+
+    /// Drive ADR 0113's streamed upload over a direct agentd UDS. Public for
+    /// the protocol integration test; production dials the same agent port
+    /// through Firecracker's vsock proxy.
+    pub async fn upload_file_via_agent_socket(
+        agent_socket: &Path,
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        let connection = UnixStream::connect(agent_socket).await.map_err(|error| {
+            SandboxError::Vm(format!("connect agent for upload: {error}").into())
+        })?;
+        engram_agentd::file_transfer::upload_file(connection, spec, bytes).await
+    }
+
+    /// Read an ADR 0113 session file over a direct agentd UDS. Test seam paired
+    /// with [`Self::upload_file_via_agent_socket`].
+    pub async fn read_file_via_agent_socket(
+        agent_socket: &Path,
+        path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        let connection = UnixStream::connect(agent_socket)
+            .await
+            .map_err(|error| SandboxError::Vm(format!("connect agent for read: {error}").into()))?;
+        engram_agentd::file_transfer::read_file(connection, path).await
     }
 
     /// Connect to the in-guest agent over Firecracker's vsock proxy.
@@ -5327,6 +5353,37 @@ impl SandboxBackend for FirecrackerBackend {
             files,
         )
         .await
+    }
+
+    async fn upload_file(
+        &self,
+        id: SandboxId,
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.vsock_uds_path.clone()
+        };
+        let connection =
+            Self::connect_fc_vsock(&self.sandboxes, id, &vsock_uds_path, ENGRAM_AGENTD_PORT)
+                .await?;
+        engram_agentd::file_transfer::upload_file(connection, spec, bytes).await
+    }
+
+    async fn read_file(
+        &self,
+        id: SandboxId,
+        path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.vsock_uds_path.clone()
+        };
+        let connection =
+            Self::connect_fc_vsock(&self.sandboxes, id, &vsock_uds_path, ENGRAM_AGENTD_PORT)
+                .await?;
+        engram_agentd::file_transfer::read_file(connection, path).await
     }
 
     /// ADR 0066: connect to the in-guest agentd relay listener on `port`

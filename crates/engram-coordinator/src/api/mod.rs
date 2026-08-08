@@ -30,6 +30,7 @@ pub(crate) mod interrupt;
 pub(crate) mod prompt;
 pub(crate) mod registries;
 pub(crate) mod session_auth;
+pub(crate) mod session_files;
 // `pub(crate)`: `evacuation::resolve_cold_boot_spec` (ADR 0028 Fix B)
 // reuses `cold_boot_spec` / the resource helpers from outside `api`.
 pub(crate) mod sessions;

@@ -42,38 +42,77 @@ const bytea = customType<{ data: Buffer }>({
 // Task model (Task 15)
 // ---------------------------------------------------------------------------
 
-export const task = pgTable("task", {
-  id: text("id").primaryKey(), // nanoid/uuid
-  type: text("type").notNull(), // 'chat' (UI) | 'slack_thread' (ADR 0060 trigger)
-  // Session titles. The effective display title is DERIVED (buildTask):
-  //   custom_title ?? liveSuggested(session) ?? suggested_title ?? title
-  // `title` is the truncated-prompt DEFAULT set at create; `suggested_title`
-  // snapshots the coordinator's live harness suggestion so it survives session
-  // GC; `custom_title` is the user's STICKY rename (harness suggestions never
-  // override it) — null once reset.
-  title: text("title"),
-  suggestedTitle: text("suggested_title"),
-  customTitle: text("custom_title"),
-  status: text("status").notNull().default("open"), // open|working|awaiting_review|done|failed
-  createdByUserId: text("created_by_user_id"), // better-auth user id; null = automation (future)
-  source: jsonb("source"), // type-specific trigger ref
-  workflowRunId: text("workflow_run_id"), // DBOS run — null for chat (ADR §4)
-  // ADR 0063 B2 echo: the EFFECTIVE harness/model/effort this task's sessions
-  // run with, resolved at create time (override ?? profile ?? catalog default)
-  // and persisted so reads can show it. Null on rows that pre-date the columns.
-  harness: text("harness"),
-  model: text("model"),
-  effort: text("effort"),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
-  updatedAt: timestamp("updated_at").notNull().defaultNow(),
-},
-(t) => [
-  // The profile picker's channel histogram: last-N Slack tasks per (team,
-  // channel), newest first.
-  index("task_slack_channel_created_idx")
-    .on(sql`(source->>'team')`, sql`(source->>'channel')`, t.createdAt.desc())
-    .where(sql`source->>'provider' = 'slack'`),
-]);
+/** ADR 0113: immutable, non-secret inputs used to launch descendants. */
+export interface TaskLaunchPolicy {
+  version: 1;
+  profileId: string;
+  imageUri: string;
+  harness: string;
+  model?: string;
+  effort?: string;
+  includeUserTokens: boolean;
+  envVars: Record<string, string>;
+  skills: string[];
+  capabilities: string[];
+  integrationPolicyJson: string;
+  integrationGrants: ProfileIntegrationGrant[];
+  integrationConnections: IntegrationConnectionSnapshot[];
+  network: ProfileNetwork;
+  secrets: ProfileSecret[];
+  repos: ProfileRepo[];
+  portExposures: number[];
+}
+
+export const task = pgTable(
+  "task",
+  {
+    id: text("id").primaryKey(), // nanoid/uuid
+    type: text("type").notNull(), // 'chat' (UI) | 'slack_thread' (ADR 0060 trigger)
+    // Session titles. The effective display title is DERIVED (buildTask):
+    //   custom_title ?? liveSuggested(session) ?? suggested_title ?? title
+    // `title` is the truncated-prompt DEFAULT set at create; `suggested_title`
+    // snapshots the coordinator's live harness suggestion so it survives session
+    // GC; `custom_title` is the user's STICKY rename (harness suggestions never
+    // override it) — null once reset.
+    title: text("title"),
+    suggestedTitle: text("suggested_title"),
+    customTitle: text("custom_title"),
+    status: text("status").notNull().default("open"), // open|working|awaiting_review|done|failed|cancelled
+    createdByUserId: text("created_by_user_id"), // better-auth user id; null = automation (future)
+    source: jsonb("source"), // type-specific trigger ref
+    workflowRunId: text("workflow_run_id"), // DBOS run — null for chat (ADR §4)
+    // ADR 0063 B2 echo: the EFFECTIVE harness/model/effort this task's sessions
+    // run with, resolved at create time (override ?? profile ?? catalog default)
+    // and persisted so reads can show it. Null on rows that pre-date the columns.
+    harness: text("harness"),
+    model: text("model"),
+    effort: text("effort"),
+    // ADR 0113: a root has null parent/name fields and root_task_id = id. Child
+    // names are immutable and root-relative. IDs are logical self-references;
+    // root deletion is an explicit recursive operation so every control-plane
+    // session is terminated before the rows cascade.
+    parentTaskId: text("parent_task_id"),
+    rootTaskId: text("root_task_id"),
+    localTaskName: text("local_task_name"),
+    canonicalTaskName: text("canonical_task_name"),
+    spawningSessionId: text("spawning_session_id"),
+    launchPolicy: jsonb("launch_policy").$type<TaskLaunchPolicy>(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  },
+  (t) => [
+    // The profile picker's channel histogram: last-N Slack tasks per (team,
+    // channel), newest first.
+    index("task_slack_channel_created_idx")
+      .on(sql`(source->>'team')`, sql`(source->>'channel')`, t.createdAt.desc())
+      .where(sql`source->>'provider' = 'slack'`),
+    index("task_parent_idx").on(t.parentTaskId),
+    index("task_root_idx").on(t.rootTaskId),
+    uniqueIndex("task_root_canonical_name_unique")
+      .on(t.rootTaskId, t.canonicalTaskName)
+      .where(sql`canonical_task_name IS NOT NULL`),
+  ],
+);
 
 export const taskSession = pgTable(
   "task_session",
@@ -99,8 +138,8 @@ export const taskSession = pgTable(
     integrationGrants: jsonb("integration_grants").$type<ProfileIntegrationGrant[]>(),
     // Immutable configured identities used by the grants above. Credential
     // refresh reads this snapshot, not the mutable connection table.
-    integrationConnections: jsonb("integration_connections")
-      .$type<IntegrationConnectionSnapshot[]>(),
+    integrationConnections:
+      jsonb("integration_connections").$type<IntegrationConnectionSnapshot[]>(),
     // Immutable user or automation principal that received this authorization
     // snapshot. This makes broker audit records attributable without consulting
     // mutable workflow state.
@@ -137,10 +176,7 @@ export const pendingToolCall = pgTable(
     completedAt: timestamp("completed_at", { withTimezone: true }),
   },
   (t) => [
-    uniqueIndex("pending_tool_calls_session_tool_call_unique").on(
-      t.sessionId,
-      t.toolCallId,
-    ),
+    uniqueIndex("pending_tool_calls_session_tool_call_unique").on(t.sessionId, t.toolCallId),
     index("pending_tool_calls_session_idx").on(t.sessionId),
     // ADR 0107 (PR #927 review): the task list derives `awaiting_review` from
     // "session-handled and unsubmitted" on every load, and this table is
@@ -151,6 +187,35 @@ export const pendingToolCall = pgTable(
     index("pending_tool_calls_awaiting_idx")
       .on(t.sessionId)
       .where(sql`${t.handling} = 'session' AND ${t.submittedAt} IS NULL`),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Recursive session coordination (ADR 0113)
+// ---------------------------------------------------------------------------
+
+export const coordinationOperation = pgTable(
+  "coordination_operation",
+  {
+    callerSessionId: text("caller_session_id").notNull(),
+    operation: text("operation").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    requestHash: text("request_hash").notNull(),
+    status: text("status").notNull().default("reserved"),
+    reservedTaskId: text("reserved_task_id"),
+    reservedSessionId: text("reserved_session_id"),
+    promptId: text("prompt_id"),
+    result: jsonb("result").$type<Record<string, unknown>>(),
+    error: text("error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [
+    primaryKey({ columns: [t.callerSessionId, t.operation, t.idempotencyKey] }),
+    index("coordination_operation_reserved_session_idx").on(t.reservedSessionId),
   ],
 );
 
@@ -177,10 +242,7 @@ export const papercut = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
-    uniqueIndex("papercuts_session_tool_call_unique").on(
-      t.sessionId,
-      t.toolCallId,
-    ),
+    uniqueIndex("papercuts_session_tool_call_unique").on(t.sessionId, t.toolCallId),
     index("papercuts_created_at_idx").on(t.createdAt),
     index("papercuts_archived_at_idx").on(t.archivedAt),
   ],
@@ -220,11 +282,7 @@ export const prRef = pgTable(
 
 /** The only statuses that represent a live pass. Store queries, guarded
  * transitions, and the partial unique index all derive from this vocabulary. */
-export const ACTIVE_REVIEW_STATUSES = [
-  "queued",
-  "finding",
-  "verifying",
-] as const;
+export const ACTIVE_REVIEW_STATUSES = ["queued", "finding", "verifying"] as const;
 
 export function isActiveReviewStatus(
   status: string,
@@ -372,10 +430,7 @@ export const reviewFinding = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
-    uniqueIndex("review_finding_session_tool_call_unique").on(
-      t.sessionId,
-      t.toolCallId,
-    ),
+    uniqueIndex("review_finding_session_tool_call_unique").on(t.sessionId, t.toolCallId),
     index("review_finding_review_idx").on(t.reviewId),
   ],
 );
@@ -396,10 +451,7 @@ export const reviewVerdict = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
-    uniqueIndex("review_verdict_session_tool_call_unique").on(
-      t.sessionId,
-      t.toolCallId,
-    ),
+    uniqueIndex("review_verdict_session_tool_call_unique").on(t.sessionId, t.toolCallId),
     uniqueIndex("review_verdict_finding_unique").on(t.findingId),
   ],
 );
@@ -673,10 +725,7 @@ export interface CreateTaskAutomationAction {
 
 export type AutomationAction = CreateTaskAutomationAction;
 
-export type WebhookVerificationScheme =
-  | "github_hmac_sha256"
-  | "slack_v0"
-  | "generic_hmac_sha256";
+export type WebhookVerificationScheme = "github_hmac_sha256" | "slack_v0" | "generic_hmac_sha256";
 
 export interface WebhookVerification {
   scheme: WebhookVerificationScheme;
@@ -776,11 +825,7 @@ export const webhookSample = pgTable(
     receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
-    index("webhook_sample_registration_event_idx").on(
-      t.registrationId,
-      t.eventKey,
-      t.receivedAt,
-    ),
+    index("webhook_sample_registration_event_idx").on(t.registrationId, t.eventKey, t.receivedAt),
   ],
 );
 
@@ -984,7 +1029,7 @@ export const user = pgTable("user", {
     .$onUpdate(() => new Date())
     .notNull(),
   // admin plugin fields:
-  role: text("role"),          // 'admin' | 'user' (we read 'user' as "member")
+  role: text("role"), // 'admin' | 'user' (we read 'user' as "member")
   banned: boolean("banned").default(false),
   banReason: text("ban_reason"),
   banExpires: timestamp("ban_expires"),

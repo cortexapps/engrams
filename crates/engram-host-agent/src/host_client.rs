@@ -26,7 +26,8 @@ use engram_core::traits::{HarnessDial, HarnessSink, HostClient, SandboxBackend, 
 use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
-    AgentSpec, ExecRequest, ExecStream, SandboxSpec, WriteFileResult, WriteFileSpec,
+    AgentSpec, ExecRequest, ExecStream, SandboxSpec, SessionFileMetadata, SessionFileSpec,
+    SessionFileStream, WriteFileResult, WriteFileSpec,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::types::{SandboxId, SessionId};
@@ -116,6 +117,23 @@ impl HostClient for LocalHostClient {
         files: Vec<WriteFileSpec>,
     ) -> Result<Vec<WriteFileResult>, SandboxError> {
         self.sandbox.write_files(id, files).await
+    }
+
+    async fn upload_file(
+        &self,
+        id: SandboxId,
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        self.sandbox.upload_file(id, spec, bytes).await
+    }
+
+    async fn read_file(
+        &self,
+        id: SandboxId,
+        path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        self.sandbox.read_file(id, path).await
     }
 
     async fn snapshot(

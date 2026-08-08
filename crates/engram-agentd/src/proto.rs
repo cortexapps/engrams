@@ -172,8 +172,8 @@ pub struct WireHandshakeAck {
 /// dispatches and either streams (Exec) or sends a single
 /// [`WireResponse`] (everything else). Single-frame size cap is
 /// [`MAX_MSG_BYTES`] (16 MiB) per the existing framing layer; for
-/// Upload / Download that bounds payload size at 16 MiB. Multi-
-/// frame chunked uploads are a follow-up.
+/// Upload / Download that bounds payload size at 16 MiB. ADR 0113's
+/// UploadStream / DownloadStream variants use separate bounded frames.
 ///
 /// **APPEND-ONLY.** The wire is bincode, which encodes enums by
 /// variant *index*. agentd is baked into session images / base
@@ -400,6 +400,21 @@ pub enum WireRequest {
     /// Kill the process group for a durable exec ticket. Appended for wire
     /// compatibility; old agentd rejects it with the named skew response.
     CancelExec { exec_id: String },
+    /// Begin an atomic streamed upload. The host follows this request with
+    /// `WireFileChunk` frames until exactly `size_bytes` have arrived.
+    UploadStream {
+        path: String,
+        size_bytes: u64,
+        sha256: String,
+    },
+    /// Begin a streamed read. The agent replies with metadata, then
+    /// `WireFileChunk` frames until `size_bytes` have been sent.
+    DownloadStream { path: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WireFileChunk {
+    pub bytes: Vec<u8>,
 }
 
 /// Body of [`WireRequest::SpawnHarness`]. ADR 0021 P1.4 dropped the
@@ -554,6 +569,16 @@ pub enum WireResponse {
     },
     /// The durable exec's process group was signalled (or had already exited).
     ExecCancelled,
+    /// The streamed upload was verified and published atomically.
+    UploadStreamOk {
+        size_bytes: u64,
+        sha256: String,
+    },
+    /// Metadata that precedes streamed download chunks.
+    DownloadStreamReady {
+        size_bytes: u64,
+        sha256: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

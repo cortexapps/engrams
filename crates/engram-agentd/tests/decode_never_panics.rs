@@ -19,8 +19,8 @@ use std::io::Cursor;
 
 use engram_agentd::proto::{
     read_msg, AgentReady, SpawnHarnessRequest, WireDownloadResponse, WireExecEvent,
-    WireExecRequest, WireHandshake, WireHandshakeAck, WireRequest, WireResponse, WireStatResponse,
-    MAX_MSG_BYTES,
+    WireExecRequest, WireFileChunk, WireHandshake, WireHandshakeAck, WireRequest, WireResponse,
+    WireStatResponse, MAX_MSG_BYTES,
 };
 use proptest::prelude::*;
 
@@ -37,6 +37,7 @@ fn decode_every_type(bytes: &[u8]) {
     let _ = bincode::deserialize::<AgentReady>(bytes);
     let _ = bincode::deserialize::<WireStatResponse>(bytes);
     let _ = bincode::deserialize::<WireDownloadResponse>(bytes);
+    let _ = bincode::deserialize::<WireFileChunk>(bytes);
 }
 
 fn read_frame_every_type(bytes: &[u8]) {
@@ -48,6 +49,7 @@ fn read_frame_every_type(bytes: &[u8]) {
         let _ = read_msg::<_, WireResponse>(&mut Cursor::new(bytes)).await;
         let _ = read_msg::<_, WireExecEvent>(&mut Cursor::new(bytes)).await;
         let _ = read_msg::<_, AgentReady>(&mut Cursor::new(bytes)).await;
+        let _ = read_msg::<_, WireFileChunk>(&mut Cursor::new(bytes)).await;
     });
 }
 

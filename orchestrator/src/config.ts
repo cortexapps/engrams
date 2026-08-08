@@ -7,11 +7,7 @@
  */
 
 import { parseAdminEmails } from "./auth/admin-allowlist.ts";
-import {
-  HEARTBEAT_INTERVAL_MS,
-  SWEEP_GRACE_MS,
-  SWEEP_INTERVAL_MS,
-} from "./sweep/sweeper.ts";
+import { HEARTBEAT_INTERVAL_MS, SWEEP_GRACE_MS, SWEEP_INTERVAL_MS } from "./sweep/sweeper.ts";
 
 export interface Config {
   /** ORCHESTRATOR_PORT — default 8787 */
@@ -163,6 +159,9 @@ export interface Config {
    * HEARTBEAT_INTERVAL_MS.
    */
   sweepHeartbeatIntervalMs: number;
+  /** ADR 0113 recursive session limits. */
+  subSessionMaxDepth: number;
+  subSessionMaxDescendants: number;
 }
 
 /** A configured generic OIDC provider (better-auth genericOAuth). */
@@ -209,9 +208,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     if (raw === undefined) return fallback;
     const value = Number(raw);
     if (!Number.isFinite(value) || value <= 0) {
-      throw new Error(
-        `Orchestrator: ${key}="${raw}" must be a positive number`,
-      );
+      throw new Error(`Orchestrator: ${key}="${raw}" must be a positive number`);
     }
     return value;
   }
@@ -272,10 +269,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     .split(",")
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
-  const iapJwksUrl = optional(
-    "IAP_JWKS_URL",
-    "https://www.gstatic.com/iap/verify/public_key-jwk",
-  );
+  const iapJwksUrl = optional("IAP_JWKS_URL", "https://www.gstatic.com/iap/verify/public_key-jwk");
 
   // OPTIONAL: env-driven OIDC. Opt-in via ORCHESTRATOR_OIDC_ISSUER; when set,
   // CLIENT_ID + CLIENT_SECRET become required (partial config is a hard error,
@@ -289,7 +283,9 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     if (!clientId)
       missing.push("ORCHESTRATOR_OIDC_CLIENT_ID (required when ORCHESTRATOR_OIDC_ISSUER is set)");
     if (!clientSecret)
-      missing.push("ORCHESTRATOR_OIDC_CLIENT_SECRET (required when ORCHESTRATOR_OIDC_ISSUER is set)");
+      missing.push(
+        "ORCHESTRATOR_OIDC_CLIENT_SECRET (required when ORCHESTRATOR_OIDC_ISSUER is set)",
+      );
     oidc = {
       issuer: oidcIssuer.replace(/\/$/, ""),
       clientId,
@@ -308,13 +304,16 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // OPTIONAL: deployment identity for OIDC claims (ADR 0109). Defaults to the
   // public hostname; a malformed base URL falls back to the raw string so the
   // claim is never empty.
-  const deploymentId = optional("ENGRAM_DEPLOYMENT_ID", (() => {
-    try {
-      return new URL(baseUrl).hostname;
-    } catch {
-      return baseUrl;
-    }
-  })());
+  const deploymentId = optional(
+    "ENGRAM_DEPLOYMENT_ID",
+    (() => {
+      try {
+        return new URL(baseUrl).hostname;
+      } catch {
+        return baseUrl;
+      }
+    })(),
+  );
 
   // OPTIONAL: bootstrap-admin allowlist (restores `auth.bootstrapAdmins`).
   // Parsed + normalised (trim/lowercase/de-dup) here; empty when unset, which
@@ -327,20 +326,15 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // switch. Interval values reject explicit invalid input instead of silently
   // falling back.
   const sweepDisabled =
-    env["ORCHESTRATOR_SWEEP_DISABLED"] === "1" ||
-    env["ORCHESTRATOR_SWEEP_DISABLED"] === "true";
-  const sweepIntervalMs = positiveNumber(
-    "ORCHESTRATOR_SWEEP_INTERVAL_MS",
-    SWEEP_INTERVAL_MS,
-  );
-  const sweepGraceMs = positiveNumber(
-    "ORCHESTRATOR_SWEEP_GRACE_MS",
-    SWEEP_GRACE_MS,
-  );
+    env["ORCHESTRATOR_SWEEP_DISABLED"] === "1" || env["ORCHESTRATOR_SWEEP_DISABLED"] === "true";
+  const sweepIntervalMs = positiveNumber("ORCHESTRATOR_SWEEP_INTERVAL_MS", SWEEP_INTERVAL_MS);
+  const sweepGraceMs = positiveNumber("ORCHESTRATOR_SWEEP_GRACE_MS", SWEEP_GRACE_MS);
   const sweepHeartbeatIntervalMs = positiveNumber(
     "ORCHESTRATOR_SWEEP_HEARTBEAT_INTERVAL_MS",
     HEARTBEAT_INTERVAL_MS,
   );
+  const subSessionMaxDepth = positiveNumber("ORCHESTRATOR_SUBSESSION_MAX_DEPTH", 4);
+  const subSessionMaxDescendants = positiveNumber("ORCHESTRATOR_SUBSESSION_MAX_DESCENDANTS", 8);
   // A live pod proves its version with a heartbeat every interval, and the
   // SIGTERM handler stops the heartbeat only AFTER the DBOS drain completes
   // (index.ts) — so whenever workflow code can execute, the freshest beat is
@@ -364,9 +358,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   }
 
   if (isNaN(port) || port <= 0 || port > 65535) {
-    throw new Error(
-      `Orchestrator: ORCHESTRATOR_PORT="${portStr}" is not a valid port number`,
-    );
+    throw new Error(`Orchestrator: ORCHESTRATOR_PORT="${portStr}" is not a valid port number`);
   }
 
   return {
@@ -392,6 +384,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     sweepIntervalMs,
     sweepGraceMs,
     sweepHeartbeatIntervalMs,
+    subSessionMaxDepth,
+    subSessionMaxDescendants,
   };
 }
 

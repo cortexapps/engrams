@@ -10,10 +10,12 @@
 
 use std::io;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use engram_core::types::sandbox::MAX_SESSION_FILE_BYTES;
+use sha2::{Digest, Sha256};
 use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -21,8 +23,8 @@ use tokio::sync::mpsc;
 use crate::exec_journal::{AttachOrStart, AttachState, ExecJournal, JournalEntry};
 use crate::harness_supervisor::HarnessSupervisor;
 use crate::proto::{
-    read_msg, write_msg, WireDownloadResponse, WireExecEvent, WireHandshake, WireHandshakeAck,
-    WireRequest, WireResponse, WireStatResponse,
+    read_msg, write_msg, WireDownloadResponse, WireExecEvent, WireFileChunk, WireHandshake,
+    WireHandshakeAck, WireRequest, WireResponse, WireStatResponse,
 };
 
 /// Channel buffer between the stdout/stderr readers and the writer.
@@ -35,6 +37,7 @@ const EVENT_BUF: usize = 64;
 /// of stdout, which keeps the JSON framing comparable in chunkiness).
 const READ_BUF_BYTES: usize = 8 * 1024;
 pub const DURABLE_EXEC_CAPABILITY_PROBE: &str = "__engram_durable_exec_capability__";
+static UPLOAD_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Drive one connection: read a `WireExecRequest`, run the child,
 /// stream events, close. All errors are surfaced as `io::Error` —
@@ -173,6 +176,18 @@ where
         WireRequest::Download { path } => {
             let resp = download_path(&path).await;
             write_msg(&mut writer, &resp).await?;
+            return Ok(());
+        }
+        WireRequest::UploadStream {
+            path,
+            size_bytes,
+            sha256,
+        } => {
+            upload_stream(&mut reader, &mut writer, &path, size_bytes, &sha256).await?;
+            return Ok(());
+        }
+        WireRequest::DownloadStream { path } => {
+            download_stream(&mut writer, &path).await?;
             return Ok(());
         }
         WireRequest::Ping => {
@@ -1054,6 +1069,212 @@ async fn download_path(path: &str) -> WireResponse {
             WireResponse::Download(WireDownloadResponse { bytes })
         }
         Err(e) => wire_io_err("read", e),
+    }
+}
+
+fn sha256_hex(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+async fn hash_open_file(file: &mut tokio::fs::File) -> io::Result<(u64, String)> {
+    file.seek(std::io::SeekFrom::Start(0)).await?;
+    let mut size_bytes = 0u64;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buf).await?;
+        if count == 0 {
+            break;
+        }
+        size_bytes += count as u64;
+        hasher.update(&buf[..count]);
+    }
+    Ok((size_bytes, sha256_hex(hasher.finalize())))
+}
+
+async fn existing_file_matches(path: &str, size_bytes: u64, sha256: &str) -> io::Result<bool> {
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let (actual_size, actual_sha256) = hash_open_file(&mut file).await?;
+    Ok(actual_size == size_bytes && actual_sha256 == sha256)
+}
+
+async fn upload_stream<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    path: &str,
+    size_bytes: u64,
+    sha256: &str,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    if size_bytes > MAX_SESSION_FILE_BYTES {
+        write_msg(
+            writer,
+            &WireResponse::Error {
+                kind: format!("{:?}", io::ErrorKind::InvalidInput),
+                message: format!("upload exceeds {MAX_SESSION_FILE_BYTES} bytes"),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    if existing_file_matches(path, size_bytes, sha256).await? {
+        write_msg(
+            writer,
+            &WireResponse::UploadStreamOk {
+                size_bytes,
+                sha256: sha256.to_owned(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    if tokio::fs::metadata(path).await.is_ok() {
+        write_msg(
+            writer,
+            &WireResponse::Error {
+                kind: format!("{:?}", io::ErrorKind::AlreadyExists),
+                message: "upload path already exists with different content".into(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    let destination = std::path::Path::new(path);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "upload path has no parent"))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let sequence = UPLOAD_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("upload");
+    let temporary = parent.join(format!(
+        ".{name}.{}.{}.partial",
+        std::process::id(),
+        sequence
+    ));
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .await?;
+    let transfer = async {
+        let mut received = 0u64;
+        let mut hasher = Sha256::new();
+        while received < size_bytes {
+            let WireFileChunk { bytes } = read_msg(reader).await?;
+            let next = received.checked_add(bytes.len() as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "upload size overflow")
+            })?;
+            if next > size_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "upload exceeds declared size",
+                ));
+            }
+            file.write_all(&bytes).await?;
+            hasher.update(&bytes);
+            received = next;
+        }
+        file.flush().await?;
+        let actual_sha256 = sha256_hex(hasher.finalize());
+        if actual_sha256 != sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("upload SHA-256 mismatch: expected {sha256}, received {actual_sha256}"),
+            ));
+        }
+        #[cfg(unix)]
+        tokio::fs::set_permissions(&temporary, {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::Permissions::from_mode(0o600)
+        })
+        .await?;
+        drop(file);
+        // A same-directory hard link publishes one complete inode without
+        // replacing an existing destination. It has rename-like atomic
+        // visibility and gives concurrent retries first-writer-wins behavior.
+        match tokio::fs::hard_link(&temporary, destination).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if existing_file_matches(path, size_bytes, sha256).await? {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "upload path won a concurrent write with different content",
+                    ))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+    .await;
+    let _ = tokio::fs::remove_file(&temporary).await;
+    match transfer {
+        Ok(()) => {
+            write_msg(
+                writer,
+                &WireResponse::UploadStreamOk {
+                    size_bytes,
+                    sha256: sha256.to_owned(),
+                },
+            )
+            .await
+        }
+        Err(error) => write_msg(writer, &wire_io_err("stream upload", error)).await,
+    }
+}
+
+async fn download_stream<W>(writer: &mut W, path: &str) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) => {
+            write_msg(writer, &wire_io_err("open streamed download", error)).await?;
+            return Ok(());
+        }
+    };
+    let (size_bytes, sha256) = match hash_open_file(&mut file).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            write_msg(writer, &wire_io_err("hash streamed download", error)).await?;
+            return Ok(());
+        }
+    };
+    write_msg(
+        writer,
+        &WireResponse::DownloadStreamReady { size_bytes, sha256 },
+    )
+    .await?;
+    file.seek(std::io::SeekFrom::Start(0)).await?;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buf).await?;
+        if count == 0 {
+            return Ok(());
+        }
+        write_msg(
+            writer,
+            &WireFileChunk {
+                bytes: buf[..count].to_vec(),
+            },
+        )
+        .await?;
     }
 }
 
@@ -2275,5 +2496,140 @@ mod tests {
             n, 0,
             "agentd must not write any bytes on a clean disconnect"
         );
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        sha256_hex(Sha256::digest(bytes))
+    }
+
+    #[tokio::test]
+    async fn streamed_upload_is_invisible_until_verified_and_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("upload.bin");
+        let destination_string = destination.to_string_lossy().into_owned();
+        let expected = b"first-second";
+        let digest = sha256(expected);
+        let (client, server) = duplex(64 * 1024);
+        let (mut client_reader, mut client_writer) = tokio::io::split(client);
+        let task = tokio::spawn(async move {
+            let (mut server_reader, mut server_writer) = tokio::io::split(server);
+            upload_stream(
+                &mut server_reader,
+                &mut server_writer,
+                &destination_string,
+                expected.len() as u64,
+                &digest,
+            )
+            .await
+        });
+
+        write_msg(
+            &mut client_writer,
+            &WireFileChunk {
+                bytes: b"first-".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        assert!(!destination.exists(), "partial upload became visible");
+        write_msg(
+            &mut client_writer,
+            &WireFileChunk {
+                bytes: b"second".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_msg::<_, WireResponse>(&mut client_reader)
+                .await
+                .unwrap(),
+            WireResponse::UploadStreamOk { .. }
+        ));
+        task.await.unwrap().unwrap();
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), expected);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                tokio::fs::metadata(&destination)
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_upload_rejects_truncation_and_checksum_mismatch() {
+        for (name, size, digest) in [
+            ("truncated", 4, sha256(b"four")),
+            ("bad-digest", 3, sha256(b"not-three")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let destination = dir.path().join(name);
+            let destination_string = destination.to_string_lossy().into_owned();
+            let (client, server) = duplex(64 * 1024);
+            let (mut client_reader, mut client_writer) = tokio::io::split(client);
+            let task = tokio::spawn(async move {
+                let (mut server_reader, mut server_writer) = tokio::io::split(server);
+                upload_stream(
+                    &mut server_reader,
+                    &mut server_writer,
+                    &destination_string,
+                    size,
+                    &digest,
+                )
+                .await
+            });
+            write_msg(
+                &mut client_writer,
+                &WireFileChunk {
+                    bytes: b"bad".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+            client_writer.shutdown().await.unwrap();
+            assert!(matches!(
+                read_msg::<_, WireResponse>(&mut client_reader)
+                    .await
+                    .unwrap(),
+                WireResponse::Error { .. }
+            ));
+            task.await.unwrap().unwrap();
+            assert!(!destination.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_upload_retry_is_idempotent_and_conflict_is_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("same.bin");
+        tokio::fs::write(&destination, b"same").await.unwrap();
+        let path = destination.to_string_lossy().into_owned();
+
+        for (digest, expected_ok) in [(sha256(b"same"), true), (sha256(b"other"), false)] {
+            let (client, server) = duplex(64 * 1024);
+            let (mut client_reader, _client_writer) = tokio::io::split(client);
+            let path = path.clone();
+            let task = tokio::spawn(async move {
+                let (mut server_reader, mut server_writer) = tokio::io::split(server);
+                upload_stream(&mut server_reader, &mut server_writer, &path, 4, &digest).await
+            });
+            let response = read_msg::<_, WireResponse>(&mut client_reader)
+                .await
+                .unwrap();
+            assert_eq!(
+                matches!(response, WireResponse::UploadStreamOk { .. }),
+                expected_ok
+            );
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(tokio::fs::read(destination).await.unwrap(), b"same");
     }
 }

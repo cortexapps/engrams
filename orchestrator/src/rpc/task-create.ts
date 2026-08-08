@@ -251,6 +251,9 @@ export interface SessionCompileOpts {
    *  /etc/gitconfig's [user] block so in-session commits are authored by the
    *  human who started the session. Omit for service-account owners. */
   owner?: { name: string; email: string };
+  /** Child sessions report blockers through output and cannot pause on a
+   *  direct human interaction tool (ADR 0113). */
+  excludeHumanInteractionTools?: boolean;
 }
 
 /** The deployment's fallback harness when neither the session nor the profile
@@ -282,26 +285,32 @@ export async function compileSessionCreateInput(
   const { harnesses } = await deps.harnessCatalog.listHarnesses({});
   const descriptor = harnesses.find((h) => h.name === selectedHarness)?.descriptor;
   const modelId =
-    opts.model ?? profile.model ?? descriptor?.models.find((m) => m.default)?.id ?? descriptor?.models[0]?.id;
+    opts.model ??
+    profile.model ??
+    descriptor?.models.find((m) => m.default)?.id ??
+    descriptor?.models[0]?.id;
   const effortId =
-    opts.effort ?? profile.effort ?? descriptor?.effort.find((e) => e.default)?.id ?? descriptor?.effort[0]?.id;
+    opts.effort ??
+    profile.effort ??
+    descriptor?.effort.find((e) => e.default)?.id ??
+    descriptor?.effort[0]?.id;
   const modelOption = descriptor?.models.find((m) => m.id === modelId);
   const effortOption = descriptor?.effort.find((e) => e.id === effortId);
   const optionSecrets = [
     ...(modelOption === undefined
       ? []
       : (modelOption.secrets ?? []).map((secret) => ({
-        optionKind: "model" as const,
-        optionId: modelOption.id,
-        ...secret,
-      }))),
+          optionKind: "model" as const,
+          optionId: modelOption.id,
+          ...secret,
+        }))),
     ...(effortOption === undefined
       ? []
       : (effortOption.secrets ?? []).map((secret) => ({
-        optionKind: "effort" as const,
-        optionId: effortOption.id,
-        ...secret,
-      }))),
+          optionKind: "effort" as const,
+          optionId: effortOption.id,
+          ...secret,
+        }))),
   ];
   if (optionSecrets.length > 0) {
     const client: OrgSecretNameClient = deps.orgSecret ?? defaultOrgSecret;
@@ -397,13 +406,11 @@ export async function compileSessionCreateInput(
     opts.capabilityOverride ?? opts.extraCapabilities ?? [],
     connections,
   );
-  const effectiveGrants = opts.capabilityOverride !== undefined
-    ? overrideGrants
-    : [...profile.integrationGrants, ...overrideGrants];
-  const resolvedEffectiveGrants = await resolveIntegrationGrants(
-    effectiveGrants,
-    connections,
-  );
+  const effectiveGrants =
+    opts.capabilityOverride !== undefined
+      ? overrideGrants
+      : [...profile.integrationGrants, ...overrideGrants];
+  const resolvedEffectiveGrants = await resolveIntegrationGrants(effectiveGrants, connections);
   const disabledConnection = resolvedEffectiveGrants.find(({ connection }) => !connection.enabled);
   if (disabledConnection) {
     throw new ConnectError(
@@ -418,23 +425,33 @@ export async function compileSessionCreateInput(
   // The profile-only resolution is LAZY: under an override it never runs (its
   // result would be unused), and without one the memo makes it query-free
   // (profile grants are a subset of the effective grants resolved above).
-  const surfacedCapabilities = opts.capabilityOverride !== undefined
-    ? capabilities
-    : grantsToCapabilities(await resolveIntegrationGrants(profile.integrationGrants, connections));
+  const surfacedCapabilities =
+    opts.capabilityOverride !== undefined
+      ? capabilities
+      : grantsToCapabilities(
+          await resolveIntegrationGrants(profile.integrationGrants, connections),
+        );
   const cliPlan = compileCliIntegrations(surfacedCapabilities, registry);
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
   // Connector-backed CLIs, then the ones a named connection makes usable. The
   // second list comes from the provider registry, so a new provider surfaces
   // its CLI without a branch here.
-  const enabledCli = [
-    ...cliPlan.enabled,
-    ...providerCliSurfaces(resolvedEffectiveGrants),
-  ];
+  const enabledCli = [...cliPlan.enabled, ...providerCliSurfaces(resolvedEffectiveGrants)];
   if (enabledCli.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(enabledCli);
-  const toolManifest = compileToolManifest(
-    deps.toolRegistry ?? productionTools,
-    surfacedCapabilities,
-  );
+  const baseToolRegistry = deps.toolRegistry ?? productionTools;
+  const manifestRegistry: ToolRegistry = opts.excludeHumanInteractionTools
+    ? {
+        register: (definition) => baseToolRegistry.register(definition),
+        get: (name) => baseToolRegistry.get(name),
+        all: () =>
+          baseToolRegistry
+            .all()
+            .filter((tool) => tool.name !== "ask_user_question" && tool.name !== "exit_plan_mode"),
+        complete: (sessionId, toolCallId, result) =>
+          baseToolRegistry.complete(sessionId, toolCallId, result),
+      }
+    : baseToolRegistry;
+  const toolManifest = compileToolManifest(manifestRegistry, surfacedCapabilities);
   if (toolManifest.length > 0) harness.ENGRAM_TOOLS = JSON.stringify(toolManifest);
   if (!opts.dropProfileSecretsAndEnv) {
     for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v;
@@ -461,21 +478,22 @@ export async function compileSessionCreateInput(
   for (const [k, v] of Object.entries(opts.extraHarnessEnv ?? {})) {
     if (k !== userEnv && k !== orgEnv) harness[k] = v;
   }
-  harness.ENGRAM_APPEND_SYSTEM_PROMPT = [
-    harness.ENGRAM_APPEND_SYSTEM_PROMPT,
-    BASE_SYSTEM_PROMPT,
-  ].filter(Boolean).join("\n\n");
+  harness.ENGRAM_APPEND_SYSTEM_PROMPT = [harness.ENGRAM_APPEND_SYSTEM_PROMPT, BASE_SYSTEM_PROMPT]
+    .filter(Boolean)
+    .join("\n\n");
   // ADR 0097: the browser bundle carries a local image-observation tool. It
   // is harness-native (not a connector capability) and is enabled only when
   // the corresponding skill is mounted into this session.
   // Where a guest looks for each present provider's credential. The values
   // come from the provider itself, so a new one needs no branch here.
   Object.assign(harness, providerGuestEnv(resolvedEffectiveGrants));
-  const selectedSkills = [...new Set([
-    ...profile.skills,
-    ...cliPlan.bundles,
-    ...providerGuestBundles(resolvedEffectiveGrants),
-  ])];
+  const selectedSkills = [
+    ...new Set([
+      ...profile.skills,
+      ...cliPlan.bundles,
+      ...providerGuestBundles(resolvedEffectiveGrants),
+    ]),
+  ];
   if (selectedSkills.includes("browser")) harness.ENGRAM_BROWSER_VIEW_ENABLED = "1";
   else delete harness.ENGRAM_BROWSER_VIEW_ENABLED;
 
@@ -486,15 +504,19 @@ export async function compileSessionCreateInput(
 
   // Per-session integration policy (caps + network + secrets), shipped only
   // when it carries content.
-  const policy = compileIntegrationPolicy(resolvedEffectiveGrants.map(({ grant, connection }) => ({
-    connectionId: connection.id,
-    provider: connection.provider,
-    operation: grant.operation,
-    resourceConstraints: grant.resourceConstraints,
-  })), registry, {
-    network: opts.networkOverride ?? profile.network,
-    secrets: opts.dropProfileSecretsAndEnv ? [] : profile.secrets,
-  });
+  const policy = compileIntegrationPolicy(
+    resolvedEffectiveGrants.map(({ grant, connection }) => ({
+      connectionId: connection.id,
+      provider: connection.provider,
+      operation: grant.operation,
+      resourceConstraints: grant.resourceConstraints,
+    })),
+    registry,
+    {
+      network: opts.networkOverride ?? profile.network,
+      secrets: opts.dropProfileSecretsAndEnv ? [] : profile.secrets,
+    },
+  );
   for (const optionSecret of optionSecrets) {
     const mode = optionSecret.mode;
     if (mode !== "literal" && mode !== "broker") {
@@ -551,15 +573,20 @@ export async function compileSessionCreateInput(
     ...(capabilities.length > 0 ? { capabilities } : {}),
     ...(integrationPolicyJson != null ? { integrationPolicyJson } : {}),
     integrationGrants: effectiveGrants,
-    integrationConnections: [...new Map(
-      resolvedEffectiveGrants.map(({ connection }) => [connection.id, {
-        id: connection.id,
-        alias: connection.alias,
-        provider: connection.provider,
-        displayName: connection.displayName,
-        config: structuredClone(connection.config),
-      } satisfies IntegrationConnectionSnapshot]),
-    ).values()],
+    integrationConnections: [
+      ...new Map(
+        resolvedEffectiveGrants.map(({ connection }) => [
+          connection.id,
+          {
+            id: connection.id,
+            alias: connection.alias,
+            provider: connection.provider,
+            displayName: connection.displayName,
+            config: structuredClone(connection.config),
+          } satisfies IntegrationConnectionSnapshot,
+        ]),
+      ).values(),
+    ],
   };
 }
 
@@ -618,6 +645,9 @@ export interface CreateTaskParams {
   profileId: string;
   title?: string | null;
   prompt?: string;
+  /** Create the session without its initial prompt. The browser uploads files
+   *  and then sends the prompt through the normal prompt path (ADR 0113). */
+  deferInitialPrompt?: boolean;
   /** ADR 0063 B2: per-session override of the profile's harness / model / effort. */
   harness?: string;
   model?: string;
@@ -672,10 +702,7 @@ export interface CreatedTask {
 
 /** Make an already-persisted session discoverable by the listener scanner.
  * Callers with consumer-specific bindings must persist those bindings first. */
-export async function registerSessionListener(
-  db: Db,
-  sessionId: string,
-): Promise<void> {
+export async function registerSessionListener(db: Db, sessionId: string): Promise<void> {
   await db.insert(sessionListenerTable).values({ sessionId });
 }
 
@@ -752,9 +779,7 @@ export async function createSessionForExistingTask(
       ...(params.capabilityOverride !== undefined
         ? { capabilityOverride: params.capabilityOverride }
         : {}),
-      ...(params.networkOverride !== undefined
-        ? { networkOverride: params.networkOverride }
-        : {}),
+      ...(params.networkOverride !== undefined ? { networkOverride: params.networkOverride } : {}),
       ...(params.dropProfileSecretsAndEnv !== undefined
         ? { dropProfileSecretsAndEnv: params.dropProfileSecretsAndEnv }
         : {}),
@@ -817,7 +842,12 @@ export async function createSessionForExistingTask(
       await deps.db.transaction(async (tx) => {
         await tx
           .delete(taskSessionTable)
-          .where(and(eq(taskSessionTable.taskId, params.taskId), eq(taskSessionTable.sessionId, sessionId)));
+          .where(
+            and(
+              eq(taskSessionTable.taskId, params.taskId),
+              eq(taskSessionTable.sessionId, sessionId),
+            ),
+          );
       });
     } catch (dbErr) {
       log.error(
@@ -898,9 +928,33 @@ export async function createTaskWithSession(
     },
   );
 
+  if (params.deferInitialPrompt) {
+    delete sessionInput.prompt;
+    delete sessionInput.harnessMode;
+  }
+
   const taskId = deps.newTaskId?.() ?? crypto.randomUUID();
   const sessionId = deps.newSessionId?.() ?? crypto.randomUUID();
   sessionInput.requestedSessionId = sessionId;
+  const launchPolicy: schema.TaskLaunchPolicy = {
+    version: 1,
+    profileId: profile.id,
+    imageUri: sessionInput.imageUri,
+    harness: sessionInput.harness ?? profile.harness,
+    ...(sessionInput.model != null ? { model: sessionInput.model } : {}),
+    ...(sessionInput.effort != null ? { effort: sessionInput.effort } : {}),
+    includeUserTokens: profile.includeUserTokens,
+    envVars: { ...profile.envVars },
+    skills: [...(sessionInput.selectedSkills ?? [])],
+    capabilities: [...(sessionInput.capabilities ?? [])],
+    integrationPolicyJson: sessionInput.integrationPolicyJson ?? "",
+    integrationGrants: [...(sessionInput.integrationGrants ?? [])],
+    integrationConnections: [...(sessionInput.integrationConnections ?? [])],
+    network: profile.network,
+    secrets: [...profile.secrets],
+    repos: [...profile.repos],
+    portExposures: [...profile.portExposures],
+  };
 
   // ADR 0109: the broker must see this snapshot before the VM can make its
   // first credentialed request. Listener registration remains post-boot.
@@ -917,6 +971,8 @@ export async function createTaskWithSession(
       harness: sessionInput.harness ?? null,
       model: sessionInput.model ?? null,
       effort: sessionInput.effort ?? null,
+      rootTaskId: taskId,
+      launchPolicy,
     });
     await tx.insert(taskSessionTable).values({
       taskId,
@@ -994,10 +1050,7 @@ export async function createTaskWithSession(
           visibility: "private",
         });
       } catch (e) {
-        log.warn(
-          { sessionId, port, err: e },
-          "task-create: auto-expose port failed (continuing)",
-        );
+        log.warn({ sessionId, port, err: e }, "task-create: auto-expose port failed (continuing)");
       }
     }
   }

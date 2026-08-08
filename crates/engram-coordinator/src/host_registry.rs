@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use engram_core::traits::{HarnessDial, HostClient, MetadataStore, SessionFence};
 use engram_core::types::sandbox::{
-    AgentSpec, ExecRequest, ExecStream, SandboxSpec, WriteFileResult, WriteFileSpec,
+    AgentSpec, ExecRequest, ExecStream, SandboxSpec, SessionFileMetadata, SessionFileSpec,
+    SessionFileStream, WriteFileResult, WriteFileSpec,
 };
 use engram_core::types::session::SessionState;
 use engram_core::types::snapshot::SnapshotMetadata;
@@ -574,6 +575,25 @@ impl HostClient for HostRegistry {
                 other => return other,
             }
         }
+    }
+
+    async fn upload_file(
+        &self,
+        id: SandboxId,
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.upload_file(id, spec, bytes).await
+    }
+
+    async fn read_file(
+        &self,
+        id: SandboxId,
+        path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.read_file(id, path).await
     }
 
     async fn snapshot(

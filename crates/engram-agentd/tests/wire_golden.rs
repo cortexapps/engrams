@@ -53,7 +53,7 @@ use std::path::PathBuf;
 
 use engram_agentd::proto::{
     AgentReady, SpawnHarnessRequest, WireDownloadResponse, WireExecEvent, WireExecRequest,
-    WireHandshake, WireHandshakeAck, WireRequest, WireResponse, WireStatResponse,
+    WireFileChunk, WireHandshake, WireHandshakeAck, WireRequest, WireResponse, WireStatResponse,
 };
 use serde::Serialize;
 
@@ -158,6 +158,14 @@ fn wire_request_golden_and_variant_indices() {
     let cancel_exec = WireRequest::CancelExec {
         exec_id: "exec-golden".into(),
     };
+    let upload_stream = WireRequest::UploadStream {
+        path: "/tmp/uploads/id/file.bin".into(),
+        size_bytes: 4,
+        sha256: "0123456789abcdef".repeat(4),
+    };
+    let download_stream = WireRequest::DownloadStream {
+        path: "/tmp/uploads/id/file.bin".into(),
+    };
 
     assert_golden("request_exec", &exec);
     assert_golden("request_stat", &stat);
@@ -174,6 +182,8 @@ fn wire_request_golden_and_variant_indices() {
     assert_golden("request_start_ide", &start_ide);
     assert_golden("request_stop_ide", &WireRequest::StopIde);
     assert_golden("request_cancel_exec", &cancel_exec);
+    assert_golden("request_upload_stream", &upload_stream);
+    assert_golden("request_download_stream", &download_stream);
 
     assert_variant_index(&exec, 0, "WireRequest::Exec");
     assert_variant_index(&stat, 1, "WireRequest::Stat");
@@ -200,6 +210,8 @@ fn wire_request_golden_and_variant_indices() {
         "WireRequest::StepClock",
     );
     assert_variant_index(&cancel_exec, 16, "WireRequest::CancelExec");
+    assert_variant_index(&upload_stream, 17, "WireRequest::UploadStream");
+    assert_variant_index(&download_stream, 18, "WireRequest::DownloadStream");
 }
 
 // ---- WireResponse ------------------------------------------------------
@@ -246,6 +258,14 @@ fn wire_response_golden_and_variant_indices() {
         port: 13337,
         spawned: true,
     };
+    let upload_stream_ok = WireResponse::UploadStreamOk {
+        size_bytes: 4,
+        sha256: "0123456789abcdef".repeat(4),
+    };
+    let download_stream_ready = WireResponse::DownloadStreamReady {
+        size_bytes: 4,
+        sha256: "0123456789abcdef".repeat(4),
+    };
 
     assert_golden("response_stat", &stat);
     assert_golden("response_upload_ok", &WireResponse::UploadOk);
@@ -266,6 +286,8 @@ fn wire_response_golden_and_variant_indices() {
     assert_golden("response_ide_ready", &ide_ready);
     assert_golden("response_ide_stopped", &WireResponse::IdeStopped);
     assert_golden("response_exec_cancelled", &WireResponse::ExecCancelled);
+    assert_golden("response_upload_stream_ok", &upload_stream_ok);
+    assert_golden("response_download_stream_ready", &download_stream_ready);
 
     assert_variant_index(&stat, 0, "WireResponse::Stat");
     assert_variant_index(&WireResponse::UploadOk, 1, "WireResponse::UploadOk");
@@ -308,6 +330,22 @@ fn wire_response_golden_and_variant_indices() {
         &WireResponse::ExecCancelled,
         16,
         "WireResponse::ExecCancelled",
+    );
+    assert_variant_index(&upload_stream_ok, 17, "WireResponse::UploadStreamOk");
+    assert_variant_index(
+        &download_stream_ready,
+        18,
+        "WireResponse::DownloadStreamReady",
+    );
+}
+
+#[test]
+fn wire_file_chunk_golden() {
+    assert_golden(
+        "file_chunk",
+        &WireFileChunk {
+            bytes: vec![0xde, 0xad, 0xbe, 0xef],
+        },
     );
 }
 
@@ -434,6 +472,20 @@ fn regen_golden() {
             exec_id: "exec-golden".into(),
         },
     );
+    write(
+        "request_upload_stream",
+        &WireRequest::UploadStream {
+            path: "/tmp/uploads/id/file.bin".into(),
+            size_bytes: 4,
+            sha256: "0123456789abcdef".repeat(4),
+        },
+    );
+    write(
+        "request_download_stream",
+        &WireRequest::DownloadStream {
+            path: "/tmp/uploads/id/file.bin".into(),
+        },
+    );
 
     write(
         "response_stat",
@@ -505,6 +557,26 @@ fn regen_golden() {
     );
     write("response_ide_stopped", &WireResponse::IdeStopped);
     write("response_exec_cancelled", &WireResponse::ExecCancelled);
+    write(
+        "response_upload_stream_ok",
+        &WireResponse::UploadStreamOk {
+            size_bytes: 4,
+            sha256: "0123456789abcdef".repeat(4),
+        },
+    );
+    write(
+        "response_download_stream_ready",
+        &WireResponse::DownloadStreamReady {
+            size_bytes: 4,
+            sha256: "0123456789abcdef".repeat(4),
+        },
+    );
+    write(
+        "file_chunk",
+        &WireFileChunk {
+            bytes: vec![0xde, 0xad, 0xbe, 0xef],
+        },
+    );
 
     write(
         "exec_event_stdout",

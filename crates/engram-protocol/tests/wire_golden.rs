@@ -658,7 +658,7 @@ fn wire_version_pinned() {
     // All session-policy goldens were regenerated; the Google fixture pins a
     // service and a populated tunnel.
     assert_eq!(
-        WIRE_VERSION, 26,
+        WIRE_VERSION, 27,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

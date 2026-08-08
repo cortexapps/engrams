@@ -148,7 +148,11 @@ use serde::{Deserialize, Serialize};
 // credential purpose becomes a provider-owned string, and tunnel mint
 // authority is optional. Bincode field replacement and addition; coordinator
 // and host roll in lockstep.
-pub const WIRE_VERSION: u32 = 26;
+// v27 (ADR 0113): HostService gains streamed session-file upload and read
+// operations. The payload itself is protobuf, but an older host cannot serve
+// the new methods. Fence mixed fleets so the coordinator retries after the
+// host roll instead of accepting a prompt whose required file was not copied.
+pub const WIRE_VERSION: u32 = 27;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

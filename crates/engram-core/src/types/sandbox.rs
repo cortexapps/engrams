@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use super::ids::SandboxId;
 use super::image::NetworkPolicy;
 
+/// Maximum size of one composer/session file (ADR 0113).
+pub const MAX_SESSION_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
 /// ADR 0068 probe-before-host_lost: the answer to "is this specific
 /// sandbox actually there", from GROUND TRUTH — not the in-memory
 /// sandbox map `SandboxBackend::list()` reads (that map, or its
@@ -444,6 +447,27 @@ pub struct WriteFileResult {
     pub ok: bool,
     pub error: Option<String>,
 }
+
+/// Metadata for one bounded-memory file transfer (ADR 0113).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileSpec {
+    pub path: String,
+    pub size_bytes: u64,
+    /// Lower-case hexadecimal SHA-256 digest.
+    pub sha256: String,
+}
+
+/// Verified metadata returned after upload or before a read stream.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFileMetadata {
+    pub path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+/// A bounded-memory stream of file bytes.
+pub type SessionFileStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, crate::SandboxError>> + Send + 'static>>;
 
 /// Output event from a streaming `exec`. A terminal backend result is marked
 /// by exactly one `Exit` or `Refused`. The event stream may instead end
