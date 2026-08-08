@@ -179,5 +179,13 @@ pub fn set_parent_from_traceparent(span: &tracing::Span, traceparent: &str) {
     let mut carrier = HashMap::new();
     carrier.insert("traceparent".to_string(), traceparent.to_string());
     let parent_cx = opentelemetry::global::get_text_map_propagator(|prop| prop.extract(&carrier));
-    span.set_parent(parent_cx);
+    // tracing-opentelemetry 0.33 made `set_parent` fallible (it errors when
+    // the span has no otel layer registered — i.e. telemetry is off). That
+    // is the documented no-op case for this function, so it must not
+    // propagate; log it instead of discarding, the same way the provider
+    // shutdown above treats a tolerated failure. Swallowing it silently
+    // would turn "traces stopped stitching" into an invisible symptom.
+    if let Err(e) = span.set_parent(parent_cx) {
+        tracing::debug!(error = %e, "set parent from traceparent");
+    }
 }
