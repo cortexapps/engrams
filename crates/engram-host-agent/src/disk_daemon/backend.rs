@@ -2036,8 +2036,11 @@ impl ChunkedDiskBackend {
 
     /// The device path registered for capture syncs, if any. Test
     /// surface for the serve-time wiring: an unregistered served
-    /// backend captures WITHOUT the pre-freeze sync, silently.
-    #[cfg(test)]
+    /// backend captures WITHOUT the pre-freeze sync, silently. Gated
+    /// to Linux like its only caller (the `serve_at` registration test
+    /// in `runtime.rs`, a `#![cfg(target_os = "linux")]` module) — on
+    /// macOS the method would be dead code under `-D warnings`.
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn registered_host_device(&self) -> Option<PathBuf> {
         self.host_device
             .lock()
