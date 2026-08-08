@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM rust:1.96-slim AS builder
+FROM rust:1.97-slim AS builder
 WORKDIR /src
 # protobuf-compiler: ADR 0013 added a build.rs in engram-protocol that
 # invokes `protoc` to compile `proto/host_service.proto`. The Debian
