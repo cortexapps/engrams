@@ -260,7 +260,7 @@ jobs:
           shared-key: workspace-debug
 
       # Install cargo-hakari from a prebuilt release (~1s) so we can
-      # `cargo hakari verify` below. The dev shell pulls this from
+      # `cargo hakari generate --diff` below. The dev shell pulls this from
       # nixpkgs; CI uses taiki-e/install-action to avoid a slow
       # `cargo install` from source.
       - name: Install cargo-hakari
@@ -282,12 +282,25 @@ jobs:
       - name: cargo check --workspace --all-targets
         if: always()
         run: cargo check --workspace --all-targets
-      # Catch dep additions that didn't regenerate workspace-hack.
-      # Run `just hakari` (or `cargo hakari generate`) locally and
-      # commit `workspace-hack/Cargo.toml` if this fails.
-      - name: cargo hakari verify
+      # Catch dep additions that didn't regenerate workspace-hack, AND
+      # any hand edit to it. Run `just hakari` locally and commit
+      # `workspace-hack/Cargo.toml` if this fails.
+      #
+      # `generate --diff` rather than `verify`: verify only asks whether
+      # the pins are SUFFICIENT to unify features, so an edit that adds a
+      # version nothing consumes sails through it. That is not
+      # hypothetical — `workspace-hack/Cargo.toml` is a workspace member,
+      # so Dependabot reads it as a manifest and opens bumps against the
+      # generated pins. #1075 landed one (der 0.7.10 -> 0.8.1; der is not
+      # a direct dependency anywhere) and left main carrying an
+      # unconsumed der 0.8.1 + pem-rfc7468 1.0.0 in the lockfile with
+      # every lane green. `generate --diff` exits 1 unless the file is
+      # exactly what `cargo hakari generate` emits, which is the only
+      # correct content for a generated file — and it subsumes verify,
+      # since generate's own output always verifies.
+      - name: cargo hakari generate --diff
         if: always()
-        run: cargo hakari verify
+        run: cargo hakari generate --diff
 
   test-linux:
     name: tests (linux)
