@@ -16,9 +16,10 @@
 //! owning the whole `NbdSandboxState`; modelling it as a `&self` trait
 //! method would be a lie about that ownership transfer. So abandon stays a
 //! method on the state, and `DeviceSync` is a single-method seam. The prod
-//! impl lives in `engram-host-agent` next to its only caller (the
-//! spawn_blocking `OpenOptions::sync_all` in `pooled_backend`); the sim
-//! impl records the sync against its acked-write ledger.
+//! impl lives in `engram-host-agent`; the disk daemon's capture primitive
+//! (`ChunkedDiskBackend::sync_host_device`, called by `flush_local` before
+//! every freeze) is the main caller. The sim impl records the sync against
+//! its acked-write ledger.
 
 use std::io;
 use std::path::Path;
@@ -28,8 +29,10 @@ use async_trait::async_trait;
 /// Force the host page cache for a block device down to its backing store.
 #[async_trait]
 pub trait DeviceSync: Send + Sync {
-    /// `sync_all()` the device at `path` (opened read+write). A failure is
-    /// a `warn`-and-proceed at the call site, not a hard error — pages left
-    /// behind ride the kernel's dead-conn parking to the successor.
+    /// `sync_all()` the device at `path` (opened read+write). Capture
+    /// paths treat a failure as a hard error (an unsynced freeze can
+    /// publish a torn chunk); best-effort warm-up paths warn and
+    /// proceed — pages left behind ride the kernel's dead-conn parking
+    /// to the successor.
     async fn sync_device(&self, path: &Path) -> io::Result<()>;
 }

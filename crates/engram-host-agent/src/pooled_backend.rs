@@ -2878,46 +2878,25 @@ impl PooledBackend {
         // memory capture below is paired with it.
         #[cfg(target_os = "linux")]
         {
-            // INVARIANT (see `nbd_sandboxes`): clone the Arc + copy the
-            // device path out of the guard, then drop it BEFORE any
-            // `.await` — a held guard across the drain/upload below
-            // parks contending `destroy`/`create` workers on the
-            // shard's sync RwLock and can deadlock the runtime.
-            let backend_dev = self
+            // INVARIANT (see `nbd_sandboxes`): clone the Arc out of the
+            // guard, then drop it BEFORE any `.await` — a held guard
+            // across the drain/upload below parks contending
+            // `destroy`/`create` workers on the shard's sync RwLock and
+            // can deadlock the runtime.
+            let disk_backend = self
                 .nbd_sandboxes
                 .get(&id)
-                .map(|entry| (entry.backend.clone(), entry.device_path().to_path_buf()));
-            if let Some((backend, dev)) = backend_dev {
-                // Push the HOST's block-device page cache down to the
-                // daemon BEFORE draining. FC's virtio-blk writes to
-                // /dev/nbdN through the kernel page cache (drive
-                // cache_type = Unsafe: guest FLUSH does not propagate), so
-                // without this fsync the drain captures only what
-                // background writeback (~30 s) happened to deliver — a
-                // session that wrote recently snapshots a TORN chunk (the
-                // delivered front + a stale tail). The migration captures
-                // each carried this fsync already; the standard pipeline
-                // (periodic checkpoint / idle-evict / rehome) relied on
-                // "quiescent sessions age past the writeback interval",
-                // which the disk post-copy canary disproved: write → evac
-                // 15 s later published chunk 34 with its last 56 KiB
-                // reverted, and a periodic checkpoint of an actively-
-                // writing guest has the same hole (recovery from it would
-                // be corrupt).
-                tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                    let f = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&dev)?;
-                    f.sync_all()
-                })
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush join: {e}")))?
-                .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
+                .map(|entry| entry.backend.clone());
+            if let Some(backend) = disk_backend {
                 // Drain in-flight NBD requests so the drain sees a quiescent
                 // dirty buffer. With FC paused above, no new virtio writes
                 // are issued, and wait_idle returns once already-in-flight
                 // requests have completed through backend.write().
+                // `flush_local` then syncs the HOST page cache for
+                // /dev/nbdN down first (the capture primitive owns that
+                // sync — see `ChunkedDiskBackend::sync_host_device`), so
+                // the drain captures the guest-acked bytes, not just what
+                // background writeback (~30 s) happened to deliver.
                 backend.wait_idle().await;
                 let pending = backend
                     .flush_local()
@@ -4765,22 +4744,10 @@ impl PooledBackend {
     /// to GCS; only the coord publish is skipped.
     #[cfg(target_os = "linux")]
     pub async fn flush_nbd_data_planes_for_shutdown(&self, deadline: std::time::Duration) {
-        // The `DeviceSync` seam's `sync_device` method (ADR 0098 P4).
-        use engram_host_core::DeviceSync as _;
-        let entries: Vec<(
-            SandboxId,
-            Arc<crate::disk_daemon::ChunkedDiskBackend>,
-            std::path::PathBuf,
-        )> = self
+        let entries: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = self
             .nbd_sandboxes
             .iter()
-            .map(|e| {
-                (
-                    *e.key(),
-                    e.value().backend.clone(),
-                    e.value().device_path().to_path_buf(),
-                )
-            })
+            .map(|e| (*e.key(), e.value().backend.clone()))
             .collect();
         if entries.is_empty() {
             return;
@@ -4807,41 +4774,23 @@ impl PooledBackend {
         let publish = self.shutdown_manifest_publish.clone();
         let session_bindings = self.session_bindings.clone();
         let mut tasks = tokio::task::JoinSet::new();
-        for (sandbox_id, backend, device) in entries {
+        for (sandbox_id, backend) in entries {
             let publish = publish.clone();
             let session_id = session_bindings.get(&sandbox_id).map(|e| *e);
             tasks.spawn(async move {
-                // 2026-07-16 RCA: FC's drive is buffered host I/O with
-                // cache_type=Unsafe, so guest-acked writes can still be
-                // sitting in the HOST page cache for /dev/nbdN — a tier
-                // the dirty-map flush below never sees, and one the
-                // pod-handoff dead-connection window can silently drop
-                // (`lost async page write`). Force it down into the
-                // daemon's dirty tier NOW, while our serve loop is
-                // still alive to ack the writeback (the checkpoint path
-                // does the same). Routed through the DeviceSync seam
-                // (ADR 0098 P4) — a spawn_blocking open+sync_all; a
-                // join/sync failure is warn-and-proceed. O_DIRECT here
-                // is a no-op (see `device_sync`), so the sync path is
-                // unchanged.
-                if let Err(e) = crate::device_sync::HostDeviceSync
-                    .sync_device(&device)
-                    .await
-                {
-                    tracing::warn!(
-                        %sandbox_id,
-                        device = %device.display(),
-                        error = %e,
-                        "SIGTERM final flush: host page-cache sync of the NBD \
-                         device failed; proceeding (pages left behind will ride \
-                         the kernel's dead-conn parking to the successor)",
-                    );
-                }
                 // Quiesce the virtio → kernel-NBD → daemon pipeline so
                 // the flush captures the just-acked disk state, then
                 // drain + upload + rebase. `flush` no-ops (zero chunks)
                 // when the dirty tier is empty — cheap for quiescent
-                // survivors.
+                // survivors. The 2026-07-16 RCA's host page-cache sync
+                // (ADR 0098 P4) now lives INSIDE the capture primitive
+                // (`ChunkedDiskBackend::sync_host_device`, called by
+                // `flush_local`), while our serve loop is still alive to
+                // ack the writeback. A sync failure fails the flush; the
+                // Err arm below leaves the writes to ride the shutdown
+                // spool + the kernel's dead-conn parking to the
+                // successor — strictly safer than publishing a manifest
+                // that misses guest-acked bytes.
                 backend.wait_idle().await;
                 // ADR 0098 P4: the per-survivor disposition is the pure
                 // `classify_survivor` decision; the driver only sequences
@@ -7946,37 +7895,27 @@ impl SandboxBackend for PooledBackend {
         let memory_manifest_json = serde_json::to_vec(&chain_manifest)
             .map_err(|e| SandboxError::Snapshot(format!("chain manifest json: {e}")))?;
 
-        // INVARIANT (see `nbd_sandboxes`): clone the Arc + copy the
-        // device path out of the guard, then drop it before the fsync
-        // join and `manifest_ref().await` below.
+        // INVARIANT (see `nbd_sandboxes`): clone the Arc out of the
+        // guard, then drop it before the sync and
+        // `manifest_ref().await` below.
         #[cfg(target_os = "linux")]
-        let backend_dev = self
+        let disk_backend = self
             .nbd_sandboxes
             .get(&id)
-            .map(|entry| (entry.backend.clone(), entry.device_path().to_path_buf()));
+            .map(|entry| entry.backend.clone());
         #[cfg(target_os = "linux")]
-        let disk_manifest_ref = match backend_dev {
-            Some((backend, dev)) => {
+        let disk_manifest_ref = match disk_backend {
+            Some(backend) => {
                 // Disk post-copy pre-copy leg: push the host block
                 // cache down into the daemon's dirty buffer WHILE the
                 // guest still runs, so the capture's under-freeze
-                // fsync only carries the since-presetup delta (and
+                // sync only carries the since-presetup delta (and
                 // any first-touch RMW base fetches happen off the
-                // blackout). Best-effort — the capture's fsync is the
+                // blackout). Best-effort — the capture's sync is the
                 // coherence-bearing one.
-                let r = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                    let f = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&dev)?;
-                    f.sync_all()
-                })
-                .await
-                .map_err(|e| std::io::Error::other(format!("presetup fsync join: {e}")))
-                .and_then(|inner| inner);
-                if let Err(e) = r {
+                if let Err(e) = backend.sync_host_device().await {
                     tracing::warn!(sandbox_id = %id, error = %e,
-                        "presetup pre-pause NBD fsync failed (non-fatal; capture re-fsyncs)");
+                        "presetup pre-pause NBD sync failed (non-fatal; capture re-syncs)");
                 }
                 Some(backend.manifest_ref().await)
             }
@@ -8117,27 +8056,22 @@ impl SandboxBackend for PooledBackend {
             // pre-export error arm AND on wire cancellation — a fenced
             // backend whose capture failed would otherwise no-op
             // flushes forever (silent durability stall).
-            let disk_entry = self
-                .nbd_sandboxes
-                .get(&id)
-                .map(|e| (e.backend.clone(), e.device_path().to_path_buf()));
+            let disk_entry = self.nbd_sandboxes.get(&id).map(|e| e.backend.clone());
             let t_disk = crate::time_source::metrics_now();
-            if let Some((backend, dev)) = &disk_entry {
+            if let Some(backend) = &disk_entry {
                 backend.set_migration_fence(true);
                 // Issue #202: record the fence on the unwind guard.
                 unwind.disk_backend = Some(backend.clone());
                 unwind.fenced = true;
-                let dev = dev.clone();
-                tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                    let f = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&dev)?;
-                    f.sync_all()
-                })
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("nbd flush join: {e}")))?
-                .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
+                // `seal_for_postcopy` below is a capture primitive of its
+                // own (it does not route through `flush_local`), so this
+                // path syncs the host page cache explicitly through the
+                // same seam. Hard error: an unsynced seal ships torn
+                // chunks to the destination.
+                backend
+                    .sync_host_device()
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
                 backend.wait_idle().await;
             }
             let mut disk_drain_ms = t_disk.elapsed().as_millis() as u64;
@@ -8197,7 +8131,7 @@ impl SandboxBackend for PooledBackend {
             // requeue before returning. Only the descriptor write and
             // the export insert sit in that window.
             let t_seal = crate::time_source::metrics_now();
-            let (disk_seal, disk_seal_info) = if let Some((backend, _)) = &disk_entry {
+            let (disk_seal, disk_seal_info) = if let Some(backend) = &disk_entry {
                 let (sealed, base_manifest, base_ref) = backend.seal_for_postcopy().await;
                 let info = serde_json::json!({
                     "sealed_chunk_indices": sealed.indices(),
@@ -8501,46 +8435,30 @@ impl SandboxBackend for PooledBackend {
 
         // Disk: drain under the pause, land the pending tier in the
         // LOCAL cache, fence further flush publishes.
-        // INVARIANT (see `nbd_sandboxes`): clone the Arc + copy the
-        // device path out of the guard, then drop it before the
-        // multi-second drain (`fsync` join + `flush_local` +
-        // `flush_to_local_cache`) — a held guard parks contending
-        // `destroy`/`create` workers on the shard's sync RwLock.
+        // INVARIANT (see `nbd_sandboxes`): clone the Arc out of the
+        // guard, then drop it before the multi-second drain
+        // (`flush_local` + `flush_to_local_cache`) — a held guard parks
+        // contending `destroy`/`create` workers on the shard's sync
+        // RwLock.
         #[cfg(target_os = "linux")]
-        let backend_dev = self
+        let disk_backend = self
             .nbd_sandboxes
             .get(&id)
-            .map(|entry| (entry.backend.clone(), entry.device_path().to_path_buf()));
+            .map(|entry| entry.backend.clone());
         #[cfg(target_os = "linux")]
-        let (disk_manifest_json, disk_ref, disk_hashes) = if let Some((backend, dev)) = backend_dev
-        {
+        let (disk_manifest_json, disk_ref, disk_hashes) = if let Some(backend) = disk_backend {
             backend.set_migration_fence(true);
             // Issue #202: the fence is now raised — record it on the
             // guard so an unwind clears it (else `flush()` no-ops for
             // the sandbox's lifetime).
             unwind.disk_backend = Some(backend.clone());
             unwind.fenced = true;
-            // Push the HOST's block-device page cache down to the
-            // daemon before draining. FC's virtio-blk writes to
-            // /dev/nbdN through the kernel page cache (drive
-            // cache_type default = Unsafe: guest FLUSH does not
-            // propagate), so without this fsync the drain captures
-            // only what background writeback happened to push —
-            // an ACTIVE guest's recent writes were still in the
-            // host cache and the export shipped a chunk with
-            // zeros/stale bytes where they belonged (the two-host
-            // NBD e2e probe; idle evictions dodge it because a
-            // quiescent session ages past the writeback interval).
-            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&dev)?;
-                f.sync_all()
-            })
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush join: {e}")))?
-            .map_err(|e| SandboxError::Snapshot(format!("nbd host-cache flush: {e}")))?;
+            // `flush_local` syncs the HOST page cache for /dev/nbdN
+            // down first (see `ChunkedDiskBackend::sync_host_device`),
+            // so the export ships the guest-acked bytes — without it an
+            // ACTIVE guest's recent writes were still in the host cache
+            // and the export shipped a chunk with zeros/stale bytes
+            // where they belonged (the two-host NBD e2e probe).
             backend.wait_idle().await;
             let pending = backend
                 .flush_local()

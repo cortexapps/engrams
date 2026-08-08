@@ -3,9 +3,11 @@
 //! [`HostDeviceSync`] is the prod side of `engram-host-core`'s
 //! [`DeviceSync`] seam: it opens `/dev/nbdN` read+write and `sync_all()`s it,
 //! forcing the host page cache for the device down into the daemon's dirty
-//! tier while the serve loop is still alive to ack the writeback. It lives
-//! here, next to its only caller (the SIGTERM final-flush pass in
-//! `pooled_backend`), while the trait and the simulator's recording stub live
+//! tier while the serve loop is still alive to ack the writeback.
+//! `disk_daemon::runtime::serve_at` registers it on the backend at CONNECT /
+//! RECONFIGURE, and the capture primitive
+//! (`ChunkedDiskBackend::sync_host_device`, called by `flush_local`) invokes
+//! it before every freeze. The trait and the simulator's recording stub live
 //! in the portable crates.
 //!
 //! # The O_DIRECT rider (2026-07-16 session-85e0298a RCA) — verdict: no-op

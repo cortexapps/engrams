@@ -34,6 +34,7 @@ use engram_chunk_store::{
     store::ChunkStore,
 };
 use engram_core::types::manifest::ManifestRef;
+use engram_host_core::DeviceSync;
 use tokio::sync::{Mutex, Notify};
 
 /// ADR 0016 Phase B default: flush is triggered when dirty bytes
@@ -103,6 +104,15 @@ pub enum DiskBackendError {
         expected: u64,
         actual: usize,
     },
+    /// The host page-cache sync of the served block device failed.
+    /// The freeze is refused: an unsynced freeze can miss guest-acked
+    /// bytes that sit only in the host page cache and publish a torn
+    /// chunk. Callers retry (the flush scheduler on its next wake) or
+    /// refuse the capture.
+    DeviceSync {
+        device: PathBuf,
+        source: std::io::Error,
+    },
     /// Internal invariant tripped (an "unreachable" branch fired).
     /// Used by `write_chunk` to surface a logic bug without
     /// panicking the daemon. Replied back to the NBD client as
@@ -139,6 +149,11 @@ impl std::fmt::Display for DiskBackendError {
                 "spool adoption refused: chunk {chunk_idx} (len {len}) is out of shape for this \
                  backend — adopting a partial spool would silently roll back acked writes \
                  (the 85e0298a class); the whole spool is rejected and preserved on disk"
+            ),
+            Self::DeviceSync { device, source } => write!(
+                f,
+                "host page-cache sync of {} failed before the freeze: {source}",
+                device.display()
             ),
             Self::InvariantViolation(m) => write!(f, "invariant violation: {m}"),
         }
@@ -1095,6 +1110,14 @@ pub struct ChunkedDiskBackend {
     /// participate too (cheap, and lets future barriers cover them).
     in_flight: Arc<InFlightTracker>,
 
+    /// The host-facing block device this backend serves (`/dev/nbdN`)
+    /// plus the [`DeviceSync`] seam, registered by `runtime::serve_at`
+    /// on CONNECT and RECONFIGURE. `flush_local` syncs it before every
+    /// freeze (see [`Self::sync_host_device`]). `None` until the
+    /// backend is served as a device (and in unit tests that drive the
+    /// backend without a kernel device). `std` mutex: every access is
+    /// a brief, non-awaiting clone.
+    host_device: std::sync::Mutex<Option<(PathBuf, Arc<dyn DeviceSync>)>>,
     /// ADR 0019: the lifecycle operation this sandbox's data plane is
     /// currently serving (cold boot / resume / …), if any. When active,
     /// `read_chunk` parents a `chunk.fetch` span on the operation so the
@@ -1463,6 +1486,7 @@ impl ChunkedDiskBackend {
             post_copy: Arc::new(std::sync::Mutex::new(None)),
             threshold_bytes,
             in_flight: Arc::new(InFlightTracker::new()),
+            host_device: std::sync::Mutex::new(None),
             operation_scope: crate::trace_scope::OperationScope::default(),
             entropy: Arc::new(engram_core::traits::OsEntropy),
             scheduler_seam: std::sync::Mutex::new(None),
@@ -2001,10 +2025,71 @@ impl ChunkedDiskBackend {
             .store(fenced, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Register the served block device (and the sync seam) so every
+    /// capture syncs the HOST page cache for the device down into the
+    /// dirty tier before it freezes. `runtime::serve_at` calls this on
+    /// both CONNECT and RECONFIGURE; re-registering replaces the
+    /// previous device.
+    pub fn register_host_device(&self, device: PathBuf, sync: Arc<dyn DeviceSync>) {
+        *self.host_device.lock().unwrap() = Some((device, sync));
+    }
+
+    /// The device path registered for capture syncs, if any. Test
+    /// surface for the serve-time wiring: an unregistered served
+    /// backend captures WITHOUT the pre-freeze sync, silently.
+    #[cfg(test)]
+    pub(crate) fn registered_host_device(&self) -> Option<PathBuf> {
+        self.host_device
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(path, _)| path.clone())
+    }
+
+    /// Force the host page cache for the served device down into the
+    /// dirty tier (a `sync_all` on `/dev/nbdN` — see `DeviceSync`).
+    ///
+    /// FC's drive is buffered host I/O (`cache_type=Unsafe`): the guest
+    /// gets its write ack when the bytes land in the HOST page cache —
+    /// a tier the dirty tier does not see until writeback delivers it.
+    /// A freeze taken without this sync captures only what background
+    /// writeback (~30 s) happened to deliver, so an actively-writing
+    /// guest publishes a TORN chunk (the delivered front + a stale
+    /// tail). The 2026-07-16 session-85e0298a RCA and the disk
+    /// post-copy canary proved the class on the capture paths; the
+    /// 2026-08-07 session-ae53a407 guest-EIO/SIGBUS incident is
+    /// consistent with the same class on an unsynced publish.
+    ///
+    /// `sync_all` returns only after the device's writeback completes,
+    /// i.e. after the daemon acked every delivered write into the
+    /// dirty tier — so a freeze that follows this call sees them all.
+    /// No-op when no device is registered (unit tests; a backend not
+    /// yet served as a device).
+    pub async fn sync_host_device(&self) -> Result<(), DiskBackendError> {
+        let registered = self.host_device.lock().unwrap().clone();
+        let Some((device, sync)) = registered else {
+            return Ok(());
+        };
+        sync.sync_device(&device)
+            .await
+            .map_err(|source| DiskBackendError::DeviceSync { device, source })
+    }
+
     /// ADR 0038 B3 — phase 1 (runs under the FC pause on the snapshot
     /// path): capture and claim the current dirty set. Upload and base
     /// rebase remain post-resume.
+    ///
+    /// The capture primitive owns the host page-cache sync: every
+    /// freeze is preceded by [`Self::sync_host_device`], so no call
+    /// site can capture without it. A sync failure refuses the freeze
+    /// (nothing publishes; the dirty tier is untouched).
     pub async fn flush_local(&self) -> Result<PendingDiskFlush, DiskBackendError> {
+        // Sync BEFORE taking the flush-pipeline / dirty-tier locks: a
+        // sync parked on a dead serve connection (kernel dead-conn
+        // window) must not wedge the other flush paths, and the
+        // writeback it forces has to reach `write()` — which takes the
+        // dirty-tier lock — to land in the tier this freeze captures.
+        self.sync_host_device().await?;
         // Issue #199: take the flush-pipeline guard before the dirty-tier
         // lock and hand it off inside the returned `PendingDiskFlush`, so the
         // freeze and the `flush_upload` that publishes its chunks are one
@@ -5052,6 +5137,147 @@ mod tests {
         assert_eq!(new_manifest.chunks.len(), 2);
         let chunk0 = new_manifest.chunks.iter().find(|c| c.offset == 0).unwrap();
         assert_ne!(chunk0.hash, h0, "chunk 0 was rewritten; hash must differ");
+    }
+
+    /// [`DeviceSync`] stub that models the HOST page cache for the
+    /// served device (the `cache_type=Unsafe` tier): armed writes are
+    /// guest-acked bytes that reach the dirty tier ONLY when the device
+    /// is synced. `sync_device` records the synced path and delivers
+    /// every armed write into the backend, like the kernel writeback a
+    /// real `sync_all` forces.
+    struct HostCacheModelSync {
+        backend: std::sync::Mutex<Option<Arc<ChunkedDiskBackend>>>,
+        pending: std::sync::Mutex<Vec<(u64, Vec<u8>)>>,
+        synced: std::sync::Mutex<Vec<PathBuf>>,
+    }
+
+    impl HostCacheModelSync {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                backend: std::sync::Mutex::new(None),
+                pending: std::sync::Mutex::new(Vec::new()),
+                synced: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DeviceSync for HostCacheModelSync {
+        async fn sync_device(&self, path: &Path) -> std::io::Result<()> {
+            self.synced.lock().unwrap().push(path.to_path_buf());
+            let backend = self.backend.lock().unwrap().clone();
+            let pending: Vec<(u64, Vec<u8>)> = self.pending.lock().unwrap().drain(..).collect();
+            if let Some(backend) = backend {
+                for (offset, data) in pending {
+                    backend
+                        .write(offset, &data)
+                        .await
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// [`DeviceSync`] stub that always fails, modelling a device whose
+    /// host page cache cannot be synced.
+    struct FailingDeviceSync;
+
+    #[async_trait::async_trait]
+    impl DeviceSync for FailingDeviceSync {
+        async fn sync_device(&self, _path: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected sync failure"))
+        }
+    }
+
+    /// The capture primitive owns the host page-cache sync: bytes the
+    /// guest was acked for that still sit ONLY in the host page cache
+    /// must land in the publish. The stub models that tier — the armed
+    /// write reaches the backend exclusively through the sync that
+    /// `flush_local` issues. Without the sync inside the primitive the
+    /// publish would carry only the base content and the successor
+    /// read-back below would see 0xAA — the torn-publish class
+    /// (2026-07-16 session-85e0298a RCA; the disk post-copy canary).
+    #[tokio::test]
+    async fn flush_captures_bytes_that_only_a_device_sync_delivers() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let chunk_size = 4096u64;
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![(0, h0)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let backend = Arc::new(
+            ChunkedDiskBackend::new(
+                manifest_ref,
+                &manifest,
+                test_cache(dir.path().join("cache")),
+                store.clone(),
+                u64::MAX,
+            )
+            .unwrap(),
+        );
+
+        let sync = HostCacheModelSync::new();
+        *sync.backend.lock().unwrap() = Some(backend.clone());
+        sync.pending.lock().unwrap().push((0, vec![0xbb; 64]));
+        backend.register_host_device(PathBuf::from("/dev/nbd-test"), sync.clone());
+
+        // No direct `write()` in this test: the only dirty bytes are the
+        // ones the flush's own sync delivers.
+        let outcome = backend.flush().await.unwrap();
+        assert_eq!(
+            sync.synced.lock().unwrap().as_slice(),
+            &[PathBuf::from("/dev/nbd-test")],
+            "the flush must sync the registered device exactly once",
+        );
+        assert_eq!(
+            outcome.chunks_flushed, 1,
+            "the sync-delivered write must be part of THIS publish",
+        );
+
+        // The successor's view: a fresh backend attached at the
+        // published manifest must read the guest-acked bytes.
+        let successor = ChunkedDiskBackend::from_blob(
+            outcome.manifest_ref,
+            test_cache(dir.path().join("cache-successor")),
+            store.clone(),
+            u64::MAX,
+        )
+        .await
+        .unwrap();
+        let bytes = successor.read(0, 64).await.unwrap();
+        assert_eq!(&bytes[..], &[0xbb; 64][..]);
+    }
+
+    /// A failed device sync refuses the freeze: nothing publishes and
+    /// the dirty tier is untouched, so a later flush (sync healthy
+    /// again) publishes everything. Proceeding past a failed sync would
+    /// publish a manifest that misses guest-acked bytes.
+    #[tokio::test]
+    async fn failed_device_sync_refuses_the_freeze_and_is_retryable() {
+        let manifest = synth_manifest(4096, 4096, vec![]);
+        let (backend, _store, _dir) = build_backend(&manifest).await;
+        let backend = Arc::new(backend);
+        let before = backend.manifest_ref().await;
+        backend.write(0, &[0xcc; 64]).await.unwrap();
+
+        backend.register_host_device(PathBuf::from("/dev/nbd-test"), Arc::new(FailingDeviceSync));
+        let err = backend.flush().await.unwrap_err();
+        assert!(matches!(err, DiskBackendError::DeviceSync { .. }));
+        assert_eq!(
+            backend.manifest_ref().await,
+            before,
+            "a refused freeze must not publish",
+        );
+
+        // Heal the sync; the retry publishes the held-back write.
+        let sync = HostCacheModelSync::new();
+        backend.register_host_device(PathBuf::from("/dev/nbd-test"), sync);
+        let outcome = backend.flush().await.unwrap();
+        assert_eq!(outcome.chunks_flushed, 1);
+        assert_eq!(outcome.manifest_ref.version, before.version + 1);
     }
 
     #[tokio::test]

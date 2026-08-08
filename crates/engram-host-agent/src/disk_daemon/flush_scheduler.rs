@@ -400,6 +400,71 @@ mod tests {
         );
     }
 
+    /// The scheduler's periodic publish is a capture like any other:
+    /// its flush must sync the served device before it freezes. The
+    /// only write in this test sits in the modeled HOST page cache
+    /// (the stub delivers it into the backend exclusively when the
+    /// device is synced), so an observed publish PROVES the tick
+    /// synced — an unsynced tick finds an empty dirty tier and never
+    /// publishes. A survivor reattaches from these periodic manifests
+    /// after an ungraceful host-agent death, so a torn periodic
+    /// publish is the same corruption class as a torn snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_flush_syncs_the_host_device_before_freezing() {
+        use engram_host_core::DeviceSync;
+        use std::path::{Path, PathBuf};
+
+        struct DeliverOnSync {
+            backend: Mutex<Option<Arc<ChunkedDiskBackend>>>,
+            pending: Mutex<Option<(u64, Vec<u8>)>>,
+        }
+
+        #[async_trait]
+        impl DeviceSync for DeliverOnSync {
+            async fn sync_device(&self, _path: &Path) -> std::io::Result<()> {
+                let backend = self.backend.lock().unwrap().clone();
+                let pending = self.pending.lock().unwrap().take();
+                if let (Some(backend), Some((offset, data))) = (backend, pending) {
+                    backend
+                        .write(offset, &data)
+                        .await
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+                Ok(())
+            }
+        }
+
+        let backend = build_backend(DEFAULT_DIRTY_THRESHOLD_BYTES).await;
+        let sync = Arc::new(DeliverOnSync {
+            backend: Mutex::new(Some(backend.clone())),
+            pending: Mutex::new(Some((0, vec![0xab; 8]))),
+        });
+        backend.register_host_device(PathBuf::from("/dev/nbd-test"), sync);
+
+        let (publisher, events) = RecordingPublisher::new();
+        let sandbox_id = SandboxId::new();
+        let config = FlushSchedulerConfig {
+            interval: Duration::from_millis(60),
+            dirty_threshold_bytes: DEFAULT_DIRTY_THRESHOLD_BYTES,
+            enabled: true,
+        };
+        let _handle =
+            FlushScheduler::spawn(sandbox_id, backend.clone(), Arc::new(publisher), config);
+
+        // No direct `write()` in this test: the publish can only carry
+        // the byte the tick's own sync delivered.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if !events.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !events.lock().unwrap().is_empty(),
+            "the tick must sync the device and publish the delivered write",
+        );
+    }
+
     /// Empty flushes (no dirty chunks) don't publish. The scheduler
     /// short-circuits before the publisher when `chunks_flushed ==
     /// 0` — important for the per-session coalescing on the
