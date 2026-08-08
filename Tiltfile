@@ -388,11 +388,13 @@ coord_env = {
 # on a virt-less box is exactly the sanctioned dev case, so opt in here.
 if sandbox_backend == 'process':
     coord_env['ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND'] = '1'
-    # ProcessBackend reads bundles directly from the staged host directory.
-    # An embedding dev image may advertise metadata-only image digests that it
-    # seeds through its own bootstrap hook.
+    # ProcessBackend reads bundles and configured local-directory images from
+    # the host filesystem. An embedding dev image owns the image catalog and
+    # its app metadata bootstrap; the OSS stack only exposes generic hooks.
     coord_env['ENGRAM_BUNDLE_DIR'] = os.path.abspath('var/bundles')
-    coord_env['ENGRAM_PROCESS_READY_IMAGE_DIGESTS'] = env_or('ENGRAM_PROCESS_READY_IMAGE_DIGESTS', '')
+    process_image_catalog = env_or('ENGRAM_PROCESS_IMAGE_CATALOG', '')
+    if process_image_catalog:
+        coord_env['ENGRAM_PROCESS_IMAGE_CATALOG'] = process_image_catalog
 
 if fc_colima_profile:
     # ADR 0082: the fc-dev VM has a ~19 GiB rootfs, smaller than the

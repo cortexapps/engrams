@@ -89,6 +89,10 @@ async fn hash_file(path: &Path) -> std::io::Result<(u64, String)> {
 /// command from a normal nonzero exit.
 const EXIT_CODE_TIMEOUT: i32 = 124;
 
+/// Reserved image workdir key consumed by agentd in VM backends. ProcessBackend
+/// bypasses agentd and must apply the same contract before it spawns a harness.
+const HARNESS_CWD_ENV: &str = "ENGRAM_HARNESS_CWD";
+
 /// Match the guest journal's per-stream retention bound. Live consumers
 /// continue receiving bytes beyond this point, but later attaches can only
 /// replay the retained prefix.
@@ -249,6 +253,13 @@ pub struct ProcessBackend {
     agent_children: DashMap<SandboxId, std::sync::Mutex<Option<tokio::process::Child>>>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct ProcessImage {
+    image_uri: String,
+    manifest_digest: String,
+    rootfs: PathBuf,
+}
+
 impl ProcessBackend {
     pub fn new(work_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -297,6 +308,24 @@ impl ProcessBackend {
                 |(drive_id, sha256)| engram_core::types::sandbox::AuxBundleRef { drive_id, sha256 },
             )
             .collect()
+    }
+
+    /// Image digests that this dev backend can serve from local directories.
+    ///
+    /// Production hosts advertise OCI images that they materialized into the
+    /// chunk store. ProcessBackend has no guest disk, so an embedding dev
+    /// environment may provide an `ENGRAM_PROCESS_IMAGE_CATALOG` JSON file
+    /// that maps the same app-visible image URI and digest to a local rootfs
+    /// directory. The coordinator can then use its normal image placement and
+    /// base-restore flow while this backend implements the restore as a copy.
+    pub fn ready_images() -> Vec<String> {
+        let mut digests = process_images()
+            .into_iter()
+            .map(|image| image.manifest_digest)
+            .collect::<Vec<_>>();
+        digests.sort_unstable();
+        digests.dedup();
+        digests
     }
 }
 
@@ -459,7 +488,7 @@ impl SandboxBackend for ProcessBackend {
                         SandboxError::InvalidSpec("argv must not be empty".into())
                     })?;
                 let workdir = match req.workdir.as_ref() {
-                    Some(rel) => state.cwd.join(rel),
+                    Some(path) => process_guest_path(&state.cwd, Path::new(path)),
                     None => state.cwd.clone(),
                 };
 
@@ -572,12 +601,14 @@ impl SandboxBackend for ProcessBackend {
                 "file exceeds {MAX_SESSION_FILE_BYTES} bytes"
             )));
         }
-        let _state = self
+        let state = self
             .sandboxes
             .get(&id)
             .ok_or(SandboxError::NotFound)?
             .clone();
-        let destination = PathBuf::from(&spec.path);
+        // Session file paths are guest-absolute. Resolve them inside this
+        // sandbox's emulated guest root, as exec and harness workdirs do.
+        let destination = process_guest_path(&state.cwd, Path::new(&spec.path));
         if let Ok((size_bytes, sha256)) = hash_file(&destination).await {
             if size_bytes == spec.size_bytes && sha256 == spec.sha256 {
                 return Ok(SessionFileMetadata {
@@ -681,12 +712,12 @@ impl SandboxBackend for ProcessBackend {
         id: SandboxId,
         path: String,
     ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
-        let _state = self
+        let state = self
             .sandboxes
             .get(&id)
             .ok_or(SandboxError::NotFound)?
             .clone();
-        let source = PathBuf::from(&path);
+        let source = process_guest_path(&state.cwd, Path::new(&path));
         let (size_bytes, sha256) = hash_file(&source)
             .await
             .map_err(|error| SandboxError::Vm(format!("read upload metadata: {error}").into()))?;
@@ -914,12 +945,19 @@ impl SandboxBackend for ProcessBackend {
         session_env: HashMap<String, String>,
         selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
     ) -> Result<SandboxId, SandboxError> {
-        // Process mode has no captured guest memory or chunked root disk. A
-        // base restore is a fresh per-session directory plus the resolved
-        // session env and unpacked dyn-slot bundle symlinks.
+        // Process mode has no captured guest memory or chunked root disk. It
+        // emulates the common base-restore contract by copying the configured
+        // local image directory into a fresh per-session root. This keeps the
+        // app and coordinator on their normal image/profile/session path while
+        // the dev-only backend uses a different substrate underneath.
         let id = SandboxId::new();
         let cwd = self.cwd_for(id);
         tokio::fs::create_dir_all(&cwd).await?;
+        if let Some(image) = process_image(&metadata.image_version)? {
+            materialize_rootfs(&image.rootfs, &cwd)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("materialize Process image: {e}").into()))?;
+        }
         stage_aux_bundles(&cwd, &selected_mounts).await;
         let spec = SandboxSpec {
             image: metadata.image_version,
@@ -1024,6 +1062,13 @@ async fn spawn_agent(
 
     let mut env = sandbox_env.clone();
     env.extend(agent.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    // agentd consumes this reserved value and starts the harness in the
+    // guest path. ProcessBackend bypasses agentd, so translate it into the
+    // corresponding host path and do not leak the reserved key to the child.
+    let harness_cwd = env
+        .remove(HARNESS_CWD_ENV)
+        .map(|path| process_guest_path(cwd, Path::new(&path)))
+        .unwrap_or_else(|| cwd.to_path_buf());
     if !env.contains_key("PATH") {
         if let Ok(p) = std::env::var("PATH") {
             env.insert("PATH".into(), p);
@@ -1069,7 +1114,7 @@ async fn spawn_agent(
         .filter(|candidate| candidate.exists());
     let mut cmd = Command::new(rooted_argv0.as_deref().unwrap_or_else(|| Path::new(argv0)));
     cmd.args(agent.argv.iter().skip(1))
-        .current_dir(cwd)
+        .current_dir(harness_cwd)
         .env_clear()
         .envs(env_iter(&env))
         .stdin(Stdio::null())
@@ -1145,6 +1190,52 @@ fn process_bundle_root() -> PathBuf {
     std::env::var_os("ENGRAM_BUNDLE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("var/bundles"))
+}
+
+fn process_images() -> Vec<ProcessImage> {
+    let Some(path) = std::env::var_os("ENGRAM_PROCESS_IMAGE_CATALOG").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        tracing::warn!(path = %path.display(), "ProcessBackend image catalog is unreadable");
+        return Vec::new();
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(images) => images,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "ProcessBackend image catalog is invalid JSON");
+            Vec::new()
+        }
+    }
+}
+
+fn process_image(image_uri: &str) -> Result<Option<ProcessImage>, SandboxError> {
+    let catalog_configured = std::env::var_os("ENGRAM_PROCESS_IMAGE_CATALOG").is_some();
+    let image = process_images()
+        .into_iter()
+        .find(|image| image.image_uri == image_uri);
+    if let Some(image) = &image {
+        if !image.rootfs.is_dir() {
+            return Err(SandboxError::InvalidSpec(format!(
+                "Process image `{image_uri}` rootfs is not a directory: {}",
+                image.rootfs.display()
+            )));
+        }
+    } else if catalog_configured {
+        return Err(SandboxError::InvalidSpec(format!(
+            "Process image `{image_uri}` is absent from ENGRAM_PROCESS_IMAGE_CATALOG"
+        )));
+    }
+    Ok(image)
+}
+
+/// Resolve a guest path inside a Process sandbox root. `PathBuf::join` treats
+/// an absolute operand as host-absolute, which made image workdirs such as
+/// `/workspace` escape the emulated guest tree. Strip only the guest root;
+/// ProcessBackend remains explicitly unisolated and does not claim to enforce
+/// a security boundary against `..` or subprocess behavior.
+fn process_guest_path(cwd: &Path, guest_path: &Path) -> PathBuf {
+    cwd.join(guest_path.strip_prefix("/").unwrap_or(guest_path))
 }
 
 /// Resolve the host-local unpacked bundle dir for a dev bundle. A per-bundle
@@ -1736,11 +1827,15 @@ mod tests {
     async fn session_file_upload_is_atomic_idempotent_and_streamed() {
         use futures::{stream, StreamExt};
 
-        let (backend, _dir) = backend();
+        let (backend, dir) = backend();
         let sandbox_id = backend.create(spec()).await.unwrap();
         let upload_id = uuid::Uuid::new_v4();
         let root = PathBuf::from(format!("/tmp/uploads/{upload_id}"));
         let path = root.join("process.bin");
+        let materialized_path = dir.path().join(sandbox_id.to_string()).join(
+            path.strip_prefix("/")
+                .expect("session file path is guest-absolute"),
+        );
         let path_string = path.to_string_lossy().into_owned();
         let bytes = Bytes::from_static(b"streamed-process-file");
         let digest = digest_hex(Sha256::digest(&bytes));
@@ -1778,7 +1873,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                tokio::fs::metadata(&path)
+                tokio::fs::metadata(&materialized_path)
                     .await
                     .unwrap()
                     .permissions()
@@ -1802,8 +1897,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(conflict, SandboxError::InvalidSpec(_)));
-        assert_eq!(tokio::fs::read(&path).await.unwrap(), bytes);
-        let _ = tokio::fs::remove_dir_all(root).await;
+        assert_eq!(tokio::fs::read(&materialized_path).await.unwrap(), bytes);
     }
 
     #[tokio::test]

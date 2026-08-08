@@ -269,24 +269,6 @@ fn parse_kek_choice(s: &str) -> Result<KekChoice, String> {
     }
 }
 
-fn parse_process_ready_images(value: &str) -> Vec<String> {
-    let mut images = value
-        .split(',')
-        .map(str::trim)
-        .filter(|image| !image.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    images.sort_unstable();
-    images.dedup();
-    images
-}
-
-fn process_ready_images() -> Vec<String> {
-    parse_process_ready_images(
-        &std::env::var("ENGRAM_PROCESS_READY_IMAGE_DIGESTS").unwrap_or_default(),
-    )
-}
-
 #[tokio::main]
 async fn main() -> Result<(), CoordinatorError> {
     // Held for the lifetime of `main`; its `Drop` flushes pending OTLP
@@ -514,7 +496,7 @@ async fn main() -> Result<(), CoordinatorError> {
         ));
         let local_backend: Arc<dyn SandboxBackend> = process_backend.clone();
         let process_current_bundles = engram_sandbox_process::ProcessBackend::current_bundles();
-        let process_ready_images = process_ready_images();
+        let process_ready_images = engram_sandbox_process::ProcessBackend::ready_images();
         // Use a stable HostId for `--mode=all` so a coordinator
         // restart picks up the same `hosts` row (FK-safe — sessions
         // / snapshots inserted in a prior run still reference a valid
@@ -727,17 +709,4 @@ async fn main() -> Result<(), CoordinatorError> {
         integrations,
     )
     .await
-}
-
-#[cfg(test)]
-mod process_ready_image_tests {
-    use super::parse_process_ready_images;
-
-    #[test]
-    fn parses_sorted_unique_image_digests() {
-        assert_eq!(
-            parse_process_ready_images(" image-b, image-a,,image-b "),
-            ["image-a", "image-b"]
-        );
-    }
 }

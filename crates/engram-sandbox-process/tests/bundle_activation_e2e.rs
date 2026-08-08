@@ -11,8 +11,8 @@
 //! actually lands skills in sessions — the per-unit behavior is covered by
 //! `engram-session-bundles` tests.
 //!
-//! Single test in its own integration binary → the `set_var` of the bundle-
-//! dir overrides is process-isolated (no cross-test env race).
+//! Single test in its own integration binary → the `set_var` catalog
+//! overrides are process-isolated (no cross-test env race).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -53,7 +53,10 @@ fn stage_fake_bundles(skills: &Path, browser: &Path, harness: &Path) {
     )
     .unwrap();
 
-    write_exec(&harness.join("harness"), "#!/bin/sh\ntouch harness-ran\n");
+    write_exec(
+        &harness.join("harness"),
+        "#!/bin/sh\npwd > harness-pwd\ntouch harness-ran\n",
+    );
 }
 
 #[tokio::test]
@@ -69,9 +72,27 @@ async fn generated_session_has_skills_and_browser_tooling() {
     )
     .unwrap();
 
+    let rootfs = tmp.path().join("images/process-dev");
+    std::fs::create_dir_all(rootfs.join("workspace")).unwrap();
+    std::fs::write(rootfs.join("workspace/README.md"), "# Process image\n").unwrap();
+    let image_catalog = tmp.path().join("process-images.json");
+    std::fs::write(
+        &image_catalog,
+        serde_json::to_vec(&serde_json::json!([{
+            "image_uri": "dev.local/process:latest",
+            "manifest_digest": "process-dev",
+            "rootfs": rootfs,
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+
     // Point ProcessBackend's dev catalog at the fake bundles. Safe: edition
     // 2021 `set_var` isn't unsafe, and this is the only test in the binary.
     std::env::set_var("ENGRAM_BUNDLE_DIR", tmp.path().join("bundles"));
+    std::env::set_var("ENGRAM_PROCESS_IMAGE_CATALOG", &image_catalog);
+
+    assert_eq!(ProcessBackend::ready_images(), ["process-dev"]);
 
     let work = tmp.path().join("work");
     let backend = ProcessBackend::new(&work);
@@ -120,14 +141,17 @@ async fn generated_session_has_skills_and_browser_tooling() {
             selected_mounts,
         )
         .await
-        .expect("restore metadata-only Process image");
+        .expect("restore directory-backed Process image");
 
     // A forge-bound session: the broker token rides AgentSpec.env (per-spawn),
     // which is exactly where the activation gate must look for it.
     let agent = AgentSpec {
         binding_epoch: 1,
         argv: vec!["/opt/engram/dyn/0/harness".into()],
-        env: HashMap::from_iter([("ENGRAM_FORGE_TOKEN".into(), "tok".into())]),
+        env: HashMap::from_iter([
+            ("ENGRAM_FORGE_TOKEN".into(), "tok".into()),
+            ("ENGRAM_HARNESS_CWD".into(), "/workspace".into()),
+        ]),
         session_env: HashMap::new(),
         host_ca_pem: None,
     };
@@ -135,15 +159,30 @@ async fn generated_session_has_skills_and_browser_tooling() {
 
     // The generated session directory.
     let cwd = work.join(id.to_string());
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("workspace/README.md")).unwrap(),
+        "# Process image\n",
+        "the local image rootfs was not materialized into the session",
+    );
     for _ in 0..50 {
-        if cwd.join("harness-ran").exists() {
+        if cwd.join("workspace/harness-ran").exists() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(
-        cwd.join("harness-ran").exists(),
+        cwd.join("workspace/harness-ran").exists(),
         "guest-absolute harness path was not translated to the Process sandbox root",
+    );
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("workspace/harness-pwd"))
+            .unwrap()
+            .trim(),
+        std::fs::canonicalize(cwd.join("workspace"))
+            .unwrap()
+            .display()
+            .to_string(),
+        "guest-absolute image workdir was not translated into the Process root",
     );
 
     // Skills discovery: ~/.claude/skills -> ~/.agents/skills, populated.
