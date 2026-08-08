@@ -164,7 +164,7 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 # carry through the musl cross-compile lane. It also leaves rustls's own provider
 # selection (pinned to `ring` below) untouched; enabling a second rustls provider
 # is what makes oci-client 0.17 panic on #34.
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 
 # grpc — the tonic/prost family is version-locked to itself (0.14
 # codegen only compiles against the 0.14 runtime + derives), so
