@@ -23,7 +23,7 @@ const fakeList = (events: WireEvent[], nextAfterIdx: bigint) => async () => ({
 });
 
 describe("curated()", () => {
-  test("accepts the six forwarded content kinds", () => {
+  test("accepts forwarded content and spec lifecycle kinds", () => {
     for (const k of [
       "run_started",
       "run_completed",
@@ -31,6 +31,10 @@ describe("curated()", () => {
       "question_answered",
       "integration_asset",
       "file_shared",
+      "harness_idle",
+      "harness_parked",
+      "resumed",
+      "file_changed",
     ]) {
       expect(curated(k)).toBe(true);
     }
@@ -44,7 +48,6 @@ describe("curated()", () => {
       "agent_message",
       "agent_message_chunk",
       "tool_call_started",
-      "harness_idle",
     ]) {
       expect(curated(k)).toBe(false);
     }

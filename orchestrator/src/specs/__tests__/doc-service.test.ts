@@ -754,13 +754,27 @@ describe("SpecDocumentService with live Postgres", () => {
       );
       expect(revisions.rows.map((row) => BigInt(row.seq))).toEqual([1n, 2n, 3n]);
 
-      const compacted = await first.compact(specId);
-      expect(compacted.coveredSeq).toBe(3n);
-      const tail = await livePool.query<{ count: string }>(
-        "SELECT count(*) FROM spec_update_log WHERE spec_id = $1",
+      // The published cursor has already materialized attribution through
+      // seq 2. Compaction may delete that prefix, but it must retain seq 3 for
+      // the next digest.
+      await livePool.query(
+        `INSERT INTO spec_projection
+           (spec_id, rev, session_id, doc_seq, sha256, rendered, document_state,
+            digest, digest_sha256,
+            staging_path, state, requested_source, pushed_at, created_at)
+         VALUES ($1, 1, $1, 2, 'digest', ''::bytea, ''::bytea,
+                 ''::bytea, 'digest', '/workspace/.engrams/spec/incoming-1.md',
+                 'published', 'test', now(), now())`,
         [specId],
       );
-      expect(tail.rows[0]!.count).toBe("0");
+
+      const compacted = await first.compact(specId);
+      expect(compacted.coveredSeq).toBe(3n);
+      const tail = await livePool.query<{ seq: string }>(
+        "SELECT seq FROM spec_update_log WHERE spec_id = $1 ORDER BY seq",
+        [specId],
+      );
+      expect(tail.rows.map((row) => BigInt(row.seq))).toEqual([3n]);
       expect(compacted.renderedMarkdown).toContain("concurrent-a");
       expect(compacted.renderedMarkdown).toContain("concurrent-b");
     },

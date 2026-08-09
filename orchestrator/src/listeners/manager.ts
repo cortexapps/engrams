@@ -11,6 +11,8 @@ import { makeProductionReviewConsumer } from "./review-consumer.ts";
 import { makeProductionSlackConsumer } from "./slack-consumer.ts";
 import { makeProductionTitleConsumer } from "./title-consumer.ts";
 import { makeProductionToolConsumer } from "./tool-consumer.ts";
+import { makeSpecProjectionConsumer } from "./spec-projection-consumer.ts";
+import { productionSpecProjection } from "../specs/projection.ts";
 
 const log = rootLog.child({ component: "listener-manager" });
 const SCAN_INTERVAL_MS = 5_000;
@@ -162,6 +164,7 @@ export function makeProductionListenerManager(): ListenerManager {
           makeProductionSlackConsumer(),
           makeProductionReviewConsumer(),
           makeProductionTitleConsumer(),
+          makeSpecProjectionConsumer(productionSpecProjection),
         ],
         readPage: (id, after, signal) =>
           readSessionEventsBounded(id, after, undefined, signal),
@@ -210,9 +213,42 @@ export function makeProductionListenerManager(): ListenerManager {
           });
         },
       });
+      let projectionTimer: ReturnType<typeof setInterval> | null = null;
+      const stopProjectionTimer = () => {
+        if (projectionTimer !== null) clearInterval(projectionTimer);
+        projectionTimer = null;
+      };
       return {
-        start: () => listener.run(),
-        stop: () => listener.stop(),
+        async start() {
+          const rev = await productionSpecProjection.requestForSession(
+            sessionId,
+            "resume",
+          );
+          if (rev !== null) {
+            // The manager owns the existing per-session lease before it calls
+            // start. Publish the resume intent before the event stream can
+            // deliver a prompt boundary.
+            await productionSpecProjection.runOnce(sessionId);
+            projectionTimer = setInterval(() => {
+              void productionSpecProjection.runOnce(sessionId).catch((error) => {
+                log.error({ sessionId, error }, "spec projection scanner failed");
+              });
+            }, 250);
+          }
+          try {
+            await listener.run();
+          } finally {
+            stopProjectionTimer();
+            await productionSpecProjection.waitForIdle(sessionId);
+          }
+        },
+        async stop() {
+          stopProjectionTimer();
+          await listener.stop();
+          // stop() drains every queued consumer before it returns. Wait after
+          // that drain so no new projection run can start before lease release.
+          await productionSpecProjection.waitForIdle(sessionId);
+        },
       };
     },
   });

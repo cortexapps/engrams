@@ -404,6 +404,33 @@ export const specParticipant = pgTable(
   (t) => [primaryKey({ columns: [t.specId, t.clientId] })],
 );
 
+export const specProjection = pgTable(
+  "spec_projection",
+  {
+    specId: uuid("spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    rev: bigint("rev", { mode: "bigint" }).notNull(),
+    sessionId: uuid("session_id").notNull(),
+    docSeq: bigint("doc_seq", { mode: "bigint" }).notNull(),
+    sha256: text("sha256").notNull(),
+    rendered: bytea("rendered").notNull(),
+    documentState: bytea("document_state").notNull(),
+    digest: bytea("digest").notNull(),
+    digestSha256: text("digest_sha256").notNull(),
+    stagingPath: text("staging_path").notNull(),
+    state: text("state").notNull(),
+    requestedSource: text("requested_source").notNull(),
+    discardNotice: boolean("discard_notice").notNull().default(false),
+    pushedAt: timestamp("pushed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.specId, t.rev] }),
+    index("spec_projection_session_state_idx").on(t.sessionId, t.state, t.rev),
+  ],
+);
+
 // ---------------------------------------------------------------------------
 // Papercuts
 // ---------------------------------------------------------------------------

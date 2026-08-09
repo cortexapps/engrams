@@ -711,10 +711,24 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
           input.coveredSeq.toString(),
         ],
       );
-      await client.query("DELETE FROM spec_update_log WHERE spec_id = $1 AND seq <= $2", [
-        input.specId,
-        input.coveredSeq.toString(),
-      ]);
+      // A compacted Yjs snapshot does not retain the participant attribution
+      // that the next agent digest needs. Keep every row after the last
+      // published projection cursor. The projection publisher advances that
+      // cursor only after it has materialized the digest in the guest.
+      await client.query(
+        `DELETE FROM spec_update_log
+          WHERE spec_id = $1
+            AND seq <= LEAST(
+              $2,
+              COALESCE(
+                (SELECT max(doc_seq)
+                   FROM spec_projection
+                  WHERE spec_id = $1 AND state = 'published'),
+                0
+              )
+            )`,
+        [input.specId, input.coveredSeq.toString()],
+      );
       await client.query("COMMIT");
       return true;
     } catch (error) {
