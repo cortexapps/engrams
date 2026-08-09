@@ -4,7 +4,7 @@
  * The coordinator echoes every prompt into the session log as an
  * `agent_message` with `role:"user"` (api/prompt.rs), and curation forwards it
  * (session-events.ts). This consumer reacts to the first one on a human-owned
- * task's primary session, asks a small model for a 3-7 word title, and writes
+ * root task's primary session, asks a small model for a 3-7 word title, and writes
  * `task.suggested_title` — the slot `effectiveTitle` (rpc/tasks.ts) already
  * prefers over the truncated-prompt default while still losing to a user
  * rename (`custom_title`).
@@ -21,7 +21,7 @@
  * purpose: a listener restart redelivers the event with a fresh budget.
  */
 
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, ne } from "drizzle-orm";
 import { APICallError, generateObject, RetryError } from "ai";
 import { z } from "zod";
 
@@ -77,7 +77,8 @@ export interface TitleableTask {
 export interface TitleConsumerDeps {
   /** The task behind `sessionId`'s PRIMARY task_session, when a human owns it
    *  (`created_by_user_id` set — the tool-consumer's ownerless test, inverted).
-   *  Null for review workers, ownerless automations, and unattributed sessions. */
+   *  Null for child tasks, review workers, ownerless automations, and
+   *  unattributed sessions. */
   findTitleableTask(sessionId: string): Promise<TitleableTask | null>;
   /** Ask the model for the title. May throw. */
   generateTitle(prompt: string): Promise<string>;
@@ -147,7 +148,13 @@ export function makeProductionTitleConsumer(): SessionConsumer {
         })
         .from(taskSessionTable)
         .innerJoin(taskTable, eq(taskSessionTable.taskId, taskTable.id))
-        .where(and(eq(taskSessionTable.sessionId, sessionId), eq(taskSessionTable.role, "primary")))
+        .where(
+          and(
+            eq(taskSessionTable.sessionId, sessionId),
+            eq(taskSessionTable.role, "primary"),
+            ne(taskTable.type, "subsession"),
+          ),
+        )
         .limit(1);
       const row = rows[0];
       return row !== undefined && row.createdByUserId != null

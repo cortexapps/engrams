@@ -1,7 +1,7 @@
 // Contract test for the sessions-rail row set: the rows are exactly the
-// server's "My tasks" window, and opening a session never adds one. The rail
-// used to prepend the open session, which dropped another user's task (opened
-// from the admin fleet list) at the top of a list it does not belong to.
+// server's "My tasks" window, and opening a session never adds one. A child
+// lookup can select its existing root row, but a hidden child is not a second
+// global-list entry.
 
 import { describe, expect, test } from "vitest";
 import { screen, waitFor } from "@testing-library/react";
@@ -48,9 +48,7 @@ function task(
  * window) are both absent from it. */
 const WINDOW = [task("t-a", "First", "s-a"), task("t-b", "Second", "s-b")];
 
-/** Fails the test if the rail reaches for anything beyond its own window —
- * the point of the change is that an open session costs no extra lookup. */
-function installTransport() {
+function installTransport(openTask?: ReturnType<typeof task>) {
   const calls: string[] = [];
   const transport = createRouterTransport((router) => {
     router.service(TaskService, {
@@ -58,8 +56,9 @@ function installTransport() {
         calls.push(req.search);
         return { tasks: WINDOW, totalCount: WINDOW.length };
       },
-      getTask: () => {
-        throw new Error("the rail must not call GetTask");
+      getTask: (req) => {
+        calls.push(`get:${req.sessionId || req.taskId}`);
+        return { task: openTask };
       },
     });
   });
@@ -86,8 +85,8 @@ function RailProbe() {
 
 const rowIds = () => screen.getByTestId("rows").textContent?.split(",").filter(Boolean) ?? [];
 
-async function renderRail(path: string) {
-  const { transport, calls } = installTransport();
+async function renderRail(path: string, openTask?: ReturnType<typeof task>) {
+  const { transport, calls } = installTransport(openTask);
   renderWithProviders(<RailProbe />, { transport, initialPath: path });
   await waitFor(() => expect(rowIds()).toEqual(["s-a", "s-b"]));
   return calls;
@@ -96,11 +95,10 @@ async function renderRail(path: string) {
 describe("useRailSessions", () => {
   test("another user's open session is not added to the rail", async () => {
     const calls = await renderRail("/sessions/s-foreign");
-    // The route resolves to an open id — the rail just declines to invent a
-    // row for it, and asks the server for nothing beyond its own window.
+    // The route resolves to an open id, but the lookup does not invent a row.
     expect(screen.getByTestId("open").textContent).toBe("s-foreign");
     expect(rowIds()).toEqual(["s-a", "s-b"]);
-    expect(calls).toEqual([""]);
+    expect(calls).toEqual(["get:s-foreign", ""]);
   });
 
   test("my own open session outside the window is not pinned either", async () => {
@@ -113,6 +111,20 @@ describe("useRailSessions", () => {
     // Second in the window, so second in the rail — not hoisted to the top.
     expect(rowIds()).toEqual(["s-a", "s-b"]);
     expect(screen.getByTestId("open").textContent).toBe("s-b");
+  });
+
+  test("a child route keeps its root task selected without adding a child row", async () => {
+    const child = {
+      ...task("t-child", "Generated title", "s-child"),
+      type: "subsession",
+      localTaskName: "research",
+      canonicalTaskName: "research",
+      parentTaskId: "t-a",
+      rootTaskId: "t-a",
+    };
+    await renderRail("/sessions/s-child", child);
+    expect(rowIds()).toEqual(["s-a", "s-b"]);
+    expect(screen.getByTestId("open").textContent).toBe("s-a");
   });
 
   test("the section pages are not mistaken for an open session", async () => {

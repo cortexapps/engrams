@@ -168,7 +168,10 @@ message ListTasksResponse {
 }
 
 message GetTaskRequest {
+  // Supply exactly one selector. Session lookup lets a session page resolve
+  // child tasks, which ListTasks intentionally hides from top-level lists.
   string task_id = 1;
+  string session_id = 2;
 }
 
 message GetTaskResponse {

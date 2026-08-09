@@ -164,6 +164,20 @@ export function useTask(id: string | null | undefined) {
   );
 }
 
+/** Resolve the task that owns a primary session, including hidden child tasks. */
+export function useTaskForSession(sessionId: string | null | undefined) {
+  return useQuery(
+    getTask,
+    { sessionId: sessionId ?? "" },
+    {
+      enabled: !!sessionId,
+      refetchInterval: 2_000,
+      refetchOnWindowFocus: true,
+      select: (response) => response.task,
+    },
+  );
+}
+
 /**
  * Rename (or reset) a task's title. Pass `{ taskId, title }` to set a sticky
  * custom title, or `{ taskId }` (title omitted) to reset to the auto title.

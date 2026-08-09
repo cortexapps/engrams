@@ -30,6 +30,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import type { IndexedEvent, ProfileSnapshotView, Session } from "../lib/types";
+import type { Task } from "../gen/engram/app/v1/task_pb";
 
 // The Devin-style work pane: the shell + browser, lifted out of the transcript
 // into a companion surface so the conversation and the live view sit side by
@@ -211,6 +212,8 @@ export interface WorkPaneProps {
   profile: ProfileSnapshotView | null;
   /** Effective harness, model, and effort for the owning task. */
   selection: OverviewSelection | null;
+  /** Root task with all descendants for hierarchy navigation. */
+  taskTree?: Task | null;
   /** Whether the viewer can open the operator diagnostics view. */
   isAdmin: boolean;
   /**
@@ -239,6 +242,7 @@ export function WorkPane({
   events,
   profile,
   selection,
+  taskTree,
   isAdmin,
   open,
   tab,
@@ -442,6 +446,7 @@ export function WorkPane({
               events={events}
               profile={profile}
               selection={selection}
+              taskTree={taskTree}
               onShowChanges={() => onTabChange("changes")}
             />
           </div>

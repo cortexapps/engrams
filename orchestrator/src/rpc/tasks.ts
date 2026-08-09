@@ -357,6 +357,7 @@ function buildTask(
   // the live session; mirror it onto the task row (only when it actually
   // changed) so it survives the session's eventual GC.
   if (
+    row.type !== "subsession" &&
     snapshots != null &&
     liveSuggested != null &&
     liveSuggested !== "" &&
@@ -365,7 +366,12 @@ function buildTask(
     snapshots.push({ taskId: row.id, suggestedTitle: liveSuggested });
   }
 
-  const title = effectiveTitle(row, liveSuggested);
+  // A child's local task name is its identity inside the tree. Do not replace
+  // it with a harness or model suggestion from the first prompt.
+  const title =
+    row.type === "subsession"
+      ? (row.localTaskName ?? row.title)
+      : effectiveTitle(row, liveSuggested);
   const creator = row.createdByUserId != null ? identityMap.get(row.createdByUserId) : undefined;
 
   // ORDERED, so `sessions[0]` is the primary for every consumer — the state
@@ -1060,11 +1066,30 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       const ability = abilityFor(user);
       const db = getDbFn();
 
+      if ((req.taskId ? 1 : 0) + (req.sessionId ? 1 : 0) !== 1) {
+        throw new ConnectError("supply exactly one of task_id or session_id", Code.InvalidArgument);
+      }
+
+      let taskId = req.taskId;
+      if (req.sessionId) {
+        const refs = await db
+          .select({ taskId: taskSessionTable.taskId })
+          .from(taskSessionTable)
+          .where(
+            and(
+              eq(taskSessionTable.sessionId, req.sessionId),
+              eq(taskSessionTable.role, "primary"),
+            ),
+          )
+          .limit(1);
+        taskId = refs[0]?.taskId ?? "";
+      }
+
       // Fetch task row.
       const taskRows = await db
         .select()
         .from(taskTable)
-        .where(eq(taskTable.id, req.taskId))
+        .where(eq(taskTable.id, taskId))
         .limit(1);
 
       if (taskRows.length === 0) {
@@ -1079,7 +1104,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       }
 
       const loaded = await loadTask(
-        req.taskId,
+        taskId,
         db,
         sessionsClient,
         profiles,

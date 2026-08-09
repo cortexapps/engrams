@@ -10,13 +10,36 @@ const testState = vi.hoisted(() => ({
 
 vi.mock("@tanstack/react-router", () => ({
   useParams: () => ({ id: "session-1" }),
+  Link: ({
+    children,
+    params,
+    to: _to,
+    ...props
+  }: {
+    children: React.ReactNode;
+    params: { id: string };
+    [key: string]: unknown;
+  }) => (
+    <a href={`/sessions/${params.id}`} {...props}>
+      {children}
+    </a>
+  ),
 }));
 vi.mock("../hooks/useSessions", () => ({
   useSession: () => ({ data: testState.session ?? undefined }),
 }));
 vi.mock("../hooks/useTasks", () => ({
   useTasks: () => ({ data: { tasks: testState.tasks } }),
-  useTask: () => ({ data: undefined }),
+  useTaskForSession: (sessionId: string) => ({
+    data: testState.tasks.find((task) =>
+      (task.sessions as Array<{ sessionId: string }> | undefined)?.some(
+        (ref) => ref.sessionId === sessionId,
+      ),
+    ),
+  }),
+  useTask: (taskId: string | null) => ({
+    data: testState.tasks.find((task) => task.id === taskId),
+  }),
 }));
 vi.mock("../hooks/useSessionEvents", () => ({
   useSessionEvents: () => ({ events: [], streamingText: "" }),
@@ -140,6 +163,7 @@ beforeEach(() => {
       titleIsCustom: true,
       harness: "task-harness",
       model: "task-model",
+      descendants: [],
       sessions: [
         {
           sessionId: "session-1",
@@ -281,5 +305,39 @@ describe("SessionDetail workspace", () => {
       harness: "task-harness",
       model: "task-model",
     });
+  });
+
+  test("uses the child task name and links back to its parent", () => {
+    const child = {
+      id: "task-child",
+      type: "subsession",
+      title: "A generated title that must not win",
+      localTaskName: "api-tests",
+      canonicalTaskName: "api-tests",
+      parentTaskId: "task-root",
+      rootTaskId: "task-root",
+      titleIsCustom: false,
+      status: "done",
+      descendants: [],
+      sessions: [{ sessionId: "session-1", role: "primary" }],
+    };
+    testState.tasks = [
+      {
+        id: "task-root",
+        title: "Build the feature",
+        titleIsCustom: true,
+        status: "working",
+        descendants: [child],
+        sessions: [{ sessionId: "session-root", role: "primary" }],
+      },
+      child,
+    ];
+
+    render(<SessionDetail />);
+
+    expect(screen.getByTestId("session-title").textContent).toBe("api-tests");
+    const parentLink = screen.getByRole("link", { name: "Back to Build the feature" });
+    expect(parentLink.getAttribute("href")).toBe("/sessions/session-root");
+    expect(screen.queryByRole("button", { name: "Rename session" })).toBeNull();
   });
 });
