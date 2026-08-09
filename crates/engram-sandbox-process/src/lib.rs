@@ -262,8 +262,20 @@ struct ProcessImage {
 
 impl ProcessBackend {
     pub fn new(work_dir: impl Into<PathBuf>) -> Self {
+        let work_dir = work_dir.into();
+        // Every emulated guest path derives from this root and may be passed
+        // to a child that has already changed into the guest workdir. Keep the
+        // root absolute so executable, HOME, state, and bundle paths do not
+        // get resolved a second time relative to that child workdir.
+        let work_dir = if work_dir.is_absolute() {
+            work_dir
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&work_dir))
+                .unwrap_or(work_dir)
+        };
         Self {
-            work_dir: work_dir.into(),
+            work_dir,
             sandboxes: DashMap::new(),
             agent_children: DashMap::new(),
         }
@@ -2477,6 +2489,55 @@ mod tests {
             .map(|s| !s.success())
             .unwrap_or(true);
         assert!(dead, "agent pid {pid} should be dead after destroy");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relative_work_dir_spawns_guest_absolute_agent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let process_cwd = std::env::current_dir().expect("process cwd");
+        let dir = tempfile::Builder::new()
+            .prefix("engram-process-relative-")
+            .tempdir_in(&process_cwd)
+            .expect("tempdir under process cwd");
+        let relative = dir
+            .path()
+            .strip_prefix(&process_cwd)
+            .expect("tempdir is under process cwd");
+        let backend = ProcessBackend::new(relative);
+        assert!(backend.work_dir.is_absolute());
+
+        let id = backend.create(spec()).await.expect("create sandbox");
+        let harness = backend.cwd_for(id).join("opt/engram/dyn/0/harness");
+        fs::create_dir_all(harness.parent().expect("harness parent"))
+            .expect("create harness directory");
+        fs::write(&harness, "#!/bin/sh\nprintf started > agent-started\n").expect("write harness");
+        fs::set_permissions(&harness, fs::Permissions::from_mode(0o755))
+            .expect("make harness executable");
+
+        backend
+            .start_agent(
+                id,
+                AgentSpec {
+                    binding_epoch: 1,
+                    argv: vec!["/opt/engram/dyn/0/harness".to_owned()],
+                    env: HashMap::new(),
+                    session_env: HashMap::new(),
+                    host_ca_pem: None,
+                },
+            )
+            .await
+            .expect("spawn guest-absolute harness from a relative backend root");
+
+        let marker = backend.cwd_for(id).join("agent-started");
+        for _ in 0..50 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(fs::read_to_string(marker).expect("agent marker"), "started");
     }
 
     #[tokio::test]
