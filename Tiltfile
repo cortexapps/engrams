@@ -315,14 +315,13 @@ local_resource('seed-buckets',
     labels=['setup'])
 
 # ----------------------------------------------------------------
-# Coordinator (cargo run, manual restart).
+# Coordinator (cargo run, automatic rebuild + restart).
 #
-# Defaults to `auto_init=True` so it starts on `tilt up`, but
-# `trigger_mode=TRIGGER_MODE_MANUAL` keeps it running through Rust
-# edits. Click "rebuild" in Tilt's UI when you want to pick up
-# code changes — we don't auto-restart because losing the in-memory
-# chunk cache / OCI client / scheduler state on every save during
-# dev is more expensive than the benefit of "edits are live".
+# Tilt watches the Rust workspace inputs below and restarts each Rust
+# service after Cargo has rebuilt it. The services intentionally share the
+# dependency list: workspace crates and embedded migrations/config can affect
+# either binary through transitive dependencies. Tilt serializes local builds,
+# so coordinator and host-agent do not contend for Cargo's target lock.
 #
 # On macOS the build → codesign → exec sequence is atomic: cargo
 # rebuild produces fresh unsigned bytes, so codesign has to run
@@ -343,6 +342,24 @@ local_resource('seed-buckets',
 # serve_cmds `exec` the binary directly instead of `cargo run` /
 # build+codesign. Empty in normal dev.
 bin_dir = env_or('ENGRAM_INTEG_BIN_DIR', '')
+
+# CI supplies immutable prebuilt binaries and has no live-edit loop. In normal
+# development, watch all Rust source and compile-time inputs that can change a
+# service binary. Keep target/ outside this list so builds cannot trigger
+# themselves.
+rust_service_deps = []
+if not bin_dir:
+    rust_service_deps = [
+        '.cargo/config.toml',
+        'Cargo.toml',
+        'Cargo.lock',
+        'rust-toolchain.toml',
+        'workspace-hack',
+        'crates',
+        'deploy/migrations',
+        'deploy/harness-claude/harness.toml',
+        'deploy/harness-codex/harness.toml',
+    ]
 
 # ADR 0019: default the OTLP export target to the local Jaeger (dc above).
 # Both coord and host-agent honor it; engram-telemetry is inert if it ever
@@ -428,6 +445,7 @@ if sandbox_backend == 'process':
 local_resource('coordinator',
     serve_cmd=coord_serve_cmd,
     serve_env=coord_env,
+    deps=rust_service_deps,
     # Blob setup is intentionally absent: GCS client construction does not
     # contact the emulator or bucket. Keep the control plane available when
     # fake-gcs-server/seed-buckets is unhealthy; only blob-using operations
@@ -455,7 +473,7 @@ local_resource('coordinator',
         link('http://127.0.0.1:8090/api/registries', 'registries'),
     ],
     labels=['app'],
-    trigger_mode=TRIGGER_MODE_MANUAL,
+    trigger_mode=TRIGGER_MODE_AUTO,
     auto_init=True)
 
 # ----------------------------------------------------------------
@@ -793,12 +811,12 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
             link('http://127.0.0.1:' + metrics_port + '/metrics', 'metrics'),
         ],
         labels=['app'],
-        # ADR 0061: AUTO so a bundle rebuild (current.json change, in `deps`
-        # below) auto-restarts the host-agent → it re-reads the stamp and a
-        # new session runs the edited skill. Source edits are NOT in `deps`,
-        # so a .rs change still requires a manual trigger (unchanged loop).
+        # AUTO covers both bundle generation changes and Rust source changes.
+        # A bundle restart makes the host-agent re-read current.json; a source
+        # restart rebuilds and re-signs/syncs where the selected backend needs
+        # it before Tilt launches the replacement process.
         trigger_mode=TRIGGER_MODE_AUTO,
-        deps=[_bundle_dir + '/current.json'],
+        deps=[_bundle_dir + '/current.json'] + rust_service_deps,
         auto_init=True)
 
 # ADR 0061 / 0055: stage the skill bundles (content-addressed payloads +
@@ -1025,12 +1043,26 @@ local_resource('orchestrator-migrate',
         'ORCHESTRATOR_DATABASE_URL=' + orchestrator_db_url + ' ' +
         'bun x drizzle-kit migrate'
     ),
+    deps=['orchestrator/drizzle', 'orchestrator/drizzle.config.ts'],
     resource_deps=['postgres'],
     labels=['setup'])
 
 local_resource('orchestrator',
-    serve_cmd='cd orchestrator && bun install --silent && bun run start',
+    # Bun watches imported TypeScript/JSON modules and replaces the server
+    # process on edits. Tilt watches the package inputs and runtime-read data
+    # that are outside Bun's import graph, then restarts this serve command.
+    # Exec the watched server directly after install so Tilt owns the listener
+    # process. A `bun run` wrapper can outlive its shell after an unclean Tilt
+    # exit and leave :8787 occupied for the next `just dev`.
+    serve_cmd='cd orchestrator && bun install --silent && exec bun --watch src/index.ts',
     serve_env=orchestrator_env,
+    deps=[
+        'orchestrator/package.json',
+        'orchestrator/bun.lock',
+        'orchestrator/reviewers',
+        'orchestrator/src/connectors',
+        'crates/engram-egress-proxy/policy/google-credential-denylist.json',
+    ],
     resource_deps=['postgres', 'orchestrator-migrate', 'coordinator'],
     readiness_probe=probe(
         period_secs=30,
@@ -1041,7 +1073,7 @@ local_resource('orchestrator',
         link('http://127.0.0.1:8787/healthz', 'healthz'),
     ],
     labels=['app'],
-    trigger_mode=TRIGGER_MODE_MANUAL,
+    trigger_mode=TRIGGER_MODE_AUTO,
     auto_init=True)
 
 # Seed the headless dev credential the `engrams` CLI (justfile recipes,
@@ -1073,9 +1105,9 @@ if sandbox_backend == 'process' and process_bootstrap_command:
 # ----------------------------------------------------------------
 # Web SPA (vite dev server).
 #
-# Vite's HMR runs in-process — Tilt should NEVER restart this.
-# Edits to web/src/** are picked up via vite's own file watcher,
-# not via a Tilt re-run. We deliberately don't pass `deps` here.
+# Vite's HMR handles source/config/public-file edits in-process so the browser
+# keeps its state. Tilt only restarts this resource when dependency metadata
+# changes, which reruns pnpm install before Vite starts again.
 #
 # The vite proxy now targets the orchestrator (:8787) for /rpc + /api,
 # so the web depends on `orchestrator` (not the coordinator directly).
@@ -1091,6 +1123,7 @@ if not skip_web:
         web_resource_deps.append('process-dev-bootstrap')
     local_resource('web',
         serve_cmd='cd web && pnpm install --silent && pnpm dev --strictPort',
+        deps=['web/package.json', 'web/pnpm-lock.yaml'],
         resource_deps=web_resource_deps,
         # See the coordinator probe above — same loopback port-pool
         # constraint applies to vite.
@@ -1104,7 +1137,7 @@ if not skip_web:
             link('http://localhost:5173/settings', 'settings'),
         ],
         labels=['app'],
-        trigger_mode=TRIGGER_MODE_MANUAL,
+        trigger_mode=TRIGGER_MODE_AUTO,
         auto_init=True)
 
 # Resources are grouped in the Tilt UI by `labels` above:
