@@ -200,10 +200,12 @@ pub enum WireRequest {
     /// instead of an error if the path is missing, to keep
     /// "does this exist" cheap to ask.
     Stat { path: String },
-    /// Write `bytes` to `path` inside the sandbox, creating parent
-    /// directories as needed. `mode` is the unix file mode to
-    /// `chmod` to after the write (mostly for `+x` on uploaded
-    /// scripts); `None` keeps the OS default.
+    /// Legacy buffered write. Keep this variant at its current index so
+    /// baked agents can decode older hosts. Current hosts use
+    /// [`Self::UploadStream`] for every session file write.
+    ///
+    /// `mode` is the Unix file mode to apply after the write. `None`
+    /// keeps the OS default.
     Upload {
         path: String,
         bytes: Vec<u8>,
@@ -400,12 +402,13 @@ pub enum WireRequest {
     /// Kill the process group for a durable exec ticket. Appended for wire
     /// compatibility; old agentd rejects it with the named skew response.
     CancelExec { exec_id: String },
-    /// Begin an atomic streamed upload. The host follows this request with
+    /// Begin an atomic streamed file write. The host follows this request with
     /// `WireFileChunk` frames until exactly `size_bytes` have arrived.
     UploadStream {
         path: String,
         size_bytes: u64,
         sha256: String,
+        mode: Option<u32>,
     },
     /// Begin a streamed read. The agent replies with metadata, then
     /// `WireFileChunk` frames until `size_bytes` have been sent.

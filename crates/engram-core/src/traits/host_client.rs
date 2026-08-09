@@ -29,7 +29,7 @@ use crate::types::egress::SessionEgressPolicy;
 use crate::types::port::PortTunnel;
 use crate::types::sandbox::{
     AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec, SessionFileMetadata,
-    SessionFileSpec, SessionFileStream, WriteFileResult, WriteFileSpec,
+    SessionFileSpec, SessionFileStream,
 };
 use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
@@ -151,27 +151,14 @@ pub trait HostClient: Send + Sync {
         })
     }
 
-    /// Write a batch of files into a running sandbox. Implementations report
-    /// file-level failures in the returned vector and reserve the outer error
-    /// for sandbox-level failures such as an unknown sandbox.
-    async fn write_files(
-        &self,
-        _id: SandboxId,
-        _files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        Err(SandboxError::Unsupported(
-            "this host doesn't support `write_files` yet".into(),
-        ))
-    }
-
-    async fn upload_file(
+    async fn write_file(
         &self,
         _id: SandboxId,
         _spec: SessionFileSpec,
         _bytes: SessionFileStream,
     ) -> Result<SessionFileMetadata, SandboxError> {
         Err(SandboxError::Unsupported(
-            "this host doesn't support `upload_file` yet".into(),
+            "this host doesn't support `write_file` yet".into(),
         ))
     }
 

@@ -182,8 +182,9 @@ where
             path,
             size_bytes,
             sha256,
+            mode,
         } => {
-            upload_stream(&mut reader, &mut writer, &path, size_bytes, &sha256).await?;
+            upload_stream(&mut reader, &mut writer, &path, size_bytes, &sha256, mode).await?;
             return Ok(());
         }
         WireRequest::DownloadStream { path } => {
@@ -1112,6 +1113,7 @@ async fn upload_stream<R, W>(
     path: &str,
     size_bytes: u64,
     sha256: &str,
+    mode: Option<u32>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -1199,7 +1201,7 @@ where
         #[cfg(unix)]
         tokio::fs::set_permissions(&temporary, {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::Permissions::from_mode(0o600)
+            std::fs::Permissions::from_mode(mode.unwrap_or(0o600))
         })
         .await?;
         drop(file);
@@ -2519,6 +2521,7 @@ mod tests {
                 &destination_string,
                 expected.len() as u64,
                 &digest,
+                Some(0o640),
             )
             .await
         });
@@ -2559,7 +2562,7 @@ mod tests {
                     .permissions()
                     .mode()
                     & 0o777,
-                0o600
+                0o640
             );
         }
     }
@@ -2583,6 +2586,7 @@ mod tests {
                     &destination_string,
                     size,
                     &digest,
+                    None,
                 )
                 .await
             });
@@ -2619,7 +2623,15 @@ mod tests {
             let path = path.clone();
             let task = tokio::spawn(async move {
                 let (mut server_reader, mut server_writer) = tokio::io::split(server);
-                upload_stream(&mut server_reader, &mut server_writer, &path, 4, &digest).await
+                upload_stream(
+                    &mut server_reader,
+                    &mut server_writer,
+                    &path,
+                    4,
+                    &digest,
+                    None,
+                )
+                .await
             });
             let response = read_msg::<_, WireResponse>(&mut client_reader)
                 .await

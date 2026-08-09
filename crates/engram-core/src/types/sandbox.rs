@@ -429,32 +429,15 @@ pub struct ExecRequest {
     pub wake: Option<bool>,
 }
 
-/// One file to write into a running sandbox.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WriteFileSpec {
-    pub path: String,
-    pub content: Vec<u8>,
-    /// Unix permission bits applied after writing. `None` leaves the
-    /// platform-created permissions unchanged.
-    pub mode: Option<u32>,
-}
-
-/// Per-file outcome from a batched [`SandboxBackend::write_files`](
-/// crate::traits::SandboxBackend::write_files) operation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WriteFileResult {
-    pub path: String,
-    pub ok: bool,
-    pub error: Option<String>,
-}
-
-/// Metadata for one bounded-memory file transfer (ADR 0113).
+/// Metadata for one bounded-memory file write (ADR 0113).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionFileSpec {
     pub path: String,
     pub size_bytes: u64,
     /// Lower-case hexadecimal SHA-256 digest.
     pub sha256: String,
+    /// Unix permission bits applied after writing. `None` creates a 0600 file.
+    pub mode: Option<u32>,
 }
 
 /// Verified metadata returned after upload or before a read stream.

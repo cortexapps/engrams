@@ -38,7 +38,6 @@ pub(crate) mod sessions_inspect;
 pub mod snapshot;
 pub(crate) mod storage;
 pub(crate) mod upload;
-pub(crate) mod write_files;
 
 pub fn router(state: SharedState) -> Router {
     // ADR 0051: the web-facing (protected / session-scoped / member / admin /

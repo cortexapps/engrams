@@ -13,7 +13,7 @@ export const REVIEW_CATEGORIES = [
 ] as const;
 export type ReviewCategory = (typeof REVIEW_CATEGORIES)[number];
 
-/** Guest directory the rendered files land in (WriteFiles target, later PR). */
+/** Guest directory where the review workflow stages rendered files. */
 export const REVIEW_GUEST_DIR = "/workspace/.review";
 
 export interface RenderReviewerOptions {
@@ -24,7 +24,7 @@ export interface RenderReviewerOptions {
   orgInstructions?: string;
 }
 
-/** A file to stage into the guest via WriteFiles. */
+/** A file to stage into the guest through the streaming file writer. */
 export interface RenderedReviewerFile {
   /** Absolute guest path, e.g. "/workspace/.review/finder.md". */
   path: string;

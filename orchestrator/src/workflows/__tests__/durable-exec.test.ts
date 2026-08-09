@@ -130,6 +130,13 @@ function instantRuntime(): RunExecRuntime & { elapsedMs(): number } {
 
 type Terminal = "exit" | "null-exit" | "missing-exit" | "error";
 
+interface RecordedFileWrite {
+  sessionId: string;
+  path: string;
+  content: Uint8Array;
+  mode?: number;
+}
+
 /**
  * A guest-journal-shaped fake: the first request for a ticket spawns once,
  * every later request attaches to the same bytes/result, and disconnect cuts
@@ -138,9 +145,7 @@ type Terminal = "exit" | "null-exit" | "missing-exit" | "error";
 class JournalExecServer implements ReviewSessionsClient {
   readonly execCalls: ExecRequest[] = [];
   readonly cancelCalls: Array<{ sessionId: string; execId: string }> = [];
-  readonly writeCalls: Array<
-    Parameters<ReviewSessionsClient["writeFiles"]>[0]
-  > = [];
+  readonly writeCalls: RecordedFileWrite[] = [];
   readonly deletedIds: string[] = [];
   readonly spawnCounts = new Map<string, number>();
 
@@ -227,15 +232,33 @@ class JournalExecServer implements ReviewSessionsClient {
     return {};
   }
 
-  async writeFiles(
-    req: Parameters<ReviewSessionsClient["writeFiles"]>[0],
-  ): Promise<{
-    results: Array<{ path: string; ok: boolean; error?: string }>;
-  }> {
-    this.writeCalls.push(req);
-    return {
-      results: req.files.map((file) => ({ path: file.path, ok: true })),
-    };
+  async writeFile(input: Parameters<ReviewSessionsClient["writeFile"]>[0]) {
+    let metadata: {
+      sessionId: string;
+      path: string;
+      sizeBytes: bigint;
+      sha256: string;
+      mode?: number;
+    } | undefined;
+    const chunks: Uint8Array[] = [];
+    for await (const item of input) {
+      if (item.frame.case === "metadata") metadata = item.frame.value;
+      else chunks.push(item.frame.value);
+    }
+    if (!metadata) throw new Error("missing file metadata");
+    const content = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0));
+    let offset = 0;
+    for (const chunk of chunks) {
+      content.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    this.writeCalls.push({
+      sessionId: metadata.sessionId,
+      path: metadata.path,
+      content,
+      mode: metadata.mode,
+    });
+    return { path: metadata.path, sizeBytes: metadata.sizeBytes, sha256: metadata.sha256 };
   }
 
   async sendPrompt(): Promise<unknown> {
@@ -366,7 +389,7 @@ describe("durable orchestrator exec caller", () => {
       createSession: () => base.createSession(),
       deleteSession: (req) => base.deleteSession(req),
       cancelExec: (req) => base.cancelExec(req),
-      writeFiles: (req) => base.writeFiles(req),
+      writeFile: (input) => base.writeFile(input),
       sendPrompt: () => base.sendPrompt(),
       exec(): AsyncIterable<ExecFrame> {
         calls++;
@@ -404,7 +427,7 @@ describe("durable orchestrator exec caller", () => {
       createSession: () => base.createSession(),
       deleteSession: (req) => base.deleteSession(req),
       cancelExec: (req) => base.cancelExec(req),
-      writeFiles: (req) => base.writeFiles(req),
+      writeFile: (input) => base.writeFile(input),
       sendPrompt: () => base.sendPrompt(),
       exec(): AsyncIterable<ExecFrame> {
         const call = ++calls;
@@ -446,7 +469,7 @@ describe("durable orchestrator exec caller", () => {
       createSession: () => base.createSession(),
       deleteSession: (req) => base.deleteSession(req),
       cancelExec: (req) => base.cancelExec(req),
-      writeFiles: (req) => base.writeFiles(req),
+      writeFile: (input) => base.writeFile(input),
       sendPrompt: () => base.sendPrompt(),
       exec(): AsyncIterable<ExecFrame> {
         calls++;
@@ -483,7 +506,7 @@ describe("durable orchestrator exec caller", () => {
       createSession: () => base.createSession(),
       deleteSession: (req) => base.deleteSession(req),
       cancelExec: (req) => base.cancelExec(req),
-      writeFiles: (req) => base.writeFiles(req),
+      writeFile: (input) => base.writeFile(input),
       sendPrompt: () => base.sendPrompt(),
       exec(): AsyncIterable<ExecFrame> {
         calls++;
@@ -522,7 +545,7 @@ describe("durable orchestrator exec caller", () => {
       createSession: () => base.createSession(),
       deleteSession: (req) => base.deleteSession(req),
       cancelExec: (req) => base.cancelExec(req),
-      writeFiles: (req) => base.writeFiles(req),
+      writeFile: (input) => base.writeFile(input),
       sendPrompt: () => base.sendPrompt(),
       exec(): AsyncIterable<ExecFrame> {
         calls++;
@@ -557,7 +580,7 @@ describe("durable orchestrator exec caller", () => {
       createSession: () => base.createSession(),
       deleteSession: (req) => base.deleteSession(req),
       cancelExec: (req) => base.cancelExec(req),
-      writeFiles: (req) => base.writeFiles(req),
+      writeFile: (input) => base.writeFile(input),
       sendPrompt: () => base.sendPrompt(),
       exec(req): AsyncIterable<ExecFrame> {
         const call = ++calls;
@@ -653,7 +676,7 @@ describe("durable orchestrator exec caller", () => {
         createSession: () => base.createSession(),
         deleteSession: (req) => base.deleteSession(req),
         cancelExec: (req) => base.cancelExec(req),
-        writeFiles: (req) => base.writeFiles(req),
+        writeFile: (input) => base.writeFile(input),
         sendPrompt: () => base.sendPrompt(),
         exec(): AsyncIterable<ExecFrame> {
           calls++;
@@ -706,7 +729,7 @@ describe("durable orchestrator exec caller", () => {
         createSession: () => base.createSession(),
         deleteSession: (req) => base.deleteSession(req),
         cancelExec: (req) => base.cancelExec(req),
-        writeFiles: (req) => base.writeFiles(req),
+        writeFile: (input) => base.writeFile(input),
         sendPrompt: () => base.sendPrompt(),
         exec(): AsyncIterable<ExecFrame> {
           calls++;
@@ -742,7 +765,7 @@ describe("durable orchestrator exec caller", () => {
         createSession: () => base.createSession(),
         deleteSession: (req) => base.deleteSession(req),
         cancelExec: (req) => base.cancelExec(req),
-        writeFiles: (req) => base.writeFiles(req),
+        writeFile: (input) => base.writeFile(input),
         sendPrompt: () => base.sendPrompt(),
         exec(req) {
           calls++;
@@ -884,6 +907,6 @@ describe("durable orchestrator exec caller", () => {
     expect(server.execCalls).toHaveLength(2);
     expect(server.execCalls.every((call) => call.execId === execId)).toBe(true);
     expect(server.execCalls.every((call) => call.stdoutOffset === 0n)).toBe(true);
-    expect(server.writeCalls).toHaveLength(2);
+    expect(server.writeCalls).toHaveLength(14);
   });
 });

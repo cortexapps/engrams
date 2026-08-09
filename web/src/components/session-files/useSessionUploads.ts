@@ -60,7 +60,7 @@ async function hashFile(file: File, progress: (value: number) => void): Promise<
   return bytesToHex(hash.digest());
 }
 
-async function uploadFile(
+async function writeFile(
   sessionId: string,
   token: UploadToken,
   update: (patch: Partial<UploadToken>) => void,
@@ -82,7 +82,7 @@ async function uploadFile(
     const request = new XMLHttpRequest();
     request.open(
       "POST",
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}/uploads?upload_id=${encodeURIComponent(token.id)}&file_name=${encodeURIComponent(token.name)}`,
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/files?path=${encodeURIComponent(token.path)}`,
     );
     request.withCredentials = true;
     request.setRequestHeader("content-type", "application/octet-stream");
@@ -152,7 +152,7 @@ export function useSessionUploads(sessionId?: string) {
   const runUpload = useCallback(
     async (targetSessionId: string, token: UploadToken): Promise<UploadToken> => {
       try {
-        const complete = await uploadFile(targetSessionId, token, (patch) =>
+        const complete = await writeFile(targetSessionId, token, (patch) =>
           patchToken(token.id, patch),
         );
         patchToken(token.id, complete);

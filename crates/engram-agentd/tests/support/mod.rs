@@ -131,13 +131,16 @@ pub fn wire_request() -> impl Strategy<Value = WireRequest> {
         Just(WireRequest::StopIde),
         any::<i64>().prop_map(|unix_nanos| WireRequest::StepClock { unix_nanos }),
         s().prop_map(|exec_id| WireRequest::CancelExec { exec_id }),
-        (s(), any::<u64>(), s()).prop_map(|(path, size_bytes, sha256)| {
-            WireRequest::UploadStream {
-                path,
-                size_bytes,
-                sha256,
+        (s(), any::<u64>(), s(), proptest::option::of(any::<u32>())).prop_map(
+            |(path, size_bytes, sha256, mode)| {
+                WireRequest::UploadStream {
+                    path,
+                    size_bytes,
+                    sha256,
+                    mode,
+                }
             }
-        }),
+        ),
         s().prop_map(|path| WireRequest::DownloadStream { path }),
     ]
 }

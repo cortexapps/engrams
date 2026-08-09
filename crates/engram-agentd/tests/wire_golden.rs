@@ -162,6 +162,7 @@ fn wire_request_golden_and_variant_indices() {
         path: "/tmp/uploads/id/file.bin".into(),
         size_bytes: 4,
         sha256: "0123456789abcdef".repeat(4),
+        mode: Some(0o640),
     };
     let download_stream = WireRequest::DownloadStream {
         path: "/tmp/uploads/id/file.bin".into(),
@@ -478,6 +479,7 @@ fn regen_golden() {
             path: "/tmp/uploads/id/file.bin".into(),
             size_bytes: 4,
             sha256: "0123456789abcdef".repeat(4),
+            mode: Some(0o640),
         },
     );
     write(

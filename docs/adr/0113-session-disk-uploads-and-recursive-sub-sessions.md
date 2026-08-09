@@ -13,9 +13,10 @@ retention, garbage collection, and object-store policy that this use case does
 not need. The session disk already has the required lifetime: it survives
 snapshot, eviction, and resume, and it disappears when the session is deleted.
 
-The existing `WriteFiles` RPC is not suitable for composer uploads. It is a
-unary setup operation with a 3 MiB aggregate limit. The host-to-guest upload
-verb also carries one buffered payload with a 16 MiB frame limit.
+The previous `WriteFiles` RPC was a unary setup operation with a 3 MiB
+aggregate limit. The host-to-guest write also carried one buffered payload
+with a 16 MiB frame limit. A separate upload verb would leave two ways to put
+bytes on a session disk.
 
 ## Decision
 
@@ -27,24 +28,26 @@ Browser uploads are ordinary files under this canonical directory:
 /tmp/uploads/<upload-uuid>/<sanitized-file-name>
 ```
 
-The client chooses the UUID and file name. The control plane validates both and
-derives the path. A caller cannot supply another destination. One file is at
-most 512 MiB. The session disk limit bounds aggregate storage.
+The browser chooses the UUID and sanitized file name and sends the resulting
+path to the control plane. `/tmp/uploads` is a composer convention, not a
+file-transfer policy. One file is at most 512 MiB. The session disk limit
+bounds aggregate storage.
 
-`SessionService` exposes authenticated `UploadFile`, `ReadFile`, and
-`CopyFiles` operations. Upload and read use streaming RPCs. The orchestrator
+`SessionService` exposes authenticated `WriteFile`, `ReadFile`, and
+`CopyFiles` operations. Write and read use streaming RPCs. The orchestrator
 serves dedicated authenticated HTTP upload and download routes and does not put
 these methods on its generic Connect pass-through surface.
 
-An upload writes to a temporary sibling, checks the declared length and SHA-256
-while it streams, sets non-executable permissions, and renames the file
-atomically. A retry with the same upload UUID, name, length, and digest succeeds
-without changing the file. Different content for an existing canonical path
+`WriteFile` accepts any normalized absolute guest path. It writes to a
+temporary sibling, checks the declared length and SHA-256 while it streams,
+sets the requested non-special Unix permission bits (0600 by default), and
+publishes the file atomically. A retry with the same path, length, and digest
+succeeds without changing the file. Different content at an existing path
 fails. A reader never observes a partial file.
 
-`ReadFile` and `CopyFiles` accept any normalized absolute guest file path.
-`/tmp/uploads` is a composer convention, not a file-transfer policy. This lets
-an agent copy a file that it created elsewhere on its disk to a child session.
+`ReadFile` and `CopyFiles` also accept any normalized absolute guest file path.
+This lets an agent copy a file that it created elsewhere on its disk to a child
+session.
 `CopyFiles` keeps each source path unchanged. It streams bytes from the source
 guest through the source host, coordinator, target host, and target guest. It
 does not use object storage and does not buffer the whole file. The coordinator

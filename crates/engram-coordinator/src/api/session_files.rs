@@ -8,40 +8,6 @@ use engram_core::SessionId;
 use crate::error::ApiError;
 use crate::state::SharedState;
 
-pub(crate) const UPLOAD_ROOT: &str = "/tmp/uploads";
-
-pub(crate) fn sanitize_file_name(name: &str) -> Result<String, ApiError> {
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
-        return Err(ApiError::BadRequest(
-            "file_name must be one file name".into(),
-        ));
-    }
-    let sanitized: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .take(255)
-        .collect();
-    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
-        return Err(ApiError::BadRequest(
-            "file_name has no usable characters".into(),
-        ));
-    }
-    Ok(sanitized)
-}
-
-pub(crate) fn canonical_upload_path(upload_id: &str, file_name: &str) -> Result<String, ApiError> {
-    let upload_id = uuid::Uuid::parse_str(upload_id)
-        .map_err(|_| ApiError::BadRequest("upload_id must be a UUID".into()))?;
-    let file_name = sanitize_file_name(file_name)?;
-    Ok(format!("{UPLOAD_ROOT}/{upload_id}/{file_name}"))
-}
-
 pub(crate) fn validate_guest_file_path(path: &str) -> Result<(), ApiError> {
     if path.len() > 4096 || !path.starts_with('/') || path == "/" || path.contains('\0') {
         return Err(ApiError::BadRequest(
@@ -59,22 +25,8 @@ pub(crate) fn validate_guest_file_path(path: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_canonical_upload_path(path: &str) -> Result<(), ApiError> {
-    let remainder = path
-        .strip_prefix(&format!("{UPLOAD_ROOT}/"))
-        .ok_or_else(|| ApiError::BadRequest("upload path must be under /tmp/uploads".into()))?;
-    let (upload_id, file_name) = remainder
-        .split_once('/')
-        .ok_or_else(|| ApiError::BadRequest("upload path is incomplete".into()))?;
-    let expected = canonical_upload_path(upload_id, file_name)?;
-    if expected != path {
-        return Err(ApiError::BadRequest("upload path is not canonical".into()));
-    }
-    Ok(())
-}
-
 fn validate_spec(spec: &SessionFileSpec) -> Result<(), ApiError> {
-    validate_canonical_upload_path(&spec.path)?;
+    validate_guest_file_path(&spec.path)?;
     if spec.size_bytes > MAX_SESSION_FILE_BYTES {
         return Err(ApiError::PayloadTooLarge(format!(
             "file exceeds {MAX_SESSION_FILE_BYTES} bytes"
@@ -88,6 +40,11 @@ fn validate_spec(spec: &SessionFileSpec) -> Result<(), ApiError> {
     {
         return Err(ApiError::BadRequest(
             "sha256 must be 64 lower-case hexadecimal characters".into(),
+        ));
+    }
+    if spec.mode.is_some_and(|mode| mode > 0o777) {
+        return Err(ApiError::BadRequest(
+            "mode must contain only Unix permission bits".into(),
         ));
     }
     Ok(())
@@ -104,7 +61,7 @@ async fn active_sandbox(
         .ok_or_else(|| ApiError::Conflict("session has no live sandbox after resume".into()))
 }
 
-pub(crate) async fn upload_file_core(
+pub(crate) async fn write_file_core(
     state: &SharedState,
     session_id: SessionId,
     spec: SessionFileSpec,
@@ -115,7 +72,7 @@ pub(crate) async fn upload_file_core(
     state
         .services
         .host
-        .upload_file(sandbox_id, spec, bytes)
+        .write_file(sandbox_id, spec, bytes)
         .await
         .map_err(ApiError::from)
 }
@@ -173,12 +130,13 @@ pub(crate) async fn copy_files_core(
             match state
                 .services
                 .host
-                .upload_file(
+                .write_file(
                     target_sandbox_id,
                     SessionFileSpec {
                         path: path.clone(),
                         size_bytes: metadata.size_bytes,
                         sha256: metadata.sha256,
+                        mode: None,
                     },
                     bytes,
                 )
@@ -216,15 +174,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn derives_canonical_path_and_sanitizes_name() {
-        assert_eq!(
-            canonical_upload_path("019fe2ff-0464-75f3-bb20-a8c1844579b9", "design notes.pdf")
-                .unwrap(),
-            "/tmp/uploads/019fe2ff-0464-75f3-bb20-a8c1844579b9/design_notes.pdf"
-        );
-    }
-
-    #[test]
     fn accepts_normalized_absolute_guest_file_paths() {
         for path in [
             "/tmp/numbers.txt",
@@ -245,20 +194,6 @@ mod tests {
             "/",
         ] {
             assert!(validate_guest_file_path(path).is_err(), "accepted {path}");
-        }
-    }
-
-    #[test]
-    fn browser_upload_paths_remain_canonical() {
-        for path in [
-            "/tmp/numbers.txt",
-            "/tmp/uploads/not-a-uuid/file",
-            "/tmp/uploads/019fe2ff-0464-75f3-bb20-a8c1844579b9/a/b",
-        ] {
-            assert!(
-                validate_canonical_upload_path(path).is_err(),
-                "accepted {path}"
-            );
         }
     }
 }

@@ -10,17 +10,17 @@ import type { GetSession, ResolveOwner } from "./guard.ts";
 const MAX_FILE_BYTES = 512 * 1024 * 1024;
 
 export interface SessionFileClient {
-  uploadFile(
+  writeFile(
     input: AsyncIterable<{
       frame:
         | {
             case: "metadata";
             value: {
               sessionId: string;
-              uploadId: string;
-              fileName: string;
+              path: string;
               sizeBytes: bigint;
               sha256: string;
+              mode?: number;
             };
           }
         | { case: "chunk"; value: Uint8Array };
@@ -75,10 +75,10 @@ export function makeSessionFilesRoute(deps: SessionFileRouteDeps = {}): Hono {
   const client = deps.sessions ?? (defaultSessions as unknown as SessionFileClient);
   const guard = makeGuard(deps.getSession, deps.resolveOwner);
 
-  app.post("/api/v1/sessions/:id/uploads", async (c) => {
+  app.post("/api/v1/sessions/:id/files", async (c) => {
     await guard(c, "shell");
-    const uploadId = c.req.query("upload_id") ?? "";
-    const fileName = c.req.query("file_name") ?? "";
+    const path = c.req.query("path") ?? "";
+    if (!path) return c.json({ error: "path is required" }, 400);
     const sha256 = c.req.header("x-upload-sha256") ?? "";
     const rawSize = c.req.header("x-upload-size") ?? c.req.header("content-length") ?? "";
     if (!/^\d+$/.test(rawSize)) {
@@ -98,8 +98,7 @@ export function makeSessionFilesRoute(deps: SessionFileRouteDeps = {}): Hono {
           case: "metadata" as const,
           value: {
             sessionId: c.req.param("id"),
-            uploadId,
-            fileName,
+            path,
             sizeBytes,
             sha256,
           },
@@ -120,7 +119,7 @@ export function makeSessionFilesRoute(deps: SessionFileRouteDeps = {}): Hono {
       }
     }
     try {
-      const result = await client.uploadFile(frames());
+      const result = await client.writeFile(frames());
       return c.json({
         path: result.path,
         size_bytes: Number(result.sizeBytes),

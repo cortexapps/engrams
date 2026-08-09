@@ -1,6 +1,7 @@
 /** Durable review-record and finder-session operations behind the workflow seam. */
 
 import { Code, ConnectError } from "@connectrpc/connect";
+import { createHash } from "node:crypto";
 
 import { getDb } from "../db/client.ts";
 import {
@@ -237,11 +238,66 @@ interface ReviewControlPlaneStore extends Pick<
 // `runExec`'s job, in ../exec/durable-exec.ts. Reviews only decide WHAT to
 // run (clone, merge-base), the ticket name, and the deadline.
 export interface ReviewSessionsClient extends TaskSessionsClient, DurableExecClient {
-  writeFiles(req: {
-    sessionId: string;
-    files: Array<{ path: string; content: Uint8Array; mode: number }>;
-  }): Promise<{ results: Array<{ path: string; ok: boolean; error?: string }> }>;
+  writeFile(input: AsyncIterable<{
+    frame:
+      | {
+        case: "metadata";
+        value: {
+          sessionId: string;
+          path: string;
+          sizeBytes: bigint;
+          sha256: string;
+          mode?: number;
+        };
+      }
+      | { case: "chunk"; value: Uint8Array };
+  }>): Promise<{ path: string; sizeBytes: bigint; sha256: string }>;
   sendPrompt(req: { sessionId: string; promptId: string; text: string }): Promise<unknown>;
+}
+
+interface FileToStage {
+  path: string;
+  content: Uint8Array;
+  mode: number;
+}
+
+async function stageFiles(
+  sessions: ReviewSessionsClient,
+  sessionId: string,
+  files: readonly FileToStage[],
+): Promise<Array<{ path: string; ok: boolean; error?: string }>> {
+  const results: Array<{ path: string; ok: boolean; error?: string }> = [];
+  for (const file of files) {
+    const sha256 = createHash("sha256").update(file.content).digest("hex");
+    async function* frames() {
+      yield {
+        frame: {
+          case: "metadata" as const,
+          value: {
+            sessionId,
+            path: file.path,
+            sizeBytes: BigInt(file.content.byteLength),
+            sha256,
+            mode: file.mode,
+          },
+        },
+      };
+      if (file.content.byteLength > 0) {
+        yield { frame: { case: "chunk" as const, value: file.content } };
+      }
+    }
+    try {
+      await sessions.writeFile(frames());
+      results.push({ path: file.path, ok: true });
+    } catch (error) {
+      results.push({
+        path: file.path,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return results;
 }
 
 type RenderReviewer = (opts: RenderReviewerOptions) => RenderedReviewerFile[];
@@ -888,8 +944,8 @@ export function makeReviewControlPlane(
         content: encoder.encode(file.content),
         mode: 0o644,
       }));
-      const response = await sessions.writeFiles({ sessionId, files });
-      const failed = response.results.find((result) => !result.ok);
+      const results = await stageFiles(sessions, sessionId, files);
+      const failed = results.find((result) => !result.ok);
       if (failed) {
         throw new ReviewSetupError(
           `failed to stage reviewer instructions at ${failed.path}: ${failed.error ?? "unknown error"}`,
@@ -1088,8 +1144,8 @@ export function makeReviewControlPlane(
         content: encoder.encode(file.content),
         mode: 0o644,
       }));
-      const response = await sessions.writeFiles({ sessionId, files });
-      const failed = response.results.find((result) => !result.ok);
+      const results = await stageFiles(sessions, sessionId, files);
+      const failed = results.find((result) => !result.ok);
       if (failed) {
         throw new ReviewSetupError(
           `failed to stage verifier inputs at ${failed.path}: ${failed.error ?? "unknown error"}`,

@@ -91,7 +91,7 @@ use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AuxBundleRef, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
-    SessionFileMetadata, SessionFileSpec, SessionFileStream, WriteFileResult, WriteFileSpec,
+    SessionFileMetadata, SessionFileSpec, SessionFileStream,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
@@ -1703,34 +1703,10 @@ impl FirecrackerBackend {
         .await
     }
 
-    /// Drive agentd's existing `Upload` verb over a direct UDS. Public for
-    /// the protocol integration test; production uses the FC-vsock variant.
-    pub async fn write_files_via_agent_socket(
-        sandbox_id: SandboxId,
-        agent_socket: &Path,
-        files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        let mut results = Vec::with_capacity(files.len());
-        for file in files {
-            let result = match UnixStream::connect(agent_socket).await {
-                Ok(conn) => upload_file_over_stream(conn, file).await,
-                Err(error) => write_file_failure(
-                    file.path,
-                    format!(
-                        "sandbox {sandbox_id}: connect to agent at {}: {error}",
-                        agent_socket.display()
-                    ),
-                ),
-            };
-            results.push(result);
-        }
-        Ok(results)
-    }
-
     /// Drive ADR 0113's streamed upload over a direct agentd UDS. Public for
     /// the protocol integration test; production dials the same agent port
     /// through Firecracker's vsock proxy.
-    pub async fn upload_file_via_agent_socket(
+    pub async fn write_file_via_agent_socket(
         agent_socket: &Path,
         spec: SessionFileSpec,
         bytes: SessionFileStream,
@@ -1738,11 +1714,11 @@ impl FirecrackerBackend {
         let connection = UnixStream::connect(agent_socket).await.map_err(|error| {
             SandboxError::Vm(format!("connect agent for upload: {error}").into())
         })?;
-        engram_agentd::file_transfer::upload_file(connection, spec, bytes).await
+        engram_agentd::file_transfer::write_file(connection, spec, bytes).await
     }
 
     /// Read an ADR 0113 session file over a direct agentd UDS. Test seam paired
-    /// with [`Self::upload_file_via_agent_socket`].
+    /// with [`Self::write_file_via_agent_socket`].
     pub async fn read_file_via_agent_socket(
         agent_socket: &Path,
         path: String,
@@ -1782,28 +1758,6 @@ impl FirecrackerBackend {
             )),
         )
         .await
-    }
-
-    async fn write_files_via_fc_vsock(
-        sandboxes: &Arc<DashMap<SandboxId, LiveSandbox>>,
-        sandbox_id: SandboxId,
-        vsock_uds_path: &Path,
-        port: u32,
-        files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        let mut results = Vec::with_capacity(files.len());
-        for file in files {
-            let result =
-                match Self::connect_fc_vsock(sandboxes, sandbox_id, vsock_uds_path, port).await {
-                    Ok(conn) => upload_file_over_stream(conn, file).await,
-                    Err(error) => write_file_failure(
-                        file.path,
-                        format!("sandbox {sandbox_id}: connect to agentd vsock: {error}"),
-                    ),
-                };
-            results.push(result);
-        }
-        Ok(results)
     }
 
     /// Open the host UDS at `vsock_uds_path`, write `CONNECT <port>\n`,
@@ -5137,44 +5091,6 @@ async fn durable_exec_fallback(
     let _ = tx.send(ExecEvent::Exit(None)).await;
 }
 
-async fn upload_file_over_stream<S>(mut stream: S, file: WriteFileSpec) -> WriteFileResult
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let path = file.path.clone();
-    let request = WireRequest::Upload {
-        path: file.path,
-        bytes: file.content,
-        mode: file.mode,
-    };
-    match write_msg(&mut stream, &request).await {
-        Ok(()) => {}
-        Err(error) => {
-            return write_file_failure(path, format!("send Upload request: {error}"));
-        }
-    }
-    match read_msg::<_, WireResponse>(&mut stream).await {
-        Ok(WireResponse::UploadOk) => WriteFileResult {
-            path,
-            ok: true,
-            error: None,
-        },
-        Ok(WireResponse::Error { kind, message }) => {
-            write_file_failure(path, format!("agentd rejected Upload ({kind}): {message}"))
-        }
-        Ok(other) => write_file_failure(path, format!("unexpected Upload response: {other:?}")),
-        Err(error) => write_file_failure(path, format!("read Upload response: {error}")),
-    }
-}
-
-fn write_file_failure(path: String, error: String) -> WriteFileResult {
-    WriteFileResult {
-        path,
-        ok: false,
-        error: Some(error),
-    }
-}
-
 /// How [`wait_for_socket`] decides the spawned process's socket is ready.
 #[derive(Clone, Copy)]
 enum SocketProbe {
@@ -5336,26 +5252,7 @@ impl SandboxBackend for FirecrackerBackend {
         cancel_exec_roundtrip(Box::new(connection), &exec_id).await
     }
 
-    async fn write_files(
-        &self,
-        id: SandboxId,
-        files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        let vsock_uds_path = {
-            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            live.state.vsock_uds_path.clone()
-        };
-        Self::write_files_via_fc_vsock(
-            &self.sandboxes,
-            id,
-            &vsock_uds_path,
-            ENGRAM_AGENTD_PORT,
-            files,
-        )
-        .await
-    }
-
-    async fn upload_file(
+    async fn write_file(
         &self,
         id: SandboxId,
         spec: SessionFileSpec,
@@ -5368,7 +5265,7 @@ impl SandboxBackend for FirecrackerBackend {
         let connection =
             Self::connect_fc_vsock(&self.sandboxes, id, &vsock_uds_path, ENGRAM_AGENTD_PORT)
                 .await?;
-        engram_agentd::file_transfer::upload_file(connection, spec, bytes).await
+        engram_agentd::file_transfer::write_file(connection, spec, bytes).await
     }
 
     async fn read_file(
@@ -8651,8 +8548,8 @@ mod tests {
         drop(guest_end);
     }
 
-    /// And on the Upload round-trip (`write_files`): a severed response read
-    /// must surface as a per-file failure the caller can retry, not a hang.
+    /// A streamed file write must fail promptly if the guest disappears while
+    /// the host waits for the verification response.
     #[tokio::test]
     async fn checkpoint_severing_the_upload_response_reports_failure_instead_of_hanging() {
         let (host_end, mut guest_end) = tokio::io::duplex(4096);
@@ -8660,30 +8557,30 @@ mod tests {
 
         let severed_guest = tokio::spawn(async move {
             let request: WireRequest = read_msg(&mut guest_end).await.expect("upload request");
-            assert!(matches!(request, WireRequest::Upload { .. }));
+            assert!(matches!(request, WireRequest::UploadStream { .. }));
             epoch_tx.send_modify(|epoch| *epoch += 1);
             guest_end
         });
 
-        let file = WriteFileSpec {
+        let spec = SessionFileSpec {
             path: "/workspace/hello.txt".into(),
-            content: b"hi".to_vec(),
+            size_bytes: 0,
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
             mode: None,
         };
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            upload_file_over_stream(EpochSeveredStream::new(host_end, epoch_rx), file),
+            engram_agentd::file_transfer::write_file(
+                EpochSeveredStream::new(host_end, epoch_rx),
+                spec,
+                Box::pin(futures_util::stream::empty()),
+            ),
         )
         .await
         .expect("upload must resolve promptly after the epoch bump, not hang");
-        assert!(!result.ok, "severed upload must report failure");
         assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("read Upload response")),
-            "failure must name the failed response read, got {:?}",
-            result.error
+            matches!(&result, Err(SandboxError::Vm(message)) if message.to_string().contains("read UploadStream response")),
+            "failure must name the failed response read, got {result:?}",
         );
         drop(severed_guest.await.unwrap());
     }
@@ -8699,27 +8596,31 @@ mod tests {
             epoch_tx.send_modify(|epoch| *epoch += 1);
             guest_end
         });
-        let file = WriteFileSpec {
+        let bytes = Bytes::from(vec![0xA5; 2 * 1024 * 1024]);
+        let spec = SessionFileSpec {
             path: "/workspace/large.bin".into(),
-            content: vec![0xA5; 2 * 1024 * 1024],
+            size_bytes: bytes.len() as u64,
+            sha256: <sha2::Sha256 as sha2::Digest>::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
             mode: None,
         };
 
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            upload_file_over_stream(EpochSeveredStream::new(host_end, epoch_rx), file),
+            engram_agentd::file_transfer::write_file(
+                EpochSeveredStream::new(host_end, epoch_rx),
+                spec,
+                Box::pin(futures_util::stream::iter([Ok(bytes)])),
+            ),
         )
         .await
         .expect("upload request write must resolve promptly after the epoch bump, not hang");
 
-        assert!(!result.ok, "severed upload write must report failure");
         assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("severed") && error.contains("Upload")),
-            "failure must name the severed Upload request, got {:?}",
-            result.error
+            matches!(&result, Err(SandboxError::Vm(message)) if message.to_string().contains("send UploadStream chunk")),
+            "failure must name the severed UploadStream write, got {result:?}",
         );
         drop(severed_guest.await.unwrap());
     }

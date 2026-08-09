@@ -45,7 +45,7 @@ use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec, SessionFileMetadata,
-    SessionFileSpec, SessionFileStream, WriteFileResult, WriteFileSpec, MAX_SESSION_FILE_BYTES,
+    SessionFileSpec, SessionFileStream, MAX_SESSION_FILE_BYTES,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
@@ -533,59 +533,7 @@ impl SandboxBackend for ProcessBackend {
         kill_exec_process_group(record.pgid, &exec_id)
     }
 
-    async fn write_files(
-        &self,
-        id: SandboxId,
-        files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        let state = self
-            .sandboxes
-            .get(&id)
-            .ok_or(SandboxError::NotFound)?
-            .clone();
-        let mut results = Vec::with_capacity(files.len());
-        for file in files {
-            // Match exec's workdir resolution: relative paths are rooted in
-            // the per-sandbox cwd; absolute paths remain absolute.
-            let resolved = state.cwd.join(&file.path);
-            let outcome: std::io::Result<()> = async {
-                if let Some(parent) = resolved.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                }
-                tokio::fs::write(&resolved, &file.content).await?;
-                if let Some(mode) = file.mode {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        tokio::fs::set_permissions(
-                            &resolved,
-                            std::fs::Permissions::from_mode(mode),
-                        )
-                        .await?;
-                    }
-                }
-                Ok(())
-            }
-            .await;
-            results.push(match outcome {
-                Ok(()) => WriteFileResult {
-                    path: file.path,
-                    ok: true,
-                    error: None,
-                },
-                Err(error) => WriteFileResult {
-                    path: file.path,
-                    ok: false,
-                    error: Some(error.to_string()),
-                },
-            });
-        }
-        Ok(results)
-    }
-
-    async fn upload_file(
+    async fn write_file(
         &self,
         id: SandboxId,
         spec: SessionFileSpec,
@@ -671,7 +619,7 @@ impl SandboxBackend for ProcessBackend {
             #[cfg(unix)]
             tokio::fs::set_permissions(&temporary, {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::Permissions::from_mode(0o600)
+                std::fs::Permissions::from_mode(spec.mode.unwrap_or(0o600))
             })
             .await
             .map_err(|error| SandboxError::Vm(format!("set upload permissions: {error}").into()))?;
@@ -1730,6 +1678,7 @@ mod tests {
             path: path_string.clone(),
             size_bytes: bytes.len() as u64,
             sha256: digest.clone(),
+            mode: Some(0o640),
         };
         let chunks = || {
             Box::pin(stream::iter([Ok(bytes.slice(..8)), Ok(bytes.slice(8..))]))
@@ -1737,11 +1686,11 @@ mod tests {
         };
 
         let first = backend
-            .upload_file(sandbox_id, spec.clone(), chunks())
+            .write_file(sandbox_id, spec.clone(), chunks())
             .await
             .unwrap();
         let retry = backend
-            .upload_file(sandbox_id, spec.clone(), chunks())
+            .write_file(sandbox_id, spec.clone(), chunks())
             .await
             .unwrap();
         assert_eq!(first, retry);
@@ -1755,14 +1704,28 @@ mod tests {
         }
         assert_eq!(metadata.sha256, digest);
         assert_eq!(round_trip, bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                tokio::fs::metadata(&path)
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
 
         let conflict = backend
-            .upload_file(
+            .write_file(
                 sandbox_id,
                 SessionFileSpec {
                     path: path_string,
                     size_bytes: 5,
                     sha256: digest_hex(Sha256::digest(b"other")),
+                    mode: None,
                 },
                 Box::pin(stream::iter([Ok(Bytes::from_static(b"other"))])),
             )

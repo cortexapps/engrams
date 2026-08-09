@@ -100,7 +100,7 @@ shaped this ADR:
    can push fixes and reply on finding threads. Agent-to-agent conversation
    happens *through the PR itself*, mediated and metered by the workflow.
 8. **Setup is deterministic, not agentic.** The workflow prepares each review
-   session itself — `Exec` runs the git clone, `WriteFiles` stages the
+   session itself — `Exec` runs the git clone, `WriteFile` stages the
    instruction files — before the first prompt is sent. The agent wakes up to
    a ready workspace and spends zero tokens on mechanical setup; and because
    the clone already happened, the review session needs no network access at
@@ -310,7 +310,7 @@ GitHub App ──webhooks──▶ POST /api/v1/integrations/github/events   (ve
         │ autofix: fix prompts to the authoring task
         │
         │ CreateTask / Exec (clone) /                  tool calls (ADR 0089)
-        │ WriteFiles / SendPrompt                            │
+        │ WriteFile / SendPrompt                       │
         ▼                                                   │
   ephemeral review sessions (reviewer profile:              │ submit_finding
   pre-cloned, no write creds, no egress)  ──────────────────┘ submit_verdict, …
@@ -404,24 +404,22 @@ schema, writes the row, and returns — replay-safe on
   The orchestrator posts the reply; free text from a session never reaches
   GitHub.
 
-### WriteFiles (new primitive, small)
+### WriteFile (streaming primitive; superseded by ADR 0113)
 
-`SessionService.Exec` exists today but has no stdin field, so pushing content
-into a guest means embedding it in a shell command string — quoting hazards
-and size limits. The as-built API adds one RPC, plumbed through the same
-coordinator → host → sandbox path as Exec:
+`SessionService.Exec` existed without a stdin field, so pushing content into a
+guest meant embedding it in a shell command string. ADR 0113 replaced the
+initial unary batch design with the canonical streaming writer:
 
-- `SessionService.WriteFiles {session_id, files: [{path, content, mode?}]}` —
-  a batch in one round trip; a batch of one is the single-file case. The
-  response reports per-file success so a partial failure is visible and
-  retryable.
+- `SessionService.WriteFile(stream)` writes one normalized absolute guest path,
+  verifies its declared size and SHA-256, and publishes it atomically. The
+  review workflow's local `stageFiles` helper invokes it sequentially and
+  preserves per-file failure reporting.
 
-The host-side backend opens one guest connection per file and reuses agentd's
-existing `Upload {path, bytes, mode}` verb. No new append-only agentd wire
-variant is added, so already-baked guest images support `WriteFiles` and no
-image rebake is required.
+The host-side backend opens one guest connection per file and uses agentd's
+bounded-memory `UploadStream` transport. This requires refreshed guest images
+as specified by ADR 0113.
 
-The review workflow uses them, as a durable step, to stage a session before
+The review workflow uses this operation, as a durable step, to stage a session before
 its first prompt:
 
 - the reviewer instruction files (`/workspace/.review/…`, next section) —
@@ -459,7 +457,7 @@ Each lens file has the five-part shape (mission / focus list / do-not-report /
 reasoning policy / writing policy). The renderer is deliberately thin: it
 loads the role file and the enabled lens files, fills the merge slots (org
 instructions, enabled categories, the tool contract), and hands the result to
-`WriteFiles` as `/workspace/.review/…`. Snapshot tests cover the rendered
+`WriteFile` as `/workspace/.review/…`. Snapshot tests cover the rendered
 output; wording changes show up as reviewable markdown diffs, because this
 text is where the product's precision/recall actually lives (the kodus
 discipline — their category lenses read like distilled postmortems, and every
@@ -619,7 +617,7 @@ written into the guest as `candidates.json`).
      read-only credential. A deterministic step that retries cleanly; a
      failed clone is an infra error on the review row, never an agent
      giving up.
-   - `WriteFiles`: the rendered reviewer instructions into
+   - `WriteFile`: the rendered reviewer instructions into
      `/workspace/.review/`.
    Because the clone is already done, the finder session needs no network
    access at all.
@@ -639,7 +637,7 @@ written into the guest as `candidates.json`).
    reasoning, which is the point: genuine skepticism needs an independent
    look.
 6. The verifier gets the same deterministic setup (`Exec` clone,
-   `WriteFiles` with `verifier.md` and `candidates.json`) and a
+   `WriteFile` with `verifier.md` and `candidates.json`) and a
    refute-to-drop prompt: for each candidate, actively try to prove it
    wrong; confirm only what survives; check the evidence (did the finder
    actually read the file it cites — an unread citation means re-verify from
@@ -971,9 +969,9 @@ answers the surface's central question with one muted sentence.
 ## Phasing
 
 - **P0 — the review pass**: GitHub App + webhook route + enrollment,
-  `WriteFiles`, the seeded reviewer profile (designation marker),
+  `WriteFile`, the seeded reviewer profile (designation marker),
   the `reviewers/` folder + renderer, the deterministic setup steps (Exec
-  clone + WriteFiles), finder/verifier phases with `submit_finding` /
+  clone + WriteFile), finder/verifier phases with `submit_finding` /
   `submit_verdict` / `finder_done`, the v1 policy gate, batched posting,
   tables, minimal `/reviews` list. Manual trigger (`@engrams review` +
   dispatch API) first; auto-on-open once the loop is proven.

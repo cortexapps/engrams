@@ -18,7 +18,7 @@ use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
-    SessionFileMetadata, SessionFileSpec, SessionFileStream, WriteFileResult, WriteFileSpec,
+    SessionFileMetadata, SessionFileSpec, SessionFileStream,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
@@ -36,16 +36,16 @@ use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
     BindHarnessSessionRequest, CancelExecRequest, CreateSandboxRequest,
     DequeueHarnessQueuedPromptRequest, EditHarnessQueuedPromptRequest, Empty, ExecStartRequest,
-    FencedSandboxRequest, GuestIpResponse, HostReadFileRequest, HostUploadFileMetadata,
-    HostUploadFileRequest, InterruptHarnessRequest, MaterializeImageRequest, MigrationExportRef,
+    FencedSandboxRequest, GuestIpResponse, HostReadFileRequest, HostWriteFileMetadata,
+    HostWriteFileRequest, InterruptHarnessRequest, MaterializeImageRequest, MigrationExportRef,
     MigrationFetchRequest, MigrationItem, PeerChunkFrame, PeerChunkGetRequest, ProxyPortData,
     ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
     ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText, RestoreBaseForSessionRequest,
     RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, SendHarnessToolResultRequest,
-    StartAgentRequest, UnbindHarnessSessionRequest, WriteFilesRequest,
+    StartAgentRequest, UnbindHarnessSessionRequest,
 };
 
-use crate::wire::{WireExecRequest, WireWriteFilesRequest, WireWriteFilesResponse};
+use crate::wire::WireExecRequest;
 
 /// ADR 0095: why a peer-chunk pull wants its hashes — the wire `scope`
 /// oneof on [`PeerChunkGetRequest`]. Observability + serve-side rate
@@ -1183,44 +1183,21 @@ impl GrpcHostClient {
         Ok(())
     }
 
-    /// Unary batched file write. The opaque bincode payload keeps the
-    /// coord↔host schema pinned independently of the in-process types.
-    pub async fn write_files(
-        &self,
-        sandbox_id: SandboxId,
-        files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        let wire = WireWriteFilesRequest::from_engine(files);
-        let req = WriteFilesRequest {
-            sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
-            request_bincode: encode_bincode(&wire, "WireWriteFilesRequest")?,
-        };
-        let resp = self
-            .inner
-            .clone()
-            .write_files(req)
-            .await
-            .map_err(grpc_to_sandbox_err)?
-            .into_inner();
-        let wire: WireWriteFilesResponse =
-            decode_bincode(&resp.response_bincode, "WireWriteFilesResponse")?;
-        Ok(wire.into_engine())
-    }
-
-    pub async fn upload_file(
+    pub async fn write_file(
         &self,
         sandbox_id: SandboxId,
         spec: SessionFileSpec,
         mut bytes: SessionFileStream,
     ) -> Result<SessionFileMetadata, SandboxError> {
         use futures::StreamExt;
-        let metadata = HostUploadFileRequest {
-            frame: Some(crate::grpc::host_upload_file_request::Frame::Metadata(
-                HostUploadFileMetadata {
+        let metadata = HostWriteFileRequest {
+            frame: Some(crate::grpc::host_write_file_request::Frame::Metadata(
+                HostWriteFileMetadata {
                     sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
                     path: spec.path,
                     size_bytes: spec.size_bytes,
                     sha256: spec.sha256,
+                    mode: spec.mode,
                 },
             )),
         };
@@ -1233,8 +1210,8 @@ impl GrpcHostClient {
                 match item {
                     Ok(chunk) => {
                         if tx
-                            .send(HostUploadFileRequest {
-                                frame: Some(crate::grpc::host_upload_file_request::Frame::Chunk(
+                            .send(HostWriteFileRequest {
+                                frame: Some(crate::grpc::host_write_file_request::Frame::Chunk(
                                     chunk.to_vec(),
                                 )),
                             })
@@ -1245,7 +1222,7 @@ impl GrpcHostClient {
                         }
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "upload source stream failed");
+                        tracing::warn!(%error, "file source stream failed");
                         return;
                     }
                 }
@@ -1254,7 +1231,7 @@ impl GrpcHostClient {
         let response = self
             .inner
             .clone()
-            .upload_file(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .write_file(tokio_stream::wrappers::ReceiverStream::new(rx))
             .await
             .map_err(grpc_to_sandbox_err)?
             .into_inner();
@@ -1597,21 +1574,13 @@ impl HostClient for GrpcHostClient {
         Self::cancel_exec(self, id, exec_id).await
     }
 
-    async fn write_files(
-        &self,
-        id: SandboxId,
-        files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        Self::write_files(self, id, files).await
-    }
-
-    async fn upload_file(
+    async fn write_file(
         &self,
         id: SandboxId,
         spec: SessionFileSpec,
         bytes: SessionFileStream,
     ) -> Result<SessionFileMetadata, SandboxError> {
-        Self::upload_file(self, id, spec, bytes).await
+        Self::write_file(self, id, spec, bytes).await
     }
 
     async fn read_file(

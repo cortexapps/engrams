@@ -26,7 +26,7 @@ use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{
     AgentSpec, AuxBundleRef, ExecRequest, ExecStream, SandboxSpec, SessionFileMetadata,
-    SessionFileSpec, SessionFileStream, WriteFileResult, WriteFileSpec,
+    SessionFileSpec, SessionFileStream,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
@@ -7532,21 +7532,13 @@ impl SandboxBackend for PooledBackend {
         self.inner.cancel_exec(id, exec_id).await
     }
 
-    async fn write_files(
-        &self,
-        id: SandboxId,
-        files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        self.inner.write_files(id, files).await
-    }
-
-    async fn upload_file(
+    async fn write_file(
         &self,
         id: SandboxId,
         spec: SessionFileSpec,
         bytes: SessionFileStream,
     ) -> Result<SessionFileMetadata, SandboxError> {
-        self.inner.upload_file(id, spec, bytes).await
+        self.inner.write_file(id, spec, bytes).await
     }
 
     async fn read_file(

@@ -76,14 +76,6 @@ export const listSessionEvents = SessionService.method.listSessionEvents;
 export const cancelExec = SessionService.method.cancelExec;
 
 /**
- * ADR 0100: stage a batch of files inside a running session without
- * embedding content in a shell command. Each file reports its own result.
- *
- * @generated from rpc engram.app.v1.SessionService.WriteFiles
- */
-export const writeFiles = SessionService.method.writeFiles;
-
-/**
  * @generated from rpc engram.app.v1.SessionService.CopyFiles
  */
 export const copyFiles = SessionService.method.copyFiles;

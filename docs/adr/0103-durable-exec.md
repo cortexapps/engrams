@@ -378,7 +378,7 @@ deadline left).
   just the steady-state exec reader loop. The audit that follows from that
   rule found three more unguarded one-shot response reads — the durable
   capability probe (which runs on every exec, before the guarded loop
-  exists), `CancelExec`, and `write_files`' Upload — each a re-introduction
+  exists), `CancelExec`, and the former unary file write — each a re-introduction
   of the infinite wedge on its own hop. All three now race the epoch watch
   via a shared helper and fail as retryable `Unavailable` (all three
   round-trips are idempotent). The same rule applies to WRITES: a large

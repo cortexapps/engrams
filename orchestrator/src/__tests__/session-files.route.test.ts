@@ -24,14 +24,14 @@ describe("session file routes", () => {
   test("streams upload metadata first and then exact chunks", async () => {
     const frames: Array<{ frame: { case: string; value: unknown } }> = [];
     const client: SessionFileClient = {
-      async uploadFile(input) {
+      async writeFile(input) {
         for await (const frame of input) frames.push(frame);
         return { path, sizeBytes: BigInt(bytes.length), sha256: digest };
       },
       async *readFile() {},
     };
     const response = await app(client).request(
-      `/api/v1/sessions/${sessionId}/uploads?upload_id=${uploadId}&file_name=notes.txt`,
+      `/api/v1/sessions/${sessionId}/files?path=${encodeURIComponent(path)}`,
       {
         method: "POST",
         body: bytes,
@@ -52,8 +52,7 @@ describe("session file routes", () => {
         case: "metadata",
         value: {
           sessionId,
-          uploadId,
-          fileName: "notes.txt",
+          path,
           sizeBytes: BigInt(bytes.length),
           sha256: digest,
         },
@@ -69,19 +68,19 @@ describe("session file routes", () => {
   test("rejects unauthenticated and oversized uploads before the RPC", async () => {
     let called = false;
     const client: SessionFileClient = {
-      async uploadFile() {
+      async writeFile() {
         called = true;
         throw new Error("not reached");
       },
       async *readFile() {},
     };
     const unauthenticated = await app(client, false).request(
-      `/api/v1/sessions/${sessionId}/uploads`,
+      `/api/v1/sessions/${sessionId}/files`,
       { method: "POST" },
     );
     expect(unauthenticated.status).toBe(401);
     const oversized = await app(client).request(
-      `/api/v1/sessions/${sessionId}/uploads?upload_id=${uploadId}&file_name=large.bin`,
+      `/api/v1/sessions/${sessionId}/files?path=${encodeURIComponent(path)}`,
       {
         method: "POST",
         headers: { "x-upload-size": String(512 * 1024 * 1024 + 1) },
@@ -93,7 +92,7 @@ describe("session file routes", () => {
 
   test("streams authenticated downloads with verified metadata headers", async () => {
     const client: SessionFileClient = {
-      async uploadFile() {
+      async writeFile() {
         throw new Error("not reached");
       },
       async *readFile(input) {

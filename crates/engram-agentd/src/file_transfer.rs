@@ -24,7 +24,7 @@ fn digest_hex(digest: impl AsRef<[u8]>) -> String {
         .collect()
 }
 
-pub async fn upload_file<S>(
+pub async fn write_file<S>(
     mut connection: S,
     spec: SessionFileSpec,
     mut source: SessionFileStream,
@@ -38,6 +38,7 @@ where
             path: spec.path.clone(),
             size_bytes: spec.size_bytes,
             sha256: spec.sha256.clone(),
+            mode: spec.mode,
         },
     )
     .await
@@ -212,12 +213,13 @@ mod tests {
             .chunks(64 * 1024)
             .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
             .collect::<Vec<_>>();
-        let result = upload_file(
+        let result = write_file(
             client,
             SessionFileSpec {
                 path: "/tmp/uploads/019fe2ff-0464-75f3-bb20-a8c1844579b9/large.bin".into(),
                 size_bytes: bytes.len() as u64,
                 sha256: sha256.clone(),
+                mode: None,
             },
             Box::pin(stream::iter(chunks)),
         )
@@ -231,12 +233,13 @@ mod tests {
     #[tokio::test]
     async fn upload_rejects_a_truncated_source_before_acceptance() {
         let (client, _server) = tokio::io::duplex(64 * 1024);
-        let error = upload_file(
+        let error = write_file(
             client,
             SessionFileSpec {
                 path: "/tmp/uploads/019fe2ff-0464-75f3-bb20-a8c1844579b9/short.bin".into(),
                 size_bytes: 4,
                 sha256: digest_hex(Sha256::digest(b"four")),
+                mode: None,
             },
             Box::pin(stream::iter([Ok(Bytes::from_static(b"bad"))])),
         )

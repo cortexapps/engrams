@@ -390,63 +390,43 @@ impl app::session_service_server::SessionService for AppSessionService {
         Ok(Response::new(app::CancelExecResponse {}))
     }
 
-    async fn write_files(
+    async fn write_file(
         &self,
-        req: Request<app::WriteFilesRequest>,
-    ) -> Result<Response<app::WriteFilesResponse>, Status> {
-        self.auth.check(&req)?;
-        let r = req.into_inner();
-        let id = parse_session_id(&r.session_id)?;
-        let files = super::convert::write_files_request_from_proto(r);
-        let results = crate::api::write_files::write_files_core(&self.state, id, files)
-            .await
-            .map_err(into_status)?;
-        Ok(Response::new(
-            super::convert::write_files_response_to_proto(results),
-        ))
-    }
-
-    async fn upload_file(
-        &self,
-        req: Request<tonic::Streaming<app::UploadFileRequest>>,
-    ) -> Result<Response<app::UploadFileResponse>, Status> {
+        req: Request<tonic::Streaming<app::WriteFileRequest>>,
+    ) -> Result<Response<app::WriteFileResponse>, Status> {
         self.auth.check(&req)?;
         let mut inbound = req.into_inner();
         let first = inbound
             .next()
             .await
-            .ok_or_else(|| Status::invalid_argument("upload metadata frame is required"))??;
+            .ok_or_else(|| Status::invalid_argument("file metadata frame is required"))??;
         let metadata = match first.frame {
-            Some(app::upload_file_request::Frame::Metadata(metadata)) => metadata,
+            Some(app::write_file_request::Frame::Metadata(metadata)) => metadata,
             _ => {
                 return Err(Status::invalid_argument(
-                    "first upload frame must be metadata",
+                    "first file frame must be metadata",
                 ))
             }
         };
         let session_id = parse_session_id(&metadata.session_id)?;
-        let path = crate::api::session_files::canonical_upload_path(
-            &metadata.upload_id,
-            &metadata.file_name,
-        )
-        .map_err(into_status)?;
         let spec = SessionFileSpec {
-            path,
+            path: metadata.path,
             size_bytes: metadata.size_bytes,
             sha256: metadata.sha256,
+            mode: metadata.mode,
         };
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move {
             while let Some(frame) = inbound.next().await {
                 let item = match frame {
-                    Ok(app::UploadFileRequest {
-                        frame: Some(app::upload_file_request::Frame::Chunk(chunk)),
+                    Ok(app::WriteFileRequest {
+                        frame: Some(app::write_file_request::Frame::Chunk(chunk)),
                     }) => Ok(bytes::Bytes::from(chunk)),
                     Ok(_) => Err(engram_core::SandboxError::InvalidSpec(
-                        "upload metadata must appear exactly once".into(),
+                        "file metadata must appear exactly once".into(),
                     )),
                     Err(error) => Err(engram_core::SandboxError::Unavailable(format!(
-                        "upload stream transport failed: {error}"
+                        "file stream transport failed: {error}"
                     ))),
                 };
                 if tx.send(item).await.is_err() {
@@ -454,7 +434,7 @@ impl app::session_service_server::SessionService for AppSessionService {
                 }
             }
         });
-        let result = crate::api::session_files::upload_file_core(
+        let result = crate::api::session_files::write_file_core(
             &self.state,
             session_id,
             spec,
@@ -462,7 +442,7 @@ impl app::session_service_server::SessionService for AppSessionService {
         )
         .await
         .map_err(into_status)?;
-        Ok(Response::new(app::UploadFileResponse {
+        Ok(Response::new(app::WriteFileResponse {
             path: result.path,
             size_bytes: result.size_bytes,
             sha256: result.sha256,

@@ -27,7 +27,7 @@ use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
     AgentSpec, ExecRequest, ExecStream, SandboxSpec, SessionFileMetadata, SessionFileSpec,
-    SessionFileStream, WriteFileResult, WriteFileSpec,
+    SessionFileStream,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::types::{SandboxId, SessionId};
@@ -111,21 +111,13 @@ impl HostClient for LocalHostClient {
         self.sandbox.cancel_exec(id, exec_id).await
     }
 
-    async fn write_files(
-        &self,
-        id: SandboxId,
-        files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        self.sandbox.write_files(id, files).await
-    }
-
-    async fn upload_file(
+    async fn write_file(
         &self,
         id: SandboxId,
         spec: SessionFileSpec,
         bytes: SessionFileStream,
     ) -> Result<SessionFileMetadata, SandboxError> {
-        self.sandbox.upload_file(id, spec, bytes).await
+        self.sandbox.write_file(id, spec, bytes).await
     }
 
     async fn read_file(

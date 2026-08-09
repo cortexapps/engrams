@@ -38,12 +38,9 @@ service SessionService {
   // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
   rpc Exec(ExecRequest) returns (stream ExecOutput);
   rpc CancelExec(CancelExecRequest) returns (CancelExecResponse);
-  // ADR 0100: stage a batch of files inside a running session without
-  // embedding content in a shell command. Each file reports its own result.
-  rpc WriteFiles(WriteFilesRequest) returns (WriteFilesResponse);
   // ADR 0113: bounded-memory session file transfer. The orchestrator serves
-  // these through dedicated authenticated HTTP routes.
-  rpc UploadFile(stream UploadFileRequest) returns (UploadFileResponse);
+  // browser writes through a dedicated authenticated HTTP route.
+  rpc WriteFile(stream WriteFileRequest) returns (WriteFileResponse);
   rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
   rpc CopyFiles(CopyFilesRequest) returns (CopyFilesResponse);
   rpc GetLog(GetLogRequest) returns (GetLogResponse);
@@ -387,46 +384,25 @@ message CancelExecRequest {
 
 message CancelExecResponse {}
 
-message WriteFileSpec {
-  string path = 1;
-  bytes content = 2;
-  // Unix permission bits (for example, 0755). Unset preserves the default
-  // permissions chosen when the guest creates the file.
-  optional uint32 mode = 3;
-}
-
-message WriteFilesRequest {
+message WriteFileMetadata {
   string session_id = 1;
-  repeated WriteFileSpec files = 2;
-}
-
-message WriteFileResult {
-  string path = 1;
-  bool ok = 2;
-  optional string error = 3;
-}
-
-message WriteFilesResponse {
-  repeated WriteFileResult results = 1;
-}
-
-message UploadFileMetadata {
-  string session_id = 1;
-  string upload_id = 2;
-  string file_name = 3;
-  uint64 size_bytes = 4;
+  // Normalized absolute destination path in the guest.
+  string path = 2;
+  uint64 size_bytes = 3;
   // Lower-case hexadecimal SHA-256 digest.
-  string sha256 = 5;
+  string sha256 = 4;
+  // Unix permission bits (for example, 0644). Unset creates a 0600 file.
+  optional uint32 mode = 5;
 }
 
-message UploadFileRequest {
+message WriteFileRequest {
   oneof frame {
-    UploadFileMetadata metadata = 1;
+    WriteFileMetadata metadata = 1;
     bytes chunk = 2;
   }
 }
 
-message UploadFileResponse {
+message WriteFileResponse {
   string path = 1;
   uint64 size_bytes = 2;
   string sha256 = 3;
