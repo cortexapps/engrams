@@ -302,18 +302,16 @@ fn token_from_kernel_cmdline() -> Option<String> {
 #[cfg(target_os = "linux")]
 fn unblock_console_stdout() {
     use std::io::IsTerminal;
-    use std::os::fd::AsRawFd;
 
     let stdout = std::io::stdout();
     if !stdout.is_terminal() {
         return;
     }
-    let fd = stdout.as_raw_fd();
-    let Ok(flags) = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL) else {
+    let Ok(flags) = nix::fcntl::fcntl(&stdout, nix::fcntl::FcntlArg::F_GETFL) else {
         return;
     };
     let flags = nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK;
-    let _ = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(flags));
+    let _ = nix::fcntl::fcntl(&stdout, nix::fcntl::FcntlArg::F_SETFL(flags));
 }
 
 #[cfg(not(target_os = "linux"))]
