@@ -10,7 +10,7 @@
 # Keep this major in step with the web CI lane (.github/workflows/ci.yml)
 # and flake.nix — see the note beside `setup-node` in that workflow.
 FROM node:24-alpine AS builder
-WORKDIR /src
+WORKDIR /src/web
 
 # pnpm v9, matching the CI web lane (pnpm/action-setup version 9 in
 # .github/workflows/ci.yml) so local + CI builds agree.
@@ -21,7 +21,8 @@ WORKDIR /src
 RUN npm install -g pnpm@9
 
 # Lockfile first so the install layer stays warm across source edits.
-COPY web/package.json web/pnpm-lock.yaml ./
+COPY web/package.json web/pnpm-lock.yaml /src/web/
+COPY orchestrator/packages/spec-document /src/orchestrator/packages/spec-document
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
 
@@ -36,7 +37,7 @@ FROM nginx:1.31-alpine
 # Keeping it would leave a stale 80/SPA-only fallback inside the
 # image if the mount ever misfires.
 RUN rm -f /etc/nginx/conf.d/default.conf
-COPY --from=builder /src/dist /usr/share/nginx/html
+COPY --from=builder /src/web/dist /usr/share/nginx/html
 # nginx:alpine's `nginx` user is UID 101; the chart runs the pod as
 # that user and listens on a high port (8080) to avoid needing
 # CAP_NET_BIND_SERVICE.
