@@ -44,6 +44,7 @@ class MemoryDocumentStore implements SpecDocumentStore {
   readonly updates = new Map<string, SpecUpdateRecord[]>();
   readonly snapshots = new Map<string, SpecSnapshotRecord>();
   readonly wakes = new Set<(specId: string) => void>();
+  readonly tailReads: string[] = [];
   dropNotifications = false;
   compactions = 0;
 
@@ -52,6 +53,7 @@ class MemoryDocumentStore implements SpecDocumentStore {
   }
 
   async readUpdatesAfter(specId: string, afterSeq: bigint): Promise<SpecUpdateRecord[]> {
+    this.tailReads.push(specId);
     return (this.updates.get(specId) ?? []).filter((row) => row.seq > afterSeq);
   }
 
@@ -309,6 +311,25 @@ describe("SpecDocumentService", () => {
 
     const reloaded = await new SpecDocumentService(store).loadDoc(SPEC_ID);
     expect(renderMarkdown(proseMirrorDocument(reloaded.doc))).toContain("durable");
+  });
+
+  test("peer notifications sync only documents in the local working set", async () => {
+    const ignoredSpecId = "00000000-0000-4000-8000-000000000109";
+    const store = new MemoryDocumentStore();
+    const service = new SpecDocumentService(store);
+    await service.applyUpdate(SPEC_ID, initialUpdate(), "cached");
+    await service.applyUpdate(ignoredSpecId, initialUpdate(), "ignored");
+    service.evict(ignoredSpecId);
+    await service.startPeerSync();
+    store.tailReads.length = 0;
+
+    await store.notifyUpdate(ignoredSpecId);
+    await Bun.sleep(0);
+    expect(store.tailReads).not.toContain(ignoredSpecId);
+
+    await store.notifyUpdate(SPEC_ID);
+    await waitFor(() => store.tailReads.includes(SPEC_ID));
+    await service.stopPeerSync();
   });
 
   test("an update over 2 MB is rejected before persistence", async () => {

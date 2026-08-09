@@ -146,6 +146,7 @@ export class SpecDocumentService {
   async startPeerSync(): Promise<void> {
     if (this.stopListening) return;
     this.stopListening = await this.store.listen((specId) => {
+      if (!this.cache.has(specId)) return;
       void this.syncFromLog(specId).catch((error: unknown) => {
         this.warn(`Spec update sync failed for ${specId}: ${errorMessage(error)}`);
       });
