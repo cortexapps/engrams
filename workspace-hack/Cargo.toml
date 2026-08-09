@@ -172,7 +172,7 @@ bitflags = { version = "2", default-features = false, features = ["std"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 libc = { version = "0.2", default-features = false, features = ["use_std"] }
-nix = { version = "0.31", features = ["ioctl", "socket"] }
+nix = { version = "0.31", features = ["ioctl", "mount", "socket"] }
 nom = { version = "7" }
 num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
@@ -195,7 +195,7 @@ bitflags = { version = "2", default-features = false, features = ["std"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 libc = { version = "0.2", default-features = false, features = ["use_std"] }
-nix = { version = "0.31", features = ["ioctl", "socket"] }
+nix = { version = "0.31", features = ["ioctl", "mount", "socket"] }
 nom = { version = "7" }
 num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
