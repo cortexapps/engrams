@@ -1,8 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
   createTemplateDocument,
+  findSection,
   parseMarkdown,
+  replaceSection,
   renderMarkdown,
+  RequirementIntegrityError,
   schema,
   type SpecTemplate,
 } from "@engrams/spec-document";
@@ -16,18 +19,22 @@ import {
   PostgresSpecDocumentStore,
   proseMirrorDocument,
   SpecDocumentService,
+  SpecDocumentRevisionConflictError,
   SpecDocumentTooLargeError,
   SPEC_UPDATE_SIZE_FACTOR,
   type CompactSnapshotInput,
   type SpecDocumentStore,
   type SpecSnapshotRecord,
   type SpecUpdateRecord,
+  type SpecUpdateEffects,
 } from "../doc-service.ts";
 import {
   SpecCheckpointService,
   type SpecCheckpointRecord,
   type SpecCheckpointStore,
 } from "../checkpoints.ts";
+import { PostgresSectionStateStore } from "../section-state-service.ts";
+import { transitionSectionState } from "../section-state.ts";
 
 const TEMPLATE: SpecTemplate = {
   sections: [
@@ -47,6 +54,7 @@ class MemoryDocumentStore implements SpecDocumentStore {
   readonly tailReads: string[] = [];
   dropNotifications = false;
   compactions = 0;
+  lastEffects: SpecUpdateEffects | null = null;
 
   async readSnapshot(specId: string): Promise<SpecSnapshotRecord | null> {
     return this.snapshots.get(specId) ?? null;
@@ -62,8 +70,10 @@ class MemoryDocumentStore implements SpecDocumentStore {
     expectedSeq: bigint,
     update: Uint8Array,
     clientId: string | null,
+    effects: SpecUpdateEffects,
   ): Promise<bigint | null> {
     if ((this.currentSeq.get(specId) ?? 0n) !== expectedSeq) return null;
+    this.lastEffects = effects;
     const seq = (this.currentSeq.get(specId) ?? 0n) + 1n;
     this.currentSeq.set(specId, seq);
     const rows = this.updates.get(specId) ?? [];
@@ -382,6 +392,72 @@ describe("SpecDocumentService", () => {
     );
   });
 
+  test("central validation reports only the sections changed by a client update", async () => {
+    const store = new MemoryDocumentStore();
+    const service = await seededService(store);
+
+    await service.applyUpdate(
+      SPEC_ID,
+      clientInsert(Y.encodeStateAsUpdate((await service.loadDoc(SPEC_ID)).doc), 0, "changed"),
+      "human-client",
+    );
+
+    expect(store.lastEffects?.sections.filter((section) => section.changed)).toEqual([
+      { id: "context", title: "Context", changed: true },
+    ]);
+  });
+
+  test("central validation rejects a requirement ID removed by a semantic mutation", async () => {
+    const store = new MemoryDocumentStore();
+    const initial = createTemplateDocument(TEMPLATE);
+    const requirements = findSection(initial, "requirements");
+    if (!requirements) throw new Error("The test Requirements section is missing.");
+    const withRequirement = replaceSection(
+      initial,
+      "requirements",
+      schema.nodes.section!.create(requirements.node.attrs, [
+        requirements.node.firstChild!,
+        schema.nodes.paragraph!.create(null, schema.text("R1: Keep stable identifiers.")),
+      ]),
+    );
+    const service = await seededService(store, encodeProseMirrorDocument(withRequirement));
+
+    await expect(
+      service.mutateDocument(SPEC_ID, "tool-client", (doc) => {
+        const section = findSection(doc, "requirements");
+        if (!section) throw new Error("The test Requirements section is missing.");
+        return replaceSection(
+          doc,
+          "requirements",
+          schema.nodes.section!.create(section.node.attrs, [
+            section.node.firstChild!,
+            schema.nodes.paragraph!.create(null, schema.text("The identifier disappeared.")),
+          ]),
+        );
+      }),
+    ).rejects.toBeInstanceOf(RequirementIntegrityError);
+    expect(store.updates.get(SPEC_ID)).toHaveLength(1);
+  });
+
+  test("a semantic mutation rejects a stale expected document revision", async () => {
+    const store = new MemoryDocumentStore();
+    const service = await seededService(store);
+    let mutationCalls = 0;
+
+    await expect(
+      service.mutateDocument(
+        SPEC_ID,
+        "tool-client",
+        (doc) => {
+          mutationCalls += 1;
+          return doc;
+        },
+        0n,
+      ),
+    ).rejects.toBeInstanceOf(SpecDocumentRevisionConflictError);
+    expect(mutationCalls).toBe(0);
+  });
+
   test("restore saves a checkpoint and applies a forward section edit", async () => {
     const documentStore = new MemoryDocumentStore();
     const checkpointStore = new MemoryCheckpointStore();
@@ -425,6 +501,8 @@ if (livePool) {
 describe("SpecDocumentService with live Postgres", () => {
   const templateId = randomUUID();
   const specId = randomUUID();
+  const userId = `spec-doc-test-${randomUUID()}`;
+  const humanClientId = `human-client-${randomUUID()}`;
 
   beforeAll(async () => {
     if (!liveDbReachable || !livePool) return;
@@ -439,6 +517,11 @@ describe("SpecDocumentService with live Postgres", () => {
        VALUES ($1, 'test-org', $2, 'Test spec', 'draft')`,
       [specId, templateId],
     );
+    await livePool.query(
+      `INSERT INTO "user" (id, name, email, email_verified, created_at, updated_at)
+       VALUES ($1, 'Spec document test', $2, false, $3, $3)`,
+      [userId, `${userId}@example.invalid`, new Date("2026-08-09T12:00:00.000Z")],
+    );
   }, 15_000);
 
   afterAll(async () => {
@@ -446,10 +529,108 @@ describe("SpecDocumentService with live Postgres", () => {
     if (liveDbReachable) {
       await livePool.query("DELETE FROM spec WHERE id = $1", [specId]);
       await livePool.query("DELETE FROM spec_template WHERE id = $1", [templateId]);
+      await livePool.query(`DELETE FROM "user" WHERE id = $1`, [userId]);
     }
     await livePool.end();
     livePool = null;
   }, 15_000);
+
+  test.skipIf(!liveDbReachable)(
+    "a human edit commits its update, drafted state, and transcript action atomically",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      await livePool.query("DELETE FROM spec_transcript_action WHERE spec_id = $1", [specId]);
+      await livePool.query("DELETE FROM spec_section_state WHERE spec_id = $1", [specId]);
+      await livePool.query("DELETE FROM spec_participant WHERE spec_id = $1", [specId]);
+      await livePool.query("DELETE FROM spec_update_log WHERE spec_id = $1", [specId]);
+      await livePool.query("DELETE FROM spec_snapshot WHERE spec_id = $1", [specId]);
+      await livePool.query("UPDATE spec SET current_doc_seq = 0 WHERE id = $1", [specId]);
+      await livePool.query(
+        `INSERT INTO spec_participant (spec_id, client_id, user_id, connected_at)
+         VALUES ($1, $2, $3, $4)`,
+        [specId, humanClientId, userId, new Date("2026-08-09T12:00:00.000Z")],
+      );
+
+      const withoutClock = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
+      await withoutClock.applyUpdate(specId, initialUpdate(), "seed");
+      const humanUpdate = clientInsert(
+        Y.encodeStateAsUpdate((await withoutClock.loadDoc(specId)).doc),
+        0,
+        "human edit",
+      );
+      await expect(withoutClock.applyUpdate(specId, humanUpdate, humanClientId)).rejects.toThrow(
+        "injected timestamp",
+      );
+      const afterRollback = await livePool.query<{
+        current_doc_seq: string;
+        updates: string;
+        states: string;
+        actions: string;
+      }>(
+        `SELECT s.current_doc_seq::text,
+                (SELECT count(*)::text FROM spec_update_log u WHERE u.spec_id = s.id) AS updates,
+                (SELECT count(*)::text FROM spec_section_state st WHERE st.spec_id = s.id) AS states,
+                (SELECT count(*)::text FROM spec_transcript_action a WHERE a.spec_id = s.id) AS actions
+           FROM spec s
+          WHERE s.id = $1`,
+        [specId],
+      );
+      expect(afterRollback.rows[0]).toEqual({
+        current_doc_seq: "1",
+        updates: "1",
+        states: "0",
+        actions: "0",
+      });
+
+      const at = new Date("2026-08-09T12:01:00.000Z");
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => at,
+      });
+      const stored = await documents.applyUpdate(specId, humanUpdate, humanClientId);
+      expect(stored.seq).toBe(2n);
+      const actionId = `human-edit:${specId}:2:context`;
+      const committed = await livePool.query<{
+        state: string;
+        action_id: string;
+        section_id: string;
+      }>(
+        `SELECT st.state, a.id AS action_id, a.chip->>'sectionId' AS section_id
+           FROM spec_section_state st
+           JOIN spec_transcript_action a
+             ON a.spec_id = st.spec_id AND a.section_id = st.section_id
+          WHERE st.spec_id = $1 AND st.section_id = 'context'`,
+        [specId],
+      );
+      expect(committed.rows[0]).toEqual({
+        state: "drafted",
+        action_id: actionId,
+        section_id: "context",
+      });
+
+      const stateStore = new PostgresSectionStateStore(livePool);
+      const current = await stateStore.read(specId, "context");
+      const confirmed = transitionSectionState(current, "confirmed", {
+        specId,
+        sectionId: "context",
+        sectionTitle: "Context",
+        allowsNa: true,
+      });
+      const later = await stateStore.persistStateAction({
+        actionId: `confirm-after-human:${specId}`,
+        specId,
+        sectionId: "context",
+        requestFingerprint: "confirm-after-human",
+        expectedDocSeq: 2n,
+        expected: current,
+        next: confirmed.value,
+        confirmedBy: userId,
+        chip: confirmed.transcriptChip,
+        at: new Date("2026-08-09T12:02:00.000Z"),
+      });
+      expect(later.status).toBe("stored");
+      expect((await stateStore.read(specId, "context")).state).toBe("confirmed");
+    },
+  );
 
   test.skipIf(!liveDbReachable)(
     "two instances converge after a dropped notification by filling the log gap",

@@ -365,6 +365,13 @@
       "when": 1786298980610,
       "tag": "0051_spec_document_foundation",
       "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "7",
+      "when": 1786302150768,
+      "tag": "0052_spec_transcript_action",
+      "breakpoints": true
     }
   ]
 }

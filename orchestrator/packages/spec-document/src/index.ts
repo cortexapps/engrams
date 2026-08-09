@@ -1,7 +1,43 @@
 export {
+  createSectionRelativeAnchor,
+  parseSectionRelativeAnchor,
+  resolveSectionRelativeAnchor,
+  serializeSectionRelativeAnchor,
+  type SectionRelativeAnchor,
+} from "./anchors.ts";
+export {
+  findQuestionMarker,
+  insertQuestionMarker,
+  QuestionResolutionConflictError,
+  removeQuestionMarker,
+  resolveQuestionMarker,
+  type LocatedQuestionMarker,
+  type ResolveQuestionMarkerResult,
+} from "./questions.ts";
+export {
+  type RestoreSectionStateUndo,
+  type SectionState,
+  type SectionStateTranscriptChip,
+  type SectionStateValue,
+} from "./actions.ts";
+export {
+  extractRequirementDefinitions,
+  extractRequirementReferences,
+  RequirementLedger,
+  RequirementIntegrityError,
+  validateRequirementEdit,
+  type RequirementDefinition,
+  type RequirementDocumentLike,
+  type RequirementId,
+  type RequirementKind,
+  type RequirementPrefix,
+  type RequirementReference,
+} from "./requirements.ts";
+export {
   SPEC_FRAGMENT_NAME,
   createTemplateDocument,
   findSection,
+  parseMarkdownBlocks,
   parseMarkdown,
   renderMarkdown,
   replaceSection,

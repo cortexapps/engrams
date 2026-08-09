@@ -129,6 +129,12 @@ sections. The template owns the section list; the canvas cannot change it (R9).
 Open questions and diagram blocks are nodes with their own stable ids, so they
 keep position under concurrent edits.
 
+Requirement and non-requirement identifiers are also stable. All accepted
+browser and tool mutations of the Requirements section run the shared
+`validateRequirementEdit` check before the server stores a Yjs update. The
+check rejects removed identifiers, revived tombstones and identifiers that do
+not use the next value for their prefix.
+
 ### D3. All spec state lives in the orchestrator's Postgres
 
 New tables, in the orchestrator schema:
@@ -141,6 +147,7 @@ New tables, in the orchestrator schema:
 | `spec_snapshot` | compacted document state plus the `seq` it covers |
 | `spec_checkpoint` | pinned history: state, state vector, rendered markdown, label, author |
 | `spec_section_state` | per-section state and the reason for `n/a` |
+| `spec_transcript_action` | durable, idempotent transcript chips for section state actions |
 | `spec_open_question` | id, section id, text, author, resolution |
 | `spec_participant` | Yjs client id to user identity, per connection epoch |
 | `spec_projection` | the push ledger: rev, doc seq, sha256, staging path, state |
@@ -232,6 +239,24 @@ Every mutating tool takes an optional `expected_rev` and returns
 `{applied, new_rev, concurrent_editors}`. That return value is the agent's
 feedback channel: it learns that its edit landed, and that other people are in
 the document. A file write could never tell it either thing.
+
+A section-state command also takes a stable action id. The row binds that id to
+a canonical command fingerprint, so reuse for a different command fails. Its
+state comparison and full transcript-chip payload commit in one transaction. A
+`runOnce` drainer publishes pending `spec_transcript_action` rows with that
+action id as the delivery key, then marks each row delivered. A failed publish
+leaves the row pending. A command retry reads its original action before it
+validates the new section state, so it returns the original result without a
+second state change. The transcript publisher must deduplicate by action id
+because a process can stop after publish and before the delivered mark.
+
+The central document validator identifies each changed section and enforces the
+Requirements ledger before persistence. While the document store holds the
+spec-row lock, it resolves a browser client through `spec_participant`. It then
+commits the Yjs update, each required drafted state and each pending transcript
+action in one transaction. Human-edit actions use the stable id
+`human-edit:<spec-id>:<document-revision>:<section-id>`. A later section-state
+command locks the same spec row, so it cannot pass an earlier document edit.
 
 `spec_read` is the agent's freshness escape hatch. Its file copy is a snapshot;
 this tool is live (N10).
