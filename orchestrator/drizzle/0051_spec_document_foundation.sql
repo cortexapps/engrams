@@ -6,6 +6,7 @@ CREATE TABLE "spec" (
 	"template_id" uuid NOT NULL,
 	"title" text NOT NULL,
 	"lifecycle" text NOT NULL,
+	"current_doc_seq" bigint DEFAULT 0 NOT NULL,
 	"published_checkpoint_id" uuid,
 	"published_by" text,
 	"published_at" timestamp with time zone,
@@ -78,11 +79,12 @@ CREATE TABLE "spec_template" (
 );
 --> statement-breakpoint
 CREATE TABLE "spec_update_log" (
-	"seq" bigserial PRIMARY KEY NOT NULL,
+	"seq" bigint NOT NULL,
 	"spec_id" uuid NOT NULL,
 	"update" "bytea" NOT NULL,
 	"client_id" text,
-	"created_at" timestamp with time zone DEFAULT now() NOT NULL
+	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "spec_update_log_spec_id_seq_pk" PRIMARY KEY("spec_id","seq")
 );
 --> statement-breakpoint
 ALTER TABLE "spec" ADD CONSTRAINT "spec_owner_user_id_user_id_fk" FOREIGN KEY ("owner_user_id") REFERENCES "public"."user"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
@@ -103,5 +105,4 @@ CREATE INDEX "spec_owner_idx" ON "spec" USING btree ("owner_user_id");--> statem
 CREATE INDEX "spec_session_idx" ON "spec" USING btree ("session_id");--> statement-breakpoint
 CREATE INDEX "spec_checkpoint_spec_created_idx" ON "spec_checkpoint" USING btree ("spec_id","created_at");--> statement-breakpoint
 CREATE INDEX "spec_open_question_spec_section_idx" ON "spec_open_question" USING btree ("spec_id","section_id");--> statement-breakpoint
-CREATE INDEX "spec_template_org_idx" ON "spec_template" USING btree ("org_id");--> statement-breakpoint
-CREATE INDEX "spec_update_log_spec_seq_idx" ON "spec_update_log" USING btree ("spec_id","seq");
+CREATE INDEX "spec_template_org_idx" ON "spec_template" USING btree ("org_id");

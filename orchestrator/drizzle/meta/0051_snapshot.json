@@ -1,5 +1,5 @@
 {
-  "id": "a8837f47-44be-47cc-b046-7b532f1aff09",
+  "id": "2eb7fa40-341d-4348-8252-45b9f520cb79",
   "prevId": "022b7ba0-d51a-47a1-9bb0-48eb2e90c14e",
   "version": "7",
   "dialect": "postgresql",
@@ -3270,6 +3270,13 @@
           "primaryKey": false,
           "notNull": true
         },
+        "current_doc_seq": {
+          "name": "current_doc_seq",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "0"
+        },
         "published_checkpoint_id": {
           "name": "published_checkpoint_id",
           "type": "uuid",
@@ -3957,8 +3964,8 @@
       "columns": {
         "seq": {
           "name": "seq",
-          "type": "bigserial",
-          "primaryKey": true,
+          "type": "bigint",
+          "primaryKey": false,
           "notNull": true
         },
         "spec_id": {
@@ -3987,29 +3994,7 @@
           "default": "now()"
         }
       },
-      "indexes": {
-        "spec_update_log_spec_seq_idx": {
-          "name": "spec_update_log_spec_seq_idx",
-          "columns": [
-            {
-              "expression": "spec_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "seq",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
+      "indexes": {},
       "foreignKeys": {
         "spec_update_log_spec_id_spec_id_fk": {
           "name": "spec_update_log_spec_id_spec_id_fk",
@@ -4025,7 +4010,15 @@
           "onUpdate": "no action"
         }
       },
-      "compositePrimaryKeys": {},
+      "compositePrimaryKeys": {
+        "spec_update_log_spec_id_seq_pk": {
+          "name": "spec_update_log_spec_id_seq_pk",
+          "columns": [
+            "spec_id",
+            "seq"
+          ]
+        }
+      },
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},

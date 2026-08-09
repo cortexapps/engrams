@@ -28,7 +28,6 @@ import {
   uniqueIndex,
   customType,
   bigint,
-  bigserial,
   uuid,
 } from "drizzle-orm/pg-core";
 
@@ -271,6 +270,9 @@ export const spec = pgTable(
       .references(() => specTemplate.id),
     title: text("title").notNull(),
     lifecycle: text("lifecycle").notNull(), // 'draft' | 'published'
+    currentDocSeq: bigint("current_doc_seq", { mode: "bigint" })
+      .notNull()
+      .default(sql`0`),
     publishedCheckpointId: uuid("published_checkpoint_id"),
     publishedBy: text("published_by").references(() => user.id, { onDelete: "set null" }),
     publishedAt: timestamp("published_at", { withTimezone: true }),
@@ -290,7 +292,7 @@ export const spec = pgTable(
 export const specUpdateLog = pgTable(
   "spec_update_log",
   {
-    seq: bigserial("seq", { mode: "bigint" }).primaryKey(),
+    seq: bigint("seq", { mode: "bigint" }).notNull(),
     specId: uuid("spec_id")
       .notNull()
       .references(() => spec.id, { onDelete: "cascade" }),
@@ -298,7 +300,7 @@ export const specUpdateLog = pgTable(
     clientId: text("client_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index("spec_update_log_spec_seq_idx").on(t.specId, t.seq)],
+  (t) => [primaryKey({ columns: [t.specId, t.seq] })],
 );
 
 export const specSnapshot = pgTable("spec_snapshot", {

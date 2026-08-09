@@ -7,6 +7,7 @@ import type { Pool, PoolClient } from "pg";
 export const SPEC_UPDATE_CHANNEL = "spec_update";
 export const SPEC_SOFT_SIZE_BYTES = 500 * 1024;
 export const SPEC_MAX_SIZE_BYTES = 2 * 1024 * 1024;
+export const SPEC_UPDATE_SIZE_FACTOR = 16;
 
 export interface SpecUpdateChannelEnvelope {
   type: "update";
@@ -70,7 +71,12 @@ export interface CompactSnapshotInput extends SpecSnapshotRecord {
 export interface SpecDocumentStore {
   readSnapshot(specId: string): Promise<SpecSnapshotRecord | null>;
   readUpdatesAfter(specId: string, afterSeq: bigint): Promise<SpecUpdateRecord[]>;
-  insertUpdate(specId: string, update: Uint8Array, clientId: string | null): Promise<bigint>;
+  insertUpdateIfLatest(
+    specId: string,
+    expectedSeq: bigint,
+    update: Uint8Array,
+    clientId: string | null,
+  ): Promise<bigint | null>;
   notifyUpdate(specId: string, seq: bigint): Promise<void>;
   compactSnapshot(input: CompactSnapshotInput): Promise<boolean>;
   listen(onWake: (specId: string) => void): Promise<() => Promise<void>>;
@@ -83,7 +89,9 @@ export interface LoadedSpecDocument {
 
 interface CachedSpecDocument {
   doc: Y.Doc;
+  validationDoc: Y.Doc;
   lastAppliedSeq: bigint;
+  renderedSizeUpperBound: number;
 }
 
 export interface SpecDocumentUpdateEvent {
@@ -98,10 +106,18 @@ export interface SpecDocumentServiceOptions {
   onWarning?: (message: string) => void;
   /** Test seam for a process failure after the durable insert. */
   afterPersist?: (specId: string, seq: bigint) => void | Promise<void>;
+  measureRenderedSize?: (doc: ProseMirrorNode) => number;
 }
 
 export interface CompactSpecResult extends SpecSnapshotRecord {
   renderedMarkdown: string;
+}
+
+export class SpecCompactionStaleError extends Error {
+  constructor(readonly specId: string) {
+    super(`Spec ${specId} changed during compaction; retry it later`);
+    this.name = "SpecCompactionStaleError";
+  }
 }
 
 export function proseMirrorDocument(doc: Y.Doc): ProseMirrorNode {
@@ -186,10 +202,7 @@ export class SpecDocumentService {
     });
   }
 
-  subscribe(
-    specId: string,
-    listener: (event: SpecDocumentUpdateEvent) => void,
-  ): () => void {
+  subscribe(specId: string, listener: (event: SpecDocumentUpdateEvent) => void): () => void {
     const listeners = this.listeners.get(specId) ?? new Set();
     listeners.add(listener);
     this.listeners.set(specId, listeners);
@@ -202,23 +215,25 @@ export class SpecDocumentService {
   async compact(specId: string): Promise<CompactSpecResult> {
     return this.withLock(specId, async () => {
       const room = await this.loadUnlocked(specId);
-      await this.syncUnlocked(specId, room);
-      const state = Y.encodeStateAsUpdate(room.doc);
-      const stateVector = Y.encodeStateVector(room.doc);
-      const renderedMarkdown = renderMarkdown(proseMirrorDocument(room.doc));
-      const input = {
-        specId,
-        state,
-        stateVector,
-        coveredSeq: room.lastAppliedSeq,
-      };
-      await this.store.compactSnapshot(input);
-      return { state, stateVector, coveredSeq: room.lastAppliedSeq, renderedMarkdown };
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        await this.syncUnlocked(specId, room);
+        const state = Y.encodeStateAsUpdate(room.doc);
+        const stateVector = Y.encodeStateVector(room.doc);
+        const renderedMarkdown = renderMarkdown(proseMirrorDocument(room.doc));
+        const coveredSeq = room.lastAppliedSeq;
+        const input = { specId, state, stateVector, coveredSeq };
+        if (await this.store.compactSnapshot(input)) {
+          return { state, stateVector, coveredSeq, renderedMarkdown };
+        }
+      }
+      throw new SpecCompactionStaleError(specId);
     });
   }
 
   evict(specId: string): void {
-    this.cache.get(specId)?.doc.destroy();
+    const room = this.cache.get(specId);
+    room?.doc.destroy();
+    room?.validationDoc.destroy();
     this.cache.delete(specId);
   }
 
@@ -227,14 +242,19 @@ export class SpecDocumentService {
     if (cached) return cached;
 
     const doc = new Y.Doc();
+    const validationDoc = new Y.Doc();
     const snapshot = await this.store.readSnapshot(specId);
     let lastAppliedSeq = 0n;
     if (snapshot) {
       Y.applyUpdate(doc, snapshot.state);
+      Y.applyUpdate(validationDoc, snapshot.state);
       lastAppliedSeq = snapshot.coveredSeq;
     }
-    const room = { doc, lastAppliedSeq };
+    const room = { doc, validationDoc, lastAppliedSeq, renderedSizeUpperBound: 0 };
     await this.applyTail(specId, room, "peer");
+    if (doc.getXmlFragment(SPEC_FRAGMENT_NAME).length > 0) {
+      room.renderedSizeUpperBound = this.measureRenderedSize(proseMirrorDocument(doc));
+    }
     this.cache.set(specId, room);
     return room;
   }
@@ -243,21 +263,23 @@ export class SpecDocumentService {
     const snapshot = await this.store.readSnapshot(specId);
     if (snapshot && snapshot.coveredSeq > room.lastAppliedSeq) {
       Y.applyUpdate(room.doc, snapshot.state);
+      Y.applyUpdate(room.validationDoc, snapshot.state);
       room.lastAppliedSeq = snapshot.coveredSeq;
     }
     await this.applyTail(specId, room, "peer");
   }
 
-  private async applyTail(
-    specId: string,
-    room: CachedSpecDocument,
-    source: "peer",
-  ): Promise<void> {
+  private async applyTail(specId: string, room: CachedSpecDocument, source: "peer"): Promise<void> {
     const updates = await this.store.readUpdatesAfter(specId, room.lastAppliedSeq);
     for (const row of updates) {
       Y.applyUpdate(room.doc, row.update);
+      Y.applyUpdate(room.validationDoc, row.update);
       room.lastAppliedSeq = row.seq;
+      room.renderedSizeUpperBound += estimatedRenderedGrowth(row.update);
       this.broadcast({ specId, ...row, source });
+    }
+    if (room.renderedSizeUpperBound >= SPEC_SOFT_SIZE_BYTES) {
+      room.renderedSizeUpperBound = this.measureRenderedSize(proseMirrorDocument(room.doc));
     }
   }
 
@@ -267,31 +289,101 @@ export class SpecDocumentService {
     update: Uint8Array,
     clientId: string | null,
   ): Promise<SpecUpdateRecord> {
-    this.validateSize(room.doc, update);
+    // Decode the untrusted client payload before it can enter the durable log.
+    // validateCandidate applies it to the private shadow and enforces the full
+    // ProseMirror document schema before persistence.
+    Y.decodeUpdate(update);
 
-    // ADR 0114 D5: the durable insert must complete before any local state or
-    // socket can observe the update.
-    const seq = await this.store.insertUpdate(specId, update, clientId);
-    await this.options.afterPersist?.(specId, seq);
-    Y.applyUpdate(room.doc, update);
-    room.lastAppliedSeq = seq;
-    const row = { seq, update, clientId };
-    this.broadcast({ specId, ...row, source: "local" });
-    await this.store.notifyUpdate(specId, seq);
-    return row;
+    for (;;) {
+      const candidate = this.validateCandidate(room, update);
+      const renderedSizeUpperBound = this.validateSize(room, update, candidate);
+
+      // ADR 0114 D5: the conditional insert allocates the next dense committed
+      // revision. A peer that committed first makes this CAS miss, so this
+      // service must load and size-check that peer update before it retries.
+      let seq: bigint | null;
+      try {
+        seq = await this.store.insertUpdateIfLatest(specId, room.lastAppliedSeq, update, clientId);
+      } catch (error) {
+        this.resetValidationDoc(room);
+        throw error;
+      }
+      if (seq === null) {
+        await this.syncUnlocked(specId, room);
+        continue;
+      }
+
+      // The durable insert must complete before local state or a socket can
+      // observe the update.
+      await this.options.afterPersist?.(specId, seq);
+      Y.applyUpdate(room.doc, update);
+      room.lastAppliedSeq = seq;
+      room.renderedSizeUpperBound = renderedSizeUpperBound;
+      const row = { seq, update, clientId };
+      this.broadcast({ specId, ...row, source: "local" });
+      await this.store.notifyUpdate(specId, seq);
+      return row;
+    }
   }
 
-  private validateSize(current: Y.Doc, update: Uint8Array): void {
-    const candidate = new Y.Doc();
-    Y.applyUpdate(candidate, Y.encodeStateAsUpdate(current));
-    Y.applyUpdate(candidate, update);
-    const markdown = renderMarkdown(proseMirrorDocument(candidate));
-    const size = new TextEncoder().encode(markdown).byteLength;
-    if (size > SPEC_MAX_SIZE_BYTES) throw new SpecDocumentTooLargeError(size);
-    if (size > SPEC_SOFT_SIZE_BYTES) {
-      this.warn(`Spec document is ${size} bytes; the soft limit is ${SPEC_SOFT_SIZE_BYTES}`);
+  private validateCandidate(room: CachedSpecDocument, update: Uint8Array): ProseMirrorNode {
+    const validationDoc = room.validationDoc;
+    Y.applyUpdate(validationDoc, update);
+    let repaired = false;
+    const onRepair = () => {
+      repaired = true;
+    };
+    validationDoc.on("update", onRepair);
+    try {
+      const candidate = proseMirrorDocument(validationDoc);
+      candidate.check();
+      if (repaired) throw new Error("The spec update violates the document schema");
+      return candidate;
+    } catch (error) {
+      this.resetValidationDoc(room);
+      throw error;
+    } finally {
+      validationDoc.off("update", onRepair);
     }
-    candidate.destroy();
+  }
+
+  private validateSize(
+    room: CachedSpecDocument,
+    update: Uint8Array,
+    candidate: ProseMirrorNode,
+  ): number {
+    const upperBound = room.renderedSizeUpperBound + estimatedRenderedGrowth(update);
+    if (
+      upperBound < SPEC_SOFT_SIZE_BYTES &&
+      room.doc.getXmlFragment(SPEC_FRAGMENT_NAME).length > 0
+    ) {
+      return upperBound;
+    }
+
+    try {
+      const size = this.measureRenderedSize(candidate);
+      if (size > SPEC_MAX_SIZE_BYTES) throw new SpecDocumentTooLargeError(size);
+      if (size > SPEC_SOFT_SIZE_BYTES) {
+        this.warn(`Spec document is ${size} bytes; the soft limit is ${SPEC_SOFT_SIZE_BYTES}`);
+      }
+      return size;
+    } catch (error) {
+      this.resetValidationDoc(room);
+      throw error;
+    }
+  }
+
+  private resetValidationDoc(room: CachedSpecDocument): void {
+    room.validationDoc.destroy();
+    room.validationDoc = new Y.Doc();
+    Y.applyUpdate(room.validationDoc, Y.encodeStateAsUpdate(room.doc));
+  }
+
+  private measureRenderedSize(doc: ProseMirrorNode): number {
+    return (
+      this.options.measureRenderedSize ??
+      ((value) => new TextEncoder().encode(renderMarkdown(value)).byteLength)
+    )(doc);
   }
 
   private broadcast(event: SpecDocumentUpdateEvent): void {
@@ -369,18 +461,41 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     }));
   }
 
-  async insertUpdate(
+  async insertUpdateIfLatest(
     specId: string,
+    expectedSeq: bigint,
     update: Uint8Array,
     clientId: string | null,
-  ): Promise<bigint> {
-    const result = await this.pool.query<{ seq: string }>(
-      `INSERT INTO spec_update_log (spec_id, update, client_id)
-       VALUES ($1, $2, $3)
-       RETURNING seq`,
-      [specId, Buffer.from(update), clientId],
-    );
-    return BigInt(result.rows[0]!.seq);
+  ): Promise<bigint | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const revision = await client.query<{ current_doc_seq: string }>(
+        `UPDATE spec
+            SET current_doc_seq = current_doc_seq + 1
+          WHERE id = $1
+            AND current_doc_seq = $2
+        RETURNING current_doc_seq`,
+        [specId, expectedSeq.toString()],
+      );
+      const nextSeq = revision.rows[0]?.current_doc_seq;
+      if (nextSeq === undefined) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+      await client.query(
+        `INSERT INTO spec_update_log (spec_id, seq, update, client_id)
+         VALUES ($1, $2, $3, $4)`,
+        [specId, nextSeq, Buffer.from(update), clientId],
+      );
+      await client.query("COMMIT");
+      return BigInt(nextSeq);
+    } catch (error) {
+      await rollback(client);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async notifyUpdate(specId: string, seq: bigint): Promise<void> {
@@ -394,11 +509,16 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      const lock = await client.query<{ acquired: boolean }>(
-        "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS acquired",
-        [`spec-compact:${input.specId}`],
+      const revision = await client.query<{ current_doc_seq: string }>(
+        `SELECT current_doc_seq
+           FROM spec
+          WHERE id = $1
+          FOR UPDATE`,
+        [input.specId],
       );
-      if (!lock.rows[0]?.acquired) {
+      const currentSeq = revision.rows[0]?.current_doc_seq;
+      if (currentSeq === undefined) throw new Error(`Unknown spec: ${input.specId}`);
+      if (BigInt(currentSeq) !== input.coveredSeq) {
         await client.query("ROLLBACK");
         return false;
       }
@@ -452,6 +572,17 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
 
 async function rollback(client: PoolClient): Promise<void> {
   await client.query("ROLLBACK").catch(() => {});
+}
+
+function estimatedRenderedGrowth(update: Uint8Array): number {
+  // Every rendered byte added by the current schema comes from text, a node
+  // name, or an attribute value carried in the Yjs update. Markdown escaping
+  // can add at most one byte per ASCII source byte. Headings, blank lines, and
+  // fences add fewer bytes than their encoded Yjs structure. A factor of 16 is
+  // therefore a conservative upper bound for all current nodes. When this
+  // bound reaches the 500 KiB soft limit, the service measures the exact render
+  // and resets the bound. New rendered node types must extend the bound test.
+  return update.byteLength * SPEC_UPDATE_SIZE_FACTOR;
 }
 
 function errorMessage(error: unknown): string {
