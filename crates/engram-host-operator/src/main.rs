@@ -101,3 +101,23 @@ fn error_policy(_obj: Arc<HostFleet>, err: &OperatorError, _ctx: Arc<Ctx>) -> Ac
     tracing::warn!(error = %err, "reconcile failed; requeueing");
     Action::requeue(Duration::from_secs(15))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_in_crd_matches_generated_schema() {
+        let checked_in: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../deploy/helm/engram-host-fleet/crds/hostfleet.engram.io.yaml"
+        ))
+        .expect("the checked-in HostFleet CRD must be valid JSON");
+        let generated =
+            serde_json::to_value(HostFleet::crd()).expect("the generated CRD must serialize");
+
+        assert_eq!(
+            checked_in, generated,
+            "regenerate the checked-in HostFleet CRD with `cargo run -q -p engram-host-operator -- crd`"
+        );
+    }
+}
