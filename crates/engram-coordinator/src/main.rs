@@ -6,7 +6,7 @@ use engram_coordinator::{
     config::{RunMode, SandboxBackendChoice},
     CoordinatorConfig, CoordinatorError, HostRegistry, Services,
 };
-use engram_core::traits::{HostClient, SandboxBackend, SecretStore};
+use engram_core::traits::{HostClient, MetadataStore, SandboxBackend, SecretStore};
 use engram_core::HostId;
 use engram_postgres::PostgresStore;
 use engram_secrets_dev::EnvSecretStore;
@@ -267,6 +267,39 @@ fn parse_kek_choice(s: &str) -> Result<KekChoice, String> {
             "unknown KEK provider `{other}` (expected env-var | gcp-kms)"
         )),
     }
+}
+
+fn in_process_heartbeat(
+    ready_images: Vec<String>,
+    current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
+) -> engram_core::types::host::HostHeartbeat {
+    engram_core::types::host::HostHeartbeat {
+        status: engram_core::types::host::HostStatus::Ready,
+        capacity: engram_core::types::host::HostCapacity {
+            total_gb: 0,
+            used_gb: 0,
+            total_mib: 0,
+            used_mib: 0,
+            running_sandboxes: 0,
+        },
+        utilization: Default::default(),
+        ready_images,
+        current_bundles,
+        total_vcpus: 0,
+        wire_version: engram_protocol::WIRE_VERSION,
+        stages_images: false,
+        capabilities: engram_core::types::host::HostCapabilities::default(),
+    }
+}
+
+async fn touch_in_process_host<M: MetadataStore + ?Sized>(
+    meta: &M,
+    host_id: HostId,
+    ready_images: Vec<String>,
+    current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
+) -> Result<(), engram_core::MetaError> {
+    meta.touch_host_heartbeat(host_id, in_process_heartbeat(ready_images, current_bundles))
+        .await
 }
 
 #[tokio::main]
@@ -534,8 +567,10 @@ async fn main() -> Result<(), CoordinatorError> {
             status: engram_core::types::host::HostStatus::Ready,
             last_heartbeat_at: clock.now_utc(),
             host_addr: None,
-            ready_images: process_ready_images.clone(),
-            current_bundles: process_current_bundles,
+            // Registration writes identity and capacity only. The heartbeat
+            // below owns all scheduling state, including these catalogs.
+            ready_images: Vec::new(),
+            current_bundles: Vec::new(),
             cordoned: false,
             total_vcpus: 0,
             // Issue #229: the in-process host runs this very binary, so it
@@ -554,44 +589,41 @@ async fn main() -> Result<(), CoordinatorError> {
                 "register in-process host in postgres: {e}"
             )));
         }
+        touch_in_process_host(
+            &pg,
+            in_proc_host,
+            process_ready_images.clone(),
+            process_current_bundles,
+        )
+        .await
+        .map_err(|e| {
+            CoordinatorError::Config(format!(
+                "publish in-process host scheduling state in postgres: {e}"
+            ))
+        })?;
         // Keep the row's `last_heartbeat_at` fresh so the dead-host
         // detector doesn't reap our own in-process host. The
         // multi-host path uses the WS dialer's heartbeat loop for
         // this; --mode=all stamps the timestamp directly.
         let pg_for_hb = pg.clone();
-        let clock_for_hb = clock.clone();
         let ready_images_for_hb = process_ready_images;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Startup published a synchronous heartbeat. Wait one full
+            // interval before the recurring heartbeat.
+            tick.tick().await;
             loop {
                 tick.tick().await;
-                let r = engram_core::types::HostRecord {
-                    id: in_proc_host,
-                    hostname: "in-process".into(),
-                    cloud_metadata: engram_core::types::host::HostMetadata::default(),
-                    capacity: engram_core::types::host::HostCapacity {
-                        total_gb: 0,
-                        used_gb: 0,
-                        total_mib: 0,
-                        used_mib: 0,
-                        running_sandboxes: 0,
-                    },
-                    utilization: Default::default(),
-                    status: engram_core::types::host::HostStatus::Ready,
-                    last_heartbeat_at: clock_for_hb.now_utc(),
-                    host_addr: None,
-                    ready_images: ready_images_for_hb.clone(),
-                    current_bundles: engram_sandbox_process::ProcessBackend::current_bundles(),
-                    cordoned: false,
-                    total_vcpus: 0,
-                    wire_version: engram_protocol::WIRE_VERSION,
-                    stages_images: false,
-                    capabilities: engram_core::types::host::HostCapabilities::default(),
-                };
-                if let Err(e) = engram_core::traits::MetadataStore::upsert_host(&pg_for_hb, r).await
+                if let Err(e) = touch_in_process_host(
+                    &pg_for_hb,
+                    in_proc_host,
+                    ready_images_for_hb.clone(),
+                    engram_sandbox_process::ProcessBackend::current_bundles(),
+                )
+                .await
                 {
-                    tracing::warn!(error = %e, "in-process heartbeat upsert failed");
+                    tracing::warn!(error = %e, "in-process heartbeat persist failed");
                 }
             }
         });
@@ -709,4 +741,75 @@ async fn main() -> Result<(), CoordinatorError> {
         integrations,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engram_core::traits::Clock;
+    use engram_core::types::host::{HostCapacity, HostRecord, HostStatus};
+    use engram_core::types::sandbox::AuxBundleRef;
+
+    #[tokio::test(start_paused = true)]
+    async fn in_process_heartbeat_publishes_scheduling_catalogs() {
+        let clock = engram_sim::SimClock::new();
+        let meta = engram_sim::SimMetadataStore::new(
+            clock.clone(),
+            Arc::new(engram_sim::SimEntropy::seeded(0xB00D1E)),
+        );
+        let host_id: HostId = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000a11")
+            .expect("valid host id")
+            .into();
+        let ready_images = vec!["sha256:image".to_owned()];
+        let current_bundles = vec![AuxBundleRef {
+            drive_id: "harness-codex".to_owned(),
+            sha256: "sha256:bundle".to_owned(),
+        }];
+
+        meta.upsert_host(HostRecord {
+            id: host_id,
+            hostname: "in-process".to_owned(),
+            cloud_metadata: Default::default(),
+            capacity: HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+                total_mib: 0,
+                used_mib: 0,
+                running_sandboxes: 0,
+            },
+            utilization: Default::default(),
+            status: HostStatus::Ready,
+            last_heartbeat_at: clock.now_utc(),
+            host_addr: None,
+            // The registration contract ignores these fields. This mirrors
+            // the ProcessBackend startup sequence and proves that the
+            // heartbeat is the step that makes the catalogs schedulable.
+            ready_images: ready_images.clone(),
+            current_bundles: current_bundles.clone(),
+            cordoned: false,
+            total_vcpus: 0,
+            wire_version: engram_protocol::WIRE_VERSION,
+            stages_images: false,
+            capabilities: Default::default(),
+        })
+        .await
+        .expect("register host");
+
+        let registered = meta.list_active_hosts().await.expect("list hosts");
+        assert!(registered[0].ready_images.is_empty());
+        assert!(registered[0].current_bundles.is_empty());
+
+        touch_in_process_host(
+            meta.as_ref(),
+            host_id,
+            ready_images.clone(),
+            current_bundles.clone(),
+        )
+        .await
+        .expect("publish heartbeat");
+
+        let advertised = meta.list_active_hosts().await.expect("list hosts");
+        assert_eq!(advertised[0].ready_images, ready_images);
+        assert_eq!(advertised[0].current_bundles, current_bundles);
+    }
 }
