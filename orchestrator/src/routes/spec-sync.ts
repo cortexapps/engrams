@@ -30,6 +30,7 @@ export interface SpecSyncDocuments {
   loadDoc(specId: string): Promise<{ doc: Y.Doc }>;
   applyUpdate(specId: string, update: Uint8Array, clientId: string): Promise<unknown>;
   subscribe(specId: string, listener: (event: SpecDocumentUpdate) => void): () => void;
+  evict(specId: string): void;
 }
 
 export interface SpecParticipantStore {
@@ -198,7 +199,7 @@ export class SpecSyncHub implements SpecPresence {
     const stopBus = this.stopBus;
     this.stopBus = null;
     if (stopBus) await stopBus();
-    for (const entry of this.rooms.values()) {
+    for (const [specId, entry] of this.rooms) {
       const room = await entry.promise;
       for (const socket of room.sockets) {
         room.socketHeartbeatStops.get(socket)?.();
@@ -206,6 +207,7 @@ export class SpecSyncHub implements SpecPresence {
       }
       room.unsubscribeDocument();
       room.awareness.destroy();
+      this.deps.documents.evict(specId);
     }
     this.rooms.clear();
   }
@@ -484,6 +486,7 @@ export class SpecSyncHub implements SpecPresence {
     this.rooms.delete(specId);
     room.unsubscribeDocument();
     room.awareness.destroy();
+    this.deps.documents.evict(specId);
   }
 
   private runBackgroundTask(operation: string, task: Promise<void>): void {

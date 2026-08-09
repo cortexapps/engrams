@@ -45,6 +45,7 @@ function fakeDocuments(): SpecSyncDocuments {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
+    evict: () => {},
   };
 }
 
@@ -276,6 +277,7 @@ describe("the spec sync UpgradeHook", () => {
   test("retires an empty room and reports a failed participant disconnect", async () => {
     let loads = 0;
     let unsubscribes = 0;
+    let evictions = 0;
     const warnings: string[] = [];
     const documents: SpecSyncDocuments = {
       loadDoc: async () => {
@@ -285,6 +287,9 @@ describe("the spec sync UpgradeHook", () => {
       applyUpdate: async () => {},
       subscribe: () => () => {
         unsubscribes += 1;
+      },
+      evict: () => {
+        evictions += 1;
       },
     };
     const port = await listenForSpecSync({
@@ -305,7 +310,7 @@ describe("the spec sync UpgradeHook", () => {
     await waitForDecodedMessage(first, "sync-step-1");
     first.close();
     await new Promise<void>((resolve) => first.once("close", () => resolve()));
-    await eventually(() => warnings.length === 1 && unsubscribes === 1);
+    await eventually(() => warnings.length === 1 && unsubscribes === 1 && evictions === 1);
 
     const second = new WebSocketClient(
       `ws://127.0.0.1:${port}/api/v1/specs/${SPEC_RETIRED}/sync?clientId=43`,
@@ -330,6 +335,7 @@ describe("the spec sync UpgradeHook", () => {
         subscribe: () => () => {
           unsubscribes += 1;
         },
+        evict: () => {},
       },
       participants: {
         connect: async () => {},
@@ -367,6 +373,7 @@ describe("the spec sync UpgradeHook", () => {
         subscribe: () => () => {
           unsubscribes += 1;
         },
+        evict: () => {},
       },
       participants: {
         connect: async () => {},
@@ -407,6 +414,7 @@ describe("the spec sync UpgradeHook", () => {
         subscribe: () => () => {
           unsubscribes += 1;
         },
+        evict: () => {},
       },
       participants: {
         connect: async () => {
@@ -591,6 +599,7 @@ function fakeDocumentNetwork(): { replica(): SpecSyncDocuments } {
           record.listeners.add(listener);
           return () => record.listeners.delete(listener);
         },
+        evict: () => {},
       };
     },
   };
