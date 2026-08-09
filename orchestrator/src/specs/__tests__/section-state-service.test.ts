@@ -109,6 +109,43 @@ function serviceWith(store: MemorySectionStateStore, transcript: MemoryTranscrip
 }
 
 describe("section state service", () => {
+  test("defers transcript delivery until the drainer runs", async () => {
+    const store = new MemorySectionStateStore();
+    const transcript = new MemoryTranscriptPublisher();
+    const service = serviceWith(store, transcript);
+
+    const first = await service.transitionDeferred({
+      actionId: "deferred-action",
+      context,
+      target: "drafted",
+      actorUserId: "user-1",
+    });
+    const replay = await service.transitionDeferred({
+      actionId: "deferred-action",
+      context,
+      target: "drafted",
+      actorUserId: "user-1",
+    });
+
+    expect(replay).toEqual(first);
+    expect(store.stateWrites).toBe(1);
+    expect(store.actions.get("deferred-action")?.deliveredAt).toBeNull();
+    expect(transcript.publications).toHaveLength(0);
+
+    const drainer = new SectionStateTranscriptDrainer(
+      store,
+      transcript,
+      () => new Date("2026-08-09T12:01:00.000Z"),
+    );
+    expect(await drainer.runOnce()).toEqual({ delivered: 1, failed: 0 });
+    expect(transcript.publications).toEqual([
+      { actionId: "deferred-action", chip: first.transcriptChip },
+    ]);
+    expect(store.actions.get("deferred-action")?.deliveredAt).toEqual(
+      new Date("2026-08-09T12:01:00.000Z"),
+    );
+  });
+
   test("publishes one durable chip after every persisted transition", async () => {
     const store = new MemorySectionStateStore();
     const transcript = new MemoryTranscriptPublisher();

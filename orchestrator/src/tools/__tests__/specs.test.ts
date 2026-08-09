@@ -179,6 +179,28 @@ describe("spec tools", () => {
     ]);
   });
 
+  test("an applied mutation waits for its projection refresh", async () => {
+    const state = recorder();
+    let release = () => {};
+    state.deps.projection.request = () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    let settled = false;
+    const pending = call(state.deps, "spec_update_section", {
+      section_id: "failure-modes",
+      markdown: "New failure modes",
+    }).then(() => {
+      settled = true;
+    });
+
+    await Bun.sleep(0);
+    expect(settled).toBe(false);
+    release();
+    await pending;
+    expect(settled).toBe(true);
+  });
+
   test("a section tool publishes section presence and clears it after failure", async () => {
     const state = recorder();
     state.deps.documents.updateSection = async () => {
@@ -210,6 +232,67 @@ describe("spec tools", () => {
         },
       },
     ]);
+  });
+
+  test("every section-scoped tool enters and leaves presence", async () => {
+    const cases: Array<{ name: string; input: object; sectionId: string }> = [
+      { name: "spec_read", input: { section_id: "context" }, sectionId: "context" },
+      {
+        name: "spec_update_section",
+        input: { section_id: "context", markdown: "new" },
+        sectionId: "context",
+      },
+      {
+        name: "spec_set_section_state",
+        input: { section_id: "context", state: "drafted" },
+        sectionId: "context",
+      },
+      {
+        name: "spec_add_open_question",
+        input: { section_id: "context", question: "Question?" },
+        sectionId: "context",
+      },
+      {
+        name: "spec_resolve_open_question",
+        input: {
+          section_id: "context",
+          question_id: "00000000-0000-4000-8000-000000000001",
+          answer_markdown: "Answer",
+        },
+        sectionId: "context",
+      },
+      {
+        name: "spec_update_block",
+        input: { section_id: "context", block_id: "diagram", source: "new" },
+        sectionId: "context",
+      },
+    ];
+
+    for (const item of cases) {
+      const state = recorder();
+      await call(state.deps, item.name, item.input);
+      expect(state.presence.map((entry) => entry.action), item.name).toEqual(["enter", "leave"]);
+      expect(state.presence[0]?.input, item.name).toMatchObject({ sectionId: item.sectionId });
+    }
+  });
+
+  test("whole-document, notes, and ticket tools do not synthesize section presence", async () => {
+    const state = recorder();
+    await call(state.deps, "spec_read", {});
+    await call(state.deps, "spec_update_notes", { markdown: "notes" });
+    await call(state.deps, "spec_propose_tickets", {
+      idempotency_key: "proposal-1",
+      tickets: [
+        {
+          client_id: "ticket-1",
+          title: "Implement the change",
+          description: "Use the approved design.",
+          section_id: "context",
+        },
+      ],
+    });
+
+    expect(state.presence).toHaveLength(0);
   });
 
   test("n/a state requires a reason without adding a union to the schema", () => {
