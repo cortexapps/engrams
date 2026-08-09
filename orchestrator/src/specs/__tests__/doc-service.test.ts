@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
   createTemplateDocument,
   findSection,
@@ -524,6 +524,16 @@ describe("SpecDocumentService with live Postgres", () => {
     );
   }, 15_000);
 
+  beforeEach(async () => {
+    if (!liveDbReachable || !livePool) return;
+    await livePool.query("DELETE FROM spec_transcript_action WHERE spec_id = $1", [specId]);
+    await livePool.query("DELETE FROM spec_section_state WHERE spec_id = $1", [specId]);
+    await livePool.query("DELETE FROM spec_participant WHERE spec_id = $1", [specId]);
+    await livePool.query("DELETE FROM spec_update_log WHERE spec_id = $1", [specId]);
+    await livePool.query("DELETE FROM spec_snapshot WHERE spec_id = $1", [specId]);
+    await livePool.query("UPDATE spec SET current_doc_seq = 0 WHERE id = $1", [specId]);
+  }, 15_000);
+
   afterAll(async () => {
     if (!livePool) return;
     if (liveDbReachable) {
@@ -539,12 +549,6 @@ describe("SpecDocumentService with live Postgres", () => {
     "a human edit commits its update, drafted state, and transcript action atomically",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
-      await livePool.query("DELETE FROM spec_transcript_action WHERE spec_id = $1", [specId]);
-      await livePool.query("DELETE FROM spec_section_state WHERE spec_id = $1", [specId]);
-      await livePool.query("DELETE FROM spec_participant WHERE spec_id = $1", [specId]);
-      await livePool.query("DELETE FROM spec_update_log WHERE spec_id = $1", [specId]);
-      await livePool.query("DELETE FROM spec_snapshot WHERE spec_id = $1", [specId]);
-      await livePool.query("UPDATE spec SET current_doc_seq = 0 WHERE id = $1", [specId]);
       await livePool.query(
         `INSERT INTO spec_participant (spec_id, client_id, user_id, connected_at)
          VALUES ($1, $2, $3, $4)`,
@@ -681,10 +685,6 @@ describe("SpecDocumentService with live Postgres", () => {
     "concurrent writers allocate dense committed revisions before compaction",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
-      await livePool.query("DELETE FROM spec_update_log WHERE spec_id = $1", [specId]);
-      await livePool.query("DELETE FROM spec_snapshot WHERE spec_id = $1", [specId]);
-      await livePool.query("UPDATE spec SET current_doc_seq = 0 WHERE id = $1", [specId]);
-
       const first = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
       const second = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
       await first.applyUpdate(specId, initialUpdate(), "seed");
