@@ -233,8 +233,20 @@ describe("SpecDocumentService", () => {
       specId: SPEC_ID,
       update: "encoded-awareness",
     });
+    const query = encodeSpecChannelEnvelope({ type: "awareness-query", specId: SPEC_ID });
+    expect(parseSpecChannelEnvelope(query)).toEqual({
+      type: "awareness-query",
+      specId: SPEC_ID,
+    });
     expect(parseSpecChannelEnvelope(`${SPEC_ID}:12`)).toBeNull();
     expect(parseSpecChannelEnvelope('{"type":"update"}')).toBeNull();
+    expect(() =>
+      encodeSpecChannelEnvelope({
+        type: "awareness",
+        specId: SPEC_ID,
+        update: "x".repeat(8_000),
+      }),
+    ).toThrow("larger than 7900 bytes");
   });
 
   test("concurrent updates from three clients converge in every apply order", async () => {

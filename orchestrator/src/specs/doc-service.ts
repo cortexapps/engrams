@@ -13,6 +13,7 @@ import { applyHumanSectionEdit, type SectionStateValue } from "./section-state.t
 import { humanEditRequestFingerprint } from "./section-state-service.ts";
 
 export const SPEC_UPDATE_CHANNEL = "spec_update";
+export const SPEC_CHANNEL_PAYLOAD_MAX_BYTES = 7_900;
 export const SPEC_SOFT_SIZE_BYTES = 500 * 1024;
 export const SPEC_MAX_SIZE_BYTES = 2 * 1024 * 1024;
 export const SPEC_UPDATE_SIZE_FACTOR = 16;
@@ -29,10 +30,24 @@ export interface SpecAwarenessChannelEnvelope {
   update: string;
 }
 
-export type SpecChannelEnvelope = SpecUpdateChannelEnvelope | SpecAwarenessChannelEnvelope;
+export interface SpecAwarenessQueryChannelEnvelope {
+  type: "awareness-query";
+  specId: string;
+}
+
+export type SpecChannelEnvelope =
+  | SpecUpdateChannelEnvelope
+  | SpecAwarenessChannelEnvelope
+  | SpecAwarenessQueryChannelEnvelope;
 
 export function encodeSpecChannelEnvelope(envelope: SpecChannelEnvelope): string {
-  return JSON.stringify(envelope);
+  const payload = JSON.stringify(envelope);
+  if (Buffer.byteLength(payload, "utf8") > SPEC_CHANNEL_PAYLOAD_MAX_BYTES) {
+    throw new Error(
+      `The spec channel payload is larger than ${SPEC_CHANNEL_PAYLOAD_MAX_BYTES} bytes`,
+    );
+  }
+  return payload;
 }
 
 export function parseSpecChannelEnvelope(payload: string): SpecChannelEnvelope | null {
@@ -46,6 +61,9 @@ export function parseSpecChannelEnvelope(payload: string): SpecChannelEnvelope |
     }
     if (record.type === "awareness" && typeof record.update === "string") {
       return { type: "awareness", specId: record.specId, update: record.update };
+    }
+    if (record.type === "awareness-query") {
+      return { type: "awareness-query", specId: record.specId };
     }
     return null;
   } catch {

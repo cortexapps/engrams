@@ -30,6 +30,7 @@ import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
 import { makeVncRoute } from "./routes/vnc.ts";
 import { makeIdeRoute, makeIdeUpgradeHandler } from "./routes/ide.ts";
+import { makeSpecSyncUpgradeHandler, SpecSyncHub } from "./routes/spec-sync.ts";
 import { makePreviewProxyMiddleware } from "./routes/preview-proxy.ts";
 import { makePreviewUpgradeHandler } from "./routes/preview-ws.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
@@ -69,11 +70,15 @@ import { makeProductionListenerManager } from "./listeners/manager.ts";
 import { makeProductionAutomationScheduler } from "./automations/scheduler.ts";
 import { assertSweepPoliciesExhaustive } from "./sweep/policy.ts";
 import { makeSweepRuntime } from "./sweep/production.ts";
-import { getDb } from "./db/client.ts";
+import { getDb, getPool } from "./db/client.ts";
+import { resolveSpecMembership } from "./authz/resolve.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
 import { makeReviewStore } from "./db/reviews.ts";
 import { makeReviewTargetHydrationStore } from "./db/review-target-hydration.ts";
 import { makeEnrollmentStore } from "./db/enrollments.ts";
+import { PostgresSpecDocumentStore, SpecDocumentService } from "./specs/doc-service.ts";
+import { PostgresSpecAwarenessBus, PostgresSpecParticipantStore } from "./specs/sync-store.ts";
+import { setSpecPresence } from "./specs/presence.ts";
 import { makeProfileStore } from "./db/profiles.ts";
 import { makeIntegrationConnectionStore } from "./db/integration-connections.ts";
 import { makeConnectorStore } from "./db/connectors.ts";
@@ -83,12 +88,21 @@ import { renderReviewer } from "./reviewers/render.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
-import {
-  DEFAULT_TARGET_HYDRATOR_CONFIG,
-  TargetHydrator,
-} from "./reviews/target-hydrator.ts";
+import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
 
 const app = new Hono();
+const specDocuments = new SpecDocumentService(new PostgresSpecDocumentStore(getPool()), {
+  onWarning: (message) => log.warn({ message }, "spec document warning"),
+});
+const specParticipants = new PostgresSpecParticipantStore(getDb());
+const specAwarenessBus = new PostgresSpecAwarenessBus(getPool());
+const specSyncHub = new SpecSyncHub({
+  documents: specDocuments,
+  participants: specParticipants,
+  awarenessBus: specAwarenessBus,
+  onWarning: (message) => log.warn({ message }, "spec sync warning"),
+});
+setSpecPresence(specSyncHub);
 
 // ADR 0051 Task 21: WebSocket shell route via @hono/node-ws.
 // createNodeWebSocket must be called with the Hono app BEFORE routes are mounted
@@ -247,7 +261,19 @@ const server = buildServer(
   // Raw WS-upgrade hooks, tried in order before the shell/vnc path: the
   // preview proxy first (Host-keyed — a preview host is a different origin,
   // so it wins outright), then the IDE proxy (path-keyed, ADR 0085).
-  [makePreviewUpgradeHandler(), makeIdeUpgradeHandler()],
+  [
+    makePreviewUpgradeHandler(),
+    makeIdeUpgradeHandler(),
+    makeSpecSyncUpgradeHandler(
+      {
+        documents: specDocuments,
+        participants: specParticipants,
+        awarenessBus: specAwarenessBus,
+        resolveMembership: resolveSpecMembership,
+      },
+      specSyncHub,
+    ),
+  ],
 );
 
 // ADR 0060: inject the SlackThreadWorkflow's seams (the Slack provider
@@ -299,9 +325,7 @@ await heartbeat.start();
 if (!config.sweepDisabled) {
   await sweeper.start();
 } else {
-  log.warn(
-    "DBOS orphan sweep disabled via ORCHESTRATOR_SWEEP_DISABLED",
-  );
+  log.warn("DBOS orphan sweep disabled via ORCHESTRATOR_SWEEP_DISABLED");
 }
 // Plain timer driver, not a DBOS workflow: hydration is bounded database/API
 // maintenance and does not need durable workflow replay or a sweep policy.
@@ -322,6 +346,8 @@ await automationScheduler.start();
 const oidcKeyRotation = startOidcKeyRotation({
   keys: makeIntegrationOidcKeyStore(getDb()),
 });
+await specDocuments.startPeerSync();
+await specSyncHub.start();
 
 server.listen(config.port, "0.0.0.0", () => {
   log.info({ port: config.port }, "orchestrator listening");
@@ -330,25 +356,28 @@ server.listen(config.port, "0.0.0.0", () => {
 // Graceful shutdown on SIGTERM (e.g. Tilt stop, Kubernetes pod termination).
 process.on("SIGTERM", () => {
   log.info("orchestrator: SIGTERM received, shutting down gracefully");
-  server.close(async (err) => {
-    // Quiesce DBOS (stops queue/recovery loops, closes the system-DB pool)
-    // after the HTTP server stops accepting connections.
+  void (async () => {
+    const serverStopped = new Promise<Error | undefined>((resolve) => {
+      server.close((err) => resolve(err));
+    });
+    await specSyncHub.stop();
+    await specDocuments.stopPeerSync();
+    const serverError = await serverStopped;
+    // Quiesce DBOS after the HTTP server stops accepting connections.
     oidcKeyRotation.stop();
     await automationScheduler.stop();
     await listenerManager.stop();
     await targetHydrator.stop();
     await sweeper.stop();
-    // The heartbeat must outlive the DBOS drain: workflows can execute until
-    // shutdownDbos() returns (or SIGKILL lands), and this pod's version must
-    // stay provably live for that whole window or another pod's sweep could
-    // adopt still-running work. Stopping the heartbeat is the LAST step.
+    // The heartbeat must outlive the DBOS drain. Workflows can execute until
+    // shutdownDbos() returns, and another pod must see this owner as live.
     await shutdownDbos();
     await heartbeat.stop();
-    if (err) {
-      log.error({ err }, "orchestrator: error during shutdown");
+    if (serverError) {
+      log.error({ err: serverError }, "orchestrator: error during shutdown");
       process.exit(1);
     }
     log.info("orchestrator: shutdown complete");
     process.exit(0);
-  });
+  })();
 });

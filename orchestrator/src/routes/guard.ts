@@ -32,16 +32,20 @@ import type { Actions } from "../authz/ability.ts";
 export type GetSession = (
   headers: Headers,
 ) => Promise<{
-  user: { id: string; role?: string | null; email?: string | null };
+  user: { id: string; role?: string | null; email?: string | null; name?: string | null };
 } | null>;
 
 /** Injected session-owner resolver. */
 export type ResolveOwner = (sessionId: string) => Promise<string | null>;
 
+/** Resolve whether a user is a member of the organization that owns a spec. */
+export type ResolveSpecMembership = (specId: string, userId: string) => Promise<boolean>;
+
 /** Resolved user returned by the guard — carries id + role. */
 export interface GuardUser {
   id: string;
   role: string;
+  name?: string;
 }
 
 /** Outcome of a header-level authorization check (no Hono `Context` involved —
@@ -78,6 +82,7 @@ export async function authorizeSessionAccess(
   const user: GuardUser = {
     id: session.user.id,
     role: session.user.role ?? "user",
+    ...(session.user.name ? { name: session.user.name } : {}),
   };
 
   if (!sessionId) return { ok: false, status: 404 };
@@ -85,6 +90,35 @@ export async function authorizeSessionAccess(
   const ability = abilityFor(user);
   const ownerId = await ownerResolver(sessionId);
   if (!ability.can(action, subject("Session", { createdByUserId: ownerId }))) {
+    return { ok: false, status: 404 };
+  }
+
+  return { ok: true, user };
+}
+
+/**
+ * Authorize an organization member for a spec-shared surface.
+ *
+ * A spec is the first live surface that is shared with all organization
+ * members. This check is separate from the session-owner check so a caller
+ * cannot accidentally apply owner-only policy to the collaborative document.
+ */
+export async function authorizeSpecMemberAccess(
+  headers: Headers,
+  specId: string | undefined,
+  resolveSession: GetSession,
+  resolveMembership: ResolveSpecMembership,
+): Promise<GuardResult> {
+  const session = await resolveSession(headers);
+  if (!session) return { ok: false, status: 401 };
+
+  const user: GuardUser = {
+    id: session.user.id,
+    role: session.user.role ?? "user",
+    ...(session.user.name ? { name: session.user.name } : {}),
+  };
+
+  if (!specId || !(await resolveMembership(specId, user.id))) {
     return { ok: false, status: 404 };
   }
 
@@ -117,6 +151,16 @@ export function makeHeaderGuard(
   const { resolveSession, ownerResolver } = resolveDefaults(getSession, resolveOwner);
   return (headers: Headers, sessionId: string | undefined, action: Actions) =>
     authorizeSessionAccess(headers, sessionId, action, resolveSession, ownerResolver);
+}
+
+/** Create the raw-header guard for an organization-shared spec surface. */
+export function makeSpecMemberHeaderGuard(
+  resolveMembership: ResolveSpecMembership,
+  getSession?: GetSession,
+) {
+  const resolveSession = getSession ?? getSessionFromHeaders;
+  return (headers: Headers, specId: string | undefined) =>
+    authorizeSpecMemberAccess(headers, specId, resolveSession, resolveMembership);
 }
 
 /**
