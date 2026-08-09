@@ -8,6 +8,10 @@ import type { Node as ProseMirrorNode } from "prosemirror-model";
 import { prosemirrorToYXmlFragment, yXmlFragmentToProseMirrorRootNode } from "y-prosemirror";
 import * as Y from "yjs";
 import type { Pool, PoolClient } from "pg";
+import {
+  listenForSpecChannel,
+  type SpecChannelListenerOptions,
+} from "./channel-listener.ts";
 
 import { applyHumanSectionEdit, type SectionStateValue } from "./section-state.ts";
 import { humanEditRequestFingerprint } from "./section-state-service.ts";
@@ -127,7 +131,10 @@ export interface SpecDocumentStore {
   ): Promise<bigint | null>;
   notifyUpdate(specId: string, seq: bigint): Promise<void>;
   compactSnapshot(input: CompactSnapshotInput): Promise<boolean>;
-  listen(onWake: (specId: string) => void): Promise<() => Promise<void>>;
+  listen(
+    onWake: (specId: string) => void,
+    onReconnect?: () => void,
+  ): Promise<() => Promise<void>>;
 }
 
 export interface LoadedSpecDocument {
@@ -195,12 +202,18 @@ export class SpecDocumentService {
 
   async startPeerSync(): Promise<void> {
     if (this.stopListening) return;
-    this.stopListening = await this.store.listen((specId) => {
+    const sync = (specId: string) => {
       if (!this.cache.has(specId)) return;
       void this.syncFromLog(specId).catch((error: unknown) => {
         this.warn(`Spec update sync failed for ${specId}: ${errorMessage(error)}`);
       });
-    });
+    };
+    this.stopListening = await this.store.listen(
+      sync,
+      () => {
+        for (const specId of this.cache.keys()) sync(specId);
+      },
+    );
   }
 
   async stopPeerSync(): Promise<void> {
@@ -570,7 +583,10 @@ interface SnapshotRow {
 }
 
 export class PostgresSpecDocumentStore implements SpecDocumentStore {
-  constructor(private readonly pool: Pool) {}
+  constructor(
+    private readonly pool: Pool,
+    private readonly listenerOptions: SpecChannelListenerOptions = {},
+  ) {}
 
   async readSnapshot(specId: string): Promise<SpecSnapshotRecord | null> {
     const result = await this.pool.query<SnapshotRow>(
@@ -709,20 +725,27 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     }
   }
 
-  async listen(onWake: (specId: string) => void): Promise<() => Promise<void>> {
-    const client = await this.pool.connect();
-    const onNotification = (message: { channel: string; payload?: string }) => {
-      if (message.channel !== SPEC_UPDATE_CHANNEL || !message.payload) return;
-      const envelope = parseSpecChannelEnvelope(message.payload);
-      if (envelope?.type === "update") onWake(envelope.specId);
-    };
-    client.on("notification", onNotification);
-    await client.query(`LISTEN ${SPEC_UPDATE_CHANNEL}`);
-    return async () => {
-      client.off("notification", onNotification);
-      await client.query(`UNLISTEN ${SPEC_UPDATE_CHANNEL}`).catch(() => {});
-      client.release();
-    };
+  async listen(
+    onWake: (specId: string) => void,
+    onReconnect?: () => void,
+  ): Promise<() => Promise<void>> {
+    return listenForSpecChannel(
+      this.pool,
+      SPEC_UPDATE_CHANNEL,
+      (message) => {
+        if (message.channel !== SPEC_UPDATE_CHANNEL || !message.payload) return;
+        const envelope = parseSpecChannelEnvelope(message.payload);
+        if (envelope?.type === "update") onWake(envelope.specId);
+      },
+      {
+        ...this.listenerOptions,
+        label: this.listenerOptions.label ?? "Spec document listener",
+        onReconnect: () => {
+          onReconnect?.();
+          this.listenerOptions.onReconnect?.();
+        },
+      },
+    );
   }
 }
 

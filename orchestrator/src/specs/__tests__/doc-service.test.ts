@@ -51,6 +51,7 @@ class MemoryDocumentStore implements SpecDocumentStore {
   readonly updates = new Map<string, SpecUpdateRecord[]>();
   readonly snapshots = new Map<string, SpecSnapshotRecord>();
   readonly wakes = new Set<(specId: string) => void>();
+  readonly reconnects = new Set<() => void>();
   readonly tailReads: string[] = [];
   dropNotifications = false;
   compactions = 0;
@@ -106,11 +107,20 @@ class MemoryDocumentStore implements SpecDocumentStore {
     return true;
   }
 
-  async listen(onWake: (specId: string) => void): Promise<() => Promise<void>> {
+  async listen(
+    onWake: (specId: string) => void,
+    onReconnect?: () => void,
+  ): Promise<() => Promise<void>> {
     this.wakes.add(onWake);
+    if (onReconnect) this.reconnects.add(onReconnect);
     return async () => {
       this.wakes.delete(onWake);
+      if (onReconnect) this.reconnects.delete(onReconnect);
     };
+  }
+
+  reconnect(): void {
+    for (const reconnect of this.reconnects) reconnect();
   }
 }
 
@@ -335,7 +345,7 @@ describe("SpecDocumentService", () => {
     expect(renderMarkdown(proseMirrorDocument(reloaded.doc))).toContain("durable");
   });
 
-  test("peer notifications sync only documents in the local working set", async () => {
+  test("peer notifications and reconnects sync only the local working set", async () => {
     const ignoredSpecId = "00000000-0000-4000-8000-000000000109";
     const store = new MemoryDocumentStore();
     const service = new SpecDocumentService(store);
@@ -351,6 +361,12 @@ describe("SpecDocumentService", () => {
 
     await store.notifyUpdate(SPEC_ID);
     await waitFor(() => store.tailReads.includes(SPEC_ID));
+
+    store.tailReads.length = 0;
+    store.reconnect();
+    await waitFor(() => store.tailReads.length > 0);
+    expect(store.tailReads).toContain(SPEC_ID);
+    expect(store.tailReads).not.toContain(ignoredSpecId);
     await service.stopPeerSync();
   });
 

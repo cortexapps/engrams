@@ -1,5 +1,7 @@
 import { and, eq, isNull, or } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
+import * as decoding from "lib0/decoding";
+import * as encoding from "lib0/encoding";
 
 import * as schema from "../db/schema.ts";
 import { specParticipant } from "../db/schema.ts";
@@ -9,22 +11,14 @@ import {
   parseSpecChannelEnvelope,
   SPEC_UPDATE_CHANNEL,
 } from "./doc-service.ts";
-
-interface AwarenessClient {
-  on(
-    event: "notification",
-    listener: (message: { channel: string; payload?: string }) => void,
-  ): void;
-  off(
-    event: "notification",
-    listener: (message: { channel: string; payload?: string }) => void,
-  ): void;
-  query(queryText: string): Promise<unknown>;
-  release(): void;
-}
+import {
+  listenForSpecChannel,
+  type SpecChannelClient,
+  type SpecChannelListenerOptions,
+} from "./channel-listener.ts";
 
 interface AwarenessPool {
-  connect(): Promise<AwarenessClient>;
+  connect(): Promise<SpecChannelClient>;
   query(queryText: string, values: unknown[]): Promise<unknown>;
 }
 
@@ -60,50 +54,59 @@ export class PostgresSpecParticipantStore implements SpecParticipantStore {
 
 /** Relay ephemeral awareness on the durable update channel without storing it. */
 export class PostgresSpecAwarenessBus implements SpecAwarenessBus {
-  private client: AwarenessClient | null = null;
+  private stopListening: (() => Promise<void>) | null = null;
 
-  constructor(private readonly pool: AwarenessPool) {}
+  constructor(
+    private readonly pool: AwarenessPool,
+    private readonly listenerOptions: SpecChannelListenerOptions = {},
+  ) {}
 
   async start(handlers: {
     update(specId: string, update: Uint8Array): void;
     query(specId: string): void;
+    reconnect?(): void;
   }): Promise<() => Promise<void>> {
-    if (this.client) throw new Error("The spec awareness bus is already started");
-    const client = await this.pool.connect();
-    const onNotification = (message: { channel: string; payload?: string }) => {
-      if (message.channel !== SPEC_UPDATE_CHANNEL || !message.payload) return;
-      const envelope = parseSpecChannelEnvelope(message.payload);
-      if (envelope?.type === "awareness") {
-        const update = Buffer.from(envelope.update, "base64");
-        if (update.toString("base64") === envelope.update) handlers.update(envelope.specId, update);
-      } else if (envelope?.type === "awareness-query") {
-        handlers.query(envelope.specId);
-      }
-    };
-    try {
-      client.on("notification", onNotification);
-      await client.query(`LISTEN ${SPEC_UPDATE_CHANNEL}`);
-      this.client = client;
-    } catch (error) {
-      client.off("notification", onNotification);
-      client.release();
-      throw error;
-    }
+    if (this.stopListening) throw new Error("The spec awareness bus is already started");
+    const stop = await listenForSpecChannel(
+      this.pool,
+      SPEC_UPDATE_CHANNEL,
+      (message) => {
+        if (message.channel !== SPEC_UPDATE_CHANNEL || !message.payload) return;
+        const envelope = parseSpecChannelEnvelope(message.payload);
+        if (envelope?.type === "awareness") {
+          const update = Buffer.from(envelope.update, "base64");
+          if (update.toString("base64") === envelope.update) {
+            handlers.update(envelope.specId, update);
+          }
+        } else if (envelope?.type === "awareness-query") {
+          handlers.query(envelope.specId);
+        }
+      },
+      {
+        ...this.listenerOptions,
+        label: this.listenerOptions.label ?? "Spec awareness listener",
+        onReconnect: () => {
+          handlers.reconnect?.();
+          this.listenerOptions.onReconnect?.();
+        },
+      },
+    );
+    this.stopListening = stop;
     return async () => {
-      if (this.client !== client) return;
-      this.client = null;
-      client.off("notification", onNotification);
-      await client.query(`UNLISTEN ${SPEC_UPDATE_CHANNEL}`).catch(() => {});
-      client.release();
+      if (this.stopListening !== stop) return;
+      this.stopListening = null;
+      await stop();
     };
   }
 
   async publish(specId: string, update: Uint8Array): Promise<void> {
-    await this.notify({
-      type: "awareness",
-      specId,
-      update: Buffer.from(update).toString("base64"),
-    });
+    for (const chunk of chunkAwarenessUpdate(specId, update)) {
+      await this.notify({
+        type: "awareness",
+        specId,
+        update: Buffer.from(chunk).toString("base64"),
+      });
+    }
   }
 
   async query(specId: string): Promise<void> {
@@ -117,5 +120,72 @@ export class PostgresSpecAwarenessBus implements SpecAwarenessBus {
   ): Promise<void> {
     const payload = encodeSpecChannelEnvelope(envelope);
     await this.pool.query("SELECT pg_notify($1, $2)", [SPEC_UPDATE_CHANNEL, payload]);
+  }
+}
+
+interface AwarenessRecord {
+  clientId: number;
+  clock: number;
+  state: string;
+}
+
+/** Split an aggregate awareness update into PostgreSQL-safe envelopes. */
+export function chunkAwarenessUpdate(specId: string, update: Uint8Array): Uint8Array[] {
+  const decoder = decoding.createDecoder(update);
+  const count = decoding.readVarUint(decoder);
+  const records: AwarenessRecord[] = [];
+  for (let index = 0; index < count; index += 1) {
+    records.push({
+      clientId: decoding.readVarUint(decoder),
+      clock: decoding.readVarUint(decoder),
+      state: decoding.readVarString(decoder),
+    });
+  }
+  if (decoding.hasContent(decoder)) throw new Error("The awareness update has trailing bytes");
+  if (records.length === 0) return [update];
+
+  const chunks: Uint8Array[] = [];
+  let current: AwarenessRecord[] = [];
+  for (const record of records) {
+    const candidate = encodeAwarenessRecords([...current, record]);
+    if (fitsAwarenessEnvelope(specId, candidate)) {
+      current.push(record);
+      continue;
+    }
+    if (current.length === 0) {
+      throw new Error("One awareness state is too large for the PostgreSQL channel");
+    }
+    chunks.push(encodeAwarenessRecords(current));
+    current = [record];
+    const single = encodeAwarenessRecords(current);
+    if (!fitsAwarenessEnvelope(specId, single)) {
+      throw new Error("One awareness state is too large for the PostgreSQL channel");
+    }
+  }
+  if (current.length > 0) chunks.push(encodeAwarenessRecords(current));
+  return chunks;
+}
+
+function encodeAwarenessRecords(records: AwarenessRecord[]): Uint8Array {
+  const encoder = encoding.createEncoder();
+  encoding.writeVarUint(encoder, records.length);
+  for (const record of records) {
+    encoding.writeVarUint(encoder, record.clientId);
+    encoding.writeVarUint(encoder, record.clock);
+    encoding.writeVarString(encoder, record.state);
+  }
+  return encoding.toUint8Array(encoder);
+}
+
+function fitsAwarenessEnvelope(specId: string, update: Uint8Array): boolean {
+  try {
+    encodeSpecChannelEnvelope({
+      type: "awareness",
+      specId,
+      update: Buffer.from(update).toString("base64"),
+    });
+    return true;
+  } catch {
+    return false;
   }
 }

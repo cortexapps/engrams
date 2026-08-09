@@ -91,16 +91,19 @@ import { makeGithubReviewPoster } from "./reviews/github-review.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
 
 const app = new Hono();
-const specDocuments = new SpecDocumentService(new PostgresSpecDocumentStore(getPool()), {
-  onWarning: (message) => log.warn({ message }, "spec document warning"),
-});
+const warnSpecDocument = (message: string) => log.warn({ message }, "spec document warning");
+const specDocuments = new SpecDocumentService(
+  new PostgresSpecDocumentStore(getPool(), { onWarning: warnSpecDocument }),
+  { onWarning: warnSpecDocument, now: () => new Date() },
+);
 const specParticipants = new PostgresSpecParticipantStore(getDb());
-const specAwarenessBus = new PostgresSpecAwarenessBus(getPool());
+const warnSpecSync = (message: string) => log.warn({ message }, "spec sync warning");
+const specAwarenessBus = new PostgresSpecAwarenessBus(getPool(), { onWarning: warnSpecSync });
 const specSyncHub = new SpecSyncHub({
   documents: specDocuments,
   participants: specParticipants,
   awarenessBus: specAwarenessBus,
-  onWarning: (message) => log.warn({ message }, "spec sync warning"),
+  onWarning: warnSpecSync,
 });
 setSpecPresence(specSyncHub);
 
