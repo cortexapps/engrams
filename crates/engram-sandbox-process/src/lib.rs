@@ -89,6 +89,10 @@ async fn hash_file(path: &Path) -> std::io::Result<(u64, String)> {
 /// command from a normal nonzero exit.
 const EXIT_CODE_TIMEOUT: i32 = 124;
 
+/// Reserved image workdir key consumed by agentd in VM backends. ProcessBackend
+/// bypasses agentd and must apply the same contract before it spawns a harness.
+const HARNESS_CWD_ENV: &str = "ENGRAM_HARNESS_CWD";
+
 /// Match the guest journal's per-stream retention bound. Live consumers
 /// continue receiving bytes beyond this point, but later attaches can only
 /// replay the retained prefix.
@@ -249,6 +253,13 @@ pub struct ProcessBackend {
     agent_children: DashMap<SandboxId, std::sync::Mutex<Option<tokio::process::Child>>>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct ProcessImage {
+    image_uri: String,
+    manifest_digest: String,
+    rootfs: PathBuf,
+}
+
 impl ProcessBackend {
     pub fn new(work_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -271,6 +282,50 @@ impl ProcessBackend {
         self.work_dir
             .join("snapshots")
             .join(snapshot_id.to_string())
+    }
+
+    /// The unpacked bundle catalog that the dev ProcessBackend can mount.
+    ///
+    /// `just bundles-process` writes `var/bundles/current.json` as the
+    /// ProcessBackend equivalent of a fleet host's squashfs stamp. The
+    /// coordinator reports these refs on its synthetic in-process host so
+    /// built-in harness and selected-skill resolution use the same catalog
+    /// path as a real host.
+    pub fn current_bundles() -> Vec<engram_core::types::sandbox::AuxBundleRef> {
+        let stamp = process_bundle_root().join("current.json");
+        let Ok(bytes) = std::fs::read(&stamp) else {
+            return Vec::new();
+        };
+        let Ok(entries) =
+            serde_json::from_slice::<std::collections::BTreeMap<String, String>>(&bytes)
+        else {
+            tracing::warn!(path = %stamp.display(), "ProcessBackend bundle stamp is invalid JSON");
+            return Vec::new();
+        };
+        entries
+            .into_iter()
+            .map(
+                |(drive_id, sha256)| engram_core::types::sandbox::AuxBundleRef { drive_id, sha256 },
+            )
+            .collect()
+    }
+
+    /// Image digests that this dev backend can serve from local directories.
+    ///
+    /// Production hosts advertise OCI images that they materialized into the
+    /// chunk store. ProcessBackend has no guest disk, so an embedding dev
+    /// environment may provide an `ENGRAM_PROCESS_IMAGE_CATALOG` JSON file
+    /// that maps the same app-visible image URI and digest to a local rootfs
+    /// directory. The coordinator can then use its normal image placement and
+    /// base-restore flow while this backend implements the restore as a copy.
+    pub fn ready_images() -> Vec<String> {
+        let mut digests = process_images()
+            .into_iter()
+            .map(|image| image.manifest_digest)
+            .collect::<Vec<_>>();
+        digests.sort_unstable();
+        digests.dedup();
+        digests
     }
 }
 
@@ -296,7 +351,7 @@ impl SandboxBackend for ProcessBackend {
         // at a host-local unpacked bundle dir. agentd's activation step (run
         // in `start_agent` below) then wires skills from these the same
         // way the FC guest does.
-        stage_aux_bundles(&cwd).await;
+        stage_aux_bundles(&cwd, &spec.aux_ro_drives).await;
         self.sandboxes.insert(id, SandboxState::new(spec, cwd));
         Ok(id)
     }
@@ -433,7 +488,7 @@ impl SandboxBackend for ProcessBackend {
                         SandboxError::InvalidSpec("argv must not be empty".into())
                     })?;
                 let workdir = match req.workdir.as_ref() {
-                    Some(rel) => state.cwd.join(rel),
+                    Some(path) => process_guest_path(&state.cwd, Path::new(path)),
                     None => state.cwd.clone(),
                 };
 
@@ -546,12 +601,14 @@ impl SandboxBackend for ProcessBackend {
                 "file exceeds {MAX_SESSION_FILE_BYTES} bytes"
             )));
         }
-        let _state = self
+        let state = self
             .sandboxes
             .get(&id)
             .ok_or(SandboxError::NotFound)?
             .clone();
-        let destination = PathBuf::from(&spec.path);
+        // Session file paths are guest-absolute. Resolve them inside this
+        // sandbox's emulated guest root, as exec and harness workdirs do.
+        let destination = process_guest_path(&state.cwd, Path::new(&spec.path));
         if let Ok((size_bytes, sha256)) = hash_file(&destination).await {
             if size_bytes == spec.size_bytes && sha256 == spec.sha256 {
                 return Ok(SessionFileMetadata {
@@ -655,12 +712,12 @@ impl SandboxBackend for ProcessBackend {
         id: SandboxId,
         path: String,
     ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
-        let _state = self
+        let state = self
             .sandboxes
             .get(&id)
             .ok_or(SandboxError::NotFound)?
             .clone();
-        let source = PathBuf::from(&path);
+        let source = process_guest_path(&state.cwd, Path::new(&path));
         let (size_bytes, sha256) = hash_file(&source)
             .await
             .map_err(|error| SandboxError::Vm(format!("read upload metadata: {error}").into()))?;
@@ -853,11 +910,10 @@ impl SandboxBackend for ProcessBackend {
         .map_err(|e| SandboxError::Snapshot(format!("restore tar join: {e}")))?
         .map_err(|e| SandboxError::Snapshot(format!("restore tar: {e}")))?;
 
-        // ADR 0027 dev parity: re-stage the bundle symlinks under the NEW
-        // cwd. The untarred tree may carry symlinks pointing at the old
-        // cwd (now stale); restaging repoints them at the current host
-        // bundle dirs so the resumed harness's skills resolve.
-        stage_aux_bundles(&cwd).await;
+        // A session snapshot carries its selected dyn-slot symlinks. Their
+        // targets are the stable, absolute Process bundle-tree paths, so leave
+        // them intact. Fresh image restores use `restore_base_for_session`,
+        // which stages the selected mounts from the current catalog below.
 
         // Synthesize a SandboxSpec from the manifest. We don't carry
         // CPU/memory/etc. through the snapshot — the next launch is a
@@ -877,6 +933,45 @@ impl SandboxBackend for ProcessBackend {
             workdir: None,
             network: Default::default(),
             aux_ro_drives: Vec::new(),
+            swap_mib: None,
+        };
+        self.sandboxes.insert(id, SandboxState::new(spec, cwd));
+        Ok(id)
+    }
+
+    async fn restore_base_for_session(
+        &self,
+        metadata: SnapshotMetadata,
+        session_env: HashMap<String, String>,
+        selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
+    ) -> Result<SandboxId, SandboxError> {
+        // Process mode has no captured guest memory or chunked root disk. It
+        // emulates the common base-restore contract by copying the configured
+        // local image directory into a fresh per-session root. This keeps the
+        // app and coordinator on their normal image/profile/session path while
+        // the dev-only backend uses a different substrate underneath.
+        let id = SandboxId::new();
+        let cwd = self.cwd_for(id);
+        tokio::fs::create_dir_all(&cwd).await?;
+        if let Some(image) = process_image(&metadata.image_version)? {
+            materialize_rootfs(&image.rootfs, &cwd)
+                .await
+                .map_err(|e| SandboxError::Vm(format!("materialize Process image: {e}").into()))?;
+        }
+        stage_aux_bundles(&cwd, &selected_mounts).await;
+        let spec = SandboxSpec {
+            image: metadata.image_version,
+            rootfs_source: None,
+            image_uri: None,
+            rootfs_manifest: None,
+            cpu: engram_core::types::sandbox::CpuLimit { vcpus: 1 },
+            memory: engram_core::types::sandbox::MemoryLimit { max_mib: 0 },
+            disk: engram_core::types::sandbox::DiskLimit { max_gib: 0 },
+            ttl: None,
+            env: session_env,
+            workdir: None,
+            network: Default::default(),
+            aux_ro_drives: selected_mounts,
             swap_mib: None,
         };
         self.sandboxes.insert(id, SandboxState::new(spec, cwd));
@@ -967,6 +1062,13 @@ async fn spawn_agent(
 
     let mut env = sandbox_env.clone();
     env.extend(agent.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    // agentd consumes this reserved value and starts the harness in the
+    // guest path. ProcessBackend bypasses agentd, so translate it into the
+    // corresponding host path and do not leak the reserved key to the child.
+    let harness_cwd = env
+        .remove(HARNESS_CWD_ENV)
+        .map(|path| process_guest_path(cwd, Path::new(&path)))
+        .unwrap_or_else(|| cwd.to_path_buf());
     if !env.contains_key("PATH") {
         if let Ok(p) = std::env::var("PATH") {
             env.insert("PATH".into(), p);
@@ -1003,9 +1105,16 @@ async fn spawn_agent(
         _ => {}
     }
 
-    let mut cmd = Command::new(argv0);
+    // The coordinator always emits the guest-absolute harness path
+    // (`/opt/engram/dyn/0/harness`). Process mode roots that path under the
+    // per-sandbox cwd, so translate it before spawning the host subprocess.
+    let rooted_argv0 = argv0
+        .strip_prefix('/')
+        .map(|relative| cwd.join(relative))
+        .filter(|candidate| candidate.exists());
+    let mut cmd = Command::new(rooted_argv0.as_deref().unwrap_or_else(|| Path::new(argv0)));
     cmd.args(agent.argv.iter().skip(1))
-        .current_dir(cwd)
+        .current_dir(harness_cwd)
         .env_clear()
         .envs(env_iter(&env))
         .stdin(Stdio::null())
@@ -1031,32 +1140,29 @@ fn env_iter<'a>(env: &'a HashMap<String, String>) -> impl Iterator<Item = (&'a s
     env.iter().map(|(k, v)| (k.as_str(), v.as_str()))
 }
 
-/// ADR 0027 dev parity. Symlink each bundle's guest mount (relative to the
-/// materialized `cwd`) at a host-local unpacked bundle dir, so
-/// `engram_session_bundles::activate(cwd, ..)` finds the bundle there.
-/// `just bundles` populates the defaults; override per drive via
-/// `ENGRAM_<DRIVE_ID>_BUNDLE_DIR`.
-///
-/// ADR 0055 dev parity for the built-in skill bundles. Production FC reserves
-/// `dyn-*` slots and `patch_drive`s the selected skills in; the non-isolated
-/// dev backend has no drives, so it symlinks each available bundle tree (under
-/// `var/bundles/<name>`, populated by `just bundles`, or the
-/// `ENGRAM_<NAME>_BUNDLE_DIR` override) at its guest mount so
-/// `engram_session_bundles::activate(cwd, ..)` finds it. Spec-independent (the
-/// restore path synthesizes a spec without aux drives) so create and restore
-/// stage identically. The catalog-driven, per-session-selected dev staging
-/// lands with the rest of the ADR 0055 catalog; today it stages the known
-/// built-in bundles at their canonical guest mounts.
-async fn stage_aux_bundles(cwd: &Path) {
-    const DEV_BUNDLES: &[&str] = &["skills", "browser", "integrations-cli"];
-    // Sequential slot index, mirroring the production init-shim's
-    // /opt/engram/dyn/<i> mounting so the shared `activate()` finds the bundles.
-    // A skipped (absent) bundle doesn't consume an index.
-    let mut i = 0usize;
-    for name in DEV_BUNDLES {
-        let Some(host_dir) = bundle_host_dir(name) else {
+/// ADR 0027/0055 dev parity. Symlink each coordinator-resolved bundle at its
+/// assigned guest dyn slot. `just bundles-process` writes the logical-name to
+/// content-id stamp and unpacked trees under the same root. Resolving by the
+/// selected mount's content id preserves slot 0 for the chosen harness and
+/// slots 3+ for only the profile-selected skills.
+async fn stage_aux_bundles(
+    cwd: &Path,
+    selected_mounts: &[engram_core::types::sandbox::AuxRoDrive],
+) {
+    let catalog = ProcessBackend::current_bundles();
+    for mount in selected_mounts {
+        let Some(sha256) = mount.sha256.as_deref() else {
             continue;
         };
+        let Some(name) = catalog
+            .iter()
+            .find(|entry| entry.sha256 == sha256)
+            .map(|entry| entry.drive_id.as_str())
+        else {
+            tracing::debug!(%sha256, drive_id = %mount.drive_id, "ProcessBackend bundle is absent from current.json");
+            continue;
+        };
+        let host_dir = bundle_host_dir(name);
         if !host_dir.exists() {
             tracing::debug!(
                 bundle = %name,
@@ -1065,7 +1171,11 @@ async fn stage_aux_bundles(cwd: &Path) {
             );
             continue;
         }
-        let link = cwd.join(format!("opt/engram/dyn/{i}"));
+        let Ok(guest_mount) = mount.guest_mount.strip_prefix("/") else {
+            tracing::debug!(bundle = %name, path = %mount.guest_mount.display(), "ProcessBackend bundle mount is not guest-absolute");
+            continue;
+        };
+        let link = cwd.join(guest_mount);
         if let Some(parent) = link.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -1073,19 +1183,70 @@ async fn stage_aux_bundles(cwd: &Path) {
         if let Err(e) = tokio::fs::symlink(&host_dir, &link).await {
             tracing::debug!(bundle = %name, error = %e, "ADR 0055 dev: bundle symlink failed");
         }
-        i += 1;
     }
 }
 
-/// Resolve the host-local unpacked bundle dir for a dev aux drive:
-/// `ENGRAM_<DRIVE_ID>_BUNDLE_DIR` if set, else `var/bundles/<drive_id>`
-/// relative to the process cwd (the repo root under `just dev`).
-fn bundle_host_dir(drive_id: &str) -> Option<PathBuf> {
+fn process_bundle_root() -> PathBuf {
+    std::env::var_os("ENGRAM_BUNDLE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("var/bundles"))
+}
+
+fn process_images() -> Vec<ProcessImage> {
+    let Some(path) = std::env::var_os("ENGRAM_PROCESS_IMAGE_CATALOG").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        tracing::warn!(path = %path.display(), "ProcessBackend image catalog is unreadable");
+        return Vec::new();
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(images) => images,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "ProcessBackend image catalog is invalid JSON");
+            Vec::new()
+        }
+    }
+}
+
+fn process_image(image_uri: &str) -> Result<Option<ProcessImage>, SandboxError> {
+    let catalog_configured = std::env::var_os("ENGRAM_PROCESS_IMAGE_CATALOG").is_some();
+    let image = process_images()
+        .into_iter()
+        .find(|image| image.image_uri == image_uri);
+    if let Some(image) = &image {
+        if !image.rootfs.is_dir() {
+            return Err(SandboxError::InvalidSpec(format!(
+                "Process image `{image_uri}` rootfs is not a directory: {}",
+                image.rootfs.display()
+            )));
+        }
+    } else if catalog_configured {
+        return Err(SandboxError::InvalidSpec(format!(
+            "Process image `{image_uri}` is absent from ENGRAM_PROCESS_IMAGE_CATALOG"
+        )));
+    }
+    Ok(image)
+}
+
+/// Resolve a guest path inside a Process sandbox root. `PathBuf::join` treats
+/// an absolute operand as host-absolute, which made image workdirs such as
+/// `/workspace` escape the emulated guest tree. Strip only the guest root;
+/// ProcessBackend remains explicitly unisolated and does not claim to enforce
+/// a security boundary against `..` or subprocess behavior.
+fn process_guest_path(cwd: &Path, guest_path: &Path) -> PathBuf {
+    cwd.join(guest_path.strip_prefix("/").unwrap_or(guest_path))
+}
+
+/// Resolve the host-local unpacked bundle dir for a dev bundle. A per-bundle
+/// override remains useful for focused tests; normal Tilt runs use
+/// `ENGRAM_BUNDLE_DIR/<logical-name>`.
+fn bundle_host_dir(drive_id: &str) -> PathBuf {
     let key = format!("ENGRAM_{}_BUNDLE_DIR", drive_id.to_uppercase());
     if let Ok(p) = std::env::var(&key) {
-        return Some(PathBuf::from(p));
+        return PathBuf::from(p);
     }
-    Some(PathBuf::from("var/bundles").join(drive_id))
+    process_bundle_root().join(drive_id)
 }
 
 /// Copy the contents of `src` into the (already-empty) `dst` directory.
@@ -1666,11 +1827,15 @@ mod tests {
     async fn session_file_upload_is_atomic_idempotent_and_streamed() {
         use futures::{stream, StreamExt};
 
-        let (backend, _dir) = backend();
+        let (backend, dir) = backend();
         let sandbox_id = backend.create(spec()).await.unwrap();
         let upload_id = uuid::Uuid::new_v4();
         let root = PathBuf::from(format!("/tmp/uploads/{upload_id}"));
         let path = root.join("process.bin");
+        let materialized_path = dir.path().join(sandbox_id.to_string()).join(
+            path.strip_prefix("/")
+                .expect("session file path is guest-absolute"),
+        );
         let path_string = path.to_string_lossy().into_owned();
         let bytes = Bytes::from_static(b"streamed-process-file");
         let digest = digest_hex(Sha256::digest(&bytes));
@@ -1708,7 +1873,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                tokio::fs::metadata(&path)
+                tokio::fs::metadata(&materialized_path)
                     .await
                     .unwrap()
                     .permissions()
@@ -1732,8 +1897,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(conflict, SandboxError::InvalidSpec(_)));
-        assert_eq!(tokio::fs::read(&path).await.unwrap(), bytes);
-        let _ = tokio::fs::remove_dir_all(root).await;
+        assert_eq!(tokio::fs::read(&materialized_path).await.unwrap(), bytes);
     }
 
     #[tokio::test]

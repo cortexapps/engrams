@@ -690,6 +690,13 @@ bundles: dev-link-shared
     deploy/bundles/ide/build.sh --stage var/bundles/ide \
         || echo "ide bundle skipped (needs Docker) — dev sessions get no IDE"
 
+# Stage the host-native built-in harnesses plus the core skills bundle for the
+# Linux ProcessBackend. This is the inner `just dev` path in dev-engrams: no
+# squashfs mount exists, so the backend symlinks these unpacked trees into each
+# selected dyn slot. The script caches the large upstream CLI payloads.
+bundles-process: dev-link-shared
+    bash deploy/dev/stage-process-bundles.sh
+
 # ADR 0035/0055: build + stage the squashfs bundles CONTENT-ADDRESSED
 # (<sha256>.squashfs + current.json stamp) under var/shared/, the
 # dev mirror of the FC-host image's /var/lib/engram/shared. Run the

@@ -491,9 +491,12 @@ async fn main() -> Result<(), CoordinatorError> {
             "⚠️  DEV-ONLY ProcessBackend: sessions run as un-isolated host subprocesses \
              (ADR 0023). NEVER use with untrusted input or in production."
         );
-        let local_backend: Arc<dyn SandboxBackend> = Arc::new(
-            engram_sandbox_process::ProcessBackend::new(cli.sandbox_work_dir.clone()),
-        );
+        let process_backend = Arc::new(engram_sandbox_process::ProcessBackend::new(
+            cli.sandbox_work_dir.clone(),
+        ));
+        let local_backend: Arc<dyn SandboxBackend> = process_backend.clone();
+        let process_current_bundles = engram_sandbox_process::ProcessBackend::current_bundles();
+        let process_ready_images = engram_sandbox_process::ProcessBackend::ready_images();
         // Use a stable HostId for `--mode=all` so a coordinator
         // restart picks up the same `hosts` row (FK-safe — sessions
         // / snapshots inserted in a prior run still reference a valid
@@ -531,8 +534,8 @@ async fn main() -> Result<(), CoordinatorError> {
             status: engram_core::types::host::HostStatus::Ready,
             last_heartbeat_at: clock.now_utc(),
             host_addr: None,
-            ready_images: Vec::new(),
-            current_bundles: Vec::new(),
+            ready_images: process_ready_images.clone(),
+            current_bundles: process_current_bundles,
             cordoned: false,
             total_vcpus: 0,
             // Issue #229: the in-process host runs this very binary, so it
@@ -557,6 +560,7 @@ async fn main() -> Result<(), CoordinatorError> {
         // this; --mode=all stamps the timestamp directly.
         let pg_for_hb = pg.clone();
         let clock_for_hb = clock.clone();
+        let ready_images_for_hb = process_ready_images;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -577,8 +581,8 @@ async fn main() -> Result<(), CoordinatorError> {
                     status: engram_core::types::host::HostStatus::Ready,
                     last_heartbeat_at: clock_for_hb.now_utc(),
                     host_addr: None,
-                    ready_images: Vec::new(),
-                    current_bundles: Vec::new(),
+                    ready_images: ready_images_for_hb.clone(),
+                    current_bundles: engram_sandbox_process::ProcessBackend::current_bundles(),
                     cordoned: false,
                     total_vcpus: 0,
                     wire_version: engram_protocol::WIRE_VERSION,
