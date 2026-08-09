@@ -80,6 +80,7 @@ import { makeConnectorStore } from "./db/connectors.ts";
 import { loadRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
 import { renderReviewer } from "./reviewers/render.ts";
+import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
 import {
@@ -131,6 +132,7 @@ app.route("/", makeOidcKeyAdminRoute());
 // ADR 0051 Task 20: browser-native HTTP legs (SSE events, artifact bytes, /me/harness-env).
 app.route("/", eventsRoute);
 app.route("/", artifactsRoute);
+app.route("/", makeSessionFilesRoute());
 // ADR 0064 P2a: live-host port-exposure registry (CRUD). The edge reverse-proxy
 // that serves the minted slugs lands in P2b.
 app.route("/", portsRoute);

@@ -1,9 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import type {
-  PapercutInput,
-  PapercutStore,
-} from "../../db/papercuts.ts";
+import type { PapercutInput, PapercutStore } from "../../db/papercuts.ts";
 import { registerBuiltinTools } from "../builtin.ts";
 import { compileToolManifest } from "../manifest.ts";
 import { createToolRegistry } from "../registry.ts";
@@ -13,9 +10,7 @@ function papercutRecorder(): { store: PapercutStore; inserted: PapercutInput[] }
   const idsByToolCall = new Map<string, string>();
   const store: PapercutStore = {
     async insert(row) {
-      const key = row.toolCallId == null
-        ? null
-        : `${row.sessionId}:${row.toolCallId}`;
+      const key = row.toolCallId == null ? null : `${row.sessionId}:${row.toolCallId}`;
       const existing = key == null ? undefined : idsByToolCall.get(key);
       if (existing) return existing;
 
@@ -56,20 +51,26 @@ describe("built-in tools", () => {
       },
     });
     expect(tool!.nativeBindings?.claude).toBeUndefined();
-    expect(tool!.input.parse({
-      questions: [{
-        question: "Deploy now?",
-        header: "Deploy",
-        multiSelect: false,
-        options: [{ label: "Yes", description: "Deploy it" }],
-      }],
-    })).toEqual({
-      questions: [{
-        question: "Deploy now?",
-        header: "Deploy",
-        multiSelect: false,
-        options: [{ label: "Yes", description: "Deploy it" }],
-      }],
+    expect(
+      tool!.input.parse({
+        questions: [
+          {
+            question: "Deploy now?",
+            header: "Deploy",
+            multiSelect: false,
+            options: [{ label: "Yes", description: "Deploy it" }],
+          },
+        ],
+      }),
+    ).toEqual({
+      questions: [
+        {
+          question: "Deploy now?",
+          header: "Deploy",
+          multiSelect: false,
+          options: [{ label: "Yes", description: "Deploy it" }],
+        },
+      ],
     });
     expect(tool!.output.parse({ "Deploy now?": ["Yes"] })).toEqual({
       "Deploy now?": ["Yes"],
@@ -99,8 +100,10 @@ describe("built-in tools", () => {
     expect(tool!.output.parse({ decision: "approve" })).toEqual({
       decision: "approve",
     });
-    expect(tool!.output.parse({ decision: "reject", feedback: "Cover tests." }))
-      .toEqual({ decision: "reject", feedback: "Cover tests." });
+    expect(tool!.output.parse({ decision: "reject", feedback: "Cover tests." })).toEqual({
+      decision: "reject",
+      feedback: "Cover tests.",
+    });
     expect(() => tool!.output.parse({ decision: "maybe" })).toThrow();
     expect(() => tool!.input.parse({})).toThrow();
   });
@@ -115,6 +118,13 @@ describe("built-in tools", () => {
       "exit_plan_mode",
       "Artifact",
       "papercut",
+      "spawn_session",
+      "send_session_message",
+      "read_session",
+      "interrupt_session",
+      "terminate_session",
+      "list_sessions",
+      "wait_sessions",
     ]);
     expect(manifest[0]).toEqual({
       name: "ask_user_question",
@@ -177,6 +187,63 @@ describe("built-in tools", () => {
     }
   });
 
+  test("coordination schemas enforce names, guest paths, cursors, and wait limits", () => {
+    const registry = createToolRegistry();
+    registerBuiltinTools(registry);
+
+    const spawn = registry.get("spawn_session")!;
+    const read = registry.get("read_session")!;
+    const wait = registry.get("wait_sessions")!;
+    const path = "/tmp/uploads/019fe2ff-0464-75f3-bb20-a8c1844579b9/design-notes.pdf";
+
+    expect(
+      spawn.input.parse({
+        task_name: "api-tests",
+        message: `Review ${path}`,
+        idempotency_key: "spawn-1",
+        file_paths: [path],
+      }),
+    ).toMatchObject({ task_name: "api-tests", file_paths: [path] });
+    expect(
+      spawn.input.parse({
+        task_name: "map-1",
+        message: "Sum the numbers",
+        idempotency_key: "spawn-map-1",
+        file_paths: ["/tmp/numbers.txt", "/workspace/map input.txt"],
+      }),
+    ).toMatchObject({ file_paths: ["/tmp/numbers.txt", "/workspace/map input.txt"] });
+    expect(() =>
+      spawn.input.parse({
+        task_name: "../sibling",
+        message: "escape",
+        idempotency_key: "spawn-2",
+      }),
+    ).toThrow();
+    expect(() =>
+      spawn.input.parse({
+        task_name: "safe",
+        message: "escape",
+        idempotency_key: "spawn-3",
+        file_paths: ["/tmp/../secret"],
+      }),
+    ).toThrow();
+    expect(() =>
+      spawn.input.parse({
+        task_name: "safe",
+        message: "relative",
+        idempotency_key: "spawn-4",
+        file_paths: ["tmp/numbers.txt"],
+      }),
+    ).toThrow();
+    expect(
+      read.input.parse({
+        session_id: "019fe2ff-0464-75f3-bb20-a8c1844579b9",
+        after_cursor: "-1",
+      }),
+    ).toMatchObject({ after_cursor: "-1" });
+    expect(() => wait.input.parse({ timeout_ms: 120_001 })).toThrow();
+  });
+
   test("papercut is included for a profile with zero capabilities", () => {
     const registry = createToolRegistry();
     registerBuiltinTools(registry);
@@ -187,6 +254,13 @@ describe("built-in tools", () => {
       "exit_plan_mode",
       "Artifact",
       "papercut",
+      "spawn_session",
+      "send_session_message",
+      "read_session",
+      "interrupt_session",
+      "terminate_session",
+      "list_sessions",
+      "wait_sessions",
     ]);
     expect(manifest.find((tool) => tool.name === "papercut")).toMatchObject({
       execution: "sync",
@@ -222,17 +296,19 @@ describe("built-in tools", () => {
 
     expect(first).toEqual({ logged: true, id: "papercut-1" });
     expect(replay).toEqual(first);
-    expect(papercuts.inserted).toEqual([{
-      summary: "Command output was unclear",
-      description: "The error omitted the failing file; a path would have helped.",
-      category: "tooling",
-      severity: "medium",
-      tags: ["errors", "cli"],
-      sessionId: "session-1",
-      toolCallId: "call-1",
-      taskId: "task-1",
-      profileId: "profile-1",
-      userId: "user-1",
-    }]);
+    expect(papercuts.inserted).toEqual([
+      {
+        summary: "Command output was unclear",
+        description: "The error omitted the failing file; a path would have helped.",
+        category: "tooling",
+        severity: "medium",
+        tags: ["errors", "cli"],
+        sessionId: "session-1",
+        toolCallId: "call-1",
+        taskId: "task-1",
+        profileId: "profile-1",
+        userId: "user-1",
+      },
+    ]);
   });
 });

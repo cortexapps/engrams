@@ -204,16 +204,23 @@ interface FakeSessionOptions {
   writeFailure?: string;
 }
 
+interface RecordedFileWrite {
+  sessionId: string;
+  path: string;
+  content: Uint8Array;
+  mode?: number;
+}
+
 function fakeSessions(options: FakeSessionOptions = {}): ReviewSessionsClient & {
   execCalls: Array<Parameters<ReviewSessionsClient["exec"]>[0]>;
   cancelCalls: Array<Parameters<ReviewSessionsClient["cancelExec"]>[0]>;
-  writeCalls: Array<Parameters<ReviewSessionsClient["writeFiles"]>[0]>;
+  writeCalls: RecordedFileWrite[];
   promptCalls: Array<Parameters<ReviewSessionsClient["sendPrompt"]>[0]>;
   deletedIds: string[];
 } {
   const execCalls: Array<Parameters<ReviewSessionsClient["exec"]>[0]> = [];
   const cancelCalls: Array<Parameters<ReviewSessionsClient["cancelExec"]>[0]> = [];
-  const writeCalls: Array<Parameters<ReviewSessionsClient["writeFiles"]>[0]> = [];
+  const writeCalls: RecordedFileWrite[] = [];
   const promptCalls: Array<Parameters<ReviewSessionsClient["sendPrompt"]>[0]> = [];
   const deletedIds: string[] = [];
   return {
@@ -252,17 +259,36 @@ function fakeSessions(options: FakeSessionOptions = {}): ReviewSessionsClient & 
       cancelCalls.push(req);
       return {};
     },
-    async writeFiles(req) {
-      writeCalls.push(req);
-      return {
-        results: req.files.map((file, index) => ({
-          path: file.path,
-          ok: options.writeFailure === undefined || index !== 0,
-          ...(options.writeFailure !== undefined && index === 0
-            ? { error: options.writeFailure }
-            : {}),
-        })),
-      };
+    async writeFile(input) {
+      let metadata: {
+        sessionId: string;
+        path: string;
+        sizeBytes: bigint;
+        sha256: string;
+        mode?: number;
+      } | undefined;
+      const chunks: Uint8Array[] = [];
+      for await (const item of input) {
+        if (item.frame.case === "metadata") metadata = item.frame.value;
+        else chunks.push(item.frame.value);
+      }
+      if (!metadata) throw new Error("missing file metadata");
+      const content = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0));
+      let offset = 0;
+      for (const chunk of chunks) {
+        content.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      writeCalls.push({
+        sessionId: metadata.sessionId,
+        path: metadata.path,
+        content,
+        mode: metadata.mode,
+      });
+      if (options.writeFailure !== undefined && writeCalls.length === 1) {
+        throw new Error(options.writeFailure);
+      }
+      return { path: metadata.path, sizeBytes: metadata.sizeBytes, sha256: metadata.sha256 };
     },
     async sendPrompt(req) {
       promptCalls.push(req);
@@ -731,13 +757,13 @@ describe("ReviewControlPlane", () => {
       stderrOffset: 0n,
       wake: true,
     }]);
-    expect(sessions.writeCalls).toHaveLength(1);
-    expect(sessions.writeCalls[0]?.files.map((file) => file.path)).toEqual([
+    expect(sessions.writeCalls).toHaveLength(2);
+    expect(sessions.writeCalls.map((file) => file.path)).toEqual([
       "/workspace/.review/finder.md",
       "/workspace/.review/lenses/functional-correctness.md",
     ]);
-    expect(sessions.writeCalls[0]?.files.every((file) => file.mode === 0o644)).toBe(true);
-    expect(new TextDecoder().decode(sessions.writeCalls[0]?.files[0]?.content)).toContain(
+    expect(sessions.writeCalls.every((file) => file.mode === 0o644)).toBe(true);
+    expect(new TextDecoder().decode(sessions.writeCalls[0]?.content)).toContain(
       "You are the finder",
     );
   });
@@ -804,7 +830,7 @@ describe("ReviewControlPlane", () => {
       stderrOffset: 0n,
       wake: true,
     });
-    const files = sessions.writeCalls[0]?.files ?? [];
+    const files = sessions.writeCalls;
     // The verifier gets the lens files too — it enforces each lens's
     // "Do not report" bar on the candidates.
     expect(files.map((file) => file.path)).toEqual([
@@ -892,7 +918,7 @@ describe("ReviewControlPlane", () => {
       enabledCategories: ["functional-correctness"],
     });
 
-    const files = sessions.writeCalls[0]?.files ?? [];
+    const files = sessions.writeCalls;
     expect(files.map((file) => file.path)).toEqual([
       "/workspace/.review/finder.md",
       "/workspace/.review/lenses/functional-correctness.md",
@@ -956,7 +982,7 @@ describe("ReviewControlPlane", () => {
       enabledCategories: ["functional-correctness"],
     });
 
-    const files = sessions.writeCalls[0]?.files ?? [];
+    const files = sessions.writeCalls;
     const staged = JSON.parse(new TextDecoder().decode(files.at(-1)?.content));
     expect(staged.prior_passes).toHaveLength(1);
     expect(staged.author_replies).toEqual([]);
@@ -973,7 +999,7 @@ describe("ReviewControlPlane", () => {
       enabledCategories: ["functional-correctness"],
     });
 
-    const paths = sessions.writeCalls[0]?.files.map((file) => file.path) ?? [];
+    const paths = sessions.writeCalls.map((file) => file.path);
     expect(paths).not.toContain("/workspace/.review/prior-findings.json");
   });
 

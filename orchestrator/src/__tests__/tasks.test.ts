@@ -727,6 +727,12 @@ function listTaskRow(
     harness: null,
     model: null,
     effort: null,
+    parentTaskId: null,
+    rootTaskId: id,
+    localTaskName: null,
+    canonicalTaskName: null,
+    spawningSessionId: null,
+    launchPolicy: null,
     createdAt: at,
     updatedAt: at,
   };
@@ -1500,6 +1506,49 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     expect(resp.task).toBeDefined();
     expect(resp.task!.id).toBe(createdTaskId);
     expect(resp.task!.sessions[0]!.sessionId).toBe(sessionId);
+  });
+
+  test.skipIf(!dbReachable)("GetTask → resolves the owning task by primary session", async () => {
+    const resp = await client.getTask({ sessionId });
+    expect(resp.task).toBeDefined();
+    expect(resp.task!.id).toBe(createdTaskId);
+    expect(resp.task!.sessions[0]!.sessionId).toBe(sessionId);
+  });
+
+  test.skipIf(!dbReachable)("GetTask → requires exactly one selector", async () => {
+    await expect(client.getTask({})).rejects.toMatchObject({ code: Code.InvalidArgument });
+    await expect(client.getTask({ taskId: createdTaskId, sessionId })).rejects.toMatchObject({
+      code: Code.InvalidArgument,
+    });
+  });
+
+  test.skipIf(!dbReachable)("GetTask → keeps a child task's immutable local name", async () => {
+    const childTaskId = `child-title-${Date.now()}`;
+    const childSessionId = `child-title-session-${Date.now()}`;
+    await db!.insert(taskTable).values({
+      id: childTaskId,
+      type: "subsession",
+      title: "api-tests",
+      suggestedTitle: "Generated title that must not win",
+      status: "done",
+      createdByUserId: MEMBER_A,
+      source: {},
+      parentTaskId: createdTaskId,
+      rootTaskId: createdTaskId,
+      localTaskName: "api-tests",
+      canonicalTaskName: "api-tests",
+    });
+    await db!.insert(taskSessionTable).values({
+      taskId: childTaskId,
+      sessionId: childSessionId,
+      role: "primary",
+      profileId: PROFILE_ID,
+    });
+
+    const resp = await client.getTask({ sessionId: childSessionId });
+    expect(resp.task?.title).toBe("api-tests");
+    expect(resp.task?.localTaskName).toBe("api-tests");
+    expect(resp.task?.parentTaskId).toBe(createdTaskId);
   });
 
   test.skipIf(!dbReachable)("GetTask response carries the profile snapshot", async () => {

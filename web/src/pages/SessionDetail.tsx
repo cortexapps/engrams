@@ -1,6 +1,6 @@
-import { useParams } from "@tanstack/react-router";
+import { Link, useParams } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { PanelsTopLeft, Pencil } from "lucide-react";
+import { ChevronLeft, ChevronRight, PanelsTopLeft, Pencil } from "lucide-react";
 import type { PanelImperativeHandle } from "react-resizable-panels";
 import { useSession } from "../hooks/useSessions";
 import { useSessionEvents } from "../hooks/useSessionEvents";
@@ -11,7 +11,7 @@ import { TitleEditForm } from "./sessions/TitleEditForm";
 import { DeleteSessionButton } from "./sessions/DeleteSessionButton";
 import { WorkPane, type PaneTabId } from "../components/WorkPane";
 import { shortId, statusLabel } from "./sessions/session-format";
-import { useTasks } from "../hooks/useTasks";
+import { useTask, useTaskForSession } from "../hooks/useTasks";
 import { useIsMobile } from "../hooks/use-mobile";
 import { useIsAdmin } from "../auth/AuthProvider";
 import {
@@ -23,6 +23,7 @@ import {
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
 import type { ProfileSnapshotView, IndexedEvent } from "../lib/types";
+import type { Task } from "../gen/engram/app/v1/task_pb";
 
 // The session workspace (ADR 0065 follow-up). The transcript is the primary
 // left column; the live shell + browser live in a resizable companion pane on
@@ -109,19 +110,39 @@ function isTypingTarget(el: Element | null): boolean {
   );
 }
 
+export function taskDisplayTitle(task: Task | null | undefined, sessionId: string): string {
+  return task?.localTaskName ?? task?.title ?? sessionId;
+}
+
+function primarySessionId(task: Task | undefined): string | undefined {
+  return (
+    task?.sessions.find((ref) => ref.role === "primary")?.sessionId ?? task?.sessions[0]?.sessionId
+  );
+}
+
 export function SessionDetail() {
   const { id } = useParams({ from: "/_app/sessions/$id" });
   const { data: session } = useSession(id);
-  const { data: tasksData } = useTasks();
-  // The task owning this session — for the masthead title + rename control.
-  const task = tasksData?.tasks.find((t) => t.sessions.some((r) => r.sessionId === id));
+  // Resolve by primary session because ListTasks intentionally excludes child
+  // tasks. A list lookup made child pages look like unattributed sessions.
+  const { data: task } = useTaskForSession(id);
   // Synthetic `unattributed-*` admin rows have no real task and can't be renamed.
   const taskId = task && !task.id.startsWith("unattributed-") ? task.id : null;
-  const taskTitle = task?.title ?? null;
+  // GetTask returns descendants of the selected task. A child page makes one
+  // additional root lookup so its Overview can show parents and siblings too.
+  const rootTaskId = task?.rootTaskId ?? task?.id;
+  const { data: loadedRootTask } = useTask(task?.parentTaskId ? rootTaskId : null);
+  const taskTree = task?.parentTaskId ? loadedRootTask : task;
+  const treeTasks = taskTree ? [taskTree, ...(taskTree.descendants ?? [])] : [];
+  const parentTask = task?.parentTaskId
+    ? treeTasks.find((candidate) => candidate.id === task.parentTaskId)
+    : undefined;
+  const parentSessionId = primarySessionId(parentTask);
+  const taskTitle = taskDisplayTitle(task, id);
   const titleIsCustom = task?.titleIsCustom ?? false;
+  const titleEditable = taskId !== null && !task?.parentTaskId;
   const [editingTitle, setEditingTitle] = useState(false);
-  const profileSnap =
-    tasksData?.tasks.flatMap((t) => t.sessions).find((r) => r.sessionId === id)?.profile ?? null;
+  const profileSnap = task?.sessions.find((ref) => ref.sessionId === id)?.profile ?? null;
   // Normalize the embedded snapshot to the UI view once. Point-in-time by
   // design (ADR 0053) — what this session launched from, not the profile's
   // current state.
@@ -309,10 +330,10 @@ export function SessionDetail() {
             <StatusGlyph status={session.status} attention={needsAttention} />
           </span>
         )}
-        {editingTitle && taskId ? (
+        {editingTitle && titleEditable ? (
           <TitleEditForm
             taskId={taskId}
-            initial={taskTitle ?? ""}
+            initial={taskTitle}
             isCustom={titleIsCustom}
             onDone={() => setEditingTitle(false)}
             inputClassName="h-8 text-base"
@@ -320,16 +341,31 @@ export function SessionDetail() {
           />
         ) : (
           <div className="group/title flex min-w-0 items-center gap-1">
+            {parentSessionId && parentTask && (
+              <>
+                <Link
+                  to="/sessions/$id"
+                  params={{ id: parentSessionId }}
+                  aria-label={`Back to ${taskDisplayTitle(parentTask, parentSessionId)}`}
+                  title={`Back to ${taskDisplayTitle(parentTask, parentSessionId)}`}
+                  className="flex min-w-0 max-w-40 shrink items-center gap-0.5 rounded-md px-1.5 py-1 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <ChevronLeft className="size-4 shrink-0" />
+                  <span className="truncate">{taskDisplayTitle(parentTask, parentSessionId)}</span>
+                </Link>
+                <ChevronRight className="size-3.5 shrink-0 text-muted-foreground/60" aria-hidden />
+              </>
+            )}
             {/* Truncation is lossy, so the full title stays reachable as a
                 native tooltip. */}
             <span
               className="min-w-0 truncate text-base font-medium"
-              title={taskTitle ?? id}
+              title={taskTitle}
               data-testid="session-title"
             >
-              {taskTitle ?? id}
+              {taskTitle}
             </span>
-            {taskId && (
+            {titleEditable && (
               <Button
                 type="button"
                 size="icon-xs"
@@ -391,6 +427,7 @@ export function SessionDetail() {
                   events={events}
                   profile={profile}
                   selection={effectiveSelection}
+                  taskTree={taskTree}
                   isAdmin={isAdmin}
                   open={paneOpen}
                   tab={paneTab}
@@ -474,6 +511,7 @@ export function SessionDetail() {
                 events={events}
                 profile={profile}
                 selection={effectiveSelection}
+                taskTree={taskTree}
                 isAdmin={isAdmin}
                 open={paneOpen}
                 tab={paneTab}

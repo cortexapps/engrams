@@ -28,8 +28,8 @@ use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::port::PortTunnel;
 use crate::types::sandbox::{
-    AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec, WriteFileResult,
-    WriteFileSpec,
+    AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec, SessionFileMetadata,
+    SessionFileSpec, SessionFileStream,
 };
 use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
@@ -151,16 +151,24 @@ pub trait HostClient: Send + Sync {
         })
     }
 
-    /// Write a batch of files into a running sandbox. Implementations report
-    /// file-level failures in the returned vector and reserve the outer error
-    /// for sandbox-level failures such as an unknown sandbox.
-    async fn write_files(
+    async fn write_file(
         &self,
         _id: SandboxId,
-        _files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        _spec: SessionFileSpec,
+        _bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
         Err(SandboxError::Unsupported(
-            "this host doesn't support `write_files` yet".into(),
+            "this host doesn't support `write_file` yet".into(),
+        ))
+    }
+
+    async fn read_file(
+        &self,
+        _id: SandboxId,
+        _path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        Err(SandboxError::Unsupported(
+            "this host doesn't support `read_file` yet".into(),
         ))
     }
 

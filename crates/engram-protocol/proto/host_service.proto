@@ -192,9 +192,9 @@ service HostService {
   // immediately funnels into `update_live_disk_manifest`.
   rpc FlushSandbox(SandboxIdMessage) returns (FlushSandboxResponse);
 
-  // ADR 0100: write a batch of files through the existing in-guest agentd
-  // Upload verb. Per-file failures are carried in the response payload.
-  rpc WriteFiles(WriteFilesRequest) returns (WriteFilesResponse);
+  // ADR 0113: bounded-memory session file transfer.
+  rpc WriteFile(stream HostWriteFileRequest) returns (HostWriteFileResponse);
+  rpc ReadFile(HostReadFileRequest) returns (stream HostReadFileResponse);
 
   // ---- streaming ----
   rpc ExecStart(ExecStartRequest) returns (stream ExecFrame);
@@ -716,17 +716,43 @@ message ReapMaterializeDirResponse {
   bytes stats_bincode = 1;
 }
 
-// --- WriteFiles ---
-
-message WriteFilesRequest {
+message HostWriteFileMetadata {
   bytes sandbox_id = 1; // 16-byte UUID
-  // bincode-encoded `engram_protocol::wire::WireWriteFilesRequest`.
-  bytes request_bincode = 2;
+  string path = 2;
+  uint64 size_bytes = 3;
+  string sha256 = 4;
+  optional uint32 mode = 5;
 }
 
-message WriteFilesResponse {
-  // bincode-encoded `engram_protocol::wire::WireWriteFilesResponse`.
-  bytes response_bincode = 1;
+message HostWriteFileRequest {
+  oneof frame {
+    HostWriteFileMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message HostWriteFileResponse {
+  string path = 1;
+  uint64 size_bytes = 2;
+  string sha256 = 3;
+}
+
+message HostReadFileRequest {
+  bytes sandbox_id = 1; // 16-byte UUID
+  string path = 2;
+}
+
+message HostReadFileMetadata {
+  string path = 1;
+  uint64 size_bytes = 2;
+  string sha256 = 3;
+}
+
+message HostReadFileResponse {
+  oneof frame {
+    HostReadFileMetadata metadata = 1;
+    bytes chunk = 2;
+  }
 }
 
 // --- ExecStart (server-streaming) ---

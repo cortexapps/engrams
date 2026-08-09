@@ -517,11 +517,11 @@ async fn exec_streaming_smoke() {
     println!("smoke(exec): all checks passed");
 }
 
-/// `WriteFiles` unary smoke: create a session, stage two files through the
-/// coordinator→host→guest path, assert both per-file results, then delete.
+/// `WriteFile` streaming smoke: create a session, stage two files through the
+/// coordinator→host→guest path, then delete.
 #[tokio::test]
 #[ignore = "requires a running dev stack (just dev + just smoke-control-plane)"]
-async fn write_files_smoke() {
+async fn write_file_smoke() {
     let Some((addr, token)) = grpc_addr_and_token() else {
         return;
     };
@@ -562,40 +562,56 @@ async fn write_files_smoke() {
         .into_inner()
         .session_id;
 
-    let mut write_req = tonic::Request::new(app::WriteFilesRequest {
-        session_id: session_id.clone(),
-        files: vec![
-            app::WriteFileSpec {
-                path: "/tmp/engram-write-files-smoke/a.txt".into(),
-                content: b"alpha".to_vec(),
-                mode: Some(0o600),
+    use sha2::{Digest, Sha256};
+    for (path, content, mode) in [
+        (
+            "/tmp/engram-write-file-smoke/a.txt",
+            b"alpha".as_slice(),
+            Some(0o600),
+        ),
+        (
+            "/tmp/engram-write-file-smoke/b.txt",
+            b"beta".as_slice(),
+            None,
+        ),
+    ] {
+        let sha256 = Sha256::digest(content)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let frames = vec![
+            app::WriteFileRequest {
+                frame: Some(app::write_file_request::Frame::Metadata(
+                    app::WriteFileMetadata {
+                        session_id: session_id.clone(),
+                        path: path.into(),
+                        size_bytes: content.len() as u64,
+                        sha256: sha256.clone(),
+                        mode,
+                    },
+                )),
             },
-            app::WriteFileSpec {
-                path: "/tmp/engram-write-files-smoke/b.txt".into(),
-                content: b"beta".to_vec(),
-                mode: None,
+            app::WriteFileRequest {
+                frame: Some(app::write_file_request::Frame::Chunk(content.to_vec())),
             },
-        ],
-    });
-    write_req.set_timeout(rpc_timeout);
-    let response = client
-        .write_files(write_req)
-        .await
-        .expect("WriteFiles")
-        .into_inner();
-    assert_eq!(response.results.len(), 2);
-    assert!(
-        response.results.iter().all(|result| result.ok),
-        "every staged file must succeed: {:?}",
-        response.results
-    );
+        ];
+        let mut write_req = tonic::Request::new(tokio_stream::iter(frames));
+        write_req.set_timeout(rpc_timeout);
+        let response = client
+            .write_file(write_req)
+            .await
+            .expect("WriteFile")
+            .into_inner();
+        assert_eq!(response.path, path);
+        assert_eq!(response.sha256, sha256);
+    }
 
     let mut del_req = tonic::Request::new(app::DeleteSessionRequest {
         session_id: session_id.clone(),
     });
     del_req.set_timeout(rpc_timeout);
     client.delete_session(del_req).await.expect("DeleteSession");
-    println!("smoke(write_files): all checks passed");
+    println!("smoke(write_file): all checks passed");
 }
 
 /// `Snapshot → EvictLocal → Resume` round-trip smoke. Also exercises

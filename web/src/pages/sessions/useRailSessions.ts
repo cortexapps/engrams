@@ -1,6 +1,6 @@
 import { useRouterState } from "@tanstack/react-router";
 import { useDebouncedValue } from "../../hooks/useDebouncedValue";
-import { useTasksInfiniteAsSessionList } from "../../hooks/useTasks";
+import { useTaskForSession, useTasksInfiniteAsSessionList } from "../../hooks/useTasks";
 import {
   UNKNOWN_STATE,
   type ListRowState,
@@ -26,6 +26,9 @@ import { useRailStore } from "./rail-store";
 /** One rail row. */
 export interface RailRow {
   id: string;
+  /** The owning task. Child routes use their root task id to keep this row
+   * selected while the reader moves within the right-pane subtask tree. */
+  taskId: string | null;
   status: ListRowState;
   /** ADR 0107: waiting on the user (plan review / question). */
   needsAttention?: boolean;
@@ -38,6 +41,7 @@ export interface RailRow {
 }
 const fromListItem = (s: SessionListItem): RailRow => ({
   id: s.id,
+  taskId: s.taskId,
   status: s.status,
   needsAttention: s.needsAttention ?? false,
   image: s.image,
@@ -147,7 +151,8 @@ export function useRailSessions(): RailSessions {
   // either as a session id would aim the rail highlight and the ⌥[ / ⌥] anchor
   // at the literal id "all" / "list".
   const seg = pathname.startsWith("/sessions/") ? pathname.split("/")[2] : undefined;
-  const openId = seg && seg !== "all" && seg !== "list" ? seg : undefined;
+  const routeSessionId = seg && seg !== "all" && seg !== "list" ? seg : undefined;
+  const { data: openTask } = useTaskForSession(routeSessionId);
 
   // ADR 0051 Task 28: use TaskService-backed list instead of REST /sessions.
   const {
@@ -190,6 +195,13 @@ export function useRailSessions(): RailSessions {
       ? [{ band: UNBANDED, label: "", items: windowed }]
       : [];
   const rows: RailRow[] = groups.flatMap((group) => group.items);
+  // The left rail is the global list of user-created root tasks. The right
+  // pane is local navigation within one task's generated subtask hierarchy.
+  // Keep the root selected while a child route is open so those two scopes do
+  // not look like competing task lists. Hidden children never gain rail rows.
+  const openId = openTask?.parentTaskId
+    ? (rows.find((row) => row.taskId === openTask.rootTaskId)?.id ?? routeSessionId)
+    : routeSessionId;
   // The jump layer navigates to visibleRows[n-1] and the rail draws n on the
   // nth row it RENDERS, so a collapsed band drops out of both together. An
   // unbanded list has nothing to collapse, so every row stays jumpable.

@@ -48,11 +48,12 @@
  */
 
 import { ConnectError, Code } from "@connectrpc/connect";
+import { create } from "@bufbuild/protobuf";
 import type { ConnectRouter } from "@connectrpc/connect";
 import { subject } from "@casl/ability";
 import { and, eq, exists, ilike, inArray, isNull, or, type SQL } from "drizzle-orm";
 
-import { TaskService } from "../gen/engram/app/v1/task_pb.ts";
+import { TaskSchema, TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import type { Task, TaskSessionRef } from "../gen/engram/app/v1/task_pb.ts";
 import type { Session } from "../gen/engram/app/v1/session_pb.ts";
 
@@ -72,22 +73,14 @@ const log = rootLog.child({ component: "task" });
 import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import { makePortExposureStore, type PortExposureStore } from "../db/port-exposures.ts";
-import {
-  makeUserIdentityStore,
-  type UserIdentity,
-  type UserIdentityStore,
-} from "../db/users.ts";
+import { makeUserIdentityStore, type UserIdentity, type UserIdentityStore } from "../db/users.ts";
 import type { ImagesClient } from "./profiles.ts";
 import type { CustomConnectorSource } from "../connectors/registry.ts";
 import {
   makePendingToolCallStore,
   type PendingToolCallStore,
 } from "../tools/pending-tool-calls.ts";
-import {
-  createTaskWithSession,
-  type Db,
-  type HarnessCatalogClient,
-} from "./task-create.ts";
+import { createTaskWithSession, type Db, type HarnessCatalogClient } from "./task-create.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 
@@ -130,15 +123,15 @@ export interface SessionsClient {
     // coordinator validates it against the harness descriptor's modes.
     harnessMode?: string;
   }): Promise<{ sessionId: string; status: string; imageVersion: string; kind: string }>;
-  listSessions(req: Record<string, never>): Promise<{ sessions: Array<{ session?: Session | undefined }> }>;
+  listSessions(
+    req: Record<string, never>,
+  ): Promise<{ sessions: Array<{ session?: Session | undefined }> }>;
   getSession(req: { sessionId: string }): Promise<{ session?: Session | undefined }>;
   deleteSession(req: { sessionId: string }): Promise<unknown>;
 }
 
 /** Injectable better-auth getSession function. */
-export type GetSession = (
-  headers: Headers,
-) => Promise<{
+export type GetSession = (headers: Headers) => Promise<{
   user: { id: string; role?: string | null; email?: string | null };
 } | null>;
 
@@ -174,7 +167,6 @@ export interface TaskDeps {
 export function searchPattern(q: string): string {
   return `%${q.replace(/[\\%_]/g, "\\$&")}%`;
 }
-
 
 /**
  * Map a control-plane session status string to a task status string.
@@ -314,10 +306,25 @@ function buildTask(
     harness: string | null;
     model: string | null;
     effort: string | null;
+    parentTaskId: string | null;
+    rootTaskId: string | null;
+    localTaskName: string | null;
+    canonicalTaskName: string | null;
+    spawningSessionId: string | null;
   },
   sessionRefs: readonly SessionRef[],
   sessionMap: Map<string, Session>,
-  profileMap: Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string; skills: string[] }>,
+  profileMap: Map<
+    string,
+    {
+      id: string;
+      name: string;
+      icon: string;
+      archived: boolean;
+      imageUri: string;
+      skills: string[];
+    }
+  >,
   identityMap: Map<string, UserIdentity>,
   snapshots?: Array<{ taskId: string; suggestedTitle: string }>,
   awaitingSessionIds?: ReadonlySet<string>,
@@ -329,7 +336,13 @@ function buildTask(
   const primarySession = primaryRef ? sessionMap.get(primaryRef.sessionId) : undefined;
   if (primarySession) {
     const mapped = sessionStatusToTaskStatus(primarySession.status);
-    if (mapped !== null) status = mapped;
+    // A child task projects the latest RUN result onto its row. Its session
+    // remains active or idle after one run so it can accept another message;
+    // those lifecycle states must not erase done/open. Terminal session states
+    // still win. Root tasks keep their existing lifecycle-derived display.
+    if (mapped !== null && (row.type !== "subsession" || mapped !== "working")) {
+      status = mapped;
+    }
     // ADR 0107: a live session parked on an unsubmitted session-handled tool
     // call (a plan awaiting review, an unanswered question) is WAITING ON THE
     // USER — the contracted `awaiting_review` status, derived at read time
@@ -344,6 +357,7 @@ function buildTask(
   // the live session; mirror it onto the task row (only when it actually
   // changed) so it survives the session's eventual GC.
   if (
+    row.type !== "subsession" &&
     snapshots != null &&
     liveSuggested != null &&
     liveSuggested !== "" &&
@@ -352,10 +366,13 @@ function buildTask(
     snapshots.push({ taskId: row.id, suggestedTitle: liveSuggested });
   }
 
-  const title = effectiveTitle(row, liveSuggested);
-  const creator = row.createdByUserId != null
-    ? identityMap.get(row.createdByUserId)
-    : undefined;
+  // A child's local task name is its identity inside the tree. Do not replace
+  // it with a harness or model suggestion from the first prompt.
+  const title =
+    row.type === "subsession"
+      ? (row.localTaskName ?? row.title)
+      : effectiveTitle(row, liveSuggested);
+  const creator = row.createdByUserId != null ? identityMap.get(row.createdByUserId) : undefined;
 
   // ORDERED, so `sessions[0]` is the primary for every consumer — the state
   // filter, the band, the activity clock, and the web row.
@@ -370,7 +387,7 @@ function buildTask(
     } as TaskSessionRef;
   });
 
-  return {
+  return create(TaskSchema, {
     id: row.id,
     type: row.type,
     ...(title != null ? { title } : {}),
@@ -394,7 +411,13 @@ function buildTask(
     ...(row.harness != null ? { harness: row.harness } : {}),
     ...(row.model != null ? { model: row.model } : {}),
     ...(row.effort != null ? { effort: row.effort } : {}),
-  } as Task;
+    ...(row.parentTaskId != null ? { parentTaskId: row.parentTaskId } : {}),
+    ...(row.rootTaskId != null ? { rootTaskId: row.rootTaskId } : {}),
+    ...(row.localTaskName != null ? { localTaskName: row.localTaskName } : {}),
+    ...(row.canonicalTaskName != null ? { canonicalTaskName: row.canonicalTaskName } : {}),
+    ...(row.spawningSessionId != null ? { spawningSessionId: row.spawningSessionId } : {}),
+    descendants: [],
+  });
 }
 
 /**
@@ -409,7 +432,10 @@ function persistTitleSnapshots(
   if (updates.length === 0) return;
   void Promise.all(
     updates.map((u) =>
-      db.update(taskTable).set({ suggestedTitle: u.suggestedTitle }).where(eq(taskTable.id, u.taskId)),
+      db
+        .update(taskTable)
+        .set({ suggestedTitle: u.suggestedTitle })
+        .where(eq(taskTable.id, u.taskId)),
     ),
   ).catch((err) => {
     log.warn({ err }, "task-title snapshot write failed (continuing)");
@@ -548,9 +574,31 @@ export async function buildProfileMap(
   refs: Array<{ profileId: string | null }>,
   profiles: ProfileStore,
   imagesClient: ImagesClient,
-): Promise<Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string; skills: string[] }>> {
+): Promise<
+  Map<
+    string,
+    {
+      id: string;
+      name: string;
+      icon: string;
+      archived: boolean;
+      imageUri: string;
+      skills: string[];
+    }
+  >
+> {
   const ids = [...new Set(refs.map((r) => r.profileId).filter((x): x is string => x != null))];
-  const out = new Map<string, { id: string; name: string; icon: string; archived: boolean; imageUri: string; skills: string[] }>();
+  const out = new Map<
+    string,
+    {
+      id: string;
+      name: string;
+      icon: string;
+      archived: boolean;
+      imageUri: string;
+      skills: string[];
+    }
+  >();
   if (ids.length === 0) return out;
   // The image catalog lives on the control plane and may be transiently
   // unavailable. Reads must stay best-effort: a catalog failure must not take
@@ -564,7 +612,9 @@ export async function buildProfileMap(
   const [rows, uriById] = await Promise.all([profiles.getByIds(ids), catalogPromise]);
   for (const p of rows) {
     out.set(p.id, {
-      id: p.id, name: p.name, icon: p.icon,
+      id: p.id,
+      name: p.name,
+      icon: p.icon,
       archived: p.deletedAt != null,
       imageUri: uriById.get(p.imageId) ?? "",
       // ADR 0064: carry the profile's skills so the web can gate optional
@@ -598,11 +648,7 @@ async function loadTask(
   const db_ = db;
 
   // Fetch task row.
-  const taskRows = await db_
-    .select()
-    .from(taskTable)
-    .where(eq(taskTable.id, taskId))
-    .limit(1);
+  const taskRows = await db_.select().from(taskTable).where(eq(taskTable.id, taskId)).limit(1);
 
   if (taskRows.length === 0) {
     throw new ConnectError("not found", Code.NotFound);
@@ -643,6 +689,55 @@ async function loadTask(
     snapshots,
     awaitingSessionIds,
   );
+  const rootTaskId = taskRow.rootTaskId ?? taskRow.id;
+  const treeRows = await db_.select().from(taskTable).where(eq(taskTable.rootTaskId, rootTaskId));
+  const childIds = new Set<string>();
+  let frontier = new Set([taskId]);
+  while (frontier.size > 0) {
+    const next = new Set<string>();
+    for (const row of treeRows) {
+      if (row.parentTaskId != null && frontier.has(row.parentTaskId) && !childIds.has(row.id)) {
+        childIds.add(row.id);
+        next.add(row.id);
+      }
+    }
+    frontier = next;
+  }
+  if (childIds.size > 0) {
+    const descendantRows = treeRows.filter((row) => childIds.has(row.id));
+    const descendantRefs = await db_
+      .select()
+      .from(taskSessionTable)
+      .where(inArray(taskSessionTable.taskId, [...childIds]));
+    const descendantSessionMap = new Map<string, Session>();
+    for (const ref of descendantRefs) {
+      try {
+        const response = await sessionsClient.getSession({ sessionId: ref.sessionId });
+        if (response.session) descendantSessionMap.set(ref.sessionId, response.session);
+      } catch {
+        // A deleted child remains visible from its persisted task state.
+      }
+    }
+    const [descendantProfileMap, descendantIdentityMap] = await Promise.all([
+      buildProfileMap(descendantRefs, profiles, imagesClient),
+      users.getIdentities([...new Set(descendantRows.flatMap((row) => row.createdByUserId ?? []))]),
+    ]);
+    task.descendants = descendantRows
+      .map((row) =>
+        buildTask(
+          row,
+          descendantRefs.filter((ref) => ref.taskId === row.id),
+          descendantSessionMap,
+          descendantProfileMap,
+          descendantIdentityMap,
+          snapshots,
+          awaitingSessionIds,
+        ),
+      )
+      .sort((left, right) =>
+        (left.canonicalTaskName ?? "").localeCompare(right.canonicalTaskName ?? ""),
+      );
+  }
   persistTitleSnapshots(db_, snapshots);
   return task;
 }
@@ -657,16 +752,14 @@ async function loadTask(
  * All deps are injectable for tests; real singletons are used when omitted.
  */
 export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
-  const getSession: GetSession =
-    deps?.getSession ??
-    getSessionFromHeaders;
+  const getSession: GetSession = deps?.getSession ?? getSessionFromHeaders;
 
-  const sessionsClient: SessionsClient = deps?.sessions ?? (defaultSessions as unknown as SessionsClient);
+  const sessionsClient: SessionsClient =
+    deps?.sessions ?? (defaultSessions as unknown as SessionsClient);
   const getDbFn = (): Db => deps?.db ?? getDb();
   // The secret store defaults to a Drizzle store over the same DB. Resolved
   // lazily so importing this module does not require a DB at import time.
-  const resolveSecrets = (): UserSecretStore =>
-    deps?.secrets ?? makeUserSecretStore(getDbFn());
+  const resolveSecrets = (): UserSecretStore => deps?.secrets ?? makeUserSecretStore(getDbFn());
   const profiles: ProfileStore = deps?.profiles ?? makeProfileStore(getDbFn());
   // Lazy (like resolveSecrets): touch getDb() only when createTask actually runs,
   // so registering without a DB (the auth/validation tests) doesn't throw.
@@ -674,8 +767,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
     deps?.portExposures ?? makePortExposureStore(getDbFn());
   // Lazy like the other DB-backed stores: registration itself must not require
   // a configured database.
-  const resolveUsers = (): UserIdentityStore =>
-    deps?.users ?? makeUserIdentityStore(getDbFn());
+  const resolveUsers = (): UserIdentityStore => deps?.users ?? makeUserIdentityStore(getDbFn());
   const imagesClient: ImagesClient = deps?.images ?? (defaultImages as unknown as ImagesClient);
   // Lazy like the other DB-backed stores (ADR 0107 attention derivation).
   let pendingCallsStoreMemo: PendingToolCallStore | undefined;
@@ -689,7 +781,9 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
     deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
   // Lazy default (see profiles.ts): touch getDb() only when a handler reads
   // connectors, so registering without a DB doesn't throw.
-  const connectors: CustomConnectorSource = deps?.connectors ?? { list: () => makeConnectorStore(getDbFn()).list() };
+  const connectors: CustomConnectorSource = deps?.connectors ?? {
+    list: () => makeConnectorStore(getDbFn()).list(),
+  };
 
   router.service(TaskService, {
     // -------------------------------------------------------------------------
@@ -737,6 +831,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           profileId: req.profileId,
           title: req.title ?? null,
           ...(req.prompt != null ? { prompt: req.prompt } : {}),
+          ...(req.deferInitialPrompt ? { deferInitialPrompt: true } : {}),
           ...(req.harness != null ? { harness: req.harness } : {}),
           ...(req.model != null ? { model: req.model } : {}),
           ...(req.effort != null ? { effort: req.effort } : {}),
@@ -824,14 +919,15 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       }
 
       const taskQuery = db.select().from(taskTable);
-      const taskRows = taskConditions.length > 0
-        ? await taskQuery.where(and(...taskConditions))
-        : await taskQuery;
+      const queriedTaskRows =
+        taskConditions.length > 0 ? await taskQuery.where(and(...taskConditions)) : await taskQuery;
+      // Child tasks are rendered under their root task and do not occupy the
+      // top-level task list (ADR 0113). Keep this final guard even when a
+      // caller supplies no SQL filters.
+      const taskRows = queriedTaskRows.filter((row) => row.parentTaskId == null);
       const creatorIds = [
         ...new Set(
-          taskRows
-            .map((row) => row.createdByUserId)
-            .filter((id): id is string => id != null),
+          taskRows.map((row) => row.createdByUserId).filter((id): id is string => id != null),
         ),
       ];
       const identityMap = await resolveUsers().getIdentities(creatorIds);
@@ -896,12 +992,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       const visibleTasks: Task[] = [];
       const snapshots: Array<{ taskId: string; suggestedTitle: string }> = [];
       for (const row of taskRows) {
-        if (
-          !ability.can(
-            "read",
-            subject("Task", { createdByUserId: row.createdByUserId }),
-          )
-        ) {
+        if (!ability.can("read", subject("Task", { createdByUserId: row.createdByUserId }))) {
           continue;
         }
         const refs = refsByTaskId.get(row.id) ?? [];
@@ -924,7 +1015,8 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
             syntheticSearch !== "" &&
             !`unattributed-${sess.id}`.toLowerCase().includes(syntheticSearch) &&
             !sess.id.toLowerCase().includes(syntheticSearch)
-          ) continue;
+          )
+            continue;
           visibleTasks.push(buildUnattributedTask(sess));
         }
       }
@@ -974,11 +1066,30 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       const ability = abilityFor(user);
       const db = getDbFn();
 
+      if ((req.taskId ? 1 : 0) + (req.sessionId ? 1 : 0) !== 1) {
+        throw new ConnectError("supply exactly one of task_id or session_id", Code.InvalidArgument);
+      }
+
+      let taskId = req.taskId;
+      if (req.sessionId) {
+        const refs = await db
+          .select({ taskId: taskSessionTable.taskId })
+          .from(taskSessionTable)
+          .where(
+            and(
+              eq(taskSessionTable.sessionId, req.sessionId),
+              eq(taskSessionTable.role, "primary"),
+            ),
+          )
+          .limit(1);
+        taskId = refs[0]?.taskId ?? "";
+      }
+
       // Fetch task row.
       const taskRows = await db
         .select()
         .from(taskTable)
-        .where(eq(taskTable.id, req.taskId))
+        .where(eq(taskTable.id, taskId))
         .limit(1);
 
       if (taskRows.length === 0) {
@@ -988,17 +1099,12 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       const taskRow = taskRows[0]!;
 
       // Anti-enumeration: task exists but is owned by someone else → NotFound.
-      if (
-        !ability.can(
-          "read",
-          subject("Task", { createdByUserId: taskRow.createdByUserId }),
-        )
-      ) {
+      if (!ability.can("read", subject("Task", { createdByUserId: taskRow.createdByUserId }))) {
         throw new ConnectError("not found", Code.NotFound);
       }
 
       const loaded = await loadTask(
-        req.taskId,
+        taskId,
         db,
         sessionsClient,
         profiles,
@@ -1031,20 +1137,26 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       const taskRow = taskRows[0]!;
 
       // Anti-enumeration: task exists but is owned by someone else → NotFound.
-      if (
-        !ability.can(
-          "delete",
-          subject("Task", { createdByUserId: taskRow.createdByUserId }),
-        )
-      ) {
+      if (!ability.can("delete", subject("Task", { createdByUserId: taskRow.createdByUserId }))) {
         throw new ConnectError("not found", Code.NotFound);
       }
 
-      // Fetch task_session rows to know which upstream sessions to delete.
+      const taskIdsToDelete =
+        taskRow.parentTaskId == null
+          ? (
+              await db
+                .select({ id: taskTable.id })
+                .from(taskTable)
+                .where(eq(taskTable.rootTaskId, taskRow.rootTaskId ?? taskRow.id))
+            ).map((row) => row.id)
+          : [taskRow.id];
+
+      // Root deletion tears down the full tree. Deleting one child touches
+      // only that child (ADR 0113).
       const sessionRefRows = await db
         .select()
         .from(taskSessionTable)
-        .where(eq(taskSessionTable.taskId, req.taskId));
+        .where(inArray(taskSessionTable.taskId, taskIdsToDelete));
 
       // Delete each upstream session. Best-effort: log failures but don't abort.
       for (const ref of sessionRefRows) {
@@ -1058,7 +1170,12 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         }
       }
 
-      // Delete the task row (cascade deletes task_session rows via FK).
+      // Delete children before their root. The task IDs are logical links so
+      // control-plane teardown remains explicit and observable.
+      if (taskIdsToDelete.length > 1) {
+        const descendantIds = taskIdsToDelete.filter((id) => id !== req.taskId);
+        await db.delete(taskTable).where(inArray(taskTable.id, descendantIds));
+      }
       await db.delete(taskTable).where(eq(taskTable.id, req.taskId));
 
       return {};
@@ -1089,12 +1206,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
       // returns NotFound, not PermissionDenied. Renaming is a `manage` verb —
       // granted on owned Tasks and, via `manage:all`, to admins (the `Actions`
       // union has no distinct "update"; `manage` is the capability owners hold).
-      if (
-        !ability.can(
-          "manage",
-          subject("Task", { createdByUserId: taskRow.createdByUserId }),
-        )
-      ) {
+      if (!ability.can("manage", subject("Task", { createdByUserId: taskRow.createdByUserId }))) {
         throw new ConnectError("not found", Code.NotFound);
       }
 

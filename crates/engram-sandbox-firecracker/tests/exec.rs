@@ -18,11 +18,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bytes::Bytes;
 use engram_agentd::exec_journal::ExecJournal;
 use engram_agentd::{serve_connection_with_journal, HarnessSupervisor};
 use engram_core::types::ids::SandboxId;
-use engram_core::types::sandbox::{ExecRequest, WriteFileSpec};
+use engram_core::types::sandbox::{ExecRequest, SessionFileSpec, SessionFileStream};
 use engram_sandbox_firecracker::FirecrackerBackend;
+use futures::{stream, StreamExt};
+use sha2::{Digest, Sha256};
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
@@ -95,39 +98,44 @@ async fn exec_stream_via_agent_socket_round_trips_stdout_and_exit() {
 }
 
 #[tokio::test]
-async fn write_files_via_agent_socket_reports_each_file_result() {
+async fn session_file_stream_exceeds_old_unary_limit_and_round_trips_exactly() {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("agent.sock");
     let agent = spawn_test_agent(socket.clone()).await;
-    let written = dir.path().join("written.txt");
-
-    let results = FirecrackerBackend::write_files_via_agent_socket(
-        SandboxId::new(),
+    let destination = dir.path().join("large-upload.bin");
+    let path = destination.to_string_lossy().into_owned();
+    let expected = vec![0xa5; 3 * 1024 * 1024 + 1];
+    let sha256 = Sha256::digest(&expected)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let chunks = expected
+        .chunks(64 * 1024)
+        .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+        .collect::<Vec<_>>();
+    FirecrackerBackend::write_file_via_agent_socket(
         &socket,
-        vec![
-            // Writing over an existing directory fails inside agentd, proving
-            // a per-file failure does not abort the rest of the batch.
-            WriteFileSpec {
-                path: dir.path().to_string_lossy().into_owned(),
-                content: b"cannot replace a directory".to_vec(),
-                mode: None,
-            },
-            WriteFileSpec {
-                path: written.to_string_lossy().into_owned(),
-                content: b"staged".to_vec(),
-                mode: Some(0o600),
-            },
-        ],
+        SessionFileSpec {
+            path: path.clone(),
+            size_bytes: expected.len() as u64,
+            sha256: sha256.clone(),
+            mode: Some(0o600),
+        },
+        Box::pin(stream::iter(chunks)) as SessionFileStream,
     )
     .await
-    .expect("write_files_via_agent_socket");
+    .expect("stream upload");
 
-    assert_eq!(results.len(), 2);
-    assert!(!results[0].ok, "directory write should fail");
-    assert!(results[0].error.is_some());
-    assert!(results[1].ok, "second write failed: {:?}", results[1]);
-    assert_eq!(tokio::fs::read(&written).await.unwrap(), b"staged");
-
+    let (metadata, mut stream) = FirecrackerBackend::read_file_via_agent_socket(&socket, path)
+        .await
+        .expect("stream read");
+    let mut actual = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        actual.extend_from_slice(&chunk.expect("read chunk"));
+    }
+    assert_eq!(metadata.size_bytes, expected.len() as u64);
+    assert_eq!(metadata.sha256, sha256);
+    assert_eq!(actual, expected);
     agent.abort();
 }
 

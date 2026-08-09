@@ -11,6 +11,7 @@ import {
 } from "@tanstack/react-query";
 import {
   deleteTask,
+  getTask,
   listTasks,
   updateTask,
 } from "../gen/engram/app/v1/task-TaskService_connectquery";
@@ -147,6 +148,34 @@ export function useTasks(params?: TaskListParams) {
     refetchOnWindowFocus: true,
     placeholderData: keepPreviousData,
   });
+}
+
+/** Fetch one task with its complete descendant tree (ADR 0113). */
+export function useTask(id: string | null | undefined) {
+  return useQuery(
+    getTask,
+    { taskId: id ?? "" },
+    {
+      enabled: !!id,
+      refetchInterval: 2_000,
+      refetchOnWindowFocus: true,
+      select: (response) => response.task,
+    },
+  );
+}
+
+/** Resolve the task that owns a primary session, including hidden child tasks. */
+export function useTaskForSession(sessionId: string | null | undefined) {
+  return useQuery(
+    getTask,
+    { sessionId: sessionId ?? "" },
+    {
+      enabled: !!sessionId,
+      refetchInterval: 2_000,
+      refetchOnWindowFocus: true,
+      select: (response) => response.task,
+    },
+  );
 }
 
 /**

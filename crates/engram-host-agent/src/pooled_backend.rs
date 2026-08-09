@@ -25,7 +25,8 @@ use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::image::WarmConfig;
 use engram_core::types::sandbox::{
-    AgentSpec, AuxBundleRef, ExecRequest, ExecStream, SandboxSpec, WriteFileResult, WriteFileSpec,
+    AgentSpec, AuxBundleRef, ExecRequest, ExecStream, SandboxSpec, SessionFileMetadata,
+    SessionFileSpec, SessionFileStream,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
@@ -7531,12 +7532,21 @@ impl SandboxBackend for PooledBackend {
         self.inner.cancel_exec(id, exec_id).await
     }
 
-    async fn write_files(
+    async fn write_file(
         &self,
         id: SandboxId,
-        files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        self.inner.write_files(id, files).await
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        self.inner.write_file(id, spec, bytes).await
+    }
+
+    async fn read_file(
+        &self,
+        id: SandboxId,
+        path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        self.inner.read_file(id, path).await
     }
 
     // ADR 0066: the port relay reaches agentd through the wrapped backend's

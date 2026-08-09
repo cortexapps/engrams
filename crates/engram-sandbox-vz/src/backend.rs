@@ -25,8 +25,8 @@ use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::SandboxProbe;
 use engram_core::types::sandbox::{
-    AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec, WriteFileResult,
-    WriteFileSpec,
+    AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec, SessionFileMetadata,
+    SessionFileSpec, SessionFileStream,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
@@ -895,33 +895,6 @@ where
     })
 }
 
-async fn upload_file_over_stream<S>(mut stream: S, file: WriteFileSpec) -> WriteFileResult
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let path = file.path.clone();
-    let request = WireRequest::Upload {
-        path: file.path,
-        bytes: file.content,
-        mode: file.mode,
-    };
-    if let Err(error) = write_msg(&mut stream, &request).await {
-        return write_file_failure(path, format!("send Upload request: {error}"));
-    }
-    match read_msg::<_, WireResponse>(&mut stream).await {
-        Ok(WireResponse::UploadOk) => WriteFileResult {
-            path,
-            ok: true,
-            error: None,
-        },
-        Ok(WireResponse::Error { kind, message }) => {
-            write_file_failure(path, format!("agentd rejected Upload ({kind}): {message}"))
-        }
-        Ok(other) => write_file_failure(path, format!("unexpected Upload response: {other:?}")),
-        Err(error) => write_file_failure(path, format!("read Upload response: {error}")),
-    }
-}
-
 async fn probe_durable_exec(mut stream: UnixStream) -> Result<bool, SandboxError> {
     write_msg(
         &mut stream,
@@ -943,14 +916,6 @@ async fn probe_durable_exec(mut stream: UnixStream) -> Result<bool, SandboxError
         Err(error) => Err(SandboxError::Vm(
             format!("durable exec capability failed before submission: {error}").into(),
         )),
-    }
-}
-
-fn write_file_failure(path: String, error: String) -> WriteFileResult {
-    WriteFileResult {
-        path,
-        ok: false,
-        error: Some(error),
     }
 }
 
@@ -1324,31 +1289,39 @@ impl SandboxBackend for VzBackend {
         }
     }
 
-    async fn write_files(
+    async fn write_file(
         &self,
         id: SandboxId,
-        files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        let vsock_uds_path = {
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        let agent_uds = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            live.vsock_uds_path.clone()
+            port_uds_path(&live.vsock_uds_path, ENGRAM_AGENTD_PORT)
         };
-        let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
-        let mut results = Vec::with_capacity(files.len());
-        for file in files {
-            let result = match UnixStream::connect(&agent_uds).await {
-                Ok(conn) => upload_file_over_stream(conn, file).await,
-                Err(error) => write_file_failure(
-                    file.path,
-                    format!(
-                        "sandbox {id}: connect engram-agentd UDS {}: {error}",
-                        agent_uds.display()
-                    ),
-                ),
-            };
-            results.push(result);
-        }
-        Ok(results)
+        let connection = UnixStream::connect(&agent_uds).await.map_err(|error| {
+            SandboxError::Vm(
+                format!("connect engram-agentd UDS {}: {error}", agent_uds.display()).into(),
+            )
+        })?;
+        engram_agentd::file_transfer::write_file(connection, spec, bytes).await
+    }
+
+    async fn read_file(
+        &self,
+        id: SandboxId,
+        path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        let agent_uds = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            port_uds_path(&live.vsock_uds_path, ENGRAM_AGENTD_PORT)
+        };
+        let connection = UnixStream::connect(&agent_uds).await.map_err(|error| {
+            SandboxError::Vm(
+                format!("connect engram-agentd UDS {}: {error}", agent_uds.display()).into(),
+            )
+        })?;
+        engram_agentd::file_transfer::read_file(connection, path).await
     }
 
     /// ADR 0066 Phase 2: dial the in-guest agentd relay on `port` (the

@@ -14,6 +14,7 @@ import { CheckIcon, CopyIcon } from "lucide-react";
 
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { cn } from "@/lib/utils";
+import { UploadPathChildren } from "@/components/session-files/UploadPathText";
 
 const MarkdownTextImpl = () => {
   return (
@@ -124,11 +125,10 @@ const defaultComponents = memoizeMarkdownComponents({
       {...props}
     />
   ),
-  p: ({ className, ...props }) => (
-    <p
-      className={cn("aui-md-p my-2.5 leading-normal first:mt-0 last:mb-0", className)}
-      {...props}
-    />
+  p: ({ className, children, ...props }) => (
+    <p className={cn("aui-md-p my-2.5 leading-normal first:mt-0 last:mb-0", className)} {...props}>
+      <UploadPathChildren>{children}</UploadPathChildren>
+    </p>
   ),
   a: ({ className, ...props }) => (
     <a

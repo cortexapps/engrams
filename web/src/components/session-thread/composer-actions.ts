@@ -1,4 +1,5 @@
 import { createContext, useContext } from "react";
+import type { UploadToken } from "../session-files/useSessionUploads";
 
 /**
  * ADR 0052: the composer's actions, provided by `SessionThread` (which owns the
@@ -46,6 +47,11 @@ export interface ComposerActions {
   setMode: (next: string) => void;
   /** ADR 0107: a proposed plan is awaiting the user's review. */
   planPending: boolean;
+  uploads: readonly UploadToken[];
+  addFiles: (files: FileList | readonly File[]) => UploadToken[];
+  addCanonicalPath: (path: string) => boolean;
+  removeUpload: (id: string) => void;
+  retryUpload: (id: string) => Promise<void>;
 }
 
 export const ComposerActionsContext = createContext<ComposerActions>({
@@ -59,6 +65,11 @@ export const ComposerActionsContext = createContext<ComposerActions>({
   mode: "default",
   setMode: () => {},
   planPending: false,
+  uploads: [],
+  addFiles: () => [],
+  addCanonicalPath: () => false,
+  removeUpload: () => {},
+  retryUpload: async () => {},
 });
 
 export const useComposerActions = (): ComposerActions => useContext(ComposerActionsContext);

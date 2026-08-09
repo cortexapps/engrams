@@ -11,7 +11,7 @@
  * the rest of the app does.
  */
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useWindowHeight } from "@react-hook/window-size";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
@@ -30,6 +30,7 @@ import {
 } from "lucide-react";
 
 import { createTask, listTasks } from "../../gen/engram/app/v1/task-TaskService_connectquery";
+import { sendPrompt } from "../../gen/engram/app/v1/session-SessionService_connectquery";
 import { useProfiles } from "../../hooks/useProfiles";
 import { defaultCapabilitiesForGrants } from "../../lib/profileIntegrations";
 import { useIntegrationCatalog } from "../../hooks/useIntegrations";
@@ -37,7 +38,7 @@ import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
 import { useHarnessEnv } from "../../hooks/useHarnessEnv";
 import { useCredentials } from "../../hooks/useCredentials";
-import { useTasksAsSessionList } from "../../hooks/useTasks";
+import { useDeleteTask, useTasksAsSessionList } from "../../hooks/useTasks";
 import { useNow } from "../../hooks/useNow";
 import {
   SessionHarnessControls,
@@ -58,7 +59,6 @@ import { derivePolicy, type DerivedPolicy } from "../../lib/profilePolicy";
 import { compareSessions, relativeTime, shortId } from "./session-format";
 import type { SessionListItem } from "../../lib/types";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
 import { Text } from "@/components/ui/text";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -75,6 +75,15 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { UploadButton } from "../../components/session-files/UploadButton";
+import {
+  InlineUploadComposer,
+  type InlineUploadComposerHandle,
+} from "../../components/session-files/InlineUploadComposer";
+import {
+  serializeComposer,
+  useSessionUploads,
+} from "../../components/session-files/useSessionUploads";
 
 // The profile you launched last is the sticky default — written on a successful
 // launch, read back on the next visit. localStorage (not server state) keeps it
@@ -129,6 +138,8 @@ export function StartScreen() {
         queryKey: createConnectQueryKey({ schema: listTasks, cardinality: undefined }),
       }),
   });
+  const sendPromptMutation = useMutation(sendPrompt);
+  const deleteTaskMutation = useDeleteTask();
 
   const profiles = profilesData?.profiles ?? [];
   const views = useMemo(() => catalogToViews(catalog?.providers ?? []), [catalog]);
@@ -141,6 +152,9 @@ export function StartScreen() {
   const [prompt, setPrompt] = useState("");
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [deferredSessionId, setDeferredSessionId] = useState<string | undefined>();
+  const [deferredTaskId, setDeferredTaskId] = useState<string | undefined>();
+  const uploads = useSessionUploads(deferredSessionId);
   // ADR 0063 B2: per-session harness/model/effort override (null = inherit the
   // profile default). Reset on profile switch so a stale pick can't carry over.
   const [harnessOverride, setHarnessOverride] = useState<HarnessOverride>(EMPTY_OVERRIDE);
@@ -223,27 +237,60 @@ export function StartScreen() {
   const credentialMissing = userEnvMissing || oauthMissing;
 
   const canLaunch =
-    !!selected && !!prompt.trim() && !createTaskMutation.isPending && !credentialMissing;
+    !!selected &&
+    (!!prompt.trim() || uploads.tokens.length > 0) &&
+    !createTaskMutation.isPending &&
+    !sendPromptMutation.isPending &&
+    !uploads.busy &&
+    !credentialMissing;
 
   const launch = async () => {
-    if (!selected || !prompt.trim() || createTaskMutation.isPending || credentialMissing) return;
+    if (
+      !selected ||
+      (!prompt.trim() && uploads.tokens.length === 0) ||
+      createTaskMutation.isPending ||
+      sendPromptMutation.isPending ||
+      credentialMissing
+    )
+      return;
     setError(null);
     try {
-      const res = await createTaskMutation.mutateAsync({
-        type: "chat",
-        profileId: selected.id,
-        prompt: prompt.trim(),
-        // Only the explicitly-overridden fields ride along; the rest fall back to
-        // the profile / descriptor default server-side (ADR 0063 B2).
-        ...(harnessOverride.harness ? { harness: harnessOverride.harness } : {}),
-        ...(harnessOverride.model ? { model: harnessOverride.model } : {}),
-        ...(harnessOverride.effort ? { effort: harnessOverride.effort } : {}),
-        ...(harnessOverride.mode ? { harnessMode: harnessOverride.mode } : {}),
-      });
-      writeLastProfileId(selected.id);
-      const sessionId = res.task?.sessions[0]?.sessionId;
-      if (sessionId) navigate({ to: "/sessions/$id", params: { id: sessionId } });
-      else setError("Task created but no session id returned.");
+      let sessionId = deferredSessionId;
+      let mustSendDeferredPrompt = deferredSessionId != null;
+      if (!sessionId) {
+        const deferInitialPrompt = uploads.tokens.length > 0;
+        const res = await createTaskMutation.mutateAsync({
+          type: "chat",
+          profileId: selected.id,
+          prompt: prompt.trim(),
+          deferInitialPrompt,
+          // Only explicit overrides ride along. Everything else resolves from
+          // the profile and harness catalog on the server.
+          ...(harnessOverride.harness ? { harness: harnessOverride.harness } : {}),
+          ...(harnessOverride.model ? { model: harnessOverride.model } : {}),
+          ...(harnessOverride.effort ? { effort: harnessOverride.effort } : {}),
+          ...(harnessOverride.mode ? { harnessMode: harnessOverride.mode } : {}),
+        });
+        mustSendDeferredPrompt = deferInitialPrompt;
+        writeLastProfileId(selected.id);
+        if (uploads.tokens.length > 0 && res.task?.id) setDeferredTaskId(res.task.id);
+        sessionId = res.task?.sessions[0]?.sessionId;
+        if (sessionId && uploads.tokens.length > 0) setDeferredSessionId(sessionId);
+      }
+      if (sessionId && mustSendDeferredPrompt) {
+        const completed = uploads.tokens.length > 0 ? await uploads.uploadAll(sessionId) : [];
+        await sendPromptMutation.mutateAsync({
+          sessionId,
+          text: serializeComposer(prompt, completed),
+          promptId: crypto.randomUUID(),
+          ...(harnessOverride.mode ? { harnessMode: harnessOverride.mode } : {}),
+        });
+      }
+      if (sessionId) {
+        setDeferredSessionId(undefined);
+        setDeferredTaskId(undefined);
+        navigate({ to: "/sessions/$id", params: { id: sessionId } });
+      } else setError("Task created but no session id returned.");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -251,7 +298,7 @@ export function StartScreen() {
 
   // Composer focus: on mount, and whenever the keymap (`c` / ⌘K "start task")
   // bumps the nonce after navigating here.
-  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const composerRef = useRef<InlineUploadComposerHandle>(null);
   const focusNonce = useKeyboardUi((s) => s.composerFocusNonce);
   const [enterToSend] = useEnterToSend();
   useEffect(() => {
@@ -278,7 +325,7 @@ export function StartScreen() {
     setTopPad(Math.max(0, (scroll.clientHeight - section.offsetHeight) / 2));
   }, [windowHeight, profilesPending, profiles.length, recent.length]);
 
-  const onComposerKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  const onComposerKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (isSubmitKey(e, enterToSend)) {
       e.preventDefault();
       void launch();
@@ -340,16 +387,29 @@ export function StartScreen() {
           {/* The composer is the one focal object: a single raised surface whose
               focus ring belongs to the whole card, so the borderless textarea and
               the control row read as one input. */}
-          <div className="@container/composer rounded-xl border bg-card shadow-sm transition-[color,box-shadow] focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/40">
-            <Textarea
+          <div
+            className="@container/composer rounded-xl border bg-card shadow-sm transition-[color,box-shadow] focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/40"
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={(event) => {
+              event.preventDefault();
+              if (event.dataTransfer.files.length > 0) {
+                composerRef.current?.addFiles(event.dataTransfer.files);
+              }
+            }}
+          >
+            <InlineUploadComposer
               ref={composerRef}
               value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
+              tokens={uploads.tokens}
+              onChange={setPrompt}
+              onFiles={uploads.addFiles}
+              onCanonicalPath={uploads.addCanonicalPath}
+              onRemove={uploads.remove}
+              onRetry={(id) => void uploads.retry(id)}
               onKeyDown={onComposerKeyDown}
-              rows={3}
-              aria-label="Task"
+              ariaLabel="Task"
               placeholder="Fix the flaky billing-gateway integration test and open a PR."
-              className="max-h-[calc(10lh+1.125rem)] min-h-[5.25rem] resize-none overflow-y-auto border-0 bg-transparent px-4 pt-3.5 pb-1 text-[0.95rem] leading-relaxed shadow-none focus-visible:ring-0 md:text-[0.95rem] dark:bg-transparent"
+              className="max-h-[calc(10lh+1.125rem)] min-h-[5.25rem] px-4 pt-3.5 pb-1 text-[0.95rem] leading-relaxed md:text-[0.95rem]"
             />
             {/* When the composer is at least @md wide (28rem), controls sit on
                 the left and Launch is pinned right, bottom-aligned so it's level
@@ -360,6 +420,10 @@ export function StartScreen() {
                 viewport, since the sidebar/task-list steal width independently. */}
             <div className="flex flex-col gap-2 px-2.5 pt-1 pb-2.5 @md/composer:flex-row @md/composer:items-end">
               <div className="flex flex-wrap items-center gap-2 @md/composer:min-w-0 @md/composer:flex-1">
+                <UploadButton
+                  onFiles={(files) => composerRef.current?.addFiles(files)}
+                  disabled={createTaskMutation.isPending}
+                />
                 <ProfileSwitcher
                   profiles={profiles}
                   selected={selected}
@@ -462,9 +526,29 @@ export function StartScreen() {
             ))}
 
           {error && (
-            <p role="alert" className="text-sm text-destructive">
-              {error}
-            </p>
+            <div
+              role="alert"
+              className="flex flex-wrap items-center gap-2 text-sm text-destructive"
+            >
+              <span>{error}</span>
+              {deferredTaskId && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={deleteTaskMutation.isPending}
+                  onClick={() => {
+                    void deleteTaskMutation.mutateAsync({ taskId: deferredTaskId }).then(() => {
+                      setDeferredTaskId(undefined);
+                      setDeferredSessionId(undefined);
+                      setError(null);
+                    });
+                  }}
+                >
+                  Delete idle task
+                </Button>
+              )}
+            </div>
           )}
 
           {/* Recent rides with the composer in the centered cluster — re-entry

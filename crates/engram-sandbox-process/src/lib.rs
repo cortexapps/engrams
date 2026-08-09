@@ -44,16 +44,44 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
-    AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec, WriteFileResult, WriteFileSpec,
+    AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec, SessionFileMetadata,
+    SessionFileSpec, SessionFileStream, MAX_SESSION_FILE_BYTES,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
+
+const FILE_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+fn digest_hex(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+async fn hash_file(path: &Path) -> std::io::Result<(u64, String)> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buf = vec![0u8; FILE_STREAM_CHUNK_BYTES];
+    loop {
+        let count = file.read(&mut buf).await?;
+        if count == 0 {
+            break;
+        }
+        size += count as u64;
+        hasher.update(&buf[..count]);
+    }
+    Ok((size, digest_hex(hasher.finalize())))
+}
 
 /// POSIX `timeout(1)` convention: command was killed because it
 /// exceeded its wall-clock budget. Surfaced as the exit status of an
@@ -505,56 +533,179 @@ impl SandboxBackend for ProcessBackend {
         kill_exec_process_group(record.pgid, &exec_id)
     }
 
-    async fn write_files(
+    async fn write_file(
         &self,
         id: SandboxId,
-        files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        let state = self
+        spec: SessionFileSpec,
+        mut bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        use futures::StreamExt;
+
+        if spec.size_bytes > MAX_SESSION_FILE_BYTES {
+            return Err(SandboxError::InvalidSpec(format!(
+                "file exceeds {MAX_SESSION_FILE_BYTES} bytes"
+            )));
+        }
+        let _state = self
             .sandboxes
             .get(&id)
             .ok_or(SandboxError::NotFound)?
             .clone();
-        let mut results = Vec::with_capacity(files.len());
-        for file in files {
-            // Match exec's workdir resolution: relative paths are rooted in
-            // the per-sandbox cwd; absolute paths remain absolute.
-            let resolved = state.cwd.join(&file.path);
-            let outcome: std::io::Result<()> = async {
-                if let Some(parent) = resolved.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                }
-                tokio::fs::write(&resolved, &file.content).await?;
-                if let Some(mode) = file.mode {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        tokio::fs::set_permissions(
-                            &resolved,
-                            std::fs::Permissions::from_mode(mode),
-                        )
-                        .await?;
-                    }
-                }
-                Ok(())
+        let destination = PathBuf::from(&spec.path);
+        if let Ok((size_bytes, sha256)) = hash_file(&destination).await {
+            if size_bytes == spec.size_bytes && sha256 == spec.sha256 {
+                return Ok(SessionFileMetadata {
+                    path: spec.path,
+                    size_bytes,
+                    sha256,
+                });
             }
-            .await;
-            results.push(match outcome {
-                Ok(()) => WriteFileResult {
-                    path: file.path,
-                    ok: true,
-                    error: None,
-                },
-                Err(error) => WriteFileResult {
-                    path: file.path,
-                    ok: false,
-                    error: Some(error.to_string()),
-                },
-            });
+            return Err(SandboxError::InvalidSpec(format!(
+                "upload path {} already exists with different content",
+                spec.path
+            )));
         }
-        Ok(results)
+        let parent = destination.parent().ok_or_else(|| {
+            SandboxError::InvalidSpec(format!("upload path {} has no parent", spec.path))
+        })?;
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            SandboxError::Vm(format!("create upload directory: {error}").into())
+        })?;
+        let temporary = parent.join(format!(
+            ".{}.{}.partial",
+            destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("upload"),
+            uuid::Uuid::new_v4()
+        ));
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await
+            .map_err(|error| {
+                SandboxError::Vm(format!("create upload temporary: {error}").into())
+            })?;
+        let transfer = async {
+            let mut hasher = Sha256::new();
+            let mut received = 0u64;
+            while let Some(chunk) = bytes.next().await {
+                let chunk = chunk?;
+                received = received.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    SandboxError::InvalidSpec("upload byte count overflow".into())
+                })?;
+                if received > spec.size_bytes || received > MAX_SESSION_FILE_BYTES {
+                    return Err(SandboxError::InvalidSpec(
+                        "upload stream exceeds its declared size".into(),
+                    ));
+                }
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|error| SandboxError::Vm(format!("write upload: {error}").into()))?;
+                hasher.update(&chunk);
+            }
+            file.flush()
+                .await
+                .map_err(|error| SandboxError::Vm(format!("flush upload: {error}").into()))?;
+            drop(file);
+            let actual_sha256 = digest_hex(hasher.finalize());
+            if received != spec.size_bytes || actual_sha256 != spec.sha256 {
+                return Err(SandboxError::InvalidSpec(format!(
+                    "upload verification failed: expected {} bytes {}, received {} bytes {}",
+                    spec.size_bytes, spec.sha256, received, actual_sha256
+                )));
+            }
+            #[cfg(unix)]
+            tokio::fs::set_permissions(&temporary, {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::Permissions::from_mode(spec.mode.unwrap_or(0o600))
+            })
+            .await
+            .map_err(|error| SandboxError::Vm(format!("set upload permissions: {error}").into()))?;
+            match tokio::fs::hard_link(&temporary, &destination).await {
+                Ok(()) => Ok((received, actual_sha256)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    match hash_file(&destination).await {
+                        Ok((size_bytes, sha256))
+                            if size_bytes == spec.size_bytes && sha256 == spec.sha256 =>
+                        {
+                            Ok((received, actual_sha256))
+                        }
+                        _ => Err(SandboxError::InvalidSpec(
+                            "upload path won a concurrent write with different content".into(),
+                        )),
+                    }
+                }
+                Err(error) => Err(SandboxError::Vm(format!("publish upload: {error}").into())),
+            }
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&temporary).await;
+        let (received, actual_sha256) = transfer?;
+        Ok(SessionFileMetadata {
+            path: spec.path,
+            size_bytes: received,
+            sha256: actual_sha256,
+        })
+    }
+
+    async fn read_file(
+        &self,
+        id: SandboxId,
+        path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        let _state = self
+            .sandboxes
+            .get(&id)
+            .ok_or(SandboxError::NotFound)?
+            .clone();
+        let source = PathBuf::from(&path);
+        let (size_bytes, sha256) = hash_file(&source)
+            .await
+            .map_err(|error| SandboxError::Vm(format!("read upload metadata: {error}").into()))?;
+        if size_bytes > MAX_SESSION_FILE_BYTES {
+            return Err(SandboxError::InvalidSpec(format!(
+                "file exceeds {MAX_SESSION_FILE_BYTES} bytes"
+            )));
+        }
+        let mut file = tokio::fs::File::open(&source)
+            .await
+            .map_err(|error| SandboxError::Vm(format!("open upload: {error}").into()))?;
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; FILE_STREAM_CHUNK_BYTES];
+            loop {
+                match file.read(&mut buf).await {
+                    Ok(0) => return,
+                    Ok(count) => {
+                        if tx
+                            .send(Ok(Bytes::copy_from_slice(&buf[..count])))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(SandboxError::Vm(
+                                format!("stream upload: {error}").into(),
+                            )))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+        Ok((
+            SessionFileMetadata {
+                path,
+                size_bytes,
+                sha256,
+            },
+            Box::pin(ReceiverStream::new(rx)),
+        ))
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
@@ -1509,6 +1660,80 @@ mod tests {
             stderr_offset: None,
             wake: None,
         }
+    }
+
+    #[tokio::test]
+    async fn session_file_upload_is_atomic_idempotent_and_streamed() {
+        use futures::{stream, StreamExt};
+
+        let (backend, _dir) = backend();
+        let sandbox_id = backend.create(spec()).await.unwrap();
+        let upload_id = uuid::Uuid::new_v4();
+        let root = PathBuf::from(format!("/tmp/uploads/{upload_id}"));
+        let path = root.join("process.bin");
+        let path_string = path.to_string_lossy().into_owned();
+        let bytes = Bytes::from_static(b"streamed-process-file");
+        let digest = digest_hex(Sha256::digest(&bytes));
+        let spec = SessionFileSpec {
+            path: path_string.clone(),
+            size_bytes: bytes.len() as u64,
+            sha256: digest.clone(),
+            mode: Some(0o640),
+        };
+        let chunks = || {
+            Box::pin(stream::iter([Ok(bytes.slice(..8)), Ok(bytes.slice(8..))]))
+                as SessionFileStream
+        };
+
+        let first = backend
+            .write_file(sandbox_id, spec.clone(), chunks())
+            .await
+            .unwrap();
+        let retry = backend
+            .write_file(sandbox_id, spec.clone(), chunks())
+            .await
+            .unwrap();
+        assert_eq!(first, retry);
+        let (metadata, mut downloaded) = backend
+            .read_file(sandbox_id, path_string.clone())
+            .await
+            .unwrap();
+        let mut round_trip = Vec::new();
+        while let Some(chunk) = downloaded.next().await {
+            round_trip.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(metadata.sha256, digest);
+        assert_eq!(round_trip, bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                tokio::fs::metadata(&path)
+                    .await
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
+
+        let conflict = backend
+            .write_file(
+                sandbox_id,
+                SessionFileSpec {
+                    path: path_string,
+                    size_bytes: 5,
+                    sha256: digest_hex(Sha256::digest(b"other")),
+                    mode: None,
+                },
+                Box::pin(stream::iter([Ok(Bytes::from_static(b"other"))])),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(conflict, SandboxError::InvalidSpec(_)));
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), bytes);
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[tokio::test]

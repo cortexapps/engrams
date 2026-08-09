@@ -11,11 +11,13 @@ import { Badge } from "@/components/ui/badge";
 import { usePrRefs } from "../hooks/usePrRefs";
 import type { IndexedEvent } from "../events";
 import type { ProfileSnapshotView, Session } from "../lib/types";
+import type { Task } from "../gen/engram/app/v1/task_pb";
 import { statusLabel } from "../pages/sessions/session-format";
 import { StatusGlyph } from "./Glyph";
 import { ExposedPortsSection } from "./ports/ExposedPortsSection";
 import { ProfileChip } from "./profiles/ProfileChip";
 import { extractFileChanges, totalCounts } from "./session-thread/fileChanges";
+import { TaskTreeNavigation } from "./TaskTreeNavigation";
 
 export interface OverviewSelection {
   harness?: string;
@@ -30,6 +32,7 @@ export interface OverviewPaneProps {
   events: IndexedEvent[];
   profile: ProfileSnapshotView | null;
   selection: OverviewSelection | null;
+  taskTree?: Task | null;
   onShowChanges: () => void;
 }
 
@@ -40,6 +43,7 @@ export function OverviewPane({
   events,
   profile,
   selection,
+  taskTree,
   onShowChanges,
 }: OverviewPaneProps) {
   const files = useMemo(() => extractFileChanges(events), [events]);
@@ -60,6 +64,8 @@ export function OverviewPane({
     // a radius, and its own padding.
     <div className="h-full min-h-0 overflow-auto">
       <div className="flex flex-col gap-3 p-3">
+        <TaskTreeNavigation rootTask={taskTree} currentSessionId={sessionId} />
+
         <div className="flex items-start gap-3 rounded-lg border bg-card p-3">
           <PackageIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
           <div className="min-w-0 flex-1 space-y-2">

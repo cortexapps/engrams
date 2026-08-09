@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use engram_core::types::sandbox::SessionFileSpec;
 use engram_protocol::app;
 use futures::StreamExt as _;
 use tonic::{Request, Response, Status};
@@ -25,6 +26,7 @@ pub struct AppSessionService {
 // EVERY RPC body starts with self.auth.check(&req)? — see auth.rs and the convention test.
 #[tonic::async_trait]
 impl app::session_service_server::SessionService for AppSessionService {
+    type ReadFileStream = BoxStream<app::ReadFileResponse>;
     async fn list_sessions(
         &self,
         req: Request<app::ListSessionsRequest>,
@@ -388,20 +390,138 @@ impl app::session_service_server::SessionService for AppSessionService {
         Ok(Response::new(app::CancelExecResponse {}))
     }
 
-    async fn write_files(
+    async fn write_file(
         &self,
-        req: Request<app::WriteFilesRequest>,
-    ) -> Result<Response<app::WriteFilesResponse>, Status> {
+        req: Request<tonic::Streaming<app::WriteFileRequest>>,
+    ) -> Result<Response<app::WriteFileResponse>, Status> {
         self.auth.check(&req)?;
-        let r = req.into_inner();
-        let id = parse_session_id(&r.session_id)?;
-        let files = super::convert::write_files_request_from_proto(r);
-        let results = crate::api::write_files::write_files_core(&self.state, id, files)
+        let mut inbound = req.into_inner();
+        let first = inbound
+            .next()
             .await
-            .map_err(into_status)?;
-        Ok(Response::new(
-            super::convert::write_files_response_to_proto(results),
-        ))
+            .ok_or_else(|| Status::invalid_argument("file metadata frame is required"))??;
+        let metadata = match first.frame {
+            Some(app::write_file_request::Frame::Metadata(metadata)) => metadata,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first file frame must be metadata",
+                ))
+            }
+        };
+        let session_id = parse_session_id(&metadata.session_id)?;
+        let spec = SessionFileSpec {
+            path: metadata.path,
+            size_bytes: metadata.size_bytes,
+            sha256: metadata.sha256,
+            mode: metadata.mode,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(frame) = inbound.next().await {
+                let item = match frame {
+                    Ok(app::WriteFileRequest {
+                        frame: Some(app::write_file_request::Frame::Chunk(chunk)),
+                    }) => Ok(bytes::Bytes::from(chunk)),
+                    Ok(_) => Err(engram_core::SandboxError::InvalidSpec(
+                        "file metadata must appear exactly once".into(),
+                    )),
+                    Err(error) => Err(engram_core::SandboxError::Unavailable(format!(
+                        "file stream transport failed: {error}"
+                    ))),
+                };
+                if tx.send(item).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let result = crate::api::session_files::write_file_core(
+            &self.state,
+            session_id,
+            spec,
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        )
+        .await
+        .map_err(into_status)?;
+        Ok(Response::new(app::WriteFileResponse {
+            path: result.path,
+            size_bytes: result.size_bytes,
+            sha256: result.sha256,
+        }))
+    }
+
+    async fn read_file(
+        &self,
+        req: Request<app::ReadFileRequest>,
+    ) -> Result<Response<Self::ReadFileStream>, Status> {
+        self.auth.check(&req)?;
+        let request = req.into_inner();
+        let session_id = parse_session_id(&request.session_id)?;
+        let (metadata, mut bytes) =
+            crate::api::session_files::read_file_core(&self.state, session_id, request.path)
+                .await
+                .map_err(into_status)?;
+        let file_name = metadata
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(Ok(app::ReadFileResponse {
+            frame: Some(app::read_file_response::Frame::Metadata(
+                app::ReadFileMetadata {
+                    path: metadata.path,
+                    size_bytes: metadata.size_bytes,
+                    sha256: metadata.sha256,
+                    file_name,
+                },
+            )),
+        }))
+        .await
+        .map_err(|_| Status::cancelled("read client closed before metadata"))?;
+        tokio::spawn(async move {
+            while let Some(item) = bytes.next().await {
+                let response = item
+                    .map(|chunk| app::ReadFileResponse {
+                        frame: Some(app::read_file_response::Frame::Chunk(chunk.to_vec())),
+                    })
+                    .map_err(|error| into_status(error.into()));
+                if tx.send(response).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
+    }
+
+    async fn copy_files(
+        &self,
+        req: Request<app::CopyFilesRequest>,
+    ) -> Result<Response<app::CopyFilesResponse>, Status> {
+        self.auth.check(&req)?;
+        let request = req.into_inner();
+        let source_session_id = parse_session_id(&request.source_session_id)?;
+        let target_session_id = parse_session_id(&request.target_session_id)?;
+        let files = crate::api::session_files::copy_files_core(
+            &self.state,
+            source_session_id,
+            target_session_id,
+            request.paths,
+        )
+        .await
+        .map_err(into_status)?;
+        Ok(Response::new(app::CopyFilesResponse {
+            files: files
+                .into_iter()
+                .map(|file| app::CopyFileResult {
+                    path: file.path,
+                    size_bytes: file.size_bytes,
+                    sha256: file.sha256,
+                })
+                .collect(),
+        }))
     }
 
     async fn get_log(

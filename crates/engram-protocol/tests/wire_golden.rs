@@ -62,10 +62,7 @@ use engram_core::types::sandbox::{
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::types::{WarmStageOutcome, WarmStageRecord};
 use engram_core::{SandboxId, SessionId, SnapshotId};
-use engram_protocol::wire::{
-    WireExecRequest, WireReapStats, WireWriteFileResult, WireWriteFileSpec, WireWriteFilesRequest,
-    WireWriteFilesResponse, WIRE_VERSION,
-};
+use engram_protocol::wire::{WireExecRequest, WireReapStats, WIRE_VERSION};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -560,29 +557,6 @@ fn wire_mirrors_golden() {
             files_skipped_too_young: 2,
         },
     );
-    // ADR 0100 (wire v17): the coord↔host WriteFiles payloads.
-    assert_golden_no_eq("wire_write_files_request", &wire_write_files_request());
-    assert_golden_no_eq("wire_write_files_response", &wire_write_files_response());
-}
-
-fn wire_write_files_request() -> WireWriteFilesRequest {
-    WireWriteFilesRequest {
-        files: vec![WireWriteFileSpec {
-            path: "/workspace/.review/finder.md".into(),
-            content: b"be skeptical".to_vec(),
-            mode: Some(0o640),
-        }],
-    }
-}
-
-fn wire_write_files_response() -> WireWriteFilesResponse {
-    WireWriteFilesResponse {
-        results: vec![WireWriteFileResult {
-            path: "/workspace/.review/finder.md".into(),
-            ok: false,
-            error: Some("read-only file system".into()),
-        }],
-    }
 }
 
 #[test]
@@ -658,7 +632,7 @@ fn wire_version_pinned() {
     // All session-policy goldens were regenerated; the Google fixture pins a
     // service and a populated tunnel.
     assert_eq!(
-        WIRE_VERSION, 26,
+        WIRE_VERSION, 27,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
@@ -765,8 +739,6 @@ fn regen_golden() {
             files_skipped_too_young: 2,
         },
     );
-    write("wire_write_files_request", &wire_write_files_request());
-    write("wire_write_files_response", &wire_write_files_response());
 }
 
 /// The engrams-review outage (2026-08-01): the internally-tagged

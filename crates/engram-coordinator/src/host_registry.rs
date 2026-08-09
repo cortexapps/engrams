@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use engram_core::traits::{HarnessDial, HostClient, MetadataStore, SessionFence};
 use engram_core::types::sandbox::{
-    AgentSpec, ExecRequest, ExecStream, SandboxSpec, WriteFileResult, WriteFileSpec,
+    AgentSpec, ExecRequest, ExecStream, SandboxSpec, SessionFileMetadata, SessionFileSpec,
+    SessionFileStream,
 };
 use engram_core::types::session::SessionState;
 use engram_core::types::snapshot::SnapshotMetadata;
@@ -551,29 +552,23 @@ impl HostClient for HostRegistry {
         backend.cancel_exec(id, exec_id).await
     }
 
-    async fn write_files(
+    async fn write_file(
         &self,
         id: SandboxId,
-        files: Vec<WriteFileSpec>,
-    ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        // Unlike exec, WriteFiles is idempotent: retrying the whole batch after
-        // an Unavailable response merely replaces each file with the same bytes.
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let (_, backend) = self.resolve_owner(id).await?;
-            match backend.write_files(id, files.clone()).await {
-                Err(SandboxError::Unavailable(msg)) if attempt < MAX_ATTEMPTS => {
-                    tracing::debug!(
-                        sandbox_id = %id, attempt, error = %msg,
-                        "write_files transient Unavailable; retrying",
-                    );
-                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
-                }
-                other => return other,
-            }
-        }
+        spec: SessionFileSpec,
+        bytes: SessionFileStream,
+    ) -> Result<SessionFileMetadata, SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.write_file(id, spec, bytes).await
+    }
+
+    async fn read_file(
+        &self,
+        id: SandboxId,
+        path: String,
+    ) -> Result<(SessionFileMetadata, SessionFileStream), SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.read_file(id, path).await
     }
 
     async fn snapshot(

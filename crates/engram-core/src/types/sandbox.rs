@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use super::ids::SandboxId;
 use super::image::NetworkPolicy;
 
+/// Maximum size of one composer/session file (ADR 0113).
+pub const MAX_SESSION_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
 /// ADR 0068 probe-before-host_lost: the answer to "is this specific
 /// sandbox actually there", from GROUND TRUTH — not the in-memory
 /// sandbox map `SandboxBackend::list()` reads (that map, or its
@@ -426,24 +429,28 @@ pub struct ExecRequest {
     pub wake: Option<bool>,
 }
 
-/// One file to write into a running sandbox.
+/// Metadata for one bounded-memory file write (ADR 0113).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WriteFileSpec {
+pub struct SessionFileSpec {
     pub path: String,
-    pub content: Vec<u8>,
-    /// Unix permission bits applied after writing. `None` leaves the
-    /// platform-created permissions unchanged.
+    pub size_bytes: u64,
+    /// Lower-case hexadecimal SHA-256 digest.
+    pub sha256: String,
+    /// Unix permission bits applied after writing. `None` creates a 0600 file.
     pub mode: Option<u32>,
 }
 
-/// Per-file outcome from a batched [`SandboxBackend::write_files`](
-/// crate::traits::SandboxBackend::write_files) operation.
+/// Verified metadata returned after upload or before a read stream.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WriteFileResult {
+pub struct SessionFileMetadata {
     pub path: String,
-    pub ok: bool,
-    pub error: Option<String>,
+    pub size_bytes: u64,
+    pub sha256: String,
 }
+
+/// A bounded-memory stream of file bytes.
+pub type SessionFileStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, crate::SandboxError>> + Send + 'static>>;
 
 /// Output event from a streaming `exec`. A terminal backend result is marked
 /// by exactly one `Exit` or `Refused`. The event stream may instead end

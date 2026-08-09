@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use engram_core::traits::{HostClient, SessionFence};
-use engram_core::types::sandbox::{ExecEvent, ExecEventStream};
+use engram_core::types::sandbox::{ExecEvent, ExecEventStream, SessionFileSpec};
 use engram_core::SandboxError;
 use engram_protocol::admin::HostAdminHandler;
 use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer};
@@ -28,21 +28,20 @@ use engram_protocol::grpc::{
     BindHarnessSessionRequest, BrowserPortResponse, CancelExecRequest, CowStateAllResponse,
     CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
     DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty,
-    ExecExit, ExecFrame, ExecStartRequest, FencedSandboxRequest, GuestIpResponse, IdePortResponse,
-    InterruptHarnessRequest, ListSandboxesResponse, MaterializeImageDone, MaterializeImageEvent,
-    MaterializeImageFailed, MaterializeImageRequest, MaterializeProgress, MigrationCaptureResponse,
-    MigrationExportRef, MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse,
-    PeerChunkFrame, PeerChunkGetRequest, PostCopyCaptureResponse, ProbeSandboxResponse,
-    ProxyPortData, ProxyPortMessage, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
-    ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
-    ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, SendHarnessToolResultRequest, SnapshotBeginResponse,
-    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest, WriteFilesRequest,
-    WriteFilesResponse,
+    ExecExit, ExecFrame, ExecStartRequest, FencedSandboxRequest, GuestIpResponse,
+    HostReadFileMetadata, HostReadFileRequest, HostReadFileResponse, HostWriteFileRequest,
+    HostWriteFileResponse, IdePortResponse, InterruptHarnessRequest, ListSandboxesResponse,
+    MaterializeImageDone, MaterializeImageEvent, MaterializeImageFailed, MaterializeImageRequest,
+    MaterializeProgress, MigrationCaptureResponse, MigrationExportRef, MigrationFetchRequest,
+    MigrationFrame, MigrationPresetupResponse, PeerChunkFrame, PeerChunkGetRequest,
+    PostCopyCaptureResponse, ProbeSandboxResponse, ProxyPortData, ProxyPortMessage,
+    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing, ProxyShellPong,
+    ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
+    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
+    SendHarnessToolResultRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
+    UnbindHarnessSessionRequest,
 };
-use engram_protocol::wire::{
-    WireExecRequest, WireReapStats, WireWriteFilesRequest, WireWriteFilesResponse,
-};
+use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
 use std::pin::Pin;
 use tokio::sync::mpsc;
@@ -268,6 +267,8 @@ impl HostService for HostServiceImpl {
         Pin<Box<dyn Stream<Item = Result<ProxyPortMessage, Status>> + Send + 'static>>;
     type MaterializeImageStream =
         Pin<Box<dyn Stream<Item = Result<MaterializeImageEvent, Status>> + Send + 'static>>;
+    type ReadFileStream =
+        Pin<Box<dyn Stream<Item = Result<HostReadFileResponse, Status>> + Send + 'static>>;
 
     async fn ping(&self, _req: Request<Empty>) -> Result<Response<Empty>, Status> {
         Ok(Response::new(Empty {}))
@@ -1264,26 +1265,116 @@ impl HostService for HostServiceImpl {
         Ok(Response::new(Empty {}))
     }
 
-    /// ADR 0100: unary batch file staging. The backend owns the guest
-    /// transport loop and returns one result for every requested file.
-    async fn write_files(
+    async fn write_file(
         &self,
-        req: Request<WriteFilesRequest>,
-    ) -> Result<Response<WriteFilesResponse>, Status> {
+        req: Request<tonic::Streaming<HostWriteFileRequest>>,
+    ) -> Result<Response<HostWriteFileResponse>, Status> {
         check_wire_version(&req)?;
-        let r = req.into_inner();
-        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
-        let wire: WireWriteFilesRequest =
-            decode_bincode(&r.request_bincode, "WireWriteFilesRequest")?;
-        let results = self
+        use futures::StreamExt;
+        let mut inbound = req.into_inner();
+        let first = inbound
+            .next()
+            .await
+            .ok_or_else(|| Status::invalid_argument("file metadata frame is required"))??;
+        let metadata = match first.frame {
+            Some(engram_protocol::grpc::host_write_file_request::Frame::Metadata(metadata)) => {
+                metadata
+            }
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first file frame must be metadata",
+                ))
+            }
+        };
+        let sandbox_id = decode_sandbox_id(&metadata.sandbox_id)?;
+        let spec = SessionFileSpec {
+            path: metadata.path,
+            size_bytes: metadata.size_bytes,
+            sha256: metadata.sha256,
+            mode: metadata.mode,
+        };
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(frame) = inbound.next().await {
+                let item = match frame {
+                    Ok(HostWriteFileRequest {
+                        frame:
+                            Some(engram_protocol::grpc::host_write_file_request::Frame::Chunk(chunk)),
+                    }) => Ok(bytes::Bytes::from(chunk)),
+                    Ok(_) => Err(SandboxError::InvalidSpec(
+                        "file metadata must appear exactly once".into(),
+                    )),
+                    Err(error) => Err(SandboxError::Unavailable(format!(
+                        "file stream transport failed: {error}"
+                    ))),
+                };
+                if tx.send(item).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let result = self
             .inner
-            .write_files(sandbox_id, wire.into_engine())
+            .write_file(
+                sandbox_id,
+                spec,
+                Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            )
             .await
             .map_err(sandbox_to_status)?;
-        let response = WireWriteFilesResponse::from_engine(results);
-        Ok(Response::new(WriteFilesResponse {
-            response_bincode: encode_bincode(&response, "WireWriteFilesResponse")?,
+        Ok(Response::new(HostWriteFileResponse {
+            path: result.path,
+            size_bytes: result.size_bytes,
+            sha256: result.sha256,
         }))
+    }
+
+    async fn read_file(
+        &self,
+        req: Request<HostReadFileRequest>,
+    ) -> Result<Response<Self::ReadFileStream>, Status> {
+        check_wire_version(&req)?;
+        use futures::StreamExt;
+        let request = req.into_inner();
+        let sandbox_id = decode_sandbox_id(&request.sandbox_id)?;
+        let (metadata, mut bytes) = self
+            .inner
+            .read_file(sandbox_id, request.path)
+            .await
+            .map_err(sandbox_to_status)?;
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(Ok(HostReadFileResponse {
+            frame: Some(
+                engram_protocol::grpc::host_read_file_response::Frame::Metadata(
+                    HostReadFileMetadata {
+                        path: metadata.path,
+                        size_bytes: metadata.size_bytes,
+                        sha256: metadata.sha256,
+                    },
+                ),
+            ),
+        }))
+        .await
+        .map_err(|_| Status::cancelled("read client closed before metadata"))?;
+        tokio::spawn(async move {
+            while let Some(item) = bytes.next().await {
+                let frame = item
+                    .map(|chunk| HostReadFileResponse {
+                        frame: Some(
+                            engram_protocol::grpc::host_read_file_response::Frame::Chunk(
+                                chunk.to_vec(),
+                            ),
+                        ),
+                    })
+                    .map_err(sandbox_to_status);
+                if tx.send(frame).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 
     /// ADR 0014 issue #6: bidi WS-frame tunnel.
