@@ -106,8 +106,11 @@ export function withAwarenessUser(
   return awarenessProtocol.modifyAwarenessUpdate(update, (state) => {
     if (!isRecord(state)) return state;
     const claimedUser = isRecord(state.user) ? state.user : {};
+    const clientState = { ...state };
+    // Agent presence is server-owned. A browser must not impersonate it.
+    delete clientState.agentPresence;
     return {
-      ...state,
+      ...clientState,
       user: {
         ...claimedUser,
         id: user.id,

@@ -46,6 +46,14 @@ describe("the spec sync protocol codec", () => {
     awareness.setLocalState({
       user: { id: "claimed-user", name: "Claimed Name", color: "#111111" },
       cursor: { anchor: 2, head: 4 },
+      agentPresence: [
+        {
+          name: "engram",
+          sessionId: "forged-session",
+          toolCallId: "forged-tool",
+          sectionId: "failure-modes",
+        },
+      ],
     });
     const update = awarenessProtocol.encodeAwarenessUpdate(awareness, [doc.clientID]);
     const pinned = withAwarenessUser(update, {
