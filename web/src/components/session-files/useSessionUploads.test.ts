@@ -1,3 +1,4 @@
+import { act, renderHook } from "@testing-library/react";
 import { describe, expect, test } from "vitest";
 
 import {
@@ -5,6 +6,7 @@ import {
   sanitizeUploadName,
   serializeComposer,
   tokenForFile,
+  useSessionUploads,
   type UploadToken,
 } from "./useSessionUploads";
 
@@ -46,5 +48,36 @@ describe("session upload composer tokens", () => {
     expect(serializeComposer(`Review ${tokens[0]!.path} first`, tokens)).toBe(
       `Review ${tokens[0]!.path} first\n${tokens[1]!.path}`,
     );
+  });
+
+  test("restores the original pending file when its path is pasted after removal", () => {
+    const file = new File(["hello"], "notes.txt");
+    const { result } = renderHook(() => useSessionUploads());
+    let original: UploadToken;
+
+    act(() => {
+      [original] = result.current.addFiles([file]);
+    });
+    act(() => result.current.remove(original!.id));
+    expect(result.current.tokens).toEqual([]);
+
+    act(() => expect(result.current.addCanonicalPath(original!.path)).toBe(true));
+
+    expect(result.current.tokens).toHaveLength(1);
+    expect(result.current.tokens[0]).toMatchObject({
+      id: original!.id,
+      path: original!.path,
+      file,
+      status: "pending",
+    });
+  });
+
+  test("does not claim that an unknown path is uploaded before a session exists", () => {
+    const { result } = renderHook(() => useSessionUploads());
+    const path = "/tmp/uploads/019fe2ff-0464-75f3-bb20-a8c1844579b9/unknown.txt";
+
+    act(() => expect(result.current.addCanonicalPath(path)).toBe(false));
+
+    expect(result.current.tokens).toEqual([]);
   });
 });

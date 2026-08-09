@@ -53,21 +53,25 @@ function renderValue(parts: readonly ValuePart[], tokensByPath: ReadonlyMap<stri
     .map((part) => {
       if (part.kind === "text") return escapeHtml(part.value);
       const token = tokensByPath.get(part.value);
+      if (!token) return escapeHtml(part.value);
       const name = token?.name ?? part.value.split("/").at(-1) ?? part.value;
-      const stateClass = token?.status === "error" ? " border-destructive/60 text-destructive" : "";
+      const stateClass =
+        token?.status === "error"
+          ? " border-destructive/60 bg-destructive/10 text-destructive"
+          : " border-border/70 bg-muted/80 text-foreground";
       const status =
         token?.status === "hashing" || token?.status === "uploading"
           ? '<span class="animate-spin" aria-hidden="true">◌</span>'
-          : '<span aria-hidden="true">▱</span>';
+          : "";
       const progress =
         token && token.progress > 0 && token.progress < 1
           ? `<span class="text-muted-foreground">${Math.round(token.progress * 100)}%</span>`
           : "";
       const retry =
         token?.status === "error" && token.file
-          ? `<button type="button" data-upload-action="retry" aria-label="Retry ${escapeHtml(name)}">↻</button>`
+          ? `<button type="button" contenteditable="false" data-upload-action="retry" class="-mr-0.5 rounded px-0.5 hover:bg-destructive/15" aria-label="Retry ${escapeHtml(name)}">↻</button>`
           : "";
-      return `<span contenteditable="false" data-upload-path="${escapeHtml(part.value)}" data-upload-start="${part.start}" data-upload-end="${part.end}" class="mx-0.5 inline-flex max-w-full items-center gap-1 rounded-md border bg-secondary/70 px-1.5 py-0.5 align-baseline font-mono text-xs${stateClass}" title="${escapeHtml(token?.error ?? part.value)}">${status}<span class="max-w-56 truncate">${escapeHtml(name)}</span>${progress}<button type="button" data-upload-action="copy" aria-label="Copy ${escapeHtml(part.value)}">⧉</button>${retry}<button type="button" data-upload-action="remove" aria-label="Remove ${escapeHtml(name)}">×</button></span>`;
+      return `<span contenteditable="false" data-upload-path="${escapeHtml(part.value)}" aria-label="${escapeHtml(name)} attachment" class="mx-0.5 inline-flex max-w-full cursor-default select-all items-center gap-1 rounded-md border px-1.5 py-px align-baseline font-mono text-[0.82em] leading-5 shadow-sm transition-colors selection:bg-primary/25${stateClass}" title="${escapeHtml(token?.error ?? part.value)}">${status}<span class="max-w-56 truncate">${escapeHtml(name)}</span>${progress}${retry}</span>`;
     })
     .join("");
 }
@@ -171,6 +175,16 @@ function restoreCaret(root: HTMLElement, offset: number) {
   selection.addRange(range);
 }
 
+function selectUploadToken(root: HTMLElement, token: HTMLElement): number | null {
+  const selection = window.getSelection();
+  if (!selection) return null;
+  const range = document.createRange();
+  range.selectNode(token);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  return selectionOffsets(root)?.[1] ?? null;
+}
+
 export interface InlineUploadComposerHandle {
   addFiles: (files: FileList | readonly File[]) => void;
   focus: () => void;
@@ -217,6 +231,25 @@ export const InlineUploadComposer = forwardRef<
   const tokensByPath = useMemo(() => new Map(tokens.map((token) => [token.path, token])), [tokens]);
   const renderedValue = useMemo(() => renderValue(parts, tokensByPath), [parts, tokensByPath]);
 
+  const removeMissingTokens = useCallback(
+    (next: string) => {
+      for (const token of tokens) {
+        if (!next.includes(token.path)) onRemove(token.id);
+      }
+    },
+    [onRemove, tokens],
+  );
+
+  const replaceRange = useCallback(
+    (start: number, end: number, inserted: string) => {
+      const next = value.slice(0, start) + inserted + value.slice(end);
+      caretRef.current = start + inserted.length;
+      onChange(next);
+      removeMissingTokens(next);
+    },
+    [onChange, removeMissingTokens, value],
+  );
+
   useLayoutEffect(() => {
     const root = rootRef.current;
     if (!root || caretRef.current == null || document.activeElement !== root) return;
@@ -230,10 +263,9 @@ export const InlineUploadComposer = forwardRef<
       const offsets = root ? selectionOffsets(root) : null;
       const fallback = caretRef.current ?? value.length;
       const [start, end] = offsets ?? [fallback, fallback];
-      caretRef.current = start + inserted.length;
-      onChange(value.slice(0, start) + inserted + value.slice(end));
+      replaceRange(start, end, inserted);
     },
-    [onChange, value],
+    [replaceRange, value.length],
   );
 
   const attachFiles = useCallback(
@@ -250,16 +282,6 @@ export const InlineUploadComposer = forwardRef<
     [attachFiles],
   );
 
-  const removePart = (path: string, start: number, end: number) => {
-    const next = value.slice(0, start) + value.slice(end);
-    caretRef.current = start;
-    onChange(next);
-    if (!next.includes(path)) {
-      const token = tokensByPath.get(path);
-      if (token) onRemove(token.id);
-    }
-  };
-
   const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
     event.preventDefault();
     const pasted = event.clipboardData.getData("text/plain");
@@ -267,6 +289,23 @@ export const InlineUploadComposer = forwardRef<
       onCanonicalPath(match[0]);
     }
     replaceSelection(pasted);
+  };
+
+  const handleCopy = (event: ClipboardEvent<HTMLDivElement>) => {
+    const root = rootRef.current;
+    const offsets = root ? selectionOffsets(root) : null;
+    if (!offsets || offsets[0] === offsets[1]) return;
+    event.preventDefault();
+    event.clipboardData.setData("text/plain", value.slice(offsets[0], offsets[1]));
+  };
+
+  const handleCut = (event: ClipboardEvent<HTMLDivElement>) => {
+    const root = rootRef.current;
+    const offsets = root ? selectionOffsets(root) : null;
+    if (!offsets || offsets[0] === offsets[1] || disabled) return;
+    event.preventDefault();
+    event.clipboardData.setData("text/plain", value.slice(offsets[0], offsets[1]));
+    replaceRange(offsets[0], offsets[1], "");
   };
 
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
@@ -303,22 +342,52 @@ export const InlineUploadComposer = forwardRef<
         if (offsets) caretRef.current = offsets[1];
         const next = editorValue(root);
         onChange(next);
-        for (const token of tokens) {
-          if (!next.includes(token.path)) onRemove(token.id);
-        }
+        removeMissingTokens(next);
       }}
+      onCopy={handleCopy}
+      onCut={handleCut}
       onPaste={handlePaste}
       onDragOver={(event) => event.preventDefault()}
       onDrop={handleDrop}
       onKeyDown={(event) => {
         onKeyDown?.(event);
-        if (event.defaultPrevented || event.key !== "Enter") return;
+        if (event.defaultPrevented) return;
+        if (event.key === "Backspace" || event.key === "Delete") {
+          const root = rootRef.current;
+          const offsets = root ? selectionOffsets(root) : null;
+          if (offsets) {
+            let [start, end] = offsets;
+            if (start === end) {
+              const adjacent = parts.find(
+                (part) =>
+                  part.kind === "upload" &&
+                  (event.key === "Backspace" ? part.end === start : part.start === start),
+              );
+              if (!adjacent) return;
+              start = adjacent.start;
+              end = adjacent.end;
+            }
+            event.preventDefault();
+            replaceRange(start, end, "");
+          }
+          return;
+        }
+        if (event.key !== "Enter") return;
         event.preventDefault();
         replaceSelection("\n");
       }}
       onMouseDown={(event) => {
-        if ((event.target as HTMLElement).closest("button[data-upload-action]"))
+        const target = event.target as HTMLElement;
+        if (target.closest("button[data-upload-action]")) {
           event.preventDefault();
+          return;
+        }
+        const chip = target.closest<HTMLElement>("[data-upload-path]");
+        const root = rootRef.current;
+        if (!chip || !root) return;
+        event.preventDefault();
+        root.focus();
+        caretRef.current = selectUploadToken(root, chip);
       }}
       onClick={(event) => {
         const button = (event.target as HTMLElement).closest<HTMLButtonElement>(
@@ -327,14 +396,9 @@ export const InlineUploadComposer = forwardRef<
         const chip = button?.closest<HTMLElement>("[data-upload-path]");
         const path = chip?.dataset.uploadPath;
         if (!button || !chip || !path) return;
-        const action = button.dataset.uploadAction;
-        if (action === "copy") void navigator.clipboard.writeText(path);
-        if (action === "retry") {
+        if (button.dataset.uploadAction === "retry") {
           const token = tokensByPath.get(path);
           if (token) onRetry(token.id);
-        }
-        if (action === "remove") {
-          removePart(path, Number(chip.dataset.uploadStart), Number(chip.dataset.uploadEnd));
         }
       }}
       dangerouslySetInnerHTML={{ __html: renderedValue }}

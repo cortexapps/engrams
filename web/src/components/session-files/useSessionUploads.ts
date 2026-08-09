@@ -141,11 +141,15 @@ export function serializeComposer(text: string, tokens: readonly UploadToken[]):
 export function useSessionUploads(sessionId?: string) {
   const [tokens, setTokens] = useState<UploadToken[]>([]);
   const tokensRef = useRef(tokens);
+  const knownTokensRef = useRef<UploadToken[]>([]);
   tokensRef.current = tokens;
 
   const patchToken = useCallback((id: string, patch: Partial<UploadToken>) => {
     setTokens((current) =>
       current.map((token) => (token.id === id ? { ...token, ...patch } : token)),
+    );
+    knownTokensRef.current = knownTokensRef.current.map((token) =>
+      token.id === id ? { ...token, ...patch } : token,
     );
   }, []);
 
@@ -169,6 +173,7 @@ export function useSessionUploads(sessionId?: string) {
   const addFiles = useCallback(
     (files: FileList | readonly File[]) => {
       const added = Array.from(files).map(tokenForFile);
+      knownTokensRef.current = [...knownTokensRef.current, ...added];
       setTokens((current) => [...current, ...added]);
       if (sessionId) {
         for (const token of added) void runUpload(sessionId, token).catch(() => {});
@@ -178,26 +183,29 @@ export function useSessionUploads(sessionId?: string) {
     [runUpload, sessionId],
   );
 
-  const addCanonicalPath = useCallback((path: string): boolean => {
-    if (!CANONICAL_UPLOAD_PATH.test(path)) return false;
-    const parts = path.split("/");
-    const id = parts.at(-2)!;
-    setTokens((current) =>
-      current.some((token) => token.path === path)
-        ? current
-        : [
-            ...current,
-            {
-              id,
-              name: parts.at(-1)!,
-              path,
-              status: "uploaded",
-              progress: 1,
-            },
-          ],
-    );
-    return true;
-  }, []);
+  const addCanonicalPath = useCallback(
+    (path: string): boolean => {
+      if (!CANONICAL_UPLOAD_PATH.test(path)) return false;
+      const known = knownTokensRef.current.find((token) => token.path === path);
+      if (!known && !sessionId) return false;
+      const parts = path.split("/");
+      const token =
+        known ??
+        ({
+          id: parts.at(-2)!,
+          name: parts.at(-1)!,
+          path,
+          status: "uploaded",
+          progress: 1,
+        } satisfies UploadToken);
+      if (!known) knownTokensRef.current = [...knownTokensRef.current, token];
+      setTokens((current) =>
+        current.some((candidate) => candidate.path === path) ? current : [...current, token],
+      );
+      return true;
+    },
+    [sessionId],
+  );
 
   const remove = useCallback((id: string) => {
     setTokens((current) => current.filter((token) => token.id !== id));
@@ -223,6 +231,11 @@ export function useSessionUploads(sessionId?: string) {
     [runUpload],
   );
 
+  const clear = useCallback(() => {
+    knownTokensRef.current = [];
+    setTokens([]);
+  }, []);
+
   return {
     tokens,
     addFiles,
@@ -230,7 +243,7 @@ export function useSessionUploads(sessionId?: string) {
     remove,
     retry,
     uploadAll,
-    clear: () => setTokens([]),
+    clear,
     busy: tokens.some((token) => token.status === "hashing" || token.status === "uploading"),
     ready: tokens.every((token) => token.status === "uploaded"),
   };
