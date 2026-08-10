@@ -22,24 +22,33 @@ class MemoryProjectionStore implements SpecProjectionStore {
   readonly rows: ProjectionRecord[] = [];
   readonly sessionSpecs = new Map([[SESSION_ID, SPEC_ID]]);
   currentDocSeq = 7n;
+  currentSemanticDocSeq = 7n;
 
   async reserve(input: SpecProjectionRequest, discardNotice = false): Promise<ProjectionRecord> {
     const latest = this.rows.filter((row) => row.specId === input.specId).at(-1);
     if (
       latest &&
       (latest.state === "rendering" || latest.state === "staged") &&
-      latest.docSeq === this.currentDocSeq
+      latest.semanticDocSeq === this.currentSemanticDocSeq
     ) {
       if (!discardNotice || latest.discardNotice || latest.rendered.byteLength === 0) {
         latest.discardNotice ||= discardNotice;
         return latest;
       }
     }
+    if (
+      latest?.state === "published" &&
+      latest.semanticDocSeq === this.currentSemanticDocSeq &&
+      !discardNotice
+    ) {
+      return latest;
+    }
     const rev = (latest?.rev ?? 0n) + 1n;
     const row: ProjectionRecord = {
       ...input,
       rev,
       docSeq: this.currentDocSeq,
+      semanticDocSeq: this.currentSemanticDocSeq,
       sha256: "",
       rendered: new Uint8Array(),
       documentState: new Uint8Array(),
@@ -268,6 +277,7 @@ describe("SpecProjectionDriver", () => {
     const rendered = pinned.rendered.slice();
     const digest = pinned.digest.slice();
     store.currentDocSeq = 8n;
+    store.currentSemanticDocSeq = 8n;
 
     await driver.runOnce(SESSION_ID);
     expect(rendererCalls()).toBe(1);
@@ -283,6 +293,7 @@ describe("SpecProjectionDriver", () => {
       if (reserved || path !== "/workspace/.engrams/spec/incoming-1.md") return;
       reserved = true;
       store.currentDocSeq = 8n;
+      store.currentSemanticDocSeq = 8n;
       await driver.enqueue({
         specId: SPEC_ID,
         sessionId: SESSION_ID,
@@ -336,6 +347,8 @@ describe("SpecProjectionDriver", () => {
     await driver.enqueue({ specId: SPEC_ID, sessionId: SESSION_ID, source: "initial" });
     await driver.runOnce(SESSION_ID);
 
+    store.currentDocSeq = 8n;
+    store.currentSemanticDocSeq = 8n;
     guest.failWriteOnce = "/workspace/.engrams/spec/incoming-digest-2.md";
     await driver.enqueue({ specId: SPEC_ID, sessionId: SESSION_ID, source: "boundary" });
     await expect(driver.runOnce(SESSION_ID)).rejects.toThrow("injected staging failure");

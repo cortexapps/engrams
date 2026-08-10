@@ -6,6 +6,7 @@ import {
   SPEC_BLOCK_CACHE_MAX_BYTES,
   SPEC_FRAGMENT_NAME,
   specNodesSemanticallyEqual,
+  validateSpecBlockCachedRender,
   validateRequirementEdit,
 } from "@engrams/spec-document";
 import type { Node as ProseMirrorNode } from "prosemirror-model";
@@ -114,10 +115,12 @@ export interface SpecSnapshotRecord {
   state: Uint8Array;
   stateVector: Uint8Array;
   coveredSeq: bigint;
+  coveredSemanticDocSeq: bigint;
 }
 
 export interface SpecUpdateRecord {
   seq: bigint;
+  semanticDocSeq: bigint;
   update: Uint8Array;
   clientId: string | null;
 }
@@ -130,7 +133,13 @@ export interface SpecDocumentSectionEffect {
 
 export interface SpecUpdateEffects {
   sections: readonly SpecDocumentSectionEffect[];
+  semanticChanged: boolean;
   at?: Date;
+}
+
+export interface SpecUpdateInsertResult {
+  seq: bigint;
+  semanticDocSeq: bigint;
 }
 
 export interface CompactSnapshotInput extends SpecSnapshotRecord {
@@ -146,7 +155,7 @@ export interface SpecDocumentStore {
     update: Uint8Array,
     clientId: string | null,
     effects: SpecUpdateEffects,
-  ): Promise<bigint | null>;
+  ): Promise<SpecUpdateInsertResult | null>;
   notifyUpdate(specId: string, seq: bigint): Promise<void>;
   compactSnapshot(input: CompactSnapshotInput): Promise<boolean>;
   listen(onWake: (specId: string) => void, onReconnect?: () => void): Promise<() => Promise<void>>;
@@ -155,12 +164,14 @@ export interface SpecDocumentStore {
 export interface LoadedSpecDocument {
   readonly doc: Y.Doc;
   readonly lastAppliedSeq: bigint;
+  readonly semanticDocSeq: bigint;
 }
 
 interface CachedSpecDocument {
   doc: Y.Doc;
   validationDoc: Y.Doc;
   lastAppliedSeq: bigint;
+  semanticDocSeq: bigint;
   renderedSizeUpperBound: number;
 }
 
@@ -195,6 +206,7 @@ export class SpecCompactionStaleError extends Error {
 export function proseMirrorDocument(doc: Y.Doc): ProseMirrorNode {
   const fragment = doc.getXmlFragment(SPEC_FRAGMENT_NAME);
   if (fragment.length === 0) throw new Error("The spec document has no sections");
+  migrateLegacyDiagramBlockIds(doc);
   return yXmlFragmentToProseMirrorRootNode(fragment, schema);
 }
 
@@ -268,8 +280,8 @@ export class SpecDocumentService {
       const room = await this.loadUnlocked(specId);
       for (;;) {
         await this.syncUnlocked(specId, room);
-        if (expectedSeq !== undefined && room.lastAppliedSeq !== expectedSeq) {
-          throw new SpecDocumentRevisionConflictError(expectedSeq, room.lastAppliedSeq);
+        if (expectedSeq !== undefined && room.semanticDocSeq !== expectedSeq) {
+          throw new SpecDocumentRevisionConflictError(expectedSeq, room.semanticDocSeq);
         }
         const fork = new Y.Doc();
         try {
@@ -307,9 +319,10 @@ export class SpecDocumentService {
         const stateVector = Y.encodeStateVector(room.doc);
         const renderedMarkdown = renderMarkdown(proseMirrorDocument(room.doc));
         const coveredSeq = room.lastAppliedSeq;
-        const input = { specId, state, stateVector, coveredSeq };
+        const coveredSemanticDocSeq = room.semanticDocSeq;
+        const input = { specId, state, stateVector, coveredSeq, coveredSemanticDocSeq };
         if (await this.store.compactSnapshot(input)) {
-          return { state, stateVector, coveredSeq, renderedMarkdown };
+          return { state, stateVector, coveredSeq, coveredSemanticDocSeq, renderedMarkdown };
         }
       }
       throw new SpecCompactionStaleError(specId);
@@ -327,45 +340,93 @@ export class SpecDocumentService {
     const cached = this.cache.get(specId);
     if (cached) return cached;
 
-    const doc = new Y.Doc();
-    const validationDoc = new Y.Doc();
-    const snapshot = await this.store.readSnapshot(specId);
-    let lastAppliedSeq = 0n;
-    if (snapshot) {
-      Y.applyUpdate(doc, snapshot.state);
-      Y.applyUpdate(validationDoc, snapshot.state);
-      lastAppliedSeq = snapshot.coveredSeq;
+    for (;;) {
+      const doc = new Y.Doc();
+      const validationDoc = new Y.Doc();
+      const snapshot = await this.store.readSnapshot(specId);
+      let lastAppliedSeq = 0n;
+      let semanticDocSeq = 0n;
+      if (snapshot) {
+        Y.applyUpdate(doc, snapshot.state);
+        Y.applyUpdate(validationDoc, snapshot.state);
+        lastAppliedSeq = snapshot.coveredSeq;
+        semanticDocSeq = snapshot.coveredSemanticDocSeq;
+      }
+      const room = {
+        doc,
+        validationDoc,
+        lastAppliedSeq,
+        semanticDocSeq,
+        renderedSizeUpperBound: 0,
+      };
+      await this.applyTail(specId, room, "peer", false);
+      const migration = migrateLegacyDiagramBlockIds(doc);
+      if (migration) {
+        Y.applyUpdate(validationDoc, migration);
+        const inserted = await this.store.insertUpdateIfLatest(
+          specId,
+          room.lastAppliedSeq,
+          migration,
+          null,
+          { sections: [], semanticChanged: false },
+        );
+        if (!inserted) {
+          doc.destroy();
+          validationDoc.destroy();
+          continue;
+        }
+        room.lastAppliedSeq = inserted.seq;
+        room.semanticDocSeq = inserted.semanticDocSeq;
+        const row = { ...inserted, update: migration, clientId: null };
+        this.broadcast({ specId, ...row, source: "local" });
+        await this.store.notifyUpdate(specId, inserted.seq);
+      }
+      if (doc.getXmlFragment(SPEC_FRAGMENT_NAME).length > 0) {
+        room.renderedSizeUpperBound = this.validateCompleteDocument(doc);
+      }
+      this.cache.set(specId, room);
+      return room;
     }
-    const room = { doc, validationDoc, lastAppliedSeq, renderedSizeUpperBound: 0 };
-    await this.applyTail(specId, room, "peer");
-    if (doc.getXmlFragment(SPEC_FRAGMENT_NAME).length > 0) {
-      room.renderedSizeUpperBound = this.measureRenderedSize(proseMirrorDocument(doc));
-    }
-    this.cache.set(specId, room);
-    return room;
   }
 
   private async syncUnlocked(specId: string, room: CachedSpecDocument): Promise<void> {
     const snapshot = await this.store.readSnapshot(specId);
     if (snapshot && snapshot.coveredSeq > room.lastAppliedSeq) {
+      const candidate = new Y.Doc();
+      let renderedSize: number;
+      try {
+        Y.applyUpdate(candidate, Y.encodeStateAsUpdate(room.doc));
+        Y.applyUpdate(candidate, snapshot.state);
+        renderedSize = this.validateCompleteDocument(candidate);
+      } finally {
+        candidate.destroy();
+      }
       Y.applyUpdate(room.doc, snapshot.state);
       Y.applyUpdate(room.validationDoc, snapshot.state);
       room.lastAppliedSeq = snapshot.coveredSeq;
+      room.semanticDocSeq = snapshot.coveredSemanticDocSeq;
+      room.renderedSizeUpperBound = renderedSize;
     }
     await this.applyTail(specId, room, "peer");
   }
 
-  private async applyTail(specId: string, room: CachedSpecDocument, source: "peer"): Promise<void> {
+  private async applyTail(
+    specId: string,
+    room: CachedSpecDocument,
+    source: "peer",
+    measure = true,
+  ): Promise<void> {
     const updates = await this.store.readUpdatesAfter(specId, room.lastAppliedSeq);
     for (const row of updates) {
       Y.applyUpdate(room.doc, row.update);
       Y.applyUpdate(room.validationDoc, row.update);
       room.lastAppliedSeq = row.seq;
+      room.semanticDocSeq = row.semanticDocSeq;
       room.renderedSizeUpperBound += estimatedRenderedGrowth(row.update);
       this.broadcast({ specId, ...row, source });
     }
-    if (room.renderedSizeUpperBound >= SPEC_SOFT_SIZE_BYTES) {
-      room.renderedSizeUpperBound = this.measureRenderedSize(proseMirrorDocument(room.doc));
+    if (measure && room.renderedSizeUpperBound >= SPEC_SOFT_SIZE_BYTES) {
+      room.renderedSizeUpperBound = this.validateCompleteDocument(room.doc);
     }
   }
 
@@ -393,12 +454,13 @@ export class SpecDocumentService {
     update: Uint8Array,
     clientId: string | null,
   ): Promise<SpecUpdateRecord | null> {
-    const { candidate, sections } = this.validateCandidate(room, update);
+    const { candidate, sections, semanticChanged } = this.validateCandidate(room, update);
     const renderedSizeUpperBound = this.validateSize(room, update, candidate);
-    let seq: bigint | null;
+    let inserted: SpecUpdateInsertResult | null;
     try {
-      seq = await this.store.insertUpdateIfLatest(specId, room.lastAppliedSeq, update, clientId, {
+      inserted = await this.store.insertUpdateIfLatest(specId, room.lastAppliedSeq, update, clientId, {
         sections,
+        semanticChanged,
         at:
           clientId !== null && sections.some((section) => section.changed)
             ? this.options.now?.()
@@ -408,31 +470,37 @@ export class SpecDocumentService {
       this.resetValidationDoc(room);
       throw error;
     }
-    if (seq === null) {
+    if (inserted === null) {
       this.resetValidationDoc(room);
       return null;
     }
 
     try {
-      await this.options.afterPersist?.(specId, seq);
+      await this.options.afterPersist?.(specId, inserted.seq);
     } catch (error) {
       this.resetValidationDoc(room);
       throw error;
     }
     Y.applyUpdate(room.doc, update);
-    room.lastAppliedSeq = seq;
+    room.lastAppliedSeq = inserted.seq;
+    room.semanticDocSeq = inserted.semanticDocSeq;
     room.renderedSizeUpperBound = renderedSizeUpperBound;
-    const row = { seq, update, clientId };
+    const row = { ...inserted, update, clientId };
     this.broadcast({ specId, ...row, source: "local" });
-    await this.store.notifyUpdate(specId, seq);
+    await this.store.notifyUpdate(specId, inserted.seq);
     return row;
   }
 
   private validateCandidate(
     room: CachedSpecDocument,
     update: Uint8Array,
-  ): { candidate: ProseMirrorNode; sections: readonly SpecDocumentSectionEffect[] } {
+  ): {
+    candidate: ProseMirrorNode;
+    sections: readonly SpecDocumentSectionEffect[];
+    semanticChanged: boolean;
+  } {
     const validationDoc = room.validationDoc;
+    const priorBlockIds = diagramBlockIdsByYjsIdentity(room.doc);
     Y.applyUpdate(validationDoc, update);
     let repaired = false;
     const onRepair = () => {
@@ -440,6 +508,7 @@ export class SpecDocumentService {
     };
     validationDoc.on("update", onRepair);
     try {
+      validateDiagramBlockIdentities(validationDoc, priorBlockIds);
       const candidate = proseMirrorDocument(validationDoc);
       candidate.check();
       if (repaired) throw new Error("The spec update violates the document schema");
@@ -449,7 +518,11 @@ export class SpecDocumentService {
           : proseMirrorDocument(room.doc);
       const sections = compareSections(before, candidate);
       validateRequirementsSection(before, candidate, sections);
-      return { candidate, sections };
+      return {
+        candidate,
+        sections,
+        semanticChanged: sections.some((section) => section.changed),
+      };
     } catch (error) {
       this.resetValidationDoc(room);
       throw error;
@@ -503,6 +576,19 @@ export class SpecDocumentService {
     )(doc);
   }
 
+  private validateCompleteDocument(doc: Y.Doc): number {
+    const document = proseMirrorDocument(doc);
+    validateDiagramBlockIdentities(doc);
+    validateCachedRenderSizes(document);
+    const encodedStateSize = Y.encodeStateAsUpdate(doc).byteLength;
+    if (encodedStateSize > SPEC_MAX_SIZE_BYTES) {
+      throw new SpecDocumentTooLargeError(encodedStateSize, "encoded Yjs state");
+    }
+    const renderedSize = this.measureRenderedSize(document);
+    if (renderedSize > SPEC_MAX_SIZE_BYTES) throw new SpecDocumentTooLargeError(renderedSize);
+    return renderedSize;
+  }
+
   private broadcast(event: SpecDocumentUpdateEvent): void {
     for (const listener of this.listeners.get(event.specId) ?? []) {
       try {
@@ -539,12 +625,82 @@ function validateCachedRenderSizes(doc: ProseMirrorNode): void {
   doc.descendants((node) => {
     if (node.type !== schema.nodes.diagramBlock) return;
     const block = readSpecBlockAttrs(node.attrs);
-    if (!block.cachedRender) return;
-    const cacheSize = encodedSpecBlockCacheSize(block.cachedRender);
+    const rawCache = node.attrs.cachedRender;
+    if (rawCache === null) return;
+    const cacheSize = encodedSpecBlockCacheSize(rawCache);
     if (cacheSize > SPEC_BLOCK_CACHE_MAX_BYTES) {
       throw new SpecBlockCacheTooLargeError(block.id, cacheSize);
     }
+    validateSpecBlockCachedRender(rawCache);
   });
+}
+
+function migrateLegacyDiagramBlockIds(doc: Y.Doc): Uint8Array | null {
+  const before = Y.encodeStateVector(doc);
+  doc.transact(() => {
+    for (const { element } of diagramBlockElements(doc)) {
+      const id = element.getAttribute("id");
+      const legacyId = element.getAttribute("blockId");
+      if (id === undefined && typeof legacyId === "string" && legacyId.length > 0) {
+        element.setAttribute("id", legacyId);
+        element.removeAttribute("blockId");
+      }
+    }
+  }, "legacy-diagram-block-id-migration");
+  const update = Y.encodeStateAsUpdate(doc, before);
+  return update.byteLength === 2 ? null : update;
+}
+
+interface YjsDiagramBlock {
+  element: Y.XmlElement;
+  identity: string;
+}
+
+function diagramBlockElements(doc: Y.Doc): YjsDiagramBlock[] {
+  const result: YjsDiagramBlock[] = [];
+  const visit = (parent: Y.XmlFragment | Y.XmlElement) => {
+    for (const [index, node] of parent.toArray().entries()) {
+      if (!(node instanceof Y.XmlElement)) continue;
+      if (node.nodeName === "diagramBlock") {
+        const relative = Y.createRelativePositionFromTypeIndex(parent, index);
+        if (!relative.item) throw new Error("Every diagram block must have a stable Yjs identity.");
+        result.push({
+          element: node,
+          identity: `${relative.item.client}:${relative.item.clock}`,
+        });
+      }
+      visit(node);
+    }
+  };
+  visit(doc.getXmlFragment(SPEC_FRAGMENT_NAME));
+  return result;
+}
+
+function diagramBlockIdsByYjsIdentity(doc: Y.Doc): Map<string, string> {
+  const ids = new Map<string, string>();
+  for (const { element, identity } of diagramBlockElements(doc)) {
+    const id = element.getAttribute("id");
+    if (typeof id !== "string" || id.trim().length === 0) {
+      throw new Error("Every diagram block must have a non-empty id.");
+    }
+    ids.set(identity, id);
+  }
+  return ids;
+}
+
+function validateDiagramBlockIdentities(
+  doc: Y.Doc,
+  priorIds: ReadonlyMap<string, string> = new Map(),
+): void {
+  const ids = new Set<string>();
+  for (const [identity, id] of diagramBlockIdsByYjsIdentity(doc)) {
+    if (ids.has(id)) throw new Error(`Diagram block id ${id} is duplicated.`);
+    ids.add(id);
+    const priorId = priorIds.get(identity);
+    if (priorId !== undefined && priorId !== id) {
+      throw new Error(`A diagram block id cannot change from ${priorId} to ${id}.`);
+    }
+  }
 }
 
 function compareSections(
@@ -602,6 +758,7 @@ function validateRequirementsSection(
 
 interface UpdateRow {
   seq: string;
+  semantic_doc_seq: string;
   update: Buffer;
   client_id: string | null;
 }
@@ -610,6 +767,7 @@ interface SnapshotRow {
   state: Buffer;
   state_vector: Buffer;
   covered_seq: string;
+  covered_semantic_doc_seq: string;
 }
 
 export class PostgresSpecDocumentStore implements SpecDocumentStore {
@@ -620,20 +778,25 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
 
   async readSnapshot(specId: string): Promise<SpecSnapshotRecord | null> {
     const result = await this.pool.query<SnapshotRow>(
-      `SELECT state, state_vector, covered_seq
+      `SELECT state, state_vector, covered_seq, covered_semantic_doc_seq
          FROM spec_snapshot
         WHERE spec_id = $1`,
       [specId],
     );
     const row = result.rows[0];
     return row
-      ? { state: row.state, stateVector: row.state_vector, coveredSeq: BigInt(row.covered_seq) }
+      ? {
+          state: row.state,
+          stateVector: row.state_vector,
+          coveredSeq: BigInt(row.covered_seq),
+          coveredSemanticDocSeq: BigInt(row.covered_semantic_doc_seq),
+        }
       : null;
   }
 
   async readUpdatesAfter(specId: string, afterSeq: bigint): Promise<SpecUpdateRecord[]> {
     const result = await this.pool.query<UpdateRow>(
-      `SELECT seq, update, client_id
+      `SELECT seq, semantic_doc_seq, update, client_id
          FROM spec_update_log
         WHERE spec_id = $1 AND seq > $2
         ORDER BY seq`,
@@ -641,6 +804,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     );
     return result.rows.map((row) => ({
       seq: BigInt(row.seq),
+      semanticDocSeq: BigInt(row.semantic_doc_seq),
       update: row.update,
       clientId: row.client_id,
     }));
@@ -652,27 +816,31 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     update: Uint8Array,
     clientId: string | null,
     effects: SpecUpdateEffects,
-  ): Promise<bigint | null> {
+  ): Promise<SpecUpdateInsertResult | null> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      const revision = await client.query<{ current_doc_seq: string }>(
+      const revision = await client.query<{
+        current_doc_seq: string;
+        current_semantic_doc_seq: string;
+      }>(
         `UPDATE spec
-            SET current_doc_seq = current_doc_seq + 1
+            SET current_doc_seq = current_doc_seq + 1,
+                current_semantic_doc_seq = current_semantic_doc_seq + $3::int
           WHERE id = $1
             AND current_doc_seq = $2
-        RETURNING current_doc_seq`,
-        [specId, expectedSeq.toString()],
+        RETURNING current_doc_seq, current_semantic_doc_seq`,
+        [specId, expectedSeq.toString(), effects.semanticChanged ? 1 : 0],
       );
-      const nextSeq = revision.rows[0]?.current_doc_seq;
-      if (nextSeq === undefined) {
+      const next = revision.rows[0];
+      if (!next) {
         await client.query("ROLLBACK");
         return null;
       }
       await client.query(
-        `INSERT INTO spec_update_log (spec_id, seq, update, client_id)
-         VALUES ($1, $2, $3, $4)`,
-        [specId, nextSeq, Buffer.from(update), clientId],
+        `INSERT INTO spec_update_log (spec_id, seq, semantic_doc_seq, update, client_id)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [specId, next.current_doc_seq, next.current_semantic_doc_seq, Buffer.from(update), clientId],
       );
       if (clientId !== null && effects.sections.some((section) => section.changed)) {
         const participant = await client.query<{ user_id: string | null }>(
@@ -684,14 +852,23 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
         const actorUserId = participant.rows[0]?.user_id;
         if (actorUserId) {
           if (!effects.at) throw new Error("A human spec update requires an injected timestamp.");
-          await draftHumanEditedSections(client, specId, BigInt(nextSeq), actorUserId, {
-            ...effects,
-            at: effects.at,
-          });
+          await draftHumanEditedSections(
+            client,
+            specId,
+            BigInt(next.current_semantic_doc_seq),
+            actorUserId,
+            {
+              ...effects,
+              at: effects.at,
+            },
+          );
         }
       }
       await client.query("COMMIT");
-      return BigInt(nextSeq);
+      return {
+        seq: BigInt(next.current_doc_seq),
+        semanticDocSeq: BigInt(next.current_semantic_doc_seq),
+      };
     } catch (error) {
       await rollback(client);
       throw error;
@@ -711,8 +888,11 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      const revision = await client.query<{ current_doc_seq: string }>(
-        `SELECT current_doc_seq
+      const revision = await client.query<{
+        current_doc_seq: string;
+        current_semantic_doc_seq: string;
+      }>(
+        `SELECT current_doc_seq, current_semantic_doc_seq
            FROM spec
           WHERE id = $1
           FOR UPDATE`,
@@ -724,14 +904,19 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
         await client.query("ROLLBACK");
         return false;
       }
+      if (BigInt(revision.rows[0]!.current_semantic_doc_seq) !== input.coveredSemanticDocSeq) {
+        await client.query("ROLLBACK");
+        return false;
+      }
       await client.query(
         `INSERT INTO spec_snapshot
-           (spec_id, state, state_vector, covered_seq, created_at)
-         VALUES ($1, $2, $3, $4, now())
+           (spec_id, state, state_vector, covered_seq, covered_semantic_doc_seq, created_at)
+         VALUES ($1, $2, $3, $4, $5, now())
          ON CONFLICT (spec_id) DO UPDATE
          SET state = excluded.state,
              state_vector = excluded.state_vector,
              covered_seq = excluded.covered_seq,
+             covered_semantic_doc_seq = excluded.covered_semantic_doc_seq,
              created_at = excluded.created_at
          WHERE spec_snapshot.covered_seq <= excluded.covered_seq`,
         [
@@ -739,6 +924,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
           Buffer.from(input.state),
           Buffer.from(input.stateVector),
           input.coveredSeq.toString(),
+          input.coveredSemanticDocSeq.toString(),
         ],
       );
       // A compacted Yjs snapshot does not retain the participant attribution

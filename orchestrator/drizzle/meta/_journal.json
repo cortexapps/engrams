@@ -379,6 +379,13 @@
       "when": 1786307332106,
       "tag": "0053_spec_projection",
       "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "7",
+      "when": 1786357509597,
+      "tag": "0054_spec_semantic_revision",
+      "breakpoints": true
     }
   ]
 }

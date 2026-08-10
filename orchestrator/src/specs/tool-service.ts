@@ -125,13 +125,13 @@ export class SpecToolService implements SpecToolDocumentService {
     const loaded = await this.options.documents.syncFromLog(specId);
     const document = proseMirrorDocument(loaded.doc);
     if (sectionId === undefined) {
-      return { specId, rev: loaded.lastAppliedSeq, markdown: renderMarkdown(document) };
+      return { specId, rev: loaded.semanticDocSeq, markdown: renderMarkdown(document) };
     }
     const section = requireSection(document, sectionId);
     const sectionDocument = schema.nodes.doc!.create(null, section.node);
     return {
       specId,
-      rev: loaded.lastAppliedSeq,
+      rev: loaded.semanticDocSeq,
       markdown: renderMarkdown(sectionDocument),
       sectionId,
     };
@@ -144,7 +144,7 @@ export class SpecToolService implements SpecToolDocumentService {
     const loaded = await this.options.documents.syncFromLog(specId);
     const desired = replacementSection(proseMirrorDocument(loaded.doc), input.sectionId, input.markdown);
     if (requireSection(proseMirrorDocument(loaded.doc), input.sectionId).node.eq(desired)) {
-      return this.result(specId, input, true, loaded.lastAppliedSeq);
+      return this.result(specId, input, true, loaded.semanticDocSeq);
     }
     try {
       const update = await this.options.documents.mutateDocument(
@@ -158,7 +158,7 @@ export class SpecToolService implements SpecToolDocumentService {
           ),
         input.expectedRev,
       );
-      return this.result(specId, input, true, update.seq);
+      return this.result(specId, input, true, update.semanticDocSeq);
     } catch (error) {
       return this.revisionConflict(specId, input, error);
     }
@@ -207,11 +207,11 @@ export class SpecToolService implements SpecToolDocumentService {
         ...(input.expectedRev === undefined ? {} : { expectedDocSeq: input.expectedRev }),
       });
       const latest = await this.options.documents.syncFromLog(specId);
-      return this.result(specId, input, true, latest.lastAppliedSeq);
+      return this.result(specId, input, true, latest.semanticDocSeq);
     } catch (error) {
       if (!(error instanceof SectionStateConflictError)) throw error;
       const latest = await this.options.documents.syncFromLog(specId);
-      return this.result(specId, input, false, latest.lastAppliedSeq);
+      return this.result(specId, input, false, latest.semanticDocSeq);
     }
   }
 
@@ -239,7 +239,7 @@ export class SpecToolService implements SpecToolDocumentService {
         throw new Error(`Open question ${questionId} belongs to a different section.`);
       }
       assertQuestionMarker(row, marker.node);
-      return this.result(specId, input, true, loaded.lastAppliedSeq);
+      return this.result(specId, input, true, loaded.semanticDocSeq);
     }
     if (row) {
       throw new Error(`Open question ${questionId} has no document marker.`);
@@ -271,7 +271,7 @@ export class SpecToolService implements SpecToolDocumentService {
         );
       }
       const latest = await this.options.documents.syncFromLog(specId);
-      return this.result(specId, input, true, latest.lastAppliedSeq);
+      return this.result(specId, input, true, latest.semanticDocSeq);
     }
 
     const anchorPosition = lastQuestionAnchor(document, input.sectionId);
@@ -289,7 +289,7 @@ export class SpecToolService implements SpecToolDocumentService {
         ...(input.expectedRev === undefined ? {} : { expectedDocSeq: input.expectedRev }),
       });
       const latest = await this.options.documents.syncFromLog(specId);
-      return this.result(specId, input, true, latest.lastAppliedSeq);
+      return this.result(specId, input, true, latest.semanticDocSeq);
     } catch (error) {
       return this.revisionConflict(specId, input, error);
     }
@@ -318,7 +318,7 @@ export class SpecToolService implements SpecToolDocumentService {
       ) {
         throw new Error("The open question was already resolved with a different answer.");
       }
-      return this.result(specId, input, true, loaded.lastAppliedSeq);
+      return this.result(specId, input, true, loaded.semanticDocSeq);
     }
     try {
       await this.options.questions.resolve({
@@ -327,7 +327,7 @@ export class SpecToolService implements SpecToolDocumentService {
         ...(input.expectedRev === undefined ? {} : { expectedDocSeq: input.expectedRev }),
       });
       const latest = await this.options.documents.syncFromLog(specId);
-      return this.result(specId, input, true, latest.lastAppliedSeq);
+      return this.result(specId, input, true, latest.semanticDocSeq);
     } catch (error) {
       return this.revisionConflict(specId, input, error);
     }
@@ -342,7 +342,7 @@ export class SpecToolService implements SpecToolDocumentService {
     requireSection(currentDocument, input.sectionId);
     const current = requireDiagramBlock(currentDocument, input.sectionId, input.blockId);
     if (current.node.attrs.source === input.source) {
-      return this.result(specId, input, true, loaded.lastAppliedSeq);
+      return this.result(specId, input, true, loaded.semanticDocSeq);
     }
     try {
       const update = await this.options.documents.mutateDocument(
@@ -358,7 +358,7 @@ export class SpecToolService implements SpecToolDocumentService {
         },
         input.expectedRev,
       );
-      return this.result(specId, input, true, update.seq);
+      return this.result(specId, input, true, update.semanticDocSeq);
     } catch (error) {
       return this.revisionConflict(specId, input, error);
     }

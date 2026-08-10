@@ -55,10 +55,11 @@ describe("SpecDigestService with live Postgres", () => {
       [templateId],
     );
     await pool.query(
-      `INSERT INTO spec (id, org_id, template_id, title, lifecycle, current_doc_seq)
-       VALUES ($1, 'test', $3, 'First', 'draft', 2),
-              ($2, 'test', $3, 'Second', 'draft', 2),
-              ($4, 'test', $3, 'Snapshot base', 'draft', 1)`,
+      `INSERT INTO spec
+         (id, org_id, template_id, title, lifecycle, current_doc_seq, current_semantic_doc_seq)
+       VALUES ($1, 'test', $3, 'First', 'draft', 2, 2),
+              ($2, 'test', $3, 'Second', 'draft', 2, 2),
+              ($4, 'test', $3, 'Snapshot base', 'draft', 1, 1)`,
       [firstSpec, secondSpec, templateId, snapshotBaseSpec],
     );
     const [firstInitial, firstEdit] = updates("first");
@@ -70,9 +71,9 @@ describe("SpecDigestService with live Postgres", () => {
       [firstSpec, secondSpec, firstUser, secondUser],
     );
     await pool.query(
-      `INSERT INTO spec_update_log (spec_id, seq, update, client_id)
-       VALUES ($1, 1, $3, 'seed'), ($1, 2, $4, 'human'),
-              ($2, 1, $5, 'seed'), ($2, 2, $6, 'human')`,
+      `INSERT INTO spec_update_log (spec_id, seq, semantic_doc_seq, update, client_id)
+       VALUES ($1, 1, 1, $3, 'seed'), ($1, 2, 2, $4, 'human'),
+              ($2, 1, 1, $5, 'seed'), ($2, 2, 2, $6, 'human')`,
       [
         firstSpec,
         secondSpec,
@@ -86,8 +87,9 @@ describe("SpecDigestService with live Postgres", () => {
     Y.applyUpdate(compacted, firstInitial);
     Y.applyUpdate(compacted, firstEdit);
     await pool.query(
-      `INSERT INTO spec_snapshot (spec_id, state, state_vector, covered_seq)
-       VALUES ($1, $2, $3, 2)`,
+      `INSERT INTO spec_snapshot
+         (spec_id, state, state_vector, covered_seq, covered_semantic_doc_seq)
+       VALUES ($1, $2, $3, 2, 2)`,
       [
         firstSpec,
         Buffer.from(Y.encodeStateAsUpdate(compacted)),
@@ -96,10 +98,10 @@ describe("SpecDigestService with live Postgres", () => {
     );
     await pool.query(
       `INSERT INTO spec_projection
-         (spec_id, rev, session_id, doc_seq, sha256, rendered, document_state,
+         (spec_id, rev, session_id, doc_seq, semantic_doc_seq, sha256, rendered, document_state,
           digest, digest_sha256, staging_path, state, requested_source,
           pushed_at, created_at)
-       VALUES ($1, 1, $1, 1, 'base', ''::bytea, $2,
+       VALUES ($1, 1, $1, 1, 1, 'base', ''::bytea, $2,
                ''::bytea, 'digest', '/workspace/.engrams/spec/incoming-1.md',
                'published', 'test', $3, $3)`,
       [firstSpec, Buffer.from(firstInitial), now],
@@ -108,8 +110,9 @@ describe("SpecDigestService with live Postgres", () => {
     const snapshotDoc = new Y.Doc();
     Y.applyUpdate(snapshotDoc, snapshotBase);
     await pool.query(
-      `INSERT INTO spec_snapshot (spec_id, state, state_vector, covered_seq)
-       VALUES ($1, $2, $3, 0)`,
+      `INSERT INTO spec_snapshot
+         (spec_id, state, state_vector, covered_seq, covered_semantic_doc_seq)
+       VALUES ($1, $2, $3, 0, 0)`,
       [
         snapshotBaseSpec,
         Buffer.from(snapshotBase),
@@ -122,8 +125,8 @@ describe("SpecDigestService with live Postgres", () => {
       [snapshotBaseSpec, firstUser],
     );
     await pool.query(
-      `INSERT INTO spec_update_log (spec_id, seq, update, client_id)
-       VALUES ($1, 1, $2, 'human')`,
+      `INSERT INTO spec_update_log (spec_id, seq, semantic_doc_seq, update, client_id)
+       VALUES ($1, 1, 1, $2, 'human')`,
       [snapshotBaseSpec, Buffer.from(snapshotDelta)],
     );
   }, 15_000);

@@ -426,12 +426,15 @@ function sameState(left: SectionStateValue, right: SectionStateValue): boolean {
 }
 
 async function lockSpec(client: PoolClient, specId: string): Promise<bigint> {
-  const result = await client.query<{ current_doc_seq: string }>(
-    "SELECT current_doc_seq::text AS current_doc_seq FROM spec WHERE id = $1 FOR UPDATE",
+  const result = await client.query<{ current_semantic_doc_seq: string }>(
+    `SELECT current_semantic_doc_seq::text AS current_semantic_doc_seq
+       FROM spec
+      WHERE id = $1
+      FOR UPDATE`,
     [specId],
   );
   if (result.rowCount !== 1) throw new Error("The spec does not exist.");
-  return BigInt(result.rows[0]!.current_doc_seq);
+  return BigInt(result.rows[0]!.current_semantic_doc_seq);
 }
 
 async function readActionWith(

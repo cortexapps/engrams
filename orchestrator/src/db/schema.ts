@@ -274,6 +274,9 @@ export const spec = pgTable(
     currentDocSeq: bigint("current_doc_seq", { mode: "bigint" })
       .notNull()
       .default(sql`0`),
+    currentSemanticDocSeq: bigint("current_semantic_doc_seq", { mode: "bigint" })
+      .notNull()
+      .default(sql`0`),
     publishedCheckpointId: uuid("published_checkpoint_id"),
     publishedBy: text("published_by").references(() => user.id, { onDelete: "set null" }),
     publishedAt: timestamp("published_at", { withTimezone: true }),
@@ -298,6 +301,7 @@ export const specUpdateLog = pgTable(
       .notNull()
       .references(() => spec.id, { onDelete: "cascade" }),
     update: bytea("update").notNull(),
+    semanticDocSeq: bigint("semantic_doc_seq", { mode: "bigint" }).notNull(),
     clientId: text("client_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -311,6 +315,7 @@ export const specSnapshot = pgTable("spec_snapshot", {
   state: bytea("state").notNull(),
   stateVector: bytea("state_vector").notNull(),
   coveredSeq: bigint("covered_seq", { mode: "bigint" }).notNull(),
+  coveredSemanticDocSeq: bigint("covered_semantic_doc_seq", { mode: "bigint" }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -413,6 +418,7 @@ export const specProjection = pgTable(
     rev: bigint("rev", { mode: "bigint" }).notNull(),
     sessionId: uuid("session_id").notNull(),
     docSeq: bigint("doc_seq", { mode: "bigint" }).notNull(),
+    semanticDocSeq: bigint("semantic_doc_seq", { mode: "bigint" }).notNull(),
     sha256: text("sha256").notNull(),
     rendered: bytea("rendered").notNull(),
     documentState: bytea("document_state").notNull(),
