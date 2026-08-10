@@ -29,7 +29,7 @@ google-cloud-storage = { version = "0.24", default-features = false, features = 
 # k8s resolv.conf (ndots/search/hosts) validation, never as a side
 # effect.
 reqwest = { workspace = true }
-reqwest-middleware = "0.4"
+reqwest-middleware = "0.5"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]

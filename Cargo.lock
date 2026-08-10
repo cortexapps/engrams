@@ -2235,7 +2235,7 @@ dependencies = [
  "futures",
  "google-cloud-storage",
  "reqwest 0.12.28",
- "reqwest-middleware",
+ "reqwest-middleware 0.5.2",
  "tempfile",
  "tokio",
  "tracing",
@@ -2828,7 +2828,7 @@ dependencies = [
  "pkcs8",
  "regex",
  "reqwest 0.12.28",
- "reqwest-middleware",
+ "reqwest-middleware 0.4.2",
  "ring",
  "serde",
  "serde_json",
@@ -5349,6 +5349,20 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "thiserror 1.0.69",
+ "tower-service",
+]
+
+[[package]]
+name = "reqwest-middleware"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07bc3f1384cffa4f274dad2d4ddd73aed32fed8f786d96c6be8aa4e5fd3c3b58"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "http",
+ "reqwest 0.13.4",
+ "thiserror 2.0.19",
  "tower-service",
 ]
 
