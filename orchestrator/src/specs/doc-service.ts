@@ -113,6 +113,17 @@ export class SpecDocumentRevisionConflictError extends Error {
   }
 }
 
+export class SpecParticipantLeaseStaleError extends Error {
+  constructor(
+    readonly specId: string,
+    readonly clientId: string,
+    readonly connectionEpoch: bigint,
+  ) {
+    super(`Spec client ${clientId} no longer owns participant epoch ${connectionEpoch}`);
+    this.name = "SpecParticipantLeaseStaleError";
+  }
+}
+
 export interface SpecSnapshotRecord {
   state: Uint8Array;
   stateVector: Uint8Array;
@@ -150,6 +161,7 @@ export interface SpecDocumentStore {
     update: Uint8Array,
     clientId: string | null,
     effects: SpecUpdateEffects,
+    participantEpoch?: bigint,
   ): Promise<bigint | null>;
   notifyUpdate(specId: string, seq: bigint): Promise<void>;
   compactSnapshot(input: CompactSnapshotInput): Promise<boolean>;
@@ -260,11 +272,12 @@ export class SpecDocumentService {
     specId: string,
     update: Uint8Array,
     clientId: string | null,
+    participantEpoch?: bigint,
   ): Promise<SpecUpdateRecord> {
     return this.withLock(specId, async () => {
       const room = await this.loadUnlocked(specId);
       await this.syncUnlocked(specId, room);
-      return this.applyUpdateUnlocked(specId, room, update, clientId);
+      return this.applyUpdateUnlocked(specId, room, update, clientId, participantEpoch);
     });
   }
 
@@ -384,6 +397,7 @@ export class SpecDocumentService {
     room: CachedSpecDocument,
     update: Uint8Array,
     clientId: string | null,
+    participantEpoch?: bigint,
   ): Promise<SpecUpdateRecord> {
     // Decode the untrusted client payload before it can enter the durable log.
     // validateCandidate applies it to the private shadow and enforces the full
@@ -391,7 +405,13 @@ export class SpecDocumentService {
     Y.decodeUpdate(update);
 
     for (;;) {
-      const stored = await this.tryApplyUpdateUnlocked(specId, room, update, clientId);
+      const stored = await this.tryApplyUpdateUnlocked(
+        specId,
+        room,
+        update,
+        clientId,
+        participantEpoch,
+      );
       if (stored) return stored;
       await this.syncUnlocked(specId, room);
     }
@@ -402,15 +422,23 @@ export class SpecDocumentService {
     room: CachedSpecDocument,
     update: Uint8Array,
     clientId: string | null,
+    participantEpoch?: bigint,
   ): Promise<SpecUpdateRecord | null> {
     const { candidate, sections } = this.validateCandidate(room, update);
     const renderedSizeUpperBound = this.validateSize(room, update, candidate);
     let seq: bigint | null;
     try {
-      seq = await this.store.insertUpdateIfLatest(specId, room.lastAppliedSeq, update, clientId, {
-        sections,
-        at: sections.some((section) => section.changed) ? this.options.now?.() : undefined,
-      });
+      seq = await this.store.insertUpdateIfLatest(
+        specId,
+        room.lastAppliedSeq,
+        update,
+        clientId,
+        {
+          sections,
+          at: sections.some((section) => section.changed) ? this.options.now?.() : undefined,
+        },
+        participantEpoch,
+      );
     } catch (error) {
       this.resetValidationDoc(room);
       throw error;
@@ -641,6 +669,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     update: Uint8Array,
     clientId: string | null,
     effects: SpecUpdateEffects,
+    participantEpoch?: bigint,
   ): Promise<bigint | null> {
     const changesDocument = effects.sections.some((section) => section.changed);
     if (changesDocument && !effects.at) {
@@ -649,6 +678,23 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      let actorUserId: string | null | undefined;
+      if (clientId !== null && participantEpoch !== undefined) {
+        const participant = await client.query<{ user_id: string | null }>(
+          `SELECT user_id
+             FROM spec_participant
+            WHERE spec_id = $1
+              AND client_id = $2
+              AND connection_epoch = $3
+              AND disconnected_at IS NULL
+            FOR SHARE`,
+          [specId, clientId, participantEpoch.toString()],
+        );
+        if (participant.rows.length === 0) {
+          throw new SpecParticipantLeaseStaleError(specId, clientId, participantEpoch);
+        }
+        actorUserId = participant.rows[0]!.user_id;
+      }
       const revision = await client.query<{ current_doc_seq: string }>(
         `UPDATE spec
             SET current_doc_seq = current_doc_seq + 1,
@@ -669,13 +715,15 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
         [specId, nextSeq, Buffer.from(update), clientId],
       );
       if (clientId !== null && changesDocument) {
-        const participant = await client.query<{ user_id: string | null }>(
-          `SELECT user_id
-             FROM spec_participant
-            WHERE spec_id = $1 AND client_id = $2`,
-          [specId, clientId],
-        );
-        const actorUserId = participant.rows[0]?.user_id;
+        if (actorUserId === undefined) {
+          const participant = await client.query<{ user_id: string | null }>(
+            `SELECT user_id
+               FROM spec_participant
+              WHERE spec_id = $1 AND client_id = $2`,
+            [specId, clientId],
+          );
+          actorUserId = participant.rows[0]?.user_id;
+        }
         if (actorUserId) {
           if (!effects.at) throw new Error("A human spec update requires an injected timestamp.");
           await draftHumanEditedSections(client, specId, BigInt(nextSeq), actorUserId, {

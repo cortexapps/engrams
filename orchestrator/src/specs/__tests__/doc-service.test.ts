@@ -24,6 +24,7 @@ import {
   SpecDocumentService,
   SpecDocumentRevisionConflictError,
   SpecDocumentTooLargeError,
+  SpecParticipantLeaseStaleError,
   SPEC_UPDATE_SIZE_FACTOR,
   type CompactSnapshotInput,
   type SpecDocumentStore,
@@ -723,6 +724,51 @@ describe("SpecDocumentService with live Postgres", () => {
       );
       const afterCache = await list.list({ orgId: "test-org", page: 1, pageSize: 50 });
       expect(afterCache.rows[0]?.updatedAt).toEqual(new Date("2026-08-09T12:00:00.000Z"));
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
+    "a replacement participant epoch fences the stale socket from the update log",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const now = new Date("2026-08-09T12:00:00.000Z");
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => now,
+      });
+      await documents.applyUpdate(specId, initialUpdate(), "seed");
+      await livePool.query(
+        `INSERT INTO spec_participant
+           (spec_id, client_id, user_id, connection_epoch, connected_at, lease_expires_at)
+         VALUES ($1, $2, $3, 1, $4, $5)`,
+        [specId, humanClientId, userId, now, new Date(now.getTime() + 60_000)],
+      );
+      await livePool.query(
+        `UPDATE spec_participant
+            SET connection_epoch = 2,
+                lease_expires_at = $3
+          WHERE spec_id = $1 AND client_id = $2`,
+        [specId, humanClientId, new Date(now.getTime() + 61_000)],
+      );
+      const update = clientInsert(
+        Y.encodeStateAsUpdate((await documents.loadDoc(specId)).doc),
+        0,
+        "fenced edit",
+      );
+
+      await expect(
+        documents.applyUpdate(specId, update, humanClientId, 1n),
+      ).rejects.toBeInstanceOf(SpecParticipantLeaseStaleError);
+      const afterStale = await livePool.query<{ current_doc_seq: string; updates: string }>(
+        `SELECT current_doc_seq::text,
+                (SELECT count(*)::text FROM spec_update_log WHERE spec_id = $1) AS updates
+           FROM spec
+          WHERE id = $1`,
+        [specId],
+      );
+      expect(afterStale.rows).toEqual([{ current_doc_seq: "1", updates: "1" }]);
+
+      const accepted = await documents.applyUpdate(specId, update, humanClientId, 2n);
+      expect(accepted.seq).toBe(2n);
     },
   );
 
