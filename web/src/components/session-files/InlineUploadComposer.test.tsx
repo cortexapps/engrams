@@ -10,6 +10,9 @@ const PATH = "/tmp/uploads/019fe2ff-0464-75f3-bb20-a8c1844579b9/engrams-upload-s
 function Harness({ recognizePaths = true }: { recognizePaths?: boolean }) {
   const [value, setValue] = useState("");
   const [tokens, setTokens] = useState<UploadToken[]>([]);
+  // Stands in for the transcript's streaming updates: a parent re-render that
+  // changes none of the composer's inputs.
+  const [, setTick] = useState(0);
   return (
     <>
       <InlineUploadComposer
@@ -37,6 +40,7 @@ function Harness({ recognizePaths = true }: { recognizePaths?: boolean }) {
         ariaLabel="Message input"
       />
       <output data-testid="value">{value}</output>
+      <button type="button" data-testid="rerender" onClick={() => setTick((t) => t + 1)} />
     </>
   );
 }
@@ -112,5 +116,30 @@ describe("InlineUploadComposer", () => {
 
     expect(screen.queryByText("engrams-upload-smoke.txt")).toBeNull();
     expect(screen.getByTestId("value").textContent).toBe("Read  now");
+  });
+
+  // A live session re-renders the composer on every streamed token. React 19
+  // reassigns `innerHTML` on every commit that re-renders an element holding a
+  // `dangerouslySetInnerHTML` prop, and replacing the children of a focused
+  // contenteditable throws the caret to offset 0 — so an unchanged re-render
+  // used to reset the caret many times a second while the user typed. The
+  // editor's nodes must therefore SURVIVE a re-render that changes nothing.
+  test("leaves the editor's DOM untouched across a re-render that changes nothing", () => {
+    render(<Harness />);
+    const editor = screen.getByRole("textbox", { name: "Message input" });
+    pastePath(editor, `Read ${PATH} now`);
+    const before = [...editor.childNodes];
+    expect(before.length).toBeGreaterThan(1);
+
+    // What a streamed token does to this subtree: re-render, same props.
+    fireEvent.click(screen.getByTestId("rerender"));
+    fireEvent.click(screen.getByTestId("rerender"));
+
+    // Node IDENTITY, not shape: a rewritten `innerHTML` reproduces the same
+    // markup with new nodes, and it is the node swap that drops the caret.
+    expect(editor.childNodes.length).toBe(before.length);
+    for (const [index, node] of before.entries()) {
+      expect(editor.childNodes[index]).toBe(node);
+    }
   });
 });
