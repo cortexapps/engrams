@@ -4501,6 +4501,11 @@ mod adapter {
         use std::pin::Pin;
         use std::task::{Context, Poll};
 
+        // These tests start real shell processes. Under the four-way nextest
+        // load, process transitions can take longer than their isolated run.
+        // This budget bounds liveness only; event-order assertions stay exact.
+        const SUBPROCESS_TRANSITION_TIMEOUT: Duration = Duration::from_secs(30);
+
         /// The generated hook settings path an argv test doesn't care about
         /// (production derives it from the state dir).
         fn test_settings() -> &'static Path {
@@ -6690,7 +6695,7 @@ mod adapter {
                 .send(HarnessCommand::Shutdown { grace_secs: 5 })
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
+            tokio::time::timeout(SUBPROCESS_TRANSITION_TIMEOUT, engine)
                 .await
                 .expect("engine exits")
                 .expect("engine task does not panic");
@@ -8494,7 +8499,7 @@ mod adapter {
             ));
 
             let mut waiting = Vec::new();
-            tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::time::timeout(SUBPROCESS_TRANSITION_TIMEOUT, async {
                 while waiting.len() < 2 {
                     match evt_rx.recv().await {
                         Some(HarnessEvent::Parked) => waiting.push("parked"),
