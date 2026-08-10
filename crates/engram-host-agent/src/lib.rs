@@ -1346,6 +1346,23 @@ impl HostAgent {
                     current_bundles.clone(),
                 )
             });
+            // ADR 0035 amendment D1: durable-at-birth — publish the stamp's
+            // generations to BlobStorage now, not at first snapshot
+            // reference. Closes the create→first-checkpoint window in
+            // which a stamp rotation + sweep destroys the only copy of
+            // a generation a running VM has attached (the 2026-08-10
+            // `chain_poisoned` firing). Fire-and-forget: must never
+            // gate readiness or heartbeating.
+            if let Some((cs, _)) = self.chunk_store.as_ref() {
+                bundles::spawn_startup_publish(
+                    bundles::BundleStore::new(
+                        cs.blob_storage().clone(),
+                        bundle_dir.clone(),
+                        bundle_ext,
+                    ),
+                    current_bundles.clone(),
+                );
+            }
 
             // ADR 0068: the blocking "gRPC readiness gate" (ADR 0050 D)
             // that used to live here — a synchronous up-to-30s TCP-connect

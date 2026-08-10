@@ -191,6 +191,7 @@ pub fn init(addr: SocketAddr) {
     ::metrics::counter!(DIRTY_RECOVER_TOTAL, "outcome" => "scan_failed").absolute(0);
     ::metrics::counter!(SHUTDOWN_STAGE_PANIC_TOTAL).absolute(0);
     ::metrics::counter!(CAPTURE_SHUTDOWN_STRAGGLER_TOTAL).absolute(0);
+    ::metrics::counter!(BUNDLE_STARTUP_PUBLISH_FAILURES_TOTAL).absolute(0);
 }
 
 // ─── metric name constants ────────────────────────────────────────
@@ -589,6 +590,15 @@ pub const NBD_SLOTS: &str = "engram_nbd_slots";
 /// (a bug) or acked guest writes are sitting unserved (an operator must
 /// reconcile).
 pub const SPOOL_LINEAGE_MISMATCH_TOTAL: &str = "engram_nbd_spool_lineage_mismatch_total";
+
+/// ADR 0035 amendment D1: a startup pass that publishes the baked stamp's bundle
+/// generations to BlobStorage failed (it retries on a 60 s timer).
+/// Sustained increments mean stamp generations stay single-copy on
+/// their nodes — the exposure behind the 2026-08-10 `chain_poisoned`
+/// firing — so a stamp rotation + sweep can destroy the only copy a
+/// running VM's next checkpoint needs. Alert on sustained increase.
+pub const BUNDLE_STARTUP_PUBLISH_FAILURES_TOTAL: &str =
+    "engram_bundle_startup_publish_failures_total";
 
 /// A SIGTERM shutdown-ladder stage panicked and was unwind-isolated (the
 /// ladder continued to the abandon sweep + spool export). Should stay at

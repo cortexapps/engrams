@@ -4,16 +4,23 @@
 //! (`<drive_id>-<sha256>.squashfs`) staged under the fleet-canonical
 //! bundle dir. The FC-host image bakes the *current* generation; every
 //! other generation a snapshot pins arrives here by being
-//! **materialized** from BlobStorage (`bundles/sha256/<sha>`), and gets
-//! there in the first place by being **published** at snapshot time —
-//! so blob storage only ever holds generations some snapshot
-//! referenced, which is exactly the GC's pin universe.
+//! **materialized** from BlobStorage (`bundles/sha256/<sha>`).
 //!
-//! Publish runs on *every* snapshot with aux refs (idempotent
-//! HEAD-then-put): base captures publish the enable-time generation,
-//! and eviction snapshots publish whatever the VM actually has attached
-//! — which after a fresh-create swap (ADR 0035 §3) can be a baked
-//! generation no capture ever published.
+//! ADR 0035 amendment (2026-08-10): generations are **durable at birth**. The catalog
+//! producers (`RegisterSkill`, `RegisterHarness`) upload to blob
+//! storage before they write the catalog row; the baked stamp path
+//! reaches blob storage via [`spawn_startup_publish`] as soon as a
+//! host stages it. Before the ADR 0035 amendment, stamp generations were published
+//! only by the first snapshot that pinned them — so a generation
+//! attached to a running VM was single-copy on its node until that
+//! snapshot, and a stamp rotation + sweep in that window destroyed
+//! the only copy (the 2026-08-10 `chain_poisoned` firing).
+//!
+//! Publish still runs on *every* snapshot with aux refs (idempotent
+//! HEAD-then-put) as the load-bearing verify-and-backstop: base
+//! captures cover the enable-time generation, eviction snapshots cover
+//! whatever the VM actually has attached. In the common case that is
+//! now a HEAD hit.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,6 +72,55 @@ pub async fn read_stamp(dir: &Path) -> Vec<AuxBundleRef> {
     }
 }
 
+/// After a failed materialize or publish, retry on this cadence
+/// instead of waiting for the next `live_bundles` CHANGE — the pin set
+/// is near-static, so "retry on next ack change" was a wedge: a
+/// transient staging failure (the 2026-07-15 fresh-NVMe bringup's
+/// mount race mid-write, a GCS blip) left the host bundle-less
+/// with a healthy agent until a pod restart. Success returns the
+/// supervisor loop to pure change-driven waits — no steady-state
+/// polling.
+const FAILED_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// ADR 0035 amendment D1: publish the baked stamp's generations to BlobStorage
+/// at host startup, retrying on [`FAILED_RETRY`] until one pass
+/// succeeds. Idempotent and HEAD-first, so N hosts staging the same
+/// bake race at the cost of N HEADs and at most one PUT per
+/// generation. Deliberately does NOT gate host readiness: a
+/// blob-storage outage must not stop the host serving, and the
+/// snapshot-time [`BundleStore::publish`] stays the load-bearing gate.
+pub fn spawn_startup_publish(
+    store: BundleStore,
+    current: Vec<AuxBundleRef>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if current.is_empty() {
+            return;
+        }
+        loop {
+            match store.publish(&current).await {
+                Ok(()) => {
+                    tracing::info!(
+                        generations = current.len(),
+                        "stamp bundle generations durable in BlobStorage",
+                    );
+                    return;
+                }
+                Err(e) => {
+                    ::metrics::counter!(crate::metrics::BUNDLE_STARTUP_PUBLISH_FAILURES_TOTAL)
+                        .increment(1);
+                    tracing::warn!(
+                        error = %e,
+                        retry_secs = FAILED_RETRY.as_secs(),
+                        "startup bundle publish failed; will retry",
+                    );
+                    tokio::time::sleep(FAILED_RETRY).await;
+                }
+            }
+        }
+    })
+}
+
 /// ADR 0035 §5: heartbeat-ack-driven bundle supervisor. Watches the
 /// coord's `live_bundles` pin set and (a) prefetches any pinned
 /// generation this host is missing — so resumes land warm instead of
@@ -76,14 +132,6 @@ pub fn spawn_supervisor(
     store: BundleStore,
     current: Vec<AuxBundleRef>,
 ) -> tokio::sync::watch::Sender<Vec<AuxBundleRef>> {
-    /// After a failed materialize, retry on this cadence instead of
-    /// waiting for the next `live_bundles` CHANGE — the pin set is
-    /// near-static, so "retry on next ack change" was a wedge: a
-    /// transient staging failure (the 2026-07-15 fresh-NVMe bringup's
-    /// mount race mid-write, a GCS blip) left the host bundle-less
-    /// with a healthy agent until a pod restart. Success returns the
-    /// loop to pure change-driven waits — no steady-state polling.
-    const FAILED_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
     let (tx, mut rx) = tokio::sync::watch::channel(Vec::<AuxBundleRef>::new());
     tokio::spawn(async move {
         let mut failed = false;
@@ -187,7 +235,7 @@ impl BundleStore {
                 drive_id = %r.drive_id,
                 sha256 = %r.sha256,
                 size_bytes = size,
-                "bundle generation published to BlobStorage (first reference)",
+                "bundle generation published to BlobStorage",
             );
         }
         Ok(())
@@ -211,8 +259,14 @@ impl BundleStore {
     /// Delete staged generations that are neither in the coord's pin
     /// set nor in the bake stamp. Best-effort (a failed unlink is just
     /// disk not reclaimed); deleting a file an FC VM still has open is
-    /// safe (unlinked-but-open) — the pin set covers every snapshot, so
-    /// nothing that needs *re-opening* is ever swept.
+    /// safe (unlinked-but-open). A swept file must always be
+    /// re-materializable from BlobStorage — that is the ADR 0035 amendment's (2026-08-10)
+    /// invariant, held by startup publish (D1: every stamp generation
+    /// is durable before it can rotate out) and the completed pin set
+    /// (D2: live-sandbox attachments pin their generations). Before
+    /// the ADR 0035 amendment this comment claimed the snapshot pin universe alone
+    /// made sweeping safe; the 2026-08-10 `chain_poisoned` incident
+    /// falsified that (swept a running VM's only copy, un-published).
     pub async fn sweep_unpinned(&self, live: &[AuxBundleRef], current: &[AuxBundleRef]) {
         let keep: std::collections::HashSet<String> = live
             .iter()
@@ -550,5 +604,48 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
         panic!("retry timer never staged the bundle (still wedged on ack change)");
+    }
+
+    /// ADR 0035 amendment D1: the startup task makes every stamp generation
+    /// durable without waiting for a snapshot to reference it.
+    #[tokio::test]
+    async fn startup_publish_makes_stamp_generations_durable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(&tmp);
+        let skills = aux("skills", b"skills-gen");
+        let browser = aux("browser", b"browser-gen");
+        stage(&s, &skills, b"skills-gen").await;
+        stage(&s, &browser, b"browser-gen").await;
+        let blob = s.blob.clone();
+
+        spawn_startup_publish(s, vec![skills.clone(), browser.clone()])
+            .await
+            .unwrap();
+
+        for r in [&skills, &browser] {
+            assert!(blob.exists(&AuxRoDrive::blob_key(&r.sha256)).await.unwrap());
+        }
+    }
+
+    /// ADR 0035 amendment D1: a transient blob-storage failure at startup must
+    /// not leave the stamp un-durable until the next pod restart — the
+    /// task retries on the same timer the supervisor uses.
+    /// `start_paused` auto-advances the 60 s sleep.
+    #[tokio::test(start_paused = true)]
+    async fn startup_publish_retries_until_blob_storage_recovers() {
+        use engram_testkit::storage::{FaultPlan, FaultyBlobStorage, InjectedError};
+        let tmp = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let (blob, _counters) = FaultyBlobStorage::arc(
+            inner,
+            FaultPlan::new().fail_nth_put(1, InjectedError::Sdk("gcs blip".into())),
+        );
+        let s = BundleStore::new(blob.clone(), tmp.path().join("shared"), "squashfs");
+        let r = aux("skills", b"flaky-upload");
+        stage(&s, &r, b"flaky-upload").await;
+
+        spawn_startup_publish(s, vec![r.clone()]).await.unwrap();
+
+        assert!(blob.exists(&AuxRoDrive::blob_key(&r.sha256)).await.unwrap());
     }
 }
