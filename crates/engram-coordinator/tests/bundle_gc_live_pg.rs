@@ -411,3 +411,91 @@ async fn live_sandbox_and_stamp_pins_survive_sweep() {
         "a dead host's stamp must stop pinning"
     );
 }
+
+/// The promote-pass re-pin guard (found by the engram-dst-cosim
+/// bundle-lifecycle swarm; the chunk GC + snapshot-blob GC carry the
+/// same check): a candidate marked while transiently UNPINNED whose sha
+/// is pinned again by the time the grace elapses must be SKIPPED (blob
+/// kept) and its stale candidate row cleared — never deleted. Before
+/// the fix the promote pass deleted purely on candidate age, 404ing the
+/// pinning restore.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn promote_skips_and_clears_a_repinned_candidate() {
+    let Some(meta) = connect().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let blob: Arc<dyn BlobStorage> =
+        Arc::new(engram_storage_local::LocalBlobStorage::new(tmp.path()));
+
+    let sha = fake_sha();
+    blob.put(
+        &AuxRoDrive::blob_key(&sha),
+        bytes::Bytes::from_static(b"squashfs-bytes"),
+    )
+    .await
+    .expect("publish");
+
+    // Sweep 1 with a LONG grace: the unpinned generation is MARKED but
+    // not yet promotable — the transiently-unpinned window.
+    let long_grace = ChunkGcConfig {
+        grace_period: Duration::from_secs(3600),
+        ..ChunkGcConfig::default()
+    };
+    let r1 = run_one_bundle_sweep(
+        meta.clone(),
+        blob.clone(),
+        &long_grace,
+        SweepMode::Full,
+        &system_clock(),
+    )
+    .await
+    .expect("sweep 1");
+    assert!(r1.candidates_marked >= 1, "{r1:?}");
+    assert_eq!(r1.promoted_deletes, 0, "{r1:?}");
+
+    // The pin lands (a snapshot row references the generation) while the
+    // stale candidate row persists.
+    seed_snapshot_with_bundles(
+        &meta,
+        vec![AuxBundleRef {
+            drive_id: "skills".into(),
+            sha256: sha.clone(),
+        }],
+    )
+    .await;
+
+    // Sweep 2 with ZERO grace: the candidate is past grace, but the
+    // re-check sees the pin — skip, keep the blob, clear the stale row.
+    let zero_grace = ChunkGcConfig {
+        grace_period: Duration::from_secs(0),
+        ..ChunkGcConfig::default()
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let r2 = run_one_bundle_sweep(
+        meta.clone(),
+        blob.clone(),
+        &zero_grace,
+        SweepMode::Full,
+        &system_clock(),
+    )
+    .await
+    .expect("sweep 2");
+    assert!(
+        r2.promote_repinned_skips >= 1,
+        "the re-pin guard must fire: {r2:?}"
+    );
+    assert!(
+        blob.exists(&AuxRoDrive::blob_key(&sha)).await.unwrap(),
+        "a re-pinned candidate's blob must never be deleted"
+    );
+    let leftover = meta
+        .list_expired_bundle_gc_candidates(Utc::now() + chrono::Duration::hours(1), 10_000)
+        .await
+        .expect("list");
+    assert!(
+        !leftover.contains(&sha),
+        "the stale candidate row is cleared, not left to re-fire"
+    );
+}

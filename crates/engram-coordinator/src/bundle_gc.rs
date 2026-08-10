@@ -33,6 +33,13 @@ pub struct BundleSweepReport {
     pub pin_set_size: usize,
     pub candidates_marked: usize,
     pub promoted_deletes: usize,
+    /// Promote-pass: expired candidates found RE-PINNED at delete time
+    /// and skipped (blob kept, stale candidate row cleared) — the same
+    /// durability guard the chunk GC's `promote_repinned_skips` counts.
+    /// `>0` means a generation was marked while transiently unpinned
+    /// and pinned again before the grace elapsed; without the re-check
+    /// it would have been wrongly deleted.
+    pub promote_repinned_skips: usize,
     pub promote_delete_errors: usize,
     pub restart_count: u32,
 }
@@ -106,11 +113,38 @@ pub async fn run_one_bundle_sweep(
         let expired = meta
             .list_expired_bundle_gc_candidates(cutoff, cfg.promote_batch_size)
             .await?;
-        let mut delete_ok: Vec<String> = Vec::with_capacity(expired.len());
+        // Re-verify the pin set at delete time — the same load-bearing
+        // safety step the chunk GC's `promote_expired` and the
+        // snapshot-blob GC carry, which this sweep alone lacked (found
+        // by the engram-dst-cosim bundle-lifecycle swarm, ADR 0035
+        // amendment). `first_seen_at` is sticky and the mark pass never
+        // clears a re-pinned candidate, so without this a generation
+        // marked while transiently unpinned (the mid-roll window before
+        // a heartbeat reports the new attachment, or pre-first-snapshot)
+        // but since pinned (a snapshot row landed; a heartbeat reported
+        // it) would be wrongly deleted — 404ing the pinning restore. A
+        // re-pinned candidate is skipped and its stale row cleared; its
+        // blob stays.
+        let pins: HashSet<String> = meta
+            .bundle_pin_set()
+            .await?
+            .into_iter()
+            .map(|r| r.sha256)
+            .collect();
+        let mut resolved: Vec<String> = Vec::with_capacity(expired.len());
         for sha in expired {
+            if pins.contains(&sha) {
+                report.promote_repinned_skips += 1;
+                resolved.push(sha);
+                continue;
+            }
             let key = format!("{BUNDLE_PREFIX}{sha}");
             match blob.delete(&key).await {
-                Ok(()) => delete_ok.push(sha),
+                Ok(()) => {
+                    tracing::info!(sha256 = %sha, "bundle generation deleted (unpinned past grace)");
+                    report.promoted_deletes += 1;
+                    resolved.push(sha);
+                }
                 Err(e) => {
                     tracing::warn!(
                         sha256 = %sha,
@@ -121,11 +155,7 @@ pub async fn run_one_bundle_sweep(
                 }
             }
         }
-        for sha in &delete_ok {
-            tracing::info!(sha256 = %sha, "bundle generation deleted (unpinned past grace)");
-        }
-        meta.delete_bundle_gc_candidates(&delete_ok).await?;
-        report.promoted_deletes = delete_ok.len();
+        meta.delete_bundle_gc_candidates(&resolved).await?;
     }
 
     Ok(report)
