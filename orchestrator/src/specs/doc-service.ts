@@ -112,6 +112,7 @@ export interface SpecDocumentSectionEffect {
 
 export interface SpecUpdateEffects {
   sections: readonly SpecDocumentSectionEffect[];
+  /** Time of a human-visible document edit. Cache-only updates omit it. */
   at?: Date;
 }
 
@@ -162,7 +163,7 @@ export interface SpecDocumentServiceOptions {
   /** Test seam for a process failure after the durable insert. */
   afterPersist?: (specId: string, seq: bigint) => void | Promise<void>;
   measureRenderedSize?: (doc: ProseMirrorNode) => number;
-  /** Injected wall time for durable human-edit actions. */
+  /** Injected wall time for durable human-visible document edits. */
   now?: () => Date;
 }
 
@@ -387,10 +388,7 @@ export class SpecDocumentService {
     try {
       seq = await this.store.insertUpdateIfLatest(specId, room.lastAppliedSeq, update, clientId, {
         sections,
-        at:
-          clientId !== null && sections.some((section) => section.changed)
-            ? this.options.now?.()
-            : undefined,
+        at: sections.some((section) => section.changed) ? this.options.now?.() : undefined,
       });
     } catch (error) {
       this.resetValidationDoc(room);
@@ -623,16 +621,21 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     clientId: string | null,
     effects: SpecUpdateEffects,
   ): Promise<bigint | null> {
+    const changesDocument = effects.sections.some((section) => section.changed);
+    if (changesDocument && !effects.at) {
+      throw new Error("A visible spec update requires an injected timestamp.");
+    }
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
       const revision = await client.query<{ current_doc_seq: string }>(
         `UPDATE spec
-            SET current_doc_seq = current_doc_seq + 1
+            SET current_doc_seq = current_doc_seq + 1,
+                updated_at = COALESCE($3::timestamptz, updated_at)
           WHERE id = $1
             AND current_doc_seq = $2
         RETURNING current_doc_seq`,
-        [specId, expectedSeq.toString()],
+        [specId, expectedSeq.toString(), effects.at ?? null],
       );
       const nextSeq = revision.rows[0]?.current_doc_seq;
       if (nextSeq === undefined) {
@@ -644,7 +647,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
          VALUES ($1, $2, $3, $4)`,
         [specId, nextSeq, Buffer.from(update), clientId],
       );
-      if (clientId !== null && effects.sections.some((section) => section.changed)) {
+      if (clientId !== null && changesDocument) {
         const participant = await client.query<{ user_id: string | null }>(
           `SELECT user_id
              FROM spec_participant

@@ -105,24 +105,25 @@ import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target
 
 const app = new Hono();
 const warnSpecDocument = (message: string) => log.warn({ message }, "spec document warning");
+const specNow = () => new Date();
 const specDocuments = new SpecDocumentService(
   new PostgresSpecDocumentStore(getPool(), { onWarning: warnSpecDocument }),
-  { onWarning: warnSpecDocument, now: () => new Date() },
+  { onWarning: warnSpecDocument, now: specNow },
 );
 const specOpenQuestions = new PostgresOpenQuestionStore(getPool());
 const specToolService = new SpecToolService({
   documents: specDocuments,
   sectionStates: new SectionStateService({
     store: new PostgresSectionStateStore(getPool()),
-    now: () => new Date(),
+    now: specNow,
   }),
   questions: new OpenQuestionService({
     store: specOpenQuestions,
     document: new SpecQuestionDocument(specDocuments, "spec-agent-question"),
-    now: () => new Date(),
+    now: specNow,
   }),
   questionStore: specOpenQuestions,
-  metadata: new PostgresSpecToolMetadataStore(getPool()),
+  metadata: new PostgresSpecToolMetadataStore(getPool(), specNow),
 });
 const specParticipants = new PostgresSpecParticipantStore(getDb());
 const warnSpecSync = (message: string) => log.warn({ message }, "spec sync warning");

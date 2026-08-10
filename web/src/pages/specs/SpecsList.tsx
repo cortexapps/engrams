@@ -1,6 +1,6 @@
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { CircleHelp, FilePenLine } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import type { SpecListItem } from "../../gen/engram/app/v1/spec_pb";
 import { useNow } from "../../hooks/useNow";
@@ -32,6 +32,13 @@ export function SpecsList() {
   const [page, setPage] = useState(1);
   const { data, error, isPending } = useSpecs(lifecycle, page, PAGE_SIZE);
   const now = useNow();
+  const totalCount = data?.totalCount;
+
+  useEffect(() => {
+    if (totalCount === undefined) return;
+    const lastPage = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
+    if (page > lastPage) setPage(lastPage);
+  }, [page, totalCount]);
 
   return (
     <div className="min-h-0 flex-1 overflow-auto p-4 md:p-6">
@@ -66,7 +73,7 @@ export function SpecsList() {
             Couldn’t load tech specs. {errorMessage(error)}
           </p>
         </div>
-      ) : data.specs.length === 0 ? (
+      ) : data.totalCount === 0 ? (
         <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed py-16 text-center">
           <FilePenLine className="size-10 text-muted-foreground" strokeWidth={1} aria-hidden />
           <p className="max-w-sm text-sm text-muted-foreground">
@@ -125,7 +132,7 @@ export function SpecPagination({
   onPageChange: (page: number) => void;
 }) {
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
-  if (totalPages === 1) return null;
+  if (totalPages === 1 && page === 1) return null;
   return (
     <div className="mt-4 flex items-center justify-end gap-3">
       <Button variant="outline" disabled={page === 1} onClick={() => onPageChange(page - 1)}>

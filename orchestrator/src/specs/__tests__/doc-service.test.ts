@@ -10,8 +10,11 @@ import {
   type SpecTemplate,
 } from "@engrams/spec-document";
 import { randomUUID } from "node:crypto";
+import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import * as Y from "yjs";
+import * as dbSchema from "../../db/schema.ts";
+import { makeSpecListStore } from "../../db/specs.ts";
 import {
   encodeProseMirrorDocument,
   encodeSpecChannelEnvelope,
@@ -152,6 +155,14 @@ function clientInsert(base: Uint8Array, sectionIndex: number, value: string): Ui
   const text = new Y.XmlText();
   text.insert(0, value);
   block.insert(0, [text]);
+  return Y.encodeStateAsUpdate(doc, vector);
+}
+
+function cacheOnlyUpdate(base: Uint8Array, value: string): Uint8Array {
+  const doc = new Y.Doc();
+  Y.applyUpdate(doc, base);
+  const vector = Y.encodeStateVector(doc);
+  doc.getMap<string>("renderer-cache").set("markdown", value);
   return Y.encodeStateAsUpdate(doc, vector);
 }
 
@@ -529,8 +540,11 @@ if (livePool) {
 describe("SpecDocumentService with live Postgres", () => {
   const templateId = randomUUID();
   const specId = randomUUID();
+  const peerSpecId = randomUUID();
   const userId = `spec-doc-test-${randomUUID()}`;
   const humanClientId = `human-client-${randomUUID()}`;
+  const initialUpdatedAt = new Date("2026-08-09T10:00:00.000Z");
+  const peerUpdatedAt = new Date("2026-08-09T11:00:00.000Z");
 
   beforeAll(async () => {
     if (!liveDbReachable || !livePool) return;
@@ -541,9 +555,10 @@ describe("SpecDocumentService with live Postgres", () => {
       [templateId],
     );
     await livePool.query(
-      `INSERT INTO spec (id, org_id, template_id, title, lifecycle)
-       VALUES ($1, 'test-org', $2, 'Test spec', 'draft')`,
-      [specId, templateId],
+      `INSERT INTO spec (id, org_id, template_id, title, lifecycle, updated_at)
+       VALUES ($1, 'test-org', $2, 'Test spec', 'draft', $3),
+              ($4, 'test-org', $2, 'Peer spec', 'draft', $5)`,
+      [specId, templateId, initialUpdatedAt, peerSpecId, peerUpdatedAt],
     );
     await livePool.query(
       `INSERT INTO "user" (id, name, email, email_verified, created_at, updated_at)
@@ -559,13 +574,19 @@ describe("SpecDocumentService with live Postgres", () => {
     await livePool.query("DELETE FROM spec_participant WHERE spec_id = $1", [specId]);
     await livePool.query("DELETE FROM spec_update_log WHERE spec_id = $1", [specId]);
     await livePool.query("DELETE FROM spec_snapshot WHERE spec_id = $1", [specId]);
-    await livePool.query("UPDATE spec SET current_doc_seq = 0 WHERE id = $1", [specId]);
+    await livePool.query(
+      `UPDATE spec
+          SET current_doc_seq = 0,
+              updated_at = CASE WHEN id = $1 THEN $3::timestamptz ELSE $4::timestamptz END
+        WHERE id = ANY($2::uuid[])`,
+      [specId, [specId, peerSpecId], initialUpdatedAt, peerUpdatedAt],
+    );
   }, 15_000);
 
   afterAll(async () => {
     if (!livePool) return;
     if (liveDbReachable) {
-      await livePool.query("DELETE FROM spec WHERE id = $1", [specId]);
+      await livePool.query("DELETE FROM spec WHERE id = ANY($1::uuid[])", [[specId, peerSpecId]]);
       await livePool.query("DELETE FROM spec_template WHERE id = $1", [templateId]);
       await livePool.query(`DELETE FROM "user" WHERE id = $1`, [userId]);
     }
@@ -586,13 +607,16 @@ describe("SpecDocumentService with live Postgres", () => {
         [specId, humanClientId, userId, connectedAt, leaseExpiresAt],
       );
 
-      const withoutClock = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
-      await withoutClock.applyUpdate(specId, initialUpdate(), "seed");
+      const seeded = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => connectedAt,
+      });
+      await seeded.applyUpdate(specId, initialUpdate(), "seed");
       const humanUpdate = clientInsert(
-        Y.encodeStateAsUpdate((await withoutClock.loadDoc(specId)).doc),
+        Y.encodeStateAsUpdate((await seeded.loadDoc(specId)).doc),
         0,
         "human edit",
       );
+      const withoutClock = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
       await expect(withoutClock.applyUpdate(specId, humanUpdate, humanClientId)).rejects.toThrow(
         "injected timestamp",
       );
@@ -668,11 +692,47 @@ describe("SpecDocumentService with live Postgres", () => {
   );
 
   test.skipIf(!liveDbReachable)(
+    "a visible edit updates list time and order without cache-only churn",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      let clock = initialUpdatedAt;
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => clock,
+      });
+      const list = makeSpecListStore(drizzle(livePool, { schema: dbSchema }), () => clock);
+
+      await documents.applyUpdate(specId, initialUpdate(), "seed");
+      const before = await list.list({ orgId: "test-org", page: 1, pageSize: 50 });
+      expect(before.rows.map((row) => row.id)).toEqual([peerSpecId, specId]);
+
+      clock = new Date("2026-08-09T12:00:00.000Z");
+      await documents.applyUpdate(
+        specId,
+        clientInsert(Y.encodeStateAsUpdate((await documents.loadDoc(specId)).doc), 0, "edit"),
+        "agent-edit",
+      );
+      const afterEdit = await list.list({ orgId: "test-org", page: 1, pageSize: 50 });
+      expect(afterEdit.rows.map((row) => row.id)).toEqual([specId, peerSpecId]);
+      expect(afterEdit.rows[0]?.updatedAt).toEqual(clock);
+
+      clock = new Date("2026-08-09T13:00:00.000Z");
+      await documents.applyUpdate(
+        specId,
+        cacheOnlyUpdate(Y.encodeStateAsUpdate((await documents.loadDoc(specId)).doc), "cached"),
+        "renderer-cache",
+      );
+      const afterCache = await list.list({ orgId: "test-org", page: 1, pageSize: 50 });
+      expect(afterCache.rows[0]?.updatedAt).toEqual(new Date("2026-08-09T12:00:00.000Z"));
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
     "two instances converge after a dropped notification by filling the log gap",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
-      const first = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
-      const second = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
+      const now = () => new Date("2026-08-09T12:00:00.000Z");
+      const first = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), { now });
+      const second = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), { now });
       await first.applyUpdate(specId, initialUpdate(), "seed");
       await second.loadDoc(specId);
       await second.startPeerSync();
@@ -716,8 +776,9 @@ describe("SpecDocumentService with live Postgres", () => {
     "concurrent writers allocate dense committed revisions before compaction",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
-      const first = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
-      const second = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
+      const now = () => new Date("2026-08-09T12:00:00.000Z");
+      const first = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), { now });
+      const second = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), { now });
       await first.applyUpdate(specId, initialUpdate(), "seed");
       const common = Y.encodeStateAsUpdate((await first.loadDoc(specId)).doc);
       await second.loadDoc(specId);
