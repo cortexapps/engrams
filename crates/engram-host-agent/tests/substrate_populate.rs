@@ -86,9 +86,17 @@ async fn pinned_chunks_survive_populate_pressure() {
     let (server, cache, store) = fixture(dir.path(), 256 * 1024);
     let _ = &server;
 
-    // The "session" chunk, pinned the way a Hello pins it.
+    // The "session" chunk, pinned the way a Hello pins it: PIN FIRST,
+    // then populate — the ADR 0075 pin-around-open ordering. (The
+    // previous populate-then-pin ordering left a window where the
+    // populate's own debounced background sweep snapshotted an empty
+    // pin map and — under real host disk pressure via the statvfs
+    // floor — evicted the chunk before/after the pin landed. That
+    // interleaving is a REAL bug the sweep now guards with a
+    // delete-time pin re-check; the test orders like production.)
     let pinned_bytes = bytes::Bytes::from(vec![0xAAu8; 64 * 1024]);
     let pinned_hash = store.put_chunk(&pinned_bytes).await.unwrap();
+    cache.pin(pinned_hash);
     // Deterministic populate via the same public path the substrate
     // server's Populate runs (put_chunk's write-through is
     // best-effort by design).
@@ -100,7 +108,6 @@ async fn pinned_chunks_survive_populate_pressure() {
         )
         .await
         .unwrap();
-    cache.pin(pinned_hash);
     assert!(cache.contains_on_disk(pinned_hash));
 
     // Storm: populate 16 fresh chunks through the writer's own get
