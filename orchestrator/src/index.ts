@@ -37,6 +37,7 @@ import { registerPassthrough } from "./rpc/passthrough.ts";
 import { makeDisableImageGuard } from "./rpc/image-guard.ts";
 import { makeExternalToolCompletionGuard } from "./rpc/tool-completion-guard.ts";
 import { registerBuiltinTools } from "./tools/builtin.ts";
+import { registerSpecTools } from "./tools/specs.ts";
 import { registerReviewTools } from "./tools/review.ts";
 import { registerDevTools } from "./tools/dev-tools.ts";
 import { registerTasks } from "./rpc/tasks.ts";
@@ -78,7 +79,17 @@ import { makeReviewTargetHydrationStore } from "./db/review-target-hydration.ts"
 import { makeEnrollmentStore } from "./db/enrollments.ts";
 import { PostgresSpecDocumentStore, SpecDocumentService } from "./specs/doc-service.ts";
 import { PostgresSpecAwarenessBus, PostgresSpecParticipantStore } from "./specs/sync-store.ts";
-import { setSpecPresence } from "./specs/presence.ts";
+import { setSpecPresence, specPresence } from "./specs/presence.ts";
+import { PostgresOpenQuestionStore, OpenQuestionService } from "./specs/open-questions.ts";
+import { SpecQuestionDocument } from "./specs/question-document.ts";
+import {
+  PostgresSectionStateStore,
+  SectionStateService,
+} from "./specs/section-state-service.ts";
+import {
+  PostgresSpecToolMetadataStore,
+  SpecToolService,
+} from "./specs/tool-service.ts";
 import { makeProfileStore } from "./db/profiles.ts";
 import { makeIntegrationConnectionStore } from "./db/integration-connections.ts";
 import { makeConnectorStore } from "./db/connectors.ts";
@@ -97,6 +108,21 @@ const specDocuments = new SpecDocumentService(
   new PostgresSpecDocumentStore(getPool(), { onWarning: warnSpecDocument }),
   { onWarning: warnSpecDocument, now: () => new Date() },
 );
+const specOpenQuestions = new PostgresOpenQuestionStore(getPool());
+const specToolService = new SpecToolService({
+  documents: specDocuments,
+  sectionStates: new SectionStateService({
+    store: new PostgresSectionStateStore(getPool()),
+    now: () => new Date(),
+  }),
+  questions: new OpenQuestionService({
+    store: specOpenQuestions,
+    document: new SpecQuestionDocument(specDocuments, "spec-agent-question"),
+    now: () => new Date(),
+  }),
+  questionStore: specOpenQuestions,
+  metadata: new PostgresSpecToolMetadataStore(getPool()),
+});
 const specParticipants = new PostgresSpecParticipantStore(getDb());
 const warnSpecSync = (message: string) => log.warn({ message }, "spec sync warning");
 const specAwarenessBus = new PostgresSpecAwarenessBus(getPool(), { onWarning: warnSpecSync });
@@ -310,6 +336,15 @@ setReviewIngressControlPlane(reviewControlPlane);
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
 registerReviewTools(tools, { reviews: makeReviewStore(getDb()) });
+registerSpecTools(tools, {
+  resolveSpecForSession: async (sessionId) => {
+    const id = await productionSpecProjection.storeSpecForSession(sessionId);
+    return id ? { id } : null;
+  },
+  documents: specToolService,
+  projection: productionSpecProjection,
+  presence: specPresence,
+});
 const integrationConnections = makeIntegrationConnectionStore(getDb());
 const configuredConnectors = await loadRegistry(makeConnectorStore(getDb()));
 await Promise.all([
@@ -350,6 +385,8 @@ const targetHydrator = new TargetHydrator({
   log: log.child({ component: "review-target-hydrator" }),
 });
 await targetHydrator.start();
+await specDocuments.startPeerSync();
+await specSyncHub.start();
 const listenerManager = makeProductionListenerManager();
 await listenerManager.start();
 const automationScheduler = makeProductionAutomationScheduler();
@@ -359,9 +396,6 @@ await automationScheduler.start();
 const oidcKeyRotation = startOidcKeyRotation({
   keys: makeIntegrationOidcKeyStore(getDb()),
 });
-await specDocuments.startPeerSync();
-await specSyncHub.start();
-
 server.listen(config.port, "0.0.0.0", () => {
   log.info({ port: config.port }, "orchestrator listening");
 });
@@ -373,13 +407,13 @@ process.on("SIGTERM", () => {
     const serverStopped = new Promise<Error | undefined>((resolve) => {
       server.close((err) => resolve(err));
     });
-    await specSyncHub.stop();
-    await specDocuments.stopPeerSync();
-    const serverError = await serverStopped;
     // Quiesce DBOS after the HTTP server stops accepting connections.
     oidcKeyRotation.stop();
     await automationScheduler.stop();
     await listenerManager.stop();
+    await specSyncHub.stop();
+    await specDocuments.stopPeerSync();
+    const serverError = await serverStopped;
     await targetHydrator.stop();
     await sweeper.stop();
     // The heartbeat must outlive the DBOS drain. Workflows can execute until

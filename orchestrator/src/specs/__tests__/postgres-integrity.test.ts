@@ -5,6 +5,7 @@ import { Pool } from "pg";
 import { PostgresOpenQuestionStore } from "../open-questions.ts";
 import { PostgresSectionStateStore } from "../section-state-service.ts";
 import { transitionSectionState } from "../section-state.ts";
+import { PostgresSpecToolMetadataStore } from "../tool-service.ts";
 
 const DB_URL = process.env["ORCHESTRATOR_DATABASE_URL"];
 let pool: Pool | null = DB_URL ? new Pool({ connectionString: DB_URL, max: 6 }) : null;
@@ -20,6 +21,11 @@ if (pool) {
 describe("spec integrity stores with live Postgres", () => {
   const templateId = randomUUID();
   const specId = randomUUID();
+  const actorUserId = `spec-tool-actor-${randomUUID()}`;
+  const samUserId = `spec-tool-sam-${randomUUID()}`;
+  const duplicateSamUserId = `spec-tool-sam-duplicate-${randomUUID()}`;
+  const disconnectedUserId = `spec-tool-disconnected-${randomUUID()}`;
+  const userIds = [actorUserId, samUserId, duplicateSamUserId, disconnectedUserId];
 
   beforeAll(async () => {
     if (!reachable || !pool) return;
@@ -34,6 +40,25 @@ describe("spec integrity stores with live Postgres", () => {
        VALUES ($1, 'test-org', $2, 'Integrity test spec', 'draft')`,
       [specId, templateId],
     );
+    await pool.query(
+      `INSERT INTO "user" (id, name, email, email_verified, created_at, updated_at)
+       VALUES
+         ($1, 'Ari', $1 || '@example.test', false, now(), now()),
+         ($2, 'Sam', $2 || '@example.test', false, now(), now()),
+         ($3, 'Sam', $3 || '@example.test', false, now(), now()),
+         ($4, 'Old editor', $4 || '@example.test', false, now(), now())`,
+      userIds,
+    );
+    await pool.query(
+      `INSERT INTO spec_participant
+         (spec_id, client_id, user_id, connected_at, disconnected_at)
+       VALUES
+         ($1, 'actor', $2, now(), NULL),
+         ($1, 'sam-1', $3, now(), NULL),
+         ($1, 'sam-2', $4, now(), NULL),
+         ($1, 'old', $5, now(), now())`,
+      [specId, ...userIds],
+    );
   });
 
   afterAll(async () => {
@@ -41,6 +66,7 @@ describe("spec integrity stores with live Postgres", () => {
     if (reachable) {
       await pool.query("DELETE FROM spec WHERE id = $1", [specId]);
       await pool.query("DELETE FROM spec_template WHERE id = $1", [templateId]);
+      await pool.query("DELETE FROM \"user\" WHERE id = ANY($1::text[])", [userIds]);
     }
     await pool.end();
     pool = null;
@@ -128,5 +154,12 @@ describe("spec integrity stores with live Postgres", () => {
 
     expect(results.filter(Boolean)).toHaveLength(1);
     expect((await store.find(id))?.state).toBe("resolved");
+  });
+
+  test.skipIf(!reachable)("lists only other active editor names", async () => {
+    if (!pool) throw new Error("The live Postgres pool is not available.");
+    const store = new PostgresSpecToolMetadataStore(pool);
+
+    expect(await store.concurrentEditorNames(specId, actorUserId)).toEqual(["Sam"]);
   });
 });

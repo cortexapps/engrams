@@ -1,0 +1,484 @@
+/** Agent tools for collaborative spec documents (ADR 0114 D6 and D11). */
+
+import { z } from "zod";
+
+import type { ToolContext, ToolRegistry } from "./registry.ts";
+
+const Revision = z
+  .string()
+  .regex(/^(0|[1-9][0-9]*)$/, "must be a non-negative decimal revision");
+const SectionId = z.string().min(1).max(200);
+const ExpectedRevision = Revision.optional().describe(
+  "Apply only when the live document is at this revision",
+);
+const IdempotencyKey = z.string().min(1).max(200);
+
+const ReadInput = z.object({
+  section_id: SectionId.optional().describe(
+    "Read only this section; omit it to read the full spec",
+  ),
+});
+
+const UpdateSectionInput = z.object({
+  section_id: SectionId,
+  markdown: z.string().describe("Replacement section content as Markdown"),
+  expected_rev: ExpectedRevision,
+});
+
+const SetSectionStateInput = z
+  .object({
+    section_id: SectionId,
+    state: z.enum(["drafted", "confirmed", "n/a"]),
+    reason: z
+      .string()
+      .min(1)
+      .max(2_000)
+      .optional()
+      .describe("Required when state is n/a"),
+    expected_rev: ExpectedRevision,
+  })
+  .superRefine((value, ctx) => {
+    if (value.state === "n/a" && value.reason === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["reason"],
+        message: 'required when state is "n/a"',
+      });
+    }
+  });
+
+const AddOpenQuestionInput = z.object({
+  section_id: SectionId,
+  question: z.string().min(1).max(20_000),
+  expected_rev: ExpectedRevision,
+});
+
+const ResolveOpenQuestionInput = z.object({
+  section_id: SectionId,
+  question_id: z.string().uuid(),
+  answer_markdown: z
+    .string()
+    .min(1)
+    .describe("Answer to add to the section before the question is resolved"),
+  expected_rev: ExpectedRevision,
+});
+
+const UpdateBlockInput = z.object({
+  section_id: SectionId,
+  block_id: z.string().min(1).max(200),
+  source: z
+    .string()
+    .describe("Replacement source specification for the diagram block"),
+  expected_rev: ExpectedRevision,
+});
+
+const UpdateNotesInput = z.object({
+  markdown: z.string().describe("Replacement working notes as Markdown"),
+  expected_rev: ExpectedRevision,
+});
+
+const TicketProposal = z.object({
+  client_id: z
+    .string()
+    .min(1)
+    .max(200)
+    .describe("Stable identifier within this proposal"),
+  parent_client_id: z.string().min(1).max(200).optional(),
+  title: z.string().min(1).max(500),
+  description: z.string().min(1),
+  section_id: SectionId,
+  depends_on: z.array(z.string().min(1).max(200)).optional(),
+});
+
+const ProposeTicketsInput = z.object({
+  tickets: z.array(TicketProposal).min(1).max(500),
+  idempotency_key: IdempotencyKey,
+  expected_rev: ExpectedRevision,
+});
+
+const ReadOutput = z.object({
+  spec_id: z.string().uuid(),
+  rev: Revision,
+  markdown: z.string(),
+  section_id: SectionId.optional(),
+});
+
+const MutationOutput = z.object({
+  applied: z.boolean(),
+  new_rev: Revision,
+  concurrent_editors: z.array(z.string()),
+});
+
+export interface SpecReference {
+  id: string;
+}
+
+export interface LiveSpecRead {
+  specId: string;
+  rev: bigint;
+  markdown: string;
+  sectionId?: string;
+}
+
+export interface SpecMutationResult {
+  applied: boolean;
+  newRev: bigint;
+  concurrentEditors: string[];
+}
+
+export interface SpecMutationContext {
+  actorUserId?: string;
+  sessionId: string;
+  toolCallId: string;
+  expectedRev?: bigint;
+}
+
+export interface SpecToolDocumentService {
+  read(specId: string, sectionId?: string): Promise<LiveSpecRead>;
+  updateSection(
+    specId: string,
+    input: SpecMutationContext & { sectionId: string; markdown: string },
+  ): Promise<SpecMutationResult>;
+  setSectionState(
+    specId: string,
+    input: SpecMutationContext & {
+      sectionId: string;
+      state: "drafted" | "confirmed" | "n/a";
+      reason?: string;
+    },
+  ): Promise<SpecMutationResult>;
+  addOpenQuestion(
+    specId: string,
+    input: SpecMutationContext & { sectionId: string; question: string },
+  ): Promise<SpecMutationResult>;
+  resolveOpenQuestion(
+    specId: string,
+    input: SpecMutationContext & {
+      sectionId: string;
+      questionId: string;
+      answerMarkdown: string;
+    },
+  ): Promise<SpecMutationResult>;
+  updateBlock(
+    specId: string,
+    input: SpecMutationContext & {
+      sectionId: string;
+      blockId: string;
+      source: string;
+    },
+  ): Promise<SpecMutationResult>;
+  updateNotes(
+    specId: string,
+    input: SpecMutationContext & { markdown: string },
+  ): Promise<SpecMutationResult>;
+  proposeTickets(
+    specId: string,
+    input: SpecMutationContext & {
+      idempotencyKey: string;
+      tickets: z.output<typeof TicketProposal>[];
+    },
+  ): Promise<SpecMutationResult>;
+}
+
+export interface SpecProjectionRefresh {
+  request(input: {
+    specId: string;
+    sessionId: string;
+    source: "agent-tool-mutation";
+  }): Promise<void>;
+}
+
+export interface SpecAgentPresence {
+  enter(input: {
+    specId: string;
+    sessionId: string;
+    toolCallId: string;
+    sectionId: string;
+  }): Promise<void>;
+  leave(input: {
+    specId: string;
+    sessionId: string;
+    toolCallId: string;
+  }): Promise<void>;
+}
+
+export interface SpecToolDeps {
+  resolveSpecForSession(sessionId: string): Promise<SpecReference | null>;
+  documents: SpecToolDocumentService;
+  projection: SpecProjectionRefresh;
+  presence: SpecAgentPresence;
+}
+
+function mutationContext(
+  ctx: ToolContext,
+  expectedRev: string | undefined,
+): SpecMutationContext {
+  return {
+    ...(ctx.userId === undefined ? {} : { actorUserId: ctx.userId }),
+    sessionId: ctx.sessionId,
+    toolCallId: ctx.toolCallId,
+    ...(expectedRev === undefined ? {} : { expectedRev: BigInt(expectedRev) }),
+  };
+}
+
+function mutationOutput(
+  result: SpecMutationResult,
+): z.input<typeof MutationOutput> {
+  return {
+    applied: result.applied,
+    new_rev: result.newRev.toString(),
+    concurrent_editors: result.concurrentEditors,
+  };
+}
+
+async function requireSpec(
+  ctx: ToolContext,
+  deps: SpecToolDeps,
+): Promise<SpecReference> {
+  const spec = await deps.resolveSpecForSession(ctx.sessionId);
+  if (spec === null)
+    throw new Error("this session is not linked to a spec document");
+  return spec;
+}
+
+async function withSectionPresence<T>(
+  ctx: ToolContext,
+  deps: SpecToolDeps,
+  specId: string,
+  sectionId: string,
+  action: () => Promise<T>,
+): Promise<T> {
+  const presence = {
+    specId,
+    sessionId: ctx.sessionId,
+    toolCallId: ctx.toolCallId,
+  };
+  await deps.presence.enter({ ...presence, sectionId });
+  try {
+    return await action();
+  } finally {
+    await deps.presence.leave(presence);
+  }
+}
+
+async function finishMutation(
+  ctx: ToolContext,
+  deps: SpecToolDeps,
+  specId: string,
+  result: SpecMutationResult,
+): Promise<z.input<typeof MutationOutput>> {
+  if (result.applied) {
+    await deps.projection.request({
+      specId,
+      sessionId: ctx.sessionId,
+      source: "agent-tool-mutation",
+    });
+  }
+  return mutationOutput(result);
+}
+
+/** Register the orchestrator-handled, synchronous spec tool family. */
+export function registerSpecTools(
+  registry: ToolRegistry,
+  deps: SpecToolDeps,
+): void {
+  registry.register({
+    name: "spec_read",
+    description:
+      "Read the live spec document, or one section, without using the file projection.",
+    input: ReadInput,
+    output: ReadOutput,
+    handling: "handled",
+    execution: "sync",
+    handler: async (ctx, args) => {
+      const spec = await requireSpec(ctx, deps);
+      const read = () => deps.documents.read(spec.id, args.section_id);
+      const result =
+        args.section_id === undefined
+          ? await read()
+          : await withSectionPresence(
+              ctx,
+              deps,
+              spec.id,
+              args.section_id,
+              read,
+            );
+      return {
+        spec_id: result.specId,
+        rev: result.rev.toString(),
+        markdown: result.markdown,
+        ...(result.sectionId === undefined
+          ? {}
+          : { section_id: result.sectionId }),
+      };
+    },
+  });
+
+  registry.register({
+    name: "spec_update_section",
+    description:
+      "Replace one spec section with Markdown parsed by the document service.",
+    input: UpdateSectionInput,
+    output: MutationOutput,
+    handling: "handled",
+    execution: "sync",
+    handler: async (ctx, args) => {
+      const spec = await requireSpec(ctx, deps);
+      const result = await withSectionPresence(
+        ctx,
+        deps,
+        spec.id,
+        args.section_id,
+        () =>
+          deps.documents.updateSection(spec.id, {
+            ...mutationContext(ctx, args.expected_rev),
+            sectionId: args.section_id,
+            markdown: args.markdown,
+          }),
+      );
+      return finishMutation(ctx, deps, spec.id, result);
+    },
+  });
+
+  registry.register({
+    name: "spec_set_section_state",
+    description:
+      "Set a section to drafted, confirmed, or n/a. The n/a state requires a reason.",
+    input: SetSectionStateInput,
+    output: MutationOutput,
+    handling: "handled",
+    execution: "sync",
+    handler: async (ctx, args) => {
+      const spec = await requireSpec(ctx, deps);
+      const result = await withSectionPresence(
+        ctx,
+        deps,
+        spec.id,
+        args.section_id,
+        () =>
+          deps.documents.setSectionState(spec.id, {
+            ...mutationContext(ctx, args.expected_rev),
+            sectionId: args.section_id,
+            state: args.state,
+            ...(args.reason === undefined ? {} : { reason: args.reason }),
+          }),
+      );
+      return finishMutation(ctx, deps, spec.id, result);
+    },
+  });
+
+  registry.register({
+    name: "spec_add_open_question",
+    description: "Add an open question anchored to a spec section.",
+    input: AddOpenQuestionInput,
+    output: MutationOutput,
+    handling: "handled",
+    execution: "sync",
+    handler: async (ctx, args) => {
+      const spec = await requireSpec(ctx, deps);
+      const result = await withSectionPresence(
+        ctx,
+        deps,
+        spec.id,
+        args.section_id,
+        () =>
+          deps.documents.addOpenQuestion(spec.id, {
+            ...mutationContext(ctx, args.expected_rev),
+            sectionId: args.section_id,
+            question: args.question,
+          }),
+      );
+      return finishMutation(ctx, deps, spec.id, result);
+    },
+  });
+
+  registry.register({
+    name: "spec_resolve_open_question",
+    description:
+      "Resolve an open question and add its answer to the anchored section in one document mutation.",
+    input: ResolveOpenQuestionInput,
+    output: MutationOutput,
+    handling: "handled",
+    execution: "sync",
+    handler: async (ctx, args) => {
+      const spec = await requireSpec(ctx, deps);
+      const result = await withSectionPresence(
+        ctx,
+        deps,
+        spec.id,
+        args.section_id,
+        () =>
+          deps.documents.resolveOpenQuestion(spec.id, {
+            ...mutationContext(ctx, args.expected_rev),
+            sectionId: args.section_id,
+            questionId: args.question_id,
+            answerMarkdown: args.answer_markdown,
+          }),
+      );
+      return finishMutation(ctx, deps, spec.id, result);
+    },
+  });
+
+  registry.register({
+    name: "spec_update_block",
+    description:
+      "Replace the source specification of a diagram block in one section.",
+    input: UpdateBlockInput,
+    output: MutationOutput,
+    handling: "handled",
+    execution: "sync",
+    handler: async (ctx, args) => {
+      const spec = await requireSpec(ctx, deps);
+      const result = await withSectionPresence(
+        ctx,
+        deps,
+        spec.id,
+        args.section_id,
+        () =>
+          deps.documents.updateBlock(spec.id, {
+            ...mutationContext(ctx, args.expected_rev),
+            sectionId: args.section_id,
+            blockId: args.block_id,
+            source: args.source,
+          }),
+      );
+      return finishMutation(ctx, deps, spec.id, result);
+    },
+  });
+
+  registry.register({
+    name: "spec_update_notes",
+    description: "Replace the collaborative working notes pane with Markdown.",
+    input: UpdateNotesInput,
+    output: MutationOutput,
+    handling: "handled",
+    execution: "sync",
+    handler: async (ctx, args) => {
+      const spec = await requireSpec(ctx, deps);
+      const result = await deps.documents.updateNotes(spec.id, {
+        ...mutationContext(ctx, args.expected_rev),
+        markdown: args.markdown,
+      });
+      return finishMutation(ctx, deps, spec.id, result);
+    },
+  });
+
+  registry.register({
+    name: "spec_propose_tickets",
+    description:
+      "Replace the post-publish ticket proposal tree. Each ticket must link to a spec section.",
+    input: ProposeTicketsInput,
+    output: MutationOutput,
+    handling: "handled",
+    execution: "sync",
+    handler: async (ctx, args) => {
+      const spec = await requireSpec(ctx, deps);
+      const result = await deps.documents.proposeTickets(spec.id, {
+        ...mutationContext(ctx, args.expected_rev),
+        idempotencyKey: args.idempotency_key,
+        tickets: args.tickets,
+      });
+      return finishMutation(ctx, deps, spec.id, result);
+    },
+  });
+}

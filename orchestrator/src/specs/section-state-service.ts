@@ -65,7 +65,7 @@ export interface SectionStateTranscriptPublisher {
 
 export interface SectionStateServiceOptions {
   store: SectionStateStore;
-  transcript: SectionStateTranscriptPublisher;
+  transcript?: SectionStateTranscriptPublisher;
   now: () => Date;
 }
 
@@ -94,6 +94,34 @@ export class SectionStateService {
       input.actorUserId,
       input.expectedDocSeq,
       (current) => transitionSectionState(current, input.target, input.context, input.naReason),
+    );
+    if (!change) throw new Error("A section transition did not change the state.");
+    return change;
+  }
+
+  /** Store a state action for a later transcript drainer without claiming delivery. */
+  async transitionDeferred(input: {
+    actionId: string;
+    context: SectionStateContext;
+    target: SectionState;
+    naReason?: string | null;
+    actorUserId: string | null;
+    expectedDocSeq?: bigint;
+  }): Promise<SectionStateChange> {
+    const change = await this.execute(
+      input.actionId,
+      fingerprint({
+        kind: "transition",
+        target: input.target,
+        naReason: input.naReason?.trim() || null,
+        actorUserId: input.actorUserId,
+        expectedDocSeq: input.expectedDocSeq?.toString() ?? null,
+      }),
+      input.context,
+      input.actorUserId,
+      input.expectedDocSeq,
+      (current) => transitionSectionState(current, input.target, input.context, input.naReason),
+      false,
     );
     if (!change) throw new Error("A section transition did not change the state.");
     return change;
@@ -147,11 +175,12 @@ export class SectionStateService {
     actorUserId: string | null,
     expectedDocSeq: bigint | undefined,
     makeChange: (current: SectionStateValue) => SectionStateChange | null,
+    deliver = true,
   ): Promise<SectionStateChange | null> {
     const existing = await this.options.store.readAction(actionId);
     if (existing) {
       this.assertActionContext(existing, context, requestFingerprint);
-      await this.deliver(existing);
+      if (deliver) await this.deliver(existing);
       return changeFromAction(existing);
     }
 
@@ -172,7 +201,7 @@ export class SectionStateService {
     });
     if (result.status === "conflict") throw new SectionStateConflictError();
     this.assertActionContext(result.action, context, requestFingerprint);
-    await this.deliver(result.action);
+    if (deliver) await this.deliver(result.action);
     return changeFromAction(result.action);
   }
 
@@ -191,6 +220,9 @@ export class SectionStateService {
 
   private async deliver(action: SectionStateTranscriptAction): Promise<void> {
     if (action.deliveredAt) return;
+    if (!this.options.transcript) {
+      throw new Error("The section-state transcript publisher is not configured.");
+    }
     await this.options.transcript.publish(action.id, action.chip);
     await this.options.store.markActionDelivered(action.id, this.options.now());
   }
