@@ -11,7 +11,7 @@ import {
   type SpecCheckpointService,
   type SpecCheckpointStore,
 } from "../specs/checkpoints.ts";
-import { proseMirrorDocument } from "../specs/doc-service.ts";
+import { proseMirrorDocument, SpecDocumentReadOnlyError } from "../specs/doc-service.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -207,6 +207,9 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
     try {
       result = await deps.checkpoints.restoreSection(specId, checkpointId, sectionId, userId);
     } catch (error) {
+      if (error instanceof SpecDocumentReadOnlyError) {
+        throw new HTTPException(409, { message: "published specs are read-only" });
+      }
       if (error instanceof Error && error.message.startsWith("Unknown spec checkpoint:")) {
         throw new HTTPException(404, { message: "not found" });
       }

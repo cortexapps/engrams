@@ -4,9 +4,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { renderWithProviders } from "@/test-utils";
 import { SpecReadPage } from "./SpecReadPage";
 
-const view: { lifecycle: "draft" | "published"; sessionId: string | null } = {
+const view: {
+  lifecycle: "draft" | "published";
+  sessionId: string | null;
+  publishedCheckpointId: string | null;
+} = {
   lifecycle: "draft",
   sessionId: null,
+  publishedCheckpointId: null,
 };
 
 const pinned = {
@@ -28,6 +33,7 @@ const older = {
   markdown: "## Context\n\nInitial content.\n",
 };
 const restoreMutate = vi.fn();
+const readRefetch = vi.fn();
 
 vi.mock("@/components/spec", () => ({
   LazySpecCanvas: ({ specId }: { specId: string }) => (
@@ -43,7 +49,7 @@ vi.mock("@/hooks/useSpecRead", () => ({
         title: "Safe restore design",
         lifecycle: view.lifecycle,
         sessionId: view.sessionId,
-        publishedCheckpointId: view.lifecycle === "published" ? pinned.id : null,
+        publishedCheckpointId: view.publishedCheckpointId,
         publishedAt: view.lifecycle === "published" ? pinned.createdAt : null,
       },
       checkpoints: [
@@ -68,6 +74,7 @@ vi.mock("@/hooks/useSpecRead", () => ({
     },
     isPending: false,
     error: null,
+    refetch: readRefetch,
   }),
   useSpecCheckpoint: (_specId: string, checkpointId: string | null) => ({
     data: checkpointId === older.id ? older : checkpointId === pinned.id ? pinned : undefined,
@@ -79,7 +86,9 @@ vi.mock("@/hooks/useSpecRead", () => ({
 beforeEach(() => {
   view.lifecycle = "draft";
   view.sessionId = null;
+  view.publishedCheckpointId = null;
   restoreMutate.mockReset();
+  readRefetch.mockReset();
 });
 
 describe("SpecReadPage", () => {
@@ -93,12 +102,26 @@ describe("SpecReadPage", () => {
 
   it("opens a published spec at the pinned read-only checkpoint", async () => {
     view.lifecycle = "published";
+    view.publishedCheckpointId = older.id;
     renderWithProviders(<SpecReadPage specId="spec-1" />);
 
     expect(await screen.findByText("Pinned content.")).toBeTruthy();
     expect(screen.getByText("Published spec")).toBeTruthy();
     expect(screen.getByText("Pinned")).toBeTruthy();
     expect(screen.queryByLabelText("Collaborative spec canvas")).toBeNull();
+  });
+
+  it("returns to the server-pinned checkpoint when a draft becomes published", async () => {
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+    fireEvent.click(await screen.findByRole("button", { name: /Initial outline/ }));
+    expect(await screen.findByText("Initial content.")).toBeTruthy();
+
+    view.lifecycle = "published";
+    view.publishedCheckpointId = older.id;
+    fireEvent.click(screen.getByRole("button", { name: /Ready to publish/ }));
+
+    expect(await screen.findByText("Pinned content.")).toBeTruthy();
+    expect(screen.queryByText("Initial content.")).toBeNull();
   });
 
   it("shows the owner session link for the spec owner", async () => {
@@ -123,5 +146,23 @@ describe("SpecReadPage", () => {
       { checkpointId: pinned.id, sectionId: "context" },
       expect.any(Object),
     );
+  });
+
+  it("refreshes server truth when restore races with publish", async () => {
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Ready to publish/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Restore section" }));
+    const callbacks = restoreMutate.mock.calls[0]?.[1] as
+      | { onError?: (error: unknown) => void }
+      | undefined;
+    callbacks?.onError?.({ status: 409 });
+
+    expect(
+      await screen.findByText(
+        "This spec was published before the restore finished. The published version is read-only.",
+      ),
+    ).toBeTruthy();
+    expect(readRefetch).toHaveBeenCalledTimes(1);
   });
 });

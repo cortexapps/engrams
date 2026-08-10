@@ -2,6 +2,18 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { API_BASE } from "@/lib/base";
 
+const DRAFT_REFETCH_INTERVAL_MS = 5_000;
+
+export class SpecRequestError extends Error {
+  constructor(
+    readonly path: string,
+    readonly status: number,
+  ) {
+    super(`${path} → ${status}`);
+    this.name = "SpecRequestError";
+  }
+}
+
 export interface SpecCheckpointSummary {
   id: string;
   label: string;
@@ -41,7 +53,7 @@ async function specRequest<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { Accept: "application/json", ...init?.headers },
     ...init,
   });
-  if (!response.ok) throw new Error(`${path} → ${response.status}`);
+  if (!response.ok) throw new SpecRequestError(path, response.status);
   return response.json() as Promise<T>;
 }
 
@@ -50,6 +62,9 @@ export function useSpecRead(specId: string) {
     queryKey: ["spec", specId],
     queryFn: () => specRequest<SpecReadResponse>(`/specs/${encodeURIComponent(specId)}`),
     enabled: specId.length > 0,
+    refetchInterval: (query) =>
+      query.state.data?.spec.lifecycle === "draft" ? DRAFT_REFETCH_INTERVAL_MS : false,
+    refetchIntervalInBackground: false,
   });
 }
 

@@ -9,7 +9,7 @@ import {
   type SpecCheckpointRecord,
   type SpecCheckpointStore,
 } from "../specs/checkpoints.ts";
-import { encodeProseMirrorDocument } from "../specs/doc-service.ts";
+import { encodeProseMirrorDocument, SpecDocumentReadOnlyError } from "../specs/doc-service.ts";
 
 const SPEC_ID = "00000000-0000-4000-8000-000000001114";
 const PINNED_ID = "00000000-0000-4000-8000-000000001115";
@@ -280,5 +280,28 @@ describe("spec read routes", () => {
 
     expect(response.status).toBe(409);
     expect(restoreSection).not.toHaveBeenCalled();
+  });
+
+  test("a restore that races with publish returns a conflict", async () => {
+    const readStore = new MemoryReadStore();
+    readStore.record = {
+      ...readStore.record,
+      lifecycle: "draft",
+      publishedCheckpointId: null,
+      publishedAt: null,
+    };
+    const restoreSection = mock(async () => {
+      throw new SpecDocumentReadOnlyError(SPEC_ID);
+    });
+    const { app } = testApp({ readStore, restoreSection });
+
+    const response = await app.request(`/api/v1/specs/${SPEC_ID}/restore`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ checkpointId: PINNED_ID, sectionId: "context" }),
+    });
+
+    expect(response.status).toBe(409);
+    expect(restoreSection).toHaveBeenCalledTimes(1);
   });
 });

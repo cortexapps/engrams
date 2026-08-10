@@ -375,6 +375,7 @@ describe("the spec sync UpgradeHook", () => {
     ]);
     browserAwareness.setLocalStateField("cursor", { anchor: 8, head: 8 });
     intendedSocket.emit("message", encodeAwarenessState(browserAwareness), true);
+    await eventually(() => readAwarenessState(intendedSocket, 42)?.cursor?.anchor === 8);
     timers.tick();
     intendedSocket.emit("pong");
 
@@ -453,12 +454,7 @@ describe("the spec sync UpgradeHook", () => {
     await eventually(() => readAwarenessState(observerSocket, 42)?.cursor?.anchor === 4);
 
     awareness.dropNextParticipantConnected();
-    await replacementHub.connect(
-      SPEC_SHARED,
-      "42",
-      { id: "member" },
-      replacementSocket,
-    );
+    await replacementHub.connect(SPEC_SHARED, "42", { id: "member" }, replacementSocket);
     browserAwareness.setLocalStateField("cursor", { anchor: 8, head: 8 });
     replacementSocket.emit("message", encodeAwarenessState(browserAwareness), true);
     await eventually(() => readAwarenessState(observerSocket, 42)?.cursor?.anchor === 8);
@@ -822,7 +818,9 @@ describe("the spec sync UpgradeHook", () => {
         connect: async () => {
           connectStarted = true;
           await participantGate;
+          return 1n;
         },
+        renew: async () => true,
         disconnect: async () => {},
       },
       awarenessBus: fakeAwarenessBus(),

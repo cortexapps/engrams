@@ -2,6 +2,7 @@ import { diffLines, diffWordsWithSpace, type Change } from "diff";
 
 interface DiffSegment {
   kind: "prose" | "code";
+  granularity: "word" | "line";
   before: string;
   after: string;
 }
@@ -11,19 +12,21 @@ interface MarkdownSegment {
   text: string;
 }
 
+const MAX_ALIGNMENT_CELLS = 10_000;
+
 export function CheckpointDiff({ before, after }: { before: string; after: string }) {
   const segments = buildCheckpointDiff(before, after);
   return (
     <div className="spec-checkpoint-diff" aria-label="Checkpoint comparison">
       {segments.map((segment, index) => {
         const changes =
-          segment.kind === "code"
+          segment.granularity === "line"
             ? diffLines(segment.before, segment.after)
             : diffWordsWithSpace(segment.before, segment.after);
         return (
           <pre
             className={`spec-diff-segment is-${segment.kind}`}
-            data-diff-granularity={segment.kind === "code" ? "line" : "word"}
+            data-diff-granularity={segment.granularity}
             key={`${segment.kind}-${index}`}
           >
             {changes.map((change, changeIndex) => (
@@ -45,6 +48,9 @@ function DiffChange({ change }: { change: Change }) {
 export function buildCheckpointDiff(before: string, after: string): DiffSegment[] {
   const beforeSegments = splitMarkdown(before);
   const afterSegments = splitMarkdown(after);
+  if ((beforeSegments.length + 1) * (afterSegments.length + 1) > MAX_ALIGNMENT_CELLS) {
+    return [{ kind: "prose", granularity: "line", before, after }];
+  }
   const scores = alignmentScores(beforeSegments, afterSegments);
   const result: DiffSegment[] = [];
   let leftIndex = 0;
@@ -59,14 +65,29 @@ export function buildCheckpointDiff(before: string, after: string): DiffSegment[
       left.kind === right.kind &&
       scores[leftIndex]![rightIndex] === pairScore + scores[leftIndex + 1]![rightIndex + 1]
     ) {
-      result.push({ kind: left.kind, before: left.text, after: right.text });
+      result.push({
+        kind: left.kind,
+        granularity: left.kind === "code" ? "line" : "word",
+        before: left.text,
+        after: right.text,
+      });
       leftIndex += 1;
       rightIndex += 1;
     } else if (left && scores[leftIndex]![rightIndex] === scores[leftIndex + 1]![rightIndex] - 1) {
-      result.push({ kind: left.kind, before: left.text, after: "" });
+      result.push({
+        kind: left.kind,
+        granularity: left.kind === "code" ? "line" : "word",
+        before: left.text,
+        after: "",
+      });
       leftIndex += 1;
     } else if (right) {
-      result.push({ kind: right.kind, before: "", after: right.text });
+      result.push({
+        kind: right.kind,
+        granularity: right.kind === "code" ? "line" : "word",
+        before: "",
+        after: right.text,
+      });
       rightIndex += 1;
     }
   }

@@ -27,17 +27,18 @@ import "./spec-read.css";
 
 export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   const params = useParams({ strict: false });
-  const routeSpecId =
-    "specId" in params && typeof params.specId === "string" ? params.specId : "";
+  const routeSpecId = "specId" in params && typeof params.specId === "string" ? params.specId : "";
   const specId = explicitSpecId ?? routeSpecId;
   const read = useSpecRead(specId);
-  const publishedId = read.data?.spec.publishedCheckpointId ?? null;
+  const publishedCheckpoint =
+    read.data?.spec.lifecycle === "published" ? read.data.publishedCheckpoint : null;
+  const publishedId = publishedCheckpoint?.id ?? null;
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const effectiveIds =
     selectedIds.length === 0 && read.data?.spec.lifecycle === "published" && publishedId
       ? [publishedId]
       : selectedIds;
-  const first = useSpecCheckpoint(specId, effectiveIds[0] ?? null, read.data?.publishedCheckpoint);
+  const first = useSpecCheckpoint(specId, effectiveIds[0] ?? null, publishedCheckpoint);
   const second = useSpecCheckpoint(specId, effectiveIds[1] ?? null);
   const restore = useRestoreSpecSection(specId);
   const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
@@ -46,7 +47,7 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   useEffect(() => {
     setSelectedIds([]);
     setRestoreNotice(null);
-  }, [specId]);
+  }, [publishedId, specId]);
 
   if (read.isPending) return <SpecReadLoading />;
   if (read.error || !read.data) {
@@ -129,6 +130,15 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
                               : "The section already matches this checkpoint. No changes were made.",
                           );
                           setSelectedIds([]);
+                        },
+                        onError: (error) => {
+                          if (errorStatus(error) === 409) {
+                            setRestoreNotice(
+                              "This spec was published before the restore finished. The published version is read-only.",
+                            );
+                            setSelectedIds([]);
+                            void read.refetch();
+                          }
                         },
                       },
                     );
@@ -315,4 +325,9 @@ function formatDate(value: string): string {
     hour: "numeric",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+function errorStatus(error: unknown): number | null {
+  if (typeof error !== "object" || error === null || !("status" in error)) return null;
+  return typeof error.status === "number" ? error.status : null;
 }

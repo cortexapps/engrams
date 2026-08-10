@@ -50,4 +50,14 @@ describe("CheckpointDiff", () => {
     expect(changes.join("\n")).toContain("const legacy = true;");
     expect(changes.join("\n")).not.toContain("Stable prose after the block.");
   });
+
+  it("uses a bounded line diff when the segment matrix is large", () => {
+    const before = Array.from({ length: 100 }, (_, index) => `Before ${index}.\n\n`).join("");
+    const after = Array.from({ length: 100 }, (_, index) => `After ${index}.\n\n`).join("");
+    const { container } = render(<CheckpointDiff before={before} after={after} />);
+
+    const segments = container.querySelectorAll("[data-diff-granularity]");
+    expect(segments).toHaveLength(1);
+    expect(segments[0]?.getAttribute("data-diff-granularity")).toBe("line");
+  });
 });

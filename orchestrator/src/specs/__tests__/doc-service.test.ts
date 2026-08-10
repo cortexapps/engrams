@@ -640,7 +640,9 @@ describe("SpecDocumentService with live Postgres", () => {
     "a stale draft update cannot persist after publication",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
-      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => new Date("2026-08-10T02:00:00.000Z"),
+      });
       await documents.applyUpdate(specId, initialUpdate(), "seed");
       const staleUpdate = clientInsert(
         Y.encodeStateAsUpdate((await documents.loadDoc(specId)).doc),
@@ -667,8 +669,11 @@ describe("SpecDocumentService with live Postgres", () => {
     "a restore recovery checkpoint includes an interleaved edit",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
+      const now = () => new Date("2026-08-10T03:00:00.000Z");
       const checkpointStore = new PostgresSpecCheckpointStore(livePool);
-      const seedDocuments = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
+      const seedDocuments = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now,
+      });
       await seedDocuments.applyUpdate(specId, initialUpdate(), "seed");
       await seedDocuments.applyUpdate(
         specId,
@@ -700,6 +705,7 @@ describe("SpecDocumentService with live Postgres", () => {
       });
       let pauseOnce = true;
       const restoringDocuments = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now,
         beforeCheckpointPersist: async () => {
           if (!pauseOnce) return;
           pauseOnce = false;
@@ -707,7 +713,9 @@ describe("SpecDocumentService with live Postgres", () => {
           await persistReleased;
         },
       });
-      const concurrentDocuments = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
+      const concurrentDocuments = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now,
+      });
       await restoringDocuments.loadDoc(specId);
       await concurrentDocuments.loadDoc(specId);
       const restoringCheckpoints = new SpecCheckpointService(restoringDocuments, checkpointStore);
@@ -905,9 +913,9 @@ describe("SpecDocumentService with live Postgres", () => {
         "fenced edit",
       );
 
-      await expect(
-        documents.applyUpdate(specId, update, humanClientId, 1n),
-      ).rejects.toBeInstanceOf(SpecParticipantLeaseStaleError);
+      await expect(documents.applyUpdate(specId, update, humanClientId, 1n)).rejects.toBeInstanceOf(
+        SpecParticipantLeaseStaleError,
+      );
       const afterStale = await livePool.query<{ current_doc_seq: string; updates: string }>(
         `SELECT current_doc_seq::text,
                 (SELECT count(*)::text FROM spec_update_log WHERE spec_id = $1) AS updates
