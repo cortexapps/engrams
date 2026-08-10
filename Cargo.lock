@@ -480,6 +480,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1505,7 +1511,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum 0.7.9",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bincode",
  "bytes",
  "chrono",
@@ -1594,7 +1600,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "rand 0.8.6",
  "serde",
  "tokio",
@@ -1847,7 +1853,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bincode",
  "bytes",
  "chrono",
@@ -1969,7 +1975,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "engram-chunk-store",
  "flate2",
@@ -2217,7 +2223,7 @@ name = "engram-secrets-gcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "engram-core",
  "engram-egress-proxy",
  "reqwest 0.12.28",
@@ -5735,7 +5741,7 @@ checksum = "7bd22781911de0ca6debda95f073c8f18bec65d1a94f1fa9573f3102e514cea4"
 dependencies = [
  "ahash",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "getrandom 0.3.4",
  "granit-parser",
@@ -7719,7 +7725,7 @@ name = "workspace-hack"
 version = "0.1.0"
 dependencies = [
  "anstyle",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bitflags 2.13.1",
  "byteorder",
  "bytes",

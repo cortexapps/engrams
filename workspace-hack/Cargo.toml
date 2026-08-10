@@ -16,7 +16,7 @@ publish = false
 ### BEGIN HAKARI SECTION
 [dependencies]
 anstyle = { version = "1" }
-base64 = { version = "0.22" }
+base64 = { version = "0.23" }
 byteorder = { version = "1" }
 bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -103,7 +103,7 @@ winnow = { version = "1" }
 zeroize = { version = "1", features = ["derive"] }
 
 [build-dependencies]
-base64 = { version = "0.22" }
+base64 = { version = "0.23" }
 byteorder = { version = "1" }
 bytes = { version = "1", features = ["serde"] }
 cc = { version = "1", default-features = false, features = ["parallel"] }
