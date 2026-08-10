@@ -65,10 +65,7 @@ export const Thread: FC = () => {
       className="aui-root aui-thread-root @container flex h-full flex-col bg-background"
       style={{ ["--thread-max-width" as string]: "44rem" }}
     >
-      {/* No `scroll-smooth`: assistant-ui's automatic scrolls use
-          `behavior: "auto"`, which defers to the CSS, so a smooth viewport
-          animated the open-a-transcript jump through the whole history. */}
-      <ThreadPrimitive.Viewport className="relative flex flex-1 flex-col overflow-x-auto overflow-y-scroll">
+      <ThreadPrimitive.Viewport className="relative flex flex-1 flex-col overflow-x-auto overflow-y-scroll scroll-smooth">
         <div className="mx-auto flex w-full max-w-(--thread-max-width) flex-1 flex-col px-4 pt-4">
           <AuiIf condition={(s) => s.thread.isEmpty}>
             <ThreadEmpty />
@@ -147,8 +144,7 @@ const ThreadEmpty: FC = () => {
 
 const ThreadScrollToBottom: FC = () => {
   return (
-    // Explicit `smooth` — the one scroll a user asks for keeps its motion.
-    <ThreadPrimitive.ScrollToBottom behavior="smooth" asChild>
+    <ThreadPrimitive.ScrollToBottom asChild>
       <TooltipIconButton
         tooltip="Scroll to bottom"
         variant="outline"
