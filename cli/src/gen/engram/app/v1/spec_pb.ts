@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/spec.proto.
  */
 export const file_engram_app_v1_spec: GenFile = /*@__PURE__*/
-  fileDesc("ChhlbmdyYW0vYXBwL3YxL3NwZWMucHJvdG8SDWVuZ3JhbS5hcHAudjEi5gEKDFNwZWNMaXN0SXRlbRIKCgJpZBgBIAEoCRINCgV0aXRsZRgCIAEoCRIVCg10ZW1wbGF0ZV9uYW1lGAMgASgJEhEKBHJlcG8YBCABKAlIAIgBARIRCglsaWZlY3ljbGUYBSABKAkSKQoMcGFydGljaXBhbnRzGAYgAygLMhMuZW5ncmFtLmFwcC52MS5Vc2VyEhsKE29wZW5fcXVlc3Rpb25fY291bnQYByABKAUSGQoRdGlja2V0X3N5bmNfc3RhdGUYCCABKAkSEgoKdXBkYXRlZF9hdBgJIAEoCUIHCgVfcmVwbyJGChBMaXN0U3BlY3NSZXF1ZXN0EhEKCWxpZmVjeWNsZRgBIAEoCRIMCgRwYWdlGAIgASgFEhEKCXBhZ2Vfc2l6ZRgDIAEoBSJUChFMaXN0U3BlY3NSZXNwb25zZRIqCgVzcGVjcxgBIAMoCzIbLmVuZ3JhbS5hcHAudjEuU3BlY0xpc3RJdGVtEhMKC3RvdGFsX2NvdW50GAIgASgFMl0KC1NwZWNTZXJ2aWNlEk4KCUxpc3RTcGVjcxIfLmVuZ3JhbS5hcHAudjEuTGlzdFNwZWNzUmVxdWVzdBogLmVuZ3JhbS5hcHAudjEuTGlzdFNwZWNzUmVzcG9uc2ViBnByb3RvMw", [file_engram_app_v1_user]);
+  fileDesc("ChhlbmdyYW0vYXBwL3YxL3NwZWMucHJvdG8SDWVuZ3JhbS5hcHAudjEiiAIKDFNwZWNMaXN0SXRlbRIKCgJpZBgBIAEoCRINCgV0aXRsZRgCIAEoCRIVCg10ZW1wbGF0ZV9uYW1lGAMgASgJEhEKBHJlcG8YBCABKAlIAIgBARIRCglsaWZlY3ljbGUYBSABKAkSKQoMcGFydGljaXBhbnRzGAYgAygLMhMuZW5ncmFtLmFwcC52MS5Vc2VyEhsKE29wZW5fcXVlc3Rpb25fY291bnQYByABKAUSGQoRdGlja2V0X3N5bmNfc3RhdGUYCCABKAkSEgoKdXBkYXRlZF9hdBgJIAEoCRIgChhhY3RpdmVfcGFydGljaXBhbnRfY291bnQYCiABKAVCBwoFX3JlcG8iRgoQTGlzdFNwZWNzUmVxdWVzdBIRCglsaWZlY3ljbGUYASABKAkSDAoEcGFnZRgCIAEoBRIRCglwYWdlX3NpemUYAyABKAUiVAoRTGlzdFNwZWNzUmVzcG9uc2USKgoFc3BlY3MYASADKAsyGy5lbmdyYW0uYXBwLnYxLlNwZWNMaXN0SXRlbRITCgt0b3RhbF9jb3VudBgCIAEoBTJdCgtTcGVjU2VydmljZRJOCglMaXN0U3BlY3MSHy5lbmdyYW0uYXBwLnYxLkxpc3RTcGVjc1JlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkxpc3RTcGVjc1Jlc3BvbnNlYgZwcm90bzM", [file_engram_app_v1_user]);
 
 /**
  * @generated from message engram.app.v1.SpecListItem
@@ -71,6 +71,13 @@ export type SpecListItem = Message<"engram.app.v1.SpecListItem"> & {
    * @generated from field: string updated_at = 9;
    */
   updatedAt: string;
+
+  /**
+   * distinct connected human collaborators
+   *
+   * @generated from field: int32 active_participant_count = 10;
+   */
+  activeParticipantCount: number;
 };
 
 /**

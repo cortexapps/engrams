@@ -50,6 +50,7 @@ export function registerSpecs(router: ConnectRouter, deps: SpecRpcDeps = {}): vo
           ...(row.repo ? { repo: row.repo } : {}),
           lifecycle: row.lifecycle,
           participants: row.participants,
+          activeParticipantCount: row.activeParticipantCount,
           openQuestionCount: row.openQuestionCount,
           ticketSyncState: row.ticketSyncState,
           updatedAt: row.updatedAt.toISOString(),

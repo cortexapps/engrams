@@ -39,10 +39,18 @@ export interface SpecAwarenessQueryChannelEnvelope {
   specId: string;
 }
 
+export interface SpecParticipantConnectedChannelEnvelope {
+  type: "participant-connected";
+  specId: string;
+  clientId: string;
+  epoch: string;
+}
+
 export type SpecChannelEnvelope =
   | SpecUpdateChannelEnvelope
   | SpecAwarenessChannelEnvelope
-  | SpecAwarenessQueryChannelEnvelope;
+  | SpecAwarenessQueryChannelEnvelope
+  | SpecParticipantConnectedChannelEnvelope;
 
 export function encodeSpecChannelEnvelope(envelope: SpecChannelEnvelope): string {
   const payload = JSON.stringify(envelope);
@@ -68,6 +76,19 @@ export function parseSpecChannelEnvelope(payload: string): SpecChannelEnvelope |
     }
     if (record.type === "awareness-query") {
       return { type: "awareness-query", specId: record.specId };
+    }
+    if (
+      record.type === "participant-connected" &&
+      typeof record.clientId === "string" &&
+      typeof record.epoch === "string" &&
+      /^\d+$/.test(record.epoch)
+    ) {
+      return {
+        type: "participant-connected",
+        specId: record.specId,
+        clientId: record.clientId,
+        epoch: record.epoch,
+      };
     }
     return null;
   } catch {

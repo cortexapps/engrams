@@ -173,7 +173,10 @@ export function SpecRow({ spec, now }: { spec: SpecListItem; now: number }) {
         </Badge>
       </TableCell>
       <TableCell>
-        <SpecPeople participants={spec.participants} />
+        <SpecPeople
+          participants={spec.participants}
+          activeParticipantCount={spec.activeParticipantCount}
+        />
       </TableCell>
       <TableCell>
         <span className="inline-flex items-center gap-1.5 font-mono text-xs tabular-nums">
@@ -191,7 +194,13 @@ export function SpecRow({ spec, now }: { spec: SpecListItem; now: number }) {
   );
 }
 
-export function SpecPeople({ participants }: { participants: SpecListItem["participants"] }) {
+export function SpecPeople({
+  participants,
+  activeParticipantCount,
+}: {
+  participants: SpecListItem["participants"];
+  activeParticipantCount: number;
+}) {
   const people = participants.slice(0, 3);
   if (people.length === 0) {
     return (
@@ -213,9 +222,9 @@ export function SpecPeople({ participants }: { participants: SpecListItem["parti
           <AvatarFallback>{initials(person.name || person.email)}</AvatarFallback>
         </Avatar>
       ))}
-      {participants.length > people.length && (
+      {activeParticipantCount > people.length && (
         <AvatarGroupCount className="size-6 text-xs">
-          +{participants.length - people.length}
+          +{activeParticipantCount - people.length}
         </AvatarGroupCount>
       )}
     </AvatarGroup>

@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { describe, expect, test, vi } from "vitest";
 
 import { SpecListItemSchema } from "../../gen/engram/app/v1/spec_pb";
+import { UserSchema } from "../../gen/engram/app/v1/user_pb";
 
 const useSpecsMock = vi.hoisted(() => vi.fn());
 
@@ -18,10 +19,25 @@ import { selectSpecFilter, SpecPagination, SpecPeople, SpecRow, SpecsList } from
 
 describe("SpecPeople", () => {
   test("an idle spec does not report a live agent", () => {
-    render(<SpecPeople participants={[]} />);
+    render(<SpecPeople participants={[]} activeParticipantCount={0} />);
 
     expect(screen.getByLabelText("No live collaborators")).toBeTruthy();
     expect(screen.queryByLabelText("Spec agent")).toBeNull();
+  });
+
+  test("uses the distinct active count for collaborators outside the SQL sample", () => {
+    render(
+      <SpecPeople
+        participants={[
+          create(UserSchema, { id: "person-1", name: "Person One", email: "one@test" }),
+          create(UserSchema, { id: "person-2", name: "Person Two", email: "two@test" }),
+          create(UserSchema, { id: "person-3", name: "Person Three", email: "three@test" }),
+        ]}
+        activeParticipantCount={8}
+      />,
+    );
+
+    expect(screen.getByText("+5")).toBeTruthy();
   });
 });
 
@@ -116,6 +132,7 @@ test("renders every field in a complete list row", () => {
     repo: "cortexapps/engrams",
     lifecycle: "draft",
     participants: [{ id: "person-1", name: "Taylor Member", email: "taylor@test" }],
+    activeParticipantCount: 1,
     openQuestionCount: 2,
     ticketSyncState: "failed",
     updatedAt,

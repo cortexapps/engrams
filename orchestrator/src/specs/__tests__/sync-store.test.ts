@@ -41,7 +41,7 @@ describe("PostgresSpecAwarenessBus", () => {
       query: async () => {},
     };
     const bus = new PostgresSpecAwarenessBus(pool);
-    const handlers = { update: () => {}, query: () => {} };
+    const handlers = { update: () => {}, query: () => {}, participantConnected: () => {} };
 
     await expect(bus.start(handlers)).rejects.toThrow("LISTEN failed");
     expect(client.releases).toBe(1);
@@ -109,6 +109,33 @@ describe("PostgresSpecAwarenessBus", () => {
     }
     aggregate.destroy();
     result.destroy();
+  });
+
+  test("publishes the participant epoch used to supersede peer sockets", async () => {
+    const payloads: string[] = [];
+    const pool = {
+      connect: async () => new FakeAwarenessClient(),
+      query: async (_queryText: string, values: unknown[]) => {
+        const payload = values[1];
+        if (typeof payload !== "string") throw new Error("The notify payload is missing");
+        payloads.push(payload);
+      },
+    };
+    const bus = new PostgresSpecAwarenessBus(pool);
+
+    await bus.publishParticipantConnected(
+      "00000000-0000-4000-8000-000000000104",
+      "42",
+      9_007_199_254_740_993n,
+    );
+
+    expect(payloads).toHaveLength(1);
+    expect(parseSpecChannelEnvelope(payloads[0]!)).toEqual({
+      type: "participant-connected",
+      specId: "00000000-0000-4000-8000-000000000104",
+      clientId: "42",
+      epoch: "9007199254740993",
+    });
   });
 });
 
@@ -188,7 +215,7 @@ describe("PostgresSpecParticipantStore", () => {
   );
 
   test.skipIf(!liveDbReachable)(
-    "an old disconnect cannot clear a newer connection epoch",
+    "stale heartbeat and disconnect ordering cannot clear the intended live epoch",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
       let current = new Date("2026-08-10T12:00:00Z");
@@ -202,16 +229,23 @@ describe("PostgresSpecParticipantStore", () => {
       current = new Date(current.getTime() + 1_000);
       const newEpoch = await participants.connect(specId, clientId, firstUserId);
 
+      await participants.disconnect(specId, clientId, newEpoch);
+      await participants.renew(specId, clientId, oldEpoch);
       await participants.disconnect(specId, clientId, oldEpoch);
+      current = new Date(current.getTime() + 1_000);
+      const liveEpoch = await participants.connect(specId, clientId, firstUserId);
+      await participants.renew(specId, clientId, oldEpoch);
+      await participants.disconnect(specId, clientId, newEpoch);
 
       const result = await livePool.query(
-        `SELECT connection_epoch, disconnected_at
+        `SELECT connection_epoch, disconnected_at, lease_expires_at > $3 AS active
          FROM spec_participant WHERE spec_id = $1 AND client_id = $2`,
-        [specId, clientId],
+        [specId, clientId, current],
       );
       expect(newEpoch).toBe(oldEpoch + 1n);
+      expect(liveEpoch).toBe(newEpoch + 1n);
       expect(result.rows).toEqual([
-        { connection_epoch: newEpoch.toString(), disconnected_at: null },
+        { connection_epoch: liveEpoch.toString(), disconnected_at: null, active: true },
       ]);
     },
   );

@@ -1,6 +1,6 @@
 /** Read-only data access for the Tech Specs list. */
 
-import { and, count, desc, eq, gt, inArray, isNull, or } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import { getDb } from "./client.ts";
@@ -19,6 +19,8 @@ import {
 export type SpecLifecycle = "draft" | "published";
 export type TicketSyncState = "none" | "pending" | "synced" | "failed";
 
+const SPEC_PARTICIPANT_SAMPLE_SIZE = 3;
+
 export interface SpecListParticipant {
   id: string;
   name: string;
@@ -32,6 +34,7 @@ export interface SpecListRow {
   repo: string | null;
   lifecycle: SpecLifecycle;
   participants: SpecListParticipant[];
+  activeParticipantCount: number;
   openQuestionCount: number;
   ticketSyncState: TicketSyncState;
   updatedAt: Date;
@@ -47,6 +50,15 @@ export interface SpecListOptions {
 export interface SpecListStore {
   isMember(userId: string): Promise<boolean>;
   list(options: SpecListOptions): Promise<{ rows: SpecListRow[]; totalCount: number }>;
+}
+
+interface ParticipantSampleRow {
+  [key: string]: unknown;
+  spec_id: string;
+  id: string;
+  name: string;
+  email: string;
+  active_participant_count: number;
 }
 
 function repoLabel(policy: TaskLaunchPolicy | null): string | null {
@@ -102,27 +114,49 @@ export function makeSpecListStore(
       const sessionIds = specRows
         .map((row) => row.sessionId)
         .filter((id): id is string => id != null);
+      const activeAt = now();
 
-      const [participantRows, questionRows, launchRows] = await Promise.all([
-        db
-          .select({
-            specId: specParticipant.specId,
-            id: user.id,
-            name: user.name,
-            email: user.email,
-            connectedAt: specParticipant.connectedAt,
-          })
-          .from(specParticipant)
-          .innerJoin(user, eq(user.id, specParticipant.userId))
-          .where(
-            and(
-              inArray(specParticipant.specId, specIds),
-              isNull(specParticipant.disconnectedAt),
-              gt(specParticipant.leaseExpiresAt, now()),
-              or(eq(user.banned, false), isNull(user.banned)),
-            ),
+      const [participantResult, questionRows, launchRows] = await Promise.all([
+        db.execute<ParticipantSampleRow>(sql`
+          WITH active_participant AS (
+            SELECT DISTINCT ON (participant.spec_id, participant.user_id)
+                   participant.spec_id,
+                   member.id,
+                   member.name,
+                   member.email,
+                   participant.connected_at AS first_connected_at
+              FROM spec_participant AS participant
+              JOIN "user" AS member ON member.id = participant.user_id
+             WHERE participant.spec_id IN (
+               ${sql.join(
+                 specIds.map((specId) => sql`${specId}`),
+                 sql`, `,
+               )}
+             )
+               AND participant.disconnected_at IS NULL
+               AND participant.lease_expires_at > ${activeAt}
+               AND (member.banned = false OR member.banned IS NULL)
+             ORDER BY participant.spec_id,
+                      participant.user_id,
+                      participant.connected_at,
+                      participant.client_id
+          ), ranked_participant AS (
+            SELECT spec_id,
+                   id,
+                   name,
+                   email,
+                   count(*) OVER (PARTITION BY spec_id)::int AS active_participant_count,
+                   row_number() OVER (
+                     PARTITION BY spec_id
+                     ORDER BY first_connected_at, id
+                   ) AS sample_rank
+              FROM active_participant
           )
-          .orderBy(specParticipant.connectedAt),
+          SELECT spec_id, id, name, email, active_participant_count
+            FROM ranked_participant
+           WHERE sample_rank <= ${SPEC_PARTICIPANT_SAMPLE_SIZE}
+           ORDER BY spec_id, sample_rank
+        `),
         db
           .select({ specId: specOpenQuestion.specId, value: count() })
           .from(specOpenQuestion)
@@ -140,11 +174,13 @@ export function makeSpecListStore(
               .where(inArray(taskSession.sessionId, sessionIds)),
       ]);
 
-      const participants = new Map<string, Map<string, SpecListParticipant>>();
-      for (const row of participantRows) {
-        const byUser = participants.get(row.specId) ?? new Map();
-        byUser.set(row.id, { id: row.id, name: row.name, email: row.email });
-        participants.set(row.specId, byUser);
+      const participants = new Map<string, SpecListParticipant[]>();
+      const activeParticipantCounts = new Map<string, number>();
+      for (const row of participantResult.rows) {
+        const sample = participants.get(row.spec_id) ?? [];
+        sample.push({ id: row.id, name: row.name, email: row.email });
+        participants.set(row.spec_id, sample);
+        activeParticipantCounts.set(row.spec_id, row.active_participant_count);
       }
       const questionCounts = new Map(questionRows.map((row) => [row.specId, Number(row.value)]));
       const repos = new Map(launchRows.map((row) => [row.sessionId, repoLabel(row.launchPolicy)]));
@@ -156,7 +192,8 @@ export function makeSpecListStore(
           templateName: row.templateName,
           repo: row.sessionId ? (repos.get(row.sessionId) ?? null) : null,
           lifecycle: row.lifecycle === "published" ? "published" : "draft",
-          participants: [...(participants.get(row.id)?.values() ?? [])],
+          participants: participants.get(row.id) ?? [],
+          activeParticipantCount: activeParticipantCounts.get(row.id) ?? 0,
           openQuestionCount: questionCounts.get(row.id) ?? 0,
           // The ticket-tree issue adds its storage. The list contract is ready
           // now, and specs without ticket drafts have no sync state.

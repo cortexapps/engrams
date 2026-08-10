@@ -23,6 +23,7 @@ message SpecListItem {
   // the ticket-tree feature. Before that feature, this value is "none".
   string ticket_sync_state = 8;
   string updated_at = 9; // RFC 3339
+  int32 active_participant_count = 10; // distinct connected human collaborators
 }
 
 message ListSpecsRequest {

@@ -61,9 +61,9 @@ export class PostgresSpecParticipantStore implements SpecParticipantStore {
     return rows[0]!.epoch;
   }
 
-  async renew(specId: string, clientId: string, epoch: bigint): Promise<void> {
+  async renew(specId: string, clientId: string, epoch: bigint): Promise<boolean> {
     const renewedAt = this.now();
-    await this.db
+    const rows = await this.db
       .update(specParticipant)
       .set({ leaseExpiresAt: new Date(renewedAt.getTime() + this.leaseDurationMs) })
       .where(
@@ -73,7 +73,9 @@ export class PostgresSpecParticipantStore implements SpecParticipantStore {
           eq(specParticipant.connectionEpoch, epoch),
           isNull(specParticipant.disconnectedAt),
         ),
-      );
+      )
+      .returning({ epoch: specParticipant.connectionEpoch });
+    return rows.length === 1;
   }
 
   async disconnect(specId: string, clientId: string, epoch: bigint): Promise<void> {
@@ -103,6 +105,7 @@ export class PostgresSpecAwarenessBus implements SpecAwarenessBus {
   async start(handlers: {
     update(specId: string, update: Uint8Array): void;
     query(specId: string): void;
+    participantConnected(specId: string, clientId: string, epoch: bigint): void;
     reconnect?(): void;
   }): Promise<() => Promise<void>> {
     if (this.stopListening) throw new Error("The spec awareness bus is already started");
@@ -119,6 +122,12 @@ export class PostgresSpecAwarenessBus implements SpecAwarenessBus {
           }
         } else if (envelope?.type === "awareness-query") {
           handlers.query(envelope.specId);
+        } else if (envelope?.type === "participant-connected") {
+          handlers.participantConnected(
+            envelope.specId,
+            envelope.clientId,
+            BigInt(envelope.epoch),
+          );
         }
       },
       {
@@ -152,10 +161,24 @@ export class PostgresSpecAwarenessBus implements SpecAwarenessBus {
     await this.notify({ type: "awareness-query", specId });
   }
 
+  async publishParticipantConnected(
+    specId: string,
+    clientId: string,
+    epoch: bigint,
+  ): Promise<void> {
+    await this.notify({
+      type: "participant-connected",
+      specId,
+      clientId,
+      epoch: epoch.toString(),
+    });
+  }
+
   private async notify(
     envelope:
       | { type: "awareness"; specId: string; update: string }
-      | { type: "awareness-query"; specId: string },
+      | { type: "awareness-query"; specId: string }
+      | { type: "participant-connected"; specId: string; clientId: string; epoch: string },
   ): Promise<void> {
     const payload = encodeSpecChannelEnvelope(envelope);
     await this.pool.query("SELECT pg_notify($1, $2)", [SPEC_UPDATE_CHANNEL, payload]);
