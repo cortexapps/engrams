@@ -399,6 +399,58 @@ describe("PostgresSpecParticipantStore", () => {
           { connection_epoch: currentEpoch.toString(), finite_expiry: true },
         ]);
 
+        const equalExpiryClientId = "current-disconnect-at-expiry";
+        const equalExpiryConnectedAt = new Date("2026-08-10T12:06:00.000Z");
+        const equalExpiryDisconnectAt = new Date(equalExpiryConnectedAt.getTime() + 60_000);
+        now = equalExpiryConnectedAt;
+        const equalExpiryEpoch = await participants.connect(
+          specId,
+          equalExpiryClientId,
+          userId,
+        );
+        now = equalExpiryDisconnectAt;
+        await participants.disconnect(specId, equalExpiryClientId, equalExpiryEpoch);
+        const equalExpiryDisconnect = await client.query<{
+          connection_epoch: string;
+          disconnected_at: Date | null;
+          lease_is_tombstone: boolean;
+        }>(
+          `SELECT connection_epoch,
+                  disconnected_at,
+                  lease_expires_at = '-infinity'::timestamptz AS lease_is_tombstone
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = $2`,
+          [specId, equalExpiryClientId],
+        );
+        expect(equalExpiryDisconnect.rows).toEqual([
+          {
+            connection_epoch: equalExpiryEpoch.toString(),
+            disconnected_at: equalExpiryDisconnectAt,
+            lease_is_tombstone: true,
+          },
+        ]);
+
+        now = new Date(equalExpiryDisconnectAt.getTime() + 1_000);
+        const reconnectedEpoch = await participants.connect(specId, equalExpiryClientId, userId);
+        const reconnected = await client.query<{
+          connection_epoch: string;
+          disconnected_at: Date | null;
+          lease_expires_at: Date;
+        }>(
+          `SELECT connection_epoch, disconnected_at, lease_expires_at
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = $2`,
+          [specId, equalExpiryClientId],
+        );
+        expect(reconnectedEpoch).toBe(equalExpiryEpoch + 1n);
+        expect(reconnected.rows).toEqual([
+          {
+            connection_epoch: reconnectedEpoch.toString(),
+            disconnected_at: null,
+            lease_expires_at: new Date(now.getTime() + 60_000),
+          },
+        ]);
+
         const protectedClientId = "legacy-connect-new-epoch";
         await oldConnect(protectedClientId, initialTime);
         now = reconnectTime;

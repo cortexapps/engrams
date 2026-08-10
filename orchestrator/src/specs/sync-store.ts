@@ -82,7 +82,11 @@ export class PostgresSpecParticipantStore implements SpecParticipantStore {
     const disconnectedAt = this.now();
     await this.db
       .update(specParticipant)
-      .set({ disconnectedAt, leaseExpiresAt: disconnectedAt })
+      .set({
+        disconnectedAt,
+        // This tombstone keeps the current write distinct from a legacy disconnect.
+        leaseExpiresAt: sql`'-infinity'::timestamptz`,
+      })
       .where(
         and(
           eq(specParticipant.specId, specId),
