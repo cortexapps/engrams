@@ -463,7 +463,13 @@ describe("production spec tool service", () => {
           id: "flow",
           kind: "mermaid",
           source: "old",
-          cachedRender: { kind: "mermaid", source: "old", svg: "<svg />" },
+          cachedRender: {
+            kind: "mermaid",
+            source: "old",
+            blockId: "flow",
+            rendererRevision: "1",
+            svg: "<svg />",
+          },
         }),
       ).doc;
     });

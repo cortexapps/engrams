@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
-import type { SpecBlockAttrs } from "@engrams/spec-document";
+import { SPEC_BLOCK_RENDERER_REVISION, type SpecBlockAttrs } from "@engrams/spec-document";
 
 import { SpecBlockView } from "./SpecBlock";
-import { sanitizeSvg, specBlockRenderAdapters } from "./block-renderers";
+import { renderSpecBlock, sanitizeSvg, specBlockRenderAdapters } from "./block-renderers";
 
 const canvasContextDescriptor = Object.getOwnPropertyDescriptor(
   HTMLCanvasElement.prototype,
@@ -11,6 +11,7 @@ const canvasContextDescriptor = Object.getOwnPropertyDescriptor(
 );
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   Reflect.deleteProperty(SVGElement.prototype, "getBBox");
   Reflect.deleteProperty(SVGElement.prototype, "getComputedTextLength");
@@ -46,6 +47,10 @@ describe("spec blocks", () => {
     expect(fetch).not.toHaveBeenCalled();
     await waitFor(() => expect(onCache).toHaveBeenCalledOnce());
     expect(onCache.mock.calls[0]?.[0]).toMatchObject({ source: "flowchart LR\n  A --> B" });
+    expect(onCache.mock.calls[0]?.[0]).toMatchObject({
+      blockId: "request-flow",
+      rendererRevision: SPEC_BLOCK_RENDERER_REVISION,
+    });
   });
 
   test("uses a matching self-contained cache without rendering again", async () => {
@@ -60,6 +65,8 @@ describe("spec blocks", () => {
           cachedRender: {
             kind: "mermaid",
             source,
+            blockId: "request-flow",
+            rendererRevision: SPEC_BLOCK_RENDERER_REVISION,
             svg: '<svg xmlns="http://www.w3.org/2000/svg"><text>Cached</text></svg>',
           },
         })}
@@ -104,18 +111,97 @@ describe("spec blocks", () => {
     expect(screen.getByText("Illustrative")).toBeTruthy();
   });
 
-  test("registers each product renderer and removes active or external SVG content", () => {
+  test("invalidates caches for another block or renderer revision", async () => {
+    const renderMermaid = vi
+      .spyOn(specBlockRenderAdapters.mermaid, "render")
+      .mockResolvedValue('<svg xmlns="http://www.w3.org/2000/svg"><text>Fresh render</text></svg>');
+    const source = "flowchart LR\n  A --> B";
+    const { rerender } = render(
+      <SpecBlockView
+        attrs={attrs({
+          source,
+          cachedRender: {
+            ...cached(source),
+            blockId: "another-block",
+          },
+        })}
+      />,
+    );
+
+    expect(await screen.findByText("Fresh render")).toBeTruthy();
+    expect(renderMermaid).toHaveBeenCalledOnce();
+
+    renderMermaid.mockClear();
+    rerender(
+      <SpecBlockView
+        attrs={attrs({
+          id: "second-block",
+          source,
+          cachedRender: {
+            ...cached(source),
+            blockId: "second-block",
+            rendererRevision: "old-renderer",
+          },
+        })}
+      />,
+    );
+    await waitFor(() => expect(renderMermaid).toHaveBeenCalledOnce());
+  });
+
+  test("uses a closed SVG allowlist for active and network-capable content", () => {
     expect(Object.keys(specBlockRenderAdapters)).toEqual(["mermaid", "d2", "flint"]);
     const sanitized = sanitizeSvg(
-      '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)">' +
-        '<script>alert(1)</script><image href="https://example.com/a.png" />' +
-        '<rect style="fill: url(https://example.com/a.svg)" /></svg>',
+      '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" onload="alert(1)">' +
+        "<script>alert(1)</script><foreignObject><div>foreign</div></foreignObject>" +
+        '<animate attributeName="href" to="https://example.com/a" />' +
+        '<set attributeName="fill" to="url(https://example.com/a.svg)" />' +
+        "<style>@import url(https://example.com/a.css); .x{fill:red}</style>" +
+        '<a href="https://example.com"><text>Unlinked</text></a>' +
+        '<image href="data:image/png;base64,AAAA" />' +
+        '<rect fill="url(https://example.com/a.svg)" clip-path="url(https://example.com/c.svg)" ' +
+        'style="fill: u\\72l(https://example.com/b.svg)" />' +
+        '<path id="safe-path" d="M0 0" marker-end="url(#safe-marker)" />' +
+        '<use href="#safe-path" xlink:href="https://example.com/b.svg#x" />' +
+        "</svg>",
     );
     const svg = new DOMParser().parseFromString(sanitized, "image/svg+xml");
-    expect(svg.querySelector("script")).toBeNull();
-    expect(svg.querySelector("image")?.hasAttribute("href")).toBe(false);
-    expect(svg.querySelector("rect")?.hasAttribute("style")).toBe(false);
+    expect(svg.querySelector("script, foreignObject, animate, set, style, a, image")).toBeNull();
+    expect(svg.querySelector("text")?.textContent).toBe("Unlinked");
+    expect(svg.querySelector("rect")?.attributes).toHaveLength(0);
     expect(svg.documentElement.hasAttribute("onload")).toBe(false);
+    expect(svg.querySelector("path")?.getAttribute("marker-end")).toBe("url(#safe-marker)");
+    expect(svg.querySelector("use")?.getAttribute("href")).toBe("#safe-path");
+    expect(svg.querySelector("use")?.hasAttribute("xlink:href")).toBe(false);
+  });
+
+  test("rejects network-capable sources before a renderer can start a request", async () => {
+    const fetch = vi.fn(() => Promise.reject(new Error("Network access is not allowed.")));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(
+      renderSpecBlock(
+        "mermaid",
+        'flowchart LR\n  A@{ img: "https://example.com/a.png" }',
+        "unsafe-mermaid",
+      ),
+    ).rejects.toThrow("Mermaid source");
+    await expect(
+      renderSpecBlock("d2", "A.icon: https://example.com/a.png", "unsafe-d2"),
+    ).rejects.toThrow("D2 source");
+    await expect(
+      renderSpecBlock(
+        "flint",
+        JSON.stringify({
+          data: { values: [{ category: "A", value: 1 }], url: "https://example.com/a.csv" },
+          chart_spec: {
+            chartType: "Bar Chart",
+            encodings: { x: { field: "category" }, y: { field: "value" } },
+          },
+        }),
+        "unsafe-flint",
+      ),
+    ).rejects.toThrow("Flint field");
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -134,6 +220,8 @@ function cached(source: string) {
   return {
     kind: "mermaid",
     source,
+    blockId: "request-flow",
+    rendererRevision: SPEC_BLOCK_RENDERER_REVISION,
     svg: '<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0" /></svg>',
   };
 }

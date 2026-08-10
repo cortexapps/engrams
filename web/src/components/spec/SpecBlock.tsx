@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  encodedSpecBlockCacheSize,
   isSpecBlockKind,
   readSpecBlockAttrs,
+  SPEC_BLOCK_CACHE_MAX_BYTES,
+  SPEC_BLOCK_RENDERER_REVISION,
   specBlockRegistration,
   type SpecBlockAttrs,
   type SpecBlockCachedRender,
@@ -40,8 +43,8 @@ export function SpecBlock({ node, editor, updateAttributes }: NodeViewProps) {
 export function SpecBlockView({ attrs, onCache }: SpecBlockViewProps) {
   const { id, kind, source, provenance } = attrs;
   const registration = specBlockRegistration(kind);
-  const renderKey = `${id}\u0000${kind}\u0000${source}`;
-  const cachedSvg = useMemo(() => readCachedSvg(attrs), [attrs.cachedRender, source]);
+  const renderKey = `${SPEC_BLOCK_RENDERER_REVISION}\u0000${id}\u0000${kind}\u0000${source}`;
+  const cachedSvg = useMemo(() => readCachedSvg(attrs), [attrs.cachedRender, id, kind, source]);
   const [rendered, setRendered] = useState<RenderedBlock | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -53,7 +56,16 @@ export function SpecBlockView({ attrs, onCache }: SpecBlockViewProps) {
       .then((svg) => {
         if (!current) return;
         setRendered({ key: renderKey, svg });
-        onCache?.({ kind, source, svg });
+        const cachedRender = {
+          kind,
+          source,
+          blockId: id,
+          rendererRevision: SPEC_BLOCK_RENDERER_REVISION,
+          svg,
+        };
+        if (encodedSpecBlockCacheSize(cachedRender) <= SPEC_BLOCK_CACHE_MAX_BYTES) {
+          onCache?.(cachedRender);
+        }
       })
       .catch((cause: unknown) => {
         if (!current) return;
@@ -117,7 +129,9 @@ function readCachedSvg(attrs: SpecBlockAttrs): string | null {
   if (
     !attrs.cachedRender ||
     attrs.cachedRender.kind !== attrs.kind ||
-    attrs.cachedRender.source !== attrs.source
+    attrs.cachedRender.source !== attrs.source ||
+    attrs.cachedRender.blockId !== attrs.id ||
+    attrs.cachedRender.rendererRevision !== SPEC_BLOCK_RENDERER_REVISION
   ) {
     return null;
   }

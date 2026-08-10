@@ -110,8 +110,17 @@ data:
       # stays blocked. Bundled assets still ship as real files
       # (web/vite.config.ts assetsInlineLimit: 0) — don't regress that to
       # data: URIs just because the CSP now tolerates them.
+      # D2 uses a product-owned same-origin worker for its local WASM compiler.
+      # D2's Dagre runtime evaluates bundled layout code. Permit this only in
+      # the dedicated worker response. Do not add `unsafe-eval` to the SPA.
+      location = /d2/d2-worker.js {
+        add_header Content-Security-Policy "default-src 'none'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; connect-src 'self'" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        try_files $uri =404;
+      }
+
       location / {
-        add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; media-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'" always;
+        add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; media-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'" always;
         add_header X-Content-Type-Options "nosniff" always;
         try_files $uri $uri/ /index.html;
       }

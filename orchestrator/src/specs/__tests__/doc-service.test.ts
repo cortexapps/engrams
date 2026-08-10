@@ -7,11 +7,14 @@ import {
   renderMarkdown,
   RequirementIntegrityError,
   schema,
+  SPEC_BLOCK_CACHE_MAX_BYTES,
+  SPEC_BLOCK_RENDERER_REVISION,
   type SpecTemplate,
 } from "@engrams/spec-document";
 import { randomUUID } from "node:crypto";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
+import { Transform } from "prosemirror-transform";
 import * as Y from "yjs";
 import * as dbSchema from "../../db/schema.ts";
 import { makeSpecListStore } from "../../db/specs.ts";
@@ -21,6 +24,7 @@ import {
   parseSpecChannelEnvelope,
   PostgresSpecDocumentStore,
   proseMirrorDocument,
+  SpecBlockCacheTooLargeError,
   SpecDocumentService,
   SpecDocumentReadOnlyError,
   SpecDocumentRevisionConflictError,
@@ -169,6 +173,50 @@ class MemoryCheckpointStore implements SpecCheckpointStore {
 
 function initialUpdate(): Uint8Array {
   return encodeProseMirrorDocument(createTemplateDocument(TEMPLATE));
+}
+
+function diagramUpdate(blockCount = 1): Uint8Array {
+  const template = createTemplateDocument(TEMPLATE);
+  const sections = template.content.content.map((section) => {
+    if (section.attrs.id !== "design") return section;
+    const heading = section.firstChild;
+    if (!heading) throw new Error("The design test section has no heading");
+    const blocks = Array.from({ length: blockCount }, (_, index) =>
+      schema.nodes.diagramBlock!.create({
+        id: `diagram-${index}`,
+        kind: "mermaid",
+        source: `flowchart LR\n  A${index} --> B${index}`,
+      }),
+    );
+    return section.type.create(section.attrs, [heading, ...blocks]);
+  });
+  return encodeProseMirrorDocument(schema.nodes.doc!.create(null, sections));
+}
+
+function withDiagramCaches(
+  document: ReturnType<typeof proseMirrorDocument>,
+  svg: (index: number) => string,
+) {
+  const positions: number[] = [];
+  document.descendants((node, position) => {
+    if (node.type === schema.nodes.diagramBlock) positions.push(position);
+  });
+  let transform = new Transform(document);
+  for (const [index, position] of positions.entries()) {
+    const node = transform.doc.nodeAt(position);
+    if (!node) throw new Error("The diagram test block is missing");
+    transform = transform.setNodeMarkup(position, undefined, {
+      ...node.attrs,
+      cachedRender: {
+        kind: node.attrs.kind,
+        source: node.attrs.source,
+        blockId: node.attrs.id,
+        rendererRevision: SPEC_BLOCK_RENDERER_REVISION,
+        svg: svg(index),
+      },
+    });
+  }
+  return transform.doc;
 }
 
 function clientInsert(base: Uint8Array, sectionIndex: number, value: string): Uint8Array {
@@ -418,6 +466,47 @@ describe("SpecDocumentService", () => {
       SpecDocumentTooLargeError,
     );
     expect(store.updates.get(SPEC_ID)).toHaveLength(1);
+  });
+
+  test("a cache-only update cannot exceed the per-block cache limit", async () => {
+    const store = new MemoryDocumentStore();
+    const service = await seededService(store, diagramUpdate());
+
+    await expect(
+      service.mutateDocument(SPEC_ID, "cache-client", (document) =>
+        withDiagramCaches(document, () => "x".repeat(SPEC_BLOCK_CACHE_MAX_BYTES + 1)),
+      ),
+    ).rejects.toBeInstanceOf(SpecBlockCacheTooLargeError);
+    expect(store.updates.get(SPEC_ID)).toHaveLength(1);
+  });
+
+  test("cache-only updates cannot make the complete Yjs state exceed 2 MB", async () => {
+    const store = new MemoryDocumentStore();
+    const service = await seededService(store, diagramUpdate(5));
+
+    await expect(
+      service.mutateDocument(SPEC_ID, "cache-client", (document) =>
+        withDiagramCaches(document, (index) =>
+          String(index).repeat(SPEC_BLOCK_CACHE_MAX_BYTES - 256),
+        ),
+      ),
+    ).rejects.toMatchObject({
+      name: "SpecDocumentTooLargeError",
+      representation: "encoded Yjs state",
+    });
+    expect(store.updates.get(SPEC_ID)).toHaveLength(1);
+  });
+
+  test("a cache-only update has no section or human-digest effect", async () => {
+    const store = new MemoryDocumentStore();
+    const service = await seededService(store, diagramUpdate());
+
+    await service.mutateDocument(SPEC_ID, "human-client", (document) =>
+      withDiagramCaches(document, () => '<svg><path d="M0 0" /></svg>'),
+    );
+
+    expect(store.lastEffects?.sections.every((section) => !section.changed)).toBe(true);
+    expect(store.lastEffects?.at).toBeUndefined();
   });
 
   test("small updates use the conservative size fast path", async () => {
@@ -927,6 +1016,52 @@ describe("SpecDocumentService with live Postgres", () => {
 
       const accepted = await documents.applyUpdate(specId, update, humanClientId, 2n);
       expect(accepted.seq).toBe(2n);
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
+    "a cache-only update preserves section state and the human transcript",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const stateTime = new Date("2026-08-09T12:03:00.000Z");
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => {
+          throw new Error("A cache-only update must not request a human-edit timestamp");
+        },
+      });
+      await documents.applyUpdate(specId, diagramUpdate(), null);
+      await livePool.query(
+        `INSERT INTO spec_participant (spec_id, client_id, user_id, connected_at)
+         VALUES ($1, $2, $3, $4)`,
+        [specId, humanClientId, userId, stateTime],
+      );
+      await livePool.query(
+        `INSERT INTO spec_section_state
+           (spec_id, section_id, state, na_reason, confirmed_by, updated_at)
+         VALUES ($1, 'design', 'confirmed', NULL, $2, $3)`,
+        [specId, userId, stateTime],
+      );
+
+      await documents.mutateDocument(specId, humanClientId, (document) =>
+        withDiagramCaches(document, () => '<svg><path d="M0 0" /></svg>'),
+      );
+
+      const result = await livePool.query<{
+        state: string;
+        updated_at: Date;
+        actions: string;
+      }>(
+        `SELECT state, updated_at,
+                (SELECT count(*)::text
+                   FROM spec_transcript_action
+                  WHERE spec_id = $1) AS actions
+           FROM spec_section_state
+          WHERE spec_id = $1 AND section_id = 'design'`,
+        [specId],
+      );
+      expect(result.rows[0]?.state).toBe("confirmed");
+      expect(result.rows[0]?.updated_at.toISOString()).toBe(stateTime.toISOString());
+      expect(result.rows[0]?.actions).toBe("0");
     },
   );
 

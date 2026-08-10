@@ -2,6 +2,10 @@ import type { Node as ProseMirrorNode } from "prosemirror-model";
 
 export const SPEC_BLOCK_KINDS = ["mermaid", "d2", "flint"] as const;
 
+/** Change this value when product renderer output can change. */
+export const SPEC_BLOCK_RENDERER_REVISION = "1";
+export const SPEC_BLOCK_CACHE_MAX_BYTES = 512 * 1024;
+
 export type SpecBlockKind = (typeof SPEC_BLOCK_KINDS)[number];
 
 export interface SpecBlockRegistration {
@@ -16,6 +20,8 @@ export type SpecBlockProvenance =
 export interface SpecBlockCachedRender {
   kind: string;
   source: string;
+  blockId: string;
+  rendererRevision: string;
   svg: string;
 }
 
@@ -25,6 +31,10 @@ export interface SpecBlockAttrs {
   source: string;
   cachedRender: SpecBlockCachedRender | null;
   provenance: SpecBlockProvenance;
+}
+
+export function encodedSpecBlockCacheSize(cache: SpecBlockCachedRender): number {
+  return new TextEncoder().encode(JSON.stringify(cache)).byteLength;
 }
 
 const registrations: Readonly<Record<SpecBlockKind, SpecBlockRegistration>> = {
@@ -45,10 +55,7 @@ export function isSpecBlockKind(kind: string): kind is SpecBlockKind {
   return SPEC_BLOCK_KINDS.some((candidate) => candidate === kind);
 }
 
-export function specNodesSemanticallyEqual(
-  left: ProseMirrorNode,
-  right: ProseMirrorNode,
-): boolean {
+export function specNodesSemanticallyEqual(left: ProseMirrorNode, right: ProseMirrorNode): boolean {
   return JSON.stringify(semanticSpecNodeJson(left)) === JSON.stringify(semanticSpecNodeJson(right));
 }
 
@@ -74,16 +81,25 @@ function readCachedRender(value: unknown): SpecBlockCachedRender | null {
     !isRecord(value) ||
     typeof value.kind !== "string" ||
     typeof value.source !== "string" ||
+    typeof value.blockId !== "string" ||
+    typeof value.rendererRevision !== "string" ||
     typeof value.svg !== "string"
   ) {
     return null;
   }
-  return { kind: value.kind, source: value.source, svg: value.svg };
+  return {
+    kind: value.kind,
+    source: value.source,
+    blockId: value.blockId,
+    rendererRevision: value.rendererRevision,
+    svg: value.svg,
+  };
 }
 
 function readProvenance(value: unknown): SpecBlockProvenance {
   if (!isRecord(value) || value.type !== "verified") {
-    const caption = isRecord(value) && typeof value.caption === "string" ? value.caption : undefined;
+    const caption =
+      isRecord(value) && typeof value.caption === "string" ? value.caption : undefined;
     return caption ? { type: "illustrative", caption } : { type: "illustrative" };
   }
   return {
