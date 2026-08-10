@@ -550,6 +550,7 @@ pub(crate) fn bundle_gc_result_to_proto(
         pin_set_size,
         candidates_marked,
         promoted_deletes,
+        promote_repinned_skips,
         promote_delete_errors,
         restart_count,
     } = r;
@@ -558,6 +559,7 @@ pub(crate) fn bundle_gc_result_to_proto(
         pin_set_size: pin_set_size as u64,
         candidates_marked: candidates_marked as u64,
         promoted_deletes: promoted_deletes as u64,
+        promote_repinned_skips: promote_repinned_skips as u64,
         promote_delete_errors: promote_delete_errors as u64,
         restart_count,
     }

@@ -61,7 +61,7 @@ use engram_chunk_store::store::ChunkStore;
 use engram_core::error::SandboxError;
 use engram_core::traits::{Clock as _, Entropy as _};
 use engram_core::types::manifest::ManifestRef;
-use engram_core::types::sandbox::ExecRequest;
+use engram_core::types::sandbox::{AuxBundleRef, ExecRequest, SandboxAuxBundles};
 use engram_core::types::SnapshotId;
 use engram_core::{HostId, SandboxId, SessionId};
 use engram_dst_host::device_plane::{DevicePlane, ServeOutcome};
@@ -89,6 +89,13 @@ pub const FINALIZE_MAX_ATTEMPTS: u32 = 3;
 /// bounding, #784 rung 2): enough `/dev/nbdN` slots for every concurrent
 /// sandbox plus a couple of spares for the slot-accounting exercise.
 pub const DEVICE_CAPACITY: u32 = 8;
+
+/// The staged-bundle file extension for the co-simulated host (the
+/// `SandboxBackend::bundle_file_ext` analog — `squashfs` in prod, a plain
+/// tag here). MUST match what [`CosimHost::finalizer`] passes the real
+/// `EvictionFinalizer`, or the finalize's bundle-publish leg misses the
+/// staged files.
+pub const BUNDLE_EXT: &str = "bin";
 
 /// Content bytes stamped with `tag` (first 8 bytes little-endian, tiled).
 pub(crate) fn synth_chunk(tag: u64) -> Vec<u8> {
@@ -228,6 +235,11 @@ impl EvictionSandbox for CosimDestroyer {
 /// One sandbox on the host.
 struct CosimSandbox {
     session_id: Option<SessionId>,
+    /// ADR 0035 amendment: the aux bundle generations this sandbox has
+    /// attached (the create-time swap-to-current — the host's stamp at
+    /// commit time). What the heartbeat's `sandbox_bundles` reports and
+    /// what a capture's `aux_bundles` pins.
+    attached_bundles: Vec<AuxBundleRef>,
     /// The private base manifest the sandbox was created on — the ref a
     /// post-roll rehydrate rebuilds the RAM backend from (rung 2: the survivor
     /// re-serve leg reconstructs `ChunkedDiskBackend` off the durable pointer).
@@ -400,6 +412,10 @@ pub enum FinalizeTickOutcome {
         /// manifestless completion is the pre-#743 shape; always `true`
         /// here).
         disk_manifest: bool,
+        /// ADR 0035 amendment: the generations this capture pinned (and the
+        /// finalize published) — recorded onto the snapshot row so the pin
+        /// set's snapshot leg holds after the sandbox is destroyed.
+        aux_bundles: Vec<AuxBundleRef>,
     },
 }
 
@@ -439,12 +455,37 @@ pub struct CosimHost {
     /// a kernel-connected device with a live holder that NO tracked record
     /// accounted for (#769 gap A). CLASSIFIED + alertable, never skipped.
     quarantined_unknown: BTreeSet<SandboxId>,
+    /// ADR 0035 amendment: the SHARED blob bucket (one `MemBlobStorage`
+    /// backing the coordinator's blob tier, this host's `ChunkStore`, AND
+    /// the bundle store) — the pre-amendment cosim gave coord and host two
+    /// disjoint buckets, which made "host publishes → coord GC deletes →
+    /// host needs it" structurally unrepresentable.
+    blob: Arc<dyn engram_core::traits::BlobStorage>,
+    /// The bake stamp: the current bundle generation set (`current.json`'s
+    /// cosim analog). One `dyn_0` slot is enough — the incident class is
+    /// about rotation, not slot count.
+    stamp: Vec<AuxBundleRef>,
+    /// ADR 0035 amendment D1 state: has the current stamp generation been
+    /// published to blob storage? `false` models the startup-publish task
+    /// not yet having succeeded (the heartbeat retries it, mirroring the
+    /// 60 s retry timer).
+    stamp_published: bool,
+    /// Deterministic generation counter for stamp contents.
+    bundle_gen: u64,
 }
 
 impl CosimHost {
     /// Build a host over a shared clock/entropy (the ONE clock the whole
-    /// co-sim shares) and its own per-run [`SimFs`] + [`ChunkStore`].
-    pub fn new(host_id: HostId, clock: Arc<SimClock>, entropy: Arc<SimEntropy>) -> Self {
+    /// co-sim shares), the SHARED blob bucket (ADR 0035 amendment: the
+    /// coordinator's blob tier and this host's chunk/bundle stores are one
+    /// bucket, exactly like prod's single GCS bucket), and its own per-run
+    /// [`SimFs`].
+    pub fn new(
+        host_id: HostId,
+        clock: Arc<SimClock>,
+        entropy: Arc<SimEntropy>,
+        blob: Arc<dyn engram_core::traits::BlobStorage>,
+    ) -> Self {
         let fs = SimFs::new().expect("sim tempdir");
         // The blob tier is the deterministic in-memory `MemBlobStorage` (ADR
         // 0098 determinism-audit item 7 / the #799 fix): no `tokio::fs`
@@ -453,9 +494,7 @@ impl CosimHost {
         // still uses the `SimFs` tempdir (inherent to reusing the REAL
         // backend), but its I/O never feeds a decision — see the swarm's
         // I/O-audit verdict.
-        let blob: Arc<dyn engram_core::traits::BlobStorage> =
-            Arc::new(engram_sim::MemBlobStorage::new());
-        let store = Arc::new(ChunkStore::new(blob));
+        let store = Arc::new(ChunkStore::new(blob.clone()));
         Self {
             host_id,
             clock,
@@ -473,7 +512,122 @@ impl CosimHost {
             device: DevicePlane::new(DEVICE_CAPACITY),
             sweep_parked_live: BTreeSet::new(),
             quarantined_unknown: BTreeSet::new(),
+            blob,
+            stamp: Vec::new(),
+            stamp_published: false,
+            bundle_gen: 0,
         }
+    }
+
+    // ─────────── ADR 0035 amendment: the bundle lifecycle ───────────
+    //
+    // The REAL `BundleStore` (publish / materialize / sweep_unpinned) over
+    // the SHARED blob bucket + this host's staged-bundle dir. The stamp is
+    // the `current.json` analog; rotation models a node-assets roll staging
+    // a new bake. The 2026-08-10 incident's whole mechanism — attach the
+    // current generation at create, rotate the stamp, sweep the only copy,
+    // fail the capture's publish — is expressible through these ops.
+
+    /// The staged-bundle dir (what the real `EvictionFinalizer` gets as
+    /// `bundle_dir`).
+    pub fn bundle_dir(&self) -> std::path::PathBuf {
+        self.fs.root().join("bundles")
+    }
+
+    fn bundle_store(&self) -> engram_host_agent::bundles::BundleStore {
+        engram_host_agent::bundles::BundleStore::new(
+            self.blob.clone(),
+            self.bundle_dir(),
+            BUNDLE_EXT,
+        )
+    }
+
+    /// Stage a NEW stamp generation (the node-assets init on a bake roll):
+    /// write deterministic content-addressed bytes into the staged dir and
+    /// point the stamp's `dyn_0` slot at it. Does NOT publish — that is
+    /// [`startup_publish`](Self::startup_publish) (D1), kept separate so the
+    /// pre-D1 world (staged-but-never-durable) stays replayable.
+    pub async fn stage_new_stamp_generation(&mut self) {
+        use sha2::Digest as _;
+        self.bundle_gen += 1;
+        let body = synth_chunk(0xB00D_0000 + self.bundle_gen);
+        let sha = hex::encode(sha2::Sha256::digest(&body));
+        let dir = self.bundle_dir();
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("bundle dir mkdir");
+        tokio::fs::write(dir.join(format!("{sha}.{BUNDLE_EXT}")), &body)
+            .await
+            .expect("stage stamp generation");
+        self.stamp = vec![AuxBundleRef {
+            drive_id: "dyn_0".into(),
+            sha256: sha,
+        }];
+        self.stamp_published = false;
+    }
+
+    /// ADR 0035 amendment D1: publish the stamp's generations to blob
+    /// storage (the startup-publish task's one pass — the REAL idempotent
+    /// HEAD-first `BundleStore::publish`).
+    pub async fn startup_publish(&mut self) -> Result<(), String> {
+        self.bundle_store()
+            .publish(&self.stamp)
+            .await
+            .map_err(|e| format!("startup publish: {e}"))?;
+        self.stamp_published = true;
+        Ok(())
+    }
+
+    /// One heartbeat-ack's worth of the REAL bundle supervisor semantics:
+    /// materialize pinned generations this host is missing, then sweep
+    /// staged generations that are neither pinned nor in the stamp. The
+    /// sweep runs even when materialize fails, exactly like the supervisor
+    /// loop.
+    pub async fn bundle_sweep(&mut self, live: &[AuxBundleRef]) -> Result<(), String> {
+        let store = self.bundle_store();
+        let materialize = store.materialize_if_missing(live).await;
+        store.sweep_unpinned(live, &self.stamp).await;
+        materialize.map_err(|e| format!("bundle materialize: {e}"))
+    }
+
+    /// The stamp (the heartbeat's `current_bundles`).
+    pub fn current_bundles(&self) -> Vec<AuxBundleRef> {
+        self.stamp.clone()
+    }
+
+    /// Has the current stamp generation reached blob storage (D1 state)?
+    pub fn stamp_published(&self) -> bool {
+        self.stamp_published
+    }
+
+    /// The heartbeat's `sandbox_bundles`: every sandbox this host still
+    /// holds (paused/capturing included — the real `aux_bundles_all` reports
+    /// every backend-map entry) with its attached generations.
+    pub fn sandbox_bundles(&self) -> Vec<SandboxAuxBundles> {
+        self.sandboxes
+            .iter()
+            .filter(|(_, s)| !s.attached_bundles.is_empty())
+            .map(|(id, s)| SandboxAuxBundles {
+                sandbox_id: *id,
+                bundles: s.attached_bundles.clone(),
+            })
+            .collect()
+    }
+
+    /// Oracle read: every held sandbox's attachments together with whether
+    /// each generation is still staged locally (checked synchronously under
+    /// the lock; blob reachability is the caller's async half).
+    pub fn attachment_staging(&self) -> Vec<(SandboxId, AuxBundleRef, bool)> {
+        let store = self.bundle_store();
+        self.sandboxes
+            .iter()
+            .flat_map(|(id, s)| {
+                s.attached_bundles.iter().map(|r| {
+                    let staged = store.staged_path(r).exists();
+                    (*id, r.clone(), staged)
+                })
+            })
+            .collect()
     }
 
     fn next_tag(&mut self) -> u64 {
@@ -543,6 +697,11 @@ impl CosimHost {
             id,
             CosimSandbox {
                 session_id: None,
+                // ADR 0035 amendment: the create-time swap-to-current — the
+                // sandbox attaches whatever generation the stamp holds NOW
+                // (`fc.swap_aux_bundles`' cosim analog). A later stamp
+                // rotation must not strand these refs.
+                attached_bundles: self.stamp.clone(),
                 base_ref,
                 published_ref: None,
                 backend: Some(backend),
@@ -931,6 +1090,7 @@ impl CosimHost {
             .session_id
             .ok_or_else(|| format!("snapshot_begin: sandbox {sandbox_id} not bound"))?;
         let cursor = s.cursor;
+        let aux_bundles = s.attached_bundles.clone();
         let Some(backend) = s.backend.clone() else {
             return Err(format!(
                 "snapshot_begin: sandbox {sandbox_id} has no backend"
@@ -979,7 +1139,11 @@ impl CosimHost {
                 total_bytes: NUM_CHUNKS * CHUNK_SIZE,
                 chunks: disk_chunks.iter().map(|(i, h, _)| (*i, *h)).collect(),
             }),
-            aux_bundles: Vec::new(),
+            // ADR 0035 amendment: the capture pins what the sandbox actually
+            // has attached, so the REAL finalize's bundle-publish leg
+            // (`run_upload_blobs` → `BundleStore::publish`) runs — the exact
+            // leg the 2026-08-10 incident failed on.
+            aux_bundles,
             stage: FinalizeStage::Captured,
             attempts: 0,
             disk_manifest: None,
@@ -1030,6 +1194,7 @@ impl CosimHost {
                     session_id,
                     cursor,
                     disk_manifest,
+                    aux_bundles: record.aux_bundles.clone(),
                 }
             }
             FinalizeAttempt::Quarantined => {
@@ -1091,8 +1256,8 @@ impl CosimHost {
         EvictionFinalizer::new(
             Some((*self.store).clone()),
             None,
-            self.fs.root().join("bundles"),
-            ".bin",
+            self.bundle_dir(),
+            BUNDLE_EXT,
             self.fs.root().to_path_buf(),
             self.pending_finalizes.clone(),
             self.destroyer.clone(),

@@ -333,6 +333,7 @@ pub fn recoverable_snapshot_row(
     image_version: &str,
     events_cursor: i64,
     now: chrono::DateTime<chrono::Utc>,
+    aux_bundles: &[engram_core::types::sandbox::AuxBundleRef],
 ) -> SnapshotRecord {
     serde_json::from_value(serde_json::json!({
         "id": id,
@@ -344,6 +345,10 @@ pub fn recoverable_snapshot_row(
         "last_accessed_at": now,
         "recoverable": true,
         "events_cursor": events_cursor,
+        // ADR 0035 amendment: every snapshot flavor pins the generations
+        // the sandbox has attached — the pin set's snapshot leg, and the
+        // reachability oracle's restore-side term.
+        "aux_bundles": aux_bundles,
     }))
     .expect("recoverable snapshot row")
 }

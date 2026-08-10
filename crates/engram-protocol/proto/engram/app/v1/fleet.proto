@@ -396,6 +396,10 @@ message BundleGcResponse {
   uint64 promoted_deletes = 4;
   uint64 promote_delete_errors = 5;
   uint32 restart_count = 6;
+  // Expired candidates found RE-PINNED at delete time and skipped
+  // (blob kept, stale candidate row cleared) — the promote-pass
+  // durability guard, same as SnapshotBlobGcResponse's field.
+  uint64 promote_repinned_skips = 7;
 }
 
 message SnapshotBlobGcRequest {

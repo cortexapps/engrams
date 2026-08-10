@@ -30,6 +30,12 @@ pub struct CosimWorld {
     pub clock: Arc<SimClock>,
     pub entropy: Arc<SimEntropy>,
     pub meta: Arc<SimMetadataStore>,
+    /// ADR 0035 amendment: the ONE blob bucket both sides share (prod: the
+    /// GCS bucket). The coordinator's blob/chunk tier, the host's chunk
+    /// store, the host's bundle store, and the bundle GC all read/write
+    /// THIS — the pre-amendment two-disjoint-buckets shape made the bundle
+    /// durability handoff unrepresentable.
+    pub blob: Arc<dyn engram_core::traits::BlobStorage>,
     pub host_id: HostId,
     /// The shared, lock-guarded host both bridge directions mutate.
     pub host: SharedHost,
@@ -46,25 +52,47 @@ pub struct CosimWorld {
 
 impl CosimWorld {
     pub async fn new(seed: u64) -> Self {
+        Self::new_with_fault_plan(seed, None).await
+    }
+
+    /// A world whose shared bucket injects faults per `plan`
+    /// (`engram_testkit::storage::FaultyBlobStorage` — deterministic,
+    /// call-counted). The bundle legs use `KeyMatch::Prefix("bundles/")`
+    /// so a plan can fail exactly the publish path while chunk uploads
+    /// proceed — the "generation never became durable" half of the
+    /// 2026-08-10 incident.
+    pub async fn new_with_fault_plan(
+        seed: u64,
+        plan: Option<engram_testkit::storage::FaultPlan>,
+    ) -> Self {
         let clock = SimClock::new();
         let entropy = Arc::new(SimEntropy::seeded(seed));
         let meta = SimMetadataStore::new(clock.clone(), Arc::new(SimEntropy::seeded(seed ^ 0xE)));
         let host_id = HostId::from(Uuid::from_u128(0x0A57_0000));
+        // The shared bucket (see the field doc), optionally fault-wrapped.
+        let mem: Arc<dyn engram_core::traits::BlobStorage> =
+            Arc::new(engram_sim::MemBlobStorage::new());
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = match plan {
+            Some(plan) => Arc::new(engram_testkit::storage::FaultyBlobStorage::new(mem, plan)),
+            None => mem,
+        };
 
         let host: SharedHost = Arc::new(tokio::sync::Mutex::new(CosimHost::new(
             host_id,
             clock.clone(),
             entropy.clone(),
+            blob.clone(),
         )));
         let view = host.lock().await.view();
 
-        let state = build_replica(&meta, &clock, &entropy, host_id, host.clone());
+        let state = build_replica(&meta, &clock, &entropy, host_id, host.clone(), blob.clone());
         let coord_plane = Arc::new(CosimCoordControlPlane::new(state.clone()));
 
         let world = Self {
             clock,
             entropy,
             meta,
+            blob,
             host_id,
             host,
             view,
@@ -72,6 +100,17 @@ impl CosimWorld {
             coord_plane,
         };
         world.seed_enabled_image(COSIM_IMAGE).await;
+        // ADR 0035 amendment: stage + publish the initial stamp generation
+        // (a healthy host boots with a staged, durable-at-birth bake) BEFORE
+        // the first heartbeat reports it. The publish is fire-and-forget,
+        // exactly like the real startup task: a faulted put leaves
+        // `stamp_published == false` and the heartbeat retries — never a
+        // boot failure.
+        {
+            let mut host = world.host.lock().await;
+            host.stage_new_stamp_generation().await;
+            let _ = host.startup_publish().await;
+        }
         world.heartbeat().await;
         world
     }
@@ -91,15 +130,26 @@ impl CosimWorld {
     }
 
     /// Register + heartbeat the host into the coordinator meta so the
-    /// scheduler can place sessions on it.
+    /// scheduler can place sessions on it. ADR 0035 amendment: the
+    /// heartbeat carries the host's REAL bundle state (stamp +
+    /// per-sandbox attachments), so `bundle_pin_set` sees every live
+    /// referent — persisted BEFORE any ack-derived pin set is computed
+    /// (the load-bearing ordering).
     pub async fn heartbeat(&self) {
+        let (current_bundles, sandbox_bundles) = {
+            let host = self.host.lock().await;
+            (host.current_bundles(), host.sandbox_bundles())
+        };
         let _ = self
             .meta
             .upsert_host(host_record(self.host_id, &self.clock))
             .await;
         let _ = self
             .meta
-            .touch_host_heartbeat(self.host_id, host_heartbeat())
+            .touch_host_heartbeat(
+                self.host_id,
+                host_heartbeat(current_bundles, sandbox_bundles),
+            )
             .await;
     }
 
@@ -175,6 +225,7 @@ fn build_replica(
     entropy: &Arc<SimEntropy>,
     host_id: HostId,
     host: SharedHost,
+    coord_blob: Arc<dyn engram_core::traits::BlobStorage>,
 ) -> SharedState {
     let registry = Arc::new(HostRegistry::new(meta.clone() as Arc<dyn MetadataStore>));
     registry.register(
@@ -186,8 +237,8 @@ fn build_replica(
     // `temp_dir()/engram-dst-cosim-blobs` was SHARED across every SimWorld — a
     // cross-world contamination + real-`tokio::fs`-latency clock-drift hazard
     // (the #793/#799 class) fatal to a multi-seed swarm. One `MemBlobStorage`
-    // backs both `blob` and `chunk_store` (they are the coordinator's one bucket).
-    let coord_blob = Arc::new(engram_sim::MemBlobStorage::new());
+    // backs `blob`, `chunk_store`, AND (ADR 0035 amendment) the host's chunk +
+    // bundle stores — it is the world's one bucket, passed in by `CosimWorld`.
     let services = Services {
         meta: meta.clone(),
         host: registry.clone() as Arc<dyn HostClient>,
@@ -230,14 +281,17 @@ fn host_capacity() -> HostCapacity {
     }
 }
 
-fn host_heartbeat() -> HostHeartbeat {
+fn host_heartbeat(
+    current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
+    sandbox_bundles: Vec<engram_core::types::sandbox::SandboxAuxBundles>,
+) -> HostHeartbeat {
     HostHeartbeat {
         status: HostStatus::Ready,
         capacity: host_capacity(),
         utilization: host_utilization(),
         ready_images: Vec::new(),
-        current_bundles: Vec::new(),
-        sandbox_bundles: Vec::new(),
+        current_bundles,
+        sandbox_bundles,
         total_vcpus: 16,
         wire_version: 1,
         stages_images: false,
