@@ -398,10 +398,17 @@ export const specParticipant = pgTable(
       .references(() => spec.id, { onDelete: "cascade" }),
     clientId: text("client_id").notNull(),
     userId: text("user_id").references(() => user.id, { onDelete: "set null" }),
+    connectionEpoch: bigint("connection_epoch", { mode: "bigint" })
+      .notNull()
+      .default(sql`0`),
     connectedAt: timestamp("connected_at", { withTimezone: true }).notNull().defaultNow(),
     disconnectedAt: timestamp("disconnected_at", { withTimezone: true }),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }).notNull(),
   },
-  (t) => [primaryKey({ columns: [t.specId, t.clientId] })],
+  (t) => [
+    primaryKey({ columns: [t.specId, t.clientId] }),
+    index("spec_participant_live_idx").on(t.specId, t.leaseExpiresAt),
+  ],
 );
 
 export const specProjection = pgTable(

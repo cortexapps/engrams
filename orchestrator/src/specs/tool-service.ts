@@ -58,7 +58,10 @@ interface EditorNameRow {
 }
 
 export class PostgresSpecToolMetadataStore implements SpecToolMetadataStore {
-  constructor(private readonly pool: Pool) {}
+  constructor(
+    private readonly pool: Pool,
+    private readonly now: () => Date,
+  ) {}
 
   async templateSections(specId: string): Promise<readonly SpecTemplateSection[]> {
     const result = await this.pool.query<TemplateSectionsRow>(
@@ -95,9 +98,10 @@ export class PostgresSpecToolMetadataStore implements SpecToolMetadataStore {
          JOIN "user" u ON u.id = p.user_id
         WHERE p.spec_id = $1
           AND p.disconnected_at IS NULL
+          AND p.lease_expires_at > $3
           AND ($2::text IS NULL OR p.user_id <> $2)
         ORDER BY u.name`,
-      [specId, actorUserId ?? null],
+      [specId, actorUserId ?? null, this.now()],
     );
     return result.rows.map((row) => row.name);
   }

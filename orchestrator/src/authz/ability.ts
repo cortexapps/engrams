@@ -40,6 +40,7 @@ export type Subjects =
   | "Fleet"
   | "Registry"
   | "Artifact"
+  | "Spec"
   | "all";
 
 // Typed subject shapes — used with CASL's `subject()` helper.
@@ -105,6 +106,10 @@ export function abilityFor(user: AbilityUser): AppAbility {
   // rides manage("all") below — no per-call branching.
   can("manage", "Artifact", { ownerUserId: user.id });
   can("read", "Artifact", { visibility: "org" });
+
+  // Tech specs are shared with all organization members. The RPC and socket
+  // guards resolve membership before they apply this ability.
+  can("read", "Spec");
 
   // Admin override.
   if (user.role === "admin") can("manage", "all");

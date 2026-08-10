@@ -1,4 +1,4 @@
-import { and, eq, isNull, or } from "drizzle-orm";
+import { and, eq, isNull, or, sql } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import * as decoding from "lib0/decoding";
 import * as encoding from "lib0/encoding";
@@ -26,29 +26,70 @@ export class PostgresSpecParticipantStore implements SpecParticipantStore {
   constructor(
     private readonly db: NodePgDatabase<typeof schema>,
     private readonly now: () => Date = () => new Date(),
+    private readonly leaseDurationMs = 60_000,
   ) {}
 
-  async connect(specId: string, clientId: string, userId: string): Promise<void> {
+  async connect(specId: string, clientId: string, userId: string): Promise<bigint> {
     const connectedAt = this.now();
+    const leaseExpiresAt = new Date(connectedAt.getTime() + this.leaseDurationMs);
     const rows = await this.db
       .insert(specParticipant)
-      .values({ specId, clientId, userId, connectedAt, disconnectedAt: null })
+      .values({
+        specId,
+        clientId,
+        userId,
+        connectionEpoch: 1n,
+        connectedAt,
+        disconnectedAt: null,
+        leaseExpiresAt,
+      })
       .onConflictDoUpdate({
         target: [specParticipant.specId, specParticipant.clientId],
-        set: { userId, connectedAt, disconnectedAt: null },
+        set: {
+          userId,
+          connectionEpoch: sql`${specParticipant.connectionEpoch} + 1`,
+          connectedAt,
+          disconnectedAt: null,
+          leaseExpiresAt,
+        },
         setWhere: or(isNull(specParticipant.userId), eq(specParticipant.userId, userId)),
       })
-      .returning({ userId: specParticipant.userId });
+      .returning({ userId: specParticipant.userId, epoch: specParticipant.connectionEpoch });
     if (rows.length === 0) {
       throw new Error(`Spec client ${clientId} is already bound to another user`);
     }
+    return rows[0]!.epoch;
   }
 
-  async disconnect(specId: string, clientId: string): Promise<void> {
+  async renew(specId: string, clientId: string, epoch: bigint): Promise<boolean> {
+    const renewedAt = this.now();
+    const rows = await this.db
+      .update(specParticipant)
+      .set({ leaseExpiresAt: new Date(renewedAt.getTime() + this.leaseDurationMs) })
+      .where(
+        and(
+          eq(specParticipant.specId, specId),
+          eq(specParticipant.clientId, clientId),
+          eq(specParticipant.connectionEpoch, epoch),
+          isNull(specParticipant.disconnectedAt),
+        ),
+      )
+      .returning({ epoch: specParticipant.connectionEpoch });
+    return rows.length === 1;
+  }
+
+  async disconnect(specId: string, clientId: string, epoch: bigint): Promise<void> {
+    const disconnectedAt = this.now();
     await this.db
       .update(specParticipant)
-      .set({ disconnectedAt: this.now() })
-      .where(and(eq(specParticipant.specId, specId), eq(specParticipant.clientId, clientId)));
+      .set({ disconnectedAt, leaseExpiresAt: disconnectedAt })
+      .where(
+        and(
+          eq(specParticipant.specId, specId),
+          eq(specParticipant.clientId, clientId),
+          eq(specParticipant.connectionEpoch, epoch),
+        ),
+      );
   }
 }
 
@@ -64,6 +105,7 @@ export class PostgresSpecAwarenessBus implements SpecAwarenessBus {
   async start(handlers: {
     update(specId: string, update: Uint8Array): void;
     query(specId: string): void;
+    participantConnected(specId: string, clientId: string, epoch: bigint): void;
     reconnect?(): void;
   }): Promise<() => Promise<void>> {
     if (this.stopListening) throw new Error("The spec awareness bus is already started");
@@ -80,6 +122,12 @@ export class PostgresSpecAwarenessBus implements SpecAwarenessBus {
           }
         } else if (envelope?.type === "awareness-query") {
           handlers.query(envelope.specId);
+        } else if (envelope?.type === "participant-connected") {
+          handlers.participantConnected(
+            envelope.specId,
+            envelope.clientId,
+            BigInt(envelope.epoch),
+          );
         }
       },
       {
@@ -113,10 +161,24 @@ export class PostgresSpecAwarenessBus implements SpecAwarenessBus {
     await this.notify({ type: "awareness-query", specId });
   }
 
+  async publishParticipantConnected(
+    specId: string,
+    clientId: string,
+    epoch: bigint,
+  ): Promise<void> {
+    await this.notify({
+      type: "participant-connected",
+      specId,
+      clientId,
+      epoch: epoch.toString(),
+    });
+  }
+
   private async notify(
     envelope:
       | { type: "awareness"; specId: string; update: string }
-      | { type: "awareness-query"; specId: string },
+      | { type: "awareness-query"; specId: string }
+      | { type: "participant-connected"; specId: string; clientId: string; epoch: string },
   ): Promise<void> {
     const payload = encodeSpecChannelEnvelope(envelope);
     await this.pool.query("SELECT pg_notify($1, $2)", [SPEC_UPDATE_CHANNEL, payload]);

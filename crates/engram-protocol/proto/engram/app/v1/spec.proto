@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+import "engram/app/v1/user.proto";
+
+// SpecService lists the organization-shared tech-spec catalog. It is native
+// to the orchestrator. The list reads only the orchestrator database and must
+// not activate or resume a session.
+service SpecService {
+  rpc ListSpecs(ListSpecsRequest) returns (ListSpecsResponse);
+}
+
+message SpecListItem {
+  string id = 1;
+  string title = 2;
+  string template_name = 3;
+  optional string repo = 4;
+  string lifecycle = 5; // "draft" | "published"
+  repeated User participants = 6; // connected human collaborators
+  int32 open_question_count = 7;
+  // "none" | "pending" | "synced" | "failed". Ticket drafts are added by
+  // the ticket-tree feature. Before that feature, this value is "none".
+  string ticket_sync_state = 8;
+  string updated_at = 9; // RFC 3339
+  int32 active_participant_count = 10; // distinct connected human collaborators
+}
+
+message ListSpecsRequest {
+  // "" | "all" | "draft" | "published". Empty means all.
+  string lifecycle = 1;
+  // The page is 1-based. page_size is limited to 200. A zero page_size means
+  // one page of 200. There is no list-all path.
+  int32 page = 2;
+  int32 page_size = 3;
+}
+
+message ListSpecsResponse {
+  repeated SpecListItem specs = 1;
+  int32 total_count = 2; // count before pagination
+}

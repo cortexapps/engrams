@@ -1,4 +1,4 @@
-import { Bandage, FileBox, ScanSearch, Server, SquareTerminal } from "lucide-react";
+import { Bandage, FileBox, FilePenLine, ScanSearch, Server, SquareTerminal } from "lucide-react";
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useIsAdmin } from "../auth/AuthProvider";
 import { useOperatorHealth } from "../hooks/useOperatorHealth";
@@ -56,6 +56,13 @@ const DESTS: Dest[] = [
     icon: FileBox,
     adminOnly: false,
     match: (p) => p.startsWith("/artifacts"),
+  },
+  {
+    to: "/specs",
+    label: "Tech Specs",
+    icon: FilePenLine,
+    adminOnly: false,
+    match: (p) => p.startsWith("/specs"),
   },
   {
     to: "/kaizen",

@@ -25,6 +25,13 @@ vi.mock("./pages/sessions/SessionsLayout", async () => {
 vi.mock("./pages/sessions/StartScreen", () => ({
   StartScreen: () => <div data-testid="sessions" />,
 }));
+vi.mock("./pages/specs/SpecsLayout", async () => {
+  const { Outlet } = await import("@tanstack/react-router");
+  return { SpecsLayout: () => <Outlet /> };
+});
+vi.mock("./pages/specs/SpecsList", () => ({
+  SpecsList: () => <div data-testid="tech-specs" />,
+}));
 
 import { routeTree } from "./router";
 
@@ -40,10 +47,10 @@ const AUTH: AuthState = {
   ability: abilityFor({ id: "user-1", role: "user" }),
 };
 
-function makeTestRouter(auth: AuthState | null) {
+function makeTestRouter(auth: AuthState | null, path = "/login") {
   return createRouter({
     routeTree,
-    history: createMemoryHistory({ initialEntries: ["/login"] }),
+    history: createMemoryHistory({ initialEntries: [path] }),
     context: { auth },
   });
 }
@@ -57,4 +64,9 @@ test("redirects authenticated user away from /login to /sessions", async () => {
   render(<RouterProvider router={makeTestRouter(AUTH)} />);
   await screen.findByTestId("sessions");
   expect(screen.queryByLabelText(/email/i)).toBeNull();
+});
+
+test("routes an authenticated member to the Tech Specs list", async () => {
+  render(<RouterProvider router={makeTestRouter(AUTH, "/specs")} />);
+  await screen.findByTestId("tech-specs");
 });

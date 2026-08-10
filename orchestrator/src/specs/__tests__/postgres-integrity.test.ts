@@ -24,8 +24,9 @@ describe("spec integrity stores with live Postgres", () => {
   const actorUserId = `spec-tool-actor-${randomUUID()}`;
   const samUserId = `spec-tool-sam-${randomUUID()}`;
   const duplicateSamUserId = `spec-tool-sam-duplicate-${randomUUID()}`;
+  const expiredUserId = `spec-tool-expired-${randomUUID()}`;
   const disconnectedUserId = `spec-tool-disconnected-${randomUUID()}`;
-  const userIds = [actorUserId, samUserId, duplicateSamUserId, disconnectedUserId];
+  const userIds = [actorUserId, samUserId, duplicateSamUserId, expiredUserId, disconnectedUserId];
 
   beforeAll(async () => {
     if (!reachable || !pool) return;
@@ -46,18 +47,36 @@ describe("spec integrity stores with live Postgres", () => {
          ($1, 'Ari', $1 || '@example.test', false, now(), now()),
          ($2, 'Sam', $2 || '@example.test', false, now(), now()),
          ($3, 'Sam', $3 || '@example.test', false, now(), now()),
-         ($4, 'Old editor', $4 || '@example.test', false, now(), now())`,
+         ($4, 'Crashed editor', $4 || '@example.test', false, now(), now()),
+         ($5, 'Old editor', $5 || '@example.test', false, now(), now())`,
       userIds,
     );
+    const connectedAt = new Date("2026-08-09T12:00:00.000Z");
+    const activeLeaseExpiresAt = new Date("2026-08-09T12:01:00.000Z");
+    const expiredLeaseExpiresAt = new Date("2026-08-09T12:00:10.000Z");
+    const disconnectedAt = new Date("2026-08-09T12:00:30.000Z");
     await pool.query(
       `INSERT INTO spec_participant
-         (spec_id, client_id, user_id, connected_at, disconnected_at)
+         (spec_id, client_id, user_id, connection_epoch, connected_at,
+          disconnected_at, lease_expires_at)
        VALUES
-         ($1, 'actor', $2, now(), NULL),
-         ($1, 'sam-1', $3, now(), NULL),
-         ($1, 'sam-2', $4, now(), NULL),
-         ($1, 'old', $5, now(), now())`,
-      [specId, ...userIds],
+         ($1, 'actor', $2, 1, $6, NULL, $7),
+         ($1, 'sam-1', $3, 1, $6, NULL, $7),
+         ($1, 'sam-2', $4, 1, $6, NULL, $7),
+         ($1, 'crashed', $5, 1, $6, NULL, $8),
+         ($1, 'old', $9, 1, $6, $10, $7)`,
+      [
+        specId,
+        actorUserId,
+        samUserId,
+        duplicateSamUserId,
+        expiredUserId,
+        connectedAt,
+        activeLeaseExpiresAt,
+        expiredLeaseExpiresAt,
+        disconnectedUserId,
+        disconnectedAt,
+      ],
     );
   });
 
@@ -156,9 +175,12 @@ describe("spec integrity stores with live Postgres", () => {
     expect((await store.find(id))?.state).toBe("resolved");
   });
 
-  test.skipIf(!reachable)("lists only other active editor names", async () => {
+  test.skipIf(!reachable)("lists only other current editor names", async () => {
     if (!pool) throw new Error("The live Postgres pool is not available.");
-    const store = new PostgresSpecToolMetadataStore(pool);
+    const store = new PostgresSpecToolMetadataStore(
+      pool,
+      () => new Date("2026-08-09T12:00:20.000Z"),
+    );
 
     expect(await store.concurrentEditorNames(specId, actorUserId)).toEqual(["Sam"]);
   });

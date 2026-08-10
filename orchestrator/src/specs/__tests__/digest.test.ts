@@ -42,7 +42,8 @@ describe("SpecDigestService with live Postgres", () => {
 
   beforeAll(async () => {
     if (!reachable || !pool) return;
-    const now = new Date();
+    const now = new Date("2026-08-09T12:00:00.000Z");
+    const participantLeaseExpiresAt = new Date("2100-01-01T00:00:00.000Z");
     await pool.query(
       `INSERT INTO "user" (id, name, email, email_verified, created_at, updated_at)
        VALUES ($1, 'Ada', $2, false, $3, $3),
@@ -65,9 +66,10 @@ describe("SpecDigestService with live Postgres", () => {
     firstBaseState = firstInitial;
     const [secondInitial, secondEdit] = updates("second");
     await pool.query(
-      `INSERT INTO spec_participant (spec_id, client_id, user_id)
-       VALUES ($1, 'human', $3), ($2, 'human', $4)`,
-      [firstSpec, secondSpec, firstUser, secondUser],
+      `INSERT INTO spec_participant
+         (spec_id, client_id, user_id, connection_epoch, connected_at, lease_expires_at)
+       VALUES ($1, 'human', $3, 1, $5, $6), ($2, 'human', $4, 1, $5, $6)`,
+      [firstSpec, secondSpec, firstUser, secondUser, now, participantLeaseExpiresAt],
     );
     await pool.query(
       `INSERT INTO spec_update_log (spec_id, seq, update, client_id)
@@ -117,9 +119,10 @@ describe("SpecDigestService with live Postgres", () => {
       ],
     );
     await pool.query(
-      `INSERT INTO spec_participant (spec_id, client_id, user_id)
-       VALUES ($1, 'human', $2)`,
-      [snapshotBaseSpec, firstUser],
+      `INSERT INTO spec_participant
+         (spec_id, client_id, user_id, connection_epoch, connected_at, lease_expires_at)
+       VALUES ($1, 'human', $2, 1, $3, $4)`,
+      [snapshotBaseSpec, firstUser, now, participantLeaseExpiresAt],
     );
     await pool.query(
       `INSERT INTO spec_update_log (spec_id, seq, update, client_id)

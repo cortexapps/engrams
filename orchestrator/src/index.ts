@@ -51,6 +51,7 @@ import { registerMint } from "./rpc/mint.ts";
 import { registerApiKeys } from "./rpc/api-key.ts";
 import { registerIntegration } from "./rpc/integration.ts";
 import { registerArtifacts } from "./rpc/artifacts.ts";
+import { registerSpecs } from "./rpc/specs.ts";
 import { registerAutomations } from "./rpc/automations.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
@@ -104,24 +105,25 @@ import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target
 
 const app = new Hono();
 const warnSpecDocument = (message: string) => log.warn({ message }, "spec document warning");
+const specNow = () => new Date();
 const specDocuments = new SpecDocumentService(
   new PostgresSpecDocumentStore(getPool(), { onWarning: warnSpecDocument }),
-  { onWarning: warnSpecDocument, now: () => new Date() },
+  { onWarning: warnSpecDocument, now: specNow },
 );
 const specOpenQuestions = new PostgresOpenQuestionStore(getPool());
 const specToolService = new SpecToolService({
   documents: specDocuments,
   sectionStates: new SectionStateService({
     store: new PostgresSectionStateStore(getPool()),
-    now: () => new Date(),
+    now: specNow,
   }),
   questions: new OpenQuestionService({
     store: specOpenQuestions,
     document: new SpecQuestionDocument(specDocuments, "spec-agent-question"),
-    now: () => new Date(),
+    now: specNow,
   }),
   questionStore: specOpenQuestions,
-  metadata: new PostgresSpecToolMetadataStore(getPool()),
+  metadata: new PostgresSpecToolMetadataStore(getPool(), specNow),
 });
 const specParticipants = new PostgresSpecParticipantStore(getDb());
 const warnSpecSync = (message: string) => log.warn({ message }, "spec sync warning");
@@ -273,6 +275,9 @@ const server = buildServer(
     // Native ArtifactService: the cross-session artifact registry (owner /
     // org-shared / admin via the shared service layer). Before passthrough.
     registerArtifacts(router);
+
+    // Native SpecService: organization-shared list from orchestrator PG only.
+    registerSpecs(router);
 
     // Generic passthrough: forwards SessionService, FleetService, ImageService
     // to the control plane with per-method CASL authz gate (ADR 0051 Task 18).
