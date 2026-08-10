@@ -1346,7 +1346,7 @@ impl HostAgent {
                     current_bundles.clone(),
                 )
             });
-            // ADR 0115 D1: durable-at-birth — publish the stamp's
+            // ADR 0035 amendment D1: durable-at-birth — publish the stamp's
             // generations to BlobStorage now, not at first snapshot
             // reference. Closes the create→first-checkpoint window in
             // which a stamp rotation + sweep destroys the only copy of
