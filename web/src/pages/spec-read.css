@@ -1,0 +1,319 @@
+.spec-read-page {
+  min-height: 100%;
+  overflow-y: auto;
+  padding: clamp(1.25rem, 3vw, 2.5rem);
+}
+
+.spec-read-header,
+.spec-read-layout,
+.spec-history-heading,
+.spec-checkpoint-title,
+.spec-restore-controls {
+  display: flex;
+}
+
+.spec-read-header {
+  max-width: 96rem;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 2rem;
+  margin: 0 auto 1.5rem;
+}
+
+.spec-read-header h1 {
+  margin-top: 0.35rem;
+  font-size: clamp(2rem, 4vw, 3.5rem);
+  font-weight: 650;
+  letter-spacing: -0.045em;
+}
+
+.spec-read-header p,
+.spec-history-heading p,
+.spec-restore-controls p {
+  color: var(--muted-foreground);
+}
+
+.spec-read-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.spec-read-eyebrow svg,
+.spec-history-heading svg,
+.spec-checkpoint-title svg {
+  width: 1rem;
+  height: 1rem;
+}
+
+.spec-read-layout {
+  max-width: 96rem;
+  align-items: flex-start;
+  gap: 1rem;
+  margin: 0 auto;
+}
+
+.spec-read-document {
+  min-width: 0;
+  flex: 1;
+}
+
+.spec-history {
+  position: sticky;
+  top: 1rem;
+  width: min(23rem, 30vw);
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+  background: var(--card);
+}
+
+.spec-history-heading {
+  align-items: flex-start;
+  gap: 0.65rem;
+  padding: 0.25rem 0.25rem 0.9rem;
+}
+
+.spec-history-heading h2 {
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.spec-history-heading p {
+  margin-top: 0.15rem;
+  font-size: 0.75rem;
+}
+
+.spec-history ol {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.spec-history li button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 0.65rem;
+  border: 1px solid transparent;
+  border-radius: 0.55rem;
+  padding: 0.7rem;
+  text-align: left;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease;
+}
+
+.spec-history li button:hover,
+.spec-history li button.is-selected {
+  border-color: var(--border);
+  background: var(--accent);
+}
+
+.spec-history-order {
+  display: grid;
+  width: 1.45rem;
+  height: 1.45rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted-foreground);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.is-selected .spec-history-order {
+  border-color: var(--foreground);
+  background: var(--foreground);
+  color: var(--background);
+}
+
+.spec-history-copy {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 0.15rem;
+}
+
+.spec-history-copy strong {
+  overflow: hidden;
+  font-size: 0.83rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spec-history-copy > span {
+  color: var(--muted-foreground);
+  font-size: 0.72rem;
+}
+
+.spec-checkpoint-card,
+.spec-history-preview {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+
+.spec-history-preview {
+  margin-top: 1rem;
+  padding: 0.75rem;
+}
+
+.spec-history-preview .spec-checkpoint-card {
+  border: 0;
+}
+
+.spec-checkpoint-title {
+  align-items: center;
+  gap: 0.7rem;
+  border-bottom: 1px solid var(--border);
+  padding: 0.85rem 1rem;
+  color: var(--muted-foreground);
+}
+
+.spec-checkpoint-title div {
+  display: grid;
+}
+
+.spec-checkpoint-title span {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.spec-checkpoint-title strong {
+  color: var(--foreground);
+  font-size: 0.9rem;
+}
+
+.spec-checkpoint-markdown {
+  max-width: 58rem;
+  min-height: 38rem;
+  margin: 0 auto;
+  padding: clamp(2rem, 6vw, 5rem);
+}
+
+.spec-checkpoint-markdown .md-h {
+  margin: 2rem 0 1rem;
+}
+
+.spec-checkpoint-diff {
+  display: grid;
+  gap: 1px;
+  padding: 1rem;
+  background: var(--border);
+}
+
+.spec-diff-segment {
+  overflow-x: auto;
+  padding: 1rem;
+  background: var(--card);
+  font-family: var(--font-sans);
+  font-size: 0.9rem;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+.spec-diff-segment.is-code {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.spec-diff-segment ins,
+.spec-diff-segment del {
+  text-decoration: none;
+}
+
+.spec-diff-segment ins {
+  background: color-mix(in oklab, var(--instrument-nominal) 20%, transparent);
+}
+
+.spec-diff-segment del {
+  background: color-mix(in oklab, var(--destructive) 16%, transparent);
+  text-decoration: line-through;
+}
+
+.spec-restore-controls {
+  align-items: center;
+  gap: 0.75rem;
+  border-top: 1px solid var(--border);
+  padding: 1rem;
+}
+
+.spec-restore-controls > div:first-child {
+  min-width: 13rem;
+  flex: 1;
+}
+
+.spec-restore-controls strong,
+.spec-restore-controls p {
+  display: block;
+  font-size: 0.78rem;
+}
+
+.spec-restore-notice,
+.spec-empty-history,
+.spec-read-error {
+  color: var(--muted-foreground);
+}
+
+.spec-restore-notice {
+  margin-top: 0.75rem;
+  border: 1px solid color-mix(in oklab, var(--instrument-nominal) 35%, var(--border));
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem;
+}
+
+.spec-empty-history,
+.spec-checkpoint-loading {
+  padding: 2rem;
+}
+
+.spec-read-loading-header {
+  display: grid;
+  gap: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+
+.spec-read-error {
+  display: grid;
+  min-height: 60vh;
+  place-content: center;
+  gap: 0.5rem;
+  text-align: center;
+}
+
+.spec-read-error h1 {
+  color: var(--foreground);
+  font-size: 1.5rem;
+  font-weight: 650;
+}
+
+@media (max-width: 64rem) {
+  .spec-read-layout {
+    flex-direction: column;
+  }
+
+  .spec-history {
+    position: static;
+    width: 100%;
+    max-height: none;
+    order: -1;
+  }
+}
+
+@media (max-width: 40rem) {
+  .spec-read-header,
+  .spec-restore-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}

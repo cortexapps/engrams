@@ -20,6 +20,7 @@ import {
 import {
   decodeSpecSyncMessage,
   encodeAwarenessState,
+  encodeSyncStep1,
   encodeSyncUpdate,
 } from "../routes/spec-sync-protocol.ts";
 import { SpecParticipantLeaseStaleError } from "../specs/doc-service.ts";
@@ -796,6 +797,42 @@ describe("the spec sync UpgradeHook", () => {
     expect(unsubscribes).toBe(1);
     expect(timers.size).toBe(0);
   });
+
+  test("answers a sync frame received during the participant bind", async () => {
+    const socket = new SilentSpecSocket();
+    const clientDocument = new Y.Doc();
+    let connectStarted = false;
+    let finishConnect = () => {};
+    const participantGate = new Promise<void>((resolve) => {
+      finishConnect = resolve;
+    });
+    const hub = new SpecSyncHub({
+      documents: fakeDocuments(),
+      participants: {
+        connect: async () => {
+          connectStarted = true;
+          await participantGate;
+        },
+        disconnect: async () => {},
+      },
+      awarenessBus: fakeAwarenessBus(),
+    });
+    cleanups.push(async () => {
+      clientDocument.destroy();
+      await hub.stop();
+    });
+
+    const connecting = hub.connect(SPEC_ONE, "42", { id: "member" }, socket);
+    await eventually(() => connectStarted);
+    socket.emit("message", encodeSyncStep1(clientDocument), true);
+    finishConnect();
+    await connecting;
+
+    expect(socket.messages.map((message) => decodeSpecSyncMessage(message).kind)).toEqual([
+      "sync-update",
+      "sync-step-1",
+    ]);
+  });
 });
 
 describe("SpecSyncHub awareness failures", () => {
@@ -924,6 +961,7 @@ class SilentSpecSocket extends EventEmitter {
   pings = 0;
   terminations = 0;
   readonly sent: Uint8Array[] = [];
+  readonly messages = this.sent;
 
   send(data: Uint8Array): void {
     this.sent.push(data.slice());

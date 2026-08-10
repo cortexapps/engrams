@@ -63,6 +63,7 @@ import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
 import { Automations } from "./pages/settings/Automations";
 import { AutomationEditor } from "./pages/settings/AutomationEditor";
+import { SpecReadPage } from "./pages/SpecReadPage";
 
 export interface RouterContext {
   /** Null when the session has resolved but no user is signed in.
@@ -282,8 +283,7 @@ const artifactViewRoute = createRoute({
 });
 
 // /specs is the organization-shared Tech Specs catalog. The layout owns the
-// top-level Specs/Templates tabs. The placeholder children keep the routes
-// stable until their assigned issues add the template and read surfaces.
+// top-level Specs and Templates tabs.
 const specsLayoutRoute = createRoute({
   getParentRoute: () => appLayoutRoute,
   path: "/specs",
@@ -307,7 +307,7 @@ const specTemplatesRoute = createRoute({
 const specDetailRoute = createRoute({
   getParentRoute: () => specsLayoutRoute,
   path: "$specId",
-  component: () => <SpecRouteStub surface="spec" />,
+  component: SpecReadPage,
 });
 
 // /kaizen layout route (second sidebar) ----------------------------------

@@ -98,7 +98,9 @@ import { loadRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
 import { renderReviewer } from "./reviewers/render.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
+import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
 import { productionSpecProjection } from "./specs/projection.ts";
+import { PostgresSpecCheckpointStore, SpecCheckpointService } from "./specs/checkpoints.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
@@ -126,6 +128,8 @@ const specToolService = new SpecToolService({
   metadata: new PostgresSpecToolMetadataStore(getPool(), specNow),
 });
 const specParticipants = new PostgresSpecParticipantStore(getDb());
+const specCheckpointStore = new PostgresSpecCheckpointStore(getPool());
+const specCheckpoints = new SpecCheckpointService(specDocuments, specCheckpointStore);
 const warnSpecSync = (message: string) => log.warn({ message }, "spec sync warning");
 const specAwarenessBus = new PostgresSpecAwarenessBus(getPool(), { onWarning: warnSpecSync });
 const specSyncHub = new SpecSyncHub({
@@ -179,6 +183,15 @@ app.route("/", makeOidcKeyAdminRoute());
 app.route("/", eventsRoute);
 app.route("/", artifactsRoute);
 app.route("/", makeSessionFilesRoute());
+app.route(
+  "/",
+  makeSpecsRoute({
+    store: new PostgresSpecReadStore(getPool()),
+    checkpointStore: specCheckpointStore,
+    checkpoints: specCheckpoints,
+    resolveMembership: resolveSpecMembership,
+  }),
+);
 // ADR 0064 P2a: live-host port-exposure registry (CRUD). The edge reverse-proxy
 // that serves the minted slugs lands in P2b.
 app.route("/", portsRoute);

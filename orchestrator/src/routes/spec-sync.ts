@@ -99,6 +99,7 @@ export interface SpecSyncSocket {
   on(event: "pong", listener: () => void): this;
   on(event: "error", listener: (error: Error) => void): this;
   once(event: "close", listener: () => void): this;
+  off(event: "message", listener: (data: RawData, isBinary: boolean) => void): this;
   off(event: "pong", listener: () => void): this;
   off(event: "error", listener: (error: Error) => void): this;
   send(data: Uint8Array): void;
@@ -234,14 +235,22 @@ export class SpecSyncHub implements SpecPresence {
     let room: SpecRoom | undefined;
     let closed = false;
     let joined = false;
+    const pendingMessages: Array<{ bytes: Uint8Array; isBinary: boolean }> = [];
+    const queueMessage = (data: RawData, isBinary: boolean) => {
+      pendingMessages.push({ bytes: Uint8Array.from(rawDataBytes(data)), isBinary });
+    };
     const onError = (error: Error) => {
       this.deps.onWarning?.(`Spec sync socket failed for spec ${specId}: ${error.message}`);
       if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
     };
     socket.on("error", onError);
+    socket.on("message", queueMessage);
+    let onMessage: ((data: RawData, isBinary: boolean) => void) | undefined;
     socket.once("close", () => {
       closed = true;
       socket.off("error", onError);
+      socket.off("message", queueMessage);
+      if (onMessage) socket.off("message", onMessage);
       if (!joined || !room) return;
       this.runBackgroundTask(
         `Disconnect participant from spec ${specId}`,
@@ -296,18 +305,35 @@ export class SpecSyncHub implements SpecPresence {
     } finally {
       entry.pendingUsers -= 1;
       if (room) this.retireRoomIfIdle(specId, entry, room);
+      if (!joined) socket.off("message", queueMessage);
     }
 
-    socket.on("message", (data, isBinary) => {
-      if (room.clientSockets.get(clientId) !== socket) return;
-      if (!isBinary) {
-        socket.close(1003, "binary messages required");
-        return;
-      }
-      void this.receive(specId, room, socket, clientId, user, rawDataBytes(data)).catch(() => {
-        socket.close(1003, "invalid spec sync message");
-      });
-    });
+    let messageFailed = false;
+    let messageWork = Promise.resolve();
+    const enqueueMessage = (bytes: Uint8Array, isBinary: boolean) => {
+      messageWork = messageWork
+        .then(async () => {
+          if (closed || messageFailed || room.clientSockets.get(clientId) !== socket) return;
+          if (!isBinary) {
+            messageFailed = true;
+            socket.close(1003, "binary messages required");
+            return;
+          }
+          await this.receive(specId, room, socket, clientId, user, bytes);
+        })
+        .catch(() => {
+          messageFailed = true;
+          socket.close(1003, "invalid spec sync message");
+        });
+    };
+    onMessage = (data, isBinary) => {
+      enqueueMessage(Uint8Array.from(rawDataBytes(data)), isBinary);
+    };
+    socket.off("message", queueMessage);
+    socket.on("message", onMessage);
+    for (const message of pendingMessages) enqueueMessage(message.bytes, message.isBinary);
+    await messageWork;
+    if (closed || messageFailed) return;
     socket.send(encodeSyncStep1(room.doc));
     if (room.awareness.getStates().size > 0) socket.send(encodeAwarenessState(room.awareness));
     if (!room.queriedPeers) {
