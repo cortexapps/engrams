@@ -13,7 +13,7 @@ workspace = true
 async-trait.workspace = true
 serde = { workspace = true, optional = true }
 tracing.workspace = true
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 rand = "0.8"
 base64 = "0.22"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
