@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   encodedSpecBlockCacheSize,
   isSpecBlockKind,
+  matchingSpecBlockCachedRender,
   readSpecBlockAttrs,
   SPEC_BLOCK_CACHE_MAX_BYTES,
   SPEC_BLOCK_RENDERER_REVISION,
@@ -126,17 +127,10 @@ function SourceFallback({ label, source }: { label: string; source: string }) {
 }
 
 function readCachedSvg(attrs: SpecBlockAttrs): string | null {
-  if (
-    !attrs.cachedRender ||
-    attrs.cachedRender.kind !== attrs.kind ||
-    attrs.cachedRender.source !== attrs.source ||
-    attrs.cachedRender.blockId !== attrs.id ||
-    attrs.cachedRender.rendererRevision !== SPEC_BLOCK_RENDERER_REVISION
-  ) {
-    return null;
-  }
+  const cache = matchingSpecBlockCachedRender(attrs);
+  if (!cache) return null;
   try {
-    return sanitizeSvg(attrs.cachedRender.svg, attrs.id);
+    return sanitizeSvg(cache.svg, attrs.id);
   } catch {
     return null;
   }

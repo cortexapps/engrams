@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
-import { SPEC_BLOCK_RENDERER_REVISION, type SpecBlockAttrs } from "@engrams/spec-document";
+import {
+  matchingSpecBlockCachedRender,
+  SPEC_BLOCK_RENDERER_REVISION,
+  type SpecBlockAttrs,
+} from "@engrams/spec-document";
 
 import { SpecBlockView } from "./SpecBlock";
 import { renderSpecBlock, sanitizeSvg, specBlockRenderAdapters } from "./block-renderers";
@@ -146,6 +150,22 @@ describe("spec blocks", () => {
       />,
     );
     await waitFor(() => expect(renderMermaid).toHaveBeenCalledOnce());
+  });
+
+  test("checks every cache identity field before live rendering uses it", () => {
+    const source = "flowchart LR\n  A --> B";
+    const current = attrs({ source, cachedRender: cached(source) });
+    expect(matchingSpecBlockCachedRender(current)).not.toBeNull();
+    expect(
+      [
+        { ...current.cachedRender!, kind: "d2" },
+        { ...current.cachedRender!, source: "flowchart LR\n  A --> C" },
+        { ...current.cachedRender!, blockId: "another-block" },
+        { ...current.cachedRender!, rendererRevision: "old-renderer" },
+      ].every(
+        (cachedRender) => matchingSpecBlockCachedRender({ ...current, cachedRender }) === null,
+      ),
+    ).toBe(true);
   });
 
   test("uses a closed SVG allowlist for active and network-capable content", () => {

@@ -1,16 +1,24 @@
 import type { Node as ProseMirrorNode } from "prosemirror-model";
 
 export const SPEC_BLOCK_KINDS = ["mermaid", "d2", "flint"] as const;
+export const SPEC_RENDER_TARGETS = ["engrams", "github"] as const;
 
 /** Change this value when product renderer output can change. */
 export const SPEC_BLOCK_RENDERER_REVISION = "2";
 export const SPEC_BLOCK_CACHE_MAX_BYTES = 512 * 1024;
 
 export type SpecBlockKind = (typeof SPEC_BLOCK_KINDS)[number];
+export type SpecRenderTarget = (typeof SPEC_RENDER_TARGETS)[number];
+export type SpecBlockExportMode = "source" | "cached-render";
 
 export interface SpecBlockRegistration {
   kind: SpecBlockKind;
   label: string;
+}
+
+export interface SpecRenderTargetRegistration {
+  target: SpecRenderTarget;
+  blockModes: Readonly<Record<SpecBlockKind, SpecBlockExportMode>>;
 }
 
 export type SpecBlockProvenance =
@@ -79,12 +87,30 @@ const registrations: Readonly<Record<SpecBlockKind, SpecBlockRegistration>> = {
   flint: { kind: "flint", label: "Flint chart" },
 };
 
+const renderTargetRegistrations: Readonly<Record<SpecRenderTarget, SpecRenderTargetRegistration>> =
+  {
+    engrams: {
+      target: "engrams",
+      blockModes: { mermaid: "source", d2: "source", flint: "source" },
+    },
+    github: {
+      target: "github",
+      blockModes: { mermaid: "source", d2: "cached-render", flint: "cached-render" },
+    },
+  };
+
 export const specBlockRegistry: readonly SpecBlockRegistration[] = SPEC_BLOCK_KINDS.map(
   (kind) => registrations[kind],
 );
 
 export function specBlockRegistration(kind: string): SpecBlockRegistration | null {
   return isSpecBlockKind(kind) ? registrations[kind] : null;
+}
+
+export function specRenderTargetRegistration(
+  target: SpecRenderTarget,
+): SpecRenderTargetRegistration {
+  return renderTargetRegistrations[target];
 }
 
 export function isSpecBlockKind(kind: string): kind is SpecBlockKind {
@@ -110,6 +136,20 @@ export function readSpecBlockAttrs(attrs: Readonly<Record<string, unknown>>): Sp
     cachedRender: readCachedRender(attrs.cachedRender),
     provenance: readProvenance(attrs.provenance),
   };
+}
+
+export function matchingSpecBlockCachedRender(attrs: SpecBlockAttrs): SpecBlockCachedRender | null {
+  const cache = attrs.cachedRender;
+  if (
+    cache === null ||
+    cache.kind !== attrs.kind ||
+    cache.source !== attrs.source ||
+    cache.blockId !== attrs.id ||
+    cache.rendererRevision !== SPEC_BLOCK_RENDERER_REVISION
+  ) {
+    return null;
+  }
+  return cache;
 }
 
 function readCachedRender(value: unknown): SpecBlockCachedRender | null {
