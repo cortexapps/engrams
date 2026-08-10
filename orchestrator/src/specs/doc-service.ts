@@ -1014,6 +1014,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      await client.query("SELECT set_config('engrams.semantic_revision_writer', '1', true)");
       let actorUserId: string | null | undefined;
       if (clientId !== null && participantEpoch !== undefined) {
         const participant = await client.query<{ user_id: string | null }>(
@@ -1083,7 +1084,13 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
       await client.query(
         `INSERT INTO spec_update_log (spec_id, seq, semantic_doc_seq, update, client_id)
          VALUES ($1, $2, $3, $4, $5)`,
-        [specId, next.current_doc_seq, next.current_semantic_doc_seq, Buffer.from(update), clientId],
+        [
+          specId,
+          next.current_doc_seq,
+          next.current_semantic_doc_seq,
+          Buffer.from(update),
+          clientId,
+        ],
       );
       if (clientId !== null && changesDocument) {
         if (actorUserId === undefined) {
@@ -1133,6 +1140,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      await client.query("SELECT set_config('engrams.semantic_revision_writer', '1', true)");
       const revision = await client.query<{
         current_doc_seq: string;
         current_semantic_doc_seq: string;

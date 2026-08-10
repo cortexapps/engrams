@@ -13,6 +13,7 @@ import {
   type SpecTemplate,
 } from "@engrams/spec-document";
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import type { Node as ProseMirrorNode } from "prosemirror-model";
@@ -294,6 +295,21 @@ function withFirstDiagramCache(document: ProseMirrorNode, cachedRender: unknown)
   }).doc;
 }
 
+function withFirstDiagramSource(document: ProseMirrorNode, source: string): ProseMirrorNode {
+  let position: number | null = null;
+  document.descendants((node, nodePosition) => {
+    if (position === null && node.type === schema.nodes.diagramBlock) position = nodePosition;
+  });
+  if (position === null) throw new Error("The diagram test block is missing");
+  const node = document.nodeAt(position);
+  if (!node) throw new Error("The diagram test block is missing");
+  return new Transform(document).setNodeMarkup(position, undefined, {
+    ...node.attrs,
+    source,
+    cachedRender: null,
+  }).doc;
+}
+
 function clientInsert(base: Uint8Array, sectionIndex: number, value: string): Uint8Array {
   const doc = new Y.Doc();
   Y.applyUpdate(doc, base);
@@ -418,9 +434,7 @@ describe("SpecDocumentService", () => {
         blocks.push({ id: node.attrs.id, source: node.attrs.source });
       }
     });
-    expect(blocks).toEqual([
-      { id: "diagram-0", source: "flowchart LR\n  A0 --> B0" },
-    ]);
+    expect(blocks).toEqual([{ id: "diagram-0", source: "flowchart LR\n  A0 --> B0" }]);
     expect(loaded.semanticDocSeq).toBe(1n);
     expect(store.updates.get(SPEC_ID)).toHaveLength(2);
 
@@ -609,6 +623,18 @@ describe("SpecDocumentService", () => {
     await expect(service.applyUpdate(SPEC_ID, update, "large-client")).rejects.toBeInstanceOf(
       SpecDocumentTooLargeError,
     );
+    expect(store.updates.get(SPEC_ID)).toHaveLength(1);
+  });
+
+  test("a diagram source cannot make the document exceed 2 MB", async () => {
+    const store = new MemoryDocumentStore();
+    const service = await seededService(store, diagramUpdate());
+
+    await expect(
+      service.mutateDocument(SPEC_ID, "large-source-client", (document) =>
+        withFirstDiagramSource(document, "x".repeat(SPEC_MAX_SIZE_BYTES + 1)),
+      ),
+    ).rejects.toBeInstanceOf(SpecDocumentTooLargeError);
     expect(store.updates.get(SPEC_ID)).toHaveLength(1);
   });
 
@@ -1060,6 +1086,138 @@ describe("SpecDocumentService with live Postgres", () => {
   );
 
   test.skipIf(!liveDbReachable)(
+    "migration 0056 backfills revisions and supports old and current writers",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const client = await livePool.connect();
+      const schemaName = `semantic_revision_${randomUUID().replaceAll("-", "")}`;
+      const quotedSchema = `"${schemaName}"`;
+      const migrationSpecId = randomUUID();
+      try {
+        await client.query("BEGIN");
+        await client.query(`CREATE SCHEMA ${quotedSchema}`);
+        await client.query(`SET LOCAL search_path TO ${quotedSchema}`);
+        await client.query(
+          `CREATE TABLE spec (
+             id uuid PRIMARY KEY,
+             current_doc_seq bigint DEFAULT 0 NOT NULL
+           );
+           CREATE TABLE spec_update_log (
+             spec_id uuid NOT NULL,
+             seq bigint NOT NULL,
+             update bytea NOT NULL,
+             client_id text,
+             PRIMARY KEY (spec_id, seq)
+           );
+           CREATE TABLE spec_snapshot (
+             spec_id uuid PRIMARY KEY,
+             state bytea NOT NULL,
+             state_vector bytea NOT NULL,
+             covered_seq bigint NOT NULL
+           );
+           CREATE TABLE spec_projection (
+             spec_id uuid NOT NULL,
+             rev bigint NOT NULL,
+             session_id uuid NOT NULL,
+             doc_seq bigint NOT NULL,
+             PRIMARY KEY (spec_id, rev)
+           )`,
+        );
+        await client.query("INSERT INTO spec (id, current_doc_seq) VALUES ($1, 2)", [
+          migrationSpecId,
+        ]);
+        await client.query(
+          `INSERT INTO spec_update_log (spec_id, seq, update, client_id)
+           VALUES ($1, 2, ''::bytea, 'legacy')`,
+          [migrationSpecId],
+        );
+        await client.query(
+          `INSERT INTO spec_snapshot (spec_id, state, state_vector, covered_seq)
+           VALUES ($1, ''::bytea, ''::bytea, 2)`,
+          [migrationSpecId],
+        );
+        await client.query(
+          `INSERT INTO spec_projection (spec_id, rev, session_id, doc_seq)
+           VALUES ($1, 1, $1, 2)`,
+          [migrationSpecId],
+        );
+
+        const migration = await readFile(
+          new URL("../../../drizzle/0056_spec_semantic_revision.sql", import.meta.url),
+          "utf8",
+        );
+        for (const statement of migration
+          .split("--> statement-breakpoint")
+          .map((value) => value.trim())
+          .filter(Boolean)) {
+          await client.query(statement);
+        }
+
+        await client.query("UPDATE spec SET current_doc_seq = 3 WHERE id = $1", [migrationSpecId]);
+        await client.query(
+          `INSERT INTO spec_update_log (spec_id, seq, update, client_id)
+           VALUES ($1, 3, ''::bytea, 'legacy')`,
+          [migrationSpecId],
+        );
+        await client.query(
+          `INSERT INTO spec_snapshot (spec_id, state, state_vector, covered_seq)
+           VALUES ($1, ''::bytea, ''::bytea, 3)
+           ON CONFLICT (spec_id) DO UPDATE SET covered_seq = excluded.covered_seq`,
+          [migrationSpecId],
+        );
+        await client.query(
+          "UPDATE spec_projection SET doc_seq = 3 WHERE spec_id = $1 AND rev = 1",
+          [migrationSpecId],
+        );
+        const legacy = await client.query<{
+          spec: string;
+          update_log: string;
+          snapshot: string;
+          projection: string;
+        }>(
+          `SELECT current_semantic_doc_seq::text AS spec,
+                  (SELECT max(semantic_doc_seq)::text FROM spec_update_log) AS update_log,
+                  (SELECT covered_semantic_doc_seq::text FROM spec_snapshot) AS snapshot,
+                  (SELECT semantic_doc_seq::text FROM spec_projection) AS projection
+             FROM spec
+            WHERE id = $1`,
+          [migrationSpecId],
+        );
+        expect(legacy.rows).toEqual([
+          { spec: "3", update_log: "3", snapshot: "3", projection: "3" },
+        ]);
+
+        await client.query("SELECT set_config('engrams.semantic_revision_writer', '1', true)");
+        await client.query(
+          `UPDATE spec
+              SET current_doc_seq = 4,
+                  current_semantic_doc_seq = 3
+            WHERE id = $1`,
+          [migrationSpecId],
+        );
+        await client.query(
+          `UPDATE spec_projection
+              SET doc_seq = 4,
+                  semantic_doc_seq = 3
+            WHERE spec_id = $1 AND rev = 1`,
+          [migrationSpecId],
+        );
+        const current = await client.query<{ spec: string; projection: string }>(
+          `SELECT current_semantic_doc_seq::text AS spec,
+                  (SELECT semantic_doc_seq::text FROM spec_projection) AS projection
+             FROM spec
+            WHERE id = $1`,
+          [migrationSpecId],
+        );
+        expect(current.rows).toEqual([{ spec: "3", projection: "3" }]);
+      } finally {
+        await client.query("ROLLBACK");
+        client.release();
+      }
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
     "a human edit commits its update, drafted state, and transcript action atomically",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
@@ -1287,7 +1445,9 @@ describe("SpecDocumentService with live Postgres", () => {
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
       await livePool.query("UPDATE spec SET session_id = $2 WHERE id = $1", [specId, specId]);
-      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => new Date("2026-08-10T11:00:00.000Z"),
+      });
       await documents.applyUpdate(specId, diagramUpdate(), null);
       const projections = new PostgresSpecProjectionStore(
         () => new Date("2026-08-10T11:00:00.000Z"),

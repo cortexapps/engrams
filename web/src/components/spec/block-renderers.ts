@@ -96,7 +96,7 @@ export const specBlockRenderAdapters: Readonly<Record<SpecBlockKind, SpecBlockRe
 };
 
 export async function renderSpecBlock(kind: SpecBlockKind, source: string, blockId: string) {
-  return sanitizeSvg(await specBlockRenderAdapters[kind].render(source, blockId));
+  return sanitizeSvg(await specBlockRenderAdapters[kind].render(source, blockId), blockId);
 }
 
 function parseFlintSource(source: string): ChartAssemblyInput {

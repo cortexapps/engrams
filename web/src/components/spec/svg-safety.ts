@@ -165,7 +165,9 @@ const LOCAL_URL = /^url\(\s*#[A-Za-z0-9_.:-]+\s*\)$/i;
 const NETWORK_TOKEN =
   /(?:@import|expression\s*\(|(?:https?|ftp|file|blob|data|javascript|vbscript)\s*:|\/\/)/i;
 
-export function sanitizeSvg(svgSource: string): string {
+export function sanitizeSvg(svgSource: string, namespace: string): string {
+  if (namespace.length === 0) throw new Error("An SVG namespace must not be empty.");
+  const idPrefix = svgIdPrefix(namespace);
   const parsed = new DOMParser().parseFromString(svgSource, "image/svg+xml");
   if (
     parsed.querySelector("parsererror") ||
@@ -176,7 +178,7 @@ export function sanitizeSvg(svgSource: string): string {
   }
 
   const output = document.implementation.createDocument(SVG_NAMESPACE, "svg", null);
-  const root = copyElement(parsed.documentElement, output, output);
+  const root = copyElement(parsed.documentElement, output, output, idPrefix);
   if (!root || root !== output.documentElement) {
     throw new Error("The block renderer returned an unsafe SVG root.");
   }
@@ -190,11 +192,12 @@ function copyElement(
   source: Element,
   parent: Element | Document,
   output: XMLDocument,
+  idPrefix: string,
 ): Element | null {
   const name = source.localName.toLowerCase();
   if (source.namespaceURI !== SVG_NAMESPACE || !ALLOWED_ELEMENTS.has(name)) {
     if (name === "a" && source.namespaceURI === SVG_NAMESPACE) {
-      copyChildren(source, parent, output);
+      copyChildren(source, parent, output, idPrefix);
     }
     return null;
   }
@@ -208,17 +211,22 @@ function copyElement(
   for (const attribute of source.attributes) {
     const attributeName = attribute.name.toLowerCase();
     if (!ALLOWED_ATTRIBUTES.has(attributeName)) continue;
-    const value = safeAttributeValue(name, attributeName, attribute.value);
+    const value = safeAttributeValue(name, attributeName, attribute.value, idPrefix);
     if (value !== null) target.setAttribute(attribute.name, value);
   }
-  copyChildren(source, target, output);
+  copyChildren(source, target, output, idPrefix);
   return target;
 }
 
-function copyChildren(source: Element, parent: Element | Document, output: XMLDocument): void {
+function copyChildren(
+  source: Element,
+  parent: Element | Document,
+  output: XMLDocument,
+  idPrefix: string,
+): void {
   for (const child of source.childNodes) {
     if (child.nodeType === Node.ELEMENT_NODE) {
-      copyElement(child as Element, parent, output);
+      copyElement(child as Element, parent, output, idPrefix);
     } else if (child.nodeType === Node.TEXT_NODE) {
       parent.appendChild(output.createTextNode(child.textContent ?? ""));
     }
@@ -229,23 +237,24 @@ function safeAttributeValue(
   elementName: string,
   attributeName: string,
   rawValue: string,
+  idPrefix: string,
 ): string | null {
   const value = rawValue.trim();
   if (value.length === 0 || containsControlCharacter(value)) return null;
-  if (attributeName === "id") return safeIdentifier(value) ? value : null;
+  if (attributeName === "id") return safeIdentifier(value) ? namespaceId(value, idPrefix) : null;
   if (attributeName === "class") return safeClassList(value) ? value : null;
-  if (attributeName === "style") return sanitizeStyle(value);
+  if (attributeName === "style") return sanitizeStyle(value, idPrefix);
   if (attributeName === "href" || attributeName === "xlink:href") {
-    return elementName === "use" && LOCAL_FRAGMENT.test(value) ? value : null;
+    return elementName === "use" ? namespaceLocalFragment(value, idPrefix) : null;
   }
   if (LOCAL_REFERENCE_ATTRIBUTES.has(attributeName)) {
-    return value === "none" || LOCAL_URL.test(value) ? value : null;
+    return value === "none" ? value : namespaceLocalUrl(value, idPrefix);
   }
-  if (PAINT_ATTRIBUTES.has(attributeName)) return safePaint(value) ? value : null;
+  if (PAINT_ATTRIBUTES.has(attributeName)) return safePaint(value, idPrefix);
   return safeScalar(value) ? value : null;
 }
 
-function sanitizeStyle(value: string): string | null {
+function sanitizeStyle(value: string, idPrefix: string): string | null {
   if (/[\\@{}]|\/\*/.test(value) || NETWORK_TOKEN.test(value)) return null;
   const declarations: string[] = [];
   for (const declaration of value.split(";")) {
@@ -255,21 +264,47 @@ function sanitizeStyle(value: string): string | null {
     const property = declaration.slice(0, separator).trim().toLowerCase();
     const propertyValue = declaration.slice(separator + 1).trim();
     if (!ALLOWED_STYLE_PROPERTIES.has(property) || propertyValue.length === 0) return null;
-    const safe = LOCAL_REFERENCE_ATTRIBUTES.has(property)
-      ? propertyValue === "none" || LOCAL_URL.test(propertyValue)
+    const safeValue = LOCAL_REFERENCE_ATTRIBUTES.has(property)
+      ? propertyValue === "none"
+        ? propertyValue
+        : namespaceLocalUrl(propertyValue, idPrefix)
       : PAINT_ATTRIBUTES.has(property)
-        ? safePaint(propertyValue)
-        : safeScalar(propertyValue);
-    if (!safe) return null;
-    declarations.push(`${property}: ${propertyValue}`);
+        ? safePaint(propertyValue, idPrefix)
+        : safeScalar(propertyValue)
+          ? propertyValue
+          : null;
+    if (safeValue === null) return null;
+    declarations.push(`${property}: ${safeValue}`);
   }
   return declarations.length > 0 ? declarations.join("; ") : null;
 }
 
-function safePaint(value: string): boolean {
-  if (value.includes("\\") || NETWORK_TOKEN.test(value)) return false;
-  if (/url\s*\(/i.test(value)) return LOCAL_URL.test(value);
-  return safeScalar(value);
+function safePaint(value: string, idPrefix: string): string | null {
+  if (value.includes("\\") || NETWORK_TOKEN.test(value)) return null;
+  if (/url\s*\(/i.test(value)) return namespaceLocalUrl(value, idPrefix);
+  return safeScalar(value) ? value : null;
+}
+
+function namespaceLocalFragment(value: string, idPrefix: string): string | null {
+  if (!LOCAL_FRAGMENT.test(value)) return null;
+  return `#${namespaceId(value.slice(1), idPrefix)}`;
+}
+
+function namespaceLocalUrl(value: string, idPrefix: string): string | null {
+  if (!LOCAL_URL.test(value)) return null;
+  const fragment = value.slice(value.indexOf("#") + 1, value.lastIndexOf(")")).trim();
+  return `url(#${namespaceId(fragment, idPrefix)})`;
+}
+
+function namespaceId(value: string, idPrefix: string): string {
+  return value.startsWith(idPrefix) ? value : `${idPrefix}${value}`;
+}
+
+function svgIdPrefix(namespace: string): string {
+  const encoded = [...new TextEncoder().encode(namespace)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `spec-block-${encoded}-`;
 }
 
 function safeScalar(value: string): boolean {

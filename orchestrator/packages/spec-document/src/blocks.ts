@@ -3,7 +3,7 @@ import type { Node as ProseMirrorNode } from "prosemirror-model";
 export const SPEC_BLOCK_KINDS = ["mermaid", "d2", "flint"] as const;
 
 /** Change this value when product renderer output can change. */
-export const SPEC_BLOCK_RENDERER_REVISION = "1";
+export const SPEC_BLOCK_RENDERER_REVISION = "2";
 export const SPEC_BLOCK_CACHE_MAX_BYTES = 512 * 1024;
 
 export type SpecBlockKind = (typeof SPEC_BLOCK_KINDS)[number];
@@ -47,8 +47,13 @@ export function validateSpecBlockCachedRender(value: unknown): SpecBlockCachedRe
   }
   const expectedKeys = ["blockId", "kind", "rendererRevision", "source", "svg"];
   const keys = Object.keys(value).sort();
-  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) {
-    throw new Error("A cached render must contain only blockId, kind, rendererRevision, source, and svg");
+  if (
+    keys.length !== expectedKeys.length ||
+    keys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    throw new Error(
+      "A cached render must contain only blockId, kind, rendererRevision, source, and svg",
+    );
   }
   if (
     typeof value.kind !== "string" ||

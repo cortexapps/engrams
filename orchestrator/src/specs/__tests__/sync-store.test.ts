@@ -288,6 +288,7 @@ describe("PostgresSpecParticipantStore", () => {
              id uuid PRIMARY KEY,
              lifecycle text NOT NULL,
              current_doc_seq bigint DEFAULT 0 NOT NULL,
+             current_semantic_doc_seq bigint DEFAULT 0 NOT NULL,
              updated_at timestamptz NOT NULL
            )`,
         );
@@ -295,6 +296,7 @@ describe("PostgresSpecParticipantStore", () => {
           `CREATE TABLE spec_update_log (
              spec_id uuid NOT NULL,
              seq bigint NOT NULL,
+             semantic_doc_seq bigint NOT NULL,
              update bytea NOT NULL,
              client_id text,
              PRIMARY KEY (spec_id, seq)
@@ -404,11 +406,7 @@ describe("PostgresSpecParticipantStore", () => {
         const equalExpiryConnectedAt = new Date("2026-08-10T12:06:00.000Z");
         const equalExpiryDisconnectAt = new Date(equalExpiryConnectedAt.getTime() + 60_000);
         now = equalExpiryConnectedAt;
-        const equalExpiryEpoch = await participants.connect(
-          specId,
-          equalExpiryClientId,
-          userId,
-        );
+        const equalExpiryEpoch = await participants.connect(specId, equalExpiryClientId, userId);
         now = equalExpiryDisconnectAt;
         await participants.disconnect(specId, equalExpiryClientId, equalExpiryEpoch);
         const equalExpiryDisconnect = await client.query<{
@@ -471,10 +469,10 @@ describe("PostgresSpecParticipantStore", () => {
             0n,
             new Uint8Array([1]),
             protectedClientId,
-            { sections: [] },
+            { sections: [], semanticChanged: false },
             protectedEpoch,
           ),
-        ).toBe(1n);
+        ).toEqual({ seq: 1n, semanticDocSeq: 0n });
         const protectedRow = await client.query<{
           connection_epoch: string;
           disconnected_at: Date | null;
@@ -547,7 +545,6 @@ describe("PostgresSpecParticipantStore", () => {
             lease_is_infinite: true,
           },
         ]);
-
       } finally {
         await documentPool?.end();
         await client.query("SET search_path TO public");

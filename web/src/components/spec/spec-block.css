@@ -1,4 +1,4 @@
-.spec-block {
+.spec-canvas-editor .spec-block {
   overflow: hidden;
   margin: 1.5rem 0;
   border: 1px solid var(--border);
@@ -6,12 +6,12 @@
   background: var(--card);
 }
 
-.spec-block[data-provenance="illustrative"] {
+.spec-canvas-editor .spec-block[data-provenance="illustrative"] {
   border-style: dashed;
   background: color-mix(in oklab, var(--muted) 55%, var(--card));
 }
 
-.spec-block-heading {
+.spec-canvas-editor .spec-block-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -20,7 +20,7 @@
   padding: 0.65rem 0.85rem;
 }
 
-.spec-block-kind {
+.spec-canvas-editor .spec-block-kind {
   color: var(--muted-foreground);
   font-size: 0.6875rem;
   font-weight: 700;
@@ -28,7 +28,7 @@
   text-transform: uppercase;
 }
 
-.spec-block-provenance {
+.spec-canvas-editor .spec-block-provenance {
   border: 1px solid color-mix(in oklab, var(--border) 75%, transparent);
   border-radius: 999px;
   padding: 0.15rem 0.5rem;
@@ -37,17 +37,17 @@
   font-weight: 650;
 }
 
-.spec-block[data-provenance="verified"] .spec-block-provenance {
+.spec-canvas-editor .spec-block[data-provenance="verified"] .spec-block-provenance {
   border-color: color-mix(in oklab, var(--instrument-nominal) 40%, var(--border));
   background: color-mix(in oklab, var(--instrument-nominal) 10%, transparent);
   color: var(--instrument-nominal-ink);
 }
 
-.spec-block[data-provenance="illustrative"] .spec-block-provenance {
+.spec-canvas-editor .spec-block[data-provenance="illustrative"] .spec-block-provenance {
   font-style: italic;
 }
 
-.spec-block-caption {
+.spec-canvas-editor .spec-block-caption {
   margin: 0;
   border-bottom: 1px solid var(--border);
   padding: 0.65rem 0.85rem;
@@ -56,26 +56,26 @@
   line-height: 1.5;
 }
 
-.spec-block-render {
+.spec-canvas-editor .spec-block-render {
   overflow-x: auto;
   padding: 1rem;
 }
 
-.spec-block-render > svg {
+.spec-canvas-editor .spec-block-render > svg {
   display: block;
   width: 100%;
   max-height: 34rem;
   margin: 0 auto;
 }
 
-.spec-block-loading,
-.spec-block-fallback-label {
+.spec-canvas-editor .spec-block-loading,
+.spec-canvas-editor .spec-block-fallback-label {
   padding: 1rem;
   color: var(--muted-foreground);
   font-size: 0.75rem;
 }
 
-.spec-block-fallback pre {
+.spec-canvas-editor .spec-block-fallback pre {
   margin: 0;
   border: 0;
   border-top: 1px solid var(--border);

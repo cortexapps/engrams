@@ -85,15 +85,22 @@ window.runSpecBlockRendererTests = async () => {
       '<path id="safe-path" d="M0 0" marker-end="url(#safe-marker)" />' +
       '<use href="#safe-path" xlink:href="https://example.invalid/b.svg#x" />' +
       "</svg>",
+    "browser-safety",
   );
   const sanitizedDocument = new DOMParser().parseFromString(sanitized, "image/svg+xml");
+  const safePathId = sanitizedDocument.querySelector("path")?.id;
   const svgVectorsRejected =
     sanitizedDocument.querySelector("script, foreignObject, animate, set, style, a, image") ===
       null &&
     sanitizedDocument.querySelector("rect")?.attributes.length === 0 &&
-    sanitizedDocument.querySelector("path")?.getAttribute("marker-end") === "url(#safe-marker)" &&
-    sanitizedDocument.querySelector("use")?.getAttribute("href") === "#safe-path" &&
-    sanitizedDocument.querySelector("use")?.hasAttribute("xlink:href") === false;
+    safePathId?.startsWith("spec-block-") === true &&
+    sanitizedDocument
+      .querySelector("path")
+      ?.getAttribute("marker-end")
+      ?.startsWith("url(#spec-block-") === true &&
+    sanitizedDocument.querySelector("use")?.getAttribute("href") === `#${safePathId}` &&
+    sanitizedDocument.querySelector("use")?.hasAttribute("xlink:href") === false &&
+    sanitizeSvg(sanitized, "browser-safety") === sanitized;
 
   const rootElement = document.getElementById("root");
   if (!rootElement) throw new Error("The browser test root is missing.");

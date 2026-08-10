@@ -163,15 +163,22 @@ describe("spec blocks", () => {
         '<path id="safe-path" d="M0 0" marker-end="url(#safe-marker)" />' +
         '<use href="#safe-path" xlink:href="https://example.com/b.svg#x" />' +
         "</svg>",
+      "request-flow",
     );
     const svg = new DOMParser().parseFromString(sanitized, "image/svg+xml");
     expect(svg.querySelector("script, foreignObject, animate, set, style, a, image")).toBeNull();
     expect(svg.querySelector("text")?.textContent).toBe("Unlinked");
     expect(svg.querySelector("rect")?.attributes).toHaveLength(0);
     expect(svg.documentElement.hasAttribute("onload")).toBe(false);
-    expect(svg.querySelector("path")?.getAttribute("marker-end")).toBe("url(#safe-marker)");
-    expect(svg.querySelector("use")?.getAttribute("href")).toBe("#safe-path");
+    const pathId = svg.querySelector("path")?.id;
+    expect(pathId).toMatch(/^spec-block-/);
+    expect(pathId).not.toBe("safe-path");
+    expect(svg.querySelector("path")?.getAttribute("marker-end")).toMatch(
+      /^url\(#spec-block-.*-safe-marker\)$/,
+    );
+    expect(svg.querySelector("use")?.getAttribute("href")).toBe(`#${pathId}`);
     expect(svg.querySelector("use")?.hasAttribute("xlink:href")).toBe(false);
+    expect(sanitizeSvg(sanitized, "request-flow")).toBe(sanitized);
   });
 
   test("rejects network-capable sources before a renderer can start a request", async () => {

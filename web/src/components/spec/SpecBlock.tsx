@@ -136,7 +136,7 @@ function readCachedSvg(attrs: SpecBlockAttrs): string | null {
     return null;
   }
   try {
-    return sanitizeSvg(attrs.cachedRender.svg);
+    return sanitizeSvg(attrs.cachedRender.svg, attrs.id);
   } catch {
     return null;
   }
