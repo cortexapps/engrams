@@ -173,6 +173,7 @@ export function makeAutomationTaskCreator(
 
       const { sessionId } = await createSession()({
         taskId,
+        taskType: "automation",
         profileId: prepared.profileId,
         integrationPrincipalId: `automation:${input.automationId}`,
         role: "primary",

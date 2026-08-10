@@ -1,6 +1,10 @@
 import { z } from "zod";
 
-import type { NativeBindings, ToolRegistry } from "./registry.ts";
+import {
+  toolSupportsTaskType,
+  type NativeBindings,
+  type ToolRegistry,
+} from "./registry.ts";
 
 export interface ToolManifestEntry {
   name: string;
@@ -14,11 +18,15 @@ export interface ToolManifestEntry {
 export function compileToolManifest(
   registry: ToolRegistry,
   capabilities?: readonly string[],
+  taskType?: string,
 ): ToolManifestEntry[] {
   const granted = capabilities == null ? undefined : new Set(capabilities);
   return registry
     .all()
-    .filter((tool) => tool.capability == null || granted == null || granted.has(tool.capability))
+    .filter((tool) =>
+      toolSupportsTaskType(tool, taskType) &&
+      (tool.capability == null || granted == null || granted.has(tool.capability))
+    )
     .map((tool) => ({
       name: tool.name,
       description: tool.description,

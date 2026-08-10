@@ -98,7 +98,8 @@ describe("spec tools", () => {
     const registry = createToolRegistry();
     registerSpecTools(registry, recorder().deps);
 
-    const manifest = compileToolManifest(registry);
+    expect(compileToolManifest(registry)).toEqual([]);
+    const manifest = compileToolManifest(registry, undefined, "spec");
     expect(manifest.map((tool) => tool.name)).toEqual([
       "spec_read",
       "spec_update_section",
@@ -312,7 +313,7 @@ describe("spec tools", () => {
         reason: "No external API",
       }),
     ).toEqual({ section_id: "scope", state: "n/a", reason: "No external API" });
-    const manifest = compileToolManifest(registry).find(
+    const manifest = compileToolManifest(registry, undefined, "spec").find(
       (entry) => entry.name === "spec_set_section_state",
     );
     expect(JSON.stringify(manifest?.inputSchema)).not.toContain('"anyOf"');

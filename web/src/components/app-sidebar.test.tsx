@@ -24,7 +24,7 @@ test("admin sees the two hats: Tasks and Operator", async () => {
   expect(screen.queryByRole("link", { name: "Settings" })).toBeNull();
 });
 
-test("member sees only Tasks in the rail", async () => {
+test("member does not see admin destinations in the rail", async () => {
   renderWithProviders(
     <ThemeProvider>
       <SidebarProvider>
@@ -43,6 +43,6 @@ test("member sees only Tasks in the rail", async () => {
   );
   expect(await screen.findByRole("link", { name: "Tasks" })).toBeTruthy();
   expect(screen.getByRole("link", { name: "Artifacts" })).toBeTruthy();
-  expect(screen.getByRole("link", { name: "Tech Specs" })).toBeTruthy();
+  expect(screen.queryByRole("link", { name: "Tech Specs" })).toBeNull();
   expect(screen.queryByRole("link", { name: "Operator" })).toBeNull();
 });

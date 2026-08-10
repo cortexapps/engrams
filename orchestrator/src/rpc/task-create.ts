@@ -47,7 +47,7 @@ import {
 } from "../connectors/registry.ts";
 import { compileToolManifest } from "../tools/manifest.ts";
 import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
-import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
+import { systemPromptForTaskType } from "../prompts/base.ts";
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import {
   oauthCredential as defaultOAuthCredential,
@@ -215,6 +215,9 @@ export interface SessionCompileDeps {
 
 export interface SessionCompileOpts {
   prompt?: string;
+  /** Orchestrator task context used to select prompt and tool surfaces. This
+   *  value is not sent to the sandbox. */
+  taskType?: string;
   /** ADR 0107: session mode riding the initial prompt (e.g. "plan").
    *  Validated against the selected harness's declared modes. */
   harnessMode?: string;
@@ -451,7 +454,11 @@ export async function compileSessionCreateInput(
           baseToolRegistry.complete(sessionId, toolCallId, result),
       }
     : baseToolRegistry;
-  const toolManifest = compileToolManifest(manifestRegistry, surfacedCapabilities);
+  const toolManifest = compileToolManifest(
+    manifestRegistry,
+    surfacedCapabilities,
+    opts.taskType,
+  );
   if (toolManifest.length > 0) harness.ENGRAM_TOOLS = JSON.stringify(toolManifest);
   if (!opts.dropProfileSecretsAndEnv) {
     for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v;
@@ -478,7 +485,10 @@ export async function compileSessionCreateInput(
   for (const [k, v] of Object.entries(opts.extraHarnessEnv ?? {})) {
     if (k !== userEnv && k !== orgEnv) harness[k] = v;
   }
-  harness.ENGRAM_APPEND_SYSTEM_PROMPT = [harness.ENGRAM_APPEND_SYSTEM_PROMPT, BASE_SYSTEM_PROMPT]
+  harness.ENGRAM_APPEND_SYSTEM_PROMPT = [
+    harness.ENGRAM_APPEND_SYSTEM_PROMPT,
+    systemPromptForTaskType(opts.taskType),
+  ]
     .filter(Boolean)
     .join("\n\n");
   // ADR 0097: the browser bundle carries a local image-observation tool. It
@@ -667,6 +677,8 @@ export interface CreateSessionForExistingTaskParams {
   taskId: string;
   profileId: string;
   role: string;
+  /** Persisted task type, supplied by the owning orchestrator workflow. */
+  taskType?: string;
   ownerUserId?: string;
   /** Stable principal stamped into the immutable integration snapshot. */
   integrationPrincipalId?: string;
@@ -770,6 +782,7 @@ export async function createSessionForExistingTask(
       // An automation-owned review task has no human token; use the harness's
       // programmatic credential while still creating the session promptless.
       ...(params.ownerUserId === undefined ? { programmatic: true } : {}),
+      ...(params.taskType !== undefined ? { taskType: params.taskType } : {}),
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
       ...(params.harnessMode != null ? { harnessMode: params.harnessMode } : {}),
       ...(params.harness != null ? { harness: params.harness } : {}),
@@ -917,6 +930,7 @@ export async function createTaskWithSession(
       connections: deps.connections ?? makeIntegrationConnectionStore(deps.db),
     },
     {
+      taskType: params.type,
       ...(params.ownerIsServiceAccount ? { programmatic: true } : {}),
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
       ...(params.harness != null ? { harness: params.harness } : {}),

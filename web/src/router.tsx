@@ -287,6 +287,7 @@ const artifactViewRoute = createRoute({
 const specsLayoutRoute = createRoute({
   getParentRoute: () => appLayoutRoute,
   path: "/specs",
+  beforeLoad: requireAdmin,
   component: SpecsLayout,
 });
 const specsIndexRoute = createRoute({
