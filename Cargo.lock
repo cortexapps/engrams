@@ -1873,6 +1873,7 @@ dependencies = [
  "engram-storage-local",
  "engram-substrate-proto",
  "engram-telemetry",
+ "engram-testkit",
  "engram-uffd-handler",
  "filetime",
  "futures",
