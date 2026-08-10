@@ -117,6 +117,18 @@ pub enum Step {
     SlotPopulate,
     /// The idle detector nominates over-idle sessions.
     IdleDetector,
+    /// ADR 0035 amendment: the full heartbeat → pin-set → materialize/sweep
+    /// cycle (persist-before-pin-set ordering; retries a failed startup
+    /// publish).
+    HostHeartbeat,
+    /// ADR 0035 amendment: one REAL zero-grace `run_one_bundle_sweep`
+    /// (mark + promote) — maximally adversarial bundle GC.
+    BundleGcSweep,
+    /// ADR 0035 amendment: a bundle-bake roll — stage a NEW stamp
+    /// generation (+ the D1 startup publish; the pre-fix no-publish variant
+    /// is directed-test territory, never a swarm step: the swarm asserts
+    /// the FIXED system).
+    RollBundleStamp,
     /// Advance virtual time (coarse — crosses decision thresholds cleanly).
     AdvanceTime(u64),
 }
@@ -181,50 +193,62 @@ impl CosimSwarm {
         match self.profile {
             Profile::Calm => match roll {
                 0..=6 if self.sessions.len() < MAX_SESSIONS => Step::BootSession,
-                7..=20 => Step::GuestWork(slot, self.rng.random_range(1..3)),
-                21..=27 => Step::PeriodicCheckpoint(slot),
-                28..=36 => Step::EvictToIdle(slot),
-                37..=44 => Step::Resume(slot),
-                45..=51 => Step::Park(slot),
-                52..=58 => Step::Unpause(slot),
-                59..=66 => Step::RegisterRehydrate(true),
-                67..=70 => Step::StaleSweep,
-                71..=78 => Step::ReconcileTick(true),
-                79..=82 => Step::DropHostBinding(slot),
-                83..=86 => Step::ForceHostLost(slot),
-                87..=89 => Step::StragglerSweep,
-                90..=91 => Step::FinalizePending,
-                92 => Step::SlotClaim,
-                93 => Step::SlotPopulate,
-                94 => Step::IdleDetector,
-                95 => Step::ForceTerminal(slot),
+                7..=18 => Step::GuestWork(slot, self.rng.random_range(1..3)),
+                19..=24 => Step::PeriodicCheckpoint(slot),
+                25..=32 => Step::EvictToIdle(slot),
+                33..=39 => Step::Resume(slot),
+                40..=45 => Step::Park(slot),
+                46..=51 => Step::Unpause(slot),
+                52..=58 => Step::RegisterRehydrate(true),
+                59..=61 => Step::StaleSweep,
+                62..=68 => Step::ReconcileTick(true),
+                69..=71 => Step::DropHostBinding(slot),
+                72..=74 => Step::ForceHostLost(slot),
+                75..=77 => Step::StragglerSweep,
+                78..=79 => Step::FinalizePending,
+                80 => Step::SlotClaim,
+                81 => Step::SlotPopulate,
+                82 => Step::IdleDetector,
+                83 => Step::ForceTerminal(slot),
+                // ADR 0035 amendment: the bundle lifecycle — a frequent
+                // heartbeat (prod: every 5 s), an occasional bake roll, and
+                // an adversarial zero-grace GC.
+                84..=89 => Step::HostHeartbeat,
+                90..=92 => Step::RollBundleStamp,
+                93..=94 => Step::BundleGcSweep,
                 _ => Step::AdvanceTime(self.rng.random_range(1..4) * 30),
             },
             Profile::Chaos => match roll {
                 0..=4 if self.sessions.len() < MAX_SESSIONS => Step::BootSession,
-                5..=14 => Step::GuestWork(slot, self.rng.random_range(1..3)),
-                15..=20 => Step::PeriodicCheckpoint(slot),
-                21..=27 => Step::EvictToIdle(slot),
-                28..=33 => Step::Resume(slot),
-                34..=40 => Step::Park(slot),
-                41..=46 => Step::Unpause(slot),
-                47..=53 => Step::Roll,
-                54..=61 => Step::RegisterRehydrate(self.rng.random_range(0..4) != 0),
-                62..=66 => Step::StaleSweep,
-                67..=69 => Step::KillGuest(slot),
-                70..=77 => Step::ReconcileTick(true),
-                78..=81 => Step::DropHostBinding(slot),
-                82..=85 => Step::ForceHostLost(slot),
-                86..=88 => Step::StragglerSweep,
-                89..=90 => Step::ForceTerminal(slot),
-                91..=92 => Step::FinalizePending,
-                93 => Step::SlotClaim,
-                94 => Step::SlotPopulate,
-                95 => Step::IdleDetector,
+                5..=13 => Step::GuestWork(slot, self.rng.random_range(1..3)),
+                14..=18 => Step::PeriodicCheckpoint(slot),
+                19..=24 => Step::EvictToIdle(slot),
+                25..=29 => Step::Resume(slot),
+                30..=35 => Step::Park(slot),
+                36..=40 => Step::Unpause(slot),
+                41..=46 => Step::Roll,
+                47..=53 => Step::RegisterRehydrate(self.rng.random_range(0..4) != 0),
+                54..=57 => Step::StaleSweep,
+                58..=60 => Step::KillGuest(slot),
+                61..=66 => Step::ReconcileTick(true),
+                67..=69 => Step::DropHostBinding(slot),
+                70..=72 => Step::ForceHostLost(slot),
+                73..=75 => Step::StragglerSweep,
+                76..=77 => Step::ForceTerminal(slot),
+                78..=79 => Step::FinalizePending,
+                80 => Step::SlotClaim,
+                81 => Step::SlotPopulate,
+                82 => Step::IdleDetector,
                 // Wave 7b (#784 layer 2): a small-weight record-loss fault so the
                 // gap-A family — a resident survivor invisible to the records —
                 // arises across the boundary and the barrier's oracles guard it.
-                96 => Step::LoseRecord(slot),
+                83 => Step::LoseRecord(slot),
+                // ADR 0035 amendment: the bundle lifecycle under chaos — the
+                // incident's interleaving (attach → bake roll → sweep → GC →
+                // capture) arises from these composing with Roll/EvictToIdle.
+                84..=89 => Step::HostHeartbeat,
+                90..=92 => Step::RollBundleStamp,
+                93..=94 => Step::BundleGcSweep,
                 _ => Step::AdvanceTime(self.rng.random_range(1..4) * 30),
             },
         }
@@ -331,6 +355,9 @@ impl CosimSwarm {
             Step::SlotClaim => self.sim.slot_claim().await,
             Step::SlotPopulate => self.sim.slot_populate_tick().await,
             Step::IdleDetector => self.sim.idle_detector().await,
+            Step::HostHeartbeat => self.sim.host_heartbeat().await,
+            Step::BundleGcSweep => self.sim.bundle_gc_sweep().await,
+            Step::RollBundleStamp => self.sim.roll_bundle_stamp(true).await,
             Step::AdvanceTime(secs) => self.sim.advance(secs).await,
         }
         Ok(())
@@ -372,6 +399,7 @@ impl CosimSwarm {
         self.sim.assert_quarantine_reconnectable().await?;
         self.sim.assert_slot_accounting().await?;
         self.sim.assert_ownership_agreement().await?;
+        self.sim.assert_bundle_reachability().await?;
         Ok(())
     }
 
@@ -400,6 +428,12 @@ impl CosimSwarm {
             self.sim.reconcile_tick(true).await;
             self.sim.straggler_sweep_tick().await;
             self.sim.finalize_pending().await;
+            // ADR 0035 amendment: the heartbeat cadence rides the drain (a
+            // failed startup publish retries; the pin-set-driven sweep
+            // settles) and the adversarial GC keeps pressure on — quiescence
+            // must converge WITH the reclaimers running, not by stopping them.
+            self.sim.host_heartbeat().await;
+            self.sim.bundle_gc_sweep().await;
             self.check_oracles().await?;
         }
         // Convergence: no session may still be mid-eviction (Evicting) or wedged

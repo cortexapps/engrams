@@ -50,8 +50,17 @@ pub struct Cosim {
 
 impl Cosim {
     pub async fn new(seed: u64) -> Self {
+        Self::new_with_fault_plan(seed, None).await
+    }
+
+    /// A harness whose shared bucket injects faults per `plan` (see
+    /// [`CosimWorld::new_with_fault_plan`]).
+    pub async fn new_with_fault_plan(
+        seed: u64,
+        plan: Option<engram_testkit::storage::FaultPlan>,
+    ) -> Self {
         Self {
-            world: CosimWorld::new(seed).await,
+            world: CosimWorld::new_with_fault_plan(seed, plan).await,
             idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig::default(),
             queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig::default(),
             dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig::default(),
@@ -285,10 +294,40 @@ impl Cosim {
         let Some(sandbox) = self.sandbox_of(session_id).await else {
             return;
         };
-        let (cursor, now) = {
+        let (cursor, now, aux) = {
             let host = self.world.host.lock().await;
-            (host.cursor(sandbox).unwrap_or(0), self.world.clock_now())
+            (
+                host.cursor(sandbox).unwrap_or(0),
+                self.world.clock_now(),
+                host.attachment_staging()
+                    .into_iter()
+                    .filter(|(id, _, _)| *id == sandbox)
+                    .map(|(_, r, _)| r)
+                    .collect::<Vec<_>>(),
+            )
         };
+        // ADR 0035 amendment: publish-before-record — the REAL snapshot
+        // pipeline makes the pinned generations durable before the row
+        // lands (HEAD-hit when startup publish already ran). A missing
+        // generation fails the checkpoint here, exactly like prod's
+        // "bundle publish: open staged … No such file" → chain poison.
+        if !aux.is_empty() {
+            if let Err(e) = {
+                let host = self.world.host.lock().await;
+                let store = engram_host_agent::bundles::BundleStore::new(
+                    self.world.blob.clone(),
+                    host.bundle_dir(),
+                    crate::host::BUNDLE_EXT,
+                );
+                drop(host);
+                store.publish(&aux).await
+            } {
+                self.log(format!(
+                    "periodic_checkpoint {session_id} FAILED bundle publish: {e}"
+                ));
+                return;
+            }
+        }
         let _ = {
             let mut host = self.world.host.lock().await;
             // Firecracker's `prepare_save` queues TRANSPORT_RESET for every
@@ -306,6 +345,7 @@ impl Cosim {
             COSIM_IMAGE,
             cursor,
             now,
+            &aux,
         );
         let _ = self.world.meta.record_snapshot(snap).await;
         self.log(format!("periodic_checkpoint {session_id} cursor={cursor}"));
@@ -370,6 +410,135 @@ impl Cosim {
     pub async fn stale_sweep(&mut self) {
         self.world.host.lock().await.stale_sweep_tick();
         self.log("stale_sweep");
+    }
+
+    // ─────────── ADR 0035 amendment: the bundle lifecycle ───────────
+
+    /// The full heartbeat → pin-set → supervisor cycle (ADR 0035 §5 + the
+    /// amendment): retry a failed startup publish (the 60 s timer's analog),
+    /// PERSIST the host's stamp + per-sandbox attachments, THEN compute the
+    /// ack's `live_bundles` from the REAL `bundle_pin_set`, then run the
+    /// REAL materialize + sweep against it. The persist-before-pin-set
+    /// ordering is the load-bearing one the incident rode. A pin-set
+    /// failure withholds the ack — no sweep runs (prod: 5xx, host retries).
+    pub async fn host_heartbeat(&mut self) {
+        {
+            let mut host = self.world.host.lock().await;
+            if !host.stamp_published() {
+                let _ = host.startup_publish().await;
+            }
+        }
+        self.world.heartbeat().await;
+        let live = match self.world.meta.bundle_pin_set().await {
+            Ok(live) => live,
+            Err(e) => {
+                self.log(format!(
+                    "host_heartbeat: pin set failed ({e}); ack withheld"
+                ));
+                return;
+            }
+        };
+        let sweep = self.world.host.lock().await.bundle_sweep(&live).await;
+        self.log(format!(
+            "host_heartbeat live_pins={} sweep={:?}",
+            live.len(),
+            sweep.err()
+        ));
+    }
+
+    /// A bundle-bake roll: the node-assets init stages a NEW stamp
+    /// generation (the old one rotates out of `current.json`). `publish`
+    /// runs the D1 startup publish; `false` replays the pre-amendment
+    /// staged-but-never-durable world (the red knob — with it, a stamp
+    /// rotation + sweep can destroy a running sandbox's only copy).
+    pub async fn roll_bundle_stamp(&mut self, publish: bool) {
+        let mut host = self.world.host.lock().await;
+        host.stage_new_stamp_generation().await;
+        let res = if publish {
+            host.startup_publish().await
+        } else {
+            Ok(())
+        };
+        drop(host);
+        self.log(format!("roll_bundle_stamp publish={publish} -> {res:?}"));
+    }
+
+    /// One REAL `run_one_bundle_sweep` (mark + promote) with ZERO grace —
+    /// maximally adversarial: anything the pin set does not cover is
+    /// reclaimable immediately, so a pin-set hole surfaces within two
+    /// sweeps instead of hiding behind the 24 h production grace.
+    pub async fn bundle_gc_sweep(&mut self) {
+        let cfg = engram_coordinator::chunk_gc::ChunkGcConfig {
+            grace_period: Duration::ZERO,
+            ..Default::default()
+        };
+        let clock: std::sync::Arc<dyn engram_core::traits::Clock> = self.world.clock.clone();
+        let report = engram_coordinator::bundle_gc::run_one_bundle_sweep(
+            self.world.meta.clone() as std::sync::Arc<dyn engram_core::traits::MetadataStore>,
+            self.world.blob.clone(),
+            &cfg,
+            engram_coordinator::chunk_gc::SweepMode::Full,
+            &clock,
+        )
+        .await;
+        self.log(format!("bundle_gc_sweep -> {report:?}"));
+    }
+
+    /// **Oracle — bundle reachability (ADR 0035 amendment; the 2026-08-10
+    /// class):** every generation attached to a sandbox the host still
+    /// holds is reachable from local staging ∪ blob storage (its next
+    /// capture must be able to publish it; a restore must be able to
+    /// materialize it), AND every recoverable snapshot row's pinned
+    /// generations are durable in blob storage (publish-before-record —
+    /// a pin nothing can satisfy must never be recorded). Checked after
+    /// every swarm step.
+    pub async fn assert_bundle_reachability(&self) -> Result<(), String> {
+        use engram_core::types::sandbox::AuxRoDrive;
+        let attachments = self.world.host.lock().await.attachment_staging();
+        for (sandbox, r, staged) in attachments {
+            if staged {
+                continue;
+            }
+            let durable = self
+                .world
+                .blob
+                .exists(&AuxRoDrive::blob_key(&r.sha256))
+                .await
+                .map_err(|e| format!("bundle-reachability: blob HEAD {}: {e}", r.sha256))?;
+            if !durable {
+                return Err(format!(
+                    "bundle-reachability: sandbox {sandbox}'s attached generation \
+                     {}/{} is staged NOWHERE and absent from blob storage — the \
+                     2026-08-10 chain_poisoned class (its next capture cannot \
+                     publish; a restore cannot materialize)",
+                    r.drive_id, r.sha256
+                ));
+            }
+        }
+        let pinned: Vec<(engram_core::types::SnapshotId, String)> = self.world.meta.with_db(|db| {
+            db.snapshots
+                .values()
+                .filter(|s| s.recoverable)
+                .flat_map(|s| s.aux_bundles.iter().map(move |b| (s.id, b.sha256.clone())))
+                .collect()
+        });
+        for (snapshot, sha) in pinned {
+            let durable = self
+                .world
+                .blob
+                .exists(&AuxRoDrive::blob_key(&sha))
+                .await
+                .map_err(|e| format!("bundle-reachability: blob HEAD {sha}: {e}"))?;
+            if !durable {
+                return Err(format!(
+                    "bundle-reachability: recoverable snapshot {snapshot} pins \
+                     generation {sha} which is absent from blob storage — a \
+                     recorded pin nothing can satisfy (the restore on another \
+                     host fails); publish-before-record was violated"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Rung-2 PARK a session's sandbox (FC paused, VM resident, device served)
@@ -535,6 +704,7 @@ impl Cosim {
                 snapshot_id,
                 session_id,
                 cursor,
+                aux_bundles,
                 ..
             } = outcome
             {
@@ -545,6 +715,7 @@ impl Cosim {
                     COSIM_IMAGE,
                     cursor,
                     self.world.clock_now(),
+                    &aux_bundles,
                 );
                 let _ = self.world.meta.record_snapshot(snap).await;
                 // ADR 0101 C: the reconcile settle — the recoverable row

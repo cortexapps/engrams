@@ -24,7 +24,13 @@ engram-secrets-dev.workspace = true
 engram-sandbox-firecracker.workspace = true
 engram-sim.workspace = true
 engram-storage-local.workspace = true
+# ADR 0035 amendment: deterministic blob-fault injection on the shared
+# bucket (bundles/-prefix put faults — the never-became-durable leg).
+engram-testkit.workspace = true
 async-trait.workspace = true
+# ADR 0035 amendment: content-address the staged stamp generations.
+hex.workspace = true
+sha2.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
