@@ -18,6 +18,7 @@ test("admin sees the two hats: Tasks and Operator", async () => {
   // accessible name also contains "tasks").
   expect(await screen.findByRole("link", { name: "Tasks" })).toBeTruthy();
   expect(screen.getByRole("link", { name: "Artifacts" })).toBeTruthy();
+  expect(screen.getByRole("link", { name: "Tech Specs" })).toBeTruthy();
   expect(screen.getByRole("link", { name: "Operator" })).toBeTruthy();
   // Settings is not a rail destination; it lives in the avatar menu.
   expect(screen.queryByRole("link", { name: "Settings" })).toBeNull();
@@ -42,5 +43,6 @@ test("member sees only Tasks in the rail", async () => {
   );
   expect(await screen.findByRole("link", { name: "Tasks" })).toBeTruthy();
   expect(screen.getByRole("link", { name: "Artifacts" })).toBeTruthy();
+  expect(screen.getByRole("link", { name: "Tech Specs" })).toBeTruthy();
   expect(screen.queryByRole("link", { name: "Operator" })).toBeNull();
 });

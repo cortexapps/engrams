@@ -39,6 +39,9 @@ import { ArtifactsLayout } from "./pages/artifacts/ArtifactsLayout";
 import { ArtifactsLibrary } from "./pages/artifacts/ArtifactsLibrary";
 import { ArtifactDetail } from "./pages/artifacts/ArtifactDetail";
 import { ArtifactViewPage } from "./pages/artifacts/ArtifactViewPage";
+import { SpecsLayout } from "./pages/specs/SpecsLayout";
+import { SpecsList } from "./pages/specs/SpecsList";
+import { SpecRouteStub } from "./pages/specs/SpecRouteStub";
 import { KaizenLayout } from "./pages/kaizen/KaizenLayout";
 import { Papercuts } from "./pages/kaizen/Papercuts";
 import { Fleet } from "./pages/Fleet";
@@ -278,6 +281,35 @@ const artifactViewRoute = createRoute({
   component: ArtifactViewPage,
 });
 
+// /specs is the organization-shared Tech Specs catalog. The layout owns the
+// top-level Specs/Templates tabs. The placeholder children keep the routes
+// stable until their assigned issues add the template and read surfaces.
+const specsLayoutRoute = createRoute({
+  getParentRoute: () => appLayoutRoute,
+  path: "/specs",
+  component: SpecsLayout,
+});
+const specsIndexRoute = createRoute({
+  getParentRoute: () => specsLayoutRoute,
+  path: "/",
+  validateSearch: (search: Record<string, unknown>): StatusSearch => {
+    const status = search["status"];
+    return status === "draft" || status === "published" ? { status } : {};
+  },
+  component: SpecsList,
+});
+type StatusSearch = { status?: "draft" | "published" };
+const specTemplatesRoute = createRoute({
+  getParentRoute: () => specsLayoutRoute,
+  path: "templates",
+  component: () => <SpecRouteStub surface="templates" />,
+});
+const specDetailRoute = createRoute({
+  getParentRoute: () => specsLayoutRoute,
+  path: "$specId",
+  component: () => <SpecRouteStub surface="spec" />,
+});
+
 // /kaizen layout route (second sidebar) ----------------------------------
 const kaizenLayoutRoute = createRoute({
   getParentRoute: () => appLayoutRoute,
@@ -437,6 +469,7 @@ export const routeTree = rootRoute.addChildren([
       artifactDetailRoute,
       artifactDetailPrettyRoute,
     ]),
+    specsLayoutRoute.addChildren([specsIndexRoute, specTemplatesRoute, specDetailRoute]),
     operatorLayoutRoute.addChildren([
       operatorIndexRoute,
       operatorFleetRoute,
