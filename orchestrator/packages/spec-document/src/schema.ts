@@ -1,6 +1,8 @@
 import { Fragment, Node as ProseMirrorNode, Schema, type NodeSpec } from "prosemirror-model";
 import { Transform } from "prosemirror-transform";
 
+import { readSpecBlockAttrs, type SpecBlockProvenance } from "./blocks.ts";
+
 export const SPEC_FRAGMENT_NAME = "prosemirror";
 
 export interface SpecTemplateSection {
@@ -48,9 +50,11 @@ export const specNodeSpecs: Readonly<Record<string, NodeSpec>> = {
   },
   diagramBlock: {
     attrs: {
-      blockId: {},
+      id: {},
       kind: {},
       source: { default: "" },
+      cachedRender: { default: null },
+      provenance: { default: { type: "illustrative" } },
     },
     group: "block",
     atom: true,
@@ -159,7 +163,11 @@ function renderBlock(node: ProseMirrorNode): string {
     return `\`\`\`${String(node.attrs.language)}\n${node.textContent}\n\`\`\``;
   }
   if (node.type === schema.nodes.diagramBlock) {
-    return `\`\`\`${String(node.attrs.kind)}\n${String(node.attrs.source)}\n\`\`\``;
+    const block = readSpecBlockAttrs(node.attrs);
+    const metadata = escapeComment(
+      JSON.stringify({ id: block.id, kind: block.kind, provenance: block.provenance }),
+    );
+    return `<!-- spec-block ${metadata} -->\n${renderCodeFence(block.kind, block.source)}`;
   }
   throw new Error(`Cannot render spec node: ${node.type.name}`);
 }
@@ -227,23 +235,34 @@ function parseBlocks(lines: string[]): ProseMirrorNode[] {
       index += 1;
       continue;
     }
-    const fence = /^```([^`]*)$/.exec(lines[index]!);
-    if (fence) {
-      const language = fence[1]!.trim();
-      const source: string[] = [];
-      index += 1;
-      while (index < lines.length && lines[index] !== "```") {
-        source.push(lines[index]!);
-        index += 1;
+    const blockMetadata = parseBlockMetadata(lines[index]!);
+    if (blockMetadata) {
+      const parsed = parseFencedSource(lines, index + 1);
+      if (!parsed) throw new Error("A spec block must have a fenced source specification");
+      if (parsed.language !== blockMetadata.kind) {
+        throw new Error("A spec block fence must use its registered kind");
       }
-      if (index === lines.length) throw new Error("An open code fence has no closing fence");
+      blocks.push(
+        schema.nodes.diagramBlock!.create({
+          id: blockMetadata.id,
+          kind: blockMetadata.kind,
+          source: parsed.source,
+          cachedRender: null,
+          provenance: blockMetadata.provenance,
+        }),
+      );
+      index = parsed.nextIndex;
+      continue;
+    }
+    const fence = parseFencedSource(lines, index);
+    if (fence) {
       blocks.push(
         schema.nodes.codeBlock!.create(
-          { language },
-          source.length > 0 ? schema.text(source.join("\n")) : undefined,
+          { language: fence.language },
+          fence.source.length > 0 ? schema.text(fence.source) : undefined,
         ),
       );
-      index += 1;
+      index = fence.nextIndex;
       continue;
     }
     const heading = /^(#{3,6})\s+(.+)$/.exec(lines[index]!);
@@ -262,7 +281,7 @@ function parseBlocks(lines: string[]): ProseMirrorNode[] {
     while (
       index < lines.length &&
       lines[index]!.trim().length > 0 &&
-      !/^```/.test(lines[index]!) &&
+      !/^`{3,}/.test(lines[index]!) &&
       !/^#{3,6}\s+/.test(lines[index]!)
     ) {
       paragraphLines.push(lines[index]!);
@@ -271,6 +290,66 @@ function parseBlocks(lines: string[]): ProseMirrorNode[] {
     blocks.push(schema.nodes.paragraph!.create(null, parseInline(paragraphLines.join("\n"))));
   }
   return blocks.length > 0 ? blocks : [paragraph()];
+}
+
+interface ParsedFence {
+  language: string;
+  source: string;
+  nextIndex: number;
+}
+
+function renderCodeFence(language: string, source: string): string {
+  const longestRun = Math.max(0, ...[...source.matchAll(/`+/g)].map((match) => match[0].length));
+  const fence = "`".repeat(Math.max(3, longestRun + 1));
+  return `${fence}${language}\n${source}\n${fence}`;
+}
+
+function parseFencedSource(lines: string[], index: number): ParsedFence | null {
+  const opening = /^(`{3,})([^`]*)$/.exec(lines[index] ?? "");
+  if (!opening) return null;
+  const fence = opening[1]!;
+  const source: string[] = [];
+  let cursor = index + 1;
+  while (cursor < lines.length && lines[cursor] !== fence) {
+    source.push(lines[cursor]!);
+    cursor += 1;
+  }
+  if (cursor === lines.length) throw new Error("An open code fence has no closing fence");
+  return {
+    language: opening[2]!.trim(),
+    source: source.join("\n"),
+    nextIndex: cursor + 1,
+  };
+}
+
+interface BlockMetadata {
+  id: string;
+  kind: string;
+  provenance: SpecBlockProvenance;
+}
+
+function parseBlockMetadata(line: string): BlockMetadata | null {
+  const match = /^<!-- spec-block (.+) -->$/.exec(line);
+  if (!match) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(match[1]!);
+  } catch {
+    throw new Error("A spec block has invalid metadata");
+  }
+  const block = readSpecBlockAttrs(isRecord(value) ? value : {});
+  if (block.id === "unknown" || block.kind === "unknown") {
+    throw new Error("A spec block must have an id and kind");
+  }
+  return { id: block.id, kind: block.kind, provenance: block.provenance };
+}
+
+function escapeComment(value: string): string {
+  return value.replaceAll("--", "\\u002d\\u002d");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function parseMarkdownBlocks(markdown: string): ProseMirrorNode[] {

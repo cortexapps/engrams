@@ -353,6 +353,7 @@ export class SpecToolService implements SpecToolDocumentService {
           return new Transform(document).setNodeMarkup(block.position, undefined, {
             ...block.node.attrs,
             source: input.source,
+            cachedRender: null,
           }).doc;
         },
         input.expectedRev,
@@ -467,7 +468,7 @@ function diagramBlocks(document: ProseMirrorNode, blockId: string): LocatedDiagr
   document.forEach((section, sectionPosition) => {
     if (section.type !== schema.nodes.section || typeof section.attrs.id !== "string") return;
     section.descendants((node, position) => {
-      if (node.type === schema.nodes.diagramBlock && node.attrs.blockId === blockId) {
+      if (node.type === schema.nodes.diagramBlock && node.attrs.id === blockId) {
         result.push({
           node,
           position: sectionPosition + 1 + position,

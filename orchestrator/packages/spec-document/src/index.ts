@@ -1,4 +1,18 @@
 export {
+  isSpecBlockKind,
+  readSpecBlockAttrs,
+  semanticSpecNodeJson,
+  SPEC_BLOCK_KINDS,
+  specBlockRegistration,
+  specBlockRegistry,
+  specNodesSemanticallyEqual,
+  type SpecBlockAttrs,
+  type SpecBlockCachedRender,
+  type SpecBlockKind,
+  type SpecBlockProvenance,
+  type SpecBlockRegistration,
+} from "./blocks.ts";
+export {
   createSectionRelativeAnchor,
   parseSectionRelativeAnchor,
   resolveSectionRelativeAnchor,
