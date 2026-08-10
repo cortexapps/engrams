@@ -29,9 +29,7 @@ import type { Actions } from "../authz/ability.ts";
 // ---------------------------------------------------------------------------
 
 /** Injected getSession implementation (same shape as passthrough.ts). */
-export type GetSession = (
-  headers: Headers,
-) => Promise<{
+export type GetSession = (headers: Headers) => Promise<{
   user: { id: string; role?: string | null; email?: string | null; name?: string | null };
 } | null>;
 
@@ -40,6 +38,9 @@ export type ResolveOwner = (sessionId: string) => Promise<string | null>;
 
 /** Resolve whether a user is a member of the organization that owns a spec. */
 export type ResolveSpecMembership = (specId: string, userId: string) => Promise<boolean>;
+
+/** Resolve whether a spec still accepts live document updates. */
+export type ResolveDraftSpec = (specId: string) => Promise<boolean>;
 
 /** Resolved user returned by the guard — carries id + role. */
 export interface GuardUser {
@@ -50,9 +51,7 @@ export interface GuardUser {
 
 /** Outcome of a header-level authorization check (no Hono `Context` involved —
  * usable from both HTTP handlers and raw `node:http` upgrade handlers). */
-export type GuardResult =
-  | { ok: true; user: GuardUser }
-  | { ok: false; status: 401 | 404 };
+export type GuardResult = { ok: true; user: GuardUser } | { ok: false; status: 401 | 404 };
 
 // ---------------------------------------------------------------------------
 // Pure authorization check
@@ -144,10 +143,7 @@ function resolveDefaults(
  * tests) — same authorization as `makeGuard`, but callable before a Hono
  * `Context` exists (raw `node:http` upgrade handlers).
  */
-export function makeHeaderGuard(
-  getSession?: GetSession,
-  resolveOwner?: ResolveOwner,
-) {
+export function makeHeaderGuard(getSession?: GetSession, resolveOwner?: ResolveOwner) {
   const { resolveSession, ownerResolver } = resolveDefaults(getSession, resolveOwner);
   return (headers: Headers, sessionId: string | undefined, action: Actions) =>
     authorizeSessionAccess(headers, sessionId, action, resolveSession, ownerResolver);
@@ -171,16 +167,10 @@ export function makeSpecMemberHeaderGuard(
  * The caller is responsible for extracting `:id` from the route params and
  * passing it as `sessionId`.
  */
-export function makeGuard(
-  getSession?: GetSession,
-  resolveOwner?: ResolveOwner,
-) {
+export function makeGuard(getSession?: GetSession, resolveOwner?: ResolveOwner) {
   const headerGuard = makeHeaderGuard(getSession, resolveOwner);
 
-  return async function guardSession(
-    c: Context,
-    action: Actions,
-  ): Promise<GuardUser> {
+  return async function guardSession(c: Context, action: Actions): Promise<GuardUser> {
     const sessionId = c.req.param("id");
     // Pull headers from the raw fetch Request (Hono wraps it).
     const result = await headerGuard(c.req.raw.headers, sessionId, action);

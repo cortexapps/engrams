@@ -75,7 +75,10 @@ export async function restoreSpecSection(
   specId: string,
   checkpointId: string,
   sectionId: string,
-): Promise<{ checkpoint: SpecCheckpoint; newRev: string }> {
+): Promise<
+  | { applied: true; checkpoint: SpecCheckpoint; newRev: string }
+  | { applied: false; checkpoint: null; newRev: string }
+> {
   return specRequest(`/specs/${encodeURIComponent(specId)}/restore`, {
     method: "POST",
     headers: { "content-type": "application/json" },

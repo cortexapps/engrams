@@ -6,6 +6,11 @@ interface DiffSegment {
   after: string;
 }
 
+interface MarkdownSegment {
+  kind: "prose" | "code";
+  text: string;
+}
+
 export function CheckpointDiff({ before, after }: { before: string; after: string }) {
   const segments = buildCheckpointDiff(before, after);
   return (
@@ -40,26 +45,76 @@ function DiffChange({ change }: { change: Change }) {
 export function buildCheckpointDiff(before: string, after: string): DiffSegment[] {
   const beforeSegments = splitMarkdown(before);
   const afterSegments = splitMarkdown(after);
-  const length = Math.max(beforeSegments.length, afterSegments.length);
+  const scores = alignmentScores(beforeSegments, afterSegments);
   const result: DiffSegment[] = [];
-  for (let index = 0; index < length; index += 1) {
-    const left = beforeSegments[index];
-    const right = afterSegments[index];
-    const kind = left?.kind === "code" || right?.kind === "code" ? "code" : "prose";
-    result.push({ kind, before: left?.text ?? "", after: right?.text ?? "" });
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < beforeSegments.length || rightIndex < afterSegments.length) {
+    const left = beforeSegments[leftIndex];
+    const right = afterSegments[rightIndex];
+    const pairScore = left && right && left.kind === right.kind ? segmentScore(left, right) : -1;
+    if (
+      left &&
+      right &&
+      left.kind === right.kind &&
+      scores[leftIndex]![rightIndex] === pairScore + scores[leftIndex + 1]![rightIndex + 1]
+    ) {
+      result.push({ kind: left.kind, before: left.text, after: right.text });
+      leftIndex += 1;
+      rightIndex += 1;
+    } else if (left && scores[leftIndex]![rightIndex] === scores[leftIndex + 1]![rightIndex] - 1) {
+      result.push({ kind: left.kind, before: left.text, after: "" });
+      leftIndex += 1;
+    } else if (right) {
+      result.push({ kind: right.kind, before: "", after: right.text });
+      rightIndex += 1;
+    }
   }
   return result;
 }
 
-function splitMarkdown(markdown: string): Array<{ kind: "prose" | "code"; text: string }> {
-  const result: Array<{ kind: "prose" | "code"; text: string }> = [];
+function alignmentScores(
+  before: readonly MarkdownSegment[],
+  after: readonly MarkdownSegment[],
+): number[][] {
+  const scores = Array.from({ length: before.length + 1 }, () =>
+    Array<number>(after.length + 1).fill(0),
+  );
+  for (let left = before.length; left >= 0; left -= 1)
+    scores[left]![after.length] = left - before.length;
+  for (let right = after.length; right >= 0; right -= 1)
+    scores[before.length]![right] = right - after.length;
+  for (let left = before.length - 1; left >= 0; left -= 1) {
+    for (let right = after.length - 1; right >= 0; right -= 1) {
+      const beforeSegment = before[left]!;
+      const afterSegment = after[right]!;
+      const aligned =
+        beforeSegment.kind === afterSegment.kind
+          ? segmentScore(beforeSegment, afterSegment) + scores[left + 1]![right + 1]!
+          : Number.NEGATIVE_INFINITY;
+      scores[left]![right] = Math.max(
+        aligned,
+        scores[left + 1]![right]! - 1,
+        scores[left]![right + 1]! - 1,
+      );
+    }
+  }
+  return scores;
+}
+
+function segmentScore(before: MarkdownSegment, after: MarkdownSegment): number {
+  return before.text === after.text ? 4 : 1;
+}
+
+function splitMarkdown(markdown: string): MarkdownSegment[] {
+  const result: MarkdownSegment[] = [];
   const lines = markdown.replace(/\r\n/g, "\n").split(/(?<=\n)/);
   let kind: "prose" | "code" = "prose";
   let buffer = "";
   for (const line of lines) {
     const fence = line.startsWith("```");
     if (fence && kind === "prose") {
-      if (buffer) result.push({ kind, text: buffer });
+      if (buffer.trim().length > 0) result.push({ kind, text: buffer });
       kind = "code";
       buffer = line;
       continue;
@@ -69,8 +124,11 @@ function splitMarkdown(markdown: string): Array<{ kind: "prose" | "code"; text: 
       result.push({ kind, text: buffer });
       kind = "prose";
       buffer = "";
+    } else if (kind === "prose" && line.trim().length === 0) {
+      if (buffer.trim().length > 0) result.push({ kind, text: buffer });
+      buffer = "";
     }
   }
-  if (buffer) result.push({ kind, text: buffer });
+  if (buffer.trim().length > 0) result.push({ kind, text: buffer });
   return result;
 }

@@ -8,10 +8,7 @@ import type { Node as ProseMirrorNode } from "prosemirror-model";
 import { prosemirrorToYXmlFragment, yXmlFragmentToProseMirrorRootNode } from "y-prosemirror";
 import * as Y from "yjs";
 import type { Pool, PoolClient } from "pg";
-import {
-  listenForSpecChannel,
-  type SpecChannelListenerOptions,
-} from "./channel-listener.ts";
+import { listenForSpecChannel, type SpecChannelListenerOptions } from "./channel-listener.ts";
 
 import { applyHumanSectionEdit, type SectionStateValue } from "./section-state.ts";
 import { humanEditRequestFingerprint } from "./section-state-service.ts";
@@ -124,6 +121,13 @@ export class SpecParticipantLeaseStaleError extends Error {
   }
 }
 
+export class SpecDocumentReadOnlyError extends Error {
+  constructor(readonly specId: string) {
+    super(`Spec ${specId} is published and read-only`);
+    this.name = "SpecDocumentReadOnlyError";
+  }
+}
+
 export interface SpecSnapshotRecord {
   state: Uint8Array;
   stateVector: Uint8Array;
@@ -152,6 +156,27 @@ export interface CompactSnapshotInput extends SpecSnapshotRecord {
   specId: string;
 }
 
+export interface SpecDocumentCheckpoint {
+  id: string;
+  specId: string;
+  state: Uint8Array;
+  stateVector: Uint8Array;
+  renderedMarkdown: string;
+  docSeq: bigint;
+  label: string;
+  authorUserId: string | null;
+  reason: string;
+  createdAt: Date;
+}
+
+export interface SpecDocumentCheckpointMetadata {
+  id: string;
+  label: string;
+  authorUserId: string | null;
+  reason: string;
+  createdAt: Date;
+}
+
 export interface SpecDocumentStore {
   readSnapshot(specId: string): Promise<SpecSnapshotRecord | null>;
   readUpdatesAfter(specId: string, afterSeq: bigint): Promise<SpecUpdateRecord[]>;
@@ -163,12 +188,18 @@ export interface SpecDocumentStore {
     effects: SpecUpdateEffects,
     participantEpoch?: bigint,
   ): Promise<bigint | null>;
+  insertCheckpointAndUpdateIfLatest(
+    specId: string,
+    expectedSeq: bigint,
+    checkpoint: SpecDocumentCheckpoint,
+    update: Uint8Array,
+    clientId: string | null,
+    effects: SpecUpdateEffects,
+    participantEpoch?: bigint,
+  ): Promise<bigint | null>;
   notifyUpdate(specId: string, seq: bigint): Promise<void>;
   compactSnapshot(input: CompactSnapshotInput): Promise<boolean>;
-  listen(
-    onWake: (specId: string) => void,
-    onReconnect?: () => void,
-  ): Promise<() => Promise<void>>;
+  listen(onWake: (specId: string) => void, onReconnect?: () => void): Promise<() => Promise<void>>;
 }
 
 export interface LoadedSpecDocument {
@@ -198,6 +229,8 @@ export interface SpecDocumentServiceOptions {
   measureRenderedSize?: (doc: ProseMirrorNode) => number;
   /** Injected wall time for durable human-visible document edits. */
   now?: () => Date;
+  /** Test seam for an update that races a serialized checkpoint restore. */
+  beforeCheckpointPersist?: (specId: string, expectedSeq: bigint) => void | Promise<void>;
 }
 
 export interface CompactSpecResult extends SpecSnapshotRecord {
@@ -242,12 +275,9 @@ export class SpecDocumentService {
         this.warn(`Spec update sync failed for ${specId}: ${errorMessage(error)}`);
       });
     };
-    this.stopListening = await this.store.listen(
-      sync,
-      () => {
-        for (const specId of this.cache.keys()) sync(specId);
-      },
-    );
+    this.stopListening = await this.store.listen(sync, () => {
+      for (const specId of this.cache.keys()) sync(specId);
+    });
   }
 
   async stopPeerSync(): Promise<void> {
@@ -304,6 +334,54 @@ export class SpecDocumentService {
           if (update.length === 2) throw new Error("The spec mutation did not change the document");
           const stored = await this.tryApplyUpdateUnlocked(specId, room, update, clientId);
           if (stored) return stored;
+        } finally {
+          fork.destroy();
+        }
+      }
+    });
+  }
+
+  async mutateDocumentWithCheckpoint(
+    specId: string,
+    clientId: string | null,
+    checkpointMetadata: SpecDocumentCheckpointMetadata,
+    mutate: (doc: ProseMirrorNode, ydoc: Y.Doc) => ProseMirrorNode,
+  ): Promise<
+    | { applied: true; checkpoint: SpecDocumentCheckpoint; update: SpecUpdateRecord }
+    | { applied: false; currentSeq: bigint }
+  > {
+    return this.withLock(specId, async () => {
+      const room = await this.loadUnlocked(specId);
+      for (;;) {
+        await this.syncUnlocked(specId, room);
+        const checkpoint: SpecDocumentCheckpoint = {
+          ...checkpointMetadata,
+          specId,
+          state: Y.encodeStateAsUpdate(room.doc),
+          stateVector: Y.encodeStateVector(room.doc),
+          renderedMarkdown: renderMarkdown(proseMirrorDocument(room.doc)),
+          docSeq: room.lastAppliedSeq,
+        };
+        const fork = new Y.Doc();
+        try {
+          Y.applyUpdate(fork, checkpoint.state);
+          const before = Y.encodeStateVector(fork);
+          const current = proseMirrorDocument(fork);
+          const replacement = mutate(current, fork);
+          if (replacement.eq(current)) return { applied: false, currentSeq: room.lastAppliedSeq };
+          prosemirrorToYXmlFragment(replacement, fork.getXmlFragment(SPEC_FRAGMENT_NAME));
+          const update = Y.encodeStateAsUpdate(fork, before);
+          if (update.length === 2) return { applied: false, currentSeq: room.lastAppliedSeq };
+          await this.options.beforeCheckpointPersist?.(specId, room.lastAppliedSeq);
+          const stored = await this.tryApplyUpdateUnlocked(
+            specId,
+            room,
+            update,
+            clientId,
+            undefined,
+            checkpoint,
+          );
+          if (stored) return { applied: true, checkpoint, update: stored };
         } finally {
           fork.destroy();
         }
@@ -423,22 +501,34 @@ export class SpecDocumentService {
     update: Uint8Array,
     clientId: string | null,
     participantEpoch?: bigint,
+    checkpoint?: SpecDocumentCheckpoint,
   ): Promise<SpecUpdateRecord | null> {
     const { candidate, sections } = this.validateCandidate(room, update);
     const renderedSizeUpperBound = this.validateSize(room, update, candidate);
     let seq: bigint | null;
     try {
-      seq = await this.store.insertUpdateIfLatest(
-        specId,
-        room.lastAppliedSeq,
-        update,
-        clientId,
-        {
-          sections,
-          at: sections.some((section) => section.changed) ? this.options.now?.() : undefined,
-        },
-        participantEpoch,
-      );
+      const effects = {
+        sections,
+        at: sections.some((section) => section.changed) ? this.options.now?.() : undefined,
+      };
+      seq = checkpoint
+        ? await this.store.insertCheckpointAndUpdateIfLatest(
+            specId,
+            room.lastAppliedSeq,
+            checkpoint,
+            update,
+            clientId,
+            effects,
+            participantEpoch,
+          )
+        : await this.store.insertUpdateIfLatest(
+            specId,
+            room.lastAppliedSeq,
+            update,
+            clientId,
+            effects,
+            participantEpoch,
+          );
     } catch (error) {
       this.resetValidationDoc(room);
       throw error;
@@ -671,6 +761,46 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     effects: SpecUpdateEffects,
     participantEpoch?: bigint,
   ): Promise<bigint | null> {
+    return this.insertDraftUpdate(
+      specId,
+      expectedSeq,
+      update,
+      clientId,
+      effects,
+      undefined,
+      participantEpoch,
+    );
+  }
+
+  async insertCheckpointAndUpdateIfLatest(
+    specId: string,
+    expectedSeq: bigint,
+    checkpoint: SpecDocumentCheckpoint,
+    update: Uint8Array,
+    clientId: string | null,
+    effects: SpecUpdateEffects,
+    participantEpoch?: bigint,
+  ): Promise<bigint | null> {
+    return this.insertDraftUpdate(
+      specId,
+      expectedSeq,
+      update,
+      clientId,
+      effects,
+      checkpoint,
+      participantEpoch,
+    );
+  }
+
+  private async insertDraftUpdate(
+    specId: string,
+    expectedSeq: bigint,
+    update: Uint8Array,
+    clientId: string | null,
+    effects: SpecUpdateEffects,
+    checkpoint?: SpecDocumentCheckpoint,
+    participantEpoch?: bigint,
+  ): Promise<bigint | null> {
     const changesDocument = effects.sections.some((section) => section.changed);
     if (changesDocument && !effects.at) {
       throw new Error("A visible spec update requires an injected timestamp.");
@@ -701,13 +831,44 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
                 updated_at = COALESCE($3::timestamptz, updated_at)
           WHERE id = $1
             AND current_doc_seq = $2
+            AND lifecycle = 'draft'
         RETURNING current_doc_seq`,
         [specId, expectedSeq.toString(), effects.at ?? null],
       );
       const nextSeq = revision.rows[0]?.current_doc_seq;
       if (nextSeq === undefined) {
+        const lifecycle = await client.query<{ lifecycle: string }>(
+          `SELECT lifecycle
+             FROM spec
+            WHERE id = $1
+            FOR UPDATE`,
+          [specId],
+        );
         await client.query("ROLLBACK");
+        if (lifecycle.rows[0]?.lifecycle === "published") {
+          throw new SpecDocumentReadOnlyError(specId);
+        }
         return null;
+      }
+      if (checkpoint) {
+        await client.query(
+          `INSERT INTO spec_checkpoint
+             (id, spec_id, state, state_vector, rendered_markdown, doc_seq,
+              label, author_user_id, reason, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [
+            checkpoint.id,
+            checkpoint.specId,
+            Buffer.from(checkpoint.state),
+            Buffer.from(checkpoint.stateVector),
+            checkpoint.renderedMarkdown,
+            checkpoint.docSeq.toString(),
+            checkpoint.label,
+            checkpoint.authorUserId,
+            checkpoint.reason,
+            checkpoint.createdAt,
+          ],
+        );
       }
       await client.query(
         `INSERT INTO spec_update_log (spec_id, seq, update, client_id)

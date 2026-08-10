@@ -11,6 +11,7 @@ import {
   proseMirrorDocument,
   SpecDocumentService,
   type CompactSnapshotInput,
+  type SpecDocumentCheckpoint,
   type SpecDocumentStore,
   type SpecSnapshotRecord,
   type SpecUpdateRecord,
@@ -49,6 +50,17 @@ class MemoryDocumentStore implements SpecDocumentStore {
     this.seq += 1n;
     this.updates.push({ seq: this.seq, update: update.slice(), clientId });
     return this.seq;
+  }
+
+  async insertCheckpointAndUpdateIfLatest(
+    specId: string,
+    expectedSeq: bigint,
+    _checkpoint: SpecDocumentCheckpoint,
+    update: Uint8Array,
+    clientId: string | null,
+    _effects: Parameters<SpecDocumentStore["insertUpdateIfLatest"]>[4],
+  ): Promise<bigint | null> {
+    return this.insertUpdateIfLatest(specId, expectedSeq, update, clientId);
   }
 
   async notifyUpdate(): Promise<void> {}

@@ -14,8 +14,12 @@ describe("CheckpointDiff", () => {
       />,
     );
 
-    const prose = container.querySelector('[data-diff-granularity="word"]');
-    const code = container.querySelector('[data-diff-granularity="line"]');
+    const prose = [...container.querySelectorAll('[data-diff-granularity="word"]')].find((node) =>
+      node.querySelector("del"),
+    );
+    const code = [...container.querySelectorAll('[data-diff-granularity="line"]')].find((node) =>
+      node.querySelector("del"),
+    );
     expect(prose).not.toBeNull();
     expect(code).not.toBeNull();
     expect(prose!.querySelector("del")?.textContent).toBe("fast");
@@ -23,5 +27,27 @@ describe("CheckpointDiff", () => {
     expect(code!.querySelector("del")?.textContent).toBe("const retries = 2;\n");
     expect(code!.querySelector("ins")?.textContent).toBe("const retries = 3;\n");
     expect(screen.getByLabelText("Checkpoint comparison")).toBeTruthy();
+  });
+
+  it("keeps later prose aligned when a code block is inserted", () => {
+    const before = "## Design\n\nKeep this paragraph.\n\nStable prose after the block.\n";
+    const after =
+      "## Design\n\nKeep this paragraph.\n\n```ts\nconst ready = true;\n```\n\nStable prose after the block.\n";
+    const { container } = render(<CheckpointDiff before={before} after={after} />);
+
+    const changes = [...container.querySelectorAll("ins, del")].map((node) => node.textContent);
+    expect(changes.join("\n")).toContain("const ready = true;");
+    expect(changes.join("\n")).not.toContain("Stable prose after the block.");
+  });
+
+  it("keeps later prose aligned when a code block is removed", () => {
+    const before =
+      "## Design\n\nKeep this paragraph.\n\n```ts\nconst legacy = true;\n```\n\nStable prose after the block.\n";
+    const after = "## Design\n\nKeep this paragraph.\n\nStable prose after the block.\n";
+    const { container } = render(<CheckpointDiff before={before} after={after} />);
+
+    const changes = [...container.querySelectorAll("ins, del")].map((node) => node.textContent);
+    expect(changes.join("\n")).toContain("const legacy = true;");
+    expect(changes.join("\n")).not.toContain("Stable prose after the block.");
   });
 });

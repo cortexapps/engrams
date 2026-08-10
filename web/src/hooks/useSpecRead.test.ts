@@ -7,6 +7,7 @@ afterEach(() => vi.unstubAllGlobals());
 describe("restoreSpecSection", () => {
   it("returns the new pre-restore checkpoint from a forward restore", async () => {
     const responseBody = {
+      applied: true,
       checkpoint: {
         id: "checkpoint-before-restore",
         label: "Before restore of context",
@@ -32,6 +33,7 @@ describe("restoreSpecSection", () => {
     const result = await restoreSpecSection("spec-1", "checkpoint-1", "context");
 
     expect(result).toEqual(responseBody);
+    if (!result.applied) throw new Error("The restore response must be applied");
     expect(result.checkpoint.reason).toBe("before_restore");
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/v1/specs/spec-1/restore",

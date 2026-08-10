@@ -68,6 +68,7 @@ async function listenForSpecSync(input: {
   awarenessBus?: SpecAwarenessBus;
   onWarning?: (message: string) => void;
   membershipError?: Error;
+  draft?: boolean;
 }) {
   const app = new Hono();
   const nodeWs = createNodeWebSocket({ app });
@@ -88,6 +89,7 @@ async function listenForSpecSync(input: {
       if (input.membershipError) throw input.membershipError;
       return input.member;
     },
+    resolveDraft: async () => input.draft ?? true,
     onWarning: input.onWarning,
   };
   const hub = new SpecSyncHub(deps);
@@ -193,6 +195,14 @@ describe("the spec sync UpgradeHook", () => {
 
   test("rejects a non-member with close code 4404", async () => {
     const port = await listenForSpecSync({ member: false });
+    const client = new WebSocketClient(
+      `ws://127.0.0.1:${port}/api/v1/specs/${SPEC_ONE}/sync?clientId=42`,
+    );
+    expect(await waitForClose(client)).toBe(4404);
+  });
+
+  test("rejects a published spec with the same not-found close code", async () => {
+    const port = await listenForSpecSync({ member: true, draft: false });
     const client = new WebSocketClient(
       `ws://127.0.0.1:${port}/api/v1/specs/${SPEC_ONE}/sync?clientId=42`,
     );

@@ -73,7 +73,7 @@ import { makeProductionAutomationScheduler } from "./automations/scheduler.ts";
 import { assertSweepPoliciesExhaustive } from "./sweep/policy.ts";
 import { makeSweepRuntime } from "./sweep/production.ts";
 import { getDb, getPool } from "./db/client.ts";
-import { resolveSpecMembership } from "./authz/resolve.ts";
+import { resolveDraftSpec, resolveSpecMembership } from "./authz/resolve.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
 import { makeReviewStore } from "./db/reviews.ts";
 import { makeReviewTargetHydrationStore } from "./db/review-target-hydration.ts";
@@ -83,14 +83,8 @@ import { PostgresSpecAwarenessBus, PostgresSpecParticipantStore } from "./specs/
 import { setSpecPresence, specPresence } from "./specs/presence.ts";
 import { PostgresOpenQuestionStore, OpenQuestionService } from "./specs/open-questions.ts";
 import { SpecQuestionDocument } from "./specs/question-document.ts";
-import {
-  PostgresSectionStateStore,
-  SectionStateService,
-} from "./specs/section-state-service.ts";
-import {
-  PostgresSpecToolMetadataStore,
-  SpecToolService,
-} from "./specs/tool-service.ts";
+import { PostgresSectionStateStore, SectionStateService } from "./specs/section-state-service.ts";
+import { PostgresSpecToolMetadataStore, SpecToolService } from "./specs/tool-service.ts";
 import { makeProfileStore } from "./db/profiles.ts";
 import { makeIntegrationConnectionStore } from "./db/integration-connections.ts";
 import { makeConnectorStore } from "./db/connectors.ts";
@@ -303,10 +297,7 @@ const server = buildServer(
         const sessionId = (request as { sessionId?: unknown }).sessionId;
         if (typeof sessionId !== "string") return;
         const response = await controlPlaneSessions.getSession({ sessionId });
-        await productionSpecProjection.preparePrompt(
-          sessionId,
-          response.session?.status ?? "",
-        );
+        await productionSpecProjection.preparePrompt(sessionId, response.session?.status ?? "");
       },
     });
   },
@@ -327,6 +318,7 @@ const server = buildServer(
         participants: specParticipants,
         awarenessBus: specAwarenessBus,
         resolveMembership: resolveSpecMembership,
+        resolveDraft: resolveDraftSpec,
       },
       specSyncHub,
     ),

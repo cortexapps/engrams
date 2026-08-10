@@ -16,6 +16,7 @@ import {
   proseMirrorDocument,
   SpecDocumentService,
   type CompactSnapshotInput,
+  type SpecDocumentCheckpoint,
   type SpecDocumentStore,
   type SpecSnapshotRecord,
   type SpecUpdateEffects,
@@ -37,11 +38,7 @@ import {
   type SectionStateTranscriptAction,
 } from "../section-state-service.ts";
 import type { SectionStateValue } from "../section-state.ts";
-import {
-  SpecToolService,
-  stableQuestionId,
-  type SpecToolMetadataStore,
-} from "../tool-service.ts";
+import { SpecToolService, stableQuestionId, type SpecToolMetadataStore } from "../tool-service.ts";
 
 const SPEC_ID = "00000000-0000-4000-8000-000000000135";
 const SESSION_ID = "00000000-0000-4000-8000-000000000136";
@@ -99,6 +96,17 @@ class MemoryDocumentStore implements SpecDocumentStore {
     this.clientIds.push(clientId);
     this.updates.push({ seq: this.seq, update: update.slice(), clientId });
     return this.seq;
+  }
+
+  async insertCheckpointAndUpdateIfLatest(
+    specId: string,
+    expectedSeq: bigint,
+    _checkpoint: SpecDocumentCheckpoint,
+    update: Uint8Array,
+    clientId: string | null,
+    effects: SpecUpdateEffects,
+  ): Promise<bigint | null> {
+    return this.insertUpdateIfLatest(specId, expectedSeq, update, clientId, effects);
   }
 
   async notifyUpdate(): Promise<void> {}
@@ -220,8 +228,11 @@ class MemoryMetadata implements SpecToolMetadataStore {
   }
 
   async concurrentEditorNames(_specId: string, actorUserId?: string): Promise<string[]> {
-    return [...new Set(this.editors.filter((editor) => editor.userId !== actorUserId).map((editor) => editor.name))]
-      .sort();
+    return [
+      ...new Set(
+        this.editors.filter((editor) => editor.userId !== actorUserId).map((editor) => editor.name),
+      ),
+    ].sort();
   }
 }
 
@@ -334,9 +345,7 @@ describe("production spec tool service", () => {
     });
 
     expect(drafted).toEqual({ applied: true, newRev: 1n, concurrentEditors: ["Sam"] });
-    const action = sectionStore.actions.get(
-      `agent-section-state:${SPEC_ID}:${SESSION_ID}:draft`,
-    );
+    const action = sectionStore.actions.get(`agent-section-state:${SPEC_ID}:${SESSION_ID}:draft`);
     expect(action?.deliveredAt).toBeNull();
     expect(action?.chip.provisional).toBe(false);
     await expect(
@@ -357,8 +366,14 @@ describe("production spec tool service", () => {
       question: "What is the retry limit?",
     };
 
-    expect(await service.addOpenQuestion(SPEC_ID, input)).toMatchObject({ applied: true, newRev: 2n });
-    expect(await service.addOpenQuestion(SPEC_ID, input)).toMatchObject({ applied: true, newRev: 2n });
+    expect(await service.addOpenQuestion(SPEC_ID, input)).toMatchObject({
+      applied: true,
+      newRev: 2n,
+    });
+    expect(await service.addOpenQuestion(SPEC_ID, input)).toMatchObject({
+      applied: true,
+      newRev: 2n,
+    });
     expect([...questionStore.rows.keys()]).toEqual([
       stableQuestionId(SPEC_ID, SESSION_ID, "question"),
     ]);
@@ -389,7 +404,10 @@ describe("production spec tool service", () => {
     };
     await service.addOpenQuestion(SPEC_ID, input);
     const id = stableQuestionId(SPEC_ID, SESSION_ID, "missing-marker");
-    await new SpecQuestionDocument(documents).removeQuestionMarker({ questionId: id, specId: SPEC_ID });
+    await new SpecQuestionDocument(documents).removeQuestionMarker({
+      questionId: id,
+      specId: SPEC_ID,
+    });
 
     expect(questionStore.rows.has(id)).toBe(true);
     await expect(service.addOpenQuestion(SPEC_ID, input)).rejects.toThrow("has no document marker");

@@ -122,9 +122,11 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
                     restore.mutate(
                       { checkpointId: first.data!.id, sectionId },
                       {
-                        onSuccess: ({ checkpoint }) => {
+                        onSuccess: ({ applied, checkpoint }) => {
                           setRestoreNotice(
-                            `Restored the section. Saved “${checkpoint.label}” as a new checkpoint.`,
+                            applied && checkpoint
+                              ? `Restored the section. Saved “${checkpoint.label}” as a new checkpoint.`
+                              : "The section already matches this checkpoint. No changes were made.",
                           );
                           setSelectedIds([]);
                         },

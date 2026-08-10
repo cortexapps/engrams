@@ -1,4 +1,4 @@
-import { screen } from "@testing-library/react";
+import { fireEvent, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { renderWithProviders } from "@/test-utils";
@@ -19,6 +19,15 @@ const pinned = {
   markdown: "## Context\n\nPinned content.\n",
   sections: [{ id: "context", title: "Context" }],
 };
+const older = {
+  ...pinned,
+  id: "checkpoint-0",
+  label: "Initial outline",
+  docSeq: "2",
+  createdAt: "2026-08-09T01:00:00.000Z",
+  markdown: "## Context\n\nInitial content.\n",
+};
+const restoreMutate = vi.fn();
 
 vi.mock("@/components/spec", () => ({
   LazySpecCanvas: ({ specId }: { specId: string }) => (
@@ -39,6 +48,14 @@ vi.mock("@/hooks/useSpecRead", () => ({
       },
       checkpoints: [
         {
+          id: older.id,
+          label: older.label,
+          author: { id: "member-1", name: "Ada" },
+          reason: older.reason,
+          docSeq: older.docSeq,
+          createdAt: older.createdAt,
+        },
+        {
           id: pinned.id,
           label: pinned.label,
           author: { id: "member-1", name: "Ada" },
@@ -53,15 +70,16 @@ vi.mock("@/hooks/useSpecRead", () => ({
     error: null,
   }),
   useSpecCheckpoint: (_specId: string, checkpointId: string | null) => ({
-    data: checkpointId ? pinned : undefined,
+    data: checkpointId === older.id ? older : checkpointId === pinned.id ? pinned : undefined,
     isPending: false,
   }),
-  useRestoreSpecSection: () => ({ mutate: vi.fn(), isPending: false }),
+  useRestoreSpecSection: () => ({ mutate: restoreMutate, isPending: false }),
 }));
 
 beforeEach(() => {
   view.lifecycle = "draft";
   view.sessionId = null;
+  restoreMutate.mockReset();
 });
 
 describe("SpecReadPage", () => {
@@ -81,5 +99,29 @@ describe("SpecReadPage", () => {
     expect(screen.getByText("Published spec")).toBeTruthy();
     expect(screen.getByText("Pinned")).toBeTruthy();
     expect(screen.queryByLabelText("Collaborative spec canvas")).toBeNull();
+  });
+
+  it("shows the owner session link for the spec owner", async () => {
+    view.sessionId = "session-1";
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    const link = await screen.findByRole("link", { name: "Open owner session" });
+    expect(link.getAttribute("href")).toBe("/sessions/session-1");
+  });
+
+  it("compares two checkpoints and restores one selected checkpoint section", async () => {
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Initial outline/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Ready to publish/ }));
+    expect(await screen.findByText("Checkpoint comparison")).toBeTruthy();
+    expect(screen.getByText("Initial outline → Ready to publish")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Initial outline/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Restore section" }));
+    expect(restoreMutate).toHaveBeenCalledWith(
+      { checkpointId: pinned.id, sectionId: "context" },
+      expect.any(Object),
+    );
   });
 });

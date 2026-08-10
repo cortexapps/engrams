@@ -22,17 +22,20 @@ import {
   PostgresSpecDocumentStore,
   proseMirrorDocument,
   SpecDocumentService,
+  SpecDocumentReadOnlyError,
   SpecDocumentRevisionConflictError,
   SpecDocumentTooLargeError,
   SpecParticipantLeaseStaleError,
   SPEC_UPDATE_SIZE_FACTOR,
   type CompactSnapshotInput,
+  type SpecDocumentCheckpoint,
   type SpecDocumentStore,
   type SpecSnapshotRecord,
   type SpecUpdateRecord,
   type SpecUpdateEffects,
 } from "../doc-service.ts";
 import {
+  PostgresSpecCheckpointStore,
   SpecCheckpointService,
   type SpecCheckpointRecord,
   type SpecCheckpointStore,
@@ -60,6 +63,8 @@ class MemoryDocumentStore implements SpecDocumentStore {
   dropNotifications = false;
   compactions = 0;
   lastEffects: SpecUpdateEffects | null = null;
+  draft = true;
+  checkpointSink: Map<string, SpecCheckpointRecord> | null = null;
 
   async readSnapshot(specId: string): Promise<SpecSnapshotRecord | null> {
     return this.snapshots.get(specId) ?? null;
@@ -77,6 +82,7 @@ class MemoryDocumentStore implements SpecDocumentStore {
     clientId: string | null,
     effects: SpecUpdateEffects,
   ): Promise<bigint | null> {
+    if (!this.draft) throw new SpecDocumentReadOnlyError(specId);
     if ((this.currentSeq.get(specId) ?? 0n) !== expectedSeq) return null;
     this.lastEffects = effects;
     const seq = (this.currentSeq.get(specId) ?? 0n) + 1n;
@@ -84,6 +90,26 @@ class MemoryDocumentStore implements SpecDocumentStore {
     const rows = this.updates.get(specId) ?? [];
     rows.push({ seq, update: update.slice(), clientId });
     this.updates.set(specId, rows);
+    return seq;
+  }
+
+  async insertCheckpointAndUpdateIfLatest(
+    specId: string,
+    expectedSeq: bigint,
+    checkpoint: SpecDocumentCheckpoint,
+    update: Uint8Array,
+    clientId: string | null,
+    effects: SpecUpdateEffects,
+  ): Promise<bigint | null> {
+    if (!this.draft) throw new SpecDocumentReadOnlyError(specId);
+    if ((this.currentSeq.get(specId) ?? 0n) !== expectedSeq) return null;
+    this.lastEffects = effects;
+    const seq = expectedSeq + 1n;
+    this.currentSeq.set(specId, seq);
+    const rows = this.updates.get(specId) ?? [];
+    rows.push({ seq, update: update.slice(), clientId });
+    this.updates.set(specId, rows);
+    this.checkpointSink?.set(checkpoint.id, checkpoint);
     return seq;
   }
 
@@ -501,6 +527,7 @@ describe("SpecDocumentService", () => {
   test("restore saves a checkpoint and applies a forward section edit", async () => {
     const documentStore = new MemoryDocumentStore();
     const checkpointStore = new MemoryCheckpointStore();
+    documentStore.checkpointSink = checkpointStore.checkpoints;
     const documents = await seededService(documentStore);
     const checkpoints = new SpecCheckpointService(documents, checkpointStore);
     await documents.applyUpdate(
@@ -519,11 +546,23 @@ describe("SpecDocumentService", () => {
     );
 
     const result = await checkpoints.restoreSection(SPEC_ID, old.id, "context");
+    if (!result.applied) throw new Error("The first restore must apply");
     const markdown = renderMarkdown(proseMirrorDocument((await documents.loadDoc(SPEC_ID)).doc));
     expect(markdown).toContain("old");
     expect(markdown).not.toContain("new");
     expect(result.update.seq).toBeGreaterThan(result.checkpointBeforeRestore.docSeq);
     expect(checkpointStore.checkpoints.size).toBe(2);
+
+    const updateCountBeforeRetry = documentStore.updates.get(SPEC_ID)?.length ?? 0;
+    const retry = await checkpoints.restoreSection(SPEC_ID, old.id, "context");
+    expect(retry).toEqual({
+      applied: false,
+      checkpointBeforeRestore: null,
+      update: null,
+      docSeq: result.update.seq,
+    });
+    expect(checkpointStore.checkpoints.size).toBe(2);
+    expect(documentStore.updates.get(SPEC_ID)).toHaveLength(updateCountBeforeRetry);
   });
 });
 
@@ -573,11 +612,13 @@ describe("SpecDocumentService with live Postgres", () => {
     await livePool.query("DELETE FROM spec_transcript_action WHERE spec_id = $1", [specId]);
     await livePool.query("DELETE FROM spec_section_state WHERE spec_id = $1", [specId]);
     await livePool.query("DELETE FROM spec_participant WHERE spec_id = $1", [specId]);
+    await livePool.query("DELETE FROM spec_checkpoint WHERE spec_id = $1", [specId]);
     await livePool.query("DELETE FROM spec_update_log WHERE spec_id = $1", [specId]);
     await livePool.query("DELETE FROM spec_snapshot WHERE spec_id = $1", [specId]);
     await livePool.query(
       `UPDATE spec
           SET current_doc_seq = 0,
+              lifecycle = 'draft',
               updated_at = CASE WHEN id = $1 THEN $3::timestamptz ELSE $4::timestamptz END
         WHERE id = ANY($2::uuid[])`,
       [specId, [specId, peerSpecId], initialUpdatedAt, peerUpdatedAt],
@@ -594,6 +635,115 @@ describe("SpecDocumentService with live Postgres", () => {
     await livePool.end();
     livePool = null;
   }, 15_000);
+
+  test.skipIf(!liveDbReachable)(
+    "a stale draft update cannot persist after publication",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
+      await documents.applyUpdate(specId, initialUpdate(), "seed");
+      const staleUpdate = clientInsert(
+        Y.encodeStateAsUpdate((await documents.loadDoc(specId)).doc),
+        0,
+        "stale draft edit",
+      );
+      await livePool.query("UPDATE spec SET lifecycle = 'published' WHERE id = $1", [specId]);
+
+      await expect(
+        documents.applyUpdate(specId, staleUpdate, "stale-client"),
+      ).rejects.toBeInstanceOf(SpecDocumentReadOnlyError);
+      const durable = await livePool.query<{ current_doc_seq: string; updates: string }>(
+        `SELECT current_doc_seq::text,
+                (SELECT count(*)::text FROM spec_update_log WHERE spec_id = $1) AS updates
+           FROM spec
+          WHERE id = $1`,
+        [specId],
+      );
+      expect(durable.rows[0]).toEqual({ current_doc_seq: "1", updates: "1" });
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
+    "a restore recovery checkpoint includes an interleaved edit",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const checkpointStore = new PostgresSpecCheckpointStore(livePool);
+      const seedDocuments = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
+      await seedDocuments.applyUpdate(specId, initialUpdate(), "seed");
+      await seedDocuments.applyUpdate(
+        specId,
+        clientInsert(Y.encodeStateAsUpdate((await seedDocuments.loadDoc(specId)).doc), 0, "old"),
+        "old-client",
+      );
+      const seedCheckpoints = new SpecCheckpointService(seedDocuments, checkpointStore);
+      const source = await seedCheckpoints.createCheckpoint(specId, {
+        reason: "run_completed",
+        label: "Old state",
+      });
+      await seedDocuments.applyUpdate(
+        specId,
+        clientInsert(
+          Y.encodeStateAsUpdate((await seedDocuments.loadDoc(specId)).doc),
+          0,
+          "current",
+        ),
+        "current-client",
+      );
+
+      let enterPersist = () => {};
+      const persistEntered = new Promise<void>((resolve) => {
+        enterPersist = resolve;
+      });
+      let releasePersist = () => {};
+      const persistReleased = new Promise<void>((resolve) => {
+        releasePersist = resolve;
+      });
+      let pauseOnce = true;
+      const restoringDocuments = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        beforeCheckpointPersist: async () => {
+          if (!pauseOnce) return;
+          pauseOnce = false;
+          enterPersist();
+          await persistReleased;
+        },
+      });
+      const concurrentDocuments = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
+      await restoringDocuments.loadDoc(specId);
+      await concurrentDocuments.loadDoc(specId);
+      const restoringCheckpoints = new SpecCheckpointService(restoringDocuments, checkpointStore);
+      const restore = restoringCheckpoints.restoreSection(specId, source.id, "context");
+      await persistEntered;
+
+      await concurrentDocuments.applyUpdate(
+        specId,
+        clientInsert(
+          Y.encodeStateAsUpdate((await concurrentDocuments.loadDoc(specId)).doc),
+          2,
+          "peer edit",
+        ),
+        "peer-client",
+      );
+      releasePersist();
+      const result = await restore;
+      if (!result.applied) throw new Error("The interleaved restore must apply");
+
+      const recoveryDoc = new Y.Doc();
+      Y.applyUpdate(recoveryDoc, result.checkpointBeforeRestore.state);
+      const recoveryMarkdown = renderMarkdown(proseMirrorDocument(recoveryDoc));
+      recoveryDoc.destroy();
+      expect(recoveryMarkdown).toContain("current");
+      expect(recoveryMarkdown).toContain("peer edit");
+      expect(result.checkpointBeforeRestore.docSeq).toBe(4n);
+      expect(result.update.seq).toBe(5n);
+
+      const finalMarkdown = renderMarkdown(
+        proseMirrorDocument((await restoringDocuments.loadDoc(specId)).doc),
+      );
+      expect(finalMarkdown).toContain("old");
+      expect(finalMarkdown).toContain("peer edit");
+      expect(finalMarkdown).not.toContain("current");
+    },
+  );
 
   test.skipIf(!liveDbReachable)(
     "a human edit commits its update, drafted state, and transcript action atomically",

@@ -5,7 +5,7 @@ import * as awarenessProtocol from "y-protocols/awareness";
 import type * as Y from "yjs";
 
 import { SpecParticipantLeaseStaleError } from "../specs/doc-service.ts";
-import type { GetSession, ResolveSpecMembership } from "./guard.ts";
+import type { GetSession, ResolveDraftSpec, ResolveSpecMembership } from "./guard.ts";
 import { makeSpecMemberHeaderGuard } from "./guard.ts";
 import {
   awarenessClientIds,
@@ -82,6 +82,7 @@ export interface SpecSyncDeps {
   participants: SpecParticipantStore;
   awarenessBus: SpecAwarenessBus;
   resolveMembership: ResolveSpecMembership;
+  resolveDraft: ResolveDraftSpec;
   getSession?: GetSession;
   onWarning?: (message: string) => void;
   heartbeatIntervalMs?: number;
@@ -688,6 +689,9 @@ export function makeSpecSyncUpgradeHandler(
       const headers = requestHeaders(req);
       const authz = await guard(headers, parsed.specId);
       if (!authz.ok) return rejectUpgrade(wss, req, socket, head, authz.status);
+      if (!(await deps.resolveDraft(parsed.specId))) {
+        return rejectUpgrade(wss, req, socket, head, 404);
+      }
       const specId = parsed.specId;
       const clientId = parsed.clientId;
 

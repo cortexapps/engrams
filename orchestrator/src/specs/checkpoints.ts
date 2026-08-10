@@ -4,6 +4,7 @@ import type { Pool } from "pg";
 import * as Y from "yjs";
 import {
   proseMirrorDocument,
+  type SpecDocumentCheckpoint,
   type SpecDocumentService,
   type SpecUpdateRecord,
 } from "./doc-service.ts";
@@ -14,28 +15,25 @@ export interface CreateCheckpointOptions {
   authorUserId?: string | null;
 }
 
-export interface SpecCheckpointRecord {
-  id: string;
-  specId: string;
-  state: Uint8Array;
-  stateVector: Uint8Array;
-  renderedMarkdown: string;
-  docSeq: bigint;
-  label: string;
-  authorUserId: string | null;
-  reason: string;
-  createdAt: Date;
-}
+export interface SpecCheckpointRecord extends SpecDocumentCheckpoint {}
 
 export interface SpecCheckpointStore {
   insertCheckpoint(checkpoint: SpecCheckpointRecord): Promise<void>;
   readCheckpoint(specId: string, checkpointId: string): Promise<SpecCheckpointRecord | null>;
 }
 
-export interface RestoreSectionResult {
-  checkpointBeforeRestore: SpecCheckpointRecord;
-  update: SpecUpdateRecord;
-}
+export type RestoreSectionResult =
+  | {
+      applied: true;
+      checkpointBeforeRestore: SpecCheckpointRecord;
+      update: SpecUpdateRecord;
+    }
+  | {
+      applied: false;
+      checkpointBeforeRestore: null;
+      update: null;
+      docSeq: bigint;
+    };
 
 export class SpecCheckpointService {
   constructor(
@@ -74,23 +72,41 @@ export class SpecCheckpointService {
     if (!source) throw new Error(`Unknown spec checkpoint: ${checkpointId}`);
 
     const sourceDoc = new Y.Doc();
-    Y.applyUpdate(sourceDoc, source.state);
-    const restored = findSection(proseMirrorDocument(sourceDoc), sectionId);
-    if (!restored) throw new Error(`Checkpoint does not contain section: ${sectionId}`);
+    try {
+      Y.applyUpdate(sourceDoc, source.state);
+      const restored = findSection(proseMirrorDocument(sourceDoc), sectionId);
+      if (!restored) throw new Error(`Checkpoint does not contain section: ${sectionId}`);
 
-    // Restore is a forward edit. Save the current state first so this restore
-    // can itself be restored.
-    const checkpointBeforeRestore = await this.createCheckpoint(specId, {
-      reason: "before_restore",
-      label: `Before restore of ${sectionId}`,
-      authorUserId,
-    });
-    const update = await this.documents.mutateDocument(
-      specId,
-      `checkpoint:${checkpointId}`,
-      (current) => replaceSection(current, sectionId, restored.node),
-    );
-    return { checkpointBeforeRestore, update };
+      // The document store commits the recovery checkpoint and forward edit
+      // under the same spec-row lock. A concurrent edit either lands before
+      // both records or after both records.
+      const result = await this.documents.mutateDocumentWithCheckpoint(
+        specId,
+        `checkpoint:${checkpointId}`,
+        {
+          id: randomUUID(),
+          reason: "before_restore",
+          label: `Before restore of ${sectionId}`,
+          authorUserId,
+          createdAt: new Date(),
+        },
+        (current) => replaceSection(current, sectionId, restored.node),
+      );
+      return result.applied
+        ? {
+            applied: true,
+            checkpointBeforeRestore: result.checkpoint,
+            update: result.update,
+          }
+        : {
+            applied: false,
+            checkpointBeforeRestore: null,
+            update: null,
+            docSeq: result.currentSeq,
+          };
+    } finally {
+      sourceDoc.destroy();
+    }
   }
 }
 
@@ -131,10 +147,7 @@ export class PostgresSpecCheckpointStore implements SpecCheckpointStore {
     );
   }
 
-  async readCheckpoint(
-    specId: string,
-    checkpointId: string,
-  ): Promise<SpecCheckpointRecord | null> {
+  async readCheckpoint(specId: string, checkpointId: string): Promise<SpecCheckpointRecord | null> {
     const result = await this.pool.query<CheckpointRow>(
       `SELECT id, spec_id, state, state_vector, rendered_markdown, doc_seq,
               label, author_user_id, reason, created_at

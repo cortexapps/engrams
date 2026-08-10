@@ -38,9 +38,7 @@ const cache = new Map<string, CacheEntry>();
  * Look up which user owns the session (via task_session → task join).
  * Returns the owning task's `createdByUserId`, or null if not found.
  */
-export async function resolveSessionOwner(
-  sessionId: string,
-): Promise<string | null> {
+export async function resolveSessionOwner(sessionId: string): Promise<string | null> {
   const now = Date.now();
 
   // Check cache first.
@@ -84,6 +82,18 @@ export async function resolveSpecMembership(specId: string, userId: string): Pro
         eq(spec.orgId, config.deploymentId),
         or(eq(user.banned, false), isNull(user.banned)),
       ),
+    )
+    .limit(1);
+  return rows.length === 1;
+}
+
+/** Return true when the deployment owns the spec and it is still a draft. */
+export async function resolveDraftSpec(specId: string): Promise<boolean> {
+  const rows = await getDb()
+    .select({ id: spec.id })
+    .from(spec)
+    .where(
+      and(eq(spec.id, specId), eq(spec.orgId, config.deploymentId), eq(spec.lifecycle, "draft")),
     )
     .limit(1);
   return rows.length === 1;

@@ -2,10 +2,14 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createTemplateDocument, renderMarkdown, type SpecTemplate } from "@engrams/spec-document";
 import { Hono } from "hono";
 
-import { sessions as coordinatorSessions } from "../control-plane/client.ts";
+import * as coordinatorClients from "../control-plane/client.ts";
 import { makeSpecsRoute, type SpecReadRecord, type SpecReadStore } from "../routes/specs.ts";
-import { type SpecCheckpointRecord, type SpecCheckpointStore } from "../specs/checkpoints.ts";
-import { encodeProseMirrorDocument, type SpecUpdateRecord } from "../specs/doc-service.ts";
+import {
+  type RestoreSectionResult,
+  type SpecCheckpointRecord,
+  type SpecCheckpointStore,
+} from "../specs/checkpoints.ts";
+import { encodeProseMirrorDocument } from "../specs/doc-service.ts";
 
 const SPEC_ID = "00000000-0000-4000-8000-000000001114";
 const PINNED_ID = "00000000-0000-4000-8000-000000001115";
@@ -97,7 +101,7 @@ function testApp(input?: {
     checkpointId: string,
     sectionId: string,
     authorUserId?: string | null,
-  ) => Promise<{ checkpointBeforeRestore: SpecCheckpointRecord; update: SpecUpdateRecord }>;
+  ) => Promise<RestoreSectionResult>;
 }) {
   const app = new Hono();
   const readStore = input?.readStore ?? new MemoryReadStore();
@@ -118,9 +122,20 @@ function testApp(input?: {
 
 afterEach(() => mock.restore());
 
+function spyOnEveryCoordinatorMethod() {
+  const spies = Object.values(coordinatorClients).flatMap((client) => {
+    const target = client as Record<string, (...args: never[]) => unknown>;
+    return Object.keys(target)
+      .filter((name) => typeof target[name] === "function")
+      .map((name) => spyOn(target, name));
+  });
+  expect(spies.length).toBeGreaterThan(0);
+  return spies;
+}
+
 describe("spec read routes", () => {
   test("opening a published spec reads its pinned checkpoint without a coordinator call", async () => {
-    const coordinatorGetSession = spyOn(coordinatorSessions, "getSession");
+    const coordinatorSpies = spyOnEveryCoordinatorMethod();
     const { app } = testApp();
 
     const response = await app.request(`/api/v1/specs/${SPEC_ID}`);
@@ -156,7 +171,30 @@ describe("spec read routes", () => {
       label: "Clarify retry boundary",
       author: { name: "Ada" },
     });
-    expect(coordinatorGetSession).not.toHaveBeenCalled();
+    for (const coordinatorSpy of coordinatorSpies) expect(coordinatorSpy).not.toHaveBeenCalled();
+  });
+
+  test("opening a draft does not call any coordinator method", async () => {
+    const coordinatorSpies = spyOnEveryCoordinatorMethod();
+    const readStore = new MemoryReadStore();
+    readStore.record = {
+      ...readStore.record,
+      lifecycle: "draft",
+      publishedCheckpointId: null,
+      publishedAt: null,
+    };
+    const { app } = testApp({ readStore });
+
+    const response = await app.request(`/api/v1/specs/${SPEC_ID}`);
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      spec: { lifecycle: string; sessionId: string | null };
+      publishedCheckpoint: unknown;
+    };
+    expect(body.spec).toMatchObject({ lifecycle: "draft", sessionId: null });
+    expect(body.publishedCheckpoint).toBeNull();
+    for (const coordinatorSpy of coordinatorSpies) expect(coordinatorSpy).not.toHaveBeenCalled();
   });
 
   test("a draft restore creates a checkpoint and applies a forward edit", async () => {
@@ -182,6 +220,7 @@ describe("spec read routes", () => {
           authorUserId: "member-2",
         });
         return {
+          applied: true as const,
           checkpointBeforeRestore: beforeRestore,
           update: { seq: 3n, update: new Uint8Array(), clientId: `checkpoint:${PINNED_ID}` },
         };
@@ -197,9 +236,37 @@ describe("spec read routes", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({
+      applied: true,
       checkpoint: { id: CURRENT_ID, label: "Before restore of context" },
       newRev: "3",
     });
+    expect(restoreSection).toHaveBeenCalledTimes(1);
+  });
+
+  test("a repeated draft restore succeeds without a checkpoint or update", async () => {
+    const readStore = new MemoryReadStore();
+    readStore.record = {
+      ...readStore.record,
+      lifecycle: "draft",
+      publishedCheckpointId: null,
+      publishedAt: null,
+    };
+    const restoreSection = mock(async (): Promise<RestoreSectionResult> => ({
+      applied: false,
+      checkpointBeforeRestore: null,
+      update: null,
+      docSeq: 3n,
+    }));
+    const { app } = testApp({ readStore, restoreSection });
+
+    const response = await app.request(`/api/v1/specs/${SPEC_ID}/restore`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ checkpointId: PINNED_ID, sectionId: "context" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ applied: false, checkpoint: null, newRev: "3" });
     expect(restoreSection).toHaveBeenCalledTimes(1);
   });
 

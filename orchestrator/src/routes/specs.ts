@@ -220,8 +220,9 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
     }
 
     return c.json({
-      checkpoint: checkpointJson(result.checkpointBeforeRestore),
-      newRev: result.update.seq.toString(),
+      applied: result.applied,
+      checkpoint: result.applied ? checkpointJson(result.checkpointBeforeRestore) : null,
+      newRev: (result.applied ? result.update.seq : result.docSeq).toString(),
     });
   });
 
