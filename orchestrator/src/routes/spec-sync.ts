@@ -270,9 +270,10 @@ export class SpecSyncHub implements SpecPresence {
           socket.close(SUPERSEDED_CLOSE_CODE, "superseded by a newer connection");
           return;
         }
+        const superseded = this.detachSocket(room, currentSocket, false);
         this.runBackgroundTask(
-          `Disconnect superseded participant from spec ${specId}`,
-          this.disconnect(specId, room, currentSocket),
+          `Supersede participant connection for spec ${specId}`,
+          this.finishSupersession(specId, entry, room, superseded),
         );
         currentSocket.close(SUPERSEDED_CLOSE_CODE, "superseded by a newer connection");
       }
@@ -435,23 +436,60 @@ export class SpecSyncHub implements SpecPresence {
   }
 
   private async disconnect(specId: string, room: SpecRoom, socket: SpecSyncSocket): Promise<void> {
+    const participant = this.detachSocket(room, socket, true);
+    if (!participant) return;
+    const entry = this.rooms.get(specId);
+    try {
+      await this.deps.participants.disconnect(specId, participant.clientId, participant.epoch);
+    } finally {
+      if (entry) this.retireRoomIfIdle(specId, entry, room);
+    }
+  }
+
+  private detachSocket(
+    room: SpecRoom,
+    socket: SpecSyncSocket,
+    removeCurrentAwareness: boolean,
+  ): { clientId: string; epoch: bigint; awarenessUpdate?: Uint8Array } | null {
     room.socketHeartbeatStops.get(socket)?.();
     room.sockets.delete(socket);
     const clientId = room.socketClientIds.get(socket);
-    const participantEpoch = room.socketParticipantEpochs.get(socket);
+    const epoch = room.socketParticipantEpochs.get(socket);
     room.socketClientIds.delete(socket);
     room.socketParticipantEpochs.delete(socket);
-    const isCurrentSocket = clientId !== undefined && room.clientSockets.get(clientId) === socket;
-    if (isCurrentSocket) {
-      room.clientSockets.delete(clientId);
+    if (clientId === undefined || epoch === undefined) return null;
+
+    const isCurrentSocket = room.clientSockets.get(clientId) === socket;
+    if (!isCurrentSocket) return { clientId, epoch };
+    room.clientSockets.delete(clientId);
+    if (removeCurrentAwareness) {
       awarenessProtocol.removeAwarenessStates(room.awareness, [Number(clientId)], socket);
+      return { clientId, epoch };
     }
-    if (!clientId || participantEpoch === undefined) return;
-    const entry = this.rooms.get(specId);
+
+    const awarenessUpdate = room.awareness.getStates().has(Number(clientId))
+      ? awarenessProtocol.encodeAwarenessUpdate(room.awareness, [Number(clientId)])
+      : undefined;
+    return { clientId, epoch, awarenessUpdate };
+  }
+
+  private async finishSupersession(
+    specId: string,
+    entry: SpecRoomEntry,
+    room: SpecRoom,
+    participant: { clientId: string; epoch: bigint; awarenessUpdate?: Uint8Array } | null,
+  ): Promise<void> {
+    if (!participant) return;
     try {
-      await this.deps.participants.disconnect(specId, clientId, participantEpoch);
+      if (participant.awarenessUpdate) {
+        await this.deps.awarenessBus.publish(specId, participant.awarenessUpdate);
+      }
     } finally {
-      if (entry) this.retireRoomIfIdle(specId, entry, room);
+      try {
+        await this.deps.participants.disconnect(specId, participant.clientId, participant.epoch);
+      } finally {
+        this.retireRoomIfIdle(specId, entry, room);
+      }
     }
   }
 
@@ -476,9 +514,10 @@ export class SpecSyncHub implements SpecPresence {
     if (!socket) return;
     const socketEpoch = room.socketParticipantEpochs.get(socket);
     if (socketEpoch === undefined || socketEpoch >= epoch) return;
+    const superseded = this.detachSocket(room, socket, false);
     this.runBackgroundTask(
-      `Disconnect superseded participant from spec ${specId}`,
-      this.disconnect(specId, room, socket),
+      `Supersede participant connection for spec ${specId}`,
+      this.finishSupersession(specId, entry, room, superseded),
     );
     socket.close(SUPERSEDED_CLOSE_CODE, "superseded by a newer connection");
   }

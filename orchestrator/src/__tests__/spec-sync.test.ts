@@ -281,55 +281,98 @@ describe("the spec sync UpgradeHook", () => {
 
   test("supersedes an older same-client socket on another replica", async () => {
     const awareness = fakeAwarenessNetwork();
+    const timers = new ManualTimers();
     const oldSocket = new DeferredCloseSpecSocket();
     const newSocket = new SilentSpecSocket();
     const intendedSocket = new SilentSpecSocket();
+    const browserDoc = new Y.Doc();
+    browserDoc.clientID = 42;
+    const browserAwareness = new awarenessProtocol.Awareness(browserDoc);
+    browserAwareness.setLocalState({ cursor: { anchor: 4, head: 4 } });
     let epoch = 0n;
     let visibleEpoch: bigint | null = null;
     const readVisibleEpoch = (): bigint | null => visibleEpoch;
     const disconnects: bigint[] = [];
+    const renewals: bigint[] = [];
+    const appliedUpdates: number[] = [];
     const participants: SpecParticipantStore = {
       connect: async () => {
         epoch += 1n;
         visibleEpoch = epoch;
         return epoch;
       },
-      renew: async (_specId, _clientId, candidate) => visibleEpoch === candidate,
+      renew: async (_specId, _clientId, candidate) => {
+        renewals.push(candidate);
+        return visibleEpoch === candidate;
+      },
       disconnect: async (_specId, _clientId, candidate) => {
         disconnects.push(candidate);
         if (visibleEpoch === candidate) visibleEpoch = null;
       },
     };
     const oldHub = new SpecSyncHub({
-      documents: fakeDocuments(),
+      documents: {
+        loadDoc: async () => ({ doc: new Y.Doc() }),
+        applyUpdate: async (_specId, update) => {
+          appliedUpdates.push(update[0] ?? -1);
+        },
+        subscribe: () => () => {},
+        evict: () => {},
+      },
       participants,
       awarenessBus: awareness.replica(),
+      heartbeatIntervalMs: 10,
+      timers,
     });
     const newHub = new SpecSyncHub({
       documents: fakeDocuments(),
       participants,
       awarenessBus: awareness.replica(),
+      heartbeatIntervalMs: 10,
+      timers,
     });
     await oldHub.start();
     await newHub.start();
     cleanups.push(async () => {
       await oldHub.stop();
       await newHub.stop();
+      browserAwareness.destroy();
+      browserDoc.destroy();
     });
 
     await oldHub.connect(SPEC_SHARED, "42", { id: "member" }, oldSocket);
+    oldSocket.emit("message", encodeAwarenessState(browserAwareness), true);
     await newHub.connect(SPEC_SHARED, "42", { id: "member" }, newSocket);
     await eventually(() => oldSocket.closeCodes[0] === 4009);
+    await eventually(() => readAwarenessState(newSocket, 42)?.cursor?.anchor === 4);
+
+    expect(decodeSpecSyncMessage(newSocket.sent[0]!).kind).toBe("sync-step-1");
+    oldSocket.emit("message", encodeSyncUpdate(new Uint8Array([1])), true);
+    oldSocket.emit("pong");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(appliedUpdates).toEqual([]);
+    expect(renewals).toEqual([]);
+    oldSocket.finishClose();
+    expect(readAwarenessState(newSocket, 42)?.cursor).toEqual({ anchor: 4, head: 4 });
 
     newSocket.close();
     await eventually(() => disconnects.includes(2n));
     await oldHub.connect(SPEC_SHARED, "42", { id: "member" }, intendedSocket);
-    oldSocket.finishClose();
+    expect(intendedSocket.sent.map((message) => decodeSpecSyncMessage(message).kind)).toEqual([
+      "sync-step-1",
+    ]);
+    browserAwareness.setLocalStateField("cursor", { anchor: 8, head: 8 });
+    intendedSocket.emit("message", encodeAwarenessState(browserAwareness), true);
+    timers.tick();
+    intendedSocket.emit("pong");
 
     expect(oldSocket.closeCodes).toEqual([4009]);
     expect(disconnects).toEqual([1n, 2n]);
     expect(readVisibleEpoch()).toBe(3n);
     expect(intendedSocket.readyState).toBe(WebSocketClient.OPEN);
+    expect(readAwarenessState(intendedSocket, 42)?.cursor).toEqual({ anchor: 8, head: 8 });
+    await eventually(() => renewals.includes(3n));
+    expect(renewals).toEqual([3n]);
   });
 
   test("retires an empty room and reports a failed participant disconnect", async () => {
@@ -481,6 +524,10 @@ describe("the spec sync UpgradeHook", () => {
     const first = new DeferredCloseSpecSocket();
     const second = new SilentSpecSocket();
     const third = new SilentSpecSocket();
+    const browserDoc = new Y.Doc();
+    browserDoc.clientID = 42;
+    const browserAwareness = new awarenessProtocol.Awareness(browserDoc);
+    browserAwareness.setLocalState({ cursor: { anchor: 2, head: 2 } });
     const appliedUpdates: number[] = [];
     const renewals: bigint[] = [];
     const disconnects: bigint[] = [];
@@ -520,13 +567,26 @@ describe("the spec sync UpgradeHook", () => {
       heartbeatIntervalMs: 10,
       timers,
     });
-    cleanups.push(() => hub.stop());
+    cleanups.push(async () => {
+      await hub.stop();
+      browserAwareness.destroy();
+      browserDoc.destroy();
+    });
 
     await hub.connect(SPEC_ONE, "42", { id: "member" }, first);
+    first.emit("message", encodeAwarenessState(browserAwareness), true);
     await hub.connect(SPEC_ONE, "42", { id: "member" }, second);
 
     expect(first.closeCodes).toEqual([4009]);
     expect(timers.size).toBe(1);
+    expect(second.sent.map((message) => decodeSpecSyncMessage(message).kind)).toEqual([
+      "sync-step-1",
+      "awareness",
+    ]);
+    expect(readAwarenessState(second, 42)).toMatchObject({
+      cursor: { anchor: 2, head: 2 },
+      user: { id: "member" },
+    });
     first.emit("message", encodeSyncUpdate(new Uint8Array([1])), true);
     second.emit("message", encodeSyncUpdate(new Uint8Array([2])), true);
     await eventually(() => appliedUpdates.length === 1);
@@ -536,7 +596,12 @@ describe("the spec sync UpgradeHook", () => {
     await eventually(() => disconnects.includes(2n));
     const thirdConnection = hub.connect(SPEC_ONE, "42", { id: "member" }, third);
     await thirdConnection;
+    expect(third.sent.map((message) => decodeSpecSyncMessage(message).kind)).toEqual([
+      "sync-step-1",
+    ]);
     finishSecondDisconnect();
+    browserAwareness.setLocalStateField("cursor", { anchor: 6, head: 6 });
+    third.emit("message", encodeAwarenessState(browserAwareness), true);
     first.emit("pong");
     first.finishClose();
     timers.tick();
@@ -548,6 +613,7 @@ describe("the spec sync UpgradeHook", () => {
     expect(readVisibleEpoch()).toBe(3n);
     expect(timers.size).toBe(1);
     expect(third.pings).toBe(1);
+    expect(readAwarenessState(third, 42)?.cursor).toEqual({ anchor: 6, head: 6 });
   });
 
   test("retires a socket that emits an error", async () => {
@@ -758,8 +824,11 @@ class SilentSpecSocket extends EventEmitter {
   readyState: number = WebSocketClient.OPEN;
   pings = 0;
   terminations = 0;
+  readonly sent: Uint8Array[] = [];
 
-  send(_data: Uint8Array): void {}
+  send(data: Uint8Array): void {
+    this.sent.push(data.slice());
+  }
 
   ping(): void {
     this.pings += 1;
@@ -790,6 +859,30 @@ class DeferredCloseSpecSocket extends SilentSpecSocket {
     this.readyState = WebSocketClient.CLOSED;
     this.emit("close");
   }
+}
+
+function readAwarenessState(
+  socket: SilentSpecSocket,
+  clientId: number,
+): TestAwarenessState | undefined {
+  const doc = new Y.Doc();
+  const awareness = new awarenessProtocol.Awareness(doc);
+  awareness.setLocalState(null);
+  for (const frame of socket.sent) {
+    const message = decodeSpecSyncMessage(frame);
+    if (message.kind === "awareness") {
+      awarenessProtocol.applyAwarenessUpdate(awareness, message.update, "test");
+    }
+  }
+  const state = awareness.getStates().get(clientId);
+  awareness.destroy();
+  doc.destroy();
+  return state;
+}
+
+interface TestAwarenessState {
+  cursor?: { anchor?: number; head?: number };
+  user?: { id?: string; name?: string };
 }
 
 function fakeDocumentNetwork(): { replica(): SpecSyncDocuments } {
