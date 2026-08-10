@@ -10,7 +10,20 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $$
 BEGIN
-  NEW.lease_expires_at := 'infinity'::timestamptz;
+  IF NEW.disconnected_at IS NULL THEN
+    NEW.lease_expires_at := 'infinity'::timestamptz;
+    RETURN NEW;
+  END IF;
+
+  -- A legacy disconnect has no epoch predicate. Do not let it disconnect a
+  -- row after a current writer has minted an epoch for the replacement socket.
+  IF OLD.connection_epoch > 0
+    AND OLD.disconnected_at IS NULL
+    AND NEW.disconnected_at IS NOT NULL
+  THEN
+    RETURN OLD;
+  END IF;
+
   RETURN NEW;
 END;
 $$;
@@ -19,9 +32,16 @@ CREATE TRIGGER "spec_participant_legacy_lease_compat"
 BEFORE UPDATE OF "connected_at", "disconnected_at" ON "spec_participant"
 FOR EACH ROW
 WHEN (
-  NEW."disconnected_at" IS NULL
-  AND NEW."connection_epoch" = OLD."connection_epoch"
+  NEW."connection_epoch" = OLD."connection_epoch"
   AND NEW."lease_expires_at" = OLD."lease_expires_at"
+  AND (
+    NEW."disconnected_at" IS NULL
+    OR (
+      OLD."connection_epoch" > 0
+      AND OLD."disconnected_at" IS NULL
+      AND NEW."disconnected_at" IS NOT NULL
+    )
+  )
 )
 EXECUTE FUNCTION "spec_participant_legacy_lease_compat"();
 --> statement-breakpoint

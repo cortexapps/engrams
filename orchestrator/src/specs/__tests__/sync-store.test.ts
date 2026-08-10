@@ -10,7 +10,11 @@ import * as Y from "yjs";
 import * as schema from "../../db/schema.ts";
 import { PostgresSpecAwarenessBus } from "../sync-store.ts";
 import { PostgresSpecParticipantStore } from "../sync-store.ts";
-import { parseSpecChannelEnvelope, SPEC_CHANNEL_PAYLOAD_MAX_BYTES } from "../doc-service.ts";
+import {
+  parseSpecChannelEnvelope,
+  PostgresSpecDocumentStore,
+  SPEC_CHANNEL_PAYLOAD_MAX_BYTES,
+} from "../doc-service.ts";
 
 class FakeAwarenessClient extends EventEmitter {
   listenAttempts = 0;
@@ -263,6 +267,7 @@ describe("PostgresSpecParticipantStore", () => {
       const initialTime = new Date("2026-08-10T12:00:00.000Z");
       const reconnectTime = new Date("2026-08-10T12:02:00.000Z");
       const currentTime = new Date("2026-08-10T12:04:00.000Z");
+      let documentPool: Pool | null = null;
       try {
         await client.query(`CREATE SCHEMA ${quotedSchema}`);
         await client.query(`SET search_path TO ${quotedSchema}`);
@@ -277,6 +282,27 @@ describe("PostgresSpecParticipantStore", () => {
              lease_expires_at timestamptz NOT NULL,
              PRIMARY KEY (spec_id, client_id)
            )`,
+        );
+        await client.query(
+          `CREATE TABLE spec (
+             id uuid PRIMARY KEY,
+             current_doc_seq bigint DEFAULT 0 NOT NULL,
+             updated_at timestamptz NOT NULL
+           )`,
+        );
+        await client.query(
+          `CREATE TABLE spec_update_log (
+             spec_id uuid NOT NULL,
+             seq bigint NOT NULL,
+             update bytea NOT NULL,
+             client_id text,
+             PRIMARY KEY (spec_id, seq)
+           )`,
+        );
+        await client.query(
+          `INSERT INTO spec (id, current_doc_seq, updated_at)
+           VALUES ($1, 0, $2)`,
+          [specId, initialTime],
         );
         await client.query(
           `INSERT INTO spec_participant
@@ -308,6 +334,14 @@ describe("PostgresSpecParticipantStore", () => {
              WHERE spec_participant.user_id IS NULL
                 OR spec_participant.user_id = excluded.user_id`,
             [specId, clientId, userId, connectedAt],
+          );
+        };
+        const oldDisconnect = async (clientId: string, disconnectedAt: Date): Promise<void> => {
+          await client.query(
+            `UPDATE spec_participant
+                SET disconnected_at = $3
+              WHERE spec_id = $1 AND client_id = $2`,
+            [specId, clientId, disconnectedAt],
           );
         };
 
@@ -355,7 +389,50 @@ describe("PostgresSpecParticipantStore", () => {
         expect(newWriter.rows).toEqual([
           { connection_epoch: currentEpoch.toString(), finite_expiry: true },
         ]);
+
+        const protectedClientId = "legacy-connect-new-epoch";
+        await oldConnect(protectedClientId, initialTime);
+        now = reconnectTime;
+        const protectedEpoch = await participants.connect(specId, protectedClientId, userId);
+        await oldDisconnect(protectedClientId, currentTime);
+
+        now = currentTime;
+        expect(await participants.renew(specId, protectedClientId, protectedEpoch)).toBe(true);
+        documentPool = new Pool({
+          connectionString: DB_URL,
+          options: `-c search_path=${schemaName}`,
+        });
+        const documents = new PostgresSpecDocumentStore(documentPool);
+        expect(
+          await documents.insertUpdateIfLatest(
+            specId,
+            0n,
+            new Uint8Array([1]),
+            protectedClientId,
+            { sections: [] },
+            protectedEpoch,
+          ),
+        ).toBe(1n);
+        const protectedRow = await client.query<{
+          connection_epoch: string;
+          disconnected_at: Date | null;
+          lease_expires_at: Date;
+        }>(
+          `SELECT connection_epoch, disconnected_at, lease_expires_at
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = $2`,
+          [specId, protectedClientId],
+        );
+        expect(protectedEpoch).toBe(1n);
+        expect(protectedRow.rows).toEqual([
+          {
+            connection_epoch: protectedEpoch.toString(),
+            disconnected_at: null,
+            lease_expires_at: new Date(currentTime.getTime() + 60_000),
+          },
+        ]);
       } finally {
+        await documentPool?.end();
         await client.query("SET search_path TO public");
         await client.query(`DROP SCHEMA IF EXISTS ${quotedSchema} CASCADE`);
         client.release();
