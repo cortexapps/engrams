@@ -21,6 +21,10 @@ import { sessions } from "./client.ts";
 export const CURATED_KINDS: ReadonlySet<string> = new Set([
   "run_started",
   "run_completed",
+  "harness_idle",
+  "harness_parked",
+  "resumed",
+  "file_changed",
   "user_question",
   "question_answered",
   "tool_call_requested",

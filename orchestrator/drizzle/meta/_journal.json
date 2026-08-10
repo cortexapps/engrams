@@ -372,6 +372,13 @@
       "when": 1786302150768,
       "tag": "0052_spec_transcript_action",
       "breakpoints": true
+    },
+    {
+      "idx": 53,
+      "version": "7",
+      "when": 1786307332106,
+      "tag": "0053_spec_projection",
+      "breakpoints": true
     }
   ]
 }

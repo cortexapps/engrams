@@ -86,6 +86,7 @@ import { loadRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
 import { renderReviewer } from "./reviewers/render.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
+import { productionSpecProjection } from "./specs/projection.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
@@ -254,6 +255,15 @@ const server = buildServer(
     registerPassthrough(router, SURFACE, controlPlaneTransport, undefined, undefined, {
       "ImageService.DisableImage": makeDisableImageGuard(),
       "SessionService.CompleteToolCall": makeExternalToolCompletionGuard(),
+      "SessionService.SendPrompt": async (request) => {
+        const sessionId = (request as { sessionId?: unknown }).sessionId;
+        if (typeof sessionId !== "string") return;
+        const response = await controlPlaneSessions.getSession({ sessionId });
+        await productionSpecProjection.preparePrompt(
+          sessionId,
+          response.session?.status ?? "",
+        );
+      },
     });
   },
   // Pass the full NodeWebSocket handle so buildServer can install the
