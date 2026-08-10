@@ -1078,6 +1078,19 @@ pub trait SandboxBackend: Send + Sync {
         Vec::new()
     }
 
+    /// ADR 0115 D2: the aux bundle generations attached to each
+    /// running sandbox, from the backend's live view (post any
+    /// create-time stamp swap, and rebuilt from the persisted manifest
+    /// on pidfd-reattach — a survivor of a host-agent roll reports the
+    /// generations it really has open). The heartbeat forwards this so
+    /// the coordinator's `bundle_pin_set` covers sandboxes that exist
+    /// but have not snapshotted yet. Default empty: a backend that
+    /// keeps no attachment record (Process) reports nothing, which the
+    /// bundle GC's grace period tolerates.
+    async fn aux_bundles_all(&self) -> Vec<crate::types::sandbox::SandboxAuxBundles> {
+        Vec::new()
+    }
+
     /// ADR 0016 Phase B commit 4a — explicit admin trigger for the
     /// FlushScheduler's primitive. Forces an immediate
     /// `ChunkedDiskBackend::flush()` on `id` and, if any chunks were

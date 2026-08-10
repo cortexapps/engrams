@@ -67,9 +67,12 @@ N HEADs and at most one PUT per generation.
   side: an old host during a roll reports nothing, which is covered by
   the GC's 24 h grace.
 - The coordinator persists the report on the `hosts` row
-  (`sandbox_bundles jsonb`, following the `current_bundles` precedent)
-  and `bundle_pin_set` gains two legs: per-sandbox attachments and
-  current stamps, both over non-dead hosts.
+  (`sandbox_bundles jsonb`, migration 0113, following the
+  `current_bundles` precedent) and `bundle_pin_set` gains two legs:
+  per-sandbox attachments and current stamps, both over
+  `ready|draining` hosts. The backend surface is a new
+  `SandboxBackend::aux_bundles_all` (default empty; FC reads the live
+  spec, VZ reads `resolved_aux_ro_drives`, Process reports nothing).
 - Ordering: the heartbeat handler persists the report **before**
   computing `live_bundles` for the ack, so a freshly rolled host's first
   ack already protects its own reattached sandboxes from its own first

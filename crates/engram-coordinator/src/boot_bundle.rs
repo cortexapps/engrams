@@ -497,6 +497,7 @@ mod tests {
                     drive_id: "claude".into(),
                     sha256: sha256.into(),
                 }],
+                sandbox_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 4,
                 wire_version: 1,

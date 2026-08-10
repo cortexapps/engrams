@@ -161,6 +161,7 @@ pub async fn register(
         // a re-registering host must not clear an operator cordon.
         ready_images: Vec::new(),
         current_bundles: Vec::new(),
+        sandbox_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
         // Issue #229: register carries the host's wire version, but the
@@ -308,6 +309,13 @@ pub struct HeartbeatRequest {
     /// host MIG, so old hosts mid-roll simply report none.
     #[serde(default)]
     pub current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
+    /// ADR 0115 D2: aux bundle generations attached to each running
+    /// sandbox this tick. Persisted on the hosts row and unioned into
+    /// `bundle_pin_set` so a live-but-unsnapshotted sandbox pins its
+    /// generations. `#[serde(default)]` — an old host mid-roll reports
+    /// none; the bundle GC's grace period covers that window.
+    #[serde(default)]
+    pub sandbox_bundles: Vec<engram_core::types::sandbox::SandboxAuxBundles>,
     /// ADR 0028 Fix A: un-acked durable checkpoint records from this
     /// host. The handler reconciles each into PG (idempotent on
     /// snapshot_id) and acks the recorded ids — what makes "the
@@ -514,6 +522,7 @@ pub async fn heartbeat(
             .map(|d| d.as_str().to_string())
             .collect(),
         current_bundles: hb.current_bundles.clone(),
+        sandbox_bundles: hb.sandbox_bundles.clone(),
         total_vcpus: hb.total_vcpus,
         wire_version: hb.wire_version,
         stages_images: hb.stages_images,
@@ -646,6 +655,15 @@ pub async fn heartbeat(
     // is an instruction to sweep, so a PG failure here must fail the
     // heartbeat (the host retries next tick) rather than degrade to
     // "nothing is pinned".
+    //
+    // ADR 0115 D2 ordering invariant: this read runs strictly AFTER
+    // `touch_host_heartbeat` persisted THIS tick's `sandbox_bundles`
+    // (early-return on failure above), so a freshly rolled host's
+    // FIRST ack already pins its own reattached sandboxes'
+    // attachments — the ack drives the host's sweep, and this exact
+    // window (roll → reattach → first sweep before any pin existed)
+    // is what destroyed a running VM's only bundle copy on
+    // 2026-08-10. Do not move this read above the persist.
     let live_bundles = state.services.meta.bundle_pin_set().await.map_err(|e| {
         ApiError::Internal(format!(
             "bundle_pin_set failed; heartbeat ack withheld: {e}"
@@ -2183,6 +2201,7 @@ mod tests {
                 host_addr: Some(format!("http://10.0.0.{id}:9101")),
                 ready_images: ready.iter().map(|s| s.to_string()).collect(),
                 current_bundles: Vec::new(),
+                sandbox_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0, // 0 = not-yet-reported, tolerated

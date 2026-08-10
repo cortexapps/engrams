@@ -1527,6 +1527,7 @@ fn sim_heartbeat(faithful: bool) -> engram_core::types::host::HostHeartbeat {
         utilization: sim_utilization(),
         ready_images: sim_ready_images(faithful),
         current_bundles: Vec::new(),
+        sandbox_bundles: Vec::new(),
         total_vcpus: 16,
         wire_version: if faithful {
             engram_protocol::WIRE_VERSION
@@ -1575,6 +1576,7 @@ fn sim_host_record(
         host_addr: None,
         ready_images: sim_ready_images(faithful),
         current_bundles: Vec::new(),
+        sandbox_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 16,
         wire_version: if faithful {

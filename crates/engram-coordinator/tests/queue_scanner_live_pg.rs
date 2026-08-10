@@ -158,6 +158,7 @@ async fn seed_ready_host(
         host_addr: None,
         ready_images: Vec::new(),
         current_bundles: Vec::new(),
+        sandbox_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,
@@ -195,6 +196,7 @@ fn ready_heartbeat(
         },
         ready_images: ready_images.to_vec(),
         current_bundles: Vec::new(),
+        sandbox_bundles: Vec::new(),
         total_vcpus,
         // Issue #229: report the coordinator's wire version so the placement
         // filter keeps this seeded host schedulable.

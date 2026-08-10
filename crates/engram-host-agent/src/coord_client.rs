@@ -572,6 +572,13 @@ pub struct HeartbeatRequest {
     /// coord's bundle-GC pin set.
     #[serde(default)]
     pub current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
+    /// ADR 0115 D2: aux bundle generations attached to each RUNNING
+    /// sandbox this tick — the pin-set leg for sandboxes that exist
+    /// but have not snapshotted yet. `#[serde(default)]` for the same
+    /// roll-ordering reason as `current_bundles`; an old host reports
+    /// nothing, which the bundle GC's grace period covers.
+    #[serde(default)]
+    pub sandbox_bundles: Vec<engram_core::types::sandbox::SandboxAuxBundles>,
     /// ADR 0028 Fix A: un-acked durable checkpoint records — see
     /// [`engram_protocol::heartbeat::CheckpointAdvert`]. Re-advertised
     /// every heartbeat until the ack's `acked_checkpoints` clears
@@ -824,6 +831,13 @@ mod tests {
                 drive_id: "skills".into(),
                 sha256: "ff00".into(),
             }],
+            sandbox_bundles: vec![engram_core::types::sandbox::SandboxAuxBundles {
+                sandbox_id: engram_core::SandboxId::new(),
+                bundles: vec![engram_core::types::sandbox::AuxBundleRef {
+                    drive_id: "dyn_0".into(),
+                    sha256: "ab12".into(),
+                }],
+            }],
             utilization: Default::default(),
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,
@@ -836,6 +850,8 @@ mod tests {
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");
+        // ADR 0115 D2: the per-sandbox attachment leg rides the same wire.
+        assert_eq!(v["sandbox_bundles"][0]["bundles"][0]["sha256"], "ab12");
     }
 
     /// ADR 0084 P1b: the new capture-job HTTP-mirror fields must decode

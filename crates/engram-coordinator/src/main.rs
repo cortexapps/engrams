@@ -285,6 +285,10 @@ fn in_process_heartbeat(
         utilization: Default::default(),
         ready_images,
         current_bundles,
+        // ADR 0115 D2: the in-process (--mode=all) host never reports
+        // per-sandbox attachments; the Process backend keeps no
+        // attachment record.
+        sandbox_bundles: Vec::new(),
         total_vcpus: 0,
         wire_version: engram_protocol::WIRE_VERSION,
         stages_images: false,
@@ -571,6 +575,7 @@ async fn main() -> Result<(), CoordinatorError> {
             // below owns all scheduling state, including these catalogs.
             ready_images: Vec::new(),
             current_bundles: Vec::new(),
+            sandbox_bundles: Vec::new(),
             cordoned: false,
             total_vcpus: 0,
             // Issue #229: the in-process host runs this very binary, so it
@@ -786,6 +791,7 @@ mod tests {
             // heartbeat is the step that makes the catalogs schedulable.
             ready_images: ready_images.clone(),
             current_bundles: current_bundles.clone(),
+            sandbox_bundles: Vec::new(),
             cordoned: false,
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,

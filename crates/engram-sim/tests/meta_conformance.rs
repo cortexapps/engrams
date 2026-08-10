@@ -388,6 +388,7 @@ fn host_record(id: HostId, name: &str, now: chrono::DateTime<chrono::Utc>) -> Ho
         host_addr: None,
         ready_images: Vec::new(),
         current_bundles: Vec::new(),
+        sandbox_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 16,
         wire_version: 1,
@@ -409,6 +410,7 @@ fn heartbeat_fixture() -> HostHeartbeat {
         utilization: Default::default(),
         ready_images: Vec::new(),
         current_bundles: Vec::new(),
+        sandbox_bundles: Vec::new(),
         total_vcpus: 16,
         wire_version: 1,
         stages_images: false,
@@ -1774,6 +1776,7 @@ async fn host_lifecycle(ctx: &Ctx) {
         utilization: Default::default(),
         ready_images: Vec::new(),
         current_bundles: Vec::new(),
+        sandbox_bundles: Vec::new(),
         total_vcpus: 16,
         wire_version: 1,
         stages_images: false,
@@ -1797,6 +1800,7 @@ async fn host_lifecycle(ctx: &Ctx) {
         utilization: util,
         ready_images: Vec::new(),
         current_bundles: Vec::new(),
+        sandbox_bundles: Vec::new(),
         total_vcpus: 16,
         wire_version: 1,
         stages_images: false,
@@ -1812,6 +1816,60 @@ async fn host_lifecycle(ctx: &Ctx) {
         .expect("h2 active");
     assert_eq!(h2_row.utilization.committed_swap_mib, 12_288);
     assert_eq!(h2_row.utilization.disk_used_mib, 100_000);
+}
+
+/// ADR 0115 D2 (D4 conformance for `bundle_pin_set` + the
+/// `hosts.sandbox_bundles` column): the pin union covers snapshot rows
+/// ∪ live hosts' per-sandbox attachments ∪ live hosts' bake stamps,
+/// dedupes across legs, sorts by `(drive_id, sha256)`, and drops the
+/// host legs when the host dies. The sandbox-attachment leg is the
+/// 2026-08-10 chain_poisoned fix: a running-but-unsnapshotted
+/// sandbox's generations must pin against sweep + GC.
+async fn bundle_pin_set_union(ctx: &Ctx) {
+    use engram_core::types::sandbox::{AuxBundleRef, SandboxAuxBundles};
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    assert!(meta.bundle_pin_set().await.unwrap().is_empty());
+
+    let aux = |drive: &str, sha: &str| AuxBundleRef {
+        drive_id: drive.to_string(),
+        sha256: sha.to_string(),
+    };
+    let snap_pin = aux("skills", "aaa1");
+    let stamp_pin = aux("dyn_0", "bbb2");
+    let attach_pin = aux("browser", "ccc3");
+
+    // Snapshot leg.
+    let sid = meta.create_session(spec("conf:pins")).await.unwrap();
+    let s1 = SnapshotId::new();
+    let mut snap = snapshot(s1, sid, now, true);
+    snap.aux_bundles = vec![snap_pin.clone()];
+    assert!(meta.record_snapshot(snap).await.unwrap());
+
+    // Host legs: a live host's stamp + a RUNNING sandbox's attachments
+    // (which duplicate the snapshot pin to prove cross-leg dedup).
+    let h1 = HostId::new();
+    meta.upsert_host(host_record(h1, "conf-pins-h1", now))
+        .await
+        .unwrap();
+    let mut hb = heartbeat_fixture();
+    hb.current_bundles = vec![stamp_pin.clone()];
+    hb.sandbox_bundles = vec![SandboxAuxBundles {
+        sandbox_id: engram_core::SandboxId::new(),
+        bundles: vec![attach_pin.clone(), snap_pin.clone()],
+    }];
+    meta.touch_host_heartbeat(h1, hb).await.unwrap();
+
+    let pins = meta.bundle_pin_set().await.unwrap();
+    assert_eq!(
+        pins,
+        vec![attach_pin.clone(), stamp_pin.clone(), snap_pin.clone()],
+        "union of all three legs, deduped, sorted by (drive_id, sha256)"
+    );
+
+    // A dead host's legs drop out; the snapshot pin outlives it.
+    meta.set_host_status(h1, HostStatus::Dead).await.unwrap();
+    assert_eq!(meta.bundle_pin_set().await.unwrap(), vec![snap_pin]);
 }
 
 /// placement_no_fit_details: per-host fit verdicts with the shared
@@ -2953,6 +3011,7 @@ conformance!(t_outbox_flow, super::outbox_flow);
 conformance!(t_snapshot_durable_head, super::snapshot_durable_head);
 conformance!(t_gc_candidates, super::gc_candidates);
 conformance!(t_host_lifecycle, super::host_lifecycle);
+conformance!(t_bundle_pin_set_union, super::bundle_pin_set_union);
 conformance!(
     t_resident_sandboxes_rehydrate_list,
     super::resident_sandboxes_rehydrate_list

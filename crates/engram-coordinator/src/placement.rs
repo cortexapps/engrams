@@ -1360,6 +1360,7 @@ mod tests {
             host_addr: None,
             ready_images: Vec::new(),
             current_bundles: Vec::new(),
+            sandbox_bundles: Vec::new(),
             cordoned: false,
             total_vcpus: 0,
             // Issue #229: 0 = "not yet reported" → tolerated by the

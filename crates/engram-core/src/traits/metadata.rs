@@ -3223,8 +3223,12 @@ pub trait MetadataStore: Send + Sync {
     /// uploaded skill stays staged + survives GC) **∪ every live `harness_catalog`
     /// row** (ADR 0062, so a registered-but-currently-unused *custom* harness's
     /// squashfs stays staged — built-ins ride the host-image stamp and need no
-    /// pin). The union (plus the hosts' reported current generations) is what the
-    /// GC keeps and what heartbeat acks advertise as `live_bundles`.
+    /// pin) **∪ every live (ready|draining) host's per-sandbox attachments**
+    /// (ADR 0115 D2, so a running-but-unsnapshotted sandbox's generations
+    /// survive the host sweep and the GC — the 2026-08-10 chain_poisoned
+    /// gap) **∪ every live host's bake stamp** (`hosts.current_bundles`).
+    /// The union is what the GC keeps and what heartbeat acks advertise
+    /// as `live_bundles`.
     async fn bundle_pin_set(&self) -> Result<Vec<crate::types::sandbox::AuxBundleRef>, MetaError> {
         Ok(Vec::new())
     }

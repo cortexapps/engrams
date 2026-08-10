@@ -663,6 +663,7 @@ impl MetadataStore for SimMetadataStore {
                 fresh.utilization = Default::default();
                 fresh.ready_images = Vec::new();
                 fresh.current_bundles = Vec::new();
+                fresh.sandbox_bundles = Vec::new();
                 fresh.cordoned = false;
                 fresh.total_vcpus = 0;
                 fresh.wire_version = 0;
@@ -730,6 +731,7 @@ impl MetadataStore for SimMetadataStore {
         host.utilization = hb.utilization;
         host.ready_images = hb.ready_images;
         host.current_bundles = hb.current_bundles;
+        host.sandbox_bundles = hb.sandbox_bundles;
         host.total_vcpus = hb.total_vcpus;
         host.wire_version = hb.wire_version;
         host.stages_images = hb.stages_images;
@@ -3186,26 +3188,48 @@ impl MetadataStore for SimMetadataStore {
         panic!("SimMeta: begin_enable_job_prestage not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
-    /// The bundle-GC pin union: every snapshot's aux_bundles, plus the
-    /// (unmodeled) mount/harness catalogs — SimDb has no catalog tables
-    /// yet, so those unions are the empty set, faithfully matching a
-    /// catalog-less database.
+    /// The bundle-GC pin union: every snapshot's aux_bundles ∪ every
+    /// live (ready|draining) host's per-sandbox attachments (ADR 0115
+    /// D2) ∪ every live host's bake stamp, plus the (unmodeled)
+    /// mount/harness catalogs — SimDb has no catalog tables yet, so
+    /// those unions are the empty set, faithfully matching a
+    /// catalog-less database. Sorted by `(drive_id, sha256)` to match
+    /// PostgresStore's ordering.
     async fn bundle_pin_set(
         &self,
     ) -> Result<Vec<engram_core::types::sandbox::AuxBundleRef>, MetaError> {
         self.gate()?;
         let db = self.db.lock();
         let mut out: Vec<engram_core::types::sandbox::AuxBundleRef> = Vec::new();
+        let mut push = |b: &engram_core::types::sandbox::AuxBundleRef| {
+            if !out
+                .iter()
+                .any(|x| x.drive_id == b.drive_id && x.sha256 == b.sha256)
+            {
+                out.push(b.clone());
+            }
+        };
         for snap in db.snapshots.values() {
             for b in &snap.aux_bundles {
-                if !out
-                    .iter()
-                    .any(|x| x.drive_id == b.drive_id && x.sha256 == b.sha256)
-                {
-                    out.push(b.clone());
-                }
+                push(b);
             }
         }
+        for host in db
+            .hosts
+            .values()
+            .filter(|h| matches!(h.status, HostStatus::Ready | HostStatus::Draining))
+        {
+            for sb in &host.sandbox_bundles {
+                for b in &sb.bundles {
+                    push(b);
+                }
+            }
+            for b in &host.current_bundles {
+                push(b);
+            }
+        }
+        drop(db);
+        out.sort_by(|a, b| (&a.drive_id, &a.sha256).cmp(&(&b.drive_id, &b.sha256)));
         Ok(out)
     }
 

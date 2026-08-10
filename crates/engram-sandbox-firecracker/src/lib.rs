@@ -5685,6 +5685,38 @@ impl SandboxBackend for FirecrackerBackend {
         Ok(self.sandboxes.iter().map(|r| *r.key()).collect())
     }
 
+    /// ADR 0115 D2: report each live sandbox's attached generations
+    /// from its in-memory spec — which reflects any fresh-create swap
+    /// (ADR 0035 §3) and, for pidfd-reattached survivors, the persisted
+    /// manifest the restore rewrote. Same ref extraction the snapshot
+    /// pipeline pins into `snapshots.aux_bundles`.
+    async fn aux_bundles_all(&self) -> Vec<engram_core::types::sandbox::SandboxAuxBundles> {
+        self.sandboxes
+            .iter()
+            .filter_map(|entry| {
+                let bundles: Vec<AuxBundleRef> = entry
+                    .value()
+                    .state
+                    .spec
+                    .aux_ro_drives
+                    .iter()
+                    .filter_map(|d| {
+                        d.sha256.as_ref().map(|sha| AuxBundleRef {
+                            drive_id: d.drive_id.clone(),
+                            sha256: sha.clone(),
+                        })
+                    })
+                    .collect();
+                (!bundles.is_empty()).then(|| {
+                    engram_core::types::sandbox::SandboxAuxBundles {
+                        sandbox_id: *entry.key(),
+                        bundles,
+                    }
+                })
+            })
+            .collect()
+    }
+
     /// ADR 0068 probe-before-host_lost: overrides the trait default
     /// with an INDEPENDENT ground-truth check — the in-memory
     /// `self.sandboxes` map, or its heartbeat-carried mirror
