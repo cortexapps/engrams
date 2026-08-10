@@ -4,6 +4,7 @@ import { WebSocket, WebSocketServer, type RawData } from "ws";
 import * as awarenessProtocol from "y-protocols/awareness";
 import type * as Y from "yjs";
 
+import { SpecParticipantLeaseStaleError } from "../specs/doc-service.ts";
 import type { GetSession, ResolveSpecMembership } from "./guard.ts";
 import { makeSpecMemberHeaderGuard } from "./guard.ts";
 import {
@@ -29,7 +30,12 @@ export interface SpecDocumentUpdate {
 
 export interface SpecSyncDocuments {
   loadDoc(specId: string): Promise<{ doc: Y.Doc }>;
-  applyUpdate(specId: string, update: Uint8Array, clientId: string): Promise<unknown>;
+  applyUpdate(
+    specId: string,
+    update: Uint8Array,
+    clientId: string,
+    participantEpoch: bigint,
+  ): Promise<unknown>;
   subscribe(specId: string, listener: (event: SpecDocumentUpdate) => void): () => void;
   evict(specId: string): void;
 }
@@ -416,7 +422,21 @@ export class SpecSyncHub implements SpecPresence {
       return;
     }
     if (message.kind === "sync-update") {
-      await this.deps.documents.applyUpdate(specId, message.update, clientId);
+      const participantEpoch = room.socketParticipantEpochs.get(socket);
+      if (participantEpoch === undefined) return;
+      try {
+        await this.deps.documents.applyUpdate(
+          specId,
+          message.update,
+          clientId,
+          participantEpoch,
+        );
+      } catch (error) {
+        // The heartbeat closes a stale socket. The durable write fence rejects
+        // edits immediately while the cross-replica notification is only a wake.
+        if (error instanceof SpecParticipantLeaseStaleError) return;
+        throw error;
+      }
       return;
     }
     if (message.kind === "awareness-query") {
@@ -514,12 +534,7 @@ export class SpecSyncHub implements SpecPresence {
     if (!socket) return;
     const socketEpoch = room.socketParticipantEpochs.get(socket);
     if (socketEpoch === undefined || socketEpoch >= epoch) return;
-    const superseded = this.detachSocket(room, socket, false);
-    this.runBackgroundTask(
-      `Supersede participant connection for spec ${specId}`,
-      this.finishSupersession(specId, entry, room, superseded),
-    );
-    socket.close(SUPERSEDED_CLOSE_CODE, "superseded by a newer connection");
+    this.closeSupersededSocket(specId, entry, room, socket);
   }
 
   private async answerAwarenessQuery(specId: string): Promise<void> {
@@ -587,7 +602,24 @@ export class SpecSyncHub implements SpecPresence {
     participantEpoch: bigint,
   ): Promise<void> {
     const renewed = await this.deps.participants.renew(specId, clientId, participantEpoch);
-    if (!renewed && room.clientSockets.get(clientId) === socket) socket.terminate();
+    if (renewed || room.clientSockets.get(clientId) !== socket) return;
+    const entry = this.rooms.get(specId);
+    if (!entry) return;
+    this.closeSupersededSocket(specId, entry, room, socket);
+  }
+
+  private closeSupersededSocket(
+    specId: string,
+    entry: SpecRoomEntry,
+    room: SpecRoom,
+    socket: SpecSyncSocket,
+  ): void {
+    const superseded = this.detachSocket(room, socket, false);
+    this.runBackgroundTask(
+      `Supersede participant connection for spec ${specId}`,
+      this.finishSupersession(specId, entry, room, superseded),
+    );
+    socket.close(SUPERSEDED_CLOSE_CODE, "superseded by a newer connection");
   }
 
   private retireRoomIfIdle(specId: string, entry: SpecRoomEntry, room: SpecRoom): void {

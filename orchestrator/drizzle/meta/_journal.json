@@ -386,6 +386,13 @@
       "when": 1786346984168,
       "tag": "0054_spec_participant_lease",
       "breakpoints": true
+    },
+    {
+      "idx": 55,
+      "version": "7",
+      "when": 1786383460778,
+      "tag": "0055_spec_participant_rollout_contract",
+      "breakpoints": true
     }
   ]
 }

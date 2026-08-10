@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { readFile } from "node:fs/promises";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import * as awarenessProtocol from "y-protocols/awareness";
@@ -9,7 +10,11 @@ import * as Y from "yjs";
 import * as schema from "../../db/schema.ts";
 import { PostgresSpecAwarenessBus } from "../sync-store.ts";
 import { PostgresSpecParticipantStore } from "../sync-store.ts";
-import { parseSpecChannelEnvelope, SPEC_CHANNEL_PAYLOAD_MAX_BYTES } from "../doc-service.ts";
+import {
+  parseSpecChannelEnvelope,
+  PostgresSpecDocumentStore,
+  SPEC_CHANNEL_PAYLOAD_MAX_BYTES,
+} from "../doc-service.ts";
 
 class FakeAwarenessClient extends EventEmitter {
   listenAttempts = 0;
@@ -247,6 +252,307 @@ describe("PostgresSpecParticipantStore", () => {
       expect(result.rows).toEqual([
         { connection_epoch: liveEpoch.toString(), disconnected_at: null, active: true },
       ]);
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
+    "migration 0055 supports old SQL and explicit lease writers during rollout",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const client = await livePool.connect();
+      const schemaName = `lease_contract_${randomUUID().replaceAll("-", "")}`;
+      const quotedSchema = `"${schemaName}"`;
+      const specId = randomUUID();
+      const userId = `mixed-version-${randomUUID()}`;
+      const initialTime = new Date("2026-08-10T12:00:00.000Z");
+      const reconnectTime = new Date("2026-08-10T12:02:00.000Z");
+      const currentTime = new Date("2026-08-10T12:04:00.000Z");
+      let documentPool: Pool | null = null;
+      try {
+        await client.query(`CREATE SCHEMA ${quotedSchema}`);
+        await client.query(`SET search_path TO ${quotedSchema}`);
+        await client.query(
+          `CREATE TABLE spec_participant (
+             spec_id uuid NOT NULL,
+             client_id text NOT NULL,
+             user_id text,
+             connection_epoch bigint DEFAULT 0 NOT NULL,
+             connected_at timestamptz NOT NULL,
+             disconnected_at timestamptz,
+             lease_expires_at timestamptz NOT NULL,
+             PRIMARY KEY (spec_id, client_id)
+           )`,
+        );
+        await client.query(
+          `CREATE TABLE spec (
+             id uuid PRIMARY KEY,
+             current_doc_seq bigint DEFAULT 0 NOT NULL,
+             updated_at timestamptz NOT NULL
+           )`,
+        );
+        await client.query(
+          `CREATE TABLE spec_update_log (
+             spec_id uuid NOT NULL,
+             seq bigint NOT NULL,
+             update bytea NOT NULL,
+             client_id text,
+             PRIMARY KEY (spec_id, seq)
+           )`,
+        );
+        await client.query(
+          `INSERT INTO spec (id, current_doc_seq, updated_at)
+           VALUES ($1, 0, $2)`,
+          [specId, initialTime],
+        );
+        await client.query(
+          `INSERT INTO spec_participant
+             (spec_id, client_id, user_id, connected_at, disconnected_at, lease_expires_at)
+           VALUES ($1, 'existing-old', $2, $3, NULL, $3)`,
+          [specId, userId, initialTime],
+        );
+
+        const migration = await readFile(
+          new URL("../../../drizzle/0055_spec_participant_rollout_contract.sql", import.meta.url),
+          "utf8",
+        );
+        for (const statement of migration
+          .split("--> statement-breakpoint")
+          .map((value) => value.trim())
+          .filter(Boolean)) {
+          await client.query(statement);
+        }
+
+        const oldConnect = async (clientId: string, connectedAt: Date): Promise<void> => {
+          await client.query(
+            `INSERT INTO spec_participant
+               (spec_id, client_id, user_id, connected_at, disconnected_at)
+             VALUES ($1, $2, $3, $4, NULL)
+             ON CONFLICT (spec_id, client_id) DO UPDATE
+             SET user_id = excluded.user_id,
+                 connected_at = excluded.connected_at,
+                 disconnected_at = NULL
+             WHERE spec_participant.user_id IS NULL
+                OR spec_participant.user_id = excluded.user_id`,
+            [specId, clientId, userId, connectedAt],
+          );
+        };
+        const oldDisconnect = async (clientId: string, disconnectedAt: Date): Promise<void> => {
+          await client.query(
+            `UPDATE spec_participant
+                SET disconnected_at = $3
+              WHERE spec_id = $1 AND client_id = $2`,
+            [specId, clientId, disconnectedAt],
+          );
+        };
+
+        await oldConnect("old-insert", initialTime);
+        const initialLegacyRows = await client.query<{ all_infinite: boolean }>(
+          `SELECT bool_and(lease_expires_at = 'infinity'::timestamptz) AS all_infinite
+             FROM spec_participant
+            WHERE client_id IN ('existing-old', 'old-insert')`,
+        );
+        expect(initialLegacyRows.rows).toEqual([{ all_infinite: true }]);
+
+        let now = initialTime;
+        const participants = new PostgresSpecParticipantStore(
+          drizzle(client, { schema }),
+          () => now,
+          60_000,
+        );
+        const firstNewEpoch = await participants.connect(specId, "mixed-client", userId);
+        await oldConnect("mixed-client", reconnectTime);
+        const oldUpsert = await client.query<{
+          connection_epoch: string;
+          connected_at: Date;
+          disconnected_at: Date | null;
+          lease_expires_at: Date;
+        }>(
+          `SELECT connection_epoch, connected_at, disconnected_at, lease_expires_at
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = 'mixed-client'`,
+          [specId],
+        );
+        expect(oldUpsert.rows).toEqual([
+          {
+            connection_epoch: firstNewEpoch.toString(),
+            connected_at: initialTime,
+            disconnected_at: null,
+            lease_expires_at: new Date(initialTime.getTime() + 60_000),
+          },
+        ]);
+
+        now = currentTime;
+        const currentEpoch = await participants.connect(specId, "mixed-client", userId);
+        expect(currentEpoch).toBe(firstNewEpoch + 1n);
+        expect(await participants.renew(specId, "mixed-client", currentEpoch)).toBe(true);
+        const newWriter = await client.query<{
+          connection_epoch: string;
+          finite_expiry: boolean;
+        }>(
+          `SELECT connection_epoch,
+                  lease_expires_at = $2::timestamptz AS finite_expiry
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = 'mixed-client'`,
+          [specId, new Date(currentTime.getTime() + 60_000)],
+        );
+        expect(newWriter.rows).toEqual([
+          { connection_epoch: currentEpoch.toString(), finite_expiry: true },
+        ]);
+
+        const equalExpiryClientId = "current-disconnect-at-expiry";
+        const equalExpiryConnectedAt = new Date("2026-08-10T12:06:00.000Z");
+        const equalExpiryDisconnectAt = new Date(equalExpiryConnectedAt.getTime() + 60_000);
+        now = equalExpiryConnectedAt;
+        const equalExpiryEpoch = await participants.connect(
+          specId,
+          equalExpiryClientId,
+          userId,
+        );
+        now = equalExpiryDisconnectAt;
+        await participants.disconnect(specId, equalExpiryClientId, equalExpiryEpoch);
+        const equalExpiryDisconnect = await client.query<{
+          connection_epoch: string;
+          disconnected_at: Date | null;
+          lease_is_tombstone: boolean;
+        }>(
+          `SELECT connection_epoch,
+                  disconnected_at,
+                  lease_expires_at = '-infinity'::timestamptz AS lease_is_tombstone
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = $2`,
+          [specId, equalExpiryClientId],
+        );
+        expect(equalExpiryDisconnect.rows).toEqual([
+          {
+            connection_epoch: equalExpiryEpoch.toString(),
+            disconnected_at: equalExpiryDisconnectAt,
+            lease_is_tombstone: true,
+          },
+        ]);
+
+        now = new Date(equalExpiryDisconnectAt.getTime() + 1_000);
+        const reconnectedEpoch = await participants.connect(specId, equalExpiryClientId, userId);
+        const reconnected = await client.query<{
+          connection_epoch: string;
+          disconnected_at: Date | null;
+          lease_expires_at: Date;
+        }>(
+          `SELECT connection_epoch, disconnected_at, lease_expires_at
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = $2`,
+          [specId, equalExpiryClientId],
+        );
+        expect(reconnectedEpoch).toBe(equalExpiryEpoch + 1n);
+        expect(reconnected.rows).toEqual([
+          {
+            connection_epoch: reconnectedEpoch.toString(),
+            disconnected_at: null,
+            lease_expires_at: new Date(now.getTime() + 60_000),
+          },
+        ]);
+
+        const protectedClientId = "legacy-connect-new-epoch";
+        await oldConnect(protectedClientId, initialTime);
+        now = reconnectTime;
+        const protectedEpoch = await participants.connect(specId, protectedClientId, userId);
+        await oldDisconnect(protectedClientId, currentTime);
+
+        now = currentTime;
+        expect(await participants.renew(specId, protectedClientId, protectedEpoch)).toBe(true);
+        documentPool = new Pool({
+          connectionString: DB_URL,
+          options: `-c search_path=${schemaName}`,
+        });
+        const documents = new PostgresSpecDocumentStore(documentPool);
+        expect(
+          await documents.insertUpdateIfLatest(
+            specId,
+            0n,
+            new Uint8Array([1]),
+            protectedClientId,
+            { sections: [] },
+            protectedEpoch,
+          ),
+        ).toBe(1n);
+        const protectedRow = await client.query<{
+          connection_epoch: string;
+          disconnected_at: Date | null;
+          lease_expires_at: Date;
+        }>(
+          `SELECT connection_epoch, disconnected_at, lease_expires_at
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = $2`,
+          [specId, protectedClientId],
+        );
+        expect(protectedEpoch).toBe(1n);
+        expect(protectedRow.rows).toEqual([
+          {
+            connection_epoch: protectedEpoch.toString(),
+            disconnected_at: null,
+            lease_expires_at: new Date(currentTime.getTime() + 60_000),
+          },
+        ]);
+
+        const legacyTakeoverClientId = "legacy-reconnect-disconnected-current";
+        const legacyReconnectTime = new Date(currentTime.getTime() + 1_000);
+        const legacyDisconnectTime = new Date(currentTime.getTime() + 2_000);
+        const disconnectedCurrentEpoch = await participants.connect(
+          specId,
+          legacyTakeoverClientId,
+          userId,
+        );
+        await participants.disconnect(specId, legacyTakeoverClientId, disconnectedCurrentEpoch);
+        await oldConnect(legacyTakeoverClientId, legacyReconnectTime);
+        const legacyTakeover = await client.query<{
+          connection_epoch: string;
+          connected_at: Date;
+          disconnected_at: Date | null;
+          lease_is_infinite: boolean;
+        }>(
+          `SELECT connection_epoch,
+                  connected_at,
+                  disconnected_at,
+                  lease_expires_at = 'infinity'::timestamptz AS lease_is_infinite
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = $2`,
+          [specId, legacyTakeoverClientId],
+        );
+        expect(legacyTakeover.rows).toEqual([
+          {
+            connection_epoch: "0",
+            connected_at: legacyReconnectTime,
+            disconnected_at: null,
+            lease_is_infinite: true,
+          },
+        ]);
+
+        await oldDisconnect(legacyTakeoverClientId, legacyDisconnectTime);
+        const closedLegacyTakeover = await client.query<{
+          connection_epoch: string;
+          disconnected_at: Date | null;
+          lease_is_infinite: boolean;
+        }>(
+          `SELECT connection_epoch,
+                  disconnected_at,
+                  lease_expires_at = 'infinity'::timestamptz AS lease_is_infinite
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = $2`,
+          [specId, legacyTakeoverClientId],
+        );
+        expect(closedLegacyTakeover.rows).toEqual([
+          {
+            connection_epoch: "0",
+            disconnected_at: legacyDisconnectTime,
+            lease_is_infinite: true,
+          },
+        ]);
+
+      } finally {
+        await documentPool?.end();
+        await client.query("SET search_path TO public");
+        await client.query(`DROP SCHEMA IF EXISTS ${quotedSchema} CASCADE`);
+        client.release();
+      }
     },
   );
 });

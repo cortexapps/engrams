@@ -22,6 +22,7 @@ import {
   encodeAwarenessState,
   encodeSyncUpdate,
 } from "../routes/spec-sync-protocol.ts";
+import { SpecParticipantLeaseStaleError } from "../specs/doc-service.ts";
 
 const cleanups: Array<() => void | Promise<void>> = [];
 const SPEC_ONE = "00000000-0000-4000-8000-000000000101";
@@ -375,6 +376,103 @@ describe("the spec sync UpgradeHook", () => {
     expect(renewals).toEqual([3n]);
   });
 
+  test("rejects a stale edit when the cross-replica participant notification is dropped", async () => {
+    const awareness = fakeAwarenessNetwork();
+    const timers = new ManualTimers();
+    const oldSocket = new DeferredCloseSpecSocket();
+    const observerSocket = new SilentSpecSocket();
+    const replacementSocket = new SilentSpecSocket();
+    const browserDoc = new Y.Doc();
+    browserDoc.clientID = 42;
+    const browserAwareness = new awarenessProtocol.Awareness(browserDoc);
+    browserAwareness.setLocalState({ cursor: { anchor: 4, head: 4 } });
+    const epochs = new Map<string, bigint>();
+    const disconnects: Array<[string, bigint]> = [];
+    const appliedUpdates: number[] = [];
+    let rejectedEdits = 0;
+    const participants: SpecParticipantStore = {
+      connect: async (_specId, clientId) => {
+        const epoch = (epochs.get(clientId) ?? 0n) + 1n;
+        epochs.set(clientId, epoch);
+        return epoch;
+      },
+      renew: async (_specId, clientId, epoch) => epochs.get(clientId) === epoch,
+      disconnect: async (_specId, clientId, epoch) => {
+        disconnects.push([clientId, epoch]);
+        if (epochs.get(clientId) === epoch) epochs.delete(clientId);
+      },
+    };
+    const oldHub = new SpecSyncHub({
+      documents: {
+        loadDoc: async () => ({ doc: new Y.Doc() }),
+        applyUpdate: async (_specId, update, clientId, epoch) => {
+          if (epochs.get(clientId) !== epoch) {
+            rejectedEdits += 1;
+            throw new SpecParticipantLeaseStaleError(SPEC_SHARED, clientId, epoch);
+          }
+          appliedUpdates.push(update[0] ?? -1);
+        },
+        subscribe: () => () => {},
+        evict: () => {},
+      },
+      participants,
+      awarenessBus: awareness.replica(),
+      heartbeatIntervalMs: 10,
+      timers,
+    });
+    const replacementHub = new SpecSyncHub({
+      documents: fakeDocuments(),
+      participants,
+      awarenessBus: awareness.replica(),
+      heartbeatIntervalMs: 10,
+      timers,
+    });
+    await oldHub.start();
+    await replacementHub.start();
+    cleanups.push(async () => {
+      await oldHub.stop();
+      await replacementHub.stop();
+      browserAwareness.destroy();
+      browserDoc.destroy();
+    });
+
+    await oldHub.connect(SPEC_SHARED, "42", { id: "member" }, oldSocket);
+    await oldHub.connect(SPEC_SHARED, "84", { id: "observer" }, observerSocket);
+    oldSocket.emit("message", encodeAwarenessState(browserAwareness), true);
+    await eventually(() => readAwarenessState(observerSocket, 42)?.cursor?.anchor === 4);
+
+    awareness.dropNextParticipantConnected();
+    await replacementHub.connect(
+      SPEC_SHARED,
+      "42",
+      { id: "member" },
+      replacementSocket,
+    );
+    browserAwareness.setLocalStateField("cursor", { anchor: 8, head: 8 });
+    replacementSocket.emit("message", encodeAwarenessState(browserAwareness), true);
+    await eventually(() => readAwarenessState(observerSocket, 42)?.cursor?.anchor === 8);
+
+    oldSocket.emit("message", encodeSyncUpdate(new Uint8Array([1])), true);
+    await eventually(() => rejectedEdits === 1);
+    expect(appliedUpdates).toEqual([]);
+    expect(oldSocket.closeCodes).toEqual([]);
+
+    timers.tick();
+    oldSocket.emit("pong");
+    await eventually(() => oldSocket.closeCodes[0] === 4009);
+    oldSocket.finishClose();
+    expect(readAwarenessState(observerSocket, 42)?.cursor).toEqual({ anchor: 8, head: 8 });
+
+    replacementSocket.close();
+    await eventually(() => readAwarenessState(observerSocket, 42) === undefined);
+    await eventually(
+      () =>
+        disconnects.some(([clientId, epoch]) => clientId === "42" && epoch === 1n) &&
+        disconnects.some(([clientId, epoch]) => clientId === "42" && epoch === 2n),
+    );
+    expect(epochs.get("42")).toBeUndefined();
+  });
+
   test("retires an empty room and reports a failed participant disconnect", async () => {
     let loads = 0;
     let unsubscribes = 0;
@@ -492,9 +590,9 @@ describe("the spec sync UpgradeHook", () => {
     expect(renewals).toEqual([[SPEC_ONE, "42", 7n]]);
   });
 
-  test("terminates a socket when its pong carries a stale participant epoch", async () => {
+  test("closes a socket when its pong carries a stale participant epoch", async () => {
     const timers = new ManualTimers();
-    const socket = new SilentSpecSocket();
+    const socket = new DeferredCloseSpecSocket();
     let disconnects = 0;
     const hub = new SpecSyncHub({
       documents: fakeDocuments(),
@@ -515,7 +613,8 @@ describe("the spec sync UpgradeHook", () => {
     timers.tick();
     socket.emit("pong");
 
-    await eventually(() => socket.terminations === 1 && disconnects === 1);
+    await eventually(() => socket.closeCodes[0] === 4009 && disconnects === 1);
+    socket.finishClose();
     expect(timers.size).toBe(0);
   });
 
@@ -915,13 +1014,20 @@ function fakeDocumentNetwork(): { replica(): SpecSyncDocuments } {
   };
 }
 
-function fakeAwarenessNetwork(): { replica(): SpecAwarenessBus } {
+function fakeAwarenessNetwork(): {
+  replica(): SpecAwarenessBus;
+  dropNextParticipantConnected(): void;
+} {
   const handlers = new Set<{
     update(specId: string, update: Uint8Array): void;
     query(specId: string): void;
     participantConnected(specId: string, clientId: string, epoch: bigint): void;
   }>();
+  let dropParticipantConnected = false;
   return {
+    dropNextParticipantConnected() {
+      dropParticipantConnected = true;
+    },
     replica() {
       let localHandlers:
         | {
@@ -945,6 +1051,10 @@ function fakeAwarenessNetwork(): { replica(): SpecAwarenessBus } {
           for (const handler of handlers) handler.query(specId);
         },
         publishParticipantConnected: async (specId, clientId, epoch) => {
+          if (dropParticipantConnected) {
+            dropParticipantConnected = false;
+            return;
+          }
           for (const handler of handlers) handler.participantConnected(specId, clientId, epoch);
         },
       };
