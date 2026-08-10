@@ -1,8 +1,11 @@
 export {
+  encodedSpecBlockCacheSize,
   isSpecBlockKind,
   readSpecBlockAttrs,
   semanticSpecNodeJson,
+  SPEC_BLOCK_CACHE_MAX_BYTES,
   SPEC_BLOCK_KINDS,
+  SPEC_BLOCK_RENDERER_REVISION,
   specBlockRegistration,
   specBlockRegistry,
   specNodesSemanticallyEqual,

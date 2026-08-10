@@ -2,7 +2,7 @@
 import http from "node:http";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { defineConfig, type Plugin } from "vite";
+import { defineConfig, transformWithOxc, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
@@ -43,6 +43,54 @@ function ghosttyWasmPlugin(): Plugin {
   };
 }
 
+function d2RuntimePlugin(): Plugin {
+  const assets = {
+    "/d2/d2-worker.js": {
+      source: async () =>
+        (
+          await transformWithOxc(
+            await readFile("src/components/spec/d2-worker.ts", "utf8"),
+            "src/components/spec/d2-worker.ts",
+          )
+        ).code,
+      type: "text/javascript; charset=utf-8",
+    },
+    "/d2/d2.wasm": {
+      source: () => readFile("node_modules/@terrastruct/d2/dist/node-esm/d2.wasm"),
+      type: "application/wasm",
+    },
+    "/d2/wasm_exec.js": {
+      source: () => readFile("node_modules/@terrastruct/d2/dist/node-esm/wasm_exec.js"),
+      type: "text/javascript; charset=utf-8",
+    },
+  } as const;
+  return {
+    name: "d2-runtime",
+    configureServer(server) {
+      for (const [route, asset] of Object.entries(assets)) {
+        server.middlewares.use(route, async (_req, res) => {
+          try {
+            res.setHeader("Content-Type", asset.type);
+            res.end(await asset.source());
+          } catch {
+            res.statusCode = 404;
+            res.end("not found");
+          }
+        });
+      }
+    },
+    async generateBundle() {
+      for (const [route, asset] of Object.entries(assets)) {
+        this.emitFile({
+          type: "asset",
+          fileName: route.slice(1),
+          source: await asset.source(),
+        });
+      }
+    },
+  };
+}
+
 // ADR 0051 Task 28: all browser traffic goes to the orchestrator (:8787).
 // The coordinator (:8090) is no longer a browser target. Its REST routes
 // remain live for engram-cli / integration scripts (Task 29) but the browser
@@ -70,7 +118,7 @@ const ORCHESTRATOR = process.env.ENGRAM_ORCHESTRATOR_URL ?? "http://127.0.0.1:87
 const proxyAgent = new http.Agent({ keepAlive: true });
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), ghosttyWasmPlugin()],
+  plugins: [react(), tailwindcss(), ghosttyWasmPlugin(), d2RuntimePlugin()],
   resolve: { alias: { "@": path.resolve(__dirname, "./src") } },
   build: {
     // Emit every asset as a real same-origin file rather than letting Vite's

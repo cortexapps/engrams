@@ -1,6 +1,9 @@
 import {
+  encodedSpecBlockCacheSize,
+  readSpecBlockAttrs,
   renderMarkdown,
   schema,
+  SPEC_BLOCK_CACHE_MAX_BYTES,
   SPEC_FRAGMENT_NAME,
   specNodesSemanticallyEqual,
   validateRequirementEdit,
@@ -9,10 +12,7 @@ import type { Node as ProseMirrorNode } from "prosemirror-model";
 import { prosemirrorToYXmlFragment, yXmlFragmentToProseMirrorRootNode } from "y-prosemirror";
 import * as Y from "yjs";
 import type { Pool, PoolClient } from "pg";
-import {
-  listenForSpecChannel,
-  type SpecChannelListenerOptions,
-} from "./channel-listener.ts";
+import { listenForSpecChannel, type SpecChannelListenerOptions } from "./channel-listener.ts";
 
 import { applyHumanSectionEdit, type SectionStateValue } from "./section-state.ts";
 import { humanEditRequestFingerprint } from "./section-state-service.ts";
@@ -77,9 +77,26 @@ export function parseSpecChannelEnvelope(payload: string): SpecChannelEnvelope |
 }
 
 export class SpecDocumentTooLargeError extends Error {
-  constructor(readonly renderedSizeBytes: number) {
-    super(`The spec document is ${renderedSizeBytes} bytes; the limit is ${SPEC_MAX_SIZE_BYTES}`);
+  constructor(
+    readonly renderedSizeBytes: number,
+    readonly representation = "rendered Markdown",
+  ) {
+    super(
+      `The spec document ${representation} is ${renderedSizeBytes} bytes; the limit is ${SPEC_MAX_SIZE_BYTES}`,
+    );
     this.name = "SpecDocumentTooLargeError";
+  }
+}
+
+export class SpecBlockCacheTooLargeError extends Error {
+  constructor(
+    readonly blockId: string,
+    readonly cacheSizeBytes: number,
+  ) {
+    super(
+      `The cached render for block ${blockId} is ${cacheSizeBytes} bytes; the limit is ${SPEC_BLOCK_CACHE_MAX_BYTES}`,
+    );
+    this.name = "SpecBlockCacheTooLargeError";
   }
 }
 
@@ -132,10 +149,7 @@ export interface SpecDocumentStore {
   ): Promise<bigint | null>;
   notifyUpdate(specId: string, seq: bigint): Promise<void>;
   compactSnapshot(input: CompactSnapshotInput): Promise<boolean>;
-  listen(
-    onWake: (specId: string) => void,
-    onReconnect?: () => void,
-  ): Promise<() => Promise<void>>;
+  listen(onWake: (specId: string) => void, onReconnect?: () => void): Promise<() => Promise<void>>;
 }
 
 export interface LoadedSpecDocument {
@@ -209,12 +223,9 @@ export class SpecDocumentService {
         this.warn(`Spec update sync failed for ${specId}: ${errorMessage(error)}`);
       });
     };
-    this.stopListening = await this.store.listen(
-      sync,
-      () => {
-        for (const specId of this.cache.keys()) sync(specId);
-      },
-    );
+    this.stopListening = await this.store.listen(sync, () => {
+      for (const specId of this.cache.keys()) sync(specId);
+    });
   }
 
   async stopPeerSync(): Promise<void> {
@@ -452,15 +463,21 @@ export class SpecDocumentService {
     update: Uint8Array,
     candidate: ProseMirrorNode,
   ): number {
-    const upperBound = room.renderedSizeUpperBound + estimatedRenderedGrowth(update);
-    if (
-      upperBound < SPEC_SOFT_SIZE_BYTES &&
-      room.doc.getXmlFragment(SPEC_FRAGMENT_NAME).length > 0
-    ) {
-      return upperBound;
-    }
-
     try {
+      validateCachedRenderSizes(candidate);
+      const encodedStateSize = Y.encodeStateAsUpdate(room.validationDoc).byteLength;
+      if (encodedStateSize > SPEC_MAX_SIZE_BYTES) {
+        throw new SpecDocumentTooLargeError(encodedStateSize, "encoded Yjs state");
+      }
+
+      const upperBound = room.renderedSizeUpperBound + estimatedRenderedGrowth(update);
+      if (
+        upperBound < SPEC_SOFT_SIZE_BYTES &&
+        room.doc.getXmlFragment(SPEC_FRAGMENT_NAME).length > 0
+      ) {
+        return upperBound;
+      }
+
       const size = this.measureRenderedSize(candidate);
       if (size > SPEC_MAX_SIZE_BYTES) throw new SpecDocumentTooLargeError(size);
       if (size > SPEC_SOFT_SIZE_BYTES) {
@@ -518,6 +535,18 @@ export class SpecDocumentService {
   }
 }
 
+function validateCachedRenderSizes(doc: ProseMirrorNode): void {
+  doc.descendants((node) => {
+    if (node.type !== schema.nodes.diagramBlock) return;
+    const block = readSpecBlockAttrs(node.attrs);
+    if (!block.cachedRender) return;
+    const cacheSize = encodedSpecBlockCacheSize(block.cachedRender);
+    if (cacheSize > SPEC_BLOCK_CACHE_MAX_BYTES) {
+      throw new SpecBlockCacheTooLargeError(block.id, cacheSize);
+    }
+  });
+}
+
 function compareSections(
   before: ProseMirrorNode | null,
   candidate: ProseMirrorNode,
@@ -533,8 +562,7 @@ function compareSections(
   return next.map((section, index) => ({
     id: section.id,
     title: section.title,
-    changed:
-      prior[index] == null || !specNodesSemanticallyEqual(prior[index].node, section.node),
+    changed: prior[index] == null || !specNodesSemanticallyEqual(prior[index].node, section.node),
   }));
 }
 
