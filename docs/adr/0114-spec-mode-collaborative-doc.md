@@ -1,8 +1,15 @@
 # ADR 0114: Spec mode — the collaborative document substrate
 
-Status: Proposed
+Status: Accepted (2026-08-10)
 
 Date: 2026-08-08
+
+Implementation record: PR #1134 (`1dc41974`) recorded the decision. PRs #1139
+(`b8f8cdda`), #1141 (`04eee868`), #1140 (`39249797`), #1143 (`2603b160`),
+and #1144 (`557f877d`) implemented D1-D12 in dependency order. Before
+acceptance, PR #1143 changed D8-D9 to use a static, harness-neutral system
+instruction. The server remains the source of truth and repairs direct edits,
+but turn-start freshness now depends on agent compliance with the instruction.
 
 **Related:** ADR 0113 (the `WriteFile`/`ReadFile` substrate this projection is
 built on, and the `coordination_operation` idempotency ledger it copies) · ADR
