@@ -49,15 +49,19 @@ describe("spec integrity stores with live Postgres", () => {
          ($4, 'Old editor', $4 || '@example.test', false, now(), now())`,
       userIds,
     );
+    const connectedAt = new Date("2026-08-09T12:00:00.000Z");
+    const activeLeaseExpiresAt = new Date("2100-01-01T00:00:00.000Z");
+    const disconnectedAt = new Date("2026-08-09T12:00:30.000Z");
     await pool.query(
       `INSERT INTO spec_participant
-         (spec_id, client_id, user_id, connected_at, disconnected_at)
+         (spec_id, client_id, user_id, connection_epoch, connected_at,
+          disconnected_at, lease_expires_at)
        VALUES
-         ($1, 'actor', $2, now(), NULL),
-         ($1, 'sam-1', $3, now(), NULL),
-         ($1, 'sam-2', $4, now(), NULL),
-         ($1, 'old', $5, now(), now())`,
-      [specId, ...userIds],
+         ($1, 'actor', $2, 1, $6, NULL, $7),
+         ($1, 'sam-1', $3, 1, $6, NULL, $7),
+         ($1, 'sam-2', $4, 1, $6, NULL, $7),
+         ($1, 'old', $5, 1, $6, $8, $8)`,
+      [specId, ...userIds, connectedAt, activeLeaseExpiresAt, disconnectedAt],
     );
   });
 

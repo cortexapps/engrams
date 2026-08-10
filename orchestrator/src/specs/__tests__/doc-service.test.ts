@@ -577,10 +577,13 @@ describe("SpecDocumentService with live Postgres", () => {
     "a human edit commits its update, drafted state, and transcript action atomically",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
+      const connectedAt = new Date("2026-08-09T12:00:00.000Z");
+      const leaseExpiresAt = new Date("2100-01-01T00:00:00.000Z");
       await livePool.query(
-        `INSERT INTO spec_participant (spec_id, client_id, user_id, connected_at)
-         VALUES ($1, $2, $3, $4)`,
-        [specId, humanClientId, userId, new Date("2026-08-09T12:00:00.000Z")],
+        `INSERT INTO spec_participant
+           (spec_id, client_id, user_id, connection_epoch, connected_at, lease_expires_at)
+         VALUES ($1, $2, $3, 1, $4, $5)`,
+        [specId, humanClientId, userId, connectedAt, leaseExpiresAt],
       );
 
       const withoutClock = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
