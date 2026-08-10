@@ -248,7 +248,7 @@ flowchart LR
     blocks.push(
       schema.nodes.codeBlock!.create({ language: escaped }, schema.text(escaped)),
       schema.nodes.diagramBlock!.create({
-        blockId: "diagram-1",
+        id: "diagram-1",
         kind: "mermaid",
         source: escaped,
       }),

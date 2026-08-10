@@ -459,7 +459,12 @@ describe("production spec tool service", () => {
       if (!section) throw new Error("The context section is missing.");
       return new Transform(document).insert(
         section.position + section.node.nodeSize - 1,
-        schema.nodes.diagramBlock!.create({ blockId: "flow", kind: "mermaid", source: "old" }),
+        schema.nodes.diagramBlock!.create({
+          id: "flow",
+          kind: "mermaid",
+          source: "old",
+          cachedRender: { kind: "mermaid", source: "old", svg: "<svg />" },
+        }),
       ).doc;
     });
 
@@ -470,6 +475,9 @@ describe("production spec tool service", () => {
       source: "new",
     });
     expect(result).toMatchObject({ applied: true, newRev: 3n });
+    const updated = proseMirrorDocument((await documents.syncFromLog(SPEC_ID)).doc);
+    const block = findSection(updated, "context")?.node.lastChild;
+    expect(block?.attrs).toMatchObject({ id: "flow", source: "new", cachedRender: null });
     await expect(
       service.updateBlock(SPEC_ID, {
         ...context("wrong-block"),

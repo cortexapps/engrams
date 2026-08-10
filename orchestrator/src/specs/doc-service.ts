@@ -2,6 +2,7 @@ import {
   renderMarkdown,
   schema,
   SPEC_FRAGMENT_NAME,
+  specNodesSemanticallyEqual,
   validateRequirementEdit,
 } from "@engrams/spec-document";
 import type { Node as ProseMirrorNode } from "prosemirror-model";
@@ -669,7 +670,8 @@ function compareSections(
   return next.map((section, index) => ({
     id: section.id,
     title: section.title,
-    changed: prior[index] == null || !prior[index].node.eq(section.node),
+    changed:
+      prior[index] == null || !specNodesSemanticallyEqual(prior[index].node, section.node),
   }));
 }
 

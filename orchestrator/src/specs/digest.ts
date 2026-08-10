@@ -1,4 +1,5 @@
 import { and, asc, eq, gt, lte } from "drizzle-orm";
+import { semanticSpecNodeJson } from "@engrams/spec-document";
 import * as Y from "yjs";
 
 import { getDb } from "../db/client.ts";
@@ -32,7 +33,7 @@ function sectionFingerprints(doc: Y.Doc): Map<string, SectionFingerprint> {
   prosemirror.forEach((section) => {
     const id = String(section.attrs.id);
     const heading = section.firstChild?.textContent.trim() || id;
-    result.set(id, { id, title: heading, value: JSON.stringify(section.toJSON()) });
+    result.set(id, { id, title: heading, value: JSON.stringify(semanticSpecNodeJson(section)) });
   });
   return result;
 }
