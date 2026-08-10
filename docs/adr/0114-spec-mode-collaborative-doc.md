@@ -301,18 +301,18 @@ the digest, or immediately through `spec_read` if it asks. This one rule removes
 the whole class of races in which the server rewrites a file the agent is
 reading.
 
-### D8. Direct writes are refused, and the refusal is honest
+### D8. Direct writes are discarded, and the instruction is harness-neutral
 
-A `PreToolUse` hook denies `Write`, `Edit` and `MultiEdit` against the
-projection path, with a message that names `spec_update_section`. The same hook
-denies a `Bash` command whose text contains the path. Mode `0444` stops
-accidental writes that neither check sees.
+The base system prompt tells every harness that the projection is read-only and
+names the `spec_*` tools as the write path. Mode `0444` stops accidental writes.
+The canonical document never imports the projection, so a direct guest edit
+cannot overwrite a human edit.
 
-None of that is airtight — a determined shell command can still change the file.
-So the server samples the file's digest with a metadata-only `ReadFile` at the
-end of each turn: one round trip, no body transfer. If the digest differs from
-the published rev, the server republishes the canonical render and tells the
-agent, in the next digest, that its direct edit was discarded.
+A determined shell command can still change the file. The server therefore
+samples the file's digest with a metadata-only `ReadFile` at the end of each
+turn: one round trip, no body transfer. If the digest differs from the published
+rev, the server republishes the canonical render and tells the agent, in the
+next digest, that its direct edit was discarded.
 
 The alternative — parse the guest markdown and merge it back into the CRDT —
 needs a three-way merge, a conflict record and a rule for what happens when a
@@ -320,25 +320,20 @@ person edited the same paragraph. That machinery is the largest single piece of
 this feature, and the tool path (D6) already gives the agent a better channel.
 We do not build it. The cost is stated plainly to the agent instead of hidden.
 
-### D9. Human edits reach the agent through a prompt hook, not the prompt text
+### D9. Human edits reach the agent through the live tool and digest
 
 The digest is written to `/workspace/.engrams/spec/digest.md` with the
-projection. A `UserPromptSubmit` hook in the harness reads that file and emits
-it as turn context.
+projection. The harness-neutral base system prompt tells the agent to call
+`spec_read` at the start of every turn and to read the digest when it needs the
+per-author change summary. `spec_read` reads the orchestrator document, so a
+queued prompt does not depend on the age of the disk projection.
 
-Two reasons it is a hook and not text prepended to the prompt:
-
-- The prompt text is the transcript. The web renders it verbatim, so injected
-  context would appear as words the person did not write.
-- A queued prompt is consumed at a later turn boundary. A digest attached when
-  the prompt was sent would already be stale when the turn began, which breaks
-  N10 exactly where type-ahead is most common.
-
-The hook fires at the real consumption boundary, so the guarantee holds for
-queued prompts too.
-
-This is a harness change and needs a harness bundle republish. It is not a wire
-change: no new event, no new command, no agentd change.
+The instruction stays outside the user prompt text. The web therefore does not
+render injected words as if the person wrote them. This first implementation
+depends on agent instruction compliance. If product evidence shows that this is
+not strong enough for N10, a later ADR can add one generic turn-context
+capability for all harnesses. Spec mode does not add a vendor hook, wire event,
+command, or harness bundle change.
 
 ### D10. Checkpoints are the history model; publish pins one
 
@@ -465,8 +460,8 @@ One phase, one pull request.
   (D5), the org-membership guard (D12), and the editor with collaborative
   cursors and section structure enforcement, behind a flag.
 - **P3 — The agent's read path.** Render, publish by staging and rename (D7),
-  the refresh schedule, resume republish, the digest, and the two harness hooks
-  (D8, D9) with a bundle republish.
+  the refresh schedule, resume republish, the digest, the harness-neutral base
+  instruction, and drift repair (D8, D9).
 - **P4 — The agent's write path.** The `spec_*` registry entries and handlers
   (D6), post-mutation publish, agent presence (D11), section states.
 - **P5 — Checkpoints and publish.** Checkpoint triggers and labels,

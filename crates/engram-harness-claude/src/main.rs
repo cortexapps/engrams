@@ -1023,17 +1023,6 @@ mod adapter {
                 .and_then(|s| s.as_str())
                 .is_some_and(|m| m == "plan");
 
-            let tool_input = v
-                .get("tool_input")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let tracker = StateDir::from_env().claude_bash_cwd();
-            let cwd = tracked_bash_cwd(&tracker);
-            if let Some(reason) = projection_write_denial(tool_name, &tool_input, &cwd) {
-                print_deny(reason);
-                return std::process::ExitCode::SUCCESS;
-            }
-
             // Claude's own process-local cwd tracker has regressed across CLI
             // releases. Make the session cwd a harness guarantee by rewriting
             // Bash input through the same supported updatedInput surface used
@@ -1049,10 +1038,16 @@ mod adapter {
                     println!("{{}}");
                     return std::process::ExitCode::SUCCESS;
                 }
+                let tool_input = v
+                    .get("tool_input")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 // Same root as the harness that spawned claude (ADR 0054:
                 // claude inherits `ENGRAM_STATE_DIR`, this hook inherits it
                 // from claude), so a redirected state dir stays coherent
                 // across the process boundary.
+                let tracker = StateDir::from_env().claude_bash_cwd();
+                let cwd = tracked_bash_cwd(&tracker);
                 println!("{}", bash_allow_output(&tool_input, &cwd, &tracker));
                 return std::process::ExitCode::SUCCESS;
             }
@@ -1099,6 +1094,10 @@ mod adapter {
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
+            let tool_input = v
+                .get("tool_input")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             // Parse into the SHARED `Question` type so we keep `multi_select`
             // per question for denormalization (its `#[serde(rename)]` makes
             // this byte-faithful to claude's `tool_input.questions`).
@@ -1200,56 +1199,6 @@ mod adapter {
                 .collect();
             names.insert("AskUserQuestion".to_string());
             names
-        }
-
-        pub(crate) fn projection_write_denial(
-            tool_name: &str,
-            tool_input: &serde_json::Value,
-            cwd: &Path,
-        ) -> Option<&'static str> {
-            const REASON: &str =
-                "The spec projection is read-only. Use spec_update_section to change the document.";
-            if matches!(tool_name, "Write" | "Edit" | "MultiEdit")
-                && tool_input
-                    .get("file_path")
-                    .or_else(|| tool_input.get("filePath"))
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|path| {
-                        lexical_absolute(Path::new(path), cwd) == Path::new("/workspace/spec.md")
-                    })
-            {
-                return Some(REASON);
-            }
-            if tool_name == "Bash"
-                && tool_input
-                    .get("command")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|command| command.contains("/workspace/spec.md"))
-            {
-                return Some(REASON);
-            }
-            None
-        }
-
-        fn lexical_absolute(path: &Path, cwd: &Path) -> PathBuf {
-            let joined = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                cwd.join(path)
-            };
-            let mut normalized = PathBuf::new();
-            for component in joined.components() {
-                match component {
-                    std::path::Component::RootDir => normalized.push("/"),
-                    std::path::Component::CurDir => {}
-                    std::path::Component::ParentDir => {
-                        normalized.pop();
-                    }
-                    std::path::Component::Normal(value) => normalized.push(value),
-                    std::path::Component::Prefix(_) => return joined,
-                }
-            }
-            normalized
         }
 
         pub(super) fn tracked_bash_cwd(tracker: &Path) -> PathBuf {
@@ -1413,29 +1362,6 @@ mod adapter {
 
         fn questions_to_json(questions: &[Question]) -> serde_json::Value {
             serde_json::to_value(questions).unwrap_or(serde_json::Value::Null)
-        }
-    }
-
-    /// Claude adds stdout from UserPromptSubmit command hooks as context for
-    /// the turn it is about to consume. The digest stays outside the prompt
-    /// text and therefore outside the user transcript.
-    pub mod prompt_hook {
-        use std::path::Path;
-        use tokio::io::AsyncWriteExt;
-
-        const DIGEST_PATH: &str = "/workspace/.engrams/spec/digest.md";
-
-        pub async fn run() -> std::process::ExitCode {
-            if let Some(digest) = read_digest(Path::new(DIGEST_PATH)).await {
-                let mut stdout = tokio::io::stdout();
-                let _ = stdout.write_all(&digest).await;
-                let _ = stdout.flush().await;
-            }
-            std::process::ExitCode::SUCCESS
-        }
-
-        pub(crate) async fn read_digest(path: &Path) -> Option<Vec<u8>> {
-            tokio::fs::read(path).await.ok()
         }
     }
 
@@ -1946,9 +1872,6 @@ mod adapter {
                 "PreToolUse": [{
                     "matcher": "*",
                     "hooks": [{ "type": "command", "command": format!("{self_exe} hook-bridge") }]
-                }],
-                "UserPromptSubmit": [{
-                    "hooks": [{ "type": "command", "command": format!("{self_exe} prompt-hook") }]
                 }]
             }
         });
@@ -5791,13 +5714,6 @@ mod adapter {
                     .unwrap(),
                 "sid-state-dir"
             );
-            let settings: serde_json::Value =
-                serde_json::from_slice(&tokio::fs::read(state.claude_settings()).await.unwrap())
-                    .unwrap();
-            let prompt_hook = &settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"];
-            assert!(prompt_hook
-                .as_str()
-                .is_some_and(|command| command.ends_with(" prompt-hook")));
             let mut listed = Vec::new();
             let mut entries = tokio::fs::read_dir(state.root()).await.unwrap();
             while let Some(entry) = entries.next_entry().await.unwrap() {
@@ -5817,19 +5733,6 @@ mod adapter {
                 .expect("engine exits")
                 .expect("engine task does not panic");
             let _ = tokio::fs::remove_file(script).await;
-        }
-
-        #[tokio::test]
-        async fn prompt_hook_reads_the_digest_at_turn_consumption() {
-            let path =
-                std::env::temp_dir().join(format!("engram-spec-digest-{}", uuid::Uuid::new_v4()));
-            assert!(prompt_hook::read_digest(&path).await.is_none());
-            tokio::fs::write(&path, b"# changed\n").await.unwrap();
-            assert_eq!(
-                prompt_hook::read_digest(&path).await,
-                Some(b"# changed\n".to_vec())
-            );
-            tokio::fs::remove_file(path).await.unwrap();
         }
 
         /// A fake claude whose `init` carries a session id, so the engine
@@ -7210,47 +7113,6 @@ mod adapter {
                 output["hookSpecificOutput"]["permissionDecisionReason"],
                 "bridge unavailable"
             );
-        }
-
-        #[test]
-        fn projection_write_hook_denies_only_the_projection_path() {
-            let projection = serde_json::json!({"file_path": "/workspace/spec.md"});
-            let cwd = Path::new("/workspace");
-            for tool in ["Write", "Edit", "MultiEdit"] {
-                let reason = hook_bridge::projection_write_denial(tool, &projection, cwd)
-                    .expect("projection write is denied");
-                assert!(reason.contains("spec_update_section"));
-            }
-            assert!(hook_bridge::projection_write_denial(
-                "Bash",
-                &serde_json::json!({"command": "printf x > /workspace/spec.md"}),
-                cwd,
-            )
-            .is_some());
-
-            let other = serde_json::json!({"file_path": "/workspace/src/spec.md"});
-            for tool in ["Write", "Edit", "MultiEdit"] {
-                assert!(hook_bridge::projection_write_denial(tool, &other, cwd).is_none());
-            }
-            assert!(hook_bridge::projection_write_denial(
-                "Bash",
-                &serde_json::json!({"command": "printf x > /workspace/src/spec.md"}),
-                cwd,
-            )
-            .is_none());
-            assert!(hook_bridge::projection_write_denial("Read", &projection, cwd).is_none());
-            for path in [
-                "spec.md",
-                "/workspace/./spec.md",
-                "/workspace/tmp/../spec.md",
-            ] {
-                assert!(hook_bridge::projection_write_denial(
-                    "Write",
-                    &serde_json::json!({"file_path": path}),
-                    cwd,
-                )
-                .is_some());
-            }
         }
 
         #[test]
@@ -8726,9 +8588,6 @@ async fn main() -> std::process::ExitCode {
     // hook invocation never has, so a hook must bypass the parser entirely.
     if std::env::args().nth(1).as_deref() == Some("hook-bridge") {
         return adapter::hook_bridge::run().await;
-    }
-    if std::env::args().nth(1).as_deref() == Some("prompt-hook") {
-        return adapter::prompt_hook::run().await;
     }
     if std::env::args().nth(1).as_deref() == Some("mcp-bridge") {
         return adapter::mcp_bridge::run().await;

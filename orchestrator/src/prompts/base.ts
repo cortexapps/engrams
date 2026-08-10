@@ -8,9 +8,17 @@ import { PAPERCUT_SYSTEM_PROMPT } from "../tools/papercut-prompt.ts";
 export const WRITING_STYLE_SYSTEM_PROMPT = `## Writing style
 Adhere to ASD-STE100 (Simplified Technical English) in all communications, including written artifacts, code comments, and messages with the user.`;
 
+/** Spec mode uses the same instruction for every harness. The live read at the
+ *  start of each turn avoids stale disk projections after queued prompts. */
+export const SPEC_MODE_SYSTEM_PROMPT = `## Spec mode
+When /workspace/spec.md exists, the session has a collaborative spec. At the start of every turn, call spec_read before you reason about or change the spec. spec_read is the live source of truth. Read /workspace/.engrams/spec/digest.md when you need the human-change summary.
+
+Treat /workspace/spec.md as a read-only projection. Never edit it with file or shell tools. Use the spec_* tools for every spec change.`;
+
 /** Appended to EVERY session's `ENGRAM_APPEND_SYSTEM_PROMPT` (ADR 0060), after
  *  any trigger-specific prompt. Tests assert against this composed value. */
 export const BASE_SYSTEM_PROMPT = [
   WRITING_STYLE_SYSTEM_PROMPT,
+  SPEC_MODE_SYSTEM_PROMPT,
   PAPERCUT_SYSTEM_PROMPT,
 ].join("\n\n");
