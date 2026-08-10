@@ -67,22 +67,43 @@
   flex: 1;
 }
 
-.spec-history {
+.spec-rail-shell {
   position: sticky;
   top: 1rem;
-  width: min(23rem, 30vw);
+  width: min(27rem, 34vw);
   max-height: calc(100vh - 2rem);
-  overflow-y: auto;
+  overflow: hidden;
   border: 1px solid var(--spec-read-rule);
   border-radius: var(--radius);
-  padding: 1rem;
   background: var(--spec-read-sheet);
+}
+
+.spec-rail-shell [data-slot="tabs"] {
+  gap: 0;
+}
+
+.spec-rail-tabs {
+  width: 100%;
+  height: 2.75rem;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  padding: 0.3rem;
+  background: color-mix(in oklab, var(--muted) 55%, transparent);
+}
+
+.spec-rail-shell [data-slot="tabs-content"] {
+  max-height: calc(100vh - 4.85rem);
+  overflow-y: auto;
+}
+
+.spec-history {
+  padding-bottom: 0.75rem;
 }
 
 .spec-history-heading {
   align-items: flex-start;
   gap: 0.65rem;
-  padding: 0.25rem 0.25rem 0.9rem;
+  padding: 1rem 1rem 0.75rem;
 }
 
 .spec-history-heading h2 {
@@ -98,6 +119,7 @@
 .spec-history ol {
   display: grid;
   gap: 0.4rem;
+  padding: 0 0.75rem;
 }
 
 .spec-history li button {
@@ -157,6 +179,239 @@
   color: var(--spec-read-faded-ink);
   font-family: var(--font-mono);
   font-size: 0.7rem;
+}
+
+.spec-section-rail {
+  padding-bottom: 0.75rem;
+}
+
+.spec-completeness {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: end;
+  gap: 0.65rem 1rem;
+  border-bottom: 1px solid var(--border);
+  padding: 1rem;
+}
+
+.spec-completeness > div {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.spec-completeness strong {
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.spec-completeness span {
+  color: var(--muted-foreground);
+  font-size: 0.72rem;
+}
+
+.spec-completeness .spec-completeness-value {
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+.spec-completeness [data-slot="progress"] {
+  grid-column: 1 / -1;
+  height: 0.3rem;
+  background: color-mix(in oklab, var(--muted-foreground) 18%, transparent);
+}
+
+.spec-completeness [data-slot="progress-indicator"] {
+  background: var(--instrument-nominal);
+}
+
+.spec-layer-list {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.8rem 0.65rem 0;
+}
+
+.spec-layer > header {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: start;
+  gap: 0.55rem;
+  padding: 0.55rem 0.55rem 0.45rem;
+}
+
+.spec-layer-index,
+.spec-layer-count {
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  line-height: 1.35rem;
+}
+
+.spec-layer h3 {
+  font-size: 0.76rem;
+  font-weight: 750;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
+.spec-layer header p {
+  margin-top: 0.1rem;
+  color: var(--muted-foreground);
+  font-size: 0.69rem;
+  line-height: 1.35;
+}
+
+.spec-layer ol {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.spec-layer li {
+  position: relative;
+  border: 1px solid transparent;
+  border-radius: 0.55rem;
+  padding: 0.65rem;
+  background: color-mix(in oklab, var(--muted) 30%, transparent);
+}
+
+.spec-layer li.is-frontier {
+  border-color: color-mix(in oklab, var(--instrument-nominal) 52%, var(--border));
+  background: color-mix(in oklab, var(--instrument-nominal) 7%, var(--card));
+  box-shadow: inset 2px 0 0 var(--instrument-nominal);
+}
+
+.spec-section-row-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+}
+
+.spec-section-marker {
+  display: grid;
+  width: 1.35rem;
+  height: 1.35rem;
+  flex: 0 0 auto;
+  place-items: center;
+  color: var(--muted-foreground);
+}
+
+.spec-section-marker svg {
+  width: 0.9rem;
+  height: 0.9rem;
+}
+
+.spec-section-copy {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 0.4rem;
+}
+
+.spec-section-copy > div:first-child {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.spec-section-copy strong {
+  overflow: hidden;
+  font-size: 0.82rem;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spec-frontier-label {
+  color: color-mix(in oklab, var(--instrument-nominal) 70%, var(--foreground));
+  font-size: 0.63rem;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.spec-section-meta,
+.spec-section-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.spec-section-meta [data-slot="badge"] {
+  padding: 0.12rem 0.42rem;
+  font-size: 0.64rem;
+}
+
+.spec-state-chip.is-confirmed {
+  background: color-mix(in oklab, var(--instrument-nominal) 18%, var(--card));
+  color: color-mix(in oklab, var(--instrument-nominal) 68%, var(--foreground));
+}
+
+.spec-state-chip.is-empty {
+  color: var(--muted-foreground);
+}
+
+.spec-question-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.22rem;
+  color: var(--muted-foreground);
+  font-size: 0.67rem;
+}
+
+.spec-question-count svg {
+  width: 0.75rem;
+  height: 0.75rem;
+}
+
+.spec-section-actions {
+  margin: 0.45rem 0 0 1.9rem;
+}
+
+.spec-section-actions [data-slot="button"] {
+  height: 1.35rem;
+  padding: 0 0.35rem;
+  color: var(--muted-foreground);
+  font-size: 0.68rem;
+}
+
+.spec-section-actions [data-slot="button"]:hover {
+  color: var(--foreground);
+}
+
+.spec-action-pending {
+  color: var(--muted-foreground);
+  font-size: 0.67rem;
+}
+
+.spec-na-popover {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.spec-na-popover label {
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.spec-na-popover [data-slot="button"] {
+  justify-self: end;
+}
+
+.spec-action-transcript {
+  margin-bottom: 0.75rem;
+  border-left: 2px solid var(--instrument-nominal);
+  padding-left: 0.65rem;
+}
+
+.spec-action-error {
+  margin-bottom: 0.75rem;
+  border: 1px solid color-mix(in oklab, var(--destructive) 38%, var(--border));
+  border-radius: 0.5rem;
+  padding: 0.7rem 0.85rem;
+  color: var(--destructive);
+  font-size: 0.78rem;
 }
 
 .spec-checkpoint-card,
@@ -305,11 +560,15 @@
     flex-direction: column;
   }
 
-  .spec-history {
+  .spec-rail-shell {
     position: static;
     width: 100%;
     max-height: none;
     order: -1;
+  }
+
+  .spec-rail-shell [data-slot="tabs-content"] {
+    max-height: none;
   }
 }
 

@@ -39,7 +39,8 @@ export interface PersistSectionStateActionInput {
 
 export type PersistSectionStateActionResult =
   | { status: "stored" | "replayed"; action: SectionStateTranscriptAction }
-  | { status: "conflict" };
+  | { status: "conflict" }
+  | { status: "read_only" };
 
 export interface SectionStateStore {
   read(specId: string, sectionId: string): Promise<SectionStateValue>;
@@ -55,6 +56,13 @@ export class SectionStateConflictError extends Error {
   constructor(message = "The section state changed before this action was stored.") {
     super(message);
     this.name = "SectionStateConflictError";
+  }
+}
+
+export class SectionStateReadOnlyError extends Error {
+  constructor(message = "Published specs are read-only.") {
+    super(message);
+    this.name = "SectionStateReadOnlyError";
   }
 }
 
@@ -168,6 +176,32 @@ export class SectionStateService {
     return change;
   }
 
+  /** Store an undo for later transcript delivery without claiming delivery. */
+  async undoDeferred(input: {
+    actionId: string;
+    context: SectionStateContext;
+    undo: RestoreSectionStateUndo;
+    actorUserId: string;
+    expectedDocSeq?: bigint;
+  }): Promise<SectionStateChange> {
+    const change = await this.execute(
+      input.actionId,
+      fingerprint({
+        kind: "undo",
+        undo: input.undo,
+        actorUserId: input.actorUserId,
+        expectedDocSeq: input.expectedDocSeq?.toString() ?? null,
+      }),
+      input.context,
+      input.actorUserId,
+      input.expectedDocSeq,
+      (current) => applySectionStateUndo(current, input.undo, input.context),
+      false,
+    );
+    if (!change) throw new Error("A section undo did not change the state.");
+    return change;
+  }
+
   private async execute(
     actionId: string,
     requestFingerprint: string,
@@ -200,6 +234,7 @@ export class SectionStateService {
       at: this.options.now(),
     });
     if (result.status === "conflict") throw new SectionStateConflictError();
+    if (result.status === "read_only") throw new SectionStateReadOnlyError();
     this.assertActionContext(result.action, context, requestFingerprint);
     if (deliver) await this.deliver(result.action);
     return changeFromAction(result.action);
@@ -295,13 +330,17 @@ export class PostgresSectionStateStore implements SectionStateStore {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      const currentDocSeq = await lockSpec(client, input.specId);
+      const lockedSpec = await lockSpec(client, input.specId);
       const existing = await readActionWith(client, input.actionId);
       if (existing) {
         await client.query("COMMIT");
         return { status: "replayed", action: existing };
       }
-      if (input.expectedDocSeq !== undefined && currentDocSeq !== input.expectedDocSeq) {
+      if (lockedSpec.lifecycle !== "draft") {
+        await client.query("ROLLBACK");
+        return { status: "read_only" };
+      }
+      if (input.expectedDocSeq !== undefined && lockedSpec.currentDocSeq !== input.expectedDocSeq) {
         await client.query("ROLLBACK");
         return { status: "conflict" };
       }
@@ -316,6 +355,12 @@ export class PostgresSectionStateStore implements SectionStateStore {
         await client.query("ROLLBACK");
         return { status: "conflict" };
       }
+      await client.query(
+        `UPDATE spec
+            SET updated_at = $2
+          WHERE id = $1`,
+        [input.specId, input.at],
+      );
       await client.query(
         `INSERT INTO spec_section_state
            (spec_id, section_id, state, na_reason, confirmed_by, updated_at)
@@ -426,16 +471,22 @@ function sameState(left: SectionStateValue, right: SectionStateValue): boolean {
   return left.state === right.state && left.naReason === right.naReason;
 }
 
-async function lockSpec(client: PoolClient, specId: string): Promise<bigint> {
-  const result = await client.query<{ current_semantic_doc_seq: string }>(
-    `SELECT current_semantic_doc_seq::text AS current_semantic_doc_seq
+async function lockSpec(
+  client: PoolClient,
+  specId: string,
+): Promise<{ currentDocSeq: bigint; lifecycle: string }> {
+  const result = await client.query<{ current_semantic_doc_seq: string; lifecycle: string }>(
+    `SELECT current_semantic_doc_seq::text AS current_semantic_doc_seq, lifecycle
        FROM spec
       WHERE id = $1
       FOR UPDATE`,
     [specId],
   );
   if (result.rowCount !== 1) throw new Error("The spec does not exist.");
-  return BigInt(result.rows[0]!.current_semantic_doc_seq);
+  return {
+    currentDocSeq: BigInt(result.rows[0]!.current_semantic_doc_seq),
+    lifecycle: result.rows[0]!.lifecycle,
+  };
 }
 
 async function readActionWith(
