@@ -17,6 +17,7 @@
     "*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}": "oxfmt --no-error-on-unmatched-pattern"
   },
   "dependencies": {
+    "@engrams/spec-document": "file:../orchestrator/packages/spec-document",
     "@assistant-ui/react": "^0.15.4",
     "@assistant-ui/react-markdown": "^0.14.8",
     "@bufbuild/protobuf": "^2.13.0",

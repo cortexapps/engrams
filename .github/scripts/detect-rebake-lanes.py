@@ -227,7 +227,7 @@ CI_SELF_PATHS = [".github/workflows/ci.yml",
                  ".github/actions/",
                  ".github/scripts/detect-rebake-lanes.py"]
 PROTO_PATHS = ["crates/engram-protocol/proto/", "buf.gen.yaml"]
-WEB_PATHS = ["web/"]
+WEB_PATHS = ["web/", "orchestrator/packages/spec-document/"]
 # The Google credential denylist (ADR 0109) is one checked-in table shared by
 # the Rust egress proxy and the orchestrator's endpoint validator. It lives with
 # the proxy, so a cargo-closure change already runs the Rust lanes — this entry
@@ -490,7 +490,11 @@ def main():
         "host-operator": bake_all or bool(cc & hop_closure)
         or any_path(changed, ["docker/host-operator.Dockerfile", "Cargo.lock", "Cargo.toml"]),
         # Bun images: own sources, own Dockerfile, or the protos they codegen.
-        "web": bake_all or proto or any_path(changed, ["web/", "docker/web.Dockerfile"]),
+        "web": bake_all or proto or any_path(changed, [
+            "web/",
+            "orchestrator/packages/spec-document/",
+            "docker/web.Dockerfile",
+        ]),
         "orchestrator": bake_all or proto or any_path(changed, ["orchestrator/", "docker/orchestrator.Dockerfile"]),
     }
     # Stable matrix order; the bake job consumes this as `fromJSON`.

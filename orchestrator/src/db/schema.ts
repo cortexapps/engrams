@@ -220,6 +220,169 @@ export const coordinationOperation = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Collaborative spec documents (ADR 0114)
+// ---------------------------------------------------------------------------
+
+export interface SpecTemplateLayer {
+  key: string;
+  title: string;
+  description?: string;
+}
+
+export interface SpecTemplateSection {
+  key: string;
+  title: string;
+  layerKey: string;
+  guidance: string;
+  doneCriteria: string[];
+  required: boolean;
+  allowNa: boolean;
+}
+
+export const specTemplate = pgTable(
+  "spec_template",
+  {
+    id: uuid("id").primaryKey(),
+    orgId: text("org_id"), // null = built-in template
+    name: text("name").notNull(),
+    description: text("description"),
+    layers: jsonb("layers").$type<SpecTemplateLayer[]>().notNull(),
+    sections: jsonb("sections").$type<SpecTemplateSection[]>().notNull(),
+    stageFlags: jsonb("stage_flags").$type<Record<string, boolean>>().notNull().default({}),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [index("spec_template_org_idx").on(t.orgId)],
+);
+
+export const spec = pgTable(
+  "spec",
+  {
+    id: uuid("id").primaryKey(),
+    orgId: text("org_id").notNull(),
+    ownerUserId: text("owner_user_id").references(() => user.id, { onDelete: "set null" }),
+    sessionId: uuid("session_id"), // logical reference to the coordinator session
+    templateId: uuid("template_id")
+      .notNull()
+      .references(() => specTemplate.id),
+    title: text("title").notNull(),
+    lifecycle: text("lifecycle").notNull(), // 'draft' | 'published'
+    currentDocSeq: bigint("current_doc_seq", { mode: "bigint" })
+      .notNull()
+      .default(sql`0`),
+    publishedCheckpointId: uuid("published_checkpoint_id"),
+    publishedBy: text("published_by").references(() => user.id, { onDelete: "set null" }),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [
+    index("spec_org_updated_idx").on(t.orgId, t.updatedAt),
+    index("spec_owner_idx").on(t.ownerUserId),
+    index("spec_session_idx").on(t.sessionId),
+  ],
+);
+
+export const specUpdateLog = pgTable(
+  "spec_update_log",
+  {
+    seq: bigint("seq", { mode: "bigint" }).notNull(),
+    specId: uuid("spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    update: bytea("update").notNull(),
+    clientId: text("client_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.specId, t.seq] })],
+);
+
+export const specSnapshot = pgTable("spec_snapshot", {
+  specId: uuid("spec_id")
+    .primaryKey()
+    .references(() => spec.id, { onDelete: "cascade" }),
+  state: bytea("state").notNull(),
+  stateVector: bytea("state_vector").notNull(),
+  coveredSeq: bigint("covered_seq", { mode: "bigint" }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const specCheckpoint = pgTable(
+  "spec_checkpoint",
+  {
+    id: uuid("id").primaryKey(),
+    specId: uuid("spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    state: bytea("state").notNull(),
+    stateVector: bytea("state_vector").notNull(),
+    renderedMarkdown: text("rendered_markdown").notNull(),
+    docSeq: bigint("doc_seq", { mode: "bigint" }).notNull(),
+    label: text("label").notNull(),
+    authorUserId: text("author_user_id").references(() => user.id, { onDelete: "set null" }),
+    reason: text("reason").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("spec_checkpoint_spec_created_idx").on(t.specId, t.createdAt)],
+);
+
+export const specSectionState = pgTable(
+  "spec_section_state",
+  {
+    specId: uuid("spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    sectionId: text("section_id").notNull(),
+    state: text("state").notNull(),
+    naReason: text("na_reason"),
+    confirmedBy: text("confirmed_by").references(() => user.id, { onDelete: "set null" }),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [primaryKey({ columns: [t.specId, t.sectionId] })],
+);
+
+export const specOpenQuestion = pgTable(
+  "spec_open_question",
+  {
+    id: uuid("id").primaryKey(),
+    specId: uuid("spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    sectionId: text("section_id").notNull(),
+    text: text("text").notNull(),
+    openedBy: text("opened_by").references(() => user.id, { onDelete: "set null" }),
+    state: text("state").notNull(),
+    resolutionNote: text("resolution_note"),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("spec_open_question_spec_section_idx").on(t.specId, t.sectionId)],
+);
+
+export const specParticipant = pgTable(
+  "spec_participant",
+  {
+    specId: uuid("spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    clientId: text("client_id").notNull(),
+    userId: text("user_id").references(() => user.id, { onDelete: "set null" }),
+    connectedAt: timestamp("connected_at", { withTimezone: true }).notNull().defaultNow(),
+    disconnectedAt: timestamp("disconnected_at", { withTimezone: true }),
+  },
+  (t) => [primaryKey({ columns: [t.specId, t.clientId] })],
+);
+
+// ---------------------------------------------------------------------------
 // Papercuts
 // ---------------------------------------------------------------------------
 

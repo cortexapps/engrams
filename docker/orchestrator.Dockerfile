@@ -20,6 +20,7 @@ WORKDIR /app/orchestrator
 # builds); --production drops devDependencies (drizzle-kit, tsc, @types) — the
 # runtime runs the .ts entry directly via Bun, no build/transpile step.
 COPY orchestrator/package.json orchestrator/bun.lock ./
+COPY orchestrator/packages/spec-document ./packages/spec-document
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     bun install --frozen-lockfile --production
 

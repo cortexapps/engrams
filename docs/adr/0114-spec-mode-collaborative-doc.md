@@ -135,9 +135,9 @@ New tables, in the orchestrator schema:
 
 | Table | Holds |
 | --- | --- |
-| `spec` | one row per spec: title, template id, owner, lifecycle (`draft`/`published`), published checkpoint id |
+| `spec` | one row per spec: title, template id, owner, lifecycle (`draft`/`published`), published checkpoint id, current document revision |
 | `spec_template` | layers, sections (title, guidance, done criteria, required, n/a allowed), stage flags |
-| `spec_update_log` | append-only Yjs updates, `bigserial seq` |
+| `spec_update_log` | append-only Yjs updates, keyed by spec id and its dense revision |
 | `spec_snapshot` | compacted document state plus the `seq` it covers |
 | `spec_checkpoint` | pinned history: state, state vector, rendered markdown, label, author |
 | `spec_section_state` | per-section state and the reason for `n/a` |
@@ -172,15 +172,26 @@ streams: the conversation over SSE, and the document over this socket.
 
 The orchestrator runs two replicas. A spec room is **not** owned by one pod.
 
-On each document update from a client:
+Each `spec` row owns `current_doc_seq`, a dense per-spec committed revision. On
+each document update from a client:
 
-1. Insert the update into `spec_update_log`, which assigns `seq`.
-2. Broadcast to local sockets.
-3. `pg_notify('spec_update', '<spec_id>:<seq>')`.
+1. In one transaction, conditionally increment `current_doc_seq` from the
+   service's last applied revision and insert the update with that revision.
+2. If the comparison fails, apply the missing log tail and retry.
+3. Broadcast to local sockets.
+4. Send a typed update envelope through `pg_notify('spec_update', ...)`.
 
 A peer pod wakes on the notification and applies every row with
 `seq > last_applied`. The notification is a wake; the log is the truth. A missed
 notification costs latency, not correctness.
+
+The spec-row update serializes revision assignment and log insertion. A
+transaction rollback does not consume a revision, and revision N cannot commit
+before revision N-1. Thus `last_applied` is a committed watermark, not a raw
+Postgres sequence high-water mark. Compaction locks the same spec row, confirms
+that the candidate covers `current_doc_seq`, then writes the snapshot and
+deletes its covered tail in one transaction. It cannot delete an update that
+the snapshot did not apply.
 
 Persist before acknowledge is what makes N2 true: a pod that dies after
 acknowledging has already made the keystroke durable, and a pod that dies before

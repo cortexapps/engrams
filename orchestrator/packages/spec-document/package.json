@@ -1,0 +1,13 @@
+{
+  "name": "@engrams/spec-document",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "prosemirror-model": "^1.25.4",
+    "prosemirror-transform": "^1.10.5"
+  }
+}
