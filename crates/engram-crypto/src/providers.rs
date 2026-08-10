@@ -79,9 +79,7 @@ impl EnvVarKeyProvider {
 
     fn cipher(&self) -> aes_gcm::Aes256Gcm {
         use aes_gcm::KeyInit;
-        aes_gcm::Aes256Gcm::new(aes_gcm::Key::<aes_gcm::Aes256Gcm>::from_slice(
-            &self.key_bytes,
-        ))
+        aes_gcm::Aes256Gcm::new((&self.key_bytes).into())
     }
 }
 
@@ -96,7 +94,7 @@ impl MasterKeyProvider for EnvVarKeyProvider {
         OsRng.fill_bytes(&mut nonce);
         let cipher = self.cipher();
         let mut out = cipher
-            .encrypt(aes_gcm::Nonce::from_slice(&nonce), dek)
+            .encrypt((&nonce).into(), dek)
             .map_err(|_| CryptoError::Aead("wrap"))?;
         // Prepend nonce.
         let mut wrapped = Vec::with_capacity(12 + out.len());
@@ -108,17 +106,21 @@ impl MasterKeyProvider for EnvVarKeyProvider {
     async fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>, CryptoError> {
         use aes_gcm::aead::Aead;
 
-        if wrapped.len() < 12 + 16 {
-            // 12-byte nonce + at least the 16-byte GCM tag.
+        // 12-byte nonce + at least the 16-byte GCM tag. Splitting off a
+        // fixed-size chunk gives the nonce a compile-time length, so the
+        // cipher takes it without a fallible conversion.
+        let Some((nonce, ct)) = wrapped
+            .split_first_chunk::<12>()
+            .filter(|(_, ct)| ct.len() >= 16)
+        else {
             return Err(CryptoError::Provider(format!(
                 "wrapped DEK too short ({} bytes)",
                 wrapped.len()
             )));
-        }
-        let (nonce, ct) = wrapped.split_at(12);
+        };
         let cipher = self.cipher();
         cipher
-            .decrypt(aes_gcm::Nonce::from_slice(nonce), ct)
+            .decrypt(nonce.into(), ct)
             .map_err(|_| CryptoError::Aead("unwrap"))
     }
 

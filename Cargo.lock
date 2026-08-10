@@ -949,7 +949,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
- "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -7672,6 +7671,7 @@ dependencies = [
  "chrono",
  "crossbeam-utils",
  "crypto-common 0.1.7",
+ "crypto-common 0.2.2",
  "der",
  "deranged",
  "digest 0.10.7",
@@ -7689,6 +7689,7 @@ dependencies = [
  "futures-util",
  "generic-array",
  "getrandom 0.2.17",
+ "getrandom 0.4.2",
  "hashbrown 0.15.5",
  "hashbrown 0.16.1",
  "hyper",
