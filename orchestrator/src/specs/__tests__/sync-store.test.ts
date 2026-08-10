@@ -9,10 +9,7 @@ import * as Y from "yjs";
 import * as schema from "../../db/schema.ts";
 import { PostgresSpecAwarenessBus } from "../sync-store.ts";
 import { PostgresSpecParticipantStore } from "../sync-store.ts";
-import {
-  parseSpecChannelEnvelope,
-  SPEC_CHANNEL_PAYLOAD_MAX_BYTES,
-} from "../doc-service.ts";
+import { parseSpecChannelEnvelope, SPEC_CHANNEL_PAYLOAD_MAX_BYTES } from "../doc-service.ts";
 
 class FakeAwarenessClient extends EventEmitter {
   listenAttempts = 0;
@@ -187,6 +184,35 @@ describe("PostgresSpecParticipantStore", () => {
         [specId, "same-client"],
       );
       expect(result.rows).toEqual([{ user_id: firstUserId }]);
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
+    "an old disconnect cannot clear a newer connection epoch",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      let current = new Date("2026-08-10T12:00:00Z");
+      const participants = new PostgresSpecParticipantStore(
+        drizzle(livePool, { schema }),
+        () => current,
+        60_000,
+      );
+      const clientId = `reconnect-${randomUUID()}`;
+      const oldEpoch = await participants.connect(specId, clientId, firstUserId);
+      current = new Date(current.getTime() + 1_000);
+      const newEpoch = await participants.connect(specId, clientId, firstUserId);
+
+      await participants.disconnect(specId, clientId, oldEpoch);
+
+      const result = await livePool.query(
+        `SELECT connection_epoch, disconnected_at
+         FROM spec_participant WHERE spec_id = $1 AND client_id = $2`,
+        [specId, clientId],
+      );
+      expect(newEpoch).toBe(oldEpoch + 1n);
+      expect(result.rows).toEqual([
+        { connection_epoch: newEpoch.toString(), disconnected_at: null },
+      ]);
     },
   );
 });

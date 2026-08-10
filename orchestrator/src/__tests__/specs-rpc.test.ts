@@ -49,6 +49,11 @@ function clientFor(userId: string | null, members: string[]) {
 }
 
 describe("SpecService", () => {
+  test("the list implementation has no coordinator session verb", async () => {
+    const source = await Bun.file(new URL("../rpc/specs.ts", import.meta.url)).text();
+    expect(source).not.toMatch(/control-plane|SessionService|sessionsClient|coordinatorClient/);
+  });
+
   test("lists organization specs for a member who does not own them", async () => {
     const { client, listCalls } = clientFor("bob", ["alice", "bob"]);
     const response = await client.listSpecs({ lifecycle: "draft", page: 0, pageSize: 0 });

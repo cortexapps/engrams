@@ -1,6 +1,6 @@
 /** Read-only data access for the Tech Specs list. */
 
-import { and, count, desc, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, count, desc, eq, gt, inArray, isNull, or } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import { getDb } from "./client.ts";
@@ -57,7 +57,10 @@ function repoLabel(policy: TaskLaunchPolicy | null): string | null {
   return pathName ?? null;
 }
 
-export function makeSpecListStore(db: NodePgDatabase<typeof schema> = getDb()): SpecListStore {
+export function makeSpecListStore(
+  db: NodePgDatabase<typeof schema> = getDb(),
+  now: () => Date = () => new Date(),
+): SpecListStore {
   return {
     async isMember(userId) {
       const rows = await db
@@ -115,6 +118,7 @@ export function makeSpecListStore(db: NodePgDatabase<typeof schema> = getDb()): 
             and(
               inArray(specParticipant.specId, specIds),
               isNull(specParticipant.disconnectedAt),
+              gt(specParticipant.leaseExpiresAt, now()),
               or(eq(user.banned, false), isNull(user.banned)),
             ),
           )

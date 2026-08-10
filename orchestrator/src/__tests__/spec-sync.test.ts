@@ -69,7 +69,8 @@ async function listenForSpecSync(input: {
   const app = new Hono();
   const nodeWs = createNodeWebSocket({ app });
   const participants: SpecParticipantStore = input.participants ?? {
-    connect: async () => {},
+    connect: async () => 1n,
+    renew: async () => {},
     disconnect: async () => {},
   };
   const deps = {
@@ -125,9 +126,10 @@ describe("the spec sync UpgradeHook", () => {
   });
 
   test("rejects malformed encoding and non-UUID spec ids without throwing", async () => {
-    expect(
-      parseSpecSyncPath(new URL("http://localhost/api/v1/specs/%/sync?clientId=42")),
-    ).toEqual({ specId: null, clientId: null });
+    expect(parseSpecSyncPath(new URL("http://localhost/api/v1/specs/%/sync?clientId=42"))).toEqual({
+      specId: null,
+      clientId: null,
+    });
     expect(
       parseSpecSyncPath(new URL("http://localhost/api/v1/specs/not-a-uuid/sync?clientId=42")),
     ).toEqual({ specId: null, clientId: null });
@@ -158,7 +160,9 @@ describe("the spec sync UpgradeHook", () => {
       participants: {
         connect: async (specId, clientId, userId) => {
           connected.push([specId, clientId, userId]);
+          return 1n;
         },
+        renew: async () => {},
         disconnect: async (specId, clientId) => {
           disconnected.push([specId, clientId]);
         },
@@ -296,7 +300,8 @@ describe("the spec sync UpgradeHook", () => {
       member: true,
       documents,
       participants: {
-        connect: async () => {},
+        connect: async () => 1n,
+        renew: async () => {},
         disconnect: async () => {
           throw new Error("participant store unavailable");
         },
@@ -338,7 +343,8 @@ describe("the spec sync UpgradeHook", () => {
         evict: () => {},
       },
       participants: {
-        connect: async () => {},
+        connect: async () => 1n,
+        renew: async () => {},
         disconnect: async () => {
           disconnects += 1;
         },
@@ -361,6 +367,33 @@ describe("the spec sync UpgradeHook", () => {
     expect(timers.size).toBe(0);
   });
 
+  test("renews the current participant epoch after a heartbeat pong", async () => {
+    const timers = new ManualTimers();
+    const socket = new SilentSpecSocket();
+    const renewals: Array<[string, string, bigint]> = [];
+    const hub = new SpecSyncHub({
+      documents: fakeDocuments(),
+      participants: {
+        connect: async () => 7n,
+        renew: async (specId, clientId, epoch) => {
+          renewals.push([specId, clientId, epoch]);
+        },
+        disconnect: async () => {},
+      },
+      awarenessBus: fakeAwarenessBus(),
+      heartbeatIntervalMs: 10,
+      timers,
+    });
+    cleanups.push(() => hub.stop());
+
+    await hub.connect(SPEC_ONE, "42", { id: "member" }, socket);
+    timers.tick();
+    socket.emit("pong");
+
+    await eventually(() => renewals.length === 1);
+    expect(renewals).toEqual([[SPEC_ONE, "42", 7n]]);
+  });
+
   test("retires a socket that emits an error", async () => {
     const socket = new SilentSpecSocket();
     const warnings: string[] = [];
@@ -376,7 +409,8 @@ describe("the spec sync UpgradeHook", () => {
         evict: () => {},
       },
       participants: {
-        connect: async () => {},
+        connect: async () => 1n,
+        renew: async () => {},
         disconnect: async () => {
           disconnects += 1;
         },
@@ -391,9 +425,7 @@ describe("the spec sync UpgradeHook", () => {
 
     await eventually(() => disconnects === 1 && unsubscribes === 1);
     expect(socket.terminations).toBe(1);
-    expect(warnings).toEqual([
-      `Spec sync socket failed for spec ${SPEC_ONE}: socket write failed`,
-    ]);
+    expect(warnings).toEqual([`Spec sync socket failed for spec ${SPEC_ONE}: socket write failed`]);
     expect(socket.listenerCount("error")).toBe(0);
   });
 
@@ -420,7 +452,9 @@ describe("the spec sync UpgradeHook", () => {
         connect: async () => {
           connectStarted = true;
           await participantGate;
+          return 1n;
         },
+        renew: async () => {},
         disconnect: async () => {
           disconnects += 1;
         },
@@ -459,7 +493,7 @@ describe("SpecSyncHub awareness failures", () => {
     };
     const hub = new SpecSyncHub({
       documents: fakeDocuments(),
-      participants: { connect: async () => {}, disconnect: async () => {} },
+      participants: { connect: async () => 1n, renew: async () => {}, disconnect: async () => {} },
       awarenessBus,
     });
     await hub.start();
@@ -496,7 +530,7 @@ describe("SpecSyncHub awareness failures", () => {
     };
     const hub = new SpecSyncHub({
       documents: fakeDocuments(),
-      participants: { connect: async () => {}, disconnect: async () => {} },
+      participants: { connect: async () => 1n, renew: async () => {}, disconnect: async () => {} },
       awarenessBus,
       onWarning: (message) => warnings.push(message),
     });

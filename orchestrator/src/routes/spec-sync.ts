@@ -34,8 +34,9 @@ export interface SpecSyncDocuments {
 }
 
 export interface SpecParticipantStore {
-  connect(specId: string, clientId: string, userId: string): Promise<void>;
-  disconnect(specId: string, clientId: string): Promise<void>;
+  connect(specId: string, clientId: string, userId: string): Promise<bigint>;
+  renew(specId: string, clientId: string, epoch: bigint): Promise<void>;
+  disconnect(specId: string, clientId: string, epoch: bigint): Promise<void>;
 }
 
 export interface SpecAwarenessBus {
@@ -129,6 +130,7 @@ interface SpecRoom {
   awareness: awarenessProtocol.Awareness;
   sockets: Set<SpecSyncSocket>;
   socketClientIds: Map<SpecSyncSocket, string>;
+  socketParticipantEpochs: Map<SpecSyncSocket, bigint>;
   clientConnectionCounts: Map<string, number>;
   socketHeartbeatStops: Map<SpecSyncSocket, () => void>;
   agents: Map<string, AgentPresenceState>;
@@ -157,12 +159,7 @@ export class SpecSyncHub implements SpecPresence {
   constructor(
     private readonly deps: Pick<
       SpecSyncDeps,
-      | "documents"
-      | "participants"
-      | "awarenessBus"
-      | "onWarning"
-      | "heartbeatIntervalMs"
-      | "timers"
+      "documents" | "participants" | "awarenessBus" | "onWarning" | "heartbeatIntervalMs" | "timers"
     >,
   ) {
     this.timers = deps.timers ?? systemTimers;
@@ -239,10 +236,10 @@ export class SpecSyncHub implements SpecPresence {
     try {
       room = await entry.promise;
       if (closed) return;
-      await this.deps.participants.connect(specId, clientId, user.id);
+      const participantEpoch = await this.deps.participants.connect(specId, clientId, user.id);
       if (closed) {
         try {
-          await this.deps.participants.disconnect(specId, clientId);
+          await this.deps.participants.disconnect(specId, clientId, participantEpoch);
         } catch (error: unknown) {
           this.deps.onWarning?.(
             `Disconnect participant from spec ${specId} failed: ${errorMessage(error)}`,
@@ -252,11 +249,12 @@ export class SpecSyncHub implements SpecPresence {
       }
       room.sockets.add(socket);
       room.socketClientIds.set(socket, clientId);
+      room.socketParticipantEpochs.set(socket, participantEpoch);
       room.clientConnectionCounts.set(
         clientId,
         (room.clientConnectionCounts.get(clientId) ?? 0) + 1,
       );
-      this.startHeartbeat(specId, room, socket);
+      this.startHeartbeat(specId, room, socket, clientId, participantEpoch);
       joined = true;
     } finally {
       entry.pendingUsers -= 1;
@@ -346,6 +344,7 @@ export class SpecSyncHub implements SpecPresence {
       awareness,
       sockets: new Set(),
       socketClientIds: new Map(),
+      socketParticipantEpochs: new Map(),
       clientConnectionCounts: new Map(),
       socketHeartbeatStops: new Map(),
       agents: new Map(),
@@ -410,8 +409,11 @@ export class SpecSyncHub implements SpecPresence {
     const entry = this.rooms.get(specId);
     try {
       const clientId = room.socketClientIds.get(socket);
+      const participantEpoch = room.socketParticipantEpochs.get(socket);
       room.socketClientIds.delete(socket);
-      if (!clientId) return;
+      room.socketParticipantEpochs.delete(socket);
+      if (!clientId || participantEpoch === undefined) return;
+      await this.deps.participants.disconnect(specId, clientId, participantEpoch);
       const remaining = (room.clientConnectionCounts.get(clientId) ?? 1) - 1;
       if (remaining > 0) {
         room.clientConnectionCounts.set(clientId, remaining);
@@ -419,7 +421,6 @@ export class SpecSyncHub implements SpecPresence {
       }
       room.clientConnectionCounts.delete(clientId);
       awarenessProtocol.removeAwarenessStates(room.awareness, [Number(clientId)], socket);
-      await this.deps.participants.disconnect(specId, clientId);
     } finally {
       if (entry) this.retireRoomIfIdle(specId, entry, room);
     }
@@ -451,10 +452,20 @@ export class SpecSyncHub implements SpecPresence {
     }
   }
 
-  private startHeartbeat(specId: string, room: SpecRoom, socket: SpecSyncSocket): void {
+  private startHeartbeat(
+    specId: string,
+    room: SpecRoom,
+    socket: SpecSyncSocket,
+    clientId: string,
+    participantEpoch: bigint,
+  ): void {
     let awaitingPong = false;
     const onPong = () => {
       awaitingPong = false;
+      this.runBackgroundTask(
+        `Renew participant lease for spec ${specId}`,
+        this.deps.participants.renew(specId, clientId, participantEpoch),
+      );
     };
     socket.on("pong", onPong);
     const timer = this.timers.setInterval(() => {

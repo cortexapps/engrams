@@ -1,5 +1,6 @@
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
-import { Bot, CircleHelp, FilePenLine } from "lucide-react";
+import { CircleHelp, FilePenLine } from "lucide-react";
+import { useState } from "react";
 
 import type { SpecListItem } from "../../gen/engram/app/v1/spec_pb";
 import { useNow } from "../../hooks/useNow";
@@ -9,6 +10,7 @@ import { relativeTime } from "../sessions/session-format";
 import { SpecTicketSyncBadge } from "./SpecTicketSyncBadge";
 import { Avatar, AvatarFallback, AvatarGroup, AvatarGroupCount } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
@@ -21,12 +23,14 @@ import {
 } from "@/components/ui/table";
 
 type StatusSearch = { status?: "draft" | "published" };
+const PAGE_SIZE = 50;
 
 export function SpecsList() {
   const search = useSearch({ from: "/_app/specs/" }) as StatusSearch;
   const navigate = useNavigate();
   const lifecycle: SpecLifecycleFilter = search.status ?? "all";
-  const { data, error, isPending } = useSpecs(lifecycle);
+  const [page, setPage] = useState(1);
+  const { data, error, isPending } = useSpecs(lifecycle, page, PAGE_SIZE);
   const now = useNow();
 
   return (
@@ -36,9 +40,8 @@ export function SpecsList() {
           value={lifecycle}
           onValueChange={(value) => {
             const status = value as SpecLifecycleFilter;
-            navigate({
-              to: "/specs",
-              search: status === "all" ? {} : { status },
+            selectSpecFilter(status, setPage, (nextSearch) => {
+              navigate({ to: "/specs", search: nextSearch });
             });
           }}
         >
@@ -71,30 +74,78 @@ export function SpecsList() {
           </p>
         </div>
       ) : (
-        <Table className="min-w-[880px]">
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-full">Title</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>People</TableHead>
-              <TableHead>Questions</TableHead>
-              <TableHead>Tickets</TableHead>
-              <TableHead className="text-right">Updated</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {data.specs.map((spec) => (
-              <SpecRow key={spec.id} spec={spec} now={now} />
-            ))}
-          </TableBody>
-        </Table>
+        <>
+          <Table className="min-w-[880px]">
+            <TableHeader>
+              <TableRow>
+                <TableHead className="w-full">Title</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead>People</TableHead>
+                <TableHead>Questions</TableHead>
+                <TableHead>Tickets</TableHead>
+                <TableHead className="text-right">Updated</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.specs.map((spec) => (
+                <SpecRow key={spec.id} spec={spec} now={now} />
+              ))}
+            </TableBody>
+          </Table>
+          <SpecPagination
+            page={page}
+            pageSize={PAGE_SIZE}
+            totalCount={data.totalCount}
+            onPageChange={setPage}
+          />
+        </>
       )}
     </div>
   );
 }
 
-function SpecRow({ spec, now }: { spec: SpecListItem; now: number }) {
-  const people = spec.participants.slice(0, 3);
+export function selectSpecFilter(
+  status: SpecLifecycleFilter,
+  setPage: (page: number) => void,
+  navigate: (search: StatusSearch) => void,
+): void {
+  setPage(1);
+  navigate(status === "all" ? {} : { status });
+}
+
+export function SpecPagination({
+  page,
+  pageSize,
+  totalCount,
+  onPageChange,
+}: {
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  onPageChange: (page: number) => void;
+}) {
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  if (totalPages === 1) return null;
+  return (
+    <div className="mt-4 flex items-center justify-end gap-3">
+      <Button variant="outline" disabled={page === 1} onClick={() => onPageChange(page - 1)}>
+        Previous
+      </Button>
+      <span className="font-mono text-xs text-muted-foreground">
+        Page {page} of {totalPages}
+      </span>
+      <Button
+        variant="outline"
+        disabled={page >= totalPages}
+        onClick={() => onPageChange(page + 1)}
+      >
+        Next
+      </Button>
+    </div>
+  );
+}
+
+export function SpecRow({ spec, now }: { spec: SpecListItem; now: number }) {
   return (
     <TableRow>
       <TableCell className="min-w-64 whitespace-normal py-3">
@@ -115,28 +166,7 @@ function SpecRow({ spec, now }: { spec: SpecListItem; now: number }) {
         </Badge>
       </TableCell>
       <TableCell>
-        <AvatarGroup aria-label="Live collaborators">
-          <Avatar size="sm" aria-label="Spec agent" title="Spec agent">
-            <AvatarFallback className="bg-instrument-nominal text-background">
-              <Bot className="size-3.5" aria-hidden />
-            </AvatarFallback>
-          </Avatar>
-          {people.map((person) => (
-            <Avatar
-              key={person.id}
-              size="sm"
-              aria-label={person.name || person.email}
-              title={person.name || person.email}
-            >
-              <AvatarFallback>{initials(person.name || person.email)}</AvatarFallback>
-            </Avatar>
-          ))}
-          {spec.participants.length > people.length && (
-            <AvatarGroupCount className="size-6 text-xs">
-              +{spec.participants.length - people.length}
-            </AvatarGroupCount>
-          )}
-        </AvatarGroup>
+        <SpecPeople participants={spec.participants} />
       </TableCell>
       <TableCell>
         <span className="inline-flex items-center gap-1.5 font-mono text-xs tabular-nums">
@@ -151,6 +181,37 @@ function SpecRow({ spec, now }: { spec: SpecListItem; now: number }) {
         {relativeTime(spec.updatedAt, now)}
       </TableCell>
     </TableRow>
+  );
+}
+
+export function SpecPeople({ participants }: { participants: SpecListItem["participants"] }) {
+  const people = participants.slice(0, 3);
+  if (people.length === 0) {
+    return (
+      <span aria-label="No live collaborators" className="text-muted-foreground">
+        —
+      </span>
+    );
+  }
+
+  return (
+    <AvatarGroup aria-label="Live collaborators">
+      {people.map((person) => (
+        <Avatar
+          key={person.id}
+          size="sm"
+          aria-label={person.name || person.email}
+          title={person.name || person.email}
+        >
+          <AvatarFallback>{initials(person.name || person.email)}</AvatarFallback>
+        </Avatar>
+      ))}
+      {participants.length > people.length && (
+        <AvatarGroupCount className="size-6 text-xs">
+          +{participants.length - people.length}
+        </AvatarGroupCount>
+      )}
+    </AvatarGroup>
   );
 }
 

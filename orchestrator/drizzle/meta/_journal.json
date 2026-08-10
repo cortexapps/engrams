@@ -379,6 +379,13 @@
       "when": 1786307332106,
       "tag": "0053_spec_projection",
       "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "7",
+      "when": 1786346984168,
+      "tag": "0054_spec_participant_lease",
+      "breakpoints": true
     }
   ]
 }

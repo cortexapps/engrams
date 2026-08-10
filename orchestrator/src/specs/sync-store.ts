@@ -1,4 +1,4 @@
-import { and, eq, isNull, or } from "drizzle-orm";
+import { and, eq, isNull, or, sql } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import * as decoding from "lib0/decoding";
 import * as encoding from "lib0/encoding";
@@ -26,29 +26,68 @@ export class PostgresSpecParticipantStore implements SpecParticipantStore {
   constructor(
     private readonly db: NodePgDatabase<typeof schema>,
     private readonly now: () => Date = () => new Date(),
+    private readonly leaseDurationMs = 60_000,
   ) {}
 
-  async connect(specId: string, clientId: string, userId: string): Promise<void> {
+  async connect(specId: string, clientId: string, userId: string): Promise<bigint> {
     const connectedAt = this.now();
+    const leaseExpiresAt = new Date(connectedAt.getTime() + this.leaseDurationMs);
     const rows = await this.db
       .insert(specParticipant)
-      .values({ specId, clientId, userId, connectedAt, disconnectedAt: null })
+      .values({
+        specId,
+        clientId,
+        userId,
+        connectionEpoch: 1n,
+        connectedAt,
+        disconnectedAt: null,
+        leaseExpiresAt,
+      })
       .onConflictDoUpdate({
         target: [specParticipant.specId, specParticipant.clientId],
-        set: { userId, connectedAt, disconnectedAt: null },
+        set: {
+          userId,
+          connectionEpoch: sql`${specParticipant.connectionEpoch} + 1`,
+          connectedAt,
+          disconnectedAt: null,
+          leaseExpiresAt,
+        },
         setWhere: or(isNull(specParticipant.userId), eq(specParticipant.userId, userId)),
       })
-      .returning({ userId: specParticipant.userId });
+      .returning({ userId: specParticipant.userId, epoch: specParticipant.connectionEpoch });
     if (rows.length === 0) {
       throw new Error(`Spec client ${clientId} is already bound to another user`);
     }
+    return rows[0]!.epoch;
   }
 
-  async disconnect(specId: string, clientId: string): Promise<void> {
+  async renew(specId: string, clientId: string, epoch: bigint): Promise<void> {
+    const renewedAt = this.now();
     await this.db
       .update(specParticipant)
-      .set({ disconnectedAt: this.now() })
-      .where(and(eq(specParticipant.specId, specId), eq(specParticipant.clientId, clientId)));
+      .set({ leaseExpiresAt: new Date(renewedAt.getTime() + this.leaseDurationMs) })
+      .where(
+        and(
+          eq(specParticipant.specId, specId),
+          eq(specParticipant.clientId, clientId),
+          eq(specParticipant.connectionEpoch, epoch),
+          isNull(specParticipant.disconnectedAt),
+        ),
+      );
+  }
+
+  async disconnect(specId: string, clientId: string, epoch: bigint): Promise<void> {
+    const disconnectedAt = this.now();
+    await this.db
+      .update(specParticipant)
+      .set({ disconnectedAt, leaseExpiresAt: disconnectedAt })
+      .where(
+        and(
+          eq(specParticipant.specId, specId),
+          eq(specParticipant.clientId, clientId),
+          eq(specParticipant.connectionEpoch, epoch),
+        ),
+      );
   }
 }
 
