@@ -11,6 +11,13 @@ SET search_path = pg_catalog
 AS $$
 BEGIN
   IF NEW.disconnected_at IS NULL THEN
+    -- A legacy reconnect can claim only an inactive row. A reconnect against
+    -- any active owner is a no-op, including a current owner with an epoch.
+    IF OLD.disconnected_at IS NULL THEN
+      RETURN OLD;
+    END IF;
+
+    NEW.connection_epoch := 0;
     NEW.lease_expires_at := 'infinity'::timestamptz;
     RETURN NEW;
   END IF;
@@ -34,14 +41,6 @@ FOR EACH ROW
 WHEN (
   NEW."connection_epoch" = OLD."connection_epoch"
   AND NEW."lease_expires_at" = OLD."lease_expires_at"
-  AND (
-    NEW."disconnected_at" IS NULL
-    OR (
-      OLD."connection_epoch" > 0
-      AND OLD."disconnected_at" IS NULL
-      AND NEW."disconnected_at" IS NOT NULL
-    )
-  )
 )
 EXECUTE FUNCTION "spec_participant_legacy_lease_compat"();
 --> statement-breakpoint
