@@ -360,16 +360,38 @@ The amended invariant: **a bundle generation that anything can reference
 is durable in blob storage, and every live referent is visible to the
 pin set.**
 
-**Deferred follow-up (simulation).** The DST worlds cannot represent
-this incident class (every sim hardcodes empty `aux_bundles`, no host
-sweep actor exists, and the cosim's coordinator and host use two
-disjoint blob buckets). A follow-up extends the cosim with a shared
-bucket, a real `BundleStore` + stamp on the sim host,
-heartbeat/GC/stamp-rotation steps, and the oracle *every generation
-attached to a live sandbox is reachable from local staging ∪ blob
-storage*. It lands after D1/D2 (the oracle is red before them). The ADR
-0098 D4 conformance obligations for the `bundle_pin_set` change landed
-with D2 itself (`t_bundle_pin_set_union`, the first conformance case for
-this method).
+**Simulation (landed as the capstone).** The DST worlds could not
+represent this incident class (every sim hardcoded empty `aux_bundles`,
+no host sweep actor existed, and the cosim's coordinator and host used
+two disjoint blob buckets). The capstone extends `engram-dst-cosim`:
+ONE shared bucket backs the coordinator's blob tier, the host's chunk
+store, the bundle store, and the bundle GC (optionally fault-wrapped by
+`engram_testkit::FaultyBlobStorage` for `bundles/`-prefix put faults);
+the cosim host carries a real staged-bundle dir + stamp and runs the
+REAL `BundleStore` publish/materialize/sweep and the REAL
+`run_one_bundle_sweep` at ZERO grace; sandboxes attach the current
+stamp at create and every capture pins `aux_bundles` through the real
+finalize; new swarm steps `HostHeartbeat` / `RollBundleStamp` /
+`BundleGcSweep` compose the incident's interleaving. The standing
+oracle, checked after every swarm step: *every generation attached to a
+live sandbox is reachable from local staging ∪ blob storage, and every
+recoverable snapshot row's pins are durable (publish-before-record)*.
+The directed pre-fix replay (`publish=false` roll + empty-ack sweep)
+fires the oracle and fails the next checkpoint — the detection this
+incident lacked. The ADR 0098 D4 conformance obligations for the
+`bundle_pin_set` change landed with D2 itself (`t_bundle_pin_set_union`,
+the first conformance case for this method).
 
-Landed on PRs #1154 (D1) and #1157 (D2).
+**The capstone's first catch (before any production firing):** the
+bundle GC's promote pass deleted expired candidates purely on age — no
+pin-set re-check at delete time, and the mark pass never clears a
+candidate whose sha is pinned again. A generation marked while
+transiently unpinned (the mid-roll window before a heartbeat reports
+the new attachment) and pinned again before the 24 h grace elapsed
+would have been wrongly deleted, 404ing the pinning restore. The chunk
+GC and snapshot-blob GC both carry this re-check; the bundle sweep
+alone lacked it. Fixed alongside the capstone
+(`promote_repinned_skips` on the report, mirroring the siblings; six
+swarm seeds reproduced the deletion deterministically).
+
+Landed on PRs #1154 (D1), #1157 (D2), and the cosim capstone PR.
