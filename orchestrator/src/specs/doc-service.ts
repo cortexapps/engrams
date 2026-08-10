@@ -1,8 +1,16 @@
-import { renderMarkdown, schema, SPEC_FRAGMENT_NAME } from "@engrams/spec-document";
+import {
+  renderMarkdown,
+  schema,
+  SPEC_FRAGMENT_NAME,
+  validateRequirementEdit,
+} from "@engrams/spec-document";
 import type { Node as ProseMirrorNode } from "prosemirror-model";
 import { prosemirrorToYXmlFragment, yXmlFragmentToProseMirrorRootNode } from "y-prosemirror";
 import * as Y from "yjs";
 import type { Pool, PoolClient } from "pg";
+
+import { applyHumanSectionEdit, type SectionStateValue } from "./section-state.ts";
+import { humanEditRequestFingerprint } from "./section-state-service.ts";
 
 export const SPEC_UPDATE_CHANNEL = "spec_update";
 export const SPEC_SOFT_SIZE_BYTES = 500 * 1024;
@@ -52,6 +60,16 @@ export class SpecDocumentTooLargeError extends Error {
   }
 }
 
+export class SpecDocumentRevisionConflictError extends Error {
+  constructor(
+    readonly expectedSeq: bigint,
+    readonly actualSeq: bigint,
+  ) {
+    super(`The spec document is at revision ${actualSeq}; expected ${expectedSeq}`);
+    this.name = "SpecDocumentRevisionConflictError";
+  }
+}
+
 export interface SpecSnapshotRecord {
   state: Uint8Array;
   stateVector: Uint8Array;
@@ -62,6 +80,17 @@ export interface SpecUpdateRecord {
   seq: bigint;
   update: Uint8Array;
   clientId: string | null;
+}
+
+export interface SpecDocumentSectionEffect {
+  id: string;
+  title: string;
+  changed: boolean;
+}
+
+export interface SpecUpdateEffects {
+  sections: readonly SpecDocumentSectionEffect[];
+  at?: Date;
 }
 
 export interface CompactSnapshotInput extends SpecSnapshotRecord {
@@ -76,6 +105,7 @@ export interface SpecDocumentStore {
     expectedSeq: bigint,
     update: Uint8Array,
     clientId: string | null,
+    effects: SpecUpdateEffects,
   ): Promise<bigint | null>;
   notifyUpdate(specId: string, seq: bigint): Promise<void>;
   compactSnapshot(input: CompactSnapshotInput): Promise<boolean>;
@@ -107,6 +137,8 @@ export interface SpecDocumentServiceOptions {
   /** Test seam for a process failure after the durable insert. */
   afterPersist?: (specId: string, seq: bigint) => void | Promise<void>;
   measureRenderedSize?: (doc: ProseMirrorNode) => number;
+  /** Injected wall time for durable human-edit actions. */
+  now?: () => Date;
 }
 
 export interface CompactSpecResult extends SpecSnapshotRecord {
@@ -186,20 +218,30 @@ export class SpecDocumentService {
   async mutateDocument(
     specId: string,
     clientId: string | null,
-    mutate: (doc: ProseMirrorNode) => ProseMirrorNode,
+    mutate: (doc: ProseMirrorNode, ydoc: Y.Doc) => ProseMirrorNode,
+    expectedSeq?: bigint,
   ): Promise<SpecUpdateRecord> {
     return this.withLock(specId, async () => {
       const room = await this.loadUnlocked(specId);
-      await this.syncUnlocked(specId, room);
-
-      const fork = new Y.Doc();
-      Y.applyUpdate(fork, Y.encodeStateAsUpdate(room.doc));
-      const before = Y.encodeStateVector(fork);
-      const replacement = mutate(proseMirrorDocument(fork));
-      prosemirrorToYXmlFragment(replacement, fork.getXmlFragment(SPEC_FRAGMENT_NAME));
-      const update = Y.encodeStateAsUpdate(fork, before);
-      if (update.length === 2) throw new Error("The spec mutation did not change the document");
-      return this.applyUpdateUnlocked(specId, room, update, clientId);
+      for (;;) {
+        await this.syncUnlocked(specId, room);
+        if (expectedSeq !== undefined && room.lastAppliedSeq !== expectedSeq) {
+          throw new SpecDocumentRevisionConflictError(expectedSeq, room.lastAppliedSeq);
+        }
+        const fork = new Y.Doc();
+        try {
+          Y.applyUpdate(fork, Y.encodeStateAsUpdate(room.doc));
+          const before = Y.encodeStateVector(fork);
+          const replacement = mutate(proseMirrorDocument(fork), fork);
+          prosemirrorToYXmlFragment(replacement, fork.getXmlFragment(SPEC_FRAGMENT_NAME));
+          const update = Y.encodeStateAsUpdate(fork, before);
+          if (update.length === 2) throw new Error("The spec mutation did not change the document");
+          const stored = await this.tryApplyUpdateUnlocked(specId, room, update, clientId);
+          if (stored) return stored;
+        } finally {
+          fork.destroy();
+        }
+      }
     });
   }
 
@@ -296,38 +338,57 @@ export class SpecDocumentService {
     Y.decodeUpdate(update);
 
     for (;;) {
-      const candidate = this.validateCandidate(room, update);
-      const renderedSizeUpperBound = this.validateSize(room, update, candidate);
-
-      // ADR 0114 D5: the conditional insert allocates the next dense committed
-      // revision. A peer that committed first makes this CAS miss, so this
-      // service must load and size-check that peer update before it retries.
-      let seq: bigint | null;
-      try {
-        seq = await this.store.insertUpdateIfLatest(specId, room.lastAppliedSeq, update, clientId);
-      } catch (error) {
-        this.resetValidationDoc(room);
-        throw error;
-      }
-      if (seq === null) {
-        await this.syncUnlocked(specId, room);
-        continue;
-      }
-
-      // The durable insert must complete before local state or a socket can
-      // observe the update.
-      await this.options.afterPersist?.(specId, seq);
-      Y.applyUpdate(room.doc, update);
-      room.lastAppliedSeq = seq;
-      room.renderedSizeUpperBound = renderedSizeUpperBound;
-      const row = { seq, update, clientId };
-      this.broadcast({ specId, ...row, source: "local" });
-      await this.store.notifyUpdate(specId, seq);
-      return row;
+      const stored = await this.tryApplyUpdateUnlocked(specId, room, update, clientId);
+      if (stored) return stored;
+      await this.syncUnlocked(specId, room);
     }
   }
 
-  private validateCandidate(room: CachedSpecDocument, update: Uint8Array): ProseMirrorNode {
+  private async tryApplyUpdateUnlocked(
+    specId: string,
+    room: CachedSpecDocument,
+    update: Uint8Array,
+    clientId: string | null,
+  ): Promise<SpecUpdateRecord | null> {
+    const { candidate, sections } = this.validateCandidate(room, update);
+    const renderedSizeUpperBound = this.validateSize(room, update, candidate);
+    let seq: bigint | null;
+    try {
+      seq = await this.store.insertUpdateIfLatest(specId, room.lastAppliedSeq, update, clientId, {
+        sections,
+        at:
+          clientId !== null && sections.some((section) => section.changed)
+            ? this.options.now?.()
+            : undefined,
+      });
+    } catch (error) {
+      this.resetValidationDoc(room);
+      throw error;
+    }
+    if (seq === null) {
+      this.resetValidationDoc(room);
+      return null;
+    }
+
+    try {
+      await this.options.afterPersist?.(specId, seq);
+    } catch (error) {
+      this.resetValidationDoc(room);
+      throw error;
+    }
+    Y.applyUpdate(room.doc, update);
+    room.lastAppliedSeq = seq;
+    room.renderedSizeUpperBound = renderedSizeUpperBound;
+    const row = { seq, update, clientId };
+    this.broadcast({ specId, ...row, source: "local" });
+    await this.store.notifyUpdate(specId, seq);
+    return row;
+  }
+
+  private validateCandidate(
+    room: CachedSpecDocument,
+    update: Uint8Array,
+  ): { candidate: ProseMirrorNode; sections: readonly SpecDocumentSectionEffect[] } {
     const validationDoc = room.validationDoc;
     Y.applyUpdate(validationDoc, update);
     let repaired = false;
@@ -339,7 +400,13 @@ export class SpecDocumentService {
       const candidate = proseMirrorDocument(validationDoc);
       candidate.check();
       if (repaired) throw new Error("The spec update violates the document schema");
-      return candidate;
+      const before =
+        room.doc.getXmlFragment(SPEC_FRAGMENT_NAME).length === 0
+          ? null
+          : proseMirrorDocument(room.doc);
+      const sections = compareSections(before, candidate);
+      validateRequirementsSection(before, candidate, sections);
+      return { candidate, sections };
     } catch (error) {
       this.resetValidationDoc(room);
       throw error;
@@ -419,6 +486,59 @@ export class SpecDocumentService {
   }
 }
 
+function compareSections(
+  before: ProseMirrorNode | null,
+  candidate: ProseMirrorNode,
+): readonly SpecDocumentSectionEffect[] {
+  const prior = before ? documentSections(before) : [];
+  const next = documentSections(candidate);
+  if (
+    prior.length > 0 &&
+    (prior.length !== next.length || prior.some((section, index) => section.id !== next[index]?.id))
+  ) {
+    throw new Error("A spec update cannot add, remove, reorder or replace template sections.");
+  }
+  return next.map((section, index) => ({
+    id: section.id,
+    title: section.title,
+    changed: prior[index] == null || !prior[index].node.eq(section.node),
+  }));
+}
+
+interface DocumentSection {
+  id: string;
+  key: string;
+  title: string;
+  node: ProseMirrorNode;
+}
+
+function documentSections(doc: ProseMirrorNode): DocumentSection[] {
+  const sections: DocumentSection[] = [];
+  doc.forEach((node) => {
+    if (node.type !== schema.nodes.section) return;
+    const id = node.attrs.id;
+    const key = node.attrs.templateSectionKey;
+    if (typeof id !== "string" || id.length === 0 || typeof key !== "string" || key.length === 0) {
+      throw new Error("Every spec section must keep its template identity.");
+    }
+    sections.push({ id, key, title: node.firstChild?.textContent ?? id, node });
+  });
+  return sections;
+}
+
+function validateRequirementsSection(
+  before: ProseMirrorNode | null,
+  candidate: ProseMirrorNode,
+  effects: readonly SpecDocumentSectionEffect[],
+): void {
+  const prior = before
+    ? documentSections(before).find((section) => section.key === "requirements")
+    : null;
+  const next = documentSections(candidate).find((section) => section.key === "requirements");
+  if (!next || !effects.find((effect) => effect.id === next.id)?.changed) return;
+  validateRequirementEdit(prior?.node ?? "", next.node);
+}
+
 interface UpdateRow {
   seq: string;
   update: Buffer;
@@ -467,6 +587,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     expectedSeq: bigint,
     update: Uint8Array,
     clientId: string | null,
+    effects: SpecUpdateEffects,
   ): Promise<bigint | null> {
     const client = await this.pool.connect();
     try {
@@ -489,6 +610,22 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
          VALUES ($1, $2, $3, $4)`,
         [specId, nextSeq, Buffer.from(update), clientId],
       );
+      if (clientId !== null && effects.sections.some((section) => section.changed)) {
+        const participant = await client.query<{ user_id: string | null }>(
+          `SELECT user_id
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = $2`,
+          [specId, clientId],
+        );
+        const actorUserId = participant.rows[0]?.user_id;
+        if (actorUserId) {
+          if (!effects.at) throw new Error("A human spec update requires an injected timestamp.");
+          await draftHumanEditedSections(client, specId, BigInt(nextSeq), actorUserId, {
+            ...effects,
+            at: effects.at,
+          });
+        }
+      }
       await client.query("COMMIT");
       return BigInt(nextSeq);
     } catch (error) {
@@ -568,6 +705,78 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
       await client.query(`UNLISTEN ${SPEC_UPDATE_CHANNEL}`).catch(() => {});
       client.release();
     };
+  }
+}
+
+interface HumanSectionStateRow {
+  section_id: string;
+  state: "empty" | "drafted" | "confirmed" | "n/a";
+  na_reason: string | null;
+}
+
+async function draftHumanEditedSections(
+  client: PoolClient,
+  specId: string,
+  seq: bigint,
+  actorUserId: string,
+  effects: SpecUpdateEffects & { at: Date },
+): Promise<void> {
+  const rows = await client.query<HumanSectionStateRow>(
+    `SELECT section_id, state, na_reason
+       FROM spec_section_state
+      WHERE spec_id = $1`,
+    [specId],
+  );
+  const states = new Map<string, SectionStateValue>(
+    rows.rows.map((row) => [row.section_id, { state: row.state, naReason: row.na_reason }]),
+  );
+  const priorSeq = seq - 1n;
+
+  for (const [index, section] of effects.sections.entries()) {
+    if (!section.changed) continue;
+    const current = states.get(section.id) ?? { state: "empty", naReason: null };
+    const unconfirmedUpstreamSectionIds = effects.sections
+      .slice(0, index)
+      .filter((upstream) => {
+        const state = states.get(upstream.id)?.state ?? "empty";
+        return state !== "confirmed" && state !== "n/a";
+      })
+      .map((upstream) => upstream.id);
+    const change = applyHumanSectionEdit(current, {
+      specId,
+      sectionId: section.id,
+      sectionTitle: section.title,
+      allowsNa: true,
+      unconfirmedUpstreamSectionIds,
+    });
+    if (!change) continue;
+
+    await client.query(
+      `INSERT INTO spec_section_state
+         (spec_id, section_id, state, na_reason, confirmed_by, updated_at)
+       VALUES ($1, $2, 'drafted', NULL, NULL, $3)
+       ON CONFLICT (spec_id, section_id) DO UPDATE
+       SET state = 'drafted',
+           na_reason = NULL,
+           confirmed_by = NULL,
+           updated_at = excluded.updated_at`,
+      [specId, section.id, effects.at],
+    );
+    const actionId = `human-edit:${specId}:${seq}:${section.id}`;
+    await client.query(
+      `INSERT INTO spec_transcript_action
+         (id, spec_id, section_id, request_fingerprint, chip, created_at, delivered_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NULL)`,
+      [
+        actionId,
+        specId,
+        section.id,
+        humanEditRequestFingerprint(actorUserId, priorSeq),
+        change.transcriptChip,
+        effects.at,
+      ],
+    );
+    states.set(section.id, change.value);
   }
 }
 

@@ -16,6 +16,7 @@
  */
 
 import { relations, sql } from "drizzle-orm";
+import type { SectionStateTranscriptChip } from "@engrams/spec-document";
 import {
   pgTable,
   text,
@@ -350,6 +351,26 @@ export const specSectionState = pgTable(
   (t) => [primaryKey({ columns: [t.specId, t.sectionId] })],
 );
 
+export const specTranscriptAction = pgTable(
+  "spec_transcript_action",
+  {
+    id: text("id").primaryKey(),
+    specId: uuid("spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    sectionId: text("section_id").notNull(),
+    requestFingerprint: text("request_fingerprint").notNull(),
+    chip: jsonb("chip").$type<SectionStateTranscriptChip>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+  },
+  (t) => [
+    index("spec_transcript_action_pending_idx")
+      .on(t.createdAt, t.id)
+      .where(sql`${t.deliveredAt} IS NULL`),
+  ],
+);
+
 export const specOpenQuestion = pgTable(
   "spec_open_question",
   {
@@ -360,6 +381,7 @@ export const specOpenQuestion = pgTable(
     sectionId: text("section_id").notNull(),
     text: text("text").notNull(),
     openedBy: text("opened_by").references(() => user.id, { onDelete: "set null" }),
+    requestFingerprint: text("request_fingerprint").notNull(),
     state: text("state").notNull(),
     resolutionNote: text("resolution_note"),
     resolvedAt: timestamp("resolved_at", { withTimezone: true }),

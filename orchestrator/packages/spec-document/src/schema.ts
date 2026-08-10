@@ -57,7 +57,12 @@ export const specNodeSpecs: Readonly<Record<string, NodeSpec>> = {
     isolating: true,
   },
   openQuestion: {
-    attrs: { questionId: {} },
+    attrs: {
+      questionId: {},
+      requestFingerprint: { default: null },
+      resolved: { default: false },
+      answerMarkdown: { default: null },
+    },
     group: "inline",
     inline: true,
     atom: true,
@@ -136,7 +141,9 @@ function renderInline(node: ProseMirrorNode): string {
     if (child.isText) {
       result += escapeText(child.text ?? "");
     } else if (child.type === schema.nodes.openQuestion) {
-      result += `{{open-question:${String(child.attrs.questionId)}}}`;
+      if (child.attrs.resolved !== true) {
+        result += `{{open-question:${String(child.attrs.questionId)}}}`;
+      }
     }
   });
   return result;
@@ -264,6 +271,10 @@ function parseBlocks(lines: string[]): ProseMirrorNode[] {
     blocks.push(schema.nodes.paragraph!.create(null, parseInline(paragraphLines.join("\n"))));
   }
   return blocks.length > 0 ? blocks : [paragraph()];
+}
+
+export function parseMarkdownBlocks(markdown: string): ProseMirrorNode[] {
+  return parseBlocks(markdown.replace(/\r\n/g, "\n").split("\n"));
 }
 
 export function parseMarkdown(markdown: string, template: SpecTemplate): ProseMirrorNode {
