@@ -1651,7 +1651,7 @@ impl SandboxBackend for VzBackend {
             .collect())
     }
 
-    /// ADR 0115 D2: same contract as the FC backend — each live
+    /// ADR 0035 amendment D2: same contract as the FC backend — each live
     /// sandbox's attached generations, from `resolved_aux_ro_drives`
     /// (the post-swap set the VM really has open). Dead-delegate
     /// sandboxes are excluded to match `list()`.
@@ -1665,19 +1665,17 @@ impl SandboxBackend for VzBackend {
                     .resolved_aux_ro_drives
                     .iter()
                     .filter_map(|d| {
-                        d.sha256.as_ref().map(|sha| {
-                            engram_core::types::sandbox::AuxBundleRef {
+                        d.sha256
+                            .as_ref()
+                            .map(|sha| engram_core::types::sandbox::AuxBundleRef {
                                 drive_id: d.drive_id.clone(),
                                 sha256: sha.clone(),
-                            }
-                        })
+                            })
                     })
                     .collect();
-                (!bundles.is_empty()).then(|| {
-                    engram_core::types::sandbox::SandboxAuxBundles {
-                        sandbox_id: *kv.key(),
-                        bundles,
-                    }
+                (!bundles.is_empty()).then(|| engram_core::types::sandbox::SandboxAuxBundles {
+                    sandbox_id: *kv.key(),
+                    bundles,
                 })
             })
             .collect()

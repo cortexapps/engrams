@@ -1818,7 +1818,7 @@ async fn host_lifecycle(ctx: &Ctx) {
     assert_eq!(h2_row.utilization.disk_used_mib, 100_000);
 }
 
-/// ADR 0115 D2 (D4 conformance for `bundle_pin_set` + the
+/// ADR 0035 amendment D2 (D4 conformance for `bundle_pin_set` + the
 /// `hosts.sandbox_bundles` column): the pin union covers snapshot rows
 /// ∪ live hosts' per-sandbox attachments ∪ live hosts' bake stamps,
 /// dedupes across legs, sorts by `(drive_id, sha256)`, and drops the

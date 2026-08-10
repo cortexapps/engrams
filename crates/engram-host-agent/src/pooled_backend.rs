@@ -10023,7 +10023,7 @@ impl SandboxBackend for PooledBackend {
         self.inner.list().await
     }
 
-    /// ADR 0115 D2: proxy to the wrapped backend — FC and VZ override
+    /// ADR 0035 amendment D2: proxy to the wrapped backend — FC and VZ override
     /// the trait default with their live attachment maps; Process
     /// inherits the empty default (it keeps no attachment record).
     async fn aux_bundles_all(&self) -> Vec<engram_core::types::sandbox::SandboxAuxBundles> {

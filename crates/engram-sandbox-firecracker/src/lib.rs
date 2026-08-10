@@ -5685,7 +5685,7 @@ impl SandboxBackend for FirecrackerBackend {
         Ok(self.sandboxes.iter().map(|r| *r.key()).collect())
     }
 
-    /// ADR 0115 D2: report each live sandbox's attached generations
+    /// ADR 0035 amendment D2: report each live sandbox's attached generations
     /// from its in-memory spec — which reflects any fresh-create swap
     /// (ADR 0035 §3) and, for pidfd-reattached survivors, the persisted
     /// manifest the restore rewrote. Same ref extraction the snapshot
@@ -5707,11 +5707,9 @@ impl SandboxBackend for FirecrackerBackend {
                         })
                     })
                     .collect();
-                (!bundles.is_empty()).then(|| {
-                    engram_core::types::sandbox::SandboxAuxBundles {
-                        sandbox_id: *entry.key(),
-                        bundles,
-                    }
+                (!bundles.is_empty()).then(|| engram_core::types::sandbox::SandboxAuxBundles {
+                    sandbox_id: *entry.key(),
+                    bundles,
                 })
             })
             .collect()

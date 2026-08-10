@@ -254,7 +254,7 @@ async fn dry_run_marks_nothing() {
     assert!(!expired.contains(&garbage_sha));
 }
 
-/// ADR 0115 D2: a generation attached to a RUNNING sandbox (no
+/// ADR 0035 amendment D2: a generation attached to a RUNNING sandbox (no
 /// snapshot row references it) and a live host's stamp generation both
 /// pin against the sweep; a dead host's legs stop pinning. This is the
 /// GC half of the 2026-08-10 chain_poisoned fix — before it, a
@@ -360,15 +360,22 @@ async fn live_sandbox_and_stamp_pins_survive_sweep() {
     }
 
     assert!(
-        blob.exists(&AuxRoDrive::blob_key(&attach_sha)).await.unwrap(),
+        blob.exists(&AuxRoDrive::blob_key(&attach_sha))
+            .await
+            .unwrap(),
         "a running sandbox's attached generation must never be deleted"
     );
     assert!(
-        blob.exists(&AuxRoDrive::blob_key(&stamp_sha)).await.unwrap(),
+        blob.exists(&AuxRoDrive::blob_key(&stamp_sha))
+            .await
+            .unwrap(),
         "a live host's stamp generation must never be deleted"
     );
     assert!(
-        !blob.exists(&AuxRoDrive::blob_key(&garbage_sha)).await.unwrap(),
+        !blob
+            .exists(&AuxRoDrive::blob_key(&garbage_sha))
+            .await
+            .unwrap(),
         "the unpinned control generation must be deleted"
     );
 
@@ -390,11 +397,17 @@ async fn live_sandbox_and_stamp_pins_survive_sweep() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(
-        !blob.exists(&AuxRoDrive::blob_key(&attach_sha)).await.unwrap(),
+        !blob
+            .exists(&AuxRoDrive::blob_key(&attach_sha))
+            .await
+            .unwrap(),
         "a dead host's sandbox attachments must stop pinning"
     );
     assert!(
-        !blob.exists(&AuxRoDrive::blob_key(&stamp_sha)).await.unwrap(),
+        !blob
+            .exists(&AuxRoDrive::blob_key(&stamp_sha))
+            .await
+            .unwrap(),
         "a dead host's stamp must stop pinning"
     );
 }

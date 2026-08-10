@@ -3224,7 +3224,7 @@ pub trait MetadataStore: Send + Sync {
     /// row** (ADR 0062, so a registered-but-currently-unused *custom* harness's
     /// squashfs stays staged — built-ins ride the host-image stamp and need no
     /// pin) **∪ every live (ready|draining) host's per-sandbox attachments**
-    /// (ADR 0115 D2, so a running-but-unsnapshotted sandbox's generations
+    /// (ADR 0035 amendment D2, so a running-but-unsnapshotted sandbox's generations
     /// survive the host sweep and the GC — the 2026-08-10 chain_poisoned
     /// gap) **∪ every live host's bake stamp** (`hosts.current_bundles`).
     /// The union is what the GC keeps and what heartbeat acks advertise

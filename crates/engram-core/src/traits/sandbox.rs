@@ -1078,7 +1078,7 @@ pub trait SandboxBackend: Send + Sync {
         Vec::new()
     }
 
-    /// ADR 0115 D2: the aux bundle generations attached to each
+    /// ADR 0035 amendment D2: the aux bundle generations attached to each
     /// running sandbox, from the backend's live view (post any
     /// create-time stamp swap, and rebuilt from the persisted manifest
     /// on pidfd-reattach — a survivor of a host-agent roll reports the

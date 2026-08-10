@@ -309,7 +309,7 @@ pub struct HeartbeatRequest {
     /// host MIG, so old hosts mid-roll simply report none.
     #[serde(default)]
     pub current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
-    /// ADR 0115 D2: aux bundle generations attached to each running
+    /// ADR 0035 amendment D2: aux bundle generations attached to each running
     /// sandbox this tick. Persisted on the hosts row and unioned into
     /// `bundle_pin_set` so a live-but-unsnapshotted sandbox pins its
     /// generations. `#[serde(default)]` — an old host mid-roll reports
@@ -656,7 +656,7 @@ pub async fn heartbeat(
     // heartbeat (the host retries next tick) rather than degrade to
     // "nothing is pinned".
     //
-    // ADR 0115 D2 ordering invariant: this read runs strictly AFTER
+    // ADR 0035 amendment D2 ordering invariant: this read runs strictly AFTER
     // `touch_host_heartbeat` persisted THIS tick's `sandbox_bundles`
     // (early-return on failure above), so a freshly rolled host's
     // FIRST ack already pins its own reattached sandboxes'

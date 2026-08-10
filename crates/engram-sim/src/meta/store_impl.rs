@@ -3189,7 +3189,7 @@ impl MetadataStore for SimMetadataStore {
     }
 
     /// The bundle-GC pin union: every snapshot's aux_bundles ∪ every
-    /// live (ready|draining) host's per-sandbox attachments (ADR 0115
+    /// live (ready|draining) host's per-sandbox attachments (the ADR 0035 amendment
     /// D2) ∪ every live host's bake stamp, plus the (unmodeled)
     /// mount/harness catalogs — SimDb has no catalog tables yet, so
     /// those unions are the empty set, faithfully matching a

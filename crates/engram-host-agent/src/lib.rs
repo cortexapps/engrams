@@ -1447,7 +1447,7 @@ impl HostAgent {
                         }
                     };
                     let running_count = running_sandboxes.len() as u32;
-                    // ADR 0115 D2: per-sandbox aux attachments, so the
+                    // ADR 0035 amendment D2: per-sandbox aux attachments, so the
                     // coord's `bundle_pin_set` covers running-but-
                     // unsnapshotted sandboxes (their generations must
                     // survive the host sweep + bundle GC until the

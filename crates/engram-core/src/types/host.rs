@@ -347,7 +347,7 @@ pub struct HostRecord {
     /// (heartbeat-persisted). Operator visibility into fleet skew.
     #[serde(default)]
     pub current_bundles: Vec<super::sandbox::AuxBundleRef>,
-    /// ADR 0115 D2: per-running-sandbox aux bundle attachments
+    /// ADR 0035 amendment D2: per-running-sandbox aux bundle attachments
     /// (heartbeat-persisted; migration 0113). `bundle_pin_set` unions
     /// these so a live-but-unsnapshotted sandbox pins its generations
     /// against the host sweep and the bundle GC. `#[serde(default)]`
@@ -405,7 +405,7 @@ pub struct HostHeartbeat {
     pub utilization: HostUtilization,
     pub ready_images: Vec<String>,
     pub current_bundles: Vec<super::sandbox::AuxBundleRef>,
-    /// ADR 0115 D2: aux bundle refs attached to each running sandbox
+    /// ADR 0035 amendment D2: aux bundle refs attached to each running sandbox
     /// this tick — see [`HostRecord::sandbox_bundles`].
     pub sandbox_bundles: Vec<super::sandbox::SandboxAuxBundles>,
     pub total_vcpus: u32,

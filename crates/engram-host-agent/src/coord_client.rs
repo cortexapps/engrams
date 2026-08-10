@@ -572,7 +572,7 @@ pub struct HeartbeatRequest {
     /// coord's bundle-GC pin set.
     #[serde(default)]
     pub current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
-    /// ADR 0115 D2: aux bundle generations attached to each RUNNING
+    /// ADR 0035 amendment D2: aux bundle generations attached to each RUNNING
     /// sandbox this tick — the pin-set leg for sandboxes that exist
     /// but have not snapshotted yet. `#[serde(default)]` for the same
     /// roll-ordering reason as `current_bundles`; an old host reports
@@ -850,7 +850,7 @@ mod tests {
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["current_bundles"][0]["sha256"], "ff00");
-        // ADR 0115 D2: the per-sandbox attachment leg rides the same wire.
+        // ADR 0035 amendment D2: the per-sandbox attachment leg rides the same wire.
         assert_eq!(v["sandbox_bundles"][0]["bundles"][0]["sha256"], "ab12");
     }
 

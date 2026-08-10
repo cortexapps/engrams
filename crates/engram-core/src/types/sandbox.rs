@@ -323,7 +323,7 @@ pub struct AuxBundleRef {
     pub sha256: String,
 }
 
-/// ADR 0115 D2: the bundle generations one RUNNING sandbox has
+/// ADR 0035 amendment D2: the bundle generations one RUNNING sandbox has
 /// attached, reported per heartbeat and persisted on the `hosts` row
 /// (`sandbox_bundles`, migration 0113). This is the pin-set leg for
 /// sandboxes that exist but have not snapshotted yet — before it, a

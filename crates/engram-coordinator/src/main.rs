@@ -285,7 +285,7 @@ fn in_process_heartbeat(
         utilization: Default::default(),
         ready_images,
         current_bundles,
-        // ADR 0115 D2: the in-process (--mode=all) host never reports
+        // ADR 0035 amendment D2: the in-process (--mode=all) host never reports
         // per-sandbox attachments; the Process backend keeps no
         // attachment record.
         sandbox_bundles: Vec::new(),

@@ -4152,7 +4152,7 @@ impl MetadataStore for PostgresStore {
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
         let current_bundles = serde_json::to_value(&hb.current_bundles)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
-        // ADR 0115 D2: per-running-sandbox aux attachments (migration 0113).
+        // ADR 0035 amendment D2: per-running-sandbox aux attachments (migration 0113).
         let sandbox_bundles = serde_json::to_value(&hb.sandbox_bundles)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
         // ADR 0068: this tick's re-probed capability vector.
@@ -8357,7 +8357,7 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
-    /// ADR 0035 §5 + ADR 0055 P2 + ADR 0062 + ADR 0115 D2: distinct bundle
+    /// ADR 0035 §5 + ADR 0055 P2 + ADR 0062 + ADR 0035 amendment D2: distinct bundle
     /// generations referenced by any snapshot row **∪ every live
     /// `mount_catalog` skill** ∪ **the current harness catalog generation**
     /// (`dyn_0`) **∪ every live host's per-sandbox attachments ∪ every live
@@ -8374,7 +8374,7 @@ impl MetadataStore for PostgresStore {
     async fn bundle_pin_set(
         &self,
     ) -> Result<Vec<engram_core::types::sandbox::AuxBundleRef>, MetaError> {
-        // ADR 0115 D2: two hosts-table legs on top of the ADR 0035/0055/0062
+        // ADR 0035 amendment D2: two hosts-table legs on top of the ADR 0035/0055/0062
         // unions. `sandbox_bundles` pins what each RUNNING sandbox has
         // attached (a live-but-unsnapshotted sandbox previously pinned
         // nothing — the 2026-08-10 chain_poisoned gap); `current_bundles`
