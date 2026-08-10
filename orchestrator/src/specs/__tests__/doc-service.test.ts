@@ -854,6 +854,7 @@ describe("SpecDocumentService with live Postgres", () => {
 
   beforeEach(async () => {
     if (!liveDbReachable || !livePool) return;
+    await livePool.query("DELETE FROM spec_checkpoint WHERE spec_id = $1", [specId]);
     await livePool.query("DELETE FROM spec_transcript_action WHERE spec_id = $1", [specId]);
     await livePool.query("DELETE FROM spec_section_state WHERE spec_id = $1", [specId]);
     await livePool.query("DELETE FROM spec_participant WHERE spec_id = $1", [specId]);
@@ -876,6 +877,62 @@ describe("SpecDocumentService with live Postgres", () => {
     await livePool.end();
     livePool = null;
   }, 15_000);
+
+  test.skipIf(!liveDbReachable)(
+    "a document mutation commits its attributed checkpoint in the same transaction",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool));
+      await documents.applyUpdate(specId, initialUpdate(), "seed");
+      const checkpointId = randomUUID();
+      const at = new Date("2026-08-09T12:03:00.000Z");
+
+      const stored = await documents.mutateDocument(
+        specId,
+        "spec-agent:test",
+        (document) => {
+          const section = findSection(document, "design");
+          if (!section) throw new Error("The Design section is missing.");
+          return replaceSection(
+            document,
+            "design",
+            schema.nodes.section!.create(section.node.attrs, [
+              section.node.firstChild!,
+              schema.nodes.paragraph!.create(null, schema.text("Checkpointed block edit.")),
+            ]),
+          );
+        },
+        undefined,
+        {
+          id: checkpointId,
+          label: "Updated block request-flow",
+          authorUserId: userId,
+          reason: "block_edit",
+          at,
+        },
+      );
+
+      const checkpoint = await livePool.query<{
+        author_user_id: string | null;
+        created_at: Date;
+        doc_seq: string;
+        reason: string;
+        rendered_markdown: string;
+      }>(
+        `SELECT author_user_id, created_at, doc_seq::text, reason, rendered_markdown
+           FROM spec_checkpoint
+          WHERE id = $1`,
+        [checkpointId],
+      );
+      expect(checkpoint.rows[0]).toMatchObject({
+        author_user_id: userId,
+        created_at: at,
+        doc_seq: stored.seq.toString(),
+        reason: "block_edit",
+      });
+      expect(checkpoint.rows[0]?.rendered_markdown).toContain("Checkpointed block edit.");
+    },
+  );
 
   test.skipIf(!liveDbReachable)(
     "a human edit commits its update, drafted state, and transcript action atomically",

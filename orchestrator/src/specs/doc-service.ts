@@ -135,6 +135,21 @@ export interface SpecUpdateEffects {
   sections: readonly SpecDocumentSectionEffect[];
   semanticChanged: boolean;
   at?: Date;
+  checkpoint?: SpecDocumentCheckpoint;
+}
+
+export interface SpecDocumentCheckpointInput {
+  id: string;
+  label: string;
+  authorUserId: string | null;
+  reason: string;
+  at: Date;
+}
+
+export interface SpecDocumentCheckpoint extends SpecDocumentCheckpointInput {
+  state: Uint8Array;
+  stateVector: Uint8Array;
+  renderedMarkdown: string;
 }
 
 export interface SpecUpdateInsertResult {
@@ -275,6 +290,7 @@ export class SpecDocumentService {
     clientId: string | null,
     mutate: (doc: ProseMirrorNode, ydoc: Y.Doc) => ProseMirrorNode,
     expectedSeq?: bigint,
+    checkpoint?: SpecDocumentCheckpointInput,
   ): Promise<SpecUpdateRecord> {
     return this.withLock(specId, async () => {
       const room = await this.loadUnlocked(specId);
@@ -291,7 +307,13 @@ export class SpecDocumentService {
           prosemirrorToYXmlFragment(replacement, fork.getXmlFragment(SPEC_FRAGMENT_NAME));
           const update = Y.encodeStateAsUpdate(fork, before);
           if (update.length === 2) throw new Error("The spec mutation did not change the document");
-          const stored = await this.tryApplyUpdateUnlocked(specId, room, update, clientId);
+          const stored = await this.tryApplyUpdateUnlocked(
+            specId,
+            room,
+            update,
+            clientId,
+            checkpoint,
+          );
           if (stored) return stored;
         } finally {
           fork.destroy();
@@ -453,6 +475,7 @@ export class SpecDocumentService {
     room: CachedSpecDocument,
     update: Uint8Array,
     clientId: string | null,
+    checkpoint?: SpecDocumentCheckpointInput,
   ): Promise<SpecUpdateRecord | null> {
     const { candidate, sections, semanticChanged } = this.validateCandidate(room, update);
     const renderedSizeUpperBound = this.validateSize(room, update, candidate);
@@ -465,6 +488,16 @@ export class SpecDocumentService {
           clientId !== null && sections.some((section) => section.changed)
             ? this.options.now?.()
             : undefined,
+        ...(checkpoint === undefined
+          ? {}
+          : {
+              checkpoint: {
+                ...checkpoint,
+                state: Y.encodeStateAsUpdate(room.validationDoc),
+                stateVector: Y.encodeStateVector(room.validationDoc),
+                renderedMarkdown: renderMarkdown(candidate),
+              },
+            }),
       });
     } catch (error) {
       this.resetValidationDoc(room);
@@ -842,6 +875,27 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
          VALUES ($1, $2, $3, $4, $5)`,
         [specId, next.current_doc_seq, next.current_semantic_doc_seq, Buffer.from(update), clientId],
       );
+      if (effects.checkpoint) {
+        const checkpoint = effects.checkpoint;
+        await client.query(
+          `INSERT INTO spec_checkpoint
+             (id, spec_id, state, state_vector, rendered_markdown, doc_seq,
+              label, author_user_id, reason, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [
+            checkpoint.id,
+            specId,
+            Buffer.from(checkpoint.state),
+            Buffer.from(checkpoint.stateVector),
+            checkpoint.renderedMarkdown,
+            next.current_doc_seq,
+            checkpoint.label,
+            checkpoint.authorUserId,
+            checkpoint.reason,
+            checkpoint.at,
+          ],
+        );
+      }
       if (clientId !== null && effects.sections.some((section) => section.changed)) {
         const participant = await client.query<{ user_id: string | null }>(
           `SELECT user_id

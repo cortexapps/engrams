@@ -36,6 +36,7 @@ import { SectionStateConflictError, type SectionStateService } from "./section-s
 import type { SectionStateValue } from "./section-state.ts";
 
 const AGENT_QUESTION_NAMESPACE = "6a7dd40c-5d36-529d-9561-5f8e1fbea3c7";
+const BLOCK_CHECKPOINT_NAMESPACE = "21b9e56c-54b5-5f8f-a650-320e68aa50d6";
 
 export interface SpecToolMetadataStore {
   templateSections(specId: string): Promise<readonly SpecTemplateSection[]>;
@@ -109,6 +110,7 @@ export interface SpecToolServiceOptions {
   questions: OpenQuestionService;
   questionStore: OpenQuestionStore;
   metadata: SpecToolMetadataStore;
+  now: () => Date;
 }
 
 interface LocatedDiagramBlock {
@@ -345,6 +347,8 @@ export class SpecToolService implements SpecToolDocumentService {
       return this.result(specId, input, true, loaded.semanticDocSeq);
     }
     try {
+      const checkpointId = stableBlockCheckpointId(specId, input.sessionId, input.toolCallId);
+      const blockKind = String(current.node.attrs.kind);
       const update = await this.options.documents.mutateDocument(
         specId,
         agentClientId(input),
@@ -357,8 +361,15 @@ export class SpecToolService implements SpecToolDocumentService {
           }).doc;
         },
         input.expectedRev,
+        {
+          id: checkpointId,
+          label: `Updated ${blockKind} block ${input.blockId}`,
+          authorUserId: input.actorUserId ?? null,
+          reason: "block_edit",
+          at: this.options.now(),
+        },
       );
-      return this.result(specId, input, true, update.semanticDocSeq);
+      return this.result(specId, input, true, update.semanticDocSeq, checkpointId);
     } catch (error) {
       return this.revisionConflict(specId, input, error);
     }
@@ -392,6 +403,7 @@ export class SpecToolService implements SpecToolDocumentService {
     input: SpecMutationContext,
     applied: boolean,
     newRev: bigint,
+    checkpointId?: string,
   ): Promise<SpecMutationResult> {
     return {
       applied,
@@ -400,6 +412,7 @@ export class SpecToolService implements SpecToolDocumentService {
         specId,
         input.actorUserId,
       ),
+      ...(checkpointId === undefined ? {} : { checkpointId }),
     };
   }
 }
@@ -532,9 +545,17 @@ export function stableQuestionId(specId: string, sessionId: string, toolCallId: 
   return uuidV5(AGENT_QUESTION_NAMESPACE, `${specId}:${sessionId}:${toolCallId}`);
 }
 
+export function stableBlockCheckpointId(
+  specId: string,
+  sessionId: string,
+  toolCallId: string,
+): string {
+  return uuidV5(BLOCK_CHECKPOINT_NAMESPACE, `${specId}:${sessionId}:${toolCallId}`);
+}
+
 function uuidV5(namespace: string, name: string): string {
   const namespaceBytes = Buffer.from(namespace.replaceAll("-", ""), "hex");
-  if (namespaceBytes.length !== 16) throw new Error("The question UUID namespace is invalid.");
+  if (namespaceBytes.length !== 16) throw new Error("The UUID namespace is invalid.");
   const bytes = createHash("sha1").update(namespaceBytes).update(name, "utf8").digest().subarray(0, 16);
   bytes[6] = (bytes[6]! & 0x0f) | 0x50;
   bytes[8] = (bytes[8]! & 0x3f) | 0x80;

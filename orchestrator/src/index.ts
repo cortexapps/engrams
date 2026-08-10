@@ -77,7 +77,11 @@ import { makePapercutStore } from "./db/papercuts.ts";
 import { makeReviewStore } from "./db/reviews.ts";
 import { makeReviewTargetHydrationStore } from "./db/review-target-hydration.ts";
 import { makeEnrollmentStore } from "./db/enrollments.ts";
-import { PostgresSpecDocumentStore, SpecDocumentService } from "./specs/doc-service.ts";
+import {
+  PostgresSpecDocumentStore,
+  proseMirrorDocument,
+  SpecDocumentService,
+} from "./specs/doc-service.ts";
 import { PostgresSpecAwarenessBus, PostgresSpecParticipantStore } from "./specs/sync-store.ts";
 import { setSpecPresence, specPresence } from "./specs/presence.ts";
 import { PostgresOpenQuestionStore, OpenQuestionService } from "./specs/open-questions.ts";
@@ -97,6 +101,7 @@ import { loadRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
 import { renderReviewer } from "./reviewers/render.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
+import { makeSpecBlockIterationRoute } from "./routes/spec-block-iteration.ts";
 import { productionSpecProjection } from "./specs/projection.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
@@ -122,6 +127,7 @@ const specToolService = new SpecToolService({
   }),
   questionStore: specOpenQuestions,
   metadata: new PostgresSpecToolMetadataStore(getPool()),
+  now: () => new Date(),
 });
 const specParticipants = new PostgresSpecParticipantStore(getDb());
 const warnSpecSync = (message: string) => log.warn({ message }, "spec sync warning");
@@ -177,6 +183,23 @@ app.route("/", makeOidcKeyAdminRoute());
 app.route("/", eventsRoute);
 app.route("/", artifactsRoute);
 app.route("/", makeSessionFilesRoute());
+app.route(
+  "/",
+  makeSpecBlockIterationRoute({
+    resolveMembership: resolveSpecMembership,
+    resolveTarget: async (specId) => {
+      const result = await getPool().query<{ session_id: string | null }>(
+        "SELECT session_id FROM spec WHERE id = $1",
+        [specId],
+      );
+      const sessionId = result.rows[0]?.session_id;
+      if (!sessionId) return null;
+      const loaded = await specDocuments.syncFromLog(specId);
+      return { sessionId, document: proseMirrorDocument(loaded.doc) };
+    },
+    preparePrompt: (sessionId, status) => productionSpecProjection.preparePrompt(sessionId, status),
+  }),
+);
 // ADR 0064 P2a: live-host port-exposure registry (CRUD). The edge reverse-proxy
 // that serves the minted slugs lands in P2b.
 app.route("/", portsRoute);

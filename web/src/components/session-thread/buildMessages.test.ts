@@ -9,6 +9,7 @@ import {
   buildMessages,
   FILE_CHANGE_TOOL,
   SHELL_TOOL,
+  SPEC_BLOCK_UPDATE_TOOL,
   TASK_TOOL,
   type FileChangeArgs,
   type RunFooter,
@@ -105,6 +106,53 @@ describe("buildMessages — message/part shaping", () => {
       isError: false,
     });
     expect(a.status).toEqual({ type: "complete", reason: "stop" });
+  });
+
+  test("a durable block tool request becomes the main transcript chip", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "block-1",
+          name: "mcp__engrams__spec_update_block",
+          args_json: JSON.stringify({
+            section_id: "design",
+            block_id: "request-flow",
+            source: "flowchart LR\nA --> B",
+          }),
+          at: AT,
+        },
+        {
+          type: "tool_result_submitted",
+          tool_call_id: "block-1",
+          result_json: JSON.stringify({
+            applied: true,
+            checkpoint_id: "00000000-0000-4000-8000-000000001124",
+          }),
+          at: AT2,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+    );
+
+    const content = real(messages)[0]?.content;
+    if (!Array.isArray(content)) throw new Error("The assistant message must contain parts.");
+    const part = content.find((candidate) => candidate.type === "tool-call");
+    expect(part).toMatchObject({
+      toolName: SPEC_BLOCK_UPDATE_TOOL,
+      args: {
+        section_id: "design",
+        block_id: "request-flow",
+        source: "flowchart LR\nA --> B",
+      },
+      result: {
+        applied: true,
+        checkpoint_id: "00000000-0000-4000-8000-000000001124",
+      },
+    });
   });
 
   test("consecutive assistant messages coalesce into one prose text part", () => {

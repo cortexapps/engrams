@@ -10,6 +10,7 @@ import { useAuth } from "@/auth/AuthProvider";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SpecPresence } from "./SpecPresence";
+import { SpecBlockIterationProvider } from "./block-iteration";
 import { specNodeExtensions } from "./extensions";
 import "./spec-canvas.css";
 
@@ -63,7 +64,11 @@ export function SpecCanvas({ specId }: { specId: string }) {
     );
   }
 
-  return <ConnectedSpecCanvas connection={connection} user={user} />;
+  return (
+    <SpecBlockIterationProvider specId={specId}>
+      <ConnectedSpecCanvas connection={connection} user={user} />
+    </SpecBlockIterationProvider>
+  );
 }
 
 function ConnectedSpecCanvas({

@@ -107,6 +107,7 @@ const MutationOutput = z.object({
   applied: z.boolean(),
   new_rev: Revision,
   concurrent_editors: z.array(z.string()),
+  checkpoint_id: z.string().uuid().optional(),
 });
 
 export interface SpecReference {
@@ -124,6 +125,7 @@ export interface SpecMutationResult {
   applied: boolean;
   newRev: bigint;
   concurrentEditors: string[];
+  checkpointId?: string;
 }
 
 export interface SpecMutationContext {
@@ -228,6 +230,7 @@ function mutationOutput(
     applied: result.applied,
     new_rev: result.newRev.toString(),
     concurrent_editors: result.concurrentEditors,
+    ...(result.checkpointId === undefined ? {} : { checkpoint_id: result.checkpointId }),
   };
 }
 
