@@ -76,6 +76,18 @@ function renderValue(parts: readonly ValuePart[], tokensByPath: ReadonlyMap<stri
     .join("");
 }
 
+// Round-trip our markup through the parser so it can be compared against a
+// live `innerHTML` on equal terms: typing a space leaves U+00A0 in the DOM
+// (serialized `&nbsp;`), a typed quote stays literal where `escapeHtml` writes
+// `&quot;`, and so on. Both sides then serialize identically, so the sync below
+// only rewrites when the editor genuinely does not show the value.
+let scratch: HTMLDivElement | null = null;
+function normalizeHtml(html: string): string {
+  scratch ??= document.createElement("div");
+  scratch.innerHTML = html;
+  return scratch.innerHTML;
+}
+
 function nodeValue(node: Node): string {
   if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
   if (!(node instanceof HTMLElement)) return "";
@@ -229,7 +241,24 @@ export const InlineUploadComposer = forwardRef<
   const caretRef = useRef<number | null>(null);
   const parts = useMemo(() => splitValue(value), [value]);
   const tokensByPath = useMemo(() => new Map(tokens.map((token) => [token.path, token])), [tokens]);
-  const renderedValue = useMemo(() => renderValue(parts, tokensByPath), [parts, tokensByPath]);
+  const renderedValue = useMemo(
+    () => normalizeHtml(renderValue(parts, tokensByPath)),
+    [parts, tokensByPath],
+  );
+
+  // The edit we last reported and have not yet seen echoed back through
+  // `value`. Until the echo lands, every incoming `value` is a render from
+  // BEFORE that edit — older than what the editor already shows — so the sync
+  // below must not write it back.
+  const pendingRef = useRef<string | null>(null);
+
+  const emit = useCallback(
+    (next: string) => {
+      pendingRef.current = next;
+      onChange(next);
+    },
+    [onChange],
+  );
 
   const removeMissingTokens = useCallback(
     (next: string) => {
@@ -244,18 +273,40 @@ export const InlineUploadComposer = forwardRef<
     (start: number, end: number, inserted: string) => {
       const next = value.slice(0, start) + inserted + value.slice(end);
       caretRef.current = start + inserted.length;
-      onChange(next);
+      emit(next);
       removeMissingTokens(next);
     },
-    [onChange, removeMissingTokens, value],
+    [emit, removeMissingTokens, value],
   );
 
+  // React must NOT own this subtree. React 19 assigns `innerHTML`
+  // UNCONDITIONALLY on every commit that re-renders an element carrying
+  // `dangerouslySetInnerHTML` (the `{__html}` literal is a new object each
+  // render, so the identity bailout never applies, and `setProp` does no
+  // string compare) — and replacing the children of a focused contenteditable
+  // collapses the caret to offset 0. The session transcript re-renders this
+  // subtree on every streamed token, so an unrelated render threw the caret to
+  // the start of the composer many times a second while the user typed.
+  //
+  // So we write the markup ourselves, only when the editor does not already
+  // show it, and restore the caret exactly when we did rewrite. A re-render
+  // that changes nothing here now leaves the editor's DOM — and the caret —
+  // alone.
   useLayoutEffect(() => {
     const root = rootRef.current;
-    if (!root || caretRef.current == null || document.activeElement !== root) return;
+    if (!root) return;
+    if (pendingRef.current != null) {
+      // Still waiting on our own edit: this render predates it. Writing now
+      // would revert the keystrokes the browser has already applied — the
+      // commit that carries the echo arrives right behind this one.
+      if (value !== pendingRef.current) return;
+      pendingRef.current = null;
+    }
+    if (root.innerHTML === renderedValue) return;
+    root.innerHTML = renderedValue;
+    if (caretRef.current == null || document.activeElement !== root) return;
     restoreCaret(root, caretRef.current);
-    caretRef.current = null;
-  }, [renderedValue]);
+  });
 
   const replaceSelection = useCallback(
     (inserted: string) => {
@@ -341,7 +392,7 @@ export const InlineUploadComposer = forwardRef<
         const offsets = selectionOffsets(root);
         if (offsets) caretRef.current = offsets[1];
         const next = editorValue(root);
-        onChange(next);
+        emit(next);
         removeMissingTokens(next);
       }}
       onCopy={handleCopy}
@@ -401,7 +452,8 @@ export const InlineUploadComposer = forwardRef<
           if (token) onRetry(token.id);
         }
       }}
-      dangerouslySetInnerHTML={{ __html: renderedValue }}
+      // No children and no `dangerouslySetInnerHTML`: the markup inside is
+      // written by the layout effect above, never by React.
     />
   );
 });
