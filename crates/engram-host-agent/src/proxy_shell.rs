@@ -19,11 +19,11 @@
 //! warm, with no per-VM-netns dial (retired — only FC ever had one, and FC now
 //! always takes the relay). Backends without a vsock relay (Process; VZ until
 //! its Phase 2 real-vsock migration) fall back to [`open_shell_tunnel_at`],
-//! which dials `dial_ip:port` directly with `tokio_tungstenite::connect_async`.
+//! which dials `dial_ip:port` directly with
+//! `tokio_tungstenite::connect_async_with_config`.
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use engram_core::error::SandboxError;
 use engram_core::traits::sandbox::HarnessByteStream;
 use engram_core::types::shell::{ShellClose, ShellFrame, ShellTunnelEnds};
@@ -70,9 +70,13 @@ pub async fn open_shell_tunnel_via_relay(
             .into(),
         ));
     }
-    let (ws, _resp) = tokio_tungstenite::client_async(ttyd_request(port)?, stream)
-        .await
-        .map_err(|e| SandboxError::Vm(format!("ttyd ws handshake over relay: {e}").into()))?;
+    let (ws, _resp) = tokio_tungstenite::client_async_with_config(
+        ttyd_request(port)?,
+        stream,
+        Some(shell_ws_config()),
+    )
+    .await
+    .map_err(|e| SandboxError::Vm(format!("ttyd ws handshake over relay: {e}").into()))?;
     pump_websocket_through_tunnel(ws, ends);
     Ok(())
 }
@@ -91,6 +95,32 @@ pub async fn open_shell_tunnel_at(
     let upstream = connect_ttyd_cold(|| ttyd_request_from(&target)).await?;
     pump_websocket_through_tunnel(upstream, ends);
     Ok(())
+}
+
+/// Read-buffer capacity for a shell WebSocket, in bytes.
+///
+/// tungstenite 0.25 introduced `read_buffer_size` and defaulted it to 128 KiB.
+/// It is **eagerly** allocated per connection (`BytesMut::with_capacity` in the
+/// frame codec), and tungstenite 0.24 — the version this repo ran until now —
+/// used a fixed 4 KiB read chunk. Taking the new default would therefore have
+/// multiplied the per-shell read buffer by 32 with no code change and no
+/// mention at the call site.
+///
+/// A shell tunnel carries interactive terminal traffic, and a host runs many
+/// sessions at once — the density case upstream itself points at when it
+/// recommends "a smaller buffer, e.g. 4 KiB … to lower total memory usage".
+/// So we pin the pre-0.25 figure and keep the memory profile the bump would
+/// otherwise have changed underneath us.
+///
+/// This caps the per-read chunk, not message size: `max_message_size` (64 MiB)
+/// and `max_frame_size` (16 MiB) are untouched, so large bursts of terminal
+/// output still stream, just in the same sized reads as before.
+const SHELL_WS_READ_BUFFER_BYTES: usize = 4 * 1024;
+
+/// The WebSocket config every shell tunnel dials with.
+fn shell_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .read_buffer_size(SHELL_WS_READ_BUFFER_BYTES)
 }
 
 /// Build the ttyd WebSocket handshake request (carrying the `tty` subprotocol
@@ -136,10 +166,13 @@ pub(crate) fn pump_websocket_through_tunnel<S>(
     let outbound_pump = async move {
         while let Some(frame) = outbound_rx.recv().await {
             let msg = match frame {
-                ShellFrame::Text(t) => Message::Text(t),
-                ShellFrame::Binary(b) => Message::Binary(b.to_vec()),
-                ShellFrame::Ping(b) => Message::Ping(b.to_vec()),
-                ShellFrame::Pong(b) => Message::Pong(b.to_vec()),
+                ShellFrame::Text(t) => Message::Text(t.into()),
+                // tungstenite takes `Bytes` since 0.26, which is what
+                // `ShellFrame` already carries — the payload now moves by
+                // refcount instead of being copied on every frame.
+                ShellFrame::Binary(b) => Message::Binary(b),
+                ShellFrame::Ping(b) => Message::Ping(b),
+                ShellFrame::Pong(b) => Message::Pong(b),
                 ShellFrame::Close(cf) => Message::Close(cf.map(|c| CloseFrame {
                     code: c.code.into(),
                     reason: c.reason.into(),
@@ -159,10 +192,10 @@ pub(crate) fn pump_websocket_through_tunnel<S>(
     let inbound_pump = async move {
         while let Some(msg) = up_stream.next().await {
             let frame = match msg {
-                Ok(Message::Text(t)) => ShellFrame::Text(t),
-                Ok(Message::Binary(b)) => ShellFrame::Binary(Bytes::from(b)),
-                Ok(Message::Ping(b)) => ShellFrame::Ping(Bytes::from(b)),
-                Ok(Message::Pong(b)) => ShellFrame::Pong(Bytes::from(b)),
+                Ok(Message::Text(t)) => ShellFrame::Text(t.as_str().to_owned()),
+                Ok(Message::Binary(b)) => ShellFrame::Binary(b),
+                Ok(Message::Ping(b)) => ShellFrame::Ping(b),
+                Ok(Message::Pong(b)) => ShellFrame::Pong(b),
                 Ok(Message::Close(Some(cf))) => ShellFrame::Close(Some(ShellClose {
                     code: cf.code.into(),
                     reason: cf.reason.to_string(),
@@ -208,7 +241,9 @@ async fn connect_ttyd_cold(
     let mut backoff = TTYD_BACKOFF_START;
     loop {
         let request = build_request()?;
-        match tokio_tungstenite::connect_async(request).await {
+        match tokio_tungstenite::connect_async_with_config(request, Some(shell_ws_config()), false)
+            .await
+        {
             Ok((ws, _resp)) => return Ok(ws),
             Err(e) => {
                 let msg = e.to_string();
@@ -230,6 +265,41 @@ mod tests {
     use engram_core::types::shell::{ShellFrame, ShellTunnel, SHELL_TUNNEL_CHANNEL_CAPACITY};
     use tokio::net::TcpListener;
 
+    /// Shell tunnels must keep the pre-tungstenite-0.25 read buffer.
+    ///
+    /// `WebSocketConfig::default()` carries a 128 KiB `read_buffer_size` that
+    /// the frame codec allocates eagerly, per connection. tungstenite 0.24 read
+    /// in fixed 4 KiB chunks, so simply accepting the new default would grow
+    /// every shell tunnel's read buffer 32-fold — invisibly, since no call site
+    /// mentions a buffer size and no test would fail.
+    ///
+    /// A host multiplexes many sessions, so that memory is real. If this test
+    /// fails, decide the memory question on purpose: do not just re-pin it to
+    /// whatever the new default happens to be.
+    #[test]
+    fn shell_tunnels_pin_the_pre_0_25_read_buffer() {
+        let config = shell_ws_config();
+
+        assert_eq!(
+            config.read_buffer_size,
+            4 * 1024,
+            "shell tunnels must keep the 4 KiB read chunk tungstenite 0.24 used, \
+             not tungstenite's 128 KiB default"
+        );
+        assert!(
+            config.read_buffer_size
+                < tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                    .read_buffer_size,
+            "the pin is only meaningful while it is below upstream's default"
+        );
+
+        // Limiting the read chunk must not limit how big a message can be:
+        // terminal output still arrives in full, just in smaller reads.
+        let defaults = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+        assert_eq!(config.max_message_size, defaults.max_message_size);
+        assert_eq!(config.max_frame_size, defaults.max_frame_size);
+    }
+
     /// End-to-end pump test: spin up a fake ttyd that does the
     /// server-side WS handshake on a localhost port, dial it from
     /// the client side, attach the pump tasks, and verify a binary
@@ -248,8 +318,8 @@ mod tests {
             if let Some(Ok(msg)) = ws.next().await {
                 let bytes = match msg {
                     Message::Binary(b) => b,
-                    Message::Text(t) => t.into_bytes(),
-                    _ => Vec::new(),
+                    Message::Text(t) => Bytes::from(t),
+                    _ => Bytes::new(),
                 };
                 use futures::SinkExt;
                 ws.send(Message::Binary(bytes)).await.unwrap();
@@ -298,7 +368,9 @@ mod tests {
                 use futures::SinkExt;
                 match msg {
                     Message::Text(t) => {
-                        ws.send(Message::Text(format!("echo:{t}"))).await.unwrap();
+                        ws.send(Message::Text(format!("echo:{t}").into()))
+                            .await
+                            .unwrap();
                     }
                     Message::Close(_) => {
                         let _ = ws.close(None).await;
