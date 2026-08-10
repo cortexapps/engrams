@@ -9,6 +9,7 @@ export {
   specBlockRegistration,
   specBlockRegistry,
   specNodesSemanticallyEqual,
+  validateSpecBlockCachedRender,
   type SpecBlockAttrs,
   type SpecBlockCachedRender,
   type SpecBlockKind,

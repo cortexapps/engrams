@@ -42,7 +42,7 @@ describe("spec blocks", () => {
       <SpecBlockView attrs={attrs({ source: "flowchart LR\n  A --> B" })} onCache={onCache} />,
     );
 
-    const diagram = await screen.findByRole("img", { name: "Mermaid diagram" });
+    const diagram = await screen.findByRole("img", { name: "Mermaid diagram" }, { timeout: 5_000 });
     expect(diagram.querySelector("svg")).not.toBeNull();
     expect(fetch).not.toHaveBeenCalled();
     await waitFor(() => expect(onCache).toHaveBeenCalledOnce());

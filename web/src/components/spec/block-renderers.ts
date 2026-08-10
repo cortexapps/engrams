@@ -42,21 +42,26 @@ const d2Adapter: SpecBlockRenderAdapter = {
   kind: "d2",
   async render(source, blockId) {
     assertSafeD2Source(source);
-    d2 ??= new D2Client();
-    const result = await d2.compile({
-      fs: { "index.d2": source },
-      inputPath: "index.d2",
-      options: {
-        layout: "dagre",
+    const client = (d2 ??= new D2Client());
+    try {
+      const result = await client.compile({
+        fs: { "index.d2": source },
+        inputPath: "index.d2",
+        options: {
+          layout: "dagre",
+          noXMLTag: true,
+          salt: blockId,
+        },
+      });
+      return await client.render(result.diagram, {
+        ...result.renderOptions,
         noXMLTag: true,
         salt: blockId,
-      },
-    });
-    return d2.render(result.diagram, {
-      ...result.renderOptions,
-      noXMLTag: true,
-      salt: blockId,
-    });
+      });
+    } catch (error) {
+      if (client.failed && d2 === client) d2 = null;
+      throw error;
+    }
   },
 };
 

@@ -73,6 +73,7 @@ const TEMPLATE_SECTIONS: SpecTemplateSection[] = [
 
 class MemoryDocumentStore implements SpecDocumentStore {
   seq = 0n;
+  semanticSeq = 0n;
   readonly updates: SpecUpdateRecord[] = [];
   readonly clientIds: Array<string | null> = [];
 
@@ -90,12 +91,18 @@ class MemoryDocumentStore implements SpecDocumentStore {
     update: Uint8Array,
     clientId: string | null,
     _effects: SpecUpdateEffects,
-  ): Promise<bigint | null> {
+  ) {
     if (expectedSeq !== this.seq) return null;
     this.seq += 1n;
+    if (_effects.semanticChanged) this.semanticSeq += 1n;
     this.clientIds.push(clientId);
-    this.updates.push({ seq: this.seq, update: update.slice(), clientId });
-    return this.seq;
+    this.updates.push({
+      seq: this.seq,
+      semanticDocSeq: this.semanticSeq,
+      update: update.slice(),
+      clientId,
+    });
+    return { seq: this.seq, semanticDocSeq: this.semanticSeq };
   }
 
   async insertCheckpointAndUpdateIfLatest(

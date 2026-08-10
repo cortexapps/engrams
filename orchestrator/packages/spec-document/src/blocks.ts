@@ -33,8 +33,39 @@ export interface SpecBlockAttrs {
   provenance: SpecBlockProvenance;
 }
 
-export function encodedSpecBlockCacheSize(cache: SpecBlockCachedRender): number {
-  return new TextEncoder().encode(JSON.stringify(cache)).byteLength;
+export function encodedSpecBlockCacheSize(cache: unknown): number {
+  const encoded = JSON.stringify(cache);
+  if (encoded === undefined) {
+    throw new Error("A cached render must be a JSON object");
+  }
+  return new TextEncoder().encode(encoded).byteLength;
+}
+
+export function validateSpecBlockCachedRender(value: unknown): SpecBlockCachedRender {
+  if (!isRecord(value)) {
+    throw new Error("A cached render must be an object");
+  }
+  const expectedKeys = ["blockId", "kind", "rendererRevision", "source", "svg"];
+  const keys = Object.keys(value).sort();
+  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) {
+    throw new Error("A cached render must contain only blockId, kind, rendererRevision, source, and svg");
+  }
+  if (
+    typeof value.kind !== "string" ||
+    typeof value.source !== "string" ||
+    typeof value.blockId !== "string" ||
+    typeof value.rendererRevision !== "string" ||
+    typeof value.svg !== "string"
+  ) {
+    throw new Error("Every cached render field must be a string");
+  }
+  return {
+    kind: value.kind,
+    source: value.source,
+    blockId: value.blockId,
+    rendererRevision: value.rendererRevision,
+    svg: value.svg,
+  };
 }
 
 const registrations: Readonly<Record<SpecBlockKind, SpecBlockRegistration>> = {
@@ -77,23 +108,11 @@ export function readSpecBlockAttrs(attrs: Readonly<Record<string, unknown>>): Sp
 }
 
 function readCachedRender(value: unknown): SpecBlockCachedRender | null {
-  if (
-    !isRecord(value) ||
-    typeof value.kind !== "string" ||
-    typeof value.source !== "string" ||
-    typeof value.blockId !== "string" ||
-    typeof value.rendererRevision !== "string" ||
-    typeof value.svg !== "string"
-  ) {
+  try {
+    return validateSpecBlockCachedRender(value);
+  } catch {
     return null;
   }
-  return {
-    kind: value.kind,
-    source: value.source,
-    blockId: value.blockId,
-    rendererRevision: value.rendererRevision,
-    svg: value.svg,
-  };
 }
 
 function readProvenance(value: unknown): SpecBlockProvenance {

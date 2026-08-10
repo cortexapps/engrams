@@ -31,6 +31,7 @@ export interface ProjectionRecord {
   rev: bigint;
   sessionId: string;
   docSeq: bigint;
+  semanticDocSeq: bigint;
   sha256: string;
   rendered: Uint8Array;
   documentState: Uint8Array;
@@ -72,6 +73,7 @@ function projectionRecord(row: typeof specProjection.$inferSelect): ProjectionRe
     rev: row.rev,
     sessionId: row.sessionId,
     docSeq: row.docSeq,
+    semanticDocSeq: row.semanticDocSeq,
     sha256: row.sha256,
     rendered: row.rendered,
     documentState: row.documentState,
@@ -90,7 +92,7 @@ export class PostgresSpecProjectionStore implements SpecProjectionStore {
   async reserve(input: SpecProjectionRequest, discardNotice = false): Promise<ProjectionRecord> {
     return getDb().transaction(async (tx) => {
       const specs = await tx
-        .select({ docSeq: spec.currentDocSeq })
+        .select({ docSeq: spec.currentDocSeq, semanticDocSeq: spec.currentSemanticDocSeq })
         .from(spec)
         .where(and(eq(spec.id, input.specId), eq(spec.sessionId, input.sessionId)))
         .for("update")
@@ -108,7 +110,7 @@ export class PostgresSpecProjectionStore implements SpecProjectionStore {
       if (
         latest &&
         PENDING_STATES.includes(latest.state as (typeof PENDING_STATES)[number]) &&
-        latest.docSeq === current.docSeq
+        latest.semanticDocSeq === current.semanticDocSeq
       ) {
         if (discardNotice && !latest.discardNotice && latest.rendered.byteLength === 0) {
           const updated = await tx
@@ -124,6 +126,13 @@ export class PostgresSpecProjectionStore implements SpecProjectionStore {
           return projectionRecord(latest);
         }
       }
+      if (
+        latest?.state === "published" &&
+        latest.semanticDocSeq === current.semanticDocSeq &&
+        !discardNotice
+      ) {
+        return projectionRecord(latest);
+      }
 
       const rev = (latest?.rev ?? 0n) + 1n;
       const stagingPath = `/workspace/.engrams/spec/incoming-${rev}.md`;
@@ -134,6 +143,7 @@ export class PostgresSpecProjectionStore implements SpecProjectionStore {
           rev,
           sessionId: input.sessionId,
           docSeq: current.docSeq,
+          semanticDocSeq: current.semanticDocSeq,
           sha256: "",
           rendered: Buffer.alloc(0),
           documentState: Buffer.alloc(0),
