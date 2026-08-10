@@ -1,10 +1,10 @@
 {
   "sdkVersion": "4.21.6",
   "workflows": {
-    "AutomationRunWorkflow": "178814191e631d66e041ea364521603b",
+    "AutomationRunWorkflow": "5d6acd798dd18b9b6d5b362553d9b969",
     "PrReviewWorkflow": "095bfee24706adefa58e67d2dda939a5",
     "ReviewIngressWorkflow": "b93d9786e5eee857fe6445c4579e231d",
-    "SlackThreadWorkflow": "8e3f0eca006aeaa4e51f1137a668644d",
+    "SlackThreadWorkflow": "a7312006d7bcc3cf3f929438f477b821",
     "ToolExecWorkflow": "e66c370bf2411dca14208569ce5562a0"
   }
 }

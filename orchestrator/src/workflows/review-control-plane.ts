@@ -891,6 +891,7 @@ export function makeReviewControlPlane(
 
       const created = await createExistingSession({
         taskId: input.taskId,
+        taskType: "pr_review",
         profileId,
         integrationPrincipalId: "automation:pr-review",
         role: "finder",
@@ -1069,6 +1070,7 @@ export function makeReviewControlPlane(
 
       const created = await createExistingSession({
         taskId: input.taskId,
+        taskType: "pr_review",
         profileId,
         integrationPrincipalId: "automation:pr-review",
         role: "verifier",

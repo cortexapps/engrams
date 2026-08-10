@@ -4,6 +4,8 @@ import { z } from "zod";
 
 import type { ToolContext, ToolRegistry } from "./registry.ts";
 
+const SPEC_TASK_TYPES = ["spec"] as const;
+
 const Revision = z
   .string()
   .regex(/^(0|[1-9][0-9]*)$/, "must be a non-negative decimal revision");
@@ -284,6 +286,7 @@ export function registerSpecTools(
 ): void {
   registry.register({
     name: "spec_read",
+    taskTypes: SPEC_TASK_TYPES,
     description:
       "Read the live spec document, or one section, without using the file projection.",
     input: ReadInput,
@@ -316,6 +319,7 @@ export function registerSpecTools(
 
   registry.register({
     name: "spec_update_section",
+    taskTypes: SPEC_TASK_TYPES,
     description:
       "Replace one spec section with Markdown parsed by the document service.",
     input: UpdateSectionInput,
@@ -342,6 +346,7 @@ export function registerSpecTools(
 
   registry.register({
     name: "spec_set_section_state",
+    taskTypes: SPEC_TASK_TYPES,
     description:
       "Set a section to drafted, confirmed, or n/a. The n/a state requires a reason.",
     input: SetSectionStateInput,
@@ -369,6 +374,7 @@ export function registerSpecTools(
 
   registry.register({
     name: "spec_add_open_question",
+    taskTypes: SPEC_TASK_TYPES,
     description: "Add an open question anchored to a spec section.",
     input: AddOpenQuestionInput,
     output: MutationOutput,
@@ -394,6 +400,7 @@ export function registerSpecTools(
 
   registry.register({
     name: "spec_resolve_open_question",
+    taskTypes: SPEC_TASK_TYPES,
     description:
       "Resolve an open question and add its answer to the anchored section in one document mutation.",
     input: ResolveOpenQuestionInput,
@@ -421,6 +428,7 @@ export function registerSpecTools(
 
   registry.register({
     name: "spec_update_block",
+    taskTypes: SPEC_TASK_TYPES,
     description:
       "Replace the source specification of a diagram block in one section.",
     input: UpdateBlockInput,
@@ -448,6 +456,7 @@ export function registerSpecTools(
 
   registry.register({
     name: "spec_update_notes",
+    taskTypes: SPEC_TASK_TYPES,
     description: "Replace the collaborative working notes pane with Markdown.",
     input: UpdateNotesInput,
     output: MutationOutput,
@@ -465,6 +474,7 @@ export function registerSpecTools(
 
   registry.register({
     name: "spec_propose_tickets",
+    taskTypes: SPEC_TASK_TYPES,
     description:
       "Replace the post-publish ticket proposal tree. Each ticket must link to a spec section.",
     input: ProposeTicketsInput,

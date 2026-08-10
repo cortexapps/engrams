@@ -47,6 +47,18 @@ const AUTH: AuthState = {
   ability: abilityFor({ id: "user-1", role: "user" }),
 };
 
+const ADMIN_AUTH: AuthState = {
+  principal: {
+    email: "admin@example.com",
+    display_name: "Test Admin",
+    role: "admin",
+    is_admin: true,
+    can_sign_out: true,
+  },
+  isAdmin: true,
+  ability: abilityFor({ id: "admin-1", role: "admin" }),
+};
+
 function makeTestRouter(auth: AuthState | null, path = "/login") {
   return createRouter({
     routeTree,
@@ -66,7 +78,13 @@ test("redirects authenticated user away from /login to /sessions", async () => {
   expect(screen.queryByLabelText(/email/i)).toBeNull();
 });
 
-test("routes an authenticated member to the Tech Specs list", async () => {
-  render(<RouterProvider router={makeTestRouter(AUTH, "/specs")} />);
+test("redirects an authenticated member away from Tech Specs", async () => {
+  const router = makeTestRouter(AUTH, "/specs");
+  await router.load();
+  expect(router.state.location.pathname).toBe("/settings/profile");
+});
+
+test("routes an admin to the Tech Specs list", async () => {
+  render(<RouterProvider router={makeTestRouter(ADMIN_AUTH, "/specs")} />);
   await screen.findByTestId("tech-specs");
 });

@@ -24,6 +24,8 @@ const INPUT: ToolExecInput = {
 function fixture(options: {
   execution?: "sync" | "deferred";
   capabilities?: string[];
+  taskType?: string;
+  taskTypes?: readonly string[];
   argsJson?: string;
   output?: z.ZodType;
   handler?: (ctx: ToolContext, args: { text: string }) => unknown;
@@ -39,6 +41,7 @@ function fixture(options: {
     handling: "handled",
     execution: options.execution ?? "sync",
     capability: "memory:write",
+    ...(options.taskTypes !== undefined ? { taskTypes: options.taskTypes } : {}),
     handler: async (ctx, args) => {
       handlerCalls.push({ ctx, args });
       return options.handler?.(ctx, args) ?? { saved: true };
@@ -77,6 +80,7 @@ function fixture(options: {
     resolveContext: async () => ({
       sessionId: "session-1",
       taskId: "task-1",
+      taskType: options.taskType ?? "chat",
       capabilities: options.capabilities ?? ["memory:write"],
     }),
     pendingCalls: pending,
@@ -179,6 +183,21 @@ describe("tool exec plain functions", () => {
     expect(JSON.parse(invalidResult.completionCalls[0]!.resultJson)).toEqual({
       error: "invalid result for tool save_memory",
     });
+  });
+
+  test("task context denies a hidden handled tool before its handler runs", async () => {
+    const denied = fixture({ taskType: "chat", taskTypes: ["spec"] });
+
+    await runAndSubmit(denied);
+
+    expect(JSON.parse(denied.completionCalls[0]!.resultJson)).toEqual({
+      error: "tool save_memory is unavailable for task type chat",
+    });
+    expect(denied.handlerCalls).toEqual([]);
+
+    const allowed = fixture({ taskType: "spec", taskTypes: ["spec"] });
+    await runAndSubmit(allowed);
+    expect(allowed.handlerCalls).toHaveLength(1);
   });
 
   test("an already-completed submit is idempotent success", async () => {

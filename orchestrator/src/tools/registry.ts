@@ -19,6 +19,8 @@ export interface NativeBindings {
 export interface SessionToolContext {
   sessionId: string;
   capabilities: readonly string[];
+  /** Orchestrator-only task context used to select and enforce tool access. */
+  taskType?: string;
   taskId?: string;
   profileId?: string;
   userId?: string;
@@ -61,6 +63,8 @@ interface ToolDefinitionBase<
   presenterExempt?: string;
   nativeBindings?: NativeBindings;
   capability?: string;
+  /** Task types for which the orchestrator can expose this tool. */
+  taskTypes?: readonly string[];
 }
 
 export interface HandledToolDefinition<
@@ -176,4 +180,14 @@ export function toolCapabilities(registry: ToolRegistry = tools): Set<string> {
     if (tool.capability != null) capabilities.add(tool.capability);
   }
   return capabilities;
+}
+
+/** Return true when a tool is available in the current orchestrator task
+ *  context. An unrestricted tool remains available to all task types. */
+export function toolSupportsTaskType(
+  tool: RegisteredTool,
+  taskType?: string,
+): boolean {
+  return tool.taskTypes === undefined ||
+    (taskType !== undefined && tool.taskTypes.includes(taskType));
 }

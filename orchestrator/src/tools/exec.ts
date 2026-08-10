@@ -17,6 +17,7 @@ import {
 } from "./pending-tool-calls.ts";
 import {
   tools as productionTools,
+  toolSupportsTaskType,
   type SessionToolContext,
   type ToolContext,
   type ToolRegistry,
@@ -74,6 +75,7 @@ export async function resolveToolContext(
   const rows = await getDb()
     .select({
       taskId: task.id,
+      taskType: task.type,
       profileId: taskSession.profileId,
       userId: task.createdByUserId,
       // The session's effective policy projection is immutable at create.
@@ -89,6 +91,7 @@ export async function resolveToolContext(
   return {
     sessionId,
     taskId: row.taskId,
+    taskType: row.taskType,
     ...(row.profileId !== null ? { profileId: row.profileId } : {}),
     ...(row.userId !== null ? { userId: row.userId } : {}),
     capabilities: row.sessionCapabilities ?? [],
@@ -129,6 +132,15 @@ export async function executeToolCall(
       toolCallId: input.toolCallId,
       toolName: tool.name,
     };
+
+    if (!toolSupportsTaskType(tool, context.taskType)) {
+      return {
+        kind: "submit",
+        result: {
+          error: `tool ${tool.name} is unavailable for task type ${context.taskType ?? "unknown"}`,
+        },
+      };
+    }
 
     if (
       tool.capability !== undefined &&

@@ -33,7 +33,10 @@ import type {
 import type { ImagesClient } from "../rpc/profiles.ts";
 import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
 import { createToolRegistry } from "../tools/registry.ts";
-import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
+import {
+  BASE_SYSTEM_PROMPT,
+  SPEC_MODE_SYSTEM_PROMPT,
+} from "../prompts/base.ts";
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 import { capabilityGrant } from "../integrations/grants.ts";
@@ -648,6 +651,51 @@ describe("compileSessionCreateInput", () => {
     );
     const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
     expect(manifest.map((tool) => tool.name)).toEqual(["always_available", "save_memory"]);
+  });
+
+  test("selects the spec prompt and tools only for spec tasks", async () => {
+    const toolRegistry = createToolRegistry();
+    toolRegistry.register({
+      name: "always_available",
+      description: "Available to every task.",
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      handler: async () => ({ ok: true }),
+    });
+    toolRegistry.register({
+      name: "spec_read",
+      description: "Read the current spec.",
+      input: z.object({}),
+      output: z.object({ markdown: z.string() }),
+      handling: "handled",
+      execution: "sync",
+      taskTypes: ["spec"],
+      handler: async () => ({ markdown: "# Spec" }),
+    });
+
+    const chat = await compileSessionCreateInput(
+      profile(),
+      { ...deps(), toolRegistry },
+      { taskType: "chat" },
+    );
+    const spec = await compileSessionCreateInput(
+      profile(),
+      { ...deps(), toolRegistry },
+      { taskType: "spec" },
+    );
+
+    expect(JSON.parse(chat.harnessEnv!.ENGRAM_TOOLS!).map((tool: { name: string }) => tool.name))
+      .toEqual(["always_available"]);
+    expect(chat.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).not.toContain(
+      SPEC_MODE_SYSTEM_PROMPT,
+    );
+    expect(JSON.parse(spec.harnessEnv!.ENGRAM_TOOLS!).map((tool: { name: string }) => tool.name))
+      .toEqual(["always_available", "spec_read"]);
+    expect(spec.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toContain(
+      SPEC_MODE_SYSTEM_PROMPT,
+    );
   });
 
   test("child manifests omit human-interaction tools but retain coordination tools", async () => {

@@ -331,6 +331,7 @@ describe("automation task creator", () => {
     });
     expect(sessionInput).toEqual({
       taskId: "task-1",
+      taskType: "automation",
       profileId: "profile-1",
       integrationPrincipalId: "automation:automation-1",
       role: "primary",
