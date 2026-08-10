@@ -51,6 +51,7 @@ class MemoryDocumentStore implements SpecDocumentStore {
   readonly updates = new Map<string, SpecUpdateRecord[]>();
   readonly snapshots = new Map<string, SpecSnapshotRecord>();
   readonly wakes = new Set<(specId: string) => void>();
+  readonly reconnects = new Set<() => void>();
   readonly tailReads: string[] = [];
   dropNotifications = false;
   compactions = 0;
@@ -106,11 +107,20 @@ class MemoryDocumentStore implements SpecDocumentStore {
     return true;
   }
 
-  async listen(onWake: (specId: string) => void): Promise<() => Promise<void>> {
+  async listen(
+    onWake: (specId: string) => void,
+    onReconnect?: () => void,
+  ): Promise<() => Promise<void>> {
     this.wakes.add(onWake);
+    if (onReconnect) this.reconnects.add(onReconnect);
     return async () => {
       this.wakes.delete(onWake);
+      if (onReconnect) this.reconnects.delete(onReconnect);
     };
+  }
+
+  reconnect(): void {
+    for (const reconnect of this.reconnects) reconnect();
   }
 }
 
@@ -233,8 +243,20 @@ describe("SpecDocumentService", () => {
       specId: SPEC_ID,
       update: "encoded-awareness",
     });
+    const query = encodeSpecChannelEnvelope({ type: "awareness-query", specId: SPEC_ID });
+    expect(parseSpecChannelEnvelope(query)).toEqual({
+      type: "awareness-query",
+      specId: SPEC_ID,
+    });
     expect(parseSpecChannelEnvelope(`${SPEC_ID}:12`)).toBeNull();
     expect(parseSpecChannelEnvelope('{"type":"update"}')).toBeNull();
+    expect(() =>
+      encodeSpecChannelEnvelope({
+        type: "awareness",
+        specId: SPEC_ID,
+        update: "x".repeat(8_000),
+      }),
+    ).toThrow("larger than 7900 bytes");
   });
 
   test("concurrent updates from three clients converge in every apply order", async () => {
@@ -323,7 +345,7 @@ describe("SpecDocumentService", () => {
     expect(renderMarkdown(proseMirrorDocument(reloaded.doc))).toContain("durable");
   });
 
-  test("peer notifications sync only documents in the local working set", async () => {
+  test("peer notifications and reconnects sync only the local working set", async () => {
     const ignoredSpecId = "00000000-0000-4000-8000-000000000109";
     const store = new MemoryDocumentStore();
     const service = new SpecDocumentService(store);
@@ -339,6 +361,12 @@ describe("SpecDocumentService", () => {
 
     await store.notifyUpdate(SPEC_ID);
     await waitFor(() => store.tailReads.includes(SPEC_ID));
+
+    store.tailReads.length = 0;
+    store.reconnect();
+    await waitFor(() => store.tailReads.length > 0);
+    expect(store.tailReads).toContain(SPEC_ID);
+    expect(store.tailReads).not.toContain(ignoredSpecId);
     await service.stopPeerSync();
   });
 

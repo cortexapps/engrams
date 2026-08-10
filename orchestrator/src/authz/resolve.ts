@@ -18,9 +18,10 @@
  * NotFound (anti-enumeration behaviour per ADR §6).
  */
 
-import { eq } from "drizzle-orm";
+import { and, eq, isNull, or } from "drizzle-orm";
+import { config } from "../config.ts";
 import { getDb } from "../db/client.ts";
-import { task, taskSession } from "../db/schema.ts";
+import { spec, task, taskSession, user } from "../db/schema.ts";
 
 const TTL_MS = 5_000;
 const MAX_SIZE = 1_000;
@@ -69,6 +70,23 @@ export async function resolveSessionOwner(
 
   cache.set(sessionId, { value, expiresAt: now + TTL_MS });
   return value;
+}
+
+/** Return true when the user belongs to the deployment that owns the spec. */
+export async function resolveSpecMembership(specId: string, userId: string): Promise<boolean> {
+  const rows = await getDb()
+    .select({ id: spec.id })
+    .from(spec)
+    .innerJoin(user, eq(user.id, userId))
+    .where(
+      and(
+        eq(spec.id, specId),
+        eq(spec.orgId, config.deploymentId),
+        or(eq(user.banned, false), isNull(user.banned)),
+      ),
+    )
+    .limit(1);
+  return rows.length === 1;
 }
 
 /**

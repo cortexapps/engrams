@@ -1,0 +1,199 @@
+.spec-canvas-shell {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--card);
+  color: var(--card-foreground);
+  box-shadow: 0 1px 2px color-mix(in oklab, var(--foreground) 6%, transparent);
+}
+
+.spec-canvas-bar {
+  display: flex;
+  min-height: 3.25rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--border);
+  padding: 0.5rem 0.75rem;
+  background: color-mix(in oklab, var(--muted) 45%, var(--card));
+}
+
+.spec-canvas-tools,
+.spec-presence,
+.spec-presence-avatars,
+.spec-presence-copy {
+  display: flex;
+  align-items: center;
+}
+
+.spec-canvas-tools {
+  gap: 0.25rem;
+}
+
+.spec-presence {
+  min-width: 0;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  font-size: 0.75rem;
+  color: var(--muted-foreground);
+}
+
+.spec-presence-avatars {
+  padding-left: 0.5rem;
+}
+
+.spec-presence-avatar {
+  display: grid;
+  width: 1.75rem;
+  height: 1.75rem;
+  place-items: center;
+  border: 2px solid var(--card);
+  border-radius: 999px;
+  margin-left: -0.5rem;
+  color: white;
+  font-size: 0.625rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.spec-presence-avatar.is-agent {
+  background: var(--foreground);
+  color: var(--background);
+}
+
+.spec-presence-copy {
+  max-width: 30rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.25rem 0.75rem;
+}
+
+.spec-canvas-editor {
+  min-height: 38rem;
+  padding: clamp(2rem, 6vw, 5rem);
+  outline: none;
+}
+
+.spec-canvas-editor > section {
+  position: relative;
+  max-width: 52rem;
+  margin: 0 auto 4.5rem;
+}
+
+.spec-canvas-editor > section + section::before {
+  position: absolute;
+  top: -2.25rem;
+  right: 0;
+  left: 0;
+  height: 1px;
+  background: var(--border);
+  content: "";
+}
+
+.spec-canvas-editor h2 {
+  margin-bottom: 1.5rem;
+  font-size: clamp(1.65rem, 3vw, 2.25rem);
+  font-weight: 650;
+  letter-spacing: -0.035em;
+}
+
+.spec-canvas-editor h3,
+.spec-canvas-editor h4,
+.spec-canvas-editor h5,
+.spec-canvas-editor h6 {
+  margin: 2rem 0 0.75rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.spec-canvas-editor p {
+  margin: 0.75rem 0;
+  color: color-mix(in oklab, var(--foreground) 88%, var(--muted-foreground));
+  font-size: 1rem;
+  line-height: 1.8;
+}
+
+.spec-canvas-editor pre {
+  overflow-x: auto;
+  margin: 1.25rem 0;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 1rem;
+  background: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+}
+
+.spec-open-question {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border: 1px solid color-mix(in oklab, var(--destructive) 28%, var(--border));
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  background: color-mix(in oklab, var(--destructive) 8%, var(--card));
+  color: var(--foreground);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.spec-diagram-block {
+  margin: 1.5rem 0;
+  border: 1px dashed var(--border);
+  border-radius: 0.75rem;
+  padding: 1rem;
+  background: color-mix(in oklab, var(--muted) 55%, transparent);
+}
+
+.spec-diagram-label {
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.spec-canvas-loading {
+  display: grid;
+  min-height: 38rem;
+  align-content: start;
+  gap: 1rem;
+  padding: clamp(2rem, 6vw, 5rem);
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+}
+
+.spec-canvas-editor .collaboration-carets__caret {
+  position: relative;
+  border-left: 2px solid;
+  margin-left: -1px;
+  pointer-events: none;
+}
+
+.spec-canvas-editor .collaboration-carets__label {
+  position: absolute;
+  top: -1.65rem;
+  left: -1px;
+  border-radius: 0.25rem 0.25rem 0.25rem 0;
+  padding: 0.15rem 0.4rem;
+  color: white;
+  font-size: 0.6875rem;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+@media (max-width: 48rem) {
+  .spec-canvas-bar,
+  .spec-presence {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .spec-presence-copy {
+    justify-content: flex-start;
+  }
+
+  .spec-canvas-editor {
+    padding: 2rem 1.25rem;
+  }
+}

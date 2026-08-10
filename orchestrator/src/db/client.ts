@@ -32,9 +32,7 @@ export function getDb(): NodePgDatabase<typeof schema> {
 
   const url = process.env["ORCHESTRATOR_DATABASE_URL"];
   if (!url) {
-    throw new Error(
-      "Orchestrator: ORCHESTRATOR_DATABASE_URL is not set — cannot connect to DB",
-    );
+    throw new Error("Orchestrator: ORCHESTRATOR_DATABASE_URL is not set — cannot connect to DB");
   }
 
   _pool = new Pool({
@@ -49,17 +47,25 @@ export function getDb(): NodePgDatabase<typeof schema> {
   return _db;
 }
 
+/** Return the pg pool that backs the Drizzle singleton. */
+export function getPool(): Pool {
+  if (!_pool) getDb();
+  return initializedPool();
+}
+
 /**
  * Perform a cheap liveness probe (`SELECT 1`) with a 2-second timeout.
  * Returns true when the DB is reachable, false otherwise (never throws).
  */
 export async function checkDb(): Promise<boolean> {
   try {
-    const pool = _pool ?? (() => {
-      // Attempt to initialise — will throw if URL is missing.
-      getDb();
-      return _pool!;
-    })();
+    const pool =
+      _pool ??
+      (() => {
+        // Attempt to initialise — will throw if URL is missing.
+        getDb();
+        return initializedPool();
+      })();
 
     const client = await pool.connect();
     try {
@@ -80,4 +86,9 @@ export async function checkDb(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function initializedPool(): Pool {
+  if (!_pool) throw new Error("Orchestrator: the database pool did not initialize");
+  return _pool;
 }
