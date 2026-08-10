@@ -8,6 +8,7 @@ import {
   specNodesSemanticallyEqual,
   validateSpecBlockCachedRender,
   validateRequirementEdit,
+  type TrackedEditTranscriptChip,
 } from "@engrams/spec-document";
 import type { Node as ProseMirrorNode } from "prosemirror-model";
 import { prosemirrorToYXmlFragment, yXmlFragmentToProseMirrorRootNode } from "y-prosemirror";
@@ -182,6 +183,26 @@ export interface SpecUpdateInsertResult {
   semanticDocSeq: bigint;
 }
 
+export interface SpecTrackedEditActionInput {
+  id: string;
+  specId: string;
+  sectionId: string;
+  requestFingerprint: string;
+  chip: TrackedEditTranscriptChip;
+  concurrentEditors: string[];
+}
+
+export interface SpecTrackedEditActionRecord extends SpecTrackedEditActionInput {
+  result: {
+    applied: true;
+    newRev: bigint;
+    transcriptChip: TrackedEditTranscriptChip;
+    concurrentEditors: string[];
+  };
+  createdAt: Date;
+  deliveredAt: Date | null;
+}
+
 export interface CompactSnapshotInput extends SpecSnapshotRecord {
   specId: string;
 }
@@ -217,6 +238,7 @@ export interface SpecDocumentStore {
     clientId: string | null,
     effects: SpecUpdateEffects,
     participantEpoch?: bigint,
+    transcriptAction?: SpecTrackedEditActionInput & { createdAt: Date },
   ): Promise<SpecUpdateInsertResult | null>;
   insertCheckpointAndUpdateIfLatest(
     specId: string,
@@ -230,6 +252,7 @@ export interface SpecDocumentStore {
   notifyUpdate(specId: string, seq: bigint): Promise<void>;
   compactSnapshot(input: CompactSnapshotInput): Promise<boolean>;
   listen(onWake: (specId: string) => void, onReconnect?: () => void): Promise<() => Promise<void>>;
+  readTrackedEditAction?(actionId: string): Promise<SpecTrackedEditActionRecord | null>;
 }
 
 export interface LoadedSpecDocument {
@@ -367,6 +390,79 @@ export class SpecDocumentService {
           if (update.length === 2) throw new Error("The spec mutation did not change the document");
           const stored = await this.tryApplyUpdateUnlocked(specId, room, update, clientId);
           if (stored) return stored;
+        } finally {
+          fork.destroy();
+        }
+      }
+    });
+  }
+
+  async readTrackedEditAction(actionId: string): Promise<SpecTrackedEditActionRecord | null> {
+    const read = this.store.readTrackedEditAction;
+    if (!read) throw new Error("The spec document store cannot read tracked-edit actions.");
+    return read.call(this.store, actionId);
+  }
+
+  async mutateDocumentWithTrackedEdit(
+    specId: string,
+    clientId: string | null,
+    action: SpecTrackedEditActionInput,
+    mutate: (doc: ProseMirrorNode, ydoc: Y.Doc) => ProseMirrorNode,
+    expectedSeq?: bigint,
+  ): Promise<
+    | { status: "stored"; update: SpecUpdateRecord; action: SpecTrackedEditActionRecord }
+    | { status: "replayed"; action: SpecTrackedEditActionRecord }
+  > {
+    const read = this.store.readTrackedEditAction;
+    if (!read) throw new Error("The spec document store cannot store tracked-edit actions.");
+    const now = this.options.now;
+    if (!now) throw new Error("A tracked edit requires an injected timestamp.");
+    const createdAt = now();
+    return this.withLock(specId, async () => {
+      const room = await this.loadUnlocked(specId);
+      for (;;) {
+        const existing = await read.call(this.store, action.id);
+        if (existing) return { status: "replayed", action: existing };
+        await this.syncUnlocked(specId, room);
+        const replay = await read.call(this.store, action.id);
+        if (replay) return { status: "replayed", action: replay };
+        if (expectedSeq !== undefined && room.semanticDocSeq !== expectedSeq) {
+          throw new SpecDocumentRevisionConflictError(expectedSeq, room.semanticDocSeq);
+        }
+        const fork = new Y.Doc();
+        try {
+          Y.applyUpdate(fork, Y.encodeStateAsUpdate(room.doc));
+          const before = Y.encodeStateVector(fork);
+          const replacement = mutate(proseMirrorDocument(fork), fork);
+          prosemirrorToYXmlFragment(replacement, fork.getXmlFragment(SPEC_FRAGMENT_NAME));
+          const update = Y.encodeStateAsUpdate(fork, before);
+          if (update.length === 2) throw new Error("The tracked edit did not change the document");
+          const stored = await this.tryApplyUpdateUnlocked(
+            specId,
+            room,
+            update,
+            clientId,
+            undefined,
+            undefined,
+            { ...action, createdAt },
+          );
+          if (stored) {
+            return {
+              status: "stored",
+              update: stored,
+              action: {
+                ...action,
+                result: {
+                  applied: true,
+                  newRev: stored.semanticDocSeq,
+                  concurrentEditors: action.concurrentEditors,
+                  transcriptChip: action.chip,
+                },
+                createdAt,
+                deliveredAt: null,
+              },
+            };
+          }
         } finally {
           fork.destroy();
         }
@@ -584,6 +680,7 @@ export class SpecDocumentService {
     clientId: string | null,
     participantEpoch?: bigint,
     checkpoint?: SpecDocumentCheckpoint,
+    transcriptAction?: SpecTrackedEditActionInput & { createdAt: Date },
   ): Promise<SpecUpdateRecord | null> {
     const { candidate, sections, semanticChanged } = this.validateCandidate(room, update);
     const renderedSizeUpperBound = this.validateSize(room, update, candidate);
@@ -614,6 +711,7 @@ export class SpecDocumentService {
             clientId,
             effects,
             participantEpoch,
+            transcriptAction,
           );
     } catch (error) {
       this.resetValidationDoc(room);
@@ -919,6 +1017,22 @@ interface SnapshotRow {
   covered_semantic_doc_seq: string;
 }
 
+interface TrackedEditActionRow {
+  id: string;
+  spec_id: string;
+  section_id: string;
+  request_fingerprint: string;
+  chip: TrackedEditTranscriptChip;
+  result: {
+    applied: true;
+    newRev: string;
+    transcriptChip: TrackedEditTranscriptChip;
+    concurrentEditors: string[];
+  } | null;
+  created_at: Date;
+  delivered_at: Date | null;
+}
+
 export class PostgresSpecDocumentStore implements SpecDocumentStore {
   constructor(
     private readonly pool: Pool,
@@ -959,6 +1073,46 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     }));
   }
 
+  async readTrackedEditAction(actionId: string): Promise<SpecTrackedEditActionRecord | null> {
+    const result = await this.pool.query<TrackedEditActionRow>(
+      `SELECT id, spec_id, section_id, request_fingerprint, chip, result,
+              created_at, delivered_at
+         FROM spec_transcript_action
+        WHERE id = $1`,
+      [actionId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    if (row.chip.kind !== "spec_tracked_edit" || !row.result) {
+      throw new Error(`Transcript action ${actionId} is not a tracked edit.`);
+    }
+    if (
+      row.result.applied !== true ||
+      typeof row.result.newRev !== "string" ||
+      row.result.transcriptChip.kind !== "spec_tracked_edit" ||
+      !Array.isArray(row.result.concurrentEditors) ||
+      !row.result.concurrentEditors.every((name) => typeof name === "string")
+    ) {
+      throw new Error(`Transcript action ${actionId} has an invalid stored result.`);
+    }
+    return {
+      id: row.id,
+      specId: row.spec_id,
+      sectionId: row.section_id,
+      requestFingerprint: row.request_fingerprint,
+      chip: row.chip,
+      concurrentEditors: row.result.concurrentEditors,
+      result: {
+        applied: true,
+        newRev: BigInt(row.result.newRev),
+        transcriptChip: row.result.transcriptChip,
+        concurrentEditors: row.result.concurrentEditors,
+      },
+      createdAt: row.created_at,
+      deliveredAt: row.delivered_at,
+    };
+  }
+
   async insertUpdateIfLatest(
     specId: string,
     expectedSeq: bigint,
@@ -966,6 +1120,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     clientId: string | null,
     effects: SpecUpdateEffects,
     participantEpoch?: bigint,
+    transcriptAction?: SpecTrackedEditActionInput & { createdAt: Date },
   ): Promise<SpecUpdateInsertResult | null> {
     return this.insertDraftUpdate(
       specId,
@@ -975,6 +1130,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
       effects,
       undefined,
       participantEpoch,
+      transcriptAction,
     );
   }
 
@@ -1006,6 +1162,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     effects: SpecUpdateEffects,
     checkpoint?: SpecDocumentCheckpoint,
     participantEpoch?: bigint,
+    transcriptAction?: SpecTrackedEditActionInput & { createdAt: Date },
   ): Promise<SpecUpdateInsertResult | null> {
     const changesDocument = effects.sections.some((section) => section.changed);
     if (clientId !== null && changesDocument && !effects.at) {
@@ -1092,6 +1249,30 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
           clientId,
         ],
       );
+      if (transcriptAction) {
+        if (transcriptAction.specId !== specId) {
+          throw new Error("The tracked edit belongs to a different spec.");
+        }
+        await client.query(
+          `INSERT INTO spec_transcript_action
+             (id, spec_id, section_id, request_fingerprint, chip, result, created_at, delivered_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)`,
+          [
+            transcriptAction.id,
+            transcriptAction.specId,
+            transcriptAction.sectionId,
+            transcriptAction.requestFingerprint,
+            transcriptAction.chip,
+            {
+              applied: true,
+              newRev: next.current_semantic_doc_seq,
+              transcriptChip: transcriptAction.chip,
+              concurrentEditors: transcriptAction.concurrentEditors,
+            },
+            transcriptAction.createdAt,
+          ],
+        );
+      }
       if (clientId !== null && changesDocument) {
         if (actorUserId === undefined) {
           const participant = await client.query<{ user_id: string | null }>(

@@ -29,9 +29,11 @@ interface CreateSpecProviderOptions {
 
 export function SpecCanvas({
   specId,
+  revision,
   selectionActions,
 }: {
   specId: string;
+  revision: string;
   /** Supply this only when the current user can send selection actions. */
   selectionActions?: SpecSelectionActions;
 }) {
@@ -76,6 +78,7 @@ export function SpecCanvas({
       connection={connection}
       user={user}
       specId={specId}
+      revision={revision}
       selectionActions={selectionActions}
     />
   );
@@ -85,11 +88,13 @@ function ConnectedSpecCanvas({
   connection,
   user,
   specId,
+  revision,
   selectionActions,
 }: {
   connection: SpecConnection;
   user: { name: string; color: string };
   specId: string;
+  revision: string;
   selectionActions?: SpecSelectionActions;
 }) {
   const extensions = useMemo(
@@ -151,6 +156,7 @@ function ConnectedSpecCanvas({
           editor={editor}
           doc={connection.doc}
           specId={specId}
+          revision={revision}
           actions={selectionActions}
         />
       )}

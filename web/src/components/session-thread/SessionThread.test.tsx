@@ -215,6 +215,67 @@ describe("SessionThread", () => {
     await waitFor(() => expect(screen.getByText(/read 1/)).toBeTruthy());
   });
 
+  test("refresh renders exactly one tracked-edit chip from the durable tool result", async () => {
+    const events = indexed([
+      { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+      {
+        type: "tool_call_started",
+        run_id: "r1",
+        tool_call_id: "selection-1",
+        tool_name: "mcp__engrams__spec_update_section",
+        args_summary: JSON.stringify({ section_id: "context" }),
+        at: AT,
+      },
+      {
+        type: "tool_call_requested",
+        run_id: "r1",
+        tool_call_id: "selection-1",
+        name: "spec_update_section",
+        args_json: JSON.stringify({ section_id: "context" }),
+        at: AT,
+      },
+      {
+        type: "tool_result_submitted",
+        tool_call_id: "selection-1",
+        result_json: JSON.stringify({
+          applied: true,
+          new_rev: "8",
+          concurrent_editors: [],
+          transcript_chip: {
+            kind: "spec_tracked_edit",
+            specId: "00000000-0000-4000-8000-000000000112",
+            sectionId: "context",
+            before: "Retry forever.",
+            after: "Retry three times.",
+          },
+        }),
+        at: AT,
+      },
+      {
+        type: "tool_call_completed",
+        run_id: "r1",
+        tool_call_id: "selection-1",
+        tool_name: "mcp__engrams__spec_update_section",
+        ok: true,
+        duration_ms: 1,
+        result_summary: "completed",
+        at: AT2,
+      },
+      { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+    ]);
+    const view = renderWithProviders(
+      <SessionThread sessionId="s1" status="idle" events={events} />,
+    );
+
+    expect(await screen.findAllByLabelText("Tracked spec edit")).toHaveLength(1);
+    expect(screen.getByText("Retry forever.")).toBeTruthy();
+    expect(screen.getByText("Retry three times.")).toBeTruthy();
+
+    view.unmount();
+    renderWithProviders(<SessionThread sessionId="s1" status="idle" events={events} />);
+    expect(await screen.findAllByLabelText("Tracked spec edit")).toHaveLength(1);
+  });
+
   test("an unanswered legacy question is read-only after the protocol upgrade", async () => {
     renderWithProviders(
       <SessionThread

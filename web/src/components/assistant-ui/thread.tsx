@@ -32,6 +32,10 @@ import { ShellToolPart } from "@/components/session-thread/ShellToolPart";
 import { FileChangePart } from "@/components/session-thread/FileChangePart";
 import { BrowserActivityPart } from "@/components/session-thread/BrowserActivityPart";
 import { TaskToolPart } from "@/components/session-thread/TaskToolPart";
+import {
+  isSpecUpdateSectionTool,
+  TrackedEditToolPart,
+} from "@/components/session-thread/TrackedEditToolPart";
 import { SystemMessage } from "@/components/session-thread/SystemMessage";
 import { RunFooter } from "@/components/session-thread/RunFooter";
 import {
@@ -220,7 +224,9 @@ const AssistantMessage: FC = () => {
                           ? FileChangePart
                           : part.toolName === TASK_TOOL
                             ? TaskToolPart
-                            : ToolFallback;
+                            : isSpecUpdateSectionTool(part.toolName)
+                              ? TrackedEditToolPart
+                              : ToolFallback;
                   return <Tool {...part} />;
                 }
                 case "indicator":

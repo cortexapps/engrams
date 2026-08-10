@@ -10,6 +10,7 @@ import {
   replaceSection,
   resolveSectionRelativeAnchor,
   schema,
+  selectionSliceFingerprint,
   serializeSectionRelativeAnchor,
   type SpecSelectionSpan,
   type TrackedEditTranscriptChip,
@@ -29,6 +30,7 @@ import type {
 import {
   proseMirrorDocument,
   SpecDocumentRevisionConflictError,
+  type SpecTrackedEditActionRecord,
   type SpecDocumentService,
 } from "./doc-service.ts";
 import {
@@ -89,10 +91,7 @@ export class PostgresSpecToolMetadataStore implements SpecToolMetadataStore {
       [specId],
     );
     return new Map(
-      result.rows.map((row) => [
-        row.section_id,
-        { state: row.state, naReason: row.na_reason },
-      ]),
+      result.rows.map((row) => [row.section_id, { state: row.state, naReason: row.na_reason }]),
     );
   }
 
@@ -154,55 +153,86 @@ export class SpecToolService implements SpecToolDocumentService {
       selection?: SpecSelectionSpan;
     },
   ): Promise<SpecMutationResult> {
+    if (input.selection) {
+      return this.updateSelectedRange(specId, { ...input, selection: input.selection });
+    }
     const loaded = await this.options.documents.syncFromLog(specId);
     if (input.expectedRev !== undefined && input.expectedRev !== loaded.semanticDocSeq) {
       return this.result(specId, input, false, loaded.semanticDocSeq);
     }
-    if (input.selection && input.selection.sectionId !== input.sectionId) {
-      throw new Error("The selected range belongs to a different section.");
-    }
     const currentDocument = proseMirrorDocument(loaded.doc);
-    const desired = input.selection
-      ? replaceSelectedRange(currentDocument, loaded.doc, input.selection, input.markdown)
-      : replaceSection(
-          currentDocument,
-          input.sectionId,
-          replacementSection(currentDocument, input.sectionId, input.markdown),
-        );
+    const desired = replaceSection(
+      currentDocument,
+      input.sectionId,
+      replacementSection(currentDocument, input.sectionId, input.markdown),
+    );
     if (currentDocument.eq(desired)) {
       return this.result(specId, input, true, loaded.semanticDocSeq);
     }
     try {
-      let transcriptChip: TrackedEditTranscriptChip | undefined;
       const update = await this.options.documents.mutateDocument(
         specId,
         agentClientId(input),
-        (document, ydoc) => {
-          if (!input.selection) {
-            return replaceSection(
-              document,
-              input.sectionId,
-              replacementSection(document, input.sectionId, input.markdown),
-            );
-          }
-          const replacement = replaceSelectedRange(
+        (document) =>
+          replaceSection(
             document,
-            ydoc,
-            input.selection,
-            input.markdown,
-          );
-          transcriptChip = {
-            kind: "spec_tracked_edit",
-            specId,
-            sectionId: input.sectionId,
-            before: input.selection.selectedText,
-            after: input.markdown,
-          };
-          return replacement;
-        },
+            input.sectionId,
+            replacementSection(document, input.sectionId, input.markdown),
+          ),
         input.expectedRev,
       );
-      return this.result(specId, input, true, update.semanticDocSeq, transcriptChip);
+      return this.result(specId, input, true, update.semanticDocSeq);
+    } catch (error) {
+      return this.revisionConflict(specId, input, error);
+    }
+  }
+
+  private async updateSelectedRange(
+    specId: string,
+    input: SpecMutationContext & {
+      sectionId: string;
+      markdown: string;
+      selection: SpecSelectionSpan;
+    },
+  ): Promise<SpecMutationResult> {
+    const actionId = trackedEditActionId(specId, input.sessionId, input.toolCallId);
+    const requestFingerprint = trackedEditRequestFingerprint(specId, input);
+    const existing = await this.options.documents.readTrackedEditAction(actionId);
+    if (existing)
+      return storedTrackedEditResult(existing, specId, input.sectionId, requestFingerprint);
+    if (input.selection.specId !== specId) {
+      throw new Error("The selected range belongs to a different spec.");
+    }
+    if (input.selection.sectionId !== input.sectionId) {
+      throw new Error("The selected range belongs to a different section.");
+    }
+    const transcriptChip: TrackedEditTranscriptChip = {
+      kind: "spec_tracked_edit",
+      specId,
+      sectionId: input.sectionId,
+      before: input.selection.selectedText,
+      after: input.markdown,
+    };
+    const concurrentEditors = await this.options.metadata.concurrentEditorNames(
+      specId,
+      input.actorUserId,
+    );
+    try {
+      const result = await this.options.documents.mutateDocumentWithTrackedEdit(
+        specId,
+        agentClientId(input),
+        {
+          id: actionId,
+          specId,
+          sectionId: input.sectionId,
+          requestFingerprint,
+          chip: transcriptChip,
+          concurrentEditors,
+        },
+        (document, ydoc) => replaceSelectedRange(document, ydoc, input.selection, input.markdown),
+        input.expectedRev,
+      );
+      return storedTrackedEditResult(result.action, specId, input.sectionId, requestFingerprint);
     } catch (error) {
       return this.revisionConflict(specId, input, error);
     }
@@ -269,10 +299,7 @@ export class SpecToolService implements SpecToolDocumentService {
     requireSection(document, input.sectionId);
     const questionText = input.question.trim();
     if (questionText.length === 0) {
-      throw new OpenQuestionError(
-        "question_text_required",
-        "An open question must have text.",
-      );
+      throw new OpenQuestionError("question_text_required", "An open question must have text.");
     }
     const row = await this.options.questionStore.find(questionId);
     const marker = findQuestionMarker(document, questionId);
@@ -348,13 +375,18 @@ export class SpecToolService implements SpecToolDocumentService {
     },
   ): Promise<SpecMutationResult> {
     const question = await this.options.questionStore.find(input.questionId);
-    if (!question) throw new OpenQuestionError("question_not_found", "The open question does not exist.");
+    if (!question)
+      throw new OpenQuestionError("question_not_found", "The open question does not exist.");
     if (question.specId !== specId || question.sectionId !== input.sectionId) {
       throw new Error("The open question belongs to a different spec section.");
     }
     if (question.state === "resolved") {
       const loaded = await this.options.documents.syncFromLog(specId);
-      const marker = findQuestionMarker(proseMirrorDocument(loaded.doc), input.questionId, input.sectionId);
+      const marker = findQuestionMarker(
+        proseMirrorDocument(loaded.doc),
+        input.questionId,
+        input.sectionId,
+      );
       if (
         !marker ||
         marker.node.attrs.resolved !== true ||
@@ -493,13 +525,11 @@ function replaceSelectedRange(
   if (start === null || end === null || start >= end) {
     throw new Error("The selected range is no longer valid.");
   }
-  const selectedText = document.textBetween(start, end, "\n");
-  if (selectedText !== selection.selectedText) {
-    throw new Error("The selected text changed before the scoped edit.");
+  const fingerprint = selectionSliceFingerprint(document, start, end);
+  if (fingerprint !== selection.sliceFingerprint) {
+    throw new Error("The selected structure changed before the scoped edit.");
   }
-  const slice = Slice.maxOpen(
-    Fragment.fromArray(parseMarkdownBlocks(replacementMarkdown)),
-  );
+  const slice = Slice.maxOpen(Fragment.fromArray(parseMarkdownBlocks(replacementMarkdown)));
   return new Transform(document).replace(start, end, slice).doc;
 }
 
@@ -608,10 +638,78 @@ export function stableQuestionId(specId: string, sessionId: string, toolCallId: 
   return uuidV5(AGENT_QUESTION_NAMESPACE, `${specId}:${sessionId}:${toolCallId}`);
 }
 
+export function trackedEditActionId(specId: string, sessionId: string, toolCallId: string): string {
+  return `selection-edit:${specId}:${sessionId}:${toolCallId}`;
+}
+
+function trackedEditRequestFingerprint(
+  specId: string,
+  input: SpecMutationContext & {
+    sectionId: string;
+    markdown: string;
+    selection: SpecSelectionSpan;
+  },
+): string {
+  const canonical = canonicalValue({
+    kind: "selection_edit",
+    specId,
+    sessionId: input.sessionId,
+    toolCallId: input.toolCallId,
+    actorUserId: input.actorUserId ?? null,
+    sectionId: input.sectionId,
+    markdown: input.markdown,
+    expectedRev: input.expectedRev?.toString() ?? null,
+    selection: input.selection,
+  });
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+function storedTrackedEditResult(
+  action: SpecTrackedEditActionRecord,
+  specId: string,
+  sectionId: string,
+  requestFingerprint: string,
+): SpecMutationResult {
+  if (action.specId !== specId || action.sectionId !== sectionId) {
+    throw new Error("The tracked-edit action ID belongs to a different spec section.");
+  }
+  if (action.chip.specId !== action.specId || action.chip.sectionId !== action.sectionId) {
+    throw new Error("The tracked-edit action has an invalid transcript scope.");
+  }
+  if (action.requestFingerprint !== requestFingerprint) {
+    throw new Error("The tracked-edit action ID belongs to a different request.");
+  }
+  if (JSON.stringify(action.chip) !== JSON.stringify(action.result.transcriptChip)) {
+    throw new Error("The tracked-edit action result does not match its transcript chip.");
+  }
+  return {
+    applied: action.result.applied,
+    newRev: action.result.newRev,
+    concurrentEditors: [...action.result.concurrentEditors],
+    transcriptChip: action.result.transcriptChip,
+  };
+}
+
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonicalValue(Reflect.get(value, key))]),
+    );
+  }
+  return value;
+}
+
 function uuidV5(namespace: string, name: string): string {
   const namespaceBytes = Buffer.from(namespace.replaceAll("-", ""), "hex");
   if (namespaceBytes.length !== 16) throw new Error("The question UUID namespace is invalid.");
-  const bytes = createHash("sha1").update(namespaceBytes).update(name, "utf8").digest().subarray(0, 16);
+  const bytes = createHash("sha1")
+    .update(namespaceBytes)
+    .update(name, "utf8")
+    .digest()
+    .subarray(0, 16);
   bytes[6] = (bytes[6]! & 0x0f) | 0x50;
   bytes[8] = (bytes[8]! & 0x3f) | 0x80;
   const hex = bytes.toString("hex");

@@ -4,6 +4,7 @@ import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { BubbleMenu } from "@tiptap/react/menus";
 import {
   createSectionRelativeAnchor,
+  selectionSliceFingerprint,
   serializeSectionRelativeAnchor,
   type SpecSelectionAction,
   type SpecSelectionActionPayload,
@@ -29,26 +30,31 @@ export function SpecSelectionBubbleMenu({
   editor,
   doc,
   specId,
+  revision,
   actions,
 }: {
   editor: Editor;
   doc: Y.Doc;
   specId: string;
+  revision: string;
   actions: SpecSelectionActions;
 }) {
   const [selection, setSelection] = useState<SpecSelectionSpan | null>(() =>
-    currentSelection(editor, doc),
+    currentSelection(editor, doc, specId, revision),
   );
 
   useEffect(() => {
-    const update = () => setSelection(currentSelection(editor, doc));
+    const update = () => {
+      const next = currentSelection(editor, doc, specId, revision);
+      setSelection((current) => (sameSelection(current, next) ? current : next));
+    };
     editor.on("selectionUpdate", update);
     editor.on("transaction", update);
     return () => {
       editor.off("selectionUpdate", update);
       editor.off("transaction", update);
     };
-  }, [doc, editor]);
+  }, [doc, editor, revision, specId]);
 
   if (!selection) return null;
   return (
@@ -57,7 +63,7 @@ export function SpecSelectionBubbleMenu({
       pluginKey="spec-selection-actions"
       updateDelay={0}
       options={{ placement: "top" }}
-      shouldShow={() => currentSelection(editor, doc) !== null}
+      shouldShow={() => currentSelection(editor, doc, specId, revision) !== null}
     >
       <SpecSelectionMenu specId={specId} selection={selection} onAction={actions.onAction} />
     </BubbleMenu>
@@ -145,6 +151,8 @@ export function createSpecSelectionSpan(
   ydoc: Y.Doc,
   from: number,
   to: number,
+  specId: string,
+  revision: string,
 ): SpecSelectionSpan | null {
   if (from >= to) return null;
   let sectionId: string | null = null;
@@ -163,14 +171,39 @@ export function createSpecSelectionSpan(
   const selectedText = document.textBetween(from, to, "\n");
   if (selectedText.trim().length === 0) return null;
   return {
+    specId,
     sectionId,
+    revision,
     startAnchor: serializeSectionRelativeAnchor(createSectionRelativeAnchor(ydoc, sectionId, from)),
     endAnchor: serializeSectionRelativeAnchor(createSectionRelativeAnchor(ydoc, sectionId, to)),
     selectedText,
+    sliceFingerprint: selectionSliceFingerprint(document, from, to),
   };
 }
 
-function currentSelection(editor: Editor, doc: Y.Doc): SpecSelectionSpan | null {
+function currentSelection(
+  editor: Editor,
+  doc: Y.Doc,
+  specId: string,
+  revision: string,
+): SpecSelectionSpan | null {
   const { from, to } = editor.state.selection;
-  return createSpecSelectionSpan(editor.state.doc, doc, from, to);
+  return createSpecSelectionSpan(editor.state.doc, doc, from, to, specId, revision);
+}
+
+export function sameSelection(
+  left: SpecSelectionSpan | null,
+  right: SpecSelectionSpan | null,
+): boolean {
+  if (left === right) return true;
+  if (left === null || right === null) return false;
+  return (
+    left.specId === right.specId &&
+    left.sectionId === right.sectionId &&
+    left.revision === right.revision &&
+    left.startAnchor === right.startAnchor &&
+    left.endAnchor === right.endAnchor &&
+    left.selectedText === right.selectedText &&
+    left.sliceFingerprint === right.sliceFingerprint
+  );
 }

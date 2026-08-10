@@ -47,6 +47,7 @@ class MemoryReadStore implements SpecReadStore {
     sessionId: "session-that-must-not-boot",
     publishedCheckpointId: PINNED_ID,
     publishedAt: new Date("2026-08-10T01:00:00.000Z"),
+    currentSemanticDocSeq: 3n,
   };
 
   async readSpec(specId: string): Promise<SpecReadRecord | null> {
@@ -102,19 +103,22 @@ function testApp(input?: {
     sectionId: string,
     authorUserId?: string | null,
   ) => Promise<RestoreSectionResult>;
+  userId?: string;
 }) {
   const app = new Hono();
   const readStore = input?.readStore ?? new MemoryReadStore();
   const checkpointStore = input?.checkpointStore ?? new MemoryCheckpointStore();
   const restoreSection = input?.restoreSection ?? mock(() => Promise.reject(new Error("unused")));
+  const userId = input?.userId ?? "member-2";
   app.route(
     "/",
     makeSpecsRoute({
       store: readStore,
       checkpointStore,
       checkpoints: { restoreSection },
-      resolveMembership: async (specId, userId) => specId === SPEC_ID && userId === "member-2",
-      getSession: async () => ({ user: { id: "member-2", name: "Grace" } }),
+      resolveMembership: async (specId, candidateUserId) =>
+        specId === SPEC_ID && candidateUserId === userId,
+      getSession: async () => ({ user: { id: userId, name: "Grace" } }),
     }),
   );
   return { app, readStore, checkpointStore, restoreSection };
@@ -149,6 +153,7 @@ describe("spec read routes", () => {
         sessionId: string | null;
         publishedCheckpointId: string;
         publishedAt: string;
+        revision: string;
       };
       publishedCheckpoint: { id: string; markdown: string; sections: Array<{ id: string }> };
       checkpoints: Array<{ label: string; author: { name: string } | null }>;
@@ -160,6 +165,7 @@ describe("spec read routes", () => {
       sessionId: null,
       publishedCheckpointId: PINNED_ID,
       publishedAt: "2026-08-10T01:00:00.000Z",
+      revision: "3",
     });
     expect(body.publishedCheckpoint.id).toBe(PINNED_ID);
     expect(body.publishedCheckpoint.markdown).toContain("## Context");
@@ -195,6 +201,28 @@ describe("spec read routes", () => {
     expect(body.spec).toMatchObject({ lifecycle: "draft", sessionId: null });
     expect(body.publishedCheckpoint).toBeNull();
     for (const coordinatorSpy of coordinatorSpies) expect(coordinatorSpy).not.toHaveBeenCalled();
+  });
+
+  test("a draft owner receives the bound session and a collaborator does not", async () => {
+    const readStore = new MemoryReadStore();
+    readStore.record = {
+      ...readStore.record,
+      lifecycle: "draft",
+      publishedCheckpointId: null,
+      publishedAt: null,
+    };
+    const owner = testApp({ readStore, userId: "owner-1" });
+    const ownerResponse = await owner.app.request(`/api/v1/specs/${SPEC_ID}`);
+    expect(ownerResponse.status).toBe(200);
+    expect((await ownerResponse.json()).spec).toMatchObject({
+      sessionId: "session-that-must-not-boot",
+      revision: "3",
+    });
+
+    const collaborator = testApp({ readStore, userId: "member-2" });
+    const collaboratorResponse = await collaborator.app.request(`/api/v1/specs/${SPEC_ID}`);
+    expect(collaboratorResponse.status).toBe(200);
+    expect((await collaboratorResponse.json()).spec.sessionId).toBeNull();
   });
 
   test("a draft restore creates a checkpoint and applies a forward edit", async () => {

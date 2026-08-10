@@ -10,9 +10,11 @@ const SpecCanvas = lazy(() =>
 /** Keep the editor, Yjs, and ProseMirror out of the main application bundle. */
 export function LazySpecCanvas({
   specId,
+  revision,
   selectionActions,
 }: {
   specId: string;
+  revision: string;
   selectionActions?: SpecSelectionActions;
 }) {
   return (
@@ -25,7 +27,7 @@ export function LazySpecCanvas({
         </div>
       }
     >
-      <SpecCanvas specId={specId} selectionActions={selectionActions} />
+      <SpecCanvas specId={specId} revision={revision} selectionActions={selectionActions} />
     </Suspense>
   );
 }

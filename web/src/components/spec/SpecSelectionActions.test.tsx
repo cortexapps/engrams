@@ -12,7 +12,7 @@ import { Transform } from "@tiptap/pm/transform";
 import { prosemirrorToYXmlFragment } from "y-prosemirror";
 import * as Y from "yjs";
 
-import { SpecSelectionMenu, createSpecSelectionSpan } from "./SpecSelectionActions";
+import { SpecSelectionMenu, createSpecSelectionSpan, sameSelection } from "./SpecSelectionActions";
 
 function selectionFixture(): SpecSelectionSpan {
   const document = createTemplateDocument({
@@ -31,7 +31,14 @@ function selectionFixture(): SpecSelectionSpan {
     withText.descendants((node, position) => {
       if (node.isText && node.text === "Retry forever.") from = position;
     });
-    const span = createSpecSelectionSpan(withText, ydoc, from, from + "Retry".length);
+    const span = createSpecSelectionSpan(
+      withText,
+      ydoc,
+      from,
+      from + "Retry".length,
+      "00000000-0000-4000-8000-000000000112",
+      "7",
+    );
     if (!span) throw new Error("The test selection is missing.");
     return span;
   } finally {
@@ -40,6 +47,18 @@ function selectionFixture(): SpecSelectionSpan {
 }
 
 describe("SpecSelectionMenu", () => {
+  test("keeps an equal transaction snapshot state-stable", () => {
+    const selection = selectionFixture();
+
+    expect(sameSelection(selection, { ...selection })).toBe(true);
+    expect(
+      sameSelection(selection, {
+        ...selection,
+        sliceFingerprint: "0".repeat(64),
+      }),
+    ).toBe(false);
+  });
+
   test("appears for a selection and sends the full span payload", async () => {
     const user = userEvent.setup();
     const onAction = vi.fn();
@@ -71,7 +90,10 @@ describe("SpecSelectionMenu", () => {
     });
     expect(selection).toMatchObject({
       sectionId: "failure-modes",
+      specId: "00000000-0000-4000-8000-000000000112",
+      revision: "7",
       selectedText: "Retry",
+      sliceFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
     expect(selection.startAnchor).toMatch(/^yjs-section:\/\/failure-modes\//);
     expect(selection.endAnchor).toMatch(/^yjs-section:\/\/failure-modes\//);

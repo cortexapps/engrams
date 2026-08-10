@@ -40,7 +40,9 @@ export {
   type SpecSelectionAction,
   type SpecSelectionActionPayload,
   type SpecSelectionSpan,
+  type SpecTranscriptChip,
   type TrackedEditTranscriptChip,
+  selectionSliceFingerprint,
 } from "./actions.ts";
 export {
   extractRequirementDefinitions,

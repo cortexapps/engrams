@@ -28,19 +28,13 @@ function documentService(
     read: async (specId, sectionId) => ({
       specId,
       rev: 8n,
-      markdown:
-        sectionId === undefined
-          ? "# Live revision 8"
-          : "Live section revision 8",
+      markdown: sectionId === undefined ? "# Live revision 8" : "Live section revision 8",
       ...(sectionId === undefined ? {} : { sectionId }),
     }),
     updateSection: async (_specId, input) => mutation("updateSection", input),
-    setSectionState: async (_specId, input) =>
-      mutation("setSectionState", input),
-    addOpenQuestion: async (_specId, input) =>
-      mutation("addOpenQuestion", input),
-    resolveOpenQuestion: async (_specId, input) =>
-      mutation("resolveOpenQuestion", input),
+    setSectionState: async (_specId, input) => mutation("setSectionState", input),
+    addOpenQuestion: async (_specId, input) => mutation("addOpenQuestion", input),
+    resolveOpenQuestion: async (_specId, input) => mutation("resolveOpenQuestion", input),
     updateBlock: async (_specId, input) => mutation("updateBlock", input),
     updateNotes: async (_specId, input) => mutation("updateNotes", input),
     proposeTickets: async (_specId, input) => mutation("proposeTickets", input),
@@ -80,16 +74,11 @@ function recorder(
   return { deps, mutations, refreshes, presence };
 }
 
-async function call(
-  deps: SpecToolDeps,
-  toolName: string,
-  input: object,
-): Promise<unknown> {
+async function call(deps: SpecToolDeps, toolName: string, input: object): Promise<unknown> {
   const registry = createToolRegistry();
   registerSpecTools(registry, deps);
   const tool = registry.get(toolName);
-  if (tool?.handling !== "handled")
-    throw new Error(`${toolName} is not a handled tool`);
+  if (tool?.handling !== "handled") throw new Error(`${toolName} is not a handled tool`);
   return tool.handler(context(toolName), tool.input.parse(input));
 }
 
@@ -199,6 +188,9 @@ describe("spec tools", () => {
       selection_start: "yjs-section://failure-modes/0102",
       selection_end: "yjs-section://failure-modes/0304",
       selection_text: "retry forever",
+      selection_spec_id: SPEC_ID,
+      selection_revision: "8",
+      selection_fingerprint: "a".repeat(64),
     });
 
     expect(state.mutations[0]).toMatchObject({
@@ -207,10 +199,13 @@ describe("spec tools", () => {
         sectionId: "failure-modes",
         markdown: "retry three times",
         selection: {
+          specId: SPEC_ID,
           sectionId: "failure-modes",
+          revision: "8",
           startAnchor: "yjs-section://failure-modes/0102",
           endAnchor: "yjs-section://failure-modes/0304",
           selectedText: "retry forever",
+          sliceFingerprint: "a".repeat(64),
         },
       },
     });
@@ -236,7 +231,7 @@ describe("spec tools", () => {
         selection_start: "yjs-section://context/01",
       }),
     ).toThrow();
-    const manifest = compileToolManifest(registry).find(
+    const manifest = compileToolManifest(registry, undefined, "spec").find(
       (entry) => entry.name === "spec_update_section",
     );
     expect(JSON.stringify(manifest?.inputSchema)).not.toContain('"anyOf"');
@@ -334,7 +329,10 @@ describe("spec tools", () => {
     for (const item of cases) {
       const state = recorder();
       await call(state.deps, item.name, item.input);
-      expect(state.presence.map((entry) => entry.action), item.name).toEqual(["enter", "leave"]);
+      expect(
+        state.presence.map((entry) => entry.action),
+        item.name,
+      ).toEqual(["enter", "leave"]);
       expect(state.presence[0]?.input, item.name).toMatchObject({ sectionId: item.sectionId });
     }
   });
@@ -362,12 +360,9 @@ describe("spec tools", () => {
     const registry = createToolRegistry();
     registerSpecTools(registry, recorder().deps);
     const tool = registry.get("spec_set_section_state");
-    if (tool === undefined)
-      throw new Error("spec_set_section_state is not registered");
+    if (tool === undefined) throw new Error("spec_set_section_state is not registered");
 
-    expect(() =>
-      tool.input.parse({ section_id: "scope", state: "n/a" }),
-    ).toThrow();
+    expect(() => tool.input.parse({ section_id: "scope", state: "n/a" })).toThrow();
     expect(
       tool.input.parse({
         section_id: "scope",

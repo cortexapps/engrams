@@ -381,6 +381,7 @@ export class PostgresSectionStateStore implements SectionStateStore {
       `SELECT id, spec_id, section_id, request_fingerprint, chip, created_at, delivered_at
          FROM spec_transcript_action
         WHERE delivered_at IS NULL
+          AND chip->>'kind' = 'spec_section_state_changed'
         ORDER BY created_at, id
         LIMIT $1`,
       [limit],

@@ -30,6 +30,9 @@ const SelectionAnchor = z
   .string()
   .min(1)
   .describe("Yjs-relative anchor from the selected document range");
+const SelectionFingerprint = z
+  .string()
+  .regex(/^[0-9a-f]{64}$/, "must be a lower-case SHA-256 fingerprint");
 
 const UpdateSectionInput = z
   .object({
@@ -40,25 +43,45 @@ const UpdateSectionInput = z
         "Replacement Markdown for the section, or for only the selected range when selection anchors are present",
       ),
     selection_start: SelectionAnchor.optional().describe(
-      "Start anchor from a selection action; requires selection_end and selection_text",
+      "Start anchor from a selection action; requires every selection field",
     ),
     selection_end: SelectionAnchor.optional().describe(
-      "End anchor from a selection action; requires selection_start and selection_text",
+      "End anchor from a selection action; requires every selection field",
     ),
     selection_text: z
       .string()
       .optional()
-      .describe("Exact selected text; the edit stops if the anchored text changed"),
+      .describe(
+        "Selected text for display; structured stale checks use selection_fingerprint",
+      ),
+    selection_spec_id: z
+      .string()
+      .uuid()
+      .optional()
+      .describe("Spec identity captured with the selection"),
+    selection_revision: Revision.optional().describe(
+      "Document revision captured with the selection",
+    ),
+    selection_fingerprint: SelectionFingerprint.optional().describe(
+      "SHA-256 fingerprint of the complete selected ProseMirror slice and boundaries",
+    ),
     expected_rev: ExpectedRevision,
   })
   .superRefine((value, ctx) => {
-    const fields = [value.selection_start, value.selection_end, value.selection_text];
+    const fields = [
+      value.selection_start,
+      value.selection_end,
+      value.selection_text,
+      value.selection_spec_id,
+      value.selection_revision,
+      value.selection_fingerprint,
+    ];
     const present = fields.filter((field) => field !== undefined).length;
     if (present !== 0 && present !== fields.length) {
       ctx.addIssue({
         code: "custom",
         path: ["selection_start"],
-        message: "selection_start, selection_end, and selection_text must be used together",
+        message: "all selection fields must be used together",
       });
     }
   });
@@ -159,7 +182,6 @@ const MutationOutput = z.object({
 export interface SpecReference {
   id: string;
 }
-
 export interface LiveSpecRead {
   specId: string;
   rev: bigint;
@@ -290,14 +312,23 @@ function updateSelection(
   args: z.output<typeof UpdateSectionInput>,
 ): SpecSelectionSpan | undefined {
   if (args.selection_start === undefined) return undefined;
-  if (args.selection_end === undefined || args.selection_text === undefined) {
+  if (
+    args.selection_end === undefined ||
+    args.selection_text === undefined ||
+    args.selection_spec_id === undefined ||
+    args.selection_revision === undefined ||
+    args.selection_fingerprint === undefined
+  ) {
     throw new Error("The parsed selection is incomplete.");
   }
   return {
+    specId: args.selection_spec_id,
     sectionId: args.section_id,
+    revision: args.selection_revision,
     startAnchor: args.selection_start,
     endAnchor: args.selection_end,
     selectedText: args.selection_text,
+    sliceFingerprint: args.selection_fingerprint,
   };
 }
 
@@ -389,7 +420,7 @@ export function registerSpecTools(
     name: "spec_update_section",
     taskTypes: SPEC_TASK_TYPES,
     description:
-      "Replace one spec section, or only an anchored selected range, with Markdown parsed by the document service. When the user supplies a selection, preserve the anchors and selected text so the service confines the edit to that range.",
+      "Replace one spec section, or only an anchored selected range, with Markdown parsed by the document service. For a selection action, copy every selection field exactly. The structured fingerprint confines the edit to the original ProseMirror slice.",
     input: UpdateSectionInput,
     output: MutationOutput,
     handling: "handled",

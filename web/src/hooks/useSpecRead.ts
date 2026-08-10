@@ -42,6 +42,7 @@ export interface SpecReadResponse {
     sessionId: string | null;
     publishedCheckpointId: string | null;
     publishedAt: string | null;
+    revision: string;
   };
   checkpoints: SpecCheckpointSummary[];
   publishedCheckpoint: SpecCheckpoint | null;

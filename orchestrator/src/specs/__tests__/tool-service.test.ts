@@ -4,11 +4,15 @@ import {
   createTemplateDocument,
   findQuestionMarker,
   findSection,
+  parseSectionRelativeAnchor,
   renderMarkdown,
+  resolveSectionRelativeAnchor,
   RequirementIntegrityError,
   schema,
+  selectionSliceFingerprint,
   serializeSectionRelativeAnchor,
   type SpecTemplate,
+  type SpecSelectionSpan,
 } from "@engrams/spec-document";
 import { Transform } from "prosemirror-transform";
 
@@ -20,6 +24,9 @@ import {
   type CompactSnapshotInput,
   type SpecDocumentCheckpoint,
   type SpecDocumentStore,
+  type LoadedSpecDocument,
+  type SpecTrackedEditActionInput,
+  type SpecTrackedEditActionRecord,
   type SpecSnapshotRecord,
   type SpecUpdateEffects,
   type SpecUpdateInsertResult,
@@ -79,6 +86,7 @@ class MemoryDocumentStore implements SpecDocumentStore {
   semanticSeq = 0n;
   readonly updates: SpecUpdateRecord[] = [];
   readonly clientIds: Array<string | null> = [];
+  readonly actions = new Map<string, SpecTrackedEditActionRecord>();
 
   async readSnapshot(): Promise<SpecSnapshotRecord | null> {
     return null;
@@ -94,7 +102,9 @@ class MemoryDocumentStore implements SpecDocumentStore {
     update: Uint8Array,
     clientId: string | null,
     _effects: SpecUpdateEffects,
-  ) {
+    _participantEpoch?: bigint,
+    transcriptAction?: SpecTrackedEditActionInput & { createdAt: Date },
+  ): Promise<SpecUpdateInsertResult | null> {
     if (expectedSeq !== this.seq) return null;
     this.seq += 1n;
     if (_effects.semanticChanged) this.semanticSeq += 1n;
@@ -105,7 +115,24 @@ class MemoryDocumentStore implements SpecDocumentStore {
       update: update.slice(),
       clientId,
     });
+    if (transcriptAction) {
+      const action: SpecTrackedEditActionRecord = {
+        ...transcriptAction,
+        result: {
+          applied: true,
+          newRev: this.semanticSeq,
+          concurrentEditors: transcriptAction.concurrentEditors,
+          transcriptChip: transcriptAction.chip,
+        },
+        deliveredAt: null,
+      };
+      this.actions.set(action.id, action);
+    }
     return { seq: this.seq, semanticDocSeq: this.semanticSeq };
+  }
+
+  async readTrackedEditAction(actionId: string): Promise<SpecTrackedEditActionRecord | null> {
+    return this.actions.get(actionId) ?? null;
   }
 
   async insertCheckpointAndUpdateIfLatest(
@@ -246,9 +273,14 @@ class MemoryMetadata implements SpecToolMetadataStore {
   }
 }
 
-async function setup() {
+async function setup(
+  options: { afterPersist?: (specId: string, seq: bigint) => void | Promise<void> } = {},
+) {
   const documentStore = new MemoryDocumentStore();
-  const documents = new SpecDocumentService(documentStore);
+  const documents = new SpecDocumentService(documentStore, {
+    now: () => new Date("2026-08-09T12:00:00.000Z"),
+    ...(options.afterPersist ? { afterPersist: options.afterPersist } : {}),
+  });
   await documents.applyUpdate(
     SPEC_ID,
     encodeProseMirrorDocument(createTemplateDocument(TEMPLATE)),
@@ -271,6 +303,44 @@ async function setup() {
     metadata: new MemoryMetadata(sectionStore),
   });
   return { service, documents, documentStore, sectionStore, questionStore };
+}
+
+async function selectedTextSpan(
+  documents: SpecDocumentService,
+  text: string,
+  selectedText = text,
+): Promise<SpecSelectionSpan> {
+  const loaded = await documents.syncFromLog(SPEC_ID);
+  const document = proseMirrorDocument(loaded.doc);
+  let start = -1;
+  document.descendants((node, position) => {
+    const index = node.isText ? (node.text?.indexOf(text) ?? -1) : -1;
+    if (start < 0 && index >= 0) start = position + index;
+  });
+  if (start < 0) throw new Error(`The selected test text is missing: ${text}`);
+  return selectionRange(loaded, document, start, start + text.length, selectedText);
+}
+
+function selectionRange(
+  loaded: LoadedSpecDocument,
+  document: ReturnType<typeof proseMirrorDocument>,
+  start: number,
+  end: number,
+  selectedText = document.textBetween(start, end, "\n"),
+): SpecSelectionSpan {
+  return {
+    specId: SPEC_ID,
+    sectionId: "context",
+    revision: loaded.semanticDocSeq.toString(),
+    startAnchor: serializeSectionRelativeAnchor(
+      createSectionRelativeAnchor(loaded.doc, "context", start),
+    ),
+    endAnchor: serializeSectionRelativeAnchor(
+      createSectionRelativeAnchor(loaded.doc, "context", end),
+    ),
+    selectedText,
+    sliceFingerprint: selectionSliceFingerprint(document, start, end),
+  };
 }
 
 function context(toolCallId: string, expectedRev?: bigint) {
@@ -328,26 +398,23 @@ describe("production spec tool service", () => {
     const document = proseMirrorDocument(loaded.doc);
     let start = -1;
     document.descendants((node, position) => {
-      const index = node.isText
-        ? (node.text?.indexOf("Retry forever.") ?? -1)
-        : -1;
+      const index = node.isText ? (node.text?.indexOf("Retry forever.") ?? -1) : -1;
       if (index >= 0) start = position + index;
     });
     if (start < 0) throw new Error("The selected test text is missing.");
     const selectedText = "Retry forever.";
     const selection = {
+      specId: SPEC_ID,
       sectionId: "context",
+      revision: loaded.semanticDocSeq.toString(),
       startAnchor: serializeSectionRelativeAnchor(
         createSectionRelativeAnchor(loaded.doc, "context", start),
       ),
       endAnchor: serializeSectionRelativeAnchor(
-        createSectionRelativeAnchor(
-          loaded.doc,
-          "context",
-          start + selectedText.length,
-        ),
+        createSectionRelativeAnchor(loaded.doc, "context", start + selectedText.length),
       ),
       selectedText,
+      sliceFingerprint: selectionSliceFingerprint(document, start, start + selectedText.length),
     };
     const untouchedRequirements = (await service.read(SPEC_ID, "requirements")).markdown;
 
@@ -361,9 +428,7 @@ describe("production spec tool service", () => {
     expect((await service.read(SPEC_ID, "context")).markdown).toBe(
       "## Context\n\nKeep this prefix. Retry three times. Keep this suffix.\n",
     );
-    expect((await service.read(SPEC_ID, "requirements")).markdown).toBe(
-      untouchedRequirements,
-    );
+    expect((await service.read(SPEC_ID, "requirements")).markdown).toBe(untouchedRequirements);
     expect(result.transcriptChip).toEqual({
       kind: "spec_tracked_edit",
       specId: SPEC_ID,
@@ -373,7 +438,40 @@ describe("production spec tool service", () => {
     });
   });
 
-  test("a scoped instruction stops when the selected text changed", async () => {
+  test("an unrelated concurrent edit keeps the exact selected range valid", async () => {
+    const { service, documents } = await setup();
+    await service.updateSection(SPEC_ID, {
+      ...context("seed-concurrent-outside"),
+      sectionId: "context",
+      markdown: "Keep this prefix. Retry forever. Keep this suffix.",
+    });
+    const selection = await selectedTextSpan(documents, "Retry forever.");
+
+    await documents.mutateDocument(SPEC_ID, "concurrent-outside", (document) => {
+      let position = -1;
+      document.descendants((node, nodePosition) => {
+        if (position < 0 && node.isText && node.text?.startsWith("Keep this prefix.")) {
+          position = nodePosition;
+        }
+      });
+      if (position < 0) throw new Error("The concurrent edit position is missing.");
+      return new Transform(document).insert(position, schema.text("Concurrent: ")).doc;
+    });
+
+    const result = await service.updateSection(SPEC_ID, {
+      ...context("concurrent-outside"),
+      sectionId: "context",
+      markdown: "Retry three times.",
+      selection,
+    });
+
+    expect(result.applied).toBe(true);
+    expect((await service.read(SPEC_ID, "context")).markdown).toBe(
+      "## Context\n\nConcurrent: Keep this prefix. Retry three times. Keep this suffix.\n",
+    );
+  });
+
+  test("selected text is display data and the structured fingerprint controls staleness", async () => {
     const { service, documents } = await setup();
     await service.updateSection(SPEC_ID, {
       ...context("seed-stale"),
@@ -388,31 +486,266 @@ describe("production spec tool service", () => {
     });
     if (start < 0) throw new Error("The stale test text is missing.");
     const selection = {
+      specId: SPEC_ID,
       sectionId: "context",
+      revision: loaded.semanticDocSeq.toString(),
       startAnchor: serializeSectionRelativeAnchor(
         createSectionRelativeAnchor(loaded.doc, "context", start),
       ),
       endAnchor: serializeSectionRelativeAnchor(
-        createSectionRelativeAnchor(
-          loaded.doc,
-          "context",
-          start + "Original selection".length,
-        ),
+        createSectionRelativeAnchor(loaded.doc, "context", start + "Original selection".length),
       ),
       selectedText: "Different selection",
+      sliceFingerprint: selectionSliceFingerprint(
+        document,
+        start,
+        start + "Original selection".length,
+      ),
     };
+
+    const result = await service.updateSection(SPEC_ID, {
+      ...context("display-text"),
+      sectionId: "context",
+      markdown: "Replacement",
+      selection,
+    });
+    expect(result.transcriptChip?.before).toBe("Different selection");
+    expect((await service.read(SPEC_ID, "context")).markdown).toContain("Replacement");
+  });
+
+  test("rejects a concurrent node-attribute change with unchanged text", async () => {
+    const { service, documents } = await setup();
+    await service.updateSection(SPEC_ID, {
+      ...context("seed-attrs"),
+      sectionId: "context",
+      markdown: "### Original selection",
+    });
+    const selection = await selectedTextSpan(documents, "Original selection");
+    await documents.mutateDocument(SPEC_ID, "concurrent-heading", (document) => {
+      let headingPosition = -1;
+      document.descendants((node, position) => {
+        if (node.type === schema.nodes.heading && node.textContent === "Original selection") {
+          headingPosition = position;
+        }
+      });
+      if (headingPosition < 0) throw new Error("The selected heading is missing.");
+      return new Transform(document).setNodeMarkup(headingPosition, undefined, { level: 4 }).doc;
+    });
 
     await expect(
       service.updateSection(SPEC_ID, {
-        ...context("stale-scoped"),
+        ...context("stale-attrs"),
         sectionId: "context",
         markdown: "Replacement",
         selection,
       }),
-    ).rejects.toThrow("selected text changed");
-    expect((await service.read(SPEC_ID, "context")).markdown).toContain(
-      "Original selection",
+    ).rejects.toThrow("selected structure changed");
+  });
+
+  test("rejects concurrent open-question and diagram changes inside the selected slice", async () => {
+    const richNodeCases = ["open-question", "diagram"] as const;
+    for (const richNodeCase of richNodeCases) {
+      const { service, documents } = await setup();
+      await service.updateSection(SPEC_ID, {
+        ...context(`seed-${richNodeCase}`),
+        sectionId: "context",
+        markdown:
+          richNodeCase === "open-question"
+            ? "Before {{open-question:q-1}} after."
+            : "Before diagram.\n\nAfter diagram.",
+      });
+      if (richNodeCase === "diagram") {
+        await documents.mutateDocument(SPEC_ID, "seed-diagram-selection", (document) => {
+          const section = findSection(document, "context");
+          if (!section) throw new Error("The context section is missing.");
+          const firstBlock = section.node.child(1);
+          return new Transform(document).insert(
+            section.position + 1 + firstBlock.nodeSize + 1,
+            schema.nodes.diagramBlock!.create({
+              id: "flow",
+              kind: "mermaid",
+              source: "old source",
+            }),
+          ).doc;
+        });
+      }
+      const loaded = await documents.syncFromLog(SPEC_ID);
+      const document = proseMirrorDocument(loaded.doc);
+      let start = -1;
+      let end = -1;
+      document.descendants((node, position) => {
+        if (node.isText && node.text?.startsWith("Before")) start = position;
+        if (node.isText && node.text?.includes("after.")) end = position + node.nodeSize;
+        if (node.isText && node.text === "After diagram.") end = position + node.nodeSize;
+      });
+      if (start < 0 || end <= start) throw new Error("The rich-node selection is missing.");
+      const selection = selectionRange(loaded, document, start, end);
+
+      await documents.mutateDocument(SPEC_ID, `change-${richNodeCase}`, (current) => {
+        if (richNodeCase === "open-question") {
+          const marker = findQuestionMarker(current, "q-1", "context");
+          if (!marker) throw new Error("The open question is missing.");
+          return new Transform(current).setNodeMarkup(marker.position, undefined, {
+            ...marker.node.attrs,
+            resolved: true,
+            answerMarkdown: "Resolved concurrently.",
+          }).doc;
+        }
+        let diagramPosition = -1;
+        current.descendants((node, position) => {
+          if (node.type === schema.nodes.diagramBlock && node.attrs.id === "flow") {
+            diagramPosition = position;
+          }
+        });
+        if (diagramPosition < 0) throw new Error("The diagram is missing.");
+        return new Transform(current).setNodeMarkup(diagramPosition, undefined, {
+          id: "flow",
+          kind: "mermaid",
+          source: "new source",
+        }).doc;
+      });
+
+      await expect(
+        service.updateSection(SPEC_ID, {
+          ...context(`stale-${richNodeCase}`),
+          sectionId: "context",
+          markdown: "Replacement",
+          selection,
+        }),
+      ).rejects.toThrow("selected structure changed");
+    }
+  });
+
+  test("rejects a concurrent block-boundary change", async () => {
+    const { service, documents } = await setup();
+    await service.updateSection(SPEC_ID, {
+      ...context("seed-boundary"),
+      sectionId: "context",
+      markdown: "First half second half.",
+    });
+    const selection = await selectedTextSpan(documents, "second half");
+    await documents.mutateDocument(SPEC_ID, "split-boundary", (document) => {
+      let splitPosition = -1;
+      document.descendants((node, position) => {
+        if (node.isText && node.text === "First half second half.") {
+          splitPosition = position + "First half ".length;
+        }
+      });
+      if (splitPosition < 0) throw new Error("The block split position is missing.");
+      return new Transform(document).split(splitPosition).doc;
+    });
+
+    await expect(
+      service.updateSection(SPEC_ID, {
+        ...context("stale-boundary"),
+        sectionId: "context",
+        markdown: "second part",
+        selection,
+      }),
+    ).rejects.toThrow(/selected (structure changed|range is no longer valid)/);
+  });
+
+  test("replays the stored tracked edit after a stop that follows the commit", async () => {
+    let stopOnce = true;
+    const { service, documents, documentStore } = await setup({
+      afterPersist: (_specId, seq) => {
+        if (!stopOnce || seq !== 3n) return;
+        stopOnce = false;
+        throw new Error("simulated stop after commit");
+      },
+    });
+    await service.updateSection(SPEC_ID, {
+      ...context("seed-stop"),
+      sectionId: "context",
+      markdown: "Retry forever.",
+    });
+    const selection = await selectedTextSpan(documents, "Retry forever.");
+    const input = {
+      ...context("stop-replay", 2n),
+      sectionId: "context",
+      markdown: "Retry three times.",
+      selection,
+    };
+
+    await expect(service.updateSection(SPEC_ID, input)).rejects.toThrow(
+      "simulated stop after commit",
     );
+    expect(documentStore.actions).toHaveLength(1);
+
+    const replay = await service.updateSection(SPEC_ID, input);
+    expect(replay).toEqual({
+      applied: true,
+      newRev: 3n,
+      concurrentEditors: ["Sam"],
+      transcriptChip: {
+        kind: "spec_tracked_edit",
+        specId: SPEC_ID,
+        sectionId: "context",
+        before: "Retry forever.",
+        after: "Retry three times.",
+      },
+    });
+    expect((await service.read(SPEC_ID, "context")).markdown).toContain("Retry three times.");
+  });
+
+  test("replays Cut from storage after its relative anchors collapse", async () => {
+    const { service, documents, documentStore } = await setup();
+    await service.updateSection(SPEC_ID, {
+      ...context("seed-cut"),
+      sectionId: "context",
+      markdown: "Keep. Remove this. Keep.",
+    });
+    const selection = await selectedTextSpan(documents, "Remove this.");
+    const input = {
+      ...context("cut-replay"),
+      sectionId: "context",
+      markdown: "",
+      selection,
+    };
+
+    const first = await service.updateSection(SPEC_ID, input);
+    const afterCut = await documents.syncFromLog(SPEC_ID);
+    const collapsedStart = resolveSectionRelativeAnchor(
+      afterCut.doc,
+      parseSectionRelativeAnchor(selection.startAnchor),
+    );
+    const collapsedEnd = resolveSectionRelativeAnchor(
+      afterCut.doc,
+      parseSectionRelativeAnchor(selection.endAnchor),
+    );
+    expect(
+      collapsedStart === null || collapsedEnd === null || collapsedStart >= collapsedEnd,
+    ).toBe(true);
+    const replay = await service.updateSection(SPEC_ID, input);
+
+    expect(replay).toEqual(first);
+    expect(documentStore.actions).toHaveLength(1);
+    expect((await service.read(SPEC_ID, "context")).markdown).toBe("## Context\n\nKeep.  Keep.\n");
+  });
+
+  test("rejects a stable tracked-edit action ID reused for a different request", async () => {
+    const { service, documents } = await setup();
+    await service.updateSection(SPEC_ID, {
+      ...context("seed-mismatch"),
+      sectionId: "context",
+      markdown: "Retry forever.",
+    });
+    const selection = await selectedTextSpan(documents, "Retry forever.");
+    await service.updateSection(SPEC_ID, {
+      ...context("mismatch"),
+      sectionId: "context",
+      markdown: "Retry three times.",
+      selection,
+    });
+
+    await expect(
+      service.updateSection(SPEC_ID, {
+        ...context("mismatch"),
+        sectionId: "context",
+        markdown: "Retry five times.",
+        selection,
+      }),
+    ).rejects.toThrow("different request");
   });
 
   test("reports a revision conflict without changing the document", async () => {
