@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { FileChange, IndexedEvent } from "../../events";
-import { countChange, extractFileChanges } from "./fileChanges";
+import { beforeAfter, countChange, extractFileChanges } from "./fileChanges";
 
 const AT = "2026-08-05T12:00:00.000Z";
 
@@ -34,6 +34,87 @@ describe("countChange", () => {
         },
       }),
     ).toEqual({ additions: 1, deletions: 1 });
+  });
+});
+
+describe("beforeAfter", () => {
+  test("reads hunk bodies whose @@ header line counts are wrong", () => {
+    // Verbatim from a prod codex session: the header claims 3 new lines while
+    // the body carries 9. jsdiff's parsePatch throws here ("Added line count
+    // did not match for hunk at line 1"), which blanked the session page.
+    const unified_diff = [
+      "@@ -1,3 +7,3 @@",
+      '-import { useEffect, useMemo, useState, type FormEvent } from "react";',
+      " import {",
+      "+  useEffect,",
+      "+  useMemo,",
+      "+  useState,",
+      "+  type FormEvent,",
+      "+  type MouseEvent as ReactMouseEvent,",
+      '+} from "react";',
+      "+import {",
+      "   encodedSpecBlockCacheSize,",
+      "",
+    ].join("\n");
+
+    expect(beforeAfter({ patch: { unified_diff } })).toEqual({
+      before: [
+        'import { useEffect, useMemo, useState, type FormEvent } from "react";',
+        "import {",
+        "  encodedSpecBlockCacheSize,",
+      ].join("\n"),
+      after: [
+        "import {",
+        "  useEffect,",
+        "  useMemo,",
+        "  useState,",
+        "  type FormEvent,",
+        "  type MouseEvent as ReactMouseEvent,",
+        '} from "react";',
+        "import {",
+        "  encodedSpecBlockCacheSize,",
+      ].join("\n"),
+    });
+  });
+
+  test("keeps empty context lines and drops the no-newline marker", () => {
+    const unified_diff = [
+      "--- a/demo.txt",
+      "+++ b/demo.txt",
+      "@@ -1,3 +1,3 @@",
+      " keep",
+      "",
+      "-old",
+      "+new",
+      "\\ No newline at end of file",
+      "",
+    ].join("\n");
+
+    expect(beforeAfter({ patch: { unified_diff } })).toEqual({
+      before: "keep\n\nold",
+      after: "keep\n\nnew",
+    });
+  });
+
+  test("stops at the next file in a multi-file patch", () => {
+    const unified_diff = [
+      "--- a/one.txt",
+      "+++ b/one.txt",
+      "@@ -1 +1 @@",
+      "-one",
+      "+ONE",
+      "--- a/two.txt",
+      "+++ b/two.txt",
+      "@@ -1 +1 @@",
+      "-two",
+      "+TWO",
+      "",
+    ].join("\n");
+
+    expect(beforeAfter({ patch: { unified_diff } })).toEqual({
+      before: "one",
+      after: "ONE",
+    });
   });
 });
 
