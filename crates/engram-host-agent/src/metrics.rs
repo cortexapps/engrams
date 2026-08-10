@@ -591,7 +591,7 @@ pub const NBD_SLOTS: &str = "engram_nbd_slots";
 /// reconcile).
 pub const SPOOL_LINEAGE_MISMATCH_TOTAL: &str = "engram_nbd_spool_lineage_mismatch_total";
 
-/// ADR 0115 D1: a startup pass that publishes the baked stamp's bundle
+/// ADR 0035 amendment D1: a startup pass that publishes the baked stamp's bundle
 /// generations to BlobStorage failed (it retries on a 60 s timer).
 /// Sustained increments mean stamp generations stay single-copy on
 /// their nodes — the exposure behind the 2026-08-10 `chain_poisoned`

@@ -6,11 +6,11 @@
 //! other generation a snapshot pins arrives here by being
 //! **materialized** from BlobStorage (`bundles/sha256/<sha>`).
 //!
-//! ADR 0115: generations are **durable at birth**. The catalog
+//! ADR 0035 amendment (2026-08-10): generations are **durable at birth**. The catalog
 //! producers (`RegisterSkill`, `RegisterHarness`) upload to blob
 //! storage before they write the catalog row; the baked stamp path
 //! reaches blob storage via [`spawn_startup_publish`] as soon as a
-//! host stages it. Before ADR 0115, stamp generations were published
+//! host stages it. Before the ADR 0035 amendment, stamp generations were published
 //! only by the first snapshot that pinned them — so a generation
 //! attached to a running VM was single-copy on its node until that
 //! snapshot, and a stamp rotation + sweep in that window destroyed
@@ -82,7 +82,7 @@ pub async fn read_stamp(dir: &Path) -> Vec<AuxBundleRef> {
 /// polling.
 const FAILED_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// ADR 0115 D1: publish the baked stamp's generations to BlobStorage
+/// ADR 0035 amendment D1: publish the baked stamp's generations to BlobStorage
 /// at host startup, retrying on [`FAILED_RETRY`] until one pass
 /// succeeds. Idempotent and HEAD-first, so N hosts staging the same
 /// bake race at the cost of N HEADs and at most one PUT per
@@ -260,11 +260,11 @@ impl BundleStore {
     /// set nor in the bake stamp. Best-effort (a failed unlink is just
     /// disk not reclaimed); deleting a file an FC VM still has open is
     /// safe (unlinked-but-open). A swept file must always be
-    /// re-materializable from BlobStorage — that is ADR 0115's
+    /// re-materializable from BlobStorage — that is the ADR 0035 amendment's (2026-08-10)
     /// invariant, held by startup publish (D1: every stamp generation
     /// is durable before it can rotate out) and the completed pin set
     /// (D2: live-sandbox attachments pin their generations). Before
-    /// ADR 0115 this comment claimed the snapshot pin universe alone
+    /// the ADR 0035 amendment this comment claimed the snapshot pin universe alone
     /// made sweeping safe; the 2026-08-10 `chain_poisoned` incident
     /// falsified that (swept a running VM's only copy, un-published).
     pub async fn sweep_unpinned(&self, live: &[AuxBundleRef], current: &[AuxBundleRef]) {
@@ -606,7 +606,7 @@ mod tests {
         panic!("retry timer never staged the bundle (still wedged on ack change)");
     }
 
-    /// ADR 0115 D1: the startup task makes every stamp generation
+    /// ADR 0035 amendment D1: the startup task makes every stamp generation
     /// durable without waiting for a snapshot to reference it.
     #[tokio::test]
     async fn startup_publish_makes_stamp_generations_durable() {
@@ -627,7 +627,7 @@ mod tests {
         }
     }
 
-    /// ADR 0115 D1: a transient blob-storage failure at startup must
+    /// ADR 0035 amendment D1: a transient blob-storage failure at startup must
     /// not leave the stamp un-durable until the next pod restart — the
     /// task retries on the same timer the supervisor uses.
     /// `start_paused` auto-advances the 60 s sleep.
@@ -635,8 +635,7 @@ mod tests {
     async fn startup_publish_retries_until_blob_storage_recovers() {
         use engram_testkit::storage::{FaultPlan, FaultyBlobStorage, InjectedError};
         let tmp = tempfile::tempdir().unwrap();
-        let inner: Arc<dyn BlobStorage> =
-            Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let inner: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
         let (blob, _counters) = FaultyBlobStorage::arc(
             inner,
             FaultPlan::new().fail_nth_put(1, InjectedError::Sdk("gcs blip".into())),

@@ -292,3 +292,84 @@ All on PR #72 (`adr-0035-content-addressed-bundles`):
   content-addressed shape — its 500 on the first CI run was the new
   resolve step refusing a stamp-less host, i.e. the loud-failure
   behavior working as specified.
+
+## Amendment (2026-08-10): durable-at-birth generations + the complete pin set
+
+The 2026-08-10 `chain_poisoned` firing exposed two holes in this ADR's
+retention model. Session `e83383b2`, sandbox `768b22e7`:
+
+1. A fresh create swapped the VM's `dyn_0` drive to the host's current
+   stamp generation (§3).
+2. A deploy rolled the host-agent DaemonSet; the new pod's init staged a
+   new stamp and the swapped-in generation rotated out of `current.json`.
+3. The new pod's supervisor swept the node's only copy — the sweep
+   keep-set is `live_bundles` ∪ the boot-time stamp, and a RUNNING
+   sandbox's attachment is in neither.
+4. The generation had never reached blob storage: publish ran only at
+   snapshot time, and no snapshot had referenced it yet.
+5. The VM's first Diff capture could not publish its pinned generation
+   (HEAD miss + staged file gone) *after* FC had consumed the KVM dirty
+   bitmap, so the checkpoint chain was poisoned. The gate held; no
+   corrupt data was served.
+
+The two structural defects, and the two decisions that close them:
+
+**Durability was circular** — a stamp generation became durable only via
+the first snapshot that pinned it, but that snapshot needs the bytes to
+still exist. Between create and first checkpoint the bytes were
+single-copy on node-local disk. The catalog producers never had this
+defect (`RegisterSkill` / `RegisterHarness` upload before writing the
+row); the baked stamp path (bake → GHCR → node-assets image → hostPath)
+was the one producer class that skipped the upload.
+
+**D1 — publish stamp generations at host-agent startup.** After
+`read_stamp`, a background task runs the idempotent HEAD-first
+`BundleStore::publish` over the stamp's generations, retried on the
+supervisor's 60 s cadence until one pass succeeds. It never gates host
+readiness (a blob outage must not stop the host serving); the
+snapshot-time publish stays as the load-bearing verify-and-backstop, now
+a HEAD hit in the common case. The publish point is the host, not CI:
+the OSS bake publishes to GHCR only and holds no deployment blob
+credentials. N hosts staging the same bake race at N HEADs and at most
+one PUT per generation. Failures increment
+`engram_bundle_startup_publish_failures_total` (pre-registered).
+
+**The pin set was incomplete** — `bundle_pin_set` covered snapshot rows
+∪ the catalogs. A generation attached to a running sandbox, or staged as
+a live host's current stamp, pinned nothing, so both the host sweep and
+the bundle GC could reclaim bytes a live VM's next snapshot needed.
+
+**D2 — pin live-sandbox attachments and host stamps.** A new
+`SandboxBackend::aux_bundles_all` (default empty) reports each running
+sandbox's attached generations from the backend's live view — post-swap,
+and rebuilt from the persisted manifest on pidfd-reattach, so a roll
+survivor reports the generations it really has open. The heartbeat
+carries the report (`serde(default)` both directions; an old host
+mid-roll reports nothing, covered by the GC's 24 h grace — no wire-version
+bump, same posture as `current_bundles`). The coordinator persists it on
+the hosts row (`sandbox_bundles` jsonb, migration 0113) and
+`bundle_pin_set` gains two legs: per-sandbox attachments and current
+stamps, both over `ready|draining` hosts. Ordering is load-bearing: the
+heartbeat handler persists the report **before** computing the ack's
+`live_bundles`, so a freshly rolled host's first ack already pins its own
+reattached sandboxes — the exact window the incident rode.
+`run_one_bundle_sweep` is unchanged; a complete pin set makes it correct
+as-is.
+
+The amended invariant: **a bundle generation that anything can reference
+is durable in blob storage, and every live referent is visible to the
+pin set.**
+
+**Deferred follow-up (simulation).** The DST worlds cannot represent
+this incident class (every sim hardcodes empty `aux_bundles`, no host
+sweep actor exists, and the cosim's coordinator and host use two
+disjoint blob buckets). A follow-up extends the cosim with a shared
+bucket, a real `BundleStore` + stamp on the sim host,
+heartbeat/GC/stamp-rotation steps, and the oracle *every generation
+attached to a live sandbox is reachable from local staging ∪ blob
+storage*. It lands after D1/D2 (the oracle is red before them). The ADR
+0098 D4 conformance obligations for the `bundle_pin_set` change landed
+with D2 itself (`t_bundle_pin_set_union`, the first conformance case for
+this method).
+
+Landed on PRs #1154 (D1) and #1157 (D2).
