@@ -1447,6 +1447,12 @@ impl HostAgent {
                         }
                     };
                     let running_count = running_sandboxes.len() as u32;
+                    // ADR 0035 amendment D2: per-sandbox aux attachments, so the
+                    // coord's `bundle_pin_set` covers running-but-
+                    // unsnapshotted sandboxes (their generations must
+                    // survive the host sweep + bundle GC until the
+                    // first snapshot pins them durably).
+                    let sandbox_bundles = pooled_for_heartbeat.aux_bundles_all().await;
                     if let Some(pool) = &nbd_pool_for_heartbeat {
                         let slots = pool.slot_counts().await;
                         for (state, count) in [
@@ -1589,6 +1595,7 @@ impl HostAgent {
                         host_addr: host_addr_for_heartbeat.clone(),
                         ready_images: readiness_for_heartbeat.snapshot(),
                         current_bundles: current_bundles.clone(),
+                        sandbox_bundles,
                         checkpoints,
                         utilization,
                         // ADR 0048: the CPU packing budget's basis.

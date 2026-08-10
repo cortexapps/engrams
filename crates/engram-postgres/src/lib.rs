@@ -4109,7 +4109,7 @@ impl MetadataStore for PostgresStore {
                    allocatable_mib,
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
                    util_committed_swap_mib,
-                   ready_images, current_bundles,
+                   ready_images, current_bundles, sandbox_bundles,
                    cordoned, total_vcpus, wire_version, stages_images, capabilities,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
@@ -4151,6 +4151,9 @@ impl MetadataStore for PostgresStore {
         let ready_images = serde_json::to_value(&hb.ready_images)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
         let current_bundles = serde_json::to_value(&hb.current_bundles)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        // ADR 0035 amendment D2: per-running-sandbox aux attachments (migration 0113).
+        let sandbox_bundles = serde_json::to_value(&hb.sandbox_bundles)
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
         // ADR 0068: this tick's re-probed capability vector.
         let capabilities = serde_json::to_value(&hb.capabilities)
@@ -4199,6 +4202,7 @@ impl MetadataStore for PostgresStore {
                       stages_images = $20,
                       last_heartbeat_at = $21,
                       util_committed_swap_mib = $22,
+                      sandbox_bundles = $23,
                       updated_at = $21
                  FROM previous
                 WHERE hosts.id = $1
@@ -4236,6 +4240,7 @@ impl MetadataStore for PostgresStore {
         .bind(hb.stages_images)
         .bind(self.clock.now_utc())
         .bind(hb.utilization.committed_swap_mib as i64)
+        .bind(sandbox_bundles)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4289,7 +4294,7 @@ impl MetadataStore for PostgresStore {
                    allocatable_mib,
                    util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
                    util_committed_swap_mib,
-                   ready_images, current_bundles,
+                   ready_images, current_bundles, sandbox_bundles,
                    cordoned, total_vcpus, wire_version, stages_images, capabilities,
                    last_heartbeat_at, status, host_addr
               FROM hosts
@@ -8352,27 +8357,48 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
-    /// ADR 0035 §5 + ADR 0055 P2 + ADR 0062: distinct bundle generations
-    /// referenced by any snapshot row **∪ every live `mount_catalog` skill** ∪
-    /// **the current harness catalog generation** (`dyn_0`) — so a
-    /// registered-but-currently-unused uploaded skill, and the harness catalog a
-    /// fresh session will mount, both stay staged on the fleet (their sha enters
-    /// `live_bundles`) and survive the bundle GC. jsonb unnest
-    /// in SQL so the coord never pages either table; the result is a handful of
-    /// refs. Catalog pins carry the skill `name` as a cosmetic `drive_id` (the
-    /// host stages by `sha256`); a sha pinned by both a snapshot slot and the
-    /// catalog appears once per distinct drive_id, which the GC (keyed on sha)
-    /// and the host supervisor (stages by sha, idempotent) both collapse.
+    /// ADR 0035 §5 + ADR 0055 P2 + ADR 0062 + ADR 0035 amendment D2: distinct bundle
+    /// generations referenced by any snapshot row **∪ every live
+    /// `mount_catalog` skill** ∪ **the current harness catalog generation**
+    /// (`dyn_0`) **∪ every live host's per-sandbox attachments ∪ every live
+    /// host's bake stamp** — so a registered-but-currently-unused uploaded
+    /// skill, the harness catalog a fresh session will mount, a
+    /// running-but-unsnapshotted sandbox's attached generations, and a
+    /// staged-fleet-wide stamp all survive the bundle GC and the host
+    /// sweep. jsonb unnest in SQL so the coord never pages any table; the
+    /// result is a handful of refs. Catalog pins carry the skill `name` as
+    /// a cosmetic `drive_id` (the host stages by `sha256`); a sha pinned by
+    /// several legs appears once per distinct drive_id, which the GC (keyed
+    /// on sha) and the host supervisor (stages by sha, idempotent) both
+    /// collapse.
     async fn bundle_pin_set(
         &self,
     ) -> Result<Vec<engram_core::types::sandbox::AuxBundleRef>, MetaError> {
+        // ADR 0035 amendment D2: two hosts-table legs on top of the ADR 0035/0055/0062
+        // unions. `sandbox_bundles` pins what each RUNNING sandbox has
+        // attached (a live-but-unsnapshotted sandbox previously pinned
+        // nothing — the 2026-08-10 chain_poisoned gap); `current_bundles`
+        // pins every live host's bake stamp so a generation staged
+        // fleet-wide survives until it leaves every stamp. Both legs
+        // exclude `dead` hosts: a dead host's sandboxes are unbound and
+        // its stamp is unreachable, so only snapshots keep those pins.
         let rows = sqlx::query_as::<_, (String, String)>(
             "SELECT DISTINCT b->>'drive_id', b->>'sha256'
                FROM snapshots, jsonb_array_elements(aux_bundles) AS b
              UNION
              SELECT name, sha256 FROM mount_catalog WHERE deleted_at IS NULL
              UNION
-             SELECT name, squashfs_sha256 FROM harness_catalog WHERE deleted_at IS NULL",
+             SELECT name, squashfs_sha256 FROM harness_catalog WHERE deleted_at IS NULL
+             UNION
+             SELECT b->>'drive_id', b->>'sha256'
+               FROM hosts h,
+                    jsonb_array_elements(h.sandbox_bundles) AS sb,
+                    jsonb_array_elements(sb->'bundles') AS b
+              WHERE h.status IN ('ready','draining')
+             UNION
+             SELECT b->>'drive_id', b->>'sha256'
+               FROM hosts h, jsonb_array_elements(h.current_bundles) AS b
+              WHERE h.status IN ('ready','draining')",
         )
         .fetch_all(&self.pool)
         .await

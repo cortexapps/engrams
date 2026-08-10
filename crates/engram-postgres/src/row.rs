@@ -145,6 +145,9 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
             .map_err(|e| MetaError::Serialization(e.to_string()))?;
     let current_bundles = serde_json::from_value(row.try_get("current_bundles").map_err(col_err)?)
         .map_err(|e| MetaError::Serialization(e.to_string()))?;
+    // ADR 0035 amendment D2 (migration 0113): per-running-sandbox aux attachments.
+    let sandbox_bundles = serde_json::from_value(row.try_get("sandbox_bundles").map_err(col_err)?)
+        .map_err(|e| MetaError::Serialization(e.to_string()))?;
     let cordoned: bool = row.try_get("cordoned").map_err(col_err)?;
     let total_vcpus: i32 = row.try_get("total_vcpus").map_err(col_err)?;
     // Issue #229: the host's reported bincode wire version (migration 0066).
@@ -188,6 +191,7 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         host_addr,
         ready_images,
         current_bundles,
+        sandbox_bundles,
         cordoned,
         total_vcpus: total_vcpus.max(0) as u32,
         wire_version: wire_version.max(0) as u32,

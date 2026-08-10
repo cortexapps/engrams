@@ -3643,6 +3643,7 @@ mod tests {
                 host_addr: Some("http://127.0.0.1:1".into()),
                 ready_images: Vec::new(),
                 current_bundles: Vec::new(),
+                sandbox_bundles: Vec::new(),
                 cordoned: false,
                 total_vcpus: 0,
                 wire_version: 0,

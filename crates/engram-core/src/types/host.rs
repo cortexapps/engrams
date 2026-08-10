@@ -347,6 +347,14 @@ pub struct HostRecord {
     /// (heartbeat-persisted). Operator visibility into fleet skew.
     #[serde(default)]
     pub current_bundles: Vec<super::sandbox::AuxBundleRef>,
+    /// ADR 0035 amendment D2: per-running-sandbox aux bundle attachments
+    /// (heartbeat-persisted; migration 0113). `bundle_pin_set` unions
+    /// these so a live-but-unsnapshotted sandbox pins its generations
+    /// against the host sweep and the bundle GC. `#[serde(default)]`
+    /// for pre-0113 rows and mid-roll hosts (the GC grace period
+    /// covers the unreported window).
+    #[serde(default)]
+    pub sandbox_bundles: Vec<super::sandbox::SandboxAuxBundles>,
     /// ADR 0047: coordinator-owned cordon bit. Written only by the
     /// admin cordon/uncordon endpoints (and the ADR 0048 wave driver);
     /// heartbeats never touch it, so it can't be clobbered back to
@@ -397,6 +405,9 @@ pub struct HostHeartbeat {
     pub utilization: HostUtilization,
     pub ready_images: Vec<String>,
     pub current_bundles: Vec<super::sandbox::AuxBundleRef>,
+    /// ADR 0035 amendment D2: aux bundle refs attached to each running sandbox
+    /// this tick — see [`HostRecord::sandbox_bundles`].
+    pub sandbox_bundles: Vec<super::sandbox::SandboxAuxBundles>,
     pub total_vcpus: u32,
     /// Issue #229: the host-agent's bincode `WIRE_VERSION` this tick.
     pub wire_version: u32,

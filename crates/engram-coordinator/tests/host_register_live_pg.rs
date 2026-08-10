@@ -49,6 +49,7 @@ fn host(id: HostId, hostname: &str, addr: &str) -> HostRecord {
         host_addr: Some(addr.to_string()),
         ready_images: Vec::new(),
         current_bundles: Vec::new(),
+        sandbox_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,

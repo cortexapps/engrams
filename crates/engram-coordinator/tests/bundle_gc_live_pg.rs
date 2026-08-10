@@ -253,3 +253,161 @@ async fn dry_run_marks_nothing() {
         .expect("list");
     assert!(!expired.contains(&garbage_sha));
 }
+
+/// ADR 0035 amendment D2: a generation attached to a RUNNING sandbox (no
+/// snapshot row references it) and a live host's stamp generation both
+/// pin against the sweep; a dead host's legs stop pinning. This is the
+/// GC half of the 2026-08-10 chain_poisoned fix — before it, a
+/// live-but-unsnapshotted sandbox's generation was GC-eligible.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn live_sandbox_and_stamp_pins_survive_sweep() {
+    use engram_core::types::host::{HostHeartbeat, HostRecord, HostStatus};
+    use engram_core::types::sandbox::SandboxAuxBundles;
+    use engram_core::types::HostCapacity;
+    use engram_core::{HostId, SandboxId};
+
+    let Some(meta) = connect().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let blob: Arc<dyn BlobStorage> =
+        Arc::new(engram_storage_local::LocalBlobStorage::new(tmp.path()));
+
+    let attach_sha = fake_sha();
+    let stamp_sha = fake_sha();
+    let garbage_sha = fake_sha();
+
+    let host_id = HostId::new();
+    let capacity = HostCapacity {
+        total_gb: 0,
+        used_gb: 0,
+        total_mib: 16_384,
+        used_mib: 0,
+        running_sandboxes: 1,
+    };
+    meta.upsert_host(HostRecord {
+        id: host_id,
+        hostname: "bundle-gc-pins-host".into(),
+        cloud_metadata: Default::default(),
+        capacity: capacity.clone(),
+        utilization: Default::default(),
+        status: HostStatus::Ready,
+        last_heartbeat_at: Utc::now(),
+        host_addr: None,
+        ready_images: Vec::new(),
+        current_bundles: Vec::new(),
+        sandbox_bundles: Vec::new(),
+        cordoned: false,
+        total_vcpus: 4,
+        wire_version: 1,
+        stages_images: false,
+        capabilities: Default::default(),
+    })
+    .await
+    .expect("upsert host");
+    meta.touch_host_heartbeat(
+        host_id,
+        HostHeartbeat {
+            status: HostStatus::Ready,
+            capacity,
+            utilization: Default::default(),
+            ready_images: Vec::new(),
+            current_bundles: vec![AuxBundleRef {
+                drive_id: "dyn_0".into(),
+                sha256: stamp_sha.clone(),
+            }],
+            sandbox_bundles: vec![SandboxAuxBundles {
+                sandbox_id: SandboxId::new(),
+                bundles: vec![AuxBundleRef {
+                    drive_id: "skills".into(),
+                    sha256: attach_sha.clone(),
+                }],
+            }],
+            total_vcpus: 4,
+            wire_version: 1,
+            stages_images: false,
+            capabilities: Default::default(),
+        },
+    )
+    .await
+    .expect("heartbeat");
+
+    for sha in [&attach_sha, &stamp_sha, &garbage_sha] {
+        blob.put(
+            &AuxRoDrive::blob_key(sha),
+            bytes::Bytes::from_static(b"squashfs-bytes"),
+        )
+        .await
+        .expect("publish");
+    }
+
+    let cfg = ChunkGcConfig {
+        grace_period: Duration::from_secs(0),
+        ..ChunkGcConfig::default()
+    };
+    for _ in 0..2 {
+        run_one_bundle_sweep(
+            meta.clone(),
+            blob.clone(),
+            &cfg,
+            SweepMode::Full,
+            &system_clock(),
+        )
+        .await
+        .expect("sweep");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        blob.exists(&AuxRoDrive::blob_key(&attach_sha))
+            .await
+            .unwrap(),
+        "a running sandbox's attached generation must never be deleted"
+    );
+    assert!(
+        blob.exists(&AuxRoDrive::blob_key(&stamp_sha))
+            .await
+            .unwrap(),
+        "a live host's stamp generation must never be deleted"
+    );
+    assert!(
+        !blob
+            .exists(&AuxRoDrive::blob_key(&garbage_sha))
+            .await
+            .unwrap(),
+        "the unpinned control generation must be deleted"
+    );
+
+    // Host dies → its legs stop pinning; both generations become
+    // sweepable (no snapshot ever referenced them).
+    meta.set_host_status(host_id, HostStatus::Dead)
+        .await
+        .expect("mark dead");
+    for _ in 0..2 {
+        run_one_bundle_sweep(
+            meta.clone(),
+            blob.clone(),
+            &cfg,
+            SweepMode::Full,
+            &system_clock(),
+        )
+        .await
+        .expect("sweep post-death");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !blob
+            .exists(&AuxRoDrive::blob_key(&attach_sha))
+            .await
+            .unwrap(),
+        "a dead host's sandbox attachments must stop pinning"
+    );
+    assert!(
+        !blob
+            .exists(&AuxRoDrive::blob_key(&stamp_sha))
+            .await
+            .unwrap(),
+        "a dead host's stamp must stop pinning"
+    );
+}

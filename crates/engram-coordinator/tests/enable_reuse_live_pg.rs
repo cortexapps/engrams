@@ -562,6 +562,7 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
         host_addr: None,
         ready_images: Vec::new(),
         current_bundles: Vec::new(),
+        sandbox_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,

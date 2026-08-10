@@ -658,6 +658,7 @@ async fn seed_staging_host(meta: &Arc<dyn MetadataStore>, digest: &str, staged: 
         host_addr: None,
         ready_images: Vec::new(),
         current_bundles: Vec::new(),
+        sandbox_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 0,
         wire_version: 0,
@@ -684,6 +685,7 @@ async fn seed_staging_host(meta: &Arc<dyn MetadataStore>, digest: &str, staged: 
                 Vec::new()
             },
             current_bundles: Vec::new(),
+            sandbox_bundles: Vec::new(),
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,
             stages_images: true,
@@ -1007,6 +1009,7 @@ async fn prestage_flip_and_straggler_reach_ready_via_live_host_rows() {
             utilization: HostUtilization::default(),
             ready_images: vec![digest.clone()],
             current_bundles: Vec::new(),
+            sandbox_bundles: Vec::new(),
             total_vcpus: 0,
             wire_version: engram_protocol::WIRE_VERSION,
             stages_images: true,
