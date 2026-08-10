@@ -180,6 +180,37 @@ updates:
       #   #1079  phf_shared 0.11 -> 0.14 Permanently red, same shape: `phf`
       #                                  0.11.3 requires phf_shared ^0.11.
       #
+      # The 2026-08-08 batch produced four more of the same shape at once
+      # (#1093 #1094 #1095 #1099). All four collapse to an EMPTY diff once
+      # `cargo hakari generate` runs, because the generated line is the only
+      # place the name appears:
+      #
+      #   #1093  pkcs8 0.10.2 -> 0.11.0   pkcs8 0.11 is not reachable at all:
+      #                                   the resolver keeps 0.10.2 because
+      #                                   ed25519-dalek / p256 / p384 require
+      #                                   ^0.10 through `der`.
+      #   #1094  sqlx-postgres 0.8 -> 0.9 The #1078 case exactly, one crate
+      #                                   over. `sqlx = "0.8"` requires
+      #                                   sqlx-postgres ^0.8, so the pair is
+      #                                   unbuildable by construction. The
+      #                                   genuine move here is a `sqlx` bump.
+      #   #1095  num-bigint 0.4.6 -> 0.5.1 0.5 is unreachable: der-parser 10
+      #                                   (via x509-parser -> rcgen) requires
+      #                                   ^0.4. Regenerating leaves only a
+      #                                   0.4.6 -> 0.4.8 lockfile refresh,
+      #                                   which is not what the PR proposed.
+      #   #1099  spki 0.7.3 -> 0.8.0      Same as pkcs8 and moves with it —
+      #                                   pkcs8 0.10 requires spki ^0.7.
+      #
+      # NOT added here: `sha2` (#1092). Dependabot read the 0.10 line in the
+      # generated file and proposed 0.11, but sha2 is a REAL direct dependency
+      # already declared at 0.11 in the root manifest — the 0.10 in
+      # workspace-hack is the transitive unification for ed25519-dalek /
+      # jsonwebtoken / sqlx-core / google-cloud-storage / p256 / p384, which
+      # still want the 0.10 generation. Ignoring the name would freeze a live
+      # dependency, which is precisely the failure this list warns about
+      # below. #1092 was closed on its own instead.
+      #
       # The backstop for the MERGE risk is now the gate, not this list:
       # `just check` and CI run `cargo hakari generate --diff`, so a change to
       # the generated file that does not match generate's output fails. This
@@ -196,8 +227,12 @@ updates:
       - dependency-name: "axum-core"
       - dependency-name: "der"
       - dependency-name: "hashbrown"
+      - dependency-name: "num-bigint"
       - dependency-name: "phf_shared"
+      - dependency-name: "pkcs8"
+      - dependency-name: "spki"
       - dependency-name: "sqlx-core"
+      - dependency-name: "sqlx-postgres"
 
   # Frontend (pnpm) ---------------------------------------------------------
   # Dependabot reads pnpm-lock.yaml directly via the `npm` ecosystem.
