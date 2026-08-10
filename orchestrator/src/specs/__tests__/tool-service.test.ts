@@ -20,6 +20,7 @@ import type { SpecTemplateSection } from "../../db/schema.ts";
 import {
   encodeProseMirrorDocument,
   proseMirrorDocument,
+  SPEC_MAX_SIZE_BYTES,
   SpecDocumentService,
   type CompactSnapshotInput,
   type SpecDocumentCheckpoint,
@@ -87,6 +88,8 @@ class MemoryDocumentStore implements SpecDocumentStore {
   readonly updates: SpecUpdateRecord[] = [];
   readonly clientIds: Array<string | null> = [];
   readonly actions = new Map<string, SpecTrackedEditActionRecord>();
+  lastEffects: SpecUpdateEffects | null = null;
+  lastCheckpoint: SpecDocumentCheckpoint | null = null;
 
   async readSnapshot(): Promise<SpecSnapshotRecord | null> {
     return null;
@@ -101,13 +104,14 @@ class MemoryDocumentStore implements SpecDocumentStore {
     expectedSeq: bigint,
     update: Uint8Array,
     clientId: string | null,
-    _effects: SpecUpdateEffects,
+    effects: SpecUpdateEffects,
     _participantEpoch?: bigint,
     transcriptAction?: SpecTrackedEditActionInput & { createdAt: Date },
   ): Promise<SpecUpdateInsertResult | null> {
     if (expectedSeq !== this.seq) return null;
     this.seq += 1n;
-    if (_effects.semanticChanged) this.semanticSeq += 1n;
+    if (effects.semanticChanged) this.semanticSeq += 1n;
+    this.lastEffects = effects;
     this.clientIds.push(clientId);
     this.updates.push({
       seq: this.seq,
@@ -138,12 +142,20 @@ class MemoryDocumentStore implements SpecDocumentStore {
   async insertCheckpointAndUpdateIfLatest(
     specId: string,
     expectedSeq: bigint,
-    _checkpoint: SpecDocumentCheckpoint,
+    checkpoint: SpecDocumentCheckpoint,
     update: Uint8Array,
     clientId: string | null,
     effects: SpecUpdateEffects,
   ): Promise<SpecUpdateInsertResult | null> {
-    return this.insertUpdateIfLatest(specId, expectedSeq, update, clientId, effects);
+    const inserted = await this.insertUpdateIfLatest(
+      specId,
+      expectedSeq,
+      update,
+      clientId,
+      effects,
+    );
+    if (inserted) this.lastCheckpoint = checkpoint;
+    return inserted;
   }
 
   async notifyUpdate(): Promise<void> {}
@@ -301,6 +313,7 @@ async function setup(
     }),
     questionStore,
     metadata: new MemoryMetadata(sectionStore),
+    now: () => new Date("2026-08-09T12:00:00.000Z"),
   });
   return { service, documents, documentStore, sectionStore, questionStore };
 }
@@ -968,7 +981,7 @@ describe("production spec tool service", () => {
   });
 
   test("updates one diagram block only in its requested section", async () => {
-    const { service, documents } = await setup();
+    const { service, documents, documentStore } = await setup();
     await documents.mutateDocument(SPEC_ID, "seed-diagram", (document) => {
       const section = findSection(document, "context");
       if (!section) throw new Error("The context section is missing.");
@@ -996,6 +1009,14 @@ describe("production spec tool service", () => {
       source: "new",
     });
     expect(result).toMatchObject({ applied: true, newRev: 3n });
+    expect(result.checkpointId).toBeString();
+    expect(documentStore.lastCheckpoint).toMatchObject({
+      id: result.checkpointId,
+      authorUserId: "user-1",
+      reason: "block_edit",
+      createdAt: new Date("2026-08-09T12:00:00.000Z"),
+    });
+    expect(documentStore.lastCheckpoint?.renderedMarkdown).toContain("```mermaid\nnew\n```");
     const updated = proseMirrorDocument((await documents.syncFromLog(SPEC_ID)).doc);
     const block = findSection(updated, "context")?.node.lastChild;
     expect(block?.attrs).toMatchObject({ id: "flow", source: "new", cachedRender: null });
@@ -1007,6 +1028,33 @@ describe("production spec tool service", () => {
         source: "wrong",
       }),
     ).rejects.toThrow("different section");
+  });
+
+  test("rejects an oversized block source before it stores a checkpoint", async () => {
+    const { service, documents, documentStore } = await setup();
+    await documents.mutateDocument(SPEC_ID, "seed-diagram", (document) => {
+      const section = findSection(document, "context");
+      if (!section) throw new Error("The context section is missing.");
+      return new Transform(document).insert(
+        section.position + section.node.nodeSize - 1,
+        schema.nodes.diagramBlock!.create({ id: "flow", kind: "mermaid", source: "old" }),
+      ).doc;
+    });
+    const updateCount = documentStore.updates.length;
+    documentStore.lastEffects = null;
+    documentStore.lastCheckpoint = null;
+
+    await expect(
+      service.updateBlock(SPEC_ID, {
+        ...context("oversized-block"),
+        sectionId: "context",
+        blockId: "flow",
+        source: "x".repeat(SPEC_MAX_SIZE_BYTES),
+      }),
+    ).rejects.toThrow("the limit is");
+    expect(documentStore.updates).toHaveLength(updateCount);
+    expect(documentStore.lastEffects).toBeNull();
+    expect(documentStore.lastCheckpoint).toBeNull();
   });
 
   test("reports later-epic notes and ticket stores as unavailable", async () => {

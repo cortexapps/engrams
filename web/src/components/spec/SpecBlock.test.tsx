@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import {
   matchingSpecBlockCachedRender,
   SPEC_BLOCK_RENDERER_REVISION,
@@ -229,6 +230,75 @@ describe("spec blocks", () => {
       ),
     ).rejects.toThrow("Flint field");
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("opens an inline mini-chat pinned to the selected block id", async () => {
+    const user = userEvent.setup();
+    const onIterate = vi.fn(async () => {});
+    render(
+      <SpecBlockView
+        attrs={attrs({ cachedRender: cached("flowchart LR\n  A --> B") })}
+        sectionId="design"
+        onIterate={onIterate}
+      />,
+    );
+
+    await user.click(screen.getByRole("img", { name: "Mermaid diagram" }));
+    expect(screen.getByText("Pinned to block")).toBeTruthy();
+    await user.type(screen.getByLabelText("Message about block request-flow"), "Add a retry path.");
+    await user.click(screen.getByRole("button", { name: "Send message about block request-flow" }));
+
+    await waitFor(() =>
+      expect(onIterate).toHaveBeenCalledWith({
+        sectionId: "design",
+        blockId: "request-flow",
+        message: "Add a retry path.",
+      }),
+    );
+    expect(
+      screen.getByText("The agent will update this block source with spec_update_block."),
+    ).toBeTruthy();
+  });
+
+  test("regenerates the visible render after the block source changes", async () => {
+    const onCache = vi.fn();
+    vi.spyOn(specBlockRenderAdapters.mermaid, "render").mockResolvedValue(
+      '<svg xmlns="http://www.w3.org/2000/svg"><text>New render</text></svg>',
+    );
+    const { rerender } = render(
+      <SpecBlockView
+        attrs={attrs({
+          source: "old source",
+          cachedRender: {
+            kind: "mermaid",
+            source: "old source",
+            blockId: "request-flow",
+            rendererRevision: SPEC_BLOCK_RENDERER_REVISION,
+            svg: '<svg xmlns="http://www.w3.org/2000/svg"><text>Old render</text></svg>',
+          },
+        })}
+        onCache={onCache}
+      />,
+    );
+    expect(screen.getByText("Old render")).toBeTruthy();
+
+    rerender(
+      <SpecBlockView
+        attrs={attrs({
+          source: "new source",
+          cachedRender: null,
+        })}
+        onCache={onCache}
+      />,
+    );
+
+    expect(await screen.findByText("New render")).toBeTruthy();
+    expect(screen.queryByText("Old render")).toBeNull();
+    await waitFor(() =>
+      expect(onCache).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "mermaid", source: "new source" }),
+      ),
+    );
   });
 });
 

@@ -1,7 +1,11 @@
 import React from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
-import type { SpecBlockAttrs, SpecBlockKind } from "@engrams/spec-document";
+import {
+  SPEC_BLOCK_RENDERER_REVISION,
+  type SpecBlockAttrs,
+  type SpecBlockKind,
+} from "@engrams/spec-document";
 
 import { SpecBlockView } from "../src/components/spec/SpecBlock";
 import { renderSpecBlock, sanitizeSvg } from "../src/components/spec/block-renderers";
@@ -9,7 +13,15 @@ import { renderSpecBlock, sanitizeSvg } from "../src/components/spec/block-rende
 declare global {
   interface Window {
     runSpecBlockRendererTests: () => Promise<BrowserTestResult>;
+    mountSpecBlockIterationTest: () => void;
+    readSpecBlockIterationRequest: () => BlockIterationRequest | null;
   }
+}
+
+interface BlockIterationRequest {
+  sectionId: string;
+  blockId: string;
+  message: string;
 }
 
 interface BrowserTestResult {
@@ -120,3 +132,36 @@ window.runSpecBlockRendererTests = async () => {
 
   return { rendered, deterministic, unsafeRejected, svgVectorsRejected, fallbackRendered };
 };
+
+let blockIterationRequest: BlockIterationRequest | null = null;
+
+window.mountSpecBlockIterationTest = () => {
+  const rootElement = document.getElementById("root");
+  if (!rootElement) throw new Error("The browser test root is missing.");
+  const source = "flowchart LR\n  Browser --> Agent";
+  const block: SpecBlockAttrs = {
+    id: "request-flow",
+    kind: "mermaid",
+    source,
+    cachedRender: {
+      kind: "mermaid",
+      source,
+      blockId: "request-flow",
+      rendererRevision: SPEC_BLOCK_RENDERER_REVISION,
+      svg: '<svg xmlns="http://www.w3.org/2000/svg"><text>Browser to agent</text></svg>',
+    },
+    provenance: { type: "illustrative" },
+  };
+  blockIterationRequest = null;
+  createRoot(rootElement).render(
+    <SpecBlockView
+      attrs={block}
+      sectionId="design"
+      onIterate={async (request) => {
+        blockIterationRequest = request;
+      }}
+    />,
+  );
+};
+
+window.readSpecBlockIterationRequest = () => blockIterationRequest;

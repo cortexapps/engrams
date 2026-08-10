@@ -84,6 +84,20 @@ try {
   assert.equal(result.unsafeRejected, true);
   assert.equal(result.svgVectorsRejected, true);
   assert.equal(result.fallbackRendered, true);
+
+  await page.evaluate(() => window.mountSpecBlockIterationTest());
+  await page.getByRole("img", { name: "Mermaid diagram" }).click();
+  await page
+    .getByRole("textbox", { name: "Message about block request-flow", exact: true })
+    .fill("Add a bounded retry path.");
+  await page.getByRole("button", { name: "Send message about block request-flow" }).click();
+  await page.waitForFunction(() => window.readSpecBlockIterationRequest() !== null);
+  assert.deepEqual(await page.evaluate(() => window.readSpecBlockIterationRequest()), {
+    sectionId: "design",
+    blockId: "request-flow",
+    message: "Add a bounded retry path.",
+  });
+  await page.getByText("Pinned to block").waitFor();
   assert.deepEqual(externalRequests, []);
   assert.deepEqual(pageErrors, []);
 } finally {

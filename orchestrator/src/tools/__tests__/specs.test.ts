@@ -237,6 +237,29 @@ describe("spec tools", () => {
     expect(JSON.stringify(manifest?.inputSchema)).not.toContain('"anyOf"');
   });
 
+  test("an applied block mutation returns its checkpoint id", async () => {
+    const checkpointId = "00000000-0000-4000-8000-000000001124";
+    const state = recorder({
+      applied: true,
+      newRev: 9n,
+      concurrentEditors: ["Ari"],
+      checkpointId,
+    });
+
+    const result = await call(state.deps, "spec_update_block", {
+      section_id: "design",
+      block_id: "request-flow",
+      source: "flowchart LR\nA --> B",
+    });
+
+    expect(result).toEqual({
+      applied: true,
+      new_rev: "9",
+      concurrent_editors: ["Ari"],
+      checkpoint_id: checkpointId,
+    });
+  });
+
   test("an applied mutation waits for its projection refresh", async () => {
     const state = recorder();
     let release = () => {};

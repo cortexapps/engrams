@@ -44,6 +44,7 @@ import { SectionStateConflictError, type SectionStateService } from "./section-s
 import type { SectionStateValue } from "./section-state.ts";
 
 const AGENT_QUESTION_NAMESPACE = "6a7dd40c-5d36-529d-9561-5f8e1fbea3c7";
+const BLOCK_CHECKPOINT_NAMESPACE = "21b9e56c-54b5-5f8f-a650-320e68aa50d6";
 
 export interface SpecToolMetadataStore {
   templateSections(specId: string): Promise<readonly SpecTemplateSection[]>;
@@ -118,6 +119,7 @@ export interface SpecToolServiceOptions {
   questions: OpenQuestionService;
   questionStore: OpenQuestionStore;
   metadata: SpecToolMetadataStore;
+  now: () => Date;
 }
 
 interface LocatedDiagramBlock {
@@ -422,9 +424,18 @@ export class SpecToolService implements SpecToolDocumentService {
       return this.result(specId, input, true, loaded.semanticDocSeq);
     }
     try {
-      const update = await this.options.documents.mutateDocument(
+      const checkpointId = stableBlockCheckpointId(specId, input.sessionId, input.toolCallId);
+      const blockKind = String(current.node.attrs.kind);
+      const result = await this.options.documents.mutateDocumentWithPostEditCheckpoint(
         specId,
         agentClientId(input),
+        {
+          id: checkpointId,
+          label: `Updated ${blockKind} block ${input.blockId}`,
+          authorUserId: input.actorUserId ?? null,
+          reason: "block_edit",
+          createdAt: this.options.now(),
+        },
         (document) => {
           const block = requireDiagramBlock(document, input.sectionId, input.blockId);
           return new Transform(document).setNodeMarkup(block.position, undefined, {
@@ -435,7 +446,14 @@ export class SpecToolService implements SpecToolDocumentService {
         },
         input.expectedRev,
       );
-      return this.result(specId, input, true, update.semanticDocSeq);
+      return this.result(
+        specId,
+        input,
+        true,
+        result.update.semanticDocSeq,
+        undefined,
+        checkpointId,
+      );
     } catch (error) {
       return this.revisionConflict(specId, input, error);
     }
@@ -470,6 +488,7 @@ export class SpecToolService implements SpecToolDocumentService {
     applied: boolean,
     newRev: bigint,
     transcriptChip?: TrackedEditTranscriptChip,
+    checkpointId?: string,
   ): Promise<SpecMutationResult> {
     return {
       applied,
@@ -479,6 +498,7 @@ export class SpecToolService implements SpecToolDocumentService {
         input.actorUserId,
       ),
       ...(transcriptChip === undefined ? {} : { transcriptChip }),
+      ...(checkpointId === undefined ? {} : { checkpointId }),
     };
   }
 }
@@ -706,9 +726,17 @@ function canonicalValue(value: unknown): unknown {
   return value;
 }
 
+export function stableBlockCheckpointId(
+  specId: string,
+  sessionId: string,
+  toolCallId: string,
+): string {
+  return uuidV5(BLOCK_CHECKPOINT_NAMESPACE, `${specId}:${sessionId}:${toolCallId}`);
+}
+
 function uuidV5(namespace: string, name: string): string {
   const namespaceBytes = Buffer.from(namespace.replaceAll("-", ""), "hex");
-  if (namespaceBytes.length !== 16) throw new Error("The question UUID namespace is invalid.");
+  if (namespaceBytes.length !== 16) throw new Error("The UUID namespace is invalid.");
   const bytes = createHash("sha1")
     .update(namespaceBytes)
     .update(name, "utf8")

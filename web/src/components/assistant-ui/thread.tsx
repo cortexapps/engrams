@@ -36,12 +36,14 @@ import {
   isSpecUpdateSectionTool,
   TrackedEditToolPart,
 } from "@/components/session-thread/TrackedEditToolPart";
+import { SpecBlockTranscriptChip } from "@/components/spec/SpecBlockTranscriptChip";
 import { SystemMessage } from "@/components/session-thread/SystemMessage";
 import { RunFooter } from "@/components/session-thread/RunFooter";
 import {
   BROWSER_ACTIVITY_TOOL,
   FILE_CHANGE_TOOL,
   SHELL_TOOL,
+  SPEC_BLOCK_UPDATE_TOOL,
   TASK_TOOL,
 } from "@/components/session-thread/buildMessages";
 import { useSessionStatus } from "@/components/session-thread/session-status";
@@ -272,7 +274,9 @@ const AssistantMessage: FC = () => {
                             ? TaskToolPart
                             : isSpecUpdateSectionTool(part.toolName)
                               ? TrackedEditToolPart
-                              : ToolFallback;
+                              : part.toolName === SPEC_BLOCK_UPDATE_TOOL
+                                ? SpecBlockTranscriptChip
+                                : ToolFallback;
                   return <Tool {...part} />;
                 }
                 case "indicator":

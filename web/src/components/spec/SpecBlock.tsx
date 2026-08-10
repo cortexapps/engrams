@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useState,
+  type FormEvent,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import {
   encodedSpecBlockCacheSize,
   isSpecBlockKind,
@@ -11,8 +17,10 @@ import {
   type SpecBlockCachedRender,
 } from "@engrams/spec-document";
 import { NodeViewWrapper, type NodeViewProps } from "@tiptap/react";
+import { Loader2Icon, MessageSquareIcon, SendIcon } from "lucide-react";
 
 import { renderSpecBlock, sanitizeSvg } from "./block-renderers";
+import { useSpecBlockIteration, type SpecBlockIterationRequest } from "./block-iteration";
 import "./spec-block.css";
 
 interface RenderedBlock {
@@ -23,13 +31,18 @@ interface RenderedBlock {
 interface SpecBlockViewProps {
   attrs: SpecBlockAttrs;
   onCache?: (render: SpecBlockCachedRender) => void;
+  sectionId?: string;
+  onIterate?: (request: SpecBlockIterationRequest) => Promise<void>;
 }
 
-export function SpecBlock({ node, editor, updateAttributes }: NodeViewProps) {
+export function SpecBlock({ node, editor, updateAttributes, getPos }: NodeViewProps) {
   const attrs = readSpecBlockAttrs(node.attrs);
+  const onIterate = useSpecBlockIteration();
   return (
     <SpecBlockView
       attrs={attrs}
+      sectionId={sectionIdAt(editor.state.doc, getPos())}
+      onIterate={onIterate ?? undefined}
       onCache={
         editor.isEditable
           ? (cachedRender) => {
@@ -41,13 +54,18 @@ export function SpecBlock({ node, editor, updateAttributes }: NodeViewProps) {
   );
 }
 
-export function SpecBlockView({ attrs, onCache }: SpecBlockViewProps) {
+export function SpecBlockView({ attrs, onCache, sectionId, onIterate }: SpecBlockViewProps) {
   const { id, kind, source, provenance } = attrs;
   const registration = specBlockRegistration(kind);
   const renderKey = `${SPEC_BLOCK_RENDERER_REVISION}\u0000${id}\u0000${kind}\u0000${source}`;
   const cachedSvg = useMemo(() => readCachedSvg(attrs), [attrs.cachedRender, id, kind, source]);
   const [rendered, setRendered] = useState<RenderedBlock | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [message, setMessage] = useState("");
+  const [sentMessage, setSentMessage] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
 
   useEffect(() => {
     if (cachedSvg || !registration || !isSpecBlockKind(kind)) return;
@@ -80,6 +98,24 @@ export function SpecBlockView({ attrs, onCache }: SpecBlockViewProps) {
   const svg = cachedSvg ?? (rendered?.key === renderKey ? rendered.svg : null);
   const label = registration?.label ?? `Unknown block: ${kind}`;
   const provenanceLabel = provenance.type === "verified" ? "Verified" : "Illustrative";
+  const canIterate = sectionId !== undefined && onIterate !== undefined;
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const text = message.trim();
+    if (!canIterate || !text || sending) return;
+    setSending(true);
+    setSendError(null);
+    try {
+      await onIterate({ sectionId, blockId: id, message: text });
+      setSentMessage(text);
+      setMessage("");
+    } catch (cause: unknown) {
+      setSendError(cause instanceof Error ? cause.message : "The block request failed.");
+    } finally {
+      setSending(false);
+    }
+  };
 
   return (
     <NodeViewWrapper
@@ -89,10 +125,28 @@ export function SpecBlockView({ attrs, onCache }: SpecBlockViewProps) {
       data-block-kind={kind}
       data-provenance={provenance.type}
       contentEditable={false}
+      onClick={(event: ReactMouseEvent<HTMLElement>) => {
+        if (!canIterate || chatOpen) return;
+        if ((event.target as Element).closest("button, textarea, input, a")) return;
+        setChatOpen(true);
+      }}
     >
       <figcaption className="spec-block-heading">
         <span className="spec-block-kind">{label}</span>
-        <span className="spec-block-provenance">{provenanceLabel}</span>
+        <span className="spec-block-heading-actions">
+          <span className="spec-block-provenance">{provenanceLabel}</span>
+          {canIterate ? (
+            <button
+              type="button"
+              className="spec-block-iterate-trigger"
+              aria-expanded={chatOpen}
+              onClick={() => setChatOpen((open) => !open)}
+            >
+              <MessageSquareIcon aria-hidden="true" />
+              Iterate
+            </button>
+          ) : null}
+        </span>
       </figcaption>
       {provenance.caption ? <p className="spec-block-caption">{provenance.caption}</p> : null}
       {svg ? (
@@ -111,8 +165,55 @@ export function SpecBlockView({ attrs, onCache }: SpecBlockViewProps) {
           Rendering {label.toLowerCase()}…
         </div>
       )}
+      {chatOpen && canIterate ? (
+        <div className="spec-block-chat" onClick={(event) => event.stopPropagation()}>
+          <div className="spec-block-chat-title">
+            <MessageSquareIcon aria-hidden="true" />
+            <span>Iterate on {id}</span>
+            <span className="spec-block-chat-pin">Pinned to block</span>
+          </div>
+          {sentMessage ? (
+            <div className="spec-block-chat-receipt" role="status">
+              <span>{sentMessage}</span>
+              <small>The agent will update this block source with spec_update_block.</small>
+            </div>
+          ) : null}
+          <form className="spec-block-chat-composer" onSubmit={submit}>
+            <textarea
+              aria-label={`Message about block ${id}`}
+              value={message}
+              maxLength={20_000}
+              placeholder="Ask for a change to this block…"
+              onChange={(event) => setMessage(event.target.value)}
+            />
+            <button
+              type="submit"
+              aria-label={`Send message about block ${id}`}
+              disabled={sending || message.trim().length === 0}
+            >
+              {sending ? <Loader2Icon className="spec-block-spin" /> : <SendIcon />}
+            </button>
+          </form>
+          {sendError ? <p className="spec-block-chat-error">{sendError}</p> : null}
+        </div>
+      ) : null}
     </NodeViewWrapper>
   );
+}
+
+function sectionIdAt(
+  document: NodeViewProps["editor"]["state"]["doc"],
+  position: number | undefined,
+) {
+  if (position === undefined) return undefined;
+  const resolved = document.resolve(position);
+  for (let depth = resolved.depth; depth >= 0; depth -= 1) {
+    const node = resolved.node(depth);
+    if (node.type.name === "section" && typeof node.attrs.id === "string") {
+      return node.attrs.id;
+    }
+  }
+  return undefined;
 }
 
 function SourceFallback({ label, source }: { label: string; source: string }) {

@@ -92,6 +92,10 @@ export interface BrowserActivityArgs {
  *  generic completion correlates as usual. */
 export const TASK_TOOL = "engram.task";
 
+/** Durable spec_update_block calls render as a document-history chip in the
+ * main transcript. The tool request and completion stay the source of truth. */
+export const SPEC_BLOCK_UPDATE_TOOL = "engram.specBlockUpdate";
+
 /** Payload carried in a system message's `metadata.custom.marker` — the
  *  harness-register events that aren't agent messages. */
 export type SystemMarker =
@@ -861,7 +865,10 @@ export function buildMessages(
               : {
                   type: "tool-call",
                   toolCallId: ev.tool_call_id,
-                  toolName: ev.tool_name,
+                  toolName:
+                    canonicalToolName(ev.tool_name) === "spec_update_block"
+                      ? SPEC_BLOCK_UPDATE_TOOL
+                      : ev.tool_name,
                   args: parseArgs(ev.args_summary),
                   argsText: ev.args_summary ?? "",
                 };
@@ -910,7 +917,8 @@ export function buildMessages(
         const part: ToolPart = {
           type: "tool-call",
           toolCallId: ev.tool_call_id,
-          toolName: ev.name,
+          toolName:
+            canonicalToolName(ev.name) === "spec_update_block" ? SPEC_BLOCK_UPDATE_TOOL : ev.name,
           args: parseArgs(ev.args_json),
           argsText: ev.args_json,
         };

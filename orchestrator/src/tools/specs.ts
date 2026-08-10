@@ -177,6 +177,7 @@ const MutationOutput = z.object({
       after: z.string(),
     })
     .optional(),
+  checkpoint_id: z.string().uuid().optional(),
 });
 
 export interface SpecReference {
@@ -194,6 +195,7 @@ export interface SpecMutationResult {
   newRev: bigint;
   concurrentEditors: string[];
   transcriptChip?: TrackedEditTranscriptChip;
+  checkpointId?: string;
 }
 
 export interface SpecMutationContext {
@@ -305,6 +307,7 @@ function mutationOutput(
     ...(result.transcriptChip === undefined
       ? {}
       : { transcript_chip: result.transcriptChip }),
+    ...(result.checkpointId === undefined ? {} : { checkpoint_id: result.checkpointId }),
   };
 }
 
