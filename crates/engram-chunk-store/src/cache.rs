@@ -1857,6 +1857,21 @@ impl ChunkCache {
                 if over == 0 {
                     break;
                 }
+                // Re-check the LIVE pin map at unlink time. The `pinned`
+                // snapshot above was taken at sweep start, and the unlink
+                // loop awaits — a chunk pinned AFTER the snapshot but
+                // BEFORE its unlink (the ADR 0075 Hello pin-around-open
+                // sequence racing an in-flight sweep) was a candidate the
+                // stale snapshot could not see, and this sweep would evict
+                // a pinned chunk. Same delete-time re-verify shape as the
+                // chunk/bundle/snapshot-blob GC promote passes. Surfaced
+                // by `pinned_chunks_survive_populate_pressure` flaking
+                // under host disk pressure (the statvfs floor made a
+                // pre-pin sweep want to evict everything; its delayed
+                // unlink then removed the just-pinned chunk).
+                if self.inner.pinned.lock().contains_key(&hash) {
+                    continue;
+                }
                 let _ = fs::remove_file(self.path_for(hash)).await;
                 self.index_remove(hash);
                 over = over.saturating_sub(size);
