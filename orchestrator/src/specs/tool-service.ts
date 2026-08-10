@@ -4,15 +4,20 @@ import {
   createSectionRelativeAnchor,
   findQuestionMarker,
   findSection,
+  parseSectionRelativeAnchor,
   parseMarkdownBlocks,
   renderMarkdown,
   replaceSection,
+  resolveSectionRelativeAnchor,
   schema,
   serializeSectionRelativeAnchor,
+  type SpecSelectionSpan,
+  type TrackedEditTranscriptChip,
 } from "@engrams/spec-document";
-import type { Node as ProseMirrorNode } from "prosemirror-model";
+import { Fragment, Slice, type Node as ProseMirrorNode } from "prosemirror-model";
 import { Transform } from "prosemirror-transform";
 import type { Pool } from "pg";
+import type * as Y from "yjs";
 
 import type { SpecTemplateSection } from "../db/schema.ts";
 import type {
@@ -143,26 +148,61 @@ export class SpecToolService implements SpecToolDocumentService {
 
   async updateSection(
     specId: string,
-    input: SpecMutationContext & { sectionId: string; markdown: string },
+    input: SpecMutationContext & {
+      sectionId: string;
+      markdown: string;
+      selection?: SpecSelectionSpan;
+    },
   ): Promise<SpecMutationResult> {
     const loaded = await this.options.documents.syncFromLog(specId);
-    const desired = replacementSection(proseMirrorDocument(loaded.doc), input.sectionId, input.markdown);
-    if (requireSection(proseMirrorDocument(loaded.doc), input.sectionId).node.eq(desired)) {
+    if (input.expectedRev !== undefined && input.expectedRev !== loaded.semanticDocSeq) {
+      return this.result(specId, input, false, loaded.semanticDocSeq);
+    }
+    if (input.selection && input.selection.sectionId !== input.sectionId) {
+      throw new Error("The selected range belongs to a different section.");
+    }
+    const currentDocument = proseMirrorDocument(loaded.doc);
+    const desired = input.selection
+      ? replaceSelectedRange(currentDocument, loaded.doc, input.selection, input.markdown)
+      : replaceSection(
+          currentDocument,
+          input.sectionId,
+          replacementSection(currentDocument, input.sectionId, input.markdown),
+        );
+    if (currentDocument.eq(desired)) {
       return this.result(specId, input, true, loaded.semanticDocSeq);
     }
     try {
+      let transcriptChip: TrackedEditTranscriptChip | undefined;
       const update = await this.options.documents.mutateDocument(
         specId,
         agentClientId(input),
-        (document) =>
-          replaceSection(
+        (document, ydoc) => {
+          if (!input.selection) {
+            return replaceSection(
+              document,
+              input.sectionId,
+              replacementSection(document, input.sectionId, input.markdown),
+            );
+          }
+          const replacement = replaceSelectedRange(
             document,
-            input.sectionId,
-            replacementSection(document, input.sectionId, input.markdown),
-          ),
+            ydoc,
+            input.selection,
+            input.markdown,
+          );
+          transcriptChip = {
+            kind: "spec_tracked_edit",
+            specId,
+            sectionId: input.sectionId,
+            before: input.selection.selectedText,
+            after: input.markdown,
+          };
+          return replacement;
+        },
         input.expectedRev,
       );
-      return this.result(specId, input, true, update.semanticDocSeq);
+      return this.result(specId, input, true, update.semanticDocSeq, transcriptChip);
     } catch (error) {
       return this.revisionConflict(specId, input, error);
     }
@@ -396,6 +436,7 @@ export class SpecToolService implements SpecToolDocumentService {
     input: SpecMutationContext,
     applied: boolean,
     newRev: bigint,
+    transcriptChip?: TrackedEditTranscriptChip,
   ): Promise<SpecMutationResult> {
     return {
       applied,
@@ -404,6 +445,7 @@ export class SpecToolService implements SpecToolDocumentService {
         specId,
         input.actorUserId,
       ),
+      ...(transcriptChip === undefined ? {} : { transcriptChip }),
     };
   }
 }
@@ -429,6 +471,36 @@ function replacementSection(
     throw new Error(`Spec section ${sectionId} has no stable heading.`);
   }
   return section.type.create(section.attrs, [heading, ...parseMarkdownBlocks(markdown)]);
+}
+
+/** Replace the exact anchored range. Transform.replace does not expand the range. */
+function replaceSelectedRange(
+  document: ProseMirrorNode,
+  ydoc: Y.Doc,
+  selection: SpecSelectionSpan,
+  replacementMarkdown: string,
+): ProseMirrorNode {
+  const startAnchor = parseSectionRelativeAnchor(selection.startAnchor);
+  const endAnchor = parseSectionRelativeAnchor(selection.endAnchor);
+  if (
+    startAnchor.sectionId !== selection.sectionId ||
+    endAnchor.sectionId !== selection.sectionId
+  ) {
+    throw new Error("The selection anchors belong to a different section.");
+  }
+  const start = resolveSectionRelativeAnchor(ydoc, startAnchor);
+  const end = resolveSectionRelativeAnchor(ydoc, endAnchor);
+  if (start === null || end === null || start >= end) {
+    throw new Error("The selected range is no longer valid.");
+  }
+  const selectedText = document.textBetween(start, end, "\n");
+  if (selectedText !== selection.selectedText) {
+    throw new Error("The selected text changed before the scoped edit.");
+  }
+  const slice = Slice.maxOpen(
+    Fragment.fromArray(parseMarkdownBlocks(replacementMarkdown)),
+  );
+  return new Transform(document).replace(start, end, slice).doc;
 }
 
 function documentSections(document: ProseMirrorNode): Array<{

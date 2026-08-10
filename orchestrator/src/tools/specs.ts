@@ -2,6 +2,11 @@
 
 import { z } from "zod";
 
+import type {
+  SpecSelectionSpan,
+  TrackedEditTranscriptChip,
+} from "@engrams/spec-document";
+
 import type { ToolContext, ToolRegistry } from "./registry.ts";
 
 const SPEC_TASK_TYPES = ["spec"] as const;
@@ -21,11 +26,42 @@ const ReadInput = z.object({
   ),
 });
 
-const UpdateSectionInput = z.object({
-  section_id: SectionId,
-  markdown: z.string().describe("Replacement section content as Markdown"),
-  expected_rev: ExpectedRevision,
-});
+const SelectionAnchor = z
+  .string()
+  .min(1)
+  .describe("Yjs-relative anchor from the selected document range");
+
+const UpdateSectionInput = z
+  .object({
+    section_id: SectionId,
+    markdown: z
+      .string()
+      .describe(
+        "Replacement Markdown for the section, or for only the selected range when selection anchors are present",
+      ),
+    selection_start: SelectionAnchor.optional().describe(
+      "Start anchor from a selection action; requires selection_end and selection_text",
+    ),
+    selection_end: SelectionAnchor.optional().describe(
+      "End anchor from a selection action; requires selection_start and selection_text",
+    ),
+    selection_text: z
+      .string()
+      .optional()
+      .describe("Exact selected text; the edit stops if the anchored text changed"),
+    expected_rev: ExpectedRevision,
+  })
+  .superRefine((value, ctx) => {
+    const fields = [value.selection_start, value.selection_end, value.selection_text];
+    const present = fields.filter((field) => field !== undefined).length;
+    if (present !== 0 && present !== fields.length) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["selection_start"],
+        message: "selection_start, selection_end, and selection_text must be used together",
+      });
+    }
+  });
 
 const SetSectionStateInput = z
   .object({
@@ -109,6 +145,15 @@ const MutationOutput = z.object({
   applied: z.boolean(),
   new_rev: Revision,
   concurrent_editors: z.array(z.string()),
+  transcript_chip: z
+    .object({
+      kind: z.literal("spec_tracked_edit"),
+      specId: z.string().uuid(),
+      sectionId: SectionId,
+      before: z.string(),
+      after: z.string(),
+    })
+    .optional(),
 });
 
 export interface SpecReference {
@@ -126,6 +171,7 @@ export interface SpecMutationResult {
   applied: boolean;
   newRev: bigint;
   concurrentEditors: string[];
+  transcriptChip?: TrackedEditTranscriptChip;
 }
 
 export interface SpecMutationContext {
@@ -139,7 +185,11 @@ export interface SpecToolDocumentService {
   read(specId: string, sectionId?: string): Promise<LiveSpecRead>;
   updateSection(
     specId: string,
-    input: SpecMutationContext & { sectionId: string; markdown: string },
+    input: SpecMutationContext & {
+      sectionId: string;
+      markdown: string;
+      selection?: SpecSelectionSpan;
+    },
   ): Promise<SpecMutationResult>;
   setSectionState(
     specId: string,
@@ -230,6 +280,24 @@ function mutationOutput(
     applied: result.applied,
     new_rev: result.newRev.toString(),
     concurrent_editors: result.concurrentEditors,
+    ...(result.transcriptChip === undefined
+      ? {}
+      : { transcript_chip: result.transcriptChip }),
+  };
+}
+
+function updateSelection(
+  args: z.output<typeof UpdateSectionInput>,
+): SpecSelectionSpan | undefined {
+  if (args.selection_start === undefined) return undefined;
+  if (args.selection_end === undefined || args.selection_text === undefined) {
+    throw new Error("The parsed selection is incomplete.");
+  }
+  return {
+    sectionId: args.section_id,
+    startAnchor: args.selection_start,
+    endAnchor: args.selection_end,
+    selectedText: args.selection_text,
   };
 }
 
@@ -321,13 +389,14 @@ export function registerSpecTools(
     name: "spec_update_section",
     taskTypes: SPEC_TASK_TYPES,
     description:
-      "Replace one spec section with Markdown parsed by the document service.",
+      "Replace one spec section, or only an anchored selected range, with Markdown parsed by the document service. When the user supplies a selection, preserve the anchors and selected text so the service confines the edit to that range.",
     input: UpdateSectionInput,
     output: MutationOutput,
     handling: "handled",
     execution: "sync",
     handler: async (ctx, args) => {
       const spec = await requireSpec(ctx, deps);
+      const selection = updateSelection(args);
       const result = await withSectionPresence(
         ctx,
         deps,
@@ -338,6 +407,7 @@ export function registerSpecTools(
             ...mutationContext(ctx, args.expected_rev),
             sectionId: args.section_id,
             markdown: args.markdown,
+            ...(selection === undefined ? {} : { selection }),
           }),
       );
       return finishMutation(ctx, deps, spec.id, result);

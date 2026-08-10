@@ -180,6 +180,68 @@ describe("spec tools", () => {
     ]);
   });
 
+  test("a selection-scoped update carries every span field to the document service", async () => {
+    const state = recorder({
+      applied: true,
+      newRev: 9n,
+      concurrentEditors: [],
+      transcriptChip: {
+        kind: "spec_tracked_edit",
+        specId: SPEC_ID,
+        sectionId: "failure-modes",
+        before: "retry forever",
+        after: "retry three times",
+      },
+    });
+    const result = await call(state.deps, "spec_update_section", {
+      section_id: "failure-modes",
+      markdown: "retry three times",
+      selection_start: "yjs-section://failure-modes/0102",
+      selection_end: "yjs-section://failure-modes/0304",
+      selection_text: "retry forever",
+    });
+
+    expect(state.mutations[0]).toMatchObject({
+      name: "updateSection",
+      input: {
+        sectionId: "failure-modes",
+        markdown: "retry three times",
+        selection: {
+          sectionId: "failure-modes",
+          startAnchor: "yjs-section://failure-modes/0102",
+          endAnchor: "yjs-section://failure-modes/0304",
+          selectedText: "retry forever",
+        },
+      },
+    });
+    expect(result).toMatchObject({
+      applied: true,
+      transcript_chip: {
+        kind: "spec_tracked_edit",
+        before: "retry forever",
+      },
+    });
+  });
+
+  test("selection fields must be complete without adding a union to the schema", () => {
+    const registry = createToolRegistry();
+    registerSpecTools(registry, recorder().deps);
+    const tool = registry.get("spec_update_section");
+    if (!tool) throw new Error("spec_update_section is not registered");
+
+    expect(() =>
+      tool.input.parse({
+        section_id: "context",
+        markdown: "replacement",
+        selection_start: "yjs-section://context/01",
+      }),
+    ).toThrow();
+    const manifest = compileToolManifest(registry).find(
+      (entry) => entry.name === "spec_update_section",
+    );
+    expect(JSON.stringify(manifest?.inputSchema)).not.toContain('"anyOf"');
+  });
+
   test("an applied mutation waits for its projection refresh", async () => {
     const state = recorder();
     let release = () => {};

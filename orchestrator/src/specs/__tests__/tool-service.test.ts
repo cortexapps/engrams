@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+  createSectionRelativeAnchor,
   createTemplateDocument,
   findQuestionMarker,
   findSection,
   renderMarkdown,
   RequirementIntegrityError,
   schema,
+  serializeSectionRelativeAnchor,
   type SpecTemplate,
 } from "@engrams/spec-document";
 import { Transform } from "prosemirror-transform";
@@ -313,6 +315,104 @@ describe("production spec tool service", () => {
     const document = proseMirrorDocument((await documents.syncFromLog(SPEC_ID)).doc);
     expect(findSection(document, "context")?.node.attrs.templateSectionKey).toBe("context");
     expect(renderMarkdown(document)).toContain("## Context\n\nNew body");
+  });
+
+  test("a scoped instruction produces a diff confined to the selected range", async () => {
+    const { service, documents } = await setup();
+    await service.updateSection(SPEC_ID, {
+      ...context("seed-scoped"),
+      sectionId: "context",
+      markdown: "Keep this prefix. Retry forever. Keep this suffix.",
+    });
+    const loaded = await documents.syncFromLog(SPEC_ID);
+    const document = proseMirrorDocument(loaded.doc);
+    let start = -1;
+    document.descendants((node, position) => {
+      const index = node.isText
+        ? (node.text?.indexOf("Retry forever.") ?? -1)
+        : -1;
+      if (index >= 0) start = position + index;
+    });
+    if (start < 0) throw new Error("The selected test text is missing.");
+    const selectedText = "Retry forever.";
+    const selection = {
+      sectionId: "context",
+      startAnchor: serializeSectionRelativeAnchor(
+        createSectionRelativeAnchor(loaded.doc, "context", start),
+      ),
+      endAnchor: serializeSectionRelativeAnchor(
+        createSectionRelativeAnchor(
+          loaded.doc,
+          "context",
+          start + selectedText.length,
+        ),
+      ),
+      selectedText,
+    };
+    const untouchedRequirements = (await service.read(SPEC_ID, "requirements")).markdown;
+
+    const result = await service.updateSection(SPEC_ID, {
+      ...context("scoped-edit"),
+      sectionId: "context",
+      markdown: "Retry three times.",
+      selection,
+    });
+
+    expect((await service.read(SPEC_ID, "context")).markdown).toBe(
+      "## Context\n\nKeep this prefix. Retry three times. Keep this suffix.\n",
+    );
+    expect((await service.read(SPEC_ID, "requirements")).markdown).toBe(
+      untouchedRequirements,
+    );
+    expect(result.transcriptChip).toEqual({
+      kind: "spec_tracked_edit",
+      specId: SPEC_ID,
+      sectionId: "context",
+      before: "Retry forever.",
+      after: "Retry three times.",
+    });
+  });
+
+  test("a scoped instruction stops when the selected text changed", async () => {
+    const { service, documents } = await setup();
+    await service.updateSection(SPEC_ID, {
+      ...context("seed-stale"),
+      sectionId: "context",
+      markdown: "Original selection",
+    });
+    const loaded = await documents.syncFromLog(SPEC_ID);
+    const document = proseMirrorDocument(loaded.doc);
+    let start = -1;
+    document.descendants((node, position) => {
+      if (node.isText && node.text === "Original selection") start = position;
+    });
+    if (start < 0) throw new Error("The stale test text is missing.");
+    const selection = {
+      sectionId: "context",
+      startAnchor: serializeSectionRelativeAnchor(
+        createSectionRelativeAnchor(loaded.doc, "context", start),
+      ),
+      endAnchor: serializeSectionRelativeAnchor(
+        createSectionRelativeAnchor(
+          loaded.doc,
+          "context",
+          start + "Original selection".length,
+        ),
+      ),
+      selectedText: "Different selection",
+    };
+
+    await expect(
+      service.updateSection(SPEC_ID, {
+        ...context("stale-scoped"),
+        sectionId: "context",
+        markdown: "Replacement",
+        selection,
+      }),
+    ).rejects.toThrow("selected text changed");
+    expect((await service.read(SPEC_ID, "context")).markdown).toContain(
+      "Original selection",
+    );
   });
 
   test("reports a revision conflict without changing the document", async () => {

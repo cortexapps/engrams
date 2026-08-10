@@ -37,6 +37,10 @@ export {
   type SectionState,
   type SectionStateTranscriptChip,
   type SectionStateValue,
+  type SpecSelectionAction,
+  type SpecSelectionActionPayload,
+  type SpecSelectionSpan,
+  type TrackedEditTranscriptChip,
 } from "./actions.ts";
 export {
   extractRequirementDefinitions,
