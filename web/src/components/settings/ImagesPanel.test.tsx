@@ -449,6 +449,52 @@ describe("ImagesPanel RPC contract", () => {
     });
   });
 
+  test("failed refresh job keeps the image row reachable for an edit", async () => {
+    // A failed job is NOT in flight: it used to suppress the image row for
+    // a full hour, which also removed "Edit config" — so an operator whose
+    // [warm] hook failed the capture could only Retry the same broken
+    // config. The failure card and the editable row must coexist.
+    const job = makeProtoJob("ghcr.io/cortex/api:warm-1", "failed");
+    job.error = "base-snapshot capture failed (warm_exit_non_zero)";
+    job.warmStage = "cold-base upload";
+    const { transport } = installCapturingTransport(
+      [makeProtoImage("ghcr.io/cortex/api:warm-1")],
+      [job],
+    );
+    renderWithProviders(<ImagesPanel />, { transport });
+
+    // The failure card AND the table row — the URI renders twice.
+    await waitFor(() => {
+      expect(screen.getAllByText("ghcr.io/cortex/api:warm-1")).toHaveLength(2);
+    });
+    expect(screen.getByText(/warm_exit_non_zero/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /edit config/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^retry$/i })).toBeTruthy();
+  });
+
+  test("dismissing a failed job closes the card and leaves the image row", async () => {
+    const job = makeProtoJob("ghcr.io/cortex/api:warm-1", "failed");
+    job.error = "base-snapshot capture failed (warm_exit_non_zero)";
+    const { transport } = installCapturingTransport(
+      [makeProtoImage("ghcr.io/cortex/api:warm-1")],
+      [job],
+    );
+    renderWithProviders(<ImagesPanel />, { transport });
+
+    const user = userEvent.setup();
+    await waitFor(() => {
+      expect(screen.getAllByText("ghcr.io/cortex/api:warm-1")).toHaveLength(2);
+    });
+    await user.click(screen.getByRole("button", { name: /dismiss failure/i }));
+
+    await waitFor(() => {
+      expect(screen.queryByText(/warm_exit_non_zero/i)).toBeNull();
+    });
+    // The row survives, with its edit affordance.
+    expect(screen.getAllByText("ghcr.io/cortex/api:warm-1")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: /edit config/i })).toBeTruthy();
+  });
+
   test("prestaging job renders the fleet chunk-prestage label", async () => {
     // ADR 0036 amendment (issue #538): the enable pipeline gained a new
     // non-terminal state between "capturing" and "ready". The dashboard
