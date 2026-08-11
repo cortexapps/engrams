@@ -14,7 +14,7 @@ import * as Y from "yjs";
 
 import { SpecSelectionMenu, createSpecSelectionSpan, sameSelection } from "./SpecSelectionActions";
 
-function selectionFixture(): SpecSelectionSpan {
+function selectionDocumentFixture() {
   const document = createTemplateDocument({
     sections: [{ id: "failure-modes", key: "failure-modes", title: "Failure modes" }],
   });
@@ -25,17 +25,25 @@ function selectionFixture(): SpecSelectionSpan {
     schema.text("Retry forever."),
   ).doc;
   const ydoc = new Y.Doc();
+  prosemirrorToYXmlFragment(withText, ydoc.getXmlFragment(SPEC_FRAGMENT_NAME));
+  let headingStart = -1;
+  let bodyStart = -1;
+  withText.descendants((node, position) => {
+    if (node.isText && node.text === "Failure modes") headingStart = position;
+    if (node.isText && node.text === "Retry forever.") bodyStart = position;
+  });
+  if (headingStart < 0 || bodyStart < 0) throw new Error("The test text is missing.");
+  return { document: withText, ydoc, headingStart, bodyStart };
+}
+
+function selectionFixture(): SpecSelectionSpan {
+  const { document, ydoc, bodyStart } = selectionDocumentFixture();
   try {
-    prosemirrorToYXmlFragment(withText, ydoc.getXmlFragment(SPEC_FRAGMENT_NAME));
-    let from = -1;
-    withText.descendants((node, position) => {
-      if (node.isText && node.text === "Retry forever.") from = position;
-    });
     const span = createSpecSelectionSpan(
-      withText,
+      document,
       ydoc,
-      from,
-      from + "Retry".length,
+      bodyStart,
+      bodyStart + "Retry".length,
       "00000000-0000-4000-8000-000000000112",
       "7",
     );
@@ -47,6 +55,49 @@ function selectionFixture(): SpecSelectionSpan {
 }
 
 describe("SpecSelectionMenu", () => {
+  test("rejects a selection wholly in the section heading", () => {
+    const { document, ydoc, headingStart } = selectionDocumentFixture();
+    try {
+      expect(
+        createSpecSelectionSpan(
+          document,
+          ydoc,
+          headingStart,
+          headingStart + "Failure".length,
+          "00000000-0000-4000-8000-000000000112",
+          "7",
+        ),
+      ).toBeNull();
+    } finally {
+      ydoc.destroy();
+    }
+  });
+
+  test("rejects a selection that crosses from the heading into the body", () => {
+    const { document, ydoc, headingStart, bodyStart } = selectionDocumentFixture();
+    try {
+      expect(
+        createSpecSelectionSpan(
+          document,
+          ydoc,
+          headingStart,
+          bodyStart + "Retry".length,
+          "00000000-0000-4000-8000-000000000112",
+          "7",
+        ),
+      ).toBeNull();
+    } finally {
+      ydoc.destroy();
+    }
+  });
+
+  test("allows a selection wholly in the section body", () => {
+    expect(selectionFixture()).toMatchObject({
+      sectionId: "failure-modes",
+      selectedText: "Retry",
+    });
+  });
+
   test("keeps an equal transaction snapshot state-stable", () => {
     const selection = selectionFixture();
 

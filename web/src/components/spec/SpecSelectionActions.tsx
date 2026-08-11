@@ -4,6 +4,7 @@ import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { BubbleMenu } from "@tiptap/react/menus";
 import {
   createSectionRelativeAnchor,
+  isRangeInSectionBody,
   selectionSliceFingerprint,
   serializeSectionRelativeAnchor,
   type SpecSelectionAction,
@@ -167,7 +168,7 @@ export function createSpecSelectionSpan(
       sectionId = node.attrs.id;
     }
   });
-  if (sectionId === null) return null;
+  if (sectionId === null || !isRangeInSectionBody(document, sectionId, from, to)) return null;
   const selectedText = document.textBetween(from, to, "\n");
   if (selectedText.trim().length === 0) return null;
   return {

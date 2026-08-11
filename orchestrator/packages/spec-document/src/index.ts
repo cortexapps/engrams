@@ -18,6 +18,7 @@ export {
 } from "./blocks.ts";
 export {
   createSectionRelativeAnchor,
+  isRangeInSectionBody,
   parseSectionRelativeAnchor,
   resolveSectionRelativeAnchor,
   serializeSectionRelativeAnchor,

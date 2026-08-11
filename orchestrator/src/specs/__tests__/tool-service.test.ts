@@ -387,7 +387,7 @@ describe("production spec tool service", () => {
     expect(renderMarkdown(document)).toContain("## Context\n\nNew body");
   });
 
-  test("a scoped instruction produces a diff confined to the selected range", async () => {
+  test("allows a selection wholly in the section body", async () => {
     const { service, documents } = await setup();
     await service.updateSection(SPEC_ID, {
       ...context("seed-scoped"),
@@ -436,6 +436,80 @@ describe("production spec tool service", () => {
       before: "Retry forever.",
       after: "Retry three times.",
     });
+  });
+
+  test("rejects a forged selection wholly in the section heading", async () => {
+    const { service, documents } = await setup();
+    await service.updateSection(SPEC_ID, {
+      ...context("seed-heading-selection"),
+      sectionId: "context",
+      markdown: "Body content.",
+    });
+    const loaded = await documents.syncFromLog(SPEC_ID);
+    const document = proseMirrorDocument(loaded.doc);
+    let headingStart = -1;
+    document.descendants((node, position) => {
+      if (node.type === schema.nodes.sectionHeading && node.textContent === "Context") {
+        headingStart = position + 1;
+      }
+    });
+    if (headingStart < 0) throw new Error("The section heading is missing.");
+    const selection = selectionRange(
+      loaded,
+      document,
+      headingStart,
+      headingStart + "Context".length,
+    );
+
+    await expect(
+      service.updateSection(SPEC_ID, {
+        ...context("heading-selection"),
+        sectionId: "context",
+        markdown: "Changed",
+        selection,
+      }),
+    ).rejects.toThrow("selected range must be inside the section body");
+    expect((await service.read(SPEC_ID, "context")).markdown).toBe(
+      "## Context\n\nBody content.\n",
+    );
+  });
+
+  test("rejects a forged selection that crosses from the heading into the body", async () => {
+    const { service, documents } = await setup();
+    await service.updateSection(SPEC_ID, {
+      ...context("seed-crossing-selection"),
+      sectionId: "context",
+      markdown: "Body content.",
+    });
+    const loaded = await documents.syncFromLog(SPEC_ID);
+    const document = proseMirrorDocument(loaded.doc);
+    let headingStart = -1;
+    let bodyStart = -1;
+    document.descendants((node, position) => {
+      if (node.type === schema.nodes.sectionHeading && node.textContent === "Context") {
+        headingStart = position + 1;
+      }
+      if (node.isText && node.text === "Body content.") bodyStart = position;
+    });
+    if (headingStart < 0 || bodyStart < 0) throw new Error("The selection text is missing.");
+    const selection = selectionRange(
+      loaded,
+      document,
+      headingStart,
+      bodyStart + "Body".length,
+    );
+
+    await expect(
+      service.updateSection(SPEC_ID, {
+        ...context("crossing-selection"),
+        sectionId: "context",
+        markdown: "Changed",
+        selection,
+      }),
+    ).rejects.toThrow("selected range must be inside the section body");
+    expect((await service.read(SPEC_ID, "context")).markdown).toBe(
+      "## Context\n\nBody content.\n",
+    );
   });
 
   test("an unrelated concurrent edit keeps the exact selected range valid", async () => {

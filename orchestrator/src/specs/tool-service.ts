@@ -4,6 +4,7 @@ import {
   createSectionRelativeAnchor,
   findQuestionMarker,
   findSection,
+  isRangeInSectionBody,
   parseSectionRelativeAnchor,
   parseMarkdownBlocks,
   renderMarkdown,
@@ -524,6 +525,9 @@ function replaceSelectedRange(
   const end = resolveSectionRelativeAnchor(ydoc, endAnchor);
   if (start === null || end === null || start >= end) {
     throw new Error("The selected range is no longer valid.");
+  }
+  if (!isRangeInSectionBody(document, selection.sectionId, start, end)) {
+    throw new Error("The selected range must be inside the section body.");
   }
   const fingerprint = selectionSliceFingerprint(document, start, end);
   if (fingerprint !== selection.sliceFingerprint) {

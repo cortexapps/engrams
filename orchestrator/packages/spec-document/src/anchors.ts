@@ -12,6 +12,22 @@ export interface SectionRelativeAnchor {
   position: Uint8Array;
 }
 
+/** Return true when a range is strictly inside a section body. */
+export function isRangeInSectionBody(
+  doc: ReturnType<typeof initProseMirrorDoc>["doc"],
+  sectionId: string,
+  from: number,
+  to: number,
+): boolean {
+  if (from >= to) return false;
+  const section = findSection(doc, sectionId);
+  const heading = section?.node.firstChild;
+  if (!section || !heading || heading.type !== schema.nodes.sectionHeading) return false;
+  const headingEnd = section.position + 1 + heading.nodeSize;
+  const sectionEnd = section.position + section.node.nodeSize;
+  return from > headingEnd && to > headingEnd && from < sectionEnd && to < sectionEnd;
+}
+
 /** Create a Yjs relative position and bind it to a stable section node ID. */
 export function createSectionRelativeAnchor(
   doc: Y.Doc,
