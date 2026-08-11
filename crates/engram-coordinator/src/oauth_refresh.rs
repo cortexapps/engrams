@@ -98,7 +98,13 @@ impl OAuthManager {
             ("client_secret", client_secret),
         ];
         let delimiter = ",";
-        match self.token_grant(&refresh.token_url, &form, delimiter).await {
+        // Refresh grants read from the response ROOT even when the initial
+        // grant lived under a dot-path: providers that nest the first grant
+        // (Slack `authed_user`) return refreshed tokens top-level.
+        match self
+            .token_grant(&refresh.token_url, &form, delimiter, "")
+            .await
+        {
             Ok(grant) => {
                 let new_bundle = ConnectorOAuthBundle {
                     v: bundle.v,

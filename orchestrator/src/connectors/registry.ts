@@ -304,8 +304,34 @@ export interface OauthMetadataProbe {
  *   the org header, so user mode needs its own header spec); forbidden for
  *   inject connectors (the single existing header renders the user value).
  */
+/**
+ * ADR 0115 amendment: how a USER-subject OAuth flow differs from the org
+ * connection's. The org facet's `extraAuthorizeParams` are NEVER inherited —
+ * they often pin the ORG identity (Linear's `actor: "app"` makes tokens post
+ * as the application); a personal flow must default to acting as the
+ * authorizing user. Slack additionally needs `scopesParam: "user_scope"`
+ * (else the provider mints a bot token) and `grantPath: "authed_user"` (the
+ * user token lives in a nested object of the exchange response).
+ */
+export interface UserOauthOverrides {
+  /** Scopes for the user flow; defaults to the facet's. */
+  scopes?: string[];
+  /** Authorize query param carrying the joined scopes; default `scope`. */
+  scopesParam?: string;
+  /** Dot-path to the grant object in the token response; default the root. */
+  grantPath?: string;
+  /** Authorize extras for the USER flow. Defaults to NONE (org extras are
+   * never inherited). Same bounds/reserved-name rules as the facet's. */
+  authorizeParams?: Record<string, string>;
+  /** Metadata mapping override (`fromTokenResponse` only); defaults to the
+   * facet's metadata. */
+  metadata?: Pick<OauthMetadataSpec, "fromTokenResponse">;
+}
+
 export interface UserCredentialFacet {
-  oauth?: boolean;
+  /** `true` reuses the facet as-is (minus its authorize extras); an object
+   * overrides the user flow's shape. */
+  oauth?: true | UserOauthOverrides;
   token?: { hint: string };
   inject?: { header: string; template: string };
 }
@@ -1334,8 +1360,116 @@ export function parseConnector(raw: unknown, where: string): Connector {
       fail(uw, "must be an object");
     }
     const uc = o.userCredential as Record<string, unknown>;
-    if (uc.oauth !== undefined && typeof uc.oauth !== "boolean") {
-      fail(uw, '"oauth" must be a boolean');
+    let userOauth: true | UserOauthOverrides | undefined;
+    if (uc.oauth !== undefined) {
+      if (uc.oauth === true) {
+        userOauth = true;
+      } else if (typeof uc.oauth === "object" && uc.oauth !== null && !Array.isArray(uc.oauth)) {
+        const raw = uc.oauth as Record<string, unknown>;
+        const overrides: UserOauthOverrides = {};
+        if (raw.scopes !== undefined) {
+          const scopes = asStringArray(uw, "oauth.scopes", raw.scopes);
+          if (scopes.length > 50) fail(uw, '"oauth.scopes" has too many entries (max 50)');
+          if (scopes.some((s) => !s || /\s/.test(s))) {
+            fail(uw, '"oauth.scopes" entries must be non-empty and whitespace-free');
+          }
+          overrides.scopes = scopes;
+        }
+        if (raw.scopesParam !== undefined) {
+          if (typeof raw.scopesParam !== "string" || !/^[a-z_]{1,32}$/.test(raw.scopesParam)) {
+            fail(uw, '"oauth.scopesParam" must be a short lowercase identifier');
+          }
+          overrides.scopesParam = raw.scopesParam;
+        }
+        if (raw.grantPath !== undefined) {
+          if (
+            typeof raw.grantPath !== "string" ||
+            raw.grantPath.length === 0 ||
+            raw.grantPath.length > 64 ||
+            raw.grantPath
+              .split(".")
+              .some(
+                (seg) =>
+                  !OAUTH_METADATA_SEGMENT_RE.test(seg) || UNSAFE_OBJECT_PATH_SEGMENTS.has(seg),
+              ) ||
+            raw.grantPath.split(".").length > MAX_OAUTH_METADATA_PATH_SEGMENTS
+          ) {
+            fail(uw, '"oauth.grantPath" must be a short dot-path');
+          }
+          overrides.grantPath = raw.grantPath;
+        }
+        if (raw.authorizeParams !== undefined) {
+          if (
+            typeof raw.authorizeParams !== "object" ||
+            raw.authorizeParams === null ||
+            Array.isArray(raw.authorizeParams)
+          ) {
+            fail(uw, '"oauth.authorizeParams" must be an object of param → value');
+          }
+          const entries = Object.entries(raw.authorizeParams as Record<string, unknown>);
+          if (entries.length > MAX_OAUTH_EXTRA_PARAMS) {
+            fail(uw, `"oauth.authorizeParams" has ${entries.length} entries (max ${MAX_OAUTH_EXTRA_PARAMS})`);
+          }
+          const params: Record<string, string> = {};
+          for (const [k, v] of entries) {
+            if (RESERVED_OAUTH_PARAMS.has(k)) fail(uw, `"oauth.authorizeParams" key "${k}" is reserved`);
+            if (
+              !k ||
+              k.length > MAX_OAUTH_PARAM_LENGTH ||
+              typeof v !== "string" ||
+              v.length > MAX_OAUTH_PARAM_LENGTH ||
+              /[\r\n\0]/.test(k) ||
+              /[\r\n\0]/.test(v)
+            ) {
+              fail(uw, '"oauth.authorizeParams" entries must be short, control-free strings');
+            }
+            params[k] = v;
+          }
+          overrides.authorizeParams = params;
+        }
+        if (raw.metadata !== undefined) {
+          if (typeof raw.metadata !== "object" || raw.metadata === null) {
+            fail(uw, '"oauth.metadata" must be an object');
+          }
+          const m = raw.metadata as Record<string, unknown>;
+          if (m.probe !== undefined) {
+            fail(uw, '"oauth.metadata.probe" is not supported on the user override (facet-only)');
+          }
+          if (m.fromTokenResponse === undefined) {
+            fail(uw, '"oauth.metadata" must carry "fromTokenResponse"');
+          }
+          if (
+            typeof m.fromTokenResponse !== "object" ||
+            m.fromTokenResponse === null ||
+            Array.isArray(m.fromTokenResponse)
+          ) {
+            fail(uw, '"oauth.metadata.fromTokenResponse" must be an object of field → dot-path');
+          }
+          const map: Partial<Record<OauthMetadataField, string>> = {};
+          for (const [k, path] of Object.entries(m.fromTokenResponse as Record<string, unknown>)) {
+            if (!OAUTH_METADATA_FIELDS.has(k)) {
+              fail(uw, `"oauth.metadata.fromTokenResponse" key "${k}" is not a metadata field`);
+            }
+            if (typeof path !== "string" || !path) {
+              fail(uw, `"oauth.metadata.fromTokenResponse.${k}" must be a non-empty dot-path`);
+            }
+            const segments = path.split(".");
+            if (segments.length > MAX_OAUTH_METADATA_PATH_SEGMENTS) {
+              fail(uw, `"oauth.metadata.fromTokenResponse.${k}" has too many path segments`);
+            }
+            for (const seg of segments) {
+              if (!OAUTH_METADATA_SEGMENT_RE.test(seg) || UNSAFE_OBJECT_PATH_SEGMENTS.has(seg)) {
+                fail(uw, `"oauth.metadata.fromTokenResponse.${k}" segment "${seg}" is not allowed`);
+              }
+            }
+            map[k as OauthMetadataField] = path;
+          }
+          overrides.metadata = { fromTokenResponse: map };
+        }
+        userOauth = overrides;
+      } else {
+        fail(uw, '"oauth" must be true or an overrides object');
+      }
     }
     let token: { hint: string } | undefined;
     if (uc.token !== undefined) {
@@ -1346,11 +1480,11 @@ export function parseConnector(raw: unknown, where: string): Connector {
       }
       token = { hint: t.hint };
     }
-    if (uc.oauth !== true && token === undefined) {
-      fail(uw, 'must declare at least one mode ("oauth": true and/or "token")');
+    if (userOauth === undefined && token === undefined) {
+      fail(uw, 'must declare at least one mode ("oauth" and/or "token")');
     }
-    if (uc.oauth === true && credential.source === "inject" && oauth === undefined) {
-      fail(uw, '"oauth": true requires the connector\'s top-level "oauth" facet');
+    if (userOauth !== undefined && credential.source === "inject" && oauth === undefined) {
+      fail(uw, '"oauth" requires the connector\'s top-level "oauth" facet');
     }
     let userInject: { header: string; template: string } | undefined;
     if (uc.inject !== undefined) {
@@ -1372,7 +1506,7 @@ export function parseConnector(raw: unknown, where: string): Connector {
         fail(uw, '"inject" is only for mint connectors (inject connectors render the user value through their existing header)');
       }
     } else {
-      if (uc.oauth === true) {
+      if (userOauth !== undefined) {
         fail(uw, 'mint connectors support "token" mode only (user-to-server OAuth is not implemented)');
       }
       if (userInject === undefined) {
@@ -1380,7 +1514,7 @@ export function parseConnector(raw: unknown, where: string): Connector {
       }
     }
     userCredential = {
-      ...(uc.oauth === true ? { oauth: true } : {}),
+      ...(userOauth !== undefined ? { oauth: userOauth } : {}),
       ...(token ? { token } : {}),
       ...(userInject ? { inject: userInject } : {}),
     };
@@ -1951,7 +2085,7 @@ export function buildProviderCatalog(
       ...(connector.userCredential
         ? {
             userCredential: {
-              oauth: connector.userCredential.oauth === true,
+              oauth: connector.userCredential.oauth !== undefined,
               token: connector.userCredential.token !== undefined,
               ...(connector.userCredential.token
                 ? { tokenHint: connector.userCredential.token.hint }

@@ -219,7 +219,7 @@ export function makeMeRoute(deps?: MeDeps): Hono {
       if (!uc) continue;
       union.set(connector.provider, {
         name: connector.display.name,
-        oauth: uc.oauth === true,
+        oauth: uc.oauth !== undefined,
         token: uc.token !== undefined,
         ...(uc.token ? { tokenHint: uc.token.hint } : {}),
       });

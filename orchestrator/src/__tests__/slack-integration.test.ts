@@ -361,10 +361,19 @@ describe("integration oauth route", () => {
       acquisitionHosts: ["acmeoauth.test"],
       tokenUrl: "https://api.acmeoauth.test/oauth/token",
       scopes: ["read"],
+      // The ORG identity pin (Linear's actor=app) — the user flow must NOT
+      // inherit it, or personal tokens act as the application.
+      extraAuthorizeParams: { actor: "app" },
       clientIdRef: "acmeoauth.client_id",
       clientSecretRef: "acmeoauth.client_secret",
     },
-    userCredential: { oauth: true },
+    userCredential: {
+      oauth: {
+        scopesParam: "user_scope",
+        grantPath: "authed_user",
+        metadata: { fromTokenResponse: { accountId: "authed_user.id" } },
+      },
+    },
   };
   const userSource = {
     list: async () => [{ provider: "acmeoauth", config: userOauthConnector }],
@@ -387,6 +396,27 @@ describe("integration oauth route", () => {
     // The provider requires an exact-match redirect URI — the user flow
     // shares the org callback.
     expect(begin.redirectUri).toContain("/api/v1/integrations/acmeoauth/oauth/callback");
+    // ADR 0115 amendment: the org identity pin (actor=app) is NOT inherited,
+    // and the connector's user overrides ride the wire spec.
+    expect(begin.spec?.extraAuthorizeParams).toEqual({});
+    expect(begin.spec?.scopesParam).toBe("user_scope");
+    expect(begin.spec?.grantPath).toBe("authed_user");
+    expect(begin.spec?.metadata?.fromTokenResponse).toEqual({ account_id: "authed_user.id" });
+  });
+
+  test("org authorize keeps its identity params (actor=app untouched)", async () => {
+    const { client, calls } = fakeRedirectClient();
+    const app = makeIntegrationOauthRoute({
+      connectors: userSource,
+      oauthCredential: client as never,
+      connectionIdFor,
+      getSession: adminSession,
+    });
+    const res = await app.request("/api/v1/integrations/acmeoauth/oauth/authorize");
+    expect(res.status).toBe(302);
+    expect(calls.begin[0]!.spec?.extraAuthorizeParams).toEqual({ actor: "app" });
+    expect(calls.begin[0]!.spec?.scopesParam ?? "").toBe("");
+    expect(calls.begin[0]!.spec?.grantPath ?? "").toBe("");
   });
 
   test("user authorize: 404 without userCredential.oauth", async () => {
