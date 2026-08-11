@@ -198,7 +198,6 @@ export class PostgresSpecProjectionStore implements SpecProjectionStore {
     },
   ): Promise<void> {
     const updated = await getDb().transaction(async (tx) => {
-      await tx.execute(sql`SELECT set_config('engrams.semantic_revision_writer', '1', true)`);
       return tx
         .update(specProjection)
         .set({

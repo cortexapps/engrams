@@ -1172,13 +1172,42 @@ describe("SpecDocumentService with live Postgres", () => {
   );
 
   test.skipIf(!liveDbReachable)(
-    "migration 0056 backfills revisions and supports old and current writers",
+    "migration 0059 drops the rollout triggers and rejects writers that omit semantic revisions",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
       const client = await livePool.connect();
       const schemaName = `semantic_revision_${randomUUID().replaceAll("-", "")}`;
       const quotedSchema = `"${schemaName}"`;
       const migrationSpecId = randomUUID();
+
+      const applyMigration = async (file: string) => {
+        const migration = await readFile(
+          new URL(`../../../drizzle/${file}`, import.meta.url),
+          "utf8",
+        );
+        for (const statement of migration
+          .split("--> statement-breakpoint")
+          .map((value) => value.trim())
+          .filter(Boolean)) {
+          await client.query(statement);
+        }
+      };
+
+      // A rejected write aborts the enclosing transaction, so run each legacy
+      // write inside a savepoint. Returns the SQLSTATE, or null when Postgres
+      // accepted the write.
+      const rejectionCode = async (statement: string, params: unknown[]) => {
+        await client.query("SAVEPOINT legacy_write");
+        try {
+          await client.query(statement, params);
+          return null;
+        } catch (error) {
+          return (error as { code?: string }).code ?? null;
+        } finally {
+          await client.query("ROLLBACK TO SAVEPOINT legacy_write");
+        }
+      };
+
       try {
         await client.query("BEGIN");
         await client.query(`CREATE SCHEMA ${quotedSchema}`);
@@ -1228,34 +1257,9 @@ describe("SpecDocumentService with live Postgres", () => {
           [migrationSpecId],
         );
 
-        const migration = await readFile(
-          new URL("../../../drizzle/0056_spec_semantic_revision.sql", import.meta.url),
-          "utf8",
-        );
-        for (const statement of migration
-          .split("--> statement-breakpoint")
-          .map((value) => value.trim())
-          .filter(Boolean)) {
-          await client.query(statement);
-        }
-
-        await client.query("UPDATE spec SET current_doc_seq = 3 WHERE id = $1", [migrationSpecId]);
-        await client.query(
-          `INSERT INTO spec_update_log (spec_id, seq, update, client_id)
-           VALUES ($1, 3, ''::bytea, 'legacy')`,
-          [migrationSpecId],
-        );
-        await client.query(
-          `INSERT INTO spec_snapshot (spec_id, state, state_vector, covered_seq)
-           VALUES ($1, ''::bytea, ''::bytea, 3)
-           ON CONFLICT (spec_id) DO UPDATE SET covered_seq = excluded.covered_seq`,
-          [migrationSpecId],
-        );
-        await client.query(
-          "UPDATE spec_projection SET doc_seq = 3 WHERE spec_id = $1 AND rev = 1",
-          [migrationSpecId],
-        );
-        const legacy = await client.query<{
+        await applyMigration("0056_spec_semantic_revision.sql");
+        // 0056 backfills the rows an older pod wrote.
+        const backfilled = await client.query<{
           spec: string;
           update_log: string;
           snapshot: string;
@@ -1269,16 +1273,125 @@ describe("SpecDocumentService with live Postgres", () => {
             WHERE id = $1`,
           [migrationSpecId],
         );
-        expect(legacy.rows).toEqual([
-          { spec: "3", update_log: "3", snapshot: "3", projection: "3" },
+        expect(backfilled.rows).toEqual([
+          { spec: "2", update_log: "2", snapshot: "2", projection: "2" },
         ]);
 
-        await client.query("SELECT set_config('engrams.semantic_revision_writer', '1', true)");
+        await applyMigration("0059_spec_semantic_revision_contract.sql");
+
+        // No rollout trigger and no rollout function survives 0059.
+        const leftovers = await client.query<{ triggers: string; functions: string }>(
+          `SELECT (SELECT count(*)::text
+                     FROM pg_trigger t
+                     JOIN pg_class c ON c.oid = t.tgrelid
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE NOT t.tgisinternal
+                      AND n.nspname = $1
+                      AND t.tgname LIKE '%legacy_semantic_revision%') AS triggers,
+                  (SELECT count(*)::text
+                     FROM pg_proc p
+                     JOIN pg_namespace n ON n.oid = p.pronamespace
+                    WHERE n.nspname = $1
+                      AND p.proname LIKE '%legacy_semantic_revision%') AS functions`,
+          [schemaName],
+        );
+        expect(leftovers.rows).toEqual([{ triggers: "0", functions: "0" }]);
+
+        // The four semantic revision columns stay NOT NULL. That constraint is
+        // what rejects a writer which omits a semantic revision.
+        const nullability = await client.query<{ table_name: string; is_nullable: string }>(
+          `SELECT table_name, is_nullable
+             FROM information_schema.columns
+            WHERE table_schema = $1
+              AND ((table_name = 'spec' AND column_name = 'current_semantic_doc_seq')
+                OR (table_name = 'spec_projection' AND column_name = 'semantic_doc_seq')
+                OR (table_name = 'spec_snapshot' AND column_name = 'covered_semantic_doc_seq')
+                OR (table_name = 'spec_update_log' AND column_name = 'semantic_doc_seq'))
+            ORDER BY table_name`,
+          [schemaName],
+        );
+        expect(nullability.rows).toEqual([
+          { table_name: "spec", is_nullable: "NO" },
+          { table_name: "spec_projection", is_nullable: "NO" },
+          { table_name: "spec_snapshot", is_nullable: "NO" },
+          { table_name: "spec_update_log", is_nullable: "NO" },
+        ]);
+
+        // An insert that omits the semantic revision is rejected (SQLSTATE
+        // 23502, not_null_violation).
+        expect(
+          await rejectionCode(
+            `INSERT INTO spec_update_log (spec_id, seq, update, client_id)
+             VALUES ($1, 3, ''::bytea, 'legacy')`,
+            [migrationSpecId],
+          ),
+        ).toBe("23502");
+        expect(
+          await rejectionCode(
+            `INSERT INTO spec_projection (spec_id, rev, session_id, doc_seq)
+             VALUES ($1, 2, $1, 3)`,
+            [migrationSpecId],
+          ),
+        ).toBe("23502");
+        // A snapshot upsert is rejected on both arms: Postgres checks NOT NULL
+        // on the proposed row before it arbitrates the conflict, so the reject
+        // does not depend on whether a snapshot row already exists.
+        expect(
+          await rejectionCode(
+            `INSERT INTO spec_snapshot (spec_id, state, state_vector, covered_seq)
+             VALUES ($1, ''::bytea, ''::bytea, 3)
+             ON CONFLICT (spec_id) DO UPDATE SET covered_seq = excluded.covered_seq`,
+            [migrationSpecId],
+          ),
+        ).toBe("23502");
+        expect(
+          await rejectionCode(
+            `INSERT INTO spec_snapshot (spec_id, state, state_vector, covered_seq)
+             VALUES ($1, ''::bytea, ''::bytea, 3)
+             ON CONFLICT (spec_id) DO UPDATE SET covered_seq = excluded.covered_seq`,
+            [randomUUID()],
+          ),
+        ).toBe("23502");
+
+        // An update that omits the semantic revision keeps a non-null value, so
+        // NOT NULL cannot reject it. It now leaves the semantic revision behind
+        // instead of advancing it. No constraint can tell that apart from a
+        // legitimate non-semantic edit, which is why 0056 needed a session
+        // setting to suppress its own trigger. The contract is that every
+        // writer states the semantic revision, and every pod now does.
+        await client.query("UPDATE spec SET current_doc_seq = 3 WHERE id = $1", [migrationSpecId]);
+        await client.query(
+          "UPDATE spec_projection SET doc_seq = 3 WHERE spec_id = $1 AND rev = 1",
+          [migrationSpecId],
+        );
+        const stale = await client.query<{ spec: string; projection: string }>(
+          `SELECT current_semantic_doc_seq::text AS spec,
+                  (SELECT semantic_doc_seq::text FROM spec_projection) AS projection
+             FROM spec
+            WHERE id = $1`,
+          [migrationSpecId],
+        );
+        expect(stale.rows).toEqual([{ spec: "2", projection: "2" }]);
+
+        // A current writer states both revisions and needs no session setting.
         await client.query(
           `UPDATE spec
               SET current_doc_seq = 4,
                   current_semantic_doc_seq = 3
             WHERE id = $1`,
+          [migrationSpecId],
+        );
+        await client.query(
+          `INSERT INTO spec_update_log (spec_id, seq, semantic_doc_seq, update, client_id)
+           VALUES ($1, 4, 3, ''::bytea, 'current')`,
+          [migrationSpecId],
+        );
+        await client.query(
+          `INSERT INTO spec_snapshot (spec_id, state, state_vector, covered_seq, covered_semantic_doc_seq)
+           VALUES ($1, ''::bytea, ''::bytea, 4, 3)
+           ON CONFLICT (spec_id) DO UPDATE
+           SET covered_seq = excluded.covered_seq,
+               covered_semantic_doc_seq = excluded.covered_semantic_doc_seq`,
           [migrationSpecId],
         );
         await client.query(
@@ -1288,14 +1401,23 @@ describe("SpecDocumentService with live Postgres", () => {
             WHERE spec_id = $1 AND rev = 1`,
           [migrationSpecId],
         );
-        const current = await client.query<{ spec: string; projection: string }>(
+        const current = await client.query<{
+          spec: string;
+          update_log: string;
+          snapshot: string;
+          projection: string;
+        }>(
           `SELECT current_semantic_doc_seq::text AS spec,
+                  (SELECT max(semantic_doc_seq)::text FROM spec_update_log) AS update_log,
+                  (SELECT covered_semantic_doc_seq::text FROM spec_snapshot) AS snapshot,
                   (SELECT semantic_doc_seq::text FROM spec_projection) AS projection
              FROM spec
             WHERE id = $1`,
           [migrationSpecId],
         );
-        expect(current.rows).toEqual([{ spec: "3", projection: "3" }]);
+        expect(current.rows).toEqual([
+          { spec: "3", update_log: "3", snapshot: "3", projection: "3" },
+        ]);
       } finally {
         await client.query("ROLLBACK");
         client.release();
