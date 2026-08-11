@@ -99,6 +99,8 @@ import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
 import { makeSpecRailRoute, PostgresSpecRailStore } from "./routes/spec-rail.ts";
 import { makeSpecBlockIterationRoute } from "./routes/spec-block-iteration.ts";
+import { makeSpecTemplatesRoute } from "./routes/spec-templates.ts";
+import { makeSpecTemplateCatalog } from "./specs/template-catalog.ts";
 import { productionSpecProjection } from "./specs/projection.ts";
 import { PostgresSpecCheckpointStore, SpecCheckpointService } from "./specs/checkpoints.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
@@ -218,6 +220,13 @@ app.route(
       return { sessionId, document: proseMirrorDocument(loaded.doc) };
     },
     preparePrompt: (sessionId, status) => productionSpecProjection.preparePrompt(sessionId, status),
+  }),
+);
+app.route(
+  "/",
+  makeSpecTemplatesRoute({
+    catalog: makeSpecTemplateCatalog(),
+    orgId: config.deploymentId,
   }),
 );
 // ADR 0064 P2a: live-host port-exposure registry (CRUD). The edge reverse-proxy

@@ -41,6 +41,7 @@ export type Subjects =
   | "Registry"
   | "Artifact"
   | "Spec"
+  | "SpecTemplate"
   | "all";
 
 // Typed subject shapes — used with CASL's `subject()` helper.
@@ -110,6 +111,10 @@ export function abilityFor(user: AbilityUser): AppAbility {
   // Tech specs are shared with all organization members. The RPC and socket
   // guards resolve membership before they apply this ability.
   can("read", "Spec");
+
+  // Spec templates are an organization catalog. Every member can read them;
+  // only admins can change them through manage("all").
+  can("read", "SpecTemplate");
 
   // Admin override.
   if (user.role === "admin") can("manage", "all");

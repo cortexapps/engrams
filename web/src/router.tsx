@@ -41,7 +41,7 @@ import { ArtifactDetail } from "./pages/artifacts/ArtifactDetail";
 import { ArtifactViewPage } from "./pages/artifacts/ArtifactViewPage";
 import { SpecsLayout } from "./pages/specs/SpecsLayout";
 import { SpecsList } from "./pages/specs/SpecsList";
-import { SpecRouteStub } from "./pages/specs/SpecRouteStub";
+import { SpecTemplates } from "./pages/specs/SpecTemplates";
 import { KaizenLayout } from "./pages/kaizen/KaizenLayout";
 import { Papercuts } from "./pages/kaizen/Papercuts";
 import { Fleet } from "./pages/Fleet";
@@ -303,7 +303,7 @@ type StatusSearch = { status?: "draft" | "published" };
 const specTemplatesRoute = createRoute({
   getParentRoute: () => specsLayoutRoute,
   path: "templates",
-  component: () => <SpecRouteStub surface="templates" />,
+  component: SpecTemplates,
 });
 const specDetailRoute = createRoute({
   getParentRoute: () => specsLayoutRoute,
