@@ -55,6 +55,27 @@ const NETONLY = {
   network: { default: "deny", allowHosts: ["internal.acme.test"], allowHostPatterns: [] },
   secrets: [],
 };
+// ADR 0115: grants opted into the launching user's personal credential — the
+// launch gate requires it for exactly this profile.
+const USERSCOPED = {
+  id: "pf4",
+  name: "Personal-creds agent",
+  description: "Runs GitHub as you.",
+  icon: "KeyRound",
+  imageId: "img1",
+  includeUserTokens: false,
+  envVars: {},
+  skills: [],
+  integrationGrants: [
+    {
+      connectionId: "connection-github",
+      operation: "pulls:write",
+      resourceConstraints: [],
+      credentialScope: "user",
+    },
+  ],
+  secrets: [],
+};
 const CATALOG = [
   {
     provider: "github",
@@ -68,6 +89,7 @@ const CATALOG = [
       icon: { mono: "GH", color: "#1f2328", logo: "" },
     },
     capabilities: [{ action: "pulls:write", access: "write", asset: "pull_request" }],
+    userCredential: { oauth: false, token: true, tokenHint: "Create a fine-grained PAT." },
   },
 ];
 
@@ -121,7 +143,7 @@ function installTransport(opts: { harnessUserEnv?: boolean; harnessOAuth?: boole
       deleteTask: () => ({}),
     });
     router.service(ProfileService, {
-      listProfiles: () => ({ profiles: [BUGFIX, DOCS, NETONLY] }),
+      listProfiles: () => ({ profiles: [BUGFIX, DOCS, NETONLY, USERSCOPED] }),
       getProfile: () => ({ profile: undefined }),
       createProfile: () => ({ profile: undefined }),
       updateProfile: () => ({ profile: undefined }),
@@ -275,6 +297,92 @@ describe("StartScreen", () => {
       await user.type(screen.getByLabelText("Task"), "Do the thing.");
       expect((screen.getByTestId("launch-task") as HTMLButtonElement).disabled).toBe(true);
       expect(created).toHaveLength(0);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  // ADR 0115: a profile that runs an integration as the launching user blocks
+  // launch until their personal credential is connected AND healthy.
+  test("blocks launch when a user-scoped integration credential is missing", async () => {
+    localStorage.setItem("engrams:lastProfileId", "pf4");
+    const origFetch = global.fetch;
+    global.fetch = (async (url: string | URL | Request) => {
+      if (String(url).endsWith("/me/credentials")) {
+        return new Response(JSON.stringify({ credentials: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (String(url).endsWith("/me/harness-env")) {
+        return new Response(JSON.stringify({ vars: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fetch ${String(url)}`);
+    }) as typeof fetch;
+    try {
+      const { transport, created } = installTransport();
+      renderWithProviders(<StartScreen />, { transport });
+      const user = userEvent.setup();
+
+      expect(await screen.findByText("Personal-creds agent")).toBeTruthy();
+      expect(await screen.findByText(/GitHub needs your personal credential/i)).toBeTruthy();
+      // The connector's PAT setup hint rides the banner.
+      expect(screen.getByText(/fine-grained PAT/i)).toBeTruthy();
+      expect(screen.getByRole("link", { name: /add credential/i }).getAttribute("href")).toBe(
+        "/settings/credentials",
+      );
+      await user.type(screen.getByLabelText("Task"), "Do the thing.");
+      expect((screen.getByTestId("launch-task") as HTMLButtonElement).disabled).toBe(true);
+      await user.click(screen.getByTestId("launch-task"));
+      expect(created).toHaveLength(0);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  test("launches once the personal integration credential is connected", async () => {
+    localStorage.setItem("engrams:lastProfileId", "pf4");
+    const origFetch = global.fetch;
+    global.fetch = (async (url: string | URL | Request) => {
+      if (String(url).endsWith("/me/credentials")) {
+        return new Response(
+          JSON.stringify({
+            credentials: [
+              {
+                kind: "connector",
+                provider: "github",
+                display: { name: "GitHub" },
+                modes: { oauth: false, token: true },
+                connected: true,
+                status: "connected",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (String(url).endsWith("/me/harness-env")) {
+        return new Response(JSON.stringify({ vars: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fetch ${String(url)}`);
+    }) as typeof fetch;
+    try {
+      const { transport, created } = installTransport();
+      renderWithProviders(<StartScreen />, { transport });
+      const user = userEvent.setup();
+
+      expect(await screen.findByText("Personal-creds agent")).toBeTruthy();
+      expect(screen.queryByText(/needs your personal credential/i)).toBeNull();
+      await user.type(screen.getByLabelText("Task"), "Do the thing.");
+      await user.click(screen.getByTestId("launch-task"));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0]!.profileId).toBe("pf4");
     } finally {
       global.fetch = origFetch;
     }

@@ -155,3 +155,88 @@ describe("Credentials OAuth controls", () => {
     }
   });
 });
+
+// ADR 0115: personal connector credentials — the Integration credentials
+// section, its PAT form, and disconnect.
+describe("Credentials connector cards", () => {
+  const connectorEntry = (over: Record<string, unknown> = {}) => ({
+    kind: "connector",
+    provider: "acme",
+    display: { name: "Acme" },
+    modes: { oauth: true, token: true },
+    tokenHint: "Create a PAT under Settings → API.",
+    connected: false,
+    status: "",
+    ...over,
+  });
+
+  test("saves a pasted token through the connector PUT route", async () => {
+    const originalFetch = global.fetch;
+    const puts: Array<{ path: string; body: unknown }> = [];
+    global.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith("/me/credentials") && !init?.method) {
+        return Response.json({ credentials: [connectorEntry()] });
+      }
+      if (path.endsWith("/me/harness-env")) return Response.json({ vars: [] });
+      if (path.endsWith("/me/connector-credentials/acme") && init?.method === "PUT") {
+        puts.push({ path, body: JSON.parse(String(init.body)) });
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    }) as typeof fetch;
+    try {
+      renderWithProviders(<TokensPanel />);
+      const user = userEvent.setup();
+      expect(await screen.findByText("Integration credentials")).toBeTruthy();
+      expect(screen.getByText(/Create a PAT under Settings → API/)).toBeTruthy();
+      // OAuth connect is a plain browser navigation to the authorize route.
+      expect(screen.getByRole("link", { name: "Connect" }).getAttribute("href")).toContain(
+        "/me/connector-credentials/acme/oauth/authorize",
+      );
+      await user.click(screen.getByRole("button", { name: "Add token" }));
+      await user.type(screen.getByPlaceholderText("paste token…"), "pat-secret");
+      await user.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(puts).toHaveLength(1));
+      expect(puts[0]!.body).toEqual({ value: "pat-secret" });
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  test("disconnects a connected personal credential and surfaces a broken one", async () => {
+    const originalFetch = global.fetch;
+    let deleted = false;
+    global.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input);
+      if (path.endsWith("/me/credentials") && !init?.method) {
+        return Response.json({
+          credentials: [
+            connectorEntry({
+              connected: true,
+              status: deleted ? "" : "broken",
+              version: 4,
+              account: { displayName: "person@example.com" },
+            }),
+          ],
+        });
+      }
+      if (path.endsWith("/me/harness-env")) return Response.json({ vars: [] });
+      if (path.endsWith("/me/connector-credentials/acme") && init?.method === "DELETE") {
+        deleted = true;
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`unexpected fetch ${path}`);
+    }) as typeof fetch;
+    try {
+      renderWithProviders(<TokensPanel />);
+      const user = userEvent.setup();
+      // A broken credential shows its status, not "connected".
+      expect(await screen.findByText("broken")).toBeTruthy();
+      await user.click(screen.getByRole("button", { name: "Disconnect" }));
+      await waitFor(() => expect(deleted).toBe(true));
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+});

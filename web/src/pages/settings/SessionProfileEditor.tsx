@@ -119,6 +119,9 @@ const schema = z.object({
       connectionId: z.string(),
       operation: z.string(),
       resourceConstraints: z.array(z.string()),
+      // ADR 0115: "" | "org" = the shared org credential; "user" = each
+      // member's personal credential (human launches then require it).
+      credentialScope: z.string().optional(),
     }),
   ),
   repos: z.array(z.custom<RepoRow>()),
@@ -271,6 +274,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
         connectionId: grant.connectionId,
         operation: grant.operation,
         resourceConstraints: [...grant.resourceConstraints],
+        ...(grant.credentialScope === "user" ? { credentialScope: "user" } : {}),
       })),
       repos: (p.repos ?? []).map((r) => ({ path: r.path, remoteUrl: r.remoteUrl })),
       envRows: mapToEnvRows(p.envVars),
@@ -371,10 +375,35 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
     const without = integrationGrants.filter(
       (grant) => grant.connectionId !== connectionId || grant.operation !== action,
     );
+    // A new grant inherits the connection's current credential scope so the
+    // save-side one-scope-per-connection invariant holds.
+    const scope = userScopedOn(connectionId) ? { credentialScope: "user" as const } : {};
     setGrants(
-      on ? [...without, { connectionId, operation: action, resourceConstraints: [] }] : without,
+      on
+        ? [...without, { connectionId, operation: action, resourceConstraints: [], ...scope }]
+        : without,
     );
   };
+  // ADR 0115: the per-integration "run as the launching user" toggle writes
+  // one scope across ALL of the connection's grants.
+  const userScopedOn = (connectionId: string) =>
+    integrationGrants.some(
+      (grant) => grant.connectionId === connectionId && grant.credentialScope === "user",
+    );
+  const setUserScoped = (connectionId: string, on: boolean) =>
+    setGrants(
+      integrationGrants.map((grant) =>
+        grant.connectionId === connectionId
+          ? on
+            ? { ...grant, credentialScope: "user" }
+            : {
+                connectionId: grant.connectionId,
+                operation: grant.operation,
+                resourceConstraints: grant.resourceConstraints,
+              }
+          : grant,
+      ),
+    );
   const enableProvider = (v: ConnectorView) => {
     const reads = v.capabilities.filter((c) => c.access === "read");
     const pick = reads.length ? reads : v.capabilities.slice(0, 1);
@@ -761,6 +790,25 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                             onToggle={(action, value) =>
                               toggleCap(v.defaultConnectionId, action, value)
                             }
+                          />
+                        </div>
+                      )}
+                      {on && v.userCredential && (
+                        <div className="flex items-center justify-between gap-3 border-t px-3 py-2">
+                          <div className="min-w-0">
+                            <Text variant="label" className="text-[0.72rem]">
+                              Use each member&apos;s personal credential
+                            </Text>
+                            <div className="text-[0.72rem] text-muted-foreground">
+                              Sessions act as the person who starts them; a launch is blocked until
+                              they connect {v.name} under Settings → Credentials. Automations keep
+                              the org credential.
+                            </div>
+                          </div>
+                          <Switch
+                            checked={userScopedOn(v.defaultConnectionId)}
+                            aria-label={`Use personal ${v.name} credentials`}
+                            onCheckedChange={(c) => setUserScoped(v.defaultConnectionId, c)}
                           />
                         </div>
                       )}

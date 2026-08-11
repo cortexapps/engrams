@@ -15,11 +15,15 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field, FieldDescription, FieldError, FieldGroup } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import {
+  connectorOAuthAuthorizeUrl,
   useCancelOAuth,
   useConnectOAuth,
   useCredentials,
+  useDeleteConnectorCredential,
   useDisconnectOAuth,
   useOAuthFlow,
+  useSetConnectorCredential,
+  type ConnectorCredentialEntry,
   type OAuthCredentialEntry,
 } from "../../hooks/useCredentials";
 
@@ -34,6 +38,9 @@ export function TokensPanel() {
   const { data: credentials, isLoading: credentialsLoading } = useCredentials(true);
   const oauth = credentials?.filter(
     (credential): credential is OAuthCredentialEntry => credential.kind === "oauth",
+  );
+  const connectors = credentials?.filter(
+    (credential): credential is ConnectorCredentialEntry => credential.kind === "connector",
   );
 
   return (
@@ -53,12 +60,145 @@ export function TokensPanel() {
       ) : (
         (vars ?? []).map((v) => <EnvVarCard key={v.envVar} entry={v} />)
       )}
+      {connectors && connectors.length > 0 && (
+        <>
+          <div>
+            <h2 className="text-base font-semibold">Integration credentials</h2>
+            <p className="max-w-prose text-sm text-muted-foreground">
+              Personal credentials for integrations a profile runs as you. Sessions you start from
+              such a profile act with your identity instead of the shared org credential.
+            </p>
+          </div>
+          {connectors.map((entry) => (
+            <ConnectorCard key={entry.provider} entry={entry} />
+          ))}
+        </>
+      )}
       <p className="max-w-prose text-sm text-muted-foreground">
         Credentials are sealed under the deployment key and selected automatically for each session.
         OAuth caches are delivered through the session control channel, never as model environment
         variables.
       </p>
     </div>
+  );
+}
+
+/** ADR 0115: one personal-credential slot per connector — OAuth connect and/or
+ *  a pasted personal access token; the newest write wins. */
+function ConnectorCard({ entry }: { entry: ConnectorCredentialEntry }) {
+  const [editing, setEditing] = useState(false);
+  const remove = useDeleteConnectorCredential();
+  const healthy = entry.connected && entry.status === "connected";
+  const badge = healthy
+    ? "connected"
+    : entry.connected
+      ? entry.status || "needs attention"
+      : "not connected";
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-center justify-between gap-3 space-y-0">
+        <div>
+          <CardTitle className="text-base">{entry.display.name}</CardTitle>
+          <p className="text-sm text-muted-foreground">Your personal credential.</p>
+          {entry.tokenHint && (
+            <p className="mt-1 max-w-prose text-sm text-muted-foreground">{entry.tokenHint}</p>
+          )}
+        </div>
+        <Badge variant={healthy ? "secondary" : "outline"}>{badge}</Badge>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {entry.connected && entry.account && (
+          <p className="text-sm text-muted-foreground">
+            {[entry.account.displayName, entry.account.workspaceName].filter(Boolean).join(" · ")}
+          </p>
+        )}
+        {editing ? (
+          <ConnectorTokenForm provider={entry.provider} onDone={() => setEditing(false)} />
+        ) : (
+          <div className="flex gap-2">
+            {entry.modes.oauth && (
+              <Button size="sm" variant={healthy ? "outline" : "default"} asChild>
+                <a href={connectorOAuthAuthorizeUrl(entry.provider, entry.connected)}>
+                  {entry.connected ? "Reconnect" : "Connect"}
+                </a>
+              </Button>
+            )}
+            {entry.modes.token && (
+              <Button
+                size="sm"
+                variant={entry.modes.oauth || healthy ? "outline" : "default"}
+                onClick={() => setEditing(true)}
+              >
+                {entry.connected ? "Replace token" : "Add token"}
+              </Button>
+            )}
+            {entry.connected && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => remove.mutate(entry.provider)}
+                disabled={remove.isPending}
+              >
+                {remove.isPending ? "Disconnecting…" : "Disconnect"}
+              </Button>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function ConnectorTokenForm({ provider, onDone }: { provider: string; onDone: () => void }) {
+  const form = useForm<ValueForm>({
+    resolver: zodResolver(valueSchema),
+    defaultValues: { value: "" },
+  });
+  const save = useSetConnectorCredential();
+
+  const onSubmit = (data: ValueForm) =>
+    save.mutate(
+      { provider, value: data.value },
+      {
+        onSuccess: onDone,
+        onError: (e) => form.setError("root", { message: String(e) }),
+      },
+    );
+
+  return (
+    <form onSubmit={form.handleSubmit(onSubmit)}>
+      <FieldGroup>
+        <Controller
+          name="value"
+          control={form.control}
+          render={({ field, fieldState }) => (
+            <Field data-invalid={fieldState.invalid}>
+              <Input
+                {...field}
+                id={`${provider}-token`}
+                type="password"
+                autoFocus
+                placeholder="paste token…"
+                className="font-mono"
+                aria-invalid={fieldState.invalid}
+              />
+              <FieldDescription>Stored encrypted, never shown again.</FieldDescription>
+              {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+            </Field>
+          )}
+        />
+        <Field orientation="horizontal">
+          <Button type="submit" size="sm" disabled={save.isPending}>
+            {save.isPending ? "Saving…" : "Save"}
+          </Button>
+          <Button type="button" size="sm" variant="ghost" onClick={onDone}>
+            Cancel
+          </Button>
+        </Field>
+        {form.formState.errors.root && <FieldError errors={[form.formState.errors.root]} />}
+      </FieldGroup>
+    </form>
   );
 }
 
