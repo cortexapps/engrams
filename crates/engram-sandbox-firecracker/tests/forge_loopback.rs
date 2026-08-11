@@ -111,18 +111,19 @@ async fn forge_credential_round_trips_over_vsock() {
                     return;
                 }
             };
-            // ADR 0056 P3c: `ForgeOp` is single-variant now (PR-open retired),
-            // so this match is exhaustive without a fallback arm.
+            // Wildcard-free on purpose: this sink only serves the git
+            // credential op, and a new `ForgeOp` variant must break the
+            // build here rather than silently fall into an error reply.
             let resp = match req.op {
                 ForgeOp::FetchCredential { .. } => ForgeResponse::Credential {
                     username: "x-access-token".into(),
                     password: format!("ghs_canned_{}", req.broker_token),
                 },
-                ForgeOp::FetchOAuthCredential | ForgeOp::UpdateOAuthCredential { .. } => {
-                    ForgeResponse::Error {
-                        message: "unexpected OAuth request".into(),
-                    }
-                }
+                ForgeOp::FetchOAuthCredential
+                | ForgeOp::UpdateOAuthCredential { .. }
+                | ForgeOp::ReportOAuthCredentialBroken { .. } => ForgeResponse::Error {
+                    message: "unexpected OAuth request".into(),
+                },
             };
             let _ = write_msg(&mut stream, &resp).await;
         });

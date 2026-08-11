@@ -366,6 +366,42 @@ impl OAuthManager {
         self.fetch_session(session_id).await
     }
 
+    /// Record that the provider terminally rejected this session's harness
+    /// credential.
+    ///
+    /// A harness bundle refreshes in-guest (ADR 0115), so the guest is the
+    /// only observer of a refresh that fails for good — a revoked grant, or
+    /// a refresh token another client already rotated away. Without this
+    /// report the row keeps reading `connected` while every turn 401s, and
+    /// the operator sees no reason to reconnect.
+    ///
+    /// The CAS on `expected_version` keeps a slow reporter from burying a
+    /// credential that a racing session has since repaired: if the version
+    /// moved, the winner's bundle stands and this call reports success.
+    pub async fn report_session_broken(
+        &self,
+        session_id: SessionId,
+        expected_version: i64,
+        reason: &str,
+    ) -> Result<(), OAuthServiceError> {
+        let binding = self
+            .meta
+            .get_session_oauth_binding(session_id)
+            .await?
+            .ok_or(OAuthServiceError::NotFound)?;
+        match self
+            .meta
+            .mark_oauth_credential_broken(&binding.key, expected_version, reason)
+            .await
+        {
+            Ok(_) => Ok(()),
+            // The version moved under us: a racer refreshed successfully, so
+            // the credential is healthy and must NOT be marked broken.
+            Err(MetaError::Conflict(_)) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub async fn run_cleanup_once(&self) -> Result<u64, MetaError> {
         let now = self.clock.now_utc();
         self.meta
@@ -842,7 +878,12 @@ impl CodexAppServer {
                 workspace_id: None,
                 workspace_name: None,
             },
-            expires_at: None,
+            // Recorded so `status()` can report `expired` instead of a
+            // permanent `connected`. It does NOT pull the row into the
+            // refresh sweep: that selects `connector`/`user_connector`
+            // kinds only, and a harness bundle refreshes in-guest over the
+            // session control channel (ADR 0115).
+            expires_at: parsed.expires_at,
         })
     }
 
@@ -887,6 +928,29 @@ impl Drop for CodexAppServer {
 
 struct ParsedCodexCache {
     account_id: String,
+    /// Access-token expiry, read from the token's own `exp` claim. `None`
+    /// when the claim is unreadable — the credential still works, it just
+    /// stays out of expiry-derived status until the next refresh rewrites it.
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Read the `exp` claim out of a JWT access token.
+///
+/// The Codex auth cache records no expiry of its own (only `last_refresh`),
+/// so the token itself is the only source. We decode the payload WITHOUT
+/// verifying the signature: this value never authorizes anything, it only
+/// feeds refresh scheduling and `status()` derivation. Any malformed input
+/// yields `None` rather than an error — a provider-side format change must
+/// not break login.
+fn codex_access_token_expiry(access_token: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use base64::Engine as _;
+    let payload = access_token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    let exp = claims.get("exp").and_then(Value::as_i64)?;
+    chrono::DateTime::from_timestamp(exp, 0)
 }
 
 fn parse_codex_cache(payload: &[u8]) -> Result<ParsedCodexCache, OAuthDriverError> {
@@ -935,7 +999,14 @@ fn parse_codex_cache(payload: &[u8]) -> Result<ParsedCodexCache, OAuthDriverErro
         .filter(|value| !value.is_empty())
         .ok_or_else(|| OAuthDriverError::new("invalid_bundle", "account identity missing"))?
         .to_string();
-    Ok(ParsedCodexCache { account_id })
+    let expires_at = tokens
+        .get("access_token")
+        .and_then(Value::as_str)
+        .and_then(codex_access_token_expiry);
+    Ok(ParsedCodexCache {
+        account_id,
+        expires_at,
+    })
 }
 
 async fn write_private(path: PathBuf, payload: &[u8]) -> Result<(), OAuthDriverError> {
@@ -1041,6 +1112,9 @@ done
             parse_codex_cache(&good).unwrap().account_id,
             "acct-personal"
         );
+        // A non-JWT access token is still a usable credential; it simply
+        // carries no expiry, so status derivation stays silent about it.
+        assert!(parse_codex_cache(&good).unwrap().expires_at.is_none());
 
         for bad in [
             json!({"auth_mode":"apikey","tokens":{}}),
@@ -1054,6 +1128,70 @@ done
     #[test]
     fn bundle_limit_rejects_oversized_input() {
         assert!(parse_codex_cache(&vec![b'x'; MAX_OAUTH_BUNDLE_BYTES + 1]).is_err());
+    }
+
+    /// Build an unsigned JWT carrying `exp`, in the shape a real ChatGPT
+    /// access token uses: base64url, no padding, three dot-separated parts.
+    fn jwt_with_exp(exp: i64) -> String {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        format!(
+            "{}.{}.{}",
+            b64(br#"{"alg":"none"}"#),
+            b64(json!({ "exp": exp, "iat": exp - 864_000 })
+                .to_string()
+                .as_bytes()),
+            "not-verified"
+        )
+    }
+
+    #[test]
+    fn access_token_expiry_comes_from_the_exp_claim() {
+        // Verified against a live Codex credential: the access token is a
+        // JWT and its lifetime is 10 days. The cache itself records no
+        // expiry, so this claim is the only source.
+        let exp = 1_787_334_053;
+        assert_eq!(
+            codex_access_token_expiry(&jwt_with_exp(exp)),
+            chrono::DateTime::from_timestamp(exp, 0)
+        );
+
+        let cache = serde_json::to_vec(&json!({
+            "auth_mode":"chatgpt",
+            "OPENAI_API_KEY":null,
+            "tokens":{
+                "access_token": jwt_with_exp(exp),
+                "refresh_token":"refresh-secret",
+                "account_id":"acct-personal"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            parse_codex_cache(&cache).unwrap().expires_at,
+            chrono::DateTime::from_timestamp(exp, 0)
+        );
+    }
+
+    #[test]
+    fn unreadable_access_token_expiry_degrades_to_none() {
+        // Never an error: the expiry only feeds status derivation, so a
+        // provider-side format change must not break the login path.
+        for token in [
+            "",
+            "opaque-not-a-jwt",
+            "only.two",
+            "a.!!!not-base64!!!.c",
+            // Valid base64url payload, but no `exp` claim.
+            &format!("a.{}.c", {
+                use base64::Engine as _;
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"iat":1}"#)
+            }),
+        ] {
+            assert!(
+                codex_access_token_expiry(token).is_none(),
+                "expected no expiry for {token:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
