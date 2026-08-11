@@ -202,6 +202,17 @@ message ProviderCatalogEntry {
   // administrator configures connections, each its own authority). The web
   // used to decide this by hard-coding the one provider it knew was named.
   string connection_model = 7;
+  // ADR 0115: user-scoped credential support, when the connector declares it.
+  // Absent = org-only. Member-safe (no refs/headers).
+  UserCredentialSupport user_credential = 8;
+}
+
+// ADR 0115: which personal-credential modes a connector accepts, plus the
+// member-facing setup line for token (PAT) mode.
+message UserCredentialSupport {
+  bool oauth = 1;
+  bool token = 2;
+  string token_hint = 3;
 }
 
 message GetIntegrationCatalogRequest {}

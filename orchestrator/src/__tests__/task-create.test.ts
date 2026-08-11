@@ -9,7 +9,7 @@
  * connectors / the user-token resolver / the upstream session client / the DB.
  */
 
-import { expect, test, describe } from "bun:test";
+import { expect, test, describe, beforeEach, afterAll } from "bun:test";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { getTableName } from "drizzle-orm";
 import { z } from "zod";
@@ -40,6 +40,7 @@ import {
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 import { capabilityGrant } from "../integrations/grants.ts";
+import { invalidateRegistry } from "../connectors/registry.ts";
 
 function defaultGrant(capability: string) {
   const provider = capability.slice(0, capability.indexOf(":"));
@@ -228,6 +229,134 @@ describe("truncatePrompt — default title from the prompt", () => {
     expect(truncatePrompt("   \n  ")).toBe(null);
     expect(truncatePrompt(undefined)).toBe(null);
     expect(truncatePrompt(null)).toBe(null);
+  });
+});
+
+// ADR 0115: user-scoped integration credentials — the launch gate and the
+// oauth_user policy stamp, mirroring the harness-credential principal rule.
+describe("compileSessionCreateInput — user-scoped integrations (ADR 0115)", () => {
+  // The merged registry caches globally; every test resets it so the custom
+  // acme connector is (only) visible where intended.
+  beforeEach(() => invalidateRegistry());
+  afterAll(() => invalidateRegistry());
+  const acmeConnector = {
+    provider: "acme",
+    protocol: "http",
+    credential: {
+      source: "inject",
+      injects: [{ header: "Authorization", secretRef: "acme.token", template: "Bearer {}" }],
+    },
+    hosts: ["api.acme.test"],
+    operations: [{ grants: ["issues:write"], match: { method: "POST", path: "/issues*" } }],
+    userCredential: { token: { hint: "Create a PAT." } },
+  };
+  const userScopedProfile = () =>
+    profile({
+      integrationGrants: [
+        {
+          connectionId: "default-acme",
+          operation: "issues:write",
+          resourceConstraints: [],
+          credentialScope: "user" as const,
+        },
+      ],
+    });
+  const userDeps = (
+    credentials: Array<{ provider: string; status: string }> | undefined,
+  ): SessionCompileDeps => ({
+    ...deps(),
+    connectors: { list: async () => [{ provider: "acme", config: acmeConnector }] },
+    oauthSubject: { kind: OauthSubjectKind.USER, id: "user-7" },
+    ...(credentials
+      ? { listUserConnectorCredentials: async () => credentials }
+      : {}),
+  });
+  const policyOf = (inp: { integrationPolicyJson?: string }) =>
+    JSON.parse(inp.integrationPolicyJson ?? "{}") as {
+      injects?: Array<{
+        secret_ref: string;
+        mint_source: null | Record<string, Record<string, string>>;
+      }>;
+    };
+
+  test("a human run with the credential connected stamps oauth_user", async () => {
+const inp = await compileSessionCreateInput(
+      userScopedProfile(),
+      userDeps([{ provider: "acme", status: "connected" }]),
+    );
+    const policy = policyOf(inp);
+    expect(policy.injects).toHaveLength(1);
+    expect(policy.injects?.[0]?.secret_ref).toBe("");
+    expect(policy.injects?.[0]?.mint_source).toEqual({
+      oauth_user: { user_id: "user-7", connection_id: "default-acme", provider: "acme" },
+    });
+  });
+
+  test("a human run without the credential is blocked with the Settings pointer", async () => {
+await expect(
+      compileSessionCreateInput(userScopedProfile(), userDeps([])),
+    ).rejects.toThrow(/Acme needs your personal credential.*Settings → Credentials/s);
+  });
+
+  test("a broken credential blocks (presence is not enough)", async () => {
+await expect(
+      compileSessionCreateInput(
+        userScopedProfile(),
+        userDeps([{ provider: "acme", status: "broken" }]),
+      ),
+    ).rejects.toThrow(/Acme needs your personal credential/);
+  });
+
+  test("an unwired credential lister fails closed", async () => {
+await expect(
+      compileSessionCreateInput(userScopedProfile(), userDeps(undefined)),
+    ).rejects.toThrow(/personal credential/);
+  });
+
+  test("a programmatic run compiles the org credential and never gates", async () => {
+const inp = await compileSessionCreateInput(
+      userScopedProfile(),
+      {
+        ...userDeps([]),
+        listUserConnectorCredentials: async () => {
+          throw new Error("the gate must not run for programmatic sessions");
+        },
+      },
+      { programmatic: true },
+    );
+    const policy = policyOf(inp);
+    expect(policy.injects?.[0]?.secret_ref).toBe("acme.token");
+    expect(policy.injects?.[0]?.mint_source).toBeNull();
+  });
+
+  test("an unscoped grant compiles the org credential for a human run", async () => {
+const inp = await compileSessionCreateInput(
+      profile({
+        integrationGrants: [
+          { connectionId: "default-acme", operation: "issues:write", resourceConstraints: [] },
+        ],
+      }),
+      userDeps([]),
+    );
+    const policy = policyOf(inp);
+    expect(policy.injects?.[0]?.secret_ref).toBe("acme.token");
+    expect(policy.injects?.[0]?.mint_source).toBeNull();
+  });
+
+  test("a capability override compiles org authority and never gates", async () => {
+const inp = await compileSessionCreateInput(
+      userScopedProfile(),
+      {
+        ...userDeps([]),
+        listUserConnectorCredentials: async () => {
+          throw new Error("the gate must not run under a capability override");
+        },
+      },
+      { capabilityOverride: ["acme:issues:write"] },
+    );
+    const policy = policyOf(inp);
+    expect(policy.injects?.[0]?.secret_ref).toBe("acme.token");
+    expect(policy.injects?.[0]?.mint_source).toBeNull();
   });
 });
 

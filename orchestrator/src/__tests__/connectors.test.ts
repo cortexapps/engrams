@@ -1262,3 +1262,181 @@ describe("cli facet (ADR 0058)", () => {
     expect(plan.enabled.find((e) => e.provider === "github")?.doc).toMatch(/gh pr create/);
   });
 });
+
+describe("user-scoped credentials (ADR 0115)", () => {
+  const acmeRaw = {
+    provider: "acme",
+    protocol: "http",
+    credential: {
+      source: "inject",
+      injects: [{ header: "Authorization", secretRef: "acme.token", template: "Bearer {}" }],
+    },
+    hosts: ["api.acme.test"],
+    operations: [{ grants: ["issues:write"], match: { method: "POST", path: "/issues*" } }],
+    userCredential: { token: { hint: "Create a PAT under Settings → API." } },
+  };
+  const acmeMintRaw = {
+    provider: "acmemint",
+    protocol: "http",
+    credential: { source: "mint", mint: { kind: "acme_app" } },
+    hosts: ["api.acmemint.test"],
+    operations: [{ grants: ["issues:write"], match: { method: "POST", path: "/issues*" } }],
+    userCredential: {
+      token: { hint: "Create a fine-grained PAT." },
+      inject: { header: "Authorization", template: "Bearer {}" },
+    },
+  };
+
+  describe("parseConnector invariants", () => {
+    test("accepts token mode on a single-header inject connector", () => {
+      const c = parseConnector(acmeRaw, "acme");
+      expect(c.userCredential).toEqual({ token: { hint: "Create a PAT under Settings → API." } });
+    });
+
+    test("accepts token mode with an inject spec on a mint connector", () => {
+      const c = parseConnector(acmeMintRaw, "acmemint");
+      expect(c.userCredential?.inject).toEqual({ header: "Authorization", template: "Bearer {}" });
+    });
+
+    test("rejects an empty facet (no mode)", () => {
+      expect(() => parseConnector({ ...acmeRaw, userCredential: {} }, "t")).toThrow(/at least one mode/);
+    });
+
+    test("rejects a multi-header inject connector", () => {
+      const multi = {
+        ...acmeRaw,
+        credential: {
+          source: "inject",
+          injects: [
+            { header: "X-Api-Key", secretRef: "acme.api", template: "{}" },
+            { header: "X-App-Key", secretRef: "acme.app", template: "{}" },
+          ],
+        },
+      };
+      expect(() => parseConnector(multi, "t")).toThrow(/exactly one credential.injects entry/);
+    });
+
+    test("rejects a user inject spec on an inject connector", () => {
+      const withInject = {
+        ...acmeRaw,
+        userCredential: { token: { hint: "x" }, inject: { header: "Authorization", template: "Bearer {}" } },
+      };
+      expect(() => parseConnector(withInject, "t")).toThrow(/only for mint connectors/);
+    });
+
+    test("rejects a mint connector without a user inject spec", () => {
+      const noInject = { ...acmeMintRaw, userCredential: { token: { hint: "x" } } };
+      expect(() => parseConnector(noInject, "t")).toThrow(/"inject" is required on a mint connector/);
+    });
+
+    test("rejects oauth mode on a mint connector", () => {
+      const withOauth = {
+        ...acmeMintRaw,
+        userCredential: {
+          oauth: true,
+          token: { hint: "x" },
+          inject: { header: "Authorization", template: "Bearer {}" },
+        },
+      };
+      expect(() => parseConnector(withOauth, "t")).toThrow(/token" mode only/);
+    });
+
+    test("rejects oauth mode without the top-level oauth facet", () => {
+      const withOauth = { ...acmeRaw, userCredential: { oauth: true } };
+      expect(() => parseConnector(withOauth, "t")).toThrow(/requires the connector's top-level "oauth" facet/);
+    });
+  });
+
+  describe("catalog projection", () => {
+    test("surfaces modes + token hint, member-safe", () => {
+      const catalog = buildProviderCatalog(registryOf(acmeRaw, datadogRaw), new Map());
+      const acme = catalog.find((entry) => entry.provider === "acme");
+      expect(acme?.userCredential).toEqual({
+        oauth: false,
+        token: true,
+        tokenHint: "Create a PAT under Settings → API.",
+      });
+      // A connector without the facet carries none.
+      expect(catalog.find((entry) => entry.provider === "datadog")?.userCredential).toBeUndefined();
+    });
+  });
+
+  describe("compileIntegrationPolicy emission", () => {
+    const grant = (userScoped: boolean): IntegrationGrantSelection => ({
+      connectionId: "conn-acme",
+      provider: "acme",
+      operation: "issues:write",
+      resourceConstraints: [],
+      userScoped,
+    });
+
+    test("a user-scoped grant with a user subject emits oauth_user and drops the secretRef", () => {
+      const policy = compileConnectionPolicy([grant(true)], registryOf(acmeRaw), {
+        userSubjectId: "user-7",
+      });
+      expect(policy.injects).toEqual([
+        {
+          hosts: ["api.acme.test"],
+          header_name: "Authorization",
+          header_template: "Bearer {}",
+          secret_ref: "",
+          mint_source: {
+            oauth_user: { user_id: "user-7", connection_id: "conn-acme", provider: "acme" },
+          },
+          methods: ["POST"],
+          path_globs: ["/issues*"],
+          graphql_operation: "",
+          graphql_field: "",
+        },
+      ]);
+    });
+
+    test("without a user subject (programmatic) a user-scoped grant compiles the org credential", () => {
+      const policy = compileConnectionPolicy([grant(true)], registryOf(acmeRaw));
+      expect(policy.injects[0]?.secret_ref).toBe("acme.token");
+      expect(policy.injects[0]?.mint_source).toBeNull();
+    });
+
+    test("an unscoped grant compiles the org credential even with a user subject", () => {
+      const policy = compileConnectionPolicy([grant(false)], registryOf(acmeRaw), {
+        userSubjectId: "user-7",
+      });
+      expect(policy.injects[0]?.secret_ref).toBe("acme.token");
+      expect(policy.injects[0]?.mint_source).toBeNull();
+    });
+
+    test("a user-scoped mint connector renders through the facet's own header spec", () => {
+      const policy = compileConnectionPolicy(
+        [{ ...grant(true), connectionId: "conn-acmemint", provider: "acmemint" }],
+        registryOf(acmeMintRaw),
+        { userSubjectId: "user-7" },
+      );
+      expect(policy.injects).toEqual([
+        {
+          hosts: ["api.acmemint.test"],
+          header_name: "Authorization",
+          header_template: "Bearer {}",
+          secret_ref: "",
+          mint_source: {
+            oauth_user: { user_id: "user-7", connection_id: "conn-acmemint", provider: "acmemint" },
+          },
+          methods: ["POST"],
+          path_globs: ["/issues*"],
+          graphql_operation: "",
+          graphql_field: "",
+        },
+      ]);
+    });
+
+    test("a user-scoped mint connector without a subject keeps the org mint", () => {
+      const policy = compileConnectionPolicy(
+        [{ ...grant(true), connectionId: "conn-acmemint", provider: "acmemint" }],
+        registryOf(acmeMintRaw),
+      );
+      expect(policy.injects[0]?.mint_source).toEqual({
+        connection: { connection_id: "conn-acmemint", provider: "acmemint" },
+      });
+      expect(policy.injects[0]?.header_name).toBe("");
+    });
+  });
+});

@@ -845,6 +845,12 @@ export interface ProfileIntegrationGrant {
   connectionId: string;
   operation: string;
   resourceConstraints: string[];
+  /** ADR 0115: which credential the session wields for this integration.
+   * Absent = "org" (the connection's shared credential). "user" = the
+   * launching user's personal credential; human launches then REQUIRE it,
+   * while programmatic sessions always compile the org credential. Rides the
+   * grant array through launch_policy and the task_session snapshot. */
+  credentialScope?: "org" | "user";
 }
 
 /** A parsed forge remote — enough to join against the GitHub integration. */

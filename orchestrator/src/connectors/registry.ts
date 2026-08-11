@@ -290,6 +290,26 @@ export interface OauthMetadataProbe {
   map: Partial<Record<OauthMetadataField, string>>;
 }
 
+/**
+ * ADR 0115: optional user-scoped credential support. A connector keeps its
+ * required org-scoped credential (secretRef inject, connector-subject OAuth,
+ * or mint); this facet additionally lets profiles opt individual integrations
+ * into the launching user's PERSONAL credential for human sessions.
+ *
+ * - `oauth: true` reuses the top-level {@link OauthFacet} (same BYO app, same
+ *   scopes) with a user subject in the sealed store.
+ * - `token` accepts a pasted personal access token; `hint` is the setup line
+ *   shown in Settings → Credentials.
+ * - `inject` is required for MINT connectors only (the mint engine renders
+ *   the org header, so user mode needs its own header spec); forbidden for
+ *   inject connectors (the single existing header renders the user value).
+ */
+export interface UserCredentialFacet {
+  oauth?: boolean;
+  token?: { hint: string };
+  inject?: { header: string; template: string };
+}
+
 export type WebhookVerificationScheme =
   | "github_hmac_sha256"
   | "slack_v0"
@@ -335,6 +355,8 @@ export interface Connector {
   test?: ConnectorTest;
   /** Optional OAuth authorization-code acquisition (e.g. Slack "Add to Slack"). */
   oauth?: OauthFacet;
+  /** ADR 0115: optional user-scoped credential support (PAT and/or OAuth). */
+  userCredential?: UserCredentialFacet;
   /** Optional inbound-webhook taxonomy + declarative curated alias mapping. */
   webhook?: WebhookFacet;
 }
@@ -359,6 +381,17 @@ export type CredentialMintSourceJson =
       /** ADR 0106 addendum: a connector OAuth token resolved from the sealed
        * credential store (subject = the connection id), refreshed there. */
       oauth_connector: {
+        connection_id: string;
+        provider: string;
+      };
+    }
+  | {
+      /** ADR 0115: a USER-scoped connector credential (OAuth or static token)
+       * resolved from the sealed store; the launching user's id is stamped at
+       * compile time and the coordinator stays principal-agnostic (wire v28).
+       * `connection_id` rides for future per-connection user credentials. */
+      oauth_user: {
+        user_id: string;
         connection_id: string;
         provider: string;
       };
@@ -458,6 +491,11 @@ export interface SessionPolicyInputs {
     allowHosts?: string[];
     allowHostPatterns?: string[];
   }>;
+  /** ADR 0115: the launching user's id, supplied ONLY for human principals.
+   * A user-scoped grant compiles an `oauth_user` mint source stamped with it;
+   * absent (programmatic sessions), user-scoped grants compile the org
+   * credential exactly like unscoped ones. */
+  userSubjectId?: string;
 }
 
 /** Connection-aware authority consumed by policy compilation. Keeping this
@@ -467,6 +505,11 @@ export interface IntegrationGrantSelection {
   provider: string;
   operation: string;
   resourceConstraints: readonly string[];
+  /** ADR 0115: the profile opted this integration into the launching user's
+   * personal credential. Only honored when the compile also supplies a
+   * `userSubjectId` (human principals); programmatic sessions compile the
+   * org credential regardless. */
+  userScoped?: boolean;
 }
 
 /** Whether a compiled policy carries anything worth shipping on CreateSession. */
@@ -1275,6 +1318,74 @@ export function parseConnector(raw: unknown, where: string): Connector {
       }
     }
   }
+
+  // ADR 0115: optional user-scoped credential support. Purely additive — the
+  // org credential above is untouched. Invariants:
+  //  - at least one mode (oauth / token);
+  //  - inject connectors need exactly ONE header (the user value renders
+  //    through it) and must NOT carry a `userCredential.inject`;
+  //  - mint connectors are token-only and MUST carry `userCredential.inject`
+  //    (the mint engine renders the org header, so user mode needs its own);
+  //  - `oauth: true` requires the top-level oauth facet.
+  let userCredential: UserCredentialFacet | undefined;
+  if (o.userCredential !== undefined) {
+    const uw = `${where} userCredential`;
+    if (typeof o.userCredential !== "object" || o.userCredential === null) {
+      fail(uw, "must be an object");
+    }
+    const uc = o.userCredential as Record<string, unknown>;
+    if (uc.oauth !== undefined && typeof uc.oauth !== "boolean") {
+      fail(uw, '"oauth" must be a boolean');
+    }
+    let token: { hint: string } | undefined;
+    if (uc.token !== undefined) {
+      if (typeof uc.token !== "object" || uc.token === null) fail(uw, '"token" must be an object');
+      const t = uc.token as Record<string, unknown>;
+      if (typeof t.hint !== "string" || !t.hint.trim() || t.hint.length > MAX_DISPLAY_BLURB) {
+        fail(uw, `"token.hint" must be a non-empty string (max ${MAX_DISPLAY_BLURB} chars)`);
+      }
+      token = { hint: t.hint };
+    }
+    if (uc.oauth !== true && token === undefined) {
+      fail(uw, 'must declare at least one mode ("oauth": true and/or "token")');
+    }
+    if (uc.oauth === true && credential.source === "inject" && oauth === undefined) {
+      fail(uw, '"oauth": true requires the connector\'s top-level "oauth" facet');
+    }
+    let userInject: { header: string; template: string } | undefined;
+    if (uc.inject !== undefined) {
+      if (typeof uc.inject !== "object" || uc.inject === null) fail(uw, '"inject" must be an object');
+      const inj = uc.inject as Record<string, unknown>;
+      if (typeof inj.header !== "string" || !HEADER_NAME_RE.test(inj.header)) {
+        fail(uw, '"inject.header" must be a valid HTTP header name');
+      }
+      if (typeof inj.template !== "string" || !inj.template.includes("{}") || /[\r\n]/.test(inj.template)) {
+        fail(uw, '"inject.template" must be a string containing the "{}" placeholder and no newlines');
+      }
+      userInject = { header: inj.header, template: inj.template };
+    }
+    if (credential.source === "inject") {
+      if (credential.injects.length !== 1) {
+        fail(uw, "requires exactly one credential.injects entry (one personal value renders through one header); multi-header connectors cannot declare user support");
+      }
+      if (userInject !== undefined) {
+        fail(uw, '"inject" is only for mint connectors (inject connectors render the user value through their existing header)');
+      }
+    } else {
+      if (uc.oauth === true) {
+        fail(uw, 'mint connectors support "token" mode only (user-to-server OAuth is not implemented)');
+      }
+      if (userInject === undefined) {
+        fail(uw, '"inject" is required on a mint connector (the mint engine renders the org header, so user mode needs its own header spec)');
+      }
+    }
+    userCredential = {
+      ...(uc.oauth === true ? { oauth: true } : {}),
+      ...(token ? { token } : {}),
+      ...(userInject ? { inject: userInject } : {}),
+    };
+  }
+
   const webhook = o.webhook !== undefined ? parseWebhookFacet(where, o.webhook) : undefined;
 
   // ADR 0059: the GraphQL endpoint (the single path GraphQL ops POST to). Required
@@ -1308,6 +1419,7 @@ export function parseConnector(raw: unknown, where: string): Connector {
     ...(cli ? { cli } : {}),
     ...(test ? { test } : {}),
     ...(oauth ? { oauth } : {}),
+    ...(userCredential ? { userCredential } : {}),
     ...(webhook ? { webhook } : {}),
   };
 }
@@ -1482,6 +1594,22 @@ export function compileIntegrationPolicy(
         path_globs = op.match?.path ? [op.match.path] : [];
       }
 
+      // ADR 0115: a user-scoped grant on a human compile (userSubjectId set)
+      // swaps the VALUE SOURCE to the launching user's sealed credential; the
+      // gating and the header shape are unchanged. Programmatic sessions never
+      // supply a subject, so they compile the org credential below.
+      const userScoped =
+        grant.userScoped === true &&
+        inputs?.userSubjectId !== undefined &&
+        connector.userCredential !== undefined;
+      const userMintSource = (): CredentialMintSourceJson => ({
+        oauth_user: {
+          user_id: inputs?.userSubjectId ?? "",
+          connection_id: grant.connectionId,
+          provider: connector.provider,
+        },
+      });
+
       if (connector.credential.source === "inject") {
         // One egress inject per declared header (most connectors have one; e.g.
         // Datadog `pup` injects DD-API-KEY AND DD-APPLICATION-KEY). An
@@ -1493,15 +1621,17 @@ export function compileIntegrationPolicy(
             hosts: connector.hosts,
             header_name: inj.header,
             header_template: inj.template ?? "{}",
-            secret_ref: inj.secretRef ?? "",
-            mint_source: connector.oauth
-              ? {
-                  oauth_connector: {
-                    connection_id: grant.connectionId,
-                    provider: connector.provider,
-                  },
-                }
-              : null,
+            secret_ref: userScoped ? "" : (inj.secretRef ?? ""),
+            mint_source: userScoped
+              ? userMintSource()
+              : connector.oauth
+                ? {
+                    oauth_connector: {
+                      connection_id: grant.connectionId,
+                      provider: connector.provider,
+                    },
+                  }
+                : null,
             methods,
             path_globs,
             graphql_operation,
@@ -1521,17 +1651,23 @@ export function compileIntegrationPolicy(
       // provider's, not hardcoded here). So we emit only the GATING + the mint
       // marker; `header_name`/`header_template` are filled coordinator-side.
       if (connector.credential.source === "mint") {
+        // ADR 0115: user mode on a mint connector renders through the facet's
+        // OWN header spec (the mint engine renders the org header, so parse
+        // requires `userCredential.inject` on mint connectors).
+        const userInject = userScoped ? connector.userCredential?.inject : undefined;
         const entry: IntegrationInjectJson = {
           hosts: connector.hosts,
-          header_name: "",
-          header_template: "",
+          header_name: userInject?.header ?? "",
+          header_template: userInject?.template ?? "",
           secret_ref: "",
-          mint_source: {
-            connection: {
-              connection_id: grant.connectionId,
-              provider: connector.provider,
-            },
-          },
+          mint_source: userInject
+            ? userMintSource()
+            : {
+                connection: {
+                  connection_id: grant.connectionId,
+                  provider: connector.provider,
+                },
+              },
           methods,
           path_globs,
           graphql_operation,
@@ -1762,6 +1898,10 @@ export interface ProviderCatalogEntry {
    * decide this by hard-coding the one provider it knew was named.
    */
   connectionModel: "singleton" | "named";
+  /** ADR 0115: user-scoped credential support, when declared. `tokenHint` is
+   * the member-facing setup line for PAT mode. Drives the profile editor's
+   * per-integration toggle and the Settings → Credentials cards. */
+  userCredential?: { oauth: boolean; token: boolean; tokenHint?: string };
 }
 
 /** GET/HEAD/OPTIONS → read; otherwise write (a method-less op is conservatively write). */
@@ -1808,6 +1948,17 @@ export function buildProviderCatalog(
       hosts: connector.hosts,
       capabilities: [...byAction.values()],
       connectionModel: "singleton",
+      ...(connector.userCredential
+        ? {
+            userCredential: {
+              oauth: connector.userCredential.oauth === true,
+              token: connector.userCredential.token !== undefined,
+              ...(connector.userCredential.token
+                ? { tokenHint: connector.userCredential.token.hint }
+                : {}),
+            },
+          }
+        : {}),
     });
   }
   // A named-connection provider is not a connector: it has no org-wide
