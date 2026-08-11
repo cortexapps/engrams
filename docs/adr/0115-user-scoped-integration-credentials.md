@@ -1,6 +1,10 @@
 # ADR 0115 — user-scoped integration credentials
 
-Status: Proposed (2026-08-11)
+Status: Proposed (2026-08-11). Implementation chain: #1176 (coordinator
+substrate), #1177 (wire v28 + session boot), #1180 (orchestrator compile +
+gate), #1181 (/me routes + shared callback + Slack surfacing), #1182 (web),
+#1183 (connector adoption: linear, slack, sentry, github). Flip to Accepted
+when the chain merges.
 
 ## Context
 
