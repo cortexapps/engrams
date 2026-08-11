@@ -1096,7 +1096,10 @@ async fn session_list_events_paginates() {
         .list_session_events(app::ListSessionEventsRequest {
             session_id: sid.to_string(),
             after_idx: None,
+            before_idx: None,
             limit: Some(3),
+            kinds: vec![],
+            tool_names: vec![],
         })
         .await
         .expect("ListSessionEvents page 1")
@@ -1113,7 +1116,10 @@ async fn session_list_events_paginates() {
         .list_session_events(app::ListSessionEventsRequest {
             session_id: sid.to_string(),
             after_idx: Some(p1.next_after_idx),
+            before_idx: None,
             limit: Some(10),
+            kinds: vec![],
+            tool_names: vec![],
         })
         .await
         .expect("ListSessionEvents page 2")
@@ -1134,13 +1140,130 @@ async fn session_list_events_paginates() {
         .list_session_events(app::ListSessionEventsRequest {
             session_id: sid.to_string(),
             after_idx: Some(p2.next_after_idx),
+            before_idx: None,
             limit: Some(10),
+            kinds: vec![],
+            tool_names: vec![],
         })
         .await
         .expect("ListSessionEvents page 3")
         .into_inner();
     assert!(p3.events.is_empty(), "tail read returns nothing");
     assert_eq!(p3.next_after_idx, 4, "tail cursor echoes, never rewinds");
+
+    server.abort();
+}
+
+/// The windowed read over the real RPC: a BACKWARD page (the transcript
+/// opens on the tail and backfills upward), the two filters, and the
+/// one-direction rule. The store-level semantics are pinned by the
+/// conformance suite; this pins the wiring — request fields → core →
+/// store — and the error code a client branches on.
+#[tokio::test]
+async fn session_list_events_windows_backward_and_filters() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+
+    let sid = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".to_string(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed session");
+
+    // idx 0..=4: two plain messages around three tool events.
+    for (kind, payload) in [
+        ("agent_message", serde_json::json!({"text": "planning"})),
+        ("tool_call_requested", serde_json::json!({"name": "Edit"})),
+        (
+            "tool_call_started",
+            serde_json::json!({"tool_name": "Edit"}),
+        ),
+        ("tool_call_requested", serde_json::json!({"name": "Bash"})),
+        ("agent_message", serde_json::json!({"text": "done"})),
+    ] {
+        meta.append_session_event(sid, kind, payload)
+            .await
+            .expect("append event");
+    }
+
+    let (addr, server) = serve(state).await;
+    let channel = dial(addr).await;
+    let mut client = app::session_service_client::SessionServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    );
+    let req = |before: Option<i64>, limit: i64, kinds: Vec<String>, tools: Vec<String>| {
+        app::ListSessionEventsRequest {
+            session_id: sid.to_string(),
+            after_idx: None,
+            before_idx: before,
+            limit: Some(limit),
+            kinds,
+            tool_names: tools,
+        }
+    };
+
+    // ---- Backward from the tail: the NEWEST 2, still oldest-first ----
+    let last = client
+        .list_session_events(req(Some(i64::MAX), 2, vec![], vec![]))
+        .await
+        .expect("newest page")
+        .into_inner();
+    assert_eq!(
+        last.events.iter().map(|e| e.idx).collect::<Vec<_>>(),
+        vec![Some(3), Some(4)],
+        "a backward page arrives re-ascended"
+    );
+
+    // ---- One page further up, anchored on the first idx just seen ----
+    let older = client
+        .list_session_events(req(Some(3), 2, vec![], vec![]))
+        .await
+        .expect("older page")
+        .into_inner();
+    assert_eq!(
+        older.events.iter().map(|e| e.idx).collect::<Vec<_>>(),
+        vec![Some(1), Some(2)],
+        "the next page up is contiguous with the one below it"
+    );
+
+    // ---- kinds narrows the read; tool_names spares the nameless kinds ----
+    let messages = client
+        .list_session_events(req(None, 100, vec!["agent_message".into()], vec![]))
+        .await
+        .expect("kind-filtered page")
+        .into_inner();
+    assert_eq!(
+        messages.events.iter().map(|e| e.idx).collect::<Vec<_>>(),
+        vec![Some(0), Some(4)],
+        "only the selected kind"
+    );
+
+    let edits = client
+        .list_session_events(req(None, 100, vec![], vec!["Edit".into()]))
+        .await
+        .expect("tool-filtered page")
+        .into_inner();
+    assert_eq!(
+        edits.events.iter().map(|e| e.idx).collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(2), Some(4)],
+        "the Bash call is gone; the two messages carry no tool name, so they stay"
+    );
+
+    // ---- A page walks ONE way ----
+    let err = client
+        .list_session_events(app::ListSessionEventsRequest {
+            session_id: sid.to_string(),
+            after_idx: Some(0),
+            before_idx: Some(4),
+            limit: Some(10),
+            kinds: vec![],
+            tool_names: vec![],
+        })
+        .await
+        .expect_err("both cursors is a caller bug");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
 
     server.abort();
 }

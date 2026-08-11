@@ -347,6 +347,23 @@ message ListSessionEventsRequest {
   // Max events to return. Server clamps to a hard cap; unset/non-positive
   // uses the server default page size.
   optional int64 limit = 3;
+  // Return events strictly BEFORE this idx, so a caller can page BACKWARD
+  // from the tail (the web transcript opens on the last page and backfills
+  // upward as the reader scrolls). The page is read newest-first and
+  // re-ascended, so it arrives oldest-first like every other page. Setting
+  // it together with `after_idx` is InvalidArgument — a page walks one way.
+  optional int64 before_idx = 4;
+  // Return only these event kinds. EMPTY = every kind (the prior behaviour).
+  // Four tool kinds carry ~95% of a long session's bytes, so a caller that
+  // needs a whole-session fold (the file-change rollup, the composer mode
+  // chip, plan ordinals, the queued-prompt rail) reads the cheap kinds from
+  // idx 0 without paying for the transcript.
+  repeated string kinds = 5;
+  // For tool-bearing kinds only, return only these tool names (`name` on
+  // tool_call_requested, `tool_name` elsewhere). EMPTY = every tool.
+  // Non-tool kinds selected by `kinds` are unaffected. This stays generic —
+  // the CALLER names the tools it needs; the server just filters.
+  repeated string tool_names = 6;
 }
 
 message ListSessionEventsResponse {

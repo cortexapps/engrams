@@ -378,11 +378,13 @@ mod tests {
         ) -> Result<i64, MetaError> {
             unimplemented!()
         }
-        async fn list_session_events_since(
+        async fn list_session_events_window(
             &self,
             _: engram_core::SessionId,
+            _: engram_core::types::EventCursor,
             _: i64,
-            _: i64,
+            _: &[String],
+            _: &[String],
         ) -> Result<Vec<engram_core::types::PersistedEvent>, MetaError> {
             unimplemented!()
         }

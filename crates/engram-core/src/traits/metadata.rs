@@ -6,7 +6,7 @@ use crate::types::capture_job::{
     CaptureJobAssignment, CaptureJobReport, CaptureJobRow, CaptureJobStage, ColdBaseRow,
     NewCaptureJob,
 };
-use crate::types::event::{ArtifactRow, PersistedEvent};
+use crate::types::event::{ArtifactRow, EventCursor, PersistedEvent};
 use crate::types::host::{HostHeartbeat, HostRecord, HostStatus};
 use crate::types::ids::{CaptureJobId, HostId, SandboxId, SessionId, SnapshotId};
 use crate::types::manifest::ManifestRef;
@@ -2097,31 +2097,76 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
-    /// Return events with `idx > since`, in idx order, capped at
-    /// `limit`. Used by `GET /sessions/:id/events?since=N` (and by
-    /// EventSource auto-reconnect via `Last-Event-ID`) to replay the
-    /// log before tailing the live bus. Pass `since = -1` to start
-    /// from the very first event.
+    /// THE event-log read. One window over the log, always returned in
+    /// ASCENDING idx order:
+    ///
+    /// - `cursor` picks the anchor and the direction.
+    ///   [`EventCursor::After(n)`] takes the OLDEST `limit` events above
+    ///   `n` (the catch-up walk; `-1` = from the head of the log).
+    ///   [`EventCursor::Before(n)`] takes the NEWEST `limit` events
+    ///   below `n` — the store reads them newest-first and re-ascends
+    ///   the page, so a backward reader gets the same shape a forward
+    ///   reader does. The two directions meet exactly at a shared
+    ///   boundary: `Before(k)` then `After(k - 1)` is the whole log with
+    ///   no gap and no duplicate.
+    /// - `limit` caps the page. A limit of 0 or less returns an empty
+    ///   page in EVERY store (never "unlimited"), so a caller can never
+    ///   turn a bad clamp into a full-log read.
+    /// - `kinds` keeps only these event kinds; EMPTY keeps every kind.
+    ///   Four tool kinds hold most of a long session's bytes, so a
+    ///   whole-session fold over the cheap kinds must not pay for the
+    ///   transcript.
+    /// - `tool_names` keeps only these tool names; EMPTY keeps every
+    ///   tool. It applies ONLY to a kind that carries a tool name (see
+    ///   [`tool_name_field`](crate::types::event::tool_name_field)). A
+    ///   kind with NO tool-name field — every non-tool kind, and
+    ///   `tool_result_submitted`, which holds a `tool_call_id` instead
+    ///   of a name — is NEVER removed by this filter. Resolving that id
+    ///   to a name needs a second lookup, and dropping the result of a
+    ///   tool the caller asked for is worse than passing one extra
+    ///   event through, so the rule is uniform: no name field, no
+    ///   filter.
+    ///
+    /// Rewound/tombstoned rows (ADR 0028 A.log) are returned like any
+    /// other, carrying `recovery_epoch` + `rewound_at`; the transcript
+    /// renders them collapsed instead of pretending they never existed.
+    async fn list_session_events_window(
+        &self,
+        session_id: SessionId,
+        cursor: EventCursor,
+        limit: i64,
+        kinds: &[String],
+        tool_names: &[String],
+    ) -> Result<Vec<PersistedEvent>, MetaError>;
+
+    /// Events with `idx > since`, in idx order, capped at `limit`. Used
+    /// by `GET /sessions/:id/events?since=N` (and by EventSource
+    /// auto-reconnect via `Last-Event-ID`) to replay the log before
+    /// tailing the live bus. Pass `since = -1` to start from the very
+    /// first event. A thin, unfiltered forward window — do not override
+    /// it, so there stays exactly one query builder per store.
     async fn list_session_events_since(
         &self,
         session_id: SessionId,
         since: i64,
         limit: i64,
-    ) -> Result<Vec<PersistedEvent>, MetaError>;
+    ) -> Result<Vec<PersistedEvent>, MetaError> {
+        self.list_session_events_window(session_id, EventCursor::After(since), limit, &[], &[])
+            .await
+    }
 
-    /// The NEWEST `limit` events, returned in ASCENDING idx order (the
-    /// same shape `list_session_events_since` yields, just anchored at
-    /// the tail). What every interactive consumer wants; the forward
-    /// cursor has no way to express it (2026-07-11 campaign: agents
-    /// polling long sessions with oldest-N reads stalled repeatedly).
-    /// Default impl (mocks): delegate to the forward read — correct for
-    /// stores whose event count fits the caller's limit anyway.
+    /// The NEWEST `limit` events, in ASCENDING idx order. What every
+    /// interactive consumer wants; the forward cursor has no way to
+    /// express it (2026-07-11 campaign: agents polling long sessions
+    /// with oldest-N reads stalled repeatedly). `Before(i64::MAX)` is
+    /// "below every possible idx", i.e. the last page.
     async fn list_session_events_tail(
         &self,
         session_id: SessionId,
         limit: i64,
     ) -> Result<Vec<PersistedEvent>, MetaError> {
-        self.list_session_events_since(session_id, -1, limit).await
+        self.list_session_events_window(session_id, EventCursor::Before(i64::MAX), limit, &[], &[])
+            .await
     }
 
     /// ADR 0028 A.log: rung-1 recovery rewind. Tombstone every live

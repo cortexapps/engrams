@@ -83,28 +83,60 @@ const LIST_DEFAULT_LIMIT: i64 = 500;
 /// ADR 0060: hard cap so one unary read stays bounded regardless of `limit`.
 const LIST_MAX_LIMIT: i64 = 1000;
 
-/// ADR 0060: unary, bounded, UNFILTERED read of the persistent log — the
-/// catch-up read the reverse-channel pump (`SessionIngestWorkflow`) walks
-/// forward. Returns events with `idx > after_idx` (`None` ≡ from the start of
-/// the log), capped, plus the cursor to pass as `after_idx` next time: the
+/// ADR 0060: one unary, bounded read of the persistent log — the catch-up
+/// read the reverse-channel pump (`SessionIngestWorkflow`) walks forward, and
+/// the page the web transcript backfills upward with.
+///
+/// The window has ONE direction per call:
+/// - `after_idx` (`None` ≡ from the start of the log) reads FORWARD: the
+///   oldest events above the cursor.
+/// - `before_idx` reads BACKWARD: the newest events below the cursor,
+///   re-ascended by the store so the page still arrives oldest-first.
+///
+/// Both at once is a caller bug, not a merge of two windows, so it is a
+/// `BadRequest` (gRPC `InvalidArgument`) — a page walks one way.
+///
+/// `kinds` / `tool_names` narrow the read IN THE STORE (empty ≡ every
+/// kind / every tool). A whole-session fold over a couple of cheap kinds
+/// must not pull the transcript's bytes through Postgres, the coordinator,
+/// and the wire to throw them away at the client. A kind that carries no
+/// tool name is never removed by `tool_names` — see
+/// [`MetadataStore::list_session_events_window`](engram_core::traits::MetadataStore::list_session_events_window).
+///
+/// Returns the page plus the cursor to pass as `after_idx` next time: the
 /// last returned idx, or the request's `after_idx` echoed back when the page
-/// is empty so a caller at the tail never rewinds. Curation is the consumer's
-/// concern (unlike the SSE/stream path, which is also unfiltered). The gRPC
-/// handler maps each [`PersistedEvent`](engram_core::types::PersistedEvent) to
-/// a proto `SessionEvent` via [`merged_to_parts`] so the unary read is
-/// byte-identical to the stream's replay arm.
+/// is empty so a caller at the tail never rewinds. A BACKWARD reader keeps
+/// paging with the FIRST idx of the page it just got (its own state), which
+/// is why the echo stays anchored to `after_idx`.
+///
+/// The gRPC handler maps each
+/// [`PersistedEvent`](engram_core::types::PersistedEvent) to a proto
+/// `SessionEvent` via [`merged_to_parts`] so the unary read is byte-identical
+/// to the stream's replay arm.
 pub(crate) async fn list_session_events_core(
     state: &SharedState,
     id: SessionId,
     after_idx: Option<i64>,
+    before_idx: Option<i64>,
     limit: Option<i64>,
+    kinds: &[String],
+    tool_names: &[String],
 ) -> Result<(Vec<engram_core::types::PersistedEvent>, i64), ApiError> {
+    if after_idx.is_some() && before_idx.is_some() {
+        return Err(ApiError::BadRequest(
+            "after_idx and before_idx are mutually exclusive: a page walks one direction".into(),
+        ));
+    }
     state.services.meta.get_session(id).await?;
     let after = after_idx.unwrap_or(-1);
+    let cursor = match before_idx {
+        Some(before) => engram_core::types::EventCursor::Before(before),
+        None => engram_core::types::EventCursor::After(after),
+    };
     let events = state
         .services
         .meta
-        .list_session_events_since(id, after, clamp_list_limit(limit))
+        .list_session_events_window(id, cursor, clamp_list_limit(limit), kinds, tool_names)
         .await?;
     let next_after_idx = events.last().map(|e| e.idx).unwrap_or(after);
     Ok((events, next_after_idx))

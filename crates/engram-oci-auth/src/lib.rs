@@ -306,11 +306,13 @@ mod tests {
         ) -> Result<i64, MetaError> {
             Ok(0)
         }
-        async fn list_session_events_since(
+        async fn list_session_events_window(
             &self,
             _: SessionId,
+            _: engram_core::types::EventCursor,
             _: i64,
-            _: i64,
+            _: &[String],
+            _: &[String],
         ) -> Result<Vec<PersistedEvent>, MetaError> {
             Ok(vec![])
         }

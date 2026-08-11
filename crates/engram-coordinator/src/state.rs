@@ -2748,21 +2748,44 @@ pub(crate) mod tests {
             }
             Ok(moved)
         }
-        async fn list_session_events_since(
+        /// The in-memory mirror of the store's one windowed read. Kinds
+        /// and tool names filter exactly as the real stores do, so a
+        /// state-level test can exercise a narrow read.
+        async fn list_session_events_window(
             &self,
             _: engram_core::SessionId,
-            since: i64,
+            cursor: engram_core::types::EventCursor,
             limit: i64,
+            kinds: &[String],
+            tool_names: &[String],
         ) -> Result<Vec<PersistedEvent>, MetaError> {
-            let limit = if limit < 0 { i64::MAX } else { limit };
-            Ok(self
-                .events
-                .lock()
-                .iter()
-                .filter(|e| e.idx > since)
-                .take(limit as usize)
-                .cloned()
-                .collect())
+            let limit = if limit < 0 { i64::MAX } else { limit } as usize;
+            let keep = |e: &PersistedEvent| {
+                (kinds.is_empty() || kinds.iter().any(|k| k == &e.kind))
+                    && (tool_names.is_empty()
+                        || e.tool_name()
+                            .is_none_or(|name| tool_names.iter().any(|t| t == name)))
+            };
+            let events = self.events.lock();
+            Ok(match cursor {
+                engram_core::types::EventCursor::After(n) => events
+                    .iter()
+                    .filter(|e| e.idx > n && keep(e))
+                    .take(limit)
+                    .cloned()
+                    .collect(),
+                engram_core::types::EventCursor::Before(n) => {
+                    let mut page: Vec<PersistedEvent> = events
+                        .iter()
+                        .rev()
+                        .filter(|e| e.idx < n && keep(e))
+                        .take(limit)
+                        .cloned()
+                        .collect();
+                    page.reverse();
+                    page
+                }
+            })
         }
         async fn insert_artifact(
             &self,
