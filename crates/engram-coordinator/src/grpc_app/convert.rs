@@ -184,6 +184,9 @@ pub(crate) fn create_request_from_proto(
                     engram_core::types::oauth::OAuthSubjectKind::Connector
                 }
                 Ok(app::OauthSubjectKind::Mcp) => engram_core::types::oauth::OAuthSubjectKind::Mcp,
+                Ok(app::OauthSubjectKind::UserConnector) => {
+                    engram_core::types::oauth::OAuthSubjectKind::UserConnector
+                }
                 _ => {
                     return Err(ApiError::BadRequest(
                         "oauth credential subject kind is required".into(),

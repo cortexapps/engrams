@@ -30,6 +30,24 @@ export const listCredentials = OAuthCredentialService.method.listCredentials;
 export const disconnect = OAuthCredentialService.method.disconnect;
 
 /**
+ * ADR 0115: store a user-entered static token (personal access token) as a
+ * sealed no-refresh bundle. Restricted to `user_connector` subjects; the
+ * write is a deliberate replacement of any prior credential for the key.
+ *
+ * @generated from rpc engram.app.v1.OAuthCredentialService.PutCredential
+ */
+export const putCredential = OAuthCredentialService.method.putCredential;
+
+/**
+ * ADR 0115: resolve a redirect flow's non-secret identity from its id (the
+ * OAuth `state`), so one registered callback URL can dispatch org-subject
+ * and user-subject completions to their own authorization checks.
+ *
+ * @generated from rpc engram.app.v1.OAuthCredentialService.LookupRedirectFlow
+ */
+export const lookupRedirectFlow = OAuthCredentialService.method.lookupRedirectFlow;
+
+/**
  * Authorization-code (redirect) flow family for connector subjects. The
  * spec is derived from the connector's oauth facet by the orchestrator,
  * which enforced host containment at the connector parse boundary; the

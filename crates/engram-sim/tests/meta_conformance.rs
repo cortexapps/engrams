@@ -2589,6 +2589,98 @@ async fn oauth_credential_and_flow(ctx: &Ctx) {
     assert!(ctx.meta.get_oauth_flow(expires_id).await.unwrap().is_none());
 }
 
+/// ADR 0115: the `user_connector` subject kind round-trips through put /
+/// list / revoke / flow creation identically in PG and SimMeta. Against PG
+/// this also exercises the widened subject-kind CHECK constraints
+/// (migration 0114) — without them every write here fails.
+async fn user_connector_subject_kind(ctx: &Ctx) {
+    use engram_core::types::oauth::{
+        NewSealedOAuthCredential, OAuthAccountMetadata, OAuthCredentialKey, OAuthFlow,
+        OAuthFlowStatus, OAuthSubjectKind,
+    };
+
+    let key = OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::UserConnector,
+        subject_id: "user-a".into(),
+        provider: "linear".into(),
+    };
+    let row = ctx
+        .meta
+        .put_oauth_credential(
+            NewSealedOAuthCredential {
+                key: key.clone(),
+                wrapped_dek: vec![7; 32],
+                nonce: vec![7; 12],
+                ciphertext: vec![7; 8],
+                key_id: "test-kek".into(),
+                // A static token seals with no provider-verified identity.
+                metadata: OAuthAccountMetadata::default(),
+                expires_at: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.version, 1);
+
+    // Kind isolation: the same subject id under `user` is a different row.
+    assert!(ctx
+        .meta
+        .list_oauth_credentials(OAuthSubjectKind::User, Some("user-a"))
+        .await
+        .unwrap()
+        .is_empty());
+    let listed = ctx
+        .meta
+        .list_oauth_credentials(OAuthSubjectKind::UserConnector, Some("user-a"))
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].key, key);
+
+    // A no-expiry row never enters the refresh due set.
+    let now = ctx.clock.now_utc();
+    assert!(ctx
+        .meta
+        .list_oauth_credentials_due_for_refresh(
+            OAuthSubjectKind::UserConnector,
+            now,
+            now + chrono::Duration::hours(6),
+            32,
+        )
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Flow rows accept the kind (the oauth_flows CHECK).
+    let flow_id = uuid::Uuid::parse_str("11500000-0000-4000-8000-000000000001").unwrap();
+    ctx.meta
+        .create_oauth_flow(OAuthFlow {
+            id: flow_id,
+            key: key.clone(),
+            owner_replica: "replica-a".into(),
+            lease_expires_at: now + chrono::Duration::seconds(30),
+            expires_at: now + chrono::Duration::seconds(30),
+            status: OAuthFlowStatus::Pending,
+            error_code: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta.get_oauth_flow(flow_id).await.unwrap().unwrap().key,
+        key
+    );
+
+    let revoked = ctx
+        .meta
+        .revoke_oauth_credential(&key, row.version)
+        .await
+        .unwrap();
+    assert!(revoked.revoked_at.is_some());
+}
+
 /// ADR 0106 addendum (connector OAuth): refresh scheduling, advisory claims,
 /// the version-fenced broken mark, publish-clears-repair, and the unowned
 /// redirect-flow finish behave identically in PG and SimMeta.
@@ -2961,6 +3053,10 @@ conformance!(
     super::oauth_credential_and_flow
 );
 conformance!(t_oauth_refresh_scheduling, super::oauth_refresh_scheduling);
+conformance!(
+    t_user_connector_subject_kind,
+    super::user_connector_subject_kind
+);
 conformance!(
     t_parked_lifecycle_and_eviction_settle,
     super::parked_lifecycle_and_eviction_settle

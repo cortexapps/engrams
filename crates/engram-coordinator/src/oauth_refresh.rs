@@ -199,15 +199,24 @@ impl OAuthManager {
     /// directly (ADR 0098).
     pub async fn run_connector_refresh_once(&self) -> Result<RefreshSweep, OAuthServiceError> {
         let now = self.clock.now_utc();
-        let due = self
-            .meta
-            .list_oauth_credentials_due_for_refresh(
-                OAuthSubjectKind::Connector,
-                now,
-                now + SWEEP_HORIZON,
-                SWEEP_BATCH,
-            )
-            .await?;
+        // Both kinds hold ConnectorOAuthBundles: org connections and users'
+        // personal connector credentials (ADR 0115). Harness `User` rows are
+        // opaque and refresh through the session control channel — never
+        // swept. Static-token bundles have no expiry, so they never enter
+        // the due set at all.
+        let mut due = Vec::new();
+        for kind in [OAuthSubjectKind::Connector, OAuthSubjectKind::UserConnector] {
+            due.extend(
+                self.meta
+                    .list_oauth_credentials_due_for_refresh(
+                        kind,
+                        now,
+                        now + SWEEP_HORIZON,
+                        SWEEP_BATCH,
+                    )
+                    .await?,
+            );
+        }
         let mut sweep = RefreshSweep {
             examined: due.len(),
             ..RefreshSweep::default()
