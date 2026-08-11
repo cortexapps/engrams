@@ -710,6 +710,24 @@ describe("on-disk registry", () => {
     expect(reg.get("slack")!.webhook?.verificationScheme).toBe("slack_v0");
   });
 
+  // ADR 0115: the shipped user-scoped facets survive the parse invariants —
+  // linear (oauth + token), slack (oauth), sentry (token), github (mint →
+  // token-only, with its own user header spec).
+  test("the shipped user-credential facets parse", () => {
+    const reg = connectorRegistry();
+    expect(reg.get("linear")!.userCredential).toMatchObject({ oauth: true });
+    expect(reg.get("linear")!.userCredential?.token?.hint).toContain("API key");
+    expect(reg.get("slack")!.userCredential).toEqual({ oauth: true });
+    expect(reg.get("sentry")!.userCredential?.token?.hint).toContain("User Auth Tokens");
+    expect(reg.get("github")!.userCredential?.oauth).toBeUndefined();
+    expect(reg.get("github")!.userCredential?.inject).toEqual({
+      header: "Authorization",
+      template: "Bearer {}",
+    });
+    // Multi-header connectors stay org-only.
+    expect(reg.get("datadog")!.userCredential).toBeUndefined();
+  });
+
   test("the shipped datadog connector compiles BOTH pup injects (api + app key)", () => {
     const policy = compileIntegrationPolicy(["datadog:metrics:read"]);
     // metrics:read activates several ops (query, metric metadata, v2 query); each
