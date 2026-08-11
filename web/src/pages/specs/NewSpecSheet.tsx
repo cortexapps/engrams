@@ -256,7 +256,7 @@ function TemplateCard({
       <input
         type="radio"
         name="new-spec-template"
-        className="mt-1"
+        className="mt-1 self-start"
         value={template.id}
         checked={selected}
         onChange={onSelect}
