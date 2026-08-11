@@ -48,6 +48,7 @@ import {
 import { compileToolManifest } from "../tools/manifest.ts";
 import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
 import { systemPromptForTaskType } from "../prompts/base.ts";
+import type { SpecPromptContext } from "../prompts/spec-mode.ts";
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import {
   oauthCredential as defaultOAuthCredential,
@@ -223,6 +224,11 @@ export interface SessionCompileOpts {
   /** Orchestrator task context used to select prompt and tool surfaces. This
    *  value is not sent to the sandbox. */
   taskType?: string;
+  /** ADR 0114 D6: the template snapshot that the new spec owns. It shapes the
+   *  spec-mode system prompt (structure, done criteria, and process stages) and
+   *  is used only when `taskType` is "spec". A `SpecTemplateSnapshot` from the
+   *  template catalog satisfies this shape. */
+  specTemplate?: SpecPromptContext;
   /** ADR 0107: session mode riding the initial prompt (e.g. "plan").
    *  Validated against the selected harness's declared modes. */
   harnessMode?: string;
@@ -528,7 +534,7 @@ export async function compileSessionCreateInput(
   }
   harness.ENGRAM_APPEND_SYSTEM_PROMPT = [
     harness.ENGRAM_APPEND_SYSTEM_PROMPT,
-    systemPromptForTaskType(opts.taskType),
+    systemPromptForTaskType(opts.taskType, opts.specTemplate),
   ]
     .filter(Boolean)
     .join("\n\n");

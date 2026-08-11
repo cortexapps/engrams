@@ -33,10 +33,8 @@ import type {
 import type { ImagesClient } from "../rpc/profiles.ts";
 import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
 import { createToolRegistry } from "../tools/registry.ts";
-import {
-  BASE_SYSTEM_PROMPT,
-  SPEC_MODE_SYSTEM_PROMPT,
-} from "../prompts/base.ts";
+import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
+import { SPEC_MODE_SYSTEM_PROMPT, type SpecPromptContext } from "../prompts/spec-mode.ts";
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 import { capabilityGrant } from "../integrations/grants.ts";
@@ -857,6 +855,40 @@ describe("compileSessionCreateInput", () => {
     expect(spec.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toContain(
       SPEC_MODE_SYSTEM_PROMPT,
     );
+  });
+
+  test("carries the spec template into the spec prompt", async () => {
+    const specTemplate: SpecPromptContext = {
+      layers: [{ key: "intent", title: "Intent" }],
+      sections: [
+        {
+          key: "problem",
+          title: "Problem",
+          layerKey: "intent",
+          guidance: "State the user problem and its cost.",
+          doneCriteria: ["The affected user is clear."],
+          required: true,
+          allowNa: false,
+        },
+      ],
+      stageFlags: { alternatives: "off", talkItThrough: "on", gapCheck: "on" },
+    };
+
+    const spec = await compileSessionCreateInput(profile(), deps(), {
+      taskType: "spec",
+      specTemplate,
+    });
+    const chat = await compileSessionCreateInput(profile(), deps(), {
+      taskType: "chat",
+      specTemplate,
+    });
+
+    const prompt = spec.harnessEnv!.ENGRAM_APPEND_SYSTEM_PROMPT!;
+    expect(prompt).toContain("State the user problem and its cost.");
+    expect(prompt).toContain("Done when: The affected user is clear.");
+    expect(prompt).toContain("### Gap check stage");
+    expect(prompt).not.toContain("### Alternatives stage");
+    expect(chat.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).not.toContain("State the user problem");
   });
 
   test("child manifests omit human-interaction tools but retain coordination tools", async () => {
