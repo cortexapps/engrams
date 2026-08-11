@@ -13,6 +13,11 @@
       { "header": "Authorization", "template": "Bearer {}", "secretRef": "sentry.auth_token" }
     ]
   },
+  "userCredential": {
+    "token": {
+      "hint": "Create a user auth token under Sentry Settings → Account → API → User Auth Tokens."
+    }
+  },
   "hosts": ["sentry.io"],
   "test": { "path": "/api/0/organizations/" },
   "operations": [

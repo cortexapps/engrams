@@ -19,6 +19,12 @@
       }
     ]
   },
+  "userCredential": {
+    "oauth": true,
+    "token": {
+      "hint": "Create a personal API key under Linear Settings → Security & access → API keys, or connect with OAuth."
+    }
+  },
   "hosts": [
     "api.linear.app"
   ],

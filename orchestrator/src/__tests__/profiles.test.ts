@@ -719,13 +719,14 @@ describe("user-scoped grants (ADR 0115)", () => {
   test("rejects user scope on a connector without userCredential", async () => {
     const s = await spawn(acmeDeps());
     try {
+      // datadog is a shipped multi-header connector — permanently org-only.
       await expectErr(
         s.client.createProfile({
           ...base,
           integrationGrants: [
             create(ProfileIntegrationGrantSchema, {
-              connectionId: "default-github",
-              operation: "issues:write",
+              connectionId: "default-datadog",
+              operation: "logs:read",
               resourceConstraints: [],
               credentialScope: "user",
             }),

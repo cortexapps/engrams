@@ -78,17 +78,18 @@ describe("/me OAuth credentials", () => {
 
     const listed = await app.request("/api/v1/me/credentials");
     expect(listed.status).toBe(200);
-    expect(await listed.json()).toMatchObject({
-      credentials: [
-        { kind: "oauth", provider: "openai-codex", connected: false },
-        {
-          kind: "connector",
-          provider: "acme",
-          modes: { oauth: false, token: true },
-          tokenHint: "Create a PAT.",
-          connected: false,
-        },
-      ],
+    const body = (await listed.json()) as { credentials: Array<Record<string, unknown>> };
+    expect(
+      body.credentials.find((entry) => entry.kind === "oauth" && entry.provider === "openai-codex"),
+    ).toMatchObject({ connected: false });
+    // The custom connector's entry rides beside the shipped seeds' entries
+    // (linear/slack/sentry/github declare user support too).
+    expect(
+      body.credentials.find((entry) => entry.kind === "connector" && entry.provider === "acme"),
+    ).toMatchObject({
+      modes: { oauth: false, token: true },
+      tokenHint: "Create a PAT.",
+      connected: false,
     });
     const begun = await app.request(
       "/api/v1/me/credentials/openai-codex/connect",
@@ -177,7 +178,8 @@ describe("/me connector credentials (ADR 0115)", () => {
   test("PUT 404s for a provider without token mode and 400s an empty value", async () => {
     const { oauth, calls } = fakeOauth();
     const app = appWith(oauth);
-    const unknown = await app.request("/api/v1/me/connector-credentials/github", {
+    // datadog is a shipped multi-header connector — permanently org-only.
+    const unknown = await app.request("/api/v1/me/connector-credentials/datadog", {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ value: "pat" }),
@@ -207,9 +209,10 @@ describe("/me connector credentials (ADR 0115)", () => {
     const { oauth } = fakeOauth();
     const listed = await appWith(oauth).request("/api/v1/me/credentials");
     const body = (await listed.json()) as { credentials: Array<Record<string, unknown>> };
-    const connector = body.credentials.find((entry) => entry.kind === "connector");
+    const connector = body.credentials.find(
+      (entry) => entry.kind === "connector" && entry.provider === "acme",
+    );
     expect(connector).toMatchObject({
-      provider: "acme",
       connected: true,
       status: "connected",
       version: 3,

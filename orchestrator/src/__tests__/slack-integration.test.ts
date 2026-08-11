@@ -391,14 +391,16 @@ describe("integration oauth route", () => {
 
   test("user authorize: 404 without userCredential.oauth", async () => {
     const { client } = fakeRedirectClient();
+    // An oauth-facet connector WITHOUT user-scoped support: org connections
+    // only, so the member authorize route must not serve it.
+    const { userCredential: _none, ...orgOnly } = userOauthConnector;
     const app = makeIntegrationOauthRoute({
-      connectors: emptySource,
+      connectors: { list: async () => [{ provider: "acmeoauth", config: orgOnly }] },
       oauthCredential: client as never,
       connectionIdFor,
       getSession: memberSession,
     });
-    // The built-in slack seed has an oauth facet but no user-scoped support.
-    const res = await app.request("/api/v1/me/connector-credentials/slack/oauth/authorize");
+    const res = await app.request("/api/v1/me/connector-credentials/acmeoauth/oauth/authorize");
     expect(res.status).toBe(404);
   });
 

@@ -8,6 +8,12 @@
     "icon": { "mono": "GH", "color": "#1f2328" }
   },
   "credential": { "source": "mint", "mint": { "kind": "github_app" } },
+  "userCredential": {
+    "token": {
+      "hint": "Create a fine-grained personal access token under GitHub Settings → Developer settings, with the permissions you want sessions to hold."
+    },
+    "inject": { "header": "Authorization", "template": "Bearer {}" }
+  },
   "webhook": {
     "verificationScheme": "github_hmac_sha256",
     "events": [

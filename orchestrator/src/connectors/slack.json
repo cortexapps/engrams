@@ -19,6 +19,9 @@
       }
     ]
   },
+  "userCredential": {
+    "oauth": true
+  },
   "webhook": {
     "verificationScheme": "slack_v0",
     "events": [
