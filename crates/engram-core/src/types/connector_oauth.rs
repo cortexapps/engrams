@@ -46,6 +46,10 @@ pub struct ConnectorOAuthBundle {
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorOAuthKind {
     Oauth2AuthorizationCode,
+    /// ADR 0115: a user-entered personal access token. No expiry, no
+    /// refresh spec — structurally invisible to the refresh sweep and
+    /// never marked broken.
+    StaticToken,
 }
 
 impl ConnectorOAuthBundle {

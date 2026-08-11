@@ -16,6 +16,13 @@ pub enum OAuthSubjectKind {
     User,
     Connector,
     Mcp,
+    /// ADR 0115: a user's personal connector credential (PAT or OAuth),
+    /// keyed by the orchestrator user id. Distinct from `User` (harness
+    /// credentials, opaque bundles) so the connector refresh sweep can
+    /// parse its rows as [`ConnectorOAuthBundle`]s.
+    ///
+    /// [`ConnectorOAuthBundle`]: crate::types::connector_oauth::ConnectorOAuthBundle
+    UserConnector,
 }
 
 impl OAuthSubjectKind {
@@ -24,6 +31,7 @@ impl OAuthSubjectKind {
             Self::User => "user",
             Self::Connector => "connector",
             Self::Mcp => "mcp",
+            Self::UserConnector => "user_connector",
         }
     }
 }
@@ -36,6 +44,7 @@ impl std::str::FromStr for OAuthSubjectKind {
             "user" => Ok(Self::User),
             "connector" => Ok(Self::Connector),
             "mcp" => Ok(Self::Mcp),
+            "user_connector" => Ok(Self::UserConnector),
             _ => Err(format!("unknown OAuth subject kind {value:?}")),
         }
     }

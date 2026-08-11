@@ -250,6 +250,16 @@ impl OAuthManager {
         Ok(flow)
     }
 
+    /// ADR 0115: fetch a flow row by id with no subject fence. The trusted
+    /// orchestrator callback route uses it to learn WHICH subject to
+    /// authorize before completing; the row carries no secrets.
+    pub async fn lookup_flow(&self, id: uuid::Uuid) -> Result<OAuthFlow, OAuthServiceError> {
+        self.meta
+            .get_oauth_flow(id)
+            .await?
+            .ok_or(OAuthServiceError::NotFound)
+    }
+
     pub async fn cancel(
         &self,
         subject: &OAuthCredentialKey,
@@ -370,7 +380,11 @@ impl OAuthManager {
     ) -> Result<(), OAuthServiceError> {
         let current = self.meta.get_oauth_credential(key).await?;
         if let Some(current) = &current {
+            // An empty stored account id records no identity to protect —
+            // static tokens (ADR 0115) seal without one, and an OAuth
+            // connect deliberately replaces them.
             if current.revoked_at.is_none()
+                && !current.metadata.account_id.is_empty()
                 && current.metadata.account_id != bundle.metadata.account_id
             {
                 return Err(OAuthServiceError::AccountChanged);
@@ -378,6 +392,66 @@ impl OAuthManager {
         }
         self.publish_bundle_at(key, bundle, current.map(|row| row.version))
             .await
+    }
+
+    /// ADR 0115: seal a user-entered personal access token as a no-refresh
+    /// [`ConnectorOAuthKind::StaticToken`] bundle. The write is a deliberate
+    /// replacement of any prior credential for the key (PAT over OAuth and
+    /// OAuth over PAT are both intended), so no account-identity check runs;
+    /// the read-version CAS still fences concurrent writers.
+    ///
+    /// [`ConnectorOAuthKind::StaticToken`]: engram_core::types::connector_oauth::ConnectorOAuthKind::StaticToken
+    pub async fn put_static_credential(
+        &self,
+        key: &OAuthCredentialKey,
+        secret: &str,
+    ) -> Result<SealedOAuthCredential, OAuthServiceError> {
+        validate_key(key)?;
+        if key.subject_kind != OAuthSubjectKind::UserConnector {
+            return Err(OAuthServiceError::BadRequest(
+                "static credentials are restricted to user_connector subjects".into(),
+            ));
+        }
+        let secret = secret.trim();
+        if secret.is_empty() {
+            return Err(OAuthServiceError::BadRequest(
+                "credential value must not be empty".into(),
+            ));
+        }
+        use engram_core::types::connector_oauth::{
+            ConnectorOAuthBundle, ConnectorOAuthKind, CONNECTOR_OAUTH_BUNDLE_VERSION,
+        };
+        let bundle = ConnectorOAuthBundle {
+            v: CONNECTOR_OAUTH_BUNDLE_VERSION,
+            kind: ConnectorOAuthKind::StaticToken,
+            access_token: secret.to_string(),
+            token_type: "bearer".into(),
+            refresh_token: None,
+            scope: None,
+            obtained_at: self.clock.now_utc(),
+            expires_at: None,
+            refresh: None,
+        };
+        let payload = bundle
+            .to_json()
+            .map_err(|_| OAuthServiceError::InvalidBundle)?;
+        let current = self.meta.get_oauth_credential(key).await?;
+        self.publish_bundle_at(
+            key,
+            ValidatedOAuthBundle {
+                payload,
+                // No provider-verified identity exists for a pasted token;
+                // an empty account id opts out of account-switch detection.
+                metadata: OAuthAccountMetadata::default(),
+                expires_at: None,
+            },
+            current.map(|row| row.version),
+        )
+        .await?;
+        self.meta
+            .get_oauth_credential(key)
+            .await?
+            .ok_or(OAuthServiceError::NotFound)
     }
 
     pub(crate) async fn publish_bundle_at(

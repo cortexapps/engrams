@@ -31,6 +31,7 @@ fn subject_from_proto(
         Ok(app::OauthSubjectKind::User) => OAuthSubjectKind::User,
         Ok(app::OauthSubjectKind::Connector) => OAuthSubjectKind::Connector,
         Ok(app::OauthSubjectKind::Mcp) => OAuthSubjectKind::Mcp,
+        Ok(app::OauthSubjectKind::UserConnector) => OAuthSubjectKind::UserConnector,
         _ => return Err("subject kind is required"),
     };
     Ok((kind, subject.id))
@@ -49,6 +50,15 @@ fn key(
         subject_id,
         provider,
     })
+}
+
+fn subject_kind_to_proto(kind: OAuthSubjectKind) -> app::OauthSubjectKind {
+    match kind {
+        OAuthSubjectKind::User => app::OauthSubjectKind::User,
+        OAuthSubjectKind::Connector => app::OauthSubjectKind::Connector,
+        OAuthSubjectKind::Mcp => app::OauthSubjectKind::Mcp,
+        OAuthSubjectKind::UserConnector => app::OauthSubjectKind::UserConnector,
+    }
 }
 
 fn flow_to_proto(flow: OAuthFlow) -> app::OAuthFlow {
@@ -293,6 +303,7 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             Ok(app::OauthSubjectKind::User) => OAuthSubjectKind::User,
             Ok(app::OauthSubjectKind::Connector) => OAuthSubjectKind::Connector,
             Ok(app::OauthSubjectKind::Mcp) => OAuthSubjectKind::Mcp,
+            Ok(app::OauthSubjectKind::UserConnector) => OAuthSubjectKind::UserConnector,
             _ => return Err(Status::invalid_argument("subject kind is required")),
         };
         let id = subject.id.trim();
@@ -331,6 +342,55 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
                 row,
                 self.state.services.clock.now_utc(),
             )),
+        }))
+    }
+
+    async fn put_credential(
+        &self,
+        req: Request<app::PutCredentialRequest>,
+    ) -> Result<Response<app::PutCredentialResponse>, Status> {
+        self.auth.check(&req)?;
+        let req = req.into_inner();
+        let row = self
+            .state
+            .oauth
+            .put_static_credential(
+                &key(req.subject, req.provider).map_err(Status::invalid_argument)?,
+                &req.secret,
+            )
+            .await
+            .map_err(oauth_status)?;
+        Ok(Response::new(app::PutCredentialResponse {
+            credential: Some(credential_to_proto(
+                row,
+                self.state.services.clock.now_utc(),
+            )),
+        }))
+    }
+
+    async fn lookup_redirect_flow(
+        &self,
+        req: Request<app::LookupRedirectFlowRequest>,
+    ) -> Result<Response<app::LookupRedirectFlowResponse>, Status> {
+        self.auth.check(&req)?;
+        let req = req.into_inner();
+        let flow_id = req
+            .flow_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("malformed flow id"))?;
+        let flow = self
+            .state
+            .oauth
+            .lookup_flow(flow_id)
+            .await
+            .map_err(oauth_status)?;
+        Ok(Response::new(app::LookupRedirectFlowResponse {
+            subject: Some(app::OAuthSubject {
+                kind: subject_kind_to_proto(flow.key.subject_kind).into(),
+                id: flow.key.subject_id,
+            }),
+            provider: flow.key.provider,
+            status: flow.status.as_str().into(),
         }))
     }
 
