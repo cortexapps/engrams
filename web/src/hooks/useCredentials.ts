@@ -26,7 +26,29 @@ export interface SecretCredentialEntry {
   connected: boolean;
 }
 
-export type CredentialEntry = OAuthCredentialEntry | SecretCredentialEntry;
+/** ADR 0115: one entry per connector declaring user-scoped support, joined
+ * against the caller's personal credential (PAT or OAuth — one slot). */
+export interface ConnectorCredentialEntry {
+  kind: "connector";
+  provider: string;
+  display: { name: string };
+  modes: { oauth: boolean; token: boolean };
+  tokenHint?: string;
+  connected: boolean;
+  /** "connected" | "expired" | "broken" | "revoked" | "" (no credential). */
+  status: string;
+  version?: number;
+  account?: {
+    displayName?: string;
+    workspaceName?: string;
+  };
+  updatedAt?: string;
+}
+
+export type CredentialEntry =
+  | OAuthCredentialEntry
+  | SecretCredentialEntry
+  | ConnectorCredentialEntry;
 export interface OAuthFlow {
   id: string;
   provider: string;
@@ -113,4 +135,39 @@ export function useDisconnectOAuth() {
       request<void>(`/me/credentials/${encodeURIComponent(provider)}`, { method: "DELETE" }),
     onSuccess: () => void invalidateCredentialList(queryClient),
   });
+}
+
+// ── ADR 0115: personal connector credentials ────────────────────────────────
+
+/** Seal a personal access token for a connector (PAT mode). */
+export function useSetConnectorCredential() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ provider, value }: { provider: string; value: string }) =>
+      request<void>(`/me/connector-credentials/${encodeURIComponent(provider)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value }),
+      }),
+    onSuccess: () => void invalidateCredentialList(queryClient),
+  });
+}
+
+/** Disconnect a personal connector credential (PAT or OAuth). */
+export function useDeleteConnectorCredential() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (provider: string) =>
+      request<void>(`/me/connector-credentials/${encodeURIComponent(provider)}`, {
+        method: "DELETE",
+      }),
+    onSuccess: () => void invalidateCredentialList(queryClient),
+  });
+}
+
+/** The user-subject OAuth authorize entry — a full browser navigation (the
+ * IdP redirects back through the shared callback to /settings/credentials). */
+export function connectorOAuthAuthorizeUrl(provider: string, force = false): string {
+  const qs = force ? "?force=1" : "";
+  return `${API_BASE}/me/connector-credentials/${encodeURIComponent(provider)}/oauth/authorize${qs}`;
 }

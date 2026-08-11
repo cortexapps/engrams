@@ -55,6 +55,9 @@ export interface ConnectorView {
    */
   connectionModel?: "named";
   connectionCount?: number;
+  /** ADR 0115: user-scoped credential support, when the connector declares
+   * it. `tokenHint` is the member-facing setup line for PAT mode. */
+  userCredential?: { oauth: boolean; token: boolean; tokenHint?: string };
 }
 
 export interface ConnectorViewsResult {
@@ -138,6 +141,15 @@ export function useConnectorViews(): ConnectorViewsResult {
       usedBy: used.length,
       usedByProfiles: used.map((p) => ({ id: p.id, name: p.name, icon: p.icon })),
       ...(named ? { connectionModel: "named" as const, connectionCount: connections.length } : {}),
+      ...(e.userCredential
+        ? {
+            userCredential: {
+              oauth: e.userCredential.oauth,
+              token: e.userCredential.token,
+              ...(e.userCredential.tokenHint ? { tokenHint: e.userCredential.tokenHint } : {}),
+            },
+          }
+        : {}),
     };
   });
 
@@ -189,6 +201,15 @@ export function catalogToViews(providers: ProviderCatalogEntry[]): ConnectorView
       usedBy: 0,
       usedByProfiles: [],
       ...(e.connectionModel === "named" ? { connectionModel: "named" as const } : {}),
+      ...(e.userCredential
+        ? {
+            userCredential: {
+              oauth: e.userCredential.oauth,
+              token: e.userCredential.token,
+              ...(e.userCredential.tokenHint ? { tokenHint: e.userCredential.tokenHint } : {}),
+            },
+          }
+        : {}),
     };
   });
   // A member cannot list named connections, but the catalog still names the

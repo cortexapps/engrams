@@ -234,7 +234,50 @@ export function StartScreen() {
           credential.connected,
       ) ?? false
     );
-  const credentialMissing = userEnvMissing || oauthMissing;
+  // ADR 0115: the profile's user-scoped integrations require the launching
+  // user's PERSONAL credential — mirror the server gate (which requires a
+  // healthy `connected` credential, not mere presence) so the requirement
+  // shows up front with a link instead of a launch-time error.
+  const userScopedProviders = useMemo(() => {
+    if (!selected) return new Set<string>();
+    const byConnection = new Map(
+      views
+        .filter((view) => view.defaultConnectionId !== "")
+        .map((view) => [view.defaultConnectionId, view.provider]),
+    );
+    return new Set(
+      (selected.integrationGrants ?? [])
+        .filter((grant) => grant.credentialScope === "user")
+        .map((grant) => byConnection.get(grant.connectionId))
+        .filter((provider): provider is string => provider !== undefined),
+    );
+  }, [selected, views]);
+  const connectorsMissing = useMemo(() => {
+    if (!selected) return [];
+    const byConnection = new Map(
+      views
+        .filter((view) => view.defaultConnectionId !== "")
+        .map((view) => [view.defaultConnectionId, view]),
+    );
+    const required = (selected.integrationGrants ?? [])
+      .filter((grant) => grant.credentialScope === "user")
+      .map((grant) => byConnection.get(grant.connectionId))
+      .filter((view) => view?.userCredential !== undefined);
+    const unique = [...new Map(required.map((view) => [view!.provider, view!])).values()];
+    return unique.filter(
+      (view) =>
+        !(
+          credentials?.some(
+            (credential) =>
+              credential.kind === "connector" &&
+              credential.provider === view.provider &&
+              credential.connected &&
+              credential.status === "connected",
+          ) ?? false
+        ),
+    );
+  }, [selected, views, credentials]);
+  const credentialMissing = userEnvMissing || oauthMissing || connectorsMissing.length > 0;
 
   const canLaunch =
     !!selected &&
@@ -363,15 +406,25 @@ export function StartScreen() {
               <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5">
                 <span className="flex items-center gap-2">
                   <KeyRound className="size-4 shrink-0 text-instrument-caution" />
-                  {oauthMissing ? (
-                    <>OpenAI is not connected</>
+                  {userEnvMissing || oauthMissing ? (
+                    <>
+                      {oauthMissing ? (
+                        <>OpenAI is not connected</>
+                      ) : (
+                        <>
+                          No <code className="font-mono">{effectiveUserEnv}</code> saved
+                        </>
+                      )}{" "}
+                      — {effectiveHarness?.descriptor?.label || effectiveHarnessName} sessions need
+                      it to launch.
+                    </>
                   ) : (
                     <>
-                      No <code className="font-mono">{effectiveUserEnv}</code> saved
+                      {connectorsMissing.map((view) => view.name).join(", ")}{" "}
+                      {connectorsMissing.length === 1 ? "needs" : "need"} your personal credential —
+                      this profile runs {connectorsMissing.length === 1 ? "it" : "them"} as you.
                     </>
-                  )}{" "}
-                  — {effectiveHarness?.descriptor?.label || effectiveHarnessName} sessions need it
-                  to launch.
+                  )}
                 </span>
                 <Link
                   to="/settings/credentials"
@@ -380,7 +433,16 @@ export function StartScreen() {
                   Add credential
                 </Link>
               </div>
-              {userEnvHint && <p className="text-muted-foreground">{userEnvHint}</p>}
+              {(userEnvMissing || oauthMissing) && userEnvHint && (
+                <p className="text-muted-foreground">{userEnvHint}</p>
+              )}
+              {!userEnvMissing &&
+                !oauthMissing &&
+                connectorsMissing[0]?.userCredential?.tokenHint && (
+                  <p className="text-muted-foreground">
+                    {connectorsMissing[0].userCredential.tokenHint}
+                  </p>
+                )}
             </div>
           )}
 
@@ -508,7 +570,11 @@ export function StartScreen() {
               connector powers OR raw network egress. A profile with neither has
               nothing to disclose (every session is sandboxed by default). */}
           {policy && (policy.capCount > 0 || policy.reachable.length > 0) && (
-            <PolicyReceipt policy={policy} imageName={imageName} />
+            <PolicyReceipt
+              policy={policy}
+              imageName={imageName}
+              userScopedProviders={userScopedProviders}
+            />
           )}
 
           {noProfiles &&
@@ -663,9 +729,12 @@ function ProfileSwitcher({
 function PolicyReceipt({
   policy,
   imageName,
+  userScopedProviders,
 }: {
   policy: DerivedPolicy;
   imageName: string | undefined;
+  /** ADR 0115: providers this profile runs with the launcher's personal credential. */
+  userScopedProviders: ReadonlySet<string>;
 }) {
   const [open, setOpen] = useState(false);
 
@@ -717,6 +786,11 @@ function PolicyReceipt({
               <div className="flex items-center gap-2">
                 <ProviderTile {...pr.view.icon} name={pr.view.name} size={16} />
                 <span className="text-[0.78rem] font-semibold">{pr.view.name}</span>
+                {userScopedProviders.has(pr.view.provider) && (
+                  <span className="rounded-sm bg-secondary px-1.5 py-0.5 text-[0.66rem] text-muted-foreground">
+                    uses your credential
+                  </span>
+                )}
               </div>
               {pr.caps.map((c) => (
                 <div key={c.action} className="flex items-center gap-2 pl-6">
