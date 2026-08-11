@@ -125,6 +125,15 @@ pub fn credential_mint_source() -> impl Strategy<Value = CredentialMintSource> {
                     },
                 )
                 .boxed(),
+            CredentialMintSource::OauthUser { .. } => (s(), s(), s())
+                .prop_map(
+                    |(user_id, connection_id, provider)| CredentialMintSource::OauthUser {
+                        user_id,
+                        connection_id,
+                        provider,
+                    },
+                )
+                .boxed(),
         }
     }
     prop_oneof![
@@ -133,6 +142,11 @@ pub fn credential_mint_source() -> impl Strategy<Value = CredentialMintSource> {
             provider: String::new(),
         }),
         shapes(CredentialMintSource::OauthConnector {
+            connection_id: String::new(),
+            provider: String::new(),
+        }),
+        shapes(CredentialMintSource::OauthUser {
+            user_id: String::new(),
             connection_id: String::new(),
             provider: String::new(),
         }),

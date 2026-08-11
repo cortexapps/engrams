@@ -81,7 +81,19 @@ fn linear_key() -> OAuthCredentialKey {
     }
 }
 
+fn user_key() -> OAuthCredentialKey {
+    OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::UserConnector,
+        subject_id: "user-7".into(),
+        provider: "linear".into(),
+    }
+}
+
 async fn seed_bundle(fx: &Fixture, bundle: &ConnectorOAuthBundle) {
+    seed_bundle_for(fx, linear_key(), bundle).await;
+}
+
+async fn seed_bundle_for(fx: &Fixture, key: OAuthCredentialKey, bundle: &ConnectorOAuthBundle) {
     let sealed = CredCipher::new(&fx.kek)
         .seal(&bundle.to_json().expect("bundle json"))
         .await
@@ -89,7 +101,7 @@ async fn seed_bundle(fx: &Fixture, bundle: &ConnectorOAuthBundle) {
     fx.meta
         .put_oauth_credential(
             NewSealedOAuthCredential {
-                key: linear_key(),
+                key,
                 wrapped_dek: sealed.wrapped_dek,
                 nonce: sealed.nonce.to_vec(),
                 ciphertext: sealed.ciphertext,
@@ -110,14 +122,21 @@ async fn seed_bundle(fx: &Fixture, bundle: &ConnectorOAuthBundle) {
 }
 
 async fn refresh_call(app: axum::Router) -> (StatusCode, Value) {
-    let body = json!({
-        "mint_source": {
-            "oauth_connector": {
-                "connection_id": "conn-linear",
-                "provider": "linear",
+    refresh_call_with(
+        app,
+        json!({
+            "mint_source": {
+                "oauth_connector": {
+                    "connection_id": "conn-linear",
+                    "provider": "linear",
+                }
             }
-        }
-    });
+        }),
+    )
+    .await
+}
+
+async fn refresh_call_with(app: axum::Router, body: Value) -> (StatusCode, Value) {
     let req = Request::builder()
         .method(Method::POST)
         .uri(format!(
@@ -225,5 +244,84 @@ async fn refresh_route_fails_when_no_credential_exists() {
         status,
         StatusCode::INTERNAL_SERVER_ERROR,
         "the proxy keeps its stale secret on a failed refresh"
+    );
+}
+
+fn oauth_user_body() -> Value {
+    json!({
+        "mint_source": {
+            "oauth_user": {
+                "user_id": "user-7",
+                "connection_id": "conn-linear",
+                "provider": "linear",
+            }
+        }
+    })
+}
+
+/// ADR 0115: an `oauth_user` mint source resolves the USER-subject sealed
+/// credential. A static token (PAT) has no expiry, so the returned refresh
+/// horizon clamps to 24 h — a disconnect or replacement reaches live
+/// sessions within a day.
+#[tokio::test]
+async fn refresh_route_resolves_a_user_static_token_with_a_daily_horizon() {
+    let fx = fixture();
+    seed_bundle_for(
+        &fx,
+        user_key(),
+        &ConnectorOAuthBundle {
+            v: 1,
+            kind: ConnectorOAuthKind::StaticToken,
+            access_token: "personal-pat".into(),
+            token_type: "bearer".into(),
+            refresh_token: None,
+            scope: None,
+            obtained_at: fx.clock.now_utc(),
+            expires_at: None,
+            refresh: None,
+        },
+    )
+    .await;
+    let (status, body) = refresh_call_with(fx.app.clone(), oauth_user_body()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["secret"], "personal-pat");
+    let expires: chrono::DateTime<chrono::Utc> = body["expires_at"]
+        .as_str()
+        .expect("expires_at")
+        .parse()
+        .expect("rfc3339");
+    assert_eq!(
+        expires,
+        fx.clock.now_utc() + chrono::Duration::hours(24),
+        "personal non-expiring tokens re-resolve daily"
+    );
+}
+
+/// The user subject is keyed by user id, not connection id: a connector-
+/// subject credential must not satisfy an `oauth_user` entry, and a missing
+/// user credential fails the route so the proxy keeps its stale secret.
+#[tokio::test]
+async fn refresh_route_keeps_user_and_connector_subjects_apart() {
+    let fx = fixture();
+    seed_bundle(
+        &fx,
+        &ConnectorOAuthBundle {
+            v: 1,
+            kind: ConnectorOAuthKind::Oauth2AuthorizationCode,
+            access_token: "org-token".into(),
+            token_type: "bearer".into(),
+            refresh_token: None,
+            scope: None,
+            obtained_at: fx.clock.now_utc(),
+            expires_at: None,
+            refresh: None,
+        },
+    )
+    .await;
+    let (status, _body) = refresh_call_with(fx.app.clone(), oauth_user_body()).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an org connector credential must not satisfy a user-subject inject"
     );
 }
