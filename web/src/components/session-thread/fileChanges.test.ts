@@ -151,3 +151,26 @@ describe("extractFileChanges", () => {
     expect(changes[0]!.changes.map((change) => change.at)).toEqual([`${AT}-0`, `${AT}-2`]);
   });
 });
+
+describe("extractFileChanges — rollup cache", () => {
+  test("returns the same rollup for the same events array, and recomputes for a new one", () => {
+    const events = [
+      changed(0, "src/a.ts", { write: { content: "a\nb\n" } }),
+      changed(1, "src/b.ts", { write: { content: "c\n" } }),
+    ];
+
+    // Same identity → same object, so the three render-time call sites
+    // (Changes-tab gate, overview card, diff pane) re-diff the log once.
+    expect(extractFileChanges(events)).toBe(extractFileChanges(events));
+
+    // A new array (what `useSessionEvents` produces per event) recomputes.
+    const grown = [...events, changed(2, "src/a.ts", { write: { content: "a\nb\nc\n" } })];
+    const first = extractFileChanges(events);
+    const second = extractFileChanges(grown);
+    expect(second).not.toBe(first);
+    expect(second).toHaveLength(2);
+    expect(second[0]!.changes).toHaveLength(2);
+    // The cached entry for the old array is untouched by the newer rollup.
+    expect(first[0]!.changes).toHaveLength(1);
+  });
+});
