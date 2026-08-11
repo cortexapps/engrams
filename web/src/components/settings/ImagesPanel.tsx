@@ -81,19 +81,31 @@ export function ImagesPanel() {
   const rows = data ?? [];
   const { data: jobs } = useEnableJobs();
 
+  // Failure cards the operator dismissed this visit. A failure sticks
+  // around for an hour (below), which is right when you still need the
+  // error text and wrong once you have read it — so let it be closed.
+  const [dismissedJobIds, setDismissedJobIds] = useState<ReadonlySet<string>>(new Set());
+  const dismissJob = (jobId: string) => setDismissedJobIds((prev) => new Set(prev).add(jobId));
+
   // ADR 0036: in-flight enables (and fresh failures, kept visible
   // for an hour so the error + retry affordance doesn't vanish).
   const visibleJobs = (jobs ?? []).filter(
     (j) =>
       isJobActive(j) ||
-      (j.state === "failed" && Date.now() - new Date(j.updated_at).getTime() < 60 * 60 * 1000),
+      (j.state === "failed" &&
+        !dismissedJobIds.has(j.id) &&
+        Date.now() - new Date(j.updated_at).getTime() < 60 * 60 * 1000),
   );
 
-  // #94: for any URI that has a visible job, the job row takes
-  // precedence — drop the matching image row so a refresh shows a
-  // single in-flight row instead of duplicating (job card + table row).
-  const jobUris = new Set(visibleJobs.map((j) => j.image_uri));
-  const imageRows = rows.filter((r) => !jobUris.has(r.image_uri));
+  // #94: while a job is IN FLIGHT its card takes precedence — drop the
+  // matching image row so a refresh shows a single in-flight row instead
+  // of duplicating (job card + table row). A FAILED job is not in
+  // flight: the image keeps the config it had, and hiding its row also
+  // hides "Edit config" — the one affordance that repairs the warm
+  // config the capture just died on. Show both; only Retry re-runs the
+  // identical config, which is not what a bad warm hook needs.
+  const activeUris = new Set(visibleJobs.filter(isJobActive).map((j) => j.image_uri));
+  const imageRows = rows.filter((r) => !activeUris.has(r.image_uri));
 
   return (
     <div className="space-y-6">
@@ -105,6 +117,7 @@ export function ImagesPanel() {
             <EnableJobRow
               key={job.id}
               job={job}
+              onDismiss={() => dismissJob(job.id)}
               // ETA reference: the most recent READY job for the same URI —
               // its stage durations are the "typically ~Xm" denominators.
               reference={(jobs ?? []).find(
@@ -1307,7 +1320,15 @@ function StageTimeline({
   );
 }
 
-function EnableJobRow({ job, reference }: { job: EnableJob; reference?: EnableJob }) {
+function EnableJobRow({
+  job,
+  reference,
+  onDismiss,
+}: {
+  job: EnableJob;
+  reference?: EnableJob;
+  onDismiss: () => void;
+}) {
   const retry = useRetryEnableJob();
   const failed = job.state === "failed";
   const active = isJobActive(job);
@@ -1381,15 +1402,25 @@ function EnableJobRow({ job, reference }: { job: EnableJob; reference?: EnableJo
               <span className="text-xs text-muted-foreground italic animate-pulse">working…</span>
             )}
             {failed && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="ml-auto"
-                onClick={() => retry.mutate({ jobId: job.id })}
-                disabled={retry.isPending}
-              >
-                {retry.isPending ? "Retrying…" : "Retry"}
-              </Button>
+              <div className="ml-auto flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => retry.mutate({ jobId: job.id })}
+                  disabled={retry.isPending}
+                >
+                  {retry.isPending ? "Retrying…" : "Retry"}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Dismiss failure"
+                  title="Dismiss — the image row below keeps Edit config"
+                  onClick={onDismiss}
+                >
+                  <XIcon className="size-4" />
+                </Button>
+              </div>
             )}
           </div>
           <StageTimeline
