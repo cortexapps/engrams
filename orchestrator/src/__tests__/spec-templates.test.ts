@@ -39,12 +39,12 @@ function appFor(role: "admin" | "user", overrides: Record<string, unknown> = {})
 }
 
 describe("spec template routes", () => {
-  test("an organization member can list templates", async () => {
+  test("a non-admin cannot list templates", async () => {
     const { app, catalog } = appFor("user");
     const response = await app.request("/api/v1/spec-templates");
 
-    expect(response.status).toBe(200);
-    expect(catalog.list).toHaveBeenCalledWith("org-1");
+    expect(response.status).toBe(403);
+    expect(catalog.list).not.toHaveBeenCalled();
   });
 
   test("a non-admin write is denied by CASL", async () => {

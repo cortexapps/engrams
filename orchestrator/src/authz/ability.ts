@@ -112,10 +112,6 @@ export function abilityFor(user: AbilityUser): AppAbility {
   // guards resolve membership before they apply this ability.
   can("read", "Spec");
 
-  // Spec templates are an organization catalog. Every member can read them;
-  // only admins can change them through manage("all").
-  can("read", "SpecTemplate");
-
   // Admin override.
   if (user.role === "admin") can("manage", "all");
 

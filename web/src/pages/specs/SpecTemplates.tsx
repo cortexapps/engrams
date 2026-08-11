@@ -1,7 +1,6 @@
 import { ArrowDown, ArrowUp, Copy, Layers3, Plus, RotateCcw, Save, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { useIsAdmin } from "@/auth/AuthProvider";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -41,7 +40,6 @@ const EMPTY_TEMPLATE: SpecTemplateDefinition = {
 };
 
 export function SpecTemplates() {
-  const isAdmin = useIsAdmin();
   const templates = useSpecTemplates();
   const save = useSaveSpecTemplate();
   const clone = useCloneSpecTemplate();
@@ -104,19 +102,17 @@ export function SpecTemplates() {
             <h2>Templates</h2>
             <p>Reusable structure and writing process.</p>
           </div>
-          {isAdmin && (
-            <Button
-              size="sm"
-              onClick={() => {
-                setSelectedId(null);
-                setCreating(true);
-                setDraft(structuredClone(EMPTY_TEMPLATE));
-              }}
-            >
-              <Plus aria-hidden />
-              New
-            </Button>
-          )}
+          <Button
+            size="sm"
+            onClick={() => {
+              setSelectedId(null);
+              setCreating(true);
+              setDraft(structuredClone(EMPTY_TEMPLATE));
+            }}
+          >
+            <Plus aria-hidden />
+            New
+          </Button>
         </div>
 
         {templates.isPending ? (
@@ -174,37 +170,31 @@ export function SpecTemplates() {
                   current structure and process.
                 </p>
               </div>
-              {isAdmin && (
-                <div className="spec-template-heading-actions">
-                  {!creating && (
-                    <Button
-                      variant="outline"
-                      onClick={() => void cloneSelected()}
-                      disabled={pending}
-                    >
-                      <Copy aria-hidden />
-                      Clone
-                    </Button>
-                  )}
-                  {selected?.builtIn && selected.modifiedFromDefault && (
-                    <Button
-                      variant="outline"
-                      onClick={() => void restoreSelected()}
-                      disabled={pending}
-                    >
-                      <RotateCcw aria-hidden />
-                      Restore default
-                    </Button>
-                  )}
-                  <Button
-                    onClick={() => void saveDraft()}
-                    disabled={pending || (!creating && !dirty)}
-                  >
-                    <Save aria-hidden />
-                    {pending ? "Saving…" : "Save template"}
+              <div className="spec-template-heading-actions">
+                {!creating && (
+                  <Button variant="outline" onClick={() => void cloneSelected()} disabled={pending}>
+                    <Copy aria-hidden />
+                    Clone
                   </Button>
-                </div>
-              )}
+                )}
+                {selected?.builtIn && selected.modifiedFromDefault && (
+                  <Button
+                    variant="outline"
+                    onClick={() => void restoreSelected()}
+                    disabled={pending}
+                  >
+                    <RotateCcw aria-hidden />
+                    Restore default
+                  </Button>
+                )}
+                <Button
+                  onClick={() => void saveDraft()}
+                  disabled={pending || (!creating && !dirty)}
+                >
+                  <Save aria-hidden />
+                  {pending ? "Saving…" : "Save template"}
+                </Button>
+              </div>
             </header>
 
             {mutationError && (
@@ -214,9 +204,9 @@ export function SpecTemplates() {
             )}
 
             <div className="spec-template-editor-body">
-              <TemplateIdentity draft={draft} disabled={!isAdmin} onChange={setDraft} />
-              <StructureEditor draft={draft} disabled={!isAdmin} onChange={setDraft} />
-              <ProcessEditor draft={draft} disabled={!isAdmin} onChange={setDraft} />
+              <TemplateIdentity draft={draft} disabled={false} onChange={setDraft} />
+              <StructureEditor draft={draft} disabled={false} onChange={setDraft} />
+              <ProcessEditor draft={draft} disabled={false} onChange={setDraft} />
             </div>
           </>
         )}

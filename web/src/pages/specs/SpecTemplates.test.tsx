@@ -4,14 +4,12 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 import type { SpecTemplate } from "@/hooks/useSpecTemplates";
 
 const state = vi.hoisted(() => ({
-  isAdmin: false,
   templates: [] as SpecTemplate[],
   save: vi.fn(),
   clone: vi.fn(),
   restore: vi.fn(),
 }));
 
-vi.mock("@/auth/AuthProvider", () => ({ useIsAdmin: () => state.isAdmin }));
 vi.mock("@/hooks/useSpecTemplates", () => ({
   useSpecTemplates: () => ({ data: state.templates, isPending: false, error: null }),
   useSaveSpecTemplate: () => ({
@@ -57,7 +55,6 @@ const builtIn: SpecTemplate = {
 };
 
 beforeEach(() => {
-  state.isAdmin = false;
   state.templates = [structuredClone(builtIn)];
   state.save.mockReset();
   state.clone.mockReset();
@@ -72,20 +69,7 @@ beforeEach(() => {
 });
 
 describe("SpecTemplates", () => {
-  test("a member can view the full template but cannot change it", async () => {
-    render(<SpecTemplates />);
-
-    expect(
-      (await screen.findByDisplayValue("Engineering design doc")).hasAttribute("disabled"),
-    ).toBe(true);
-    expect(screen.getByDisplayValue("Problem").hasAttribute("disabled")).toBe(true);
-    expect(screen.getByLabelText("Alternatives stage").hasAttribute("disabled")).toBe(true);
-    expect(screen.queryByRole("button", { name: "Save template" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "New" })).toBeNull();
-  });
-
   test("an admin edits the built-in template in place", async () => {
-    state.isAdmin = true;
     render(<SpecTemplates />);
     const name = await screen.findByDisplayValue("Engineering design doc");
 
@@ -103,7 +87,6 @@ describe("SpecTemplates", () => {
   });
 
   test("an admin can type multiple done criteria", async () => {
-    state.isAdmin = true;
     render(<SpecTemplates />);
     const criteria = (await screen.findByLabelText("Done criteria")) as HTMLTextAreaElement;
 
@@ -127,7 +110,6 @@ describe("SpecTemplates", () => {
   });
 
   test("an admin can restore and clone the built-in template", async () => {
-    state.isAdmin = true;
     render(<SpecTemplates />);
     await screen.findByDisplayValue("Engineering design doc");
 
@@ -139,7 +121,6 @@ describe("SpecTemplates", () => {
   });
 
   test("an admin can start a valid new template", async () => {
-    state.isAdmin = true;
     render(<SpecTemplates />);
     fireEvent.click(await screen.findByRole("button", { name: "New" }));
 
