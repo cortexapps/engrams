@@ -852,7 +852,9 @@ export function buildMessages(
         if (planAttemptToolCallIds.has(ev.tool_call_id)) break;
         const part = openTools.get(ev.tool_call_id);
         if (part) {
-          part.result = ev.result_summary ?? undefined;
+          if (!submittedResults.has(ev.tool_call_id)) {
+            part.result = ev.result_summary ?? undefined;
+          }
           part.isError = !ev.ok;
           openTools.delete(ev.tool_call_id);
         } else {

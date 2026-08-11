@@ -14,6 +14,26 @@ const template = {
 };
 
 describe("the spec canvas schema", () => {
+  test("allows the server document to replace Tiptap's initial placeholder section", () => {
+    const placeholder = schema.nodes.doc!.create(null, [
+      schema.nodes.section!.create(null, [
+        schema.nodes.sectionHeading!.create(),
+        schema.nodes.paragraph!.create(),
+      ]),
+    ]);
+    const state = EditorState.create({
+      doc: placeholder,
+      plugins: [createSectionStructurePlugin()],
+    });
+    const serverDocument = createTemplateDocument(template);
+    const result = state.applyTransaction(
+      state.tr.replaceWith(0, placeholder.content.size, serverDocument.content),
+    );
+
+    expect(result.transactions).toHaveLength(1);
+    expect(sectionIds(result.state.doc)).toEqual(["context", "failure-modes"]);
+  });
+
   test("refuses a transaction that deletes a structural section", () => {
     const doc = createTemplateDocument(template);
     const state = EditorState.create({ doc, plugins: [createSectionStructurePlugin()] });

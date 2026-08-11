@@ -23,6 +23,7 @@ export interface SpecReadRecord {
   sessionId: string | null;
   publishedCheckpointId: string | null;
   publishedAt: Date | null;
+  currentSemanticDocSeq: bigint;
 }
 
 export interface SpecCheckpointSummary {
@@ -48,6 +49,7 @@ interface SpecRow {
   session_id: string | null;
   published_checkpoint_id: string | null;
   published_at: Date | null;
+  current_semantic_doc_seq: string;
 }
 
 interface CheckpointSummaryRow {
@@ -67,7 +69,7 @@ export class PostgresSpecReadStore implements SpecReadStore {
   async readSpec(specId: string): Promise<SpecReadRecord | null> {
     const result = await this.pool.query<SpecRow>(
       `SELECT id, title, lifecycle, owner_user_id, session_id,
-              published_checkpoint_id, published_at
+              published_checkpoint_id, published_at, current_semantic_doc_seq
          FROM spec
         WHERE id = $1`,
       [specId],
@@ -85,6 +87,7 @@ export class PostgresSpecReadStore implements SpecReadStore {
       sessionId: row.session_id,
       publishedCheckpointId: row.published_checkpoint_id,
       publishedAt: row.published_at,
+      currentSemanticDocSeq: BigInt(row.current_semantic_doc_seq),
     };
   }
 
@@ -165,6 +168,7 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
         sessionId: record.ownerUserId === userId ? record.sessionId : null,
         publishedCheckpointId: record.publishedCheckpointId,
         publishedAt: record.publishedAt?.toISOString() ?? null,
+        revision: record.currentSemanticDocSeq.toString(),
       },
       checkpoints: summaries.map(checkpointSummaryJson),
       publishedCheckpoint: publishedCheckpoint ? checkpointJson(publishedCheckpoint) : null,

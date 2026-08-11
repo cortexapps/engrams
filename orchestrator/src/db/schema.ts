@@ -16,7 +16,7 @@
  */
 
 import { relations, sql } from "drizzle-orm";
-import type { SectionStateTranscriptChip } from "@engrams/spec-document";
+import type { SpecTranscriptChip } from "@engrams/spec-document";
 import {
   pgTable,
   text,
@@ -365,7 +365,8 @@ export const specTranscriptAction = pgTable(
       .references(() => spec.id, { onDelete: "cascade" }),
     sectionId: text("section_id").notNull(),
     requestFingerprint: text("request_fingerprint").notNull(),
-    chip: jsonb("chip").$type<SectionStateTranscriptChip>().notNull(),
+    chip: jsonb("chip").$type<SpecTranscriptChip>().notNull(),
+    result: jsonb("result").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
     deliveredAt: timestamp("delivered_at", { withTimezone: true }),
   },

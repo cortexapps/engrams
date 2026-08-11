@@ -18,6 +18,7 @@ export {
 } from "./blocks.ts";
 export {
   createSectionRelativeAnchor,
+  isRangeInSectionBody,
   parseSectionRelativeAnchor,
   resolveSectionRelativeAnchor,
   serializeSectionRelativeAnchor,
@@ -37,6 +38,12 @@ export {
   type SectionState,
   type SectionStateTranscriptChip,
   type SectionStateValue,
+  type SpecSelectionAction,
+  type SpecSelectionActionPayload,
+  type SpecSelectionSpan,
+  type SpecTranscriptChip,
+  type TrackedEditTranscriptChip,
+  selectionSliceFingerprint,
 } from "./actions.ts";
 export {
   extractRequirementDefinitions,

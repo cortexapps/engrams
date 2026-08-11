@@ -969,6 +969,90 @@ describe("SpecDocumentService with live Postgres", () => {
   }, 15_000);
 
   test.skipIf(!liveDbReachable)(
+    "a tracked edit commits its update, result, and transcript action atomically",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      let stopOnce = true;
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => new Date("2026-08-09T12:03:00.000Z"),
+        afterPersist: (_storedSpecId, seq) => {
+          if (!stopOnce || seq !== 2n) return;
+          stopOnce = false;
+          throw new Error("simulated stop after tracked-edit commit");
+        },
+      });
+      await documents.applyUpdate(specId, initialUpdate(), "seed");
+      const action = {
+        id: `selection-edit:${specId}:session:call`,
+        specId,
+        sectionId: "context",
+        requestFingerprint: "request-fingerprint",
+        concurrentEditors: ["Sam"],
+        chip: {
+          kind: "spec_tracked_edit" as const,
+          specId,
+          sectionId: "context",
+          before: "",
+          after: "Tracked edit",
+        },
+      };
+
+      await expect(
+        documents.mutateDocumentWithTrackedEdit(
+          specId,
+          "agent:session:call",
+          action,
+          (document) => {
+            const section = findSection(document, "context");
+            if (!section) throw new Error("The context section is missing.");
+            return new Transform(document).insert(
+              section.position + section.node.nodeSize - 2,
+              schema.text("Tracked edit"),
+            ).doc;
+          },
+        ),
+      ).rejects.toThrow("simulated stop after tracked-edit commit");
+
+      const committed = await livePool.query<{
+        current_doc_seq: string;
+        updates: string;
+        actions: string;
+        stored_rev: string;
+      }>(
+        `SELECT s.current_doc_seq::text,
+                (SELECT count(*)::text FROM spec_update_log u WHERE u.spec_id = s.id) AS updates,
+                (SELECT count(*)::text FROM spec_transcript_action a WHERE a.spec_id = s.id) AS actions,
+                (SELECT a.result->>'newRev' FROM spec_transcript_action a WHERE a.id = $2) AS stored_rev
+           FROM spec s
+          WHERE s.id = $1`,
+        [specId, action.id],
+      );
+      expect(committed.rows[0]).toEqual({
+        current_doc_seq: "2",
+        updates: "2",
+        actions: "1",
+        stored_rev: "2",
+      });
+
+      const replay = await documents.mutateDocumentWithTrackedEdit(
+        specId,
+        "agent:session:call",
+        action,
+        () => {
+          throw new Error("a replay must not resolve the changed range");
+        },
+      );
+      expect(replay.status).toBe("replayed");
+      expect(replay.action.result).toEqual({
+        applied: true,
+        newRev: 2n,
+        concurrentEditors: ["Sam"],
+        transcriptChip: action.chip,
+      });
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
     "a stale draft update cannot persist after publication",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");

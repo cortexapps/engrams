@@ -1,0 +1,1 @@
+ALTER TABLE "spec_transcript_action" ADD COLUMN "result" jsonb;

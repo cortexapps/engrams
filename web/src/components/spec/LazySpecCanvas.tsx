@@ -1,13 +1,22 @@
 import { lazy, Suspense } from "react";
 
 import { Skeleton } from "@/components/ui/skeleton";
+import type { SpecSelectionActions } from "./SpecSelectionActions";
 
 const SpecCanvas = lazy(() =>
   import("./SpecCanvas").then((module) => ({ default: module.SpecCanvas })),
 );
 
 /** Keep the editor, Yjs, and ProseMirror out of the main application bundle. */
-export function LazySpecCanvas({ specId }: { specId: string }) {
+export function LazySpecCanvas({
+  specId,
+  revision,
+  selectionActions,
+}: {
+  specId: string;
+  revision: string;
+  selectionActions?: SpecSelectionActions;
+}) {
   return (
     <Suspense
       fallback={
@@ -18,7 +27,7 @@ export function LazySpecCanvas({ specId }: { specId: string }) {
         </div>
       }
     >
-      <SpecCanvas specId={specId} />
+      <SpecCanvas specId={specId} revision={revision} selectionActions={selectionActions} />
     </Suspense>
   );
 }

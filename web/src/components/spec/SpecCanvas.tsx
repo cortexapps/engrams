@@ -10,6 +10,7 @@ import { useAuth } from "@/auth/AuthProvider";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SpecPresence } from "./SpecPresence";
+import { SpecSelectionBubbleMenu, type SpecSelectionActions } from "./SpecSelectionActions";
 import { specNodeExtensions } from "./extensions";
 import "./spec-canvas.css";
 
@@ -26,7 +27,16 @@ interface CreateSpecProviderOptions {
   WebSocketPolyfill?: WebSocketProviderOptions["WebSocketPolyfill"];
 }
 
-export function SpecCanvas({ specId }: { specId: string }) {
+export function SpecCanvas({
+  specId,
+  revision,
+  selectionActions,
+}: {
+  specId: string;
+  revision: string;
+  /** Supply this only when the current user can send selection actions. */
+  selectionActions?: SpecSelectionActions;
+}) {
   const { principal } = useAuth();
   const [connection, setConnection] = useState<SpecConnection | null>(null);
   const [synced, setSynced] = useState(false);
@@ -63,15 +73,29 @@ export function SpecCanvas({ specId }: { specId: string }) {
     );
   }
 
-  return <ConnectedSpecCanvas connection={connection} user={user} />;
+  return (
+    <ConnectedSpecCanvas
+      connection={connection}
+      user={user}
+      specId={specId}
+      revision={revision}
+      selectionActions={selectionActions}
+    />
+  );
 }
 
 function ConnectedSpecCanvas({
   connection,
   user,
+  specId,
+  revision,
+  selectionActions,
 }: {
   connection: SpecConnection;
   user: { name: string; color: string };
+  specId: string;
+  revision: string;
+  selectionActions?: SpecSelectionActions;
 }) {
   const extensions = useMemo(
     () => [
@@ -127,6 +151,15 @@ function ConnectedSpecCanvas({
         </div>
         <SpecPresence awareness={connection.provider.awareness} />
       </div>
+      {selectionActions && (
+        <SpecSelectionBubbleMenu
+          editor={editor}
+          doc={connection.doc}
+          specId={specId}
+          revision={revision}
+          actions={selectionActions}
+        />
+      )}
       <EditorContent editor={editor} />
     </div>
   );

@@ -1,7 +1,10 @@
-import { fireEvent, screen } from "@testing-library/react";
+import { createRouterTransport } from "@connectrpc/connect";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { SpecSelectionAction, SpecSelectionActionPayload } from "@engrams/spec-document";
 
 import { renderWithProviders } from "@/test-utils";
+import { SessionService } from "@/gen/engram/app/v1/session_pb";
 import { SpecReadPage } from "./SpecReadPage";
 
 const view: {
@@ -35,9 +38,40 @@ const older = {
 const restoreMutate = vi.fn();
 const readRefetch = vi.fn();
 
+const actionPayload = (action: SpecSelectionAction): SpecSelectionActionPayload => ({
+  specId: "spec-1",
+  action,
+  instruction: action === "custom" ? "Use a bounded retry." : `${action} instruction`,
+  span: {
+    specId: "spec-1",
+    sectionId: "failure-modes",
+    revision: "17",
+    startAnchor: "start-anchor",
+    endAnchor: "end-anchor",
+    selectedText: "Retry forever.",
+    sliceFingerprint: "a".repeat(64),
+  },
+});
+
 vi.mock("@/components/spec", () => ({
-  LazySpecCanvas: ({ specId }: { specId: string }) => (
-    <div aria-label="Collaborative spec canvas">{specId}</div>
+  LazySpecCanvas: ({
+    specId,
+    revision,
+    selectionActions,
+  }: {
+    specId: string;
+    revision: string;
+    selectionActions?: { onAction: (payload: SpecSelectionActionPayload) => void };
+  }) => (
+    <div aria-label="Collaborative spec canvas">
+      {specId}:{revision}
+      {selectionActions &&
+        (["refine", "wrong", "cut", "ask", "custom"] as const).map((action) => (
+          <button key={action} onClick={() => selectionActions.onAction(actionPayload(action))}>
+            action-{action}
+          </button>
+        ))}
+    </div>
   ),
 }));
 
@@ -51,6 +85,7 @@ vi.mock("@/hooks/useSpecRead", () => ({
         sessionId: view.sessionId,
         publishedCheckpointId: view.publishedCheckpointId,
         publishedAt: view.lifecycle === "published" ? pinned.createdAt : null,
+        revision: "17",
       },
       checkpoints: [
         {
@@ -95,7 +130,9 @@ describe("SpecReadPage", () => {
   it("joins a draft through the existing lazy canvas without collaborator chat", async () => {
     renderWithProviders(<SpecReadPage specId="spec-1" />);
 
-    expect((await screen.findByLabelText("Collaborative spec canvas")).textContent).toBe("spec-1");
+    expect((await screen.findByLabelText("Collaborative spec canvas")).textContent).toBe(
+      "spec-1:17",
+    );
     expect(screen.getByText("Live draft")).toBeTruthy();
     expect(screen.queryByText("Open owner session")).toBeNull();
   });
@@ -130,6 +167,59 @@ describe("SpecReadPage", () => {
 
     const link = await screen.findByRole("link", { name: "Open owner session" });
     expect(link.getAttribute("href")).toBe("/sessions/session-1");
+  });
+
+  it.each(["refine", "wrong", "cut", "ask", "custom"] as const)(
+    "sends the complete %s selection through the owner session",
+    async (action) => {
+      view.sessionId = "session-1";
+      const sent: Array<{ sessionId: string; text: string; promptId: string }> = [];
+      const transport = createRouterTransport((router) => {
+        router.service(SessionService, {
+          sendPrompt: (request) => {
+            sent.push({
+              sessionId: request.sessionId,
+              text: request.text,
+              promptId: request.promptId,
+            });
+            return { sessionId: request.sessionId, note: "accepted" };
+          },
+        });
+      });
+      renderWithProviders(<SpecReadPage specId="spec-1" />, { transport });
+
+      fireEvent.click(await screen.findByRole("button", { name: `action-${action}` }));
+      await waitFor(() => expect(sent).toHaveLength(1));
+
+      expect(sent[0]!.sessionId).toBe("session-1");
+      expect(sent[0]!.promptId).not.toBe("");
+      for (const expected of [
+        `"action": "${action}"`,
+        '"spec_id": "spec-1"',
+        '"section_id": "failure-modes"',
+        '"selection_spec_id": "spec-1"',
+        '"selection_revision": "17"',
+        '"selection_start": "start-anchor"',
+        '"selection_end": "end-anchor"',
+        '"selection_text": "Retry forever."',
+        `"selection_fingerprint": "${"a".repeat(64)}"`,
+      ]) {
+        expect(sent[0]!.text).toContain(expected);
+      }
+      if (action === "ask") {
+        expect(sent[0]!.text).toContain("Answer in chat");
+        expect(sent[0]!.text).not.toContain("Call spec_update_section once");
+      } else {
+        expect(sent[0]!.text).toContain("Call spec_update_section once");
+      }
+    },
+  );
+
+  it("does not give a collaborator an agent-driving action handler", async () => {
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    expect(await screen.findByLabelText("Collaborative spec canvas")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "action-refine" })).toBeNull();
   });
 
   it("compares two checkpoints and restores one selected checkpoint section", async () => {

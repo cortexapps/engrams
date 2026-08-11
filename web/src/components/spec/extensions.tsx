@@ -158,8 +158,10 @@ export function sectionIds(doc: ProseMirrorNode): string[] | null {
 export function hasSameSectionStructure(before: ProseMirrorNode, after: ProseMirrorNode): boolean {
   const beforeIds = sectionIds(before);
   const afterIds = sectionIds(after);
+  // Tiptap creates one placeholder section before Collaboration reads Yjs.
+  // Permit only the first transition from that invalid placeholder to server data.
+  if (beforeIds === null) return afterIds !== null;
   return (
-    beforeIds !== null &&
     afterIds !== null &&
     beforeIds.length === afterIds.length &&
     beforeIds.every((id, index) => id === afterIds[index])
