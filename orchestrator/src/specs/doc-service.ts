@@ -1222,7 +1222,6 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query("SELECT set_config('engrams.semantic_revision_writer', '1', true)");
       let actorUserId: string | null | undefined;
       if (clientId !== null && participantEpoch !== undefined) {
         const participant = await client.query<{ user_id: string | null }>(
@@ -1385,7 +1384,6 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query("SELECT set_config('engrams.semantic_revision_writer', '1', true)");
       const revision = await client.query<{
         current_doc_seq: string;
         current_semantic_doc_seq: string;
