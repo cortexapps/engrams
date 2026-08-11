@@ -1109,6 +1109,17 @@ if sandbox_backend == 'process' and process_bootstrap_command:
 # keeps its state. Tilt only restarts this resource when dependency metadata
 # changes, which reruns pnpm install before Vite starts again.
 #
+# The install is `--offline`: it resolves from the pnpm store and never
+# contacts the registry. dev-engrams captures its base snapshot with egress
+# DENIED, and a plain `pnpm install` stalls there until the warm hook's 180s
+# web-readiness budget expires, which aborts the capture. Offline is not a
+# workaround for the sandbox alone — `web/` links `@engrams/spec-document`
+# with `file:`, which defeats pnpm's "lockfile is up to date, skip
+# resolution" fast path, so EVERY plain install re-resolves ~750 packages
+# against the network. Cost of the flag: after you edit web/package.json,
+# run `pnpm install` yourself once to fetch the new package; Tilt then
+# starts Vite from the store.
+#
 # The vite proxy now targets the orchestrator (:8787) for /rpc + /api,
 # so the web depends on `orchestrator` (not the coordinator directly).
 #
@@ -1122,7 +1133,7 @@ if not skip_web:
     if sandbox_backend == 'process' and process_bootstrap_command:
         web_resource_deps.append('process-dev-bootstrap')
     local_resource('web',
-        serve_cmd='cd web && pnpm install --silent && pnpm dev --strictPort',
+        serve_cmd='cd web && pnpm install --offline --silent && pnpm dev --strictPort',
         deps=['web/package.json', 'web/pnpm-lock.yaml'],
         resource_deps=web_resource_deps,
         # See the coordinator probe above — same loopback port-pool
