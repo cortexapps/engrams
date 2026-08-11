@@ -20,6 +20,7 @@ import {
 import {
   decodeSpecSyncMessage,
   encodeAwarenessState,
+  encodeSyncStep1,
   encodeSyncUpdate,
 } from "../routes/spec-sync-protocol.ts";
 import { SpecParticipantLeaseStaleError } from "../specs/doc-service.ts";
@@ -67,6 +68,7 @@ async function listenForSpecSync(input: {
   awarenessBus?: SpecAwarenessBus;
   onWarning?: (message: string) => void;
   membershipError?: Error;
+  draft?: boolean;
 }) {
   const app = new Hono();
   const nodeWs = createNodeWebSocket({ app });
@@ -87,6 +89,7 @@ async function listenForSpecSync(input: {
       if (input.membershipError) throw input.membershipError;
       return input.member;
     },
+    resolveDraft: async () => input.draft ?? true,
     onWarning: input.onWarning,
   };
   const hub = new SpecSyncHub(deps);
@@ -192,6 +195,14 @@ describe("the spec sync UpgradeHook", () => {
 
   test("rejects a non-member with close code 4404", async () => {
     const port = await listenForSpecSync({ member: false });
+    const client = new WebSocketClient(
+      `ws://127.0.0.1:${port}/api/v1/specs/${SPEC_ONE}/sync?clientId=42`,
+    );
+    expect(await waitForClose(client)).toBe(4404);
+  });
+
+  test("rejects a published spec with the same not-found close code", async () => {
+    const port = await listenForSpecSync({ member: true, draft: false });
     const client = new WebSocketClient(
       `ws://127.0.0.1:${port}/api/v1/specs/${SPEC_ONE}/sync?clientId=42`,
     );
@@ -364,6 +375,7 @@ describe("the spec sync UpgradeHook", () => {
     ]);
     browserAwareness.setLocalStateField("cursor", { anchor: 8, head: 8 });
     intendedSocket.emit("message", encodeAwarenessState(browserAwareness), true);
+    await eventually(() => readAwarenessState(intendedSocket, 42)?.cursor?.anchor === 8);
     timers.tick();
     intendedSocket.emit("pong");
 
@@ -442,12 +454,7 @@ describe("the spec sync UpgradeHook", () => {
     await eventually(() => readAwarenessState(observerSocket, 42)?.cursor?.anchor === 4);
 
     awareness.dropNextParticipantConnected();
-    await replacementHub.connect(
-      SPEC_SHARED,
-      "42",
-      { id: "member" },
-      replacementSocket,
-    );
+    await replacementHub.connect(SPEC_SHARED, "42", { id: "member" }, replacementSocket);
     browserAwareness.setLocalStateField("cursor", { anchor: 8, head: 8 });
     replacementSocket.emit("message", encodeAwarenessState(browserAwareness), true);
     await eventually(() => readAwarenessState(observerSocket, 42)?.cursor?.anchor === 8);
@@ -796,6 +803,44 @@ describe("the spec sync UpgradeHook", () => {
     expect(unsubscribes).toBe(1);
     expect(timers.size).toBe(0);
   });
+
+  test("answers a sync frame received during the participant bind", async () => {
+    const socket = new SilentSpecSocket();
+    const clientDocument = new Y.Doc();
+    let connectStarted = false;
+    let finishConnect = () => {};
+    const participantGate = new Promise<void>((resolve) => {
+      finishConnect = resolve;
+    });
+    const hub = new SpecSyncHub({
+      documents: fakeDocuments(),
+      participants: {
+        connect: async () => {
+          connectStarted = true;
+          await participantGate;
+          return 1n;
+        },
+        renew: async () => true,
+        disconnect: async () => {},
+      },
+      awarenessBus: fakeAwarenessBus(),
+    });
+    cleanups.push(async () => {
+      clientDocument.destroy();
+      await hub.stop();
+    });
+
+    const connecting = hub.connect(SPEC_ONE, "42", { id: "member" }, socket);
+    await eventually(() => connectStarted);
+    socket.emit("message", encodeSyncStep1(clientDocument), true);
+    finishConnect();
+    await connecting;
+
+    expect(socket.messages.map((message) => decodeSpecSyncMessage(message).kind)).toEqual([
+      "sync-update",
+      "sync-step-1",
+    ]);
+  });
 });
 
 describe("SpecSyncHub awareness failures", () => {
@@ -924,6 +969,7 @@ class SilentSpecSocket extends EventEmitter {
   pings = 0;
   terminations = 0;
   readonly sent: Uint8Array[] = [];
+  readonly messages = this.sent;
 
   send(data: Uint8Array): void {
     this.sent.push(data.slice());

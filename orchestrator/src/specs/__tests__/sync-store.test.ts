@@ -286,6 +286,7 @@ describe("PostgresSpecParticipantStore", () => {
         await client.query(
           `CREATE TABLE spec (
              id uuid PRIMARY KEY,
+             lifecycle text NOT NULL,
              current_doc_seq bigint DEFAULT 0 NOT NULL,
              updated_at timestamptz NOT NULL
            )`,
@@ -300,8 +301,8 @@ describe("PostgresSpecParticipantStore", () => {
            )`,
         );
         await client.query(
-          `INSERT INTO spec (id, current_doc_seq, updated_at)
-           VALUES ($1, 0, $2)`,
+          `INSERT INTO spec (id, lifecycle, current_doc_seq, updated_at)
+           VALUES ($1, 'draft', 0, $2)`,
           [specId, initialTime],
         );
         await client.query(
