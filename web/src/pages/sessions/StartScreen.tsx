@@ -277,7 +277,11 @@ export function StartScreen() {
         ),
     );
   }, [selected, views, credentials]);
-  const credentialMissing = userEnvMissing || oauthMissing || connectorsMissing.length > 0;
+  // ADR 0115 amendment: a missing PERSONAL integration credential warns but
+  // does not block — the server disables those integrations for the session.
+  // Only the harness credential still gates the launch.
+  const credentialMissing = userEnvMissing || oauthMissing;
+  const showCredentialBox = credentialMissing || connectorsMissing.length > 0;
 
   const canLaunch =
     !!selected &&
@@ -401,7 +405,7 @@ export function StartScreen() {
             Start a task
           </Text>
 
-          {credentialMissing && (
+          {showCredentialBox && (
             <div className="flex flex-col gap-1.5 rounded-lg border border-instrument-caution/40 bg-secondary/60 px-3 py-2.5 text-sm">
               <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5">
                 <span className="flex items-center gap-2">
@@ -421,8 +425,9 @@ export function StartScreen() {
                   ) : (
                     <>
                       {connectorsMissing.map((view) => view.name).join(", ")}{" "}
-                      {connectorsMissing.length === 1 ? "needs" : "need"} your personal credential —
-                      this profile runs {connectorsMissing.length === 1 ? "it" : "them"} as you.
+                      {connectorsMissing.length === 1 ? "is" : "are"} turned off for this session —
+                      this profile runs {connectorsMissing.length === 1 ? "it" : "them"} as you, and
+                      you haven&apos;t connected a personal credential.
                     </>
                   )}
                 </span>

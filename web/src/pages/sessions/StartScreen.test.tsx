@@ -302,9 +302,9 @@ describe("StartScreen", () => {
     }
   });
 
-  // ADR 0115: a profile that runs an integration as the launching user blocks
-  // launch until their personal credential is connected AND healthy.
-  test("blocks launch when a user-scoped integration credential is missing", async () => {
+  // ADR 0115 amendment: a missing personal credential WARNS (the integration
+  // is disabled server-side for the session) but never blocks the launch.
+  test("warns without blocking when a user-scoped integration credential is missing", async () => {
     localStorage.setItem("engrams:lastProfileId", "pf4");
     const origFetch = global.fetch;
     global.fetch = (async (url: string | URL | Request) => {
@@ -328,16 +328,19 @@ describe("StartScreen", () => {
       const user = userEvent.setup();
 
       expect(await screen.findByText("Personal-creds agent")).toBeTruthy();
-      expect(await screen.findByText(/GitHub needs your personal credential/i)).toBeTruthy();
+      expect(await screen.findByText(/GitHub is turned off for this session/i)).toBeTruthy();
       // The connector's PAT setup hint rides the banner.
       expect(screen.getByText(/fine-grained PAT/i)).toBeTruthy();
       expect(screen.getByRole("link", { name: /add credential/i }).getAttribute("href")).toBe(
         "/settings/credentials",
       );
+      // The warning does NOT gate the launch: the session starts with the
+      // integration disabled.
       await user.type(screen.getByLabelText("Task"), "Do the thing.");
-      expect((screen.getByTestId("launch-task") as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByTestId("launch-task") as HTMLButtonElement).disabled).toBe(false);
       await user.click(screen.getByTestId("launch-task"));
-      expect(created).toHaveLength(0);
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0]!.profileId).toBe("pf4");
     } finally {
       global.fetch = origFetch;
     }
@@ -378,7 +381,7 @@ describe("StartScreen", () => {
       const user = userEvent.setup();
 
       expect(await screen.findByText("Personal-creds agent")).toBeTruthy();
-      expect(screen.queryByText(/needs your personal credential/i)).toBeNull();
+      expect(screen.queryByText(/turned off for this session/i)).toBeNull();
       await user.type(screen.getByLabelText("Task"), "Do the thing.");
       await user.click(screen.getByTestId("launch-task"));
       await waitFor(() => expect(created).toHaveLength(1));
