@@ -102,6 +102,30 @@ describe("SpecTemplates", () => {
     expect(screen.getByText("Modified from default")).toBeTruthy();
   });
 
+  test("an admin can type multiple done criteria", async () => {
+    state.isAdmin = true;
+    render(<SpecTemplates />);
+    const criteria = (await screen.findByLabelText("Done criteria")) as HTMLTextAreaElement;
+
+    fireEvent.change(criteria, { target: { value: " First criterion \n" } });
+    expect(criteria.value).toBe(" First criterion \n");
+    fireEvent.change(criteria, { target: { value: " First criterion \nSecond criterion " } });
+    fireEvent.click(screen.getByRole("button", { name: "Save template" }));
+
+    await waitFor(() => expect(state.save).toHaveBeenCalledTimes(1));
+    expect(state.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        definition: expect.objectContaining({
+          sections: [
+            expect.objectContaining({
+              doneCriteria: ["First criterion", "Second criterion"],
+            }),
+          ],
+        }),
+      }),
+    );
+  });
+
   test("an admin can restore and clone the built-in template", async () => {
     state.isAdmin = true;
     render(<SpecTemplates />);

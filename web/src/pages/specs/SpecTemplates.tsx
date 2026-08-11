@@ -77,7 +77,10 @@ export function SpecTemplates() {
 
   async function saveDraft() {
     if (!draft) return;
-    const saved = await save.mutateAsync({ id: creating ? null : selectedId, definition: draft });
+    const saved = await save.mutateAsync({
+      id: creating ? null : selectedId,
+      definition: normalizeDefinitionForSave(draft),
+    });
     setCreating(false);
     setSelectedId(saved.id);
     setDraft(definitionOf(saved));
@@ -522,10 +525,7 @@ function SectionEditor({
             placeholder="One criterion per line"
             onChange={(event) =>
               onChange({
-                doneCriteria: event.target.value
-                  .split("\n")
-                  .map((line) => line.trim())
-                  .filter(Boolean),
+                doneCriteria: event.target.value.split("\n"),
               })
             }
           />
@@ -681,6 +681,16 @@ function definitionOf(template: SpecTemplateDefinition): SpecTemplateDefinition 
     layers: structuredClone(template.layers),
     sections: structuredClone(template.sections),
     stageFlags: structuredClone(template.stageFlags),
+  };
+}
+
+function normalizeDefinitionForSave(definition: SpecTemplateDefinition): SpecTemplateDefinition {
+  return {
+    ...definition,
+    sections: definition.sections.map((section) => ({
+      ...section,
+      doneCriteria: section.doneCriteria.map((line) => line.trim()).filter(Boolean),
+    })),
   };
 }
 
