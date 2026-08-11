@@ -210,12 +210,14 @@ describe("useSessionEvents — the windowed open sequence", () => {
     const floor = result.current.oldestIdx!;
     expect(floor).toBeGreaterThan(0);
 
-    // Below the floor the spine carries the conversation; the heavy tool kinds
-    // are deferred to the window.
+    // Below the floor the spine carries the run SKELETON only: the heavy tool
+    // kinds AND the conversation prose are deferred to the window, so the page
+    // opens a few screens tall instead of as tall as the whole log.
     const below = result.current.events.filter((e) => e.idx < floor);
     expect(below.length).toBeGreaterThan(0);
     expect(below.some((e) => e.event.type === "run_started")).toBe(true);
     expect(below.some((e) => e.event.type === "tool_call_completed")).toBe(false);
+    expect(below.some((e) => e.event.type === "agent_message")).toBe(false);
     // The window edge sits ON a run boundary, so no turn is cut in half.
     expect(result.current.events.find((e) => e.idx === floor)!.event.type).toBe("run_started");
     expect(h.since).toBe(h.log.length - 1);

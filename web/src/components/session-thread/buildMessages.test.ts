@@ -2141,6 +2141,111 @@ describe("buildMessages — a WINDOWED transcript (lib/sessionWindow.ts)", () =>
     expect(footer!.interrupted).toBe(false);
   });
 
+  // Conversation prose is windowed too (lib/sessionWindow.ts), and the user
+  // echo IS prose — the wire filters on kind, not role, so a run below the
+  // floor arrives as its `run_started` alone. The turn must not render as an
+  // EMPTY bubble; `prompt_summary` is the fallback when the harness sets it,
+  // and nothing renders when it does not.
+  test("a run whose echo is not loaded falls back to prompt_summary", () => {
+    const { messages } = buildMessages(
+      atIdx(0, [
+        {
+          type: "run_started",
+          run_id: "r-old",
+          prompt_id: "p-old",
+          prompt_summary: "fix the flaky test (truncated on the wire)",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r-old", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const users = real(messages).filter((m) => m.role === "user");
+    expect(users).toHaveLength(1);
+    expect(users[0]).toMatchObject({
+      id: "p-old",
+      content: [{ type: "text", text: "fix the flaky test (truncated on the wire)" }],
+    });
+  });
+
+  test("a run with neither echo nor summary renders NO bubble, not an empty one", () => {
+    // The state every harness is in today (`prompt_summary` is null on
+    // purpose). An unloaded turn has to be absent, not a blank grey box.
+    const { messages } = buildMessages(
+      atIdx(0, [
+        { type: "run_started", run_id: "r-old", prompt_id: "p-old", prompt_summary: null, at: AT },
+        { type: "run_completed", run_id: "r-old", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    expect(real(messages)).toHaveLength(0);
+  });
+
+  test("the loaded echo beats the summary — one bubble, the FULL prompt", () => {
+    const { messages } = buildMessages(
+      atIdx(0, [
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "fix the flaky test, and explain why it flaked",
+          prompt_id: "p-old",
+          at: AT,
+        },
+        {
+          type: "run_started",
+          run_id: "r-old",
+          prompt_id: "p-old",
+          prompt_summary: "fix the flaky test (truncated on the wire)",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r-old", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const users = real(messages).filter((m) => m.role === "user");
+    expect(users).toHaveLength(1);
+    expect(users[0]!.content).toEqual([
+      { type: "text", text: "fix the flaky test, and explain why it flaked" },
+    ]);
+  });
+
+  test("the summary fallback keeps the 68c70a65 inversion intact — one bubble, full text", () => {
+    // run_started BEFORE its echo (prod 68c70a65). The pre-scanned echo still
+    // wins over the summary, and the ADR 0108 trailing render must not add a
+    // second bubble for the same prompt_id (the duplicate-id crash).
+    const { messages } = buildMessages(
+      atIdx(0, [
+        {
+          type: "run_started",
+          run_id: "r1",
+          prompt_id: "p1",
+          prompt_summary: "are you there? (summary)",
+          at: AT,
+        },
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "are you there?",
+          prompt_id: "p1",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    expect(real(messages).filter((m) => m.id === "p1")).toHaveLength(1);
+    const user = real(messages).find((m) => m.role === "user");
+    expect(user!.content).toEqual([{ type: "text", text: "are you there?" }]);
+  });
+
   test("the spine keeps the plan ordinals and the file-change rollup whole", () => {
     // A spine holds every cheap kind from idx 0 plus the structural tool calls
     // — but NOT the generic tool rows the window carries. The whole-session

@@ -15,7 +15,8 @@
 //     plan proposal, a question, the agent's task list). It keeps the
 //     whole-session folds honest: the file-change rollup, the plan ordinals,
 //     the composer mode chip and the queued-prompt rail all read the log from
-//     its start.
+//     its start. The spine carries whole-session FACTS, not conversation
+//     PROSE — see `OFF_SPINE_KINDS`.
 //   - the WINDOW — the newest ~200 events, UNFILTERED, so the tail the reader
 //     actually looks at keeps full tool detail. A 200-event tail is 152 KB.
 //     `loadOlder` prepends one more window per backfill.
@@ -29,6 +30,11 @@
 // window floor stays invisible until the reader backfills that window, so an
 // old card can read as unresolved. The card that MATTERS — the newest, still
 // pending one — is at the tail by construction, inside the window.
+//
+// Known limit: a run below the window floor is not narrated at all until the
+// reader backfills it — its `run_started` is loaded, but the prompt and the
+// answer are not. That is the point: the session opens on its LAST page and
+// grows upward.
 
 import { parseEventFrame } from "../events";
 import { SESSION_EVENT_KINDS } from "../sse";
@@ -60,6 +66,33 @@ const HEAVY_TOOL_KINDS: ReadonlySet<string> = new Set([
   "tool_result_submitted",
 ]);
 
+/** Kinds the spine does NOT read in full. The heavy tool kinds are here for
+ *  their BYTES; `agent_message` is here for its HEIGHT.
+ *
+ *  A spine that held `agent_message` sent few bytes but made the page as TALL
+ *  as an unwindowed one: `buildMessages` folds a run's prose into ONE assistant
+ *  bubble, so a 10 251-event session still rendered 13 bubbles up to 14 036 px
+ *  tall — a 157 744 px transcript, identical to the unwindowed page. The
+ *  product is "open on the LAST page and grow upward as the reader scrolls",
+ *  so conversation TEXT has to be windowed too, not only tool detail.
+ *
+ *  What stays is the run SKELETON — `run_started` / `run_completed` /
+ *  `run_interrupted` and the prompt_* kinds, all tiny — because the window
+ *  edges snap to it, plus the kinds the whole-session folds read (file changes,
+ *  mode, plan ordinals, the queued-prompt rail).
+ *
+ *  Consequence, and it is the intended one: a run below the window floor shows
+ *  NOTHING until the reader backfills it. The user's prompt rides
+ *  `agent_message{role:"user"}` and the wire filters on kind, not role, so it
+ *  is deferred with the rest of that turn. `run_started.prompt_summary` would
+ *  be a cheap stand-in and `buildMessages` uses it when it is set — but every
+ *  harness sets it to `None` on purpose today (it would render the prompt twice
+ *  beside the echo), so in practice the turn simply is not loaded yet. */
+const OFF_SPINE_KINDS: ReadonlySet<string> = new Set<string>([
+  ...HEAVY_TOOL_KINDS,
+  "agent_message",
+]);
+
 /** Tools whose CALL is conversation structure — a plan card, a question card,
  *  the agent's task list — so the spine keeps them from idx 0. Claude exposes
  *  a registered tool as `mcp__engrams__<name>` while a generic request event
@@ -73,7 +106,7 @@ export const SPINE_TOOL_NAMES: readonly string[] = STRUCTURAL_TOOLS.flatMap((nam
 
 /** Cheap kinds in full, plus the two tool kinds the tool-name filter narrows. */
 export const SPINE_KINDS: readonly string[] = [
-  ...SESSION_EVENT_KINDS.filter((kind) => !HEAVY_TOOL_KINDS.has(kind)),
+  ...SESSION_EVENT_KINDS.filter((kind) => !OFF_SPINE_KINDS.has(kind)),
   "tool_call_requested",
   "tool_call_started",
 ];

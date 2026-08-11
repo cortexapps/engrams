@@ -698,8 +698,28 @@ export function buildMessages(
           // appended AFTER this run_started, `heldUserText` is empty here but the
           // pre-scan still has the text, so the user turn renders instead of
           // vanishing.
+          //
+          // Last fall back to this event's OWN `prompt_summary`. The echo is an
+          // `agent_message`, which the windowed read keeps OUT of the spine
+          // (lib/sessionWindow.ts), so a run BELOW the window floor has no echo
+          // loaded and the turn would otherwise render as empty text. The
+          // summary is truncated to ~1 KB on the wire — the right trade for a
+          // turn that is not loaded, since the full prompt replaces it the
+          // moment the reader backfills that window (same `prompt_id`, so the
+          // bubble changes in place). The ORDER matters: every earlier source is
+          // the FULL text, so the summary is used only when nothing better is
+          // loaded and can never double-render beside a present echo.
+          //
+          // Today this is a safety net, not a live path: every harness sets
+          // `prompt_summary` to null on purpose (it would render the prompt
+          // twice beside the echo), so an unloaded turn shows nothing at all
+          // until it is backfilled.
           const text =
-            held?.text ?? userEchoByPromptId.get(ev.prompt_id) ?? queued.get(ev.prompt_id) ?? "";
+            held?.text ??
+            userEchoByPromptId.get(ev.prompt_id) ??
+            queued.get(ev.prompt_id) ??
+            ev.prompt_summary ??
+            "";
           if (text) {
             out.push({
               role: "user",

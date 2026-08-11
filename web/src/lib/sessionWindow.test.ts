@@ -75,14 +75,41 @@ function fixtureLister(log: Wire[]) {
 }
 
 /** A fixture session: runs of prose + Read tool pairs, like a real transcript
- *  (the tool kinds are the bytes the window exists to defer). */
-function fixtureLog(toolsPerRun: number[]): { log: Wire[]; runStarts: number[] } {
+ *  (the tool kinds are the bytes the window exists to defer). With `echoes`,
+ *  each turn also opens with the reader's own prompt — a `role:"user"`
+ *  agent_message, which is how the real coordinator records it. */
+function fixtureLog(
+  toolsPerRun: number[],
+  echoes = false,
+): { log: Wire[]; runStarts: number[]; echoIdxs: number[] } {
   const log: Wire[] = [];
   const runStarts: number[] = [];
+  const echoIdxs: number[] = [];
   toolsPerRun.forEach((tools, r) => {
     const runId = `r${r}`;
+    if (echoes) {
+      echoIdxs.push(log.length);
+      log.push(
+        wire(log.length, "agent_message", {
+          run_id: "",
+          message_id: `u${r}`,
+          role: "user",
+          text: `ask ${r}`,
+          prompt_id: `p${r}`,
+        }),
+      );
+    }
     runStarts.push(log.length);
-    log.push(wire(log.length, "run_started", { run_id: runId, prompt_summary: `prompt ${r}` }));
+    log.push(
+      wire(log.length, "run_started", {
+        run_id: runId,
+        // Every harness sets this to null on purpose (it would double-render
+        // the prompt beside the echo), so a fixture that pretends otherwise
+        // would test a wire that does not exist.
+        prompt_summary: null,
+        prompt_id: echoes ? `p${r}` : null,
+      }),
+    );
     log.push(
       wire(log.length, "agent_message", {
         run_id: runId,
@@ -114,7 +141,7 @@ function fixtureLog(toolsPerRun: number[]): { log: Wire[]; runStarts: number[] }
     }
     log.push(wire(log.length, "run_completed", { run_id: runId, ok: true }));
   });
-  return { log, runStarts };
+  return { log, runStarts, echoIdxs };
 }
 
 const kindsOf = (events: IndexedEvent[]) => new Set(events.map((e) => e.event.type));
@@ -200,6 +227,22 @@ describe("loadTranscript — the session-open sequence", () => {
     // The heavy kinds are NOT in the spine.
     expect(spineCall!.kinds).not.toContain("tool_call_completed");
     expect(spineCall!.kinds).not.toContain("tool_result_submitted");
+    // Neither is conversation PROSE: an `agent_message` costs few bytes but
+    // renders a full-height bubble, so a spine that held it made the page as
+    // tall as an unwindowed one. Prose belongs to the window.
+    expect(spineCall!.kinds).not.toContain("agent_message");
+    // The run SKELETON stays — it is tiny, and the window edges snap to it.
+    expect(spineCall!.kinds).toEqual(
+      expect.arrayContaining([
+        "run_started",
+        "run_completed",
+        "run_interrupted",
+        "prompt_queued",
+        "prompt_edited",
+        "prompt_dequeued",
+        "prompt_steered",
+      ]),
+    );
   });
 
   test("the tail window is the LAST page (before_idx = i64::MAX)", async () => {
@@ -235,10 +278,25 @@ describe("loadTranscript — the session-open sequence", () => {
     // Below the floor: spine kinds only. At and above it: full fidelity.
     const below = loaded.events.filter((e) => e.idx < loaded.floor!);
     const above = loaded.events.filter((e) => e.idx >= loaded.floor!);
-    expect(kindsOf(below)).toEqual(new Set(["run_started", "agent_message", "run_completed"]));
+    expect(kindsOf(below)).toEqual(new Set(["run_started", "run_completed"]));
     expect(kindsOf(above)).toContain("tool_call_completed");
-    // Every turn is still narrated, whatever the window holds.
+    expect(kindsOf(above)).toContain("agent_message");
+    // The run boundaries are still all there — the window edges snap to them.
     expect(below.filter((e) => e.event.type === "run_started").length).toBeGreaterThan(0);
+  });
+
+  test("conversation prose is WINDOWED — an older run keeps only its boundary", async () => {
+    // The point of the whole exercise: an open session must be a few screens
+    // tall, not the whole log. Prose is the HEIGHT, so a run below the floor
+    // arrives as its `run_started` (and its receipt) and nothing else — the
+    // reader's own prompt included, since the wire filters on kind, not role.
+    const { log: withEchoes } = fixtureLog([43, 60, 20, 30], true);
+    const { list } = fixtureLister(withEchoes);
+    const loaded = await loadTranscript(list);
+    const prose = loaded.events.filter((e) => e.event.type === "agent_message");
+    const proseInLog = withEchoes.filter((w) => w.kind === "agent_message");
+    expect(prose.length).toBeLessThan(proseInLog.length);
+    expect(prose.every((e) => e.idx >= loaded.floor!)).toBe(true);
   });
 
   test("`since` is the highest idx held, so the live tail continues from it", async () => {
