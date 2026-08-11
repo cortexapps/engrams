@@ -4,9 +4,16 @@ description = "OpenAI Codex coding agent. Human runs use a managed ChatGPT conne
 exec = "harness"
 
 # Hosts the harness itself must reach (ADR 0063 addendum): api.openai.com for
-# API-key runs, chatgpt.com for ChatGPT-token runs.
+# API-key runs, chatgpt.com for ChatGPT-token runs, and auth.openai.com so a
+# ChatGPT access token can be REFRESHED in the guest. Codex refreshes at
+# auth.openai.com/oauth/token and rewrites its auth cache; the harness watcher
+# then pushes the new bundle back (ForgeOp::UpdateOAuthCredential). Without this
+# host the refresh cannot complete, so the stored bundle rots and every turn
+# fails with 401 token_expired once the access token expires. There is no
+# server-side repair: the refresh scanner covers connector subjects only, so
+# this in-guest loop is the ONLY refresh path a user credential has.
 [egress]
-allow_hosts = ["api.openai.com", "chatgpt.com"]
+allow_hosts = ["api.openai.com", "auth.openai.com", "chatgpt.com"]
 
 [auth]
 org_env = "CODEX_API_KEY"
