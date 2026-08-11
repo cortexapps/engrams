@@ -407,6 +407,13 @@
       "when": 1786403806929,
       "tag": "0057_spec_tracked_edit_result",
       "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "7",
+      "when": 1786412678388,
+      "tag": "0058_spec_template_catalog",
+      "breakpoints": true
     }
   ]
 }

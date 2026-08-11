@@ -39,6 +39,7 @@ export type Subjects =
   | "Registry"
   | "Artifact"
   | "Spec"
+  | "SpecTemplate"
   | "all";
 
 // Typed subject shapes — used with CASL's `subject()` helper.

@@ -32,6 +32,9 @@ vi.mock("./pages/specs/SpecsLayout", async () => {
 vi.mock("./pages/specs/SpecsList", () => ({
   SpecsList: () => <div data-testid="tech-specs" />,
 }));
+vi.mock("./pages/specs/SpecTemplates", () => ({
+  SpecTemplates: () => <div data-testid="spec-templates" />,
+}));
 
 import { routeTree } from "./router";
 
@@ -87,4 +90,9 @@ test("redirects an authenticated member away from Tech Specs", async () => {
 test("routes an admin to the Tech Specs list", async () => {
   render(<RouterProvider router={makeTestRouter(ADMIN_AUTH, "/specs")} />);
   await screen.findByTestId("tech-specs");
+});
+
+test("routes an admin to the Templates catalog", async () => {
+  render(<RouterProvider router={makeTestRouter(ADMIN_AUTH, "/specs/templates")} />);
+  await screen.findByTestId("spec-templates");
 });
