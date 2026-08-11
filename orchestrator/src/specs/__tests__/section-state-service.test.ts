@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   SectionStateConflictError,
+  SectionStateReadOnlyError,
   SectionStateService,
   SectionStateTranscriptDrainer,
   type PersistSectionStateActionInput,
@@ -27,6 +28,7 @@ class MemorySectionStateStore implements SectionStateStore {
   value: SectionStateValue = { state: "empty", naReason: null };
   readonly actions = new Map<string, SectionStateTranscriptAction>();
   rejectWrite = false;
+  readOnly = false;
   rejectDeliveryMarkOnce = false;
   stateWrites = 0;
   docSeq = 1n;
@@ -44,6 +46,7 @@ class MemorySectionStateStore implements SectionStateStore {
   ): Promise<PersistSectionStateActionResult> {
     const existing = this.actions.get(input.actionId);
     if (existing) return { status: "replayed", action: existing };
+    if (this.readOnly) return { status: "read_only" };
     if (
       this.rejectWrite ||
       (input.expectedDocSeq !== undefined && input.expectedDocSeq !== this.docSeq) ||
@@ -144,6 +147,29 @@ describe("section state service", () => {
     expect(store.actions.get("deferred-action")?.deliveredAt).toEqual(
       new Date("2026-08-09T12:01:00.000Z"),
     );
+  });
+
+  test("defers an undo transcript chip for the same drainer", async () => {
+    const store = new MemorySectionStateStore();
+    const transcript = new MemoryTranscriptPublisher();
+    const service = serviceWith(store, transcript);
+    const drafted = await service.transitionDeferred({
+      actionId: "draft-before-undo",
+      context,
+      target: "drafted",
+      actorUserId: "user-1",
+    });
+
+    const undo = await service.undoDeferred({
+      actionId: "deferred-undo",
+      context,
+      undo: drafted.transcriptChip.undo,
+      actorUserId: "user-1",
+    });
+
+    expect(undo.value).toEqual({ state: "empty", naReason: null });
+    expect(store.actions.get("deferred-undo")?.deliveredAt).toBeNull();
+    expect(transcript.publications).toHaveLength(0);
   });
 
   test("publishes one durable chip after every persisted transition", async () => {
@@ -342,6 +368,24 @@ describe("section state service", () => {
     ).rejects.toBeInstanceOf(SectionStateConflictError);
     expect(store.actions.size).toBe(0);
     expect(transcript.publications).toHaveLength(0);
+  });
+
+  test("rejects a new action when the spec becomes read-only", async () => {
+    const store = new MemorySectionStateStore();
+    store.readOnly = true;
+    const transcript = new MemoryTranscriptPublisher();
+    const service = serviceWith(store, transcript);
+
+    await expect(
+      service.transitionDeferred({
+        actionId: "published-action",
+        context,
+        target: "drafted",
+        actorUserId: "user-1",
+      }),
+    ).rejects.toBeInstanceOf(SectionStateReadOnlyError);
+    expect(store.value.state).toBe("empty");
+    expect(store.actions.size).toBe(0);
   });
 
   test("does not change state at a stale expected document revision", async () => {

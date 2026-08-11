@@ -93,6 +93,7 @@ import { tools } from "./tools/registry.ts";
 import { renderReviewer } from "./reviewers/render.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
+import { makeSpecRailRoute, PostgresSpecRailStore } from "./routes/spec-rail.ts";
 import { productionSpecProjection } from "./specs/projection.ts";
 import { PostgresSpecCheckpointStore, SpecCheckpointService } from "./specs/checkpoints.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
@@ -107,12 +108,13 @@ const specDocuments = new SpecDocumentService(
   { onWarning: warnSpecDocument, now: specNow },
 );
 const specOpenQuestions = new PostgresOpenQuestionStore(getPool());
+const specSectionStates = new SectionStateService({
+  store: new PostgresSectionStateStore(getPool()),
+  now: specNow,
+});
 const specToolService = new SpecToolService({
   documents: specDocuments,
-  sectionStates: new SectionStateService({
-    store: new PostgresSectionStateStore(getPool()),
-    now: specNow,
-  }),
+  sectionStates: specSectionStates,
   questions: new OpenQuestionService({
     store: specOpenQuestions,
     document: new SpecQuestionDocument(specDocuments, "spec-agent-question"),
@@ -183,6 +185,15 @@ app.route(
     store: new PostgresSpecReadStore(getPool()),
     checkpointStore: specCheckpointStore,
     checkpoints: specCheckpoints,
+    resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecRailRoute({
+    store: new PostgresSpecRailStore(getPool()),
+    documents: specDocuments,
+    sectionStates: specSectionStates,
     resolveMembership: resolveSpecMembership,
   }),
 );

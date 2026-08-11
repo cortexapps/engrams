@@ -1,10 +1,16 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook } from "@testing-library/react";
+import { createElement, type PropsWithChildren } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook } from "@testing-library/react";
-import { createElement, type PropsWithChildren } from "react";
-
-import { restoreSpecSection, type SpecRequestError, useSpecRead } from "./useSpecRead";
+import {
+  restoreSpecSection,
+  setSpecSectionState,
+  type SpecRequestError,
+  useSetSpecSectionState,
+  useSpecRail,
+  useSpecRead,
+} from "./useSpecRead";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -120,3 +126,128 @@ function jsonResponse(value: unknown): Response {
     headers: { "content-type": "application/json" },
   });
 }
+
+describe("setSpecSectionState", () => {
+  it("sends one stable action ID and returns the transcript chip", async () => {
+    const responseBody = {
+      chip: {
+        kind: "spec_section_state_changed",
+        specId: "spec-1",
+        sectionId: "design",
+        sectionTitle: "Design",
+        before: { state: "drafted", naReason: null },
+        after: { state: "confirmed", naReason: null },
+        provisional: false,
+        undo: {
+          kind: "restore_section_state",
+          specId: "spec-1",
+          sectionId: "design",
+          expected: { state: "confirmed", naReason: null },
+          restore: { state: "drafted", naReason: null },
+        },
+      },
+      rail: { layers: [], completeness: { complete: 1, total: 1 }, frontierSectionId: null },
+    };
+    const fetchMock = vi.fn(() =>
+      Promise.resolve(
+        new Response(JSON.stringify(responseBody), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await setSpecSectionState(
+      "spec-1",
+      "design",
+      "confirmed",
+      undefined,
+      "00000000-0000-4000-8000-000000001118",
+    );
+
+    expect(result).toEqual(responseBody);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/specs/spec-1/sections/design/state",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          actionId: "00000000-0000-4000-8000-000000001118",
+          state: "confirmed",
+        }),
+      }),
+    );
+  });
+
+  it("keeps its action ID across a transport retry and invalidates server state", async () => {
+    const responseBody = {
+      chip: {
+        kind: "spec_section_state_changed",
+        specId: "spec-1",
+        sectionId: "design",
+        sectionTitle: "Design",
+        before: { state: "drafted", naReason: null },
+        after: { state: "confirmed", naReason: null },
+        provisional: false,
+        undo: {
+          kind: "restore_section_state",
+          specId: "spec-1",
+          sectionId: "design",
+          expected: { state: "confirmed", naReason: null },
+          restore: { state: "drafted", naReason: null },
+        },
+      },
+      rail: { layers: [], completeness: { complete: 1, total: 1 }, frontierSectionId: null },
+    };
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("The connection closed."))
+      .mockResolvedValue(jsonResponse(responseBody));
+    vi.stubGlobal("fetch", fetchMock);
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: 1, retryDelay: 0 }, queries: { retry: false } },
+    });
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: PropsWithChildren) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const actionId = "00000000-0000-4000-8000-000000001119";
+    const { result } = renderHook(() => useSetSpecSectionState("spec-1"), { wrapper });
+
+    act(() => {
+      result.current.mutate({ sectionId: "design", state: "confirmed", actionId });
+    });
+
+    await vi.waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    for (const call of fetchMock.mock.calls) {
+      const init = call[1] as RequestInit;
+      expect(JSON.parse(String(init.body))).toMatchObject({ actionId });
+    }
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["spec", "spec-1"] });
+    queryClient.clear();
+  });
+});
+
+describe("useSpecRail", () => {
+  it("polls server state while the spec is a draft", async () => {
+    vi.useFakeTimers();
+    const first = { layers: [], completeness: { complete: 0, total: 1 }, frontierSectionId: "a" };
+    const second = { layers: [], completeness: { complete: 1, total: 1 }, frontierSectionId: null };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ rail: first }))
+      .mockResolvedValue(jsonResponse({ rail: second }));
+    vi.stubGlobal("fetch", fetchMock);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["spec", "spec-1"], specReadResponse("draft"));
+    const wrapper = ({ children }: PropsWithChildren) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useSpecRail("spec-1"), { wrapper });
+
+    await vi.waitFor(() => expect(result.current.data?.completeness.complete).toBe(0));
+    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.waitFor(() => expect(result.current.data?.completeness.complete).toBe(1));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    queryClient.clear();
+  });
+});

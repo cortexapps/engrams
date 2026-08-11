@@ -6,6 +6,11 @@ import type { SpecSelectionActionPayload } from "@engrams/spec-document";
 
 import { CheckpointDiff } from "@/components/spec/CheckpointDiff";
 import { LazySpecCanvas } from "@/components/spec";
+import {
+  SectionStateTranscriptChip,
+  type SpecSectionStateChipData,
+} from "@/components/spec/SectionStateTranscriptChip";
+import { SpecSectionRail, type SpecRailAction } from "@/components/spec/SpecSectionRail";
 import { Markdown } from "@/components/Markdown";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -17,14 +22,18 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { sendPrompt as sendPromptMethod } from "@/gen/engram/app/v1/session-SessionService_connectquery";
 import {
   type SpecCheckpoint,
   type SpecCheckpointSummary,
   useRestoreSpecSection,
+  useSetSpecSectionState,
   useSpecCheckpoint,
+  useSpecRail,
   useSpecRead,
+  useUndoSpecSectionState,
 } from "@/hooks/useSpecRead";
 import "./spec-read.css";
 
@@ -34,6 +43,7 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   const specId = explicitSpecId ?? routeSpecId;
   const read = useSpecRead(specId);
   const sendSelectionPrompt = useMutation(sendPromptMethod);
+  const rail = useSpecRail(specId);
   const publishedCheckpoint =
     read.data?.spec.lifecycle === "published" ? read.data.publishedCheckpoint : null;
   const publishedId = publishedCheckpoint?.id ?? null;
@@ -45,16 +55,24 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   const first = useSpecCheckpoint(specId, effectiveIds[0] ?? null, publishedCheckpoint);
   const second = useSpecCheckpoint(specId, effectiveIds[1] ?? null);
   const restore = useRestoreSpecSection(specId);
+  const sectionState = useSetSpecSectionState(specId);
+  const undoSectionState = useUndoSpecSectionState(specId);
   const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
+  const [actionChip, setActionChip] = useState<SpecSectionStateChipData | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [pendingSectionId, setPendingSectionId] = useState<string | null>(null);
   useDocumentTitle(read.data?.spec.title ?? "Tech spec");
 
   useEffect(() => {
     setSelectedIds([]);
     setRestoreNotice(null);
+    setActionChip(null);
+    setActionError(null);
+    setPendingSectionId(null);
   }, [publishedId, specId]);
 
-  if (read.isPending) return <SpecReadLoading />;
-  if (read.error || !read.data) {
+  if (read.isPending || rail.isPending) return <SpecReadLoading />;
+  if (read.error || rail.error || !read.data || !rail.data) {
     return (
       <main className="spec-read-error">
         <h1>Spec not available</h1>
@@ -90,6 +108,19 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
       return [current[1]!, checkpointId];
     });
   };
+  const runSectionAction = (action: SpecRailAction) => {
+    setActionError(null);
+    setActionChip(null);
+    setPendingSectionId(action.sectionId);
+    sectionState.mutate(
+      { ...action, actionId: crypto.randomUUID() },
+      {
+        onSuccess: ({ chip }) => setActionChip(chip),
+        onError: (error) => setActionError(error.message),
+        onSettled: () => setPendingSectionId(null),
+      },
+    );
+  };
 
   return (
     <main className="spec-read-page">
@@ -120,6 +151,27 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
           className="spec-read-document"
           aria-label={isDraft ? "Live spec" : "Published spec"}
         >
+          {isDraft && actionChip && (
+            <div className="spec-action-transcript" aria-label="Latest section action">
+              <SectionStateTranscriptChip
+                chip={actionChip}
+                undoPending={undoSectionState.isPending}
+                onUndo={(undo) => {
+                  setActionError(null);
+                  setPendingSectionId(undo.sectionId);
+                  undoSectionState.mutate(
+                    { sectionId: undo.sectionId, undo, actionId: crypto.randomUUID() },
+                    {
+                      onSuccess: ({ chip }) => setActionChip(chip),
+                      onError: (error) => setActionError(error.message),
+                      onSettled: () => setPendingSectionId(null),
+                    },
+                  );
+                }}
+              />
+            </div>
+          )}
+          {actionError && <p className="spec-action-error">{actionError}</p>}
           {isDraft && (
             <LazySpecCanvas
               specId={specId}
@@ -177,12 +229,30 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
           {restoreNotice && <p className="spec-restore-notice">{restoreNotice}</p>}
         </section>
 
-        <CheckpointHistory
-          checkpoints={checkpoints}
-          publishedCheckpointId={publishedId}
-          selectedIds={effectiveIds}
-          onSelect={updateSelection}
-        />
+        <aside className="spec-rail-shell">
+          <Tabs defaultValue="sections">
+            <TabsList className="spec-rail-tabs" aria-label="Spec navigation">
+              <TabsTrigger value="sections">Sections</TabsTrigger>
+              <TabsTrigger value="checkpoints">Checkpoints</TabsTrigger>
+            </TabsList>
+            <TabsContent value="sections">
+              <SpecSectionRail
+                rail={rail.data}
+                editable={isDraft}
+                pendingSectionId={pendingSectionId}
+                onAction={runSectionAction}
+              />
+            </TabsContent>
+            <TabsContent value="checkpoints">
+              <CheckpointHistory
+                checkpoints={checkpoints}
+                publishedCheckpointId={publishedId}
+                selectedIds={effectiveIds}
+                onSelect={updateSelection}
+              />
+            </TabsContent>
+          </Tabs>
+        </aside>
       </div>
     </main>
   );
@@ -288,7 +358,7 @@ function CheckpointHistory({
   onSelect: (id: string) => void;
 }) {
   return (
-    <aside className="spec-history" aria-label="Checkpoint history">
+    <div className="spec-history" aria-label="Checkpoint history">
       <div className="spec-history-heading">
         <History aria-hidden="true" />
         <div>
@@ -328,7 +398,7 @@ function CheckpointHistory({
           })}
         </ol>
       )}
-    </aside>
+    </div>
   );
 }
 

@@ -1,4 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import type {
+  RestoreSectionStateUndo,
+  SectionState,
+  SectionStateTranscriptChip,
+} from "@engrams/spec-document";
 
 import { API_BASE } from "@/lib/base";
 
@@ -34,6 +39,29 @@ export interface SpecCheckpoint {
   sections: Array<{ id: string; title: string }>;
 }
 
+export interface SpecRailSection {
+  id: string;
+  templateKey: string;
+  title: string;
+  state: SectionState;
+  naReason: string | null;
+  allowNa: boolean;
+  openQuestionCount: number;
+  provisional: boolean;
+  frontier: boolean;
+}
+
+export interface SpecRail {
+  layers: Array<{
+    key: string;
+    title: string;
+    description: string | null;
+    sections: SpecRailSection[];
+  }>;
+  completeness: { complete: number; total: number };
+  frontierSectionId: string | null;
+}
+
 export interface SpecReadResponse {
   spec: {
     id: string;
@@ -65,6 +93,21 @@ export function useSpecRead(specId: string) {
     enabled: specId.length > 0,
     refetchInterval: (query) =>
       query.state.data?.spec.lifecycle === "draft" ? DRAFT_REFETCH_INTERVAL_MS : false,
+    refetchIntervalInBackground: false,
+  });
+}
+
+export function useSpecRail(specId: string) {
+  const queryClient = useQueryClient();
+  return useQuery({
+    queryKey: ["spec", specId, "rail"],
+    queryFn: async () =>
+      (await specRequest<{ rail: SpecRail }>(`/specs/${encodeURIComponent(specId)}/rail`)).rail,
+    enabled: specId.length > 0,
+    refetchInterval: () =>
+      queryClient.getQueryData<SpecReadResponse>(["spec", specId])?.spec.lifecycle === "published"
+        ? false
+        : DRAFT_REFETCH_INTERVAL_MS,
     refetchIntervalInBackground: false,
   });
 }
@@ -110,5 +153,71 @@ export function useRestoreSpecSection(specId: string) {
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["spec", specId] });
     },
+  });
+}
+
+export interface SpecSectionStateResult {
+  chip: SectionStateTranscriptChip;
+  rail: SpecRail;
+}
+
+export async function setSpecSectionState(
+  specId: string,
+  sectionId: string,
+  state: Exclude<SectionState, "empty">,
+  reason: string | undefined,
+  actionId: string,
+): Promise<SpecSectionStateResult> {
+  return specRequest(
+    `/specs/${encodeURIComponent(specId)}/sections/${encodeURIComponent(sectionId)}/state`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actionId, state, ...(reason === undefined ? {} : { reason }) }),
+    },
+  );
+}
+
+export async function undoSpecSectionState(
+  specId: string,
+  sectionId: string,
+  undo: RestoreSectionStateUndo,
+  actionId: string,
+): Promise<SpecSectionStateResult> {
+  return specRequest(
+    `/specs/${encodeURIComponent(specId)}/sections/${encodeURIComponent(sectionId)}/undo`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ actionId, undo }),
+    },
+  );
+}
+
+export function useSetSpecSectionState(specId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: {
+      sectionId: string;
+      state: Exclude<SectionState, "empty">;
+      reason?: string;
+      actionId: string;
+    }) => setSpecSectionState(specId, input.sectionId, input.state, input.reason, input.actionId),
+    onSuccess: (result) => {
+      queryClient.setQueryData<SpecRail>(["spec", specId, "rail"], result.rail);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["spec", specId] }),
+  });
+}
+
+export function useUndoSpecSectionState(specId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { sectionId: string; undo: RestoreSectionStateUndo; actionId: string }) =>
+      undoSpecSectionState(specId, input.sectionId, input.undo, input.actionId),
+    onSuccess: (result) => {
+      queryClient.setQueryData<SpecRail>(["spec", specId, "rail"], result.rail);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["spec", specId] }),
   });
 }

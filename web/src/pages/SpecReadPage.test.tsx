@@ -1,5 +1,6 @@
 import { createRouterTransport } from "@connectrpc/connect";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SpecSelectionAction, SpecSelectionActionPayload } from "@engrams/spec-document";
 
@@ -52,6 +53,79 @@ const actionPayload = (action: SpecSelectionAction): SpecSelectionActionPayload 
     sliceFingerprint: "a".repeat(64),
   },
 });
+
+const rail = {
+  completeness: { complete: 1, total: 2 },
+  frontierSectionId: "design",
+  layers: [
+    {
+      key: "understand",
+      title: "Understand",
+      description: null,
+      sections: [
+        {
+          id: "context",
+          templateKey: "context",
+          title: "Context",
+          state: "confirmed" as const,
+          naReason: null,
+          allowNa: false,
+          openQuestionCount: 0,
+          provisional: false,
+          frontier: false,
+        },
+      ],
+    },
+    {
+      key: "define",
+      title: "Define",
+      description: null,
+      sections: [
+        {
+          id: "design",
+          templateKey: "design",
+          title: "Design",
+          state: "drafted" as const,
+          naReason: null,
+          allowNa: true,
+          openQuestionCount: 1,
+          provisional: false,
+          frontier: true,
+        },
+      ],
+    },
+  ],
+};
+
+const stateChip = {
+  kind: "spec_section_state_changed" as const,
+  specId: "spec-1",
+  sectionId: "design",
+  sectionTitle: "Design",
+  before: { state: "drafted" as const, naReason: null },
+  after: { state: "confirmed" as const, naReason: null },
+  provisional: false,
+  undo: {
+    kind: "restore_section_state" as const,
+    specId: "spec-1",
+    sectionId: "design",
+    expected: { state: "confirmed" as const, naReason: null },
+    restore: { state: "drafted" as const, naReason: null },
+  },
+};
+
+const setStateMutate = vi.fn(
+  (
+    _input: unknown,
+    options?: { onSuccess?: (result: { chip: typeof stateChip; rail: typeof rail }) => void },
+  ) => options?.onSuccess?.({ chip: stateChip, rail }),
+);
+const undoStateMutate = vi.fn(
+  (
+    _input: unknown,
+    options?: { onSuccess?: (result: { chip: typeof stateChip; rail: typeof rail }) => void },
+  ) => options?.onSuccess?.({ chip: stateChip, rail }),
+);
 
 vi.mock("@/components/spec", () => ({
   LazySpecCanvas: ({
@@ -111,11 +185,14 @@ vi.mock("@/hooks/useSpecRead", () => ({
     error: null,
     refetch: readRefetch,
   }),
+  useSpecRail: () => ({ data: rail, isPending: false, error: null }),
   useSpecCheckpoint: (_specId: string, checkpointId: string | null) => ({
     data: checkpointId === older.id ? older : checkpointId === pinned.id ? pinned : undefined,
     isPending: false,
   }),
   useRestoreSpecSection: () => ({ mutate: restoreMutate, isPending: false }),
+  useSetSpecSectionState: () => ({ mutate: setStateMutate, isPending: false }),
+  useUndoSpecSectionState: () => ({ mutate: undoStateMutate, isPending: false }),
 }));
 
 beforeEach(() => {
@@ -124,6 +201,8 @@ beforeEach(() => {
   view.publishedCheckpointId = null;
   restoreMutate.mockReset();
   readRefetch.mockReset();
+  setStateMutate.mockClear();
+  undoStateMutate.mockClear();
 });
 
 describe("SpecReadPage", () => {
@@ -138,18 +217,22 @@ describe("SpecReadPage", () => {
   });
 
   it("opens a published spec at the pinned read-only checkpoint", async () => {
+    const user = userEvent.setup();
     view.lifecycle = "published";
     view.publishedCheckpointId = older.id;
     renderWithProviders(<SpecReadPage specId="spec-1" />);
 
     expect(await screen.findByText("Pinned content.")).toBeTruthy();
     expect(screen.getByText("Published spec")).toBeTruthy();
+    await user.click(screen.getByRole("tab", { name: "Checkpoints" }));
     expect(screen.getByText("Pinned")).toBeTruthy();
     expect(screen.queryByLabelText("Collaborative spec canvas")).toBeNull();
   });
 
   it("returns to the server-pinned checkpoint when a draft becomes published", async () => {
+    const user = userEvent.setup();
     renderWithProviders(<SpecReadPage specId="spec-1" />);
+    await user.click(await screen.findByRole("tab", { name: "Checkpoints" }));
     fireEvent.click(await screen.findByRole("button", { name: /Initial outline/ }));
     expect(await screen.findByText("Initial content.")).toBeTruthy();
 
@@ -223,15 +306,17 @@ describe("SpecReadPage", () => {
   });
 
   it("compares two checkpoints and restores one selected checkpoint section", async () => {
+    const user = userEvent.setup();
     renderWithProviders(<SpecReadPage specId="spec-1" />);
 
-    fireEvent.click(await screen.findByRole("button", { name: /Initial outline/ }));
-    fireEvent.click(screen.getByRole("button", { name: /Ready to publish/ }));
+    await user.click(await screen.findByRole("tab", { name: "Checkpoints" }));
+    await user.click(await screen.findByRole("button", { name: /Initial outline/ }));
+    await user.click(screen.getByRole("button", { name: /Ready to publish/ }));
     expect(await screen.findByText("Checkpoint comparison")).toBeTruthy();
     expect(screen.getByText("Initial outline → Ready to publish")).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: /Initial outline/ }));
-    fireEvent.click(await screen.findByRole("button", { name: "Restore section" }));
+    await user.click(screen.getByRole("button", { name: /Initial outline/ }));
+    await user.click(await screen.findByRole("button", { name: "Restore section" }));
     expect(restoreMutate).toHaveBeenCalledWith(
       { checkpointId: pinned.id, sectionId: "context" },
       expect.any(Object),
@@ -239,7 +324,9 @@ describe("SpecReadPage", () => {
   });
 
   it("refreshes server truth when restore races with publish", async () => {
+    const user = userEvent.setup();
     renderWithProviders(<SpecReadPage specId="spec-1" />);
+    await user.click(await screen.findByRole("tab", { name: "Checkpoints" }));
 
     fireEvent.click(await screen.findByRole("button", { name: /Ready to publish/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Restore section" }));
@@ -254,5 +341,45 @@ describe("SpecReadPage", () => {
       ),
     ).toBeTruthy();
     expect(readRefetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows an undoable transcript chip after confirm-from-rail", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    await user.click(await screen.findByRole("button", { name: "Confirm" }));
+    expect(await screen.findByRole("status", { name: "Design state changed" })).toBeTruthy();
+    expect(setStateMutate).toHaveBeenCalledWith(
+      {
+        sectionId: "design",
+        state: "confirmed",
+        actionId: expect.any(String),
+      },
+      expect.any(Object),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(undoStateMutate).toHaveBeenCalledWith(
+      {
+        sectionId: "design",
+        undo: stateChip.undo,
+        actionId: expect.any(String),
+      },
+      expect.any(Object),
+    );
+  });
+
+  it("attributes a checkpoint and marks its selection order", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    await user.click(await screen.findByRole("tab", { name: "Checkpoints" }));
+    const checkpoint = screen.getByRole("button", { name: /Ready to publish/ });
+    expect(within(checkpoint).getByText(/Ada/)).toBeTruthy();
+
+    await user.click(checkpoint);
+    const selected = screen.getByRole("button", { name: /Ready to publish/ });
+    expect(selected.getAttribute("aria-pressed")).toBe("true");
+    expect(within(selected).getByText("1")).toBeTruthy();
   });
 });
