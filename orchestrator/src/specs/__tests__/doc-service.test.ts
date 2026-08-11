@@ -21,6 +21,7 @@ import { Transform } from "prosemirror-transform";
 import * as Y from "yjs";
 import * as dbSchema from "../../db/schema.ts";
 import { makeSpecListStore } from "../../db/specs.ts";
+import { PostgresSpecReadStore } from "../../routes/specs.ts";
 import {
   encodeProseMirrorDocument,
   encodeSpecChannelEnvelope,
@@ -33,6 +34,7 @@ import {
   SpecDocumentRevisionConflictError,
   SpecDocumentTooLargeError,
   SpecParticipantLeaseStaleError,
+  SPEC_BLOCK_EDIT_CHECKPOINT_LIMIT,
   SPEC_MAX_SIZE_BYTES,
   SPEC_UPDATE_SIZE_FACTOR,
   type CompactSnapshotInput,
@@ -1300,6 +1302,163 @@ describe("SpecDocumentService with live Postgres", () => {
       }
     },
   );
+
+  test.skipIf(!liveDbReachable)(
+    "a document mutation commits its attributed checkpoint in the same transaction",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const checkpointId = randomUUID();
+      const at = new Date("2026-08-09T12:03:00.000Z");
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => at,
+      });
+      await documents.applyUpdate(specId, initialUpdate(), "seed");
+
+      const stored = await documents.mutateDocumentWithPostEditCheckpoint(
+        specId,
+        "spec-agent:test",
+        {
+          id: checkpointId,
+          label: "Updated block request-flow",
+          authorUserId: userId,
+          reason: "block_edit",
+          createdAt: at,
+        },
+        (document) => {
+          const section = findSection(document, "design");
+          if (!section) throw new Error("The Design section is missing.");
+          return replaceSection(
+            document,
+            "design",
+            schema.nodes.section!.create(section.node.attrs, [
+              section.node.firstChild!,
+              schema.nodes.paragraph!.create(null, schema.text("Checkpointed block edit.")),
+            ]),
+          );
+        },
+      );
+
+      const checkpoint = await livePool.query<{
+        author_user_id: string | null;
+        created_at: Date;
+        doc_seq: string;
+        reason: string;
+        rendered_markdown: string;
+      }>(
+        `SELECT author_user_id, created_at, doc_seq::text, reason, rendered_markdown
+           FROM spec_checkpoint
+          WHERE id = $1`,
+        [checkpointId],
+      );
+      expect(checkpoint.rows[0]).toMatchObject({
+        author_user_id: userId,
+        created_at: at,
+        doc_seq: stored.update.seq.toString(),
+        reason: "block_edit",
+      });
+      expect(checkpoint.rows[0]?.rendered_markdown).toContain("Checkpointed block edit.");
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
+    "keeps only the newest automatic block-edit checkpoints",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => new Date("2026-08-09T12:03:00.000Z"),
+      });
+      await documents.applyUpdate(specId, initialUpdate(), "seed");
+      const manualCheckpointId = randomUUID();
+      const compacted = await documents.compact(specId);
+      await livePool.query(
+        `INSERT INTO spec_checkpoint
+           (id, spec_id, state, state_vector, rendered_markdown, doc_seq,
+            label, author_user_id, reason, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          manualCheckpointId,
+          specId,
+          Buffer.from(compacted.state),
+          Buffer.from(compacted.stateVector),
+          compacted.renderedMarkdown,
+          compacted.coveredSeq.toString(),
+          "Manual checkpoint",
+          userId,
+          "manual",
+          new Date("2026-08-09T12:02:00.000Z"),
+        ],
+      );
+
+      for (let index = 0; index < SPEC_BLOCK_EDIT_CHECKPOINT_LIMIT + 2; index += 1) {
+        await documents.mutateDocumentWithPostEditCheckpoint(
+          specId,
+          "spec-agent:test",
+          {
+            id: randomUUID(),
+            label: `Block edit ${index}`,
+            authorUserId: userId,
+            reason: "block_edit",
+            createdAt: new Date(Date.UTC(2026, 7, 9, 12, 3, index)),
+          },
+          (document) => {
+            const section = findSection(document, "design");
+            if (!section) throw new Error("The Design section is missing.");
+            return replaceSection(
+              document,
+              "design",
+              schema.nodes.section!.create(section.node.attrs, [
+                section.node.firstChild!,
+                schema.nodes.paragraph!.create(null, schema.text(`Block edit ${index}.`)),
+              ]),
+            );
+          },
+        );
+      }
+
+      const counts = await livePool.query<{ block_edits: string; manual: string }>(
+        `SELECT count(*) FILTER (WHERE reason = 'block_edit')::text AS block_edits,
+                count(*) FILTER (WHERE reason = 'manual')::text AS manual
+           FROM spec_checkpoint
+          WHERE spec_id = $1`,
+        [specId],
+      );
+      expect(counts.rows).toEqual([
+        { block_edits: SPEC_BLOCK_EDIT_CHECKPOINT_LIMIT.toString(), manual: "1" },
+      ]);
+    },
+  );
+
+  test.skipIf(!liveDbReachable)("bounds the checkpoint history query", async () => {
+    if (!livePool) throw new Error("The live Postgres pool is not available");
+    const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+      now: () => new Date("2026-08-09T12:03:00.000Z"),
+    });
+    await documents.applyUpdate(specId, initialUpdate(), "seed");
+    const compacted = await documents.compact(specId);
+    await livePool.query(
+      `INSERT INTO spec_checkpoint
+         (id, spec_id, state, state_vector, rendered_markdown, doc_seq,
+          label, author_user_id, reason, created_at)
+       SELECT ('10000000-0000-4000-8000-' || lpad(value::text, 12, '0'))::uuid,
+              $1, $2, $3, $4, $5, 'Checkpoint ' || value, $6, 'run_completed',
+              $7::timestamptz + value * interval '1 second'
+         FROM generate_series(1, 105) AS value`,
+      [
+        specId,
+        Buffer.from(compacted.state),
+        Buffer.from(compacted.stateVector),
+        compacted.renderedMarkdown,
+        compacted.coveredSeq.toString(),
+        userId,
+        new Date("2026-08-09T12:00:00.000Z"),
+      ],
+    );
+
+    const checkpoints = await new PostgresSpecReadStore(livePool).listCheckpoints(specId);
+    expect(checkpoints).toHaveLength(100);
+    expect(checkpoints[0]?.label).toBe("Checkpoint 105");
+    expect(checkpoints.at(-1)?.label).toBe("Checkpoint 6");
+  });
 
   test.skipIf(!liveDbReachable)(
     "a human edit commits its update, drafted state, and transcript action atomically",

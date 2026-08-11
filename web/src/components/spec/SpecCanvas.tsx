@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { SpecPresence } from "./SpecPresence";
 import { SpecSelectionBubbleMenu, type SpecSelectionActions } from "./SpecSelectionActions";
+import { SpecBlockIterationProvider } from "./block-iteration";
 import { specNodeExtensions } from "./extensions";
 import "./spec-canvas.css";
 
@@ -74,13 +75,15 @@ export function SpecCanvas({
   }
 
   return (
-    <ConnectedSpecCanvas
-      connection={connection}
-      user={user}
-      specId={specId}
-      revision={revision}
-      selectionActions={selectionActions}
-    />
+    <SpecBlockIterationProvider specId={specId}>
+      <ConnectedSpecCanvas
+        connection={connection}
+        user={user}
+        specId={specId}
+        revision={revision}
+        selectionActions={selectionActions}
+      />
+    </SpecBlockIterationProvider>
   );
 }
 

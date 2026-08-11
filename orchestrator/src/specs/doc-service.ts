@@ -23,6 +23,7 @@ export const SPEC_UPDATE_CHANNEL = "spec_update";
 export const SPEC_CHANNEL_PAYLOAD_MAX_BYTES = 7_900;
 export const SPEC_SOFT_SIZE_BYTES = 500 * 1024;
 export const SPEC_MAX_SIZE_BYTES = 2 * 1024 * 1024;
+export const SPEC_BLOCK_EDIT_CHECKPOINT_LIMIT = 20;
 export const SPEC_UPDATE_SIZE_FACTOR = 16;
 
 export interface SpecUpdateChannelEnvelope {
@@ -463,6 +464,56 @@ export class SpecDocumentService {
               },
             };
           }
+        } finally {
+          fork.destroy();
+        }
+      }
+    });
+  }
+
+  async mutateDocumentWithPostEditCheckpoint(
+    specId: string,
+    clientId: string | null,
+    checkpointMetadata: SpecDocumentCheckpointMetadata,
+    mutate: (doc: ProseMirrorNode, ydoc: Y.Doc) => ProseMirrorNode,
+    expectedSeq?: bigint,
+  ): Promise<{ checkpoint: SpecDocumentCheckpoint; update: SpecUpdateRecord }> {
+    return this.withLock(specId, async () => {
+      const room = await this.loadUnlocked(specId);
+      for (;;) {
+        await this.syncUnlocked(specId, room);
+        if (expectedSeq !== undefined && room.semanticDocSeq !== expectedSeq) {
+          throw new SpecDocumentRevisionConflictError(expectedSeq, room.semanticDocSeq);
+        }
+        const fork = new Y.Doc();
+        try {
+          Y.applyUpdate(fork, Y.encodeStateAsUpdate(room.doc));
+          const before = Y.encodeStateVector(fork);
+          const current = proseMirrorDocument(fork);
+          const replacement = mutate(current, fork);
+          if (replacement.eq(current)) {
+            throw new Error("The spec mutation did not change the document");
+          }
+          prosemirrorToYXmlFragment(replacement, fork.getXmlFragment(SPEC_FRAGMENT_NAME));
+          const update = Y.encodeStateAsUpdate(fork, before);
+          if (update.length === 2) throw new Error("The spec mutation did not change the document");
+          const checkpoint: SpecDocumentCheckpoint = {
+            ...checkpointMetadata,
+            specId,
+            state: Y.encodeStateAsUpdate(fork),
+            stateVector: Y.encodeStateVector(fork),
+            renderedMarkdown: renderMarkdown(replacement),
+            docSeq: room.lastAppliedSeq + 1n,
+          };
+          const stored = await this.tryApplyUpdateUnlocked(
+            specId,
+            room,
+            update,
+            clientId,
+            undefined,
+            checkpoint,
+          );
+          if (stored) return { checkpoint, update: stored };
         } finally {
           fork.destroy();
         }
@@ -1237,6 +1288,19 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
             checkpoint.createdAt,
           ],
         );
+        if (checkpoint.reason === "block_edit") {
+          await client.query(
+            `DELETE FROM spec_checkpoint
+              WHERE id IN (
+                SELECT id
+                  FROM spec_checkpoint
+                 WHERE spec_id = $1 AND reason = 'block_edit'
+                 ORDER BY created_at DESC, id DESC
+                 OFFSET $2
+              )`,
+            [specId, SPEC_BLOCK_EDIT_CHECKPOINT_LIMIT],
+          );
+        }
       }
       await client.query(
         `INSERT INTO spec_update_log (spec_id, seq, semantic_doc_seq, update, client_id)

@@ -14,6 +14,7 @@ import {
 import { proseMirrorDocument, SpecDocumentReadOnlyError } from "../specs/doc-service.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SPEC_CHECKPOINT_LIST_LIMIT = 100;
 
 export interface SpecReadRecord {
   id: string;
@@ -99,8 +100,9 @@ export class PostgresSpecReadStore implements SpecReadStore {
          FROM spec_checkpoint AS checkpoint
          LEFT JOIN "user" AS author ON author.id = checkpoint.author_user_id
         WHERE checkpoint.spec_id = $1
-        ORDER BY checkpoint.created_at DESC, checkpoint.id DESC`,
-      [specId],
+        ORDER BY checkpoint.created_at DESC, checkpoint.id DESC
+        LIMIT $2`,
+      [specId, SPEC_CHECKPOINT_LIST_LIMIT],
     );
     return result.rows.map((row) => ({
       id: row.id,
