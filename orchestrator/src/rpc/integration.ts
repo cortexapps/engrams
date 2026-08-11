@@ -491,6 +491,16 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
           })),
           defaultConnectionId: defaultConnection?.id ?? "",
           connectionModel: e.connectionModel,
+          // ADR 0115: absent when the connector is org-only.
+          ...(e.userCredential
+            ? {
+                userCredential: {
+                  oauth: e.userCredential.oauth,
+                  token: e.userCredential.token,
+                  tokenHint: e.userCredential.tokenHint ?? "",
+                },
+              }
+            : {}),
         };
       }));
       return { providers: entries };

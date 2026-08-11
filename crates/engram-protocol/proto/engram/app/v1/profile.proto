@@ -119,6 +119,11 @@ message ProfileIntegrationGrant {
   string connection_id = 1;
   string operation = 2;
   repeated string resource_constraints = 3;
+  // ADR 0115: which credential sessions wield for this integration. "" or
+  // "org" = the connection's shared credential; "user" = the launching
+  // user's personal credential (human launches then require it; programmatic
+  // sessions always use the org credential).
+  string credential_scope = 4;
 }
 
 // ADR 0057: a profile's egress network allow-list. `default` is the posture for

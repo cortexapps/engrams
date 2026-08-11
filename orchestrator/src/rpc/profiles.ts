@@ -124,6 +124,7 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
       connectionId: grant.connectionId,
       operation: grant.operation,
       resourceConstraints: grant.resourceConstraints,
+      credentialScope: grant.credentialScope ?? "",
     })),
     // ADR 0057: network + secrets describe access/config (the secret VALUES
     // live in the org store, never here), so they're member-visible like skills.
@@ -386,6 +387,43 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         );
       }
     }
+
+    // ADR 0115: user-scoped credential invariants.
+    //  - user scope requires the connector to declare `userCredential`;
+    //  - one scope per connection (the editor toggles per integration);
+    //  - no user scope when two granted connections share a provider — the
+    //    v1 user credential is keyed per (user, provider), so two identities
+    //    of one provider would resolve the same personal token.
+    const scopeByConnection = new Map<string, "org" | "user">();
+    const userScopedProviders = new Map<string, string>();
+    for (const { grant, connection } of resolved) {
+      const scope = grant.credentialScope ?? "org";
+      const prior = scopeByConnection.get(grant.connectionId);
+      if (prior !== undefined && prior !== scope) {
+        throw new ConnectError(
+          `integration connection "${connection.alias}" mixes credential scopes; ` +
+            `use one scope for all of its grants`,
+          Code.InvalidArgument,
+        );
+      }
+      scopeByConnection.set(grant.connectionId, scope);
+      if (scope !== "user") continue;
+      if (registry.get(connection.provider)?.userCredential === undefined) {
+        throw new ConnectError(
+          `connector "${connection.provider}" does not support user-scoped credentials`,
+          Code.InvalidArgument,
+        );
+      }
+      const priorConnection = userScopedProviders.get(connection.provider);
+      if (priorConnection !== undefined && priorConnection !== grant.connectionId) {
+        throw new ConnectError(
+          `user-scoped credentials allow only one "${connection.provider}" connection per ` +
+            `profile (personal credentials are keyed per provider)`,
+          Code.InvalidArgument,
+        );
+      }
+      userScopedProviders.set(connection.provider, grant.connectionId);
+    }
   }
 
   function normalizeIntegrationGrants(
@@ -393,13 +431,25 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       connectionId?: string;
       operation?: string;
       resourceConstraints?: string[];
+      credentialScope?: string;
     }>,
   ): ProfileIntegrationGrant[] {
-    return grants.map((grant) => ({
-      connectionId: (grant.connectionId ?? "").trim(),
-      operation: (grant.operation ?? "").trim(),
-      resourceConstraints: [...new Set(grant.resourceConstraints ?? [])].sort(),
-    }));
+    return grants.map((grant) => {
+      const scope = (grant.credentialScope ?? "").trim();
+      if (scope !== "" && scope !== "org" && scope !== "user") {
+        throw new ConnectError(
+          `invalid credential scope "${scope}" (expected "org" or "user")`,
+          Code.InvalidArgument,
+        );
+      }
+      return {
+        connectionId: (grant.connectionId ?? "").trim(),
+        operation: (grant.operation ?? "").trim(),
+        resourceConstraints: [...new Set(grant.resourceConstraints ?? [])].sort(),
+        // Stored only when user-scoped; absent means org (the default).
+        ...(scope === "user" ? { credentialScope: "user" as const } : {}),
+      };
+    });
   }
 
   router.service(ProfileService, {

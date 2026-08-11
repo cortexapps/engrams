@@ -210,6 +210,11 @@ export interface SessionCompileDeps {
   /** Resolve whether the human owner has a live provider connection. */
   hasOAuthCredential?: (provider: string) => Promise<boolean>;
   oauthSubject?: { kind: OauthSubjectKind; id: string };
+  /** ADR 0115: list the owner's personal CONNECTOR credentials (subject kind
+   *  `user_connector`) — one call serves every user-scoped integration gate.
+   *  Only `status === "connected"` rows satisfy the gate (a broken credential
+   *  must block, not boot an unauthenticated session). */
+  listUserConnectorCredentials?: () => Promise<Array<{ provider: string; status: string }>>;
   connections: IntegrationConnectionStore;
 }
 
@@ -421,6 +426,37 @@ export async function compileSessionCreateInput(
       Code.FailedPrecondition,
     );
   }
+  // ADR 0115: a user-scoped grant (profile opted the integration into the
+  // launching user's personal credential) requires that credential for a
+  // HUMAN run — mirroring the harness gate above: the PRINCIPAL decides.
+  // Programmatic sessions compile the org credential regardless, and
+  // override grants never carry a scope, so an override session never gates.
+  const userScopedGrants = isHuman
+    ? resolvedEffectiveGrants.filter(
+        ({ grant, connection }) =>
+          grant.credentialScope === "user" &&
+          registry.get(connection.provider)?.userCredential !== undefined,
+      )
+    : [];
+  if (userScopedGrants.length > 0) {
+    const rows = (await deps.listUserConnectorCredentials?.()) ?? [];
+    const connected = new Set(
+      rows.filter((row) => row.status === "connected").map((row) => row.provider),
+    );
+    const missing = [
+      ...new Set(userScopedGrants.map(({ connection }) => connection.provider)),
+    ].filter((provider) => !connected.has(provider));
+    if (missing.length > 0) {
+      const names = missing.map(
+        (provider) => registry.get(provider)?.display.name ?? provider,
+      );
+      throw new ConnectError(
+        `${names.join(", ")} need${names.length === 1 ? "s" : ""} your personal credential.` +
+          ` Connect it under Settings → Credentials, then start the task again.`,
+        Code.FailedPrecondition,
+      );
+    }
+  }
   const capabilities = grantsToCapabilities(resolvedEffectiveGrants);
   // A capability override is the complete session authority and therefore
   // also owns its CLI/tool surface. Without one, preserve the narrower
@@ -520,11 +556,15 @@ export async function compileSessionCreateInput(
       provider: connection.provider,
       operation: grant.operation,
       resourceConstraints: grant.resourceConstraints,
+      // ADR 0115: only a human compile stamps the user subject below, so a
+      // programmatic session's user-scoped grants fall back to org authority.
+      userScoped: grant.credentialScope === "user",
     })),
     registry,
     {
       network: opts.networkOverride ?? profile.network,
       secrets: opts.dropProfileSecretsAndEnv ? [] : profile.secrets,
+      ...(isHuman && deps.oauthSubject ? { userSubjectId: deps.oauthSubject.id } : {}),
     },
   );
   for (const optionSecret of optionSecrets) {
@@ -630,7 +670,7 @@ export interface CreateTaskDeps {
   };
   oauth?: {
     listCredentials(req: { subject: { kind: OauthSubjectKind; id: string } }): Promise<{
-      credentials: Array<{ provider: string; connected: boolean }>;
+      credentials: Array<{ provider: string; connected: boolean; status: string }>;
     }>;
   };
   db: Db;
@@ -774,6 +814,15 @@ export async function createSessionForExistingTask(
               return response.credentials.some(
                 (credential) => credential.provider === provider && credential.connected,
               );
+            },
+            listUserConnectorCredentials: async () => {
+              const response = await (deps.oauth ?? defaultOAuthCredential).listCredentials({
+                subject: { kind: OauthSubjectKind.USER_CONNECTOR, id: params.ownerUserId! },
+              });
+              return response.credentials.map((credential) => ({
+                provider: credential.provider,
+                status: credential.status,
+              }));
             },
           }),
       connections: deps.connections ?? makeIntegrationConnectionStore(deps.db),
@@ -926,6 +975,15 @@ export async function createTaskWithSession(
         return response.credentials.some(
           (credential) => credential.provider === provider && credential.connected,
         );
+      },
+      listUserConnectorCredentials: async () => {
+        const response = await (deps.oauth ?? defaultOAuthCredential).listCredentials({
+          subject: { kind: OauthSubjectKind.USER_CONNECTOR, id: params.ownerUserId },
+        });
+        return response.credentials.map((credential) => ({
+          provider: credential.provider,
+          status: credential.status,
+        }));
       },
       connections: deps.connections ?? makeIntegrationConnectionStore(deps.db),
     },

@@ -1,4 +1,4 @@
-import { expect, test, describe, beforeAll, afterAll } from "bun:test";
+import { expect, test, describe, beforeAll, beforeEach, afterAll } from "bun:test";
 import { ConnectError, Code, createClient, createRouterTransport } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
 
@@ -10,6 +10,7 @@ import type { MountCatalogClient } from "../skills/catalog.ts";
 import { PR_REVIEW_CAPABILITY } from "../tools/review.ts";
 import { capabilityGrant } from "../integrations/grants.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
+import { invalidateRegistry } from "../connectors/registry.ts";
 
 const protoGrant = (capability: string) =>
   create(ProfileIntegrationGrantSchema, capabilityGrant(
@@ -666,6 +667,142 @@ describe("ProfileService — auth + field filtering", () => {
       await expectErr(s.client.deleteProfile({ id: designated.id }), Code.FailedPrecondition);
       expect(softDeleteCalls).toBe(0);
       expect((await store.get(designated.id))?.deletedAt).toBeNull();
+    } finally { await s.close(); }
+  });
+});
+
+describe("user-scoped grants (ADR 0115)", () => {
+  beforeEach(() => invalidateRegistry());
+  afterAll(() => invalidateRegistry());
+
+  const acmeConnector = {
+    provider: "acme",
+    protocol: "http",
+    credential: {
+      source: "inject",
+      injects: [{ header: "Authorization", secretRef: "acme.token", template: "Bearer {}" }],
+    },
+    hosts: ["api.acme.test"],
+    operations: [{ grants: ["issues:write"], match: { method: "POST", path: "/issues*" } }],
+    userCredential: { token: { hint: "Create a PAT." } },
+  };
+  const acmeDeps = (): ProfileDeps => ({
+    getSession: makeGetSession("a", "admin"),
+    store: makeFakeStore(),
+    images: fakeImages(["img-1"]),
+    mountCatalog: fakeCatalog([]),
+    connectors: { list: async () => [{ provider: "acme", config: acmeConnector }] },
+  });
+  const base = {
+    name: "x", description: "", icon: "Bot", imageId: "img-1", harness: "claude",
+    includeUserTokens: false, envVars: {},
+  };
+  const grant = (connectionId: string, scope: string, operation = "issues:write") =>
+    create(ProfileIntegrationGrantSchema, {
+      connectionId,
+      operation,
+      resourceConstraints: [],
+      credentialScope: scope,
+    });
+
+  test("a user-scoped grant on a supporting connector round-trips", async () => {
+    const s = await spawn(acmeDeps());
+    try {
+      const r = await s.client.createProfile({
+        ...base,
+        integrationGrants: [grant("default-acme", "user")],
+      });
+      expect(r.profile!.integrationGrants[0]?.credentialScope).toBe("user");
+    } finally { await s.close(); }
+  });
+
+  test("rejects user scope on a connector without userCredential", async () => {
+    const s = await spawn(acmeDeps());
+    try {
+      await expectErr(
+        s.client.createProfile({
+          ...base,
+          integrationGrants: [
+            create(ProfileIntegrationGrantSchema, {
+              connectionId: "default-github",
+              operation: "issues:write",
+              resourceConstraints: [],
+              credentialScope: "user",
+            }),
+          ],
+        }),
+        Code.InvalidArgument,
+      );
+    } finally { await s.close(); }
+  });
+
+  test("rejects an invalid scope value", async () => {
+    const s = await spawn(acmeDeps());
+    try {
+      await expectErr(
+        s.client.createProfile({
+          ...base,
+          integrationGrants: [grant("default-acme", "personal")],
+        }),
+        Code.InvalidArgument,
+      );
+    } finally { await s.close(); }
+  });
+
+  test("rejects mixed scopes on one connection", async () => {
+    const s = await spawn(acmeDeps());
+    try {
+      await expectErr(
+        s.client.createProfile({
+          ...base,
+          integrationGrants: [
+            grant("default-acme", "user"),
+            grant("default-acme", "org"),
+          ],
+        }),
+        Code.InvalidArgument,
+      );
+    } finally { await s.close(); }
+  });
+
+  test("rejects user scope across two connections of one provider", async () => {
+    // Two connection rows both naming provider "acme": the v1 user credential
+    // is keyed per (user, provider), so this must not save.
+    const deps = acmeDeps();
+    const twoAcme: IntegrationConnectionStore = {
+      list: async () => [],
+      get: async (id) =>
+        id === "default-acme" || id === "alt-acme"
+          ? {
+              id, alias: id, provider: "acme", displayName: id,
+              isDefault: id === "default-acme", config: {}, enabled: true,
+              testedAt: new Date(0), createdAt: new Date(0), updatedAt: new Date(0),
+            }
+          : null,
+      getMany: async (ids) => {
+        const rows = await Promise.all(ids.map((id) => twoAcme.get(id)));
+        return rows.filter((row) => row != null);
+      },
+      getDefault: async () => twoAcme.get("default-acme"),
+      create: async () => { throw new Error("unused"); },
+      update: async () => { throw new Error("unused"); },
+      delete: async () => { throw new Error("unused"); },
+      markTested: async () => { throw new Error("unused"); },
+      setEnabled: async () => { throw new Error("unused"); },
+      ensureDefault: async () => (await twoAcme.get("default-acme"))!,
+    };
+    const s = await spawn({ ...deps, connections: twoAcme });
+    try {
+      await expectErr(
+        s.client.createProfile({
+          ...base,
+          integrationGrants: [
+            grant("default-acme", "user"),
+            grant("alt-acme", "user"),
+          ],
+        }),
+        Code.InvalidArgument,
+      );
     } finally { await s.close(); }
   });
 });

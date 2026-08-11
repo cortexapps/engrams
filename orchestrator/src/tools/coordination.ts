@@ -216,6 +216,24 @@ async function compileChildInput(
   const db = getDb();
   const secrets = makeUserSecretStore(db);
   const identity = await makeUserIdentityStore(db).getIdentity(parent.createdByUserId);
+  // ADR 0115: the child ships the parent's FROZEN policy, so the user-scoped
+  // gate must follow what that policy actually stamped — not the profile
+  // toggle. A service-account parent compiled org authority (no `oauth_user`
+  // entries); re-deriving from the toggle would wrongly block its spawns.
+  const userStampedConnections = (() => {
+    try {
+      const parsed = JSON.parse(policy.integrationPolicyJson || "{}") as {
+        injects?: Array<{ mint_source?: { oauth_user?: { connection_id?: string } } | null }>;
+      };
+      return new Set(
+        (parsed.injects ?? [])
+          .map((inject) => inject.mint_source?.oauth_user?.connection_id)
+          .filter((id): id is string => typeof id === "string"),
+      );
+    } catch {
+      return new Set<string>();
+    }
+  })();
   const syntheticProfile = {
     id: policy.profileId,
     name: "launch snapshot",
@@ -228,7 +246,11 @@ async function compileChildInput(
     includeUserTokens: policy.includeUserTokens,
     envVars: structuredClone(policy.envVars),
     skills: [...policy.skills],
-    integrationGrants: structuredClone(policy.integrationGrants),
+    integrationGrants: structuredClone(policy.integrationGrants).map((grant) =>
+      userStampedConnections.has(grant.connectionId)
+        ? { ...grant, credentialScope: "user" as const }
+        : { ...grant, credentialScope: "org" as const },
+    ),
     network: structuredClone(policy.network),
     secrets: structuredClone(policy.secrets),
     repos: structuredClone(policy.repos),
@@ -260,6 +282,15 @@ async function compileChildInput(
         return response.credentials.some(
           (credential) => credential.provider === provider && credential.connected,
         );
+      },
+      listUserConnectorCredentials: async () => {
+        const response = await oauthCredential.listCredentials({
+          subject: { kind: OauthSubjectKind.USER_CONNECTOR, id: parent.createdByUserId! },
+        });
+        return response.credentials.map((credential) => ({
+          provider: credential.provider,
+          status: credential.status,
+        }));
       },
       orgSecret,
       connections: snapshotConnectionStore(policy),
