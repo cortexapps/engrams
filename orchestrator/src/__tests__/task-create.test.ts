@@ -35,6 +35,7 @@ import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
 import { createToolRegistry } from "../tools/registry.ts";
 import {
   BASE_SYSTEM_PROMPT,
+  COORDINATION_SYSTEM_PROMPT,
   SPEC_MODE_SYSTEM_PROMPT,
 } from "../prompts/base.ts";
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
@@ -880,6 +881,45 @@ describe("compileSessionCreateInput", () => {
     );
     const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
     expect(manifest.map((tool) => tool.name)).toEqual(["spawn_session"]);
+    // A child can spawn, so it carries the playbook too.
+    expect(inp.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toContain(COORDINATION_SYSTEM_PROMPT);
+  });
+
+  // The playbook rides the COMPILED manifest, not the task type: a profile
+  // whose manifest carries no spawn_session must not be told how to spawn.
+  test("the coordination playbook follows the compiled manifest", async () => {
+    const registryWith = createToolRegistry();
+    registryWith.register({
+      name: "spawn_session",
+      description: "Spawn a named child session.",
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      handler: async () => ({ ok: true }),
+    });
+    const registryWithout = createToolRegistry();
+    registryWithout.register({
+      name: "save_memory",
+      description: "Save a note.",
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      handler: async () => ({ ok: true }),
+    });
+
+    const spawner = await compileSessionCreateInput(profile(), {
+      ...deps(),
+      toolRegistry: registryWith,
+    });
+    const plain = await compileSessionCreateInput(profile(), {
+      ...deps(),
+      toolRegistry: registryWithout,
+    });
+
+    expect(spawner.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toContain(COORDINATION_SYSTEM_PROMPT);
+    expect(plain.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(BASE_SYSTEM_PROMPT);
   });
 
   test("omits ENGRAM_TOOLS when no registered tool matches the profile", async () => {

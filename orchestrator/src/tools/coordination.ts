@@ -487,7 +487,10 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
   registry.register({
     name: "spawn_session",
     description:
-      "Spawn a named child session. Optional file_paths may name files anywhere in this session and are copied to the same absolute paths before the message is sent.",
+      "Spawn a named child session. A child session is durable: it gets its own sandbox and its own history, and it continues after your turn ends. " +
+      "Spawn one child for each unit of work, such as one issue or one pull request. Give follow-up work and review fixes to that same child with send_session_message. " +
+      "Do not spawn a second child to review, to rebase, or to wait for continuous integration. " +
+      "Optional file_paths may name files anywhere in this session and are copied to the same absolute paths before the message is sent.",
     input: SpawnInput,
     output: z.object({ session_id: z.string(), canonical_task_name: z.string() }),
     handling: "handled",
@@ -634,7 +637,9 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
   registry.register({
     name: "send_session_message",
     description:
-      "Send a message to a descendant session. Optional file_paths may name files anywhere in this session and are copied to the same absolute paths before the normal prompt path accepts the message.",
+      "Send a message to a descendant session. Use this to give more work to a child that exists, such as a review fix, a rebase result, or a correction. " +
+      "Prefer it to a second spawn_session for the same unit of work: the child keeps its context and its checkout. " +
+      "Optional file_paths may name files anywhere in this session and are copied to the same absolute paths before the normal prompt path accepts the message.",
     input: SendInput,
     output: z.object({ session_id: z.string(), accepted: z.boolean() }),
     handling: "handled",
@@ -677,7 +682,10 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
 
   registry.register({
     name: "read_session",
-    description: "Read assistant output and run-state updates from a descendant session.",
+    description:
+      "Read assistant output and run-state updates from a descendant session. " +
+      "Read each active child at least every 15 minutes. If a child shows no useful event for 30 minutes, interrupt it and examine the blocker before you retry or replace it. " +
+      "To wait for the next event, call wait_sessions. Do not call this tool in a loop.",
     input: z.object({
       session_id: z.string().uuid(),
       after_cursor: z
@@ -697,7 +705,9 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
 
   registry.register({
     name: "interrupt_session",
-    description: "Interrupt only the selected descendant session.",
+    description:
+      "Interrupt only the selected descendant session. Use this when a child is stuck or does work you no longer need. " +
+      "The child stays alive, so you can correct it with send_session_message afterwards.",
     input: z.object({ session_id: z.string().uuid() }),
     output: z.object({ session_id: z.string(), interrupted: z.boolean() }),
     handling: "handled",
@@ -712,7 +722,9 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
 
   registry.register({
     name: "terminate_session",
-    description: "Terminate only the selected descendant session.",
+    description:
+      "Terminate only the selected descendant session. The child and its sandbox are gone, and its unpushed work is lost. " +
+      "When you only want to redirect the child, use interrupt_session instead.",
     input: z.object({ session_id: z.string().uuid() }),
     output: z.object({ session_id: z.string(), terminated: z.boolean() }),
     handling: "handled",
@@ -760,7 +772,8 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
   registry.register({
     name: "wait_sessions",
     description:
-      "Wait until one descendant session has a relevant event after its cursor. Defaults to all descendants and 30 seconds; the hard limit is 120 seconds.",
+      "Wait until one descendant session has a relevant event after its cursor. Defaults to all descendants and 30 seconds; the hard limit is 120 seconds. " +
+      "Use this to wait for children instead of a read_session poll loop.",
     input: z.object({
       session_ids: z.array(z.string().uuid()).optional(),
       after_cursors: z.record(z.string(), z.string().regex(/^-?\d+$/)).optional(),

@@ -528,7 +528,10 @@ export async function compileSessionCreateInput(
   }
   harness.ENGRAM_APPEND_SYSTEM_PROMPT = [
     harness.ENGRAM_APPEND_SYSTEM_PROMPT,
-    systemPromptForTaskType(opts.taskType),
+    systemPromptForTaskType(
+      opts.taskType,
+      toolManifest.map((tool) => tool.name),
+    ),
   ]
     .filter(Boolean)
     .join("\n\n");

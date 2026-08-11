@@ -156,6 +156,11 @@ One coordinating agent owns the Git graph for a multi-PR effort. Before implemen
 it records a stack manifest with each issue, branch, base, dependency, migration number or
 `none`, shared file, and required focused gate.
 
+The product ships the tool-independent half of these rules to every session that can spawn
+(`COORDINATION_SYSTEM_PROMPT` in `orchestrator/src/prompts/base.ts`, plus the coordination
+tool descriptions in `orchestrator/src/tools/coordination.ts`) — keep the two in sync, the
+way the "Writing" bullet below tracks `WRITING_STYLE_SYSTEM_PROMPT`.
+
 - Use real stacked bases when several dependent PRs must stay clean at the same time. If
   every PR targets `main`, keep only the next PR in merge order green. After it merges,
   rebase its immediate successor. Do not rebase every descendant after every merge.

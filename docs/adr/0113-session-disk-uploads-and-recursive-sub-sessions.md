@@ -97,6 +97,27 @@ Deleting one child terminates only that task. Deleting a root recursively
 terminates its descendants. `ListTasks` hides sub-sessions unless requested;
 `GetTask` returns descendants so the root page can render the tree.
 
+### How a session learns to coordinate (amendment)
+
+The tools alone do not produce good coordination. A first run of a multi-PR
+epic spawned 66 children for 6 pull requests, and most of them were review,
+rebase, or retry sessions that a single child could have done. The guidance
+therefore ships with the product, at three levels:
+
+- The tool descriptions carry the contract the model reads at the call site:
+  one child for each unit of work, `send_session_message` before a second
+  spawn, and `wait_sessions` in place of a read loop.
+- The orchestrator appends a coordination playbook to the system prompt for
+  the rules that span several tools and turns. It is gated on the COMPILED
+  tool manifest, not on the task type, so a session that cannot spawn never
+  reads how to spawn.
+- The harness redirects its own sub-agent built-in to `spawn_session`, and its
+  hook denies that built-in while the durable replacement is present. A
+  sub-agent lives inside one turn and can leave no branch behind, so a model
+  that reaches for it silently loses the work. The redirect and the denial
+  read one shared predicate, so they cannot disagree. The condition comes from
+  the manifest, so the harness learns no orchestrator modes.
+
 ## Consequences
 
 - Uploaded files have session lifetime. They are not user-library objects.

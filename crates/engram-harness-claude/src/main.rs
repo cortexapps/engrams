@@ -152,6 +152,14 @@ mod adapter {
             .filter(|tool| tool.native_bindings.claude.is_none())
     }
 
+    /// True when the orchestrator surfaced the durable sub-session tool to
+    /// this session. The system-prompt redirect and the bridge's Task denial
+    /// both hang off this ONE predicate, so the two can never disagree about
+    /// whether a session has a replacement for Task.
+    pub(crate) fn spawn_session_injected(manifest: &ToolManifest) -> bool {
+        injected_tools(manifest).any(|tool| tool.name == "spawn_session")
+    }
+
     /// System-prompt guidance for injected tools that REPLACE removed CLI
     /// built-ins. Claude >= 2.1.187 dropped `AskUserQuestion` and
     /// `ExitPlanMode` from headless `--print` mode, but the model's training
@@ -195,6 +203,22 @@ mod adapter {
                  list, get, share, or unshare hosted artifacts, call the \
                  mcp__engrams__Artifact tool directly (it is already loaded) — never the \
                  bare name Artifact.",
+            );
+        }
+        // The model reaches for the built-in Task tool whenever it wants
+        // parallelism, even when the user asks for a sub-session by name. A
+        // sub-agent is in-process and disappears with the turn, so the work
+        // it does never reaches a branch or a pull request. The bridge denies
+        // Task under the same condition (`hook_bridge::run`); this line makes
+        // the model choose the durable tool BEFORE it burns a denial.
+        if spawn_session_injected(manifest) {
+            lines.push(
+                "The built-in Task tool is not available here. A sub-agent runs inside \
+                 this turn and leaves nothing behind. To do work in parallel, call the \
+                 mcp__engrams__spawn_session tool directly (it is already loaded): a \
+                 child session is durable, owns its own sandbox, and can open a pull \
+                 request. Where instructions mention sub-agents, use \
+                 mcp__engrams__spawn_session instead.",
             );
         }
         if lines.is_empty() {
@@ -1052,6 +1076,19 @@ mod adapter {
                 return std::process::ExitCode::SUCCESS;
             }
 
+            // A sub-agent is in-process: it disappears with the turn and can
+            // leave no branch and no pull request behind. When this session
+            // carries the durable equivalent, deny Task and NAME the
+            // replacement — the denial reason reaches the model, which is what
+            // made the AskUserQuestion redirect stick where prompt guidance
+            // alone did not (`injected_tool_guidance` carries the same
+            // redirect for the turns before a denial happens). Gated on the
+            // manifest, so a session without coordination tools keeps Task.
+            if tool_name == "Task" && spawn_session_available() {
+                print_deny(TASK_DENIAL_REASON);
+                return std::process::ExitCode::SUCCESS;
+            }
+
             // Ordinary built-ins (including ToolSearch) → allow. Manifest MCP
             // tools MUST round-trip so the main process can apply their sync /
             // deferred policy and emit the generic request event, and so must
@@ -1201,6 +1238,13 @@ mod adapter {
             names
         }
 
+        /// True when the orchestrator surfaced the durable sub-session tool to
+        /// THIS session. The bridge is a fresh process per fire, so it reads
+        /// the manifest from the environment it inherits from claude.
+        pub(super) fn spawn_session_available() -> bool {
+            super::spawn_session_injected(&super::manifest_from_env())
+        }
+
         pub(super) fn tracked_bash_cwd(tracker: &Path) -> PathBuf {
             let tracked = std::fs::read_to_string(tracker).ok().and_then(|raw| {
                 let path = PathBuf::from(raw.trim_end_matches(['\r', '\n']));
@@ -1295,6 +1339,16 @@ mod adapter {
                 r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"defer"}}}}"#
             );
         }
+        /// The denial the model reads when it reaches for a sub-agent. It has
+        /// to NAME the replacement: a bare refusal makes the model retry Task
+        /// under a different description instead of switching tools.
+        pub(super) const TASK_DENIAL_REASON: &str =
+            "Sub-agents are not available in this session. They run inside one turn and \
+             leave no branch, commit, or pull request behind. Call \
+             mcp__engrams__spawn_session instead: a child session is durable and owns its \
+             own sandbox. Spawn one child for each unit of work, and send follow-up work \
+             to it with mcp__engrams__send_session_message.";
+
         pub(super) fn deny_output(reason: &str) -> serde_json::Value {
             serde_json::json!({
                 "hookSpecificOutput": {
@@ -4582,6 +4636,38 @@ mod adapter {
                 ToolExecution::Sync
             )])
             .is_none());
+        }
+
+        /// The model reaches for the built-in Task tool whenever it wants
+        /// parallelism. A session that carries the durable replacement gets a
+        /// redirect; one that does not keeps Task and must never be told
+        /// about a tool it cannot call.
+        #[test]
+        fn spawn_session_redirects_the_task_built_in() {
+            let with_spawn = vec![generic_tool("spawn_session", ToolExecution::Sync)];
+            assert!(spawn_session_injected(&with_spawn));
+            let text = injected_tool_guidance(&with_spawn).expect("guidance for spawn_session");
+            assert!(text.contains("mcp__engrams__spawn_session"));
+            assert!(text.contains("Task"));
+
+            let without = vec![generic_tool("save_memory", ToolExecution::Sync)];
+            assert!(!spawn_session_injected(&without));
+            assert!(injected_tool_guidance(&without).is_none());
+            assert!(!spawn_session_injected(&Vec::new()));
+        }
+
+        /// The bridge denies Task under the SAME predicate as the redirect,
+        /// and the denial names the replacement — a bare refusal makes the
+        /// model retry Task instead of switching tools.
+        #[test]
+        fn task_denial_names_the_durable_replacement() {
+            let output = hook_bridge::deny_output(hook_bridge::TASK_DENIAL_REASON);
+            assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+            let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .expect("a denial reason");
+            assert!(reason.contains("mcp__engrams__spawn_session"));
+            assert!(reason.contains("mcp__engrams__send_session_message"));
         }
 
         #[test]
