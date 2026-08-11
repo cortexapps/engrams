@@ -11,6 +11,13 @@
  *
  *   GET /api/v1/integrations/:provider/oauth/authorize  (admin) → 302 to the IdP
  *   GET /api/v1/integrations/:provider/oauth/callback           → exchange + 302 back
+ *   GET /api/v1/me/connector-credentials/:provider/oauth/authorize
+ *       (any member, ADR 0115) → 302 to the IdP with a user_connector subject
+ *
+ * ONE registered callback URL serves org-subject AND user-subject completions
+ * (providers require an exact-match redirect URI): the callback resolves the
+ * flow's non-secret subject via LookupRedirectFlow and dispatches to the
+ * matching authorization check + finish page.
  *
  * Generic over any oauth-facet connector — Slack and Linear are the first.
  */
@@ -33,7 +40,7 @@ import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 
 type OauthCredentialClient = Pick<
   typeof defaultOauthCredential,
-  "beginRedirectFlow" | "completeRedirectFlow"
+  "beginRedirectFlow" | "completeRedirectFlow" | "lookupRedirectFlow"
 >;
 
 type GetSession = (
@@ -78,6 +85,12 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
     return { id: session.user.id };
   }
 
+  async function requireUser(headers: Headers): Promise<{ id: string }> {
+    const session = await getSession(headers);
+    if (!session) throw new HTTPException(401, { message: "unauthenticated" });
+    return { id: session.user.id };
+  }
+
   async function oauthConnector(provider: string): Promise<Connector> {
     const registry = await loadRegistry(connectorSource());
     const conn = registry.get(provider);
@@ -102,6 +115,14 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
     return c.redirect(`${base}?${qs}`);
   }
 
+  // ADR 0115: a member's personal flow lands on their credentials page.
+  function finishUser(provider: string, ok: boolean, message: string, c: Context) {
+    const qs = ok
+      ? `connected=${encodeURIComponent(provider)}`
+      : `error=${encodeURIComponent(message)}`;
+    return c.redirect(`/settings/credentials?${qs}`);
+  }
+
   app.get("/api/v1/integrations/:provider/oauth/authorize", async (c) => {
     await requireAdmin(c.req.raw.headers);
     const provider = c.req.param("provider");
@@ -118,6 +139,30 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
     return c.redirect(authorizeUrl);
   });
 
+  // ADR 0115: a member connects a connector with THEIR OWN subject. Not
+  // admin-gated, and deliberately never calls `ensureDefault` (no connection
+  // rows are created on a member's behalf) — the subject is the user id.
+  app.get("/api/v1/me/connector-credentials/:provider/oauth/authorize", async (c) => {
+    const user = await requireUser(c.req.raw.headers);
+    const provider = c.req.param("provider");
+    const connector = await oauthConnector(provider);
+    if (connector.userCredential?.oauth !== true) {
+      throw new HTTPException(404, {
+        message: `connector "${provider}" has no user-scoped OAuth flow`,
+      });
+    }
+    const force = c.req.query("force") === "1";
+    const { authorizeUrl } = await oauthCredential.beginRedirectFlow({
+      subject: { kind: OauthSubjectKind.USER_CONNECTOR, id: user.id },
+      provider,
+      spec: redirectOauthSpec(connector, force ? { prompt: "consent" } : undefined),
+      // The provider requires an exact-match registered redirect URI, so the
+      // user flow shares the org callback; the flow row carries the subject.
+      redirectUri: redirectUri(provider),
+    });
+    return c.redirect(authorizeUrl);
+  });
+
   app.get("/api/v1/integrations/:provider/oauth/callback", async (c) => {
     const provider = c.req.param("provider");
     const idpError = c.req.query("error");
@@ -126,24 +171,46 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
     const code = c.req.query("code");
     const state = c.req.query("state");
     if (!code || !state) throw new HTTPException(400, { message: "missing code or state" });
-    // The callback carries the admin's session cookie; the durable flow row
-    // (looked up by `state` coordinator-side) is the CSRF check.
-    await requireAdmin(c.req.raw.headers);
+
+    // The durable flow row (looked up by `state`) names the subject this flow
+    // belongs to; dispatch to the matching authorization check. The row is
+    // also the CSRF fence — completion is subject-checked coordinator-side.
+    let flowSubject: { kind: OauthSubjectKind; id: string };
+    try {
+      const lookup = await oauthCredential.lookupRedirectFlow({ flowId: state });
+      if (!lookup.subject) throw new HTTPException(400, { message: "unknown OAuth flow" });
+      flowSubject = lookup.subject;
+    } catch (err) {
+      if (err instanceof HTTPException) throw err;
+      const message = err instanceof ConnectError ? err.rawMessage : "unknown OAuth flow";
+      return finish(provider, false, message, c);
+    }
+    const isUserFlow = flowSubject.kind === OauthSubjectKind.USER_CONNECTOR;
+    if (isUserFlow) {
+      const user = await requireUser(c.req.raw.headers);
+      if (user.id !== flowSubject.id) {
+        throw new HTTPException(403, { message: "this OAuth flow belongs to another user" });
+      }
+    } else {
+      // The callback carries the admin's session cookie.
+      await requireAdmin(c.req.raw.headers);
+    }
 
     const connector = await oauthConnector(provider);
+    const done = isUserFlow ? finishUser : finish;
     try {
       await oauthCredential.completeRedirectFlow({
-        subject: await subjectFor(connector),
+        subject: flowSubject,
         provider,
         flowId: state,
         code,
         redirectUri: redirectUri(provider),
         spec: redirectOauthSpec(connector),
       });
-      return finish(provider, true, "connected", c);
+      return done(provider, true, "connected", c);
     } catch (err) {
       const message = err instanceof ConnectError ? err.rawMessage : "OAuth exchange failed";
-      return finish(provider, false, message, c);
+      return done(provider, false, message, c);
     }
   });
 

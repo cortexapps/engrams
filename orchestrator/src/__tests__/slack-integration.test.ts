@@ -200,10 +200,19 @@ describe("oauth facet parse", () => {
 
 // ── The OAuth acquisition route (durable-flow CSRF, coordinator-side) ───────
 
-function fakeRedirectClient(opts?: { completeError?: ConnectError }) {
-  const calls: { begin: BeginRedirectFlowRequest[]; complete: CompleteRedirectFlowRequest[] } = {
+function fakeRedirectClient(opts?: {
+  completeError?: ConnectError;
+  lookupError?: ConnectError;
+  flowSubject?: { kind: OauthSubjectKind; id: string };
+}) {
+  const calls: {
+    begin: BeginRedirectFlowRequest[];
+    complete: CompleteRedirectFlowRequest[];
+    lookup: Array<{ flowId: string }>;
+  } = {
     begin: [],
     complete: [],
+    lookup: [],
   };
   const client = {
     beginRedirectFlow: async (req: BeginRedirectFlowRequest) => {
@@ -218,6 +227,19 @@ function fakeRedirectClient(opts?: { completeError?: ConnectError }) {
       calls.complete.push(req);
       if (opts?.completeError) throw opts.completeError;
       return { credential: { provider: "slack", connected: true } };
+    },
+    // ADR 0115: the callback resolves the flow's subject before completing.
+    lookupRedirectFlow: async (req: { flowId: string }) => {
+      calls.lookup.push(req);
+      if (opts?.lookupError) throw opts.lookupError;
+      return {
+        subject: opts?.flowSubject ?? {
+          kind: OauthSubjectKind.CONNECTOR,
+          id: "conn-slack-default",
+        },
+        provider: "slack",
+        status: "pending",
+      };
     },
   };
   return { client, calls };
@@ -320,6 +342,132 @@ describe("integration oauth route", () => {
     });
     const res = await app.request("/api/v1/integrations/slack/oauth/callback");
     expect(res.status).toBe(400);
+    expect(calls.complete).toHaveLength(0);
+  });
+
+  // ── ADR 0115: user-subject flows over the SAME registered callback ────────
+
+  const userOauthConnector = {
+    provider: "acmeoauth",
+    protocol: "http",
+    credential: {
+      source: "inject",
+      injects: [{ header: "Authorization", template: "Bearer {}" }],
+    },
+    hosts: ["api.acmeoauth.test"],
+    operations: [{ grants: ["issues:write"], match: { method: "POST", path: "/issues*" } }],
+    oauth: {
+      authorizeUrl: "https://acmeoauth.test/oauth/authorize",
+      acquisitionHosts: ["acmeoauth.test"],
+      tokenUrl: "https://api.acmeoauth.test/oauth/token",
+      scopes: ["read"],
+      clientIdRef: "acmeoauth.client_id",
+      clientSecretRef: "acmeoauth.client_secret",
+    },
+    userCredential: { oauth: true },
+  };
+  const userSource = {
+    list: async () => [{ provider: "acmeoauth", config: userOauthConnector }],
+  };
+  const memberSession = async () => ({ user: { id: "u2", role: "user" } });
+
+  test("user authorize: any member → 302 with a user_connector subject", async () => {
+    const { client, calls } = fakeRedirectClient();
+    const app = makeIntegrationOauthRoute({
+      connectors: userSource,
+      oauthCredential: client as never,
+      connectionIdFor,
+      getSession: memberSession,
+    });
+    const res = await app.request("/api/v1/me/connector-credentials/acmeoauth/oauth/authorize");
+    expect(res.status).toBe(302);
+    const begin = calls.begin[0]!;
+    expect(begin.subject?.kind).toBe(OauthSubjectKind.USER_CONNECTOR);
+    expect(begin.subject?.id).toBe("u2");
+    // The provider requires an exact-match redirect URI — the user flow
+    // shares the org callback.
+    expect(begin.redirectUri).toContain("/api/v1/integrations/acmeoauth/oauth/callback");
+  });
+
+  test("user authorize: 404 without userCredential.oauth", async () => {
+    const { client } = fakeRedirectClient();
+    const app = makeIntegrationOauthRoute({
+      connectors: emptySource,
+      oauthCredential: client as never,
+      connectionIdFor,
+      getSession: memberSession,
+    });
+    // The built-in slack seed has an oauth facet but no user-scoped support.
+    const res = await app.request("/api/v1/me/connector-credentials/slack/oauth/authorize");
+    expect(res.status).toBe(404);
+  });
+
+  test("callback: a user-subject flow completes for its owner → credentials page", async () => {
+    const { client, calls } = fakeRedirectClient({
+      flowSubject: { kind: OauthSubjectKind.USER_CONNECTOR, id: "u2" },
+    });
+    const app = makeIntegrationOauthRoute({
+      connectors: emptySource,
+      oauthCredential: client as never,
+      connectionIdFor,
+      getSession: memberSession,
+    });
+    const res = await app.request(
+      "/api/v1/integrations/slack/oauth/callback?code=abc&state=10600000-0000-4000-8000-0000000000aa",
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/settings/credentials?connected=slack");
+    expect(calls.complete[0]!.subject).toMatchObject({
+      kind: OauthSubjectKind.USER_CONNECTOR,
+      id: "u2",
+    });
+  });
+
+  test("callback: a user-subject flow is fenced to its owner", async () => {
+    const { client, calls } = fakeRedirectClient({
+      flowSubject: { kind: OauthSubjectKind.USER_CONNECTOR, id: "someone-else" },
+    });
+    const app = makeIntegrationOauthRoute({
+      connectors: emptySource,
+      oauthCredential: client as never,
+      connectionIdFor,
+      getSession: memberSession,
+    });
+    const res = await app.request(
+      "/api/v1/integrations/slack/oauth/callback?code=abc&state=10600000-0000-4000-8000-0000000000aa",
+    );
+    expect(res.status).toBe(403);
+    expect(calls.complete).toHaveLength(0);
+  });
+
+  test("callback: an org-subject flow still requires an admin", async () => {
+    const { client, calls } = fakeRedirectClient();
+    const app = makeIntegrationOauthRoute({
+      connectors: emptySource,
+      oauthCredential: client as never,
+      connectionIdFor,
+      getSession: memberSession,
+    });
+    const res = await app.request(
+      "/api/v1/integrations/slack/oauth/callback?code=abc&state=10600000-0000-4000-8000-0000000000aa",
+    );
+    expect(res.status).toBe(403);
+    expect(calls.complete).toHaveLength(0);
+  });
+
+  test("callback: an unknown flow id (forged state) → error redirect at lookup", async () => {
+    const { client, calls } = fakeRedirectClient({
+      lookupError: new ConnectError("OAuth resource not found", Code.NotFound),
+    });
+    const app = makeIntegrationOauthRoute({
+      connectors: emptySource,
+      oauthCredential: client as never,
+      connectionIdFor,
+      getSession: adminSession,
+    });
+    const res = await app.request("/api/v1/integrations/slack/oauth/callback?code=abc&state=forged");
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toContain("error=");
     expect(calls.complete).toHaveLength(0);
   });
 });

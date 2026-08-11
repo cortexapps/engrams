@@ -27,6 +27,8 @@
  */
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
+import { Code, ConnectError } from "@connectrpc/connect";
+import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
 import {
   routeSessionEvent,
@@ -217,7 +219,18 @@ async function slackThreadWorkflowImpl(): Promise<void> {
     // Surface WHY it failed — this path used to swallow the cause, leaving only
     // the generic "Couldn't start a session" with no way to diagnose.
     log.error({ channel: m.channel, thread: m.threadRoot, err }, "slack: failed to start session");
-    await step(() => pol.onFail(mention, CREATE_FAIL_MSG), "onFail");
+    // A FailedPrecondition's message is written to be user-facing (missing
+    // harness or personal integration credentials, disabled image/connection):
+    // post it instead of a dead-end generic failure, with a direct link when
+    // it points at the credentials page.
+    let message = CREATE_FAIL_MSG;
+    if (err instanceof ConnectError && err.code === Code.FailedPrecondition) {
+      message = err.rawMessage;
+      if (message.includes("Settings → Credentials")) {
+        message += ` ${config.baseUrl.replace(/\/$/, "")}/settings/credentials`;
+      }
+    }
+    await step(() => pol.onFail(mention, message), "onFail");
     return;
   }
 

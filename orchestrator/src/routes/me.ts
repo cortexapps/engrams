@@ -33,6 +33,9 @@ import { harnessCatalog as defaultHarnessCatalog } from "../control-plane/client
 import { oauthCredential as defaultOAuthCredential } from "../control-plane/client.ts";
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
+import { loadRegistry, type CustomConnectorSource } from "../connectors/registry.ts";
+import { makeConnectorStore } from "../db/connectors.ts";
+import { getDb } from "../db/client.ts";
 import type { GetSession } from "./guard.ts";
 
 // ---------------------------------------------------------------------------
@@ -77,6 +80,8 @@ export interface MeDeps {
   harnessCatalog?: HarnessCatalogReader;
   getSession?: GetSession;
   oauth?: OAuthCredentialClient;
+  /** ADR 0115: custom-connector source for the user-credential surface. */
+  connectors?: CustomConnectorSource;
 }
 
 export interface OAuthCredentialClient {
@@ -99,6 +104,7 @@ export interface OAuthCredentialClient {
       provider: string;
       version: bigint;
       connected: boolean;
+      status: string;
       account?: {
         displayName?: string;
         planType?: string;
@@ -113,6 +119,12 @@ export interface OAuthCredentialClient {
     subject: { kind: OauthSubjectKind; id: string };
     provider: string;
     expectedVersion: bigint;
+  }): Promise<unknown>;
+  /** ADR 0115: seal a user-entered personal access token (user_connector). */
+  putCredential(req: {
+    subject: { kind: OauthSubjectKind; id: string };
+    provider: string;
+    secret: string;
   }): Promise<unknown>;
 }
 
@@ -181,6 +193,40 @@ export function makeMeRoute(deps?: MeDeps): Hono {
     id: userId,
   });
 
+  // ADR 0115: personal CONNECTOR credentials live under a distinct subject
+  // kind, so the harness (`user`) and connector (`user_connector`) planes can
+  // never enumerate or overwrite one another.
+  const connectorSubject = (userId: string) => ({
+    kind: OauthSubjectKind.USER_CONNECTOR,
+    id: userId,
+  });
+
+  const resolveConnectors = (): CustomConnectorSource =>
+    deps?.connectors ?? makeConnectorStore(getDb());
+
+  /** Connectors declaring user-scoped support → member-safe surface data.
+   *  The map's keys are the only providers the PAT PUT/DELETE routes accept. */
+  async function connectorUnion(): Promise<
+    Map<string, { name: string; oauth: boolean; token: boolean; tokenHint?: string }>
+  > {
+    const registry = await loadRegistry(resolveConnectors());
+    const union = new Map<
+      string,
+      { name: string; oauth: boolean; token: boolean; tokenHint?: string }
+    >();
+    for (const connector of registry.values()) {
+      const uc = connector.userCredential;
+      if (!uc) continue;
+      union.set(connector.provider, {
+        name: connector.display.name,
+        oauth: uc.oauth === true,
+        token: uc.token !== undefined,
+        ...(uc.token ? { tokenHint: uc.token.hint } : {}),
+      });
+    }
+    return union;
+  }
+
   // GET /api/v1/me/harness-env — the env vars the registered harnesses ask for,
   // each with whether the caller has set it. This is the settings-page list.
   app.get("/api/v1/me/harness-env", async (c) => {
@@ -238,12 +284,39 @@ export function makeMeRoute(deps?: MeDeps): Hono {
   // existing sealed-value flow; OAuth entries expose metadata and lifecycle.
   app.get("/api/v1/me/credentials", async (c) => {
     const user = await requireUser(c.req.raw.headers);
-    const [envVars, providers, oauthRows] = await Promise.all([
+    const [envVars, providers, connectors, oauthRows, connectorRows] = await Promise.all([
       userEnvUnion(),
       oauthUnion(),
+      connectorUnion(),
       resolveOAuth().listCredentials({ subject: oauthSubject(user.id) }),
+      resolveOAuth().listCredentials({ subject: connectorSubject(user.id) }),
     ]);
     const byProvider = new Map(oauthRows.credentials.map((row) => [row.provider, row]));
+    const connectorByProvider = new Map(
+      connectorRows.credentials.map((row) => [row.provider, row]),
+    );
+    // ADR 0115: one entry per connector declaring user-scoped support, joined
+    // against the caller's personal credential row (PAT or OAuth — one slot).
+    const connectorEntries = [...connectors.entries()].map(([provider, entry]) => {
+      const row = connectorByProvider.get(provider);
+      return {
+        kind: "connector" as const,
+        provider,
+        display: { name: entry.name },
+        modes: { oauth: entry.oauth, token: entry.token },
+        ...(entry.tokenHint ? { tokenHint: entry.tokenHint } : {}),
+        connected: row?.connected ?? false,
+        status: row?.status ?? "",
+        ...(row
+          ? {
+              version: Number(row.version),
+              account: row.account,
+              createdAt: row.createdAt,
+              updatedAt: row.updatedAt,
+            }
+          : {}),
+      };
+    });
     const secretEntries = await Promise.all(
       [...envVars.entries()].map(async ([envVar, entry]) => ({
         kind: "secret_env" as const,
@@ -271,7 +344,57 @@ export function makeMeRoute(deps?: MeDeps): Hono {
           : {}),
       };
     });
-    return c.json({ credentials: [...oauthEntries, ...secretEntries] });
+    return c.json({ credentials: [...oauthEntries, ...secretEntries, ...connectorEntries] });
+  });
+
+  // ADR 0115: seal a personal access token for a connector. 404 unless the
+  // connector declares token mode — a client can't seal arbitrary providers.
+  app.put("/api/v1/me/connector-credentials/:provider", async (c) => {
+    const user = await requireUser(c.req.raw.headers);
+    const provider = c.req.param("provider");
+    const entry = (await connectorUnion()).get(provider);
+    if (!entry?.token) {
+      throw new HTTPException(404, {
+        message: `connector "${provider}" does not accept a personal token`,
+      });
+    }
+    let body: { value?: unknown };
+    try {
+      body = (await c.req.json()) as { value?: unknown };
+    } catch {
+      throw new HTTPException(400, { message: "invalid JSON body" });
+    }
+    const value = typeof body.value === "string" ? body.value.trim() : undefined;
+    if (!value) {
+      throw new HTTPException(400, { message: "value must not be empty" });
+    }
+    // NEVER log the value. Sealed in the coordinator's credential store.
+    await resolveOAuth().putCredential({
+      subject: connectorSubject(user.id),
+      provider,
+      secret: value,
+    });
+    return new Response(null, { status: 204 });
+  });
+
+  // ADR 0115: disconnect a personal connector credential (PAT or OAuth).
+  app.delete("/api/v1/me/connector-credentials/:provider", async (c) => {
+    const user = await requireUser(c.req.raw.headers);
+    const provider = c.req.param("provider");
+    if (!(await connectorUnion()).has(provider)) {
+      throw new HTTPException(404, {
+        message: `connector "${provider}" has no user-scoped credentials`,
+      });
+    }
+    const rows = await resolveOAuth().listCredentials({ subject: connectorSubject(user.id) });
+    const row = rows.credentials.find((credential) => credential.provider === provider);
+    if (!row || !row.connected) return new Response(null, { status: 204 });
+    await resolveOAuth().disconnect({
+      subject: connectorSubject(user.id),
+      provider,
+      expectedVersion: row.version,
+    });
+    return new Response(null, { status: 204 });
   });
 
   app.post("/api/v1/me/credentials/:provider/connect", async (c) => {
