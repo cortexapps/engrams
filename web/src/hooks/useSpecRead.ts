@@ -5,19 +5,11 @@ import type {
   SectionStateTranscriptChip,
 } from "@engrams/spec-document";
 
-import { API_BASE } from "@/lib/base";
+import { specRequest } from "@/lib/spec-api";
 
 const DRAFT_REFETCH_INTERVAL_MS = 5_000;
 
-export class SpecRequestError extends Error {
-  constructor(
-    readonly path: string,
-    readonly status: number,
-  ) {
-    super(`${path} → ${status}`);
-    this.name = "SpecRequestError";
-  }
-}
+export { SpecRequestError } from "@/lib/spec-api";
 
 export interface SpecCheckpointSummary {
   id: string;
@@ -71,19 +63,11 @@ export interface SpecReadResponse {
     publishedCheckpointId: string | null;
     publishedAt: string | null;
     revision: string;
+    /** The template the spec locked when its session started (ADR 0114 D3). */
+    template: { id: string; name: string };
   };
   checkpoints: SpecCheckpointSummary[];
   publishedCheckpoint: SpecCheckpoint | null;
-}
-
-async function specRequest<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    credentials: "include",
-    headers: { Accept: "application/json", ...init?.headers },
-    ...init,
-  });
-  if (!response.ok) throw new SpecRequestError(path, response.status);
-  return response.json() as Promise<T>;
 }
 
 export function useSpecRead(specId: string) {

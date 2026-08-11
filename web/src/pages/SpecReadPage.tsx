@@ -1,6 +1,6 @@
 import { Link, useParams } from "@tanstack/react-router";
 import { useMutation } from "@connectrpc/connect-query";
-import { Check, Clock3, GitCompareArrows, History, Radio, RotateCcw } from "lucide-react";
+import { Check, Clock3, GitCompareArrows, History, Lock, Radio, RotateCcw } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { SpecSelectionActionPayload } from "@engrams/spec-document";
 
@@ -35,6 +35,7 @@ import {
   useSpecRead,
   useUndoSpecSectionState,
 } from "@/hooks/useSpecRead";
+import { TEMPLATE_LOCK_REASON } from "./specs/template-lock";
 import "./spec-read.css";
 
 export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
@@ -136,6 +137,7 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
               ? "You are in the live document with the other collaborators."
               : `Read-only at the pinned checkpoint${spec.publishedAt ? ` · ${formatDate(spec.publishedAt)}` : ""}.`}
           </p>
+          <LockedTemplate name={spec.template.name} />
         </div>
         {spec.sessionId && (
           <Button asChild variant="outline">
@@ -449,6 +451,26 @@ function SpecReadLoading() {
       </div>
       <Skeleton className="min-h-[38rem] w-full" />
     </main>
+  );
+}
+
+/**
+ * The template this spec locked at creation (ADR 0114 D3, R3).
+ *
+ * The control is disabled rather than absent, so the reason is where a person
+ * looks for the choice they made.
+ */
+function LockedTemplate({ name }: { name: string }) {
+  return (
+    <div className="spec-read-template">
+      <label htmlFor="spec-template-locked">Template</label>
+      <select id="spec-template-locked" disabled value="locked" title={TEMPLATE_LOCK_REASON}>
+        <option value="locked">{name}</option>
+      </select>
+      <span>
+        <Lock aria-hidden="true" /> {TEMPLATE_LOCK_REASON}
+      </span>
+    </div>
   );
 }
 

@@ -160,6 +160,10 @@ vi.mock("@/hooks/useSpecRead", () => ({
         publishedCheckpointId: view.publishedCheckpointId,
         publishedAt: view.lifecycle === "published" ? pinned.createdAt : null,
         revision: "17",
+        template: {
+          id: "00000000-0000-4000-8000-000000000115",
+          name: "Engineering design doc",
+        },
       },
       checkpoints: [
         {
@@ -214,6 +218,15 @@ describe("SpecReadPage", () => {
     );
     expect(screen.getByText("Live draft")).toBeTruthy();
     expect(screen.queryByText("Open owner session")).toBeNull();
+  });
+
+  it("shows the locked template with the reason it cannot change", async () => {
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    const control = await screen.findByLabelText("Template");
+    expect((control as HTMLSelectElement).disabled).toBe(true);
+    expect(control.textContent).toBe("Engineering design doc");
+    expect(screen.getByText("The template is locked once the session starts.")).toBeTruthy();
   });
 
   it("opens a published spec at the pinned read-only checkpoint", async () => {

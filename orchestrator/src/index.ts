@@ -55,7 +55,11 @@ import { registerSpecs } from "./rpc/specs.ts";
 import { registerAutomations } from "./rpc/automations.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
-import { sessions as controlPlaneSessions } from "./control-plane/client.ts";
+import {
+  harnessCatalog as controlPlaneHarnessCatalog,
+  images as controlPlaneImages,
+  sessions as controlPlaneSessions,
+} from "./control-plane/client.ts";
 import type { ConnectRouter } from "@connectrpc/connect";
 // ADR 0060: embedded DBOS engine. Workflow modules (P1+) must be imported
 // ABOVE the initDbos() call below so their workflows/steps are registered
@@ -101,6 +105,9 @@ import { makeSpecRailRoute, PostgresSpecRailStore } from "./routes/spec-rail.ts"
 import { makeSpecBlockIterationRoute } from "./routes/spec-block-iteration.ts";
 import { makeSpecTemplatesRoute } from "./routes/spec-templates.ts";
 import { makeSpecTemplateCatalog } from "./specs/template-catalog.ts";
+import { createSpec, makeSpecCreateStore } from "./specs/create.ts";
+import { createTaskWithSession } from "./rpc/task-create.ts";
+import { makeUserSecretStore } from "./db/user-secrets.ts";
 import { productionSpecProjection } from "./specs/projection.ts";
 import { PostgresSpecCheckpointStore, SpecCheckpointService } from "./specs/checkpoints.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
@@ -194,6 +201,42 @@ app.route(
     checkpointStore: specCheckpointStore,
     checkpoints: specCheckpoints,
     resolveMembership: resolveSpecMembership,
+    orgId: config.deploymentId,
+    create: (request) =>
+      createSpec(
+        {
+          store: makeSpecCreateStore(getDb()),
+          catalog: makeSpecTemplateCatalog(),
+          documents: specDocuments,
+          // R5: a spec session is an ordinary session on the chosen profile, so
+          // it rides the one create primitive. The task type "spec" is what
+          // selects the spec tool manifest and the spec-mode system prompt.
+          startSession: async (input) => {
+            await createTaskWithSession(
+              {
+                profiles: makeProfileStore(getDb()),
+                images: controlPlaneImages,
+                connectors: { list: () => makeConnectorStore(getDb()).list() },
+                harnessCatalog: controlPlaneHarnessCatalog,
+                sessions: controlPlaneSessions,
+                secrets: makeUserSecretStore(getDb()),
+                db: getDb(),
+                newTaskId: () => input.taskId,
+                newSessionId: () => input.sessionId,
+              },
+              {
+                type: "spec",
+                ownerUserId: input.ownerUserId,
+                profileId: input.profileId,
+                title: input.title,
+                prompt: input.prompt,
+                specTemplate: input.specTemplate,
+              },
+            );
+          },
+        },
+        request,
+      ),
   }),
 );
 app.route(
