@@ -593,6 +593,17 @@ pub enum ForgeOp {
         expected_version: i64,
         opaque_bundle: Vec<u8>,
     },
+    /// Report that the provider terminally rejected this session's OAuth
+    /// credential and the guest could not repair it. The host marks the
+    /// credential broken so its status reads "reconnect" instead of
+    /// "connected". Compare-and-swap on `expected_version`: a version that
+    /// has moved means a racing session already repaired the credential, and
+    /// the report is dropped. The reply is [`ForgeResponse::Error`] on
+    /// failure and [`ForgeResponse::OAuthCredentialBroken`] on success.
+    ReportOAuthCredentialBroken {
+        expected_version: i64,
+        reason: String,
+    },
 }
 
 /// The host's reply to a [`ForgeRequest`].
@@ -612,6 +623,10 @@ pub enum ForgeResponse {
         version: i64,
         opaque_bundle: Vec<u8>,
     },
+    /// Acknowledges [`ForgeOp::ReportOAuthCredentialBroken`]. Carries no
+    /// bundle: the guest has nothing left to run with, and re-sending a
+    /// rejected credential would only invite a retry loop.
+    OAuthCredentialBroken,
 }
 
 // ---- Artifact upload bridge (ADR 0026) ---------------------------------

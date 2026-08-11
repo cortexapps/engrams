@@ -152,3 +152,49 @@ only in `oauth_credentials` under `subject_kind = 'connector'`.
   instead of gaining a sibling RPC, and `OAuthCredentialMeta` now
   carries the derived status (`connected|expired|broken|revoked`) that
   the connector UI maps to connected / needs-reconnect.
+
+## Addendum: harness credential health (2026-08-11)
+
+ADR 0115 keeps harness (`user`) subjects out of the refresh sweep: their
+bundles are opaque, so they refresh in-guest over the session control
+channel. That division is right, and research while diagnosing a dead
+session confirmed it is not merely a convenience. ChatGPT refresh tokens
+are **single-use and rotate with no grace period**, so a second refresher
+does not add redundancy — it invalidates the first. A coordinator-side
+sweep over harness subjects would rotate the grant out from under every
+live session on a timer. There must be exactly one refresher per
+credential, and for harness bundles that is the guest.
+
+Two gaps let a dead credential stay invisible, and both are closed here.
+
+- **The row now records an expiry.** The Codex driver returned
+  `expires_at: None`, so `status()` could only ever say `connected` —
+  even for a credential the provider had stopped accepting. The auth
+  cache stores no expiry of its own (only `last_refresh`), so the value
+  comes from the access token's own `exp` claim, decoded without
+  signature verification: it authorizes nothing and feeds status
+  derivation only. An unreadable claim degrades to `None` rather than
+  failing the login. This does NOT enter the row into the sweep, which
+  still selects `connector` / `user_connector` kinds only.
+- **The control channel now reports failure, not just success.** It
+  carried refreshed bundles up (`UpdateOAuthCredential`) but had no way
+  to say "the provider refused this and I could not repair it". The
+  guest is the only observer of that, so `ReportOAuthCredentialBroken`
+  is appended to `ForgeOp`, setting `broken_at` / `broken_reason` under
+  the same version CAS. A stale reporter whose version has moved is
+  dropped: a racing session already repaired the credential.
+
+The guest's repair ladder reads the **store before the provider**. On a
+failed turn it probes `account/rateLimits/read` — a live authenticated
+call, unlike `account/read`, which answers from local cache and succeeds
+with a token the provider has already revoked. On a 401 it first asks the
+coordinator for the stored bundle and adopts it if the version moved
+(free, and the common multi-session race), and only then spends its own
+single-use grant. That spend is capped at once per app-server generation,
+because a retry loop would burn grants and break every sibling holder.
+
+Expiry alone would not have caught the incident that prompted this: the
+credential was rejected seven days before its token's `exp`, because a
+sibling client on another machine rotated the shared grant. Sharing one
+provider account between engrams and a personal CLI stays fragile by
+construction; the reporting path is what makes the result legible.

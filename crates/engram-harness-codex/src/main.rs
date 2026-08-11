@@ -260,6 +260,16 @@ struct AppServer {
     buffered: VecDeque<Value>,
     stderr_task: Option<tokio::task::JoinHandle<Vec<String>>>,
     oauth_watcher: Option<tokio::task::JoinHandle<()>>,
+    /// Shared with the watcher task so a failed turn can also read the
+    /// current version and talk to the coordinator (see
+    /// [`check_credential_health`]). `None` under an org API key, which has
+    /// no refresh lifecycle.
+    oauth: Option<Arc<Mutex<OAuthSession>>>,
+    /// One provider-side refresh per app-server generation. The ChatGPT
+    /// refresh token is single-use and rotates, so a retry loop would burn
+    /// through grants and invalidate every sibling holder. A restart clears
+    /// this, and a restart only happens after a real state change.
+    credential_repair_attempted: bool,
     _oauth_home: Option<tempfile::TempDir>,
     generation: u64,
 }
@@ -668,6 +678,8 @@ impl AppServer {
             buffered: VecDeque::new(),
             stderr_task: Some(engram_harness_sdk::spawn_stderr_tail(stderr, 64, true)),
             oauth_watcher: None,
+            oauth: None,
+            credential_repair_attempted: false,
             _oauth_home: oauth_home,
             generation,
         };
@@ -727,6 +739,7 @@ impl AppServer {
         server.persisted_prompts = persisted_prompts(&response);
         persist_thread_id(&cli.thread_id_file(), &server.thread_id).await?;
         if let Some(oauth) = oauth {
+            server.oauth = Some(Arc::clone(&oauth));
             server.oauth_watcher = Some(spawn_oauth_watcher(oauth, auth_path));
         }
         Ok(server)
@@ -780,6 +793,113 @@ impl AppServer {
             None => Ok(None),
         }
     }
+}
+
+/// What a post-failure credential probe concluded.
+enum CredentialHealth {
+    /// The provider still accepts the credential, or there is nothing to
+    /// check. The turn failed for some other reason.
+    Healthy,
+    /// The coordinator holds a newer bundle than ours — a sibling session
+    /// repaired the credential. Restart to pick it up.
+    AdoptStored,
+    /// Refreshed in place. The watcher publishes the rewritten cache.
+    Refreshed,
+    /// Terminally rejected, and the coordinator has been told.
+    Broken,
+}
+
+/// Did the app-server reject this call because the provider refused our
+/// credential, rather than for a transport or server-side fault?
+fn is_auth_rejection(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("401") || message.contains("unauthorized")
+}
+
+/// Probe the provider after a failed turn, and repair the credential when it
+/// is the cause.
+///
+/// The probe is `account/rateLimits/read` because it is a LIVE authenticated
+/// call — the app-server fetches `chatgpt.com/backend-api/wham/usage` and
+/// surfaces a 401 as a JSON-RPC error. `account/read` cannot serve here: it
+/// reports local cache state and answers happily with a token the provider
+/// has already revoked.
+///
+/// Order matters. We ask the coordinator for the stored bundle BEFORE asking
+/// the provider for a new one: ChatGPT refresh tokens are single-use and
+/// rotate, so when a sibling session has already refreshed, spending our
+/// (now stale) grant would fail and could invalidate the winner's. Reading
+/// the store first is free and repairs the common multi-session race without
+/// touching the provider at all.
+async fn check_credential_health(server: &mut AppServer) -> CredentialHealth {
+    if server.oauth.is_none() {
+        return CredentialHealth::Healthy;
+    }
+    match server
+        .request_wait("account/rateLimits/read", json!({}))
+        .await
+    {
+        Ok(_) => return CredentialHealth::Healthy,
+        Err(message) if !is_auth_rejection(&message) => return CredentialHealth::Healthy,
+        Err(_) => {}
+    }
+
+    // 1. Has a sibling session already repaired it?
+    let Some(oauth) = server.oauth.clone() else {
+        return CredentialHealth::Healthy;
+    };
+    let (version, fetched) = {
+        let session = oauth.lock().await;
+        (
+            session.version,
+            session
+                .control
+                .exchange(ForgeOp::FetchOAuthCredential)
+                .await,
+        )
+    };
+    if let Ok(ForgeResponse::OAuthCredential {
+        version: stored, ..
+    }) = fetched
+    {
+        if stored != version {
+            tracing::info!(
+                stored,
+                held = version,
+                "stored OAuth credential is newer; restarting to adopt it"
+            );
+            return CredentialHealth::AdoptStored;
+        }
+    }
+
+    // 2. Nothing newer stored. Spend our grant — once per generation.
+    if server.credential_repair_attempted {
+        return CredentialHealth::Broken;
+    }
+    server.credential_repair_attempted = true;
+    if server
+        .request_wait("account/chatgptAuthTokens/refresh", json!({}))
+        .await
+        .is_ok()
+    {
+        return CredentialHealth::Refreshed;
+    }
+
+    // 3. The provider will not renew it. Say so, so the credential stops
+    //    reading "connected" while every turn fails.
+    let reported = oauth
+        .lock()
+        .await
+        .control
+        .exchange(ForgeOp::ReportOAuthCredentialBroken {
+            expected_version: version,
+            reason: "provider rejected the credential and refresh failed".into(),
+        })
+        .await;
+    if let Err(error) = reported {
+        tracing::warn!(%error, "could not report the broken OAuth credential");
+    }
+    CredentialHealth::Broken
 }
 
 enum DriveOutcome {
@@ -1845,16 +1965,50 @@ async fn handle_message(
                 .unwrap_or(&run_id)
                 .to_owned();
             if status == "interrupted" {
-                emit(events, HarnessEvent::RunInterrupted { run_id: completed }).await;
+                emit(
+                    events,
+                    HarnessEvent::RunInterrupted {
+                        run_id: completed.clone(),
+                    },
+                )
+                .await;
             } else {
                 emit(
                     events,
                     HarnessEvent::RunCompleted {
-                        run_id: completed,
+                        run_id: completed.clone(),
                         ok: status == "completed",
                     },
                 )
                 .await;
+            }
+            // A failed turn is the one moment we know something is wrong and
+            // the app-server is still alive to ask. A dead credential fails
+            // every turn in milliseconds and, before this, said nothing.
+            if status != "completed" && status != "interrupted" {
+                match check_credential_health(server).await {
+                    CredentialHealth::Healthy | CredentialHealth::Refreshed => {}
+                    CredentialHealth::AdoptStored => {
+                        // The restart path re-fetches the credential at spawn
+                        // and resumes the persisted thread.
+                        let _ = server.child.start_kill();
+                    }
+                    CredentialHealth::Broken => {
+                        emit(
+                            events,
+                            HarnessEvent::AgentMessage {
+                                run_id: completed,
+                                message_id: format!("credential-{}", uuid::Uuid::new_v4()),
+                                role: AgentRole::System,
+                                text: "This session's model credential was rejected and could \
+                                       not be refreshed. Reconnect the account in Settings → \
+                                       Credentials, then start a new session."
+                                    .into(),
+                            },
+                        )
+                        .await;
+                    }
+                }
             }
             *active = None;
             emit(events, HarnessEvent::Idle).await;
@@ -2225,6 +2379,29 @@ async fn ensure_skills_link(home: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_rejection_is_distinguished_from_other_faults() {
+        // The real shape, captured from a live app-server probe with a token
+        // the provider refused.
+        assert!(is_auth_rejection(
+            "account/rateLimits/read: {\"code\":-32603,\"message\":\"failed to fetch codex rate \
+             limits: GET https://chatgpt.com/backend-api/wham/usage failed: 401 Unauthorized\"}"
+        ));
+        assert!(is_auth_rejection("provider returned Unauthorized"));
+
+        // Everything else must stay Healthy: misreading a transient fault as
+        // a dead credential would spend the single-use refresh grant and
+        // could mark a working credential broken.
+        for benign in [
+            "app-server EOF",
+            "failed to fetch codex rate limits: 500 Internal Server Error",
+            "429 Too Many Requests",
+            "connection reset by peer",
+        ] {
+            assert!(!is_auth_rejection(benign), "misread {benign:?} as auth");
+        }
+    }
 
     #[test]
     fn browser_view_is_declared_only_when_enabled() {

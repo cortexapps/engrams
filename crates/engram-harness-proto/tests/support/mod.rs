@@ -240,6 +240,12 @@ fn forge_op() -> impl Strategy<Value = ForgeOp> {
                 opaque_bundle,
             }
         ),
+        (any::<i64>(), s()).prop_map(|(expected_version, reason)| {
+            ForgeOp::ReportOAuthCredentialBroken {
+                expected_version,
+                reason,
+            }
+        }),
     ]
 }
 
@@ -260,6 +266,7 @@ pub fn forge_response() -> impl Strategy<Value = ForgeResponse> {
                 }
             }),
         s().prop_map(|message| ForgeResponse::Error { message }),
+        Just(ForgeResponse::OAuthCredentialBroken),
     ]
 }
 
@@ -398,6 +405,7 @@ fn _exhaustiveness_forge_op(o: &ForgeOp) {
         ForgeOp::FetchCredential { .. } => {}
         ForgeOp::FetchOAuthCredential => {}
         ForgeOp::UpdateOAuthCredential { .. } => {}
+        ForgeOp::ReportOAuthCredentialBroken { .. } => {}
     }
 }
 
@@ -406,6 +414,7 @@ fn _exhaustiveness_forge_response(r: &ForgeResponse) {
         ForgeResponse::Credential { .. } => {}
         ForgeResponse::OAuthCredential { .. } => {}
         ForgeResponse::Error { .. } => {}
+        ForgeResponse::OAuthCredentialBroken => {}
     }
 }
 

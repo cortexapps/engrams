@@ -282,5 +282,23 @@ async fn process_request(state: &SharedState, req: ForgeRequest) -> ForgeRespons
                 message: error.code().into(),
             },
         },
+        ForgeOp::ReportOAuthCredentialBroken {
+            expected_version,
+            reason,
+        } => {
+            // The guest picks the reason from a fixed set; cap it anyway so a
+            // compromised guest cannot write unbounded text into the row.
+            let reason: String = reason.chars().take(200).collect();
+            match state
+                .oauth
+                .report_session_broken(req.session_id, expected_version, &reason)
+                .await
+            {
+                Ok(()) => ForgeResponse::OAuthCredentialBroken,
+                Err(error) => ForgeResponse::Error {
+                    message: error.code().into(),
+                },
+            }
+        }
     }
 }
