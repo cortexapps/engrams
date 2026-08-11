@@ -152,7 +152,13 @@ use serde::{Deserialize, Serialize};
 // operations. The payload itself is protobuf, but an older host cannot serve
 // the new methods. Fence mixed fleets so the coordinator retries after the
 // host roll instead of accepting a prompt whose required file was not copied.
-pub const WIRE_VERSION: u32 = 27;
+// v28 (ADR 0115): `CredentialMintSource` gains the trailing `OauthUser`
+// variant (a user's personal connector credential resolved from the sealed
+// store) on `SessionEgressPolicy` inject entries and the host→coord
+// inject/refresh route. Trailing-variant addition: every existing encoding
+// is unchanged, but a v27 host cannot decode a policy carrying the new
+// variant, so the roll is lockstep.
+pub const WIRE_VERSION: u32 = 28;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

@@ -792,7 +792,8 @@ pub(crate) async fn resolve_inject_entries(
                     // has to supply a new raw token.
                     let (header_name, header_template) = match mint_source {
                         CredentialMintSource::Connection { .. } => (h.name, "{}".to_string()),
-                        CredentialMintSource::OauthConnector { .. } => {
+                        CredentialMintSource::OauthConnector { .. }
+                        | CredentialMintSource::OauthUser { .. } => {
                             (inj.header_name.clone(), inj.header_template.clone())
                         }
                     };
@@ -907,8 +908,8 @@ async fn mint_inject_header(
                         name: String::new(),
                         value: token.secret,
                     },
-                    // A non-expiring bundle never needs a proxy re-ask; park
-                    // the refresh far out.
+                    // A non-expiring org bundle never needs a proxy re-ask;
+                    // park the refresh far out.
                     token.expires_at.unwrap_or_else(|| {
                         state.services.clock.now_utc() + chrono::Duration::days(3650)
                     }),
@@ -919,6 +920,44 @@ async fn mint_inject_header(
                         provider = %provider,
                         code = error.code(),
                         "connector OAuth token could not be resolved for inject"
+                    );
+                    None
+                }
+            };
+        }
+        // ADR 0115: a user's personal connector credential (OAuth or static
+        // token). Same delivery seam as `OauthConnector`; only the subject
+        // differs, stamped into the policy at compile time.
+        CredentialMintSource::OauthUser {
+            user_id,
+            connection_id: _,
+            provider,
+        } => {
+            let key = engram_core::types::oauth::OAuthCredentialKey {
+                subject_kind: engram_core::types::oauth::OAuthSubjectKind::UserConnector,
+                subject_id: user_id.clone(),
+                provider: provider.clone(),
+            };
+            return match state.oauth.resolve_connector_token(&key).await {
+                Ok(token) => Some((
+                    engram_core::traits::InjectHeader {
+                        name: String::new(),
+                        value: token.secret,
+                    },
+                    // A personal non-expiring token (PAT) re-resolves daily
+                    // so a Disconnect or replacement reaches live sessions
+                    // within a day — unlike org statics, this is personal
+                    // credential material the user can revoke.
+                    token.expires_at.unwrap_or_else(|| {
+                        state.services.clock.now_utc() + chrono::Duration::hours(24)
+                    }),
+                )),
+                Err(error) => {
+                    tracing::warn!(
+                        %session_id,
+                        provider = %provider,
+                        code = error.code(),
+                        "user connector credential could not be resolved for inject"
                     );
                     None
                 }

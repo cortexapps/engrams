@@ -147,6 +147,20 @@ pub enum CredentialMintSource {
         connection_id: String,
         provider: String,
     },
+    /// ADR 0115: the inject value is a USER-scoped connector credential
+    /// (OAuth or static token) resolved from the sealed store (subject kind
+    /// `user_connector`, subject id = the launching user, stamped by the
+    /// orchestrator at compile time). The coordinator stays
+    /// principal-agnostic — every re-resolution path reads this stamp from
+    /// the persisted policy. `connection_id` is carried for future
+    /// per-connection user credentials; key derivation ignores it today.
+    /// NEVER a value. New variant appended (bincode variant indexes are the
+    /// wire): wire v28.
+    OauthUser {
+        user_id: String,
+        connection_id: String,
+        provider: String,
+    },
 }
 
 /// ADR 0057: one profile-defined secret the session injects. The value lives in
