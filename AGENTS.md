@@ -29,9 +29,12 @@ layer: how to build, test, and the conventions we hold.
   (local wins for overrides like `ENGRAM_SANDBOX_BACKEND`), and `just dev-link-shared`
   (run at Tilt parse time) symlinks `var/shared` + `var/bundles` to the primary
   checkout's — no per-worktree re-bake, no broken sealed keys.
-- `just check` — **the pre-commit gate**: `cargo fmt --check`, `cargo clippy -D warnings`,
-  `cargo hakari generate --diff`, `cargo nextest run --workspace`. Run before every commit;
-  CI enforces the same. (After adding/removing workspace deps, run `just hakari`.)
+- `just check` — **the full Rust workspace gate**: `cargo fmt --check`,
+  `cargo clippy -D warnings`, `cargo hakari generate --diff`,
+  `cargo nextest run --workspace`. Run it once before a PR when the change affects Rust,
+  Cargo, coordinator SQLx state, protobuf shared with Rust, or shared backend behavior. Do
+  not run it for a docs-only, web-only, or orchestrator-only change. CI applies its own
+  path-gated full check. (After adding/removing workspace deps, run `just hakari`.)
   **`workspace-hack/Cargo.toml` is generated** — never hand-edit it and never bump a
   version inside it; `generate --diff` fails unless it matches `cargo hakari generate`.
 - `just test [args]` / `cargo nextest run -p <crate>` — fast inner-loop tests.
@@ -100,6 +103,31 @@ Firecracker path; VZ exists to exercise that path on macOS, not to fork it.
   platform's `cfg`. Hawk does not see `#[cfg(test)]` consumers: confirm each deletion
   with `cargo check --workspace --all-targets` on both targets.
 
+## Change-scoped validation
+
+Use the smallest local gate that covers the changed paths. The current-head `CI Gate` is
+the final full-repository result.
+
+- **Docs only**: run `git diff --check`. Run a document-specific formatter or validator
+  when the changed format has one.
+- **Web only**: from `web/`, run `pnpm format:check`, `pnpm lint`, focused `pnpm test`
+  targets, and `pnpm build`.
+- **Orchestrator only**: from `orchestrator/`, run `bun run typecheck` and the focused
+  `bun test` targets. Run live-Postgres tests only when the changed behavior needs them.
+- **Rust or shared backend**: use per-crate checks and tests while editing, then run
+  `just check` once before the PR. Add the target-specific checks required elsewhere in
+  this file when the changed code is platform-gated.
+- **Mixed changes**: take the union of the applicable gates. Do not add Rust checks only
+  because a PR also changes web or orchestrator code.
+- **Conflict-only rebase**: run the formatter and type checker for each affected package,
+  plus a focused regression test when the resolution changes behavior. Push promptly and
+  use current-head CI as the complete gate.
+- **Workflow changes**: validate the YAML and run `actionlint` when available. They remain
+  outside `just check`.
+
+Run each package formatter before every push, including a conflict-only rebase. Do not wait
+for an unrelated local lane after the affected gates pass.
+
 ## CI
 
 `.github/workflows/ci.yml` is the **single** CI workflow (Linux + macOS/VZ + the e2e
@@ -121,6 +149,33 @@ through the merge queue, or tight-burst them only after a combined local check.
 `.github/**` is outside `just check`: validate workflow YAML
 (`yaml.safe_load` / actionlint) and prefer `run: |` block scalars. Keep the `merge_group`
 trigger in the required workflow.
+
+## Multi-PR and multi-agent work
+
+One coordinating agent owns the Git graph for a multi-PR effort. Before implementation,
+it records a stack manifest with each issue, branch, base, dependency, migration number or
+`none`, shared file, and required focused gate.
+
+- Use real stacked bases when several dependent PRs must stay clean at the same time. If
+  every PR targets `main`, keep only the next PR in merge order green. After it merges,
+  rebase its immediate successor. Do not rebase every descendant after every merge.
+- Reserve and record migration numbers before parallel work starts. The coordinating agent
+  verifies the migration chain and is the only agent that changes stack bases or migration
+  order.
+- Before a force-push, verify the latest base SHA, the remote branch lease, and queued
+  predecessor merges. A force-push can dismiss approvals and remove a merge-queue entry;
+  report both effects after the push.
+- Use one implementation session per issue. Reuse that session for review fixes. Do not
+  create separate review, rereview, and final-review sessions when the Engrams review is
+  already active.
+- Treat only the current PR head as live. Ignore superseded CI and stale review findings.
+  Create a fix task only for a valid current-head finding.
+- An implementation session finishes after it opens the PR and its focused local gates
+  pass. One coordinating monitor owns current-head CI, Engrams review, and merge-order
+  updates for the complete stack.
+- Require a concise progress update from a child session at least every 15 minutes. If it
+  has no useful event for 30 minutes, interrupt it and inspect the blocker before retrying
+  or replacing it.
 
 ## Conventions
 
