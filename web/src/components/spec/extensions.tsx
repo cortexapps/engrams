@@ -4,6 +4,8 @@ import { NodeViewWrapper, ReactNodeViewRenderer, type NodeViewProps } from "@tip
 import { specNodeSpecs } from "@engrams/spec-document";
 import type { Node as ProseMirrorNode, NodeSpec } from "@tiptap/pm/model";
 
+import { SpecBlock } from "./SpecBlock";
+
 function nodeSpec(name: keyof typeof specNodeSpecs): NodeSpec {
   const spec = specNodeSpecs[name];
   if (!spec) throw new Error(`The shared spec schema has no ${name} node`);
@@ -125,15 +127,6 @@ const SpecOpenQuestion = Node.create({
   addNodeView: () => ReactNodeViewRenderer(OpenQuestionStub, { as: "span" }),
 });
 
-function DiagramBlockStub({ node }: NodeViewProps) {
-  return (
-    <NodeViewWrapper className="spec-diagram-block" contentEditable={false}>
-      <div className="spec-diagram-label">{String(node.attrs.kind || "diagram")}</div>
-      <pre>{String(node.attrs.source || "Diagram preview will appear here.")}</pre>
-    </NodeViewWrapper>
-  );
-}
-
 const SpecDiagramBlock = Node.create({
   name: "diagramBlock",
   ...sharedConfig("diagramBlock"),
@@ -141,12 +134,12 @@ const SpecDiagramBlock = Node.create({
   renderHTML: ({ node }) => [
     "figure",
     {
-      "data-spec-diagram": node.attrs.blockId,
+      "data-spec-diagram": node.attrs.id,
       "data-kind": node.attrs.kind,
       "data-source": node.attrs.source,
     },
   ],
-  addNodeView: () => ReactNodeViewRenderer(DiagramBlockStub),
+  addNodeView: () => ReactNodeViewRenderer(SpecBlock),
 });
 
 export function sectionIds(doc: ProseMirrorNode): string[] | null {

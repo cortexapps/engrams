@@ -7,11 +7,17 @@ import {
   renderMarkdown,
   RequirementIntegrityError,
   schema,
+  SPEC_BLOCK_CACHE_MAX_BYTES,
+  SPEC_BLOCK_RENDERER_REVISION,
+  SPEC_FRAGMENT_NAME,
   type SpecTemplate,
 } from "@engrams/spec-document";
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
+import type { Node as ProseMirrorNode } from "prosemirror-model";
+import { Transform } from "prosemirror-transform";
 import * as Y from "yjs";
 import * as dbSchema from "../../db/schema.ts";
 import { makeSpecListStore } from "../../db/specs.ts";
@@ -21,16 +27,19 @@ import {
   parseSpecChannelEnvelope,
   PostgresSpecDocumentStore,
   proseMirrorDocument,
+  SpecBlockCacheTooLargeError,
   SpecDocumentService,
   SpecDocumentReadOnlyError,
   SpecDocumentRevisionConflictError,
   SpecDocumentTooLargeError,
   SpecParticipantLeaseStaleError,
+  SPEC_MAX_SIZE_BYTES,
   SPEC_UPDATE_SIZE_FACTOR,
   type CompactSnapshotInput,
   type SpecDocumentCheckpoint,
   type SpecDocumentStore,
   type SpecSnapshotRecord,
+  type SpecUpdateInsertResult,
   type SpecUpdateRecord,
   type SpecUpdateEffects,
 } from "../doc-service.ts";
@@ -42,6 +51,7 @@ import {
 } from "../checkpoints.ts";
 import { PostgresSectionStateStore } from "../section-state-service.ts";
 import { transitionSectionState } from "../section-state.ts";
+import { PostgresSpecProjectionStore } from "../projection.ts";
 
 const TEMPLATE: SpecTemplate = {
   sections: [
@@ -55,6 +65,7 @@ const SPEC_ID = "00000000-0000-4000-8000-000000000108";
 
 class MemoryDocumentStore implements SpecDocumentStore {
   private readonly currentSeq = new Map<string, bigint>();
+  private readonly currentSemanticSeq = new Map<string, bigint>();
   readonly updates = new Map<string, SpecUpdateRecord[]>();
   readonly snapshots = new Map<string, SpecSnapshotRecord>();
   readonly wakes = new Set<(specId: string) => void>();
@@ -65,6 +76,14 @@ class MemoryDocumentStore implements SpecDocumentStore {
   lastEffects: SpecUpdateEffects | null = null;
   draft = true;
   checkpointSink: Map<string, SpecCheckpointRecord> | null = null;
+
+  seedUpdate(specId: string, update: Uint8Array, semanticDocSeq = 1n): void {
+    this.currentSeq.set(specId, 1n);
+    this.currentSemanticSeq.set(specId, semanticDocSeq);
+    this.updates.set(specId, [
+      { seq: 1n, semanticDocSeq, update: update.slice(), clientId: "legacy-seed" },
+    ]);
+  }
 
   async readSnapshot(specId: string): Promise<SpecSnapshotRecord | null> {
     return this.snapshots.get(specId) ?? null;
@@ -81,16 +100,19 @@ class MemoryDocumentStore implements SpecDocumentStore {
     update: Uint8Array,
     clientId: string | null,
     effects: SpecUpdateEffects,
-  ): Promise<bigint | null> {
+  ): Promise<SpecUpdateInsertResult | null> {
     if (!this.draft) throw new SpecDocumentReadOnlyError(specId);
     if ((this.currentSeq.get(specId) ?? 0n) !== expectedSeq) return null;
     this.lastEffects = effects;
     const seq = (this.currentSeq.get(specId) ?? 0n) + 1n;
+    const semanticDocSeq =
+      (this.currentSemanticSeq.get(specId) ?? 0n) + (effects.semanticChanged ? 1n : 0n);
     this.currentSeq.set(specId, seq);
+    this.currentSemanticSeq.set(specId, semanticDocSeq);
     const rows = this.updates.get(specId) ?? [];
-    rows.push({ seq, update: update.slice(), clientId });
+    rows.push({ seq, semanticDocSeq, update: update.slice(), clientId });
     this.updates.set(specId, rows);
-    return seq;
+    return { seq, semanticDocSeq };
   }
 
   async insertCheckpointAndUpdateIfLatest(
@@ -100,17 +122,20 @@ class MemoryDocumentStore implements SpecDocumentStore {
     update: Uint8Array,
     clientId: string | null,
     effects: SpecUpdateEffects,
-  ): Promise<bigint | null> {
+  ): Promise<SpecUpdateInsertResult | null> {
     if (!this.draft) throw new SpecDocumentReadOnlyError(specId);
     if ((this.currentSeq.get(specId) ?? 0n) !== expectedSeq) return null;
     this.lastEffects = effects;
     const seq = expectedSeq + 1n;
+    const semanticDocSeq =
+      (this.currentSemanticSeq.get(specId) ?? 0n) + (effects.semanticChanged ? 1n : 0n);
     this.currentSeq.set(specId, seq);
+    this.currentSemanticSeq.set(specId, semanticDocSeq);
     const rows = this.updates.get(specId) ?? [];
-    rows.push({ seq, update: update.slice(), clientId });
+    rows.push({ seq, semanticDocSeq, update: update.slice(), clientId });
     this.updates.set(specId, rows);
     this.checkpointSink?.set(checkpoint.id, checkpoint);
-    return seq;
+    return { seq, semanticDocSeq };
   }
 
   async notifyUpdate(specId: string): Promise<void> {
@@ -128,6 +153,7 @@ class MemoryDocumentStore implements SpecDocumentStore {
         state: input.state.slice(),
         stateVector: input.stateVector.slice(),
         coveredSeq: input.coveredSeq,
+        coveredSemanticDocSeq: input.coveredSemanticDocSeq,
       });
     }
     this.updates.set(
@@ -171,6 +197,119 @@ function initialUpdate(): Uint8Array {
   return encodeProseMirrorDocument(createTemplateDocument(TEMPLATE));
 }
 
+function diagramUpdate(blockCount = 1): Uint8Array {
+  const template = createTemplateDocument(TEMPLATE);
+  const sections = template.content.content.map((section) => {
+    if (section.attrs.id !== "design") return section;
+    const heading = section.firstChild;
+    if (!heading) throw new Error("The design test section has no heading");
+    const blocks = Array.from({ length: blockCount }, (_, index) =>
+      schema.nodes.diagramBlock!.create({
+        id: `diagram-${index}`,
+        kind: "mermaid",
+        source: `flowchart LR\n  A${index} --> B${index}`,
+      }),
+    );
+    return section.type.create(section.attrs, [heading, ...blocks]);
+  });
+  return encodeProseMirrorDocument(schema.nodes.doc!.create(null, sections));
+}
+
+function legacyDiagramUpdate(): Uint8Array {
+  const doc = new Y.Doc();
+  Y.applyUpdate(doc, diagramUpdate());
+  const diagram = doc.getXmlFragment(SPEC_FRAGMENT_NAME).get(2);
+  if (!(diagram instanceof Y.XmlElement)) throw new Error("The legacy design section is missing");
+  const block = diagram.get(1);
+  if (!(block instanceof Y.XmlElement)) throw new Error("The legacy diagram block is missing");
+  const id = block.getAttribute("id");
+  if (typeof id !== "string") throw new Error("The legacy diagram id is missing");
+  block.setAttribute("blockId", id);
+  block.removeAttribute("id");
+  return Y.encodeStateAsUpdate(doc);
+}
+
+function diagramDocumentWithIds(ids: readonly string[]): Uint8Array {
+  const template = createTemplateDocument(TEMPLATE);
+  const sections = template.content.content.map((section) => {
+    if (section.attrs.id !== "design") return section;
+    return section.type.create(section.attrs, [
+      section.firstChild!,
+      ...ids.map((id) =>
+        schema.nodes.diagramBlock!.create({ id, kind: "mermaid", source: "flowchart LR" }),
+      ),
+    ]);
+  });
+  return encodeProseMirrorDocument(schema.nodes.doc!.create(null, sections));
+}
+
+function changeFirstDiagramId(base: Uint8Array, id: string): Uint8Array {
+  const doc = new Y.Doc();
+  Y.applyUpdate(doc, base);
+  const before = Y.encodeStateVector(doc);
+  const section = doc.getXmlFragment(SPEC_FRAGMENT_NAME).get(2);
+  if (!(section instanceof Y.XmlElement)) throw new Error("The design section is missing");
+  const block = section.get(1);
+  if (!(block instanceof Y.XmlElement)) throw new Error("The diagram block is missing");
+  block.setAttribute("id", id);
+  return Y.encodeStateAsUpdate(doc, before);
+}
+
+function withDiagramCaches(
+  document: ReturnType<typeof proseMirrorDocument>,
+  svg: (index: number) => string,
+) {
+  const positions: number[] = [];
+  document.descendants((node, position) => {
+    if (node.type === schema.nodes.diagramBlock) positions.push(position);
+  });
+  let transform = new Transform(document);
+  for (const [index, position] of positions.entries()) {
+    const node = transform.doc.nodeAt(position);
+    if (!node) throw new Error("The diagram test block is missing");
+    transform = transform.setNodeMarkup(position, undefined, {
+      ...node.attrs,
+      cachedRender: {
+        kind: node.attrs.kind,
+        source: node.attrs.source,
+        blockId: node.attrs.id,
+        rendererRevision: SPEC_BLOCK_RENDERER_REVISION,
+        svg: svg(index),
+      },
+    });
+  }
+  return transform.doc;
+}
+
+function withFirstDiagramCache(document: ProseMirrorNode, cachedRender: unknown): ProseMirrorNode {
+  let position: number | null = null;
+  document.descendants((node, nodePosition) => {
+    if (position === null && node.type === schema.nodes.diagramBlock) position = nodePosition;
+  });
+  if (position === null) throw new Error("The diagram test block is missing");
+  const node = document.nodeAt(position);
+  if (!node) throw new Error("The diagram test block is missing");
+  return new Transform(document).setNodeMarkup(position, undefined, {
+    ...node.attrs,
+    cachedRender,
+  }).doc;
+}
+
+function withFirstDiagramSource(document: ProseMirrorNode, source: string): ProseMirrorNode {
+  let position: number | null = null;
+  document.descendants((node, nodePosition) => {
+    if (position === null && node.type === schema.nodes.diagramBlock) position = nodePosition;
+  });
+  if (position === null) throw new Error("The diagram test block is missing");
+  const node = document.nodeAt(position);
+  if (!node) throw new Error("The diagram test block is missing");
+  return new Transform(document).setNodeMarkup(position, undefined, {
+    ...node.attrs,
+    source,
+    cachedRender: null,
+  }).doc;
+}
+
 function clientInsert(base: Uint8Array, sectionIndex: number, value: string): Uint8Array {
   const doc = new Y.Doc();
   Y.applyUpdate(doc, base);
@@ -191,6 +330,19 @@ function cacheOnlyUpdate(base: Uint8Array, value: string): Uint8Array {
   const vector = Y.encodeStateVector(doc);
   doc.getMap<string>("renderer-cache").set("markdown", value);
   return Y.encodeStateAsUpdate(doc, vector);
+}
+
+function documentWithContextText(document: ProseMirrorNode, value: string): ProseMirrorNode {
+  const section = findSection(document, "context");
+  if (!section?.node.firstChild) throw new Error("The context section is missing");
+  return replaceSection(
+    document,
+    "context",
+    section.node.type.create(section.node.attrs, [
+      section.node.firstChild,
+      schema.nodes.paragraph!.create(null, value.length > 0 ? schema.text(value) : undefined),
+    ]),
+  );
 }
 
 async function seededService(
@@ -248,7 +400,7 @@ flowchart LR
     blocks.push(
       schema.nodes.codeBlock!.create({ language: escaped }, schema.text(escaped)),
       schema.nodes.diagramBlock!.create({
-        blockId: "diagram-1",
+        id: "diagram-1",
         kind: "mermaid",
         source: escaped,
       }),
@@ -270,6 +422,30 @@ flowchart LR
 });
 
 describe("SpecDocumentService", () => {
+  test("a base-version Yjs update migrates blockId without changing block identity", async () => {
+    const store = new MemoryDocumentStore();
+    store.seedUpdate(SPEC_ID, legacyDiagramUpdate());
+
+    const first = new SpecDocumentService(store);
+    const loaded = await first.loadDoc(SPEC_ID);
+    const blocks: Array<{ id: unknown; source: unknown }> = [];
+    proseMirrorDocument(loaded.doc).descendants((node) => {
+      if (node.type === schema.nodes.diagramBlock) {
+        blocks.push({ id: node.attrs.id, source: node.attrs.source });
+      }
+    });
+    expect(blocks).toEqual([{ id: "diagram-0", source: "flowchart LR\n  A0 --> B0" }]);
+    expect(loaded.semanticDocSeq).toBe(1n);
+    expect(store.updates.get(SPEC_ID)).toHaveLength(2);
+
+    first.evict(SPEC_ID);
+    const reloaded = await new SpecDocumentService(store).loadDoc(SPEC_ID);
+    const diagram = findSection(proseMirrorDocument(reloaded.doc), "design")?.node.child(1);
+    expect(diagram?.type).toBe(schema.nodes.diagramBlock);
+    expect(diagram?.attrs.id).toBe("diagram-0");
+    expect(reloaded.semanticDocSeq).toBe(1n);
+  });
+
   test("the shared channel envelope is typed and rejects malformed payloads", () => {
     const awareness = encodeSpecChannelEnvelope({
       type: "awareness",
@@ -343,6 +519,36 @@ describe("SpecDocumentService", () => {
       renderMarkdown(proseMirrorDocument(liveDoc)),
     );
     expect(stateVector(rebuiltDoc)).toEqual(stateVector(liveDoc));
+  });
+
+  test("a newer compacted snapshot refreshes the rendered size bound", async () => {
+    const store = new MemoryDocumentStore();
+    const first = await seededService(store);
+    const second = new SpecDocumentService(store);
+    await second.loadDoc(SPEC_ID);
+
+    const baseDocument = proseMirrorDocument((await first.loadDoc(SPEC_ID)).doc);
+    const emptySize = new TextEncoder().encode(
+      renderMarkdown(documentWithContextText(baseDocument, "")),
+    ).byteLength;
+    const escapedCharacters = Math.floor((SPEC_MAX_SIZE_BYTES - emptySize - 100) / 2);
+    await first.mutateDocument(SPEC_ID, "large-client", (document) =>
+      documentWithContextText(document, "*".repeat(escapedCharacters)),
+    );
+    const compacted = await first.compact(SPEC_ID);
+    expect(new TextEncoder().encode(compacted.renderedMarkdown).byteLength).toBeLessThan(
+      SPEC_MAX_SIZE_BYTES,
+    );
+
+    await second.syncFromLog(SPEC_ID);
+    const tail = clientInsert(
+      Y.encodeStateAsUpdate((await second.loadDoc(SPEC_ID)).doc),
+      0,
+      "*".repeat(100),
+    );
+    await expect(second.applyUpdate(SPEC_ID, tail, "tail-client")).rejects.toBeInstanceOf(
+      SpecDocumentTooLargeError,
+    );
   });
 
   test("compaction preserves state and is idempotent", async () => {
@@ -420,6 +626,95 @@ describe("SpecDocumentService", () => {
     expect(store.updates.get(SPEC_ID)).toHaveLength(1);
   });
 
+  test("a diagram source cannot make the document exceed 2 MB", async () => {
+    const store = new MemoryDocumentStore();
+    const service = await seededService(store, diagramUpdate());
+
+    await expect(
+      service.mutateDocument(SPEC_ID, "large-source-client", (document) =>
+        withFirstDiagramSource(document, "x".repeat(SPEC_MAX_SIZE_BYTES + 1)),
+      ),
+    ).rejects.toBeInstanceOf(SpecDocumentTooLargeError);
+    expect(store.updates.get(SPEC_ID)).toHaveLength(1);
+  });
+
+  test("a cache-only update cannot exceed the per-block cache limit", async () => {
+    const store = new MemoryDocumentStore();
+    const service = await seededService(store, diagramUpdate());
+
+    await expect(
+      service.mutateDocument(SPEC_ID, "cache-client", (document) =>
+        withDiagramCaches(document, () => "x".repeat(SPEC_BLOCK_CACHE_MAX_BYTES + 1)),
+      ),
+    ).rejects.toBeInstanceOf(SpecBlockCacheTooLargeError);
+    expect(store.updates.get(SPEC_ID)).toHaveLength(1);
+  });
+
+  test("a large unknown cache field counts against the raw per-block limit", async () => {
+    const store = new MemoryDocumentStore();
+    const service = await seededService(store, diagramUpdate());
+
+    await expect(
+      service.mutateDocument(SPEC_ID, "cache-client", (document) =>
+        withFirstDiagramCache(document, {
+          kind: "mermaid",
+          source: "flowchart LR",
+          blockId: "diagram-0",
+          rendererRevision: SPEC_BLOCK_RENDERER_REVISION,
+          svg: "<svg />",
+          extra: "x".repeat(SPEC_BLOCK_CACHE_MAX_BYTES),
+        }),
+      ),
+    ).rejects.toBeInstanceOf(SpecBlockCacheTooLargeError);
+    expect(store.updates.get(SPEC_ID)).toHaveLength(1);
+  });
+
+  test("malformed cached renders are rejected before persistence", async () => {
+    const store = new MemoryDocumentStore();
+    const service = await seededService(store, diagramUpdate());
+
+    await expect(
+      service.mutateDocument(SPEC_ID, "cache-client", (document) =>
+        withFirstDiagramCache(document, {
+          kind: "mermaid",
+          blockId: "diagram-0",
+          rendererRevision: SPEC_BLOCK_RENDERER_REVISION,
+          svg: "<svg />",
+        }),
+      ),
+    ).rejects.toThrow("must contain only");
+    expect(store.updates.get(SPEC_ID)).toHaveLength(1);
+  });
+
+  test("cache-only updates cannot make the complete Yjs state exceed 2 MB", async () => {
+    const store = new MemoryDocumentStore();
+    const service = await seededService(store, diagramUpdate(5));
+
+    await expect(
+      service.mutateDocument(SPEC_ID, "cache-client", (document) =>
+        withDiagramCaches(document, (index) =>
+          String(index).repeat(SPEC_BLOCK_CACHE_MAX_BYTES - 256),
+        ),
+      ),
+    ).rejects.toMatchObject({
+      name: "SpecDocumentTooLargeError",
+      representation: "encoded Yjs state",
+    });
+    expect(store.updates.get(SPEC_ID)).toHaveLength(1);
+  });
+
+  test("a cache-only update has no section or human-digest effect", async () => {
+    const store = new MemoryDocumentStore();
+    const service = await seededService(store, diagramUpdate());
+
+    await service.mutateDocument(SPEC_ID, "human-client", (document) =>
+      withDiagramCaches(document, () => '<svg><path d="M0 0" /></svg>'),
+    );
+
+    expect(store.lastEffects?.sections.every((section) => !section.changed)).toBe(true);
+    expect(store.lastEffects?.at).toBeUndefined();
+  });
+
   test("small updates use the conservative size fast path", async () => {
     const store = new MemoryDocumentStore();
     let exactMeasurements = 0;
@@ -456,6 +751,41 @@ describe("SpecDocumentService", () => {
     expect(renderMarkdown(proseMirrorDocument((await service.loadDoc(SPEC_ID)).doc))).toContain(
       "Context",
     );
+  });
+
+  test("a diagram block id cannot be empty", async () => {
+    const store = new MemoryDocumentStore();
+    const service = new SpecDocumentService(store);
+
+    await expect(
+      service.applyUpdate(SPEC_ID, diagramDocumentWithIds([""]), "hostile-client"),
+    ).rejects.toThrow("non-empty id");
+    expect(store.updates.get(SPEC_ID)).toBeUndefined();
+  });
+
+  test("diagram block ids must be globally unique", async () => {
+    const store = new MemoryDocumentStore();
+    const service = new SpecDocumentService(store);
+
+    await expect(
+      service.applyUpdate(
+        SPEC_ID,
+        diagramDocumentWithIds(["duplicate", "duplicate"]),
+        "hostile-client",
+      ),
+    ).rejects.toThrow("duplicated");
+    expect(store.updates.get(SPEC_ID)).toBeUndefined();
+  });
+
+  test("an existing Yjs diagram element cannot change its id", async () => {
+    const store = new MemoryDocumentStore();
+    const service = await seededService(store, diagramUpdate());
+    const base = Y.encodeStateAsUpdate((await service.loadDoc(SPEC_ID)).doc);
+
+    await expect(
+      service.applyUpdate(SPEC_ID, changeFirstDiagramId(base, "changed-id"), "hostile-client"),
+    ).rejects.toThrow("cannot change");
+    expect(store.updates.get(SPEC_ID)).toHaveLength(1);
   });
 
   test("central validation reports only the sections changed by a client update", async () => {
@@ -613,11 +943,13 @@ describe("SpecDocumentService with live Postgres", () => {
     await livePool.query("DELETE FROM spec_section_state WHERE spec_id = $1", [specId]);
     await livePool.query("DELETE FROM spec_participant WHERE spec_id = $1", [specId]);
     await livePool.query("DELETE FROM spec_checkpoint WHERE spec_id = $1", [specId]);
+    await livePool.query("DELETE FROM spec_projection WHERE spec_id = $1", [specId]);
     await livePool.query("DELETE FROM spec_update_log WHERE spec_id = $1", [specId]);
     await livePool.query("DELETE FROM spec_snapshot WHERE spec_id = $1", [specId]);
     await livePool.query(
       `UPDATE spec
           SET current_doc_seq = 0,
+              current_semantic_doc_seq = 0,
               lifecycle = 'draft',
               updated_at = CASE WHEN id = $1 THEN $3::timestamptz ELSE $4::timestamptz END
         WHERE id = ANY($2::uuid[])`,
@@ -750,6 +1082,138 @@ describe("SpecDocumentService with live Postgres", () => {
       expect(finalMarkdown).toContain("old");
       expect(finalMarkdown).toContain("peer edit");
       expect(finalMarkdown).not.toContain("current");
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
+    "migration 0056 backfills revisions and supports old and current writers",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const client = await livePool.connect();
+      const schemaName = `semantic_revision_${randomUUID().replaceAll("-", "")}`;
+      const quotedSchema = `"${schemaName}"`;
+      const migrationSpecId = randomUUID();
+      try {
+        await client.query("BEGIN");
+        await client.query(`CREATE SCHEMA ${quotedSchema}`);
+        await client.query(`SET LOCAL search_path TO ${quotedSchema}`);
+        await client.query(
+          `CREATE TABLE spec (
+             id uuid PRIMARY KEY,
+             current_doc_seq bigint DEFAULT 0 NOT NULL
+           );
+           CREATE TABLE spec_update_log (
+             spec_id uuid NOT NULL,
+             seq bigint NOT NULL,
+             update bytea NOT NULL,
+             client_id text,
+             PRIMARY KEY (spec_id, seq)
+           );
+           CREATE TABLE spec_snapshot (
+             spec_id uuid PRIMARY KEY,
+             state bytea NOT NULL,
+             state_vector bytea NOT NULL,
+             covered_seq bigint NOT NULL
+           );
+           CREATE TABLE spec_projection (
+             spec_id uuid NOT NULL,
+             rev bigint NOT NULL,
+             session_id uuid NOT NULL,
+             doc_seq bigint NOT NULL,
+             PRIMARY KEY (spec_id, rev)
+           )`,
+        );
+        await client.query("INSERT INTO spec (id, current_doc_seq) VALUES ($1, 2)", [
+          migrationSpecId,
+        ]);
+        await client.query(
+          `INSERT INTO spec_update_log (spec_id, seq, update, client_id)
+           VALUES ($1, 2, ''::bytea, 'legacy')`,
+          [migrationSpecId],
+        );
+        await client.query(
+          `INSERT INTO spec_snapshot (spec_id, state, state_vector, covered_seq)
+           VALUES ($1, ''::bytea, ''::bytea, 2)`,
+          [migrationSpecId],
+        );
+        await client.query(
+          `INSERT INTO spec_projection (spec_id, rev, session_id, doc_seq)
+           VALUES ($1, 1, $1, 2)`,
+          [migrationSpecId],
+        );
+
+        const migration = await readFile(
+          new URL("../../../drizzle/0056_spec_semantic_revision.sql", import.meta.url),
+          "utf8",
+        );
+        for (const statement of migration
+          .split("--> statement-breakpoint")
+          .map((value) => value.trim())
+          .filter(Boolean)) {
+          await client.query(statement);
+        }
+
+        await client.query("UPDATE spec SET current_doc_seq = 3 WHERE id = $1", [migrationSpecId]);
+        await client.query(
+          `INSERT INTO spec_update_log (spec_id, seq, update, client_id)
+           VALUES ($1, 3, ''::bytea, 'legacy')`,
+          [migrationSpecId],
+        );
+        await client.query(
+          `INSERT INTO spec_snapshot (spec_id, state, state_vector, covered_seq)
+           VALUES ($1, ''::bytea, ''::bytea, 3)
+           ON CONFLICT (spec_id) DO UPDATE SET covered_seq = excluded.covered_seq`,
+          [migrationSpecId],
+        );
+        await client.query(
+          "UPDATE spec_projection SET doc_seq = 3 WHERE spec_id = $1 AND rev = 1",
+          [migrationSpecId],
+        );
+        const legacy = await client.query<{
+          spec: string;
+          update_log: string;
+          snapshot: string;
+          projection: string;
+        }>(
+          `SELECT current_semantic_doc_seq::text AS spec,
+                  (SELECT max(semantic_doc_seq)::text FROM spec_update_log) AS update_log,
+                  (SELECT covered_semantic_doc_seq::text FROM spec_snapshot) AS snapshot,
+                  (SELECT semantic_doc_seq::text FROM spec_projection) AS projection
+             FROM spec
+            WHERE id = $1`,
+          [migrationSpecId],
+        );
+        expect(legacy.rows).toEqual([
+          { spec: "3", update_log: "3", snapshot: "3", projection: "3" },
+        ]);
+
+        await client.query("SELECT set_config('engrams.semantic_revision_writer', '1', true)");
+        await client.query(
+          `UPDATE spec
+              SET current_doc_seq = 4,
+                  current_semantic_doc_seq = 3
+            WHERE id = $1`,
+          [migrationSpecId],
+        );
+        await client.query(
+          `UPDATE spec_projection
+              SET doc_seq = 4,
+                  semantic_doc_seq = 3
+            WHERE spec_id = $1 AND rev = 1`,
+          [migrationSpecId],
+        );
+        const current = await client.query<{ spec: string; projection: string }>(
+          `SELECT current_semantic_doc_seq::text AS spec,
+                  (SELECT semantic_doc_seq::text FROM spec_projection) AS projection
+             FROM spec
+            WHERE id = $1`,
+          [migrationSpecId],
+        );
+        expect(current.rows).toEqual([{ spec: "3", projection: "3" }]);
+      } finally {
+        await client.query("ROLLBACK");
+        client.release();
+      }
     },
   );
 
@@ -931,6 +1395,117 @@ describe("SpecDocumentService with live Postgres", () => {
   );
 
   test.skipIf(!liveDbReachable)(
+    "a cache-only update preserves section state and the human transcript",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const stateTime = new Date("2026-08-09T12:03:00.000Z");
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => {
+          throw new Error("A cache-only update must not request a human-edit timestamp");
+        },
+      });
+      await documents.applyUpdate(specId, diagramUpdate(), null);
+      await livePool.query(
+        `INSERT INTO spec_participant (spec_id, client_id, user_id, connected_at)
+         VALUES ($1, $2, $3, $4)`,
+        [specId, humanClientId, userId, stateTime],
+      );
+      await livePool.query(
+        `INSERT INTO spec_section_state
+           (spec_id, section_id, state, na_reason, confirmed_by, updated_at)
+         VALUES ($1, 'design', 'confirmed', NULL, $2, $3)`,
+        [specId, userId, stateTime],
+      );
+
+      await documents.mutateDocument(specId, humanClientId, (document) =>
+        withDiagramCaches(document, () => '<svg><path d="M0 0" /></svg>'),
+      );
+
+      const result = await livePool.query<{
+        state: string;
+        updated_at: Date;
+        actions: string;
+      }>(
+        `SELECT state, updated_at,
+                (SELECT count(*)::text
+                   FROM spec_transcript_action
+                  WHERE spec_id = $1) AS actions
+           FROM spec_section_state
+          WHERE spec_id = $1 AND section_id = 'design'`,
+        [specId],
+      );
+      expect(result.rows[0]?.state).toBe("confirmed");
+      expect(result.rows[0]?.updated_at.toISOString()).toBe(stateTime.toISOString());
+      expect(result.rows[0]?.actions).toBe("0");
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
+    "spec_read, a cache write, and an agent mutation use one intended semantic projection",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      await livePool.query("UPDATE spec SET session_id = $2 WHERE id = $1", [specId, specId]);
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => new Date("2026-08-10T11:00:00.000Z"),
+      });
+      await documents.applyUpdate(specId, diagramUpdate(), null);
+      const projections = new PostgresSpecProjectionStore(
+        () => new Date("2026-08-10T11:00:00.000Z"),
+      );
+      const initialProjection = await projections.reserve({
+        specId,
+        sessionId: specId,
+        source: "initial",
+      });
+      await projections.markPublished(specId, initialProjection.rev);
+
+      const readRevision = (await documents.syncFromLog(specId)).semanticDocSeq;
+      expect(readRevision).toBe(1n);
+      const cacheUpdate = await documents.mutateDocument(specId, "cache-client", (document) =>
+        withDiagramCaches(document, () => '<svg><path d="M0 0" /></svg>'),
+      );
+      expect(cacheUpdate.semanticDocSeq).toBe(readRevision);
+      const afterCache = await projections.reserve({
+        specId,
+        sessionId: specId,
+        source: "cache-only",
+      });
+      expect(afterCache.rev).toBe(initialProjection.rev);
+
+      const agentUpdate = await documents.mutateDocument(
+        specId,
+        "agent-client",
+        (document) => documentWithContextText(document, "agent edit"),
+        readRevision,
+      );
+      expect(agentUpdate.semanticDocSeq).toBe(2n);
+      const intendedProjection = await projections.reserve({
+        specId,
+        sessionId: specId,
+        source: "agent-tool",
+      });
+      expect(intendedProjection.rev).toBe(initialProjection.rev + 1n);
+      const revisions = await livePool.query<{
+        current_doc_seq: string;
+        current_semantic_doc_seq: string;
+        projection_count: string;
+      }>(
+        `SELECT current_doc_seq::text,
+                current_semantic_doc_seq::text,
+                (SELECT count(*)::text FROM spec_projection WHERE spec_id = $1) AS projection_count
+           FROM spec
+          WHERE id = $1`,
+        [specId],
+      );
+      expect(revisions.rows[0]).toEqual({
+        current_doc_seq: "3",
+        current_semantic_doc_seq: "2",
+        projection_count: "2",
+      });
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
     "two instances converge after a dropped notification by filling the log gap",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
@@ -1027,10 +1602,10 @@ describe("SpecDocumentService with live Postgres", () => {
       // the next digest.
       await livePool.query(
         `INSERT INTO spec_projection
-           (spec_id, rev, session_id, doc_seq, sha256, rendered, document_state,
+           (spec_id, rev, session_id, doc_seq, semantic_doc_seq, sha256, rendered, document_state,
             digest, digest_sha256,
             staging_path, state, requested_source, pushed_at, created_at)
-         VALUES ($1, 1, $1, 2, 'digest', ''::bytea, ''::bytea,
+         VALUES ($1, 1, $1, 2, 2, 'digest', ''::bytea, ''::bytea,
                  ''::bytea, 'digest', '/workspace/.engrams/spec/incoming-1.md',
                  'published', 'test', now(), now())`,
         [specId],

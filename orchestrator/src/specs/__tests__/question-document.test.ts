@@ -14,6 +14,8 @@ import {
   type SpecDocumentCheckpoint,
   type SpecDocumentStore,
   type SpecSnapshotRecord,
+  type SpecUpdateEffects,
+  type SpecUpdateInsertResult,
   type SpecUpdateRecord,
 } from "../doc-service.ts";
 import {
@@ -30,6 +32,7 @@ const QUESTION_ID = "00000000-0000-4000-8000-000000000011";
 
 class MemoryDocumentStore implements SpecDocumentStore {
   private seq = 0n;
+  private semanticSeq = 0n;
   readonly updates: SpecUpdateRecord[] = [];
 
   async readSnapshot(): Promise<SpecSnapshotRecord | null> {
@@ -45,11 +48,18 @@ class MemoryDocumentStore implements SpecDocumentStore {
     expectedSeq: bigint,
     update: Uint8Array,
     clientId: string | null,
-  ): Promise<bigint | null> {
+    effects: SpecUpdateEffects,
+  ) {
     if (this.seq !== expectedSeq) return null;
     this.seq += 1n;
-    this.updates.push({ seq: this.seq, update: update.slice(), clientId });
-    return this.seq;
+    if (effects.semanticChanged) this.semanticSeq += 1n;
+    this.updates.push({
+      seq: this.seq,
+      semanticDocSeq: this.semanticSeq,
+      update: update.slice(),
+      clientId,
+    });
+    return { seq: this.seq, semanticDocSeq: this.semanticSeq };
   }
 
   async insertCheckpointAndUpdateIfLatest(
@@ -58,9 +68,9 @@ class MemoryDocumentStore implements SpecDocumentStore {
     _checkpoint: SpecDocumentCheckpoint,
     update: Uint8Array,
     clientId: string | null,
-    _effects: Parameters<SpecDocumentStore["insertUpdateIfLatest"]>[4],
-  ): Promise<bigint | null> {
-    return this.insertUpdateIfLatest(specId, expectedSeq, update, clientId);
+    effects: Parameters<SpecDocumentStore["insertUpdateIfLatest"]>[4],
+  ): Promise<SpecUpdateInsertResult | null> {
+    return this.insertUpdateIfLatest(specId, expectedSeq, update, clientId, effects);
   }
 
   async notifyUpdate(): Promise<void> {}

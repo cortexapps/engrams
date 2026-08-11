@@ -31,6 +31,7 @@ export interface ProjectionRecord {
   rev: bigint;
   sessionId: string;
   docSeq: bigint;
+  semanticDocSeq: bigint;
   sha256: string;
   rendered: Uint8Array;
   documentState: Uint8Array;
@@ -51,6 +52,7 @@ export interface SpecProjectionStore {
     rev: bigint,
     value: {
       docSeq: bigint;
+      semanticDocSeq: bigint;
       sha256: string;
       rendered: Uint8Array;
       documentState: Uint8Array;
@@ -72,6 +74,7 @@ function projectionRecord(row: typeof specProjection.$inferSelect): ProjectionRe
     rev: row.rev,
     sessionId: row.sessionId,
     docSeq: row.docSeq,
+    semanticDocSeq: row.semanticDocSeq,
     sha256: row.sha256,
     rendered: row.rendered,
     documentState: row.documentState,
@@ -90,13 +93,14 @@ export class PostgresSpecProjectionStore implements SpecProjectionStore {
   async reserve(input: SpecProjectionRequest, discardNotice = false): Promise<ProjectionRecord> {
     return getDb().transaction(async (tx) => {
       const specs = await tx
-        .select({ docSeq: spec.currentDocSeq })
+        .select({ docSeq: spec.currentDocSeq, semanticDocSeq: spec.currentSemanticDocSeq })
         .from(spec)
         .where(and(eq(spec.id, input.specId), eq(spec.sessionId, input.sessionId)))
         .for("update")
         .limit(1);
       const current = specs[0];
-      if (!current) throw new Error(`Spec ${input.specId} is not attached to session ${input.sessionId}`);
+      if (!current)
+        throw new Error(`Spec ${input.specId} is not attached to session ${input.sessionId}`);
 
       const latestRows = await tx
         .select()
@@ -108,21 +112,26 @@ export class PostgresSpecProjectionStore implements SpecProjectionStore {
       if (
         latest &&
         PENDING_STATES.includes(latest.state as (typeof PENDING_STATES)[number]) &&
-        latest.docSeq === current.docSeq
+        latest.semanticDocSeq === current.semanticDocSeq
       ) {
         if (discardNotice && !latest.discardNotice && latest.rendered.byteLength === 0) {
           const updated = await tx
             .update(specProjection)
             .set({ discardNotice: true })
-            .where(
-              and(eq(specProjection.specId, input.specId), eq(specProjection.rev, latest.rev)),
-            )
+            .where(and(eq(specProjection.specId, input.specId), eq(specProjection.rev, latest.rev)))
             .returning();
           return projectionRecord(updated[0]!);
         }
         if (!discardNotice || latest.discardNotice || latest.rendered.byteLength === 0) {
           return projectionRecord(latest);
         }
+      }
+      if (
+        latest?.state === "published" &&
+        latest.semanticDocSeq === current.semanticDocSeq &&
+        !discardNotice
+      ) {
+        return projectionRecord(latest);
       }
 
       const rev = (latest?.rev ?? 0n) + 1n;
@@ -134,6 +143,7 @@ export class PostgresSpecProjectionStore implements SpecProjectionStore {
           rev,
           sessionId: input.sessionId,
           docSeq: current.docSeq,
+          semanticDocSeq: current.semanticDocSeq,
           sha256: "",
           rendered: Buffer.alloc(0),
           documentState: Buffer.alloc(0),
@@ -179,6 +189,7 @@ export class PostgresSpecProjectionStore implements SpecProjectionStore {
     rev: bigint,
     value: {
       docSeq: bigint;
+      semanticDocSeq: bigint;
       sha256: string;
       rendered: Uint8Array;
       documentState: Uint8Array;
@@ -186,24 +197,28 @@ export class PostgresSpecProjectionStore implements SpecProjectionStore {
       digestSha256: string;
     },
   ): Promise<void> {
-    const updated = await getDb()
-      .update(specProjection)
-      .set({
-        docSeq: value.docSeq,
-        sha256: value.sha256,
-        rendered: Buffer.from(value.rendered),
-        documentState: Buffer.from(value.documentState),
-        digest: Buffer.from(value.digest),
-        digestSha256: value.digestSha256,
-      })
-      .where(
-        and(
-          eq(specProjection.specId, specId),
-          eq(specProjection.rev, rev),
-          sql`octet_length(${specProjection.rendered}) = 0`,
-        ),
-      )
-      .returning({ rev: specProjection.rev });
+    const updated = await getDb().transaction(async (tx) => {
+      await tx.execute(sql`SELECT set_config('engrams.semantic_revision_writer', '1', true)`);
+      return tx
+        .update(specProjection)
+        .set({
+          docSeq: value.docSeq,
+          semanticDocSeq: value.semanticDocSeq,
+          sha256: value.sha256,
+          rendered: Buffer.from(value.rendered),
+          documentState: Buffer.from(value.documentState),
+          digest: Buffer.from(value.digest),
+          digestSha256: value.digestSha256,
+        })
+        .where(
+          and(
+            eq(specProjection.specId, specId),
+            eq(specProjection.rev, rev),
+            sql`octet_length(${specProjection.rendered}) = 0`,
+          ),
+        )
+        .returning({ rev: specProjection.rev });
+    });
     if (updated.length === 0) {
       throw new Error(`Spec projection ${specId}:${rev} render is already pinned`);
     }
@@ -272,6 +287,7 @@ export class PostgresSpecProjectionStore implements SpecProjectionStore {
 
 export interface CanonicalSpecRender {
   docSeq: bigint;
+  semanticDocSeq: bigint;
   markdown: string;
   documentState: Uint8Array;
 }
@@ -286,13 +302,17 @@ export class PostgresCanonicalSpecRenderer implements CanonicalSpecRenderer {
       // The shared row lock makes current_doc_seq and its update tail one
       // revision. A document writer must update this row before it appends.
       const docs = await tx
-        .select({ currentDocSeq: spec.currentDocSeq })
+        .select({
+          currentDocSeq: spec.currentDocSeq,
+          currentSemanticDocSeq: spec.currentSemanticDocSeq,
+        })
         .from(spec)
         .where(eq(spec.id, specId))
         .for("share")
         .limit(1);
       if (!docs[0]) throw new Error(`Unknown spec: ${specId}`);
       const currentDocSeq = docs[0].currentDocSeq;
+      const currentSemanticDocSeq = docs[0].currentSemanticDocSeq;
       const snapshots = await tx
         .select({ state: specSnapshot.state, coveredSeq: specSnapshot.coveredSeq })
         .from(specSnapshot)
@@ -319,6 +339,7 @@ export class PostgresCanonicalSpecRenderer implements CanonicalSpecRenderer {
       for (const update of updates) Y.applyUpdate(doc, update.update);
       return {
         docSeq: currentDocSeq,
+        semanticDocSeq: currentSemanticDocSeq,
         markdown: renderMarkdown(proseMirrorDocument(doc)),
         documentState: Y.encodeStateAsUpdate(doc),
       };
@@ -425,7 +446,9 @@ export class SpecProjectionDriver implements SpecProjection {
         }
       }
       if (this.nowMs() >= deadline) {
-        throw new Error(`Spec projection ${specId}:${rev} was not published within ${deadlineMs}ms`);
+        throw new Error(
+          `Spec projection ${specId}:${rev} was not published within ${deadlineMs}ms`,
+        );
       }
       await this.sleep(25);
     }
@@ -465,15 +488,13 @@ export class SpecProjectionDriver implements SpecProjection {
       // A missing projection is the same drift result as a digest mismatch.
     }
     if (observed === published.sha256) return false;
-    await this.store.reserve(
-      { specId, sessionId, source: "drift-repair" },
-      true,
-    );
+    await this.store.reserve({ specId, sessionId, source: "drift-repair" }, true);
     return true;
   }
 
   private async publish(record: ProjectionRecord): Promise<void> {
     let docSeq = record.docSeq;
+    let semanticDocSeq = record.semanticDocSeq;
     let rendered = record.rendered;
     let documentState = record.documentState;
     let digest = record.digest;
@@ -488,6 +509,7 @@ export class SpecProjectionDriver implements SpecProjection {
         canonical.markdown,
       ].join("\n");
       docSeq = canonical.docSeq;
+      semanticDocSeq = canonical.semanticDocSeq;
       rendered = this.encoder.encode(body);
       documentState = canonical.documentState;
       sha256 = createHash("sha256").update(rendered).digest("hex");
@@ -503,6 +525,7 @@ export class SpecProjectionDriver implements SpecProjection {
       digestSha256 = createHash("sha256").update(digest).digest("hex");
       await this.store.recordRender(record.specId, record.rev, {
         docSeq,
+        semanticDocSeq,
         sha256,
         rendered,
         documentState,
@@ -527,11 +550,14 @@ export class SpecProjectionDriver implements SpecProjection {
     });
     if (result.exitStatus !== 0) {
       await this.store.markSuperseded(record.specId, record.rev);
-      await this.store.reserve({
-        specId: record.specId,
-        sessionId: record.sessionId,
-        source: "publish-retry",
-      }, record.discardNotice);
+      await this.store.reserve(
+        {
+          specId: record.specId,
+          sessionId: record.sessionId,
+          source: "publish-retry",
+        },
+        record.discardNotice,
+      );
       throw new Error(
         `Spec projection publish failed with status ${String(result.exitStatus)}: ${result.stderr}`,
       );

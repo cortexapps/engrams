@@ -393,6 +393,13 @@
       "when": 1786383460778,
       "tag": "0055_spec_participant_rollout_contract",
       "breakpoints": true
+    },
+    {
+      "idx": 56,
+      "version": "7",
+      "when": 1786402528900,
+      "tag": "0056_spec_semantic_revision",
+      "breakpoints": true
     }
   ]
 }

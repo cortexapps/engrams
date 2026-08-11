@@ -22,24 +22,33 @@ class MemoryProjectionStore implements SpecProjectionStore {
   readonly rows: ProjectionRecord[] = [];
   readonly sessionSpecs = new Map([[SESSION_ID, SPEC_ID]]);
   currentDocSeq = 7n;
+  currentSemanticDocSeq = 7n;
 
   async reserve(input: SpecProjectionRequest, discardNotice = false): Promise<ProjectionRecord> {
     const latest = this.rows.filter((row) => row.specId === input.specId).at(-1);
     if (
       latest &&
       (latest.state === "rendering" || latest.state === "staged") &&
-      latest.docSeq === this.currentDocSeq
+      latest.semanticDocSeq === this.currentSemanticDocSeq
     ) {
       if (!discardNotice || latest.discardNotice || latest.rendered.byteLength === 0) {
         latest.discardNotice ||= discardNotice;
         return latest;
       }
     }
+    if (
+      latest?.state === "published" &&
+      latest.semanticDocSeq === this.currentSemanticDocSeq &&
+      !discardNotice
+    ) {
+      return latest;
+    }
     const rev = (latest?.rev ?? 0n) + 1n;
     const row: ProjectionRecord = {
       ...input,
       rev,
       docSeq: this.currentDocSeq,
+      semanticDocSeq: this.currentSemanticDocSeq,
       sha256: "",
       rendered: new Uint8Array(),
       documentState: new Uint8Array(),
@@ -61,7 +70,9 @@ class MemoryProjectionStore implements SpecProjectionStore {
   }
 
   async latestPublished(specId: string): Promise<ProjectionRecord | null> {
-    return this.rows.filter((row) => row.specId === specId && row.state === "published").at(-1) ?? null;
+    return (
+      this.rows.filter((row) => row.specId === specId && row.state === "published").at(-1) ?? null
+    );
   }
 
   async recordRender(
@@ -69,6 +80,7 @@ class MemoryProjectionStore implements SpecProjectionStore {
     rev: bigint,
     value: {
       docSeq: bigint;
+      semanticDocSeq: bigint;
       sha256: string;
       rendered: Uint8Array;
       documentState: Uint8Array;
@@ -124,7 +136,11 @@ class FakeGuest implements ProjectionGuestClient {
   failWriteOnce: string | null = null;
   onWrite: ((path: string) => void | Promise<void>) | null = null;
 
-  async writeFile(input: AsyncIterable<Parameters<ProjectionGuestClient["writeFile"]>[0] extends AsyncIterable<infer F> ? F : never>) {
+  async writeFile(
+    input: AsyncIterable<
+      Parameters<ProjectionGuestClient["writeFile"]>[0] extends AsyncIterable<infer F> ? F : never
+    >,
+  ) {
     let path = "";
     let expectedSha = "";
     const chunks: Uint8Array[] = [];
@@ -229,6 +245,7 @@ function fixture() {
       rendererCalls += 1;
       return {
         docSeq: store.currentDocSeq,
+        semanticDocSeq: store.currentSemanticDocSeq,
         markdown: `## Context\n\nCanonical ${store.currentDocSeq}\n`,
         documentState: new Uint8Array([1, 2, Number(store.currentDocSeq)]),
       };
@@ -237,13 +254,10 @@ function fixture() {
   const source: SpecDigestSource = {
     changes: async () => [{ sectionId: "context", sectionTitle: "Context", author: "Ada" }],
   };
-  const driver = new SpecProjectionDriver(
-    store,
-    renderer,
-    new SpecDigestService(source),
-    guest,
-    { sleep: () => Bun.sleep(1), nowMs: Date.now },
-  );
+  const driver = new SpecProjectionDriver(store, renderer, new SpecDigestService(source), guest, {
+    sleep: () => Bun.sleep(1),
+    nowMs: Date.now,
+  });
   return { store, guest, driver, rendererCalls: () => rendererCalls };
 }
 
@@ -268,12 +282,33 @@ describe("SpecProjectionDriver", () => {
     const rendered = pinned.rendered.slice();
     const digest = pinned.digest.slice();
     store.currentDocSeq = 8n;
+    store.currentSemanticDocSeq = 8n;
 
     await driver.runOnce(SESSION_ID);
     expect(rendererCalls()).toBe(1);
     expect(pinned.rendered).toEqual(rendered);
     expect(pinned.digest).toEqual(digest);
-    expect(new TextDecoder().decode(guest.files.get(SPEC_PROJECTION_PATH))).toContain("Canonical 7");
+    expect(new TextDecoder().decode(guest.files.get(SPEC_PROJECTION_PATH))).toContain(
+      "Canonical 7",
+    );
+  });
+
+  test("a cache-only transport advance keeps one semantic projection", async () => {
+    const { driver, store } = fixture();
+    await driver.enqueue({ specId: SPEC_ID, sessionId: SESSION_ID, source: "initial" });
+    store.currentDocSeq = 8n;
+    store.currentSemanticDocSeq = 7n;
+
+    await driver.runOnce(SESSION_ID);
+    expect(store.rows).toHaveLength(1);
+    expect(store.rows[0]).toMatchObject({
+      docSeq: 8n,
+      semanticDocSeq: 7n,
+      state: "published",
+    });
+
+    await driver.enqueue({ specId: SPEC_ID, sessionId: SESSION_ID, source: "cache-only" });
+    expect(store.rows).toHaveLength(1);
   });
 
   test("a mutation during staging reserves and publishes a dirty successor", async () => {
@@ -283,6 +318,7 @@ describe("SpecProjectionDriver", () => {
       if (reserved || path !== "/workspace/.engrams/spec/incoming-1.md") return;
       reserved = true;
       store.currentDocSeq = 8n;
+      store.currentSemanticDocSeq = 8n;
       await driver.enqueue({
         specId: SPEC_ID,
         sessionId: SESSION_ID,
@@ -297,7 +333,9 @@ describe("SpecProjectionDriver", () => {
     guest.onWrite = null;
     await driver.runOnce(SESSION_ID);
     expect(store.rows.map((row) => row.state)).toEqual(["superseded", "published"]);
-    expect(new TextDecoder().decode(guest.files.get(SPEC_PROJECTION_PATH))).toContain("Canonical 8");
+    expect(new TextDecoder().decode(guest.files.get(SPEC_PROJECTION_PATH))).toContain(
+      "Canonical 8",
+    );
   });
 
   test("the next publish sweeps a staged file after a failed publish", async () => {
@@ -336,6 +374,8 @@ describe("SpecProjectionDriver", () => {
     await driver.enqueue({ specId: SPEC_ID, sessionId: SESSION_ID, source: "initial" });
     await driver.runOnce(SESSION_ID);
 
+    store.currentDocSeq = 8n;
+    store.currentSemanticDocSeq = 8n;
     guest.failWriteOnce = "/workspace/.engrams/spec/incoming-digest-2.md";
     await driver.enqueue({ specId: SPEC_ID, sessionId: SESSION_ID, source: "boundary" });
     await expect(driver.runOnce(SESSION_ID)).rejects.toThrow("injected staging failure");
@@ -403,13 +443,15 @@ describe("SpecProjectionDriver", () => {
   test("an agent mutation request returns only after the lease scanner publishes", async () => {
     const { driver, guest, store } = fixture();
     let returned = false;
-    const request = driver.request({
-      specId: SPEC_ID,
-      sessionId: SESSION_ID,
-      source: "agent-tool-mutation",
-    }).then(() => {
-      returned = true;
-    });
+    const request = driver
+      .request({
+        specId: SPEC_ID,
+        sessionId: SESSION_ID,
+        source: "agent-tool-mutation",
+      })
+      .then(() => {
+        returned = true;
+      });
     while ((await store.pending(SESSION_ID)).length === 0) await Promise.resolve();
     expect(returned).toBe(false);
     expect(guest.files.has(SPEC_PROJECTION_PATH)).toBe(false);

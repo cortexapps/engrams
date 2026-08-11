@@ -28,8 +28,11 @@ Terms used in this document:
   orchestrator and persisted in its Postgres.
 - **Projection** — a read-only markdown render of the doc, published to the
   guest file system so the agent can read the spec with ordinary file tools.
-- **Rev** — a monotonic integer per spec. Each published projection carries
-  one.
+- **Rev** — a monotonic semantic document revision per spec. Agent tools read
+  and compare this value. Cache-only Yjs updates do not change it.
+- **Doc seq** — the dense transport order for all durable Yjs updates,
+  including cache-only updates. Projections keep this cursor for replay and
+  digest work.
 - **Section** — a template-defined part of the spec. A section is a document
   node with a stable identity, not a heading that matches by text.
 - **Digest** — the per-section, per-author summary of human edits since the
@@ -148,10 +151,10 @@ New tables, in the orchestrator schema:
 
 | Table | Holds |
 | --- | --- |
-| `spec` | one row per spec: title, template id, owner, lifecycle (`draft`/`published`), published checkpoint id, current document revision |
+| `spec` | one row per spec: title, template id, owner, lifecycle (`draft`/`published`), published checkpoint id, current transport sequence, current semantic revision |
 | `spec_template` | layers, sections (title, guidance, done criteria, required, n/a allowed), stage flags |
-| `spec_update_log` | append-only Yjs updates, keyed by spec id and its dense revision |
-| `spec_snapshot` | compacted document state plus the `seq` it covers |
+| `spec_update_log` | append-only Yjs updates, keyed by spec id and dense transport sequence; each row also records the resulting semantic revision |
+| `spec_snapshot` | compacted document state plus the transport sequence and semantic revision it covers |
 | `spec_checkpoint` | pinned history: state, state vector, rendered markdown, label, author |
 | `spec_section_state` | per-section state and the reason for `n/a` |
 | `spec_transcript_action` | durable, idempotent transcript chips for section state actions |
@@ -186,11 +189,16 @@ streams: the conversation over SSE, and the document over this socket.
 
 The orchestrator runs two replicas. A spec room is **not** owned by one pod.
 
-Each `spec` row owns `current_doc_seq`, a dense per-spec committed revision. On
-each document update from a client:
+Each `spec` row owns `current_doc_seq`, a dense per-spec committed transport
+sequence. It also owns `current_semantic_doc_seq`, which changes only when the
+source document changes. A render-cache update stays durable in the Yjs log but
+does not invalidate an agent revision or create a new projection. On each
+document update from a client:
 
 1. In one transaction, conditionally increment `current_doc_seq` from the
-   service's last applied revision and insert the update with that revision.
+   service's last applied transport sequence. Increment
+   `current_semantic_doc_seq` only for a semantic change, and insert the update
+   with both resulting values.
 2. If the comparison fails, apply the missing log tail and retry.
 3. Broadcast to local sockets.
 4. Send a typed update envelope through `pg_notify('spec_update', ...)`.
@@ -199,11 +207,11 @@ A peer pod wakes on the notification and applies every row with
 `seq > last_applied`. The notification is a wake; the log is the truth. A missed
 notification costs latency, not correctness.
 
-The spec-row update serializes revision assignment and log insertion. A
-transaction rollback does not consume a revision, and revision N cannot commit
-before revision N-1. Thus `last_applied` is a committed watermark, not a raw
+The spec-row update serializes sequence assignment and log insertion. A
+transaction rollback does not consume a sequence, and sequence N cannot commit
+before sequence N-1. Thus `last_applied` is a committed watermark, not a raw
 Postgres sequence high-water mark. Compaction locks the same spec row, confirms
-that the candidate covers `current_doc_seq`, then writes the snapshot and
+that the candidate covers both current values, then writes the snapshot and
 deletes its covered tail in one transaction. It cannot delete an update that
 the snapshot did not apply.
 
@@ -242,10 +250,11 @@ claude CLI rejects the whole `tools/list` if any one tool emits `anyOf`, which
 removes every injected tool at once. Per-action requirements go in a zod
 refinement, exactly as the `Artifact` tool does.
 
-Every mutating tool takes an optional `expected_rev` and returns
+Every mutating tool takes an optional semantic `expected_rev` and returns
 `{applied, new_rev, concurrent_editors}`. That return value is the agent's
 feedback channel: it learns that its edit landed, and that other people are in
-the document. A file write could never tell it either thing.
+the document. A cache-only Yjs write does not cause a conflict. A file write
+could never tell it either thing.
 
 A section-state command also takes a stable action id. The row binds that id to
 a canonical command fingerprint, so reuse for a different command fails. Its

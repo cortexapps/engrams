@@ -20,6 +20,7 @@ import {
   type SpecDocumentStore,
   type SpecSnapshotRecord,
   type SpecUpdateEffects,
+  type SpecUpdateInsertResult,
   type SpecUpdateRecord,
 } from "../doc-service.ts";
 import {
@@ -73,6 +74,7 @@ const TEMPLATE_SECTIONS: SpecTemplateSection[] = [
 
 class MemoryDocumentStore implements SpecDocumentStore {
   seq = 0n;
+  semanticSeq = 0n;
   readonly updates: SpecUpdateRecord[] = [];
   readonly clientIds: Array<string | null> = [];
 
@@ -90,12 +92,18 @@ class MemoryDocumentStore implements SpecDocumentStore {
     update: Uint8Array,
     clientId: string | null,
     _effects: SpecUpdateEffects,
-  ): Promise<bigint | null> {
+  ) {
     if (expectedSeq !== this.seq) return null;
     this.seq += 1n;
+    if (_effects.semanticChanged) this.semanticSeq += 1n;
     this.clientIds.push(clientId);
-    this.updates.push({ seq: this.seq, update: update.slice(), clientId });
-    return this.seq;
+    this.updates.push({
+      seq: this.seq,
+      semanticDocSeq: this.semanticSeq,
+      update: update.slice(),
+      clientId,
+    });
+    return { seq: this.seq, semanticDocSeq: this.semanticSeq };
   }
 
   async insertCheckpointAndUpdateIfLatest(
@@ -105,7 +113,7 @@ class MemoryDocumentStore implements SpecDocumentStore {
     update: Uint8Array,
     clientId: string | null,
     effects: SpecUpdateEffects,
-  ): Promise<bigint | null> {
+  ): Promise<SpecUpdateInsertResult | null> {
     return this.insertUpdateIfLatest(specId, expectedSeq, update, clientId, effects);
   }
 
@@ -459,7 +467,18 @@ describe("production spec tool service", () => {
       if (!section) throw new Error("The context section is missing.");
       return new Transform(document).insert(
         section.position + section.node.nodeSize - 1,
-        schema.nodes.diagramBlock!.create({ blockId: "flow", kind: "mermaid", source: "old" }),
+        schema.nodes.diagramBlock!.create({
+          id: "flow",
+          kind: "mermaid",
+          source: "old",
+          cachedRender: {
+            kind: "mermaid",
+            source: "old",
+            blockId: "flow",
+            rendererRevision: "1",
+            svg: "<svg />",
+          },
+        }),
       ).doc;
     });
 
@@ -470,6 +489,9 @@ describe("production spec tool service", () => {
       source: "new",
     });
     expect(result).toMatchObject({ applied: true, newRev: 3n });
+    const updated = proseMirrorDocument((await documents.syncFromLog(SPEC_ID)).doc);
+    const block = findSection(updated, "context")?.node.lastChild;
+    expect(block?.attrs).toMatchObject({ id: "flow", source: "new", cachedRender: null });
     await expect(
       service.updateBlock(SPEC_ID, {
         ...context("wrong-block"),
