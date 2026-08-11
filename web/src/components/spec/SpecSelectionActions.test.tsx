@@ -9,10 +9,12 @@ import {
   type SpecSelectionSpan,
 } from "@engrams/spec-document";
 import { Transform } from "@tiptap/pm/transform";
+import { getSchema } from "@tiptap/core";
 import { prosemirrorToYXmlFragment } from "y-prosemirror";
 import * as Y from "yjs";
 
 import { SpecSelectionMenu, createSpecSelectionSpan, sameSelection } from "./SpecSelectionActions";
+import { specNodeExtensions } from "./extensions";
 
 function selectionDocumentFixture() {
   const document = createTemplateDocument({
@@ -96,6 +98,30 @@ describe("SpecSelectionMenu", () => {
       sectionId: "failure-modes",
       selectedText: "Retry",
     });
+  });
+
+  test("allows a body selection from the TipTap editor schema", () => {
+    const { document, ydoc, bodyStart } = selectionDocumentFixture();
+    try {
+      const editorSchema = getSchema(specNodeExtensions);
+      const editorDocument = editorSchema.nodeFromJSON(document.toJSON());
+      expect(editorDocument.type).not.toBe(document.type);
+      expect(
+        createSpecSelectionSpan(
+          editorDocument,
+          ydoc,
+          bodyStart,
+          bodyStart + "Retry".length,
+          "00000000-0000-4000-8000-000000000112",
+          "7",
+        ),
+      ).toMatchObject({
+        sectionId: "failure-modes",
+        selectedText: "Retry",
+      });
+    } finally {
+      ydoc.destroy();
+    }
   });
 
   test("keeps an equal transaction snapshot state-stable", () => {
