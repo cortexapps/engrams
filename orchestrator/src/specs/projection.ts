@@ -340,7 +340,7 @@ export class PostgresCanonicalSpecRenderer implements CanonicalSpecRenderer {
       return {
         docSeq: currentDocSeq,
         semanticDocSeq: currentSemanticDocSeq,
-        markdown: renderMarkdown(proseMirrorDocument(doc)),
+        markdown: renderMarkdown(proseMirrorDocument(doc), "github"),
         documentState: Y.encodeStateAsUpdate(doc),
       };
     });

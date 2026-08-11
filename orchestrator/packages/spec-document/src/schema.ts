@@ -1,7 +1,15 @@
 import { Fragment, Node as ProseMirrorNode, Schema, type NodeSpec } from "prosemirror-model";
 import { Transform } from "prosemirror-transform";
 
-import { readSpecBlockAttrs, type SpecBlockProvenance } from "./blocks.ts";
+import {
+  isSpecBlockKind,
+  matchingSpecBlockCachedRender,
+  readSpecBlockAttrs,
+  specRenderTargetRegistration,
+  type SpecBlockAttrs,
+  type SpecBlockProvenance,
+  type SpecRenderTarget,
+} from "./blocks.ts";
 
 export const SPEC_FRAGMENT_NAME = "prosemirror";
 
@@ -153,7 +161,7 @@ function renderInline(node: ProseMirrorNode): string {
   return result;
 }
 
-function renderBlock(node: ProseMirrorNode): string {
+function renderBlock(node: ProseMirrorNode, target: SpecRenderTarget): string {
   if (node.type === schema.nodes.paragraph) return renderInline(node);
   if (node.type === schema.nodes.heading) {
     const level = Math.min(6, Math.max(3, Number(node.attrs.level)));
@@ -164,15 +172,21 @@ function renderBlock(node: ProseMirrorNode): string {
   }
   if (node.type === schema.nodes.diagramBlock) {
     const block = readSpecBlockAttrs(node.attrs);
-    const metadata = escapeComment(
-      JSON.stringify({ id: block.id, kind: block.kind, provenance: block.provenance }),
-    );
-    return `<!-- spec-block ${metadata} -->\n${renderCodeFence(block.kind, block.source)}`;
+    const mode = isSpecBlockKind(block.kind)
+      ? specRenderTargetRegistration(target).blockModes[block.kind]
+      : "source";
+    if (mode === "cached-render") {
+      const cache = matchingSpecBlockCachedRender(block);
+      if (cache) {
+        return `${renderBlockMetadata(block, true)}\n${cache.svg}`;
+      }
+    }
+    return `${renderBlockMetadata(block, false)}\n${renderCodeFence(block.kind, block.source)}`;
   }
   throw new Error(`Cannot render spec node: ${node.type.name}`);
 }
 
-export function renderMarkdown(doc: ProseMirrorNode): string {
+export function renderMarkdown(doc: ProseMirrorNode, target: SpecRenderTarget = "engrams"): string {
   const sections: string[] = [];
   doc.forEach((section) => {
     if (section.type !== schema.nodes.section) {
@@ -183,12 +197,24 @@ export function renderMarkdown(doc: ProseMirrorNode): string {
       if (index === 0) {
         blocks.push(`## ${renderInline(node)}`);
       } else {
-        blocks.push(renderBlock(node));
+        blocks.push(renderBlock(node, target));
       }
     });
     sections.push(blocks.join("\n\n"));
   });
   return `${sections.join("\n\n").trimEnd()}\n`;
+}
+
+function renderBlockMetadata(block: SpecBlockAttrs, includeSource: boolean): string {
+  const metadata = includeSource
+    ? {
+        id: block.id,
+        kind: block.kind,
+        provenance: block.provenance,
+        source: block.source,
+      }
+    : { id: block.id, kind: block.kind, provenance: block.provenance };
+  return `<!-- spec-block ${escapeComment(JSON.stringify(metadata))} -->`;
 }
 
 function parseInline(value: string): Fragment {
