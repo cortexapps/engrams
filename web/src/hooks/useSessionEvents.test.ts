@@ -28,7 +28,12 @@ const h = vi.hoisted(() => ({
   requests: [] as { afterIdx?: bigint; beforeIdx?: bigint; limit: bigint; kinds: string[] }[],
 }));
 
-vi.mock("../sse", () => ({
+// Only `subscribeSession` is faked. The rest of the module is kept REAL —
+// `sessionWindow` derives the spine kinds from `SESSION_EVENT_KINDS`, so a
+// mock that omits it fails the whole module, not just the subscribe path,
+// and a hand-copied list would drift from the real one.
+vi.mock("../sse", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../sse")>()),
   subscribeSession: (_sessionId: string, handlers: SseHandlers, since: number) => {
     h.handlers = handlers;
     h.since = since;
