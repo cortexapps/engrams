@@ -43,7 +43,19 @@ vi.mock("../sse", async (importOriginal) => ({
   },
 }));
 
-vi.mock("@connectrpc/connect-query", () => ({ useTransport: () => ({}) }));
+// The transport identity must be STABLE across renders, because that is what
+// the real hook is. `useTransport` is `useContext(transportContext)`, and the
+// context value is the transport `<TransportProvider>` gets — one object that
+// `App.tsx` builds once at module scope. A factory that returns a fresh `{}`
+// per call is a transport that changes identity on EVERY render, which the
+// app cannot do; `useSessionEvents` memoises its page reader on the transport
+// and re-runs the whole open sequence when that reader changes, so an unstable
+// transport makes the effect reset state → re-render → reset again, about
+// 14 000 times a second, until the worker heap is gone.
+vi.mock("@connectrpc/connect-query", () => {
+  const transport = {};
+  return { useTransport: () => transport };
+});
 
 // A stand-in coordinator over `h.log`, with the page semantics the real
 // ListSessionEvents has: forward from `after_idx`, backward from `before_idx`
@@ -134,9 +146,26 @@ function fixtureLog(runs: number, tools: number) {
   return log;
 }
 
+/** A healthy mount renders a HANDFUL of times: the open sequence runs once per
+ *  session, not once per render. The budget is the guard rail — a hook that
+ *  re-runs its effect every render never reaches its subscribe (each teardown
+ *  bumps the generation, so the in-flight read is dropped), so the wait below
+ *  cannot time out and the loop runs until the heap is gone. The budget turns
+ *  that into a named failure. */
+const RENDER_BUDGET = 50;
+
 /** Mount the hook and wait for the open sequence to reach the subscribe. */
 async function mounted() {
-  const hook = renderHook(() => useSessionEvents("s1"));
+  let renders = 0;
+  const hook = renderHook(() => {
+    renders += 1;
+    if (renders > RENDER_BUDGET) {
+      throw new Error(
+        `useSessionEvents re-rendered ${renders} times: the open sequence is looping`,
+      );
+    }
+    return useSessionEvents("s1");
+  });
   await waitFor(() => expect(h.handlers).not.toBeNull());
   return hook;
 }
@@ -226,6 +255,10 @@ describe("useSessionEvents — the windowed open sequence", () => {
     // The window edge sits ON a run boundary, so no turn is cut in half.
     expect(result.current.events.find((e) => e.idx === floor)!.event.type).toBe("run_started");
     expect(h.since).toBe(h.log.length - 1);
+    // The open sequence costs a FIXED number of pages — one spine page, one
+    // tail page, one snap fill — however many renders React does. It does not
+    // grow with the log, and it does not repeat.
+    expect(h.requests).toHaveLength(3);
   });
 
   test("loadOlder prepends the next window and moves the oldest idx down", async () => {

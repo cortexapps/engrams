@@ -7,16 +7,19 @@
 import { describe, expect, test } from "vitest";
 import {
   decodePage,
+  loadSpine,
   loadTranscript,
   loadWindow,
   mergeIndexed,
   runStartIdxs,
   snapTo,
+  snapWindow,
   SPINE_KINDS,
   SPINE_TOOL_NAMES,
   WINDOW,
   type ListEventsPage,
   type PageRequest,
+  type RawPage,
 } from "./sessionWindow";
 import type { IndexedEvent } from "./types";
 
@@ -346,5 +349,92 @@ describe("loadWindow — the backfill step", () => {
     const older = await loadWindow(list, BigInt(loaded.floor!), loaded.runStarts);
     expect(older.exhausted).toBe(false);
     expect(older.floor).toBeGreaterThan(0);
+  });
+});
+
+describe("a degenerate server answer cannot spin the reader", () => {
+  // Both paging loops read a cursor the SERVER controls, so both have to end
+  // on an answer the server should never give: a page that stays full while
+  // its cursor stands still, or one that walks forward a single event at a
+  // time. A reader that trusted either would hold the tab's main thread and
+  // grow its heap until the tab died, so the bounds are pinned here.
+
+  /** A lister that answers whatever the case under test needs, and REFUSES
+   *  past `cap` pages — a lost bound then names itself instead of hanging. */
+  function scriptedLister(
+    answer: (req: PageRequest, call: number) => { count: number; next: number; firstIdx: number },
+    cap = 4000,
+  ) {
+    let calls = 0;
+    const list: ListEventsPage = (req) => {
+      calls += 1;
+      if (calls > cap) throw new Error(`unbounded read: over ${cap} pages`);
+      const a = answer(req, calls);
+      const rows = Array.from({ length: a.count }, (_, i) => wire(a.firstIdx + i, "harness_idle"));
+      return Promise.resolve({ events: decodePage(rows), count: a.count, next: a.next });
+    };
+    return { list, calls: () => calls };
+  }
+
+  test("the spine stops when the forward cursor stands still", async () => {
+    // Every page is FULL, so no page ever reads as the last one, and `next`
+    // never moves: only the no-progress check can end this.
+    const { list, calls } = scriptedLister(() => ({ count: 1000, next: 7, firstIdx: 0 }));
+    await expect(loadSpine(list)).resolves.toBeDefined();
+    expect(calls()).toBe(2);
+  });
+
+  test("the spine stops after its page cap when the cursor crawls", async () => {
+    // The cursor DOES advance, one idx per page, and the page stays full: the
+    // no-progress check never fires, so the page cap is the only bound.
+    const { list, calls } = scriptedLister((_req, call) => ({
+      count: 1000,
+      next: call,
+      firstIdx: 0,
+    }));
+    await expect(loadSpine(list)).resolves.toBeDefined();
+    expect(calls()).toBe(50);
+  });
+
+  test("the snap fill stops when the forward cursor stands still", async () => {
+    const page: RawPage = {
+      events: decodePage([wire(1000, "harness_idle")]),
+      count: WINDOW,
+      next: 1000,
+    };
+    const { list, calls } = scriptedLister(() => ({ count: WINDOW, next: -1, firstIdx: 5000 }));
+    const win = await snapWindow(list, page, [0]);
+    expect(calls()).toBe(1);
+    // The fill never reached the boundary, so the window keeps its TRUE floor
+    // rather than claiming a turn it does not hold.
+    expect(win.floor).toBe(1000);
+  });
+
+  test("the snap fill stops at its read cap when the server dribbles", async () => {
+    // One event per page, forever: the fill would walk a 100 000-event gap a
+    // page at a time if the read cap did not end it.
+    const page: RawPage = {
+      events: decodePage([wire(100000, "harness_idle")]),
+      count: WINDOW,
+      next: 100000,
+    };
+    const { list, calls } = scriptedLister((_req, call) => ({
+      count: 1,
+      next: call,
+      firstIdx: 5000,
+    }));
+    await expect(snapWindow(list, page, [0])).resolves.toBeDefined();
+    expect(calls()).toBe(1000);
+  });
+
+  test("an empty page ends the fill at once", async () => {
+    const page: RawPage = {
+      events: decodePage([wire(1000, "harness_idle")]),
+      count: WINDOW,
+      next: 1000,
+    };
+    const { list, calls } = scriptedLister(() => ({ count: 0, next: 0, firstIdx: 0 }));
+    await expect(snapWindow(list, page, [0])).resolves.toBeDefined();
+    expect(calls()).toBe(1);
   });
 });
