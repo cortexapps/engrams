@@ -143,6 +143,18 @@ integration cards (OAuth connect, PAT entry, disconnect). Slack-triggered
 sessions surface the `FailedPrecondition` message in-thread with a
 credentials link instead of the generic failure text.
 
+### Amendment (2026-08-11): warn and disable, never block
+
+A missing or unhealthy personal credential no longer blocks a human launch.
+The compile DROPS the unsatisfied user-scoped grants instead: the
+integration contributes no capability, no tool or CLI surface, no egress
+entry, no opened host, and no snapshot grant for that session. There is
+still no org fallback — the integration is off, not downgraded. The start
+screen keeps the same warning box (naming the disabled integrations, with
+the Settings → Credentials link) but leaves the launch enabled. The harness
+credential gate is unchanged: a session without it boots unauthenticated,
+so it still blocks.
+
 ## Consequences
 
 - ADR 0057's single-tenant model stays. User-scoped means per-user inside

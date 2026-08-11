@@ -292,25 +292,57 @@ const inp = await compileSessionCreateInput(
     });
   });
 
-  test("a human run without the credential is blocked with the Settings pointer", async () => {
-await expect(
-      compileSessionCreateInput(userScopedProfile(), userDeps([])),
-    ).rejects.toThrow(/Acme needs your personal credential.*Settings → Credentials/s);
+  // ADR 0115 amendment: a missing personal credential no longer blocks the
+  // launch — the integration is disabled for the session (no org fallback,
+  // no capability, no policy entry, no snapshot grant).
+  test("a human run without the credential launches with the integration disabled", async () => {
+    const inp = await compileSessionCreateInput(userScopedProfile(), userDeps([]));
+    expect(inp.capabilities).toBeUndefined();
+    expect(inp.integrationPolicyJson).toBeUndefined();
+    expect(inp.integrationGrants).toEqual([]);
+    expect(inp.integrationConnections).toEqual([]);
   });
 
-  test("a broken credential blocks (presence is not enough)", async () => {
-await expect(
-      compileSessionCreateInput(
-        userScopedProfile(),
-        userDeps([{ provider: "acme", status: "broken" }]),
-      ),
-    ).rejects.toThrow(/Acme needs your personal credential/);
+  test("a broken credential disables too (presence is not enough)", async () => {
+    const inp = await compileSessionCreateInput(
+      userScopedProfile(),
+      userDeps([{ provider: "acme", status: "broken" }]),
+    );
+    expect(inp.capabilities).toBeUndefined();
+    expect(inp.integrationPolicyJson).toBeUndefined();
   });
 
-  test("an unwired credential lister fails closed", async () => {
-await expect(
-      compileSessionCreateInput(userScopedProfile(), userDeps(undefined)),
-    ).rejects.toThrow(/personal credential/);
+  test("an unwired credential lister fails closed to disabled, never org", async () => {
+    const inp = await compileSessionCreateInput(userScopedProfile(), userDeps(undefined));
+    expect(inp.capabilities).toBeUndefined();
+    expect(inp.integrationPolicyJson).toBeUndefined();
+  });
+
+  test("a drop only removes the unsatisfied integration, not its neighbors", async () => {
+    const inp = await compileSessionCreateInput(
+      profile({
+        integrationGrants: [
+          {
+            connectionId: "default-acme",
+            operation: "issues:write",
+            resourceConstraints: [],
+            credentialScope: "user" as const,
+          },
+          { connectionId: "default-github", operation: "issues:write", resourceConstraints: [] },
+        ],
+      }),
+      userDeps([]),
+    );
+    expect(inp.capabilities).toEqual(["github:issues:write"]);
+    expect(inp.integrationGrants).toEqual([
+      { connectionId: "default-github", operation: "issues:write", resourceConstraints: [] },
+    ]);
+    expect(inp.integrationConnections?.map((c) => c.provider)).toEqual(["github"]);
+    // No acme inject in the policy, and no org fallback for it.
+    const policy = policyOf(inp);
+    expect(
+      (policy.injects ?? []).some((inject) => inject.secret_ref === "acme.token"),
+    ).toBe(false);
   });
 
   test("a programmatic run compiles the org credential and never gates", async () => {

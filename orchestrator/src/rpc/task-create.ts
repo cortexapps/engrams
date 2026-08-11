@@ -426,11 +426,16 @@ export async function compileSessionCreateInput(
       Code.FailedPrecondition,
     );
   }
-  // ADR 0115: a user-scoped grant (profile opted the integration into the
-  // launching user's personal credential) requires that credential for a
-  // HUMAN run — mirroring the harness gate above: the PRINCIPAL decides.
+  // ADR 0115 (amended): a user-scoped grant (profile opted the integration
+  // into the launching user's personal credential) needs that credential for
+  // a HUMAN run — the PRINCIPAL decides, like the harness gate above. A
+  // missing or unhealthy personal credential does NOT block the launch and
+  // NEVER falls back to the org credential: the integration is disabled for
+  // this session — its grants are dropped before capabilities, the tool/CLI
+  // surface, the egress policy, and the snapshot are compiled. The start
+  // screen mirrors this with a warning so the drop is never silent.
   // Programmatic sessions compile the org credential regardless, and
-  // override grants never carry a scope, so an override session never gates.
+  // override grants never carry a scope, so an override session never drops.
   const userScopedGrants = isHuman
     ? resolvedEffectiveGrants.filter(
         ({ grant, connection }) =>
@@ -438,26 +443,24 @@ export async function compileSessionCreateInput(
           registry.get(connection.provider)?.userCredential !== undefined,
       )
     : [];
+  let unavailableUserProviders = new Set<string>();
   if (userScopedGrants.length > 0) {
+    // Fail closed: an unwired lister reads as "no credentials", so the
+    // integrations disable rather than silently borrowing org authority.
     const rows = (await deps.listUserConnectorCredentials?.()) ?? [];
     const connected = new Set(
       rows.filter((row) => row.status === "connected").map((row) => row.provider),
     );
-    const missing = [
-      ...new Set(userScopedGrants.map(({ connection }) => connection.provider)),
-    ].filter((provider) => !connected.has(provider));
-    if (missing.length > 0) {
-      const names = missing.map(
-        (provider) => registry.get(provider)?.display.name ?? provider,
-      );
-      throw new ConnectError(
-        `${names.join(", ")} need${names.length === 1 ? "s" : ""} your personal credential.` +
-          ` Connect it under Settings → Credentials, then start the task again.`,
-        Code.FailedPrecondition,
-      );
-    }
+    unavailableUserProviders = new Set(
+      userScopedGrants
+        .map(({ connection }) => connection.provider)
+        .filter((provider) => !connected.has(provider)),
+    );
   }
-  const capabilities = grantsToCapabilities(resolvedEffectiveGrants);
+  const grantAvailable = ({ grant, connection }: (typeof resolvedEffectiveGrants)[number]) =>
+    !(grant.credentialScope === "user" && unavailableUserProviders.has(connection.provider));
+  const activeResolvedGrants = resolvedEffectiveGrants.filter(grantAvailable);
+  const capabilities = grantsToCapabilities(activeResolvedGrants);
   // A capability override is the complete session authority and therefore
   // also owns its CLI/tool surface. Without one, preserve the narrower
   // profile-owned surface: extra integration grants do not add model tools.
@@ -468,14 +471,16 @@ export async function compileSessionCreateInput(
     opts.capabilityOverride !== undefined
       ? capabilities
       : grantsToCapabilities(
-          await resolveIntegrationGrants(profile.integrationGrants, connections),
+          (await resolveIntegrationGrants(profile.integrationGrants, connections)).filter(
+            grantAvailable,
+          ),
         );
   const cliPlan = compileCliIntegrations(surfacedCapabilities, registry);
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
   // Connector-backed CLIs, then the ones a named connection makes usable. The
   // second list comes from the provider registry, so a new provider surfaces
   // its CLI without a branch here.
-  const enabledCli = [...cliPlan.enabled, ...providerCliSurfaces(resolvedEffectiveGrants)];
+  const enabledCli = [...cliPlan.enabled, ...providerCliSurfaces(activeResolvedGrants)];
   if (enabledCli.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(enabledCli);
   const baseToolRegistry = deps.toolRegistry ?? productionTools;
   const manifestRegistry: ToolRegistry = opts.excludeHumanInteractionTools
@@ -532,12 +537,12 @@ export async function compileSessionCreateInput(
   // the corresponding skill is mounted into this session.
   // Where a guest looks for each present provider's credential. The values
   // come from the provider itself, so a new one needs no branch here.
-  Object.assign(harness, providerGuestEnv(resolvedEffectiveGrants));
+  Object.assign(harness, providerGuestEnv(activeResolvedGrants));
   const selectedSkills = [
     ...new Set([
       ...profile.skills,
       ...cliPlan.bundles,
-      ...providerGuestBundles(resolvedEffectiveGrants),
+      ...providerGuestBundles(activeResolvedGrants),
     ]),
   ];
   if (selectedSkills.includes("browser")) harness.ENGRAM_BROWSER_VIEW_ENABLED = "1";
@@ -551,7 +556,7 @@ export async function compileSessionCreateInput(
   // Per-session integration policy (caps + network + secrets), shipped only
   // when it carries content.
   const policy = compileIntegrationPolicy(
-    resolvedEffectiveGrants.map(({ grant, connection }) => ({
+    activeResolvedGrants.map(({ grant, connection }) => ({
       connectionId: connection.id,
       provider: connection.provider,
       operation: grant.operation,
@@ -584,8 +589,8 @@ export async function compileSessionCreateInput(
     };
     policy.secrets.push(secret);
   }
-  compileProviderPolicy(policy, resolvedEffectiveGrants);
-  policy.guest_services = providerGuestServices(resolvedEffectiveGrants);
+  compileProviderPolicy(policy, activeResolvedGrants);
+  policy.guest_services = providerGuestServices(activeResolvedGrants);
   // ADR 0063 B4: a programmatic task (cron / Slack / API) authenticates the
   // harness with the ORG credential, not a per-user token. The org-secret value
   // never leaves the coordinator (ADR 0057), so we can't read it here — instead
@@ -622,10 +627,12 @@ export async function compileSessionCreateInput(
     ...(selectedSkills.length > 0 ? { selectedSkills } : {}),
     ...(capabilities.length > 0 ? { capabilities } : {}),
     ...(integrationPolicyJson != null ? { integrationPolicyJson } : {}),
-    integrationGrants: effectiveGrants,
+    // The snapshot records the authority the session ACTUALLY holds — a
+    // dropped user-scoped integration leaves no grant behind.
+    integrationGrants: activeResolvedGrants.map(({ grant }) => grant),
     integrationConnections: [
       ...new Map(
-        resolvedEffectiveGrants.map(({ connection }) => [
+        activeResolvedGrants.map(({ connection }) => [
           connection.id,
           {
             id: connection.id,
