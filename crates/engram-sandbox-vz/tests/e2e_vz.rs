@@ -853,11 +853,11 @@ async fn e2e_vz_forge_credential_round_trips() {
                     username: "x-access-token".into(),
                     password: format!("ghs_canned_{}", req.broker_token),
                 },
-                ForgeOp::FetchOAuthCredential | ForgeOp::UpdateOAuthCredential { .. } => {
-                    ForgeResponse::Error {
-                        message: "unexpected OAuth request".into(),
-                    }
-                }
+                ForgeOp::FetchOAuthCredential
+                | ForgeOp::UpdateOAuthCredential { .. }
+                | ForgeOp::ReportOAuthCredentialBroken { .. } => ForgeResponse::Error {
+                    message: "unexpected OAuth request".into(),
+                },
             };
             let _ = write_msg(&mut stream, &resp).await;
         });
