@@ -45,6 +45,8 @@ import {
   TASK_TOOL,
 } from "@/components/session-thread/buildMessages";
 import { useSessionStatus } from "@/components/session-thread/session-status";
+import { useTranscriptWindow } from "@/components/session-thread/transcript-window";
+import { useTranscriptBackfill } from "@/hooks/useTranscriptBackfill";
 import { useComposerActions } from "@/components/session-thread/composer-actions";
 import {
   InlineUploadComposer,
@@ -64,13 +66,27 @@ import type { SessionState } from "@/lib/types";
 // harness "system" register), plus a composer that pokes the sandbox.
 
 export const Thread: FC = () => {
+  // The transcript opens on a tail window and reads older pages upward. The
+  // viewport owns the scroll position, so the backfill trigger and the
+  // prepend anchor live here (hooks/useTranscriptBackfill.ts).
+  const transcriptWindow = useTranscriptWindow();
+  const { viewportRef } = useTranscriptBackfill(transcriptWindow);
   return (
     <ThreadPrimitive.Root
       className="aui-root aui-thread-root @container flex h-full flex-col bg-background"
       style={{ ["--thread-max-width" as string]: "44rem" }}
     >
-      <ThreadPrimitive.Viewport className="relative flex flex-1 flex-col overflow-x-auto overflow-y-scroll scroll-smooth">
+      <ThreadPrimitive.Viewport
+        ref={viewportRef}
+        className="relative flex flex-1 flex-col overflow-x-auto overflow-y-scroll scroll-smooth"
+      >
         <div className="mx-auto flex w-full max-w-(--thread-max-width) flex-1 flex-col px-4 pt-4">
+          <TranscriptBackfillNotice
+            hasMore={transcriptWindow.hasMore}
+            loadingOlder={transcriptWindow.loadingOlder}
+            loadOlder={transcriptWindow.loadOlder}
+          />
+
           <AuiIf condition={(s) => s.thread.isEmpty}>
             <ThreadEmpty />
           </AuiIf>
@@ -86,6 +102,36 @@ export const Thread: FC = () => {
         </div>
       </ThreadPrimitive.Viewport>
     </ThreadPrimitive.Root>
+  );
+};
+
+/** The top-of-transcript affordance while older pages exist: a status line
+ *  while a page reads, and a manual control otherwise (scrolling to the top
+ *  reads the next page on its own, but a reader who lands there through a
+ *  keyboard Home key or a short viewport gets an explicit way to continue). */
+const TranscriptBackfillNotice: FC<{
+  hasMore: boolean;
+  loadingOlder: boolean;
+  loadOlder: () => void;
+}> = ({ hasMore, loadingOlder, loadOlder }) => {
+  if (!hasMore && !loadingOlder) return null;
+  return (
+    <div className="flex justify-center pb-2">
+      {loadingOlder ? (
+        <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Loader2Icon className="size-3 animate-spin" />
+          Loading earlier messages…
+        </span>
+      ) : (
+        <button
+          type="button"
+          onClick={loadOlder}
+          className="cursor-pointer text-xs text-muted-foreground underline-offset-4 hover:underline"
+        >
+          Load earlier messages
+        </button>
+      )}
+    </div>
   );
 };
 

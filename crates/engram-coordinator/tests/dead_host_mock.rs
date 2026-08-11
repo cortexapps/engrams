@@ -179,11 +179,13 @@ impl MetadataStore for MiniMeta {
     ) -> Result<i64, MetaError> {
         Ok(0)
     }
-    async fn list_session_events_since(
+    async fn list_session_events_window(
         &self,
         _s: SessionId,
-        _since: i64,
+        _cursor: engram_core::types::EventCursor,
         _limit: i64,
+        _kinds: &[String],
+        _tool_names: &[String],
     ) -> Result<Vec<PersistedEvent>, MetaError> {
         Ok(Vec::new())
     }

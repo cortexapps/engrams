@@ -204,7 +204,14 @@ vi.mock("../../hooks/useNow", () => ({ useNow: () => 0 }));
 // The transcript pane streams over SSE, which jsdom has no EventSource for; the
 // pane's job here is to mount the right session, not to replay a transcript.
 vi.mock("../../hooks/useSessionEvents", () => ({
-  useSessionEvents: () => ({ events: [], streamingText: "" }),
+  useSessionEvents: () => ({
+    events: [],
+    streamingText: "",
+    hasMore: false,
+    loadingOlder: false,
+    loadOlder: () => {},
+    oldestIdx: null,
+  }),
 }));
 vi.mock("../../hooks/useSessions", () => ({
   useSession: () => ({ data: { id: "finder-sess-1", status: "completed" } }),

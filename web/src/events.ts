@@ -367,14 +367,34 @@ export function parseOrchestratorFrame(frameData: string, kind: string): Indexed
     return null;
   }
 
+  return parseEventFrame(envelope.idx, kind, envelope.payload_json);
+}
+
+/**
+ * Parse one ALREADY-SPLIT durable event — the `{idx, kind, payload_json}`
+ * triple that both the SSE envelope and a `ListSessionEvents` page carry — into
+ * an IndexedEvent, or null when the frame is not a durable event.
+ *
+ * This is steps 2-6 of the contract above. The windowed transcript read
+ * (lib/sessionWindow.ts) decodes its pages through THIS function, so a replayed
+ * event and a live event become byte-identical IndexedEvents: one decode path,
+ * one set of rewind-metadata rules, no second shape to keep in sync.
+ */
+export function parseEventFrame(
+  idx: number | null,
+  kind: string,
+  payloadJson: string,
+): IndexedEvent | null {
+  if (kind === "ping" || kind === "lagged") return null;
+
   // Lagged frames have idx === null; they're handled by the lagged listener.
   // Non-numeric idx = contract-breaking envelope — drop it (mirrors the old
   // dispatch's Number.isFinite guard) while keeping idx 0 valid.
-  if (typeof envelope.idx !== "number" || !Number.isFinite(envelope.idx)) return null;
+  if (typeof idx !== "number" || !Number.isFinite(idx)) return null;
 
   let raw: Record<string, unknown>;
   try {
-    raw = JSON.parse(envelope.payload_json) as Record<string, unknown>;
+    raw = JSON.parse(payloadJson) as Record<string, unknown>;
   } catch {
     return null;
   }
@@ -392,7 +412,7 @@ export function parseOrchestratorFrame(frameData: string, kind: string): Indexed
   const payload = { ...raw, type: kind } as SessionEvent;
 
   return {
-    idx: envelope.idx,
+    idx,
     event: payload,
     rewound,
     recoveryEpoch,

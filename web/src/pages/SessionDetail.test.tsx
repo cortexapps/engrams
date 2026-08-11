@@ -42,7 +42,14 @@ vi.mock("../hooks/useTasks", () => ({
   }),
 }));
 vi.mock("../hooks/useSessionEvents", () => ({
-  useSessionEvents: () => ({ events: [], streamingText: "" }),
+  useSessionEvents: () => ({
+    events: [],
+    streamingText: "",
+    hasMore: false,
+    loadingOlder: false,
+    loadOlder: () => {},
+    oldestIdx: null,
+  }),
 }));
 vi.mock("../hooks/useDocumentTitle", () => ({
   useDocumentTitle: () => {},

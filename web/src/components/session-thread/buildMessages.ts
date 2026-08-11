@@ -386,6 +386,13 @@ export function buildMessages(
   // durable `agent_message` supersedes it (the hook empties it the instant
   // that lands, so re-running yields identical text — no double-render).
   streamingText = "",
+  // The oldest idx the transcript window covers UNFILTERED, or null when the
+  // whole log is loaded. Below it the spine carries the question but not the
+  // `tool_result_submitted` that answered it, so an old, long-decided plan
+  // would otherwise read as still awaiting the reviewer — which is not just a
+  // stale card: it drives the composer's review hint and clears `isRunning`.
+  // An unloaded answer is UNKNOWN, and unknown is not pending.
+  decisionFloorIdx: number | null = null,
 ): BuildMessagesResult {
   const out: Draft[] = [];
 
@@ -435,26 +442,77 @@ export function buildMessages(
     return null;
   };
 
-  // Assistant message ids MUST be position-independent. A previous `a:${out.length}`
-  // scheme keyed on array position, so inserting/removing an earlier bubble (a
-  // queued user message landing mid-run, or a `prompt_dequeued` filtering one out
-  // after the loop) re-numbered every later assistant turn — and assistant-ui keys
-  // messages by id, so a turn silently changing id throws "a message with the same
-  // id already exists in the parent tree" (the crash). A dedicated monotonic counter
-  // gives the Nth assistant turn a STABLE `a:N` regardless of what surrounds it.
-  let assistantSeq = 0;
+  // Assistant message ids MUST be position-independent AND independent of WHERE
+  // the loaded transcript starts. Two schemes failed that: `a:${out.length}` keyed
+  // on array position, so inserting/removing an earlier bubble (a queued user
+  // message landing mid-run, or a `prompt_dequeued` filtering one out after the
+  // loop) re-numbered every later assistant turn; a monotonic per-call counter
+  // fixed that but still numbered turns 0..N PER CALL, so the windowed transcript
+  // (lib/sessionWindow.ts) re-numbered every later turn the moment OLDER events
+  // were prepended. Either way assistant-ui, which keys messages by id, throws "a
+  // message with the same id already exists in the parent tree" (the crash).
+  //
+  // So an id derives from the server-assigned `idx` of the event that OPENED the
+  // turn — absolute and immutable, whatever is loaded around it. The FIRST bubble
+  // of a run anchors on its `run_started` idx instead of its own opener, which
+  // holds ONE id across the two renders that legitimately open the same turn from
+  // different events: the live streaming tail (no durable event yet) and the
+  // durable `agent_message` that supersedes it. Anchors are therefore distinct
+  // idxs by construction — a `run_started` opens no bubble itself — but the
+  // suffix below keeps that true by construction, not by assumption.
+  const usedAssistantIds = new Set<string>();
+  const assistantId = (anchor: number | null): string => {
+    const base = anchor == null ? "a:live" : `a:${anchor}`;
+    if (!usedAssistantIds.has(base)) {
+      usedAssistantIds.add(base);
+      return base;
+    }
+    for (let n = 2; ; n++) {
+      const candidate = `${base}#${n}`;
+      if (!usedAssistantIds.has(candidate)) {
+        usedAssistantIds.add(candidate);
+        return candidate;
+      }
+    }
+  };
 
-  const ensureAssistant = (at?: string): Draft => {
+  // The idx of the open run's `run_started`, and whether that run already made
+  // an assistant bubble — together they pick the anchor above.
+  let runStartIdx: number | null = null;
+  let runHasAssistant = false;
+
+  const ensureAssistant = (idx: number | null, at?: string): Draft => {
     if (active) return active;
+    const anchor = runOpen && !runHasAssistant && runStartIdx != null ? runStartIdx : idx;
+    runHasAssistant = true;
     active = {
       role: "assistant",
       content: [],
-      id: `a:${assistantSeq++}`,
+      id: assistantId(anchor),
       createdAt: at ? new Date(at) : undefined,
       status: { type: "running" },
     };
     out.push(active);
     return active;
+  };
+
+  // A sandbox exec whose `exec_started` is OUTSIDE the loaded window still has
+  // its output and its exit status inside it. Without a standalone part the
+  // correlation below silently DROPPED all of it (the same hole an orphan tool
+  // completion already fills), so the reader saw a turn with the command's
+  // output missing. The command text is unknown here — the output is what
+  // survives, which is the point.
+  const openExecPart = (execId: string, idx: number, at?: string): ToolPart => {
+    const part: ToolPart = {
+      type: "tool-call",
+      toolCallId: execId,
+      toolName: SHELL_TOOL,
+      args: { command: "" } satisfies ShellArgs,
+      argsText: "",
+    };
+    ensureAssistant(idx, at).content.push(part);
+    openExecs.set(execId, part);
+    return part;
   };
 
   // Push a system "harness register" message carrying a marker payload. The
@@ -546,9 +604,17 @@ export function buildMessages(
   // render below cannot double-emit a bubble for an echo that lands AFTER its
   // run_started (the 68c70a65 inversion — the loop re-holds that echo).
   const consumedPromptIds = new Set<string>();
-  for (const { event } of events) {
-    if (event.type === "user_question") questionToolCallIds.add(event.tool_call_id);
-    else if (event.type === "run_started" && event.prompt_id)
+  // The idx that ASKED for each deferred decision. A decision is ANSWERED by a
+  // `tool_result_submitted`, which is not a spine kind, so below the window
+  // floor we hold the question without its answer. Keeping the asking idx lets
+  // the "is this still pending?" tests below tell "answered: no" apart from
+  // "not loaded yet" — see `decisionKnown`.
+  const decisionAskedAtIdx = new Map<string, number>();
+  for (const { idx, event } of events) {
+    if (event.type === "user_question") {
+      questionToolCallIds.add(event.tool_call_id);
+      decisionAskedAtIdx.set(event.tool_call_id, idx);
+    } else if (event.type === "run_started" && event.prompt_id)
       consumedPromptIds.add(event.prompt_id);
     else if (event.type === "prompt_steered") consumedPromptIds.add(event.prompt_id);
     else if (event.type === "tool_call_requested") {
@@ -556,9 +622,11 @@ export function buildMessages(
       requestedToolNames.add(event.name);
       if (event.name === "ask_user_question" && parseCanonicalQuestions(event.args_json) !== null) {
         questionToolCallIds.add(event.tool_call_id);
+        decisionAskedAtIdx.set(event.tool_call_id, idx);
       }
       if (event.name === "exit_plan_mode" && parsePlanArgs(event.args_json) !== null) {
         planToolCallIds.add(event.tool_call_id);
+        decisionAskedAtIdx.set(event.tool_call_id, idx);
       }
     } else if (event.type === "tool_call_started") {
       startedToolCallIds.add(event.tool_call_id);
@@ -617,6 +685,8 @@ export function buildMessages(
         planHandoff = false;
         active = null;
         runStartLen = out.length;
+        runStartIdx = idx;
+        runHasAssistant = false;
         if (ev.prompt_id) {
           // The prompt that started this run enters the conversation HERE — its
           // consumption position. For a message queued mid-run that's AFTER the
@@ -628,8 +698,28 @@ export function buildMessages(
           // appended AFTER this run_started, `heldUserText` is empty here but the
           // pre-scan still has the text, so the user turn renders instead of
           // vanishing.
+          //
+          // Last fall back to this event's OWN `prompt_summary`. The echo is an
+          // `agent_message`, which the windowed read keeps OUT of the spine
+          // (lib/sessionWindow.ts), so a run BELOW the window floor has no echo
+          // loaded and the turn would otherwise render as empty text. The
+          // summary is truncated to ~1 KB on the wire — the right trade for a
+          // turn that is not loaded, since the full prompt replaces it the
+          // moment the reader backfills that window (same `prompt_id`, so the
+          // bubble changes in place). The ORDER matters: every earlier source is
+          // the FULL text, so the summary is used only when nothing better is
+          // loaded and can never double-render beside a present echo.
+          //
+          // Today this is a safety net, not a live path: every harness sets
+          // `prompt_summary` to null on purpose (it would render the prompt
+          // twice beside the echo), so an unloaded turn shows nothing at all
+          // until it is backfilled.
           const text =
-            held?.text ?? userEchoByPromptId.get(ev.prompt_id) ?? queued.get(ev.prompt_id) ?? "";
+            held?.text ??
+            userEchoByPromptId.get(ev.prompt_id) ??
+            queued.get(ev.prompt_id) ??
+            ev.prompt_summary ??
+            "";
           if (text) {
             out.push({
               role: "user",
@@ -676,7 +766,7 @@ export function buildMessages(
         } else if (ev.role === "system") {
           pushSystem(`m:${idx}`, ev.text, { kind: "note", role: ev.role, at: ev.at });
         } else {
-          const a = ensureAssistant(ev.at);
+          const a = ensureAssistant(idx, ev.at);
           const last = a.content[a.content.length - 1];
           // Coalesce consecutive assistant text into one prose part (matches
           // the old block model's join), keeping tool parts as boundaries.
@@ -730,7 +820,7 @@ export function buildMessages(
         )
           break;
         bump(classifyTool(ev.tool_name));
-        const a = ensureAssistant(ev.at);
+        const a = ensureAssistant(idx, ev.at);
         // ADR 0054 Flavor A: a Write/Edit/MultiEdit that produced a successful
         // `file_changed` renders as a rich diff (the `FILE_CHANGE_TOOL` part)
         // in place of the generic card. The tally still counts the ORIGINAL
@@ -827,7 +917,7 @@ export function buildMessages(
         if (submittedResults.has(ev.tool_call_id)) {
           part.result = submittedResults.get(ev.tool_call_id);
         }
-        ensureAssistant(ev.at).content.push(part);
+        ensureAssistant(idx, ev.at).content.push(part);
         openTools.set(ev.tool_call_id, part);
         break;
       }
@@ -860,7 +950,7 @@ export function buildMessages(
         } else {
           // Completion without a matching start (replay edge) — emit a
           // standalone completed part.
-          const a = ensureAssistant(ev.at);
+          const a = ensureAssistant(idx, ev.at);
           a.content.push({
             type: "tool-call",
             toolCallId: ev.tool_call_id,
@@ -876,7 +966,7 @@ export function buildMessages(
 
       case "exec_started": {
         bump("ran");
-        const a = ensureAssistant(ev.at);
+        const a = ensureAssistant(idx, ev.at);
         const command = (ev.command ?? []).join(" ");
         const part: ToolPart = {
           type: "tool-call",
@@ -892,20 +982,18 @@ export function buildMessages(
 
       case "stdout":
       case "stderr": {
-        const part = openExecs.get(ev.exec_id);
-        if (part) part.result = `${(part.result as string | undefined) ?? ""}${ev.chunk}`;
+        const part = openExecs.get(ev.exec_id) ?? openExecPart(ev.exec_id, idx);
+        part.result = `${(part.result as string | undefined) ?? ""}${ev.chunk}`;
         break;
       }
 
       case "exec_completed": {
-        const part = openExecs.get(ev.exec_id);
-        if (part) {
-          const args = part.args as unknown as ShellArgs;
-          args.exit = ev.exit_status;
-          args.durationMs = ev.rusage?.wall_ms ?? null;
-          part.isError = ev.exit_status != null && ev.exit_status !== 0;
-          openExecs.delete(ev.exec_id);
-        }
+        const part = openExecs.get(ev.exec_id) ?? openExecPart(ev.exec_id, idx, ev.at);
+        const args = part.args as unknown as ShellArgs;
+        args.exit = ev.exit_status;
+        args.durationMs = ev.rusage?.wall_ms ?? null;
+        part.isError = ev.exit_status != null && ev.exit_status !== 0;
+        openExecs.delete(ev.exec_id);
         break;
       }
 
@@ -1181,7 +1269,9 @@ export function buildMessages(
   // text comes wholly from the coalesced durable event instead: same text,
   // same positional assistant bubble, no flash.
   if (streamingText && runOpen) {
-    const a = ensureAssistant();
+    // No event opened this bubble — the open run's `run_started` anchors it, so
+    // the durable `agent_message` that supersedes the tail keeps the same id.
+    const a = ensureAssistant(null);
     const last = a.content[a.content.length - 1];
     if (last && last.type === "text") last.text += streamingText;
     else a.content.push({ type: "text", text: streamingText });
@@ -1193,9 +1283,12 @@ export function buildMessages(
   // (plus a live Stop button) under a plan card asking for a decision — session
   // 676b367f. `harness_parked` never reaches the client, so derive it from the
   // ledger the cards already read.
+  // Only a decision whose ANSWER would have been loaded can count as pending.
+  const decisionKnown = (id: string) =>
+    decisionFloorIdx === null || (decisionAskedAtIdx.get(id) ?? -1) >= decisionFloorIdx;
   const awaitingDecision =
-    [...planToolCallIds].some((id) => !planResolutionByToolCallId.has(id)) ||
-    [...questionToolCallIds].some((id) => !answersByToolCallId.has(id));
+    [...planToolCallIds].some((id) => decisionKnown(id) && !planResolutionByToolCallId.has(id)) ||
+    [...questionToolCallIds].some((id) => decisionKnown(id) && !answersByToolCallId.has(id));
   const isRunning = !sessionInactive && !awaitingDecision && (runOpen || tailAwaiting(out));
 
   // Give the working indicator somewhere to live when we're running but the
@@ -1224,6 +1317,7 @@ export function buildMessages(
       if (
         event.type === "tool_call_requested" &&
         planToolCallIds.has(event.tool_call_id) &&
+        decisionKnown(event.tool_call_id) &&
         !planResolutionByToolCallId.has(event.tool_call_id)
       ) {
         pendingPlan = { toolCallId: event.tool_call_id };

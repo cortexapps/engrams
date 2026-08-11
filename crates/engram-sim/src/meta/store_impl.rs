@@ -16,7 +16,7 @@ use engram_core::types::capture_job::{
     CaptureJobAssignment, CaptureJobReport, CaptureJobRow, CaptureJobStage, CaptureTerminalReport,
     ColdBaseRow, NewCaptureJob,
 };
-use engram_core::types::event::{ArtifactRow, PersistedEvent};
+use engram_core::types::event::{ArtifactRow, EventCursor, PersistedEvent};
 use engram_core::types::host::{HostRecord, HostStatus, ReservedBudget};
 use engram_core::types::ids::CaptureJobId;
 use engram_core::types::manifest::ManifestRef;
@@ -1092,25 +1092,55 @@ impl MetadataStore for SimMetadataStore {
         Ok(idx)
     }
 
-    async fn list_session_events_since(
+    /// The sim mirror of PostgresStore's one event-log query. The stored
+    /// vec is append-ordered, so ascending idx is its natural order and
+    /// `.rev()` is the DESC subquery. The filters must match the SQL
+    /// exactly, so both read the kind→field map from engram-core
+    /// (`PersistedEvent::tool_name`): a kind that carries NO tool name
+    /// passes a tool-name filter untouched, like the SQL `IS NULL` arm.
+    async fn list_session_events_window(
         &self,
         session_id: SessionId,
-        since: i64,
+        cursor: EventCursor,
         limit: i64,
+        kinds: &[String],
+        tool_names: &[String],
     ) -> Result<Vec<PersistedEvent>, MetaError> {
         self.gate()?;
         let db = self.db.lock();
-        Ok(db
-            .session_events
-            .get(&session_id)
-            .map(|v| {
-                v.iter()
-                    .filter(|e| e.idx > since)
-                    .take(limit.max(0) as usize)
+        let Some(all) = db.session_events.get(&session_id) else {
+            return Ok(Vec::new());
+        };
+        // A non-positive limit is an empty page, never "unlimited" —
+        // same contract PG's `LIMIT 0` gives.
+        let limit = limit.max(0) as usize;
+        let keep = |e: &PersistedEvent| {
+            (kinds.is_empty() || kinds.iter().any(|k| k == &e.kind))
+                && (tool_names.is_empty()
+                    || e.tool_name()
+                        .is_none_or(|name| tool_names.iter().any(|t| t == name)))
+        };
+        Ok(match cursor {
+            EventCursor::After(n) => all
+                .iter()
+                .filter(|e| e.idx > n && keep(e))
+                .take(limit)
+                .cloned()
+                .collect(),
+            EventCursor::Before(n) => {
+                // Newest-first, then re-ascend — the page is the LAST
+                // `limit` matches below the anchor, in reading order.
+                let mut page: Vec<PersistedEvent> = all
+                    .iter()
+                    .rev()
+                    .filter(|e| e.idx < n && keep(e))
+                    .take(limit)
                     .cloned()
-                    .collect()
-            })
-            .unwrap_or_default())
+                    .collect();
+                page.reverse();
+                page
+            }
+        })
     }
 
     /// Phase 1c (ADR 0052): PostgresStore fans one EPHEMERAL live-token delta
@@ -2443,23 +2473,6 @@ impl MetadataStore for SimMetadataStore {
             .session_events
             .get(&sid)
             .and_then(|v| v.iter().filter(|e| e.created_at <= at).map(|e| e.idx).max()))
-    }
-
-    async fn list_session_events_tail(
-        &self,
-        session_id: SessionId,
-        limit: i64,
-    ) -> Result<Vec<PersistedEvent>, MetaError> {
-        self.gate()?;
-        let db = self.db.lock();
-        Ok(db
-            .session_events
-            .get(&session_id)
-            .map(|v| {
-                let n = v.len().saturating_sub(limit.max(0) as usize);
-                v[n..].to_vec()
-            })
-            .unwrap_or_default())
     }
 
     /// Fenced CTE mirror: epoch mismatch -> Ok(None), no row, no idx.

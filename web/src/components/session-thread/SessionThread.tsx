@@ -17,6 +17,11 @@ import {
 import { buildMessages } from "./buildMessages";
 import { SessionStatusContext } from "./session-status";
 import { ComposerActionsContext, type InterruptSource } from "./composer-actions";
+import {
+  NO_TRANSCRIPT_BACKFILL,
+  TranscriptWindowContext,
+  type TranscriptWindow,
+} from "./transcript-window";
 import { QuestionActionsContext } from "./question-actions";
 import type { IndexedEvent, SessionState } from "../../lib/types";
 import { serializeComposer, useSessionUploads } from "../session-files/useSessionUploads";
@@ -53,6 +58,11 @@ export interface SessionThreadProps {
    * tokens stream as they arrive; superseded by the durable `agent_message`.
    */
   streamingText?: string;
+  /**
+   * The windowed transcript's backfill controls, also from `useSessionEvents`.
+   * Omitted = the caller holds the whole log and there is nothing to read.
+   */
+  transcriptWindow?: TranscriptWindow;
 }
 
 const SEND_BLOCKED: ReadonlySet<SessionState> = new Set<SessionState>([
@@ -67,6 +77,7 @@ export function SessionThread({
   events,
   status,
   streamingText = "",
+  transcriptWindow,
 }: SessionThreadProps) {
   const uploads = useSessionUploads(sessionId);
   const {
@@ -76,8 +87,25 @@ export function SessionThread({
     pendingPlan,
     currentMode,
   } = useMemo(
-    () => buildMessages(events, sessionId, status, streamingText),
-    [events, sessionId, status, streamingText],
+    () =>
+      buildMessages(
+        events,
+        sessionId,
+        status,
+        streamingText,
+        // Below the window floor the spine carries a deferred question without
+        // the result that answered it, so an old decision must read as unknown
+        // rather than as one still waiting on the reviewer.
+        transcriptWindow?.hasMore ? (transcriptWindow.oldestIdx ?? null) : null,
+      ),
+    [
+      events,
+      sessionId,
+      status,
+      streamingText,
+      transcriptWindow?.hasMore,
+      transcriptWindow?.oldestIdx,
+    ],
   );
 
   // Phase 1b: optimistic prompts. A prompt the user just submitted is held here
@@ -388,9 +416,11 @@ export function SessionThread({
             <QuestionActionsContext.Provider
               value={{ submitAnswer, completeTool, answeredToolCallIds, sendBlocked }}
             >
-              <TooltipProvider>
-                <Thread />
-              </TooltipProvider>
+              <TranscriptWindowContext.Provider value={transcriptWindow ?? NO_TRANSCRIPT_BACKFILL}>
+                <TooltipProvider>
+                  <Thread />
+                </TooltipProvider>
+              </TranscriptWindowContext.Provider>
             </QuestionActionsContext.Provider>
           </ComposerActionsContext.Provider>
         </SessionStatusContext.Provider>

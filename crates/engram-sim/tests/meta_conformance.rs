@@ -12,6 +12,7 @@
 //! and runs in CI's Postgres-gated step alongside the coordinator's
 //! live-PG lane.
 
+use engram_core::types::event::EventCursor;
 use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 use std::time::Duration;
@@ -3346,6 +3347,465 @@ async fn list_session_events_pages_without_gap_or_dup(ctx: &Ctx) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Windowed transcript reads (`list_session_events_window`)
+//
+// D4 obligation for the new store method. The web transcript opens on the
+// LAST page and backfills upward, so a backward page that overlaps or skips
+// at the boundary duplicates or loses transcript lines — a defect only a
+// two-store test can catch, because sim `.rev().take()` and SQL
+// `ORDER BY idx DESC LIMIT` are different code with the same contract.
+// ---------------------------------------------------------------------------
+
+/// Read the whole window with the direction/filters spelled out, so each
+/// scenario below reads as the property it asserts.
+async fn window(
+    ctx: &Ctx,
+    id: SessionId,
+    cursor: EventCursor,
+    limit: i64,
+    kinds: &[&str],
+    tool_names: &[&str],
+) -> Vec<engram_core::types::PersistedEvent> {
+    let kinds: Vec<String> = kinds.iter().map(|s| s.to_string()).collect();
+    let tools: Vec<String> = tool_names.iter().map(|s| s.to_string()).collect();
+    ctx.meta
+        .list_session_events_window(id, cursor, limit, &kinds, &tools)
+        .await
+        .unwrap()
+}
+
+fn idxs(events: &[engram_core::types::PersistedEvent]) -> Vec<i64> {
+    events.iter().map(|e| e.idx).collect()
+}
+
+/// Every page, both directions, arrives in ascending idx order — the
+/// property that lets one renderer draw a forward and a backward page.
+fn assert_ascending(page: &[engram_core::types::PersistedEvent]) {
+    assert!(
+        page.windows(2).all(|w| w[0].idx < w[1].idx),
+        "a page must be in strictly ascending idx order, got {:?}",
+        idxs(page)
+    );
+}
+
+/// (a) The backward walk is the forward walk. Paging backward from the tail
+/// and concatenating the pages yields the SAME sequence as paging forward
+/// from -1, and the two directions meet exactly at a shared boundary:
+/// `Before(k)` ++ `After(k - 1)` is the whole log, no gap, no duplicate.
+async fn events_backward_walk_equals_forward_walk(ctx: &Ctx) {
+    let id = ctx
+        .meta
+        .create_session(spec("conf:window-back"))
+        .await
+        .unwrap();
+
+    // Not a multiple of the page size, so both walks end on a SHORT page.
+    const TOTAL: i64 = 25;
+    const PAGE: i64 = 10;
+    for n in 0..TOTAL {
+        ctx.meta
+            .append_session_event(id, "agent_message", serde_json::json!({ "n": n }))
+            .await
+            .unwrap();
+    }
+
+    let mut forward = Vec::new();
+    let mut cursor = -1i64;
+    loop {
+        let page = window(ctx, id, EventCursor::After(cursor), PAGE, &[], &[]).await;
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() as i64 <= PAGE, "page must respect the limit");
+        assert_ascending(&page);
+        cursor = page.last().unwrap().idx;
+        forward.extend(idxs(&page));
+    }
+    assert_eq!(forward, (0..TOTAL).collect::<Vec<_>>());
+
+    // Backward: anchor at "below every idx", then re-anchor on the FIRST
+    // idx of the page just read (the transcript's backfill loop).
+    let mut backward: Vec<i64> = Vec::new();
+    let mut anchor = i64::MAX;
+    let mut reads = 0;
+    loop {
+        let page = window(ctx, id, EventCursor::Before(anchor), PAGE, &[], &[]).await;
+        reads += 1;
+        assert!(reads < 10, "backward walk failed to terminate");
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() as i64 <= PAGE, "page must respect the limit");
+        assert_ascending(&page);
+        assert!(
+            page.iter().all(|e| e.idx < anchor),
+            "a backward page must stay strictly below its anchor"
+        );
+        anchor = page.first().unwrap().idx;
+        let mut head = idxs(&page);
+        head.extend(std::mem::take(&mut backward));
+        backward = head;
+    }
+    assert_eq!(
+        backward, forward,
+        "the backward walk reconstructs the same log as the forward walk"
+    );
+
+    // The boundary itself: one backward page and one forward page taken at
+    // the same idx tile the log exactly once.
+    let boundary = TOTAL / 2;
+    let below = window(ctx, id, EventCursor::Before(boundary), TOTAL, &[], &[]).await;
+    let above = window(ctx, id, EventCursor::After(boundary - 1), TOTAL, &[], &[]).await;
+    let mut joined = idxs(&below);
+    joined.extend(idxs(&above));
+    assert_eq!(
+        joined,
+        (0..TOTAL).collect::<Vec<_>>(),
+        "Before(k) ++ After(k-1) is contiguous: no gap, no duplicate"
+    );
+}
+
+/// Append the mixed transcript the filter scenarios read: three tools, all
+/// four tool kinds, a non-tool kind, and one malformed tool event with no
+/// name field at all.
+async fn seed_mixed_transcript(ctx: &Ctx, id: SessionId) {
+    let ev: &[(&str, serde_json::Value)] = &[
+        ("agent_message", serde_json::json!({"text": "planning"})),
+        (
+            "tool_call_requested",
+            serde_json::json!({"name": "Edit", "tool_call_id": "t1"}),
+        ),
+        (
+            "tool_call_started",
+            serde_json::json!({"tool_name": "Edit", "tool_call_id": "t1"}),
+        ),
+        (
+            "tool_call_completed",
+            serde_json::json!({"tool_name": "Edit", "tool_call_id": "t1"}),
+        ),
+        (
+            "tool_result_submitted",
+            serde_json::json!({"tool_call_id": "t1"}),
+        ),
+        ("status_changed", serde_json::json!({"to": "running"})),
+        (
+            "tool_call_requested",
+            serde_json::json!({"name": "Bash", "tool_call_id": "t2"}),
+        ),
+        (
+            "tool_call_started",
+            serde_json::json!({"tool_name": "Bash", "tool_call_id": "t2"}),
+        ),
+        (
+            "tool_call_completed",
+            serde_json::json!({"tool_name": "Bash", "tool_call_id": "t2"}),
+        ),
+        (
+            "tool_result_submitted",
+            serde_json::json!({"tool_call_id": "t2"}),
+        ),
+        ("agent_message", serde_json::json!({"text": "done"})),
+        // Malformed on purpose: a tool kind whose payload carries NO name.
+        // The contract says "no name, no filter", so it must pass through.
+        (
+            "tool_call_started",
+            serde_json::json!({"tool_call_id": "t3"}),
+        ),
+    ];
+    for (kind, payload) in ev {
+        ctx.meta
+            .append_session_event(id, kind, payload.clone())
+            .await
+            .unwrap();
+    }
+}
+
+/// (b) A filtered read is the unfiltered read, filtered. The store may run
+/// the predicate in SQL, but it must not change WHICH events a caller sees —
+/// only how many bytes cross the wire to get them.
+async fn events_kind_filter_equals_in_memory_filter(ctx: &Ctx) {
+    let id = ctx
+        .meta
+        .create_session(spec("conf:window-kinds"))
+        .await
+        .unwrap();
+    seed_mixed_transcript(ctx, id).await;
+
+    let all = window(ctx, id, EventCursor::After(-1), 1000, &[], &[]).await;
+    for selection in [
+        vec!["agent_message"],
+        vec!["tool_call_requested"],
+        vec!["agent_message", "status_changed"],
+        // A kind nobody appended: an empty page, NOT "every kind".
+        vec!["no_such_kind"],
+    ] {
+        let filtered = window(ctx, id, EventCursor::After(-1), 1000, &selection, &[]).await;
+        let expected: Vec<i64> = all
+            .iter()
+            .filter(|e| selection.contains(&e.kind.as_str()))
+            .map(|e| e.idx)
+            .collect();
+        assert_eq!(
+            idxs(&filtered),
+            expected,
+            "kinds={selection:?} must select exactly the in-memory filter"
+        );
+        assert_ascending(&filtered);
+
+        // The same must hold backward — the filter runs INSIDE the
+        // newest-first subquery, so a broken one silently returns the
+        // newest N events of the WRONG kind.
+        let back = window(
+            ctx,
+            id,
+            EventCursor::Before(i64::MAX),
+            1000,
+            &selection,
+            &[],
+        )
+        .await;
+        assert_eq!(idxs(&back), expected, "backward kinds={selection:?}");
+    }
+
+    // The empty list is "every kind", never "no kind".
+    assert_eq!(
+        idxs(&window(ctx, id, EventCursor::After(-1), 1000, &[], &[]).await),
+        idxs(&all),
+        "an empty kinds list keeps every kind"
+    );
+}
+
+/// (c) `tool_names` filters the kinds that CARRY a name
+/// (`tool_call_requested` reads `name`, started/completed read `tool_name`)
+/// and passes through every kind that does not — `tool_result_submitted`,
+/// which holds only a `tool_call_id`, plus every non-tool kind the caller
+/// selected. This is the documented rule; it is asserted here because a
+/// store that "helpfully" drops the un-named kinds loses tool results the
+/// caller explicitly asked for.
+async fn events_tool_name_filter_spares_nameless_kinds(ctx: &Ctx) {
+    let id = ctx
+        .meta
+        .create_session(spec("conf:window-tools"))
+        .await
+        .unwrap();
+    seed_mixed_transcript(ctx, id).await;
+
+    let all = window(ctx, id, EventCursor::After(-1), 1000, &[], &[]).await;
+    let expect_for = |tools: &[&str]| -> Vec<i64> {
+        all.iter()
+            .filter(|e| match e.tool_name() {
+                Some(name) => tools.contains(&name),
+                // No name field (or a malformed payload): never filtered.
+                None => true,
+            })
+            .map(|e| e.idx)
+            .collect()
+    };
+
+    for tools in [
+        vec!["Edit"],
+        vec!["Bash"],
+        vec!["Edit", "Bash"],
+        vec!["Grep"],
+    ] {
+        let got = window(ctx, id, EventCursor::After(-1), 1000, &[], &tools).await;
+        assert_eq!(
+            idxs(&got),
+            expect_for(&tools),
+            "tool_names={tools:?} keeps that tool plus every nameless kind"
+        );
+        assert_ascending(&got);
+        let back = window(ctx, id, EventCursor::Before(i64::MAX), 1000, &[], &tools).await;
+        assert_eq!(
+            idxs(&back),
+            expect_for(&tools),
+            "backward tool_names={tools:?}"
+        );
+    }
+
+    // Named checks on the four tool kinds + a non-tool kind, so a change to
+    // the kind→field map fails here with a legible message.
+    let edit_only = window(ctx, id, EventCursor::After(-1), 1000, &[], &["Edit"]).await;
+    let kept: Vec<(&str, Option<&str>)> = edit_only
+        .iter()
+        .map(|e| (e.kind.as_str(), e.tool_name()))
+        .collect();
+    assert!(
+        kept.contains(&("tool_call_requested", Some("Edit"))),
+        "requested reads `name`: {kept:?}"
+    );
+    assert!(
+        kept.contains(&("tool_call_started", Some("Edit")))
+            && kept.contains(&("tool_call_completed", Some("Edit"))),
+        "started/completed read `tool_name`: {kept:?}"
+    );
+    assert_eq!(
+        kept.iter()
+            .filter(|(k, _)| *k == "tool_result_submitted")
+            .count(),
+        2,
+        "both results pass through: they carry no tool name"
+    );
+    assert_eq!(
+        kept.iter()
+            .filter(|(k, _)| *k == "tool_call_started")
+            .count(),
+        2,
+        "the malformed nameless `tool_call_started` passes through too: {kept:?}"
+    );
+    assert!(
+        kept.iter().any(|(k, _)| *k == "agent_message")
+            && kept.iter().any(|(k, _)| *k == "status_changed"),
+        "non-tool kinds are unaffected by tool_names: {kept:?}"
+    );
+    assert!(
+        !kept.contains(&("tool_call_started", Some("Bash"))),
+        "the other tool's named events are gone: {kept:?}"
+    );
+
+    // Both filters intersect: the kind narrows the rows, the tool name
+    // narrows the NAMED ones inside that kind. The nameless
+    // `tool_call_started` survives here too — the "no name, no filter" rule
+    // is a property of the ROW, not of how the caller reached it.
+    let started_edit = window(
+        ctx,
+        id,
+        EventCursor::After(-1),
+        1000,
+        &["tool_call_started"],
+        &["Edit"],
+    )
+    .await;
+    assert!(
+        started_edit.iter().all(|e| e.kind == "tool_call_started"),
+        "the kind filter still applies with a tool filter"
+    );
+    assert_eq!(
+        started_edit
+            .iter()
+            .map(|e| e.tool_name())
+            .collect::<Vec<_>>(),
+        vec![Some("Edit"), None],
+        "the Edit start, plus the nameless start that no tool filter removes"
+    );
+}
+
+/// (d) The backward anchor at the two extremes: `Before(0)` is below the
+/// first idx, so the page is EMPTY (never "the whole log"), and an anchor
+/// past the tail returns the last page, the same one `Before(i64::MAX)`
+/// gives. These are the two anchors a transcript hits first — one at the
+/// top of the scrollback, one on the very first open.
+async fn events_before_bounds_are_empty_and_tail(ctx: &Ctx) {
+    let id = ctx
+        .meta
+        .create_session(spec("conf:window-bounds"))
+        .await
+        .unwrap();
+    const TOTAL: i64 = 12;
+    for n in 0..TOTAL {
+        ctx.meta
+            .append_session_event(id, "agent_message", serde_json::json!({ "n": n }))
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        window(ctx, id, EventCursor::Before(0), 100, &[], &[])
+            .await
+            .is_empty(),
+        "Before(0) is strictly below the first event: an empty page"
+    );
+    // Negative anchors are equally empty, not an error.
+    assert!(
+        window(ctx, id, EventCursor::Before(-5), 100, &[], &[])
+            .await
+            .is_empty(),
+        "a negative anchor is empty, not a wrap-around"
+    );
+
+    let past_tail = window(ctx, id, EventCursor::Before(TOTAL + 100), 5, &[], &[]).await;
+    let newest = window(ctx, id, EventCursor::Before(i64::MAX), 5, &[], &[]).await;
+    assert_eq!(
+        idxs(&past_tail),
+        (TOTAL - 5..TOTAL).collect::<Vec<_>>(),
+        "an anchor past the tail yields the newest page, re-ascended"
+    );
+    assert_eq!(idxs(&newest), idxs(&past_tail), "past-the-tail == i64::MAX");
+
+    // And it agrees with the tail wrapper, which is the same window.
+    let tail = ctx.meta.list_session_events_tail(id, 5).await.unwrap();
+    assert_eq!(
+        idxs(&tail),
+        idxs(&newest),
+        "the tail wrapper is this window"
+    );
+
+    // A session with no events at all is empty in both directions.
+    let empty = ctx
+        .meta
+        .create_session(spec("conf:window-empty"))
+        .await
+        .unwrap();
+    assert!(
+        window(ctx, empty, EventCursor::Before(i64::MAX), 10, &[], &[])
+            .await
+            .is_empty()
+    );
+    assert!(window(ctx, empty, EventCursor::After(-1), 10, &[], &[])
+        .await
+        .is_empty());
+}
+
+/// (e) The limit means the same thing in both directions: a positive limit
+/// takes from the anchor's end, and a non-positive one is an EMPTY page,
+/// never "unlimited". The second half matters most — a caller that clamps
+/// badly must get nothing, not a whole-session read.
+async fn events_limit_clamps_identically_both_directions(ctx: &Ctx) {
+    let id = ctx
+        .meta
+        .create_session(spec("conf:window-limit"))
+        .await
+        .unwrap();
+    const TOTAL: i64 = 8;
+    for n in 0..TOTAL {
+        ctx.meta
+            .append_session_event(id, "agent_message", serde_json::json!({ "n": n }))
+            .await
+            .unwrap();
+    }
+
+    for limit in [0i64, -1, -1000] {
+        assert!(
+            window(ctx, id, EventCursor::After(-1), limit, &[], &[])
+                .await
+                .is_empty(),
+            "forward limit {limit} is an empty page"
+        );
+        assert!(
+            window(ctx, id, EventCursor::Before(i64::MAX), limit, &[], &[])
+                .await
+                .is_empty(),
+            "backward limit {limit} is an empty page"
+        );
+    }
+
+    // A limit takes from the anchor's end: the OLDEST n forward, the
+    // NEWEST n backward.
+    for limit in [1i64, 3, TOTAL - 1] {
+        let fwd = window(ctx, id, EventCursor::After(-1), limit, &[], &[]).await;
+        assert_eq!(idxs(&fwd), (0..limit).collect::<Vec<_>>());
+        let back = window(ctx, id, EventCursor::Before(i64::MAX), limit, &[], &[]).await;
+        assert_eq!(idxs(&back), (TOTAL - limit..TOTAL).collect::<Vec<_>>());
+    }
+
+    // A limit larger than the log returns the whole log, both ways.
+    let fwd = window(ctx, id, EventCursor::After(-1), TOTAL * 10, &[], &[]).await;
+    let back = window(ctx, id, EventCursor::Before(i64::MAX), TOTAL * 10, &[], &[]).await;
+    assert_eq!(idxs(&fwd), (0..TOTAL).collect::<Vec<_>>());
+    assert_eq!(idxs(&back), (0..TOTAL).collect::<Vec<_>>());
+}
+
 async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     let meta = &ctx.meta;
     let id = meta.create_session(spec("conf:rewind")).await.unwrap();
@@ -3845,6 +4305,26 @@ conformance!(
 conformance!(
     t_list_session_events_pages,
     super::list_session_events_pages_without_gap_or_dup
+);
+conformance!(
+    t_events_backward_walk_equals_forward_walk,
+    super::events_backward_walk_equals_forward_walk
+);
+conformance!(
+    t_events_kind_filter,
+    super::events_kind_filter_equals_in_memory_filter
+);
+conformance!(
+    t_events_tool_name_filter,
+    super::events_tool_name_filter_spares_nameless_kinds
+);
+conformance!(
+    t_events_before_bounds,
+    super::events_before_bounds_are_empty_and_tail
+);
+conformance!(
+    t_events_limit_clamps,
+    super::events_limit_clamps_identically_both_directions
 );
 conformance!(t_placement_no_fit, super::placement_no_fit);
 conformance!(

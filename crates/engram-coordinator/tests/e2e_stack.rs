@@ -437,7 +437,12 @@ impl Driver {
             let req = app::ListSessionEventsRequest {
                 session_id: sid.to_string(),
                 after_idx,
+                // A forward walk over the whole log: no backward anchor,
+                // no kind/tool narrowing.
+                before_idx: None,
                 limit: Some(500),
+                kinds: vec![],
+                tool_names: vec![],
             };
             let resp = self
                 .sess

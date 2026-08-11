@@ -108,7 +108,8 @@ export function ReviewTranscriptPane({
  * true by construction rather than by assumption.
  */
 function RoleTranscript({ sessionId }: { sessionId: string }) {
-  const { events, streamingText } = useSessionEvents(sessionId);
+  const { events, streamingText, hasMore, loadingOlder, loadOlder, oldestIdx } =
+    useSessionEvents(sessionId);
   const { data: session } = useSession(sessionId);
 
   return (
@@ -131,6 +132,7 @@ function RoleTranscript({ sessionId }: { sessionId: string }) {
           events={events}
           status={session?.status}
           streamingText={streamingText}
+          transcriptWindow={{ hasMore, loadingOlder, loadOlder, oldestIdx }}
         />
       </div>
     </div>

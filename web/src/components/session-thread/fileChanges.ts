@@ -95,7 +95,26 @@ export function totalCounts(rollups: FileChangeRollup[]): { additions: number; d
   return { additions, deletions };
 }
 
+// Three components roll the same `events` array up on every render — the
+// Changes-tab gate (WorkPane), the "N files changed" card (OverviewPane), and
+// the diff list (ChangesPane) — and each rollup re-runs `diffLines` over the
+// WHOLE history, so one arriving event cost three full re-diffs. `events` is
+// append-only and replaced by identity whenever it changes, so keying a cache
+// on the array itself collapses those three calls into one per event without
+// threading the result through props. The entry dies with the array.
+//
+// Callers treat the result as read-only; it is shared, not a fresh copy.
+const rollupCache = new WeakMap<IndexedEvent[], FileChangeRollup[]>();
+
 export function extractFileChanges(events: IndexedEvent[]): FileChangeRollup[] {
+  const cached = rollupCache.get(events);
+  if (cached) return cached;
+  const computed = computeFileChanges(events);
+  rollupCache.set(events, computed);
+  return computed;
+}
+
+function computeFileChanges(events: IndexedEvent[]): FileChangeRollup[] {
   const rollups: FileChangeRollup[] = [];
   const byPath = new Map<string, FileChangeRollup>();
 

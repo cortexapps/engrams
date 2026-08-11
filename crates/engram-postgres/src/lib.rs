@@ -20,8 +20,8 @@ use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState, SessionOp}
 use engram_core::types::{
     ArtifactRow, BindingDisposition, Capability, CaptureJobAssignment, CaptureJobReport,
     CaptureJobRow, CaptureTerminalReport, ColdBaseRow, EnableJob, EnableJobState, EnabledImage,
-    HostRecord, HostStatus, NewCaptureJob, PersistedEvent, RegistryCredential, Session,
-    SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
+    EventCursor, HostRecord, HostStatus, NewCaptureJob, PersistedEvent, RegistryCredential,
+    Session, SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
 };
 use engram_core::{CaptureJobId, HostId, MetaError, SandboxId, SessionId, SnapshotId};
 use row::col_err;
@@ -4989,60 +4989,98 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
-    async fn list_session_events_since(
+    async fn list_session_events_window(
         &self,
         session_id: SessionId,
-        since: i64,
+        cursor: EventCursor,
         limit: i64,
+        kinds: &[String],
+        tool_names: &[String],
     ) -> Result<Vec<PersistedEvent>, MetaError> {
-        // ADR 0028 A.log: replay ALL events (incl. tombstoned), each
+        // THE one event-log query builder. `_since` and `_tail` are the
+        // trait's thin wrappers over it, so a change to the row shape or
+        // to the rewind semantics has exactly one place to land.
+        //
+        // ADR 0028 A.log: read ALL events (incl. tombstoned), each
         // carrying its `recovery_epoch` + `rewound_at`. The transcript
         // renders rewound rows collapsed/greyed and segments by epoch —
         // honest history, not a silent deletion.
-        let rows = sqlx::query(
-            r#"
-            SELECT idx, kind, payload, created_at, recovery_epoch, rewound_at
-              FROM session_events
-             WHERE session_id = $1 AND idx > $2
-             ORDER BY idx
-             LIMIT $3
-            "#,
-        )
-        .bind(session_id.as_uuid())
-        .bind(since)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        rows.iter().map(row::persisted_event_from_row).collect()
-    }
+        //
+        // Both filters go INTO the query: a caller that wants 200 `Edit`
+        // calls out of a 50k-event session must read 200 rows from
+        // Postgres, not 50k rows plus a client-side loop.
+        const COLS: &str = "idx, kind, payload, created_at, recovery_epoch, rewound_at";
 
-    async fn list_session_events_tail(
-        &self,
-        session_id: SessionId,
-        limit: i64,
-    ) -> Result<Vec<PersistedEvent>, MetaError> {
-        // Newest `limit` by idx, re-ascended so the caller sees the same
-        // shape as the forward read (a plain ORDER BY idx DESC would
-        // render the transcript backwards).
-        let rows = sqlx::query(
-            r#"
-            SELECT idx, kind, payload, created_at, recovery_epoch, rewound_at
-              FROM (
-                SELECT idx, kind, payload, created_at, recovery_epoch, rewound_at
-                  FROM session_events
-                 WHERE session_id = $1
-                 ORDER BY idx DESC
-                 LIMIT $2
-              ) newest
-             ORDER BY idx
-            "#,
-        )
-        .bind(session_id.as_uuid())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
+        // Placeholders: $1 session, $2 anchor, then each filter it uses,
+        // then the limit. The binds below follow the SAME order.
+        let mut next_placeholder = 3;
+        let mut predicates = String::new();
+        if !kinds.is_empty() {
+            predicates.push_str(&format!(" AND kind = ANY(${next_placeholder})"));
+            next_placeholder += 1;
+        }
+        if !tool_names.is_empty() {
+            // The kind→field map comes from engram-core, so the SQL and
+            // the sim read one table. Every part is a compile-time
+            // constant — no caller string reaches the query text.
+            let mut case = String::from("CASE kind");
+            for (kind, field) in engram_core::types::event::TOOL_NAME_FIELDS {
+                case.push_str(&format!(" WHEN '{kind}' THEN payload->>'{field}'"));
+            }
+            case.push_str(" ELSE NULL END");
+            // `IS NULL` passes the row: a kind that carries no tool name
+            // is never removed by a tool-name filter (trait contract).
+            predicates.push_str(&format!(
+                " AND ({case} IS NULL OR {case} = ANY(${next_placeholder}))"
+            ));
+            next_placeholder += 1;
+        }
+        let limit_placeholder = next_placeholder;
+
+        let (anchor, sql) = match cursor {
+            EventCursor::After(n) => (
+                n,
+                format!(
+                    "SELECT {COLS} \
+                       FROM session_events \
+                      WHERE session_id = $1 AND idx > $2{predicates} \
+                      ORDER BY idx \
+                      LIMIT ${limit_placeholder}"
+                ),
+            ),
+            // Newest-first inside, re-ascended outside, so the backward
+            // page arrives in the same order as a forward one (a plain
+            // ORDER BY idx DESC would render the transcript backwards).
+            EventCursor::Before(n) => (
+                n,
+                format!(
+                    "SELECT {COLS} \
+                       FROM ( \
+                         SELECT {COLS} \
+                           FROM session_events \
+                          WHERE session_id = $1 AND idx < $2{predicates} \
+                          ORDER BY idx DESC \
+                          LIMIT ${limit_placeholder} \
+                       ) newest \
+                      ORDER BY idx"
+                ),
+            ),
+        };
+
+        let mut q = sqlx::query(&sql).bind(session_id.as_uuid()).bind(anchor);
+        if !kinds.is_empty() {
+            q = q.bind(kinds.to_vec());
+        }
+        if !tool_names.is_empty() {
+            q = q.bind(tool_names.to_vec());
+        }
+        // A non-positive limit is an empty page, never "unlimited" (the
+        // trait contract) — and PG rejects a negative LIMIT outright.
+        let rows = q
+            .bind(limit.max(0))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
         rows.iter().map(row::persisted_event_from_row).collect()
     }
 
