@@ -94,7 +94,14 @@ mod tests {
             Some("openai-codex")
         );
         assert_eq!(d.auth.org_env.as_deref(), Some("CODEX_API_KEY"));
-        assert_eq!(d.egress.allow_hosts, vec!["api.openai.com", "chatgpt.com"]);
+        // auth.openai.com is load-bearing, not decorative: it is where Codex
+        // refreshes an expired ChatGPT access token. Drop it and the in-guest
+        // refresh loop — the only refresh path a user credential has — breaks,
+        // and sessions die with 401 token_expired.
+        assert_eq!(
+            d.egress.allow_hosts,
+            vec!["api.openai.com", "auth.openai.com", "chatgpt.com"]
+        );
         assert_eq!(
             d.models
                 .iter()
