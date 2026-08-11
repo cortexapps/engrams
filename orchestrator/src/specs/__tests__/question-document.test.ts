@@ -15,6 +15,7 @@ import {
   type SpecDocumentStore,
   type SpecSnapshotRecord,
   type SpecUpdateEffects,
+  type SpecUpdateInsertResult,
   type SpecUpdateRecord,
 } from "../doc-service.ts";
 import {
@@ -67,9 +68,9 @@ class MemoryDocumentStore implements SpecDocumentStore {
     _checkpoint: SpecDocumentCheckpoint,
     update: Uint8Array,
     clientId: string | null,
-    _effects: Parameters<SpecDocumentStore["insertUpdateIfLatest"]>[4],
-  ): Promise<bigint | null> {
-    return this.insertUpdateIfLatest(specId, expectedSeq, update, clientId);
+    effects: Parameters<SpecDocumentStore["insertUpdateIfLatest"]>[4],
+  ): Promise<SpecUpdateInsertResult | null> {
+    return this.insertUpdateIfLatest(specId, expectedSeq, update, clientId, effects);
   }
 
   async notifyUpdate(): Promise<void> {}

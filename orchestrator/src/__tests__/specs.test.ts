@@ -222,7 +222,12 @@ describe("spec read routes", () => {
         return {
           applied: true as const,
           checkpointBeforeRestore: beforeRestore,
-          update: { seq: 3n, update: new Uint8Array(), clientId: `checkpoint:${PINNED_ID}` },
+          update: {
+            seq: 3n,
+            semanticDocSeq: 3n,
+            update: new Uint8Array(),
+            clientId: `checkpoint:${PINNED_ID}`,
+          },
         };
       },
     );

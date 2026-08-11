@@ -20,6 +20,7 @@ import {
   type SpecDocumentStore,
   type SpecSnapshotRecord,
   type SpecUpdateEffects,
+  type SpecUpdateInsertResult,
   type SpecUpdateRecord,
 } from "../doc-service.ts";
 import {
@@ -112,7 +113,7 @@ class MemoryDocumentStore implements SpecDocumentStore {
     update: Uint8Array,
     clientId: string | null,
     effects: SpecUpdateEffects,
-  ): Promise<bigint | null> {
+  ): Promise<SpecUpdateInsertResult | null> {
     return this.insertUpdateIfLatest(specId, expectedSeq, update, clientId, effects);
   }
 
