@@ -89,6 +89,15 @@ pub struct RedirectOauthSpec {
     pub client_secret_ref: String,
     pub pkce: bool,
     pub metadata: RedirectMetadataSpec,
+    /// ADR 0115: the authorize query parameter that carries the joined
+    /// scopes. Empty means the RFC name, `scope`. Slack's user-subject flow
+    /// sends `user_scope` so the provider mints a USER token, not a bot.
+    pub scopes_param: String,
+    /// ADR 0115: dot-path to the grant object inside the token response.
+    /// Empty means the root. Slack's user token lives under `authed_user`
+    /// (`access_token`/`token_type`/`scope` are read from that object;
+    /// metadata dot-paths still see the full response).
+    pub grant_path: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -123,6 +132,14 @@ impl RedirectOauthSpec {
             ","
         } else {
             &self.scope_delimiter
+        }
+    }
+
+    fn scopes_param(&self) -> &str {
+        if self.scopes_param.is_empty() {
+            "scope"
+        } else {
+            &self.scopes_param
         }
     }
 
@@ -162,6 +179,24 @@ impl RedirectOauthSpec {
         }
         if self.client_id_ref.trim().is_empty() || self.client_secret_ref.trim().is_empty() {
             return Err("client id/secret refs are required".into());
+        }
+        if !self.scopes_param.is_empty()
+            && (self.scopes_param.len() > 32
+                || !self
+                    .scopes_param
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_'))
+        {
+            return Err("scopes_param must be a short lowercase identifier".into());
+        }
+        if !self.grant_path.is_empty()
+            && (self.grant_path.len() > 64
+                || self.grant_path.split('.').count() > 4
+                || self.grant_path.split('.').any(|seg| {
+                    seg.is_empty() || !seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                }))
+        {
+            return Err("grant_path must be a short dot-path".into());
         }
         for (field, path) in &self.metadata.from_token_response {
             validate_metadata_mapping(field, path)?;
@@ -406,7 +441,7 @@ impl OAuthManager {
             q.append_pair("response_type", "code");
             q.append_pair("state", &flow_id.to_string());
             if !spec.scopes.is_empty() {
-                q.append_pair("scope", &spec.scopes.join(spec.delimiter()));
+                q.append_pair(spec.scopes_param(), &spec.scopes.join(spec.delimiter()));
             }
             for (k, v) in &spec.extra_authorize_params {
                 q.append_pair(k, v);
@@ -505,7 +540,7 @@ impl OAuthManager {
             ));
         }
         let grant = self
-            .token_grant(&spec.token_url, &form, spec.delimiter())
+            .token_grant(&spec.token_url, &form, spec.delimiter(), &spec.grant_path)
             .await?;
 
         let mut fields = BTreeMap::new();
@@ -568,11 +603,15 @@ impl OAuthManager {
     /// response shape, tolerating the common deviations: HTTP-200 error
     /// bodies (Slack `{"ok":false}` — caught by the missing token), and
     /// array `scope` (older Linear apps).
+    /// `grant_path` selects the object the grant fields are read from
+    /// (ADR 0115: Slack's user token lives under `authed_user`); empty means
+    /// the response root. Metadata dot-paths always see the full response.
     pub(crate) async fn token_grant(
         &self,
         token_url: &str,
         form: &[(&str, String)],
         scope_delimiter: &str,
+        grant_path: &str,
     ) -> Result<TokenGrant, OAuthServiceError> {
         let http = reqwest::Client::builder()
             .user_agent("engram-connector-oauth")
@@ -593,8 +632,17 @@ impl OAuthManager {
                 format!("token response was not JSON (HTTP {status})"),
             )
         })?;
-        let access_token = json
-            .get("access_token")
+        // The grant object: the root, or the spec's dot-path into it. A
+        // missing path reads as "no token", so the error below names it.
+        let grant = if grant_path.is_empty() {
+            Some(&json)
+        } else {
+            grant_path
+                .split('.')
+                .try_fold(&json, |value, seg| value.get(seg))
+        };
+        let access_token = grant
+            .and_then(|g| g.get("access_token"))
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
@@ -602,7 +650,14 @@ impl OAuthManager {
             let err = json
                 .get("error")
                 .and_then(Value::as_str)
-                .unwrap_or("no access token in response");
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    if grant_path.is_empty() {
+                        "no access token in response".to_owned()
+                    } else {
+                        format!("no access token under {grant_path:?}")
+                    }
+                });
             let code = if err == "invalid_grant" {
                 "invalid_grant"
             } else {
@@ -613,18 +668,19 @@ impl OAuthManager {
                 format!("token grant rejected (HTTP {status}): {err}"),
             ));
         }
-        let token_type = json
+        let grant = grant.expect("grant object exists when a token was read");
+        let token_type = grant
             .get("token_type")
             .and_then(Value::as_str)
             .unwrap_or("bearer")
             .to_ascii_lowercase();
-        let refresh_token = json
+        let refresh_token = grant
             .get("refresh_token")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned);
-        let scope = normalize_scope(json.get("scope"), scope_delimiter);
-        let expires_at = json
+        let scope = normalize_scope(grant.get("scope"), scope_delimiter);
+        let expires_at = grant
             .get("expires_in")
             .and_then(|v| {
                 v.as_i64()
@@ -709,8 +765,23 @@ mod tests {
             client_secret_ref: "linear.client_secret".into(),
             pkce: false,
             metadata: RedirectMetadataSpec::default(),
+            scopes_param: String::new(),
+            grant_path: String::new(),
         };
         assert!(base.validate().is_ok());
+
+        let mut user_scope = base.clone();
+        user_scope.scopes_param = "user_scope".into();
+        user_scope.grant_path = "authed_user".into();
+        assert!(user_scope.validate().is_ok());
+
+        let mut bad_param = base.clone();
+        bad_param.scopes_param = "User Scope".into();
+        assert!(bad_param.validate().is_err());
+
+        let mut bad_path = base.clone();
+        bad_path.grant_path = "authed user.token".into();
+        assert!(bad_path.validate().is_err());
 
         let mut http_url = base.clone();
         http_url.authorize_url = "http://linear.app/oauth/authorize".into();

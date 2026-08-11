@@ -67,3 +67,35 @@ export function redirectOauthSpec(
     metadata,
   });
 }
+
+/**
+ * ADR 0115 amendment: the USER-subject variant of a connector's redirect
+ * spec. The org facet's `extraAuthorizeParams` are never inherited — they
+ * often pin the ORG identity (Linear's `actor: "app"` makes tokens post as
+ * the application), and a personal flow must act as the authorizing user.
+ * The `userCredential.oauth` overrides supply user-flow scopes, the scopes
+ * query param (Slack `user_scope`), the grant path (Slack `authed_user`),
+ * user-flow authorize extras, and a metadata mapping.
+ */
+export function userRedirectOauthSpec(
+  connector: Connector,
+  extraParams?: Record<string, string>,
+): RedirectOauthSpec {
+  const oauth = connector.oauth;
+  const mode = connector.userCredential?.oauth;
+  if (!oauth || mode === undefined) {
+    throw new Error(`connector "${connector.provider}" has no user-scoped OAuth flow`);
+  }
+  const overrides = mode === true ? {} : mode;
+  const base = redirectOauthSpec(connector, extraParams);
+  base.extraAuthorizeParams = { ...(extraParams ?? {}), ...(overrides.authorizeParams ?? {}) };
+  if (overrides.scopes !== undefined) base.scopes = [...overrides.scopes];
+  if (overrides.scopesParam !== undefined) base.scopesParam = overrides.scopesParam;
+  if (overrides.grantPath !== undefined) base.grantPath = overrides.grantPath;
+  if (overrides.metadata !== undefined) {
+    base.metadata = create(RedirectMetadataSpecSchema, {
+      fromTokenResponse: wireMap(overrides.metadata.fromTokenResponse),
+    });
+  }
+  return base;
+}

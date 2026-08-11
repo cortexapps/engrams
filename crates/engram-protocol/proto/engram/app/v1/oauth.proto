@@ -164,6 +164,13 @@ message RedirectOauthSpec {
   // PKCE (S256). The verifier is derived, never persisted.
   bool pkce = 8;
   RedirectMetadataSpec metadata = 9;
+  // ADR 0115: the authorize query parameter carrying the joined scopes.
+  // Empty means "scope". Slack user-subject flows send "user_scope" so the
+  // provider mints a USER token instead of a bot token.
+  string scopes_param = 10;
+  // ADR 0115: dot-path to the grant object inside the token response
+  // (Slack user tokens live under "authed_user"). Empty means the root.
+  string grant_path = 11;
 }
 
 // Declarative account-metadata extraction — no per-provider coordinator code.

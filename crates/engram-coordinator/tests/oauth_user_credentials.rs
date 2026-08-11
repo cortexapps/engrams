@@ -116,6 +116,8 @@ fn spec(host: &str) -> RedirectOauthSpec {
         client_id_ref: "linear.client_id".into(),
         client_secret_ref: "linear.client_secret".into(),
         pkce: false,
+        scopes_param: String::new(),
+        grant_path: String::new(),
         metadata: RedirectMetadataSpec {
             from_token_response: BTreeMap::new(),
             probe: Some(RedirectMetadataProbe {

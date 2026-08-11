@@ -20,7 +20,17 @@
     ]
   },
   "userCredential": {
-    "oauth": true
+    "oauth": {
+      "scopesParam": "user_scope",
+      "grantPath": "authed_user",
+      "metadata": {
+        "fromTokenResponse": {
+          "accountId": "authed_user.id",
+          "workspaceId": "team.id",
+          "workspaceName": "team.name"
+        }
+      }
+    }
   },
   "webhook": {
     "verificationScheme": "slack_v0",

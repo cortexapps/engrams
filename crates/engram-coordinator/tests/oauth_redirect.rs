@@ -127,6 +127,8 @@ fn spec(host: &str, probe: bool) -> RedirectOauthSpec {
         client_id_ref: "linear.client_id".into(),
         client_secret_ref: "linear.client_secret".into(),
         pkce: false,
+        scopes_param: String::new(),
+        grant_path: String::new(),
         metadata: RedirectMetadataSpec {
             from_token_response: BTreeMap::new(),
             probe: probe.then(|| RedirectMetadataProbe {
@@ -283,6 +285,80 @@ async fn complete_publishes_bundle_with_rotation_and_probe_metadata() {
         .expect("get")
         .expect("row");
     assert_eq!(flow.status, OAuthFlowStatus::Succeeded);
+}
+
+/// ADR 0115: a user-subject spec can rename the scopes param and read the
+/// grant from a nested object — Slack mints USER tokens via `user_scope`,
+/// and the user token lives under `authed_user`, not the response root.
+#[tokio::test]
+async fn user_scope_param_and_nested_grant_path_mint_the_user_token() {
+    let fx = fixture().await;
+    *fx.provider.token_response.lock() = json!({
+        "ok": true,
+        // The root token is the BOT token — the spec's grant path must
+        // select the authed_user object instead.
+        "access_token": "xoxb-bot-token",
+        "token_type": "bot",
+        "team": {"id": "T1", "name": "Acme"},
+        "authed_user": {
+            "id": "U7",
+            "access_token": "xoxp-user-token",
+            "token_type": "user",
+            "scope": "chat:write",
+        },
+    });
+    let mut sp = spec(&fx.host, false);
+    sp.scopes_param = "user_scope".into();
+    sp.grant_path = "authed_user".into();
+    sp.metadata.from_token_response = BTreeMap::from([
+        (META_ACCOUNT_ID.to_string(), "authed_user.id".to_string()),
+        (META_WORKSPACE_NAME.to_string(), "team.name".to_string()),
+    ]);
+
+    let begun = fx
+        .manager
+        .begin_redirect(linear_key(), &sp, "https://cb.example.com/x")
+        .await
+        .expect("begin");
+    let url = reqwest::Url::parse(&begun.authorize_url).expect("authorize url");
+    let q: BTreeMap<String, String> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    assert_eq!(
+        q["user_scope"], "read,write",
+        "scopes ride the renamed param"
+    );
+    assert!(
+        !q.contains_key("scope"),
+        "no bot-scope param on a user flow"
+    );
+
+    let row = fx
+        .manager
+        .complete_redirect(
+            linear_key(),
+            begun.flow.id,
+            "code-abc",
+            "https://cb.example.com/x",
+            &sp,
+        )
+        .await
+        .expect("complete");
+    // Metadata dot-paths see the FULL response even with a nested grant.
+    assert_eq!(row.metadata.account_id, "U7");
+    assert_eq!(row.metadata.workspace_name.as_deref(), Some("Acme"));
+    let bundle = open_bundle(&fx, &linear_key()).await;
+    assert_eq!(
+        bundle.access_token, "xoxp-user-token",
+        "the USER token, not the bot's"
+    );
+    assert_eq!(bundle.token_type, "user");
+    assert_eq!(bundle.scope.as_deref(), Some("chat:write"));
+    assert!(
+        bundle.refresh_token.is_none(),
+        "no rotation → no refresh spec"
+    );
 }
 
 #[tokio::test]

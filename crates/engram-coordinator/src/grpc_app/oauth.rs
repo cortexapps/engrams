@@ -109,6 +109,8 @@ fn redirect_spec_from_proto(
         client_id_ref: spec.client_id_ref,
         client_secret_ref: spec.client_secret_ref,
         pkce: spec.pkce,
+        scopes_param: spec.scopes_param,
+        grant_path: spec.grant_path,
         metadata: RedirectMetadataSpec {
             from_token_response: metadata.from_token_response.into_iter().collect(),
             probe: metadata.probe.map(|probe| RedirectMetadataProbe {

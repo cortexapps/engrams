@@ -717,7 +717,21 @@ describe("on-disk registry", () => {
     const reg = connectorRegistry();
     expect(reg.get("linear")!.userCredential).toMatchObject({ oauth: true });
     expect(reg.get("linear")!.userCredential?.token?.hint).toContain("API key");
-    expect(reg.get("slack")!.userCredential).toEqual({ oauth: true });
+    // Slack's user flow mints a USER token: scopes ride `user_scope` and the
+    // grant lives under `authed_user` (ADR 0115 amendment).
+    expect(reg.get("slack")!.userCredential).toEqual({
+      oauth: {
+        scopesParam: "user_scope",
+        grantPath: "authed_user",
+        metadata: {
+          fromTokenResponse: {
+            accountId: "authed_user.id",
+            workspaceId: "team.id",
+            workspaceName: "team.name",
+          },
+        },
+      },
+    });
     expect(reg.get("sentry")!.userCredential?.token?.hint).toContain("User Auth Tokens");
     expect(reg.get("github")!.userCredential?.oauth).toBeUndefined();
     expect(reg.get("github")!.userCredential?.inject).toEqual({
@@ -1362,6 +1376,73 @@ describe("user-scoped credentials (ADR 0115)", () => {
     test("rejects oauth mode without the top-level oauth facet", () => {
       const withOauth = { ...acmeRaw, userCredential: { oauth: true } };
       expect(() => parseConnector(withOauth, "t")).toThrow(/requires the connector's top-level "oauth" facet/);
+    });
+
+    // ADR 0115 amendment: the user-flow overrides object.
+    describe("oauth overrides", () => {
+      const oauthRaw = {
+        ...acmeRaw,
+        credential: {
+          source: "inject",
+          injects: [{ header: "Authorization", template: "Bearer {}" }],
+        },
+        oauth: {
+          authorizeUrl: "https://acme.test/oauth/authorize",
+          acquisitionHosts: ["acme.test"],
+          tokenUrl: "https://api.acme.test/oauth/token",
+          scopes: ["read"],
+          extraAuthorizeParams: { actor: "app" },
+          clientIdRef: "acme.client_id",
+          clientSecretRef: "acme.client_secret",
+        },
+      };
+      const withOverrides = (oauth: unknown) => ({
+        ...oauthRaw,
+        userCredential: { oauth },
+      });
+
+      test("parses scopes/scopesParam/grantPath/authorizeParams/metadata", () => {
+        const c = parseConnector(
+          withOverrides({
+            scopes: ["chat:write"],
+            scopesParam: "user_scope",
+            grantPath: "authed_user",
+            authorizeParams: { prompt: "consent" },
+            metadata: { fromTokenResponse: { accountId: "authed_user.id" } },
+          }),
+          "t",
+        );
+        expect(c.userCredential?.oauth).toEqual({
+          scopes: ["chat:write"],
+          scopesParam: "user_scope",
+          grantPath: "authed_user",
+          authorizeParams: { prompt: "consent" },
+          metadata: { fromTokenResponse: { accountId: "authed_user.id" } },
+        });
+      });
+
+      test("rejects reserved authorize params, bad param names, and probes", () => {
+        expect(() =>
+          parseConnector(withOverrides({ authorizeParams: { redirect_uri: "https://evil" } }), "t"),
+        ).toThrow(/reserved/);
+        expect(() =>
+          parseConnector(withOverrides({ scopesParam: "User Scope" }), "t"),
+        ).toThrow(/lowercase identifier/);
+        expect(() =>
+          parseConnector(withOverrides({ grantPath: "__proto__.x" }), "t"),
+        ).toThrow(/dot-path/);
+        expect(() =>
+          parseConnector(
+            withOverrides({
+              metadata: {
+                fromTokenResponse: { accountId: "a.b" },
+                probe: { path: "/x", map: { accountId: "id" } },
+              },
+            }),
+            "t",
+          ),
+        ).toThrow(/probe/);
+      });
     });
   });
 

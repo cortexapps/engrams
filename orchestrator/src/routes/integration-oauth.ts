@@ -31,7 +31,7 @@ import { abilityFor } from "../authz/ability.ts";
 import { config } from "../config.ts";
 import { loadRegistry } from "../connectors/registry.ts";
 import type { Connector } from "../connectors/registry.ts";
-import { redirectOauthSpec } from "../connectors/oauth-spec.ts";
+import { redirectOauthSpec, userRedirectOauthSpec } from "../connectors/oauth-spec.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeIntegrationConnectionStore } from "../db/integration-connections.ts";
 import { getDb } from "../db/client.ts";
@@ -146,7 +146,7 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
     const user = await requireUser(c.req.raw.headers);
     const provider = c.req.param("provider");
     const connector = await oauthConnector(provider);
-    if (connector.userCredential?.oauth !== true) {
+    if (connector.userCredential?.oauth === undefined) {
       throw new HTTPException(404, {
         message: `connector "${provider}" has no user-scoped OAuth flow`,
       });
@@ -155,7 +155,11 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
     const { authorizeUrl } = await oauthCredential.beginRedirectFlow({
       subject: { kind: OauthSubjectKind.USER_CONNECTOR, id: user.id },
       provider,
-      spec: redirectOauthSpec(connector, force ? { prompt: "consent" } : undefined),
+      // The USER-flavored spec: never inherits the org facet's authorize
+      // extras (Linear's `actor: "app"` would make the personal token post
+      // as the application) and applies the connector's user overrides
+      // (Slack `user_scope` / `authed_user`).
+      spec: userRedirectOauthSpec(connector, force ? { prompt: "consent" } : undefined),
       // The provider requires an exact-match registered redirect URI, so the
       // user flow shares the org callback; the flow row carries the subject.
       redirectUri: redirectUri(provider),
@@ -205,7 +209,9 @@ export function makeIntegrationOauthRoute(deps?: IntegrationOauthDeps): Hono {
         flowId: state,
         code,
         redirectUri: redirectUri(provider),
-        spec: redirectOauthSpec(connector),
+        // The completion must use the SAME spec flavor the flow began with:
+        // the user variant carries the grant path the exchange reads.
+        spec: isUserFlow ? userRedirectOauthSpec(connector) : redirectOauthSpec(connector),
       });
       return done(provider, true, "connected", c);
     } catch (err) {
