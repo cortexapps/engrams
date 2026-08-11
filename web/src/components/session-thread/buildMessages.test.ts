@@ -12,8 +12,10 @@ import {
   TASK_TOOL,
   type FileChangeArgs,
   type RunFooter,
+  type ShellArgs,
   type SystemMarker,
 } from "./buildMessages";
+import { extractFileChanges } from "./fileChanges";
 import type { IndexedEvent, SessionEvent, UserQuestion } from "../../lib/types";
 
 const AT = "2026-06-02T12:00:00.000Z";
@@ -2048,5 +2050,218 @@ describe("buildMessages — ADR 0107 out-of-mode plan attempt", () => {
       "active",
     );
     expect(isRunning).toBe(false);
+  });
+});
+
+describe("buildMessages — a WINDOWED transcript (lib/sessionWindow.ts)", () => {
+  // The transcript opens on a tail window and prepends older pages as the
+  // reader scrolls up. Everything here is about what survives that: ids that
+  // do not move, a turn that is whole at the window edge, whole-session folds
+  // that read the spine, and output whose `exec_started` is out of the window.
+
+  /** The same events at their REAL idxs — a window is a slice of the log, not
+   *  a log of its own, so the idxs must not be renumbered. */
+  function atIdx(start: number, events: SessionEvent[]): IndexedEvent[] {
+    return events.map((event, i) => ({ idx: start + i, event }));
+  }
+
+  const assistantIds = (messages: ReturnType<typeof buildMessages>["messages"]) =>
+    real(messages)
+      .filter((m) => m.role === "assistant")
+      .map((m) => m.id);
+
+  const twoRuns: SessionEvent[] = [
+    { type: "run_started", run_id: "r1", prompt_summary: "first", at: AT },
+    {
+      type: "agent_message",
+      run_id: "r1",
+      message_id: "a1",
+      role: "assistant",
+      text: "one",
+      at: AT,
+    },
+    {
+      type: "tool_call_started",
+      run_id: "r1",
+      tool_call_id: "t1",
+      tool_name: "Read",
+      args_summary: null,
+      at: AT,
+    },
+    {
+      type: "tool_call_completed",
+      run_id: "r1",
+      tool_call_id: "t1",
+      tool_name: "Read",
+      ok: true,
+      duration_ms: 3,
+      result_summary: "ok",
+      at: AT,
+    },
+    { type: "run_completed", run_id: "r1", ok: true, at: AT },
+    { type: "run_started", run_id: "r2", prompt_summary: "second", at: AT2 },
+    {
+      type: "agent_message",
+      run_id: "r2",
+      message_id: "a2",
+      role: "assistant",
+      text: "two",
+      at: AT2,
+    },
+    { type: "run_completed", run_id: "r2", ok: true, at: AT2 },
+  ];
+
+  test("assistant ids are unchanged when OLDER events are prepended", () => {
+    const whole = atIdx(0, twoRuns);
+    // The window opened on the second run (idx 5 is its run_started).
+    const windowed = whole.slice(5);
+
+    const before = assistantIds(buildMessages(windowed, SID).messages);
+    const after = assistantIds(buildMessages(whole, SID).messages);
+
+    // The turn the reader already had keeps its id, so assistant-ui never sees
+    // one message under two ids (the "same id already exists" crash).
+    expect(before).toEqual(["a:5"]);
+    expect(after).toEqual(["a:0", "a:5"]);
+    expect(after).toEqual(expect.arrayContaining(before));
+    // Ids are unique — a run's later bubbles cannot collide with its first.
+    expect(new Set(after).size).toBe(after.length);
+  });
+
+  test("a window snapped to a run boundary renders the run's user bubble and receipt", () => {
+    const windowed = atIdx(0, twoRuns).slice(5);
+    const { messages } = buildMessages(windowed, SID);
+    const user = real(messages).find((m) => m.role === "user");
+    expect(user).toBeDefined();
+    expect(user!.content).toEqual([{ type: "text", text: "second" }]);
+    const assistant = real(messages).find((m) => m.role === "assistant");
+    const footer = assistant!.metadata?.custom?.run as RunFooter | undefined;
+    expect(footer).toBeDefined();
+    expect(footer!.ok).toBe(true);
+    expect(footer!.interrupted).toBe(false);
+  });
+
+  test("the spine keeps the plan ordinals and the file-change rollup whole", () => {
+    // A spine holds every cheap kind from idx 0 plus the structural tool calls
+    // — but NOT the generic tool rows the window carries. The whole-session
+    // folds must still be right.
+    const spine: SessionEvent[] = [
+      { type: "run_started", run_id: "r1", prompt_summary: "plan it", at: AT },
+      {
+        type: "tool_call_requested",
+        run_id: "r1",
+        tool_call_id: "t-plan-1",
+        name: "exit_plan_mode",
+        args_json: JSON.stringify({ plan: "# first draft" }),
+        at: AT,
+      },
+      { type: "run_completed", run_id: "r1", ok: true, at: AT },
+      { type: "run_started", run_id: "r2", prompt_summary: "again", at: AT2 },
+      {
+        type: "file_changed",
+        run_id: "r2",
+        tool_call_id: "t-edit-1",
+        path: "src/a.ts",
+        change: { write: { content: "one\n" } },
+        at: AT2,
+      },
+      {
+        type: "file_changed",
+        run_id: "r2",
+        tool_call_id: "t-edit-2",
+        path: "src/b.ts",
+        change: { write: { content: "two\n" } },
+        at: AT2,
+      },
+      {
+        type: "tool_call_requested",
+        run_id: "r2",
+        tool_call_id: "t-plan-2",
+        name: "exit_plan_mode",
+        args_json: JSON.stringify({ plan: "# second draft" }),
+        at: AT2,
+      },
+      { type: "run_completed", run_id: "r2", ok: true, at: AT2 },
+    ];
+    const events = atIdx(0, spine);
+    const { messages } = buildMessages(events, SID);
+    const plans = real(messages)
+      .map(customMarker)
+      .filter((m): m is Extract<SystemMarker, { kind: "plan" }> => m?.kind === "plan");
+    expect(plans.map((p) => p.revision)).toEqual([1, 2]);
+
+    // The rollup reads `file_changed`, a spine kind, so it is complete even
+    // though the edit tool rows themselves are outside the window.
+    const rollups = extractFileChanges(events);
+    expect(rollups.map((r) => r.path)).toEqual(["src/a.ts", "src/b.ts"]);
+  });
+
+  test("exec output whose exec_started is outside the window renders a fallback", () => {
+    // Only the tail of the exec is in the window. Before the fallback the
+    // correlation dropped every chunk AND the exit status: the reader saw a
+    // turn with nothing where the command's output belonged.
+    const { messages } = buildMessages(
+      atIdx(400, [
+        { type: "stdout", exec_id: "e1", chunk: "hello\n" },
+        { type: "stderr", exec_id: "e1", chunk: "warn\n" },
+        {
+          type: "exec_completed",
+          exec_id: "e1",
+          exit_status: 1,
+          rusage: { wall_ms: 12 },
+          at: AT,
+        },
+      ]),
+      SID,
+    );
+    const parts = real(messages).flatMap((m) => (Array.isArray(m.content) ? m.content : []));
+    const shell = parts.find(
+      (p): p is Extract<typeof p, { type: "tool-call" }> =>
+        p.type === "tool-call" && p.toolName === SHELL_TOOL,
+    );
+    expect(shell).toBeDefined();
+    expect(shell!.toolCallId).toBe("e1");
+    expect(shell!.result).toBe("hello\nwarn\n");
+    expect((shell!.args as ShellArgs).exit).toBe(1);
+    expect(shell!.isError).toBe(true);
+  });
+});
+
+describe("buildMessages — windowed decisions", () => {
+  const planArgs = JSON.stringify({ plan: "step one" });
+
+  function planAsked(idx: number, id: string): IndexedEvent {
+    return {
+      idx,
+      event: {
+        type: "tool_call_requested",
+        run_id: "r1",
+        tool_call_id: id,
+        name: "exit_plan_mode",
+        args_json: planArgs,
+        at: AT,
+      },
+    };
+  }
+
+  test("a plan whose answer is below the window floor is not pending", () => {
+    // The spine carries the ASK from idx 0, but `tool_result_submitted` is not
+    // a spine kind, so the approval that resolved it was never loaded.
+    const events = [planAsked(2, "old-plan")];
+
+    // Whole log loaded → genuinely unresolved, so it is pending.
+    const whole = buildMessages(events, SID, "idle", "", null);
+    expect(whole.pendingPlan).toEqual({ toolCallId: "old-plan" });
+    expect(whole.isRunning).toBe(false);
+
+    // Windowed with a floor above the ask → the answer is unknown, not absent.
+    const windowed = buildMessages(events, SID, "idle", "", 100);
+    expect(windowed.pendingPlan).toBeNull();
+  });
+
+  test("a plan asked inside the window still reads as pending", () => {
+    const events = [planAsked(150, "live-plan")];
+    const windowed = buildMessages(events, SID, "idle", "", 100);
+    expect(windowed.pendingPlan).toEqual({ toolCallId: "live-plan" });
   });
 });
