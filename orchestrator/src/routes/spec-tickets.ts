@@ -20,7 +20,7 @@ import {
   type SpecTicketTreeService,
   type SpecTicketTreeView,
 } from "../specs/ticket-tree.ts";
-import { SpecTicketTreeError } from "@engrams/spec-document";
+import { SpecTicketTreeError, type SpecTicketSyncState } from "@engrams/spec-document";
 import type { GetSession, ResolveSpecMembership } from "./guard.ts";
 import { makeSpecMemberHeaderGuard } from "./guard.ts";
 
@@ -38,7 +38,7 @@ export interface SpecTicketPayload {
   description: string;
   backlink: { sectionId: string; sectionTitle: string; href: string };
   dependsOn: string[];
-  syncState: string;
+  syncState: SpecTicketSyncState;
   linearId: string | null;
   syncError: string | null;
   openQuestions: Array<{ id: string; sectionId: string; text: string }>;
