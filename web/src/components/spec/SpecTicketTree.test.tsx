@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, test } from "vitest";
@@ -145,7 +145,6 @@ describe("the ticket tree", () => {
   test("renders the pinned revision, the tree shape and every backlink", () => {
     renderTree();
     expect(screen.getByText("Tickets · 5")).toBeTruthy();
-    expect(screen.getByText("spec v18 pinned")).toBeTruthy();
     expect(rows().map((entry) => entry.depth)).toEqual(["0", "0", "1", "0", "0"]);
     const backlinks = screen.getAllByRole("link").map((link) => link.textContent);
     expect(backlinks).toEqual(["§Data model", "§Data model", "§API", "§Data model", "§API"]);
@@ -156,9 +155,13 @@ describe("the ticket tree", () => {
   test("a drag onto another row nests it and closes the gap it left", () => {
     const { commands } = renderTree();
 
-    fireEvent.dragStart(grip("Enforce org quota in the gateway limiter"));
-    fireEvent.dragOver(row("Add org quota columns"));
-    fireEvent.drop(row("Add org quota columns"));
+    // One synchronous batch, so no re-render lands between the two events —
+    // the drop must still know which row is in the air.
+    act(() => {
+      fireEvent.dragStart(grip("Enforce org quota in the gateway limiter"));
+      fireEvent.dragOver(row("Add org quota columns"));
+      fireEvent.drop(row("Add org quota columns"));
+    });
 
     // The dropped row is now a child of the row it landed on …
     expect(rows()).toEqual([

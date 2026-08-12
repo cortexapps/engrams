@@ -22,12 +22,6 @@
   letter-spacing: 0.02em;
 }
 
-.spec-ticket-pin {
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 0.68rem;
-  color: var(--muted-foreground);
-}
-
 .spec-ticket-bar-actions {
   display: flex;
   gap: 0.4rem;

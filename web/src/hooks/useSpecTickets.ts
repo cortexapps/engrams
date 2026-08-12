@@ -63,7 +63,7 @@ export function useSpecTickets(specId: string, enabled = true) {
   return useQuery({
     queryKey: specTicketsKey(specId),
     enabled: enabled && specId.length > 0,
-    queryFn: () => specRequest<SpecTicketTree>(`/api/v1/specs/${specId}/tickets`),
+    queryFn: () => specRequest<SpecTicketTree>(`/specs/${specId}/tickets`),
   });
 }
 
@@ -96,7 +96,8 @@ export function writeTree(queryClient: QueryClient, specId: string, tree: SpecTi
 }
 
 function runCommand(specId: string, command: SpecTicketCommand): Promise<SpecTicketTree> {
-  const base = `/api/v1/specs/${specId}/tickets`;
+  // `specRequest` adds the `/api/v1` prefix, so paths here start at the spec.
+  const base = `/specs/${specId}/tickets`;
   switch (command.kind) {
     case "add":
       return specRequest<SpecTicketTree>(base, {

@@ -53,6 +53,10 @@ export function SpecTicketTree({ tree, onCommand, onTree }: SpecTicketTreeProps)
   const [selected, setSelected] = useState<string[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  // The row being dragged also lives in a ref. The drop must know it whether
+  // or not a re-render landed between `dragstart` and `drop`; state alone
+  // would make a fast drag depend on render timing.
+  const dragged = useRef<string | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
@@ -113,9 +117,6 @@ export function SpecTicketTree({ tree, onCommand, onTree }: SpecTicketTreeProps)
     <div className="spec-ticket-tree">
       <header className="spec-ticket-bar">
         <span className="spec-ticket-count">Tickets · {rows.length}</span>
-        <Badge variant="outline" className="spec-ticket-pin">
-          spec v{tree.docSeq} pinned
-        </Badge>
         <div className="spec-ticket-bar-actions">
           <Button
             variant="outline"
@@ -182,17 +183,22 @@ export function SpecTicketTree({ tree, onCommand, onTree }: SpecTicketTreeProps)
                 ],
               })
             }
-            onDragStart={() => setDraggingId(ticket.id)}
+            onDragStart={() => {
+              dragged.current = ticket.id;
+              setDraggingId(ticket.id);
+            }}
             onDragEnd={() => {
+              dragged.current = null;
               setDraggingId(null);
               setDropTarget(null);
             }}
             onDragOver={() => setDropTarget(ticket.id)}
             onDrop={() => {
-              const dragged = draggingId;
+              const source = dragged.current;
+              dragged.current = null;
               setDraggingId(null);
               setDropTarget(null);
-              if (dragged && dragged !== ticket.id) move(dragged, ticket.id);
+              if (source && source !== ticket.id) move(source, ticket.id);
             }}
             onNest={() => {
               const previous = previousSibling(rows, ticket);
