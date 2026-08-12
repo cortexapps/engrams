@@ -107,6 +107,14 @@
   padding-left: 1.1rem;
 }
 
+/*
+ * A React node view wraps its editable content in a block element. The words in
+ * a bullet must stay on the mark's own line, beside the receipt.
+ */
+.spec-notes-bullet [data-node-view-content-react] {
+  display: inline;
+}
+
 .spec-notes-mark {
   font-family: var(--font-mono, ui-monospace, monospace);
   font-size: 0.75rem;
