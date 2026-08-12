@@ -84,7 +84,8 @@ export class PostgresSpecParticipantStore implements SpecParticipantStore {
       .update(specParticipant)
       .set({
         disconnectedAt,
-        // This tombstone keeps the current write distinct from a legacy disconnect.
+        // The tombstone expires the lease immediately, so a live-participant
+        // read drops this socket before its lease would have run out.
         leaseExpiresAt: sql`'-infinity'::timestamptz`,
       })
       .where(

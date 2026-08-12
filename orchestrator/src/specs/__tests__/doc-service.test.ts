@@ -1771,9 +1771,10 @@ describe("SpecDocumentService with live Postgres", () => {
       });
       await documents.applyUpdate(specId, diagramUpdate(), null);
       await livePool.query(
-        `INSERT INTO spec_participant (spec_id, client_id, user_id, connected_at)
-         VALUES ($1, $2, $3, $4)`,
-        [specId, humanClientId, userId, stateTime],
+        `INSERT INTO spec_participant
+           (spec_id, client_id, user_id, connection_epoch, connected_at, lease_expires_at)
+         VALUES ($1, $2, $3, 1, $4, $5)`,
+        [specId, humanClientId, userId, stateTime, new Date(stateTime.getTime() + 60_000)],
       );
       await livePool.query(
         `INSERT INTO spec_section_state
