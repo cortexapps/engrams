@@ -50,6 +50,23 @@ pub fn init(addr: SocketAddr) {
             .expect("install capture histogram buckets");
     }
 
+    // ADR 0116 C1: the starvation probes resolve SUB-millisecond — a
+    // healthy sched-delay tick and a page-cache pwrite both sit well
+    // under the default 5 ms floor, where every sample would land in
+    // the first bucket and the p99 excursion the probes exist to catch
+    // would be invisible until it crossed 5 ms.
+    let probe_buckets = &[
+        0.0002, 0.0005, 0.001, 0.0025, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 1.0, 5.0,
+    ];
+    for name in [TOKIO_SCHED_DELAY_SECONDS, NBD_DIRTY_FILE_IO_SECONDS] {
+        builder = builder
+            .set_buckets_for_metric(
+                metrics_exporter_prometheus::Matcher::Full(name.to_string()),
+                probe_buckets,
+            )
+            .expect("install probe histogram buckets");
+    }
+
     // ADR 0101 B: epoch age lives in the pacing clamp band
     // [ENGRAM_CHECKPOINT_MIN_INTERVAL_SECS 30, ENGRAM_CHECKPOINT_INTERVAL_SECS
     // 600], stretching above the backstop by capture time — under the
@@ -707,3 +724,73 @@ pub const NBD_READ_SECONDS: &str = "engram_nbd_read_seconds";
 /// mix, which moves the latency histogram without the path itself
 /// changing speed.
 pub const NBD_READ_BYTES: &str = "engram_nbd_read_bytes";
+
+/// Counter (ADR 0116 C1). NBD serve-loop exits by cause, labeled
+/// `reason` (`eof` | `read_error` | `parse_error` | `disconnect` |
+/// `write_bound` | `payload_read_error` | `reply_write_error`) and
+/// `device` (`/dev/nbdN`; bounded by the device-slot pool, ADR 0049).
+/// An UNSOLICITED exit (anything but `disconnect` on teardown) leaves a
+/// netlink-configured device with no server: the kernel parks I/O for
+/// `dead_conn_timeout` (300 s) and then fails the device permanently —
+/// the 2026-08-12 nbd98 incident. C2's supervisor consumes this signal;
+/// C1 makes the death visible and countable per cause.
+pub const NBD_SERVE_EXITS_TOTAL: &str = "engram_nbd_serve_exits_total";
+
+/// Histogram (ADR 0116 C1). Latency of the disk daemon's local
+/// chunk-file I/O primitives (`read_exact_at` / `write_all_at` — the
+/// dirty-tier and local-cache pwrite/pread choke points), labeled
+/// `op` (`read` | `write`). These run as BLOCKING syscalls on the
+/// shared tokio runtime; a p99 excursion here during a capture-upload
+/// storm is the H1 (executor/IO saturation) signature, vs. a clean
+/// pwrite p99 with a spiking sched-delay probe pointing at H2
+/// (handler starvation) — the C3 QoS knobs are tuned by which fires.
+pub const NBD_DIRTY_FILE_IO_SECONDS: &str = "engram_nbd_dirty_file_io_seconds";
+
+/// Histogram (ADR 0116 C1). Observed-minus-expected delay of a 100 ms
+/// heartbeat tick on the host-agent's main tokio runtime — the
+/// executor-starvation probe. Steady-state ≈ 0; sustained excursions
+/// past ~10 ms mean runnable tasks (the NBD serve reader/writer among
+/// them) are waiting on workers, which is how a neighbor's upload storm
+/// turns into kernel NBD timeouts. Named generically: the probe moves
+/// to the dedicated serve runtime in C3 and the delta between the two
+/// runtimes becomes the isolation proof.
+pub const TOKIO_SCHED_DELAY_SECONDS: &str = "engram_tokio_sched_delay_seconds";
+
+/// ADR 0116 C1: the executor-starvation probe task. A 100 ms tick that
+/// records how late each tick fires ([`TOKIO_SCHED_DELAY_SECONDS`]).
+/// Monotonic-Instant carve-out per `time_source` (a pure metric timer;
+/// never a decision input). Runs for the process lifetime; the caller
+/// holds the JoinHandle only to keep ownership explicit.
+pub fn spawn_sched_delay_probe() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        const TICK: std::time::Duration = std::time::Duration::from_millis(100);
+        let mut interval = tokio::time::interval(TICK);
+        // Delay (not Burst): after a stall we want ONE honest large
+        // sample, not a flurry of zero-delay catch-up ticks diluting it.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await; // arms the schedule
+        let mut last = crate::time_source::metrics_now();
+        loop {
+            interval.tick().await;
+            let now = crate::time_source::metrics_now();
+            let delay = now.duration_since(last).saturating_sub(TICK);
+            ::metrics::histogram!(TOKIO_SCHED_DELAY_SECONDS).record(delay.as_secs_f64());
+            last = now;
+        }
+    })
+}
+
+/// Counter (ADR 0116 C2). Supervised serve-loop restarts: an unsolicited
+/// serve death repaired in place (fresh socketpair + RECONFIGURE against
+/// the same live backend). Label `device`. Steady state: zero — every
+/// increment is a serve loop that pre-C2 would have died silently and
+/// left the guest to a permanent EIO after `dead_conn_timeout`.
+pub const NBD_SERVE_RESTARTS_TOTAL: &str = "engram_nbd_serve_restarts_total";
+
+/// Counter (ADR 0116 C2). Supervised serve loops that exhausted the
+/// restart budget (5 per 10 min) and gave up — the device stays
+/// configured (guest I/O parks under `dead_conn_timeout`) and the
+/// sandbox's failing flushes escalate it (C4). Alert-worthy: this is a
+/// crash-looping data plane, not a transient.
+pub const NBD_SERVE_RESTART_BUDGET_EXHAUSTED_TOTAL: &str =
+    "engram_nbd_serve_restart_budget_exhausted_total";

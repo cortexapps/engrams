@@ -83,6 +83,33 @@ fn steady_reconcile_interval(autoscaling_enabled: bool) -> Duration {
     }
 }
 
+/// ADR 0116 A-D2: the handoff TTL for a roll — the window the durable
+/// lease deadline must cover: the bounded enable-work gate, the pod
+/// swap, and the successor gate, plus margin. Sized against the SAME
+/// `MAX_HANDOFF_TTL_SECS` the coordinator clamps to (#1218 review), so
+/// the operator's request is never silently truncated: a CR whose gate
+/// budgets exceed the ceiling degrades HERE, loudly, where the operator
+/// can also see its own roll will outlive its shield.
+fn roll_handoff_ttl_secs(spec: &HostFleetSpec) -> u64 {
+    let sized = spec
+        .enable_work_timeout_seconds
+        .saturating_add(spec.drain_timeout_seconds)
+        .saturating_add(120);
+    let max = engram_core::types::host::MAX_HANDOFF_TTL_SECS;
+    if sized > max {
+        tracing::warn!(
+            sized,
+            max,
+            "roll gate budgets exceed the handoff TTL ceiling; the lease shield will \
+             expire before a maximally-slow roll finishes — shrink the gate budgets \
+             or raise MAX_HANDOFF_TTL_SECS in lockstep on both sides"
+        );
+        max
+    } else {
+        sized
+    }
+}
+
 /// A host-agent pod distilled to the fields the planner needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PodInfo {
@@ -329,6 +356,15 @@ async fn roll_node(
     // which the planner just re-rolls (the cordon is idempotent).
     set_node_roll_cordon(client, node, true).await?;
     coord.cordon(host_id).await?;
+    // ADR 0116 A-D2: declare the handoff BEFORE anything can kill the
+    // pod, so the coordinator's binding-lease deadline covers the whole
+    // replacement (enable-work gate + pod delete + successor gate, plus
+    // margin). A failure here aborts the roll exactly like a cordon
+    // failure — the pod must never die without a durable deadline in PG.
+    // (An old coordinator without the RPC returns accepted=false and the
+    // roll proceeds under its legacy cordon shield.)
+    let handoff_ttl = roll_handoff_ttl_secs(spec);
+    coord.handoff(host_id, handoff_ttl).await?;
 
     // ADR 0088: the reattach roll is lossless for session VMs but NOT for
     // the host-agent's own enable work — an in-flight materialize stream or
@@ -351,9 +387,13 @@ async fn roll_node(
     pods.delete(pod, &DeleteParams::default()).await?;
     tracing::info!(%node, %pod, "pod deleted; waiting for the successor to come up Ready on target + reattach");
 
-    // Gate on the successor being Ready on the target image BEFORE uncordoning
-    // — keeping the host `draining` (dead-host-detector-exempt) through the
-    // swap so the reattaching sessions are never struck out.
+    // Gate on the successor being Ready on the target image BEFORE
+    // uncordoning. The shield against the dead-host detector striking the
+    // reattaching sessions mid-swap is the ADR 0116 handoff declared
+    // above (an explicit lease deadline sized to this gate's budget) —
+    // NOT `draining`, which the production heartbeat loop never reports
+    // (hardcoded false), and not the cordon's legacy 10x multiplier,
+    // which the 2026-08-12 roll outlived.
     let successor = gate_successor_ready(
         client,
         spec,
@@ -815,6 +855,29 @@ pub(crate) fn coord_token() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR 0116 A-D2 (#1218 review): the DEFAULT roll gate budgets must
+    /// fit under the shared handoff ceiling, or every default-config
+    /// roll writes a deadline the coordinator would truncate. A default
+    /// bump that breaks this fails here, not in a mid-roll orphan.
+    #[test]
+    fn default_roll_budget_fits_under_the_handoff_ceiling() {
+        let spec: HostFleetSpec = serde_json::from_value(serde_json::json!({
+            "daemonSet": { "namespace": "engrams-hosts", "name": "hf-host-agent" },
+            "image": "host-agent:test",
+            "nodeAssetsImage": "node-assets:test",
+            "coordinatorUrl": "http://coord.test",
+        }))
+        .expect("HostFleetSpec with serde defaults");
+        let sized = spec.enable_work_timeout_seconds + spec.drain_timeout_seconds + 120;
+        assert!(
+            sized <= engram_core::types::host::MAX_HANDOFF_TTL_SECS,
+            "default roll budget ({sized}s) exceeds MAX_HANDOFF_TTL_SECS \
+             ({}s) — raise the ceiling in lockstep",
+            engram_core::types::host::MAX_HANDOFF_TTL_SECS,
+        );
+        assert_eq!(roll_handoff_ttl_secs(&spec), sized);
+    }
 
     #[test]
     fn autoscaling_uses_the_fast_steady_reconcile_interval() {

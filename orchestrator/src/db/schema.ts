@@ -16,7 +16,14 @@
  */
 
 import { relations, sql } from "drizzle-orm";
-import type { SpecTranscriptChip } from "@engrams/spec-document";
+import type {
+  GapFindingKind,
+  GapFindingSeverity,
+  GapProposedDiff,
+  SpecTicketSyncState,
+  SpecTranscriptChip,
+  TraceabilityMatrix,
+} from "@engrams/spec-document";
 import {
   pgTable,
   text,
@@ -25,6 +32,7 @@ import {
   timestamp,
   boolean,
   primaryKey,
+  foreignKey,
   index,
   uniqueIndex,
   customType,
@@ -461,6 +469,253 @@ export const specProjection = pgTable(
     index("spec_projection_session_state_idx").on(t.sessionId, t.state, t.rev),
   ],
 );
+
+/**
+ * One gap-check pass over a spec (ADR 0114 D6, R33).
+ *
+ * `semanticDocSeq` is the revision the pass covered. A run is stale, and the
+ * publish gate must ask for a fresh one, when the spec has moved past it.
+ */
+export const specGapCheckRun = pgTable(
+  "spec_gap_check_run",
+  {
+    id: uuid("id").primaryKey(),
+    specId: uuid("spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    sessionId: uuid("session_id"),
+    requestFingerprint: text("request_fingerprint").notNull(),
+    semanticDocSeq: bigint("semantic_doc_seq", { mode: "bigint" }).notNull(),
+    /** Set when a fatal finding stopped the pass outside-in (R32). */
+    stoppedAtLayerKey: text("stopped_at_layer_key"),
+    suppressedCount: integer("suppressed_count").notNull().default(0),
+    matrix: jsonb("matrix").$type<TraceabilityMatrix>().notNull(),
+    startedBy: text("started_by").references(() => user.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("spec_gap_check_run_fingerprint_idx").on(t.specId, t.requestFingerprint),
+    index("spec_gap_check_run_spec_created_idx").on(t.specId, t.createdAt),
+  ],
+);
+
+/**
+ * One finding of a gap-check run, with the disposition a person gave it.
+ * A finding never edits the document by itself (R28): it becomes an open
+ * question at its anchor, or a proposed diff that somebody accepts.
+ */
+export const specGapCheckFinding = pgTable(
+  "spec_gap_check_finding",
+  {
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => specGapCheckRun.id, { onDelete: "cascade" }),
+    findingId: text("finding_id").notNull(),
+    /** Reported order, outermost layer first. */
+    ordinal: integer("ordinal").notNull(),
+    kind: text("kind").$type<GapFindingKind>().notNull(),
+    severity: text("severity").$type<GapFindingSeverity>().notNull(),
+    layerKey: text("layer_key").notNull(),
+    sectionId: text("section_id").notNull(),
+    sectionTitle: text("section_title").notNull(),
+    requirementId: text("requirement_id"),
+    summary: text("summary").notNull(),
+    detail: text("detail").notNull(),
+    proposedDiff: jsonb("proposed_diff").$type<GapProposedDiff>(),
+    disposition: text("disposition").$type<GapFindingDisposition>().notNull().default("pending"),
+    openQuestionId: uuid("open_question_id"),
+    disposedBy: text("disposed_by").references(() => user.id, { onDelete: "set null" }),
+    disposedAt: timestamp("disposed_at", { withTimezone: true }),
+  },
+  (t) => [primaryKey({ columns: [t.runId, t.findingId] })],
+);
+
+/** What a person did with a finding. `pending` means nobody has acted yet. */
+export type GapFindingDisposition = "pending" | "question_opened" | "diff_accepted" | "dismissed";
+
+/**
+ * The publish lifecycle of one spec (ADR 0114 D10, R36).
+ *
+ * The states run forward only:
+ *
+ *   requested → pinned → artifact_published → complete
+ *              ↘ blocked
+ *
+ * `requested` records the intent, and a scanner drives every later step
+ * (ADR 0034). The checkpoint id and the artifact id are minted with the
+ * request, so a replayed step reuses them and the publish stays exactly-once.
+ *
+ * `blocked` is the one edge that does not go forward: the pin re-checks the
+ * gate against the revision it is about to pin, and a document that moved out
+ * of the gate lands here with the reason in `last_error`. Nothing was pinned,
+ * so the owner settles the section and publishes again. It is terminal until
+ * they do, because a publish must be a deliberate act on the pinned content.
+ */
+export type SpecPublishState =
+  | "requested"
+  | "pinned"
+  | "artifact_published"
+  | "complete"
+  | "blocked";
+
+/**
+ * One publish per spec. The primary key is the spec id because v1 has no
+ * unpublish and no revise (R38): rework is a new spec.
+ */
+export const specPublish = pgTable(
+  "spec_publish",
+  {
+    specId: uuid("spec_id")
+      .primaryKey()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    /** The drafting session, which carries the artifact bytes and the hand-off. */
+    sessionId: uuid("session_id").notNull(),
+    /** Minted with the request, so the pin inserts one checkpoint under replay. */
+    checkpointId: uuid("checkpoint_id").notNull(),
+    /** Minted with the request, so the artifact leg creates one artifact. */
+    artifactId: text("artifact_id").notNull(),
+    artifactVersion: integer("artifact_version"),
+    state: text("state").$type<SpecPublishState>().notNull(),
+    /** The approver identity, stamped from day one (R37, ADR 0114 D12). */
+    requestedBy: text("requested_by").references(() => user.id, { onDelete: "set null" }),
+    requestedAt: timestamp("requested_at", { withTimezone: true }).notNull(),
+    /** What the person acknowledged carrying into the tickets (R35). */
+    acknowledgedQuestionCount: integer("acknowledged_question_count").notNull().default(0),
+    acknowledgedQuestionIds: jsonb("acknowledged_question_ids").$type<string[]>().notNull(),
+    gapCheckRunId: uuid("gap_check_run_id"),
+    attempts: integer("attempts").notNull().default(0),
+    /** The scanner's claim and its backoff in one column. */
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull(),
+    lastError: text("last_error"),
+    pinnedAt: timestamp("pinned_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (t) => [
+    index("spec_publish_due_idx")
+      .on(t.nextAttemptAt)
+      .where(sql`${t.state} <> 'complete'`),
+  ],
+);
+
+/**
+ * One proposed ticket (ADR 0114 D6, R39-R40).
+ *
+ * The agent proposes the first tree from the *pinned* spec, and after that a
+ * person shapes it by hand: retitle, edit, split, merge, reorder, re-parent,
+ * add, delete. The tree is therefore ordinary mutable rows, not a projection
+ * of the agent's last proposal.
+ *
+ * `section_id` is the §backlink. Every draft carries one, and it always names
+ * a section of the pinned checkpoint, so a backlink stays resolvable for the
+ * life of the spec. The open questions a draft carries are derived from that
+ * same id (R29) rather than stored, so a re-parent or a merge can never leave
+ * a question attached to a ticket that no longer covers its section.
+ */
+export const specTicketDraft = pgTable(
+  "spec_ticket_draft",
+  {
+    id: uuid("id").primaryKey(),
+    specId: uuid("spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    /** Null for a root ticket. A delete takes the whole subtree with it. */
+    parentId: uuid("parent_id"),
+    /** Dense order among siblings, from 0. The service rewrites it on a move. */
+    ordinal: integer("ordinal").notNull(),
+    title: text("title").notNull(),
+    /** Markdown. It opens with the link back to the pinned section. */
+    description: text("description").notNull(),
+    /** The §backlink: a section of the pinned checkpoint. */
+    sectionId: text("section_id").notNull(),
+    /** Ids of sibling drafts this one waits for. */
+    dependsOn: jsonb("depends_on").$type<string[]>().notNull().default([]),
+    syncState: text("sync_state").$type<SpecTicketSyncState>().notNull().default("draft"),
+    linearId: text("linear_id"),
+    syncError: text("sync_error"),
+  },
+  (t) => [
+    index("spec_ticket_draft_tree_idx").on(t.specId, t.parentId, t.ordinal),
+    foreignKey({
+      columns: [t.parentId],
+      foreignColumns: [t.id],
+      name: "spec_ticket_draft_parent_id_fk",
+    }).onDelete("cascade"),
+  ],
+);
+
+/** The status of one reserved sync operation. */
+export type SpecTicketSyncOperationStatus = "reserved" | "complete" | "failed";
+
+/**
+ * The Linear sync idempotency ledger (ADR 0114 D6, N4).
+ *
+ * The shape is `coordination_operation` from ADR 0113: a primary key of
+ * (caller, operation, idempotency key), a canonical hash of the request, the
+ * ids the operation reserved before it ran, a status, and the result. The
+ * caller here is the spec, because a batch belongs to a spec and not to a
+ * session — the person who starts a sync may close the tab, and the batch must
+ * still finish.
+ *
+ * `reserved_external_id` is what makes a retry safe. A Linear issue id is
+ * chosen by us before the create, so a driver that dies between the create and
+ * the ledger write can look the issue up by that id and adopt it, instead of
+ * creating a second one.
+ */
+export const specTicketSyncOperation = pgTable(
+  "spec_ticket_sync_operation",
+  {
+    callerSpecId: uuid("caller_spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    operation: text("operation").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    requestHash: text("request_hash").notNull(),
+    status: text("status").$type<SpecTicketSyncOperationStatus>().notNull().default("reserved"),
+    reservedTicketId: uuid("reserved_ticket_id"),
+    /** The Linear id this operation will create, chosen before it runs. */
+    reservedExternalId: text("reserved_external_id"),
+    /** How many times a driver has run this operation. 0 means never. */
+    attempts: integer("attempts").notNull().default(0),
+    result: jsonb("result").$type<Record<string, unknown>>(),
+    error: text("error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [
+    primaryKey({ columns: [t.callerSpecId, t.operation, t.idempotencyKey] }),
+    index("spec_ticket_sync_operation_ticket_idx").on(t.reservedTicketId),
+  ],
+);
+
+/**
+ * The per-spec sync target (R45).
+ *
+ * Team, project and labels default from the org connector's configuration. A
+ * person may override them for one spec at sync time, and the override lands
+ * here — never back on the org default, which is the whole point of the
+ * requirement. A spec with no row uses the org defaults.
+ *
+ * The names ride beside the ids so the ledger can say "team · Platform"
+ * without a second call to Linear.
+ */
+export const specTicketSyncConfig = pgTable("spec_ticket_sync_config", {
+  specId: uuid("spec_id")
+    .primaryKey()
+    .references(() => spec.id, { onDelete: "cascade" }),
+  teamId: text("team_id"),
+  teamName: text("team_name"),
+  projectId: text("project_id"),
+  projectName: text("project_name"),
+  labelIds: jsonb("label_ids").$type<string[]>().notNull().default([]),
+  labelNames: jsonb("label_names").$type<string[]>().notNull().default([]),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow()
+    .$onUpdate(() => new Date()),
+});
 
 // ---------------------------------------------------------------------------
 // Papercuts

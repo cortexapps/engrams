@@ -21,7 +21,9 @@ use engram_core::traits::{Clock, MetadataStore};
 use engram_core::types::capture_job::{
     CaptureJobReport, CaptureJobStage, CaptureTerminalReport, NewCaptureJob,
 };
-use engram_core::types::host::{HostCapacity, HostHeartbeat, HostRecord, HostStatus};
+use engram_core::types::host::{
+    HostCapacity, HostHeartbeat, HostLeaseState, HostRecord, HostStatus,
+};
 use engram_core::types::image::ImageConfig;
 use engram_core::types::session::{SessionMode, SessionSpec, SessionState};
 use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState};
@@ -395,6 +397,9 @@ fn host_record(id: HostId, name: &str, now: chrono::DateTime<chrono::Utc>) -> Ho
         wire_version: 1,
         stages_images: false,
         capabilities: Default::default(),
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
     }
 }
 
@@ -416,6 +421,7 @@ fn heartbeat_fixture() -> HostHeartbeat {
         wire_version: 1,
         stages_images: false,
         capabilities: Default::default(),
+        lease_renew_until: None,
     }
 }
 
@@ -970,6 +976,171 @@ async fn queue_fifo(ctx: &Ctx) {
         q[1].queued_at < q[2].queued_at,
         "queued_at stamped at flip time"
     );
+}
+
+/// ADR 0116 A-D1..D4: the host binding lease — register replaces + bumps
+/// the epoch + ends a handoff; heartbeat renews with GREATEST and never
+/// demotes a handoff; handoff keeps the max deadline; the expiry list
+/// treats a NULL lease as expired (no lease ⇒ no shield), ignores
+/// cordons, and excludes future handoffs; `renew_host_lease` (the
+/// durable probe-rescue) GREATEST-extends, promotes `none`→`active`,
+/// never demotes a handoff, and refuses dead/unknown rows.
+async fn host_binding_lease(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let ttl = chrono::Duration::seconds(45);
+    let host = HostId::new();
+
+    let fetch = |meta: std::sync::Arc<dyn MetadataStore>, host: HostId| async move {
+        meta.list_active_hosts()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|h| h.id == host)
+            .expect("host row")
+    };
+
+    // Register: deadline replaced, Active, epoch 1.
+    let t0 = ctx.clock.now_utc();
+    let mut rec = host_record(host, "lease-host", t0);
+    rec.lease_expires_at = Some(t0 + ttl);
+    meta.upsert_host(rec.clone()).await.unwrap();
+    let row = fetch(meta.clone(), host).await;
+    assert_eq!(row.lease_expires_at, Some(t0 + ttl));
+    assert_eq!(row.lease_state, HostLeaseState::Active);
+    assert_eq!(row.lease_epoch, 1);
+
+    // Heartbeat renew extends (GREATEST over a later target).
+    ctx.clock.advance(Duration::from_secs(10));
+    let t1 = ctx.clock.now_utc();
+    let mut hb = heartbeat_fixture();
+    hb.lease_renew_until = Some(t1 + ttl);
+    meta.touch_host_heartbeat(host, hb.clone()).await.unwrap();
+    let row = fetch(meta.clone(), host).await;
+    assert_eq!(row.lease_expires_at, Some(t1 + ttl), "renew extends");
+    assert_eq!(row.lease_state, HostLeaseState::Active);
+
+    // Handoff: max deadline, state flips; a later racing heartbeat renew
+    // must neither shrink the deadline nor demote the state.
+    let handoff_until = t1 + chrono::Duration::seconds(600);
+    assert!(meta.begin_host_handoff(host, handoff_until).await.unwrap());
+    let mut hb2 = heartbeat_fixture();
+    hb2.lease_renew_until = Some(t1 + ttl);
+    meta.touch_host_heartbeat(host, hb2).await.unwrap();
+    let row = fetch(meta.clone(), host).await;
+    assert_eq!(
+        row.lease_expires_at,
+        Some(handoff_until),
+        "a predecessor's racing heartbeat never shrinks a handoff deadline"
+    );
+    assert_eq!(
+        row.lease_state,
+        HostLeaseState::Handoff,
+        "a heartbeat never demotes a declared handoff"
+    );
+    // Repeated handoff with an EARLIER deadline keeps the max.
+    assert!(meta
+        .begin_host_handoff(host, t1 + chrono::Duration::seconds(60))
+        .await
+        .unwrap());
+    let row = fetch(meta.clone(), host).await;
+    assert_eq!(row.lease_expires_at, Some(handoff_until));
+
+    // Successor register: REPLACES the (longer) handoff deadline —
+    // successor presence ends the handoff — Active, epoch 2.
+    ctx.clock.advance(Duration::from_secs(20));
+    let t2 = ctx.clock.now_utc();
+    let mut rec2 = host_record(host, "lease-host", t2);
+    rec2.lease_expires_at = Some(t2 + ttl);
+    meta.upsert_host(rec2).await.unwrap();
+    let row = fetch(meta.clone(), host).await;
+    assert_eq!(row.lease_expires_at, Some(t2 + ttl), "register replaces");
+    assert_eq!(row.lease_state, HostLeaseState::Active);
+    assert_eq!(row.lease_epoch, 2);
+
+    // Expiry list: a NULL-lease ready row is a candidate IMMEDIATELY
+    // (no lease ⇒ no shield), cordoned or not; a leased host is
+    // shielded until its deadline.
+    let unleased = HostId::new();
+    meta.upsert_host(host_record(unleased, "unleased-host", t2))
+        .await
+        .unwrap();
+    meta.set_host_cordoned(unleased, true).await.unwrap();
+    let expired: Vec<HostId> = meta
+        .list_lease_expired_hosts()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert!(
+        expired.contains(&unleased),
+        "a NULL lease reads as expired; cordon grants no shield"
+    );
+    assert!(!expired.contains(&host), "live lease shields");
+
+    // The durable probe-rescue: renew writes the unleased host's FIRST
+    // lease (`none` → `active`) and takes it off the candidate list.
+    assert!(meta.renew_host_lease(unleased, t2 + ttl).await.unwrap());
+    let row = fetch(meta.clone(), unleased).await;
+    assert_eq!(row.lease_expires_at, Some(t2 + ttl));
+    assert_eq!(row.lease_state, HostLeaseState::Active);
+    let expired = meta.list_lease_expired_hosts().await.unwrap();
+    assert!(expired.is_empty(), "rescue shields: {expired:?}");
+
+    ctx.clock.advance(Duration::from_secs(46));
+    let expired: Vec<HostId> = meta
+        .list_lease_expired_hosts()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert!(
+        expired.contains(&host),
+        "leased host expires at its deadline"
+    );
+    assert!(expired.contains(&unleased), "rescue expires at its TTL");
+
+    // A future handoff shields a host from the expiry list, and a
+    // racing rescue with an earlier deadline never shrinks it.
+    let t3 = ctx.clock.now_utc();
+    let handoff_shield = t3 + chrono::Duration::seconds(600);
+    assert!(meta.begin_host_handoff(host, handoff_shield).await.unwrap());
+    assert!(meta.renew_host_lease(host, t3 + ttl).await.unwrap());
+    let row = fetch(meta.clone(), host).await;
+    assert_eq!(
+        row.lease_expires_at,
+        Some(handoff_shield),
+        "a rescue never shrinks a handoff deadline"
+    );
+    assert_eq!(
+        row.lease_state,
+        HostLeaseState::Handoff,
+        "a rescue never demotes a declared handoff"
+    );
+    let expired: Vec<HostId> = meta
+        .list_lease_expired_hosts()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert!(
+        !expired.contains(&host),
+        "handoff shields until its deadline"
+    );
+
+    // Handoff and rescue on an unknown host: false. On a dead host: false.
+    assert!(!meta.begin_host_handoff(HostId::new(), t3).await.unwrap());
+    assert!(!meta
+        .renew_host_lease(HostId::new(), t3 + ttl)
+        .await
+        .unwrap());
+    meta.set_host_status(unleased, HostStatus::Dead)
+        .await
+        .unwrap();
+    assert!(!meta.begin_host_handoff(unleased, t3).await.unwrap());
+    assert!(!meta.renew_host_lease(unleased, t3 + ttl).await.unwrap());
 }
 
 /// Dead-host lease: acquire, contest, claimant-guarded release, stale
@@ -1722,53 +1893,63 @@ async fn gc_candidates(ctx: &Ctx) {
     );
 }
 
-/// Host staleness: cordoned hosts get the 10x-lenient bar; dead is
-/// sticky against heartbeats; mark_host_dead orphans with honest prevs
-/// and is idempotent.
+/// ADR 0116 A-D4 host death: the mark is lease-checked (a live lease
+/// aborts with Conflict; expiry-or-NULL proceeds), orphans with honest
+/// prevs, is idempotent, and dead is sticky against heartbeats.
 async fn host_lifecycle(ctx: &Ctx) {
     let meta = &ctx.meta;
     let now = ctx.clock.now_utc();
     let h1 = HostId::new();
     let h2 = HostId::new();
+    // h1 registers with NO lease (NULL = expired = markable); h2 with a
+    // live one.
     meta.upsert_host(host_record(h1, "conf-h1", now))
         .await
         .unwrap();
-    meta.upsert_host(host_record(h2, "conf-h2", now))
-        .await
-        .unwrap();
-    meta.set_host_cordoned(h2, true).await.unwrap();
+    let mut rec2 = host_record(h2, "conf-h2", now);
+    rec2.lease_expires_at = Some(now + chrono::Duration::seconds(45));
+    meta.upsert_host(rec2).await.unwrap();
 
-    assert!(meta.list_stale_hosts(30).await.unwrap().is_empty());
-    ctx.clock.advance(Duration::from_secs(31));
-    let stale: Vec<HostId> = meta
-        .list_stale_hosts(30)
-        .await
-        .unwrap()
-        .iter()
-        .map(|h| h.id)
-        .collect();
-    assert_eq!(stale, vec![h1], "cordoned host shielded at 1x staleness");
-    ctx.clock.advance(Duration::from_secs(270));
+    // A live lease aborts the mark with Conflict and changes NOTHING.
+    let sid2 = meta.create_session(spec("conf:shielded")).await.unwrap();
+    meta.assign_session_host(sid2, Some(h2)).await.unwrap();
+    let err = meta.mark_host_dead_if_lease_expired(h2).await.unwrap_err();
+    assert!(
+        matches!(err, MetaError::Conflict(_)),
+        "live lease must abort the mark with Conflict, got {err:?}"
+    );
+    assert_eq!(meta.host_status(h2).await.unwrap(), Some(HostStatus::Ready));
     assert_eq!(
-        meta.list_stale_hosts(30).await.unwrap().len(),
-        2,
-        "cordon shield expires at 10x"
+        meta.get_session(sid2).await.unwrap().status,
+        SessionState::Pending,
+        "an aborted mark must not touch the host's sessions"
     );
 
-    // Orphaning: honest prev states, idempotent.
+    // Orphaning on an expired (NULL) lease: honest prev states, idempotent.
     let sid = meta.create_session(spec("conf:orphan")).await.unwrap();
     meta.assign_session_host(sid, Some(h1)).await.unwrap();
-    let affected = meta.mark_host_dead_and_orphan_sessions(h1).await.unwrap();
+    let affected = meta.mark_host_dead_if_lease_expired(h1).await.unwrap();
     assert_eq!(affected, vec![(sid, SessionState::Pending)]);
     assert_eq!(
         meta.get_session(sid).await.unwrap().status,
         SessionState::HostLost
     );
     assert!(meta
-        .mark_host_dead_and_orphan_sessions(h1)
+        .mark_host_dead_if_lease_expired(h1)
         .await
         .unwrap()
         .is_empty());
+    // Unknown host: empty, not an error (idempotent with a raced delete).
+    assert!(meta
+        .mark_host_dead_if_lease_expired(HostId::new())
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Once h2's lease expires, the mark proceeds.
+    ctx.clock.advance(Duration::from_secs(46));
+    let affected = meta.mark_host_dead_if_lease_expired(h2).await.unwrap();
+    assert_eq!(affected, vec![(sid2, SessionState::Pending)]);
 
     // Dead is sticky against a Ready-claiming heartbeat.
     let hb = HostHeartbeat {
@@ -1782,6 +1963,7 @@ async fn host_lifecycle(ctx: &Ctx) {
         wire_version: 1,
         stages_images: false,
         capabilities: Default::default(),
+        lease_renew_until: None,
     };
     meta.touch_host_heartbeat(h1, hb).await.unwrap();
     assert_eq!(meta.host_status(h1).await.unwrap(), Some(HostStatus::Dead));
@@ -1789,6 +1971,12 @@ async fn host_lifecycle(ctx: &Ctx) {
     // ADR 0112 (D4 conformance for the util_committed_swap_mib column):
     // the heartbeat's committed-swap term round-trips into the host
     // read on BOTH stores — placement's floor math depends on it.
+    // A fresh host: h1 and h2 are both dead by this point.
+    let h3 = HostId::new();
+    let t = ctx.clock.now_utc();
+    meta.upsert_host(host_record(h3, "conf-h3", t))
+        .await
+        .unwrap();
     let util = engram_core::types::host::HostUtilization {
         disk_total_mib: 400_000,
         disk_used_mib: 100_000,
@@ -1797,7 +1985,7 @@ async fn host_lifecycle(ctx: &Ctx) {
     };
     let hb2 = HostHeartbeat {
         status: HostStatus::Ready,
-        capacity: host_record(h2, "conf-h2", now).capacity,
+        capacity: host_record(h3, "conf-h3", t).capacity,
         utilization: util,
         ready_images: Vec::new(),
         current_bundles: Vec::new(),
@@ -1806,17 +1994,18 @@ async fn host_lifecycle(ctx: &Ctx) {
         wire_version: 1,
         stages_images: false,
         capabilities: Default::default(),
+        lease_renew_until: None,
     };
-    meta.touch_host_heartbeat(h2, hb2).await.unwrap();
-    let h2_row = meta
+    meta.touch_host_heartbeat(h3, hb2).await.unwrap();
+    let h3_row = meta
         .list_active_hosts()
         .await
         .unwrap()
         .into_iter()
-        .find(|h| h.id == h2)
-        .expect("h2 active");
-    assert_eq!(h2_row.utilization.committed_swap_mib, 12_288);
-    assert_eq!(h2_row.utilization.disk_used_mib, 100_000);
+        .find(|h| h.id == h3)
+        .expect("h3 active");
+    assert_eq!(h3_row.utilization.committed_swap_mib, 12_288);
+    assert_eq!(h3_row.utilization.disk_used_mib, 100_000);
 }
 
 /// ADR 0035 amendment D2 (D4 conformance for `bundle_pin_set` + the
@@ -3089,6 +3278,7 @@ conformance!(
 );
 conformance!(t_queue_fifo, super::queue_fifo);
 conformance!(t_dead_host_lease, super::dead_host_lease);
+conformance!(t_host_binding_lease, super::host_binding_lease);
 conformance!(t_ops_pipeline, super::ops_pipeline);
 conformance!(t_ops_idempotency, super::ops_idempotency);
 conformance!(

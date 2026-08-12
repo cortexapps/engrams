@@ -76,6 +76,9 @@ async fn seed_host(meta: &Arc<dyn MetadataStore>, hostname: &str, allocatable_mi
         wire_version: 0,
         stages_images: false,
         capabilities: engram_core::types::host::HostCapabilities::default(),
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
     })
     .await
     .expect("upsert host");
@@ -95,6 +98,7 @@ async fn seed_host(meta: &Arc<dyn MetadataStore>, hostname: &str, allocatable_mi
             wire_version: engram_protocol::WIRE_VERSION,
             stages_images: false,
             capabilities: engram_core::types::host::HostCapabilities::default(),
+            lease_renew_until: None,
         },
     )
     .await
@@ -407,6 +411,7 @@ async fn ram_ledger_util_columns_round_trip_through_real_pg() {
             wire_version: engram_protocol::WIRE_VERSION,
             stages_images: false,
             capabilities: engram_core::types::host::HostCapabilities::default(),
+            lease_renew_until: None,
         },
     )
     .await

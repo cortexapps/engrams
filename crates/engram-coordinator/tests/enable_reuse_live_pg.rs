@@ -568,6 +568,9 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
         wire_version: 0,
         stages_images: false,
         capabilities: engram_core::types::host::HostCapabilities::default(),
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
     })
     .await
     .expect("hosts row");

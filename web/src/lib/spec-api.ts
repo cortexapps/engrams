@@ -13,6 +13,9 @@ export class SpecRequestError extends Error {
     readonly path: string,
     readonly status: number,
     detail?: string,
+    /** The parsed JSON body, when the handler answered with one. A refusal
+     *  that carries its own state (the publish gate) is read from here. */
+    readonly body?: unknown,
   ) {
     super(detail && detail.length > 0 ? detail : `${path} → ${status}`);
     this.name = "SpecRequestError";
@@ -26,27 +29,30 @@ export async function specRequest<T>(path: string, init?: RequestInit): Promise<
     ...init,
   });
   if (!response.ok) {
-    throw new SpecRequestError(path, response.status, await errorDetail(response));
+    const failure = await errorDetail(response);
+    throw new SpecRequestError(path, response.status, failure.detail, failure.body);
   }
   return response.json() as Promise<T>;
 }
 
 /** Hono's HTTPException answers with plain text; a handler may answer JSON. */
-async function errorDetail(response: Response): Promise<string> {
+async function errorDetail(response: Response): Promise<{ detail: string; body?: unknown }> {
   let raw: string;
   try {
     raw = await response.text();
   } catch {
-    return "";
+    return { detail: "" };
   }
   try {
     const body: unknown = JSON.parse(raw);
-    if (typeof body === "object" && body !== null && "message" in body) {
-      const message = (body as { message: unknown }).message;
-      if (typeof message === "string") return message;
+    if (typeof body === "object" && body !== null) {
+      const named = body as { message?: unknown; error?: unknown };
+      const detail = typeof named.message === "string" ? named.message : undefined;
+      const fallback = typeof named.error === "string" ? named.error : raw;
+      return { detail: detail ?? fallback, body };
     }
   } catch {
     // Plain text is the normal shape.
   }
-  return raw;
+  return { detail: raw };
 }

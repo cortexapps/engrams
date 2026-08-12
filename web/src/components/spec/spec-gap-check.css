@@ -1,0 +1,190 @@
+/* The gap-check surface (mock 2j). The matrix is the check: a requirement with
+   no coverage reads as an amber cell, so a spec that is only its deepest layer
+   fails here structurally (R31). */
+
+.spec-gap-check {
+  --spec-gap-rule: var(--border);
+  --spec-gap-caution-wash: color-mix(in oklab, var(--instrument-caution) 16%, var(--card));
+  display: grid;
+  gap: 1rem;
+}
+
+.spec-gap-check-head {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+}
+
+.spec-gap-check-title {
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.spec-gap-check-meta {
+  display: flex;
+  gap: 1.2rem;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--muted-foreground);
+}
+
+.spec-gap-check-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.4rem;
+}
+
+/* ----------------------------------------------------------------- matrix */
+
+.spec-gap-matrix-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--spec-gap-rule);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+
+.spec-gap-matrix {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 44rem;
+  font-size: 0.76rem;
+}
+
+.spec-gap-matrix th {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+  padding: 0.5rem 0.7rem;
+  text-align: left;
+  border-bottom: 1px solid var(--foreground);
+  white-space: nowrap;
+}
+
+.spec-gap-matrix td {
+  padding: 0.45rem 0.7rem;
+  border-bottom: 1px solid var(--spec-gap-rule);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  vertical-align: top;
+}
+
+.spec-gap-matrix tr:last-child td {
+  border-bottom: none;
+}
+
+/* The amber gap cell. */
+.spec-gap-cell {
+  background: var(--spec-gap-caution-wash);
+  color: var(--foreground);
+  font-weight: 600;
+}
+
+.spec-gap-requirement {
+  white-space: nowrap;
+  color: var(--foreground);
+}
+
+.spec-gap-requirement-id {
+  font-weight: 600;
+}
+
+.spec-gap-requirement-label {
+  color: var(--muted-foreground);
+}
+
+.spec-gap-citation {
+  display: block;
+  color: var(--muted-foreground);
+}
+
+.spec-gap-verdict {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.spec-gap-verdict-covered {
+  color: var(--instrument-nominal-ink);
+}
+
+.spec-gap-verdict-gap {
+  color: var(--instrument-critical);
+}
+
+.spec-gap-verdict-scope {
+  color: var(--instrument-caution-ink);
+}
+
+/* --------------------------------------------------------------- findings */
+
+.spec-gap-findings {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.spec-gap-finding {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  border: 1px solid var(--spec-gap-rule);
+  border-radius: 0.5rem;
+  padding: 0.55rem 0.75rem;
+  background: var(--card);
+  font-size: 0.82rem;
+}
+
+/* The outside-in stop reads as caution, not as an error: the pass worked. */
+.spec-gap-finding-fatal {
+  border-color: var(--instrument-caution);
+}
+
+.spec-gap-finding-disposed {
+  opacity: 0.62;
+}
+
+.spec-gap-finding-label {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+  margin-right: 0.5rem;
+}
+
+.spec-gap-finding-fatal .spec-gap-finding-label {
+  color: var(--instrument-caution-ink);
+}
+
+.spec-gap-finding-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-shrink: 0;
+}
+
+.spec-gap-finding-outcome {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+
+.spec-gap-suppressed {
+  font-size: 0.78rem;
+  color: var(--muted-foreground);
+}
+
+.spec-gap-empty {
+  border: 1px dashed var(--spec-gap-rule);
+  border-radius: var(--radius);
+  padding: 1rem;
+  font-size: 0.85rem;
+  color: var(--muted-foreground);
+}

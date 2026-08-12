@@ -13,8 +13,6 @@
 //! leaves trust them all.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,11 +20,9 @@ use async_trait::async_trait;
 use engram_core::types::integration::{CredentialPurpose, SessionTunnel};
 use engram_core::{HostId, SessionId};
 use engram_egress_proxy::{
-    CaSource, CertMint, GuestGatewayRegistry, InjectRefresher, Listeners, Proxy, ProxyConfig,
-    RefreshedInject, Registry, TunnelConnector,
+    CaSource, CertMint, EndpointFactory, GuestGatewayRegistry, InjectRefresher, Listeners, Proxy,
+    ProxyConfig, RefreshedInject, Registry, TunnelEndpoint,
 };
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpStream, UnixStream};
 
 use crate::coord_client::HttpCoordClient;
 
@@ -71,15 +67,18 @@ impl InjectRefresher for CoordInjectRefresher {
     }
 }
 
-/// Starts one host-local Cloud SQL Auth Proxy per guest database connection.
-/// OAuth tokens are passed only through the child environment.
-pub struct CoordCloudSqlConnector {
+/// Builds pooled Cloud SQL endpoints: mint the two connection
+/// credentials via the coordinator, then run the native connect protocol
+/// (`engram-cloud-sql`). No child process is involved; an endpoint is an
+/// ephemeral client certificate plus a TLS config, and every guest
+/// connection through it is one TLS stream to the instance.
+pub struct CloudSqlEndpointFactory {
     coord: HttpCoordClient,
     host_id: HostId,
+    http: reqwest::Client,
 }
 
 const CLOUD_SQL_CONNECTOR_KIND: &str = "gcp.cloud_sql";
-const CLOUD_SQL_STDERR_TAIL_BYTES: usize = 8 * 1024;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,9 +87,19 @@ struct CloudSqlTunnelConfig {
     database_user: String,
 }
 
-impl CoordCloudSqlConnector {
+impl CloudSqlEndpointFactory {
     pub fn new(coord: HttpCoordClient, host_id: HostId) -> Self {
-        Self { coord, host_id }
+        Self {
+            coord,
+            host_id,
+            // The sqladmin calls get their own bounded client so one stuck
+            // request cannot wedge an endpoint build past the pool's
+            // stale-serve window.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .expect("the sqladmin client builds from static settings"),
+        }
     }
 
     async fn token(
@@ -98,7 +107,7 @@ impl CoordCloudSqlConnector {
         session_id: SessionId,
         tunnel: &SessionTunnel,
         purpose: CredentialPurpose,
-    ) -> std::io::Result<String> {
+    ) -> std::io::Result<(String, chrono::DateTime<chrono::Utc>)> {
         let mint_source = tunnel.mint_source.as_ref().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -108,197 +117,94 @@ impl CoordCloudSqlConnector {
         self.coord
             .mint_connection_credential(self.host_id, session_id, mint_source, purpose)
             .await
-            .map(|response| response.secret)
+            .map(|response| (response.secret, response.expires_at))
             .map_err(|error| std::io::Error::other(error.to_string()))
     }
+}
 
-    async fn relay_inner(
+/// One pooled endpoint: the crate's immutable endpoint plus the
+/// credential-derived staleness deadline the tunnel pool rotates on.
+pub struct CloudSqlEndpoint {
+    inner: engram_cloud_sql::CloudSqlEndpoint,
+    stale_after: chrono::DateTime<chrono::Utc>,
+}
+
+#[async_trait]
+impl TunnelEndpoint for CloudSqlEndpoint {
+    type Conn = engram_cloud_sql::CloudSqlStream;
+
+    async fn connect(&self) -> std::io::Result<Self::Conn> {
+        self.inner.connect().await
+    }
+
+    fn stale_after(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        Some(self.stale_after)
+    }
+}
+
+#[async_trait]
+impl EndpointFactory for CloudSqlEndpointFactory {
+    type Endpoint = CloudSqlEndpoint;
+
+    fn kind(&self) -> &'static str {
+        CLOUD_SQL_CONNECTOR_KIND
+    }
+
+    async fn spawn_endpoint(
         &self,
-        downstream: &mut TcpStream,
-        initial_data: Vec<u8>,
         session_id: SessionId,
-        tunnel: SessionTunnel,
-        established: &mut bool,
-    ) -> std::io::Result<()> {
+        tunnel: &SessionTunnel,
+    ) -> std::io::Result<Self::Endpoint> {
         let config: CloudSqlTunnelConfig = serde_json::from_str(&tunnel.config_json)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let (api_token, login_token) = tokio::try_join!(
+        let instance = engram_cloud_sql::InstanceName::parse(&config.instance)?;
+        let mint_start = crate::time_source::metrics_now();
+        let ((api_token, _api_expires), (login_token, login_expires)) = tokio::try_join!(
             self.token(
                 session_id,
-                &tunnel,
+                tunnel,
                 CredentialPurpose::new("cloud_sql_admin")
             ),
             self.token(
                 session_id,
-                &tunnel,
+                tunnel,
                 CredentialPurpose::new("cloud_sql_login")
             ),
         )?;
-        // A private directory gives each relay its own socket namespace. A
-        // bind-then-drop TCP reservation can be stolen by another session
-        // before the child binds, which can cross-connect two tenants.
-        let socket_dir = cloud_sql_socket_dir()?;
-        let socket_path = cloud_sql_postgres_socket_path(socket_dir.path(), &config.instance);
+        let mint_ms = mint_start.elapsed().as_millis() as u64;
 
-        let binary = std::env::var_os("ENGRAM_CLOUD_SQL_PROXY")
-            .unwrap_or_else(|| "/usr/local/bin/cloud-sql-proxy".into());
-        let mut child = tokio::process::Command::new(binary)
-            .arg(&config.instance)
-            .arg("--auto-iam-authn")
-            .arg(format!("--unix-socket={}", socket_dir.path().display()))
-            .arg("--max-connections=1")
-            // Do not inherit host-agent credentials or deployment secrets.
-            .env_clear()
-            .env("CSQL_PROXY_TOKEN", api_token)
-            .env("CSQL_PROXY_LOGIN_TOKEN", login_token)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-        let stderr = child
-            .stderr
-            .take()
-            .expect("stderr was configured as a pipe");
-        let stderr_task = tokio::spawn(collect_stderr_tail(stderr));
+        let build_start = crate::time_source::metrics_now();
+        let endpoint = engram_cloud_sql::build_endpoint(engram_cloud_sql::EndpointRequest {
+            http: &self.http,
+            api_base: None,
+            instance: &instance,
+            admin_token: &api_token,
+            login_token: &login_token,
+            server_proxy_port_override: None,
+        })
+        .await?;
+        let build_ms = build_start.elapsed().as_millis() as u64;
 
-        let mut upstream = None;
-        let mut last_connect_error = None;
-        for _ in 0..100 {
-            if let Some(status) = child.try_wait()? {
-                let stderr = stderr_task.await.unwrap_or_default();
-                return Err(std::io::Error::other(format!(
-                    "Cloud SQL Auth Proxy exited before accepting a connection: {status}{}",
-                    stderr_context(&stderr),
-                )));
-            }
-            match UnixStream::connect(&socket_path).await {
-                Ok(stream) => {
-                    upstream = Some(stream);
-                    break;
-                }
-                Err(error) => {
-                    last_connect_error = Some(error);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
-        let Some(mut upstream) = upstream else {
-            let _ = child.kill().await;
-            let stderr = stderr_task.await.unwrap_or_default();
-            let connect_context = last_connect_error
-                .map(|error| format!("; last socket error: {error}"))
-                .unwrap_or_default();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "Cloud SQL Auth Proxy did not become ready{connect_context}{}",
-                    stderr_context(&stderr),
-                ),
-            ));
-        };
-
-        downstream
-            .write_all(b"HTTP/1.1 200 Connection Established\r\nEngram-Gateway: 1\r\n\r\n")
-            .await?;
-        *established = true;
-        if !initial_data.is_empty() {
-            upstream.write_all(&initial_data).await?;
-        }
+        // The ephemeral certificate IS the login credential and Google caps
+        // its NotAfter at the login token's expiry; the minimum keeps the
+        // deadline honest if that capping ever changes. The admin token only
+        // mattered during the build.
+        let stale_after = endpoint.cert_not_after().min(login_expires);
         tracing::info!(
             %session_id,
             tunnel_id = %tunnel.id,
             instance = %config.instance,
             database_user = %config.database_user,
-            "authorized session tunnel",
+            mint_ms,
+            build_ms,
+            %stale_after,
+            "built cloud sql tunnel endpoint",
         );
-        let relay_result = tokio::io::copy_bidirectional(downstream, &mut upstream).await;
-        let _ = child.kill().await;
-        let _ = stderr_task.await;
-        relay_result.map(|_| ())
+        Ok(CloudSqlEndpoint {
+            inner: endpoint,
+            stale_after,
+        })
     }
-}
-
-#[async_trait]
-impl TunnelConnector for CoordCloudSqlConnector {
-    fn kind(&self) -> &'static str {
-        CLOUD_SQL_CONNECTOR_KIND
-    }
-
-    async fn relay(
-        &self,
-        mut downstream: TcpStream,
-        initial_data: Vec<u8>,
-        session_id: SessionId,
-        tunnel: SessionTunnel,
-    ) -> std::io::Result<()> {
-        let mut established = false;
-        let result = self
-            .relay_inner(
-                &mut downstream,
-                initial_data,
-                session_id,
-                tunnel,
-                &mut established,
-            )
-            .await;
-        if let Err(error) = &result {
-            if !established {
-                let _ = write_tunnel_failure(&mut downstream, error).await;
-            }
-        }
-        result
-    }
-}
-
-fn cloud_sql_socket_dir() -> std::io::Result<tempfile::TempDir> {
-    tempfile::Builder::new()
-        .prefix("engram-cloud-sql-")
-        .tempdir()
-}
-
-fn cloud_sql_postgres_socket_path(socket_dir: &Path, instance: &str) -> PathBuf {
-    socket_dir.join(instance).join(".s.PGSQL.5432")
-}
-
-async fn collect_stderr_tail(mut stderr: tokio::process::ChildStderr) -> Vec<u8> {
-    let mut tail = Vec::new();
-    let mut chunk = [0_u8; 1024];
-    loop {
-        match stderr.read(&mut chunk).await {
-            Ok(0) | Err(_) => return tail,
-            Ok(read) => append_tail(&mut tail, &chunk[..read]),
-        }
-    }
-}
-
-fn append_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
-    tail.extend_from_slice(chunk);
-    if tail.len() > CLOUD_SQL_STDERR_TAIL_BYTES {
-        tail.drain(..tail.len() - CLOUD_SQL_STDERR_TAIL_BYTES);
-    }
-}
-
-fn stderr_context(stderr: &[u8]) -> String {
-    let stderr = String::from_utf8_lossy(stderr);
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        String::new()
-    } else {
-        format!("; stderr: {stderr}")
-    }
-}
-
-async fn write_tunnel_failure(
-    downstream: &mut (impl AsyncWrite + Unpin),
-    error: &std::io::Error,
-) -> std::io::Result<()> {
-    let body = format!("Cloud SQL tunnel failed: {error}\n");
-    let response = format!(
-        "HTTP/1.1 502 Bad Gateway\r\nEngram-Gateway: 1\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len(),
-    );
-    downstream.write_all(response.as_bytes()).await
 }
 
 /// Per-host egress-proxy handle. Holds the registry (mutated as
@@ -307,6 +213,10 @@ async fn write_tunnel_failure(
 /// trusts our leaves), and the spawned listener task.
 pub struct HostEgress {
     pub registry: Arc<Registry>,
+    /// The gateway's connector registry. Held so session teardown can
+    /// fan `session_closed` out to every tunnel upstream — the egress
+    /// `Registry` itself has no per-session teardown hook.
+    pub gateway: Arc<GuestGatewayRegistry>,
     /// CA cert PEM. Stamped into every harness substrate this host
     /// builds so the guest's trust store accepts our MITM leaves.
     pub ca_cert_pem: String,
@@ -387,7 +297,7 @@ impl HostEgress {
         proxy_cfg.guest_gateway_bind_addr = guest_gateway_bind_addr;
         proxy_cfg.observe_sink = observe_sink;
         proxy_cfg.inject_refresher = inject_refresher;
-        proxy_cfg.guest_gateway = guest_gateway;
+        proxy_cfg.guest_gateway = guest_gateway.clone();
         let proxy = Proxy::new(proxy_cfg);
 
         let listeners = bind_with_retry(&proxy).await.map_err(EgressError::Bind)?;
@@ -403,9 +313,19 @@ impl HostEgress {
 
         Ok(Self {
             registry,
+            gateway: guest_gateway,
             ca_cert_pem,
             _proxy_task: task,
         })
+    }
+
+    /// The single session-teardown entry point for egress state: drop the
+    /// session's registration AND tell every tunnel upstream to drop
+    /// session-scoped resources. Callers must use this, not
+    /// `registry.unregister` directly, or pooled upstream state leaks.
+    pub fn unregister_session(&self, session_id: SessionId) {
+        self.registry.unregister(session_id);
+        self.gateway.session_closed(session_id);
     }
 }
 
@@ -591,54 +511,6 @@ mod tests {
     use engram_core::types::integration::{CredentialMintSource, SessionTunnel};
     use engram_core::{SandboxId, SessionId};
     use std::net::Ipv4Addr;
-
-    #[test]
-    fn cloud_sql_relays_get_distinct_socket_namespaces() {
-        let first = cloud_sql_socket_dir().unwrap();
-        let second = cloud_sql_socket_dir().unwrap();
-        assert_ne!(first.path(), second.path());
-    }
-
-    #[tokio::test]
-    async fn cloud_sql_relay_connects_to_the_postgres_proxy_socket() {
-        // macOS limits Unix socket paths to 103 bytes. Use the system's short
-        // temp alias so this proxy-layout regression also runs in macOS CI.
-        let socket_dir = tempfile::Builder::new()
-            .prefix("csql-")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let instance = "test-project:test-region:test-instance";
-        let instance_dir = socket_dir.path().join(instance);
-        std::fs::create_dir(&instance_dir).unwrap();
-        let proxy_socket = instance_dir.join(".s.PGSQL.5432");
-        let _listener = tokio::net::UnixListener::bind(&proxy_socket).unwrap();
-
-        UnixStream::connect(cloud_sql_postgres_socket_path(socket_dir.path(), instance))
-            .await
-            .unwrap();
-    }
-
-    #[test]
-    fn cloud_sql_stderr_tail_is_bounded_and_keeps_the_newest_bytes() {
-        let mut tail = Vec::new();
-        append_tail(&mut tail, &vec![b'a'; CLOUD_SQL_STDERR_TAIL_BYTES]);
-        append_tail(&mut tail, b"diagnostic");
-        assert_eq!(tail.len(), CLOUD_SQL_STDERR_TAIL_BYTES);
-        assert!(tail.ends_with(b"diagnostic"));
-    }
-
-    #[tokio::test]
-    async fn cloud_sql_setup_failure_returns_an_actionable_bad_gateway() {
-        let (mut downstream, mut client) = tokio::io::duplex(4096);
-        let error = std::io::Error::other("invalid instance");
-        write_tunnel_failure(&mut downstream, &error).await.unwrap();
-        drop(downstream);
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
-        let response = String::from_utf8(response).unwrap();
-        assert!(response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"));
-        assert!(response.contains("Cloud SQL tunnel failed: invalid instance\n"));
-    }
 
     /// ADR 0056 (B′): `register_policy` translates a wire `EgressInjectEntry`
     /// (secret already resolved by the coordinator) into the proxy's

@@ -45,6 +45,15 @@ export const adminDrainHost = FleetService.method.adminDrainHost;
 export const cordonHost = FleetService.method.cordonHost;
 
 /**
+ * ADR 0116 A-D2: planned-handoff declaration (see the request message).
+ * Additive: an older coordinator answers Unimplemented and the caller
+ * proceeds under the legacy cordon shield.
+ *
+ * @generated from rpc engram.app.v1.FleetService.BeginHostHandoff
+ */
+export const beginHostHandoff = FleetService.method.beginHostHandoff;
+
+/**
  * @generated from rpc engram.app.v1.FleetService.UncordonHost
  */
 export const uncordonHost = FleetService.method.uncordonHost;

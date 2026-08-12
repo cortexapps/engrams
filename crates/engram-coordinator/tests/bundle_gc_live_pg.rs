@@ -303,6 +303,9 @@ async fn live_sandbox_and_stamp_pins_survive_sweep() {
         wire_version: 1,
         stages_images: false,
         capabilities: Default::default(),
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
     })
     .await
     .expect("upsert host");
@@ -328,6 +331,7 @@ async fn live_sandbox_and_stamp_pins_survive_sweep() {
             wire_version: 1,
             stages_images: false,
             capabilities: Default::default(),
+            lease_renew_until: None,
         },
     )
     .await

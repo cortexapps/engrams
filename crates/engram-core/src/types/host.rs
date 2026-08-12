@@ -391,6 +391,73 @@ pub struct HostRecord {
     /// placement gate, same posture as `wire_version == 0`.
     #[serde(default)]
     pub capabilities: HostCapabilities,
+    /// ADR 0116 A-D1: the binding-lease deadline (migration 0115).
+    /// Write side (`upsert_host`): the register-time renewal target
+    /// (`now + LEASE_TTL`), computed by the handler from the injected
+    /// clock — the store REPLACES the stored deadline with it
+    /// (successor presence ends a handoff early). Read side: the
+    /// current deadline. `None` = no renewal observed since the
+    /// migration; enforcement falls back to
+    /// `last_heartbeat_at + LEASE_TTL`.
+    #[serde(default)]
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    /// ADR 0116 A-D1: lease lifecycle state. Read-only on this struct —
+    /// `upsert_host` forces `Active`, `begin_host_handoff` sets
+    /// `Handoff`, heartbeats never demote a handoff.
+    #[serde(default)]
+    pub lease_state: HostLeaseState,
+    /// ADR 0116 A-D1: host-agent generation, bumped by every register.
+    /// Read-only on this struct (the store owns the bump).
+    #[serde(default)]
+    pub lease_epoch: u64,
+}
+
+/// ADR 0116 A-D2: hard ceiling on a declared handoff TTL, shared by the
+/// coordinator's clamp and the operator's own request sizing so the two
+/// can never disagree (#1218 review: a 1 h coordinator clamp silently
+/// truncated the operator's default ~102 min roll budget — the deadline
+/// could not cover exactly the long enable-work rolls it exists for).
+///
+/// The asymmetry that sizes it: a too-LONG shield on a genuinely dead
+/// host delays orphaning by at most this ceiling (bounded, recoverable —
+/// expiry still fires); a too-SHORT shield lets the dead-host path
+/// strike a mid-roll host and destroy healthy VMs (the 2026-08-12
+/// incident class). So the ceiling errs long: 24 h dominates any sane
+/// roll budget while still bounding how long a buggy declaration can
+/// wedge detection.
+pub const MAX_HANDOFF_TTL_SECS: u64 = 86_400;
+
+/// ADR 0116 A-D1: the host binding-lease lifecycle (migration 0115).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostLeaseState {
+    /// Pre-migration row / no renewal observed yet.
+    #[default]
+    None,
+    /// Heartbeat-sustained.
+    Active,
+    /// A planned operation declared a successor deadline; replaced by
+    /// `Active` on the successor's register, or consumed by expiry.
+    Handoff,
+}
+
+impl HostLeaseState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Active => "active",
+            Self::Handoff => "handoff",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(Self::None),
+            "active" => Some(Self::Active),
+            "handoff" => Some(Self::Handoff),
+            _ => None,
+        }
+    }
 }
 
 /// ADR 0047: everything a heartbeat persists, in one struct — the
@@ -416,6 +483,16 @@ pub struct HostHeartbeat {
     pub stages_images: bool,
     /// ADR 0068: this tick's re-probed capability vector.
     pub capabilities: HostCapabilities,
+    /// ADR 0116 A-D3: the lease renewal target for this tick
+    /// (`now + LEASE_TTL`, computed by the handler from the injected
+    /// clock — same single-clock posture as `HostRecord::
+    /// last_heartbeat_at`). The store applies it with GREATEST
+    /// semantics: a renewal never shrinks a longer (handoff) deadline,
+    /// and a heartbeat never demotes `Handoff` to `Active`. `None`
+    /// skips renewal entirely (legacy/mock callers); the production
+    /// handler always passes `Some` — the coordinator renews on every
+    /// heartbeat regardless of host-agent version.
+    pub lease_renew_until: Option<DateTime<Utc>>,
 }
 
 /// ADR 0048: per-host reserved budget across BOTH placement dimensions —

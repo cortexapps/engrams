@@ -4052,8 +4052,10 @@ impl MetadataStore for PostgresStore {
                                capacity_total_mib, capacity_used_mib,
                                running_sandboxes_count,
                                last_heartbeat_at, status, host_addr,
-                               capabilities, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                               capabilities, created_at,
+                               lease_expires_at, lease_state, lease_epoch)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    $14, CASE WHEN $14::timestamptz IS NULL THEN 'none' ELSE 'active' END, 1)
             ON CONFLICT (id) DO UPDATE SET
                 hostname                = EXCLUDED.hostname,
                 cloud_metadata          = EXCLUDED.cloud_metadata,
@@ -4066,7 +4068,20 @@ impl MetadataStore for PostgresStore {
                 status                  = EXCLUDED.status,
                 host_addr               = COALESCE(EXCLUDED.host_addr, hosts.host_addr),
                 capabilities            = EXCLUDED.capabilities,
-                updated_at              = $13
+                updated_at              = $13,
+                -- ADR 0116 A-D3: a register is a (possibly new) host-agent
+                -- generation adopting the host. It REPLACES the lease
+                -- deadline (successor presence ends a handoff early — no
+                -- GREATEST here, unlike the heartbeat renew), flips the
+                -- lease Active, and bumps the generation fence. A NULL
+                -- renewal target (legacy caller) leaves the lease columns
+                -- untouched.
+                lease_expires_at = COALESCE($14, hosts.lease_expires_at),
+                lease_state      = CASE WHEN $14::timestamptz IS NULL
+                                        THEN hosts.lease_state
+                                        ELSE 'active' END,
+                lease_epoch      = hosts.lease_epoch
+                                     + CASE WHEN $14::timestamptz IS NULL THEN 0 ELSE 1 END
             "#,
         )
         .bind(host.id.as_uuid())
@@ -4082,6 +4097,7 @@ impl MetadataStore for PostgresStore {
         .bind(host.host_addr.as_deref())
         .bind(capabilities)
         .bind(self.clock.now_utc())
+        .bind(host.lease_expires_at)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4111,6 +4127,7 @@ impl MetadataStore for PostgresStore {
                    util_committed_swap_mib,
                    ready_images, current_bundles, sandbox_bundles,
                    cordoned, total_vcpus, wire_version, stages_images, capabilities,
+                   lease_expires_at, lease_state, lease_epoch,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
             ORDER BY id
@@ -4161,7 +4178,7 @@ impl MetadataStore for PostgresStore {
         let placement_changed = sqlx::query_scalar::<_, bool>(
             // Issue #230: `dead` is terminal w.r.t. heartbeats — see
             // `HostStatus::can_transition_to`. The dead-host sweep
-            // (`mark_host_dead_and_orphan_sessions`) marks a partitioned
+            // (`mark_host_dead_if_lease_expired`) marks a partitioned
             // host `dead` and UNBINDS its sessions (host_id/sandbox_id
             // NULLed). Without this guard the host's very next heartbeat
             // blindly wrote `status = $2` (ready/draining from the agent's
@@ -4203,6 +4220,23 @@ impl MetadataStore for PostgresStore {
                       last_heartbeat_at = $21,
                       util_committed_swap_mib = $22,
                       sandbox_bundles = $23,
+                      -- ADR 0116 A-D3: the lease renewal rides the SAME
+                      -- per-heartbeat UPDATE (single writer, single clock).
+                      -- GREATEST: a predecessor's last racing heartbeat can
+                      -- never shrink a longer (handoff) deadline. The state
+                      -- CASE never demotes a declared handoff back to
+                      -- active — only a register (upsert_host) ends a
+                      -- handoff. A NULL renewal target (legacy/mock caller)
+                      -- leaves both columns untouched.
+                      lease_expires_at = CASE WHEN $24::timestamptz IS NULL
+                                              THEN hosts.lease_expires_at
+                                              ELSE GREATEST(COALESCE(hosts.lease_expires_at, $24), $24)
+                                         END,
+                      lease_state = CASE WHEN $24::timestamptz IS NULL
+                                              OR hosts.lease_state = 'handoff'
+                                         THEN hosts.lease_state
+                                         ELSE 'active'
+                                    END,
                       updated_at = $21
                  FROM previous
                 WHERE hosts.id = $1
@@ -4241,6 +4275,7 @@ impl MetadataStore for PostgresStore {
         .bind(self.clock.now_utc())
         .bind(hb.utilization.committed_swap_mib as i64)
         .bind(sandbox_bundles)
+        .bind(hb.lease_renew_until)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4279,10 +4314,41 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
-    async fn list_stale_hosts(&self, threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
-        // `make_interval` keeps the threshold parameterised without
-        // string-templating an INTERVAL literal. Cast to BIGINT so a
-        // very-large threshold (well past i32::MAX) doesn't overflow.
+    async fn begin_host_handoff(
+        &self,
+        id: HostId,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        // ADR 0116 A-D2: GREATEST — repeated/racing declarations keep the
+        // max deadline; a handoff can only lengthen the lease. `dead` rows
+        // are excluded (a handoff on a dead host is meaningless; the row
+        // returns via register, which re-leases).
+        let n = sqlx::query(
+            r#"UPDATE hosts
+                  SET lease_state = 'handoff',
+                      lease_expires_at = GREATEST(COALESCE(lease_expires_at, $2), $2),
+                      updated_at = $3
+                WHERE id = $1 AND status <> 'dead'"#,
+        )
+        .bind(id.as_uuid())
+        .bind(until)
+        .bind(self.clock.now_utc())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    async fn list_lease_expired_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
+        // ADR 0116 A-D4: the lease predicate — the death path's sole
+        // candidate source. A NULL lease reads as expired (no lease ⇒
+        // no shield; register and every heartbeat write one, so NULL on
+        // a ready row means the host never spoke post-migration — the
+        // death path's probe-rescue heals a live one by writing its
+        // first lease). Deliberately NO cordon multiplier — an explicit
+        // handoff deadline is the shield a planned operation gets. Only
+        // `ready` rows: draining/dead are host-affirmed states.
         let rows = sqlx::query(
             r#"
             SELECT id, hostname, cloud_metadata,
@@ -4296,28 +4362,13 @@ impl MetadataStore for PostgresStore {
                    util_committed_swap_mib,
                    ready_images, current_bundles, sandbox_bundles,
                    cordoned, total_vcpus, wire_version, stages_images, capabilities,
+                   lease_expires_at, lease_state, lease_epoch,
                    last_heartbeat_at, status, host_addr
               FROM hosts
-             -- Only `ready` hosts are strike-out candidates. A `draining`
-             -- host is host-reported operator territory (agent shutdown /
-             -- preStop), and a `cordoned` host is coordinator territory:
-             -- mid image-roll (where ADR 0044 K2 reattach keeps its VMs
-             -- alive across the brief pod-swap heartbeat gap) or mid
-             -- scale-down drain (ADR 0048). The detector must not race a
-             -- roll and route the reattaching sessions to Idle out from
-             -- under the successor — BUT a cordon must not shield a
-             -- genuinely-dead host forever (a wave victim that dies
-             -- mid-drain still needs its sessions rehomed), so cordoned
-             -- hosts are struck out at a 10× stale threshold (ADR 0047).
              WHERE status = 'ready'
-               AND (
-                     (NOT cordoned
-                      AND last_heartbeat_at < $2 - make_interval(secs => $1::bigint))
-                  OR last_heartbeat_at < $2 - make_interval(secs => $1::bigint * 10)
-               )
+               AND (lease_expires_at IS NULL OR lease_expires_at < $1)
             "#,
         )
-        .bind(threshold_secs as i64)
         .bind(self.clock.now_utc())
         .fetch_all(&self.pool)
         .await
@@ -4325,7 +4376,34 @@ impl MetadataStore for PostgresStore {
         rows.iter().map(row::host_from_row).collect()
     }
 
-    async fn mark_host_dead_and_orphan_sessions(
+    async fn renew_host_lease(
+        &self,
+        id: HostId,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        // ADR 0116 A-D4: the durable probe-rescue. GREATEST — a rescue
+        // can only lengthen the lease, never shorten a declared
+        // handoff; `none` promotes to `active` (the rescue IS the
+        // host's first lease), `handoff` is never demoted.
+        let n = sqlx::query(
+            r#"UPDATE hosts
+                  SET lease_expires_at = GREATEST(COALESCE(lease_expires_at, $2), $2),
+                      lease_state = CASE WHEN lease_state = 'none' THEN 'active'
+                                         ELSE lease_state END,
+                      updated_at = $3
+                WHERE id = $1 AND status <> 'dead'"#,
+        )
+        .bind(id.as_uuid())
+        .bind(until)
+        .bind(self.clock.now_utc())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    async fn mark_host_dead_if_lease_expired(
         &self,
         host_id: HostId,
     ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
@@ -4335,6 +4413,12 @@ impl MetadataStore for PostgresStore {
         // transition. Splitting the two stages keeps "host went away"
         // a distinct lifecycle moment from "session is unrecoverable."
         //
+        // ADR 0116 A-D4: the lease is re-checked under the row lock
+        // before anything changes. A renewal that landed since the
+        // caller's list read (heartbeat or probe-rescue) aborts the
+        // whole transaction with `Conflict` — the coordinator never
+        // revokes a binding whose lease is live.
+        //
         // RETURNING `id, prev_status` so the caller can emit honest
         // StatusChanged events. The `prev_status` is read inside the
         // same UPDATE via a CTE so we don't race with a concurrent
@@ -4342,6 +4426,30 @@ impl MetadataStore for PostgresStore {
         // the duration of this transaction.
         let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+
+        let host_row =
+            sqlx::query(r#"SELECT status, lease_expires_at FROM hosts WHERE id = $1 FOR UPDATE"#)
+                .bind(host_id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        let Some(host_row) = host_row else {
+            // No row: nothing to orphan (idempotent with a raced
+            // delete_host).
+            return Ok(Vec::new());
+        };
+        let status: String = sqlx::Row::try_get(&host_row, "status").map_err(db_err)?;
+        if status == "dead" {
+            // Idempotent: another replica already settled this host.
+            return Ok(Vec::new());
+        }
+        let lease: Option<DateTime<Utc>> =
+            sqlx::Row::try_get(&host_row, "lease_expires_at").map_err(db_err)?;
+        if lease.is_some_and(|expires| expires >= now) {
+            return Err(MetaError::Conflict(format!(
+                "host {host_id} lease renewed to {lease:?}; refusing to mark dead"
+            )));
+        }
 
         sqlx::query(r#"UPDATE hosts SET status = 'dead', updated_at = $2 WHERE id = $1"#)
             .bind(host_id.as_uuid())

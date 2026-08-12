@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { logger as honoLogger } from "hono/logger";
 import { createNodeWebSocket } from "@hono/node-ws";
@@ -69,6 +70,7 @@ import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
 import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread.ts";
 import { setReviewControlPlane } from "./workflows/pr-review.ts";
 import { setReviewIngressControlPlane } from "./workflows/review-ingress.ts";
+import { startSpecTicketSyncWorkflow } from "./workflows/spec-ticket-sync.ts";
 import { makeSlackPolicy } from "./integrations/slack-policy.ts";
 import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
 import { makeReviewControlPlane } from "./workflows/review-control-plane.ts";
@@ -93,6 +95,11 @@ import { PostgresOpenQuestionStore, OpenQuestionService } from "./specs/open-que
 import { SpecQuestionDocument } from "./specs/question-document.ts";
 import { PostgresSectionStateStore, SectionStateService } from "./specs/section-state-service.ts";
 import { PostgresSpecToolMetadataStore, SpecToolService } from "./specs/tool-service.ts";
+import {
+  PostgresPinnedSpecReader,
+  PostgresSpecTicketStore,
+  SpecTicketTreeService,
+} from "./specs/ticket-tree.ts";
 import { makeProfileStore } from "./db/profiles.ts";
 import { makeIntegrationConnectionStore } from "./db/integration-connections.ts";
 import { makeConnectorStore } from "./db/connectors.ts";
@@ -101,6 +108,7 @@ import { tools } from "./tools/registry.ts";
 import { renderReviewer } from "./reviewers/render.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
+import { makeSpecGapCheckRoute } from "./routes/spec-gap-check.ts";
 import { makeSpecRailRoute, PostgresSpecRailStore } from "./routes/spec-rail.ts";
 import { makeSpecAlternativesRoute } from "./routes/spec-alternatives.ts";
 import {
@@ -115,6 +123,23 @@ import { createTaskWithSession } from "./rpc/task-create.ts";
 import { makeUserSecretStore } from "./db/user-secrets.ts";
 import { productionSpecProjection } from "./specs/projection.ts";
 import { PostgresSpecCheckpointStore, SpecCheckpointService } from "./specs/checkpoints.ts";
+import { GapCheckService, PostgresGapCheckStore } from "./specs/gap-check.ts";
+import { PostgresSpecPublishStore, SpecPublishService } from "./specs/publish.ts";
+import {
+  productionSpecPublishArtifactPublisher,
+  productionSpecTicketizeHandoff,
+} from "./specs/publish-artifact.ts";
+import {
+  DEFAULT_SPEC_PUBLISH_SCANNER_CONFIG,
+  SpecPublishScanner,
+} from "./specs/publish-scanner.ts";
+import { makeSpecPublishRoute } from "./routes/spec-publish.ts";
+import { makeSpecTicketRoute } from "./routes/spec-tickets.ts";
+import { makeSpecTicketSyncRoute } from "./routes/spec-ticket-sync.ts";
+import { makeLinearIssueClient } from "./integrations/linear-issues.ts";
+import { SpecTicketSyncService } from "./specs/ticket-sync-service.ts";
+import { PostgresSpecTicketSyncStore } from "./specs/ticket-sync-store.ts";
+import { makeSpecTicketSyncConnector } from "./specs/ticket-sync-connector.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
@@ -136,6 +161,24 @@ const specAlternatives = new SpecAlternativesService({
   documents: specDocuments,
   now: specNow,
 });
+// The post-publish ticket tree (ADR 0114 D6). It reads the pinned checkpoint,
+// never the live head, so every §backlink stays resolvable.
+const specLinear = makeLinearIssueClient();
+const specTickets = new SpecTicketTreeService({
+  store: new PostgresSpecTicketStore(getPool()),
+  pinned: new PostgresPinnedSpecReader(getPool()),
+  newId: () => randomUUID(),
+});
+// Linear sync (ADR 0114 D6, N4). The route records the intent; a DBOS workflow
+// creates the issues, one durable step per ticket, so a pod roll resumes the
+// batch and the ledger keeps a retry from creating a second issue.
+const specTicketSync = new SpecTicketSyncService({
+  store: new PostgresSpecTicketSyncStore(getPool()),
+  linear: specLinear,
+  connector: makeSpecTicketSyncConnector(),
+  log: log.child({ component: "spec-ticket-sync" }),
+  start: startSpecTicketSyncWorkflow,
+});
 const specToolService = new SpecToolService({
   documents: specDocuments,
   sectionStates: specSectionStates,
@@ -147,11 +190,41 @@ const specToolService = new SpecToolService({
   }),
   questionStore: specOpenQuestions,
   metadata: new PostgresSpecToolMetadataStore(getPool(), specNow),
+  tickets: specTickets,
+  now: specNow,
+});
+const specRailStore = new PostgresSpecRailStore(getPool());
+const specGapCheck = new GapCheckService({
+  documents: specDocuments,
+  railStore: specRailStore,
+  store: new PostgresGapCheckStore(getPool()),
+  toolDocuments: specToolService,
   now: specNow,
 });
 const specParticipants = new PostgresSpecParticipantStore(getDb());
 const specCheckpointStore = new PostgresSpecCheckpointStore(getPool());
 const specCheckpoints = new SpecCheckpointService(specDocuments, specCheckpointStore);
+// The publish gate (ADR 0114 D10). The route records the intent; the scanner
+// pins the checkpoint, records the artifact version, and starts ticketize.
+const specPublishStore = new PostgresSpecPublishStore(getPool());
+const specPublish = new SpecPublishService({
+  store: specPublishStore,
+  railStore: specRailStore,
+  documents: specDocuments,
+  gapCheck: specGapCheck,
+  now: specNow,
+});
+const specPublishScanner = new SpecPublishScanner({
+  store: specPublishStore,
+  documents: specDocuments,
+  gate: specPublish,
+  checkpointStore: specCheckpointStore,
+  artifacts: productionSpecPublishArtifactPublisher(),
+  ticketize: productionSpecTicketizeHandoff(),
+  config: DEFAULT_SPEC_PUBLISH_SCANNER_CONFIG,
+  now: specNow,
+  log: log.child({ component: "spec-publish-scanner" }),
+});
 const warnSpecSync = (message: string) => log.warn({ message }, "spec sync warning");
 const specAwarenessBus = new PostgresSpecAwarenessBus(getPool(), { onWarning: warnSpecSync });
 const specSyncHub = new SpecSyncHub({
@@ -254,7 +327,7 @@ app.route(
 app.route(
   "/",
   makeSpecRailRoute({
-    store: new PostgresSpecRailStore(getPool()),
+    store: specRailStore,
     documents: specDocuments,
     sectionStates: specSectionStates,
     resolveMembership: resolveSpecMembership,
@@ -265,6 +338,36 @@ app.route(
   makeSpecAlternativesRoute({
     alternatives: specAlternatives,
     resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecGapCheckRoute({
+    gapCheck: specGapCheck,
+    resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecPublishRoute({
+    publish: specPublish,
+    wake: (specId) => specPublishScanner.wake(specId),
+    resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecTicketRoute({
+    tickets: specTickets,
+    resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecTicketSyncRoute({
+    sync: specTicketSync,
+    resolveMembership: resolveSpecMembership,
+    readWorkspace: () => specLinear.readWorkspace(),
   }),
 );
 app.route(
@@ -459,6 +562,7 @@ registerSpecTools(tools, {
   documents: specToolService,
   projection: productionSpecProjection,
   presence: specPresence,
+  gapCheck: specGapCheck,
 });
 const integrationConnections = makeIntegrationConnectionStore(getDb());
 const configuredConnectors = await loadRegistry(makeConnectorStore(getDb()));
@@ -502,6 +606,7 @@ const targetHydrator = new TargetHydrator({
 await targetHydrator.start();
 await specDocuments.startPeerSync();
 await specSyncHub.start();
+await specPublishScanner.start();
 const listenerManager = makeProductionListenerManager();
 await listenerManager.start();
 const automationScheduler = makeProductionAutomationScheduler();
@@ -526,6 +631,7 @@ process.on("SIGTERM", () => {
     oidcKeyRotation.stop();
     await automationScheduler.stop();
     await listenerManager.stop();
+    await specPublishScanner.stop();
     await specSyncHub.stop();
     await specDocuments.stopPeerSync();
     const serverError = await serverStopped;

@@ -129,6 +129,9 @@ async fn seed_fc_host(meta: &Arc<dyn MetadataStore>, fc_version: &str) -> HostId
             fc_snapshot_version: Some(fc_version.to_string()),
             wire_version: engram_protocol::WIRE_VERSION,
         },
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
     })
     .await
     .expect("upsert host");

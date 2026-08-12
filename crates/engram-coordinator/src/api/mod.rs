@@ -31,8 +31,9 @@ pub(crate) mod prompt;
 pub(crate) mod registries;
 pub(crate) mod session_auth;
 pub(crate) mod session_files;
-// `pub(crate)`: `evacuation::resolve_cold_boot_spec` (ADR 0028 Fix B)
-// reuses `cold_boot_spec` / the resource helpers from outside `api`.
+// `pub(crate)`: `boot_materializer` (ADR 0116) reuses the slot/harness
+// resolvers (`resolve_selected_skills`, `resolve_harness_mount`, …) from
+// outside `api`.
 pub(crate) mod sessions;
 pub(crate) mod sessions_inspect;
 pub mod snapshot;
@@ -65,6 +66,9 @@ pub fn router(state: SharedState) -> Router {
         .route("/admin/sessions/:id/resume", post(admin::resume_session))
         .route("/hosts/register", post(host_http::register))
         .route("/hosts/:id/heartbeat", post(host_http::heartbeat))
+        // ADR 0116 A-D2: the host's SIGTERM-ladder handoff belt (the
+        // operator's authoritative declaration rides app-gRPC instead).
+        .route("/hosts/:id/handoff", post(host_http::handoff))
         .route("/hosts/forge", post(forge::forge_forward))
         .route("/hosts/upload", post(upload::upload_forward))
         .route(

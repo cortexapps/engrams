@@ -156,6 +156,239 @@ fn unrecoverable_only_straggler_settles_dead_not_idle() {
     });
 }
 
+/// Park a session at Active with `host_id` + `sandbox_id` bound — the
+/// healthy shape a roll must carry through. Staged through legal FSM
+/// edges on the REAL store.
+async fn seed_bound_active(
+    meta: &Arc<SimMetadataStore>,
+    host: HostId,
+    sandbox: SandboxId,
+) -> SessionId {
+    let sid = meta
+        .create_session(SessionSpec {
+            image: "sim:lease".into(),
+            mode: SessionMode::Agent,
+        })
+        .await
+        .expect("create");
+    meta.assign_session_host(sid, Some(host))
+        .await
+        .expect("assign host");
+    meta.transition_session_created(sid, sandbox)
+        .await
+        .expect("created");
+    meta.transition_session(sid, SessionState::Active, BindingDisposition::Retain)
+        .await
+        .expect("active");
+    sid
+}
+
+fn host_lost_transitions(sim: &Sim, sid: SessionId) -> usize {
+    sim.world.meta.with_db(|db| {
+        db.transition_log
+            .iter()
+            .filter(|t| t.session == sid && t.to == SessionState::HostLost)
+            .count()
+    })
+}
+
+/// ADR 0116 A3 keystone: the 2026-08-12 incident replayed under the
+/// lease model. An operator roll declares a handoff, the predecessor
+/// pod goes silent for 5.5 sim-minutes (far past every retired
+/// staleness threshold), then the successor registers. The session
+/// must never leave Active and its binding must never be touched — in
+/// the incident, the staleness+strike path cleared the binding 44 s
+/// before the successor adopted the still-running VM, and the
+/// successor's teardown then destroyed the healthy VM.
+#[test]
+fn shielded_roll_keeps_the_session_bound_through_five_minutes_of_silence() {
+    on_sim(116_001, |mut sim| async move {
+        let host = sim.world.host_ids[0];
+        let sandbox = SandboxId::new();
+        let meta = sim.world.meta.clone();
+        let sid = seed_bound_active(&meta, host, sandbox).await;
+        place_live_sandbox(&sim, host, sandbox, sid);
+
+        // The fleet registers + heartbeats (leases written, ADR 0116 A-D1).
+        sim.execute(Step::HostHeartbeats).await;
+
+        // The operator declares the handoff BEFORE the pod delete —
+        // the roll_node ordering (A-D2). TTL sized like prod's roll
+        // shield.
+        let until = sim.world.clock.now_utc() + chrono::Duration::seconds(6120);
+        assert!(meta.begin_host_handoff(host, until).await.unwrap());
+
+        // The pod delete: the host-agent is GONE — heartbeats stop AND
+        // probes fail (the incident shape; under the retired staleness
+        // path this accumulated probe strikes and cleared the binding).
+        // The world keeps the sandbox map: the VMs live on the node,
+        // not in the pod.
+        sim.execute(Step::CrashHost(0)).await;
+        sim.execute(Step::AdvanceTime(Duration::from_secs(330)))
+            .await;
+
+        // The detector sweeps repeatedly across the silence window.
+        for _ in 0..3 {
+            sim.execute(Step::Driver(0, DriverKind::DeadHost)).await;
+            assert_eq!(
+                status(&sim, sid),
+                SessionState::Active,
+                "the handoff deadline shields the binding through the roll",
+            );
+        }
+        assert!(
+            sandbox_live(&sim, host, sandbox),
+            "the still-running VM must not be destroyed mid-roll"
+        );
+
+        // The successor pod comes up on the node (world: the host
+        // answers again, the surviving VMs still in place) and
+        // registers: fresh lease, epoch bump, handoff ends (A-D3).
+        sim.world
+            .host_world
+            .hosts
+            .lock()
+            .get_mut(&host)
+            .expect("host in world")
+            .up = true;
+        sim.execute(Step::HostRegister(0)).await;
+        sim.execute(Step::HostHeartbeats).await;
+        sim.execute(Step::Driver(0, DriverKind::DeadHost)).await;
+
+        assert_eq!(
+            status(&sim, sid),
+            SessionState::Active,
+            "the session never left Active across the whole roll",
+        );
+        assert_eq!(
+            host_lost_transitions(&sim, sid),
+            0,
+            "the binding was never revoked — no HostLost transition ever fired",
+        );
+        assert!(sandbox_live(&sim, host, sandbox));
+    });
+}
+
+/// The control leg: the same shape WITHOUT a handoff declaration — a
+/// `kill -9` (SIGKILL/preemption writes no marker by design). The lease
+/// expires at its 45 s TTL, the probe finds the host unreachable, and
+/// the explicit death path settles the checkpointed session to Idle.
+#[test]
+fn unshielded_death_settles_idle_after_lease_expiry() {
+    on_sim(116_002, |mut sim| async move {
+        let host = sim.world.host_ids[0];
+        let sandbox = SandboxId::new();
+        let meta = sim.world.meta.clone();
+        let sid = seed_bound_active(&meta, host, sandbox).await;
+        place_live_sandbox(&sim, host, sandbox, sid);
+        sim.execute(Step::HostHeartbeats).await;
+        // A recoverable checkpoint exists, so stage-2 routes Idle.
+        let now = sim.world.clock.now_utc();
+        record_snapshot(&meta, sid, true, now).await;
+
+        // kill -9: the machine is gone (VMs die with it), no handoff.
+        sim.execute(Step::CrashHost(0)).await;
+
+        // Inside the lease TTL nothing happens — silence alone is not
+        // yet expiry.
+        sim.execute(Step::AdvanceTime(Duration::from_secs(30)))
+            .await;
+        sim.execute(Step::Driver(0, DriverKind::DeadHost)).await;
+        assert_eq!(
+            status(&sim, sid),
+            SessionState::Active,
+            "inside the lease TTL the binding holds",
+        );
+
+        // Past the TTL the lease is expired, the probe fails, and the
+        // death path runs both stages.
+        sim.execute(Step::AdvanceTime(Duration::from_secs(20)))
+            .await;
+        sim.execute(Step::Driver(0, DriverKind::DeadHost)).await;
+        assert_eq!(
+            status(&sim, sid),
+            SessionState::Idle,
+            "an expired lease + failed probe settles the checkpointed session to Idle",
+        );
+    });
+}
+
+/// The rk28 shape under the lease model: heartbeats vanish (a peer
+/// pod's PG pool saturated) while the host itself stays up and answers
+/// the probe. The rescue durably renews the lease — the session stays
+/// bound through arbitrarily many detector sweeps, with no in-memory
+/// strike/grace machinery involved.
+#[test]
+fn probe_rescue_durably_renews_and_the_binding_holds() {
+    on_sim(116_003, |mut sim| async move {
+        let host = sim.world.host_ids[0];
+        let sandbox = SandboxId::new();
+        let meta = sim.world.meta.clone();
+        let sid = seed_bound_active(&meta, host, sandbox).await;
+        place_live_sandbox(&sim, host, sandbox, sid);
+        sim.execute(Step::HostHeartbeats).await;
+
+        // Heartbeats stop; the host stays up (answers RPCs).
+        sim.execute(Step::HeartbeatPartition(0, true)).await;
+
+        for round in 0..3 {
+            // Well past the lease TTL each round — without the durable
+            // rescue every sweep after the first would kill the host.
+            sim.execute(Step::AdvanceTime(Duration::from_secs(60)))
+                .await;
+            sim.execute(Step::Driver(0, DriverKind::DeadHost)).await;
+            assert_eq!(
+                status(&sim, sid),
+                SessionState::Active,
+                "round {round}: the answered probe renews the lease durably; the binding holds",
+            );
+        }
+        let lease = sim
+            .world
+            .meta
+            .with_db(|db| db.hosts.get(&host).and_then(|h| h.lease_expires_at));
+        assert!(
+            lease.is_some_and(|e| e >= sim.world.clock.now_utc()),
+            "the rescue WROTE the reprieve: the lease is live in the store, not in a \
+             per-replica strike map ({lease:?})",
+        );
+    });
+}
+
+/// NON-VACUITY: the lease-liveness oracle FIRES when a binding is
+/// revoked (HostLost, bindings cleared) while the host's lease is
+/// live, and stays quiet on a legal revocation after expiry.
+#[test]
+fn lease_liveness_oracle_fires_on_a_revocation_under_a_live_lease() {
+    on_sim(116_004, |mut sim| async move {
+        let host = sim.world.host_ids[0];
+        let sandbox = SandboxId::new();
+        let meta = sim.world.meta.clone();
+        let sid = seed_bound_active(&meta, host, sandbox).await;
+        sim.execute(Step::HostHeartbeats).await;
+
+        let mut oracles = engram_dst::invariants::Oracles::default();
+        oracles
+            .check_step(&sim.world)
+            .expect("a bound Active session under a live lease is legal");
+
+        // The bad actor: clear the binding and flip HostLost while the
+        // lease is live — exactly what the retired staleness path did
+        // to the incident session.
+        sim.world.meta.with_db_mut(|db| {
+            let row = db.sessions.get_mut(&sid).expect("session row");
+            row.session.host_id = None;
+            row.session.sandbox_id = None;
+            row.session.status = SessionState::HostLost;
+        });
+        let violation = oracles
+            .check_step(&sim.world)
+            .expect_err("revoking a binding under a live lease must fire");
+        assert_eq!(violation.invariant, "lease-liveness");
+        let _ = sandbox;
+    });
+}
+
 /// Commit 2 (ask-the-host): a bound HostLost straggler whose host still
 /// reports the sandbox SERVING (a live VM under a HostLost row — the >60s
 /// partition/desync window) must NOT be destroyed on the first sweep. The

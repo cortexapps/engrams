@@ -267,6 +267,12 @@ async fn main() -> Result<(), HostAgentError> {
     // available as soon as the process is up.
     engram_host_agent::metrics::init(cli.metrics_addr);
 
+    // ADR 0116 C1: the executor-starvation probe — a 100 ms tick whose
+    // observed lateness is the "runnable tasks are waiting on workers"
+    // signal (the NBD serve loops share this runtime until C3 isolates
+    // them). Held for the process lifetime.
+    let _sched_delay_probe = engram_host_agent::metrics::spawn_sched_delay_probe();
+
     // #1003: SIGUSR2 → symbolized pprof heap dump; allocator stats as
     // Prometheus gauges every 30 s. Dumps land in the work_dir (the
     // node volume — survives the OOM kill the dump is usually for).
@@ -704,14 +710,22 @@ async fn main() -> Result<(), HostAgentError> {
             engram_host_agent::coord_client::HttpCoordClient::new(refresh_coord_url, refresh_token),
             host_id,
         ));
-    let cloud_sql_connector: Arc<dyn engram_egress_proxy::TunnelConnector> =
-        Arc::new(engram_host_agent::egress::CoordCloudSqlConnector::new(
+    // The pooled Cloud SQL upstream: one native endpoint per (session,
+    // tunnel), rotated before credential expiry. The reaper task reaps
+    // idle endpoints and pre-rotates near-stale ones; it holds only a
+    // weak reference, so it ends with the pool.
+    let cloud_sql_pool = Arc::new(engram_egress_proxy::TunnelPool::new(
+        engram_host_agent::egress::CloudSqlEndpointFactory::new(
             engram_host_agent::coord_client::HttpCoordClient::new(
                 cloud_sql_coord_url,
                 cloud_sql_token,
             ),
             host_id,
-        ));
+        ),
+        engram_egress_proxy::PoolConfig::default(),
+    ));
+    let _cloud_sql_reaper = cloud_sql_pool.spawn_reaper(std::time::Duration::from_secs(30));
+    let cloud_sql_connector: Arc<dyn engram_egress_proxy::TunnelUpstream> = cloud_sql_pool;
     match build_host_egress(
         &cli,
         Some(observe_sink),

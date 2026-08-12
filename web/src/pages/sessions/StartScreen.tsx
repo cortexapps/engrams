@@ -221,18 +221,23 @@ export function StartScreen() {
   const effectiveUserEnv = effectiveHarness?.descriptor?.auth?.userEnv;
   const effectiveOAuth = effectiveHarness?.descriptor?.auth?.userOauth?.provider;
   const userEnvHint = effectiveHarness?.descriptor?.auth?.userEnvHint;
+  // `/me/harness-env` and `/me/credentials` land after the first paint, so their
+  // data is `undefined` for the first frames — UNKNOWN, not "missing". Reading
+  // undefined as missing flashed the caution box (and disabled Launch) on every
+  // load until the fetch resolved. Every check below holds at "not missing"
+  // while the list is unknown, so the box only pops in once a credential is
+  // known to be absent. No loader: a credential the user HAS never blinks.
   const userEnvMissing =
     !!effectiveUserEnv &&
-    (harnessEnvVars?.some((v) => v.envVar === effectiveUserEnv && !v.present) ?? false);
+    !!harnessEnvVars?.some((v) => v.envVar === effectiveUserEnv && !v.present);
   const oauthMissing =
     !!effectiveOAuth &&
-    !(
-      credentials?.some(
-        (credential) =>
-          credential.kind === "oauth" &&
-          credential.provider === effectiveOAuth &&
-          credential.connected,
-      ) ?? false
+    credentials !== undefined &&
+    !credentials.some(
+      (credential) =>
+        credential.kind === "oauth" &&
+        credential.provider === effectiveOAuth &&
+        credential.connected,
     );
   // ADR 0115: the profile's user-scoped integrations require the launching
   // user's PERSONAL credential — mirror the server gate (which requires a
@@ -253,7 +258,7 @@ export function StartScreen() {
     );
   }, [selected, views]);
   const connectorsMissing = useMemo(() => {
-    if (!selected) return [];
+    if (!selected || credentials === undefined) return [];
     const byConnection = new Map(
       views
         .filter((view) => view.defaultConnectionId !== "")
@@ -266,14 +271,12 @@ export function StartScreen() {
     const unique = [...new Map(required.map((view) => [view!.provider, view!])).values()];
     return unique.filter(
       (view) =>
-        !(
-          credentials?.some(
-            (credential) =>
-              credential.kind === "connector" &&
-              credential.provider === view.provider &&
-              credential.connected &&
-              credential.status === "connected",
-          ) ?? false
+        !credentials.some(
+          (credential) =>
+            credential.kind === "connector" &&
+            credential.provider === view.provider &&
+            credential.connected &&
+            credential.status === "connected",
         ),
     );
   }, [selected, views, credentials]);

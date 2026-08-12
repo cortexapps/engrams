@@ -162,6 +162,13 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
     let capabilities: engram_core::types::host::HostCapabilities =
         serde_json::from_value(row.try_get("capabilities").map_err(col_err)?)
             .map_err(|e| MetaError::Serialization(format!("hosts.capabilities decode: {e}")))?;
+    // ADR 0116 A-D1 (migration 0115): the binding lease.
+    let lease_expires_at: Option<DateTime<Utc>> =
+        row.try_get("lease_expires_at").map_err(col_err)?;
+    let lease_state: String = row.try_get("lease_state").map_err(col_err)?;
+    let lease_state = engram_core::types::host::HostLeaseState::parse(&lease_state)
+        .ok_or_else(|| MetaError::Serialization(format!("hosts.lease_state: {lease_state:?}")))?;
+    let lease_epoch: i64 = row.try_get("lease_epoch").map_err(col_err)?;
     Ok(HostRecord {
         id: HostId(id),
         hostname: row.try_get("hostname").map_err(col_err)?,
@@ -197,6 +204,9 @@ pub(crate) fn host_from_row(row: &PgRow) -> Result<HostRecord, MetaError> {
         wire_version: wire_version.max(0) as u32,
         stages_images,
         capabilities,
+        lease_expires_at,
+        lease_state,
+        lease_epoch: lease_epoch.max(0) as u64,
     })
 }
 

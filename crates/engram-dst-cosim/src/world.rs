@@ -148,7 +148,7 @@ impl CosimWorld {
             .meta
             .touch_host_heartbeat(
                 self.host_id,
-                host_heartbeat(current_bundles, sandbox_bundles),
+                host_heartbeat(&self.clock, current_bundles, sandbox_bundles),
             )
             .await;
     }
@@ -282,6 +282,7 @@ fn host_capacity() -> HostCapacity {
 }
 
 fn host_heartbeat(
+    clock: &Arc<SimClock>,
     current_bundles: Vec<engram_core::types::sandbox::AuxBundleRef>,
     sandbox_bundles: Vec<engram_core::types::sandbox::SandboxAuxBundles>,
 ) -> HostHeartbeat {
@@ -296,6 +297,10 @@ fn host_heartbeat(
         wire_version: 1,
         stages_images: false,
         capabilities: Default::default(),
+        // ADR 0116 A-D1: every heartbeat renews the binding lease,
+        // exactly like the prod handler — a NULL lease reads as
+        // expired and would put the whole cosim fleet on death row.
+        lease_renew_until: Some(clock.now_utc() + engram_coordinator::config::host_lease_ttl()),
     }
 }
 
@@ -317,5 +322,9 @@ fn host_record(id: HostId, clock: &Arc<SimClock>) -> HostRecord {
         wire_version: 1,
         stages_images: false,
         capabilities: Default::default(),
+        // ADR 0116 A-D1: register writes the lease outright.
+        lease_expires_at: Some(clock.now_utc() + engram_coordinator::config::host_lease_ttl()),
+        lease_state: Default::default(),
+        lease_epoch: 0,
     }
 }

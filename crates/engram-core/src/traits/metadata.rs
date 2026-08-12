@@ -1689,20 +1689,72 @@ pub trait MetadataStore: Send + Sync {
     /// pod churn must stick).
     async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError>;
 
-    /// List hosts whose `last_heartbeat_at` is older than `threshold_secs`
-    /// AND whose status is `Ready`. The dead-host detector polls this every
-    /// ~10s and races other coordinator replicas via `pg_try_advisory_lock`
-    /// for the right to evict each candidate. `Dead` rows are filtered out so
-    /// a still-running replica's detector doesn't re-kill them; `Draining`
-    /// rows are filtered out because they're operator-managed (mid image-roll
-    /// — where ADR 0044 K2 reattach keeps the VMs alive across the pod-swap
-    /// heartbeat gap — or mid node-removal), so the detector must not race the
-    /// operator and route a reattaching host's sessions to Idle.
-    async fn list_stale_hosts(&self, threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError>;
+    /// ADR 0116 A-D2: declare a planned handoff for `id` — extend the
+    /// binding-lease deadline to at least `until` and flip
+    /// `lease_state = 'handoff'`. Written by the operator (before a
+    /// roll's pod delete) and by the host's SIGTERM ladder (best-effort
+    /// belt); GREATEST semantics, so repeated/racing declarations keep
+    /// the max deadline. Returns `false` when no row exists (or the
+    /// host is `dead` — a handoff on a dead host is meaningless).
+    /// Default body is a mock no-op (`Ok(false)`); PG and sim implement
+    /// the real semantics (conformance: `t_host_binding_lease`).
+    async fn begin_host_handoff(
+        &self,
+        id: HostId,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        let _ = (id, until);
+        Ok(false)
+    }
 
-    /// Atomically (a) mark `host_id` as `Dead`, (b) clear `host_id`
-    /// and `sandbox_id` on every non-terminal session pointed at it,
+    /// ADR 0116 A-D4: hosts whose binding lease has expired — `ready`
+    /// rows with `lease_expires_at < now`, where a NULL lease reads as
+    /// expired (no lease ⇒ no shield; register and every heartbeat
+    /// write one, so a NULL on a ready row means the host never spoke
+    /// post-migration — the probe-rescue in the death path heals a
+    /// live one by writing its first lease). The A1 mixed-fleet
+    /// COALESCE fallback on `last_heartbeat_at` is retired: the fleet
+    /// has re-registered under the lease substrate. Deliberately NO
+    /// cordon multiplier: an explicit handoff deadline is the shield a
+    /// planned operation gets. This is the death path's sole candidate
+    /// source. Default body is a mock no-op (`Ok(vec![])`); PG and sim
+    /// implement the real predicate.
+    async fn list_lease_expired_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0116 A-D4: durably renew `id`'s binding lease to at least
+    /// `until` — the probe-rescue path. A host that answers a Ping
+    /// while its lease is expired is alive (the lease lapsed because
+    /// heartbeat persistence failed, not the host); the rescue writes
+    /// the reprieve into the row so EVERY replica's detector honors it,
+    /// replacing the per-replica in-memory strike/grace memory. GREATEST
+    /// semantics like `begin_host_handoff` (a rescue can only lengthen
+    /// the lease, and never shortens a declared handoff); promotes
+    /// `lease_state` from `none` to `active` but never demotes
+    /// `handoff`. Returns `false` when no row exists or the host is
+    /// `dead`. Default body is a mock no-op (`Ok(false)`).
+    async fn renew_host_lease(
+        &self,
+        id: HostId,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        let _ = (id, until);
+        Ok(false)
+    }
+
+    /// Atomically, and only while `host_id`'s binding lease is still
+    /// expired: (a) mark the host `Dead`, (b) clear `host_id` and
+    /// `sandbox_id` on every non-terminal session pointed at it,
     /// (c) transition those sessions to `HostLost`.
+    ///
+    /// ADR 0116 A-D4: the lease is re-checked under the row lock in
+    /// the same transaction. A lease renewed since the caller's
+    /// `list_lease_expired_hosts` read (a heartbeat or probe-rescue
+    /// landed in the window) aborts with `MetaError::Conflict` and
+    /// changes nothing — the coordinator never revokes a binding whose
+    /// lease is live. A NULL lease reads as expired, matching the list
+    /// predicate.
     ///
     /// ADR 0015 M2: the orphaned sessions move to `HostLost` rather
     /// than straight to `Dead`. The caller then runs a per-session
@@ -1716,11 +1768,11 @@ pub trait MetadataStore: Send + Sync {
     /// Returns `(SessionId, previous_state)` pairs so the caller can
     /// emit honest `StatusChanged { from: previous_state, to:
     /// HostLost }` events instead of hand-encoding a placeholder
-    /// `from`. Postgres uses a single transaction; the Mock takes
-    /// its sessions mutex once. Idempotent on a host already marked
-    /// Dead — returns an empty vec since no sessions still point at
-    /// it.
-    async fn mark_host_dead_and_orphan_sessions(
+    /// `from`. Postgres uses a single transaction; the sim takes its
+    /// state mutex once. Idempotent on a host already marked Dead —
+    /// returns an empty vec since no sessions still point at it — and
+    /// on a missing row (empty vec: nothing to orphan).
+    async fn mark_host_dead_if_lease_expired(
         &self,
         host_id: HostId,
     ) -> Result<Vec<(SessionId, SessionState)>, MetaError>;
@@ -1728,7 +1780,7 @@ pub trait MetadataStore: Send + Sync {
     /// Current status of a single host row, `None` when no row exists.
     /// The dead-host detector re-checks this after winning the eviction
     /// lease — another replica may have flipped the host Dead in the
-    /// window since `list_stale_hosts`. Default (mock): no row.
+    /// window since `list_lease_expired_hosts`. Default (mock): no row.
     async fn host_status(&self, host_id: HostId) -> Result<Option<HostStatus>, MetaError> {
         let _ = host_id;
         Ok(None)

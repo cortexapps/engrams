@@ -1509,6 +1509,9 @@ mod tests {
             wire_version: 0,
             stages_images: true,
             capabilities: Default::default(),
+            lease_expires_at: None,
+            lease_state: Default::default(),
+            lease_epoch: 0,
         }
     }
 

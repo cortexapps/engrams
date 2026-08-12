@@ -200,6 +200,43 @@ mod tests {
         assert_eq!(p.key_id(), "test:v1");
     }
 
+    /// KNOWN-ANSWER test: a stored KEK still decodes to the same key.
+    ///
+    /// Every other test here is self-consistent — it encodes bytes and decodes
+    /// them back with the same `base64` — so an alphabet or padding change
+    /// would keep them all green while silently turning every KEK already in a
+    /// secret manager into a different 32 bytes. Sealed data would then fail to
+    /// unwrap in production, not in CI.
+    ///
+    /// The literal is RFC 4648 standard base64 of the bytes 0x00..=0x1f. It is
+    /// pinned to a literal, so a `base64` bump that moved the decoding fails
+    /// here instead. If this fails, that is a re-key migration, not a new
+    /// expected value.
+    #[tokio::test]
+    async fn stored_kek_base64_decodes_to_the_same_key() {
+        const STORED: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        let expected: [u8; 32] = std::array::from_fn(|i| i as u8);
+
+        // Decoding is not observable directly (the key bytes are private), so
+        // prove it by key agreement: a provider built from the stored string
+        // must unwrap what a provider built from the literal bytes wrapped.
+        let from_stored = EnvVarKeyProvider::from_base64(STORED, "kat:v1").unwrap();
+        let from_literal = EnvVarKeyProvider::from_bytes(expected, "kat:v1");
+
+        let dek = [9u8; 32];
+        let wrapped = from_literal.wrap(&dek).await.unwrap();
+        assert_eq!(
+            from_stored.unwrap(&wrapped).await.unwrap(),
+            dek,
+            "base64 decoding of a stored KEK moved — sealed data would not unwrap"
+        );
+
+        // The unpadded spelling is accepted too, and yields the same key.
+        let unpadded = EnvVarKeyProvider::from_base64(STORED.trim_end_matches('='), "kat:v1")
+            .expect("unpadded KEK must still decode");
+        assert_eq!(unpadded.unwrap(&wrapped).await.unwrap(), dek);
+    }
+
     #[tokio::test]
     async fn wrap_unwrap_round_trip_recovers_dek() {
         let p = EnvVarKeyProvider::from_bytes([42u8; 32], "test:v1");

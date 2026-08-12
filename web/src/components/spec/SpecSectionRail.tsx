@@ -4,7 +4,7 @@ import {
   MessageCircleQuestionIcon,
   RotateCcwIcon,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -23,11 +23,14 @@ export function SpecSectionRail({
   rail,
   editable,
   pendingSectionId,
+  focusedSectionId = null,
   onAction,
 }: {
   rail: SpecRail;
   editable: boolean;
   pendingSectionId: string | null;
+  /** The section a publish blocker sent the person to (mock 2k). */
+  focusedSectionId?: string | null;
   onAction: (action: SpecRailAction) => void;
 }) {
   const { complete, total } = rail.completeness;
@@ -72,6 +75,7 @@ export function SpecSectionRail({
                     section={section}
                     editable={editable}
                     pending={pendingSectionId === section.id}
+                    focused={focusedSectionId === section.id}
                     onAction={onAction}
                   />
                 ))}
@@ -88,15 +92,27 @@ function SectionRow({
   section,
   editable,
   pending,
+  focused,
   onAction,
 }: {
   section: SpecRailSection;
   editable: boolean;
   pending: boolean;
+  focused: boolean;
   onAction: (action: SpecRailAction) => void;
 }) {
+  const row = useRef<HTMLLIElement | null>(null);
+  useEffect(() => {
+    if (focused) row.current?.scrollIntoView({ block: "nearest" });
+  }, [focused]);
   return (
-    <li className={section.frontier ? "is-frontier" : undefined}>
+    <li
+      ref={row}
+      id={`spec-section-row-${section.id}`}
+      className={[section.frontier ? "is-frontier" : "", focused ? "is-focused" : ""]
+        .filter(Boolean)
+        .join(" ")}
+    >
       <div className="spec-section-row-main">
         <span className="spec-section-marker" aria-hidden="true">
           {isComplete(section) ? <CheckIcon /> : <CircleDotDashedIcon />}

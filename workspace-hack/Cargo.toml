@@ -35,6 +35,7 @@ futures-core = { version = "0.3" }
 futures-executor = { version = "0.3" }
 futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
+futures-task = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
@@ -53,6 +54,7 @@ log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 nix = { version = "0.31", default-features = false, features = ["fs", "mman", "sched", "signal", "uio"] }
 num-bigint = { version = "0.4" }
+num-bigint-dig = { version = "0.8", default-features = false, features = ["i128", "prime", "u64_digit", "zeroize"] }
 num-integer = { version = "0.1", default-features = false, features = ["i128", "std"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
@@ -63,13 +65,15 @@ ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "s
 prost = { version = "0.14" }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9", default-features = false, features = ["small_rng", "thread_rng"] }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8", features = ["small_rng"] }
-rand_chacha = { version = "0.9" }
+rand_chacha-274715c4dabd11b0 = { package = "rand_chacha", version = "0.9" }
+rand_chacha-468e82937335b1c9 = { package = "rand_chacha", version = "0.3", default-features = false, features = ["std"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
 reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "json", "query", "rustls-no-provider", "stream"] }
 reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["charset", "json", "multipart", "rustls-tls", "stream"] }
+rsa = { version = "0.9" }
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
@@ -119,6 +123,7 @@ futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
 futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
+futures-task = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 generic-array = { version = "0.14", default-features = false, features = ["more_lengths", "zeroize"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
@@ -136,6 +141,7 @@ proc-macro2 = { version = "1" }
 prost = { version = "0.14" }
 quote = { version = "1" }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8", features = ["small_rng"] }
+rand_chacha-468e82937335b1c9 = { package = "rand_chacha", version = "0.3", default-features = false, features = ["std"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }

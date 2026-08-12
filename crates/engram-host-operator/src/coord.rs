@@ -130,6 +130,30 @@ impl CoordClient {
         Ok(())
     }
 
+    /// ADR 0116 A-D2: `FleetService.BeginHostHandoff` — declare the
+    /// planned roll so the coordinator's binding-lease deadline covers
+    /// the whole pod replacement. ANY failure is an error the caller
+    /// treats exactly like a cordon failure: with the A3 cutover the
+    /// lease is the ONLY shield (the staleness heuristics that used to
+    /// cover an undeclared roll are retired), so a roll must never
+    /// delete the pod without a durable deadline in PG. (The
+    /// Unimplemented-tolerant arm for pre-A2 coordinators died here in
+    /// A3, per the ADR's scaffolding ledger — coord fleet ≥ A2.)
+    pub async fn handoff(&self, host: HostId, ttl_secs: u64) -> Result<bool, OperatorError> {
+        self.fleet
+            .clone()
+            .begin_host_handoff(app::BeginHostHandoffRequest {
+                host_id: host.to_string(),
+                ttl_secs,
+            })
+            .await
+            .map(|resp| resp.into_inner().accepted)
+            .map_err(|status| OperatorError::Rpc {
+                op: "handoff",
+                status: Box::new(status),
+            })
+    }
+
     /// `FleetService.UncordonHost`.
     pub async fn uncordon(&self, host: HostId) -> Result<(), OperatorError> {
         self.fleet

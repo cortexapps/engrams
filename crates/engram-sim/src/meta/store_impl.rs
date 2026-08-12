@@ -656,6 +656,16 @@ impl MetadataStore for SimMetadataStore {
                     prev.host_addr = host.host_addr;
                 }
                 prev.capabilities = host.capabilities;
+                // ADR 0116 A-D3, exactly the 0115 ON CONFLICT arm: a
+                // register REPLACES the lease deadline (successor presence
+                // ends a handoff early — no GREATEST here, unlike the
+                // heartbeat renew), flips Active, bumps the generation
+                // fence. A None target leaves the lease untouched.
+                if let Some(until) = host.lease_expires_at {
+                    prev.lease_expires_at = Some(until);
+                    prev.lease_state = engram_core::types::host::HostLeaseState::Active;
+                    prev.lease_epoch += 1;
+                }
             }
             std::collections::btree_map::Entry::Vacant(v) => {
                 let mut fresh = host;
@@ -668,6 +678,13 @@ impl MetadataStore for SimMetadataStore {
                 fresh.total_vcpus = 0;
                 fresh.wire_version = 0;
                 fresh.stages_images = false;
+                // ADR 0116 A-D1, exactly the 0115 INSERT arm.
+                fresh.lease_state = if fresh.lease_expires_at.is_some() {
+                    engram_core::types::host::HostLeaseState::Active
+                } else {
+                    engram_core::types::host::HostLeaseState::None
+                };
+                fresh.lease_epoch = 1;
                 v.insert(fresh);
             }
         }
@@ -737,7 +754,82 @@ impl MetadataStore for SimMetadataStore {
         host.stages_images = hb.stages_images;
         host.capabilities = hb.capabilities;
         host.last_heartbeat_at = now;
+        // ADR 0116 A-D3, exactly the 0115 heartbeat-renew CASE arms:
+        // GREATEST (a racing predecessor heartbeat never shrinks a handoff
+        // deadline); never demote a declared handoff; None skips renewal.
+        if let Some(renew) = hb.lease_renew_until {
+            host.lease_expires_at = Some(match host.lease_expires_at {
+                Some(existing) => existing.max(renew),
+                None => renew,
+            });
+            if host.lease_state != engram_core::types::host::HostLeaseState::Handoff {
+                host.lease_state = engram_core::types::host::HostLeaseState::Active;
+            }
+        }
         Ok(())
+    }
+
+    /// ADR 0116 A-D2: exactly the 0115 `begin_host_handoff` UPDATE.
+    async fn begin_host_handoff(
+        &self,
+        id: HostId,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        let Some(host) = db.hosts.get_mut(&id) else {
+            return Ok(false);
+        };
+        if host.status == HostStatus::Dead {
+            return Ok(false);
+        }
+        host.lease_state = engram_core::types::host::HostLeaseState::Handoff;
+        host.lease_expires_at = Some(match host.lease_expires_at {
+            Some(existing) => existing.max(until),
+            None => until,
+        });
+        Ok(true)
+    }
+
+    /// ADR 0116 A-D4: `status='ready' AND (lease_expires_at IS NULL OR
+    /// lease_expires_at < now)`. NULL = no shield. No cordon multiplier.
+    async fn list_lease_expired_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
+        self.gate()?;
+        let now = self.now();
+        let db = self.db.lock();
+        Ok(db
+            .hosts
+            .values()
+            .filter(|h| h.status == HostStatus::Ready)
+            .filter(|h| h.lease_expires_at.is_none_or(|expires| expires < now))
+            .cloned()
+            .collect())
+    }
+
+    /// ADR 0116 A-D4: exactly the `renew_host_lease` UPDATE — GREATEST,
+    /// `none` promotes to `active`, `handoff` never demoted, dead rows
+    /// excluded.
+    async fn renew_host_lease(
+        &self,
+        id: HostId,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        let Some(host) = db.hosts.get_mut(&id) else {
+            return Ok(false);
+        };
+        if host.status == HostStatus::Dead {
+            return Ok(false);
+        }
+        host.lease_expires_at = Some(match host.lease_expires_at {
+            Some(existing) => existing.max(until),
+            None => until,
+        });
+        if host.lease_state == engram_core::types::host::HostLeaseState::None {
+            host.lease_state = engram_core::types::host::HostLeaseState::Active;
+        }
+        Ok(true)
     }
 
     async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
@@ -752,35 +844,28 @@ impl MetadataStore for SimMetadataStore {
         Ok(())
     }
 
-    /// `status='ready' AND (not-cordoned-and-stale OR 10x-stale)`.
-    async fn list_stale_hosts(&self, threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
-        self.gate()?;
-        let now = self.now();
-        let db = self.db.lock();
-        let t = chrono::Duration::seconds(threshold_secs as i64);
-        Ok(db
-            .hosts
-            .values()
-            .filter(|h| h.status == HostStatus::Ready)
-            .filter(|h| {
-                (!h.cordoned && h.last_heartbeat_at < now - t)
-                    || h.last_heartbeat_at < now - (t * 10)
-            })
-            .cloned()
-            .collect())
-    }
-
-    /// tx: host -> dead; every non-terminal session on it -> host_lost
-    /// with host/sandbox cleared. Returns (id, prev) pairs.
-    async fn mark_host_dead_and_orphan_sessions(
+    /// tx: lease re-checked under the lock (renewed ⇒ `Conflict`, ADR
+    /// 0116 A-D4); then host -> dead; every non-terminal session on it
+    /// -> host_lost with host/sandbox cleared. Returns (id, prev) pairs.
+    async fn mark_host_dead_if_lease_expired(
         &self,
         host_id: HostId,
     ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
         self.gate()?;
         let now = self.now();
         let mut db = self.db.lock();
-        if let Some(h) = db.hosts.get_mut(&host_id) {
-            h.status = HostStatus::Dead;
+        match db.hosts.get_mut(&host_id) {
+            None => return Ok(Vec::new()),
+            Some(h) if h.status == HostStatus::Dead => return Ok(Vec::new()),
+            Some(h) => {
+                if h.lease_expires_at.is_some_and(|expires| expires >= now) {
+                    return Err(MetaError::Conflict(format!(
+                        "host {host_id} lease renewed to {:?}; refusing to mark dead",
+                        h.lease_expires_at
+                    )));
+                }
+                h.status = HostStatus::Dead;
+            }
         }
         let mut out = Vec::new();
         let mut log = Vec::new();

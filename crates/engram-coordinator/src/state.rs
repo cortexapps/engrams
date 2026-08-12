@@ -2124,6 +2124,9 @@ pub(crate) mod tests {
                 wire_version: 0,
                 stages_images: false,
                 capabilities: engram_core::types::host::HostCapabilities::default(),
+                lease_expires_at: None,
+                lease_state: Default::default(),
+                lease_epoch: 0,
             });
         }
 
@@ -2515,10 +2518,7 @@ pub(crate) mod tests {
                 None => Err(MetaError::NotFound),
             }
         }
-        async fn list_stale_hosts(&self, _: u64) -> Result<Vec<HostRecord>, MetaError> {
-            Ok(Vec::new())
-        }
-        async fn mark_host_dead_and_orphan_sessions(
+        async fn mark_host_dead_if_lease_expired(
             &self,
             _: HostId,
         ) -> Result<Vec<(engram_core::SessionId, engram_core::types::SessionState)>, MetaError>

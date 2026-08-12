@@ -345,10 +345,7 @@ mod tests {
         async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
             unimplemented!()
         }
-        async fn list_stale_hosts(&self, _: u64) -> Result<Vec<HostRecord>, MetaError> {
-            unimplemented!()
-        }
-        async fn mark_host_dead_and_orphan_sessions(
+        async fn mark_host_dead_if_lease_expired(
             &self,
             _: HostId,
         ) -> Result<Vec<(engram_core::SessionId, engram_core::types::SessionState)>, MetaError>
@@ -505,6 +502,9 @@ mod tests {
                 wire_version: 1,
                 stages_images: false,
                 capabilities: engram_core::types::host::HostCapabilities::default(),
+                lease_expires_at: None,
+                lease_state: Default::default(),
+                lease_epoch: 0,
             };
             Ok(vec![
                 host(

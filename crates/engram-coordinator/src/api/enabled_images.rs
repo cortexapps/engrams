@@ -1420,13 +1420,7 @@ mod tests {
             async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
                 unreachable!()
             }
-            async fn list_stale_hosts(
-                &self,
-                _: u64,
-            ) -> Result<Vec<engram_core::types::host::HostRecord>, MetaError> {
-                unreachable!()
-            }
-            async fn mark_host_dead_and_orphan_sessions(
+            async fn mark_host_dead_if_lease_expired(
                 &self,
                 _: HostId,
             ) -> Result<

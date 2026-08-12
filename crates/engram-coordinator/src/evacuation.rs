@@ -47,13 +47,20 @@ pub enum EvacError {
     /// `None`. Caller routes to `HostLost → Dead`.
     NoRecoverableState,
     /// ADR 0028 Fix B: the session is disk-only recoverable (a live
-    /// disk manifest exists but no usable snapshot) and the caller
-    /// couldn't supply a cold-boot spec — typically because the
-    /// session's image is no longer enabled, so there's no manifest
-    /// to derive boot resources from. Structural: retrying won't fix
-    /// it; the caller routes to `Idle` (re-enable the image, then
-    /// `/resume` recovers via the same cold-boot path).
+    /// disk manifest exists but no usable snapshot) and the cold-boot
+    /// spec resolved to `None` — the session's image is no longer
+    /// enabled, so there's no manifest to derive boot resources from.
+    /// Structural: retrying won't fix it; the caller routes to `Idle`
+    /// (re-enable the image, then `/resume` recovers via the same
+    /// cold-boot path).
     ColdBootUnavailable(String),
+    /// ADR 0116: the lazily-awaited cold-boot materialization failed —
+    /// a transient store/catalog read inside `materialize_cold_boot`
+    /// (harness selection, runtime spec, fleet catalog, …). Retryable,
+    /// NOT structural: the next scanner tick / resume retry re-derives
+    /// it. The future is awaited only on the disk-only rung, so a
+    /// memory-snapshot recovery can never fail on slot resolution.
+    SpecResolution(crate::error::ApiError),
     /// No host could accept the relocate (no capacity, or no host
     /// with the image prefetched). Caller logs + retries later or
     /// routes to `HostLost → Dead`.
@@ -99,6 +106,9 @@ impl std::fmt::Display for EvacError {
                     "disk-only recoverable but no cold-boot spec available: {reason}"
                 )
             }
+            Self::SpecResolution(e) => {
+                write!(f, "cold-boot spec resolution failed (retryable): {e}")
+            }
             Self::NoTargetAvailable(e) => write!(f, "no host could accept the relocate: {e:?}"),
             Self::NoCapacityQueue => write!(
                 f,
@@ -117,59 +127,19 @@ impl std::error::Error for EvacError {
             | Self::NoCapacityQueue => None,
             Self::RestoreFailed(e) => Some(e),
             Self::Rebind(e) => Some(e),
+            Self::SpecResolution(e) => Some(e),
         }
     }
 }
 
-/// ADR 0028 Fix B: derive the disk-only recovery's cold-boot
-/// `SandboxSpec` from the session's enabled image (config-derived
-/// resources, env, bundles — `api::sessions::cold_boot_spec`).
-/// `None` when the image row is gone/unreadable — callers pass that
-/// through and `evacuate_dead_source` fails structurally
-/// (`ColdBootUnavailable`) only if the recovery actually needed it.
-pub async fn resolve_cold_boot_spec(
-    meta: &Arc<dyn MetadataStore>,
-    session: &Session,
-) -> Option<engram_core::types::sandbox::SandboxSpec> {
-    let enabled = match meta.get_enabled_image(&session.image).await {
-        Ok(Some(row)) => row,
-        Ok(None) => {
-            tracing::warn!(
-                session_id = %session.id,
-                image = %session.image,
-                "cold-boot spec: image is not enabled; disk-only recovery unavailable",
-            );
-            return None;
-        }
-        Err(e) => {
-            tracing::warn!(
-                session_id = %session.id,
-                image = %session.image,
-                error = %e,
-                "cold-boot spec: enabled-image lookup failed",
-            );
-            return None;
-        }
-    };
-    // ADR 0080: the row carries the config as typed JSONB — no TOML parse.
-    let config = enabled.effective_config();
-    // ADR 0057: disk-only recovery rebuilds the session's own egress network
-    // from its persisted policy (the image config carries no network).
-    let network = match meta.get_session_integration_policy(session.id).await {
-        Ok(Some(json)) => engram_core::types::IntegrationPolicy::parse(&json)
-            .ok()
-            .flatten()
-            .map(|p| p.network)
-            .unwrap_or_default(),
-        _ => Default::default(),
-    };
-    Some(crate::api::sessions::cold_boot_spec(
-        &session.image,
-        &config,
-        None,
-        network,
-    ))
-}
+// ADR 0028 Fix B's spec derivation moved to
+// `crate::boot_materializer::materialize_cold_boot` (ADR 0116): the
+// disk-only recovery spec now also carries the session's persisted slot
+// selections (harness/skills), so a recovered guest can always spawn what
+// its argv names. Callers pass the materialization as an UN-AWAITED
+// future; `evacuate_dead_source` awaits it only on the disk-only rung
+// (`SpecResolution` = transient read, retryable; `ColdBootUnavailable` =
+// image un-enabled, structural).
 
 /// Pick the disk manifest the target should restore from. Mirrors the
 /// `effective_resume_disk_manifest` semantics in `api/snapshot.rs`:
@@ -231,17 +201,21 @@ fn pick_evac_disk_manifest(
 /// Leaves the session at `Created` on the new host. Caller is
 /// responsible for the start_agent + Active transition.
 #[allow(clippy::too_many_arguments)] // cohesive relocation inputs; threading a struct buys nothing
-pub async fn evacuate_dead_source(
+pub async fn evacuate_dead_source<F>(
     registry: &Arc<HostRegistry>,
     meta: &Arc<dyn MetadataStore>,
     session: Session,
     snapshot: Option<SnapshotRecord>,
-    // ADR 0028 Fix B: the disk-only recovery's boot shape (from
-    // `api::sessions::cold_boot_spec`, manifest-derived resources).
-    // `None` is fine when a memory snapshot exists; when the session
-    // is disk-only recoverable and this is `None`, the call fails
-    // structurally with `ColdBootUnavailable`.
-    cold_boot_spec: Option<engram_core::types::sandbox::SandboxSpec>,
+    // ADR 0028 Fix B / ADR 0116: the disk-only recovery's boot shape,
+    // passed as an UN-AWAITED future (`boot_materializer::
+    // materialize_cold_boot`) and awaited only on the disk-only rung.
+    // The rung decision lives HERE, with the recovery ladder — so a
+    // caller can never eagerly fail a memory-snapshot recovery on slot
+    // resolution it would not consult, and never has to pick an error
+    // posture for a value it doesn't know is needed. `Ok(None)` (image
+    // un-enabled) fails structurally with `ColdBootUnavailable`; `Err`
+    // (transient store read) fails retryably with `SpecResolution`.
+    cold_boot_spec: F,
     // ADR 0045 Phase F (teleport): when `Some`, place onto this exact
     // host instead of the capacity-ranked pick (operator-pinned
     // destination). `None` keeps the standard any-peer policy.
@@ -259,7 +233,7 @@ pub async fn evacuate_dead_source(
     fence: SessionFence,
     // #800 (RESERVED evac placement): the session's reserved 2D budget
     // `(mem_mib, cpu_vcpus)`, resolved from the enabled image
-    // (`resolve_cold_boot_spec`). `Some` feeds the HARD reserved pick — a
+    // (`boot_materializer::materialize_cold_boot`). `Some` feeds the HARD reserved pick — a
     // relocation that fits no survivor returns `NoCapacityQueue` (the caller
     // queues instead of overcommitting). `None` (image un-enabled / budget
     // unresolvable) keeps the pre-#800 capacity-SOFT posture — never strand
@@ -269,7 +243,12 @@ pub async fn evacuate_dead_source(
     // ADR 0098 D1: the caller's injected wall clock, used for the
     // peer-hint heartbeat-staleness gate (`host_can_serve_chunks`).
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<EvacReceipt, EvacError> {
+) -> Result<EvacReceipt, EvacError>
+where
+    F: std::future::Future<
+        Output = Result<Option<engram_core::types::sandbox::SandboxSpec>, crate::error::ApiError>,
+    >,
+{
     let session_id = session.id;
     let old_sandbox_id = session.sandbox_id;
 
@@ -316,12 +295,17 @@ pub async fn evacuate_dead_source(
     } else {
         let disk = disk_manifest
             .expect("disk-only branch requires a disk manifest (NoRecoverableState guards above)");
-        let mut spec = cold_boot_spec.ok_or_else(|| {
-            EvacError::ColdBootUnavailable(format!(
-                "session {session_id} has a live disk manifest ({disk}) but no \
-                 cold-boot spec — is its image still enabled?"
-            ))
-        })?;
+        // ADR 0116: first (and only) await of the lazily-passed
+        // materialization — the memory-snapshot rung above never runs it.
+        let mut spec = cold_boot_spec
+            .await
+            .map_err(EvacError::SpecResolution)?
+            .ok_or_else(|| {
+                EvacError::ColdBootUnavailable(format!(
+                    "session {session_id} has a live disk manifest ({disk}) but no \
+                     cold-boot spec — is its image still enabled?"
+                ))
+            })?;
         spec.rootfs_manifest = Some(disk);
         Some(spec)
     };
@@ -811,6 +795,9 @@ mod tests {
             wire_version: 0,
             stages_images: false,
             capabilities: engram_core::types::host::HostCapabilities::default(),
+            lease_expires_at: None,
+            lease_state: Default::default(),
+            lease_epoch: 0,
         })
         .await
         .expect("host row");
@@ -852,6 +839,9 @@ mod tests {
             wire_version: 0,
             stages_images: false,
             capabilities: engram_core::types::host::HostCapabilities::default(),
+            lease_expires_at: None,
+            lease_state: Default::default(),
+            lease_epoch: 0,
         })
         .await
         .expect("measured host row");
@@ -880,6 +870,7 @@ mod tests {
                 wire_version: 0,
                 stages_images: false,
                 capabilities: engram_core::types::host::HostCapabilities::default(),
+                lease_renew_until: None,
             },
         )
         .await
@@ -968,7 +959,7 @@ mod tests {
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
             Some(snapshot),
-            None,
+            poison_spec(),
             None,
             None,
             SessionFence::unfenced(),
@@ -1026,7 +1017,7 @@ mod tests {
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
             Some(snapshot),
-            None,
+            poison_spec(),
             None,
             None,
             SessionFence::unfenced(),
@@ -1078,7 +1069,7 @@ mod tests {
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
             Some(snapshot),
-            None,
+            poison_spec(),
             None,
             Some(origin),
             SessionFence::unfenced(),
@@ -1093,8 +1084,28 @@ mod tests {
         );
     }
 
-    /// A plausible cold-boot spec, the shape `resolve_cold_boot_spec`
+    /// A plausible cold-boot spec, the shape `materialize_cold_boot`
     /// would derive from an enabled image.
+    /// ADR 0116: the lazily-passed cold-boot materialization, pre-resolved
+    /// for tests (production passes `materialize_cold_boot` un-awaited).
+    fn ready_spec(
+        spec: Option<SandboxSpec>,
+    ) -> impl std::future::Future<Output = Result<Option<SandboxSpec>, crate::error::ApiError>>
+    {
+        std::future::ready(Ok(spec))
+    }
+
+    /// ADR 0116 (#1212 review finding): the memory-snapshot rung must not
+    /// RUN the cold-boot materialization — not merely tolerate its errors.
+    /// This future panics if anything ever polls it.
+    fn poison_spec(
+    ) -> impl std::future::Future<Output = Result<Option<SandboxSpec>, crate::error::ApiError>>
+    {
+        std::future::poll_fn(|_| {
+            panic!("cold-boot materialization was polled on the memory-snapshot rung")
+        })
+    }
+
     fn test_cold_boot_spec() -> SandboxSpec {
         SandboxSpec {
             image: "ghcr.io/test/img:t".into(),
@@ -1134,7 +1145,7 @@ mod tests {
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
             None,
-            Some(test_cold_boot_spec()),
+            ready_spec(Some(test_cold_boot_spec())),
             None,
             None,
             SessionFence::unfenced(),
@@ -1186,7 +1197,7 @@ mod tests {
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
             None,
-            None,
+            ready_spec(None),
             None,
             None,
             SessionFence::unfenced(),
@@ -1204,6 +1215,40 @@ mod tests {
         );
     }
 
+    /// ADR 0116 (#1212 review finding): a TRANSIENT materialization error
+    /// on the disk-only rung surfaces as `SpecResolution` — retryable, not
+    /// structural — so the caller's next tick re-derives it instead of
+    /// failing the session fast.
+    #[tokio::test]
+    async fn evac_dead_source_disk_only_spec_read_error_is_retryable() {
+        let meta = sim_meta();
+        let live = fake_manifest(0xBEEF, 4);
+        let session =
+            stage_hostlost_session(&meta, HostId::new(), SandboxId::new(), Some(live)).await;
+
+        let (registry, _target_host, _target_be) = build_registry_with_target(meta.clone()).await;
+
+        let result = evacuate_dead_source(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session.clone(),
+            None,
+            std::future::ready(Err(crate::error::ApiError::Internal(
+                "runtime spec read failed (simulated PG blip)".into(),
+            ))),
+            None,
+            None,
+            SessionFence::unfenced(),
+            None, // #800: budget — tests keep the capacity-soft pick
+            chrono::Utc::now(),
+        )
+        .await;
+        match &result {
+            Err(e @ EvacError::SpecResolution(_)) => assert!(!e.is_structural()),
+            other => panic!("expected SpecResolution, got {other:?}"),
+        }
+    }
+
     /// Arm 4: no snapshot, no live_disk → NoRecoverableState. Caller
     /// (dead_host.rs) routes this to HostLost → Dead.
     #[tokio::test]
@@ -1219,7 +1264,7 @@ mod tests {
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
             None,
-            None,
+            ready_spec(None),
             None,
             None,
             SessionFence::unfenced(),
@@ -1255,7 +1300,7 @@ mod tests {
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
             None,
-            Some(test_cold_boot_spec()),
+            ready_spec(Some(test_cold_boot_spec())),
             None,
             None,
             SessionFence::unfenced(),
@@ -1297,7 +1342,7 @@ mod tests {
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
             None,
-            Some(test_cold_boot_spec()),
+            ready_spec(Some(test_cold_boot_spec())),
             None,
             None,
             SessionFence::unfenced(),
@@ -1318,7 +1363,7 @@ mod tests {
             &(meta.clone() as Arc<dyn MetadataStore>),
             session.clone(),
             None,
-            Some(test_cold_boot_spec()),
+            ready_spec(Some(test_cold_boot_spec())),
             None,
             None,
             SessionFence::unfenced(),

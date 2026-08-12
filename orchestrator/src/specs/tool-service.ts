@@ -47,6 +47,7 @@ import {
   type OpenQuestionStore,
 } from "./open-questions.ts";
 import { SectionStateConflictError, type SectionStateService } from "./section-state-service.ts";
+import type { SpecTicketTreeService } from "./ticket-tree.ts";
 import type { SectionStateValue } from "./section-state.ts";
 
 const AGENT_QUESTION_NAMESPACE = "6a7dd40c-5d36-529d-9561-5f8e1fbea3c7";
@@ -144,6 +145,8 @@ export interface SpecToolServiceOptions {
   questionStore: OpenQuestionStore;
   alternatives: SpecAlternativesService;
   metadata: SpecToolMetadataStore;
+  /** The post-publish ticket tree, which reads the pinned spec (#1127). */
+  tickets: Pick<SpecTicketTreeService, "propose">;
   now: () => Date;
 }
 
@@ -583,11 +586,27 @@ export class SpecToolService implements SpecToolDocumentService {
     throw new Error("Working notes are not available until #1120.");
   }
 
+  /**
+   * Land the agent's ticket proposal (ADR 0114 D6).
+   *
+   * The tree is not part of the document, so this tool changes no revision.
+   * It still honours `expected_rev`, because an agent that proposes against a
+   * spec it has not re-read should learn that before its tickets land.
+   */
   async proposeTickets(
-    _specId: string,
-    _input: Parameters<SpecToolDocumentService["proposeTickets"]>[1],
+    specId: string,
+    input: Parameters<SpecToolDocumentService["proposeTickets"]>[1],
   ): Promise<SpecMutationResult> {
-    throw new Error("Ticket drafts are not available until #1127.");
+    const loaded = await this.options.documents.syncFromLog(specId);
+    if (input.expectedRev !== undefined && input.expectedRev !== loaded.semanticDocSeq) {
+      return this.result(specId, input, false, loaded.semanticDocSeq);
+    }
+    await this.options.tickets.propose({
+      specId,
+      idempotencyKey: input.idempotencyKey,
+      tickets: input.tickets,
+    });
+    return this.result(specId, input, true, loaded.semanticDocSeq);
   }
 
   private async revisionConflict(

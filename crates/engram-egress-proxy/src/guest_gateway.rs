@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use engram_core::types::integration::SessionTunnel;
@@ -24,18 +24,31 @@ const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 pub const PLACEHOLDER_TOKEN: &str = "engram_google_token_placeholder";
 pub const GCE_METADATA_SERVICE_KIND: &str = "gcp.gce_metadata";
 
+/// The byte stream an upstream hands back for one guest connection.
+pub trait TunnelStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> TunnelStream for T {}
+
 /// A registered host implementation for one tunnel connector kind.
+///
+/// An upstream only produces the byte stream. The gateway owns the HTTP
+/// framing: the `200 Connection Established` response, the coalesced
+/// initial data, the relay pump, and failure shaping. A connector never
+/// re-implements that machinery.
 #[async_trait]
-pub trait TunnelConnector: Send + Sync {
+pub trait TunnelUpstream: Send + Sync {
     fn kind(&self) -> &'static str;
 
-    async fn relay(
+    /// Produce one upstream byte stream for one authorized guest connection.
+    async fn connect(
         &self,
-        downstream: TcpStream,
-        initial_data: Vec<u8>,
         session_id: SessionId,
-        tunnel: SessionTunnel,
-    ) -> std::io::Result<()>;
+        tunnel: &SessionTunnel,
+    ) -> std::io::Result<Box<dyn TunnelStream>>;
+
+    /// The session ended; drop anything scoped to it. Sync by design: the
+    /// teardown call sites must not block on upstream reaping — resource
+    /// `Drop` does the work.
+    fn session_closed(&self, _session_id: SessionId) {}
 }
 
 /// One registered compatibility adapter on the guest gateway.
@@ -63,13 +76,13 @@ pub trait GuestServiceAdapter: Send + Sync {
 #[derive(Default)]
 pub struct GuestGatewayRegistry {
     services: HashMap<String, Arc<dyn GuestServiceAdapter>>,
-    tunnels: HashMap<String, Arc<dyn TunnelConnector>>,
+    tunnels: HashMap<String, Arc<dyn TunnelUpstream>>,
 }
 
 impl GuestGatewayRegistry {
     pub fn new(
         services: impl IntoIterator<Item = Arc<dyn GuestServiceAdapter>>,
-        connectors: impl IntoIterator<Item = Arc<dyn TunnelConnector>>,
+        connectors: impl IntoIterator<Item = Arc<dyn TunnelUpstream>>,
     ) -> Self {
         let mut service_map = HashMap::new();
         for service in services {
@@ -91,8 +104,18 @@ impl GuestGatewayRegistry {
         self.services.get(kind).cloned()
     }
 
-    fn tunnel(&self, kind: &str) -> Option<Arc<dyn TunnelConnector>> {
+    fn tunnel(&self, kind: &str) -> Option<Arc<dyn TunnelUpstream>> {
         self.tunnels.get(kind).cloned()
+    }
+
+    /// The session ended; every registered upstream drops any state scoped
+    /// to it (pooled endpoints, cached credentials). The egress registry has
+    /// no per-session teardown hook of its own, so the host-agent calls this
+    /// next to `Registry::unregister`.
+    pub fn session_closed(&self, session_id: SessionId) {
+        for upstream in self.tunnels.values() {
+            upstream.session_closed(session_id);
+        }
     }
 }
 
@@ -210,23 +233,38 @@ async fn serve_connection(
             .await?;
             return stream.shutdown().await;
         };
-        let tunnel_id = tunnel.id.clone();
-        let connector_kind = tunnel.connector.clone();
-        if let Err(error) = connector
-            .relay(stream, initial_data, session.session_id, tunnel)
-            .await
-        {
-            tracing::warn!(
-                %peer,
-                session_id = %session.session_id,
-                %tunnel_id,
-                %connector_kind,
-                %error,
-                "guest tunnel relay failed",
-            );
-            return Err(error);
+        let mut upstream = match connector.connect(session.session_id, &tunnel).await {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                tracing::warn!(
+                    %peer,
+                    session_id = %session.session_id,
+                    tunnel_id = %tunnel.id,
+                    connector_kind = %tunnel.connector,
+                    %error,
+                    "guest tunnel connect failed",
+                );
+                write_response(
+                    &mut stream,
+                    ("Engram-Gateway", "1"),
+                    "502 Bad Gateway",
+                    "text/plain",
+                    &format!("tunnel {} failed: {error}", tunnel.id),
+                )
+                .await?;
+                let _ = stream.shutdown().await;
+                return Err(error);
+            }
+        };
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\nEngram-Gateway: 1\r\n\r\n")
+            .await?;
+        if !initial_data.is_empty() {
+            upstream.write_all(&initial_data).await?;
         }
-        return Ok(());
+        return tokio::io::copy_bidirectional(&mut stream, &mut upstream)
+            .await
+            .map(|_| ());
     }
 
     let Some(service) = session
@@ -457,36 +495,53 @@ mod tests {
     use engram_core::types::integration::GuestService;
     use engram_core::SessionId;
 
-    struct CapturingConnector {
+    struct CapturingUpstream {
         received: Arc<parking_lot::Mutex<Vec<u8>>>,
     }
 
     #[async_trait]
-    impl TunnelConnector for CapturingConnector {
+    impl TunnelUpstream for CapturingUpstream {
         fn kind(&self) -> &'static str {
             "test.capture"
         }
 
-        async fn relay(
+        async fn connect(
             &self,
-            mut downstream: TcpStream,
-            initial_data: Vec<u8>,
             _session_id: SessionId,
-            _tunnel: SessionTunnel,
-        ) -> std::io::Result<()> {
-            let mut received = initial_data;
-            downstream.read_to_end(&mut received).await?;
-            *self.received.lock() = received;
-            downstream
-                .write_all(b"HTTP/1.1 200 Connection Established\r\nEngram-Gateway: 1\r\n\r\n")
-                .await
+            _tunnel: &SessionTunnel,
+        ) -> std::io::Result<Box<dyn TunnelStream>> {
+            let (near, mut far) = tokio::io::duplex(64 * 1024);
+            let received = self.received.clone();
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let _ = far.read_to_end(&mut buffer).await;
+                *received.lock() = buffer;
+            });
+            Ok(Box::new(near))
+        }
+    }
+
+    struct FailingUpstream;
+
+    #[async_trait]
+    impl TunnelUpstream for FailingUpstream {
+        fn kind(&self) -> &'static str {
+            "test.failing"
+        }
+
+        async fn connect(
+            &self,
+            _session_id: SessionId,
+            _tunnel: &SessionTunnel,
+        ) -> std::io::Result<Box<dyn TunnelStream>> {
+            Err(std::io::Error::other("invalid instance"))
         }
     }
 
     fn gateway_registry() -> GuestGatewayRegistry {
         GuestGatewayRegistry::new(
             [Arc::new(GceMetadataService) as Arc<dyn GuestServiceAdapter>],
-            std::iter::empty::<Arc<dyn TunnelConnector>>(),
+            std::iter::empty::<Arc<dyn TunnelUpstream>>(),
         )
     }
 
@@ -756,9 +811,9 @@ mod tests {
         let received = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let gateway = Arc::new(GuestGatewayRegistry::new(
             std::iter::empty::<Arc<dyn GuestServiceAdapter>>(),
-            [Arc::new(CapturingConnector {
+            [Arc::new(CapturingUpstream {
                 received: received.clone(),
-            }) as Arc<dyn TunnelConnector>],
+            }) as Arc<dyn TunnelUpstream>],
         ));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -782,6 +837,93 @@ mod tests {
         server.await.unwrap();
         assert!(response.starts_with(b"HTTP/1.1 200 Connection Established\r\n"));
         assert_eq!(&*received.lock(), b"postgres-startup");
+    }
+
+    /// The gateway owns failure shaping: an upstream connect error becomes
+    /// an actionable 502 with the error text, written before the guest
+    /// stream closes.
+    #[tokio::test]
+    async fn tunnel_connect_failure_returns_an_actionable_bad_gateway() {
+        let registry = Arc::new(Registry::new());
+        registry.register(SessionState {
+            session_id: SessionId::new(),
+            guest_ip: std::net::Ipv4Addr::LOCALHOST,
+            network_allow: HostList::empty(),
+            allow_all: false,
+            secrets: Vec::new(),
+            injects: Vec::new(),
+            observes: Vec::new(),
+            guest_services: Vec::new(),
+            tunnels: vec![SessionTunnel {
+                id: "prod-readonly".into(),
+                connector: "test.failing".into(),
+                config_json: "{}".into(),
+                mint_source: None,
+            }],
+        });
+        let gateway = Arc::new(GuestGatewayRegistry::new(
+            std::iter::empty::<Arc<dyn GuestServiceAdapter>>(),
+            [Arc::new(FailingUpstream) as Arc<dyn TunnelUpstream>],
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            // The connect failure propagates as an error after the 502 is
+            // written; the response, not the return value, is the contract.
+            let _ = serve_connection(stream, peer, &registry, &gateway).await;
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                b"CONNECT /_engrams/v1/tunnels/prod-readonly HTTP/1.1\r\nEngram-Gateway: 1\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(response.contains("tunnel prod-readonly failed: invalid instance"));
+    }
+
+    #[test]
+    fn session_closed_fans_out_to_every_tunnel_upstream() {
+        struct RecordingUpstream {
+            closed: Arc<parking_lot::Mutex<Vec<SessionId>>>,
+        }
+
+        #[async_trait]
+        impl TunnelUpstream for RecordingUpstream {
+            fn kind(&self) -> &'static str {
+                "test.recording"
+            }
+
+            async fn connect(
+                &self,
+                _session_id: SessionId,
+                _tunnel: &SessionTunnel,
+            ) -> std::io::Result<Box<dyn TunnelStream>> {
+                Err(std::io::Error::other("unused"))
+            }
+
+            fn session_closed(&self, session_id: SessionId) {
+                self.closed.lock().push(session_id);
+            }
+        }
+
+        let closed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let gateway = GuestGatewayRegistry::new(
+            std::iter::empty::<Arc<dyn GuestServiceAdapter>>(),
+            [Arc::new(RecordingUpstream {
+                closed: closed.clone(),
+            }) as Arc<dyn TunnelUpstream>],
+        );
+        let session_id = SessionId::new();
+        gateway.session_closed(session_id);
+        assert_eq!(&*closed.lock(), &[session_id]);
     }
 
     #[test]

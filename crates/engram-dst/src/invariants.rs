@@ -38,6 +38,11 @@ pub struct Oracles {
     /// First step at which each session was OBSERVED in the attach
     /// disagreement (Active + sandbox running + harness unattached).
     attach_disagreement_since: BTreeMap<SessionId, chrono::DateTime<chrono::Utc>>,
+    /// Each session's host binding as of the PREVIOUS step, for the
+    /// lease-liveness oracle: a flip to HostLost erases the binding, so
+    /// the host it was torn from is only knowable from last step's
+    /// observation.
+    prev_bindings: BTreeMap<SessionId, engram_core::HostId>,
 }
 
 impl Oracles {
@@ -54,6 +59,62 @@ impl Oracles {
         snapshot_safety(world)?;
         user_input_never_rewound(world)?;
         self.attach_disagreement(world)?;
+        self.lease_liveness(world)?;
+        Ok(())
+    }
+
+    /// ADR 0116 A-D4: the lease-liveness oracle. A session may lose its
+    /// host binding to `HostLost` only when the host's binding lease is
+    /// expired — revocation is lease-expiry or host-affirmed, never
+    /// inferred from silence. Stateful: the flip erases `host_id`, so
+    /// each step's bindings are remembered and a fresh `HostLost` row is
+    /// checked against its REMEMBERED host's CURRENT lease. (Renewals
+    /// only ever extend the deadline, so a lease live now was live at
+    /// the flip one step ago; the mark's own row-locked re-check is the
+    /// prod-side twin of this rule.)
+    fn lease_liveness(&mut self, world: &SimWorld) -> Result<(), Violation> {
+        let now = world.clock.now_utc();
+        let result = world.meta.with_db(|db| {
+            for (sid, row) in &db.sessions {
+                if row.session.status != SessionState::HostLost {
+                    continue;
+                }
+                // Only the binding-CLEARING flip (the mark's bulk orphan)
+                // is lease-gated. HostLost with bindings retained is the
+                // #762 straggler park — host-affirmed settlement territory
+                // (the ask-the-host sweep), not a revocation.
+                if row.session.host_id.is_some() {
+                    continue;
+                }
+                let Some(prev_host) = self.prev_bindings.get(sid) else {
+                    continue;
+                };
+                let live_lease = db
+                    .hosts
+                    .get(prev_host)
+                    .and_then(|h| h.lease_expires_at)
+                    .is_some_and(|expires| expires >= now);
+                if live_lease {
+                    return Err(Violation {
+                        invariant: "lease-liveness",
+                        detail: format!(
+                            "session {sid} flipped to HostLost while host {prev_host}'s binding \
+                             lease is still live — revocation inferred from silence (ADR 0116 \
+                             A-D4)",
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        });
+        result?;
+        // Remember this step's bindings for the next step's check.
+        self.prev_bindings = world.meta.with_db(|db| {
+            db.sessions
+                .values()
+                .filter_map(|r| r.session.host_id.map(|h| (r.session.id, h)))
+                .collect()
+        });
         Ok(())
     }
 

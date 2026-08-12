@@ -8,9 +8,12 @@ import {
   SPEC_ALTERNATIVES_REASON_MAX_CHARS,
   SPEC_ALTERNATIVES_TRADEOFF_COUNT,
   SPEC_TRADEOFF_SIGNS,
+  type GapFinding,
+  type GapFindingSeverity,
   type SpecAlternativeOption,
   type SpecAlternativesComparison,
   type SpecSelectionSpan,
+  type TraceabilityMatrix,
   type TrackedEditTranscriptChip,
 } from "@engrams/spec-document";
 
@@ -223,6 +226,66 @@ const ProposeTicketsInput = z.object({
   expected_rev: ExpectedRevision,
 });
 
+const RedTeamFindingInput = z.object({
+  layer_key: z.string().min(1).max(200),
+  section_id: SectionId,
+  severity: z
+    .enum(["fatal", "gap", "note"])
+    .describe("Use fatal only for a flaw that makes the layers below it not worth reviewing"),
+  summary: z.string().min(1).max(2_000),
+  detail: z.string().min(1).max(20_000),
+});
+
+const ProposedDiffInput = z.object({
+  finding_id: z.string().min(1).max(400).describe("The id of a finding this pass reported"),
+  after: z
+    .string()
+    .max(200_000)
+    .describe("Replacement Markdown for the finding's section, offered for a person to accept"),
+});
+
+const GapCheckInput = z.object({
+  red_team: z
+    .array(RedTeamFindingInput)
+    .max(50)
+    .optional()
+    .describe("Edge cases, migration risk, rollback and failure modes you found"),
+  proposed_diffs: z
+    .array(ProposedDiffInput)
+    .max(50)
+    .optional()
+    .describe("Optional remedies for the findings this pass computes; never applied by the pass"),
+});
+
+const GapCheckFindingOutput = z.object({
+  id: z.string(),
+  kind: z.string(),
+  severity: z.enum(["fatal", "gap", "note"]),
+  layer_key: z.string(),
+  section_id: SectionId,
+  requirement_id: z.string().nullable(),
+  summary: z.string(),
+  detail: z.string(),
+  has_proposed_diff: z.boolean(),
+});
+
+const GapCheckOutput = z.object({
+  run_id: z.string().uuid(),
+  rev: Revision,
+  stopped_at_layer: z
+    .string()
+    .nullable()
+    .describe("Set when a fatal flaw halted the pass; do not polish the layers below it"),
+  suppressed_count: z
+    .number()
+    .int()
+    .describe("Findings withheld because they sit below the halting layer"),
+  covered_requirements: z.number().int(),
+  gap_requirements: z.number().int(),
+  uncited_content: z.number().int(),
+  findings: z.array(GapCheckFindingOutput),
+});
+
 const ReadOutput = z.object({
   spec_id: z.string().uuid(),
   rev: Revision,
@@ -379,11 +442,41 @@ export interface SpecAgentPresence {
   }): Promise<void>;
 }
 
+/** A red-team finding: the judgment the deterministic pass cannot compute. */
+export interface SpecRedTeamFinding {
+  layerKey: string;
+  sectionId: string;
+  severity: GapFindingSeverity;
+  summary: string;
+  detail: string;
+}
+
+export interface SpecGapCheckRunResult {
+  id: string;
+  semanticDocSeq: bigint;
+  stoppedAtLayerKey: string | null;
+  suppressedCount: number;
+  matrix: TraceabilityMatrix;
+  findings: readonly GapFinding[];
+}
+
+export interface SpecGapCheckRunner {
+  run(input: {
+    specId: string;
+    sessionId: string | null;
+    requestFingerprint: string;
+    actorUserId: string | null;
+    redTeam?: readonly SpecRedTeamFinding[];
+    proposedDiffs?: readonly { findingId: string; after: string }[];
+  }): Promise<SpecGapCheckRunResult>;
+}
+
 export interface SpecToolDeps {
   resolveSpecForSession(sessionId: string): Promise<SpecReference | null>;
   documents: SpecToolDocumentService;
   projection: SpecProjectionRefresh;
   presence: SpecAgentPresence;
+  gapCheck: SpecGapCheckRunner;
 }
 
 function proposalContext(ctx: ToolContext): SpecProposalContext {
@@ -768,4 +861,64 @@ export function registerSpecTools(
       return finishMutation(ctx, deps, spec.id, result);
     },
   });
+
+  registry.register({
+    name: "spec_gap_check",
+    taskTypes: SPEC_TASK_TYPES,
+    description:
+      "Run the gap check: trace every requirement to the layers below it, flag content that " +
+      "cites no requirement, and record your red-team findings. The pass reports only — it " +
+      "never edits the spec. Each finding becomes an open question or a proposed diff that a " +
+      "person accepts. If the result names a stopped_at_layer, fix that layer before you look " +
+      "at anything below it.",
+    input: GapCheckInput,
+    output: GapCheckOutput,
+    handling: "handled",
+    execution: "sync",
+    handler: async (ctx, args) => {
+      const spec = await requireSpec(ctx, deps);
+      const run = await deps.gapCheck.run({
+        specId: spec.id,
+        sessionId: ctx.sessionId,
+        requestFingerprint: `agent-gap-check:${spec.id}:${ctx.sessionId}:${ctx.toolCallId}`,
+        actorUserId: ctx.userId ?? null,
+        redTeam: (args.red_team ?? []).map((finding) => ({
+          layerKey: finding.layer_key,
+          sectionId: finding.section_id,
+          severity: finding.severity,
+          summary: finding.summary,
+          detail: finding.detail,
+        })),
+        proposedDiffs: (args.proposed_diffs ?? []).map((diff) => ({
+          findingId: diff.finding_id,
+          after: diff.after,
+        })),
+      });
+      return gapCheckOutput(run);
+    },
+  });
+}
+
+function gapCheckOutput(run: SpecGapCheckRunResult): z.input<typeof GapCheckOutput> {
+  const requirementRows = run.matrix.rows.filter((row) => row.requirementId !== null);
+  return {
+    run_id: run.id,
+    rev: run.semanticDocSeq.toString(),
+    stopped_at_layer: run.stoppedAtLayerKey,
+    suppressed_count: run.suppressedCount,
+    covered_requirements: requirementRows.filter((row) => row.verdict === "covered").length,
+    gap_requirements: requirementRows.filter((row) => row.verdict === "gap").length,
+    uncited_content: run.matrix.rows.filter((row) => row.verdict === "scope").length,
+    findings: run.findings.map((finding) => ({
+      id: finding.id,
+      kind: finding.kind,
+      severity: finding.severity,
+      layer_key: finding.layerKey,
+      section_id: finding.sectionId,
+      requirement_id: finding.requirementId,
+      summary: finding.summary,
+      detail: finding.detail,
+      has_proposed_diff: finding.proposedDiff !== null,
+    })),
+  };
 }

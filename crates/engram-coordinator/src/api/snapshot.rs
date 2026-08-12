@@ -50,7 +50,7 @@ const OP_OBSERVE_POLL: Duration = Duration::from_millis(250);
 /// is the benign default (zero secrets means broker mode does
 /// nothing); see the matching create-path placeholder in
 /// `api/sessions.rs`.
-fn placeholder_egress_policy(
+pub(crate) fn placeholder_egress_policy(
     session_id: SessionId,
     sandbox_id: SandboxId,
 ) -> engram_core::types::egress::SessionEgressPolicy {
@@ -70,85 +70,12 @@ fn placeholder_egress_policy(
     }
 }
 
-/// Build the resume-shape `AgentSpec` + `SessionEgressPolicy` to (re)attach a
-/// harness to `sandbox_id` for `session`. Loads the image manifest bundle +
-/// secrets ONCE and reuses it for both the spec and the policy.
-///
-/// The spec is **resume-shaped**: `resolve_harness(prompt = None)`. Prompt-less
-/// is load-bearing — the initial prompt rides the harness env, so a boot-shape
-/// respawn of an *exited* harness would re-inject it mid-conversation; the
-/// resume shape just `--resume`s the existing claude session and goes `Idle`.
-///
-/// Shared by [`finish_resume_to_active`] (a fresh post-restore sandbox) and the
-/// ADR 0034 Track A desync watchdog's in-place reattach (the session's existing
-/// LIVE sandbox). `None` when the manifest bundle can't load (dev-VM / process
-/// backend) — callers skip the agent attach, exactly as resume did before.
-pub(crate) async fn resolve_resume_agent_and_policy(
-    state: &SharedState,
-    session: &Session,
-    sandbox_id: SandboxId,
-) -> Option<(
-    engram_core::types::sandbox::AgentSpec,
-    engram_core::types::egress::SessionEgressPolicy,
-)> {
-    let id = session.id;
-    // ADR 0016 §A.1.7: load manifest + SecretBundle + env once; reused for the
-    // launch env AND the egress policy (avoids a second SecretStore round-trip).
-    let (resume_bundle, resume_base_env) =
-        crate::api::sessions::resolve_session_env(state, session).await;
-    let b = resume_bundle.as_ref()?;
-    // Same split as create: agentd holds the durable session env (image env +
-    // secrets + session id); the harness gets the forge broker token as a
-    // per-spawn extra, from the PG-sealed row (ADR 0047) — same token across
-    // coord restarts and replicas.
-    let mut session_env = resume_base_env.clone();
-    session_env.insert("ENGRAM_SESSION_ID".into(), id.to_string());
-    // ADR 0062: the harness comes from the session's persisted selection (not the
-    // baked manifest). The dyn_0 catalog mount is re-anchored from the eviction
-    // snapshot's aux_bundles, so we use only the AgentSpec here (the argv still
-    // points at /opt/engram/dyn/0/<name>/<exec>); the returned mount is dropped.
-    let selected_harness = state
-        .services
-        .meta
-        .get_session_harness(id)
-        .await
-        .ok()
-        .flatten();
-    // The harness egress is dropped alongside the mount: the resume path
-    // re-reads the session policy persisted at create, which already carries
-    // the merged harness egress (ADR 0063 addendum).
-    let (mut agent, _harness_mount, _harness_egress) = crate::api::sessions::resolve_harness(
-        state,
-        selected_harness.as_deref(),
-        session.mode,
-        id,
-        session_env,
-        b.config.workdir.clone(),
-        // Resume: the mode was validated when its prompt was accepted.
-        None,
-    )
-    .await
-    .ok()
-    .flatten()?;
-    crate::api::sessions::inject_harness_env(state, id, &mut agent.env).await;
-    // ADR 0073: stamp the CURRENT epoch (this runs after the flow's
-    // bind — minted for fresh-spawn resumes, unminted for live moves,
-    // where the surviving harness must keep validating).
-    agent.binding_epoch = state
-        .services
-        .meta
-        .current_binding_epoch(id)
-        .await
-        .unwrap_or(0);
-    // Rebuild the SessionEgressPolicy for `sandbox_id`. Falls back to the
-    // legacy placeholder when the host has no guest IP (process backend, VZ in
-    // some configs) or the IP is unparseable — same as the create path.
-    let policy =
-        crate::api::sessions::build_resume_egress_policy(state, id, sandbox_id, &session.image)
-            .await
-            .unwrap_or_else(|| placeholder_egress_policy(id, sandbox_id));
-    Some((agent, policy))
-}
+// ADR 0116 B2: the resume-shape agent+policy derivation moved to
+// `crate::boot_materializer::materialize_snapshot_resume` — one home for
+// every boot flavor's materialization, with the resume flavor's absences
+// (no mount: aux pins re-anchor host-side; no egress merge: the persisted
+// policy already carries it) expressed structurally instead of by
+// positional tuple-drops.
 
 /// Re-establish a session's harness on its EXISTING live sandbox without a
 /// teardown — the shared primitive behind the ADR 0034 Track A desync watchdog
@@ -187,7 +114,8 @@ pub(crate) async fn reattach_harness_in_place(
     if session.sandbox_id != Some(sandbox_id) {
         return Ok(false);
     }
-    let Some((agent, policy)) = resolve_resume_agent_and_policy(state, &session, sandbox_id).await
+    let Some(crate::boot_materializer::ResumeMaterials { agent, policy }) =
+        crate::boot_materializer::materialize_snapshot_resume(state, &session, sandbox_id).await
     else {
         return Ok(false);
     };
@@ -1195,17 +1123,10 @@ async fn resume_disk_only_cold_boot(
     ctx: &crate::session_ops::OpCtx<'_>,
     session: Session,
 ) -> Result<SnapshotResponse, ApiError> {
-    use crate::evacuation::{evacuate_dead_source, resolve_cold_boot_spec, EvacError};
+    use crate::evacuation::{evacuate_dead_source, EvacError};
 
     let state = ctx.state;
     let id = session.id;
-    let Some(spec) = resolve_cold_boot_spec(&state.services.meta, &session).await else {
-        return Err(ApiError::Conflict(format!(
-            "session {id} has only a live disk manifest and its image `{}` is no \
-             longer enabled — re-enable it (POST /api/enabled-images), then retry /resume",
-            session.image,
-        )));
-    };
 
     // The previous host isn't dead here (Idle = the sandbox was
     // destroyed); clearing host_id disables `exclude_host` so a
@@ -1223,7 +1144,11 @@ async fn resume_disk_only_cold_boot(
         &state.services.meta,
         relocatable,
         None,
-        Some(spec),
+        // ADR 0116: lazily materialized — this path is disk-only by
+        // construction (no snapshot above), so the rung-2 branch always
+        // awaits it; the laziness keeps ONE call shape with the
+        // evac-resumer leg, where rung-1 must never run these reads.
+        crate::boot_materializer::materialize_cold_boot(state, &session),
         None,
         // ADR 0045 C2 (E2B fold, origin affinity): prefer the host the
         // session last ran on — its NBD chunk cache (and base shm) are
@@ -1246,6 +1171,17 @@ async fn resume_disk_only_cold_boot(
         EvacError::NoTargetAvailable(_) => ApiError::Unavailable(format!(
             "no host can take the disk-only cold-boot recovery right now: {e}. \
              Retry shortly.",
+        )),
+        // Image un-enabled: structural, user-actionable — same message the
+        // eager pre-check used to produce.
+        EvacError::ColdBootUnavailable(_) => ApiError::Conflict(format!(
+            "session {id} has only a live disk manifest and its image `{}` is no \
+             longer enabled — re-enable it (POST /api/enabled-images), then retry /resume",
+            session.image,
+        )),
+        // Transient slot-resolution read: retryable, not terminal.
+        EvacError::SpecResolution(_) => ApiError::Unavailable(format!(
+            "cold-boot spec resolution hit a transient error: {e}. Retry shortly.",
         )),
         _ => ApiError::Internal(format!("disk-only cold-boot recovery failed: {e}")),
     })?;
@@ -1580,7 +1516,9 @@ pub async fn finish_resume_to_active(
     // skip the agent re-attach then, same as before.
     let mut start_agent_failed: Option<String> = None;
     if let Some((agent, policy)) =
-        resolve_resume_agent_and_policy(state, session, new_sandbox_id).await
+        crate::boot_materializer::materialize_snapshot_resume(state, session, new_sandbox_id)
+            .await
+            .map(|m| (m.agent, m.policy))
     {
         if let Err(e) = state
             .services
@@ -1745,9 +1683,8 @@ async fn resume_from_fc_snapshot(
     // can't be resolved (image un-enabled, etc.) we fall back to the
     // pre-0072 soft `None` posture — the tier-0 DISK veto (the primary
     // locality signal) still fires regardless.
-    let resume_budget = crate::evacuation::resolve_cold_boot_spec(&state.services.meta, &session)
-        .await
-        .map(|spec| (spec.memory.max_mib, spec.cpu.vcpus));
+    let resume_budget =
+        crate::boot_materializer::resolve_resume_budget(&state.services.meta, &session).await;
     let ctx = ScheduleContext {
         repo: image_repo,
         image_version: image_tag,

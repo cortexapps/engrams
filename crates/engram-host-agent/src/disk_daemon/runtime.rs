@@ -202,9 +202,67 @@ pub struct NbdHandle {
     nbd_device: PathBuf,
     /// Device minor (`N` of `/dev/nbdN`) for netlink commands.
     index: u32,
-    /// Background tokio task running the NBD serve loop. Aborted
-    /// on `Drop`.
+    /// Background tokio task running the serve SUPERVISOR (ADR 0116
+    /// C2), which owns the serve loop and every RECONFIGURE retry.
+    /// Aborted on `Drop`.
     serve_task: Option<TokioJoinHandle<()>>,
+    /// ADR 0116 C2: lifecycle state shared with the supervisor. The
+    /// handle's ONLY write is `released` (set before the abort in both
+    /// `Drop` and [`Self::abandon`]), which is the explicit-release
+    /// fact that distinguishes deliberate teardown from an unsolicited
+    /// serve death the supervisor must repair.
+    shared: Arc<ServeShared>,
+}
+
+/// ADR 0116 C2: the serve lifecycle, published by the supervisor on a
+/// watch channel. The 2026-08-12 incident's shape — a serve loop dying
+/// with nothing noticing while the kernel parked I/O for a
+/// `dead_conn_timeout` nobody used — is unrepresentable under this
+/// contract: a loop is `Serving`, or it was explicitly released, or the
+/// supervisor is restarting it, or it says loudly why it gave up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServeStatus {
+    /// Configured; the current socket's adoption is not yet confirmed
+    /// (the kernel silently drops a RECONFIGURE socket when no dead
+    /// connection slot exists yet — see [`reattach`]'s doc).
+    Adopting,
+    /// The serve loop is alive and confirmed adopted.
+    Serving,
+    /// Initial adoption never succeeded within its budget (Reconfigure
+    /// mode). The device stays configured; the caller decides
+    /// (rehydrate quarantines the survivor).
+    AdoptionFailed,
+    /// Post-adoption restart budget exhausted. The device stays
+    /// configured — guest I/O parks under `dead_conn_timeout`, and the
+    /// sandbox's failing flushes surface it (C4's escalation ladder).
+    Exhausted,
+}
+
+/// Shared between [`NbdHandle`] and its supervisor task.
+struct ServeShared {
+    /// True once the handle's owner tore the serve down ON PURPOSE
+    /// (`Drop`, [`NbdHandle::abandon`]). The supervisor treats any
+    /// serve-loop exit with this set as legitimate and stops.
+    released: std::sync::atomic::AtomicBool,
+    status_tx: tokio::sync::watch::Sender<ServeStatus>,
+}
+
+impl ServeShared {
+    fn new(initial: ServeStatus) -> (Arc<Self>, tokio::sync::watch::Receiver<ServeStatus>) {
+        let (status_tx, rx) = tokio::sync::watch::channel(initial);
+        (
+            Arc::new(Self {
+                released: std::sync::atomic::AtomicBool::new(false),
+                status_tx,
+            }),
+            rx,
+        )
+    }
+
+    fn released(&self) -> bool {
+        self.released.load(std::sync::atomic::Ordering::SeqCst)
+            || SHUTDOWN_ABANDON_MODE.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl NbdHandle {
@@ -216,18 +274,39 @@ impl NbdHandle {
     /// support for the survivor-rehydrate path; production death is
     /// the real thing.
     pub fn abandon(mut self) {
+        // ADR 0116 C2: mark the release BEFORE the abort so a supervisor
+        // iteration racing the abort observes a legitimate teardown, not
+        // an unsolicited death to repair.
+        self.shared
+            .released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(task) = self.serve_task.take() {
             task.abort();
         }
         // Skip Drop (which would netlink-disconnect).
         std::mem::forget(self);
     }
+
+    /// ADR 0116 C2: subscribe to the supervisor's lifecycle. `reattach`
+    /// awaits `Serving`/`AdoptionFailed` on this instead of polling the
+    /// serve task's `is_finished` (the pre-C2 race-prone confirm).
+    pub fn status(&self) -> tokio::sync::watch::Receiver<ServeStatus> {
+        self.shared.status_tx.subscribe()
+    }
 }
 
 impl Drop for NbdHandle {
     fn drop(&mut self) {
-        // Abort the serve loop first (its socket half dying is what
-        // the kernel's recv worker observes), then issue the netlink
+        // ADR 0116 C2: a Drop is an explicit release — flag it before
+        // the abort so the supervisor never repairs a deliberate
+        // teardown.
+        self.shared
+            .released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Abort the supervisor first — the serve loop is polled INLINE
+        // inside it (never a child task, #1221 review), so this abort
+        // cancels the serve future and drops its socket half, which is
+        // what the kernel's recv worker observes. Then issue the netlink
         // disconnect from a detached thread: the genl round-trip is
         // normally instant, but it can wait on in-flight kernel-side
         // teardown and Drop often runs on a tokio worker (ADR 0017
@@ -1266,7 +1345,7 @@ pub async fn spawn(
         nbd_device,
         backend_id,
         ConnectMode::Connect,
-        &HostNbdKernel,
+        Arc::new(HostNbdKernel),
     )
     .await
 }
@@ -1294,112 +1373,64 @@ pub async fn reattach(
     nbd_device: &Path,
     backend_id: &str,
 ) -> Result<NbdHandle, NbdRuntimeError> {
-    let budget = std::time::Duration::from_secs(150);
-    let started = crate::time_source::metrics_now();
-    let mut attempt = 0u32;
+    // ADR 0116 C2: adoption retries are the SUPERVISOR's job now — one
+    // owner for every RECONFIGURE, whether at rehydrate or after a
+    // mid-life serve death. This wrapper just awaits the verdict on the
+    // status watch (replacing the pre-C2 `is_finished` polling, whose
+    // scheduling-jitter race produced false adoptions under load).
+    let handle = serve_at(
+        backend,
+        nbd_device,
+        backend_id,
+        ConnectMode::Reconfigure,
+        Arc::new(HostNbdKernel),
+    )
+    .await?;
+    let mut status = handle.status();
     loop {
-        attempt += 1;
-        let handle = serve_at(
-            backend.clone(),
-            nbd_device,
-            backend_id,
-            ConnectMode::Reconfigure,
-            &HostNbdKernel,
-        )
-        .await?;
-        // An adopted socket stays open (the kernel holds its dup); a
-        // rejected one (kernel-swallowed ENOSPC) EOFs the serve loop. The
-        // EOF is near-instant in the KERNEL, but observing the serve task
-        // FINISH is subject to runtime scheduling jitter — a single short
-        // check raced it under load: a rejection whose EOF surfaced after
-        // the window read as a FALSE "adopted", `reattach` returned Ok, and
-        // the guest's parked I/O never resumed (flaky
-        // survivor_reconfigure_resumes_parked_io; in prod, a hung guest).
-        // Poll for the rejection EOF over a generous window — retry the
-        // moment it finishes, declare adoption only if it stays alive.
-        const ADOPT_CONFIRM: std::time::Duration = std::time::Duration::from_secs(2);
-        let confirm_deadline = crate::time_source::metrics_now() + ADOPT_CONFIRM;
-        let mut rejected = false;
-        while crate::time_source::metrics_now() < confirm_deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if handle
-                .serve_task
-                .as_ref()
-                .map(|t| t.is_finished())
-                .unwrap_or(true)
-            {
-                rejected = true;
-                break;
+        match *status.borrow() {
+            ServeStatus::Serving => return Ok(handle),
+            ServeStatus::AdoptionFailed | ServeStatus::Exhausted => {
+                // Not adopted. Abandon WITHOUT the netlink disconnect —
+                // the device must stay configured for the parked guest
+                // I/O and any later retry.
+                handle.abandon();
+                return Err(NbdRuntimeError::Io(io::Error::other(format!(
+                    "NBD RECONFIGURE not adopted within {ADOPTION_BUDGET:?}: the kernel \
+                     reports success but closes the socket — predecessor's connection \
+                     never marked dead?"
+                ))));
             }
+            ServeStatus::Adopting => {}
         }
-        if !rejected {
-            if attempt > 1 {
-                tracing::info!(
-                    device = %nbd_device.display(),
-                    attempt,
-                    waited_ms = started.elapsed().as_millis() as u64,
-                    "NBD RECONFIGURE adopted after retries",
-                );
-            }
-            return Ok(handle);
+        if status.changed().await.is_err() {
+            // Supervisor gone without a verdict (release raced us).
+            handle.abandon();
+            return Err(NbdRuntimeError::Io(io::Error::other(
+                "NBD serve supervisor ended before adoption was confirmed",
+            )));
         }
-        // Not adopted. Drop WITHOUT the netlink disconnect (the
-        // device must stay configured for the next attempt — and
-        // for the parked guest I/O).
-        handle.abandon();
-        if started.elapsed() > budget {
-            return Err(NbdRuntimeError::Io(io::Error::other(format!(
-                "NBD RECONFIGURE not adopted within {budget:?} ({attempt} attempts): \
-                 the kernel reports success but closes the socket — predecessor's \
-                 connection never marked dead?"
-            ))));
-        }
-        tracing::debug!(
-            device = %nbd_device.display(),
-            attempt,
-            "NBD RECONFIGURE socket not adopted (kernel-swallowed ENOSPC); retrying",
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
 
+#[derive(Clone, Copy)]
 enum ConnectMode {
     Connect,
     Reconfigure,
 }
 
-async fn serve_at(
-    backend: Arc<ChunkedDiskBackend>,
+/// ADR 0116 C2: one CONNECT/RECONFIGURE round-trip — fresh socketpair,
+/// kernel-side half handed to the kernel seam, server-side half returned
+/// as the serve stream. Factored out of `serve_at` so the supervisor can
+/// repeat it on every restart.
+async fn configure_socket(
+    kernel: &(dyn NbdKernel + Send + Sync),
+    mode: ConnectMode,
     nbd_device: &Path,
     backend_id: &str,
-    mode: ConnectMode,
-    // ADR 0098 P7 (Flow B): the kernel control plane behind the seam. Prod
-    // passes `&HostNbdKernel`; the CONNECT/RECONFIGURE genl round-trips run on
-    // `spawn_blocking` inside the impl. serve_at owns the socketpair lifetime
-    // (below), so it stays the choke point for the serve loop.
-    kernel: &dyn NbdKernel,
-) -> Result<NbdHandle, NbdRuntimeError> {
-    let total_bytes = backend.total_bytes();
-    if !total_bytes.is_multiple_of(NBD_BLOCK_SIZE) {
-        return Err(NbdRuntimeError::UnalignedSize {
-            total_bytes,
-            block_size: NBD_BLOCK_SIZE,
-        });
-    }
-    let index = nbd_netlink::device_index(nbd_device)?;
-
-    // 1. socketpair(AF_UNIX, SOCK_STREAM). Both halves are SOCK_STREAM
-    //    so reads block until enough bytes arrive (vs SOCK_DGRAM which
-    //    would frame-truncate). One end goes to the kernel, the other
-    //    stays in-process as a Tokio stream.
+    total_bytes: u64,
+) -> Result<TokioUnixStream, NbdRuntimeError> {
     let (kernel_side, server_side) = unix_socketpair()?;
-
-    // 2. Configure (or re-arm) the device through the kernel seam. The
-    //    kernel dups the socket fd, runs its own receive machinery (no
-    //    NBD_DO_IT thread), and parks guest I/O for `dead_conn_timeout`
-    //    whenever the connection dies — the pod-roll survival contract. The
-    //    serve fd is the kernel-side half, alive across the await because
-    //    serve_at owns it until `drop(kernel_side)` below.
     let serve_fd = kernel_side.as_raw_fd();
     match mode {
         ConnectMode::Connect => {
@@ -1429,6 +1460,236 @@ async fn serve_at(
     }
     // The kernel holds its own reference now.
     drop(kernel_side);
+    Ok(TokioUnixStream::from_std(server_side)?)
+}
+
+/// ADR 0116 C2: supervisor timing/budget knobs. Prod uses
+/// [`Default`]; tests inject tiny values so budget behavior is testable
+/// in milliseconds.
+#[derive(Clone, Copy, Debug)]
+struct SupervisorTuning {
+    /// How long a fresh socket must serve before it counts as adopted
+    /// (the kernel silently drops a RECONFIGURE socket when no dead
+    /// connection slot exists yet; the drop EOFs our loop within ms).
+    adopt_confirm: std::time::Duration,
+    /// Per-(re)configure budget for adoption retries — covers a full
+    /// 90 s request-timeout straggler marking the predecessor's
+    /// connection dead.
+    adoption_budget: std::time::Duration,
+    /// Unsolicited post-adoption deaths tolerated per window.
+    restart_budget: usize,
+    restart_window: std::time::Duration,
+}
+
+impl Default for SupervisorTuning {
+    fn default() -> Self {
+        Self {
+            adopt_confirm: std::time::Duration::from_secs(2),
+            adoption_budget: std::time::Duration::from_secs(150),
+            restart_budget: 5,
+            restart_window: std::time::Duration::from_secs(600),
+        }
+    }
+}
+
+/// Adoption-retry budget, surfaced for `reattach`'s error message.
+const ADOPTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// ADR 0116 C2: the serve supervisor — the data-plane form of the
+/// campaign invariant. A serve loop may be down only via explicit
+/// release (`Drop` / `abandon` / shutdown-abandon) — any other exit is
+/// repaired in place: fresh socketpair, netlink RECONFIGURE against the
+/// SAME live backend (dirty tier preserved), adoption-confirmed, within
+/// the kernel's `dead_conn_timeout` park window. The 2026-08-12 nbd98
+/// death sat recoverable for 7 hours because nothing owned this repair.
+#[allow(clippy::too_many_arguments)] // cohesive supervisor inputs
+async fn supervise(
+    backend: Arc<ChunkedDiskBackend>,
+    nbd_device: PathBuf,
+    backend_id: String,
+    kernel: Arc<dyn NbdKernel + Send + Sync>,
+    shared: Arc<ServeShared>,
+    first_stream: TokioUnixStream,
+    // Reconfigure mode: the first socket's adoption needs confirming too.
+    mut confirm_pending: bool,
+    tuning: SupervisorTuning,
+) {
+    let device_label = nbd_device.display().to_string();
+    let total_bytes = backend.total_bytes();
+    let mut stream = Some(first_stream);
+    let mut adoption_deadline = crate::time_source::metrics_now() + tuning.adoption_budget;
+    let mut restarts: Vec<std::time::Instant> = Vec::new();
+    'serve: loop {
+        let Some(s) = stream.take() else { return };
+        // #1221 review (HIGH): the serve loop is polled INLINE — never
+        // spawned as a child task. Aborting a task does not cancel its
+        // children, so a spawned loop would survive `Drop`/`abandon()`'s
+        // abort of the supervisor as a detached zombie holding the
+        // socket open: the kernel never marks the connection dead, and
+        // the reattach BLKFLSBUF-failure path ("nothing serves reads
+        // meanwhile") would silently serve stale predecessor pages
+        // (#810 class). Inline, cancelling the supervisor cancels this
+        // future, dropping the stream halves — the socket dies exactly
+        // as the pre-C2 direct abort did.
+        let mut serve = std::pin::pin!(serve_loop(backend.clone(), s, device_label.clone()));
+        if confirm_pending {
+            // Rejection-aware confirm: a kernel-swallowed RECONFIGURE
+            // (clean-ACKed ENOSPC) EOFs the loop within ms; a socket that
+            // serves past the confirm window is adopted.
+            tokio::select! {
+                _ = &mut serve => {
+                    if shared.released() {
+                        return;
+                    }
+                    if crate::time_source::metrics_now() > adoption_deadline {
+                        tracing::error!(device = %device_label,
+                            "NBD serve adoption never confirmed within its budget; giving up \
+                             (device stays configured; guest I/O parks under dead_conn_timeout)");
+                        let _ = shared.status_tx.send(ServeStatus::AdoptionFailed);
+                        return;
+                    }
+                    tokio::time::sleep(tuning.adopt_confirm).await;
+                    // fall through to re-configure below
+                }
+                _ = tokio::time::sleep(tuning.adopt_confirm) => {
+                    // Adopted. (`confirm_pending` needs no reset: every
+                    // re-configure below sets it true again explicitly.)
+                    let _ = shared.status_tx.send(ServeStatus::Serving);
+                    serve.as_mut().await;
+                    if shared.released() {
+                        return;
+                    }
+                    if !budget_permits_restart(
+                        &mut restarts,
+                        &device_label,
+                        &shared,
+                        tuning,
+                    ) {
+                        return;
+                    }
+                    adoption_deadline =
+                        crate::time_source::metrics_now() + tuning.adoption_budget;
+                }
+            }
+        } else {
+            let _ = shared.status_tx.send(ServeStatus::Serving);
+            serve.as_mut().await;
+            if shared.released() {
+                return;
+            }
+            if !budget_permits_restart(&mut restarts, &device_label, &shared, tuning) {
+                return;
+            }
+            adoption_deadline = crate::time_source::metrics_now() + tuning.adoption_budget;
+        }
+        let _ = shared.status_tx.send(ServeStatus::Adopting);
+        loop {
+            match configure_socket(
+                &*kernel,
+                ConnectMode::Reconfigure,
+                &nbd_device,
+                &backend_id,
+                total_bytes,
+            )
+            .await
+            {
+                Ok(s) => {
+                    stream = Some(s);
+                    confirm_pending = true;
+                    continue 'serve;
+                }
+                Err(e) => {
+                    if shared.released() {
+                        return;
+                    }
+                    // A netlink failure is likely persistent; pace it and
+                    // let the adoption budget bound the retries.
+                    tracing::warn!(device = %device_label, error = %e,
+                        "NBD RECONFIGURE failed during supervised re-serve; retrying");
+                    if crate::time_source::metrics_now() > adoption_deadline {
+                        tracing::error!(device = %device_label,
+                            "NBD supervised re-serve exhausted its adoption budget on \
+                             RECONFIGURE errors; giving up");
+                        let _ = shared.status_tx.send(if restarts.is_empty() {
+                            ServeStatus::AdoptionFailed
+                        } else {
+                            ServeStatus::Exhausted
+                        });
+                        return;
+                    }
+                    tokio::time::sleep(tuning.adopt_confirm).await;
+                }
+            }
+        }
+    }
+}
+
+/// Prune the restart window and decide whether another repair is
+/// allowed. On exhaustion: loud error + counter + `Exhausted` status,
+/// device deliberately left configured (guest I/O parks under
+/// `dead_conn_timeout`; the sandbox's failing flushes escalate it —
+/// C4's ladder).
+fn budget_permits_restart(
+    restarts: &mut Vec<std::time::Instant>,
+    device_label: &str,
+    shared: &ServeShared,
+    tuning: SupervisorTuning,
+) -> bool {
+    let now = crate::time_source::metrics_now();
+    restarts.retain(|t| now.duration_since(*t) < tuning.restart_window);
+    if restarts.len() >= tuning.restart_budget {
+        tracing::error!(device = %device_label,
+            budget = tuning.restart_budget,
+            window_secs = tuning.restart_window.as_secs(),
+            "NBD serve restart budget exhausted; leaving the device configured \
+             (guest I/O parks under dead_conn_timeout; the sandbox's failing \
+             flushes escalate it)");
+        ::metrics::counter!(
+            crate::metrics::NBD_SERVE_RESTART_BUDGET_EXHAUSTED_TOTAL,
+            "device" => device_label.to_string(),
+        )
+        .increment(1);
+        let _ = shared.status_tx.send(ServeStatus::Exhausted);
+        return false;
+    }
+    restarts.push(now);
+    ::metrics::counter!(
+        crate::metrics::NBD_SERVE_RESTARTS_TOTAL,
+        "device" => device_label.to_string(),
+    )
+    .increment(1);
+    tracing::warn!(device = %device_label,
+        restarts_in_window = restarts.len(),
+        "NBD serve loop died without release; re-serving via RECONFIGURE");
+    true
+}
+
+async fn serve_at(
+    backend: Arc<ChunkedDiskBackend>,
+    nbd_device: &Path,
+    backend_id: &str,
+    mode: ConnectMode,
+    // ADR 0098 P7 (Flow B): the kernel control plane behind the seam. Prod
+    // passes `HostNbdKernel`; the CONNECT/RECONFIGURE genl round-trips run on
+    // `spawn_blocking` inside the impl. ADR 0116 C2: owned (`Arc`) because the
+    // supervisor repeats RECONFIGURE across the handle's lifetime.
+    kernel: Arc<dyn NbdKernel + Send + Sync>,
+) -> Result<NbdHandle, NbdRuntimeError> {
+    let total_bytes = backend.total_bytes();
+    if !total_bytes.is_multiple_of(NBD_BLOCK_SIZE) {
+        return Err(NbdRuntimeError::UnalignedSize {
+            total_bytes,
+            block_size: NBD_BLOCK_SIZE,
+        });
+    }
+    let index = nbd_netlink::device_index(nbd_device)?;
+
+    // 1+2. Configure (or re-arm) the device through the kernel seam
+    //    (socketpair + genl round-trip; see `configure_socket`). The
+    //    kernel dups the socket fd, runs its own receive machinery (no
+    //    NBD_DO_IT thread), and parks guest I/O for `dead_conn_timeout`
+    //    whenever the connection dies — the pod-roll survival contract.
+    let stream = configure_socket(&*kernel, mode, nbd_device, backend_id, total_bytes).await?;
 
     // Register the served device on the backend so every capture
     // (`ChunkedDiskBackend::flush_local`) syncs the HOST page cache
@@ -1439,14 +1700,33 @@ async fn serve_at(
         Arc::new(crate::device_sync::HostDeviceSync),
     );
 
-    // 3. Spawn the tokio serve task on the server-side socket.
-    let stream = TokioUnixStream::from_std(server_side)?;
-    let serve_task = tokio::spawn(serve_loop(backend, stream));
+    // 3. Spawn the SUPERVISOR (ADR 0116 C2), which owns the serve loop
+    //    and every subsequent RECONFIGURE. A CONNECT is adopted by
+    //    definition (the genl call fails loudly otherwise); a
+    //    RECONFIGURE's first socket needs the adoption confirm.
+    let confirm_pending = matches!(mode, ConnectMode::Reconfigure);
+    let initial = if confirm_pending {
+        ServeStatus::Adopting
+    } else {
+        ServeStatus::Serving
+    };
+    let (shared, _rx) = ServeShared::new(initial);
+    let serve_task = tokio::spawn(supervise(
+        backend,
+        nbd_device.to_path_buf(),
+        backend_id.to_string(),
+        kernel,
+        shared.clone(),
+        stream,
+        confirm_pending,
+        SupervisorTuning::default(),
+    ));
 
     Ok(NbdHandle {
         nbd_device: nbd_device.to_path_buf(),
         index,
         serve_task: Some(serve_task),
+        shared,
     })
 }
 
@@ -1502,7 +1782,19 @@ fn unix_socketpair() -> io::Result<(OwnedFd, std::os::unix::net::UnixStream)> {
 /// the virtio→kernel-NBD→userspace pipeline) counts a request as
 /// in-flight until its bytes are on the wire. `ENGRAM_NBD_SERVE_CONCURRENCY=1`
 /// reproduces the legacy strictly-serial loop.
-async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
+async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream, device: String) {
+    // ADR 0116 C1: every exit path names its cause. Anything except
+    // `disconnect` leaves a configured device with no server — the
+    // kernel parks I/O for dead_conn_timeout, then fails the device
+    // permanently (the 2026-08-12 nbd98 shape). C2 supervises on this.
+    let exit = |reason: &'static str| {
+        ::metrics::counter!(
+            crate::metrics::NBD_SERVE_EXITS_TOTAL,
+            "reason" => reason,
+            "device" => device.clone(),
+        )
+        .increment(1);
+    };
     let in_flight = backend.in_flight_tracker();
     let concurrency = nbd_serve_concurrency();
     let sem = Arc::new(Semaphore::new(concurrency));
@@ -1512,7 +1804,7 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
     // unboundedly. Capacity = concurrency: every in-flight reply fits, so
     // a keeping-up kernel never blocks a handler on send.
     let (reply_tx, reply_rx) = mpsc::channel::<ReplyMsg>(concurrency.max(1));
-    let writer = tokio::spawn(writer_loop(write_half, reply_rx));
+    let writer = tokio::spawn(writer_loop(write_half, reply_rx, device.clone()));
 
     loop {
         let mut header = [0u8; REQUEST_HEADER_LEN];
@@ -1520,10 +1812,12 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 tracing::info!("NBD serve loop: kernel closed socket cleanly");
+                exit("eof");
                 break;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "NBD serve loop: read header failed");
+                exit("read_error");
                 break;
             }
         }
@@ -1531,6 +1825,7 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(error = %e, "NBD serve loop: malformed request header");
+                exit("parse_error");
                 break;
             }
         };
@@ -1538,6 +1833,7 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
         // Disconnect is a sentinel to end the loop, not a tracked op.
         if matches!(req.command, NbdCommand::Disconnect) {
             tracing::info!("NBD client requested disconnect");
+            exit("disconnect");
             break;
         }
 
@@ -1551,11 +1847,13 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
                     length = req.length,
                     "NBD serve loop: WRITE payload length exceeds request or disk bound"
                 );
+                exit("write_bound");
                 break;
             }
             let mut data = vec![0u8; req.length as usize];
             if let Err(e) = read_half.read_exact(&mut data).await {
                 tracing::warn!(error = %e, "NBD write payload read failed");
+                exit("payload_read_error");
                 break;
             }
             Some(data)
@@ -1698,20 +1996,40 @@ async fn handle_request(
 /// keeps the wire well-formed under concurrent handlers. Each message's
 /// guard+permit drop at the end of the iteration — AFTER the flush — so
 /// `wait_idle()` observes the request as in-flight until then.
-async fn writer_loop(mut write_half: OwnedWriteHalf, mut reply_rx: mpsc::Receiver<ReplyMsg>) {
+async fn writer_loop(
+    mut write_half: OwnedWriteHalf,
+    mut reply_rx: mpsc::Receiver<ReplyMsg>,
+    device: String,
+) {
     while let Some(msg) = reply_rx.recv().await {
         if let Err(e) = write_half.write_all(&msg.header).await {
             tracing::warn!(error = %e, "NBD reply header write failed");
+            // ADR 0116 C1: the 2026-08-12 signature — the kernel marked
+            // the sock dead (send-side timeout) and our write EPIPEs.
+            ::metrics::counter!(
+                crate::metrics::NBD_SERVE_EXITS_TOTAL,
+                "reason" => "reply_write_error",
+                "device" => device,
+            )
+            .increment(1);
             return;
         }
         if let Some(payload) = &msg.payload {
             if let Err(e) = write_half.write_all(payload).await {
                 tracing::warn!(error = %e, "NBD reply payload write failed");
+                ::metrics::counter!(
+                    crate::metrics::NBD_SERVE_EXITS_TOTAL,
+                    "reason" => "reply_write_error",
+                    "device" => device,
+                )
+                .increment(1);
                 return;
             }
         }
         // `msg` (guard + permit) drops here, after the reply is on the wire.
     }
+    // Clean end: serve_loop dropped the sender on its own (already
+    // counted) exit — not a distinct death.
 }
 
 #[cfg(test)]
@@ -1795,7 +2113,7 @@ mod tests {
             &device,
             "test-backend",
             ConnectMode::Connect,
-            &FakeKernel,
+            Arc::new(FakeKernel),
         )
         .await
         .unwrap();
@@ -1888,7 +2206,7 @@ mod tests {
         let backend = Arc::new(backend);
         let in_flight = backend.in_flight_tracker();
         let (client, server) = TokioUnixStream::pair().unwrap();
-        let serve = tokio::spawn(serve_loop(backend, server));
+        let serve = tokio::spawn(serve_loop(backend, server, "/dev/nbd-test".into()));
         let (mut rd, mut wr) = client.into_split();
 
         let cs = 4096u32;
@@ -1927,7 +2245,7 @@ mod tests {
         let (backend, _dir) = three_chunk_backend().await;
         let backend = Arc::new(backend);
         let (client, server) = TokioUnixStream::pair().unwrap();
-        let serve = tokio::spawn(serve_loop(backend, server));
+        let serve = tokio::spawn(serve_loop(backend, server, "/dev/nbd-test".into()));
         let (mut rd, mut wr) = client.into_split();
 
         // WRITE 4096 bytes of 0xff at offset 0 (NBD_CMD_WRITE = 1): header then
@@ -1956,7 +2274,7 @@ mod tests {
         let backend = Arc::new(backend);
         let assertion_backend = backend.clone();
         let (client, server) = TokioUnixStream::pair().unwrap();
-        let serve = tokio::spawn(serve_loop(backend, server));
+        let serve = tokio::spawn(serve_loop(backend, server, "/dev/nbd-test".into()));
         let (mut rd, mut wr) = client.into_split();
 
         wr.write_all(&req_bytes(1, 1, 0, u32::MAX)).await.unwrap();
@@ -1973,5 +2291,227 @@ mod tests {
 
         let contents = assertion_backend.read(0, 4096).await.unwrap();
         assert!(contents.iter().all(|byte| *byte == 0xaa));
+    }
+
+    /// ADR 0116 C2 test rig: records every kernel call and hands the
+    /// KERNEL-side socket half to the test, which then plays the kernel —
+    /// driving requests, reading replies, and dropping the socket to
+    /// simulate an unsolicited serve death.
+    struct RecordingKernel {
+        socks: tokio::sync::mpsc::UnboundedSender<std::os::unix::net::UnixStream>,
+        reconfigures: Arc<std::sync::atomic::AtomicUsize>,
+        disconnects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RecordingKernel {
+        fn dup_and_send(&self, serve_fd: std::os::fd::RawFd) -> io::Result<()> {
+            // SAFETY: dup a live fd the caller owns for the duration of
+            // this call; the dup is immediately owned by UnixStream.
+            let duped = unsafe { libc::dup(serve_fd) };
+            if duped < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `duped` is a fresh fd we own.
+            let sock = unsafe { std::os::unix::net::UnixStream::from_raw_fd(duped) };
+            let _ = self.socks.send(sock);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl engram_host_core::NbdKernel for RecordingKernel {
+        async fn connect(&self, req: engram_host_core::NbdConnectRequest<'_>) -> io::Result<()> {
+            self.dup_and_send(req.serve_fd)
+        }
+        async fn reconfigure(
+            &self,
+            req: engram_host_core::NbdReconfigureRequest<'_>,
+        ) -> io::Result<()> {
+            self.reconfigures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.dup_and_send(req.serve_fd)
+        }
+        async fn disconnect(&self, _device: &Path) -> io::Result<()> {
+            self.disconnects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn backend_identifier(&self, _device: &Path) -> Option<String> {
+            None
+        }
+        fn connected_devices(&self) -> Vec<engram_host_core::ConnectedDevice> {
+            Vec::new()
+        }
+    }
+
+    fn tokio_sock(s: std::os::unix::net::UnixStream) -> TokioUnixStream {
+        s.set_nonblocking(true).unwrap();
+        TokioUnixStream::from_std(s).unwrap()
+    }
+
+    /// ADR 0116 C2 (the incident property): a serve loop that dies WITHOUT
+    /// an explicit release is re-served in place — the kernel sees exactly
+    /// one RECONFIGURE, and the fresh loop answers requests against the
+    /// same backend.
+    #[tokio::test]
+    async fn supervisor_reserves_an_unreleased_serve_death() {
+        let (backend, _dir) = three_chunk_backend().await;
+        let backend = Arc::new(backend);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reconfigures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let kernel = Arc::new(RecordingKernel {
+            socks: tx,
+            reconfigures: reconfigures.clone(),
+            disconnects: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let handle = serve_at(
+            backend,
+            &PathBuf::from("/dev/nbd41"),
+            "sup-test",
+            ConnectMode::Connect,
+            kernel,
+        )
+        .await
+        .unwrap();
+
+        // Kernel side of the CONNECT socket: prove the first loop serves.
+        let k1 = tokio_sock(rx.recv().await.unwrap());
+        let (mut rd1, mut wr1) = k1.into_split();
+        wr1.write_all(&req_bytes(0, 7, 0, 4096)).await.unwrap();
+        let (h, err, payload) = read_reply(&mut rd1, 4096).await;
+        assert_eq!((h, err), (7, 0));
+        assert!(payload.iter().all(|b| *b == 0xaa));
+
+        // Unsolicited death: the kernel-side socket goes away (the
+        // 2026-08-12 shape — kernel marked the sock dead, loop EOF'd).
+        drop(rd1);
+        drop(wr1);
+
+        // The supervisor must RECONFIGURE and the fresh loop must serve.
+        let k2 = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("supervisor never re-served")
+            .unwrap();
+        assert_eq!(
+            reconfigures.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one RECONFIGURE for one death"
+        );
+        let k2 = tokio_sock(k2);
+        let (mut rd2, mut wr2) = k2.into_split();
+        wr2.write_all(&req_bytes(0, 9, 4096, 4096)).await.unwrap();
+        let (h, err, payload) = read_reply(&mut rd2, 4096).await;
+        assert_eq!((h, err), (9, 0));
+        assert!(payload.iter().all(|b| *b == 0xbb));
+
+        // And the status watch converges back to Serving (adoption
+        // confirmed after the tuning window).
+        let mut status = handle.status();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if *status.borrow() == ServeStatus::Serving {
+                    break;
+                }
+                status.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("status never returned to Serving");
+
+        handle.abandon();
+    }
+
+    /// ADR 0116 C2: an EXPLICIT release (abandon) is the legitimate end —
+    /// the supervisor must not repair it.
+    #[tokio::test]
+    async fn supervisor_never_restarts_a_released_serve() {
+        let (backend, _dir) = three_chunk_backend().await;
+        let backend = Arc::new(backend);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reconfigures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let kernel = Arc::new(RecordingKernel {
+            socks: tx,
+            reconfigures: reconfigures.clone(),
+            disconnects: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let handle = serve_at(
+            backend,
+            &PathBuf::from("/dev/nbd42"),
+            "sup-test",
+            ConnectMode::Connect,
+            kernel,
+        )
+        .await
+        .unwrap();
+        let k1 = rx.recv().await.unwrap();
+
+        handle.abandon();
+        drop(k1);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            reconfigures.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a released serve must never be re-served"
+        );
+    }
+
+    /// ADR 0116 C2: crash-looping serve deaths exhaust the restart budget
+    /// and the supervisor gives up LOUDLY (`Exhausted` on the watch),
+    /// leaving the device configured — never an unbounded silent loop.
+    #[tokio::test]
+    async fn supervisor_restart_budget_exhausts_loudly() {
+        let (backend, _dir) = three_chunk_backend().await;
+        let backend = Arc::new(backend);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reconfigures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let kernel = Arc::new(RecordingKernel {
+            socks: tx,
+            reconfigures: reconfigures.clone(),
+            disconnects: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let (shared, mut status) = ServeShared::new(ServeStatus::Serving);
+        let (client, server) = TokioUnixStream::pair().unwrap();
+        let tuning = SupervisorTuning {
+            adopt_confirm: std::time::Duration::from_millis(50),
+            adoption_budget: std::time::Duration::from_secs(5),
+            restart_budget: 2,
+            restart_window: std::time::Duration::from_secs(60),
+        };
+        let _sup = tokio::spawn(supervise(
+            backend,
+            PathBuf::from("/dev/nbd43"),
+            "sup-test".to_string(),
+            kernel,
+            shared,
+            server,
+            false,
+            tuning,
+        ));
+
+        // Death 1 (restart 1) and death 2 (restart 2): hold each fresh
+        // socket past the adoption window so the NEXT drop counts as a
+        // post-adoption death, not a kernel-swallowed rejection.
+        drop(client);
+        for _ in 0..2 {
+            let k = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("supervisor stopped re-serving early")
+                .unwrap();
+            tokio::time::sleep(tuning.adopt_confirm * 3).await;
+            drop(k);
+        }
+
+        // Death 3 exceeds budget 2: Exhausted, and no further RECONFIGURE.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if *status.borrow() == ServeStatus::Exhausted {
+                    break;
+                }
+                status.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("supervisor never reported Exhausted");
+        assert_eq!(reconfigures.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

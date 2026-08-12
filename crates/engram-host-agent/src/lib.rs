@@ -977,6 +977,11 @@ impl HostAgent {
                     wire_version: engram_protocol::WIRE_VERSION,
                     cloud_metadata: None,
                     capabilities,
+                    // ADR 0116 A-D2: adopt (read + delete) the
+                    // predecessor's handoff marker — tells the coord
+                    // this register is a roll succession, and how long
+                    // the swap really took.
+                    handoff_marker: adopt_handoff_marker(&self.cfg.work_dir),
                 };
                 let cc = coord_client.clone();
                 let pooled_for_rehydrate = pooled.clone();
@@ -1806,6 +1811,29 @@ impl HostAgent {
             // exact post-bitmap failure this quiesce exists to prevent.
             // In-flight captures are drained (bounded) below instead.
             pooled.quiesce_captures_for_shutdown();
+            // ADR 0116 A-D2: declare the handoff BEFORE the heartbeat
+            // task dies — the coordinator must learn "this exit is
+            // planned; hold the lease" while our channel to it is still
+            // warm. Two writers, cheapest-first: (1) the durable marker
+            // in the bindings dir (the successor adopts + reports it),
+            // (2) a best-effort POST bounded to 2 s + one retry — never
+            // blocks the ladder (the operator's authoritative gRPC
+            // declaration covers operator-driven rolls; this belt covers
+            // kubelet-initiated restarts the operator never sees).
+            let handoff_ttl = engram_host_core::shutdown::shutdown_handoff_ttl_secs(
+                std::env::var("ENGRAM_SHUTDOWN_HANDOFF_TTL_SECS")
+                    .ok()
+                    .as_deref(),
+            );
+            let resident = pooled.list().await.map(|v| v.len() as u32).unwrap_or(0);
+            declare_shutdown_handoff(
+                &self.cfg.work_dir,
+                &coord_client,
+                host_id,
+                handoff_ttl,
+                resident,
+            )
+            .await;
             heartbeat_task.abort();
             if let Some(t) = grpc_task {
                 t.abort();
@@ -2092,6 +2120,91 @@ async fn rehydrate_survivors(
 
 /// Await either SIGINT (ctrl-c) or SIGTERM (Kubernetes shutdown).
 /// On non-unix platforms, falls back to ctrl-c only.
+/// ADR 0116 A-D2: the SIGTERM ladder's handoff declaration. Writes the
+/// durable marker first (atomic tmp+rename+fsync in the bindings dir —
+/// the successor adopts and reports it), then makes ONE bounded (2 s)
+/// belt POST with one retry. Never fails the ladder: the marker is
+/// best-effort durability, the POST is best-effort reach, and the
+/// operator's authoritative gRPC declaration covers operator-driven
+/// rolls regardless.
+async fn declare_shutdown_handoff(
+    work_dir: &std::path::Path,
+    coord_client: &coord_client::HttpCoordClient,
+    host_id: engram_core::HostId,
+    ttl_secs: u64,
+    resident_sandboxes: u32,
+) {
+    use engram_core::traits::Clock;
+    // ADR 0098 D1: the injected production clock, same construction as
+    // the event sink's — a marker timestamp, never a decision input.
+    let now = engram_core::traits::SystemClock::new().now_utc();
+    let marker = engram_host_core::shutdown::HandoffMarker {
+        declared_at_unix_ms: now.timestamp_millis(),
+        ttl_secs,
+        resident_sandboxes,
+    };
+    let dir = work_dir.join("bindings");
+    let final_path = dir.join(engram_host_core::shutdown::HANDOFF_MARKER_FILE);
+    let tmp = dir.join(".handoff.json.tmp");
+    let write = || -> std::io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(&marker)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&tmp, bytes)?;
+        std::fs::File::open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, &final_path)?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
+    };
+    match write() {
+        Ok(()) => tracing::info!(%host_id, ttl_secs, resident_sandboxes,
+            "shutdown handoff: durable marker written for the successor"),
+        Err(e) => tracing::warn!(%host_id, error = %e,
+            "shutdown handoff: marker write failed; successor registers as fresh"),
+    }
+    for attempt in 0..2u8 {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            coord_client.handoff(host_id, ttl_secs),
+        )
+        .await
+        {
+            Ok(Ok(accepted)) => {
+                tracing::info!(%host_id, ttl_secs, accepted, "shutdown handoff: belt POST landed");
+                return;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(%host_id, attempt, error = %e, "shutdown handoff: belt POST failed");
+            }
+            Err(_) => {
+                tracing::warn!(%host_id, attempt, "shutdown handoff: belt POST timed out (2s)");
+            }
+        }
+    }
+}
+
+/// ADR 0116 A-D2: successor-side adoption of the predecessor's handoff
+/// marker — read + DELETE (a marker must never be reported twice; a
+/// crash between read and delete re-reports once, which is harmless
+/// observability). `None` = fresh start or unreadable marker.
+fn adopt_handoff_marker(
+    work_dir: &std::path::Path,
+) -> Option<engram_host_core::shutdown::HandoffMarker> {
+    let path = work_dir
+        .join("bindings")
+        .join(engram_host_core::shutdown::HANDOFF_MARKER_FILE);
+    let bytes = std::fs::read(&path).ok()?;
+    let marker = match serde_json::from_slice(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "handoff marker unreadable; removing + registering fresh");
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+    let _ = std::fs::remove_file(&path);
+    Some(marker)
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -2230,5 +2343,24 @@ mod tests {
         assert!(!stages_images_gate(true, false));
         assert!(!stages_images_gate(false, true));
         assert!(!stages_images_gate(false, false));
+    }
+
+    /// ADR 0116 A-D2: the ladder writes a durable marker; the successor
+    /// adopts it exactly once (read + delete). The belt POST is aimed at
+    /// an unroutable loopback port so it fails fast without a live coord.
+    #[tokio::test]
+    async fn shutdown_handoff_marker_round_trips_and_is_adopted_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("bindings")).expect("bindings dir");
+        let cc = coord_client::HttpCoordClient::new("http://127.0.0.1:1".to_string(), None);
+        let host_id = engram_core::HostId::new();
+        declare_shutdown_handoff(dir.path(), &cc, host_id, 600, 3).await;
+
+        let adopted = adopt_handoff_marker(dir.path()).expect("marker adopted");
+        assert_eq!(adopted.ttl_secs, 600);
+        assert_eq!(adopted.resident_sandboxes, 3);
+        assert!(adopted.declared_at_unix_ms > 0);
+        // Adoption is consume-once.
+        assert!(adopt_handoff_marker(dir.path()).is_none());
     }
 }

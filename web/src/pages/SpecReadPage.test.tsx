@@ -200,6 +200,26 @@ vi.mock("@/components/spec", () => ({
   ),
 }));
 
+// After publish the canvas is the ticket tree, and the spec becomes the second
+// tab (mock 2l). The tree itself is covered by SpecTicketTree.test.tsx.
+vi.mock("@/hooks/useSpecTickets", () => ({
+  useSpecTickets: () => ({
+    data: {
+      specId: "spec-1",
+      checkpointId: pinned.id,
+      docSeq: "18",
+      publishedAt: pinned.createdAt,
+      sections: [{ id: "context", title: "Context" }],
+      tickets: [],
+      unattachedQuestions: [],
+    },
+    isPending: false,
+    error: null,
+  }),
+  useSpecTicketCommand: () => ({ mutateAsync: vi.fn() }),
+  writeTree: vi.fn(),
+}));
+
 vi.mock("@/hooks/useSpecRead", () => ({
   useSpecRead: () => ({
     data: {
@@ -364,8 +384,11 @@ describe("SpecReadPage", () => {
     view.publishedCheckpointId = older.id;
     renderWithProviders(<SpecReadPage specId="spec-1" />);
 
-    expect(await screen.findByText("Pinned content.")).toBeTruthy();
+    // The tree leads; the pinned spec is one tab away and still read-only.
+    expect(await screen.findByRole("list", { name: "Ticket tree" })).toBeTruthy();
     expect(screen.getByText("Published spec")).toBeTruthy();
+    await user.click(screen.getByRole("tab", { name: "Spec v18 pinned" }));
+    expect(await screen.findByText("Pinned content.")).toBeTruthy();
     await user.click(screen.getByRole("tab", { name: "Checkpoints" }));
     expect(screen.getByText("Pinned")).toBeTruthy();
     expect(screen.queryByLabelText("Collaborative spec canvas")).toBeNull();
@@ -382,6 +405,7 @@ describe("SpecReadPage", () => {
     view.publishedCheckpointId = older.id;
     fireEvent.click(screen.getByRole("button", { name: /Ready to publish/ }));
 
+    await user.click(await screen.findByRole("tab", { name: "Spec v18 pinned" }));
     expect(await screen.findByText("Pinned content.")).toBeTruthy();
     expect(screen.queryByText("Initial content.")).toBeNull();
   });

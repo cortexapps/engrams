@@ -169,6 +169,13 @@ pub enum Step {
     /// drawn from WORLD entropy (never `self.rng`), so folding it in shifts
     /// only the pick-table weights, not the scheduler's own pick stream.
     DrainHost(usize),
+    /// ADR 0116 A3: ONE host registers (the store half of the register
+    /// endpoint — a fresh lease written, epoch bumped, any declared
+    /// handoff ended) without the fleet-wide heartbeat sweep of
+    /// `HostHeartbeats`. The successor-adoption leg of a roll. NOT in
+    /// any pick table — pinned incident-replay scenarios only, so
+    /// existing swarm seeds keep their traces.
+    HostRegister(usize),
 }
 
 #[derive(Debug)]
@@ -186,8 +193,6 @@ pub struct Sim {
     oracles: invariants::Oracles,
     rng: ChaCha8Rng,
     profile: Profile,
-    /// dead_host probe history, owned across sweeps like the real loop.
-    probe_memory: Vec<engram_coordinator::dead_host::ProbeMemoryMap>,
     /// dead_host straggler serving-strike history (#777 ask-the-host),
     /// owned per replica across sweeps like the real loop.
     straggler_strikes: Vec<engram_coordinator::dead_host::StragglerStrikeMap>,
@@ -226,7 +231,6 @@ impl Sim {
             oracles: Default::default(),
             rng,
             profile,
-            probe_memory: (0..replicas).map(|_| Default::default()).collect(),
             straggler_strikes: (0..replicas).map(|_| Default::default()).collect(),
             dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig::default(),
             queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig::default(),
@@ -489,7 +493,6 @@ impl Sim {
                             &self.dead_host_cfg,
                             &state,
                             "sim-pod",
-                            &mut self.probe_memory[r],
                             &mut self.straggler_strikes[r],
                         )
                         .await;
@@ -698,7 +701,7 @@ impl Sim {
                     return;
                 };
                 for id in up {
-                    let hb = sim_heartbeat(self.faithful_hosts);
+                    let hb = sim_heartbeat(&self.world.clock, self.faithful_hosts);
                     let _ = state
                         .services
                         .meta
@@ -743,6 +746,38 @@ impl Sim {
                     }
                 }
             }
+            Step::HostRegister(i) => {
+                // The store half of the register endpoint for ONE host:
+                // a fresh lease replaces any handoff deadline and the
+                // epoch bumps (upsert_host's occupied arm) — the
+                // successor announcing itself after a roll. The
+                // in-memory registry half mirrors `HostHeartbeats`.
+                let id = self.world.host_ids[i];
+                let Some(state) = self.world.replicas.iter().find_map(|r| r.state.clone()) else {
+                    return;
+                };
+                let _ = state
+                    .services
+                    .meta
+                    .upsert_host(sim_host_record(
+                        id,
+                        self.world.clock.clone(),
+                        self.faithful_hosts,
+                    ))
+                    .await;
+                for r in self.world.replicas.iter() {
+                    if let Some(rs) = &r.state {
+                        rs.host_registry.register(
+                            id,
+                            std::sync::Arc::new(crate::world::SimHostClient {
+                                host_id: id,
+                                world: self.world.host_world.clone(),
+                                entropy: self.world.entropy.clone(),
+                            }),
+                        );
+                    }
+                }
+            }
             Step::CrashHost(i) => {
                 let id = self.world.host_ids[i];
                 {
@@ -774,7 +809,6 @@ impl Sim {
             }
             Step::CrashReplica(i) => {
                 self.world.replicas[i].state = None;
-                self.probe_memory[i].clear();
                 self.straggler_strikes[i].clear();
             }
             Step::RestartReplica(i) => {
@@ -1514,7 +1548,11 @@ async fn pump_harness_plane(world: &SimWorld) {
 /// `snapshot-safety` (#790 faithful capture manifests), and
 /// `placement-accounting` (#722 — one reservation authority: a `pending`
 /// reserves unconditionally + resume honors the hard reserved-budget bound).
-fn sim_heartbeat(faithful: bool) -> engram_core::types::host::HostHeartbeat {
+fn sim_heartbeat(
+    clock: &Arc<engram_sim::SimClock>,
+    faithful: bool,
+) -> engram_core::types::host::HostHeartbeat {
+    use engram_core::traits::Clock;
     engram_core::types::host::HostHeartbeat {
         status: engram_core::types::host::HostStatus::Ready,
         capacity: engram_core::types::host::HostCapacity {
@@ -1536,6 +1574,11 @@ fn sim_heartbeat(faithful: bool) -> engram_core::types::host::HostHeartbeat {
         },
         stages_images: faithful,
         capabilities: Default::default(),
+        // ADR 0116 A-D1/A-D4: mirror the prod heartbeat handler
+        // (host_http.rs) — every heartbeat renews the binding lease.
+        // Without this, every sim host reads as lease-expired (NULL =
+        // no shield) and the death path fires on the whole fleet.
+        lease_renew_until: Some(clock.now_utc() + engram_coordinator::config::host_lease_ttl()),
     }
 }
 
@@ -1586,5 +1629,10 @@ fn sim_host_record(
         },
         stages_images: faithful,
         capabilities: Default::default(),
+        // ADR 0116 A-D1: mirror the prod register handler — register
+        // writes the host's lease outright (the store bumps the epoch).
+        lease_expires_at: Some(clock.now_utc() + engram_coordinator::config::host_lease_ttl()),
+        lease_state: Default::default(),
+        lease_epoch: 0,
     }
 }

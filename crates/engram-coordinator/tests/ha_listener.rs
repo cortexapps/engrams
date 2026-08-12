@@ -508,6 +508,9 @@ async fn cross_replica_scheduling_pins_and_tokens() {
                 wire_version: 0,
                 stages_images: false,
                 capabilities: engram_core::types::host::HostCapabilities::default(),
+                lease_expires_at: None,
+                lease_state: Default::default(),
+                lease_epoch: 0,
             })
             .await
             .expect("seed host");
@@ -531,6 +534,7 @@ async fn cross_replica_scheduling_pins_and_tokens() {
                     wire_version: engram_protocol::WIRE_VERSION,
                     stages_images: false,
                     capabilities: engram_core::types::host::HostCapabilities::default(),
+                    lease_renew_until: None,
                 },
             )
             .await
