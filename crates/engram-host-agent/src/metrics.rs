@@ -779,3 +779,18 @@ pub fn spawn_sched_delay_probe() -> tokio::task::JoinHandle<()> {
         }
     })
 }
+
+/// Counter (ADR 0116 C2). Supervised serve-loop restarts: an unsolicited
+/// serve death repaired in place (fresh socketpair + RECONFIGURE against
+/// the same live backend). Label `device`. Steady state: zero — every
+/// increment is a serve loop that pre-C2 would have died silently and
+/// left the guest to a permanent EIO after `dead_conn_timeout`.
+pub const NBD_SERVE_RESTARTS_TOTAL: &str = "engram_nbd_serve_restarts_total";
+
+/// Counter (ADR 0116 C2). Supervised serve loops that exhausted the
+/// restart budget (5 per 10 min) and gave up — the device stays
+/// configured (guest I/O parks under `dead_conn_timeout`) and the
+/// sandbox's failing flushes escalate it (C4). Alert-worthy: this is a
+/// crash-looping data plane, not a transient.
+pub const NBD_SERVE_RESTART_BUDGET_EXHAUSTED_TOTAL: &str =
+    "engram_nbd_serve_restart_budget_exhausted_total";
