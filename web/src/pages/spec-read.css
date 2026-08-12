@@ -631,3 +631,11 @@
   gap: 0.5rem;
   align-items: center;
 }
+
+/* After publish the document column holds two tabs: the ticket tree a person
+   shapes, and the spec it came from (mock 2l). */
+.spec-read-canvas-tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}

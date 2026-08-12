@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { logger as honoLogger } from "hono/logger";
 import { createNodeWebSocket } from "@hono/node-ws";
@@ -93,6 +94,11 @@ import { PostgresOpenQuestionStore, OpenQuestionService } from "./specs/open-que
 import { SpecQuestionDocument } from "./specs/question-document.ts";
 import { PostgresSectionStateStore, SectionStateService } from "./specs/section-state-service.ts";
 import { PostgresSpecToolMetadataStore, SpecToolService } from "./specs/tool-service.ts";
+import {
+  PostgresPinnedSpecReader,
+  PostgresSpecTicketStore,
+  SpecTicketTreeService,
+} from "./specs/ticket-tree.ts";
 import { makeProfileStore } from "./db/profiles.ts";
 import { makeIntegrationConnectionStore } from "./db/integration-connections.ts";
 import { makeConnectorStore } from "./db/connectors.ts";
@@ -122,6 +128,7 @@ import {
   SpecPublishScanner,
 } from "./specs/publish-scanner.ts";
 import { makeSpecPublishRoute } from "./routes/spec-publish.ts";
+import { makeSpecTicketRoute } from "./routes/spec-tickets.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
@@ -138,6 +145,13 @@ const specSectionStates = new SectionStateService({
   store: new PostgresSectionStateStore(getPool()),
   now: specNow,
 });
+// The post-publish ticket tree (ADR 0114 D6). It reads the pinned checkpoint,
+// never the live head, so every §backlink stays resolvable.
+const specTickets = new SpecTicketTreeService({
+  store: new PostgresSpecTicketStore(getPool()),
+  pinned: new PostgresPinnedSpecReader(getPool()),
+  newId: () => randomUUID(),
+});
 const specToolService = new SpecToolService({
   documents: specDocuments,
   sectionStates: specSectionStates,
@@ -148,6 +162,7 @@ const specToolService = new SpecToolService({
   }),
   questionStore: specOpenQuestions,
   metadata: new PostgresSpecToolMetadataStore(getPool(), specNow),
+  tickets: specTickets,
   now: specNow,
 });
 const specRailStore = new PostgresSpecRailStore(getPool());
@@ -302,6 +317,13 @@ app.route(
   makeSpecPublishRoute({
     publish: specPublish,
     wake: (specId) => specPublishScanner.wake(specId),
+    resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecTicketRoute({
+    tickets: specTickets,
     resolveMembership: resolveSpecMembership,
   }),
 );

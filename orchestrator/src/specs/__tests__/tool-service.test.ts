@@ -49,6 +49,11 @@ import {
   type SectionStateTranscriptAction,
 } from "../section-state-service.ts";
 import type { SectionStateValue } from "../section-state.ts";
+import type {
+  ProposeTicketsInput,
+  ProposeTicketsResult,
+  SpecTicketTreeService,
+} from "../ticket-tree.ts";
 import { SpecToolService, stableQuestionId, type SpecToolMetadataStore } from "../tool-service.ts";
 
 const SPEC_ID = "00000000-0000-4000-8000-000000000135";
@@ -285,6 +290,27 @@ class MemoryMetadata implements SpecToolMetadataStore {
   }
 }
 
+/** The ticket tree is its own service (#1127); here we only need what reached it. */
+class RecordedTicketProposals implements Pick<SpecTicketTreeService, "propose"> {
+  readonly calls: ProposeTicketsInput[] = [];
+
+  async propose(input: ProposeTicketsInput): Promise<ProposeTicketsResult> {
+    this.calls.push(input);
+    return {
+      applied: true,
+      view: {
+        specId: input.specId,
+        checkpointId: "checkpoint-1",
+        docSeq: "1",
+        publishedAt: null,
+        sections: [],
+        tickets: [],
+        unattachedQuestions: [],
+      },
+    };
+  }
+}
+
 async function setup(
   options: { afterPersist?: (specId: string, seq: bigint) => void | Promise<void> } = {},
 ) {
@@ -300,6 +326,7 @@ async function setup(
   );
   const sectionStore = new MemorySectionStore();
   const questionStore = new MemoryQuestionStore();
+  const tickets = new RecordedTicketProposals();
   const service = new SpecToolService({
     documents,
     sectionStates: new SectionStateService({
@@ -313,9 +340,10 @@ async function setup(
     }),
     questionStore,
     metadata: new MemoryMetadata(sectionStore),
+    tickets,
     now: () => new Date("2026-08-09T12:00:00.000Z"),
   });
-  return { service, documents, documentStore, sectionStore, questionStore };
+  return { service, documents, documentStore, sectionStore, questionStore, tickets };
 }
 
 async function selectedTextSpan(
@@ -1057,18 +1085,48 @@ describe("production spec tool service", () => {
     expect(documentStore.lastCheckpoint).toBeNull();
   });
 
-  test("reports later-epic notes and ticket stores as unavailable", async () => {
+  test("reports the later-epic notes store as unavailable", async () => {
     const { service } = await setup();
     await expect(
       service.updateNotes(SPEC_ID, { ...context("notes"), markdown: "notes" }),
     ).rejects.toThrow("#1120");
-    await expect(
-      service.proposeTickets(SPEC_ID, {
-        ...context("tickets"),
-        idempotencyKey: "proposal-1",
-        tickets: [],
-      }),
-    ).rejects.toThrow("#1127");
+  });
+
+  test("a ticket proposal reaches the tree with its idempotency key", async () => {
+    const { service, tickets } = await setup();
+    const proposal = {
+      client_id: "t1",
+      title: "Add org quota columns",
+      description: "Add the columns and backfill.",
+      section_id: "context",
+    };
+    const result = await service.proposeTickets(SPEC_ID, {
+      ...context("tickets"),
+      idempotencyKey: "proposal-1",
+      tickets: [proposal],
+    });
+    expect(result.applied).toBe(true);
+    expect(tickets.calls).toEqual([
+      { specId: SPEC_ID, idempotencyKey: "proposal-1", tickets: [proposal] },
+    ]);
+  });
+
+  test("a stale expected revision blocks the proposal before it lands", async () => {
+    const { service, tickets } = await setup();
+    const result = await service.proposeTickets(SPEC_ID, {
+      ...context("tickets", 9_999n),
+      idempotencyKey: "proposal-1",
+      tickets: [
+        {
+          client_id: "t1",
+          title: "Add org quota columns",
+          description: "Add the columns.",
+          section_id: "context",
+        },
+      ],
+    });
+    expect(result.applied).toBe(false);
+    expect(tickets.calls).toEqual([]);
   });
 
   test("keeps repaired markers unresolved", async () => {

@@ -20,6 +20,7 @@ import type {
   GapFindingKind,
   GapFindingSeverity,
   GapProposedDiff,
+  SpecTicketSyncState,
   SpecTranscriptChip,
   TraceabilityMatrix,
 } from "@engrams/spec-document";
@@ -31,6 +32,7 @@ import {
   timestamp,
   boolean,
   primaryKey,
+  foreignKey,
   index,
   uniqueIndex,
   customType,
@@ -592,6 +594,52 @@ export const specPublish = pgTable(
     index("spec_publish_due_idx")
       .on(t.nextAttemptAt)
       .where(sql`${t.state} <> 'complete'`),
+  ],
+);
+
+/**
+ * One proposed ticket (ADR 0114 D6, R39-R40).
+ *
+ * The agent proposes the first tree from the *pinned* spec, and after that a
+ * person shapes it by hand: retitle, edit, split, merge, reorder, re-parent,
+ * add, delete. The tree is therefore ordinary mutable rows, not a projection
+ * of the agent's last proposal.
+ *
+ * `section_id` is the §backlink. Every draft carries one, and it always names
+ * a section of the pinned checkpoint, so a backlink stays resolvable for the
+ * life of the spec. The open questions a draft carries are derived from that
+ * same id (R29) rather than stored, so a re-parent or a merge can never leave
+ * a question attached to a ticket that no longer covers its section.
+ */
+export const specTicketDraft = pgTable(
+  "spec_ticket_draft",
+  {
+    id: uuid("id").primaryKey(),
+    specId: uuid("spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    /** Null for a root ticket. A delete takes the whole subtree with it. */
+    parentId: uuid("parent_id"),
+    /** Dense order among siblings, from 0. The service rewrites it on a move. */
+    ordinal: integer("ordinal").notNull(),
+    title: text("title").notNull(),
+    /** Markdown. It opens with the link back to the pinned section. */
+    description: text("description").notNull(),
+    /** The §backlink: a section of the pinned checkpoint. */
+    sectionId: text("section_id").notNull(),
+    /** Ids of sibling drafts this one waits for. */
+    dependsOn: jsonb("depends_on").$type<string[]>().notNull().default([]),
+    syncState: text("sync_state").$type<SpecTicketSyncState>().notNull().default("draft"),
+    linearId: text("linear_id"),
+    syncError: text("sync_error"),
+  },
+  (t) => [
+    index("spec_ticket_draft_tree_idx").on(t.specId, t.parentId, t.ordinal),
+    foreignKey({
+      columns: [t.parentId],
+      foreignColumns: [t.id],
+      name: "spec_ticket_draft_parent_id_fk",
+    }).onDelete("cascade"),
   ],
 );
 

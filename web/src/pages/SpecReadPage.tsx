@@ -1,4 +1,5 @@
 import { Link, useParams } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { useMutation } from "@connectrpc/connect-query";
 import { Check, Clock3, GitCompareArrows, History, Lock, Radio, RotateCcw } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -13,6 +14,7 @@ import {
 import { SpecGapCheckPanel } from "@/components/spec/SpecGapCheckPanel";
 import { SpecPublishControl } from "@/components/spec/SpecPublishControl";
 import { SpecSectionRail, type SpecRailAction } from "@/components/spec/SpecSectionRail";
+import { SpecTicketTree } from "@/components/spec/SpecTicketTree";
 import { Markdown } from "@/components/Markdown";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -37,6 +39,7 @@ import {
   useSpecRead,
   useUndoSpecSectionState,
 } from "@/hooks/useSpecRead";
+import { useSpecTicketCommand, useSpecTickets, writeTree } from "@/hooks/useSpecTickets";
 import { TEMPLATE_LOCK_REASON } from "./specs/template-lock";
 import "./spec-read.css";
 
@@ -58,6 +61,12 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   const first = useSpecCheckpoint(specId, effectiveIds[0] ?? null, publishedCheckpoint);
   const second = useSpecCheckpoint(specId, effectiveIds[1] ?? null);
   const restore = useRestoreSpecSection(specId);
+  // After publish the canvas becomes the ticket tree, and the spec stays
+  // reachable as a second tab, read-only at the pinned version (mock 2l).
+  const isPublished = read.data?.spec.lifecycle === "published";
+  const tickets = useSpecTickets(specId, isPublished);
+  const ticketCommand = useSpecTicketCommand(specId);
+  const queryClient = useQueryClient();
   const sectionState = useSetSpecSectionState(specId);
   const undoSectionState = useUndoSpecSectionState(specId);
   const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
@@ -217,12 +226,39 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
                 selectionActions={selectionActions}
               />
             )}
+            {/* Two tabs of the same room: the tree a person shapes, and the
+                spec it came from, pinned and read-only. */}
             {!isDraft && (
-              <CheckpointContent
-                first={first.data}
-                second={second.data}
-                loading={first.isPending || second.isPending}
-              />
+              <Tabs defaultValue="tickets" className="spec-read-canvas-tabs">
+                <TabsList aria-label="Published spec">
+                  <TabsTrigger value="tickets">Tickets</TabsTrigger>
+                  <TabsTrigger value="spec">
+                    Spec{tickets.data ? ` v${tickets.data.docSeq}` : ""} pinned
+                  </TabsTrigger>
+                </TabsList>
+                <TabsContent value="tickets">
+                  {tickets.isPending && <Skeleton className="h-40 w-full" />}
+                  {tickets.error && (
+                    <p className="spec-action-error">
+                      The ticket tree is not available yet. {tickets.error.message}
+                    </p>
+                  )}
+                  {tickets.data && (
+                    <SpecTicketTree
+                      tree={tickets.data}
+                      onCommand={(command) => ticketCommand.mutateAsync(command)}
+                      onTree={(tree) => writeTree(queryClient, specId, tree)}
+                    />
+                  )}
+                </TabsContent>
+                <TabsContent value="spec">
+                  <CheckpointContent
+                    first={first.data}
+                    second={second.data}
+                    loading={first.isPending || second.isPending}
+                  />
+                </TabsContent>
+              </Tabs>
             )}
             {isDraft && effectiveIds.length > 0 && (
               <div className="spec-history-preview">
