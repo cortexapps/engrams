@@ -105,6 +105,11 @@
   flex: 1;
 }
 
+/* The alternatives stage takes the pane; the rail returns on the pick. */
+.spec-read-layout.is-stage .spec-rail-shell {
+  display: none;
+}
+
 .spec-rail-shell {
   position: sticky;
   top: 1rem;

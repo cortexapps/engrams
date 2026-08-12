@@ -6,6 +6,7 @@ import type { SpecSelectionActionPayload } from "@engrams/spec-document";
 
 import { CheckpointDiff } from "@/components/spec/CheckpointDiff";
 import { LazySpecCanvas } from "@/components/spec";
+import { SpecAlternatives } from "@/components/spec/SpecAlternatives";
 import {
   SectionStateTranscriptChip,
   type SpecSectionStateChipData,
@@ -28,7 +29,9 @@ import { sendPrompt as sendPromptMethod } from "@/gen/engram/app/v1/session-Sess
 import {
   type SpecCheckpoint,
   type SpecCheckpointSummary,
+  useDecideSpecAlternative,
   useRestoreSpecSection,
+  useSpecAlternatives,
   useSetSpecSectionState,
   useSpecCheckpoint,
   useSpecRail,
@@ -56,6 +59,8 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   const first = useSpecCheckpoint(specId, effectiveIds[0] ?? null, publishedCheckpoint);
   const second = useSpecCheckpoint(specId, effectiveIds[1] ?? null);
   const restore = useRestoreSpecSection(specId);
+  const alternatives = useSpecAlternatives(specId, read.data?.spec.lifecycle === "draft");
+  const decideAlternative = useDecideSpecAlternative(specId);
   const sectionState = useSetSpecSectionState(specId);
   const undoSectionState = useUndoSpecSectionState(specId);
   const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
@@ -85,6 +90,16 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   const { spec, checkpoints } = read.data;
   const isDraft = spec.lifecycle === "draft";
   const ownerSessionId = isDraft ? spec.sessionId : null;
+  const stage = isDraft ? (alternatives.data ?? null) : null;
+  // The pane earns its width while the stage is open: the rail returns on the
+  // pick (mock 2f).
+  const stageOpen = stage !== null && stage.decision === null;
+  const sendOwnerPrompt = (text: string) => {
+    if (!ownerSessionId) return;
+    sendSelectionPrompt
+      .mutateAsync({ sessionId: ownerSessionId, promptId: crypto.randomUUID(), text })
+      .catch((error) => console.warn("spec prompt failed", error));
+  };
   const selectionActions = ownerSessionId
     ? {
         onAction: (payload: SpecSelectionActionPayload) => {
@@ -148,11 +163,23 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
         )}
       </header>
 
-      <div className="spec-read-layout">
+      <div className={stageOpen ? "spec-read-layout is-stage" : "spec-read-layout"}>
         <section
           className="spec-read-document"
           aria-label={isDraft ? "Live spec" : "Published spec"}
         >
+          {stage && (
+            <SpecAlternatives
+              stage={stage}
+              editable={ownerSessionId !== null}
+              pending={decideAlternative.isPending}
+              error={decideAlternative.error?.message ?? null}
+              onPick={({ optionKey, reason }) =>
+                decideAlternative.mutate({ setId: stage.proposal.setId, optionKey, reason })
+              }
+              onHybrid={() => sendOwnerPrompt(hybridPrompt(stage.proposal.setId))}
+            />
+          )}
           {isDraft && actionChip && (
             <div className="spec-action-transcript" aria-label="Latest section action">
               <SectionStateTranscriptChip
@@ -231,7 +258,7 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
           {restoreNotice && <p className="spec-restore-notice">{restoreNotice}</p>}
         </section>
 
-        <aside className="spec-rail-shell">
+        <aside className="spec-rail-shell" hidden={stageOpen}>
           <Tabs defaultValue="sections">
             <TabsList className="spec-rail-tabs" aria-label="Spec navigation">
               <TabsTrigger value="sections">Sections</TabsTrigger>
@@ -258,6 +285,15 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
       </div>
     </main>
   );
+}
+
+/** Ask for a hybrid in the conversation; the agent records it with the tool. */
+export function hybridPrompt(setId: string): string {
+  return [
+    "I want a hybrid of the alternatives, not one card as it stands.",
+    `Alternatives set: ${setId}`,
+    "Ask me what to combine, then call spec_decide_alternative with no option_key and my reason.",
+  ].join("\n\n");
 }
 
 export function selectionActionPrompt(payload: SpecSelectionActionPayload): string {

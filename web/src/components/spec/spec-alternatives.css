@@ -1,0 +1,238 @@
+/* The alternatives stage in the canvas (ADR 0114 D6, requirement R20). */
+
+.spec-alternatives {
+  margin-bottom: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  padding: 0.85rem 1rem 0.9rem;
+}
+
+.spec-alternatives-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  padding-bottom: 0.7rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.spec-alternatives-label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}
+
+.spec-alternatives-label svg,
+.spec-alternatives-provenance svg {
+  width: 0.9rem;
+  height: 0.9rem;
+}
+
+/* One caption covers the whole comparison surface (R16). */
+.spec-alternatives-provenance {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-width: 0;
+  max-width: 28rem;
+  overflow: hidden;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  padding: 0.1rem 0.55rem;
+  background: color-mix(in oklab, var(--muted) 45%, transparent);
+  color: var(--muted-foreground);
+  font-size: 0.7rem;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.spec-alternatives-toggle {
+  margin-left: auto;
+}
+
+.spec-alternatives-decided {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  margin-top: 0.75rem;
+  border-left: 2px solid var(--instrument-nominal);
+  padding: 0.35rem 0.7rem;
+  background: color-mix(in oklab, var(--instrument-nominal) 8%, transparent);
+  font-size: 0.85rem;
+}
+
+.spec-alternatives-decided span {
+  color: var(--muted-foreground);
+}
+
+/* Two or three cards; they wrap rather than shrink below a readable width. */
+.spec-alternatives-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 0.7rem;
+  margin-top: 0.75rem;
+}
+
+.spec-alternative-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius) - 2px);
+  background: var(--background);
+  padding: 0.7rem 0.8rem;
+}
+
+.spec-alternative-card.is-lean {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 1px var(--primary);
+}
+
+.spec-alternative-card.is-won {
+  border-color: var(--instrument-nominal);
+  box-shadow: 0 0 0 1px var(--instrument-nominal);
+}
+
+.spec-alternative-key {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--muted-foreground);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.spec-alternative-key em {
+  border-radius: 999px;
+  padding: 0 0.4rem;
+  background: color-mix(in oklab, var(--primary) 14%, transparent);
+  color: var(--foreground);
+  font-size: 0.62rem;
+  font-style: normal;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.spec-alternative-card h3 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.spec-alternative-tradeoffs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.28rem;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.spec-alternative-tradeoffs li {
+  display: flex;
+  gap: 0.45rem;
+}
+
+.spec-tradeoff-sign {
+  flex: 0 0 auto;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.spec-tradeoff-sign.is-gain {
+  color: var(--instrument-nominal-ink);
+}
+
+.spec-tradeoff-sign.is-cost {
+  color: var(--instrument-critical-ink);
+}
+
+.spec-tradeoff-sign.is-caveat {
+  color: var(--instrument-caution-ink);
+}
+
+.spec-alternative-pick {
+  margin-top: auto;
+  align-self: flex-start;
+}
+
+/* Compare replaces the cards in place; it takes the canvas, not a modal. */
+.spec-alternatives-compare {
+  width: 100%;
+  margin-top: 0.75rem;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.spec-alternatives-compare th,
+.spec-alternatives-compare td {
+  border-bottom: 1px solid var(--border);
+  padding: 0.4rem 0.7rem 0.4rem 0;
+  text-align: left;
+  vertical-align: top;
+}
+
+.spec-alternatives-compare thead th {
+  border-bottom: 1px solid var(--foreground);
+  color: var(--muted-foreground);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.spec-alternatives-compare tbody th {
+  font-weight: 600;
+}
+
+.spec-alternatives-compare .is-winner {
+  background: color-mix(in oklab, var(--primary) 8%, transparent);
+  color: var(--foreground);
+}
+
+.spec-alternatives-reason {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.75rem;
+  border: 1px dashed var(--border);
+  border-radius: calc(var(--radius) - 2px);
+  padding: 0.6rem 0.7rem;
+}
+
+.spec-alternatives-reason label {
+  color: var(--muted-foreground);
+  font-size: 0.8rem;
+}
+
+.spec-alternatives-reason-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.4rem;
+}
+
+.spec-alternatives-error {
+  margin-top: 0.6rem;
+  color: var(--destructive);
+  font-size: 0.82rem;
+}
+
+.spec-alternatives-foot {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  flex-wrap: wrap;
+  margin-top: 0.75rem;
+  color: var(--muted-foreground);
+  font-size: 0.78rem;
+}
+
+.spec-alternatives-foot button {
+  margin-left: auto;
+}
