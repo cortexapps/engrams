@@ -468,7 +468,8 @@ export function proposalDraftId(
 
 const TICKET_DRAFT_NAMESPACE = "0d3a5f26-9c4a-5a1b-9a3d-6d5f0f7b2c81";
 
-function uuidV5(name: string, namespace: string): string {
+/** A name-derived UUID: the same name always gives the same id. */
+export function uuidV5(name: string, namespace: string): string {
   const hash = createHash("sha1");
   hash.update(Buffer.from(namespace.replace(/-/g, ""), "hex"));
   hash.update(Buffer.from(name, "utf8"));
