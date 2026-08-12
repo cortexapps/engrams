@@ -1,0 +1,232 @@
+/* The ticket tree (mock 2l). Rows are instrument-plain: a grip, a title, a
+   backlink, and the state. Nesting is the only decoration that carries
+   meaning, so it is the only one with weight. */
+
+.spec-ticket-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.spec-ticket-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.spec-ticket-count {
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.spec-ticket-pin {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.68rem;
+  color: var(--muted-foreground);
+}
+
+.spec-ticket-bar-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-left: auto;
+}
+
+.spec-ticket-error {
+  margin: 0;
+  border: 1px solid var(--destructive);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.8rem;
+  color: var(--destructive);
+}
+
+.spec-ticket-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.spec-ticket-row {
+  --ticket-depth: 0;
+  margin-left: calc(var(--ticket-depth) * 1.6rem);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--card);
+}
+
+.spec-ticket-row[data-selected="true"] {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 1px var(--primary);
+}
+
+.spec-ticket-row[data-dragging="true"] {
+  opacity: 0.5;
+}
+
+/* The drop target is the row you would nest under, so the cue sits on its
+   leading edge — the same edge the new child will line up against. */
+.spec-ticket-row[data-drop-target="true"] {
+  border-left: 3px solid var(--primary);
+}
+
+.spec-ticket-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+.spec-ticket-grip {
+  display: inline-flex;
+  align-items: center;
+  cursor: grab;
+  color: var(--muted-foreground);
+  background: none;
+  border: none;
+  padding: 0.1rem;
+  border-radius: 0.25rem;
+}
+
+.spec-ticket-grip:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+.spec-ticket-select {
+  accent-color: var(--primary);
+}
+
+.spec-ticket-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  cursor: pointer;
+}
+
+.spec-ticket-caret {
+  width: 0.85rem;
+  height: 0.85rem;
+  color: var(--muted-foreground);
+  transition: transform 120ms ease;
+}
+
+.spec-ticket-title[aria-expanded="true"] .spec-ticket-caret {
+  transform: rotate(90deg);
+}
+
+.spec-ticket-backlink {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.68rem;
+  color: var(--muted-foreground);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.05rem 0.45rem;
+  white-space: nowrap;
+  text-decoration: none;
+}
+
+.spec-ticket-backlink:hover {
+  color: var(--foreground);
+}
+
+.spec-ticket-flag {
+  font-size: 0.68rem;
+  border-color: color-mix(in oklab, var(--destructive) 35%, transparent);
+}
+
+.spec-ticket-linear {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.68rem;
+  color: var(--muted-foreground);
+}
+
+.spec-ticket-row-actions {
+  display: flex;
+  gap: 0.1rem;
+}
+
+.spec-ticket-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  border-top: 1px solid var(--border);
+  padding: 0.7rem;
+}
+
+.spec-ticket-editor label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.72rem;
+  color: var(--muted-foreground);
+}
+
+.spec-ticket-editor select {
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: var(--background);
+  padding: 0.35rem 0.5rem;
+  font-size: 0.8rem;
+  color: var(--foreground);
+}
+
+.spec-ticket-editor button[type="submit"] {
+  align-self: flex-start;
+}
+
+.spec-ticket-hint {
+  margin: 0;
+  border: 1px dashed var(--border);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.8rem;
+  font-size: 0.78rem;
+  color: var(--muted-foreground);
+}
+
+/* An open question that no ticket covers is a hole in the trace, so it gets
+   its own block rather than a quiet omission (R29). */
+.spec-ticket-orphans {
+  border: 1px solid color-mix(in oklab, var(--destructive) 35%, transparent);
+  border-radius: 0.5rem;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.8rem;
+}
+
+.spec-ticket-orphans h3 {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin: 0 0 0.35rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--destructive);
+}
+
+.spec-ticket-orphans ul {
+  margin: 0;
+  padding-left: 1rem;
+  color: var(--muted-foreground);
+}
+
+.spec-ticket-orphan-section {
+  margin-left: 0.4rem;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.68rem;
+}
