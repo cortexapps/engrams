@@ -171,13 +171,15 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
           {stage && (
             <SpecAlternatives
               stage={stage}
-              editable={ownerSessionId !== null}
+              editable={isDraft}
               pending={decideAlternative.isPending}
               error={decideAlternative.error?.message ?? null}
               onPick={({ optionKey, reason }) =>
                 decideAlternative.mutate({ setId: stage.proposal.setId, optionKey, reason })
               }
-              onHybrid={() => sendOwnerPrompt(hybridPrompt(stage.proposal.setId))}
+              {...(ownerSessionId === null
+                ? {}
+                : { onHybrid: () => sendOwnerPrompt(hybridPrompt(stage.proposal.setId)) })}
             />
           )}
           {isDraft && actionChip && (

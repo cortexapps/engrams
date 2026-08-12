@@ -166,6 +166,28 @@ describe("SpecAlternatives", () => {
     expect(screen.queryByRole("button", { name: "Reply with a hybrid" })).toBeNull();
   });
 
+  test("closes the reason field once the decision lands", async () => {
+    const user = userEvent.setup();
+    const { view } = renderStage();
+
+    await user.click(screen.getByRole("button", { name: "Pick B" }));
+    expect(screen.getByLabelText(/Why does B win\?/)).toBeTruthy();
+
+    view.rerender(
+      <div style={{ width: RAIL_WIDTH }}>
+        <SpecAlternatives
+          stage={{ proposal, decision }}
+          editable
+          pending={false}
+          error={null}
+          onPick={vi.fn()}
+        />
+      </div>,
+    );
+    expect(screen.queryByLabelText(/Why does B win\?/)).toBeNull();
+    expect(screen.getByRole("status").textContent).toContain("Picked B");
+  });
+
   test("a reader who cannot decide still reads the cards and the compare", async () => {
     const user = userEvent.setup();
     renderStage({ editable: false });

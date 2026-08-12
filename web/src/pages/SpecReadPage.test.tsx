@@ -313,6 +313,25 @@ describe("SpecReadPage", () => {
     expect(screen.getByRole("status").textContent).toContain("Picked B · Hierarchical limiter");
   });
 
+  it("lets an org member pick even when no session is live", async () => {
+    const user = userEvent.setup();
+    view.alternatives = alternativesStage;
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    expect(await screen.findByRole("button", { name: "Pick B" })).toBeTruthy();
+    // The hybrid reply needs a conversation to land in.
+    expect(screen.queryByRole("button", { name: "Reply with a hybrid" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Pick A" }));
+    await user.type(screen.getByLabelText(/Why does A win\?/), "Smallest blast radius.");
+    await user.click(screen.getByRole("button", { name: "Confirm A" }));
+    expect(decideMutate).toHaveBeenCalledWith({
+      setId: "set-1",
+      optionKey: "A",
+      reason: "Smallest blast radius.",
+    });
+  });
+
   it("sends the pick with the set it was shown for", async () => {
     const user = userEvent.setup();
     view.sessionId = "session-1";

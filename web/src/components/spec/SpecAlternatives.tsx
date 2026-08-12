@@ -109,7 +109,7 @@ export function SpecAlternatives({
         </div>
       )}
 
-      {pickingKey !== null && (
+      {pickingKey !== null && !decided && (
         <form
           className="spec-alternatives-reason"
           onSubmit={(event) => {
