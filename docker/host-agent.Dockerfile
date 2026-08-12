@@ -20,20 +20,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/engram-host-agent /tmp/engram-host-agent \
     && cp target/release/engram-uffd-handler /tmp/engram-uffd-handler
 
-FROM debian:trixie-slim AS cloud-sql-proxy
-ARG TARGETARCH
-ARG CLOUD_SQL_PROXY_VERSION=2.24.1
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
-    && case "$TARGETARCH" in \
-        amd64) sha=fae2766aac9d614a2bdef2f2a7778f3d054f3acd5ff07a81a9e300bd471512eb ;; \
-        arm64) sha=da49fd73b0d33c0ab8e5dfc19dfb104cdd969ebd355eef8fd3b079c20a723c82 ;; \
-        *) echo "unsupported Cloud SQL Auth Proxy architecture: $TARGETARCH" >&2; exit 1 ;; \
-    esac \
-    && curl -fsSL -o /usr/local/bin/cloud-sql-proxy \
-      "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v${CLOUD_SQL_PROXY_VERSION}/cloud-sql-proxy.linux.${TARGETARCH}" \
-    && echo "$sha  /usr/local/bin/cloud-sql-proxy" | sha256sum -c - \
-    && chmod 0755 /usr/local/bin/cloud-sql-proxy
-
 # Trixie matches the builder's glibc — bookworm (2.36) refuses
 # binaries linked against trixie's glibc 2.39+.
 FROM debian:trixie-slim
@@ -73,7 +59,4 @@ COPY --from=builder /tmp/engram-host-agent /usr/local/bin/engram-host-agent
 # lookup of `engram-uffd-handler` is the FirecrackerConfig default). Without
 # it, every Uffd-mode restore/resume page-faults forever / fails to spawn.
 COPY --from=builder /tmp/engram-uffd-handler /usr/local/bin/engram-uffd-handler
-# ADR 0109 Cloud SQL addendum: host-only transport. Guest sessions never
-# receive this binary or either OAuth token used by automatic IAM auth.
-COPY --from=cloud-sql-proxy /usr/local/bin/cloud-sql-proxy /usr/local/bin/cloud-sql-proxy
 ENTRYPOINT ["/usr/local/bin/engram-host-agent"]

@@ -1473,6 +1473,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-cloud-sql"
+version = "0.1.0"
+dependencies = [
+ "axum 0.7.9",
+ "chrono",
+ "pem",
+ "rand_core 0.6.4",
+ "rcgen",
+ "reqwest 0.12.28",
+ "rsa",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "workspace-hack",
+ "x509-parser",
+]
+
+[[package]]
 name = "engram-cloud-static"
 version = "0.1.0"
 dependencies = [
@@ -1845,6 +1866,7 @@ dependencies = [
  "dashmap",
  "engram-blob-client",
  "engram-chunk-store",
+ "engram-cloud-sql",
  "engram-cloud-static",
  "engram-core",
  "engram-egress-proxy",
@@ -7738,6 +7760,7 @@ dependencies = [
  "futures-executor",
  "futures-io",
  "futures-sink",
+ "futures-task",
  "futures-util",
  "generic-array",
  "getrandom 0.2.17",
@@ -7757,6 +7780,7 @@ dependencies = [
  "nix 0.31.3",
  "nom",
  "num-bigint",
+ "num-bigint-dig",
  "num-integer",
  "num-iter",
  "num-traits",
@@ -7770,6 +7794,7 @@ dependencies = [
  "quote",
  "rand 0.8.6",
  "rand 0.9.4",
+ "rand_chacha 0.3.1",
  "rand_chacha 0.9.0",
  "rand_core 0.6.4",
  "regex",
@@ -7778,6 +7803,7 @@ dependencies = [
  "reqwest 0.12.28",
  "reqwest 0.13.4",
  "ring",
+ "rsa",
  "rustix",
  "rustls",
  "rustls-webpki",
