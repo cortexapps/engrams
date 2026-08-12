@@ -156,7 +156,13 @@ pub async fn build_endpoint(request: EndpointRequest<'_>) -> Result<CloudSqlEndp
         .to_public_key()
         .to_public_key_der()
         .map_err(|e| Error::Tls(format!("public key encoding failed: {e}")))?;
-    let public_key_pem = pem::encode(&pem::Pem::new("RSA PUBLIC KEY", spki_der.into_vec()));
+    // LF line endings, not the pem crate's CRLF default: the sqladmin
+    // parser rejects CRLF PEM with "invalid PEM format" (observed in
+    // production 2026-08-12; Go's pem.EncodeToMemory also emits LF).
+    let public_key_pem = pem::encode_config(
+        &pem::Pem::new("RSA PUBLIC KEY", spki_der.into_vec()),
+        pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF),
+    );
 
     let client_cert_pem = api::generate_ephemeral_cert(
         request.http,

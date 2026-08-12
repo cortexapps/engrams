@@ -53,6 +53,18 @@ struct GenerateEphemeralCertResponse {
     ephemeral_cert: SslCert,
 }
 
+/// The error body names the reason (e.g. "invalid PEM format"); without
+/// it a production 400 is undiagnosable from the host logs.
+async fn truncated_body(response: reqwest::Response) -> String {
+    let body = response.text().await.unwrap_or_default();
+    let body = body.trim().replace(['\n', '\r'], " ");
+    if body.len() > 300 {
+        format!("{}…", &body[..300])
+    } else {
+        body
+    }
+}
+
 pub async fn connect_settings(
     http: &reqwest::Client,
     api_base: &str,
@@ -71,7 +83,10 @@ pub async fn connect_settings(
         .map_err(|e| Error::Api(format!("connectSettings request failed: {e}")))?;
     let status = response.status();
     if !status.is_success() {
-        return Err(Error::Api(format!("connectSettings returned {status}")));
+        let body = truncated_body(response).await;
+        return Err(Error::Api(format!(
+            "connectSettings returned {status}: {body}"
+        )));
     }
     let settings: ConnectSettings = response
         .json()
@@ -119,8 +134,9 @@ pub async fn generate_ephemeral_cert(
         .map_err(|e| Error::Api(format!("generateEphemeralCert request failed: {e}")))?;
     let status = response.status();
     if !status.is_success() {
+        let body = truncated_body(response).await;
         return Err(Error::Api(format!(
-            "generateEphemeralCert returned {status}"
+            "generateEphemeralCert returned {status}: {body}"
         )));
     }
     let response: GenerateEphemeralCertResponse = response
