@@ -665,16 +665,13 @@
   padding-bottom: 0.75rem;
 }
 
-.spec-rail-shell.is-folded {
-  position: static;
-  width: 100%;
+.spec-rail-sheet-body {
   min-height: 0;
-  max-height: none;
   overflow-y: auto;
 }
 
-.spec-rail-shell.is-folded [data-slot="tabs-content"] {
-  max-height: none;
+.spec-rail-sheet-body [data-slot="tabs"] {
+  gap: 0;
 }
 
 @media (max-width: 64rem) {

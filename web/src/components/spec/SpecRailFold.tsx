@@ -51,7 +51,7 @@ export function SpecRailFold({ rail, children }: { rail: SpecRail; children: Rea
       </SheetTrigger>
       <SheetContent side="bottom" className="spec-rail-sheet">
         <SheetTitle className="spec-rail-sheet-title">Spec sections</SheetTitle>
-        <div className="spec-rail-shell is-folded">{children}</div>
+        <div className="spec-rail-sheet-body">{children}</div>
       </SheetContent>
     </Sheet>
   );
