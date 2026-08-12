@@ -560,7 +560,7 @@ describe("PostgresSpecParticipantStore", () => {
   );
 
   test.skipIf(!liveDbReachable)(
-    "migration 0063 removes the rollout contract and keeps the lease writers",
+    "migration 0064 removes the rollout contract and keeps the lease writers",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
       const client = await livePool.connect();
@@ -628,7 +628,7 @@ describe("PostgresSpecParticipantStore", () => {
         );
         const survivingEpoch = await participants.connect(specId, "current-client", userId);
 
-        await applyMigration(client, "0063_spec_participant_lease_contract.sql");
+        await applyMigration(client, "0064_spec_participant_lease_contract.sql");
 
         // The compatibility contract is gone: no default, no trigger, no function.
         const columnDefault = await client.query<{ column_default: string | null }>(
