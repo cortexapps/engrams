@@ -1086,7 +1086,7 @@ impl SimWorld {
             // FIDELITY (R3 #722): the workload reserves `mem_budget_mib: 2048`
             // / `cpu_budget_vcpus: 2` at create (scheduler.rs), so the enabled
             // image MUST resolve to the SAME budget — in production
-            // `reserve_and_persist_create` and `resolve_cold_boot_spec` both
+            // `reserve_and_persist_create` and `materialize_cold_boot` both
             // derive from `ImageConfig::resolved_memory_mib`/`_vcpus`, so
             // create-reserve == resume-resolve by construction. The old
             // `name = "sim"`-only config left memory at DEFAULT_MEMORY_MIB

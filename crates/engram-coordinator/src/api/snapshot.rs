@@ -1195,11 +1195,11 @@ async fn resume_disk_only_cold_boot(
     ctx: &crate::session_ops::OpCtx<'_>,
     session: Session,
 ) -> Result<SnapshotResponse, ApiError> {
-    use crate::evacuation::{evacuate_dead_source, resolve_cold_boot_spec, EvacError};
+    use crate::evacuation::{evacuate_dead_source, EvacError};
 
     let state = ctx.state;
     let id = session.id;
-    let Some(spec) = resolve_cold_boot_spec(&state.services.meta, &session).await else {
+    let Some(spec) = crate::boot_materializer::materialize_cold_boot(state, &session).await? else {
         return Err(ApiError::Conflict(format!(
             "session {id} has only a live disk manifest and its image `{}` is no \
              longer enabled — re-enable it (POST /api/enabled-images), then retry /resume",
@@ -1745,9 +1745,8 @@ async fn resume_from_fc_snapshot(
     // can't be resolved (image un-enabled, etc.) we fall back to the
     // pre-0072 soft `None` posture — the tier-0 DISK veto (the primary
     // locality signal) still fires regardless.
-    let resume_budget = crate::evacuation::resolve_cold_boot_spec(&state.services.meta, &session)
-        .await
-        .map(|spec| (spec.memory.max_mib, spec.cpu.vcpus));
+    let resume_budget =
+        crate::boot_materializer::resolve_resume_budget(&state.services.meta, &session).await;
     let ctx = ScheduleContext {
         repo: image_repo,
         image_version: image_tag,

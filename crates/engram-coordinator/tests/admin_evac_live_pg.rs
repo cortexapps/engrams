@@ -344,7 +344,7 @@ fn proto_to_core_manifest(r: ChunkManifestRef) -> ManifestRef {
 }
 
 /// ADR 0028 Fix B: the cold-boot spec a disk-only recovery rides (in
-/// prod, derived from the enabled image via `resolve_cold_boot_spec`).
+/// prod, derived from the enabled image via `materialize_cold_boot`).
 fn test_cold_boot_spec() -> SandboxSpec {
     SandboxSpec {
         image: "ghcr.io/test/img:t".into(),
@@ -475,7 +475,7 @@ async fn evacuate_dead_source_disk_only_records_memory_loss() {
     let session = meta.get_session(session_id).await.expect("get session");
     // ADR 0028 Fix B: disk-only recovery is a cold boot — the caller
     // supplies the boot spec (in prod, derived from the enabled image
-    // via `resolve_cold_boot_spec`).
+    // via `materialize_cold_boot`).
     let receipt = evacuate_dead_source(
         &registry,
         &meta,

@@ -121,55 +121,13 @@ impl std::error::Error for EvacError {
     }
 }
 
-/// ADR 0028 Fix B: derive the disk-only recovery's cold-boot
-/// `SandboxSpec` from the session's enabled image (config-derived
-/// resources, env, bundles — `api::sessions::cold_boot_spec`).
-/// `None` when the image row is gone/unreadable — callers pass that
-/// through and `evacuate_dead_source` fails structurally
-/// (`ColdBootUnavailable`) only if the recovery actually needed it.
-pub async fn resolve_cold_boot_spec(
-    meta: &Arc<dyn MetadataStore>,
-    session: &Session,
-) -> Option<engram_core::types::sandbox::SandboxSpec> {
-    let enabled = match meta.get_enabled_image(&session.image).await {
-        Ok(Some(row)) => row,
-        Ok(None) => {
-            tracing::warn!(
-                session_id = %session.id,
-                image = %session.image,
-                "cold-boot spec: image is not enabled; disk-only recovery unavailable",
-            );
-            return None;
-        }
-        Err(e) => {
-            tracing::warn!(
-                session_id = %session.id,
-                image = %session.image,
-                error = %e,
-                "cold-boot spec: enabled-image lookup failed",
-            );
-            return None;
-        }
-    };
-    // ADR 0080: the row carries the config as typed JSONB — no TOML parse.
-    let config = enabled.effective_config();
-    // ADR 0057: disk-only recovery rebuilds the session's own egress network
-    // from its persisted policy (the image config carries no network).
-    let network = match meta.get_session_integration_policy(session.id).await {
-        Ok(Some(json)) => engram_core::types::IntegrationPolicy::parse(&json)
-            .ok()
-            .flatten()
-            .map(|p| p.network)
-            .unwrap_or_default(),
-        _ => Default::default(),
-    };
-    Some(crate::api::sessions::cold_boot_spec(
-        &session.image,
-        &config,
-        None,
-        network,
-    ))
-}
+// ADR 0028 Fix B's spec derivation moved to
+// `crate::boot_materializer::materialize_cold_boot` (ADR 0116): the
+// disk-only recovery spec now also carries the session's persisted slot
+// selections (harness/skills), so a recovered guest can always spawn what
+// its argv names. Callers still pass `None` through and
+// `evacuate_dead_source` fails structurally (`ColdBootUnavailable`) only
+// if the recovery actually needed it.
 
 /// Pick the disk manifest the target should restore from. Mirrors the
 /// `effective_resume_disk_manifest` semantics in `api/snapshot.rs`:
@@ -237,7 +195,7 @@ pub async fn evacuate_dead_source(
     session: Session,
     snapshot: Option<SnapshotRecord>,
     // ADR 0028 Fix B: the disk-only recovery's boot shape (from
-    // `api::sessions::cold_boot_spec`, manifest-derived resources).
+    // `boot_materializer::capture_boot_spec`, manifest-derived resources).
     // `None` is fine when a memory snapshot exists; when the session
     // is disk-only recoverable and this is `None`, the call fails
     // structurally with `ColdBootUnavailable`.
@@ -259,7 +217,7 @@ pub async fn evacuate_dead_source(
     fence: SessionFence,
     // #800 (RESERVED evac placement): the session's reserved 2D budget
     // `(mem_mib, cpu_vcpus)`, resolved from the enabled image
-    // (`resolve_cold_boot_spec`). `Some` feeds the HARD reserved pick — a
+    // (`boot_materializer::materialize_cold_boot`). `Some` feeds the HARD reserved pick — a
     // relocation that fits no survivor returns `NoCapacityQueue` (the caller
     // queues instead of overcommitting). `None` (image un-enabled / budget
     // unresolvable) keeps the pre-#800 capacity-SOFT posture — never strand
@@ -1093,7 +1051,7 @@ mod tests {
         );
     }
 
-    /// A plausible cold-boot spec, the shape `resolve_cold_boot_spec`
+    /// A plausible cold-boot spec, the shape `materialize_cold_boot`
     /// would derive from an enabled image.
     fn test_cold_boot_spec() -> SandboxSpec {
         SandboxSpec {

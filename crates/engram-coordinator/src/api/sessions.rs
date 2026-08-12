@@ -19,65 +19,10 @@ use crate::state::{SessionEvent, SharedState};
 /// placement reserves them for sessions and captures alike.)
 pub(crate) const DEFAULT_DISK_GIB: u32 = 20;
 
-/// The system's cold-boot `SandboxSpec` shape — a fresh kernel boot
-/// (not a snapshot restore) with manifest-derived resources, env, and
-/// the ADR 0027 aux bundles (current generations: a fresh boot has no
-/// snapshot device model to pin against).
-///
-/// Two callers, by design the SAME shape (ADR 0028):
-/// - base-snapshot capture at image enable (`enabled_images.rs`),
-///   `rootfs_manifest = None` — the image's own rootfs;
-/// - disk-only cold-boot recovery (`evacuation.rs` Fix B),
-///   `rootfs_manifest = Some(live_disk_manifest)` — a fresh kernel
-///   mounting the session's evolved rootfs lineage.
-pub(crate) fn cold_boot_spec(
-    image_uri: &str,
-    config: &ImageConfig,
-    rootfs_manifest: Option<engram_core::types::manifest::ManifestRef>,
-    // ADR 0057: network is no longer on the manifest. The caller supplies it —
-    // base-snapshot capture uses allow-all (a trusted, ephemeral build step;
-    // every session that later restores the snapshot gets its own policy
-    // network), disk-only recovery passes the session's persisted policy network.
-    network: engram_core::types::image::NetworkPolicy,
-) -> engram_core::types::sandbox::SandboxSpec {
-    use engram_core::types::sandbox::{AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
-
-    let vcpus = config.resolved_vcpus();
-    let memory_mib = config.resolved_memory_mib();
-    let disk_gib = config
-        .resources
-        .suggested_disk_gib
-        .unwrap_or(DEFAULT_DISK_GIB);
-    // ADR 0112: swap is opt-in per image; 0 stays `None` so backends
-    // and old sidecars see "no swap device" identically.
-    let swap_mib = config.resolved_swap_mib();
-
-    // ADR 0055: capture reserves a fixed pool of dynamic-mount slots, each
-    // carrying the sentinel. Per-session creates `patch_drive` the selected
-    // skills into slots in the paused restore window, so the base snapshot
-    // stays skill-agnostic — one per image, not one per skill-combination.
-    let aux_ro_drives = (0..AuxRoDrive::RESERVED_SLOTS)
-        .map(AuxRoDrive::reserved_slot)
-        .collect();
-
-    SandboxSpec {
-        image: image_uri.to_string(),
-        rootfs_source: None,
-        image_uri: Some(image_uri.to_string()),
-        rootfs_manifest,
-        cpu: CpuLimit { vcpus },
-        memory: MemoryLimit {
-            max_mib: memory_mib,
-        },
-        disk: DiskLimit { max_gib: disk_gib },
-        ttl: None,
-        env: config.env.clone(),
-        workdir: None,
-        network,
-        aux_ro_drives,
-        swap_mib: (swap_mib > 0).then_some(swap_mib),
-    }
-}
+// The cold-boot `SandboxSpec` shape moved to `crate::boot_materializer::
+// capture_boot_spec` (ADR 0116): capture keeps the sentinel-slot shape by
+// design; the disk-only recovery flavor now overlays the session's persisted
+// slot selections (`materialize_cold_boot`).
 
 /// ADR 0057: resolve the session policy's secrets into (env additions, broker
 /// egress entries). The image manifest no longer declares secrets — the
@@ -1218,7 +1163,7 @@ pub(crate) async fn prepare_from_row(
 /// a name the fleet doesn't carry is looked up in the `mount_catalog` table.
 /// Each skill gets a reserved slot (dyn_0..) + the staged sha the host
 /// `patch_drive`s in.
-async fn resolve_selected_skills(
+pub(crate) async fn resolve_selected_skills(
     state: &SharedState,
     names: &[String],
 ) -> Result<Vec<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
@@ -1271,7 +1216,7 @@ async fn resolve_selected_skills(
 /// without this mount degrades to whatever `ttyd` the image itself carries
 /// (agentd warns again at StartShell when it falls back), never to a failed
 /// create.
-async fn resolve_guest_tools_mount(
+pub(crate) async fn resolve_guest_tools_mount(
     state: &SharedState,
 ) -> Result<Option<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
     use engram_core::types::sandbox::AuxRoDrive;
@@ -1302,7 +1247,7 @@ async fn resolve_guest_tools_mount(
 /// Deliberately soft, unlike skills: the Process backend runs no guest
 /// agentd at all, and on FC the *capture* path already hard-fails a fleet
 /// that stages no agentd bundle, so mis-staging can't compound silently.
-async fn resolve_agentd_mount(
+pub(crate) async fn resolve_agentd_mount(
     state: &SharedState,
 ) -> Result<Option<engram_core::types::sandbox::AuxRoDrive>, ApiError> {
     use engram_core::types::sandbox::AuxRoDrive;
@@ -1550,32 +1495,20 @@ async fn prepare_inner(
     // (`bundle_for` already errors if the enabled image has no base
     // snapshot) — no per-create `get_snapshot` on this path.
     let base_snapshot_id = bundle.base_snapshot.id;
-    // ADR 0055: resolve the profile's selected skill names to reserved-slot
-    // mounts against the fleet's staged bundles (name -> sha). Capped at
-    // RESERVED_SLOTS; an unknown skill name is a 400.
-    let mut selected_mounts = resolve_selected_skills(state, &selected_skills).await?;
-    // ADR 0080: pin the fleet's current agentd generation to its reserved
-    // slot (`dyn_1`) — the identical paused-window patch_drive path. The
-    // host compares this pin against the snapshot's and only when they
-    // differ does the captured agentd re-exec (RefreshAgent), so an agentd
-    // roll reaches new sessions with zero recapture and zero steady-state
-    // latency. `None` (Process dev, or a fleet mid-bring-up) keeps the
-    // snapshot's pinned generation.
-    if let Some(mount) = resolve_agentd_mount(state).await? {
-        selected_mounts.push(mount);
-    }
-    // ADR 0080 §D: pin the fleet's current guest-tools generation (ttyd) to
-    // its reserved slot (`dyn_2`) — same paused-window patch_drive path as
-    // skills, soft like agentd (a fleet without guest-tools warns and the
-    // SHELL tab relies on an image-baked ttyd).
-    if let Some(mount) = resolve_guest_tools_mount(state).await? {
-        selected_mounts.push(mount);
-    }
-    // ADR 0062: the harness catalog rides `dyn_0` alongside the skills (dyn_2..),
-    // bound through the identical paused-window patch_drive path.
-    if let Some(mount) = harness_mount {
-        selected_mounts.push(mount);
-    }
+    // ADR 0116: slot assembly (skills dyn_3.., agentd dyn_1, guest-tools
+    // dyn_2, harness dyn_0 — ADR 0055/0080/0062) lives in the boot
+    // materializer, shared with the disk-only cold-boot recovery so the two
+    // paths can never disagree about what rides the reserved slots. The
+    // per-slot semantics (soft agentd/guest-tools, hard skills) are
+    // documented on the resolvers.
+    let harness_slot = match (harness_mount, agent.as_ref()) {
+        (Some(mount), Some(spec)) => Some((spec.argv[0].clone(), mount)),
+        _ => None,
+    };
+    let selected_mounts =
+        crate::boot_materializer::slot_plan_for_create(state, harness_slot, &selected_skills)
+            .await?
+            .into_mounts();
     // Issue #535 (a): already resolved at bundle-fill time; reuse rather
     // than recompute (identical inputs, so identical outputs).
     let memory_mib = bundle.memory_mib;
@@ -2078,8 +2011,6 @@ pub(crate) async fn resolve_harness(
     )>,
     ApiError,
 > {
-    use engram_core::types::sandbox::AuxRoDrive;
-
     if session_mode.is_dev_vm() {
         return Ok(None);
     }
@@ -2089,44 +2020,8 @@ pub(crate) async fn resolve_harness(
         ));
     };
 
-    // Resolve the harness to (descriptor, squashfs sha) — mirroring
-    // resolve_selected_skills' "fleet stamp ∪ catalog" lookup. A built-in rides the
-    // host-image `current_bundles` stamp + an embedded descriptor; a custom harness
-    // rides the `harness_catalog` (its own squashfs, materialized like an uploaded
-    // skill). Built-ins win, so a custom row can never shadow one.
-    let descriptor = resolve_descriptor(state, name).await?;
+    let (descriptor, exec, mount) = resolve_harness_mount(state, name).await?;
     validate_harness_mode(&descriptor, name, harness_mode)?;
-    let harness_sha = if let Some(builtin) = crate::builtin_harness::builtin(name) {
-        fleet_bundle_catalog(state)
-            .await?
-            .get(builtin.stamp_key)
-            .cloned()
-            .ok_or_else(|| {
-                ApiError::BadRequest(format!(
-                    "built-in harness `{name}` squashfs (`{}`) is not staged on any host yet",
-                    builtin.stamp_key
-                ))
-            })?
-    } else if let Some(row) = state
-        .services
-        .meta
-        .get_harness_by_name(name)
-        .await
-        .map_err(|e| ApiError::Internal(format!("harness catalog lookup for `{name}`: {e}")))?
-    {
-        row.squashfs_sha256
-    } else {
-        return Err(ApiError::BadRequest(format!(
-            "harness `{name}` is not a built-in and is not registered in the catalog"
-        )));
-    };
-
-    // argv[0] = the harness's launch entry within its own squashfs on dyn_0.
-    let exec = format!(
-        "{}/{}",
-        AuxRoDrive::slot_guest_mount(AuxRoDrive::HARNESS_SLOT_INDEX).display(),
-        descriptor.exec_path(),
-    );
 
     // Harness-only extras, layered on top of `session_env` for the harness
     // child. `session_env` already carries ENGRAM_SESSION_ID + the image env +
@@ -2190,13 +2085,67 @@ pub(crate) async fn resolve_harness(
         session_env,
         host_ca_pem: None,
     };
+    Ok(Some((agent, mount, descriptor.egress)))
+}
+
+/// Resolve a harness name to its `dyn_0` mount + the in-guest exec path the
+/// agent argv points at, against the fleet stamp ∪ the harness catalog
+/// (built-ins win, so a custom row can never shadow one). Shared by the
+/// create path ([`resolve_harness`], which also builds the `AgentSpec`) and
+/// the cold-boot materializer (ADR 0116, `crate::boot_materializer`), so
+/// the two can never disagree about what rides slot 0.
+pub(crate) async fn resolve_harness_mount(
+    state: &SharedState,
+    name: &str,
+) -> Result<
+    (
+        engram_core::types::harness::HarnessDescriptor,
+        String,
+        engram_core::types::sandbox::AuxRoDrive,
+    ),
+    ApiError,
+> {
+    use engram_core::types::sandbox::AuxRoDrive;
+
+    let descriptor = resolve_descriptor(state, name).await?;
+    let harness_sha = if let Some(builtin) = crate::builtin_harness::builtin(name) {
+        fleet_bundle_catalog(state)
+            .await?
+            .get(builtin.stamp_key)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "built-in harness `{name}` squashfs (`{}`) is not staged on any host yet",
+                    builtin.stamp_key
+                ))
+            })?
+    } else if let Some(row) = state
+        .services
+        .meta
+        .get_harness_by_name(name)
+        .await
+        .map_err(|e| ApiError::Internal(format!("harness catalog lookup for `{name}`: {e}")))?
+    {
+        row.squashfs_sha256
+    } else {
+        return Err(ApiError::BadRequest(format!(
+            "harness `{name}` is not a built-in and is not registered in the catalog"
+        )));
+    };
+
+    // The harness's launch entry within its own squashfs on dyn_0.
+    let exec = format!(
+        "{}/{}",
+        AuxRoDrive::slot_guest_mount(AuxRoDrive::HARNESS_SLOT_INDEX).display(),
+        descriptor.exec_path(),
+    );
     let mount = AuxRoDrive {
         drive_id: AuxRoDrive::slot_drive_id(AuxRoDrive::HARNESS_SLOT_INDEX),
         guest_mount: AuxRoDrive::slot_guest_mount(AuxRoDrive::HARNESS_SLOT_INDEX),
         fs_type: "squashfs".into(),
         sha256: Some(harness_sha),
     };
-    Ok(Some((agent, mount, descriptor.egress)))
+    Ok((descriptor, exec, mount))
 }
 
 #[cfg(test)]
