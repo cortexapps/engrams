@@ -67,6 +67,11 @@ pub struct ChunkStore {
     /// NIC instead of stacking on it. `None` (coordinator, tests) =
     /// unbudgeted, unchanged.
     upload_budget: Option<crate::budget::UploadBudget>,
+    /// ADR 0116 C3: which arbitration class this store's PUTs draw
+    /// from. `Foreground` by default; bulk producers (checkpoint
+    /// re-chunk, materialize, base capture) clone a `Background` store
+    /// via [`Self::with_upload_class`].
+    upload_class: crate::budget::UploadClass,
 }
 
 impl ChunkStore {
@@ -84,6 +89,7 @@ impl ChunkStore {
             resolver,
             cache: None,
             upload_budget: None,
+            upload_class: crate::budget::UploadClass::Foreground,
         }
     }
 
@@ -94,6 +100,16 @@ impl ChunkStore {
     /// to every store on the host.
     pub fn with_upload_budget(mut self, budget: crate::budget::UploadBudget) -> Self {
         self.upload_budget = Some(budget);
+        self
+    }
+
+    /// ADR 0116 C3: a clone of this store whose PUTs draw from `class`.
+    /// The bulk producers (checkpoint re-chunk, materialize/enable
+    /// chunking, base capture) take a `Background` clone at their entry
+    /// point; everything else stays `Foreground`. Same blob, resolver,
+    /// cache, and budget — only the arbitration class differs.
+    pub fn with_upload_class(mut self, class: crate::budget::UploadClass) -> Self {
+        self.upload_class = class;
         self
     }
 
@@ -165,7 +181,7 @@ impl ChunkStore {
             // Budget the PUT body only — the HEAD above and the local
             // warm below stay unbudgeted.
             let _permit = match &self.upload_budget {
-                Some(b) => Some(b.acquire().await),
+                Some(b) => Some(b.acquire(self.upload_class).await),
                 None => None,
             };
             self.inner.put(&key, bytes).await
@@ -214,7 +230,7 @@ impl ChunkStore {
         let bytes = Bytes::copy_from_slice(body);
         let put_result = {
             let _permit = match &self.upload_budget {
-                Some(b) => Some(b.acquire().await),
+                Some(b) => Some(b.acquire(self.upload_class).await),
                 None => None,
             };
             self.inner.put(&key, bytes).await
@@ -481,7 +497,7 @@ mod tests {
 
         // Hold the only permit hostage; the deduped re-put must still
         // return promptly via the exists() short-circuit.
-        let _hostage = budget.acquire().await;
+        let _hostage = budget.acquire(crate::budget::UploadClass::Foreground).await;
         tokio::time::timeout(std::time::Duration::from_secs(5), s.put_chunk(body))
             .await
             .expect("deduped put must not wait on the budget")

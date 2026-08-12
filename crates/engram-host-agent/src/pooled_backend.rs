@@ -2494,6 +2494,20 @@ impl PooledBackend {
         }
     }
 
+    /// ADR 0116 C3: a finisher whose chunk PUTs draw from `class`.
+    /// The periodic checkpoint and the cold-base seed take
+    /// `Background` (bulk work nobody is blocked on — the 2026-08-12
+    /// storm producer); eviction, drain, and migration keep the
+    /// `Foreground` default (a session is waiting on them).
+    pub(crate) fn finisher_with_class(
+        &self,
+        class: engram_chunk_store::UploadClass,
+    ) -> SnapshotFinisher {
+        let mut f = self.finisher();
+        f.chunk_store = f.chunk_store.map(|cs| cs.with_upload_class(class));
+        f
+    }
+
     /// ADR 0088 addendum: the deferred-finish flavor of `snapshot()`,
     /// used by the cold-base seed so its multi-GiB upload runs
     /// CONCURRENTLY with the warm hook instead of blocking it. The
@@ -2520,7 +2534,10 @@ impl PooledBackend {
     ) -> Result<DeferredSnapshot, SandboxError> {
         let (capture_guard, cap) = self.capture_phase(id, SwapDisarmPolicy::Terminal).await?;
         self.spawn_trace_publish(id);
-        let finisher = self.finisher();
+        // ADR 0116 C3: the cold-base seed's multi-GiB upload is the
+        // canonical background bulk producer — nested-capped so it can
+        // never own the whole wire.
+        let finisher = self.finisher_with_class(engram_chunk_store::UploadClass::Background);
         Ok(DeferredSnapshot {
             handle: tokio::spawn(async move {
                 let _guard = capture_guard;
@@ -4594,7 +4611,14 @@ impl PooledBackend {
         // consumed) instead of paging GiBs back per 30 s tick; the
         // continuously-flushed disk is that tick's durability.
         let metadata = self
-            .snapshot_with_swap_policy(id, SwapDisarmPolicy::Periodic)
+            .snapshot_with_swap_policy(
+                id,
+                SwapDisarmPolicy::Periodic,
+                // ADR 0116 C3: the periodic re-chunk is THE storm
+                // producer (2026-08-12: it held all 96 permits while a
+                // live NBD serve loop starved) — background class.
+                engram_chunk_store::UploadClass::Background,
+            )
             .await?;
         let _ = self.commit_snapshot(id).await;
         Ok(metadata)
@@ -4603,11 +4627,15 @@ impl PooledBackend {
     /// ADR 0045 D5 composed capture with an explicit ADR 0112 swap
     /// policy: capture, then run the post phase inline holding the
     /// capture lock (the periodic-checkpoint and drain flavor;
-    /// eviction uses snapshot_begin/snapshot_wait).
+    /// eviction uses snapshot_begin/snapshot_wait). `class` picks the
+    /// upload arbitration class (ADR 0116 C3): the periodic checkpoint
+    /// is `Background`, a drain a session is waiting on is
+    /// `Foreground`.
     pub(crate) async fn snapshot_with_swap_policy(
         &self,
         id: SandboxId,
         swap_policy: SwapDisarmPolicy,
+        class: engram_chunk_store::UploadClass,
     ) -> Result<SnapshotMetadata, SandboxError> {
         let (_capture_guard, cap) = self.capture_phase(id, swap_policy).await?;
         // Lift the per-jail working-set trace into the blob store under the
@@ -4615,7 +4643,7 @@ impl PooledBackend {
         // the replay; the handler can't publish it itself — SIGKILLed on
         // destroy). Detached + best-effort; never blocks the capture.
         self.spawn_trace_publish(id);
-        self.finisher().finish(id, cap).await
+        self.finisher_with_class(class).finish(id, cap).await
     }
 
     /// ADR 0016 Phase B commit 4: build a coord-bound publisher
@@ -7562,9 +7590,15 @@ impl SandboxBackend for PooledBackend {
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         // ADR 0112: trait callers are the drain / operator / base-bake
         // flavors — Terminal disarm. The periodic checkpoint reaches
-        // the same pipeline through `snapshot_with_swap_policy`.
-        self.snapshot_with_swap_policy(id, SwapDisarmPolicy::Terminal)
-            .await
+        // the same pipeline through `snapshot_with_swap_policy`. ADR
+        // 0116 C3: foreground — a drain/evict caller has a session
+        // waiting on this capture.
+        self.snapshot_with_swap_policy(
+            id,
+            SwapDisarmPolicy::Terminal,
+            engram_chunk_store::UploadClass::Foreground,
+        )
+        .await
     }
 
     /// ADR 0045 D5 (rewritten for issue #529): the eviction flavor. Runs
@@ -9855,6 +9889,11 @@ impl SandboxBackend for PooledBackend {
                 "this host has no chunk store wired; cannot materialize images".into(),
             ));
         };
+        // ADR 0116 C3: enable-flow chunking (64-wide over a multi-GiB
+        // flatten) is bulk background work — nested-capped so it never
+        // owns the whole wire.
+        let chunk_store =
+            chunk_store.with_upload_class(engram_chunk_store::UploadClass::Background);
         // ≤1 concurrent materialize per host: an image pull + flatten +
         // pack saturates NVMe/network; queueing a second behind it
         // just serializes with extra memory pressure. `try_lock` (not

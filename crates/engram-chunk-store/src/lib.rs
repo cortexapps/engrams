@@ -57,7 +57,7 @@ mod time_source;
 pub mod working_set;
 
 pub use bootstrap::{Bootstrap, BootstrapEntry, BOOTSTRAP_SCHEMA_VERSION};
-pub use budget::UploadBudget;
+pub use budget::{UploadBudget, UploadClass};
 pub use cache::{ChunkCache, ChunkCacheConfig};
 pub use error::{ChunkStoreError, Result};
 pub use file::ChunkFileStats;

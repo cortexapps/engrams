@@ -1503,6 +1503,33 @@ const ADOPTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(150)
 /// the kernel's `dead_conn_timeout` park window. The 2026-08-12 nbd98
 /// death sat recoverable for 7 hours because nothing owned this repair.
 #[allow(clippy::too_many_arguments)] // cohesive supervisor inputs
+/// ADR 0116 C3: the dedicated serve runtime — two threads that run ONLY
+/// the NBD supervisors (reader + writer loops: socketpair I/O + header
+/// parse, nothing that blocks). Per-request handlers spawn back onto
+/// the MAIN runtime via the handle captured at [`serve_at`] (they do
+/// chunk fetches and the blocking dirty pwrite — they must not clog the
+/// serve threads). Under main-runtime saturation (the 2026-08-12 storm:
+/// a 96-wide checkpoint re-chunk monopolizing the workers) the reader
+/// keeps draining the kernel's requests, so the kernel's send never
+/// blocks into its 90 s timeout and the connection never dies —
+/// "neighbor storm ⇒ device death" becomes "neighbor storm ⇒ guest
+/// latency". Process-global: serve loops are tiny, and one shared pair
+/// of threads serves every device on the host.
+fn serve_runtime() -> &'static tokio::runtime::Runtime {
+    static SERVE_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    SERVE_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("nbd-serve")
+            .enable_all()
+            .build()
+            .expect("build NBD serve runtime")
+    })
+}
+
+// One arg per supervised concern; a bundling struct would only rename
+// the coupling (every field is threaded verbatim to serve/reconfigure).
+#[allow(clippy::too_many_arguments)]
 async fn supervise(
     backend: Arc<ChunkedDiskBackend>,
     nbd_device: PathBuf,
@@ -1513,6 +1540,8 @@ async fn supervise(
     // Reconfigure mode: the first socket's adoption needs confirming too.
     mut confirm_pending: bool,
     tuning: SupervisorTuning,
+    // ADR 0116 C3: where per-request handlers run (the main runtime).
+    handler_rt: tokio::runtime::Handle,
 ) {
     let device_label = nbd_device.display().to_string();
     let total_bytes = backend.total_bytes();
@@ -1531,7 +1560,12 @@ async fn supervise(
         // (#810 class). Inline, cancelling the supervisor cancels this
         // future, dropping the stream halves — the socket dies exactly
         // as the pre-C2 direct abort did.
-        let mut serve = std::pin::pin!(serve_loop(backend.clone(), s, device_label.clone()));
+        let mut serve = std::pin::pin!(serve_loop(
+            backend.clone(),
+            s,
+            device_label.clone(),
+            handler_rt.clone()
+        ));
         if confirm_pending {
             // Rejection-aware confirm: a kernel-swallowed RECONFIGURE
             // (clean-ACKed ENOSPC) EOFs the loop within ms; a socket that
@@ -1711,7 +1745,13 @@ async fn serve_at(
         ServeStatus::Serving
     };
     let (shared, _rx) = ServeShared::new(initial);
-    let serve_task = tokio::spawn(supervise(
+    // ADR 0116 C3: the supervisor (reader + writer) lives on the
+    // dedicated serve runtime so a saturated main runtime can never
+    // starve it into the kernel's 90 s send timeout; its per-request
+    // handlers spawn back HERE via the captured handle. The JoinHandle
+    // is runtime-agnostic — Drop/abandon abort it exactly as before.
+    let handler_rt = tokio::runtime::Handle::current();
+    let serve_task = serve_runtime().handle().spawn(supervise(
         backend,
         nbd_device.to_path_buf(),
         backend_id.to_string(),
@@ -1720,6 +1760,7 @@ async fn serve_at(
         stream,
         confirm_pending,
         SupervisorTuning::default(),
+        handler_rt,
     ));
 
     Ok(NbdHandle {
@@ -1782,7 +1823,15 @@ fn unix_socketpair() -> io::Result<(OwnedFd, std::os::unix::net::UnixStream)> {
 /// the virtio→kernel-NBD→userspace pipeline) counts a request as
 /// in-flight until its bytes are on the wire. `ENGRAM_NBD_SERVE_CONCURRENCY=1`
 /// reproduces the legacy strictly-serial loop.
-async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream, device: String) {
+async fn serve_loop(
+    backend: Arc<ChunkedDiskBackend>,
+    stream: TokioUnixStream,
+    device: String,
+    // ADR 0116 C3: handlers run on the MAIN runtime — they fetch chunks
+    // and do the blocking dirty pwrite, which must not clog the
+    // dedicated serve threads this loop runs on.
+    handler_rt: tokio::runtime::Handle,
+) {
     // ADR 0116 C1: every exit path names its cause. Anything except
     // `disconnect` leaves a configured device with no server — the
     // kernel parks I/O for dead_conn_timeout, then fails the device
@@ -1875,7 +1924,7 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream, d
         };
         let backend = backend.clone();
         let reply_tx = reply_tx.clone();
-        tokio::spawn(async move {
+        handler_rt.spawn(async move {
             let msg = handle_request(&backend, req, write_data, guard, permit).await;
             // If the writer is gone (connection torn down), the send
             // fails and `msg` — including its guard — drops here,
@@ -2206,7 +2255,12 @@ mod tests {
         let backend = Arc::new(backend);
         let in_flight = backend.in_flight_tracker();
         let (client, server) = TokioUnixStream::pair().unwrap();
-        let serve = tokio::spawn(serve_loop(backend, server, "/dev/nbd-test".into()));
+        let serve = tokio::spawn(serve_loop(
+            backend,
+            server,
+            "/dev/nbd-test".into(),
+            tokio::runtime::Handle::current(),
+        ));
         let (mut rd, mut wr) = client.into_split();
 
         let cs = 4096u32;
@@ -2237,6 +2291,72 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), serve).await;
     }
 
+    /// ADR 0116 C3: the reader survives handler-runtime saturation. The
+    /// serve loop runs on the dedicated serve runtime; its handlers are
+    /// pointed at a single-threaded runtime whose only worker is
+    /// BLOCKED (the 2026-08-12 storm shape: the main runtime's workers
+    /// monopolized by a checkpoint re-chunk). The reader must still
+    /// CONSUME the request — observed via the in-flight guard, which
+    /// the reader takes before spawning the handler — even though no
+    /// reply can arrive. Pre-C3 (reader on the saturated runtime) the
+    /// kernel's send would have blocked into its 90 s timeout and
+    /// killed the connection.
+    #[tokio::test]
+    async fn reader_consumes_requests_while_the_handler_runtime_is_saturated() {
+        let (backend, _dir) = three_chunk_backend().await;
+        let backend = Arc::new(backend);
+        let in_flight = backend.in_flight_tracker();
+        let (client, server) = TokioUnixStream::pair().unwrap();
+
+        // The "main" runtime: one worker, fully blocked.
+        let saturated = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
+        saturated.spawn(async move {
+            // Block the worker THREAD (not an await point) — the
+            // storm's blocking pwrite/chunk work shape.
+            let _ = block_rx.recv();
+        });
+
+        // The serve loop on the DEDICATED runtime, handlers on the
+        // saturated one.
+        let serve = serve_runtime().handle().spawn(serve_loop(
+            backend,
+            server,
+            "/dev/nbd-test".into(),
+            saturated.handle().clone(),
+        ));
+        let (_rd, mut wr) = client.into_split();
+        wr.write_all(&req_bytes(0, 7, 0, 4096)).await.unwrap();
+
+        // The reader must take the in-flight guard within a tight bound
+        // — it consumed the request while the handler runtime is dead
+        // to the world.
+        let deadline = crate::time_source::metrics_now() + std::time::Duration::from_secs(5);
+        loop {
+            if in_flight.count() > 0 {
+                break;
+            }
+            assert!(
+                crate::time_source::metrics_now() < deadline,
+                "reader did not consume the request while the handler runtime was saturated",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Unblock, then clean up: the handler completes and the
+        // disconnect ends the loop.
+        block_tx.send(()).unwrap();
+        wr.write_all(&req_bytes(2, 0, 0, 0)).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), serve).await;
+        // A runtime cannot be Dropped inside async; consume it without
+        // blocking this test's worker.
+        saturated.shutdown_background();
+    }
+
     /// ADR 0071 (#1): a WRITE round-trips through the pipeline — its payload is
     /// consumed in order by the reader, applied by the backend, and a later
     /// READ of the same range reads it back.
@@ -2245,7 +2365,12 @@ mod tests {
         let (backend, _dir) = three_chunk_backend().await;
         let backend = Arc::new(backend);
         let (client, server) = TokioUnixStream::pair().unwrap();
-        let serve = tokio::spawn(serve_loop(backend, server, "/dev/nbd-test".into()));
+        let serve = tokio::spawn(serve_loop(
+            backend,
+            server,
+            "/dev/nbd-test".into(),
+            tokio::runtime::Handle::current(),
+        ));
         let (mut rd, mut wr) = client.into_split();
 
         // WRITE 4096 bytes of 0xff at offset 0 (NBD_CMD_WRITE = 1): header then
@@ -2274,7 +2399,12 @@ mod tests {
         let backend = Arc::new(backend);
         let assertion_backend = backend.clone();
         let (client, server) = TokioUnixStream::pair().unwrap();
-        let serve = tokio::spawn(serve_loop(backend, server, "/dev/nbd-test".into()));
+        let serve = tokio::spawn(serve_loop(
+            backend,
+            server,
+            "/dev/nbd-test".into(),
+            tokio::runtime::Handle::current(),
+        ));
         let (mut rd, mut wr) = client.into_split();
 
         wr.write_all(&req_bytes(1, 1, 0, u32::MAX)).await.unwrap();
@@ -2486,6 +2616,7 @@ mod tests {
             server,
             false,
             tuning,
+            tokio::runtime::Handle::current(),
         ));
 
         // Death 1 (restart 1) and death 2 (restart 2): hold each fresh
