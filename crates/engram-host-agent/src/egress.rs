@@ -121,8 +121,16 @@ impl CoordCloudSqlConnector {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let mint_start = crate::time_source::metrics_now();
         let (api_token, login_token) = tokio::try_join!(
-            self.token(session_id, tunnel, CredentialPurpose::new("cloud_sql_admin")),
-            self.token(session_id, tunnel, CredentialPurpose::new("cloud_sql_login")),
+            self.token(
+                session_id,
+                tunnel,
+                CredentialPurpose::new("cloud_sql_admin")
+            ),
+            self.token(
+                session_id,
+                tunnel,
+                CredentialPurpose::new("cloud_sql_login")
+            ),
         )?;
         let mint_ms = mint_start.elapsed().as_millis() as u64;
         // A private directory gives each relay its own socket namespace. A
