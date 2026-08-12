@@ -267,6 +267,12 @@ async fn main() -> Result<(), HostAgentError> {
     // available as soon as the process is up.
     engram_host_agent::metrics::init(cli.metrics_addr);
 
+    // ADR 0116 C1: the executor-starvation probe — a 100 ms tick whose
+    // observed lateness is the "runnable tasks are waiting on workers"
+    // signal (the NBD serve loops share this runtime until C3 isolates
+    // them). Held for the process lifetime.
+    let _sched_delay_probe = engram_host_agent::metrics::spawn_sched_delay_probe();
+
     // #1003: SIGUSR2 → symbolized pprof heap dump; allocator stats as
     // Prometheus gauges every 30 s. Dumps land in the work_dir (the
     // node volume — survives the OOM kill the dump is usually for).

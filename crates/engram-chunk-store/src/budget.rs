@@ -32,6 +32,18 @@ const PERMITS_ENV: &str = "ENGRAM_UPLOAD_BUDGET_PERMITS";
 /// Host-wide cap on concurrent chunk-upload PUTs. Cheap to clone;
 /// every [`crate::ChunkStore`] on the host should share ONE instance
 /// (see `with_upload_budget`).
+///
+/// **PROCESS-scoped by design** (ADR 0116 C1): the resource this guards
+/// — in-flight HTTP PUT bodies on the NIC — cannot outlive the process,
+/// so a deploy/restart correctly resets to a full budget (and the
+/// in-flight gauge to zero); there is no stranded reservation to
+/// recover, unlike the PG leases whose protected work (VMs) outlives
+/// its holder. Corollary: "host-wide" holds only while exactly one
+/// host-agent process runs per node — true under the OnDelete roll (the
+/// old pod fully exits before its successor starts). An overlapping
+/// roll strategy would double the effective cap; if that ever changes,
+/// this must become node-scoped (C3, which restructures the budget into
+/// classes, is the natural home).
 #[derive(Clone)]
 pub struct UploadBudget {
     permits: Arc<Semaphore>,
@@ -55,8 +67,13 @@ impl UploadBudget {
     }
 
     /// Acquire one PUT slot (FIFO). Infallible: the semaphore is never
-    /// closed. The wait is recorded so budget contention is visible.
-    pub async fn acquire(&self) -> OwnedSemaphorePermit {
+    /// closed. The wait is recorded so budget contention is visible, and
+    /// the returned guard carries the in-flight gauge (ADR 0116 C1): a
+    /// sustained `engram_upload_budget_in_flight` at the cap is the
+    /// "one background workload owns the whole wire" storm signature
+    /// (2026-08-12: a checkpoint re-chunk held all 96 while a live NBD
+    /// serve loop starved) — the input C3's upload classes are sized by.
+    pub async fn acquire(&self) -> UploadPermit {
         let started = crate::time_source::metrics_now();
         let permit = Arc::clone(&self.permits)
             .acquire_owned()
@@ -64,7 +81,21 @@ impl UploadBudget {
             .expect("upload budget semaphore never closed");
         metrics::histogram!("engram_upload_budget_wait_seconds")
             .record(started.elapsed().as_secs_f64());
-        permit
+        metrics::gauge!("engram_upload_budget_in_flight").increment(1.0);
+        UploadPermit { _permit: permit }
+    }
+}
+
+/// RAII PUT slot from [`UploadBudget::acquire`]. Dropping releases the
+/// semaphore permit and decrements the in-flight gauge together, so the
+/// gauge is exact (never sampled) across every exit path.
+pub struct UploadPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for UploadPermit {
+    fn drop(&mut self) {
+        metrics::gauge!("engram_upload_budget_in_flight").decrement(1.0);
     }
 }
 
