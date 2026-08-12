@@ -2,17 +2,25 @@ import { useEffect, useMemo, useState } from "react";
 import { Collaboration } from "@tiptap/extension-collaboration";
 import { CollaborationCaret } from "@tiptap/extension-collaboration-caret";
 import { EditorContent, useEditor } from "@tiptap/react";
-import { SPEC_FRAGMENT_NAME } from "@engrams/spec-document";
+import {
+  SPEC_FRAGMENT_NAME,
+  SPEC_NOTES_ARCHIVED_AT_KEY,
+  SPEC_NOTES_FRAGMENT_NAME,
+  SPEC_NOTES_STATE_NAME,
+} from "@engrams/spec-document";
 import { WebsocketProvider } from "y-websocket";
 import * as Y from "yjs";
 
 import { useAuth } from "@/auth/AuthProvider";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { SpecNotesPane } from "./SpecNotesPane";
 import { SpecPresence } from "./SpecPresence";
 import { SpecSelectionBubbleMenu, type SpecSelectionActions } from "./SpecSelectionActions";
 import { SpecBlockIterationProvider } from "./block-iteration";
 import { specNodeExtensions } from "./extensions";
+import { readSectionTitles, SpecSectionTitleProvider } from "./section-titles";
 import "./spec-canvas.css";
 
 interface SpecConnection {
@@ -28,15 +36,24 @@ interface CreateSpecProviderOptions {
   WebSocketPolyfill?: WebSocketProviderOptions["WebSocketPolyfill"];
 }
 
+export interface SpecNotesStageActions {
+  /** Close the talk-it-through stage. Omit it for a viewer who cannot. */
+  onDistill: () => void;
+  distilling?: boolean;
+  distillError?: string | null;
+}
+
 export function SpecCanvas({
   specId,
   revision,
   selectionActions,
+  notesActions,
 }: {
   specId: string;
   revision: string;
   /** Supply this only when the current user can send selection actions. */
   selectionActions?: SpecSelectionActions;
+  notesActions?: SpecNotesStageActions;
 }) {
   const { principal } = useAuth();
   const [connection, setConnection] = useState<SpecConnection | null>(null);
@@ -82,6 +99,7 @@ export function SpecCanvas({
         specId={specId}
         revision={revision}
         selectionActions={selectionActions}
+        notesActions={notesActions}
       />
     </SpecBlockIterationProvider>
   );
@@ -93,12 +111,14 @@ function ConnectedSpecCanvas({
   specId,
   revision,
   selectionActions,
+  notesActions,
 }: {
   connection: SpecConnection;
   user: { name: string; color: string };
   specId: string;
   revision: string;
   selectionActions?: SpecSelectionActions;
+  notesActions?: SpecNotesStageActions;
 }) {
   const extensions = useMemo(
     () => [
@@ -122,7 +142,45 @@ function ConnectedSpecCanvas({
     },
   });
 
+  const notesStage = useNotesStage(connection.doc);
+  const sectionTitles = useMemo(
+    () => (editor ? readSectionTitles(editor.state.doc) : new Map<string, string>()),
+    // The tags follow a retitled heading, so this re-reads on every revision.
+    [editor, editor?.state.doc],
+  );
+
   if (!editor) return null;
+  const specDocument = (
+    <>
+      {selectionActions && (
+        <SpecSelectionBubbleMenu
+          editor={editor}
+          doc={connection.doc}
+          specId={specId}
+          revision={revision}
+          actions={selectionActions}
+        />
+      )}
+      <EditorContent editor={editor} />
+    </>
+  );
+  const notesPane = notesStage.present && (
+    <SpecSectionTitleProvider titles={sectionTitles}>
+      <SpecNotesPane
+        doc={connection.doc}
+        provider={connection.provider}
+        user={user}
+        archived={notesStage.archived}
+        {...(notesActions === undefined || notesStage.archived
+          ? {}
+          : {
+              onDistill: notesActions.onDistill,
+              distilling: notesActions.distilling ?? false,
+              distillError: notesActions.distillError ?? null,
+            })}
+      />
+    </SpecSectionTitleProvider>
+  );
   return (
     <div className="spec-canvas-shell">
       <div className="spec-canvas-bar">
@@ -154,18 +212,56 @@ function ConnectedSpecCanvas({
         </div>
         <SpecPresence awareness={connection.provider.awareness} />
       </div>
-      {selectionActions && (
-        <SpecSelectionBubbleMenu
-          editor={editor}
-          doc={connection.doc}
-          specId={specId}
-          revision={revision}
-          actions={selectionActions}
-        />
+      {!notesStage.present && specDocument}
+      {notesStage.present && (
+        // While the notes are live the canvas leads with them: the agent's pen
+        // is down, so the spec is the second tab, not the first (R21).
+        <Tabs defaultValue={notesStage.archived ? "spec" : "notes"} className="spec-canvas-stage">
+          <TabsList aria-label="Canvas view">
+            <TabsTrigger value="notes">
+              {notesStage.archived ? "Notes archive" : "Working notes"}
+            </TabsTrigger>
+            <TabsTrigger value="spec">Spec</TabsTrigger>
+          </TabsList>
+          <TabsContent value="notes">{notesPane}</TabsContent>
+          <TabsContent value="spec">{specDocument}</TabsContent>
+        </Tabs>
       )}
-      <EditorContent editor={editor} />
     </div>
   );
+}
+
+export interface SpecNotesStage {
+  /** True once the agent opened the notes. */
+  present: boolean;
+  /** True after distillation. The pane is then a read-only archive (R23). */
+  archived: boolean;
+}
+
+/**
+ * The stage state, read from the live document.
+ *
+ * Both facts are plain Yjs, so the pane appears and collapses without a fetch,
+ * and the notes editor mounts only when the server really holds notes: an empty
+ * fragment would let the editor push a placeholder cluster into the document.
+ */
+export function readNotesStage(doc: Y.Doc): SpecNotesStage {
+  const archivedAt = doc.getMap(SPEC_NOTES_STATE_NAME).get(SPEC_NOTES_ARCHIVED_AT_KEY);
+  return {
+    present: doc.getXmlFragment(SPEC_NOTES_FRAGMENT_NAME).length > 0,
+    archived: typeof archivedAt === "string" && archivedAt.length > 0,
+  };
+}
+
+function useNotesStage(doc: Y.Doc): SpecNotesStage {
+  const [stage, setStage] = useState<SpecNotesStage>(() => readNotesStage(doc));
+  useEffect(() => {
+    const read = () => setStage(readNotesStage(doc));
+    read();
+    doc.on("update", read);
+    return () => doc.off("update", read);
+  }, [doc]);
+  return stage;
 }
 
 export function createSpecProvider(

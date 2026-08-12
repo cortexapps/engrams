@@ -35,6 +35,7 @@ import {
   type SpecCheckpoint,
   type SpecCheckpointSummary,
   useDecideSpecAlternative,
+  useDistillSpecNotes,
   useRestoreSpecSection,
   useSpecAlternatives,
   useSetSpecSectionState,
@@ -73,6 +74,8 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   const tickets = useSpecTickets(specId, isPublished);
   const ticketCommand = useSpecTicketCommand(specId);
   const queryClient = useQueryClient();
+  const distillNotes = useDistillSpecNotes(specId);
+  const [distillError, setDistillError] = useState<string | null>(null);
   const sectionState = useSetSpecSectionState(specId);
   const undoSectionState = useUndoSpecSectionState(specId);
   const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
@@ -268,6 +271,16 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
                 specId={specId}
                 revision={spec.revision}
                 selectionActions={selectionActions}
+                notesActions={{
+                  onDistill: () => {
+                    setDistillError(null);
+                    distillNotes.mutate(undefined, {
+                      onError: (error) => setDistillError(error.message),
+                    });
+                  },
+                  distilling: distillNotes.isPending,
+                  distillError,
+                }}
               />
             )}
             {/* Two tabs of the same room: the tree a person shapes, and the

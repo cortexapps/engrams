@@ -1186,6 +1186,8 @@ function notesStructure(notes: SpecWorkingNotes): string {
   return JSON.stringify(
     notes.clusters.map((cluster) => ({
       id: cluster.id,
+      // The theme is the agent's clustering, so a person cannot rewrite it.
+      theme: cluster.theme,
       sectionIds: cluster.sectionIds,
       bullets: cluster.bullets.map((bullet) => ({
         id: bullet.id,

@@ -107,21 +107,20 @@ export class SpecWorkingNotesError extends Error {
 export const specNotesNodeSpecs: Readonly<Record<string, NodeSpec>> = {
   doc: { content: "noteCluster+" },
   noteCluster: {
-    content: "noteClusterTheme noteBullet+",
+    content: "noteBullet+",
     // Every attribute carries a default because ProseMirror only generates a
     // node in a required content position when it can create it unattended.
     // Identity is enforced by validateWorkingNotes, exactly as it is for a
     // spec section.
+    //
+    // The theme and the destination tags are attributes, not editable content:
+    // they are the agent's clustering. A person edits the words in a bullet.
     attrs: {
       id: { default: null },
+      theme: { default: "" },
       sectionIds: { default: [] },
     },
     isolating: true,
-  },
-  noteClusterTheme: {
-    content: "inline*",
-    marks: "",
-    defining: true,
   },
   noteBullet: {
     content: "inline*",
@@ -339,9 +338,9 @@ export function buildWorkingNotesDocument(notes: SpecWorkingNotes): ProseMirrorN
   return notesSchema.nodes.doc!.create(
     null,
     notes.clusters.map((cluster) =>
-      notesSchema.nodes.noteCluster!.create({ id: cluster.id, sectionIds: cluster.sectionIds }, [
-        notesSchema.nodes.noteClusterTheme!.create(null, notesSchema.text(cluster.theme)),
-        ...cluster.bullets.map((bullet) =>
+      notesSchema.nodes.noteCluster!.create(
+        { id: cluster.id, theme: cluster.theme, sectionIds: cluster.sectionIds },
+        cluster.bullets.map((bullet) =>
           notesSchema.nodes.noteBullet!.create(
             {
               id: bullet.id,
@@ -353,24 +352,21 @@ export function buildWorkingNotesDocument(notes: SpecWorkingNotes): ProseMirrorN
             notesSchema.text(bullet.text),
           ),
         ),
-      ]),
+      ),
     ),
   );
 }
 
 export function readWorkingNotes(document: ProseMirrorNode): SpecWorkingNotes {
   const clusters: SpecNoteCluster[] = [];
+  // Node types are compared by name: the browser editor builds an equivalent
+  // schema of its own, and it reads the notes with this same function.
   document.forEach((cluster) => {
-    if (cluster.type !== notesSchema.nodes.noteCluster) {
+    if (cluster.type.name !== "noteCluster") {
       throw new SpecWorkingNotesError("Working notes can contain only clusters.");
     }
     const bullets: SpecNoteBullet[] = [];
-    let theme = "";
-    cluster.forEach((child, _offset, index) => {
-      if (index === 0) {
-        theme = child.textContent;
-        return;
-      }
+    cluster.forEach((child) => {
       bullets.push({
         id: stringAttribute(child.attrs.id, "A note bullet needs an id."),
         mark: isSpecNoteMark(child.attrs.mark) ? child.attrs.mark : "unchecked",
@@ -382,7 +378,7 @@ export function readWorkingNotes(document: ProseMirrorNode): SpecWorkingNotes {
     });
     clusters.push({
       id: stringAttribute(cluster.attrs.id, "A note cluster needs an id."),
-      theme,
+      theme: typeof cluster.attrs.theme === "string" ? cluster.attrs.theme : "",
       sectionIds: sectionTags(cluster.attrs.sectionIds),
       bullets,
     });

@@ -183,13 +183,16 @@ vi.mock("@/components/spec", () => ({
     specId,
     revision,
     selectionActions,
+    notesActions,
   }: {
     specId: string;
     revision: string;
     selectionActions?: { onAction: (payload: SpecSelectionActionPayload) => void };
+    notesActions?: { onDistill: () => void };
   }) => (
     <div aria-label="Collaborative spec canvas">
       {specId}:{revision}
+      {notesActions && <button onClick={notesActions.onDistill}>Draft the spec</button>}
       {selectionActions &&
         (["refine", "wrong", "cut", "ask", "custom"] as const).map((action) => (
           <button key={action} onClick={() => selectionActions.onAction(actionPayload(action))}>
@@ -219,6 +222,8 @@ vi.mock("@/hooks/useSpecTickets", () => ({
   useSpecTicketCommand: () => ({ mutateAsync: vi.fn() }),
   writeTree: vi.fn(),
 }));
+
+const distillMutate = vi.fn();
 
 vi.mock("@/hooks/useSpecRead", () => ({
   useSpecRead: () => ({
@@ -270,6 +275,7 @@ vi.mock("@/hooks/useSpecRead", () => ({
   useUndoSpecSectionState: () => ({ mutate: undoStateMutate, isPending: false }),
   useSpecAlternatives: () => ({ data: view.alternatives, isPending: false, error: null }),
   useDecideSpecAlternative: () => ({ mutate: decideMutate, isPending: false, error: null }),
+  useDistillSpecNotes: () => ({ mutate: distillMutate, isPending: false }),
 }));
 
 beforeEach(() => {
@@ -282,13 +288,14 @@ beforeEach(() => {
   readRefetch.mockReset();
   setStateMutate.mockClear();
   undoStateMutate.mockClear();
+  distillMutate.mockClear();
 });
 
 describe("SpecReadPage", () => {
   it("joins a draft through the existing lazy canvas without collaborator chat", async () => {
     renderWithProviders(<SpecReadPage specId="spec-1" />);
 
-    expect((await screen.findByLabelText("Collaborative spec canvas")).textContent).toBe(
+    expect((await screen.findByLabelText("Collaborative spec canvas")).textContent).toContain(
       "spec-1:17",
     );
     expect(screen.getByText("Live draft")).toBeTruthy();
@@ -367,6 +374,15 @@ describe("SpecReadPage", () => {
       optionKey: "B",
       reason: "One code path.",
     });
+  });
+
+  it("closes the talk-it-through stage from the canvas", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    await user.click(await screen.findByRole("button", { name: "Draft the spec" }));
+
+    expect(distillMutate).toHaveBeenCalledTimes(1);
   });
 
   it("shows the locked template with the reason it cannot change", async () => {

@@ -248,3 +248,28 @@ export function useUndoSpecSectionState(specId: string) {
     onSettled: () => queryClient.invalidateQueries({ queryKey: ["spec", specId] }),
   });
 }
+
+export interface SpecNotesDistillResponse {
+  applied: boolean;
+  writtenSectionIds: string[];
+  refutedBullets: number;
+  untaggedBullets: number;
+}
+
+export async function distillSpecNotes(specId: string): Promise<SpecNotesDistillResponse> {
+  return specRequest(`/specs/${encodeURIComponent(specId)}/notes/distill`, { method: "POST" });
+}
+
+/**
+ * Close the talk-it-through stage (R22).
+ *
+ * The notes and the sections both arrive over the sync socket, so this refreshes
+ * only the rail, whose section states come from Postgres.
+ */
+export function useDistillSpecNotes(specId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => distillSpecNotes(specId),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["spec", specId] }),
+  });
+}
