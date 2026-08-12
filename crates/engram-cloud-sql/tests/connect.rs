@@ -22,6 +22,11 @@ use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{RootCertStore, ServerConfig};
 
 const INSTANCE: &str = "proj-1:us-west2:db-1";
+/// The CN Cloud SQL stamps into LEGACY server certificates: `project:instance`,
+/// TWO fields, no region (reference: cloudsqlconn `verifyCn`). Hard-coded on
+/// purpose — the fixture must mirror Google's real format, never the
+/// verifier's expectation, so a divergence fails the test.
+const LEGACY_CN: &str = "proj-1:db-1";
 const LOGIN_TOKEN: &str = "login-token-value";
 const ADMIN_TOKEN: &str = "admin-token-value";
 
@@ -202,7 +207,7 @@ async fn assert_echo(endpoint: &engram_cloud_sql::CloudSqlEndpoint) {
 #[tokio::test]
 async fn legacy_cn_regime_connects_end_to_end() {
     let fixture = Arc::new(Fixture::new());
-    let (cert, key) = fixture.server_cert(Some(INSTANCE), None);
+    let (cert, key) = fixture.server_cert(Some(LEGACY_CN), None);
     let instance = fake_instance(&fixture, cert, key).await;
     let api = mock_sqladmin(fixture, instance, None, None).await;
 
@@ -211,10 +216,29 @@ async fn legacy_cn_regime_connects_end_to_end() {
     assert!(endpoint.cert_not_after() > chrono::Utc::now() - chrono::Duration::days(1));
 }
 
+/// Review finding on this change: the verifier once expected the THREE-field
+/// `project:region:instance` form, which no real legacy certificate carries.
+/// A certificate with that CN must fail, so the code can never regress to
+/// comparing against the connection-name rendering again.
+#[tokio::test]
+async fn legacy_cn_regime_rejects_the_three_field_connection_name() {
+    let fixture = Arc::new(Fixture::new());
+    let (cert, key) = fixture.server_cert(Some(INSTANCE), None);
+    let instance = fake_instance(&fixture, cert, key).await;
+    let api = mock_sqladmin(fixture, instance, None, None).await;
+
+    let endpoint = built_endpoint(&api, instance.port()).await.unwrap();
+    let error = endpoint
+        .connect()
+        .await
+        .expect_err("a project:region:instance CN must fail");
+    assert!(error.to_string().contains("not the instance"), "{error}");
+}
+
 #[tokio::test]
 async fn legacy_cn_regime_rejects_a_wrong_instance_name() {
     let fixture = Arc::new(Fixture::new());
-    let (cert, key) = fixture.server_cert(Some("proj-1:us-west2:other-db"), None);
+    let (cert, key) = fixture.server_cert(Some("proj-1:other-db"), None);
     let instance = fake_instance(&fixture, cert, key).await;
     let api = mock_sqladmin(fixture, instance, None, None).await;
 

@@ -247,7 +247,11 @@ fn server_verify(
     instance: &InstanceName,
 ) -> Result<tls::ServerVerify, Error> {
     match settings.server_ca_mode.as_deref() {
-        // CAS regimes name the instance via a DNS SAN.
+        // CAS regimes name the instance via a DNS SAN. Deliberate deviation
+        // from the reference connector: no CN fallback when the SAN check
+        // fails (the Go connector tolerates certificates whose SANs lag the
+        // metadata DNS name); a CAS instance in that transient state fails
+        // the build and the pool retries.
         Some(mode) if mode.contains("CAS") => {
             let dns_name = settings
                 .dns_name
@@ -256,8 +260,10 @@ fn server_verify(
             Ok(tls::ServerVerify::StandardDns { dns_name })
         }
         // The legacy per-instance CA (or an old API that omits the mode).
+        // The certificate CN is `project:instance` — TWO fields, no region
+        // (reference: cloudsqlconn `verifyCn` builds `Project():Name()`).
         _ => Ok(tls::ServerVerify::LegacyCn {
-            expected_cn: instance.to_string(),
+            expected_cn: format!("{}:{}", instance.project, instance.name),
         }),
     }
 }
