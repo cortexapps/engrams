@@ -51,7 +51,63 @@ function recorder(
   const mutations: Array<{ name: string; input: object }> = [];
   const refreshes: object[] = [];
   const presence: Array<{ action: "enter" | "leave"; input: object }> = [];
+  const gapChecks: object[] = [];
   const deps: SpecToolDeps = {
+    gapCheck: {
+      run: async (input) => {
+        gapChecks.push(input);
+        return {
+          id: "019fe2ff-0464-75f3-bb20-a8c1844579ba",
+          semanticDocSeq: 8n,
+          stoppedAtLayerKey: "contract",
+          suppressedCount: 2,
+          matrix: {
+            layers: [{ key: "contract", title: "Contract" }],
+            rows: [
+              {
+                requirementId: "R1",
+                label: "an org caps its sandboxes",
+                verdict: "covered",
+                cells: [{ layerKey: "contract", covered: true, citations: [], note: null }],
+              },
+              {
+                requirementId: "N1",
+                label: "the limiter stays fast",
+                verdict: "gap",
+                cells: [
+                  {
+                    layerKey: "contract",
+                    covered: false,
+                    citations: [],
+                    note: "no Contract content cites N1",
+                  },
+                ],
+              },
+              {
+                requirementId: null,
+                label: "an auto-upgrade prompt",
+                verdict: "scope",
+                cells: [{ layerKey: "contract", covered: false, citations: [], note: "uncited" }],
+              },
+            ],
+          },
+          findings: [
+            {
+              id: "red_team:sec-behavior:0",
+              kind: "red_team",
+              severity: "fatal",
+              layerKey: "contract",
+              sectionId: "sec-behavior",
+              sectionTitle: "Behavior",
+              requirementId: null,
+              summary: "the reset promise contradicts the cache TTL",
+              detail: "Resolve the contradiction before polishing the layers below it.",
+              proposedDiff: null,
+            },
+          ],
+        };
+      },
+    },
     resolveSpecForSession: async () => ({ id: SPEC_ID }),
     documents: documentService(async (name, input) => {
       mutations.push({ name, input });
@@ -71,7 +127,7 @@ function recorder(
       },
     },
   };
-  return { deps, mutations, refreshes, presence };
+  return { deps, mutations, refreshes, presence, gapChecks };
 }
 
 async function call(deps: SpecToolDeps, toolName: string, input: object): Promise<unknown> {
@@ -98,6 +154,7 @@ describe("spec tools", () => {
       "spec_update_block",
       "spec_update_notes",
       "spec_propose_tickets",
+      "spec_gap_check",
     ]);
     for (const tool of registry.all()) {
       expect(tool).toMatchObject({ handling: "handled", execution: "sync" });
@@ -397,5 +454,66 @@ describe("spec tools", () => {
       (entry) => entry.name === "spec_set_section_state",
     );
     expect(JSON.stringify(manifest?.inputSchema)).not.toContain('"anyOf"');
+  });
+
+  test("spec_gap_check reports the stop layer and summarises the matrix", async () => {
+    const state = recorder();
+
+    const result = await call(state.deps, "spec_gap_check", {
+      red_team: [
+        {
+          layer_key: "contract",
+          section_id: "sec-behavior",
+          severity: "fatal",
+          summary: "the reset promise contradicts the cache TTL",
+          detail: "Resolve the contradiction before polishing the layers below it.",
+        },
+      ],
+      proposed_diffs: [{ finding_id: "requirement_gap:N1:system", after: "## Design\n\nTimed.\n" }],
+    });
+
+    expect(result).toEqual({
+      run_id: "019fe2ff-0464-75f3-bb20-a8c1844579ba",
+      rev: "8",
+      stopped_at_layer: "contract",
+      suppressed_count: 2,
+      covered_requirements: 1,
+      gap_requirements: 1,
+      uncited_content: 1,
+      findings: [
+        {
+          id: "red_team:sec-behavior:0",
+          kind: "red_team",
+          severity: "fatal",
+          layer_key: "contract",
+          section_id: "sec-behavior",
+          requirement_id: null,
+          summary: "the reset promise contradicts the cache TTL",
+          detail: "Resolve the contradiction before polishing the layers below it.",
+          has_proposed_diff: false,
+        },
+      ],
+    });
+    expect(state.gapChecks).toEqual([
+      {
+        specId: SPEC_ID,
+        sessionId: "019fe2ff-0464-75f3-bb20-a8c1844579b8",
+        requestFingerprint: `agent-gap-check:${SPEC_ID}:019fe2ff-0464-75f3-bb20-a8c1844579b8:call-spec_gap_check`,
+        actorUserId: "user-1",
+        redTeam: [
+          {
+            layerKey: "contract",
+            sectionId: "sec-behavior",
+            severity: "fatal",
+            summary: "the reset promise contradicts the cache TTL",
+            detail: "Resolve the contradiction before polishing the layers below it.",
+          },
+        ],
+        proposedDiffs: [{ findingId: "requirement_gap:N1:system", after: "## Design\n\nTimed.\n" }],
+      },
+    ]);
+    // The pass reports; it never mutates the document (R28).
+    expect(state.mutations).toEqual([]);
+    expect(state.refreshes).toEqual([]);
   });
 });

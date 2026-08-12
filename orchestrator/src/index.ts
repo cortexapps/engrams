@@ -101,6 +101,7 @@ import { tools } from "./tools/registry.ts";
 import { renderReviewer } from "./reviewers/render.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
+import { makeSpecGapCheckRoute } from "./routes/spec-gap-check.ts";
 import { makeSpecRailRoute, PostgresSpecRailStore } from "./routes/spec-rail.ts";
 import { makeSpecBlockIterationRoute } from "./routes/spec-block-iteration.ts";
 import { makeSpecTemplatesRoute } from "./routes/spec-templates.ts";
@@ -110,6 +111,7 @@ import { createTaskWithSession } from "./rpc/task-create.ts";
 import { makeUserSecretStore } from "./db/user-secrets.ts";
 import { productionSpecProjection } from "./specs/projection.ts";
 import { PostgresSpecCheckpointStore, SpecCheckpointService } from "./specs/checkpoints.ts";
+import { GapCheckService, PostgresGapCheckStore } from "./specs/gap-check.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
@@ -136,6 +138,14 @@ const specToolService = new SpecToolService({
   }),
   questionStore: specOpenQuestions,
   metadata: new PostgresSpecToolMetadataStore(getPool(), specNow),
+  now: specNow,
+});
+const specRailStore = new PostgresSpecRailStore(getPool());
+const specGapCheck = new GapCheckService({
+  documents: specDocuments,
+  railStore: specRailStore,
+  store: new PostgresGapCheckStore(getPool()),
+  toolDocuments: specToolService,
   now: specNow,
 });
 const specParticipants = new PostgresSpecParticipantStore(getDb());
@@ -243,9 +253,16 @@ app.route(
 app.route(
   "/",
   makeSpecRailRoute({
-    store: new PostgresSpecRailStore(getPool()),
+    store: specRailStore,
     documents: specDocuments,
     sectionStates: specSectionStates,
+    resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecGapCheckRoute({
+    gapCheck: specGapCheck,
     resolveMembership: resolveSpecMembership,
   }),
 );
@@ -441,6 +458,7 @@ registerSpecTools(tools, {
   documents: specToolService,
   projection: productionSpecProjection,
   presence: specPresence,
+  gapCheck: specGapCheck,
 });
 const integrationConnections = makeIntegrationConnectionStore(getDb());
 const configuredConnectors = await loadRegistry(makeConnectorStore(getDb()));

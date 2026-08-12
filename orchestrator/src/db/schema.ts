@@ -16,7 +16,13 @@
  */
 
 import { relations, sql } from "drizzle-orm";
-import type { SpecTranscriptChip } from "@engrams/spec-document";
+import type {
+  GapFindingKind,
+  GapFindingSeverity,
+  GapProposedDiff,
+  SpecTranscriptChip,
+  TraceabilityMatrix,
+} from "@engrams/spec-document";
 import {
   pgTable,
   text,
@@ -461,6 +467,69 @@ export const specProjection = pgTable(
     index("spec_projection_session_state_idx").on(t.sessionId, t.state, t.rev),
   ],
 );
+
+/**
+ * One gap-check pass over a spec (ADR 0114 D6, R33).
+ *
+ * `semanticDocSeq` is the revision the pass covered. A run is stale, and the
+ * publish gate must ask for a fresh one, when the spec has moved past it.
+ */
+export const specGapCheckRun = pgTable(
+  "spec_gap_check_run",
+  {
+    id: uuid("id").primaryKey(),
+    specId: uuid("spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    sessionId: uuid("session_id"),
+    requestFingerprint: text("request_fingerprint").notNull(),
+    semanticDocSeq: bigint("semantic_doc_seq", { mode: "bigint" }).notNull(),
+    /** Set when a fatal finding stopped the pass outside-in (R32). */
+    stoppedAtLayerKey: text("stopped_at_layer_key"),
+    suppressedCount: integer("suppressed_count").notNull().default(0),
+    matrix: jsonb("matrix").$type<TraceabilityMatrix>().notNull(),
+    startedBy: text("started_by").references(() => user.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("spec_gap_check_run_fingerprint_idx").on(t.specId, t.requestFingerprint),
+    index("spec_gap_check_run_spec_created_idx").on(t.specId, t.createdAt),
+  ],
+);
+
+/**
+ * One finding of a gap-check run, with the disposition a person gave it.
+ * A finding never edits the document by itself (R28): it becomes an open
+ * question at its anchor, or a proposed diff that somebody accepts.
+ */
+export const specGapCheckFinding = pgTable(
+  "spec_gap_check_finding",
+  {
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => specGapCheckRun.id, { onDelete: "cascade" }),
+    findingId: text("finding_id").notNull(),
+    /** Reported order, outermost layer first. */
+    ordinal: integer("ordinal").notNull(),
+    kind: text("kind").$type<GapFindingKind>().notNull(),
+    severity: text("severity").$type<GapFindingSeverity>().notNull(),
+    layerKey: text("layer_key").notNull(),
+    sectionId: text("section_id").notNull(),
+    sectionTitle: text("section_title").notNull(),
+    requirementId: text("requirement_id"),
+    summary: text("summary").notNull(),
+    detail: text("detail").notNull(),
+    proposedDiff: jsonb("proposed_diff").$type<GapProposedDiff>(),
+    disposition: text("disposition").$type<GapFindingDisposition>().notNull().default("pending"),
+    openQuestionId: uuid("open_question_id"),
+    disposedBy: text("disposed_by").references(() => user.id, { onDelete: "set null" }),
+    disposedAt: timestamp("disposed_at", { withTimezone: true }),
+  },
+  (t) => [primaryKey({ columns: [t.runId, t.findingId] })],
+);
+
+/** What a person did with a finding. `pending` means nobody has acted yet. */
+export type GapFindingDisposition = "pending" | "question_opened" | "diff_accepted" | "dismissed";
 
 // ---------------------------------------------------------------------------
 // Papercuts

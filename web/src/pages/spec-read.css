@@ -617,3 +617,9 @@
     flex-direction: column;
   }
 }
+
+.spec-read-header-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
