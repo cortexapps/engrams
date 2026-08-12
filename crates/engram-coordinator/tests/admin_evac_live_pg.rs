@@ -36,6 +36,15 @@ use async_trait::async_trait;
 use chrono::Utc;
 use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef as ChunkManifestRef};
 use engram_coordinator::evacuation::{evacuate_dead_source, EvacError};
+
+/// ADR 0116: the lazily-passed cold-boot materialization, pre-resolved
+/// for tests (production passes `materialize_cold_boot` un-awaited).
+fn ready_spec(
+    spec: Option<SandboxSpec>,
+) -> impl std::future::Future<Output = Result<Option<SandboxSpec>, engram_coordinator::error::ApiError>>
+{
+    std::future::ready(Ok(spec))
+}
 use engram_coordinator::host_registry::HostRegistry;
 use engram_core::traits::{HarnessDial, HostClient, MetadataStore};
 use engram_core::types::evacuation::EvacLoss;
@@ -421,7 +430,7 @@ async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
         &meta,
         session,
         Some(snapshot),
-        None,
+        ready_spec(None),
         None,
         None,
         engram_core::traits::SessionFence::unfenced(),
@@ -481,7 +490,7 @@ async fn evacuate_dead_source_disk_only_records_memory_loss() {
         &meta,
         session,
         None,
-        Some(test_cold_boot_spec()),
+        ready_spec(Some(test_cold_boot_spec())),
         None,
         None,
         engram_core::traits::SessionFence::unfenced(),
@@ -527,7 +536,7 @@ async fn evacuate_dead_source_no_state_returns_no_recoverable() {
         &meta,
         session,
         None,
-        None,
+        ready_spec(None),
         None,
         None,
         engram_core::traits::SessionFence::unfenced(),
