@@ -329,6 +329,15 @@ async fn roll_node(
     // which the planner just re-rolls (the cordon is idempotent).
     set_node_roll_cordon(client, node, true).await?;
     coord.cordon(host_id).await?;
+    // ADR 0116 A-D2: declare the handoff BEFORE anything can kill the
+    // pod, so the coordinator's binding-lease deadline covers the whole
+    // replacement (enable-work gate + pod delete + successor gate, plus
+    // margin). A failure here aborts the roll exactly like a cordon
+    // failure — the pod must never die without a durable deadline in PG.
+    // (An old coordinator without the RPC returns accepted=false and the
+    // roll proceeds under its legacy cordon shield.)
+    let handoff_ttl = spec.enable_work_timeout_seconds + spec.drain_timeout_seconds + 120;
+    coord.handoff(host_id, handoff_ttl).await?;
 
     // ADR 0088: the reattach roll is lossless for session VMs but NOT for
     // the host-agent's own enable work — an in-flight materialize stream or
@@ -351,9 +360,13 @@ async fn roll_node(
     pods.delete(pod, &DeleteParams::default()).await?;
     tracing::info!(%node, %pod, "pod deleted; waiting for the successor to come up Ready on target + reattach");
 
-    // Gate on the successor being Ready on the target image BEFORE uncordoning
-    // — keeping the host `draining` (dead-host-detector-exempt) through the
-    // swap so the reattaching sessions are never struck out.
+    // Gate on the successor being Ready on the target image BEFORE
+    // uncordoning. The shield against the dead-host detector striking the
+    // reattaching sessions mid-swap is the ADR 0116 handoff declared
+    // above (an explicit lease deadline sized to this gate's budget) —
+    // NOT `draining`, which the production heartbeat loop never reports
+    // (hardcoded false), and not the cordon's legacy 10x multiplier,
+    // which the 2026-08-12 roll outlived.
     let successor = gate_successor_ready(
         client,
         spec,

@@ -61,6 +61,31 @@ pub struct RegisterRequest {
     /// `host_meets_capabilities`).
     #[serde(default)]
     pub capabilities: engram_core::types::host::HostCapabilities,
+    /// ADR 0116 A-D2: the predecessor's durable handoff marker, adopted
+    /// (read + deleted) by this successor at startup. OBSERVABILITY
+    /// ONLY — register renews the lease regardless (A-D3); this
+    /// distinguishes a roll adoption from a fresh register and measures
+    /// real adoption latency, the input that sizes handoff TTLs.
+    /// `#[serde(default)]` for legacy host-agents.
+    #[serde(default)]
+    pub handoff_marker: Option<HandoffMarker>,
+}
+
+/// ADR 0116 A-D2: the durable note a shutting-down host-agent leaves
+/// beside its binding records for the successor generation. Mirrored in
+/// `engram-host-core::shutdown` (the writer); duplicated shape rather
+/// than a shared dep because the coordinator only OBSERVES it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HandoffMarker {
+    /// Predecessor's wall clock at declaration (unix ms). Same-node
+    /// clock, so adoption latency derived from it is honest to within
+    /// node clock error — fine for a histogram, never a decision input.
+    pub declared_at_unix_ms: i64,
+    /// The TTL the predecessor asked its belt POST for.
+    pub ttl_secs: u64,
+    /// Sandboxes resident at declaration (diagnostics only).
+    #[serde(default)]
+    pub resident_sandboxes: u32,
 }
 
 #[derive(Serialize)]
@@ -137,6 +162,27 @@ pub async fn register(
             coord_wire_version = engram_protocol::WIRE_VERSION,
             "wire_version mismatch on host register; host will be drained from \
              scheduling until it rolls to the coordinator's version (issue #229)",
+        );
+    }
+    // ADR 0116 A-D2: a successor adopting a declared handoff reports the
+    // predecessor's marker — observability only (the lease renews below
+    // regardless). Adoption latency is the number the handoff TTLs are
+    // sized against; `stale_only` shadow disagreements plus this
+    // histogram together decide when A3 can cut over.
+    if let Some(marker) = &req.handoff_marker {
+        let declared = chrono::DateTime::<Utc>::from_timestamp_millis(marker.declared_at_unix_ms);
+        let adoption_secs = declared
+            .map(|d| (state.services.clock.now_utc() - d).num_milliseconds() as f64 / 1000.0)
+            .filter(|s| *s >= 0.0);
+        if let Some(secs) = adoption_secs {
+            ::metrics::histogram!(crate::metrics::HOST_HANDOFF_ADOPTION_SECONDS).record(secs);
+        }
+        tracing::info!(
+            host_id = %req.host_id,
+            adoption_secs = ?adoption_secs,
+            marker_ttl_secs = marker.ttl_secs,
+            resident_sandboxes = marker.resident_sandboxes,
+            "host register adopts a declared handoff (roll succession)",
         );
     }
     let record = HostRecord {
@@ -430,6 +476,32 @@ pub struct HeartbeatResponse {
     /// deletes the matching durable capture-job records.
     #[serde(default)]
     pub acked_capture_jobs: Vec<engram_core::types::CaptureJobId>,
+}
+
+/// ADR 0116 A-D2: `POST /api/hosts/:id/handoff {ttl_secs}` — the host
+/// SIGTERM ladder's best-effort belt (the operator's authoritative
+/// declaration rides app-gRPC `FleetService::BeginHostHandoff`; both
+/// call the same core). Body carries a DURATION; the deadline is
+/// computed on the coordinator clock.
+pub async fn handoff(
+    State(state): State<SharedState>,
+    Path(host_id): Path<HostId>,
+    Json(req): Json<HandoffRequest>,
+) -> Result<Json<HandoffResponse>, ApiError> {
+    let accepted =
+        crate::api::admin::begin_host_handoff_core(&state, host_id, req.ttl_secs).await?;
+    Ok(Json(HandoffResponse { host_id, accepted }))
+}
+
+#[derive(Deserialize)]
+pub struct HandoffRequest {
+    pub ttl_secs: u64,
+}
+
+#[derive(Serialize)]
+pub struct HandoffResponse {
+    pub host_id: HostId,
+    pub accepted: bool,
 }
 
 pub async fn heartbeat(
@@ -1850,6 +1922,28 @@ mod tests {
     use crate::state::AppState;
     use crate::Services;
     use engram_core::traits::SandboxBackend;
+
+    /// ADR 0116 A-D2 wire pin: the coordinator's `HandoffMarker` mirror
+    /// must decode exactly what `engram_host_core::shutdown::HandoffMarker`
+    /// serializes — the shapes are deliberately duplicated (the coord only
+    /// OBSERVES the marker), so this JSON literal is the interop contract.
+    /// A field rename on either side fails here, not in a mixed fleet.
+    #[test]
+    fn handoff_marker_wire_shape_is_pinned() {
+        let from_host = r#"{
+            "declared_at_unix_ms": 1765432100000,
+            "ttl_secs": 600,
+            "resident_sandboxes": 4
+        }"#;
+        let m: HandoffMarker = serde_json::from_str(from_host).expect("decode host marker");
+        assert_eq!(m.declared_at_unix_ms, 1_765_432_100_000);
+        assert_eq!(m.ttl_secs, 600);
+        assert_eq!(m.resident_sandboxes, 4);
+        // Legacy host (no resident count field) decodes with the default.
+        let minimal = r#"{"declared_at_unix_ms": 1, "ttl_secs": 2}"#;
+        let m: HandoffMarker = serde_json::from_str(minimal).expect("decode minimal");
+        assert_eq!(m.resident_sandboxes, 0);
+    }
     use engram_core::types::session::SessionMode;
     use engram_core::types::Session;
     use engram_core::types::SessionState;

@@ -25,6 +25,10 @@ service FleetService {
   // semantics today; kept distinct.
   rpc AdminDrainHost(AdminDrainHostRequest) returns (AdminDrainHostResponse);
   rpc CordonHost(CordonHostRequest) returns (CordonHostResponse);
+  // ADR 0116 A-D2: planned-handoff declaration (see the request message).
+  // Additive: an older coordinator answers Unimplemented and the caller
+  // proceeds under the legacy cordon shield.
+  rpc BeginHostHandoff(BeginHostHandoffRequest) returns (BeginHostHandoffResponse);
   rpc UncordonHost(UncordonHostRequest) returns (UncordonHostResponse);
   // ADR 0048 deregister — was DELETE /api/admin/hosts/:id (dropped in the
   // ADR 0051 gRPC-only migration but never re-added here, stranding the
@@ -199,6 +203,25 @@ message DrainFailure {
 
 message CordonHostRequest {
   string host_id = 1;
+}
+
+// ADR 0116 A-D2: declare a planned handoff — extend the host's
+// binding-lease deadline so the dead-host path cannot orphan its
+// sessions while a roll's successor pod comes up. Written by the
+// operator right after CordonHost, before the pod delete.
+message BeginHostHandoffRequest {
+  string host_id = 1;
+  // Handoff window as a DURATION; the coordinator computes the
+  // deadline on its own clock (single-clock discipline, ADR 0098 D3).
+  uint64 ttl_secs = 2;
+}
+
+message BeginHostHandoffResponse {
+  string host_id = 1;
+  // False when the host row is unknown or dead (a handoff on a dead
+  // host is meaningless — the row returns via register, which
+  // re-leases).
+  bool accepted = 2;
 }
 
 message CordonHostResponse {

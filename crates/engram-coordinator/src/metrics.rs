@@ -474,6 +474,15 @@ pub const HEARTBEAT_PERSIST_FAILURES_TOTAL: &str = "engram_heartbeat_persist_fai
 pub const DEAD_HOST_LEASE_SHADOW_DISAGREE_TOTAL: &str =
     "engram_dead_host_lease_shadow_disagree_total";
 
+/// Histogram (ADR 0116 A2). Wall time from a predecessor host-agent's
+/// handoff declaration (its durable marker's timestamp) to the
+/// successor's register that adopts it — the REAL roll-succession
+/// latency (the incident's was 5.5 min). The number handoff TTLs are
+/// sized against, and — together with the shadow-disagree counter —
+/// the go/no-go input for the A3 cutover. Same-node clocks, so skew is
+/// node clock error; observability only, never a decision input.
+pub const HOST_HANDOFF_ADOPTION_SECONDS: &str = "engram_host_handoff_adoption_seconds";
+
 /// Histogram (ADR 0036 amendment, issue #538). Wall time of the enable
 /// scanner's `prestaging` stage — the fleet chunk-prestage wait between
 /// base-snapshot capture and the `enabled_images` upsert. Labels:
