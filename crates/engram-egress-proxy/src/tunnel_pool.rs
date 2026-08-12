@@ -196,9 +196,16 @@ impl<F: EndpointFactory> TunnelPool<F> {
             *entry = None;
         }
 
+        // The failure backoff suppresses spawn retries only while the old
+        // generation is still hard-valid. Past hard expiry the generation
+        // must not serve a new connection, so the spawn retries on every
+        // connect until one succeeds or the error surfaces as the 502.
         let needs_fresh = match entry.as_ref() {
             None => true,
-            Some(e) => e.wants_rotation(now, &self.config) && !e.in_failure_backoff(now),
+            Some(e) => {
+                e.wants_rotation(now, &self.config)
+                    && (!e.in_failure_backoff(now) || !e.hard_valid(now))
+            }
         };
         if needs_fresh {
             match self.factory.spawn_endpoint(session_id, tunnel).await {
@@ -636,6 +643,44 @@ mod tests {
             panic!("a hard-expired generation with a failed spawn must not serve");
         };
         assert_eq!(error.to_string(), "mint refused");
+    }
+
+    /// The review finding on this change: a backoff armed while the
+    /// generation was hard-valid must not let that generation serve past
+    /// its hard expiry once the expiry passes during the backoff window.
+    #[tokio::test]
+    async fn hard_expiry_overrides_the_failure_backoff() {
+        let state = Arc::new(SpawnState::default());
+        // Hard-valid for a moment, and already inside the rotate buffer.
+        *state.stale_after.lock() = Some(wall_now() + Duration::milliseconds(150));
+        let pool = pool_with(state.clone(), no_floor());
+        let session = SessionId::new();
+        let t = tunnel("db", "{}");
+
+        let _first = pool.open(session, &t).await.unwrap();
+        // A failed rotation while hard-valid arms the 45s backoff, which
+        // outlives the 150ms hard expiry.
+        state.fail_next.store(true, Ordering::SeqCst);
+        let mut stale_served = pool.open(session, &t).await.unwrap();
+        roundtrip(&mut stale_served).await;
+        assert_eq!(state.count.load(Ordering::SeqCst), 1);
+
+        // Cross the hard expiry while the backoff is still armed.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        // The expired generation must not serve. The spawn retries despite
+        // the backoff; its failure surfaces instead of a connection.
+        state.fail_next.store(true, Ordering::SeqCst);
+        let Err(error) = pool.open(session, &t).await.map(|_| ()) else {
+            panic!("a hard-expired generation must not serve inside the backoff");
+        };
+        assert_eq!(error.to_string(), "mint refused");
+
+        // A recovered spawn serves again.
+        *state.stale_after.lock() = None;
+        let mut fresh = pool.open(session, &t).await.unwrap();
+        roundtrip(&mut fresh).await;
+        assert_eq!(state.count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
