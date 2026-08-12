@@ -115,6 +115,8 @@ import {
   PostgresSpecAlternativesStore,
   SpecAlternativesService,
 } from "./specs/alternatives.ts";
+import { makeSpecNotesRoute } from "./routes/spec-notes.ts";
+import { SpecWorkingNotesService } from "./specs/notes.ts";
 import { makeSpecBlockIterationRoute } from "./routes/spec-block-iteration.ts";
 import { makeSpecTemplatesRoute } from "./routes/spec-templates.ts";
 import { makeSpecTemplateCatalog } from "./specs/template-catalog.ts";
@@ -179,10 +181,15 @@ const specTicketSync = new SpecTicketSyncService({
   log: log.child({ component: "spec-ticket-sync" }),
   start: startSpecTicketSyncWorkflow,
 });
+const specWorkingNotes = new SpecWorkingNotesService({
+  documents: specDocuments,
+  now: specNow,
+});
 const specToolService = new SpecToolService({
   documents: specDocuments,
   sectionStates: specSectionStates,
   alternatives: specAlternatives,
+  notes: specWorkingNotes,
   questions: new OpenQuestionService({
     store: specOpenQuestions,
     document: new SpecQuestionDocument(specDocuments, "spec-agent-question"),
@@ -344,6 +351,13 @@ app.route(
   "/",
   makeSpecGapCheckRoute({
     gapCheck: specGapCheck,
+    resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecNotesRoute({
+    notes: specWorkingNotes,
     resolveMembership: resolveSpecMembership,
   }),
 );

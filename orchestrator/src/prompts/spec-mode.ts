@@ -87,7 +87,7 @@ const SPEC_STAGES: readonly SpecStage[] = [
     on: "This spec uses the talk-it-through stage. Start it when the person wants to think out loud.",
     suggested:
       "This spec offers the talk-it-through stage. Offer it when the person wants to think out loud, and start it only when they accept.",
-    body: "In this stage the person speaks freely, and you keep the working notes with spec_update_notes. Write one item for each idea. Mark each item as agreed, as contradicted, or as open, and give the section where it belongs. Check each repository claim while you listen, and give the provenance for the result. Move the notes into the spec when the person asks for it, or when few items are still open.",
+    body: "In this stage the person speaks freely, and you keep the working notes with spec_update_notes. Write no spec section while the notes are open. Send your complete model each time, with one bullet for each idea, and keep every bullet id stable. Mark each bullet as verified, as contradicted, or as unchecked, and name the receipt for a verified or a contradicted bullet. Keep a contradicted claim beside its receipt. Cluster the bullets by theme, and tag each cluster toward the section where it belongs. Check each repository claim while you listen. A person can rewrite any bullet, and their words win: read the corrections in the reply and correct your model. Call spec_distill_notes when the person asks for the spec, or when the untagged pile stops growing. Distillation writes only the tagged clusters, and a section with no material stays empty.",
   },
   {
     key: "gapCheck",

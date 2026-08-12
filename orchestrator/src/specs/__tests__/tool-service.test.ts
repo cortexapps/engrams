@@ -36,12 +36,18 @@ import { OpenQuestionService } from "../open-questions.ts";
 import { SpecQuestionDocument } from "../question-document.ts";
 import { SectionStateService } from "../section-state-service.ts";
 import type { SectionStateValue } from "../section-state.ts";
+import { SpecWorkingNotesService } from "../notes.ts";
 import type {
   ProposeTicketsInput,
   ProposeTicketsResult,
   SpecTicketTreeService,
 } from "../ticket-tree.ts";
-import { SpecToolService, stableQuestionId, type SpecToolMetadataStore } from "../tool-service.ts";
+import {
+  SpecNotesStageError,
+  SpecToolService,
+  stableQuestionId,
+  type SpecToolMetadataStore,
+} from "../tool-service.ts";
 
 const SPEC_ID = "00000000-0000-4000-8000-000000000135";
 const SESSION_ID = "00000000-0000-4000-8000-000000000136";
@@ -75,6 +81,8 @@ const TEMPLATE_SECTIONS: SpecTemplateSection[] = [
 ];
 
 class MemoryMetadata implements SpecToolMetadataStore {
+  stageFlags: SpecTemplateStageFlags = { ...DEFAULT_SPEC_TEMPLATE_STAGE_FLAGS };
+
   constructor(
     private readonly stateStore: MemorySectionStore,
     private readonly editors: Array<{ userId: string; name: string }> = [
@@ -89,7 +97,7 @@ class MemoryMetadata implements SpecToolMetadataStore {
   }
 
   async templateStageFlags(): Promise<SpecTemplateStageFlags> {
-    return DEFAULT_SPEC_TEMPLATE_STAGE_FLAGS;
+    return this.stageFlags;
   }
 
   async sectionStates(): Promise<ReadonlyMap<string, SectionStateValue>> {
@@ -142,6 +150,11 @@ async function setup(
   const sectionStore = new MemorySectionStore();
   const questionStore = new MemoryQuestionStore();
   const tickets = new RecordedTicketProposals();
+  const metadata = new MemoryMetadata(sectionStore);
+  const notes = new SpecWorkingNotesService({
+    documents,
+    now: () => new Date("2026-08-09T12:00:00.000Z"),
+  });
   const service = new SpecToolService({
     documents,
     sectionStates: new SectionStateService({
@@ -159,11 +172,21 @@ async function setup(
       documents,
       now: () => new Date("2026-08-09T12:00:00.000Z"),
     }),
-    metadata: new MemoryMetadata(sectionStore),
+    notes,
+    metadata,
     tickets,
     now: () => new Date("2026-08-09T12:00:00.000Z"),
   });
-  return { service, documents, documentStore, sectionStore, questionStore, tickets };
+  return {
+    service,
+    documents,
+    documentStore,
+    sectionStore,
+    questionStore,
+    metadata,
+    notes,
+    tickets,
+  };
 }
 
 async function selectedTextSpan(
@@ -905,13 +928,6 @@ describe("production spec tool service", () => {
     expect(documentStore.lastCheckpoint).toBeNull();
   });
 
-  test("reports the later-epic notes store as unavailable", async () => {
-    const { service } = await setup();
-    await expect(
-      service.updateNotes(SPEC_ID, { ...context("notes"), markdown: "notes" }),
-    ).rejects.toThrow("#1120");
-  });
-
   test("a ticket proposal reaches the tree with its idempotency key", async () => {
     const { service, tickets } = await setup();
     const proposal = {
@@ -966,5 +982,108 @@ describe("production spec tool service", () => {
       "context",
     );
     expect(marker?.node.attrs.resolved).toBe(false);
+  });
+});
+
+describe("the talk-it-through stage keeps the pen down", () => {
+  const NOTES = {
+    clusters: [
+      {
+        id: "burst",
+        theme: "burst semantics",
+        sectionIds: ["context"],
+        bullets: [
+          {
+            id: "b1",
+            mark: "verified" as const,
+            kind: "observation" as const,
+            text: "in-flight sessions are sacred",
+            provenance: "agreed with the author",
+          },
+        ],
+      },
+    ],
+  };
+
+  test("the agent writes no section while the notes are open", async () => {
+    const { service } = await setup();
+    await service.updateNotes(SPEC_ID, { ...context("notes-open"), notes: NOTES });
+
+    await expect(
+      service.updateSection(SPEC_ID, {
+        ...context("pen-down"),
+        sectionId: "context",
+        markdown: "Drafted too early.",
+      }),
+    ).rejects.toThrow(SpecNotesStageError);
+  });
+
+  test("distillation writes the tagged material and reopens the sections", async () => {
+    const { service, documents } = await setup();
+    await service.updateNotes(SPEC_ID, { ...context("notes-live"), notes: NOTES });
+
+    const distilled = await service.distillNotes(SPEC_ID, context("distil"));
+    const result = await service.updateSection(SPEC_ID, {
+      ...context("after-distil"),
+      sectionId: "context",
+      markdown: "The author's draft.",
+    });
+
+    expect(distilled.applied).toBe(true);
+    expect(distilled.distillation.sections.map((section) => section.sectionId)).toEqual(["context"]);
+    expect(result.applied).toBe(true);
+    const loaded = await documents.syncFromLog(SPEC_ID);
+    expect(renderMarkdown(proseMirrorDocument(loaded.doc))).toContain("The author's draft.");
+  });
+
+  test("a section written before the stage opened is untouched", async () => {
+    const { service, documents } = await setup();
+    await service.updateSection(SPEC_ID, {
+      ...context("recon"),
+      sectionId: "context",
+      markdown: "Recon found the limiter.",
+    });
+
+    await service.updateNotes(SPEC_ID, { ...context("notes-after-recon"), notes: NOTES });
+
+    const loaded = await documents.syncFromLog(SPEC_ID);
+    expect(renderMarkdown(proseMirrorDocument(loaded.doc))).toContain("Recon found the limiter.");
+  });
+
+  test("a template that does not run the stage has no notes pane", async () => {
+    const { service, metadata } = await setup();
+    metadata.stageFlags = { ...DEFAULT_SPEC_TEMPLATE_STAGE_FLAGS, talkItThrough: "off" };
+
+    await expect(
+      service.updateNotes(SPEC_ID, { ...context("notes-off"), notes: NOTES }),
+    ).rejects.toThrow("does not run the talk-it-through stage");
+  });
+
+  test("the notes report the untagged pile and the corrections", async () => {
+    const { service } = await setup();
+    const result = await service.updateNotes(SPEC_ID, {
+      ...context("notes-gauge"),
+      notes: {
+        clusters: [
+          ...NOTES.clusters,
+          {
+            id: "pile",
+            theme: "untagged",
+            bullets: [
+              {
+                id: "b2",
+                mark: "unchecked" as const,
+                kind: "question" as const,
+                text: "how fine is the billing granularity?",
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(result.stage.untaggedBullets).toBe(1);
+    expect(result.corrections).toEqual([]);
+    expect(result.stage.archivedAt).toBeNull();
   });
 });
