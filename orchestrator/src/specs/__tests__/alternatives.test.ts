@@ -322,6 +322,40 @@ describe("SpecAlternativesService", () => {
     expect(store.rows.size).toBe(0);
   });
 
+  test("refuses to write a pick for a set bound to another section", async () => {
+    const { alternatives, documents, store } = await setup();
+    // Reach past propose() to stand in for a row stored before the bind rule.
+    await store.insertAction({
+      id: "alternatives-set:stray",
+      specId: SPEC_ID,
+      sectionId: "design",
+      requestFingerprint: "stray",
+      chip: {
+        kind: "spec_alternatives_proposed",
+        specId: SPEC_ID,
+        sectionId: "design",
+        setId: "stray",
+        options: OPTIONS,
+        comparison: COMPARISON,
+        leanKey: null,
+      },
+      createdAt: NOW(),
+    });
+    const before = await sectionMarkdown(documents, "design");
+
+    await expect(
+      alternatives.decide({
+        specId: SPEC_ID,
+        setId: "stray",
+        optionKey: "B",
+        reason: "Wrong section.",
+        decidedBy: "agent",
+      }),
+    ).rejects.toThrow(/not the alternatives section/);
+    expect(await sectionMarkdown(documents, "design")).toBe(before);
+    expect(store.rows.size).toBe(1);
+  });
+
   test("refuses a pick reason beyond the stored bound", async () => {
     const { alternatives } = await setup();
     await propose(alternatives);

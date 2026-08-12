@@ -265,6 +265,10 @@ export class SpecAlternativesService {
       );
     }
     const current = await this.options.documents.syncFromLog(input.specId);
+    // Bind again at the write. propose() refuses a set bound elsewhere, but a
+    // row stored before that rule, or by any other writer, must never let the
+    // pick overwrite a section that is not the alternatives section.
+    requireAlternativesSection(proseMirrorDocument(current.doc), stage.proposal.sectionId);
     if (input.expectedRev !== undefined && input.expectedRev !== current.semanticDocSeq) {
       return {
         stage,
