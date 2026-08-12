@@ -1221,7 +1221,7 @@ impl PooledBackend {
         let (Some(sid), Some(egress)) = (session_id, self.egress.as_ref()) else {
             return;
         };
-        egress.registry.unregister(sid);
+        egress.unregister_session(sid);
         tracing::debug!(
             session_id = %sid,
             "capture egress: unregistered policy after capture teardown",
@@ -9188,7 +9188,7 @@ impl SandboxBackend for PooledBackend {
         self.unreachable_guests.remove(&id);
         if let Some(egress) = self.egress.as_ref() {
             if let Some(session_id) = removed_session {
-                egress.registry.unregister(session_id);
+                egress.unregister_session(session_id);
             }
         }
         let result = self.inner.destroy(id).await;
