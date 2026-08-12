@@ -1796,6 +1796,14 @@ fn sandbox_to_status(err: SandboxError) -> Status {
         // (so the kind survives the wire); same defensive fallback as
         // CaptureFailed for any future non-streaming caller.
         SandboxError::MaterializeFailed(failure) => Status::internal(failure.to_string()),
+        // ADR 0116 B-D4: the guest's io::ErrorKind rides a marker
+        // message on `failed_precondition`, exactly the wire-skew
+        // shape — the coord-side client parses it back to the typed
+        // variant; an older coordinator sees an ordinary status and
+        // behaves as before (no WIRE_VERSION bump).
+        SandboxError::HarnessSpawn { kind, message } => Status::failed_precondition(
+            engram_protocol::wire::harness_spawn_message(&kind, &message),
+        ),
     }
 }
 
@@ -1970,5 +1978,24 @@ mod wire_version_tests {
         req.metadata_mut()
             .insert(WIRE_VERSION_METADATA_KEY, "not-a-number".parse().unwrap());
         assert!(check_wire_version(&req).is_ok());
+    }
+
+    #[test]
+    fn harness_spawn_error_maps_to_failed_precondition_marker() {
+        // ADR 0116 B-D4: a spawn rejection must survive `sandbox_to_status`
+        // as a parseable marker (the wire-skew shape), never fold into
+        // `Status::internal` with the Snapshot/Io/Vm bucket.
+        let status = sandbox_to_status(SandboxError::HarnessSpawn {
+            kind: "NotFound".into(),
+            message: "spawn_harness: spawn \"/opt/engram/dyn/0/bin/h\": ENOENT".into(),
+        });
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            engram_protocol::wire::parse_harness_spawn_message(status.message()),
+            Some((
+                "NotFound".to_string(),
+                "spawn_harness: spawn \"/opt/engram/dyn/0/bin/h\": ENOENT".to_string()
+            )),
+        );
     }
 }

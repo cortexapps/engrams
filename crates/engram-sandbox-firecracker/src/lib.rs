@@ -6638,9 +6638,13 @@ impl SandboxBackend for FirecrackerBackend {
                 }
                 Ok(())
             }
-            engram_agentd::WireResponse::Error { kind, message } => Err(SandboxError::Vm(
-                format!("SpawnHarness rejected ({kind}): {message}").into(),
-            )),
+            // ADR 0116 B-D4: agentd sends the guest io::ErrorKind typed
+            // (`WireResponse::Error.kind`); keep it typed instead of
+            // flattening into `Vm`, so the coordinator's resume re-plan
+            // can tell "binary missing" from a transient failure.
+            engram_agentd::WireResponse::Error { kind, message } => {
+                Err(SandboxError::HarnessSpawn { kind, message })
+            }
             other => Err(SandboxError::Vm(
                 format!("SpawnHarness: unexpected response: {other:?}").into(),
             )),

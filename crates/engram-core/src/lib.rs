@@ -11,7 +11,10 @@ pub mod socket;
 pub mod traits;
 pub mod types;
 
-pub use error::{BackendError, BlobError, MetaError, SandboxError, SecretError};
+pub use error::{
+    harness_spawn_kind_is_deterministic, BackendError, BlobError, MetaError, SandboxError,
+    SecretError,
+};
 pub use traits::{
     BlobObjectMeta, BlobStorage, ByteStream, CloudBackend, DisableEnabledImageOutcome,
     MetadataStore, SandboxBackend, SecretStore,

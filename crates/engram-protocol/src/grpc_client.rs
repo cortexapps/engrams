@@ -1893,15 +1893,22 @@ fn grpc_to_sandbox_err(status: tonic::Status) -> SandboxError {
         // the RPC boundary (a `failed_precondition` carrying the skew
         // marker). Map it to the typed, RETRYABLE `WireSkew` variant so
         // the API surfaces a 503 — never the 400 a raw bincode decode
-        // error would have produced. A `failed_precondition` WITHOUT the
-        // marker (none is emitted host-side today, but be defensive)
-        // falls through to the generic mapping.
-        Code::FailedPrecondition => match crate::wire::parse_wire_skew_message(status.message()) {
-            Some((host, coord)) => SandboxError::WireSkew { host, coord },
-            None => {
+        // error would have produced. ADR 0116 B-D4: a `failed_precondition`
+        // carrying the harness-spawn marker maps to the typed
+        // `HarnessSpawn` the same way, preserving the guest's
+        // io::ErrorKind for the resume re-plan. A `failed_precondition`
+        // with NEITHER marker falls through to the generic mapping.
+        Code::FailedPrecondition => {
+            if let Some((host, coord)) = crate::wire::parse_wire_skew_message(status.message()) {
+                SandboxError::WireSkew { host, coord }
+            } else if let Some((kind, message)) =
+                crate::wire::parse_harness_spawn_message(status.message())
+            {
+                SandboxError::HarnessSpawn { kind, message }
+            } else {
                 SandboxError::Vm(format!("grpc {}: {}", status.code(), status.message()).into())
             }
-        },
+        }
         _ => SandboxError::Vm(format!("grpc {}: {}", status.code(), status.message()).into()),
     }
 }
@@ -1967,5 +1974,25 @@ mod grpc_err_tests {
             "some other precondition",
         ));
         assert!(matches!(err, SandboxError::Vm(_)));
+    }
+
+    #[test]
+    fn harness_spawn_failed_precondition_maps_to_typed_variant() {
+        // ADR 0116 B-D4: the host's spawn-rejection marker maps back to
+        // the typed `HarnessSpawn` with the guest's io::ErrorKind intact
+        // — the input B4's resume re-plan classifies on. An old host
+        // (pre-marker) still sends `internal`, covered by
+        // `real_vm_error_still_maps_to_vm` above.
+        let status = tonic::Status::failed_precondition(crate::wire::harness_spawn_message(
+            "NotFound",
+            "spawn_harness: spawn \"/opt/engram/dyn/0/bin/h\": ENOENT",
+        ));
+        match grpc_to_sandbox_err(status) {
+            SandboxError::HarnessSpawn { kind, message } => {
+                assert_eq!(kind, "NotFound");
+                assert!(message.contains("ENOENT"));
+            }
+            other => panic!("expected HarnessSpawn, got {other:?}"),
+        }
     }
 }
