@@ -253,6 +253,31 @@ impl app::fleet_service_server::FleetService for AppFleetService {
         }))
     }
 
+    async fn begin_host_handoff(
+        &self,
+        req: Request<app::BeginHostHandoffRequest>,
+    ) -> Result<Response<app::BeginHostHandoffResponse>, Status> {
+        self.auth.check(&req)?;
+        let host_id: engram_core::HostId = req
+            .get_ref()
+            .host_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("malformed host_id"))?;
+        // ADR 0116 A-D2: shared core computes the deadline on the
+        // coordinator clock and extends the lease (GREATEST).
+        let accepted = crate::api::admin::begin_host_handoff_core(
+            &self.state,
+            host_id,
+            req.get_ref().ttl_secs,
+        )
+        .await
+        .map_err(into_status)?;
+        Ok(Response::new(app::BeginHostHandoffResponse {
+            host_id: host_id.to_string(),
+            accepted,
+        }))
+    }
+
     async fn uncordon_host(
         &self,
         req: Request<app::UncordonHostRequest>,

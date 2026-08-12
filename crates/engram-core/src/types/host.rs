@@ -412,6 +412,21 @@ pub struct HostRecord {
     pub lease_epoch: u64,
 }
 
+/// ADR 0116 A-D2: hard ceiling on a declared handoff TTL, shared by the
+/// coordinator's clamp and the operator's own request sizing so the two
+/// can never disagree (#1218 review: a 1 h coordinator clamp silently
+/// truncated the operator's default ~102 min roll budget — the deadline
+/// could not cover exactly the long enable-work rolls it exists for).
+///
+/// The asymmetry that sizes it: a too-LONG shield on a genuinely dead
+/// host delays orphaning by at most this ceiling (bounded, recoverable —
+/// expiry still fires); a too-SHORT shield lets the dead-host path
+/// strike a mid-roll host and destroy healthy VMs (the 2026-08-12
+/// incident class). So the ceiling errs long: 24 h dominates any sane
+/// roll budget while still bounding how long a buggy declaration can
+/// wedge detection.
+pub const MAX_HANDOFF_TTL_SECS: u64 = 86_400;
+
 /// ADR 0116 A-D1: the host binding-lease lifecycle (migration 0115).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

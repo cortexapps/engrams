@@ -425,6 +425,52 @@ pub(crate) async fn cordon_host_core(
     })
 }
 
+/// ADR 0116 A-D2: transport-agnostic core for the planned-handoff
+/// declaration. Computes the deadline from the injected clock
+/// (`now + ttl`) and extends the host's binding lease via
+/// `begin_host_handoff` (GREATEST semantics — repeated/racing
+/// declarations keep the max). Called by the gRPC
+/// `FleetService::begin_host_handoff` (the operator, right after
+/// cordon) and the HTTP `POST /api/hosts/:id/handoff` (the host's
+/// SIGTERM-ladder belt). `accepted = false` (unknown/dead host) is a
+/// non-error: the caller proceeds — the roll continues under whatever
+/// shield remains, and enforcement (A3) treats an absent lease with the
+/// legacy fallback.
+pub(crate) async fn begin_host_handoff_core(
+    state: &SharedState,
+    host_id: engram_core::HostId,
+    ttl_secs: u64,
+) -> Result<bool, ApiError> {
+    // Clamp: a zero/absurd TTL is a caller bug, not a lease we want to
+    // honor. The ceiling is the SHARED `MAX_HANDOFF_TTL_SECS` (24 h) the
+    // operator also sizes against, so a legitimate roll budget is never
+    // silently truncated (#1218 review: a 1 h ceiling here undercut the
+    // operator's default ~102 min sizing). Clamping is LOUD — a
+    // truncated deadline written silently is exactly how a shield
+    // quietly stops covering the roll it exists for.
+    let requested = ttl_secs;
+    let ttl_secs = ttl_secs.clamp(1, engram_core::types::host::MAX_HANDOFF_TTL_SECS);
+    if ttl_secs != requested {
+        tracing::warn!(%host_id, requested, applied = ttl_secs,
+            "handoff TTL clamped — the declared deadline will NOT match the caller's sizing");
+    }
+    let until = state.services.clock.now_utc() + chrono::Duration::seconds(ttl_secs as i64);
+    let accepted = state
+        .services
+        .meta
+        .begin_host_handoff(host_id, until)
+        .await
+        .map_err(|e| ApiError::Internal(format!("begin_host_handoff: {e}")))?;
+    if accepted {
+        tracing::info!(%host_id, ttl_secs, %until,
+            "handoff declared: binding lease extended for a planned operation");
+    } else {
+        tracing::warn!(%host_id, ttl_secs,
+            "handoff declaration ignored: host row unknown or dead");
+    }
+    Ok(accepted)
+}
+
 /// `POST /api/admin/hosts/:id/uncordon` — inverse of cordon. The
 /// host returns to the picker's view immediately.
 /// Transport-agnostic core for the uncordon primitive (ADR 0051). Clears

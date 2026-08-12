@@ -187,6 +187,12 @@ export const POLICY: Record<string, PolicyEntry> = {
   "FleetService.DrainHost": { action: "manage", subject: "all" },
   "FleetService.AdminDrainHost": { action: "manage", subject: "all" },
   "FleetService.CordonHost": { action: "manage", subject: "all" },
+  // ADR 0116 A-D2: planned-handoff declaration. Admin-only like cordon —
+  // it extends the host's binding-lease deadline, the shield a planned
+  // operation gets from the dead-host path (the operator is the routine
+  // caller and dials the coordinator directly; this passthrough is the
+  // admin/manual-maintenance path).
+  "FleetService.BeginHostHandoff": { action: "manage", subject: "all" },
   "FleetService.UncordonHost": { action: "manage", subject: "all" },
   "FleetService.DeleteHost": { action: "manage", subject: "all" },
   "FleetService.GetStorageSummary": { action: "manage", subject: "all" },

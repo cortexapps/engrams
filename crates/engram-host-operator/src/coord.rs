@@ -130,6 +130,37 @@ impl CoordClient {
         Ok(())
     }
 
+    /// ADR 0116 A-D2: `FleetService.BeginHostHandoff` — declare the
+    /// planned roll so the coordinator's binding-lease deadline covers
+    /// the whole pod replacement. UNIMPLEMENTED-tolerant: an older
+    /// coordinator predates the RPC; the roll proceeds under its legacy
+    /// cordon shield (warn, `Ok(false)`). Any other failure is an error
+    /// the caller treats exactly like a cordon failure — a roll must
+    /// never delete the pod without a durable deadline in PG once the
+    /// coordinator supports one.
+    pub async fn handoff(&self, host: HostId, ttl_secs: u64) -> Result<bool, OperatorError> {
+        match self
+            .fleet
+            .clone()
+            .begin_host_handoff(app::BeginHostHandoffRequest {
+                host_id: host.to_string(),
+                ttl_secs,
+            })
+            .await
+        {
+            Ok(resp) => Ok(resp.into_inner().accepted),
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                tracing::warn!(%host,
+                    "coordinator predates BeginHostHandoff; rolling under the legacy cordon shield");
+                Ok(false)
+            }
+            Err(status) => Err(OperatorError::Rpc {
+                op: "handoff",
+                status: Box::new(status),
+            }),
+        }
+    }
+
     /// `FleetService.UncordonHost`.
     pub async fn uncordon(&self, host: HostId) -> Result<(), OperatorError> {
         self.fleet

@@ -66,6 +66,9 @@ pub fn router(state: SharedState) -> Router {
         .route("/admin/sessions/:id/resume", post(admin::resume_session))
         .route("/hosts/register", post(host_http::register))
         .route("/hosts/:id/heartbeat", post(host_http::heartbeat))
+        // ADR 0116 A-D2: the host's SIGTERM-ladder handoff belt (the
+        // operator's authoritative declaration rides app-gRPC instead).
+        .route("/hosts/:id/handoff", post(host_http::handoff))
         .route("/hosts/forge", post(forge::forge_forward))
         .route("/hosts/upload", post(upload::upload_forward))
         .route(

@@ -131,6 +131,31 @@ impl HttpCoordClient {
         decode_json(resp, "register").await
     }
 
+    /// ADR 0116 A-D2: `POST /api/v1/hosts/:id/handoff` — the SIGTERM
+    /// ladder's belt declaration. Best-effort by contract: the caller
+    /// bounds it with a short timeout and never blocks the ladder on it
+    /// (the durable marker + the operator's authoritative gRPC
+    /// declaration carry the cases where this POST loses the race).
+    pub async fn handoff(&self, host_id: HostId, ttl_secs: u64) -> Result<bool, CoordError> {
+        #[derive(serde::Serialize)]
+        struct HandoffRequest {
+            ttl_secs: u64,
+        }
+        #[derive(serde::Deserialize)]
+        struct HandoffResponse {
+            accepted: bool,
+        }
+        let url = self.endpoint(&format!("/hosts/{host_id}/handoff"));
+        let builder = self.http.post(&url);
+        let resp = self
+            .auth(builder, &HandoffRequest { ttl_secs })
+            .send()
+            .await
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
+        let decoded: HandoffResponse = decode_json(resp, "handoff").await?;
+        Ok(decoded.accepted)
+    }
+
     /// POST /api/v1/hosts/:id/heartbeat
     pub async fn heartbeat(
         &self,
@@ -516,6 +541,11 @@ pub struct RegisterRequest {
     /// mixed-fleet interop with a pre-0068 host-agent.
     #[serde(default)]
     pub capabilities: engram_core::types::host::HostCapabilities,
+    /// ADR 0116 A-D2: the predecessor's handoff marker this successor
+    /// adopted from the bindings dir at startup, if any. Observability
+    /// only on the coordinator (`#[serde(default)]` there).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff_marker: Option<engram_host_core::shutdown::HandoffMarker>,
 }
 
 #[derive(Deserialize)]

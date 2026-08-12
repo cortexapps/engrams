@@ -271,6 +271,42 @@ pub fn plan_shutdown(flush_env: Option<f64>, capture_drain_env: Option<f64>) -> 
     }
 }
 
+/// ADR 0116 A-D2: the durable note a shutting-down host-agent leaves in
+/// its bindings directory for the successor generation — proof this was
+/// a PLANNED exit with a declared lease deadline. The successor adopts
+/// it (read + delete) and reports it on register; the coordinator uses
+/// it for observability only (register renews the lease regardless).
+/// Written FIRST in the SIGTERM ladder, before the heartbeat task is
+/// aborted, so the belt POST and the durable note both precede any
+/// silence the coordinator could observe.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HandoffMarker {
+    /// Predecessor wall clock at declaration (unix ms). Same-node clock;
+    /// adoption latency derived from it is a histogram input, never a
+    /// decision.
+    pub declared_at_unix_ms: i64,
+    /// TTL the predecessor requested for its handoff window.
+    pub ttl_secs: u64,
+    /// Sandboxes resident at declaration (diagnostics).
+    #[serde(default)]
+    pub resident_sandboxes: u32,
+}
+
+/// File name of the handoff marker inside the bindings directory.
+pub const HANDOFF_MARKER_FILE: &str = "handoff.json";
+
+/// Default handoff TTL the host's own SIGTERM ladder declares (the belt;
+/// the operator's authoritative declaration is sized to its roll gates
+/// instead). 600 s covers a kubelet restart + image pull on a slow node
+/// (the 2026-08-12 replacement took 5.5 min). Env
+/// `ENGRAM_SHUTDOWN_HANDOFF_TTL_SECS` overrides.
+pub fn shutdown_handoff_ttl_secs(env_val: Option<&str>) -> u64 {
+    env_val
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(600)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +454,14 @@ mod tests {
             }),
             SurvivorAction::Publish
         );
+    }
+
+    #[test]
+    fn shutdown_handoff_ttl_parses_with_default() {
+        assert_eq!(shutdown_handoff_ttl_secs(None), 600);
+        assert_eq!(shutdown_handoff_ttl_secs(Some("120")), 120);
+        assert_eq!(shutdown_handoff_ttl_secs(Some("0")), 600);
+        assert_eq!(shutdown_handoff_ttl_secs(Some("junk")), 600);
     }
 
     #[test]
