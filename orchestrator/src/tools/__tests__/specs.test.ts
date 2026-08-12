@@ -405,4 +405,41 @@ describe("spec tools", () => {
     );
     expect(JSON.stringify(manifest?.inputSchema)).not.toContain('"anyOf"');
   });
+
+  test("the alternatives tools advertise only the guards they honour", () => {
+    const registry = createToolRegistry();
+    registerSpecTools(registry, recorder().deps);
+    const propose = registry.get("spec_propose_alternatives");
+    const decide = registry.get("spec_decide_alternative");
+    if (propose === undefined || decide === undefined) {
+      throw new Error("the alternatives tools are not registered");
+    }
+
+    // A proposal writes no document, so it takes no revision guard.
+    const manifest = compileToolManifest(registry, undefined, "spec");
+    const proposeSchema = manifest.find((entry) => entry.name === "spec_propose_alternatives");
+    expect(JSON.stringify(proposeSchema?.inputSchema)).not.toContain("expected_rev");
+    const decideSchema = manifest.find((entry) => entry.name === "spec_decide_alternative");
+    expect(JSON.stringify(decideSchema?.inputSchema)).toContain("expected_rev");
+
+    expect(() =>
+      decide.input.parse({ set_id: "set-1", option_key: "B", reason: "x".repeat(4_001) }),
+    ).toThrow();
+  });
+
+  test("spec_decide_alternative reports a replayed pick as not applied", async () => {
+    const state = recorder({ applied: false, newRev: 8n, concurrentEditors: [] });
+    const result = await call(state.deps, "spec_decide_alternative", {
+      set_id: "set-1",
+      option_key: "B",
+      reason: "One code path.",
+      expected_rev: "8",
+    });
+
+    expect(result).toMatchObject({ applied: false, new_rev: "8" });
+    expect(state.mutations[0]).toMatchObject({
+      name: "decideAlternative",
+      input: { setId: "set-1", optionKey: "B", expectedRev: 8n },
+    });
+  });
 });

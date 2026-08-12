@@ -203,7 +203,6 @@ describe("SpecAlternativesService", () => {
       optionKey: "B",
       reason: "One code path, and the team tier drops out free later.",
       decidedBy: "author",
-      actionId: "call-1",
     });
 
     expect(result.applied).toBe(true);
@@ -228,7 +227,6 @@ describe("SpecAlternativesService", () => {
       optionKey: null,
       reason: "Take A's meter path with B's walk.",
       decidedBy: "author",
-      actionId: "call-1",
     });
 
     const markdown = await sectionMarkdown(documents, "alternatives");
@@ -249,7 +247,6 @@ describe("SpecAlternativesService", () => {
       optionKey: "B",
       reason: "One code path.",
       decidedBy: "author" as const,
-      actionId: "call-1",
     };
     const first = await alternatives.decide(pick);
     const second = await alternatives.decide(pick);
@@ -270,7 +267,6 @@ describe("SpecAlternativesService", () => {
       optionKey: "B",
       reason: "One code path.",
       decidedBy: "author",
-      actionId: "call-1",
     });
 
     await expect(
@@ -280,7 +276,6 @@ describe("SpecAlternativesService", () => {
         optionKey: "C",
         reason: "Second thoughts.",
         decidedBy: "author",
-        actionId: "call-1",
       }),
     ).rejects.toThrow(SpecAlternativesConflictError);
   });
@@ -291,14 +286,95 @@ describe("SpecAlternativesService", () => {
     const base = { specId: SPEC_ID, setId: "call-1", decidedBy: "author" as const };
 
     await expect(
-      alternatives.decide({ ...base, optionKey: "Z", reason: "why", actionId: "a" }),
+      alternatives.decide({ ...base, optionKey: "Z", reason: "why" }),
     ).rejects.toThrow(/unknown option: Z/);
     await expect(
-      alternatives.decide({ ...base, optionKey: "B", reason: "  ", actionId: "b" }),
+      alternatives.decide({ ...base, optionKey: "B", reason: "  " }),
     ).rejects.toThrow(SpecAlternativesError);
     await expect(
-      alternatives.decide({ ...base, setId: "other", optionKey: "B", reason: "why", actionId: "c" }),
+      alternatives.decide({ ...base, setId: "other", optionKey: "B", reason: "why" }),
     ).rejects.toThrow(SpecAlternativesConflictError);
+  });
+
+  test("binds the set to the alternatives section and refuses any other", async () => {
+    const { alternatives, store } = await setup();
+
+    await expect(
+      alternatives.propose({
+        specId: SPEC_ID,
+        sectionId: "design",
+        actionId: "call-1",
+        options: OPTIONS,
+        comparison: COMPARISON,
+        leanKey: null,
+      }),
+    ).rejects.toThrow(/not the alternatives section/);
+    await expect(
+      alternatives.propose({
+        specId: SPEC_ID,
+        sectionId: "missing",
+        actionId: "call-2",
+        options: OPTIONS,
+        comparison: COMPARISON,
+        leanKey: null,
+      }),
+    ).rejects.toThrow(/Unknown spec section/);
+    expect(store.rows.size).toBe(0);
+  });
+
+  test("refuses a pick reason beyond the stored bound", async () => {
+    const { alternatives } = await setup();
+    await propose(alternatives);
+
+    await expect(
+      alternatives.decide({
+        specId: SPEC_ID,
+        setId: "call-1",
+        optionKey: "B",
+        reason: "x".repeat(4_001),
+        decidedBy: "author",
+      }),
+    ).rejects.toThrow(/limited to 4000 characters/);
+  });
+
+  test("refuses a stale expected revision before it stores anything", async () => {
+    const { alternatives, documents, store } = await setup();
+    await propose(alternatives);
+    const live = await documents.syncFromLog(SPEC_ID);
+
+    const result = await alternatives.decide({
+      specId: SPEC_ID,
+      setId: "call-1",
+      optionKey: "B",
+      reason: "One code path.",
+      decidedBy: "author",
+      expectedRev: live.semanticDocSeq + 5n,
+    });
+
+    expect(result.applied).toBe(false);
+    expect(result.newRev).toBe(live.semanticDocSeq);
+    expect(result.stage.decision).toBeNull();
+    expect(store.rows.size).toBe(1);
+    expect(await sectionMarkdown(documents, "alternatives")).not.toContain("Selected:");
+  });
+
+  test("writes at the expected revision and reports the new one", async () => {
+    const { alternatives, documents } = await setup();
+    await propose(alternatives);
+    const live = await documents.syncFromLog(SPEC_ID);
+
+    const result = await alternatives.decide({
+      specId: SPEC_ID,
+      setId: "call-1",
+      optionKey: "B",
+      reason: "One code path.",
+      decidedBy: "author",
+      expectedRev: live.semanticDocSeq,
+    });
+
+    expect(result.applied).toBe(true);
+    expect(result.stage.decision?.pickedKey).toBe("B");
+    expect(await sectionMarkdown(documents, "alternatives")).toContain("Selected: B");
   });
 
   test("refuses a set that breaks the card ceiling before it is stored", async () => {
@@ -343,10 +419,43 @@ describe("layer-3 drafting waits for the pick", () => {
       optionKey: "B",
       reason: "One code path.",
       decidedBy: "author",
-      actionId: "call-1",
     });
     const result = await update(service, "design");
     expect(result.applied).toBe(true);
+  });
+
+  test("a decision on another section never releases the layer", async () => {
+    const { alternatives, service, store } = await setup();
+    // The service refuses a set bound elsewhere, so reach past it to prove the
+    // gate does not trust a stray decision row on its own.
+    const stray = {
+      kind: "spec_alternatives_decided" as const,
+      specId: SPEC_ID,
+      sectionId: "design",
+      setId: "stray",
+      pickedKey: "B",
+      reason: "Wrong section.",
+      decidedBy: "agent" as const,
+    };
+    await store.insertAction({
+      id: "alternatives-set:stray",
+      specId: SPEC_ID,
+      sectionId: "design",
+      requestFingerprint: "stray-proposal",
+      chip: { ...stray, kind: "spec_alternatives_proposed", options: OPTIONS, comparison: COMPARISON, leanKey: null },
+      createdAt: NOW(),
+    });
+    await store.insertAction({
+      id: "alternatives-pick:stray",
+      specId: SPEC_ID,
+      sectionId: "design",
+      requestFingerprint: "stray-decision",
+      chip: stray,
+      createdAt: NOW(),
+    });
+
+    expect(await alternatives.readStage(SPEC_ID)).not.toBeNull();
+    await expect(update(service, "design")).rejects.toThrow(SpecAlternativesStageError);
   });
 
   test("never blocks the alternatives section itself or an upstream layer", async () => {

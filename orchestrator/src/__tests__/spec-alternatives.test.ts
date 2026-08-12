@@ -156,6 +156,18 @@ describe("spec alternatives routes", () => {
     expect(decide.mock.calls[0]![0]).toMatchObject({ optionKey: null });
   });
 
+  test("bounds the reason the same way the agent tool does", async () => {
+    const { app, decide } = testApp();
+    const response = await app.request(`/api/v1/specs/${SPEC_ID}/alternatives/decide`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ setId: "set-1", optionKey: "B", reason: "x".repeat(4_001) }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(decide).not.toHaveBeenCalled();
+  });
+
   test("refuses a pick with no reason", async () => {
     const { app, decide } = testApp();
     const response = await app.request(`/api/v1/specs/${SPEC_ID}/alternatives/decide`, {

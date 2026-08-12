@@ -5,7 +5,10 @@
  * writes §Alternatives considered through the ordinary section mutation.
  */
 
-import { SpecAlternativesError } from "@engrams/spec-document";
+import {
+  SPEC_ALTERNATIVES_REASON_MAX_CHARS,
+  SpecAlternativesError,
+} from "@engrams/spec-document";
 import { Hono, type Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 
@@ -63,6 +66,13 @@ export function makeSpecAlternativesRoute(deps: SpecAlternativesRouteDeps): Hono
     if (typeof reason !== "string" || reason.trim().length === 0) {
       throw new HTTPException(400, { message: "reason must be a non-empty string" });
     }
+    // The reason is stored and rendered into the document, so this route bounds
+    // it exactly as the agent tool does.
+    if (reason.length > SPEC_ALTERNATIVES_REASON_MAX_CHARS) {
+      throw new HTTPException(400, {
+        message: `reason is limited to ${SPEC_ALTERNATIVES_REASON_MAX_CHARS} characters`,
+      });
+    }
     try {
       const result = await deps.alternatives.decide({
         specId,
@@ -70,7 +80,6 @@ export function makeSpecAlternativesRoute(deps: SpecAlternativesRouteDeps): Hono
         optionKey: typeof optionKey === "string" ? optionKey : null,
         reason,
         decidedBy: "author",
-        actionId: setId,
       });
       return c.json({ stage: result.stage, applied: result.applied });
     } catch (error) {

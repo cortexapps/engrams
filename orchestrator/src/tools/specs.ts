@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   SPEC_ALTERNATIVES_MAX_OPTIONS,
   SPEC_ALTERNATIVES_MIN_OPTIONS,
+  SPEC_ALTERNATIVES_REASON_MAX_CHARS,
   SPEC_ALTERNATIVES_TRADEOFF_COUNT,
   SPEC_TRADEOFF_SIGNS,
   type SpecAlternativeOption,
@@ -183,7 +184,6 @@ const ProposeAlternativesInput = z.object({
     .max(20)
     .describe("Numbers against numbers; one value for every option on each axis"),
   lean_key: OptionKey.optional().describe("The option you lean towards; omit when you have none"),
-  expected_rev: ExpectedRevision,
 });
 
 const DecideAlternativeInput = z.object({
@@ -191,7 +191,11 @@ const DecideAlternativeInput = z.object({
   option_key: OptionKey.optional().describe(
     "The winning card; omit it when the author chose a hybrid that no card holds",
   ),
-  reason: z.string().min(1).max(4_000).describe("Why the winner won; written into the section"),
+  reason: z
+    .string()
+    .min(1)
+    .max(SPEC_ALTERNATIVES_REASON_MAX_CHARS)
+    .describe("Why the winner won; written into the section"),
   expected_rev: ExpectedRevision,
 });
 
@@ -652,7 +656,7 @@ export function registerSpecTools(
     name: "spec_propose_alternatives",
     taskTypes: SPEC_TASK_TYPES,
     description:
-      "Propose two or three alternatives as cards in the canvas. Each card carries a one-line premise and exactly three signed trade-off lines (+ gain, - cost, ~ caveat). The comparison holds the numbers, under one provenance caption that says what you verified them against. This stores the set; it does not write the section.",
+      "Propose two or three alternatives as cards in the canvas. section_id must be the template's alternatives section. Each card carries a one-line premise and exactly three signed trade-off lines (+ gain, - cost, ~ caveat). The comparison holds the numbers, under one provenance caption that says what you verified them against. This stores the set; it does not write the section, so it takes no expected_rev.",
     input: ProposeAlternativesInput,
     output: ProposeAlternativesOutput,
     handling: "handled",
@@ -661,7 +665,7 @@ export function registerSpecTools(
       const spec = await requireSpec(ctx, deps);
       const result = await withSectionPresence(ctx, deps, spec.id, args.section_id, () =>
         deps.documents.proposeAlternatives(spec.id, {
-          ...mutationContext(ctx, args.expected_rev),
+          ...mutationContext(ctx, undefined),
           sectionId: args.section_id,
           options: args.options.map((option) => ({
             key: option.key,

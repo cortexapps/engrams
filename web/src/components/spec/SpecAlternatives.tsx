@@ -8,10 +8,11 @@
 
 import { useState } from "react";
 import { LayersIcon, ScaleIcon, ShieldCheckIcon } from "lucide-react";
-import type {
-  SpecAlternativeOption,
-  SpecAlternativesStage,
-  SpecTradeoffSign,
+import {
+  SPEC_ALTERNATIVES_REASON_MAX_CHARS,
+  type SpecAlternativeOption,
+  type SpecAlternativesStage,
+  type SpecTradeoffSign,
 } from "@engrams/spec-document";
 
 import { Button } from "@/components/ui/button";
@@ -125,6 +126,7 @@ export function SpecAlternatives({
             id="spec-alternatives-reason-field"
             value={reason}
             rows={2}
+            maxLength={SPEC_ALTERNATIVES_REASON_MAX_CHARS}
             onChange={(event) => setReason(event.target.value)}
           />
           <div className="spec-alternatives-reason-actions">

@@ -16,6 +16,8 @@ import {
   renderAlternativesConsidered,
   replaceSection,
   schema,
+  SPEC_ALTERNATIVES_REASON_MAX_CHARS,
+  SPEC_ALTERNATIVES_SECTION_KEY,
   SpecAlternativesError,
   validateSpecAlternatives,
   type AlternativesDecidedTranscriptChip,
@@ -26,7 +28,11 @@ import {
 import type { Node as ProseMirrorNode } from "prosemirror-model";
 import type { Pool } from "pg";
 
-import { proseMirrorDocument, type SpecDocumentService } from "./doc-service.ts";
+import {
+  proseMirrorDocument,
+  SpecDocumentRevisionConflictError,
+  type SpecDocumentService,
+} from "./doc-service.ts";
 
 export interface SpecAlternativesActionRecord {
   id: string;
@@ -162,12 +168,14 @@ export interface ProposeAlternativesInput extends SpecAlternativesProposal {
 
 export interface DecideAlternativeInput {
   specId: string;
+  /** The decision is keyed by this set, so it needs no separate action ID. */
   setId: string;
   /** The winning card, or null for an author-written hybrid. */
   optionKey: string | null;
   reason: string;
   decidedBy: "agent" | "author";
-  actionId: string;
+  /** Write the section only when the live document is at this revision. */
+  expectedRev?: bigint;
 }
 
 export interface DecideAlternativeResult {
@@ -187,7 +195,7 @@ export class SpecAlternativesService {
   async propose(input: ProposeAlternativesInput): Promise<AlternativesProposedTranscriptChip> {
     validateSpecAlternatives(input);
     const loaded = await this.options.documents.syncFromLog(input.specId);
-    requireSection(proseMirrorDocument(loaded.doc), input.sectionId);
+    requireAlternativesSection(proseMirrorDocument(loaded.doc), input.sectionId);
     const chip: AlternativesProposedTranscriptChip = {
       kind: "spec_alternatives_proposed",
       specId: input.specId,
@@ -227,6 +235,10 @@ export class SpecAlternativesService {
    * content comparison. A process that stops between the two leaves a replay
    * that still writes the section, so the pair converges without a shared
    * transaction.
+   *
+   * A stale `expectedRev` refuses before anything is stored. A concurrent edit
+   * that lands between the store and the write returns `applied: false` with
+   * the live revision, and the next call at that revision completes the write.
    */
   async decide(input: DecideAlternativeInput): Promise<DecideAlternativeResult> {
     const stage = await this.options.store.readStage(input.specId);
@@ -246,6 +258,19 @@ export class SpecAlternativesService {
     if (reason.length === 0) {
       throw new SpecAlternativesError("A pick must state why the winner won.");
     }
+    if (reason.length > SPEC_ALTERNATIVES_REASON_MAX_CHARS) {
+      throw new SpecAlternativesError(
+        `A pick reason is limited to ${SPEC_ALTERNATIVES_REASON_MAX_CHARS} characters.`,
+      );
+    }
+    const current = await this.options.documents.syncFromLog(input.specId);
+    if (input.expectedRev !== undefined && input.expectedRev !== current.semanticDocSeq) {
+      return {
+        stage,
+        applied: false,
+        newRev: current.semanticDocSeq,
+      };
+    }
     const chip: AlternativesDecidedTranscriptChip = {
       kind: "spec_alternatives_decided",
       specId: input.specId,
@@ -257,7 +282,12 @@ export class SpecAlternativesService {
     };
     const decision = await this.storeDecision(input, chip);
     const markdown = renderAlternativesConsidered(stage.proposal, decision);
-    const write = await this.writeSection(input.specId, stage.proposal.sectionId, markdown);
+    const write = await this.writeSection(
+      input.specId,
+      stage.proposal.sectionId,
+      markdown,
+      input.expectedRev,
+    );
     return { stage: { proposal: stage.proposal, decision }, ...write };
   }
 
@@ -292,6 +322,7 @@ export class SpecAlternativesService {
     specId: string,
     sectionId: string,
     markdown: string,
+    expectedRev?: bigint,
   ): Promise<{ applied: boolean; newRev: bigint }> {
     const loaded = await this.options.documents.syncFromLog(specId);
     const document = proseMirrorDocument(loaded.doc);
@@ -301,10 +332,18 @@ export class SpecAlternativesService {
       replacementSection(document, sectionId, markdown),
     );
     if (document.eq(desired)) return { applied: false, newRev: loaded.semanticDocSeq };
-    const update = await this.options.documents.mutateDocument(specId, "spec-alternatives", (doc) =>
-      replaceSection(doc, sectionId, replacementSection(doc, sectionId, markdown)),
-    );
-    return { applied: true, newRev: update.semanticDocSeq };
+    try {
+      const update = await this.options.documents.mutateDocument(
+        specId,
+        "spec-alternatives",
+        (doc) => replaceSection(doc, sectionId, replacementSection(doc, sectionId, markdown)),
+        expectedRev,
+      );
+      return { applied: true, newRev: update.semanticDocSeq };
+    } catch (error) {
+      if (!(error instanceof SpecDocumentRevisionConflictError)) throw error;
+      return { applied: false, newRev: error.actualSeq };
+    }
   }
 }
 
@@ -340,6 +379,37 @@ function requireSection(document: ProseMirrorNode, sectionId: string): ProseMirr
   const found = findSection(document, sectionId);
   if (!found) throw new SpecAlternativesError(`Unknown spec section: ${sectionId}`);
   return found.node;
+}
+
+/**
+ * A set belongs to the template's alternatives section and to no other. Without
+ * this bind, a wrong section id would overwrite that section with the canonical
+ * §Alternatives considered body, and its decision would release the Layer-3
+ * gate that the genuine section still holds.
+ */
+function requireAlternativesSection(document: ProseMirrorNode, sectionId: string): void {
+  const section = requireSection(document, sectionId);
+  if (section.attrs.templateSectionKey !== SPEC_ALTERNATIVES_SECTION_KEY) {
+    throw new SpecAlternativesError(
+      `Spec section ${sectionId} is not the alternatives section.`,
+    );
+  }
+}
+
+/** The document's alternatives section, or null when the template has none. */
+export function findAlternativesSectionId(document: ProseMirrorNode): string | null {
+  let found: string | null = null;
+  document.forEach((section) => {
+    if (
+      found === null &&
+      section.type === schema.nodes.section &&
+      section.attrs.templateSectionKey === SPEC_ALTERNATIVES_SECTION_KEY &&
+      typeof section.attrs.id === "string"
+    ) {
+      found = section.attrs.id;
+    }
+  });
+  return found;
 }
 
 function replacementSection(

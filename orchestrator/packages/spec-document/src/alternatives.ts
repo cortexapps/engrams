@@ -11,6 +11,14 @@ export const SPEC_ALTERNATIVES_MIN_OPTIONS = 2;
 export const SPEC_ALTERNATIVES_MAX_OPTIONS = 3;
 /** One premise plus exactly three signed trade-off lines. */
 export const SPEC_ALTERNATIVES_TRADEOFF_COUNT = 3;
+/**
+ * The template key of the section a set belongs to. A set is bound to this
+ * section: it is the section the pick writes, and the one the Layer-3 gate
+ * watches.
+ */
+export const SPEC_ALTERNATIVES_SECTION_KEY = "alternatives";
+/** The pick reason is stored and rendered, so both write paths bound it. */
+export const SPEC_ALTERNATIVES_REASON_MAX_CHARS = 4_000;
 
 export const SPEC_TRADEOFF_SIGNS = ["+", "-", "~"] as const;
 export type SpecTradeoffSign = (typeof SPEC_TRADEOFF_SIGNS)[number];

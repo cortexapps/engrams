@@ -13,6 +13,7 @@ import {
   schema,
   selectionSliceFingerprint,
   serializeSectionRelativeAnchor,
+  SPEC_ALTERNATIVES_SECTION_KEY,
   type SpecAlternativeOption,
   type SpecAlternativesComparison,
   type SpecSelectionSpan,
@@ -152,8 +153,6 @@ export class SpecAlternativesStageError extends Error {
     this.name = "SpecAlternativesStageError";
   }
 }
-
-const ALTERNATIVES_TEMPLATE_KEY = "alternatives";
 
 interface LocatedDiagramBlock {
   node: ProseMirrorNode;
@@ -505,6 +504,8 @@ export class SpecToolService implements SpecToolDocumentService {
     const chip = await this.options.alternatives.propose({
       specId,
       sectionId: input.sectionId,
+      // A proposal writes no document, so the set is deduplicated by the call
+      // that made it rather than by a document revision.
       actionId: `${input.sessionId}:${input.toolCallId}`,
       options: input.options,
       comparison: input.comparison,
@@ -527,9 +528,9 @@ export class SpecToolService implements SpecToolDocumentService {
       optionKey: input.optionKey,
       reason: input.reason,
       decidedBy: "agent",
-      actionId: `${input.sessionId}:${input.toolCallId}`,
+      ...(input.expectedRev === undefined ? {} : { expectedRev: input.expectedRev }),
     });
-    return this.result(specId, input, true, decision.newRev);
+    return this.result(specId, input, decision.applied, decision.newRev);
   }
 
   /**
@@ -547,25 +548,28 @@ export class SpecToolService implements SpecToolDocumentService {
     if (flags.alternatives !== "on") return;
     const templateSections = await this.options.metadata.templateSections(specId);
     const alternativesRule = templateSections.find(
-      (candidate) => candidate.key === ALTERNATIVES_TEMPLATE_KEY,
+      (candidate) => candidate.key === SPEC_ALTERNATIVES_SECTION_KEY,
     );
     if (!alternativesRule) return;
     const sections = documentSections(document);
     const target = sections.find((candidate) => candidate.id === sectionId);
-    if (!target || target.key === ALTERNATIVES_TEMPLATE_KEY) return;
+    if (!target || target.key === SPEC_ALTERNATIVES_SECTION_KEY) return;
     const targetRule = templateSections.find((candidate) => candidate.key === target.key);
     if (!targetRule || targetRule.layerKey !== alternativesRule.layerKey) return;
     const alternativesSection = sections.find(
-      (candidate) => candidate.key === ALTERNATIVES_TEMPLATE_KEY,
+      (candidate) => candidate.key === SPEC_ALTERNATIVES_SECTION_KEY,
     );
     if (!alternativesSection) return;
     const states = await this.options.metadata.sectionStates(specId);
     const state = states.get(alternativesSection.id)?.state;
     if (state === "confirmed" || state === "n/a") return;
     const stage = await this.options.alternatives.readStage(specId);
-    if (stage?.decision) return;
+    // Only a decision on the real alternatives section releases the layer. A
+    // set bound elsewhere must never unblock the gate it bypassed.
+    if (stage?.decision && stage.decision.sectionId === alternativesSection.id) return;
+    const proposed = stage?.proposal.sectionId === alternativesSection.id;
     throw new SpecAlternativesStageError(
-      stage
+      proposed
         ? `${target.title} waits for the alternatives pick. Ask the author to pick a card, then call spec_decide_alternative.`
         : `${target.title} waits for the alternatives stage. Call spec_propose_alternatives for ${alternativesSection.title} first.`,
     );
