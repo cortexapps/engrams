@@ -2518,10 +2518,7 @@ pub(crate) mod tests {
                 None => Err(MetaError::NotFound),
             }
         }
-        async fn list_stale_hosts(&self, _: u64) -> Result<Vec<HostRecord>, MetaError> {
-            Ok(Vec::new())
-        }
-        async fn mark_host_dead_and_orphan_sessions(
+        async fn mark_host_dead_if_lease_expired(
             &self,
             _: HostId,
         ) -> Result<Vec<(engram_core::SessionId, engram_core::types::SessionState)>, MetaError>

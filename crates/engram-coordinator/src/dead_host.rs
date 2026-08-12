@@ -1,8 +1,18 @@
 //! Dead-host auto-detector.
 //!
-//! Background task that polls for hosts whose `last_heartbeat_at` is
-//! older than the configured threshold and races other coordinator
-//! replicas — via a PG leasing row (`dead_host_inflight`,
+//! ADR 0116 A-D4: the death path keys on the host **binding lease**
+//! (`hosts.lease_expires_at`) and nothing else. Register writes the
+//! lease, every heartbeat renews it, and a planned operation (an
+//! operator roll, a SIGTERM ladder) extends it with an explicit
+//! handoff deadline sized to cover the operation — so an expired
+//! lease is not "the host is quiet", it is "the host's coverage ran
+//! out with no planned reason". The pre-0116 staleness heuristics
+//! (stale threshold, cordon multiplier, probe strikes, rescue grace)
+//! existed to soften inference from silence; with the lease they are
+//! retired, not tuned.
+//!
+//! Background task that polls for lease-expired hosts and races other
+//! coordinator replicas — via a PG leasing row (`dead_host_inflight`,
 //! ADR 0098 D4; the repo convention: leasing row over advisory lock)
 //! — for the right to evacuate each candidate. The winner:
 //!
@@ -35,15 +45,19 @@
 //! forever (with a `host_id` pointing at a host that won't respond);
 //! operators can still `POST /sessions/:id/migrate` by hand.
 //!
-//! **Probe strikes + rescue grace (2026-07-09 rk28 incident):** a stale
-//! row alone never kills a host — the issue-#231 liveness probe must
-//! ALSO fail `min_probe_failures` consecutive ticks, and any answered
-//! probe (a "rescue") arms a `probe_rescue_grace` window during which
-//! failures defer instead of evict. A single failed Ping in the middle
-//! of a post-roll http2 flap used to orphan live sessions twenty
-//! seconds after the same detector had proven the host alive; a
-//! genuinely dead host just pays `(min_probe_failures − 1)` extra
-//! ticks (~20 s at defaults).
+//! **The probe rescue (issue #231, rk28, now durable):** before the
+//! winner orphans anything it dials the host once. A host that answers
+//! is alive — its lease lapsed because heartbeat *persistence* failed
+//! (a peer pod's PG pool saturated), not the host — so the rescue
+//! writes a fresh lease into the row (`renew_host_lease`) and skips.
+//! The written renewal is what retired the per-replica strike counters
+//! and the rescue-grace window: every replica's detector honors a
+//! durable fact instead of each keeping private memory, and the rk28
+//! shape (a single failed Ping seconds after a rescue) cannot kill a
+//! host whose rescue bought it a full TTL. The mark itself re-checks
+//! the lease under the row lock and aborts on a renewal that raced in
+//! (`Conflict`) — the coordinator never revokes a binding whose lease
+//! is live.
 //!
 //! **ADR 0045 Phase A (retire reactive evac):** the second stage
 //! routes a recoverable session (snapshot row OR
@@ -109,39 +123,18 @@ async fn emit_status_changed(
 
 #[derive(Clone, Debug)]
 pub struct DeadHostConfig {
-    /// How often to poll for stale hosts. The dead-host detection
-    /// latency is `poll_interval + threshold` worst-case; with
-    /// defaults that's 30s + 10s = 40s, just inside the
-    /// DESIGN.md:700 deliverable target of 30s migration on
-    /// `kill -9`. Tighten for stricter targets.
+    /// How often to poll for lease-expired hosts. Worst-case detection
+    /// latency is `host_lease_ttl + poll_interval` (45s + 10s at
+    /// defaults) for a `kill -9`; a planned operation never enters the
+    /// death path at all (its handoff deadline covers it).
     pub poll_interval: Duration,
-    /// A host is considered dead when its `last_heartbeat_at` is
-    /// older than this. Default 30s (~6× the 5s heartbeat cadence)
-    /// — comfortable margin for transient network blips, fast
-    /// enough to catch real failures.
-    pub stale_threshold: Duration,
-    /// Consecutive FAILED liveness probes (one per detector tick)
-    /// required before a stale-row host is actually marked dead.
-    /// A genuinely dead host fails every probe, so this only adds
-    /// `(min_probe_failures - 1) × poll_interval` (~20s at defaults)
-    /// to real detection; a host mid-flap gets the strikes forgiven
-    /// the moment one probe lands. Prod incident 2026-07-09 (rk28):
-    /// a single failed Ping during a ~2-minute post-roll http2 flap
-    /// orphaned two live sessions — twenty seconds after the SAME
-    /// detector's probe had rescued the host.
-    pub min_probe_failures: u32,
-    /// A host that ANSWERED a probe (a "rescue") this recently cannot
-    /// be marked dead by a subsequent probe failure — a host proven
-    /// alive seconds ago is overwhelmingly mid-flap, not dead. The
-    /// grace is measured from the last rescue, so a truly-dead host
-    /// still gets evicted once it expires (with `min_probe_failures`
-    /// long since accumulated).
-    pub probe_rescue_grace: Duration,
     /// An eviction lease older than this is presumed abandoned (the
     /// claiming pod crashed mid-eviction) and may be taken over by any
     /// replica. Comfortably larger than a full eviction pass; small
     /// enough that a crashed pod delays a genuinely-dead host's
-    /// eviction by at most this long.
+    /// eviction by at most this long. (This is the `dead_host_inflight`
+    /// executor lease — replica failover, a different domain from the
+    /// binding lease; ADR 0116 non-goals.)
     pub lease_stale_after: Duration,
     /// Issue #777 "ask-the-host": how many consecutive sweep cycles the
     /// straggler sweep will DEFER destroying a still-bound sandbox whose
@@ -158,58 +151,11 @@ impl Default for DeadHostConfig {
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_secs(10),
-            stale_threshold: Duration::from_secs(30),
-            min_probe_failures: 3,
-            probe_rescue_grace: Duration::from_secs(120),
             lease_stale_after: Duration::from_secs(180),
             straggler_serving_strike_cap: 3,
         }
     }
 }
-
-/// Per-host probe history the detector keeps in memory. Per-replica
-/// (deliberately not persisted): with two replicas racing the eviction
-/// lease, each counts its own strikes, so eviction can take up to 2× the
-/// strike window — a bounded, conservative error in the safe direction
-/// (never evicts EARLIER than a single replica would).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ProbeMemory {
-    /// Consecutive failed probes, one per detector tick. Reset by any
-    /// answered probe.
-    consecutive_failures: u32,
-    /// When this host last answered a probe while its row was stale, as
-    /// a `Clock::now_mono()` mark (ADR 0098 D1: monotonic marks are
-    /// stored as `Duration`, not opaque `Instant`s).
-    last_rescue: Option<Duration>,
-}
-
-/// Pure verdict for the probe-failure path: is this failure enough
-/// evidence to orphan the host's sessions? `mem` has already been
-/// updated with the current failure. Two gates, both must pass:
-/// enough consecutive strikes, and no recent rescue (a host that
-/// answered a probe `probe_rescue_grace` ago is mid-flap until proven
-/// otherwise for the grace duration).
-fn probe_failure_permits_eviction(
-    mem: &ProbeMemory,
-    now: Duration,
-    min_probe_failures: u32,
-    probe_rescue_grace: Duration,
-) -> bool {
-    if mem.consecutive_failures < min_probe_failures {
-        return false;
-    }
-    match mem.last_rescue {
-        Some(rescued_at) => now.saturating_sub(rescued_at) >= probe_rescue_grace,
-        None => true,
-    }
-}
-
-/// Spawn the detector as a background task. Returns a JoinHandle the
-/// caller can drop on shutdown. Runs forever; logs and continues on
-/// per-tick errors so a transient Postgres blip doesn't stop the loop.
-/// Per-host probe history, keyed by host id. Owned by the caller of
-/// [`run_once`] so strikes persist across sweeps.
-pub type ProbeMemoryMap = std::collections::HashMap<HostId, ProbeMemory>;
 
 /// Per-session serving-strike history for the straggler sweep (issue
 /// #777 "ask-the-host"), keyed by session id. Counts consecutive sweep
@@ -219,16 +165,20 @@ pub type ProbeMemoryMap = std::collections::HashMap<HostId, ProbeMemory>;
 /// caller of [`run_once`] so it persists across sweeps and pruned to the
 /// current HostLost set each cycle.
 ///
-/// Per-replica and deliberately in-memory (the same choice as
-/// [`ProbeMemory`]): the running-sandbox SET is not persisted in PG, so
-/// there is no natural column to mirror; and this is a per-pod backstop,
-/// not cross-pod truth. With replicas racing, each counts its own strikes
+/// Per-replica and deliberately in-memory: the running-sandbox SET is
+/// not persisted in PG, so there is no natural column to mirror; and
+/// this is a per-pod backstop, not cross-pod truth. (Slated for
+/// retirement in ADR 0116 A4 alongside tombstones.) With replicas
+/// racing, each counts its own strikes
 /// — a bounded, conservative error in the safe direction (it can only
 /// DELAY a destroy, never destroy a live VM earlier than a single replica
 /// would), and a settle by ANY replica ends the deferral for all via the
 /// #211 CAS + `Conflict`-idempotent transition.
 pub type StragglerStrikeMap = std::collections::BTreeMap<SessionId, u32>;
 
+/// Spawn the detector as a background task. Returns a JoinHandle the
+/// caller can drop on shutdown. Runs forever; logs and continues on
+/// per-tick errors so a transient Postgres blip doesn't stop the loop.
 pub fn spawn(cfg: DeadHostConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Same claimant identity convention as the enable scanner: the
@@ -236,27 +186,15 @@ pub fn spawn(cfg: DeadHostConfig, state: SharedState) -> tokio::task::JoinHandle
         let claimant = std::env::var("HOSTNAME").unwrap_or_else(|_| "coord".into());
         let mut tick = tokio::time::interval(cfg.poll_interval);
         // Skip the immediate first tick — the coordinator just
-        // started and no host has had time to be considered stale.
+        // started and no host's lease has had time to expire.
         tick.tick().await;
-        // Probe history across ticks (strikes + rescue grace); pruned
-        // to the current candidate set each sweep, so a host whose
-        // heartbeats recover starts its next staleness episode fresh.
-        let mut probe_memory = ProbeMemoryMap::new();
         // Serving-strike history across ticks for the straggler sweep
         // (issue #777 ask-the-host); pruned to the current HostLost set
         // inside the sweep.
         let mut straggler_strikes = StragglerStrikeMap::new();
         loop {
             tick.tick().await;
-            if let Err(e) = run_once(
-                &cfg,
-                &state,
-                &claimant,
-                &mut probe_memory,
-                &mut straggler_strikes,
-            )
-            .await
-            {
+            if let Err(e) = run_once(&cfg, &state, &claimant, &mut straggler_strikes).await {
                 tracing::warn!(error = %e, "dead-host detector tick failed; will retry");
             }
         }
@@ -269,69 +207,21 @@ pub async fn run_once(
     cfg: &DeadHostConfig,
     state: &SharedState,
     claimant: &str,
-    probe_memory: &mut ProbeMemoryMap,
     straggler_strikes: &mut StragglerStrikeMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let candidates = state
-        .services
-        .meta
-        .list_stale_hosts(cfg.stale_threshold.as_secs())
-        .await?;
-    // ADR 0116 A1: shadow the lease-expiry predicate against the legacy
-    // staleness heuristics WITHOUT acting on it — the observability ramp
-    // before the A3 cutover replaces `list_stale_hosts` with it. Best
-    // effort: a shadow read failure must not stall the real detector.
-    match state
-        .services
-        .meta
-        .list_lease_expired_hosts(crate::config::host_lease_ttl().num_seconds() as u64)
-        .await
-    {
-        Ok(lease_expired) => {
-            let stale: std::collections::HashSet<HostId> =
-                candidates.iter().map(|h| h.id).collect();
-            let lease: std::collections::HashSet<HostId> =
-                lease_expired.iter().map(|h| h.id).collect();
-            for id in lease.difference(&stale) {
-                ::metrics::counter!(
-                    crate::metrics::DEAD_HOST_LEASE_SHADOW_DISAGREE_TOTAL,
-                    "direction" => "lease_only"
-                )
-                .increment(1);
-                tracing::warn!(host_id = %id,
-                    "lease-shadow: lease expired but staleness heuristics shield this host \
-                     (expected mid-roll pre-handoff; A3 rolls make the handoff explicit)");
-            }
-            for id in stale.difference(&lease) {
-                ::metrics::counter!(
-                    crate::metrics::DEAD_HOST_LEASE_SHADOW_DISAGREE_TOTAL,
-                    "direction" => "stale_only"
-                )
-                .increment(1);
-                tracing::warn!(host_id = %id,
-                    "lease-shadow: staleness heuristics would strike a host whose lease is \
-                     still covered — the A3 cutover would have kept this host's sessions bound");
-            }
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "lease-shadow read failed; skipping comparison this tick");
-        }
-    }
+    // ADR 0116 A-D4: the lease predicate is the sole candidate source.
+    let candidates = state.services.meta.list_lease_expired_hosts().await?;
     host_lost_straggler_sweep(cfg, state, straggler_strikes).await?;
-    // A host that stopped being a candidate recovered (its heartbeats
-    // are landing again) — drop its strikes/rescue history.
-    let ids: std::collections::HashSet<HostId> = candidates.iter().map(|h| h.id).collect();
-    probe_memory.retain(|id, _| ids.contains(id));
     if candidates.is_empty() {
         return Ok(());
     }
     tracing::debug!(
         count = candidates.len(),
-        "dead-host detector found stale candidates"
+        "dead-host detector found lease-expired candidates"
     );
     for host in candidates {
         let host_addr = host.host_addr.clone();
-        if let Err(e) = evict_host(cfg, state, claimant, host.id, host_addr, probe_memory).await {
+        if let Err(e) = evict_host(cfg, state, claimant, host.id, host_addr).await {
             tracing::warn!(host_id = %host.id, error = %e, "evict failed; another replica may have it");
         }
     }
@@ -589,7 +479,6 @@ async fn evict_host(
     claimant: &str,
     host_id: HostId,
     host_addr: Option<String>,
-    probe_memory: &mut std::collections::HashMap<HostId, ProbeMemory>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let meta = &state.services.meta;
     if !meta
@@ -605,7 +494,7 @@ async fn evict_host(
     // (including errors — the lease is not a lock; a leaked row would
     // only delay a retry by `lease_stale_after`, but there is no reason
     // to pay that on a clean error path).
-    let result = evict_host_locked(cfg, state, host_id, host_addr, probe_memory).await;
+    let result = evict_host_locked(state, host_id, host_addr).await;
     if let Err(e) = meta.release_dead_host_lease(host_id, claimant).await {
         tracing::warn!(
             host_id = %host_id,
@@ -617,11 +506,9 @@ async fn evict_host(
 }
 
 async fn evict_host_locked(
-    cfg: &DeadHostConfig,
     state: &SharedState,
     host_id: HostId,
     host_addr: Option<String>,
-    probe_memory: &mut std::collections::HashMap<HostId, ProbeMemory>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let meta = &state.services.meta;
     let host_registry = &state.host_registry;
@@ -629,7 +516,7 @@ async fn evict_host_locked(
 
     // Re-check the host's status *after* taking the lease — another
     // replica that already won may have flipped it to Dead in the
-    // window between our `list_stale_hosts` and now.
+    // window between our `list_lease_expired_hosts` and now.
     let status = meta.host_status(host_id).await?;
     if matches!(
         status,
@@ -639,115 +526,86 @@ async fn evict_host_locked(
         return Ok(());
     }
 
-    // Defense-in-depth (issue #231): the row says stale, but is the host
-    // actually gone? Dial it directly with a cheap `Ping` before we
+    // Defense-in-depth (issue #231): the lease says expired, but is the
+    // host actually gone? Dial it directly with a cheap `Ping` before we
     // orphan its sessions. The asymmetric-PG-failure mode — one coord
-    // pod's pool saturates and stops advancing H's `last_heartbeat_at`
-    // while THIS pod's detector is healthy — staled a *live* host's row;
-    // marking it dead here would orphan every session on a host that's
-    // up and loaded. If the host answers, skip the eviction and warn so
-    // an operator catches the heartbeat-persistence fault instead of a
-    // fleet section flapping mid-run.
+    // pod's pool saturates and stops renewing H's lease on heartbeat
+    // while THIS pod's detector is healthy — lapsed a *live* host's
+    // lease; marking it dead here would orphan every session on a host
+    // that's up and loaded. If the host answers, RENEW the lease
+    // durably (`renew_host_lease`, ADR 0116 A-D4) and skip: the written
+    // reprieve is honored by every replica's detector, which is what
+    // retired the per-replica strike/grace memory — and the rk28 shape
+    // (one failed Ping seconds after a rescue) cannot kill a host whose
+    // rescue bought it a full TTL.
     //
     // Probe via the client THIS pod already holds for the host — the same
     // `host_registry` seam reconcile and the straggler sweep probe through
-    // (`backend_of`), not a second, lower-level channel cache. The primary
-    // #231 failure mode is exactly the one where THIS pod is healthy: a
-    // PEER pod's PG pool saturates and stops persisting H's
-    // `last_heartbeat_at`, staling the row, while this pod still receives
-    // H's heartbeats and so holds a live registry client — probing it is
-    // the most direct "is H actually gone?" test. (Before ADR 0098 Phase 3,
-    // this path went straight to `host_pool.get`, a seam the coordinator
-    // otherwise never uses for host RPCs and that the DST harness leaves
-    // unpopulated, so the probe silently never ran in-sim and a live-but-
-    // stale host was orphaned on mere heartbeat staleness — issue #787.)
-    //
-    // Only when the registry has nothing for H (the cross-pod case: this
-    // pod never saw H register) do we fall back to warming a fresh dial
-    // from the persisted `host_addr`. No client anywhere and no addr
-    // (pre-0013 row) ⇒ unprobeable ⇒ fall through to eviction, exactly as
-    // before this guard existed. `Some(answered)` = we had something to
-    // probe with (a dial that failed to warm counts as a FAILED probe —
-    // unreachability evidence, same as a failed Ping); `None` = unprobeable.
-    let probe_outcome: Option<bool> = if let Some(client) = state.host_registry.backend_of(host_id)
-    {
-        Some(host_responds(&client).await)
+    // (`backend_of`), not a second, lower-level channel cache. (Before ADR
+    // 0098 Phase 3, this path went straight to `host_pool.get`, a seam the
+    // DST harness leaves unpopulated, so the probe silently never ran
+    // in-sim — issue #787.) Only when the registry has nothing for H (the
+    // cross-pod case: this pod never saw H register) do we fall back to
+    // warming a fresh dial from the persisted `host_addr`. A dial that
+    // fails to warm, or no addr at all, is unreachability evidence — the
+    // lease already expired, so eviction proceeds.
+    let rescued: bool = if let Some(client) = state.host_registry.backend_of(host_id) {
+        host_responds(&client).await
     } else {
         match state.services.host_pool.get(host_id) {
             Ok(c) => {
                 let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(c);
-                Some(host_responds(&client).await)
+                host_responds(&client).await
             }
             Err(_) => match host_addr {
                 Some(addr) => match state.services.host_pool.get_or_warm(host_id, addr).await {
                     Ok(c) => {
                         let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(c);
-                        Some(host_responds(&client).await)
+                        host_responds(&client).await
                     }
                     Err(e) => {
-                        tracing::debug!(host_id = %host_id, error = %e, "dead-host probe: could not warm a dial; treating as a failed probe");
-                        Some(false)
+                        tracing::debug!(host_id = %host_id, error = %e, "dead-host probe: could not warm a dial; unreachable");
+                        false
                     }
                 },
-                None => None,
+                None => false,
             },
         }
     };
-    match probe_outcome {
-        Some(true) => {
-            // ADR 0068: this probe already existed (added in `7fcc4c3c`).
-            // Graphing it alongside the reconcile probe's rescue counter
-            // (`RECONCILE_PROBE_RESCUES_TOTAL`) makes both rescue paths
-            // visible together. The rescue also arms the grace window: a
-            // host proven alive NOW can't be killed by a single failed
-            // probe on the next tick (prod 2026-07-09, rk28).
-            ::metrics::counter!(crate::metrics::DEAD_HOST_PROBE_RESCUES_TOTAL).increment(1);
-            probe_memory.insert(
-                host_id,
-                ProbeMemory {
-                    consecutive_failures: 0,
-                    last_rescue: Some(state.services.clock.now_mono()),
-                },
-            );
-            tracing::warn!(
-                host_id = %host_id,
-                "stale row but live host — host answered Ping while last_heartbeat_at is stale; SKIPPING eviction. Check heartbeat persistence (coord PG pool saturation?) — see engram_heartbeat_persist_failures_total (issue #231)",
-            );
+    if rescued {
+        // ADR 0068 lineage (added in `7fcc4c3c`); made durable in ADR
+        // 0116 A-D4. Graphed alongside the reconcile probe's rescue
+        // counter (`RECONCILE_PROBE_RESCUES_TOTAL`).
+        ::metrics::counter!(crate::metrics::DEAD_HOST_PROBE_RESCUES_TOTAL).increment(1);
+        let until = state.services.clock.now_utc() + crate::config::host_lease_ttl();
+        if let Err(e) = meta.renew_host_lease(host_id, until).await {
+            tracing::warn!(host_id = %host_id, error = %e,
+                "probe-rescue lease renewal failed; host stays a candidate next tick");
+        }
+        tracing::warn!(
+            host_id = %host_id,
+            "expired lease but live host — host answered Ping; renewed its lease and SKIPPING \
+             eviction. Check heartbeat persistence (coord PG pool saturation?) — see \
+             engram_heartbeat_persist_failures_total (issue #231)",
+        );
+        return Ok(());
+    }
+
+    let affected = match meta.mark_host_dead_if_lease_expired(host_id).await {
+        Ok(affected) => affected,
+        Err(MetaError::Conflict(detail)) => {
+            // A renewal raced in between our list read and the mark (a
+            // late heartbeat landed, or another replica's probe rescued
+            // the host). The host is alive; the abort IS the invariant
+            // holding — never revoke a binding whose lease is live.
+            ::metrics::counter!(crate::metrics::DEAD_HOST_MARK_ABORTED_LEASE_RENEWED_TOTAL)
+                .increment(1);
+            tracing::info!(host_id = %host_id, %detail,
+                "mark-dead aborted: lease renewed mid-flight; host came back");
             return Ok(());
         }
-        Some(false) => {
-            // Failed probe: one strike. Evict only with enough
-            // consecutive strikes AND no recent rescue — a genuinely
-            // dead host fails every tick and pays only
-            // `(min_probe_failures - 1) × poll_interval`; a flapping
-            // host rides it out.
-            let mem = probe_memory.entry(host_id).or_default();
-            mem.consecutive_failures = mem.consecutive_failures.saturating_add(1);
-            let now = state.services.clock.now_mono();
-            if !probe_failure_permits_eviction(
-                mem,
-                now,
-                cfg.min_probe_failures,
-                cfg.probe_rescue_grace,
-            ) {
-                tracing::warn!(
-                    host_id = %host_id,
-                    strikes = mem.consecutive_failures,
-                    min_strikes = cfg.min_probe_failures,
-                    recently_rescued = mem
-                        .last_rescue
-                        .is_some_and(|t| now.saturating_sub(t) < cfg.probe_rescue_grace),
-                    "stale row + failed probe, but not enough evidence to orphan its sessions yet; deferring eviction to a later tick",
-                );
-                return Ok(());
-            }
-        }
-        // Unprobeable (no host_addr): legacy immediate eviction.
-        None => {}
-    }
-    probe_memory.remove(&host_id);
-
-    let affected = meta.mark_host_dead_and_orphan_sessions(host_id).await?;
+        Err(e) => return Err(e.into()),
+    };
 
     // Notify other replicas so they drop their HostRegistry entry.
     meta.notify_host_dead(host_id).await?;
@@ -865,7 +723,7 @@ mod tests {
     // The detector's polling loop and lease dance need a
     // MetadataStore with real lease semantics to test meaningfully
     // (live Postgres, or engram-sim's SimMetadataStore). The trait-layer logic
-    // (`mark_host_dead_and_orphan_sessions` semantics) is covered
+    // (`mark_host_dead_if_lease_expired` semantics) is covered
     // by Mock-based tests in `tests/dead_host_mock.rs`. End-to-end
     // multi-replica behaviour is the live-Postgres test
     // (`#[ignore]`'d, gated behind dev-VM Docker compose).
@@ -1019,63 +877,12 @@ mod tests {
         );
     }
 
-    // Prod incident 2026-07-09 (rk28): during a ~2-minute post-roll
-    // http2 flap the detector's probe rescued the host four times, then
-    // a SINGLE failed Ping — twenty seconds after the last rescue —
-    // marked it dead and orphaned two live sessions. The verdict below
-    // is the gate that makes that impossible: a failed probe evicts
-    // only with `min_probe_failures` consecutive strikes AND no rescue
-    // within `probe_rescue_grace`.
-    const MIN: u32 = 3;
-    const GRACE: Duration = Duration::from_secs(120);
-
-    fn mem(failures: u32, rescued_ago: Option<Duration>) -> (ProbeMemory, Duration) {
-        // `now` is a monotonic mark (ADR 0098 D1: `Clock::now_mono()`
-        // returns a `Duration`). Anchor it far enough from the
-        // ProbeMemory's rescue mark that subtraction can't underflow.
-        let now = GRACE * 10;
-        let m = ProbeMemory {
-            consecutive_failures: failures,
-            last_rescue: rescued_ago.map(|ago| now - ago),
-        };
-        (m, now)
-    }
-
-    #[test]
-    fn single_probe_failure_never_evicts() {
-        // The incident shape: one failed probe, host rescued 20s ago.
-        let (m, now) = mem(1, Some(Duration::from_secs(20)));
-        assert!(!probe_failure_permits_eviction(&m, now, MIN, GRACE));
-        // Even with no rescue on record, one strike isn't enough.
-        let (m, now) = mem(1, None);
-        assert!(!probe_failure_permits_eviction(&m, now, MIN, GRACE));
-    }
-
-    #[test]
-    fn consecutive_failures_without_a_rescue_evict() {
-        // The genuine dead host (kill -9): never answers, accumulates
-        // strikes across ticks, evicts at the threshold.
-        let (m, now) = mem(MIN - 1, None);
-        assert!(!probe_failure_permits_eviction(&m, now, MIN, GRACE));
-        let (m, now) = mem(MIN, None);
-        assert!(probe_failure_permits_eviction(&m, now, MIN, GRACE));
-    }
-
-    #[test]
-    fn recent_rescue_blocks_eviction_even_at_the_strike_threshold() {
-        // Enough strikes, but the host answered a probe inside the
-        // grace window — mid-flap until proven otherwise.
-        let (m, now) = mem(MIN + 2, Some(GRACE - Duration::from_secs(1)));
-        assert!(!probe_failure_permits_eviction(&m, now, MIN, GRACE));
-    }
-
-    #[test]
-    fn expired_rescue_grace_allows_eviction_with_enough_strikes() {
-        // The flap turned out to be a real death: the last rescue is
-        // beyond the grace and the strikes kept mounting — evict.
-        let (m, now) = mem(MIN, Some(GRACE));
-        assert!(probe_failure_permits_eviction(&m, now, MIN, GRACE));
-        let (m, now) = mem(MIN, Some(GRACE * 2));
-        assert!(probe_failure_permits_eviction(&m, now, MIN, GRACE));
-    }
+    // The rk28 property (2026-07-09: a single failed Ping seconds after
+    // a rescue orphaned two live sessions) is now held by written state
+    // instead of an in-memory verdict: a rescue durably renews the
+    // lease (`renew_host_lease`, conformance `t_host_binding_lease`),
+    // and the mark re-checks the lease under the row lock and aborts
+    // with `Conflict` on a renewal (`mark_host_dead_if_lease_expired`
+    // conformance legs). The DST pin `issue_787_dead_host_false_evict_
+    // double_boot` replays the false-evict shape end to end.
 }

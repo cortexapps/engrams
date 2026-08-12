@@ -264,9 +264,9 @@ async fn ensure_host_row(meta: &Arc<dyn MetadataStore>, host_id: HostId, label: 
     .expect("upsert_host");
 }
 
-/// Seed a host row with an explicit `status` + `last_heartbeat_at` so a test
-/// can stage stale / draining hosts for the dead-host detector's
-/// `list_stale_hosts` query.
+/// Seed a host row with an explicit `status` + `last_heartbeat_at` (and a
+/// NULL lease) so a test can stage candidates for the dead-host detector's
+/// `list_lease_expired_hosts` query.
 async fn seed_host_with(
     meta: &Arc<dyn MetadataStore>,
     host_id: HostId,
@@ -949,53 +949,58 @@ async fn seed_ready_host(
     .expect("seed host row");
 }
 
-/// ADR 0044 K3 amendment: the dead-host detector must NOT strike out a
-/// `draining` host — it's operator-managed (mid image-roll, where K2 reattach
-/// keeps its VMs alive across the pod-swap heartbeat gap, or mid node-removal).
-/// So `list_stale_hosts` returns only stale `ready` hosts.
+/// ADR 0044 K3 amendment, kept under ADR 0116 A-D4: the dead-host
+/// detector must NOT strike out a `draining` host — it's operator-managed
+/// (mid image-roll, where K2 reattach keeps its VMs alive across the
+/// pod-swap heartbeat gap, or mid node-removal). `list_lease_expired_hosts`
+/// returns only `ready` rows, and a NULL lease on a ready row reads as
+/// expired (no lease ⇒ no shield).
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn list_stale_hosts_excludes_draining_hosts() {
+async fn lease_expiry_list_excludes_draining_hosts() {
     use engram_core::types::HostStatus;
     let Some(rig) = rig().await else { return };
     let meta = rig.meta.clone();
 
-    let stale = Utc::now() - chrono::Duration::seconds(120);
-    let fresh = Utc::now();
-    let stale_ready = HostId::new();
-    let stale_draining = HostId::new();
-    let fresh_ready = HostId::new();
-    seed_host_with(&meta, stale_ready, "stale-ready", HostStatus::Ready, stale).await;
+    // Both seeded rows carry a NULL lease (`seed_host_with` writes
+    // `lease_expires_at: None`) ⇒ both read as expired; only status
+    // separates them.
+    let now = Utc::now();
+    let unleased_ready = HostId::new();
+    let unleased_draining = HostId::new();
+    seed_host_with(&meta, unleased_ready, "nl-ready", HostStatus::Ready, now).await;
     seed_host_with(
         &meta,
-        stale_draining,
-        "stale-drain",
+        unleased_draining,
+        "nl-drain",
         HostStatus::Draining,
-        stale,
+        now,
     )
     .await;
-    seed_host_with(&meta, fresh_ready, "fresh-ready", HostStatus::Ready, fresh).await;
-
-    let stale_ids: Vec<HostId> = meta
-        .list_stale_hosts(60)
+    let leased_ready = HostId::new();
+    seed_host_with(&meta, leased_ready, "leased-ready", HostStatus::Ready, now).await;
+    assert!(meta
+        .renew_host_lease(leased_ready, now + chrono::Duration::seconds(45))
         .await
-        .expect("list_stale_hosts")
+        .expect("renew_host_lease"));
+
+    let expired_ids: Vec<HostId> = meta
+        .list_lease_expired_hosts()
+        .await
+        .expect("list_lease_expired_hosts")
         .into_iter()
         .map(|h| h.id)
         .collect();
 
     assert!(
-        stale_ids.contains(&stale_ready),
-        "a stale READY host is a strike-out candidate"
+        expired_ids.contains(&unleased_ready),
+        "a NULL-lease READY host is a candidate immediately"
     );
     assert!(
-        !stale_ids.contains(&stale_draining),
-        "a stale DRAINING host is operator-managed — must be excluded"
+        !expired_ids.contains(&unleased_draining),
+        "a DRAINING host is operator-managed — must be excluded"
     );
-    assert!(
-        !stale_ids.contains(&fresh_ready),
-        "a fresh host is not stale"
-    );
+    assert!(!expired_ids.contains(&leased_ready), "a live lease shields");
 }
 
 /// ADR 0047: `apply_missing_sandbox_strikes` semantics on the real SQL —

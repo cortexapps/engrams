@@ -245,7 +245,7 @@ pub struct SimDb {
     /// D6 transition-legality oracle's input (defense-in-depth over the
     /// FSM checks in the write paths, and it catches direct-write bugs
     /// in SimMeta itself). `exempt` marks the documented
-    /// mark_host_dead_and_orphan_sessions bulk flip, which is broader
+    /// mark_host_dead_if_lease_expired bulk flip, which is broader
     /// than the FSM table (ADR 0099 H6 finding, design call pending).
     pub transition_log: Vec<TransitionLogEntry>,
 }

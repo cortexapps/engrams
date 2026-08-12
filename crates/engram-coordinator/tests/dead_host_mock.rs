@@ -1,4 +1,4 @@
-//! Trait-layer tests for `MetadataStore::mark_host_dead_and_orphan_sessions`.
+//! Trait-layer tests for `MetadataStore::mark_host_dead_if_lease_expired`.
 //!
 //! The actual detector loop (advisory locks, polling cadence, NOTIFY
 //! emission) is Postgres-specific and tested separately against a
@@ -135,10 +135,7 @@ impl MetadataStore for MiniMeta {
     async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
         Ok(())
     }
-    async fn list_stale_hosts(&self, _threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn mark_host_dead_and_orphan_sessions(
+    async fn mark_host_dead_if_lease_expired(
         &self,
         host_id: HostId,
     ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
@@ -323,7 +320,7 @@ async fn evacuates_active_and_idle_sessions_clears_host_id() {
     let s_active = seed_session(&meta, host, SessionState::Active).await;
     let s_idle = seed_session(&meta, host, SessionState::Idle).await;
 
-    let affected = meta.mark_host_dead_and_orphan_sessions(host).await.unwrap();
+    let affected = meta.mark_host_dead_if_lease_expired(host).await.unwrap();
 
     // ADR 0015 M2: bulk transition lands the sessions in HostLost
     // and reports each affected session's previous state so the
@@ -363,7 +360,7 @@ async fn skips_terminal_sessions_even_on_dead_host() {
     let s_failed = seed_session(&meta, host, SessionState::Failed).await;
     let s_active = seed_session(&meta, host, SessionState::Active).await;
 
-    let affected = meta.mark_host_dead_and_orphan_sessions(host).await.unwrap();
+    let affected = meta.mark_host_dead_if_lease_expired(host).await.unwrap();
 
     assert_eq!(
         affected,
@@ -390,7 +387,7 @@ async fn does_not_touch_sessions_on_other_hosts() {
     let s_live = seed_session(&meta, live_host, SessionState::Active).await;
 
     let affected = meta
-        .mark_host_dead_and_orphan_sessions(dead_host)
+        .mark_host_dead_if_lease_expired(dead_host)
         .await
         .unwrap();
 
@@ -415,10 +412,10 @@ async fn idempotent_on_already_dead_host() {
     let host = HostId::new();
     let _s = seed_session(&meta, host, SessionState::Active).await;
 
-    let first = meta.mark_host_dead_and_orphan_sessions(host).await.unwrap();
+    let first = meta.mark_host_dead_if_lease_expired(host).await.unwrap();
     assert_eq!(first.len(), 1);
 
-    let second = meta.mark_host_dead_and_orphan_sessions(host).await.unwrap();
+    let second = meta.mark_host_dead_if_lease_expired(host).await.unwrap();
     assert!(
         second.is_empty(),
         "second call on an already-evacuated host must return empty"
@@ -430,7 +427,7 @@ async fn host_with_no_sessions_returns_empty() {
     let meta = MiniMeta::default();
     let lonely_host = HostId::new();
     let affected = meta
-        .mark_host_dead_and_orphan_sessions(lonely_host)
+        .mark_host_dead_if_lease_expired(lonely_host)
         .await
         .unwrap();
     assert!(affected.is_empty());
@@ -442,6 +439,6 @@ async fn arc_dyn_metadata_store_dispatches_correctly() {
     // dispatch reaches the same impl. (Compile-time check + smoke
     // call.)
     let meta: Arc<dyn MetadataStore> = Arc::new(MiniMeta::default());
-    let result = meta.mark_host_dead_and_orphan_sessions(HostId::new()).await;
+    let result = meta.mark_host_dead_if_lease_expired(HostId::new()).await;
     assert!(result.is_ok());
 }

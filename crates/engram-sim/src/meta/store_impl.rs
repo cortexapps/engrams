@@ -791,23 +791,45 @@ impl MetadataStore for SimMetadataStore {
         Ok(true)
     }
 
-    /// ADR 0116 A-D4: `status='ready' AND COALESCE(lease_expires_at,
-    /// last_heartbeat_at + fallback_ttl) < now`. No cordon multiplier.
-    async fn list_lease_expired_hosts(
-        &self,
-        fallback_ttl_secs: u64,
-    ) -> Result<Vec<HostRecord>, MetaError> {
+    /// ADR 0116 A-D4: `status='ready' AND (lease_expires_at IS NULL OR
+    /// lease_expires_at < now)`. NULL = no shield. No cordon multiplier.
+    async fn list_lease_expired_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
         self.gate()?;
         let now = self.now();
         let db = self.db.lock();
-        let ttl = chrono::Duration::seconds(fallback_ttl_secs as i64);
         Ok(db
             .hosts
             .values()
             .filter(|h| h.status == HostStatus::Ready)
-            .filter(|h| h.lease_expires_at.unwrap_or(h.last_heartbeat_at + ttl) < now)
+            .filter(|h| h.lease_expires_at.is_none_or(|expires| expires < now))
             .cloned()
             .collect())
+    }
+
+    /// ADR 0116 A-D4: exactly the `renew_host_lease` UPDATE — GREATEST,
+    /// `none` promotes to `active`, `handoff` never demoted, dead rows
+    /// excluded.
+    async fn renew_host_lease(
+        &self,
+        id: HostId,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        let Some(host) = db.hosts.get_mut(&id) else {
+            return Ok(false);
+        };
+        if host.status == HostStatus::Dead {
+            return Ok(false);
+        }
+        host.lease_expires_at = Some(match host.lease_expires_at {
+            Some(existing) => existing.max(until),
+            None => until,
+        });
+        if host.lease_state == engram_core::types::host::HostLeaseState::None {
+            host.lease_state = engram_core::types::host::HostLeaseState::Active;
+        }
+        Ok(true)
     }
 
     async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
@@ -822,35 +844,28 @@ impl MetadataStore for SimMetadataStore {
         Ok(())
     }
 
-    /// `status='ready' AND (not-cordoned-and-stale OR 10x-stale)`.
-    async fn list_stale_hosts(&self, threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
-        self.gate()?;
-        let now = self.now();
-        let db = self.db.lock();
-        let t = chrono::Duration::seconds(threshold_secs as i64);
-        Ok(db
-            .hosts
-            .values()
-            .filter(|h| h.status == HostStatus::Ready)
-            .filter(|h| {
-                (!h.cordoned && h.last_heartbeat_at < now - t)
-                    || h.last_heartbeat_at < now - (t * 10)
-            })
-            .cloned()
-            .collect())
-    }
-
-    /// tx: host -> dead; every non-terminal session on it -> host_lost
-    /// with host/sandbox cleared. Returns (id, prev) pairs.
-    async fn mark_host_dead_and_orphan_sessions(
+    /// tx: lease re-checked under the lock (renewed ⇒ `Conflict`, ADR
+    /// 0116 A-D4); then host -> dead; every non-terminal session on it
+    /// -> host_lost with host/sandbox cleared. Returns (id, prev) pairs.
+    async fn mark_host_dead_if_lease_expired(
         &self,
         host_id: HostId,
     ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
         self.gate()?;
         let now = self.now();
         let mut db = self.db.lock();
-        if let Some(h) = db.hosts.get_mut(&host_id) {
-            h.status = HostStatus::Dead;
+        match db.hosts.get_mut(&host_id) {
+            None => return Ok(Vec::new()),
+            Some(h) if h.status == HostStatus::Dead => return Ok(Vec::new()),
+            Some(h) => {
+                if h.lease_expires_at.is_some_and(|expires| expires >= now) {
+                    return Err(MetaError::Conflict(format!(
+                        "host {host_id} lease renewed to {:?}; refusing to mark dead",
+                        h.lease_expires_at
+                    )));
+                }
+                h.status = HostStatus::Dead;
+            }
         }
         let mut out = Vec::new();
         let mut log = Vec::new();

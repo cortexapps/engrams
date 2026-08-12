@@ -322,13 +322,7 @@ mod tests {
         async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
             Ok(())
         }
-        async fn list_stale_hosts(
-            &self,
-            _threshold_secs: u64,
-        ) -> Result<Vec<engram_core::types::HostRecord>, MetaError> {
-            Ok(Vec::new())
-        }
-        async fn mark_host_dead_and_orphan_sessions(
+        async fn mark_host_dead_if_lease_expired(
             &self,
             _host_id: HostId,
         ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {

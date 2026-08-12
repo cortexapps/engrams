@@ -77,6 +77,13 @@ pub fn init(addr: SocketAddr) {
         1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0, 3600.0,
     ];
 
+    // ADR 0116 A2/A3: handoff adoption is pod-swap-regime — the five
+    // first-shielded-roll samples ran 36-44 s (image pull + agent
+    // start), and a marker adopted near its 600 s belt TTL matters.
+    // Under the default 30 s-capped spread every real adoption landed
+    // in +Inf (observed on the 2026-08-12 cutover evidence roll).
+    let handoff_adoption_buckets = &[5.0, 15.0, 30.0, 45.0, 60.0, 120.0, 300.0, 600.0];
+
     // Issue #527 Phase 1: prompt→run-start is the same wide-regime problem
     // as eviction — the prod evidence this metric replaces the proxy for
     // shows p50 ≈24.5s, p90 ≈140s, max 1,703s (a resume can be a full cold
@@ -133,6 +140,11 @@ pub fn init(addr: SocketAddr) {
             prompt_to_run_started_buckets,
         )
         .expect("install prompt-to-run-started histogram buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(HOST_HANDOFF_ADOPTION_SECONDS.to_string()),
+            handoff_adoption_buckets,
+        )
+        .expect("install handoff-adoption histogram buckets")
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Suffix("_seconds".to_string()),
             buckets,
@@ -461,26 +473,25 @@ pub const QUEUE_HEAD_AGE_SECONDS: &str = "engram_queue_head_age_seconds";
 /// per-host labels; the paired `warn!` carries the id for forensics.
 pub const HEARTBEAT_PERSIST_FAILURES_TOTAL: &str = "engram_heartbeat_persist_failures_total";
 
-/// Counter (ADR 0116 A1). The shadow-cutover comparator: ticks where the
-/// lease-expiry predicate (`list_lease_expired_hosts`) and the legacy
-/// staleness predicate (`list_stale_hosts`) DISAGREE about the dead-host
-/// candidate set. Label `direction`: `lease_only` (the lease would strike
-/// a host the staleness heuristics shield — expected during rolls, where
-/// the cordon 10x shield is broader than a missing handoff) or
-/// `stale_only` (the staleness path would strike a host the lease still
-/// covers — each one is a session the A3 cutover would have SAVED from
-/// an orphan). Watch this at ~zero `stale_only` regressions before
-/// cutting enforcement over in A3; the paired `warn!` carries host ids.
-pub const DEAD_HOST_LEASE_SHADOW_DISAGREE_TOTAL: &str =
-    "engram_dead_host_lease_shadow_disagree_total";
+/// Counter (ADR 0116 A-D4). Mark-dead aborted because the host's lease
+/// was renewed between the detector's list read and the row-locked
+/// re-check — a late heartbeat or a peer replica's probe-rescue landed
+/// in the window. Each increment is the invariant HOLDING (the
+/// coordinator refused to revoke a binding whose lease is live), not a
+/// fault; sustained increments mean a host is oscillating around its
+/// lease deadline — check heartbeat persistence.
+pub const DEAD_HOST_MARK_ABORTED_LEASE_RENEWED_TOTAL: &str =
+    "engram_dead_host_mark_aborted_lease_renewed_total";
 
 /// Histogram (ADR 0116 A2). Wall time from a predecessor host-agent's
 /// handoff declaration (its durable marker's timestamp) to the
 /// successor's register that adopts it — the REAL roll-succession
-/// latency (the incident's was 5.5 min). The number handoff TTLs are
-/// sized against, and — together with the shadow-disagree counter —
-/// the go/no-go input for the A3 cutover. Same-node clocks, so skew is
-/// node clock error; observability only, never a decision input.
+/// latency (the incident's was 5.5 min; the first shielded roll
+/// measured 36-44 s across five nodes). The number handoff TTLs are
+/// sized against. Same-node clocks, so skew is node clock error;
+/// observability only, never a decision input. Bucketed for the
+/// pod-swap regime in `init` (the default `_seconds` spread tops out
+/// at 30 s and put every real adoption in +Inf).
 pub const HOST_HANDOFF_ADOPTION_SECONDS: &str = "engram_host_handoff_adoption_seconds";
 
 /// Histogram (ADR 0036 amendment, issue #538). Wall time of the enable
