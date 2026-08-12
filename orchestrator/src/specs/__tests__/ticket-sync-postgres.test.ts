@@ -424,15 +424,31 @@ describe("linear sync with live Postgres", () => {
       reserveSyncOperation(store, { ...reservation, requestHash: requestHash({ title: "b" }) }),
     ).rejects.toThrow(/already used with different arguments/);
 
-    // A failed reservation is the one that may be re-bound: that is the Retry
-    // button on a row a person edited after it failed. The reserved Linear id
-    // does not change, so the retry still adopts rather than duplicates.
-    await store.fail(specId, CREATE_ISSUE_OPERATION, ticketId, "Linear returned 401");
+    // The refusal holds even after a later error, because a complete
+    // reservation can no longer be pushed back to failed.
+    await store.fail(specId, CREATE_ISSUE_OPERATION, ticketId, "connection terminated");
+    await expect(
+      reserveSyncOperation(store, { ...reservation, requestHash: requestHash({ title: "b" }) }),
+    ).rejects.toThrow(/already used with different arguments/);
+
+    // An UNFINISHED reservation is the one that may be re-bound: that is the
+    // Retry button on a row a person edited after it failed. The reserved
+    // Linear id does not change, so the retry adopts rather than duplicates.
+    const otherId = ids.get("Hourly meter rollup job")!;
+    const unfinished = {
+      specId,
+      operation: CREATE_ISSUE_OPERATION,
+      idempotencyKey: otherId,
+      reservedTicketId: otherId,
+      reservedExternalId: reservedIssueId(specId, otherId),
+    };
+    await reserveSyncOperation(store, { ...unfinished, requestHash: requestHash({ title: "a" }) });
+    await store.fail(specId, CREATE_ISSUE_OPERATION, otherId, "Linear returned 401");
     const rebound = await reserveSyncOperation(store, {
-      ...reservation,
+      ...unfinished,
       requestHash: requestHash({ title: "b" }),
     });
-    expect(rebound.reservedExternalId).toBe(reservedIssueId(specId, ticketId));
+    expect(rebound.reservedExternalId).toBe(reservedIssueId(specId, otherId));
     expect(rebound.requestHash).toBe(requestHash({ title: "b" }));
   });
 
@@ -590,6 +606,92 @@ describe("linear sync with live Postgres", () => {
       expect(failed?.syncError).toContain("connection terminated");
     },
   );
+
+  test.skipIf(!reachable)(
+    "a bookkeeping error after a real create never becomes a duplicate",
+    async () => {
+      const specId = await publishedSpec();
+      const ids = await propose(specId);
+      const linear = new FakeLinear();
+      const store = new PostgresSpecTicketSyncStore(pool!);
+      const stumbles = ids.get("Hourly meter rollup job")!;
+      let dropped = false;
+      // Linear creates the issue, the ledger records it, and the connection
+      // drops on the very next write — the stamp of the draft row. One fault,
+      // ordinary infra blip.
+      const flaky = delegating(store, {
+        writeTicketState: (spec, ticketId, patch) => {
+          if (!dropped && ticketId === stumbles && patch.syncState === "synced") {
+            dropped = true;
+            return Promise.reject(new Error("connection terminated unexpectedly"));
+          }
+          return store.writeTicketState(spec, ticketId, patch);
+        },
+      });
+
+      const plan = await planSpecTicketSync({ specId }, deps(linear));
+      for (const ticketId of plan.order) {
+        await syncOneSpecTicket(
+          { specId, ticketId, target: plan.target },
+          { ...deps(linear), store: flaky },
+        );
+      }
+
+      expect(dropped).toBe(true);
+      expect(linear.created).toHaveLength(4);
+      // The ledger keeps the truth: the issue exists, so its row stays
+      // complete. A row that said `failed` here is the one state a retry could
+      // create a second issue from.
+      const operation = (await store.listOperations(specId)).find(
+        (row) => row.idempotencyKey === stumbles,
+      );
+      expect(operation?.status).toBe("complete");
+      expect(operation?.result?.["identifier"]).toBeString();
+      expect(operation?.error).toBeNull();
+
+      // The retry reads that reservation and stamps the identity it already
+      // holds. It asks Linear for nothing and creates nothing.
+      const before = linear.found.length;
+      await syncOneSpecTicket({ specId, ticketId: stumbles, target: plan.target }, deps(linear));
+
+      expect(linear.created).toHaveLength(4);
+      expect(linear.issues.size).toBe(4);
+      expect(linear.found).toHaveLength(before);
+      const row = (await store.listTickets(specId)).find((entry) => entry.id === stumbles);
+      expect(row?.syncState).toBe("synced");
+      expect(row?.linearId).toBe(reservedIssueId(specId, stumbles));
+    },
+  );
+
+  test.skipIf(!reachable)("a complete reservation is never downgraded to failed", async () => {
+    const specId = await publishedSpec();
+    const ids = await propose(specId);
+    const ticketId = ids.get("Add org quota columns + backfill")!;
+    const store = new PostgresSpecTicketSyncStore(pool!);
+    await reserveSyncOperation(store, {
+      specId,
+      operation: CREATE_ISSUE_OPERATION,
+      idempotencyKey: ticketId,
+      requestHash: requestHash({ title: "a" }),
+      reservedTicketId: ticketId,
+      reservedExternalId: reservedIssueId(specId, ticketId),
+    });
+    await store.complete(specId, CREATE_ISSUE_OPERATION, ticketId, {
+      id: reservedIssueId(specId, ticketId),
+      identifier: "ENG-412",
+      url: "https://linear.app/acme/issue/ENG-412",
+    });
+
+    // The guard is the table's, not the caller's discipline.
+    await store.fail(specId, CREATE_ISSUE_OPERATION, ticketId, "connection terminated");
+
+    const operation = (await store.listOperations(specId)).find(
+      (row) => row.idempotencyKey === ticketId,
+    );
+    expect(operation?.status).toBe("complete");
+    expect(operation?.error).toBeNull();
+    expect(operation?.result?.["identifier"]).toBe("ENG-412");
+  });
 
   test.skipIf(!reachable)("a deleted ticket is reported, not thrown", async () => {
     const specId = await publishedSpec();

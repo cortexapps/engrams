@@ -251,11 +251,21 @@ export class PostgresSpecTicketSyncStore implements SpecTicketSyncStore {
     );
   }
 
+  /**
+   * A complete reservation is never downgraded.
+   *
+   * `complete` means Linear holds the issue and this ledger row names it. If a
+   * later step fails — the state write, the next read, anything — the row must
+   * keep saying so, because a row that says `failed` about an issue that exists
+   * is the one state from which a retry can create a duplicate. The `WHERE`
+   * clause is that guarantee, not a caller's discipline.
+   */
   async fail(specId: string, operation: string, key: string, error: string): Promise<void> {
     await this.pool.query(
       `UPDATE spec_ticket_sync_operation
           SET status = 'failed', error = $4, updated_at = now()
-        WHERE caller_spec_id = $1 AND operation = $2 AND idempotency_key = $3`,
+        WHERE caller_spec_id = $1 AND operation = $2 AND idempotency_key = $3
+          AND status <> 'complete'`,
       [specId, operation, key, error],
     );
   }

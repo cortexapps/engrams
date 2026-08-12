@@ -324,6 +324,36 @@ async function recordTicketFailure(
   return { ticketId, state: "failed", issue: null, error: reason, adopted: false };
 }
 
+/**
+ * Stamp the draft row with an issue the ledger already holds. **Never throws.**
+ *
+ * By the time this runs, the reservation is `complete`: Linear made the issue
+ * and the ledger names it. A dropped connection here must therefore not be
+ * reported as a Linear failure — that report is the one state a retry could
+ * double-create from, a ledger row saying `failed` about an issue that exists.
+ * The row is left as it was instead, and the next attempt reads the complete
+ * reservation and stamps the identity it already holds.
+ */
+async function stampSynced(
+  specId: string,
+  ticketId: string,
+  issue: LinearIssue,
+  deps: SpecTicketSyncDeps,
+): Promise<void> {
+  try {
+    await deps.store.writeTicketState(specId, ticketId, {
+      syncState: "synced",
+      linearId: issue.id,
+      syncError: null,
+    });
+  } catch (error) {
+    deps.log?.warn(
+      { specId, ticketId, issue: issue.identifier, reason: failureReason(error) },
+      "a synced spec ticket could not be stamped; the ledger holds the issue",
+    );
+  }
+}
+
 async function createSpecTicketIssue(
   input: { specId: string; ticketId: string; target: SpecTicketSyncTarget },
   deps: SpecTicketSyncDeps,
@@ -370,11 +400,7 @@ async function createSpecTicketIssue(
   // this driver is replaying it. Re-state the row and make no call.
   const finished = readIssueResult(operation);
   if (operation.status === "complete" && finished) {
-    await deps.store.writeTicketState(input.specId, ticket.id, {
-      syncState: "synced",
-      linearId: finished.id,
-      syncError: null,
-    });
+    await stampSynced(input.specId, ticket.id, finished, deps);
     return { ticketId: ticket.id, state: "synced", issue: finished, error: null, adopted: true };
   }
 
@@ -405,11 +431,10 @@ async function createSpecTicketIssue(
     identifier: issue.identifier,
     url: issue.url,
   });
-  await deps.store.writeTicketState(input.specId, ticket.id, {
-    syncState: "synced",
-    linearId: issue.id,
-    syncError: null,
-  });
+
+  // The issue exists and the ledger says so. Everything after this line is
+  // bookkeeping about a fact that is already true.
+  await stampSynced(input.specId, ticket.id, issue, deps);
   return {
     ticketId: ticket.id,
     state: "synced",
