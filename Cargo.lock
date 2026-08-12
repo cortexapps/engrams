@@ -7687,9 +7687,10 @@ name = "workspace-hack"
 version = "0.1.0"
 dependencies = [
  "anstyle",
+ "axum",
+ "axum-core",
  "base64 0.22.1",
  "bitflags 2.13.1",
- "byteorder",
  "bytes",
  "cc",
  "chrono",

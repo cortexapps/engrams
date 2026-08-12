@@ -267,7 +267,7 @@ async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
     let (tx, mut rx) = mpsc::unbounded_channel::<RecordedPublish>();
     let app = Router::new()
         .route(
-            "/api/v1/hosts/:host_id/live-manifest",
+            "/api/v1/hosts/{host_id}/live-manifest",
             post(live_manifest_handler),
         )
         .with_state(tx);
@@ -747,7 +747,7 @@ async fn sigterm_overrun_aborts_inflight_flush_so_the_spool_stamp_cannot_go_stal
     let (tx, mut rx) = mpsc::unbounded_channel::<RecordedPublish>();
     let app = Router::new()
         .route(
-            "/api/v1/hosts/:host_id/live-manifest",
+            "/api/v1/hosts/{host_id}/live-manifest",
             post(live_manifest_handler),
         )
         .with_state(tx);
