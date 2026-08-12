@@ -13,6 +13,12 @@ export interface CreateCheckpointOptions {
   reason: string;
   label: string;
   authorUserId?: string | null;
+  /**
+   * A caller-minted id. The insert then keeps the first writer's row and the
+   * call returns it, so a replayed step cuts one checkpoint, not two — the
+   * publish pin depends on this (ADR 0114 D10).
+   */
+  id?: string;
 }
 
 export interface SpecCheckpointRecord extends SpecDocumentCheckpoint {}
@@ -47,7 +53,7 @@ export class SpecCheckpointService {
   ): Promise<SpecCheckpointRecord> {
     const compacted = await this.documents.compact(specId);
     const checkpoint: SpecCheckpointRecord = {
-      id: randomUUID(),
+      id: options.id ?? randomUUID(),
       specId,
       state: compacted.state,
       stateVector: compacted.stateVector,
@@ -59,6 +65,10 @@ export class SpecCheckpointService {
       createdAt: new Date(),
     };
     await this.store.insertCheckpoint(checkpoint);
+    if (options.id) {
+      const stored = await this.store.readCheckpoint(specId, options.id);
+      if (stored) return stored;
+    }
     return checkpoint;
   }
 
@@ -131,7 +141,8 @@ export class PostgresSpecCheckpointStore implements SpecCheckpointStore {
       `INSERT INTO spec_checkpoint
          (id, spec_id, state, state_vector, rendered_markdown, doc_seq,
           label, author_user_id, reason, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (id) DO NOTHING`,
       [
         checkpoint.id,
         checkpoint.specId,

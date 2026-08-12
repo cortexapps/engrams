@@ -348,7 +348,8 @@ export class PostgresCanonicalSpecRenderer implements CanonicalSpecRenderer {
 
 export interface ProjectionGuestClient extends SessionFileClient, DurableExecClient {}
 
-async function writeGuestFile(
+/** Stage one read-only file in the guest. The publish path reuses it. */
+export async function writeGuestFile(
   client: SessionFileClient,
   sessionId: string,
   path: string,

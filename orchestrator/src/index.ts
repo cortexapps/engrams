@@ -112,6 +112,16 @@ import { makeUserSecretStore } from "./db/user-secrets.ts";
 import { productionSpecProjection } from "./specs/projection.ts";
 import { PostgresSpecCheckpointStore, SpecCheckpointService } from "./specs/checkpoints.ts";
 import { GapCheckService, PostgresGapCheckStore } from "./specs/gap-check.ts";
+import { PostgresSpecPublishStore, SpecPublishService } from "./specs/publish.ts";
+import {
+  productionSpecPublishArtifactPublisher,
+  productionSpecTicketizeHandoff,
+} from "./specs/publish-artifact.ts";
+import {
+  DEFAULT_SPEC_PUBLISH_SCANNER_CONFIG,
+  SpecPublishScanner,
+} from "./specs/publish-scanner.ts";
+import { makeSpecPublishRoute } from "./routes/spec-publish.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
@@ -151,6 +161,26 @@ const specGapCheck = new GapCheckService({
 const specParticipants = new PostgresSpecParticipantStore(getDb());
 const specCheckpointStore = new PostgresSpecCheckpointStore(getPool());
 const specCheckpoints = new SpecCheckpointService(specDocuments, specCheckpointStore);
+// The publish gate (ADR 0114 D10). The route records the intent; the scanner
+// pins the checkpoint, records the artifact version, and starts ticketize.
+const specPublishStore = new PostgresSpecPublishStore(getPool());
+const specPublish = new SpecPublishService({
+  store: specPublishStore,
+  railStore: specRailStore,
+  documents: specDocuments,
+  gapCheck: specGapCheck,
+  now: specNow,
+});
+const specPublishScanner = new SpecPublishScanner({
+  store: specPublishStore,
+  checkpoints: specCheckpoints,
+  checkpointStore: specCheckpointStore,
+  artifacts: productionSpecPublishArtifactPublisher(),
+  ticketize: productionSpecTicketizeHandoff(),
+  config: DEFAULT_SPEC_PUBLISH_SCANNER_CONFIG,
+  now: specNow,
+  log: log.child({ component: "spec-publish-scanner" }),
+});
 const warnSpecSync = (message: string) => log.warn({ message }, "spec sync warning");
 const specAwarenessBus = new PostgresSpecAwarenessBus(getPool(), { onWarning: warnSpecSync });
 const specSyncHub = new SpecSyncHub({
@@ -263,6 +293,14 @@ app.route(
   "/",
   makeSpecGapCheckRoute({
     gapCheck: specGapCheck,
+    resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecPublishRoute({
+    publish: specPublish,
+    wake: (specId) => specPublishScanner.wake(specId),
     resolveMembership: resolveSpecMembership,
   }),
 );
@@ -502,6 +540,7 @@ const targetHydrator = new TargetHydrator({
 await targetHydrator.start();
 await specDocuments.startPeerSync();
 await specSyncHub.start();
+await specPublishScanner.start();
 const listenerManager = makeProductionListenerManager();
 await listenerManager.start();
 const automationScheduler = makeProductionAutomationScheduler();
@@ -526,6 +565,7 @@ process.on("SIGTERM", () => {
     oidcKeyRotation.stop();
     await automationScheduler.stop();
     await listenerManager.stop();
+    await specPublishScanner.stop();
     await specSyncHub.stop();
     await specDocuments.stopPeerSync();
     const serverError = await serverStopped;
