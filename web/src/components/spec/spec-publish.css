@@ -1,0 +1,224 @@
+/* The publish gate (mock 2k).
+
+   Two rules carry the surface. The primary is the readiness signal, so it is
+   quiet while the gate blocks and filled only when the gate would pass. And an
+   open-question publish is amber, never red: red is reserved for destructive,
+   and publishing with open questions is deliberate, not dangerous. */
+
+.spec-publish-dialog {
+  --spec-publish-caution: var(--instrument-caution);
+  --spec-publish-caution-wash: color-mix(in oklab, var(--instrument-caution) 12%, var(--card));
+  max-width: 34rem;
+  gap: 0.9rem;
+}
+
+.spec-publish-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}
+
+.spec-publish-eyebrow svg {
+  width: 0.85rem;
+  height: 0.85rem;
+}
+
+.spec-publish-amber .spec-publish-eyebrow {
+  color: var(--spec-publish-caution);
+}
+
+.spec-publish-amber {
+  border-left: 2px solid var(--spec-publish-caution);
+  padding-left: 0.7rem;
+  margin-left: -0.7rem;
+}
+
+/* ---------------------------------------------------------------- blockers */
+
+.spec-publish-blockers,
+.spec-publish-questions,
+.spec-publish-steps {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.spec-publish-blockers li {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  padding: 0.5rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+.spec-publish-blocker-copy {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.spec-publish-blocker-copy svg {
+  width: 0.9rem;
+  height: 0.9rem;
+  color: var(--muted-foreground);
+  flex-shrink: 0;
+}
+
+.spec-publish-blocker-copy span {
+  color: var(--muted-foreground);
+}
+
+.spec-publish-blockers li > button {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+/* --------------------------------------------------------------- questions */
+
+.spec-publish-questions li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.spec-publish-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.15rem;
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--spec-publish-caution);
+}
+
+.spec-publish-flag svg {
+  width: 0.75rem;
+  height: 0.75rem;
+}
+
+.spec-publish-backlink {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--muted-foreground);
+}
+
+.spec-publish-ack {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  border: 1px solid var(--spec-publish-caution);
+  border-radius: var(--radius);
+  background: var(--spec-publish-caution-wash);
+  padding: 0.6rem 0.75rem;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  cursor: pointer;
+}
+
+.spec-publish-ack input {
+  margin-top: 0.2rem;
+  accent-color: var(--spec-publish-caution);
+}
+
+/* ------------------------------------------------------------------- steps */
+
+.spec-publish-steps li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--muted-foreground);
+}
+
+.spec-publish-steps li.is-done {
+  color: var(--foreground);
+}
+
+.spec-publish-steps li.is-active {
+  color: var(--foreground);
+  font-weight: 500;
+}
+
+.spec-publish-steps li > span {
+  font-family: var(--font-mono);
+  width: 1rem;
+}
+
+/* ------------------------------------------------------------------ footer */
+
+.spec-publish-footer {
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+/* The one-way statement takes its own line: squeezed between the buttons it
+   wraps to three lines and reads as decoration rather than as the warning. */
+.spec-publish-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-basis: 100%;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--muted-foreground);
+}
+
+.spec-publish-footer > button:nth-of-type(1) {
+  margin-left: auto;
+}
+
+.spec-publish-meta svg {
+  width: 0.8rem;
+  height: 0.8rem;
+}
+
+.spec-publish-note {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  color: var(--muted-foreground);
+  margin: 0;
+}
+
+.spec-publish-error {
+  font-size: 0.8rem;
+  color: var(--destructive);
+  margin: 0;
+}
+
+/* The pin refused an earlier attempt. Amber: nothing was published, and the
+   person decides what happens next. */
+.spec-publish-refused {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+  border-left: 2px solid var(--spec-publish-caution);
+  padding-left: 0.6rem;
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--muted-foreground);
+}
+
+.spec-publish-refused svg {
+  width: 0.9rem;
+  height: 0.9rem;
+  flex-shrink: 0;
+  margin-top: 0.15rem;
+  color: var(--spec-publish-caution);
+}

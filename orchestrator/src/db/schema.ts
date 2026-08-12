@@ -531,6 +531,70 @@ export const specGapCheckFinding = pgTable(
 /** What a person did with a finding. `pending` means nobody has acted yet. */
 export type GapFindingDisposition = "pending" | "question_opened" | "diff_accepted" | "dismissed";
 
+/**
+ * The publish lifecycle of one spec (ADR 0114 D10, R36).
+ *
+ * The states run forward only:
+ *
+ *   requested → pinned → artifact_published → complete
+ *              ↘ blocked
+ *
+ * `requested` records the intent, and a scanner drives every later step
+ * (ADR 0034). The checkpoint id and the artifact id are minted with the
+ * request, so a replayed step reuses them and the publish stays exactly-once.
+ *
+ * `blocked` is the one edge that does not go forward: the pin re-checks the
+ * gate against the revision it is about to pin, and a document that moved out
+ * of the gate lands here with the reason in `last_error`. Nothing was pinned,
+ * so the owner settles the section and publishes again. It is terminal until
+ * they do, because a publish must be a deliberate act on the pinned content.
+ */
+export type SpecPublishState =
+  | "requested"
+  | "pinned"
+  | "artifact_published"
+  | "complete"
+  | "blocked";
+
+/**
+ * One publish per spec. The primary key is the spec id because v1 has no
+ * unpublish and no revise (R38): rework is a new spec.
+ */
+export const specPublish = pgTable(
+  "spec_publish",
+  {
+    specId: uuid("spec_id")
+      .primaryKey()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    /** The drafting session, which carries the artifact bytes and the hand-off. */
+    sessionId: uuid("session_id").notNull(),
+    /** Minted with the request, so the pin inserts one checkpoint under replay. */
+    checkpointId: uuid("checkpoint_id").notNull(),
+    /** Minted with the request, so the artifact leg creates one artifact. */
+    artifactId: text("artifact_id").notNull(),
+    artifactVersion: integer("artifact_version"),
+    state: text("state").$type<SpecPublishState>().notNull(),
+    /** The approver identity, stamped from day one (R37, ADR 0114 D12). */
+    requestedBy: text("requested_by").references(() => user.id, { onDelete: "set null" }),
+    requestedAt: timestamp("requested_at", { withTimezone: true }).notNull(),
+    /** What the person acknowledged carrying into the tickets (R35). */
+    acknowledgedQuestionCount: integer("acknowledged_question_count").notNull().default(0),
+    acknowledgedQuestionIds: jsonb("acknowledged_question_ids").$type<string[]>().notNull(),
+    gapCheckRunId: uuid("gap_check_run_id"),
+    attempts: integer("attempts").notNull().default(0),
+    /** The scanner's claim and its backoff in one column. */
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull(),
+    lastError: text("last_error"),
+    pinnedAt: timestamp("pinned_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (t) => [
+    index("spec_publish_due_idx")
+      .on(t.nextAttemptAt)
+      .where(sql`${t.state} <> 'complete'`),
+  ],
+);
+
 // ---------------------------------------------------------------------------
 // Papercuts
 // ---------------------------------------------------------------------------
