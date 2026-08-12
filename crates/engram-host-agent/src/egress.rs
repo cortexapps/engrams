@@ -122,6 +122,7 @@ impl CoordCloudSqlConnector {
     ) -> std::io::Result<()> {
         let config: CloudSqlTunnelConfig = serde_json::from_str(&tunnel.config_json)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let mint_start = crate::time_source::metrics_now();
         let (api_token, login_token) = tokio::try_join!(
             self.token(
                 session_id,
@@ -134,6 +135,7 @@ impl CoordCloudSqlConnector {
                 CredentialPurpose::new("cloud_sql_login")
             ),
         )?;
+        let mint_ms = mint_start.elapsed().as_millis() as u64;
         // A private directory gives each relay its own socket namespace. A
         // bind-then-drop TCP reservation can be stolen by another session
         // before the child binds, which can cross-connect two tenants.
@@ -143,6 +145,7 @@ impl CoordCloudSqlConnector {
 
         let binary = std::env::var_os("ENGRAM_CLOUD_SQL_PROXY")
             .unwrap_or_else(|| "/usr/local/bin/cloud-sql-proxy".into());
+        let spawn_start = crate::time_source::metrics_now();
         let mut child = tokio::process::Command::new(binary)
             // `unix-socket-path` pins the listen directory. `--unix-socket`
             // would instead append the instance connection name, so a long
@@ -155,6 +158,14 @@ impl CoordCloudSqlConnector {
             ))
             .arg("--auto-iam-authn")
             .arg("--max-connections=1")
+            // `--lazy-refresh` disables cloudsqlconn's refresh-ahead cache.
+            // The refresh-ahead path judges every ephemeral cert against the
+            // login token's oauth2 `Expiry`, which a static `--login-token`
+            // leaves at the zero time — every cert reads as already expired,
+            // the cache churns refreshes, and its 30-second rate limiter
+            // blocks ~25% of dials for exactly 30s (issue #1201). The lazy
+            // cache has no limiter and refreshes inline on each dial.
+            .arg("--lazy-refresh")
             // Do not inherit host-agent credentials or deployment secrets.
             .env_clear()
             .env("CSQL_PROXY_TOKEN", api_token)
@@ -206,6 +217,8 @@ impl CoordCloudSqlConnector {
             ));
         };
 
+        let socket_wait_ms = spawn_start.elapsed().as_millis() as u64;
+
         downstream
             .write_all(b"HTTP/1.1 200 Connection Established\r\nEngram-Gateway: 1\r\n\r\n")
             .await?;
@@ -213,11 +226,16 @@ impl CoordCloudSqlConnector {
         if !initial_data.is_empty() {
             upstream.write_all(&initial_data).await?;
         }
+        // With `--lazy-refresh` the child binds its socket before any API
+        // call, so `socket_wait_ms` is pure spawn+bind; the first byte the
+        // guest relays then pays the ephemeral-cert fetch inline.
         tracing::info!(
             %session_id,
             tunnel_id = %tunnel.id,
             instance = %config.instance,
             database_user = %config.database_user,
+            mint_ms,
+            socket_wait_ms,
             "authorized session tunnel",
         );
         let relay_result = tokio::io::copy_bidirectional(downstream, &mut upstream).await;
