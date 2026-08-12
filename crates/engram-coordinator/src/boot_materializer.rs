@@ -327,6 +327,97 @@ pub(crate) async fn materialize_cold_boot(
     Ok(Some(spec))
 }
 
+/// ADR 0116 B2: everything a snapshot RESUME materializes — the agent
+/// spec and the per-sandbox egress policy. **Deliberately no mount
+/// field**: the eviction snapshot's `aux_bundles` pins re-anchor the
+/// `dyn` slots host-side (fc restore staging hard-checks them; "resumes
+/// never swap" — live guest processes hold fds into the pinned bundle),
+/// and the harness egress was merged into the persisted policy at
+/// create. Making those absences STRUCTURAL is the point: the pre-B2
+/// shape expressed them by positionally dropping tuple fields, which is
+/// how the cold-boot harness wedge survived review.
+pub(crate) struct ResumeMaterials {
+    pub agent: engram_core::types::sandbox::AgentSpec,
+    pub policy: engram_core::types::egress::SessionEgressPolicy,
+}
+
+/// ADR 0016 §A.1.7 / ADR 0116 B2: derive the resume-shape agent spec +
+/// egress policy for a session (moved verbatim from
+/// `api/snapshot.rs::resolve_resume_agent_and_policy`; the manifest +
+/// SecretBundle + env load once, reused for both).
+///
+/// The spec is **resume-shaped**: harness resolved with `prompt = None`.
+/// Prompt-less is load-bearing — the initial prompt rides the harness
+/// env, so a boot-shape respawn of an *exited* harness would re-inject
+/// it mid-conversation; the resume shape just `--resume`s the existing
+/// claude session and goes `Idle`.
+///
+/// Shared by `finish_resume_to_active` (a fresh post-restore sandbox)
+/// and the ADR 0034 Track A desync watchdog's in-place reattach (the
+/// session's existing LIVE sandbox). `None` when the manifest bundle
+/// can't load (dev-VM / process backend) — callers skip the agent
+/// attach, exactly as resume did before.
+pub(crate) async fn materialize_snapshot_resume(
+    state: &SharedState,
+    session: &Session,
+    sandbox_id: engram_core::SandboxId,
+) -> Option<ResumeMaterials> {
+    let id = session.id;
+    let (resume_bundle, resume_base_env) =
+        crate::api::sessions::resolve_session_env(state, session).await;
+    let b = resume_bundle.as_ref()?;
+    // Same split as create: agentd holds the durable session env (image env +
+    // secrets + session id); the harness gets the forge broker token as a
+    // per-spawn extra, from the PG-sealed row (ADR 0047) — same token across
+    // coord restarts and replicas.
+    let mut session_env = resume_base_env.clone();
+    session_env.insert("ENGRAM_SESSION_ID".into(), id.to_string());
+    // ADR 0062: the harness comes from the session's persisted selection
+    // (not the baked manifest).
+    let selected_harness = state
+        .services
+        .meta
+        .get_session_harness(id)
+        .await
+        .ok()
+        .flatten();
+    let resolved = crate::api::sessions::resolve_harness(
+        state,
+        selected_harness.as_deref(),
+        session.mode,
+        id,
+        session_env,
+        b.config.workdir.clone(),
+        // Resume: the mode was validated when its prompt was accepted.
+        None,
+    )
+    .await
+    .ok()
+    .flatten()?;
+    // Consumed BY NAME: only the agent spec. `resolved.mount` re-anchors
+    // host-side from the snapshot's aux_bundles; `resolved.egress` is
+    // already merged into the persisted policy (see [`ResumeMaterials`]).
+    let mut agent = resolved.agent;
+    crate::api::sessions::inject_harness_env(state, id, &mut agent.env).await;
+    // ADR 0073: stamp the CURRENT epoch (this runs after the flow's
+    // bind — minted for fresh-spawn resumes, unminted for live moves,
+    // where the surviving harness must keep validating).
+    agent.binding_epoch = state
+        .services
+        .meta
+        .current_binding_epoch(id)
+        .await
+        .unwrap_or(0);
+    // Rebuild the SessionEgressPolicy for `sandbox_id`. Falls back to the
+    // legacy placeholder when the host has no guest IP (process backend, VZ in
+    // some configs) or the IP is unparseable — same as the create path.
+    let policy =
+        crate::api::sessions::build_resume_egress_policy(state, id, sandbox_id, &session.image)
+            .await
+            .unwrap_or_else(|| crate::api::snapshot::placeholder_egress_policy(id, sandbox_id));
+    Some(ResumeMaterials { agent, policy })
+}
+
 /// The placement-budget slice of the cold-boot shape, for callers that
 /// need `(memory_mib, vcpus)` and nothing else (the resume verb's
 /// `ScheduleContext`, ADR 0078). Best-effort by contract: `None` on any
