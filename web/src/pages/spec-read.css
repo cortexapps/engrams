@@ -606,6 +606,77 @@
   font-weight: 650;
 }
 
+/*
+ * The folded rail (R51). Below the shared mobile breakpoint the rail is a bar:
+ * a tally and a flag count. The full rail lives in the sheet the bar opens.
+ */
+.spec-rail-fold {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 0.6rem;
+  border: 1px solid var(--spec-read-rule);
+  border-radius: var(--radius);
+  padding: 0.7rem 0.85rem;
+  background: var(--spec-read-sheet);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-align: left;
+}
+
+.spec-rail-fold svg {
+  width: 1rem;
+  height: 1rem;
+  color: var(--muted-foreground);
+}
+
+.spec-rail-fold-tally {
+  flex: 1;
+}
+
+.spec-rail-fold-flags {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  border-radius: 999px;
+  padding: 0.1rem 0.5rem;
+  background: color-mix(in oklab, var(--destructive) 12%, var(--card));
+}
+
+.spec-rail-fold-flags svg {
+  color: var(--destructive);
+}
+
+.spec-rail-fold-flags[data-empty="true"] {
+  background: var(--muted);
+}
+
+.spec-rail-fold-flags[data-empty="true"] svg {
+  color: var(--muted-foreground);
+}
+
+.spec-rail-sheet {
+  max-height: 80vh;
+  gap: 0;
+  padding: 1rem 0.75rem 0.75rem;
+}
+
+.spec-rail-sheet-title {
+  padding-bottom: 0.75rem;
+}
+
+.spec-rail-shell.is-folded {
+  position: static;
+  width: 100%;
+  min-height: 0;
+  max-height: none;
+  overflow-y: auto;
+}
+
+.spec-rail-shell.is-folded [data-slot="tabs-content"] {
+  max-height: none;
+}
+
 @media (max-width: 64rem) {
   .spec-read-layout {
     flex-direction: column;
