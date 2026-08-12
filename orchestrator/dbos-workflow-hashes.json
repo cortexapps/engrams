@@ -4,7 +4,7 @@
     "AutomationRunWorkflow": "5d6acd798dd18b9b6d5b362553d9b969",
     "PrReviewWorkflow": "095bfee24706adefa58e67d2dda939a5",
     "ReviewIngressWorkflow": "b93d9786e5eee857fe6445c4579e231d",
-    "SlackThreadWorkflow": "a7312006d7bcc3cf3f929438f477b821",
+    "SlackThreadWorkflow": "066799607907358e675bfb607c6f253c",
     "ToolExecWorkflow": "e66c370bf2411dca14208569ce5562a0"
   }
 }
