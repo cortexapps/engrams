@@ -1471,7 +1471,10 @@ async fn prepare_inner(
     )
     .await?
     {
-        Some((spec, mount, egress)) => (Some(spec), Some(mount), egress),
+        // The CREATE flavor consumes all three fields BY NAME (ADR 0116
+        // B2): the agent spec, the dyn_0 mount for the slot plan, and
+        // the egress to merge into the policy it persists.
+        Some(h) => (Some(h.agent), Some(h.mount), h.egress),
         None => (None, None, Default::default()),
     };
 
@@ -2003,14 +2006,7 @@ pub(crate) async fn resolve_harness(
     // the user's first prompt would vanish with a 200. Resume passes None: its
     // mode was validated when the prompt that carried it was accepted.
     harness_mode: Option<&str>,
-) -> Result<
-    Option<(
-        engram_core::types::sandbox::AgentSpec,
-        engram_core::types::sandbox::AuxRoDrive,
-        engram_core::types::harness::HarnessEgress,
-    )>,
-    ApiError,
-> {
+) -> Result<Option<ResolvedHarness>, ApiError> {
     if session_mode.is_dev_vm() {
         return Ok(None);
     }
@@ -2085,7 +2081,31 @@ pub(crate) async fn resolve_harness(
         session_env,
         host_ca_pem: None,
     };
-    Ok(Some((agent, mount, descriptor.egress)))
+    Ok(Some(ResolvedHarness {
+        agent,
+        mount,
+        egress: descriptor.egress,
+    }))
+}
+
+/// ADR 0116 B2: `resolve_harness`'s output, with NAMED fields so each
+/// boot flavor consumes exactly what it needs by name — positional
+/// tuple-dropping (`let (agent, _mount, _egress) = …`) is how the
+/// cold-boot harness wedge survived review, and it is retired.
+pub(crate) struct ResolvedHarness {
+    /// The spec the backend execs (argv points into `dyn_0`).
+    pub agent: engram_core::types::sandbox::AgentSpec,
+    /// The `dyn_0` catalog mount. Consumed by the CREATE flavor's slot
+    /// plan (and, via `resolve_harness_mount`, the cold-boot flavor).
+    /// A snapshot RESUME structurally has no use for it: the eviction
+    /// snapshot's `aux_bundles` pins re-anchor the slot host-side, and
+    /// the restore staging hard-checks them (fc restore: "resumes never
+    /// swap").
+    pub mount: engram_core::types::sandbox::AuxRoDrive,
+    /// The harness's declared egress. Merged into the session policy at
+    /// CREATE (ADR 0063 addendum) and persisted; a resume re-reads the
+    /// merged policy rather than re-merging.
+    pub egress: engram_core::types::harness::HarnessEgress,
 }
 
 /// Resolve a harness name to its `dyn_0` mount + the in-guest exec path the
