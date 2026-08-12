@@ -401,22 +401,6 @@ function requireAlternativesSection(document: ProseMirrorNode, sectionId: string
   }
 }
 
-/** The document's alternatives section, or null when the template has none. */
-export function findAlternativesSectionId(document: ProseMirrorNode): string | null {
-  let found: string | null = null;
-  document.forEach((section) => {
-    if (
-      found === null &&
-      section.type === schema.nodes.section &&
-      section.attrs.templateSectionKey === SPEC_ALTERNATIVES_SECTION_KEY &&
-      typeof section.attrs.id === "string"
-    ) {
-      found = section.attrs.id;
-    }
-  });
-  return found;
-}
-
 function replacementSection(
   document: ProseMirrorNode,
   sectionId: string,
