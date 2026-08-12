@@ -155,6 +155,13 @@ async function setup() {
     questionStore,
     alternatives,
     metadata,
+    // The ticket tree is a post-publish concern (#1127); the alternatives stage
+    // never reaches it, so fail loudly rather than pretend a proposal landed.
+    tickets: {
+      propose: () => {
+        throw new Error("the alternatives tests never propose tickets");
+      },
+    },
     now: NOW,
   });
   return { alternatives, documents, metadata, sectionStore, service, store };
