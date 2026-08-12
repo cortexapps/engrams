@@ -21,6 +21,30 @@
   },
   "userCredential": {
     "oauth": {
+      "scopes": [
+        "chat:write",
+        "channels:read",
+        "channels:history",
+        "channels:write",
+        "groups:read",
+        "groups:history",
+        "im:read",
+        "im:history",
+        "mpim:read",
+        "users:read",
+        "users:read.email",
+        "files:read",
+        "files:write",
+        "reactions:read",
+        "reactions:write",
+        "pins:read",
+        "pins:write",
+        "bookmarks:read",
+        "bookmarks:write",
+        "usergroups:read",
+        "team:read",
+        "emoji:read"
+      ],
       "scopesParam": "user_scope",
       "grantPath": "authed_user",
       "metadata": {

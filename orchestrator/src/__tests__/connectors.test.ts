@@ -719,7 +719,7 @@ describe("on-disk registry", () => {
     expect(reg.get("linear")!.userCredential?.token?.hint).toContain("API key");
     // Slack's user flow mints a USER token: scopes ride `user_scope` and the
     // grant lives under `authed_user` (ADR 0115 amendment).
-    expect(reg.get("slack")!.userCredential).toEqual({
+    expect(reg.get("slack")!.userCredential).toMatchObject({
       oauth: {
         scopesParam: "user_scope",
         grantPath: "authed_user",
@@ -732,6 +732,18 @@ describe("on-disk registry", () => {
         },
       },
     });
+    // The user flow declares its OWN scope list: Slack validates user_scope
+    // names strictly, and one bot-only name fails the whole authorize page
+    // with "Invalid permissions requested". The bot-only pair must never
+    // ride the user flow; the user-token spelling of channel management is
+    // channels:write.
+    const slackUserOauth = reg.get("slack")!.userCredential!.oauth;
+    const userScopes = slackUserOauth === true ? [] : (slackUserOauth?.scopes ?? []);
+    expect(userScopes.length).toBeGreaterThan(0);
+    expect(userScopes).not.toContain("app_mentions:read");
+    expect(userScopes).not.toContain("channels:manage");
+    expect(userScopes).toContain("channels:write");
+    expect(userScopes).toContain("chat:write");
     expect(reg.get("sentry")!.userCredential?.token?.hint).toContain("User Auth Tokens");
     expect(reg.get("github")!.userCredential?.oauth).toBeUndefined();
     expect(reg.get("github")!.userCredential?.inject).toEqual({
