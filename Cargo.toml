@@ -245,7 +245,7 @@ filetime = "0.2"
 xattr = "1"
 # ADR 0055 P2: read user-uploaded .zip skill archives. Lean: deflate + store
 # only (no bzip2/zstd/aes), and extraction is budgeted against zip bombs.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 # ADR 0088 addendum rollout fix: the C-backed zstd. The prior pure-Rust
 # `ruzstd` was the enable pipeline's REAL flatten bottleneck for
 # zstd-layered images (dev-brain's 3.5 GB compressed layer decoded
