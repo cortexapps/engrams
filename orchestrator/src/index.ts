@@ -110,6 +110,11 @@ import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
 import { makeSpecGapCheckRoute } from "./routes/spec-gap-check.ts";
 import { makeSpecRailRoute, PostgresSpecRailStore } from "./routes/spec-rail.ts";
+import { makeSpecAlternativesRoute } from "./routes/spec-alternatives.ts";
+import {
+  PostgresSpecAlternativesStore,
+  SpecAlternativesService,
+} from "./specs/alternatives.ts";
 import { makeSpecBlockIterationRoute } from "./routes/spec-block-iteration.ts";
 import { makeSpecTemplatesRoute } from "./routes/spec-templates.ts";
 import { makeSpecTemplateCatalog } from "./specs/template-catalog.ts";
@@ -151,6 +156,11 @@ const specSectionStates = new SectionStateService({
   store: new PostgresSectionStateStore(getPool()),
   now: specNow,
 });
+const specAlternatives = new SpecAlternativesService({
+  store: new PostgresSpecAlternativesStore(getPool()),
+  documents: specDocuments,
+  now: specNow,
+});
 // The post-publish ticket tree (ADR 0114 D6). It reads the pinned checkpoint,
 // never the live head, so every §backlink stays resolvable.
 const specLinear = makeLinearIssueClient();
@@ -172,6 +182,7 @@ const specTicketSync = new SpecTicketSyncService({
 const specToolService = new SpecToolService({
   documents: specDocuments,
   sectionStates: specSectionStates,
+  alternatives: specAlternatives,
   questions: new OpenQuestionService({
     store: specOpenQuestions,
     document: new SpecQuestionDocument(specDocuments, "spec-agent-question"),
@@ -319,6 +330,13 @@ app.route(
     store: specRailStore,
     documents: specDocuments,
     sectionStates: specSectionStates,
+    resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecAlternativesRoute({
+    alternatives: specAlternatives,
     resolveMembership: resolveSpecMembership,
   }),
 );

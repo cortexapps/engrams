@@ -3,6 +3,7 @@ import type {
   RestoreSectionStateUndo,
   SectionState,
   SectionStateTranscriptChip,
+  SpecAlternativesStage,
 } from "@engrams/spec-document";
 
 import { specRequest } from "@/lib/spec-api";
@@ -176,6 +177,48 @@ export async function undoSpecSectionState(
       body: JSON.stringify({ actionId, undo }),
     },
   );
+}
+
+/** The alternatives stage in the canvas (ADR 0114 D6, requirement R20). */
+export function useSpecAlternatives(specId: string, enabled: boolean) {
+  return useQuery({
+    queryKey: ["spec", specId, "alternatives"],
+    queryFn: async () =>
+      (
+        await specRequest<{ stage: SpecAlternativesStage | null }>(
+          `/specs/${encodeURIComponent(specId)}/alternatives`,
+        )
+      ).stage,
+    enabled: enabled && specId.length > 0,
+    refetchInterval: DRAFT_REFETCH_INTERVAL_MS,
+    refetchIntervalInBackground: false,
+  });
+}
+
+export async function decideSpecAlternative(
+  specId: string,
+  input: { setId: string; optionKey: string | null; reason: string },
+): Promise<{ stage: SpecAlternativesStage; applied: boolean }> {
+  return specRequest(`/specs/${encodeURIComponent(specId)}/alternatives/decide`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export function useDecideSpecAlternative(specId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { setId: string; optionKey: string | null; reason: string }) =>
+      decideSpecAlternative(specId, input),
+    onSuccess: (result) => {
+      queryClient.setQueryData<SpecAlternativesStage>(
+        ["spec", specId, "alternatives"],
+        result.stage,
+      );
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["spec", specId] }),
+  });
 }
 
 export function useSetSpecSectionState(specId: string) {

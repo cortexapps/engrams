@@ -36,6 +36,11 @@ function documentService(
     addOpenQuestion: async (_specId, input) => mutation("addOpenQuestion", input),
     resolveOpenQuestion: async (_specId, input) => mutation("resolveOpenQuestion", input),
     updateBlock: async (_specId, input) => mutation("updateBlock", input),
+    proposeAlternatives: async (_specId, input) => ({
+      ...(await mutation("proposeAlternatives", input)),
+      setId: "set-1",
+    }),
+    decideAlternative: async (_specId, input) => mutation("decideAlternative", input),
     updateNotes: async (_specId, input) => mutation("updateNotes", input),
     proposeTickets: async (_specId, input) => mutation("proposeTickets", input),
   };
@@ -152,6 +157,8 @@ describe("spec tools", () => {
       "spec_add_open_question",
       "spec_resolve_open_question",
       "spec_update_block",
+      "spec_propose_alternatives",
+      "spec_decide_alternative",
       "spec_update_notes",
       "spec_propose_tickets",
       "spec_gap_check",
@@ -454,6 +461,43 @@ describe("spec tools", () => {
       (entry) => entry.name === "spec_set_section_state",
     );
     expect(JSON.stringify(manifest?.inputSchema)).not.toContain('"anyOf"');
+  });
+
+  test("the alternatives tools advertise only the guards they honour", () => {
+    const registry = createToolRegistry();
+    registerSpecTools(registry, recorder().deps);
+    const propose = registry.get("spec_propose_alternatives");
+    const decide = registry.get("spec_decide_alternative");
+    if (propose === undefined || decide === undefined) {
+      throw new Error("the alternatives tools are not registered");
+    }
+
+    // A proposal writes no document, so it takes no revision guard.
+    const manifest = compileToolManifest(registry, undefined, "spec");
+    const proposeSchema = manifest.find((entry) => entry.name === "spec_propose_alternatives");
+    expect(JSON.stringify(proposeSchema?.inputSchema)).not.toContain("expected_rev");
+    const decideSchema = manifest.find((entry) => entry.name === "spec_decide_alternative");
+    expect(JSON.stringify(decideSchema?.inputSchema)).toContain("expected_rev");
+
+    expect(() =>
+      decide.input.parse({ set_id: "set-1", option_key: "B", reason: "x".repeat(4_001) }),
+    ).toThrow();
+  });
+
+  test("spec_decide_alternative reports a replayed pick as not applied", async () => {
+    const state = recorder({ applied: false, newRev: 8n, concurrentEditors: [] });
+    const result = await call(state.deps, "spec_decide_alternative", {
+      set_id: "set-1",
+      option_key: "B",
+      reason: "One code path.",
+      expected_rev: "8",
+    });
+
+    expect(result).toMatchObject({ applied: false, new_rev: "8" });
+    expect(state.mutations[0]).toMatchObject({
+      name: "decideAlternative",
+      input: { setId: "set-1", optionKey: "B", expectedRev: 8n },
+    });
   });
 
   test("spec_gap_check reports the stop layer and summarises the matrix", async () => {

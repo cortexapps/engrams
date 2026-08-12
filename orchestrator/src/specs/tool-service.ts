@@ -13,6 +13,9 @@ import {
   schema,
   selectionSliceFingerprint,
   serializeSectionRelativeAnchor,
+  SPEC_ALTERNATIVES_SECTION_KEY,
+  type SpecAlternativeOption,
+  type SpecAlternativesComparison,
   type SpecSelectionSpan,
   type TrackedEditTranscriptChip,
 } from "@engrams/spec-document";
@@ -21,13 +24,16 @@ import { Transform } from "prosemirror-transform";
 import type { Pool } from "pg";
 import type * as Y from "yjs";
 
-import type { SpecTemplateSection } from "../db/schema.ts";
+import type { SpecTemplateSection, SpecTemplateStageFlags } from "../db/schema.ts";
 import type {
   LiveSpecRead,
+  SpecAlternativesProposalResult,
   SpecMutationContext,
+  SpecProposalContext,
   SpecMutationResult,
   SpecToolDocumentService,
 } from "../tools/specs.ts";
+import type { SpecAlternativesService } from "./alternatives.ts";
 import {
   proseMirrorDocument,
   SpecDocumentRevisionConflictError,
@@ -49,12 +55,17 @@ const BLOCK_CHECKPOINT_NAMESPACE = "21b9e56c-54b5-5f8f-a650-320e68aa50d6";
 
 export interface SpecToolMetadataStore {
   templateSections(specId: string): Promise<readonly SpecTemplateSection[]>;
+  templateStageFlags(specId: string): Promise<SpecTemplateStageFlags>;
   sectionStates(specId: string): Promise<ReadonlyMap<string, SectionStateValue>>;
   concurrentEditorNames(specId: string, actorUserId?: string): Promise<string[]>;
 }
 
 interface TemplateSectionsRow {
   sections: SpecTemplateSection[];
+}
+
+interface TemplateStageFlagsRow {
+  stage_flags: SpecTemplateStageFlags;
 }
 
 interface SectionStateRow {
@@ -84,6 +95,19 @@ export class PostgresSpecToolMetadataStore implements SpecToolMetadataStore {
     const row = result.rows[0];
     if (!row) throw new Error(`Unknown spec: ${specId}`);
     return row.sections;
+  }
+
+  async templateStageFlags(specId: string): Promise<SpecTemplateStageFlags> {
+    const result = await this.pool.query<TemplateStageFlagsRow>(
+      `SELECT t.stage_flags
+         FROM spec s
+         JOIN spec_template t ON t.id = s.template_id
+        WHERE s.id = $1`,
+      [specId],
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error(`Unknown spec: ${specId}`);
+    return row.stage_flags;
   }
 
   async sectionStates(specId: string): Promise<ReadonlyMap<string, SectionStateValue>> {
@@ -119,10 +143,19 @@ export interface SpecToolServiceOptions {
   sectionStates: SectionStateService;
   questions: OpenQuestionService;
   questionStore: OpenQuestionStore;
+  alternatives: SpecAlternativesService;
   metadata: SpecToolMetadataStore;
   /** The post-publish ticket tree, which reads the pinned spec (#1127). */
   tickets: Pick<SpecTicketTreeService, "propose">;
   now: () => Date;
+}
+
+/** The template runs the alternatives stage and the pick has not landed. */
+export class SpecAlternativesStageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SpecAlternativesStageError";
+  }
 }
 
 interface LocatedDiagramBlock {
@@ -167,6 +200,7 @@ export class SpecToolService implements SpecToolDocumentService {
       return this.result(specId, input, false, loaded.semanticDocSeq);
     }
     const currentDocument = proseMirrorDocument(loaded.doc);
+    await this.assertAlternativesStageClear(specId, currentDocument, input.sectionId);
     const desired = replaceSection(
       currentDocument,
       input.sectionId,
@@ -460,6 +494,89 @@ export class SpecToolService implements SpecToolDocumentService {
     } catch (error) {
       return this.revisionConflict(specId, input, error);
     }
+  }
+
+  async proposeAlternatives(
+    specId: string,
+    input: SpecProposalContext & {
+      sectionId: string;
+      options: SpecAlternativeOption[];
+      comparison: SpecAlternativesComparison;
+      leanKey: string | null;
+    },
+  ): Promise<SpecAlternativesProposalResult> {
+    const chip = await this.options.alternatives.propose({
+      specId,
+      sectionId: input.sectionId,
+      // A proposal writes no document, so the set is deduplicated by the call
+      // that made it rather than by a document revision.
+      actionId: `${input.sessionId}:${input.toolCallId}`,
+      options: input.options,
+      comparison: input.comparison,
+      leanKey: input.leanKey,
+    });
+    const latest = await this.options.documents.syncFromLog(specId);
+    return {
+      ...(await this.result(specId, input, true, latest.semanticDocSeq)),
+      setId: chip.setId,
+    };
+  }
+
+  async decideAlternative(
+    specId: string,
+    input: SpecMutationContext & { setId: string; optionKey: string | null; reason: string },
+  ): Promise<SpecMutationResult> {
+    const decision = await this.options.alternatives.decide({
+      specId,
+      setId: input.setId,
+      optionKey: input.optionKey,
+      reason: input.reason,
+      decidedBy: "agent",
+      ...(input.expectedRev === undefined ? {} : { expectedRev: input.expectedRev }),
+    });
+    return this.result(specId, input, decision.applied, decision.newRev);
+  }
+
+  /**
+   * Deep Layer-3 drafting waits for the pick when the template runs the
+   * alternatives stage (R20). The alternatives section itself stays writable,
+   * and a confirmed or n/a alternatives section releases the rest of the layer
+   * for a spec that settled the question by hand.
+   */
+  private async assertAlternativesStageClear(
+    specId: string,
+    document: ProseMirrorNode,
+    sectionId: string,
+  ): Promise<void> {
+    const flags = await this.options.metadata.templateStageFlags(specId);
+    if (flags.alternatives !== "on") return;
+    const templateSections = await this.options.metadata.templateSections(specId);
+    const alternativesRule = templateSections.find(
+      (candidate) => candidate.key === SPEC_ALTERNATIVES_SECTION_KEY,
+    );
+    if (!alternativesRule) return;
+    const sections = documentSections(document);
+    const target = sections.find((candidate) => candidate.id === sectionId);
+    if (!target || target.key === SPEC_ALTERNATIVES_SECTION_KEY) return;
+    const targetRule = templateSections.find((candidate) => candidate.key === target.key);
+    if (!targetRule || targetRule.layerKey !== alternativesRule.layerKey) return;
+    const alternativesSection = sections.find(
+      (candidate) => candidate.key === SPEC_ALTERNATIVES_SECTION_KEY,
+    );
+    if (!alternativesSection) return;
+    const states = await this.options.metadata.sectionStates(specId);
+    const state = states.get(alternativesSection.id)?.state;
+    if (state === "confirmed" || state === "n/a") return;
+    const stage = await this.options.alternatives.readStage(specId);
+    // Only a decision on the real alternatives section releases the layer. A
+    // set bound elsewhere must never unblock the gate it bypassed.
+    if (stage?.decision && stage.decision.sectionId === alternativesSection.id) return;
+    const proposed = stage?.proposal.sectionId === alternativesSection.id;
+    throw new SpecAlternativesStageError(
+      proposed
+        ? `${target.title} waits for the alternatives pick. Ask the author to pick a card, then call spec_decide_alternative.`
+        : `${target.title} waits for the alternatives stage. Call spec_propose_alternatives for ${alternativesSection.title} first.`,
+    );
   }
 
   async updateNotes(

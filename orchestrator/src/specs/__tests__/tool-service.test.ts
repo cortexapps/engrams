@@ -16,38 +16,25 @@ import {
 } from "@engrams/spec-document";
 import { Transform } from "prosemirror-transform";
 
-import type { SpecTemplateSection } from "../../db/schema.ts";
+import {
+  DEFAULT_SPEC_TEMPLATE_STAGE_FLAGS,
+  type SpecTemplateSection,
+  type SpecTemplateStageFlags,
+} from "../../db/schema.ts";
+import { SpecAlternativesService } from "../alternatives.ts";
+import { MemoryDocumentStore } from "./memory-document-store.ts";
+import { MemoryQuestionStore, MemorySectionStore } from "./memory-spec-stores.ts";
+import { MemoryAlternativesStore } from "./memory-alternatives-store.ts";
 import {
   encodeProseMirrorDocument,
   proseMirrorDocument,
   SPEC_MAX_SIZE_BYTES,
   SpecDocumentService,
-  type CompactSnapshotInput,
-  type SpecDocumentCheckpoint,
-  type SpecDocumentStore,
   type LoadedSpecDocument,
-  type SpecTrackedEditActionInput,
-  type SpecTrackedEditActionRecord,
-  type SpecSnapshotRecord,
-  type SpecUpdateEffects,
-  type SpecUpdateInsertResult,
-  type SpecUpdateRecord,
 } from "../doc-service.ts";
-import {
-  OpenQuestionService,
-  type CreateOpenQuestionInput,
-  type OpenQuestionRecord,
-  type OpenQuestionStore,
-  type ResolveOpenQuestionInput,
-} from "../open-questions.ts";
+import { OpenQuestionService } from "../open-questions.ts";
 import { SpecQuestionDocument } from "../question-document.ts";
-import {
-  SectionStateService,
-  type PersistSectionStateActionInput,
-  type PersistSectionStateActionResult,
-  type SectionStateStore,
-  type SectionStateTranscriptAction,
-} from "../section-state-service.ts";
+import { SectionStateService } from "../section-state-service.ts";
 import type { SectionStateValue } from "../section-state.ts";
 import type {
   ProposeTicketsInput,
@@ -87,182 +74,6 @@ const TEMPLATE_SECTIONS: SpecTemplateSection[] = [
   },
 ];
 
-class MemoryDocumentStore implements SpecDocumentStore {
-  seq = 0n;
-  semanticSeq = 0n;
-  readonly updates: SpecUpdateRecord[] = [];
-  readonly clientIds: Array<string | null> = [];
-  readonly actions = new Map<string, SpecTrackedEditActionRecord>();
-  lastEffects: SpecUpdateEffects | null = null;
-  lastCheckpoint: SpecDocumentCheckpoint | null = null;
-
-  async readSnapshot(): Promise<SpecSnapshotRecord | null> {
-    return null;
-  }
-
-  async readUpdatesAfter(_specId: string, afterSeq: bigint): Promise<SpecUpdateRecord[]> {
-    return this.updates.filter((row) => row.seq > afterSeq);
-  }
-
-  async insertUpdateIfLatest(
-    _specId: string,
-    expectedSeq: bigint,
-    update: Uint8Array,
-    clientId: string | null,
-    effects: SpecUpdateEffects,
-    _participantEpoch?: bigint,
-    transcriptAction?: SpecTrackedEditActionInput & { createdAt: Date },
-  ): Promise<SpecUpdateInsertResult | null> {
-    if (expectedSeq !== this.seq) return null;
-    this.seq += 1n;
-    if (effects.semanticChanged) this.semanticSeq += 1n;
-    this.lastEffects = effects;
-    this.clientIds.push(clientId);
-    this.updates.push({
-      seq: this.seq,
-      semanticDocSeq: this.semanticSeq,
-      update: update.slice(),
-      clientId,
-    });
-    if (transcriptAction) {
-      const action: SpecTrackedEditActionRecord = {
-        ...transcriptAction,
-        result: {
-          applied: true,
-          newRev: this.semanticSeq,
-          concurrentEditors: transcriptAction.concurrentEditors,
-          transcriptChip: transcriptAction.chip,
-        },
-        deliveredAt: null,
-      };
-      this.actions.set(action.id, action);
-    }
-    return { seq: this.seq, semanticDocSeq: this.semanticSeq };
-  }
-
-  async readTrackedEditAction(actionId: string): Promise<SpecTrackedEditActionRecord | null> {
-    return this.actions.get(actionId) ?? null;
-  }
-
-  async insertCheckpointAndUpdateIfLatest(
-    specId: string,
-    expectedSeq: bigint,
-    checkpoint: SpecDocumentCheckpoint,
-    update: Uint8Array,
-    clientId: string | null,
-    effects: SpecUpdateEffects,
-  ): Promise<SpecUpdateInsertResult | null> {
-    const inserted = await this.insertUpdateIfLatest(
-      specId,
-      expectedSeq,
-      update,
-      clientId,
-      effects,
-    );
-    if (inserted) this.lastCheckpoint = checkpoint;
-    return inserted;
-  }
-
-  async notifyUpdate(): Promise<void> {}
-
-  async compactSnapshot(_input: CompactSnapshotInput): Promise<boolean> {
-    return false;
-  }
-
-  async listen(): Promise<() => Promise<void>> {
-    return async () => {};
-  }
-}
-
-class MemorySectionStore implements SectionStateStore {
-  readonly values = new Map<string, SectionStateValue>();
-  readonly actions = new Map<string, SectionStateTranscriptAction>();
-  docSeq = 1n;
-
-  async read(_specId: string, sectionId: string): Promise<SectionStateValue> {
-    return this.values.get(sectionId) ?? { state: "empty", naReason: null };
-  }
-
-  async readAction(actionId: string): Promise<SectionStateTranscriptAction | null> {
-    return this.actions.get(actionId) ?? null;
-  }
-
-  async persistStateAction(
-    input: PersistSectionStateActionInput,
-  ): Promise<PersistSectionStateActionResult> {
-    const existing = this.actions.get(input.actionId);
-    if (existing) return { status: "replayed", action: existing };
-    const current = await this.read(input.specId, input.sectionId);
-    if (
-      (input.expectedDocSeq !== undefined && input.expectedDocSeq !== this.docSeq) ||
-      current.state !== input.expected.state ||
-      current.naReason !== input.expected.naReason
-    ) {
-      return { status: "conflict" };
-    }
-    this.values.set(input.sectionId, input.next);
-    const action: SectionStateTranscriptAction = {
-      id: input.actionId,
-      specId: input.specId,
-      sectionId: input.sectionId,
-      requestFingerprint: input.requestFingerprint,
-      chip: input.chip,
-      createdAt: input.at,
-      deliveredAt: null,
-    };
-    this.actions.set(action.id, action);
-    return { status: "stored", action };
-  }
-
-  async listPendingActions(limit: number): Promise<SectionStateTranscriptAction[]> {
-    return [...this.actions.values()].filter((action) => !action.deliveredAt).slice(0, limit);
-  }
-
-  async markActionDelivered(actionId: string, deliveredAt: Date): Promise<boolean> {
-    const action = this.actions.get(actionId);
-    if (!action || action.deliveredAt) return false;
-    action.deliveredAt = deliveredAt;
-    return true;
-  }
-}
-
-class MemoryQuestionStore implements OpenQuestionStore {
-  readonly rows = new Map<string, OpenQuestionRecord>();
-
-  async find(id: string): Promise<OpenQuestionRecord | null> {
-    return this.rows.get(id) ?? null;
-  }
-
-  async countOpenBySection(): Promise<Record<string, number>> {
-    return {};
-  }
-
-  async create(input: CreateOpenQuestionInput): Promise<OpenQuestionRecord> {
-    const existing = this.rows.get(input.id);
-    if (existing) return existing;
-    const row: OpenQuestionRecord = {
-      ...input,
-      state: "open",
-      resolutionLink: null,
-      resolvedAt: null,
-    };
-    this.rows.set(row.id, row);
-    return row;
-  }
-
-  async resolve(input: ResolveOpenQuestionInput): Promise<boolean> {
-    const row = this.rows.get(input.id);
-    if (!row || row.state !== input.expectedState) return false;
-    this.rows.set(input.id, {
-      ...row,
-      state: "resolved",
-      resolutionLink: input.resolutionLink,
-      resolvedAt: input.resolvedAt,
-    });
-    return true;
-  }
-}
-
 class MemoryMetadata implements SpecToolMetadataStore {
   constructor(
     private readonly stateStore: MemorySectionStore,
@@ -275,6 +86,10 @@ class MemoryMetadata implements SpecToolMetadataStore {
 
   async templateSections(): Promise<readonly SpecTemplateSection[]> {
     return TEMPLATE_SECTIONS;
+  }
+
+  async templateStageFlags(): Promise<SpecTemplateStageFlags> {
+    return DEFAULT_SPEC_TEMPLATE_STAGE_FLAGS;
   }
 
   async sectionStates(): Promise<ReadonlyMap<string, SectionStateValue>> {
@@ -339,6 +154,11 @@ async function setup(
       now: () => new Date("2026-08-09T12:00:00.000Z"),
     }),
     questionStore,
+    alternatives: new SpecAlternativesService({
+      store: new MemoryAlternativesStore(),
+      documents,
+      now: () => new Date("2026-08-09T12:00:00.000Z"),
+    }),
     metadata: new MemoryMetadata(sectionStore),
     tickets,
     now: () => new Date("2026-08-09T12:00:00.000Z"),
