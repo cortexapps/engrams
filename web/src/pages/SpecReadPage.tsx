@@ -10,6 +10,7 @@ import {
   SectionStateTranscriptChip,
   type SpecSectionStateChipData,
 } from "@/components/spec/SectionStateTranscriptChip";
+import { SpecGapCheckPanel } from "@/components/spec/SpecGapCheckPanel";
 import { SpecSectionRail, type SpecRailAction } from "@/components/spec/SpecSectionRail";
 import { Markdown } from "@/components/Markdown";
 import { Badge } from "@/components/ui/badge";
@@ -62,6 +63,8 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   const [actionChip, setActionChip] = useState<SpecSectionStateChipData | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pendingSectionId, setPendingSectionId] = useState<string | null>(null);
+  // The gap check takes the document area when it is open (mock 2j).
+  const [gapCheckOpen, setGapCheckOpen] = useState(false);
   useDocumentTitle(read.data?.spec.title ?? "Tech spec");
 
   useEffect(() => {
@@ -139,13 +142,20 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
           </p>
           <LockedTemplate name={spec.template.name} />
         </div>
-        {spec.sessionId && (
-          <Button asChild variant="outline">
-            <Link to="/sessions/$id" params={{ id: spec.sessionId }}>
-              Open owner session
-            </Link>
-          </Button>
-        )}
+        <div className="spec-read-header-actions">
+          {!gapCheckOpen && (
+            <Button variant="outline" onClick={() => setGapCheckOpen(true)}>
+              Gap check
+            </Button>
+          )}
+          {spec.sessionId && (
+            <Button asChild variant="outline">
+              <Link to="/sessions/$id" params={{ id: spec.sessionId }}>
+                Open owner session
+              </Link>
+            </Button>
+          )}
+        </div>
       </header>
 
       <div className="spec-read-layout">
@@ -153,82 +163,92 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
           className="spec-read-document"
           aria-label={isDraft ? "Live spec" : "Published spec"}
         >
-          {isDraft && actionChip && (
-            <div className="spec-action-transcript" aria-label="Latest section action">
-              <SectionStateTranscriptChip
-                chip={actionChip}
-                undoPending={undoSectionState.isPending}
-                onUndo={(undo) => {
-                  setActionError(null);
-                  setPendingSectionId(undo.sectionId);
-                  undoSectionState.mutate(
-                    { sectionId: undo.sectionId, undo, actionId: crypto.randomUUID() },
-                    {
-                      onSuccess: ({ chip }) => setActionChip(chip),
-                      onError: (error) => setActionError(error.message),
-                      onSettled: () => setPendingSectionId(null),
-                    },
-                  );
-                }}
-              />
-            </div>
-          )}
-          {actionError && <p className="spec-action-error">{actionError}</p>}
-          {isDraft && (
-            <LazySpecCanvas
+          {gapCheckOpen ? (
+            <SpecGapCheckPanel
               specId={specId}
-              revision={spec.revision}
-              selectionActions={selectionActions}
+              editable={isDraft}
+              onBack={() => setGapCheckOpen(false)}
             />
-          )}
-          {!isDraft && (
-            <CheckpointContent
-              first={first.data}
-              second={second.data}
-              loading={first.isPending || second.isPending}
-            />
-          )}
-          {isDraft && effectiveIds.length > 0 && (
-            <div className="spec-history-preview">
-              <CheckpointContent
-                first={first.data}
-                second={second.data}
-                loading={first.isPending || second.isPending}
-              />
-              {effectiveIds.length === 1 && first.data && (
-                <RestoreControls
-                  key={first.data.id}
-                  checkpoint={first.data}
-                  pending={restore.isPending}
-                  onRestore={(sectionId) => {
-                    restore.mutate(
-                      { checkpointId: first.data!.id, sectionId },
-                      {
-                        onSuccess: ({ applied, checkpoint }) => {
-                          setRestoreNotice(
-                            applied && checkpoint
-                              ? `Restored the section. Saved “${checkpoint.label}” as a new checkpoint.`
-                              : "The section already matches this checkpoint. No changes were made.",
-                          );
-                          setSelectedIds([]);
+          ) : (
+            <>
+              {isDraft && actionChip && (
+                <div className="spec-action-transcript" aria-label="Latest section action">
+                  <SectionStateTranscriptChip
+                    chip={actionChip}
+                    undoPending={undoSectionState.isPending}
+                    onUndo={(undo) => {
+                      setActionError(null);
+                      setPendingSectionId(undo.sectionId);
+                      undoSectionState.mutate(
+                        { sectionId: undo.sectionId, undo, actionId: crypto.randomUUID() },
+                        {
+                          onSuccess: ({ chip }) => setActionChip(chip),
+                          onError: (error) => setActionError(error.message),
+                          onSettled: () => setPendingSectionId(null),
                         },
-                        onError: (error) => {
-                          if (errorStatus(error) === 409) {
-                            setRestoreNotice(
-                              "This spec was published before the restore finished. The published version is read-only.",
-                            );
-                            setSelectedIds([]);
-                            void read.refetch();
-                          }
-                        },
-                      },
-                    );
-                  }}
+                      );
+                    }}
+                  />
+                </div>
+              )}
+              {actionError && <p className="spec-action-error">{actionError}</p>}
+              {isDraft && (
+                <LazySpecCanvas
+                  specId={specId}
+                  revision={spec.revision}
+                  selectionActions={selectionActions}
                 />
               )}
-            </div>
+              {!isDraft && (
+                <CheckpointContent
+                  first={first.data}
+                  second={second.data}
+                  loading={first.isPending || second.isPending}
+                />
+              )}
+              {isDraft && effectiveIds.length > 0 && (
+                <div className="spec-history-preview">
+                  <CheckpointContent
+                    first={first.data}
+                    second={second.data}
+                    loading={first.isPending || second.isPending}
+                  />
+                  {effectiveIds.length === 1 && first.data && (
+                    <RestoreControls
+                      key={first.data.id}
+                      checkpoint={first.data}
+                      pending={restore.isPending}
+                      onRestore={(sectionId) => {
+                        restore.mutate(
+                          { checkpointId: first.data!.id, sectionId },
+                          {
+                            onSuccess: ({ applied, checkpoint }) => {
+                              setRestoreNotice(
+                                applied && checkpoint
+                                  ? `Restored the section. Saved “${checkpoint.label}” as a new checkpoint.`
+                                  : "The section already matches this checkpoint. No changes were made.",
+                              );
+                              setSelectedIds([]);
+                            },
+                            onError: (error) => {
+                              if (errorStatus(error) === 409) {
+                                setRestoreNotice(
+                                  "This spec was published before the restore finished. The published version is read-only.",
+                                );
+                                setSelectedIds([]);
+                                void read.refetch();
+                              }
+                            },
+                          },
+                        );
+                      }}
+                    />
+                  )}
+                </div>
+              )}
+              {restoreNotice && <p className="spec-restore-notice">{restoreNotice}</p>}
+            </>
           )}
-          {restoreNotice && <p className="spec-restore-notice">{restoreNotice}</p>}
         </section>
 
         <aside className="spec-rail-shell">
