@@ -954,7 +954,20 @@ pub(crate) fn resolve_recover_attach_ref(
     }
 }
 
-fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+// ADR 0116 C1: both local-file primitives run as BLOCKING syscalls on
+// the shared tokio runtime (deliberate — see the module's latency notes);
+// their latency histogram is the H1-vs-H2 discriminator when a capture
+// storm degrades serve latency. Success-path only: errors surface
+// through the callers' own accounting.
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+    let started = crate::time_source::metrics_now();
+    read_exact_at_inner(file, bytes, offset)?;
+    ::metrics::histogram!(crate::metrics::NBD_DIRTY_FILE_IO_SECONDS, "op" => "read")
+        .record(started.elapsed().as_secs_f64());
+    Ok(())
+}
+
+fn read_exact_at_inner(file: &File, mut bytes: &mut [u8], mut offset: u64) -> std::io::Result<()> {
     while !bytes.is_empty() {
         let read = file.read_at(bytes, offset)?;
         if read == 0 {
@@ -969,7 +982,15 @@ fn read_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> std::io:
     Ok(())
 }
 
-fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
+fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+    let started = crate::time_source::metrics_now();
+    write_all_at_inner(file, bytes, offset)?;
+    ::metrics::histogram!(crate::metrics::NBD_DIRTY_FILE_IO_SECONDS, "op" => "write")
+        .record(started.elapsed().as_secs_f64());
+    Ok(())
+}
+
+fn write_all_at_inner(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {
     while !bytes.is_empty() {
         let written = file.write_at(bytes, offset)?;
         if written == 0 {

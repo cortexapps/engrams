@@ -1441,7 +1441,11 @@ async fn serve_at(
 
     // 3. Spawn the tokio serve task on the server-side socket.
     let stream = TokioUnixStream::from_std(server_side)?;
-    let serve_task = tokio::spawn(serve_loop(backend, stream));
+    let serve_task = tokio::spawn(serve_loop(
+        backend,
+        stream,
+        nbd_device.display().to_string(),
+    ));
 
     Ok(NbdHandle {
         nbd_device: nbd_device.to_path_buf(),
@@ -1502,7 +1506,19 @@ fn unix_socketpair() -> io::Result<(OwnedFd, std::os::unix::net::UnixStream)> {
 /// the virtio→kernel-NBD→userspace pipeline) counts a request as
 /// in-flight until its bytes are on the wire. `ENGRAM_NBD_SERVE_CONCURRENCY=1`
 /// reproduces the legacy strictly-serial loop.
-async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
+async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream, device: String) {
+    // ADR 0116 C1: every exit path names its cause. Anything except
+    // `disconnect` leaves a configured device with no server — the
+    // kernel parks I/O for dead_conn_timeout, then fails the device
+    // permanently (the 2026-08-12 nbd98 shape). C2 supervises on this.
+    let exit = |reason: &'static str| {
+        ::metrics::counter!(
+            crate::metrics::NBD_SERVE_EXITS_TOTAL,
+            "reason" => reason,
+            "device" => device.clone(),
+        )
+        .increment(1);
+    };
     let in_flight = backend.in_flight_tracker();
     let concurrency = nbd_serve_concurrency();
     let sem = Arc::new(Semaphore::new(concurrency));
@@ -1512,7 +1528,7 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
     // unboundedly. Capacity = concurrency: every in-flight reply fits, so
     // a keeping-up kernel never blocks a handler on send.
     let (reply_tx, reply_rx) = mpsc::channel::<ReplyMsg>(concurrency.max(1));
-    let writer = tokio::spawn(writer_loop(write_half, reply_rx));
+    let writer = tokio::spawn(writer_loop(write_half, reply_rx, device.clone()));
 
     loop {
         let mut header = [0u8; REQUEST_HEADER_LEN];
@@ -1520,10 +1536,12 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 tracing::info!("NBD serve loop: kernel closed socket cleanly");
+                exit("eof");
                 break;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "NBD serve loop: read header failed");
+                exit("read_error");
                 break;
             }
         }
@@ -1531,6 +1549,7 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(error = %e, "NBD serve loop: malformed request header");
+                exit("parse_error");
                 break;
             }
         };
@@ -1538,6 +1557,7 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
         // Disconnect is a sentinel to end the loop, not a tracked op.
         if matches!(req.command, NbdCommand::Disconnect) {
             tracing::info!("NBD client requested disconnect");
+            exit("disconnect");
             break;
         }
 
@@ -1551,11 +1571,13 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
                     length = req.length,
                     "NBD serve loop: WRITE payload length exceeds request or disk bound"
                 );
+                exit("write_bound");
                 break;
             }
             let mut data = vec![0u8; req.length as usize];
             if let Err(e) = read_half.read_exact(&mut data).await {
                 tracing::warn!(error = %e, "NBD write payload read failed");
+                exit("payload_read_error");
                 break;
             }
             Some(data)
@@ -1698,20 +1720,40 @@ async fn handle_request(
 /// keeps the wire well-formed under concurrent handlers. Each message's
 /// guard+permit drop at the end of the iteration — AFTER the flush — so
 /// `wait_idle()` observes the request as in-flight until then.
-async fn writer_loop(mut write_half: OwnedWriteHalf, mut reply_rx: mpsc::Receiver<ReplyMsg>) {
+async fn writer_loop(
+    mut write_half: OwnedWriteHalf,
+    mut reply_rx: mpsc::Receiver<ReplyMsg>,
+    device: String,
+) {
     while let Some(msg) = reply_rx.recv().await {
         if let Err(e) = write_half.write_all(&msg.header).await {
             tracing::warn!(error = %e, "NBD reply header write failed");
+            // ADR 0116 C1: the 2026-08-12 signature — the kernel marked
+            // the sock dead (send-side timeout) and our write EPIPEs.
+            ::metrics::counter!(
+                crate::metrics::NBD_SERVE_EXITS_TOTAL,
+                "reason" => "reply_write_error",
+                "device" => device,
+            )
+            .increment(1);
             return;
         }
         if let Some(payload) = &msg.payload {
             if let Err(e) = write_half.write_all(payload).await {
                 tracing::warn!(error = %e, "NBD reply payload write failed");
+                ::metrics::counter!(
+                    crate::metrics::NBD_SERVE_EXITS_TOTAL,
+                    "reason" => "reply_write_error",
+                    "device" => device,
+                )
+                .increment(1);
                 return;
             }
         }
         // `msg` (guard + permit) drops here, after the reply is on the wire.
     }
+    // Clean end: serve_loop dropped the sender on its own (already
+    // counted) exit — not a distinct death.
 }
 
 #[cfg(test)]
@@ -1888,7 +1930,7 @@ mod tests {
         let backend = Arc::new(backend);
         let in_flight = backend.in_flight_tracker();
         let (client, server) = TokioUnixStream::pair().unwrap();
-        let serve = tokio::spawn(serve_loop(backend, server));
+        let serve = tokio::spawn(serve_loop(backend, server, "/dev/nbd-test".into()));
         let (mut rd, mut wr) = client.into_split();
 
         let cs = 4096u32;
@@ -1927,7 +1969,7 @@ mod tests {
         let (backend, _dir) = three_chunk_backend().await;
         let backend = Arc::new(backend);
         let (client, server) = TokioUnixStream::pair().unwrap();
-        let serve = tokio::spawn(serve_loop(backend, server));
+        let serve = tokio::spawn(serve_loop(backend, server, "/dev/nbd-test".into()));
         let (mut rd, mut wr) = client.into_split();
 
         // WRITE 4096 bytes of 0xff at offset 0 (NBD_CMD_WRITE = 1): header then
@@ -1956,7 +1998,7 @@ mod tests {
         let backend = Arc::new(backend);
         let assertion_backend = backend.clone();
         let (client, server) = TokioUnixStream::pair().unwrap();
-        let serve = tokio::spawn(serve_loop(backend, server));
+        let serve = tokio::spawn(serve_loop(backend, server, "/dev/nbd-test".into()));
         let (mut rd, mut wr) = client.into_split();
 
         wr.write_all(&req_bytes(1, 1, 0, u32::MAX)).await.unwrap();
