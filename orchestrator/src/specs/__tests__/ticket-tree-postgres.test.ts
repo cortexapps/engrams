@@ -330,6 +330,68 @@ describe("the ticket tree with live Postgres", () => {
     expect(rows.rows[0]?.count).toBe(2);
   });
 
+  test.skipIf(!reachable)("a retitle writes one row and leaves the rest untouched", async () => {
+    const proposed = await service().propose({
+      specId,
+      idempotencyKey: `retitle-${randomUUID()}`,
+      tickets: PROPOSAL,
+    });
+    const target = proposed.view.tickets[0]?.id ?? "";
+    const other = proposed.view.tickets[1]?.id ?? "";
+    const untouchedBefore = await rowVersion(other);
+
+    await service().updateTicket({ specId, id: target, title: "Add org quota columns + backfill" });
+
+    // `xmin` is the transaction that last wrote the row. A write proportional
+    // to the change cannot have touched a row the change did not name.
+    expect(await rowVersion(other)).toBe(untouchedBefore);
+    const titles = (await service().read(specId)).tickets.map((ticket) => ticket.title);
+    expect(titles[0]).toBe("Add org quota columns + backfill");
+  });
+
+  test.skipIf(!reachable)("folding a parent keeps the children the merge re-parented", async () => {
+    // `parent_id` cascades on delete, so a merge that removes a ticket whose
+    // children the survivor adopts is the case that must not lose them.
+    const proposed = await service().propose({
+      specId,
+      idempotencyKey: `cascade-${randomUUID()}`,
+      tickets: PROPOSAL,
+    });
+    const parent = proposed.view.tickets[0]?.id ?? "";
+    const child = proposed.view.tickets[1]?.id ?? "";
+    expect(await storedParent(child)).toBe(parent);
+
+    const added = await service().addTicket({
+      specId,
+      parentId: child,
+      title: "Backfill in batches",
+      description: "The batches.",
+      sectionId: "sec-data",
+    });
+    const grandchild = added.tickets.find((ticket) => ticket.title === "Backfill in batches")?.id;
+    if (grandchild === undefined) throw new Error("the added ticket is missing");
+
+    // Fold the middle ticket into the root. Its child must survive, under the
+    // survivor, rather than disappearing with its old parent.
+    const merged = await service().mergeTickets({ specId, targetId: parent, sourceIds: [child] });
+    expect(merged.tickets.map((ticket) => ticket.id)).not.toContain(child);
+    expect(merged.tickets.map((ticket) => ticket.id)).toContain(grandchild);
+    expect(await storedParent(grandchild)).toBe(parent);
+    const rows = await pool!.query<{ count: number }>(
+      "SELECT count(*)::int AS count FROM spec_ticket_draft WHERE spec_id = $1",
+      [specId],
+    );
+    expect(rows.rows[0]?.count).toBe(2);
+  });
+
+  async function rowVersion(id: string): Promise<string> {
+    const result = await pool!.query<{ version: string }>(
+      "SELECT xmin::text AS version FROM spec_ticket_draft WHERE id = $1",
+      [id],
+    );
+    return result.rows[0]?.version ?? "missing";
+  }
+
   async function storedParent(id: string): Promise<string | null> {
     const result = await pool!.query<{ parent_id: string | null }>(
       "SELECT parent_id FROM spec_ticket_draft WHERE id = $1",

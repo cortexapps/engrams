@@ -638,12 +638,19 @@ export class PostgresSpecTicketStore implements SpecTicketStore {
 }
 
 /**
- * Write the new tree over the old one.
+ * Write the new tree over the old one, in at most three statements.
  *
- * Parents are detached before the deletes, because `parent_id` cascades: a
- * delete of a ticket whose children the caller kept would otherwise take them
- * too. Ordinals go to a disjoint range first, so no intermediate state trips
- * a future uniqueness constraint on `(spec_id, parent_id, ordinal)`.
+ * Direct manipulation is the primary verb on this surface (R39), so the cost
+ * of a write is the cost of a retitle and of a drag. It is therefore
+ * proportional to what changed, not to the size of the tree: only the rows
+ * that actually differ are sent, and they go in one `unnest` upsert rather
+ * than one statement each.
+ *
+ * The one ordering rule is the cascade. `parent_id` is `ON DELETE CASCADE`, so
+ * a child the caller kept under a parent the caller deleted would go with it.
+ * Detaching those children first is what prevents that. Ordinals need no such
+ * care: the tree index is not unique, so an intermediate duplicate is not a
+ * state the database can refuse.
  */
 async function writeTree(
   client: PoolClient,
@@ -653,58 +660,83 @@ async function writeTree(
 ): Promise<void> {
   const keep = new Set(next.map((row) => row.id));
   const removed = current.filter((row) => !keep.has(row.id)).map((row) => row.id);
+  const before = new Map(current.map((row) => [row.id, row]));
+  const changed = next.filter((row) => !sameRow(before.get(row.id), row));
 
-  if (current.length > 0) {
-    await client.query(
-      `UPDATE spec_ticket_draft SET parent_id = NULL, ordinal = ordinal + $2
-        WHERE spec_id = $1`,
-      [specId, ORDINAL_PARK],
-    );
-  }
   if (removed.length > 0) {
+    const gone = new Set(removed);
+    const orphans = current
+      .filter((row) => keep.has(row.id) && row.parentId !== null && gone.has(row.parentId))
+      .map((row) => row.id);
+    if (orphans.length > 0) {
+      await client.query(
+        `UPDATE spec_ticket_draft SET parent_id = NULL
+          WHERE spec_id = $1 AND id = ANY($2::uuid[])`,
+        [specId, orphans],
+      );
+    }
     await client.query(`DELETE FROM spec_ticket_draft WHERE spec_id = $1 AND id = ANY($2::uuid[])`, [
       specId,
       removed,
     ]);
   }
-  for (const row of next) {
-    await client.query(
-      `INSERT INTO spec_ticket_draft
-         (id, spec_id, parent_id, ordinal, title, description, section_id,
-          depends_on, sync_state, linear_id, sync_error)
-       VALUES ($1, $2, NULL, $3 + ${ORDINAL_PARK}, $4, $5, $6, $7, $8, $9, $10)
-       ON CONFLICT (id) DO UPDATE SET
-         ordinal = EXCLUDED.ordinal,
-         title = EXCLUDED.title,
-         description = EXCLUDED.description,
-         section_id = EXCLUDED.section_id,
-         depends_on = EXCLUDED.depends_on,
-         sync_state = EXCLUDED.sync_state,
-         linear_id = EXCLUDED.linear_id,
-         sync_error = EXCLUDED.sync_error`,
-      [
-        row.id,
-        specId,
-        row.ordinal,
-        row.title,
-        row.description,
-        row.sectionId,
-        JSON.stringify(row.dependsOn),
-        row.syncState,
-        row.linearId,
-        row.syncError,
-      ],
-    );
-  }
-  // Every row exists now, so the parent links can be restored in one pass.
-  for (const row of next) {
-    await client.query(`UPDATE spec_ticket_draft SET parent_id = $2, ordinal = $3 WHERE id = $1`, [
-      row.id,
-      row.parentId,
-      row.ordinal,
-    ]);
-  }
+
+  if (changed.length === 0) return;
+  // One statement for every changed row. The self-referencing key is checked
+  // at the end of the statement, so a new child and its new parent may arrive
+  // together and in any order.
+  await client.query(
+    `INSERT INTO spec_ticket_draft
+       (id, spec_id, parent_id, ordinal, title, description, section_id,
+        depends_on, sync_state, linear_id, sync_error)
+     SELECT r.id, $1, r.parent_id, r.ordinal, r.title, r.description, r.section_id,
+            r.depends_on::jsonb, r.sync_state, r.linear_id, r.sync_error
+       FROM unnest($2::uuid[], $3::uuid[], $4::integer[], $5::text[], $6::text[],
+                   $7::text[], $8::text[], $9::text[], $10::text[], $11::text[])
+         AS r(id, parent_id, ordinal, title, description, section_id,
+              depends_on, sync_state, linear_id, sync_error)
+     ON CONFLICT (id) DO UPDATE SET
+       parent_id = EXCLUDED.parent_id,
+       ordinal = EXCLUDED.ordinal,
+       title = EXCLUDED.title,
+       description = EXCLUDED.description,
+       section_id = EXCLUDED.section_id,
+       depends_on = EXCLUDED.depends_on,
+       sync_state = EXCLUDED.sync_state,
+       linear_id = EXCLUDED.linear_id,
+       sync_error = EXCLUDED.sync_error`,
+    [
+      specId,
+      changed.map((row) => row.id),
+      changed.map((row) => row.parentId),
+      changed.map((row) => row.ordinal),
+      changed.map((row) => row.title),
+      changed.map((row) => row.description),
+      changed.map((row) => row.sectionId),
+      changed.map((row) => JSON.stringify(row.dependsOn)),
+      changed.map((row) => row.syncState),
+      changed.map((row) => row.linearId),
+      changed.map((row) => row.syncError),
+    ],
+  );
 }
 
-/** A range no live ordinal uses, so a rewrite never collides with itself. */
-const ORDINAL_PARK = 1_000_000;
+/** True when the stored row already says what the new row says. */
+function sameRow(
+  stored: SpecTicketDraftRecord | undefined,
+  next: SpecTicketDraftRecord,
+): boolean {
+  return (
+    stored !== undefined &&
+    stored.parentId === next.parentId &&
+    stored.ordinal === next.ordinal &&
+    stored.title === next.title &&
+    stored.description === next.description &&
+    stored.sectionId === next.sectionId &&
+    stored.syncState === next.syncState &&
+    stored.linearId === next.linearId &&
+    stored.syncError === next.syncError &&
+    stored.dependsOn.length === next.dependsOn.length &&
+    stored.dependsOn.every((id, index) => id === next.dependsOn[index])
+  );
+}
