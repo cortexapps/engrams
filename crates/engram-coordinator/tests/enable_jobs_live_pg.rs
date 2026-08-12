@@ -664,6 +664,9 @@ async fn seed_staging_host(meta: &Arc<dyn MetadataStore>, digest: &str, staged: 
         wire_version: 0,
         stages_images: true,
         capabilities: Default::default(),
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
     })
     .await
     .expect("upsert staging host");
@@ -690,6 +693,7 @@ async fn seed_staging_host(meta: &Arc<dyn MetadataStore>, digest: &str, staged: 
             wire_version: engram_protocol::WIRE_VERSION,
             stages_images: true,
             capabilities: Default::default(),
+            lease_renew_until: None,
         },
     )
     .await
@@ -1014,6 +1018,7 @@ async fn prestage_flip_and_straggler_reach_ready_via_live_host_rows() {
             wire_version: engram_protocol::WIRE_VERSION,
             stages_images: true,
             capabilities: Default::default(),
+            lease_renew_until: None,
         },
     )
     .await

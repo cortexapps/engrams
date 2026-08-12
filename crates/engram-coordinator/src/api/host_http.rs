@@ -178,6 +178,13 @@ pub async fn register(
         // `upsert_host` doc comment on why a first-row host shouldn't
         // sit at `schema: 0` until its first heartbeat.
         capabilities: req.capabilities,
+        // ADR 0116 A-D3: a register is a host-agent generation adopting
+        // the host — the store REPLACES the lease deadline with this
+        // (ending any handoff early), flips it Active, and bumps
+        // `lease_epoch`. Coordinator-side regardless of host version.
+        lease_expires_at: Some(state.services.clock.now_utc() + crate::config::host_lease_ttl()),
+        lease_state: Default::default(),
+        lease_epoch: 0,
     };
     state.services.meta.upsert_host(record).await?;
 
@@ -527,6 +534,11 @@ pub async fn heartbeat(
         wire_version: hb.wire_version,
         stages_images: hb.stages_images,
         capabilities: hb.capabilities.clone(),
+        // ADR 0116 A-D3: the coordinator renews the binding lease on
+        // EVERY heartbeat, regardless of host-agent version — the renewal
+        // rides the same single UPDATE as the persist (GREATEST inside,
+        // so a racing predecessor can never shrink a handoff deadline).
+        lease_renew_until: Some(state.services.clock.now_utc() + crate::config::host_lease_ttl()),
     };
     if let Err(e) = state
         .services
@@ -2207,6 +2219,9 @@ mod tests {
                 wire_version: 0, // 0 = not-yet-reported, tolerated
                 stages_images: true,
                 capabilities: Default::default(),
+                lease_expires_at: None,
+                lease_state: Default::default(),
+                lease_epoch: 0,
             }
         }
 

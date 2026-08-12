@@ -293,6 +293,7 @@ fn in_process_heartbeat(
         wire_version: engram_protocol::WIRE_VERSION,
         stages_images: false,
         capabilities: engram_core::types::host::HostCapabilities::default(),
+        lease_renew_until: None,
     }
 }
 
@@ -588,6 +589,12 @@ async fn main() -> Result<(), CoordinatorError> {
             // dev/Process-backend host, and passes vacuously.
             stages_images: false,
             capabilities: engram_core::types::host::HostCapabilities::default(),
+            // ADR 0116 A-D3: the in-process host leases like any other —
+            // register replaces the deadline, the in-process heartbeat
+            // loop renews it.
+            lease_expires_at: Some(clock.now_utc() + engram_coordinator::config::host_lease_ttl()),
+            lease_state: Default::default(),
+            lease_epoch: 0,
         };
         if let Err(e) = engram_core::traits::MetadataStore::upsert_host(&pg, host_record).await {
             return Err(CoordinatorError::Config(format!(
@@ -797,6 +804,9 @@ mod tests {
             wire_version: engram_protocol::WIRE_VERSION,
             stages_images: false,
             capabilities: Default::default(),
+            lease_expires_at: None,
+            lease_state: Default::default(),
+            lease_epoch: 0,
         })
         .await
         .expect("register host");

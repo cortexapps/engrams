@@ -58,6 +58,9 @@ fn host(id: HostId, hostname: &str, addr: &str) -> HostRecord {
         wire_version: 0,
         stages_images: false,
         capabilities: engram_core::types::host::HostCapabilities::default(),
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
     }
 }
 
@@ -79,6 +82,7 @@ fn heartbeat(status: HostStatus) -> HostHeartbeat {
         wire_version: 0,
         stages_images: false,
         capabilities: engram_core::types::host::HostCapabilities::default(),
+        lease_renew_until: None,
     }
 }
 

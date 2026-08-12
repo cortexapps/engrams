@@ -1253,6 +1253,9 @@ mod tests {
                 wire_version: 0,
                 stages_images: false,
                 capabilities: engram_core::types::host::HostCapabilities::default(),
+                lease_expires_at: None,
+                lease_state: Default::default(),
+                lease_epoch: 0,
             });
         meta.snapshots
             .lock()
@@ -1446,6 +1449,9 @@ mod tests {
                 wire_version: 0,
                 stages_images: false,
                 capabilities: engram_core::types::host::HostCapabilities::default(),
+                lease_expires_at: None,
+                lease_state: Default::default(),
+                lease_epoch: 0,
             });
         meta.snapshots
             .lock()
@@ -1736,6 +1742,9 @@ mod tests {
                 wire_version: 0,
                 stages_images: false,
                 capabilities: engram_core::types::host::HostCapabilities::default(),
+                lease_expires_at: None,
+                lease_state: Default::default(),
+                lease_epoch: 0,
             });
         meta.snapshots
             .lock()

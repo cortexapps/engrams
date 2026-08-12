@@ -461,6 +461,19 @@ pub const QUEUE_HEAD_AGE_SECONDS: &str = "engram_queue_head_age_seconds";
 /// per-host labels; the paired `warn!` carries the id for forensics.
 pub const HEARTBEAT_PERSIST_FAILURES_TOTAL: &str = "engram_heartbeat_persist_failures_total";
 
+/// Counter (ADR 0116 A1). The shadow-cutover comparator: ticks where the
+/// lease-expiry predicate (`list_lease_expired_hosts`) and the legacy
+/// staleness predicate (`list_stale_hosts`) DISAGREE about the dead-host
+/// candidate set. Label `direction`: `lease_only` (the lease would strike
+/// a host the staleness heuristics shield — expected during rolls, where
+/// the cordon 10x shield is broader than a missing handoff) or
+/// `stale_only` (the staleness path would strike a host the lease still
+/// covers — each one is a session the A3 cutover would have SAVED from
+/// an orphan). Watch this at ~zero `stale_only` regressions before
+/// cutting enforcement over in A3; the paired `warn!` carries host ids.
+pub const DEAD_HOST_LEASE_SHADOW_DISAGREE_TOTAL: &str =
+    "engram_dead_host_lease_shadow_disagree_total";
+
 /// Histogram (ADR 0036 amendment, issue #538). Wall time of the enable
 /// scanner's `prestaging` stage — the fleet chunk-prestage wait between
 /// base-snapshot capture and the `enabled_images` upsert. Labels:
