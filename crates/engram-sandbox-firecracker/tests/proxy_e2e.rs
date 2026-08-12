@@ -327,7 +327,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     proxy_cfg.guest_gateway = Arc::new(engram_egress_proxy::GuestGatewayRegistry::new(
         [Arc::new(engram_egress_proxy::GceMetadataService)
             as Arc<dyn engram_egress_proxy::GuestServiceAdapter>],
-        std::iter::empty::<Arc<dyn engram_egress_proxy::TunnelConnector>>(),
+        std::iter::empty::<Arc<dyn engram_egress_proxy::TunnelUpstream>>(),
     ));
     let proxy = engram_egress_proxy::Proxy::new(proxy_cfg);
     // Bind synchronously (ADR 0083) — the listener is up before serve

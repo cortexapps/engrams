@@ -44,7 +44,7 @@ pub use ca::{Ca, CaError, CaSource, EnvCaSource, LocalDiskCaSource};
 pub use cert_mint::{CertMint, MintError};
 pub use graphql::{parse_request_body as parse_graphql_request, ParsedGraphql};
 pub use guest_gateway::{
-    GceMetadataService, GuestGatewayRegistry, GuestServiceAdapter, TunnelConnector,
+    GceMetadataService, GuestGatewayRegistry, GuestServiceAdapter, TunnelStream, TunnelUpstream,
     GCE_METADATA_SERVICE_KIND,
 };
 pub use observe::{ObserveSink, ObservedAsset, UrlFallback};

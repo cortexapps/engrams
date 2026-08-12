@@ -704,7 +704,7 @@ async fn main() -> Result<(), HostAgentError> {
             engram_host_agent::coord_client::HttpCoordClient::new(refresh_coord_url, refresh_token),
             host_id,
         ));
-    let cloud_sql_connector: Arc<dyn engram_egress_proxy::TunnelConnector> =
+    let cloud_sql_connector: Arc<dyn engram_egress_proxy::TunnelUpstream> =
         Arc::new(engram_host_agent::egress::CoordCloudSqlConnector::new(
             engram_host_agent::coord_client::HttpCoordClient::new(
                 cloud_sql_coord_url,
