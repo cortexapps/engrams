@@ -41,6 +41,7 @@ import {
   SpecTicketSyncError,
   type SpecTicketSyncConnector,
   type SpecTicketSyncDeps,
+  type SpecTicketSyncStore,
 } from "../ticket-sync.ts";
 import { PostgresSpecTicketSyncStore } from "../ticket-sync-store.ts";
 import { SpecTicketSyncService } from "../ticket-sync-service.ts";
@@ -181,6 +182,32 @@ class FakeLinear implements LinearIssueClient {
   async readWorkspace(): Promise<LinearWorkspace> {
     return { teams: [{ id: "team-platform", name: "Platform" }], projects: [], labels: [] };
   }
+}
+
+/**
+ * The real store with one method replaced.
+ *
+ * The delegations are written out rather than spread, because the store is a
+ * class and a spread of an instance copies none of its prototype methods.
+ */
+function delegating(
+  store: SpecTicketSyncStore,
+  overrides: Partial<SpecTicketSyncStore>,
+): SpecTicketSyncStore {
+  return {
+    listTickets: (specId) => store.listTickets(specId),
+    readTicket: (specId, ticketId) => store.readTicket(specId, ticketId),
+    writeTicketState: (specId, ticketId, patch) => store.writeTicketState(specId, ticketId, patch),
+    readConfig: (specId) => store.readConfig(specId),
+    writeConfig: (specId, target) => store.writeConfig(specId, target),
+    reserve: (input) => store.reserve(input),
+    rehash: (specId, operation, key, hash) => store.rehash(specId, operation, key, hash),
+    countAttempt: (specId, operation, key) => store.countAttempt(specId, operation, key),
+    complete: (specId, operation, key, result) => store.complete(specId, operation, key, result),
+    fail: (specId, operation, key, error) => store.fail(specId, operation, key, error),
+    listOperations: (specId) => store.listOperations(specId),
+    ...overrides,
+  };
 }
 
 function connectedTo(teamId: string | null): SpecTicketSyncConnector {
@@ -522,6 +549,108 @@ describe("linear sync with live Postgres", () => {
     const other = await publishedSpec();
     expect((await service.read(other)).target.teamId).toBe("team-platform");
   });
+
+  test.skipIf(!reachable)(
+    "a row that throws before its Linear call still lets the batch finish",
+    async () => {
+      const specId = await publishedSpec();
+      const ids = await propose(specId);
+      const linear = new FakeLinear();
+      const store = new PostgresSpecTicketSyncStore(pool!);
+      const broken = ids.get("Enforce org quota in the gateway limiter")!;
+      // A transient Postgres error on one row's first read — before the
+      // reservation and before any Linear call. That region used to sit
+      // outside the guard, so the throw ended the workflow and left every
+      // later row at `queued` with no driver: the exact shape R41 forbids.
+      const flaky = delegating(store, {
+        readTicket: (spec, ticketId) =>
+          ticketId === broken
+            ? Promise.reject(new Error("connection terminated unexpectedly"))
+            : store.readTicket(spec, ticketId),
+      });
+
+      const plan = await planSpecTicketSync({ specId }, deps(linear));
+      const outcomes: string[] = [];
+      for (const ticketId of plan.order) {
+        // The assertion is that this never throws, whatever one row does.
+        const result = await syncOneSpecTicket(
+          { specId, ticketId, target: plan.target },
+          { ...deps(linear), store: flaky },
+        );
+        outcomes.push(result.state);
+      }
+
+      expect(outcomes).toEqual(["synced", "synced", "failed", "synced"]);
+      const rows = await store.listTickets(specId);
+      // R41: the three siblings landed, and the row that threw carries the
+      // reason instead of stranding the batch.
+      expect(rows.filter((row) => row.syncState === "synced")).toHaveLength(3);
+      const failed = rows.find((row) => row.id === broken);
+      expect(failed?.syncState).toBe("failed");
+      expect(failed?.syncError).toContain("connection terminated");
+    },
+  );
+
+  test.skipIf(!reachable)("a deleted ticket is reported, not thrown", async () => {
+    const specId = await publishedSpec();
+    const ids = await propose(specId);
+    const linear = new FakeLinear();
+    const removed = ids.get("Quota-aware 429 payload")!;
+    const plan = await planSpecTicketSync({ specId }, deps(linear));
+    await tree().deleteTicket({ specId, id: removed });
+
+    const result = await syncOneSpecTicket(
+      { specId, ticketId: removed, target: plan.target },
+      deps(linear),
+    );
+
+    expect(result.state).toBe("gone");
+    expect(linear.created).toHaveLength(0);
+  });
+
+  test.skipIf(!reachable)(
+    "a reserved row whose request drifted is re-bound, not refused",
+    async () => {
+      const specId = await publishedSpec();
+      const ids = await propose(specId);
+      const linear = new FakeLinear();
+      const store = new PostgresSpecTicketSyncStore(pool!);
+      const blocked = ids.get("Enforce org quota in the gateway limiter")!;
+      const plan = await planSpecTicketSync({ specId }, deps(linear));
+
+      // The blocked ticket is attempted while its blocker has no identity yet,
+      // and its driver dies mid-create: Linear holds the issue, the ledger row
+      // stays unfinished.
+      linear.loseResponse.add("Enforce org quota in the gateway limiter");
+      await syncOneSpecTicket({ specId, ticketId: blocked, target: plan.target }, deps(linear));
+      await pool!.query(
+        `UPDATE spec_ticket_sync_operation SET status = 'reserved'
+          WHERE caller_spec_id = $1 AND operation = $2 AND idempotency_key = $3`,
+        [specId, CREATE_ISSUE_OPERATION, blocked],
+      );
+
+      // Now the blocker syncs, so the blocked ticket's description gains its
+      // "Blocked by ENG-…" line (R44) and its request hash legitimately moves.
+      for (const ticketId of plan.order.filter((id) => id !== blocked)) {
+        await syncOneSpecTicket({ specId, ticketId, target: plan.target }, deps(linear));
+      }
+      const retried = await syncOneSpecTicket(
+        { specId, ticketId: blocked, target: plan.target },
+        deps(linear),
+      );
+
+      // The drift is not a conflict: it adopts the issue the dead driver made,
+      // and creates nothing new.
+      expect(retried.state).toBe("synced");
+      expect(retried.adopted).toBe(true);
+      expect(linear.created).toHaveLength(4);
+      expect(linear.issues.size).toBe(4);
+      const reserved = (await store.listOperations(specId)).find(
+        (operation) => operation.idempotencyKey === blocked,
+      );
+      expect(reserved?.status).toBe("complete");
+    },
+  );
 
   test.skipIf(!reachable)("an unknown ticket is refused, not queued", async () => {
     const specId = await publishedSpec();

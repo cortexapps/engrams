@@ -256,9 +256,16 @@ export function mergeTarget(
   };
 }
 
+/**
+ * What one ticket's step did. `gone` is the ticket a person deleted while the
+ * batch was running: there is no row left to write a state on, and that is not
+ * a failure of the batch.
+ */
+export type SyncOneOutcome = SpecTicketSyncState | "gone";
+
 export interface SyncOneResult {
   ticketId: string;
-  state: SpecTicketSyncState;
+  state: SyncOneOutcome;
   issue: LinearIssue | null;
   /** Why it failed, in the words the ledger shows. */
   error: string | null;
@@ -269,18 +276,69 @@ export interface SyncOneResult {
 /**
  * Sync one ticket. This is the whole N4 assertion in one function.
  *
- * It never throws for a Linear failure: the reason lands on the row and the
- * batch carries on (R41). It throws only when the caller misused the ledger —
- * an idempotency key reused with different arguments — because that is a bug
- * in the caller, not a fact about Linear.
+ * **It never throws.** That is R41, and it is a property of this function rather
+ * than of its caller: the batch is a bare loop of durable steps, so a step that
+ * throws ends the workflow in `ERROR`, and the sweep re-adopts only `PENDING`
+ * work — every later ticket would sit at `queued` with no driver until an
+ * operator noticed. So everything that can fail for one row is guarded here: the
+ * reads, the reservation, and the Linear call alike. A row that cannot even
+ * record its own failure is logged and reported failed, because carrying on is
+ * still the better answer for the five rows behind it.
  */
 export async function syncOneSpecTicket(
   input: { specId: string; ticketId: string; target: SpecTicketSyncTarget },
   deps: SpecTicketSyncDeps,
 ): Promise<SyncOneResult> {
+  try {
+    return await createSpecTicketIssue(input, deps);
+  } catch (error) {
+    return recordTicketFailure(input.specId, input.ticketId, error, deps);
+  }
+}
+
+/**
+ * Write one row's failure. This is the last line of R41, so it swallows its own
+ * errors: a driver that cannot reach Postgres to record a failure must still
+ * return, or the batch it is in dies with it. The row then stays `syncing`,
+ * which the ledger shows as in flight and a retry repairs.
+ */
+async function recordTicketFailure(
+  specId: string,
+  ticketId: string,
+  error: unknown,
+  deps: SpecTicketSyncDeps,
+): Promise<SyncOneResult> {
+  const reason = failureReason(error);
+  try {
+    await deps.store.fail(specId, CREATE_ISSUE_OPERATION, ticketId, reason);
+    await deps.store.writeTicketState(specId, ticketId, {
+      syncState: "failed",
+      syncError: reason,
+    });
+  } catch (cause) {
+    deps.log?.warn(
+      { specId, ticketId, reason, cause: failureReason(cause) },
+      "a spec ticket sync failure could not be recorded",
+    );
+  }
+  return { ticketId, state: "failed", issue: null, error: reason, adopted: false };
+}
+
+async function createSpecTicketIssue(
+  input: { specId: string; ticketId: string; target: SpecTicketSyncTarget },
+  deps: SpecTicketSyncDeps,
+): Promise<SyncOneResult> {
   const ticket = await deps.store.readTicket(input.specId, input.ticketId);
   if (!ticket) {
-    throw new SpecTicketSyncError("not_found", `Unknown ticket: ${input.ticketId}`);
+    // Deleted between the click and the driver. There is nothing to sync and
+    // nothing to mark, so the step reports it and the batch moves on.
+    return {
+      ticketId: input.ticketId,
+      state: "gone",
+      issue: null,
+      error: "The ticket was deleted before it synced.",
+      adopted: false,
+    };
   }
   // Create-only (R43). A synced ticket is finished, whatever the batch says.
   if (ticket.syncState === "synced" && ticket.linearId) {
@@ -325,51 +383,40 @@ export async function syncOneSpecTicket(
     syncError: null,
   });
 
-  try {
-    // Any attempt after the first may have created the issue and died before
-    // it could say so. Ask Linear before creating a second one (N4).
-    const existing =
-      operation.attempts > 0 ? await deps.linear.findIssue(reservedExternalId) : null;
-    // The count commits before the call, so a driver that dies during the
-    // create still probes on its next attempt.
-    await deps.store.countAttempt(input.specId, CREATE_ISSUE_OPERATION, ticket.id);
-    const issue =
-      existing ??
-      (await deps.linear.createIssue({
-        id: reservedExternalId,
-        // `resolveTarget` refuses a batch with no team, so this is set.
-        teamId: input.target.teamId ?? "",
-        title: ticket.title,
-        description,
-        ...(input.target.projectId === null ? {} : { projectId: input.target.projectId }),
-        ...(input.target.labelIds.length === 0 ? {} : { labelIds: input.target.labelIds }),
-      }));
-    await deps.store.complete(input.specId, CREATE_ISSUE_OPERATION, ticket.id, {
-      id: issue.id,
-      identifier: issue.identifier,
-      url: issue.url,
-    });
-    await deps.store.writeTicketState(input.specId, ticket.id, {
-      syncState: "synced",
-      linearId: issue.id,
-      syncError: null,
-    });
-    return {
-      ticketId: ticket.id,
-      state: "synced",
-      issue,
-      error: null,
-      adopted: existing !== null,
-    };
-  } catch (error) {
-    const reason = failureReason(error);
-    await deps.store.fail(input.specId, CREATE_ISSUE_OPERATION, ticket.id, reason);
-    await deps.store.writeTicketState(input.specId, ticket.id, {
-      syncState: "failed",
-      syncError: reason,
-    });
-    return { ticketId: ticket.id, state: "failed", issue: null, error: reason, adopted: false };
-  }
+  // Any attempt after the first may have created the issue and died before it
+  // could say so. Ask Linear before creating a second one (N4).
+  const existing = operation.attempts > 0 ? await deps.linear.findIssue(reservedExternalId) : null;
+  // The count commits before the call, so a driver that dies during the create
+  // still probes on its next attempt.
+  await deps.store.countAttempt(input.specId, CREATE_ISSUE_OPERATION, ticket.id);
+  const issue =
+    existing ??
+    (await deps.linear.createIssue({
+      id: reservedExternalId,
+      // `resolveTarget` refuses a batch with no team, so this is set.
+      teamId: input.target.teamId ?? "",
+      title: ticket.title,
+      description,
+      ...(input.target.projectId === null ? {} : { projectId: input.target.projectId }),
+      ...(input.target.labelIds.length === 0 ? {} : { labelIds: input.target.labelIds }),
+    }));
+  await deps.store.complete(input.specId, CREATE_ISSUE_OPERATION, ticket.id, {
+    id: issue.id,
+    identifier: issue.identifier,
+    url: issue.url,
+  });
+  await deps.store.writeTicketState(input.specId, ticket.id, {
+    syncState: "synced",
+    linearId: issue.id,
+    syncError: null,
+  });
+  return {
+    ticketId: ticket.id,
+    state: "synced",
+    issue,
+    error: null,
+    adopted: existing !== null,
+  };
 }
 
 /**
@@ -396,31 +443,14 @@ export async function linkSpecTicketDependencies(
     for (const blockerTicketId of ticket.dependsOn) {
       const blockerIssueId = linearIdByTicket.get(blockerTicketId);
       if (!blockerIssueId) continue;
-      const key = `${ticket.id}:${blockerTicketId}`;
-      const reserved = reservedRelationId(input.specId, ticket.id, blockerTicketId);
-      const operation = await reserveSyncOperation(deps.store, {
-        specId: input.specId,
-        operation: CREATE_RELATION_OPERATION,
-        idempotencyKey: key,
-        requestHash: requestHash({ blockerIssueId, blockedIssueId }),
-        reservedTicketId: ticket.id,
-        reservedExternalId: reserved,
-      });
-      if (operation.status === "complete") continue;
+      // Every edge is guarded whole — the reservation included. One edge that
+      // cannot even be reserved must not cost the others their relation.
       try {
-        await deps.store.countAttempt(input.specId, CREATE_RELATION_OPERATION, key);
-        await deps.linear.createBlockingRelation({
-          id: reserved,
-          blockerIssueId,
-          blockedIssueId,
-        });
-        await deps.store.complete(input.specId, CREATE_RELATION_OPERATION, key, {
-          id: reserved,
-        });
-        linked += 1;
+        if (await linkOneDependency({ ...input, ticket, blockerTicketId, blockerIssueId, blockedIssueId }, deps)) {
+          linked += 1;
+        }
       } catch (error) {
         const reason = failureReason(error);
-        await deps.store.fail(input.specId, CREATE_RELATION_OPERATION, key, reason);
         failed += 1;
         deps.log?.warn(
           { specId: input.specId, ticketId: ticket.id, blockerTicketId, reason },
@@ -432,13 +462,62 @@ export async function linkSpecTicketDependencies(
   return { linked, failed };
 }
 
+/** One edge. True when this attempt created the relation. */
+async function linkOneDependency(
+  input: {
+    specId: string;
+    ticket: SyncTicketRow;
+    blockerTicketId: string;
+    blockerIssueId: string;
+    blockedIssueId: string;
+  },
+  deps: SpecTicketSyncDeps,
+): Promise<boolean> {
+  const key = `${input.ticket.id}:${input.blockerTicketId}`;
+  const reserved = reservedRelationId(input.specId, input.ticket.id, input.blockerTicketId);
+  const operation = await reserveSyncOperation(deps.store, {
+    specId: input.specId,
+    operation: CREATE_RELATION_OPERATION,
+    idempotencyKey: key,
+    requestHash: requestHash({
+      blockerIssueId: input.blockerIssueId,
+      blockedIssueId: input.blockedIssueId,
+    }),
+    reservedTicketId: input.ticket.id,
+    reservedExternalId: reserved,
+  });
+  if (operation.status === "complete") return false;
+  try {
+    await deps.store.countAttempt(input.specId, CREATE_RELATION_OPERATION, key);
+    await deps.linear.createBlockingRelation({
+      id: reserved,
+      blockerIssueId: input.blockerIssueId,
+      blockedIssueId: input.blockedIssueId,
+    });
+    await deps.store.complete(input.specId, CREATE_RELATION_OPERATION, key, { id: reserved });
+    return true;
+  } catch (error) {
+    await deps.store.fail(input.specId, CREATE_RELATION_OPERATION, key, failureReason(error));
+    throw error;
+  }
+}
+
 /**
  * Take the reservation, and refuse a key reused with different arguments.
  *
- * The one exception is a reservation that already failed: the person edited the
- * ticket and pressed Retry, which is the whole point of a failed row keeping
- * its place. Even then the reserved Linear id does not change, so the retry
- * still adopts an issue an earlier attempt may have created.
+ * The refusal is bounded to the case where it protects something: a **complete**
+ * reservation. Its arguments are history — the issue exists, R43 forbids a
+ * second write, and re-binding them would misreport what Linear holds.
+ *
+ * An unfinished reservation is re-bound instead, whether it is `failed` or
+ * `reserved`. Both are attempts at the *same* ticket, because the key is the
+ * ticket id, and the request legitimately drifts between attempts: the
+ * description gains a "Blocked by ENG-412" line as soon as the blocker syncs
+ * (R44). Refusing that drift turned an ordinary crash-recovery retry into a
+ * fatal conflict. Re-binding costs nothing, because the reserved Linear id is
+ * derived from the spec and the ticket and never moves — so the next attempt,
+ * whose `attempts` count survived, probes Linear and adopts rather than
+ * creating a second issue.
  */
 export async function reserveSyncOperation(
   store: SpecTicketSyncStore,
@@ -446,7 +525,7 @@ export async function reserveSyncOperation(
 ): Promise<SyncOperationRow> {
   const row = await store.reserve(input);
   if (row.requestHash === input.requestHash) return row;
-  if (row.status !== "failed") {
+  if (row.status === "complete") {
     throw new SpecTicketSyncError(
       "conflict",
       `idempotency key was already used with different arguments (${input.operation} ${input.idempotencyKey})`,

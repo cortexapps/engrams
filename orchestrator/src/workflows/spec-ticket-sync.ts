@@ -48,9 +48,13 @@ export function productionSpecTicketSyncDeps(): SpecTicketSyncDeps {
  * Plan the batch, or fail its rows honestly.
  *
  * The plan needs a connected Linear and a team. Both can go away between the
- * click and the driver, and a row that stays `queued` forever is the worst
- * possible answer — so the reason lands on every row the batch was asked for,
- * and the batch stops.
+ * click and the driver. A row that stays `queued` forever is the worst possible
+ * answer — the sweep re-adopts only pending work, so a workflow that ended in
+ * `ERROR` leaves every row of its batch with no driver and the browser polling
+ * an in-flight count that never moves. So **every** error marks the rows,
+ * not only the ones this module named: a transient Postgres error at plan time
+ * is exactly as stranding as a disconnected Linear, and a marked row says what
+ * happened and can be retried.
  */
 async function planOrFail(
   input: SpecTicketSyncWorkflowInput,
@@ -60,14 +64,24 @@ async function planOrFail(
     const plan = await planSpecTicketSync(input, deps);
     return { order: plan.order, target: plan.target };
   } catch (error) {
-    if (!(error instanceof SpecTicketSyncError)) throw error;
-    for (const ticketId of input.ticketIds) {
-      await deps.store.writeTicketState(input.specId, ticketId, {
-        syncState: "failed",
-        syncError: error.message,
-      });
+    const reason =
+      error instanceof SpecTicketSyncError || error instanceof Error
+        ? error.message
+        : String(error);
+    try {
+      for (const ticketId of input.ticketIds) {
+        await deps.store.writeTicketState(input.specId, ticketId, {
+          syncState: "failed",
+          syncError: reason,
+        });
+      }
+    } catch (cause) {
+      log.warn(
+        { specId: input.specId, reason, cause: String(cause) },
+        "a spec ticket sync plan failure could not be recorded",
+      );
     }
-    return { failed: error.message };
+    return { failed: reason };
   }
 }
 
@@ -84,8 +98,20 @@ async function specTicketSyncWorkflowEntry(input: SpecTicketSyncWorkflowInput): 
       { name: "spec-ticket-sync-issue" },
     );
   }
+  // Relations are the better rendering of a fact the description already
+  // states (R44), so this leg is best-effort by design: it must not end a
+  // workflow whose issues are all created.
   await DBOS.runStep(
-    () => linkSpecTicketDependencies({ specId: input.specId }, productionSpecTicketSyncDeps()),
+    () =>
+      linkSpecTicketDependencies({ specId: input.specId }, productionSpecTicketSyncDeps()).catch(
+        (error: unknown) => {
+          log.warn(
+            { specId: input.specId, reason: String(error) },
+            "spec ticket dependencies were not linked in Linear",
+          );
+          return { linked: 0, failed: 0 };
+        },
+      ),
     { name: "spec-ticket-sync-relations" },
   );
 }

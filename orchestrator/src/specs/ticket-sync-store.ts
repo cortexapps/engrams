@@ -216,10 +216,12 @@ export class PostgresSpecTicketSyncStore implements SpecTicketSyncStore {
     requestHash: string,
   ): Promise<void> {
     await this.pool.query(
+      // Any unfinished reservation may be re-bound; a complete one may not.
+      // Its arguments are the record of a create that really happened.
       `UPDATE spec_ticket_sync_operation
           SET request_hash = $4, status = 'reserved', error = NULL, updated_at = now()
         WHERE caller_spec_id = $1 AND operation = $2 AND idempotency_key = $3
-          AND status = 'failed'`,
+          AND status <> 'complete'`,
       [specId, operation, key, requestHash],
     );
   }
