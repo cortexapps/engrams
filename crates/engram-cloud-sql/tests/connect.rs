@@ -115,6 +115,13 @@ async fn mock_sqladmin(
         assert_eq!(body["access_token"], LOGIN_TOKEN);
         let public_key = body["public_key"].as_str().expect("a public key PEM");
         assert!(public_key.contains("RSA PUBLIC KEY"));
+        // The real sqladmin parser rejects CRLF PEM with "invalid PEM
+        // format" (production, 2026-08-12). Encode Google's contract here,
+        // not the crate's own encoder tolerance.
+        assert!(
+            !public_key.contains('\r'),
+            "the public key PEM must use LF line endings",
+        );
         Json(serde_json::json!({
             "ephemeralCert": { "cert": state.fixture.sign_client_key(public_key) },
         }))
