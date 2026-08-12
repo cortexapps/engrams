@@ -218,6 +218,22 @@ describe("createSpec", () => {
     expect(store.rows.size).toBe(1);
   });
 
+  test("a service-account create reaches the session as programmatic", async () => {
+    const { deps, sessions } = testDeps();
+
+    await createSpec(deps, request({ ownerIsServiceAccount: true }));
+
+    expect(sessions[0]!.ownerIsServiceAccount).toBe(true);
+  });
+
+  test("an ordinary create does not claim to be a service account", async () => {
+    const { deps, sessions } = testDeps();
+
+    await createSpec(deps, request());
+
+    expect(sessions[0]!.ownerIsServiceAccount).toBeUndefined();
+  });
+
   test("a spec with no title is named by its problem statement", async () => {
     const { deps } = testDeps();
 
@@ -243,6 +259,7 @@ const READ_STORE: SpecReadStore = {
 function testApp(overrides?: {
   create?: (input: CreateSpecRequest) => Promise<CreateSpecResult>;
   role?: string;
+  email?: string;
 }) {
   const calls: CreateSpecRequest[] = [];
   const app = new Hono();
@@ -266,7 +283,12 @@ function testApp(overrides?: {
         };
       },
       getSession: async () => ({
-        user: { id: OWNER_ID, name: "Grace", role: overrides?.role ?? "user" },
+        user: {
+          id: OWNER_ID,
+          name: "Grace",
+          role: overrides?.role ?? "user",
+          email: overrides?.email ?? "grace@example.com",
+        },
       }),
     }),
   );
@@ -313,6 +335,23 @@ describe("POST /api/v1/specs", () => {
         idempotencyKey: "create-1",
       },
     ]);
+  });
+
+  test("an API-key caller is carried through as a service-account principal", async () => {
+    const { app, calls } = testApp({ email: "apikey+ci-engrams@service.local" });
+
+    const response = await app.request("/api/v1/specs", createBody());
+
+    expect(response.status).toBe(201);
+    expect(calls[0]!.ownerIsServiceAccount).toBe(true);
+  });
+
+  test("a human caller is not marked as a service account", async () => {
+    const { app, calls } = testApp();
+
+    await app.request("/api/v1/specs", createBody());
+
+    expect(calls[0]!.ownerIsServiceAccount).toBeUndefined();
   });
 
   test("a replayed create answers 200, not 201", async () => {

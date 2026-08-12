@@ -6,6 +6,7 @@ import * as Y from "yjs";
 
 import { getSessionFromHeaders } from "../auth/session.ts";
 import { abilityFor } from "../authz/ability.ts";
+import { isServiceAccountEmail } from "../rpc/api-key.ts";
 import type { GetSession, ResolveSpecMembership } from "./guard.ts";
 import { makeSpecMemberHeaderGuard } from "./guard.ts";
 import {
@@ -176,6 +177,10 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
     if (!abilityFor(actor).can("create", "Spec")) {
       throw new HTTPException(403, { message: "forbidden" });
     }
+    // An API key resolves through this same session, so the principal kind must
+    // reach the session compile: a service account has no per-user harness
+    // token, and the human path would boot it credential-less (ADR 0063 B4).
+    const ownerIsServiceAccount = isServiceAccountEmail(session.user.email ?? "");
 
     let body: unknown;
     try {
@@ -189,6 +194,7 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
       result = await deps.create({
         orgId: deps.orgId,
         ownerUserId: actor.id,
+        ...(ownerIsServiceAccount ? { ownerIsServiceAccount: true } : {}),
         ...createSpecInput(body),
       });
     } catch (error) {

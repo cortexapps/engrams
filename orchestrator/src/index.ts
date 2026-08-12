@@ -227,6 +227,7 @@ app.route(
               {
                 type: "spec",
                 ownerUserId: input.ownerUserId,
+                ...(input.ownerIsServiceAccount ? { ownerIsServiceAccount: true } : {}),
                 profileId: input.profileId,
                 title: input.title,
                 prompt: input.prompt,
