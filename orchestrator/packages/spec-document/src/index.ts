@@ -65,6 +65,17 @@ export {
   type RequirementReference,
 } from "./requirements.ts";
 export {
+  evaluatePublishGate,
+  sectionIsSettled,
+  type PublishBlocker,
+  type PublishBlockerReason,
+  type PublishGate,
+  type PublishGateInput,
+  type PublishGateQuestion,
+  type PublishGateSection,
+  type PublishGateSectionState,
+} from "./publish-gate.ts";
+export {
   analyzeTraceability,
   applyOutsideIn,
   REQUIREMENTS_SECTION_KEY,
