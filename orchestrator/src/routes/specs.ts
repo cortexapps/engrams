@@ -1,8 +1,12 @@
+import { Code, ConnectError } from "@connectrpc/connect";
 import { Hono, type Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import type { Pool } from "pg";
 import * as Y from "yjs";
 
+import { getSessionFromHeaders } from "../auth/session.ts";
+import { abilityFor } from "../authz/ability.ts";
+import { isServiceAccountEmail } from "../rpc/api-key.ts";
 import type { GetSession, ResolveSpecMembership } from "./guard.ts";
 import { makeSpecMemberHeaderGuard } from "./guard.ts";
 import {
@@ -11,10 +15,14 @@ import {
   type SpecCheckpointService,
   type SpecCheckpointStore,
 } from "../specs/checkpoints.ts";
+import type { CreateSpecRequest, CreateSpecResult } from "../specs/create.ts";
 import { proseMirrorDocument, SpecDocumentReadOnlyError } from "../specs/doc-service.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SPEC_CHECKPOINT_LIST_LIMIT = 100;
+const SPEC_TITLE_MAX_CHARS = 200;
+const SPEC_PROBLEM_MAX_CHARS = 20_000;
+const IDEMPOTENCY_KEY_MAX_CHARS = 200;
 
 export interface SpecReadRecord {
   id: string;
@@ -25,6 +33,9 @@ export interface SpecReadRecord {
   publishedCheckpointId: string | null;
   publishedAt: Date | null;
   currentSemanticDocSeq: bigint;
+  /** The template the spec locked at creation (ADR 0114 D3). */
+  templateId: string;
+  templateName: string;
 }
 
 export interface SpecCheckpointSummary {
@@ -51,6 +62,8 @@ interface SpecRow {
   published_checkpoint_id: string | null;
   published_at: Date | null;
   current_semantic_doc_seq: string;
+  template_id: string;
+  template_name: string;
 }
 
 interface CheckpointSummaryRow {
@@ -69,10 +82,12 @@ export class PostgresSpecReadStore implements SpecReadStore {
 
   async readSpec(specId: string): Promise<SpecReadRecord | null> {
     const result = await this.pool.query<SpecRow>(
-      `SELECT id, title, lifecycle, owner_user_id, session_id,
-              published_checkpoint_id, published_at, current_semantic_doc_seq
+      `SELECT spec.id, spec.title, spec.lifecycle, spec.owner_user_id, spec.session_id,
+              spec.published_checkpoint_id, spec.published_at, spec.current_semantic_doc_seq,
+              spec.template_id, spec_template.name AS template_name
          FROM spec
-        WHERE id = $1`,
+         JOIN spec_template ON spec_template.id = spec.template_id
+        WHERE spec.id = $1`,
       [specId],
     );
     const row = result.rows[0];
@@ -89,6 +104,8 @@ export class PostgresSpecReadStore implements SpecReadStore {
       publishedCheckpointId: row.published_checkpoint_id,
       publishedAt: row.published_at,
       currentSemanticDocSeq: BigInt(row.current_semantic_doc_seq),
+      templateId: row.template_id,
+      templateName: row.template_name,
     };
   }
 
@@ -121,12 +138,16 @@ export interface SpecsRouteDeps {
   checkpointStore: SpecCheckpointStore;
   checkpoints: Pick<SpecCheckpointService, "restoreSection">;
   resolveMembership: ResolveSpecMembership;
+  /** The organization that owns every spec this deployment serves. */
+  orgId: string;
+  create: (request: CreateSpecRequest) => Promise<CreateSpecResult>;
   getSession?: GetSession;
 }
 
 export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
   const app = new Hono();
   const authorize = makeSpecMemberHeaderGuard(deps.resolveMembership, deps.getSession);
+  const getSession = deps.getSession ?? getSessionFromHeaders;
 
   async function requireMember(c: Context): Promise<{ specId: string; userId: string }> {
     const specId = c.req.param("id");
@@ -141,6 +162,58 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
     }
     return { specId, userId: result.user.id };
   }
+
+  /**
+   * Create a spec and the session that drafts it (R2-R6).
+   *
+   * Creation is REST, next to the rest of this surface, and not an rpc on the
+   * read service: `rpc/specs.ts` must never activate a session, and a test
+   * holds that property.
+   */
+  app.post("/api/v1/specs", async (c) => {
+    const session = await getSession(c.req.raw.headers);
+    if (!session) throw new HTTPException(401, { message: "unauthenticated" });
+    const actor = { id: session.user.id, role: session.user.role ?? "user" };
+    if (!abilityFor(actor).can("create", "Spec")) {
+      throw new HTTPException(403, { message: "forbidden" });
+    }
+    // An API key resolves through this same session, so the principal kind must
+    // reach the session compile: a service account has no per-user harness
+    // token, and the human path would boot it credential-less (ADR 0063 B4).
+    const ownerIsServiceAccount = isServiceAccountEmail(session.user.email ?? "");
+
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      throw new HTTPException(400, { message: "invalid JSON body" });
+    }
+
+    let result: CreateSpecResult;
+    try {
+      result = await deps.create({
+        orgId: deps.orgId,
+        ownerUserId: actor.id,
+        ...(ownerIsServiceAccount ? { ownerIsServiceAccount: true } : {}),
+        ...createSpecInput(body),
+      });
+    } catch (error) {
+      throw createSpecException(error);
+    }
+
+    return c.json(
+      {
+        spec: {
+          id: result.specId,
+          title: result.title,
+          sessionId: result.sessionId,
+          templateId: result.templateId,
+          lifecycle: "draft",
+        },
+      },
+      result.created ? 201 : 200,
+    );
+  });
 
   app.get("/api/v1/specs/:id", async (c) => {
     const { specId, userId } = await requireMember(c);
@@ -171,6 +244,9 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
         publishedCheckpointId: record.publishedCheckpointId,
         publishedAt: record.publishedAt?.toISOString() ?? null,
         revision: record.currentSemanticDocSeq.toString(),
+        // The spec locked this template when its session started (R3). The web
+        // renders it as a disabled control with that reason.
+        template: { id: record.templateId, name: record.templateName },
       },
       checkpoints: summaries.map(checkpointSummaryJson),
       publishedCheckpoint: publishedCheckpoint ? checkpointJson(publishedCheckpoint) : null,
@@ -236,6 +312,80 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
   });
 
   return app;
+}
+
+type CreateSpecInput = Omit<CreateSpecRequest, "orgId" | "ownerUserId">;
+
+/** Validate the create body. Every rejection is a 400 with the failing field. */
+function createSpecInput(body: unknown): CreateSpecInput {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new HTTPException(400, { message: "body must be an object" });
+  }
+  const input = body as Record<string, unknown>;
+  const title = input["title"];
+  if (title !== undefined && (typeof title !== "string" || title.length > SPEC_TITLE_MAX_CHARS)) {
+    throw new HTTPException(400, {
+      message: `title must be text of at most ${SPEC_TITLE_MAX_CHARS} characters`,
+    });
+  }
+  return {
+    templateId: uuidField(input["templateId"], "templateId"),
+    profileId: uuidField(input["profileId"], "profileId"),
+    problemStatement: problemStatement(input["problemStatement"]),
+    idempotencyKey: idempotencyKey(input["idempotencyKey"]),
+    ...(title === undefined ? {} : { title }),
+  };
+}
+
+function uuidField(value: unknown, field: string): string {
+  if (typeof value !== "string" || !UUID.test(value)) {
+    throw new HTTPException(400, { message: `${field} must be a UUID` });
+  }
+  return value;
+}
+
+function problemStatement(value: unknown): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new HTTPException(400, { message: "problemStatement must not be empty" });
+  }
+  if (value.length > SPEC_PROBLEM_MAX_CHARS) {
+    throw new HTTPException(400, {
+      message: `problemStatement must be at most ${SPEC_PROBLEM_MAX_CHARS} characters`,
+    });
+  }
+  return value;
+}
+
+function idempotencyKey(value: unknown): string {
+  if (typeof value !== "string" || value === "" || value.length > IDEMPOTENCY_KEY_MAX_CHARS) {
+    throw new HTTPException(400, {
+      message: `idempotencyKey must be text of at most ${IDEMPOTENCY_KEY_MAX_CHARS} characters`,
+    });
+  }
+  return value;
+}
+
+/** Map the create path's Connect codes onto this REST surface. An unknown
+ *  failure keeps its own type, so it still reaches the 500 handler. */
+function createSpecException(error: unknown): Error {
+  if (error instanceof HTTPException) return error;
+  if (!(error instanceof ConnectError)) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+  switch (error.code) {
+    case Code.NotFound:
+      return new HTTPException(404, { message: error.rawMessage });
+    case Code.AlreadyExists:
+      return new HTTPException(409, { message: error.rawMessage });
+    case Code.InvalidArgument:
+      return new HTTPException(400, { message: error.rawMessage });
+    case Code.FailedPrecondition:
+      return new HTTPException(422, { message: error.rawMessage });
+    case Code.PermissionDenied:
+      return new HTTPException(403, { message: error.rawMessage });
+    default:
+      return error;
+  }
 }
 
 function checkpointSummaryJson(checkpoint: SpecCheckpointSummary) {

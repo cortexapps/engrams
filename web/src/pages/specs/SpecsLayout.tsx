@@ -1,27 +1,32 @@
 import { Link, Outlet, useRouterState } from "@tanstack/react-router";
 import { Plus } from "lucide-react";
+import { useState } from "react";
 
 import { PageHeading } from "@/components/page-heading";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { NewSpecSheet } from "./NewSpecSheet";
 
 const tabClass =
   "inline-flex h-10 items-center border-b-2 px-1 text-sm font-medium transition-colors";
 
 export function SpecsLayout() {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
+  // v1 creates a spec from this page only (R6), never from a session composer.
+  const [creating, setCreating] = useState(false);
   return (
     <div className="section-sheet flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="shrink-0 px-4 pt-4 md:px-6 md:pt-6">
         <PageHeading
           title="Tech Specs"
           actions={
-            <Button disabled title="The spec creation flow is not available yet">
+            <Button onClick={() => setCreating(true)}>
               <Plus aria-hidden />
               New spec
             </Button>
           }
         />
+        <NewSpecSheet open={creating} onOpenChange={setCreating} />
         <nav aria-label="Tech Specs" className="mt-5 flex gap-6 border-b">
           <Link
             to="/specs"

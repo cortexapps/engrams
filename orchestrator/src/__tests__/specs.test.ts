@@ -14,6 +14,7 @@ import { encodeProseMirrorDocument, SpecDocumentReadOnlyError } from "../specs/d
 const SPEC_ID = "00000000-0000-4000-8000-000000001114";
 const PINNED_ID = "00000000-0000-4000-8000-000000001115";
 const CURRENT_ID = "00000000-0000-4000-8000-000000001116";
+const TEMPLATE_ID = "00000000-0000-4000-8000-000000000115";
 const TEMPLATE: SpecTemplate = {
   sections: [
     { id: "context", key: "context", title: "Context" },
@@ -48,6 +49,8 @@ class MemoryReadStore implements SpecReadStore {
     publishedCheckpointId: PINNED_ID,
     publishedAt: new Date("2026-08-10T01:00:00.000Z"),
     currentSemanticDocSeq: 3n,
+    templateId: TEMPLATE_ID,
+    templateName: "Engineering design doc",
   };
 
   async readSpec(specId: string): Promise<SpecReadRecord | null> {
@@ -118,6 +121,8 @@ function testApp(input?: {
       checkpoints: { restoreSection },
       resolveMembership: async (specId, candidateUserId) =>
         specId === SPEC_ID && candidateUserId === userId,
+      orgId: "org-1",
+      create: () => Promise.reject(new Error("unused")),
       getSession: async () => ({ user: { id: userId, name: "Grace" } }),
     }),
   );
@@ -154,6 +159,7 @@ describe("spec read routes", () => {
         publishedCheckpointId: string;
         publishedAt: string;
         revision: string;
+        template: { id: string; name: string };
       };
       publishedCheckpoint: { id: string; markdown: string; sections: Array<{ id: string }> };
       checkpoints: Array<{ label: string; author: { name: string } | null }>;
@@ -166,6 +172,8 @@ describe("spec read routes", () => {
       publishedCheckpointId: PINNED_ID,
       publishedAt: "2026-08-10T01:00:00.000Z",
       revision: "3",
+      // R3: the read surface names the template the spec locked at creation.
+      template: { id: TEMPLATE_ID, name: "Engineering design doc" },
     });
     expect(body.publishedCheckpoint.id).toBe(PINNED_ID);
     expect(body.publishedCheckpoint.markdown).toContain("## Context");

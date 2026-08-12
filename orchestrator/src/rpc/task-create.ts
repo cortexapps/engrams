@@ -717,6 +717,10 @@ export interface CreateTaskParams {
   effort?: string;
   /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
   harnessMode?: string;
+  /** ADR 0114 D3: the template snapshot that the new spec owns for its complete
+   *  lifetime. Shapes the spec-mode system prompt, and is used only when `type`
+   *  is "spec". Pass the snapshot the spec owns, never the live template row. */
+  specTemplate?: SpecPromptContext;
   /** Type-specific trigger ref recorded on the task row (operator-visible). */
   source?: Record<string, unknown>;
   /** Extra harness env merged LAST — e.g. the trigger's
@@ -1008,6 +1012,7 @@ export async function createTaskWithSession(
       ...(params.model != null ? { model: params.model } : {}),
       ...(params.effort != null ? { effort: params.effort } : {}),
       ...(params.harnessMode != null ? { harnessMode: params.harnessMode } : {}),
+      ...(params.specTemplate ? { specTemplate: params.specTemplate } : {}),
       ...(params.extraHarnessEnv ? { extraHarnessEnv: params.extraHarnessEnv } : {}),
       ...(owner ? { owner } : {}),
     },

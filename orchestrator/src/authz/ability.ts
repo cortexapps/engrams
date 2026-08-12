@@ -108,9 +108,11 @@ export function abilityFor(user: AbilityUser): AppAbility {
   can("manage", "Artifact", { ownerUserId: user.id });
   can("read", "Artifact", { visibility: "org" });
 
-  // Tech specs are shared with all organization members. The RPC and socket
-  // guards resolve membership before they apply this ability.
-  can("read", "Spec");
+  // Tech specs are shared with all organization members (ADR 0114 D12), so any
+  // member may read one and start one. The RPC and socket guards resolve
+  // membership before they apply this ability. Publishing stays owner-only and
+  // is checked on its own path.
+  can(["read", "create"], "Spec");
 
   // Admin override.
   if (user.role === "admin") can("manage", "all");
