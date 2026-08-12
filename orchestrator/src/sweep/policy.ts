@@ -21,6 +21,11 @@ export const SWEEP_POLICIES: Record<string, SweepPolicy> = {
   ReviewIngressWorkflow: { mode: "adopt", staleAfterHours: 1 },
   ToolExecWorkflow: { mode: "adopt", staleAfterHours: 1 },
   AutomationRunWorkflow: { mode: "adopt", staleAfterHours: 1 },
+  // A ticket sync is a handful of Linear calls, so an hour is generous. A
+  // stranded batch is rows a person asked to sync that never reached Linear,
+  // and adopting it is exactly what N4 makes safe: the ledger keeps the resumed
+  // batch from creating a second issue for a ticket that already has one.
+  SpecTicketSyncWorkflow: { mode: "adopt", staleAfterHours: 1 },
 };
 
 export type ResolvedPolicy = SweepPolicy | { mode: "alert-only" };
