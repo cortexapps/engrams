@@ -2,9 +2,15 @@
 
 import { z } from "zod";
 
-import type {
-  SpecSelectionSpan,
-  TrackedEditTranscriptChip,
+import {
+  SPEC_ALTERNATIVES_MAX_OPTIONS,
+  SPEC_ALTERNATIVES_MIN_OPTIONS,
+  SPEC_ALTERNATIVES_TRADEOFF_COUNT,
+  SPEC_TRADEOFF_SIGNS,
+  type SpecAlternativeOption,
+  type SpecAlternativesComparison,
+  type SpecSelectionSpan,
+  type TrackedEditTranscriptChip,
 } from "@engrams/spec-document";
 
 import type { ToolContext, ToolRegistry } from "./registry.ts";
@@ -133,6 +139,62 @@ const UpdateBlockInput = z.object({
   expected_rev: ExpectedRevision,
 });
 
+const OptionKey = z
+  .string()
+  .min(1)
+  .max(40)
+  .describe("Short card label, for example A");
+
+const AlternativeTradeoff = z.object({
+  sign: z.enum(SPEC_TRADEOFF_SIGNS).describe("+ for a gain, - for a cost, ~ for a caveat"),
+  text: z.string().min(1).max(400),
+});
+
+const AlternativeOption = z.object({
+  key: OptionKey,
+  title: z.string().min(1).max(200).describe("The one-line premise on the card"),
+  tradeoffs: z
+    .array(AlternativeTradeoff)
+    .length(SPEC_ALTERNATIVES_TRADEOFF_COUNT)
+    .describe("Exactly three signed trade-off lines"),
+});
+
+const ComparisonCell = z.object({
+  option_key: OptionKey,
+  value: z.string().min(1).max(400),
+});
+
+const ComparisonRow = z.object({
+  axis: z.string().min(1).max(200),
+  cells: z.array(ComparisonCell).min(SPEC_ALTERNATIVES_MIN_OPTIONS).max(SPEC_ALTERNATIVES_MAX_OPTIONS),
+});
+
+const ProposeAlternativesInput = z.object({
+  section_id: SectionId.describe("The alternatives section this set belongs to"),
+  options: z.array(AlternativeOption).min(SPEC_ALTERNATIVES_MIN_OPTIONS).max(SPEC_ALTERNATIVES_MAX_OPTIONS),
+  comparison_provenance: z
+    .string()
+    .min(1)
+    .max(500)
+    .describe("One caption that covers the comparison, for example a verified file and commit"),
+  comparison_rows: z
+    .array(ComparisonRow)
+    .min(1)
+    .max(20)
+    .describe("Numbers against numbers; one value for every option on each axis"),
+  lean_key: OptionKey.optional().describe("The option you lean towards; omit when you have none"),
+  expected_rev: ExpectedRevision,
+});
+
+const DecideAlternativeInput = z.object({
+  set_id: z.string().min(1).max(200).describe("The set_id returned by spec_propose_alternatives"),
+  option_key: OptionKey.optional().describe(
+    "The winning card; omit it when the author chose a hybrid that no card holds",
+  ),
+  reason: z.string().min(1).max(4_000).describe("Why the winner won; written into the section"),
+  expected_rev: ExpectedRevision,
+});
+
 const UpdateNotesInput = z.object({
   markdown: z.string().describe("Replacement working notes as Markdown"),
   expected_rev: ExpectedRevision,
@@ -180,6 +242,13 @@ const MutationOutput = z.object({
   checkpoint_id: z.string().uuid().optional(),
 });
 
+const ProposeAlternativesOutput = z.object({
+  set_id: z.string(),
+  applied: z.boolean(),
+  new_rev: Revision,
+  concurrent_editors: z.array(z.string()),
+});
+
 export interface SpecReference {
   id: string;
 }
@@ -196,6 +265,10 @@ export interface SpecMutationResult {
   concurrentEditors: string[];
   transcriptChip?: TrackedEditTranscriptChip;
   checkpointId?: string;
+}
+
+export interface SpecAlternativesProposalResult extends SpecMutationResult {
+  setId: string;
 }
 
 export interface SpecMutationContext {
@@ -241,6 +314,23 @@ export interface SpecToolDocumentService {
       sectionId: string;
       blockId: string;
       source: string;
+    },
+  ): Promise<SpecMutationResult>;
+  proposeAlternatives(
+    specId: string,
+    input: SpecMutationContext & {
+      sectionId: string;
+      options: SpecAlternativeOption[];
+      comparison: SpecAlternativesComparison;
+      leanKey: string | null;
+    },
+  ): Promise<SpecAlternativesProposalResult>;
+  decideAlternative(
+    specId: string,
+    input: SpecMutationContext & {
+      setId: string;
+      optionKey: string | null;
+      reason: string;
     },
   ): Promise<SpecMutationResult>;
   updateNotes(
@@ -554,6 +644,72 @@ export function registerSpecTools(
             source: args.source,
           }),
       );
+      return finishMutation(ctx, deps, spec.id, result);
+    },
+  });
+
+  registry.register({
+    name: "spec_propose_alternatives",
+    taskTypes: SPEC_TASK_TYPES,
+    description:
+      "Propose two or three alternatives as cards in the canvas. Each card carries a one-line premise and exactly three signed trade-off lines (+ gain, - cost, ~ caveat). The comparison holds the numbers, under one provenance caption that says what you verified them against. This stores the set; it does not write the section.",
+    input: ProposeAlternativesInput,
+    output: ProposeAlternativesOutput,
+    handling: "handled",
+    execution: "sync",
+    handler: async (ctx, args) => {
+      const spec = await requireSpec(ctx, deps);
+      const result = await withSectionPresence(ctx, deps, spec.id, args.section_id, () =>
+        deps.documents.proposeAlternatives(spec.id, {
+          ...mutationContext(ctx, args.expected_rev),
+          sectionId: args.section_id,
+          options: args.options.map((option) => ({
+            key: option.key,
+            title: option.title,
+            tradeoffs: option.tradeoffs.map((tradeoff) => ({
+              sign: tradeoff.sign,
+              text: tradeoff.text,
+            })),
+          })),
+          comparison: {
+            provenance: args.comparison_provenance,
+            rows: args.comparison_rows.map((row) => ({
+              axis: row.axis,
+              cells: row.cells.map((cell) => ({
+                optionKey: cell.option_key,
+                value: cell.value,
+              })),
+            })),
+          },
+          leanKey: args.lean_key ?? null,
+        }),
+      );
+      return {
+        set_id: result.setId,
+        applied: result.applied,
+        new_rev: result.newRev.toString(),
+        concurrent_editors: result.concurrentEditors,
+      };
+    },
+  });
+
+  registry.register({
+    name: "spec_decide_alternative",
+    taskTypes: SPEC_TASK_TYPES,
+    description:
+      "Record the pick for a proposed alternatives set and write the alternatives section with every option, the comparison, and the reason the winner won. Omit option_key when the author chose a hybrid that no card holds.",
+    input: DecideAlternativeInput,
+    output: MutationOutput,
+    handling: "handled",
+    execution: "sync",
+    handler: async (ctx, args) => {
+      const spec = await requireSpec(ctx, deps);
+      const result = await deps.documents.decideAlternative(spec.id, {
+        ...mutationContext(ctx, args.expected_rev),
+        setId: args.set_id,
+        optionKey: args.option_key ?? null,
+        reason: args.reason,
+      });
       return finishMutation(ctx, deps, spec.id, result);
     },
   });

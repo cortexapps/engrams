@@ -102,6 +102,11 @@ import { renderReviewer } from "./reviewers/render.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
 import { makeSpecRailRoute, PostgresSpecRailStore } from "./routes/spec-rail.ts";
+import { makeSpecAlternativesRoute } from "./routes/spec-alternatives.ts";
+import {
+  PostgresSpecAlternativesStore,
+  SpecAlternativesService,
+} from "./specs/alternatives.ts";
 import { makeSpecBlockIterationRoute } from "./routes/spec-block-iteration.ts";
 import { makeSpecTemplatesRoute } from "./routes/spec-templates.ts";
 import { makeSpecTemplateCatalog } from "./specs/template-catalog.ts";
@@ -126,9 +131,15 @@ const specSectionStates = new SectionStateService({
   store: new PostgresSectionStateStore(getPool()),
   now: specNow,
 });
+const specAlternatives = new SpecAlternativesService({
+  store: new PostgresSpecAlternativesStore(getPool()),
+  documents: specDocuments,
+  now: specNow,
+});
 const specToolService = new SpecToolService({
   documents: specDocuments,
   sectionStates: specSectionStates,
+  alternatives: specAlternatives,
   questions: new OpenQuestionService({
     store: specOpenQuestions,
     document: new SpecQuestionDocument(specDocuments, "spec-agent-question"),
@@ -246,6 +257,13 @@ app.route(
     store: new PostgresSpecRailStore(getPool()),
     documents: specDocuments,
     sectionStates: specSectionStates,
+    resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecAlternativesRoute({
+    alternatives: specAlternatives,
     resolveMembership: resolveSpecMembership,
   }),
 );

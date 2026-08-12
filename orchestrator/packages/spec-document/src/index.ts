@@ -23,6 +23,27 @@ export {
   type SpecRenderTargetRegistration,
 } from "./blocks.ts";
 export {
+  isSpecTradeoffSign,
+  renderAlternativesConsidered,
+  SPEC_ALTERNATIVES_MAX_OPTIONS,
+  SPEC_ALTERNATIVES_MIN_OPTIONS,
+  SPEC_ALTERNATIVES_TRADEOFF_COUNT,
+  SPEC_TRADEOFF_SIGNS,
+  SpecAlternativesError,
+  validateSpecAlternatives,
+  type AlternativesDecidedTranscriptChip,
+  type AlternativesProposedTranscriptChip,
+  type SpecAlternativeOption,
+  type SpecAlternativeTradeoff,
+  type SpecAlternativesComparison,
+  type SpecAlternativesComparisonCell,
+  type SpecAlternativesComparisonRow,
+  type SpecAlternativesProposal,
+  type SpecAlternativesStage,
+  type SpecAlternativesTranscriptChip,
+  type SpecTradeoffSign,
+} from "./alternatives.ts";
+export {
   createSectionRelativeAnchor,
   isRangeInSectionBody,
   parseSectionRelativeAnchor,

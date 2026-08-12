@@ -36,6 +36,11 @@ function documentService(
     addOpenQuestion: async (_specId, input) => mutation("addOpenQuestion", input),
     resolveOpenQuestion: async (_specId, input) => mutation("resolveOpenQuestion", input),
     updateBlock: async (_specId, input) => mutation("updateBlock", input),
+    proposeAlternatives: async (_specId, input) => ({
+      ...(await mutation("proposeAlternatives", input)),
+      setId: "set-1",
+    }),
+    decideAlternative: async (_specId, input) => mutation("decideAlternative", input),
     updateNotes: async (_specId, input) => mutation("updateNotes", input),
     proposeTickets: async (_specId, input) => mutation("proposeTickets", input),
   };
@@ -96,6 +101,8 @@ describe("spec tools", () => {
       "spec_add_open_question",
       "spec_resolve_open_question",
       "spec_update_block",
+      "spec_propose_alternatives",
+      "spec_decide_alternative",
       "spec_update_notes",
       "spec_propose_tickets",
     ]);
