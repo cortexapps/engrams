@@ -449,6 +449,13 @@
       "when": 1786530000000,
       "tag": "0063_spec_ticket_sync",
       "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "7",
+      "when": 1786540000000,
+      "tag": "0064_spec_participant_lease_contract",
+      "breakpoints": true
     }
   ]
 }

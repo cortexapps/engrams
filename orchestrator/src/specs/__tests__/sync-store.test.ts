@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import { drizzle } from "drizzle-orm/node-postgres";
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 import * as awarenessProtocol from "y-protocols/awareness";
 import * as Y from "yjs";
 
@@ -143,6 +143,20 @@ describe("PostgresSpecAwarenessBus", () => {
     });
   });
 });
+
+/** Run one drizzle migration file against the client's current search path. */
+async function applyMigration(client: PoolClient, fileName: string): Promise<void> {
+  const migration = await readFile(
+    new URL(`../../../drizzle/${fileName}`, import.meta.url),
+    "utf8",
+  );
+  for (const statement of migration
+    .split("--> statement-breakpoint")
+    .map((value) => value.trim())
+    .filter(Boolean)) {
+    await client.query(statement);
+  }
+}
 
 const DB_URL = process.env["ORCHESTRATOR_DATABASE_URL"];
 let livePool: Pool | null = DB_URL ? new Pool({ connectionString: DB_URL }) : null;
@@ -314,16 +328,7 @@ describe("PostgresSpecParticipantStore", () => {
           [specId, userId, initialTime],
         );
 
-        const migration = await readFile(
-          new URL("../../../drizzle/0055_spec_participant_rollout_contract.sql", import.meta.url),
-          "utf8",
-        );
-        for (const statement of migration
-          .split("--> statement-breakpoint")
-          .map((value) => value.trim())
-          .filter(Boolean)) {
-          await client.query(statement);
-        }
+        await applyMigration(client, "0055_spec_participant_rollout_contract.sql");
 
         const oldConnect = async (clientId: string, connectedAt: Date): Promise<void> => {
           await client.query(
@@ -547,6 +552,208 @@ describe("PostgresSpecParticipantStore", () => {
         ]);
       } finally {
         await documentPool?.end();
+        await client.query("SET search_path TO public");
+        await client.query(`DROP SCHEMA IF EXISTS ${quotedSchema} CASCADE`);
+        client.release();
+      }
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
+    "migration 0064 removes the rollout contract and keeps the lease writers",
+    async () => {
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const client = await livePool.connect();
+      const schemaName = `lease_contract_end_${randomUUID().replaceAll("-", "")}`;
+      const quotedSchema = `"${schemaName}"`;
+      const specId = randomUUID();
+      const userId = `contract-end-${randomUUID()}`;
+      const initialTime = new Date("2026-08-10T12:00:00.000Z");
+      const disconnectTime = new Date("2026-08-10T12:01:00.000Z");
+      const currentTime = new Date("2026-08-10T12:05:00.000Z");
+      try {
+        await client.query(`CREATE SCHEMA ${quotedSchema}`);
+        await client.query(`SET search_path TO ${quotedSchema}`);
+        await client.query(
+          `CREATE TABLE spec_participant (
+             spec_id uuid NOT NULL,
+             client_id text NOT NULL,
+             user_id text,
+             connection_epoch bigint DEFAULT 0 NOT NULL,
+             connected_at timestamptz NOT NULL,
+             disconnected_at timestamptz,
+             lease_expires_at timestamptz NOT NULL,
+             PRIMARY KEY (spec_id, client_id)
+           )`,
+        );
+        // A row that an old pod left connected before the expand migration.
+        await client.query(
+          `INSERT INTO spec_participant
+             (spec_id, client_id, user_id, connected_at, disconnected_at, lease_expires_at)
+           VALUES ($1, 'legacy-connected', $2, $3, NULL, $3)`,
+          [specId, userId, initialTime],
+        );
+
+        await applyMigration(client, "0055_spec_participant_rollout_contract.sql");
+
+        // Old-pod writes that the contract served: an insert without a lease,
+        // and a disconnect without an epoch predicate.
+        for (const clientId of ["legacy-inserted", "legacy-disconnected"]) {
+          await client.query(
+            `INSERT INTO spec_participant
+               (spec_id, client_id, user_id, connected_at, disconnected_at)
+             VALUES ($1, $2, $3, $4, NULL)`,
+            [specId, clientId, userId, initialTime],
+          );
+        }
+        await client.query(
+          `UPDATE spec_participant
+              SET disconnected_at = $3
+            WHERE spec_id = $1 AND client_id = $2`,
+          [specId, "legacy-disconnected", disconnectTime],
+        );
+        const beforeContract = await client.query<{ infinite_leases: string }>(
+          `SELECT count(*)::text AS infinite_leases
+             FROM spec_participant
+            WHERE connection_epoch = 0 AND lease_expires_at = 'infinity'::timestamptz`,
+        );
+        expect(beforeContract.rows).toEqual([{ infinite_leases: "3" }]);
+
+        // A current writer holds a finite lease across the contract migration.
+        let now = initialTime;
+        const participants = new PostgresSpecParticipantStore(
+          drizzle(client, { schema }),
+          () => now,
+          60_000,
+        );
+        const survivingEpoch = await participants.connect(specId, "current-client", userId);
+
+        await applyMigration(client, "0064_spec_participant_lease_contract.sql");
+
+        // The compatibility contract is gone: no default, no trigger, no function.
+        const columnDefault = await client.query<{ column_default: string | null }>(
+          `SELECT column_default
+             FROM information_schema.columns
+            WHERE table_schema = $1
+              AND table_name = 'spec_participant'
+              AND column_name = 'lease_expires_at'`,
+          [schemaName],
+        );
+        expect(columnDefault.rows).toEqual([{ column_default: null }]);
+        const leftovers = await client.query<{ triggers: string; functions: string }>(
+          `SELECT (SELECT count(*)::text
+                     FROM pg_trigger t
+                     JOIN pg_class c ON c.oid = t.tgrelid
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = $1
+                      AND t.tgname = 'spec_participant_legacy_lease_compat') AS triggers,
+                  (SELECT count(*)::text
+                     FROM pg_proc p
+                     JOIN pg_namespace n ON n.oid = p.pronamespace
+                    WHERE n.nspname = $1
+                      AND p.proname = 'spec_participant_legacy_lease_compat') AS functions`,
+          [schemaName],
+        );
+        expect(leftovers.rows).toEqual([{ triggers: "0", functions: "0" }]);
+
+        // Without the default, an old-pod insert can no longer land.
+        await expect(
+          client.query(
+            `INSERT INTO spec_participant
+               (spec_id, client_id, user_id, connected_at, disconnected_at)
+             VALUES ($1, 'post-contract-legacy', $2, $3, NULL)`,
+            [specId, userId, currentTime],
+          ),
+        ).rejects.toThrow('null value in column "lease_expires_at"');
+
+        // Every epoch-zero infinite lease is expired, so stale presence is gone.
+        const expired = await client.query<{ client_id: string; lease_is_tombstone: boolean }>(
+          `SELECT client_id, lease_expires_at = '-infinity'::timestamptz AS lease_is_tombstone
+             FROM spec_participant
+            WHERE connection_epoch = 0
+            ORDER BY client_id`,
+        );
+        expect(expired.rows).toEqual([
+          { client_id: "legacy-connected", lease_is_tombstone: true },
+          { client_id: "legacy-disconnected", lease_is_tombstone: true },
+          { client_id: "legacy-inserted", lease_is_tombstone: true },
+        ]);
+        const stillLive = await client.query<{ live: string }>(
+          `SELECT count(*)::text AS live
+             FROM spec_participant
+            WHERE lease_expires_at > $1::timestamptz`,
+          [currentTime],
+        );
+        expect(stillLive.rows).toEqual([{ live: "0" }]);
+
+        // The contract migration leaves the current writer's row alone.
+        const survivor = await client.query<{
+          connection_epoch: string;
+          lease_expires_at: Date;
+        }>(
+          `SELECT connection_epoch, lease_expires_at
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = 'current-client'`,
+          [specId],
+        );
+        expect(survivor.rows).toEqual([
+          {
+            connection_epoch: survivingEpoch.toString(),
+            lease_expires_at: new Date(initialTime.getTime() + 60_000),
+          },
+        ]);
+
+        // Connect, renew, and disconnect still write finite lease values.
+        now = currentTime;
+        const reconnectedEpoch = await participants.connect(specId, "current-client", userId);
+        expect(reconnectedEpoch).toBe(survivingEpoch + 1n);
+        const connected = await client.query<{
+          connection_epoch: string;
+          disconnected_at: Date | null;
+          lease_expires_at: Date;
+        }>(
+          `SELECT connection_epoch, disconnected_at, lease_expires_at
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = 'current-client'`,
+          [specId],
+        );
+        expect(connected.rows).toEqual([
+          {
+            connection_epoch: reconnectedEpoch.toString(),
+            disconnected_at: null,
+            lease_expires_at: new Date(currentTime.getTime() + 60_000),
+          },
+        ]);
+
+        const renewTime = new Date(currentTime.getTime() + 30_000);
+        now = renewTime;
+        expect(await participants.renew(specId, "current-client", reconnectedEpoch)).toBe(true);
+        const renewed = await client.query<{ lease_expires_at: Date }>(
+          `SELECT lease_expires_at
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = 'current-client'`,
+          [specId],
+        );
+        expect(renewed.rows).toEqual([
+          { lease_expires_at: new Date(renewTime.getTime() + 60_000) },
+        ]);
+
+        const disconnectedAt = new Date(renewTime.getTime() + 5_000);
+        now = disconnectedAt;
+        await participants.disconnect(specId, "current-client", reconnectedEpoch);
+        const closed = await client.query<{
+          disconnected_at: Date | null;
+          lease_is_tombstone: boolean;
+        }>(
+          `SELECT disconnected_at, lease_expires_at = '-infinity'::timestamptz AS lease_is_tombstone
+             FROM spec_participant
+            WHERE spec_id = $1 AND client_id = 'current-client'`,
+          [specId],
+        );
+        expect(closed.rows).toEqual([
+          { disconnected_at: disconnectedAt, lease_is_tombstone: true },
+        ]);
+      } finally {
         await client.query("SET search_path TO public");
         await client.query(`DROP SCHEMA IF EXISTS ${quotedSchema} CASCADE`);
         client.release();
