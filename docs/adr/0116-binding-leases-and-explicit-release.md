@@ -3,8 +3,9 @@
 - Status: Proposed
 - Date: 2026-08-12
 - Implementation record: PR #1212 (workstream B, PR B1: the boot
-  materializer + cold-boot slot fix) landed as groundwork before this
-  document. Later PRs are recorded here as they land.
+  materializer + cold-boot slot fix; merged 2026-08-12) landed as
+  groundwork before this document. Later PRs are recorded here as they
+  land.
 - Related: ADR 0090 (sandbox ownership is coordinator truth — refined
   here), ADR 0068 (probe-before-flip), ADR 0079 (session-op executor +
   fencing), ADR 0028 (eviction durability, Fix B cold boot), ADR 0045
@@ -93,6 +94,19 @@ remains the single authority on ownership. What changes is the set of
 admissible inputs to *revocation*: a host report, or lease expiry. Row
 staleness, failed probes, and missing host-local state are no longer
 grounds to clear a binding.
+
+The invariant has a data-flow corollary, learned during B1's review
+(#1212): **an input whose necessity only the callee knows is passed as
+a computation, not a pre-resolved value.** `evacuate_dead_source` used
+to take an eagerly-materialized cold-boot spec that only its disk-only
+rung consults; every caller then had to guess an error posture blind —
+swallow (conflates structural with transient) or propagate (gates the
+memory-snapshot rung on reads it never makes). Both postures were
+wrong because the parameter shape was wrong. The spec is now an
+un-awaited future the disk-only rung alone polls, and the rung-1 tests
+pass a poison future that panics if polled. Apply the same test to new
+seams this ADR introduces: if a caller must pre-resolve something a
+callee may not need, move the resolution behind the seam.
 
 The success metric is a net-negative diff: the lease and the tombstone
 replace the strike counters, grace windows, and rescue heuristics that
