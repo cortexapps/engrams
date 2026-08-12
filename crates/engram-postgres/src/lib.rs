@@ -4052,8 +4052,10 @@ impl MetadataStore for PostgresStore {
                                capacity_total_mib, capacity_used_mib,
                                running_sandboxes_count,
                                last_heartbeat_at, status, host_addr,
-                               capabilities, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                               capabilities, created_at,
+                               lease_expires_at, lease_state, lease_epoch)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    $14, CASE WHEN $14::timestamptz IS NULL THEN 'none' ELSE 'active' END, 1)
             ON CONFLICT (id) DO UPDATE SET
                 hostname                = EXCLUDED.hostname,
                 cloud_metadata          = EXCLUDED.cloud_metadata,
@@ -4066,7 +4068,20 @@ impl MetadataStore for PostgresStore {
                 status                  = EXCLUDED.status,
                 host_addr               = COALESCE(EXCLUDED.host_addr, hosts.host_addr),
                 capabilities            = EXCLUDED.capabilities,
-                updated_at              = $13
+                updated_at              = $13,
+                -- ADR 0116 A-D3: a register is a (possibly new) host-agent
+                -- generation adopting the host. It REPLACES the lease
+                -- deadline (successor presence ends a handoff early — no
+                -- GREATEST here, unlike the heartbeat renew), flips the
+                -- lease Active, and bumps the generation fence. A NULL
+                -- renewal target (legacy caller) leaves the lease columns
+                -- untouched.
+                lease_expires_at = COALESCE($14, hosts.lease_expires_at),
+                lease_state      = CASE WHEN $14::timestamptz IS NULL
+                                        THEN hosts.lease_state
+                                        ELSE 'active' END,
+                lease_epoch      = hosts.lease_epoch
+                                     + CASE WHEN $14::timestamptz IS NULL THEN 0 ELSE 1 END
             "#,
         )
         .bind(host.id.as_uuid())
@@ -4082,6 +4097,7 @@ impl MetadataStore for PostgresStore {
         .bind(host.host_addr.as_deref())
         .bind(capabilities)
         .bind(self.clock.now_utc())
+        .bind(host.lease_expires_at)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4111,6 +4127,7 @@ impl MetadataStore for PostgresStore {
                    util_committed_swap_mib,
                    ready_images, current_bundles, sandbox_bundles,
                    cordoned, total_vcpus, wire_version, stages_images, capabilities,
+                   lease_expires_at, lease_state, lease_epoch,
                    last_heartbeat_at, status, host_addr
             FROM hosts WHERE status IN ('ready','draining')
             ORDER BY id
@@ -4203,6 +4220,23 @@ impl MetadataStore for PostgresStore {
                       last_heartbeat_at = $21,
                       util_committed_swap_mib = $22,
                       sandbox_bundles = $23,
+                      -- ADR 0116 A-D3: the lease renewal rides the SAME
+                      -- per-heartbeat UPDATE (single writer, single clock).
+                      -- GREATEST: a predecessor's last racing heartbeat can
+                      -- never shrink a longer (handoff) deadline. The state
+                      -- CASE never demotes a declared handoff back to
+                      -- active — only a register (upsert_host) ends a
+                      -- handoff. A NULL renewal target (legacy/mock caller)
+                      -- leaves both columns untouched.
+                      lease_expires_at = CASE WHEN $24::timestamptz IS NULL
+                                              THEN hosts.lease_expires_at
+                                              ELSE GREATEST(COALESCE(hosts.lease_expires_at, $24), $24)
+                                         END,
+                      lease_state = CASE WHEN $24::timestamptz IS NULL
+                                              OR hosts.lease_state = 'handoff'
+                                         THEN hosts.lease_state
+                                         ELSE 'active'
+                                    END,
                       updated_at = $21
                  FROM previous
                 WHERE hosts.id = $1
@@ -4241,6 +4275,7 @@ impl MetadataStore for PostgresStore {
         .bind(self.clock.now_utc())
         .bind(hb.utilization.committed_swap_mib as i64)
         .bind(sandbox_bundles)
+        .bind(hb.lease_renew_until)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4296,6 +4331,7 @@ impl MetadataStore for PostgresStore {
                    util_committed_swap_mib,
                    ready_images, current_bundles, sandbox_bundles,
                    cordoned, total_vcpus, wire_version, stages_images, capabilities,
+                   lease_expires_at, lease_state, lease_epoch,
                    last_heartbeat_at, status, host_addr
               FROM hosts
              -- Only `ready` hosts are strike-out candidates. A `draining`
@@ -4318,6 +4354,71 @@ impl MetadataStore for PostgresStore {
             "#,
         )
         .bind(threshold_secs as i64)
+        .bind(self.clock.now_utc())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::host_from_row).collect()
+    }
+
+    async fn begin_host_handoff(
+        &self,
+        id: HostId,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        // ADR 0116 A-D2: GREATEST — repeated/racing declarations keep the
+        // max deadline; a handoff can only lengthen the lease. `dead` rows
+        // are excluded (a handoff on a dead host is meaningless; the row
+        // returns via register, which re-leases).
+        let n = sqlx::query(
+            r#"UPDATE hosts
+                  SET lease_state = 'handoff',
+                      lease_expires_at = GREATEST(COALESCE(lease_expires_at, $2), $2),
+                      updated_at = $3
+                WHERE id = $1 AND status <> 'dead'"#,
+        )
+        .bind(id.as_uuid())
+        .bind(until)
+        .bind(self.clock.now_utc())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    async fn list_lease_expired_hosts(
+        &self,
+        fallback_ttl_secs: u64,
+    ) -> Result<Vec<HostRecord>, MetaError> {
+        // ADR 0116 A-D4: the lease predicate. COALESCE is the mixed-fleet
+        // fallback (a pre-0115 row / never-renewed legacy host reads as
+        // `last_heartbeat_at + fallback_ttl`). Deliberately NO cordon
+        // multiplier — an explicit handoff deadline is the shield a
+        // planned operation gets. Only `ready` rows: draining/dead are
+        // host-affirmed states.
+        let rows = sqlx::query(
+            r#"
+            SELECT id, hostname, cloud_metadata,
+                   capacity_total_gb, capacity_used_gb,
+                   capacity_total_mib, capacity_used_mib,
+                   running_sandboxes_count,
+                   util_disk_total_mib, util_disk_used_mib,
+                   util_mem_total_mib, util_mem_used_mib, util_cpu_pct,
+                   allocatable_mib,
+                   util_base_shm_mib, util_parked_pss_mib, util_running_pss_mib,
+                   util_committed_swap_mib,
+                   ready_images, current_bundles, sandbox_bundles,
+                   cordoned, total_vcpus, wire_version, stages_images, capabilities,
+                   lease_expires_at, lease_state, lease_epoch,
+                   last_heartbeat_at, status, host_addr
+              FROM hosts
+             WHERE status = 'ready'
+               AND COALESCE(lease_expires_at,
+                            last_heartbeat_at + make_interval(secs => $1::bigint)) < $2
+            "#,
+        )
+        .bind(fallback_ttl_secs as i64)
         .bind(self.clock.now_utc())
         .fetch_all(&self.pool)
         .await

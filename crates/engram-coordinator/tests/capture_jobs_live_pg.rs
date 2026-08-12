@@ -115,6 +115,9 @@ async fn seed_host(
         wire_version: 0,
         stages_images: false,
         capabilities: engram_core::types::host::HostCapabilities::default(),
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
     })
     .await
     .expect("upsert host");
@@ -134,6 +137,7 @@ async fn seed_host(
             wire_version: engram_protocol::WIRE_VERSION,
             stages_images: false,
             capabilities: engram_core::types::host::HostCapabilities::default(),
+            lease_renew_until: None,
         },
     )
     .await

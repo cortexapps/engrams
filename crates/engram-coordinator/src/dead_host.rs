@@ -277,6 +277,46 @@ pub async fn run_once(
         .meta
         .list_stale_hosts(cfg.stale_threshold.as_secs())
         .await?;
+    // ADR 0116 A1: shadow the lease-expiry predicate against the legacy
+    // staleness heuristics WITHOUT acting on it — the observability ramp
+    // before the A3 cutover replaces `list_stale_hosts` with it. Best
+    // effort: a shadow read failure must not stall the real detector.
+    match state
+        .services
+        .meta
+        .list_lease_expired_hosts(crate::config::host_lease_ttl().num_seconds() as u64)
+        .await
+    {
+        Ok(lease_expired) => {
+            let stale: std::collections::HashSet<HostId> =
+                candidates.iter().map(|h| h.id).collect();
+            let lease: std::collections::HashSet<HostId> =
+                lease_expired.iter().map(|h| h.id).collect();
+            for id in lease.difference(&stale) {
+                ::metrics::counter!(
+                    crate::metrics::DEAD_HOST_LEASE_SHADOW_DISAGREE_TOTAL,
+                    "direction" => "lease_only"
+                )
+                .increment(1);
+                tracing::warn!(host_id = %id,
+                    "lease-shadow: lease expired but staleness heuristics shield this host \
+                     (expected mid-roll pre-handoff; A3 rolls make the handoff explicit)");
+            }
+            for id in stale.difference(&lease) {
+                ::metrics::counter!(
+                    crate::metrics::DEAD_HOST_LEASE_SHADOW_DISAGREE_TOTAL,
+                    "direction" => "stale_only"
+                )
+                .increment(1);
+                tracing::warn!(host_id = %id,
+                    "lease-shadow: staleness heuristics would strike a host whose lease is \
+                     still covered — the A3 cutover would have kept this host's sessions bound");
+            }
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "lease-shadow read failed; skipping comparison this tick");
+        }
+    }
     host_lost_straggler_sweep(cfg, state, straggler_strikes).await?;
     // A host that stopped being a candidate recovered (its heartbeats
     // are landing again) — drop its strikes/rescue history.

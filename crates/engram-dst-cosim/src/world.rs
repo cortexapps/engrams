@@ -296,6 +296,7 @@ fn host_heartbeat(
         wire_version: 1,
         stages_images: false,
         capabilities: Default::default(),
+        lease_renew_until: None,
     }
 }
 
@@ -317,5 +318,8 @@ fn host_record(id: HostId, clock: &Arc<SimClock>) -> HostRecord {
         wire_version: 1,
         stages_images: false,
         capabilities: Default::default(),
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
     }
 }

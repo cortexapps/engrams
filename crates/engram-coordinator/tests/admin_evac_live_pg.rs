@@ -247,6 +247,9 @@ async fn ensure_host_row(meta: &Arc<dyn MetadataStore>, host_id: HostId, label: 
         wire_version: 0,
         stages_images: false,
         capabilities: engram_core::types::host::HostCapabilities::default(),
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
     })
     .await
     .expect("upsert_host");
@@ -287,6 +290,9 @@ async fn seed_host_with(
         wire_version: 0,
         stages_images: false,
         capabilities: engram_core::types::host::HostCapabilities::default(),
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
     })
     .await
     .expect("upsert_host");
@@ -855,6 +861,7 @@ async fn durable_cordon_excludes_host_from_placement_on_every_replica() {
             wire_version: engram_protocol::WIRE_VERSION,
             stages_images: false,
             capabilities: engram_core::types::host::HostCapabilities::default(),
+            lease_renew_until: None,
         },
     )
     .await
@@ -925,6 +932,9 @@ async fn seed_ready_host(
         wire_version: 0,
         stages_images: false,
         capabilities: engram_core::types::host::HostCapabilities::default(),
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
     })
     .await
     .expect("seed host row");
@@ -1149,6 +1159,7 @@ async fn drain_dont_strand_guard_blocks_when_no_survivor_fits() {
                     wire_version: engram_protocol::WIRE_VERSION,
                     stages_images: false,
                     capabilities: engram_core::types::host::HostCapabilities::default(),
+                    lease_renew_until: None,
                 },
             )
             .await

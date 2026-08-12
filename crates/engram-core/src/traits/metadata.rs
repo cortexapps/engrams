@@ -1700,6 +1700,42 @@ pub trait MetadataStore: Send + Sync {
     /// operator and route a reattaching host's sessions to Idle.
     async fn list_stale_hosts(&self, threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError>;
 
+    /// ADR 0116 A-D2: declare a planned handoff for `id` — extend the
+    /// binding-lease deadline to at least `until` and flip
+    /// `lease_state = 'handoff'`. Written by the operator (before a
+    /// roll's pod delete) and by the host's SIGTERM ladder (best-effort
+    /// belt); GREATEST semantics, so repeated/racing declarations keep
+    /// the max deadline. Returns `false` when no row exists (or the
+    /// host is `dead` — a handoff on a dead host is meaningless).
+    /// Default body is a mock no-op (`Ok(false)`); PG and sim implement
+    /// the real semantics (conformance: `t_host_binding_lease`).
+    async fn begin_host_handoff(
+        &self,
+        id: HostId,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetaError> {
+        let _ = (id, until);
+        Ok(false)
+    }
+
+    /// ADR 0116 A-D4: hosts whose binding lease has expired — `ready`
+    /// rows with `COALESCE(lease_expires_at, last_heartbeat_at +
+    /// fallback_ttl) < now`. The COALESCE arm is the mixed-fleet
+    /// fallback for rows that predate migration 0115 or have never
+    /// been renewed. Deliberately NO cordon multiplier: an explicit
+    /// handoff deadline is the shield a planned operation gets. In A1
+    /// this only feeds the shadow-disagreement metric; the A3 cutover
+    /// makes it the death path's sole candidate source, replacing
+    /// `list_stale_hosts`. Default body is a mock no-op (`Ok(vec![])`);
+    /// PG and sim implement the real predicate.
+    async fn list_lease_expired_hosts(
+        &self,
+        fallback_ttl_secs: u64,
+    ) -> Result<Vec<HostRecord>, MetaError> {
+        let _ = fallback_ttl_secs;
+        Ok(Vec::new())
+    }
+
     /// Atomically (a) mark `host_id` as `Dead`, (b) clear `host_id`
     /// and `sandbox_id` on every non-terminal session pointed at it,
     /// (c) transition those sessions to `HostLost`.

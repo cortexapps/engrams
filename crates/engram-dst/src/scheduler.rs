@@ -1536,6 +1536,7 @@ fn sim_heartbeat(faithful: bool) -> engram_core::types::host::HostHeartbeat {
         },
         stages_images: faithful,
         capabilities: Default::default(),
+        lease_renew_until: None,
     }
 }
 
@@ -1586,5 +1587,8 @@ fn sim_host_record(
         },
         stages_images: faithful,
         capabilities: Default::default(),
+        lease_expires_at: None,
+        lease_state: Default::default(),
+        lease_epoch: 0,
     }
 }
