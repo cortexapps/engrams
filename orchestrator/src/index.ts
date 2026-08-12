@@ -128,6 +128,7 @@ import {
   SpecPublishScanner,
 } from "./specs/publish-scanner.ts";
 import { makeSpecPublishRoute } from "./routes/spec-publish.ts";
+import { makeSpecTicketRoute } from "./routes/spec-tickets.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
@@ -316,6 +317,13 @@ app.route(
   makeSpecPublishRoute({
     publish: specPublish,
     wake: (specId) => specPublishScanner.wake(specId),
+    resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecTicketRoute({
+    tickets: specTickets,
     resolveMembership: resolveSpecMembership,
   }),
 );
