@@ -282,6 +282,13 @@ export interface SpecMutationContext {
   expectedRev?: bigint;
 }
 
+/**
+ * A proposal stores a card set and writes no document, so it carries no
+ * revision guard. The type says so, which is what stops a guard from being
+ * accepted and then ignored.
+ */
+export type SpecProposalContext = Omit<SpecMutationContext, "expectedRev">;
+
 export interface SpecToolDocumentService {
   read(specId: string, sectionId?: string): Promise<LiveSpecRead>;
   updateSection(
@@ -322,7 +329,7 @@ export interface SpecToolDocumentService {
   ): Promise<SpecMutationResult>;
   proposeAlternatives(
     specId: string,
-    input: SpecMutationContext & {
+    input: SpecProposalContext & {
       sectionId: string;
       options: SpecAlternativeOption[];
       comparison: SpecAlternativesComparison;
@@ -379,14 +386,20 @@ export interface SpecToolDeps {
   presence: SpecAgentPresence;
 }
 
+function proposalContext(ctx: ToolContext): SpecProposalContext {
+  return {
+    ...(ctx.userId === undefined ? {} : { actorUserId: ctx.userId }),
+    sessionId: ctx.sessionId,
+    toolCallId: ctx.toolCallId,
+  };
+}
+
 function mutationContext(
   ctx: ToolContext,
   expectedRev: string | undefined,
 ): SpecMutationContext {
   return {
-    ...(ctx.userId === undefined ? {} : { actorUserId: ctx.userId }),
-    sessionId: ctx.sessionId,
-    toolCallId: ctx.toolCallId,
+    ...proposalContext(ctx),
     ...(expectedRev === undefined ? {} : { expectedRev: BigInt(expectedRev) }),
   };
 }
@@ -665,7 +678,7 @@ export function registerSpecTools(
       const spec = await requireSpec(ctx, deps);
       const result = await withSectionPresence(ctx, deps, spec.id, args.section_id, () =>
         deps.documents.proposeAlternatives(spec.id, {
-          ...mutationContext(ctx, undefined),
+          ...proposalContext(ctx),
           sectionId: args.section_id,
           options: args.options.map((option) => ({
             key: option.key,

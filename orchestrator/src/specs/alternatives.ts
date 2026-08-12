@@ -161,6 +161,7 @@ export interface SpecAlternativesServiceOptions {
 
 export interface ProposeAlternativesInput extends SpecAlternativesProposal {
   specId: string;
+  /** Must be the template's alternatives section; any other is refused. */
   sectionId: string;
   /** Stable per tool call, so a replayed call stores one set. */
   actionId: string;

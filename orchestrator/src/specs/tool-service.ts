@@ -29,6 +29,7 @@ import type {
   LiveSpecRead,
   SpecAlternativesProposalResult,
   SpecMutationContext,
+  SpecProposalContext,
   SpecMutationResult,
   SpecToolDocumentService,
 } from "../tools/specs.ts";
@@ -494,7 +495,7 @@ export class SpecToolService implements SpecToolDocumentService {
 
   async proposeAlternatives(
     specId: string,
-    input: SpecMutationContext & {
+    input: SpecProposalContext & {
       sectionId: string;
       options: SpecAlternativeOption[];
       comparison: SpecAlternativesComparison;
