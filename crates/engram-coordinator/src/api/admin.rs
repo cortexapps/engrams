@@ -442,9 +442,18 @@ pub(crate) async fn begin_host_handoff_core(
     ttl_secs: u64,
 ) -> Result<bool, ApiError> {
     // Clamp: a zero/absurd TTL is a caller bug, not a lease we want to
-    // honor. The ceiling (1 h) bounds how long a bad declaration can
-    // shield a genuinely dead host.
-    let ttl_secs = ttl_secs.clamp(1, 3600);
+    // honor. The ceiling is the SHARED `MAX_HANDOFF_TTL_SECS` (24 h) the
+    // operator also sizes against, so a legitimate roll budget is never
+    // silently truncated (#1218 review: a 1 h ceiling here undercut the
+    // operator's default ~102 min sizing). Clamping is LOUD — a
+    // truncated deadline written silently is exactly how a shield
+    // quietly stops covering the roll it exists for.
+    let requested = ttl_secs;
+    let ttl_secs = ttl_secs.clamp(1, engram_core::types::host::MAX_HANDOFF_TTL_SECS);
+    if ttl_secs != requested {
+        tracing::warn!(%host_id, requested, applied = ttl_secs,
+            "handoff TTL clamped — the declared deadline will NOT match the caller's sizing");
+    }
     let until = state.services.clock.now_utc() + chrono::Duration::seconds(ttl_secs as i64);
     let accepted = state
         .services
