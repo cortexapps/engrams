@@ -80,7 +80,7 @@ function notes(): SpecWorkingNotes {
   };
 }
 
-function paneUnder(input: { archived?: boolean; onDistill?: () => void } = {}) {
+function paneUnder(input: { archived?: boolean; readOnly?: boolean; onDistill?: () => void } = {}) {
   const doc = new Y.Doc();
   documents.push(doc);
   prosemirrorToYXmlFragment(
@@ -93,17 +93,20 @@ function paneUnder(input: { archived?: boolean; onDistill?: () => void } = {}) {
     WebSocketPolyfill: window.WebSocket,
   });
   providers.push(provider);
-  return render(
+  const pane = (readOnly: boolean) => (
     <SpecSectionTitleProvider titles={TITLES}>
       <SpecNotesPane
         doc={doc}
         provider={provider}
         user={USER}
         archived={input.archived ?? false}
+        readOnly={readOnly}
         {...(input.onDistill ? { onDistill: input.onDistill } : {})}
       />
-    </SpecSectionTitleProvider>,
+    </SpecSectionTitleProvider>
   );
+  const view = render(pane(input.readOnly ?? false));
+  return { ...view, setReadOnly: (readOnly: boolean) => view.rerender(pane(readOnly)) };
 }
 
 describe("the working notes pane", () => {
@@ -162,6 +165,20 @@ describe("the working notes pane", () => {
     button.click();
 
     expect(onDistill).toHaveBeenCalledTimes(1);
+  });
+
+  test("read-only reaches the mounted editor, in both directions", async () => {
+    // The width test settles one render after mount, so the pane can be created
+    // writable and told to stop. The creation option alone would miss that.
+    const view = paneUnder();
+    const editor = await screen.findByLabelText("Working notes text");
+    await waitFor(() => expect(editor.getAttribute("contenteditable")).toBe("true"));
+
+    view.setReadOnly(true);
+    await waitFor(() => expect(editor.getAttribute("contenteditable")).toBe("false"));
+
+    view.setReadOnly(false);
+    await waitFor(() => expect(editor.getAttribute("contenteditable")).toBe("true"));
   });
 
   test("the archive is read-only, and it says why", async () => {

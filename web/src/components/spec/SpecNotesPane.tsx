@@ -61,10 +61,11 @@ export function SpecNotesPane({
     ],
     [doc, provider, user],
   );
+  const writable = !archived && !readOnly;
   const editor = useEditor({
     extensions,
     immediatelyRender: false,
-    editable: !archived && !readOnly,
+    editable: writable,
     editorProps: {
       attributes: {
         class: "spec-notes-editor",
@@ -72,6 +73,12 @@ export function SpecNotesPane({
       },
     },
   });
+  // Both inputs change under a mounted editor: distillation archives the notes,
+  // and the width test settles one render after mount. The creation option
+  // alone would leave a phone with an editable pane.
+  useEffect(() => {
+    editor?.setEditable(writable);
+  }, [editor, writable]);
   const summary = useNotesSummary(editor);
   const trend = useUntaggedTrend(summary?.untaggedBullets ?? null);
 
