@@ -37,6 +37,7 @@ export function SpecNotesPane({
   provider,
   user,
   archived,
+  readOnly = false,
   onDistill,
   distilling = false,
   distillError = null,
@@ -45,6 +46,8 @@ export function SpecNotesPane({
   provider: WebsocketProvider;
   user: { name: string; color: string };
   archived: boolean;
+  /** True on a small screen, where the whole canvas is read-and-resolve (R51). */
+  readOnly?: boolean;
   /** Omit it when this viewer cannot close the stage. */
   onDistill?: () => void;
   distilling?: boolean;
@@ -61,7 +64,7 @@ export function SpecNotesPane({
   const editor = useEditor({
     extensions,
     immediatelyRender: false,
-    editable: !archived,
+    editable: !archived && !readOnly,
     editorProps: {
       attributes: {
         class: "spec-notes-editor",

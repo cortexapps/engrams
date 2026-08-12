@@ -30,6 +30,11 @@
   gap: 0.25rem;
 }
 
+.spec-canvas-read-only {
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+}
+
 .spec-presence {
   min-width: 0;
   justify-content: flex-end;
