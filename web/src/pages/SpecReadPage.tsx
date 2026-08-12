@@ -14,6 +14,7 @@ import {
 import { SpecGapCheckPanel } from "@/components/spec/SpecGapCheckPanel";
 import { SpecPublishControl } from "@/components/spec/SpecPublishControl";
 import { SpecSectionRail, type SpecRailAction } from "@/components/spec/SpecSectionRail";
+import { SpecTicketSyncPanel } from "@/components/spec/SpecTicketSyncPanel";
 import { SpecTicketTree } from "@/components/spec/SpecTicketTree";
 import { Markdown } from "@/components/Markdown";
 import { Badge } from "@/components/ui/badge";
@@ -77,6 +78,8 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   const [gapCheckOpen, setGapCheckOpen] = useState(false);
   // The section a publish blocker sent the person to (mock 2k).
   const [focusedSectionId, setFocusedSectionId] = useState<string | null>(null);
+  // Ticketize takes it the same way, and only after publish (mock 2l).
+  const [ticketsOpen, setTicketsOpen] = useState(false);
   useDocumentTitle(read.data?.spec.title ?? "Tech spec");
 
   useEffect(() => {
@@ -86,6 +89,7 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
     setActionError(null);
     setPendingSectionId(null);
     setFocusedSectionId(null);
+    setTicketsOpen(false);
   }, [publishedId, specId]);
 
   if (read.isPending || rail.isPending) return <SpecReadLoading />;
@@ -156,9 +160,14 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
           <LockedTemplate name={spec.template.name} />
         </div>
         <div className="spec-read-header-actions">
-          {!gapCheckOpen && (
+          {!gapCheckOpen && !ticketsOpen && (
             <Button variant="outline" onClick={() => setGapCheckOpen(true)}>
               Gap check
+            </Button>
+          )}
+          {!isDraft && !gapCheckOpen && !ticketsOpen && (
+            <Button variant="outline" onClick={() => setTicketsOpen(true)}>
+              Tickets
             </Button>
           )}
           {spec.sessionId && (
@@ -190,6 +199,12 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
               editable={isDraft}
               onBack={() => setGapCheckOpen(false)}
             />
+          </section>
+        </div>
+      ) : ticketsOpen ? (
+        <div className="spec-read-layout">
+          <section className="spec-read-document" aria-label="Tickets">
+            <SpecTicketSyncPanel specId={specId} onBack={() => setTicketsOpen(false)} />
           </section>
         </div>
       ) : (

@@ -643,6 +643,80 @@ export const specTicketDraft = pgTable(
   ],
 );
 
+/** The status of one reserved sync operation. */
+export type SpecTicketSyncOperationStatus = "reserved" | "complete" | "failed";
+
+/**
+ * The Linear sync idempotency ledger (ADR 0114 D6, N4).
+ *
+ * The shape is `coordination_operation` from ADR 0113: a primary key of
+ * (caller, operation, idempotency key), a canonical hash of the request, the
+ * ids the operation reserved before it ran, a status, and the result. The
+ * caller here is the spec, because a batch belongs to a spec and not to a
+ * session — the person who starts a sync may close the tab, and the batch must
+ * still finish.
+ *
+ * `reserved_external_id` is what makes a retry safe. A Linear issue id is
+ * chosen by us before the create, so a driver that dies between the create and
+ * the ledger write can look the issue up by that id and adopt it, instead of
+ * creating a second one.
+ */
+export const specTicketSyncOperation = pgTable(
+  "spec_ticket_sync_operation",
+  {
+    callerSpecId: uuid("caller_spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    operation: text("operation").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    requestHash: text("request_hash").notNull(),
+    status: text("status").$type<SpecTicketSyncOperationStatus>().notNull().default("reserved"),
+    reservedTicketId: uuid("reserved_ticket_id"),
+    /** The Linear id this operation will create, chosen before it runs. */
+    reservedExternalId: text("reserved_external_id"),
+    /** How many times a driver has run this operation. 0 means never. */
+    attempts: integer("attempts").notNull().default(0),
+    result: jsonb("result").$type<Record<string, unknown>>(),
+    error: text("error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [
+    primaryKey({ columns: [t.callerSpecId, t.operation, t.idempotencyKey] }),
+    index("spec_ticket_sync_operation_ticket_idx").on(t.reservedTicketId),
+  ],
+);
+
+/**
+ * The per-spec sync target (R45).
+ *
+ * Team, project and labels default from the org connector's configuration. A
+ * person may override them for one spec at sync time, and the override lands
+ * here — never back on the org default, which is the whole point of the
+ * requirement. A spec with no row uses the org defaults.
+ *
+ * The names ride beside the ids so the ledger can say "team · Platform"
+ * without a second call to Linear.
+ */
+export const specTicketSyncConfig = pgTable("spec_ticket_sync_config", {
+  specId: uuid("spec_id")
+    .primaryKey()
+    .references(() => spec.id, { onDelete: "cascade" }),
+  teamId: text("team_id"),
+  teamName: text("team_name"),
+  projectId: text("project_id"),
+  projectName: text("project_name"),
+  labelIds: jsonb("label_ids").$type<string[]>().notNull().default([]),
+  labelNames: jsonb("label_names").$type<string[]>().notNull().default([]),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow()
+    .$onUpdate(() => new Date()),
+});
+
 // ---------------------------------------------------------------------------
 // Papercuts
 // ---------------------------------------------------------------------------

@@ -70,6 +70,7 @@ import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
 import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread.ts";
 import { setReviewControlPlane } from "./workflows/pr-review.ts";
 import { setReviewIngressControlPlane } from "./workflows/review-ingress.ts";
+import { startSpecTicketSyncWorkflow } from "./workflows/spec-ticket-sync.ts";
 import { makeSlackPolicy } from "./integrations/slack-policy.ts";
 import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
 import { makeReviewControlPlane } from "./workflows/review-control-plane.ts";
@@ -129,6 +130,11 @@ import {
 } from "./specs/publish-scanner.ts";
 import { makeSpecPublishRoute } from "./routes/spec-publish.ts";
 import { makeSpecTicketRoute } from "./routes/spec-tickets.ts";
+import { makeSpecTicketSyncRoute } from "./routes/spec-ticket-sync.ts";
+import { makeLinearIssueClient } from "./integrations/linear-issues.ts";
+import { SpecTicketSyncService } from "./specs/ticket-sync-service.ts";
+import { PostgresSpecTicketSyncStore } from "./specs/ticket-sync-store.ts";
+import { makeSpecTicketSyncConnector } from "./specs/ticket-sync-connector.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
@@ -147,10 +153,21 @@ const specSectionStates = new SectionStateService({
 });
 // The post-publish ticket tree (ADR 0114 D6). It reads the pinned checkpoint,
 // never the live head, so every §backlink stays resolvable.
+const specLinear = makeLinearIssueClient();
 const specTickets = new SpecTicketTreeService({
   store: new PostgresSpecTicketStore(getPool()),
   pinned: new PostgresPinnedSpecReader(getPool()),
   newId: () => randomUUID(),
+});
+// Linear sync (ADR 0114 D6, N4). The route records the intent; a DBOS workflow
+// creates the issues, one durable step per ticket, so a pod roll resumes the
+// batch and the ledger keeps a retry from creating a second issue.
+const specTicketSync = new SpecTicketSyncService({
+  store: new PostgresSpecTicketSyncStore(getPool()),
+  linear: specLinear,
+  connector: makeSpecTicketSyncConnector(),
+  log: log.child({ component: "spec-ticket-sync" }),
+  start: startSpecTicketSyncWorkflow,
 });
 const specToolService = new SpecToolService({
   documents: specDocuments,
@@ -325,6 +342,14 @@ app.route(
   makeSpecTicketRoute({
     tickets: specTickets,
     resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecTicketSyncRoute({
+    sync: specTicketSync,
+    resolveMembership: resolveSpecMembership,
+    readWorkspace: () => specLinear.readWorkspace(),
   }),
 );
 app.route(
