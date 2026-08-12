@@ -20,6 +20,7 @@ import type {
   GapFindingKind,
   GapFindingSeverity,
   GapProposedDiff,
+  SpecTicketSyncState,
   SpecTranscriptChip,
   TraceabilityMatrix,
 } from "@engrams/spec-document";
@@ -595,15 +596,6 @@ export const specPublish = pgTable(
       .where(sql`${t.state} <> 'complete'`),
   ],
 );
-
-/**
- * How far one draft has travelled towards the issue tracker (R41).
- *
- * The ticket tree owns `draft`; the sync leg owns every other value. A failed
- * row keeps its place in the tree and carries its reason, because a spec that
- * says six tickets and ships four is a trust problem.
- */
-export type SpecTicketSyncState = "draft" | "queued" | "syncing" | "synced" | "failed";
 
 /**
  * One proposed ticket (ADR 0114 D6, R39-R40).

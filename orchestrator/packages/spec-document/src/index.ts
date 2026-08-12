@@ -99,6 +99,37 @@ export {
   type TraceabilityVerdict,
 } from "./traceability.ts";
 export {
+  addTicket,
+  childrenOf,
+  deleteTicket,
+  descendantIds,
+  mergeTickets,
+  moveTicket,
+  normalizeTree,
+  orderedTree,
+  splitTicket,
+  SpecTicketTreeError,
+  treeDepths,
+  updateTicket,
+  type AddTicketInput,
+  type MergeTicketsInput,
+  type MoveTicketInput,
+  type SpecTicketNode,
+  type SpecTicketSyncState,
+  type SpecTicketTreeErrorCode,
+  type SplitPart,
+  type UpdateTicketInput,
+} from "./ticket-tree.ts";
+export {
+  backlinkBody,
+  backlinkHref,
+  backlinkLabel,
+  backlinkLine,
+  specTicketBacklink,
+  withBacklink,
+  type SpecTicketBacklink,
+} from "./ticket-backlink.ts";
+export {
   SPEC_FRAGMENT_NAME,
   createTemplateDocument,
   findSection,
