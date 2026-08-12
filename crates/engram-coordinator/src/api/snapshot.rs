@@ -1195,17 +1195,10 @@ async fn resume_disk_only_cold_boot(
     ctx: &crate::session_ops::OpCtx<'_>,
     session: Session,
 ) -> Result<SnapshotResponse, ApiError> {
-    use crate::evacuation::{evacuate_dead_source, resolve_cold_boot_spec, EvacError};
+    use crate::evacuation::{evacuate_dead_source, EvacError};
 
     let state = ctx.state;
     let id = session.id;
-    let Some(spec) = resolve_cold_boot_spec(&state.services.meta, &session).await else {
-        return Err(ApiError::Conflict(format!(
-            "session {id} has only a live disk manifest and its image `{}` is no \
-             longer enabled — re-enable it (POST /api/enabled-images), then retry /resume",
-            session.image,
-        )));
-    };
 
     // The previous host isn't dead here (Idle = the sandbox was
     // destroyed); clearing host_id disables `exclude_host` so a
@@ -1223,7 +1216,11 @@ async fn resume_disk_only_cold_boot(
         &state.services.meta,
         relocatable,
         None,
-        Some(spec),
+        // ADR 0116: lazily materialized — this path is disk-only by
+        // construction (no snapshot above), so the rung-2 branch always
+        // awaits it; the laziness keeps ONE call shape with the
+        // evac-resumer leg, where rung-1 must never run these reads.
+        crate::boot_materializer::materialize_cold_boot(state, &session),
         None,
         // ADR 0045 C2 (E2B fold, origin affinity): prefer the host the
         // session last ran on — its NBD chunk cache (and base shm) are
@@ -1246,6 +1243,17 @@ async fn resume_disk_only_cold_boot(
         EvacError::NoTargetAvailable(_) => ApiError::Unavailable(format!(
             "no host can take the disk-only cold-boot recovery right now: {e}. \
              Retry shortly.",
+        )),
+        // Image un-enabled: structural, user-actionable — same message the
+        // eager pre-check used to produce.
+        EvacError::ColdBootUnavailable(_) => ApiError::Conflict(format!(
+            "session {id} has only a live disk manifest and its image `{}` is no \
+             longer enabled — re-enable it (POST /api/enabled-images), then retry /resume",
+            session.image,
+        )),
+        // Transient slot-resolution read: retryable, not terminal.
+        EvacError::SpecResolution(_) => ApiError::Unavailable(format!(
+            "cold-boot spec resolution hit a transient error: {e}. Retry shortly.",
         )),
         _ => ApiError::Internal(format!("disk-only cold-boot recovery failed: {e}")),
     })?;
@@ -1745,9 +1753,8 @@ async fn resume_from_fc_snapshot(
     // can't be resolved (image un-enabled, etc.) we fall back to the
     // pre-0072 soft `None` posture — the tier-0 DISK veto (the primary
     // locality signal) still fires regardless.
-    let resume_budget = crate::evacuation::resolve_cold_boot_spec(&state.services.meta, &session)
-        .await
-        .map(|spec| (spec.memory.max_mib, spec.cpu.vcpus));
+    let resume_budget =
+        crate::boot_materializer::resolve_resume_budget(&state.services.meta, &session).await;
     let ctx = ScheduleContext {
         repo: image_repo,
         image_version: image_tag,

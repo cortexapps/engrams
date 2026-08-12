@@ -1319,7 +1319,7 @@ pub async fn claim_capture_job(
         allow_hosts: Vec::new(),
         allow_host_patterns: Vec::new(),
     };
-    let spec = crate::api::sessions::cold_boot_spec(
+    let spec = crate::boot_materializer::capture_boot_spec(
         &capture_uri,
         &config,
         Some(disk_manifest),

@@ -233,6 +233,12 @@ The deliberate site list (each addition gets a one-line entry here):
    work is closing bypasses).
 6. `terminal_target` legality — upgrade the existing debug assertion to the
    shared macro for `#[track_caller]` diagnostics.
+7. Cold-boot argv-slot agreement in `boot_materializer::materialize_cold_boot`
+   (ADR 0116) — always-on: a spec whose harness argv points at an unbacked
+   `dyn` slot converts every downstream resume attempt into a deterministic
+   spawn-ENOENT loop (the 2026-08-12 incident); failing the op loudly is
+   strictly better, and the coordinator is stateless over PG so the redrive
+   is safe.
 
 **Landed (H6 macro PR).** The two macros live in `engram-core/src/invariant.rs`
 (the `tracing` facade — no subscriber, no I/O — is the only new dep; the no-I/O

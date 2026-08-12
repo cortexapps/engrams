@@ -61,7 +61,7 @@ use engram_core::types::BindingDisposition;
 use engram_core::types::{Session, SessionState};
 
 use crate::api::snapshot::{finish_resume_to_active, FinishResumeOutcome};
-use crate::evacuation::{evacuate_dead_source, resolve_cold_boot_spec, EvacError};
+use crate::evacuation::{evacuate_dead_source, EvacError};
 use crate::state::{SessionEvent, SharedState};
 
 /// Issue #214: max age of an operator teleport pin before the evac
@@ -453,19 +453,16 @@ async fn run_resume_pipeline(
         .filter(|s| s.memory_manifest.is_some())
         .and_then(|s| s.events_cursor);
 
-    // ADR 0028 Fix B: pre-resolve the disk-only cold-boot spec. Only
-    // consulted when no coherent memory snapshot is usable; a `None`
-    // there fails structurally rather than burning the budget.
-    let cold_boot_spec = resolve_cold_boot_spec(&state.services.meta, &session).await;
-
     // #800 (RESERVED evac placement): the session's reserved 2D budget,
     // resolved from the enabled image the same way the resume verb resolves
-    // it (`resume_from_fc_snapshot`). `None` (image un-enabled) keeps the
-    // pre-#800 capacity-soft placement inside `evacuate_dead_source`. Read
-    // here, before `cold_boot_spec` is moved into the call below.
-    let evac_budget = cold_boot_spec
-        .as_ref()
-        .map(|s| (s.memory.max_mib, s.cpu.vcpus));
+    // it. `None` (image un-enabled) keeps the pre-#800 capacity-soft
+    // placement inside `evacuate_dead_source`. Deliberately the LIGHT
+    // probe (ADR 0116): the full cold-boot materialization is passed
+    // below as an un-awaited future that only the disk-only rung runs —
+    // a rung-1 memory-snapshot recovery must never fail (or even do the
+    // reads) for slot resolution it will not consult.
+    let evac_budget =
+        crate::boot_materializer::resolve_resume_budget(&state.services.meta, &session).await;
 
     // ADR 0045 Phase F: an operator-pinned teleport destination, if any.
     // Honored strictly (a bad pin retries then falls back to Idle, never
@@ -514,7 +511,8 @@ async fn run_resume_pipeline(
         &state.services.meta,
         session.clone(),
         snapshot,
-        cold_boot_spec,
+        // ADR 0116: un-awaited — only the disk-only rung inside runs it.
+        crate::boot_materializer::materialize_cold_boot(state, &session),
         require_host,
         // No origin preference: every scanner producer (drain, dead
         // host, migration parachute) is moving AWAY from the source.
