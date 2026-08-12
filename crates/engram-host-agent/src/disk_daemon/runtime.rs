@@ -303,8 +303,10 @@ impl Drop for NbdHandle {
         self.shared
             .released
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Abort the serve loop first (its socket half dying is what
-        // the kernel's recv worker observes), then issue the netlink
+        // Abort the supervisor first — the serve loop is polled INLINE
+        // inside it (never a child task, #1221 review), so this abort
+        // cancels the serve future and drops its socket half, which is
+        // what the kernel's recv worker observes. Then issue the netlink
         // disconnect from a detached thread: the genl round-trip is
         // normally instant, but it can wait on in-flight kernel-side
         // teardown and Drop often runs on a tokio worker (ADR 0017
@@ -1519,7 +1521,17 @@ async fn supervise(
     let mut restarts: Vec<std::time::Instant> = Vec::new();
     'serve: loop {
         let Some(s) = stream.take() else { return };
-        let mut serve = tokio::spawn(serve_loop(backend.clone(), s, device_label.clone()));
+        // #1221 review (HIGH): the serve loop is polled INLINE — never
+        // spawned as a child task. Aborting a task does not cancel its
+        // children, so a spawned loop would survive `Drop`/`abandon()`'s
+        // abort of the supervisor as a detached zombie holding the
+        // socket open: the kernel never marks the connection dead, and
+        // the reattach BLKFLSBUF-failure path ("nothing serves reads
+        // meanwhile") would silently serve stale predecessor pages
+        // (#810 class). Inline, cancelling the supervisor cancels this
+        // future, dropping the stream halves — the socket dies exactly
+        // as the pre-C2 direct abort did.
+        let mut serve = std::pin::pin!(serve_loop(backend.clone(), s, device_label.clone()));
         if confirm_pending {
             // Rejection-aware confirm: a kernel-swallowed RECONFIGURE
             // (clean-ACKed ENOSPC) EOFs the loop within ms; a socket that
@@ -1543,7 +1555,7 @@ async fn supervise(
                     // Adopted. (`confirm_pending` needs no reset: every
                     // re-configure below sets it true again explicitly.)
                     let _ = shared.status_tx.send(ServeStatus::Serving);
-                    let _ = serve.await;
+                    serve.as_mut().await;
                     if shared.released() {
                         return;
                     }
@@ -1561,7 +1573,7 @@ async fn supervise(
             }
         } else {
             let _ = shared.status_tx.send(ServeStatus::Serving);
-            let _ = serve.await;
+            serve.as_mut().await;
             if shared.released() {
                 return;
             }
