@@ -140,12 +140,12 @@ impl SandboxBackendChoice {
 }
 
 /// ADR 0116 A-D1: the host binding-lease TTL. Every heartbeat renews the
-/// lease to `now + TTL` (register replaces it outright); enforcement (A3)
-/// reads `lease_expires_at` and nothing else. Default 45 s — heartbeat
-/// q5s ⇒ ~9 missed beats; today's effective detection is already ~50-60 s
-/// once the probe strikes add their share, so the kill-9 deliverable is
-/// preserved with less machinery. Env `ENGRAM_HOST_LEASE_TTL_SECS`
-/// overrides (read once per process).
+/// lease to `now + TTL` (register replaces it outright), and the death
+/// path (A-D4) reads `lease_expires_at` and nothing else. Default 45 s —
+/// heartbeat q5s ⇒ ~9 missed beats before expiry, matching the retired
+/// staleness path's ~50-60 s effective detection, so the kill-9
+/// deliverable is preserved with less machinery. Env
+/// `ENGRAM_HOST_LEASE_TTL_SECS` overrides (read once per process).
 pub fn host_lease_ttl() -> chrono::Duration {
     static SECS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     let secs = *SECS.get_or_init(|| {

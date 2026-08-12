@@ -1,6 +1,6 @@
 //! Live-Postgres regression for issue #230: host lifecycle transition
 //! discipline. The dead-host sweep
-//! (`mark_host_dead_and_orphan_sessions`) marks a partitioned host
+//! (`mark_host_dead_if_lease_expired`) marks a partitioned host
 //! `dead` and unbinds its sessions. Before the fix, the host's very
 //! next heartbeat did a blind `UPDATE hosts SET status = $2` and flipped
 //! `dead -> ready`, resurrecting a zombie host into the schedulable set
@@ -113,7 +113,7 @@ async fn heartbeat_cannot_resurrect_a_dead_host() {
     // The dead-host sweep marks the partitioned host dead + orphans its
     // sessions (none here — the host-status flip is what we're asserting).
     store
-        .mark_host_dead_and_orphan_sessions(id)
+        .mark_host_dead_if_lease_expired(id)
         .await
         .expect("mark dead");
     assert_eq!(

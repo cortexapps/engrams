@@ -4,8 +4,25 @@
 - Date: 2026-08-12
 - Implementation record: PR #1212 (workstream B, PR B1: the boot
   materializer + cold-boot slot fix; merged 2026-08-12) landed as
-  groundwork before this document. Later PRs are recorded here as they
-  land.
+  groundwork before this document. #1215 (A1 lease substrate), #1218
+  (A2 handoff writers), #1216 (C1 NBD observability), #1221 (C2 serve
+  supervisor), #1222 (B2 resume fold) followed. The A3 death-path
+  cutover landed with prod evidence from the first shielded roll
+  (2026-08-12: five nodes, operator handoff → durable marker → belt
+  POST → successor adoption at 36-44 s each, zero orphans,
+  `stale_only` shadow disagreements = 0). A3 divergences from the
+  Proposed text: (1) the mark's raced-renewal abort is a `Conflict` +
+  info log + counter (`engram_dead_host_mark_aborted_lease_renewed_
+  total`), NOT a `soft_invariant!` — a late heartbeat landing between
+  the list read and the row-locked re-check is a legal race the abort
+  exists to absorb, and an invariant that fires on legal races trains
+  alert fatigue; (2) the A1 COALESCE heartbeat fallback in the expiry
+  list is retired one deploy cycle after A1 as scheduled, and a NULL
+  lease on a ready row now reads as EXPIRED (no lease ⇒ no shield;
+  the probe-rescue writes a live host's first lease, so the state is
+  self-healing); (3) the operator's Unimplemented tolerance for
+  pre-A2 coordinators died in A3 per the scaffolding ledger. Later
+  PRs are recorded here as they land.
 - Related: ADR 0090 (sandbox ownership is coordinator truth — refined
   here), ADR 0068 (probe-before-flip), ADR 0079 (session-op executor +
   fencing), ADR 0028 (eviction durability, Fix B cold boot), ADR 0045

@@ -205,8 +205,8 @@ pub async fn run_with_registry_and_local(
     // (ADR 0098 D4): cross-replica mutual exclusion is a MetadataStore
     // leasing row (`dead_host_inflight`), not an advisory lock on a
     // private PgPool — so it works against any store, including the
-    // simulator. A stale heartbeat triggers eviction within
-    // ~poll_interval + stale_threshold.
+    // simulator. An expired binding lease (ADR 0116 A-D4) triggers
+    // eviction within ~host_lease_ttl + poll_interval.
     let _dead_host = dead_host::spawn(dead_host::DeadHostConfig::default(), state.clone());
     // ADR 0018 commit 12c: the evac-resumer scanner picks up sessions
     // marked Evacuating (by the admin /drain, /evacuate, or

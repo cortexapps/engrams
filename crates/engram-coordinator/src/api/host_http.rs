@@ -568,11 +568,11 @@ pub async fn heartbeat(
     // (`draining` = the agent's own shutdown flag); the
     // coordinator-owned `cordoned` bit is deliberately not written here.
     //
-    // Issue #231: this persist is NOT best-effort. It advances the
-    // host's `last_heartbeat_at`, which is exactly what the dead-host
-    // detector keys on (`list_stale_hosts`: ready + last_heartbeat_at
-    // older than the stale threshold → mark dead + orphan every session
-    // on the host). If we swallow the error and ack 200, an asymmetric
+    // Issue #231: this persist is NOT best-effort. It renews the
+    // host's binding lease, which is exactly what the dead-host
+    // detector keys on (ADR 0116 A-D4, `list_lease_expired_hosts`:
+    // ready + lease expired → mark dead + orphan every session on
+    // the host). If we swallow the error and ack 200, an asymmetric
     // PG failure — this pod's pool saturated while a sibling pod's
     // detector is healthy — silently staled a *live* host's row and
     // orphaned its sessions, with the host getting 200s the whole time
