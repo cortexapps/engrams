@@ -260,6 +260,37 @@ describe("SpecPublishControl", () => {
     expect(screen.getByText("3 open questions were carried into the tickets.")).toBeTruthy();
   });
 
+  test("a refused pin re-opens the gate and says nothing was published", async () => {
+    const user = userEvent.setup();
+    state.status = {
+      ...blocked(),
+      canPublish: true,
+      publish: {
+        state: "blocked",
+        checkpointId: "cp-1",
+        artifactId: "art-1",
+        artifactVersion: null,
+        acknowledgedQuestionCount: 0,
+        requestedAt: "2026-08-12T15:04:00.000Z",
+        pinnedAt: null,
+        completedAt: null,
+        lastError: "1 required sections are no longer settled.",
+      },
+    };
+    render(<SpecPublishControl specId="spec-1" onReviewSection={vi.fn()} />);
+
+    // The gate is what the person needs next, not a progress dialog.
+    await user.click(screen.getByRole("button", { name: /Publish — 2 required sections/ }));
+
+    expect(screen.getByText("2 required sections are not settled")).toBeTruthy();
+    expect(
+      screen.getByText(
+        /The last publish did not pin: 1 required sections are no longer settled\. Nothing was published\./,
+      ),
+    ).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: "Review →" })).toHaveLength(2);
+  });
+
   test("a finished publish offers no control at all", () => {
     state.status = status({
       canPublish: false,

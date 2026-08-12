@@ -30,7 +30,8 @@ export interface SpecPublishGate {
 }
 
 export interface SpecPublishRecord {
-  state: "requested" | "pinned" | "artifact_published" | "complete";
+  /** `blocked` means the pin refused: the gate moved before it committed. */
+  state: "requested" | "pinned" | "artifact_published" | "complete" | "blocked";
   checkpointId: string;
   artifactId: string;
   artifactVersion: number | null;
@@ -80,8 +81,15 @@ export function useSpecPublish(specId: string) {
     queryKey: specPublishKey(specId),
     queryFn: () => specRequest<SpecPublishStatus>(`/specs/${specId}/publish`),
     refetchInterval: (query) => {
+      // A blocked publish is not advancing: it waits for the person, so polling
+      // it would be a busy loop against a state only they can change.
       const publish = query.state.data?.publish;
-      return publish && publish.state !== "complete" ? 2_000 : false;
+      const advancing =
+        publish !== null &&
+        publish !== undefined &&
+        publish.state !== "complete" &&
+        publish.state !== "blocked";
+      return advancing ? 2_000 : false;
     },
   });
 }

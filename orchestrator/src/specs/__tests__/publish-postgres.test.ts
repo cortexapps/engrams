@@ -113,39 +113,21 @@ const freshGapCheck = {
   },
 };
 
-/**
- * The checkpoint content the compaction would produce. The real
- * PostgresSpecCheckpointStore does the insert, so the ON CONFLICT rule that
- * makes the pin exactly-once is the one under test.
- */
-class TestCheckpoints {
+/** The compaction the pin freezes. The real pin SQL writes the checkpoint. */
+class TestDocuments {
   compactions = 0;
+  semanticDocSeq = 4n;
 
-  constructor(
-    private readonly store: PostgresSpecCheckpointStore,
-    private readonly specId: string,
-  ) {}
-
-  async createCheckpoint(
-    specId: string,
-    options: CreateCheckpointOptions,
-  ): Promise<SpecCheckpointRecord> {
+  async compact(specId: string) {
     this.compactions += 1;
-    const checkpoint: SpecCheckpointRecord = {
-      id: options.id ?? randomUUID(),
-      specId,
+    void specId;
+    return {
       state: new Uint8Array([1, 2, 3]),
       stateVector: new Uint8Array([4]),
       renderedMarkdown: `# Org sandbox quotas\n\nCompaction ${this.compactions}\n`,
-      docSeq: 4n,
-      label: options.label,
-      authorUserId: options.authorUserId ?? null,
-      reason: options.reason,
-      createdAt: NOW,
+      coveredSeq: 4n,
+      coveredSemanticDocSeq: this.semanticDocSeq,
     };
-    await this.store.insertCheckpoint(checkpoint);
-    const stored = await this.store.readCheckpoint(this.specId, checkpoint.id);
-    return stored ?? checkpoint;
   }
 }
 
@@ -161,6 +143,8 @@ describe("spec publish with live Postgres", () => {
   const templateId = randomUUID();
   const specId = randomUUID();
   const otherSpecId = randomUUID();
+  /** Its own spec, because this scenario publishes the row it starts. */
+  const raceSpecId = randomUUID();
   const sessionId = randomUUID();
   const owner = `spec-publish-owner-${randomUUID()}`;
   const member = `spec-publish-member-${randomUUID()}`;
@@ -178,18 +162,30 @@ describe("spec publish with live Postgres", () => {
        VALUES ($1, 'Publish test template', '[]', $2, '{"alternatives":"on","talkItThrough":"suggested","gapCheck":"on"}')`,
       [templateId, JSON.stringify(TEMPLATE_SECTIONS)],
     );
-    for (const id of [specId, otherSpecId]) {
+    for (const id of [specId, otherSpecId, raceSpecId]) {
+      // The revision matches the fixture document, because the pin transaction
+      // refuses to freeze a revision the spec row has already moved past.
       await pool.query(
-        `INSERT INTO spec (id, org_id, owner_user_id, session_id, template_id, title, lifecycle)
-         VALUES ($1, 'test-org', $2, $3, $4, 'Org sandbox quotas', 'draft')`,
+        `INSERT INTO spec (id, org_id, owner_user_id, session_id, template_id, title,
+                           lifecycle, current_doc_seq, current_semantic_doc_seq)
+         VALUES ($1, 'test-org', $2, $3, $4, 'Org sandbox quotas', 'draft', 4, 4)`,
         [id, owner, sessionId, templateId],
+      );
+      // Real section states: the pin transaction reads this table, not the
+      // rail fixture, so the gate it re-checks is the stored one.
+      await pool.query(
+        `INSERT INTO spec_section_state (spec_id, section_id, state, na_reason)
+         VALUES ($1, 'sec-req', 'confirmed', NULL), ($1, 'sec-data', 'confirmed', NULL)`,
+        [id],
       );
     }
   });
 
   afterAll(async () => {
     if (!reachable || !pool) return;
-    await pool.query("DELETE FROM spec WHERE id = ANY($1::uuid[])", [[specId, otherSpecId]]);
+    await pool.query("DELETE FROM spec WHERE id = ANY($1::uuid[])", [
+      [specId, otherSpecId, raceSpecId],
+    ]);
     await pool.query("DELETE FROM spec_template WHERE id = $1", [templateId]);
     await pool.query('DELETE FROM artifact WHERE owner_user_id = ANY($1::text[])', [
       [owner, member],
@@ -208,9 +204,9 @@ describe("spec publish with live Postgres", () => {
     });
   }
 
-  function scannerDeps(store: PostgresSpecPublishStore, targetSpecId: string) {
+  function scannerDeps(store: PostgresSpecPublishStore, railStore = new MemoryRailStore()) {
     const checkpointStore = new PostgresSpecCheckpointStore(pool!);
-    const checkpoints = new TestCheckpoints(checkpointStore, targetSpecId);
+    const documents = new TestDocuments();
     const artifacts = makeSpecPublishArtifactPublisher({
       store: makeArtifactStore(drizzle(pool!, { schema })),
       pull: {
@@ -235,7 +231,9 @@ describe("spec publish with live Postgres", () => {
     return {
       deps: {
         store,
-        checkpoints,
+        documents,
+        // The real gate service, so the pin re-check is the production one.
+        gate: service(store, railStore),
         checkpointStore,
         artifacts,
         ticketize,
@@ -244,7 +242,8 @@ describe("spec publish with live Postgres", () => {
         now: () => new Date(NOW.getTime() + 1_000),
         log,
       },
-      checkpoints,
+      documents,
+      railStore,
       ticketize,
     };
   }
@@ -283,12 +282,12 @@ describe("spec publish with live Postgres", () => {
     "publishing pins exactly one checkpoint and one artifact version",
     async () => {
       const store = new PostgresSpecPublishStore(pool!);
-      const first = scannerDeps(store, specId);
+      const first = scannerDeps(store);
 
       // Drive the machine four times. Every step after the first is a replay.
       await runSpecPublishTick(first.deps);
       await runSpecPublishTick(first.deps);
-      const second = scannerDeps(store, specId);
+      const second = scannerDeps(store);
       await runSpecPublishTick(second.deps);
       await runSpecPublishTick(second.deps);
 
@@ -336,6 +335,71 @@ describe("spec publish with live Postgres", () => {
       const starts = [...first.ticketize.starts, ...second.ticketize.starts];
       expect(starts.length).toBeGreaterThanOrEqual(1);
       expect([...new Set(starts)]).toEqual([ticketizePromptId(specId)]);
+    },
+  );
+
+  test.skipIf(!reachable)(
+    "a required section unsettled between the request and the pin blocks the pin",
+    async () => {
+      // The window the request-time gate cannot cover: the document stays
+      // editable until the pin commits, and a co-editor's edit flips a
+      // confirmed section back to drafted.
+      const store = new PostgresSpecPublishStore(pool!);
+      const publish = service(store);
+      await publish.requestPublish({
+        specId: raceSpecId,
+        actorUserId: owner,
+        actionId: randomUUID(),
+        acknowledgeOpenQuestions: false,
+        runGapCheck: false,
+      });
+      await pool!.query(
+        `UPDATE spec_section_state SET state = 'drafted'
+          WHERE spec_id = $1 AND section_id = 'sec-data'`,
+        [raceSpecId],
+      );
+
+      const tick = scannerDeps(store);
+      // The rail fixture still reads confirmed, so only the transaction's own
+      // check against spec_section_state can refuse this pin.
+      const result = await runSpecPublishTick(tick.deps);
+
+      expect(result.blocked).toBe(1);
+      expect(result.pinned).toBe(0);
+      const record = await store.readPublish(raceSpecId);
+      expect(record?.state).toBe("blocked");
+      expect(record?.lastError).toBe("1 required sections are no longer settled.");
+      // Nothing became immutable.
+      const spec = await pool!.query<{ lifecycle: string; published_at: Date | null }>(
+        "SELECT lifecycle, published_at FROM spec WHERE id = $1",
+        [raceSpecId],
+      );
+      expect(spec.rows[0]!.lifecycle).toBe("draft");
+      expect(spec.rows[0]!.published_at).toBeNull();
+      const checkpoints = await pool!.query<{ count: number }>(
+        "SELECT count(*)::int AS count FROM spec_checkpoint WHERE spec_id = $1",
+        [raceSpecId],
+      );
+      expect(checkpoints.rows[0]!.count).toBe(0);
+
+      // Settling the section and asking again re-arms the same row.
+      await pool!.query(
+        `UPDATE spec_section_state SET state = 'confirmed'
+          WHERE spec_id = $1 AND section_id = 'sec-data'`,
+        [raceSpecId],
+      );
+      const again = await publish.requestPublish({
+        specId: raceSpecId,
+        actorUserId: owner,
+        actionId: randomUUID(),
+        acknowledgeOpenQuestions: false,
+        runGapCheck: false,
+      });
+      expect(again.publish.state).toBe("requested");
+      expect(again.publish.checkpointId).toBe(record!.checkpointId);
+      const pinned = await runSpecPublishTick(scannerDeps(store).deps);
+      expect(pinned.pinned).toBe(1);
+      expect((await store.readPublish(raceSpecId))?.state).toBe("complete");
     },
   );
 
@@ -406,32 +470,36 @@ describe("spec publish with live Postgres", () => {
     expect(claimed[0]!.specTitle).toBe("Org sandbox quotas");
     expect(claimed[0]!.ownerUserId).toBe(owner);
 
-    // markPinned advances once, whichever driver calls it again.
+    // The pin transaction commits once, whichever driver calls it again.
     const pinInput = {
       specId: otherSpecId,
-      checkpointId: record.checkpointId,
       publishedBy: owner,
       at: now,
+      checkpoint: {
+        id: record.checkpointId,
+        state: new Uint8Array([1]),
+        stateVector: new Uint8Array([2]),
+        renderedMarkdown: "# pinned\n",
+        docSeq: 4n,
+        label: "Published version",
+        reason: "publish",
+      },
+      semanticDocSeq: 4n,
+      requiredSectionIds: [] as string[],
+      acknowledgedQuestionIds: [] as string[],
     };
-    const checkpointStore = new PostgresSpecCheckpointStore(pool!);
-    await checkpointStore.insertCheckpoint({
-      id: record.checkpointId,
-      specId: otherSpecId,
-      state: new Uint8Array([1]),
-      stateVector: new Uint8Array([2]),
-      renderedMarkdown: "# pinned\n",
-      docSeq: 4n,
-      label: "Published version",
-      authorUserId: owner,
-      reason: "publish",
-      createdAt: now,
-    });
-    expect(await store.markPinned(pinInput)).toBe(true);
-    expect(await store.markPinned(pinInput)).toBe(false);
-    const spec = await pool!.query<{ lifecycle: string }>(
-      "SELECT lifecycle FROM spec WHERE id = $1",
+    expect(await store.pin(pinInput)).toEqual({ kind: "pinned" });
+    expect(await store.pin(pinInput)).toEqual({ kind: "not_requested" });
+    const checkpoints = await pool!.query<{ count: number }>(
+      "SELECT count(*)::int AS count FROM spec_checkpoint WHERE spec_id = $1",
       [otherSpecId],
     );
-    expect(spec.rows[0]!.lifecycle).toBe("published");
+    expect(checkpoints.rows[0]!.count).toBe(1);
+    const published = await pool!.query<{ lifecycle: string; published_checkpoint_id: string }>(
+      "SELECT lifecycle, published_checkpoint_id FROM spec WHERE id = $1",
+      [otherSpecId],
+    );
+    expect(published.rows[0]!.lifecycle).toBe("published");
+    expect(published.rows[0]!.published_checkpoint_id).toBe(record.checkpointId);
   });
 });

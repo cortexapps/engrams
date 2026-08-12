@@ -173,7 +173,8 @@ const specPublish = new SpecPublishService({
 });
 const specPublishScanner = new SpecPublishScanner({
   store: specPublishStore,
-  checkpoints: specCheckpoints,
+  documents: specDocuments,
+  gate: specPublish,
   checkpointStore: specCheckpointStore,
   artifacts: productionSpecPublishArtifactPublisher(),
   ticketize: productionSpecTicketizeHandoff(),

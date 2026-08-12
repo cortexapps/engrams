@@ -53,11 +53,17 @@ export function SpecPublishControl({ specId, onReviewSection }: SpecPublishContr
 
   if (!status.data) return null;
   const current = refusal ?? status.data;
-  const running = current.publish !== null && current.publish.state !== "complete";
+  // A publish the pin refused is not running: the spec is still a draft, and
+  // the gate is what the person needs next. Its reason rides along.
+  const refused = current.publish?.state === "blocked" ? current.publish.lastError : null;
+  const running =
+    current.publish !== null &&
+    current.publish.state !== "complete" &&
+    current.publish.state !== "blocked";
   // A finished publish needs no control: the page header already says
   // published. A running one stays reachable, because its steps can still
   // fail and retry, and hiding that would hide the only honest signal.
-  if (!running && (!current.canPublish || current.publish !== null)) return null;
+  if (!running && !current.canPublish) return null;
 
   const gate = current.gate;
   const label = running
@@ -83,7 +89,7 @@ export function SpecPublishControl({ specId, onReviewSection }: SpecPublishContr
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="spec-publish-dialog">
-          {current.publish ? (
+          {running ? (
             <PublishedFace status={current} onClose={() => setOpen(false)} />
           ) : gate.ready ? (
             <ReadyFace
@@ -93,6 +99,7 @@ export function SpecPublishControl({ specId, onReviewSection }: SpecPublishContr
               onAcknowledge={setAcknowledged}
               pending={publish.isPending}
               error={error}
+              refused={refused}
               onKeepDrafting={() => setOpen(false)}
               onPublish={() => {
                 setError(null);
@@ -111,6 +118,7 @@ export function SpecPublishControl({ specId, onReviewSection }: SpecPublishContr
               status={current}
               pending={publish.isPending}
               error={error}
+              refused={refused}
               onCancel={() => setOpen(false)}
               onReview={(sectionId) => {
                 setOpen(false);
@@ -128,6 +136,20 @@ export function SpecPublishControl({ specId, onReviewSection }: SpecPublishContr
         </DialogContent>
       </Dialog>
     </>
+  );
+}
+
+/**
+ * The pin refused an earlier publish. Amber, not red: nothing was lost and
+ * nothing was published — the document moved out of the gate, and the person
+ * decides what to do next.
+ */
+function RefusedNotice({ reason }: { reason: string }) {
+  return (
+    <p className="spec-publish-refused">
+      <TriangleAlert aria-hidden="true" />
+      The last publish did not pin: {reason} Nothing was published.
+    </p>
   );
 }
 
@@ -152,6 +174,7 @@ function BlockedFace({
   status,
   pending,
   error,
+  refused,
   onCancel,
   onReview,
   onRecheck,
@@ -160,6 +183,7 @@ function BlockedFace({
   status: SpecPublishStatus;
   pending: boolean;
   error: string | null;
+  refused: string | null;
   onCancel: () => void;
   onReview: (sectionId: string) => void;
   onRecheck: () => void;
@@ -193,6 +217,7 @@ function BlockedFace({
           </li>
         ))}
       </ul>
+      {refused ? <RefusedNotice reason={refused} /> : null}
       {error ? <p className="spec-publish-error">{error}</p> : null}
       <DialogFooter className="spec-publish-footer">
         <span className="spec-publish-meta">{footerMeta(gate, status)}</span>
@@ -216,6 +241,7 @@ function ReadyFace({
   onAcknowledge,
   pending,
   error,
+  refused,
   onKeepDrafting,
   onPublish,
 }: {
@@ -225,6 +251,7 @@ function ReadyFace({
   onAcknowledge: (value: boolean) => void;
   pending: boolean;
   error: string | null;
+  refused: string | null;
   onKeepDrafting: () => void;
   onPublish: () => void;
 }) {
@@ -282,6 +309,7 @@ function ReadyFace({
           </label>
         </>
       ) : null}
+      {refused ? <RefusedNotice reason={refused} /> : null}
       {error ? <p className="spec-publish-error">{error}</p> : null}
       <p className="spec-publish-note">{footerMeta(gate, status)}</p>
       <DialogFooter className="spec-publish-footer">

@@ -12,6 +12,7 @@ import type { GapCheckRun, GapCheckRunInput, GapCheckStatus } from "../gap-check
 import {
   SpecPublishError,
   SpecPublishService,
+  type PinOutcome,
   type SpecPublishRecord,
   type SpecPublishStore,
   type SpecPublishTarget,
@@ -121,8 +122,34 @@ class MemoryPublishStore implements SpecPublishStore {
     return [];
   }
 
-  async markPinned(): Promise<boolean> {
+  async pin(): Promise<PinOutcome> {
+    return { kind: "not_requested" };
+  }
+
+  async markBlocked(): Promise<boolean> {
     return false;
+  }
+
+  async resetBlocked(input: {
+    requestedBy: string | null;
+    requestedAt: Date;
+    acknowledgedQuestionIds: readonly string[];
+    gapCheckRunId: string | null;
+  }): Promise<boolean> {
+    if (this.record?.state !== "blocked") return false;
+    this.record = {
+      ...this.record,
+      state: "requested",
+      requestedBy: input.requestedBy,
+      requestedAt: input.requestedAt,
+      acknowledgedQuestionIds: [...input.acknowledgedQuestionIds],
+      acknowledgedQuestionCount: input.acknowledgedQuestionIds.length,
+      gapCheckRunId: input.gapCheckRunId,
+      attempts: 0,
+      nextAttemptAt: input.requestedAt,
+      lastError: null,
+    };
+    return true;
   }
 
   async markArtifactPublished(): Promise<boolean> {
@@ -392,6 +419,114 @@ describe("publish gate service", () => {
     expect(second.created).toBe(false);
     expect(second.publish).toEqual(first.publish);
     expect(store.record?.checkpointId).toBe("minted-1");
+  });
+
+  test("a blocked publish re-gates and re-arms on the next request", async () => {
+    const { service, store } = fixture({
+      questions: [{ id: "q-1", sectionId: "sec-data", text: "Who signs this off?" }],
+    });
+    const first = await service.requestPublish(
+      publishInput({ acknowledgeOpenQuestions: true }),
+    );
+    // The pin refused it: a required section moved out of the gate.
+    store.record = { ...first.publish, state: "blocked", lastError: "1 required sections…" };
+    store.questions.push({ id: "q-2", sectionId: "sec-data", text: "And the ceiling?" });
+
+    // The gate still needs the acknowledgment, now for both questions.
+    const refused = await refusal(service.requestPublish(publishInput()));
+    expect(refused.code).toBe("acknowledgment_required");
+    expect(store.record?.state).toBe("blocked");
+
+    const again = await service.requestPublish(publishInput({ acknowledgeOpenQuestions: true }));
+
+    expect(again.created).toBe(true);
+    expect(again.publish.state).toBe("requested");
+    expect(again.publish.lastError).toBeNull();
+    expect(again.publish.acknowledgedQuestionIds).toEqual(["q-1", "q-2"]);
+    // The ids are kept: the blocked attempt created neither the checkpoint nor
+    // the artifact, so reusing them keeps the publish exactly-once.
+    expect(again.publish.checkpointId).toBe(first.publish.checkpointId);
+    expect(again.publish.artifactId).toBe(first.publish.artifactId);
+  });
+
+  test("a blocked publish that still fails the gate stays blocked", async () => {
+    const { service, store, states } = fixture();
+    const first = await service.requestPublish(publishInput());
+    store.record = { ...first.publish, state: "blocked", lastError: "moved" };
+    states.set("sec-data", { state: "drafted", naReason: null });
+
+    const error = await refusal(service.requestPublish(publishInput()));
+
+    expect(error.code).toBe("blocked");
+    expect(store.record?.state).toBe("blocked");
+  });
+
+  test("verifyForPin passes for the revision it was given", async () => {
+    const { service } = fixture();
+
+    const verified = await service.verifyForPin(SPEC_ID, {
+      semanticDocSeq: 4n,
+      acknowledgedQuestionIds: [],
+    });
+
+    expect(verified).toEqual({ ok: true, requiredSectionIds: ["sec-req", "sec-data"] });
+  });
+
+  test("verifyForPin defers when the document moved past the compaction", async () => {
+    const { service } = fixture();
+
+    const verified = await service.verifyForPin(SPEC_ID, {
+      semanticDocSeq: 3n,
+      acknowledgedQuestionIds: [],
+    });
+
+    expect(verified).toEqual({
+      ok: false,
+      retryable: true,
+      reason: "The document moved while the publish was pinning.",
+    });
+  });
+
+  test("verifyForPin refuses a section that left the gate, and names it", async () => {
+    const { service } = fixture({
+      states: new Map([
+        ["sec-req", { state: "confirmed", naReason: null }],
+        ["sec-data", { state: "drafted", naReason: null }],
+      ]),
+    });
+
+    const verified = await service.verifyForPin(SPEC_ID, {
+      semanticDocSeq: 4n,
+      acknowledgedQuestionIds: [],
+    });
+
+    expect(verified).toEqual({
+      ok: false,
+      retryable: false,
+      reason: "1 required sections are no longer settled: Data model.",
+    });
+  });
+
+  test("verifyForPin refuses when the open questions are not the acknowledged set", async () => {
+    const { service } = fixture({
+      questions: [{ id: "q-1", sectionId: "sec-data", text: "Who signs this off?" }],
+    });
+
+    const stale = await service.verifyForPin(SPEC_ID, {
+      semanticDocSeq: 4n,
+      acknowledgedQuestionIds: [],
+    });
+    expect(stale).toEqual({
+      ok: false,
+      retryable: false,
+      reason: "The open questions changed after the acknowledgment.",
+    });
+
+    const matched = await service.verifyForPin(SPEC_ID, {
+      semanticDocSeq: 4n,
+      acknowledgedQuestionIds: ["q-1"],
+    });
+    expect(matched.ok).toBe(true);
   });
 
   test("a published spec with no record refuses a second publish (R38)", async () => {

@@ -537,12 +537,24 @@ export type GapFindingDisposition = "pending" | "question_opened" | "diff_accept
  * The states run forward only:
  *
  *   requested → pinned → artifact_published → complete
+ *              ↘ blocked
  *
  * `requested` records the intent, and a scanner drives every later step
  * (ADR 0034). The checkpoint id and the artifact id are minted with the
  * request, so a replayed step reuses them and the publish stays exactly-once.
+ *
+ * `blocked` is the one edge that does not go forward: the pin re-checks the
+ * gate against the revision it is about to pin, and a document that moved out
+ * of the gate lands here with the reason in `last_error`. Nothing was pinned,
+ * so the owner settles the section and publishes again. It is terminal until
+ * they do, because a publish must be a deliberate act on the pinned content.
  */
-export type SpecPublishState = "requested" | "pinned" | "artifact_published" | "complete";
+export type SpecPublishState =
+  | "requested"
+  | "pinned"
+  | "artifact_published"
+  | "complete"
+  | "blocked";
 
 /**
  * One publish per spec. The primary key is the spec id because v1 has no

@@ -200,3 +200,25 @@
   color: var(--destructive);
   margin: 0;
 }
+
+/* The pin refused an earlier attempt. Amber: nothing was published, and the
+   person decides what happens next. */
+.spec-publish-refused {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+  border-left: 2px solid var(--spec-publish-caution);
+  padding-left: 0.6rem;
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--muted-foreground);
+}
+
+.spec-publish-refused svg {
+  width: 0.9rem;
+  height: 0.9rem;
+  flex-shrink: 0;
+  margin-top: 0.15rem;
+  color: var(--spec-publish-caution);
+}

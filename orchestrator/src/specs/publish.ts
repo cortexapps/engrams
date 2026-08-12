@@ -84,7 +84,8 @@ export interface SpecPublishStore {
    * statement re-reads `next_attempt_at` and finds nothing to claim.
    *
    * `specId` restricts the claim to one spec, so a push wake never consumes
-   * another spec's turn.
+   * another spec's turn. A `blocked` row is never claimed: it waits for a
+   * person to settle the gate, not for the next tick.
    */
   claimDue(input: {
     now: Date;
@@ -93,19 +94,71 @@ export interface SpecPublishStore {
     specId?: string;
   }): Promise<SpecPublishWork[]>;
   /**
-   * Pin the checkpoint and flip the spec to published, in one transaction.
-   * False when another driver already pinned it.
+   * Insert the pinned checkpoint, flip the spec to published and advance the
+   * publish row — in ONE transaction that re-checks the gate while it holds the
+   * spec row.
+   *
+   * The gate is re-checked here and not only at request time because the
+   * document stays editable until this commit: the spec is org-editable and
+   * live, so a co-editor can unsettle a required section or open a question
+   * between the click and the pin. Publishing that would produce an immutable
+   * spec that never satisfied its own gate, and v1 has no way to correct it
+   * (R38). The check reads `spec_section_state` and `spec_open_question`, which
+   * every other writer reaches through the same spec-row lock, so there is no
+   * window left to lose.
    */
-  markPinned(input: {
-    specId: string;
-    checkpointId: string;
-    publishedBy: string | null;
-    at: Date;
-  }): Promise<boolean>;
+  pin(input: PinPublishInput): Promise<PinOutcome>;
   markArtifactPublished(input: { specId: string; version: number }): Promise<boolean>;
   markComplete(input: { specId: string; at: Date }): Promise<boolean>;
+  /** Terminal refusal: the gate no longer holds for the content to be pinned. */
+  markBlocked(input: { specId: string; reason: string; at: Date }): Promise<boolean>;
+  /** Re-arm a blocked publish after the owner asks again. */
+  resetBlocked(input: {
+    specId: string;
+    requestedBy: string | null;
+    requestedAt: Date;
+    acknowledgedQuestionIds: readonly string[];
+    gapCheckRunId: string | null;
+  }): Promise<boolean>;
   recordFailure(input: { specId: string; error: string; retryAt: Date }): Promise<void>;
 }
+
+export interface PinPublishInput {
+  specId: string;
+  publishedBy: string | null;
+  at: Date;
+  /** The compacted document this pin commits, rendered and encoded. */
+  checkpoint: {
+    id: string;
+    state: Uint8Array;
+    stateVector: Uint8Array;
+    renderedMarkdown: string;
+    docSeq: bigint;
+    label: string;
+    reason: string;
+  };
+  /** The revision the gate was verified against. */
+  semanticDocSeq: bigint;
+  /** Every required section, as the verified document defines them. */
+  requiredSectionIds: readonly string[];
+  /** The questions the owner acknowledged carrying into the tickets (R35). */
+  acknowledgedQuestionIds: readonly string[];
+}
+
+export type VerifyForPinResult =
+  | { ok: true; requiredSectionIds: string[] }
+  /** `retryable` separates "the document moved" from "a person must act". */
+  | { ok: false; retryable: boolean; reason: string };
+
+export type PinOutcome =
+  /** The pin committed: checkpoint, lifecycle flip and publish row together. */
+  | { kind: "pinned" }
+  /** The document moved past the compaction. Recompact and try again. */
+  | { kind: "stale_document"; currentSemanticDocSeq: bigint }
+  /** The gate no longer holds for this content. A person must settle it. */
+  | { kind: "gate_failed"; reason: string }
+  /** Another driver already advanced this row. */
+  | { kind: "not_requested" };
 
 /** Everything the browser needs to render the button and the dialog. */
 export interface SpecPublishStatus {
@@ -184,9 +237,11 @@ export class SpecPublishService {
   /**
    * Record the publish intent, after the gate passes.
    *
-   * The gate is evaluated here and nowhere else. A blocked publish never
-   * reaches the state machine, so an unsettled required section cannot become
-   * a pinned version.
+   * This is the gate a person meets. It is not the last word: the document
+   * stays editable until the pin commits, so the pin re-checks the same gate
+   * against the revision it is about to freeze (`verifyForPin`). A blocked
+   * publish therefore never reaches the state machine, and a publish that the
+   * document walks out of never reaches an immutable version.
    */
   async requestPublish(input: RequestPublishInput): Promise<RequestPublishResult> {
     const target = await this.options.store.readTarget(input.specId);
@@ -202,9 +257,10 @@ export class SpecPublishService {
     }
 
     // A publish already recorded is the whole answer: the state machine owns
-    // the rest, and a second request must not pin a second version (R38).
+    // the rest, and a second request must not pin a second version (R38). A
+    // blocked one is the exception — it pinned nothing, so it re-gates below.
     const existing = await this.options.store.readPublish(input.specId);
-    if (existing) {
+    if (existing && existing.state !== "blocked") {
       return {
         publish: existing,
         status: await this.statusFor(target, input.actorUserId),
@@ -278,6 +334,24 @@ export class SpecPublishService {
     }
 
     const now = this.options.now();
+    const acknowledgedQuestionIds = status.gate.openQuestions.map((question) => question.id);
+    if (existing) {
+      // A blocked publish keeps its checkpoint and artifact ids, because it
+      // created neither. Only the acknowledgment and the attempt state are new.
+      await this.options.store.resetBlocked({
+        specId: input.specId,
+        requestedBy: input.actorUserId,
+        requestedAt: now,
+        acknowledgedQuestionIds,
+        gapCheckRunId: status.gapCheck.runId,
+      });
+      const stored = await this.options.store.readPublish(input.specId);
+      if (!stored) {
+        throw new SpecPublishError("spec_not_found", `Spec ${input.specId} does not exist.`);
+      }
+      return { publish: stored, status: { ...status, publish: stored }, created: true };
+    }
+
     const record: SpecPublishRecord = {
       specId: input.specId,
       sessionId: target.sessionId,
@@ -287,8 +361,8 @@ export class SpecPublishService {
       state: "requested",
       requestedBy: input.actorUserId,
       requestedAt: now,
-      acknowledgedQuestionCount: status.gate.openQuestions.length,
-      acknowledgedQuestionIds: status.gate.openQuestions.map((question) => question.id),
+      acknowledgedQuestionCount: acknowledgedQuestionIds.length,
+      acknowledgedQuestionIds,
       gapCheckRunId: status.gapCheck.runId,
       attempts: 0,
       nextAttemptAt: now,
@@ -301,6 +375,60 @@ export class SpecPublishService {
       publish: stored,
       status: { ...status, publish: stored },
       created: stored.checkpointId === record.checkpointId,
+    };
+  }
+
+  /**
+   * The gate, re-checked for the revision the pin is about to freeze.
+   *
+   * The scanner calls this after it compacts and before it writes anything. It
+   * refuses on three counts: the document moved past the compaction (transient
+   * — recompact and retry), a required section is no longer settled, or the
+   * open questions are not the ones the owner acknowledged. The last two are a
+   * person's decision, so they stop the publish instead of retrying it.
+   */
+  async verifyForPin(
+    specId: string,
+    input: { semanticDocSeq: bigint; acknowledgedQuestionIds: readonly string[] },
+  ): Promise<VerifyForPinResult> {
+    const metadata = await this.options.railStore.readMetadata(specId);
+    if (!metadata) {
+      return { ok: false, retryable: false, reason: `Spec ${specId} does not exist.` };
+    }
+    const loaded = await this.options.documents.syncFromLog(specId);
+    if (loaded.semanticDocSeq !== input.semanticDocSeq) {
+      return {
+        ok: false,
+        retryable: true,
+        reason: "The document moved while the publish was pinning.",
+      };
+    }
+    const sections = publishGateSections(proseMirrorDocument(loaded.doc), metadata);
+    const openQuestions = await this.openQuestions(specId, sections);
+    // The gap check is a request-time affordance (R30), not a pin condition:
+    // re-running it here would make a publish depend on a second analysis of a
+    // document nobody changed.
+    const gate = evaluatePublishGate({ sections, openQuestions, gapCheckStale: false });
+    if (!gate.ready) {
+      const named = gate.blockers.map((blocker) => blocker.sectionTitle).join(", ");
+      return {
+        ok: false,
+        retryable: false,
+        reason: `${gate.blockers.length} required sections are no longer settled: ${named}.`,
+      };
+    }
+    const acknowledged = [...input.acknowledgedQuestionIds].sort();
+    const open = openQuestions.map((question) => question.id).sort();
+    if (acknowledged.length !== open.length || open.some((id, index) => id !== acknowledged[index])) {
+      return {
+        ok: false,
+        retryable: false,
+        reason: "The open questions changed after the acknowledgment.",
+      };
+    }
+    return {
+      ok: true,
+      requiredSectionIds: sections.filter((section) => section.required).map((s) => s.id),
     };
   }
 
@@ -335,7 +463,9 @@ export class SpecPublishService {
       },
       publish,
       canPublish:
-        target.ownerUserId === actorUserId && target.lifecycle === "draft" && publish === null,
+        target.ownerUserId === actorUserId &&
+        target.lifecycle === "draft" &&
+        (publish === null || publish.state === "blocked"),
       publishedAt: target.publishedAt,
     };
   }
@@ -511,13 +641,13 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
           WHERE spec_id IN (
                   SELECT spec_id
                     FROM spec_publish
-                   WHERE state <> 'complete'
+                   WHERE state NOT IN ('complete', 'blocked')
                      AND next_attempt_at <= $1
                      AND ($4::uuid IS NULL OR spec_id = $4::uuid)
                    ORDER BY next_attempt_at
                    LIMIT $3
                 )
-            AND state <> 'complete'
+            AND state NOT IN ('complete', 'blocked')
             AND next_attempt_at <= $1
         RETURNING ${PUBLISH_COLUMNS}
        )
@@ -533,15 +663,89 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
     }));
   }
 
-  async markPinned(input: {
-    specId: string;
-    checkpointId: string;
-    publishedBy: string | null;
-    at: Date;
-  }): Promise<boolean> {
+  async pin(input: PinPublishInput): Promise<PinOutcome> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      // Every writer of the document, the section states and the open questions
+      // takes this row first, so holding it makes the checks below final.
+      const spec = await client.query<{ lifecycle: string; current_semantic_doc_seq: string }>(
+        `SELECT lifecycle, current_semantic_doc_seq::text AS current_semantic_doc_seq
+           FROM spec WHERE id = $1 FOR UPDATE`,
+        [input.specId],
+      );
+      const row = spec.rows[0];
+      if (!row || row.lifecycle !== "draft") {
+        await client.query("ROLLBACK");
+        return { kind: "not_requested" };
+      }
+      const currentSemanticDocSeq = BigInt(row.current_semantic_doc_seq);
+      if (currentSemanticDocSeq !== input.semanticDocSeq) {
+        await client.query("ROLLBACK");
+        return { kind: "stale_document", currentSemanticDocSeq };
+      }
+
+      const unsettled = await client.query<{ section_id: string }>(
+        `SELECT required.section_id
+           FROM unnest($2::text[]) AS required(section_id)
+           LEFT JOIN spec_section_state AS state
+             ON state.spec_id = $1 AND state.section_id = required.section_id
+          WHERE state.section_id IS NULL
+             OR NOT (
+                  state.state = 'confirmed'
+                  OR (state.state = 'n/a' AND btrim(coalesce(state.na_reason, '')) <> '')
+                )`,
+        [input.specId, [...input.requiredSectionIds]],
+      );
+      if (unsettled.rowCount !== 0) {
+        await client.query("ROLLBACK");
+        return {
+          kind: "gate_failed",
+          reason: `${unsettled.rowCount} required sections are no longer settled.`,
+        };
+      }
+      const questions = await client.query<{ id: string }>(
+        `SELECT id FROM spec_open_question
+          WHERE spec_id = $1 AND state = 'open'
+          ORDER BY id`,
+        [input.specId],
+      );
+      const acknowledged = [...input.acknowledgedQuestionIds].sort();
+      const open = questions.rows.map((question) => question.id);
+      if (
+        open.length !== acknowledged.length ||
+        open.some((id, index) => id !== acknowledged[index])
+      ) {
+        await client.query("ROLLBACK");
+        return {
+          kind: "gate_failed",
+          reason: "The open questions changed after the acknowledgment.",
+        };
+      }
+
+      // The checkpoint, the flip and the row advance commit together. A
+      // published spec therefore always has its pinned checkpoint, that
+      // checkpoint always holds the content the gate passed on, and the
+      // document store refuses every edit from here (R38).
+      await client.query(
+        `INSERT INTO spec_checkpoint
+           (id, spec_id, state, state_vector, rendered_markdown, doc_seq,
+            label, author_user_id, reason, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          input.checkpoint.id,
+          input.specId,
+          Buffer.from(input.checkpoint.state),
+          Buffer.from(input.checkpoint.stateVector),
+          input.checkpoint.renderedMarkdown,
+          input.checkpoint.docSeq.toString(),
+          input.checkpoint.label,
+          input.publishedBy,
+          input.checkpoint.reason,
+          input.at,
+        ],
+      );
       const advanced = await client.query(
         `UPDATE spec_publish
             SET state = 'pinned', pinned_at = $2, last_error = NULL
@@ -550,23 +754,17 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
       );
       if (advanced.rowCount === 0) {
         await client.query("ROLLBACK");
-        return false;
+        return { kind: "not_requested" };
       }
-      // The flip and the pin commit together: a published spec always has its
-      // pinned checkpoint, and the document store refuses edits from here on.
-      const flipped = await client.query(
+      await client.query(
         `UPDATE spec
             SET lifecycle = 'published', published_checkpoint_id = $2,
                 published_by = $3, published_at = $4, updated_at = $4
           WHERE id = $1 AND lifecycle = 'draft'`,
-        [input.specId, input.checkpointId, input.publishedBy, input.at],
+        [input.specId, input.checkpoint.id, input.publishedBy, input.at],
       );
-      if (flipped.rowCount === 0) {
-        await client.query("ROLLBACK");
-        return false;
-      }
       await client.query("COMMIT");
-      return true;
+      return { kind: "pinned" };
     } catch (error) {
       await rollbackQuietly(client);
       throw error;
@@ -591,6 +789,36 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
           SET state = 'complete', completed_at = $2, last_error = NULL
         WHERE spec_id = $1 AND state = 'artifact_published'`,
       [input.specId, input.at],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async markBlocked(input: { specId: string; reason: string; at: Date }): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE spec_publish
+          SET state = 'blocked', last_error = $2, next_attempt_at = $3
+        WHERE spec_id = $1 AND state = 'requested'`,
+      [input.specId, input.reason.slice(0, 2000), input.at],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async resetBlocked(input: {
+    specId: string;
+    requestedBy: string | null;
+    requestedAt: Date;
+    acknowledgedQuestionIds: readonly string[];
+    gapCheckRunId: string | null;
+  }): Promise<boolean> {
+    const ids = [...input.acknowledgedQuestionIds];
+    const result = await this.pool.query(
+      `UPDATE spec_publish
+          SET state = 'requested', requested_by = $2, requested_at = $3,
+              acknowledged_question_ids = $4, acknowledged_question_count = $5,
+              gap_check_run_id = $6, attempts = 0, next_attempt_at = $3,
+              last_error = NULL
+        WHERE spec_id = $1 AND state = 'blocked'`,
+      [input.specId, input.requestedBy, input.requestedAt, JSON.stringify(ids), ids.length, input.gapCheckRunId],
     );
     return (result.rowCount ?? 0) > 0;
   }

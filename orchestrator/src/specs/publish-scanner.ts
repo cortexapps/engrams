@@ -21,9 +21,9 @@
 import type { Logger } from "pino";
 
 import type { SpecCheckpointRecord, SpecCheckpointStore } from "./checkpoints.ts";
-import type { SpecCheckpointService } from "./checkpoints.ts";
 import type { SpecPublishState } from "../db/schema.ts";
-import type { SpecPublishStore, SpecPublishWork } from "./publish.ts";
+import type { SpecDocumentService } from "./doc-service.ts";
+import type { SpecPublishService, SpecPublishStore, SpecPublishWork } from "./publish.ts";
 
 /** The label the pinned checkpoint carries in the history rail (R13). */
 export const PUBLISHED_CHECKPOINT_LABEL = "Published version";
@@ -74,7 +74,10 @@ export interface SpecTicketizeHandoff {
 
 export interface SpecPublishTickDeps {
   store: SpecPublishStore;
-  checkpoints: Pick<SpecCheckpointService, "createCheckpoint">;
+  /** Compaction gives the content to pin, and the revision it covers. */
+  documents: Pick<SpecDocumentService, "compact">;
+  /** The gate, re-checked for the revision this pin freezes. */
+  gate: Pick<SpecPublishService, "verifyForPin">;
   checkpointStore: Pick<SpecCheckpointStore, "readCheckpoint">;
   artifacts: SpecPublishArtifactPublisher;
   ticketize: SpecTicketizeHandoff;
@@ -90,6 +93,8 @@ export interface SpecPublishTickResult {
   pinned: number;
   artifactsPublished: number;
   completed: number;
+  /** Publishes the gate refused at pin time. Each one waits for a person. */
+  blocked: number;
   failed: number;
 }
 
@@ -108,6 +113,7 @@ export async function runSpecPublishTick(
     pinned: 0,
     artifactsPublished: 0,
     completed: 0,
+    blocked: 0,
     failed: 0,
   };
   const rows = await deps.store.claimDue({
@@ -123,12 +129,13 @@ export async function runSpecPublishTick(
     try {
       // Each step is one transition, so a publish that becomes ready mid-sweep
       // finishes in this sweep instead of waiting for the next tick.
-      while (state !== "complete") {
+      while (state !== "complete" && state !== "blocked") {
         const next = await advance(deps, row, state);
         if (next === state) break;
         if (next === "pinned") result.pinned += 1;
         if (next === "artifact_published") result.artifactsPublished += 1;
         if (next === "complete") result.completed += 1;
+        if (next === "blocked") result.blocked += 1;
         state = next;
       }
     } catch (error) {
@@ -162,24 +169,8 @@ async function advance(
   state: SpecPublishState,
 ): Promise<SpecPublishState> {
   switch (state) {
-    case "requested": {
-      // The checkpoint id came with the request, and the insert keeps the first
-      // writer's row, so a replay pins exactly one version.
-      await deps.checkpoints.createCheckpoint(row.specId, {
-        id: row.checkpointId,
-        reason: PUBLISH_CHECKPOINT_REASON,
-        label: PUBLISHED_CHECKPOINT_LABEL,
-        authorUserId: row.requestedBy,
-      });
-      const pinned = await deps.store.markPinned({
-        specId: row.specId,
-        checkpointId: row.checkpointId,
-        publishedBy: row.requestedBy,
-        at: deps.now(),
-      });
-      // Another driver pinned it first. Its transaction is the truth.
-      return pinned ? "pinned" : await currentState(deps, row);
-    }
+    case "requested":
+      return pinStep(deps, row);
     case "pinned": {
       const existing = await deps.artifacts.read(row.artifactId);
       const version =
@@ -211,7 +202,94 @@ async function advance(
     }
     case "complete":
       return "complete";
+    case "blocked":
+      return "blocked";
   }
+}
+
+/**
+ * Pin the checkpoint (R36), after the gate is re-checked for the exact revision
+ * this pin freezes.
+ *
+ * The request-time gate is not enough on its own: the document stays editable
+ * until this commit, and the spec is org-editable and live (ADR 0114 D12). So
+ * the compaction fixes the content, `verifyForPin` re-checks the gate against
+ * that revision, and the pin transaction re-checks it once more while it holds
+ * the spec row — the same row every document, section-state and open-question
+ * writer takes. Only then does anything become immutable.
+ */
+async function pinStep(
+  deps: SpecPublishTickDeps,
+  row: SpecPublishWork,
+): Promise<SpecPublishState> {
+  const compacted = await deps.documents.compact(row.specId);
+  const verified = await deps.gate.verifyForPin(row.specId, {
+    semanticDocSeq: compacted.coveredSemanticDocSeq,
+    acknowledgedQuestionIds: row.acknowledgedQuestionIds,
+  });
+  if (!verified.ok) {
+    // A document that merely moved is transient: recompact on the next claim.
+    if (verified.retryable) {
+      deps.log.info(
+        { specId: row.specId, reason: verified.reason },
+        "spec publish pin deferred; the document moved",
+      );
+      return "requested";
+    }
+    return blockPublish(deps, row, verified.reason);
+  }
+
+  const outcome = await deps.store.pin({
+    specId: row.specId,
+    publishedBy: row.requestedBy,
+    at: deps.now(),
+    checkpoint: {
+      // The id came with the request, so a replay pins one version, not two.
+      id: row.checkpointId,
+      state: compacted.state,
+      stateVector: compacted.stateVector,
+      renderedMarkdown: compacted.renderedMarkdown,
+      docSeq: compacted.coveredSeq,
+      label: PUBLISHED_CHECKPOINT_LABEL,
+      reason: PUBLISH_CHECKPOINT_REASON,
+    },
+    semanticDocSeq: compacted.coveredSemanticDocSeq,
+    requiredSectionIds: verified.requiredSectionIds,
+    acknowledgedQuestionIds: row.acknowledgedQuestionIds,
+  });
+  switch (outcome.kind) {
+    case "pinned":
+      return "pinned";
+    case "stale_document":
+      deps.log.info(
+        { specId: row.specId, currentSemanticDocSeq: outcome.currentSemanticDocSeq.toString() },
+        "spec publish pin deferred; the document moved during the pin",
+      );
+      return "requested";
+    case "gate_failed":
+      return blockPublish(deps, row, outcome.reason);
+    case "not_requested":
+      // Another driver already advanced this row. Its transaction is the truth.
+      return currentState(deps, row);
+  }
+}
+
+/** Stop the publish and say why. Nothing was pinned, so the owner can retry. */
+async function blockPublish(
+  deps: SpecPublishTickDeps,
+  row: SpecPublishWork,
+  reason: string,
+): Promise<SpecPublishState> {
+  deps.log.warn(
+    { specId: row.specId, reason },
+    "spec publish refused at the pin: the gate no longer holds",
+  );
+  const marked = await deps.store.markBlocked({
+    specId: row.specId,
+    reason,
+    at: deps.now(),
+  });
+  return marked ? "blocked" : currentState(deps, row);
 }
 
 /** The artifact carries exactly what the pinned checkpoint holds. */

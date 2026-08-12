@@ -12,7 +12,14 @@ import {
   type SpecPublishTickDeps,
   type SpecTicketizeHandoff,
 } from "../publish-scanner.ts";
-import type { SpecPublishRecord, SpecPublishStore, SpecPublishWork } from "../publish.ts";
+import type {
+  PinOutcome,
+  PinPublishInput,
+  SpecPublishRecord,
+  SpecPublishStore,
+  SpecPublishWork,
+  VerifyForPinResult,
+} from "../publish.ts";
 
 const SPEC_ID = "00000000-0000-4000-8000-000000000126";
 const SESSION_ID = "00000000-0000-4000-8000-000000000127";
@@ -53,6 +60,15 @@ class MemoryPublishStore implements SpecPublishStore {
   publishedBy: string | null = null;
   publishedAt: Date | null = null;
   claims = 0;
+  /** The document revision, the section states and the open questions the
+   *  pin transaction would read. */
+  semanticDocSeq = 12n;
+  sectionStates = new Map<string, "confirmed" | "drafted" | "n/a-with-reason">([
+    ["sec-req", "confirmed"],
+    ["sec-data", "confirmed"],
+  ]);
+  openQuestionIds: string[] = [];
+  readonly checkpoints = new Map<string, string>();
 
   constructor(row: SpecPublishRecord = record()) {
     this.row = row;
@@ -80,7 +96,7 @@ class MemoryPublishStore implements SpecPublishStore {
     limit: number;
     specId?: string;
   }): Promise<SpecPublishWork[]> {
-    if (this.row.state === "complete") return [];
+    if (this.row.state === "complete" || this.row.state === "blocked") return [];
     if (this.row.nextAttemptAt > input.now) return [];
     if (input.specId !== undefined && input.specId !== this.row.specId) return [];
     this.claims += 1;
@@ -88,18 +104,68 @@ class MemoryPublishStore implements SpecPublishStore {
     return [{ ...this.row, specTitle: "Org sandbox quotas", ownerUserId: OWNER }];
   }
 
-  async markPinned(input: {
-    specId: string;
-    checkpointId: string;
-    publishedBy: string | null;
-    at: Date;
-  }): Promise<boolean> {
-    if (this.row.state !== "requested" || this.lifecycle !== "draft") return false;
+  /** Mirrors the pin transaction: the same guards, in the same order. */
+  async pin(input: PinPublishInput): Promise<PinOutcome> {
+    if (this.row.state !== "requested" || this.lifecycle !== "draft") {
+      return { kind: "not_requested" };
+    }
+    if (this.semanticDocSeq !== input.semanticDocSeq) {
+      return { kind: "stale_document", currentSemanticDocSeq: this.semanticDocSeq };
+    }
+    const unsettled = input.requiredSectionIds.filter((id) => {
+      const state = this.sectionStates.get(id);
+      if (state === undefined) return true;
+      return !(state === "confirmed" || state === "n/a-with-reason");
+    });
+    if (unsettled.length > 0) {
+      return {
+        kind: "gate_failed",
+        reason: `${unsettled.length} required sections are no longer settled.`,
+      };
+    }
+    const acknowledged = [...input.acknowledgedQuestionIds].sort();
+    const open = [...this.openQuestionIds].sort();
+    if (open.length !== acknowledged.length || open.some((id, i) => id !== acknowledged[i])) {
+      return {
+        kind: "gate_failed",
+        reason: "The open questions changed after the acknowledgment.",
+      };
+    }
+    this.checkpoints.set(input.checkpoint.id, input.checkpoint.renderedMarkdown);
     this.row = { ...this.row, state: "pinned", pinnedAt: input.at, lastError: null };
     this.lifecycle = "published";
-    this.publishedCheckpointId = input.checkpointId;
+    this.publishedCheckpointId = input.checkpoint.id;
     this.publishedBy = input.publishedBy;
     this.publishedAt = input.at;
+    return { kind: "pinned" };
+  }
+
+  async markBlocked(input: { specId: string; reason: string; at: Date }): Promise<boolean> {
+    if (this.row.state !== "requested") return false;
+    this.row = { ...this.row, state: "blocked", lastError: input.reason, nextAttemptAt: input.at };
+    return true;
+  }
+
+  async resetBlocked(input: {
+    specId: string;
+    requestedBy: string | null;
+    requestedAt: Date;
+    acknowledgedQuestionIds: readonly string[];
+    gapCheckRunId: string | null;
+  }): Promise<boolean> {
+    if (this.row.state !== "blocked") return false;
+    this.row = {
+      ...this.row,
+      state: "requested",
+      requestedBy: input.requestedBy,
+      requestedAt: input.requestedAt,
+      acknowledgedQuestionIds: [...input.acknowledgedQuestionIds],
+      acknowledgedQuestionCount: input.acknowledgedQuestionIds.length,
+      gapCheckRunId: input.gapCheckRunId,
+      attempts: 0,
+      nextAttemptAt: input.requestedAt,
+      lastError: null,
+    };
     return true;
   }
 
@@ -125,37 +191,66 @@ class MemoryPublishStore implements SpecPublishStore {
   }
 }
 
-/** Checkpoints keyed by id, so a replay at the same id inserts nothing new. */
-class MemoryCheckpoints {
-  readonly rows = new Map<string, SpecCheckpointRecord>();
+/** The compaction the pin freezes, and the checkpoint the artifact leg reads. */
+class MemoryDocuments {
   compactions = 0;
+  markdown = "# Org sandbox quotas\n\nA counter row per org.\n";
 
-  async createCheckpoint(
-    specId: string,
-    options: CreateCheckpointOptions,
-  ): Promise<SpecCheckpointRecord> {
+  constructor(private readonly store: MemoryPublishStore) {}
+
+  async compact(specId: string) {
     this.compactions += 1;
-    const id = options.id ?? `mint-${this.rows.size + 1}`;
-    const existing = this.rows.get(id);
-    if (existing) return existing;
-    const created: SpecCheckpointRecord = {
-      id,
+    void specId;
+    return {
+      state: new Uint8Array([1]),
+      stateVector: new Uint8Array([2]),
+      renderedMarkdown: this.markdown,
+      coveredSeq: 12n,
+      coveredSemanticDocSeq: this.store.semanticDocSeq,
+    };
+  }
+}
+
+/** The gate, as the service would re-check it for the compacted revision. */
+class MemoryGate {
+  verifications = 0;
+  /** Set to refuse, exactly as verifyForPin would. */
+  refuseWith: { retryable: boolean; reason: string } | null = null;
+
+  async verifyForPin(
+    specId: string,
+    input: { semanticDocSeq: bigint; acknowledgedQuestionIds: readonly string[] },
+  ): Promise<VerifyForPinResult> {
+    this.verifications += 1;
+    void specId;
+    void input;
+    if (this.refuseWith) return { ok: false, ...this.refuseWith };
+    return { ok: true, requiredSectionIds: ["sec-req", "sec-data"] };
+  }
+}
+
+/** Reads the checkpoint the pin transaction wrote. */
+class MemoryCheckpointStore {
+  constructor(private readonly store: MemoryPublishStore) {}
+
+  async readCheckpoint(
+    specId: string,
+    checkpointId: string,
+  ): Promise<SpecCheckpointRecord | null> {
+    const markdown = this.store.checkpoints.get(checkpointId);
+    if (markdown === undefined) return null;
+    return {
+      id: checkpointId,
       specId,
       state: new Uint8Array([1]),
       stateVector: new Uint8Array([2]),
-      renderedMarkdown: "# Org sandbox quotas\n\nA counter row per org.\n",
+      renderedMarkdown: markdown,
       docSeq: 12n,
-      label: options.label,
-      authorUserId: options.authorUserId ?? null,
-      reason: options.reason,
+      label: PUBLISHED_CHECKPOINT_LABEL,
+      authorUserId: OWNER,
+      reason: "publish",
       createdAt: NOW,
     };
-    this.rows.set(id, created);
-    return created;
-  }
-
-  async readCheckpoint(_specId: string, checkpointId: string): Promise<SpecCheckpointRecord | null> {
-    return this.rows.get(checkpointId) ?? null;
   }
 }
 
@@ -212,14 +307,17 @@ class MemoryTicketize implements SpecTicketizeHandoff {
 
 function fixture(row?: SpecPublishRecord) {
   const store = new MemoryPublishStore(row);
-  const checkpoints = new MemoryCheckpoints();
+  const documents = new MemoryDocuments(store);
+  const gate = new MemoryGate();
+  const checkpointStore = new MemoryCheckpointStore(store);
   const artifacts = new MemoryArtifacts();
   const ticketize = new MemoryTicketize();
   let clock = NOW.getTime();
   const deps: SpecPublishTickDeps = {
     store,
-    checkpoints,
-    checkpointStore: checkpoints,
+    documents,
+    gate,
+    checkpointStore,
     artifacts,
     ticketize,
     config: { batchSize: 10, retryDelayMs: 15_000 },
@@ -229,7 +327,8 @@ function fixture(row?: SpecPublishRecord) {
   return {
     deps,
     store,
-    checkpoints,
+    documents,
+    gate,
     artifacts,
     ticketize,
     advanceClock: (ms: number) => {
@@ -249,6 +348,7 @@ describe("spec publish scanner", () => {
       pinned: 1,
       artifactsPublished: 1,
       completed: 1,
+      blocked: 0,
       failed: 0,
     });
     expect(f.store.row.state).toBe("complete");
@@ -256,8 +356,7 @@ describe("spec publish scanner", () => {
     expect(f.store.publishedCheckpointId).toBe(CHECKPOINT_ID);
     expect(f.store.publishedBy).toBe(OWNER);
     expect(f.store.publishedAt).toEqual(NOW);
-    expect([...f.checkpoints.rows.keys()]).toEqual([CHECKPOINT_ID]);
-    expect(f.checkpoints.rows.get(CHECKPOINT_ID)?.label).toBe(PUBLISHED_CHECKPOINT_LABEL);
+    expect([...f.store.checkpoints.keys()]).toEqual([CHECKPOINT_ID]);
     expect(f.store.row.artifactVersion).toBe(1);
     expect(f.artifacts.publishes).toEqual([
       {
@@ -282,7 +381,7 @@ describe("spec publish scanner", () => {
 
     expect(second.claimed).toBe(0);
     expect(third.claimed).toBe(0);
-    expect(f.checkpoints.rows.size).toBe(1);
+    expect(f.store.checkpoints.size).toBe(1);
     expect(f.artifacts.publishes).toHaveLength(1);
     expect(f.ticketize.starts).toHaveLength(1);
   });
@@ -298,6 +397,7 @@ describe("spec publish scanner", () => {
       pinned: 1,
       artifactsPublished: 0,
       completed: 0,
+      blocked: 0,
       failed: 1,
     });
     expect(f.store.row.state).toBe("pinned");
@@ -312,9 +412,10 @@ describe("spec publish scanner", () => {
       pinned: 0,
       artifactsPublished: 1,
       completed: 1,
+      blocked: 0,
       failed: 0,
     });
-    expect(f.checkpoints.rows.size).toBe(1);
+    expect(f.store.checkpoints.size).toBe(1);
     expect(f.artifacts.publishes).toHaveLength(1);
     expect(f.store.row.lastError).toBeNull();
   });
@@ -332,18 +433,7 @@ describe("spec publish scanner", () => {
 
   test("an artifact recorded before a crash is adopted, not written twice", async () => {
     const f = fixture(record({ state: "pinned", pinnedAt: NOW }));
-    f.checkpoints.rows.set(CHECKPOINT_ID, {
-      id: CHECKPOINT_ID,
-      specId: SPEC_ID,
-      state: new Uint8Array([1]),
-      stateVector: new Uint8Array([2]),
-      renderedMarkdown: "# pinned\n",
-      docSeq: 12n,
-      label: PUBLISHED_CHECKPOINT_LABEL,
-      authorUserId: OWNER,
-      reason: "publish",
-      createdAt: NOW,
-    });
+    f.store.checkpoints.set(CHECKPOINT_ID, "# pinned\n");
     f.artifacts.versions.set(ARTIFACT_ID, 1);
 
     const result = await runSpecPublishTick(f.deps);
@@ -378,6 +468,115 @@ describe("spec publish scanner", () => {
     expect(f.store.row.state).toBe("pinned");
     expect(f.store.row.lastError).toContain("is missing");
     expect(f.artifacts.publishes).toHaveLength(0);
+  });
+
+  test("a required section unsettled after the request blocks the pin, not the spec", async () => {
+    const f = fixture();
+    // A co-editor edits the confirmed section, which flips it back to drafted.
+    f.store.sectionStates.set("sec-data", "drafted");
+
+    const result = await runSpecPublishTick(f.deps);
+
+    expect(result).toEqual({
+      claimed: 1,
+      pinned: 0,
+      artifactsPublished: 0,
+      completed: 0,
+      blocked: 1,
+      failed: 0,
+    });
+    expect(f.store.row.state).toBe("blocked");
+    expect(f.store.row.lastError).toBe("1 required sections are no longer settled.");
+    // Nothing became immutable: no checkpoint, no flip, no artifact.
+    expect(f.store.checkpoints.size).toBe(0);
+    expect(f.store.lifecycle).toBe("draft");
+    expect(f.store.publishedCheckpointId).toBeNull();
+    expect(f.artifacts.publishes).toHaveLength(0);
+    expect(f.ticketize.starts).toHaveLength(0);
+  });
+
+  test("a blocked publish is never claimed again by the timer", async () => {
+    const f = fixture();
+    f.store.sectionStates.set("sec-data", "drafted");
+    await runSpecPublishTick(f.deps);
+
+    f.advanceClock(60_000);
+    const second = await runSpecPublishTick(f.deps);
+
+    expect(second.claimed).toBe(0);
+    expect(f.store.row.state).toBe("blocked");
+  });
+
+  test("a question opened after the acknowledgment blocks the pin (R35)", async () => {
+    const f = fixture();
+    f.store.openQuestionIds = ["q-new"];
+
+    const result = await runSpecPublishTick(f.deps);
+
+    expect(result.blocked).toBe(1);
+    expect(f.store.row.lastError).toBe("The open questions changed after the acknowledgment.");
+    expect(f.store.checkpoints.size).toBe(0);
+  });
+
+  test("the gate's own refusal blocks before anything is compacted into a version", async () => {
+    const f = fixture();
+    f.gate.refuseWith = { retryable: false, reason: "2 required sections are no longer settled." };
+
+    const result = await runSpecPublishTick(f.deps);
+
+    expect(result.blocked).toBe(1);
+    expect(f.store.row.state).toBe("blocked");
+    expect(f.store.checkpoints.size).toBe(0);
+    expect(f.store.lifecycle).toBe("draft");
+  });
+
+  test("a document that merely moved defers the pin and retries", async () => {
+    const f = fixture();
+    f.gate.refuseWith = {
+      retryable: true,
+      reason: "The document moved while the publish was pinning.",
+    };
+
+    const first = await runSpecPublishTick(f.deps);
+    expect(first).toEqual({
+      claimed: 1,
+      pinned: 0,
+      artifactsPublished: 0,
+      completed: 0,
+      blocked: 0,
+      failed: 0,
+    });
+    expect(f.store.row.state).toBe("requested");
+
+    // The document settles, and the next claim pins it.
+    f.gate.refuseWith = null;
+    f.advanceClock(20_000);
+    const second = await runSpecPublishTick(f.deps);
+
+    expect(second.pinned).toBe(1);
+    expect(second.completed).toBe(1);
+    expect(f.store.checkpoints.size).toBe(1);
+  });
+
+  test("the pin transaction refuses a document that moved after the gate check", async () => {
+    const f = fixture();
+    // The gate verified revision 12; the row moves on before the transaction.
+    f.gate.refuseWith = null;
+    f.documents.markdown = "# stale\n";
+    const compact = f.deps.documents.compact.bind(f.deps.documents);
+    f.deps.documents.compact = async (specId: string) => {
+      const compacted = await compact(specId);
+      f.store.semanticDocSeq = compacted.coveredSemanticDocSeq + 1n;
+      return compacted;
+    };
+
+    const result = await runSpecPublishTick(f.deps);
+
+    expect(result.pinned).toBe(0);
+    expect(result.blocked).toBe(0);
+    expect(f.store.row.state).toBe("requested");
+    expect(f.store.checkpoints.size).toBe(0);
+    expect(f.store.lifecycle).toBe("draft");
   });
 
   test("a push wake for another spec claims nothing", async () => {
