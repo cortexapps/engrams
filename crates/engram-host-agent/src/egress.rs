@@ -13,8 +13,6 @@
 //! leaves trust them all.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,11 +20,9 @@ use async_trait::async_trait;
 use engram_core::types::integration::{CredentialPurpose, SessionTunnel};
 use engram_core::{HostId, SessionId};
 use engram_egress_proxy::{
-    CaSource, CertMint, GuestGatewayRegistry, InjectRefresher, Listeners, Proxy, ProxyConfig,
-    RefreshedInject, Registry, TunnelStream, TunnelUpstream,
+    CaSource, CertMint, EndpointFactory, GuestGatewayRegistry, InjectRefresher, Listeners, Proxy,
+    ProxyConfig, RefreshedInject, Registry, TunnelEndpoint,
 };
-use tokio::io::AsyncReadExt;
-use tokio::net::UnixStream;
 
 use crate::coord_client::HttpCoordClient;
 
@@ -71,15 +67,18 @@ impl InjectRefresher for CoordInjectRefresher {
     }
 }
 
-/// Starts one host-local Cloud SQL Auth Proxy per guest database connection.
-/// OAuth tokens are passed only through the child environment.
-pub struct CoordCloudSqlConnector {
+/// Builds pooled Cloud SQL endpoints: mint the two connection
+/// credentials via the coordinator, then run the native connect protocol
+/// (`engram-cloud-sql`). No child process is involved; an endpoint is an
+/// ephemeral client certificate plus a TLS config, and every guest
+/// connection through it is one TLS stream to the instance.
+pub struct CloudSqlEndpointFactory {
     coord: HttpCoordClient,
     host_id: HostId,
+    http: reqwest::Client,
 }
 
 const CLOUD_SQL_CONNECTOR_KIND: &str = "gcp.cloud_sql";
-const CLOUD_SQL_STDERR_TAIL_BYTES: usize = 8 * 1024;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,9 +87,19 @@ struct CloudSqlTunnelConfig {
     database_user: String,
 }
 
-impl CoordCloudSqlConnector {
+impl CloudSqlEndpointFactory {
     pub fn new(coord: HttpCoordClient, host_id: HostId) -> Self {
-        Self { coord, host_id }
+        Self {
+            coord,
+            host_id,
+            // The sqladmin calls get their own bounded client so one stuck
+            // request cannot wedge an endpoint build past the pool's
+            // stale-serve window.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .expect("the sqladmin client builds from static settings"),
+        }
     }
 
     async fn token(
@@ -98,7 +107,7 @@ impl CoordCloudSqlConnector {
         session_id: SessionId,
         tunnel: &SessionTunnel,
         purpose: CredentialPurpose,
-    ) -> std::io::Result<String> {
+    ) -> std::io::Result<(String, chrono::DateTime<chrono::Utc>)> {
         let mint_source = tunnel.mint_source.as_ref().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -108,19 +117,49 @@ impl CoordCloudSqlConnector {
         self.coord
             .mint_connection_credential(self.host_id, session_id, mint_source, purpose)
             .await
-            .map(|response| response.secret)
+            .map(|response| (response.secret, response.expires_at))
             .map_err(|error| std::io::Error::other(error.to_string()))
     }
+}
 
-    async fn connect_inner(
+/// One pooled endpoint: the crate's immutable endpoint plus the
+/// credential-derived staleness deadline the tunnel pool rotates on.
+pub struct CloudSqlEndpoint {
+    inner: engram_cloud_sql::CloudSqlEndpoint,
+    stale_after: chrono::DateTime<chrono::Utc>,
+}
+
+#[async_trait]
+impl TunnelEndpoint for CloudSqlEndpoint {
+    type Conn = engram_cloud_sql::CloudSqlStream;
+
+    async fn connect(&self) -> std::io::Result<Self::Conn> {
+        self.inner.connect().await
+    }
+
+    fn stale_after(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        Some(self.stale_after)
+    }
+}
+
+#[async_trait]
+impl EndpointFactory for CloudSqlEndpointFactory {
+    type Endpoint = CloudSqlEndpoint;
+
+    fn kind(&self) -> &'static str {
+        CLOUD_SQL_CONNECTOR_KIND
+    }
+
+    async fn spawn_endpoint(
         &self,
         session_id: SessionId,
         tunnel: &SessionTunnel,
-    ) -> std::io::Result<CloudSqlStream> {
+    ) -> std::io::Result<Self::Endpoint> {
         let config: CloudSqlTunnelConfig = serde_json::from_str(&tunnel.config_json)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let instance = engram_cloud_sql::InstanceName::parse(&config.instance)?;
         let mint_start = crate::time_source::metrics_now();
-        let (api_token, login_token) = tokio::try_join!(
+        let ((api_token, _api_expires), (login_token, login_expires)) = tokio::try_join!(
             self.token(
                 session_id,
                 tunnel,
@@ -133,226 +172,38 @@ impl CoordCloudSqlConnector {
             ),
         )?;
         let mint_ms = mint_start.elapsed().as_millis() as u64;
-        // A private directory gives each relay its own socket namespace. A
-        // bind-then-drop TCP reservation can be stolen by another session
-        // before the child binds, which can cross-connect two tenants.
-        let socket_dir = cloud_sql_socket_dir()?;
-        let listen_dir = cloud_sql_listen_dir(socket_dir.path());
-        let socket_path = cloud_sql_postgres_socket_path(socket_dir.path());
 
-        let binary = std::env::var_os("ENGRAM_CLOUD_SQL_PROXY")
-            .unwrap_or_else(|| "/usr/local/bin/cloud-sql-proxy".into());
-        let spawn_start = crate::time_source::metrics_now();
-        let mut child = tokio::process::Command::new(binary)
-            // `unix-socket-path` pins the listen directory. `--unix-socket`
-            // would instead append the instance connection name, so a long
-            // name pushes the socket past the 108-byte `sockaddr_un` limit and
-            // the proxy exits with "bind: invalid argument".
-            .arg(format!(
-                "{}?unix-socket-path={}",
-                config.instance,
-                listen_dir.display()
-            ))
-            .arg("--auto-iam-authn")
-            .arg("--max-connections=1")
-            // `--lazy-refresh` disables cloudsqlconn's refresh-ahead cache.
-            // The refresh-ahead path judges every ephemeral cert against the
-            // login token's oauth2 `Expiry`, which a static `--login-token`
-            // leaves at the zero time — every cert reads as already expired,
-            // the cache churns refreshes, and its 30-second rate limiter
-            // blocks ~25% of dials for exactly 30s (issue #1201). The lazy
-            // cache has no limiter and refreshes inline on each dial.
-            .arg("--lazy-refresh")
-            // Do not inherit host-agent credentials or deployment secrets.
-            .env_clear()
-            .env("CSQL_PROXY_TOKEN", api_token)
-            .env("CSQL_PROXY_LOGIN_TOKEN", login_token)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-        let stderr = child
-            .stderr
-            .take()
-            .expect("stderr was configured as a pipe");
-        let stderr_task = tokio::spawn(collect_stderr_tail(stderr));
+        let build_start = crate::time_source::metrics_now();
+        let endpoint = engram_cloud_sql::build_endpoint(engram_cloud_sql::EndpointRequest {
+            http: &self.http,
+            api_base: None,
+            instance: &instance,
+            admin_token: &api_token,
+            login_token: &login_token,
+            server_proxy_port_override: None,
+        })
+        .await?;
+        let build_ms = build_start.elapsed().as_millis() as u64;
 
-        let mut upstream = None;
-        let mut last_connect_error = None;
-        for _ in 0..100 {
-            if let Some(status) = child.try_wait()? {
-                let stderr = stderr_task.await.unwrap_or_default();
-                return Err(std::io::Error::other(format!(
-                    "Cloud SQL Auth Proxy exited before accepting a connection: {status}{}",
-                    stderr_context(&stderr),
-                )));
-            }
-            match UnixStream::connect(&socket_path).await {
-                Ok(stream) => {
-                    upstream = Some(stream);
-                    break;
-                }
-                Err(error) => {
-                    last_connect_error = Some(error);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
-        let Some(upstream) = upstream else {
-            let _ = child.kill().await;
-            let stderr = stderr_task.await.unwrap_or_default();
-            let connect_context = last_connect_error
-                .map(|error| format!("; last socket error: {error}"))
-                .unwrap_or_default();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "Cloud SQL Auth Proxy did not become ready{connect_context}{}",
-                    stderr_context(&stderr),
-                ),
-            ));
-        };
-
-        let socket_wait_ms = spawn_start.elapsed().as_millis() as u64;
-
-        // With `--lazy-refresh` the child binds its socket before any API
-        // call, so `socket_wait_ms` is pure spawn+bind; the first byte the
-        // guest relays then pays the ephemeral-cert fetch inline.
+        // The ephemeral certificate IS the login credential and Google caps
+        // its NotAfter at the login token's expiry; the minimum keeps the
+        // deadline honest if that capping ever changes. The admin token only
+        // mattered during the build.
+        let stale_after = endpoint.cert_not_after().min(login_expires);
         tracing::info!(
             %session_id,
             tunnel_id = %tunnel.id,
             instance = %config.instance,
             database_user = %config.database_user,
             mint_ms,
-            socket_wait_ms,
-            "authorized session tunnel",
+            build_ms,
+            %stale_after,
+            "built cloud sql tunnel endpoint",
         );
-        // The stderr task stays detached: it drains the pipe for the child's
-        // lifetime so a chatty child never blocks on a full pipe, and it ends
-        // when the child dies with the returned stream.
-        drop(stderr_task);
-        Ok(CloudSqlStream {
-            upstream,
-            _child: child,
-            _socket_dir: socket_dir,
+        Ok(CloudSqlEndpoint {
+            inner: endpoint,
+            stale_after,
         })
-    }
-}
-
-/// One relayed connection's grip on its Cloud SQL Auth Proxy child. The
-/// stream is the child's unix socket. A drop kills the child
-/// (`kill_on_drop`) and removes the private socket directory, so the
-/// child lives exactly as long as the guest connection it serves.
-struct CloudSqlStream {
-    upstream: UnixStream,
-    _child: tokio::process::Child,
-    _socket_dir: tempfile::TempDir,
-}
-
-impl tokio::io::AsyncRead for CloudSqlStream {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.upstream).poll_read(cx, buf)
-    }
-}
-
-impl tokio::io::AsyncWrite for CloudSqlStream {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.upstream).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.upstream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.upstream).poll_shutdown(cx)
-    }
-
-    fn poll_write_vectored(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.upstream).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.upstream.is_write_vectored()
-    }
-}
-
-#[async_trait]
-impl TunnelUpstream for CoordCloudSqlConnector {
-    fn kind(&self) -> &'static str {
-        CLOUD_SQL_CONNECTOR_KIND
-    }
-
-    async fn connect(
-        &self,
-        session_id: SessionId,
-        tunnel: &SessionTunnel,
-    ) -> std::io::Result<Box<dyn TunnelStream>> {
-        Ok(Box::new(self.connect_inner(session_id, tunnel).await?))
-    }
-}
-
-fn cloud_sql_socket_dir() -> std::io::Result<tempfile::TempDir> {
-    tempfile::Builder::new()
-        .prefix("engram-cloud-sql-")
-        .tempdir()
-}
-
-/// The directory the proxy listens in. The proxy creates this one level below
-/// the relay's private directory, so the name is a fixed component and the
-/// socket path stays the same length for every instance.
-fn cloud_sql_listen_dir(socket_dir: &Path) -> PathBuf {
-    socket_dir.join("db")
-}
-
-fn cloud_sql_postgres_socket_path(socket_dir: &Path) -> PathBuf {
-    cloud_sql_listen_dir(socket_dir).join(".s.PGSQL.5432")
-}
-
-async fn collect_stderr_tail(mut stderr: tokio::process::ChildStderr) -> Vec<u8> {
-    let mut tail = Vec::new();
-    let mut chunk = [0_u8; 1024];
-    loop {
-        match stderr.read(&mut chunk).await {
-            Ok(0) | Err(_) => return tail,
-            Ok(read) => append_tail(&mut tail, &chunk[..read]),
-        }
-    }
-}
-
-fn append_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
-    tail.extend_from_slice(chunk);
-    if tail.len() > CLOUD_SQL_STDERR_TAIL_BYTES {
-        tail.drain(..tail.len() - CLOUD_SQL_STDERR_TAIL_BYTES);
-    }
-}
-
-fn stderr_context(stderr: &[u8]) -> String {
-    let stderr = String::from_utf8_lossy(stderr);
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        String::new()
-    } else {
-        format!("; stderr: {stderr}")
     }
 }
 
@@ -660,56 +511,6 @@ mod tests {
     use engram_core::types::integration::{CredentialMintSource, SessionTunnel};
     use engram_core::{SandboxId, SessionId};
     use std::net::Ipv4Addr;
-
-    #[test]
-    fn cloud_sql_relays_get_distinct_socket_namespaces() {
-        let first = cloud_sql_socket_dir().unwrap();
-        let second = cloud_sql_socket_dir().unwrap();
-        assert_ne!(first.path(), second.path());
-    }
-
-    #[tokio::test]
-    async fn cloud_sql_relay_connects_to_the_postgres_proxy_socket() {
-        // macOS limits Unix socket paths to 103 bytes. Use the system's short
-        // temp alias so this proxy-layout regression also runs in macOS CI.
-        let socket_dir = tempfile::Builder::new()
-            .prefix("csql-")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let listen_dir = cloud_sql_listen_dir(socket_dir.path());
-        std::fs::create_dir(&listen_dir).unwrap();
-        let proxy_socket = listen_dir.join(".s.PGSQL.5432");
-        let _listener = tokio::net::UnixListener::bind(&proxy_socket).unwrap();
-
-        UnixStream::connect(cloud_sql_postgres_socket_path(socket_dir.path()))
-            .await
-            .unwrap();
-    }
-
-    #[test]
-    fn cloud_sql_socket_path_stays_inside_the_sockaddr_un_limit() {
-        // `sockaddr_un.sun_path` holds 108 bytes on Linux and 104 on macOS.
-        // The listen directory carries a fixed name, so no instance connection
-        // name can push the socket over either limit. A 66-character name
-        // reached 109 bytes when the proxy appended it instead.
-        let socket_dir = cloud_sql_socket_dir().unwrap();
-        let socket_path = cloud_sql_postgres_socket_path(socket_dir.path());
-        let length = socket_path.as_os_str().len();
-        assert!(
-            length < 104,
-            "socket path is {length} bytes: {}",
-            socket_path.display()
-        );
-    }
-
-    #[test]
-    fn cloud_sql_stderr_tail_is_bounded_and_keeps_the_newest_bytes() {
-        let mut tail = Vec::new();
-        append_tail(&mut tail, &vec![b'a'; CLOUD_SQL_STDERR_TAIL_BYTES]);
-        append_tail(&mut tail, b"diagnostic");
-        assert_eq!(tail.len(), CLOUD_SQL_STDERR_TAIL_BYTES);
-        assert!(tail.ends_with(b"diagnostic"));
-    }
 
     /// ADR 0056 (B′): `register_policy` translates a wire `EgressInjectEntry`
     /// (secret already resolved by the coordinator) into the proxy's

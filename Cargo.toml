@@ -19,6 +19,7 @@ members = [
     "crates/engram-session-bundles",
     "crates/engram-mount-manifest",
     "crates/engram-cloud-gcp",
+    "crates/engram-cloud-sql",
     "crates/engram-cloud-static",
     "crates/engram-harness-claude",
     "crates/engram-harness-codex",
@@ -97,6 +98,7 @@ engram-testkit = { path = "crates/engram-testkit" }
 engram-sandbox-firecracker = { path = "crates/engram-sandbox-firecracker" }
 engram-sandbox-vz = { path = "crates/engram-sandbox-vz" }
 engram-cloud-gcp = { path = "crates/engram-cloud-gcp" }
+engram-cloud-sql = { path = "crates/engram-cloud-sql" }
 engram-cloud-static = { path = "crates/engram-cloud-static" }
 engram-harness-noop = { path = "crates/engram-harness-noop" }
 engram-harness-proto = { path = "crates/engram-harness-proto" }
@@ -299,6 +301,9 @@ proptest = "1"
 # master seed forks per-component streams so adding a consumer doesn't
 # shift every other stream.
 rand = { version = "0.9", default-features = false, features = ["std"] }
+rand_core06 = { package = "rand_core", version = "0.6", default-features = false, features = ["getrandom"] }
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
+pem = "3"
 rand_chacha = "0.9"
 
 # tls + cert mint (host-side egress proxy)
