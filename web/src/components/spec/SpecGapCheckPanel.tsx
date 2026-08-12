@@ -104,6 +104,7 @@ export function SpecGapCheckPanel({ specId, editable, onBack }: SpecGapCheckPane
             stoppedAtLayerKey={run.stoppedAtLayerKey}
             suppressedCount={run.suppressedCount}
             editable={editable}
+            stale={stale}
             pendingFindingId={pendingFindingId}
             onDispose={onDispose}
           />

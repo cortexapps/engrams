@@ -194,6 +194,42 @@ describe("PostgresGapCheckStore with live Postgres", () => {
     expect(finding.disposedAt).toEqual(disposedAt);
   });
 
+  test.skipIf(!reachable)("a released reservation is available again", async () => {
+    const store = new PostgresGapCheckStore(pool!);
+    const original = run();
+    await store.insertRun(original, "fingerprint-release");
+    const reserved = await store.markDisposition({
+      runId: original.id,
+      findingId: "requirement_gap:R1:contract",
+      disposition: "diff_accepted",
+      openQuestionId: null,
+      disposedBy: actorUserId,
+      disposedAt: new Date("2026-08-12T14:40:00.000Z"),
+    });
+    expect(reserved).toBe(true);
+
+    await store.releaseDisposition(original.id, "requirement_gap:R1:contract");
+
+    const stored = await store.readRun(original.id);
+    const finding = stored!.findings.find(
+      (candidate) => candidate.id === "requirement_gap:R1:contract",
+    )!;
+    expect(finding.disposition).toBe("pending");
+    expect(finding.disposedBy).toBeNull();
+    expect(finding.disposedAt).toBeNull();
+    expect(finding.openQuestionId).toBeNull();
+    // And it can be reserved again.
+    const second = await store.markDisposition({
+      runId: original.id,
+      findingId: "requirement_gap:R1:contract",
+      disposition: "dismissed",
+      openQuestionId: null,
+      disposedBy: actorUserId,
+      disposedAt: new Date("2026-08-12T14:41:00.000Z"),
+    });
+    expect(second).toBe(true);
+  });
+
   test.skipIf(!reachable)("latestRun reads the newest pass for the spec", async () => {
     const store = new PostgresGapCheckStore(pool!);
     const older = run({ createdAt: new Date("2026-08-12T10:00:00.000Z") });

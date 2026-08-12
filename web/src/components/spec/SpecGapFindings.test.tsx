@@ -69,6 +69,35 @@ describe("SpecGapFindings", () => {
     expect(onDispose).toHaveBeenCalledWith("f2", "accept_diff");
   });
 
+  test("a stale pass cannot have its diff accepted", async () => {
+    const user = userEvent.setup();
+    const onDispose = vi.fn();
+    render(
+      <SpecGapFindings
+        findings={[
+          finding({
+            id: "f1",
+            proposedDiff: { sectionId: "sec-api", before: "old", after: "new" },
+          }),
+        ]}
+        stoppedAtLayerKey={null}
+        suppressedCount={0}
+        editable
+        stale
+        onDispose={onDispose}
+      />,
+    );
+
+    const accept = screen.getByRole("button", { name: "Accept proposed diff" });
+    expect(accept.hasAttribute("disabled")).toBe(true);
+    await user.click(accept);
+    expect(onDispose).not.toHaveBeenCalled();
+
+    // Opening a question is still safe: it adds an anchor, it replaces nothing.
+    await user.click(screen.getByRole("button", { name: "Open question @ §API surface" }));
+    expect(onDispose).toHaveBeenCalledWith("f1", "open_question");
+  });
+
   test("labels the finding that stopped the pass and counts the withheld ones", () => {
     render(
       <SpecGapFindings

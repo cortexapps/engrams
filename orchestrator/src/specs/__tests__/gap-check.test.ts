@@ -115,6 +115,9 @@ class MemoryGapCheckStore implements GapCheckStore {
     this.runs.set(run.id, run);
   }
 
+  /** Runs once, inside markDisposition, to stage a concurrent disposal. */
+  beforeMarkDisposition: (() => Promise<void>) | null = null;
+
   async markDisposition(input: {
     runId: string;
     findingId: string;
@@ -123,10 +126,18 @@ class MemoryGapCheckStore implements GapCheckStore {
     disposedBy: string | null;
     disposedAt: Date;
   }): Promise<boolean> {
+    if (this.beforeMarkDisposition) {
+      const hook = this.beforeMarkDisposition;
+      this.beforeMarkDisposition = null;
+      await hook();
+    }
     const run = this.runs.get(input.runId);
     if (!run) return false;
+    // The real compare-and-swap: only a pending finding can be reserved.
+    const current = run.findings.find((finding) => finding.id === input.findingId);
+    if (!current || current.disposition !== "pending") return false;
     const findings = run.findings.map((finding) =>
-      finding.id === input.findingId && finding.disposition === "pending"
+      finding.id === input.findingId
         ? {
             ...finding,
             disposition: input.disposition,
@@ -139,6 +150,23 @@ class MemoryGapCheckStore implements GapCheckStore {
     this.runs.set(run.id, { ...run, findings });
     return true;
   }
+
+  async releaseDisposition(runId: string, findingId: string): Promise<void> {
+    const run = this.runs.get(runId);
+    if (!run) return;
+    const findings = run.findings.map((finding) =>
+      finding.id === findingId
+        ? {
+            ...finding,
+            disposition: "pending" as const,
+            openQuestionId: null,
+            disposedBy: null,
+            disposedAt: null,
+          }
+        : finding,
+    );
+    this.runs.set(run.id, { ...run, findings });
+  }
 }
 
 interface RecordedCall {
@@ -150,6 +178,8 @@ interface RecordedCall {
 
 class RecordingDocuments implements GapCheckDocumentService {
   readonly calls: RecordedCall[] = [];
+  /** Set false to model a revision conflict inside the document services. */
+  applied = true;
 
   async addOpenQuestion(
     _specId: string,
@@ -161,7 +191,7 @@ class RecordingDocuments implements GapCheckDocumentService {
       payload: input.question,
       context: input,
     });
-    return { applied: true, newRev: 2n, concurrentEditors: [] };
+    return { applied: this.applied, newRev: 2n, concurrentEditors: [] };
   }
 
   async updateSection(
@@ -174,7 +204,7 @@ class RecordingDocuments implements GapCheckDocumentService {
       payload: input.markdown,
       context: input,
     });
-    return { applied: true, newRev: 2n, concurrentEditors: [] };
+    return { applied: this.applied, newRev: 2n, concurrentEditors: [] };
   }
 }
 
@@ -439,6 +469,121 @@ describe("GapCheckService.disposeFinding", () => {
         actorUserId: "user-2",
       }),
     ).rejects.toThrow(GapCheckError);
+  });
+
+  test("accepting a diff binds the revision the run read", async () => {
+    const { service, toolDocuments } = makeService();
+    const run = await service.run(
+      runInput({
+        proposedDiffs: [
+          { findingId: "requirement_gap:N1:system", after: "## Design\n\nTimed for N1.\n" },
+        ],
+      }),
+    );
+
+    await service.disposeFinding({
+      runId: run.id,
+      findingId: "requirement_gap:N1:system",
+      action: "accept_diff",
+      actorUserId: "user-1",
+    });
+
+    // Without this the whole section is replaced with text written against an
+    // older revision, silently discarding any edit made since.
+    expect(toolDocuments.calls[0]!.context.expectedRev).toBe(7n);
+  });
+
+  test("a section edited since the run refuses the diff and stays pending", async () => {
+    const { service, store, toolDocuments } = makeService();
+    const run = await service.run(
+      runInput({
+        proposedDiffs: [
+          { findingId: "requirement_gap:N1:system", after: "## Design\n\nTimed for N1.\n" },
+        ],
+      }),
+    );
+    // The document moved on, so updateSection reports a conflict.
+    toolDocuments.applied = false;
+
+    await expect(
+      service.disposeFinding({
+        runId: run.id,
+        findingId: "requirement_gap:N1:system",
+        action: "accept_diff",
+        actorUserId: "user-1",
+      }),
+    ).rejects.toThrow(GapCheckError);
+
+    const stored = await store.readRun(run.id);
+    const finding = stored!.findings.find(
+      (candidate) => candidate.id === "requirement_gap:N1:system",
+    )!;
+    // The reservation was released, so somebody can run the check again and
+    // dispose of it properly.
+    expect(finding.disposition).toBe("pending");
+    expect(finding.disposedBy).toBeNull();
+  });
+
+  test("a question that does not land leaves the finding pending", async () => {
+    const { service, store, toolDocuments } = makeService();
+    const run = await service.run(runInput());
+    const gap = run.findings.find((finding) => finding.kind === "requirement_gap")!;
+    toolDocuments.applied = false;
+
+    await expect(
+      service.disposeFinding({
+        runId: run.id,
+        findingId: gap.id,
+        action: "open_question",
+        actorUserId: "user-1",
+      }),
+    ).rejects.toThrow(GapCheckError);
+
+    const stored = await store.readRun(run.id);
+    expect(stored!.findings.find((candidate) => candidate.id === gap.id)!.disposition).toBe(
+      "pending",
+    );
+  });
+
+  test("the loser of a concurrent disposal never reaches the document", async () => {
+    const { service, store, toolDocuments } = makeService();
+    const run = await service.run(
+      runInput({
+        proposedDiffs: [
+          { findingId: "requirement_gap:N1:system", after: "## Design\n\nTimed for N1.\n" },
+        ],
+      }),
+    );
+    // Somebody else dismisses the finding between this caller's read and its
+    // reservation — the interleaving that "act, then record" gets wrong.
+    store.beforeMarkDisposition = async () => {
+      await store.markDisposition({
+        runId: run.id,
+        findingId: "requirement_gap:N1:system",
+        disposition: "dismissed",
+        openQuestionId: null,
+        disposedBy: "user-2",
+        disposedAt: NOW,
+      });
+    };
+
+    await expect(
+      service.disposeFinding({
+        runId: run.id,
+        findingId: "requirement_gap:N1:system",
+        action: "accept_diff",
+        actorUserId: "user-1",
+      }),
+    ).rejects.toThrow(GapCheckError);
+
+    // The section was never rewritten, so the record still matches the document.
+    expect(toolDocuments.calls).toEqual([]);
+    const stored = await store.readRun(run.id);
+    const finding = stored!.findings.find(
+      (candidate) => candidate.id === "requirement_gap:N1:system",
+    )!;
+    expect(finding.disposition).toBe("dismissed");
+    expect(finding.disposedBy).toBe("user-2");
   });
 
   test("dismissing a finding never touches the document", async () => {

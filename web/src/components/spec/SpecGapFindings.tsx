@@ -24,6 +24,8 @@ export interface SpecGapFindingsProps {
   stoppedAtLayerKey: string | null;
   suppressedCount: number;
   editable: boolean;
+  /** The spec moved on since this pass, so its diffs no longer describe it. */
+  stale?: boolean;
   pendingFindingId?: string | null;
   onDispose: (findingId: string, action: GapDispositionAction) => void;
 }
@@ -38,6 +40,7 @@ export function SpecGapFindings({
   stoppedAtLayerKey,
   suppressedCount,
   editable,
+  stale = false,
   pendingFindingId,
   onDispose,
 }: SpecGapFindingsProps) {
@@ -54,6 +57,7 @@ export function SpecGapFindings({
           ordinal={index + 1}
           stopped={finding.severity === "fatal" && finding.layerKey === stoppedAtLayerKey}
           editable={editable}
+          stale={stale}
           busy={pendingFindingId === finding.id}
           onDispose={onDispose}
         />
@@ -73,6 +77,7 @@ function Finding({
   ordinal,
   stopped,
   editable,
+  stale,
   busy,
   onDispose,
 }: {
@@ -80,6 +85,7 @@ function Finding({
   ordinal: number;
   stopped: boolean;
   editable: boolean;
+  stale: boolean;
   busy: boolean;
   onDispose: (findingId: string, action: GapDispositionAction) => void;
 }) {
@@ -111,7 +117,14 @@ function Finding({
             Open question @ §{finding.sectionTitle}
           </Button>
           {finding.proposedDiff === null ? null : (
-            <Button size="sm" disabled={busy} onClick={() => onDispose(finding.id, "accept_diff")}>
+            <Button
+              size="sm"
+              // A diff written against an older revision would replace the
+              // whole section and discard the edits made since.
+              disabled={busy || stale}
+              title={stale ? "The spec changed since this pass. Run the check again." : undefined}
+              onClick={() => onDispose(finding.id, "accept_diff")}
+            >
               Accept proposed diff
             </Button>
           )}

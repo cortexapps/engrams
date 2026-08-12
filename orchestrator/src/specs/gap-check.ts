@@ -97,6 +97,7 @@ export class GapCheckError extends Error {
       | "finding_not_found"
       | "already_disposed"
       | "no_proposed_diff"
+      | "stale_run"
       | "untraceable_document"
       | "unknown_layer"
       | "unknown_section",
@@ -112,7 +113,10 @@ export interface GapCheckStore {
   latestRun(specId: string): Promise<GapCheckRun | null>;
   readRun(runId: string): Promise<GapCheckRun | null>;
   insertRun(run: GapCheckRun, requestFingerprint: string): Promise<void>;
-  /** False when the finding was already disposed of by somebody else. */
+  /**
+   * Reserve a pending finding for one disposition. False means somebody else
+   * won it, and the caller must not touch the document.
+   */
   markDisposition(input: {
     runId: string;
     findingId: string;
@@ -121,6 +125,8 @@ export interface GapCheckStore {
     disposedBy: string | null;
     disposedAt: Date;
   }): Promise<boolean>;
+  /** Return a reserved finding to pending after its side effect failed. */
+  releaseDisposition(runId: string, findingId: string): Promise<void>;
 }
 
 /** The two document services the gap check reuses to land a disposition. */
@@ -239,7 +245,12 @@ export class GapCheckService {
 
   /**
    * Land one finding in the document, the only way a finding ever reaches it.
-   * Returns the updated run.
+   *
+   * The disposition is reserved before the document changes. The reservation
+   * is a compare-and-swap on `pending`, so of two concurrent disposals only
+   * one reaches the document at all, and the recorded outcome is always the
+   * one that happened. A side effect that fails releases the reservation
+   * rather than leaving a finding recorded as landed when it never did.
    */
   async disposeFinding(input: DisposeFindingInput): Promise<GapCheckRun> {
     const run = await this.readRun(input.runId);
@@ -256,49 +267,27 @@ export class GapCheckService {
         `Finding ${input.findingId} was already ${finding.disposition}.`,
       );
     }
+    if (input.action === "accept_diff" && finding.proposedDiff === null) {
+      throw new GapCheckError(
+        "no_proposed_diff",
+        `Finding ${finding.id} carries no proposed diff to accept.`,
+      );
+    }
 
     const context: SpecMutationContext = {
       ...(input.actorUserId === null ? {} : { actorUserId: input.actorUserId }),
       sessionId: run.sessionId ?? run.id,
       toolCallId: `gap-finding:${run.id}:${finding.id}`,
     };
+    const disposition = DISPOSITION_FOR[input.action];
+    // The same derivation addOpenQuestion uses, so the recorded link points at
+    // the row it creates.
+    const openQuestionId =
+      input.action === "open_question"
+        ? stableQuestionId(run.specId, context.sessionId, context.toolCallId)
+        : null;
 
-    let disposition: GapFindingDisposition;
-    let openQuestionId: string | null = null;
-    switch (input.action) {
-      case "open_question": {
-        await this.options.toolDocuments.addOpenQuestion(run.specId, {
-          ...context,
-          sectionId: finding.sectionId,
-          question: finding.detail,
-        });
-        disposition = "question_opened";
-        // The same derivation addOpenQuestion used, so the recorded link
-        // points at the row it actually created.
-        openQuestionId = stableQuestionId(run.specId, context.sessionId, context.toolCallId);
-        break;
-      }
-      case "accept_diff": {
-        if (!finding.proposedDiff) {
-          throw new GapCheckError(
-            "no_proposed_diff",
-            `Finding ${finding.id} carries no proposed diff to accept.`,
-          );
-        }
-        await this.options.toolDocuments.updateSection(run.specId, {
-          ...context,
-          sectionId: finding.proposedDiff.sectionId,
-          markdown: finding.proposedDiff.after,
-        });
-        disposition = "diff_accepted";
-        break;
-      }
-      case "dismiss":
-        disposition = "dismissed";
-        break;
-    }
-
-    await this.options.store.markDisposition({
+    const reserved = await this.options.store.markDisposition({
       runId: run.id,
       findingId: finding.id,
       disposition,
@@ -306,9 +295,78 @@ export class GapCheckService {
       disposedBy: input.actorUserId,
       disposedAt: this.options.now(),
     });
+    if (!reserved) {
+      throw new GapCheckError(
+        "already_disposed",
+        `Finding ${finding.id} was disposed of by somebody else.`,
+      );
+    }
+
+    try {
+      await this.applyDisposition(run, finding, input.action, context);
+    } catch (error) {
+      // Nothing reached the document, so the finding goes back to pending and
+      // stays available to whoever tries next.
+      await this.options.store.releaseDisposition(run.id, finding.id);
+      throw error;
+    }
     return this.readRun(run.id);
   }
+
+  /** Carry one reserved disposition into the document. */
+  private async applyDisposition(
+    run: GapCheckRun,
+    finding: GapCheckFinding,
+    action: DispositionAction,
+    context: SpecMutationContext,
+  ): Promise<void> {
+    if (action === "dismiss") return;
+
+    if (action === "open_question") {
+      const result = await this.options.toolDocuments.addOpenQuestion(run.specId, {
+        ...context,
+        sectionId: finding.sectionId,
+        question: finding.detail,
+      });
+      if (!result.applied) {
+        throw new GapCheckError(
+          "stale_run",
+          `The question for finding ${finding.id} did not land. Run the gap check again.`,
+        );
+      }
+      return;
+    }
+
+    const diff = finding.proposedDiff;
+    if (!diff) {
+      throw new GapCheckError(
+        "no_proposed_diff",
+        `Finding ${finding.id} carries no proposed diff to accept.`,
+      );
+    }
+    // The diff replaces the whole section, and it was written against the
+    // revision this run read. Bind that revision so an edit made since then is
+    // a conflict instead of a silent loss.
+    const result = await this.options.toolDocuments.updateSection(run.specId, {
+      ...context,
+      expectedRev: run.semanticDocSeq,
+      sectionId: diff.sectionId,
+      markdown: diff.after,
+    });
+    if (!result.applied) {
+      throw new GapCheckError(
+        "stale_run",
+        `${finding.sectionTitle} changed after this gap check ran, so the proposed diff was not applied. Run the check again.`,
+      );
+    }
+  }
 }
+
+const DISPOSITION_FOR: Record<DispositionAction, GapFindingDisposition> = {
+  open_question: "question_opened",
+  accept_diff: "diff_accepted",
+  dismiss: "dismissed",
+};
 
 /** Adapt the live document into the analyzer's input. */
 export function readSections(
@@ -570,6 +628,16 @@ export class PostgresGapCheckStore implements GapCheckStore {
       ],
     );
     return (result.rowCount ?? 0) > 0;
+  }
+
+  async releaseDisposition(runId: string, findingId: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE spec_gap_check_finding
+          SET disposition = 'pending', open_question_id = NULL,
+              disposed_by = NULL, disposed_at = NULL
+        WHERE run_id = $1 AND finding_id = $2`,
+      [runId, findingId],
+    );
   }
 
   private async hydrate(row: GapCheckRunRow | undefined): Promise<GapCheckRun | null> {

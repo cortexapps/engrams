@@ -186,6 +186,7 @@ function gapCheckHttpError(error: unknown): HTTPException {
       case "finding_not_found":
         return new HTTPException(404, { message: error.message });
       case "already_disposed":
+      case "stale_run":
         return new HTTPException(409, { message: error.message });
       default:
         return new HTTPException(400, { message: error.message });
