@@ -136,9 +136,9 @@ impl CosimWorld {
     /// referent — persisted BEFORE any ack-derived pin set is computed
     /// (the load-bearing ordering).
     pub async fn heartbeat(&self) {
-        let (current_bundles, sandbox_bundles) = {
+        let (current_bundles, sandbox_bundles, running) = {
             let host = self.host.lock().await;
-            (host.current_bundles(), host.sandbox_bundles())
+            (host.current_bundles(), host.sandbox_bundles(), host.list())
         };
         let _ = self
             .meta
@@ -151,6 +151,27 @@ impl CosimWorld {
                 host_heartbeat(&self.clock, current_bundles, sandbox_bundles),
             )
             .await;
+        // ADR 0116 A-D5: the heartbeat's tombstone leg — the same pure
+        // step the HTTP handler drives, consumed the way the real
+        // host-agent's heartbeat arm does (destroy the advertised
+        // sandboxes); the NEXT heartbeat's running set acks the rows by
+        // absence. Without this, an entombed VM stays served while the
+        // coordinator disowns it — the exact split-brain the
+        // ownership-agreement oracle flags.
+        let meta: Arc<dyn engram_core::traits::MetadataStore> = self.meta.clone();
+        let tombstoned = engram_coordinator::dead_host::process_sandbox_tombstones(
+            &meta,
+            self.host_id,
+            &running,
+            true,
+        )
+        .await;
+        if !tombstoned.is_empty() {
+            let mut host = self.host.lock().await;
+            for sandbox in tombstoned {
+                host.destroy(sandbox);
+            }
+        }
     }
 
     /// Seed an enabled image (+ its base snapshot row) so the boot

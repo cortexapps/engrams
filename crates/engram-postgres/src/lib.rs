@@ -4403,6 +4403,65 @@ impl MetadataStore for PostgresStore {
         Ok(n > 0)
     }
 
+    async fn record_sandbox_tombstone(
+        &self,
+        host_id: HostId,
+        sandbox_id: SandboxId,
+        session_id: Option<SessionId>,
+    ) -> Result<(), MetaError> {
+        // ADR 0116 A-D5: idempotent — a re-driven unbind path re-writes
+        // the same fact.
+        sqlx::query(
+            r#"INSERT INTO sandbox_tombstones (host_id, sandbox_id, session_id, created_at)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (host_id, sandbox_id) DO NOTHING"#,
+        )
+        .bind(host_id.as_uuid())
+        .bind(sandbox_id.as_uuid())
+        .bind(session_id.map(|s| s.as_uuid()))
+        .bind(self.clock.now_utc())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn sandbox_tombstones_for_host(
+        &self,
+        host_id: HostId,
+    ) -> Result<Vec<SandboxId>, MetaError> {
+        let rows: Vec<uuid::Uuid> = sqlx::query_scalar(
+            r#"SELECT sandbox_id FROM sandbox_tombstones WHERE host_id = $1 ORDER BY sandbox_id"#,
+        )
+        .bind(host_id.as_uuid())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(SandboxId::from).collect())
+    }
+
+    async fn ack_sandbox_tombstones_by_absence(
+        &self,
+        host_id: HostId,
+        running: &[SandboxId],
+    ) -> Result<Vec<SandboxId>, MetaError> {
+        // ADR 0116 A-D5: the sandbox LEAVING the host's reported running
+        // set is the host-affirmed "it is destroyed" — the row's job is
+        // done.
+        let running: Vec<uuid::Uuid> = running.iter().map(|s| s.as_uuid()).collect();
+        let rows: Vec<uuid::Uuid> = sqlx::query_scalar(
+            r#"DELETE FROM sandbox_tombstones
+                WHERE host_id = $1 AND sandbox_id <> ALL($2)
+               RETURNING sandbox_id"#,
+        )
+        .bind(host_id.as_uuid())
+        .bind(&running)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(SandboxId::from).collect())
+    }
+
     async fn mark_host_dead_if_lease_expired(
         &self,
         host_id: HostId,
@@ -4458,23 +4517,39 @@ impl MetadataStore for PostgresStore {
             .await
             .map_err(db_err)?;
 
+        // ADR 0116 A-D5: the tombstones ride the SAME transaction as
+        // the binding clears — every orphaned binding leaves a durable
+        // "your host must destroy this VM" fact, so the (possibly
+        // partitioned, possibly returning) host reaps its own disowned
+        // VMs from an explicit coordinator fact instead of a
+        // successor's inference.
         let rows = sqlx::query(
             r#"
             WITH prior AS (
-                SELECT id, status AS prev_status
+                SELECT id, sandbox_id, status AS prev_status
                   FROM sessions
                  WHERE host_id = $1
                    AND status NOT IN ('completed','failed','dead')
                    FOR UPDATE
+            ),
+            cleared AS (
+                UPDATE sessions s
+                   SET host_id    = NULL,
+                       sandbox_id = NULL,
+                       status     = 'host_lost',
+                       last_active_at = $2
+                  FROM prior p
+                 WHERE s.id = p.id
+                RETURNING s.id
+            ),
+            entombed AS (
+                INSERT INTO sandbox_tombstones (host_id, sandbox_id, session_id, created_at)
+                SELECT $1, p.sandbox_id, p.id, $2
+                  FROM prior p
+                 WHERE p.sandbox_id IS NOT NULL
+                ON CONFLICT (host_id, sandbox_id) DO NOTHING
             )
-            UPDATE sessions s
-               SET host_id    = NULL,
-                   sandbox_id = NULL,
-                   status     = 'host_lost',
-                   last_active_at = $2
-              FROM prior p
-             WHERE s.id = p.id
-            RETURNING s.id, p.prev_status
+            SELECT p.id, p.prev_status FROM prior p
             "#,
         )
         .bind(host_id.as_uuid())

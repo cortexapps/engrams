@@ -193,9 +193,6 @@ pub struct Sim {
     oracles: invariants::Oracles,
     rng: ChaCha8Rng,
     profile: Profile,
-    /// dead_host straggler serving-strike history (#777 ask-the-host),
-    /// owned per replica across sweeps like the real loop.
-    straggler_strikes: Vec<engram_coordinator::dead_host::StragglerStrikeMap>,
     dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig,
     queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig,
     idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig,
@@ -225,13 +222,11 @@ impl Sim {
         let rng = ChaCha8Rng::seed_from_u64(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let world = SimWorld::new(seed, 2, 3);
         world.seed_enabled_image(SIM_IMAGE);
-        let replicas = world.replicas.len();
         Self {
             world,
             oracles: Default::default(),
             rng,
             profile,
-            straggler_strikes: (0..replicas).map(|_| Default::default()).collect(),
             dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig::default(),
             queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig::default(),
             idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig::default(),
@@ -493,7 +488,6 @@ impl Sim {
                             &self.dead_host_cfg,
                             &state,
                             "sim-pod",
-                            &mut self.straggler_strikes[r],
                         )
                         .await;
                     }
@@ -730,6 +724,30 @@ impl Sim {
                         )
                         .await;
                     }
+                    // ADR 0116 A-D5: the heartbeat's tombstone leg — the
+                    // same extracted pure step the HTTP handler drives
+                    // (the swarm bypasses the handler, harness_desync
+                    // precedent). Advertised tombstones are consumed the
+                    // way the host-agent's heartbeat arm does: destroy
+                    // the local VM (a world Destroy effect, respecting
+                    // deferred-effect windows); the NEXT heartbeat's
+                    // running set then acks the row by absence. No
+                    // entropy draw; with no tombstones outstanding this
+                    // is read-only, so existing seeds keep their traces.
+                    let running_list: Vec<engram_core::SandboxId> =
+                        running.iter().copied().collect();
+                    let tombstoned = engram_coordinator::dead_host::process_sandbox_tombstones(
+                        &state.services.meta,
+                        id,
+                        &running_list,
+                        true,
+                    )
+                    .await;
+                    for sandbox in tombstoned {
+                        self.world
+                            .host_world
+                            .record_effect(id, crate::world::Effect::Destroy { sandbox });
+                    }
                     // Re-register on every live replica (the register
                     // endpoint's in-memory half).
                     for r in self.world.replicas.iter() {
@@ -809,7 +827,6 @@ impl Sim {
             }
             Step::CrashReplica(i) => {
                 self.world.replicas[i].state = None;
-                self.straggler_strikes[i].clear();
             }
             Step::RestartReplica(i) => {
                 if self.world.replicas[i].state.is_none() {

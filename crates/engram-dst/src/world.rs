@@ -184,6 +184,10 @@ pub struct EffectQueue {
 #[derive(Debug)]
 pub struct SimHostWorld {
     pub hosts: Mutex<BTreeMap<HostId, SimHostState>>,
+    /// ADR 0116 A4: every APPLIED destroy effect, in order — oracle
+    /// memory for the destroy-of-bound check (the oracle drains it via
+    /// a cursor; the log itself is append-only within a run).
+    pub destroyed: Mutex<Vec<(HostId, SandboxId)>>,
     pub effects: Mutex<EffectQueue>,
     /// ADR 0108 E: the harness-attach plane (dial scheduling + hub
     /// registration + the accepted-prompt echo queue).
@@ -215,6 +219,7 @@ impl Default for SimHostWorld {
     fn default() -> Self {
         Self {
             hosts: Mutex::new(BTreeMap::new()),
+            destroyed: Mutex::new(Vec::new()),
             effects: Mutex::new(EffectQueue::default()),
             attach: Mutex::new(AttachPlane::default()),
             blob: Arc::new(engram_sim::MemBlobStorage::new()),
@@ -260,7 +265,10 @@ impl SimHostWorld {
     }
 
     /// Record a verb's world-effect. Inline unless the host is deferred.
-    fn record_effect(&self, host: HostId, effect: Effect) {
+    /// `pub` for the scheduler's tombstone-consumption leg and the
+    /// pinned-scenario tests (ADR 0116 A-D5) — same deferred-window
+    /// semantics as the client verbs.
+    pub fn record_effect(&self, host: HostId, effect: Effect) {
         let deferred = {
             let mut q = self.effects.lock();
             if q.deferred.contains(&host) {
@@ -293,6 +301,12 @@ impl SimHostWorld {
         // lock order is hosts → attach, never nested the other way.
         if let Effect::Destroy { sandbox } = effect {
             self.attach.lock().harness.remove(sandbox);
+            // ADR 0116 A4: the destroy log (oracle memory) — every
+            // applied destroy is recorded for the destroy-of-bound
+            // oracle, which checks it against the PG bindings AFTER the
+            // step. Appended before the removal so "was it running" is
+            // capturable by future oracles if needed.
+            self.destroyed.lock().push((host, *sandbox));
         }
         let mut hosts = self.hosts.lock();
         let Some(h) = hosts.get_mut(&host) else {

@@ -31,12 +31,6 @@ pub struct Cosim {
     pub world: CosimWorld,
     idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig,
     queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig,
-    /// The dead-host detector config (default) — drives the REAL
-    /// `host_lost_straggler_sweep` (#782/#777 arms) at the boundary.
-    dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig,
-    /// The straggler-sweep serving-strike ledger, owned across ticks like the
-    /// real detector loop (the #777 ask-the-host defer/strike history).
-    straggler_strikes: engram_coordinator::dead_host::StragglerStrikeMap,
     /// The reconcile strike ledger, owned across ticks like the real loop.
     strikes: HashMap<SandboxId, u32>,
     /// The sandbox each session was last bound to (captured before the D5
@@ -63,8 +57,6 @@ impl Cosim {
             world: CosimWorld::new_with_fault_plan(seed, plan).await,
             idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig::default(),
             queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig::default(),
-            dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig::default(),
-            straggler_strikes: engram_coordinator::dead_host::StragglerStrikeMap::new(),
             strikes: HashMap::new(),
             session_sandbox: BTreeMap::new(),
             evict_cursor: BTreeMap::new(),
@@ -657,19 +649,13 @@ impl Cosim {
         self.world.host.lock().await.regain_all_records();
     }
 
-    /// One tick of the coordinator's REAL `host_lost_straggler_sweep` (#782 /
-    /// #777): for a bound HostLost row past the 60s min-age it probes the host
-    /// (`probe_sandbox → process_alive`, across the boundary) and DEFERS the
-    /// destroy while the VM is alive (banking a serving-strike) until the strike
-    /// cap, then destroys + settles. Owns the strike ledger across ticks like
-    /// the real detector loop.
+    /// One tick of the coordinator's REAL `host_lost_straggler_sweep`
+    /// (#782/#777, tombstone model since ADR 0116 A4): a bound HostLost
+    /// row past the 60s min-age is entombed and settled; a SERVING VM
+    /// is never destroyed by the coordinator (its tombstone owns it),
+    /// a gone/not-alive one gets the inline belt destroy.
     pub async fn straggler_sweep_tick(&mut self) {
-        let _ = engram_coordinator::dead_host::host_lost_straggler_sweep(
-            &self.dead_host_cfg,
-            &self.world.state,
-            &mut self.straggler_strikes,
-        )
-        .await;
+        let _ = engram_coordinator::dead_host::host_lost_straggler_sweep(&self.world.state).await;
         self.log("straggler_sweep_tick");
     }
 
@@ -1025,10 +1011,27 @@ impl Cosim {
             .await
             .unwrap_or(false);
             if !owned {
+                // ADR 0116 A-D5: a disowned-but-served sandbox with an
+                // OUTSTANDING TOMBSTONE is a legal converging transient,
+                // not split-brain — the coordinator has explicitly
+                // obligated the host to destroy it, and the next
+                // heartbeat consumes + acks. Only an un-entombed
+                // disagreement is the re-home split-brain this flags.
+                let entombed = self
+                    .world
+                    .meta
+                    .sandbox_tombstones_for_host(self.world.host_id)
+                    .await
+                    .unwrap_or_default()
+                    .contains(&sandbox);
+                if entombed {
+                    continue;
+                }
                 return Err(format!(
                     "ownership-agreement: host ACTIVELY serves sandbox {sandbox} (live backend) \
-                     bound to NON-TERMINAL session {session}, but the coordinator disowns it — a \
-                     served plane the coordinator has re-homed (split-brain)"
+                     bound to NON-TERMINAL session {session}, but the coordinator disowns it \
+                     with NO tombstone recorded — a served plane the coordinator has re-homed \
+                     (split-brain)"
                 ));
             }
         }

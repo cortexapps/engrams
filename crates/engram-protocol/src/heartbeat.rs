@@ -154,6 +154,13 @@ pub struct QuarantinedSurvivor {
     pub session_id: SessionId,
 }
 
+/// NOTE (ADR 0116 A-D5): `tombstoned_sandboxes` rides ONLY the JSON
+/// HTTP heartbeat mirrors (`#[serde(default)]`, additive, no
+/// `WIRE_VERSION` bump) and is deliberately absent here — this bincode
+/// twin is positional, so appending a field would break old peers
+/// without a bump (the `CheckpointKind` JSON-only precedent). The
+/// WS/`--mode=all` path simply doesn't deliver tombstones; its dev
+/// backends never leave disowned VMs behind.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HeartbeatAck {
     pub server_time: DateTime<Utc>,

@@ -582,16 +582,14 @@ pub const HOST_LOST_STRAGGLERS_SETTLED_TOTAL: &str = "engram_host_lost_straggler
 pub const HOST_LOST_UNRECOVERABLE_SNAPSHOT_TOTAL: &str =
     "engram_host_lost_unrecoverable_snapshot_total";
 
-/// Counter (issue #777, ADR 0098 Phase 3 ask-the-host).
-/// `host_lost_straggler_sweep` was about to destroy a still-bound
-/// sandbox, probed the host, and found the VMM process ALIVE — so it
-/// DEFERRED the destroy+settle for the reattach machinery and banked a
-/// serving-strike instead. Sustained nonzero means live VMs are sitting
-/// under HostLost rows (a partition/desync parking bug upstream); the
-/// sweep no longer kills them on sight (removes the >60s-partition
-/// destroy-a-live-VM window of #762/#769).
-pub const HOST_LOST_STRAGGLER_DEFERRED_SERVING_TOTAL: &str =
-    "engram_host_lost_straggler_deferred_serving_total";
+/// Counter (ADR 0116 A-D5, retiring the #777 serving-strike deferral).
+/// `host_lost_straggler_sweep` found a still-bound sandbox whose host
+/// reports the VMM process ALIVE — the coordinator never destroys a
+/// serving VM. The row settles now; the VM's tombstone rides the next
+/// heartbeat response and its OWN host destroys it (ack-by-absence
+/// clears the row). Sustained nonzero means live VMs are sitting under
+/// HostLost rows (a partition/desync parking bug upstream).
+pub const HOST_LOST_ENTOMBED_SERVING_TOTAL: &str = "engram_host_lost_entombed_serving_total";
 
 /// Counter (ADR 0019 / telemetry restoration #526). Same-host vs
 /// cross-host resume split, emitted in `api/snapshot.rs::resume_from_fc_snapshot`
