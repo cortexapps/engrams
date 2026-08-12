@@ -138,14 +138,22 @@ impl CoordCloudSqlConnector {
         // bind-then-drop TCP reservation can be stolen by another session
         // before the child binds, which can cross-connect two tenants.
         let socket_dir = cloud_sql_socket_dir()?;
-        let socket_path = cloud_sql_postgres_socket_path(socket_dir.path(), &config.instance);
+        let listen_dir = cloud_sql_listen_dir(socket_dir.path());
+        let socket_path = cloud_sql_postgres_socket_path(socket_dir.path());
 
         let binary = std::env::var_os("ENGRAM_CLOUD_SQL_PROXY")
             .unwrap_or_else(|| "/usr/local/bin/cloud-sql-proxy".into());
         let mut child = tokio::process::Command::new(binary)
-            .arg(&config.instance)
+            // `unix-socket-path` pins the listen directory. `--unix-socket`
+            // would instead append the instance connection name, so a long
+            // name pushes the socket past the 108-byte `sockaddr_un` limit and
+            // the proxy exits with "bind: invalid argument".
+            .arg(format!(
+                "{}?unix-socket-path={}",
+                config.instance,
+                listen_dir.display()
+            ))
             .arg("--auto-iam-authn")
-            .arg(format!("--unix-socket={}", socket_dir.path().display()))
             .arg("--max-connections=1")
             // Do not inherit host-agent credentials or deployment secrets.
             .env_clear()
@@ -257,8 +265,15 @@ fn cloud_sql_socket_dir() -> std::io::Result<tempfile::TempDir> {
         .tempdir()
 }
 
-fn cloud_sql_postgres_socket_path(socket_dir: &Path, instance: &str) -> PathBuf {
-    socket_dir.join(instance).join(".s.PGSQL.5432")
+/// The directory the proxy listens in. The proxy creates this one level below
+/// the relay's private directory, so the name is a fixed component and the
+/// socket path stays the same length for every instance.
+fn cloud_sql_listen_dir(socket_dir: &Path) -> PathBuf {
+    socket_dir.join("db")
+}
+
+fn cloud_sql_postgres_socket_path(socket_dir: &Path) -> PathBuf {
+    cloud_sql_listen_dir(socket_dir).join(".s.PGSQL.5432")
 }
 
 async fn collect_stderr_tail(mut stderr: tokio::process::ChildStderr) -> Vec<u8> {
@@ -607,15 +622,30 @@ mod tests {
             .prefix("csql-")
             .tempdir_in("/tmp")
             .unwrap();
-        let instance = "test-project:test-region:test-instance";
-        let instance_dir = socket_dir.path().join(instance);
-        std::fs::create_dir(&instance_dir).unwrap();
-        let proxy_socket = instance_dir.join(".s.PGSQL.5432");
+        let listen_dir = cloud_sql_listen_dir(socket_dir.path());
+        std::fs::create_dir(&listen_dir).unwrap();
+        let proxy_socket = listen_dir.join(".s.PGSQL.5432");
         let _listener = tokio::net::UnixListener::bind(&proxy_socket).unwrap();
 
-        UnixStream::connect(cloud_sql_postgres_socket_path(socket_dir.path(), instance))
+        UnixStream::connect(cloud_sql_postgres_socket_path(socket_dir.path()))
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn cloud_sql_socket_path_stays_inside_the_sockaddr_un_limit() {
+        // `sockaddr_un.sun_path` holds 108 bytes on Linux and 104 on macOS.
+        // The listen directory carries a fixed name, so no instance connection
+        // name can push the socket over either limit. A 66-character name
+        // reached 109 bytes when the proxy appended it instead.
+        let socket_dir = cloud_sql_socket_dir().unwrap();
+        let socket_path = cloud_sql_postgres_socket_path(socket_dir.path());
+        let length = socket_path.as_os_str().len();
+        assert!(
+            length < 104,
+            "socket path is {length} bytes: {}",
+            socket_path.display()
+        );
     }
 
     #[test]
