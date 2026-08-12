@@ -121,8 +121,14 @@ export class TraceabilityInputError extends Error {
   }
 }
 
+/** Enough text to carry a whole claim, so flagging it as uncited is fair. */
 function isSubstantive(block: TraceabilityBlock): boolean {
   return block.text.trim().length >= SUBSTANTIVE_BLOCK_MIN_CHARS;
+}
+
+/** Any text at all. This is what "the layer is written" means. */
+function hasContent(block: TraceabilityBlock): boolean {
+  return block.text.trim().length > 0;
 }
 
 function sectionText(section: TraceabilitySection): string {
@@ -358,11 +364,17 @@ function structuralFindings(
   liveRequirementCount: number,
 ): GapFinding[] {
   const findings: GapFinding[] = [];
+  // Whether a layer is written at all is a different question from whether a
+  // block states a whole claim. Judging presence by the scope-creep threshold
+  // would call a layer of short sentences empty and stop the pass on it.
   const substantiveLayers = new Set<string>();
   for (const section of input.sections) {
     if (section.state === "n/a") continue;
-    if (section.blocks.some(isSubstantive)) substantiveLayers.add(section.layerKey);
+    if (section.blocks.some(hasContent)) substantiveLayers.add(section.layerKey);
   }
+  // A requirement line carries no length threshold, so a terse ledger is still
+  // a written ledger.
+  if (liveRequirementCount > 0) substantiveLayers.add(ledgerSection.layerKey);
 
   let deepest = -1;
   input.layers.forEach((layer, index) => {

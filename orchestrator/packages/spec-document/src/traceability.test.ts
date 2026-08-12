@@ -245,6 +245,114 @@ describe("analyzeTraceability", () => {
     expect(stopped.suppressedCount).toBe(2);
   });
 
+  test("a terse requirements ledger is a written layer, not an empty one", () => {
+    // Every ledger line here is under the scope-creep threshold, and every one
+    // is a valid requirement. The ledger layer must not read as empty.
+    const result = analyzeTraceability({
+      layers: LAYERS,
+      sections: [
+        section({
+          id: "sec-req",
+          key: "requirements",
+          title: "Requirements",
+          layerKey: "intent",
+          blocks: blocks("- R1: Users can log in.", "- N1: Login is fast."),
+        }),
+        section({
+          id: "sec-behavior",
+          key: "behavior",
+          title: "Behavior",
+          layerKey: "contract",
+          blocks: blocks("A user signs in with an email and a password (R1, N1)."),
+        }),
+        section({
+          id: "sec-design",
+          key: "design",
+          title: "Design",
+          layerKey: "system",
+          blocks: blocks(
+            "A session cookie carries the login, and the check is a single indexed read (R1, N1).",
+          ),
+        }),
+      ],
+    });
+
+    expect(result.findings.filter((finding) => finding.kind === "missing_outer_layer")).toEqual([]);
+    expect(result.findings.every((finding) => finding.severity !== "fatal")).toBe(true);
+    // Nothing is suppressed, because nothing was fatal.
+    const stopped = applyOutsideIn(result.findings, LAYERS);
+    expect(stopped.stoppedAtLayerKey).toBeNull();
+    expect(stopped.suppressedCount).toBe(0);
+    expect(result.matrix.rows.map((row) => row.requirementId)).toEqual(["R1", "N1"]);
+  });
+
+  test("a layer of short sentences is written, so it stops no pass", () => {
+    const result = analyzeTraceability({
+      layers: LAYERS,
+      sections: [
+        section({
+          id: "sec-req",
+          key: "requirements",
+          title: "Requirements",
+          layerKey: "intent",
+          blocks: blocks("- R1: Users can log in."),
+        }),
+        // Short, but plainly written.
+        section({
+          id: "sec-behavior",
+          key: "behavior",
+          title: "Behavior",
+          layerKey: "contract",
+          blocks: blocks("Sign-in works (R1)."),
+        }),
+        section({
+          id: "sec-design",
+          key: "design",
+          title: "Design",
+          layerKey: "system",
+          blocks: blocks("A session cookie carries the login and is checked on each request (R1)."),
+        }),
+      ],
+    });
+
+    expect(result.findings.filter((finding) => finding.severity === "fatal")).toEqual([]);
+  });
+
+  test("a truly empty outer layer still stops the pass", () => {
+    const result = analyzeTraceability({
+      layers: LAYERS,
+      sections: [
+        section({
+          id: "sec-req",
+          key: "requirements",
+          title: "Requirements",
+          layerKey: "intent",
+          blocks: blocks("- R1: Users can log in."),
+        }),
+        // The template's untouched placeholder paragraph.
+        section({
+          id: "sec-behavior",
+          key: "behavior",
+          title: "Behavior",
+          layerKey: "contract",
+          blocks: blocks("   "),
+        }),
+        section({
+          id: "sec-design",
+          key: "design",
+          title: "Design",
+          layerKey: "system",
+          blocks: blocks("A session cookie carries the login and is checked on each request (R1)."),
+        }),
+      ],
+    });
+
+    const fatal = result.findings.filter((finding) => finding.severity === "fatal");
+    expect(fatal).toHaveLength(1);
+    expect(fatal[0]!.kind).toBe("missing_outer_layer");
+    expect(fatal[0]!.layerKey).toBe("contract");
+  });
+
   test("a document with no requirements section cannot be traced", () => {
     expect(() =>
       analyzeTraceability({
