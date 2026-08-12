@@ -11,6 +11,7 @@ import {
   type SpecSectionStateChipData,
 } from "@/components/spec/SectionStateTranscriptChip";
 import { SpecGapCheckPanel } from "@/components/spec/SpecGapCheckPanel";
+import { SpecPublishControl } from "@/components/spec/SpecPublishControl";
 import { SpecSectionRail, type SpecRailAction } from "@/components/spec/SpecSectionRail";
 import { Markdown } from "@/components/Markdown";
 import { Badge } from "@/components/ui/badge";
@@ -65,6 +66,8 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   const [pendingSectionId, setPendingSectionId] = useState<string | null>(null);
   // The gap check takes the document area when it is open (mock 2j).
   const [gapCheckOpen, setGapCheckOpen] = useState(false);
+  // The section a publish blocker sent the person to (mock 2k).
+  const [focusedSectionId, setFocusedSectionId] = useState<string | null>(null);
   useDocumentTitle(read.data?.spec.title ?? "Tech spec");
 
   useEffect(() => {
@@ -73,6 +76,7 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
     setActionChip(null);
     setActionError(null);
     setPendingSectionId(null);
+    setFocusedSectionId(null);
   }, [publishedId, specId]);
 
   if (read.isPending || rail.isPending) return <SpecReadLoading />;
@@ -155,6 +159,16 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
               </Link>
             </Button>
           )}
+          {/* The publish button is the readiness signal, so it lives in the
+              header next to the spec it gates (mock 2k). */}
+          <SpecPublishControl
+            specId={specId}
+            editable={isDraft}
+            onReviewSection={(sectionId) => {
+              setGapCheckOpen(false);
+              setFocusedSectionId(sectionId);
+            }}
+          />
         </div>
       </header>
 
@@ -265,6 +279,7 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
                   rail={rail.data}
                   editable={isDraft}
                   pendingSectionId={pendingSectionId}
+                  focusedSectionId={focusedSectionId}
                   onAction={runSectionAction}
                 />
               </TabsContent>

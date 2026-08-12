@@ -318,6 +318,14 @@
   box-shadow: inset 2px 0 0 var(--instrument-nominal);
 }
 
+/* Where a publish blocker sent the person (mock 2k): the row that carries the
+   Confirm and the n/a action is the place to act on the blocker. */
+.spec-layer li.is-focused {
+  border-color: color-mix(in oklab, var(--instrument-caution) 60%, var(--border));
+  background: color-mix(in oklab, var(--instrument-caution) 9%, var(--card));
+  box-shadow: inset 2px 0 0 var(--instrument-caution);
+}
+
 .spec-section-row-main {
   display: flex;
   align-items: flex-start;
