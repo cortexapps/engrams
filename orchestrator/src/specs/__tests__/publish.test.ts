@@ -7,6 +7,7 @@ import * as Y from "yjs";
 import type { SpecTemplateLayer, SpecTemplateSection } from "../../db/schema.ts";
 import type { SpecRailMetadata, SpecRailStore } from "../../routes/spec-rail.ts";
 import type { LoadedSpecDocument } from "../doc-service.ts";
+import { GapCheckError } from "../gap-check.ts";
 import type { GapCheckRun, GapCheckRunInput, GapCheckStatus } from "../gap-check.ts";
 import {
   SpecPublishError,
@@ -152,6 +153,7 @@ function gapCheckRun(id: string): GapCheckRun {
 
 class MemoryGapCheck {
   runs: GapCheckRunInput[] = [];
+  failWith: GapCheckError | null = null;
 
   constructor(private stale: boolean) {}
 
@@ -165,6 +167,7 @@ class MemoryGapCheck {
 
   async run(input: GapCheckRunInput): Promise<GapCheckRun> {
     this.runs.push(input);
+    if (this.failWith) throw this.failWith;
     this.stale = false;
     return gapCheckRun("run-2");
   }
@@ -335,6 +338,20 @@ describe("publish gate service", () => {
       "publish-gate:00000000-0000-4000-8000-0000000000aa",
     );
     expect(result.created).toBe(true);
+  });
+
+  test("a gap check that cannot read the document refuses plainly", async () => {
+    const { service, gapCheck, store } = fixture({ stale: true });
+    gapCheck.failWith = new GapCheckError(
+      "untraceable_document",
+      "The spec has no requirements section, so it cannot be traced.",
+    );
+
+    const error = await refusal(service.requestPublish(publishInput({ runGapCheck: true })));
+
+    expect(error.code).toBe("gap_check_failed");
+    expect(error.message).toBe("The spec has no requirements section, so it cannot be traced.");
+    expect(store.record).toBeNull();
   });
 
   test("a template with the gap check off never asks for a run", async () => {

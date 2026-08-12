@@ -56,6 +56,7 @@ export type SpecPublishRefusalReason =
   | "blocked"
   | "acknowledgment_required"
   | "gap_check_stale"
+  | "gap_check_failed"
   | "already_published"
   | "no_session";
 
@@ -69,11 +70,19 @@ export function specPublishKey(specId: string) {
   return ["spec", specId, "publish"] as const;
 }
 
-export function useSpecPublish(specId: string, enabled = true) {
+/**
+ * The gate. While a publish is in flight the scanner is still advancing it, so
+ * the status is polled until it completes; the steps a person watches are the
+ * server's own, not an optimistic guess.
+ */
+export function useSpecPublish(specId: string) {
   return useQuery({
     queryKey: specPublishKey(specId),
     queryFn: () => specRequest<SpecPublishStatus>(`/specs/${specId}/publish`),
-    enabled,
+    refetchInterval: (query) => {
+      const publish = query.state.data?.publish;
+      return publish && publish.state !== "complete" ? 2_000 : false;
+    },
   });
 }
 
@@ -126,6 +135,7 @@ function isRefusalReason(value: unknown): value is SpecPublishRefusalReason {
     value === "blocked" ||
     value === "acknowledgment_required" ||
     value === "gap_check_stale" ||
+    value === "gap_check_failed" ||
     value === "already_published" ||
     value === "no_session"
   );

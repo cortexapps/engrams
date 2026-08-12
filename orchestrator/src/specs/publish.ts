@@ -30,7 +30,7 @@ import type { Pool } from "pg";
 import type { SpecPublishState } from "../db/schema.ts";
 import type { SpecRailMetadata, SpecRailStore } from "../routes/spec-rail.ts";
 import { proseMirrorDocument, type SpecDocumentService } from "./doc-service.ts";
-import { readSections } from "./gap-check.ts";
+import { GapCheckError, readSections } from "./gap-check.ts";
 import type { GapCheckService } from "./gap-check.ts";
 
 /** What the publish path needs to know about the spec row itself. */
@@ -145,7 +145,8 @@ export class SpecPublishError extends Error {
       | "already_published"
       | "blocked"
       | "acknowledgment_required"
-      | "gap_check_stale",
+      | "gap_check_stale"
+      | "gap_check_failed",
     message: string,
     /** The gate at refusal time, so the dialog can list what to fix. */
     readonly status?: SpecPublishStatus,
@@ -243,12 +244,20 @@ export class SpecPublishService {
           status,
         );
       }
-      await this.options.gapCheck.run({
-        specId: input.specId,
-        sessionId: target.sessionId,
-        requestFingerprint: `publish-gate:${input.actionId}`,
-        actorUserId: input.actorUserId,
-      });
+      try {
+        await this.options.gapCheck.run({
+          specId: input.specId,
+          sessionId: target.sessionId,
+          requestFingerprint: `publish-gate:${input.actionId}`,
+          actorUserId: input.actorUserId,
+        });
+      } catch (error) {
+        // The pass could not read the document — most often a requirement
+        // ledger it cannot trace. Say so, rather than publish without the
+        // check or fail with a bare 500.
+        if (!(error instanceof GapCheckError)) throw error;
+        throw new SpecPublishError("gap_check_failed", error.message, status);
+      }
       status = await this.statusFor(target, input.actorUserId);
       // The pass can find nothing to change, but a person may have settled a
       // section between the two reads, so the gate is re-checked, not assumed.

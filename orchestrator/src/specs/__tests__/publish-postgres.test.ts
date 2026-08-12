@@ -12,7 +12,11 @@ import type { CreateCheckpointOptions, SpecCheckpointRecord } from "../checkpoin
 import type { LoadedSpecDocument } from "../doc-service.ts";
 import type { GapCheckRun, GapCheckStatus } from "../gap-check.ts";
 import { makeSpecPublishArtifactPublisher } from "../publish-artifact.ts";
-import { runSpecPublishTick, type SpecTicketizeHandoff } from "../publish-scanner.ts";
+import {
+  runSpecPublishTick,
+  ticketizePromptId,
+  type SpecTicketizeHandoff,
+} from "../publish-scanner.ts";
 import {
   PostgresSpecPublishStore,
   SpecPublishError,
@@ -325,8 +329,13 @@ describe("spec publish with live Postgres", () => {
       expect(artifact.rows[0]!.current_version).toBe(1);
       expect(artifact.rows[0]!.owner_user_id).toBe(owner);
 
-      // The ticketize hand-off carries the stable prompt id, once.
-      expect(first.ticketize.starts.length + second.ticketize.starts.length).toBe(1);
+      // The hand-off always carries the same prompt id. The count is not
+      // asserted: a driver that dies between the hand-off and the complete
+      // mark repeats the call, and SendPrompt's prompt id is what makes that
+      // repeat harmless (ADR 0067).
+      const starts = [...first.ticketize.starts, ...second.ticketize.starts];
+      expect(starts.length).toBeGreaterThanOrEqual(1);
+      expect([...new Set(starts)]).toEqual([ticketizePromptId(specId)]);
     },
   );
 

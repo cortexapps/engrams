@@ -164,16 +164,23 @@
 .spec-publish-footer {
   align-items: center;
   gap: 0.5rem;
+  flex-wrap: wrap;
 }
 
+/* The one-way statement takes its own line: squeezed between the buttons it
+   wraps to three lines and reads as decoration rather than as the warning. */
 .spec-publish-meta {
   display: flex;
   align-items: center;
   gap: 0.35rem;
-  margin-right: auto;
+  flex-basis: 100%;
   font-family: var(--font-mono);
   font-size: 0.66rem;
   color: var(--muted-foreground);
+}
+
+.spec-publish-footer > button:nth-of-type(1) {
+  margin-left: auto;
 }
 
 .spec-publish-meta svg {

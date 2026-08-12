@@ -123,15 +123,13 @@ beforeEach(() => {
 describe("SpecPublishControl", () => {
   test("the button is quiet while the gate blocks and filled when it passes (R34)", () => {
     state.status = blocked();
-    const { rerender } = render(
-      <SpecPublishControl specId="spec-1" editable onReviewSection={vi.fn()} />,
-    );
+    const { rerender } = render(<SpecPublishControl specId="spec-1" onReviewSection={vi.fn()} />);
 
     const quiet = screen.getByRole("button", { name: /Publish — 2 required sections/ });
     expect(quiet.className).not.toContain("bg-primary");
 
     state.status = status();
-    rerender(<SpecPublishControl specId="spec-1" editable onReviewSection={vi.fn()} />);
+    rerender(<SpecPublishControl specId="spec-1" onReviewSection={vi.fn()} />);
     const filled = screen.getByRole("button", { name: /Publish — the gate passes/ });
     expect(filled.className).toContain("bg-primary");
   });
@@ -140,7 +138,7 @@ describe("SpecPublishControl", () => {
     const user = userEvent.setup();
     const onReviewSection = vi.fn();
     state.status = blocked();
-    render(<SpecPublishControl specId="spec-1" editable onReviewSection={onReviewSection} />);
+    render(<SpecPublishControl specId="spec-1" onReviewSection={onReviewSection} />);
 
     await user.click(screen.getByRole("button", { name: /Publish/ }));
 
@@ -159,7 +157,7 @@ describe("SpecPublishControl", () => {
   test("open questions are written out in full and the count is in the checkbox (R35)", async () => {
     const user = userEvent.setup();
     state.status = withQuestions();
-    render(<SpecPublishControl specId="spec-1" editable onReviewSection={vi.fn()} />);
+    render(<SpecPublishControl specId="spec-1" onReviewSection={vi.fn()} />);
 
     await user.click(screen.getByRole("button", { name: /Publish/ }));
 
@@ -182,7 +180,7 @@ describe("SpecPublishControl", () => {
   test("publishing with open questions waits for the acknowledgment (R35)", async () => {
     const user = userEvent.setup();
     state.status = withQuestions();
-    render(<SpecPublishControl specId="spec-1" editable onReviewSection={vi.fn()} />);
+    render(<SpecPublishControl specId="spec-1" onReviewSection={vi.fn()} />);
     await user.click(screen.getByRole("button", { name: /Publish/ }));
 
     const primary = screen.getByRole<HTMLButtonElement>("button", {
@@ -206,7 +204,7 @@ describe("SpecPublishControl", () => {
       gate: { ...status().gate, gapCheckRunRequired: true },
       gapCheck: { stale: true, runId: null, ranAt: null, gates: true },
     });
-    render(<SpecPublishControl specId="spec-1" editable onReviewSection={vi.fn()} />);
+    render(<SpecPublishControl specId="spec-1" onReviewSection={vi.fn()} />);
 
     await user.click(screen.getByRole("button", { name: /Run gap check & publish/ }));
     expect(screen.getByText("9 of 9 ready · gap check has not run")).toBeTruthy();
@@ -227,7 +225,7 @@ describe("SpecPublishControl", () => {
       reason: "blocked",
       status: blocked(),
     });
-    render(<SpecPublishControl specId="spec-1" editable onReviewSection={vi.fn()} />);
+    render(<SpecPublishControl specId="spec-1" onReviewSection={vi.fn()} />);
 
     await user.click(screen.getByRole("button", { name: /Publish/ }));
     await user.click(screen.getByRole("button", { name: "Publish & ticketize" }));
@@ -252,9 +250,9 @@ describe("SpecPublishControl", () => {
         lastError: null,
       },
     });
-    render(<SpecPublishControl specId="spec-1" editable onReviewSection={vi.fn()} />);
+    render(<SpecPublishControl specId="spec-1" onReviewSection={vi.fn()} />);
 
-    await user.click(screen.getByRole("button", { name: /Publish/ }));
+    await user.click(screen.getByRole("button", { name: /Publishing/ }));
 
     expect(screen.getByText("This spec is published")).toBeTruthy();
     expect(screen.getByText("Pinned the checkpoint")).toBeTruthy();
@@ -262,16 +260,56 @@ describe("SpecPublishControl", () => {
     expect(screen.getByText("3 open questions were carried into the tickets.")).toBeTruthy();
   });
 
-  test("a published spec offers no gate at all", () => {
-    state.status = status();
-    render(<SpecPublishControl specId="spec-1" editable={false} onReviewSection={vi.fn()} />);
+  test("a finished publish offers no control at all", () => {
+    state.status = status({
+      canPublish: false,
+      publish: {
+        state: "complete",
+        checkpointId: "cp-1",
+        artifactId: "art-1",
+        artifactVersion: 1,
+        acknowledgedQuestionCount: 0,
+        requestedAt: "2026-08-12T15:04:00.000Z",
+        pinnedAt: "2026-08-12T15:04:01.000Z",
+        completedAt: "2026-08-12T15:04:03.000Z",
+        lastError: null,
+      },
+    });
+    render(<SpecPublishControl specId="spec-1" onReviewSection={vi.fn()} />);
 
     expect(screen.queryByRole("button", { name: /Publish/ })).toBeNull();
   });
 
+  test("a running publish stays reachable, and it reports its retry", async () => {
+    const user = userEvent.setup();
+    state.status = status({
+      canPublish: false,
+      publish: {
+        state: "pinned",
+        checkpointId: "cp-1",
+        artifactId: "art-1",
+        artifactVersion: null,
+        acknowledgedQuestionCount: 0,
+        requestedAt: "2026-08-12T15:04:00.000Z",
+        pinnedAt: "2026-08-12T15:04:01.000Z",
+        completedAt: null,
+        lastError: "the sandbox is not reachable",
+      },
+    });
+    render(<SpecPublishControl specId="spec-1" onReviewSection={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: /Publishing/ }));
+
+    expect(
+      screen.getByText(
+        "The last step did not finish: the sandbox is not reachable. It retries on its own.",
+      ),
+    ).toBeTruthy();
+  });
+
   test("a non-owner member sees no publish button (R37)", () => {
     state.status = status({ canPublish: false });
-    render(<SpecPublishControl specId="spec-1" editable onReviewSection={vi.fn()} />);
+    render(<SpecPublishControl specId="spec-1" onReviewSection={vi.fn()} />);
 
     expect(screen.queryByRole("button", { name: /Publish/ })).toBeNull();
   });

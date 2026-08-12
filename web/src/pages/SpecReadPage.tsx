@@ -163,7 +163,6 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
               header next to the spec it gates (mock 2k). */}
           <SpecPublishControl
             specId={specId}
-            editable={isDraft}
             onReviewSection={(sectionId) => {
               setGapCheckOpen(false);
               setFocusedSectionId(sectionId);

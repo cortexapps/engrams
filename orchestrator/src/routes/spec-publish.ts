@@ -215,6 +215,7 @@ function publishHttpError(error: unknown): HTTPException {
       case "blocked":
       case "acknowledgment_required":
       case "gap_check_stale":
+      case "gap_check_failed":
       case "already_published":
       case "no_session":
         return httpJson(409, body);

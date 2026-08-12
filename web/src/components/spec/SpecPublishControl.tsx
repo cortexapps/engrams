@@ -22,8 +22,6 @@ import "./spec-publish.css";
 
 export interface SpecPublishControlProps {
   specId: string;
-  /** A published spec has no gate left to read. */
-  editable: boolean;
   /** Puts the person in the blocking section, one click from the blocker. */
   onReviewSection: (sectionId: string) => void;
 }
@@ -34,9 +32,12 @@ export interface SpecPublishControlProps {
  * The button is the readiness signal: it stays quiet while the gate blocks and
  * it fills only when the gate would pass. A primary that is always lit and
  * mostly opens a "not yet" dialog teaches people to ignore the accent colour.
+ *
+ * The server's own status decides what this renders, so the browser never keeps
+ * a second opinion about who may publish or what is left to do.
  */
-export function SpecPublishControl({ specId, editable, onReviewSection }: SpecPublishControlProps) {
-  const status = useSpecPublish(specId, editable);
+export function SpecPublishControl({ specId, onReviewSection }: SpecPublishControlProps) {
+  const status = useSpecPublish(specId);
   const publish = usePublishSpec(specId);
   const [open, setOpen] = useState(false);
   const [acknowledged, setAcknowledged] = useState(false);
@@ -50,22 +51,32 @@ export function SpecPublishControl({ specId, editable, onReviewSection }: SpecPu
     setError(null);
   }, [open]);
 
-  if (!editable || !status.data) return null;
+  if (!status.data) return null;
   const current = refusal ?? status.data;
-  if (!current.canPublish && current.publish === null) return null;
+  const running = current.publish !== null && current.publish.state !== "complete";
+  // A finished publish needs no control: the page header already says
+  // published. A running one stays reachable, because its steps can still
+  // fail and retry, and hiding that would hide the only honest signal.
+  if (!running && (!current.canPublish || current.publish !== null)) return null;
 
   const gate = current.gate;
-  const label = gate.gapCheckRunRequired ? "Run gap check & publish" : "Publish";
+  const label = running
+    ? "Publishing…"
+    : gate.gapCheckRunRequired
+      ? "Run gap check & publish"
+      : "Publish";
 
   return (
     <>
       <Button
-        variant={gate.ready ? "default" : "outline"}
+        variant={!running && gate.ready ? "default" : "outline"}
         onClick={() => setOpen(true)}
         aria-label={
-          gate.ready
-            ? `${label} — the gate passes`
-            : `${label} — ${gate.blockers.length} required sections are not settled`
+          running
+            ? "Publishing — read the remaining steps"
+            : gate.ready
+              ? `${label} — the gate passes`
+              : `${label} — ${gate.blockers.length} required sections are not settled`
         }
       >
         {label}
@@ -340,7 +351,7 @@ function PublishedFace({ status, onClose }: { status: SpecPublishStatus; onClose
       ) : null}
       <DialogFooter className="spec-publish-footer">
         <Button size="sm" variant="outline" onClick={onClose}>
-          Close
+          Done
         </Button>
       </DialogFooter>
     </>
