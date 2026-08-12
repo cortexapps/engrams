@@ -114,7 +114,10 @@ function installTransport(opts: { harnessUserEnv?: boolean; harnessOAuth?: boole
                       userEnv: "CLAUDE_CODE_OAUTH_TOKEN",
                       userEnvHint: "Run `claude setup-token`.",
                     },
-                models: [],
+                // A model list gives the composer a control that renders ONLY
+                // from this descriptor — the in-flight test below anchors on it
+                // to prove the harness catalog resolved.
+                models: [{ id: "opus", label: "Claude Opus 5", default: true }],
                 effort: [],
               },
             },
@@ -254,6 +257,67 @@ describe("StartScreen", () => {
       expect((screen.getByTestId("launch-task") as HTMLButtonElement).disabled).toBe(true);
       await user.click(screen.getByTestId("launch-task"));
       expect(created).toHaveLength(0);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  // `/me/credentials` resolves after the first paint. An undefined list means
+  // UNKNOWN, not "missing" — reading it as missing flashed the caution box and
+  // disabled Launch on every load. The box waits for the answer, then pops in.
+  test("holds the credential warning until /me/credentials resolves", async () => {
+    let releaseCredentials: () => void = () => {};
+    const credentialsInFlight = new Promise<void>((resolve) => {
+      releaseCredentials = resolve;
+    });
+    const origFetch = global.fetch;
+    global.fetch = (async (url: string | URL | Request) => {
+      if (String(url).endsWith("/me/credentials")) {
+        await credentialsInFlight;
+        return new Response(
+          JSON.stringify({
+            credentials: [
+              {
+                kind: "oauth",
+                provider: "openai-codex",
+                harnesses: [{ name: "codex", label: "Codex" }],
+                connected: false,
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (String(url).endsWith("/me/harness-env")) {
+        return new Response(JSON.stringify({ vars: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fetch ${String(url)}`);
+    }) as typeof fetch;
+    try {
+      const { transport } = installTransport({ harnessOAuth: true });
+      renderWithProviders(<StartScreen />, { transport });
+      const user = userEvent.setup();
+
+      // Everything the box depends on EXCEPT the credential list has landed:
+      // the model picker renders from the same descriptor that declares the
+      // OAuth provider, so the catalog is in hand. This is exactly the window
+      // the box used to flash in.
+      expect(await screen.findByTestId("session-model-select")).toBeTruthy();
+      expect(screen.queryByText(/OpenAI is not connected/i)).toBeNull();
+      // Launch stays enabled too: nothing is known to be missing yet.
+      await user.type(screen.getByLabelText("Task"), "Do the thing.");
+      expect((screen.getByTestId("launch-task") as HTMLButtonElement).disabled).toBe(false);
+
+      releaseCredentials();
+
+      // Now the answer is in, and it says disconnected — the box pops in.
+      expect(await screen.findByText(/OpenAI is not connected/i)).toBeTruthy();
+      await waitFor(() =>
+        expect((screen.getByTestId("launch-task") as HTMLButtonElement).disabled).toBe(true),
+      );
     } finally {
       global.fetch = origFetch;
     }
