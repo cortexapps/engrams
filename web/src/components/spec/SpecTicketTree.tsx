@@ -85,26 +85,44 @@ export function SpecTicketTree({ tree, onCommand, onTree }: SpecTicketTreeProps)
     }
   }
 
-  function move(id: string, parentId: string | null, index?: number): void {
-    let optimistic: SpecTicketTree | undefined;
+  /**
+   * Apply a tree operation locally, then send it.
+   *
+   * The tree refuses some operations itself — a drop onto one's own child, a
+   * merge into one's own descendant. A refusal is an expected outcome and not
+   * a fault, so it becomes a message and nothing is sent. Returns false when
+   * the tree refused, so a caller can leave its own state alone.
+   */
+  function attempt(
+    change: (nodes: SpecTicketNode[]) => SpecTicketNode[],
+    command: SpecTicketCommand,
+  ): boolean {
+    let optimistic: SpecTicketTree;
     try {
-      optimistic = applyLocally(tree, (nodes) =>
-        moveTicket(nodes, { id, parentId, ...(index === undefined ? {} : { index }) }),
-      );
+      optimistic = applyLocally(tree, change);
     } catch (failure) {
-      // The tree itself refused, so nothing is sent and nothing moves.
-      setError(failure instanceof Error ? failure.message : "That move is not allowed.");
-      return;
+      setError(failure instanceof Error ? failure.message : "That change is not allowed.");
+      return false;
     }
-    void run({ kind: "move", id, parentId, ...(index === undefined ? {} : { index }) }, optimistic);
+    void run(command, optimistic);
+    return true;
+  }
+
+  function move(id: string, parentId: string | null, index?: number): void {
+    const where = { id, parentId, ...(index === undefined ? {} : { index }) };
+    attempt((nodes) => moveTicket(nodes, where), { kind: "move", ...where });
   }
 
   function merge(): void {
     const [targetId, ...sourceIds] = selected;
     if (targetId === undefined || sourceIds.length === 0) return;
-    const optimistic = applyLocally(tree, (nodes) => mergeTickets(nodes, { targetId, sourceIds }));
-    setSelected([targetId]);
-    void run({ kind: "merge", targetId, sourceIds }, optimistic);
+    // The selection survives a refusal, so the person can pick again.
+    const sent = attempt((nodes) => mergeTickets(nodes, { targetId, sourceIds }), {
+      kind: "merge",
+      targetId,
+      sourceIds,
+    });
+    if (sent) setSelected([targetId]);
   }
 
   const rows = tree.tickets;

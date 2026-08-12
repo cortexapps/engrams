@@ -232,6 +232,36 @@ describe("the ticket tree", () => {
     expect(merged.tickets.find((entry) => entry.id === "events")?.depth).toBe(1);
   });
 
+  test("a merge into one's own descendant is refused, and the picks survive", async () => {
+    const user = userEvent.setup();
+    const { commands } = renderTree();
+
+    // The first pick is the target, so picking the child before its parent asks
+    // to fold an ancestor into its own descendant.
+    await user.click(
+      screen.getByRole("checkbox", { name: "Select Emit sandbox.created meter events" }),
+    );
+    await user.click(screen.getByRole("checkbox", { name: "Select Hourly meter rollup job" }));
+    await user.click(screen.getByRole("button", { name: /Merge/ }));
+
+    expect(commands).toEqual([]);
+    expect(screen.getByRole("alert").textContent).toContain("own descendants");
+    // Nothing moved, and both picks are still picked.
+    expect(rows().map((entry) => entry.title)).toEqual([
+      "Add org quota columns",
+      "Hourly meter rollup job",
+      "Emit sandbox.created meter events",
+      "Enforce org quota in the gateway limiter",
+      "Quota-aware 429 payload",
+    ]);
+    for (const name of [
+      "Select Emit sandbox.created meter events",
+      "Select Hourly meter rollup job",
+    ]) {
+      expect((screen.getByRole("checkbox", { name }) as HTMLInputElement).checked).toBe(true);
+    }
+  });
+
   test("the merge button needs two tickets", async () => {
     const user = userEvent.setup();
     renderTree();
