@@ -87,12 +87,16 @@ async fn terminal_sessions_leftover_vm_is_still_reaped() {
         .await;
     sim.drop_local_binding(sandbox);
 
+    // ADR 0116 A5: ticks at the real cadence — the first stamps the
+    // first-seen mark, and the age grace (2x the interval) clears with
+    // the time advances between ticks.
     for _ in 0..3 {
         sim.reconcile_tick(true).await;
+        sim.advance(120).await;
     }
 
     assert!(
         sim.reconcile_destroys().contains(&sandbox),
-        "a terminal session's confirmed-orphan VM is reaped after the strikes"
+        "a terminal session's confirmed-orphan VM is reaped once the age grace clears"
     );
 }
