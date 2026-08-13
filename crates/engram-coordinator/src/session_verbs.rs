@@ -256,10 +256,25 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
         // recoverability, demoting to Dead when nothing usable exists).
         SessionState::Unreachable => {
             if let Some(sandbox_id) = session.sandbox_id {
+                // ADR 0116 A-D5: the durable fact before the unbind —
+                // if the destroy below fails, the tombstone (not an
+                // orphan-reap inference) owns the VM's cleanup.
+                if let Some(host_id) = session.host_id {
+                    if let Err(e) = state
+                        .services
+                        .meta
+                        .record_sandbox_tombstone(host_id, sandbox_id, Some(id))
+                        .await
+                    {
+                        tracing::warn!(session_id = %id, %sandbox_id, error = %e,
+                            "unreachable recovery: tombstone write failed; retrying the op");
+                        return OpOutcome::Retry("tombstone write failed".into());
+                    }
+                }
                 if let Err(e) = state.services.host.destroy(sandbox_id, ctx.fence()).await {
                     tracing::warn!(session_id = %id, %sandbox_id, error = %e,
                         "unreachable recovery: destroy of the dead sandbox failed \
-                         (continuing — orphan_reap owns stragglers)");
+                         (continuing — its tombstone owns cleanup)");
                 }
             }
             match state
@@ -1397,8 +1412,24 @@ async fn destroy(ctx: &OpCtx<'_>) -> OpOutcome {
                 session_id = %id,
                 sandbox_id = %sandbox_id,
                 error = %e,
-                "sandbox destroy failed during session delete; host-agent reconcile will GC",
+                "sandbox destroy failed during session delete; its tombstone owns cleanup",
             );
+            // ADR 0116 A-D5: the row is terminal and the binding is
+            // detached — without a durable fact the VM's only cleanup
+            // would be host-side inference. Best-effort (the op step
+            // re-drives on failure).
+            if let Some(host_id) = session.host_id {
+                if let Err(e) = state
+                    .services
+                    .meta
+                    .record_sandbox_tombstone(host_id, sandbox_id, Some(id))
+                    .await
+                {
+                    tracing::warn!(session_id = %id, %sandbox_id, error = %e,
+                        "destroy op: tombstone write failed; retrying the op");
+                    return OpOutcome::Retry("tombstone write failed".into());
+                }
+            }
         }
         // ADR 0006: the host-agent unregisters its local proxy entry as
         // part of `destroy`. No coordinator-side cleanup.

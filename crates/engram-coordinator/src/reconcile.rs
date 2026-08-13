@@ -427,47 +427,19 @@ async fn flip_missing(
     // the two dead-host sites keyed on mere snapshot presence (an
     // un-recoverable snapshot could be lied into Idle) — the shared
     // predicate closes both directions.
-    let latest_snapshot = match meta.latest_snapshot_for_session(session_id).await {
-        Ok(opt) => opt,
-        Err(e) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "reconcile: latest_snapshot_for_session failed; treating as not-recoverable"
-            );
-            None
-        }
-    };
-    let has_recoverable_snapshot = latest_snapshot.as_ref().is_some_and(|s| s.recoverable);
-    let new_status = crate::dead_host::recovery_target(
-        has_recoverable_snapshot,
-        session.live_disk_manifest.is_some(),
-    );
-    crate::dead_host::note_unrecoverable_if_dead(new_status, latest_snapshot.as_ref(), session_id);
-    match meta
-        .transition_session(session_id, new_status, BindingDisposition::RequireUnbound)
-        .await
-    {
-        Ok(host_lost_prev) => {
-            emit_status_changed(meta, events, session_id, host_lost_prev, new_status, now).await;
-            tracing::info!(
-                session_id = %session_id,
-                host_id = %host_id,
-                final_state = ?new_status,
-                has_recoverable_snapshot,
-                has_live_manifest = session.live_disk_manifest.is_some(),
-                "ADR 0009 reconcile: orphaned session moved through HostLost"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                ?new_status,
-                "reconcile: HostLost second-stage transition failed; leaving at HostLost"
-            );
-        }
-    }
+    // ADR 0116 A4: the shared settle. NOTE the error-posture change
+    // from the pre-A4 copy this replaces: a snapshot-read error now
+    // leaves the row at HostLost for the straggler sweep (the old copy
+    // treated it as not-recoverable — a PG blip could terminally Dead a
+    // recoverable session, a latent honest-Dead violation).
+    crate::dead_host::settle_host_lost(
+        meta,
+        events,
+        session_id,
+        Some(session.live_disk_manifest.is_some()),
+        now,
+    )
+    .await;
     // The Active -> HostLost transition above landed regardless of
     // whether stage 2 (HostLost -> {Idle,Dead}) also succeeded — the
     // session left Active, which is what `to_flip` promises callers.

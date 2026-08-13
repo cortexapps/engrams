@@ -43,6 +43,10 @@ pub struct Oracles {
     /// the host it was torn from is only knowable from last step's
     /// observation.
     prev_bindings: BTreeMap<SessionId, engram_core::HostId>,
+    /// Cursor into the world's destroy log (ADR 0116 A4): destroys
+    /// before this index have been checked by the destroy-of-bound
+    /// oracle.
+    destroys_checked: usize,
 }
 
 impl Oracles {
@@ -60,7 +64,52 @@ impl Oracles {
         user_input_never_rewound(world)?;
         self.attach_disagreement(world)?;
         self.lease_liveness(world)?;
+        self.destroy_of_bound_sandbox(world)?;
         Ok(())
+    }
+
+    /// ADR 0116 A4: no destroy of a sandbox bound to an ACTIVE session.
+    /// Legal coordinator destroys either detach the binding first (the
+    /// idle-evict fused flip, the straggler sweep's guarded clear, the
+    /// delete verb's terminal Detach), target a never-bound VM (boot
+    /// rollbacks), or run under a transitional state that owns the
+    /// teardown (Evacuating's confirmed source teardown, Unreachable
+    /// recovery — destroy-then-confirm-then-clear is the ADR 0116
+    /// discipline there). What no path may ever do is destroy the VM
+    /// under a session that is bound AND Active — the incident's
+    /// healthy-VM kill, promoted to an every-step check. Stateful:
+    /// drains the world's destroy log via a cursor and checks each new
+    /// entry against CURRENT bindings (the step that destroyed also
+    /// holds any binding it failed to clear).
+    fn destroy_of_bound_sandbox(&mut self, world: &SimWorld) -> Result<(), Violation> {
+        let new: Vec<(engram_core::HostId, engram_core::SandboxId)> = {
+            let log = world.host_world.destroyed.lock();
+            log[self.destroys_checked.min(log.len())..].to_vec()
+        };
+        if new.is_empty() {
+            return Ok(());
+        }
+        self.destroys_checked += new.len();
+        world.meta.with_db(|db| {
+            for (host, sandbox) in &new {
+                if let Some(row) = db.sessions.values().find(|r| {
+                    r.session.sandbox_id == Some(*sandbox)
+                        && r.session.status == SessionState::Active
+                }) {
+                    return Err(Violation {
+                        invariant: "destroy-of-bound-sandbox",
+                        detail: format!(
+                            "sandbox {sandbox} on host {host} was destroyed while ACTIVE \
+                             session {} still binds it — destroy must follow the binding \
+                             clear or a transition out of Active, never precede both \
+                             (ADR 0116 A4)",
+                            row.session.id,
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        })
     }
 
     /// ADR 0116 A-D4: the lease-liveness oracle. A session may lose its

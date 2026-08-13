@@ -202,7 +202,8 @@ plus the ADR 0068 probe-before-flip), `unreachable_guests`,
 `quarantined_survivors`, and the host's own destroy. Row staleness,
 failed probes, and missing host-local bindings no longer qualify.
 
-Migration `0115_sandbox_tombstones.sql` adds
+Migration `0116_sandbox_tombstones.sql` (0115 was taken by the
+lease substrate) adds
 `sandbox_tombstones(host_id, sandbox_id, session_id, created_at)` —
 explicit disownment the host consumes. Written by the bulk orphan
 in-transaction and by every site that unbinds after a failed destroy

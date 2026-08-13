@@ -869,6 +869,7 @@ impl MetadataStore for SimMetadataStore {
         }
         let mut out = Vec::new();
         let mut log = Vec::new();
+        let mut tombstones = Vec::new();
         for row in db.sessions.values_mut() {
             if row.session.host_id == Some(host_id)
                 && !matches!(
@@ -877,6 +878,11 @@ impl MetadataStore for SimMetadataStore {
                 )
             {
                 let prev = row.session.status;
+                // ADR 0116 A-D5: same-tx tombstone per cleared binding,
+                // exactly the PG CTE's `entombed` leg.
+                if let Some(sandbox_id) = row.session.sandbox_id {
+                    tombstones.push(((host_id, sandbox_id), (Some(row.session.id), now)));
+                }
                 row.session.host_id = None;
                 row.session.sandbox_id = None;
                 row.session.status = SessionState::HostLost;
@@ -890,8 +896,64 @@ impl MetadataStore for SimMetadataStore {
                 out.push((row.session.id, prev));
             }
         }
+        for (key, value) in tombstones {
+            db.sandbox_tombstones.entry(key).or_insert(value);
+        }
         db.transition_log.append(&mut log);
         Ok(out)
+    }
+
+    /// ADR 0116 A-D5: exactly the `record_sandbox_tombstone` INSERT —
+    /// idempotent on the (host, sandbox) key.
+    async fn record_sandbox_tombstone(
+        &self,
+        host_id: HostId,
+        sandbox_id: engram_core::SandboxId,
+        session_id: Option<SessionId>,
+    ) -> Result<(), MetaError> {
+        self.gate()?;
+        let now = self.now();
+        self.db
+            .lock()
+            .sandbox_tombstones
+            .entry((host_id, sandbox_id))
+            .or_insert((session_id, now));
+        Ok(())
+    }
+
+    async fn sandbox_tombstones_for_host(
+        &self,
+        host_id: HostId,
+    ) -> Result<Vec<engram_core::SandboxId>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        Ok(db
+            .sandbox_tombstones
+            .keys()
+            .filter(|(h, _)| *h == host_id)
+            .map(|(_, s)| *s)
+            .collect())
+    }
+
+    /// ADR 0116 A-D5: delete every tombstone for the host whose sandbox
+    /// is absent from the reported running set (ack-by-absence).
+    async fn ack_sandbox_tombstones_by_absence(
+        &self,
+        host_id: HostId,
+        running: &[engram_core::SandboxId],
+    ) -> Result<Vec<engram_core::SandboxId>, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        let acked: Vec<engram_core::SandboxId> = db
+            .sandbox_tombstones
+            .keys()
+            .filter(|(h, s)| *h == host_id && !running.contains(s))
+            .map(|(_, s)| *s)
+            .collect();
+        for s in &acked {
+            db.sandbox_tombstones.remove(&(host_id, *s));
+        }
+        Ok(acked)
     }
 
     async fn host_status(&self, host_id: HostId) -> Result<Option<HostStatus>, MetaError> {

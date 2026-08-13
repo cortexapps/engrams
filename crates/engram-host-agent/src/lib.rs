@@ -1701,6 +1701,37 @@ impl HostAgent {
                             capture_jobs_for_heartbeat
                                 .ack(&resp.acked_capture_jobs)
                                 .await;
+                            // ADR 0116 A-D5: destroy tombstoned sandboxes
+                            // — the coordinator's durable "this VM is
+                            // disowned; its host must destroy it" fact
+                            // (bindings cleared without host-affirmed
+                            // absence). Each destroy is its own task so a
+                            // slow teardown never delays this tick; the
+                            // coordinator deletes the row once the sandbox
+                            // leaves our reported running set
+                            // (ack-by-absence), so failures simply retry
+                            // on the next advertise. Placed BEFORE the
+                            // capture-assignment arm: its `None` case
+                            // `continue`s the loop.
+                            for &sandbox_id in &resp.tombstoned_sandboxes {
+                                let backend = pooled_for_heartbeat.clone();
+                                tokio::spawn(async move {
+                                    match backend.destroy(sandbox_id).await {
+                                        Ok(()) => tracing::info!(
+                                            %sandbox_id,
+                                            "destroyed tombstoned sandbox (coordinator disowned it)",
+                                        ),
+                                        // Already gone: the next heartbeat's
+                                        // running set acks the row.
+                                        Err(engram_core::SandboxError::NotFound) => {}
+                                        Err(e) => tracing::warn!(
+                                            %sandbox_id,
+                                            error = %e,
+                                            "tombstoned sandbox destroy failed; retrying on next advertise",
+                                        ),
+                                    }
+                                });
+                            }
                             // `None` = the coord's assignment read failed
                             // (unknown) — take no action at all this tick.
                             // `Some` is authoritative: converge-cancel any

@@ -1743,6 +1743,51 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
+    /// ADR 0116 A-D5: record that `sandbox_id` on `host_id` is disowned
+    /// and its host must destroy it — written by every site that clears
+    /// a binding WITHOUT host-affirmed absence (a failed destroy
+    /// followed by an unbind; the dead-host bulk orphan writes its
+    /// tombstones in-transaction instead). Idempotent (`ON CONFLICT DO
+    /// NOTHING` on the `(host_id, sandbox_id)` key). `session_id` is
+    /// forensics only. Delivered on the host's next heartbeat response;
+    /// deleted by [`Self::ack_sandbox_tombstones_by_absence`]. Default
+    /// body is a mock no-op; PG and sim implement the real semantics
+    /// (conformance: `t_sandbox_tombstones`).
+    async fn record_sandbox_tombstone(
+        &self,
+        host_id: HostId,
+        sandbox_id: crate::SandboxId,
+        session_id: Option<SessionId>,
+    ) -> Result<(), MetaError> {
+        let _ = (host_id, sandbox_id, session_id);
+        Ok(())
+    }
+
+    /// ADR 0116 A-D5: the tombstones currently outstanding for
+    /// `host_id`, advertised on every heartbeat response until the host
+    /// acks by absence. Default body: none.
+    async fn sandbox_tombstones_for_host(
+        &self,
+        host_id: HostId,
+    ) -> Result<Vec<crate::SandboxId>, MetaError> {
+        let _ = host_id;
+        Ok(Vec::new())
+    }
+
+    /// ADR 0116 A-D5: ack-by-absence — delete every tombstone for
+    /// `host_id` whose sandbox is NOT in `running` (the host's reported
+    /// running set; the sandbox leaving it IS the host-affirmed "it is
+    /// destroyed"). Returns the acked sandbox ids for logging. Default
+    /// body: none.
+    async fn ack_sandbox_tombstones_by_absence(
+        &self,
+        host_id: HostId,
+        running: &[crate::SandboxId],
+    ) -> Result<Vec<crate::SandboxId>, MetaError> {
+        let _ = (host_id, running);
+        Ok(Vec::new())
+    }
+
     /// Atomically, and only while `host_id`'s binding lease is still
     /// expired: (a) mark the host `Dead`, (b) clear `host_id` and
     /// `sandbox_id` on every non-terminal session pointed at it,

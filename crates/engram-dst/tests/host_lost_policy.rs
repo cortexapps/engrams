@@ -1,14 +1,18 @@
-//! Issue #777 HostLost stage-2 policy proofs (ADR 0098 Phase 3),
-//! driven against the REAL coordinator drivers over engram-sim.
+//! HostLost stage-2 policy proofs (#777 / ADR 0098 Phase 3, extended by
+//! ADR 0116 A3/A4), driven against the REAL coordinator drivers over
+//! engram-sim.
 //!
-//! Two design calls, each pinned red-then-green:
-//!   1. **honest-Dead** — a bound HostLost straggler whose only snapshot
-//!      is un-recoverable settles to `Dead`, never a lying `Idle`.
-//!   2. **ask-the-host** (added with the sweep's serving-defer in the
-//!      same PR's second commit) — a bound HostLost straggler whose host
-//!      still reports the sandbox serving is NOT destroyed on the first
-//!      sweep; it is deferred for the reattach machinery until the
-//!      serving-strike cap, then settles (convergence — oracle #8's shape).
+//! The pinned design calls:
+//!   1. **honest-Dead** (#777) — a bound HostLost straggler whose only
+//!      snapshot is un-recoverable settles to `Dead`, never a lying
+//!      `Idle`.
+//!   2. **entomb, never destroy-despite-alive** (ADR 0116 A-D5,
+//!      retiring #777's serving-strike defer) — a SERVING VM is never
+//!      destroyed by the coordinator; its tombstone rides the heartbeat
+//!      and its own host destroys it (ack-by-absence closes the loop).
+//!   3. **the lease shield** (A3) — the incident replay, the kill-9
+//!      control leg, the durable probe-rescue, and the lease-liveness +
+//!      destroy-of-bound oracle non-vacuity proofs.
 
 use engram_core::types::BindingDisposition;
 use std::sync::Arc;
@@ -389,21 +393,20 @@ fn lease_liveness_oracle_fires_on_a_revocation_under_a_live_lease() {
     });
 }
 
-/// Commit 2 (ask-the-host): a bound HostLost straggler whose host still
-/// reports the sandbox SERVING (a live VM under a HostLost row — the >60s
-/// partition/desync window) must NOT be destroyed on the first sweep. The
-/// sweep defers for the reattach machinery, banking a serving-strike each
-/// cycle, until the `straggler_serving_strike_cap` (default 3) is reached
-/// — then it destroys+settles (bounded convergence, oracle #8's shape).
+/// ADR 0116 A-D5 (retires the #777 serving-strike deferral): a bound
+/// HostLost straggler whose host still reports the sandbox SERVING is
+/// NEVER destroyed by the coordinator — not on the first sweep, not
+/// after any number of them. The first sweep records a tombstone (the
+/// durable "your host must destroy this VM" fact), settles the ROW
+/// immediately (a recoverable snapshot is on record, so Idle), and
+/// leaves the VM to its own host's heartbeat consumption.
 ///
-/// Red-then-green: with the pre-#777 sweep the FIRST cycle best-effort
-/// destroyed the still-bound sandbox and settled the row (killing the live
-/// VM); after ask-the-host the first two cycles leave the row HostLost and
-/// the sandbox alive, and only the third settles. A recoverable snapshot
-/// is on record, so the eventual settle is `Idle` (proving the row was
-/// recovered, not condemned).
+/// Red-then-green: the pre-A4 sweep destroyed the live VM at the third
+/// strike (destroy-despite-alive — inference, not host-affirmed); now
+/// no amount of sweeping kills it, and the tombstone row carries the
+/// obligation instead.
 #[test]
-fn serving_straggler_is_deferred_then_settles_at_the_strike_cap() {
+fn serving_straggler_settles_row_and_entombs_vm_without_destroying_it() {
     on_sim(777_002, |mut sim| async move {
         let host = sim.world.host_ids[0];
         let sandbox = SandboxId::new();
@@ -413,44 +416,103 @@ fn serving_straggler_is_deferred_then_settles_at_the_strike_cap() {
         // World-truth: the VM is still up and serving on its host, even
         // though the coordinator parked the session at HostLost.
         place_live_sandbox(&sim, host, sandbox, sid);
-        // A recoverable snapshot so the eventual settle target is Idle.
+        // A recoverable snapshot so the settle target is Idle.
         let now = sim.world.clock.now_utc();
         record_snapshot(&meta, sid, true, now).await;
 
-        // Age past the 60s min-age (no further advances between sweeps —
-        // last_active_at stays stale, so every cycle acts).
+        // Age past the 60s min-age.
         sim.execute(Step::AdvanceTime(Duration::from_secs(120)))
             .await;
 
-        // Cap is 3 → cycles 1 and 2 DEFER (strike < cap), cycle 3 settles.
-        // Cycle 1:
-        sim.execute(Step::Driver(0, DriverKind::DeadHost)).await;
-        assert_eq!(
-            status(&sim, sid),
-            SessionState::HostLost,
-            "a still-serving straggler must survive the first sweep (ask-the-host defer)",
-        );
-        assert!(
-            sandbox_live(&sim, host, sandbox),
-            "the live VM must NOT be destroyed while the host reports it serving",
-        );
-
-        // Cycle 2 (still under the cap):
-        sim.execute(Step::Driver(0, DriverKind::DeadHost)).await;
-        assert_eq!(status(&sim, sid), SessionState::HostLost);
-        assert!(sandbox_live(&sim, host, sandbox));
-
-        // Cycle 3: strike reaches the cap → destroy + settle. The snapshot
-        // is recoverable, so it lands Idle.
+        // The FIRST sweep settles the row and entombs the VM.
         sim.execute(Step::Driver(0, DriverKind::DeadHost)).await;
         assert_eq!(
             status(&sim, sid),
             SessionState::Idle,
-            "at the serving-strike cap the straggler settles (bounded convergence, #777)",
+            "the row settles immediately — it no longer waits on the VM",
         );
         assert!(
-            !sandbox_live(&sim, host, sandbox),
-            "the sandbox is destroyed on the settling cycle",
+            sandbox_live(&sim, host, sandbox),
+            "the SERVING VM must never be destroyed by the coordinator",
         );
+        assert_eq!(
+            sim.world
+                .meta
+                .sandbox_tombstones_for_host(host)
+                .await
+                .unwrap(),
+            vec![sandbox],
+            "the tombstone carries the destroy obligation to the host",
+        );
+
+        // Further sweeps change nothing — no strike cap, no delayed kill.
+        for _ in 0..3 {
+            sim.execute(Step::Driver(0, DriverKind::DeadHost)).await;
+            assert!(sandbox_live(&sim, host, sandbox));
+        }
+
+        // The heartbeat closes the loop: the tombstone rides the ack,
+        // the HOST destroys its own VM (the sim heartbeat's consumption
+        // leg — real `process_sandbox_tombstones` + a world destroy),
+        // and the next heartbeat's running set acks the row by absence.
+        sim.execute(Step::HostHeartbeats).await;
+        assert!(
+            !sandbox_live(&sim, host, sandbox),
+            "the host destroys its tombstoned VM on heartbeat consumption",
+        );
+        sim.execute(Step::HostHeartbeats).await;
+        assert!(
+            sim.world
+                .meta
+                .sandbox_tombstones_for_host(host)
+                .await
+                .unwrap()
+                .is_empty(),
+            "ack-by-absence clears the row once the sandbox leaves the running set",
+        );
+    });
+}
+
+/// NON-VACUITY: the destroy-of-bound-sandbox oracle FIRES when a
+/// sandbox is destroyed while an ACTIVE session still binds it, and
+/// stays quiet when the binding is cleared first (the legal order).
+#[test]
+fn destroy_of_bound_oracle_fires_on_destroy_under_active_binding() {
+    on_sim(116_005, |sim| async move {
+        let host = sim.world.host_ids[0];
+        let sandbox = SandboxId::new();
+        let meta = sim.world.meta.clone();
+        let sid = seed_bound_active(&meta, host, sandbox).await;
+        place_live_sandbox(&sim, host, sandbox, sid);
+
+        let mut oracles = engram_dst::invariants::Oracles::default();
+        oracles
+            .check_step(&sim.world)
+            .expect("a bound Active session with a live VM is legal");
+
+        // The bad actor: destroy the VM while the Active binding stands.
+        sim.world
+            .host_world
+            .record_effect(host, engram_dst::world::Effect::Destroy { sandbox });
+        let violation = oracles
+            .check_step(&sim.world)
+            .expect_err("destroying under an Active binding must fire");
+        assert_eq!(violation.invariant, "destroy-of-bound-sandbox");
+
+        // Legal order stays quiet: a second sandbox, binding cleared
+        // BEFORE the destroy.
+        let sandbox2 = SandboxId::new();
+        let sid2 = seed_bound_active(&meta, host, sandbox2).await;
+        place_live_sandbox(&sim, host, sandbox2, sid2);
+        meta.transition_session(sid2, SessionState::HostLost, BindingDisposition::Detach)
+            .await
+            .expect("detach flip");
+        sim.world.host_world.record_effect(
+            host,
+            engram_dst::world::Effect::Destroy { sandbox: sandbox2 },
+        );
+        oracles
+            .check_step(&sim.world)
+            .expect("a destroy after the binding clear is the legal order");
     });
 }

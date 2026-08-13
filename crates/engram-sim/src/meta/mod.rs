@@ -234,6 +234,12 @@ pub struct SimDb {
     pub chunk_generation: u64,
     /// `dead_host_inflight`: host -> (claimed_by, claimed_at).
     pub dead_host_inflight: std::collections::BTreeMap<HostId, (String, DateTime<Utc>)>,
+    /// ADR 0116 A-D5 `sandbox_tombstones`: (host, sandbox) ->
+    /// (session_id, created_at). Exactly the migration-0116 PK shape.
+    pub sandbox_tombstones: std::collections::BTreeMap<
+        (HostId, engram_core::SandboxId),
+        (Option<SessionId>, DateTime<Utc>),
+    >,
     pub runtime_specs:
         std::collections::BTreeMap<SessionId, engram_core::types::runtime_spec::RuntimeSpec>,
     pub session_capabilities:

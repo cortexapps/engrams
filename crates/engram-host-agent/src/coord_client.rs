@@ -710,6 +710,11 @@ pub struct HeartbeatResponse {
     /// PG. The host deletes the matching durable capture-job records.
     #[serde(default)]
     pub acked_capture_jobs: Vec<engram_core::types::CaptureJobId>,
+    /// ADR 0116 A-D5: sandboxes this host must destroy (their bindings
+    /// were cleared coordinator-side without host-affirmed absence).
+    /// Defaults empty against an old coordinator.
+    #[serde(default)]
+    pub tombstoned_sandboxes: Vec<engram_core::SandboxId>,
 }
 
 #[derive(Serialize)]
@@ -901,5 +906,23 @@ mod tests {
         // everything you're running".
         assert!(ack.capture_assignments.is_none());
         assert!(ack.acked_capture_jobs.is_empty());
+        // ADR 0116 A-D5: absent tombstones decode to empty — an old
+        // coord simply never obligates a destroy.
+        assert!(ack.tombstoned_sandboxes.is_empty());
+    }
+
+    /// ADR 0116 A-D5: a coord that advertises tombstones round-trips
+    /// them into the typed field.
+    #[test]
+    fn heartbeat_response_tombstones_decode() {
+        let sb = engram_core::SandboxId::new();
+        let ack = serde_json::json!({
+            "server_time": "2026-08-12T00:00:00Z",
+            "revoked_sessions": [],
+            "live_bundles": [],
+            "tombstoned_sandboxes": [sb],
+        });
+        let ack: HeartbeatResponse = serde_json::from_value(ack).unwrap();
+        assert_eq!(ack.tombstoned_sandboxes, vec![sb]);
     }
 }

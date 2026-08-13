@@ -88,8 +88,8 @@ use engram_core::SessionId;
 /// state already changed; rolling back the eviction is worse than a
 /// missed SSE event.
 async fn emit_status_changed(
-    meta: &Arc<dyn MetadataStore>,
-    events: &Arc<SessionEventBus>,
+    meta: &dyn MetadataStore,
+    events: &SessionEventBus,
     session_id: SessionId,
     from: SessionState,
     to: SessionState,
@@ -136,15 +136,6 @@ pub struct DeadHostConfig {
     /// executor lease — replica failover, a different domain from the
     /// binding lease; ADR 0116 non-goals.)
     pub lease_stale_after: Duration,
-    /// Issue #777 "ask-the-host": how many consecutive sweep cycles the
-    /// straggler sweep will DEFER destroying a still-bound sandbox whose
-    /// host still reports it serving (a live VM under a HostLost row —
-    /// the >60s partition/desync window) before giving up and
-    /// destroying+settling anyway. The cap keeps the sweep convergent
-    /// (never parks forever, the #762/#769 wedge) while giving the
-    /// reattach machinery a bounded window to recover the live VM in
-    /// place. Default 3 (~3 sweep cycles).
-    pub straggler_serving_strike_cap: u32,
 }
 
 impl Default for DeadHostConfig {
@@ -152,29 +143,9 @@ impl Default for DeadHostConfig {
         Self {
             poll_interval: Duration::from_secs(10),
             lease_stale_after: Duration::from_secs(180),
-            straggler_serving_strike_cap: 3,
         }
     }
 }
-
-/// Per-session serving-strike history for the straggler sweep (issue
-/// #777 "ask-the-host"), keyed by session id. Counts consecutive sweep
-/// cycles on which the host still reported a still-bound sandbox as
-/// serving, so the sweep can defer the destroy up to
-/// `straggler_serving_strike_cap` cycles before giving up. Owned by the
-/// caller of [`run_once`] so it persists across sweeps and pruned to the
-/// current HostLost set each cycle.
-///
-/// Per-replica and deliberately in-memory: the running-sandbox SET is
-/// not persisted in PG, so there is no natural column to mirror; and
-/// this is a per-pod backstop, not cross-pod truth. (Slated for
-/// retirement in ADR 0116 A4 alongside tombstones.) With replicas
-/// racing, each counts its own strikes
-/// — a bounded, conservative error in the safe direction (it can only
-/// DELAY a destroy, never destroy a live VM earlier than a single replica
-/// would), and a settle by ANY replica ends the deferral for all via the
-/// #211 CAS + `Conflict`-idempotent transition.
-pub type StragglerStrikeMap = std::collections::BTreeMap<SessionId, u32>;
 
 /// Spawn the detector as a background task. Returns a JoinHandle the
 /// caller can drop on shutdown. Runs forever; logs and continues on
@@ -188,13 +159,9 @@ pub fn spawn(cfg: DeadHostConfig, state: SharedState) -> tokio::task::JoinHandle
         // Skip the immediate first tick — the coordinator just
         // started and no host's lease has had time to expire.
         tick.tick().await;
-        // Serving-strike history across ticks for the straggler sweep
-        // (issue #777 ask-the-host); pruned to the current HostLost set
-        // inside the sweep.
-        let mut straggler_strikes = StragglerStrikeMap::new();
         loop {
             tick.tick().await;
-            if let Err(e) = run_once(&cfg, &state, &claimant, &mut straggler_strikes).await {
+            if let Err(e) = run_once(&cfg, &state, &claimant).await {
                 tracing::warn!(error = %e, "dead-host detector tick failed; will retry");
             }
         }
@@ -207,11 +174,10 @@ pub async fn run_once(
     cfg: &DeadHostConfig,
     state: &SharedState,
     claimant: &str,
-    straggler_strikes: &mut StragglerStrikeMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ADR 0116 A-D4: the lease predicate is the sole candidate source.
     let candidates = state.services.meta.list_lease_expired_hosts().await?;
-    host_lost_straggler_sweep(cfg, state, straggler_strikes).await?;
+    host_lost_straggler_sweep(state).await?;
     if candidates.is_empty() {
         return Ok(());
     }
@@ -232,28 +198,19 @@ pub async fn run_once(
 /// or failed. This is deliberately a delayed backstop, not the normal
 /// HostLost path.
 ///
-/// **Convergence (oracle #8's shape):** every arm terminates in a settle
-/// within bounded cycles. A row younger than the 60s min-age is skipped
-/// (a later cycle handles it); an unbound row settles immediately; a
-/// bound row whose host is gone/silent (probe fails / no backend) settles
-/// immediately; a bound row whose host still reports the sandbox SERVING
-/// is deferred at most `straggler_serving_strike_cap` cycles (the
-/// ask-the-host defer, #777) and then settles. No arm parks forever — the
-/// #762/#769 eternal-wedge is not reintroduced.
+/// **Convergence (oracle #8's shape):** every arm settles the ROW within
+/// bounded cycles — a row younger than the 60s min-age waits for a later
+/// cycle; everything else settles this one (ADR 0116 A4 retired the
+/// serving-strike deferral: the row no longer waits on the VM). The VM
+/// converges separately through its tombstone: a serving VM is destroyed
+/// by its OWN host on heartbeat consumption (never by the coordinator);
+/// a gone/not-alive one gets the inline belt destroy. No arm parks
+/// forever — the #762/#769 eternal-wedge is not reintroduced.
 pub async fn host_lost_straggler_sweep(
-    cfg: &DeadHostConfig,
     state: &SharedState,
-    straggler_strikes: &mut StragglerStrikeMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let meta = &state.services.meta;
     let sessions = meta.list_host_lost_sessions().await?;
-
-    // Prune serving-strike history to the rows still HostLost — a session
-    // that settled (or a competing replica settled) drops its strikes, so
-    // a fresh HostLost episode starts clean.
-    let host_lost_ids: std::collections::HashSet<SessionId> =
-        sessions.iter().map(|s| s.id).collect();
-    straggler_strikes.retain(|sid, _| host_lost_ids.contains(sid));
 
     for session in sessions {
         let now = state.services.clock.now_utc();
@@ -265,21 +222,38 @@ pub async fn host_lost_straggler_sweep(
         }
 
         if let Some(sandbox_id) = session.sandbox_id {
-            // ADR 0098 Phase 3 / #777 "ask-the-host": before destroying a
-            // still-bound sandbox, consult HOST TRUTH. The running-sandbox
-            // SET is not persisted in PG (only a count + last_heartbeat_at),
-            // so we use the same direct probe reconcile's ADR 0068 belt uses
-            // — `probe_sandbox` → `process_alive`. A live-and-serving VM
-            // under a HostLost row is the >60s partition/desync window
-            // (#776 review): the reattach machinery may still recover it in
-            // place, so DEFER the destroy and bank a serving-strike rather
-            // than kill the live VM. Only a probe that FAILS (host gone /
-            // unreachable / `Unsupported` from an old host-agent), a
-            // process that is NOT alive, or the strike cap being reached
-            // proceeds to destroy — mirroring reconcile's "only an explicit
-            // process_alive == true rescues" asymmetry. No backend in the
-            // registry ⇒ the host is already gone ⇒ nothing to protect ⇒
-            // proceed.
+            // ADR 0116 A-D5: the durable fact comes FIRST — a binding is
+            // never cleared without a tombstone recorded, so the VM is
+            // owned by an explicit coordinator fact from the moment the
+            // row lets go of it. A write failure leaves the row bound
+            // for a later cycle rather than orphaning the VM.
+            if let Some(host_id) = session.host_id {
+                if let Err(e) = meta
+                    .record_sandbox_tombstone(host_id, sandbox_id, Some(session.id))
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        session_id = %session.id,
+                        %sandbox_id,
+                        "host-lost straggler tombstone write failed; leaving the row bound \
+                         for a later cycle",
+                    );
+                    continue;
+                }
+            }
+
+            state.host_registry.invalidate_sandbox(sandbox_id);
+
+            // ADR 0098 Phase 3 / #777 "ask-the-host", ADR 0116 A-D5: a
+            // host that reports the sandbox SERVING is host-affirmed
+            // alive — the coordinator NEVER destroys it (the retired
+            // strike cap used to, after 3 deferrals). Its tombstone
+            // rides the next heartbeat response and the host destroys
+            // its own VM; ack-by-absence then clears the row. Only a
+            // probe that fails (host gone / unreachable) or an
+            // explicitly not-alive process gets the inline belt destroy
+            // — covering hosts that predate tombstone consumption.
             let serving = match session
                 .host_id
                 .and_then(|host_id| state.host_registry.backend_of(host_id))
@@ -290,36 +264,14 @@ pub async fn host_lost_straggler_sweep(
                 None => false,
             };
             if serving {
-                let strikes = straggler_strikes.entry(session.id).or_default();
-                *strikes += 1;
-                if *strikes < cfg.straggler_serving_strike_cap {
-                    ::metrics::counter!(crate::metrics::HOST_LOST_STRAGGLER_DEFERRED_SERVING_TOTAL)
-                        .increment(1);
-                    tracing::warn!(
-                        session_id = %session.id,
-                        %sandbox_id,
-                        strikes = *strikes,
-                        cap = cfg.straggler_serving_strike_cap,
-                        "host-lost straggler: host still reports the sandbox SERVING — deferring \
-                         destroy+settle for the reattach machinery (ask-the-host, #777)",
-                    );
-                    continue;
-                }
-                tracing::warn!(
+                ::metrics::counter!(crate::metrics::HOST_LOST_ENTOMBED_SERVING_TOTAL).increment(1);
+                tracing::info!(
                     session_id = %session.id,
                     %sandbox_id,
-                    strikes = *strikes,
-                    "host-lost straggler: serving-strike cap reached — destroying and settling \
-                     (bounded convergence, #777)",
+                    "host-lost straggler: sandbox still serving — its tombstone owns it now; \
+                     the host destroys it on heartbeat consumption (ADR 0116 A-D5)",
                 );
-            }
-            // Not serving, or the strike cap is reached: proceed to destroy
-            // + settle as before. Drop any strike history for this row.
-            straggler_strikes.remove(&session.id);
-
-            state.host_registry.invalidate_sandbox(sandbox_id);
-
-            if let Some(backend) = session
+            } else if let Some(backend) = session
                 .host_id
                 .and_then(|host_id| state.host_registry.backend_of(host_id))
             {
@@ -328,7 +280,7 @@ pub async fn host_lost_straggler_sweep(
                         error = %e,
                         session_id = %session.id,
                         %sandbox_id,
-                        "host-lost straggler destroy failed; continuing settlement",
+                        "host-lost straggler belt destroy failed; the tombstone owns cleanup",
                     );
                 }
             }
@@ -359,48 +311,130 @@ pub async fn host_lost_straggler_sweep(
             }
         }
 
-        let snapshot = match meta.latest_snapshot_for_session(session.id).await {
-            Ok(snapshot) => snapshot,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    session_id = %session.id,
-                    "host-lost straggler snapshot lookup failed",
-                );
-                continue;
-            }
-        };
-        let has_recoverable_snapshot = snapshot.as_ref().is_some_and(|s| s.recoverable);
-        let target = recovery_target(
-            has_recoverable_snapshot,
-            session.live_disk_manifest.is_some(),
-        );
-        note_unrecoverable_if_dead(target, snapshot.as_ref(), session.id);
-        match meta
-            .transition_session(session.id, target, BindingDisposition::RequireUnbound)
-            .await
-        {
-            Ok(prev) => {
-                emit_status_changed(meta, &state.events, session.id, prev, target, now).await;
-                ::metrics::counter!(crate::metrics::HOST_LOST_STRAGGLERS_SETTLED_TOTAL)
-                    .increment(1);
-                tracing::info!(
-                    session_id = %session.id,
-                    ?target,
-                    "host-lost straggler settled",
-                );
-            }
-            Err(MetaError::Conflict(_)) => {}
-            Err(e) => tracing::warn!(
-                error = %e,
-                session_id = %session.id,
-                ?target,
-                "host-lost straggler second-stage transition failed",
-            ),
-        }
+        settle_host_lost(
+            meta.as_ref(),
+            &state.events,
+            session.id,
+            Some(session.live_disk_manifest.is_some()),
+            now,
+        )
+        .await;
     }
 
     Ok(())
+}
+
+/// ADR 0116 A-D5: the heartbeat's tombstone leg — ack-by-absence, then
+/// advertise what is still outstanding. Called by the HTTP heartbeat
+/// handler and driven directly by the DST scheduler's heartbeat step
+/// (which bypasses the handler), so sim and prod run the same code.
+///
+/// Acking requires `running_known`: an unenumerable running set
+/// (`backend.list()` failed host-side) is "no information", not "no
+/// sandboxes" — deleting tombstones against it would un-obligate
+/// destroys on a single host-side blip (the issue-#215 asymmetry,
+/// applied to tombstones). Advertising is unconditional and read-only.
+/// Errors degrade to "advertise nothing this tick" — the next
+/// heartbeat retries; a tombstone is durable precisely so delivery can
+/// be lazy.
+pub async fn process_sandbox_tombstones(
+    meta: &Arc<dyn MetadataStore>,
+    host_id: HostId,
+    running: &[engram_core::SandboxId],
+    running_known: bool,
+) -> Vec<engram_core::SandboxId> {
+    if running_known {
+        match meta
+            .ack_sandbox_tombstones_by_absence(host_id, running)
+            .await
+        {
+            Ok(acked) if !acked.is_empty() => {
+                tracing::info!(
+                    host_id = %host_id,
+                    count = acked.len(),
+                    "sandbox tombstones acked by absence (host-affirmed destroyed)",
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(host_id = %host_id, error = %e,
+                    "tombstone ack-by-absence failed; retrying next heartbeat");
+            }
+        }
+    }
+    match meta.sandbox_tombstones_for_host(host_id).await {
+        Ok(tombstones) => tombstones,
+        Err(e) => {
+            tracing::debug!(host_id = %host_id, error = %e,
+                "tombstone advertise read failed; advertising none this tick");
+            Vec::new()
+        }
+    }
+}
+
+/// THE HostLost stage-2 settle (ADR 0116 A4 consolidation of the three
+/// duplicate drivers: the dead-host bulk's per-session loop, the
+/// straggler sweep's tail, and reconcile's flip_missing tail).
+/// Resolves recoverability and moves the row `HostLost -> Idle | Dead`
+/// via [`recovery_target`] — THE predicate.
+///
+/// Error posture, deliberately uniform: any read error leaves the row
+/// at HostLost for a later sweep cycle (never route to `Dead` on a PG
+/// blip — the pre-A4 reconcile copy did, a latent honest-Dead
+/// violation); a transition `Conflict` is swallowed (a competing
+/// replica settled first — the desired outcome); a settle increments
+/// `HOST_LOST_STRAGGLERS_SETTLED_TOTAL` and logs the predicate inputs.
+///
+/// `known_live_manifest` skips the `get_session` round-trip when the
+/// caller already holds the row.
+pub(crate) async fn settle_host_lost(
+    meta: &dyn MetadataStore,
+    events: &SessionEventBus,
+    session_id: SessionId,
+    known_live_manifest: Option<bool>,
+    now: DateTime<Utc>,
+) {
+    let snapshot = match meta.latest_snapshot_for_session(session_id).await {
+        Ok(opt) => opt,
+        Err(e) => {
+            tracing::warn!(error = %e, %session_id,
+                "settle_host_lost: snapshot lookup failed; leaving session at HostLost");
+            return;
+        }
+    };
+    let has_live_manifest = match known_live_manifest {
+        Some(known) => known,
+        None => match meta.get_session(session_id).await {
+            Ok(s) => s.live_disk_manifest.is_some(),
+            Err(e) => {
+                tracing::warn!(error = %e, %session_id,
+                    "settle_host_lost: get_session failed; leaving session at HostLost");
+                return;
+            }
+        },
+    };
+    let has_recoverable_snapshot = snapshot.as_ref().is_some_and(|s| s.recoverable);
+    let target = recovery_target(has_recoverable_snapshot, has_live_manifest);
+    note_unrecoverable_if_dead(target, snapshot.as_ref(), session_id);
+    match meta
+        .transition_session(session_id, target, BindingDisposition::RequireUnbound)
+        .await
+    {
+        Ok(prev) => {
+            emit_status_changed(meta, events, session_id, prev, target, now).await;
+            ::metrics::counter!(crate::metrics::HOST_LOST_STRAGGLERS_SETTLED_TOTAL).increment(1);
+            tracing::info!(
+                %session_id,
+                ?target,
+                has_recoverable_snapshot,
+                has_live_manifest,
+                "HostLost settled",
+            );
+        }
+        Err(MetaError::Conflict(_)) => {}
+        Err(e) => tracing::warn!(error = %e, %session_id, ?target,
+            "settle_host_lost: second-stage transition failed; leaving at HostLost"),
+    }
 }
 
 /// Defense-in-depth liveness probe for the dead-host detector (issue
@@ -616,7 +650,7 @@ async fn evict_host_locked(
     // the session had been Idle).
     for (session_id, prev) in &affected {
         emit_status_changed(
-            meta,
+            meta.as_ref(),
             events,
             *session_id,
             *prev,
@@ -647,63 +681,17 @@ async fn evict_host_locked(
     //
     // Failures of any query/transition are logged and skipped; the
     // row stays at HostLost and a future reconcile pass (or
-    // operator action) can move it on.
+    // operator action) can move it on. (ADR 0116 A4: the shared
+    // `settle_host_lost` drives this — one settle, three callers.)
     for (session_id, _) in &affected {
-        let snapshot = match meta.latest_snapshot_for_session(*session_id).await {
-            Ok(opt) => opt,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    %session_id,
-                    "snapshot lookup failed; leaving session at HostLost"
-                );
-                continue;
-            }
-        };
-
-        // Look up the session row for live_disk_manifest so a disk-only
-        // session (no memory snapshot) stays recoverable via the
-        // cold-boot `/resume` path. Failure leaves the row at HostLost.
-        let has_live_manifest = match meta.get_session(*session_id).await {
-            Ok(s) => s.live_disk_manifest.is_some(),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    %session_id,
-                    "get_session failed during second-stage; leaving at HostLost",
-                );
-                continue;
-            }
-        };
-
-        let has_recoverable_snapshot = snapshot.as_ref().is_some_and(|s| s.recoverable);
-        let target = recovery_target(has_recoverable_snapshot, has_live_manifest);
-        note_unrecoverable_if_dead(target, snapshot.as_ref(), *session_id);
-
-        match meta
-            .transition_session(*session_id, target, BindingDisposition::RequireUnbound)
-            .await
-        {
-            Ok(prev) => {
-                emit_status_changed(
-                    meta,
-                    events,
-                    *session_id,
-                    prev,
-                    target,
-                    state.services.clock.now_utc(),
-                )
-                .await;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    %session_id,
-                    ?target,
-                    "HostLost second-stage transition failed; leaving session at HostLost"
-                );
-            }
-        }
+        settle_host_lost(
+            meta.as_ref(),
+            events,
+            *session_id,
+            None,
+            state.services.clock.now_utc(),
+        )
+        .await;
     }
 
     host_registry.unregister(host_id);

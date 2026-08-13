@@ -476,6 +476,14 @@ pub struct HeartbeatResponse {
     /// deletes the matching durable capture-job records.
     #[serde(default)]
     pub acked_capture_jobs: Vec<engram_core::types::CaptureJobId>,
+    /// ADR 0116 A-D5: sandboxes this host must destroy — their bindings
+    /// were cleared without host-affirmed absence (dead-host bulk
+    /// orphan, failed-destroy unbinds). Advertised every tick until the
+    /// sandbox leaves the host's reported running set (ack-by-absence).
+    /// `#[serde(default)]` both sides: additive, no wire bump; an old
+    /// coordinator simply never populates it.
+    #[serde(default)]
+    pub tombstoned_sandboxes: Vec<SandboxId>,
 }
 
 /// ADR 0116 A-D2: `POST /api/hosts/:id/handoff {ttl_secs}` — the host
@@ -1102,6 +1110,16 @@ pub async fn heartbeat(
         }
     };
 
+    // ADR 0116 A-D5: ack tombstones the host's running set no longer
+    // contains, then advertise what is still outstanding.
+    let tombstoned_sandboxes = crate::dead_host::process_sandbox_tombstones(
+        &state.services.meta,
+        host_id,
+        &hb.running_sandboxes,
+        hb.running_sandboxes_known,
+    )
+    .await;
+
     Ok(Json(HeartbeatResponse {
         server_time: state.services.clock.now_utc(),
         revoked_sessions: Vec::new(),
@@ -1111,6 +1129,7 @@ pub async fn heartbeat(
         acked_checkpoints,
         capture_assignments,
         acked_capture_jobs,
+        tombstoned_sandboxes,
     }))
 }
 

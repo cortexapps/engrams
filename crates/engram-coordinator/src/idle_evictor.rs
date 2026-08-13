@@ -1119,15 +1119,29 @@ pub(crate) async fn run_evict_pipeline(
 
     // Step 4 (host destroy, post-PG): now the session is Idle,
     // destroy the sandbox. Best-effort — failures don't bubble
-    // because the PG state is already correct; the host's
-    // orphan_reap background task cleans up a stuck sandbox.
+    // because the PG state is already correct; ADR 0116 A-D5: a
+    // failure writes a tombstone (the binding was detached by the
+    // fused flip BEFORE this destroy — the strongest disowned-VM
+    // case), so the host destroys it from an explicit fact instead
+    // of orphan-reap inference.
     if let Err(e) = state.services.host.destroy(sandbox_id, ctx.fence()).await {
         tracing::warn!(
             session_id = %session_id,
             sandbox_id = %sandbox_id,
             error = %e,
-            "idle eviction: destroy failed after Idle transition; orphan_reap will clean up",
+            "idle eviction: destroy failed after Idle transition; its tombstone owns cleanup",
         );
+        if let Some(host_id) = session.host_id {
+            if let Err(e) = state
+                .services
+                .meta
+                .record_sandbox_tombstone(host_id, sandbox_id, Some(session_id))
+                .await
+            {
+                tracing::warn!(session_id = %session_id, %sandbox_id, error = %e,
+                    "idle eviction: tombstone write failed; the next heartbeat reconcile owns it");
+            }
+        }
     }
     // ADR 0006: host-agent unregisters its local proxy entry as
     // part of `destroy`. No coordinator-side cleanup needed.

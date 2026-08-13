@@ -1143,6 +1143,76 @@ async fn host_binding_lease(ctx: &Ctx) {
     assert!(!meta.renew_host_lease(unleased, t3 + ttl).await.unwrap());
 }
 
+/// ADR 0116 A-D5: sandbox tombstones — the bulk orphan writes one per
+/// cleared binding in the SAME transaction; `record_sandbox_tombstone`
+/// is idempotent; `ack_sandbox_tombstones_by_absence` deletes exactly
+/// the rows whose sandbox left the host's reported running set.
+async fn sandbox_tombstones(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let host = HostId::new();
+    meta.upsert_host(host_record(host, "tomb-host", now))
+        .await
+        .unwrap();
+
+    // A bound session on the host; the bulk orphan must entomb its
+    // sandbox in-tx.
+    let sid = meta.create_session(spec("conf:tombstone")).await.unwrap();
+    meta.assign_session_host(sid, Some(host)).await.unwrap();
+    let sb = engram_core::SandboxId::new();
+    meta.transition_session_created(sid, sb).await.unwrap();
+    let affected = meta.mark_host_dead_if_lease_expired(host).await.unwrap();
+    assert_eq!(affected.len(), 1);
+    assert_eq!(
+        meta.sandbox_tombstones_for_host(host).await.unwrap(),
+        vec![sb],
+        "the bulk orphan writes a tombstone per cleared binding"
+    );
+
+    // Idempotent re-record + a second, session-less tombstone.
+    meta.record_sandbox_tombstone(host, sb, Some(sid))
+        .await
+        .unwrap();
+    let sb2 = engram_core::SandboxId::new();
+    meta.record_sandbox_tombstone(host, sb2, None)
+        .await
+        .unwrap();
+    let mut listed = meta.sandbox_tombstones_for_host(host).await.unwrap();
+    listed.sort();
+    let mut expected = vec![sb, sb2];
+    expected.sort();
+    assert_eq!(listed, expected);
+
+    // Ack-by-absence: a sandbox STILL in the running set keeps its row;
+    // one absent from it is acked (deleted).
+    let acked = meta
+        .ack_sandbox_tombstones_by_absence(host, &[sb])
+        .await
+        .unwrap();
+    assert_eq!(acked, vec![sb2], "only the absent sandbox is acked");
+    assert_eq!(
+        meta.sandbox_tombstones_for_host(host).await.unwrap(),
+        vec![sb]
+    );
+    let acked = meta
+        .ack_sandbox_tombstones_by_absence(host, &[])
+        .await
+        .unwrap();
+    assert_eq!(acked, vec![sb]);
+    assert!(meta
+        .sandbox_tombstones_for_host(host)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Unknown host: nothing outstanding, nothing acked.
+    assert!(meta
+        .sandbox_tombstones_for_host(HostId::new())
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 /// Dead-host lease: acquire, contest, claimant-guarded release, stale
 /// takeover.
 async fn dead_host_lease(ctx: &Ctx) {
@@ -3279,6 +3349,7 @@ conformance!(
 conformance!(t_queue_fifo, super::queue_fifo);
 conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_host_binding_lease, super::host_binding_lease);
+conformance!(t_sandbox_tombstones, super::sandbox_tombstones);
 conformance!(t_ops_pipeline, super::ops_pipeline);
 conformance!(t_ops_idempotency, super::ops_idempotency);
 conformance!(
