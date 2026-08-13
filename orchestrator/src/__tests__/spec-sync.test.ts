@@ -19,6 +19,7 @@ import {
 } from "../routes/spec-sync.ts";
 import {
   decodeSpecSyncMessage,
+  encodeAwarenessMessage,
   encodeAwarenessState,
   encodeSyncStep1,
   encodeSyncUpdate,
@@ -840,6 +841,65 @@ describe("the spec sync UpgradeHook", () => {
       "sync-update",
       "sync-step-1",
     ]);
+  });
+
+  test("drops an echoed foreign awareness record instead of closing the socket", async () => {
+    const echoing = new DeferredCloseSpecSocket();
+    const peer = new SilentSpecSocket();
+    const echoDoc = new Y.Doc();
+    echoDoc.clientID = 42;
+    const echoAwareness = new awarenessProtocol.Awareness(echoDoc);
+    echoAwareness.setLocalState({ cursor: { anchor: 1, head: 1 } });
+    const peerDoc = new Y.Doc();
+    peerDoc.clientID = 7;
+    const peerAwareness = new awarenessProtocol.Awareness(peerDoc);
+    peerAwareness.setLocalState({ cursor: { anchor: 9, head: 9 } });
+    const hub = new SpecSyncHub({
+      documents: fakeDocuments(),
+      participants: {
+        connect: async () => 1n,
+        renew: async () => true,
+        disconnect: async () => {},
+      },
+      awarenessBus: fakeAwarenessBus(),
+    });
+    cleanups.push(async () => {
+      echoAwareness.destroy();
+      echoDoc.destroy();
+      peerAwareness.destroy();
+      peerDoc.destroy();
+      await hub.stop();
+    });
+
+    await hub.connect(SPEC_ONE, "42", { id: "echoer" }, echoing);
+    await hub.connect(SPEC_ONE, "7", { id: "peer" }, peer);
+    peer.emit("message", encodeAwarenessState(peerAwareness), true);
+    await eventually(() => readAwarenessState(echoing, 7) !== undefined);
+
+    // A y-websocket provider re-broadcasts every awareness change it applies,
+    // so after the peer's state arrives the client sends it back alongside its
+    // own. The echoed foreign record is dropped; the connection stays open.
+    awarenessProtocol.applyAwarenessUpdate(
+      echoAwareness,
+      awarenessProtocol.encodeAwarenessUpdate(peerAwareness, [7]),
+      "peer",
+    );
+    echoing.emit(
+      "message",
+      encodeAwarenessMessage(awarenessProtocol.encodeAwarenessUpdate(echoAwareness, [42, 7])),
+      true,
+    );
+    await eventually(() => readAwarenessState(peer, 42) !== undefined);
+
+    expect(echoing.closeCodes).toEqual([]);
+    expect(readAwarenessState(peer, 42)).toMatchObject({
+      cursor: { anchor: 1, head: 1 },
+      user: { id: "echoer" },
+    });
+    expect(readAwarenessState(peer, 7)).toMatchObject({
+      cursor: { anchor: 9, head: 9 },
+      user: { id: "peer" },
+    });
   });
 });
 

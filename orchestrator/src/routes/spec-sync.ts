@@ -8,12 +8,12 @@ import { SpecParticipantLeaseStaleError } from "../specs/doc-service.ts";
 import type { GetSession, ResolveDraftSpec, ResolveSpecMembership } from "./guard.ts";
 import { makeSpecMemberHeaderGuard } from "./guard.ts";
 import {
-  awarenessClientIds,
   decodeSpecSyncMessage,
   encodeAwarenessState,
   encodeSyncStep1,
   encodeSyncStep2,
   encodeSyncUpdate,
+  ownAwarenessUpdate,
   withAwarenessUser,
 } from "./spec-sync-protocol.ts";
 
@@ -474,11 +474,9 @@ export class SpecSyncHub implements SpecPresence {
       socket.close(1009, "awareness update too large");
       return;
     }
-    const expectedClientId = Number(clientId);
-    if (awarenessClientIds(message.update).some((id) => id !== expectedClientId)) {
-      throw new Error("An awareness update used a different client id");
-    }
-    const pinned = withAwarenessUser(message.update, user);
+    const own = ownAwarenessUpdate(message.update, Number(clientId));
+    if (own === null) return;
+    const pinned = withAwarenessUser(own, user);
     awarenessProtocol.applyAwarenessUpdate(room.awareness, pinned, socket);
   }
 
