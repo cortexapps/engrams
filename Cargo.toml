@@ -317,7 +317,7 @@ proptest = "1"
 rand = { version = "0.10", default-features = false, features = ["std"] }
 rand_core06 = { package = "rand_core", version = "0.6", default-features = false, features = ["getrandom"] }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
-pem = "3"
+pem = "4"
 rand_chacha = "0.10"
 
 # tls + cert mint (host-side egress proxy)
