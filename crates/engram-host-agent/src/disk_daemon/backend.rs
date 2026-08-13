@@ -1209,6 +1209,16 @@ impl InFlightTracker {
         }
     }
 
+    /// Snapshot of the current in-flight count. Test-only observability
+    /// (the ADR 0116 C3 reader-liveness probe) — never a
+    /// synchronization primitive; use `wait_idle` for that.
+    // The sole consumer (the runtime.rs reader-liveness probe) is
+    // linux-gated with the rest of the NBD serve tests.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn count(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Increment + return a guard that decrements on drop. Use with
     /// `let _guard = tracker.enter();` at the top of each NBD handler.
     /// Only the Linux NBD daemon's `serve_loop` constructs guards;
