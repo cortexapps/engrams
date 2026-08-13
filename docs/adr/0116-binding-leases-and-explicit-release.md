@@ -1,6 +1,6 @@
 # ADR 0116: Binding leases — ownership is granted and released, never inferred
 
-- Status: Proposed
+- Status: Accepted (2026-08-13)
 - Date: 2026-08-12
 - Implementation record: PR #1212 (workstream B, PR B1: the boot
   materializer + cold-boot slot fix; merged 2026-08-12) landed as

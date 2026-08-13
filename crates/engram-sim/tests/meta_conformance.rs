@@ -2676,6 +2676,17 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     assert_eq!(s.status, SessionState::Idle);
     assert_eq!(s.sandbox_id, None, "the settle detaches the sandbox");
     assert_eq!(s.host_id, Some(host), "host affinity preserved");
+    // ADR 0116 A6: the settle entombs the released binding in the SAME
+    // transaction — normally the next heartbeat acks it by absence
+    // instantly; after a host crash it destroys the survivor from an
+    // explicit fact.
+    assert!(
+        meta.sandbox_tombstones_for_host(host)
+            .await
+            .unwrap()
+            .contains(&sb),
+        "the settle writes the released binding'''s tombstone in-tx"
+    );
     // 6. Idempotent: a re-advert's second settle is a clean no-op.
     assert!(
         meta.settle_evicted_session_idle(sid, sb, good_snap, &settle_events)

@@ -2299,6 +2299,9 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn delete_pending_session(&self, session_id: SessionId) -> Result<(), MetaError> {
+        // ADR 0116 A6 audit: compliant by its own guard — only an
+        // UNBOUND pending reservation (sandbox_id IS NULL: no VM ever
+        // came up) is ever deleted; no binding is released here.
         let n = sqlx::query(
             "DELETE FROM sessions WHERE id = $1 AND status = 'pending' AND sandbox_id IS NULL",
         )
@@ -2701,7 +2704,9 @@ impl MetadataStore for PostgresStore {
         use engram_core::types::session::DeleteHostOutcome;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         // Refuse while any session is still bound — deleting the row out
-        // from under a live session would orphan its routing. ADR 0084 (c):
+        // from under a live session would orphan its routing (ADR 0116
+        // A6 audit: this refusal IS the release discipline — a bound
+        // host row is never removed on inference). ADR 0084 (c):
         // an in-flight base-snapshot capture binds the host the same way
         // (its VM is running there); count non-terminal `capture_jobs`
         // rows bound to this host in the same guard.
@@ -2995,17 +3000,39 @@ impl MetadataStore for PostgresStore {
         // commit only.
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let now = self.clock.now_utc();
+        // ADR 0116 A6: the settle releases a binding on the host'''s own
+        // durable capture report (host-affirmed) — but the VM'''s destroy
+        // is host-owned and may not have happened yet (a crash between
+        // "capture durable" and the teardown). The same-tx tombstone
+        // closes that window: normally the next heartbeat'''s running set
+        // acks it by absence instantly; after a crash it destroys the
+        // survivor from an explicit fact instead of the slow
+        // stably-unbound sweep.
         let res = sqlx::query(
             r#"
-            UPDATE sessions
+            WITH prior AS (
+                SELECT id, host_id, sandbox_id
+                  FROM sessions
+                 WHERE id = $1
+                   AND status = 'evicting'
+                   AND sandbox_id = $2
+                   AND EXISTS (
+                       SELECT 1 FROM snapshots
+                        WHERE id = $3 AND session_id = $1 AND recoverable
+                   )
+                   FOR UPDATE
+            ),
+            entombed AS (
+                INSERT INTO sandbox_tombstones (host_id, sandbox_id, session_id, created_at)
+                SELECT p.host_id, p.sandbox_id, p.id, $4
+                  FROM prior p
+                 WHERE p.host_id IS NOT NULL
+                ON CONFLICT (host_id, sandbox_id) DO NOTHING
+            )
+            UPDATE sessions s
                SET status = 'idle', sandbox_id = NULL, updated_at = $4
-             WHERE id = $1
-               AND status = 'evicting'
-               AND sandbox_id = $2
-               AND EXISTS (
-                   SELECT 1 FROM snapshots
-                    WHERE id = $3 AND session_id = $1 AND recoverable
-               )
+              FROM prior p
+             WHERE s.id = p.id
             "#,
         )
         .bind(session_id.as_uuid())
