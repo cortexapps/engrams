@@ -33,10 +33,15 @@ export interface SpecPromptContext {
 }
 
 /** The standing rules of spec mode. Every spec session gets these, with or
- *  without a template snapshot. The live read at the start of each turn avoids
- *  stale disk projections after queued prompts. */
+ *  without a template snapshot. Freshness is pushed, not polled (ADR 0114 D9):
+ *  a UserPromptSubmit hook delivers the digest with each prompt, and every
+ *  content mutation carries expected_rev, so a stale section write bounces
+ *  instead of clobbering. The agent therefore reads the sections the digest
+ *  names instead of the whole spec every turn. */
 export const SPEC_MODE_SYSTEM_PROMPT = `## Spec mode
-When /workspace/spec.md exists, the session has a collaborative spec. At the start of every turn, call spec_read before you reason about or change the spec. spec_read is the live source of truth. Read /workspace/.engrams/spec/digest.md when you need the human-change summary.
+When /workspace/spec.md exists, the session has a collaborative spec. Each prompt arrives with a digest that names the sections humans changed since your last turn. Call spec_read with a section_id before you write into or reason from a section the digest names, or one you have not read in this session. Call spec_read without a section_id when you need the whole document. spec_read is the live source of truth; /workspace/spec.md is a projection that can lag behind it.
+
+Every spec_update_section, spec_set_section_state, and spec_update_block call carries expected_rev: the rev from your latest spec_read of that section. A result with applied=false means the section changed after that read. Re-read the section, then reapply your change on top of what you find. Edits elsewhere in the document never bounce your write, so never retry a bounced call with the returned rev without reading first.
 
 Treat /workspace/spec.md as a read-only projection. Never edit it with file or shell tools. Use the spec_* tools for every spec change.
 
