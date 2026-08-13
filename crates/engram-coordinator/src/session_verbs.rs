@@ -75,6 +75,146 @@ const SHORTCUT_MAX_ATTEMPTS: i32 = 3;
 /// markers are recorded inside `api::snapshot`'s pipeline functions,
 /// which this verb owns exclusively now). Wraps [`resume_inner`] with the
 /// retry-budget livelock terminator.
+/// ADR 0116 B-D3: the resume plan, derived from durable state — the
+/// recorded step, whether a binding exists, the session status, and the
+/// attempt count. Replaces the old inline shortcut/fall-through fork
+/// whose "falling through to full dispatch (re-restore)" log lied for
+/// Created rows (resume_from_created never re-restores — it retries the
+/// identical finish). Pure, table-tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumePlan {
+    /// A prior attempt already restored + bound a VM: skip to the
+    /// idempotent finish leg.
+    FinishShortcut,
+    /// The finish has failed enough (or deterministically): the plan
+    /// must CHANGE — rebuild the binding so the next attempt genuinely
+    /// re-materializes.
+    Rebuild,
+    /// Run the normal per-status dispatch (for Idle this is a real
+    /// re-restore).
+    FullDispatch,
+}
+
+fn derive_resume_plan(
+    resume_point: Option<&str>,
+    bound: bool,
+    status: SessionState,
+    attempts: i32,
+) -> ResumePlan {
+    let shortcut_eligible = matches!(resume_point, Some("bind" | "finish"))
+        && bound
+        && matches!(status, SessionState::Idle | SessionState::Created);
+    if !shortcut_eligible {
+        return ResumePlan::FullDispatch;
+    }
+    if attempts <= SHORTCUT_MAX_ATTEMPTS {
+        return ResumePlan::FinishShortcut;
+    }
+    // Past the shortcut budget: an Idle row re-restores through the
+    // normal dispatch (a genuine plan change already); a Created row
+    // would just re-run the identical finish — force the rebuild.
+    if status == SessionState::Created {
+        ResumePlan::Rebuild
+    } else {
+        ResumePlan::FullDispatch
+    }
+}
+
+/// ADR 0116 B-D3: release the current binding so the next resume
+/// attempt re-materializes from scratch — THE re-plan primitive,
+/// factored from the ADR 0091 Unreachable arm. Order is the A4
+/// discipline: durable tombstone first (the VM is owned by an explicit
+/// fact from the moment the row lets go), then teardown, then the
+/// fenced unbind + Idle flip.
+///
+/// `require_confirm` selects the teardown posture: the deterministic
+/// spawn re-plan runs against a LIVE host, so the unbind is gated on
+/// `confirm_source_teardown` (host-affirmed release — never strand a
+/// running VM's plane behind a cleared row); the Unreachable arm's
+/// guest is already dead, so its destroy stays best-effort and the
+/// tombstone alone owns cleanup.
+async fn rebuild_binding(
+    ctx: &OpCtx<'_>,
+    session: &engram_core::types::Session,
+    note: &str,
+    require_confirm: bool,
+) -> OpOutcome {
+    let state = ctx.state;
+    let id = ctx.op.session_id;
+    if let Some(sandbox_id) = session.sandbox_id {
+        if let Some(host_id) = session.host_id {
+            if let Err(e) = state
+                .services
+                .meta
+                .record_sandbox_tombstone(host_id, sandbox_id, Some(id))
+                .await
+            {
+                tracing::warn!(session_id = %id, %sandbox_id, error = %e,
+                    "rebuild_binding: tombstone write failed; retrying the op");
+                return OpOutcome::Retry("rebuild: tombstone write failed".into());
+            }
+            if require_confirm {
+                if let Err(e) = crate::evac_resumer::confirm_source_teardown(
+                    state,
+                    host_id,
+                    sandbox_id,
+                    ctx.fence(),
+                )
+                .await
+                {
+                    tracing::warn!(session_id = %id, %sandbox_id, error = %e,
+                        "rebuild_binding: source teardown not confirmed; retrying \
+                         (the tombstone owns eventual cleanup)");
+                    return OpOutcome::Retry(format!("rebuild: teardown unconfirmed: {e}"));
+                }
+            } else if let Err(e) = state.services.host.destroy(sandbox_id, ctx.fence()).await {
+                tracing::warn!(session_id = %id, %sandbox_id, error = %e,
+                    "rebuild_binding: destroy of the dead sandbox failed \
+                     (continuing — its tombstone owns cleanup)");
+            }
+            state.host_registry.invalidate_sandbox(sandbox_id);
+        }
+    }
+    match state
+        .services
+        .meta
+        .fenced_assign_sandbox(id, ctx.epoch, None, session.host_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            // A successor re-claimed; stop silently.
+            return OpOutcome::Done;
+        }
+        Err(e) => return OpOutcome::Retry(format!("rebuild: unbind: {e}")),
+    }
+    match crate::session_ops::transition_with_fence(
+        state,
+        id,
+        ctx.fence(),
+        SessionState::Idle,
+        BindingDisposition::RequireUnbound,
+    )
+    .await
+    {
+        Ok(prev) => {
+            let _ = state
+                .emit_fenced(
+                    id,
+                    ctx.fence(),
+                    SessionEvent::StatusChanged {
+                        from: prev,
+                        to: SessionState::Idle,
+                        at: state.services.clock.now_utc(),
+                    },
+                )
+                .await;
+            OpOutcome::Retry(note.to_string())
+        }
+        Err(e) => OpOutcome::Retry(format!("rebuild: idle flip: {e}")),
+    }
+}
+
 async fn resume(ctx: &OpCtx<'_>) -> OpOutcome {
     match resume_inner(ctx).await {
         OpOutcome::Retry(e) if ctx.op.attempts >= RESUME_MAX_ATTEMPTS => {
@@ -196,10 +336,16 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
     // `SHORTCUT_MAX_ATTEMPTS` failed finishes we fall through to full
     // dispatch (`resume_from_idle` restores a FRESH VM and rebinds,
     // overwriting the stale binding).
-    if let (Some("bind" | "finish"), Some(sandbox_id), SessionState::Idle | SessionState::Created) =
-        (ctx.resume_point(), session.sandbox_id, session.status)
-    {
-        if ctx.op.attempts <= SHORTCUT_MAX_ATTEMPTS {
+    match derive_resume_plan(
+        ctx.resume_point(),
+        session.sandbox_id.is_some(),
+        session.status,
+        ctx.op.attempts,
+    ) {
+        ResumePlan::FinishShortcut => {
+            let sandbox_id = session
+                .sandbox_id
+                .expect("FinishShortcut requires a binding");
             if !ctx.step("finish").await {
                 return OpOutcome::Failed("fenced at finish".into());
             }
@@ -216,31 +362,64 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
                 // 2026-07-21 livelock incident (prod 8174b7aa): a failed
                 // harness start parked the session at Created and this arm
                 // read `Ok(_) => Done` — the op "succeeded" while the
-                // session sat wedged with nothing owning it. Mirror
-                // `resume_from_created` (its ADR 0090 comment: "retryable,
-                // not a 200 — the resume op's backoff + budget own the
-                // retry"): Retry, so a transient start_agent flake heals
-                // in-op, the stale-binding case falls through to full
-                // dispatch after SHORTCUT_MAX_ATTEMPTS, and a truly dead
-                // harness terminates VISIBLY via the budget's
-                // Created → Failed flip instead of a silent Done.
-                Ok(crate::api::snapshot::FinishResumeOutcome::CreatedHarnessFailed(e)) => {
+                // session sat wedged with nothing owning it. ADR 0116
+                // B-D3: a DETERMINISTIC failure (B3's typed kind — the
+                // binary is missing/unreadable) recurs on an identical
+                // re-dispatch, so retrying the same finish burns the
+                // budget for nothing: RE-PLAN now (rebuild the binding;
+                // the next attempt re-materializes from scratch). A
+                // transient failure stays in the finish retries, bounded
+                // by SHORTCUT_MAX_ATTEMPTS.
+                Ok(crate::api::snapshot::FinishResumeOutcome::CreatedHarnessFailed {
+                    message,
+                    deterministic,
+                }) => {
+                    if deterministic {
+                        tracing::warn!(
+                            session_id = %id,
+                            %sandbox_id,
+                            error = %message,
+                            "deterministic harness-spawn failure — re-planning (rebuild \
+                             binding) instead of retrying the identical finish",
+                        );
+                        return rebuild_binding(
+                            ctx,
+                            &session,
+                            "re-planned after deterministic harness-spawn failure",
+                            true,
+                        )
+                        .await;
+                    }
                     OpOutcome::Retry(format!(
                         "harness start failed after resume (session parked at \
-                         Created; will retry): {e}"
+                         Created; will retry): {message}"
                     ))
                 }
                 Err(e) => outcome_from_api_error(e),
             };
         }
-        tracing::warn!(
-            session_id = %id,
-            %sandbox_id,
-            attempts = ctx.op.attempts,
-            "resume crash-shortcut kept failing; binding likely stale — \
-             falling through to full dispatch (re-restore)",
-        );
-        // fall through to the match below (full re-restore)
+        ResumePlan::Rebuild => {
+            // Past the shortcut budget with the row parked at Created:
+            // `resume_from_created` would retry the identical finish
+            // forever (the misleading old "full dispatch (re-restore)"
+            // log — no re-restore happens from Created). The plan must
+            // CHANGE: rebuild the binding so the next attempt genuinely
+            // re-materializes.
+            tracing::warn!(
+                session_id = %id,
+                attempts = ctx.op.attempts,
+                "resume crash-shortcut exhausted on a Created row — re-planning \
+                 (rebuild binding)",
+            );
+            return rebuild_binding(ctx, &session, "re-planned after shortcut exhaustion", true)
+                .await;
+        }
+        ResumePlan::FullDispatch => {
+            // Fall through to the status match below. For an Idle row
+            // past the shortcut budget this IS a genuine re-restore
+            // (`resume_from_idle` confirms the retained source teardown
+            // and restores a fresh VM).
+        }
     }
 
     match session.status {
@@ -255,66 +434,16 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
         // restores from the latest checkpoint (and arbitrates
         // recoverability, demoting to Dead when nothing usable exists).
         SessionState::Unreachable => {
-            if let Some(sandbox_id) = session.sandbox_id {
-                // ADR 0116 A-D5: the durable fact before the unbind —
-                // if the destroy below fails, the tombstone (not an
-                // orphan-reap inference) owns the VM's cleanup.
-                if let Some(host_id) = session.host_id {
-                    if let Err(e) = state
-                        .services
-                        .meta
-                        .record_sandbox_tombstone(host_id, sandbox_id, Some(id))
-                        .await
-                    {
-                        tracing::warn!(session_id = %id, %sandbox_id, error = %e,
-                            "unreachable recovery: tombstone write failed; retrying the op");
-                        return OpOutcome::Retry("tombstone write failed".into());
-                    }
-                }
-                if let Err(e) = state.services.host.destroy(sandbox_id, ctx.fence()).await {
-                    tracing::warn!(session_id = %id, %sandbox_id, error = %e,
-                        "unreachable recovery: destroy of the dead sandbox failed \
-                         (continuing — its tombstone owns cleanup)");
-                }
-            }
-            match state
-                .services
-                .meta
-                .fenced_assign_sandbox(id, ctx.epoch, None, session.host_id)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    // A successor re-claimed; stop silently.
-                    return OpOutcome::Done;
-                }
-                Err(e) => return OpOutcome::Retry(format!("unreachable recovery: unbind: {e}")),
-            }
-            match crate::session_ops::transition_with_fence(
-                state,
-                id,
-                ctx.fence(),
-                SessionState::Idle,
-                BindingDisposition::RequireUnbound,
+            // ADR 0116 B-D3: the shared re-plan primitive. The guest is
+            // dead/wedged on a live host — no confirm gate (the destroy
+            // is best-effort; the tombstone owns cleanup).
+            rebuild_binding(
+                ctx,
+                &session,
+                "unreachable guest cleared; resuming from checkpoint",
+                false,
             )
             .await
-            {
-                Ok(prev) => {
-                    let _ = state
-                        .emit_fenced(
-                            id,
-                            ctx.fence(),
-                            SessionEvent::StatusChanged {
-                                from: prev,
-                                to: SessionState::Idle,
-                                at: state.services.clock.now_utc(),
-                            },
-                        )
-                        .await;
-                    OpOutcome::Retry("unreachable guest cleared; resuming from checkpoint".into())
-                }
-                Err(e) => OpOutcome::Retry(format!("unreachable recovery: idle flip: {e}")),
-            }
         }
         SessionState::Idle => match crate::api::snapshot::resume_from_idle(ctx, session).await {
             Ok(_) => OpOutcome::Done,
@@ -1475,6 +1604,54 @@ mod tests {
     use engram_core::types::session_op::{EnqueueOutcome, OpState};
     use engram_core::SessionId;
 
+    // ADR 0116 B-D3: the resume-plan table. Every arm of the derivation
+    // is pinned — in particular the Created-past-budget row, which used
+    // to fall through to resume_from_created and retry the IDENTICAL
+    // finish under a log claiming "re-restore" (the incident'''s
+    // 60-retries-over-50-minutes shape).
+    #[test]
+    fn resume_plan_table() {
+        use SessionState::*;
+        let b = SHORTCUT_MAX_ATTEMPTS;
+        // Shortcut-eligible, inside the budget: finish.
+        for status in [Idle, Created] {
+            for step in ["bind", "finish"] {
+                assert_eq!(
+                    derive_resume_plan(Some(step), true, status, b),
+                    ResumePlan::FinishShortcut,
+                );
+            }
+        }
+        // Past the budget: Created rebuilds (the plan CHANGES); Idle
+        // full-dispatches (a genuine re-restore already).
+        assert_eq!(
+            derive_resume_plan(Some("finish"), true, Created, b + 1),
+            ResumePlan::Rebuild,
+        );
+        assert_eq!(
+            derive_resume_plan(Some("finish"), true, Idle, b + 1),
+            ResumePlan::FullDispatch,
+        );
+        // Not shortcut-eligible: no recorded bind/finish step, no
+        // binding, or a status outside Idle/Created.
+        assert_eq!(
+            derive_resume_plan(Some("dispatch"), true, Idle, 1),
+            ResumePlan::FullDispatch,
+        );
+        assert_eq!(
+            derive_resume_plan(None, true, Idle, 1),
+            ResumePlan::FullDispatch
+        );
+        assert_eq!(
+            derive_resume_plan(Some("finish"), false, Idle, 1),
+            ResumePlan::FullDispatch,
+        );
+        assert_eq!(
+            derive_resume_plan(Some("finish"), true, Active, 1),
+            ResumePlan::FullDispatch,
+        );
+    }
+
     /// ADR 0078 re-review (finding #2): a transient placement failure —
     /// `PickError::HostUnreachable` (the picked host couldn't be dialed)
     /// or `PickError::Internal` (the hosts read hiccuped) — must surface
@@ -2101,6 +2278,211 @@ mod tests {
             SessionState::Dead,
             "a stale-binding shortcut must fall through to full re-restore, \
              not latch the dead binding",
+        );
+    }
+
+    /// ADR 0116 B-D3: a Created row past the shortcut budget RE-PLANS —
+    /// but the rebuild's unbind is GATED on host-affirmed teardown. With
+    /// no backend registered for the host (unconfirmable), the gate must
+    /// hold: the op retries with the teardown-unconfirmed note and the
+    /// binding stays untouched (never strand a possibly-running VM's
+    /// plane behind a cleared row; its tombstone owns eventual cleanup).
+    #[tokio::test]
+    async fn rebuild_gate_holds_when_teardown_is_unconfirmable() {
+        let id = SessionId::new();
+        let mut s = idle_session(id);
+        s.status = SessionState::Created;
+        s.host_id = Some(engram_core::HostId::new());
+        s.sandbox_id = Some(engram_core::SandboxId::new());
+        let (state, mini, _local) = crate::state::tests::build_state_for_session(s);
+
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(id, OpKind::Resume, serde_json::json!({}), None, "test-pod")
+            .await
+            .expect("enqueue resume")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("lane busy: {other:?}"),
+        };
+        assert!(mini
+            .ops
+            .force_attempts_and_step(op.id, SHORTCUT_MAX_ATTEMPTS + 1, Some("finish"),));
+        let refreshed = mini.ops.get(op.id).unwrap();
+        crate::session_ops::drive_claimed(&state, refreshed).await;
+
+        let after = mini.ops.get(op.id).unwrap();
+        assert_ne!(
+            after.state,
+            OpState::Done,
+            "the gate must not complete the op"
+        );
+        assert!(
+            after
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("teardown unconfirmed"),
+            "the retry names the unconfirmed teardown: {:?}",
+            after.error,
+        );
+        let row = mini.session.lock().clone();
+        assert_eq!(
+            row.status,
+            SessionState::Created,
+            "no flip without confirmation"
+        );
+        assert!(
+            row.sandbox_id.is_some(),
+            "the binding is NOT cleared unconfirmed"
+        );
+    }
+
+    /// ADR 0116 B-D3: the full re-plan. A Created row past the shortcut
+    /// budget, whose host CONFIRMS the teardown (destroy acknowledged +
+    /// probe reports gone), is rebuilt: unbound, flipped to Idle, and the
+    /// op retries so the next attempt genuinely re-materializes. This is
+    /// the plan CHANGE the old fork never made from Created — its
+    /// "falling through to full dispatch (re-restore)" re-ran the
+    /// identical finish (the incident's 60-retries-over-50-minutes).
+    #[tokio::test]
+    async fn rebuild_replans_created_row_after_confirmed_teardown() {
+        use engram_core::traits::HostClient;
+        use engram_core::types::egress::SessionEgressPolicy;
+        use engram_core::types::sandbox::{
+            AgentSpec, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
+        };
+        use engram_core::types::snapshot::SnapshotMetadata;
+        use engram_core::{SandboxError, SandboxId};
+
+        /// destroy acks; the follow-up probe affirms absence.
+        struct TornDownHost;
+        #[async_trait::async_trait]
+        impl HostClient for TornDownHost {
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                unimplemented!()
+            }
+            async fn destroy(
+                &self,
+                _id: SandboxId,
+                _fence: engram_core::traits::SessionFence,
+            ) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn probe_sandbox(&self, _id: SandboxId) -> Result<SandboxProbe, SandboxError> {
+                Ok(SandboxProbe {
+                    known_to_backend: false,
+                    process_alive: false,
+                    control_alive: None,
+                })
+            }
+            async fn exec_stream(
+                &self,
+                _id: SandboxId,
+                _cmd: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                unimplemented!()
+            }
+            async fn snapshot(
+                &self,
+                _id: SandboxId,
+                _fence: engram_core::traits::SessionFence,
+            ) -> Result<SnapshotMetadata, SandboxError> {
+                unimplemented!()
+            }
+            async fn restore(
+                &self,
+                _metadata: SnapshotMetadata,
+                _fence: engram_core::traits::SessionFence,
+            ) -> Result<SandboxId, SandboxError> {
+                unimplemented!()
+            }
+            async fn start_agent(
+                &self,
+                _id: SandboxId,
+                _agent: AgentSpec,
+                _policy: SessionEgressPolicy,
+                _fence: engram_core::traits::SessionFence,
+            ) -> Result<(), SandboxError> {
+                unimplemented!()
+            }
+            async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
+                None
+            }
+            async fn bind_session(
+                &self,
+                _session_id: SessionId,
+                _sandbox_id: SandboxId,
+                _binding_epoch: u64,
+            ) {
+            }
+            async fn unbind_session(&self, _session_id: SessionId) {}
+            async fn send_prompt(
+                &self,
+                _sandbox_id: SandboxId,
+                _prompt_id: String,
+                _text: String,
+                _mode: Option<String>,
+            ) -> Result<(), SandboxError> {
+                unimplemented!()
+            }
+        }
+
+        let id = SessionId::new();
+        let host_id = engram_core::HostId::new();
+        let mut s = idle_session(id);
+        s.status = SessionState::Created;
+        s.host_id = Some(host_id);
+        s.sandbox_id = Some(engram_core::SandboxId::new());
+        let (state, mini, _local) = crate::state::tests::build_state_for_session(s);
+        state
+            .host_registry
+            .register(host_id, std::sync::Arc::new(TornDownHost));
+
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(id, OpKind::Resume, serde_json::json!({}), None, "test-pod")
+            .await
+            .expect("enqueue resume")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("lane busy: {other:?}"),
+        };
+        assert!(mini
+            .ops
+            .force_attempts_and_step(op.id, SHORTCUT_MAX_ATTEMPTS + 1, Some("finish"),));
+        let refreshed = mini.ops.get(op.id).unwrap();
+        crate::session_ops::drive_claimed(&state, refreshed).await;
+
+        let row = mini.session.lock().clone();
+        assert_eq!(
+            row.status,
+            SessionState::Idle,
+            "the re-plan releases the binding and rests the row at Idle",
+        );
+        assert!(
+            row.sandbox_id.is_none(),
+            "the binding is cleared post-confirmation"
+        );
+        let after = mini.ops.get(op.id).unwrap();
+        assert_ne!(
+            after.state,
+            OpState::Done,
+            "the op retries — the NEXT attempt re-materializes from scratch",
+        );
+        assert!(
+            after
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("re-planned after shortcut exhaustion"),
+            "the retry names the re-plan: {:?}",
+            after.error,
         );
     }
 

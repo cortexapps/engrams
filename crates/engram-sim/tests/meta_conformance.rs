@@ -1623,12 +1623,13 @@ async fn fenced_transition_with_events(ctx: &Ctx) {
         .await
         .unwrap()
         .is_none());
-    // Illegal transition (Created → Idle): Conflict, nothing lands.
+    // Illegal transition (Created → Queued; Created → Idle became the
+    // legal ADR 0116 B-D3 re-plan edge): Conflict, nothing lands.
     let err = meta
         .fenced_transition_session_with_events(
             sid,
             epoch,
-            SessionState::Idle,
+            SessionState::Queued,
             BindingDisposition::Detach,
             &events,
         )

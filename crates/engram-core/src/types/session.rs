@@ -207,6 +207,7 @@ impl SessionState {
     /// Created     -> Active | Failed | HostLost
     /// Active      -> Idle | HostLost | Evacuating | Evicting | Failed
     ///              | Completed | Dead
+    /// Created     -> Active | Failed | HostLost | Idle (re-plan, ADR 0116)
     /// Idle        -> Created (resume) | Dead | Completed | Queued (resume
     ///                hit no capacity, ADR 0048)
     /// HostLost    -> Created | Idle | Dead | Completed
@@ -258,7 +259,14 @@ impl SessionState {
             // timeout goes Queued → Idle; a create-origin timeout / cancel
             // goes Queued → Failed.
             Queued => matches!(target, Pending | Idle | Failed),
-            Created => matches!(target, Active | Failed | HostLost),
+            // ADR 0116 B-D3: Created -> Idle is the resume RE-PLAN edge —
+            // a deterministic harness-spawn failure (or shortcut
+            // exhaustion) confirms the freshly-restored VM'''s teardown
+            // and returns the row to Idle UNBOUND, so the next attempt
+            // re-materializes from scratch instead of retrying the
+            // identical finish (the 2026-08-12 60-retry burn). Guarded
+            // by RequireUnbound at the call site.
+            Created => matches!(target, Active | Failed | HostLost | Idle),
             Active => matches!(
                 target,
                 Idle | HostLost | Evacuating | Evicting | Failed | Completed | Dead | Unreachable
@@ -876,6 +884,9 @@ mod tests {
             (Created, Active),
             (Created, Failed),
             (Created, HostLost),
+            // ADR 0116 B-D3: the resume re-plan edge (confirmed-teardown
+            // release back to Idle, RequireUnbound-guarded).
+            (Created, Idle),
             (Active, Idle),
             (Active, HostLost),
             (Active, Evacuating),
