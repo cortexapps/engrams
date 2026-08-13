@@ -43,35 +43,26 @@ use engram_host_core::CoordControlPlane;
 /// above any create→bind latency.
 pub const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Consecutive orphan verdicts required before a local destroy. Two ticks
-/// (~60s) clears the create→bind window (a fresh sandbox publishes its
-/// session binding within a tick) and rides out a one-tick coord outage.
-pub const ORPHAN_STRIKES: u32 = 2;
+/// ADR 0116 A5: how long a sandbox must have been visible to this
+/// process before a coordinator-confirmed no-owner answer may destroy
+/// it — the create→bind grace, re-keyed on AGE instead of the retired
+/// consecutive-verdict strikes. Two reconcile intervals clears the
+/// create→bind window (a fresh sandbox publishes its binding within a
+/// tick). First-seen is in-memory: a host-agent restart re-arms the
+/// grace for every survivor — a bounded, conservative delay (one
+/// minute), never a mis-reap.
+pub const ORPHAN_GRACE: Duration = Duration::from_secs(2 * RECONCILE_INTERVAL.as_secs());
 
-/// Apply one reconcile tick's verdict for a single sandbox to the strike
-/// ledger, returning `true` iff it should be destroyed NOW.
-///
-/// - `is_orphan == false` (still owned, or coordinator unreachable so we
-///   conservatively assume owned) resets the count and returns `false`.
-/// - `is_orphan == true` increments the count; once it reaches
-///   `threshold`, returns `true` (destroy).
-///
-/// The caller removes the entry after a successful destroy (and prunes
-/// entries for sandboxes that vanished); a destroy that fails leaves the
-/// count at/over threshold so the next tick retries immediately.
-pub fn orphan_strike(
-    strikes: &mut HashMap<SandboxId, u32>,
+/// The age gate: `true` iff `sandbox` has been continuously visible for
+/// at least [`ORPHAN_GRACE`]. Stamps first sight; the caller prunes
+/// entries for sandboxes that vanished.
+pub fn past_orphan_grace(
+    first_seen: &mut HashMap<SandboxId, Duration>,
     sandbox: SandboxId,
-    is_orphan: bool,
-    threshold: u32,
+    now_mono: Duration,
 ) -> bool {
-    if !is_orphan {
-        strikes.remove(&sandbox);
-        return false;
-    }
-    let n = strikes.entry(sandbox).or_insert(0);
-    *n += 1;
-    *n >= threshold
+    let first = *first_seen.entry(sandbox).or_insert(now_mono);
+    now_mono.saturating_sub(first) >= ORPHAN_GRACE
 }
 
 /// Marker for "the coordinator was unreachable" — a transient control-plane
@@ -94,10 +85,12 @@ pub enum ReconcileInput {
     /// transient, never session-owned; a slow `[warm]` hook must not be
     /// reaped mid-capture). Exempt WITHOUT a coordinator call.
     Exempt,
-    /// The sandbox had a LOCAL session binding, so the driver asked
-    /// `sandbox_ownership`. `Ok(true)` = still owned, `Ok(false)` =
-    /// ownership moved on, `Err` = coord unreachable.
-    Bound(Result<bool, CoordUnreachable>),
+    /// The sandbox has a LOCAL session binding. ADR 0116 A5: the bound
+    /// arm's `sandbox_ownership` PG poll is RETIRED — a locally bound
+    /// sandbox is owned until the coordinator says otherwise through
+    /// the tombstone push (the heartbeat's `tombstoned_sandboxes` arm
+    /// destroys it explicitly). No coordinator call, no inference.
+    LocallyBound,
     /// The sandbox had NO local binding, so the driver asked `sandbox_owner`
     /// ("does ANY session own this on me?"). `Ok(Some)` = coord owns it
     /// (repair the missing local binding), `Ok(None)` = coord-CONFIRMED no
@@ -137,10 +130,9 @@ pub enum ReapVerdict {
 pub fn classify(input: ReconcileInput) -> ReapVerdict {
     match input {
         ReconcileInput::Exempt => ReapVerdict::Exempt,
-        // Locally-bound arm.
-        ReconcileInput::Bound(Ok(true)) => ReapVerdict::Owned,
-        ReconcileInput::Bound(Ok(false)) => ReapVerdict::Orphan,
-        ReconcileInput::Bound(Err(CoordUnreachable)) => ReapVerdict::Owned,
+        // Locally-bound arm (ADR 0116 A5): owned, period — revocation
+        // arrives as a tombstone, never as a poll verdict.
+        ReconcileInput::LocallyBound => ReapVerdict::Owned,
         // Unbound arm (ADR 0090): a coord-owned answer repairs the binding;
         // ONLY a coordinator-confirmed absence is an orphan.
         ReconcileInput::Unbound(Ok(Some(session))) => ReapVerdict::RepairBinding(session),
@@ -210,12 +202,7 @@ async fn gather_input(
         return ReconcileInput::Exempt;
     }
     match session {
-        Some(sid) => ReconcileInput::Bound(
-            coord
-                .sandbox_ownership(host_id, sid, sandbox_id)
-                .await
-                .map_err(|_| CoordUnreachable),
-        ),
+        Some(_) => ReconcileInput::LocallyBound,
         None => ReconcileInput::Unbound(
             coord
                 .sandbox_owner(host_id, sandbox_id)
@@ -226,46 +213,50 @@ async fn gather_input(
 }
 
 /// One full teardown-reconcile tick: list → classify every sandbox (pure
-/// core + one coordinator call each) → strike-debounce → destroy confirmed
-/// orphans / repair recovered bindings. The `strikes` ledger is a
-/// caller-owned parameter (the sim owns its lifetime across ticks, exactly
-/// like the interval wrapper in `lib.rs`).
+/// core; ADR 0116 A5: only the UNBOUND arm makes a coordinator call) →
+/// destroy age-cleared confirmed orphans / repair recovered bindings.
+/// The `first_seen` ledger is a caller-owned parameter (the sim owns its
+/// lifetime across ticks, exactly like the interval wrapper in
+/// `lib.rs`); `now_mono` is the caller's injected monotonic mark.
 ///
-/// Returns `Err` only if the initial `list()` fails — the caller logs it and
-/// skips the tick (unchanged from the inline loop). A destroy failure is
-/// logged and left to retry next tick (the strike stays at/over threshold).
+/// Returns `Err` only if the initial `list()` fails — the caller logs it
+/// and skips the tick (unchanged from the inline loop). A destroy
+/// failure is logged and left to retry next tick.
 pub async fn reconcile_once(
     backend: &dyn ReconcileBackend,
     coord: &dyn CoordControlPlane,
     host_id: HostId,
-    strikes: &mut HashMap<SandboxId, u32>,
+    first_seen: &mut HashMap<SandboxId, Duration>,
+    now_mono: Duration,
 ) -> Result<(), SandboxError> {
     let sandboxes = backend.list().await?;
     let live: std::collections::HashSet<SandboxId> = sandboxes.iter().copied().collect();
-    strikes.retain(|id, _| live.contains(id));
+    first_seen.retain(|id, _| live.contains(id));
     for sandbox_id in sandboxes {
         let session = backend.session_for_sandbox(sandbox_id);
         let verdict = classify(gather_input(backend, coord, host_id, sandbox_id, session).await);
-        let orphan = match &verdict {
-            ReapVerdict::Exempt | ReapVerdict::Owned => false,
+        match &verdict {
+            ReapVerdict::Exempt | ReapVerdict::Owned => {}
             ReapVerdict::RepairBinding(session) => {
                 tracing::info!(%sandbox_id, session_id = %session,
                     "teardown reconcile: coordinator owns this sandbox; \
                      repopulating the local binding");
                 backend.record_session_binding(sandbox_id, *session);
-                false
             }
-            ReapVerdict::Orphan => true,
-        };
-        if orphan_strike(strikes, sandbox_id, orphan, ORPHAN_STRIKES) {
-            tracing::warn!(%sandbox_id, ?session,
-                "teardown reconcile: sandbox no longer owned by its session; \
-                 destroying locally");
-            if let Err(e) = backend.destroy(sandbox_id).await {
-                tracing::warn!(%sandbox_id, error = %e,
-                    "teardown reconcile: local destroy failed; retrying next tick");
-            } else {
-                strikes.remove(&sandbox_id);
+            ReapVerdict::Orphan => {
+                // ADR 0116 A5: a coordinator-CONFIRMED no-owner answer
+                // destroys as soon as the create→bind age grace clears —
+                // no verdict-counting.
+                if !past_orphan_grace(first_seen, sandbox_id, now_mono) {
+                    continue;
+                }
+                tracing::warn!(%sandbox_id,
+                    "teardown reconcile: coordinator confirms no owner; \
+                     destroying locally");
+                if let Err(e) = backend.destroy(sandbox_id).await {
+                    tracing::warn!(%sandbox_id, error = %e,
+                        "teardown reconcile: local destroy failed; retrying next tick");
+                }
             }
         }
     }
@@ -340,28 +331,10 @@ mod tests {
     }
 
     #[test]
-    fn classify_bound_owned_is_owned() {
-        assert_eq!(
-            classify(ReconcileInput::Bound(Ok(true))),
-            ReapVerdict::Owned
-        );
-    }
-
-    #[test]
-    fn classify_bound_not_owned_is_orphan() {
-        assert_eq!(
-            classify(ReconcileInput::Bound(Ok(false))),
-            ReapVerdict::Orphan
-        );
-    }
-
-    #[test]
-    fn classify_bound_coord_unreachable_assumes_owned() {
-        // A transient coord blip on a locally-bound sandbox never reaps.
-        assert_eq!(
-            classify(ReconcileInput::Bound(Err(CoordUnreachable))),
-            ReapVerdict::Owned
-        );
+    fn classify_locally_bound_is_owned_without_a_coord_call() {
+        // ADR 0116 A5: a local binding IS ownership until a tombstone
+        // says otherwise — the polling bound arm is retired.
+        assert_eq!(classify(ReconcileInput::LocallyBound), ReapVerdict::Owned);
     }
 
     #[test]
@@ -397,20 +370,16 @@ mod tests {
     }
 
     #[test]
-    fn classify_orphan_is_the_only_verdict_that_strikes() {
-        // Exactly one of the seven inputs maps to Orphan-via-Bound and one
-        // via Unbound; every other input clears the strike ledger.
-        let orphaning = [
-            ReconcileInput::Bound(Ok(false)),
-            ReconcileInput::Unbound(Ok(None)),
-        ];
-        for input in orphaning {
-            assert_eq!(classify(input), ReapVerdict::Orphan);
-        }
+    fn classify_orphan_only_via_confirmed_absence() {
+        // Exactly ONE input maps to Orphan: the coordinator-confirmed
+        // no-owner answer on an unbound sandbox.
+        assert_eq!(
+            classify(ReconcileInput::Unbound(Ok(None))),
+            ReapVerdict::Orphan
+        );
         let never_orphan = [
             ReconcileInput::Exempt,
-            ReconcileInput::Bound(Ok(true)),
-            ReconcileInput::Bound(Err(CoordUnreachable)),
+            ReconcileInput::LocallyBound,
             ReconcileInput::Unbound(Ok(Some(SessionId::new()))),
             ReconcileInput::Unbound(Err(CoordUnreachable)),
         ];
@@ -420,47 +389,16 @@ mod tests {
     }
 
     #[test]
-    fn owned_sandbox_never_strikes() {
-        let mut s = HashMap::new();
+    fn orphan_grace_gates_young_sandboxes_then_clears() {
+        // ADR 0116 A5: the create→bind window is an AGE grace, not a
+        // verdict count. A confirmed orphan younger than ORPHAN_GRACE
+        // is spared; the same sandbox past the grace is destroyed.
+        let mut seen = HashMap::new();
         let id = SandboxId::new();
-        for _ in 0..5 {
-            assert!(!orphan_strike(&mut s, id, false, ORPHAN_STRIKES));
-        }
-        assert!(s.is_empty(), "an owned sandbox leaves no ledger entry");
-    }
-
-    #[test]
-    fn orphan_destroyed_only_after_consecutive_strikes() {
-        let mut s = HashMap::new();
-        let id = SandboxId::new();
-        // First orphan tick: one strike, below threshold — don't destroy
-        // (protects an in-flight create whose binding hasn't landed).
-        assert!(!orphan_strike(&mut s, id, true, ORPHAN_STRIKES));
-        // Second consecutive orphan tick crosses the threshold.
-        assert!(orphan_strike(&mut s, id, true, ORPHAN_STRIKES));
-    }
-
-    #[test]
-    fn a_single_non_orphan_tick_resets_the_count() {
-        let mut s = HashMap::new();
-        let id = SandboxId::new();
-        assert!(!orphan_strike(&mut s, id, true, ORPHAN_STRIKES)); // strike 1
-        assert!(!orphan_strike(&mut s, id, false, ORPHAN_STRIKES)); // owned again → reset
-                                                                    // The next orphan run must start the count over, not destroy on its
-                                                                    // first strike.
-        assert!(!orphan_strike(&mut s, id, true, ORPHAN_STRIKES)); // strike 1 again
-        assert!(orphan_strike(&mut s, id, true, ORPHAN_STRIKES)); // strike 2 → destroy
-    }
-
-    #[test]
-    fn a_failed_destroy_retries_immediately_next_tick() {
-        let mut s = HashMap::new();
-        let id = SandboxId::new();
-        assert!(!orphan_strike(&mut s, id, true, ORPHAN_STRIKES)); // strike 1
-        assert!(orphan_strike(&mut s, id, true, ORPHAN_STRIKES)); // strike 2 → destroy attempt
-                                                                  // The caller's destroy failed, so it did NOT remove the entry: the
-                                                                  // count stays at/over threshold and re-fires on the next tick.
-        assert!(orphan_strike(&mut s, id, true, ORPHAN_STRIKES));
+        let t0 = Duration::from_secs(1_000);
+        assert!(!past_orphan_grace(&mut seen, id, t0));
+        assert!(!past_orphan_grace(&mut seen, id, t0 + ORPHAN_GRACE / 2));
+        assert!(past_orphan_grace(&mut seen, id, t0 + ORPHAN_GRACE));
     }
 
     // ---- ADR 0098 R-CoSim / issue #570: an in-flight capture is exempt ----
@@ -479,6 +417,7 @@ mod tests {
         sandbox: SandboxId,
         session: SessionId,
         capture_in_flight: bool,
+        bound: bool,
         destroyed: parking_lot::Mutex<Vec<SandboxId>>,
     }
 
@@ -497,7 +436,14 @@ mod tests {
             self.capture_in_flight
         }
         fn session_for_sandbox(&self, _: SandboxId) -> Option<SessionId> {
-            Some(self.session)
+            // ADR 0116 A5: the reap-eligible shape is UNBOUND (a bound
+            // sandbox is owned until its tombstone arrives; `bound`
+            // models the mid-capture local binding).
+            if self.bound {
+                Some(self.session)
+            } else {
+                None
+            }
         }
         fn record_session_binding(&self, _: SandboxId, _: SessionId) {}
         async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
@@ -536,18 +482,22 @@ mod tests {
         }
     }
 
-    async fn ticks_to_destroy(capture_in_flight: bool) -> usize {
+    async fn ticks_to_destroy(capture_in_flight: bool, bound: bool) -> usize {
         let backend = MidCaptureBackend {
             sandbox: SandboxId::new(),
             session: SessionId::new(),
             capture_in_flight,
+            bound,
             destroyed: parking_lot::Mutex::new(Vec::new()),
         };
         let coord = UnownedCoord;
         let host = HostId::new();
-        let mut strikes = HashMap::new();
-        for tick in 1..=(ORPHAN_STRIKES as usize + 3) {
-            reconcile_once(&backend, &coord, host, &mut strikes)
+        let mut first_seen = HashMap::new();
+        // Ticks at the real cadence: age at tick k is (k-1)*interval, so
+        // the ORPHAN_GRACE (2*interval) clears at tick 3.
+        for tick in 1..=6usize {
+            let now = Duration::from_secs(1_000) + RECONCILE_INTERVAL * (tick as u32 - 1);
+            reconcile_once(&backend, &coord, host, &mut first_seen, now)
                 .await
                 .expect("tick");
             if !backend.destroyed.lock().is_empty() {
@@ -562,21 +512,33 @@ mod tests {
         // The fix: mid-capture, the unowned sandbox is exempt — no destroy
         // however long the D5 window lasts.
         assert_eq!(
-            ticks_to_destroy(true).await,
+            ticks_to_destroy(true, false).await,
             usize::MAX,
             "a sandbox with a capture in flight must never be reaped (issue #570)",
         );
     }
 
     #[tokio::test]
-    async fn unowned_idle_sandbox_is_still_reaped_when_no_capture() {
-        // The exemption is scoped: a genuinely-unowned sandbox with NO
-        // capture in flight is still reaped after the strike debounce — the
-        // fix must not blunt the reconciler's real job.
+    async fn locally_bound_sandbox_is_never_reaped_by_polling() {
+        // ADR 0116 A5: a bound sandbox is owned until its tombstone
+        // arrives — the coordinator's "no owner" poll answer no longer
+        // reaps it (the retired bound arm did).
         assert_eq!(
-            ticks_to_destroy(false).await,
-            ORPHAN_STRIKES as usize,
-            "an unowned sandbox with no capture must reap after the strikes",
+            ticks_to_destroy(false, true).await,
+            usize::MAX,
+            "a locally bound sandbox must never be reaped by the poll",
+        );
+    }
+
+    #[tokio::test]
+    async fn unbound_confirmed_orphan_reaps_after_the_age_grace() {
+        // The reconciler's real job survives: an unbound sandbox the
+        // coordinator confirms nobody owns is reaped once the
+        // create->bind age grace clears (tick 3 at the real cadence).
+        assert_eq!(
+            ticks_to_destroy(false, false).await,
+            3,
+            "an unbound confirmed orphan reaps at the first post-grace tick",
         );
     }
 }

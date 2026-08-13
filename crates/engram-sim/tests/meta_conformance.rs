@@ -1211,6 +1211,74 @@ async fn sandbox_tombstones(ctx: &Ctx) {
         .await
         .unwrap()
         .is_empty());
+
+    // ADR 0116 A5 rebind-supersede: rebinding a session onto a fresh
+    // sandbox entombs the superseded one in the same write.
+    let sid2 = meta.create_session(spec("conf:rebind")).await.unwrap();
+    meta.assign_session_host(sid2, Some(host)).await.unwrap();
+    let old_sb = engram_core::SandboxId::new();
+    meta.transition_session_created(sid2, old_sb).await.unwrap();
+    let new_sb = engram_core::SandboxId::new();
+    meta.rebind_session_guarded(sid2, host, new_sb, Some(Some(old_sb)), &[])
+        .await
+        .unwrap();
+    assert!(
+        meta.sandbox_tombstones_for_host(host)
+            .await
+            .unwrap()
+            .contains(&old_sb),
+        "a rebind entombs the superseded binding"
+    );
+    meta.ack_sandbox_tombstones_by_absence(host, &[])
+        .await
+        .unwrap();
+
+    // ADR 0116 A5 lost-destroy leftover: a running sandbox NO session
+    // binds is sighted, spared inside the grace, and entombed once the
+    // sighting is stable past it; a BOUND running sandbox never is.
+    let ghost = engram_core::SandboxId::new();
+    let entombed = meta
+        .entomb_stably_unbound(host, &[ghost, new_sb], 30)
+        .await
+        .unwrap();
+    assert!(entombed.is_empty(), "a fresh sighting is inside the grace");
+    ctx.clock.advance(Duration::from_secs(31));
+    let entombed = meta
+        .entomb_stably_unbound(host, &[ghost, new_sb], 30)
+        .await
+        .unwrap();
+    assert_eq!(
+        entombed,
+        vec![ghost],
+        "stably unbound graduates; bound never"
+    );
+    assert!(meta
+        .sandbox_tombstones_for_host(host)
+        .await
+        .unwrap()
+        .contains(&ghost));
+    // A sighting whose sandbox becomes bound (or leaves the set) is
+    // pruned — it must NOT graduate later from a stale stamp.
+    let late_bind = engram_core::SandboxId::new();
+    let none = meta
+        .entomb_stably_unbound(host, &[late_bind], 30)
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+    let sid3 = meta.create_session(spec("conf:latebind")).await.unwrap();
+    meta.assign_session_host(sid3, Some(host)).await.unwrap();
+    meta.transition_session_created(sid3, late_bind)
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(31));
+    let none = meta
+        .entomb_stably_unbound(host, &[late_bind], 30)
+        .await
+        .unwrap();
+    assert!(
+        none.is_empty(),
+        "a now-bound sandbox is pruned, never entombed"
+    );
 }
 
 /// Dead-host lease: acquire, contest, claimant-guarded release, stale

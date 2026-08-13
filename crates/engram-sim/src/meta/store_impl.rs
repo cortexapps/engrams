@@ -921,6 +921,50 @@ impl MetadataStore for SimMetadataStore {
         Ok(())
     }
 
+    /// ADR 0116 A5: exactly the `entomb_stably_unbound` transaction —
+    /// prune, stamp, graduate.
+    async fn entomb_stably_unbound(
+        &self,
+        host_id: HostId,
+        running: &[engram_core::SandboxId],
+        grace_secs: u64,
+    ) -> Result<Vec<engram_core::SandboxId>, MetaError> {
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let bound: std::collections::BTreeSet<engram_core::SandboxId> = db
+            .sessions
+            .values()
+            .filter_map(|r| r.session.sandbox_id)
+            .collect();
+        let unbound: Vec<engram_core::SandboxId> = running
+            .iter()
+            .copied()
+            .filter(|s| !bound.contains(s))
+            .collect();
+        db.sandbox_unbound_sightings
+            .retain(|(h, s), _| *h != host_id || unbound.contains(s));
+        for s in &unbound {
+            db.sandbox_unbound_sightings
+                .entry((host_id, *s))
+                .or_insert(now);
+        }
+        let cutoff = now - chrono::Duration::seconds(grace_secs as i64);
+        let graduated: Vec<engram_core::SandboxId> = db
+            .sandbox_unbound_sightings
+            .iter()
+            .filter(|((h, _), first)| *h == host_id && **first <= cutoff)
+            .map(|((_, s), _)| *s)
+            .collect();
+        for s in &graduated {
+            db.sandbox_unbound_sightings.remove(&(host_id, *s));
+            db.sandbox_tombstones
+                .entry((host_id, *s))
+                .or_insert((None, now));
+        }
+        Ok(graduated)
+    }
+
     async fn sandbox_tombstones_for_host(
         &self,
         host_id: HostId,
@@ -4133,6 +4177,10 @@ impl MetadataStore for SimMetadataStore {
         self.gate()?;
         let now = self.now();
         let mut db = self.db.lock();
+        let mut db_tombstone_insert: Option<(
+            (HostId, SandboxId),
+            (Option<SessionId>, DateTime<Utc>),
+        )> = None;
         let Some(r) = db.sessions.get_mut(&id) else {
             return Err(MetaError::NotFound);
         };
@@ -4151,10 +4199,20 @@ impl MetadataStore for SimMetadataStore {
                 allowed_states
             )));
         }
+        // ADR 0116 A5: entomb the superseded binding in the same write —
+        // exactly the PG CTE'''s entombed leg.
+        if let (Some(old_host), Some(old_sandbox)) = (r.session.host_id, r.session.sandbox_id) {
+            if old_sandbox != sandbox_id {
+                db_tombstone_insert = Some(((old_host, old_sandbox), (Some(id), now)));
+            }
+        }
         r.session.host_id = Some(host_id);
         r.session.sandbox_id = Some(sandbox_id);
         r.missing_strikes = 0;
         r.updated_at = now;
+        if let Some((key, value)) = db_tombstone_insert {
+            db.sandbox_tombstones.entry(key).or_insert(value);
+        }
         Ok(())
     }
 

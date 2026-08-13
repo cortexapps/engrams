@@ -240,6 +240,10 @@ pub struct SimDb {
         (HostId, engram_core::SandboxId),
         (Option<SessionId>, DateTime<Utc>),
     >,
+    /// ADR 0116 A5 `sandbox_unbound_sightings`: (host, sandbox) ->
+    /// first_seen_at. The lost-destroy debounce.
+    pub sandbox_unbound_sightings:
+        std::collections::BTreeMap<(HostId, engram_core::SandboxId), DateTime<Utc>>,
     pub runtime_specs:
         std::collections::BTreeMap<SessionId, engram_core::types::runtime_spec::RuntimeSpec>,
     pub session_capabilities:

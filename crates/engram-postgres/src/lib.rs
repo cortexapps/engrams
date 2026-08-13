@@ -3978,12 +3978,34 @@ impl MetadataStore for PostgresStore {
         let expected_uuid = expected_current.map(|o| o.map(|s| s.as_uuid()));
         // Issue #215: re-keying onto a fresh sandbox clears the stale
         // reconcile strike streak (see `assign_session_sandbox`).
+        // ADR 0116 A5: a rebind SUPERSEDES the old binding without
+        // host-affirmed absence — the superseded sandbox gets its
+        // tombstone in the SAME statement (the A4 discipline; without it
+        // the old VM would have no destroy channel now that the teardown
+        // poll'''s bound arm is retired).
         let n = sqlx::query(
             r#"
-            UPDATE sessions SET host_id = $2, sandbox_id = $3, missing_strikes = 0, updated_at = $7
-            WHERE id = $1
-              AND ($4::text[] IS NULL OR status = ANY($4))
-              AND ($5::boolean IS FALSE OR sandbox_id IS NOT DISTINCT FROM $6)
+            WITH prior AS (
+                SELECT id, host_id AS old_host, sandbox_id AS old_sandbox
+                  FROM sessions
+                 WHERE id = $1
+                   AND ($4::text[] IS NULL OR status = ANY($4))
+                   AND ($5::boolean IS FALSE OR sandbox_id IS NOT DISTINCT FROM $6)
+                   FOR UPDATE
+            ),
+            entombed AS (
+                INSERT INTO sandbox_tombstones (host_id, sandbox_id, session_id, created_at)
+                SELECT p.old_host, p.old_sandbox, p.id, $7
+                  FROM prior p
+                 WHERE p.old_sandbox IS NOT NULL
+                   AND p.old_sandbox <> $3
+                   AND p.old_host IS NOT NULL
+                ON CONFLICT (host_id, sandbox_id) DO NOTHING
+            )
+            UPDATE sessions s
+               SET host_id = $2, sandbox_id = $3, missing_strikes = 0, updated_at = $7
+              FROM prior p
+             WHERE s.id = p.id
             "#,
         )
         .bind(id.as_uuid())
@@ -4424,6 +4446,62 @@ impl MetadataStore for PostgresStore {
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn entomb_stably_unbound(
+        &self,
+        host_id: HostId,
+        running: &[SandboxId],
+        grace_secs: u64,
+    ) -> Result<Vec<SandboxId>, MetaError> {
+        // ADR 0116 A5: one transaction — prune stale sightings, stamp
+        // current unbound ones, graduate the stably-unbound to
+        // tombstones. `bound` is the global binding check (sandbox ids
+        // are unique across hosts).
+        let now = self.clock.now_utc();
+        let running_uuids: Vec<uuid::Uuid> = running.iter().map(|s| s.as_uuid()).collect();
+        let rows: Vec<uuid::Uuid> = sqlx::query_scalar(
+            r#"
+            WITH unbound AS (
+                SELECT r.sandbox_id
+                  FROM unnest($2::uuid[]) AS r(sandbox_id)
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM sessions s WHERE s.sandbox_id = r.sandbox_id
+                 )
+            ),
+            pruned AS (
+                DELETE FROM sandbox_unbound_sightings
+                 WHERE host_id = $1
+                   AND sandbox_id NOT IN (SELECT sandbox_id FROM unbound)
+            ),
+            stamped AS (
+                INSERT INTO sandbox_unbound_sightings (host_id, sandbox_id, first_seen_at)
+                SELECT $1, u.sandbox_id, $3 FROM unbound u
+                ON CONFLICT (host_id, sandbox_id) DO NOTHING
+            ),
+            graduated AS (
+                DELETE FROM sandbox_unbound_sightings
+                 WHERE host_id = $1
+                   AND sandbox_id IN (SELECT sandbox_id FROM unbound)
+                   AND first_seen_at <= $3 - make_interval(secs => $4::bigint)
+                RETURNING sandbox_id
+            ),
+            entombed AS (
+                INSERT INTO sandbox_tombstones (host_id, sandbox_id, session_id, created_at)
+                SELECT $1, g.sandbox_id, NULL, $3 FROM graduated g
+                ON CONFLICT (host_id, sandbox_id) DO NOTHING
+            )
+            SELECT sandbox_id FROM graduated
+            "#,
+        )
+        .bind(host_id.as_uuid())
+        .bind(&running_uuids)
+        .bind(now)
+        .bind(grace_secs as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(SandboxId::from).collect())
     }
 
     async fn sandbox_tombstones_for_host(
