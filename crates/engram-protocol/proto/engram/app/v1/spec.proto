@@ -16,7 +16,7 @@ message SpecListItem {
   string title = 2;
   string template_name = 3;
   optional string repo = 4;
-  string lifecycle = 5; // "draft" | "published"
+  string phase = 5; // "ideation" | "drafting" | "published"
   repeated User participants = 6; // connected human collaborators
   int32 open_question_count = 7;
   // "none" | "pending" | "synced" | "failed". Ticket drafts are added by
@@ -27,8 +27,8 @@ message SpecListItem {
 }
 
 message ListSpecsRequest {
-  // "" | "all" | "draft" | "published". Empty means all.
-  string lifecycle = 1;
+  // "" | "all" | "ideation" | "drafting" | "published". Empty means all.
+  string phase = 1;
   // The page is 1-based. page_size is limited to 200. A zero page_size means
   // one page of 200. There is no list-all path.
   int32 page = 2;

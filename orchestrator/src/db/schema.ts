@@ -277,7 +277,7 @@ export const spec = pgTable(
       .notNull()
       .references(() => specTemplate.id),
     title: text("title").notNull(),
-    lifecycle: text("lifecycle").notNull(), // 'draft' | 'published'
+    phase: text("phase").notNull(), // 'ideation' | 'drafting' | 'published'
     currentDocSeq: bigint("current_doc_seq", { mode: "bigint" })
       .notNull()
       .default(sql`0`),

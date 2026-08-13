@@ -296,11 +296,13 @@ const specsIndexRoute = createRoute({
   path: "/",
   validateSearch: (search: Record<string, unknown>): StatusSearch => {
     const status = search["status"];
-    return status === "draft" || status === "published" ? { status } : {};
+    return status === "ideation" || status === "drafting" || status === "published"
+      ? { status }
+      : {};
   },
   component: SpecsList,
 });
-type StatusSearch = { status?: "draft" | "published" };
+type StatusSearch = { status?: "ideation" | "drafting" | "published" };
 const specTemplatesRoute = createRoute({
   getParentRoute: () => specsLayoutRoute,
   path: "templates",

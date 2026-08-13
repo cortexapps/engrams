@@ -21,7 +21,7 @@ import { makeSpecMemberHeaderGuard } from "./guard.ts";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export interface SpecRailMetadata {
-  lifecycle: "draft" | "published";
+  phase: "ideation" | "drafting" | "published";
   layers: SpecTemplateLayer[];
   sections: SpecTemplateSection[];
   states: ReadonlyMap<
@@ -56,7 +56,7 @@ export interface SpecRailStore {
 }
 
 interface RailTemplateRow {
-  lifecycle: string;
+  phase: string;
   layers: SpecTemplateLayer[];
   sections: SpecTemplateSection[];
 }
@@ -81,7 +81,7 @@ export class PostgresSpecRailStore implements SpecRailStore {
   async readMetadata(specId: string): Promise<SpecRailMetadata | null> {
     const [templateResult, stateResult, questionResult] = await Promise.all([
       this.pool.query<RailTemplateRow>(
-        `SELECT spec.lifecycle, template.layers, template.sections
+        `SELECT spec.phase, template.layers, template.sections
            FROM spec
            JOIN spec_template AS template ON template.id = spec.template_id
           WHERE spec.id = $1`,
@@ -105,11 +105,15 @@ export class PostgresSpecRailStore implements SpecRailStore {
     ]);
     const template = templateResult.rows[0];
     if (!template) return null;
-    if (template.lifecycle !== "draft" && template.lifecycle !== "published") {
-      throw new Error(`Spec ${specId} has an invalid lifecycle: ${template.lifecycle}`);
+    if (
+      template.phase !== "ideation" &&
+      template.phase !== "drafting" &&
+      template.phase !== "published"
+    ) {
+      throw new Error(`Spec ${specId} has an invalid phase: ${template.phase}`);
     }
     return {
-      lifecycle: template.lifecycle,
+      phase: template.phase,
       layers: template.layers,
       sections: template.sections,
       states: new Map(

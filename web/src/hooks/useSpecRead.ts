@@ -7,7 +7,7 @@ import type {
 
 import { specRequest } from "@/lib/spec-api";
 
-const DRAFT_REFETCH_INTERVAL_MS = 5_000;
+const ACTIVE_SPEC_REFETCH_INTERVAL_MS = 5_000;
 
 export { SpecRequestError } from "@/lib/spec-api";
 
@@ -52,7 +52,7 @@ export interface SpecReadResponse {
   spec: {
     id: string;
     title: string;
-    lifecycle: "draft" | "published";
+    phase: "ideation" | "drafting" | "published";
     sessionId: string | null;
     viewerIsOwner: boolean;
     publishedCheckpointId: string | null;
@@ -71,7 +71,7 @@ export function useSpecRead(specId: string) {
     queryFn: () => specRequest<SpecReadResponse>(`/specs/${encodeURIComponent(specId)}`),
     enabled: specId.length > 0,
     refetchInterval: (query) =>
-      query.state.data?.spec.lifecycle === "draft" ? DRAFT_REFETCH_INTERVAL_MS : false,
+      query.state.data?.spec.phase !== "published" ? ACTIVE_SPEC_REFETCH_INTERVAL_MS : false,
     refetchIntervalInBackground: false,
   });
 }
@@ -84,9 +84,9 @@ export function useSpecRail(specId: string) {
       (await specRequest<{ rail: SpecRail }>(`/specs/${encodeURIComponent(specId)}/rail`)).rail,
     enabled: specId.length > 0,
     refetchInterval: () =>
-      queryClient.getQueryData<SpecReadResponse>(["spec", specId])?.spec.lifecycle === "published"
+      queryClient.getQueryData<SpecReadResponse>(["spec", specId])?.spec.phase === "published"
         ? false
-        : DRAFT_REFETCH_INTERVAL_MS,
+        : ACTIVE_SPEC_REFETCH_INTERVAL_MS,
     refetchIntervalInBackground: false,
   });
 }

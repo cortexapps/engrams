@@ -92,7 +92,7 @@ class MemoryRailStore implements SpecRailStore {
 
   async readMetadata(): Promise<SpecRailMetadata | null> {
     return {
-      lifecycle: "draft",
+      phase: "drafting",
       layers: [
         { key: "intent", title: "Intent" },
         { key: "contract", title: "Contract" },
@@ -167,8 +167,8 @@ describe("spec publish with live Postgres", () => {
       // refuses to freeze a revision the spec row has already moved past.
       await pool.query(
         `INSERT INTO spec (id, org_id, owner_user_id, session_id, template_id, title,
-                           lifecycle, current_doc_seq, current_semantic_doc_seq)
-         VALUES ($1, 'test-org', $2, $3, $4, 'Org sandbox quotas', 'draft', 4, 4)`,
+                           phase, current_doc_seq, current_semantic_doc_seq)
+         VALUES ($1, 'test-org', $2, $3, $4, 'Org sandbox quotas', 'drafting', 4, 4)`,
         [id, owner, sessionId, templateId],
       );
       // Real section states: the pin transaction reads this table, not the
@@ -296,16 +296,16 @@ describe("spec publish with live Postgres", () => {
       expect(record?.artifactVersion).toBe(1);
 
       const spec = await pool!.query<{
-        lifecycle: string;
+        phase: string;
         published_checkpoint_id: string | null;
         published_by: string | null;
         published_at: Date | null;
       }>(
-        `SELECT lifecycle, published_checkpoint_id, published_by, published_at
+        `SELECT phase, published_checkpoint_id, published_by, published_at
            FROM spec WHERE id = $1`,
         [specId],
       );
-      expect(spec.rows[0]!.lifecycle).toBe("published");
+      expect(spec.rows[0]!.phase).toBe("published");
       expect(spec.rows[0]!.published_checkpoint_id).toBe(record!.checkpointId);
       expect(spec.rows[0]!.published_by).toBe(owner);
       expect(spec.rows[0]!.published_at).not.toBeNull();
@@ -370,11 +370,11 @@ describe("spec publish with live Postgres", () => {
       expect(record?.state).toBe("blocked");
       expect(record?.lastError).toBe("1 required sections are no longer settled.");
       // Nothing became immutable.
-      const spec = await pool!.query<{ lifecycle: string; published_at: Date | null }>(
-        "SELECT lifecycle, published_at FROM spec WHERE id = $1",
+      const spec = await pool!.query<{ phase: string; published_at: Date | null }>(
+        "SELECT phase, published_at FROM spec WHERE id = $1",
         [raceSpecId],
       );
-      expect(spec.rows[0]!.lifecycle).toBe("draft");
+      expect(spec.rows[0]!.phase).toBe("drafting");
       expect(spec.rows[0]!.published_at).toBeNull();
       const checkpoints = await pool!.query<{ count: number }>(
         "SELECT count(*)::int AS count FROM spec_checkpoint WHERE spec_id = $1",
@@ -430,11 +430,11 @@ describe("spec publish with live Postgres", () => {
       [otherSpecId],
     );
     expect(rows.rows[0]!.count).toBe(0);
-    const spec = await pool!.query<{ lifecycle: string }>(
-      "SELECT lifecycle FROM spec WHERE id = $1",
+    const spec = await pool!.query<{ phase: string }>(
+      "SELECT phase FROM spec WHERE id = $1",
       [otherSpecId],
     );
-    expect(spec.rows[0]!.lifecycle).toBe("draft");
+    expect(spec.rows[0]!.phase).toBe("drafting");
   });
 
   test.skipIf(!reachable)("a claim is exclusive: two drivers, one claimed row", async () => {
@@ -495,11 +495,11 @@ describe("spec publish with live Postgres", () => {
       [otherSpecId],
     );
     expect(checkpoints.rows[0]!.count).toBe(1);
-    const published = await pool!.query<{ lifecycle: string; published_checkpoint_id: string }>(
-      "SELECT lifecycle, published_checkpoint_id FROM spec WHERE id = $1",
+    const published = await pool!.query<{ phase: string; published_checkpoint_id: string }>(
+      "SELECT phase, published_checkpoint_id FROM spec WHERE id = $1",
       [otherSpecId],
     );
-    expect(published.rows[0]!.lifecycle).toBe("published");
+    expect(published.rows[0]!.phase).toBe("published");
     expect(published.rows[0]!.published_checkpoint_id).toBe(record.checkpointId);
   });
 });

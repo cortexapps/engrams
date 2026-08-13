@@ -321,7 +321,7 @@ describe("POST /api/v1/specs", () => {
         title: "Sessions lose their queued prompt after an eviction.",
         sessionId: "00000000-0000-5000-8000-0000000000bb",
         templateId: TEMPLATE_ID,
-        lifecycle: "draft",
+        phase: "ideation",
       },
     });
     expect(calls).toEqual([

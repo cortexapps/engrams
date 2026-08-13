@@ -70,13 +70,13 @@ describe("restoreSpecSection", () => {
 });
 
 describe("useSpecRead", () => {
-  it("polls a foreground draft until the server returns the published checkpoint", async () => {
+  it("polls a foreground drafting spec until the server returns the published checkpoint", async () => {
     vi.useFakeTimers();
-    const draft = specReadResponse("draft");
+    const drafting = specReadResponse("drafting");
     const published = specReadResponse("published");
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse(draft))
+      .mockResolvedValueOnce(jsonResponse(drafting))
       .mockResolvedValue(jsonResponse(published));
     vi.stubGlobal("fetch", fetchMock);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -84,22 +84,22 @@ describe("useSpecRead", () => {
       createElement(QueryClientProvider, { client: queryClient }, children);
 
     const { result } = renderHook(() => useSpecRead("spec-1"), { wrapper });
-    await vi.waitFor(() => expect(result.current.data?.spec.lifecycle).toBe("draft"));
+    await vi.waitFor(() => expect(result.current.data?.spec.phase).toBe("drafting"));
     await vi.advanceTimersByTimeAsync(5_000);
-    await vi.waitFor(() => expect(result.current.data?.spec.lifecycle).toBe("published"));
+    await vi.waitFor(() => expect(result.current.data?.spec.phase).toBe("published"));
     expect(fetchMock).toHaveBeenCalledTimes(2);
 
     queryClient.clear();
   });
 });
 
-function specReadResponse(lifecycle: "draft" | "published") {
-  const published = lifecycle === "published";
+function specReadResponse(phase: "drafting" | "published") {
+  const published = phase === "published";
   return {
     spec: {
       id: "spec-1",
       title: "Polling design",
-      lifecycle,
+      phase,
       sessionId: null,
       publishedCheckpointId: published ? "checkpoint-1" : null,
       publishedAt: published ? "2026-08-10T01:00:00.000Z" : null,
@@ -227,7 +227,7 @@ describe("setSpecSectionState", () => {
 });
 
 describe("useSpecRail", () => {
-  it("polls server state while the spec is a draft", async () => {
+  it("polls server state while the spec is drafting", async () => {
     vi.useFakeTimers();
     const first = { sections: [], completeness: { complete: 0, total: 1 } };
     const second = { sections: [], completeness: { complete: 1, total: 1 } };
@@ -237,7 +237,7 @@ describe("useSpecRail", () => {
       .mockResolvedValue(jsonResponse({ rail: second }));
     vi.stubGlobal("fetch", fetchMock);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    queryClient.setQueryData(["spec", "spec-1"], specReadResponse("draft"));
+    queryClient.setQueryData(["spec", "spec-1"], specReadResponse("drafting"));
     const wrapper = ({ children }: PropsWithChildren) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useSpecRail("spec-1"), { wrapper });

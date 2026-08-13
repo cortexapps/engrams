@@ -19,7 +19,7 @@ export interface CreatedSpec {
   title: string;
   sessionId: string;
   templateId: string;
-  lifecycle: "draft";
+  phase: "ideation";
 }
 
 export async function createSpec(input: CreateSpecInput): Promise<CreatedSpec> {

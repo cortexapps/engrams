@@ -43,7 +43,7 @@ export interface SpecPublishRecord {
 }
 
 export interface SpecPublishStatus {
-  lifecycle: "draft" | "published";
+  phase: "ideation" | "drafting" | "published";
   canPublish: boolean;
   publishedAt: string | null;
   gate: SpecPublishGate;
@@ -59,6 +59,7 @@ export type SpecPublishRefusalReason =
   | "gap_check_stale"
   | "gap_check_failed"
   | "already_published"
+  | "ideation"
   | "no_session";
 
 export interface SpecPublishRefusal {
@@ -145,10 +146,11 @@ function isRefusalReason(value: unknown): value is SpecPublishRefusalReason {
     value === "gap_check_stale" ||
     value === "gap_check_failed" ||
     value === "already_published" ||
+    value === "ideation" ||
     value === "no_session"
   );
 }
 
 function isStatus(value: unknown): value is SpecPublishStatus {
-  return typeof value === "object" && value !== null && "gate" in value && "lifecycle" in value;
+  return typeof value === "object" && value !== null && "gate" in value && "phase" in value;
 }

@@ -241,8 +241,8 @@ describe("linear sync with live Postgres", () => {
     const checkpointId = randomUUID();
     specIds.push(specId);
     await pool!.query(
-      `INSERT INTO spec (id, org_id, owner_user_id, session_id, template_id, title, lifecycle)
-       VALUES ($1, 'test-org', $2, $3, $4, 'Org sandbox quotas', 'draft')`,
+      `INSERT INTO spec (id, org_id, owner_user_id, session_id, template_id, title, phase)
+       VALUES ($1, 'test-org', $2, $3, $4, 'Org sandbox quotas', 'drafting')`,
       [specId, owner, sessionId, templateId],
     );
     await pool!.query(
@@ -252,7 +252,7 @@ describe("linear sync with live Postgres", () => {
       [checkpointId, specId, PINNED_STATE, Buffer.from([0]), NOW],
     );
     await pool!.query(
-      `UPDATE spec SET lifecycle = 'published', published_checkpoint_id = $2,
+      `UPDATE spec SET phase = 'published', published_checkpoint_id = $2,
               published_by = $3, published_at = $4, current_semantic_doc_seq = 18
         WHERE id = $1`,
       [specId, checkpointId, owner, NOW],

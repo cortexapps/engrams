@@ -44,7 +44,7 @@ vi.mock("@/hooks/useSpecRead", () => ({
       spec: {
         id: "spec-1",
         title: "Quota design",
-        lifecycle: "draft",
+        phase: "drafting",
         sessionId: null,
         viewerIsOwner: false,
         publishedCheckpointId: null,

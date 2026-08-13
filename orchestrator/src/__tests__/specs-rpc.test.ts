@@ -22,7 +22,7 @@ function makeStore(members: string[]) {
             title: "Session durability",
             templateName: "Engineering design doc",
             repo: "cortexapps/engrams",
-            lifecycle: "draft",
+            phase: "drafting",
             participants: [{ id: "alice", name: "Alice", email: "alice@example.com" }],
             activeParticipantCount: 4,
             openQuestionCount: 2,
@@ -57,15 +57,15 @@ describe("SpecService", () => {
 
   test("lists organization specs for a member who does not own them", async () => {
     const { client, listCalls } = clientFor("bob", ["alice", "bob"]);
-    const response = await client.listSpecs({ lifecycle: "draft", page: 0, pageSize: 0 });
+    const response = await client.listSpecs({ phase: "drafting", page: 0, pageSize: 0 });
 
-    expect(listCalls).toEqual([{ orgId: "org-1", lifecycle: "draft", page: 1, pageSize: 200 }]);
+    expect(listCalls).toEqual([{ orgId: "org-1", phase: "drafting", page: 1, pageSize: 200 }]);
     expect(response.totalCount).toBe(1);
     expect(response.specs[0]).toMatchObject({
       title: "Session durability",
       templateName: "Engineering design doc",
       repo: "cortexapps/engrams",
-      lifecycle: "draft",
+      phase: "drafting",
       activeParticipantCount: 4,
       openQuestionCount: 2,
       ticketSyncState: "none",

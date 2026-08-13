@@ -79,7 +79,7 @@ import { makeProductionAutomationScheduler } from "./automations/scheduler.ts";
 import { assertSweepPoliciesExhaustive } from "./sweep/policy.ts";
 import { makeSweepRuntime } from "./sweep/production.ts";
 import { getDb, getPool } from "./db/client.ts";
-import { resolveDraftSpec, resolveSpecMembership } from "./authz/resolve.ts";
+import { resolveDraftingSpec, resolveSpecMembership } from "./authz/resolve.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
 import { makeReviewStore } from "./db/reviews.ts";
 import { makeReviewTargetHydrationStore } from "./db/review-target-hydration.ts";
@@ -111,6 +111,10 @@ import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
 import { makeSpecRailRoute, PostgresSpecRailStore } from "./routes/spec-rail.ts";
 import { makeSpecBlockIterationRoute } from "./routes/spec-block-iteration.ts";
 import { makeSpecMessagesRoute, PostgresSpecMessageStore } from "./routes/spec-messages.ts";
+import {
+  makeSpecStartDraftingRoute,
+  PostgresSpecStartDraftingStore,
+} from "./routes/spec-start-drafting.ts";
 import { makeSpecEventsRoute } from "./routes/spec-events.ts";
 import { makeSpecTemplatesRoute } from "./routes/spec-templates.ts";
 import { makeSpecTemplateCatalog } from "./specs/template-catalog.ts";
@@ -374,6 +378,14 @@ app.route(
 );
 app.route(
   "/",
+  makeSpecStartDraftingRoute({
+    store: new PostgresSpecStartDraftingStore(getPool()),
+    resolveMembership: resolveSpecMembership,
+    preparePrompt: (sessionId, status) => productionSpecProjection.preparePrompt(sessionId, status),
+  }),
+);
+app.route(
+  "/",
   makeSpecEventsRoute({
     resolveMembership: resolveSpecMembership,
     resolveSessionId: (specId) => specMessageStore.resolveSessionId(specId),
@@ -518,7 +530,7 @@ const server = buildServer(
         participants: specParticipants,
         awarenessBus: specAwarenessBus,
         resolveMembership: resolveSpecMembership,
-        resolveDraft: resolveDraftSpec,
+        resolveDraft: resolveDraftingSpec,
       },
       specSyncHub,
     ),

@@ -277,7 +277,7 @@ export function makeSpecCreateStore(db: Db): SpecCreateStore {
     async insertIfAbsent(row) {
       const inserted = await db
         .insert(spec)
-        .values({ ...row, lifecycle: "draft" })
+        .values({ ...row, phase: "ideation" })
         .onConflictDoNothing()
         .returning({ id: spec.id });
       return inserted.length === 1;

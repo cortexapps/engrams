@@ -4,7 +4,7 @@ import { Code, ConnectError, type ConnectRouter } from "@connectrpc/connect";
 
 import { abilityFor } from "../authz/ability.ts";
 import { config } from "../config.ts";
-import { makeSpecListStore, type SpecLifecycle, type SpecListStore } from "../db/specs.ts";
+import { makeSpecListStore, type SpecListStore, type SpecPhase } from "../db/specs.ts";
 import { SpecService } from "../gen/engram/app/v1/spec_pb.ts";
 import { requireUser, type GetSession } from "./require.ts";
 
@@ -16,10 +16,10 @@ export interface SpecRpcDeps {
   orgId?: string;
 }
 
-function lifecycleOf(value: string): SpecLifecycle | undefined {
+function phaseOf(value: string): SpecPhase | undefined {
   if (value === "" || value === "all") return undefined;
-  if (value === "draft" || value === "published") return value;
-  throw new ConnectError("invalid lifecycle", Code.InvalidArgument);
+  if (value === "ideation" || value === "drafting" || value === "published") return value;
+  throw new ConnectError("invalid phase", Code.InvalidArgument);
 }
 
 export function registerSpecs(router: ConnectRouter, deps: SpecRpcDeps = {}): void {
@@ -34,10 +34,10 @@ export function registerSpecs(router: ConnectRouter, deps: SpecRpcDeps = {}): vo
         throw new ConnectError("not found", Code.NotFound);
       }
 
-      const lifecycle = lifecycleOf(req.lifecycle);
+      const phase = phaseOf(req.phase);
       const { rows, totalCount } = await store.list({
         orgId,
-        ...(lifecycle ? { lifecycle } : {}),
+        ...(phase ? { phase } : {}),
         page: Math.max(req.page, 1),
         pageSize: req.pageSize > 0 ? Math.min(req.pageSize, MAX_PAGE_SIZE) : MAX_PAGE_SIZE,
       });
@@ -48,7 +48,7 @@ export function registerSpecs(router: ConnectRouter, deps: SpecRpcDeps = {}): vo
           title: row.title,
           templateName: row.templateName,
           ...(row.repo ? { repo: row.repo } : {}),
-          lifecycle: row.lifecycle,
+          phase: row.phase,
           participants: row.participants,
           activeParticipantCount: row.activeParticipantCount,
           openQuestionCount: row.openQuestionCount,

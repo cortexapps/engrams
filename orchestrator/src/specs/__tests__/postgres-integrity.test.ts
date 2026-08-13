@@ -21,7 +21,7 @@ if (pool) {
 describe("spec integrity stores with live Postgres", () => {
   const templateId = randomUUID();
   const specId = randomUUID();
-  const lifecycleSpecId = randomUUID();
+  const phaseSpecId = randomUUID();
   const actorUserId = `spec-tool-actor-${randomUUID()}`;
   const samUserId = `spec-tool-sam-${randomUUID()}`;
   const duplicateSamUserId = `spec-tool-sam-duplicate-${randomUUID()}`;
@@ -37,10 +37,10 @@ describe("spec integrity stores with live Postgres", () => {
       [templateId],
     );
     await pool.query(
-      `INSERT INTO spec (id, org_id, template_id, title, lifecycle)
-       VALUES ($1, 'test-org', $2, 'Integrity test spec', 'draft'),
-              ($3, 'test-org', $2, 'Lifecycle test spec', 'draft')`,
-      [specId, templateId, lifecycleSpecId],
+      `INSERT INTO spec (id, org_id, template_id, title, phase)
+       VALUES ($1, 'test-org', $2, 'Integrity test spec', 'drafting'),
+              ($3, 'test-org', $2, 'Phase test spec', 'drafting')`,
+      [specId, templateId, phaseSpecId],
     );
     await pool.query(
       `INSERT INTO "user" (id, name, email, email_verified, created_at, updated_at)
@@ -85,7 +85,7 @@ describe("spec integrity stores with live Postgres", () => {
     if (!pool) return;
     if (reachable) {
       await pool.query("DELETE FROM spec WHERE id = ANY($1::uuid[])", [
-        [specId, lifecycleSpecId],
+        [specId, phaseSpecId],
       ]);
       await pool.query("DELETE FROM spec_template WHERE id = $1", [templateId]);
       await pool.query("DELETE FROM \"user\" WHERE id = ANY($1::text[])", [userIds]);
@@ -147,12 +147,12 @@ describe("spec integrity stores with live Postgres", () => {
   });
 
   test.skipIf(!reachable)(
-    "a state action checks lifecycle and updates list time in its transaction",
+    "a state action checks phase and updates list time in its transaction",
     async () => {
       if (!pool) throw new Error("The live Postgres pool is not available.");
       const store = new PostgresSectionStateStore(pool);
       const context = {
-        specId: lifecycleSpecId,
+        specId: phaseSpecId,
         sectionId: "context",
         sectionTitle: "Context",
         allowsNa: false,
@@ -162,7 +162,7 @@ describe("spec integrity stores with live Postgres", () => {
       const actionAt = new Date("2026-08-10T12:00:00.000Z");
       const input = {
         actionId: randomUUID(),
-        specId: lifecycleSpecId,
+        specId: phaseSpecId,
         sectionId: context.sectionId,
         requestFingerprint: "draft-context",
         expected,
@@ -175,13 +175,13 @@ describe("spec integrity stores with live Postgres", () => {
       expect((await store.persistStateAction(input)).status).toBe("stored");
       const afterAction = await pool.query<{ updated_at: Date }>(
         "SELECT updated_at FROM spec WHERE id = $1",
-        [lifecycleSpecId],
+        [phaseSpecId],
       );
       expect(afterAction.rows[0]?.updated_at).toEqual(actionAt);
 
       const publishedAt = new Date("2026-08-10T12:01:00.000Z");
-      await pool.query("UPDATE spec SET lifecycle = 'published', updated_at = $2 WHERE id = $1", [
-        lifecycleSpecId,
+      await pool.query("UPDATE spec SET phase = 'published', updated_at = $2 WHERE id = $1", [
+        phaseSpecId,
         publishedAt,
       ]);
       expect((await store.persistStateAction(input)).status).toBe("replayed");
@@ -206,7 +206,7 @@ describe("spec integrity stores with live Postgres", () => {
                 (SELECT count(*)::text FROM spec_transcript_action a WHERE a.spec_id = s.id) AS actions
            FROM spec s
           WHERE s.id = $1`,
-        [lifecycleSpecId],
+        [phaseSpecId],
       );
       expect(durable.rows[0]).toEqual({ updated_at: publishedAt, states: "1", actions: "1" });
     },

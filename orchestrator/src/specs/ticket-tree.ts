@@ -514,7 +514,7 @@ export class PostgresPinnedSpecReader implements PinnedSpecReader {
          FROM spec s
          JOIN spec_checkpoint c
            ON c.id = s.published_checkpoint_id AND c.spec_id = s.id
-        WHERE s.id = $1 AND s.lifecycle = 'published'`,
+        WHERE s.id = $1 AND s.phase = 'published'`,
       [specId],
     );
     const row = pinned.rows[0];

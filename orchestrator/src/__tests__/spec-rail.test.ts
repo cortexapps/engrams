@@ -47,7 +47,7 @@ const settleChip: SectionStateTranscriptChip = {
 
 class MemoryRailStore implements SpecRailStore {
   metadata: SpecRailMetadata = {
-    lifecycle: "draft",
+    phase: "drafting",
     layers: [
       { key: "understand", title: "Understand" },
       { key: "define", title: "Define" },
@@ -232,7 +232,7 @@ describe("spec rail routes", () => {
 
   test("lets the service replay an existing action after publish", async () => {
     const store = new MemoryRailStore();
-    store.metadata = { ...store.metadata, lifecycle: "published" };
+    store.metadata = { ...store.metadata, phase: "published" };
     const { app, transitionDeferred } = testApp({ store });
     const response = await app.request(`/api/v1/specs/${SPEC_ID}/sections/design/state`, {
       method: "POST",
@@ -246,7 +246,7 @@ describe("spec rail routes", () => {
 
   test("maps an atomic published-state rejection to a conflict", async () => {
     const store = new MemoryRailStore();
-    store.metadata = { ...store.metadata, lifecycle: "published" };
+    store.metadata = { ...store.metadata, phase: "published" };
     const transitionDeferred = mock(async () => {
       throw new SectionStateReadOnlyError();
     });
@@ -258,7 +258,7 @@ describe("spec rail routes", () => {
     });
 
     expect(response.status).toBe(409);
-    expect(await response.text()).toBe("Published specs are read-only.");
+    expect(await response.text()).toBe("Only specs in drafting can change section state.");
   });
 
   test("does not expose an undo action to a non-member", async () => {

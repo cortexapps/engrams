@@ -29,7 +29,7 @@ vi.mock("@/hooks/useSpecPublish", async (importOriginal) => {
 
 function status(overrides: Partial<SpecPublishStatus> = {}): SpecPublishStatus {
   return {
-    lifecycle: "draft",
+    phase: "drafting",
     canPublish: true,
     publishedAt: null,
     gate: {

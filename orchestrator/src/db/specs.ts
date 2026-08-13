@@ -16,7 +16,7 @@ import {
   type TaskLaunchPolicy,
 } from "./schema.ts";
 
-export type SpecLifecycle = "draft" | "published";
+export type SpecPhase = "ideation" | "drafting" | "published";
 export type TicketSyncState = "none" | "pending" | "synced" | "failed";
 
 const SPEC_PARTICIPANT_SAMPLE_SIZE = 3;
@@ -32,7 +32,7 @@ export interface SpecListRow {
   title: string;
   templateName: string;
   repo: string | null;
-  lifecycle: SpecLifecycle;
+  phase: SpecPhase;
   participants: SpecListParticipant[];
   activeParticipantCount: number;
   openQuestionCount: number;
@@ -42,7 +42,7 @@ export interface SpecListRow {
 
 export interface SpecListOptions {
   orgId: string;
-  lifecycle?: SpecLifecycle;
+  phase?: SpecPhase;
   page: number;
   pageSize: number;
 }
@@ -86,7 +86,7 @@ export function makeSpecListStore(
     async list(options) {
       const conditions = [
         eq(spec.orgId, options.orgId),
-        ...(options.lifecycle ? [eq(spec.lifecycle, options.lifecycle)] : []),
+        ...(options.phase ? [eq(spec.phase, options.phase)] : []),
       ];
       const where = and(...conditions);
       const totalRows = await db.select({ value: count() }).from(spec).where(where);
@@ -98,7 +98,7 @@ export function makeSpecListStore(
           title: spec.title,
           templateName: specTemplate.name,
           sessionId: spec.sessionId,
-          lifecycle: spec.lifecycle,
+          phase: spec.phase,
           updatedAt: spec.updatedAt,
         })
         .from(spec)
@@ -191,7 +191,7 @@ export function makeSpecListStore(
           title: row.title,
           templateName: row.templateName,
           repo: row.sessionId ? (repos.get(row.sessionId) ?? null) : null,
-          lifecycle: row.lifecycle === "published" ? "published" : "draft",
+          phase: specPhase(row.phase, row.id),
           participants: participants.get(row.id) ?? [],
           activeParticipantCount: activeParticipantCounts.get(row.id) ?? 0,
           openQuestionCount: questionCounts.get(row.id) ?? 0,
@@ -204,4 +204,9 @@ export function makeSpecListStore(
       };
     },
   };
+}
+
+function specPhase(value: string, specId: string): SpecPhase {
+  if (value === "ideation" || value === "drafting" || value === "published") return value;
+  throw new Error(`Spec ${specId} has an invalid phase: ${value}`);
 }

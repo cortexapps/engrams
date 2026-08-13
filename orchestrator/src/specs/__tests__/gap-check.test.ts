@@ -81,7 +81,7 @@ class MemoryRailStore implements SpecRailStore {
 
   async readMetadata(): Promise<SpecRailMetadata | null> {
     return {
-      lifecycle: "draft",
+      phase: "drafting",
       layers: LAYERS,
       sections: TEMPLATE_SECTIONS,
       states: this.states,

@@ -147,7 +147,7 @@ export class SpecParticipantLeaseStaleError extends Error {
 
 export class SpecDocumentReadOnlyError extends Error {
   constructor(readonly specId: string) {
-    super(`Spec ${specId} is published and read-only`);
+    super(`Spec ${specId} is not in drafting and is read-only`);
     this.name = "SpecDocumentReadOnlyError";
   }
 }
@@ -1285,21 +1285,21 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
                 updated_at = COALESCE($4::timestamptz, updated_at)
           WHERE id = $1
             AND current_doc_seq = $2
-            AND lifecycle = 'draft'
+            AND phase = 'drafting'
         RETURNING current_doc_seq, current_semantic_doc_seq`,
         [specId, expectedSeq.toString(), effects.semanticChanged ? 1 : 0, effects.at ?? null],
       );
       const next = revision.rows[0];
       if (!next) {
-        const lifecycle = await client.query<{ lifecycle: string }>(
-          `SELECT lifecycle
+        const phase = await client.query<{ phase: string }>(
+          `SELECT phase
              FROM spec
             WHERE id = $1
             FOR UPDATE`,
           [specId],
         );
         await client.query("ROLLBACK");
-        if (lifecycle.rows[0]?.lifecycle === "published") {
+        if (phase.rows[0]?.phase !== "drafting") {
           throw new SpecDocumentReadOnlyError(specId);
         }
         return null;
