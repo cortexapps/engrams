@@ -44,7 +44,7 @@ impl GcpSecretManagerCaSource {
         cert_secret: impl Into<String>,
         key_secret: impl Into<String>,
     ) -> Result<Self, SecretError> {
-        let http = reqwest::Client::builder()
+        let http = engram_tls::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| SecretError::Backend(Box::new(e)))?;

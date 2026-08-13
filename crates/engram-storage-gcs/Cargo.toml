@@ -10,16 +10,34 @@ description = "GCS BlobStorage impl. Stage 0 ships a stub returning NotImplement
 workspace = true
 
 [dependencies]
+engram-tls.workspace = true
 engram-core.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
 tracing.workspace = true
-# google-cloud-storage v0.24: ADC + STORAGE_EMULATOR_HOST support;
-# the streaming download path returns a futures Stream natively, so
-# we don't have to re-buffer on the GET side.
-google-cloud-storage = { version = "0.24", default-features = false, features = ["rustls-tls", "auth"] }
+# `gcloud-storage` is the crate we have always used. It was published as
+# `google-cloud-storage` up to 0.24; @yoshidan then donated THAT NAME to
+# Google for the official google-cloud-rust SDK and continued the same
+# codebase under `gcloud-storage`. So this is a rename, not a new
+# dependency: same `ClientConfig`/`http::objects` surface, same
+# `Client::upload_streamed_object`/`download_streamed_object`. What the
+# rename buys is reqwest 0.13 + reqwest-middleware 0.5, which is what
+# releases the injected-client pin below.
+#
+# Feature choice mirrors the workspace crypto pins exactly (see the
+# jsonwebtoken and rustls notes in the root manifest): `auth` for ADC,
+# `rustls-no-provider` so the TLS stack takes the workspace's `ring`
+# instead of pulling aws-lc-rs, `jwt-rust-crypto` so the signing backend
+# unifies with the workspace's `rust_crypto`. The crate's own default
+# feature set is `rustls-tls` + `jwt-aws-lc-rs`, which is precisely the
+# second-provider panic engram-oci documents, hence default-features = false.
+gcloud-storage = { version = "1.3", default-features = false, features = [
+    "auth",
+    "rustls-no-provider",
+    "jwt-rust-crypto",
+] }
 # The SDK accepts an injected `ClientConfig.http` — we build our own
 # tuned reqwest client (bounded connect, sized keep-alive pool,
 # pinned http1) rather than taking the SDK's untuned default. NO
@@ -29,6 +47,8 @@ google-cloud-storage = { version = "0.24", default-features = false, features = 
 # k8s resolv.conf (ndots/search/hosts) validation, never as a side
 # effect.
 reqwest = { workspace = true }
+# 0.5 is required by gcloud-storage 1.3 and requires reqwest 0.13; the
+# three move as one unit (see the `gcs-transport` group in dependabot.yml).
 reqwest-middleware = "0.5"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 

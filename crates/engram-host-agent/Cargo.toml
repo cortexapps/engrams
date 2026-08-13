@@ -31,6 +31,7 @@ name = "engram-host-agent"
 path = "src/main.rs"
 
 [dependencies]
+engram-tls.workspace = true
 engram-core.workspace = true
 engram-host-core.workspace = true
 engram-protocol.workspace = true

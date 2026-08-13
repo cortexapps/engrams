@@ -17,6 +17,7 @@ name = "engram-coordinator"
 path = "src/main.rs"
 
 [dependencies]
+engram-tls.workspace = true
 engram-core.workspace = true
 engram-protocol.workspace = true
 engram-postgres.workspace = true
