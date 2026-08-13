@@ -202,6 +202,81 @@ describe("spec blocks", () => {
     expect(sanitizeSvg(sanitized, "request-flow")).toBe(sanitized);
   });
 
+  test("keeps a Mermaid theme stylesheet scoped to the diagram's own root id", () => {
+    const sanitized = sanitizeSvg(
+      '<svg xmlns="http://www.w3.org/2000/svg" id="spec-mermaid-flow">' +
+        "<style>" +
+        "#spec-mermaid-flow{font-family:'trebuchet ms',verdana;font-size:16px;fill:#333;}" +
+        "#spec-mermaid-flow .node rect{fill:#ececff;stroke:#9370db;stroke-width:1px;}" +
+        "#spec-mermaid-flow .edgeLabel{background-color:hsl(80, 100%, 96%);text-align:center;fill:#333;}" +
+        "#spec-mermaid-flow .arrow{fill:url(#spec-mermaid-flow-grad);}" +
+        "</style>" +
+        '<rect class="node" />' +
+        "</svg>",
+      "request-flow",
+    );
+    const svg = new DOMParser().parseFromString(sanitized, "image/svg+xml");
+    const css = svg.querySelector("style")?.textContent ?? "";
+    const rootId = svg.documentElement.id;
+    expect(rootId).toMatch(/^spec-block-.*spec-mermaid-flow$/);
+    // Every kept selector anchors on the PREFIXED root id.
+    expect(css).toContain(`#${rootId} .node rect { fill: #ececff; stroke: #9370db`);
+    expect(css).toContain(`#${rootId} { font-family: 'trebuchet ms',verdana`);
+    // Unlisted properties drop without costing the rule its allowed paint.
+    expect(css).not.toContain("background-color");
+    expect(css).not.toContain("text-align");
+    expect(css).toContain(`#${rootId} .edgeLabel { fill: #333; }`);
+    // url(#…) fragments inside declarations are re-namespaced.
+    expect(css).toMatch(/\.arrow \{ fill: url\(#spec-block-.*-spec-mermaid-flow-grad\); \}/);
+    // A second pass is a fixed point.
+    expect(sanitizeSvg(sanitized, "request-flow")).toBe(sanitized);
+  });
+
+  test("drops stylesheet rules that could reach outside the block", () => {
+    const scoped = (body: string) =>
+      sanitizeSvg(
+        `<svg xmlns="http://www.w3.org/2000/svg" id="m"><style>${body}</style><rect /></svg>`,
+        "request-flow",
+      );
+    // Unanchored selectors go, anchored siblings stay.
+    const mixed = new DOMParser().parseFromString(
+      scoped("body{display:none;}#m rect{fill:red;}.sidebar{opacity:0;}#other #m{fill:red;}"),
+      "image/svg+xml",
+    );
+    const mixedCss = mixed.querySelector("style")?.textContent ?? "";
+    expect(mixedCss).toContain("rect { fill: red; }");
+    expect(mixedCss).not.toContain("display");
+    expect(mixedCss).not.toContain("sidebar");
+    expect(mixedCss).not.toContain("#other");
+    // An at-rule, an escape, a comment, or unbalanced braces drop the sheet.
+    for (const hostile of [
+      "@media screen{#m rect{fill:red;}}",
+      "@import url(x);#m rect{fill:red;}",
+      "#m rect{fill:\\72 ed;}",
+      "#m rect{/*x*/fill:red;}",
+      "#m rect{fill:red;}}orphan{",
+    ]) {
+      expect(
+        new DOMParser().parseFromString(scoped(hostile), "image/svg+xml").querySelector("style"),
+      ).toBeNull();
+    }
+    // Mermaid's ever-present @keyframes strip away without costing the sheet.
+    const keyframed = new DOMParser().parseFromString(
+      scoped("@keyframes dash{to{stroke-dashoffset:0;}}#m rect{fill:red;}"),
+      "image/svg+xml",
+    );
+    expect(keyframed.querySelector("style")?.textContent).toContain("rect { fill: red; }");
+    expect(keyframed.querySelector("style")?.textContent).not.toContain("keyframes");
+    // A root without a safe id keeps no stylesheet at all.
+    const unidentified = sanitizeSvg(
+      '<svg xmlns="http://www.w3.org/2000/svg"><style>svg{fill:red;}</style><rect /></svg>',
+      "request-flow",
+    );
+    expect(
+      new DOMParser().parseFromString(unidentified, "image/svg+xml").querySelector("style"),
+    ).toBeNull();
+  });
+
   test("rejects network-capable sources before a renderer can start a request", async () => {
     const fetch = vi.fn(() => Promise.reject(new Error("Network access is not allowed.")));
     vi.stubGlobal("fetch", fetch);

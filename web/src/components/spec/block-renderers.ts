@@ -29,6 +29,11 @@ const mermaidAdapter: SpecBlockRenderAdapter = {
       mermaid.initialize({
         startOnLoad: false,
         securityLevel: "strict",
+        // Both levels: current Mermaid reads the TOP-LEVEL flag for node
+        // labels — with only the flowchart-scoped one it still emits
+        // foreignObject HTML labels, which sanitizeSvg strips, and every
+        // node renders empty. SVG <text> labels survive the sanitizer.
+        htmlLabels: false,
         flowchart: { htmlLabels: false },
       });
       mermaidInitialized = true;
