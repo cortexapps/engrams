@@ -230,19 +230,38 @@ impl FlushHealthTracker {
     }
 }
 
-/// ADR 0116 C4: does this flush error indict the DEVICE-side data
-/// plane, as opposed to the blob tier? `DeviceSync` (host page-cache
-/// sync of `/dev/nbdN` failed) and `ShortChunk` (a fetched chunk
-/// cannot be served without reading out of bounds) mean the device is
-/// wedged and a park would freeze nothing durable. `Chunk(_)` is the
-/// blob tier — GCS throttling/outages heal on their own and must NOT
-/// quarantine the sandbox; everything else (shape/range/logic errors)
-/// likewise stays on the plain retry path.
+/// ADR 0116 C4 (#1238 review, HIGH): does this flush error mean the
+/// LOCAL durable-write plane cannot land bytes — as opposed to the
+/// blob tier? Classified by WHICH TIER failed, not by hand-picked
+/// variants:
+///
+/// - `Chunk(_)` is the blob tier — GCS throttling/outages heal on
+///   their own and must NOT quarantine the sandbox. The ONLY
+///   non-escalating class.
+/// - Everything else on the flush path means nothing durable is
+///   landing locally: `DeviceSync` (host page-cache sync of
+///   `/dev/nbdN` failed), `ShortChunk` (a chunk cannot be served
+///   in-bounds), `DirtyFile` (the dirty tier's own I/O — a read-only
+///   remount or EIO fails every 30 s tick identically, forever),
+///   `InvariantViolation` (including the poisoned tier after a freeze
+///   double-fault, which persists until process restart), and the
+///   shape/range arms that a flush should never produce (four
+///   identical consecutive ones = the same wedge). The exhaustive
+///   match makes a NEW variant a compile error, forcing the tier
+///   decision instead of silently defaulting to the warn-loop this
+///   module exists to eliminate.
 fn is_device_class(e: &DiskBackendError) -> bool {
-    matches!(
-        e,
-        DiskBackendError::DeviceSync { .. } | DiskBackendError::ShortChunk { .. }
-    )
+    match e {
+        DiskBackendError::Chunk(_) => false,
+        DiskBackendError::DeviceSync { .. }
+        | DiskBackendError::ShortChunk { .. }
+        | DiskBackendError::DirtyFile { .. }
+        | DiskBackendError::InvariantViolation(_)
+        | DiskBackendError::WrongKind(_)
+        | DiskBackendError::InvalidManifest(_)
+        | DiskBackendError::OutOfRange { .. }
+        | DiskBackendError::AdoptShape { .. } => true,
+    }
 }
 
 /// Owns the scheduler task. `Drop` aborts the task; the spawned
@@ -708,14 +727,46 @@ mod tests {
                 actual: "bb".into(),
             }
         )));
-        assert!(!is_device_class(&DiskBackendError::WrongKind(
+        // #1238 review (HIGH): local dirty-tier durability failures are
+        // device-class — a read-only remount / EIO fails every tick
+        // identically forever, and the poisoned tier
+        // (InvariantViolation) persists until process restart. Treating
+        // them as non-escalating reproduced the silent warn-loop AND
+        // reset the counter, masking interleaved device failures.
+        assert!(is_device_class(&DiskBackendError::DirtyFile {
+            operation: "freeze rename",
+            path: std::path::PathBuf::from("/var/lib/engram/dirty/9"),
+            source: std::io::Error::other("read-only file system"),
+        }));
+        assert!(is_device_class(&DiskBackendError::InvariantViolation(
+            "dirty tier poisoned by freeze double-fault".into()
+        )));
+        // Shape/range arms a flush should never produce: four identical
+        // consecutive ones are the same wedge — escalate.
+        assert!(is_device_class(&DiskBackendError::WrongKind(
             "memory".into()
         )));
-        assert!(!is_device_class(&DiskBackendError::OutOfRange {
+        assert!(is_device_class(&DiskBackendError::OutOfRange {
             offset: 8192,
             length: 4096,
             total: 4096,
         }));
+    }
+
+    /// #1238 review (HIGH), the masking half: a non-blob failure must
+    /// never RESET the consecutive count under an interleaved
+    /// device-class run. With the tier-based classifier every local
+    /// failure accumulates, so 2×DeviceSync + 2×DirtyFile fires at 4.
+    #[test]
+    fn mixed_local_failures_accumulate_to_escalation() {
+        let mut t = FlushHealthTracker::default();
+        assert!(!t.on_flush_result(true)); // DeviceSync
+        assert!(!t.on_flush_result(true)); // DirtyFile (device-class now)
+        assert!(!t.on_flush_result(true)); // DirtyFile
+        assert!(
+            t.on_flush_result(true),
+            "the 4th consecutive local failure fires"
+        );
     }
 
     type EscalationLog = Arc<Mutex<Vec<SandboxId>>>;
