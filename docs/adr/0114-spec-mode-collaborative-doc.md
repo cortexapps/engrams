@@ -351,6 +351,39 @@ not strong enough for N10, a later ADR can add one generic turn-context
 capability for all harnesses. Spec mode does not add a vendor hook, wire event,
 command, or harness bundle change.
 
+**Amendment (2026-08-12).** Two changes replace compliance-dependent freshness
+with enforced freshness, and reverse this section's no-vendor-hook call:
+
+1. **The write fence.** `expected_rev` is now required on `spec_update_section`,
+   `spec_set_section_state`, and `spec_update_block`, and it is section-scoped:
+   each `spec_update_log` row records the section ids it changed
+   (`changed_section_ids`, migration 0065), and a mutation is refused only when
+   its TARGET section changed past `expected_rev` by a writer outside the
+   agent's own session. A document-global check was rejected because live
+   co-editing advances the global revision continuously — every agent write
+   would bounce, and the model would learn to resubmit with the returned
+   revision unread, which is no fence. The fence is harness-neutral: it holds
+   even for a harness that ignores every instruction.
+2. **The digest push.** `engram-harness-sdk` gains one turn-context seam
+   (`turn_context::with_turn_context`): at the consumption boundary — the
+   moment an adapter writes a prompt to its vendor agent — it prepends the
+   digest file to the vendor-facing text, delimited as
+   `<engrams-turn-context>`. Every adapter calls it (Claude and Codex today);
+   a new harness inherits the behavior from the SDK instead of porting a
+   vendor hook. This is harness-agnostic by construction: each adapter
+   already owns its prompt queue and writes to the vendor only at turn start,
+   so the digest is read after any queue wait and a queued prompt never
+   carries a stale digest (N10). The transcript objection that rejected
+   prompt-prepending does not apply at this layer: the coordinator's
+   `role:user` message is the single source of the person's bubble, and the
+   wrapped text reaches only the vendor process. Injection is gated on the
+   session's tool manifest carrying `spec_read` — an orchestrator-controlled
+   signal — never on the digest file existing, so a repository checked out
+   into the workspace cannot plant a digest into a non-spec session's
+   prompts. The read-every-turn prompt instruction is replaced with
+   digest-guided section reads; the fence stays the correctness backstop for
+   a harness that ignores every instruction.
+
 ### D10. Checkpoints are the history model; publish pins one
 
 A checkpoint holds a compacted document state, its state vector, the rendered
