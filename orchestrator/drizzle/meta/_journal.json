@@ -477,6 +477,13 @@
       "when": 1786772800000,
       "tag": "0067_spec_template_drop_stage_flags",
       "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "7",
+      "when": 1786859200000,
+      "tag": "0068_spec_chat_message",
+      "breakpoints": true
     }
   ]
 }

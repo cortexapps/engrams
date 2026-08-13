@@ -300,6 +300,23 @@ export const spec = pgTable(
   ],
 );
 
+/** One clean human turn in the shared spec conversation. The author name is a
+ * snapshot, so account changes do not rewrite conversation history. */
+export const specChatMessage = pgTable(
+  "spec_chat_message",
+  {
+    promptId: text("prompt_id").primaryKey(),
+    specId: uuid("spec_id")
+      .notNull()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    authorUserId: text("author_user_id").references(() => user.id, { onDelete: "set null" }),
+    authorName: text("author_name").notNull(),
+    text: text("text").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("spec_chat_message_spec_created_idx").on(t.specId, t.createdAt)],
+);
+
 export const specUpdateLog = pgTable(
   "spec_update_log",
   {

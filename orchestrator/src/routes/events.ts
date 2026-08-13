@@ -24,11 +24,9 @@
  * Injectable deps for tests: see makeEventsRoute(deps).
  */
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
-import {
-  sessions as defaultSessions,
-} from "../control-plane/client.ts";
+import { sessions as defaultSessions } from "../control-plane/client.ts";
 import { makeGuard } from "./guard.ts";
 import type { GetSession, ResolveOwner } from "./guard.ts";
 
@@ -66,61 +64,70 @@ export function makeEventsRoute(deps?: EventsDeps): Hono {
     // 1. Auth + ownership check — throws HTTPException on failure.
     await guardFn(c, "read");
 
-    return streamSSE(c, async (stream) => {
-      // 2. Compute replay cursor: max(?since, Last-Event-ID).
-      //    Parse as BigInt DIRECTLY from the string — the coordinator `idx`
-      //    is int64, so a `Number(...)` round-trip would silently lose
-      //    precision past 2^53 and resolve a reconnect to the wrong idx
-      //    (replayed/skipped events). Only non-negative integer strings
-      //    qualify; negatives (`?since=-1` "from start"), floats, and
-      //    non-numeric drop out → `undefined` ≡ from the start of the log.
-      const cursors = [c.req.query("since"), c.req.header("last-event-id")]
-        .filter((v): v is string => typeof v === "string" && /^\d+$/.test(v))
-        .map((v) => BigInt(v));
-      const since = cursors.length
-        ? cursors.reduce((a, b) => (b > a ? b : a))
-        : undefined;
-
-      // 3. Open upstream server-stream. Pass the browser's AbortSignal so
-      //    a client disconnect triggers RST on the upstream gRPC stream.
-      const upstream = sessionsClient.streamEvents(
-        { sessionId: c.req.param("id"), since },
-        { signal: c.req.raw.signal },
-      );
-
-      // 4. Keepalive ping every 15 s (mirrors coordinator's axum KeepAlive).
-      const ping = setInterval(
-        () => void stream.writeSSE({ data: "", event: "ping" }),
-        15_000,
-      );
-
-      try {
-        for await (const ev of upstream) {
-          // idx is optional int64 → bigint | undefined in protobuf-es.
-          // IMPORTANT: 0n is a valid idx — check !== undefined, NOT !ev.idx.
-          const hasIdx = ev.idx !== undefined;
-          await stream.writeSSE({
-            // Only set SSE id when there is an actual idx. Lagged frames
-            // (idx unset) must NOT emit an id: line — reconnect cursors
-            // must never be disturbed by a lag notification.
-            ...(hasIdx ? { id: String(ev.idx) } : {}),
-            event: ev.kind,
-            data: JSON.stringify({
-              // Normalise to JS number (safe: event counts never exceed
-              // Number.MAX_SAFE_INTEGER in practice).
-              idx: hasIdx ? Number(ev.idx) : null,
-              kind: ev.kind,
-              payload_json: ev.payloadJson,
-            }),
-          });
-        }
-      } finally {
-        clearInterval(ping);
-      }
-    });
+    return streamSessionEventsSSE(c, c.req.param("id"), sessionsClient);
   });
 
   return app;
+}
+
+/** Stream one control-plane session with the canonical browser SSE contract. */
+export function streamSessionEventsSSE(
+  c: Context,
+  sessionId: string,
+  sessionsClient: SessionsClient,
+): Response {
+  return streamSSE(c, async (stream) => {
+    // 2. Compute replay cursor: max(?since, Last-Event-ID).
+    //    Parse as BigInt DIRECTLY from the string — the coordinator `idx`
+    //    is int64, so a `Number(...)` round-trip would silently lose
+    //    precision past 2^53 and resolve a reconnect to the wrong idx
+    //    (replayed/skipped events). Only non-negative integer strings
+    //    qualify; negatives (`?since=-1` "from start"), floats, and
+    //    non-numeric drop out → `undefined` ≡ from the start of the log.
+    const cursors = [c.req.query("since"), c.req.header("last-event-id")]
+      .filter((v): v is string => typeof v === "string" && /^\d+$/.test(v))
+      .map((v) => BigInt(v));
+    const since = cursors.length
+      ? cursors.reduce((a, b) => (b > a ? b : a))
+      : undefined;
+
+    // 3. Open upstream server-stream. Pass the browser's AbortSignal so
+    //    a client disconnect triggers RST on the upstream gRPC stream.
+    const upstream = sessionsClient.streamEvents(
+      { sessionId, since },
+      { signal: c.req.raw.signal },
+    );
+
+    // 4. Keepalive ping every 15 s (mirrors coordinator's axum KeepAlive).
+    const ping = setInterval(
+      () => void stream.writeSSE({ data: "", event: "ping" }),
+      15_000,
+    );
+
+    try {
+      for await (const ev of upstream) {
+        // idx is optional int64 → bigint | undefined in protobuf-es.
+        // IMPORTANT: 0n is a valid idx — check !== undefined, NOT !ev.idx.
+        const hasIdx = ev.idx !== undefined;
+        await stream.writeSSE({
+          // Only set SSE id when there is an actual idx. Lagged frames
+          // (idx unset) must NOT emit an id: line — reconnect cursors
+          // must never be disturbed by a lag notification.
+          ...(hasIdx ? { id: String(ev.idx) } : {}),
+          event: ev.kind,
+          data: JSON.stringify({
+            // Normalise to JS number (safe: event counts never exceed
+            // Number.MAX_SAFE_INTEGER in practice).
+            idx: hasIdx ? Number(ev.idx) : null,
+            kind: ev.kind,
+            payload_json: ev.payloadJson,
+          }),
+        });
+      }
+    } finally {
+      clearInterval(ping);
+    }
+  });
 }
 
 export default makeEventsRoute();

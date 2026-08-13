@@ -13,6 +13,40 @@ import type {
   SectionStateTranscriptAction,
 } from "../section-state-service.ts";
 import type { SectionStateValue } from "../section-state.ts";
+import type {
+  CreateSpecChatMessageInput,
+  SpecChatMessageRecord,
+  SpecMessageStore,
+} from "../../routes/spec-messages.ts";
+
+export class MemorySpecMessageStore implements SpecMessageStore {
+  sessionId: string | null = null;
+  readonly rows: SpecChatMessageRecord[] = [];
+  now = () => new Date();
+
+  async resolveSessionId(): Promise<string | null> {
+    return this.sessionId;
+  }
+
+  async insertMessage(input: CreateSpecChatMessageInput): Promise<void> {
+    this.rows.push({ ...input, createdAt: this.now() });
+  }
+
+  async listMessages(
+    specId: string,
+    after: Date | undefined,
+    limit: number,
+  ): Promise<SpecChatMessageRecord[]> {
+    return this.rows
+      .filter((row) => row.specId === specId && (!after || row.createdAt > after))
+      .sort(
+        (left, right) =>
+          left.createdAt.getTime() - right.createdAt.getTime() ||
+          left.promptId.localeCompare(right.promptId),
+      )
+      .slice(0, limit);
+  }
+}
 
 export class MemorySectionStore implements SectionStateStore {
   readonly values = new Map<string, SectionStateValue>();

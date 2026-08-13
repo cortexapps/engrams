@@ -241,6 +241,7 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
         title: record.title,
         lifecycle: record.lifecycle,
         sessionId: record.ownerUserId === userId ? record.sessionId : null,
+        viewerIsOwner: record.ownerUserId === userId,
         publishedCheckpointId: record.publishedCheckpointId,
         publishedAt: record.publishedAt?.toISOString() ?? null,
         revision: record.currentSemanticDocSeq.toString(),

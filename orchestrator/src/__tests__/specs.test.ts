@@ -156,6 +156,7 @@ describe("spec read routes", () => {
         title: string;
         lifecycle: string;
         sessionId: string | null;
+        viewerIsOwner: boolean;
         publishedCheckpointId: string;
         publishedAt: string;
         revision: string;
@@ -169,6 +170,7 @@ describe("spec read routes", () => {
       title: "Checkpoint-safe restore",
       lifecycle: "published",
       sessionId: null,
+      viewerIsOwner: false,
       publishedCheckpointId: PINNED_ID,
       publishedAt: "2026-08-10T01:00:00.000Z",
       revision: "3",
@@ -224,13 +226,17 @@ describe("spec read routes", () => {
     expect(ownerResponse.status).toBe(200);
     expect((await ownerResponse.json()).spec).toMatchObject({
       sessionId: "session-that-must-not-boot",
+      viewerIsOwner: true,
       revision: "3",
     });
 
     const collaborator = testApp({ readStore, userId: "member-2" });
     const collaboratorResponse = await collaborator.app.request(`/api/v1/specs/${SPEC_ID}`);
     expect(collaboratorResponse.status).toBe(200);
-    expect((await collaboratorResponse.json()).spec.sessionId).toBeNull();
+    expect((await collaboratorResponse.json()).spec).toMatchObject({
+      sessionId: null,
+      viewerIsOwner: false,
+    });
   });
 
   test("a draft restore creates a checkpoint and applies a forward edit", async () => {
