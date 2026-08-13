@@ -31,8 +31,8 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key};
 use async_trait::async_trait;
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 
 pub mod providers;
 
@@ -91,16 +91,25 @@ impl<'a> CredCipher<'a> {
     /// AES-256-GCM, wrap the DEK with the KEK, and tag the result
     /// with the active KEK's `key_id`.
     pub async fn seal(&self, plaintext: &[u8]) -> Result<SealedCred, CryptoError> {
-        // OsRng is `Send` (unit struct around the OS RNG). We avoid
-        // `thread_rng()` here because it returns a `!Send` handle,
+        // SysRng is `Send` (unit struct around the OS RNG). We avoid
+        // `rand::rng()` here because it returns a `!Send` handle,
         // which would poison the future with `!Send` and break axum
         // handlers that hold a `CredCipher` across an await point.
-        let mut rng = OsRng;
+        //
+        // rand 0.10 makes the OS RNG explicitly fallible: SysRng
+        // implements only `TryRng`, where 0.9's `OsRng` implemented
+        // the infallible `RngCore` and panicked internally on a failed
+        // syscall. Propagate instead — a DEK or nonce must never come
+        // from a degraded source, and both callers already handle
+        // `CryptoError`.
+        let mut rng = SysRng;
 
         let mut dek = [0u8; 32];
-        rng.fill_bytes(&mut dek);
+        rng.try_fill_bytes(&mut dek)
+            .map_err(|e| CryptoError::Provider(format!("OS RNG failed for DEK: {e}")))?;
         let mut nonce = [0u8; 12];
-        rng.fill_bytes(&mut nonce);
+        rng.try_fill_bytes(&mut nonce)
+            .map_err(|e| CryptoError::Provider(format!("OS RNG failed for nonce: {e}")))?;
 
         let cipher = Aes256Gcm::new((&dek).into());
         let ciphertext = cipher

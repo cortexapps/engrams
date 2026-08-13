@@ -27,4 +27,4 @@ wiremock = "0.6"
 # Generate a throwaway RSA key at test time rather than committing a
 # private-key fixture (keeps PEM material out of git history).
 rsa = "0.9"
-rand = "0.10"
+rand_core06.workspace = true

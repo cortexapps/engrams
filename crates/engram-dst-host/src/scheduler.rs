@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
