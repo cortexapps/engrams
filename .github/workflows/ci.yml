@@ -199,6 +199,8 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - name: Build and start the bundle
         run: |
+          python3 -m unittest discover \
+            -s deploy/bundles/integrations-cli/tests -p 'test_*.py'
           deploy/bundles/integrations-cli/build.sh --stage var/integrations-cli
           config_dir="$(mktemp -d)"
           trap 'rm -rf "$config_dir"' EXIT

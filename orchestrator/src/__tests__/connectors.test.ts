@@ -270,6 +270,23 @@ describe("parseConnector", () => {
     expect(() => parseConnector(bad, "x")).toThrow(/non-empty array/);
   });
 
+  test("rejects an inject header scoped outside the connector hosts", () => {
+    const bad = {
+      ...datadogRaw,
+      credential: {
+        source: "inject",
+        injects: [
+          {
+            header: "DD_API_KEY",
+            secretRef: "datadog-api-key",
+            hosts: ["mcp.datadoghq.com"],
+          },
+        ],
+      },
+    };
+    expect(() => parseConnector(bad, "datadog")).toThrow(/must also appear in the connector's top-level hosts/);
+  });
+
   test("rejects a mint without a kind", () => {
     const bad = { ...githubRaw, credential: { source: "mint", mint: {} } };
     expect(() => parseConnector(bad, "x")).toThrow(/mint.kind/);
@@ -754,15 +771,42 @@ describe("on-disk registry", () => {
     expect(reg.get("datadog")!.userCredential).toBeUndefined();
   });
 
-  test("the shipped datadog connector compiles BOTH pup injects (api + app key)", () => {
+  test("the shipped datadog connector scopes REST and MCP header spellings to their hosts", () => {
     const policy = compileIntegrationPolicy(["datadog:metrics:read"]);
     // metrics:read activates several ops (query, metric metadata, v2 query); each
     // emits one inject per header (DD-API-KEY + DD-APPLICATION-KEY) gated to that
     // op's path — so assert on the unique header/secret SET, not the entry count.
     const headers = [...new Set(policy.injects.map((i) => i.header_name))].sort();
-    expect(headers).toEqual(["DD-API-KEY", "DD-APPLICATION-KEY"]);
+    expect(headers).toEqual(["DD-API-KEY", "DD-APPLICATION-KEY", "DD_API_KEY", "DD_APPLICATION_KEY"]);
     const refs = [...new Set(policy.injects.map((i) => i.secret_ref))].sort();
     expect(refs).toEqual(["datadog-api-key", "datadog-app-key"]);
+    const apiHeaders = new Set(
+      policy.injects
+        .filter((i) => i.hosts.includes("api.datadoghq.com"))
+        .map((i) => i.header_name),
+    );
+    expect([...apiHeaders].sort()).toEqual(["DD-API-KEY", "DD-APPLICATION-KEY"]);
+    const mcpHeaders = new Set(
+      policy.injects
+        .filter((i) => i.hosts.includes("mcp.datadoghq.com"))
+        .map((i) => i.header_name),
+    );
+    expect([...mcpHeaders].sort()).toEqual(["DD_API_KEY", "DD_APPLICATION_KEY"]);
+  });
+
+  test("the shipped datadog powers authorize span aggregation and only the profiling MCP toolset", () => {
+    const apm = compileIntegrationPolicy(["datadog:apm:read"]);
+    expect(
+      apm.injects.some(
+        (i) => i.hosts.includes("api.datadoghq.com") && i.path_globs.includes("/api/v2/spans/analytics/aggregate"),
+      ),
+    ).toBe(true);
+
+    const profiling = compileIntegrationPolicy(["datadog:profiling:read"]);
+    const mcp = profiling.injects.filter((i) => i.hosts.includes("mcp.datadoghq.com"));
+    expect([...new Set(mcp.map((i) => i.header_name))].sort()).toEqual(["DD_API_KEY", "DD_APPLICATION_KEY"]);
+    expect(mcp.every((i) => i.methods.includes("POST"))).toBe(true);
+    expect(mcp.every((i) => i.path_globs[0] === "/api/unstable/mcp-server/mcp?toolsets=profiling")).toBe(true);
   });
 
   test("the shipped github issues:write compiles minted injects + issue observes (REST + GraphQL)", () => {
@@ -1300,7 +1344,13 @@ describe("cli facet (ADR 0058)", () => {
     expect(plan.dummyEnv.GH_TOKEN).toBeUndefined();
     expect(plan.dummyEnv.DD_API_KEY).toBe("x-engrams-managed");
     expect(plan.dummyEnv.DD_APP_KEY).toBe("x-engrams-managed");
-    expect(plan.enabled.find((e) => e.provider === "datadog")?.bins).toEqual(["pup"]);
+    expect(plan.enabled.find((e) => e.provider === "datadog")?.bins).toEqual(["pup", "datadog"]);
+    expect(plan.enabled.find((e) => e.provider === "datadog")?.doc).toMatch(
+      /Use `datadog profiling` for allocations/,
+    );
+    expect(plan.enabled.find((e) => e.provider === "datadog")?.doc).toMatch(
+      /do not present them as trace, endpoint, or stack attribution/,
+    );
     expect(plan.bundles).toEqual([INTEGRATIONS_CLI_BUNDLE]);
     // gh's doc carries the PR-open guidance.
     expect(plan.enabled.find((e) => e.provider === "github")?.doc).toMatch(/gh pr create/);

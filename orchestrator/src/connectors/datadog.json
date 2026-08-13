@@ -4,17 +4,35 @@
   "display": {
     "name": "Datadog",
     "category": "Observability",
-    "blurb": "Query and manage Datadog — logs, metrics, monitors, dashboards, events, incidents, SLOs, hosts, APM traces, plus CI Visibility & Test Optimization (pipelines + flaky tests) — via the `pup` agent CLI. Both keys are brokered at the egress proxy, never seen by the agent.",
+    "blurb": "Query and manage Datadog through `pup` plus the engrams-owned `datadog` REST and Continuous Profiler CLI. Both keys are brokered at the egress proxy, never seen by the agent.",
     "icon": { "mono": "DD", "color": "#632ca6" }
   },
   "credential": {
     "source": "inject",
     "injects": [
-      { "header": "DD-API-KEY", "secretRef": "datadog-api-key" },
-      { "header": "DD-APPLICATION-KEY", "secretRef": "datadog-app-key" }
+      {
+        "header": "DD-API-KEY",
+        "secretRef": "datadog-api-key",
+        "hosts": ["api.datadoghq.com"]
+      },
+      {
+        "header": "DD-APPLICATION-KEY",
+        "secretRef": "datadog-app-key",
+        "hosts": ["api.datadoghq.com"]
+      },
+      {
+        "header": "DD_API_KEY",
+        "secretRef": "datadog-api-key",
+        "hosts": ["mcp.datadoghq.com"]
+      },
+      {
+        "header": "DD_APPLICATION_KEY",
+        "secretRef": "datadog-app-key",
+        "hosts": ["mcp.datadoghq.com"]
+      }
     ]
   },
-  "hosts": ["api.datadoghq.com"],
+  "hosts": ["api.datadoghq.com", "mcp.datadoghq.com"],
   "test": { "path": "/api/v1/dashboard" },
   "operations": [
     {
@@ -141,6 +159,17 @@
       "match": { "method": "POST", "path": "/api/v2/spans/events/search" }
     },
     {
+      "grants": ["apm:read"],
+      "match": { "method": "POST", "path": "/api/v2/spans/analytics/aggregate" }
+    },
+    {
+      "grants": ["profiling:read"],
+      "match": {
+        "method": "POST",
+        "path": "/api/unstable/mcp-server/mcp?toolsets=profiling"
+      }
+    },
+    {
       "grants": ["notebooks:read"],
       "match": { "method": "GET", "path": "/api/v1/notebooks*" }
     },
@@ -211,8 +240,8 @@
     }
   ],
   "cli": {
-    "bins": ["pup"],
+    "bins": ["pup", "datadog"],
     "dummyEnv": { "DD_API_KEY": "x-engrams-managed", "DD_APP_KEY": "x-engrams-managed" },
-    "doc": "Use `pup` (the official Datadog CLI for agents) to query and manage Datadog from this session — logs, metrics, monitors, dashboards, events, incidents, SLOs, hosts, APM/traces, synthetics, and more (200+ commands across 33+ products). Authentication is automatic: `DD_API_KEY` and `DD_APP_KEY` are managed placeholders the egress proxy replaces with the real keys on requests to api.datadoghq.com. Do NOT run `pup auth login` or set real keys.\n\nEach call needs the matching power on your profile; a path your profile didn't grant is denied at the network boundary, not authenticated. Powers and what they unlock:\n- Observability read: `logs:read` (search/list logs), `metrics:read` (timeseries query + metric metadata), `monitors:read`, `dashboards:read`, `events:read`, `incidents:read`, `slos:read`, `hosts:read`, `synthetics:read`, `downtimes:read`, `apm:read` (spans/traces), `notebooks:read`, `users:read`, `tags:read`.\n- Observability write: `monitors:write` (create/update/delete + mute), `dashboards:write` (create/update/delete), `events:write` (post an event), `incidents:write` (declare/update an incident).\n- CI Visibility & Test Optimization: `ci_pipelines:read` (list/search/aggregate CI pipeline events — /api/v2/ci/pipelines/...), `ci_tests:read` (list/search/aggregate CI test events — /api/v2/ci/tests/...), `test_optimization:read` (search flaky tests via /api/v2/test/flaky-test-management/tests + read test-optimization service settings & flaky-test policies). Writes: `ci_pipelines:write` (send a pipeline event), `test_optimization:write` (update flaky-test states + modify settings/policies). Use these to triage flaky tests, slow suites, and CI pipeline failures from a session.\n\nThis profile is for the US1 site (api.datadoghq.com). Run `pup --help` to explore commands."
+    "doc": "Choose the Datadog command by the question:\n- Use `datadog profiling` for allocations, CPU profiles, flame graphs, call graphs, and profile time series.\n- Use `pup` for its broad, structured Datadog API command surface.\n- Use `datadog api <METHOD> <PATH> [JSON]` when `pup` does not expose an allowed REST endpoint or request shape.\n\nAuthentication is automatic: `DD_API_KEY` and `DD_APP_KEY` are managed placeholders that the egress proxy replaces with the real keys only on permitted requests. Do NOT run `pup auth login` or set real keys.\n\nContinuous Profiler (requires `profiling:read`, plus Datadog application-key permissions `mcp_read` and `continuous_profiler_read`):\n1. `datadog profiling tools` — list the profiling-only MCP tools and their current input schemas.\n2. `datadog profiling schema explore_profiling_flame_graph` — inspect one exact schema.\n3. `datadog profiling call get_profiling_profile_types '{...}'` — discover the profile families and sample types for a service, trace, or time range.\n4. Call `explore_profiling_flame_graph` or `get_profiling_timeseries` with the discovered allocation sample type to find high-allocation endpoints, methods, and stacks. The fixed upstream endpoint exposes only Datadog's `profiling` toolset. JVM allocation-rate metrics are service-level signals; do not present them as trace, endpoint, or stack attribution. If `profiling:read` is unavailable, report that boundary instead.\n\nRaw REST example: span aggregation is `datadog api POST /api/v2/spans/analytics/aggregate '<body>'` and requires `apm:read`. `pup traces aggregate` uses the same now-authorized path.\n\nOther powers:\n- Observability read: `logs:read`, `metrics:read`, `monitors:read`, `dashboards:read`, `events:read`, `incidents:read`, `slos:read`, `hosts:read`, `synthetics:read`, `downtimes:read`, `apm:read` (span search and aggregation), `notebooks:read`, `users:read`, `tags:read`.\n- Observability write: `monitors:write`, `dashboards:write`, `events:write`, `incidents:write`.\n- CI Visibility & Test Optimization: `ci_pipelines:read`, `ci_tests:read`, `test_optimization:read`, `ci_pipelines:write`, `test_optimization:write`.\n\nThis connector targets Datadog US1. A path or profiling endpoint that the profile did not grant is denied at the network boundary. Run `pup --help` or `datadog --help` to explore."
   }
 }

@@ -19,7 +19,8 @@
 #   bin/gh                    fetched static Go binary
 #   bin/glab                  fetched static Go binary (GitLab CLI)
 #   bin/stripe                fetched static Go binary (Stripe CLI)
-#   bin/pup                   fetched glibc Rust binary (Datadog CLI for agents)
+#   bin/pup                   fetched glibc Rust binary (broad Datadog API CLI)
+#   bin/datadog               engrams-owned Datadog REST + profiling MCP client
 #   bin/gcloud                wrapper for the pinned Google Cloud CLI archive
 #   bin/engram-tunnel         guest client for session-authorized host tunnels
 #   bin/<provider>            committed POSIX-sh + curl connector wrappers (linear,
@@ -186,6 +187,9 @@ build_tree() {
     chmod 0755 "$dest/bin/engram-tunnel"
     mkdir -p "$dest/libexec"
     cp "$here/libexec/engram_tunnel.py" "$dest/libexec/"
+    cp "$here/bin/datadog" "$dest/bin/datadog"
+    chmod 0755 "$dest/bin/datadog"
+    cp "$here/libexec/datadog.py" "$dest/libexec/"
     # The Slack CLI is a committed POSIX-sh + curl wrapper (no fetched binary):
     # auth is brokered, so it just calls the Slack Web API and the proxy injects
     # the bot token host-side.

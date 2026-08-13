@@ -296,6 +296,25 @@ P1 shipped on `adr-0058-p1-cli-integrations`. What landed, and where it simplifi
   while the guest holds only `x-engrams-managed` dummies — surfacing and fixing the egress-allow
   gap in #420 (see P3/P4 pickup note 3).
 
+- **Datadog profiling CLI bridge (2026-08-13).** `pup` 1.4.0 can search spans, but it does not
+  support Continuous Profiler. The Datadog MCP server is the supported agent surface for
+  profile types, allocation flame graphs, call graphs, and profile time series. We did not
+  enable harness-native MCP (P3/P4 remains deferred). Instead, the shared bundle now includes
+  a small engrams-owned `datadog` CLI. It is a Streamable HTTP client for the fixed
+  `?toolsets=profiling` endpoint and a generic REST client for allowed Datadog API paths. The
+  `profiling:read` power opens only that profiling toolset endpoint. The existing `apm:read`
+  power also opens the previously missing span-aggregate path. `pup` stays available for its
+  broad command surface; this avoids a large usability regression for products that the small
+  wrapper does not model.
+
+  Datadog's REST API and MCP server use different header names for the same two keys. REST uses
+  `DD-API-KEY` and `DD-APPLICATION-KEY`; MCP uses `DD_API_KEY` and `DD_APPLICATION_KEY`.
+  Connector inject entries can therefore name an optional subset of the connector's top-level
+  hosts. The compiler applies each header only to that host subset. The connect UI deduplicates
+  aliases by `secretRef`, so an administrator still enters and rotates exactly two stored keys.
+  The application key must have Datadog's `mcp_read` and `continuous_profiler_read`
+  permissions for `profiling:read` to work.
+
 **Deferred (documented, not dropped):** `in-guest-token` + the `request-signing`/SigV4 arm
 (P2); MCP facet + `--mcp-config` + headless approval (P3/P4); `binSource: uploaded`/`npx` (the
 ADR 0055 P2 binary-upload + runtime-npx paths). **Pre-merge:** the full FC-session e2e
