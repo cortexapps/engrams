@@ -278,7 +278,18 @@ vi.mock("@/hooks/useSpecRead", () => ({
   useDistillSpecNotes: () => ({ mutate: distillMutate, isPending: false }),
 }));
 
+const desktopWidth = window.innerWidth;
+
+function setWidth(pixels: number) {
+  Object.defineProperty(window, "innerWidth", {
+    configurable: true,
+    writable: true,
+    value: pixels,
+  });
+}
+
 beforeEach(() => {
+  setWidth(desktopWidth);
   view.lifecycle = "draft";
   view.sessionId = null;
   view.publishedCheckpointId = null;
@@ -549,6 +560,40 @@ describe("SpecReadPage", () => {
       },
       expect.any(Object),
     );
+  });
+
+  it("folds the rail into a tally and a flag count at 420px", async () => {
+    setWidth(420);
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    const fold = await screen.findByRole("button", {
+      name: "Spec sections. 1 of 2 complete. 1 open question.",
+    });
+    expect(fold.textContent).toContain("1/2 sections");
+    // The rail gave up its column: no tab strip, and no visible section list.
+    expect(screen.queryByRole("tab", { name: "Sections" })).toBeNull();
+    expect(screen.queryByText("Completeness")).toBeNull();
+    expect(await screen.findByLabelText("Collaborative spec canvas")).toBeTruthy();
+  });
+
+  it("confirms a section from the folded rail's sheet", async () => {
+    const user = userEvent.setup();
+    setWidth(420);
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    await user.click(await screen.findByRole("button", { name: /^Spec sections\./ }));
+    expect(await screen.findByRole("tab", { name: "Sections" })).toBeTruthy();
+
+    await user.click(await screen.findByRole("button", { name: "Confirm" }));
+
+    expect(setStateMutate).toHaveBeenCalledWith(
+      { sectionId: "design", state: "confirmed", actionId: expect.any(String) },
+      expect.any(Object),
+    );
+    // The sheet is modal, so the chip behind it is out of the accessibility
+    // tree until the reader closes the sheet.
+    await user.keyboard("{Escape}");
+    expect(await screen.findByRole("status", { name: "Design state changed" })).toBeTruthy();
   });
 
   it("attributes a checkpoint and marks its selection order", async () => {

@@ -14,6 +14,7 @@ import {
 } from "@/components/spec/SectionStateTranscriptChip";
 import { SpecGapCheckPanel } from "@/components/spec/SpecGapCheckPanel";
 import { SpecPublishControl } from "@/components/spec/SpecPublishControl";
+import { SpecRailFold } from "@/components/spec/SpecRailFold";
 import { SpecSectionRail, type SpecRailAction } from "@/components/spec/SpecSectionRail";
 import { SpecTicketSyncPanel } from "@/components/spec/SpecTicketSyncPanel";
 import { SpecTicketTree } from "@/components/spec/SpecTicketTree";
@@ -30,6 +31,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { sendPrompt as sendPromptMethod } from "@/gen/engram/app/v1/session-SessionService_connectquery";
 import {
   type SpecCheckpoint,
@@ -88,6 +90,7 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   const [focusedSectionId, setFocusedSectionId] = useState<string | null>(null);
   // Ticketize takes it the same way, and only after publish (mock 2l).
   const [ticketsOpen, setTicketsOpen] = useState(false);
+  const foldRail = useIsMobile();
   useDocumentTitle(read.data?.spec.title ?? "Tech spec");
 
   useEffect(() => {
@@ -161,6 +164,32 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
     );
   };
 
+  const railPanel = (
+    <Tabs defaultValue="sections">
+      <TabsList className="spec-rail-tabs" aria-label="Spec navigation">
+        <TabsTrigger value="sections">Sections</TabsTrigger>
+        <TabsTrigger value="checkpoints">Checkpoints</TabsTrigger>
+      </TabsList>
+      <TabsContent value="sections">
+        <SpecSectionRail
+          rail={rail.data}
+          editable={isDraft}
+          pendingSectionId={pendingSectionId}
+          focusedSectionId={focusedSectionId}
+          onAction={runSectionAction}
+        />
+      </TabsContent>
+      <TabsContent value="checkpoints">
+        <CheckpointHistory
+          checkpoints={checkpoints}
+          publishedCheckpointId={publishedId}
+          selectedIds={effectiveIds}
+          onSelect={updateSelection}
+        />
+      </TabsContent>
+    </Tabs>
+  );
+
   return (
     <main className="spec-read-page">
       <header className="spec-read-header">
@@ -226,7 +255,11 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
           </section>
         </div>
       ) : (
-        <div className={stageOpen ? "spec-read-layout is-stage" : "spec-read-layout"}>
+        <div
+          className={stageOpen ? "spec-read-layout is-stage" : "spec-read-layout"}
+          data-folded-rail={foldRail ? "true" : undefined}
+        >
+          {foldRail && <SpecRailFold rail={rail.data}>{railPanel}</SpecRailFold>}
           <section
             className="spec-read-document"
             aria-label={isDraft ? "Live spec" : "Published spec"}
@@ -360,31 +393,11 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
             {restoreNotice && <p className="spec-restore-notice">{restoreNotice}</p>}
           </section>
 
-          <aside className="spec-rail-shell" hidden={stageOpen}>
-            <Tabs defaultValue="sections">
-              <TabsList className="spec-rail-tabs" aria-label="Spec navigation">
-                <TabsTrigger value="sections">Sections</TabsTrigger>
-                <TabsTrigger value="checkpoints">Checkpoints</TabsTrigger>
-              </TabsList>
-              <TabsContent value="sections">
-                <SpecSectionRail
-                  rail={rail.data}
-                  editable={isDraft}
-                  pendingSectionId={pendingSectionId}
-                  focusedSectionId={focusedSectionId}
-                  onAction={runSectionAction}
-                />
-              </TabsContent>
-              <TabsContent value="checkpoints">
-                <CheckpointHistory
-                  checkpoints={checkpoints}
-                  publishedCheckpointId={publishedId}
-                  selectedIds={effectiveIds}
-                  onSelect={updateSelection}
-                />
-              </TabsContent>
-            </Tabs>
-          </aside>
+          {!foldRail && (
+            <aside className="spec-rail-shell" hidden={stageOpen}>
+              {railPanel}
+            </aside>
+          )}
         </div>
       )}
     </main>

@@ -15,6 +15,7 @@ import { useAuth } from "@/auth/AuthProvider";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { SpecNotesPane } from "./SpecNotesPane";
 import { SpecPresence } from "./SpecPresence";
 import { SpecSelectionBubbleMenu, type SpecSelectionActions } from "./SpecSelectionActions";
@@ -105,7 +106,14 @@ export function SpecCanvas({
   );
 }
 
-function ConnectedSpecCanvas({
+/**
+ * The canvas over an established connection.
+ *
+ * A small screen is read-and-resolve (ADR 0114 D4, R51): the WYSIWYG belongs to
+ * the desktop, so the editor mounts read-only and the writing controls go away.
+ * The connection is untouched, so the document still changes as others type.
+ */
+export function ConnectedSpecCanvas({
   connection,
   user,
   specId,
@@ -131,9 +139,11 @@ function ConnectedSpecCanvas({
     ],
     [connection.doc, connection.provider, user],
   );
+  const readOnly = useIsMobile();
   const editor = useEditor({
     extensions,
     immediatelyRender: false,
+    editable: !readOnly,
     editorProps: {
       attributes: {
         class: "spec-canvas-editor",
@@ -141,6 +151,10 @@ function ConnectedSpecCanvas({
       },
     },
   });
+  // The width can change under a mounted editor (a rotation, a resized window).
+  useEffect(() => {
+    editor?.setEditable(!readOnly);
+  }, [editor, readOnly]);
 
   const notesStage = useNotesStage(connection.doc);
   const sectionTitles = useMemo(
@@ -152,7 +166,7 @@ function ConnectedSpecCanvas({
   if (!editor) return null;
   const specDocument = (
     <>
-      {selectionActions && (
+      {selectionActions && !readOnly && (
         <SpecSelectionBubbleMenu
           editor={editor}
           doc={connection.doc}
@@ -171,6 +185,7 @@ function ConnectedSpecCanvas({
         provider={connection.provider}
         user={user}
         archived={notesStage.archived}
+        readOnly={readOnly}
         {...(notesActions === undefined || notesStage.archived
           ? {}
           : {
@@ -184,32 +199,36 @@ function ConnectedSpecCanvas({
   return (
     <div className="spec-canvas-shell">
       <div className="spec-canvas-bar">
-        <div className="spec-canvas-tools" role="toolbar" aria-label="Spec formatting">
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            onClick={() => editor.chain().focus().setNode("paragraph").run()}
-          >
-            Body
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            onClick={() => editor.chain().focus().setNode("heading", { level: 3 }).run()}
-          >
-            H3
-          </Button>
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            onClick={() => editor.chain().focus().setNode("codeBlock").run()}
-          >
-            Code
-          </Button>
-        </div>
+        {readOnly ? (
+          <p className="spec-canvas-read-only">Read-only on a small screen. The text stays live.</p>
+        ) : (
+          <div className="spec-canvas-tools" role="toolbar" aria-label="Spec formatting">
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              onClick={() => editor.chain().focus().setNode("paragraph").run()}
+            >
+              Body
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              onClick={() => editor.chain().focus().setNode("heading", { level: 3 }).run()}
+            >
+              H3
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              onClick={() => editor.chain().focus().setNode("codeBlock").run()}
+            >
+              Code
+            </Button>
+          </div>
+        )}
         <SpecPresence awareness={connection.provider.awareness} />
       </div>
       {!notesStage.present && specDocument}
