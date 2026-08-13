@@ -183,7 +183,7 @@ async fn spawn(mode: Mode, blob: Bytes) -> (SocketAddr, Registry, oneshot::Sende
     };
     let app = Router::new()
         .route("/v2/", get(v2_root))
-        .route("/v2/:repo/blobs/:digest", get(get_blob))
+        .route("/v2/{repo}/blobs/{digest}", get(get_blob))
         .with_state(reg.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

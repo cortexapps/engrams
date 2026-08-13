@@ -16,8 +16,9 @@ publish = false
 ### BEGIN HAKARI SECTION
 [dependencies]
 anstyle = { version = "1" }
+axum = { version = "0.8", features = ["macros", "ws"] }
+axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 base64 = { version = "0.22" }
-byteorder = { version = "1" }
 bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-utils = { version = "0.8" }
@@ -63,7 +64,7 @@ phf_shared = { version = "0.11" }
 pkcs8 = { version = "0.10", default-features = false, features = ["pem", "std"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 prost = { version = "0.14" }
-rand-274715c4dabd11b0 = { package = "rand", version = "0.9", default-features = false, features = ["small_rng", "thread_rng"] }
+rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8", features = ["small_rng"] }
 rand_chacha-274715c4dabd11b0 = { package = "rand_chacha", version = "0.9", default-features = false, features = ["std"] }
 rand_chacha-468e82937335b1c9 = { package = "rand_chacha", version = "0.3", default-features = false, features = ["std"] }
@@ -108,7 +109,6 @@ zeroize = { version = "1", features = ["derive"] }
 
 [build-dependencies]
 base64 = { version = "0.22" }
-byteorder = { version = "1" }
 bytes = { version = "1", features = ["serde"] }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 chrono = { version = "0.4", features = ["serde"] }
