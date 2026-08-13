@@ -3,10 +3,25 @@
   --spec-read-sheet: var(--card);
   --spec-read-rule: var(--border);
   --spec-read-faded-ink: var(--muted-foreground);
-  min-height: 100%;
-  overflow-y: auto;
+  /* An app frame, not a scrolling page: the header pins, and each of the
+     three regions scrolls internally. Sticky panes sized against 100vh can
+     never fit inside a padded scroll container that also holds a
+     variable-height header — their bottoms (the chat composer, the rail
+     tail) end past the fold at every scroll position. */
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
   padding: clamp(1.25rem, 3vw, 2.5rem);
   background: var(--background);
+}
+
+/* The small screen stacks the regions, so the page is the scroller again. */
+.spec-read-page:has(.spec-read-layout[data-folded-rail="true"]) {
+  display: block;
+  height: auto;
+  min-height: 100%;
+  overflow-y: auto;
 }
 
 .spec-read-header,
@@ -19,6 +34,8 @@
 
 .spec-read-header {
   max-width: 96rem;
+  width: 100%;
+  flex-shrink: 0;
   align-items: flex-end;
   justify-content: space-between;
   gap: 2rem;
@@ -95,14 +112,28 @@
 
 .spec-read-layout {
   max-width: 96rem;
-  align-items: flex-start;
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  align-items: stretch;
   gap: 1rem;
   margin: 0 auto;
+}
+
+.spec-read-layout[data-folded-rail="true"] {
+  flex: none;
+  align-items: flex-start;
 }
 
 .spec-read-document {
   min-width: 0;
   flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.spec-read-layout[data-folded-rail="true"] .spec-read-document {
+  overflow-y: visible;
 }
 
 /* The alternatives stage takes the pane; the rail returns on the pick. */
@@ -110,11 +141,50 @@
   display: none;
 }
 
+/* The chat rail: the owner's conversation with the drafting agent, the first
+   of the brief's three regions. A definite height (not max-height) keeps the
+   thread's composer pinned to the bottom of the shell. */
+.spec-chat-shell {
+  display: flex;
+  flex-direction: column;
+  width: min(26rem, 30vw);
+  height: 100%;
+  overflow: hidden;
+  border: 1px solid var(--spec-read-rule);
+  border-radius: var(--radius);
+  background: var(--spec-read-sheet);
+}
+
+.spec-chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-shrink: 0;
+  padding: 0.35rem 0.5rem 0.35rem 0.85rem;
+  border-bottom: 1px solid var(--spec-read-rule);
+}
+
+.spec-chat-status {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--spec-read-faded-ink);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.spec-chat-thread {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
 .spec-rail-shell {
-  position: sticky;
-  top: 1rem;
   width: min(27rem, 34vw);
-  max-height: calc(100vh - 2rem);
+  height: 100%;
   overflow: hidden;
   border: 1px solid var(--spec-read-rule);
   border-radius: var(--radius);
@@ -123,6 +193,11 @@
 
 .spec-rail-shell [data-slot="tabs"] {
   gap: 0;
+  /* Fill the shell so the tab panel's scroller is bounded by the visible
+     box. Left to its content height, the tabs block overflows the shell's
+     hidden edge and the panel's own bottom scrolls out of reach. */
+  height: 100%;
+  min-height: 0;
 }
 
 .spec-rail-tabs {

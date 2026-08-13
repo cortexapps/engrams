@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 import type { SpecSelectionActionPayload } from "@engrams/spec-document";
 
 import { CheckpointDiff } from "@/components/spec/CheckpointDiff";
-import { LazySpecCanvas } from "@/components/spec";
+import { LazySpecCanvas, SpecChatRail } from "@/components/spec";
 import { SpecAlternatives } from "@/components/spec/SpecAlternatives";
 import {
   SectionStateTranscriptChip,
@@ -260,6 +260,15 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
           data-folded-rail={foldRail ? "true" : undefined}
         >
           {foldRail && <SpecRailFold rail={rail.data}>{railPanel}</SpecRailFold>}
+          {/* The chat rail is the first of the three regions (chat | canvas |
+              section rail). The read route returns sessionId only to the
+              owner, so this mounts exactly for the person who drives the
+              agent (R60); a small screen is read-and-resolve and skips it.
+              It stays up through the alternatives stage — the conversation
+              is how the person asks about the options. */}
+          {!foldRail && ownerSessionId && (
+            <SpecChatRail key={ownerSessionId} sessionId={ownerSessionId} />
+          )}
           <section
             className="spec-read-document"
             aria-label={isDraft ? "Live spec" : "Published spec"}
