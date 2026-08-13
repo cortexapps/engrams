@@ -147,7 +147,9 @@ describe("SpecPublishControl", () => {
     expect(screen.getByText("— drafted, not confirmed")).toBeTruthy();
     expect(screen.getByText("API surface")).toBeTruthy();
     expect(screen.getByText("— empty")).toBeTruthy();
-    expect(screen.getByText("7 of 9 ready · gap check ran 02:31 PM")).toBeTruthy();
+    // The ran-at hour follows the viewer's timezone, so the assertion must not
+    // pin one (a UTC-authored literal fails on any laptop west of Greenwich).
+    expect(screen.getByText(/^7 of 9 ready · gap check ran \d{1,2}:31\s?(AM|PM)$/)).toBeTruthy();
 
     const reviews = screen.getAllByRole("button", { name: "Review →" });
     await user.click(reviews[0]!);
