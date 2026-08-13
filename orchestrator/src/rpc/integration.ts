@@ -594,15 +594,17 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
             }
           : {
               source: "inject",
-              // ADR 0058: probe EVERY injected header. The web sends drafted
-              // values keyed by org-secret ref; a header with no draft falls
-              // back to its stored secret coordinator-side.
-              injects: c.credential.injects.map((inj) => ({
-                header: inj.header,
-                template: inj.template ?? "{}",
-                secretRef: inj.secretRef ?? "",
-                draftSecret: (inj.secretRef !== undefined ? draft[inj.secretRef] : "") ?? "",
-              })),
+              // Probe every header that applies to the test host. A connector
+              // can use different spellings on separate first-party surfaces
+              // (Datadog REST uses hyphens; its MCP server uses underscores).
+              injects: c.credential.injects
+                .filter((inj) => inj.hosts === undefined || inj.hosts.includes(host))
+                .map((inj) => ({
+                  header: inj.header,
+                  template: inj.template ?? "{}",
+                  secretRef: inj.secretRef ?? "",
+                  draftSecret: (inj.secretRef !== undefined ? draft[inj.secretRef] : "") ?? "",
+                })),
               mintProvider: "",
               oauthConnectionId: c.oauth
                 ? await connectionIdFor(c.provider, `${c.display.name} (default)`)

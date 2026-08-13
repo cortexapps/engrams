@@ -183,6 +183,37 @@ describe("parseConnectorConfig", () => {
     ]);
   });
 
+  test("shows one credential per secret when separate hosts use header aliases", () => {
+    const raw = {
+      provider: "datadog",
+      protocol: "http",
+      credential: {
+        source: "inject",
+        injects: [
+          { header: "DD-API-KEY", secretRef: "datadog-api-key", hosts: ["api.datadoghq.com"] },
+          { header: "DD_API_KEY", secretRef: "datadog-api-key", hosts: ["mcp.datadoghq.com"] },
+          {
+            header: "DD-APPLICATION-KEY",
+            secretRef: "datadog-app-key",
+            hosts: ["api.datadoghq.com"],
+          },
+          {
+            header: "DD_APPLICATION_KEY",
+            secretRef: "datadog-app-key",
+            hosts: ["mcp.datadoghq.com"],
+          },
+        ],
+      },
+      hosts: ["api.datadoghq.com", "mcp.datadoghq.com"],
+      operations: [],
+    };
+
+    expect(parseConnectorConfig(JSON.stringify(raw), "datadog").injects).toEqual([
+      { header: "DD-API-KEY", secretRef: "datadog-api-key", template: "{}" },
+      { header: "DD-APPLICATION-KEY", secretRef: "datadog-app-key", template: "{}" },
+    ]);
+  });
+
   test("malformed JSON yields an empty inject connector (no throw)", () => {
     const c = parseConnectorConfig("{not json", "x");
     expect(c.credentialSource).toBe("inject");

@@ -289,6 +289,23 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
           ...(typeof rawCli.bundle === "string" ? { bundle: rawCli.bundle } : {}),
         }
       : undefined;
+  // One stored secret can be rendered under different header spellings on
+  // separate first-party hosts (Datadog REST versus Datadog MCP). The connect
+  // and rotate sheets collect secrets, not transport aliases, so show each ref
+  // once. OAuth headers have no ref and remain distinct by header name.
+  const injects: ParsedInject[] = [];
+  const seenInjects = new Set<string>();
+  for (const inject of cred.injects ?? []) {
+    const parsed = {
+      header: inject.header ?? "",
+      secretRef: inject.secretRef ?? "",
+      template: inject.template ?? "{}",
+    };
+    const key = parsed.secretRef || `header:${parsed.header}`;
+    if (seenInjects.has(key)) continue;
+    seenInjects.add(key);
+    injects.push(parsed);
+  }
 
   return {
     provider,
@@ -303,15 +320,7 @@ export function parseConnectorConfig(configJson: string, provider: string): Pars
         color: d.icon?.color ?? defaultIconColor(provider),
       },
     },
-    ...(credentialSource === "inject"
-      ? {
-          injects: (cred.injects ?? []).map((i) => ({
-            header: i.header ?? "",
-            secretRef: i.secretRef ?? "",
-            template: i.template ?? "{}",
-          })),
-        }
-      : { mintKind: cred.mint?.kind }),
+    ...(credentialSource === "inject" ? { injects } : { mintKind: cred.mint?.kind }),
     ...(oauth ? { oauth } : {}),
     capabilities,
     ...(cli ? { cli } : {}),
