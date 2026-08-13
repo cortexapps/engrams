@@ -36,7 +36,8 @@ use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::BlobStorage;
 use engram_core::types::manifest::ManifestRef;
 use engram_host_agent::disk_daemon::{
-    attach_manifest, HostNbdKernel, NbdSandboxState, NbdSlotAllocator,
+    attach_manifest, device_has_live_holder, HostNbdKernel, NbdRuntimeError, NbdSandboxState,
+    NbdSlotAllocator,
 };
 use engram_host_core::NbdKernel;
 use engram_storage_local::LocalBlobStorage;
@@ -60,11 +61,14 @@ fn device_is_free(nbd_path: &std::path::Path) -> bool {
 /// to release the device (idempotent).
 ///
 /// This used to send DISCONNECT twenty times with a fixed 200 ms sleep between
-/// them and return whatever the state was. That is both slow and unreliable:
-/// it always cost 4 s even for a free device, and DISCONNECT only *starts* the
-/// teardown, so a device still tearing down failed the CONNECT below with
-/// `EBUSY` — observed on main and on PR #1241 on 2026-08-13. The teardown is
-/// asynchronous, so the precondition has to be observed, not assumed.
+/// them and return whatever the state was: always 4 s, even for a device that
+/// was already free, and no check that the kernel had finished.
+///
+/// The wait is now observed rather than assumed. It is NOT what fixes the
+/// `EBUSY` flake seen on main and on PR #1241 on 2026-08-13 — the udev probe
+/// window described at the CONNECT below is invisible to sysfs, so the retry
+/// there is the fix. This wait covers the other half: a binding that a prior
+/// aborted run left with a live pid, which no retry could clear.
 fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
     let Some(idx) = nbd_path
         .file_name()
@@ -183,17 +187,45 @@ async fn connected_devices_reflects_kernel_ground_truth() {
         .expect("put manifest");
 
     // CONNECT + serve: a real netlink-bound /dev/nbdN with a live server.
+    //
+    // Retry on EBUSY. A DISCONNECT raises a uevent, and systemd-udevd opens the
+    // block device to probe it (blkid et al.) for a few milliseconds after.
+    // While that probe fd is open the kernel refuses a new CONNECT, and sysfs
+    // shows no pid and zero size throughout — so no amount of waiting on sysfs
+    // can close the window, and a check that passed a moment ago says nothing
+    // about the instant of the CONNECT. `device_has_live_holder` documents the
+    // same udev behavior for the production sweep, which parks and retries
+    // rather than treating one observation as final.
     let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
-    let state = attach_manifest(
-        manifest_ref,
-        cache,
-        store,
-        &pool,
-        u64::MAX,
-        /*fork=*/ false,
-    )
-    .await
-    .expect("netlink CONNECT attach");
+    let mut attached = None;
+    for attempt in 0..40 {
+        match attach_manifest(
+            manifest_ref,
+            cache.clone(),
+            store.clone(),
+            &pool,
+            u64::MAX,
+            /*fork=*/ false,
+        )
+        .await
+        {
+            Ok(state) => {
+                attached = Some(state);
+                break;
+            }
+            Err(NbdRuntimeError::Io(e))
+                if e.kind() == std::io::ErrorKind::ResourceBusy && attempt < 39 =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(e) => panic!(
+                "netlink CONNECT attach after {} attempts: {e:?} (holder {:?})",
+                attempt + 1,
+                device_has_live_holder(&nbd_path),
+            ),
+        }
+    }
+    let state = attached.expect("netlink CONNECT attach");
     let device = state.device_path().to_path_buf();
 
     // AFTER CONNECT: the device is in the inventory, with the pid + backend id
