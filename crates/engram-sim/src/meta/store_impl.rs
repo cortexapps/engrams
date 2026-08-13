@@ -3020,11 +3020,22 @@ impl MetadataStore for SimMetadataStore {
         if r.session.status != SessionState::Evicting || r.session.sandbox_id != Some(sandbox_id) {
             return Ok(None);
         }
+        // ADR 0116 A6: same-tx tombstone for the released binding —
+        // exactly the PG CTE'''s entombed leg.
+        let tombstone_key = r.session.host_id.map(|h| (h, sandbox_id));
         r.session.status = SessionState::Idle;
         r.session.sandbox_id = None;
         // The settle's lifecycle facts land under the same db lock (the
         // sim's transaction) — the settle is CAS-once, so a caller-side
         // append after it had a crash window of permanent loss.
+        if let Some(key) = tombstone_key {
+            db.sandbox_tombstones
+                .entry(key)
+                .or_insert((Some(session_id), now));
+        }
+        let Some(r) = db.sessions.get_mut(&session_id) else {
+            return Ok(None);
+        };
         let recovery_epoch = r.recovery_epoch;
         let mut indices = Vec::with_capacity(events.len());
         for (kind, payload) in events {

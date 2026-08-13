@@ -334,10 +334,11 @@ async fn run_autoscale(
 /// maintenance), where the VMs genuinely die with the node — see
 /// [`gate_drain`].
 ///
-/// The cordon stays in force across the swap so the dead-host detector (which
-/// only strikes out `ready` hosts) skips this `draining` host during its brief
-/// heartbeat gap — otherwise the gap could strike the host out and route its
-/// (reattaching) sessions to Idle out from under the successor.
+/// The cordon stays in force across the swap for scheduling only (no new
+/// placements on a mid-swap host). ADR 0116 A6: the shield against the
+/// dead-host detector is the handoff lease declared below — NOT the
+/// cordon (its legacy 10x staleness multiplier died with A3) and NOT
+/// `draining` (the production heartbeat loop hardcodes it false).
 async fn roll_node(
     client: &Client,
     spec: &HostFleetSpec,
