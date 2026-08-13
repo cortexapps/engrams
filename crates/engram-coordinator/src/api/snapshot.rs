@@ -940,9 +940,9 @@ pub(crate) async fn resume_from_created(
         FinishResumeOutcome::Active => "resumed from Created (auto-evac completion)",
         // ADR 0090: retryable, not a 200 — the resume op's backoff +
         // budget own the retry; Done here re-enqueued fresh ops forever.
-        FinishResumeOutcome::CreatedHarnessFailed(e) => {
+        FinishResumeOutcome::CreatedHarnessFailed { message, .. } => {
             return Err(ApiError::Unavailable(format!(
-                "harness start failed after resume from Created (will retry): {e}"
+                "harness start failed after resume from Created (will retry): {message}"
             )));
         }
     };
@@ -1222,9 +1222,9 @@ async fn resume_disk_only_cold_boot(
         // ADR 0090: retryable — see FinishResumeOutcome. This is the exact
         // arm behind campaign B1's wedge (relocated onto a fresh node whose
         // bundle staging lacked the harness; the loop never surfaced).
-        FinishResumeOutcome::CreatedHarnessFailed(e) => {
+        FinishResumeOutcome::CreatedHarnessFailed { message, .. } => {
             return Err(ApiError::Unavailable(format!(
-                "harness spawn failed after disk-only relocation (will retry): {e}"
+                "harness spawn failed after disk-only relocation (will retry): {message}"
             )));
         }
     };
@@ -1360,7 +1360,17 @@ fn resume_placement_label(
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum FinishResumeOutcome {
     Active,
-    CreatedHarnessFailed(String),
+    /// The harness rebuild failed and the session is parked at
+    /// `Created`. ADR 0116 B-D3: `deterministic` carries B3's typed
+    /// classification (`harness_spawn_kind_is_deterministic`) — a
+    /// deterministic failure (missing/unreadable binary) recurs on an
+    /// identical re-dispatch, so the resume verb RE-PLANS (rebuild the
+    /// binding, re-materialize) instead of burning its budget on
+    /// verbatim retries; a transient one stays in the finish retries.
+    CreatedHarnessFailed {
+        message: String,
+        deterministic: bool,
+    },
 }
 
 /// ADR 0028 A.log: rung-1 recovery rewind. Called after a coherent
@@ -1514,7 +1524,7 @@ pub async fn finish_resume_to_active(
     // (shared with the ADR 0034 Track A in-place reattach) returns `None`
     // when the manifest bundle can't load (dev-VM / process backend) — we
     // skip the agent re-attach then, same as before.
-    let mut start_agent_failed: Option<String> = None;
+    let mut start_agent_failed: Option<(String, bool)> = None;
     if let Some((agent, policy)) =
         crate::boot_materializer::materialize_snapshot_resume(state, session, new_sandbox_id)
             .await
@@ -1526,13 +1536,22 @@ pub async fn finish_resume_to_active(
             .start_agent(new_sandbox_id, agent, policy, fence)
             .await
         {
+            // ADR 0116 B-D3: classify BEFORE the type is lost — B3
+            // carried the guest's io::ErrorKind across both wires for
+            // exactly this decision.
+            let deterministic = matches!(
+                &e,
+                engram_core::SandboxError::HarnessSpawn { kind, .. }
+                    if engram_core::harness_spawn_kind_is_deterministic(kind)
+            );
             tracing::warn!(
                 session_id = %id,
                 sandbox_id = %new_sandbox_id,
                 error = %e,
+                deterministic,
                 "post-resume start_agent failed; leaving session at Created so /exec returns 409",
             );
-            start_agent_failed = Some(e.to_string());
+            start_agent_failed = Some((e.to_string(), deterministic));
         }
     }
     if let Some(err) = start_agent_failed {
@@ -1572,7 +1591,10 @@ pub async fn finish_resume_to_active(
                 )
                 .await;
         }
-        return Ok(FinishResumeOutcome::CreatedHarnessFailed(err));
+        return Ok(FinishResumeOutcome::CreatedHarnessFailed {
+            message: err.0,
+            deterministic: err.1,
+        });
     }
     let prev_for_active = crate::session_ops::transition_with_fence(
         state,
@@ -2036,9 +2058,9 @@ async fn resume_from_fc_snapshot(
     .await?;
     match outcome {
         // ADR 0090: retryable — see FinishResumeOutcome.
-        FinishResumeOutcome::CreatedHarnessFailed(e) => Err(ApiError::Unavailable(format!(
-            "harness reattach failed after snapshot resume (will retry): {e}"
-        ))),
+        FinishResumeOutcome::CreatedHarnessFailed { message, .. } => Err(ApiError::Unavailable(
+            format!("harness reattach failed after snapshot resume (will retry): {message}"),
+        )),
         FinishResumeOutcome::Active => {
             state
                 .emit(

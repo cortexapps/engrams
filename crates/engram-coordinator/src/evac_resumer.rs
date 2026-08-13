@@ -693,7 +693,7 @@ async fn run_resume_pipeline(
                 "evac-resumer: session reached Active on peer host",
             );
         }
-        Ok(FinishResumeOutcome::CreatedHarnessFailed(e)) => {
+        Ok(FinishResumeOutcome::CreatedHarnessFailed { message: e, .. }) => {
             tracing::warn!(
                 %session_id,
                 error = %e,
