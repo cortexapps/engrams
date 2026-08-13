@@ -175,29 +175,26 @@ async fn rebuild_binding(
             state.host_registry.invalidate_sandbox(sandbox_id);
         }
     }
+    // ONE atomic write (#1237 review): `Detach` clears `sandbox_id` in
+    // the same UPDATE as the Idle flip (`host_id` untouched — resume
+    // affinity preserved). The old two-write release (fenced unbind,
+    // THEN the flip) had a crash window that stranded a Created row
+    // unbound — a state no path rescues (an unbound Created routes to
+    // resume_from_created'''s Conflict guard, never back to a rebuild) —
+    // so the retry budget would terminally Fail a recoverable session.
+    // Atomicity makes that state unrepresentable.
     match state
         .services
         .meta
-        .fenced_assign_sandbox(id, ctx.epoch, None, session.host_id)
+        .fenced_transition_session(
+            id,
+            ctx.epoch,
+            SessionState::Idle,
+            BindingDisposition::Detach,
+        )
         .await
     {
-        Ok(true) => {}
-        Ok(false) => {
-            // A successor re-claimed; stop silently.
-            return OpOutcome::Done;
-        }
-        Err(e) => return OpOutcome::Retry(format!("rebuild: unbind: {e}")),
-    }
-    match crate::session_ops::transition_with_fence(
-        state,
-        id,
-        ctx.fence(),
-        SessionState::Idle,
-        BindingDisposition::RequireUnbound,
-    )
-    .await
-    {
-        Ok(prev) => {
+        Ok(Some(prev)) => {
             let _ = state
                 .emit_fenced(
                     id,
@@ -211,7 +208,12 @@ async fn rebuild_binding(
                 .await;
             OpOutcome::Retry(note.to_string())
         }
-        Err(e) => OpOutcome::Retry(format!("rebuild: idle flip: {e}")),
+        Ok(None) => {
+            // A successor re-claimed; stop silently.
+            crate::metrics::note_fenced_write();
+            OpOutcome::Done
+        }
+        Err(e) => OpOutcome::Retry(format!("rebuild: release: {e}")),
     }
 }
 
