@@ -1,59 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { Awareness } from "y-protocols/awareness";
-
-export interface HumanPresence {
-  kind: "human";
-  clientId: number;
-  id?: string;
-  name: string;
-  color: string;
-}
-
-export interface AgentPresence {
-  kind: "agent";
-  clientId: number;
-  name: string;
-  sessionId: string;
-  toolCallId: string;
-  sectionId: string;
-}
-
-export type SpecPresenceEntry = HumanPresence | AgentPresence;
-
-export function readSpecPresence(awareness: Awareness): SpecPresenceEntry[] {
-  const entries: SpecPresenceEntry[] = [];
-  for (const [clientId, state] of awareness.getStates()) {
-    if (isRecord(state.user) && typeof state.user.name === "string") {
-      entries.push({
-        kind: "human",
-        clientId,
-        ...(typeof state.user.id === "string" ? { id: state.user.id } : {}),
-        name: state.user.name,
-        color: typeof state.user.color === "string" ? state.user.color : "#64748b",
-      });
-    }
-    if (Array.isArray(state.agentPresence)) {
-      for (const agent of state.agentPresence) {
-        if (
-          isRecord(agent) &&
-          typeof agent.sectionId === "string" &&
-          typeof agent.sessionId === "string" &&
-          typeof agent.toolCallId === "string"
-        ) {
-          entries.push({
-            kind: "agent",
-            clientId,
-            name: typeof agent.name === "string" ? agent.name : "engram",
-            sectionId: agent.sectionId,
-            sessionId: agent.sessionId,
-            toolCallId: agent.toolCallId,
-          });
-        }
-      }
-    }
-  }
-  return entries;
-}
+import { readSpecPresence } from "@/components/spec-mode/section-presence";
 
 export function SpecPresence({ awareness }: { awareness: Awareness }) {
   const [revision, setRevision] = useState(0);
@@ -100,8 +47,4 @@ function initials(name: string): string {
     .slice(0, 2)
     .map((part) => part[0]?.toUpperCase())
     .join("");
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

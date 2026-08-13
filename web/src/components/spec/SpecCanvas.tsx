@@ -7,6 +7,7 @@ import { WebsocketProvider } from "y-websocket";
 import * as Y from "yjs";
 
 import { useAuth } from "@/auth/AuthProvider";
+import { collaboratorColor } from "@/components/spec-mode/collaborator-colors";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useIsMobile } from "@/hooks/use-mobile";
@@ -45,7 +46,7 @@ export function SpecCanvas({
   const user = useMemo(
     () => ({
       name: principal.display_name || principal.email,
-      color: presenceColor(principal.email),
+      color: collaboratorColor(principal.email),
     }),
     [principal.display_name, principal.email],
   );
@@ -212,11 +213,4 @@ export function createSpecProvider(
 function specSocketBase(specId: string, location: Pick<Location, "host" | "protocol">): string {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${location.host}/api/v1/specs/${encodeURIComponent(specId)}`;
-}
-
-function presenceColor(seed: string): string {
-  let hash = 0;
-  for (const character of seed) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
-  const palette = ["#2563eb", "#7c3aed", "#c2410c", "#0f766e", "#be123c", "#4f46e5"];
-  return palette[hash % palette.length]!;
 }

@@ -88,7 +88,21 @@ export const SESSION_EVENT_KINDS: readonly SessionEventKind[] = [
  * and metadata lift, and is exported for the contract test.
  */
 export function subscribeSession(sessionId: string, handlers: SseHandlers, since = -1): () => void {
-  const url = `${API_BASE}/sessions/${sessionId}/events?since=${since}`;
+  return subscribeEventFeed(
+    `${API_BASE}/sessions/${encodeURIComponent(sessionId)}/events?since=${since}`,
+    handlers,
+  );
+}
+
+/** Subscribe to the member-gated event feed for one collaborative spec. */
+export function subscribeSpec(specId: string, handlers: SseHandlers, since = -1): () => void {
+  return subscribeEventFeed(
+    `${API_BASE}/specs/${encodeURIComponent(specId)}/events?since=${since}`,
+    handlers,
+  );
+}
+
+function subscribeEventFeed(url: string, handlers: SseHandlers): () => void {
   const es = new EventSource(url);
 
   // Wire one listener per discriminant so EventSource doesn't deliver
