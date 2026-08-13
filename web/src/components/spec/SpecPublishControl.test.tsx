@@ -65,15 +65,15 @@ function blocked(): SpecPublishStatus {
           sectionId: "sec-data",
           sectionTitle: "Data model",
           layerKey: "contract",
-          state: "drafted",
-          reason: "drafted",
+          state: "proposed",
+          reason: "proposed",
         },
         {
           sectionId: "sec-api",
           sectionTitle: "API surface",
           layerKey: "contract",
-          state: "empty",
-          reason: "empty",
+          state: "open",
+          reason: "open",
         },
       ],
       openQuestions: [],
@@ -144,9 +144,9 @@ describe("SpecPublishControl", () => {
 
     expect(screen.getByText("2 required sections are not settled")).toBeTruthy();
     expect(screen.getByText("Data model")).toBeTruthy();
-    expect(screen.getByText("— drafted, not confirmed")).toBeTruthy();
+    expect(screen.getByText("— proposed, not settled")).toBeTruthy();
     expect(screen.getByText("API surface")).toBeTruthy();
-    expect(screen.getByText("— empty")).toBeTruthy();
+    expect(screen.getByText("— open")).toBeTruthy();
     // The ran-at hour follows the viewer's timezone, so the assertion must not
     // pin one (a UTC-authored literal fails on any laptop west of Greenwich).
     expect(screen.getByText(/^7 of 9 ready · gap check ran \d{1,2}:31\s?(AM|PM)$/)).toBeTruthy();

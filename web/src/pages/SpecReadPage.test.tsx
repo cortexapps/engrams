@@ -107,43 +107,28 @@ const actionPayload = (action: SpecSelectionAction): SpecSelectionActionPayload 
 
 const rail = {
   completeness: { complete: 1, total: 2 },
-  frontierSectionId: "design",
-  layers: [
+  sections: [
     {
-      key: "understand",
-      title: "Understand",
-      description: null,
-      sections: [
-        {
-          id: "context",
-          templateKey: "context",
-          title: "Context",
-          state: "confirmed" as const,
-          naReason: null,
-          allowNa: false,
-          openQuestionCount: 0,
-          provisional: false,
-          frontier: false,
-        },
-      ],
+      id: "context",
+      templateKey: "context",
+      title: "Context",
+      state: "settled" as const,
+      naReason: null,
+      allowNa: false,
+      openQuestionCount: 0,
+      settledBy: { id: "member-1", name: "Ada" },
+      stateChangedAt: "2026-08-13T08:00:00.000Z",
     },
     {
-      key: "define",
-      title: "Define",
-      description: null,
-      sections: [
-        {
-          id: "design",
-          templateKey: "design",
-          title: "Design",
-          state: "drafted" as const,
-          naReason: null,
-          allowNa: true,
-          openQuestionCount: 1,
-          provisional: false,
-          frontier: true,
-        },
-      ],
+      id: "design",
+      templateKey: "design",
+      title: "Design",
+      state: "proposed" as const,
+      naReason: null,
+      allowNa: true,
+      openQuestionCount: 1,
+      settledBy: null,
+      stateChangedAt: "2026-08-13T09:00:00.000Z",
     },
   ],
 };
@@ -153,15 +138,14 @@ const stateChip = {
   specId: "spec-1",
   sectionId: "design",
   sectionTitle: "Design",
-  before: { state: "drafted" as const, naReason: null },
-  after: { state: "confirmed" as const, naReason: null },
-  provisional: false,
+  before: { state: "proposed" as const, naReason: null },
+  after: { state: "settled" as const, naReason: null },
   undo: {
     kind: "restore_section_state" as const,
     specId: "spec-1",
     sectionId: "design",
-    expected: { state: "confirmed" as const, naReason: null },
-    restore: { state: "drafted" as const, naReason: null },
+    expected: { state: "settled" as const, naReason: null },
+    restore: { state: "proposed" as const, naReason: null },
   },
 };
 
@@ -569,16 +553,16 @@ describe("SpecReadPage", () => {
     expect(readRefetch).toHaveBeenCalledTimes(1);
   });
 
-  it("shows an undoable transcript chip after confirm-from-rail", async () => {
+  it("shows an undoable transcript chip after settle-from-rail", async () => {
     const user = userEvent.setup();
     renderWithProviders(<SpecReadPage specId="spec-1" />);
 
-    await user.click(await screen.findByRole("button", { name: "Confirm" }));
+    await user.click(await screen.findByRole("button", { name: "Settle" }));
     expect(await screen.findByRole("status", { name: "Design state changed" })).toBeTruthy();
     expect(setStateMutate).toHaveBeenCalledWith(
       {
         sectionId: "design",
-        state: "confirmed",
+        state: "settled",
         actionId: expect.any(String),
       },
       expect.any(Object),
@@ -609,7 +593,7 @@ describe("SpecReadPage", () => {
     expect(await screen.findByLabelText("Collaborative spec canvas")).toBeTruthy();
   });
 
-  it("confirms a section from the folded rail's sheet", async () => {
+  it("settles a section from the folded rail's sheet", async () => {
     const user = userEvent.setup();
     setWidth(420);
     renderWithProviders(<SpecReadPage specId="spec-1" />);
@@ -617,10 +601,10 @@ describe("SpecReadPage", () => {
     await user.click(await screen.findByRole("button", { name: /^Spec sections\./ }));
     expect(await screen.findByRole("tab", { name: "Sections" })).toBeTruthy();
 
-    await user.click(await screen.findByRole("button", { name: "Confirm" }));
+    await user.click(await screen.findByRole("button", { name: "Settle" }));
 
     expect(setStateMutate).toHaveBeenCalledWith(
-      { sectionId: "design", state: "confirmed", actionId: expect.any(String) },
+      { sectionId: "design", state: "settled", actionId: expect.any(String) },
       expect.any(Object),
     );
     // The sheet is modal, so the chip behind it is out of the accessibility

@@ -389,7 +389,7 @@ export function readSections(
       key,
       title: node.firstChild.textContent || id,
       layerKey: rule.layerKey,
-      state: metadata.states.get(id)?.state ?? "empty",
+      state: metadata.states.get(id)?.state ?? "open",
       blocks: readBlocks(node),
     });
   });

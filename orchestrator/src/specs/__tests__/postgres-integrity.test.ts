@@ -98,14 +98,14 @@ describe("spec integrity stores with live Postgres", () => {
   test.skipIf(!reachable)("only one concurrent section state action wins", async () => {
     if (!pool) throw new Error("The live Postgres pool is not available.");
     const store = new PostgresSectionStateStore(pool);
-    const expected = { state: "empty" as const, naReason: null };
+    const expected = { state: "open" as const, naReason: null };
     const sectionContext = {
       specId,
       sectionId: "requirements",
       sectionTitle: "Requirements",
       allowsNa: true,
     };
-    const drafted = transitionSectionState(expected, "drafted", sectionContext);
+    const proposed = transitionSectionState(expected, "proposed", sectionContext);
     const notApplicable = transitionSectionState(
       expected,
       "n/a",
@@ -118,11 +118,11 @@ describe("spec integrity stores with live Postgres", () => {
         actionId: randomUUID(),
         specId,
         sectionId: "requirements",
-        requestFingerprint: "drafted-command",
+        requestFingerprint: "proposed-command",
         expected,
-        next: drafted.value,
-        confirmedBy: null,
-        chip: drafted.transcriptChip,
+        next: proposed.value,
+        settledBy: null,
+        chip: proposed.transcriptChip,
         at: new Date("2026-08-09T12:00:00.000Z"),
       },
       {
@@ -132,7 +132,7 @@ describe("spec integrity stores with live Postgres", () => {
         requestFingerprint: "not-applicable-command",
         expected,
         next: notApplicable.value,
-        confirmedBy: null,
+        settledBy: null,
         chip: notApplicable.transcriptChip,
         at: new Date("2026-08-09T12:00:01.000Z"),
       },
@@ -141,7 +141,7 @@ describe("spec integrity stores with live Postgres", () => {
 
     expect(results.filter(({ status }) => status === "stored")).toHaveLength(1);
     expect(results.filter(({ status }) => status === "conflict")).toHaveLength(1);
-    expect((await store.read(specId, "requirements")).state).not.toBe("empty");
+    expect((await store.read(specId, "requirements")).state).not.toBe("open");
     const winnerIndex = results.findIndex(({ status }) => status === "stored");
     const replay = await store.persistStateAction(inputs[winnerIndex]!);
     expect(replay.status).toBe("replayed");
@@ -158,8 +158,8 @@ describe("spec integrity stores with live Postgres", () => {
         sectionTitle: "Context",
         allowsNa: false,
       };
-      const expected = { state: "empty" as const, naReason: null };
-      const drafted = transitionSectionState(expected, "drafted", context);
+      const expected = { state: "open" as const, naReason: null };
+      const proposed = transitionSectionState(expected, "proposed", context);
       const actionAt = new Date("2026-08-10T12:00:00.000Z");
       const input = {
         actionId: randomUUID(),
@@ -167,9 +167,9 @@ describe("spec integrity stores with live Postgres", () => {
         sectionId: context.sectionId,
         requestFingerprint: "draft-context",
         expected,
-        next: drafted.value,
-        confirmedBy: null,
-        chip: drafted.transcriptChip,
+        next: proposed.value,
+        settledBy: null,
+        chip: proposed.transcriptChip,
         at: actionAt,
       };
 
@@ -188,13 +188,13 @@ describe("spec integrity stores with live Postgres", () => {
       expect((await store.persistStateAction(input)).status).toBe("replayed");
 
       const otherContext = { ...context, sectionId: "design", sectionTitle: "Design" };
-      const otherDrafted = transitionSectionState(expected, "drafted", otherContext);
+      const otherProposed = transitionSectionState(expected, "proposed", otherContext);
       const rejected = await store.persistStateAction({
         ...input,
         actionId: randomUUID(),
         sectionId: otherContext.sectionId,
         requestFingerprint: "draft-design",
-        chip: otherDrafted.transcriptChip,
+        chip: otherProposed.transcriptChip,
       });
       expect(rejected.status).toBe("read_only");
       const durable = await pool.query<{

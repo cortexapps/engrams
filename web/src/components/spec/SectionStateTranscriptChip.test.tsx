@@ -12,15 +12,14 @@ const chip: SpecSectionStateChipData = {
   specId: "00000000-0000-4000-8000-000000000001",
   sectionId: "failure-modes",
   sectionTitle: "Failure modes",
-  before: { state: "empty", naReason: null },
-  after: { state: "drafted", naReason: null },
-  provisional: true,
+  before: { state: "open", naReason: null },
+  after: { state: "proposed", naReason: null },
   undo: {
     kind: "restore_section_state",
     specId: "00000000-0000-4000-8000-000000000001",
     sectionId: "failure-modes",
-    expected: { state: "drafted", naReason: null },
-    restore: { state: "empty", naReason: null },
+    expected: { state: "proposed", naReason: null },
+    restore: { state: "open", naReason: null },
   },
 };
 
@@ -31,9 +30,8 @@ describe("SectionStateTranscriptChip", () => {
     render(<SectionStateTranscriptChip chip={chip} onUndo={onUndo} />);
 
     expect(screen.getByRole("status", { name: "Failure modes state changed" }).textContent).toMatch(
-      /empty → drafted/,
+      /open → proposed/,
     );
-    expect(screen.getByText("provisional")).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: "Undo" }));
     expect(onUndo).toHaveBeenCalledOnce();
@@ -45,7 +43,6 @@ describe("SectionStateTranscriptChip", () => {
       <SectionStateTranscriptChip
         chip={{
           ...chip,
-          provisional: false,
           after: { state: "n/a", naReason: "The change has no data migration." },
         }}
         onUndo={() => {}}
@@ -53,6 +50,5 @@ describe("SectionStateTranscriptChip", () => {
     );
 
     expect(screen.getByText("The change has no data migration.")).toBeTruthy();
-    expect(screen.queryByText("provisional")).toBeNull();
   });
 });

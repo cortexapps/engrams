@@ -200,7 +200,7 @@ function BlockedFace({
         </DialogTitle>
         <DialogDescription>
           Publishing pins an immutable version and opens ticketization. Every required section must
-          be confirmed, or marked n/a with a reason.
+          be settled, or marked n/a with a reason.
         </DialogDescription>
       </DialogHeader>
       <ul className="spec-publish-blockers">
@@ -225,7 +225,7 @@ function BlockedFace({
           Cancel
         </Button>
         {/* Quiet, because the gate does not pass. It re-checks: a section
-            confirmed in another tab shows up here. */}
+            settled in another tab shows up here. */}
         <Button size="sm" variant="outline" disabled={pending} onClick={onRecheck}>
           {pending ? "Checking…" : "Publish"}
         </Button>
@@ -277,7 +277,7 @@ function ReadyFace({
         <DialogDescription>
           {amber
             ? "Open questions do not block a publish. They carry into the tickets that cover their sections."
-            : "Every required section is confirmed, or marked n/a with a reason."}
+            : "Every required section is settled, or marked n/a with a reason."}
         </DialogDescription>
       </DialogHeader>
       {amber ? (
@@ -397,10 +397,10 @@ function PublishStep({ label, done, active }: { label: string; done?: boolean; a
 
 function blockerText(reason: SpecPublishGate["blockers"][number]["reason"]): string {
   switch (reason) {
-    case "drafted":
-      return "— drafted, not confirmed";
-    case "empty":
-      return "— empty";
+    case "proposed":
+      return "— proposed, not settled";
+    case "open":
+      return "— open";
     case "na_without_reason":
       return "— marked n/a with no reason";
   }

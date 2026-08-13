@@ -332,12 +332,12 @@ export class SpecToolService implements SpecToolDocumentService {
     specId: string,
     input: SpecMutationContext & {
       sectionId: string;
-      state: "drafted" | "confirmed" | "n/a";
+      state: "open" | "proposed" | "settled" | "n/a";
       reason?: string;
     },
   ): Promise<SpecMutationResult> {
     const loaded = await this.options.documents.syncFromLog(specId);
-    // Confirming (or drafting over) content the agent has not seen is the
+    // Changing the state of content that the agent has not seen is the
     // same clobber as a stale section write, so the same fence applies.
     if (await this.staleForSection(specId, input, input.sectionId, loaded.semanticDocSeq)) {
       return this.result(specId, input, false, loaded.semanticDocSeq);
@@ -352,14 +352,6 @@ export class SpecToolService implements SpecToolDocumentService {
     if (!templateSection) {
       throw new Error(`Spec section ${input.sectionId} has no template rule.`);
     }
-    const states = await this.options.metadata.sectionStates(specId);
-    const unconfirmedUpstreamSectionIds = sections
-      .slice(0, sectionIndex)
-      .filter((candidate) => {
-        const state = states.get(candidate.id)?.state ?? "empty";
-        return state !== "confirmed" && state !== "n/a";
-      })
-      .map((candidate) => candidate.id);
     try {
       await this.options.sectionStates.transitionDeferred({
         actionId: `agent-section-state:${specId}:${input.sessionId}:${input.toolCallId}`,
@@ -368,7 +360,6 @@ export class SpecToolService implements SpecToolDocumentService {
           sectionId: input.sectionId,
           sectionTitle: section.title,
           allowsNa: templateSection.allowNa,
-          unconfirmedUpstreamSectionIds,
         },
         target: input.state,
         ...(input.reason === undefined ? {} : { naReason: input.reason }),
@@ -599,7 +590,7 @@ export class SpecToolService implements SpecToolDocumentService {
   /**
    * Deep Layer-3 drafting waits for the pick when the template runs the
    * alternatives stage (R20). The alternatives section itself stays writable,
-   * and a confirmed or n/a alternatives section releases the rest of the layer
+   * and a settled or n/a alternatives section releases the rest of the layer
    * for a spec that settled the question by hand.
    */
   private async assertAlternativesStageClear(
@@ -625,7 +616,7 @@ export class SpecToolService implements SpecToolDocumentService {
     if (!alternativesSection) return;
     const states = await this.options.metadata.sectionStates(specId);
     const state = states.get(alternativesSection.id)?.state;
-    if (state === "confirmed" || state === "n/a") return;
+    if (state === "settled" || state === "n/a") return;
     const stage = await this.options.alternatives.readStage(specId);
     // Only a decision on the real alternatives section releases the layer. A
     // set bound elsewhere must never unblock the gate it bypassed.

@@ -24,7 +24,13 @@ export interface SpecRailMetadata {
   lifecycle: "draft" | "published";
   layers: SpecTemplateLayer[];
   sections: SpecTemplateSection[];
-  states: ReadonlyMap<string, SectionStateValue>;
+  states: ReadonlyMap<
+    string,
+    SectionStateValue & {
+      settledBy?: { id: string; name: string } | null;
+      stateChangedAt?: Date;
+    }
+  >;
   openQuestionCounts: ReadonlyMap<string, number>;
 }
 
@@ -36,19 +42,13 @@ export interface SpecRailSection {
   naReason: string | null;
   allowNa: boolean;
   openQuestionCount: number;
-  provisional: boolean;
-  frontier: boolean;
+  settledBy: { id: string; name: string } | null;
+  stateChangedAt: string | null;
 }
 
 export interface SpecRail {
-  layers: Array<{
-    key: string;
-    title: string;
-    description: string | null;
-    sections: SpecRailSection[];
-  }>;
+  sections: SpecRailSection[];
   completeness: { complete: number; total: number };
-  frontierSectionId: string | null;
 }
 
 export interface SpecRailStore {
@@ -65,6 +65,9 @@ interface RailStateRow {
   section_id: string;
   state: SectionState;
   na_reason: string | null;
+  settled_by: string | null;
+  settled_by_name: string | null;
+  updated_at: Date;
 }
 
 interface OpenQuestionCountRow {
@@ -85,9 +88,11 @@ export class PostgresSpecRailStore implements SpecRailStore {
         [specId],
       ),
       this.pool.query<RailStateRow>(
-        `SELECT section_id, state, na_reason
-           FROM spec_section_state
-          WHERE spec_id = $1`,
+        `SELECT state.section_id, state.state, state.na_reason, state.settled_by,
+                member.name AS settled_by_name, state.updated_at
+           FROM spec_section_state AS state
+           LEFT JOIN "user" AS member ON member.id = state.settled_by
+          WHERE state.spec_id = $1`,
         [specId],
       ),
       this.pool.query<OpenQuestionCountRow>(
@@ -110,7 +115,15 @@ export class PostgresSpecRailStore implements SpecRailStore {
       states: new Map(
         stateResult.rows.map((row) => [
           row.section_id,
-          { state: row.state, naReason: row.na_reason },
+          {
+            state: row.state,
+            naReason: row.na_reason,
+            settledBy:
+              row.state === "settled" && row.settled_by !== null
+                ? { id: row.settled_by, name: row.settled_by_name ?? "Unknown member" }
+                : null,
+            stateChangedAt: row.updated_at,
+          },
         ]),
       ),
       openQuestionCounts: new Map(
@@ -225,19 +238,7 @@ async function readRail(
   const loaded = await documents.syncFromLog(specId);
   const document = proseMirrorDocument(loaded.doc);
   const rules = new Map(metadata.sections.map((section) => [section.key, section]));
-  const grouped = new Map(
-    metadata.layers.map((layer) => [
-      layer.key,
-      {
-        key: layer.key,
-        title: layer.title,
-        description: layer.description ?? null,
-        sections: [] as SpecRailSection[],
-      },
-    ]),
-  );
   const ordered: SpecRailSection[] = [];
-  let hasIncompleteUpstream = false;
   document.forEach((section) => {
     const id = section.attrs["id"];
     const templateKey = section.attrs["templateSectionKey"];
@@ -246,55 +247,42 @@ async function readRail(
     }
     const rule = rules.get(templateKey);
     if (!rule) throw new Error(`Spec section ${id} has no template rule.`);
-    const layer = grouped.get(rule.layerKey);
-    if (!layer) throw new Error(`Spec section ${id} has an unknown layer: ${rule.layerKey}`);
-    const value = metadata.states.get(id) ?? { state: "empty" as const, naReason: null };
+    const value = metadata.states.get(id);
     const entry: SpecRailSection = {
       id,
       templateKey,
       title: section.firstChild.textContent,
-      state: value.state,
-      naReason: value.naReason,
+      state: value?.state ?? "open",
+      naReason: value?.naReason ?? null,
       allowNa: rule.allowNa,
       openQuestionCount: metadata.openQuestionCounts.get(id) ?? 0,
-      provisional: value.state === "drafted" && hasIncompleteUpstream,
-      frontier: false,
+      settledBy: value?.state === "settled" ? (value.settledBy ?? null) : null,
+      stateChangedAt: value?.stateChangedAt?.toISOString() ?? null,
     };
     ordered.push(entry);
-    layer.sections.push(entry);
-    if (!sectionIsComplete(entry)) hasIncompleteUpstream = true;
   });
-  const frontier = ordered.find((section) => !sectionIsComplete(section)) ?? null;
-  if (frontier) frontier.frontier = true;
   return {
-    layers: [...grouped.values()],
+    sections: ordered,
     completeness: {
       complete: ordered.filter(sectionIsComplete).length,
       total: ordered.length,
     },
-    frontierSectionId: frontier?.id ?? null,
   };
 }
 
 function stateContext(rail: SpecRail, specId: string, sectionId: string) {
-  const sections = rail.layers.flatMap((layer) => layer.sections);
-  const index = sections.findIndex((section) => section.id === sectionId);
-  if (index < 0) throw new HTTPException(404, { message: "section not found" });
-  const section = sections[index]!;
+  const section = rail.sections.find((candidate) => candidate.id === sectionId);
+  if (!section) throw new HTTPException(404, { message: "section not found" });
   return {
     specId,
     sectionId,
     sectionTitle: section.title,
     allowsNa: section.allowNa,
-    unconfirmedUpstreamSectionIds: sections
-      .slice(0, index)
-      .filter((candidate) => !sectionIsComplete(candidate))
-      .map((candidate) => candidate.id),
   };
 }
 
 function sectionIsComplete(section: Pick<SpecRailSection, "state">): boolean {
-  return section.state === "confirmed" || section.state === "n/a";
+  return section.state === "settled" || section.state === "n/a";
 }
 
 async function requireMetadata(store: SpecRailStore, specId: string): Promise<SpecRailMetadata> {
@@ -328,9 +316,9 @@ function requireActionId(value: unknown): string {
   return value;
 }
 
-function requireTargetState(value: unknown): "drafted" | "confirmed" | "n/a" {
-  if (value !== "drafted" && value !== "confirmed" && value !== "n/a") {
-    throw new HTTPException(400, { message: "state must be drafted, confirmed, or n/a" });
+function requireTargetState(value: unknown): "proposed" | "settled" | "open" | "n/a" {
+  if (value !== "proposed" && value !== "settled" && value !== "open" && value !== "n/a") {
+    throw new HTTPException(400, { message: "state must be proposed, settled, open, or n/a" });
   }
   return value;
 }
@@ -358,7 +346,7 @@ function requireStateValue(value: unknown): SectionStateValue {
   const state = value["state"];
   const naReason = value["naReason"];
   if (
-    (state !== "empty" && state !== "drafted" && state !== "confirmed" && state !== "n/a") ||
+    (state !== "open" && state !== "proposed" && state !== "settled" && state !== "n/a") ||
     (naReason !== null && typeof naReason !== "string")
   ) {
     throw new HTTPException(400, { message: "undo state is invalid" });

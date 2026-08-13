@@ -21,7 +21,7 @@ function section(
 ): TraceabilitySection {
   return {
     title: overrides.title ?? overrides.key,
-    state: "drafted",
+    state: "proposed",
     blocks: [],
     ...overrides,
   };

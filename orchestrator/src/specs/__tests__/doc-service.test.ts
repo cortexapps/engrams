@@ -1587,7 +1587,7 @@ describe("SpecDocumentService with live Postgres", () => {
   });
 
   test.skipIf(!liveDbReachable)(
-    "a human edit commits its update, drafted state, and transcript action atomically",
+    "a human edit commits its update, proposed state, and transcript action atomically",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
       const connectedAt = new Date("2026-08-09T12:00:00.000Z");
@@ -1653,33 +1653,33 @@ describe("SpecDocumentService with live Postgres", () => {
         [specId],
       );
       expect(committed.rows[0]).toEqual({
-        state: "drafted",
+        state: "proposed",
         action_id: actionId,
         section_id: "context",
       });
 
       const stateStore = new PostgresSectionStateStore(livePool);
       const current = await stateStore.read(specId, "context");
-      const confirmed = transitionSectionState(current, "confirmed", {
+      const settled = transitionSectionState(current, "settled", {
         specId,
         sectionId: "context",
         sectionTitle: "Context",
         allowsNa: true,
       });
       const later = await stateStore.persistStateAction({
-        actionId: `confirm-after-human:${specId}`,
+        actionId: `settle-after-human:${specId}`,
         specId,
         sectionId: "context",
-        requestFingerprint: "confirm-after-human",
+        requestFingerprint: "settle-after-human",
         expectedDocSeq: 2n,
         expected: current,
-        next: confirmed.value,
-        confirmedBy: userId,
-        chip: confirmed.transcriptChip,
+        next: settled.value,
+        settledBy: userId,
+        chip: settled.transcriptChip,
         at: new Date("2026-08-09T12:02:00.000Z"),
       });
       expect(later.status).toBe("stored");
-      expect((await stateStore.read(specId, "context")).state).toBe("confirmed");
+      expect((await stateStore.read(specId, "context")).state).toBe("settled");
     },
   );
 
@@ -1782,8 +1782,8 @@ describe("SpecDocumentService with live Postgres", () => {
       );
       await livePool.query(
         `INSERT INTO spec_section_state
-           (spec_id, section_id, state, na_reason, confirmed_by, updated_at)
-         VALUES ($1, 'design', 'confirmed', NULL, $2, $3)`,
+           (spec_id, section_id, state, na_reason, settled_by, updated_at)
+         VALUES ($1, 'design', 'settled', NULL, $2, $3)`,
         [specId, userId, stateTime],
       );
 
@@ -1804,7 +1804,7 @@ describe("SpecDocumentService with live Postgres", () => {
           WHERE spec_id = $1 AND section_id = 'design'`,
         [specId],
       );
-      expect(result.rows[0]?.state).toBe("confirmed");
+      expect(result.rows[0]?.state).toBe("settled");
       expect(result.rows[0]?.updated_at.toISOString()).toBe(stateTime.toISOString());
       expect(result.rows[0]?.actions).toBe("0");
     },

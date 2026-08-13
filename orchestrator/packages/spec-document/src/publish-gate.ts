@@ -8,7 +8,7 @@
  *
  * Two rules carry the whole gate:
  *
- * - A required section must be `confirmed`, or `n/a` with a reason (R34).
+ * - A required section must be `settled`, or `n/a` with a reason (R34).
  *   Every other state is a blocker, and each blocker names its section so the
  *   dialog can put the person one click from it.
  * - An open question never blocks (R35). It needs an explicit acknowledgment
@@ -16,7 +16,7 @@
  *   the count and read the questions in full.
  */
 
-export type PublishGateSectionState = "empty" | "drafted" | "confirmed" | "n/a";
+export type PublishGateSectionState = "open" | "proposed" | "settled" | "n/a";
 
 /** One section, as the gate reads it. */
 export interface PublishGateSection {
@@ -38,7 +38,7 @@ export interface PublishGateQuestion {
 }
 
 /** Why one required section is not settled. */
-export type PublishBlockerReason = "empty" | "drafted" | "na_without_reason";
+export type PublishBlockerReason = "open" | "proposed" | "na_without_reason";
 
 export interface PublishBlocker {
   sectionId: string;
@@ -71,7 +71,7 @@ export interface PublishGate {
 
 /** True when this section state settles a required section (R34). */
 export function sectionIsSettled(section: PublishGateSection): boolean {
-  if (section.state === "confirmed") return true;
+  if (section.state === "settled") return true;
   return section.state === "n/a" && (section.naReason ?? "").trim().length > 0;
 }
 
@@ -107,5 +107,5 @@ export function evaluatePublishGate(input: PublishGateInput): PublishGate {
 
 function blockerReason(section: PublishGateSection): PublishBlockerReason {
   if (section.state === "n/a") return "na_without_reason";
-  return section.state === "drafted" ? "drafted" : "empty";
+  return section.state === "proposed" ? "proposed" : "open";
 }

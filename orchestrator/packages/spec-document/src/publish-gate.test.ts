@@ -14,7 +14,7 @@ function section(
     title: overrides.title ?? overrides.id,
     layerKey: "intent",
     required: true,
-    state: "confirmed",
+    state: "settled",
     naReason: null,
     ...overrides,
   };
@@ -32,7 +32,7 @@ function question(
 }
 
 describe("publish gate", () => {
-  test("a spec whose required sections are confirmed is ready", () => {
+  test("a spec whose required sections are settled is ready", () => {
     const gate = evaluatePublishGate({
       sections: [section({ id: "sec-problem" }), section({ id: "sec-data" })],
       openQuestions: [],
@@ -50,12 +50,12 @@ describe("publish gate", () => {
     });
   });
 
-  test("an unconfirmed required section blocks and names its section (R34)", () => {
+  test("an unsettled required section blocks and names its section (R34)", () => {
     const gate = evaluatePublishGate({
       sections: [
         section({ id: "sec-problem" }),
-        section({ id: "sec-data", title: "Data model", state: "drafted" }),
-        section({ id: "sec-api", title: "API surface", state: "empty", layerKey: "contract" }),
+        section({ id: "sec-data", title: "Data model", state: "proposed" }),
+        section({ id: "sec-api", title: "API surface", state: "open", layerKey: "contract" }),
       ],
       openQuestions: [],
       gapCheckStale: false,
@@ -69,15 +69,15 @@ describe("publish gate", () => {
         sectionId: "sec-data",
         sectionTitle: "Data model",
         layerKey: "intent",
-        state: "drafted",
-        reason: "drafted",
+        state: "proposed",
+        reason: "proposed",
       },
       {
         sectionId: "sec-api",
         sectionTitle: "API surface",
         layerKey: "contract",
-        state: "empty",
-        reason: "empty",
+        state: "open",
+        reason: "open",
       },
     ]);
   });
@@ -106,7 +106,7 @@ describe("publish gate", () => {
     const gate = evaluatePublishGate({
       sections: [
         section({ id: "sec-problem" }),
-        section({ id: "sec-notes", required: false, state: "empty" }),
+        section({ id: "sec-notes", required: false, state: "open" }),
       ],
       openQuestions: [],
       gapCheckStale: false,
@@ -130,7 +130,7 @@ describe("publish gate", () => {
 
   test("a blocked gate asks for blockers, not for an acknowledgment", () => {
     const gate = evaluatePublishGate({
-      sections: [section({ id: "sec-data", state: "drafted" })],
+      sections: [section({ id: "sec-data", state: "proposed" })],
       openQuestions: [question({ id: "q-1" })],
       gapCheckStale: true,
     });
@@ -151,13 +151,13 @@ describe("publish gate", () => {
     expect(gate.gapCheckRunRequired).toBe(true);
   });
 
-  test("sectionIsSettled reads confirmed and n/a with a reason", () => {
-    expect(sectionIsSettled(section({ id: "a", state: "confirmed" }))).toBe(true);
+  test("sectionIsSettled reads settled and n/a with a reason", () => {
+    expect(sectionIsSettled(section({ id: "a", state: "settled" }))).toBe(true);
     expect(sectionIsSettled(section({ id: "a", state: "n/a", naReason: "Out of scope." }))).toBe(
       true,
     );
     expect(sectionIsSettled(section({ id: "a", state: "n/a" }))).toBe(false);
-    expect(sectionIsSettled(section({ id: "a", state: "drafted" }))).toBe(false);
-    expect(sectionIsSettled(section({ id: "a", state: "empty" }))).toBe(false);
+    expect(sectionIsSettled(section({ id: "a", state: "proposed" }))).toBe(false);
+    expect(sectionIsSettled(section({ id: "a", state: "open" }))).toBe(false);
   });
 });

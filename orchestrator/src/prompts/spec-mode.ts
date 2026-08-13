@@ -3,8 +3,8 @@
  *
  * The instruction has two parts. The first part is the standing rules of the
  * mode: the tool write path, recon before questions, provenance on every
- * repository statement, and drafting at the frontier. Those rules hold for
- * every spec, so they are constant.
+ * repository statement, and the document-first workflow. Those rules hold
+ * for every spec, so they are constant.
  *
  * The second part comes from the spec's own template snapshot: the layers, the
  * sections with their guidance and done criteria, and the process stage flags.
@@ -51,12 +51,7 @@ Read the repository before you write your first message. That message states wha
 Write into the document before you send that message. Use spec_update_section to put the problem statement into the section that holds the problem, and to add the requirements that your recon supports. Mark those requirements as candidates. The person must see reviewable document content first, not chat prose. Then name the largest gap, and ask about it.
 
 ### Give provenance for every repository statement
-Each statement about the repository carries the file and the short commit sha, in the form \`path/to/file.ts @ 8f2c1a4\`. This rule covers prose, data definitions, interface sketches, and every number that you compare. When you cannot verify a statement, write "unverified" next to it. Never give a guess as a repository fact.
-
-### Draft at the frontier
-The frontier is the first layer of the template that the person has not confirmed. Draft there, and keep the later layers short until the frontier moves to them.
-
-When the person gives you content for a later layer, accept it and record it immediately. Mark that content "provisional" until its layer becomes the frontier. Never refuse content because it comes early, and never lose it.`;
+Each statement about the repository carries the file and the short commit sha, in the form \`path/to/file.ts @ 8f2c1a4\`. This rule covers prose, data definitions, interface sketches, and every number that you compare. When you cannot verify a statement, write "unverified" next to it. Never give a guess as a repository fact.`;
 
 /**
  * One process stage from the template flags.

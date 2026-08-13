@@ -26,7 +26,7 @@ describe("spec mode prompt", () => {
     expect(specModeSystemPrompt()).toBe(SPEC_MODE_SYSTEM_PROMPT);
   });
 
-  test("states the recon, provenance and frontier rules", () => {
+  test("states the recon and provenance rules", () => {
     const prompt = specModeSystemPrompt(context());
 
     // Recon first (R7): repository first, document content first, questions last.
@@ -36,10 +36,8 @@ describe("spec mode prompt", () => {
     // Provenance (R16).
     expect(prompt).toContain("path/to/file.ts @ 8f2c1a4");
     expect(prompt).toContain('write "unverified" next to it');
-    // Frontier discipline (R19): draft at the frontier, accept early content.
-    expect(prompt).toContain("The frontier is the first layer");
-    expect(prompt).toContain('Mark that content "provisional"');
-    expect(prompt).toContain("Never refuse content because it comes early");
+    expect(prompt).not.toContain("frontier");
+    expect(prompt).not.toContain("provisional");
   });
 
   test("carries the template's layers, section guidance and done criteria", () => {

@@ -25,7 +25,7 @@ const context: SectionStateContext = {
 };
 
 class MemorySectionStateStore implements SectionStateStore {
-  value: SectionStateValue = { state: "empty", naReason: null };
+  value: SectionStateValue = { state: "open", naReason: null };
   readonly actions = new Map<string, SectionStateTranscriptAction>();
   rejectWrite = false;
   readOnly = false;
@@ -120,13 +120,13 @@ describe("section state service", () => {
     const first = await service.transitionDeferred({
       actionId: "deferred-action",
       context,
-      target: "drafted",
+      target: "proposed",
       actorUserId: "user-1",
     });
     const replay = await service.transitionDeferred({
       actionId: "deferred-action",
       context,
-      target: "drafted",
+      target: "proposed",
       actorUserId: "user-1",
     });
 
@@ -153,21 +153,21 @@ describe("section state service", () => {
     const store = new MemorySectionStateStore();
     const transcript = new MemoryTranscriptPublisher();
     const service = serviceWith(store, transcript);
-    const drafted = await service.transitionDeferred({
+    const proposed = await service.transitionDeferred({
       actionId: "draft-before-undo",
       context,
-      target: "drafted",
+      target: "proposed",
       actorUserId: "user-1",
     });
 
     const undo = await service.undoDeferred({
       actionId: "deferred-undo",
       context,
-      undo: drafted.transcriptChip.undo,
+      undo: proposed.transcriptChip.undo,
       actorUserId: "user-1",
     });
 
-    expect(undo.value).toEqual({ state: "empty", naReason: null });
+    expect(undo.value).toEqual({ state: "open", naReason: null });
     expect(store.actions.get("deferred-undo")?.deliveredAt).toBeNull();
     expect(transcript.publications).toHaveLength(0);
   });
@@ -177,24 +177,24 @@ describe("section state service", () => {
     const transcript = new MemoryTranscriptPublisher();
     const service = serviceWith(store, transcript);
 
-    const drafted = await service.transition({
+    const proposed = await service.transition({
       actionId: "draft-action",
       context,
-      target: "drafted",
+      target: "proposed",
       actorUserId: "user-1",
     });
-    const confirmed = await service.transition({
-      actionId: "confirm-action",
+    const settled = await service.transition({
+      actionId: "settle-action",
       context,
-      target: "confirmed",
+      target: "settled",
       actorUserId: "user-1",
     });
 
-    expect(store.value).toEqual({ state: "confirmed", naReason: null });
+    expect(store.value).toEqual({ state: "settled", naReason: null });
     expect(store.stateWrites).toBe(2);
     expect(transcript.publications).toEqual([
-      { actionId: "draft-action", chip: drafted.transcriptChip },
-      { actionId: "confirm-action", chip: confirmed.transcriptChip },
+      { actionId: "draft-action", chip: proposed.transcriptChip },
+      { actionId: "settle-action", chip: settled.transcriptChip },
     ]);
   });
 
@@ -237,18 +237,18 @@ describe("section state service", () => {
     const input = {
       actionId: "retry-action",
       context,
-      target: "drafted" as const,
+      target: "proposed" as const,
       actorUserId: "user-1",
     };
 
     await expect(service.transition(input)).rejects.toThrow("transcript is unavailable");
-    expect(store.value.state).toBe("drafted");
+    expect(store.value.state).toBe("proposed");
     expect(store.stateWrites).toBe(1);
     expect(await store.listPendingActions(10)).toHaveLength(1);
 
     transcript.fail = false;
     const replay = await service.transition(input);
-    expect(replay.value.state).toBe("drafted");
+    expect(replay.value.state).toBe("proposed");
     expect(store.stateWrites).toBe(1);
     expect(transcript.publications.map(({ actionId }) => actionId)).toEqual(["retry-action"]);
     expect(await store.listPendingActions(10)).toHaveLength(0);
@@ -263,7 +263,7 @@ describe("section state service", () => {
       service.transition({
         actionId: "drain-action",
         context,
-        target: "drafted",
+        target: "proposed",
         actorUserId: "user-1",
       }),
     ).rejects.toThrow();
@@ -287,7 +287,7 @@ describe("section state service", () => {
     const input = {
       actionId: "mark-retry-action",
       context,
-      target: "drafted" as const,
+      target: "proposed" as const,
       actorUserId: "user-1",
     };
 
@@ -308,7 +308,7 @@ describe("section state service", () => {
     await service.transition({
       actionId: "reused-action",
       context,
-      target: "drafted",
+      target: "proposed",
       actorUserId: "user-1",
     });
 
@@ -316,7 +316,7 @@ describe("section state service", () => {
       service.transition({
         actionId: "reused-action",
         context,
-        target: "confirmed",
+        target: "settled",
         actorUserId: "user-1",
       }),
     ).rejects.toThrow("different command");
@@ -331,7 +331,7 @@ describe("section state service", () => {
     await service.transition({
       actionId: "ordered-action",
       context,
-      target: "drafted",
+      target: "proposed",
       actorUserId: "user-1",
     });
     const reorderedContext: SectionStateContext = {
@@ -344,11 +344,11 @@ describe("section state service", () => {
     const replay = await service.transition({
       actionId: "ordered-action",
       context: reorderedContext,
-      target: "drafted",
+      target: "proposed",
       actorUserId: "user-1",
     });
 
-    expect(replay.value.state).toBe("drafted");
+    expect(replay.value.state).toBe("proposed");
     expect(store.stateWrites).toBe(1);
   });
 
@@ -362,7 +362,7 @@ describe("section state service", () => {
       service.transition({
         actionId: "stale-action",
         context,
-        target: "drafted",
+        target: "proposed",
         actorUserId: "user-1",
       }),
     ).rejects.toBeInstanceOf(SectionStateConflictError);
@@ -380,11 +380,11 @@ describe("section state service", () => {
       service.transitionDeferred({
         actionId: "published-action",
         context,
-        target: "drafted",
+        target: "proposed",
         actorUserId: "user-1",
       }),
     ).rejects.toBeInstanceOf(SectionStateReadOnlyError);
-    expect(store.value.state).toBe("empty");
+    expect(store.value.state).toBe("open");
     expect(store.actions.size).toBe(0);
   });
 
@@ -397,12 +397,12 @@ describe("section state service", () => {
       service.transition({
         actionId: "stale-document-action",
         context,
-        target: "drafted",
+        target: "proposed",
         actorUserId: "user-1",
         expectedDocSeq: 0n,
       }),
     ).rejects.toBeInstanceOf(SectionStateConflictError);
-    expect(store.value.state).toBe("empty");
+    expect(store.value.state).toBe("open");
     expect(store.actions.size).toBe(0);
   });
 });

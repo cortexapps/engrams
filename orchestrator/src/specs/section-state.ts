@@ -13,9 +13,9 @@ export type {
 } from "@engrams/spec-document";
 
 export const SECTION_STATES = [
-  "empty",
-  "drafted",
-  "confirmed",
+  "open",
+  "proposed",
+  "settled",
   "n/a",
 ] as const satisfies readonly SectionState[];
 
@@ -24,7 +24,6 @@ export interface SectionStateContext {
   sectionId: string;
   sectionTitle: string;
   allowsNa: boolean;
-  unconfirmedUpstreamSectionIds?: readonly string[];
 }
 
 export interface SectionStateChange {
@@ -48,10 +47,10 @@ export class SectionStateTransitionError extends Error {
 }
 
 const LEGAL_TARGETS: Readonly<Record<SectionState, ReadonlySet<SectionState>>> = {
-  empty: new Set(["drafted", "n/a"]),
-  drafted: new Set(["confirmed", "n/a"]),
-  confirmed: new Set(["drafted", "n/a"]),
-  "n/a": new Set(["drafted"]),
+  open: new Set(["proposed", "n/a"]),
+  proposed: new Set(["settled", "open", "n/a"]),
+  settled: new Set(["proposed", "n/a"]),
+  "n/a": new Set(["proposed"]),
 };
 
 function normalizedValue(state: SectionState, naReason?: string | null): SectionStateValue {
@@ -90,8 +89,6 @@ function chipFor(
     sectionTitle: context.sectionTitle,
     before,
     after,
-    provisional:
-      after.state === "drafted" && (context.unconfirmedUpstreamSectionIds?.length ?? 0) > 0,
     undo: {
       kind: "restore_section_state",
       specId: context.specId,
@@ -128,15 +125,15 @@ export function transitionSectionState(
 }
 
 /**
- * Apply a human document edit. A first edit drafts an empty section. An edit
- * also reopens confirmed or n/a content because the old decision is stale.
+ * Apply a human document edit. A first edit proposes an open section. An edit
+ * also proposes settled or n/a content because the old decision is stale.
  */
 export function applyHumanSectionEdit(
   current: SectionStateValue,
   context: SectionStateContext,
 ): SectionStateChange | null {
-  if (current.state === "drafted") return null;
-  return transitionSectionState(current, "drafted", context);
+  if (current.state === "proposed") return null;
+  return transitionSectionState(current, "proposed", context);
 }
 
 /** Apply an undo only if no later state action changed the section. */

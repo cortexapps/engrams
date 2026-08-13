@@ -75,7 +75,7 @@ function loaded(semanticDocSeq: bigint): LoadedSpecDocument {
   return { doc: ydoc, lastAppliedSeq: semanticDocSeq, semanticDocSeq };
 }
 
-type SectionStateValue = { state: "empty" | "drafted" | "confirmed" | "n/a"; naReason: string | null };
+type SectionStateValue = { state: "open" | "proposed" | "settled" | "n/a"; naReason: string | null };
 
 class MemoryRailStore implements SpecRailStore {
   constructor(readonly states: Map<string, SectionStateValue>) {}
@@ -211,8 +211,8 @@ function fixture(options: FixtureOptions = {}) {
   const states =
     options.states ??
     new Map<string, SectionStateValue>([
-      ["sec-req", { state: "confirmed", naReason: null }],
-      ["sec-data", { state: "confirmed", naReason: null }],
+      ["sec-req", { state: "settled", naReason: null }],
+      ["sec-data", { state: "settled", naReason: null }],
     ]);
   const store = new MemoryPublishStore({
     specId: SPEC_ID,
@@ -261,11 +261,11 @@ function publishInput(overrides: Partial<Parameters<SpecPublishService["requestP
 }
 
 describe("publish gate service", () => {
-  test("an unconfirmed required section blocks the publish and names it (R34)", async () => {
+  test("an unsettled required section blocks the publish and names it (R34)", async () => {
     const { service, store } = fixture({
       states: new Map([
-        ["sec-req", { state: "confirmed", naReason: null }],
-        ["sec-data", { state: "drafted", naReason: null }],
+        ["sec-req", { state: "settled", naReason: null }],
+        ["sec-data", { state: "proposed", naReason: null }],
       ]),
     });
 
@@ -277,8 +277,8 @@ describe("publish gate service", () => {
         sectionId: "sec-data",
         sectionTitle: "Data model",
         layerKey: "contract",
-        state: "drafted",
-        reason: "drafted",
+        state: "proposed",
+        reason: "proposed",
       },
     ]);
     expect(error.status?.gate.settledRequiredCount).toBe(1);
@@ -289,7 +289,7 @@ describe("publish gate service", () => {
   test("n/a with a reason settles a required section (R34)", async () => {
     const { service, store } = fixture({
       states: new Map([
-        ["sec-req", { state: "confirmed", naReason: null }],
+        ["sec-req", { state: "settled", naReason: null }],
         ["sec-data", { state: "n/a", naReason: "The feature stores nothing." }],
       ]),
     });
@@ -305,7 +305,7 @@ describe("publish gate service", () => {
   test("n/a without a reason still blocks", async () => {
     const { service } = fixture({
       states: new Map([
-        ["sec-req", { state: "confirmed", naReason: null }],
+        ["sec-req", { state: "settled", naReason: null }],
         ["sec-data", { state: "n/a", naReason: null }],
       ]),
     });
@@ -453,7 +453,7 @@ describe("publish gate service", () => {
     const { service, store, states } = fixture();
     const first = await service.requestPublish(publishInput());
     store.record = { ...first.publish, state: "blocked", lastError: "moved" };
-    states.set("sec-data", { state: "drafted", naReason: null });
+    states.set("sec-data", { state: "proposed", naReason: null });
 
     const error = await refusal(service.requestPublish(publishInput()));
 
@@ -490,8 +490,8 @@ describe("publish gate service", () => {
   test("verifyForPin refuses a section that left the gate, and names it", async () => {
     const { service } = fixture({
       states: new Map([
-        ["sec-req", { state: "confirmed", naReason: null }],
-        ["sec-data", { state: "drafted", naReason: null }],
+        ["sec-req", { state: "settled", naReason: null }],
+        ["sec-data", { state: "proposed", naReason: null }],
       ]),
     });
 

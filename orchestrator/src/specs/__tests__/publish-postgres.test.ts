@@ -83,10 +83,10 @@ function specDocument(): LoadedSpecDocument {
 }
 
 class MemoryRailStore implements SpecRailStore {
-  states = new Map<string, { state: "empty" | "drafted" | "confirmed" | "n/a"; naReason: string | null }>(
+  states = new Map<string, { state: "open" | "proposed" | "settled" | "n/a"; naReason: string | null }>(
     [
-      ["sec-req", { state: "confirmed", naReason: null }],
-      ["sec-data", { state: "confirmed", naReason: null }],
+      ["sec-req", { state: "settled", naReason: null }],
+      ["sec-data", { state: "settled", naReason: null }],
     ],
   );
 
@@ -175,7 +175,7 @@ describe("spec publish with live Postgres", () => {
       // rail fixture, so the gate it re-checks is the stored one.
       await pool.query(
         `INSERT INTO spec_section_state (spec_id, section_id, state, na_reason)
-         VALUES ($1, 'sec-req', 'confirmed', NULL), ($1, 'sec-data', 'confirmed', NULL)`,
+         VALUES ($1, 'sec-req', 'settled', NULL), ($1, 'sec-data', 'settled', NULL)`,
         [id],
       );
     }
@@ -343,7 +343,7 @@ describe("spec publish with live Postgres", () => {
     async () => {
       // The window the request-time gate cannot cover: the document stays
       // editable until the pin commits, and a co-editor's edit flips a
-      // confirmed section back to drafted.
+      // settled section back to proposed.
       const store = new PostgresSpecPublishStore(pool!);
       const publish = service(store);
       await publish.requestPublish({
@@ -354,13 +354,13 @@ describe("spec publish with live Postgres", () => {
         runGapCheck: false,
       });
       await pool!.query(
-        `UPDATE spec_section_state SET state = 'drafted'
+        `UPDATE spec_section_state SET state = 'proposed'
           WHERE spec_id = $1 AND section_id = 'sec-data'`,
         [raceSpecId],
       );
 
       const tick = scannerDeps(store);
-      // The rail fixture still reads confirmed, so only the transaction's own
+      // The rail fixture still reads settled, so only the transaction's own
       // check against spec_section_state can refuse this pin.
       const result = await runSpecPublishTick(tick.deps);
 
@@ -384,7 +384,7 @@ describe("spec publish with live Postgres", () => {
 
       // Settling the section and asking again re-arms the same row.
       await pool!.query(
-        `UPDATE spec_section_state SET state = 'confirmed'
+        `UPDATE spec_section_state SET state = 'settled'
           WHERE spec_id = $1 AND section_id = 'sec-data'`,
         [raceSpecId],
       );

@@ -118,7 +118,7 @@ const UpdateSectionInput = z
 const SetSectionStateInput = z
   .object({
     section_id: SectionId,
-    state: z.enum(["drafted", "confirmed", "n/a"]),
+    state: z.enum(["open", "proposed", "settled", "n/a"]),
     reason: z
       .string()
       .min(1)
@@ -484,7 +484,7 @@ export interface SpecToolDocumentService {
     specId: string,
     input: SpecMutationContext & {
       sectionId: string;
-      state: "drafted" | "confirmed" | "n/a";
+      state: "open" | "proposed" | "settled" | "n/a";
       reason?: string;
     },
   ): Promise<SpecMutationResult>;
@@ -793,7 +793,7 @@ export function registerSpecTools(
     name: "spec_set_section_state",
     taskTypes: SPEC_TASK_TYPES,
     description:
-      "Set a section to drafted, confirmed, or n/a. The n/a state requires a reason.",
+      "Set a section to open, proposed, settled, or n/a. The n/a state requires a reason.",
     input: SetSectionStateInput,
     output: MutationOutput,
     handling: "handled",

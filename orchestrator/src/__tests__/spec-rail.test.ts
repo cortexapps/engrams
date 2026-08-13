@@ -18,7 +18,7 @@ import { SectionStateReadOnlyError } from "../specs/section-state-service.ts";
 import { SectionStateTransitionError } from "../specs/section-state.ts";
 
 const SPEC_ID = "00000000-0000-4000-8000-000000001114";
-const CONFIRM_ACTION_ID = "00000000-0000-4000-8000-000000001117";
+const SETTLE_ACTION_ID = "00000000-0000-4000-8000-000000001117";
 const UNDO_ACTION_ID = "00000000-0000-4000-8000-000000001118";
 const TEMPLATE: SpecTemplate = {
   sections: [
@@ -29,20 +29,19 @@ const TEMPLATE: SpecTemplate = {
 const liveDoc = new Y.Doc();
 Y.applyUpdate(liveDoc, encodeProseMirrorDocument(createTemplateDocument(TEMPLATE)));
 
-const confirmChip: SectionStateTranscriptChip = {
+const settleChip: SectionStateTranscriptChip = {
   kind: "spec_section_state_changed",
   specId: SPEC_ID,
   sectionId: "design",
   sectionTitle: "Design",
-  before: { state: "drafted", naReason: null },
-  after: { state: "confirmed", naReason: null },
-  provisional: false,
+  before: { state: "proposed", naReason: null },
+  after: { state: "settled", naReason: null },
   undo: {
     kind: "restore_section_state",
     specId: SPEC_ID,
     sectionId: "design",
-    expected: { state: "confirmed", naReason: null },
-    restore: { state: "drafted", naReason: null },
+    expected: { state: "settled", naReason: null },
+    restore: { state: "proposed", naReason: null },
   },
 };
 
@@ -74,8 +73,24 @@ class MemoryRailStore implements SpecRailStore {
       },
     ],
     states: new Map([
-      ["context", { state: "confirmed", naReason: null }],
-      ["design", { state: "drafted", naReason: null }],
+      [
+        "context",
+        {
+          state: "settled",
+          naReason: null,
+          settledBy: { id: "member-1", name: "Ada" },
+          stateChangedAt: new Date("2026-08-13T08:00:00.000Z"),
+        },
+      ],
+      [
+        "design",
+        {
+          state: "proposed",
+          naReason: null,
+          settledBy: null,
+          stateChangedAt: new Date("2026-08-13T09:00:00.000Z"),
+        },
+      ],
     ]),
     openQuestionCounts: new Map([["design", 2]]),
   };
@@ -100,11 +115,11 @@ function testApp(input?: {
   const store = input?.store ?? new MemoryRailStore();
   const transitionDeferred = mock(
     input?.transitionDeferred ??
-      (async () => ({ value: confirmChip.after, transcriptChip: confirmChip })),
+      (async () => ({ value: settleChip.after, transcriptChip: settleChip })),
   );
   const undoDeferred = mock(
     input?.undoDeferred ??
-      (async () => ({ value: confirmChip.before, transcriptChip: confirmChip })),
+      (async () => ({ value: settleChip.before, transcriptChip: settleChip })),
   );
   app.route(
     "/",
@@ -127,66 +142,60 @@ function testApp(input?: {
 afterEach(() => mock.restore());
 
 describe("spec rail routes", () => {
-  test("groups sections by layer and marks the first incomplete section", async () => {
+  test("returns document-ordered sections with settle credit", async () => {
     const { app } = testApp();
     const response = await app.request(`/api/v1/specs/${SPEC_ID}/rail`);
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({
+    expect(await response.json()).toEqual({
       rail: {
+        sections: [
+          {
+            id: "context",
+            templateKey: "context",
+            title: "Context",
+            state: "settled",
+            naReason: null,
+            allowNa: false,
+            openQuestionCount: 0,
+            settledBy: { id: "member-1", name: "Ada" },
+            stateChangedAt: "2026-08-13T08:00:00.000Z",
+          },
+          {
+            id: "design",
+            templateKey: "design",
+            title: "Design",
+            state: "proposed",
+            naReason: null,
+            allowNa: true,
+            openQuestionCount: 2,
+            settledBy: null,
+            stateChangedAt: "2026-08-13T09:00:00.000Z",
+          },
+        ],
         completeness: { complete: 1, total: 2 },
-        frontierSectionId: "design",
-        layers: [
-          { title: "Understand", sections: [{ id: "context", openQuestionCount: 0 }] },
-          { title: "Define", sections: [{ id: "design", openQuestionCount: 2 }] },
-        ],
       },
     });
   });
 
-  test("marks drafted downstream content as provisional", async () => {
-    const store = new MemoryRailStore();
-    store.metadata = {
-      ...store.metadata,
-      states: new Map([
-        ["context", { state: "drafted", naReason: null }],
-        ["design", { state: "drafted", naReason: null }],
-      ]),
-    };
-    const { app } = testApp({ store });
-    const response = await app.request(`/api/v1/specs/${SPEC_ID}/rail`);
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({
-      rail: {
-        frontierSectionId: "context",
-        layers: [
-          { sections: [{ id: "context", provisional: false, frontier: true }] },
-          { sections: [{ id: "design", provisional: true, frontier: false }] },
-        ],
-      },
-    });
-  });
-
-  test("returns an undoable transcript chip for one-click confirmation", async () => {
+  test("returns an undoable transcript chip for one-click settlement", async () => {
     const { app, transitionDeferred } = testApp();
     const response = await app.request(`/api/v1/specs/${SPEC_ID}/sections/design/state`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ actionId: CONFIRM_ACTION_ID, state: "confirmed" }),
+      body: JSON.stringify({ actionId: SETTLE_ACTION_ID, state: "settled" }),
     });
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ chip: confirmChip });
+    expect(await response.json()).toMatchObject({ chip: settleChip });
     expect(transitionDeferred.mock.calls[0]![0]).toMatchObject({
-      actionId: `rail:${SPEC_ID}:${CONFIRM_ACTION_ID}`,
-      target: "confirmed",
+      actionId: `rail:${SPEC_ID}:${SETTLE_ACTION_ID}`,
+      target: "settled",
       actorUserId: "member-2",
       context: {
         sectionId: "design",
         sectionTitle: "Design",
         allowsNa: true,
-        unconfirmedUpstreamSectionIds: [],
       },
     });
   });
@@ -196,11 +205,11 @@ describe("spec rail routes", () => {
     const response = await app.request(`/api/v1/specs/${SPEC_ID}/sections/design/undo`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ actionId: UNDO_ACTION_ID, undo: confirmChip.undo }),
+      body: JSON.stringify({ actionId: UNDO_ACTION_ID, undo: settleChip.undo }),
     });
 
     expect(response.status).toBe(200);
-    expect(undoDeferred.mock.calls[0]![0]).toMatchObject({ undo: confirmChip.undo });
+    expect(undoDeferred.mock.calls[0]![0]).toMatchObject({ undo: settleChip.undo });
   });
 
   test("rejects n/a without a reason", async () => {
@@ -214,7 +223,7 @@ describe("spec rail routes", () => {
     const response = await app.request(`/api/v1/specs/${SPEC_ID}/sections/design/state`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ actionId: CONFIRM_ACTION_ID, state: "n/a" }),
+      body: JSON.stringify({ actionId: SETTLE_ACTION_ID, state: "n/a" }),
     });
 
     expect(response.status).toBe(400);
@@ -228,7 +237,7 @@ describe("spec rail routes", () => {
     const response = await app.request(`/api/v1/specs/${SPEC_ID}/sections/design/state`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ actionId: CONFIRM_ACTION_ID, state: "confirmed" }),
+      body: JSON.stringify({ actionId: SETTLE_ACTION_ID, state: "settled" }),
     });
 
     expect(response.status).toBe(200);
@@ -245,7 +254,7 @@ describe("spec rail routes", () => {
     const response = await app.request(`/api/v1/specs/${SPEC_ID}/sections/design/state`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ actionId: CONFIRM_ACTION_ID, state: "confirmed" }),
+      body: JSON.stringify({ actionId: SETTLE_ACTION_ID, state: "settled" }),
     });
 
     expect(response.status).toBe(409);
@@ -259,7 +268,7 @@ describe("spec rail routes", () => {
     const response = await app.request(`/api/v1/specs/${SPEC_ID}/sections/design/undo`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ actionId: UNDO_ACTION_ID, undo: confirmChip.undo }),
+      body: JSON.stringify({ actionId: UNDO_ACTION_ID, undo: settleChip.undo }),
     });
 
     expect(response.status).toBe(404);

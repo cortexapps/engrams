@@ -77,7 +77,7 @@ function loaded(document: ProseMirrorNode, semanticDocSeq: bigint): LoadedSpecDo
 }
 
 class MemoryRailStore implements SpecRailStore {
-  constructor(private readonly states = new Map<string, { state: "empty" | "drafted" | "confirmed" | "n/a"; naReason: string | null }>()) {}
+  constructor(private readonly states = new Map<string, { state: "open" | "proposed" | "settled" | "n/a"; naReason: string | null }>()) {}
 
   async readMetadata(): Promise<SpecRailMetadata | null> {
     return {
