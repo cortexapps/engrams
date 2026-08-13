@@ -826,6 +826,7 @@ impl NbdSandboxState {
         &mut self,
         sandbox_id: engram_core::SandboxId,
         publisher: Arc<dyn crate::disk_daemon::LiveManifestPublisher>,
+        health: Arc<dyn crate::disk_daemon::DataPlaneHealth>,
         config: crate::disk_daemon::FlushSchedulerConfig,
     ) {
         if !config.enabled {
@@ -835,6 +836,7 @@ impl NbdSandboxState {
             sandbox_id,
             self.backend.clone(),
             publisher,
+            health,
             config,
         );
         self.scheduler = Some(handle);

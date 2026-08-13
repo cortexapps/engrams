@@ -504,10 +504,54 @@ struct QuarantinedSurvivor {
     /// The disk manifest ref the failed rehydrate attached from — the
     /// coordinator's effective ref at register time. It cannot advance
     /// while the disk is unserved (nothing publishes), so the retry
-    /// reuses it verbatim.
-    disk_manifest: engram_core::types::manifest::ManifestRef,
+    /// reuses it verbatim. `None` for an ADR 0116 C4 data-plane-failed
+    /// entry: the disk is still served (the flush loop is what failed),
+    /// so there is no failed-rehydrate manifest and nothing to
+    /// RECONFIGURE — the quarantine evict owns the remediation and the
+    /// rehydrate retry pass skips the entry.
+    disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
     /// Retry attempts so far — log pacing only.
     retry_attempts: u64,
+    /// Why the entry exists — advertised to the coordinator (additive
+    /// JSON field) and read by `pause()`'s ADR 0116 C4 park refusal.
+    reason: engram_protocol::heartbeat::QuarantineReason,
+}
+
+/// ADR 0116 C4: PooledBackend's [`crate::disk_daemon::DataPlaneHealth`]
+/// sink. Mirrors how `CoordLiveManifestPublisher`'s resolver closes
+/// over `session_bindings`: a small struct over the two shared maps,
+/// with no back-reference to the backend. On a report it resolves the
+/// session binding and inserts a `DataPlaneFailed` survivor entry, so
+/// the next heartbeat advertises it and the coordinator's keyed
+/// quarantine evict engages. `or_insert` only: an existing entry (a
+/// failed rehydrate already being retried) keeps its manifest, reason,
+/// and pacing counter — the advertise it drives is the same.
+struct QuarantineDataPlaneHealth {
+    quarantined_survivors: Arc<DashMap<SandboxId, QuarantinedSurvivor>>,
+    session_bindings: Arc<DashMap<SandboxId, SessionId>>,
+}
+
+#[async_trait]
+impl crate::disk_daemon::DataPlaneHealth for QuarantineDataPlaneHealth {
+    async fn data_plane_failed(&self, sandbox_id: SandboxId) {
+        let Some(session_id) = self.session_bindings.get(&sandbox_id).map(|e| *e) else {
+            // Unbound (warm-pool / post-destroy race): there is no
+            // session to advertise; the destroy path owns cleanup.
+            tracing::warn!(
+                %sandbox_id,
+                "flush escalation on an unbound sandbox; no survivor entry to advertise",
+            );
+            return;
+        };
+        self.quarantined_survivors
+            .entry(sandbox_id)
+            .or_insert(QuarantinedSurvivor {
+                session_id,
+                disk_manifest: None,
+                retry_attempts: 0,
+                reason: engram_protocol::heartbeat::QuarantineReason::DataPlaneFailed,
+            });
+    }
 }
 
 pub(crate) use engram_host_core::SwapDisarmPolicy;
@@ -772,6 +816,14 @@ pub struct PooledBackend {
     /// PooledBackend's lifetime. `None` for the no-op publisher (no
     /// task to abort).
     live_manifest_publisher_handle: Option<crate::disk_daemon::LiveManifestPublisherHandle>,
+    /// ADR 0116 C4: the flush scheduler's escalation sink
+    /// ([`QuarantineDataPlaneHealth`] over `quarantined_survivors` +
+    /// `session_bindings`). Cloned into every scheduler install site
+    /// next to the publisher.
+    // Read only by the linux NBD/flush-scheduler paths; macOS (VZ
+    // parity) builds construct but never read it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    data_plane_health: Arc<dyn crate::disk_daemon::DataPlaneHealth>,
     /// ADR 0028 Fix A: root for checkpoint state — `rolling/` (the
     /// per-sandbox rolling memory images, diff-apply targets) and
     /// `records/` (durable per-checkpoint records awaiting coord
@@ -2155,6 +2207,7 @@ impl PooledBackend {
             let inner = self.inner.clone();
             let nbd_sandboxes = self.nbd_sandboxes.clone();
             let publisher = self.live_manifest_publisher.clone();
+            let health = self.data_plane_health.clone();
             let flush_config = self.flush_config.clone();
             let abandoning = self.abandoning.clone();
             let dirty_root = self
@@ -2182,7 +2235,7 @@ impl PooledBackend {
                 // in the continuous-flush pipeline. Field-ordered Drop
                 // ensures scheduler-cancel → NBD-disconnect → slot-release
                 // on subsequent destroy.
-                state.install_flush_scheduler(new_id, publisher, flush_config);
+                state.install_flush_scheduler(new_id, publisher, health, flush_config);
                 // ADR 0019: open the resume operation window — restore-time disk
                 // reads (load_snapshot + the resumed guest's working set) attach
                 // `chunk.fetch` spans to this trace. Covers idle→resume AND
@@ -2237,12 +2290,21 @@ impl PooledBackend {
         // source of truth (the backend config, set once from ENGRAM_BUNDLE_DIR /
         // the SHARED_DIR default) and no way to make them disagree.
         let bundle_dir = inner.bundle_dir().to_path_buf();
+        let session_bindings: Arc<DashMap<SandboxId, SessionId>> = Arc::new(DashMap::new());
+        let quarantined_survivors: Arc<DashMap<SandboxId, QuarantinedSurvivor>> =
+            Arc::new(DashMap::new());
+        // ADR 0116 C4: the escalation sink shares the survivor map and
+        // the binding index with the backend itself.
+        let data_plane_health = Arc::new(QuarantineDataPlaneHealth {
+            quarantined_survivors: quarantined_survivors.clone(),
+            session_bindings: session_bindings.clone(),
+        });
         Self {
             inner,
             image_cache: None,
             egress: None,
-            session_bindings: Arc::new(DashMap::new()),
-            quarantined_survivors: Arc::new(DashMap::new()),
+            session_bindings,
+            quarantined_survivors,
             unreachable_guests: Arc::new(DashMap::new()),
             dead_probe_inflight: Arc::new(DashMap::new()),
             chunk_store: None,
@@ -2267,6 +2329,7 @@ impl PooledBackend {
             flush_config: crate::disk_daemon::FlushSchedulerConfig::from_env(),
             live_manifest_publisher: Arc::new(crate::disk_daemon::NoOpLiveManifestPublisher),
             live_manifest_publisher_handle: None,
+            data_plane_health,
             checkpoint_dir: None,
             chain_heads: None,
             checkpoint_chains: Arc::new(DashMap::new()),
@@ -3974,6 +4037,7 @@ impl PooledBackend {
             .map(|e| engram_protocol::heartbeat::QuarantinedSurvivor {
                 sandbox_id: *e.key(),
                 session_id: e.value().session_id,
+                reason: e.value().reason,
             })
             .collect()
     }
@@ -4002,9 +4066,16 @@ impl PooledBackend {
             .collect();
         let mut recovered = 0usize;
         for (sandbox_id, q) in survivors {
+            // ADR 0116 C4: a data-plane-failed entry carries no
+            // failed-rehydrate manifest — its disk is still served, so
+            // there is nothing to RECONFIGURE; the quarantine evict
+            // owns the remediation.
+            let Some(disk_manifest) = q.disk_manifest else {
+                continue;
+            };
             let attempt = q.retry_attempts.saturating_add(1);
             match self
-                .rehydrate_sandbox(q.session_id, sandbox_id, q.disk_manifest)
+                .rehydrate_sandbox(q.session_id, sandbox_id, disk_manifest)
                 .await
             {
                 Ok(true) => {
@@ -7465,6 +7536,7 @@ impl SandboxBackend for PooledBackend {
                 let inner = self.inner.clone();
                 let nbd_sandboxes = self.nbd_sandboxes.clone();
                 let publisher = self.live_manifest_publisher.clone();
+                let health = self.data_plane_health.clone();
                 let flush_config = self.flush_config.clone();
                 let abandoning = self.abandoning.clone();
                 let dirty_root = self
@@ -7482,7 +7554,7 @@ impl SandboxBackend for PooledBackend {
                                     .into(),
                             )
                         })?;
-                    state.install_flush_scheduler(sandbox_id, publisher, flush_config);
+                    state.install_flush_scheduler(sandbox_id, publisher, health, flush_config);
                     // ADR 0019: open the cold-boot operation window. The guest's
                     // rootfs/substrate ext4-mount page-ins (served by this NBD
                     // backend) now attach `chunk.fetch` spans to the cold-boot
@@ -8972,6 +9044,26 @@ impl SandboxBackend for PooledBackend {
     /// evictor) treats it like the checkpoint driver's own skip: retry
     /// next nomination.
     async fn pause(&self, id: SandboxId) -> Result<(), SandboxError> {
+        // ADR 0116 C4: refuse to park a failed data plane. A park on a
+        // flush-escalated sandbox would freeze a VM whose disk writes
+        // cannot durably land — the 2026-08-12 incident's second leg.
+        // `InvalidSpec` is deliberate: the idle evictor maps it to the
+        // fall-through-to-full-eviction arm (no new wire variant), and
+        // that full eviction is quarantine-bounded by the survivor
+        // advert's keyed evict op.
+        if self.quarantined_survivors.get(&id).is_some_and(|q| {
+            q.reason == engram_protocol::heartbeat::QuarantineReason::DataPlaneFailed
+        }) {
+            ::metrics::counter!(
+                crate::metrics::RUNG2_PARK_FAILED_TOTAL,
+                "reason" => "data_plane_failed",
+            )
+            .increment(1);
+            return Err(SandboxError::InvalidSpec(format!(
+                "pause {id}: data plane failed (flush escalation); park refused — \
+                 a park would freeze nothing durable, evict instead"
+            )));
+        }
         if self.capture_in_flight(id) {
             ::metrics::counter!(
                 crate::metrics::RUNG2_PARK_FAILED_TOTAL,
@@ -10507,12 +10599,13 @@ impl PooledBackend {
                 self.quarantined_survivors
                     .entry(sandbox_id)
                     .and_modify(|q| {
-                        q.disk_manifest = disk_manifest;
+                        q.disk_manifest = Some(disk_manifest);
                     })
                     .or_insert(QuarantinedSurvivor {
                         session_id,
-                        disk_manifest,
+                        disk_manifest: Some(disk_manifest),
                         retry_attempts: 0,
+                        reason: engram_protocol::heartbeat::QuarantineReason::Rehydrate,
                     });
                 return Err(SandboxError::Vm(
                     format!(
@@ -10529,6 +10622,7 @@ impl PooledBackend {
         state.install_flush_scheduler(
             sandbox_id,
             self.live_manifest_publisher.clone(),
+            self.data_plane_health.clone(),
             self.flush_config.clone(),
         );
 

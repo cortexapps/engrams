@@ -718,7 +718,13 @@ pub(crate) async fn run_evict_pipeline(
                 },
                 Err(engram_core::SandboxError::InvalidSpec(_)) => {
                     // Backend can't pause (VZ/Process) — fall through to
-                    // the full eviction below.
+                    // the full eviction below. ADR 0116 C4 deliberately
+                    // lands here too: the host refuses a park with
+                    // `InvalidSpec` when the sandbox's data plane is
+                    // flush-escalated (a park would freeze nothing
+                    // durable), so the session takes the full eviction;
+                    // the quarantine flavor arrives separately via the
+                    // survivor advert's keyed evict op.
                 }
                 // ADR 0091: TRANSIENT refusal — the host declined the park
                 // because a capture (usually the periodic checkpoint, 600s
