@@ -136,11 +136,6 @@
   overflow-y: visible;
 }
 
-/* The alternatives stage takes the pane; the rail returns on the pick. */
-.spec-read-layout.is-stage .spec-rail-shell {
-  display: none;
-}
-
 /* The chat rail: the owner's conversation with the drafting agent, the first
    of the brief's three regions. A definite height (not max-height) keeps the
    thread's composer pinned to the bottom of the shell. */

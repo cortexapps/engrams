@@ -470,6 +470,13 @@
       "when": 1786686400000,
       "tag": "0066_spec_section_state_rename",
       "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "7",
+      "when": 1786772800000,
+      "tag": "0067_spec_template_drop_stage_flags",
+      "breakpoints": true
     }
   ]
 }

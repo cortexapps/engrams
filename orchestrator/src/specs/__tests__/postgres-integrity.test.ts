@@ -32,9 +32,8 @@ describe("spec integrity stores with live Postgres", () => {
   beforeAll(async () => {
     if (!reachable || !pool) return;
     await pool.query(
-      `INSERT INTO spec_template
-         (id, name, layers, sections, stage_flags)
-       VALUES ($1, 'Integrity test template', '[]', '[]', '{}')`,
+      `INSERT INTO spec_template (id, name, layers, sections)
+       VALUES ($1, 'Integrity test template', '[]', '[]')`,
       [templateId],
     );
     await pool.query(

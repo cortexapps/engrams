@@ -1,7 +1,6 @@
 import { lazy, Suspense } from "react";
 
 import { Skeleton } from "@/components/ui/skeleton";
-import type { SpecNotesStageActions } from "./SpecCanvas";
 import type { SpecSelectionActions } from "./SpecSelectionActions";
 
 const SpecCanvas = lazy(() =>
@@ -13,12 +12,10 @@ export function LazySpecCanvas({
   specId,
   revision,
   selectionActions,
-  notesActions,
 }: {
   specId: string;
   revision: string;
   selectionActions?: SpecSelectionActions;
-  notesActions?: SpecNotesStageActions;
 }) {
   return (
     <Suspense
@@ -30,12 +27,7 @@ export function LazySpecCanvas({
         </div>
       }
     >
-      <SpecCanvas
-        specId={specId}
-        revision={revision}
-        selectionActions={selectionActions}
-        notesActions={notesActions}
-      />
+      <SpecCanvas specId={specId} revision={revision} selectionActions={selectionActions} />
     </Suspense>
   );
 }

@@ -161,8 +161,7 @@
   font-size: 14px;
 }
 
-.spec-template-details-grid,
-.spec-template-process-grid {
+.spec-template-details-grid {
   display: grid;
   grid-template-columns: 1fr 1.5fr;
   gap: 18px;
@@ -265,43 +264,6 @@
   font-size: 12px;
 }
 
-.spec-template-process-grid {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.spec-template-stage {
-  display: grid;
-  gap: 12px;
-  padding: 14px;
-  border: 1px solid hsl(var(--border));
-  border-radius: 9px;
-}
-
-.spec-template-stage span,
-.spec-template-stage small {
-  display: block;
-}
-
-.spec-template-stage strong {
-  font-size: 13px;
-}
-
-.spec-template-stage small {
-  margin-top: 4px;
-  color: hsl(var(--muted-foreground));
-  font-size: 11px;
-  line-height: 1.45;
-}
-
-.spec-template-stage select {
-  height: 34px;
-  padding: 0 10px;
-  border: 1px solid hsl(var(--input));
-  border-radius: 7px;
-  background: hsl(var(--background));
-  font-size: 12px;
-}
-
 .spec-template-empty {
   display: grid;
   min-height: 320px;
@@ -353,7 +315,6 @@
 
   .spec-template-details-grid,
   .spec-template-section-grid,
-  .spec-template-process-grid,
   .spec-template-layer-fields {
     grid-template-columns: 1fr;
   }

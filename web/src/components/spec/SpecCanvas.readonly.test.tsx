@@ -1,13 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import {
-  buildWorkingNotesDocument,
-  parseMarkdown,
-  SPEC_FRAGMENT_NAME,
-  SPEC_NOTES_FRAGMENT_NAME,
-  type SpecTemplate,
-  type SpecWorkingNotes,
-} from "@engrams/spec-document";
+import { parseMarkdown, SPEC_FRAGMENT_NAME, type SpecTemplate } from "@engrams/spec-document";
 import { prosemirrorToYXmlFragment } from "y-prosemirror";
 import type { WebsocketProvider } from "y-websocket";
 import * as Y from "yjs";
@@ -19,26 +12,6 @@ const TEMPLATE: SpecTemplate = {
   sections: [{ id: "context", key: "context", title: "Context" }],
 };
 const MARKDOWN = "## Context\n\nThe limiter retries {{open-question:q1}} forever.\n";
-const NOTES: SpecWorkingNotes = {
-  clusters: [
-    {
-      id: "burst",
-      theme: "burst semantics",
-      sectionIds: ["context"],
-      bullets: [
-        {
-          id: "b1",
-          mark: "unchecked",
-          kind: "question",
-          text: "how fine is the billing granularity?",
-          provenance: null,
-          agentText: "how fine is the billing granularity?",
-        },
-      ],
-    },
-  ],
-};
-
 const documents: Y.Doc[] = [];
 const providers: WebsocketProvider[] = [];
 const desktopWidth = window.innerWidth;
@@ -67,21 +40,15 @@ function element(parent: Y.XmlFragment, index: number): Y.XmlElement {
 
 /**
  * Mount the canvas over a live provider, with one section that carries an
- * inline open-question marker. Pass `notes` to open the talk-it-through stage.
+ * inline open-question marker.
  */
-function canvasUnder({ notes = false }: { notes?: boolean } = {}) {
+function canvasUnder() {
   const doc = new Y.Doc();
   documents.push(doc);
   prosemirrorToYXmlFragment(
     parseMarkdown(MARKDOWN, TEMPLATE),
     doc.getXmlFragment(SPEC_FRAGMENT_NAME),
   );
-  if (notes) {
-    prosemirrorToYXmlFragment(
-      buildWorkingNotesDocument(NOTES),
-      doc.getXmlFragment(SPEC_NOTES_FRAGMENT_NAME),
-    );
-  }
   const provider = createSpecProvider("spec-1", doc, {
     connect: false,
     location: { protocol: "https:", host: "engrams.test" },
@@ -128,23 +95,6 @@ describe("the spec canvas at width", () => {
 
     await waitFor(() => expect(editor.textContent).toContain("Ada added a sentence."));
     expect(editor.getAttribute("contenteditable")).toBe("false");
-  });
-
-  test("at 420px the working-notes editor is not editable either", async () => {
-    setWidth(420);
-    canvasUnder({ notes: true });
-
-    // The notes stage leads, so the pane mounts without a tab change (R21).
-    const notes = await screen.findByLabelText("Working notes text");
-    await waitFor(() => expect(notes.getAttribute("contenteditable")).toBe("false"));
-    expect(notes.className).toContain("spec-notes-editor");
-  });
-
-  test("the desktop keeps the working notes writable", async () => {
-    canvasUnder({ notes: true });
-
-    const notes = await screen.findByLabelText("Working notes text");
-    await waitFor(() => expect(notes.getAttribute("contenteditable")).toBe("true"));
   });
 
   test("the desktop keeps the WYSIWYG", async () => {

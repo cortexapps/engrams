@@ -3,30 +3,11 @@
 import { z } from "zod";
 
 import {
-  SPEC_ALTERNATIVES_MAX_OPTIONS,
-  SPEC_ALTERNATIVES_MIN_OPTIONS,
-  SPEC_ALTERNATIVES_REASON_MAX_CHARS,
-  SPEC_ALTERNATIVES_TRADEOFF_COUNT,
-  SPEC_NOTE_KINDS,
-  SPEC_NOTE_MARKS,
-  SPEC_NOTE_PROVENANCE_MAX_LENGTH,
-  SPEC_NOTE_TEXT_MAX_LENGTH,
-  SPEC_NOTE_THEME_MAX_LENGTH,
-  SPEC_NOTES_MAX_BULLETS_PER_CLUSTER,
-  SPEC_NOTES_MAX_CLUSTERS,
-  SPEC_NOTES_MAX_SECTION_TAGS,
-  SPEC_TRADEOFF_SIGNS,
   type GapFinding,
   type GapFindingSeverity,
-  type SpecAlternativeOption,
-  type SpecAlternativesComparison,
-  type SpecNoteCorrection,
   type SpecSelectionSpan,
-  type SpecWorkingNotes,
-  type SpecWorkingNotesInput,
   type TraceabilityMatrix,
   type TrackedEditTranscriptChip,
-  type WorkingNotesDistillation,
 } from "@engrams/spec-document";
 
 import type { ToolContext, ToolRegistry } from "./registry.ts";
@@ -162,112 +143,6 @@ const UpdateBlockInput = z.object({
   expected_rev: RequiredRevision,
 });
 
-const OptionKey = z
-  .string()
-  .min(1)
-  .max(40)
-  .describe("Short card label, for example A");
-
-const AlternativeTradeoff = z.object({
-  sign: z.enum(SPEC_TRADEOFF_SIGNS).describe("+ for a gain, - for a cost, ~ for a caveat"),
-  text: z.string().min(1).max(400),
-});
-
-const AlternativeOption = z.object({
-  key: OptionKey,
-  title: z.string().min(1).max(200).describe("The one-line premise on the card"),
-  tradeoffs: z
-    .array(AlternativeTradeoff)
-    .length(SPEC_ALTERNATIVES_TRADEOFF_COUNT)
-    .describe("Exactly three signed trade-off lines"),
-});
-
-const ComparisonCell = z.object({
-  option_key: OptionKey,
-  value: z.string().min(1).max(400),
-});
-
-const ComparisonRow = z.object({
-  axis: z.string().min(1).max(200),
-  cells: z.array(ComparisonCell).min(SPEC_ALTERNATIVES_MIN_OPTIONS).max(SPEC_ALTERNATIVES_MAX_OPTIONS),
-});
-
-const ProposeAlternativesInput = z.object({
-  section_id: SectionId.describe("The alternatives section this set belongs to"),
-  options: z.array(AlternativeOption).min(SPEC_ALTERNATIVES_MIN_OPTIONS).max(SPEC_ALTERNATIVES_MAX_OPTIONS),
-  comparison_provenance: z
-    .string()
-    .min(1)
-    .max(500)
-    .describe("One caption that covers the comparison, for example a verified file and commit"),
-  comparison_rows: z
-    .array(ComparisonRow)
-    .min(1)
-    .max(20)
-    .describe("Numbers against numbers; one value for every option on each axis"),
-  lean_key: OptionKey.optional().describe("The option you lean towards; omit when you have none"),
-});
-
-const DecideAlternativeInput = z.object({
-  set_id: z.string().min(1).max(200).describe("The set_id returned by spec_propose_alternatives"),
-  option_key: OptionKey.optional().describe(
-    "The winning card; omit it when the author chose a hybrid that no card holds",
-  ),
-  reason: z
-    .string()
-    .min(1)
-    .max(SPEC_ALTERNATIVES_REASON_MAX_CHARS)
-    .describe("Why the winner won; written into the section"),
-  expected_rev: ExpectedRevision,
-});
-
-const NoteBullet = z.object({
-  id: z
-    .string()
-    .min(1)
-    .max(200)
-    .describe("Stable identifier for this bullet; reuse it in every later call"),
-  mark: z
-    .enum(SPEC_NOTE_MARKS)
-    .describe(
-      "verified: you checked it; contradicted: you checked it and it is false; unchecked: not checked yet",
-    ),
-  kind: z
-    .enum(SPEC_NOTE_KINDS)
-    .describe("observation, requirement candidate, tracked tension, or a question for the author"),
-  text: z.string().min(1).max(SPEC_NOTE_TEXT_MAX_LENGTH).describe("One distilled line"),
-  provenance: z
-    .string()
-    .min(1)
-    .max(SPEC_NOTE_PROVENANCE_MAX_LENGTH)
-    .optional()
-    .describe("The receipt. Required for a verified or contradicted bullet"),
-});
-
-const NoteCluster = z.object({
-  id: z.string().min(1).max(200).describe("Stable identifier for this cluster"),
-  theme: z.string().min(1).max(SPEC_NOTE_THEME_MAX_LENGTH).describe("The theme of the cluster"),
-  section_ids: z
-    .array(SectionId)
-    .max(SPEC_NOTES_MAX_SECTION_TAGS)
-    .optional()
-    .describe("Destination sections. Leave it out while the cluster has no home yet"),
-  bullets: z.array(NoteBullet).min(1).max(SPEC_NOTES_MAX_BULLETS_PER_CLUSTER),
-});
-
-const UpdateNotesInput = z.object({
-  clusters: z
-    .array(NoteCluster)
-    .min(1)
-    .max(SPEC_NOTES_MAX_CLUSTERS)
-    .describe("Your complete current model of the conversation, clustered by theme"),
-  expected_rev: ExpectedRevision,
-});
-
-const DistillNotesInput = z.object({
-  expected_rev: ExpectedRevision,
-});
-
 const TicketProposal = z.object({
   client_id: z
     .string()
@@ -287,60 +162,38 @@ const ProposeTicketsInput = z.object({
   expected_rev: ExpectedRevision,
 });
 
-const RedTeamFindingInput = z.object({
-  layer_key: z.string().min(1).max(200),
+const FailureFindingInput = z.object({
   section_id: SectionId,
   severity: z
     .enum(["fatal", "gap", "note"])
-    .describe("Use fatal only for a flaw that makes the layers below it not worth reviewing"),
+    .describe("Use fatal only for a flaw that makes later review not useful"),
   summary: z.string().min(1).max(2_000),
   detail: z.string().min(1).max(20_000),
 });
 
-const ProposedDiffInput = z.object({
-  finding_id: z.string().min(1).max(400).describe("The id of a finding this pass reported"),
-  after: z
-    .string()
-    .max(200_000)
-    .describe("Replacement Markdown for the finding's section, offered for a person to accept"),
-});
-
 const GapCheckInput = z.object({
-  red_team: z
-    .array(RedTeamFindingInput)
+  findings: z
+    .array(FailureFindingInput)
     .max(50)
     .optional()
-    .describe("Edge cases, migration risk, rollback and failure modes you found"),
-  proposed_diffs: z
-    .array(ProposedDiffInput)
-    .max(50)
-    .optional()
-    .describe("Optional remedies for the findings this pass computes; never applied by the pass"),
+    .describe("Edge cases, migration risk, rollback problems, and failure modes you found"),
 });
 
 const GapCheckFindingOutput = z.object({
-  id: z.string(),
-  kind: z.string(),
   severity: z.enum(["fatal", "gap", "note"]),
-  layer_key: z.string(),
   section_id: SectionId,
-  requirement_id: z.string().nullable(),
   summary: z.string(),
   detail: z.string(),
-  has_proposed_diff: z.boolean(),
 });
 
 const GapCheckOutput = z.object({
   run_id: z.string().uuid(),
   rev: Revision,
-  stopped_at_layer: z
-    .string()
-    .nullable()
-    .describe("Set when a fatal flaw halted the pass; do not polish the layers below it"),
+  stopped_early: z.boolean().describe("True when a fatal flaw halted the pass"),
   suppressed_count: z
     .number()
     .int()
-    .describe("Findings withheld because they sit below the halting layer"),
+    .describe("Findings withheld because they come after the fatal flaw"),
   covered_requirements: z.number().int(),
   gap_requirements: z.number().int(),
   uncited_content: z.number().int(),
@@ -379,41 +232,6 @@ const MutationOutput = z.object({
   checkpoint_id: z.string().uuid().optional(),
 });
 
-const ProposeAlternativesOutput = z.object({
-  set_id: z.string(),
-  applied: z.boolean(),
-  new_rev: Revision,
-  concurrent_editors: z.array(z.string()),
-});
-
-const UpdateNotesOutput = z.object({
-  applied: z.boolean(),
-  new_rev: Revision,
-  concurrent_editors: z.array(z.string()),
-  untagged_bullets: z
-    .number()
-    .describe("Bullets with no destination section. Keep talking while this grows"),
-  corrections: z
-    .array(
-      z.object({
-        bullet_id: z.string(),
-        your_text: z.string(),
-        their_text: z.string(),
-        kept_after_you_dropped_it: z.boolean(),
-      }),
-    )
-    .describe("Bullets a person rewrote. Their words won; correct your model"),
-});
-
-const DistillNotesOutput = z.object({
-  applied: z.boolean(),
-  new_rev: Revision,
-  concurrent_editors: z.array(z.string()),
-  written_section_ids: z.array(SectionId),
-  refuted_bullets: z.number().describe("Contradicted bullets, which never enter the spec"),
-  untagged_bullets: z.number().describe("Bullets that had no destination when the stage closed"),
-});
-
 export interface SpecReference {
   id: string;
 }
@@ -436,39 +254,12 @@ export interface SpecMutationResult {
   checkpointId?: string;
 }
 
-export interface SpecAlternativesProposalResult extends SpecMutationResult {
-  setId: string;
-}
-
-export interface SpecWorkingNotesStageView {
-  notes: SpecWorkingNotes;
-  archivedAt: string | null;
-  untaggedBullets: number;
-}
-
-export interface SpecNotesUpdateResult extends SpecMutationResult {
-  stage: SpecWorkingNotesStageView;
-  corrections: SpecNoteCorrection[];
-}
-
-export interface SpecNotesDistillResult extends SpecMutationResult {
-  stage: SpecWorkingNotesStageView;
-  distillation: WorkingNotesDistillation;
-}
-
 export interface SpecMutationContext {
   actorUserId?: string;
   sessionId: string;
   toolCallId: string;
   expectedRev?: bigint;
 }
-
-/**
- * A proposal stores a card set and writes no document, so it carries no
- * revision guard. The type says so, which is what stops a guard from being
- * accepted and then ignored.
- */
-export type SpecProposalContext = Omit<SpecMutationContext, "expectedRev">;
 
 export interface SpecToolDocumentService {
   read(specId: string, sectionId?: string): Promise<LiveSpecRead>;
@@ -508,28 +299,6 @@ export interface SpecToolDocumentService {
       source: string;
     },
   ): Promise<SpecMutationResult>;
-  proposeAlternatives(
-    specId: string,
-    input: SpecProposalContext & {
-      sectionId: string;
-      options: SpecAlternativeOption[];
-      comparison: SpecAlternativesComparison;
-      leanKey: string | null;
-    },
-  ): Promise<SpecAlternativesProposalResult>;
-  decideAlternative(
-    specId: string,
-    input: SpecMutationContext & {
-      setId: string;
-      optionKey: string | null;
-      reason: string;
-    },
-  ): Promise<SpecMutationResult>;
-  updateNotes(
-    specId: string,
-    input: SpecMutationContext & { notes: SpecWorkingNotesInput },
-  ): Promise<SpecNotesUpdateResult>;
-  distillNotes(specId: string, input: SpecMutationContext): Promise<SpecNotesDistillResult>;
   proposeTickets(
     specId: string,
     input: SpecMutationContext & {
@@ -561,9 +330,8 @@ export interface SpecAgentPresence {
   }): Promise<void>;
 }
 
-/** A red-team finding: the judgment the deterministic pass cannot compute. */
-export interface SpecRedTeamFinding {
-  layerKey: string;
+/** A failure that needs agent judgment beyond the deterministic pass. */
+export interface SpecFailureFinding {
   sectionId: string;
   severity: GapFindingSeverity;
   summary: string;
@@ -585,8 +353,7 @@ export interface SpecGapCheckRunner {
     sessionId: string | null;
     requestFingerprint: string;
     actorUserId: string | null;
-    redTeam?: readonly SpecRedTeamFinding[];
-    proposedDiffs?: readonly { findingId: string; after: string }[];
+    redTeam?: readonly SpecFailureFinding[];
   }): Promise<SpecGapCheckRunResult>;
 }
 
@@ -598,7 +365,7 @@ export interface SpecToolDeps {
   gapCheck: SpecGapCheckRunner;
 }
 
-function proposalContext(ctx: ToolContext): SpecProposalContext {
+function baseMutationContext(ctx: ToolContext): Omit<SpecMutationContext, "expectedRev"> {
   return {
     ...(ctx.userId === undefined ? {} : { actorUserId: ctx.userId }),
     sessionId: ctx.sessionId,
@@ -611,7 +378,7 @@ function mutationContext(
   expectedRev: string | undefined,
 ): SpecMutationContext {
   return {
-    ...proposalContext(ctx),
+    ...baseMutationContext(ctx),
     ...(expectedRev === undefined ? {} : { expectedRev: BigInt(expectedRev) }),
   };
 }
@@ -651,23 +418,6 @@ function updateSelection(
     endAnchor: args.selection_end,
     selectedText: args.selection_text,
     sliceFingerprint: args.selection_fingerprint,
-  };
-}
-
-function notesInput(args: z.output<typeof UpdateNotesInput>): SpecWorkingNotesInput {
-  return {
-    clusters: args.clusters.map((cluster) => ({
-      id: cluster.id,
-      theme: cluster.theme,
-      sectionIds: cluster.section_ids ?? [],
-      bullets: cluster.bullets.map((bullet) => ({
-        id: bullet.id,
-        mark: bullet.mark,
-        kind: bullet.kind,
-        text: bullet.text,
-        provenance: bullet.provenance ?? null,
-      })),
-    })),
   };
 }
 
@@ -900,130 +650,6 @@ export function registerSpecTools(
   });
 
   registry.register({
-    name: "spec_propose_alternatives",
-    taskTypes: SPEC_TASK_TYPES,
-    description:
-      "Propose two or three alternatives as cards in the canvas. section_id must be the template's alternatives section. Each card carries a one-line premise and exactly three signed trade-off lines (+ gain, - cost, ~ caveat). The comparison holds the numbers, under one provenance caption that says what you verified them against. This stores the set; it does not write the section, so it takes no expected_rev.",
-    input: ProposeAlternativesInput,
-    output: ProposeAlternativesOutput,
-    handling: "handled",
-    execution: "sync",
-    handler: async (ctx, args) => {
-      const spec = await requireSpec(ctx, deps);
-      const result = await withSectionPresence(ctx, deps, spec.id, args.section_id, () =>
-        deps.documents.proposeAlternatives(spec.id, {
-          ...proposalContext(ctx),
-          sectionId: args.section_id,
-          options: args.options.map((option) => ({
-            key: option.key,
-            title: option.title,
-            tradeoffs: option.tradeoffs.map((tradeoff) => ({
-              sign: tradeoff.sign,
-              text: tradeoff.text,
-            })),
-          })),
-          comparison: {
-            provenance: args.comparison_provenance,
-            rows: args.comparison_rows.map((row) => ({
-              axis: row.axis,
-              cells: row.cells.map((cell) => ({
-                optionKey: cell.option_key,
-                value: cell.value,
-              })),
-            })),
-          },
-          leanKey: args.lean_key ?? null,
-        }),
-      );
-      return {
-        set_id: result.setId,
-        applied: result.applied,
-        new_rev: result.newRev.toString(),
-        concurrent_editors: result.concurrentEditors,
-      };
-    },
-  });
-
-  registry.register({
-    name: "spec_decide_alternative",
-    taskTypes: SPEC_TASK_TYPES,
-    description:
-      "Record the pick for a proposed alternatives set and write the alternatives section with every option, the comparison, and the reason the winner won. Omit option_key when the author chose a hybrid that no card holds.",
-    input: DecideAlternativeInput,
-    output: MutationOutput,
-    handling: "handled",
-    execution: "sync",
-    handler: async (ctx, args) => {
-      const spec = await requireSpec(ctx, deps);
-      const result = await deps.documents.decideAlternative(spec.id, {
-        ...mutationContext(ctx, args.expected_rev),
-        setId: args.set_id,
-        optionKey: args.option_key ?? null,
-        reason: args.reason,
-      });
-      return finishMutation(ctx, deps, spec.id, result);
-    },
-  });
-
-  registry.register({
-    name: "spec_update_notes",
-    taskTypes: SPEC_TASK_TYPES,
-    description:
-      "Replace the working notes on the canvas with your current model of the conversation. Send every cluster and bullet each time, and keep a bullet id stable. While the notes are open you write no spec section. A person can rewrite any bullet: their words win, and the reply names each one.",
-    input: UpdateNotesInput,
-    output: UpdateNotesOutput,
-    handling: "handled",
-    execution: "sync",
-    handler: async (ctx, args) => {
-      const spec = await requireSpec(ctx, deps);
-      const result = await deps.documents.updateNotes(spec.id, {
-        ...mutationContext(ctx, args.expected_rev),
-        notes: notesInput(args),
-      });
-      await finishMutation(ctx, deps, spec.id, result);
-      return {
-        applied: result.applied,
-        new_rev: result.newRev.toString(),
-        concurrent_editors: result.concurrentEditors,
-        untagged_bullets: result.stage.untaggedBullets,
-        corrections: result.corrections.map((correction) => ({
-          bullet_id: correction.bulletId,
-          your_text: correction.agentText,
-          their_text: correction.personText,
-          kept_after_you_dropped_it: correction.keptAgainstDrop,
-        })),
-      };
-    },
-  });
-
-  registry.register({
-    name: "spec_distill_notes",
-    taskTypes: SPEC_TASK_TYPES,
-    description:
-      "Close the talk-it-through stage: write each tagged cluster into its destination section and archive the notes as a read-only record. A section with no tagged material stays empty. Never invent content to fill it.",
-    input: DistillNotesInput,
-    output: DistillNotesOutput,
-    handling: "handled",
-    execution: "sync",
-    handler: async (ctx, args) => {
-      const spec = await requireSpec(ctx, deps);
-      const result = await deps.documents.distillNotes(
-        spec.id,
-        mutationContext(ctx, args.expected_rev),
-      );
-      await finishMutation(ctx, deps, spec.id, result);
-      return {
-        applied: result.applied,
-        new_rev: result.newRev.toString(),
-        concurrent_editors: result.concurrentEditors,
-        written_section_ids: result.distillation.sections.map((section) => section.sectionId),
-        refuted_bullets: result.distillation.refutedBullets,
-        untagged_bullets: result.distillation.untaggedBullets,
-      };
-    },
-  });
-
-  registry.register({
     name: "spec_propose_tickets",
     taskTypes: SPEC_TASK_TYPES,
     description:
@@ -1047,11 +673,10 @@ export function registerSpecTools(
     name: "spec_gap_check",
     taskTypes: SPEC_TASK_TYPES,
     description:
-      "Run the gap check: trace every requirement to the layers below it, flag content that " +
-      "cites no requirement, and record your red-team findings. The pass reports only — it " +
-      "never edits the spec. Each finding becomes an open question or a proposed diff that a " +
-      "person accepts. If the result names a stopped_at_layer, fix that layer before you look " +
-      "at anything below it.",
+      "Look for what breaks: trace each requirement to supporting sections, flag content that " +
+      "cites no requirement, and include the failures that you found. This tool reports only " +
+      "and never edits the spec. Record each result with spec_add_open_question in the " +
+      "applicable section.",
     input: GapCheckInput,
     output: GapCheckOutput,
     handling: "handled",
@@ -1063,16 +688,11 @@ export function registerSpecTools(
         sessionId: ctx.sessionId,
         requestFingerprint: `agent-gap-check:${spec.id}:${ctx.sessionId}:${ctx.toolCallId}`,
         actorUserId: ctx.userId ?? null,
-        redTeam: (args.red_team ?? []).map((finding) => ({
-          layerKey: finding.layer_key,
+        redTeam: (args.findings ?? []).map((finding) => ({
           sectionId: finding.section_id,
           severity: finding.severity,
           summary: finding.summary,
           detail: finding.detail,
-        })),
-        proposedDiffs: (args.proposed_diffs ?? []).map((diff) => ({
-          findingId: diff.finding_id,
-          after: diff.after,
         })),
       });
       return gapCheckOutput(run);
@@ -1085,21 +705,16 @@ function gapCheckOutput(run: SpecGapCheckRunResult): z.input<typeof GapCheckOutp
   return {
     run_id: run.id,
     rev: run.semanticDocSeq.toString(),
-    stopped_at_layer: run.stoppedAtLayerKey,
+    stopped_early: run.stoppedAtLayerKey !== null,
     suppressed_count: run.suppressedCount,
     covered_requirements: requirementRows.filter((row) => row.verdict === "covered").length,
     gap_requirements: requirementRows.filter((row) => row.verdict === "gap").length,
     uncited_content: run.matrix.rows.filter((row) => row.verdict === "scope").length,
     findings: run.findings.map((finding) => ({
-      id: finding.id,
-      kind: finding.kind,
       severity: finding.severity,
-      layer_key: finding.layerKey,
       section_id: finding.sectionId,
-      requirement_id: finding.requirementId,
       summary: finding.summary,
       detail: finding.detail,
-      has_proposed_diff: finding.proposedDiff !== null,
     })),
   };
 }

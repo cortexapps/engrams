@@ -2,8 +2,6 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import type { Node as ProseMirrorNode, ResolvedPos } from "prosemirror-model";
 
-import type { SpecAlternativesTranscriptChip } from "./alternatives.ts";
-
 export type SectionState = "open" | "proposed" | "settled" | "n/a";
 
 export interface SectionStateValue {
@@ -61,8 +59,7 @@ export interface TrackedEditTranscriptChip {
 
 export type SpecTranscriptChip =
   | SectionStateTranscriptChip
-  | TrackedEditTranscriptChip
-  | SpecAlternativesTranscriptChip;
+  | TrackedEditTranscriptChip;
 
 /** Hash the complete selected slice and its structural boundaries. */
 export function selectionSliceFingerprint(

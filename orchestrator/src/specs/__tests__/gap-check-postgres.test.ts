@@ -23,8 +23,8 @@ describe("PostgresGapCheckStore with live Postgres", () => {
   beforeAll(async () => {
     if (!reachable || !pool) return;
     await pool.query(
-      `INSERT INTO spec_template (id, name, layers, sections, stage_flags)
-       VALUES ($1, 'Gap check test template', '[]', '[]', '{}')`,
+      `INSERT INTO spec_template (id, name, layers, sections)
+       VALUES ($1, 'Gap check test template', '[]', '[]')`,
       [templateId],
     );
     await pool.query(
@@ -250,8 +250,8 @@ describe("PostgresGapCheckStore with live Postgres", () => {
     const throwawayTemplateId = randomUUID();
     const throwawaySpecId = randomUUID();
     await pool!.query(
-      `INSERT INTO spec_template (id, name, layers, sections, stage_flags)
-       VALUES ($1, 'Cascade template', '[]', '[]', '{}')`,
+      `INSERT INTO spec_template (id, name, layers, sections)
+       VALUES ($1, 'Cascade template', '[]', '[]')`,
       [throwawayTemplateId],
     );
     await pool!.query(

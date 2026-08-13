@@ -70,7 +70,6 @@ const builtIn: SpecTemplate = {
       allowNa: false,
     },
   ],
-  stageFlags: { alternatives: "on", talkItThrough: "suggested", gapCheck: "off" },
 };
 
 const orgTemplate: SpecTemplate = {
@@ -79,7 +78,6 @@ const orgTemplate: SpecTemplate = {
   name: "Incident review",
   description: "A post-incident record.",
   builtIn: false,
-  stageFlags: { alternatives: "off", talkItThrough: "on", gapCheck: "on" },
 };
 
 beforeEach(() => {
@@ -93,7 +91,7 @@ beforeEach(() => {
 });
 
 describe("NewSpecSheet", () => {
-  test("template cards show structure and the process stages", async () => {
+  test("template cards show their document structure", async () => {
     render(<NewSpecSheet open onOpenChange={() => {}} />);
 
     const cards = await screen.findAllByRole("radio");
@@ -105,18 +103,9 @@ describe("NewSpecSheet", () => {
     expect(within(designDoc).getByText("System")).toBeTruthy();
     expect(within(designDoc).getByText("Rollout")).toBeTruthy();
 
-    // Process: all three stage flags, in the template editor's own words (R2).
-    expect(within(designDoc).getByText("Alternatives")).toBeTruthy();
-    expect(within(designDoc).getByText("Talk it through")).toBeTruthy();
-    expect(within(designDoc).getByText("Gap check")).toBeTruthy();
-    expect(within(designDoc).getByText("On")).toBeTruthy();
-    expect(within(designDoc).getByText("Suggested")).toBeTruthy();
-    expect(within(designDoc).getByText("Off")).toBeTruthy();
-
-    // The other template shows its own, different stages.
     const incident = cards[1]!.closest("label")!;
     expect(within(incident).getByText("A post-incident record.")).toBeTruthy();
-    expect(within(incident).getAllByText("On")).toHaveLength(2);
+    expect(within(designDoc).queryByText("Process")).toBeNull();
   });
 
   test("the organization default is preselected", async () => {

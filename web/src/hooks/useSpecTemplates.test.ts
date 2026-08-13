@@ -23,7 +23,6 @@ const definition: SpecTemplateDefinition = {
       allowNa: false,
     },
   ],
-  stageFlags: { alternatives: "on", talkItThrough: "suggested", gapCheck: "on" },
 };
 
 afterEach(() => vi.unstubAllGlobals());

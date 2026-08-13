@@ -57,7 +57,7 @@ export interface GapCheckStatus {
 
 /** A red-team finding: agent judgment the deterministic pass cannot compute. */
 export interface RedTeamFinding {
-  layerKey: string;
+  layerKey?: string;
   sectionId: string;
   severity: GapFindingSeverity;
   summary: string;
@@ -199,7 +199,11 @@ export class GapCheckService {
       analysis = analyzeTraceability({ layers, sections });
     } catch (error) {
       if (error instanceof TraceabilityInputError) {
-        throw new GapCheckError("untraceable_document", error.message);
+        const message =
+          error.code === "unknown_layer"
+            ? "A spec section names an unknown scope."
+            : "A requirements section is required to trace coverage.";
+        throw new GapCheckError("untraceable_document", message);
       }
       throw error;
     }
@@ -415,24 +419,22 @@ function redTeamFinding(
   layers: readonly TraceabilityLayer[],
   sections: readonly TraceabilitySection[],
 ): GapFinding {
-  if (!layers.some((layer) => layer.key === finding.layerKey)) {
-    throw new GapCheckError(
-      "unknown_layer",
-      `A red-team finding names an unknown layer: ${finding.layerKey}`,
-    );
-  }
   const section = sections.find((candidate) => candidate.id === finding.sectionId);
   if (!section) {
     throw new GapCheckError(
       "unknown_section",
-      `A red-team finding names an unknown section: ${finding.sectionId}`,
+      `A finding names an unknown section: ${finding.sectionId}`,
     );
+  }
+  const layerKey = finding.layerKey ?? section.layerKey;
+  if (!layers.some((layer) => layer.key === layerKey)) {
+    throw new GapCheckError("unknown_layer", `A finding names an unknown scope: ${layerKey}`);
   }
   return {
     id: `red_team:${finding.sectionId}:${index}`,
     kind: "red_team",
     severity: finding.severity,
-    layerKey: finding.layerKey,
+    layerKey,
     sectionId: section.id,
     sectionTitle: section.title,
     requirementId: null,

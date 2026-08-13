@@ -2,11 +2,7 @@ import { createRouterTransport } from "@connectrpc/connect";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type {
-  SpecAlternativesStage,
-  SpecSelectionAction,
-  SpecSelectionActionPayload,
-} from "@engrams/spec-document";
+import type { SpecSelectionAction, SpecSelectionActionPayload } from "@engrams/spec-document";
 
 import { renderWithProviders } from "@/test-utils";
 import { SessionService } from "@/gen/engram/app/v1/session_pb";
@@ -16,58 +12,11 @@ const view: {
   lifecycle: "draft" | "published";
   sessionId: string | null;
   publishedCheckpointId: string | null;
-  alternatives: SpecAlternativesStage | null;
 } = {
   lifecycle: "draft",
   sessionId: null,
   publishedCheckpointId: null,
-  alternatives: null,
 };
-
-const alternativesStage: SpecAlternativesStage = {
-  proposal: {
-    kind: "spec_alternatives_proposed",
-    specId: "spec-1",
-    sectionId: "alternatives",
-    setId: "set-1",
-    options: [
-      {
-        key: "A",
-        title: "Second org-level bucket",
-        tradeoffs: [
-          { sign: "+", text: "no schema change on the hot path" },
-          { sign: "-", text: "two buckets to reason about" },
-          { sign: "~", text: "billing needs a separate meter" },
-        ],
-      },
-      {
-        key: "B",
-        title: "Hierarchical limiter",
-        tradeoffs: [
-          { sign: "+", text: "one code path" },
-          { sign: "-", text: "touches every gateway call site" },
-          { sign: "~", text: "meter fits at the walk root" },
-        ],
-      },
-    ],
-    comparison: {
-      provenance: "verified against gateway/limits.rs @ 8f2c1a4",
-      rows: [
-        {
-          axis: "Blast radius",
-          cells: [
-            { optionKey: "A", value: "2 files" },
-            { optionKey: "B", value: "31 call sites" },
-          ],
-        },
-      ],
-    },
-    leanKey: "B",
-  },
-  decision: null,
-};
-
-const decideMutate = vi.fn();
 
 const pinned = {
   id: "checkpoint-1",
@@ -170,16 +119,13 @@ vi.mock("@/components/spec", () => ({
     specId,
     revision,
     selectionActions,
-    notesActions,
   }: {
     specId: string;
     revision: string;
     selectionActions?: { onAction: (payload: SpecSelectionActionPayload) => void };
-    notesActions?: { onDistill: () => void };
   }) => (
     <div aria-label="Collaborative spec canvas">
       {specId}:{revision}
-      {notesActions && <button onClick={notesActions.onDistill}>Draft the spec</button>}
       {selectionActions &&
         (["refine", "wrong", "cut", "ask", "custom"] as const).map((action) => (
           <button key={action} onClick={() => selectionActions.onAction(actionPayload(action))}>
@@ -209,8 +155,6 @@ vi.mock("@/hooks/useSpecTickets", () => ({
   useSpecTicketCommand: () => ({ mutateAsync: vi.fn() }),
   writeTree: vi.fn(),
 }));
-
-const distillMutate = vi.fn();
 
 vi.mock("@/hooks/useSpecRead", () => ({
   useSpecRead: () => ({
@@ -260,9 +204,6 @@ vi.mock("@/hooks/useSpecRead", () => ({
   useRestoreSpecSection: () => ({ mutate: restoreMutate, isPending: false }),
   useSetSpecSectionState: () => ({ mutate: setStateMutate, isPending: false }),
   useUndoSpecSectionState: () => ({ mutate: undoStateMutate, isPending: false }),
-  useSpecAlternatives: () => ({ data: view.alternatives, isPending: false, error: null }),
-  useDecideSpecAlternative: () => ({ mutate: decideMutate, isPending: false, error: null }),
-  useDistillSpecNotes: () => ({ mutate: distillMutate, isPending: false }),
 }));
 
 const desktopWidth = window.innerWidth;
@@ -280,13 +221,10 @@ beforeEach(() => {
   view.lifecycle = "draft";
   view.sessionId = null;
   view.publishedCheckpointId = null;
-  view.alternatives = null;
-  decideMutate.mockReset();
   restoreMutate.mockReset();
   readRefetch.mockReset();
   setStateMutate.mockClear();
   undoStateMutate.mockClear();
-  distillMutate.mockClear();
 });
 
 describe("SpecReadPage", () => {
@@ -328,89 +266,6 @@ describe("SpecReadPage", () => {
 
     expect(await screen.findByLabelText("Collaborative spec canvas")).toBeTruthy();
     expect(screen.queryByLabelText("Drafting session")).toBeNull();
-  });
-
-  it("keeps the alternatives stage out of the canvas until the agent proposes one", async () => {
-    renderWithProviders(<SpecReadPage specId="spec-1" />);
-
-    expect(await screen.findByLabelText("Collaborative spec canvas")).toBeTruthy();
-    expect(screen.queryByLabelText("Alternatives")).toBeNull();
-    expect(screen.getByRole("tab", { name: "Sections" })).toBeTruthy();
-  });
-
-  it("takes the pane for an open stage, and keeps the doc one scroll below", async () => {
-    view.sessionId = "session-1";
-    view.alternatives = alternativesStage;
-    renderWithProviders(<SpecReadPage specId="spec-1" />);
-
-    expect(await screen.findByLabelText("Alternatives")).toBeTruthy();
-    expect(screen.getByLabelText("Collaborative spec canvas")).toBeTruthy();
-    expect(screen.queryByRole("tab", { name: "Sections" })).toBeNull();
-  });
-
-  it("returns the rail once the pick lands", async () => {
-    view.sessionId = "session-1";
-    view.alternatives = {
-      proposal: alternativesStage.proposal,
-      decision: {
-        kind: "spec_alternatives_decided",
-        specId: "spec-1",
-        sectionId: "alternatives",
-        setId: "set-1",
-        pickedKey: "B",
-        reason: "One code path.",
-        decidedBy: "author",
-      },
-    };
-    renderWithProviders(<SpecReadPage specId="spec-1" />);
-
-    expect(await screen.findByRole("tab", { name: "Sections" })).toBeTruthy();
-    expect(screen.getByRole("status").textContent).toContain("Picked B · Hierarchical limiter");
-  });
-
-  it("lets an org member pick even when no session is live", async () => {
-    const user = userEvent.setup();
-    view.alternatives = alternativesStage;
-    renderWithProviders(<SpecReadPage specId="spec-1" />);
-
-    expect(await screen.findByRole("button", { name: "Pick B" })).toBeTruthy();
-    // The hybrid reply needs a conversation to land in.
-    expect(screen.queryByRole("button", { name: "Reply with a hybrid" })).toBeNull();
-
-    await user.click(screen.getByRole("button", { name: "Pick A" }));
-    await user.type(screen.getByLabelText(/Why does A win\?/), "Smallest blast radius.");
-    await user.click(screen.getByRole("button", { name: "Confirm A" }));
-    expect(decideMutate).toHaveBeenCalledWith({
-      setId: "set-1",
-      optionKey: "A",
-      reason: "Smallest blast radius.",
-    });
-  });
-
-  it("sends the pick with the set it was shown for", async () => {
-    const user = userEvent.setup();
-    view.sessionId = "session-1";
-    view.alternatives = alternativesStage;
-    renderWithProviders(<SpecReadPage specId="spec-1" />);
-
-    await user.click(await screen.findByRole("button", { name: "Pick B" }));
-    await user.type(screen.getByLabelText(/Why does B win\?/), "One code path.");
-    await user.click(screen.getByRole("button", { name: "Confirm B" }));
-
-    expect(decideMutate).toHaveBeenCalledWith({
-      setId: "set-1",
-      optionKey: "B",
-      reason: "One code path.",
-    });
-  });
-
-  it("closes the talk-it-through stage from the canvas", async () => {
-    const user = userEvent.setup();
-    renderWithProviders(<SpecReadPage specId="spec-1" />);
-
-    await user.click(await screen.findByRole("button", { name: "Draft the spec" }));
-
-    expect(distillMutate).toHaveBeenCalledTimes(1);
   });
 
   it("shows the locked template with the reason it cannot change", async () => {

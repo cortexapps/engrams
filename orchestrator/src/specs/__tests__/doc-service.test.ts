@@ -925,9 +925,8 @@ describe("SpecDocumentService with live Postgres", () => {
   beforeAll(async () => {
     if (!liveDbReachable || !livePool) return;
     await livePool.query(
-      `INSERT INTO spec_template
-         (id, name, layers, sections, stage_flags)
-       VALUES ($1, 'Test template', '[]', '[]', '{}')`,
+      `INSERT INTO spec_template (id, name, layers, sections)
+       VALUES ($1, 'Test template', '[]', '[]')`,
       [templateId],
     );
     await livePool.query(

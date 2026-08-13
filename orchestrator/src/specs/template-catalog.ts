@@ -4,13 +4,7 @@ import { and, asc, eq, isNull, or } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import { getDb } from "../db/client.ts";
-import {
-  DEFAULT_SPEC_TEMPLATE_STAGE_FLAGS,
-  specTemplate,
-  type SpecTemplateLayer,
-  type SpecTemplateSection,
-  type SpecTemplateStageFlags,
-} from "../db/schema.ts";
+import { specTemplate, type SpecTemplateLayer, type SpecTemplateSection } from "../db/schema.ts";
 import * as schema from "../db/schema.ts";
 
 export const ENGINEERING_DESIGN_TEMPLATE_ID = "00000000-0000-4000-8000-000000000115";
@@ -20,7 +14,6 @@ export interface SpecTemplateDefinition {
   description: string;
   layers: SpecTemplateLayer[];
   sections: SpecTemplateSection[];
-  stageFlags: SpecTemplateStageFlags;
 }
 
 export interface SpecTemplateCatalogItem extends SpecTemplateDefinition {
@@ -35,7 +28,6 @@ export interface SpecTemplateSnapshot {
   templateId: string;
   layers: SpecTemplateLayer[];
   sections: SpecTemplateSection[];
-  stageFlags: SpecTemplateStageFlags;
 }
 
 export const ENGINEERING_DESIGN_TEMPLATE: SpecTemplateDefinition = {
@@ -151,7 +143,6 @@ export const ENGINEERING_DESIGN_TEMPLATE: SpecTemplateDefinition = {
       true,
     ),
   ],
-  stageFlags: { ...DEFAULT_SPEC_TEMPLATE_STAGE_FLAGS },
 };
 
 function section(
@@ -254,7 +245,6 @@ export class SpecTemplateCatalog {
       templateId: template.id,
       layers: structuredClone(template.layers),
       sections: structuredClone(template.sections),
-      stageFlags: structuredClone(template.stageFlags),
     };
   }
 }
@@ -350,7 +340,6 @@ export function validateSpecTemplate(input: unknown): SpecTemplateDefinition {
     description,
     layers,
     sections,
-    stageFlags: validateStageFlags(input["stageFlags"]),
   };
 }
 
@@ -390,22 +379,6 @@ function validateSection(value: unknown, index: number): SpecTemplateSection {
   };
 }
 
-function validateStageFlags(value: unknown): SpecTemplateStageFlags {
-  if (!isObject(value)) {
-    throw new SpecTemplateValidationError("stageFlags must be an object");
-  }
-  return {
-    alternatives: stageMode(value["alternatives"], "stageFlags.alternatives"),
-    talkItThrough: stageMode(value["talkItThrough"], "stageFlags.talkItThrough"),
-    gapCheck: stageMode(value["gapCheck"], "stageFlags.gapCheck"),
-  };
-}
-
-function stageMode(value: unknown, field: string): "on" | "suggested" | "off" {
-  if (value === "on" || value === "suggested" || value === "off") return value;
-  throw new SpecTemplateValidationError(`${field} must be on, suggested, or off`);
-}
-
 function requiredString(value: unknown, field: string): string {
   const result = text(value, field).trim();
   if (!result) throw new SpecTemplateValidationError(`${field} must not be empty`);
@@ -434,7 +407,6 @@ function toRow(row: typeof specTemplate.$inferSelect): SpecTemplateRow {
     description: row.description ?? "",
     layers: row.layers,
     sections: row.sections,
-    stageFlags: row.stageFlags,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -446,7 +418,6 @@ function definitionOf(row: SpecTemplateRow): SpecTemplateDefinition {
     description: row.description,
     layers: row.layers,
     sections: row.sections,
-    stageFlags: row.stageFlags,
   };
 }
 

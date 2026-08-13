@@ -53,7 +53,6 @@ const SNAPSHOT: SpecTemplateSnapshot = {
       allowNa: false,
     },
   ],
-  stageFlags: { alternatives: "on", talkItThrough: "suggested", gapCheck: "off" },
 };
 
 class MemorySpecCreateStore implements SpecCreateStore {

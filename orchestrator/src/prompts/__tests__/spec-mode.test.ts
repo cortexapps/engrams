@@ -1,25 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
-import type { SpecTemplateStageFlags, SpecTemplateStageMode } from "../../db/schema.ts";
 import { ENGINEERING_DESIGN_TEMPLATE } from "../../specs/template-catalog.ts";
 import { SPEC_MODE_SYSTEM_PROMPT, specModeSystemPrompt } from "../spec-mode.ts";
 
-/** The built-in template, with the stage flags that a test needs. */
-function context(flags: Partial<SpecTemplateStageFlags> = {}) {
+function context() {
   return {
     layers: ENGINEERING_DESIGN_TEMPLATE.layers,
     sections: ENGINEERING_DESIGN_TEMPLATE.sections,
-    stageFlags: {
-      ...ENGINEERING_DESIGN_TEMPLATE.stageFlags,
-      ...flags,
-    },
   };
 }
-
-const ALTERNATIVES_STAGE_HEADING = "### Alternatives stage";
-const ALTERNATIVES_STAGE_BODY = "at least two credible directions";
-const TALK_IT_THROUGH_STAGE_HEADING = "### Talk it through stage";
-const GAP_CHECK_STAGE_HEADING = "### Gap check stage";
 
 describe("spec mode prompt", () => {
   test("keeps the standing rules with no template", () => {
@@ -53,63 +42,20 @@ describe("spec mode prompt", () => {
     expect(prompt).toContain("- API (layer: Contract; optional; n/a is permitted with a reason)");
   });
 
-  test("a stage that is off contributes no instruction", () => {
-    const on = specModeSystemPrompt(context({ alternatives: "on" }));
-    const off = specModeSystemPrompt(context({ alternatives: "off" }));
+  test("keeps document sections without the deleted process machinery", () => {
+    const prompt = specModeSystemPrompt(context());
 
-    expect(on).toContain(ALTERNATIVES_STAGE_HEADING);
-    expect(on).toContain(ALTERNATIVES_STAGE_BODY);
-    expect(off).not.toContain(ALTERNATIVES_STAGE_HEADING);
-    expect(off).not.toContain(ALTERNATIVES_STAGE_BODY);
-    // A stage is process and a section is structure: the flag removes the
-    // stage, and it never removes the section of the same name.
-    expect(off).toContain("- Alternatives (layer: System; required) — Compare the serious");
-    // The other stages are untouched.
-    expect(off).toContain(TALK_IT_THROUGH_STAGE_HEADING);
-    expect(off).toContain(GAP_CHECK_STAGE_HEADING);
-  });
-
-  test("every stage disappears when the template turns all of them off", () => {
-    const allOff: SpecTemplateStageFlags = {
-      alternatives: "off",
-      talkItThrough: "off",
-      gapCheck: "off",
-    };
-    const prompt = specModeSystemPrompt(context(allOff));
-
-    for (const heading of [
-      ALTERNATIVES_STAGE_HEADING,
-      TALK_IT_THROUGH_STAGE_HEADING,
-      GAP_CHECK_STAGE_HEADING,
-    ]) {
-      expect(prompt).not.toContain(heading);
-    }
+    expect(prompt).toContain("- Alternatives (layer: System; required) — Compare the serious");
     expect(prompt).toContain("### The structure of this spec");
-  });
-
-  test("on runs a stage and suggested offers it", () => {
-    const on = specModeSystemPrompt(context({ talkItThrough: "on" }));
-    const suggested = specModeSystemPrompt(context({ talkItThrough: "suggested" }));
-
-    expect(on).toContain("This spec uses the talk-it-through stage.");
-    expect(on).not.toContain("This spec offers the talk-it-through stage.");
-    expect(suggested).toContain("This spec offers the talk-it-through stage.");
-    expect(suggested).toContain("start it only when they accept");
-    expect(suggested).not.toContain("This spec uses the talk-it-through stage.");
-    // Both modes carry the same description of the stage.
-    const body = "you keep the working notes with spec_update_notes";
-    expect(on).toContain(body);
-    expect(suggested).toContain(body);
+    expect(prompt).not.toMatch(/\bstage\b/i);
+    expect(prompt).not.toContain("spec_propose_alternatives");
+    expect(prompt).not.toContain("spec_update_notes");
   });
 
   test("the assembled prompt names no harness", () => {
-    for (const mode of ["on", "suggested", "off"] as SpecTemplateStageMode[]) {
-      const prompt = specModeSystemPrompt(
-        context({ alternatives: mode, talkItThrough: mode, gapCheck: mode }),
-      );
-      expect(prompt).not.toContain("Claude");
-      expect(prompt).not.toContain("Codex");
-    }
+    const prompt = specModeSystemPrompt(context());
+    expect(prompt).not.toContain("Claude");
+    expect(prompt).not.toContain("Codex");
   });
 
   test("a section without done criteria omits the line", () => {
@@ -126,7 +72,6 @@ describe("spec mode prompt", () => {
           allowNa: false,
         },
       ],
-      stageFlags: { alternatives: "off", talkItThrough: "off", gapCheck: "off" },
     });
 
     expect(prompt).toContain("- Problem (layer: Intent; required) — State the problem.");

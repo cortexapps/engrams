@@ -42,8 +42,6 @@ export interface SpecPublishTarget {
   sessionId: string | null;
   publishedCheckpointId: string | null;
   publishedAt: Date | null;
-  /** `off` means this template does not run the gap check, so it cannot gate. */
-  gapCheckStage: "on" | "suggested" | "off";
 }
 
 /** The durable publish record — one row per spec. */
@@ -444,12 +442,10 @@ export class SpecPublishService {
     const sections = publishGateSections(proseMirrorDocument(loaded.doc), metadata);
     const openQuestions = await this.openQuestions(target.specId, sections);
     const gapCheck = await this.options.gapCheck.status(target.specId);
-    // A template with the gap check off cannot make a stale pass a gate (R30).
-    const gates = target.gapCheckStage !== "off";
     const gate = evaluatePublishGate({
       sections,
       openQuestions,
-      gapCheckStale: gates && gapCheck.stale,
+      gapCheckStale: gapCheck.stale,
     });
     const publish = await this.options.store.readPublish(target.specId);
     return {
@@ -459,7 +455,7 @@ export class SpecPublishService {
         stale: gapCheck.stale,
         runId: gapCheck.run?.id ?? null,
         ranAt: gapCheck.run?.createdAt ?? null,
-        gates,
+        gates: true,
       },
       publish,
       canPublish:
@@ -517,7 +513,6 @@ interface SpecPublishTargetRow {
   session_id: string | null;
   published_checkpoint_id: string | null;
   published_at: Date | null;
-  gap_check_stage: string | null;
 }
 
 interface SpecPublishRow {
@@ -555,10 +550,8 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
   async readTarget(specId: string): Promise<SpecPublishTarget | null> {
     const result = await this.pool.query<SpecPublishTargetRow>(
       `SELECT spec.id, spec.title, spec.lifecycle, spec.owner_user_id, spec.session_id,
-              spec.published_checkpoint_id, spec.published_at,
-              template.stage_flags->>'gapCheck' AS gap_check_stage
+              spec.published_checkpoint_id, spec.published_at
          FROM spec
-         JOIN spec_template AS template ON template.id = spec.template_id
         WHERE spec.id = $1`,
       [specId],
     );
@@ -575,7 +568,6 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
       sessionId: row.session_id,
       publishedCheckpointId: row.published_checkpoint_id,
       publishedAt: row.published_at,
-      gapCheckStage: stageMode(row.gap_check_stage),
     };
   }
 
@@ -850,10 +842,6 @@ function publishRecord(row: SpecPublishRow): SpecPublishRecord {
     pinnedAt: row.pinned_at,
     completedAt: row.completed_at,
   };
-}
-
-function stageMode(value: string | null): "on" | "suggested" | "off" {
-  return value === "off" || value === "suggested" ? value : "on";
 }
 
 async function rollbackQuietly(client: { query: (sql: string) => Promise<unknown> }): Promise<void> {

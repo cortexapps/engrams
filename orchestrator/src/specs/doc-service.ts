@@ -1,20 +1,13 @@
 import {
   encodedSpecBlockCacheSize,
-  notesSchema,
   readSpecBlockAttrs,
-  readWorkingNotes,
   renderMarkdown,
   schema,
   SPEC_BLOCK_CACHE_MAX_BYTES,
   SPEC_FRAGMENT_NAME,
-  SPEC_NOTES_ARCHIVED_AT_KEY,
-  SPEC_NOTES_FRAGMENT_NAME,
-  SPEC_NOTES_STATE_NAME,
   specNodesSemanticallyEqual,
   validateSpecBlockCachedRender,
   validateRequirementEdit,
-  validateWorkingNotes,
-  type SpecWorkingNotes,
   type TrackedEditTranscriptChip,
 } from "@engrams/spec-document";
 import type { Node as ProseMirrorNode } from "prosemirror-model";
@@ -156,21 +149,6 @@ export class SpecDocumentReadOnlyError extends Error {
   constructor(readonly specId: string) {
     super(`Spec ${specId} is published and read-only`);
     this.name = "SpecDocumentReadOnlyError";
-  }
-}
-
-/** The working notes are distilled, so the archive is read-only (R23). */
-export class SpecNotesArchivedError extends Error {
-  constructor(readonly archivedAt: string) {
-    super(`The working notes were archived at ${archivedAt} and are read-only`);
-    this.name = "SpecNotesArchivedError";
-  }
-}
-
-export class SpecNotesEditError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "SpecNotesEditError";
   }
 }
 
@@ -340,29 +318,6 @@ export function proseMirrorDocument(doc: Y.Doc): ProseMirrorNode {
   return yXmlFragmentToProseMirrorRootNode(fragment, schema);
 }
 
-/**
- * The working notes, or null when the stage never opened (ADR 0114 D6, R21).
- *
- * The notes sit in their own fragment, so every spec renderer, projection,
- * export and checkpoint render passes over them without a filter.
- */
-export function workingNotesDocument(doc: Y.Doc): ProseMirrorNode | null {
-  const fragment = doc.getXmlFragment(SPEC_NOTES_FRAGMENT_NAME);
-  if (fragment.length === 0) return null;
-  return yXmlFragmentToProseMirrorRootNode(fragment, notesSchema);
-}
-
-export function readSpecWorkingNotes(doc: Y.Doc): SpecWorkingNotes | null {
-  const document = workingNotesDocument(doc);
-  return document === null ? null : readWorkingNotes(document);
-}
-
-/** The ISO stamp of the distillation that closed the stage, or null. */
-export function specNotesArchivedAt(doc: Y.Doc): string | null {
-  const value = doc.getMap(SPEC_NOTES_STATE_NAME).get(SPEC_NOTES_ARCHIVED_AT_KEY);
-  return typeof value === "string" && value.length > 0 ? value : null;
-}
-
 export function encodeProseMirrorDocument(doc: ProseMirrorNode): Uint8Array {
   const ydoc = new Y.Doc();
   prosemirrorToYXmlFragment(doc, ydoc.getXmlFragment(SPEC_FRAGMENT_NAME));
@@ -454,42 +409,6 @@ export class SpecDocumentService {
           prosemirrorToYXmlFragment(replacement, fork.getXmlFragment(SPEC_FRAGMENT_NAME));
           const update = Y.encodeStateAsUpdate(fork, before);
           if (update.length === 2) throw new Error("The spec mutation did not change the document");
-          const stored = await this.tryApplyUpdateUnlocked(specId, room, update, clientId);
-          if (stored) return stored;
-        } finally {
-          fork.destroy();
-        }
-      }
-    });
-  }
-
-  /**
-   * Write the working notes and nothing else (ADR 0114 D6, R21).
-   *
-   * A notes write is cache-only: it is durable in the Yjs log, but it does not
-   * move the semantic revision, so it never invalidates the agent's view of the
-   * spec and never triggers a projection republish. The notes are not the spec.
-   */
-  async mutateNotes(
-    specId: string,
-    clientId: string | null,
-    mutate: (ydoc: Y.Doc) => void,
-    expectedSeq?: bigint,
-  ): Promise<SpecUpdateRecord> {
-    return this.withLock(specId, async () => {
-      const room = await this.loadUnlocked(specId);
-      for (;;) {
-        await this.syncUnlocked(specId, room);
-        if (expectedSeq !== undefined && room.semanticDocSeq !== expectedSeq) {
-          throw new SpecDocumentRevisionConflictError(expectedSeq, room.semanticDocSeq);
-        }
-        const fork = new Y.Doc();
-        try {
-          Y.applyUpdate(fork, Y.encodeStateAsUpdate(room.doc));
-          const before = Y.encodeStateVector(fork);
-          mutate(fork);
-          const update = Y.encodeStateAsUpdate(fork, before);
-          if (update.length === 2) throw new Error("The notes mutation changed nothing");
           const stored = await this.tryApplyUpdateUnlocked(specId, room, update, clientId);
           if (stored) return stored;
         } finally {
@@ -834,7 +753,7 @@ export class SpecDocumentService {
     checkpoint?: SpecDocumentCheckpoint,
     transcriptAction?: SpecTrackedEditActionInput & { createdAt: Date },
   ): Promise<SpecUpdateRecord | null> {
-    const { candidate, sections, semanticChanged } = this.validateCandidate(room, update, clientId);
+    const { candidate, sections, semanticChanged } = this.validateCandidate(room, update);
     const renderedSizeUpperBound = this.validateSize(room, update, candidate);
     let inserted: SpecUpdateInsertResult | null;
     try {
@@ -893,7 +812,6 @@ export class SpecDocumentService {
   private validateCandidate(
     room: CachedSpecDocument,
     update: Uint8Array,
-    clientId: string | null,
   ): {
     candidate: ProseMirrorNode;
     sections: readonly SpecDocumentSectionEffect[];
@@ -918,8 +836,6 @@ export class SpecDocumentService {
           : proseMirrorDocument(room.doc);
       const sections = compareSections(before, candidate);
       validateRequirementsSection(before, candidate, sections);
-      validateNotesChange(room.doc, validationDoc, clientId);
-      if (repaired) throw new Error("The spec update violates the working-notes schema");
       return {
         candidate,
         sections,
@@ -1156,68 +1072,6 @@ function validateRequirementsSection(
   const next = documentSections(candidate).find((section) => section.key === "requirements");
   if (!next || !effects.find((effect) => effect.id === next.id)?.changed) return;
   validateRequirementEdit(prior?.node ?? "", next.node);
-}
-
-/**
- * The working-notes rules, enforced for every write (ADR 0114 D6, R21-R23).
- *
- * A browser client is exactly a numeric Yjs client id: the sync route rejects
- * anything else, so this is a sound way to tell a person's keystrokes from a
- * server write. A person owns the words in a bullet, which is the correction
- * channel R23 asks for. The agent owns the structure: the marks, the
- * destination tags and the bullet set. Nobody writes after the archive stamp.
- */
-function validateNotesChange(
-  prior: Y.Doc,
-  candidate: Y.Doc,
-  clientId: string | null,
-): void {
-  const priorNode = workingNotesDocument(prior);
-  const nextNode = workingNotesDocument(candidate);
-  const priorArchivedAt = specNotesArchivedAt(prior);
-  const nextArchivedAt = specNotesArchivedAt(candidate);
-  const sameNotes =
-    priorNode === null ? nextNode === null : nextNode !== null && priorNode.eq(nextNode);
-  if (sameNotes && priorArchivedAt === nextArchivedAt) return;
-  if (priorArchivedAt !== null) throw new SpecNotesArchivedError(priorArchivedAt);
-  if (nextNode === null) {
-    throw new SpecNotesEditError("The working notes cannot be emptied; distil them instead.");
-  }
-  nextNode.check();
-  const next = readWorkingNotes(nextNode);
-  validateWorkingNotes(next);
-  const fromBrowser = clientId !== null && /^[0-9]+$/.test(clientId);
-  if (!fromBrowser) return;
-  if (nextArchivedAt !== priorArchivedAt) {
-    throw new SpecNotesEditError("Only the server archives the working notes.");
-  }
-  if (priorNode === null) {
-    throw new SpecNotesEditError("Only the agent opens the working notes.");
-  }
-  if (notesStructure(readWorkingNotes(priorNode)) !== notesStructure(next)) {
-    throw new SpecNotesEditError(
-      "A person edits the words in a note; the agent owns the marks, the tags and the bullet set.",
-    );
-  }
-}
-
-/** Everything in the notes except the words a person may rewrite. */
-function notesStructure(notes: SpecWorkingNotes): string {
-  return JSON.stringify(
-    notes.clusters.map((cluster) => ({
-      id: cluster.id,
-      // The theme is the agent's clustering, so a person cannot rewrite it.
-      theme: cluster.theme,
-      sectionIds: cluster.sectionIds,
-      bullets: cluster.bullets.map((bullet) => ({
-        id: bullet.id,
-        mark: bullet.mark,
-        kind: bullet.kind,
-        provenance: bullet.provenance,
-        agentText: bullet.agentText,
-      })),
-    })),
-  );
 }
 
 interface UpdateRow {

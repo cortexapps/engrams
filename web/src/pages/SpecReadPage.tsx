@@ -7,12 +7,10 @@ import type { SpecSelectionActionPayload } from "@engrams/spec-document";
 
 import { CheckpointDiff } from "@/components/spec/CheckpointDiff";
 import { LazySpecCanvas, SpecChatRail } from "@/components/spec";
-import { SpecAlternatives } from "@/components/spec/SpecAlternatives";
 import {
   SectionStateTranscriptChip,
   type SpecSectionStateChipData,
 } from "@/components/spec/SectionStateTranscriptChip";
-import { SpecGapCheckPanel } from "@/components/spec/SpecGapCheckPanel";
 import { SpecPublishControl } from "@/components/spec/SpecPublishControl";
 import { SpecRailFold } from "@/components/spec/SpecRailFold";
 import { SpecSectionRail, type SpecRailAction } from "@/components/spec/SpecSectionRail";
@@ -36,10 +34,7 @@ import { sendPrompt as sendPromptMethod } from "@/gen/engram/app/v1/session-Sess
 import {
   type SpecCheckpoint,
   type SpecCheckpointSummary,
-  useDecideSpecAlternative,
-  useDistillSpecNotes,
   useRestoreSpecSection,
-  useSpecAlternatives,
   useSetSpecSectionState,
   useSpecCheckpoint,
   useSpecRail,
@@ -68,24 +63,18 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   const first = useSpecCheckpoint(specId, effectiveIds[0] ?? null, publishedCheckpoint);
   const second = useSpecCheckpoint(specId, effectiveIds[1] ?? null);
   const restore = useRestoreSpecSection(specId);
-  const alternatives = useSpecAlternatives(specId, read.data?.spec.lifecycle === "draft");
-  const decideAlternative = useDecideSpecAlternative(specId);
   // After publish the canvas becomes the ticket tree, and the spec stays
   // reachable as a second tab, read-only at the pinned version (mock 2l).
   const isPublished = read.data?.spec.lifecycle === "published";
   const tickets = useSpecTickets(specId, isPublished);
   const ticketCommand = useSpecTicketCommand(specId);
   const queryClient = useQueryClient();
-  const distillNotes = useDistillSpecNotes(specId);
-  const [distillError, setDistillError] = useState<string | null>(null);
   const sectionState = useSetSpecSectionState(specId);
   const undoSectionState = useUndoSpecSectionState(specId);
   const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
   const [actionChip, setActionChip] = useState<SpecSectionStateChipData | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pendingSectionId, setPendingSectionId] = useState<string | null>(null);
-  // The gap check takes the document area when it is open (mock 2j).
-  const [gapCheckOpen, setGapCheckOpen] = useState(false);
   // The section a publish blocker sent the person to (mock 2k).
   const [focusedSectionId, setFocusedSectionId] = useState<string | null>(null);
   // Ticketize takes it the same way, and only after publish (mock 2l).
@@ -116,16 +105,6 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
   const { spec, checkpoints } = read.data;
   const isDraft = spec.lifecycle === "draft";
   const ownerSessionId = isDraft ? spec.sessionId : null;
-  const stage = isDraft ? (alternatives.data ?? null) : null;
-  // The pane earns its width while the stage is open: the rail returns on the
-  // pick (mock 2f).
-  const stageOpen = stage !== null && stage.decision === null;
-  const sendOwnerPrompt = (text: string) => {
-    if (!ownerSessionId) return;
-    sendSelectionPrompt
-      .mutateAsync({ sessionId: ownerSessionId, promptId: crypto.randomUUID(), text })
-      .catch((error) => console.warn("spec prompt failed", error));
-  };
   const selectionActions = ownerSessionId
     ? {
         onAction: (payload: SpecSelectionActionPayload) => {
@@ -207,12 +186,7 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
           <LockedTemplate name={spec.template.name} />
         </div>
         <div className="spec-read-header-actions">
-          {!gapCheckOpen && !ticketsOpen && (
-            <Button variant="outline" onClick={() => setGapCheckOpen(true)}>
-              Gap check
-            </Button>
-          )}
-          {!isDraft && !gapCheckOpen && !ticketsOpen && (
+          {!isDraft && !ticketsOpen && (
             <Button variant="outline" onClick={() => setTicketsOpen(true)}>
               Tickets
             </Button>
@@ -229,43 +203,25 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
           <SpecPublishControl
             specId={specId}
             onReviewSection={(sectionId) => {
-              setGapCheckOpen(false);
               setFocusedSectionId(sectionId);
             }}
           />
         </div>
       </header>
 
-      {/* The matrix takes the canvas: a squeezed matrix hides the very columns
-          that carry the verdict (mock 2j). */}
-      {gapCheckOpen ? (
-        <div className="spec-read-layout">
-          <section className="spec-read-document" aria-label="Gap check">
-            <SpecGapCheckPanel
-              specId={specId}
-              editable={isDraft}
-              onBack={() => setGapCheckOpen(false)}
-            />
-          </section>
-        </div>
-      ) : ticketsOpen ? (
+      {ticketsOpen ? (
         <div className="spec-read-layout">
           <section className="spec-read-document" aria-label="Tickets">
             <SpecTicketSyncPanel specId={specId} onBack={() => setTicketsOpen(false)} />
           </section>
         </div>
       ) : (
-        <div
-          className={stageOpen ? "spec-read-layout is-stage" : "spec-read-layout"}
-          data-folded-rail={foldRail ? "true" : undefined}
-        >
+        <div className="spec-read-layout" data-folded-rail={foldRail ? "true" : undefined}>
           {foldRail && <SpecRailFold rail={rail.data}>{railPanel}</SpecRailFold>}
           {/* The chat rail is the first of the three regions (chat | canvas |
               section rail). The read route returns sessionId only to the
               owner, so this mounts exactly for the person who drives the
-              agent (R60); a small screen is read-and-resolve and skips it.
-              It stays up through the alternatives stage — the conversation
-              is how the person asks about the options. */}
+              agent (R60); a small screen is read-and-resolve and skips it. */}
           {!foldRail && ownerSessionId && (
             <SpecChatRail key={ownerSessionId} sessionId={ownerSessionId} />
           )}
@@ -273,20 +229,6 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
             className="spec-read-document"
             aria-label={isDraft ? "Live spec" : "Published spec"}
           >
-            {stage && (
-              <SpecAlternatives
-                stage={stage}
-                editable={isDraft}
-                pending={decideAlternative.isPending}
-                error={decideAlternative.error?.message ?? null}
-                onPick={({ optionKey, reason }) =>
-                  decideAlternative.mutate({ setId: stage.proposal.setId, optionKey, reason })
-                }
-                {...(ownerSessionId === null
-                  ? {}
-                  : { onHybrid: () => sendOwnerPrompt(hybridPrompt(stage.proposal.setId)) })}
-              />
-            )}
             {isDraft && actionChip && (
               <div className="spec-action-transcript" aria-label="Latest section action">
                 <SectionStateTranscriptChip
@@ -313,16 +255,6 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
                 specId={specId}
                 revision={spec.revision}
                 selectionActions={selectionActions}
-                notesActions={{
-                  onDistill: () => {
-                    setDistillError(null);
-                    distillNotes.mutate(undefined, {
-                      onError: (error) => setDistillError(error.message),
-                    });
-                  },
-                  distilling: distillNotes.isPending,
-                  distillError,
-                }}
               />
             )}
             {/* Two tabs of the same room: the tree a person shapes, and the
@@ -402,24 +334,11 @@ export function SpecReadPage({ specId: explicitSpecId }: { specId?: string }) {
             {restoreNotice && <p className="spec-restore-notice">{restoreNotice}</p>}
           </section>
 
-          {!foldRail && (
-            <aside className="spec-rail-shell" hidden={stageOpen}>
-              {railPanel}
-            </aside>
-          )}
+          {!foldRail && <aside className="spec-rail-shell">{railPanel}</aside>}
         </div>
       )}
     </main>
   );
-}
-
-/** Ask for a hybrid in the conversation; the agent records it with the tool. */
-export function hybridPrompt(setId: string): string {
-  return [
-    "I want a hybrid of the alternatives, not one card as it stands.",
-    `Alternatives set: ${setId}`,
-    "Ask me what to combine, then call spec_decide_alternative with no option_key and my reason.",
-  ].join("\n\n");
 }
 
 export function selectionActionPrompt(payload: SpecSelectionActionPayload): string {
