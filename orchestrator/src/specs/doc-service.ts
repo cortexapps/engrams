@@ -276,6 +276,17 @@ export interface SpecDocumentStore {
   compactSnapshot(input: CompactSnapshotInput): Promise<boolean>;
   listen(onWake: (specId: string) => void, onReconnect?: () => void): Promise<() => Promise<void>>;
   readTrackedEditAction?(actionId: string): Promise<SpecTrackedEditActionRecord | null>;
+  /**
+   * Section ids changed after `afterSemanticSeq` by anyone whose client id
+   * does not match `excludeClientLike` (SQL LIKE pattern). A NULL client id is
+   * a system write and always counts. The section-scoped write fence reads
+   * this: an agent mutation is stale only when its target section is here.
+   */
+  sectionsChangedSince(
+    specId: string,
+    afterSemanticSeq: bigint,
+    excludeClientLike: string,
+  ): Promise<Set<string>>;
 }
 
 export interface LoadedSpecDocument {
@@ -411,6 +422,15 @@ export class SpecDocumentService {
       await this.syncUnlocked(specId, room);
       return this.applyUpdateUnlocked(specId, room, update, clientId, participantEpoch);
     });
+  }
+
+  /** Passthrough for the section-scoped write fence (ADR 0114 amendment). */
+  async sectionsChangedSince(
+    specId: string,
+    afterSemanticSeq: bigint,
+    excludeClientLike: string,
+  ): Promise<Set<string>> {
+    return this.store.sectionsChangedSince(specId, afterSemanticSeq, excludeClientLike);
   }
 
   async mutateDocument(
@@ -1270,6 +1290,22 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
     }));
   }
 
+  async sectionsChangedSince(
+    specId: string,
+    afterSemanticSeq: bigint,
+    excludeClientLike: string,
+  ): Promise<Set<string>> {
+    const result = await this.pool.query<{ section_id: string }>(
+      `SELECT DISTINCT unnest(changed_section_ids) AS section_id
+         FROM spec_update_log
+        WHERE spec_id = $1
+          AND semantic_doc_seq > $2
+          AND (client_id IS NULL OR client_id NOT LIKE $3)`,
+      [specId, afterSemanticSeq.toString(), excludeClientLike],
+    );
+    return new Set(result.rows.map((row) => row.section_id));
+  }
+
   async readTrackedEditAction(actionId: string): Promise<SpecTrackedEditActionRecord | null> {
     const result = await this.pool.query<TrackedEditActionRow>(
       `SELECT id, spec_id, section_id, request_fingerprint, chip, result,
@@ -1448,14 +1484,16 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
         }
       }
       await client.query(
-        `INSERT INTO spec_update_log (spec_id, seq, semantic_doc_seq, update, client_id)
-         VALUES ($1, $2, $3, $4, $5)`,
+        `INSERT INTO spec_update_log
+           (spec_id, seq, semantic_doc_seq, update, client_id, changed_section_ids)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
         [
           specId,
           next.current_doc_seq,
           next.current_semantic_doc_seq,
           Buffer.from(update),
           clientId,
+          effects.sections.filter((section) => section.changed).map((section) => section.id),
         ],
       );
       if (transcriptAction) {

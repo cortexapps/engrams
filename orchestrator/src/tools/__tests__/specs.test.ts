@@ -30,6 +30,7 @@ function documentService(
       rev: 8n,
       markdown: sectionId === undefined ? "# Live revision 8" : "Live section revision 8",
       ...(sectionId === undefined ? {} : { sectionId }),
+      sections: [{ id: "context", key: "context", title: "Context" }],
     }),
     updateSection: async (_specId, input) => mutation("updateSection", input),
     setSectionState: async (_specId, input) => mutation("setSectionState", input),
@@ -204,6 +205,7 @@ describe("spec tools", () => {
       spec_id: SPEC_ID,
       rev: "8",
       markdown: "# Live revision 8",
+      sections: [{ section_id: "context", key: "context", title: "Context" }],
     });
     expect(result).not.toEqual({
       rev: 7,
@@ -276,6 +278,7 @@ describe("spec tools", () => {
       selection_spec_id: SPEC_ID,
       selection_revision: "8",
       selection_fingerprint: "a".repeat(64),
+      expected_rev: "8",
     });
 
     expect(state.mutations[0]).toMatchObject({
@@ -335,6 +338,7 @@ describe("spec tools", () => {
       section_id: "design",
       block_id: "request-flow",
       source: "flowchart LR\nA --> B",
+      expected_rev: "8",
     });
 
     expect(result).toEqual({
@@ -356,6 +360,7 @@ describe("spec tools", () => {
     const pending = call(state.deps, "spec_update_section", {
       section_id: "failure-modes",
       markdown: "New failure modes",
+      expected_rev: "7",
     }).then(() => {
       settled = true;
     });
@@ -377,6 +382,7 @@ describe("spec tools", () => {
       call(state.deps, "spec_update_section", {
         section_id: "failure-modes",
         markdown: "New failure modes",
+        expected_rev: "7",
       }),
     ).rejects.toThrow("document update failed");
     expect(state.presence).toEqual([
@@ -405,12 +411,12 @@ describe("spec tools", () => {
       { name: "spec_read", input: { section_id: "context" }, sectionId: "context" },
       {
         name: "spec_update_section",
-        input: { section_id: "context", markdown: "new" },
+        input: { section_id: "context", markdown: "new", expected_rev: "8" },
         sectionId: "context",
       },
       {
         name: "spec_set_section_state",
-        input: { section_id: "context", state: "drafted" },
+        input: { section_id: "context", state: "drafted", expected_rev: "8" },
         sectionId: "context",
       },
       {
@@ -429,7 +435,7 @@ describe("spec tools", () => {
       },
       {
         name: "spec_update_block",
-        input: { section_id: "context", block_id: "diagram", source: "new" },
+        input: { section_id: "context", block_id: "diagram", source: "new", expected_rev: "8" },
         sectionId: "context",
       },
     ];
@@ -479,14 +485,22 @@ describe("spec tools", () => {
     const tool = registry.get("spec_set_section_state");
     if (tool === undefined) throw new Error("spec_set_section_state is not registered");
 
-    expect(() => tool.input.parse({ section_id: "scope", state: "n/a" })).toThrow();
+    expect(() =>
+      tool.input.parse({ section_id: "scope", state: "n/a", expected_rev: "8" }),
+    ).toThrow();
     expect(
       tool.input.parse({
         section_id: "scope",
         state: "n/a",
         reason: "No external API",
+        expected_rev: "8",
       }),
-    ).toEqual({ section_id: "scope", state: "n/a", reason: "No external API" });
+    ).toEqual({
+      section_id: "scope",
+      state: "n/a",
+      reason: "No external API",
+      expected_rev: "8",
+    });
     const manifest = compileToolManifest(registry, undefined, "spec").find(
       (entry) => entry.name === "spec_set_section_state",
     );

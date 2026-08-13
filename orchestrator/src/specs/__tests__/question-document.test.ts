@@ -75,6 +75,10 @@ class MemoryDocumentStore implements SpecDocumentStore {
 
   async notifyUpdate(): Promise<void> {}
 
+  async sectionsChangedSince(): Promise<Set<string>> {
+    return new Set();
+  }
+
   async compactSnapshot(_input: CompactSnapshotInput): Promise<boolean> {
     return true;
   }

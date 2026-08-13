@@ -40,6 +40,13 @@ const SectionId = z.string().min(1).max(200);
 const ExpectedRevision = Revision.optional().describe(
   "Apply only when the live document is at this revision",
 );
+/** Content mutations carry the revision from the agent's latest read: the
+ *  write is refused when the TARGET section changed past it (edits elsewhere
+ *  in the document never bounce it). On applied=false, re-read the section
+ *  and reapply with the returned revision. */
+const RequiredRevision = Revision.describe(
+  "The rev from your latest spec_read of this section; the write is refused when the section changed since",
+);
 const IdempotencyKey = z.string().min(1).max(200);
 
 const ReadInput = z.object({
@@ -87,7 +94,7 @@ const UpdateSectionInput = z
     selection_fingerprint: SelectionFingerprint.optional().describe(
       "SHA-256 fingerprint of the complete selected ProseMirror slice and boundaries",
     ),
-    expected_rev: ExpectedRevision,
+    expected_rev: RequiredRevision,
   })
   .superRefine((value, ctx) => {
     const fields = [
@@ -118,7 +125,7 @@ const SetSectionStateInput = z
       .max(2_000)
       .optional()
       .describe("Required when state is n/a"),
-    expected_rev: ExpectedRevision,
+    expected_rev: RequiredRevision,
   })
   .superRefine((value, ctx) => {
     if (value.state === "n/a" && value.reason === undefined) {
@@ -152,7 +159,7 @@ const UpdateBlockInput = z.object({
   source: z
     .string()
     .describe("Replacement source specification for the diagram block"),
-  expected_rev: ExpectedRevision,
+  expected_rev: RequiredRevision,
 });
 
 const OptionKey = z
@@ -345,6 +352,15 @@ const ReadOutput = z.object({
   rev: Revision,
   markdown: z.string(),
   section_id: SectionId.optional(),
+  sections: z
+    .array(
+      z.object({
+        section_id: SectionId,
+        key: z.string(),
+        title: z.string(),
+      }),
+    )
+    .describe("Every section's id — pass one as section_id in the spec_* mutation tools"),
 });
 
 const MutationOutput = z.object({
@@ -406,6 +422,10 @@ export interface LiveSpecRead {
   rev: bigint;
   markdown: string;
   sectionId?: string;
+  /** The document's section map. The rendered markdown carries no ids, and
+   *  every mutation requires one, so this list is the agent's ONLY way to
+   *  learn them — a spec agent without it cannot write at all. */
+  sections: Array<{ id: string; key: string; title: string }>;
 }
 
 export interface SpecMutationResult {
@@ -731,6 +751,11 @@ export function registerSpecTools(
         ...(result.sectionId === undefined
           ? {}
           : { section_id: result.sectionId }),
+        sections: result.sections.map((section) => ({
+          section_id: section.id,
+          key: section.key,
+          title: section.title,
+        })),
       };
     },
   });

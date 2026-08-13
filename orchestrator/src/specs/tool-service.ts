@@ -186,8 +186,12 @@ export class SpecToolService implements SpecToolDocumentService {
   async read(specId: string, sectionId?: string): Promise<LiveSpecRead> {
     const loaded = await this.options.documents.syncFromLog(specId);
     const document = proseMirrorDocument(loaded.doc);
+    // The rendered markdown carries no section ids, and every mutation
+    // requires one, so the section map rides EVERY read — without it an
+    // agent has no way to learn the ids and cannot write at all.
+    const sections = documentSections(document);
     if (sectionId === undefined) {
-      return { specId, rev: loaded.semanticDocSeq, markdown: renderMarkdown(document) };
+      return { specId, rev: loaded.semanticDocSeq, markdown: renderMarkdown(document), sections };
     }
     const section = requireSection(document, sectionId);
     const sectionDocument = schema.nodes.doc!.create(null, section.node);
@@ -196,7 +200,38 @@ export class SpecToolService implements SpecToolDocumentService {
       rev: loaded.semanticDocSeq,
       markdown: renderMarkdown(sectionDocument),
       sectionId,
+      sections,
     };
+  }
+
+  /**
+   * The section-scoped write fence (ADR 0114 amendment).
+   *
+   * A mutation carries `expected_rev` from the agent's last read. The write
+   * is stale only when the TARGET section changed past that revision by
+   * someone other than this agent's session (a human, or a system write such
+   * as a restore or a distillation). A global-revision fence would bounce
+   * every write while a human types anywhere in the document, and the model
+   * would learn to rubber-stamp the returned revision — which is no fence.
+   *
+   * The check runs before the mutation, outside the apply lock: a same-section
+   * write that lands in the milliseconds between the check and the apply is
+   * not caught. The window it closes is the model's seconds-long think time
+   * between its read and its write, which is where clobbers actually happen.
+   */
+  private async staleForSection(
+    specId: string,
+    input: SpecMutationContext,
+    sectionId: string,
+    headRev: bigint,
+  ): Promise<boolean> {
+    if (input.expectedRev === undefined || input.expectedRev >= headRev) return false;
+    const changed = await this.options.documents.sectionsChangedSince(
+      specId,
+      input.expectedRev,
+      `agent:${input.sessionId}:%`,
+    );
+    return changed.has(sectionId);
   }
 
   async updateSection(
@@ -211,7 +246,7 @@ export class SpecToolService implements SpecToolDocumentService {
       return this.updateSelectedRange(specId, { ...input, selection: input.selection });
     }
     const loaded = await this.options.documents.syncFromLog(specId);
-    if (input.expectedRev !== undefined && input.expectedRev !== loaded.semanticDocSeq) {
+    if (await this.staleForSection(specId, input, input.sectionId, loaded.semanticDocSeq)) {
       return this.result(specId, input, false, loaded.semanticDocSeq);
     }
     const currentDocument = proseMirrorDocument(loaded.doc);
@@ -235,7 +270,6 @@ export class SpecToolService implements SpecToolDocumentService {
             input.sectionId,
             replacementSection(document, input.sectionId, input.markdown),
           ),
-        input.expectedRev,
       );
       return this.result(specId, input, true, update.semanticDocSeq);
     } catch (error) {
@@ -303,6 +337,11 @@ export class SpecToolService implements SpecToolDocumentService {
     },
   ): Promise<SpecMutationResult> {
     const loaded = await this.options.documents.syncFromLog(specId);
+    // Confirming (or drafting over) content the agent has not seen is the
+    // same clobber as a stale section write, so the same fence applies.
+    if (await this.staleForSection(specId, input, input.sectionId, loaded.semanticDocSeq)) {
+      return this.result(specId, input, false, loaded.semanticDocSeq);
+    }
     const document = proseMirrorDocument(loaded.doc);
     const sections = documentSections(document);
     const sectionIndex = sections.findIndex((section) => section.id === input.sectionId);
@@ -334,7 +373,9 @@ export class SpecToolService implements SpecToolDocumentService {
         target: input.state,
         ...(input.reason === undefined ? {} : { naReason: input.reason }),
         actorUserId: input.actorUserId ?? null,
-        ...(input.expectedRev === undefined ? {} : { expectedDocSeq: input.expectedRev }),
+        // No expectedDocSeq: the store's global-revision check is replaced by
+        // the section-scoped fence above, which does not bounce on unrelated
+        // edits elsewhere in the document.
       });
       const latest = await this.options.documents.syncFromLog(specId);
       return this.result(specId, input, true, latest.semanticDocSeq);
@@ -470,6 +511,9 @@ export class SpecToolService implements SpecToolDocumentService {
     input: SpecMutationContext & { sectionId: string; blockId: string; source: string },
   ): Promise<SpecMutationResult> {
     const loaded = await this.options.documents.syncFromLog(specId);
+    if (await this.staleForSection(specId, input, input.sectionId, loaded.semanticDocSeq)) {
+      return this.result(specId, input, false, loaded.semanticDocSeq);
+    }
     const currentDocument = proseMirrorDocument(loaded.doc);
     requireSection(currentDocument, input.sectionId);
     const current = requireDiagramBlock(currentDocument, input.sectionId, input.blockId);
@@ -497,7 +541,6 @@ export class SpecToolService implements SpecToolDocumentService {
             cachedRender: null,
           }).doc;
         },
-        input.expectedRev,
       );
       return this.result(
         specId,
@@ -712,7 +755,14 @@ function agentClientId(input: SpecMutationContext): string {
 
 function requireSection(document: ProseMirrorNode, sectionId: string) {
   const section = findSection(document, sectionId);
-  if (!section) throw new Error(`Unknown spec section: ${sectionId}`);
+  if (!section) {
+    // Teach instead of stonewalling: a wrong guess (a slug, a title) is an
+    // agent that never learned the ids, so the rejection carries them.
+    const known = documentSections(document)
+      .map((candidate) => `${candidate.id} (${candidate.title})`)
+      .join(", ");
+    throw new Error(`Unknown spec section: ${sectionId}. Valid section ids: ${known}`);
+  }
   return section;
 }
 
