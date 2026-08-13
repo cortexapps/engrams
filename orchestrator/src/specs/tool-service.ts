@@ -17,6 +17,7 @@ import {
   type SpecAlternativeOption,
   type SpecAlternativesComparison,
   type SpecSelectionSpan,
+  type SpecWorkingNotesInput,
   type TrackedEditTranscriptChip,
 } from "@engrams/spec-document";
 import { Fragment, Slice, type Node as ProseMirrorNode } from "prosemirror-model";
@@ -31,15 +32,20 @@ import type {
   SpecMutationContext,
   SpecProposalContext,
   SpecMutationResult,
+  SpecNotesDistillResult,
+  SpecNotesUpdateResult,
   SpecToolDocumentService,
 } from "../tools/specs.ts";
 import type { SpecAlternativesService } from "./alternatives.ts";
 import {
   proseMirrorDocument,
+  readSpecWorkingNotes,
+  specNotesArchivedAt,
   SpecDocumentRevisionConflictError,
   type SpecTrackedEditActionRecord,
   type SpecDocumentService,
 } from "./doc-service.ts";
+import type { SpecWorkingNotesService } from "./notes.ts";
 import {
   OpenQuestionError,
   type OpenQuestionRecord,
@@ -144,6 +150,7 @@ export interface SpecToolServiceOptions {
   questions: OpenQuestionService;
   questionStore: OpenQuestionStore;
   alternatives: SpecAlternativesService;
+  notes: Pick<SpecWorkingNotesService, "update" | "distill" | "readStage">;
   metadata: SpecToolMetadataStore;
   /** The post-publish ticket tree, which reads the pinned spec (#1127). */
   tickets: Pick<SpecTicketTreeService, "propose">;
@@ -155,6 +162,14 @@ export class SpecAlternativesStageError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "SpecAlternativesStageError";
+  }
+}
+
+/** The working notes are open, or the template never runs the stage. */
+export class SpecNotesStageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SpecNotesStageError";
   }
 }
 
@@ -200,6 +215,7 @@ export class SpecToolService implements SpecToolDocumentService {
       return this.result(specId, input, false, loaded.semanticDocSeq);
     }
     const currentDocument = proseMirrorDocument(loaded.doc);
+    this.assertNotesStageClear(loaded.doc);
     await this.assertAlternativesStageClear(specId, currentDocument, input.sectionId);
     const desired = replaceSection(
       currentDocument,
@@ -580,10 +596,61 @@ export class SpecToolService implements SpecToolDocumentService {
   }
 
   async updateNotes(
-    _specId: string,
-    _input: Parameters<SpecToolDocumentService["updateNotes"]>[1],
-  ): Promise<SpecMutationResult> {
-    throw new Error("Working notes are not available until #1120.");
+    specId: string,
+    input: SpecMutationContext & { notes: SpecWorkingNotesInput },
+  ): Promise<SpecNotesUpdateResult> {
+    await this.assertNotesStageRuns(specId);
+    const result = await this.options.notes.update({
+      specId,
+      notes: input.notes,
+      clientId: agentClientId(input),
+      ...(input.expectedRev === undefined ? {} : { expectedRev: input.expectedRev }),
+    });
+    return {
+      ...(await this.result(specId, input, true, result.newRev)),
+      stage: result.stage,
+      corrections: result.corrections,
+    };
+  }
+
+  async distillNotes(
+    specId: string,
+    input: SpecMutationContext,
+  ): Promise<SpecNotesDistillResult> {
+    const result = await this.options.notes.distill({
+      specId,
+      clientId: agentClientId(input),
+      ...(input.expectedRev === undefined ? {} : { expectedRev: input.expectedRev }),
+    });
+    return {
+      ...(await this.result(specId, input, result.applied, result.newRev)),
+      distillation: result.distillation,
+      stage: result.stage,
+    };
+  }
+
+  /** The template must run the stage before the agent opens a notes pane. */
+  private async assertNotesStageRuns(specId: string): Promise<void> {
+    const flags = await this.options.metadata.templateStageFlags(specId);
+    if (flags.talkItThrough === "off") {
+      throw new SpecNotesStageError("This template does not run the talk-it-through stage.");
+    }
+  }
+
+  /**
+   * Pen down (R21): while the working notes are live, the agent writes no spec
+   * section. The canvas hosts the notes instead, and distillation is the one
+   * write that closes the stage. Sections written before the stage opened stay
+   * as they are, so a recon draft is not blocked by a later conversation, and a
+   * scoped edit that a person asked for over a selection still lands: the rule
+   * stops the agent's own drafting, not the author's requests.
+   */
+  private assertNotesStageClear(doc: Y.Doc): void {
+    if (readSpecWorkingNotes(doc) === null) return;
+    if (specNotesArchivedAt(doc) !== null) return;
+    throw new SpecNotesStageError(
+      "The working notes are open, so the spec sections are closed. Keep the notes with spec_update_notes, then call spec_distill_notes to write the sections.",
+    );
   }
 
   /**

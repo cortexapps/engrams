@@ -1,0 +1,168 @@
+/*
+ * Working notes (mock 2e).
+ *
+ * Ruled paper and a dashed border are the whole point: the pane must read as
+ * scratch, never as the spec. Everything the agent owns — marks, receipts,
+ * themes, destination tags — is set in the mono face and cannot be typed into.
+ */
+
+.spec-notes-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+}
+
+.spec-notes-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.spec-notes-label {
+  font-weight: 600;
+  font-size: 0.8125rem;
+  color: var(--foreground);
+}
+
+.spec-notes-gauge {
+  margin-right: auto;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  color: var(--muted-foreground);
+}
+
+.spec-notes-error {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: var(--destructive);
+}
+
+.spec-notes-editor {
+  border: 1px dashed color-mix(in oklab, var(--muted-foreground) 65%, transparent);
+  border-radius: 0.5rem;
+  padding: 0.85rem 1.15rem;
+  font-size: 0.875rem;
+  line-height: 1.75rem;
+  /* The ruled line sits on the text baseline grid. */
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent,
+    transparent calc(1.75rem - 1px),
+    color-mix(in oklab, var(--muted-foreground) 22%, transparent) calc(1.75rem - 1px),
+    color-mix(in oklab, var(--muted-foreground) 22%, transparent) 1.75rem
+  );
+  background-attachment: local;
+  outline: none;
+}
+
+.spec-notes-editor:focus-visible {
+  border-color: var(--ring);
+}
+
+.spec-notes-cluster + .spec-notes-cluster {
+  margin-top: 0.75rem;
+}
+
+.spec-notes-cluster-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  user-select: none;
+}
+
+.spec-notes-theme {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--foreground);
+}
+
+.spec-notes-tag {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.625rem;
+  border-radius: 0.25rem;
+  padding: 0.05em 0.4em;
+  white-space: nowrap;
+  color: var(--primary);
+  background: color-mix(in oklab, var(--primary) 12%, transparent);
+}
+
+.spec-notes-tag-empty {
+  color: var(--muted-foreground);
+  background: color-mix(in oklab, var(--muted-foreground) 12%, transparent);
+}
+
+.spec-notes-bullets {
+  padding-left: 1.1rem;
+}
+
+.spec-notes-bullet {
+  text-indent: -1.1rem;
+  padding-left: 1.1rem;
+}
+
+/*
+ * A React node view wraps its editable content in a block element. The words in
+ * a bullet must stay on the mark's own line, beside the receipt.
+ */
+.spec-notes-bullet [data-node-view-content-react] {
+  display: inline;
+}
+
+.spec-notes-mark {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding-right: 0.4em;
+  user-select: none;
+}
+
+.spec-notes-mark-verified {
+  color: var(--chart-2, oklch(0.62 0.14 155));
+}
+
+.spec-notes-mark-contradicted {
+  color: var(--destructive);
+}
+
+.spec-notes-mark-unchecked {
+  color: var(--chart-4, oklch(0.75 0.15 80));
+}
+
+.spec-notes-bullet[data-mark="contradicted"] .spec-notes-text {
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in oklab, var(--destructive) 60%, transparent);
+}
+
+.spec-notes-receipt {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.6875rem;
+  color: var(--muted-foreground);
+  user-select: none;
+}
+
+.spec-notes-receipt::before {
+  content: " — ";
+}
+
+.spec-notes-kind {
+  font-size: 0.75rem;
+  font-style: italic;
+  color: var(--muted-foreground);
+  user-select: none;
+}
+
+.spec-notes-kind::before {
+  content: " · ";
+}
+
+/* A bullet a person rewrote. The agent is told at its next write. */
+.spec-notes-bullet[data-corrected="true"] .spec-notes-text {
+  box-shadow: inset 0 -0.55em 0 color-mix(in oklab, var(--primary) 14%, transparent);
+}

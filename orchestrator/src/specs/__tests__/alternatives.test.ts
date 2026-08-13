@@ -23,6 +23,7 @@ import {
   proseMirrorDocument,
   SpecDocumentService,
 } from "../doc-service.ts";
+import { SpecWorkingNotesService } from "../notes.ts";
 import { OpenQuestionService } from "../open-questions.ts";
 import { SpecQuestionDocument } from "../question-document.ts";
 import { SectionStateService } from "../section-state-service.ts";
@@ -144,6 +145,7 @@ async function setup() {
   const sectionStore = new MemorySectionStore();
   const questionStore = new MemoryQuestionStore();
   const metadata = new MemoryMetadata(sectionStore);
+  const notes = new SpecWorkingNotesService({ documents, now: NOW });
   const service = new SpecToolService({
     documents,
     sectionStates: new SectionStateService({ store: sectionStore, now: NOW }),
@@ -154,6 +156,7 @@ async function setup() {
     }),
     questionStore,
     alternatives,
+    notes,
     metadata,
     // The ticket tree is a post-publish concern (#1127); the alternatives stage
     // never reaches it, so fail loudly rather than pretend a proposal landed.

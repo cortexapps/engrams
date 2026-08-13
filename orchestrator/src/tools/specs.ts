@@ -7,14 +7,26 @@ import {
   SPEC_ALTERNATIVES_MIN_OPTIONS,
   SPEC_ALTERNATIVES_REASON_MAX_CHARS,
   SPEC_ALTERNATIVES_TRADEOFF_COUNT,
+  SPEC_NOTE_KINDS,
+  SPEC_NOTE_MARKS,
+  SPEC_NOTE_PROVENANCE_MAX_LENGTH,
+  SPEC_NOTE_TEXT_MAX_LENGTH,
+  SPEC_NOTE_THEME_MAX_LENGTH,
+  SPEC_NOTES_MAX_BULLETS_PER_CLUSTER,
+  SPEC_NOTES_MAX_CLUSTERS,
+  SPEC_NOTES_MAX_SECTION_TAGS,
   SPEC_TRADEOFF_SIGNS,
   type GapFinding,
   type GapFindingSeverity,
   type SpecAlternativeOption,
   type SpecAlternativesComparison,
+  type SpecNoteCorrection,
   type SpecSelectionSpan,
+  type SpecWorkingNotes,
+  type SpecWorkingNotesInput,
   type TraceabilityMatrix,
   type TrackedEditTranscriptChip,
+  type WorkingNotesDistillation,
 } from "@engrams/spec-document";
 
 import type { ToolContext, ToolRegistry } from "./registry.ts";
@@ -202,8 +214,50 @@ const DecideAlternativeInput = z.object({
   expected_rev: ExpectedRevision,
 });
 
+const NoteBullet = z.object({
+  id: z
+    .string()
+    .min(1)
+    .max(200)
+    .describe("Stable identifier for this bullet; reuse it in every later call"),
+  mark: z
+    .enum(SPEC_NOTE_MARKS)
+    .describe(
+      "verified: you checked it; contradicted: you checked it and it is false; unchecked: not checked yet",
+    ),
+  kind: z
+    .enum(SPEC_NOTE_KINDS)
+    .describe("observation, requirement candidate, tracked tension, or a question for the author"),
+  text: z.string().min(1).max(SPEC_NOTE_TEXT_MAX_LENGTH).describe("One distilled line"),
+  provenance: z
+    .string()
+    .min(1)
+    .max(SPEC_NOTE_PROVENANCE_MAX_LENGTH)
+    .optional()
+    .describe("The receipt. Required for a verified or contradicted bullet"),
+});
+
+const NoteCluster = z.object({
+  id: z.string().min(1).max(200).describe("Stable identifier for this cluster"),
+  theme: z.string().min(1).max(SPEC_NOTE_THEME_MAX_LENGTH).describe("The theme of the cluster"),
+  section_ids: z
+    .array(SectionId)
+    .max(SPEC_NOTES_MAX_SECTION_TAGS)
+    .optional()
+    .describe("Destination sections. Leave it out while the cluster has no home yet"),
+  bullets: z.array(NoteBullet).min(1).max(SPEC_NOTES_MAX_BULLETS_PER_CLUSTER),
+});
+
 const UpdateNotesInput = z.object({
-  markdown: z.string().describe("Replacement working notes as Markdown"),
+  clusters: z
+    .array(NoteCluster)
+    .min(1)
+    .max(SPEC_NOTES_MAX_CLUSTERS)
+    .describe("Your complete current model of the conversation, clustered by theme"),
+  expected_rev: ExpectedRevision,
+});
+
+const DistillNotesInput = z.object({
   expected_rev: ExpectedRevision,
 });
 
@@ -316,6 +370,34 @@ const ProposeAlternativesOutput = z.object({
   concurrent_editors: z.array(z.string()),
 });
 
+const UpdateNotesOutput = z.object({
+  applied: z.boolean(),
+  new_rev: Revision,
+  concurrent_editors: z.array(z.string()),
+  untagged_bullets: z
+    .number()
+    .describe("Bullets with no destination section. Keep talking while this grows"),
+  corrections: z
+    .array(
+      z.object({
+        bullet_id: z.string(),
+        your_text: z.string(),
+        their_text: z.string(),
+        kept_after_you_dropped_it: z.boolean(),
+      }),
+    )
+    .describe("Bullets a person rewrote. Their words won; correct your model"),
+});
+
+const DistillNotesOutput = z.object({
+  applied: z.boolean(),
+  new_rev: Revision,
+  concurrent_editors: z.array(z.string()),
+  written_section_ids: z.array(SectionId),
+  refuted_bullets: z.number().describe("Contradicted bullets, which never enter the spec"),
+  untagged_bullets: z.number().describe("Bullets that had no destination when the stage closed"),
+});
+
 export interface SpecReference {
   id: string;
 }
@@ -336,6 +418,22 @@ export interface SpecMutationResult {
 
 export interface SpecAlternativesProposalResult extends SpecMutationResult {
   setId: string;
+}
+
+export interface SpecWorkingNotesStageView {
+  notes: SpecWorkingNotes;
+  archivedAt: string | null;
+  untaggedBullets: number;
+}
+
+export interface SpecNotesUpdateResult extends SpecMutationResult {
+  stage: SpecWorkingNotesStageView;
+  corrections: SpecNoteCorrection[];
+}
+
+export interface SpecNotesDistillResult extends SpecMutationResult {
+  stage: SpecWorkingNotesStageView;
+  distillation: WorkingNotesDistillation;
 }
 
 export interface SpecMutationContext {
@@ -409,8 +507,9 @@ export interface SpecToolDocumentService {
   ): Promise<SpecMutationResult>;
   updateNotes(
     specId: string,
-    input: SpecMutationContext & { markdown: string },
-  ): Promise<SpecMutationResult>;
+    input: SpecMutationContext & { notes: SpecWorkingNotesInput },
+  ): Promise<SpecNotesUpdateResult>;
+  distillNotes(specId: string, input: SpecMutationContext): Promise<SpecNotesDistillResult>;
   proposeTickets(
     specId: string,
     input: SpecMutationContext & {
@@ -532,6 +631,23 @@ function updateSelection(
     endAnchor: args.selection_end,
     selectedText: args.selection_text,
     sliceFingerprint: args.selection_fingerprint,
+  };
+}
+
+function notesInput(args: z.output<typeof UpdateNotesInput>): SpecWorkingNotesInput {
+  return {
+    clusters: args.clusters.map((cluster) => ({
+      id: cluster.id,
+      theme: cluster.theme,
+      sectionIds: cluster.section_ids ?? [],
+      bullets: cluster.bullets.map((bullet) => ({
+        id: bullet.id,
+        mark: bullet.mark,
+        kind: bullet.kind,
+        text: bullet.text,
+        provenance: bullet.provenance ?? null,
+      })),
+    })),
   };
 }
 
@@ -827,18 +943,58 @@ export function registerSpecTools(
   registry.register({
     name: "spec_update_notes",
     taskTypes: SPEC_TASK_TYPES,
-    description: "Replace the collaborative working notes pane with Markdown.",
+    description:
+      "Replace the working notes on the canvas with your current model of the conversation. Send every cluster and bullet each time, and keep a bullet id stable. While the notes are open you write no spec section. A person can rewrite any bullet: their words win, and the reply names each one.",
     input: UpdateNotesInput,
-    output: MutationOutput,
+    output: UpdateNotesOutput,
     handling: "handled",
     execution: "sync",
     handler: async (ctx, args) => {
       const spec = await requireSpec(ctx, deps);
       const result = await deps.documents.updateNotes(spec.id, {
         ...mutationContext(ctx, args.expected_rev),
-        markdown: args.markdown,
+        notes: notesInput(args),
       });
-      return finishMutation(ctx, deps, spec.id, result);
+      await finishMutation(ctx, deps, spec.id, result);
+      return {
+        applied: result.applied,
+        new_rev: result.newRev.toString(),
+        concurrent_editors: result.concurrentEditors,
+        untagged_bullets: result.stage.untaggedBullets,
+        corrections: result.corrections.map((correction) => ({
+          bullet_id: correction.bulletId,
+          your_text: correction.agentText,
+          their_text: correction.personText,
+          kept_after_you_dropped_it: correction.keptAgainstDrop,
+        })),
+      };
+    },
+  });
+
+  registry.register({
+    name: "spec_distill_notes",
+    taskTypes: SPEC_TASK_TYPES,
+    description:
+      "Close the talk-it-through stage: write each tagged cluster into its destination section and archive the notes as a read-only record. A section with no tagged material stays empty. Never invent content to fill it.",
+    input: DistillNotesInput,
+    output: DistillNotesOutput,
+    handling: "handled",
+    execution: "sync",
+    handler: async (ctx, args) => {
+      const spec = await requireSpec(ctx, deps);
+      const result = await deps.documents.distillNotes(
+        spec.id,
+        mutationContext(ctx, args.expected_rev),
+      );
+      await finishMutation(ctx, deps, spec.id, result);
+      return {
+        applied: result.applied,
+        new_rev: result.newRev.toString(),
+        concurrent_editors: result.concurrentEditors,
+        written_section_ids: result.distillation.sections.map((section) => section.sectionId),
+        refuted_bullets: result.distillation.refutedBullets,
+        untagged_bullets: result.distillation.untaggedBullets,
+      };
     },
   });
 

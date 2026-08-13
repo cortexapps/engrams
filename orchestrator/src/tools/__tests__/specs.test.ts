@@ -41,7 +41,27 @@ function documentService(
       setId: "set-1",
     }),
     decideAlternative: async (_specId, input) => mutation("decideAlternative", input),
-    updateNotes: async (_specId, input) => mutation("updateNotes", input),
+    updateNotes: async (_specId, input) => ({
+      ...(await mutation("updateNotes", input)),
+      stage: { notes: { clusters: [] }, archivedAt: null, untaggedBullets: 2 },
+      corrections: [
+        {
+          bulletId: "b1",
+          agentText: "refills daily",
+          personText: "refills weekly",
+          keptAgainstDrop: false,
+        },
+      ],
+    }),
+    distillNotes: async (_specId, input) => ({
+      ...(await mutation("distillNotes", input)),
+      stage: { notes: { clusters: [] }, archivedAt: "2026-08-12T00:00:00.000Z", untaggedBullets: 1 },
+      distillation: {
+        sections: [{ sectionId: "behavior", markdown: "Verified - it holds\n" }],
+        refutedBullets: 1,
+        untaggedBullets: 1,
+      },
+    }),
     proposeTickets: async (_specId, input) => mutation("proposeTickets", input),
   };
 }
@@ -160,6 +180,7 @@ describe("spec tools", () => {
       "spec_propose_alternatives",
       "spec_decide_alternative",
       "spec_update_notes",
+      "spec_distill_notes",
       "spec_propose_tickets",
       "spec_gap_check",
     ]);
@@ -427,7 +448,16 @@ describe("spec tools", () => {
   test("whole-document, notes, and ticket tools do not synthesize section presence", async () => {
     const state = recorder();
     await call(state.deps, "spec_read", {});
-    await call(state.deps, "spec_update_notes", { markdown: "notes" });
+    await call(state.deps, "spec_update_notes", {
+      clusters: [
+        {
+          id: "burst",
+          theme: "burst semantics",
+          bullets: [{ id: "b1", mark: "unchecked", kind: "observation", text: "refills daily" }],
+        },
+      ],
+    });
+    await call(state.deps, "spec_distill_notes", {});
     await call(state.deps, "spec_propose_tickets", {
       idempotency_key: "proposal-1",
       tickets: [
