@@ -595,6 +595,9 @@ impl Cosim {
                         engram_protocol::heartbeat::QuarantinedSurvivor {
                             sandbox_id,
                             session_id,
+                            // The cosim's survivors model the ADR 0090
+                            // rehydrate flavor.
+                            reason: Default::default(),
                         }
                     })
                 })

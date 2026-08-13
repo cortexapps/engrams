@@ -81,7 +81,7 @@ use engram_core::SandboxId;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use super::backend::ChunkedDiskBackend;
+use super::backend::{ChunkedDiskBackend, DiskBackendError};
 
 /// Phase B production defaults. Env vars override per [`Self::from_env`].
 #[derive(Clone, Debug)]
@@ -166,6 +166,85 @@ impl LiveManifestPublisher for NoOpLiveManifestPublisher {
     async fn publish(&self, _sandbox_id: SandboxId, _manifest_ref: ManifestRef) {}
 }
 
+/// ADR 0116 C4: escalation sink for a persistently failed data plane.
+/// The scheduler calls this once per failure EPISODE — after
+/// [`FLUSH_ESCALATION_THRESHOLD`] consecutive device-class flush
+/// failures — not once per failed flush. The production impl
+/// (PooledBackend) records the sandbox as a quarantined survivor so
+/// the coordinator's quarantine-evict ladder owns the remediation.
+/// The 2026-08-12 incident is the motivation: a host-side flush
+/// failed every 30 s for 7+ hours with only a warn log, and a rung-2
+/// park then froze a device with nothing durable captured.
+#[async_trait]
+pub trait DataPlaneHealth: Send + Sync {
+    async fn data_plane_failed(&self, sandbox_id: SandboxId);
+}
+
+/// Default impl for tests and callers without quarantine plumbing.
+pub struct NoOpDataPlaneHealth;
+
+#[async_trait]
+impl DataPlaneHealth for NoOpDataPlaneHealth {
+    async fn data_plane_failed(&self, _sandbox_id: SandboxId) {}
+}
+
+/// ADR 0116 C4: consecutive device-class flush failures that fire the
+/// escalation. At the default 30 s cadence this is ~2 minutes of a
+/// continuously failed data plane — long enough to skip a transient
+/// error burst, short enough that the quarantine ladder engages well
+/// before the wedge can silently age.
+const FLUSH_ESCALATION_THRESHOLD: u32 = 4;
+
+/// ADR 0116 C4 — pure escalation state, split from the scheduler loop
+/// per the `spawn()`/`run_once()` discipline (ADR 0098) so the
+/// fire-exactly-once ladder is testable without the timer.
+///
+/// `fired` latches after one escalation so a permanently dead device
+/// does not re-fire on every subsequent wake; a successful flush
+/// resets the count AND re-arms the latch, so a heal→relapse cycle
+/// escalates again.
+#[derive(Debug, Default)]
+struct FlushHealthTracker {
+    consecutive: u32,
+    fired: bool,
+}
+
+impl FlushHealthTracker {
+    /// Feed one flush outcome. Returns `true` exactly once per
+    /// failure episode: when the consecutive device-class failure
+    /// count reaches [`FLUSH_ESCALATION_THRESHOLD`] and this episode
+    /// has not fired yet. `device_class_failure: false` (a successful
+    /// flush, or a non-device-class error) resets the ladder.
+    fn on_flush_result(&mut self, device_class_failure: bool) -> bool {
+        if !device_class_failure {
+            self.consecutive = 0;
+            self.fired = false;
+            return false;
+        }
+        self.consecutive = self.consecutive.saturating_add(1);
+        if self.consecutive >= FLUSH_ESCALATION_THRESHOLD && !self.fired {
+            self.fired = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// ADR 0116 C4: does this flush error indict the DEVICE-side data
+/// plane, as opposed to the blob tier? `DeviceSync` (host page-cache
+/// sync of `/dev/nbdN` failed) and `ShortChunk` (a fetched chunk
+/// cannot be served without reading out of bounds) mean the device is
+/// wedged and a park would freeze nothing durable. `Chunk(_)` is the
+/// blob tier — GCS throttling/outages heal on their own and must NOT
+/// quarantine the sandbox; everything else (shape/range/logic errors)
+/// likewise stays on the plain retry path.
+fn is_device_class(e: &DiskBackendError) -> bool {
+    matches!(
+        e,
+        DiskBackendError::DeviceSync { .. } | DiskBackendError::ShortChunk { .. }
+    )
+}
+
 /// Owns the scheduler task. `Drop` aborts the task; the spawned
 /// task is structured so abort-after-flush-completion is safe (it
 /// holds an `Arc<ChunkedDiskBackend>` and `tokio::spawn::abort()`
@@ -190,10 +269,15 @@ impl FlushScheduler {
     /// not buried in spawn. The returned handle's `Drop` aborts the
     /// task; place it ordered-first in any owning struct so abort
     /// runs before NBD teardown.
+    ///
+    /// `health` is the ADR 0116 C4 escalation sink: fed once per
+    /// persistent device-class failure episode (see
+    /// [`FlushHealthTracker`]), never per failed flush.
     pub fn spawn(
         sandbox_id: SandboxId,
         backend: Arc<ChunkedDiskBackend>,
         publisher: Arc<dyn LiveManifestPublisher>,
+        health: Arc<dyn DataPlaneHealth>,
         config: FlushSchedulerConfig,
     ) -> FlushSchedulerHandle {
         let threshold_notify = backend.threshold_notify();
@@ -207,19 +291,47 @@ impl FlushScheduler {
             // Consume the immediate first tick so we don't issue a
             // flush at t=0 (nothing dirty yet at spawn).
             interval.tick().await;
+            let mut tracker = FlushHealthTracker::default();
             loop {
                 tokio::select! {
                     _ = interval.tick() => {},
                     _ = threshold_notify.notified() => {},
                 }
                 let outcome = match backend.flush().await {
-                    Ok(o) => o,
+                    Ok(o) => {
+                        // ADR 0116 C4: a successful flush ends the
+                        // failure episode and re-arms the escalation —
+                        // BEFORE the `chunks_flushed == 0` short-circuit
+                        // below, so an empty-but-successful flush also
+                        // heals the ladder.
+                        tracker.on_flush_result(false);
+                        o
+                    }
                     Err(e) => {
-                        tracing::warn!(
-                            %sandbox_id,
-                            error = %e,
-                            "flush_scheduler: backend.flush() failed; will retry on next wake",
-                        );
+                        // ADR 0116 C4: device-class failures escalate
+                        // after FLUSH_ESCALATION_THRESHOLD consecutive
+                        // misses. The 2026-08-12 incident's silent leg
+                        // was exactly this warn, every 30 s, for 7+
+                        // hours, with a rung-2 park then landing on the
+                        // wedged device.
+                        if tracker.on_flush_result(is_device_class(&e)) {
+                            ::metrics::counter!(crate::metrics::NBD_FLUSH_ESCALATIONS_TOTAL)
+                                .increment(1);
+                            tracing::error!(
+                                %sandbox_id,
+                                error = %e,
+                                consecutive_failures = FLUSH_ESCALATION_THRESHOLD,
+                                "flush_scheduler: persistent device-class flush failure; \
+                                 escalating to DataPlaneHealth (quarantine ladder)",
+                            );
+                            health.data_plane_failed(sandbox_id).await;
+                        } else {
+                            tracing::warn!(
+                                %sandbox_id,
+                                error = %e,
+                                "flush_scheduler: backend.flush() failed; will retry on next wake",
+                            );
+                        }
                         continue;
                     }
                 };
@@ -342,8 +454,13 @@ mod tests {
             dirty_threshold_bytes: threshold_bytes,
             enabled: true,
         };
-        let _handle =
-            FlushScheduler::spawn(sandbox_id, backend.clone(), Arc::new(publisher), config);
+        let _handle = FlushScheduler::spawn(
+            sandbox_id,
+            backend.clone(),
+            Arc::new(publisher),
+            Arc::new(NoOpDataPlaneHealth),
+            config,
+        );
 
         // Cross the threshold.
         backend.write(0, &[0xcc; 8]).await.unwrap();
@@ -379,8 +496,13 @@ mod tests {
             dirty_threshold_bytes: DEFAULT_DIRTY_THRESHOLD_BYTES,
             enabled: true,
         };
-        let _handle =
-            FlushScheduler::spawn(sandbox_id, backend.clone(), Arc::new(publisher), config);
+        let _handle = FlushScheduler::spawn(
+            sandbox_id,
+            backend.clone(),
+            Arc::new(publisher),
+            Arc::new(NoOpDataPlaneHealth),
+            config,
+        );
 
         // One write — well below the 256 MiB default threshold —
         // so the only path to a publish is the periodic tick.
@@ -448,8 +570,13 @@ mod tests {
             dirty_threshold_bytes: DEFAULT_DIRTY_THRESHOLD_BYTES,
             enabled: true,
         };
-        let _handle =
-            FlushScheduler::spawn(sandbox_id, backend.clone(), Arc::new(publisher), config);
+        let _handle = FlushScheduler::spawn(
+            sandbox_id,
+            backend.clone(),
+            Arc::new(publisher),
+            Arc::new(NoOpDataPlaneHealth),
+            config,
+        );
 
         // No direct `write()` in this test: the publish can only carry
         // the byte the tick's own sync delivered.
@@ -480,8 +607,13 @@ mod tests {
             dirty_threshold_bytes: DEFAULT_DIRTY_THRESHOLD_BYTES,
             enabled: true,
         };
-        let _handle =
-            FlushScheduler::spawn(sandbox_id, backend.clone(), Arc::new(publisher), config);
+        let _handle = FlushScheduler::spawn(
+            sandbox_id,
+            backend.clone(),
+            Arc::new(publisher),
+            Arc::new(NoOpDataPlaneHealth),
+            config,
+        );
 
         // Let several ticks fire with no writes.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -505,8 +637,13 @@ mod tests {
             dirty_threshold_bytes: DEFAULT_DIRTY_THRESHOLD_BYTES,
             enabled: true,
         };
-        let handle =
-            FlushScheduler::spawn(sandbox_id, backend.clone(), Arc::new(publisher), config);
+        let handle = FlushScheduler::spawn(
+            sandbox_id,
+            backend.clone(),
+            Arc::new(publisher),
+            Arc::new(NoOpDataPlaneHealth),
+            config,
+        );
         drop(handle);
 
         // Cancellation has propagated by the next tick boundary.
@@ -520,6 +657,235 @@ mod tests {
             events.lock().unwrap().is_empty(),
             "drop must cancel the spawned task; saw {} publishes post-drop",
             events.lock().unwrap().len(),
+        );
+    }
+
+    /// ADR 0116 C4: the pure escalation ladder — no fire below the
+    /// threshold, one fire at it, a latched episode never re-fires,
+    /// and a success re-arms so a relapse fires again.
+    #[test]
+    fn flush_health_tracker_fires_once_at_threshold_and_rearms_on_success() {
+        let mut t = FlushHealthTracker::default();
+        for i in 0..3 {
+            assert!(!t.on_flush_result(true), "failure {i} must not fire");
+        }
+        assert!(t.on_flush_result(true), "the 4th consecutive failure fires");
+        assert!(
+            !t.on_flush_result(true),
+            "a latched episode must not re-fire on the 5th",
+        );
+        assert!(!t.on_flush_result(false), "a success never fires");
+        for i in 0..3 {
+            assert!(
+                !t.on_flush_result(true),
+                "relapse failure {i} must not fire early"
+            );
+        }
+        assert!(
+            t.on_flush_result(true),
+            "after a success re-armed the ladder, the relapse fires again",
+        );
+    }
+
+    /// ADR 0116 C4: only device-class errors escalate. The blob tier
+    /// (`Chunk`) heals on its own (GCS throttling/outage) and must
+    /// not quarantine the sandbox.
+    #[test]
+    fn device_class_classifier_separates_device_from_blob_tier() {
+        use std::path::PathBuf;
+        assert!(is_device_class(&DiskBackendError::DeviceSync {
+            device: PathBuf::from("/dev/nbd9"),
+            source: std::io::Error::other("sync failed"),
+        }));
+        assert!(is_device_class(&DiskBackendError::ShortChunk {
+            chunk_idx: 3,
+            expected: 4096,
+            actual: 12,
+        }));
+        assert!(!is_device_class(&DiskBackendError::Chunk(
+            engram_chunk_store::error::ChunkStoreError::HashMismatch {
+                expected: "aa".into(),
+                actual: "bb".into(),
+            }
+        )));
+        assert!(!is_device_class(&DiskBackendError::WrongKind(
+            "memory".into()
+        )));
+        assert!(!is_device_class(&DiskBackendError::OutOfRange {
+            offset: 8192,
+            length: 4096,
+            total: 4096,
+        }));
+    }
+
+    type EscalationLog = Arc<Mutex<Vec<SandboxId>>>;
+
+    /// ADR 0116 C4: recording `DataPlaneHealth` sink — every report
+    /// appends the sandbox id.
+    struct RecordingHealth {
+        events: EscalationLog,
+    }
+
+    impl RecordingHealth {
+        fn new() -> (Self, EscalationLog) {
+            let events: EscalationLog = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    events: events.clone(),
+                },
+                events,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl DataPlaneHealth for RecordingHealth {
+        async fn data_plane_failed(&self, sandbox_id: SandboxId) {
+            self.events.lock().unwrap().push(sandbox_id);
+        }
+    }
+
+    /// `DeviceSync` stub that always fails — a wedged device whose
+    /// host page cache cannot sync (the backend.rs precedent).
+    struct FailingDeviceSync;
+
+    #[async_trait]
+    impl engram_host_core::DeviceSync for FailingDeviceSync {
+        async fn sync_device(&self, _path: &std::path::Path) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected sync failure"))
+        }
+    }
+
+    /// `DeviceSync` stub that always succeeds — a healed device.
+    struct HealthySync;
+
+    #[async_trait]
+    impl engram_host_core::DeviceSync for HealthySync {
+        async fn sync_device(&self, _path: &std::path::Path) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// ADR 0116 C4: a persistently failing device sync escalates into
+    /// the `DataPlaneHealth` sink exactly once — the 4th consecutive
+    /// failed wake fires, later failed wakes stay latched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failing_device_sync_escalates_exactly_once() {
+        let backend = build_backend(DEFAULT_DIRTY_THRESHOLD_BYTES).await;
+        backend.write(0, &[0xcc; 8]).await.unwrap();
+        backend.register_host_device(
+            std::path::PathBuf::from("/dev/nbd-test"),
+            Arc::new(FailingDeviceSync),
+        );
+        let (publisher, _publishes) = RecordingPublisher::new();
+        let (health, escalations) = RecordingHealth::new();
+        let sandbox_id = SandboxId::new();
+        let config = FlushSchedulerConfig {
+            interval: Duration::from_millis(20),
+            dirty_threshold_bytes: DEFAULT_DIRTY_THRESHOLD_BYTES,
+            enabled: true,
+        };
+        let _handle = FlushScheduler::spawn(
+            sandbox_id,
+            backend.clone(),
+            Arc::new(publisher),
+            Arc::new(health),
+            config,
+        );
+
+        // Four failed wakes (~80 ms at the 20 ms interval) fire the
+        // escalation; poll generously.
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if !escalations.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            escalations.lock().unwrap().as_slice(),
+            &[sandbox_id],
+            "the threshold crossing must report exactly once, with the sandbox id",
+        );
+
+        // ~15 more failed wakes: the latch holds, no second report.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            escalations.lock().unwrap().len(),
+            1,
+            "a latched failure episode must not re-fire",
+        );
+    }
+
+    /// ADR 0116 C4: healing the device re-arms the ladder — a later
+    /// relapse escalates AGAIN, so a heal→relapse cycle cannot hide
+    /// behind the first episode's latch. Heals via re-registering a
+    /// healthy sync (the backend.rs heal precedent).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn healed_device_relapse_escalates_again() {
+        let backend = build_backend(DEFAULT_DIRTY_THRESHOLD_BYTES).await;
+        backend.write(0, &[0xcc; 8]).await.unwrap();
+        backend.register_host_device(
+            std::path::PathBuf::from("/dev/nbd-test"),
+            Arc::new(FailingDeviceSync),
+        );
+        let (publisher, publishes) = RecordingPublisher::new();
+        let (health, escalations) = RecordingHealth::new();
+        let sandbox_id = SandboxId::new();
+        let config = FlushSchedulerConfig {
+            interval: Duration::from_millis(20),
+            dirty_threshold_bytes: DEFAULT_DIRTY_THRESHOLD_BYTES,
+            enabled: true,
+        };
+        let _handle = FlushScheduler::spawn(
+            sandbox_id,
+            backend.clone(),
+            Arc::new(publisher),
+            Arc::new(health),
+            config,
+        );
+
+        // First failure episode.
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if !escalations.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(escalations.lock().unwrap().len(), 1, "first episode fires");
+
+        // Heal the device. The next successful flush publishes the
+        // held-back dirty write — the observable proof a success fed
+        // the tracker and re-armed the latch.
+        backend.register_host_device(
+            std::path::PathBuf::from("/dev/nbd-test"),
+            Arc::new(HealthySync),
+        );
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if !publishes.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !publishes.lock().unwrap().is_empty(),
+            "the healed device must flush and publish the held-back write",
+        );
+
+        // Relapse: the device fails again; a second episode fires.
+        backend.register_host_device(
+            std::path::PathBuf::from("/dev/nbd-test"),
+            Arc::new(FailingDeviceSync),
+        );
+        for _ in 0..400 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if escalations.lock().unwrap().len() >= 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            escalations.lock().unwrap().len(),
+            2,
+            "a relapse after a heal must escalate again",
         );
     }
 }
