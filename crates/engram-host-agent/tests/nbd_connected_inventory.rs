@@ -41,7 +41,30 @@ use engram_host_agent::disk_daemon::{
 use engram_host_core::NbdKernel;
 use engram_storage_local::LocalBlobStorage;
 
-/// Clear any stale binding from a prior aborted run (idempotent).
+/// True when the kernel holds no binding on this device: the sysfs `pid` is
+/// absent or empty, and the block device reports zero size.
+fn device_is_free(nbd_path: &std::path::Path) -> bool {
+    let Some(name) = nbd_path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if pid_file(nbd_path).is_some() {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/sys/block/{name}/size")) {
+        Ok(size) => size.trim() == "0",
+        Err(_) => false,
+    }
+}
+
+/// Clear any stale binding from a prior aborted run, then WAIT for the kernel
+/// to release the device (idempotent).
+///
+/// This used to send DISCONNECT twenty times with a fixed 200 ms sleep between
+/// them and return whatever the state was. That is both slow and unreliable:
+/// it always cost 4 s even for a free device, and DISCONNECT only *starts* the
+/// teardown, so a device still tearing down failed the CONNECT below with
+/// `EBUSY` — observed on main and on PR #1241 on 2026-08-13. The teardown is
+/// asynchronous, so the precondition has to be observed, not assumed.
 fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
     let Some(idx) = nbd_path
         .file_name()
@@ -51,10 +74,29 @@ fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
     else {
         return;
     };
-    for _ in 0..20 {
-        let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(idx);
-        std::thread::sleep(std::time::Duration::from_millis(200));
+    for attempt in 0..40 {
+        if device_is_free(nbd_path) {
+            return;
+        }
+        // Re-send only every fourth pass: DISCONNECT is the request, and the
+        // waiting between passes is what lets the kernel finish it.
+        if attempt % 4 == 0 {
+            let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(idx);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
+    // Do not return quietly into a CONNECT that will fail with a bare `EBUSY`.
+    // Name what still holds the device instead.
+    panic!(
+        "{} is still bound after 10 s of DISCONNECT: sysfs pid {:?}, size {:?}",
+        nbd_path.display(),
+        pid_file(nbd_path),
+        nbd_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|name| std::fs::read_to_string(format!("/sys/block/{name}/size")).ok())
+            .map(|s| s.trim().to_string()),
+    );
 }
 
 fn preflight() -> Option<PathBuf> {
