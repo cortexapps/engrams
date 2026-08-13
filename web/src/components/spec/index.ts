@@ -1,5 +1,4 @@
 export { LazySpecCanvas } from "./LazySpecCanvas";
-export { SpecChatRail } from "./SpecChatRail";
 export {
   SpecSelectionMenu,
   createSpecSelectionSpan,

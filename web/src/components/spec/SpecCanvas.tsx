@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo } from "react";
 import { Collaboration } from "@tiptap/extension-collaboration";
 import { CollaborationCaret } from "@tiptap/extension-collaboration-caret";
 import { EditorContent, useEditor } from "@tiptap/react";
@@ -9,7 +9,6 @@ import * as Y from "yjs";
 import { useAuth } from "@/auth/AuthProvider";
 import { collaboratorColor } from "@/components/spec-mode/collaborator-colors";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { SpecPresence } from "./SpecPresence";
 import { SpecSelectionBubbleMenu, type SpecSelectionActions } from "./SpecSelectionActions";
@@ -17,7 +16,7 @@ import { SpecBlockIterationProvider } from "./block-iteration";
 import { specNodeExtensions } from "./extensions";
 import "./spec-canvas.css";
 
-interface SpecConnection {
+export interface SpecConnection {
   doc: Y.Doc;
   provider: WebsocketProvider;
 }
@@ -31,18 +30,20 @@ interface CreateSpecProviderOptions {
 }
 
 export function SpecCanvas({
+  doc,
+  provider,
   specId,
   revision,
   selectionActions,
 }: {
+  doc: Y.Doc;
+  provider: WebsocketProvider;
   specId: string;
   revision: string;
   /** Supply this only when the current user can send selection actions. */
   selectionActions?: SpecSelectionActions;
 }) {
   const { principal } = useAuth();
-  const [connection, setConnection] = useState<SpecConnection | null>(null);
-  const [synced, setSynced] = useState(false);
   const user = useMemo(
     () => ({
       name: principal.display_name || principal.email,
@@ -51,35 +52,10 @@ export function SpecCanvas({
     [principal.display_name, principal.email],
   );
 
-  useEffect(() => {
-    const doc = new Y.Doc();
-    const provider = createSpecProvider(specId, doc);
-    const onSync = (isSynced: boolean) => setSynced(isSynced);
-    provider.on("sync", onSync);
-    setConnection({ doc, provider });
-    return () => {
-      provider.off("sync", onSync);
-      provider.destroy();
-      doc.destroy();
-      setConnection(null);
-      setSynced(false);
-    };
-  }, [specId]);
-
-  if (!connection || !synced) {
-    return (
-      <div className="spec-canvas-loading" aria-label="Loading collaborative spec">
-        <Skeleton className="h-7 w-2/5" />
-        <Skeleton className="h-4 w-full" />
-        <Skeleton className="h-4 w-5/6" />
-      </div>
-    );
-  }
-
   return (
     <SpecBlockIterationProvider specId={specId}>
       <ConnectedSpecCanvas
-        connection={connection}
+        connection={{ doc, provider }}
         user={user}
         specId={specId}
         revision={revision}

@@ -1,4 +1,6 @@
 import { lazy, Suspense } from "react";
+import type { WebsocketProvider } from "y-websocket";
+import type * as Y from "yjs";
 
 import { Skeleton } from "@/components/ui/skeleton";
 import type { SpecSelectionActions } from "./SpecSelectionActions";
@@ -9,10 +11,14 @@ const SpecCanvas = lazy(() =>
 
 /** Keep the editor, Yjs, and ProseMirror out of the main application bundle. */
 export function LazySpecCanvas({
+  doc,
+  provider,
   specId,
   revision,
   selectionActions,
 }: {
+  doc: Y.Doc;
+  provider: WebsocketProvider;
   specId: string;
   revision: string;
   selectionActions?: SpecSelectionActions;
@@ -27,7 +33,13 @@ export function LazySpecCanvas({
         </div>
       }
     >
-      <SpecCanvas specId={specId} revision={revision} selectionActions={selectionActions} />
+      <SpecCanvas
+        doc={doc}
+        provider={provider}
+        specId={specId}
+        revision={revision}
+        selectionActions={selectionActions}
+      />
     </Suspense>
   );
 }

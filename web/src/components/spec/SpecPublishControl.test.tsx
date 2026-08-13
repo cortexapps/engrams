@@ -149,7 +149,7 @@ describe("SpecPublishControl", () => {
     expect(screen.getByText("— open")).toBeTruthy();
     // The ran-at hour follows the viewer's timezone, so the assertion must not
     // pin one (a UTC-authored literal fails on any laptop west of Greenwich).
-    expect(screen.getByText(/^7 of 9 ready · gap check ran \d{1,2}:31\s?(AM|PM)$/)).toBeTruthy();
+    expect(screen.getByText(/^7 of 9 ready · review ran \d{1,2}:31\s?(AM|PM)$/)).toBeTruthy();
 
     const reviews = screen.getAllByRole("button", { name: "Review →" });
     await user.click(reviews[0]!);
@@ -200,7 +200,7 @@ describe("SpecPublishControl", () => {
     );
   });
 
-  test("a stale gap check makes the run part of the publish (R30)", async () => {
+  test("a stale review makes the run part of the publish (R30)", async () => {
     const user = userEvent.setup();
     state.status = status({
       gate: { ...status().gate, gapCheckRunRequired: true },
@@ -208,11 +208,11 @@ describe("SpecPublishControl", () => {
     });
     render(<SpecPublishControl specId="spec-1" onReviewSection={vi.fn()} />);
 
-    await user.click(screen.getByRole("button", { name: /Run gap check & publish/ }));
-    expect(screen.getByText("9 of 9 ready · gap check has not run")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: /Review & publish/ }));
+    expect(screen.getByText("9 of 9 ready · review has not run")).toBeTruthy();
 
     const dialog = within(screen.getByRole("dialog"));
-    await user.click(dialog.getByRole("button", { name: "Run gap check & publish" }));
+    await user.click(dialog.getByRole("button", { name: "Review & publish" }));
     expect(mutate).toHaveBeenCalledWith(
       { acknowledgeOpenQuestions: false, runGapCheck: true },
       expect.anything(),

@@ -42,6 +42,8 @@ import { ArtifactViewPage } from "./pages/artifacts/ArtifactViewPage";
 import { SpecsLayout } from "./pages/specs/SpecsLayout";
 import { SpecsList } from "./pages/specs/SpecsList";
 import { SpecTemplates } from "./pages/specs/SpecTemplates";
+import { NewSpecPage } from "./pages/specmode/NewSpecPage";
+import { SpecShellPage } from "./pages/specmode/SpecShellPage";
 import { KaizenLayout } from "./pages/kaizen/KaizenLayout";
 import { Papercuts } from "./pages/kaizen/Papercuts";
 import { Fleet } from "./pages/Fleet";
@@ -63,7 +65,6 @@ import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
 import { Automations } from "./pages/settings/Automations";
 import { AutomationEditor } from "./pages/settings/AutomationEditor";
-import { SpecReadPage } from "./pages/SpecReadPage";
 
 export interface RouterContext {
   /** Null when the session has resolved but no user is signed in.
@@ -287,7 +288,7 @@ const artifactViewRoute = createRoute({
 const specsLayoutRoute = createRoute({
   getParentRoute: () => appLayoutRoute,
   path: "/specs",
-  beforeLoad: requireAdmin,
+  beforeLoad: requireAuth,
   component: SpecsLayout,
 });
 const specsIndexRoute = createRoute({
@@ -305,10 +306,19 @@ const specTemplatesRoute = createRoute({
   path: "templates",
   component: SpecTemplates,
 });
+// Spec mode owns the full window. These routes are authenticated siblings of
+// the app shell, so its spine and document frame never sit inside app chrome.
 const specDetailRoute = createRoute({
-  getParentRoute: () => specsLayoutRoute,
-  path: "$specId",
-  component: SpecReadPage,
+  getParentRoute: () => rootRoute,
+  path: "/specs/$specId",
+  beforeLoad: requireAuth,
+  component: SpecShellPage,
+});
+const newSpecRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/specs/new",
+  beforeLoad: requireAuth,
+  component: NewSpecPage,
 });
 
 // /kaizen layout route (second sidebar) ----------------------------------
@@ -454,6 +464,9 @@ export const routeTree = rootRoute.addChildren([
   loginRoute,
   // Standalone artifact view — authenticated but chromeless (popout).
   artifactViewRoute,
+  // Spec mode — authenticated, chromeless, and responsible for its own frame.
+  specDetailRoute,
+  newSpecRoute,
   // Authenticated app shell — all authenticated routes nested here
   appLayoutRoute.addChildren([
     indexRoute,
@@ -470,7 +483,7 @@ export const routeTree = rootRoute.addChildren([
       artifactDetailRoute,
       artifactDetailPrettyRoute,
     ]),
-    specsLayoutRoute.addChildren([specsIndexRoute, specTemplatesRoute, specDetailRoute]),
+    specsLayoutRoute.addChildren([specsIndexRoute, specTemplatesRoute]),
     operatorLayoutRoute.addChildren([
       operatorIndexRoute,
       operatorFleetRoute,
