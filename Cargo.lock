@@ -7590,7 +7590,7 @@ dependencies = [
  "idna",
  "indexmap",
  "ipnet",
- "jsonwebtoken 10.4.0",
+ "jsonwebtoken 11.0.0",
  "lazy_static",
  "libc",
  "log",
