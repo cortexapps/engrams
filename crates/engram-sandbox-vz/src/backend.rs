@@ -1198,9 +1198,11 @@ impl SandboxBackend for VzBackend {
                 );
                 Ok(())
             }
-            engram_agentd::WireResponse::Error { kind, message } => Err(SandboxError::Vm(
-                format!("SpawnHarness rejected ({kind}): {message}").into(),
-            )),
+            // ADR 0116 B-D4: keep agentd's typed kind, exactly like the
+            // Firecracker backend (production drives the design).
+            engram_agentd::WireResponse::Error { kind, message } => {
+                Err(SandboxError::HarnessSpawn { kind, message })
+            }
             other => Err(SandboxError::Vm(
                 format!("SpawnHarness: unexpected response: {other:?}").into(),
             )),

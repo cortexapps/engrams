@@ -155,6 +155,34 @@ pub enum SandboxError {
     /// carries it as a terminal `MaterializeImageFailed` frame so the
     /// kind survives the wire.
     MaterializeFailed(crate::types::MaterializeFailure),
+    /// ADR 0116 B-D4: agentd could not spawn the harness process inside
+    /// the guest. `kind` mirrors the guest's `std::io::ErrorKind` as its
+    /// `Debug` string (`"NotFound"`, `"PermissionDenied"`, …) — agentd
+    /// already sends it typed over the vsock wire (`WireResponse::Error
+    /// { kind, .. }`); this variant stops the backends from flattening
+    /// it into `Vm`. Crosses the host→coord gRPC boundary as a
+    /// `failed_precondition` with a marker message (the wire-skew
+    /// precedent — `engram_protocol::wire::harness_spawn_message`), so
+    /// no `WIRE_VERSION` bump and mixed fleets degrade to today's
+    /// stringly behavior in both directions. B4's resume re-plan reads
+    /// [`harness_spawn_kind_is_deterministic`] to stop retrying a plan
+    /// that cannot succeed (the incident: 60 identical retries against
+    /// a spec whose harness path was never mounted).
+    HarnessSpawn {
+        kind: String,
+        message: String,
+    },
+}
+
+/// ADR 0116 B-D4: is a harness-spawn failure of this `kind`
+/// deterministic — guaranteed to recur if the identical spec is
+/// dispatched to the identical sandbox again? A missing or
+/// non-executable binary does not heal with time; a re-plan (rebuild
+/// the binding, re-materialize the spec) is the only move. Everything
+/// else (interrupted syscalls, transient resource exhaustion, kinds we
+/// do not recognize) stays retryable — the conservative default.
+pub fn harness_spawn_kind_is_deterministic(kind: &str) -> bool {
+    matches!(kind, "NotFound" | "PermissionDenied" | "InvalidInput")
 }
 
 impl fmt::Display for SandboxError {
@@ -182,6 +210,10 @@ impl fmt::Display for SandboxError {
             Self::Unsupported(msg) => write!(f, "host does not implement this RPC: {msg}"),
             Self::CaptureFailed(failure) => write!(f, "{failure}"),
             Self::MaterializeFailed(failure) => write!(f, "{failure}"),
+            // Prefix-compatible with the wire marker, like WireSkew's arm.
+            Self::HarnessSpawn { kind, message } => {
+                write!(f, "harness_spawn: kind={kind} {message}")
+            }
         }
     }
 }
@@ -381,5 +413,27 @@ mod tests {
         assert!(SandboxError::InvalidSpec("bad cpu".into())
             .to_string()
             .contains("bad cpu"));
+    }
+
+    // ADR 0116 B-D4: the deterministic/transient split the resume
+    // re-plan keys on. A missing or unreadable binary recurs on an
+    // identical re-dispatch; everything unrecognized stays retryable —
+    // the conservative default (a wrong "deterministic" verdict skips
+    // retries that might have worked; a wrong "transient" verdict just
+    // burns the existing retry budget, which is today's behavior).
+    #[test]
+    fn harness_spawn_kind_classification() {
+        for kind in ["NotFound", "PermissionDenied", "InvalidInput"] {
+            assert!(
+                harness_spawn_kind_is_deterministic(kind),
+                "{kind} must be deterministic"
+            );
+        }
+        for kind in ["Interrupted", "WouldBlock", "OutOfMemory", "Other", "bogus"] {
+            assert!(
+                !harness_spawn_kind_is_deterministic(kind),
+                "{kind} must stay retryable"
+            );
+        }
     }
 }

@@ -193,6 +193,38 @@ pub fn parse_wire_skew_message(msg: &str) -> Option<(u32, u32)> {
     Some((host.trim().parse().ok()?, coord.trim().parse().ok()?))
 }
 
+/// Marker prefix for the host-agent's harness-spawn rejection message
+/// (ADR 0116 B-D4, the [`WIRE_SKEW_STATUS_PREFIX`] precedent). The host
+/// returns a `failed_precondition` status whose message starts with this
+/// prefix and carries the guest's `io::ErrorKind` Debug string in a fixed
+/// `kind=<Kind>` token; the coord-side client matches the prefix to map
+/// the status back to a typed `SandboxError::HarnessSpawn` rather than a
+/// generic VM error. A coordinator that predates the marker sees an
+/// ordinary `failed_precondition` string and behaves exactly as before —
+/// no `WIRE_VERSION` bump.
+pub const HARNESS_SPAWN_STATUS_PREFIX: &str = "harness_spawn:";
+
+/// Render the host-agent's harness-spawn rejection message. `kind` is the
+/// guest `io::ErrorKind` Debug string agentd sent (`"NotFound"`, …);
+/// `message` is the human-readable spawn error.
+pub fn harness_spawn_message(kind: &str, message: &str) -> String {
+    format!("{HARNESS_SPAWN_STATUS_PREFIX} kind={kind} {message}")
+}
+
+/// Parse a (kind, message) pair out of a [`harness_spawn_message`].
+/// Returns `None` if `msg` isn't a harness-spawn marker (so a regular
+/// `failed_precondition` from some other source falls through to the
+/// default mapping).
+pub fn parse_harness_spawn_message(msg: &str) -> Option<(String, String)> {
+    let rest = msg.strip_prefix(HARNESS_SPAWN_STATUS_PREFIX)?.trim();
+    let rest = rest.strip_prefix("kind=")?;
+    let (kind, message) = rest.split_once(' ')?;
+    if kind.is_empty() {
+        return None;
+    }
+    Some((kind.to_string(), message.trim().to_string()))
+}
+
 /// Wire-friendly mirror of [`engram_core::types::sandbox::ExecRequest`].
 ///
 /// Defined here so the gRPC payload bincode roundtrips cleanly via
@@ -313,6 +345,48 @@ mod tests {
         assert_eq!(parse_wire_skew_message("wire_version skew: garbage"), None);
         assert_eq!(
             parse_wire_skew_message("wire_version skew: host=x coord=3"),
+            None
+        );
+    }
+
+    #[test]
+    fn harness_spawn_message_round_trips() {
+        // ADR 0116 B-D4: the host renders the spawn-rejection marker; the
+        // coord parses it back to (kind, message). Lossless round-trip so
+        // the guest's io::ErrorKind survives to the resume re-plan.
+        let msg = harness_spawn_message(
+            "NotFound",
+            "spawn_harness: spawn \"/opt/engram/dyn/0/bin/h\": No such file or directory",
+        );
+        assert_eq!(
+            parse_harness_spawn_message(&msg),
+            Some((
+                "NotFound".to_string(),
+                "spawn_harness: spawn \"/opt/engram/dyn/0/bin/h\": No such file or directory"
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_harness_spawn_message_rejects_non_marker_status() {
+        // Unmarked / malformed statuses fall through to the default
+        // mapping — same discipline as the skew parser.
+        assert_eq!(parse_harness_spawn_message("image not ready"), None);
+        assert_eq!(parse_harness_spawn_message("harness_spawn: garbage"), None);
+        assert_eq!(parse_harness_spawn_message("harness_spawn: kind= x"), None);
+        assert_eq!(
+            parse_harness_spawn_message("harness_spawn: kind=NotFound"),
+            None,
+            "a kind with no message is malformed"
+        );
+        // The skew marker is not a spawn marker and vice versa.
+        assert_eq!(
+            parse_harness_spawn_message("wire_version skew: host=2 coord=3"),
+            None
+        );
+        assert_eq!(
+            parse_wire_skew_message(&harness_spawn_message("NotFound", "x")),
             None
         );
     }

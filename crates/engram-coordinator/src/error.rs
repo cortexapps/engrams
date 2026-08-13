@@ -203,6 +203,12 @@ impl From<SandboxError> for ApiError {
                 "host wire_version {host} != coordinator {coord} (rolling deploy in \
                  progress); retry shortly."
             )),
+            // ADR 0116 B-D4: same classification a spawn failure got when
+            // it was a `Vm` string (Internal, 500) — B3 only types the
+            // error; B4's resume re-plan is the consumer that changes the
+            // decision (rebuild the binding on a deterministic kind
+            // instead of retrying the identical plan).
+            spawn @ SandboxError::HarnessSpawn { .. } => Self::Internal(spawn.to_string()),
             other => Self::Internal(other.to_string()),
         }
     }
