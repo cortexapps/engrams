@@ -24,7 +24,6 @@ chrono = { version = "0.4", features = ["serde"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common-6f8ce4dd05d13bba = { package = "crypto-common", version = "0.2", default-features = false, features = ["getrandom"] }
 crypto-common-c65f7effa3be6d31 = { package = "crypto-common", version = "0.1", default-features = false, features = ["std"] }
-der = { version = "0.7", default-features = false, features = ["oid", "pem", "std"] }
 deranged = { version = "0.5", features = ["serde"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
@@ -49,6 +48,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "ser
 idna = { version = "1" }
 indexmap = { version = "2", features = ["serde"] }
 ipnet = { version = "2" }
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
@@ -61,7 +61,6 @@ num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
 phf_shared = { version = "0.11" }
-pkcs8 = { version = "0.10", default-features = false, features = ["pem", "std"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 prost = { version = "0.14" }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
@@ -72,11 +71,9 @@ rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
-reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "json", "query", "rustls-no-provider", "stream"] }
-reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["charset", "json", "multipart", "rustls-tls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "charset", "form", "json", "multipart", "query", "rustls-no-provider", "stream"] }
 rsa = { version = "0.9" }
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
-rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "raw_value"] }
@@ -86,7 +83,6 @@ simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
 socket2 = { version = "0.6", default-features = false, features = ["all"] }
-spki = { version = "0.7", default-features = false, features = ["pem", "std"] }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "chrono", "json", "migrate", "offline", "uuid"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["chrono", "json", "migrate", "offline", "uuid"] }
 subtle = { version = "2", default-features = false, features = ["i128"] }
@@ -147,7 +143,6 @@ regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
-rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "raw_value"] }
@@ -175,14 +170,12 @@ zeroize = { version = "1", features = ["derive"] }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 libc = { version = "0.2", default-features = false, features = ["use_std"] }
 nix = { version = "0.31", features = ["ioctl", "mount", "socket"] }
 nom = { version = "7" }
 num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
-ring = { version = "0.17", features = ["std"] }
 rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
@@ -194,19 +187,16 @@ lazy_static = { version = "1", default-features = false, features = ["spin_no_st
 libc = { version = "0.2", features = ["extra_traits", "use_std"] }
 nom = { version = "7" }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
-ring = { version = "0.17", features = ["std"] }
 rustix = { version = "1", features = ["fs"] }
 
 [target.x86_64-unknown-linux-musl.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 libc = { version = "0.2", default-features = false, features = ["use_std"] }
 nix = { version = "0.31", features = ["ioctl", "mount", "socket"] }
 nom = { version = "7" }
 num-iter = { version = "0.1", default-features = false, features = ["i128", "std"] }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
-ring = { version = "0.17", features = ["std"] }
 rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
@@ -218,15 +208,12 @@ lazy_static = { version = "1", default-features = false, features = ["spin_no_st
 libc = { version = "0.2", features = ["extra_traits", "use_std"] }
 nom = { version = "7" }
 prost = { version = "0.14", default-features = false, features = ["no-recursion-limit"] }
-ring = { version = "0.17", features = ["std"] }
 rustix = { version = "1", features = ["fs"] }
 
 [target.x86_64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 errno = { version = "0.3" }
-hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-ring = { version = "0.17", features = ["std"] }
 rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
@@ -236,15 +223,12 @@ bitflags = { version = "2", default-features = false, features = ["std"] }
 errno = { version = "0.3" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2", features = ["extra_traits"] }
-ring = { version = "0.17", features = ["std"] }
 rustix = { version = "1", features = ["fs"] }
 
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 errno = { version = "0.3" }
-hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-ring = { version = "0.17", features = ["std"] }
 rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", default-features = false, features = ["timeout"] }
 tower-http = { version = "0.6", features = ["auth", "follow-redirect", "map-response-body", "trace", "util"] }
@@ -254,7 +238,6 @@ bitflags = { version = "2", default-features = false, features = ["std"] }
 errno = { version = "0.3" }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2", features = ["extra_traits"] }
-ring = { version = "0.17", features = ["std"] }
 rustix = { version = "1", features = ["fs"] }
 
 ### END HAKARI SECTION

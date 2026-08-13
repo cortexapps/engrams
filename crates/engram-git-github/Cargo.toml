@@ -10,6 +10,7 @@ description = "GitHub App GitForge: mints scoped installation tokens and opens p
 workspace = true
 
 [dependencies]
+engram-tls.workspace = true
 engram-core.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

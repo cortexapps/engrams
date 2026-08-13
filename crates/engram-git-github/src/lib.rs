@@ -164,7 +164,7 @@ impl GitHubApp {
         let encoding_key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes()).map_err(|e| {
             IntegrationError::Unauthorized(format!("invalid GitHub App private key: {e}"))
         })?;
-        let http = reqwest::Client::builder()
+        let http = engram_tls::client_builder()
             .user_agent("engram-git-github")
             .build()
             .map_err(|e| IntegrationError::Backend(Box::new(e)))?;

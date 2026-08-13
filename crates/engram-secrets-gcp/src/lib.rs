@@ -96,7 +96,7 @@ struct MetadataTokenResponse {
 
 impl MetadataTokenSource {
     pub fn new() -> Result<Self, SecretError> {
-        let http = reqwest::Client::builder()
+        let http = engram_tls::client_builder()
             .timeout(Duration::from_secs(5))
             .build()
             .map_err(|e| SecretError::Backend(Box::new(e)))?;
@@ -189,7 +189,7 @@ impl GcpSecretManager {
     /// Construct the production-default backend: metadata-server
     /// auth + the public Secret Manager API.
     pub fn new(project: impl Into<String>) -> Result<Self, SecretError> {
-        let http = reqwest::Client::builder()
+        let http = engram_tls::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| SecretError::Backend(Box::new(e)))?;

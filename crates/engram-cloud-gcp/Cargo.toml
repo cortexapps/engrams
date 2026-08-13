@@ -10,6 +10,7 @@ description = "GCP cloud integrations (GKE node-pool scaler)."
 workspace = true
 
 [dependencies]
+engram-tls.workspace = true
 engram-core.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true

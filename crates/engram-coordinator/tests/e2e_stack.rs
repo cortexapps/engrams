@@ -813,7 +813,7 @@ impl OrchestratorDriver {
         Self {
             base_url,
             api_key,
-            http: reqwest::Client::new(),
+            http: engram_tls::client(),
         }
     }
 
