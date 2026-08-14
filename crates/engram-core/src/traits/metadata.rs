@@ -1763,6 +1763,26 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
+    /// ADR 0116 A5: the lost-destroy leftover channel. For every
+    /// sandbox in `running` that NO session row binds: stamp (or keep)
+    /// an unbound-sighting; a sighting older than `grace_secs` GRADUATES
+    /// to a tombstone (host-affirmed present + coordinator-confirmed
+    /// unowned, stable past the create→bind window — both facts
+    /// explicit, no liveness inference). Sightings for sandboxes that
+    /// became bound, left the running set, or graduated are pruned in
+    /// the same transaction. Returns the newly entombed ids. Default
+    /// body is a mock no-op; PG and sim implement the real semantics
+    /// (conformance: `t_sandbox_tombstones`).
+    async fn entomb_stably_unbound(
+        &self,
+        host_id: HostId,
+        running: &[crate::SandboxId],
+        grace_secs: u64,
+    ) -> Result<Vec<crate::SandboxId>, MetaError> {
+        let _ = (host_id, running, grace_secs);
+        Ok(Vec::new())
+    }
+
     /// ADR 0116 A-D5: the tombstones currently outstanding for
     /// `host_id`, advertised on every heartbeat response until the host
     /// acks by absence. Default body: none.

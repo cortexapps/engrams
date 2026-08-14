@@ -144,15 +144,11 @@ impl BlobRetryConfig {
 
 impl OciClient {
     pub fn new(auth: Arc<dyn RegistryAuthResolver>) -> Self {
-        // oci-client 0.17's reqwest (0.13, `rustls-no-provider` — see
-        // Cargo.toml) refuses to build until a process-level rustls
-        // CryptoProvider is installed; it does not fall back to the
-        // compiled-in provider. The workspace compiles exactly ONE
-        // provider (ring — aws-lc-rs is not in the lockfile), so this
-        // install cannot pick a wrong provider and cannot race a
-        // different one: a second install of the same provider is the
-        // only possible "error", hence the ignored Result.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        // oci-client builds its own reqwest client internally, so it cannot
+        // be routed through `engram_tls::client_builder`. Install the
+        // process provider directly before handing off — without it that
+        // client panics on construction. See `engram-tls` for why.
+        engram_tls::install_provider();
         // Two cached inner clients, one per protocol. They MUST be
         // cached on the struct rather than rebuilt per call: the
         // bearer-token cache lives inside `Client`, so a fresh client
@@ -171,7 +167,7 @@ impl OciClient {
         Self {
             inner,
             inner_http,
-            http: reqwest::Client::new(),
+            http: engram_tls::client(),
             head_tokens: Arc::new(Mutex::new(HashMap::new())),
             auth,
             blob_retry: BlobRetryConfig::default(),

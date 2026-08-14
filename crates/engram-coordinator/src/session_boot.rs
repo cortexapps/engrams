@@ -1039,7 +1039,7 @@ const CONNECTION_BROKER_TIMEOUT: std::time::Duration = std::time::Duration::from
 fn connection_broker_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        engram_tls::client_builder()
             .timeout(CONNECTION_BROKER_TIMEOUT)
             .build()
             .expect("the connection broker client builds from static settings")

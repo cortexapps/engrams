@@ -1,7 +1,9 @@
 //! GCS-backed [`BlobStorage`].
 //!
-//! Wires `google-cloud-storage` v0.24 against the trait. Application
-//! Default Credentials (ADC) by default; emulator support via
+//! Wires `gcloud-storage` v1.3 against the trait — the crate that was
+//! published as `google-cloud-storage` up to 0.24, before that name moved
+//! to Google's official SDK (see the manifest note on the rename).
+//! Application Default Credentials (ADC) by default; emulator support via
 //! `STORAGE_EMULATOR_HOST` (the standard convention `fake-gcs-server`
 //! honors). Returning to ADC after an emulator override is just
 //! unsetting the env var.
@@ -33,13 +35,13 @@ use async_trait::async_trait;
 use engram_core::error::BlobError;
 use engram_core::traits::{BlobObjectMeta, BlobStorage, ByteStream};
 use futures::{SinkExt, StreamExt};
-use google_cloud_storage::client::{Client, ClientConfig};
-use google_cloud_storage::http::objects::delete::DeleteObjectRequest;
-use google_cloud_storage::http::objects::download::Range;
-use google_cloud_storage::http::objects::get::GetObjectRequest;
-use google_cloud_storage::http::objects::list::ListObjectsRequest;
-use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
-use google_cloud_storage::http::Error as GcsHttpError;
+use gcloud_storage::client::{Client, ClientConfig};
+use gcloud_storage::http::objects::delete::DeleteObjectRequest;
+use gcloud_storage::http::objects::download::Range;
+use gcloud_storage::http::objects::get::GetObjectRequest;
+use gcloud_storage::http::objects::list::ListObjectsRequest;
+use gcloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
+use gcloud_storage::http::Error as GcsHttpError;
 
 /// GCS-backed storage. One client per instance, cheap to clone.
 pub struct GcsBlobStorage {
@@ -53,11 +55,15 @@ impl GcsBlobStorage {
     /// — `fake-gcs-server` for local dev. Otherwise uses ADC against
     /// production GCS.
     ///
-    /// Note: `google-cloud-storage` v0.24 does not auto-honor
+    /// Note: `gcloud-storage` does not auto-honor
     /// `STORAGE_EMULATOR_HOST` (`grep -rn STORAGE_EMULATOR_HOST` in
     /// the SDK turns up only a `// TODO emulator support` note). We
     /// thread it through explicitly here.
     pub async fn connect(bucket: impl Into<String>) -> Result<Self, BlobError> {
+        // `gcloud-auth` builds its own client inside `auth_config` to fetch
+        // ADC tokens, so the process provider has to be installed before
+        // that call — not just before the tuned client below.
+        engram_tls::install_provider();
         let mut cfg = Self::auth_config().await?;
         // Inject our own transport instead of the SDK's untuned default
         // (per TigerBeetle's object-storage-client findings, 2026-07):
@@ -90,7 +96,7 @@ impl GcsBlobStorage {
         // `http1_only()` here is belt-and-braces against the feature
         // ever arriving transitively; to re-test h2, re-run blobbench
         // with the feature enabled rather than trusting this number.
-        let http = reqwest::Client::builder()
+        let http = engram_tls::client_builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .pool_max_idle_per_host(64)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
@@ -112,6 +118,9 @@ impl GcsBlobStorage {
     /// dev code paths must use [`Self::connect`].
     #[doc(hidden)]
     pub async fn connect_untuned(bucket: impl Into<String>) -> Result<Self, BlobError> {
+        // No tuned client here, so the SDK builds its own — same reason as
+        // `connect` that this has to happen first.
+        engram_tls::install_provider();
         let cfg = Self::auth_config().await?;
         Ok(Self {
             client: Arc::new(Client::new(cfg)),
@@ -312,6 +321,35 @@ impl BlobStorage for GcsBlobStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the rustls CryptoProvider contract for this crate's clients.
+    ///
+    /// `connect()` reaches TLS twice — the tuned client it builds, and the
+    /// one `gcloud-auth` builds internally — and the workspace compiles
+    /// reqwest with `rustls-no-provider`, under which `build()` panics
+    /// until a process-level provider is installed (see `engram-tls`).
+    /// Without the install this fails with "No rustls crypto provider is
+    /// configured" and every GCS operation fails at construction.
+    ///
+    /// `engram-tls` owns the install and has its own unit pin, but this
+    /// test is what covers THIS crate's two entry points: `connect` calls
+    /// `install_provider` explicitly for the SDK's internal client, and a
+    /// future edit could drop that line without any other test noticing.
+    /// The emulator tests below cannot catch it — they return early when
+    /// `STORAGE_EMULATOR_HOST` is unset, which is the case on any host
+    /// without docker. This one sets the variable itself, so it runs
+    /// everywhere and needs no network: anonymous auth against a dead port
+    /// never dials.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_installs_a_crypto_provider() {
+        // nextest runs one process per test, so this cannot race a
+        // sibling's view of the environment.
+        std::env::set_var("STORAGE_EMULATOR_HOST", "http://127.0.0.1:1");
+
+        GcsBlobStorage::connect("engram-provider-contract")
+            .await
+            .expect("connect must build a TLS client without a preinstalled provider");
+    }
 
     /// Smoke test that `connect` doesn't panic when `STORAGE_EMULATOR_HOST`
     /// is set and the emulator is reachable. Gated on the env var being

@@ -199,6 +199,8 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - name: Build and start the bundle
         run: |
+          python3 -m unittest discover \
+            -s deploy/bundles/integrations-cli/tests -p 'test_*.py'
           deploy/bundles/integrations-cli/build.sh --stage var/integrations-cli
           config_dir="$(mktemp -d)"
           trap 'rm -rf "$config_dir"' EXIT
@@ -852,7 +854,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_fc == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/fc-setup
@@ -923,7 +925,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_fc == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/fc-setup
@@ -966,7 +968,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_fc == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/fc-setup
@@ -1093,7 +1095,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_fc == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/fc-setup

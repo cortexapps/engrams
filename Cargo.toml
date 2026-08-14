@@ -41,6 +41,7 @@ members = [
     "crates/engram-testkit",
     "crates/engram-egress-proxy",
     "crates/engram-crypto",
+    "crates/engram-tls",
     "crates/engram-oci",
     "crates/engram-oci-auth",
     "crates/engram-storage-local",
@@ -120,6 +121,7 @@ engram-agentd = { path = "crates/engram-agentd" }
 engram-uffd-handler = { path = "crates/engram-uffd-handler" }
 engram-egress-proxy = { path = "crates/engram-egress-proxy" }
 engram-crypto = { path = "crates/engram-crypto" }
+engram-tls = { path = "crates/engram-tls" }
 engram-oci = { path = "crates/engram-oci" }
 engram-oci-auth = { path = "crates/engram-oci-auth" }
 engram-storage-local = { path = "crates/engram-storage-local" }
@@ -154,12 +156,24 @@ clock-steering = "0.2.1"
 bincode = "1.3"
 
 # http / api
-axum = { version = "0.7", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "cors"] }
 hyper = "1"
 h2 = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# reqwest 0.13 renamed the TLS features: 0.12's `rustls-tls` became `rustls`,
+# and `rustls` now turns on rustls's aws-lc-rs provider. `rustls-no-provider`
+# is the 0.13 spelling of what `rustls-tls` used to mean here — bring the TLS
+# stack, leave provider choice to the one the workspace enables (`ring`,
+# pinned below). Selecting `rustls` instead would put a second provider in the
+# tree, the same failure mode the jsonwebtoken note above describes.
+#
+# The cost of `rustls-no-provider` is that reqwest then requires a
+# PROCESS-level provider and panics in `ClientBuilder::build` without one —
+# it does not fall back to the compiled-in `ring`, and 0.12's `rustls-tls`
+# did. That is why clients are built through `engram-tls` rather than by
+# calling `reqwest::Client::builder()` directly; see that crate's docs.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
 http = "1"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
 # JWT / JWKS verification for the auth seam (ADR 0031): OIDC ID-token
@@ -300,11 +314,11 @@ proptest = "1"
 # seed-stable, documented stream layout (the standard DST choice); the
 # master seed forks per-component streams so adding a consumer doesn't
 # shift every other stream.
-rand = { version = "0.9", default-features = false, features = ["std"] }
+rand = { version = "0.10", default-features = false, features = ["std"] }
 rand_core06 = { package = "rand_core", version = "0.6", default-features = false, features = ["getrandom"] }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
 pem = "3"
-rand_chacha = "0.9"
+rand_chacha = "0.10"
 
 # tls + cert mint (host-side egress proxy)
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }

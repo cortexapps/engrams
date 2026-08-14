@@ -190,7 +190,7 @@ async fn built_endpoint(
     api_base: &str,
     instance_port: u16,
 ) -> Result<engram_cloud_sql::CloudSqlEndpoint, engram_cloud_sql::Error> {
-    let http = reqwest::Client::new();
+    let http = engram_tls::client();
     let instance = InstanceName::parse(INSTANCE).unwrap();
     build_endpoint(EndpointRequest {
         http: &http,
@@ -295,7 +295,7 @@ async fn a_region_mismatch_is_a_config_error() {
     let instance = fake_instance(&fixture, cert, key).await;
     let api = mock_sqladmin(fixture, instance, None, None).await;
 
-    let http = reqwest::Client::new();
+    let http = engram_tls::client();
     let wrong_region = InstanceName::parse("proj-1:europe-west1:db-1").unwrap();
     let error = build_endpoint(EndpointRequest {
         http: &http,

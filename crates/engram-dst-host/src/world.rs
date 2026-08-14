@@ -627,20 +627,24 @@ impl SimHost {
             .map(|s| (s.sandbox_id, s.session_id))
     }
 
-    /// Drive one REAL `reconcile_once` tick against the sim world, over the
-    /// caller-owned `strikes` ledger. Flow C's end-to-end path: list →
-    /// classify (pure core + a coord call per sandbox) → strike-debounce →
-    /// destroy/repair. Returns the list()-failure error verbatim (benign in
-    /// the sim — `list()` never fails).
+    /// Drive one REAL `reconcile_once` tick against the sim world, over
+    /// the caller-owned `first_seen` ledger and the caller's monotonic
+    /// mark (ADR 0116 A5: the age grace replaced the strike debounce).
+    /// Flow C's end-to-end path: list → classify (pure core; only the
+    /// unbound arm makes a coord call) → age-gate → destroy/repair.
+    /// Returns the list()-failure error verbatim (benign in the sim —
+    /// `list()` never fails).
     pub async fn reconcile_tick(
         &self,
-        strikes: &mut std::collections::HashMap<SandboxId, u32>,
+        first_seen: &mut std::collections::HashMap<SandboxId, std::time::Duration>,
+        now_mono: std::time::Duration,
     ) -> Result<(), String> {
         engram_host_agent::teardown_reconcile::reconcile_once(
             &*self.reconcile,
             &*self.coord,
             self.host_id,
-            strikes,
+            first_seen,
+            now_mono,
         )
         .await
         .map_err(|e| format!("reconcile_once: {e}"))

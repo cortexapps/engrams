@@ -77,7 +77,8 @@ describe("runIntegrationOp", () => {
     expect(req.method).toBe("GET");
     expect(req.path).toBe("/api/v1/dashboard");
     expect(req.credential?.source).toBe("inject");
-    // Datadog's pup injects two headers; both ride the spec.
+    // The API host receives the REST spellings only. MCP uses the same stored
+    // keys under underscore headers, but those aliases are host-scoped.
     const refs = (req.credential?.injects ?? []).map((i) => i.secretRef).sort();
     expect(refs).toEqual(["datadog-api-key", "datadog-app-key"]);
   });

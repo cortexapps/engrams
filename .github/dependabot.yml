@@ -61,7 +61,8 @@ updates:
           ["tonic", "tonic-*", "prost", "prost-*", "sha2", "hmac", "digest",
            "opentelemetry", "opentelemetry-*", "opentelemetry_*",
            "tracing-opentelemetry", "kube", "kube-*", "k8s-openapi",
-           "schemars", "rand", "rand_chacha", "rand_core"]
+           "schemars", "rand", "rand_chacha", "rand_core",
+           "reqwest", "reqwest-middleware", "gcloud-*"]
       # Exception to the majors-arrive-individually rule: the tonic/prost
       # family is version-locked to itself (tonic 0.14 codegen emits code
       # that only compiles against prost 0.14 and the tonic 0.14 runtime).
@@ -150,6 +151,34 @@ updates:
       # breaks `main`. Grouping is the only buildable review unit.
       rand:
         patterns: ["rand", "rand_chacha", "rand_core"]
+        update-types: ["major", "minor", "patch"]
+      # Sixth family: the GCS transport stack. `gcloud-storage` types its
+      # injectable `ClientConfig.http` as a `reqwest_middleware::
+      # ClientWithMiddleware`, and `reqwest-middleware` re-exports a specific
+      # `reqwest` generation. All three have to agree, because
+      # engram-storage-gcs hands a `reqwest::Client` it built itself to that
+      # field (`install_crypto_provider`/`connect` in that crate):
+      #
+      #   gcloud-storage 1.3 -> reqwest-middleware 0.5 -> reqwest 0.13
+      #   google-cloud-storage 0.24 -> reqwest-middleware 0.4 -> reqwest 0.12
+      #
+      # #1163 bumped `reqwest-middleware` 0.4 -> 0.5 alone and could not go
+      # green in any landing order: 0.5 wants reqwest 0.13 while the workspace
+      # declared 0.12, AND google-cloud-storage 0.24 typed the field as a 0.4
+      # client, so moving reqwest first did not help either. Mutually locked,
+      # like rand/rand_chacha above.
+      #
+      # NOTE the crate rename inside this family. The SDK was published as
+      # `google-cloud-storage` up to 0.24; @yoshidan then donated that NAME to
+      # Google for the official google-cloud-rust SDK and continued the same
+      # codebase as `gcloud-storage`. So `google-cloud-storage` 1.x is a
+      # DIFFERENT library, not an upgrade — it has no reqwest client injection
+      # at all, which would silently drop the measured `http1_only` pin
+      # (blobbench 2026-07-31: ALPN h2 cost 4-5x on bulk transfer, GET
+      # 1914 -> 378 MiB/s). `gcloud-*` is the pattern to watch now; the old
+      # name is no longer a dependency here.
+      gcs-transport:
+        patterns: ["reqwest", "reqwest-middleware", "gcloud-*"]
         update-types: ["major", "minor", "patch"]
     ignore:
       # ---- hakari-only crates -------------------------------------------

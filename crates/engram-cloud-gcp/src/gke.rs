@@ -77,7 +77,7 @@ impl GkeNodePoolScaler {
     /// operator runs in-cluster). Fails fast off-GKE so the caller can fall
     /// back to the noop scaler.
     pub async fn detect() -> Result<Self, BackendError> {
-        let http = reqwest::Client::builder()
+        let http = engram_tls::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| BackendError::Sdk(Box::new(e)))?;

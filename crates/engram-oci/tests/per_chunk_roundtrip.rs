@@ -175,14 +175,14 @@ async fn spawn_registry() -> (SocketAddr, Registry, oneshot::Sender<()>) {
     let reg = Registry::default();
     let app = Router::new()
         .route("/v2/", get(v2_root))
-        .route("/v2/:repo/blobs/:digest", get(get_blob))
-        .route("/v2/:repo/blobs/uploads/", post(begin_upload))
+        .route("/v2/{repo}/blobs/{digest}", get(get_blob))
+        .route("/v2/{repo}/blobs/uploads/", post(begin_upload))
         .route(
-            "/v2/:repo/blobs/uploads/:id",
+            "/v2/{repo}/blobs/uploads/{id}",
             axum::routing::patch(patch_upload).put(put_upload),
         )
         .route(
-            "/v2/:repo/manifests/:tag",
+            "/v2/{repo}/manifests/{tag}",
             put(put_manifest).get(get_manifest),
         )
         .with_state(reg.clone());

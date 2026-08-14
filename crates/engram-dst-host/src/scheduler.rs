@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
@@ -278,7 +278,7 @@ pub struct Sim {
     /// `HashMap`. `HashMap` (not `BTreeMap`) mirrors the prod signature; it is
     /// keyed-access only inside `reconcile_once` (never iterated for a
     /// decision), so it is not a determinism leak.
-    reconcile_strikes: std::collections::HashMap<engram_core::SandboxId, u32>,
+    reconcile_first_seen: std::collections::HashMap<engram_core::SandboxId, std::time::Duration>,
     report: SimReport,
 }
 
@@ -296,7 +296,7 @@ impl Sim {
             rng,
             profile,
             crashed: false,
-            reconcile_strikes: std::collections::HashMap::new(),
+            reconcile_first_seen: std::collections::HashMap::new(),
             report: SimReport {
                 seed,
                 steps_run: 0,
@@ -486,14 +486,14 @@ impl Sim {
                 self.host.crash_process().await?;
                 // A fresh host-agent process starts with an empty strike
                 // ledger (the real wrapper's local `HashMap`).
-                self.reconcile_strikes.clear();
+                self.reconcile_first_seen.clear();
                 self.crashed = true;
             }
             Step::AbruptCrash => {
                 self.host.abrupt_crash().await?;
                 // Same successor-process reset as any roll; RAM died, so bias
                 // toward Restart next.
-                self.reconcile_strikes.clear();
+                self.reconcile_first_seen.clear();
                 self.crashed = true;
             }
             Step::Restart => {
@@ -508,7 +508,10 @@ impl Sim {
             }
             Step::ReconcileTick => {
                 self.host
-                    .reconcile_tick(&mut self.reconcile_strikes)
+                    .reconcile_tick(
+                        &mut self.reconcile_first_seen,
+                        engram_core::traits::Clock::now_mono(&*self.host.clock),
+                    )
                     .await?;
             }
             Step::DropLocalBinding(idx) => self.host.drop_local_binding(idx),
@@ -517,14 +520,14 @@ impl Sim {
                 self.host.sigterm(budget_secs(budget_ms)).await?;
                 // A fresh host-agent process starts with an empty strike
                 // ledger; RAM died, so bias toward Restart next.
-                self.reconcile_strikes.clear();
+                self.reconcile_first_seen.clear();
                 self.crashed = true;
             }
             Step::SigtermFlushParkedAt(idx, seam) => {
                 self.host.sigterm_flush_parked(idx, seam).await?;
                 // A SIGTERM either way (parked-flush or the fallback plain
                 // overrun ladder): RAM died, strikes reset, Restart next.
-                self.reconcile_strikes.clear();
+                self.reconcile_first_seen.clear();
                 self.crashed = true;
             }
             Step::SnapshotBegin(idx) => {
@@ -533,19 +536,19 @@ impl Sim {
             Step::FinalizeTick(idx) => self.host.finalize_tick(idx).await?,
             Step::FinalizeCrashAt(idx, op) => {
                 self.host.finalize_crash_at(idx, op).await?;
-                self.reconcile_strikes.clear();
+                self.reconcile_first_seen.clear();
                 self.crashed = true;
             }
             Step::SpoolCrashAt(op) => {
                 self.host.spool_crash_at(op).await?;
-                self.reconcile_strikes.clear();
+                self.reconcile_first_seen.clear();
                 self.crashed = true;
             }
             Step::FlushHandoffRace(idx) => self.host.flush_handoff_race(idx).await?,
             Step::FlushFenceAbort(idx) => self.host.flush_fence_abort(idx).await?,
             Step::FlushPreRebaseCrash(idx) => {
                 self.host.flush_pre_rebase_crash(idx).await?;
-                self.reconcile_strikes.clear();
+                self.reconcile_first_seen.clear();
                 self.crashed = true;
             }
             Step::MigrationBegin(idx) => {

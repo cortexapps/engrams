@@ -10,6 +10,7 @@ description = "GCP Secret Manager SecretStore implementation. Production target 
 workspace = true
 
 [dependencies]
+engram-tls.workspace = true
 engram-core.workspace = true
 engram-egress-proxy.workspace = true
 async-trait.workspace = true

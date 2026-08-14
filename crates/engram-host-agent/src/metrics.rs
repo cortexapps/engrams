@@ -514,8 +514,13 @@ pub const HEARTBEAT_DELIVERY_FAILURES_TOTAL: &str = "engram_host_heartbeat_deliv
 /// Counter (ADR 0091). External pause (the rung-2 park's host leg)
 /// refused or failed, labeled by bounded `reason`:
 /// `capture_in_flight` (typed retryable refusal — the park retries next
-/// nomination) / `vmm_pause` (the VMM itself failed the PATCH). Sustained
-/// `vmm_pause` means parking is genuinely broken, not merely contended.
+/// nomination) / `vmm_pause` (the VMM itself failed the PATCH) /
+/// `data_plane_failed` (ADR 0116 C4: the sandbox's flush loop escalated
+/// a persistent device-class failure — the park is refused
+/// non-retryably, because it would freeze nothing durable, and the
+/// caller falls through to the quarantine-bounded full eviction).
+/// Sustained `vmm_pause` means parking is genuinely broken, not merely
+/// contended.
 pub const RUNG2_PARK_FAILED_TOTAL: &str = "engram_rung2_park_failed_total";
 
 /// Issue #540 (host RAM ledger): gauge of host RAM (MiB) attributed to
@@ -631,6 +636,17 @@ pub const SHUTDOWN_STAGE_PANIC_TOTAL: &str = "engram_host_shutdown_stage_panic_t
 /// `engram_quarantine_stuck_total`.
 pub const QUARANTINE_REHYDRATE_RECOVERED_TOTAL: &str =
     "engram_nbd_quarantine_rehydrate_recovered_total";
+
+/// Counter (ADR 0116 C4). A sandbox's continuous-flush loop hit the
+/// escalation threshold (4 consecutive device-class flush failures)
+/// and reported its data plane failed: the sandbox joins
+/// `quarantined_survivors` (reason `data_plane_failed`), the next
+/// heartbeat advertises it, and the coordinator's keyed quarantine
+/// evict owns the remediation. Label-free; one increment per failure
+/// episode, not per failed flush. Steady state zero — alert on any
+/// increase: the 2026-08-12 incident's 7-hour silent 30 s warn-loop
+/// becomes this counter.
+pub const NBD_FLUSH_ESCALATIONS_TOTAL: &str = "engram_nbd_flush_escalations_total";
 
 // ─── ADR 0110 rollout gates ───────────────────────────────────────
 //

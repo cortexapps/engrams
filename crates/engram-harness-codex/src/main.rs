@@ -347,7 +347,7 @@ impl CredentialControl {
                 endpoint.trim_end_matches('/'),
                 self.session_id
             );
-            return reqwest::Client::new()
+            return engram_tls::client()
                 .post(url)
                 .json(&request)
                 .send()

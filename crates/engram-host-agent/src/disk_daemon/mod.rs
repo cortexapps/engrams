@@ -54,8 +54,8 @@ pub use backend::{
     PostCopyDiskSeal, PostCopyDrainSubscription, DEFAULT_DIRTY_THRESHOLD_BYTES,
 };
 pub use flush_scheduler::{
-    FlushScheduler, FlushSchedulerConfig, FlushSchedulerHandle, LiveManifestPublisher,
-    NoOpLiveManifestPublisher,
+    DataPlaneHealth, FlushScheduler, FlushSchedulerConfig, FlushSchedulerHandle,
+    LiveManifestPublisher, NoOpDataPlaneHealth, NoOpLiveManifestPublisher,
 };
 pub use live_manifest_publisher::{
     CoordLiveManifestPublisher, LiveManifestPublisherHandle, SessionResolver,

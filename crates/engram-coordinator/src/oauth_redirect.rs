@@ -613,7 +613,7 @@ impl OAuthManager {
         scope_delimiter: &str,
         grant_path: &str,
     ) -> Result<TokenGrant, OAuthServiceError> {
-        let http = reqwest::Client::builder()
+        let http = engram_tls::client_builder()
             .user_agent("engram-connector-oauth")
             .timeout(EXCHANGE_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
@@ -706,7 +706,7 @@ impl OAuthManager {
         probe: &RedirectMetadataProbe,
         access_token: &str,
     ) -> Result<Value, OAuthServiceError> {
-        let http = reqwest::Client::builder()
+        let http = engram_tls::client_builder()
             .user_agent("engram-connector-oauth")
             .timeout(EXCHANGE_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())

@@ -2309,7 +2309,7 @@ pub(crate) mod tests {
             &self,
             id: engram_core::SessionId,
             target: engram_core::types::SessionState,
-            _disposition: engram_core::types::BindingDisposition,
+            disposition: engram_core::types::BindingDisposition,
         ) -> Result<engram_core::types::SessionState, MetaError> {
             let mut s = self.session.lock();
             if id != s.id {
@@ -2319,6 +2319,13 @@ pub(crate) mod tests {
             prev.try_transition_to(target)
                 .map_err(|e| MetaError::Conflict(e.to_string()))?;
             s.status = target;
+            // Mirror PG's `Detach`: the binding clears in the SAME
+            // write (host_id untouched). RequireUnbound/Retain keep
+            // this mock's historical laxness — tests that need those
+            // semantics use the sim store.
+            if matches!(disposition, engram_core::types::BindingDisposition::Detach) {
+                s.sandbox_id = None;
+            }
             // ADR 0018 commit 12b: entering Evacuating resets the
             // retry counter so a fresh drain starts the scanner's
             // budget clean. Mirrors the PG `CASE WHEN $2 =

@@ -1775,6 +1775,7 @@ pub async fn quarantined_survivor_advertise_core(
                             host_id = %host_id,
                             session_id = %q.session_id,
                             sandbox_id = %q.sandbox_id,
+                            reason = ?q.reason,
                             "quarantined survivor advertised — enqueued evict_local \
                              (capture + relocate; ADR 0090)",
                         );
@@ -2208,6 +2209,55 @@ mod tests {
             keyed.len(),
             1,
             "re-advertised quarantined survivor must dedup to one keyed evict op, got {keyed:#?}",
+        );
+    }
+
+    /// ADR 0116 C4: a survivor advertised with the additive
+    /// `reason: "data_plane_failed"` still produces the same keyed
+    /// quarantine evict — the reason changes the WARN log, never the
+    /// enqueue behavior (the keyed op is already convergence-safe).
+    /// The old-host shape (no `reason` key) is pinned by
+    /// `quarantined_survivor_readverts_dedup_to_one_op` above, whose
+    /// fixture omits the field.
+    #[tokio::test]
+    async fn quarantined_survivor_with_data_plane_reason_enqueues_keyed_evict() {
+        let host_id = HostId::new();
+        let sandbox_id = SandboxId::new();
+        let session_id = engram_core::SessionId::new();
+        let mut session = session_with_status(session_id, sandbox_id, SessionState::Active);
+        session.host_id = Some(host_id);
+        let (state, meta, _local) = build_state_for_session(session);
+
+        let hb_json = serde_json::json!({
+            "capacity": { "total_mib": 1024, "used_mib": 0, "running_sandboxes": 1 },
+            "running_sandboxes": [sandbox_id],
+            "quarantined_survivors": [
+                {
+                    "sandbox_id": sandbox_id,
+                    "session_id": session_id,
+                    "reason": "data_plane_failed",
+                },
+            ],
+        });
+        let hb: HeartbeatRequest =
+            serde_json::from_value(hb_json).expect("deserialize heartbeat with reason");
+        let result = heartbeat(State(state.clone()), Path(host_id), Json(hb)).await;
+        assert!(result.is_ok(), "heartbeat failed: {:?}", result.err());
+
+        let keyed: Vec<_> = meta
+            .ops
+            .all()
+            .into_iter()
+            .filter(|o| {
+                o.idempotency_key.as_deref()
+                    == Some(format!("adr0090-quarantine:{sandbox_id}").as_str())
+            })
+            .collect();
+        assert_eq!(
+            keyed.len(),
+            1,
+            "a data-plane-failed survivor must drive the keyed quarantine evict, \
+             got {keyed:#?}",
         );
     }
 

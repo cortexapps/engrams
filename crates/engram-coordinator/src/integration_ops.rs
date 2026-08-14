@@ -31,7 +31,7 @@ pub async fn run_integration_op(
     state: &SharedState,
     req: app::RunIntegrationOpRequest,
 ) -> Result<app::RunIntegrationOpResponse, String> {
-    let http = reqwest::Client::builder()
+    let http = engram_tls::client_builder()
         .user_agent("engram-integration-op")
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())

@@ -69,6 +69,7 @@ export interface IntegrationOpResult {
 async function credentialSpec(
   c: Connector,
   deps?: RunOpDeps,
+  host?: string,
 ): Promise<MessageInitShape<typeof CredentialSpecSchema>> {
   if (c.credential.source === "mint") {
     // The coordinator resolves the mint engine by PROVIDER id (not the kind).
@@ -81,11 +82,13 @@ async function credentialSpec(
     oauthConnectionId: c.oauth
       ? await connectionIdFor(c.provider, `${c.display.name} (default)`)
       : "",
-    injects: c.credential.injects.map((i) => ({
-      header: i.header,
-      template: i.template ?? "{}",
-      secretRef: i.secretRef ?? "",
-    })),
+    injects: c.credential.injects
+      .filter((i) => host === undefined || i.hosts === undefined || i.hosts.includes(host))
+      .map((i) => ({
+        header: i.header,
+        template: i.template ?? "{}",
+        secretRef: i.secretRef ?? "",
+      })),
   };
 }
 
@@ -119,7 +122,7 @@ export async function runIntegrationOp(
     path: req.path,
     body,
     contentType: req.contentType ?? "",
-    credential: await credentialSpec(c, deps),
+    credential: await credentialSpec(c, deps, host),
   });
   return {
     status: resp.status,

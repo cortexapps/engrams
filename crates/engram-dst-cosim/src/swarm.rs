@@ -48,7 +48,7 @@
 //! (`tests/swarm_replay.rs` + the CLI) is the determinism guard.
 
 use engram_core::types::BindingDisposition;
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 

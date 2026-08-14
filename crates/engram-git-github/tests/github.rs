@@ -19,8 +19,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn test_key() -> &'static str {
     static KEY: OnceLock<String> = OnceLock::new();
     KEY.get_or_init(|| {
-        let mut rng = rand::thread_rng();
-        let key = RsaPrivateKey::new(&mut rng, 2048).expect("generate test RSA key");
+        // `rsa` 0.9 takes an RNG from the rand_core 0.6 generation, which
+        // is a different trait family than the workspace `rand` (0.10).
+        // Same seam as engram-cloud-sql's key generation.
+        let key = RsaPrivateKey::new(&mut rand_core06::OsRng, 2048).expect("generate test RSA key");
         key.to_pkcs8_pem(LineEnding::LF)
             .expect("encode pkcs8 pem")
             .to_string()
