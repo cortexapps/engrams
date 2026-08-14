@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { Collaboration } from "@tiptap/extension-collaboration";
 import { CollaborationCaret } from "@tiptap/extension-collaboration-caret";
 import { EditorContent, useEditor } from "@tiptap/react";
@@ -8,9 +8,16 @@ import * as Y from "yjs";
 
 import { useAuth } from "@/auth/AuthProvider";
 import { collaboratorColor } from "@/components/spec-mode/collaborator-colors";
+import {
+  SectionNodeViewProvider,
+  type SectionStateAction,
+} from "@/components/spec-mode/SectionNodeView";
+import type { SpecSurface } from "@/components/spec-mode/spec-surface";
+import { Provenance, refreshProvenance } from "@/components/spec-mode/provenance";
 import { Button } from "@/components/ui/button";
 import { useIsMobile } from "@/hooks/use-mobile";
 import type { SpecConnection } from "./SpecConnection";
+import { useSetSpecSectionState } from "@/hooks/useSpecRead";
 import { SpecPresence } from "./SpecPresence";
 import { SpecSelectionBubbleMenu, type SpecSelectionActions } from "./SpecSelectionActions";
 import { SpecBlockIterationProvider } from "./block-iteration";
@@ -23,15 +30,20 @@ export function SpecCanvas({
   specId,
   revision,
   selectionActions,
+  surface,
+  showProvenance,
 }: {
   doc: Y.Doc;
   provider: WebsocketProvider;
   specId: string;
   revision: string;
+  surface: SpecSurface;
+  showProvenance: boolean;
   /** Supply this only when the current user can send selection actions. */
   selectionActions?: SpecSelectionActions;
 }) {
   const { principal } = useAuth();
+  const sectionState = useSetSpecSectionState(specId);
   const user = useMemo(
     () => ({
       name: principal.display_name || principal.email,
@@ -48,6 +60,14 @@ export function SpecCanvas({
         specId={specId}
         revision={revision}
         selectionActions={selectionActions}
+        surface={surface}
+        showProvenance={showProvenance}
+        pendingSectionId={
+          sectionState.isPending ? (sectionState.variables?.sectionId ?? null) : null
+        }
+        onSetSectionState={(action) =>
+          sectionState.mutate({ ...action, actionId: crypto.randomUUID() })
+        }
       />
     </SpecBlockIterationProvider>
   );
@@ -66,16 +86,32 @@ export function ConnectedSpecCanvas({
   specId,
   revision,
   selectionActions,
+  surface,
+  showProvenance,
+  pendingSectionId = null,
+  onSetSectionState = () => undefined,
 }: {
   connection: SpecConnection;
   user: { name: string; color: string };
   specId: string;
   revision: string;
+  surface: SpecSurface;
+  showProvenance: boolean;
   selectionActions?: SpecSelectionActions;
+  pendingSectionId?: string | null;
+  onSetSectionState?: (action: SectionStateAction) => void;
 }) {
+  const surfaceRef = useRef(surface);
+  const showProvenanceRef = useRef(showProvenance);
+  surfaceRef.current = surface;
+  showProvenanceRef.current = showProvenance;
   const extensions = useMemo(
     () => [
       ...specNodeExtensions,
+      Provenance.configure({
+        getRanges: () => surfaceRef.current.provenanceRanges,
+        isVisible: () => showProvenanceRef.current,
+      }),
       Collaboration.configure({
         document: connection.doc,
         field: SPEC_FRAGMENT_NAME,
@@ -100,6 +136,9 @@ export function ConnectedSpecCanvas({
   useEffect(() => {
     editor?.setEditable(!readOnly);
   }, [editor, readOnly]);
+  useEffect(() => {
+    if (editor) refreshProvenance(editor);
+  }, [editor, showProvenance, surface]);
 
   if (!editor) return null;
   const specDocument = (
@@ -113,7 +152,11 @@ export function ConnectedSpecCanvas({
           actions={selectionActions}
         />
       )}
-      <EditorContent editor={editor} />
+      <SectionNodeViewProvider
+        value={{ surface, showProvenance, pendingSectionId, setSectionState: onSetSectionState }}
+      >
+        <EditorContent editor={editor} />
+      </SectionNodeViewProvider>
     </>
   );
   return (

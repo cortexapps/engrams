@@ -17,6 +17,10 @@ describe("deriveSpecSurface", () => {
       { id: "problem", state: "settled", isEmpty: true, openQuestionCount: 0 },
       { id: "api", state: "open", isEmpty: false, openQuestionCount: 2 },
     ]);
+    expect(surface.openQuestions).toEqual([
+      { id: "q1", resolved: false, text: null },
+      { id: "q2", resolved: false, text: null },
+    ]);
     document.destroy();
   });
 
@@ -32,6 +36,36 @@ describe("deriveSpecSurface", () => {
         at: "2026-08-13T10:00:00.000Z",
       },
     });
+  });
+
+  test("marks only the first empty open section as reached", () => {
+    const document = yDocument("## Problem\n\n\n\n## API\n\n");
+    const surface = deriveSpecSurface(
+      rail([
+        { id: "problem", state: "open" },
+        { id: "api", state: "open" },
+      ]),
+      document,
+    );
+
+    expect(surface.sections.map(({ id, isReached }) => ({ id, isReached }))).toEqual([
+      { id: "problem", isReached: true },
+      { id: "api", isReached: false },
+    ]);
+    document.destroy();
+  });
+
+  test("derives provenance labels and decoration ranges once", () => {
+    const document = yDocument(
+      "## Problem\n\nThe limiter is in gateway/limits.rs @ 8f2c1a4.\n\n## API\n\nA route.\n",
+    );
+    const surface = deriveSpecSurface(rail(), document);
+
+    expect(surface.sections[0]?.provenance).toEqual([{ label: "gateway/limits.rs @ 8f2c1a4" }]);
+    expect(surface.provenanceRanges).toEqual([
+      expect.objectContaining({ label: "gateway/limits.rs @ 8f2c1a4" }),
+    ]);
+    document.destroy();
   });
 });
 

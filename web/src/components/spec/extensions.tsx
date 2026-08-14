@@ -1,10 +1,12 @@
 import { Node, Extension, type Attributes, type NodeConfig } from "@tiptap/core";
 import { Plugin } from "@tiptap/pm/state";
-import { NodeViewWrapper, ReactNodeViewRenderer, type NodeViewProps } from "@tiptap/react";
+import { ReactNodeViewRenderer } from "@tiptap/react";
 import { specNodeSpecs } from "@engrams/spec-document";
 import type { Node as ProseMirrorNode, NodeSpec } from "@tiptap/pm/model";
 
 import { SpecBlock } from "./SpecBlock";
+import { OpenQuestionCard } from "../spec-mode/OpenQuestionCard";
+import { SectionNodeView } from "../spec-mode/SectionNodeView";
 
 function nodeSpec(name: keyof typeof specNodeSpecs): NodeSpec {
   const spec = specNodeSpecs[name];
@@ -59,6 +61,7 @@ const SpecSection = Node.create({
     },
     0,
   ],
+  addNodeView: () => ReactNodeViewRenderer(SectionNodeView, { as: "section" }),
 });
 
 const SpecSectionHeading = Node.create({
@@ -101,20 +104,6 @@ const SpecText = Node.create({
   ...sharedConfig("text"),
 });
 
-function OpenQuestionStub({ node }: NodeViewProps) {
-  return (
-    <NodeViewWrapper
-      as="span"
-      className="spec-open-question"
-      data-question-id={String(node.attrs.questionId)}
-      contentEditable={false}
-    >
-      <span aria-hidden="true">?</span>
-      <span>Open question</span>
-    </NodeViewWrapper>
-  );
-}
-
 const SpecOpenQuestion = Node.create({
   name: "openQuestion",
   ...sharedConfig("openQuestion"),
@@ -124,7 +113,7 @@ const SpecOpenQuestion = Node.create({
     { "data-spec-open-question": node.attrs.questionId },
     "Open question",
   ],
-  addNodeView: () => ReactNodeViewRenderer(OpenQuestionStub, { as: "span" }),
+  addNodeView: () => ReactNodeViewRenderer(OpenQuestionCard, { as: "span" }),
 });
 
 const SpecDiagramBlock = Node.create({

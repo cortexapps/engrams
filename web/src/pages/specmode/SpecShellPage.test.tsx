@@ -38,6 +38,10 @@ vi.mock("@/components/spec/LazySpecCanvas", () => ({
   },
 }));
 
+vi.mock("@/hooks/useSpecPublish", () => ({
+  useSpecPublish: () => ({ data: { gate: { openQuestions: [] } } }),
+}));
+
 vi.mock("@/hooks/useSpecRead", () => ({
   useSpecRead: () => ({
     data: {
@@ -57,6 +61,24 @@ vi.mock("@/hooks/useSpecRead", () => ({
     },
     isPending: false,
     error: null,
+  }),
+  useSpecRail: () => ({
+    data: {
+      sections: [
+        {
+          id: "problem",
+          templateKey: "problem",
+          title: "Problem",
+          state: "open",
+          naReason: null,
+          allowNa: true,
+          openQuestionCount: 0,
+          settledBy: null,
+          stateChangedAt: null,
+        },
+      ],
+      completeness: { complete: 0, total: 1 },
+    },
   }),
   useSpecCheckpoint: () => ({ data: undefined, isPending: false }),
 }));

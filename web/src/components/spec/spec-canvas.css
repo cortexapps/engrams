@@ -129,19 +129,6 @@
   font-size: 0.8125rem;
 }
 
-.spec-open-question {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  border: 1px solid color-mix(in oklab, var(--destructive) 28%, var(--border));
-  border-radius: 999px;
-  padding: 0.1rem 0.5rem;
-  background: color-mix(in oklab, var(--destructive) 8%, var(--card));
-  color: var(--foreground);
-  font-size: 0.75rem;
-  font-weight: 600;
-}
-
 .spec-diagram-block {
   margin: 1.5rem 0;
   border: 1px dashed var(--border);

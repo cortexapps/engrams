@@ -132,6 +132,12 @@
   align-items: center;
 }
 
+.spec-mode-provenance-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .spec-mode-title-group {
   gap: 12px;
 }
@@ -176,9 +182,151 @@
 
 .spec-mode-sections {
   grid-area: sections;
+  display: flex;
   min-height: 0;
   border-right: 1px solid var(--border);
   background: var(--background);
+}
+
+.spec-mode-section-list-shell {
+  display: flex;
+  width: 100%;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.spec-mode-section-list-header {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 16px 10px;
+}
+
+.spec-mode-section-tally {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.spec-mode-section-tally strong {
+  font-size: 1.35rem;
+}
+
+.spec-mode-section-tally span {
+  font-size: 0.72rem;
+}
+
+.spec-mode-section-list {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+  overflow-y: auto;
+  padding: 4px 8px 16px;
+}
+
+.spec-mode-section-row {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 9px;
+  border-radius: 6px;
+  padding: 8px 9px;
+  color: inherit;
+  text-align: left;
+}
+
+.spec-mode-section-row:hover,
+.spec-mode-section-row:focus-visible,
+.spec-mode-section-row[data-state="proposed"],
+.spec-mode-section-row[data-reading="true"] {
+  background: var(--accent);
+}
+
+.spec-mode-section-row:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
+.spec-mode-section-row[data-reached="false"] {
+  opacity: 0.55;
+}
+
+.spec-mode-section-row-copy {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 2px;
+}
+
+.spec-mode-section-row-title {
+  overflow: hidden;
+  font-size: 0.82rem;
+  line-height: 1.35;
+  letter-spacing: -0.005em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spec-mode-section-row[data-state="open"] .spec-mode-section-row-title {
+  color: var(--muted-foreground);
+}
+
+.spec-mode-section-credit {
+  overflow: hidden;
+  font-size: 0.66rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spec-mode-section-glyph {
+  width: 12px;
+  flex: none;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1;
+  text-align: center;
+}
+
+.spec-mode-section-glyph[data-glyph-tone="nominal"] {
+  color: var(--instrument-nominal);
+}
+
+.spec-mode-section-glyph[data-glyph-tone="proposal"] {
+  color: var(--foreground);
+}
+
+.spec-mode-section-glyph[data-glyph-tone="question"] {
+  color: var(--instrument-caution);
+}
+
+.spec-mode-section-glyph[data-glyph-tone="reading"] {
+  color: var(--ring);
+}
+
+.spec-mode-section-glyph[data-proposed="true"] {
+  animation: penbeat 2.4s ease-in-out infinite;
+}
+
+.spec-mode-section-flags {
+  flex: none;
+  color: var(--instrument-caution);
+  font-size: 0.68rem;
+}
+
+.spec-mode-section-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px solid var(--border);
+  padding: 12px 16px;
+}
+
+.spec-mode-section-legend > :last-child {
+  font-size: 0.68rem;
+  line-height: 1.7;
 }
 
 .spec-mode-document {
@@ -195,6 +343,159 @@
   min-height: 100%;
   margin: 0 auto;
   padding: 32px 40px 80px;
+}
+
+.spec-mode-document .spec-canvas-shell {
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.spec-mode-document .spec-canvas-editor {
+  min-height: 0;
+  padding: 0;
+}
+
+.spec-mode-document .spec-canvas-editor > section {
+  display: flex;
+  max-width: none;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0 0 26px;
+}
+
+.spec-mode-document .spec-canvas-editor > section + section::before {
+  display: none;
+}
+
+.spec-mode-section-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.spec-mode-section-heading h2 {
+  margin: 0;
+  font-size: 1.12rem;
+  line-height: 1.35;
+}
+
+.spec-mode-document-credit {
+  font-size: 0.66rem;
+}
+
+.spec-mode-inline-cursor-slot {
+  display: inline-flex;
+  min-width: 0;
+}
+
+.spec-mode-section-content > h2:first-child {
+  display: none;
+}
+
+.spec-mode-section-content p {
+  margin: 0;
+  font-size: 0.92rem;
+  line-height: 1.72;
+  text-wrap: pretty;
+}
+
+.spec-mode-section-content > * + * {
+  margin-top: 10px;
+}
+
+.spec-mode-document section[data-reached="false"] {
+  opacity: 0.75;
+}
+
+.spec-mode-proposal-actions,
+.spec-mode-section-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.spec-mode-proposal-actions {
+  justify-content: space-between;
+  padding-top: 2px;
+}
+
+.spec-mode-empty-invitation {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: 13px 15px;
+  background: var(--secondary);
+}
+
+.spec-mode-empty-copy {
+  font-size: 0.87rem;
+  line-height: 1.65;
+  text-wrap: pretty;
+}
+
+.spec-mode-not-this-spec {
+  display: grid;
+  gap: 10px;
+  width: 320px;
+}
+
+.spec-mode-provenance-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.spec-mode-provenance-chips span {
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 2px 7px;
+  font-size: 0.68rem;
+}
+
+.spec-mode-provenance-mark {
+  border-bottom: 1px solid var(--ring);
+  background: color-mix(in oklab, var(--ring) 8%, transparent);
+}
+
+.spec-mode-open-question {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px dashed var(--instrument-caution);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  background: color-mix(in oklch, var(--instrument-caution) 8%, transparent);
+  vertical-align: middle;
+}
+
+.spec-mode-open-question[data-resolved="true"] {
+  display: none;
+}
+
+.spec-mode-open-question-flag {
+  color: var(--instrument-caution);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+.spec-mode-open-question-copy {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.spec-mode-open-question-copy > :first-child {
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+
+.spec-mode-open-question-copy > :last-child {
+  font-size: 0.66rem;
 }
 
 .spec-mode-conversation {
@@ -339,7 +640,8 @@
 
 @media (prefers-reduced-motion: reduce) {
   .spec-mode-fadein,
-  .spec-mode-penbeat {
+  .spec-mode-penbeat,
+  .spec-mode-section-glyph[data-proposed="true"] {
     animation: none;
   }
 

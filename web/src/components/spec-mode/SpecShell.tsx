@@ -1,6 +1,8 @@
-import type { ReactNode } from "react";
+import type { ReactNode, RefObject, UIEventHandler } from "react";
 
 import type { SpecCheckpointSummary } from "@/hooks/useSpecRead";
+import { SectionList } from "./SectionList";
+import type { SpecSurface } from "./spec-surface";
 import { SpecSpine } from "./SpecSpine";
 import { SpecTopBar } from "./SpecTopBar";
 import "./spec-mode.css";
@@ -11,6 +13,12 @@ export function SpecShell({
   templateName,
   checkpoints,
   viewerIsOwner,
+  surface,
+  onSelectSection = () => undefined,
+  documentPaneRef,
+  onDocumentScroll,
+  showProvenance = true,
+  onShowProvenanceChange = () => undefined,
   children,
 }: {
   specId: string;
@@ -18,6 +26,12 @@ export function SpecShell({
   templateName: string;
   checkpoints: SpecCheckpointSummary[];
   viewerIsOwner: boolean;
+  surface?: SpecSurface;
+  onSelectSection?: (sectionId: string) => void;
+  documentPaneRef?: RefObject<HTMLElement | null>;
+  onDocumentScroll?: UIEventHandler<HTMLElement>;
+  showProvenance?: boolean;
+  onShowProvenanceChange?: (visible: boolean) => void;
   children?: ReactNode;
 }) {
   return (
@@ -41,14 +55,19 @@ export function SpecShell({
           templateName={templateName}
           checkpoints={checkpoints}
           viewerIsOwner={viewerIsOwner}
+          showProvenance={showProvenance}
+          onShowProvenanceChange={onShowProvenanceChange}
         />
-        {/* F3 owns the section list. Keep the structural region empty until then. */}
-        <aside className="spec-mode-sections" aria-label="Spec sections" />
+        <aside className="spec-mode-sections" aria-label="Spec sections">
+          {surface ? <SectionList surface={surface} onSelectSection={onSelectSection} /> : null}
+        </aside>
         <section
+          ref={documentPaneRef}
           className="spec-mode-document"
           aria-label="Spec document"
           data-scroll="doc"
           style={{ overflowY: "auto" }}
+          onScroll={onDocumentScroll}
         >
           <div className="spec-mode-document-inner">{children}</div>
         </section>

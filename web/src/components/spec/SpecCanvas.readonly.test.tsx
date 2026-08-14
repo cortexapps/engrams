@@ -5,6 +5,8 @@ import { prosemirrorToYXmlFragment } from "y-prosemirror";
 import type { WebsocketProvider } from "y-websocket";
 import * as Y from "yjs";
 
+import { deriveSpecSurface } from "@/components/spec-mode/spec-surface";
+import type { SpecRail } from "@/hooks/useSpecRead";
 import { ConnectedSpecCanvas } from "./SpecCanvas";
 import { createSpecProvider } from "./SpecConnection";
 
@@ -56,12 +58,30 @@ function canvasUnder() {
     WebSocketPolyfill: window.WebSocket,
   });
   providers.push(provider);
+  const rail: SpecRail = {
+    sections: [
+      {
+        id: "context",
+        templateKey: "context",
+        title: "Context",
+        state: "open",
+        naReason: null,
+        allowNa: true,
+        openQuestionCount: 1,
+        settledBy: null,
+        stateChangedAt: null,
+      },
+    ],
+    completeness: { complete: 0, total: 1 },
+  };
   const view = render(
     <ConnectedSpecCanvas
       connection={{ doc, provider }}
       user={USER}
       specId="spec-1"
       revision="17"
+      surface={deriveSpecSurface(rail, doc)}
+      showProvenance
     />,
   );
   return { ...view, doc };
@@ -115,7 +135,7 @@ describe("the spec canvas at width", () => {
 
     const editor = await screen.findByLabelText("Collaborative spec document");
     await waitFor(() =>
-      expect(editor.querySelector('.spec-open-question[data-question-id="q1"]')).toBeTruthy(),
+      expect(editor.querySelector('.spec-mode-open-question[data-question-id="q1"]')).toBeTruthy(),
     );
     expect(editor.textContent).toContain("Open question");
   });
