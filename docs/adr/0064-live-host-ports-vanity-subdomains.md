@@ -1,6 +1,12 @@
 # ADR 0064: Live-host guest ports at vanity subdomains
 
-**Status:** Proposed (2026-06-29). engrams can run an agent that builds a web app inside a
+**Status:** Superseded by [ADR 0118](0118-session-apps.md) (2026-08-14). P1-P4 all landed
+and are live; ADR 0118 keeps the ADR 0064/0066 tunnel unchanged and replaces the
+*exposure* concept above it with named **session apps** (reserved hostnames, injected env
+vars, and an orchestrator-enforced login wall in place of IAP). Read this ADR for the data
+path, and ADR 0118 for the model and the edge. Original status: Proposed (2026-06-29).
+
+engrams can run an agent that builds a web app inside a
 session, but there is no way to *reach* a port that agent opened (a dev server on
 `localhost:3000`). The only inbound path that exists today is the hardcoded ttyd shell
 tunnel (ADR 0014 issue #6 / ADR 0051 §8): the egress proxy (ADR 0006) is strictly
