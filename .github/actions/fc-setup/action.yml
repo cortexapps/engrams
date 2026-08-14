@@ -157,8 +157,18 @@ runs:
     # `restore-keys` degrades that invalidation to an incremental
     # re-fetch on top of the prior artifacts (the fetch script is
     # idempotent per-file) instead of a full cold download.
-    - name: Cache FC kernel + rootfs artifacts
-      uses: actions/cache@v6
+    #
+    # Restore and save are SPLIT on purpose. `actions/cache` saves in a
+    # post-job step, which does not run when the job fails or hits its
+    # timeout — and a cold download costs more than the lane's whole
+    # budget. That made an evicted cache self-perpetuating: every lane
+    # missed, every lane spent ~17 min downloading, every lane timed out,
+    # and no lane ever saved what it had just downloaded (2026-08-13, all
+    # four FC lanes red on PR #1241). Saving right after the fetch means
+    # the download is kept even when the tests later fail.
+    - name: Restore FC kernel + rootfs artifacts
+      id: fc-artifacts
+      uses: actions/cache/restore@v6
       with:
         path: ~/.cache/engram-fc-test
         key: fc-test-artifacts-${{ hashFiles('crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh') }}
@@ -179,6 +189,16 @@ runs:
       run: |
         bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh \
           | sed 's/^export //' >> "$GITHUB_ENV"
+
+    # Only on a miss: an exact hit has nothing new to store. The four FC
+    # lanes run in parallel and race for the same key; the loser gets a
+    # "cache already exists" warning, not a failure.
+    - name: Save FC kernel + rootfs artifacts
+      if: steps.fc-artifacts.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.cache/engram-fc-test
+        key: ${{ steps.fc-artifacts.outputs.cache-primary-key }}
 
     # snapshot_uffd needs the host-side handler binary in
     # `target/debug/` (the test resolves it relative to

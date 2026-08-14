@@ -249,6 +249,12 @@ async fn main() -> ExitCode {
 
 struct AppServer {
     child: Child,
+    /// ADR 0114 D9: whether this session's manifest carries the spec tool
+    /// family. The turn-context injection is gated on this — an
+    /// orchestrator-controlled signal — not on the digest file existing, so
+    /// a repository checked out into the workspace cannot plant a digest
+    /// into a non-spec session's prompts.
+    spec_session: bool,
     /// ADR 0107: the session-mode stamp path — read at every turn start so
     /// per-turn params (sandbox, plan preamble) follow the latch.
     mode_stamp_path: PathBuf,
@@ -669,6 +675,10 @@ impl AppServer {
         let stderr = child.stderr.take().ok_or("app-server stderr unavailable")?;
         let mut server = Self {
             child,
+            spec_session: cli
+                .tool_manifest
+                .iter()
+                .any(|tool| tool.name == "spec_read"),
             mode_stamp_path: cli.mode_stamp_file(),
             stdin,
             lines: BufReader::new(stdout).lines(),
@@ -1219,6 +1229,15 @@ async fn start_turn(server: &mut AppServer, prompt: &QueuedPrompt) -> Result<i64
         format!("{PLAN_MODE_PREAMBLE}\n\n{}", prompt.text)
     } else {
         prompt.text.clone()
+    };
+    // ADR 0114 D9: the spec digest rides the vendor-facing text at the
+    // consumption boundary — same SDK seam as every other adapter. The
+    // person's bubble comes from the coordinator record, never this string.
+    // Gated on the manifest, so only a spec session ever injects.
+    let text = if server.spec_session {
+        engram_harness_sdk::turn_context::with_turn_context(&text)
+    } else {
+        text
     };
     let sandbox = if plan_mode {
         // Codex's own OS sandbox enforces read-only inside the VM; network

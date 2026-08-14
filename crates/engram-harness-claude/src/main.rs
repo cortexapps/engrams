@@ -1867,6 +1867,11 @@ mod adapter {
         let self_exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "engram-harness-claude".to_string());
+        // ADR 0114 D9 lives in the SDK, not here: the spec digest is
+        // prepended to the vendor-facing prompt at the consumption boundary
+        // (`turn_context::with_turn_context` in `start_turn`), the same seam
+        // every adapter uses — a Claude-only UserPromptSubmit hook would fork
+        // the mechanism per vendor.
         let settings = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
@@ -3547,7 +3552,23 @@ mod adapter {
             },
         )
         .await;
-        if let Err(e) = write_user_message(stdin, text).await {
+        // ADR 0114 D9: the spec digest rides the vendor-facing text at the
+        // consumption boundary. The person's bubble comes from the
+        // coordinator's role:user message, never from this string, so the
+        // injected block cannot render as their words. Gated on the
+        // manifest — an orchestrator-controlled signal — so a repository
+        // checked out into the workspace cannot plant a digest file into a
+        // non-spec session's prompts.
+        let spec_session = cli
+            .tool_manifest
+            .iter()
+            .any(|tool| tool.name == "spec_read");
+        let text = if spec_session {
+            engram_harness_sdk::turn_context::with_turn_context(text)
+        } else {
+            text.to_owned()
+        };
+        if let Err(e) = write_user_message(stdin, &text).await {
             // The only way this fails is claude's stdin already gone (it
             // died); the stdout-EOF reap path will close this run.
             tracing::warn!(error = %e, "writing prompt to claude stdin failed");

@@ -4,7 +4,7 @@ export const SPEC_BLOCK_KINDS = ["mermaid", "d2", "flint"] as const;
 export const SPEC_RENDER_TARGETS = ["engrams", "github"] as const;
 
 /** Change this value when product renderer output can change. */
-export const SPEC_BLOCK_RENDERER_REVISION = "2";
+export const SPEC_BLOCK_RENDERER_REVISION = "4";
 export const SPEC_BLOCK_CACHE_MAX_BYTES = 512 * 1024;
 
 export type SpecBlockKind = (typeof SPEC_BLOCK_KINDS)[number];

@@ -146,6 +146,10 @@ class MemoryDocumentStore implements SpecDocumentStore {
     }
   }
 
+  async sectionsChangedSince(): Promise<Set<string>> {
+    return new Set();
+  }
+
   async compactSnapshot(input: CompactSnapshotInput): Promise<boolean> {
     this.compactions += 1;
     if ((this.currentSeq.get(input.specId) ?? 0n) !== input.coveredSeq) return false;

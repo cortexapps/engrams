@@ -20,6 +20,8 @@ export class MemoryDocumentStore implements SpecDocumentStore {
   readonly actions = new Map<string, SpecTrackedEditActionRecord>();
   lastEffects: SpecUpdateEffects | null = null;
   lastCheckpoint: SpecDocumentCheckpoint | null = null;
+  /** Mirrors `spec_update_log.changed_section_ids`, indexed like `updates`. */
+  readonly changedSections: Array<{ semanticDocSeq: bigint; sectionIds: string[] }> = [];
 
   async readSnapshot(): Promise<SpecSnapshotRecord | null> {
     return null;
@@ -48,6 +50,12 @@ export class MemoryDocumentStore implements SpecDocumentStore {
       semanticDocSeq: this.semanticSeq,
       update: update.slice(),
       clientId,
+    });
+    this.changedSections.push({
+      semanticDocSeq: this.semanticSeq,
+      sectionIds: effects.sections
+        .filter((section) => section.changed)
+        .map((section) => section.id),
     });
     if (transcriptAction) {
       const action: SpecTrackedEditActionRecord = {
@@ -80,6 +88,27 @@ export class MemoryDocumentStore implements SpecDocumentStore {
     const inserted = await this.insertUpdateIfLatest(specId, expectedSeq, update, clientId, effects);
     if (inserted) this.lastCheckpoint = checkpoint;
     return inserted;
+  }
+
+  async sectionsChangedSince(
+    _specId: string,
+    afterSemanticSeq: bigint,
+    excludeClientLike: string,
+  ): Promise<Set<string>> {
+    // The production pattern is always `agent:{sessionId}:%`; the fake
+    // supports exactly the trailing-wildcard form the query uses.
+    if (!excludeClientLike.endsWith("%")) {
+      throw new Error("MemoryDocumentStore only supports a trailing-% LIKE pattern");
+    }
+    const excludePrefix = excludeClientLike.slice(0, -1);
+    const changed = new Set<string>();
+    this.changedSections.forEach((row, index) => {
+      if (row.semanticDocSeq <= afterSemanticSeq) return;
+      const clientId = this.updates[index]?.clientId ?? null;
+      if (clientId !== null && clientId.startsWith(excludePrefix)) return;
+      for (const sectionId of row.sectionIds) changed.add(sectionId);
+    });
+    return changed;
   }
 
   async notifyUpdate(): Promise<void> {}

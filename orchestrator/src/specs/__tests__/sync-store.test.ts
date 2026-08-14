@@ -306,6 +306,11 @@ describe("PostgresSpecParticipantStore", () => {
              updated_at timestamptz NOT NULL
            )`,
         );
+        // The fixture stands in for the schema around migration 0055, which is
+        // the migration under test. It must still carry every column the
+        // CURRENT document-store SQL writes, because this test drives the live
+        // `PostgresSpecDocumentStore` against it. `changed_section_ids` (0065)
+        // is one of those columns.
         await client.query(
           `CREATE TABLE spec_update_log (
              spec_id uuid NOT NULL,
@@ -313,6 +318,7 @@ describe("PostgresSpecParticipantStore", () => {
              semantic_doc_seq bigint NOT NULL,
              update bytea NOT NULL,
              client_id text,
+             changed_section_ids text[] DEFAULT '{}'::text[] NOT NULL,
              PRIMARY KEY (spec_id, seq)
            )`,
         );

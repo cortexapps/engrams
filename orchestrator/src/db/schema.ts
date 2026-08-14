@@ -328,6 +328,12 @@ export const specUpdateLog = pgTable(
     update: bytea("update").notNull(),
     semanticDocSeq: bigint("semantic_doc_seq", { mode: "bigint" }).notNull(),
     clientId: text("client_id"),
+    /** Section ids this update changed — the section-scoped write fence reads
+     *  these to reject only mutations whose TARGET section moved. */
+    changedSectionIds: text("changed_section_ids")
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [primaryKey({ columns: [t.specId, t.seq] })],

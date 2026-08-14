@@ -51,6 +51,7 @@ import {
 
 const SPEC_ID = "00000000-0000-4000-8000-000000000135";
 const SESSION_ID = "00000000-0000-4000-8000-000000000136";
+const OTHER_SESSION_ID = "00000000-0000-4000-8000-000000000137";
 
 const TEMPLATE: SpecTemplate = {
   sections: [
@@ -246,13 +247,23 @@ describe("production spec tool service", () => {
     });
 
     expect(await service.read(SPEC_ID)).toMatchObject({ rev: 2n });
-    expect(await service.read(SPEC_ID, "context")).toEqual({
+    // The section map rides every read: markdown carries no ids, and the
+    // mutation tools require one, so this list is how an agent learns them.
+    const sectionRead = await service.read(SPEC_ID, "context");
+    expect(sectionRead).toEqual({
       specId: SPEC_ID,
       rev: 2n,
       sectionId: "context",
       markdown: "## Context\n\nLive content\n",
+      sections: [
+        { id: "context", key: "context", title: "Context" },
+        { id: "requirements", key: "requirements", title: "Requirements" },
+      ],
     });
-    await expect(service.read(SPEC_ID, "missing")).rejects.toThrow("Unknown spec section");
+    // A wrong guess teaches the valid ids instead of stonewalling.
+    await expect(service.read(SPEC_ID, "missing")).rejects.toThrow(
+      /Unknown spec section: missing\. Valid section ids: context \(Context\), requirements \(Requirements\)/,
+    );
   });
 
   test("replaces only the section body and uses an agent client identity", async () => {
@@ -269,6 +280,83 @@ describe("production spec tool service", () => {
     const document = proseMirrorDocument((await documents.syncFromLog(SPEC_ID)).doc);
     expect(findSection(document, "context")?.node.attrs.templateSectionKey).toBe("context");
     expect(renderMarkdown(document)).toContain("## Context\n\nNew body");
+  });
+
+  test("a stale expected_rev bounces only when the target section changed", async () => {
+    const { service } = await setup();
+    // Someone else writes into "context" after this agent's read at rev 1.
+    const foreign = await service.updateSection(SPEC_ID, {
+      sessionId: OTHER_SESSION_ID,
+      toolCallId: "foreign-write",
+      actorUserId: "user-2",
+      sectionId: "context",
+      markdown: "Foreign body",
+    });
+    expect(foreign).toMatchObject({ applied: true, newRev: 2n });
+
+    // The same-section write with the pre-change revision bounces…
+    const bounced = await service.updateSection(SPEC_ID, {
+      ...context("stale-context", 1n),
+      sectionId: "context",
+      markdown: "Agent body",
+    });
+    expect(bounced).toMatchObject({ applied: false, newRev: 2n });
+
+    // …while a different-section write with the SAME stale revision applies:
+    // a fence that bounced it would teach the model to rub-stamp revisions.
+    const applied = await service.updateSection(SPEC_ID, {
+      ...context("fresh-requirements", 1n),
+      sectionId: "requirements",
+      markdown: "R1: the fence is section-scoped.",
+    });
+    expect(applied).toMatchObject({ applied: true, newRev: 3n });
+  });
+
+  test("the agent's own writes never fence its later ones", async () => {
+    const { service } = await setup();
+    await service.updateSection(SPEC_ID, {
+      ...context("first-pass", 1n),
+      sectionId: "context",
+      markdown: "First pass",
+    });
+    // The turn-start revision is stale only because of this agent's own write.
+    const second = await service.updateSection(SPEC_ID, {
+      ...context("second-pass", 1n),
+      sectionId: "context",
+      markdown: "Second pass",
+    });
+    expect(second).toMatchObject({ applied: true, newRev: 3n });
+  });
+
+  test("confirming a section that changed since the agent's read bounces", async () => {
+    const { service } = await setup();
+    await service.updateSection(SPEC_ID, {
+      sessionId: OTHER_SESSION_ID,
+      toolCallId: "foreign-edit",
+      actorUserId: "user-2",
+      sectionId: "context",
+      markdown: "Changed under the agent",
+    });
+
+    const staleConfirm = await service.setSectionState(SPEC_ID, {
+      ...context("stale-confirm", 1n),
+      sectionId: "context",
+      state: "confirmed",
+    });
+    expect(staleConfirm).toMatchObject({ applied: false, newRev: 2n });
+
+    const freshDraft = await service.setSectionState(SPEC_ID, {
+      ...context("fresh-draft", 2n),
+      sectionId: "context",
+      state: "drafted",
+    });
+    expect(freshDraft).toMatchObject({ applied: true });
+    const freshConfirm = await service.setSectionState(SPEC_ID, {
+      ...context("fresh-confirm", 2n),
+      sectionId: "context",
+      state: "confirmed",
+    });
+    expect(freshConfirm).toMatchObject({ applied: true });
   });
 
   test("allows a selection wholly in the section body", async () => {

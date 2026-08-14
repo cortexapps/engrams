@@ -9,7 +9,9 @@ describe("base system prompt", () => {
     expect(systemPromptForTaskType()).toBe(BASE_SYSTEM_PROMPT);
     expect(systemPromptForTaskType("chat")).toBe(BASE_SYSTEM_PROMPT);
     expect(systemPromptForTaskType("spec")).toContain(SPEC_MODE_SYSTEM_PROMPT);
-    expect(SPEC_MODE_SYSTEM_PROMPT).toContain("call spec_read");
+    expect(SPEC_MODE_SYSTEM_PROMPT).toContain("Call spec_read");
+    expect(SPEC_MODE_SYSTEM_PROMPT).toContain("digest that names the sections");
+    expect(SPEC_MODE_SYSTEM_PROMPT).toContain("expected_rev");
     expect(SPEC_MODE_SYSTEM_PROMPT).toContain("Never edit it");
     expect(SPEC_MODE_SYSTEM_PROMPT).toContain("spec_* tools");
     expect(SPEC_MODE_SYSTEM_PROMPT).not.toContain("Claude");

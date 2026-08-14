@@ -82,6 +82,42 @@ export function encodeAwarenessState(
   return encodeAwarenessMessage(awarenessProtocol.encodeAwarenessUpdate(awareness, clientIds));
 }
 
+/**
+ * Keep only the sender's own records from an awareness update.
+ *
+ * A y-websocket provider re-broadcasts every awareness change it applies —
+ * including states it just learned about OTHER participants from this
+ * server. The hub is authoritative for those, so an echoed foreign record
+ * is dropped, never treated as a protocol violation (closing the socket on
+ * it put every multi-participant room into a reconnect loop). Returns null
+ * when no record from the sender remains.
+ */
+export function ownAwarenessUpdate(update: Uint8Array, clientId: number): Uint8Array | null {
+  const decoder = decoding.createDecoder(update);
+  const count = decoding.readVarUint(decoder);
+  const kept: { clock: number; state: string }[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const recordClientId = decoding.readVarUint(decoder);
+    const clock = decoding.readVarUint(decoder);
+    const state = decoding.readVarString(decoder);
+    if (recordClientId !== clientId) continue;
+    JSON.parse(state);
+    kept.push({ clock, state });
+  }
+  if (decoder.pos !== decoder.arr.length) {
+    throw new Error("The awareness update has trailing bytes");
+  }
+  if (kept.length === 0) return null;
+  const encoder = encoding.createEncoder();
+  encoding.writeVarUint(encoder, kept.length);
+  for (const record of kept) {
+    encoding.writeVarUint(encoder, clientId);
+    encoding.writeVarUint(encoder, record.clock);
+    encoding.writeVarString(encoder, record.state);
+  }
+  return encoding.toUint8Array(encoder);
+}
+
 /** Read the Yjs client ids from an awareness update and validate its JSON. */
 export function awarenessClientIds(update: Uint8Array): number[] {
   const decoder = decoding.createDecoder(update);

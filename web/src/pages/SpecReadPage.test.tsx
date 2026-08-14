@@ -179,6 +179,9 @@ const undoStateMutate = vi.fn(
 );
 
 vi.mock("@/components/spec", () => ({
+  SpecChatRail: ({ sessionId }: { sessionId: string }) => (
+    <aside aria-label="Drafting session">chat-rail:{sessionId}</aside>
+  ),
   LazySpecCanvas: ({
     specId,
     revision,
@@ -311,6 +314,36 @@ describe("SpecReadPage", () => {
     );
     expect(screen.getByText("Live draft")).toBeTruthy();
     expect(screen.queryByText("Open owner session")).toBeNull();
+    expect(screen.queryByLabelText("Drafting session")).toBeNull();
+  });
+
+  it("mounts the chat rail for the owner of a draft", async () => {
+    view.sessionId = "session-1";
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    expect((await screen.findByLabelText("Drafting session")).textContent).toContain(
+      "chat-rail:session-1",
+    );
+    expect(screen.getByLabelText("Collaborative spec canvas")).toBeTruthy();
+  });
+
+  it("keeps the chat rail off a published spec", async () => {
+    view.sessionId = "session-1";
+    view.lifecycle = "published";
+    view.publishedCheckpointId = older.id;
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    expect(await screen.findByText("Published spec")).toBeTruthy();
+    expect(screen.queryByLabelText("Drafting session")).toBeNull();
+  });
+
+  it("keeps the chat rail off a folded small screen", async () => {
+    view.sessionId = "session-1";
+    setWidth(420);
+    renderWithProviders(<SpecReadPage specId="spec-1" />);
+
+    expect(await screen.findByLabelText("Collaborative spec canvas")).toBeTruthy();
+    expect(screen.queryByLabelText("Drafting session")).toBeNull();
   });
 
   it("keeps the alternatives stage out of the canvas until the agent proposes one", async () => {
