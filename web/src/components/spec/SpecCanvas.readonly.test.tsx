@@ -45,7 +45,7 @@ function element(parent: Y.XmlFragment, index: number): Y.XmlElement {
  * Mount the canvas over a live provider, with one section that carries an
  * inline open-question marker.
  */
-function canvasUnder() {
+function canvasUnder({ readOnly = false }: { readOnly?: boolean } = {}) {
   const doc = new Y.Doc();
   documents.push(doc);
   prosemirrorToYXmlFragment(
@@ -82,6 +82,7 @@ function canvasUnder() {
       revision="17"
       surface={deriveSpecSurface(rail, doc)}
       showProvenance
+      readOnly={readOnly}
     />,
   );
   return { ...view, doc };
@@ -124,6 +125,17 @@ describe("the spec canvas at width", () => {
     const editor = await screen.findByLabelText("Collaborative spec document");
     await waitFor(() => expect(editor.getAttribute("contenteditable")).toBe("true"));
     expect(screen.getByRole("toolbar", { name: "Spec formatting" })).toBeTruthy();
+  });
+
+  test("a published head can use the same read-only editor on a desktop", async () => {
+    canvasUnder({ readOnly: true });
+
+    const editor = await screen.findByLabelText("Collaborative spec document");
+    await waitFor(() => expect(editor.getAttribute("contenteditable")).toBe("false"));
+    expect(
+      screen.getByText("The current draft is read-only here. The text stays live."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("toolbar", { name: "Spec formatting" })).toBeNull();
   });
 
   test.each([

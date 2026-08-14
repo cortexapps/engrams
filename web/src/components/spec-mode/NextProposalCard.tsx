@@ -15,9 +15,11 @@ interface ProposalContent {
 export function NextProposalCard({
   next,
   onSend,
+  alternateLabel,
 }: {
   next: NextProposal;
   onSend: (message: string) => Promise<unknown>;
+  alternateLabel?: string;
 }) {
   const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
   const [failedPrompt, setFailedPrompt] = useState<string | null>(null);
@@ -58,7 +60,7 @@ export function NextProposalCard({
           disabled={pendingPrompt !== null}
           onClick={() => void send(content.secondaryPrompt)}
         >
-          {content.secondaryLabel}
+          {alternateLabel ?? content.secondaryLabel}
         </Button>
       </div>
       {pendingPrompt ? (

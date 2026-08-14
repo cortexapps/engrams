@@ -2,17 +2,20 @@ import { useParams } from "@tanstack/react-router";
 import { useEffect, useRef, useState, type UIEvent } from "react";
 import type { SpecSelectionActionPayload } from "@engrams/spec-document";
 
-import { Markdown } from "@/components/Markdown";
 import { IdeationScreen } from "@/components/spec-mode/IdeationScreen";
+import { SpecMobileView } from "@/components/spec-mode/SpecMobileView";
+import { SpecPublishedView } from "@/components/spec-mode/SpecPublishedView";
 import { SpecShell } from "@/components/spec-mode/SpecShell";
 import type { SpecConnection } from "@/components/spec/SpecConnection";
 import { useSpecPresence } from "@/components/spec-mode/section-presence";
 import { useSpecSurface } from "@/components/spec-mode/spec-surface";
 import { useScrollAnchors } from "@/components/spec-mode/useScrollAnchors";
 import { LazySpecCanvas } from "@/components/spec/LazySpecCanvas";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Text } from "@/components/ui/text";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { useSendSpecMessage } from "@/hooks/useSpecMessages";
 import { useSpecPublish } from "@/hooks/useSpecPublish";
 import { useSpecRail, useSpecRead, useStartSpecDrafting } from "@/hooks/useSpecRead";
@@ -26,21 +29,24 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   const publish = useSpecPublish(specId);
   const startDrafting = useStartSpecDrafting(specId);
   const sendSelectionPrompt = useSendSpecMessage(specId);
+  const isMobile = useIsMobile();
   const phase = read.data?.spec.phase ?? null;
+  const [showDraft, setShowDraft] = useState(false);
   // Ideation connects too: the screen has no document, but it shows who is
   // here, and presence rides the same awareness.
   const { connection, synced } = useSpecConnection(
     specId,
-    phase === "ideation" || phase === "drafting",
+    phase === "ideation" || phase === "drafting" || (phase === "published" && showDraft),
   );
   const presence = useSpecPresence(connection?.provider.awareness ?? null);
   const [readingSectionId, setReadingSectionId] = useState<string | null>(null);
   const [showProvenance, setShowProvenance] = useState(true);
   const documentPaneRef = useRef<HTMLElement | null>(null);
   const { scrollToSection } = useScrollAnchors(documentPaneRef);
+  const openQuestions = publish.data?.openQuestions ?? [];
   const surface = useSpecSurface(
     rail.data,
-    phase === "drafting" ? (connection?.doc ?? null) : null,
+    phase === "drafting" || showDraft ? (connection?.doc ?? null) : null,
     {
       readingSectionId,
       openQuestions: publish.data?.openQuestions,
@@ -118,6 +124,30 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
       />
     );
   }
+  if (spec.phase === "published" && !showDraft) {
+    const owner = checkpoints.find(
+      (checkpoint) => checkpoint.id === publishedCheckpoint?.id,
+    )?.author;
+    return publishedCheckpoint ? (
+      <SpecPublishedView
+        specId={specId}
+        title={spec.title}
+        checkpoint={publishedCheckpoint}
+        owner={owner ?? null}
+        currentRevision={spec.revision}
+        publishedAt={spec.publishedAt}
+        openQuestions={openQuestions}
+        onOpenDraft={() => setShowDraft(true)}
+      />
+    ) : (
+      <main className="spec-mode-error">
+        <Text as="h1" variant="heading">
+          Published version not available
+        </Text>
+        <Text tone="muted">The pinned document is not available.</Text>
+      </main>
+    );
+  }
   const selectionActions =
     phase === "drafting"
       ? {
@@ -131,47 +161,70 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
           },
         }
       : undefined;
+  const canvas =
+    connection && synced ? (
+      <LazySpecCanvas
+        doc={connection.doc}
+        provider={connection.provider}
+        specId={specId}
+        revision={spec.revision}
+        selectionActions={selectionActions}
+        surface={surface}
+        presence={presence}
+        showProvenance={showProvenance}
+        readOnly={phase === "published"}
+      />
+    ) : (
+      <div className="spec-mode-loading" aria-label="Loading collaborative spec">
+        <Skeleton className="h-7 w-2/5" />
+        <Skeleton className="h-4 w-full" />
+        <Skeleton className="h-4 w-5/6" />
+      </div>
+    );
+
+  if (isMobile) {
+    return (
+      <SpecMobileView
+        title={spec.title}
+        surface={surface}
+        presence={presence}
+        onSend={(message) => sendSelectionPrompt.mutateAsync(message)}
+        onBackToPublished={phase === "published" ? () => setShowDraft(false) : undefined}
+      >
+        {canvas}
+      </SpecMobileView>
+    );
+  }
 
   return (
-    <SpecShell
-      specId={specId}
-      title={spec.title}
-      templateName={spec.template.name}
-      checkpoints={checkpoints}
-      viewerIsOwner={spec.viewerIsOwner}
-      surface={phase === "drafting" ? surface : undefined}
-      presence={presence}
-      onSelectSection={selectSection}
-      documentPaneRef={documentPaneRef}
-      onDocumentScroll={trackReadingSection}
-      showProvenance={showProvenance}
-      onShowProvenanceChange={setShowProvenance}
-    >
-      {phase === "drafting" ? (
-        connection && synced ? (
-          <LazySpecCanvas
-            doc={connection.doc}
-            provider={connection.provider}
-            specId={specId}
-            revision={spec.revision}
-            selectionActions={selectionActions}
-            surface={surface}
-            presence={presence}
-            showProvenance={showProvenance}
-          />
-        ) : (
-          <div className="spec-mode-loading" aria-label="Loading collaborative spec">
-            <Skeleton className="h-7 w-2/5" />
-            <Skeleton className="h-4 w-full" />
-            <Skeleton className="h-4 w-5/6" />
-          </div>
-        )
-      ) : publishedCheckpoint ? (
-        <article className="spec-mode-published-document">
-          <Markdown text={publishedCheckpoint.markdown} highlightCode />
-        </article>
+    <>
+      {phase === "published" ? (
+        <Button
+          type="button"
+          variant="outline"
+          className="spec-mode-return-published"
+          onClick={() => setShowDraft(false)}
+        >
+          Back to published version
+        </Button>
       ) : null}
-    </SpecShell>
+      <SpecShell
+        specId={specId}
+        title={spec.title}
+        templateName={spec.template.name}
+        checkpoints={checkpoints}
+        viewerIsOwner={phase === "drafting" && spec.viewerIsOwner}
+        surface={surface}
+        presence={presence}
+        onSelectSection={selectSection}
+        documentPaneRef={documentPaneRef}
+        onDocumentScroll={trackReadingSection}
+        showProvenance={showProvenance}
+        onShowProvenanceChange={setShowProvenance}
+      >
+        {canvas}
+      </SpecShell>
+    </>
   );
 }
 
