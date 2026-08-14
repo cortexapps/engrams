@@ -126,6 +126,33 @@ describe("buildSpecThread", () => {
     expect(JSON.stringify(buildSpecThread(messages, new Map()))).not.toContain("speaker:");
   });
 
+  test("shows the founding problem statement, which has no stored row", () => {
+    // The statement that creates a spec is sent with the session, not through
+    // the messages route, so it never gets a row. Hiding it made the first turn
+    // of every spec read "This message is not available".
+    const messages = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "founding-prompt",
+          role: "user",
+          text: "jq ignores a duplicate --arg name and keeps the last value.",
+          at: AT,
+        },
+      ]),
+      "session-1",
+    ).messages;
+
+    expect(buildSpecThread(messages, new Map())).toMatchObject([
+      {
+        kind: "human",
+        author: null,
+        text: "jq ignores a duplicate --arg name and keeps the last value.",
+      },
+    ]);
+  });
+
   test("preserves the snapshot name when a stored author's id is null", () => {
     const messages = buildMessages(
       indexed([
