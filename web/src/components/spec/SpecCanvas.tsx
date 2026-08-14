@@ -12,13 +12,13 @@ import {
   SectionNodeViewProvider,
   type SectionStateAction,
 } from "@/components/spec-mode/SectionNodeView";
+import { sectionIdAtPos, type SpecPresenceEntry } from "@/components/spec-mode/section-presence";
 import type { SpecSurface } from "@/components/spec-mode/spec-surface";
 import { Provenance, refreshProvenance } from "@/components/spec-mode/provenance";
 import { Button } from "@/components/ui/button";
 import { useIsMobile } from "@/hooks/use-mobile";
 import type { SpecConnection } from "./SpecConnection";
 import { useSetSpecSectionState } from "@/hooks/useSpecRead";
-import { SpecPresence } from "./SpecPresence";
 import { SpecSelectionBubbleMenu, type SpecSelectionActions } from "./SpecSelectionActions";
 import { SpecBlockIterationProvider } from "./block-iteration";
 import { specNodeExtensions } from "./extensions";
@@ -32,6 +32,7 @@ export function SpecCanvas({
   selectionActions,
   surface,
   showProvenance,
+  presence,
 }: {
   doc: Y.Doc;
   provider: WebsocketProvider;
@@ -39,6 +40,7 @@ export function SpecCanvas({
   revision: string;
   surface: SpecSurface;
   showProvenance: boolean;
+  presence: SpecPresenceEntry[];
   /** Supply this only when the current user can send selection actions. */
   selectionActions?: SpecSelectionActions;
 }) {
@@ -47,6 +49,7 @@ export function SpecCanvas({
   const user = useMemo(
     () => ({
       name: principal.display_name || principal.email,
+      id: principal.email,
       color: collaboratorColor(principal.email),
     }),
     [principal.display_name, principal.email],
@@ -62,6 +65,7 @@ export function SpecCanvas({
         selectionActions={selectionActions}
         surface={surface}
         showProvenance={showProvenance}
+        presence={presence}
         pendingSectionId={
           sectionState.isPending ? (sectionState.variables?.sectionId ?? null) : null
         }
@@ -88,16 +92,18 @@ export function ConnectedSpecCanvas({
   selectionActions,
   surface,
   showProvenance,
+  presence = [],
   pendingSectionId = null,
   onSetSectionState = () => undefined,
 }: {
   connection: SpecConnection;
-  user: { name: string; color: string };
+  user: { id: string; name: string; color: string };
   specId: string;
   revision: string;
   surface: SpecSurface;
   showProvenance: boolean;
   selectionActions?: SpecSelectionActions;
+  presence?: SpecPresenceEntry[];
   pendingSectionId?: string | null;
   onSetSectionState?: (action: SectionStateAction) => void;
 }) {
@@ -140,7 +146,34 @@ export function ConnectedSpecCanvas({
     if (editor) refreshProvenance(editor);
   }, [editor, showProvenance, surface]);
 
+  useEffect(() => {
+    if (!editor) return;
+    const awareness = connection.provider.awareness;
+    const publishLocation = () => {
+      const sectionId = sectionIdAtPos(editor.state.doc, editor.state.selection.head);
+      const location = awareness.getLocalState()?.location;
+      const currentSectionId =
+        typeof location === "object" &&
+        location !== null &&
+        "sectionId" in location &&
+        typeof location.sectionId === "string"
+          ? location.sectionId
+          : null;
+      if (sectionId === currentSectionId) return;
+      awareness.setLocalStateField("location", sectionId === null ? null : { sectionId });
+    };
+    publishLocation();
+    editor.on("selectionUpdate", publishLocation);
+    editor.on("transaction", publishLocation);
+    return () => {
+      editor.off("selectionUpdate", publishLocation);
+      editor.off("transaction", publishLocation);
+      awareness.setLocalStateField("location", null);
+    };
+  }, [connection.provider.awareness, editor]);
+
   if (!editor) return null;
+
   const specDocument = (
     <>
       {selectionActions && !readOnly && (
@@ -153,7 +186,13 @@ export function ConnectedSpecCanvas({
         />
       )}
       <SectionNodeViewProvider
-        value={{ surface, showProvenance, pendingSectionId, setSectionState: onSetSectionState }}
+        value={{
+          surface,
+          showProvenance,
+          pendingSectionId,
+          presence,
+          setSectionState: onSetSectionState,
+        }}
       >
         <EditorContent editor={editor} />
       </SectionNodeViewProvider>
@@ -192,7 +231,6 @@ export function ConnectedSpecCanvas({
             </Button>
           </div>
         )}
-        <SpecPresence awareness={connection.provider.awareness} />
       </div>
       {specDocument}
     </div>

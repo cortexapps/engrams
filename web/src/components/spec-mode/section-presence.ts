@@ -1,5 +1,8 @@
+import { useEffect, useMemo, useState } from "react";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import type { Awareness } from "y-protocols/awareness";
+
+import { collaboratorColor } from "./collaborator-colors";
 
 export interface HumanPresence {
   kind: "human";
@@ -7,6 +10,8 @@ export interface HumanPresence {
   id?: string;
   name: string;
   color: string;
+  isSelf: boolean;
+  sectionId?: string;
 }
 
 export interface AgentPresence {
@@ -15,7 +20,7 @@ export interface AgentPresence {
   name: string;
   sessionId: string;
   toolCallId: string;
-  sectionId: string;
+  sectionId?: string;
 }
 
 export type SpecPresenceEntry = HumanPresence | AgentPresence;
@@ -76,7 +81,7 @@ export function mapAwarenessCursorsToSections(
       clientId,
       ...(typeof state.user.id === "string" ? { userId: state.user.id } : {}),
       name: state.user.name,
-      color: typeof state.user.color === "string" ? state.user.color : "#64748b",
+      color: collaboratorColor(typeof state.user.id === "string" ? state.user.id : null),
       sectionId,
     });
   }
@@ -88,19 +93,22 @@ export function readSpecPresence(awareness: Awareness): SpecPresenceEntry[] {
   const entries: SpecPresenceEntry[] = [];
   for (const [clientId, state] of awareness.getStates()) {
     if (isRecord(state.user) && typeof state.user.name === "string") {
+      const id = typeof state.user.id === "string" ? state.user.id : null;
+      const sectionId = readSectionId(state.location);
       entries.push({
         kind: "human",
         clientId,
-        ...(typeof state.user.id === "string" ? { id: state.user.id } : {}),
+        ...(id !== null ? { id } : {}),
         name: state.user.name,
-        color: typeof state.user.color === "string" ? state.user.color : "#64748b",
+        color: collaboratorColor(id),
+        isSelf: clientId === awareness.clientID,
+        ...(sectionId !== null ? { sectionId } : {}),
       });
     }
     if (Array.isArray(state.agentPresence)) {
       for (const agent of state.agentPresence) {
         if (
           isRecord(agent) &&
-          typeof agent.sectionId === "string" &&
           typeof agent.sessionId === "string" &&
           typeof agent.toolCallId === "string"
         ) {
@@ -108,9 +116,9 @@ export function readSpecPresence(awareness: Awareness): SpecPresenceEntry[] {
             kind: "agent",
             clientId,
             name: typeof agent.name === "string" ? agent.name : "engram",
-            sectionId: agent.sectionId,
             sessionId: agent.sessionId,
             toolCallId: agent.toolCallId,
+            ...(typeof agent.sectionId === "string" ? { sectionId: agent.sectionId } : {}),
           });
         }
       }
@@ -119,10 +127,29 @@ export function readSpecPresence(awareness: Awareness): SpecPresenceEntry[] {
   return entries;
 }
 
+/** Subscribe to the one awareness store owned by the spec page. */
+export function useSpecPresence(awareness: Awareness | null): SpecPresenceEntry[] {
+  const [revision, setRevision] = useState(0);
+  useEffect(() => {
+    if (awareness === null) return;
+    const update = () => setRevision((value) => value + 1);
+    awareness.on("change", update);
+    return () => awareness.off("change", update);
+  }, [awareness]);
+  return useMemo(
+    () => (awareness === null ? [] : readSpecPresence(awareness)),
+    [awareness, revision],
+  );
+}
+
 function readCursor(value: unknown): AwarenessCursor | null {
   return isRecord(value) && "anchor" in value && "head" in value
     ? { anchor: value.anchor, head: value.head }
     : null;
+}
+
+function readSectionId(value: unknown): string | null {
+  return isRecord(value) && typeof value.sectionId === "string" ? value.sectionId : null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

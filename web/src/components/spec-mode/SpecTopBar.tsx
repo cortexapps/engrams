@@ -3,6 +3,9 @@ import { Switch } from "@/components/ui/switch";
 import { Text } from "@/components/ui/text";
 import type { SpecCheckpointSummary } from "@/hooks/useSpecRead";
 import { CheckpointButton } from "./CheckpointButton";
+import { PresenceGroup } from "./PresenceGroup";
+import type { SpecPresenceEntry } from "./section-presence";
+import type { SpecSurfaceSection } from "./spec-surface";
 
 export function SpecTopBar({
   specId,
@@ -10,6 +13,8 @@ export function SpecTopBar({
   templateName,
   checkpoints,
   viewerIsOwner,
+  presence,
+  sections,
   showProvenance,
   onShowProvenanceChange,
 }: {
@@ -18,6 +23,8 @@ export function SpecTopBar({
   templateName: string;
   checkpoints: SpecCheckpointSummary[];
   viewerIsOwner: boolean;
+  presence: SpecPresenceEntry[];
+  sections: SpecSurfaceSection[];
   showProvenance: boolean;
   onShowProvenanceChange: (visible: boolean) => void;
 }) {
@@ -32,9 +39,10 @@ export function SpecTopBar({
         </Text>
       </div>
       <div className="spec-mode-top-actions">
-        {/* F5 fills this region from the page-owned provider awareness. */}
-        <div className="spec-mode-presence-region" aria-label="Presence" />
-        <span className="spec-mode-top-separator" aria-hidden="true" />
+        <PresenceGroup presence={presence} sections={sections} />
+        {presence.length > 0 ? (
+          <span className="spec-mode-top-separator" aria-hidden="true" />
+        ) : null}
         <label className="spec-mode-provenance-toggle">
           <Text as="span" variant="label" tone="muted">
             Sources

@@ -18,59 +18,15 @@
   background: color-mix(in oklab, var(--muted) 45%, var(--card));
 }
 
-.spec-canvas-tools,
-.spec-presence,
-.spec-presence-avatars,
-.spec-presence-copy {
+.spec-canvas-tools {
   display: flex;
   align-items: center;
-}
-
-.spec-canvas-tools {
   gap: 0.25rem;
 }
 
 .spec-canvas-read-only {
   color: var(--muted-foreground);
   font-size: 0.75rem;
-}
-
-.spec-presence {
-  min-width: 0;
-  justify-content: flex-end;
-  gap: 0.75rem;
-  font-size: 0.75rem;
-  color: var(--muted-foreground);
-}
-
-.spec-presence-avatars {
-  padding-left: 0.5rem;
-}
-
-.spec-presence-avatar {
-  display: grid;
-  width: 1.75rem;
-  height: 1.75rem;
-  place-items: center;
-  border: 2px solid var(--card);
-  border-radius: 999px;
-  margin-left: -0.5rem;
-  color: white;
-  font-size: 0.625rem;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-}
-
-.spec-presence-avatar.is-agent {
-  background: var(--foreground);
-  color: var(--background);
-}
-
-.spec-presence-copy {
-  max-width: 30rem;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 0.25rem 0.75rem;
 }
 
 .spec-canvas-editor {
@@ -205,14 +161,9 @@
 }
 
 @media (max-width: 48rem) {
-  .spec-canvas-bar,
-  .spec-presence {
+  .spec-canvas-bar {
     align-items: flex-start;
     flex-direction: column;
-  }
-
-  .spec-presence-copy {
-    justify-content: flex-start;
   }
 
   .spec-canvas-editor {
