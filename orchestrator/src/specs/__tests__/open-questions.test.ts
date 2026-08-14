@@ -26,6 +26,7 @@ const question: OpenQuestionRecord = {
   requestFingerprint: QUESTION_FINGERPRINT,
   state: "open",
   resolutionLink: null,
+  resolvedBy: null,
   resolvedAt: null,
 };
 
@@ -168,7 +169,7 @@ describe("open questions", () => {
     });
 
     await expect(
-      service.resolve({ questionId: question.id, answerMarkdown: "Use three tries." }),
+      service.resolve({ questionId: question.id, answerMarkdown: "Use three tries.", resolvedBy: "user-2" }),
     ).rejects.toBeInstanceOf(OpenQuestionError);
     expect(resolveInputs).toHaveLength(0);
   });
@@ -179,6 +180,7 @@ describe("open questions", () => {
     const resolved = await service.resolve({
       questionId: question.id,
       answerMarkdown: "  Use three tries.  ",
+      resolvedBy: "user-2",
     });
 
     expect(resolved).toMatchObject({
@@ -191,6 +193,7 @@ describe("open questions", () => {
         expectedState: "open",
         resolutionLink: "yjs-section://failure-modes/AQID",
         resolvedAt: new Date("2026-08-09T12:00:00.000Z"),
+        resolvedBy: "user-2",
       },
     ]);
   });
@@ -226,6 +229,7 @@ describe("open questions", () => {
     const resolved = await service.resolve({
       questionId: question.id,
       answerMarkdown: "Use three tries.",
+      resolvedBy: "user-2",
     });
 
     expect(resolved.state).toBe("resolved");

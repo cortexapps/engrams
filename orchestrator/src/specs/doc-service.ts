@@ -190,6 +190,7 @@ export interface SpecTrackedEditActionInput {
   sectionId: string;
   requestFingerprint: string;
   chip: TrackedEditTranscriptChip;
+  actorUserId: string | null;
   concurrentEditors: string[];
 }
 
@@ -1094,6 +1095,7 @@ interface TrackedEditActionRow {
   section_id: string;
   request_fingerprint: string;
   chip: TrackedEditTranscriptChip;
+  actor_user_id: string | null;
   result: {
     applied: true;
     newRev: string;
@@ -1163,7 +1165,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
   async readTrackedEditAction(actionId: string): Promise<SpecTrackedEditActionRecord | null> {
     const result = await this.pool.query<TrackedEditActionRow>(
       `SELECT id, spec_id, section_id, request_fingerprint, chip, result,
-              created_at, delivered_at
+              actor_user_id, created_at, delivered_at
          FROM spec_transcript_action
         WHERE id = $1`,
       [actionId],
@@ -1188,6 +1190,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
       sectionId: row.section_id,
       requestFingerprint: row.request_fingerprint,
       chip: row.chip,
+      actorUserId: row.actor_user_id,
       concurrentEditors: row.result.concurrentEditors,
       result: {
         applied: true,
@@ -1356,8 +1359,8 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
         }
         await client.query(
           `INSERT INTO spec_transcript_action
-             (id, spec_id, section_id, request_fingerprint, chip, result, created_at, delivered_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)`,
+             (id, spec_id, section_id, request_fingerprint, chip, result, actor_user_id, created_at, delivered_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL)`,
           [
             transcriptAction.id,
             transcriptAction.specId,
@@ -1370,6 +1373,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
               transcriptChip: transcriptAction.chip,
               concurrentEditors: transcriptAction.concurrentEditors,
             },
+            transcriptAction.actorUserId,
             transcriptAction.createdAt,
           ],
         );
@@ -1562,14 +1566,15 @@ async function proposeHumanEditedSections(
     const actionId = `human-edit:${specId}:${seq}:${section.id}`;
     await client.query(
       `INSERT INTO spec_transcript_action
-         (id, spec_id, section_id, request_fingerprint, chip, created_at, delivered_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NULL)`,
+         (id, spec_id, section_id, request_fingerprint, chip, actor_user_id, created_at, delivered_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)`,
       [
         actionId,
         specId,
         section.id,
         humanEditRequestFingerprint(actorUserId, priorSeq),
         change.transcriptChip,
+        actorUserId,
         effects.at,
       ],
     );

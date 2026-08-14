@@ -121,6 +121,7 @@ describe("spec integrity stores with live Postgres", () => {
         expected,
         next: proposed.value,
         settledBy: null,
+        actorUserId: null,
         chip: proposed.transcriptChip,
         at: new Date("2026-08-09T12:00:00.000Z"),
       },
@@ -132,6 +133,7 @@ describe("spec integrity stores with live Postgres", () => {
         expected,
         next: notApplicable.value,
         settledBy: null,
+        actorUserId: null,
         chip: notApplicable.transcriptChip,
         at: new Date("2026-08-09T12:00:01.000Z"),
       },
@@ -168,6 +170,7 @@ describe("spec integrity stores with live Postgres", () => {
         expected,
         next: proposed.value,
         settledBy: null,
+        actorUserId: null,
         chip: proposed.transcriptChip,
         at: actionAt,
       };
@@ -230,12 +233,14 @@ describe("spec integrity stores with live Postgres", () => {
         id,
         expectedState: "open",
         resolutionLink: "yjs-section://failure-modes/first",
+        resolvedBy: null,
         resolvedAt: new Date("2026-08-09T12:00:00.000Z"),
       }),
       store.resolve({
         id,
         expectedState: "open",
         resolutionLink: "yjs-section://failure-modes/second",
+        resolvedBy: null,
         resolvedAt: new Date("2026-08-09T12:00:01.000Z"),
       }),
     ]);

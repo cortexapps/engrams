@@ -63,6 +63,7 @@ class MemorySectionStateStore implements SectionStateStore {
       sectionId: input.sectionId,
       requestFingerprint: input.requestFingerprint,
       chip: input.chip,
+      actorUserId: input.actorUserId,
       createdAt: input.at,
       deliveredAt: null,
     };
@@ -132,6 +133,7 @@ describe("section state service", () => {
 
     expect(replay).toEqual(first);
     expect(store.stateWrites).toBe(1);
+    expect(store.actions.get("deferred-action")?.actorUserId).toBe("user-1");
     expect(store.actions.get("deferred-action")?.deliveredAt).toBeNull();
     expect(transcript.publications).toHaveLength(0);
 

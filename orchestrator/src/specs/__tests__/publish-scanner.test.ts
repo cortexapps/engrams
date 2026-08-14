@@ -18,7 +18,6 @@ import type {
   SpecPublishRecord,
   SpecPublishStore,
   SpecPublishWork,
-  VerifyForPinResult,
 } from "../publish.ts";
 
 const SPEC_ID = "00000000-0000-4000-8000-000000000126";
@@ -60,13 +59,8 @@ class MemoryPublishStore implements SpecPublishStore {
   publishedBy: string | null = null;
   publishedAt: Date | null = null;
   claims = 0;
-  /** The document revision, the section states and the open questions the
-   *  pin transaction would read. */
+  /** The document revision and open questions the pin transaction reads. */
   semanticDocSeq = 12n;
-  sectionStates = new Map<string, "settled" | "proposed" | "n/a-with-reason">([
-    ["sec-req", "settled"],
-    ["sec-data", "settled"],
-  ]);
   openQuestionIds: string[] = [];
   readonly checkpoints = new Map<string, string>();
 
@@ -112,22 +106,11 @@ class MemoryPublishStore implements SpecPublishStore {
     if (this.semanticDocSeq !== input.semanticDocSeq) {
       return { kind: "stale_document", currentSemanticDocSeq: this.semanticDocSeq };
     }
-    const unsettled = input.requiredSectionIds.filter((id) => {
-      const state = this.sectionStates.get(id);
-      if (state === undefined) return true;
-      return !(state === "settled" || state === "n/a-with-reason");
-    });
-    if (unsettled.length > 0) {
-      return {
-        kind: "gate_failed",
-        reason: `${unsettled.length} required sections are no longer settled.`,
-      };
-    }
     const acknowledged = [...input.acknowledgedQuestionIds].sort();
     const open = [...this.openQuestionIds].sort();
     if (open.length !== acknowledged.length || open.some((id, i) => id !== acknowledged[i])) {
       return {
-        kind: "gate_failed",
+        kind: "confirmation_failed",
         reason: "The open questions changed after the acknowledgment.",
       };
     }
@@ -211,24 +194,6 @@ class MemoryDocuments {
   }
 }
 
-/** The gate, as the service would re-check it for the compacted revision. */
-class MemoryGate {
-  verifications = 0;
-  /** Set to refuse, exactly as verifyForPin would. */
-  refuseWith: { retryable: boolean; reason: string } | null = null;
-
-  async verifyForPin(
-    specId: string,
-    input: { semanticDocSeq: bigint; acknowledgedQuestionIds: readonly string[] },
-  ): Promise<VerifyForPinResult> {
-    this.verifications += 1;
-    void specId;
-    void input;
-    if (this.refuseWith) return { ok: false, ...this.refuseWith };
-    return { ok: true, requiredSectionIds: ["sec-req", "sec-data"] };
-  }
-}
-
 /** Reads the checkpoint the pin transaction wrote. */
 class MemoryCheckpointStore {
   constructor(private readonly store: MemoryPublishStore) {}
@@ -308,7 +273,6 @@ class MemoryTicketize implements SpecTicketizeHandoff {
 function fixture(row?: SpecPublishRecord) {
   const store = new MemoryPublishStore(row);
   const documents = new MemoryDocuments(store);
-  const gate = new MemoryGate();
   const checkpointStore = new MemoryCheckpointStore(store);
   const artifacts = new MemoryArtifacts();
   const ticketize = new MemoryTicketize();
@@ -316,7 +280,6 @@ function fixture(row?: SpecPublishRecord) {
   const deps: SpecPublishTickDeps = {
     store,
     documents,
-    gate,
     checkpointStore,
     artifacts,
     ticketize,
@@ -328,7 +291,6 @@ function fixture(row?: SpecPublishRecord) {
     deps,
     store,
     documents,
-    gate,
     artifacts,
     ticketize,
     advanceClock: (ms: number) => {
@@ -470,34 +432,20 @@ describe("spec publish scanner", () => {
     expect(f.artifacts.publishes).toHaveLength(0);
   });
 
-  test("a required section unsettled after the request blocks the pin, not the spec", async () => {
+  test("the scanner does not inspect section settlement before the pin", async () => {
     const f = fixture();
-    // A co-editor edits the settled section, which flips it back to proposed.
-    f.store.sectionStates.set("sec-data", "proposed");
 
     const result = await runSpecPublishTick(f.deps);
 
-    expect(result).toEqual({
-      claimed: 1,
-      pinned: 0,
-      artifactsPublished: 0,
-      completed: 0,
-      blocked: 1,
-      failed: 0,
-    });
-    expect(f.store.row.state).toBe("blocked");
-    expect(f.store.row.lastError).toBe("1 required sections are no longer settled.");
-    // Nothing became immutable: no checkpoint, no flip, no artifact.
-    expect(f.store.checkpoints.size).toBe(0);
-    expect(f.store.phase).toBe("drafting");
-    expect(f.store.publishedCheckpointId).toBeNull();
-    expect(f.artifacts.publishes).toHaveLength(0);
-    expect(f.ticketize.starts).toHaveLength(0);
+    expect(result.pinned).toBe(1);
+    expect(result.completed).toBe(1);
+    expect(f.store.row.state).toBe("complete");
+    expect(f.store.checkpoints.size).toBe(1);
   });
 
   test("a blocked publish is never claimed again by the timer", async () => {
     const f = fixture();
-    f.store.sectionStates.set("sec-data", "proposed");
+    f.store.openQuestionIds = ["q-new"];
     await runSpecPublishTick(f.deps);
 
     f.advanceClock(60_000);
@@ -518,50 +466,9 @@ describe("spec publish scanner", () => {
     expect(f.store.checkpoints.size).toBe(0);
   });
 
-  test("the gate's own refusal blocks before anything is compacted into a version", async () => {
+  test("the pin transaction defers a document that moved after compaction", async () => {
     const f = fixture();
-    f.gate.refuseWith = { retryable: false, reason: "2 required sections are no longer settled." };
-
-    const result = await runSpecPublishTick(f.deps);
-
-    expect(result.blocked).toBe(1);
-    expect(f.store.row.state).toBe("blocked");
-    expect(f.store.checkpoints.size).toBe(0);
-    expect(f.store.phase).toBe("drafting");
-  });
-
-  test("a document that merely moved defers the pin and retries", async () => {
-    const f = fixture();
-    f.gate.refuseWith = {
-      retryable: true,
-      reason: "The document moved while the publish was pinning.",
-    };
-
-    const first = await runSpecPublishTick(f.deps);
-    expect(first).toEqual({
-      claimed: 1,
-      pinned: 0,
-      artifactsPublished: 0,
-      completed: 0,
-      blocked: 0,
-      failed: 0,
-    });
-    expect(f.store.row.state).toBe("requested");
-
-    // The document settles, and the next claim pins it.
-    f.gate.refuseWith = null;
-    f.advanceClock(20_000);
-    const second = await runSpecPublishTick(f.deps);
-
-    expect(second.pinned).toBe(1);
-    expect(second.completed).toBe(1);
-    expect(f.store.checkpoints.size).toBe(1);
-  });
-
-  test("the pin transaction refuses a document that moved after the gate check", async () => {
-    const f = fixture();
-    // The gate verified revision 12; the row moves on before the transaction.
-    f.gate.refuseWith = null;
+    // The compacted revision is 12; the row moves before the transaction.
     f.documents.markdown = "# stale\n";
     const compact = f.deps.documents.compact.bind(f.deps.documents);
     f.deps.documents.compact = async (specId: string) => {

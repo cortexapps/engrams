@@ -7,8 +7,6 @@ import * as Y from "yjs";
 import type { SpecTemplateLayer, SpecTemplateSection } from "../../db/schema.ts";
 import type { SpecRailMetadata, SpecRailStore } from "../../routes/spec-rail.ts";
 import type { LoadedSpecDocument } from "../doc-service.ts";
-import { GapCheckError } from "../gap-check.ts";
-import type { GapCheckRun, GapCheckRunInput, GapCheckStatus } from "../gap-check.ts";
 import {
   SpecPublishError,
   SpecPublishService,
@@ -163,47 +161,9 @@ class MemoryPublishStore implements SpecPublishStore {
   async recordFailure(): Promise<void> {}
 }
 
-function gapCheckRun(id: string): GapCheckRun {
-  return {
-    id,
-    specId: SPEC_ID,
-    sessionId: SESSION_ID,
-    semanticDocSeq: 4n,
-    stoppedAtLayerKey: null,
-    suppressedCount: 0,
-    matrix: { layers: LAYERS, rows: [] },
-    findings: [],
-    startedBy: OWNER,
-    createdAt: NOW,
-  };
-}
-
-class MemoryGapCheck {
-  runs: GapCheckRunInput[] = [];
-  failWith: GapCheckError | null = null;
-
-  constructor(private stale: boolean) {}
-
-  async status(): Promise<GapCheckStatus> {
-    return {
-      run: this.stale ? null : gapCheckRun("run-1"),
-      currentSemanticDocSeq: 4n,
-      stale: this.stale,
-    };
-  }
-
-  async run(input: GapCheckRunInput): Promise<GapCheckRun> {
-    this.runs.push(input);
-    if (this.failWith) throw this.failWith;
-    this.stale = false;
-    return gapCheckRun("run-2");
-  }
-}
-
 interface FixtureOptions {
   states?: Map<string, SectionStateValue>;
   questions?: Array<{ id: string; sectionId: string; text: string }>;
-  stale?: boolean;
   target?: Partial<SpecPublishTarget>;
 }
 
@@ -225,17 +185,15 @@ function fixture(options: FixtureOptions = {}) {
     ...options.target,
   });
   store.questions.push(...(options.questions ?? []));
-  const gapCheck = new MemoryGapCheck(options.stale ?? false);
   let minted = 0;
   const service = new SpecPublishService({
     store,
     railStore: new MemoryRailStore(states),
     documents: { syncFromLog: async () => loaded(4n) },
-    gapCheck,
     now: () => NOW,
     newId: () => `minted-${(minted += 1)}`,
   });
-  return { service, store, gapCheck, states };
+  return { service, store, states };
 }
 
 async function refusal(promise: Promise<unknown>): Promise<SpecPublishError> {
@@ -254,12 +212,11 @@ function publishInput(overrides: Partial<Parameters<SpecPublishService["requestP
     actorUserId: OWNER,
     actionId: "00000000-0000-4000-8000-0000000000aa",
     acknowledgeOpenQuestions: false,
-    runGapCheck: false,
     ...overrides,
   };
 }
 
-describe("publish gate service", () => {
+describe("publish confirmation service", () => {
   test("ideation refuses publish until a person starts drafting", async () => {
     const { service, store } = fixture({ target: { phase: "ideation" } });
 
@@ -272,7 +229,7 @@ describe("publish gate service", () => {
     expect(store.record).toBeNull();
   });
 
-  test("an unsettled required section blocks the publish and names it (R34)", async () => {
+  test("an unsettled required section no longer blocks publish", async () => {
     const { service, store } = fixture({
       states: new Map([
         ["sec-req", { state: "settled", naReason: null }],
@@ -280,21 +237,11 @@ describe("publish gate service", () => {
       ]),
     });
 
-    const error = await refusal(service.requestPublish(publishInput()));
+    const result = await service.requestPublish(publishInput());
 
-    expect(error.code).toBe("blocked");
-    expect(error.status?.gate.blockers).toEqual([
-      {
-        sectionId: "sec-data",
-        sectionTitle: "Data model",
-        layerKey: "contract",
-        state: "proposed",
-        reason: "proposed",
-      },
-    ]);
-    expect(error.status?.gate.settledRequiredCount).toBe(1);
-    expect(error.status?.gate.requiredCount).toBe(2);
-    expect(store.record).toBeNull();
+    expect(result.created).toBe(true);
+    expect(result.publish.state).toBe("requested");
+    expect(store.record).not.toBeNull();
   });
 
   test("n/a with a reason settles a required section (R34)", async () => {
@@ -313,7 +260,7 @@ describe("publish gate service", () => {
     expect(store.record?.artifactId).toBe("minted-2");
   });
 
-  test("n/a without a reason still blocks", async () => {
+  test("section n/a state and reason do not gate publish", async () => {
     const { service } = fixture({
       states: new Map([
         ["sec-req", { state: "settled", naReason: null }],
@@ -321,10 +268,10 @@ describe("publish gate service", () => {
       ]),
     });
 
-    const error = await refusal(service.requestPublish(publishInput()));
+    const result = await service.requestPublish(publishInput());
 
-    expect(error.code).toBe("blocked");
-    expect(error.status?.gate.blockers[0]?.reason).toBe("na_without_reason");
+    expect(result.created).toBe(true);
+    expect(result.publish.state).toBe("requested");
   });
 
   test("open questions need the acknowledgment, and then they publish (R35)", async () => {
@@ -337,8 +284,8 @@ describe("publish gate service", () => {
 
     const error = await refusal(service.requestPublish(publishInput()));
     expect(error.code).toBe("acknowledgment_required");
-    expect(error.status?.gate.ready).toBe(true);
-    expect(error.status?.gate.openQuestions).toEqual([
+    expect(error.message).toBe("2 open questions need an acknowledgment.");
+    expect(error.status?.openQuestions).toEqual([
       {
         id: "q-1",
         sectionId: "sec-data",
@@ -362,37 +309,16 @@ describe("publish gate service", () => {
     expect(result.publish.acknowledgedQuestionIds).toEqual(["q-1", "q-2"]);
   });
 
-  test("a stale gap check runs as part of the publish (R30)", async () => {
-    const { service, gapCheck, store } = fixture({ stale: true });
+  test("publish records no gap-check run", async () => {
+    const { service } = fixture();
 
-    const refused = await refusal(service.requestPublish(publishInput()));
-    expect(refused.code).toBe("gap_check_stale");
-    expect(gapCheck.runs).toHaveLength(0);
-    expect(store.record).toBeNull();
+    const result = await service.requestPublish(publishInput());
 
-    const result = await service.requestPublish(publishInput({ runGapCheck: true }));
-    expect(gapCheck.runs).toHaveLength(1);
-    expect(gapCheck.runs[0]?.requestFingerprint).toBe(
-      "publish-gate:00000000-0000-4000-8000-0000000000aa",
-    );
     expect(result.created).toBe(true);
+    expect(result.publish.gapCheckRunId).toBeNull();
   });
 
-  test("a gap check that cannot read the document refuses plainly", async () => {
-    const { service, gapCheck, store } = fixture({ stale: true });
-    gapCheck.failWith = new GapCheckError(
-      "untraceable_document",
-      "The spec has no requirements section, so it cannot be traced.",
-    );
-
-    const error = await refusal(service.requestPublish(publishInput({ runGapCheck: true })));
-
-    expect(error.code).toBe("gap_check_failed");
-    expect(error.message).toBe("The spec has no requirements section, so it cannot be traced.");
-    expect(store.record).toBeNull();
-  });
-
-  test("only the owner publishes, and a member still reads the gate (R37)", async () => {
+  test("only the owner publishes, and a member still reads the confirmation", async () => {
     const { service, store } = fixture();
 
     const error = await refusal(
@@ -403,7 +329,7 @@ describe("publish gate service", () => {
     expect(store.record).toBeNull();
 
     const status = await service.status(SPEC_ID, OTHER_MEMBER);
-    expect(status.gate.ready).toBe(true);
+    expect(status.openQuestions).toEqual([]);
     expect(status.canPublish).toBe(false);
     expect((await service.status(SPEC_ID, OWNER)).canPublish).toBe(true);
   });
@@ -429,11 +355,11 @@ describe("publish gate service", () => {
     const first = await service.requestPublish(
       publishInput({ acknowledgeOpenQuestions: true }),
     );
-    // The pin refused it: a required section moved out of the gate.
-    store.record = { ...first.publish, state: "blocked", lastError: "1 required sections…" };
+    // The pin refused it because a new question appeared after acknowledgment.
+    store.record = { ...first.publish, state: "blocked", lastError: "questions changed" };
     store.questions.push({ id: "q-2", sectionId: "sec-data", text: "And the ceiling?" });
 
-    // The gate still needs the acknowledgment, now for both questions.
+    // The confirmation needs an acknowledgment for both current questions.
     const refused = await refusal(service.requestPublish(publishInput()));
     expect(refused.code).toBe("acknowledgment_required");
     expect(store.record?.state).toBe("blocked");
@@ -450,84 +376,16 @@ describe("publish gate service", () => {
     expect(again.publish.artifactId).toBe(first.publish.artifactId);
   });
 
-  test("a blocked publish that still fails the gate stays blocked", async () => {
+  test("a blocked publish re-arms even when a section is unsettled", async () => {
     const { service, store, states } = fixture();
     const first = await service.requestPublish(publishInput());
     store.record = { ...first.publish, state: "blocked", lastError: "moved" };
     states.set("sec-data", { state: "proposed", naReason: null });
 
-    const error = await refusal(service.requestPublish(publishInput()));
+    const again = await service.requestPublish(publishInput());
 
-    expect(error.code).toBe("blocked");
-    expect(store.record?.state).toBe("blocked");
-  });
-
-  test("verifyForPin passes for the revision it was given", async () => {
-    const { service } = fixture();
-
-    const verified = await service.verifyForPin(SPEC_ID, {
-      semanticDocSeq: 4n,
-      acknowledgedQuestionIds: [],
-    });
-
-    expect(verified).toEqual({ ok: true, requiredSectionIds: ["sec-req", "sec-data"] });
-  });
-
-  test("verifyForPin defers when the document moved past the compaction", async () => {
-    const { service } = fixture();
-
-    const verified = await service.verifyForPin(SPEC_ID, {
-      semanticDocSeq: 3n,
-      acknowledgedQuestionIds: [],
-    });
-
-    expect(verified).toEqual({
-      ok: false,
-      retryable: true,
-      reason: "The document moved while the publish was pinning.",
-    });
-  });
-
-  test("verifyForPin refuses a section that left the gate, and names it", async () => {
-    const { service } = fixture({
-      states: new Map([
-        ["sec-req", { state: "settled", naReason: null }],
-        ["sec-data", { state: "proposed", naReason: null }],
-      ]),
-    });
-
-    const verified = await service.verifyForPin(SPEC_ID, {
-      semanticDocSeq: 4n,
-      acknowledgedQuestionIds: [],
-    });
-
-    expect(verified).toEqual({
-      ok: false,
-      retryable: false,
-      reason: "1 required sections are no longer settled: Data model.",
-    });
-  });
-
-  test("verifyForPin refuses when the open questions are not the acknowledged set", async () => {
-    const { service } = fixture({
-      questions: [{ id: "q-1", sectionId: "sec-data", text: "Who signs this off?" }],
-    });
-
-    const stale = await service.verifyForPin(SPEC_ID, {
-      semanticDocSeq: 4n,
-      acknowledgedQuestionIds: [],
-    });
-    expect(stale).toEqual({
-      ok: false,
-      retryable: false,
-      reason: "The open questions changed after the acknowledgment.",
-    });
-
-    const matched = await service.verifyForPin(SPEC_ID, {
-      semanticDocSeq: 4n,
-      acknowledgedQuestionIds: ["q-1"],
-    });
-    expect(matched.ok).toBe(true);
+    expect(again.created).toBe(true);
+    expect(store.record?.state).toBe("requested");
   });
 
   test("a published spec with no record refuses a second publish (R38)", async () => {
@@ -546,12 +404,12 @@ describe("publish gate service", () => {
     expect(error.code).toBe("no_session");
   });
 
-  test("an optional section never blocks, whatever its state", async () => {
+  test("status reports only the confirmation fields", async () => {
     const { service } = fixture();
 
     const status = await service.status(SPEC_ID, OWNER);
 
-    expect(status.gate.requiredCount).toBe(2);
-    expect(status.gate.ready).toBe(true);
+    expect(status.openQuestions).toEqual([]);
+    expect(status.canPublish).toBe(true);
   });
 });

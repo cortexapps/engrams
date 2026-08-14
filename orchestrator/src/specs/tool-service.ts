@@ -284,6 +284,7 @@ export class SpecToolService implements SpecToolDocumentService {
           sectionId: input.sectionId,
           requestFingerprint,
           chip: transcriptChip,
+          actorUserId: input.actorUserId ?? null,
           concurrentEditors,
         },
         (document, ydoc) => replaceSelectedRange(document, ydoc, input.selection, input.markdown),
@@ -458,6 +459,7 @@ export class SpecToolService implements SpecToolDocumentService {
       await this.options.questions.resolve({
         questionId: input.questionId,
         answerMarkdown: input.answerMarkdown,
+        resolvedBy: input.actorUserId ?? null,
         ...(input.expectedRev === undefined ? {} : { expectedDocSeq: input.expectedRev }),
       });
       const latest = await this.options.documents.syncFromLog(specId);

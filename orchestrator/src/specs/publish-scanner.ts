@@ -23,7 +23,7 @@ import type { Logger } from "pino";
 import type { SpecCheckpointRecord, SpecCheckpointStore } from "./checkpoints.ts";
 import type { SpecPublishState } from "../db/schema.ts";
 import type { SpecDocumentService } from "./doc-service.ts";
-import type { SpecPublishService, SpecPublishStore, SpecPublishWork } from "./publish.ts";
+import type { SpecPublishStore, SpecPublishWork } from "./publish.ts";
 
 /** The label the pinned checkpoint carries in the history rail (R13). */
 export const PUBLISHED_CHECKPOINT_LABEL = "Published version";
@@ -76,8 +76,6 @@ export interface SpecPublishTickDeps {
   store: SpecPublishStore;
   /** Compaction gives the content to pin, and the revision it covers. */
   documents: Pick<SpecDocumentService, "compact">;
-  /** The gate, re-checked for the revision this pin freezes. */
-  gate: Pick<SpecPublishService, "verifyForPin">;
   checkpointStore: Pick<SpecCheckpointStore, "readCheckpoint">;
   artifacts: SpecPublishArtifactPublisher;
   ticketize: SpecTicketizeHandoff;
@@ -93,7 +91,7 @@ export interface SpecPublishTickResult {
   pinned: number;
   artifactsPublished: number;
   completed: number;
-  /** Publishes the gate refused at pin time. Each one waits for a person. */
+  /** Publishes whose question acknowledgment changed before the pin. */
   blocked: number;
   failed: number;
 }
@@ -208,37 +206,15 @@ async function advance(
 }
 
 /**
- * Pin the checkpoint (R36), after the gate is re-checked for the exact revision
- * this pin freezes.
- *
- * The request-time gate is not enough on its own: the document stays editable
- * until this commit, and the spec is org-editable and live (ADR 0114 D12). So
- * the compaction fixes the content, `verifyForPin` re-checks the gate against
- * that revision, and the pin transaction re-checks it once more while it holds
- * the spec row — the same row every document, section-state and open-question
- * writer takes. Only then does anything become immutable.
+ * Pin the checkpoint. The transaction checks the compacted revision and the
+ * acknowledged open-question set while it holds the spec row. It does not
+ * inspect section state or run a gap check.
  */
 async function pinStep(
   deps: SpecPublishTickDeps,
   row: SpecPublishWork,
 ): Promise<SpecPublishState> {
   const compacted = await deps.documents.compact(row.specId);
-  const verified = await deps.gate.verifyForPin(row.specId, {
-    semanticDocSeq: compacted.coveredSemanticDocSeq,
-    acknowledgedQuestionIds: row.acknowledgedQuestionIds,
-  });
-  if (!verified.ok) {
-    // A document that merely moved is transient: recompact on the next claim.
-    if (verified.retryable) {
-      deps.log.info(
-        { specId: row.specId, reason: verified.reason },
-        "spec publish pin deferred; the document moved",
-      );
-      return "requested";
-    }
-    return blockPublish(deps, row, verified.reason);
-  }
-
   const outcome = await deps.store.pin({
     specId: row.specId,
     publishedBy: row.requestedBy,
@@ -254,7 +230,6 @@ async function pinStep(
       reason: PUBLISH_CHECKPOINT_REASON,
     },
     semanticDocSeq: compacted.coveredSemanticDocSeq,
-    requiredSectionIds: verified.requiredSectionIds,
     acknowledgedQuestionIds: row.acknowledgedQuestionIds,
   });
   switch (outcome.kind) {
@@ -266,7 +241,7 @@ async function pinStep(
         "spec publish pin deferred; the document moved during the pin",
       );
       return "requested";
-    case "gate_failed":
+    case "confirmation_failed":
       return blockPublish(deps, row, outcome.reason);
     case "not_requested":
       // Another driver already advanced this row. Its transaction is the truth.
@@ -282,7 +257,7 @@ async function blockPublish(
 ): Promise<SpecPublishState> {
   deps.log.warn(
     { specId: row.specId, reason },
-    "spec publish refused at the pin: the gate no longer holds",
+    "spec publish refused at the pin: open questions need a new acknowledgment",
   );
   const marked = await deps.store.markBlocked({
     specId: row.specId,

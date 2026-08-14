@@ -1,37 +1,28 @@
 /**
- * The publish gate and the publish record (ADR 0114 D10 and D12, R30, R34-R38).
+ * The publish confirmation and durable publish record (ADR 0114 D10 and D12).
  *
  * Publishing has one browser-facing step and three side-effectful ones. This
- * module owns the browser-facing step: it evaluates the gate, refuses a
- * publish that the gate blocks, and records the intent in one row. Every later
- * step belongs to the scanner in `publish-scanner.ts`, because the artifact leg
- * needs a live sandbox and the ticketize leg needs the session — neither may
- * ride on the lifetime of an HTTP request (ADR 0034).
+ * module owns the browser-facing confirmation and records the intent in one
+ * row. Every later step belongs to the scanner in `publish-scanner.ts`, because
+ * the artifact leg needs a live sandbox and the ticketize leg needs the session.
+ * Neither may ride on the lifetime of an HTTP request (ADR 0034).
  *
  * The row carries the checkpoint id and the artifact id, both minted with the
  * request. That is what makes the publish exactly-once however many times the
  * scanner drives it: the pin inserts one checkpoint at a known id, and the
  * artifact leg creates one artifact at a known id.
  *
- * v1 is owner-only (R37) and one-way (R38). There is no unpublish and no
- * revise: rework is a new spec, and the published spec stays readable.
+ * Publishing is owner-only and one-way. Open questions need an explicit
+ * acknowledgment, but document completeness and gap checks do not gate it.
  */
 
-import {
-  evaluatePublishGate,
-  type PublishGate,
-  type PublishGateQuestion,
-  type PublishGateSection,
-} from "@engrams/spec-document";
 import { randomUUID } from "node:crypto";
-import type { Node as ProseMirrorNode } from "prosemirror-model";
 import type { Pool } from "pg";
 
 import type { SpecPublishState } from "../db/schema.ts";
 import type { SpecRailMetadata, SpecRailStore } from "../routes/spec-rail.ts";
 import { proseMirrorDocument, type SpecDocumentService } from "./doc-service.ts";
-import { GapCheckError, readSections } from "./gap-check.ts";
-import type { GapCheckService } from "./gap-check.ts";
+import { readSections } from "./gap-check.ts";
 
 /** What the publish path needs to know about the spec row itself. */
 export interface SpecPublishTarget {
@@ -82,8 +73,7 @@ export interface SpecPublishStore {
    * statement re-reads `next_attempt_at` and finds nothing to claim.
    *
    * `specId` restricts the claim to one spec, so a push wake never consumes
-   * another spec's turn. A `blocked` row is never claimed: it waits for a
-   * person to settle the gate, not for the next tick.
+   * another spec's turn. A `blocked` row waits for a new acknowledgment.
    */
   claimDue(input: {
     now: Date;
@@ -93,22 +83,13 @@ export interface SpecPublishStore {
   }): Promise<SpecPublishWork[]>;
   /**
    * Insert the pinned checkpoint, flip the spec to published and advance the
-   * publish row — in ONE transaction that re-checks the gate while it holds the
-   * spec row.
-   *
-   * The gate is re-checked here and not only at request time because the
-   * document stays editable until this commit: the spec is org-editable and
-   * live, so a co-editor can unsettle a required section or open a question
-   * between the click and the pin. Publishing that would produce an immutable
-   * spec that never satisfied its own gate, and v1 has no way to correct it
-   * (R38). The check reads `spec_section_state` and `spec_open_question`, which
-   * every other writer reaches through the same spec-row lock, so there is no
-   * window left to lose.
+   * publish row in one transaction. The transaction confirms that no new open
+   * question appeared after the owner acknowledged the list.
    */
   pin(input: PinPublishInput): Promise<PinOutcome>;
   markArtifactPublished(input: { specId: string; version: number }): Promise<boolean>;
   markComplete(input: { specId: string; at: Date }): Promise<boolean>;
-  /** Terminal refusal: the gate no longer holds for the content to be pinned. */
+  /** Terminal refusal: the open-question acknowledgment is no longer current. */
   markBlocked(input: { specId: string; reason: string; at: Date }): Promise<boolean>;
   /** Re-arm a blocked publish after the owner asks again. */
   resetBlocked(input: {
@@ -135,49 +116,45 @@ export interface PinPublishInput {
     label: string;
     reason: string;
   };
-  /** The revision the gate was verified against. */
+  /** The revision the confirmation was made against. */
   semanticDocSeq: bigint;
-  /** Every required section, as the verified document defines them. */
-  requiredSectionIds: readonly string[];
-  /** The questions the owner acknowledged carrying into the tickets (R35). */
+  /** The questions the owner acknowledged carrying into the tickets. */
   acknowledgedQuestionIds: readonly string[];
 }
-
-export type VerifyForPinResult =
-  | { ok: true; requiredSectionIds: string[] }
-  /** `retryable` separates "the document moved" from "a person must act". */
-  | { ok: false; retryable: boolean; reason: string };
 
 export type PinOutcome =
   /** The pin committed: checkpoint, phase flip and publish row together. */
   | { kind: "pinned" }
   /** The document moved past the compaction. Recompact and try again. */
   | { kind: "stale_document"; currentSemanticDocSeq: bigint }
-  /** The gate no longer holds for this content. A person must settle it. */
-  | { kind: "gate_failed"; reason: string }
+  /** A new open question needs a fresh acknowledgment. */
+  | { kind: "confirmation_failed"; reason: string }
   /** Another driver already advanced this row. */
   | { kind: "not_requested" };
 
-/** Everything the browser needs to render the button and the dialog. */
+export interface SpecPublishOpenQuestion {
+  id: string;
+  sectionId: string;
+  sectionTitle: string;
+  text: string;
+}
+
+/** Everything the browser needs to render the button and confirmation. */
 export interface SpecPublishStatus {
   phase: "ideation" | "drafting" | "published";
-  gate: PublishGate;
-  gapCheck: { stale: boolean; runId: string | null; ranAt: Date | null; gates: boolean };
+  openQuestions: SpecPublishOpenQuestion[];
   publish: SpecPublishRecord | null;
-  /** True when the caller may publish this spec (R37). */
+  /** True when the caller may publish this spec. */
   canPublish: boolean;
-  publishedAt: Date | null;
 }
 
 export interface RequestPublishInput {
   specId: string;
   actorUserId: string;
-  /** A stable id, so a replayed request runs one gap check, not two. */
+  /** A stable id for this confirmation. */
   actionId: string;
-  /** The person acknowledged the open questions in full (R35). */
+  /** The person acknowledged the open questions in full. */
   acknowledgeOpenQuestions: boolean;
-  /** The person accepted running the gap check as part of the publish (R30). */
-  runGapCheck: boolean;
 }
 
 export interface RequestPublishResult {
@@ -195,12 +172,9 @@ export class SpecPublishError extends Error {
       | "no_session"
       | "ideation"
       | "already_published"
-      | "blocked"
-      | "acknowledgment_required"
-      | "gap_check_stale"
-      | "gap_check_failed",
+      | "acknowledgment_required",
     message: string,
-    /** The gate at refusal time, so the dialog can list what to fix. */
+    /** The confirmation state at refusal time, so the dialog can list questions. */
     readonly status?: SpecPublishStatus,
   ) {
     super(message);
@@ -212,7 +186,6 @@ export interface SpecPublishServiceOptions {
   store: SpecPublishStore;
   railStore: SpecRailStore;
   documents: Pick<SpecDocumentService, "syncFromLog">;
-  gapCheck: Pick<GapCheckService, "status" | "run">;
   now: () => Date;
   newId?: () => string;
 }
@@ -224,7 +197,7 @@ export class SpecPublishService {
     this.newId = options.newId ?? randomUUID;
   }
 
-  /** The gate as it stands, for one caller. Every org member may read it. */
+  /** The confirmation state for one caller. Every org member may read it. */
   async status(specId: string, actorUserId: string): Promise<SpecPublishStatus> {
     const target = await this.options.store.readTarget(specId);
     if (!target) {
@@ -234,13 +207,8 @@ export class SpecPublishService {
   }
 
   /**
-   * Record the publish intent, after the gate passes.
-   *
-   * This is the gate a person meets. It is not the last word: the document
-   * stays editable until the pin commits, so the pin re-checks the same gate
-   * against the revision it is about to freeze (`verifyForPin`). A blocked
-   * publish therefore never reaches the state machine, and a publish that the
-   * document walks out of never reaches an immutable version.
+   * Record the publish intent after the owner confirms the open questions.
+   * The scanner pins the document and completes the durable pipeline.
    */
   async requestPublish(input: RequestPublishInput): Promise<RequestPublishResult> {
     const target = await this.options.store.readTarget(input.specId);
@@ -256,8 +224,8 @@ export class SpecPublishService {
     }
 
     // A publish already recorded is the whole answer: the state machine owns
-    // the rest, and a second request must not pin a second version (R38). A
-    // blocked one is the exception — it pinned nothing, so it re-gates below.
+    // the rest, and a second request must not pin a second version. A blocked
+    // one is the exception because it pinned nothing.
     const existing = await this.options.store.readPublish(input.specId);
     if (existing && existing.state !== "blocked") {
       return {
@@ -288,59 +256,17 @@ export class SpecPublishService {
       );
     }
 
-    let status = await this.statusFor(target, input.actorUserId);
-    if (!status.gate.ready) {
-      throw new SpecPublishError(
-        "blocked",
-        `${status.gate.blockers.length} required sections are not settled.`,
-        status,
-      );
-    }
-    // R30: the gap check runs as part of the publish when it is stale for this
-    // drafting round. The dialog stays open through the run.
-    if (status.gate.gapCheckRunRequired) {
-      if (!input.runGapCheck) {
-        throw new SpecPublishError(
-          "gap_check_stale",
-          "The gap check has not run for this revision of the spec.",
-          status,
-        );
-      }
-      try {
-        await this.options.gapCheck.run({
-          specId: input.specId,
-          sessionId: target.sessionId,
-          requestFingerprint: `publish-gate:${input.actionId}`,
-          actorUserId: input.actorUserId,
-        });
-      } catch (error) {
-        // The pass could not read the document — most often a requirement
-        // ledger it cannot trace. Say so, rather than publish without the
-        // check or fail with a bare 500.
-        if (!(error instanceof GapCheckError)) throw error;
-        throw new SpecPublishError("gap_check_failed", error.message, status);
-      }
-      status = await this.statusFor(target, input.actorUserId);
-      // The pass can find nothing to change, but a person may have settled a
-      // section between the two reads, so the gate is re-checked, not assumed.
-      if (!status.gate.ready) {
-        throw new SpecPublishError(
-          "blocked",
-          `${status.gate.blockers.length} required sections are not settled.`,
-          status,
-        );
-      }
-    }
-    if (status.gate.acknowledgmentRequired && !input.acknowledgeOpenQuestions) {
+    const status = await this.statusFor(target, input.actorUserId);
+    if (status.openQuestions.length > 0 && !input.acknowledgeOpenQuestions) {
       throw new SpecPublishError(
         "acknowledgment_required",
-        `${status.gate.openQuestions.length} open questions need an acknowledgment.`,
+        `${status.openQuestions.length} open questions need an acknowledgment.`,
         status,
       );
     }
 
     const now = this.options.now();
-    const acknowledgedQuestionIds = status.gate.openQuestions.map((question) => question.id);
+    const acknowledgedQuestionIds = status.openQuestions.map((question) => question.id);
     if (existing) {
       // A blocked publish keeps its checkpoint and artifact ids, because it
       // created neither. Only the acknowledgment and the attempt state are new.
@@ -349,7 +275,7 @@ export class SpecPublishService {
         requestedBy: input.actorUserId,
         requestedAt: now,
         acknowledgedQuestionIds,
-        gapCheckRunId: status.gapCheck.runId,
+        gapCheckRunId: null,
       });
       const stored = await this.options.store.readPublish(input.specId);
       if (!stored) {
@@ -369,7 +295,7 @@ export class SpecPublishService {
       requestedAt: now,
       acknowledgedQuestionCount: acknowledgedQuestionIds.length,
       acknowledgedQuestionIds,
-      gapCheckRunId: status.gapCheck.runId,
+      gapCheckRunId: null,
       attempts: 0,
       nextAttemptAt: now,
       lastError: null,
@@ -384,102 +310,37 @@ export class SpecPublishService {
     };
   }
 
-  /**
-   * The gate, re-checked for the revision the pin is about to freeze.
-   *
-   * The scanner calls this after it compacts and before it writes anything. It
-   * refuses on three counts: the document moved past the compaction (transient
-   * — recompact and retry), a required section is no longer settled, or the
-   * open questions are not the ones the owner acknowledged. The last two are a
-   * person's decision, so they stop the publish instead of retrying it.
-   */
-  async verifyForPin(
-    specId: string,
-    input: { semanticDocSeq: bigint; acknowledgedQuestionIds: readonly string[] },
-  ): Promise<VerifyForPinResult> {
-    const metadata = await this.options.railStore.readMetadata(specId);
-    if (!metadata) {
-      return { ok: false, retryable: false, reason: `Spec ${specId} does not exist.` };
-    }
-    const loaded = await this.options.documents.syncFromLog(specId);
-    if (loaded.semanticDocSeq !== input.semanticDocSeq) {
-      return {
-        ok: false,
-        retryable: true,
-        reason: "The document moved while the publish was pinning.",
-      };
-    }
-    const sections = publishGateSections(proseMirrorDocument(loaded.doc), metadata);
-    const openQuestions = await this.openQuestions(specId, sections);
-    // The gap check is a request-time affordance (R30), not a pin condition:
-    // re-running it here would make a publish depend on a second analysis of a
-    // document nobody changed.
-    const gate = evaluatePublishGate({ sections, openQuestions, gapCheckStale: false });
-    if (!gate.ready) {
-      const named = gate.blockers.map((blocker) => blocker.sectionTitle).join(", ");
-      return {
-        ok: false,
-        retryable: false,
-        reason: `${gate.blockers.length} required sections are no longer settled: ${named}.`,
-      };
-    }
-    const acknowledged = [...input.acknowledgedQuestionIds].sort();
-    const open = openQuestions.map((question) => question.id).sort();
-    if (acknowledged.length !== open.length || open.some((id, index) => id !== acknowledged[index])) {
-      return {
-        ok: false,
-        retryable: false,
-        reason: "The open questions changed after the acknowledgment.",
-      };
-    }
-    return {
-      ok: true,
-      requiredSectionIds: sections.filter((section) => section.required).map((s) => s.id),
-    };
-  }
-
   private async statusFor(
     target: SpecPublishTarget,
     actorUserId: string,
   ): Promise<SpecPublishStatus> {
-    const metadata = await this.options.railStore.readMetadata(target.specId);
-    if (!metadata) {
-      throw new SpecPublishError("spec_not_found", `Spec ${target.specId} does not exist.`);
-    }
-    const loaded = await this.options.documents.syncFromLog(target.specId);
-    const sections = publishGateSections(proseMirrorDocument(loaded.doc), metadata);
-    const openQuestions = await this.openQuestions(target.specId, sections);
-    const gapCheck = await this.options.gapCheck.status(target.specId);
-    const gate = evaluatePublishGate({
-      sections,
-      openQuestions,
-      gapCheckStale: gapCheck.stale,
-    });
+    const openQuestions = await this.openQuestions(target.specId);
     const publish = await this.options.store.readPublish(target.specId);
     return {
       phase: target.phase,
-      gate,
-      gapCheck: {
-        stale: gapCheck.stale,
-        runId: gapCheck.run?.id ?? null,
-        ranAt: gapCheck.run?.createdAt ?? null,
-        gates: true,
-      },
+      openQuestions,
       publish,
       canPublish:
         target.ownerUserId === actorUserId &&
         target.phase === "drafting" &&
         (publish === null || publish.state === "blocked"),
-      publishedAt: target.publishedAt,
     };
   }
 
-  private async openQuestions(
-    specId: string,
-    sections: readonly PublishGateSection[],
-  ): Promise<PublishGateQuestion[]> {
+  private async openQuestions(specId: string): Promise<SpecPublishOpenQuestion[]> {
     const rows = await this.options.store.listOpenQuestions(specId);
-    const titles = new Map(sections.map((section) => [section.id, section.title]));
+    if (rows.length === 0) return [];
+    const metadata = await this.options.railStore.readMetadata(specId);
+    if (!metadata) {
+      throw new SpecPublishError("spec_not_found", `Spec ${specId} does not exist.`);
+    }
+    const loaded = await this.options.documents.syncFromLog(specId);
+    const titles = new Map(
+      readSections(proseMirrorDocument(loaded.doc), metadata).map((section) => [
+        section.id,
+        section.title,
+      ]),
+    );
     return rows.map((row) => ({
       id: row.id,
       sectionId: row.sectionId,
@@ -487,30 +348,6 @@ export class SpecPublishService {
       text: row.text,
     }));
   }
-}
-
-/**
- * Read the gate's view of the document. The section walk is the gap check's
- * (`readSections`), so both surfaces see one section list; the gate adds the
- * template's `required` flag and the recorded `n/a` reason.
- */
-export function publishGateSections(
-  document: ProseMirrorNode,
-  metadata: SpecRailMetadata,
-): PublishGateSection[] {
-  const rules = new Map(metadata.sections.map((section) => [section.key, section]));
-  return readSections(document, metadata).map((section) => {
-    const rule = rules.get(section.key);
-    if (!rule) throw new Error(`Spec section ${section.id} has no template rule.`);
-    return {
-      id: section.id,
-      title: section.title,
-      layerKey: section.layerKey,
-      required: rule.required,
-      state: section.state,
-      naReason: metadata.states.get(section.id)?.naReason ?? null,
-    };
-  });
 }
 
 interface SpecPublishTargetRow {
@@ -667,8 +504,8 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      // Every writer of the document, the section states and the open questions
-      // takes this row first, so holding it makes the checks below final.
+      // Every document and open-question writer takes this row first, so
+      // holding it makes the revision and acknowledgment checks final.
       const spec = await client.query<{ phase: string; current_semantic_doc_seq: string }>(
         `SELECT phase, current_semantic_doc_seq::text AS current_semantic_doc_seq
            FROM spec WHERE id = $1 FOR UPDATE`,
@@ -685,25 +522,6 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
         return { kind: "stale_document", currentSemanticDocSeq };
       }
 
-      const unsettled = await client.query<{ section_id: string }>(
-        `SELECT required.section_id
-           FROM unnest($2::text[]) AS required(section_id)
-           LEFT JOIN spec_section_state AS state
-             ON state.spec_id = $1 AND state.section_id = required.section_id
-          WHERE state.section_id IS NULL
-             OR NOT (
-                  state.state = 'settled'
-                  OR (state.state = 'n/a' AND btrim(coalesce(state.na_reason, '')) <> '')
-                )`,
-        [input.specId, [...input.requiredSectionIds]],
-      );
-      if (unsettled.rowCount !== 0) {
-        await client.query("ROLLBACK");
-        return {
-          kind: "gate_failed",
-          reason: `${unsettled.rowCount} required sections are no longer settled.`,
-        };
-      }
       const questions = await client.query<{ id: string }>(
         `SELECT id FROM spec_open_question
           WHERE spec_id = $1 AND state = 'open'
@@ -718,15 +536,14 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
       ) {
         await client.query("ROLLBACK");
         return {
-          kind: "gate_failed",
+          kind: "confirmation_failed",
           reason: "The open questions changed after the acknowledgment.",
         };
       }
 
-      // The checkpoint, the flip and the row advance commit together. A
-      // published spec therefore always has its pinned checkpoint, that
-      // checkpoint always holds the content the gate passed on, and the
-      // document store refuses every edit from here (R38).
+      // The checkpoint, the phase flip, and the row advance commit together.
+      // A published spec therefore always has its pinned checkpoint, and the
+      // document store refuses every later edit.
       await client.query(
         `INSERT INTO spec_checkpoint
            (id, spec_id, state, state_vector, rendered_markdown, doc_seq,

@@ -993,6 +993,7 @@ describe("SpecDocumentService with live Postgres", () => {
         sectionId: "context",
         requestFingerprint: "request-fingerprint",
         concurrentEditors: ["Sam"],
+        actorUserId: userId,
         chip: {
           kind: "spec_tracked_edit" as const,
           specId,
@@ -1023,11 +1024,13 @@ describe("SpecDocumentService with live Postgres", () => {
         updates: string;
         actions: string;
         stored_rev: string;
+        actor_user_id: string | null;
       }>(
         `SELECT s.current_doc_seq::text,
                 (SELECT count(*)::text FROM spec_update_log u WHERE u.spec_id = s.id) AS updates,
                 (SELECT count(*)::text FROM spec_transcript_action a WHERE a.spec_id = s.id) AS actions,
-                (SELECT a.result->>'newRev' FROM spec_transcript_action a WHERE a.id = $2) AS stored_rev
+                (SELECT a.result->>'newRev' FROM spec_transcript_action a WHERE a.id = $2) AS stored_rev,
+                (SELECT a.actor_user_id FROM spec_transcript_action a WHERE a.id = $2) AS actor_user_id
            FROM spec s
           WHERE s.id = $1`,
         [specId, action.id],
@@ -1037,6 +1040,7 @@ describe("SpecDocumentService with live Postgres", () => {
         updates: "2",
         actions: "1",
         stored_rev: "2",
+        actor_user_id: userId,
       });
 
       const replay = await documents.mutateDocumentWithTrackedEdit(
@@ -1643,8 +1647,10 @@ describe("SpecDocumentService with live Postgres", () => {
         state: string;
         action_id: string;
         section_id: string;
+        actor_user_id: string | null;
       }>(
-        `SELECT st.state, a.id AS action_id, a.chip->>'sectionId' AS section_id
+        `SELECT st.state, a.id AS action_id, a.chip->>'sectionId' AS section_id,
+                a.actor_user_id
            FROM spec_section_state st
            JOIN spec_transcript_action a
              ON a.spec_id = st.spec_id AND a.section_id = st.section_id
@@ -1655,6 +1661,7 @@ describe("SpecDocumentService with live Postgres", () => {
         state: "proposed",
         action_id: actionId,
         section_id: "context",
+        actor_user_id: userId,
       });
 
       const stateStore = new PostgresSectionStateStore(livePool);
@@ -1674,6 +1681,7 @@ describe("SpecDocumentService with live Postgres", () => {
         expected: current,
         next: settled.value,
         settledBy: userId,
+        actorUserId: userId,
         chip: settled.transcriptChip,
         at: new Date("2026-08-09T12:02:00.000Z"),
       });
