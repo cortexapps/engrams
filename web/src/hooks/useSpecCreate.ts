@@ -8,6 +8,11 @@ export interface CreateSpecInput {
   templateId: string;
   profileId: string;
   problemStatement: string;
+  harness?: string;
+  model?: string;
+  modelRouter?: string;
+  effort?: string;
+  harnessMode?: string;
   title?: string;
   /** The client's stable key for this create. The server derives the spec id
    *  from it, so a repeated send does not create a second spec. */

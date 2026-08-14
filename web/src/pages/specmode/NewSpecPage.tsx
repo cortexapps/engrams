@@ -1,15 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { Check, CheckCheck, Loader2 } from "lucide-react";
-
-import { Button } from "@/components/ui/button";
+import { Check } from "lucide-react";
 import { RadioGroup as RadioGroupPrimitive } from "radix-ui";
 
+import { TaskComposer, type TaskComposerState } from "@/components/composer/TaskComposer";
 import { RadioGroup } from "@/components/ui/radio-group";
 import { Text } from "@/components/ui/text";
-import { Textarea } from "@/components/ui/textarea";
-import type { Profile } from "@/gen/engram/app/v1/profile_pb";
-import { useProfiles } from "@/hooks/useProfiles";
 import { useCreateSpec } from "@/hooks/useSpecCreate";
 import { useSpecTemplates, type SpecTemplate } from "@/hooks/useSpecTemplates";
 import { TEMPLATE_LOCK_REASON } from "@/pages/specs/template-lock";
@@ -21,40 +17,45 @@ function defaultTemplateId(templates: readonly SpecTemplate[]): string {
 export function NewSpecPage() {
   const navigate = useNavigate();
   const templates = useSpecTemplates();
-  const profiles = useProfiles();
   const create = useCreateSpec();
 
-  const [prompt, setPrompt] = useState("");
   const [templateId, setTemplateId] = useState("");
-  const [profileId, setProfileId] = useState("");
-
+  const [composerState, setComposerState] = useState<TaskComposerState | null>(null);
   const templateList = useMemo(() => templates.data ?? [], [templates.data]);
-  const profileList = useMemo(() => profiles.data?.profiles ?? [], [profiles.data]);
-  const profile = profileList.find((candidate) => candidate.id === profileId);
 
   useEffect(() => {
     setTemplateId((current) => current || defaultTemplateId(templateList));
   }, [templateList]);
-  useEffect(() => {
-    setProfileId((current) => current || profileList[0]?.id || "");
-  }, [profileList]);
 
-  const signature = JSON.stringify([prompt, templateId, profileId]);
+  const signature = JSON.stringify([
+    composerState?.prompt ?? "",
+    templateId,
+    composerState?.profileId ?? "",
+    composerState?.harnessOverride.harness ?? null,
+    composerState?.harnessOverride.model ?? null,
+    composerState?.harnessOverride.modelRouter ?? null,
+    composerState?.harnessOverride.effort ?? null,
+    composerState?.harnessOverride.mode ?? null,
+  ]);
   const [idempotencyKey, setIdempotencyKey] = useState(() => crypto.randomUUID());
   useEffect(() => setIdempotencyKey(crypto.randomUUID()), [signature]);
 
-  const ready = prompt.trim().length > 0 && templateId !== "" && profileId !== "";
-
-  const submit = (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!ready || create.isPending) return;
-
+  const submit = (state: TaskComposerState) => {
+    if (!state.valid || !state.profileId || !templateId || create.isPending) return;
+    const { harnessOverride } = state;
     create.mutate(
       {
         templateId,
-        profileId,
-        problemStatement: prompt.trim(),
+        profileId: state.profileId,
+        problemStatement: state.prompt.trim(),
         idempotencyKey,
+        ...(harnessOverride.harness ? { harness: harnessOverride.harness } : {}),
+        ...(harnessOverride.model ? { model: harnessOverride.model } : {}),
+        ...(harnessOverride.modelRouter !== null
+          ? { modelRouter: harnessOverride.modelRouter }
+          : {}),
+        ...(harnessOverride.effort ? { effort: harnessOverride.effort } : {}),
+        ...(harnessOverride.mode ? { harnessMode: harnessOverride.mode } : {}),
       },
       {
         onSuccess: (spec) => {
@@ -66,11 +67,11 @@ export function NewSpecPage() {
 
   return (
     <main
-      className="fixed inset-0 overflow-y-auto bg-background px-5 py-12 sm:px-10 sm:py-16"
+      className="section-sheet flex-1 overflow-y-auto px-5 py-12 sm:px-10 sm:py-16"
       aria-labelledby="new-spec-title"
       data-testid="new-spec"
     >
-      <form className="mx-auto flex w-full max-w-[680px] flex-col gap-7" onSubmit={submit}>
+      <div className="mx-auto flex w-full max-w-[680px] flex-col gap-7">
         <header className="grid gap-3">
           <Text as="p" variant="label" tone="muted">
             New spec
@@ -83,34 +84,6 @@ export function NewSpecPage() {
             see is what I found — not a blank page.
           </Text>
         </header>
-
-        <section className="rounded-lg border bg-card p-[18px] shadow-xs">
-          <label className="sr-only" htmlFor="new-spec-prompt">
-            What is the spec about?
-          </label>
-          <Textarea
-            id="new-spec-prompt"
-            autoFocus
-            rows={3}
-            value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
-            placeholder="Per-org caps on sandbox creation, plus a meter we can bill against."
-            className="min-h-24 resize-none border-0 bg-transparent p-0 text-base shadow-none focus-visible:ring-0 dark:bg-transparent"
-          />
-          <div className="mt-4 flex min-h-8 flex-wrap items-center gap-2 border-t pt-4">
-            <span className="inline-flex min-w-0 items-center gap-1.5 rounded-md border bg-background px-2 py-1">
-              <CheckCheck aria-hidden="true" className="size-3.5 shrink-0" />
-              <Text as="span" variant="code" tone="muted" className="truncate text-xs">
-                {profileContext(profile)}
-              </Text>
-            </span>
-            {profile && profile.repos.length > 1 ? (
-              <Text as="span" variant="code" tone="muted" className="text-xs">
-                +{profile.repos.length - 1} more
-              </Text>
-            ) : null}
-          </div>
-        </section>
 
         <fieldset className="grid gap-3">
           <div className="flex items-baseline justify-between gap-4">
@@ -171,15 +144,16 @@ export function NewSpecPage() {
           )}
         </fieldset>
 
-        {profiles.error ? (
-          <Text role="alert" tone="destructive">
-            The profiles did not load. {profiles.error.message}
-          </Text>
-        ) : !profiles.isPending && profileList.length === 0 ? (
-          <Text role="alert" tone="destructive">
-            No active profile is available. Add a profile before you start a spec.
-          </Text>
-        ) : null}
+        <TaskComposer
+          submitLabel="Start"
+          pendingLabel="Starting…"
+          pending={create.isPending}
+          disabled={!templateId}
+          ariaLabel="What is the spec about?"
+          placeholder="Per-org caps on sandbox creation, plus a meter we can bill against."
+          onStateChange={setComposerState}
+          onSubmit={submit}
+        />
 
         {create.error ? (
           <Text role="alert" tone="destructive">
@@ -187,28 +161,10 @@ export function NewSpecPage() {
           </Text>
         ) : null}
 
-        <footer className="flex flex-wrap items-center gap-4">
-          <Button type="submit" disabled={!ready || create.isPending}>
-            {create.isPending ? <Loader2 aria-hidden="true" className="animate-spin" /> : null}
-            Start
-          </Button>
-          <Text variant="code" tone="muted" className="text-xs">
-            Recon takes about 40 seconds
-          </Text>
-        </footer>
-      </form>
+        <Text variant="code" tone="muted" className="text-xs">
+          Recon takes about 40 seconds
+        </Text>
+      </div>
     </main>
   );
-}
-
-function profileContext(profile: Pick<Profile, "name" | "repos"> | undefined): string {
-  const repo = profile?.repos[0];
-  if (repo?.remote?.owner && repo.remote.name) {
-    return `${repo.remote.owner}/${repo.remote.name}`;
-  }
-  if (repo?.path) {
-    const name = repo.path.replace(/[/]$/, "").split("/").at(-1);
-    if (name) return name;
-  }
-  return profile?.name ?? "Profile";
 }

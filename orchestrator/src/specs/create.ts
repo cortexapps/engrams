@@ -32,9 +32,9 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { createTemplateDocument } from "@engrams/spec-document";
 import { eq } from "drizzle-orm";
 
-import { spec } from "../db/schema.ts";
+import { spec, task, taskSession } from "../db/schema.ts";
 import { log as rootLog } from "../log.ts";
-import { truncatePrompt, type Db } from "../rpc/task-create.ts";
+import { truncatePrompt, type CreateTaskParams, type Db } from "../rpc/task-create.ts";
 import { encodeProseMirrorDocument, type SpecDocumentService } from "./doc-service.ts";
 import type { SpecTemplateCatalog, SpecTemplateSnapshot } from "./template-catalog.ts";
 
@@ -46,6 +46,7 @@ export const UNTITLED_SPEC = "Untitled spec";
 /** The row that a create reserves before the session boots. */
 export interface ReservedSpecRow {
   id: string;
+  requestHash: string;
   orgId: string;
   ownerUserId: string;
   sessionId: string;
@@ -60,6 +61,7 @@ export interface ExistingSpecRow {
   sessionId: string | null;
   templateId: string;
   title: string;
+  requestHash?: string;
 }
 
 export interface SpecCreateStore {
@@ -80,6 +82,12 @@ export interface SpecSessionInput {
    *  harness token (ADR 0063 B4). */
   ownerIsServiceAccount?: boolean;
   profileId: string;
+  harness?: string;
+  model?: string;
+  modelRouter?: string;
+  effort?: string;
+  harnessMode?: string;
+  requestHash: string;
   title: string;
   prompt: string;
   specTemplate: SpecTemplateSnapshot;
@@ -101,6 +109,11 @@ export interface CreateSpecRequest {
   /** The client's stable key for this create. It derives every reserved id. */
   idempotencyKey: string;
   profileId: string;
+  harness?: string;
+  model?: string;
+  modelRouter?: string;
+  effort?: string;
+  harnessMode?: string;
   templateId: string;
   problemStatement: string;
   title?: string;
@@ -136,12 +149,14 @@ export async function createSpec(
   }
 
   const title = specTitle(request.title, request.problemStatement);
+  const requestHash = specCreateRequestHash(request);
   const specId = derivedUuid("spec", request.orgId, request.idempotencyKey);
   const taskId = derivedUuid("spec-task", request.orgId, request.idempotencyKey);
   const sessionId = derivedUuid("spec-session", request.orgId, request.idempotencyKey);
 
   const reserved = await deps.store.insertIfAbsent({
     id: specId,
+    requestHash,
     orgId: request.orgId,
     ownerUserId: request.ownerUserId,
     sessionId,
@@ -149,7 +164,7 @@ export async function createSpec(
     title,
   });
   if (!reserved) {
-    return replayed(deps, specId, request, snapshot.templateId, title);
+    return replayed(deps, specId, request, snapshot.templateId, title, requestHash);
   }
 
   try {
@@ -160,6 +175,12 @@ export async function createSpec(
       ownerUserId: request.ownerUserId,
       ...(request.ownerIsServiceAccount ? { ownerIsServiceAccount: true } : {}),
       profileId: request.profileId,
+      ...(request.harness !== undefined ? { harness: request.harness } : {}),
+      ...(request.model !== undefined ? { model: request.model } : {}),
+      ...(request.modelRouter !== undefined ? { modelRouter: request.modelRouter } : {}),
+      ...(request.effort !== undefined ? { effort: request.effort } : {}),
+      ...(request.harnessMode !== undefined ? { harnessMode: request.harnessMode } : {}),
+      requestHash,
       title,
       prompt: request.problemStatement,
       specTemplate: snapshot,
@@ -186,12 +207,14 @@ async function replayed(
   request: CreateSpecRequest,
   templateId: string,
   title: string,
+  requestHash: string,
 ): Promise<CreateSpecResult> {
   const existing = await deps.store.read(specId);
   if (!existing) {
     throw new ConnectError("the reserved spec disappeared during creation", Code.Aborted);
   }
   if (
+    (existing.requestHash !== undefined && existing.requestHash !== requestHash) ||
     existing.ownerUserId !== request.ownerUserId ||
     existing.templateId !== templateId ||
     existing.title !== title
@@ -211,6 +234,12 @@ async function replayed(
     templateId: existing.templateId,
     created: false,
   };
+}
+
+function requestHashFromSource(source: unknown): string | undefined {
+  if (typeof source !== "object" || source === null || Array.isArray(source)) return undefined;
+  const requestHash = (source as Record<string, unknown>)["specCreateRequestHash"];
+  return typeof requestHash === "string" ? requestHash : undefined;
 }
 
 async function releaseReservation(deps: SpecCreationDeps, specId: string): Promise<void> {
@@ -250,6 +279,45 @@ function specTitle(title: string | undefined, problemStatement: string): string 
   return given ?? truncatePrompt(problemStatement) ?? UNTITLED_SPEC;
 }
 
+function specCreateRequestHash(request: CreateSpecRequest): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        orgId: request.orgId,
+        ownerUserId: request.ownerUserId,
+        ownerIsServiceAccount: request.ownerIsServiceAccount ?? false,
+        profileId: request.profileId,
+        templateId: request.templateId,
+        problemStatement: request.problemStatement,
+        title: request.title ?? null,
+        harness: request.harness ?? null,
+        model: request.model ?? null,
+        modelRouter: request.modelRouter ?? null,
+        effort: request.effort ?? null,
+        harnessMode: request.harnessMode ?? null,
+      }),
+    )
+    .digest("hex");
+}
+
+export function specCreateTaskParams(input: SpecSessionInput): CreateTaskParams {
+  return {
+    type: "spec",
+    ownerUserId: input.ownerUserId,
+    ...(input.ownerIsServiceAccount ? { ownerIsServiceAccount: true } : {}),
+    profileId: input.profileId,
+    ...(input.harness !== undefined ? { harness: input.harness } : {}),
+    ...(input.model !== undefined ? { model: input.model } : {}),
+    ...(input.modelRouter !== undefined ? { modelRouter: input.modelRouter } : {}),
+    ...(input.effort !== undefined ? { effort: input.effort } : {}),
+    ...(input.harnessMode !== undefined ? { harnessMode: input.harnessMode } : {}),
+    title: input.title,
+    prompt: input.prompt,
+    specTemplate: input.specTemplate,
+    source: { specCreateRequestHash: input.requestHash },
+  };
+}
+
 /**
  * A version-5-shaped UUID over the given parts.
  *
@@ -277,7 +345,15 @@ export function makeSpecCreateStore(db: Db): SpecCreateStore {
     async insertIfAbsent(row) {
       const inserted = await db
         .insert(spec)
-        .values({ ...row, phase: "ideation" })
+        .values({
+          id: row.id,
+          orgId: row.orgId,
+          ownerUserId: row.ownerUserId,
+          sessionId: row.sessionId,
+          templateId: row.templateId,
+          title: row.title,
+          phase: "ideation",
+        })
         .onConflictDoNothing()
         .returning({ id: spec.id });
       return inserted.length === 1;
@@ -291,11 +367,15 @@ export function makeSpecCreateStore(db: Db): SpecCreateStore {
           sessionId: spec.sessionId,
           templateId: spec.templateId,
           title: spec.title,
+          source: task.source,
         })
         .from(spec)
+        .leftJoin(taskSession, eq(taskSession.sessionId, spec.sessionId))
+        .leftJoin(task, eq(task.id, taskSession.taskId))
         .where(eq(spec.id, specId))
         .limit(1);
-      return rows[0] ?? null;
+      const row = rows[0];
+      return row ? { ...row, requestHash: requestHashFromSource(row.source) } : null;
     },
 
     async delete(specId) {

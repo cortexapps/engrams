@@ -23,6 +23,7 @@ const SPEC_CHECKPOINT_LIST_LIMIT = 100;
 const SPEC_TITLE_MAX_CHARS = 200;
 const SPEC_PROBLEM_MAX_CHARS = 20_000;
 const IDEMPOTENCY_KEY_MAX_CHARS = 200;
+const SESSION_OVERRIDE_MAX_CHARS = 500;
 
 export interface SpecReadRecord {
   id: string;
@@ -323,6 +324,11 @@ function createSpecInput(body: unknown): CreateSpecInput {
     throw new HTTPException(400, { message: "body must be an object" });
   }
   const input = body as Record<string, unknown>;
+  const harness = optionalOverride(input["harness"], "harness");
+  const model = optionalOverride(input["model"], "model");
+  const modelRouter = optionalOverride(input["modelRouter"], "modelRouter", true);
+  const effort = optionalOverride(input["effort"], "effort");
+  const harnessMode = optionalOverride(input["harnessMode"], "harnessMode");
   const title = input["title"];
   if (title !== undefined && (typeof title !== "string" || title.length > SPEC_TITLE_MAX_CHARS)) {
     throw new HTTPException(400, {
@@ -332,6 +338,11 @@ function createSpecInput(body: unknown): CreateSpecInput {
   return {
     templateId: uuidField(input["templateId"], "templateId"),
     profileId: uuidField(input["profileId"], "profileId"),
+    ...(harness !== undefined ? { harness } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(modelRouter !== undefined ? { modelRouter } : {}),
+    ...(effort !== undefined ? { effort } : {}),
+    ...(harnessMode !== undefined ? { harnessMode } : {}),
     problemStatement: problemStatement(input["problemStatement"]),
     idempotencyKey: idempotencyKey(input["idempotencyKey"]),
     ...(title === undefined ? {} : { title }),
@@ -361,6 +372,24 @@ function idempotencyKey(value: unknown): string {
   if (typeof value !== "string" || value === "" || value.length > IDEMPOTENCY_KEY_MAX_CHARS) {
     throw new HTTPException(400, {
       message: `idempotencyKey must be text of at most ${IDEMPOTENCY_KEY_MAX_CHARS} characters`,
+    });
+  }
+  return value;
+}
+
+function optionalOverride(
+  value: unknown,
+  field: string,
+  allowEmpty = false,
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (
+    typeof value !== "string" ||
+    (!allowEmpty && value === "") ||
+    value.length > SESSION_OVERRIDE_MAX_CHARS
+  ) {
+    throw new HTTPException(400, {
+      message: field + " must be text of at most " + SESSION_OVERRIDE_MAX_CHARS + " characters",
     });
   }
   return value;

@@ -110,16 +110,19 @@ test("routes an admin to the Templates catalog", async () => {
   await screen.findByTestId("spec-templates");
 });
 
-test("renders a spec in its chromeless full-window route", async () => {
+test("renders a spec inside the app chrome", async () => {
+  // The document surface used to render chromeless behind its own narrow
+  // spine. The spine carried half the destinations the sidebar does, so a
+  // person lost navigation to read a spec.
   render(<RouterProvider router={makeTestRouter(AUTH, "/specs/spec-1")} />);
   await screen.findByTestId("spec-shell");
-  expect(screen.queryByTestId("app-sidebar")).toBeNull();
+  expect(screen.getByTestId("app-sidebar")).toBeTruthy();
 });
 
-test("renders new-spec creation outside the app chrome", async () => {
+test("renders new-spec creation inside the app chrome", async () => {
   render(<RouterProvider router={makeTestRouter(AUTH, "/specs/new")} />);
   await screen.findByTestId("new-spec");
-  expect(screen.queryByTestId("app-sidebar")).toBeNull();
+  expect(screen.getByTestId("app-sidebar")).toBeTruthy();
 });
 
 test.each(["/specs/spec-1", "/specs/new"])("requires auth for %s", async (path) => {

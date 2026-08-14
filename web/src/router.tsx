@@ -309,18 +309,20 @@ const specTemplatesRoute = createRoute({
   path: "templates",
   component: SpecTemplates,
 });
-// Spec mode owns the full window. These routes are authenticated siblings of
-// the app shell, so its spine and document frame never sit inside app chrome.
+// Both spec pages keep the app sidebar. The document surface used to render
+// chromeless behind its own narrow spine, but that spine was a lossy copy of
+// the sidebar — it carried three destinations where the sidebar carries six,
+// and it would have drifted further with every entry the real one gained. A
+// person who wants the document at full width collapses the sidebar, which is
+// a control the app already has.
 const specDetailRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appLayoutRoute,
   path: "/specs/$specId",
-  beforeLoad: requireAuth,
   component: SpecShellPage,
 });
 const newSpecRoute = createRoute({
-  getParentRoute: () => rootRoute,
+  getParentRoute: () => appLayoutRoute,
   path: "/specs/new",
-  beforeLoad: requireAuth,
   component: NewSpecPage,
 });
 
@@ -473,13 +475,12 @@ export const routeTree = rootRoute.addChildren([
   loginRoute,
   // Standalone artifact view — authenticated but chromeless (popout).
   artifactViewRoute,
-  // Spec mode — authenticated, chromeless, and responsible for its own frame.
-  specDetailRoute,
-  newSpecRoute,
   // Authenticated app shell — all authenticated routes nested here
   appLayoutRoute.addChildren([
     indexRoute,
     deviceAuthRoute,
+    newSpecRoute,
+    specDetailRoute,
     sessionsLayoutRoute.addChildren([
       startScreenRoute,
       mySessionsRoute,
