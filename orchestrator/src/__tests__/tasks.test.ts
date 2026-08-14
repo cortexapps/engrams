@@ -2142,9 +2142,9 @@ describe("TaskService — principal-authoritative harness credentials (ADR 0053/
       const json = fakeSessions.createReqs[0]?.integrationPolicyJson;
       expect(json).toBeDefined();
       const policy = JSON.parse(json!);
-      // ADR 0058: the datadog connector (pup) injects BOTH DD-API-KEY and
-      // DD-APPLICATION-KEY. `slos:read` is a single GET op, so it compiles to
-      // exactly those two injects, gated to the SLO path; no asset → no observe.
+      // ADR 0058: the Datadog connector renders the same two stored keys under
+      // REST header names on the API host and MCP header names on the MCP host.
+      // `slos:read` gates every alias to the SLO path; no asset → no observe.
       expect(policy.injects).toEqual([
         {
           hosts: ["api.datadoghq.com"],
@@ -2160,6 +2160,28 @@ describe("TaskService — principal-authoritative harness credentials (ADR 0053/
         {
           hosts: ["api.datadoghq.com"],
           header_name: "DD-APPLICATION-KEY",
+          header_template: "{}",
+          secret_ref: "datadog-app-key",
+          mint_source: null,
+          methods: ["GET"],
+          path_globs: ["/api/v1/slo*"],
+          graphql_operation: "",
+          graphql_field: "",
+        },
+        {
+          hosts: ["mcp.datadoghq.com"],
+          header_name: "DD_API_KEY",
+          header_template: "{}",
+          secret_ref: "datadog-api-key",
+          mint_source: null,
+          methods: ["GET"],
+          path_globs: ["/api/v1/slo*"],
+          graphql_operation: "",
+          graphql_field: "",
+        },
+        {
+          hosts: ["mcp.datadoghq.com"],
+          header_name: "DD_APPLICATION_KEY",
           header_template: "{}",
           secret_ref: "datadog-app-key",
           mint_source: null,

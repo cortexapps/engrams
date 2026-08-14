@@ -95,7 +95,7 @@ impl CloudSqlEndpointFactory {
             // The sqladmin calls get their own bounded client so one stuck
             // request cannot wedge an endpoint build past the pool's
             // stale-serve window.
-            http: reqwest::Client::builder()
+            http: engram_tls::client_builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .expect("the sqladmin client builds from static settings"),

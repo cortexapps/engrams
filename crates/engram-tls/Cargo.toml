@@ -1,0 +1,24 @@
+[package]
+name = "engram-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The workspace's rustls CryptoProvider seam: installs ring and owns reqwest client construction."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The provider itself. The workspace pins rustls to `ring` and compiles no
+# other provider (see the root manifest), so the install below is
+# unambiguous by construction.
+rustls.workspace = true
+# This crate owns `Client` construction for the whole workspace, so it is
+# the one place reqwest is a direct dependency for that purpose.
+reqwest.workspace = true
+tracing.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

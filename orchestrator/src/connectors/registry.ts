@@ -46,6 +46,10 @@ export interface InjectHeader {
   header: string;
   secretRef?: string;
   template?: string;
+  /** Optional subset of the connector hosts that receive this header. This is
+   * needed when one provider uses different auth header spellings on separate
+   * first-party surfaces (Datadog REST versus Datadog MCP). */
+  hosts?: string[];
 }
 /** ADR 0058: a connector may inject ONE OR MORE headers. Most need one (e.g.
  * Datadog's `DD-API-KEY`); some need several (Datadog `pup` needs `DD-API-KEY`
@@ -1187,10 +1191,19 @@ export function parseConnector(raw: unknown, where: string): Connector {
         if (/[\r\n]/.test(inj.template)) fail(iw, '"template" must not contain newlines');
         if (!inj.template.includes("{}")) fail(iw, '"template" must contain the "{}" value placeholder');
       }
+      let injectHosts: string[] | undefined;
+      if (inj.hosts !== undefined) {
+        injectHosts = asStringArray(iw, "hosts", inj.hosts);
+        if (injectHosts.length === 0) fail(iw, '"hosts" must not be empty when present');
+        for (const host of injectHosts) {
+          assertHost(iw, host);
+        }
+      }
       return {
         header: inj.header,
         ...(typeof inj.secretRef === "string" ? { secretRef: inj.secretRef } : {}),
         ...(typeof inj.template === "string" ? { template: inj.template } : {}),
+        ...(injectHosts ? { hosts: injectHosts } : {}),
       };
     });
     credential = { source: "inject", injects };
@@ -1207,6 +1220,18 @@ export function parseConnector(raw: unknown, where: string): Connector {
   const hosts = asStringArray(where, "hosts", o.hosts);
   if (hosts.length > MAX_HOSTS) fail(where, `"hosts" has ${hosts.length} entries (max ${MAX_HOSTS})`);
   for (const h of hosts) assertHost(where, h);
+  if (credential.source === "inject") {
+    for (const [index, inj] of credential.injects.entries()) {
+      for (const host of inj.hosts ?? []) {
+        if (!hosts.includes(host)) {
+          fail(
+            `${where} credential.injects[${index}]`,
+            `"hosts" entry "${host}" must also appear in the connector's top-level hosts`,
+          );
+        }
+      }
+    }
+  }
 
   if (!Array.isArray(o.operations)) fail(where, '"operations" must be an array');
   if (o.operations.length > MAX_OPERATIONS) fail(where, `"operations" has ${o.operations.length} entries (max ${MAX_OPERATIONS})`);
@@ -1752,7 +1777,7 @@ export function compileIntegrationPolicy(
         // proxy's refresh rail keeps it fresh (ADR 0106 addendum).
         for (const inj of connector.credential.injects) {
           const entry: IntegrationInjectJson = {
-            hosts: connector.hosts,
+            hosts: inj.hosts ?? connector.hosts,
             header_name: inj.header,
             header_template: inj.template ?? "{}",
             secret_ref: userScoped ? "" : (inj.secretRef ?? ""),

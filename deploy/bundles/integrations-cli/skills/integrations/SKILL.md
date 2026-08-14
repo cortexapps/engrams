@@ -1,14 +1,14 @@
 ---
 name: integrations
-description: Third-party integration CLIs (e.g. gh for GitHub, glab for GitLab, stripe for Stripe, pup for Datadog, linear for Linear, slack for Slack, gcloud for Google Cloud) are available in this session, authenticated automatically by the engrams platform. Use when you need to interact with a connected service from the command line. Run `engrams-integrations` to see which are enabled and how to use each.
+description: Third-party integration CLIs (e.g. gh for GitHub, glab for GitLab, stripe for Stripe, pup and datadog for Datadog, linear for Linear, slack for Slack, gcloud for Google Cloud) are available in this session, authenticated automatically by the engrams platform. Use when you need to interact with a connected service from the command line. Run `engrams-integrations` to see which are enabled and how to use each.
 ---
 
 # Integration CLIs
 
 This session has command-line tools for the third-party services your profile
 connected — for example `gh` (GitHub), `glab` (GitLab), `stripe` (Stripe),
-`pup` (Datadog), `linear` (Linear), `slack` (Slack), and `gcloud` (Google
-Cloud). **You never
+`pup` and `datadog` (Datadog), `linear` (Linear), `slack` (Slack), and
+`gcloud` (Google Cloud). **You never
 handle real credentials**: each tool carries a harmless placeholder token, and the
 engrams egress proxy injects the real, capability-scoped credential on the wire.
 Do not paste, export, or `login` with real API tokens — it's already wired.

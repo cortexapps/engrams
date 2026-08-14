@@ -59,7 +59,7 @@ impl HttpCoordClient {
     /// `reqwest` builder downstream will reject it with a clear
     /// "builder error for url" at the first send.
     pub fn new(coord_url: String, auth_token: Option<String>) -> Self {
-        let http = reqwest::Client::builder()
+        let http = engram_tls::client_builder()
             // ADR 0016 §A.1.3: 10s pool-idle timeout (was 90s).
             //
             // Why tighten it. The coord LB front-end IP (10.10.0.2) is

@@ -62,47 +62,47 @@ pub fn router(state: SharedState) -> Router {
     let internal = Router::new()
         // ADR 0045 Phase F: freeze / unfreeze a microVM in place.
         // In prod: ENGRAM_AUTH_TOKENS must include the orchestrator's bearer.
-        .route("/admin/sessions/:id/pause", post(admin::pause_session))
-        .route("/admin/sessions/:id/resume", post(admin::resume_session))
+        .route("/admin/sessions/{id}/pause", post(admin::pause_session))
+        .route("/admin/sessions/{id}/resume", post(admin::resume_session))
         .route("/hosts/register", post(host_http::register))
-        .route("/hosts/:id/heartbeat", post(host_http::heartbeat))
+        .route("/hosts/{id}/heartbeat", post(host_http::heartbeat))
         // ADR 0116 A-D2: the host's SIGTERM-ladder handoff belt (the
         // operator's authoritative declaration rides app-gRPC instead).
-        .route("/hosts/:id/handoff", post(host_http::handoff))
+        .route("/hosts/{id}/handoff", post(host_http::handoff))
         .route("/hosts/forge", post(forge::forge_forward))
         .route("/hosts/upload", post(upload::upload_forward))
         .route(
-            "/hosts/:id/auth/resolve-registry",
+            "/hosts/{id}/auth/resolve-registry",
             post(host_http::resolve_registry_auth),
         )
         .route(
-            "/hosts/:id/capture-jobs/:job_id/claim",
+            "/hosts/{id}/capture-jobs/{job_id}/claim",
             post(host_http::claim_capture_job),
         )
         .route(
-            "/hosts/:id/sessions/:session_id/sandboxes/:sandbox_id/ownership",
+            "/hosts/{id}/sessions/{session_id}/sandboxes/{sandbox_id}/ownership",
             get(host_http::sandbox_ownership),
         )
         // ADR 0090: the unknown-binding form (teardown reconciler).
         .route(
-            "/hosts/:id/sandboxes/:sandbox_id/owner",
+            "/hosts/{id}/sandboxes/{sandbox_id}/owner",
             get(host_http::sandbox_owner),
         )
         .route(
-            "/hosts/:id/live-manifest",
+            "/hosts/{id}/live-manifest",
             post(host_http::live_manifest_publish),
         )
         // WS4: the egress proxy re-mints a near-expiry inject credential.
         .route(
-            "/hosts/:id/sessions/:session_id/inject/refresh",
+            "/hosts/{id}/sessions/{session_id}/inject/refresh",
             post(host_http::refresh_inject),
         )
         .route(
-            "/sessions/:id/harness-events",
+            "/sessions/{id}/harness-events",
             post(host_http::harness_event_ingest),
         )
         .route(
-            "/sessions/:id/integration-asset",
+            "/sessions/{id}/integration-asset",
             post(host_http::integration_asset_ingest),
         )
         .layer(middleware::from_fn_with_state(
@@ -115,9 +115,9 @@ pub fn router(state: SharedState) -> Router {
     // bearer), so these live OUTSIDE the `internal` bearer layer — the
     // in-guest helper holds only its session-scoped token.
     let forge_seam = Router::new()
-        .route("/sessions/:id/git-credential", get(forge::git_credential))
+        .route("/sessions/{id}/git-credential", get(forge::git_credential))
         .route(
-            "/sessions/:id/credential-control",
+            "/sessions/{id}/credential-control",
             post(forge::credential_control),
         );
 

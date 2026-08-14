@@ -530,23 +530,18 @@ impl HostAgent {
             // drives every destroy as a best-effort RPC; when that RPC
             // fails (transient gRPC) the FC leaks, and nothing reaps it
             // (ADR 0009 reconcile only sweeps session→sandbox-missing).
-            // This generalizes the migration source-ownership rule
-            // (ADR 0045 C1) to ALL sandboxes: each tick, for every
-            // non-migration sandbox, ask the coord whether its session
-            // still owns it; once the answer has been "no" for
-            // ORPHAN_STRIKES consecutive ticks (debounce vs an in-flight
-            // create's not-yet-published binding + a transient coord
-            // outage), destroy it LOCALLY — a destroy that can't be
-            // defeated by the same coord→host gRPC flakiness that leaked
-            // it. `sandbox_ownership` reads `sessions.sandbox_id` (PG,
-            // ADR 0047's sole authority), so a terminal/idle/rebound
-            // session reliably answers "not owned".
+            // ADR 0116 A5: only the UNBOUND arm asks the coordinator
+            // ("does ANY session own this?") — a locally BOUND sandbox
+            // is owned until its tombstone arrives on the heartbeat (the
+            // polling bound arm + the ORPHAN_STRIKES verdict counter are
+            // retired). A coordinator-confirmed no-owner answer destroys
+            // locally once the create→bind age grace clears.
             {
                 // ADR 0098 P3: the tick body is now
                 // `teardown_reconcile::reconcile_once` (pure classify +
                 // focused backend seam, driven directly by the host-internal
                 // simulator). This wrapper keeps only the interval cadence +
-                // the caller-owned strike ledger; `reconcile_once` returns
+                // the caller-owned first-seen ledger; `reconcile_once` returns
                 // `Err` only when `list()` fails, which we log + skip exactly
                 // as the old inline `continue` did.
                 let reap_backend = Arc::new(teardown_reconcile::PooledReconcileBackend::new(
@@ -561,17 +556,22 @@ impl HostAgent {
                 let host_id_for_reap = host_id;
                 tokio::spawn(async move {
                     use crate::teardown_reconcile::{reconcile_once, RECONCILE_INTERVAL};
-                    let mut strikes: std::collections::HashMap<SandboxId, u32> =
+                    let mut first_seen: std::collections::HashMap<SandboxId, std::time::Duration> =
                         std::collections::HashMap::new();
                     let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    // The age gate's monotonic origin. The sim passes its
+                    // own mark at the reconcile_once seam; this wrapper is
+                    // prod-only.
+                    let epoch = crate::time_source::metrics_now();
                     loop {
                         tick.tick().await;
                         if let Err(e) = reconcile_once(
                             &*reap_backend,
                             &*coord_for_reap,
                             host_id_for_reap,
-                            &mut strikes,
+                            &mut first_seen,
+                            crate::time_source::metrics_now().duration_since(epoch),
                         )
                         .await
                         {

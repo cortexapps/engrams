@@ -337,6 +337,13 @@ pub async fn host_lost_straggler_sweep(
 /// Errors degrade to "advertise nothing this tick" — the next
 /// heartbeat retries; a tombstone is durable precisely so delivery can
 /// be lazy.
+/// ADR 0116 A5: how long a running-but-unbound sandbox must stay
+/// unbound before it is entombed as a lost-destroy leftover. Two
+/// heartbeat-ish windows clears the create→bind gap (the binding is
+/// written when the host's create returns; a boot never takes this
+/// long to bind).
+pub const UNBOUND_ENTOMB_GRACE_SECS: u64 = 30;
+
 pub async fn process_sandbox_tombstones(
     meta: &Arc<dyn MetadataStore>,
     host_id: HostId,
@@ -344,6 +351,24 @@ pub async fn process_sandbox_tombstones(
     running_known: bool,
 ) -> Vec<engram_core::SandboxId> {
     if running_known {
+        // ADR 0116 A5: the lost-destroy leftover channel — a sandbox
+        // the host affirms running that no session binds, stably past
+        // the create→bind grace, is entombed (both facts explicit; no
+        // liveness inference).
+        match meta
+            .entomb_stably_unbound(host_id, running, UNBOUND_ENTOMB_GRACE_SECS)
+            .await
+        {
+            Ok(entombed) if !entombed.is_empty() => {
+                tracing::warn!(host_id = %host_id, count = entombed.len(),
+                    "entombed stably-unbound running sandboxes (lost-destroy leftovers)");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(host_id = %host_id, error = %e,
+                    "unbound-sighting sweep failed; retrying next heartbeat");
+            }
+        }
         match meta
             .ack_sandbox_tombstones_by_absence(host_id, running)
             .await

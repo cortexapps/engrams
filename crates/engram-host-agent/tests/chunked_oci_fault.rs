@@ -136,7 +136,7 @@ async fn spawn_fake_registry(
     };
     let app = Router::new()
         .route("/v2/", get(handle_v2_root))
-        .route("/v2/:repo/blobs/:digest", get(handle_blob))
+        .route("/v2/{repo}/blobs/{digest}", get(handle_blob))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

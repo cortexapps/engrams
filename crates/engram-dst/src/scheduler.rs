@@ -14,7 +14,7 @@ use engram_core::types::session_op::{EnqueueOutcome, OpKind};
 use engram_core::{HostId, SessionId};
 use rand::prelude::*;
 use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 
 use crate::invariants;

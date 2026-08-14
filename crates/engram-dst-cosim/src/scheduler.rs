@@ -31,8 +31,9 @@ pub struct Cosim {
     pub world: CosimWorld,
     idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig,
     queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig,
-    /// The reconcile strike ledger, owned across ticks like the real loop.
-    strikes: HashMap<SandboxId, u32>,
+    /// The reconcile first-seen ledger (ADR 0116 A5: the age grace that
+    /// replaced the strike debounce), owned across ticks like the real loop.
+    first_seen: HashMap<SandboxId, std::time::Duration>,
     /// The sandbox each session was last bound to (captured before the D5
     /// unbind clears the coordinator's `sandbox_id`).
     session_sandbox: BTreeMap<SessionId, SandboxId>,
@@ -57,7 +58,7 @@ impl Cosim {
             world: CosimWorld::new_with_fault_plan(seed, plan).await,
             idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig::default(),
             queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig::default(),
-            strikes: HashMap::new(),
+            first_seen: HashMap::new(),
             session_sandbox: BTreeMap::new(),
             evict_cursor: BTreeMap::new(),
             trace: Vec::new(),
@@ -348,11 +349,13 @@ impl Cosim {
     /// (never consulted the capture-in-flight signal).
     pub async fn reconcile_tick(&mut self, honor_capture_signal: bool) {
         let backend = self.world.reconcile_backend(honor_capture_signal);
+        let now = engram_core::traits::Clock::now_mono(&*self.world.clock);
         let _ = engram_host_agent::teardown_reconcile::reconcile_once(
             &backend,
             &*self.world.coord_plane,
             self.world.host_id,
-            &mut self.strikes,
+            &mut self.first_seen,
+            now,
         )
         .await;
         self.log(format!("reconcile_tick(honor={honor_capture_signal})"));
@@ -592,6 +595,9 @@ impl Cosim {
                         engram_protocol::heartbeat::QuarantinedSurvivor {
                             sandbox_id,
                             session_id,
+                            // The cosim's survivors model the ADR 0090
+                            // rehydrate flavor.
+                            reason: Default::default(),
                         }
                     })
                 })

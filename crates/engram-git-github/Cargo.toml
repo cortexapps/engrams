@@ -10,6 +10,7 @@ description = "GitHub App GitForge: mints scoped installation tokens and opens p
 workspace = true
 
 [dependencies]
+engram-tls.workspace = true
 engram-core.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
@@ -27,4 +28,4 @@ wiremock = "0.6"
 # Generate a throwaway RSA key at test time rather than committing a
 # private-key fixture (keeps PEM material out of git history).
 rsa = "0.9"
-rand = "0.8"
+rand_core06.workspace = true

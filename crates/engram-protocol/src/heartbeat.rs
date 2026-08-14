@@ -145,13 +145,37 @@ pub struct HostCapacityReport {
     pub running_sandboxes: u32,
 }
 
+/// ADR 0116 C4: why a survivor is quarantined. `Rehydrate` is the
+/// ADR 0090 original — the NBD rehydrate `RECONFIGURE` failed after a
+/// roll. `DataPlaneFailed` is the flush-escalation flavor — the device
+/// is still served, but consecutive device-class flush failures mean
+/// nothing durable can land. The coordinator's reaction (the keyed
+/// quarantine evict) is the same for both; the reason feeds the WARN
+/// log and the host-side park refusal. `#[serde(default)]` on the
+/// carrying field keeps the JSON heartbeat additive-safe with no
+/// WIRE_VERSION bump (the `tombstoned_sandboxes`/`CheckpointKind`
+/// precedent; the bincode twin's only cross-peer consumers are
+/// same-build dev paths).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuarantineReason {
+    #[default]
+    Rehydrate,
+    DataPlaneFailed,
+}
+
 /// ADR 0090: one quarantined survivor — a sandbox whose NBD slot was
-/// parked after a failed rehydrate `RECONFIGURE`, still owned by
+/// parked after a failed rehydrate `RECONFIGURE` (or, ADR 0116 C4,
+/// whose flush loop escalated a failed data plane), still owned by
 /// `session_id` per the generation's register reply.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QuarantinedSurvivor {
     pub sandbox_id: SandboxId,
     pub session_id: SessionId,
+    /// ADR 0116 C4 — additive: a survivor from a pre-reason host
+    /// decodes as [`QuarantineReason::Rehydrate`].
+    #[serde(default)]
+    pub reason: QuarantineReason,
 }
 
 /// NOTE (ADR 0116 A-D5): `tombstoned_sandboxes` rides ONLY the JSON
@@ -606,6 +630,35 @@ mod tests {
         // authoritative "cancel everything you're running".
         assert!(ack.capture_assignments.is_none());
         assert!(ack.acked_capture_jobs.is_empty());
+    }
+
+    /// ADR 0116 C4 rollout interop: a survivor from a pre-reason
+    /// host carries no `reason` key — it must decode to `Rehydrate`,
+    /// not fail the heartbeat.
+    #[test]
+    fn quarantined_survivor_without_reason_decodes_to_rehydrate() {
+        let v = serde_json::json!({
+            "sandbox_id": SandboxId::new(),
+            "session_id": SessionId::new(),
+        });
+        let q: QuarantinedSurvivor = serde_json::from_value(v).expect("decode without reason");
+        assert_eq!(q.reason, QuarantineReason::Rehydrate);
+    }
+
+    /// ADR 0116 C4: the data-plane-failed flavor round-trips, and its
+    /// wire token is the snake_case string the coordinator's fixtures
+    /// use.
+    #[test]
+    fn quarantined_survivor_reason_round_trips_through_json() {
+        let original = QuarantinedSurvivor {
+            sandbox_id: SandboxId::new(),
+            session_id: SessionId::new(),
+            reason: QuarantineReason::DataPlaneFailed,
+        };
+        let v = serde_json::to_value(&original).unwrap();
+        assert_eq!(v["reason"], serde_json::json!("data_plane_failed"));
+        let back: QuarantinedSurvivor = serde_json::from_value(v).unwrap();
+        assert_eq!(back, original);
     }
 
     #[test]

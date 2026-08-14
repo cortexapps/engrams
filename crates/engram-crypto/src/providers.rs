@@ -87,11 +87,16 @@ impl EnvVarKeyProvider {
 impl MasterKeyProvider for EnvVarKeyProvider {
     async fn wrap(&self, dek: &[u8]) -> Result<Vec<u8>, CryptoError> {
         use aes_gcm::aead::Aead;
-        use rand::rngs::OsRng;
-        use rand::RngCore;
+        use rand::rngs::SysRng;
+        use rand::TryRng;
 
+        // rand 0.10: the OS RNG is fallible (`TryRng`), where 0.9's
+        // `OsRng` panicked internally instead. Propagate — a wrap nonce
+        // must never come from a degraded source.
         let mut nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce);
+        SysRng
+            .try_fill_bytes(&mut nonce)
+            .map_err(|e| CryptoError::Provider(format!("OS RNG failed for wrap nonce: {e}")))?;
         let cipher = self.cipher();
         let mut out = cipher
             .encrypt((&nonce).into(), dek)

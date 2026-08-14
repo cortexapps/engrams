@@ -14,7 +14,7 @@
 # symlinks onto PATH. Auth is brokered: each CLI carries a harmless placeholder
 # and the egress proxy injects the real credential host-side (ADR 0056/0057).
 name = "integrations-cli"
-description = "Integration CLIs, including gcloud and the credential-free Cloud SQL relay, and a discovery skill; binaries run on the base image's glibc."
+description = "Integration CLIs, including the engrams-owned Datadog profiler client, gcloud, and the credential-free Cloud SQL relay; binaries run on the base image's glibc."
 
 [versions]
 # GitHub CLI — a static Go binary (no glibc deps).

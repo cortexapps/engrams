@@ -11,6 +11,10 @@
 
 use std::collections::HashMap;
 
+/// A fixed monotonic mark for cases where the age gate is irrelevant
+/// (owned / repair / unreachable postures never reach it).
+const MARK: std::time::Duration = std::time::Duration::from_secs(10_000);
+
 use engram_dst_host::{
     decode_tag, invariants, synth_chunk, CrashFs, Profile, ScriptedResponse, Sim, SimHost,
     CHUNK_SIZE, SIM_FINALIZE_MAX_ATTEMPTS,
@@ -43,9 +47,9 @@ async fn none_arm_coord_owned_unbound_sandbox_is_repaired_never_reaped() {
     host.drop_local_binding(0);
     assert!(host.reconcile.binding(sandbox_id).is_none());
 
-    let mut strikes = HashMap::new();
+    let mut first_seen = HashMap::new();
     for tick in 0..5 {
-        host.reconcile_tick(&mut strikes).await.unwrap();
+        host.reconcile_tick(&mut first_seen, MARK).await.unwrap();
         invariants::check(&host)
             .await
             .unwrap_or_else(|v| panic!("tick {tick}: {} — {}", v.invariant, v.detail));
@@ -91,9 +95,9 @@ async fn none_arm_unbound_but_coord_unreachable_is_never_reaped() {
     host.coord
         .script(ScriptedResponse::Unreachable("sim: coord down"));
 
-    let mut strikes = HashMap::new();
+    let mut first_seen = HashMap::new();
     for _ in 0..2 {
-        host.reconcile_tick(&mut strikes).await.unwrap();
+        host.reconcile_tick(&mut first_seen, MARK).await.unwrap();
         invariants::check(&host).await.unwrap();
     }
     assert!(host.reconcile.is_live(sandbox_id));
@@ -118,24 +122,40 @@ async fn coord_flip_ownership_false_twice_reaps_on_second_strike() {
     let host = scenario_host(0, 1).await;
     let sandbox_id = host.sandboxes[0].sandbox_id;
 
-    // Departed ownership: revoke the honest model so the reap is CORRECT, and
-    // fire the adversarial script so the answer is deterministically false.
+    // ADR 0116 A5: departed ownership on a still-BOUND sandbox no longer
+    // reaps — the poll's bound arm is retired; the coordinator's tombstone
+    // push owns that destroy. However long we sweep, the VM survives.
     host.revoke_ownership(0);
-    host.coord.script(ScriptedResponse::Ownership(false));
-    host.coord.script(ScriptedResponse::Ownership(false));
-
-    let mut strikes = HashMap::new();
-    host.reconcile_tick(&mut strikes).await.unwrap(); // strike 1
+    let mut first_seen = HashMap::new();
+    for _ in 0..4 {
+        host.reconcile_tick(&mut first_seen, MARK).await.unwrap();
+        invariants::check(&host).await.unwrap();
+    }
     assert!(
         host.reconcile.is_live(sandbox_id),
-        "one orphan strike must NOT reap (the create→bind debounce)",
+        "a locally BOUND sandbox is never reaped by polling (ADR 0116 A5)",
+    );
+    assert!(host.reconcile.destroyed().is_empty());
+
+    // The reap that remains: UNBOUND + coordinator-CONFIRMED no owner,
+    // past the create→bind age grace.
+    host.drop_local_binding(0);
+    let mut first_seen = HashMap::new();
+    use engram_host_agent::teardown_reconcile::{ORPHAN_GRACE, RECONCILE_INTERVAL};
+    let t0 = MARK;
+    host.reconcile_tick(&mut first_seen, t0).await.unwrap();
+    assert!(
+        host.reconcile.is_live(sandbox_id),
+        "a young confirmed orphan is spared by the age grace",
     );
     invariants::check(&host).await.unwrap();
-
-    host.reconcile_tick(&mut strikes).await.unwrap(); // strike 2 → destroy
+    let _ = RECONCILE_INTERVAL;
+    host.reconcile_tick(&mut first_seen, t0 + ORPHAN_GRACE)
+        .await
+        .unwrap();
     assert!(
         !host.reconcile.is_live(sandbox_id),
-        "the second consecutive orphan strike reaps a genuinely-departed sandbox",
+        "a confirmed orphan past the age grace is reaped",
     );
     invariants::check(&host).await.unwrap();
     assert_eq!(host.reconcile.destroyed().len(), 1);
@@ -156,9 +176,9 @@ async fn coord_unreachable_twice_never_reaps() {
     host.coord
         .script(ScriptedResponse::Unreachable("sim: coord unreachable"));
 
-    let mut strikes = HashMap::new();
+    let mut first_seen = HashMap::new();
     for _ in 0..3 {
-        host.reconcile_tick(&mut strikes).await.unwrap();
+        host.reconcile_tick(&mut first_seen, MARK).await.unwrap();
         invariants::check(&host).await.unwrap();
     }
     assert!(
@@ -175,19 +195,27 @@ async fn failed_destroy_retries_next_tick() {
     let host = scenario_host(0, 1).await;
     let sandbox_id = host.sandboxes[0].sandbox_id;
 
-    host.revoke_ownership(0); // genuinely departed → orphan every tick
+    // ADR 0116 A5 reap shape: UNBOUND + coordinator-confirmed no owner,
+    // past the age grace.
+    host.revoke_ownership(0);
+    host.drop_local_binding(0);
     host.reconcile.fail_next_destroy(); // the first destroy attempt fails
 
-    let mut strikes = HashMap::new();
-    host.reconcile_tick(&mut strikes).await.unwrap(); // strike 1
-    host.reconcile_tick(&mut strikes).await.unwrap(); // strike 2 → destroy FAILS
+    use engram_host_agent::teardown_reconcile::ORPHAN_GRACE;
+    let mut first_seen = HashMap::new();
+    host.reconcile_tick(&mut first_seen, MARK).await.unwrap(); // stamps first-seen
+    host.reconcile_tick(&mut first_seen, MARK + ORPHAN_GRACE) // grace cleared → destroy FAILS
+        .await
+        .unwrap();
     assert!(
         host.reconcile.is_live(sandbox_id),
-        "a failed destroy leaves the sandbox live and the strike at threshold",
+        "a failed destroy leaves the sandbox live",
     );
     invariants::check(&host).await.unwrap();
 
-    host.reconcile_tick(&mut strikes).await.unwrap(); // retry → destroy succeeds
+    host.reconcile_tick(&mut first_seen, MARK + ORPHAN_GRACE) // retry succeeds
+        .await
+        .unwrap();
     assert!(
         !host.reconcile.is_live(sandbox_id),
         "the next tick retries the destroy immediately",
@@ -217,8 +245,8 @@ async fn crash_loses_bindings_then_reconcile_repairs_all_without_reaping() {
     }
     host.restart().await.unwrap();
 
-    let mut strikes = HashMap::new();
-    host.reconcile_tick(&mut strikes).await.unwrap();
+    let mut first_seen = HashMap::new();
+    host.reconcile_tick(&mut first_seen, MARK).await.unwrap();
     invariants::check(&host).await.unwrap();
     for id in &ids {
         assert!(
