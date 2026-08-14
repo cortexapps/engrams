@@ -21,7 +21,12 @@ export interface SpecChatMessageRecord {
   authorUserId: string | null;
   authorName: string;
   text: string;
-  createdAt: Date;
+  createdAt: string;
+}
+
+export interface SpecMessageCursor {
+  createdAt: string;
+  promptId: string;
 }
 
 export interface CreateSpecChatMessageInput {
@@ -37,7 +42,7 @@ export interface SpecMessageStore {
   insertMessage(input: CreateSpecChatMessageInput): Promise<void>;
   listMessages(
     specId: string,
-    after: Date | undefined,
+    after: SpecMessageCursor | undefined,
     limit: number,
   ): Promise<SpecChatMessageRecord[]>;
 }
@@ -52,7 +57,7 @@ interface SpecChatMessageRow {
   author_user_id: string | null;
   author_name: string;
   text: string;
-  created_at: Date;
+  created_at: string;
 }
 
 export class PostgresSpecMessageStore implements SpecMessageStore {
@@ -77,20 +82,37 @@ export class PostgresSpecMessageStore implements SpecMessageStore {
 
   async listMessages(
     specId: string,
-    after: Date | undefined,
+    after: SpecMessageCursor | undefined,
     limit: number,
   ): Promise<SpecChatMessageRecord[]> {
     const result = after
       ? await this.pool.query<SpecChatMessageRow>(
-          `SELECT prompt_id, spec_id, author_user_id, author_name, text, created_at
-             FROM spec_chat_message
-            WHERE spec_id = $1 AND created_at > $2
-            ORDER BY created_at ASC, prompt_id ASC
-            LIMIT $3`,
-          [specId, after, limit],
+          `WITH page_cursor AS (
+             SELECT created_at, prompt_id
+               FROM spec_chat_message
+              WHERE spec_id = $1
+                AND prompt_id = $3
+                AND created_at >= date_trunc('milliseconds', $2::timestamptz)
+                AND created_at < date_trunc('milliseconds', $2::timestamptz)
+                                 + interval '1 millisecond'
+           )
+           SELECT message.prompt_id, message.spec_id, message.author_user_id,
+                  message.author_name, message.text,
+                  to_char(message.created_at AT TIME ZONE 'UTC',
+                          'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
+             FROM spec_chat_message AS message
+             JOIN page_cursor ON true
+            WHERE message.spec_id = $1
+              AND (message.created_at, message.prompt_id) >
+                  (page_cursor.created_at, page_cursor.prompt_id)
+            ORDER BY message.created_at ASC, message.prompt_id ASC
+            LIMIT $4`,
+          [specId, after.createdAt, after.promptId, limit],
         )
       : await this.pool.query<SpecChatMessageRow>(
-          `SELECT prompt_id, spec_id, author_user_id, author_name, text, created_at
+          `SELECT prompt_id, spec_id, author_user_id, author_name, text,
+                  to_char(created_at AT TIME ZONE 'UTC',
+                          'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at
              FROM spec_chat_message
             WHERE spec_id = $1
             ORDER BY created_at ASC, prompt_id ASC
@@ -154,8 +176,8 @@ export function makeSpecMessagesRoute(deps: SpecMessagesRouteDeps): Hono {
     } catch {
       throw new HTTPException(400, { message: "request body must be JSON" });
     }
-    const message = typeof body.message === "string" ? body.message.trim() : "";
-    if (!message) throw new HTTPException(400, { message: "message is required" });
+    const message = typeof body.message === "string" ? body.message : "";
+    if (!message.trim()) throw new HTTPException(400, { message: "message is required" });
     if (new TextEncoder().encode(message).byteLength > MAX_MESSAGE_BYTES) {
       throw new HTTPException(413, { message: `message exceeds ${MAX_MESSAGE_BYTES} bytes` });
     }
@@ -179,7 +201,7 @@ export function makeSpecMessagesRoute(deps: SpecMessagesRouteDeps): Hono {
     await client.sendPrompt({
       sessionId,
       promptId,
-      text: `[speaker: ${authorName}]\n${message}`,
+      text: `[speaker: ${authorName}]\n${neutralizeSpeakerHeaders(message)}`,
     });
     return c.json({ prompt_id: promptId }, 202);
   });
@@ -188,13 +210,19 @@ export function makeSpecMessagesRoute(deps: SpecMessagesRouteDeps): Hono {
     const { specId } = await requireMember(c);
     const after = parseAfter(c.req.query("after"));
     const messages = await deps.store.listMessages(specId, after, MESSAGE_PAGE_SIZE);
+    const last = messages.at(-1);
     return c.json({
       messages: messages.map((message) => ({
         prompt_id: message.promptId,
         author: { id: message.authorUserId, name: message.authorName },
         text: message.text,
-        created_at: message.createdAt.toISOString(),
+        created_at: message.createdAt,
       })),
+      next_after: last
+        ? encodeSpecMessageCursor({ createdAt: last.createdAt, promptId: last.promptId })
+        : after
+          ? encodeSpecMessageCursor(after)
+          : "",
     });
   });
 
@@ -218,14 +246,66 @@ export function speakerName(name: string | undefined): string {
   return clean || "Unknown member";
 }
 
-function parseAfter(value: string | undefined): Date | undefined {
-  if (value === undefined || value.trim() === "") return undefined;
-  if (!ISO_TIMESTAMP.test(value)) {
-    throw new HTTPException(400, { message: "after must be an ISO timestamp" });
+/** Remove body text that can be mistaken for the one trusted turn header. */
+function neutralizeSpeakerHeaders(message: string): string {
+  return message.replace(/\[speaker:/gi, "speaker reference in message (untrusted):");
+}
+
+interface SpecMessageCursorToken {
+  created_at: string;
+  prompt_id: string;
+}
+
+/** Encode the keyset as unpadded base64url of compact UTF-8 JSON. */
+export function encodeSpecMessageCursor(cursor: SpecMessageCursor): string {
+  const token: SpecMessageCursorToken = {
+    created_at: cursor.createdAt,
+    prompt_id: cursor.promptId,
+  };
+  return Buffer.from(JSON.stringify(token), "utf8").toString("base64url");
+}
+
+function parseAfter(value: string | undefined): SpecMessageCursor | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (value.length > 4096 || !/^[A-Za-z0-9_-]+$/.test(value)) throw invalidAfter();
+
+  let decoded: Buffer;
+  try {
+    decoded = Buffer.from(value, "base64url");
+  } catch {
+    throw invalidAfter();
   }
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) {
-    throw new HTTPException(400, { message: "after must be an ISO timestamp" });
+  // Buffer's decoder is permissive. Require the exact unpadded base64url form
+  // that this route emits, so corrupt or truncated tokens cannot be accepted.
+  if (decoded.toString("base64url") !== value) throw invalidAfter();
+
+  let token: unknown;
+  try {
+    token = JSON.parse(decoded.toString("utf8")) as unknown;
+  } catch {
+    throw invalidAfter();
   }
-  return parsed;
+  if (!isCursorToken(token)) throw invalidAfter();
+  if (!ISO_TIMESTAMP.test(token.created_at)) throw invalidAfter();
+  const createdAt = new Date(token.created_at);
+  if (Number.isNaN(createdAt.getTime())) throw invalidAfter();
+  return { createdAt: token.created_at, promptId: token.prompt_id };
+}
+
+function isCursorToken(value: unknown): value is SpecMessageCursorToken {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  return (
+    keys.length === 2 &&
+    keys[0] === "created_at" &&
+    keys[1] === "prompt_id" &&
+    typeof record.created_at === "string" &&
+    typeof record.prompt_id === "string" &&
+    record.prompt_id.length > 0
+  );
+}
+
+function invalidAfter(): HTTPException {
+  return new HTTPException(400, { message: "after must be a valid message cursor" });
 }

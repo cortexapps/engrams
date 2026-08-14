@@ -16,6 +16,7 @@ import type { SectionStateValue } from "../section-state.ts";
 import type {
   CreateSpecChatMessageInput,
   SpecChatMessageRecord,
+  SpecMessageCursor,
   SpecMessageStore,
 } from "../../routes/spec-messages.ts";
 
@@ -29,19 +30,34 @@ export class MemorySpecMessageStore implements SpecMessageStore {
   }
 
   async insertMessage(input: CreateSpecChatMessageInput): Promise<void> {
-    this.rows.push({ ...input, createdAt: this.now() });
+    this.rows.push({ ...input, createdAt: this.now().toISOString() });
   }
 
   async listMessages(
     specId: string,
-    after: Date | undefined,
+    after: SpecMessageCursor | undefined,
     limit: number,
   ): Promise<SpecChatMessageRecord[]> {
+    const cursorRow = after
+      ? this.rows.find(
+          (row) =>
+            row.specId === specId &&
+            row.promptId === after.promptId &&
+            new Date(row.createdAt).getTime() === new Date(after.createdAt).getTime(),
+        )
+      : undefined;
     return this.rows
-      .filter((row) => row.specId === specId && (!after || row.createdAt > after))
+      .filter(
+        (row) =>
+          row.specId === specId &&
+          (!after ||
+            (cursorRow !== undefined &&
+              (row.createdAt > cursorRow.createdAt ||
+                (row.createdAt === cursorRow.createdAt && row.promptId > cursorRow.promptId)))),
+      )
       .sort(
         (left, right) =>
-          left.createdAt.getTime() - right.createdAt.getTime() ||
+          left.createdAt.localeCompare(right.createdAt) ||
           left.promptId.localeCompare(right.promptId),
       )
       .slice(0, limit);
