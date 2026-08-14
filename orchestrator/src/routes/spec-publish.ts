@@ -12,32 +12,11 @@ import { makeSpecMemberHeaderGuard } from "./guard.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** The wire shape of the gate. Every org member may read it (ADR 0114 D12). */
+/** The wire shape of the confirmation. Every org member may read it. */
 export interface SpecPublishStatusPayload {
   phase: "ideation" | "drafting" | "published";
   canPublish: boolean;
-  publishedAt: string | null;
-  gate: {
-    ready: boolean;
-    settledRequiredCount: number;
-    requiredCount: number;
-    acknowledgmentRequired: boolean;
-    gapCheckRunRequired: boolean;
-    blockers: Array<{
-      sectionId: string;
-      sectionTitle: string;
-      layerKey: string;
-      state: string;
-      reason: string;
-    }>;
-    openQuestions: Array<{
-      id: string;
-      sectionId: string;
-      sectionTitle: string;
-      text: string;
-    }>;
-  };
-  gapCheck: { stale: boolean; runId: string | null; ranAt: string | null; gates: boolean };
+  openQuestions: Array<{ id: string; sectionId: string; sectionTitle: string; text: string }>;
   publish: {
     state: string;
     checkpointId: string;
@@ -97,7 +76,6 @@ export function makeSpecPublishRoute(deps: SpecPublishRouteDeps): Hono {
       throw new HTTPException(400, { message: "actionId must be a UUID" });
     }
     const acknowledgeOpenQuestions = flag(body["acknowledgeOpenQuestions"], "acknowledgeOpenQuestions");
-    const runGapCheck = flag(body["runGapCheck"], "runGapCheck");
 
     let result;
     try {
@@ -106,7 +84,6 @@ export function makeSpecPublishRoute(deps: SpecPublishRouteDeps): Hono {
         actorUserId: userId,
         actionId,
         acknowledgeOpenQuestions,
-        runGapCheck,
       });
     } catch (error) {
       throw publishHttpError(error);
@@ -125,33 +102,12 @@ function statusPayload(status: SpecPublishStatus): SpecPublishStatusPayload {
   return {
     phase: status.phase,
     canPublish: status.canPublish,
-    publishedAt: status.publishedAt?.toISOString() ?? null,
-    gate: {
-      ready: status.gate.ready,
-      settledRequiredCount: status.gate.settledRequiredCount,
-      requiredCount: status.gate.requiredCount,
-      acknowledgmentRequired: status.gate.acknowledgmentRequired,
-      gapCheckRunRequired: status.gate.gapCheckRunRequired,
-      blockers: status.gate.blockers.map((blocker) => ({
-        sectionId: blocker.sectionId,
-        sectionTitle: blocker.sectionTitle,
-        layerKey: blocker.layerKey,
-        state: blocker.state,
-        reason: blocker.reason,
-      })),
-      openQuestions: status.gate.openQuestions.map((question) => ({
-        id: question.id,
-        sectionId: question.sectionId,
-        sectionTitle: question.sectionTitle,
-        text: question.text,
-      })),
-    },
-    gapCheck: {
-      stale: status.gapCheck.stale,
-      runId: status.gapCheck.runId,
-      ranAt: status.gapCheck.ranAt?.toISOString() ?? null,
-      gates: status.gapCheck.gates,
-    },
+    openQuestions: status.openQuestions.map((question) => ({
+      id: question.id,
+      sectionId: question.sectionId,
+      sectionTitle: question.sectionTitle,
+      text: question.text,
+    })),
     publish: status.publish === null ? null : publishPayload(status.publish),
   };
 }
@@ -193,10 +149,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/**
- * A refusal carries the gate, so the dialog lists the blockers or the questions
- * without a second request.
- */
+/** A refusal carries the confirmation state, so the dialog needs no second read. */
 function publishHttpError(error: unknown): HTTPException {
   if (error instanceof HTTPException) return error;
   if (error instanceof SpecPublishError) {
@@ -212,11 +165,8 @@ function publishHttpError(error: unknown): HTTPException {
       // they cannot publish rather than that the spec does not exist (R37).
       case "not_owner":
         return httpJson(403, body);
-      case "blocked":
       case "ideation":
       case "acknowledgment_required":
-      case "gap_check_stale":
-      case "gap_check_failed":
       case "already_published":
       case "no_session":
         return httpJson(409, body);

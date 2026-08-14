@@ -97,6 +97,7 @@ export class MemorySectionStore implements SectionStateStore {
       sectionId: input.sectionId,
       requestFingerprint: input.requestFingerprint,
       chip: input.chip,
+      actorUserId: input.actorUserId,
       createdAt: input.at,
       deliveredAt: null,
     };
@@ -134,6 +135,7 @@ export class MemoryQuestionStore implements OpenQuestionStore {
       ...input,
       state: "open",
       resolutionLink: null,
+      resolvedBy: null,
       resolvedAt: null,
     };
     this.rows.set(row.id, row);
@@ -147,6 +149,7 @@ export class MemoryQuestionStore implements OpenQuestionStore {
       ...row,
       state: "resolved",
       resolutionLink: input.resolutionLink,
+      resolvedBy: input.resolvedBy,
       resolvedAt: input.resolvedAt,
     });
     return true;

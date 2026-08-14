@@ -10,7 +10,6 @@ import type { SpecRailMetadata, SpecRailStore } from "../../routes/spec-rail.ts"
 import { PostgresSpecCheckpointStore } from "../checkpoints.ts";
 import type { CreateCheckpointOptions, SpecCheckpointRecord } from "../checkpoints.ts";
 import type { LoadedSpecDocument } from "../doc-service.ts";
-import type { GapCheckRun, GapCheckStatus } from "../gap-check.ts";
 import { makeSpecPublishArtifactPublisher } from "../publish-artifact.ts";
 import {
   runSpecPublishTick,
@@ -104,15 +103,6 @@ class MemoryRailStore implements SpecRailStore {
   }
 }
 
-const freshGapCheck = {
-  async status(): Promise<GapCheckStatus> {
-    return { run: null, currentSemanticDocSeq: 4n, stale: false };
-  },
-  async run(): Promise<GapCheckRun> {
-    throw new Error("the gap check is fresh, so it must not run");
-  },
-};
-
 /** The compaction the pin freezes. The real pin SQL writes the checkpoint. */
 class TestDocuments {
   compactions = 0;
@@ -171,8 +161,7 @@ describe("spec publish with live Postgres", () => {
          VALUES ($1, 'test-org', $2, $3, $4, 'Org sandbox quotas', 'drafting', 4, 4)`,
         [id, owner, sessionId, templateId],
       );
-      // Real section states: the pin transaction reads this table, not the
-      // rail fixture, so the gate it re-checks is the stored one.
+      // Section states exist, but the publish confirmation does not read them.
       await pool.query(
         `INSERT INTO spec_section_state (spec_id, section_id, state, na_reason)
          VALUES ($1, 'sec-req', 'settled', NULL), ($1, 'sec-data', 'settled', NULL)`,
@@ -199,7 +188,6 @@ describe("spec publish with live Postgres", () => {
       store,
       railStore,
       documents: { syncFromLog: async () => specDocument() },
-      gapCheck: freshGapCheck,
       now: () => NOW,
     });
   }
@@ -257,14 +245,12 @@ describe("spec publish with live Postgres", () => {
       actorUserId: owner,
       actionId: randomUUID(),
       acknowledgeOpenQuestions: false,
-      runGapCheck: false,
     });
     const second = await publish.requestPublish({
       specId,
       actorUserId: owner,
       actionId: randomUUID(),
       acknowledgeOpenQuestions: false,
-      runGapCheck: false,
     });
 
     expect(first.created).toBe(true);
@@ -339,11 +325,8 @@ describe("spec publish with live Postgres", () => {
   );
 
   test.skipIf(!reachable)(
-    "a required section unsettled between the request and the pin blocks the pin",
+    "an unsettled section does not block the pin or run a gap check",
     async () => {
-      // The window the request-time gate cannot cover: the document stays
-      // editable until the pin commits, and a co-editor's edit flips a
-      // settled section back to proposed.
       const store = new PostgresSpecPublishStore(pool!);
       const publish = service(store);
       await publish.requestPublish({
@@ -351,7 +334,6 @@ describe("spec publish with live Postgres", () => {
         actorUserId: owner,
         actionId: randomUUID(),
         acknowledgeOpenQuestions: false,
-        runGapCheck: false,
       });
       await pool!.query(
         `UPDATE spec_section_state SET state = 'proposed'
@@ -359,47 +341,19 @@ describe("spec publish with live Postgres", () => {
         [raceSpecId],
       );
 
-      const tick = scannerDeps(store);
-      // The rail fixture still reads settled, so only the transaction's own
-      // check against spec_section_state can refuse this pin.
-      const result = await runSpecPublishTick(tick.deps);
+      const result = await runSpecPublishTick(scannerDeps(store).deps);
 
-      expect(result.blocked).toBe(1);
-      expect(result.pinned).toBe(0);
+      expect(result.blocked).toBe(0);
+      expect(result.pinned).toBe(1);
       const record = await store.readPublish(raceSpecId);
-      expect(record?.state).toBe("blocked");
-      expect(record?.lastError).toBe("1 required sections are no longer settled.");
-      // Nothing became immutable.
-      const spec = await pool!.query<{ phase: string; published_at: Date | null }>(
-        "SELECT phase, published_at FROM spec WHERE id = $1",
+      expect(record?.state).toBe("complete");
+      const sideEffects = await pool!.query<{ checkpoints: number; gap_checks: number }>(
+        `SELECT
+           (SELECT count(*)::int FROM spec_checkpoint WHERE spec_id = $1) AS checkpoints,
+           (SELECT count(*)::int FROM spec_gap_check_run WHERE spec_id = $1) AS gap_checks`,
         [raceSpecId],
       );
-      expect(spec.rows[0]!.phase).toBe("drafting");
-      expect(spec.rows[0]!.published_at).toBeNull();
-      const checkpoints = await pool!.query<{ count: number }>(
-        "SELECT count(*)::int AS count FROM spec_checkpoint WHERE spec_id = $1",
-        [raceSpecId],
-      );
-      expect(checkpoints.rows[0]!.count).toBe(0);
-
-      // Settling the section and asking again re-arms the same row.
-      await pool!.query(
-        `UPDATE spec_section_state SET state = 'settled'
-          WHERE spec_id = $1 AND section_id = 'sec-data'`,
-        [raceSpecId],
-      );
-      const again = await publish.requestPublish({
-        specId: raceSpecId,
-        actorUserId: owner,
-        actionId: randomUUID(),
-        acknowledgeOpenQuestions: false,
-        runGapCheck: false,
-      });
-      expect(again.publish.state).toBe("requested");
-      expect(again.publish.checkpointId).toBe(record!.checkpointId);
-      const pinned = await runSpecPublishTick(scannerDeps(store).deps);
-      expect(pinned.pinned).toBe(1);
-      expect((await store.readPublish(raceSpecId))?.state).toBe("complete");
+      expect(sideEffects.rows[0]).toEqual({ checkpoints: 1, gap_checks: 0 });
     },
   );
 
@@ -414,7 +368,6 @@ describe("spec publish with live Postgres", () => {
         actorUserId: member,
         actionId: randomUUID(),
         acknowledgeOpenQuestions: false,
-        runGapCheck: false,
       });
     } catch (error) {
       if (!(error instanceof SpecPublishError)) throw error;
@@ -423,8 +376,8 @@ describe("spec publish with live Postgres", () => {
 
     expect(refusal?.code).toBe("not_owner");
     expect(refusal?.status?.canPublish).toBe(false);
-    // The member still reads the gate, because a spec is org-visible (D12).
-    expect(refusal?.status?.gate.ready).toBe(true);
+    // The member still reads the confirmation, because a spec is org-visible.
+    expect(refusal?.status?.openQuestions).toEqual([]);
     const rows = await pool!.query<{ count: number }>(
       "SELECT count(*)::int AS count FROM spec_publish WHERE spec_id = $1",
       [otherSpecId],
@@ -485,7 +438,6 @@ describe("spec publish with live Postgres", () => {
         reason: "publish",
       },
       semanticDocSeq: 4n,
-      requiredSectionIds: [] as string[],
       acknowledgedQuestionIds: [] as string[],
     };
     expect(await store.pin(pinInput)).toEqual({ kind: "pinned" });

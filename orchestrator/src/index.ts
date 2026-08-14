@@ -140,6 +140,7 @@ import {
   productionDraftingSeedSender,
 } from "./specs/drafting-seed-scanner.ts";
 import { makeSpecPublishRoute } from "./routes/spec-publish.ts";
+import { makeSpecDecisionsRoute, PostgresSpecDecisionStore } from "./routes/spec-decisions.ts";
 import { makeSpecTicketRoute } from "./routes/spec-tickets.ts";
 import { makeSpecTicketSyncRoute } from "./routes/spec-ticket-sync.ts";
 import { makeLinearIssueClient } from "./integrations/linear-issues.ts";
@@ -205,20 +206,18 @@ const specGapCheck = new GapCheckService({
 const specParticipants = new PostgresSpecParticipantStore(getDb());
 const specCheckpointStore = new PostgresSpecCheckpointStore(getPool());
 const specCheckpoints = new SpecCheckpointService(specDocuments, specCheckpointStore);
-// The publish gate (ADR 0114 D10). The route records the intent; the scanner
-// pins the checkpoint, records the artifact version, and starts ticketize.
+// The publish confirmation records the intent. The scanner pins the checkpoint,
+// records the artifact version, and starts ticketize.
 const specPublishStore = new PostgresSpecPublishStore(getPool());
 const specPublish = new SpecPublishService({
   store: specPublishStore,
   railStore: specRailStore,
   documents: specDocuments,
-  gapCheck: specGapCheck,
   now: specNow,
 });
 const specPublishScanner = new SpecPublishScanner({
   store: specPublishStore,
   documents: specDocuments,
-  gate: specPublish,
   checkpointStore: specCheckpointStore,
   artifacts: productionSpecPublishArtifactPublisher(),
   ticketize: productionSpecTicketizeHandoff(),
@@ -347,6 +346,13 @@ app.route(
   makeSpecPublishRoute({
     publish: specPublish,
     wake: (specId) => specPublishScanner.wake(specId),
+    resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecDecisionsRoute({
+    store: new PostgresSpecDecisionStore(getPool()),
     resolveMembership: resolveSpecMembership,
   }),
 );

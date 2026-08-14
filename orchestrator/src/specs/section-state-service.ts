@@ -20,6 +20,7 @@ export interface SectionStateTranscriptAction {
   sectionId: string;
   requestFingerprint: string;
   chip: SectionStateTranscriptChip;
+  actorUserId: string | null;
   createdAt: Date;
   deliveredAt: Date | null;
 }
@@ -33,6 +34,7 @@ export interface PersistSectionStateActionInput {
   expected: SectionStateValue;
   next: SectionStateValue;
   settledBy: string | null;
+  actorUserId: string | null;
   chip: SectionStateTranscriptChip;
   at: Date;
 }
@@ -230,6 +232,7 @@ export class SectionStateService {
       expected: current,
       next: change.value,
       settledBy: change.value.state === "settled" ? actorUserId : null,
+      actorUserId,
       chip: change.transcriptChip,
       at: this.options.now(),
     });
@@ -297,6 +300,7 @@ interface TranscriptActionRow {
   section_id: string;
   request_fingerprint: string;
   chip: SectionStateTranscriptChip;
+  actor_user_id: string | null;
   created_at: Date;
   delivered_at: Date | null;
 }
@@ -316,7 +320,8 @@ export class PostgresSectionStateStore implements SectionStateStore {
 
   async readAction(actionId: string): Promise<SectionStateTranscriptAction | null> {
     const result = await this.pool.query<TranscriptActionRow>(
-      `SELECT id, spec_id, section_id, request_fingerprint, chip, created_at, delivered_at
+      `SELECT id, spec_id, section_id, request_fingerprint, chip, actor_user_id,
+              created_at, delivered_at
          FROM spec_transcript_action
         WHERE id = $1`,
       [actionId],
@@ -381,8 +386,8 @@ export class PostgresSectionStateStore implements SectionStateStore {
       );
       const insertedAction = await client.query(
         `INSERT INTO spec_transcript_action
-           (id, spec_id, section_id, request_fingerprint, chip, created_at, delivered_at)
-         VALUES ($1, $2, $3, $4, $5, $6, NULL)
+           (id, spec_id, section_id, request_fingerprint, chip, actor_user_id, created_at, delivered_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)
          ON CONFLICT (id) DO NOTHING
          RETURNING id`,
         [
@@ -391,6 +396,7 @@ export class PostgresSectionStateStore implements SectionStateStore {
           input.sectionId,
           input.requestFingerprint,
           input.chip,
+          input.actorUserId,
           input.at,
         ],
       );
@@ -409,6 +415,7 @@ export class PostgresSectionStateStore implements SectionStateStore {
           sectionId: input.sectionId,
           requestFingerprint: input.requestFingerprint,
           chip: input.chip,
+          actorUserId: input.actorUserId,
           createdAt: input.at,
           deliveredAt: null,
         },
@@ -423,7 +430,8 @@ export class PostgresSectionStateStore implements SectionStateStore {
 
   async listPendingActions(limit: number): Promise<SectionStateTranscriptAction[]> {
     const result = await this.pool.query<TranscriptActionRow>(
-      `SELECT id, spec_id, section_id, request_fingerprint, chip, created_at, delivered_at
+      `SELECT id, spec_id, section_id, request_fingerprint, chip, actor_user_id,
+              created_at, delivered_at
          FROM spec_transcript_action
         WHERE delivered_at IS NULL
           AND chip->>'kind' = 'spec_section_state_changed'
@@ -453,6 +461,7 @@ function actionValue(row: TranscriptActionRow | undefined): SectionStateTranscri
         sectionId: row.section_id,
         requestFingerprint: row.request_fingerprint,
         chip: row.chip,
+        actorUserId: row.actor_user_id,
         createdAt: row.created_at,
         deliveredAt: row.delivered_at,
       }
@@ -494,7 +503,8 @@ async function readActionWith(
   actionId: string,
 ): Promise<SectionStateTranscriptAction | null> {
   const result = await client.query<TranscriptActionRow>(
-    `SELECT id, spec_id, section_id, request_fingerprint, chip, created_at, delivered_at
+    `SELECT id, spec_id, section_id, request_fingerprint, chip, actor_user_id,
+            created_at, delivered_at
        FROM spec_transcript_action
       WHERE id = $1`,
     [actionId],

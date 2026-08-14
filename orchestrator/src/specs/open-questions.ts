@@ -11,6 +11,7 @@ export interface OpenQuestionRecord {
   requestFingerprint: string;
   state: OpenQuestionState;
   resolutionLink: string | null;
+  resolvedBy: string | null;
   resolvedAt: Date | null;
 }
 
@@ -27,6 +28,7 @@ export interface ResolveOpenQuestionInput {
   id: string;
   expectedState: "open";
   resolutionLink: string;
+  resolvedBy: string | null;
   resolvedAt: Date;
 }
 
@@ -197,6 +199,7 @@ export class OpenQuestionService {
   async resolve(input: {
     questionId: string;
     answerMarkdown: string;
+    resolvedBy: string | null;
     expectedDocSeq?: bigint;
   }): Promise<OpenQuestionRecord> {
     const answerMarkdown = input.answerMarkdown.trim();
@@ -233,6 +236,7 @@ export class OpenQuestionService {
       id: question.id,
       expectedState: "open",
       resolutionLink: documentResult.resolutionLink,
+      resolvedBy: input.resolvedBy,
       resolvedAt,
     });
     if (!applied) {
@@ -249,6 +253,7 @@ export class OpenQuestionService {
       ...question,
       state: "resolved",
       resolutionLink: documentResult.resolutionLink,
+      resolvedBy: input.resolvedBy,
       resolvedAt,
     };
   }
@@ -281,6 +286,7 @@ interface OpenQuestionRow {
   state: OpenQuestionState;
   resolution_note: string | null;
   request_fingerprint: string;
+  resolved_by: string | null;
   resolved_at: Date | null;
 }
 
@@ -295,7 +301,7 @@ export class PostgresOpenQuestionStore implements OpenQuestionStore {
   async find(id: string): Promise<OpenQuestionRecord | null> {
     const result = await this.pool.query<OpenQuestionRow>(
       `SELECT id, spec_id, section_id, text, opened_by, request_fingerprint,
-              state, resolution_note, resolved_at
+              state, resolution_note, resolved_by, resolved_at
          FROM spec_open_question
         WHERE id = $1`,
       [id],
@@ -311,6 +317,7 @@ export class PostgresOpenQuestionStore implements OpenQuestionStore {
           requestFingerprint: row.request_fingerprint,
           state: row.state,
           resolutionLink: row.resolution_note,
+          resolvedBy: row.resolved_by,
           resolvedAt: row.resolved_at,
         }
       : null;
@@ -351,9 +358,9 @@ export class PostgresOpenQuestionStore implements OpenQuestionStore {
   async resolve(input: ResolveOpenQuestionInput): Promise<boolean> {
     const result = await this.pool.query(
       `UPDATE spec_open_question
-          SET state = 'resolved', resolution_note = $2, resolved_at = $3
-        WHERE id = $1 AND state = $4`,
-      [input.id, input.resolutionLink, input.resolvedAt, input.expectedState],
+          SET state = 'resolved', resolution_note = $2, resolved_by = $3, resolved_at = $4
+        WHERE id = $1 AND state = $5`,
+      [input.id, input.resolutionLink, input.resolvedBy, input.resolvedAt, input.expectedState],
     );
     return result.rowCount === 1;
   }

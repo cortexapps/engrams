@@ -98,6 +98,7 @@ class CrashOnceQuestionStore implements OpenQuestionStore {
     requestFingerprint: "question-request",
     state: "open",
     resolutionLink: null,
+    resolvedBy: null,
     resolvedAt: null,
   };
   crash = true;
@@ -124,6 +125,7 @@ class CrashOnceQuestionStore implements OpenQuestionStore {
       ...this.record,
       state: "resolved",
       resolutionLink: input.resolutionLink,
+      resolvedBy: input.resolvedBy,
       resolvedAt: input.resolvedAt,
     };
     return true;
@@ -140,6 +142,7 @@ class ConcurrentQuestionStore implements OpenQuestionStore {
     requestFingerprint: "question-request",
     state: "open",
     resolutionLink: null,
+    resolvedBy: null,
     resolvedAt: null,
   };
   resolveWins = 0;
@@ -173,6 +176,7 @@ class ConcurrentQuestionStore implements OpenQuestionStore {
       ...this.record,
       state: "resolved",
       resolutionLink: input.resolutionLink,
+      resolvedBy: input.resolvedBy,
       resolvedAt: input.resolvedAt,
     };
     return true;
@@ -216,7 +220,7 @@ describe("SpecQuestionDocument", () => {
       document: new SpecQuestionDocument(new SpecDocumentService(documentStore)),
       now: () => new Date("2026-08-09T12:00:00.000Z"),
     });
-    const input = { questionId: QUESTION_ID, answerMarkdown: "Use three tries." };
+    const input = { questionId: QUESTION_ID, answerMarkdown: "Use three tries.", resolvedBy: "user-2" };
 
     await expect(service.resolve(input)).rejects.toThrow("process stopped");
     const updateCount = documentStore.updates.length;
@@ -247,8 +251,8 @@ describe("SpecQuestionDocument", () => {
     });
 
     const results = await Promise.all([
-      first.resolve({ questionId: QUESTION_ID, answerMarkdown: "Use three tries." }),
-      second.resolve({ questionId: QUESTION_ID, answerMarkdown: "Use three tries." }),
+      first.resolve({ questionId: QUESTION_ID, answerMarkdown: "Use three tries.", resolvedBy: "user-1" }),
+      second.resolve({ questionId: QUESTION_ID, answerMarkdown: "Use three tries.", resolvedBy: "user-2" }),
     ]);
 
     const merged = await new SpecDocumentService(store).loadDoc(SPEC_ID);
@@ -281,8 +285,8 @@ describe("SpecQuestionDocument", () => {
     });
 
     const results = await Promise.allSettled([
-      first.resolve({ questionId: QUESTION_ID, answerMarkdown: "Use three tries." }),
-      second.resolve({ questionId: QUESTION_ID, answerMarkdown: "Do not retry." }),
+      first.resolve({ questionId: QUESTION_ID, answerMarkdown: "Use three tries.", resolvedBy: "user-1" }),
+      second.resolve({ questionId: QUESTION_ID, answerMarkdown: "Do not retry.", resolvedBy: "user-2" }),
     ]);
 
     const merged = await new SpecDocumentService(store).loadDoc(SPEC_ID);
