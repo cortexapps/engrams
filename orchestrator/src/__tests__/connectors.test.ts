@@ -865,6 +865,26 @@ describe("on-disk registry", () => {
     const rest = policy.observes.find((o) => o.path_globs.includes("/repos/*/pulls"));
     expect(new Set(rest!.data.map(([k]) => k))).toEqual(new Set(gql!.data.map(([k]) => k)));
   });
+
+  test("the shipped github pulls:write covers review-thread replies and resolution", () => {
+    const policy = compileIntegrationPolicy(["github:pulls:write"]);
+    const restReply = policy.injects.find((inject) =>
+      inject.path_globs.includes("/repos/*/pulls/*/comments/*/replies")
+    );
+    expect(restReply).toMatchObject({
+      methods: ["POST"],
+      graphql_operation: "",
+      graphql_field: "",
+    });
+
+    const graphqlFields = new Set(
+      policy.injects
+        .filter((inject) => inject.graphql_operation === "mutation")
+        .map((inject) => inject.graphql_field),
+    );
+    expect(graphqlFields).toContain("addPullRequestReviewThreadReply");
+    expect(graphqlFields).toContain("resolveReviewThread");
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -175,6 +175,10 @@
       "grants": ["pulls:write"],
       "match": { "method": "POST", "path": "/repos/*/pulls/*/comments" }
     },
+    {
+      "grants": ["pulls:write"],
+      "match": { "method": "POST", "path": "/repos/*/pulls/*/comments/*/replies" }
+    },
 
     {
       "grants": ["issues:read"],
@@ -374,6 +378,14 @@
     {
       "grants": ["pulls:write"],
       "match": { "operation": "mutation", "field": "addPullRequestReview" }
+    },
+    {
+      "grants": ["pulls:write"],
+      "match": { "operation": "mutation", "field": "addPullRequestReviewThreadReply" }
+    },
+    {
+      "grants": ["pulls:write"],
+      "match": { "operation": "mutation", "field": "resolveReviewThread" }
     },
     {
       "grants": ["pulls:write"],
