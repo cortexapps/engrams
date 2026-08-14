@@ -6,10 +6,21 @@ import type { GetSession, ResolveSpecMembership } from "./guard.ts";
 import { makeSpecMemberHeaderGuard } from "./guard.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const DELETED_ACTOR_NAME = "Deleted user";
+export const UNKNOWN_ACTOR_NAME = "actor unknown";
 
 export interface SpecDecisionActor {
   id: string | null;
+  /**
+   * The person who made the decision, or `UNKNOWN_ACTOR_NAME`.
+   *
+   * Two different situations produce an unknown actor, and the schema cannot
+   * tell them apart: a decision made before the attribution columns existed,
+   * and a decision whose account was deleted — both foreign keys are
+   * ON DELETE SET NULL, so removing an account erases the id as well. The
+   * label therefore claims only what is true of both, that nobody can be
+   * named. Snapshotting the name at write time, the way spec_chat_message
+   * does, is what would keep the credit through a deletion.
+   */
   name: string;
 }
 
@@ -111,7 +122,7 @@ export class PostgresSpecDecisionStore implements SpecDecisionStore {
               actor_user_id, actor_name, decided_at
          FROM decisions
         ORDER BY decided_at, kind, id`,
-      [specId, DELETED_ACTOR_NAME],
+      [specId, UNKNOWN_ACTOR_NAME],
     );
     return result.rows.map(decisionFromRow);
   }

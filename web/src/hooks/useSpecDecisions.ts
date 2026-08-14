@@ -4,6 +4,7 @@ import { specRequest } from "@/lib/spec-api";
 
 export interface SpecDecisionActor {
   id: string | null;
+  /** The person, or the server's label when nobody can be named. */
   name: string;
 }
 

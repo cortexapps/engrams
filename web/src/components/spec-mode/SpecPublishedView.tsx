@@ -285,6 +285,8 @@ function PublishedTicketTree({
   );
 }
 
+const UNKNOWN_ACTOR_NAME = "actor unknown";
+
 export function decisionActors(
   owner: SpecDecisionActor | null,
   decisions: SpecDecision[],
@@ -294,6 +296,9 @@ export function decisionActors(
     : decisions.map((decision) => decision.actor);
   const seen = new Set<string>();
   return actors.filter((actor) => {
+    // An unknown actor is not a person, so it cannot appear in the byline —
+    // the earlier build credited "Deleted user" as a decision-maker.
+    if (actor.id === null && actor.name === UNKNOWN_ACTOR_NAME) return false;
     const key = actor.id ?? `name:${actor.name}`;
     if (seen.has(key)) return false;
     seen.add(key);

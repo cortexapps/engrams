@@ -653,13 +653,30 @@ export class SpecDocumentService {
       const migration = migrateLegacyDiagramBlockIds(doc);
       if (migration) {
         Y.applyUpdate(validationDoc, migration);
-        const inserted = await this.store.insertUpdateIfLatest(
-          specId,
-          room.lastAppliedSeq,
-          migration,
-          null,
-          { sections: [], semanticChanged: false },
-        );
+        // A published spec is immutable, so this normalization cannot be
+        // persisted for it — and it does not need to be. The change is a
+        // cosmetic rename of a diagram block's id attribute, it is already
+        // applied to the in-memory document, and the published content itself
+        // is pinned in a checkpoint. Failing here instead would make READING a
+        // published spec impossible: both the rail and the publish status call
+        // this load path, and both returned 500 for every published spec.
+        let inserted: Awaited<ReturnType<SpecDocumentStore["insertUpdateIfLatest"]>>;
+        try {
+          inserted = await this.store.insertUpdateIfLatest(
+            specId,
+            room.lastAppliedSeq,
+            migration,
+            null,
+            { sections: [], semanticChanged: false },
+          );
+        } catch (error) {
+          if (!(error instanceof SpecDocumentReadOnlyError)) throw error;
+          if (doc.getXmlFragment(SPEC_FRAGMENT_NAME).length > 0) {
+            room.renderedSizeUpperBound = this.validateCompleteDocument(doc);
+          }
+          this.cache.set(specId, room);
+          return room;
+        }
         if (!inserted) {
           doc.destroy();
           validationDoc.destroy();

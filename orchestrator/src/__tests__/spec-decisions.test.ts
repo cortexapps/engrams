@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 
 import {
+  UNKNOWN_ACTOR_NAME,
   makeSpecDecisionsRoute,
   PostgresSpecDecisionStore,
   type SpecDecisionStore,
@@ -134,8 +135,10 @@ describe("spec decisions route", () => {
         WHERE id = $1`,
       [SPEC_ID, CHECKPOINT_ID, OWNER_ID, PUBLISHED_AT],
     );
-    // Both actor foreign keys use ON DELETE SET NULL. The decision survives,
-    // and the read model supplies a stable display label for the deleted user.
+    // Both actor foreign keys use ON DELETE SET NULL, so deleting the account
+    // erases the id as well. The decision survives, but nobody can be named —
+    // the same state a decision from before the attribution columns is in, and
+    // the read model labels both the same way for that reason.
     await pool.query('DELETE FROM "user" WHERE id = $1', [DELETED_ACTOR_ID]);
   });
 
@@ -173,7 +176,7 @@ describe("spec decisions route", () => {
             sectionTitle: "Data model",
             question: "Which lock coordinates writers?",
             resolutionLink: "section:data@resolution",
-            actor: { id: null, name: "Deleted user" },
+            actor: { id: null, name: UNKNOWN_ACTOR_NAME },
             decidedAt: RESOLVED_AT.toISOString(),
           },
         ],
@@ -201,7 +204,7 @@ describe("spec decisions route", () => {
             sectionTitle: "Data model",
             question: "Which lock coordinates writers?",
             resolutionLink: "section:data@resolution",
-            actor: { id: null, name: "Deleted user" },
+            actor: { id: null, name: UNKNOWN_ACTOR_NAME },
             decidedAt: RESOLVED_AT,
           },
         ];
@@ -214,7 +217,7 @@ describe("spec decisions route", () => {
     expect(await response.json()).toMatchObject({
       decisions: [
         { kind: "section_settled", actor: { id: SETTLE_ACTOR_ID, name: "Priya Raman" } },
-        { kind: "question_resolved", actor: { id: null, name: "Deleted user" } },
+        { kind: "question_resolved", actor: { id: null, name: UNKNOWN_ACTOR_NAME } },
       ],
     });
   });
