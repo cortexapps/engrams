@@ -33,3 +33,56 @@ platforms = [
 
 # Write out exact versions rather than a semver range. (Defaults to false.)
 # exact-versions = true
+
+# Crates kept OUT of the generated workspace-hack manifest -----------------
+#
+# `workspace-hack/Cargo.toml` is a workspace member, so Dependabot reads it as
+# a manifest and opens bumps against the generated pins. For a crate that only
+# ever appears here that is pure noise, and `.github/dependabot.yml` handles it
+# with an `ignore` entry by name.
+#
+# That does not work for a crate which is BOTH a real direct dependency at one
+# generation AND transitively unified at an older one. The pin hakari writes is
+# the older generation — correctly, that is what the third-party graph resolves
+# to — while the root manifest already declares the newer one:
+#
+#   crate          root Cargo.toml   generated pin   held at the old generation by
+#   sha2           0.11              0.10            sqlx-core, sqlx-postgres, p256,
+#                                                    p384, ed25519-dalek, gcloud-storage
+#   base64         0.23              0.22            axum, reqwest, tonic, hyper-util,
+#                                                    kube-client, k8s-openapi, + 12 more
+#   jsonwebtoken   11                10              gcloud-auth, oci-client
+#
+# Dependabot reads the old pin, proposes the new generation, and edits the
+# generated file. The result is always the same: `cargo hakari generate` puts
+# the pin straight back, so the PR collapses to an EMPTY diff and can never go
+# green against the `generate --diff` gate. #1092 and #1232 (sha2), #1234
+# (jsonwebtoken) and #1236 (base64) were all exactly this, and #1232 proves the
+# shape recurs — closing the PR does not stop the next one.
+#
+# An `ignore` entry is NOT available here, and this is the important part: the
+# names above are LIVE dependencies. Ignoring `sha2` or `base64` by name to
+# quieten a phantom PR would also suppress a genuine patch on a crypto crate,
+# including a security update, because Dependabot security updates honour
+# ignore conditions too. That trade is not acceptable.
+#
+# Excluding them from the generated output is. It removes the stale declaration
+# Dependabot was chasing, so the phantom PR is never created, while the real
+# declaration in the root manifest stays fully live and a genuine sha2 0.12 /
+# base64 0.24 / jsonwebtoken 12 still arrives as a normal PR.
+#
+# The cost is the unification these three would have contributed: they may now
+# rebuild when a member selects a different feature set. All three are small,
+# fast-compiling leaf crates, which is why they are an acceptable trade and,
+# say, `hashbrown` would not be.
+#
+# The rule, for whoever hits the next one:
+#   - crate appears ONLY in workspace-hack -> `ignore` in dependabot.yml
+#   - crate is a real dependency whose generated pin is an OLDER generation
+#     -> add it here
+[final-excludes]
+third-party = [
+    { name = "base64" },
+    { name = "jsonwebtoken" },
+    { name = "sha2" },
+]

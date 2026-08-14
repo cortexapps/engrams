@@ -231,14 +231,31 @@ updates:
       #   #1099  spki 0.7.3 -> 0.8.0      Same as pkcs8 and moves with it —
       #                                   pkcs8 0.10 requires spki ^0.7.
       #
-      # NOT added here: `sha2` (#1092). Dependabot read the 0.10 line in the
-      # generated file and proposed 0.11, but sha2 is a REAL direct dependency
-      # already declared at 0.11 in the root manifest — the 0.10 in
-      # workspace-hack is the transitive unification for ed25519-dalek /
-      # jsonwebtoken / sqlx-core / google-cloud-storage / p256 / p384, which
-      # still want the 0.10 generation. Ignoring the name would freeze a live
-      # dependency, which is precisely the failure this list warns about
-      # below. #1092 was closed on its own instead.
+      #   #1233  num-bigint-dig          Same shape as #1095 one crate over.
+      #          0.8.6 -> 0.9.1          `rsa` 0.9.10 requires ^0.8, and rsa is
+      #                                  the only consumer, so 0.9 is
+      #                                  unreachable while rsa stays at 0.9.
+      #
+      # NOT added here: `sha2`, `base64`, `jsonwebtoken`. Dependabot read the
+      # OLD generation from the generated file (0.10 / 0.22 / 10) and proposed
+      # the new one, but all three are REAL direct dependencies already declared
+      # at the newer generation in the root manifest (0.11 / 0.23 / 11). The old
+      # pin is the transitive unification — sqlx-core, p256, p384,
+      # ed25519-dalek and gcloud-storage still want sha2 0.10; axum, reqwest and
+      # tonic still want base64 0.22; gcloud-auth and oci-client still want
+      # jsonwebtoken 10.
+      #
+      # Ignoring those names would freeze a live dependency, which is precisely
+      # the failure this list warns about below — and worse than noise, because
+      # Dependabot security updates honour ignore conditions too, so it would
+      # also suppress a security patch on a crypto crate.
+      #
+      # They are handled at the source instead: `[final-excludes]` in
+      # `.config/hakari.toml` keeps them out of the generated manifest, so there
+      # is no stale pin for Dependabot to chase and the real declaration stays
+      # live. #1092 and #1232 (sha2), #1234 (jsonwebtoken) and #1236 (base64)
+      # were this shape; #1232 recurring after #1092 was closed is why the fix
+      # moved from "close it again" to the generator.
       #
       # The backstop for the MERGE risk is now the gate, not this list:
       # `just check` and CI run `cargo hakari generate --diff`, so a change to
@@ -252,11 +269,14 @@ updates:
       # To check whether a crate is hakari-only before adding it:
       #   grep -rn '^<name> = ' Cargo.toml crates/*/Cargo.toml
       # No hit outside workspace-hack/Cargo.toml means it is phantom, and its
-      # version is dictated by whichever real dependency pulls it in.
+      # version is dictated by whichever real dependency pulls it in. A HIT
+      # means it is a live dependency: it does not belong in this list, it
+      # belongs in `[final-excludes]` in `.config/hakari.toml`.
       - dependency-name: "axum-core"
       - dependency-name: "der"
       - dependency-name: "hashbrown"
       - dependency-name: "num-bigint"
+      - dependency-name: "num-bigint-dig"
       - dependency-name: "phf_shared"
       - dependency-name: "pkcs8"
       - dependency-name: "spki"
