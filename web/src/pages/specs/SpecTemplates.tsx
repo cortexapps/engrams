@@ -526,7 +526,7 @@ function SectionEditor({
           onCheckedChange={(checked) => onChange({ required: checked })}
         />
         <ToggleField
-          label="Allow n/a"
+          label="Allow Not this spec"
           checked={section.allowNa}
           disabled={disabled}
           onCheckedChange={(checked) => onChange({ allowNa: checked })}

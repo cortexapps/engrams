@@ -21,6 +21,7 @@ export function LazySpecCanvas({
   surface,
   presence,
   showProvenance,
+  readOnly = false,
 }: {
   doc: Y.Doc;
   provider: WebsocketProvider;
@@ -30,6 +31,7 @@ export function LazySpecCanvas({
   presence: SpecPresenceEntry[];
   showProvenance: boolean;
   selectionActions?: SpecSelectionActions;
+  readOnly?: boolean;
 }) {
   return (
     <Suspense
@@ -50,6 +52,7 @@ export function LazySpecCanvas({
         surface={surface}
         presence={presence}
         showProvenance={showProvenance}
+        readOnly={readOnly}
       />
     </Suspense>
   );

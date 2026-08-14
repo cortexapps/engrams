@@ -33,6 +33,7 @@ export function SpecCanvas({
   surface,
   showProvenance,
   presence,
+  readOnly = false,
 }: {
   doc: Y.Doc;
   provider: WebsocketProvider;
@@ -43,6 +44,8 @@ export function SpecCanvas({
   presence: SpecPresenceEntry[];
   /** Supply this only when the current user can send selection actions. */
   selectionActions?: SpecSelectionActions;
+  /** Keep a published head readable without opening a second document renderer. */
+  readOnly?: boolean;
 }) {
   const { principal } = useAuth();
   const sectionState = useSetSpecSectionState(specId);
@@ -66,6 +69,7 @@ export function SpecCanvas({
         surface={surface}
         showProvenance={showProvenance}
         presence={presence}
+        readOnly={readOnly}
         pendingSectionId={
           sectionState.isPending ? (sectionState.variables?.sectionId ?? null) : null
         }
@@ -95,6 +99,7 @@ export function ConnectedSpecCanvas({
   presence = [],
   pendingSectionId = null,
   onSetSectionState = () => undefined,
+  readOnly: forcedReadOnly = false,
 }: {
   connection: SpecConnection;
   user: { id: string; name: string; color: string };
@@ -106,6 +111,7 @@ export function ConnectedSpecCanvas({
   presence?: SpecPresenceEntry[];
   pendingSectionId?: string | null;
   onSetSectionState?: (action: SectionStateAction) => void;
+  readOnly?: boolean;
 }) {
   const surfaceRef = useRef(surface);
   const showProvenanceRef = useRef(showProvenance);
@@ -126,7 +132,8 @@ export function ConnectedSpecCanvas({
     ],
     [connection.doc, connection.provider, user],
   );
-  const readOnly = useIsMobile();
+  const smallScreen = useIsMobile();
+  const readOnly = forcedReadOnly || smallScreen;
   const editor = useEditor({
     extensions,
     immediatelyRender: false,
@@ -202,7 +209,10 @@ export function ConnectedSpecCanvas({
     <div className="spec-canvas-shell">
       <div className="spec-canvas-bar">
         {readOnly ? (
-          <p className="spec-canvas-read-only">Read-only on a small screen. The text stays live.</p>
+          <p className="spec-canvas-read-only">
+            {smallScreen ? "Read-only on a small screen." : "The current draft is read-only here."}
+            {" The text stays live."}
+          </p>
         ) : (
           <div className="spec-canvas-tools" role="toolbar" aria-label="Spec formatting">
             <Button

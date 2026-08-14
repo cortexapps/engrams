@@ -6,7 +6,9 @@ import * as Y from "yjs";
 import { renderWithProviders } from "@/test-utils";
 import { SpecShellPage } from "./SpecShellPage";
 
-const readState = vi.hoisted(() => ({ phase: "drafting" as "ideation" | "drafting" }));
+const readState = vi.hoisted(() => ({
+  phase: "drafting" as "ideation" | "drafting" | "published",
+}));
 
 const providerState = vi.hoisted(() => {
   const callbacks = new Set<(synced: boolean) => void>();
@@ -40,6 +42,14 @@ vi.mock("@/components/spec/LazySpecCanvas", () => ({
   },
 }));
 
+vi.mock("@/components/spec-mode/SpecPublishedView", () => ({
+  SpecPublishedView: (props: { title: string; openQuestions: unknown[] }) => (
+    <main aria-label="Published spec view">
+      {props.title} · {props.openQuestions.length} open
+    </main>
+  ),
+}));
+
 vi.mock("@/hooks/useSpecPublish", () => ({
   useSpecPublish: () => ({ data: { gate: { openQuestions: [] } } }),
 }));
@@ -66,13 +76,37 @@ vi.mock("@/hooks/useSpecRead", () => ({
         phase: readState.phase,
         sessionId: null,
         viewerIsOwner: false,
-        publishedCheckpointId: null,
-        publishedAt: null,
+        publishedCheckpointId: readState.phase === "published" ? "published-1" : null,
+        publishedAt: readState.phase === "published" ? "2026-08-13T18:00:00.000Z" : null,
         revision: "17",
         template: { id: "template-1", name: "Engineering spec" },
       },
-      checkpoints: [],
-      publishedCheckpoint: null,
+      checkpoints:
+        readState.phase === "published"
+          ? [
+              {
+                id: "published-1",
+                label: "Published",
+                author: { id: "owner", name: "Nikhil" },
+                reason: "publish",
+                docSeq: "17",
+                createdAt: "2026-08-13T18:00:00.000Z",
+              },
+            ]
+          : [],
+      publishedCheckpoint:
+        readState.phase === "published"
+          ? {
+              id: "published-1",
+              label: "Published",
+              authorUserId: "owner",
+              reason: "publish",
+              docSeq: "17",
+              createdAt: "2026-08-13T18:00:00.000Z",
+              markdown: "## Problem\n\nPublished.\n",
+              sections: [{ id: "problem", title: "Problem" }],
+            }
+          : null,
     },
     isPending: false,
     error: null,
@@ -148,5 +182,15 @@ describe("SpecShellPage", () => {
     expect(screen.getByText("Thinking it through")).toBeTruthy();
     expect(screen.queryByRole("region", { name: "Spec document" })).toBeNull();
     expect(screen.queryByRole("complementary", { name: "Spec sections" })).toBeNull();
+  });
+
+  it("routes a published phase to the artifact read view", async () => {
+    readState.phase = "published";
+
+    renderWithProviders(<SpecShellPage specId="spec-1" />);
+
+    expect(await screen.findByRole("main", { name: "Published spec view" })).toBeTruthy();
+    expect(screen.getByText("Quota design · 0 open")).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Spec document" })).toBeNull();
   });
 });
