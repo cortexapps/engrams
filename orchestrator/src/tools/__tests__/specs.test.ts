@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { compileToolManifest } from "../manifest.ts";
+import { SpecIdeationPhaseError } from "../../specs/tool-service.ts";
 import { createToolRegistry, type ToolContext } from "../registry.ts";
 import {
   registerSpecTools,
@@ -186,6 +187,90 @@ describe("spec tools", () => {
       rev: 7,
       markdown: "# Published projection revision 7",
     });
+    expect(state.refreshes).toHaveLength(0);
+  });
+
+  test("the exhaustive mutating-tool table returns teaching refusals in ideation", async () => {
+    const state = recorder();
+    const refuse = async (): Promise<SpecMutationResult> => {
+      throw new SpecIdeationPhaseError(8n, ["Ari"]);
+    };
+    state.deps.documents.updateSection = refuse;
+    state.deps.documents.updateBlock = refuse;
+    state.deps.documents.setSectionState = refuse;
+    state.deps.documents.addOpenQuestion = refuse;
+    state.deps.documents.resolveOpenQuestion = refuse;
+    state.deps.documents.proposeTickets = refuse;
+
+    const cases: Array<{ name: string; input: object }> = [
+      {
+        name: "spec_update_section",
+        input: { section_id: "context", markdown: "No write", expected_rev: "8" },
+      },
+      {
+        name: "spec_update_block",
+        input: {
+          section_id: "context",
+          block_id: "diagram",
+          source: "No write",
+          expected_rev: "8",
+        },
+      },
+      {
+        name: "spec_set_section_state",
+        input: { section_id: "context", state: "proposed", expected_rev: "8" },
+      },
+      {
+        name: "spec_add_open_question",
+        input: { section_id: "context", question: "No write?", expected_rev: "8" },
+      },
+      {
+        name: "spec_resolve_open_question",
+        input: {
+          section_id: "context",
+          question_id: "00000000-0000-4000-8000-000000000001",
+          answer_markdown: "No write",
+          expected_rev: "8",
+        },
+      },
+      {
+        name: "spec_propose_tickets",
+        input: {
+          idempotency_key: "no-write",
+          expected_rev: "8",
+          tickets: [
+            {
+              client_id: "ticket-1",
+              title: "No write",
+              description: "This proposal must be refused.",
+              section_id: "context",
+            },
+          ],
+        },
+      },
+    ];
+    const registry = createToolRegistry();
+    registerSpecTools(registry, state.deps);
+    const readOnly = new Set(["spec_read", "spec_gap_check"]);
+    expect(
+      registry
+        .all()
+        .map((tool) => tool.name)
+        .filter((name) => !readOnly.has(name))
+        .sort(),
+    ).toEqual(cases.map((item) => item.name).sort());
+
+    for (const item of cases) {
+      expect(await call(state.deps, item.name, item.input), item.name).toEqual({
+        applied: false,
+        new_rev: "8",
+        concurrent_editors: ["Ari"],
+        message:
+          "This spec is in ideation. Ask the person to start drafting, and keep reading the repository and investigating in the meantime.",
+      });
+    }
+    expect(await call(state.deps, "spec_read", {})).toMatchObject({ rev: "8" });
+    expect(await call(state.deps, "spec_gap_check", {})).toMatchObject({ rev: "8" });
     expect(state.refreshes).toHaveLength(0);
   });
 

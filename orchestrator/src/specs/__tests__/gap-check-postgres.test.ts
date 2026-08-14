@@ -28,8 +28,8 @@ describe("PostgresGapCheckStore with live Postgres", () => {
       [templateId],
     );
     await pool.query(
-      `INSERT INTO spec (id, org_id, template_id, title, lifecycle)
-       VALUES ($1, 'test-org', $2, 'Gap check test spec', 'draft')`,
+      `INSERT INTO spec (id, org_id, template_id, title, phase)
+       VALUES ($1, 'test-org', $2, 'Gap check test spec', 'drafting')`,
       [specId, templateId],
     );
     await pool.query(
@@ -255,8 +255,8 @@ describe("PostgresGapCheckStore with live Postgres", () => {
       [throwawayTemplateId],
     );
     await pool!.query(
-      `INSERT INTO spec (id, org_id, template_id, title, lifecycle)
-       VALUES ($1, 'test-org', $2, 'Cascade spec', 'draft')`,
+      `INSERT INTO spec (id, org_id, template_id, title, phase)
+       VALUES ($1, 'test-org', $2, 'Cascade spec', 'drafting')`,
       [throwawaySpecId, throwawayTemplateId],
     );
     const store = new PostgresGapCheckStore(pool!);

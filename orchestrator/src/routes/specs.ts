@@ -27,7 +27,7 @@ const IDEMPOTENCY_KEY_MAX_CHARS = 200;
 export interface SpecReadRecord {
   id: string;
   title: string;
-  lifecycle: "draft" | "published";
+  phase: "ideation" | "drafting" | "published";
   ownerUserId: string | null;
   sessionId: string | null;
   publishedCheckpointId: string | null;
@@ -56,7 +56,7 @@ export interface SpecReadStore {
 interface SpecRow {
   id: string;
   title: string;
-  lifecycle: string;
+  phase: string;
   owner_user_id: string | null;
   session_id: string | null;
   published_checkpoint_id: string | null;
@@ -82,7 +82,7 @@ export class PostgresSpecReadStore implements SpecReadStore {
 
   async readSpec(specId: string): Promise<SpecReadRecord | null> {
     const result = await this.pool.query<SpecRow>(
-      `SELECT spec.id, spec.title, spec.lifecycle, spec.owner_user_id, spec.session_id,
+      `SELECT spec.id, spec.title, spec.phase, spec.owner_user_id, spec.session_id,
               spec.published_checkpoint_id, spec.published_at, spec.current_semantic_doc_seq,
               spec.template_id, spec_template.name AS template_name
          FROM spec
@@ -92,13 +92,13 @@ export class PostgresSpecReadStore implements SpecReadStore {
     );
     const row = result.rows[0];
     if (!row) return null;
-    if (row.lifecycle !== "draft" && row.lifecycle !== "published") {
-      throw new Error(`Spec ${specId} has an invalid lifecycle: ${row.lifecycle}`);
+    if (row.phase !== "ideation" && row.phase !== "drafting" && row.phase !== "published") {
+      throw new Error(`Spec ${specId} has an invalid phase: ${row.phase}`);
     }
     return {
       id: row.id,
       title: row.title,
-      lifecycle: row.lifecycle,
+      phase: row.phase,
       ownerUserId: row.owner_user_id,
       sessionId: row.session_id,
       publishedCheckpointId: row.published_checkpoint_id,
@@ -208,7 +208,7 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
           title: result.title,
           sessionId: result.sessionId,
           templateId: result.templateId,
-          lifecycle: "draft",
+          phase: "ideation",
         },
       },
       result.created ? 201 : 200,
@@ -222,7 +222,7 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
 
     const summaries = await deps.store.listCheckpoints(specId);
     let publishedCheckpoint: SpecCheckpointRecord | null = null;
-    if (record.lifecycle === "published") {
+    if (record.phase === "published") {
       if (!record.publishedCheckpointId) {
         throw new HTTPException(500, { message: "published spec has no pinned checkpoint" });
       }
@@ -239,7 +239,7 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
       spec: {
         id: record.id,
         title: record.title,
-        lifecycle: record.lifecycle,
+        phase: record.phase,
         sessionId: record.ownerUserId === userId ? record.sessionId : null,
         viewerIsOwner: record.ownerUserId === userId,
         publishedCheckpointId: record.publishedCheckpointId,
@@ -267,8 +267,8 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
     const { specId, userId } = await requireMember(c);
     const record = await deps.store.readSpec(specId);
     if (!record) throw new HTTPException(404, { message: "not found" });
-    if (record.lifecycle !== "draft") {
-      throw new HTTPException(409, { message: "published specs are read-only" });
+    if (record.phase !== "drafting") {
+      throw new HTTPException(409, { message: "the spec must be drafting to restore a section" });
     }
 
     let body: { checkpointId?: unknown; sectionId?: unknown };

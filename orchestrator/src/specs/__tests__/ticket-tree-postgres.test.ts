@@ -134,8 +134,8 @@ describe("the ticket tree with live Postgres", () => {
     );
     for (const id of [specId, draftSpecId]) {
       await pool.query(
-        `INSERT INTO spec (id, org_id, owner_user_id, session_id, template_id, title, lifecycle)
-         VALUES ($1, 'test-org', $2, $3, $4, 'Org sandbox quotas', 'draft')`,
+        `INSERT INTO spec (id, org_id, owner_user_id, session_id, template_id, title, phase)
+         VALUES ($1, 'test-org', $2, $3, $4, 'Org sandbox quotas', 'drafting')`,
         [id, owner, sessionId, templateId],
       );
     }
@@ -152,7 +152,7 @@ describe("the ticket tree with live Postgres", () => {
       );
     }
     await pool.query(
-      `UPDATE spec SET lifecycle = 'published', published_checkpoint_id = $2,
+      `UPDATE spec SET phase = 'published', published_checkpoint_id = $2,
               published_by = $3, published_at = $4, current_semantic_doc_seq = 24
         WHERE id = $1`,
       [specId, checkpointId, owner, NOW],

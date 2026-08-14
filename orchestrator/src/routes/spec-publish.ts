@@ -14,7 +14,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 
 /** The wire shape of the gate. Every org member may read it (ADR 0114 D12). */
 export interface SpecPublishStatusPayload {
-  lifecycle: "draft" | "published";
+  phase: "ideation" | "drafting" | "published";
   canPublish: boolean;
   publishedAt: string | null;
   gate: {
@@ -54,7 +54,7 @@ export interface SpecPublishStatusPayload {
 export interface SpecPublishRouteDeps {
   publish: Pick<SpecPublishService, "status" | "requestPublish">;
   /**
-   * The push wake for the lifecycle scanner. The route records the intent and
+   * The push wake for the publish scanner. The route records the intent and
    * nudges; it never runs the publish steps itself (ADR 0034).
    */
   wake: (specId: string) => Promise<unknown>;
@@ -123,7 +123,7 @@ export function makeSpecPublishRoute(deps: SpecPublishRouteDeps): Hono {
 
 function statusPayload(status: SpecPublishStatus): SpecPublishStatusPayload {
   return {
-    lifecycle: status.lifecycle,
+    phase: status.phase,
     canPublish: status.canPublish,
     publishedAt: status.publishedAt?.toISOString() ?? null,
     gate: {
@@ -213,6 +213,7 @@ function publishHttpError(error: unknown): HTTPException {
       case "not_owner":
         return httpJson(403, body);
       case "blocked":
+      case "ideation":
       case "acknowledgment_required":
       case "gap_check_stale":
       case "gap_check_failed":

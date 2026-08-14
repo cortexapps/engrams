@@ -43,7 +43,7 @@ class MemoryReadStore implements SpecReadStore {
   record: SpecReadRecord = {
     id: SPEC_ID,
     title: "Checkpoint-safe restore",
-    lifecycle: "published",
+    phase: "published",
     ownerUserId: "owner-1",
     sessionId: "session-that-must-not-boot",
     publishedCheckpointId: PINNED_ID,
@@ -154,7 +154,7 @@ describe("spec read routes", () => {
       spec: {
         id: string;
         title: string;
-        lifecycle: string;
+        phase: string;
         sessionId: string | null;
         viewerIsOwner: boolean;
         publishedCheckpointId: string;
@@ -168,7 +168,7 @@ describe("spec read routes", () => {
     expect(body.spec).toEqual({
       id: SPEC_ID,
       title: "Checkpoint-safe restore",
-      lifecycle: "published",
+      phase: "published",
       sessionId: null,
       viewerIsOwner: false,
       publishedCheckpointId: PINNED_ID,
@@ -195,7 +195,7 @@ describe("spec read routes", () => {
     const readStore = new MemoryReadStore();
     readStore.record = {
       ...readStore.record,
-      lifecycle: "draft",
+      phase: "drafting",
       publishedCheckpointId: null,
       publishedAt: null,
     };
@@ -205,10 +205,10 @@ describe("spec read routes", () => {
 
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
-      spec: { lifecycle: string; sessionId: string | null };
+      spec: { phase: string; sessionId: string | null };
       publishedCheckpoint: unknown;
     };
-    expect(body.spec).toMatchObject({ lifecycle: "draft", sessionId: null });
+    expect(body.spec).toMatchObject({ phase: "drafting", sessionId: null });
     expect(body.publishedCheckpoint).toBeNull();
     for (const coordinatorSpy of coordinatorSpies) expect(coordinatorSpy).not.toHaveBeenCalled();
   });
@@ -217,7 +217,7 @@ describe("spec read routes", () => {
     const readStore = new MemoryReadStore();
     readStore.record = {
       ...readStore.record,
-      lifecycle: "draft",
+      phase: "drafting",
       publishedCheckpointId: null,
       publishedAt: null,
     };
@@ -243,7 +243,7 @@ describe("spec read routes", () => {
     const readStore = new MemoryReadStore();
     readStore.record = {
       ...readStore.record,
-      lifecycle: "draft",
+      phase: "drafting",
       publishedCheckpointId: null,
       publishedAt: null,
     };
@@ -294,7 +294,7 @@ describe("spec read routes", () => {
     const readStore = new MemoryReadStore();
     readStore.record = {
       ...readStore.record,
-      lifecycle: "draft",
+      phase: "drafting",
       publishedCheckpointId: null,
       publishedAt: null,
     };
@@ -333,7 +333,7 @@ describe("spec read routes", () => {
     const readStore = new MemoryReadStore();
     readStore.record = {
       ...readStore.record,
-      lifecycle: "draft",
+      phase: "drafting",
       publishedCheckpointId: null,
       publishedAt: null,
     };

@@ -82,7 +82,7 @@ class MemoryRailStore implements SpecRailStore {
 
   async readMetadata(): Promise<SpecRailMetadata | null> {
     return {
-      lifecycle: "draft",
+      phase: "drafting",
       layers: LAYERS,
       sections: TEMPLATE_SECTIONS,
       states: this.states,
@@ -217,7 +217,7 @@ function fixture(options: FixtureOptions = {}) {
   const store = new MemoryPublishStore({
     specId: SPEC_ID,
     title: "Org sandbox quotas",
-    lifecycle: "draft",
+    phase: "drafting",
     ownerUserId: OWNER,
     sessionId: SESSION_ID,
     publishedCheckpointId: null,
@@ -260,6 +260,18 @@ function publishInput(overrides: Partial<Parameters<SpecPublishService["requestP
 }
 
 describe("publish gate service", () => {
+  test("ideation refuses publish until a person starts drafting", async () => {
+    const { service, store } = fixture({ target: { phase: "ideation" } });
+
+    const error = await refusal(service.requestPublish(publishInput()));
+
+    expect(error.code).toBe("ideation");
+    expect(error.message).toContain("Start drafting");
+    expect(error.status?.phase).toBe("ideation");
+    expect(error.status?.canPublish).toBe(false);
+    expect(store.record).toBeNull();
+  });
+
   test("an unsettled required section blocks the publish and names it (R34)", async () => {
     const { service, store } = fixture({
       states: new Map([
@@ -519,7 +531,7 @@ describe("publish gate service", () => {
   });
 
   test("a published spec with no record refuses a second publish (R38)", async () => {
-    const { service } = fixture({ target: { lifecycle: "published" } });
+    const { service } = fixture({ target: { phase: "published" } });
 
     const error = await refusal(service.requestPublish(publishInput()));
 

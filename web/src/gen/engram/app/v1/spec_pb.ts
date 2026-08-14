@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/spec.proto.
  */
 export const file_engram_app_v1_spec: GenFile = /*@__PURE__*/
-  fileDesc("ChhlbmdyYW0vYXBwL3YxL3NwZWMucHJvdG8SDWVuZ3JhbS5hcHAudjEiiAIKDFNwZWNMaXN0SXRlbRIKCgJpZBgBIAEoCRINCgV0aXRsZRgCIAEoCRIVCg10ZW1wbGF0ZV9uYW1lGAMgASgJEhEKBHJlcG8YBCABKAlIAIgBARIRCglsaWZlY3ljbGUYBSABKAkSKQoMcGFydGljaXBhbnRzGAYgAygLMhMuZW5ncmFtLmFwcC52MS5Vc2VyEhsKE29wZW5fcXVlc3Rpb25fY291bnQYByABKAUSGQoRdGlja2V0X3N5bmNfc3RhdGUYCCABKAkSEgoKdXBkYXRlZF9hdBgJIAEoCRIgChhhY3RpdmVfcGFydGljaXBhbnRfY291bnQYCiABKAVCBwoFX3JlcG8iRgoQTGlzdFNwZWNzUmVxdWVzdBIRCglsaWZlY3ljbGUYASABKAkSDAoEcGFnZRgCIAEoBRIRCglwYWdlX3NpemUYAyABKAUiVAoRTGlzdFNwZWNzUmVzcG9uc2USKgoFc3BlY3MYASADKAsyGy5lbmdyYW0uYXBwLnYxLlNwZWNMaXN0SXRlbRITCgt0b3RhbF9jb3VudBgCIAEoBTJdCgtTcGVjU2VydmljZRJOCglMaXN0U3BlY3MSHy5lbmdyYW0uYXBwLnYxLkxpc3RTcGVjc1JlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkxpc3RTcGVjc1Jlc3BvbnNlYgZwcm90bzM", [file_engram_app_v1_user]);
+  fileDesc("ChhlbmdyYW0vYXBwL3YxL3NwZWMucHJvdG8SDWVuZ3JhbS5hcHAudjEihAIKDFNwZWNMaXN0SXRlbRIKCgJpZBgBIAEoCRINCgV0aXRsZRgCIAEoCRIVCg10ZW1wbGF0ZV9uYW1lGAMgASgJEhEKBHJlcG8YBCABKAlIAIgBARINCgVwaGFzZRgFIAEoCRIpCgxwYXJ0aWNpcGFudHMYBiADKAsyEy5lbmdyYW0uYXBwLnYxLlVzZXISGwoTb3Blbl9xdWVzdGlvbl9jb3VudBgHIAEoBRIZChF0aWNrZXRfc3luY19zdGF0ZRgIIAEoCRISCgp1cGRhdGVkX2F0GAkgASgJEiAKGGFjdGl2ZV9wYXJ0aWNpcGFudF9jb3VudBgKIAEoBUIHCgVfcmVwbyJCChBMaXN0U3BlY3NSZXF1ZXN0Eg0KBXBoYXNlGAEgASgJEgwKBHBhZ2UYAiABKAUSEQoJcGFnZV9zaXplGAMgASgFIlQKEUxpc3RTcGVjc1Jlc3BvbnNlEioKBXNwZWNzGAEgAygLMhsuZW5ncmFtLmFwcC52MS5TcGVjTGlzdEl0ZW0SEwoLdG90YWxfY291bnQYAiABKAUyXQoLU3BlY1NlcnZpY2USTgoJTGlzdFNwZWNzEh8uZW5ncmFtLmFwcC52MS5MaXN0U3BlY3NSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5MaXN0U3BlY3NSZXNwb25zZWIGcHJvdG8z", [file_engram_app_v1_user]);
 
 /**
  * @generated from message engram.app.v1.SpecListItem
@@ -39,11 +39,11 @@ export type SpecListItem = Message<"engram.app.v1.SpecListItem"> & {
   repo?: string;
 
   /**
-   * "draft" | "published"
+   * "ideation" | "drafting" | "published"
    *
-   * @generated from field: string lifecycle = 5;
+   * @generated from field: string phase = 5;
    */
-  lifecycle: string;
+  phase: string;
 
   /**
    * connected human collaborators
@@ -92,11 +92,11 @@ export const SpecListItemSchema: GenMessage<SpecListItem> = /*@__PURE__*/
  */
 export type ListSpecsRequest = Message<"engram.app.v1.ListSpecsRequest"> & {
   /**
-   * "" | "all" | "draft" | "published". Empty means all.
+   * "" | "all" | "ideation" | "drafting" | "published". Empty means all.
    *
-   * @generated from field: string lifecycle = 1;
+   * @generated from field: string phase = 1;
    */
-  lifecycle: string;
+  phase: string;
 
   /**
    * The page is 1-based. page_size is limited to 200. A zero page_size means

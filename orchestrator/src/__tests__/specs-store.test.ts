@@ -70,8 +70,8 @@ describe.skipIf(!reachable)("spec list store", () => {
       ids.session,
     ]);
     await pool.query(
-      `INSERT INTO spec (id, org_id, session_id, template_id, title, lifecycle, updated_at)
-       VALUES ($1, 'org-a', $2, $3, 'Visible spec', 'draft', $4),
+      `INSERT INTO spec (id, org_id, session_id, template_id, title, phase, updated_at)
+       VALUES ($1, 'org-a', $2, $3, 'Visible spec', 'drafting', $4),
               ($5, 'org-b', NULL, $3, 'Other organization', 'published', $4)`,
       [ids.spec, ids.session, ids.template, now, ids.otherSpec],
     );

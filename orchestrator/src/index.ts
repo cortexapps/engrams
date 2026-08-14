@@ -79,7 +79,7 @@ import { makeProductionAutomationScheduler } from "./automations/scheduler.ts";
 import { assertSweepPoliciesExhaustive } from "./sweep/policy.ts";
 import { makeSweepRuntime } from "./sweep/production.ts";
 import { getDb, getPool } from "./db/client.ts";
-import { resolveDraftSpec, resolveSpecMembership } from "./authz/resolve.ts";
+import { resolveDraftingSpec, resolveSpecMembership } from "./authz/resolve.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
 import { makeReviewStore } from "./db/reviews.ts";
 import { makeReviewTargetHydrationStore } from "./db/review-target-hydration.ts";
@@ -111,6 +111,7 @@ import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
 import { makeSpecRailRoute, PostgresSpecRailStore } from "./routes/spec-rail.ts";
 import { makeSpecBlockIterationRoute } from "./routes/spec-block-iteration.ts";
 import { makeSpecMessagesRoute, PostgresSpecMessageStore } from "./routes/spec-messages.ts";
+import { makeSpecStartDraftingRoute } from "./routes/spec-start-drafting.ts";
 import { makeSpecEventsRoute } from "./routes/spec-events.ts";
 import { makeSpecTemplatesRoute } from "./routes/spec-templates.ts";
 import { makeSpecTemplateCatalog } from "./specs/template-catalog.ts";
@@ -129,6 +130,12 @@ import {
   DEFAULT_SPEC_PUBLISH_SCANNER_CONFIG,
   SpecPublishScanner,
 } from "./specs/publish-scanner.ts";
+import {
+  DEFAULT_DRAFTING_SEED_SCANNER_CONFIG,
+  DraftingSeedScanner,
+  PostgresSpecDraftingSeedStore,
+  productionDraftingSeedSender,
+} from "./specs/drafting-seed-scanner.ts";
 import { makeSpecPublishRoute } from "./routes/spec-publish.ts";
 import { makeSpecTicketRoute } from "./routes/spec-tickets.ts";
 import { makeSpecTicketSyncRoute } from "./routes/spec-ticket-sync.ts";
@@ -215,6 +222,14 @@ const specPublishScanner = new SpecPublishScanner({
   config: DEFAULT_SPEC_PUBLISH_SCANNER_CONFIG,
   now: specNow,
   log: log.child({ component: "spec-publish-scanner" }),
+});
+const specDraftingSeedStore = new PostgresSpecDraftingSeedStore(getPool());
+const draftingSeedScanner = new DraftingSeedScanner({
+  store: specDraftingSeedStore,
+  sender: productionDraftingSeedSender(),
+  config: DEFAULT_DRAFTING_SEED_SCANNER_CONFIG,
+  now: specNow,
+  log: log.child({ component: "drafting-seed-scanner" }),
 });
 const warnSpecSync = (message: string) => log.warn({ message }, "spec sync warning");
 const specAwarenessBus = new PostgresSpecAwarenessBus(getPool(), { onWarning: warnSpecSync });
@@ -374,6 +389,14 @@ app.route(
 );
 app.route(
   "/",
+  makeSpecStartDraftingRoute({
+    store: specDraftingSeedStore,
+    resolveMembership: resolveSpecMembership,
+    wake: (specId) => draftingSeedScanner.wake(specId),
+  }),
+);
+app.route(
+  "/",
   makeSpecEventsRoute({
     resolveMembership: resolveSpecMembership,
     resolveSessionId: (specId) => specMessageStore.resolveSessionId(specId),
@@ -518,7 +541,7 @@ const server = buildServer(
         participants: specParticipants,
         awarenessBus: specAwarenessBus,
         resolveMembership: resolveSpecMembership,
-        resolveDraft: resolveDraftSpec,
+        resolveDraft: resolveDraftingSpec,
       },
       specSyncHub,
     ),
@@ -598,6 +621,7 @@ const targetHydrator = new TargetHydrator({
 await targetHydrator.start();
 await specDocuments.startPeerSync();
 await specSyncHub.start();
+await draftingSeedScanner.start();
 await specPublishScanner.start();
 const listenerManager = makeProductionListenerManager();
 await listenerManager.start();
@@ -624,6 +648,7 @@ process.on("SIGTERM", () => {
     await automationScheduler.stop();
     await listenerManager.stop();
     await specPublishScanner.stop();
+    await draftingSeedScanner.stop();
     await specSyncHub.stop();
     await specDocuments.stopPeerSync();
     const serverError = await serverStopped;

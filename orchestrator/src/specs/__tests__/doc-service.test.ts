@@ -930,9 +930,9 @@ describe("SpecDocumentService with live Postgres", () => {
       [templateId],
     );
     await livePool.query(
-      `INSERT INTO spec (id, org_id, template_id, title, lifecycle, updated_at)
-       VALUES ($1, 'test-org', $2, 'Test spec', 'draft', $3),
-              ($4, 'test-org', $2, 'Peer spec', 'draft', $5)`,
+      `INSERT INTO spec (id, org_id, template_id, title, phase, updated_at)
+       VALUES ($1, 'test-org', $2, 'Test spec', 'drafting', $3),
+              ($4, 'test-org', $2, 'Peer spec', 'drafting', $5)`,
       [specId, templateId, initialUpdatedAt, peerSpecId, peerUpdatedAt],
     );
     await livePool.query(
@@ -955,7 +955,7 @@ describe("SpecDocumentService with live Postgres", () => {
       `UPDATE spec
           SET current_doc_seq = 0,
               current_semantic_doc_seq = 0,
-              lifecycle = 'draft',
+              phase = 'drafting',
               updated_at = CASE WHEN id = $1 THEN $3::timestamptz ELSE $4::timestamptz END
         WHERE id = ANY($2::uuid[])`,
       [specId, [specId, peerSpecId], initialUpdatedAt, peerUpdatedAt],
@@ -1070,7 +1070,7 @@ describe("SpecDocumentService with live Postgres", () => {
         0,
         "stale draft edit",
       );
-      await livePool.query("UPDATE spec SET lifecycle = 'published' WHERE id = $1", [specId]);
+      await livePool.query("UPDATE spec SET phase = 'published' WHERE id = $1", [specId]);
 
       await expect(
         documents.applyUpdate(specId, staleUpdate, "stale-client"),

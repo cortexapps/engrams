@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 
 import type { SpecListItem } from "../../gen/engram/app/v1/spec_pb";
 import { useNow } from "../../hooks/useNow";
-import { useSpecs, type SpecLifecycleFilter } from "../../hooks/useSpecs";
+import { useSpecs, type SpecPhaseFilter } from "../../hooks/useSpecs";
 import { errorMessage } from "../../lib/errors";
 import { relativeTime } from "../sessions/session-format";
 import { SpecTicketSyncBadge } from "./SpecTicketSyncBadge";
@@ -22,15 +22,15 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-type StatusSearch = { status?: "draft" | "published" };
+type StatusSearch = { status?: "ideation" | "drafting" | "published" };
 const PAGE_SIZE = 50;
 
 export function SpecsList() {
   const search = useSearch({ from: "/_app/specs/" }) as StatusSearch;
   const navigate = useNavigate();
-  const lifecycle: SpecLifecycleFilter = search.status ?? "all";
+  const phase: SpecPhaseFilter = search.status ?? "all";
   const [page, setPage] = useState(1);
-  const { data, error, isPending } = useSpecs(lifecycle, page, PAGE_SIZE);
+  const { data, error, isPending } = useSpecs(phase, page, PAGE_SIZE);
   const now = useNow();
   const totalCount = data?.totalCount;
 
@@ -44,9 +44,9 @@ export function SpecsList() {
     <div className="min-h-0 flex-1 overflow-auto p-4 md:p-6">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <Tabs
-          value={lifecycle}
+          value={phase}
           onValueChange={(value) => {
-            const status = value as SpecLifecycleFilter;
+            const status = value as SpecPhaseFilter;
             selectSpecFilter(status, setPage, (nextSearch) => {
               navigate({ to: "/specs", search: nextSearch });
             });
@@ -54,7 +54,8 @@ export function SpecsList() {
         >
           <TabsList aria-label="Filter tech specs">
             <TabsTrigger value="all">All</TabsTrigger>
-            <TabsTrigger value="draft">Drafts</TabsTrigger>
+            <TabsTrigger value="ideation">Ideation</TabsTrigger>
+            <TabsTrigger value="drafting">Drafting</TabsTrigger>
             <TabsTrigger value="published">Published</TabsTrigger>
           </TabsList>
         </Tabs>
@@ -77,7 +78,7 @@ export function SpecsList() {
         <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed py-16 text-center">
           <FilePenLine className="size-10 text-muted-foreground" strokeWidth={1} aria-hidden />
           <p className="max-w-sm text-sm text-muted-foreground">
-            {lifecycle === "all" ? "No tech specs yet." : `No ${lifecycle} tech specs.`}
+            {phase === "all" ? "No tech specs yet." : `No ${phase} tech specs.`}
           </p>
         </div>
       ) : (
@@ -112,7 +113,7 @@ export function SpecsList() {
 }
 
 export function selectSpecFilter(
-  status: SpecLifecycleFilter,
+  status: SpecPhaseFilter,
   setPage: (page: number) => void,
   navigate: (search: StatusSearch) => void,
 ): void {
@@ -168,8 +169,12 @@ export function SpecRow({ spec, now }: { spec: SpecListItem; now: number }) {
         </p>
       </TableCell>
       <TableCell>
-        <Badge variant={spec.lifecycle === "published" ? "outline" : "secondary"}>
-          {spec.lifecycle === "published" ? "Published" : "Draft"}
+        <Badge variant={spec.phase === "published" ? "outline" : "secondary"}>
+          {spec.phase === "published"
+            ? "Published"
+            : spec.phase === "ideation"
+              ? "Ideation"
+              : "Drafting"}
         </Badge>
       </TableCell>
       <TableCell>

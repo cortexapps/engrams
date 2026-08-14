@@ -57,10 +57,10 @@ describe("SpecDigestService with live Postgres", () => {
     );
     await pool.query(
       `INSERT INTO spec
-         (id, org_id, template_id, title, lifecycle, current_doc_seq, current_semantic_doc_seq)
-       VALUES ($1, 'test', $3, 'First', 'draft', 2, 2),
-              ($2, 'test', $3, 'Second', 'draft', 2, 2),
-              ($4, 'test', $3, 'Snapshot base', 'draft', 1, 1)`,
+         (id, org_id, template_id, title, phase, current_doc_seq, current_semantic_doc_seq)
+       VALUES ($1, 'test', $3, 'First', 'drafting', 2, 2),
+              ($2, 'test', $3, 'Second', 'drafting', 2, 2),
+              ($4, 'test', $3, 'Snapshot base', 'drafting', 1, 1)`,
       [firstSpec, secondSpec, templateId, snapshotBaseSpec],
     );
     const [firstInitial, firstEdit] = updates("first");

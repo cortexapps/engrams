@@ -277,7 +277,7 @@ export const spec = pgTable(
       .notNull()
       .references(() => specTemplate.id),
     title: text("title").notNull(),
-    lifecycle: text("lifecycle").notNull(), // 'draft' | 'published'
+    phase: text("phase").notNull(), // 'ideation' | 'drafting' | 'published'
     currentDocSeq: bigint("current_doc_seq", { mode: "bigint" })
       .notNull()
       .default(sql`0`),
@@ -297,6 +297,33 @@ export const spec = pgTable(
     index("spec_org_updated_idx").on(t.orgId, t.updatedAt),
     index("spec_owner_idx").on(t.ownerUserId),
     index("spec_session_idx").on(t.sessionId),
+  ],
+);
+
+export type SpecDraftingSeedState = "pending" | "delivered";
+
+/** Durable outbox for the first turn after ideation becomes drafting. */
+export const specDraftingSeed = pgTable(
+  "spec_drafting_seed",
+  {
+    specId: uuid("spec_id")
+      .primaryKey()
+      .references(() => spec.id, { onDelete: "cascade" }),
+    sessionId: uuid("session_id").notNull(),
+    /** Stable across retries; the coordinator deduplicates SendPrompt on it. */
+    promptId: text("prompt_id").notNull().unique(),
+    text: text("text").notNull(),
+    state: text("state").$type<SpecDraftingSeedState>().notNull(),
+    attempts: integer("attempts").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull(),
+    lastError: text("last_error"),
+    requestedAt: timestamp("requested_at", { withTimezone: true }).notNull(),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+  },
+  (t) => [
+    index("spec_drafting_seed_due_idx")
+      .on(t.nextAttemptAt)
+      .where(sql`${t.state} = 'pending'`),
   ],
 );
 

@@ -13,7 +13,7 @@ import { sendPrompt as sendPromptMethod } from "@/gen/engram/app/v1/session-Sess
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { type SpecReadResponse, useSpecRead } from "@/hooks/useSpecRead";
 
-type CurrentSpecPhase = "drafting" | "published";
+type CurrentSpecPhase = "ideation" | "drafting" | "published";
 
 export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   const params = useParams({ strict: false });
@@ -115,9 +115,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
 }
 
 function currentPhase(read: SpecReadResponse): CurrentSpecPhase {
-  // S4 replaces this lifecycle derivation with the server's phase value and
-  // adds the ideation branch to this page-level switch.
-  return read.spec.lifecycle === "published" ? "published" : "drafting";
+  return read.spec.phase;
 }
 
 function useSpecConnection(specId: string, enabled: boolean) {

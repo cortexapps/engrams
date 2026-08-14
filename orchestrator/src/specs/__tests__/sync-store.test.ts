@@ -196,8 +196,8 @@ describe("PostgresSpecParticipantStore", () => {
       [templateId],
     );
     await livePool.query(
-      `INSERT INTO spec (id, org_id, template_id, title, lifecycle)
-       VALUES ($1, 'test-org', $2, 'Participant test', 'draft')`,
+      `INSERT INTO spec (id, org_id, template_id, title, phase)
+       VALUES ($1, 'test-org', $2, 'Participant test', 'drafting')`,
       [specId, templateId],
     );
   });
@@ -300,7 +300,7 @@ describe("PostgresSpecParticipantStore", () => {
         await client.query(
           `CREATE TABLE spec (
              id uuid PRIMARY KEY,
-             lifecycle text NOT NULL,
+             phase text NOT NULL,
              current_doc_seq bigint DEFAULT 0 NOT NULL,
              current_semantic_doc_seq bigint DEFAULT 0 NOT NULL,
              updated_at timestamptz NOT NULL
@@ -323,8 +323,8 @@ describe("PostgresSpecParticipantStore", () => {
            )`,
         );
         await client.query(
-          `INSERT INTO spec (id, lifecycle, current_doc_seq, updated_at)
-           VALUES ($1, 'draft', 0, $2)`,
+          `INSERT INTO spec (id, phase, current_doc_seq, updated_at)
+           VALUES ($1, 'drafting', 0, $2)`,
           [specId, initialTime],
         );
         await client.query(

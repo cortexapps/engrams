@@ -34,7 +34,12 @@ import type {
   ProposeTicketsResult,
   SpecTicketTreeService,
 } from "../ticket-tree.ts";
-import { SpecToolService, stableQuestionId, type SpecToolMetadataStore } from "../tool-service.ts";
+import {
+  SpecIdeationPhaseError,
+  SpecToolService,
+  stableQuestionId,
+  type SpecToolMetadataStore,
+} from "../tool-service.ts";
 
 const SPEC_ID = "00000000-0000-4000-8000-000000000135";
 const SESSION_ID = "00000000-0000-4000-8000-000000000136";
@@ -69,6 +74,8 @@ const TEMPLATE_SECTIONS: SpecTemplateSection[] = [
 ];
 
 class MemoryMetadata implements SpecToolMetadataStore {
+  phaseValue: "ideation" | "drafting" | "published" = "drafting";
+
   constructor(
     private readonly editors: Array<{ userId: string; name: string }> = [
       { userId: "user-1", name: "Ari" },
@@ -76,6 +83,10 @@ class MemoryMetadata implements SpecToolMetadataStore {
       { userId: "user-3", name: "Sam" },
     ],
   ) {}
+
+  async phase(): Promise<"ideation" | "drafting" | "published"> {
+    return this.phaseValue;
+  }
 
   async templateSections(): Promise<readonly SpecTemplateSection[]> {
     return TEMPLATE_SECTIONS;
@@ -112,7 +123,10 @@ class RecordedTicketProposals implements Pick<SpecTicketTreeService, "propose"> 
 }
 
 async function setup(
-  options: { afterPersist?: (specId: string, seq: bigint) => void | Promise<void> } = {},
+  options: {
+    afterPersist?: (specId: string, seq: bigint) => void | Promise<void>;
+    phase?: "ideation" | "drafting" | "published";
+  } = {},
 ) {
   const documentStore = new MemoryDocumentStore();
   const documents = new SpecDocumentService(documentStore, {
@@ -128,6 +142,7 @@ async function setup(
   const questionStore = new MemoryQuestionStore();
   const tickets = new RecordedTicketProposals();
   const metadata = new MemoryMetadata();
+  metadata.phaseValue = options.phase ?? "drafting";
   const service = new SpecToolService({
     documents,
     sectionStates: new SectionStateService({
@@ -154,6 +169,102 @@ async function setup(
     tickets,
   };
 }
+
+test("every mutating service entry point refuses during ideation", async () => {
+  const { service, documents, tickets } = await setup({ phase: "ideation" });
+  const before = await service.read(SPEC_ID);
+  const base = { sessionId: SESSION_ID, toolCallId: "ideation-call", actorUserId: "user-1" };
+  const cases: Array<{ name: string; run: () => Promise<unknown> }> = [
+    {
+      name: "spec_update_section",
+      run: () =>
+        service.updateSection(SPEC_ID, {
+          ...base,
+          sectionId: "context",
+          markdown: "Must not land",
+          expectedRev: before.rev,
+        }),
+    },
+    {
+      name: "spec_update_block",
+      run: () =>
+        service.updateBlock(SPEC_ID, {
+          ...base,
+          sectionId: "context",
+          blockId: "missing",
+          source: "must not land",
+          expectedRev: before.rev,
+        }),
+    },
+    {
+      name: "spec_set_section_state",
+      run: () =>
+        service.setSectionState(SPEC_ID, {
+          ...base,
+          sectionId: "context",
+          state: "proposed",
+          expectedRev: before.rev,
+        }),
+    },
+    {
+      name: "spec_add_open_question",
+      run: () =>
+        service.addOpenQuestion(SPEC_ID, {
+          ...base,
+          sectionId: "context",
+          question: "Must not land?",
+          expectedRev: before.rev,
+        }),
+    },
+    {
+      name: "spec_resolve_open_question",
+      run: () =>
+        service.resolveOpenQuestion(SPEC_ID, {
+          ...base,
+          sectionId: "context",
+          questionId: "00000000-0000-4000-8000-000000000001",
+          answerMarkdown: "Must not land",
+          expectedRev: before.rev,
+        }),
+    },
+    {
+      name: "spec_propose_tickets",
+      run: () =>
+        service.proposeTickets(SPEC_ID, {
+          ...base,
+          idempotencyKey: "must-not-land",
+          tickets: [
+            {
+              client_id: "ticket-1",
+              title: "Must not land",
+              description: "This proposal is refused.",
+              section_id: "context",
+            },
+          ],
+          expectedRev: before.rev,
+        }),
+    },
+  ];
+
+  for (const item of cases) {
+    try {
+      await item.run();
+      throw new Error(`${item.name} was expected to refuse ideation`);
+    } catch (error) {
+      expect(error, item.name).toBeInstanceOf(SpecIdeationPhaseError);
+      expect(error, item.name).toMatchObject({
+        newRev: before.rev,
+        concurrentEditors: ["Sam"],
+      });
+      expect((error as Error).message, item.name).toContain("Ask the person to start drafting");
+      expect((error as Error).message, item.name).toContain("keep reading the repository");
+    }
+  }
+
+  expect((await service.read(SPEC_ID)).markdown).toBe(before.markdown);
+  expect((await documents.syncFromLog(SPEC_ID)).semanticDocSeq).toBe(before.rev);
+  expect(tickets.calls).toHaveLength(0);
+});
 
 async function selectedTextSpan(
   documents: SpecDocumentService,

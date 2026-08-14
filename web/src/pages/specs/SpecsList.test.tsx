@@ -62,18 +62,18 @@ test("polling returns an empty last page to the new last page", async () => {
     id: "spec-page-1",
     title: "First page spec",
     templateName: "Design",
-    lifecycle: "draft",
+    phase: "drafting",
     updatedAt: "2026-08-10T12:00:00.000Z",
   });
   const secondPageSpec = create(SpecListItemSchema, {
     id: "spec-page-2",
     title: "Second page spec",
     templateName: "Design",
-    lifecycle: "draft",
+    phase: "drafting",
     updatedAt: "2026-08-10T12:00:00.000Z",
   });
   let totalCount = 51;
-  useSpecsMock.mockImplementation((_lifecycle: string, page: number) => ({
+  useSpecsMock.mockImplementation((_phase: string, page: number) => ({
     data: {
       specs: page === 1 ? [firstPageSpec] : totalCount === 51 ? [secondPageSpec] : [],
       totalCount,
@@ -101,10 +101,11 @@ test("keeps backward navigation while it corrects an out-of-range page", () => {
   expect(screen.getByText("Page 2 of 1")).toBeTruthy();
 });
 
-test("All, Drafts, and Published reset pagination and select their filter", () => {
+test("all phase filters reset pagination and select their value", () => {
   for (const [status, expected] of [
     ["all", {}],
-    ["draft", { status: "draft" }],
+    ["ideation", { status: "ideation" }],
+    ["drafting", { status: "drafting" }],
     ["published", { status: "published" }],
   ] as const) {
     let selectedPage = 3;
@@ -130,7 +131,7 @@ test("renders every field in a complete list row", () => {
     title: "Durable collaboration",
     templateName: "Design",
     repo: "cortexapps/engrams",
-    lifecycle: "draft",
+    phase: "drafting",
     participants: [{ id: "person-1", name: "Taylor Member", email: "taylor@test" }],
     activeParticipantCount: 1,
     openQuestionCount: 2,
@@ -147,7 +148,7 @@ test("renders every field in a complete list row", () => {
 
   expect(screen.getByText("Durable collaboration")).toBeTruthy();
   expect(screen.getByText("Design · cortexapps/engrams")).toBeTruthy();
-  expect(screen.getByText("Draft")).toBeTruthy();
+  expect(screen.getByText("Drafting")).toBeTruthy();
   expect(screen.getByLabelText("Taylor Member")).toBeTruthy();
   expect(screen.getByText("2")).toBeTruthy();
   expect(screen.getByText("Sync failed")).toBeTruthy();

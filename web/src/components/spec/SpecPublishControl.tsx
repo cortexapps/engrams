@@ -53,7 +53,7 @@ export function SpecPublishControl({ specId, onReviewSection }: SpecPublishContr
 
   if (!status.data) return null;
   const current = refusal ?? status.data;
-  // A publish the pin refused is not running: the spec is still a draft, and
+  // A publish the pin refused is not running: the spec is still in drafting, and
   // the gate is what the person needs next. Its reason rides along.
   const refused = current.publish?.state === "blocked" ? current.publish.lastError : null;
   const running =

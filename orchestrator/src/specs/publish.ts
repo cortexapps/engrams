@@ -37,7 +37,7 @@ import type { GapCheckService } from "./gap-check.ts";
 export interface SpecPublishTarget {
   specId: string;
   title: string;
-  lifecycle: "draft" | "published";
+  phase: "ideation" | "drafting" | "published";
   ownerUserId: string | null;
   sessionId: string | null;
   publishedCheckpointId: string | null;
@@ -149,7 +149,7 @@ export type VerifyForPinResult =
   | { ok: false; retryable: boolean; reason: string };
 
 export type PinOutcome =
-  /** The pin committed: checkpoint, lifecycle flip and publish row together. */
+  /** The pin committed: checkpoint, phase flip and publish row together. */
   | { kind: "pinned" }
   /** The document moved past the compaction. Recompact and try again. */
   | { kind: "stale_document"; currentSemanticDocSeq: bigint }
@@ -160,7 +160,7 @@ export type PinOutcome =
 
 /** Everything the browser needs to render the button and the dialog. */
 export interface SpecPublishStatus {
-  lifecycle: "draft" | "published";
+  phase: "ideation" | "drafting" | "published";
   gate: PublishGate;
   gapCheck: { stale: boolean; runId: string | null; ranAt: Date | null; gates: boolean };
   publish: SpecPublishRecord | null;
@@ -193,6 +193,7 @@ export class SpecPublishError extends Error {
       | "spec_not_found"
       | "not_owner"
       | "no_session"
+      | "ideation"
       | "already_published"
       | "blocked"
       | "acknowledgment_required"
@@ -265,10 +266,17 @@ export class SpecPublishService {
         created: false,
       };
     }
-    if (target.lifecycle === "published") {
+    if (target.phase === "published") {
       throw new SpecPublishError(
         "already_published",
         "This spec is already published. Rework means a new spec.",
+        await this.statusFor(target, input.actorUserId),
+      );
+    }
+    if (target.phase === "ideation") {
+      throw new SpecPublishError(
+        "ideation",
+        "Start drafting before you publish this spec.",
         await this.statusFor(target, input.actorUserId),
       );
     }
@@ -449,7 +457,7 @@ export class SpecPublishService {
     });
     const publish = await this.options.store.readPublish(target.specId);
     return {
-      lifecycle: target.lifecycle,
+      phase: target.phase,
       gate,
       gapCheck: {
         stale: gapCheck.stale,
@@ -460,7 +468,7 @@ export class SpecPublishService {
       publish,
       canPublish:
         target.ownerUserId === actorUserId &&
-        target.lifecycle === "draft" &&
+        target.phase === "drafting" &&
         (publish === null || publish.state === "blocked"),
       publishedAt: target.publishedAt,
     };
@@ -508,7 +516,7 @@ export function publishGateSections(
 interface SpecPublishTargetRow {
   id: string;
   title: string;
-  lifecycle: string;
+  phase: string;
   owner_user_id: string | null;
   session_id: string | null;
   published_checkpoint_id: string | null;
@@ -549,7 +557,7 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
 
   async readTarget(specId: string): Promise<SpecPublishTarget | null> {
     const result = await this.pool.query<SpecPublishTargetRow>(
-      `SELECT spec.id, spec.title, spec.lifecycle, spec.owner_user_id, spec.session_id,
+      `SELECT spec.id, spec.title, spec.phase, spec.owner_user_id, spec.session_id,
               spec.published_checkpoint_id, spec.published_at
          FROM spec
         WHERE spec.id = $1`,
@@ -557,13 +565,13 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
     );
     const row = result.rows[0];
     if (!row) return null;
-    if (row.lifecycle !== "draft" && row.lifecycle !== "published") {
-      throw new Error(`Spec ${specId} has an invalid lifecycle: ${row.lifecycle}`);
+    if (row.phase !== "ideation" && row.phase !== "drafting" && row.phase !== "published") {
+      throw new Error(`Spec ${specId} has an invalid phase: ${row.phase}`);
     }
     return {
       specId: row.id,
       title: row.title,
-      lifecycle: row.lifecycle,
+      phase: row.phase,
       ownerUserId: row.owner_user_id,
       sessionId: row.session_id,
       publishedCheckpointId: row.published_checkpoint_id,
@@ -661,13 +669,13 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
       await client.query("BEGIN");
       // Every writer of the document, the section states and the open questions
       // takes this row first, so holding it makes the checks below final.
-      const spec = await client.query<{ lifecycle: string; current_semantic_doc_seq: string }>(
-        `SELECT lifecycle, current_semantic_doc_seq::text AS current_semantic_doc_seq
+      const spec = await client.query<{ phase: string; current_semantic_doc_seq: string }>(
+        `SELECT phase, current_semantic_doc_seq::text AS current_semantic_doc_seq
            FROM spec WHERE id = $1 FOR UPDATE`,
         [input.specId],
       );
       const row = spec.rows[0];
-      if (!row || row.lifecycle !== "draft") {
+      if (!row || row.phase !== "drafting") {
         await client.query("ROLLBACK");
         return { kind: "not_requested" };
       }
@@ -750,9 +758,9 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
       }
       await client.query(
         `UPDATE spec
-            SET lifecycle = 'published', published_checkpoint_id = $2,
+            SET phase = 'published', published_checkpoint_id = $2,
                 published_by = $3, published_at = $4, updated_at = $4
-          WHERE id = $1 AND lifecycle = 'draft'`,
+          WHERE id = $1 AND phase = 'drafting'`,
         [input.specId, input.checkpoint.id, input.publishedBy, input.at],
       );
       await client.query("COMMIT");

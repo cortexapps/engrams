@@ -60,7 +60,7 @@ export class SectionStateConflictError extends Error {
 }
 
 export class SectionStateReadOnlyError extends Error {
-  constructor(message = "Published specs are read-only.") {
+  constructor(message = "Only specs in drafting can change section state.") {
     super(message);
     this.name = "SectionStateReadOnlyError";
   }
@@ -336,7 +336,7 @@ export class PostgresSectionStateStore implements SectionStateStore {
         await client.query("COMMIT");
         return { status: "replayed", action: existing };
       }
-      if (lockedSpec.lifecycle !== "draft") {
+      if (lockedSpec.phase !== "drafting") {
         await client.query("ROLLBACK");
         return { status: "read_only" };
       }
@@ -474,9 +474,9 @@ function sameState(left: SectionStateValue, right: SectionStateValue): boolean {
 async function lockSpec(
   client: PoolClient,
   specId: string,
-): Promise<{ currentDocSeq: bigint; lifecycle: string }> {
-  const result = await client.query<{ current_semantic_doc_seq: string; lifecycle: string }>(
-    `SELECT current_semantic_doc_seq::text AS current_semantic_doc_seq, lifecycle
+): Promise<{ currentDocSeq: bigint; phase: string }> {
+  const result = await client.query<{ current_semantic_doc_seq: string; phase: string }>(
+    `SELECT current_semantic_doc_seq::text AS current_semantic_doc_seq, phase
        FROM spec
       WHERE id = $1
       FOR UPDATE`,
@@ -485,7 +485,7 @@ async function lockSpec(
   if (result.rowCount !== 1) throw new Error("The spec does not exist.");
   return {
     currentDocSeq: BigInt(result.rows[0]!.current_semantic_doc_seq),
-    lifecycle: result.rows[0]!.lifecycle,
+    phase: result.rows[0]!.phase,
   };
 }
 

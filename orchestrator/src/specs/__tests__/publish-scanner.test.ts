@@ -55,7 +55,7 @@ function record(overrides: Partial<SpecPublishRecord> = {}): SpecPublishRecord {
 /** The store, with the state machine's guards but no Postgres. */
 class MemoryPublishStore implements SpecPublishStore {
   row: SpecPublishRecord;
-  lifecycle: "draft" | "published" = "draft";
+  phase: "drafting" | "published" = "drafting";
   publishedCheckpointId: string | null = null;
   publishedBy: string | null = null;
   publishedAt: Date | null = null;
@@ -106,7 +106,7 @@ class MemoryPublishStore implements SpecPublishStore {
 
   /** Mirrors the pin transaction: the same guards, in the same order. */
   async pin(input: PinPublishInput): Promise<PinOutcome> {
-    if (this.row.state !== "requested" || this.lifecycle !== "draft") {
+    if (this.row.state !== "requested" || this.phase !== "drafting") {
       return { kind: "not_requested" };
     }
     if (this.semanticDocSeq !== input.semanticDocSeq) {
@@ -133,7 +133,7 @@ class MemoryPublishStore implements SpecPublishStore {
     }
     this.checkpoints.set(input.checkpoint.id, input.checkpoint.renderedMarkdown);
     this.row = { ...this.row, state: "pinned", pinnedAt: input.at, lastError: null };
-    this.lifecycle = "published";
+    this.phase = "published";
     this.publishedCheckpointId = input.checkpoint.id;
     this.publishedBy = input.publishedBy;
     this.publishedAt = input.at;
@@ -352,7 +352,7 @@ describe("spec publish scanner", () => {
       failed: 0,
     });
     expect(f.store.row.state).toBe("complete");
-    expect(f.store.lifecycle).toBe("published");
+    expect(f.store.phase).toBe("published");
     expect(f.store.publishedCheckpointId).toBe(CHECKPOINT_ID);
     expect(f.store.publishedBy).toBe(OWNER);
     expect(f.store.publishedAt).toEqual(NOW);
@@ -401,7 +401,7 @@ describe("spec publish scanner", () => {
       failed: 1,
     });
     expect(f.store.row.state).toBe("pinned");
-    expect(f.store.lifecycle).toBe("published");
+    expect(f.store.phase).toBe("published");
     expect(f.store.row.lastError).toBe("the sandbox is not reachable");
 
     f.advanceClock(20_000);
@@ -489,7 +489,7 @@ describe("spec publish scanner", () => {
     expect(f.store.row.lastError).toBe("1 required sections are no longer settled.");
     // Nothing became immutable: no checkpoint, no flip, no artifact.
     expect(f.store.checkpoints.size).toBe(0);
-    expect(f.store.lifecycle).toBe("draft");
+    expect(f.store.phase).toBe("drafting");
     expect(f.store.publishedCheckpointId).toBeNull();
     expect(f.artifacts.publishes).toHaveLength(0);
     expect(f.ticketize.starts).toHaveLength(0);
@@ -527,7 +527,7 @@ describe("spec publish scanner", () => {
     expect(result.blocked).toBe(1);
     expect(f.store.row.state).toBe("blocked");
     expect(f.store.checkpoints.size).toBe(0);
-    expect(f.store.lifecycle).toBe("draft");
+    expect(f.store.phase).toBe("drafting");
   });
 
   test("a document that merely moved defers the pin and retries", async () => {
@@ -576,7 +576,7 @@ describe("spec publish scanner", () => {
     expect(result.blocked).toBe(0);
     expect(f.store.row.state).toBe("requested");
     expect(f.store.checkpoints.size).toBe(0);
-    expect(f.store.lifecycle).toBe("draft");
+    expect(f.store.phase).toBe("drafting");
   });
 
   test("a push wake for another spec claims nothing", async () => {

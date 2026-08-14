@@ -11,6 +11,7 @@ import {
 } from "@engrams/spec-document";
 
 import type { ToolContext, ToolRegistry } from "./registry.ts";
+import { SpecIdeationPhaseError } from "../specs/tool-service.ts";
 
 const SPEC_TASK_TYPES = ["spec"] as const;
 
@@ -220,6 +221,7 @@ const MutationOutput = z.object({
   applied: z.boolean(),
   new_rev: Revision,
   concurrent_editors: z.array(z.string()),
+  message: z.string().optional(),
   transcript_chip: z
     .object({
       kind: z.literal("spec_tracked_edit"),
@@ -250,6 +252,7 @@ export interface SpecMutationResult {
   applied: boolean;
   newRev: bigint;
   concurrentEditors: string[];
+  message?: string;
   transcriptChip?: TrackedEditTranscriptChip;
   checkpointId?: string;
 }
@@ -390,6 +393,7 @@ function mutationOutput(
     applied: result.applied,
     new_rev: result.newRev.toString(),
     concurrent_editors: result.concurrentEditors,
+    ...(result.message === undefined ? {} : { message: result.message }),
     ...(result.transcriptChip === undefined
       ? {}
       : { transcript_chip: result.transcriptChip }),
@@ -451,12 +455,24 @@ async function withSectionPresence<T>(
   }
 }
 
-async function finishMutation(
+async function runMutation(
   ctx: ToolContext,
   deps: SpecToolDeps,
   specId: string,
-  result: SpecMutationResult,
+  action: () => Promise<SpecMutationResult>,
 ): Promise<z.input<typeof MutationOutput>> {
+  let result: SpecMutationResult;
+  try {
+    result = await action();
+  } catch (error) {
+    if (!(error instanceof SpecIdeationPhaseError)) throw error;
+    result = {
+      applied: false,
+      newRev: error.newRev,
+      concurrentEditors: error.concurrentEditors,
+      message: error.message,
+    };
+  }
   if (result.applied) {
     await deps.projection.request({
       specId,
@@ -522,20 +538,16 @@ export function registerSpecTools(
     handler: async (ctx, args) => {
       const spec = await requireSpec(ctx, deps);
       const selection = updateSelection(args);
-      const result = await withSectionPresence(
-        ctx,
-        deps,
-        spec.id,
-        args.section_id,
-        () =>
+      return runMutation(ctx, deps, spec.id, () =>
+        withSectionPresence(ctx, deps, spec.id, args.section_id, () =>
           deps.documents.updateSection(spec.id, {
             ...mutationContext(ctx, args.expected_rev),
             sectionId: args.section_id,
             markdown: args.markdown,
             ...(selection === undefined ? {} : { selection }),
           }),
+        ),
       );
-      return finishMutation(ctx, deps, spec.id, result);
     },
   });
 
@@ -550,20 +562,16 @@ export function registerSpecTools(
     execution: "sync",
     handler: async (ctx, args) => {
       const spec = await requireSpec(ctx, deps);
-      const result = await withSectionPresence(
-        ctx,
-        deps,
-        spec.id,
-        args.section_id,
-        () =>
+      return runMutation(ctx, deps, spec.id, () =>
+        withSectionPresence(ctx, deps, spec.id, args.section_id, () =>
           deps.documents.setSectionState(spec.id, {
             ...mutationContext(ctx, args.expected_rev),
             sectionId: args.section_id,
             state: args.state,
             ...(args.reason === undefined ? {} : { reason: args.reason }),
           }),
+        ),
       );
-      return finishMutation(ctx, deps, spec.id, result);
     },
   });
 
@@ -577,19 +585,15 @@ export function registerSpecTools(
     execution: "sync",
     handler: async (ctx, args) => {
       const spec = await requireSpec(ctx, deps);
-      const result = await withSectionPresence(
-        ctx,
-        deps,
-        spec.id,
-        args.section_id,
-        () =>
+      return runMutation(ctx, deps, spec.id, () =>
+        withSectionPresence(ctx, deps, spec.id, args.section_id, () =>
           deps.documents.addOpenQuestion(spec.id, {
             ...mutationContext(ctx, args.expected_rev),
             sectionId: args.section_id,
             question: args.question,
           }),
+        ),
       );
-      return finishMutation(ctx, deps, spec.id, result);
     },
   });
 
@@ -604,20 +608,16 @@ export function registerSpecTools(
     execution: "sync",
     handler: async (ctx, args) => {
       const spec = await requireSpec(ctx, deps);
-      const result = await withSectionPresence(
-        ctx,
-        deps,
-        spec.id,
-        args.section_id,
-        () =>
+      return runMutation(ctx, deps, spec.id, () =>
+        withSectionPresence(ctx, deps, spec.id, args.section_id, () =>
           deps.documents.resolveOpenQuestion(spec.id, {
             ...mutationContext(ctx, args.expected_rev),
             sectionId: args.section_id,
             questionId: args.question_id,
             answerMarkdown: args.answer_markdown,
           }),
+        ),
       );
-      return finishMutation(ctx, deps, spec.id, result);
     },
   });
 
@@ -632,20 +632,16 @@ export function registerSpecTools(
     execution: "sync",
     handler: async (ctx, args) => {
       const spec = await requireSpec(ctx, deps);
-      const result = await withSectionPresence(
-        ctx,
-        deps,
-        spec.id,
-        args.section_id,
-        () =>
+      return runMutation(ctx, deps, spec.id, () =>
+        withSectionPresence(ctx, deps, spec.id, args.section_id, () =>
           deps.documents.updateBlock(spec.id, {
             ...mutationContext(ctx, args.expected_rev),
             sectionId: args.section_id,
             blockId: args.block_id,
             source: args.source,
           }),
+        ),
       );
-      return finishMutation(ctx, deps, spec.id, result);
     },
   });
 
@@ -660,12 +656,13 @@ export function registerSpecTools(
     execution: "sync",
     handler: async (ctx, args) => {
       const spec = await requireSpec(ctx, deps);
-      const result = await deps.documents.proposeTickets(spec.id, {
-        ...mutationContext(ctx, args.expected_rev),
-        idempotencyKey: args.idempotency_key,
-        tickets: args.tickets,
-      });
-      return finishMutation(ctx, deps, spec.id, result);
+      return runMutation(ctx, deps, spec.id, () =>
+        deps.documents.proposeTickets(spec.id, {
+          ...mutationContext(ctx, args.expected_rev),
+          idempotencyKey: args.idempotency_key,
+          tickets: args.tickets,
+        }),
+      );
     },
   });
 

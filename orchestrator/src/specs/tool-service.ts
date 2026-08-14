@@ -47,12 +47,17 @@ const AGENT_QUESTION_NAMESPACE = "6a7dd40c-5d36-529d-9561-5f8e1fbea3c7";
 const BLOCK_CHECKPOINT_NAMESPACE = "21b9e56c-54b5-5f8f-a650-320e68aa50d6";
 
 export interface SpecToolMetadataStore {
+  phase(specId: string): Promise<"ideation" | "drafting" | "published">;
   templateSections(specId: string): Promise<readonly SpecTemplateSection[]>;
   concurrentEditorNames(specId: string, actorUserId?: string): Promise<string[]>;
 }
 
 interface TemplateSectionsRow {
   sections: SpecTemplateSection[];
+}
+
+interface SpecPhaseRow {
+  phase: string;
 }
 
 interface EditorNameRow {
@@ -64,6 +69,16 @@ export class PostgresSpecToolMetadataStore implements SpecToolMetadataStore {
     private readonly pool: Pool,
     private readonly now: () => Date,
   ) {}
+
+  async phase(specId: string): Promise<"ideation" | "drafting" | "published"> {
+    const result = await this.pool.query<SpecPhaseRow>("SELECT phase FROM spec WHERE id = $1", [
+      specId,
+    ]);
+    const value = result.rows[0]?.phase;
+    if (value === "ideation" || value === "drafting" || value === "published") return value;
+    if (value === undefined) throw new Error(`Unknown spec: ${specId}`);
+    throw new Error(`Spec ${specId} has an invalid phase: ${value}`);
+  }
 
   async templateSections(specId: string): Promise<readonly SpecTemplateSection[]> {
     const result = await this.pool.query<TemplateSectionsRow>(
@@ -105,6 +120,18 @@ export interface SpecToolServiceOptions {
   now: () => Date;
 }
 
+export class SpecIdeationPhaseError extends Error {
+  constructor(
+    readonly newRev: bigint,
+    readonly concurrentEditors: string[],
+  ) {
+    super(
+      "This spec is in ideation. Ask the person to start drafting, and keep reading the repository and investigating in the meantime.",
+    );
+    this.name = "SpecIdeationPhaseError";
+  }
+}
+
 interface LocatedDiagramBlock {
   node: ProseMirrorNode;
   position: number;
@@ -114,6 +141,15 @@ interface LocatedDiagramBlock {
 /** Production adapter from agent tool contracts to the collaborative document services. */
 export class SpecToolService implements SpecToolDocumentService {
   constructor(private readonly options: SpecToolServiceOptions) {}
+
+  private async requireDrafting(specId: string, input: SpecMutationContext): Promise<void> {
+    if ((await this.options.metadata.phase(specId)) !== "ideation") return;
+    const loaded = await this.options.documents.syncFromLog(specId);
+    throw new SpecIdeationPhaseError(
+      loaded.semanticDocSeq,
+      await this.options.metadata.concurrentEditorNames(specId, input.actorUserId),
+    );
+  }
 
   async read(specId: string, sectionId?: string): Promise<LiveSpecRead> {
     const loaded = await this.options.documents.syncFromLog(specId);
@@ -174,6 +210,7 @@ export class SpecToolService implements SpecToolDocumentService {
       selection?: SpecSelectionSpan;
     },
   ): Promise<SpecMutationResult> {
+    await this.requireDrafting(specId, input);
     if (input.selection) {
       return this.updateSelectedRange(specId, { ...input, selection: input.selection });
     }
@@ -266,6 +303,7 @@ export class SpecToolService implements SpecToolDocumentService {
       reason?: string;
     },
   ): Promise<SpecMutationResult> {
+    await this.requireDrafting(specId, input);
     const loaded = await this.options.documents.syncFromLog(specId);
     // Changing the state of content that the agent has not seen is the
     // same clobber as a stale section write, so the same fence applies.
@@ -311,6 +349,7 @@ export class SpecToolService implements SpecToolDocumentService {
     specId: string,
     input: SpecMutationContext & { sectionId: string; question: string },
   ): Promise<SpecMutationResult> {
+    await this.requireDrafting(specId, input);
     const questionId = stableQuestionId(specId, input.sessionId, input.toolCallId);
     const loaded = await this.options.documents.syncFromLog(specId);
     const document = proseMirrorDocument(loaded.doc);
@@ -392,6 +431,7 @@ export class SpecToolService implements SpecToolDocumentService {
       answerMarkdown: string;
     },
   ): Promise<SpecMutationResult> {
+    await this.requireDrafting(specId, input);
     const question = await this.options.questionStore.find(input.questionId);
     if (!question)
       throw new OpenQuestionError("question_not_found", "The open question does not exist.");
@@ -431,6 +471,7 @@ export class SpecToolService implements SpecToolDocumentService {
     specId: string,
     input: SpecMutationContext & { sectionId: string; blockId: string; source: string },
   ): Promise<SpecMutationResult> {
+    await this.requireDrafting(specId, input);
     const loaded = await this.options.documents.syncFromLog(specId);
     if (await this.staleForSection(specId, input, input.sectionId, loaded.semanticDocSeq)) {
       return this.result(specId, input, false, loaded.semanticDocSeq);
@@ -487,6 +528,7 @@ export class SpecToolService implements SpecToolDocumentService {
     specId: string,
     input: Parameters<SpecToolDocumentService["proposeTickets"]>[1],
   ): Promise<SpecMutationResult> {
+    await this.requireDrafting(specId, input);
     const loaded = await this.options.documents.syncFromLog(specId);
     if (input.expectedRev !== undefined && input.expectedRev !== loaded.semanticDocSeq) {
       return this.result(specId, input, false, loaded.semanticDocSeq);
