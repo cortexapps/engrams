@@ -43,7 +43,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
     phase === "drafting" ? (connection?.doc ?? null) : null,
     {
       readingSectionId,
-      openQuestions: publish.data?.gate.openQuestions,
+      openQuestions: publish.data?.openQuestions,
     },
   );
   useDocumentTitle(read.data?.spec.title ?? "Tech spec");

@@ -1,4 +1,4 @@
-import { SpecPublishControl } from "@/components/spec/SpecPublishControl";
+import { SpecPublishConfirm } from "./SpecPublishConfirm";
 import { Switch } from "@/components/ui/switch";
 import { Text } from "@/components/ui/text";
 import type { SpecCheckpointSummary } from "@/hooks/useSpecRead";
@@ -55,7 +55,7 @@ export function SpecTopBar({
         </label>
         <CheckpointButton specId={specId} checkpoints={checkpoints} />
         {viewerIsOwner ? (
-          <SpecPublishControl specId={specId} onReviewSection={() => undefined} />
+          <SpecPublishConfirm specId={specId} viewerIsOwner={viewerIsOwner} />
         ) : null}
       </div>
     </header>

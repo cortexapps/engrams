@@ -4,8 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 import { renderWithProviders } from "@/test-utils";
 import { SpecShell } from "./SpecShell";
 
-vi.mock("@/components/spec/SpecPublishControl", () => ({
-  SpecPublishControl: () => <button type="button">Publish</button>,
+vi.mock("./SpecPublishConfirm", () => ({
+  SpecPublishConfirm: () => <button type="button">Publish</button>,
 }));
 
 describe("SpecShell", () => {
