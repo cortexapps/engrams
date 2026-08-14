@@ -36,12 +36,39 @@ use engram_chunk_store::{ChunkStore, ManifestKind};
 use engram_core::traits::BlobStorage;
 use engram_core::types::manifest::ManifestRef;
 use engram_host_agent::disk_daemon::{
-    attach_manifest, HostNbdKernel, NbdSandboxState, NbdSlotAllocator,
+    attach_manifest, device_has_live_holder, HostNbdKernel, NbdRuntimeError, NbdSandboxState,
+    NbdSlotAllocator,
 };
 use engram_host_core::NbdKernel;
 use engram_storage_local::LocalBlobStorage;
 
-/// Clear any stale binding from a prior aborted run (idempotent).
+/// True when the kernel holds no binding on this device: the sysfs `pid` is
+/// absent or empty, and the block device reports zero size.
+fn device_is_free(nbd_path: &std::path::Path) -> bool {
+    let Some(name) = nbd_path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if pid_file(nbd_path).is_some() {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/sys/block/{name}/size")) {
+        Ok(size) => size.trim() == "0",
+        Err(_) => false,
+    }
+}
+
+/// Clear any stale binding from a prior aborted run, then WAIT for the kernel
+/// to release the device (idempotent).
+///
+/// This used to send DISCONNECT twenty times with a fixed 200 ms sleep between
+/// them and return whatever the state was: always 4 s, even for a device that
+/// was already free, and no check that the kernel had finished.
+///
+/// The wait is now observed rather than assumed. It is NOT what fixes the
+/// `EBUSY` flake seen on main and on PR #1241 on 2026-08-13 — the udev probe
+/// window described at the CONNECT below is invisible to sysfs, so the retry
+/// there is the fix. This wait covers the other half: a binding that a prior
+/// aborted run left with a live pid, which no retry could clear.
 fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
     let Some(idx) = nbd_path
         .file_name()
@@ -51,10 +78,29 @@ fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
     else {
         return;
     };
-    for _ in 0..20 {
-        let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(idx);
-        std::thread::sleep(std::time::Duration::from_millis(200));
+    for attempt in 0..40 {
+        if device_is_free(nbd_path) {
+            return;
+        }
+        // Re-send only every fourth pass: DISCONNECT is the request, and the
+        // waiting between passes is what lets the kernel finish it.
+        if attempt % 4 == 0 {
+            let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(idx);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
+    // Do not return quietly into a CONNECT that will fail with a bare `EBUSY`.
+    // Name what still holds the device instead.
+    panic!(
+        "{} is still bound after 10 s of DISCONNECT: sysfs pid {:?}, size {:?}",
+        nbd_path.display(),
+        pid_file(nbd_path),
+        nbd_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|name| std::fs::read_to_string(format!("/sys/block/{name}/size")).ok())
+            .map(|s| s.trim().to_string()),
+    );
 }
 
 fn preflight() -> Option<PathBuf> {
@@ -141,17 +187,45 @@ async fn connected_devices_reflects_kernel_ground_truth() {
         .expect("put manifest");
 
     // CONNECT + serve: a real netlink-bound /dev/nbdN with a live server.
+    //
+    // Retry on EBUSY. A DISCONNECT raises a uevent, and systemd-udevd opens the
+    // block device to probe it (blkid et al.) for a few milliseconds after.
+    // While that probe fd is open the kernel refuses a new CONNECT, and sysfs
+    // shows no pid and zero size throughout — so no amount of waiting on sysfs
+    // can close the window, and a check that passed a moment ago says nothing
+    // about the instant of the CONNECT. `device_has_live_holder` documents the
+    // same udev behavior for the production sweep, which parks and retries
+    // rather than treating one observation as final.
     let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
-    let state = attach_manifest(
-        manifest_ref,
-        cache,
-        store,
-        &pool,
-        u64::MAX,
-        /*fork=*/ false,
-    )
-    .await
-    .expect("netlink CONNECT attach");
+    let mut attached = None;
+    for attempt in 0..40 {
+        match attach_manifest(
+            manifest_ref,
+            cache.clone(),
+            store.clone(),
+            &pool,
+            u64::MAX,
+            /*fork=*/ false,
+        )
+        .await
+        {
+            Ok(state) => {
+                attached = Some(state);
+                break;
+            }
+            Err(NbdRuntimeError::Io(e))
+                if e.kind() == std::io::ErrorKind::ResourceBusy && attempt < 39 =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(e) => panic!(
+                "netlink CONNECT attach after {} attempts: {e:?} (holder {:?})",
+                attempt + 1,
+                device_has_live_holder(&nbd_path),
+            ),
+        }
+    }
+    let state = attached.expect("netlink CONNECT attach");
     let device = state.device_path().to_path_buf();
 
     // AFTER CONNECT: the device is in the inventory, with the pid + backend id
