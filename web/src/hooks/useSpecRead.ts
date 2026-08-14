@@ -76,6 +76,54 @@ export function useSpecRead(specId: string) {
   });
 }
 
+export interface StartSpecDraftingResult {
+  phase: "drafting";
+  started: boolean;
+  promptId?: string;
+}
+
+export async function startSpecDrafting(specId: string): Promise<StartSpecDraftingResult> {
+  const response = await specRequest<{
+    phase: "drafting";
+    started: boolean;
+    prompt_id?: string;
+  }>(`/specs/${encodeURIComponent(specId)}/start-drafting`, { method: "POST" });
+  return {
+    phase: response.phase,
+    started: response.started,
+    ...(response.prompt_id ? { promptId: response.prompt_id } : {}),
+  };
+}
+
+export function useStartSpecDrafting(specId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => startSpecDrafting(specId),
+    onMutate: async () => {
+      await queryClient.cancelQueries({ queryKey: ["spec", specId] });
+      const previous = queryClient.getQueryData<SpecReadResponse>(["spec", specId]);
+      if (previous?.spec.phase === "ideation") {
+        queryClient.setQueryData<SpecReadResponse>(["spec", specId], {
+          ...previous,
+          spec: { ...previous.spec, phase: "drafting" },
+        });
+      }
+      return { previous };
+    },
+    onError: (_error, _variables, context) => {
+      if (context?.previous) {
+        queryClient.setQueryData<SpecReadResponse>(["spec", specId], context.previous);
+      }
+    },
+    onSuccess: (result) => {
+      queryClient.setQueryData<SpecReadResponse>(["spec", specId], (current) =>
+        current ? { ...current, spec: { ...current.spec, phase: result.phase } } : current,
+      );
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["spec", specId] }),
+  });
+}
+
 export function useSpecRail(specId: string) {
   const queryClient = useQueryClient();
   return useQuery({

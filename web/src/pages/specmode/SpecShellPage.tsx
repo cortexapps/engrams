@@ -3,6 +3,7 @@ import { useEffect, useRef, useState, type UIEvent } from "react";
 import type { SpecSelectionActionPayload } from "@engrams/spec-document";
 
 import { Markdown } from "@/components/Markdown";
+import { IdeationScreen } from "@/components/spec-mode/IdeationScreen";
 import { SpecShell } from "@/components/spec-mode/SpecShell";
 import type { SpecConnection } from "@/components/spec/SpecConnection";
 import { useSpecPresence } from "@/components/spec-mode/section-presence";
@@ -14,9 +15,7 @@ import { Text } from "@/components/ui/text";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useSendSpecMessage } from "@/hooks/useSpecMessages";
 import { useSpecPublish } from "@/hooks/useSpecPublish";
-import { type SpecReadResponse, useSpecRail, useSpecRead } from "@/hooks/useSpecRead";
-
-type CurrentSpecPhase = "ideation" | "drafting" | "published";
+import { useSpecRail, useSpecRead, useStartSpecDrafting } from "@/hooks/useSpecRead";
 
 export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   const params = useParams({ strict: false });
@@ -25,18 +24,28 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   const read = useSpecRead(specId);
   const rail = useSpecRail(specId);
   const publish = useSpecPublish(specId);
+  const startDrafting = useStartSpecDrafting(specId);
   const sendSelectionPrompt = useSendSpecMessage(specId);
-  const phase = read.data ? currentPhase(read.data) : null;
-  const { connection, synced } = useSpecConnection(specId, phase === "drafting");
+  const phase = read.data?.spec.phase ?? null;
+  // Ideation connects too: the screen has no document, but it shows who is
+  // here, and presence rides the same awareness.
+  const { connection, synced } = useSpecConnection(
+    specId,
+    phase === "ideation" || phase === "drafting",
+  );
   const presence = useSpecPresence(connection?.provider.awareness ?? null);
   const [readingSectionId, setReadingSectionId] = useState<string | null>(null);
   const [showProvenance, setShowProvenance] = useState(true);
   const documentPaneRef = useRef<HTMLElement | null>(null);
   const { scrollToSection } = useScrollAnchors(documentPaneRef);
-  const surface = useSpecSurface(rail.data, connection?.doc ?? null, {
-    readingSectionId,
-    openQuestions: publish.data?.gate.openQuestions,
-  });
+  const surface = useSpecSurface(
+    rail.data,
+    phase === "drafting" ? (connection?.doc ?? null) : null,
+    {
+      readingSectionId,
+      openQuestions: publish.data?.gate.openQuestions,
+    },
+  );
   useDocumentTitle(read.data?.spec.title ?? "Tech spec");
 
   const selectSection = (sectionId: string) => {
@@ -96,6 +105,19 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   }
 
   const { spec, checkpoints, publishedCheckpoint } = read.data;
+  if (spec.phase === "ideation") {
+    return (
+      <IdeationScreen
+        specId={specId}
+        title={spec.title}
+        templateName={spec.template.name}
+        awareness={connection?.provider.awareness}
+        isStartingDrafting={startDrafting.isPending}
+        startDraftingError={startDraftingError(startDrafting.error)}
+        onStartDrafting={() => startDrafting.mutate()}
+      />
+    );
+  }
   const selectionActions =
     phase === "drafting"
       ? {
@@ -153,10 +175,6 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   );
 }
 
-function currentPhase(read: SpecReadResponse): CurrentSpecPhase {
-  return read.spec.phase;
-}
-
 function useSpecConnection(specId: string, enabled: boolean) {
   const [connection, setConnection] = useState<SpecConnection | null>(null);
   const [synced, setSynced] = useState(false);
@@ -190,6 +208,11 @@ function useSpecConnection(specId: string, enabled: boolean) {
   }, [enabled, specId]);
 
   return { connection, synced };
+}
+
+function startDraftingError(error: Error | null): string | null {
+  if (!error) return null;
+  return `Drafting did not start: ${error.message}. You are still in the conversation.`;
 }
 
 export function selectionActionPrompt(payload: SpecSelectionActionPayload): string {

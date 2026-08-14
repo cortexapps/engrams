@@ -12,9 +12,11 @@ interface PendingMessage {
 export function SpecComposer({
   acknowledgedPromptIds,
   onSend,
+  placeholder = "Reply, or select any passage in the document to talk about it",
 }: {
   acknowledgedPromptIds: ReadonlySet<string>;
   onSend: (message: string) => Promise<{ promptId: string }>;
+  placeholder?: string;
 }) {
   const [text, setText] = useState("");
   const [pending, setPending] = useState<PendingMessage | null>(null);
@@ -65,7 +67,7 @@ export function SpecComposer({
           aria-label="Message the spec collaborators"
           aria-invalid={error ? true : undefined}
           disabled={pending !== null}
-          placeholder="Reply, or select any passage in the document to talk about it"
+          placeholder={placeholder}
           onChange={(event) => {
             setText(event.target.value);
             setError(null);
