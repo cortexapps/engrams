@@ -2,16 +2,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { specRequest, SpecRequestError } from "@/lib/spec-api";
 
-export type SpecPublishBlockerReason = "open" | "proposed" | "na_without_reason";
-
-export interface SpecPublishBlocker {
-  sectionId: string;
-  sectionTitle: string;
-  layerKey: string;
-  state: string;
-  reason: SpecPublishBlockerReason;
-}
-
 export interface SpecPublishQuestion {
   id: string;
   sectionId: string;
@@ -19,18 +9,7 @@ export interface SpecPublishQuestion {
   text: string;
 }
 
-export interface SpecPublishGate {
-  ready: boolean;
-  settledRequiredCount: number;
-  requiredCount: number;
-  acknowledgmentRequired: boolean;
-  gapCheckRunRequired: boolean;
-  blockers: SpecPublishBlocker[];
-  openQuestions: SpecPublishQuestion[];
-}
-
 export interface SpecPublishRecord {
-  /** `blocked` means the pin refused: the gate moved before it committed. */
   state: "requested" | "pinned" | "artifact_published" | "complete" | "blocked";
   checkpointId: string;
   artifactId: string;
@@ -45,19 +24,14 @@ export interface SpecPublishRecord {
 export interface SpecPublishStatus {
   phase: "ideation" | "drafting" | "published";
   canPublish: boolean;
-  publishedAt: string | null;
-  gate: SpecPublishGate;
-  gapCheck: { stale: boolean; runId: string | null; ranAt: string | null; gates: boolean };
+  openQuestions: SpecPublishQuestion[];
   publish: SpecPublishRecord | null;
 }
 
-/** Why the server refused, with the gate as it stood at refusal time. */
+/** Why the server refused, with its confirmation state at refusal time. */
 export type SpecPublishRefusalReason =
   | "not_owner"
-  | "blocked"
   | "acknowledgment_required"
-  | "gap_check_stale"
-  | "gap_check_failed"
   | "already_published"
   | "ideation"
   | "no_session";
@@ -72,18 +46,12 @@ export function specPublishKey(specId: string) {
   return ["spec", specId, "publish"] as const;
 }
 
-/**
- * The gate. While a publish is in flight the scanner is still advancing it, so
- * the status is polled until it completes; the steps a person watches are the
- * server's own, not an optimistic guess.
- */
+/** Poll while the durable publish scanner advances the recorded request. */
 export function useSpecPublish(specId: string) {
   return useQuery({
     queryKey: specPublishKey(specId),
     queryFn: () => specRequest<SpecPublishStatus>(`/specs/${specId}/publish`),
     refetchInterval: (query) => {
-      // A blocked publish is not advancing: it waits for the person, so polling
-      // it would be a busy loop against a state only they can change.
       const publish = query.state.data?.publish;
       const advancing =
         publish !== null &&
@@ -97,7 +65,6 @@ export function useSpecPublish(specId: string) {
 
 export interface PublishSpecInput {
   acknowledgeOpenQuestions: boolean;
-  runGapCheck: boolean;
 }
 
 export function usePublishSpec(specId: string) {
@@ -110,7 +77,6 @@ export function usePublishSpec(specId: string) {
         body: JSON.stringify({
           actionId: crypto.randomUUID(),
           acknowledgeOpenQuestions: input.acknowledgeOpenQuestions,
-          runGapCheck: input.runGapCheck,
         }),
       }),
     onSuccess: (status) => {
@@ -120,10 +86,7 @@ export function usePublishSpec(specId: string) {
   });
 }
 
-/**
- * Read a refusal. The server sends the gate with it, so the dialog shows the
- * new blockers or the questions without a second request.
- */
+/** Read a refusal. The server can include the current questions with it. */
 export function specPublishRefusal(error: unknown): SpecPublishRefusal | null {
   if (!(error instanceof SpecRequestError)) return null;
   const body = error.body;
@@ -141,10 +104,7 @@ export function specPublishRefusal(error: unknown): SpecPublishRefusal | null {
 function isRefusalReason(value: unknown): value is SpecPublishRefusalReason {
   return (
     value === "not_owner" ||
-    value === "blocked" ||
     value === "acknowledgment_required" ||
-    value === "gap_check_stale" ||
-    value === "gap_check_failed" ||
     value === "already_published" ||
     value === "ideation" ||
     value === "no_session"
@@ -152,5 +112,12 @@ function isRefusalReason(value: unknown): value is SpecPublishRefusalReason {
 }
 
 function isStatus(value: unknown): value is SpecPublishStatus {
-  return typeof value === "object" && value !== null && "gate" in value && "phase" in value;
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "phase" in value &&
+    "canPublish" in value &&
+    "openQuestions" in value &&
+    Array.isArray((value as { openQuestions?: unknown }).openQuestions)
+  );
 }
