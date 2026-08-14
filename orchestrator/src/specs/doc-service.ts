@@ -1248,13 +1248,20 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
         current_doc_seq: string;
         current_semantic_doc_seq: string;
       }>(
+        // Writable while drafting, or when this is the document's first update.
+        // A spec is born in ideation and its template sections are seeded at
+        // creation, so gating on the phase alone made creating a spec
+        // impossible: the seed was refused and the create returned 500. Seq 0
+        // is only ever the seed — it establishes the document rather than
+        // changing anyone's content, and after it the spec is at seq 1, so no
+        // further write lands during ideation.
         `UPDATE spec
             SET current_doc_seq = current_doc_seq + 1,
                 current_semantic_doc_seq = current_semantic_doc_seq + $3::int,
                 updated_at = COALESCE($4::timestamptz, updated_at)
           WHERE id = $1
             AND current_doc_seq = $2
-            AND phase = 'drafting'
+            AND (phase = 'drafting' OR current_doc_seq = 0)
         RETURNING current_doc_seq, current_semantic_doc_seq`,
         [specId, expectedSeq.toString(), effects.semanticChanged ? 1 : 0, effects.at ?? null],
       );

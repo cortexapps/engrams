@@ -1041,6 +1041,47 @@ describe("SpecDocumentService with live Postgres", () => {
   );
 
   test.skipIf(!liveDbReachable)(
+    "an ideation spec accepts its seed and nothing after it",
+    async () => {
+      // Every spec is created in ideation and has its template sections seeded
+      // during creation, so a write gate that asks only for the drafting phase
+      // made creating a spec impossible — POST /api/v1/specs returned 500 for
+      // every request. No test caught it because each live fixture inserts its
+      // specs already drafting, which is a state a real spec reaches only after
+      // somebody starts drafting.
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => new Date("2026-08-14T02:00:00.000Z"),
+      });
+      await livePool.query("UPDATE spec SET phase = 'ideation' WHERE id = $1", [specId]);
+
+      await documents.applyUpdate(specId, initialUpdate(), "seed");
+
+      const seeded = await livePool.query<{ current_doc_seq: string }>(
+        "SELECT current_doc_seq::text FROM spec WHERE id = $1",
+        [specId],
+      );
+      expect(seeded.rows[0]).toEqual({ current_doc_seq: "1" });
+
+      // The seed is the one write ideation allows: the document exists now, so
+      // a second update is a change to content and waits for drafting.
+      const afterSeed = clientInsert(
+        Y.encodeStateAsUpdate((await documents.loadDoc(specId)).doc),
+        0,
+        "edit during ideation",
+      );
+      await expect(documents.applyUpdate(specId, afterSeed, "ideating-client")).rejects.toBeInstanceOf(
+        SpecDocumentReadOnlyError,
+      );
+      const unchanged = await livePool.query<{ current_doc_seq: string }>(
+        "SELECT current_doc_seq::text FROM spec WHERE id = $1",
+        [specId],
+      );
+      expect(unchanged.rows[0]).toEqual({ current_doc_seq: "1" });
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
     "a stale draft update cannot persist after publication",
     async () => {
       if (!livePool) throw new Error("The live Postgres pool is not available");
