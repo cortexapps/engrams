@@ -1,0 +1,22 @@
+-- Start spec mode v2 from an empty slate.
+--
+-- Every spec in existence predates the v2 contract, and each of those old rows
+-- carries a shape the new code has to special-case: section states settled
+-- before the actor columns existed, conversation turns from before the message
+-- store, and diagram blocks under a legacy attribute name that the document
+-- loader tried to rewrite on every read. Reading a published spec even failed
+-- outright, because that rewrite is a write and a published spec is immutable.
+--
+-- Tolerating those shapes means compatibility branches in the read paths for
+-- data that only exists because it was made during development. Deleting it
+-- retires the branches instead, so the remaining behaviour is the contract
+-- rather than the contract plus its history. This is destructive and
+-- deliberate: two specs exist, none belongs to a customer.
+--
+-- Every spec_* child table cascades from spec, so this one statement clears
+-- states, updates, snapshots, checkpoints, questions, transcript actions,
+-- messages, participants, projections, publishes, seeds, gap-check runs, and
+-- ticket rows. Artifact versions written by an earlier publish are NOT
+-- referenced by these tables and stay where they are; they are ordinary
+-- artifacts and remain readable on their own terms.
+DELETE FROM "spec";
