@@ -16,7 +16,14 @@ import type { AuthState } from "./auth/AuthProvider";
 // /sessions index) render.
 vi.mock("./pages/RootLayout", async () => {
   const { Outlet } = await import("@tanstack/react-router");
-  return { RootLayout: () => <Outlet /> };
+  return {
+    RootLayout: () => (
+      <>
+        <nav data-testid="app-sidebar" />
+        <Outlet />
+      </>
+    ),
+  };
 });
 vi.mock("./pages/sessions/SessionsLayout", async () => {
   const { Outlet } = await import("@tanstack/react-router");
@@ -34,6 +41,12 @@ vi.mock("./pages/specs/SpecsList", () => ({
 }));
 vi.mock("./pages/specs/SpecTemplates", () => ({
   SpecTemplates: () => <div data-testid="spec-templates" />,
+}));
+vi.mock("./pages/specmode/SpecShellPage", () => ({
+  SpecShellPage: () => <div data-testid="spec-shell" />,
+}));
+vi.mock("./pages/specmode/NewSpecPage", () => ({
+  NewSpecPage: () => <div data-testid="new-spec" />,
 }));
 
 import { routeTree } from "./router";
@@ -81,10 +94,10 @@ test("redirects authenticated user away from /login to /sessions", async () => {
   expect(screen.queryByLabelText(/email/i)).toBeNull();
 });
 
-test("redirects an authenticated member away from Tech Specs", async () => {
-  const router = makeTestRouter(AUTH, "/specs");
-  await router.load();
-  expect(router.state.location.pathname).toBe("/settings/profile");
+test("routes an authenticated member to the Tech Specs list", async () => {
+  render(<RouterProvider router={makeTestRouter(AUTH, "/specs")} />);
+  await screen.findByTestId("tech-specs");
+  expect(screen.getByTestId("app-sidebar")).toBeTruthy();
 });
 
 test("routes an admin to the Tech Specs list", async () => {
@@ -95,4 +108,22 @@ test("routes an admin to the Tech Specs list", async () => {
 test("routes an admin to the Templates catalog", async () => {
   render(<RouterProvider router={makeTestRouter(ADMIN_AUTH, "/specs/templates")} />);
   await screen.findByTestId("spec-templates");
+});
+
+test("renders a spec in its chromeless full-window route", async () => {
+  render(<RouterProvider router={makeTestRouter(AUTH, "/specs/spec-1")} />);
+  await screen.findByTestId("spec-shell");
+  expect(screen.queryByTestId("app-sidebar")).toBeNull();
+});
+
+test("renders new-spec creation outside the app chrome", async () => {
+  render(<RouterProvider router={makeTestRouter(AUTH, "/specs/new")} />);
+  await screen.findByTestId("new-spec");
+  expect(screen.queryByTestId("app-sidebar")).toBeNull();
+});
+
+test.each(["/specs/spec-1", "/specs/new"])("requires auth for %s", async (path) => {
+  const router = makeTestRouter(null, path);
+  await router.load();
+  expect(router.state.location.pathname).toBe("/login");
 });

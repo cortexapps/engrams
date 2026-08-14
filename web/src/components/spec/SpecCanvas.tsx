@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo } from "react";
 import { Collaboration } from "@tiptap/extension-collaboration";
 import { CollaborationCaret } from "@tiptap/extension-collaboration-caret";
 import { EditorContent, useEditor } from "@tiptap/react";
@@ -9,40 +9,29 @@ import * as Y from "yjs";
 import { useAuth } from "@/auth/AuthProvider";
 import { collaboratorColor } from "@/components/spec-mode/collaborator-colors";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
 import { useIsMobile } from "@/hooks/use-mobile";
+import type { SpecConnection } from "./SpecConnection";
 import { SpecPresence } from "./SpecPresence";
 import { SpecSelectionBubbleMenu, type SpecSelectionActions } from "./SpecSelectionActions";
 import { SpecBlockIterationProvider } from "./block-iteration";
 import { specNodeExtensions } from "./extensions";
 import "./spec-canvas.css";
 
-interface SpecConnection {
-  doc: Y.Doc;
-  provider: WebsocketProvider;
-}
-
-type WebSocketProviderOptions = NonNullable<ConstructorParameters<typeof WebsocketProvider>[3]>;
-
-interface CreateSpecProviderOptions {
-  connect?: boolean;
-  location?: Pick<Location, "host" | "protocol">;
-  WebSocketPolyfill?: WebSocketProviderOptions["WebSocketPolyfill"];
-}
-
 export function SpecCanvas({
+  doc,
+  provider,
   specId,
   revision,
   selectionActions,
 }: {
+  doc: Y.Doc;
+  provider: WebsocketProvider;
   specId: string;
   revision: string;
   /** Supply this only when the current user can send selection actions. */
   selectionActions?: SpecSelectionActions;
 }) {
   const { principal } = useAuth();
-  const [connection, setConnection] = useState<SpecConnection | null>(null);
-  const [synced, setSynced] = useState(false);
   const user = useMemo(
     () => ({
       name: principal.display_name || principal.email,
@@ -51,35 +40,10 @@ export function SpecCanvas({
     [principal.display_name, principal.email],
   );
 
-  useEffect(() => {
-    const doc = new Y.Doc();
-    const provider = createSpecProvider(specId, doc);
-    const onSync = (isSynced: boolean) => setSynced(isSynced);
-    provider.on("sync", onSync);
-    setConnection({ doc, provider });
-    return () => {
-      provider.off("sync", onSync);
-      provider.destroy();
-      doc.destroy();
-      setConnection(null);
-      setSynced(false);
-    };
-  }, [specId]);
-
-  if (!connection || !synced) {
-    return (
-      <div className="spec-canvas-loading" aria-label="Loading collaborative spec">
-        <Skeleton className="h-7 w-2/5" />
-        <Skeleton className="h-4 w-full" />
-        <Skeleton className="h-4 w-5/6" />
-      </div>
-    );
-  }
-
   return (
     <SpecBlockIterationProvider specId={specId}>
       <ConnectedSpecCanvas
-        connection={connection}
+        connection={{ doc, provider }}
         user={user}
         specId={specId}
         revision={revision}
@@ -190,27 +154,4 @@ export function ConnectedSpecCanvas({
       {specDocument}
     </div>
   );
-}
-
-export function createSpecProvider(
-  specId: string,
-  doc: Y.Doc,
-  options: CreateSpecProviderOptions = {},
-): WebsocketProvider {
-  const providerOptions: WebSocketProviderOptions = {
-    connect: options.connect ?? true,
-    params: { clientId: String(doc.clientID) },
-    ...(options.WebSocketPolyfill ? { WebSocketPolyfill: options.WebSocketPolyfill } : {}),
-  };
-  return new WebsocketProvider(
-    specSocketBase(specId, options.location ?? window.location),
-    "sync",
-    doc,
-    providerOptions,
-  );
-}
-
-function specSocketBase(specId: string, location: Pick<Location, "host" | "protocol">): string {
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${location.host}/api/v1/specs/${encodeURIComponent(specId)}`;
 }

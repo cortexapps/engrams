@@ -61,7 +61,7 @@ const DESTS: Dest[] = [
     to: "/specs",
     label: "Tech Specs",
     icon: FilePenLine,
-    adminOnly: true,
+    adminOnly: false,
     match: (p) => p.startsWith("/specs"),
   },
   {

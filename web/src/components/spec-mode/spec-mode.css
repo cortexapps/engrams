@@ -1,0 +1,349 @@
+@keyframes fadein {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes penbeat {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.spec-mode-viewport {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100svh;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior: none;
+  background: var(--background);
+  color: var(--foreground);
+}
+
+.spec-mode-shell {
+  display: grid;
+  grid-template-rows: 56px minmax(0, 1fr);
+  grid-template-columns: 52px 236px minmax(0, 1fr) 392px;
+  grid-template-areas:
+    "spine topbar topbar topbar"
+    "spine sections document conversation";
+  min-width: 1240px;
+  height: 100%;
+}
+
+.spec-mode-spine {
+  grid-area: spine;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 0;
+  background: var(--sidebar);
+  color: var(--sidebar-foreground);
+}
+
+.spec-mode-mark,
+.spec-mode-nav-square {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: inherit;
+  text-decoration: none;
+}
+
+.spec-mode-mark {
+  width: 22px;
+  height: 22px;
+}
+
+.spec-mode-nav-square {
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  opacity: 0.55;
+  transition:
+    color 150ms ease,
+    background-color 150ms ease,
+    opacity 150ms ease;
+}
+
+.spec-mode-nav-square svg {
+  width: 16px;
+  height: 16px;
+}
+
+.spec-mode-nav-square:hover,
+.spec-mode-nav-square:focus-visible {
+  background: var(--sidebar-accent);
+  opacity: 1;
+}
+
+.spec-mode-nav-square:focus-visible,
+.spec-mode-mark:focus-visible {
+  outline: 2px solid var(--sidebar-ring);
+  outline-offset: 2px;
+}
+
+.spec-mode-nav-square[data-active="true"] {
+  background: var(--sidebar-accent);
+  color: var(--sidebar-primary);
+  opacity: 1;
+}
+
+.spec-mode-user-initial {
+  display: flex;
+  width: 26px;
+  height: 26px;
+  align-items: center;
+  justify-content: center;
+  margin-top: auto;
+  border: 1px solid var(--sidebar-border);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+}
+
+.spec-mode-top-bar {
+  grid-area: topbar;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 18px;
+  border-bottom: 1px solid var(--border);
+  padding: 0 20px;
+  background: var(--background);
+}
+
+.spec-mode-title-group,
+.spec-mode-top-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.spec-mode-title-group {
+  gap: 12px;
+}
+
+.spec-mode-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spec-mode-template-name {
+  flex: none;
+  white-space: nowrap;
+}
+
+.spec-mode-top-actions {
+  gap: 16px;
+  margin-left: auto;
+}
+
+.spec-mode-presence-region {
+  min-width: 0;
+}
+
+.spec-mode-top-separator {
+  width: 1px;
+  height: 22px;
+  background: var(--border);
+}
+
+.spec-mode-checkpoint-trigger {
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--muted-foreground);
+}
+
+.spec-mode-checkpoint-trigger svg {
+  width: 13px;
+  height: 13px;
+}
+
+.spec-mode-sections {
+  grid-area: sections;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  background: var(--background);
+}
+
+.spec-mode-document {
+  grid-area: document;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--background);
+}
+
+.spec-mode-document-inner {
+  width: 100%;
+  max-width: 720px;
+  min-height: 100%;
+  margin: 0 auto;
+  padding: 32px 40px 80px;
+}
+
+.spec-mode-conversation {
+  grid-area: conversation;
+  min-height: 0;
+  border-left: 1px solid var(--border);
+  background: var(--card);
+}
+
+.spec-mode-published-document {
+  font-size: 0.94rem;
+  line-height: 1.75;
+  text-wrap: pretty;
+}
+
+.spec-mode-loading {
+  display: grid;
+  gap: 12px;
+}
+
+.spec-mode-error {
+  display: grid;
+  gap: 8px;
+}
+
+.spec-mode-proposal[data-proposal-treatment="gutter"] {
+  margin-left: -18px;
+  border-left: 3px solid var(--ring);
+  padding-left: 15px;
+}
+
+.spec-mode-proposal[data-proposal-treatment="wash"] {
+  background: color-mix(in oklab, var(--ring) 6%, transparent);
+}
+
+.spec-mode-proposal[data-proposal-treatment="underlay"] {
+  border: 1px dashed var(--ring);
+}
+
+.spec-mode-fadein {
+  animation: fadein 0.35s ease-out;
+}
+
+.spec-mode-penbeat {
+  animation: penbeat 1.4s ease-in-out infinite;
+}
+
+.spec-mode-checkpoint-sheet {
+  gap: 0;
+  padding: 0;
+}
+
+.spec-mode-checkpoint-body {
+  display: grid;
+  min-height: 0;
+  flex: 1;
+  align-content: start;
+  gap: 16px;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+.spec-mode-checkpoint-list {
+  display: grid;
+  gap: 4px;
+}
+
+.spec-mode-checkpoint-list button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  border-radius: 6px;
+  padding: 8px 9px;
+  text-align: left;
+}
+
+.spec-mode-checkpoint-list button:hover,
+.spec-mode-checkpoint-list button[data-selected="true"] {
+  background: var(--accent);
+}
+
+.spec-mode-checkpoint-list button > span:last-child {
+  display: grid;
+  gap: 2px;
+}
+
+.spec-mode-checkpoint-list small {
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+}
+
+.spec-mode-checkpoint-order {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+}
+
+/* CheckpointDiff used to inherit these rules from the deleted read page. */
+.spec-checkpoint-diff {
+  display: grid;
+  gap: 1px;
+  border: 1px solid var(--border);
+  background: var(--border);
+}
+
+.spec-diff-segment {
+  overflow-x: auto;
+  padding: 16px;
+  background: var(--card);
+  font-family: var(--font-sans);
+  font-size: 0.9rem;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+.spec-diff-segment.is-code {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+.spec-diff-segment ins,
+.spec-diff-segment del {
+  text-decoration: none;
+}
+
+.spec-diff-segment ins {
+  background: color-mix(in oklab, var(--instrument-nominal) 20%, transparent);
+}
+
+.spec-diff-segment del {
+  background: color-mix(in oklab, var(--destructive) 16%, transparent);
+  text-decoration: line-through;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spec-mode-fadein,
+  .spec-mode-penbeat {
+    animation: none;
+  }
+
+  .spec-mode-nav-square {
+    transition: none;
+  }
+}

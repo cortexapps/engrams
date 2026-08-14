@@ -54,6 +54,7 @@ export interface SpecReadResponse {
     title: string;
     lifecycle: "draft" | "published";
     sessionId: string | null;
+    viewerIsOwner: boolean;
     publishedCheckpointId: string | null;
     publishedAt: string | null;
     revision: string;

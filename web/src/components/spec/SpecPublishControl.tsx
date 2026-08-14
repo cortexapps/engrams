@@ -66,11 +66,7 @@ export function SpecPublishControl({ specId, onReviewSection }: SpecPublishContr
   if (!running && !current.canPublish) return null;
 
   const gate = current.gate;
-  const label = running
-    ? "Publishing…"
-    : gate.gapCheckRunRequired
-      ? "Run gap check & publish"
-      : "Publish";
+  const label = running ? "Publishing…" : gate.gapCheckRunRequired ? "Review & publish" : "Publish";
 
   return (
     <>
@@ -323,10 +319,10 @@ function ReadyFace({
         <Button size="sm" disabled={pending || (amber && !acknowledged)} onClick={onPublish}>
           {pending
             ? gate.gapCheckRunRequired
-              ? "Running gap check…"
+              ? "Reviewing…"
               : "Publishing…"
             : gate.gapCheckRunRequired
-              ? "Run gap check & publish"
+              ? "Review & publish"
               : "Publish & ticketize"}
         </Button>
       </DialogFooter>
@@ -409,9 +405,9 @@ function blockerText(reason: SpecPublishGate["blockers"][number]["reason"]): str
 function footerMeta(gate: SpecPublishGate, status: SpecPublishStatus): string {
   const ready = `${gate.settledRequiredCount} of ${gate.requiredCount} ready`;
   if (!status.gapCheck.gates) return ready;
-  if (status.gapCheck.ranAt === null) return `${ready} · gap check has not run`;
-  if (status.gapCheck.stale) return `${ready} · gap check is stale`;
-  return `${ready} · gap check ran ${formatTime(status.gapCheck.ranAt)}`;
+  if (status.gapCheck.ranAt === null) return `${ready} · review has not run`;
+  if (status.gapCheck.stale) return `${ready} · review is stale`;
+  return `${ready} · review ran ${formatTime(status.gapCheck.ranAt)}`;
 }
 
 function formatTime(iso: string): string {
