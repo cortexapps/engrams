@@ -14,6 +14,7 @@ import * as Y from "yjs";
 import { makeSpecsRoute, type SpecReadStore } from "../routes/specs.ts";
 import {
   createSpec,
+  specCreateTaskParams,
   UNTITLED_SPEC,
   type CreateSpecRequest,
   type CreateSpecResult,
@@ -158,6 +159,33 @@ describe("createSpec", () => {
     expect(titles).toEqual(["Problem", "Design"]);
   });
 
+  test("forwards composer overrides to the ordinary task create params", async () => {
+    const { deps, sessions } = testDeps();
+
+    await createSpec(
+      deps,
+      request({
+        harness: "codex",
+        model: "gpt-5",
+        modelRouter: "",
+        effort: "high",
+        harnessMode: "plan",
+      }),
+    );
+
+    expect(specCreateTaskParams(sessions[0]!)).toMatchObject({
+      type: "spec",
+      ownerUserId: OWNER_ID,
+      profileId: PROFILE_ID,
+      harness: "codex",
+      model: "gpt-5",
+      modelRouter: "",
+      effort: "high",
+      harnessMode: "plan",
+      source: { specCreateRequestHash: sessions[0]!.requestHash },
+    });
+  });
+
   test("a second create with the same idempotency key does not double-create", async () => {
     const { deps, store, seeded, sessions } = testDeps();
 
@@ -192,6 +220,16 @@ describe("createSpec", () => {
     await expect(createSpec(deps, request({ title: "A different spec" }))).rejects.toThrow(
       /already used with different arguments/,
     );
+  });
+
+  test("reusing a key with different composer overrides is refused", async () => {
+    const { deps } = testDeps({ snapshot: structuredClone(SNAPSHOT) });
+
+    await createSpec(deps, request({ harness: "claude", effort: "high" }));
+
+    await expect(
+      createSpec(deps, request({ harness: "codex", effort: "low" })),
+    ).rejects.toThrow(/already used with different arguments/);
   });
 
   test("an unknown template creates nothing", async () => {
@@ -336,6 +374,30 @@ describe("POST /api/v1/specs", () => {
     ]);
   });
 
+  test("forwards composer overrides from the REST body", async () => {
+    const { app, calls } = testApp();
+
+    const response = await app.request(
+      "/api/v1/specs",
+      createBody({
+        harness: "codex",
+        model: "gpt-5",
+        modelRouter: "",
+        effort: "high",
+        harnessMode: "plan",
+      }),
+    );
+
+    expect(response.status).toBe(201);
+    expect(calls[0]).toMatchObject({
+      harness: "codex",
+      model: "gpt-5",
+      modelRouter: "",
+      effort: "high",
+      harnessMode: "plan",
+    });
+  });
+
   test("an API-key caller is carried through as a service-account principal", async () => {
     const { app, calls } = testApp({ email: "apikey+ci-engrams@service.local" });
 
@@ -392,6 +454,19 @@ describe("POST /api/v1/specs", () => {
     expect(await response.text()).toContain(field);
     expect(calls).toHaveLength(0);
   });
+
+  test.each(["harness", "model", "modelRouter", "effort", "harnessMode"])(
+    "rejects a non-text %s override",
+    async (field) => {
+      const { app, calls } = testApp();
+
+      const response = await app.request("/api/v1/specs", createBody({ [field]: 42 }));
+
+      expect(response.status).toBe(400);
+      expect(await response.text()).toContain(field);
+      expect(calls).toHaveLength(0);
+    },
+  );
 
   test("an unauthenticated caller is refused", async () => {
     const app = new Hono();

@@ -315,7 +315,6 @@ export class SpecCompactionStaleError extends Error {
 export function proseMirrorDocument(doc: Y.Doc): ProseMirrorNode {
   const fragment = doc.getXmlFragment(SPEC_FRAGMENT_NAME);
   if (fragment.length === 0) throw new Error("The spec document has no sections");
-  migrateLegacyDiagramBlockIds(doc);
   return yXmlFragmentToProseMirrorRootNode(fragment, schema);
 }
 
@@ -630,7 +629,10 @@ export class SpecDocumentService {
     const cached = this.cache.get(specId);
     if (cached) return cached;
 
-    for (;;) {
+    // No retry loop: the only path that used to re-read was a legacy
+    // diagram-block rewrite that could lose a race with a concurrent write.
+    // That rewrite is gone, so loading reads once.
+    {
       const doc = new Y.Doc();
       const validationDoc = new Y.Doc();
       const snapshot = await this.store.readSnapshot(specId);
@@ -650,27 +652,6 @@ export class SpecDocumentService {
         renderedSizeUpperBound: 0,
       };
       await this.applyTail(specId, room, "peer", false);
-      const migration = migrateLegacyDiagramBlockIds(doc);
-      if (migration) {
-        Y.applyUpdate(validationDoc, migration);
-        const inserted = await this.store.insertUpdateIfLatest(
-          specId,
-          room.lastAppliedSeq,
-          migration,
-          null,
-          { sections: [], semanticChanged: false },
-        );
-        if (!inserted) {
-          doc.destroy();
-          validationDoc.destroy();
-          continue;
-        }
-        room.lastAppliedSeq = inserted.seq;
-        room.semanticDocSeq = inserted.semanticDocSeq;
-        const row = { ...inserted, update: migration, clientId: null };
-        this.broadcast({ specId, ...row, source: "local" });
-        await this.store.notifyUpdate(specId, inserted.seq);
-      }
       if (doc.getXmlFragment(SPEC_FRAGMENT_NAME).length > 0) {
         room.renderedSizeUpperBound = this.validateCompleteDocument(doc);
       }
@@ -954,21 +935,6 @@ function validateCachedRenderSizes(doc: ProseMirrorNode): void {
   });
 }
 
-function migrateLegacyDiagramBlockIds(doc: Y.Doc): Uint8Array | null {
-  const before = Y.encodeStateVector(doc);
-  doc.transact(() => {
-    for (const { element } of diagramBlockElements(doc)) {
-      const id = element.getAttribute("id");
-      const legacyId = element.getAttribute("blockId");
-      if (id === undefined && typeof legacyId === "string" && legacyId.length > 0) {
-        element.setAttribute("id", legacyId);
-        element.removeAttribute("blockId");
-      }
-    }
-  }, "legacy-diagram-block-id-migration");
-  const update = Y.encodeStateAsUpdate(doc, before);
-  return update.byteLength === 2 ? null : update;
-}
 
 interface YjsDiagramBlock {
   element: Y.XmlElement;
@@ -1282,13 +1248,20 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
         current_doc_seq: string;
         current_semantic_doc_seq: string;
       }>(
+        // Writable while drafting, or when this is the document's first update.
+        // A spec is born in ideation and its template sections are seeded at
+        // creation, so gating on the phase alone made creating a spec
+        // impossible: the seed was refused and the create returned 500. Seq 0
+        // is only ever the seed — it establishes the document rather than
+        // changing anyone's content, and after it the spec is at seq 1, so no
+        // further write lands during ideation.
         `UPDATE spec
             SET current_doc_seq = current_doc_seq + 1,
                 current_semantic_doc_seq = current_semantic_doc_seq + $3::int,
                 updated_at = COALESCE($4::timestamptz, updated_at)
           WHERE id = $1
             AND current_doc_seq = $2
-            AND phase = 'drafting'
+            AND (phase = 'drafting' OR current_doc_seq = 0)
         RETURNING current_doc_seq, current_semantic_doc_seq`,
         [specId, expectedSeq.toString(), effects.semanticChanged ? 1 : 0, effects.at ?? null],
       );

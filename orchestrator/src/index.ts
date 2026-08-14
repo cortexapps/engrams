@@ -118,7 +118,7 @@ import { makeSpecStartDraftingRoute } from "./routes/spec-start-drafting.ts";
 import { makeSpecEventsRoute } from "./routes/spec-events.ts";
 import { makeSpecTemplatesRoute } from "./routes/spec-templates.ts";
 import { makeSpecTemplateCatalog } from "./specs/template-catalog.ts";
-import { createSpec, makeSpecCreateStore } from "./specs/create.ts";
+import { createSpec, makeSpecCreateStore, specCreateTaskParams } from "./specs/create.ts";
 import { createTaskWithSession } from "./rpc/task-create.ts";
 import { makeUserSecretStore } from "./db/user-secrets.ts";
 import { productionSpecProjection } from "./specs/projection.ts";
@@ -316,15 +316,7 @@ app.route(
                 newTaskId: () => input.taskId,
                 newSessionId: () => input.sessionId,
               },
-              {
-                type: "spec",
-                ownerUserId: input.ownerUserId,
-                ...(input.ownerIsServiceAccount ? { ownerIsServiceAccount: true } : {}),
-                profileId: input.profileId,
-                title: input.title,
-                prompt: input.prompt,
-                specTemplate: input.specTemplate,
-              },
+              specCreateTaskParams(input),
             );
           },
         },

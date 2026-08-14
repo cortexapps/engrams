@@ -9,7 +9,7 @@ vi.mock("./SpecPublishConfirm", () => ({
 }));
 
 describe("SpecShell", () => {
-  it("renders the four-column frame with document-only vertical scrolling", async () => {
+  it("renders the three-column frame with document-only vertical scrolling", async () => {
     renderWithProviders(
       <SpecShell
         specId="spec-1"
@@ -26,7 +26,9 @@ describe("SpecShell", () => {
     const shell = viewport.firstElementChild as HTMLElement;
     const documentRegion = screen.getByRole("region", { name: "Spec document" });
 
-    expect(screen.getByRole("navigation", { name: "Primary" })).toBeTruthy();
+    // No "Primary" navigation here any more: the app sidebar provides it, and
+    // the shell's own spine was a lossy copy of it.
+    expect(screen.queryByRole("navigation", { name: "Primary" })).toBeNull();
     expect(screen.getByRole("complementary", { name: "Spec sections" })).toBeTruthy();
     expect(documentRegion).toBeTruthy();
     expect(screen.getByRole("complementary", { name: "Conversation" })).toBeTruthy();
@@ -35,11 +37,14 @@ describe("SpecShell", () => {
     expect(viewport.className).toContain("spec-mode-viewport");
     expect(shell.className).toContain("spec-mode-shell");
     expect(documentRegion.className).toContain("spec-mode-document");
-    expect(getComputedStyle(viewport).position).toBe("fixed");
+    // Fills the app layout rather than the window, so it cannot cover the
+    // sidebar beside it.
+    expect(getComputedStyle(viewport).position).not.toBe("fixed");
+    expect(getComputedStyle(viewport).height).toBe("100%");
     expect(getComputedStyle(viewport).overflowX).toBe("auto");
     expect(getComputedStyle(viewport).overflowY).toBe("hidden");
-    expect(getComputedStyle(shell).minWidth).toBe("1240px");
-    expect(getComputedStyle(shell).gridTemplateColumns).toBe("52px 236px minmax(0, 1fr) 392px");
+    expect(getComputedStyle(shell).minWidth).toBe("1188px");
+    expect(getComputedStyle(shell).gridTemplateColumns).toBe("236px minmax(0, 1fr) 392px");
     expect(getComputedStyle(documentRegion).overflowY).toBe("auto");
   });
 

@@ -221,20 +221,6 @@ function diagramUpdate(blockCount = 1): Uint8Array {
   return encodeProseMirrorDocument(schema.nodes.doc!.create(null, sections));
 }
 
-function legacyDiagramUpdate(): Uint8Array {
-  const doc = new Y.Doc();
-  Y.applyUpdate(doc, diagramUpdate());
-  const diagram = doc.getXmlFragment(SPEC_FRAGMENT_NAME).get(2);
-  if (!(diagram instanceof Y.XmlElement)) throw new Error("The legacy design section is missing");
-  const block = diagram.get(1);
-  if (!(block instanceof Y.XmlElement)) throw new Error("The legacy diagram block is missing");
-  const id = block.getAttribute("id");
-  if (typeof id !== "string") throw new Error("The legacy diagram id is missing");
-  block.setAttribute("blockId", id);
-  block.removeAttribute("id");
-  return Y.encodeStateAsUpdate(doc);
-}
-
 function diagramDocumentWithIds(ids: readonly string[]): Uint8Array {
   const template = createTemplateDocument(TEMPLATE);
   const sections = template.content.content.map((section) => {
@@ -428,28 +414,21 @@ flowchart LR
 });
 
 describe("SpecDocumentService", () => {
-  test("a base-version Yjs update migrates blockId without changing block identity", async () => {
+  test("loading a document never writes to it", async () => {
+    // Loading used to rewrite legacy diagram-block ids and persist the result,
+    // which made reading a published spec impossible: the write was refused
+    // because the spec is immutable, and the refusal escaped the read. The
+    // rewrite is gone with the data that needed it, so a load is a read.
     const store = new MemoryDocumentStore();
-    store.seedUpdate(SPEC_ID, legacyDiagramUpdate());
+    store.seedUpdate(SPEC_ID, diagramUpdate());
 
-    const first = new SpecDocumentService(store);
-    const loaded = await first.loadDoc(SPEC_ID);
-    const blocks: Array<{ id: unknown; source: unknown }> = [];
-    proseMirrorDocument(loaded.doc).descendants((node) => {
-      if (node.type === schema.nodes.diagramBlock) {
-        blocks.push({ id: node.attrs.id, source: node.attrs.source });
-      }
-    });
-    expect(blocks).toEqual([{ id: "diagram-0", source: "flowchart LR\n  A0 --> B0" }]);
+    const service = new SpecDocumentService(store);
+    const loaded = await service.loadDoc(SPEC_ID);
+
+    expect(store.updates.get(SPEC_ID)).toHaveLength(1);
     expect(loaded.semanticDocSeq).toBe(1n);
-    expect(store.updates.get(SPEC_ID)).toHaveLength(2);
-
-    first.evict(SPEC_ID);
-    const reloaded = await new SpecDocumentService(store).loadDoc(SPEC_ID);
-    const diagram = findSection(proseMirrorDocument(reloaded.doc), "design")?.node.child(1);
+    const diagram = findSection(proseMirrorDocument(loaded.doc), "design")?.node.child(1);
     expect(diagram?.type).toBe(schema.nodes.diagramBlock);
-    expect(diagram?.attrs.id).toBe("diagram-0");
-    expect(reloaded.semanticDocSeq).toBe(1n);
   });
 
   test("the shared channel envelope is typed and rejects malformed payloads", () => {
@@ -1058,6 +1037,47 @@ describe("SpecDocumentService with live Postgres", () => {
         concurrentEditors: ["Sam"],
         transcriptChip: action.chip,
       });
+    },
+  );
+
+  test.skipIf(!liveDbReachable)(
+    "an ideation spec accepts its seed and nothing after it",
+    async () => {
+      // Every spec is created in ideation and has its template sections seeded
+      // during creation, so a write gate that asks only for the drafting phase
+      // made creating a spec impossible — POST /api/v1/specs returned 500 for
+      // every request. No test caught it because each live fixture inserts its
+      // specs already drafting, which is a state a real spec reaches only after
+      // somebody starts drafting.
+      if (!livePool) throw new Error("The live Postgres pool is not available");
+      const documents = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+        now: () => new Date("2026-08-14T02:00:00.000Z"),
+      });
+      await livePool.query("UPDATE spec SET phase = 'ideation' WHERE id = $1", [specId]);
+
+      await documents.applyUpdate(specId, initialUpdate(), "seed");
+
+      const seeded = await livePool.query<{ current_doc_seq: string }>(
+        "SELECT current_doc_seq::text FROM spec WHERE id = $1",
+        [specId],
+      );
+      expect(seeded.rows[0]).toEqual({ current_doc_seq: "1" });
+
+      // The seed is the one write ideation allows: the document exists now, so
+      // a second update is a change to content and waits for drafting.
+      const afterSeed = clientInsert(
+        Y.encodeStateAsUpdate((await documents.loadDoc(specId)).doc),
+        0,
+        "edit during ideation",
+      );
+      await expect(documents.applyUpdate(specId, afterSeed, "ideating-client")).rejects.toBeInstanceOf(
+        SpecDocumentReadOnlyError,
+      );
+      const unchanged = await livePool.query<{ current_doc_seq: string }>(
+        "SELECT current_doc_seq::text FROM spec WHERE id = $1",
+        [specId],
+      );
+      expect(unchanged.rows[0]).toEqual({ current_doc_seq: "1" });
     },
   );
 

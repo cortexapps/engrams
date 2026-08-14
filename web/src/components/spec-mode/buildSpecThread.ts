@@ -38,6 +38,32 @@ export interface ParsedSpecAgentText {
 }
 
 /**
+ * The text of a human turn that has no row in the message store.
+ *
+ * Not every human turn arrives through the messages route. The problem
+ * statement that creates a spec is sent with the session, and a block
+ * conversation sends its own scoped prompt, so neither has a stored row — and
+ * showing "This message is not available" for the sentence a person opened
+ * their spec with makes the founding turn of every spec look broken.
+ *
+ * A turn carrying a `[speaker:` header is the one case that stays hidden. That
+ * header is the agent's attribution seam, so rendering it would present a line
+ * a member could have forged as though the UI vouched for it. Without a header
+ * there is nothing to forge and the text is simply what the person wrote.
+ */
+function unattributedText(message: ThreadMessageLike): string {
+  const parts = Array.isArray(message.content) ? message.content : [];
+  const text = parts
+    .map((part) => (typeof part === "object" && part.type === "text" ? part.text : ""))
+    .join("")
+    .trim();
+  return text.length > 0 && !SPEAKER_HEADER.test(text) ? text : "";
+}
+
+/** Matches the attribution header the server prepends for the agent alone. */
+const SPEAKER_HEADER = /^\[speaker:/m;
+
+/**
  * Project the shared buildMessages fold through an explicit allow-list. No
  * unrecognized message role or part can enter the spec conversation.
  */
@@ -57,7 +83,7 @@ export function buildSpecThread(
         id: `human:${promptId}`,
         promptId,
         author: stored?.author ?? null,
-        text: stored?.text ?? "",
+        text: stored?.text ?? unattributedText(message),
         createdAt: stored?.createdAt ?? toIso(message.createdAt),
       });
       continue;

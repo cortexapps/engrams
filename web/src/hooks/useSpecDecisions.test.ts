@@ -25,7 +25,7 @@ describe("useSpecDecisions", () => {
         sectionTitle: "Data model",
         question: "Which lock coordinates writers?",
         resolutionLink: "section:data@resolution",
-        actor: { id: null, name: "Deleted user" },
+        actor: { id: null, name: "actor unknown" },
         decidedAt: "2026-08-13T18:01:00.000Z",
       },
     ];

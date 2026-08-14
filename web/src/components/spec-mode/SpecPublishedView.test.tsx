@@ -125,6 +125,28 @@ describe("SpecPublishedView", () => {
     expect(screen.getByRole("button", { name: "Open tickets" })).toBeTruthy();
   });
 
+  test("keeps an unnameable actor out of the byline", () => {
+    // A byline names people. A decision whose actor cannot be named — no
+    // recorded actor, or an account deleted before the credit was durable —
+    // must not appear as one, whatever label the server gives it.
+    const unknown = [
+      ...decisions,
+      {
+        id: "d-unknown",
+        kind: "section_settled" as const,
+        sectionId: "s9",
+        sectionTitle: "Rollout",
+        actor: { id: null, name: "actor unknown" },
+        decidedAt: "2026-08-13T12:00:00.000Z",
+      },
+    ];
+
+    const people = decisionActors({ id: "owner", name: "Nikhil Unni" }, unknown);
+
+    expect(people.map((person) => person.id)).toEqual(["owner", "priya"]);
+    expect(people.some((person) => person.id === null)).toBe(false);
+  });
+
   test("deduplicates the owner when the owner also decided", () => {
     expect(decisionActors({ id: "owner", name: "Nikhil Unni" }, decisions)).toEqual([
       { id: "owner", name: "Nikhil Unni" },

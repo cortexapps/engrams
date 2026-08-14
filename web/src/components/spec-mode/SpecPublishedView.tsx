@@ -294,6 +294,13 @@ export function decisionActors(
     : decisions.map((decision) => decision.actor);
   const seen = new Set<string>();
   return actors.filter((actor) => {
+    // An unknown actor is not a person, so it cannot appear in the byline —
+    // an earlier build credited a deleted-user label as a decision-maker. Test
+    // the id, not the label: a missing id is exactly what makes an actor
+    // unnameable, and matching the server's wording here would silently stop
+    // working the moment that wording changed. A checkpoint author always
+    // carries an id, so a real owner is never dropped.
+    if (actor.id === null) return false;
     const key = actor.id ?? `name:${actor.name}`;
     if (seen.has(key)) return false;
     seen.add(key);

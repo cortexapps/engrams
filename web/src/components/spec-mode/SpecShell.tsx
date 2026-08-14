@@ -5,7 +5,6 @@ import { ConversationRail } from "./ConversationRail";
 import { SectionList } from "./SectionList";
 import type { SpecPresenceEntry } from "./section-presence";
 import type { SpecSurface } from "./spec-surface";
-import { SpecSpine } from "./SpecSpine";
 import { SpecTopBar } from "./SpecTopBar";
 import "./spec-mode.css";
 
@@ -39,20 +38,21 @@ export function SpecShell({
   children?: ReactNode;
 }) {
   return (
+    // Fills the app layout rather than the viewport: the sidebar lives beside
+    // this, and a fixed-position shell would cover it.
     <div
       className="spec-mode-viewport"
       data-testid="spec-mode-viewport"
-      style={{ position: "fixed", inset: 0, overflowX: "auto", overflowY: "hidden" }}
+      style={{ height: "100%", overflowX: "auto", overflowY: "hidden" }}
     >
       <div
         className="spec-mode-shell"
         style={{
           display: "grid",
-          gridTemplateColumns: "52px 236px minmax(0, 1fr) 392px",
-          minWidth: 1240,
+          gridTemplateColumns: "236px minmax(0, 1fr) 392px",
+          minWidth: 1188,
         }}
       >
-        <SpecSpine />
         <SpecTopBar
           specId={specId}
           title={title}
@@ -81,7 +81,12 @@ export function SpecShell({
         </section>
         <aside className="spec-mode-conversation" aria-label="Conversation">
           {surface ? (
-            <ConversationRail specId={specId} surface={surface} onSelectSection={onSelectSection} />
+            <ConversationRail
+              specId={specId}
+              surface={surface}
+              presence={presence}
+              onSelectSection={onSelectSection}
+            />
           ) : null}
         </aside>
       </div>
