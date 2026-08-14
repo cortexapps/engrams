@@ -1,17 +1,20 @@
 import { useMutation } from "@connectrpc/connect-query";
 import { useParams } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type UIEvent } from "react";
 import type { SpecSelectionActionPayload } from "@engrams/spec-document";
 
 import { Markdown } from "@/components/Markdown";
 import { SpecShell } from "@/components/spec-mode/SpecShell";
 import type { SpecConnection } from "@/components/spec/SpecConnection";
+import { useSpecSurface } from "@/components/spec-mode/spec-surface";
+import { useScrollAnchors } from "@/components/spec-mode/useScrollAnchors";
 import { LazySpecCanvas } from "@/components/spec/LazySpecCanvas";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Text } from "@/components/ui/text";
 import { sendPrompt as sendPromptMethod } from "@/gen/engram/app/v1/session-SessionService_connectquery";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
-import { type SpecReadResponse, useSpecRead } from "@/hooks/useSpecRead";
+import { useSpecPublish } from "@/hooks/useSpecPublish";
+import { type SpecReadResponse, useSpecRail, useSpecRead } from "@/hooks/useSpecRead";
 
 type CurrentSpecPhase = "ideation" | "drafting" | "published";
 
@@ -20,10 +23,35 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   const routeSpecId = "specId" in params && typeof params.specId === "string" ? params.specId : "";
   const specId = explicitSpecId ?? routeSpecId;
   const read = useSpecRead(specId);
+  const rail = useSpecRail(specId);
+  const publish = useSpecPublish(specId);
   const sendSelectionPrompt = useMutation(sendPromptMethod);
   const phase = read.data ? currentPhase(read.data) : null;
   const { connection, synced } = useSpecConnection(specId, phase === "drafting");
+  const [readingSectionId, setReadingSectionId] = useState<string | null>(null);
+  const [showProvenance, setShowProvenance] = useState(true);
+  const documentPaneRef = useRef<HTMLElement | null>(null);
+  const { scrollToSection } = useScrollAnchors(documentPaneRef);
+  const surface = useSpecSurface(rail.data, connection?.doc ?? null, {
+    readingSectionId,
+    openQuestions: publish.data?.gate.openQuestions,
+  });
   useDocumentTitle(read.data?.spec.title ?? "Tech spec");
+
+  const selectSection = (sectionId: string) => {
+    setReadingSectionId(sectionId);
+    scrollToSection(sectionId);
+  };
+  const trackReadingSection = (event: UIEvent<HTMLElement>) => {
+    const pane = event.currentTarget;
+    const readingLine = pane.scrollTop + 72;
+    const sections = Array.from(pane.querySelectorAll<HTMLElement>("[data-section-id]"));
+    const current = sections.reduce<HTMLElement | null>(
+      (closest, section) => (section.offsetTop <= readingLine ? section : closest),
+      sections[0] ?? null,
+    );
+    setReadingSectionId(current?.dataset.sectionId ?? null);
+  };
 
   if (read.isPending) {
     return (
@@ -33,6 +61,8 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
         templateName=""
         checkpoints={[]}
         viewerIsOwner={false}
+        showProvenance={showProvenance}
+        onShowProvenanceChange={setShowProvenance}
       >
         <div className="spec-mode-loading" aria-label="Loading spec">
           <Skeleton className="h-7 w-2/5" />
@@ -51,6 +81,8 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
         templateName=""
         checkpoints={[]}
         viewerIsOwner={false}
+        showProvenance={showProvenance}
+        onShowProvenanceChange={setShowProvenance}
       >
         <div className="spec-mode-error">
           <Text as="h2" variant="heading">
@@ -88,6 +120,12 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
       templateName={spec.template.name}
       checkpoints={checkpoints}
       viewerIsOwner={spec.viewerIsOwner}
+      surface={phase === "drafting" ? surface : undefined}
+      onSelectSection={selectSection}
+      documentPaneRef={documentPaneRef}
+      onDocumentScroll={trackReadingSection}
+      showProvenance={showProvenance}
+      onShowProvenanceChange={setShowProvenance}
     >
       {phase === "drafting" ? (
         connection && synced ? (
@@ -97,6 +135,8 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
             specId={specId}
             revision={spec.revision}
             selectionActions={selectionActions}
+            surface={surface}
+            showProvenance={showProvenance}
           />
         ) : (
           <div className="spec-mode-loading" aria-label="Loading collaborative spec">

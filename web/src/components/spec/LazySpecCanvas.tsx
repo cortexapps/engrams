@@ -3,6 +3,7 @@ import type { WebsocketProvider } from "y-websocket";
 import type * as Y from "yjs";
 
 import { Skeleton } from "@/components/ui/skeleton";
+import type { SpecSurface } from "@/components/spec-mode/spec-surface";
 import type { SpecSelectionActions } from "./SpecSelectionActions";
 
 const SpecCanvas = lazy(() =>
@@ -16,11 +17,15 @@ export function LazySpecCanvas({
   specId,
   revision,
   selectionActions,
+  surface,
+  showProvenance,
 }: {
   doc: Y.Doc;
   provider: WebsocketProvider;
   specId: string;
   revision: string;
+  surface: SpecSurface;
+  showProvenance: boolean;
   selectionActions?: SpecSelectionActions;
 }) {
   return (
@@ -39,6 +44,8 @@ export function LazySpecCanvas({
         specId={specId}
         revision={revision}
         selectionActions={selectionActions}
+        surface={surface}
+        showProvenance={showProvenance}
       />
     </Suspense>
   );
