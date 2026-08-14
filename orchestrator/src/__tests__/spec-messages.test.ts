@@ -377,9 +377,9 @@ describe.skipIf(!postgresReachable)("Postgres spec message keyset", () => {
       [postgresIds.template],
     );
     await livePool.query(
-      `INSERT INTO spec (id, org_id, template_id, title, lifecycle)
-       VALUES ($1, 'test-org', $3, 'Microsecond cursor', 'draft'),
-              ($2, 'test-org', $3, 'Tied cursor', 'draft')`,
+      `INSERT INTO spec (id, org_id, template_id, title, phase)
+       VALUES ($1, 'test-org', $3, 'Microsecond cursor', 'drafting'),
+              ($2, 'test-org', $3, 'Tied cursor', 'drafting')`,
       [postgresIds.microsecondSpec, postgresIds.tiedSpec, postgresIds.template],
     );
   });
