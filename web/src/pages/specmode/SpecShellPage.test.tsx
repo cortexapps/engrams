@@ -1,7 +1,7 @@
 import { act, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { WebsocketProvider } from "y-websocket";
-import type * as Y from "yjs";
+import * as Y from "yjs";
 
 import { renderWithProviders } from "@/test-utils";
 import { SpecShellPage } from "./SpecShellPage";
@@ -23,10 +23,11 @@ const providerState = vi.hoisted(() => {
   };
 });
 
-vi.mock("@/components/spec/SpecCanvas", () => ({
-  createSpecProvider: (specId: string, doc: Y.Doc) => {
+vi.mock("@/components/spec/SpecConnection", () => ({
+  createSpecConnection: (specId: string) => {
+    const doc = new Y.Doc();
     providerState.create(specId, doc);
-    return providerState.provider as unknown as WebsocketProvider;
+    return { doc, provider: providerState.provider as unknown as WebsocketProvider };
   },
 }));
 

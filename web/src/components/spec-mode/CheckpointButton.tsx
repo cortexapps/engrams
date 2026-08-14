@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { History } from "lucide-react";
 
 import { CheckpointDiff } from "@/components/spec/CheckpointDiff";
@@ -28,8 +28,11 @@ export function CheckpointButton({
   const latest = ordered.at(-1);
   const defaultIds = useMemo(() => ordered.slice(-2).map((checkpoint) => checkpoint.id), [ordered]);
   const [selectedIds, setSelectedIds] = useState<string[]>(defaultIds);
+  const [open, setOpen] = useState(false);
+  const defaultIdsRef = useRef(defaultIds);
+  defaultIdsRef.current = defaultIds;
 
-  useEffect(() => setSelectedIds(defaultIds), [defaultIds]);
+  useEffect(() => setSelectedIds(defaultIdsRef.current), [specId]);
 
   const before = useSpecCheckpoint(specId, selectedIds.at(-2) ?? null);
   const after = useSpecCheckpoint(specId, selectedIds.at(-1) ?? null);
@@ -42,7 +45,13 @@ export function CheckpointButton({
   };
 
   return (
-    <Sheet>
+    <Sheet
+      open={open}
+      onOpenChange={(nextOpen) => {
+        setOpen(nextOpen);
+        if (nextOpen) setSelectedIds(defaultIdsRef.current);
+      }}
+    >
       <SheetTrigger asChild>
         <Button variant="outline" size="sm" className="spec-mode-checkpoint-trigger">
           <History aria-hidden="true" />

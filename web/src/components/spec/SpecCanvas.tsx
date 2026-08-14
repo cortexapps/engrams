@@ -10,24 +10,12 @@ import { useAuth } from "@/auth/AuthProvider";
 import { collaboratorColor } from "@/components/spec-mode/collaborator-colors";
 import { Button } from "@/components/ui/button";
 import { useIsMobile } from "@/hooks/use-mobile";
+import type { SpecConnection } from "./SpecConnection";
 import { SpecPresence } from "./SpecPresence";
 import { SpecSelectionBubbleMenu, type SpecSelectionActions } from "./SpecSelectionActions";
 import { SpecBlockIterationProvider } from "./block-iteration";
 import { specNodeExtensions } from "./extensions";
 import "./spec-canvas.css";
-
-export interface SpecConnection {
-  doc: Y.Doc;
-  provider: WebsocketProvider;
-}
-
-type WebSocketProviderOptions = NonNullable<ConstructorParameters<typeof WebsocketProvider>[3]>;
-
-interface CreateSpecProviderOptions {
-  connect?: boolean;
-  location?: Pick<Location, "host" | "protocol">;
-  WebSocketPolyfill?: WebSocketProviderOptions["WebSocketPolyfill"];
-}
 
 export function SpecCanvas({
   doc,
@@ -166,27 +154,4 @@ export function ConnectedSpecCanvas({
       {specDocument}
     </div>
   );
-}
-
-export function createSpecProvider(
-  specId: string,
-  doc: Y.Doc,
-  options: CreateSpecProviderOptions = {},
-): WebsocketProvider {
-  const providerOptions: WebSocketProviderOptions = {
-    connect: options.connect ?? true,
-    params: { clientId: String(doc.clientID) },
-    ...(options.WebSocketPolyfill ? { WebSocketPolyfill: options.WebSocketPolyfill } : {}),
-  };
-  return new WebsocketProvider(
-    specSocketBase(specId, options.location ?? window.location),
-    "sync",
-    doc,
-    providerOptions,
-  );
-}
-
-function specSocketBase(specId: string, location: Pick<Location, "host" | "protocol">): string {
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${location.host}/api/v1/specs/${encodeURIComponent(specId)}`;
 }

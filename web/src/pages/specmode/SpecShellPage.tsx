@@ -2,23 +2,16 @@ import { useMutation } from "@connectrpc/connect-query";
 import { useParams } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import type { SpecSelectionActionPayload } from "@engrams/spec-document";
-import type { WebsocketProvider } from "y-websocket";
-import * as Y from "yjs";
 
 import { Markdown } from "@/components/Markdown";
 import { SpecShell } from "@/components/spec-mode/SpecShell";
-import { createSpecProvider } from "@/components/spec/SpecCanvas";
+import type { SpecConnection } from "@/components/spec/SpecConnection";
 import { LazySpecCanvas } from "@/components/spec/LazySpecCanvas";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Text } from "@/components/ui/text";
 import { sendPrompt as sendPromptMethod } from "@/gen/engram/app/v1/session-SessionService_connectquery";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { type SpecReadResponse, useSpecRead } from "@/hooks/useSpecRead";
-
-interface SpecConnection {
-  doc: Y.Doc;
-  provider: WebsocketProvider;
-}
 
 type CurrentSpecPhase = "drafting" | "published";
 
@@ -136,17 +129,26 @@ function useSpecConnection(specId: string, enabled: boolean) {
     setSynced(false);
     if (!enabled) return;
 
-    const doc = new Y.Doc();
-    const provider = createSpecProvider(specId, doc);
-    const onSync = (isSynced: boolean) => setSynced(isSynced);
-    provider.on("sync", onSync);
-    setConnection({ doc, provider });
-    if (provider.synced) setSynced(true);
+    let disposed = false;
+    let disposeConnection: (() => void) | undefined;
+    void import("@/components/spec/SpecConnection").then(({ createSpecConnection }) => {
+      if (disposed) return;
+
+      const nextConnection = createSpecConnection(specId);
+      const onSync = (isSynced: boolean) => setSynced(isSynced);
+      nextConnection.provider.on("sync", onSync);
+      setConnection(nextConnection);
+      if (nextConnection.provider.synced) setSynced(true);
+      disposeConnection = () => {
+        nextConnection.provider.off("sync", onSync);
+        nextConnection.provider.destroy();
+        nextConnection.doc.destroy();
+      };
+    });
 
     return () => {
-      provider.off("sync", onSync);
-      provider.destroy();
-      doc.destroy();
+      disposed = true;
+      disposeConnection?.();
     };
   }, [enabled, specId]);
 

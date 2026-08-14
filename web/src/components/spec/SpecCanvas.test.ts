@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "vitest";
 import * as Y from "yjs";
 
-import { createSpecProvider } from "./SpecCanvas";
+import { createSpecProvider } from "./SpecConnection";
 
 const documents: Y.Doc[] = [];
 

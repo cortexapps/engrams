@@ -5,7 +5,8 @@ import { prosemirrorToYXmlFragment } from "y-prosemirror";
 import type { WebsocketProvider } from "y-websocket";
 import * as Y from "yjs";
 
-import { ConnectedSpecCanvas, createSpecProvider } from "./SpecCanvas";
+import { ConnectedSpecCanvas } from "./SpecCanvas";
+import { createSpecProvider } from "./SpecConnection";
 
 const USER = { name: "Grace", color: "#2563eb" };
 const TEMPLATE: SpecTemplate = {
