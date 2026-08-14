@@ -110,6 +110,8 @@ import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
 import { makeSpecRailRoute, PostgresSpecRailStore } from "./routes/spec-rail.ts";
 import { makeSpecBlockIterationRoute } from "./routes/spec-block-iteration.ts";
+import { makeSpecMessagesRoute, PostgresSpecMessageStore } from "./routes/spec-messages.ts";
+import { makeSpecEventsRoute } from "./routes/spec-events.ts";
 import { makeSpecTemplatesRoute } from "./routes/spec-templates.ts";
 import { makeSpecTemplateCatalog } from "./specs/template-catalog.ts";
 import { createSpec, makeSpecCreateStore } from "./specs/create.ts";
@@ -182,6 +184,7 @@ const specToolService = new SpecToolService({
   now: specNow,
 });
 const specRailStore = new PostgresSpecRailStore(getPool());
+const specMessageStore = new PostgresSpecMessageStore(getPool());
 const specGapCheck = new GapCheckService({
   documents: specDocuments,
   railStore: specRailStore,
@@ -359,6 +362,21 @@ app.route(
       return { sessionId, document: proseMirrorDocument(loaded.doc) };
     },
     preparePrompt: (sessionId, status) => productionSpecProjection.preparePrompt(sessionId, status),
+  }),
+);
+app.route(
+  "/",
+  makeSpecMessagesRoute({
+    store: specMessageStore,
+    resolveMembership: resolveSpecMembership,
+    preparePrompt: (sessionId, status) => productionSpecProjection.preparePrompt(sessionId, status),
+  }),
+);
+app.route(
+  "/",
+  makeSpecEventsRoute({
+    resolveMembership: resolveSpecMembership,
+    resolveSessionId: (specId) => specMessageStore.resolveSessionId(specId),
   }),
 );
 app.route(

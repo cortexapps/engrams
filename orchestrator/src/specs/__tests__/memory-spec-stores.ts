@@ -13,6 +13,56 @@ import type {
   SectionStateTranscriptAction,
 } from "../section-state-service.ts";
 import type { SectionStateValue } from "../section-state.ts";
+import type {
+  CreateSpecChatMessageInput,
+  SpecChatMessageRecord,
+  SpecMessageCursor,
+  SpecMessageStore,
+} from "../../routes/spec-messages.ts";
+
+export class MemorySpecMessageStore implements SpecMessageStore {
+  sessionId: string | null = null;
+  readonly rows: SpecChatMessageRecord[] = [];
+  now = () => new Date();
+
+  async resolveSessionId(): Promise<string | null> {
+    return this.sessionId;
+  }
+
+  async insertMessage(input: CreateSpecChatMessageInput): Promise<void> {
+    this.rows.push({ ...input, createdAt: this.now().toISOString() });
+  }
+
+  async listMessages(
+    specId: string,
+    after: SpecMessageCursor | undefined,
+    limit: number,
+  ): Promise<SpecChatMessageRecord[]> {
+    const cursorRow = after
+      ? this.rows.find(
+          (row) =>
+            row.specId === specId &&
+            row.promptId === after.promptId &&
+            new Date(row.createdAt).getTime() === new Date(after.createdAt).getTime(),
+        )
+      : undefined;
+    return this.rows
+      .filter(
+        (row) =>
+          row.specId === specId &&
+          (!after ||
+            (cursorRow !== undefined &&
+              (row.createdAt > cursorRow.createdAt ||
+                (row.createdAt === cursorRow.createdAt && row.promptId > cursorRow.promptId)))),
+      )
+      .sort(
+        (left, right) =>
+          left.createdAt.localeCompare(right.createdAt) ||
+          left.promptId.localeCompare(right.promptId),
+      )
+      .slice(0, limit);
+  }
+}
 
 export class MemorySectionStore implements SectionStateStore {
   readonly values = new Map<string, SectionStateValue>();
