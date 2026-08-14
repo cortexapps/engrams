@@ -81,7 +81,12 @@ export function SpecShell({
         </section>
         <aside className="spec-mode-conversation" aria-label="Conversation">
           {surface ? (
-            <ConversationRail specId={specId} surface={surface} onSelectSection={onSelectSection} />
+            <ConversationRail
+              specId={specId}
+              surface={surface}
+              presence={presence}
+              onSelectSection={onSelectSection}
+            />
           ) : null}
         </aside>
       </div>

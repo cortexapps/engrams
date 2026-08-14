@@ -134,7 +134,10 @@ function IdeationPresence({ awareness }: { awareness?: Awareness }) {
   );
 
   return (
-    <div className="spec-mode-ideation-presence" aria-label={`${entries.length} people present`}>
+    <div
+      className="spec-mode-ideation-presence"
+      aria-label={`${entries.length} ${entries.length === 1 ? "person" : "people"} present`}
+    >
       {entries.map((entry) => (
         <span className="spec-mode-ideation-person" key={entry.key}>
           <span
