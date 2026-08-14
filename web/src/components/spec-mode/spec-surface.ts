@@ -67,6 +67,24 @@ const EMPTY_SPEC_SURFACE: SpecSurface = {
 };
 
 /** Keep the shared surface current when either the rail or the Yjs document changes. */
+/**
+ * How long a burst of document updates settles before the surface is derived
+ * again.
+ *
+ * Deriving rebuilds the whole ProseMirror document from the Yjs fragment and
+ * scans every text node for provenance, which is O(document). The editor turns
+ * each local keystroke into a Yjs transaction, so without this the cost is paid
+ * per character on the main thread and grows with the spec — invisible at test
+ * size, and worst exactly when a spec is long enough to be worth writing.
+ *
+ * A person does not perceive this delay in the derived facts (emptiness,
+ * question counts, provenance chips), because they are reading what they just
+ * typed, not the derivation of it. State the person acts on — settling a
+ * section, dropping a proposal — does NOT come through here: it arrives with
+ * the rail, so those still land immediately.
+ */
+const DERIVE_SETTLE_MS = 120;
+
 export function useSpecSurface(
   rail: SpecRail | null | undefined,
   document: Y.Doc | null,
@@ -77,8 +95,19 @@ export function useSpecSurface(
   const openQuestions = options.openQuestions;
   useEffect(() => {
     if (document === null) return;
-    document.on("update", documentChanged);
-    return () => document.off("update", documentChanged);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const settle = () => {
+      if (timer !== null) return;
+      timer = setTimeout(() => {
+        timer = null;
+        documentChanged();
+      }, DERIVE_SETTLE_MS);
+    };
+    document.on("update", settle);
+    return () => {
+      document.off("update", settle);
+      if (timer !== null) clearTimeout(timer);
+    };
   }, [document]);
   return useMemo(
     () =>

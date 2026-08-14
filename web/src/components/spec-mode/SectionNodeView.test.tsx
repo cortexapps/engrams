@@ -116,6 +116,35 @@ describe("SectionNodeView", () => {
     expect(screen.queryByText(/Nothing here yet/)).toBeNull();
   });
 
+  test("stops inviting a draft once the section is no longer open", async () => {
+    // Excluding a section leaves its body empty, so emptiness alone must not
+    // bring the invitation back and ask the person to decide again.
+    const doc = yDocument("## Proposed design\n\n");
+    const provider = specProvider(doc);
+    const naRail: SpecRail = {
+      ...rail("open"),
+      sections: rail("open").sections.map((section) => ({
+        ...section,
+        state: "n/a" as const,
+        naReason: "The design does not change.",
+      })),
+    };
+    for (const railValue of [naRail, rail("proposed"), rail("settled")]) {
+      const view = render(
+        <ConnectedSpecCanvas
+          connection={{ doc, provider }}
+          user={{ name: "Grace", color: "#2563eb" }}
+          specId="spec-1"
+          revision="17"
+          surface={deriveSpecSurface(railValue, doc)}
+          showProvenance
+        />,
+      );
+      expect(screen.queryByText(/Nothing here yet/)).toBeNull();
+      view.unmount();
+    }
+  });
+
   test("uses surface provenance for both the settled chip and inline decoration", async () => {
     const doc = yDocument(
       "## Proposed design\n\nThe limiter lives in gateway/limits.rs @ 8f2c1a4.\n",

@@ -99,7 +99,13 @@ export function SectionNodeView({ editor, getPos, node }: NodeViewProps) {
         </div>
       ) : null}
 
-      {section.isEmpty && section.isReached ? (
+      {/* Only an OPEN section invites drafting. `isReached` is true for every
+          non-open state, so without the state test the invitation came back on
+          a section somebody had just excluded — asking them to draft it or
+          exclude it again, with the reason they gave stored but never shown.
+          It also let "Draft it" sit beside Keep and Revise while a proposed
+          section was still empty. */}
+      {section.state === "open" && section.isEmpty && section.isReached ? (
         <div className="spec-mode-empty-invitation" contentEditable={false}>
           <Text tone="muted" className="spec-mode-empty-copy">
             Nothing here yet. I can draft this from the three handlers that already touch quota in{" "}

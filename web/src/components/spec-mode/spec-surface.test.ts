@@ -1,10 +1,16 @@
 import { parseMarkdown, SPEC_FRAGMENT_NAME } from "@engrams/spec-document";
 import { prosemirrorToYXmlFragment } from "y-prosemirror";
-import { describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
 import * as Y from "yjs";
 
 import type { SpecRail } from "@/hooks/useSpecRead";
-import { deriveNextProposal, deriveSpecSurface, isSectionComplete } from "./spec-surface";
+import {
+  deriveNextProposal,
+  deriveSpecSurface,
+  isSectionComplete,
+  useSpecSurface,
+} from "./spec-surface";
 
 describe("deriveSpecSurface", () => {
   test("keeps rail state while deriving invitations and open questions from the document", () => {
@@ -146,6 +152,37 @@ function yDocument(markdown: string): Y.Doc {
   );
   return document;
 }
+
+describe("useSpecSurface", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  test("a burst of document updates costs one derivation, not one per update", () => {
+    // Deriving rebuilds the whole document and scans every text node, and the
+    // editor turns each keystroke into a Yjs update. Typing must not pay that
+    // per character.
+    const doc = yDocument("## Problem\n\nThe limiter retries forever.\n\n## API\n\nOne route.\n");
+    const railValue = rail();
+    const { result } = renderHook(() => useSpecSurface(railValue, doc));
+    const first = result.current;
+
+    act(() => {
+      for (let i = 0; i < 25; i += 1) {
+        doc.getMap("burst").set(`key-${i}`, i);
+      }
+    });
+    // Nothing settled yet, so the surface identity is unchanged.
+    expect(result.current).toBe(first);
+
+    act(() => void vi.advanceTimersByTime(200));
+    const afterBurst = result.current;
+    expect(afterBurst).not.toBe(first);
+
+    // A quiet period does not derive again.
+    act(() => void vi.advanceTimersByTime(1_000));
+    expect(result.current).toBe(afterBurst);
+  });
+});
 
 function rail(
   states: Array<{ id: "problem" | "api"; state: "open" | "proposed" | "settled" | "n/a" }> = [
