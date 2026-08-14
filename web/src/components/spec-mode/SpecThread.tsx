@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, type UIEvent } from "react";
+import { useLayoutEffect, useRef, type ReactNode, type UIEvent } from "react";
 
 import { Text } from "@/components/ui/text";
 import { collaboratorColor } from "./collaborator-colors";
@@ -11,11 +11,13 @@ export function SpecThread({
   isRunning,
   toolLabel,
   onActivity,
+  emptyState,
 }: {
   entries: readonly SpecThreadEntry[];
   isRunning: boolean;
   toolLabel?: string | null;
   onActivity: (sectionId: string) => void;
+  emptyState?: ReactNode;
 }) {
   const threadRef = useRef<HTMLDivElement | null>(null);
   const followsTail = useRef(true);
@@ -42,6 +44,7 @@ export function SpecThread({
       aria-live="polite"
       onScroll={trackScroll}
     >
+      {entries.length === 0 && !isRunning ? emptyState : null}
       {entries.map((entry) => {
         if (entry.kind === "document_activity") {
           const sections = entry.sectionTitles.map((title) => `§${title}`).join(", ");

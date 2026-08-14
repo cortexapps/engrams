@@ -5,11 +5,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   restoreSpecSection,
+  startSpecDrafting,
   setSpecSectionState,
   type SpecRequestError,
   useSetSpecSectionState,
   useSpecRail,
   useSpecRead,
+  useStartSpecDrafting,
 } from "./useSpecRead";
 
 afterEach(() => {
@@ -69,6 +71,81 @@ describe("restoreSpecSection", () => {
   });
 });
 
+describe("startSpecDrafting", () => {
+  it("posts the one-way bridge and flips the cached server phase optimistically", async () => {
+    let resolveResponse: ((response: Response) => void) | undefined;
+    const fetchMock = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveResponse = resolve;
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["spec", "spec-1"], specReadResponse("ideation"));
+    const wrapper = ({ children }: PropsWithChildren) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useStartSpecDrafting("spec-1"), { wrapper });
+
+    let pending: Promise<unknown> | undefined;
+    act(() => {
+      pending = result.current.mutateAsync();
+    });
+
+    await vi.waitFor(() =>
+      expect(
+        queryClient.getQueryData<ReturnType<typeof specReadResponse>>(["spec", "spec-1"])?.spec
+          .phase,
+      ).toBe("drafting"),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/specs/spec-1/start-drafting",
+      expect.objectContaining({ method: "POST" }),
+    );
+
+    resolveResponse?.(jsonResponse({ phase: "drafting", started: true, prompt_id: "seed-prompt" }));
+    await pending;
+    await vi.waitFor(() =>
+      expect(result.current.data).toEqual({
+        phase: "drafting",
+        started: true,
+        promptId: "seed-prompt",
+      }),
+    );
+    queryClient.clear();
+  });
+
+  it("restores ideation when start-drafting fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(new Response("control plane unavailable", { status: 503 }))),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["spec", "spec-1"], specReadResponse("ideation"));
+    const wrapper = ({ children }: PropsWithChildren) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useStartSpecDrafting("spec-1"), { wrapper });
+
+    await expect(result.current.mutateAsync()).rejects.toMatchObject({ status: 503 });
+    expect(
+      queryClient.getQueryData<ReturnType<typeof specReadResponse>>(["spec", "spec-1"])?.spec.phase,
+    ).toBe("ideation");
+    queryClient.clear();
+  });
+
+  it("maps the idempotent server response", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(jsonResponse({ phase: "drafting", started: false }))),
+    );
+
+    await expect(startSpecDrafting("spec-1")).resolves.toEqual({
+      phase: "drafting",
+      started: false,
+    });
+  });
+});
+
 describe("useSpecRead", () => {
   it("polls a foreground drafting spec until the server returns the published checkpoint", async () => {
     vi.useFakeTimers();
@@ -93,7 +170,7 @@ describe("useSpecRead", () => {
   });
 });
 
-function specReadResponse(phase: "drafting" | "published") {
+function specReadResponse(phase: "ideation" | "drafting" | "published") {
   const published = phase === "published";
   return {
     spec: {

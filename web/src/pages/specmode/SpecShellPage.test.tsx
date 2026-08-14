@@ -1,10 +1,12 @@
 import { act, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { WebsocketProvider } from "y-websocket";
 import * as Y from "yjs";
 
 import { renderWithProviders } from "@/test-utils";
 import { SpecShellPage } from "./SpecShellPage";
+
+const readState = vi.hoisted(() => ({ phase: "drafting" as "ideation" | "drafting" }));
 
 const providerState = vi.hoisted(() => {
   const callbacks = new Set<(synced: boolean) => void>();
@@ -61,7 +63,7 @@ vi.mock("@/hooks/useSpecRead", () => ({
       spec: {
         id: "spec-1",
         title: "Quota design",
-        phase: "drafting",
+        phase: readState.phase,
         sessionId: null,
         viewerIsOwner: false,
         publishedCheckpointId: null,
@@ -74,6 +76,11 @@ vi.mock("@/hooks/useSpecRead", () => ({
     },
     isPending: false,
     error: null,
+  }),
+  useStartSpecDrafting: () => ({
+    isPending: false,
+    error: null,
+    mutate: vi.fn(),
   }),
   useSpecRail: () => ({
     data: {
@@ -97,6 +104,10 @@ vi.mock("@/hooks/useSpecRead", () => ({
 }));
 
 describe("SpecShellPage", () => {
+  beforeEach(() => {
+    readState.phase = "drafting";
+  });
+
   it("owns one Yjs connection and disposes it after the canvas unmounts", async () => {
     providerState.callbacks.clear();
     providerState.provider.on.mockClear();
@@ -127,5 +138,15 @@ describe("SpecShellPage", () => {
     expect(providerState.provider.off).toHaveBeenCalledTimes(1);
     expect(providerState.provider.destroy).toHaveBeenCalledTimes(1);
     expect((createdDoc as Y.Doc).isDestroyed).toBe(true);
+  });
+  it("routes an ideation server phase to the centered thread instead of the shell", async () => {
+    readState.phase = "ideation";
+
+    renderWithProviders(<SpecShellPage specId="spec-1" />);
+
+    expect(await screen.findByRole("main", { name: "Spec ideation" })).toBeTruthy();
+    expect(screen.getByText("Thinking it through")).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Spec document" })).toBeNull();
+    expect(screen.queryByRole("complementary", { name: "Spec sections" })).toBeNull();
   });
 });
