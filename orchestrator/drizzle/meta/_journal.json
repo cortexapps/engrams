@@ -498,6 +498,13 @@
       "when": 1787032000000,
       "tag": "0070_spec_drafting_seed",
       "breakpoints": true
+    },
+    {
+      "idx": 71,
+      "version": "7",
+      "when": 1787118400000,
+      "tag": "0071_first_class_model_routers",
+      "breakpoints": true
     }
   ]
 }

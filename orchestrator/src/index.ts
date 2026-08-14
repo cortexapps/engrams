@@ -48,6 +48,7 @@ import { registerPrRefs } from "./rpc/pr-refs.ts";
 import { registerReviews } from "./rpc/reviews.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
 import { registerOrgSecret } from "./rpc/org-secret.ts";
+import { registerModelRouters } from "./rpc/model-routers.ts";
 import { registerMint } from "./rpc/mint.ts";
 import { registerApiKeys } from "./rpc/api-key.ts";
 import { registerIntegration } from "./rpc/integration.ts";
@@ -101,6 +102,8 @@ import {
   SpecTicketTreeService,
 } from "./specs/ticket-tree.ts";
 import { makeProfileStore } from "./db/profiles.ts";
+import { makeModelRouterStore } from "./db/model-routers.ts";
+import { ModelRouterCatalogRefresher } from "./model-routers/catalog.ts";
 import { makeIntegrationConnectionStore } from "./db/integration-connections.ts";
 import { makeConnectorStore } from "./db/connectors.ts";
 import { loadRegistry } from "./connectors/registry.ts";
@@ -484,6 +487,9 @@ const server = buildServer(
     // coordinator-side and never returned.
     registerOrgSecret(router);
 
+    // ADR 0117: orchestrator-owned router registry, model catalog, and policy.
+    registerModelRouters(router);
+
     // Native MintService (ADR 0057 C3): admin-gated proxy over the coordinator's
     // read-only mint-kind registry (Plane-A form metadata). Before passthrough.
     registerMint(router);
@@ -627,6 +633,10 @@ const listenerManager = makeProductionListenerManager();
 await listenerManager.start();
 const automationScheduler = makeProductionAutomationScheduler();
 await automationScheduler.start();
+const modelRouterRefresher = new ModelRouterCatalogRefresher({
+  store: makeModelRouterStore(getDb()),
+});
+modelRouterRefresher.start();
 // ADR 0109: scheduled OIDC signing-key rotation. The first step also creates
 // the active key, so the public JWKS GET stays read-only.
 const oidcKeyRotation = startOidcKeyRotation({
@@ -645,6 +655,7 @@ process.on("SIGTERM", () => {
     });
     // Quiesce DBOS after the HTTP server stops accepting connections.
     oidcKeyRotation.stop();
+    modelRouterRefresher.stop();
     await automationScheduler.stop();
     await listenerManager.stop();
     await specPublishScanner.stop();

@@ -62,6 +62,8 @@ message CreateTaskRequest {
   // ADR 0113: create the task and primary session without sending the prompt.
   // The prompt still supplies the initial task title.
   bool defer_initial_prompt = 10;
+  // Empty means direct/native provider. Unset inherits the profile.
+  optional string model_router = 11;
 }
 
 message CreateTaskResponse {
@@ -105,6 +107,7 @@ message Task {
   optional string canonical_task_name = 17;
   optional string spawning_session_id = 18;
   repeated Task descendants = 19;
+  optional string model_router = 20;
 }
 
 message TaskSessionRef {

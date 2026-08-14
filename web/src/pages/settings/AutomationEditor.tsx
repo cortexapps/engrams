@@ -125,11 +125,13 @@ const TIMEZONE_SUGGESTIONS = [
 function overrideFields(override: HarnessOverride): {
   harness?: string;
   model?: string;
+  modelRouter?: string;
   effort?: string;
 } {
   return {
     ...(override.harness ? { harness: override.harness } : {}),
     ...(override.model ? { model: override.model } : {}),
+    ...(override.modelRouter !== null ? { modelRouter: override.modelRouter } : {}),
     ...(override.effort ? { effort: override.effort } : {}),
   };
 }
@@ -371,6 +373,7 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
         action?.case === "createTask"
           ? {
               harness: action.value.harness ?? null,
+              modelRouter: action.value.modelRouter ?? null,
               model: action.value.model ?? null,
               effort: action.value.effort ?? null,
               // Mode is the `planFirst` switch below, not one of these pickers.
@@ -890,8 +893,13 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
             <SessionHarnessControls
               harnesses={harnesses.data}
               {...(selectedProfile?.harness ? { profileHarness: selectedProfile.harness } : {})}
+              {...(selectedProfile?.modelRouter
+                ? { profileModelRouter: selectedProfile.modelRouter }
+                : {})}
+              {...(selectedProfile?.model ? { profileModel: selectedProfile.model } : {})}
               value={draft.override}
               onChange={(next) => update("override", next)}
+              audience="programmatic"
             />
             <FieldDescription>
               Every run of this automation uses this selection. A field left on the profile default

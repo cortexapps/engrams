@@ -38,6 +38,7 @@ import {
   customType,
   bigint,
   uuid,
+  check,
 } from "drizzle-orm/pg-core";
 
 /** Raw binary column (Postgres `bytea`). node-postgres maps `bytea` ⇄ Buffer. */
@@ -57,6 +58,7 @@ export interface TaskLaunchPolicy {
   profileId: string;
   imageUri: string;
   harness: string;
+  modelRouter?: string;
   model?: string;
   effort?: string;
   includeUserTokens: boolean;
@@ -90,10 +92,11 @@ export const task = pgTable(
     createdByUserId: text("created_by_user_id"), // better-auth user id; null = automation (future)
     source: jsonb("source"), // type-specific trigger ref
     workflowRunId: text("workflow_run_id"), // DBOS run — null for chat (ADR §4)
-    // ADR 0063 B2 echo: the EFFECTIVE harness/model/effort this task's sessions
+    // ADR 0063 B2 and ADR 0117 echo: the effective harness/router/model/effort
     // run with, resolved at create time (override ?? profile ?? catalog default)
     // and persisted so reads can show it. Null on rows that pre-date the columns.
     harness: text("harness"),
+    modelRouter: text("model_router"),
     model: text("model"),
     effort: text("effort"),
     // ADR 0113: a root has null parent/name fields and root_task_id = id. Child
@@ -1186,6 +1189,7 @@ export const profile = pgTable(
     // backfilled to `claude`). model/effort stay nullable → the harness
     // descriptor's defaults. All overridable per session.
     harness: text("harness").notNull(),
+    modelRouter: text("model_router"),
     model: text("model"),
     effort: text("effort"),
     includeUserTokens: boolean("include_user_tokens").notNull().default(false),
@@ -1255,11 +1259,58 @@ export interface CreateTaskAutomationAction {
   /** ADR 0063 B2: override the profile's default harness / model / effort for
    *  every session this automation launches. Absent = inherit the profile. */
   harness?: string;
+  modelRouter?: string;
   model?: string;
   effort?: string;
 }
 
 export type AutomationAction = CreateTaskAutomationAction;
+
+export const routerModel = pgTable(
+  "router_model",
+  {
+    routerId: text("router_id").notNull(),
+    modelId: text("model_id").notNull(),
+    canonicalSlug: text("canonical_slug").notNull(),
+    name: text("name").notNull(),
+    author: text("author"),
+    description: text("description"),
+    contextLength: integer("context_length").notNull().default(0),
+    promptPrice: text("prompt_price"),
+    completionPrice: text("completion_price"),
+    inputModalities: jsonb("input_modalities").$type<string[]>().notNull().default([]),
+    outputModalities: jsonb("output_modalities").$type<string[]>().notNull().default([]),
+    supportedParameters: jsonb("supported_parameters").$type<string[]>().notNull().default([]),
+    huggingFaceId: text("hugging_face_id"),
+    upstream: jsonb("upstream").$type<Record<string, unknown>>().notNull().default({}),
+    available: boolean("available").notNull().default(true),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.routerId, t.modelId] }), index("router_model_available_idx").on(t.routerId, t.available)],
+);
+
+export const routerModelPolicy = pgTable(
+  "router_model_policy",
+  {
+    routerId: text("router_id").notNull(),
+    modelId: text("model_id").notNull(),
+    enabled: boolean("enabled").notNull().default(false),
+    userEnabled: boolean("user_enabled").notNull().default(false),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.routerId, t.modelId] }),
+    foreignKey({ columns: [t.routerId, t.modelId], foreignColumns: [routerModel.routerId, routerModel.modelId] }).onDelete("cascade"),
+    check("router_model_policy_user_implies_enabled", sql`NOT ${t.userEnabled} OR ${t.enabled}`),
+  ],
+);
+
+export const routerSyncState = pgTable("router_sync_state", {
+  routerId: text("router_id").primaryKey(),
+  lastSuccessfulSyncAt: timestamp("last_successful_sync_at", { withTimezone: true }),
+  lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true }),
+  lastError: text("last_error"),
+});
 
 export type WebhookVerificationScheme = "github_hmac_sha256" | "slack_v0" | "generic_hmac_sha256";
 

@@ -41,6 +41,9 @@ import {
 } from "../../hooks/useProfiles";
 import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
+import { useModelRouters, useRouterModels } from "../../hooks/useModelRouters";
+import { RouterModelAudience } from "../../gen/engram/app/v1/model_router_pb";
+import { SearchableOptionMenu } from "../sessions/SessionHarnessControls";
 import { useSkills, useUploadSkill } from "../../hooks/useSkills";
 import { useOrgSecretNames } from "../../hooks/useOrgSecrets";
 import { defaultCapabilitiesForGrants } from "../../lib/profileIntegrations";
@@ -109,6 +112,7 @@ const schema = z.object({
   // ADR 0062/0063: default harness (catalog name) + model/effort (option ids).
   // null = inherit the deployment / descriptor default.
   harness: z.string().nullable(),
+  modelRouter: z.string().nullable(),
   model: z.string().nullable(),
   effort: z.string().nullable(),
   designation: z.boolean(),
@@ -191,6 +195,7 @@ const EMPTY: ProfileFormValues = {
   icon: "Bot",
   imageId: "",
   harness: null,
+  modelRouter: null,
   model: null,
   effort: null,
   designation: false,
@@ -213,6 +218,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const { data: existing } = useProfile(editingId);
   const { data: images } = useEnabledImages(true);
   const { data: harnesses } = useHarnessCatalog(true);
+  const { data: modelRouterData } = useModelRouters();
   const { data: skillCatalog } = useSkills();
   const { data: orgSecretNames } = useOrgSecretNames();
   const { data: connectionData } = useIntegrationConnections();
@@ -246,7 +252,14 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   // ADR 0062/0063: the selected harness's descriptor drives the model/effort
   // option lists (they're enums on the harness, not free-form).
   const harness = watch("harness");
+  const modelRouter = watch("modelRouter");
   const harnessDescriptor = harnesses?.find((h) => h.name === harness)?.descriptor;
+  const routerDescriptor = modelRouterData?.routers.find((router) => router.id === modelRouter);
+  const { data: routerModelData } = useRouterModels(
+    modelRouter ?? "",
+    "",
+    RouterModelAudience.ADMIN_CATALOG,
+  );
   const networkDefault = watch("networkDefault");
   const allowHostsText = watch("allowHostsText");
   const allowPatternsText = watch("allowPatternsText");
@@ -265,6 +278,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       // leaving the form to submit "" (→ `harness "" is not in the catalog`).
       // The default-harness effect below then fills a concrete harness to edit.
       harness: optionId(p.harness),
+      modelRouter: optionId(p.modelRouter),
       model: optionId(p.model),
       effort: optionId(p.effort),
       designation: p.designation === "pr_reviewer",
@@ -337,14 +351,20 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
           secrets: secretRows.map((r) => ({ ref: r.ref, envVar: r.envVar, mode: r.mode })),
         },
         views,
-        // ADR 0063 addendum: the draft's harness opens its own model-API hosts
-        // (merged server-side at create) — show them in "Can reach".
+        // ADR 0117: always-needed harness egress plus the selected route's
+        // provider egress is merged server-side at create. Show the same receipt.
         {
-          allowHosts: harnessDescriptor?.egress?.allowHosts ?? [],
-          allowHostPatterns: harnessDescriptor?.egress?.allowHostPatterns ?? [],
+          allowHosts: [
+            ...(harnessDescriptor?.egress?.allowHosts ?? []),
+            ...(routerDescriptor?.egressHosts ?? harnessDescriptor?.nativeEgress?.allowHosts ?? []),
+          ],
+          allowHostPatterns: [
+            ...(harnessDescriptor?.egress?.allowHostPatterns ?? []),
+            ...(routerDescriptor ? [] : (harnessDescriptor?.nativeEgress?.allowHostPatterns ?? [])),
+          ],
         },
       ),
-    [capabilities, network, secretRows, views, harnessDescriptor],
+    [capabilities, network, secretRows, views, harnessDescriptor, routerDescriptor],
   );
   const connected = views.filter(
     (view) => view.status === "connected" && view.connectionModel !== "named",
@@ -429,6 +449,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       icon: vals.icon,
       imageId: vals.imageId,
       harness: optionId(vals.harness) ?? undefined,
+      modelRouter: optionId(vals.modelRouter) ?? undefined,
       model: optionId(vals.model) ?? undefined,
       effort: optionId(vals.effort) ?? undefined,
       includeUserTokens: vals.includeUserTokens,
@@ -621,10 +642,23 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                       // invalidate the dependent selections.
                       if (next === form.getValues("harness")) return;
                       field.onChange(next);
-                      // model/effort are enums on the harness — reset them when
-                      // the harness changes so a stale option can't survive.
-                      setValue("model", null);
-                      setValue("effort", null);
+                      const router = modelRouterData?.routers.find(
+                        (item) => item.id === form.getValues("modelRouter"),
+                      );
+                      const nextDescriptor = harnesses?.find(
+                        (item) => item.name === next,
+                      )?.descriptor;
+                      const compatible = Boolean(
+                        router &&
+                        nextDescriptor?.routerProtocols?.some((protocol) =>
+                          router.protocols.includes(protocol),
+                        ),
+                      );
+                      if (!compatible) {
+                        setValue("modelRouter", null);
+                        setValue("model", null);
+                        setValue("effort", null);
+                      }
                     }}
                   >
                     <SelectTrigger
@@ -650,36 +684,73 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
               )}
             />
 
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <Controller
+                control={control}
+                name="modelRouter"
+                render={({ field }) => (
+                  <Field>
+                    <FieldLabel htmlFor="model-router-select">Route</FieldLabel>
+                    <Select
+                      value={field.value ?? "__direct__"}
+                      onValueChange={(value) => {
+                        field.onChange(value === "__direct__" ? null : value);
+                        setValue("model", null);
+                      }}
+                    >
+                      <SelectTrigger id="model-router-select" className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__direct__">Direct</SelectItem>
+                        {(modelRouterData?.routers ?? [])
+                          .filter((router) =>
+                            harnessDescriptor?.routerProtocols?.some((protocol) =>
+                              router.protocols.includes(protocol),
+                            ),
+                          )
+                          .map((router) => (
+                            <SelectItem key={router.id} value={router.id}>
+                              {router.label}
+                            </SelectItem>
+                          ))}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                )}
+              />
               <Controller
                 control={control}
                 name="model"
                 render={({ field }) => (
                   <Field>
                     <FieldLabel htmlFor="model-select">Model</FieldLabel>
-                    <Select
-                      value={field.value ?? "__inherit__"}
-                      onValueChange={(v) =>
-                        field.onChange(v === "__inherit__" ? null : optionId(v))
+                    <SearchableOptionMenu
+                      current={
+                        modelRouter
+                          ? (routerModelData?.models.find((model) => model.id === field.value)
+                              ?.name ?? "Default model")
+                          : (harnessDescriptor?.models.find((model) => model.id === field.value)
+                              ?.label ?? "Default model")
                       }
-                      disabled={!harnessDescriptor || harnessDescriptor.models.length === 0}
-                    >
-                      <SelectTrigger
-                        id="model-select"
-                        data-testid="model-select"
-                        className="w-full"
-                      >
-                        <SelectValue placeholder="Default" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="__inherit__">Default</SelectItem>
-                        {(harnessDescriptor?.models ?? []).map((m) => (
-                          <SelectItem key={m.id} value={m.id}>
-                            {m.label || m.id}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                      inheritLabel="Default model"
+                      options={
+                        modelRouter
+                          ? (routerModelData?.models ?? []).map((model) => ({
+                              id: model.id,
+                              label: model.name,
+                              detail: `${model.id}${!model.available ? " · unavailable" : !model.enabled ? " · automation blocked" : !model.userEnabled ? " · users blocked" : ""}`,
+                            }))
+                          : (harnessDescriptor?.models ?? []).map((model) => ({
+                              id: model.id,
+                              label: model.label || model.id,
+                            }))
+                      }
+                      selected={field.value}
+                      onSelect={field.onChange}
+                      disabled={!harnessDescriptor}
+                      testId="model-select"
+                    />
                   </Field>
                 )}
               />

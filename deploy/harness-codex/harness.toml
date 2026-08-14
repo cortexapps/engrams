@@ -2,8 +2,9 @@ name = "codex"
 label = "Codex"
 description = "OpenAI Codex coding agent. Human runs use a managed ChatGPT connection; programmatic runs use an organization API key."
 exec = "harness"
+router_protocols = ["openai_responses"]
 
-# Hosts the harness itself must reach (ADR 0063 addendum): api.openai.com for
+# Native OpenAI hosts (ADR 0117): api.openai.com for
 # API-key runs, chatgpt.com for ChatGPT-token runs, and auth.openai.com so a
 # ChatGPT access token can be REFRESHED in the guest. Codex refreshes at
 # auth.openai.com/oauth/token and rewrites its auth cache; the harness watcher
@@ -12,7 +13,7 @@ exec = "harness"
 # fails with 401 token_expired once the access token expires. There is no
 # server-side repair: the refresh scanner covers connector subjects only, so
 # this in-guest loop is the ONLY refresh path a user credential has.
-[egress]
+[native_egress]
 allow_hosts = ["api.openai.com", "auth.openai.com", "chatgpt.com"]
 
 [auth]

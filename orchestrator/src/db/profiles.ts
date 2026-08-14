@@ -28,6 +28,7 @@ export interface ProfileRow {
   // names a concrete harness) + default model/effort (catalog option ids; null =
   // the harness descriptor's default).
   harness: string;
+  modelRouter?: string | null;
   model: string | null;
   effort: string | null;
   includeUserTokens: boolean;
@@ -57,6 +58,7 @@ export interface ProfileInput {
   icon: string;
   imageId: string;
   harness: string;
+  modelRouter?: string | null;
   model: string | null;
   effort: string | null;
   includeUserTokens: boolean;
@@ -98,6 +100,7 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     icon: r.icon,
     imageId: r.imageId,
     harness: r.harness,
+    modelRouter: r.modelRouter ?? null,
     model: r.model ?? null,
     effort: r.effort ?? null,
     includeUserTokens: r.includeUserTokens,

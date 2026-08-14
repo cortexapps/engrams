@@ -80,9 +80,10 @@ import {
   makePendingToolCallStore,
   type PendingToolCallStore,
 } from "../tools/pending-tool-calls.ts";
-import { createTaskWithSession, type Db, type HarnessCatalogClient } from "./task-create.ts";
+import { createTaskWithSession, type Db, type HarnessCatalogClient, type OrgSecretNameClient } from "./task-create.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
+import type { ModelRouterStore } from "../db/model-routers.ts";
 
 // Re-export ImagesClient so downstream modules (image-guard, tests) can import
 // it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
@@ -153,6 +154,8 @@ export interface TaskDeps {
   /** Owner identity lookup for git attribution and task read enrichment. */
   users?: UserIdentityStore;
   connections?: IntegrationConnectionStore;
+  modelRouters?: ModelRouterStore;
+  orgSecret?: OrgSecretNameClient;
   /** Register a session for stream-listener scanner discovery. */
   db?: Db;
   /** ADR 0107: the pending-tool-call ledger, for the awaiting_review derivation. */
@@ -304,6 +307,7 @@ function buildTask(
     source: unknown;
     createdAt: Date;
     harness: string | null;
+    modelRouter: string | null;
     model: string | null;
     effort: string | null;
     parentTaskId: string | null;
@@ -409,6 +413,7 @@ function buildTask(
     // ADR 0063 B2 echo: the effective selection persisted at create time.
     // Null on rows that pre-date the columns → unset on the wire.
     ...(row.harness != null ? { harness: row.harness } : {}),
+    ...(row.modelRouter != null ? { modelRouter: row.modelRouter } : {}),
     ...(row.model != null ? { model: row.model } : {}),
     ...(row.effort != null ? { effort: row.effort } : {}),
     ...(row.parentTaskId != null ? { parentTaskId: row.parentTaskId } : {}),
@@ -819,6 +824,8 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           portExposures: resolvePortExposures(),
           users: resolveUsers(),
           ...(deps?.connections ? { connections: deps.connections } : {}),
+          ...(deps?.modelRouters ? { modelRouters: deps.modelRouters } : {}),
+          ...(deps?.orgSecret ? { orgSecret: deps.orgSecret } : {}),
           db: getDbFn(),
         },
         {
@@ -834,6 +841,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           ...(req.deferInitialPrompt ? { deferInitialPrompt: true } : {}),
           ...(req.harness != null ? { harness: req.harness } : {}),
           ...(req.model != null ? { model: req.model } : {}),
+          ...(req.modelRouter != null ? { modelRouter: req.modelRouter } : {}),
           ...(req.effort != null ? { effort: req.effort } : {}),
           ...(req.harnessMode != null ? { harnessMode: req.harnessMode } : {}),
         },

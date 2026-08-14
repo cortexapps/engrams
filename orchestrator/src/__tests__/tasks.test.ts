@@ -725,6 +725,7 @@ function listTaskRow(
     source: {},
     workflowRunId: null,
     harness: null,
+    modelRouter: null,
     model: null,
     effort: null,
     parentTaskId: null,

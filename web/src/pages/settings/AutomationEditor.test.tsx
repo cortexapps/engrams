@@ -66,6 +66,10 @@ vi.mock("@/hooks/useHarnessCatalog", () => ({
     ],
   }),
 }));
+vi.mock("@/hooks/useModelRouters", () => ({
+  useModelRouters: () => ({ data: { routers: [] } }),
+  useRouterModels: () => ({ data: { models: [] } }),
+}));
 vi.mock("@tanstack/react-router", async (orig) => ({
   ...(await orig()),
   useNavigate: () => vi.fn(),

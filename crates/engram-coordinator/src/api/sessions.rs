@@ -1479,7 +1479,7 @@ async fn prepare_inner(
     };
 
     // ADR 0063 addendum: fold the selected harness's declared egress
-    // (`harness.toml [egress]` — its model API hosts) into the session policy
+    // (`harness.toml [egress]` — route-independent hosts) into the session policy
     // BEFORE the boot network is read and the policy is persisted, so queued
     // boots / resume / recovery all re-read the merged value. Profiles never
     // list LLM-provider hosts themselves.

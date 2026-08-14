@@ -205,6 +205,13 @@ impl Cli {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("__model-router-token") {
+        if let Ok(token) = std::env::var("ENGRAM_MODEL_ROUTER_API_KEY") {
+            println!("{token}");
+            return ExitCode::SUCCESS;
+        }
+        return ExitCode::from(1);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -310,9 +317,10 @@ fn codex_app_server_command(bin: &Path, runtime_home: &Path) -> Command {
         .args(["app-server", "--stdio"])
         .env("CODEX_HOME", runtime_home)
         .env("CODEX_NON_INTERACTIVE", "1")
-        // Authentication is delivered over the trusted app-server/control
-        // protocols. Neither provider credentials nor the session broker
-        // capability may be inherited by the child process environment.
+        // Native authentication is delivered over the trusted app-server and
+        // control protocols. The routed credential stays inherited because
+        // the configured command-auth helper reads it. The model-controlled
+        // shell policy below removes it from tool processes.
         .env_remove("CODEX_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("ENGRAM_CREDENTIAL_BROKER_TOKEN")
@@ -628,11 +636,16 @@ fn spawn_oauth_watcher(
 
 impl AppServer {
     async fn spawn(cli: &Cli, generation: u64) -> Result<Self, String> {
-        let api_key = cli
-            .test_api_key
-            .clone()
-            .or_else(|| std::env::var("CODEX_API_KEY").ok());
-        let oauth = if api_key.is_none() {
+        let routed =
+            std::env::var("ENGRAM_MODEL_ROUTER_PROTOCOL").as_deref() == Ok("openai_responses");
+        let api_key = (!routed)
+            .then(|| {
+                cli.test_api_key
+                    .clone()
+                    .or_else(|| std::env::var("CODEX_API_KEY").ok())
+            })
+            .flatten();
+        let oauth = if api_key.is_none() && !routed {
             Some(match cli.test_credential_control.clone() {
                 Some(control) => OAuthSession::fetch_from(control).await?,
                 None => OAuthSession::fetch(cli.session_id).await?,
@@ -663,6 +676,9 @@ impl AppServer {
             .as_ref()
             .map_or(codex_home, |dir| dir.path().to_path_buf());
         ensure_skills_link(&runtime_home).await;
+        if routed {
+            write_router_config(&runtime_home).await?;
+        }
         let auth_path = runtime_home.join("auth.json");
         if let Some(oauth) = &oauth {
             write_auth_cache(&auth_path, &oauth.last_payload).await?;
@@ -700,7 +716,10 @@ impl AppServer {
             )
             .await?;
         server.notify("initialized", json!({})).await?;
-        if let Some(api_key) = api_key {
+        if routed {
+            // The custom provider performs command-backed bearer auth. Native
+            // OpenAI account login is intentionally bypassed.
+        } else if let Some(api_key) = api_key {
             server
                 .request_wait(
                     "account/login/start",
@@ -2363,17 +2382,51 @@ fn thread_params() -> Value {
         "sandbox": "danger-full-access",
         "config": {
             "shell_environment_policy": {
-                "exclude": ["CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_HOME", "ENGRAM_CREDENTIAL_BROKER_TOKEN", "ENGRAM_CREDENTIAL_ENDPOINT"]
+                "exclude": ["CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_HOME", "ENGRAM_CREDENTIAL_BROKER_TOKEN", "ENGRAM_CREDENTIAL_ENDPOINT", "ENGRAM_MODEL_ROUTER_API_KEY", "ENGRAM_MODEL_ROUTER_BASE_URL", "ENGRAM_MODEL_ROUTER_ID", "ENGRAM_MODEL_ROUTER_MODEL", "ENGRAM_MODEL_ROUTER_PROTOCOL"]
             }
         }
     });
-    if let Ok(model) = std::env::var("ENGRAM_CODEX_MODEL") {
+    if let Ok(model) =
+        std::env::var("ENGRAM_MODEL_ROUTER_MODEL").or_else(|_| std::env::var("ENGRAM_CODEX_MODEL"))
+    {
         params["model"] = json!(model);
     }
     if let Ok(instructions) = std::env::var("ENGRAM_APPEND_SYSTEM_PROMPT") {
         params["developerInstructions"] = json!(instructions);
     }
     params
+}
+
+async fn write_router_config(runtime_home: &Path) -> Result<(), String> {
+    let model = std::env::var("ENGRAM_MODEL_ROUTER_MODEL")
+        .map_err(|_| "routed Codex launch is missing ENGRAM_MODEL_ROUTER_MODEL".to_string())?;
+    let base_url = std::env::var("ENGRAM_MODEL_ROUTER_BASE_URL")
+        .map_err(|_| "routed Codex launch is missing ENGRAM_MODEL_ROUTER_BASE_URL".to_string())?;
+    let helper =
+        std::env::current_exe().map_err(|e| format!("resolve router credential helper: {e}"))?;
+    let config = router_config(&model, &base_url, &helper.to_string_lossy());
+    let path = runtime_home.join("config.toml");
+    tokio::fs::write(&path, config)
+        .await
+        .map_err(|e| format!("write routed Codex config: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|e| format!("protect routed Codex config: {e}"))?;
+    }
+    Ok(())
+}
+
+fn router_config(model: &str, base_url: &str, helper: &str) -> String {
+    let quote = |value: &str| serde_json::to_string(value).expect("string JSON cannot fail");
+    format!(
+        "model = {}\nmodel_provider = \"openrouter\"\n\n[model_providers.openrouter]\nname = \"OpenRouter\"\nbase_url = {}\nwire_api = \"responses\"\n\n[model_providers.openrouter.auth]\ncommand = {}\nargs = [\"__model-router-token\"]\ntimeout_ms = 5000\nrefresh_interval_ms = 0\n",
+        quote(model),
+        quote(base_url),
+        quote(helper),
+    )
 }
 
 async fn persist_thread_id(path: &Path, id: &str) -> Result<(), String> {
@@ -2398,6 +2451,20 @@ async fn ensure_skills_link(home: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routed_provider_config_uses_responses_and_command_auth() {
+        let config = router_config(
+            "deepseek/deepseek-v4-pro-0813",
+            "https://openrouter.ai/api/v1",
+            "/sbin/engram-harness-codex",
+        );
+        assert!(config.contains("model_provider = \"openrouter\""));
+        assert!(config.contains("wire_api = \"responses\""));
+        assert!(config.contains("command = \"/sbin/engram-harness-codex\""));
+        assert!(config.contains("args = [\"__model-router-token\"]"));
+        assert!(!config.contains("router-secret"));
+    }
 
     #[test]
     fn auth_rejection_is_distinguished_from_other_faults() {

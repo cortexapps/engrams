@@ -2293,6 +2293,27 @@ mod adapter {
         Condemned,
     }
 
+    /// Convert the normalized router contract into Claude Code's Anthropic
+    /// gateway contract. Every model tier is pinned to the selected model so
+    /// that a routed session cannot fall back to a native Anthropic model.
+    pub(super) fn model_router_env(
+        model: &str,
+        base_url: &str,
+        token: &str,
+    ) -> [(&'static str, String); 9] {
+        [
+            ("ANTHROPIC_BASE_URL", base_url.to_owned()),
+            ("ANTHROPIC_AUTH_TOKEN", token.to_owned()),
+            ("ANTHROPIC_API_KEY", String::new()),
+            ("ANTHROPIC_MODEL", model.to_owned()),
+            ("ANTHROPIC_DEFAULT_FABLE_MODEL", model.to_owned()),
+            ("ANTHROPIC_DEFAULT_OPUS_MODEL", model.to_owned()),
+            ("ANTHROPIC_DEFAULT_SONNET_MODEL", model.to_owned()),
+            ("ANTHROPIC_DEFAULT_HAIKU_MODEL", model.to_owned()),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", model.to_owned()),
+        ]
+    }
+
     /// The single in-flight turn, owned by the session loop. `run_id` is
     /// minted on prompt-accept — BEFORE any claude output — so no event
     /// can be emitted without a valid `run_id`. The bare-event desync
@@ -2482,7 +2503,8 @@ mod adapter {
             .claude_bin
             .as_deref()
             .expect("claude_bin resolved at entry()");
-        let mut child = match Command::new(claude_bin)
+        let mut command = Command::new(claude_bin);
+        command
             .args(&argv)
             // Long-run knobs for unattended Claude inside a VM.
             // Bash defaults (2min default / 10min cap) silently
@@ -2528,9 +2550,17 @@ mod adapter {
             // (`/var/log/engram/harness.log`), so the prior `/exec`-
             // visible behavior is preserved.
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        if std::env::var("ENGRAM_MODEL_ROUTER_PROTOCOL").as_deref() == Ok("anthropic_messages") {
+            let model = std::env::var("ENGRAM_MODEL_ROUTER_MODEL").unwrap_or_default();
+            let base_url = std::env::var("ENGRAM_MODEL_ROUTER_BASE_URL").unwrap_or_default();
+            let token = std::env::var("ENGRAM_MODEL_ROUTER_API_KEY").unwrap_or_default();
+            for (name, value) in model_router_env(&model, &base_url, &token) {
+                command.env(name, value);
+            }
+            command.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+        }
+        let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
                 // No run is in flight, so we deliberately do NOT emit a
@@ -8626,6 +8656,31 @@ mod tests {
     use super::adapter::*;
     use engram_harness_proto::{FileChange, HarnessEvent};
     use std::collections::HashMap;
+
+    #[test]
+    fn routed_model_pins_every_claude_tier_and_blanks_native_auth() {
+        let env = model_router_env(
+            "deepseek/deepseek-v4-pro-0813",
+            "https://openrouter.ai/api",
+            "router-secret",
+        )
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "https://openrouter.ai/api");
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "router-secret");
+        assert_eq!(env["ANTHROPIC_API_KEY"], "");
+        for name in [
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_FABLE_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+        ] {
+            assert_eq!(env[name], "deepseek/deepseek-v4-pro-0813");
+        }
+    }
 
     #[test]
     fn system_init_emits_nothing_and_assistant_text_carries_run_id() {

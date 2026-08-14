@@ -10,17 +10,20 @@
 name  = "claude"
 label = "Claude Code"
 description = "Anthropic's Claude Code agent. Needs an ANTHROPIC_API_KEY org secret for programmatic runs; human runs use a per-user Claude token."
+router_protocols = ["anthropic_messages"]
 
 # Launch contract (coordinator-internal): the entry binary at the root of this
 # harness's squashfs. argv[0] = /opt/engram/dyn/0/harness; the SDK dial flags
 # (--vsock-host / --connect, --session-id) are appended by the coordinator.
 exec = "harness"
 
-# Hosts the harness itself must reach (ADR 0063 addendum): its model API and
-# telemetry. Concatenated into the session's deny-default egress allowlist at
-# create — profiles never list these themselves.
+# Hosts the harness must always reach (ADR 0117). Native Anthropic model egress
+# is separate so routed launches do not receive it.
 [egress]
-allow_hosts = ["api.anthropic.com", "statsig.anthropic.com"]
+allow_hosts = ["statsig.anthropic.com"]
+
+[native_egress]
+allow_hosts = ["api.anthropic.com"]
 
 [auth]
 # Programmatic / org credential (Slack triggers, cron, API) — resolved host-side
@@ -57,41 +60,6 @@ env   = { ANTHROPIC_MODEL = "claude-sonnet-4-6" }
 id    = "haiku"
 label = "Claude Haiku 4.5"
 env   = { ANTHROPIC_MODEL = "claude-haiku-4-5" }
-
-# The per-option `secrets` list carries credential names only, never values.
-# In broker mode the guest holds a placeholder while the proxy substitutes the
-# real key only on requests to `openrouter.ai`.
-#
-# Claude Code routes by TIER, not by a single model: the main loop reads
-# ANTHROPIC_MODEL, and the sonnet/haiku tier defaults name what it falls back
-# to for cheaper work. All are pointed at OpenRouter slugs so no tier silently
-# escapes to api.anthropic.com on a credential the guest doesn't have.
-[[models]]
-id    = "glm-5.2"
-label = "Open Weight Frontier (GLM + DS)"
-env   = { ANTHROPIC_MODEL = "z-ai/glm-5.2",
-          ANTHROPIC_BASE_URL = "https://openrouter.ai/api",
-          ANTHROPIC_API_KEY = "",
-          ANTHROPIC_DEFAULT_SONNET_MODEL = "~deepseek/deepseek-v4-flash-latest",
-          ANTHROPIC_DEFAULT_HAIKU_MODEL = "~deepseek/deepseek-v4-flash-latest" }
-secrets = [
-  { ref = "openrouter.api_key", env = "ANTHROPIC_AUTH_TOKEN", mode = "broker", hosts = ["openrouter.ai"] },
-  { ref = "openrouter.api_key", env = "OPENROUTER_API_KEY",   mode = "broker", hosts = ["openrouter.ai"] },
-]
-
-# Same OpenRouter routing, with DeepSeek v4 Flash on the main loop too.
-[[models]]
-id    = "deepseek-v4-flash"
-label = "Deepseek v4 Flash"
-env   = { ANTHROPIC_MODEL = "~deepseek/deepseek-v4-flash-latest",
-          ANTHROPIC_BASE_URL = "https://openrouter.ai/api",
-          ANTHROPIC_API_KEY = "",
-          ANTHROPIC_DEFAULT_SONNET_MODEL = "~deepseek/deepseek-v4-flash-latest",
-          ANTHROPIC_DEFAULT_HAIKU_MODEL = "~deepseek/deepseek-v4-flash-latest" }
-secrets = [
-  { ref = "openrouter.api_key", env = "ANTHROPIC_AUTH_TOKEN", mode = "broker", hosts = ["openrouter.ai"] },
-  { ref = "openrouter.api_key", env = "OPENROUTER_API_KEY",   mode = "broker", hosts = ["openrouter.ai"] },
-]
 
 # Session modes (ADR 0107). Pure declaration: mode selection rides prompts
 # (harness_mode) and the harness maps `plan` to `--permission-mode plan`.

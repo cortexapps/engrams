@@ -78,6 +78,8 @@ message Profile {
   // config (set by hand or via DiscoverProfileRepos). The Slack routing picker
   // feeds these into its capability cards.
   repeated ProfileRepo repos = 22;
+  // Empty means direct/native provider. Otherwise this is a ModelRouter id.
+  optional string model_router = 23;
 }
 
 // One git checkout inside the profile's image. `remote` is the parsed identity
@@ -204,6 +206,7 @@ message CreateProfileRequest {
   optional string designation = 16;
   repeated ProfileIntegrationGrant integration_grants = 17;
   repeated ProfileRepo repos = 18;
+  optional string model_router = 19;
 }
 
 message CreateProfileResponse {
@@ -235,6 +238,7 @@ message UpdateProfileRequest {
   optional string designation = 17;
   repeated ProfileIntegrationGrant integration_grants = 18;
   repeated ProfileRepo repos = 19;
+  optional string model_router = 20;
 }
 
 message UpdateProfileResponse {

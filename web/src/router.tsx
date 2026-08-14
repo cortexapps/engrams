@@ -56,6 +56,7 @@ import { RegistriesPanel } from "./components/settings/RegistriesPanel";
 import { SecretsPanel } from "./components/settings/SecretsPanel";
 import { ApiKeysPanel } from "./components/settings/ApiKeysPanel";
 import { HarnessesPanel } from "./components/settings/HarnessesPanel";
+import { ModelRoutersPanel } from "./components/settings/ModelRoutersPanel";
 import { IntegrationsPanel } from "./components/settings/IntegrationsPanel";
 import { ReviewedReposPanel } from "./components/settings/ReviewedReposPanel";
 import { IntegrationDetail } from "./components/integrations/IntegrationDetail";
@@ -397,6 +398,12 @@ const harnessesRoute = createRoute({
   beforeLoad: requireAdmin,
   component: HarnessesPanel,
 });
+const modelRoutersRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "model-routers",
+  beforeLoad: requireAdmin,
+  component: ModelRoutersPanel,
+});
 const integrationsRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "integrations",
@@ -503,6 +510,7 @@ export const routeTree = rootRoute.addChildren([
       secretsRoute,
       apiKeysRoute,
       harnessesRoute,
+      modelRoutersRoute,
       integrationsRoute,
       integrationDetailRoute,
       connectionSetupRoute,
