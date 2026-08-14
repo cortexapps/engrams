@@ -191,8 +191,8 @@ describe("PostgresSpecParticipantStore", () => {
       ],
     );
     await livePool.query(
-      `INSERT INTO spec_template (id, name, layers, sections, stage_flags)
-       VALUES ($1, 'Participant test', '[]', '[]', '{}')`,
+      `INSERT INTO spec_template (id, name, layers, sections)
+       VALUES ($1, 'Participant test', '[]', '[]')`,
       [templateId],
     );
     await livePool.query(

@@ -248,20 +248,6 @@ export interface SpecTemplateSection {
   allowNa: boolean;
 }
 
-export type SpecTemplateStageMode = "on" | "suggested" | "off";
-
-export interface SpecTemplateStageFlags {
-  alternatives: SpecTemplateStageMode;
-  talkItThrough: SpecTemplateStageMode;
-  gapCheck: SpecTemplateStageMode;
-}
-
-export const DEFAULT_SPEC_TEMPLATE_STAGE_FLAGS: SpecTemplateStageFlags = {
-  alternatives: "on",
-  talkItThrough: "suggested",
-  gapCheck: "on",
-};
-
 export const specTemplate = pgTable(
   "spec_template",
   {
@@ -271,10 +257,6 @@ export const specTemplate = pgTable(
     description: text("description"),
     layers: jsonb("layers").$type<SpecTemplateLayer[]>().notNull(),
     sections: jsonb("sections").$type<SpecTemplateSection[]>().notNull(),
-    stageFlags: jsonb("stage_flags")
-      .$type<SpecTemplateStageFlags>()
-      .notNull()
-      .default(DEFAULT_SPEC_TEMPLATE_STAGE_FLAGS),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .notNull()

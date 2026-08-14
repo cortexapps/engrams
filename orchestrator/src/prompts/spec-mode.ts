@@ -6,30 +6,21 @@
  * repository statement, and the document-first workflow. Those rules hold
  * for every spec, so they are constant.
  *
- * The second part comes from the spec's own template snapshot: the layers, the
- * sections with their guidance and done criteria, and the process stage flags.
- * House judgment about process is therefore configuration, not code — an org
- * changes the stages in the template editor, and the next session gets the new
- * instruction. A caller that has no snapshot (an older spec, or a session
- * created before the spec exists) gets the standing rules alone.
+ * The second part comes from the spec's own template snapshot: the layers and
+ * the sections with their guidance and done criteria. A caller that has no
+ * snapshot gets the standing rules alone.
  *
  * The prompt stays harness-neutral: it names no agent product and no vendor
  * tool. A test holds that property.
  */
 
-import type {
-  SpecTemplateLayer,
-  SpecTemplateSection,
-  SpecTemplateStageFlags,
-  SpecTemplateStageMode,
-} from "../db/schema.ts";
+import type { SpecTemplateLayer, SpecTemplateSection } from "../db/schema.ts";
 
 /** The part of a spec's template snapshot that shapes the system prompt.
  *  `SpecTemplateSnapshot` satisfies it, so a caller passes the snapshot. */
 export interface SpecPromptContext {
   layers: readonly SpecTemplateLayer[];
   sections: readonly SpecTemplateSection[];
-  stageFlags: SpecTemplateStageFlags;
 }
 
 /** The standing rules of spec mode. Every spec session gets these, with or
@@ -53,60 +44,10 @@ Write into the document before you send that message. Use spec_update_section to
 ### Give provenance for every repository statement
 Each statement about the repository carries the file and the short commit sha, in the form \`path/to/file.ts @ 8f2c1a4\`. This rule covers prose, data definitions, interface sketches, and every number that you compare. When you cannot verify a statement, write "unverified" next to it. Never give a guess as a repository fact.`;
 
-/**
- * One process stage from the template flags.
- *
- * A stage is process, and a section is structure. They are independent: a
- * template can keep an "Alternatives" section while its alternatives stage is
- * off. `off` removes the stage text completely — the agent then knows nothing
- * about the stage, which is what the flag means.
- */
-interface SpecStage {
-  key: keyof SpecTemplateStageFlags;
-  title: string;
-  /** Trigger sentence when the template runs the stage as part of the process. */
-  on: string;
-  /** Trigger sentence when the template offers the stage to the person. */
-  suggested: string;
-  /** What the stage does. Identical for `on` and `suggested`. */
-  body: string;
-}
-
-const SPEC_STAGES: readonly SpecStage[] = [
-  {
-    key: "alternatives",
-    title: "Alternatives",
-    on: "This spec uses the alternatives stage. Run it while the design direction is still open, and do not ask for permission first.",
-    suggested:
-      "This spec offers the alternatives stage. Tell the person what the stage gives them, and run it only when they accept.",
-    body: "In this stage you give at least two credible directions. For each direction, write what it costs and what it gives. Name the direction that you recommend, and give your reason. Write the comparison into the document, not only into the conversation. Every number in the comparison carries provenance.",
-  },
-  {
-    key: "talkItThrough",
-    title: "Talk it through",
-    on: "This spec uses the talk-it-through stage. Start it when the person wants to think out loud.",
-    suggested:
-      "This spec offers the talk-it-through stage. Offer it when the person wants to think out loud, and start it only when they accept.",
-    body: "In this stage the person speaks freely, and you keep the working notes with spec_update_notes. Write no spec section while the notes are open. Send your complete model each time, with one bullet for each idea, and keep every bullet id stable. Mark each bullet as verified, as contradicted, or as unchecked, and name the receipt for a verified or a contradicted bullet. Keep a contradicted claim beside its receipt. Cluster the bullets by theme, and tag each cluster toward the section where it belongs. Check each repository claim while you listen. A person can rewrite any bullet, and their words win: read the corrections in the reply and correct your model. Call spec_distill_notes when the person asks for the spec, or when the untagged pile stops growing. Distillation writes only the tagged clusters, and a section with no material stays empty.",
-  },
-  {
-    key: "gapCheck",
-    title: "Gap check",
-    on: "This spec uses the gap-check stage. Run it before the person publishes.",
-    suggested:
-      "This spec offers the gap-check stage. Offer it before the person publishes, and run it only when they accept.",
-    body: "In this stage you compare each required section with its done criteria. Report every gap in one list, and say what closes it. Mark a section as n/a with spec_set_section_state only when the template permits it, and always give the reason. Never report a section as complete while a criterion is open.",
-  },
-];
-
 /** Assemble the spec-mode instruction for one session. */
 export function specModeSystemPrompt(context?: SpecPromptContext): string {
   if (!context) return SPEC_MODE_SYSTEM_PROMPT;
-  return [
-    SPEC_MODE_SYSTEM_PROMPT,
-    structureBlock(context),
-    ...stageBlocks(context.stageFlags),
-  ].join("\n\n");
+  return [SPEC_MODE_SYSTEM_PROMPT, structureBlock(context)].join("\n\n");
 }
 
 /** The layers and the sections that this spec owns for its complete lifetime. */
@@ -139,27 +80,4 @@ function sectionFacts(section: SpecTemplateSection, layerTitles: Map<string, str
     section.required ? "required" : "optional",
     ...(section.allowNa ? ["n/a is permitted with a reason"] : []),
   ].join("; ");
-}
-
-/** One block for each stage that the template runs or offers. An `off` stage
- *  contributes nothing, so the agent never learns that the stage exists. */
-function stageBlocks(flags: SpecTemplateStageFlags): string[] {
-  const blocks: string[] = [];
-  for (const stage of SPEC_STAGES) {
-    const trigger = stageTrigger(stage, flags[stage.key]);
-    if (!trigger) continue;
-    blocks.push([`### ${stage.title} stage`, trigger, stage.body].join("\n"));
-  }
-  return blocks;
-}
-
-function stageTrigger(stage: SpecStage, mode: SpecTemplateStageMode): string | null {
-  switch (mode) {
-    case "on":
-      return stage.on;
-    case "suggested":
-      return stage.suggested;
-    case "off":
-      return null;
-  }
 }

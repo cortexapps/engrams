@@ -871,7 +871,6 @@ describe("compileSessionCreateInput", () => {
           allowNa: false,
         },
       ],
-      stageFlags: { alternatives: "off", talkItThrough: "on", gapCheck: "on" },
     };
 
     const spec = await compileSessionCreateInput(profile(), deps(), {
@@ -886,8 +885,7 @@ describe("compileSessionCreateInput", () => {
     const prompt = spec.harnessEnv!.ENGRAM_APPEND_SYSTEM_PROMPT!;
     expect(prompt).toContain("State the user problem and its cost.");
     expect(prompt).toContain("Done when: The affected user is clear.");
-    expect(prompt).toContain("### Gap check stage");
-    expect(prompt).not.toContain("### Alternatives stage");
+    expect(prompt).not.toMatch(/\bstage\b/i);
     expect(chat.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).not.toContain("State the user problem");
   });
 

@@ -51,8 +51,8 @@ describe("SpecDigestService with live Postgres", () => {
       [firstUser, `${firstUser}@example.test`, now, secondUser, `${secondUser}@example.test`],
     );
     await pool.query(
-      `INSERT INTO spec_template (id, name, layers, sections, stage_flags)
-       VALUES ($1, 'Digest test', '[]', '[]', '{}')`,
+      `INSERT INTO spec_template (id, name, layers, sections)
+       VALUES ($1, 'Digest test', '[]', '[]')`,
       [templateId],
     );
     await pool.query(

@@ -2,8 +2,8 @@
  * The "New spec" creation flow (ADR 0114 D3, R2-R6, mock 2b).
  *
  * The sheet asks for the problem first, then where the session runs, then which
- * template shapes the document. The template cards show structure AND process
- * at the point of choice (R2), because that choice is locked once the session
+ * template shapes the document. The template cards show its structure at the
+ * point of choice (R2), because that choice is locked once the session
  * starts (R3). Creation lives here and not in the session composer (R6).
  */
 
@@ -40,25 +40,8 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { useCreateSpec } from "@/hooks/useSpecCreate";
 import { useProfiles } from "@/hooks/useProfiles";
-import {
-  useSpecTemplates,
-  type SpecTemplate,
-  type SpecTemplateStageMode,
-} from "@/hooks/useSpecTemplates";
+import { useSpecTemplates, type SpecTemplate } from "@/hooks/useSpecTemplates";
 import { TEMPLATE_LOCK_REASON } from "./template-lock";
-
-/** The stage words, kept identical to the template editor's own labels. */
-const STAGES = [
-  { key: "alternatives", label: "Alternatives" },
-  { key: "talkItThrough", label: "Talk it through" },
-  { key: "gapCheck", label: "Gap check" },
-] as const;
-
-const STAGE_MODE_LABEL: Record<SpecTemplateStageMode, string> = {
-  on: "On",
-  suggested: "Suggested",
-  off: "Off",
-};
 
 /**
  * The organization default.
@@ -290,21 +273,6 @@ function TemplateCard({
                       .join(" · ") || "No sections"}
                   </span>
                 </div>
-              ))}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-              Process
-            </dt>
-            <dd className="mt-1 flex flex-wrap gap-x-4 gap-y-1">
-              {STAGES.map((stage) => (
-                <span key={stage.key} className="text-muted-foreground">
-                  {stage.label}{" "}
-                  <span className="font-medium text-foreground">
-                    {STAGE_MODE_LABEL[template.stageFlags[stage.key]]}
-                  </span>
-                </span>
               ))}
             </dd>
           </div>

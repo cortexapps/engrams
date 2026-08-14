@@ -37,32 +37,6 @@ function documentService(
     addOpenQuestion: async (_specId, input) => mutation("addOpenQuestion", input),
     resolveOpenQuestion: async (_specId, input) => mutation("resolveOpenQuestion", input),
     updateBlock: async (_specId, input) => mutation("updateBlock", input),
-    proposeAlternatives: async (_specId, input) => ({
-      ...(await mutation("proposeAlternatives", input)),
-      setId: "set-1",
-    }),
-    decideAlternative: async (_specId, input) => mutation("decideAlternative", input),
-    updateNotes: async (_specId, input) => ({
-      ...(await mutation("updateNotes", input)),
-      stage: { notes: { clusters: [] }, archivedAt: null, untaggedBullets: 2 },
-      corrections: [
-        {
-          bulletId: "b1",
-          agentText: "refills daily",
-          personText: "refills weekly",
-          keptAgainstDrop: false,
-        },
-      ],
-    }),
-    distillNotes: async (_specId, input) => ({
-      ...(await mutation("distillNotes", input)),
-      stage: { notes: { clusters: [] }, archivedAt: "2026-08-12T00:00:00.000Z", untaggedBullets: 1 },
-      distillation: {
-        sections: [{ sectionId: "behavior", markdown: "Verified - it holds\n" }],
-        refutedBullets: 1,
-        untaggedBullets: 1,
-      },
-    }),
     proposeTickets: async (_specId, input) => mutation("proposeTickets", input),
   };
 }
@@ -127,7 +101,7 @@ function recorder(
               sectionTitle: "Behavior",
               requirementId: null,
               summary: "the reset promise contradicts the cache TTL",
-              detail: "Resolve the contradiction before polishing the layers below it.",
+              detail: "Resolve the contradiction before you review later sections.",
               proposedDiff: null,
             },
           ],
@@ -178,10 +152,6 @@ describe("spec tools", () => {
       "spec_add_open_question",
       "spec_resolve_open_question",
       "spec_update_block",
-      "spec_propose_alternatives",
-      "spec_decide_alternative",
-      "spec_update_notes",
-      "spec_distill_notes",
       "spec_propose_tickets",
       "spec_gap_check",
     ]);
@@ -194,6 +164,11 @@ describe("spec tools", () => {
         `tool ${tool.name} must emit a type:"object" inputSchema`,
       ).toBe("object");
       expect(JSON.stringify(tool.inputSchema)).not.toContain('"anyOf"');
+    }
+    const inspection = registry.get("spec_gap_check");
+    if (!inspection) throw new Error("spec_gap_check is not registered");
+    for (const retiredWord of ["layer", "red-team", "stage"]) {
+      expect(inspection.description.toLocaleLowerCase()).not.toContain(retiredWord);
     }
   });
 
@@ -451,19 +426,9 @@ describe("spec tools", () => {
     }
   });
 
-  test("whole-document, notes, and ticket tools do not synthesize section presence", async () => {
+  test("whole-document and ticket tools do not synthesize section presence", async () => {
     const state = recorder();
     await call(state.deps, "spec_read", {});
-    await call(state.deps, "spec_update_notes", {
-      clusters: [
-        {
-          id: "burst",
-          theme: "burst semantics",
-          bullets: [{ id: "b1", mark: "unchecked", kind: "observation", text: "refills daily" }],
-        },
-      ],
-    });
-    await call(state.deps, "spec_distill_notes", {});
     await call(state.deps, "spec_propose_tickets", {
       idempotency_key: "proposal-1",
       tickets: [
@@ -507,78 +472,34 @@ describe("spec tools", () => {
     expect(JSON.stringify(manifest?.inputSchema)).not.toContain('"anyOf"');
   });
 
-  test("the alternatives tools advertise only the guards they honour", () => {
-    const registry = createToolRegistry();
-    registerSpecTools(registry, recorder().deps);
-    const propose = registry.get("spec_propose_alternatives");
-    const decide = registry.get("spec_decide_alternative");
-    if (propose === undefined || decide === undefined) {
-      throw new Error("the alternatives tools are not registered");
-    }
-
-    // A proposal writes no document, so it takes no revision guard.
-    const manifest = compileToolManifest(registry, undefined, "spec");
-    const proposeSchema = manifest.find((entry) => entry.name === "spec_propose_alternatives");
-    expect(JSON.stringify(proposeSchema?.inputSchema)).not.toContain("expected_rev");
-    const decideSchema = manifest.find((entry) => entry.name === "spec_decide_alternative");
-    expect(JSON.stringify(decideSchema?.inputSchema)).toContain("expected_rev");
-
-    expect(() =>
-      decide.input.parse({ set_id: "set-1", option_key: "B", reason: "x".repeat(4_001) }),
-    ).toThrow();
-  });
-
-  test("spec_decide_alternative reports a replayed pick as not applied", async () => {
-    const state = recorder({ applied: false, newRev: 8n, concurrentEditors: [] });
-    const result = await call(state.deps, "spec_decide_alternative", {
-      set_id: "set-1",
-      option_key: "B",
-      reason: "One code path.",
-      expected_rev: "8",
-    });
-
-    expect(result).toMatchObject({ applied: false, new_rev: "8" });
-    expect(state.mutations[0]).toMatchObject({
-      name: "decideAlternative",
-      input: { setId: "set-1", optionKey: "B", expectedRev: 8n },
-    });
-  });
-
-  test("spec_gap_check reports the stop layer and summarises the matrix", async () => {
+  test("spec_gap_check reports failures and summarises the matrix", async () => {
     const state = recorder();
 
     const result = await call(state.deps, "spec_gap_check", {
-      red_team: [
+      findings: [
         {
-          layer_key: "contract",
           section_id: "sec-behavior",
           severity: "fatal",
           summary: "the reset promise contradicts the cache TTL",
-          detail: "Resolve the contradiction before polishing the layers below it.",
+          detail: "Resolve the contradiction before you review later sections.",
         },
       ],
-      proposed_diffs: [{ finding_id: "requirement_gap:N1:system", after: "## Design\n\nTimed.\n" }],
     });
 
     expect(result).toEqual({
       run_id: "019fe2ff-0464-75f3-bb20-a8c1844579ba",
       rev: "8",
-      stopped_at_layer: "contract",
+      stopped_early: true,
       suppressed_count: 2,
       covered_requirements: 1,
       gap_requirements: 1,
       uncited_content: 1,
       findings: [
         {
-          id: "red_team:sec-behavior:0",
-          kind: "red_team",
           severity: "fatal",
-          layer_key: "contract",
           section_id: "sec-behavior",
-          requirement_id: null,
           summary: "the reset promise contradicts the cache TTL",
-          detail: "Resolve the contradiction before polishing the layers below it.",
-          has_proposed_diff: false,
+          detail: "Resolve the contradiction before you review later sections.",
         },
       ],
     });
@@ -590,14 +511,12 @@ describe("spec tools", () => {
         actorUserId: "user-1",
         redTeam: [
           {
-            layerKey: "contract",
             sectionId: "sec-behavior",
             severity: "fatal",
             summary: "the reset promise contradicts the cache TTL",
-            detail: "Resolve the contradiction before polishing the layers below it.",
+            detail: "Resolve the contradiction before you review later sections.",
           },
         ],
-        proposedDiffs: [{ findingId: "requirement_gap:N1:system", after: "## Design\n\nTimed.\n" }],
       },
     ]);
     // The pass reports; it never mutates the document (R28).

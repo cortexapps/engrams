@@ -2,8 +2,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { API_BASE } from "@/lib/base";
 
-export type SpecTemplateStageMode = "on" | "suggested" | "off";
-
 export interface SpecTemplateLayer {
   key: string;
   title: string;
@@ -25,11 +23,6 @@ export interface SpecTemplateDefinition {
   description: string;
   layers: SpecTemplateLayer[];
   sections: SpecTemplateSection[];
-  stageFlags: {
-    alternatives: SpecTemplateStageMode;
-    talkItThrough: SpecTemplateStageMode;
-    gapCheck: SpecTemplateStageMode;
-  };
 }
 
 export interface SpecTemplate extends SpecTemplateDefinition {

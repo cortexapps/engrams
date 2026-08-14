@@ -37,7 +37,6 @@ describe("base system prompt", () => {
           allowNa: false,
         },
       ],
-      stageFlags: { alternatives: "on", talkItThrough: "on", gapCheck: "on" },
     };
 
     expect(systemPromptForTaskType("spec", spec)).toContain("State the user problem.");

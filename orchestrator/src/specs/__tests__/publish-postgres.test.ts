@@ -158,8 +158,8 @@ describe("spec publish with live Postgres", () => {
       [owner, member],
     );
     await pool.query(
-      `INSERT INTO spec_template (id, name, layers, sections, stage_flags)
-       VALUES ($1, 'Publish test template', '[]', $2, '{"alternatives":"on","talkItThrough":"suggested","gapCheck":"on"}')`,
+      `INSERT INTO spec_template (id, name, layers, sections)
+       VALUES ($1, 'Publish test template', '[]', $2)`,
       [templateId, JSON.stringify(TEMPLATE_SECTIONS)],
     );
     for (const id of [specId, otherSpecId, raceSpecId]) {

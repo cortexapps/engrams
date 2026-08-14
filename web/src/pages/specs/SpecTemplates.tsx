@@ -16,7 +16,6 @@ import {
   type SpecTemplate,
   type SpecTemplateDefinition,
   type SpecTemplateSection,
-  type SpecTemplateStageMode,
 } from "@/hooks/useSpecTemplates";
 import { errorMessage } from "@/lib/errors";
 import "./spec-templates.css";
@@ -36,7 +35,6 @@ const EMPTY_TEMPLATE: SpecTemplateDefinition = {
       allowNa: false,
     },
   ],
-  stageFlags: { alternatives: "on", talkItThrough: "suggested", gapCheck: "on" },
 };
 
 export function SpecTemplates() {
@@ -100,7 +98,7 @@ export function SpecTemplates() {
         <div className="spec-template-catalog-heading">
           <div>
             <h2>Templates</h2>
-            <p>Reusable structure and writing process.</p>
+            <p>Reusable document structure.</p>
           </div>
           <Button
             size="sm"
@@ -151,7 +149,7 @@ export function SpecTemplates() {
         {!draft ? (
           <div className="spec-template-empty">
             <Layers3 aria-hidden />
-            <p>Select a template to view its structure and process.</p>
+            <p>Select a template to view its structure.</p>
           </div>
         ) : (
           <>
@@ -167,7 +165,7 @@ export function SpecTemplates() {
                 </div>
                 <p>
                   Template edits apply to future spec sessions only. Existing specs keep their
-                  current structure and process.
+                  current structure.
                 </p>
               </div>
               <div className="spec-template-heading-actions">
@@ -206,7 +204,6 @@ export function SpecTemplates() {
             <div className="spec-template-editor-body">
               <TemplateIdentity draft={draft} disabled={false} onChange={setDraft} />
               <StructureEditor draft={draft} disabled={false} onChange={setDraft} />
-              <ProcessEditor draft={draft} disabled={false} onChange={setDraft} />
             </div>
           </>
         )}
@@ -539,87 +536,6 @@ function SectionEditor({
   );
 }
 
-function ProcessEditor({
-  draft,
-  disabled,
-  onChange,
-}: {
-  draft: SpecTemplateDefinition;
-  disabled: boolean;
-  onChange: (draft: SpecTemplateDefinition) => void;
-}) {
-  function update(key: keyof SpecTemplateDefinition["stageFlags"], value: SpecTemplateStageMode) {
-    onChange({ ...draft, stageFlags: { ...draft.stageFlags, [key]: value } });
-  }
-
-  return (
-    <section className="spec-template-panel" aria-labelledby="template-process-title">
-      <div className="spec-template-section-heading">
-        <div>
-          <h3 id="template-process-title">Process</h3>
-          <p>Set how the agent guides these stages in new spec sessions.</p>
-        </div>
-      </div>
-      <div className="spec-template-process-grid">
-        <StageSelect
-          label="Alternatives"
-          detail="Compare serious options before the design is fixed."
-          value={draft.stageFlags.alternatives}
-          disabled={disabled}
-          onChange={(value) => update("alternatives", value)}
-        />
-        <StageSelect
-          label="Talk it through"
-          detail="Invite a live discussion before the detailed draft."
-          value={draft.stageFlags.talkItThrough}
-          disabled={disabled}
-          onChange={(value) => update("talkItThrough", value)}
-        />
-        <StageSelect
-          label="Gap check"
-          detail="Check the draft against its requirements before publish."
-          value={draft.stageFlags.gapCheck}
-          disabled={disabled}
-          onChange={(value) => update("gapCheck", value)}
-        />
-      </div>
-    </section>
-  );
-}
-
-function StageSelect({
-  label,
-  detail,
-  value,
-  disabled,
-  onChange,
-}: {
-  label: string;
-  detail: string;
-  value: SpecTemplateStageMode;
-  disabled: boolean;
-  onChange: (value: SpecTemplateStageMode) => void;
-}) {
-  return (
-    <label className="spec-template-stage">
-      <span>
-        <strong>{label}</strong>
-        <small>{detail}</small>
-      </span>
-      <select
-        aria-label={`${label} stage`}
-        value={value}
-        disabled={disabled}
-        onChange={(event) => onChange(event.target.value as SpecTemplateStageMode)}
-      >
-        <option value="on">On</option>
-        <option value="suggested">Suggested</option>
-        <option value="off">Off</option>
-      </select>
-    </label>
-  );
-}
-
 function ToggleField({
   label,
   checked,
@@ -670,7 +586,6 @@ function definitionOf(template: SpecTemplateDefinition): SpecTemplateDefinition 
     description: template.description,
     layers: structuredClone(template.layers),
     sections: structuredClone(template.sections),
-    stageFlags: structuredClone(template.stageFlags),
   };
 }
 

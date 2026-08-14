@@ -222,7 +222,6 @@ function fixture(options: FixtureOptions = {}) {
     sessionId: SESSION_ID,
     publishedCheckpointId: null,
     publishedAt: null,
-    gapCheckStage: "on",
     ...options.target,
   });
   store.questions.push(...(options.questions ?? []));
@@ -379,16 +378,6 @@ describe("publish gate service", () => {
     expect(error.code).toBe("gap_check_failed");
     expect(error.message).toBe("The spec has no requirements section, so it cannot be traced.");
     expect(store.record).toBeNull();
-  });
-
-  test("a template with the gap check off never asks for a run", async () => {
-    const { service, gapCheck } = fixture({ stale: true, target: { gapCheckStage: "off" } });
-
-    const result = await service.requestPublish(publishInput());
-
-    expect(result.created).toBe(true);
-    expect(gapCheck.runs).toHaveLength(0);
-    expect(result.status.gapCheck.gates).toBe(false);
   });
 
   test("only the owner publishes, and a member still reads the gate (R37)", async () => {
