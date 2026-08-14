@@ -17,7 +17,7 @@ import { Text } from "@/components/ui/text";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { useSendSpecMessage } from "@/hooks/useSpecMessages";
-import { useSpecPublish, type SpecPublishQuestion } from "@/hooks/useSpecPublish";
+import { useSpecPublish } from "@/hooks/useSpecPublish";
 import { useSpecRail, useSpecRead, useStartSpecDrafting } from "@/hooks/useSpecRead";
 
 export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
@@ -43,7 +43,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   const [showProvenance, setShowProvenance] = useState(true);
   const documentPaneRef = useRef<HTMLElement | null>(null);
   const { scrollToSection } = useScrollAnchors(documentPaneRef);
-  const openQuestions = publishQuestions(publish.data);
+  const openQuestions = publish.data?.openQuestions ?? [];
   const surface = useSpecSurface(
     rail.data,
     phase === "drafting" || showDraft ? (connection?.doc ?? null) : null,
@@ -226,23 +226,6 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
       </SpecShell>
     </>
   );
-}
-
-function publishQuestions(value: unknown): SpecPublishQuestion[] {
-  if (typeof value !== "object" || value === null) return [];
-  if ("openQuestions" in value && Array.isArray(value.openQuestions)) {
-    return value.openQuestions as SpecPublishQuestion[];
-  }
-  if (
-    "gate" in value &&
-    typeof value.gate === "object" &&
-    value.gate !== null &&
-    "openQuestions" in value.gate &&
-    Array.isArray(value.gate.openQuestions)
-  ) {
-    return value.gate.openQuestions as SpecPublishQuestion[];
-  }
-  return [];
 }
 
 function useSpecConnection(specId: string, enabled: boolean) {
