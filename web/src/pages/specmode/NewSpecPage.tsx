@@ -3,6 +3,9 @@ import { useNavigate } from "@tanstack/react-router";
 import { Check, CheckCheck, Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { RadioGroup as RadioGroupPrimitive } from "radix-ui";
+
+import { RadioGroup } from "@/components/ui/radio-group";
 import { Text } from "@/components/ui/text";
 import { Textarea } from "@/components/ui/textarea";
 import type { Profile } from "@/gen/engram/app/v1/profile_pb";
@@ -126,22 +129,24 @@ export function NewSpecPage() {
               The shapes did not load. {templates.error.message}
             </Text>
           ) : (
-            <div
-              className="grid grid-cols-1 gap-3 sm:grid-cols-3"
-              role="radiogroup"
+            <RadioGroup
+              className="grid-cols-1 sm:grid-cols-3"
+              value={templateId}
+              onValueChange={setTemplateId}
               aria-label="Shape"
             >
               {templateList.map((template) => {
                 const selected = template.id === templateId;
                 return (
-                  <button
+                  // The stock RadioGroupItem hard-codes its dot as JSX
+                  // children, which would discard this card. The primitive
+                  // gives the same roving focus and arrow keys and takes
+                  // children.
+                  <RadioGroupPrimitive.Item
                     key={template.id}
-                    type="button"
-                    role="radio"
-                    aria-checked={selected}
+                    value={template.id}
                     data-selected={selected || undefined}
-                    className="relative min-h-32 rounded-lg border bg-card p-4 text-left shadow-xs transition-[border-color,background-color,box-shadow] outline-none hover:bg-accent/40 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60 data-[selected=true]:border-ring data-[selected=true]:bg-accent/40"
-                    onClick={() => setTemplateId(template.id)}
+                    className="relative block aspect-auto size-auto min-h-32 rounded-lg border bg-card p-4 text-left shadow-xs transition-[border-color,background-color,box-shadow] outline-none hover:bg-accent/40 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60 data-[selected=true]:border-ring data-[selected=true]:bg-accent/40"
                   >
                     {selected ? (
                       <Check
@@ -159,10 +164,10 @@ export function NewSpecPage() {
                       {template.sections.length}{" "}
                       {template.sections.length === 1 ? "section" : "sections"}
                     </Text>
-                  </button>
+                  </RadioGroupPrimitive.Item>
                 );
               })}
-            </div>
+            </RadioGroup>
           )}
         </fieldset>
 
