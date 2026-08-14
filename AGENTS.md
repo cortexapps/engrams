@@ -290,5 +290,7 @@ it records a stack manifest with each issue, branch, base, dependency, migration
   the conformance rule) · **0099** correctness hardening (per-test PG isolation,
   proptest, fault injection, invariants)
 - **0051** the TypeScript orchestration tier · **0003** the VZ backend · **0006** the egress proxy
+- **0066** the vsock port relay · **0118** session apps (named ports, reserved hostnames,
+  and the orchestrator-enforced login wall that replaces IAP on preview hosts)
 
 When in doubt about *why* something is shaped the way it is, grep `docs/adr/` before assuming.
