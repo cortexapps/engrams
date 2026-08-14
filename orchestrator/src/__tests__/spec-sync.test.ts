@@ -903,6 +903,39 @@ describe("the spec sync UpgradeHook", () => {
   });
 });
 
+describe("SpecSyncHub human presence", () => {
+  test("reads trusted people from the live awareness room", async () => {
+    const socket = new SilentSpecSocket();
+    const browserDoc = new Y.Doc();
+    browserDoc.clientID = 42;
+    const browserAwareness = new awarenessProtocol.Awareness(browserDoc);
+    browserAwareness.setLocalState({ user: { id: "forged", name: "Forged name" } });
+    const hub = new SpecSyncHub({
+      documents: fakeDocuments(),
+      participants: {
+        connect: async () => 1n,
+        renew: async () => true,
+        disconnect: async () => {},
+      },
+      awarenessBus: fakeAwarenessBus(),
+    });
+    cleanups.push(async () => {
+      browserAwareness.destroy();
+      browserDoc.destroy();
+      await hub.stop();
+    });
+
+    await hub.connect(SPEC_ONE, "42", { id: "member-1", name: "Ada Lovelace" }, socket);
+    socket.emit("message", encodeAwarenessState(browserAwareness), true);
+    await eventually(() => readAwarenessState(socket, 42) !== undefined);
+
+    expect(await hub.humanPresence(SPEC_ONE)).toEqual([
+      { id: "member-1", name: "Ada Lovelace" },
+    ]);
+    expect(await hub.humanPresence(SPEC_SHARED)).toEqual([]);
+  });
+});
+
 describe("SpecSyncHub awareness failures", () => {
   test("queries peers for active rooms after the awareness listener reconnects", async () => {
     let reconnect: (() => void) | undefined;

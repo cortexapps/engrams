@@ -7,9 +7,11 @@ import { getDb } from "../db/client.ts";
 import { spec, specProjection, specSnapshot, specUpdateLog } from "../db/schema.ts";
 import { runExec, type DurableExecClient } from "../exec/durable-exec.ts";
 import type { SessionFileClient } from "../routes/session-files.ts";
+import type { SpecHumanPresenceReader } from "../routes/spec-sync.ts";
 import { renderMarkdown } from "@engrams/spec-document";
 import { proseMirrorDocument } from "./doc-service.ts";
 import { PostgresSpecDigestSource, SpecDigestService } from "./digest.ts";
+import { specHumanPresence } from "./presence.ts";
 
 export const SPEC_PROJECTION_PATH = "/workspace/spec.md";
 export const SPEC_DIGEST_PATH = "/workspace/.engrams/spec/digest.md";
@@ -377,12 +379,14 @@ export async function writeGuestFile(
 export interface SpecProjectionDriverOptions {
   sleep?: (ms: number) => Promise<void>;
   nowMs: () => number;
+  humanPresence?: SpecHumanPresenceReader;
 }
 
 export class SpecProjectionDriver implements SpecProjection {
   private readonly encoder = new TextEncoder();
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly nowMs: () => number;
+  private readonly humanPresence: SpecHumanPresenceReader | undefined;
   private readonly runs = new Map<string, Promise<number>>();
 
   constructor(
@@ -394,6 +398,7 @@ export class SpecProjectionDriver implements SpecProjection {
   ) {
     this.sleep = options.sleep ?? Bun.sleep;
     this.nowMs = options.nowMs;
+    this.humanPresence = options.humanPresence;
   }
 
   async enqueue(input: SpecProjectionRequest): Promise<bigint> {
@@ -513,6 +518,7 @@ export class SpecProjectionDriver implements SpecProjection {
       rendered = this.encoder.encode(body);
       documentState = canonical.documentState;
       sha256 = createHash("sha256").update(rendered).digest("hex");
+      const peopleHere = await this.readHumanPresence(record.specId);
       digest = this.encoder.encode(
         await this.digest.render(
           record.specId,
@@ -520,6 +526,7 @@ export class SpecProjectionDriver implements SpecProjection {
           canonical.docSeq,
           record.discardNotice,
           previous?.documentState ?? null,
+          peopleHere,
         ),
       );
       digestSha256 = createHash("sha256").update(digest).digest("hex");
@@ -565,6 +572,16 @@ export class SpecProjectionDriver implements SpecProjection {
     await this.store.markPublished(record.specId, record.rev);
   }
 
+  private async readHumanPresence(specId: string): Promise<string[]> {
+    if (!this.humanPresence) return [];
+    try {
+      return (await this.humanPresence.humanPresence(specId)).map((person) => person.name);
+    } catch {
+      // Presence is ephemeral. A failed live read must not block the durable projection.
+      return [];
+    }
+  }
+
   private async runPending(sessionId: string): Promise<number> {
     const pending = await this.store.pending(sessionId);
     for (const record of pending) await this.publish(record);
@@ -580,5 +597,5 @@ export const productionSpecProjection = new SpecProjectionDriver(
   new PostgresCanonicalSpecRenderer(),
   new SpecDigestService(new PostgresSpecDigestSource()),
   productionGuest,
-  { nowMs: Date.now },
+  { nowMs: Date.now, humanPresence: specHumanPresence },
 );
