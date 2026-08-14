@@ -81,12 +81,39 @@ export class PostgresSpecDecisionStore implements SpecDecisionStore {
                 action.chip->>'sectionTitle' AS section_title,
                 NULL::text AS question,
                 NULL::text AS resolution_link,
-                action.actor_user_id,
-                coalesce(actor.name, $2) AS actor_name,
+                coalesce(action.actor_user_id, settle.settled_by) AS actor_user_id,
+                coalesce(actor.name, settler.name, $2) AS actor_name,
                 action.created_at AS decided_at
            FROM spec_transcript_action AS action
            JOIN published ON action.created_at <= published.cutoff
            LEFT JOIN "user" AS actor ON actor.id = action.actor_user_id
+           -- spec_section_state.settled_by has recorded the settling person
+           -- since the section-state table existed, while action.actor_user_id
+           -- arrived later and was not backfilled. Read the older column when
+           -- the newer one is empty, or the decisions card claims nobody
+           -- settled a section that the section list credits by name. Only the
+           -- LATEST settle carries this fallback: settled_by is current state,
+           -- not per-action history, so attributing an earlier settle to it
+           -- could name the wrong person.
+           LEFT JOIN LATERAL (
+             SELECT state.settled_by
+               FROM spec_section_state AS state
+              WHERE state.spec_id = action.spec_id
+                AND state.section_id = action.section_id
+                AND state.state = 'settled'
+                AND action.id = (
+                  SELECT latest.id
+                    FROM spec_transcript_action AS latest
+                   WHERE latest.spec_id = action.spec_id
+                     AND latest.section_id = action.section_id
+                     AND latest.chip->>'kind' = 'spec_section_state_changed'
+                     AND latest.chip->'after'->>'state' = 'settled'
+                     AND latest.created_at <= published.cutoff
+                   ORDER BY latest.created_at DESC, latest.id DESC
+                   LIMIT 1
+                )
+           ) AS settle ON true
+           LEFT JOIN "user" AS settler ON settler.id = settle.settled_by
           WHERE action.spec_id = $1
             AND action.chip->>'kind' = 'spec_section_state_changed'
             AND action.chip->'after'->>'state' = 'settled'
