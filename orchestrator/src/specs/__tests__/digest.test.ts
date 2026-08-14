@@ -5,7 +5,13 @@ import { Pool } from "pg";
 import * as Y from "yjs";
 
 import { encodeProseMirrorDocument } from "../doc-service.ts";
-import { PostgresSpecDigestSource, SpecDigestService } from "../digest.ts";
+import {
+  PostgresSpecDigestSource,
+  SPEC_DIGEST_MAX_BYTES,
+  SpecDigestService,
+  type SpecDigestSnapshot,
+  type SpecDigestSource,
+} from "../digest.ts";
 
 const TEMPLATE: SpecTemplate = {
   sections: [{ id: "context", key: "context", title: "Context" }],
@@ -26,6 +32,91 @@ function updates(value: string): [Uint8Array, Uint8Array] {
   return [initial, Y.encodeStateAsUpdate(doc, vector)];
 }
 
+function memorySource(snapshot: SpecDigestSnapshot): SpecDigestSource {
+  return { read: async () => snapshot };
+}
+
+describe("SpecDigestService rendering", () => {
+  test("names the phase, section status, settle credit, presence, and question counts", async () => {
+    const digest = await new SpecDigestService(
+      memorySource({
+        phase: "drafting",
+        sections: [
+          {
+            sectionId: "problem",
+            sectionTitle: "Problem",
+            state: "settled",
+            stateChangedAt: new Date("2026-08-13T18:42:00.000Z"),
+            settledBy: "Priya Shah",
+            openQuestionCount: 0,
+          },
+          {
+            sectionId: "design",
+            sectionTitle: "Proposed design",
+            state: "proposed",
+            stateChangedAt: new Date("2026-08-13T19:03:00.000Z"),
+            settledBy: null,
+            openQuestionCount: 2,
+          },
+          {
+            sectionId: "rollout",
+            sectionTitle: "Rollout",
+            state: "open",
+            stateChangedAt: null,
+            settledBy: null,
+            openQuestionCount: 1,
+          },
+        ],
+        changes: [
+          { sectionId: "problem", sectionTitle: "Problem", author: "Nikhil Unni" },
+          { sectionId: "design", sectionTitle: "Proposed design", author: "Marcus Lee" },
+        ],
+      }),
+    ).render("spec-1", 3n, 5n, false, null, ["Nikhil Unni", "Priya Shah"]);
+
+    expect(digest).toContain("Phase: drafting.");
+    expect(digest).toContain(
+      "Problem: settled by Priya Shah at 2026-08-13T18:42:00.000Z.",
+    );
+    expect(digest).toContain("Proposed design: proposed since 2026-08-13T19:03:00.000Z.");
+    expect(digest).toContain("Nikhil Unni updated this section.");
+    expect(digest).toContain("## People here now\nNikhil Unni, Priya Shah.");
+    expect(digest).toContain("Problem: 0 open questions.");
+    expect(digest).toContain("Proposed design: 2 open questions.");
+    expect(digest).toContain("Rollout: 1 open question.");
+  });
+
+  test("keeps load-bearing settlement context within its own byte budget", async () => {
+    const long = "界".repeat(100);
+    const sections = Array.from({ length: 120 }, (_, index) => ({
+      sectionId: `section-${index}`,
+      sectionTitle: `Section ${index} ${long}`,
+      state: index === 119 ? ("settled" as const) : ("open" as const),
+      stateChangedAt: index === 119 ? new Date("2026-08-13T20:15:00.000Z") : null,
+      settledBy: index === 119 ? `Alexandra ${long}` : null,
+      openQuestionCount: index % 4,
+    }));
+    const digest = await new SpecDigestService(
+      memorySource({
+        phase: "drafting",
+        sections,
+        changes: sections.map((section, index) => ({
+          sectionId: section.sectionId,
+          sectionTitle: section.sectionTitle,
+          author: `Collaborator ${index} ${long}`,
+        })),
+      }),
+    ).render("spec-large", 0n, 120n, false, null, [`Present ${long}`]);
+
+    expect(new TextEncoder().encode(digest).byteLength).toBeLessThanOrEqual(
+      SPEC_DIGEST_MAX_BYTES,
+    );
+    expect(digest).toContain("Phase: drafting.");
+    expect(digest).toContain("settled by Alexandra");
+    expect(digest).toContain("at 2026-08-13T20:15:00.000Z");
+  });
+});
+
 const DB_URL = process.env["ORCHESTRATOR_DATABASE_URL"];
 let pool: Pool | null = DB_URL ? new Pool({ connectionString: DB_URL, max: 2 }) : null;
 let reachable = false;
@@ -36,6 +127,7 @@ describe("SpecDigestService with live Postgres", () => {
   const firstSpec = randomUUID();
   const secondSpec = randomUUID();
   const snapshotBaseSpec = randomUUID();
+  const openQuestionId = randomUUID();
   const firstUser = `digest-${randomUUID()}`;
   const secondUser = `digest-${randomUUID()}`;
   let firstBaseState: Uint8Array = new Uint8Array();
@@ -62,6 +154,18 @@ describe("SpecDigestService with live Postgres", () => {
               ($2, 'test', $3, 'Second', 'drafting', 2, 2),
               ($4, 'test', $3, 'Snapshot base', 'drafting', 1, 1)`,
       [firstSpec, secondSpec, templateId, snapshotBaseSpec],
+    );
+    await pool.query(
+      `INSERT INTO spec_section_state
+         (spec_id, section_id, state, na_reason, settled_by, updated_at)
+       VALUES ($1, 'context', 'settled', NULL, $2, $3)`,
+      [firstSpec, firstUser, now],
+    );
+    await pool.query(
+      `INSERT INTO spec_open_question
+         (id, spec_id, section_id, text, opened_by, request_fingerprint, state, created_at)
+       VALUES ($1, $2, 'context', 'Which rollout tier goes first?', $3, 'digest-test', 'open', $4)`,
+      [openQuestionId, firstSpec, secondUser, now],
     );
     const [firstInitial, firstEdit] = updates("first");
     firstBaseState = firstInitial;
@@ -157,8 +261,11 @@ describe("SpecDigestService with live Postgres", () => {
       false,
       firstBaseState,
     );
+    expect(digest).toContain("Phase: drafting.");
+    expect(digest).toContain("Context: settled by Ada at 2026-08-09T12:00:00.000Z.");
+    expect(digest).toContain("Context: 1 open question.");
     expect(digest).toContain("Ada updated this section");
-    expect(digest).not.toContain("Grace");
+    expect(digest).not.toContain("Grace updated this section");
     expect(digest).not.toContain("second");
   });
 

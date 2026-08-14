@@ -77,6 +77,16 @@ export interface SpecPresence {
   leave(input: SpecPresenceLeaveInput): Promise<void>;
 }
 
+export interface SpecHumanPresence {
+  id: string;
+  name: string;
+}
+
+/** Read the people in the live Yjs awareness room. */
+export interface SpecHumanPresenceReader {
+  humanPresence(specId: string): Promise<SpecHumanPresence[]>;
+}
+
 export interface SpecSyncDeps {
   documents: SpecSyncDocuments;
   participants: SpecParticipantStore;
@@ -161,7 +171,7 @@ interface AwarenessChange {
 }
 
 /** Own the local sockets for all spec rooms on one orchestrator replica. */
-export class SpecSyncHub implements SpecPresence {
+export class SpecSyncHub implements SpecPresence, SpecHumanPresenceReader {
   private readonly rooms = new Map<string, SpecRoomEntry>();
   private stopBus: (() => Promise<void>) | null = null;
   private readonly timers: SpecSyncTimers;
@@ -341,6 +351,28 @@ export class SpecSyncHub implements SpecPresence {
       room.queriedPeers = true;
       await this.deps.awarenessBus.query(specId);
     }
+  }
+
+  async humanPresence(specId: string): Promise<SpecHumanPresence[]> {
+    const entry = this.rooms.get(specId);
+    if (!entry) return [];
+    const room = await entry.promise;
+    if (this.rooms.get(specId) !== entry) return [];
+
+    const people = new Map<string, SpecHumanPresence>();
+    for (const state of room.awareness.getStates().values()) {
+      const awarenessUser = isRecord(state) && isRecord(state["user"])
+        ? state["user"]
+        : null;
+      const id = awarenessUser?.["id"];
+      const name = awarenessUser?.["name"];
+      if (typeof id === "string" && typeof name === "string") {
+        people.set(id, { id, name });
+      }
+    }
+    return [...people.values()].sort(
+      (left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id),
+    );
   }
 
   async enter(input: SpecPresenceEnterInput): Promise<void> {
@@ -749,6 +781,10 @@ function agentKey(input: SpecPresenceLeaveInput): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 const systemTimers: SpecSyncTimers = {

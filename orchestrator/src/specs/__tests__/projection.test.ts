@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 
 import type { ExecAttachRequest, ExecOutputFrame } from "../../exec/durable-exec.ts";
+import type { SpecHumanPresenceReader } from "../../routes/spec-sync.ts";
 import {
   SPEC_DIGEST_PATH,
   SPEC_PROJECTION_PATH,
@@ -236,7 +237,7 @@ function concat(chunks: Uint8Array[]): Uint8Array {
   return result;
 }
 
-function fixture() {
+function fixture(humanPresence?: SpecHumanPresenceReader) {
   const store = new MemoryProjectionStore();
   const guest = new FakeGuest();
   let rendererCalls = 0;
@@ -252,11 +253,25 @@ function fixture() {
     },
   };
   const source: SpecDigestSource = {
-    changes: async () => [{ sectionId: "context", sectionTitle: "Context", author: "Ada" }],
+    read: async () => ({
+      phase: "drafting",
+      sections: [
+        {
+          sectionId: "context",
+          sectionTitle: "Context",
+          state: "settled",
+          stateChangedAt: new Date("2026-08-13T18:42:00.000Z"),
+          settledBy: "Ada",
+          openQuestionCount: 0,
+        },
+      ],
+      changes: [{ sectionId: "context", sectionTitle: "Context", author: "Ada" }],
+    }),
   };
   const driver = new SpecProjectionDriver(store, renderer, new SpecDigestService(source), guest, {
     sleep: () => Bun.sleep(1),
     nowMs: Date.now,
+    humanPresence,
   });
   return { store, guest, driver, rendererCalls: () => rendererCalls };
 }
@@ -271,6 +286,21 @@ describe("SpecProjectionDriver", () => {
     expect(guest.spawned).toBe(1);
     expect(guest.attempts.get(`spec-publish-${SPEC_ID}-1`)).toBe(2);
     expect(new TextDecoder().decode(guest.files.get(SPEC_PROJECTION_PATH))).toContain("Canonical");
+  });
+
+  test("a failed presence read does not fail the digest publish", async () => {
+    const { driver, guest, store } = fixture({
+      humanPresence: async () => {
+        throw new Error("awareness unavailable");
+      },
+    });
+    await driver.enqueue({ specId: SPEC_ID, sessionId: SESSION_ID, source: "test" });
+    await driver.runOnce(SESSION_ID);
+
+    const digest = new TextDecoder().decode(guest.files.get(SPEC_DIGEST_PATH));
+    expect(digest).toContain("Phase: drafting.");
+    expect(digest).not.toContain("People here now");
+    expect(store.rows[0]?.state).toBe("published");
   });
 
   test("a staging retry reuses the pinned projection and digest bytes", async () => {
