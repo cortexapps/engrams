@@ -68,6 +68,8 @@ import {
   type DiscoverReposDeps,
 } from "./profile-discover.ts";
 import { sessions as defaultSessions } from "../control-plane/client.ts";
+import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
+import { getModelRouterDefinition, selectRouterProtocol } from "../model-routers/registry.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -84,6 +86,7 @@ export interface HarnessCatalogClient {
       descriptor?: {
         models?: Array<{ id: string }>;
         effort?: Array<{ id: string }>;
+        routerProtocols?: string[];
       };
     }>;
   }>;
@@ -102,6 +105,7 @@ export interface ProfileDeps {
   connectors?: CustomConnectorSource;
   toolCapabilities?: Set<string>;
   connections?: IntegrationConnectionStore;
+  modelRouters?: ModelRouterStore;
   /** Repo autodiscovery flow (boot → scan → tear down); injectable for tests. */
   discoverRepos?: (profileId: string) => Promise<DiscoveredRepo[]>;
 }
@@ -139,6 +143,7 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     // ADR 0062/0063: default harness/model/effort — member-visible (they
     // describe a selection, not a secret).
     harness: row.harness ?? undefined,
+    modelRouter: row.modelRouter ?? undefined,
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
     designation: row.designation ?? undefined,
@@ -254,6 +259,11 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
   // fails.
   const connectors: CustomConnectorSource = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
   const connections = deps?.connections ?? makeIntegrationConnectionStore(getDb());
+  // Keep the production store lazy. Most requests do not select a router, and
+  // tests that inject the other stores must not acquire a database connection
+  // while the service is registered.
+  const modelRouters = (): ModelRouterStore =>
+    deps?.modelRouters ?? makeModelRouterStore(getDb());
   // Resolve the production registry lazily: ProfileService is registered before
   // startup registers all built-in tools.
   const toolCapabilities = (): Set<string> =>
@@ -298,6 +308,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
    */
   async function assertHarnessValid(
     harness: string | null,
+    modelRouter: string | null,
     model: string | null,
     effort: string | null,
   ): Promise<string> {
@@ -309,7 +320,22 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
     if (!descriptor) {
       throw new ConnectError(`harness "${harness}" is not in the catalog`, Code.InvalidArgument);
     }
-    if (model != null && !(descriptor.models ?? []).some((m) => m.id === model)) {
+    if (modelRouter) {
+      const router = getModelRouterDefinition(modelRouter);
+      if (!router) throw new ConnectError(`model router "${modelRouter}" is not registered`, Code.InvalidArgument);
+      if (!selectRouterProtocol(router, descriptor.routerProtocols ?? [])) {
+        throw new ConnectError(
+          `harness "${harness}" does not support model router "${modelRouter}"`,
+          Code.InvalidArgument,
+        );
+      }
+      if (model != null && !(await modelRouters().getModel(modelRouter, model))) {
+        throw new ConnectError(
+          `model "${model}" is not in router "${modelRouter}"`,
+          Code.InvalidArgument,
+        );
+      }
+    } else if (model != null && !(descriptor.models ?? []).some((m) => m.id === model)) {
       throw new ConnectError(
         `model "${model}" is not valid for harness "${harness}"`,
         Code.InvalidArgument,
@@ -486,8 +512,9 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
       const model = catalogOptionId(req.model);
+      const modelRouter = catalogOptionId(req.modelRouter);
       const effort = catalogOptionId(req.effort);
-      const harness = await assertHarnessValid(catalogOptionId(req.harness), model, effort);
+      const harness = await assertHarnessValid(catalogOptionId(req.harness), modelRouter, model, effort);
       await assertSkillsValid(req.skills ?? []);
       const integrationGrants = normalizeIntegrationGrants(req.integrationGrants ?? []);
       const resolvedGrants = await resolveIntegrationGrants(integrationGrants, connections);
@@ -516,6 +543,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         secrets,
         repos: normalizeReposChecked(req.repos ?? []),
         harness,
+        modelRouter,
         model,
         effort,
         portExposures: req.portExposures ?? [],
@@ -534,8 +562,9 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
       const model = catalogOptionId(req.model);
+      const modelRouter = catalogOptionId(req.modelRouter);
       const effort = catalogOptionId(req.effort);
-      const harness = await assertHarnessValid(catalogOptionId(req.harness), model, effort);
+      const harness = await assertHarnessValid(catalogOptionId(req.harness), modelRouter, model, effort);
       await assertSkillsValid(req.skills ?? []);
       const integrationGrants = normalizeIntegrationGrants(req.integrationGrants ?? []);
       const resolvedGrants = await resolveIntegrationGrants(integrationGrants, connections);
@@ -564,6 +593,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         secrets,
         repos: normalizeReposChecked(req.repos ?? []),
         harness,
+        modelRouter,
         model,
         effort,
         portExposures: req.portExposures ?? [],

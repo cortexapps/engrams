@@ -57,6 +57,8 @@ import {
   validateAutomationTemplate,
 } from "../automations/template.ts";
 import { SYSTEM_GITHUB_REGISTRATION_ID } from "../automations/webhook.ts";
+import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
+import { getModelRouterDefinition, selectRouterProtocol } from "../model-routers/registry.ts";
 
 export type GetSession = (
   headers: Headers,
@@ -74,6 +76,7 @@ export interface AutomationDeps {
   connectors?: CustomConnectorSource;
   harnessCatalog?: HarnessCatalogClient;
   orgSecret?: OrgSecretClient;
+  modelRouters?: ModelRouterStore;
   now?: () => Date;
   randomSecret?: () => string;
 }
@@ -228,6 +231,10 @@ function parseAction(value: ProtoAutomationAction | undefined): AutomationAction
   const harness = catalogOptionId(action.harness);
   const model = catalogOptionId(action.model);
   const effort = catalogOptionId(action.effort);
+  // Presence matters for the router field: absent inherits the profile, while
+  // an explicitly empty value selects the direct/native route.
+  const modelRouter =
+    action.modelRouter === undefined ? undefined : action.modelRouter.trim();
   return {
     kind: "create_task",
     profileId: requiredText(action.profileId, "action profile_id"),
@@ -237,6 +244,7 @@ function parseAction(value: ProtoAutomationAction | undefined): AutomationAction
     ...(action.harnessMode ? { harnessMode: action.harnessMode } : {}),
     ...(harness !== undefined ? { harness } : {}),
     ...(model !== undefined ? { model } : {}),
+    ...(modelRouter !== undefined ? { modelRouter } : {}),
     ...(effort !== undefined ? { effort } : {}),
   };
 }
@@ -274,6 +282,7 @@ function protoAction(action: AutomationAction): ProtoAutomationAction {
         ...(action.harnessMode !== undefined ? { harnessMode: action.harnessMode } : {}),
         ...(action.harness !== undefined ? { harness: action.harness } : {}),
         ...(action.model !== undefined ? { model: action.model } : {}),
+        ...(action.modelRouter !== undefined ? { modelRouter: action.modelRouter } : {}),
         ...(action.effort !== undefined ? { effort: action.effort } : {}),
       },
     },
@@ -369,6 +378,10 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
   const connectors = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
   const harnessCatalog: HarnessCatalogClient =
     deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
+  // Keep router persistence lazy so non-routed automation requests and
+  // dependency-injected tests do not open the production database.
+  const modelRouters = (): ModelRouterStore =>
+    deps?.modelRouters ?? makeModelRouterStore(getDb());
   const now = deps?.now ?? (() => new Date());
   const randomSecret =
     deps?.randomSecret ??
@@ -405,6 +418,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     if (
       action.harness === undefined
       && action.model === undefined
+      && action.modelRouter === undefined
       && action.effort === undefined
     ) {
       return action;
@@ -415,7 +429,16 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     if (!descriptor) {
       throw new ConnectError(`harness "${harness}" is not in the catalog`, Code.InvalidArgument);
     }
-    if (action.model !== undefined && !(descriptor.models ?? []).some((m) => m.id === action.model)) {
+    if (action.modelRouter) {
+      const router = getModelRouterDefinition(action.modelRouter);
+      if (!router) throw new ConnectError(`model router "${action.modelRouter}" is not registered`, Code.InvalidArgument);
+      if (!selectRouterProtocol(router, descriptor.routerProtocols ?? [])) {
+        throw new ConnectError(`harness "${harness}" does not support model router "${router.id}"`, Code.InvalidArgument);
+      }
+      if (action.model !== undefined && !(await modelRouters().getModel(router.id, action.model))) {
+        throw new ConnectError(`model "${action.model}" is not in router "${router.id}"`, Code.InvalidArgument);
+      }
+    } else if (action.model !== undefined && !(descriptor.models ?? []).some((m) => m.id === action.model)) {
       throw new ConnectError(
         `model "${action.model}" is not valid for harness "${harness}"`,
         Code.InvalidArgument,

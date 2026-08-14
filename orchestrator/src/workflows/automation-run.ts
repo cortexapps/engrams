@@ -39,6 +39,7 @@ export interface PreparedAutomationRun {
    *  harness the render step read. */
   harness?: string;
   model?: string;
+  modelRouter?: string;
   effort?: string;
 }
 
@@ -183,6 +184,7 @@ export function makeAutomationTaskCreator(
         // when it inherits the profile's default.
         ...(prepared.harness !== undefined ? { harness: prepared.harness } : {}),
         ...(prepared.model !== undefined ? { model: prepared.model } : {}),
+        ...(prepared.modelRouter !== undefined ? { modelRouter: prepared.modelRouter } : {}),
         ...(prepared.effort !== undefined ? { effort: prepared.effort } : {}),
         registerListener: true,
         // No owner and no policy overrides: the shared compiler keeps profile
@@ -258,6 +260,9 @@ export async function automationRunWorkflowImpl(
             ? { harness: automation.action.harness }
             : {}),
           ...(automation.action.model !== undefined ? { model: automation.action.model } : {}),
+          ...(automation.action.modelRouter !== undefined
+            ? { modelRouter: automation.action.modelRouter }
+            : {}),
           ...(automation.action.effort !== undefined ? { effort: automation.action.effort } : {}),
         };
       },

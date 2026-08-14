@@ -72,6 +72,11 @@ import {
   providerGuestEnv,
   providerGuestServices,
 } from "../integrations/providers/index.ts";
+import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
+import {
+  getModelRouterDefinition,
+  selectRouterProtocol,
+} from "../model-routers/registry.ts";
 
 const log = rootLog.child({ component: "task" });
 
@@ -125,6 +130,7 @@ export interface SessionCreateInput {
    *  ride the task row for display — the coordinator learns them via the
    *  compiled harness env, never via these fields. */
   model?: string;
+  modelRouter?: string;
   effort?: string;
   /** ADR 0106: provider + opaque owner only; never contains OAuth bytes. */
   oauthCredential?: {
@@ -156,28 +162,17 @@ export interface HarnessDescriptorView {
     id: string;
     default: boolean;
     env: Record<string, string>;
-    secrets?: Array<{
-      ref: string;
-      env: string;
-      mode: string;
-      hosts: string[];
-      hostPatterns: string[];
-    }>;
   }>;
   effort: Array<{
     id: string;
     default: boolean;
     env: Record<string, string>;
-    secrets?: Array<{
-      ref: string;
-      env: string;
-      mode: string;
-      hosts: string[];
-      hostPatterns: string[];
-    }>;
   }>;
   /** ADR 0107: declared session modes (pure declaration — no env). */
   modes?: Array<{ id: string; default: boolean }>;
+  routerProtocols?: string[];
+  egress?: { allowHosts?: string[]; allowHostPatterns?: string[] };
+  nativeEgress?: { allowHosts?: string[]; allowHostPatterns?: string[] };
 }
 export interface HarnessCatalogClient {
   listHarnesses(req: Record<string, never>): Promise<{
@@ -217,6 +212,7 @@ export interface SessionCompileDeps {
    *  must block, not boot an unauthenticated session). */
   listUserConnectorCredentials?: () => Promise<Array<{ provider: string; status: string }>>;
   connections: IntegrationConnectionStore;
+  modelRouters?: ModelRouterStore;
 }
 
 export interface SessionCompileOpts {
@@ -255,6 +251,8 @@ export interface SessionCompileOpts {
    *  effort. Unset = use the profile's default. */
   harness?: string;
   model?: string;
+  /** Empty or absent selects the harness's direct/native provider. */
+  modelRouter?: string;
   effort?: string;
   /** Extra harness env with the highest configurable precedence — e.g. the
    *  trigger's ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0060). Native auth names are
@@ -293,51 +291,73 @@ export async function compileSessionCreateInput(
     );
   }
 
-  // ADR 0062/0063: resolve the effective harness/model/effort (per-session
+  // ADR 0062/0063/0117: resolve the effective harness/router/model/effort (per-session
   // override < profile default < deployment/descriptor default).
   const selectedHarness = opts.harness ?? profile.harness ?? DEFAULT_HARNESS;
+  const selectedRouterId = opts.modelRouter ?? profile.modelRouter ?? undefined;
   const { harnesses } = await deps.harnessCatalog.listHarnesses({});
   const descriptor = harnesses.find((h) => h.name === selectedHarness)?.descriptor;
+  if (!descriptor) {
+    throw new ConnectError(`harness \`${selectedHarness}\` is not in the catalog`, Code.FailedPrecondition);
+  }
+  const router = selectedRouterId ? getModelRouterDefinition(selectedRouterId) : null;
+  if (selectedRouterId && !router) {
+    throw new ConnectError(`model router \`${selectedRouterId}\` is not registered`, Code.InvalidArgument);
+  }
+  const routerProtocol = router ? selectRouterProtocol(router, descriptor.routerProtocols ?? []) : null;
+  if (router && !routerProtocol) {
+    throw new ConnectError(
+      `harness \`${selectedHarness}\` has no protocol adapter for model router \`${router.id}\``,
+      Code.FailedPrecondition,
+    );
+  }
   const modelId =
     opts.model ??
     profile.model ??
-    descriptor?.models.find((m) => m.default)?.id ??
-    descriptor?.models[0]?.id;
-  const effortId =
+    router?.defaultModel ??
+    descriptor.models.find((m) => m.default)?.id ??
+    descriptor.models[0]?.id;
+  let effortId: string | undefined =
     opts.effort ??
     profile.effort ??
-    descriptor?.effort.find((e) => e.default)?.id ??
-    descriptor?.effort[0]?.id;
-  const modelOption = descriptor?.models.find((m) => m.id === modelId);
-  const effortOption = descriptor?.effort.find((e) => e.id === effortId);
-  const optionSecrets = [
-    ...(modelOption === undefined
-      ? []
-      : (modelOption.secrets ?? []).map((secret) => ({
-          optionKind: "model" as const,
-          optionId: modelOption.id,
-          ...secret,
-        }))),
-    ...(effortOption === undefined
-      ? []
-      : (effortOption.secrets ?? []).map((secret) => ({
-          optionKind: "effort" as const,
-          optionId: effortOption.id,
-          ...secret,
-        }))),
-  ];
-  if (optionSecrets.length > 0) {
+    descriptor.effort.find((e) => e.default)?.id ??
+    descriptor.effort[0]?.id;
+  const modelOption = router ? undefined : descriptor.models.find((m) => m.id === modelId);
+  let routedModel;
+  if (router) {
+    if (!modelId) throw new ConnectError("a routed launch requires a model", Code.InvalidArgument);
+    routedModel = await (deps.modelRouters ?? makeModelRouterStore()).getModel(router.id, modelId);
+    if (!routedModel || !routedModel.available) {
+      throw new ConnectError(`router model \`${modelId}\` is unavailable`, Code.FailedPrecondition);
+    }
+    if (!routedModel.enabled || (isHumanPrincipal(opts) && !routedModel.userEnabled)) {
+      log.warn({ routerId: router.id, modelId, human: isHumanPrincipal(opts) }, "model router policy rejected launch");
+      throw new ConnectError(`router model \`${modelId}\` is not enabled for this principal`, Code.PermissionDenied);
+    }
+    if (!routedModel.supportedParameters.includes("reasoning") && !routedModel.supportedParameters.includes("reasoning_effort")) {
+      effortId = undefined;
+    }
     const client: OrgSecretNameClient = deps.orgSecret ?? defaultOrgSecret;
     const available = new Set((await client.listSecrets({})).secrets.map((secret) => secret.name));
-    for (const secret of optionSecrets) {
-      if (!available.has(secret.ref)) {
-        throw new ConnectError(
-          `${secret.optionKind} option ${secret.optionId} references missing org secret ${secret.ref}`,
-          Code.FailedPrecondition,
-        );
-      }
+    if (!available.has(router.credentialSecret)) {
+      throw new ConnectError(
+        `${router.label} needs the organization secret ${router.credentialSecret}`,
+        Code.FailedPrecondition,
+      );
     }
+    log.info(
+      {
+        routerId: router.id,
+        modelId,
+        harness: selectedHarness,
+        principal: isHumanPrincipal(opts) ? "human" : "programmatic",
+      },
+      "model router launch accepted",
+    );
+  } else if (modelId && !modelOption) {
+    throw new ConnectError(`model \`${modelId}\` is not valid for harness \`${selectedHarness}\``, Code.InvalidArgument);
   }
+  const effortOption = descriptor.effort.find((e) => e.id === effortId);
 
   // ADR 0107: a create-time session mode must be one the harness declares.
   // The coordinator re-validates; failing fast here gives the create surface
@@ -360,7 +380,7 @@ export async function compileSessionCreateInput(
   // real user is that user (the old `type === "chat"` gate booted Slack
   // sessions credential-less — "Not logged in", session e721311e), while an
   // API-key creator is programmatic even for a "chat" task.
-  const isHuman = !opts.programmatic;
+  const isHuman = isHumanPrincipal(opts);
 
   // General harness env, lowest → highest precedence: other user tokens < CLI
   // dummy env < profile env_vars < strip native auth names < model env < effort
@@ -373,7 +393,7 @@ export async function compileSessionCreateInput(
   const orgEnv = descriptor?.auth?.orgEnv;
   let humanUserToken: string | undefined;
   let oauthCredential: SessionCreateInput["oauthCredential"];
-  if (isHuman) {
+  if (isHuman && !router) {
     // The declared user credential is MANDATORY for a human run — a
     // session without it boots unauthenticated. Always inject it, and BLOCK
     // the create when the user hasn't set it (surfacing the descriptor's setup
@@ -522,6 +542,12 @@ export async function compileSessionCreateInput(
   // carried separately in the integration policy.
   for (const [k, v] of Object.entries(modelOption?.env ?? {})) harness[k] = v;
   for (const [k, v] of Object.entries(effortOption?.env ?? {})) harness[k] = v;
+  if (router && routerProtocol && modelId) {
+    harness.ENGRAM_MODEL_ROUTER_ID = router.id;
+    harness.ENGRAM_MODEL_ROUTER_PROTOCOL = routerProtocol;
+    harness.ENGRAM_MODEL_ROUTER_BASE_URL = router.protocols[routerProtocol].baseUrl;
+    harness.ENGRAM_MODEL_ROUTER_MODEL = modelId;
+  }
   // ADR 0031 §7: git commit attribution — the initiating human authors the
   // in-session commits (the guest turns these into /etc/gitconfig's [user]
   // block). Orchestrator-authoritative, so it beats profile env_vars.
@@ -556,7 +582,7 @@ export async function compileSessionCreateInput(
 
   // The human credential remains the final, principal-authoritative env write,
   // so no descriptor or trigger can replace it.
-  if (isHuman && userEnv && humanUserToken !== undefined) harness[userEnv] = humanUserToken;
+  if (isHuman && !router && userEnv && humanUserToken !== undefined) harness[userEnv] = humanUserToken;
   const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
 
   // Per-session integration policy (caps + network + secrets), shipped only
@@ -578,20 +604,21 @@ export async function compileSessionCreateInput(
       ...(isHuman && deps.oauthSubject ? { userSubjectId: deps.oauthSubject.id } : {}),
     },
   );
-  for (const optionSecret of optionSecrets) {
-    const mode = optionSecret.mode;
-    if (mode !== "literal" && mode !== "broker") {
-      throw new ConnectError(
-        `${optionSecret.optionKind} option ${optionSecret.optionId} has invalid secret mode ${mode}`,
-        Code.FailedPrecondition,
-      );
-    }
+  const routeEgress = router ? router.egressHosts : (descriptor.nativeEgress?.allowHosts ?? []);
+  policy.network.allow_hosts = [...new Set([...policy.network.allow_hosts, ...routeEgress])];
+  policy.network.allow_host_patterns = [
+    ...new Set([
+      ...policy.network.allow_host_patterns,
+      ...(router ? [] : (descriptor.nativeEgress?.allowHostPatterns ?? [])),
+    ]),
+  ];
+  if (router) {
     const secret: IntegrationSecretJson = {
-      secret_ref: optionSecret.ref,
-      env_var: optionSecret.env,
-      mode,
-      allow_hosts: optionSecret.hosts ?? [],
-      allow_host_patterns: optionSecret.hostPatterns ?? [],
+      secret_ref: router.credentialSecret,
+      env_var: "ENGRAM_MODEL_ROUTER_API_KEY",
+      mode: "broker",
+      allow_hosts: [...router.egressHosts],
+      allow_host_patterns: [],
     };
     policy.secrets.push(secret);
   }
@@ -609,7 +636,7 @@ export async function compileSessionCreateInput(
     orgEnv !== undefined &&
     modelOption !== undefined &&
     Object.prototype.hasOwnProperty.call(modelOption.env, orgEnv);
-  if (!isHuman && orgEnv && !modelDisablesNativeOrgCredential) {
+  if (!router && !isHuman && orgEnv && !modelDisablesNativeOrgCredential) {
     policy.secrets.push({
       secret_ref: orgEnv,
       env_var: orgEnv,
@@ -624,6 +651,7 @@ export async function compileSessionCreateInput(
     imageUri: image.imageUri,
     mode: "agent",
     harness: selectedHarness,
+    ...(router ? { modelRouter: router.id } : {}),
     ...(modelId != null ? { model: modelId } : {}),
     ...(effortId != null ? { effort: effortId } : {}),
     ...(opts.prompt != null ? { prompt: opts.prompt } : {}),
@@ -651,6 +679,10 @@ export async function compileSessionCreateInput(
       ).values(),
     ],
   };
+}
+
+function isHumanPrincipal(opts: SessionCompileOpts): boolean {
+  return !opts.programmatic;
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +726,8 @@ export interface CreateTaskDeps {
    *  Defaults to a Drizzle store over `db` when omitted. */
   users?: UserIdentityStore;
   connections?: IntegrationConnectionStore;
+  modelRouters?: ModelRouterStore;
+  orgSecret?: OrgSecretNameClient;
 }
 
 export interface CreateTaskParams {
@@ -714,6 +748,7 @@ export interface CreateTaskParams {
   /** ADR 0063 B2: per-session override of the profile's harness / model / effort. */
   harness?: string;
   model?: string;
+  modelRouter?: string;
   effort?: string;
   /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
   harnessMode?: string;
@@ -746,6 +781,7 @@ export interface CreateSessionForExistingTaskParams {
    *  (an automation's stored selection). Unset = the profile's default. */
   harness?: string;
   model?: string;
+  modelRouter?: string;
   effort?: string;
   extraCapabilities?: readonly string[];
   capabilityOverride?: readonly string[];
@@ -843,6 +879,8 @@ export async function createSessionForExistingTask(
             },
           }),
       connections: deps.connections ?? makeIntegrationConnectionStore(deps.db),
+      modelRouters: deps.modelRouters,
+      orgSecret: deps.orgSecret,
     },
     {
       // An automation-owned review task has no human token; use the harness's
@@ -853,6 +891,7 @@ export async function createSessionForExistingTask(
       ...(params.harnessMode != null ? { harnessMode: params.harnessMode } : {}),
       ...(params.harness != null ? { harness: params.harness } : {}),
       ...(params.model != null ? { model: params.model } : {}),
+      ...(params.modelRouter != null ? { modelRouter: params.modelRouter } : {}),
       ...(params.effort != null ? { effort: params.effort } : {}),
       ...(params.extraCapabilities ? { extraCapabilities: params.extraCapabilities } : {}),
       ...(params.capabilityOverride !== undefined
@@ -1003,6 +1042,8 @@ export async function createTaskWithSession(
         }));
       },
       connections: deps.connections ?? makeIntegrationConnectionStore(deps.db),
+      modelRouters: deps.modelRouters,
+      orgSecret: deps.orgSecret,
     },
     {
       taskType: params.type,
@@ -1010,6 +1051,7 @@ export async function createTaskWithSession(
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
       ...(params.harness != null ? { harness: params.harness } : {}),
       ...(params.model != null ? { model: params.model } : {}),
+      ...(params.modelRouter != null ? { modelRouter: params.modelRouter } : {}),
       ...(params.effort != null ? { effort: params.effort } : {}),
       ...(params.harnessMode != null ? { harnessMode: params.harnessMode } : {}),
       ...(params.specTemplate ? { specTemplate: params.specTemplate } : {}),
@@ -1031,6 +1073,7 @@ export async function createTaskWithSession(
     profileId: profile.id,
     imageUri: sessionInput.imageUri,
     harness: sessionInput.harness ?? profile.harness,
+    ...(sessionInput.modelRouter != null ? { modelRouter: sessionInput.modelRouter } : {}),
     ...(sessionInput.model != null ? { model: sessionInput.model } : {}),
     ...(sessionInput.effort != null ? { effort: sessionInput.effort } : {}),
     includeUserTokens: profile.includeUserTokens,
@@ -1059,6 +1102,7 @@ export async function createTaskWithSession(
       // ADR 0063 B2 echo: persist the EFFECTIVE selection (already resolved by
       // compileSessionCreateInput) so reads can show what this task runs with.
       harness: sessionInput.harness ?? null,
+      modelRouter: sessionInput.modelRouter ?? null,
       model: sessionInput.model ?? null,
       effort: sessionInput.effort ?? null,
       rootTaskId: taskId,

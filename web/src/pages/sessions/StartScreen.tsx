@@ -36,6 +36,7 @@ import { defaultCapabilitiesForGrants } from "../../lib/profileIntegrations";
 import { useIntegrationCatalog } from "../../hooks/useIntegrations";
 import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
+import { useModelRouters } from "../../hooks/useModelRouters";
 import { useHarnessEnv } from "../../hooks/useHarnessEnv";
 import { useCredentials } from "../../hooks/useCredentials";
 import { useDeleteTask, useTasksAsSessionList } from "../../hooks/useTasks";
@@ -120,6 +121,7 @@ export function StartScreen() {
   const { data: catalog } = useIntegrationCatalog();
   const { data: images } = useEnabledImages(true);
   const { data: harnesses } = useHarnessCatalog(true);
+  const { data: modelRouterData } = useModelRouters();
   const { data: harnessEnvVars } = useHarnessEnv(true);
   const { data: credentials } = useCredentials(true);
   // `order: "recency"` — the DEFAULT list order bands live work onto page one,
@@ -188,6 +190,13 @@ export function StartScreen() {
     selected?.harness ??
     (harnesses?.length === 1 ? harnesses[0]?.name : undefined);
   const effectiveHarness = harnesses?.find((h) => h.name === effectiveHarnessName);
+  const effectiveRouterId =
+    harnessOverride.modelRouter === null
+      ? selected?.modelRouter
+      : harnessOverride.modelRouter || undefined;
+  const effectiveRouter = modelRouterData?.routers.find(
+    (router) => router.id === effectiveRouterId,
+  );
   // ADR 0107: only harnesses that declare a non-default mode get the chip.
   const planModes = (effectiveHarness?.descriptor?.modes ?? [])
     .filter((m) => m.id !== "default")
@@ -209,8 +218,18 @@ export function StartScreen() {
         // harness.toml) rides the "Reaches" receipt — it's merged into the
         // session allowlist server-side at create.
         {
-          allowHosts: effectiveHarness?.descriptor?.egress?.allowHosts ?? [],
-          allowHostPatterns: effectiveHarness?.descriptor?.egress?.allowHostPatterns ?? [],
+          allowHosts: [
+            ...(effectiveHarness?.descriptor?.egress?.allowHosts ?? []),
+            ...(effectiveRouter?.egressHosts ??
+              effectiveHarness?.descriptor?.nativeEgress?.allowHosts ??
+              []),
+          ],
+          allowHostPatterns: [
+            ...(effectiveHarness?.descriptor?.egress?.allowHostPatterns ?? []),
+            ...(effectiveRouter
+              ? []
+              : (effectiveHarness?.descriptor?.nativeEgress?.allowHostPatterns ?? [])),
+          ],
         },
       )
     : null;
@@ -228,9 +247,11 @@ export function StartScreen() {
   // while the list is unknown, so the box only pops in once a credential is
   // known to be absent. No loader: a credential the user HAS never blinks.
   const userEnvMissing =
+    !effectiveRouter &&
     !!effectiveUserEnv &&
     !!harnessEnvVars?.some((v) => v.envVar === effectiveUserEnv && !v.present);
   const oauthMissing =
+    !effectiveRouter &&
     !!effectiveOAuth &&
     credentials !== undefined &&
     !credentials.some(
@@ -318,6 +339,9 @@ export function StartScreen() {
           // the profile and harness catalog on the server.
           ...(harnessOverride.harness ? { harness: harnessOverride.harness } : {}),
           ...(harnessOverride.model ? { model: harnessOverride.model } : {}),
+          ...(harnessOverride.modelRouter !== null
+            ? { modelRouter: harnessOverride.modelRouter }
+            : {}),
           ...(harnessOverride.effort ? { effort: harnessOverride.effort } : {}),
           ...(harnessOverride.mode ? { harnessMode: harnessOverride.mode } : {}),
         });
@@ -545,6 +569,8 @@ export function StartScreen() {
                   <SessionHarnessControls
                     harnesses={harnesses}
                     profileHarness={selected?.harness}
+                    profileModelRouter={selected?.modelRouter}
+                    profileModel={selected?.model}
                     value={harnessOverride}
                     onChange={setHarnessOverride}
                     disabled={createTaskMutation.isPending}

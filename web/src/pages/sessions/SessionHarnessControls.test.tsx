@@ -7,7 +7,29 @@ import { HarnessSummarySchema } from "../../gen/engram/app/v1/harness_pb";
 import { ModeChip } from "../../components/ModeChip";
 import { EMPTY_OVERRIDE, SessionHarnessControls } from "./SessionHarnessControls";
 
-afterEach(cleanup);
+const routerCatalog = vi.hoisted(() => ({
+  routers: [] as Array<{
+    id: string;
+    label: string;
+    protocols: string[];
+    defaultModel: string;
+  }>,
+  models: [] as Array<{
+    id: string;
+    name: string;
+    supportsReasoning: boolean;
+  }>,
+}));
+vi.mock("@/hooks/useModelRouters", () => ({
+  useModelRouters: () => ({ data: { routers: routerCatalog.routers } }),
+  useRouterModels: () => ({ data: { models: routerCatalog.models } }),
+}));
+
+afterEach(() => {
+  cleanup();
+  routerCatalog.routers = [];
+  routerCatalog.models = [];
+});
 
 const codex = create(HarnessSummarySchema, {
   name: "codex",
@@ -77,8 +99,80 @@ describe("SessionHarnessControls", () => {
     await userEvent.click(await screen.findByRole("menuitem", { name: "Claude Code" }));
     expect(onChange).toHaveBeenCalledWith({
       harness: "claude",
+      modelRouter: null,
       model: null,
       effort: null,
+      mode: "plan",
+    });
+  });
+
+  test("changing to a compatible harness preserves an explicit routed model", async () => {
+    routerCatalog.routers = [
+      {
+        id: "openrouter",
+        label: "OpenRouter",
+        protocols: ["anthropic_messages", "openai_responses"],
+        defaultModel: "deepseek/deepseek-v4-pro-0813",
+      },
+    ];
+    routerCatalog.models = [
+      {
+        id: "deepseek/deepseek-v4-pro-0813",
+        name: "DeepSeek V4 Pro 0813",
+        supportsReasoning: true,
+      },
+    ];
+    const claude = create(HarnessSummarySchema, {
+      name: "claude",
+      descriptor: {
+        name: "claude",
+        label: "Claude Code",
+        routerProtocols: ["anthropic_messages"],
+      },
+    });
+    const routedCodex = create(HarnessSummarySchema, {
+      name: "codex",
+      descriptor: {
+        name: "codex",
+        label: "Codex",
+        routerProtocols: ["openai_responses"],
+        models: [
+          { id: "gpt-5", label: "GPT-5", default: true },
+          { id: "gpt-5-mini", label: "GPT-5 mini" },
+        ],
+        effort: [
+          { id: "medium", label: "Medium", default: true },
+          { id: "high", label: "High" },
+        ],
+        modes: [{ id: "plan", label: "Plan" }],
+      },
+    });
+    const onChange = vi.fn();
+    render(
+      <SessionHarnessControls
+        harnesses={[routedCodex, claude]}
+        profileHarness="codex"
+        value={{
+          harness: null,
+          modelRouter: "openrouter",
+          model: "deepseek/deepseek-v4-pro-0813",
+          effort: "high",
+          mode: "plan",
+        }}
+        onChange={onChange}
+      />,
+    );
+
+    expect(screen.getByTestId("session-model-select").textContent).toContain(
+      "DeepSeek V4 Pro 0813",
+    );
+    await userEvent.click(screen.getByTestId("session-harness-select"));
+    await userEvent.click(await screen.findByRole("menuitem", { name: "Claude Code" }));
+    expect(onChange).toHaveBeenCalledWith({
+      harness: "claude",
+      modelRouter: "openrouter",
+      model: "deepseek/deepseek-v4-pro-0813",
+      effort: "high",
       mode: "plan",
     });
   });

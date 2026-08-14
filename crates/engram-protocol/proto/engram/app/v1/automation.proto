@@ -82,6 +82,7 @@ message CreateTaskAutomationAction {
   optional string harness = 6;
   optional string model = 7;
   optional string effort = 8;
+  optional string model_router = 9;
 }
 
 message CreateAutomationRequest {

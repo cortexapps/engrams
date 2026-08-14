@@ -241,6 +241,7 @@ async function compileChildInput(
     icon: "",
     imageId: "launch-snapshot",
     harness: policy.harness,
+    modelRouter: policy.modelRouter ?? null,
     model: policy.model ?? null,
     effort: policy.effort ?? null,
     includeUserTokens: policy.includeUserTokens,
@@ -522,6 +523,7 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
         const childPolicy: TaskLaunchPolicy = {
           ...structuredClone(policy),
           harness: input.harness ?? policy.harness,
+          ...(input.modelRouter ? { modelRouter: input.modelRouter } : {}),
           ...(input.model ? { model: input.model } : {}),
           ...(input.effort ? { effort: input.effort } : {}),
         };
@@ -558,6 +560,7 @@ export function registerCoordinationTools(registry: ToolRegistry): void {
               createdByUserId: parent.createdByUserId,
               source: {},
               harness: input.harness ?? null,
+              modelRouter: input.modelRouter ?? null,
               model: input.model ?? null,
               effort: input.effort ?? null,
               parentTaskId: parent.id,

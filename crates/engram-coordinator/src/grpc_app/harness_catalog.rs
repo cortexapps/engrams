@@ -53,6 +53,11 @@ fn descriptor_to_proto(
             allow_hosts: d.egress.allow_hosts.clone(),
             allow_host_patterns: d.egress.allow_host_patterns.clone(),
         }),
+        router_protocols: d.router_protocols.clone(),
+        native_egress: Some(app::HarnessEgress {
+            allow_hosts: d.native_egress.allow_hosts.clone(),
+            allow_host_patterns: d.native_egress.allow_host_patterns.clone(),
+        }),
     }
 }
 
@@ -62,20 +67,6 @@ fn option_to_proto(o: &engram_core::types::harness::HarnessOption) -> app::Harne
         label: o.label.clone(),
         default: o.default,
         env: o.env.clone().into_iter().collect(),
-        secrets: o
-            .secrets
-            .iter()
-            .map(|secret| app::HarnessOptionSecret {
-                r#ref: secret.r#ref.clone(),
-                env: secret.env.clone(),
-                mode: match secret.mode {
-                    engram_core::types::image::SecretMode::Literal => "literal".to_string(),
-                    engram_core::types::image::SecretMode::Broker => "broker".to_string(),
-                },
-                hosts: secret.hosts.clone(),
-                host_patterns: secret.host_patterns.clone(),
-            })
-            .collect(),
     }
 }
 

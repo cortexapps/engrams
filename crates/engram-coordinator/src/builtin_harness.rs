@@ -69,13 +69,11 @@ mod tests {
         assert_eq!(d.name, "claude");
         assert_eq!(d.exec_path(), "harness");
         assert_eq!(b.stamp_key, "harness-claude");
-        // ADR 0063 addendum: the harness declares its own model-API egress —
-        // sessions merge these into their allowlist at create. An empty block
-        // here would strangle every deny-default session's harness.
-        assert_eq!(
-            d.egress.allow_hosts,
-            vec!["api.anthropic.com", "statsig.anthropic.com"]
-        );
+        // ADR 0117: telemetry is always needed, while the native model API is
+        // used only when no router is selected.
+        assert_eq!(d.egress.allow_hosts, vec!["statsig.anthropic.com"]);
+        assert_eq!(d.native_egress.allow_hosts, vec!["api.anthropic.com"]);
+        assert_eq!(d.router_protocols, vec!["anthropic_messages"]);
         // A built-in is never in the catalog: the name is resolved from here.
         assert!(builtin("definitely-not-a-builtin").is_none());
     }
@@ -98,10 +96,12 @@ mod tests {
         // refreshes an expired ChatGPT access token. Drop it and the in-guest
         // refresh loop — the only refresh path a user credential has — breaks,
         // and sessions die with 401 token_expired.
+        assert!(d.egress.is_empty());
         assert_eq!(
-            d.egress.allow_hosts,
+            d.native_egress.allow_hosts,
             vec!["api.openai.com", "auth.openai.com", "chatgpt.com"]
         );
+        assert_eq!(d.router_protocols, vec!["openai_responses"]);
         assert_eq!(
             d.models
                 .iter()

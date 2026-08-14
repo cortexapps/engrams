@@ -38,6 +38,9 @@ vi.mock("../../hooks/useHarnessCatalog", () => ({
         name: "claude",
         descriptor: {
           label: "Claude Code",
+          routerProtocols: ["anthropic_messages"],
+          egress: { allowHosts: ["statsig.anthropic.com"], allowHostPatterns: [] },
+          nativeEgress: { allowHosts: ["api.anthropic.com"], allowHostPatterns: [] },
           models: [
             { id: "opus", label: "Claude Opus 4.8", default: true, env: {} },
             { id: "sonnet", label: "Claude Sonnet 4.6", default: false, env: {} },
@@ -47,6 +50,11 @@ vi.mock("../../hooks/useHarnessCatalog", () => ({
       },
     ],
   }),
+}));
+const modelRoutersHolder = vi.hoisted(() => ({ value: [] as unknown[] }));
+vi.mock("../../hooks/useModelRouters", () => ({
+  useModelRouters: () => ({ data: { routers: modelRoutersHolder.value } }),
+  useRouterModels: () => ({ data: { models: [] } }),
 }));
 const uploadSkill = vi.hoisted(() => vi.fn().mockResolvedValue({ skill: { name: "x" } }));
 vi.mock("../../hooks/useSkills", () => ({
@@ -141,6 +149,7 @@ beforeEach(() => {
   profileHolder.value = undefined;
   paramsHolder.value = {};
   connectionsHolder.value = [];
+  modelRoutersHolder.value = [];
   create.mockClear();
   update.mockClear();
   discover.mockClear();
@@ -213,6 +222,28 @@ describe("SessionProfileEditor (create)", () => {
       default: "deny",
       allowHosts: ["sentry.io", "api.github.com"],
     });
+  });
+
+  it("shows always-needed egress plus only the selected model route", async () => {
+    modelRoutersHolder.value = [
+      {
+        id: "openrouter",
+        label: "OpenRouter",
+        protocols: ["anthropic_messages"],
+        egressHosts: ["openrouter.ai"],
+      },
+    ];
+    const user = userEvent.setup();
+    render(<SessionProfileEditor mode="create" />);
+
+    expect(screen.getByText("statsig.anthropic.com")).toBeTruthy();
+    expect(screen.getByText("api.anthropic.com")).toBeTruthy();
+    await user.click(screen.getByLabelText("Route"));
+    await user.click(await screen.findByRole("option", { name: "OpenRouter" }));
+
+    expect(await screen.findByText("openrouter.ai")).toBeTruthy();
+    expect(screen.getByText("statsig.anthropic.com")).toBeTruthy();
+    expect(screen.queryByText("api.anthropic.com")).toBeNull();
   });
 
   it("sends an empty designation when the reviewer toggle is untouched", async () => {

@@ -39,6 +39,7 @@ import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 import { capabilityGrant } from "../integrations/grants.ts";
 import { invalidateRegistry } from "../connectors/registry.ts";
+import type { ModelRouterStore, RouterModelRow } from "../db/model-routers.ts";
 
 function defaultGrant(capability: string) {
   const provider = capability.slice(0, capability.indexOf(":"));
@@ -102,31 +103,13 @@ const providerHarnessCatalog = (): HarnessCatalogClient => ({
         name: "claude",
         descriptor: {
           auth: { userEnv: USER_ENV, orgEnv: ORG_ENV },
+          routerProtocols: ["anthropic_messages"],
+          nativeEgress: { allowHosts: ["api.anthropic.com"], allowHostPatterns: [] },
           models: [
             {
-              id: "glm-5.2",
+              id: "opus",
               default: true,
-              env: {
-                ANTHROPIC_MODEL: "z-ai/glm-5.2",
-                ANTHROPIC_BASE_URL: "https://openrouter.ai/api",
-                [ORG_ENV]: "",
-              },
-              secrets: [
-                {
-                  ref: "openrouter.api_key",
-                  env: "ANTHROPIC_AUTH_TOKEN",
-                  mode: "broker",
-                  hosts: ["openrouter.ai"],
-                  hostPatterns: [],
-                },
-                {
-                  ref: "openrouter.api_key",
-                  env: "OPENROUTER_API_KEY",
-                  mode: "broker",
-                  hosts: ["openrouter.ai"],
-                  hostPatterns: [],
-                },
-              ],
+              env: { ANTHROPIC_MODEL: "claude-opus-4-8" },
             },
           ],
           effort: [],
@@ -134,6 +117,37 @@ const providerHarnessCatalog = (): HarnessCatalogClient => ({
       },
     ],
   }),
+});
+
+const routedModel = (over: Partial<RouterModelRow> = {}): RouterModelRow => ({
+  routerId: "openrouter",
+  modelId: "z-ai/glm-5.2",
+  canonicalSlug: "z-ai/glm-5.2",
+  name: "GLM 5.2",
+  author: "z-ai",
+  description: null,
+  contextLength: 200_000,
+  promptPrice: null,
+  completionPrice: null,
+  inputModalities: ["text"],
+  outputModalities: ["text"],
+  supportedParameters: ["tools", "reasoning"],
+  huggingFaceId: null,
+  upstream: {},
+  available: true,
+  enabled: true,
+  userEnabled: true,
+  updatedAt: new Date(0),
+  ...over,
+});
+
+const fakeModelRouters = (row = routedModel()): ModelRouterStore => ({
+  listModels: async () => [row],
+  getModel: async (_routerId, modelId) => modelId === row.modelId ? row : null,
+  replaceCatalog: async () => ({ markedUnavailable: 0 }),
+  updatePolicy: async () => row,
+  getSyncState: async () => null,
+  recordFailure: async () => {},
 });
 
 const fakeConnections = (): IntegrationConnectionStore => {
@@ -662,27 +676,31 @@ describe("compileSessionCreateInput", () => {
     expect(inp.harnessEnv?.ANTHROPIC_MODEL).toBe("claude-sonnet-4-6");
   });
 
-  test("model secrets compile to broker policy secrets for human and programmatic principals", async () => {
+  test("routed models replace native auth and native egress for human and programmatic principals", async () => {
     const providerDeps: SessionCompileDeps = {
       ...deps(),
       harnessCatalog: providerHarnessCatalog(),
       orgSecret: {
         listSecrets: async () => ({ secrets: [{ name: "openrouter.api_key" }] }),
       },
+      modelRouters: fakeModelRouters(),
     };
 
     for (const programmatic of [false, true]) {
       const inp = await compileSessionCreateInput(
-        profile(),
+        profile({ modelRouter: "openrouter", model: "z-ai/glm-5.2" }),
         providerDeps,
         programmatic ? { programmatic: true } : {},
       );
       expect(inp.harnessEnv).toMatchObject({
-        ANTHROPIC_MODEL: "z-ai/glm-5.2",
-        ANTHROPIC_BASE_URL: "https://openrouter.ai/api",
-        [ORG_ENV]: "",
+        ENGRAM_MODEL_ROUTER_ID: "openrouter",
+        ENGRAM_MODEL_ROUTER_PROTOCOL: "anthropic_messages",
+        ENGRAM_MODEL_ROUTER_BASE_URL: "https://openrouter.ai/api",
+        ENGRAM_MODEL_ROUTER_MODEL: "z-ai/glm-5.2",
       });
+      expect(inp.harnessEnv?.ENGRAM_MODEL_ROUTER_API_KEY).toBeUndefined();
       const policy = JSON.parse(inp.integrationPolicyJson!) as {
+        network: { allow_hosts: string[] };
         secrets: Array<{
           secret_ref: string;
           env_var: string;
@@ -694,41 +712,89 @@ describe("compileSessionCreateInput", () => {
       expect(policy.secrets).toEqual([
         {
           secret_ref: "openrouter.api_key",
-          env_var: "ANTHROPIC_AUTH_TOKEN",
-          mode: "broker",
-          allow_hosts: ["openrouter.ai"],
-          allow_host_patterns: [],
-        },
-        {
-          secret_ref: "openrouter.api_key",
-          env_var: "OPENROUTER_API_KEY",
+          env_var: "ENGRAM_MODEL_ROUTER_API_KEY",
           mode: "broker",
           allow_hosts: ["openrouter.ai"],
           allow_host_patterns: [],
         },
       ]);
-      if (programmatic) {
-        expect(policy.secrets.some((secret) => secret.env_var === ORG_ENV)).toBe(false);
-      }
+      expect(policy.secrets.some((secret) => secret.env_var === ORG_ENV)).toBe(false);
+      expect(inp.harnessEnv?.[USER_ENV]).toBeUndefined();
+      expect(policy.network.allow_hosts).toContain("openrouter.ai");
+      expect(policy.network.allow_hosts).not.toContain("api.anthropic.com");
     }
   });
 
-  test("fails before create when a model references a missing org secret", async () => {
+  test("fails before create when a routed model key is missing", async () => {
     const providerDeps: SessionCompileDeps = {
       ...deps(),
       harnessCatalog: providerHarnessCatalog(),
       orgSecret: { listSecrets: async () => ({ secrets: [] }) },
+      modelRouters: fakeModelRouters(),
     };
     try {
-      await compileSessionCreateInput(profile(), providerDeps);
+      await compileSessionCreateInput(
+        profile({ modelRouter: "openrouter", model: "z-ai/glm-5.2" }),
+        providerDeps,
+      );
       throw new Error("expected a missing-secret failure");
     } catch (error) {
       expect(error).toBeInstanceOf(ConnectError);
       if (!(error instanceof ConnectError)) throw error;
       expect(error.code).toBe(Code.FailedPrecondition);
-      expect(error.message).toContain("model option glm-5.2");
       expect(error.message).toContain("openrouter.api_key");
     }
+  });
+
+  test("fails before create for an unavailable model or protocol mismatch", async () => {
+    const base: SessionCompileDeps = {
+      ...deps(),
+      harnessCatalog: providerHarnessCatalog(),
+      orgSecret: {
+        listSecrets: async () => ({ secrets: [{ name: "openrouter.api_key" }] }),
+      },
+      modelRouters: fakeModelRouters(routedModel({ available: false })),
+    };
+    const routedProfile = profile({ modelRouter: "openrouter", model: "z-ai/glm-5.2" });
+    await expect(compileSessionCreateInput(routedProfile, base)).rejects.toMatchObject({
+      code: Code.FailedPrecondition,
+    });
+
+    await expect(
+      compileSessionCreateInput(routedProfile, {
+        ...base,
+        modelRouters: fakeModelRouters(),
+        harnessCatalog: {
+          listHarnesses: async () => ({
+            harnesses: [
+              {
+                name: "claude",
+                descriptor: {
+                  auth: { userEnv: USER_ENV, orgEnv: ORG_ENV },
+                  routerProtocols: [],
+                  models: [{ id: "opus", default: true, env: {} }],
+                  effort: [],
+                },
+              },
+            ],
+          }),
+        },
+      }),
+    ).rejects.toMatchObject({ code: Code.FailedPrecondition });
+  });
+
+  test("applies the human policy gate and omits effort for a non-reasoning routed model", async () => {
+    const providerDeps: SessionCompileDeps = {
+      ...deps(),
+      harnessCatalog: providerHarnessCatalog(),
+      orgSecret: { listSecrets: async () => ({ secrets: [{ name: "openrouter.api_key" }] }) },
+      modelRouters: fakeModelRouters(routedModel({ supportedParameters: ["tools"], userEnabled: false })),
+    };
+    const routedProfile = profile({ modelRouter: "openrouter", model: "z-ai/glm-5.2", effort: "high" });
+    await expect(compileSessionCreateInput(routedProfile, providerDeps)).rejects.toMatchObject({ code: Code.PermissionDenied });
+    const input = await compileSessionCreateInput(routedProfile, providerDeps, { programmatic: true });
+    expect(input.effort).toBeUndefined();
+    expect(input.harnessEnv?.MAX_THINKING_TOKENS).toBeUndefined();
   });
 
   test("models without secret refs preserve native principal credential rules", async () => {

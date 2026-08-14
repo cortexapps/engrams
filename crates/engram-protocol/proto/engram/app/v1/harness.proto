@@ -67,13 +67,16 @@ message HarnessDescriptor {
   repeated HarnessOption effort = 5;
   // Human-readable one-liner for the admin Harnesses tab.
   optional string description = 6;
-  // ADR 0063 addendum: egress hosts the harness itself must reach (its model
-  // API / telemetry). Merged into the session's deny-default allowlist at
-  // create; surfaced so the UI's "Reaches" receipts show the true egress set.
+  // Hosts the harness always needs, independent of its model route. Merged
+  // into the session's deny-default allowlist at create.
   HarnessEgress egress = 7;
   // Session modes this harness supports (ADR 0107), e.g. plan. Pure
   // declaration — no env map; mode selection rides prompts (harness_mode).
   repeated HarnessMode modes = 8;
+  // Model-router protocols that this harness can consume.
+  repeated string router_protocols = 9;
+  // Provider egress used only for direct/native launches.
+  HarnessEgress native_egress = 10;
 }
 
 // The harness.toml `[egress]` block: exact hostnames + `*.domain` patterns,
@@ -116,16 +119,6 @@ enum OauthDelivery {
   OAUTH_DELIVERY_OPAQUE_BUNDLE = 1;
 }
 
-// One option-secret delivery specification. Carries org-secret names and
-// broker hosts only, never a secret value.
-message HarnessOptionSecret {
-  string ref = 1;
-  string env = 2;
-  string mode = 3;
-  repeated string hosts = 4;
-  repeated string host_patterns = 5;
-}
-
 // One model or effort option; env is the literal var(s) that select it.
 message HarnessOption {
   // Stable option id the wire carries (e.g. "opus").
@@ -135,8 +128,8 @@ message HarnessOption {
   bool default = 3;
   // Env vars this option sets, merged into the session's harness env.
   map<string, string> env = 4;
-  // Org-secret names and their guest delivery rules. Never secret values.
-  repeated HarnessOptionSecret secrets = 5;
+  reserved 5;
+  reserved "secrets";
 }
 
 // One session mode (ADR 0107). Unlike HarnessOption there is no env map: a

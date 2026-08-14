@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// Orchestrator-owned model-router registry, catalog, and launch policy.
+service ModelRouterService {
+  rpc ListModelRouters(ListModelRoutersRequest) returns (ListModelRoutersResponse);
+  rpc ListRouterModels(ListRouterModelsRequest) returns (ListRouterModelsResponse);
+  rpc RefreshRouterModels(RefreshRouterModelsRequest) returns (RefreshRouterModelsResponse);
+  rpc UpdateRouterModelPolicy(UpdateRouterModelPolicyRequest) returns (UpdateRouterModelPolicyResponse);
+}
+
+enum RouterModelAudience {
+  ROUTER_MODEL_AUDIENCE_UNSPECIFIED = 0;
+  ROUTER_MODEL_AUDIENCE_USER = 1;
+  ROUTER_MODEL_AUDIENCE_PROGRAMMATIC = 2;
+  ROUTER_MODEL_AUDIENCE_ADMIN_CATALOG = 3;
+}
+
+message ModelRouter {
+  string id = 1;
+  string label = 2;
+  string description = 3;
+  repeated string protocols = 4;
+  string credential_secret = 5;
+  repeated string egress_hosts = 6;
+  bool credential_configured = 7;
+  optional string last_successful_sync_at = 8;
+  optional string last_sync_error = 9;
+  uint32 model_count = 10;
+  uint32 available_model_count = 11;
+  uint32 enabled_model_count = 12;
+  string default_model = 13;
+}
+
+message RouterModel {
+  string router_id = 1;
+  string id = 2;
+  string canonical_slug = 3;
+  string name = 4;
+  optional string author = 5;
+  optional string description = 6;
+  uint64 context_length = 7;
+  optional string prompt_price = 8;
+  optional string completion_price = 9;
+  repeated string input_modalities = 10;
+  repeated string output_modalities = 11;
+  repeated string supported_parameters = 12;
+  optional string hugging_face_id = 13;
+  bool available = 14;
+  bool enabled = 15;
+  bool user_enabled = 16;
+  string upstream_url = 17;
+  string updated_at = 18;
+  bool supports_reasoning = 19;
+}
+
+message ListModelRoutersRequest {}
+message ListModelRoutersResponse { repeated ModelRouter routers = 1; }
+
+message ListRouterModelsRequest {
+  string router_id = 1;
+  RouterModelAudience audience = 2;
+  string search = 3;
+}
+message ListRouterModelsResponse { repeated RouterModel models = 1; }
+
+message RefreshRouterModelsRequest { string router_id = 1; }
+message RefreshRouterModelsResponse {
+  uint32 discovered = 1;
+  uint32 available = 2;
+  uint32 marked_unavailable = 3;
+}
+
+message UpdateRouterModelPolicyRequest {
+  string router_id = 1;
+  string model_id = 2;
+  bool enabled = 3;
+  bool user_enabled = 4;
+}
+message UpdateRouterModelPolicyResponse { RouterModel model = 1; }
