@@ -1,10 +1,15 @@
 import { describe, expect, test } from "vitest";
 
-import { collaboratorColor } from "./collaborator-colors";
+import { collaboratorColor, MISSING_COLLABORATOR_COLOR } from "./collaborator-colors";
 
 describe("collaboratorColor", () => {
   test("is stable for the same user id", () => {
     expect(collaboratorColor("user-42")).toBe(collaboratorColor("user-42"));
+  });
+
+  test("uses a stable neutral color when the author's account is gone", () => {
+    expect(collaboratorColor(null)).toBe(MISSING_COLLABORATOR_COLOR);
+    expect(collaboratorColor(null)).toBe("#64748b");
   });
 
   test("assigns only six-digit awareness-safe identity colors", () => {

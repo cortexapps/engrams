@@ -125,6 +125,42 @@ describe("buildSpecThread", () => {
     ]);
     expect(JSON.stringify(buildSpecThread(messages, new Map()))).not.toContain("speaker:");
   });
+
+  test("preserves the snapshot name when a stored author's id is null", () => {
+    const messages = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "human-echo",
+          role: "user",
+          prompt_id: "prompt-deleted-author",
+          text: "[speaker: Grace Hopper]\nRaw text",
+          at: AT,
+        },
+      ]),
+      "session-1",
+    ).messages;
+    const stored = new Map<string, SpecMessage>([
+      [
+        "prompt-deleted-author",
+        {
+          promptId: "prompt-deleted-author",
+          author: { id: null, name: "Grace Hopper" },
+          text: "Keep the snapshot.",
+          createdAt: AT,
+        },
+      ],
+    ]);
+
+    expect(buildSpecThread(messages, stored)).toMatchObject([
+      {
+        kind: "human",
+        author: { id: null, name: "Grace Hopper" },
+        text: "Keep the snapshot.",
+      },
+    ]);
+  });
 });
 
 describe("parseSpecAgentText", () => {

@@ -33,6 +33,18 @@ export type NextProposal =
   | { kind: "look_for_breakage" }
   | null;
 
+/** Return whether a section counts toward spec completion. */
+export function isSectionComplete(section: { state: SectionState }): boolean {
+  switch (section.state) {
+    case "settled":
+    case "n/a":
+      return true;
+    case "open":
+    case "proposed":
+      return false;
+  }
+}
+
 /**
  * Derive the one surface model read by the section rail and document pane.
  * The rail owns workflow state. The live document contributes only facts that
@@ -69,21 +81,18 @@ export function deriveSpecSurface(rail: SpecRail, document: Y.Doc | null): SpecS
 
 /** Return the one next offer in document order. Components own its wording. */
 export function deriveNextProposal(surface: SpecSurface): NextProposal {
-  const open = surface.sections.find((section) => section.state === "open");
+  if (surface.sections.length === 0) return null;
+
+  const incomplete = surface.sections.filter((section) => !isSectionComplete(section));
+  const open = incomplete.find((section) => section.state === "open");
   if (open) {
     return { kind: "draft_section", sectionId: open.id, sectionTitle: open.title };
   }
-  const proposed = surface.sections.find((section) => section.state === "proposed");
+  const proposed = incomplete.find((section) => section.state === "proposed");
   if (proposed) {
     return { kind: "settle_section", sectionId: proposed.id, sectionTitle: proposed.title };
   }
-  if (
-    surface.sections.length > 0 &&
-    surface.sections.every((section) => section.state === "settled")
-  ) {
-    return { kind: "look_for_breakage" };
-  }
-  return null;
+  return { kind: "look_for_breakage" };
 }
 
 interface DocumentSectionFacts {

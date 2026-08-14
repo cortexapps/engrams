@@ -6,6 +6,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
+import { isSectionComplete } from "@/components/spec-mode/spec-surface";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -90,7 +91,7 @@ function SectionRow({
     >
       <div className="spec-section-row-main">
         <span className="spec-section-marker" aria-hidden="true">
-          {isComplete(section) ? <CheckIcon /> : <CircleDotDashedIcon />}
+          {isSectionComplete(section) ? <CheckIcon /> : <CircleDotDashedIcon />}
         </span>
         <div className="spec-section-copy">
           <div>
@@ -137,7 +138,7 @@ function SectionRow({
               </Button>
             </>
           )}
-          {(section.state === "settled" || section.state === "n/a") && (
+          {isSectionComplete(section) && (
             <Button
               type="button"
               variant="ghost"
@@ -226,8 +227,4 @@ function StateChip({ section }: { section: SpecRailSection }) {
       Not started
     </Badge>
   );
-}
-
-function isComplete(section: SpecRailSection): boolean {
-  return section.state === "settled" || section.state === "n/a";
 }

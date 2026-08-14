@@ -4,7 +4,7 @@ import { describe, expect, test } from "vitest";
 import * as Y from "yjs";
 
 import type { SpecRail } from "@/hooks/useSpecRead";
-import { deriveNextProposal, deriveSpecSurface } from "./spec-surface";
+import { deriveNextProposal, deriveSpecSurface, isSectionComplete } from "./spec-surface";
 
 describe("deriveSpecSurface", () => {
   test("keeps rail state while deriving invitations and open questions from the document", () => {
@@ -70,6 +70,33 @@ describe("deriveNextProposal", () => {
     );
     expect(deriveNextProposal(surface)).toEqual({ kind: "look_for_breakage" });
   });
+
+  test("offers breakage inspection when settled and n/a sections complete the spec", () => {
+    const surface = deriveSpecSurface(
+      rail([
+        { id: "problem", state: "settled" },
+        { id: "api", state: "n/a" },
+      ]),
+      null,
+    );
+    expect(deriveNextProposal(surface)).toEqual({ kind: "look_for_breakage" });
+  });
+
+  test("offers breakage inspection when every section is n/a", () => {
+    const surface = deriveSpecSurface(
+      rail([
+        { id: "problem", state: "n/a" },
+        { id: "api", state: "n/a" },
+      ]),
+      null,
+    );
+    expect(deriveNextProposal(surface)).toEqual({ kind: "look_for_breakage" });
+  });
+
+  test("offers no next step when the spec has no sections", () => {
+    const surface = deriveSpecSurface(rail([]), null);
+    expect(deriveNextProposal(surface)).toBeNull();
+  });
 });
 
 function yDocument(markdown: string): Y.Doc {
@@ -105,7 +132,7 @@ function rail(
       stateChangedAt: id === "problem" ? "2026-08-13T10:00:00.000Z" : null,
     })),
     completeness: {
-      complete: states.filter(({ state }) => state === "settled" || state === "n/a").length,
+      complete: states.filter(isSectionComplete).length,
       total: states.length,
     },
   };
