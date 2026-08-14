@@ -12,7 +12,7 @@ import {
   type SectionStateValue,
 } from "./section-state.ts";
 
-const EMPTY_SECTION_STATE: SectionStateValue = { state: "empty", naReason: null };
+const OPEN_SECTION_STATE: SectionStateValue = { state: "open", naReason: null };
 
 export interface SectionStateTranscriptAction {
   id: string;
@@ -32,7 +32,7 @@ export interface PersistSectionStateActionInput {
   expectedDocSeq?: bigint;
   expected: SectionStateValue;
   next: SectionStateValue;
-  confirmedBy: string | null;
+  settledBy: string | null;
   chip: SectionStateTranscriptChip;
   at: Date;
 }
@@ -229,7 +229,7 @@ export class SectionStateService {
       expectedDocSeq,
       expected: current,
       next: change.value,
-      confirmedBy: change.value.state === "confirmed" ? actorUserId : null,
+      settledBy: change.value.state === "settled" ? actorUserId : null,
       chip: change.transcriptChip,
       at: this.options.now(),
     });
@@ -363,19 +363,19 @@ export class PostgresSectionStateStore implements SectionStateStore {
       );
       await client.query(
         `INSERT INTO spec_section_state
-           (spec_id, section_id, state, na_reason, confirmed_by, updated_at)
+           (spec_id, section_id, state, na_reason, settled_by, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (spec_id, section_id) DO UPDATE
          SET state = excluded.state,
              na_reason = excluded.na_reason,
-             confirmed_by = excluded.confirmed_by,
+             settled_by = excluded.settled_by,
              updated_at = excluded.updated_at`,
         [
           input.specId,
           input.sectionId,
           input.next.state,
           input.next.naReason,
-          input.confirmedBy,
+          input.settledBy,
           input.at,
         ],
       );
@@ -464,7 +464,7 @@ function changeFromAction(action: SectionStateTranscriptAction): SectionStateCha
 }
 
 function rowValue(row: SectionStateRow | undefined): SectionStateValue {
-  return row ? { state: row.state, naReason: row.na_reason } : EMPTY_SECTION_STATE;
+  return row ? { state: row.state, naReason: row.na_reason } : OPEN_SECTION_STATE;
 }
 
 function sameState(left: SectionStateValue, right: SectionStateValue): boolean {

@@ -416,7 +416,7 @@ describe("spec tools", () => {
       },
       {
         name: "spec_set_section_state",
-        input: { section_id: "context", state: "drafted", expected_rev: "8" },
+        input: { section_id: "context", state: "proposed", expected_rev: "8" },
         sectionId: "context",
       },
       {

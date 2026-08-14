@@ -447,7 +447,7 @@ describe("layer-3 drafting waits for the pick", () => {
       sessionId: SESSION_ID,
       toolCallId: `call-${sectionId}`,
       sectionId,
-      markdown: "Drafted body.",
+      markdown: "Proposed body.",
     });
 
   test("refuses a sibling layer-3 section until the pick lands", async () => {
@@ -516,9 +516,9 @@ describe("layer-3 drafting waits for the pick", () => {
     expect((await update(service, "design")).applied).toBe(true);
   });
 
-  test("a confirmed alternatives section releases the layer without a stored set", async () => {
+  test("a settled alternatives section releases the layer without a stored set", async () => {
     const { sectionStore, service } = await setup();
-    sectionStore.values.set("alternatives", { state: "confirmed", naReason: null });
+    sectionStore.values.set("alternatives", { state: "settled", naReason: null });
 
     expect((await update(service, "design")).applied).toBe(true);
   });

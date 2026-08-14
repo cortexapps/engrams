@@ -343,48 +343,13 @@
   background: var(--instrument-nominal);
 }
 
-.spec-layer-list {
+.spec-section-list {
   display: grid;
-  gap: 0.35rem;
+  gap: 0.3rem;
   padding: 0.8rem 0.65rem 0;
 }
 
-.spec-layer > header {
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  align-items: start;
-  gap: 0.55rem;
-  padding: 0.55rem 0.55rem 0.45rem;
-}
-
-.spec-layer-index,
-.spec-layer-count {
-  color: var(--muted-foreground);
-  font-family: var(--font-mono);
-  font-size: 0.66rem;
-  line-height: 1.35rem;
-}
-
-.spec-layer h3 {
-  font-size: 0.76rem;
-  font-weight: 750;
-  letter-spacing: 0.055em;
-  text-transform: uppercase;
-}
-
-.spec-layer header p {
-  margin-top: 0.1rem;
-  color: var(--muted-foreground);
-  font-size: 0.69rem;
-  line-height: 1.35;
-}
-
-.spec-layer ol {
-  display: grid;
-  gap: 0.3rem;
-}
-
-.spec-layer li {
+.spec-section-list li {
   position: relative;
   border: 1px solid transparent;
   border-radius: 0.55rem;
@@ -392,15 +357,9 @@
   background: color-mix(in oklab, var(--muted) 30%, transparent);
 }
 
-.spec-layer li.is-frontier {
-  border-color: color-mix(in oklab, var(--instrument-nominal) 52%, var(--border));
-  background: color-mix(in oklab, var(--instrument-nominal) 7%, var(--card));
-  box-shadow: inset 2px 0 0 var(--instrument-nominal);
-}
-
 /* Where a publish blocker sent the person (mock 2k): the row that carries the
-   Confirm and the n/a action is the place to act on the blocker. */
-.spec-layer li.is-focused {
+   Settle and the n/a action is the place to act on the blocker. */
+.spec-section-list li.is-focused {
   border-color: color-mix(in oklab, var(--instrument-caution) 60%, var(--border));
   background: color-mix(in oklab, var(--instrument-caution) 9%, var(--card));
   box-shadow: inset 2px 0 0 var(--instrument-caution);
@@ -448,14 +407,6 @@
   white-space: nowrap;
 }
 
-.spec-frontier-label {
-  color: color-mix(in oklab, var(--instrument-nominal) 70%, var(--foreground));
-  font-size: 0.63rem;
-  font-weight: 750;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
 .spec-section-meta,
 .spec-section-actions {
   display: flex;
@@ -469,13 +420,18 @@
   font-size: 0.64rem;
 }
 
-.spec-state-chip.is-confirmed {
+.spec-state-chip.is-settled {
   background: color-mix(in oklab, var(--instrument-nominal) 18%, var(--card));
   color: color-mix(in oklab, var(--instrument-nominal) 68%, var(--foreground));
 }
 
-.spec-state-chip.is-empty {
+.spec-state-chip.is-open {
   color: var(--muted-foreground);
+}
+
+.spec-settle-credit {
+  color: var(--muted-foreground);
+  font-size: 0.67rem;
 }
 
 .spec-question-count {

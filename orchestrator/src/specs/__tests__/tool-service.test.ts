@@ -328,7 +328,7 @@ describe("production spec tool service", () => {
     expect(second).toMatchObject({ applied: true, newRev: 3n });
   });
 
-  test("confirming a section that changed since the agent's read bounces", async () => {
+  test("settling a section that changed since the agent's read bounces", async () => {
     const { service } = await setup();
     await service.updateSection(SPEC_ID, {
       sessionId: OTHER_SESSION_ID,
@@ -338,25 +338,25 @@ describe("production spec tool service", () => {
       markdown: "Changed under the agent",
     });
 
-    const staleConfirm = await service.setSectionState(SPEC_ID, {
-      ...context("stale-confirm", 1n),
+    const staleSettle = await service.setSectionState(SPEC_ID, {
+      ...context("stale-settle", 1n),
       sectionId: "context",
-      state: "confirmed",
+      state: "settled",
     });
-    expect(staleConfirm).toMatchObject({ applied: false, newRev: 2n });
+    expect(staleSettle).toMatchObject({ applied: false, newRev: 2n });
 
     const freshDraft = await service.setSectionState(SPEC_ID, {
       ...context("fresh-draft", 2n),
       sectionId: "context",
-      state: "drafted",
+      state: "proposed",
     });
     expect(freshDraft).toMatchObject({ applied: true });
-    const freshConfirm = await service.setSectionState(SPEC_ID, {
-      ...context("fresh-confirm", 2n),
+    const freshSettle = await service.setSectionState(SPEC_ID, {
+      ...context("fresh-settle", 2n),
       sectionId: "context",
-      state: "confirmed",
+      state: "settled",
     });
-    expect(freshConfirm).toMatchObject({ applied: true });
+    expect(freshSettle).toMatchObject({ applied: true });
   });
 
   test("allows a selection wholly in the section body", async () => {
@@ -825,16 +825,16 @@ describe("production spec tool service", () => {
 
   test("stores a state action for later delivery and enforces template n/a rules", async () => {
     const { service, sectionStore } = await setup();
-    const drafted = await service.setSectionState(SPEC_ID, {
+    const proposed = await service.setSectionState(SPEC_ID, {
       ...context("draft", 1n),
       sectionId: "context",
-      state: "drafted",
+      state: "proposed",
     });
 
-    expect(drafted).toEqual({ applied: true, newRev: 1n, concurrentEditors: ["Sam"] });
+    expect(proposed).toEqual({ applied: true, newRev: 1n, concurrentEditors: ["Sam"] });
     const action = sectionStore.actions.get(`agent-section-state:${SPEC_ID}:${SESSION_ID}:draft`);
     expect(action?.deliveredAt).toBeNull();
-    expect(action?.chip.provisional).toBe(false);
+    expect(action?.chip).not.toHaveProperty("provisional");
     await expect(
       service.setSectionState(SPEC_ID, {
         ...context("context-na"),
@@ -1101,7 +1101,7 @@ describe("the talk-it-through stage keeps the pen down", () => {
       service.updateSection(SPEC_ID, {
         ...context("pen-down"),
         sectionId: "context",
-        markdown: "Drafted too early.",
+        markdown: "Proposed too early.",
       }),
     ).rejects.toThrow(SpecNotesStageError);
   });

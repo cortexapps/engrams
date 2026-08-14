@@ -4,7 +4,7 @@ import type { Node as ProseMirrorNode, ResolvedPos } from "prosemirror-model";
 
 import type { SpecAlternativesTranscriptChip } from "./alternatives.ts";
 
-export type SectionState = "empty" | "drafted" | "confirmed" | "n/a";
+export type SectionState = "open" | "proposed" | "settled" | "n/a";
 
 export interface SectionStateValue {
   state: SectionState;
@@ -26,7 +26,6 @@ export interface SectionStateTranscriptChip {
   sectionTitle: string;
   before: SectionStateValue;
   after: SectionStateValue;
-  provisional: boolean;
   undo: RestoreSectionStateUndo;
 }
 

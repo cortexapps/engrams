@@ -40,19 +40,13 @@ export interface SpecRailSection {
   naReason: string | null;
   allowNa: boolean;
   openQuestionCount: number;
-  provisional: boolean;
-  frontier: boolean;
+  settledBy: { id: string; name: string } | null;
+  stateChangedAt: string | null;
 }
 
 export interface SpecRail {
-  layers: Array<{
-    key: string;
-    title: string;
-    description: string | null;
-    sections: SpecRailSection[];
-  }>;
+  sections: SpecRailSection[];
   completeness: { complete: number; total: number };
-  frontierSectionId: string | null;
 }
 
 export interface SpecReadResponse {
@@ -149,7 +143,7 @@ export interface SpecSectionStateResult {
 export async function setSpecSectionState(
   specId: string,
   sectionId: string,
-  state: Exclude<SectionState, "empty">,
+  state: SectionState,
   reason: string | undefined,
   actionId: string,
 ): Promise<SpecSectionStateResult> {
@@ -226,7 +220,7 @@ export function useSetSpecSectionState(specId: string) {
   return useMutation({
     mutationFn: (input: {
       sectionId: string;
-      state: Exclude<SectionState, "empty">;
+      state: SectionState;
       reason?: string;
       actionId: string;
     }) => setSpecSectionState(specId, input.sectionId, input.state, input.reason, input.actionId),

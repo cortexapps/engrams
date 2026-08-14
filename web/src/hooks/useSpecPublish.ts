@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { specRequest, SpecRequestError } from "@/lib/spec-api";
 
-export type SpecPublishBlockerReason = "empty" | "drafted" | "na_without_reason";
+export type SpecPublishBlockerReason = "open" | "proposed" | "na_without_reason";
 
 export interface SpecPublishBlocker {
   sectionId: string;

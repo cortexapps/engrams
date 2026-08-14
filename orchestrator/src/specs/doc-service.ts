@@ -1532,7 +1532,7 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
         }
         if (actorUserId) {
           if (!effects.at) throw new Error("A human spec update requires an injected timestamp.");
-          await draftHumanEditedSections(
+          await proposeHumanEditedSections(
             client,
             specId,
             BigInt(next.current_semantic_doc_seq),
@@ -1661,11 +1661,11 @@ export class PostgresSpecDocumentStore implements SpecDocumentStore {
 
 interface HumanSectionStateRow {
   section_id: string;
-  state: "empty" | "drafted" | "confirmed" | "n/a";
+  state: "open" | "proposed" | "settled" | "n/a";
   na_reason: string | null;
 }
 
-async function draftHumanEditedSections(
+async function proposeHumanEditedSections(
   client: PoolClient,
   specId: string,
   seq: bigint,
@@ -1683,33 +1683,25 @@ async function draftHumanEditedSections(
   );
   const priorSeq = seq - 1n;
 
-  for (const [index, section] of effects.sections.entries()) {
+  for (const section of effects.sections) {
     if (!section.changed) continue;
-    const current = states.get(section.id) ?? { state: "empty", naReason: null };
-    const unconfirmedUpstreamSectionIds = effects.sections
-      .slice(0, index)
-      .filter((upstream) => {
-        const state = states.get(upstream.id)?.state ?? "empty";
-        return state !== "confirmed" && state !== "n/a";
-      })
-      .map((upstream) => upstream.id);
+    const current = states.get(section.id) ?? { state: "open", naReason: null };
     const change = applyHumanSectionEdit(current, {
       specId,
       sectionId: section.id,
       sectionTitle: section.title,
       allowsNa: true,
-      unconfirmedUpstreamSectionIds,
     });
     if (!change) continue;
 
     await client.query(
       `INSERT INTO spec_section_state
-         (spec_id, section_id, state, na_reason, confirmed_by, updated_at)
-       VALUES ($1, $2, 'drafted', NULL, NULL, $3)
+         (spec_id, section_id, state, na_reason, settled_by, updated_at)
+       VALUES ($1, $2, 'proposed', NULL, NULL, $3)
        ON CONFLICT (spec_id, section_id) DO UPDATE
-       SET state = 'drafted',
+       SET state = 'proposed',
            na_reason = NULL,
-           confirmed_by = NULL,
+           settled_by = NULL,
            updated_at = excluded.updated_at`,
       [specId, section.id, effects.at],
     );

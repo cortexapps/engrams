@@ -6,11 +6,7 @@ import type { SpecRail } from "@/hooks/useSpecRead";
 
 /** Every open question in the spec. These are the flags a reader came back for. */
 export function openQuestionCount(rail: SpecRail): number {
-  return rail.layers.reduce(
-    (total, layer) =>
-      total + layer.sections.reduce((sum, section) => sum + section.openQuestionCount, 0),
-    0,
-  );
+  return rail.sections.reduce((total, section) => total + section.openQuestionCount, 0);
 }
 
 export function railFoldLabel(complete: number, total: number, flags: number): string {
@@ -24,7 +20,7 @@ export function railFoldLabel(complete: number, total: number, flags: number): s
  * A small screen reads and resolves, so the rail gives up its column and keeps
  * only the two facts that make a reader open it: the tally and the flag count.
  * The full rail is one tap away in the sheet, and it keeps every action it has
- * on the desktop — a reader can still confirm a section from there.
+ * on the desktop — a reader can still settle a section from there.
  */
 export function SpecRailFold({ rail, children }: { rail: SpecRail; children: ReactNode }) {
   const [open, setOpen] = useState(false);

@@ -18,20 +18,21 @@ const context: SectionStateContext = {
 };
 
 const values: Record<SectionState, SectionStateValue> = {
-  empty: { state: "empty", naReason: null },
-  drafted: { state: "drafted", naReason: null },
-  confirmed: { state: "confirmed", naReason: null },
+  open: { state: "open", naReason: null },
+  proposed: { state: "proposed", naReason: null },
+  settled: { state: "settled", naReason: null },
   "n/a": { state: "n/a", naReason: "The change has no data migration." },
 };
 
 const legalTransitions: ReadonlyArray<readonly [SectionState, SectionState]> = [
-  ["empty", "drafted"],
-  ["empty", "n/a"],
-  ["drafted", "confirmed"],
-  ["drafted", "n/a"],
-  ["confirmed", "drafted"],
-  ["confirmed", "n/a"],
-  ["n/a", "drafted"],
+  ["open", "proposed"],
+  ["open", "n/a"],
+  ["proposed", "settled"],
+  ["proposed", "open"],
+  ["proposed", "n/a"],
+  ["settled", "proposed"],
+  ["settled", "n/a"],
+  ["n/a", "proposed"],
 ];
 
 describe("section state machine", () => {
@@ -75,37 +76,35 @@ describe("section state machine", () => {
   });
 
   test("rejects n/a without a reason", () => {
-    expect(() => transitionSectionState(values.empty, "n/a", context)).toThrow(
+    expect(() => transitionSectionState(values.open, "n/a", context)).toThrow(
       "must have a reason",
     );
   });
 
   test("rejects n/a when the template does not allow it", () => {
     expect(() =>
-      transitionSectionState(values.empty, "n/a", { ...context, allowsNa: false }, "No change."),
+      transitionSectionState(values.open, "n/a", { ...context, allowsNa: false }, "No change."),
     ).toThrow("does not allow");
   });
 
-  test("a human edit drafts empty, confirmed, and n/a sections", () => {
-    for (const state of ["empty", "confirmed", "n/a"] as const) {
-      expect(applyHumanSectionEdit(values[state], context)?.value).toEqual(values.drafted);
+  test("a human edit proposes open, settled, and n/a sections", () => {
+    for (const state of ["open", "settled", "n/a"] as const) {
+      expect(applyHumanSectionEdit(values[state], context)?.value).toEqual(values.proposed);
     }
-    expect(applyHumanSectionEdit(values.drafted, context)).toBeNull();
+    expect(applyHumanSectionEdit(values.proposed, context)).toBeNull();
   });
 
-  test("drafted content is provisional when an upstream section is not confirmed", () => {
-    const change = transitionSectionState(values.empty, "drafted", {
-      ...context,
-      unconfirmedUpstreamSectionIds: ["problem"],
-    });
-    expect(change.transcriptChip.provisional).toBe(true);
+  test("keeps the direct open-to-settled transition illegal", () => {
+    expect(() => transitionSectionState(values.open, "settled", context)).toThrow(
+      SectionStateTransitionError,
+    );
   });
 
   test("undo restores the prior state and rejects a stale action", () => {
-    const change = transitionSectionState(values.drafted, "confirmed", context);
+    const change = transitionSectionState(values.proposed, "settled", context);
     const undoChange = applySectionStateUndo(change.value, change.transcriptChip.undo, context);
-    expect(undoChange.value).toEqual(values.drafted);
-    expect(() => applySectionStateUndo(values.empty, change.transcriptChip.undo, context)).toThrow(
+    expect(undoChange.value).toEqual(values.proposed);
+    expect(() => applySectionStateUndo(values.open, change.transcriptChip.undo, context)).toThrow(
       "does not match",
     );
   });

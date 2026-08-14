@@ -20,7 +20,7 @@ export class MemorySectionStore implements SectionStateStore {
   docSeq = 1n;
 
   async read(_specId: string, sectionId: string): Promise<SectionStateValue> {
-    return this.values.get(sectionId) ?? { state: "empty", naReason: null };
+    return this.values.get(sectionId) ?? { state: "open", naReason: null };
   }
 
   async readAction(actionId: string): Promise<SectionStateTranscriptAction | null> {

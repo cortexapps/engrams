@@ -78,7 +78,7 @@ describe("extractAgentTasks", () => {
     ]);
   });
 
-  test("an in-flight TaskCreate (no completion yet) shows provisionally, id null", () => {
+  test("an in-flight TaskCreate (no completion yet) shows unresolved with a null id", () => {
     const tasks = extractAgentTasks(indexed([createStarted("t1", { subject: "Fix the bug" })]));
     expect(tasks).toHaveLength(1);
     expect(tasks[0]).toMatchObject({ id: null, subject: "Fix the bug", status: "pending" });

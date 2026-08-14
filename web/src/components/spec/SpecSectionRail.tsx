@@ -15,7 +15,7 @@ import type { SpecRail, SpecRailSection } from "@/hooks/useSpecRead";
 
 export interface SpecRailAction {
   sectionId: string;
-  state: "drafted" | "confirmed" | "n/a";
+  state: "open" | "proposed" | "settled" | "n/a";
   reason?: string;
 }
 
@@ -49,41 +49,18 @@ export function SpecSectionRail({
         <Progress value={percent} aria-label={`${percent}% complete`} />
       </div>
 
-      <div className="spec-layer-list">
-        {rail.layers.map((layer, layerIndex) => {
-          const layerComplete = layer.sections.filter(isComplete).length;
-          return (
-            <section
-              className="spec-layer"
-              aria-labelledby={`spec-layer-${layer.key}`}
-              key={layer.key}
-            >
-              <header>
-                <span className="spec-layer-index">{String(layerIndex + 1).padStart(2, "0")}</span>
-                <div>
-                  <h3 id={`spec-layer-${layer.key}`}>{layer.title}</h3>
-                  {layer.description && <p>{layer.description}</p>}
-                </div>
-                <span className="spec-layer-count">
-                  {layerComplete}/{layer.sections.length}
-                </span>
-              </header>
-              <ol>
-                {layer.sections.map((section) => (
-                  <SectionRow
-                    key={section.id}
-                    section={section}
-                    editable={editable}
-                    pending={pendingSectionId === section.id}
-                    focused={focusedSectionId === section.id}
-                    onAction={onAction}
-                  />
-                ))}
-              </ol>
-            </section>
-          );
-        })}
-      </div>
+      <ol className="spec-section-list">
+        {rail.sections.map((section) => (
+          <SectionRow
+            key={section.id}
+            section={section}
+            editable={editable}
+            pending={pendingSectionId === section.id}
+            focused={focusedSectionId === section.id}
+            onAction={onAction}
+          />
+        ))}
+      </ol>
     </div>
   );
 }
@@ -109,9 +86,7 @@ function SectionRow({
     <li
       ref={row}
       id={`spec-section-row-${section.id}`}
-      className={[section.frontier ? "is-frontier" : "", focused ? "is-focused" : ""]
-        .filter(Boolean)
-        .join(" ")}
+      className={focused ? "is-focused" : undefined}
     >
       <div className="spec-section-row-main">
         <span className="spec-section-marker" aria-hidden="true">
@@ -120,11 +95,12 @@ function SectionRow({
         <div className="spec-section-copy">
           <div>
             <strong>{section.title}</strong>
-            {section.frontier && <span className="spec-frontier-label">Frontier</span>}
           </div>
           <div className="spec-section-meta">
             <StateChip section={section} />
-            {section.provisional && <Badge variant="outline">Provisional</Badge>}
+            {section.settledBy && (
+              <span className="spec-settle-credit">Settled by {section.settledBy.name}</span>
+            )}
             {section.openQuestionCount > 0 && (
               <span
                 className="spec-question-count"
@@ -139,24 +115,35 @@ function SectionRow({
       </div>
       {editable && (
         <div className="spec-section-actions">
-          {section.state === "drafted" && (
-            <Button
-              type="button"
-              variant="ghost"
-              size="xs"
-              disabled={pending}
-              onClick={() => onAction({ sectionId: section.id, state: "confirmed" })}
-            >
-              Confirm
-            </Button>
+          {section.state === "proposed" && (
+            <>
+              <Button
+                type="button"
+                variant="ghost"
+                size="xs"
+                disabled={pending}
+                onClick={() => onAction({ sectionId: section.id, state: "settled" })}
+              >
+                Settle
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="xs"
+                disabled={pending}
+                onClick={() => onAction({ sectionId: section.id, state: "open" })}
+              >
+                Drop
+              </Button>
+            </>
           )}
-          {(section.state === "confirmed" || section.state === "n/a") && (
+          {(section.state === "settled" || section.state === "n/a") && (
             <Button
               type="button"
               variant="ghost"
               size="xs"
               disabled={pending}
-              onClick={() => onAction({ sectionId: section.id, state: "drafted" })}
+              onClick={() => onAction({ sectionId: section.id, state: "proposed" })}
             >
               <RotateCcwIcon aria-hidden="true" />
               Revisit
@@ -217,13 +204,13 @@ function NotApplicableAction({
 }
 
 function StateChip({ section }: { section: SpecRailSection }) {
-  if (section.state === "confirmed") {
-    return <Badge className="spec-state-chip is-confirmed">Confirmed</Badge>;
+  if (section.state === "settled") {
+    return <Badge className="spec-state-chip is-settled">Settled</Badge>;
   }
-  if (section.state === "drafted") {
+  if (section.state === "proposed") {
     return (
       <Badge variant="secondary" className="spec-state-chip">
-        Drafted
+        Proposed
       </Badge>
     );
   }
@@ -235,12 +222,12 @@ function StateChip({ section }: { section: SpecRailSection }) {
     );
   }
   return (
-    <Badge variant="outline" className="spec-state-chip is-empty">
+    <Badge variant="outline" className="spec-state-chip is-open">
       Not started
     </Badge>
   );
 }
 
 function isComplete(section: SpecRailSection): boolean {
-  return section.state === "confirmed" || section.state === "n/a";
+  return section.state === "settled" || section.state === "n/a";
 }

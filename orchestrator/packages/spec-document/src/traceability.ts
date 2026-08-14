@@ -14,7 +14,7 @@ export const REQUIREMENTS_SECTION_KEY = "requirements";
  */
 export const SUBSTANTIVE_BLOCK_MIN_CHARS = 40;
 
-export type TraceabilitySectionState = "empty" | "drafted" | "confirmed" | "n/a";
+export type TraceabilitySectionState = "open" | "proposed" | "settled" | "n/a";
 
 export interface TraceabilityLayer {
   key: string;
@@ -414,7 +414,7 @@ function structuralFindings(
       sectionTitle: anchor.title,
       requirementId: null,
       summary: `${layer.title} is empty, but a deeper layer is written`,
-      detail: `${layer.title} carries no content, yet ${input.layers[deepest]!.title} is drafted on top of it. Fill the outer layer first; the work below it rests on an unstated premise.`,
+      detail: `${layer.title} carries no content, yet ${input.layers[deepest]!.title} is proposed on top of it. Fill the outer layer first; the work below it rests on an unstated premise.`,
       proposedDiff: null,
     });
   }

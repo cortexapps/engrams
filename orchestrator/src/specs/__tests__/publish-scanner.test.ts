@@ -63,9 +63,9 @@ class MemoryPublishStore implements SpecPublishStore {
   /** The document revision, the section states and the open questions the
    *  pin transaction would read. */
   semanticDocSeq = 12n;
-  sectionStates = new Map<string, "confirmed" | "drafted" | "n/a-with-reason">([
-    ["sec-req", "confirmed"],
-    ["sec-data", "confirmed"],
+  sectionStates = new Map<string, "settled" | "proposed" | "n/a-with-reason">([
+    ["sec-req", "settled"],
+    ["sec-data", "settled"],
   ]);
   openQuestionIds: string[] = [];
   readonly checkpoints = new Map<string, string>();
@@ -115,7 +115,7 @@ class MemoryPublishStore implements SpecPublishStore {
     const unsettled = input.requiredSectionIds.filter((id) => {
       const state = this.sectionStates.get(id);
       if (state === undefined) return true;
-      return !(state === "confirmed" || state === "n/a-with-reason");
+      return !(state === "settled" || state === "n/a-with-reason");
     });
     if (unsettled.length > 0) {
       return {
@@ -472,8 +472,8 @@ describe("spec publish scanner", () => {
 
   test("a required section unsettled after the request blocks the pin, not the spec", async () => {
     const f = fixture();
-    // A co-editor edits the confirmed section, which flips it back to drafted.
-    f.store.sectionStates.set("sec-data", "drafted");
+    // A co-editor edits the settled section, which flips it back to proposed.
+    f.store.sectionStates.set("sec-data", "proposed");
 
     const result = await runSpecPublishTick(f.deps);
 
@@ -497,7 +497,7 @@ describe("spec publish scanner", () => {
 
   test("a blocked publish is never claimed again by the timer", async () => {
     const f = fixture();
-    f.store.sectionStates.set("sec-data", "drafted");
+    f.store.sectionStates.set("sec-data", "proposed");
     await runSpecPublishTick(f.deps);
 
     f.advanceClock(60_000);

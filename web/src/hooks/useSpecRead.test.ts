@@ -135,18 +135,17 @@ describe("setSpecSectionState", () => {
         specId: "spec-1",
         sectionId: "design",
         sectionTitle: "Design",
-        before: { state: "drafted", naReason: null },
-        after: { state: "confirmed", naReason: null },
-        provisional: false,
+        before: { state: "proposed", naReason: null },
+        after: { state: "settled", naReason: null },
         undo: {
           kind: "restore_section_state",
           specId: "spec-1",
           sectionId: "design",
-          expected: { state: "confirmed", naReason: null },
-          restore: { state: "drafted", naReason: null },
+          expected: { state: "settled", naReason: null },
+          restore: { state: "proposed", naReason: null },
         },
       },
-      rail: { layers: [], completeness: { complete: 1, total: 1 }, frontierSectionId: null },
+      rail: { sections: [], completeness: { complete: 1, total: 1 } },
     };
     const fetchMock = vi.fn(() =>
       Promise.resolve(
@@ -161,7 +160,7 @@ describe("setSpecSectionState", () => {
     const result = await setSpecSectionState(
       "spec-1",
       "design",
-      "confirmed",
+      "settled",
       undefined,
       "00000000-0000-4000-8000-000000001118",
     );
@@ -173,7 +172,7 @@ describe("setSpecSectionState", () => {
         method: "POST",
         body: JSON.stringify({
           actionId: "00000000-0000-4000-8000-000000001118",
-          state: "confirmed",
+          state: "settled",
         }),
       }),
     );
@@ -186,18 +185,17 @@ describe("setSpecSectionState", () => {
         specId: "spec-1",
         sectionId: "design",
         sectionTitle: "Design",
-        before: { state: "drafted", naReason: null },
-        after: { state: "confirmed", naReason: null },
-        provisional: false,
+        before: { state: "proposed", naReason: null },
+        after: { state: "settled", naReason: null },
         undo: {
           kind: "restore_section_state",
           specId: "spec-1",
           sectionId: "design",
-          expected: { state: "confirmed", naReason: null },
-          restore: { state: "drafted", naReason: null },
+          expected: { state: "settled", naReason: null },
+          restore: { state: "proposed", naReason: null },
         },
       },
-      rail: { layers: [], completeness: { complete: 1, total: 1 }, frontierSectionId: null },
+      rail: { sections: [], completeness: { complete: 1, total: 1 } },
     };
     const fetchMock = vi
       .fn()
@@ -214,7 +212,7 @@ describe("setSpecSectionState", () => {
     const { result } = renderHook(() => useSetSpecSectionState("spec-1"), { wrapper });
 
     act(() => {
-      result.current.mutate({ sectionId: "design", state: "confirmed", actionId });
+      result.current.mutate({ sectionId: "design", state: "settled", actionId });
     });
 
     await vi.waitFor(() => expect(result.current.isSuccess).toBe(true));
@@ -231,8 +229,8 @@ describe("setSpecSectionState", () => {
 describe("useSpecRail", () => {
   it("polls server state while the spec is a draft", async () => {
     vi.useFakeTimers();
-    const first = { layers: [], completeness: { complete: 0, total: 1 }, frontierSectionId: "a" };
-    const second = { layers: [], completeness: { complete: 1, total: 1 }, frontierSectionId: null };
+    const first = { sections: [], completeness: { complete: 0, total: 1 } };
+    const second = { sections: [], completeness: { complete: 1, total: 1 } };
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse({ rail: first }))

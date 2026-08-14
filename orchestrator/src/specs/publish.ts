@@ -692,7 +692,7 @@ export class PostgresSpecPublishStore implements SpecPublishStore {
              ON state.spec_id = $1 AND state.section_id = required.section_id
           WHERE state.section_id IS NULL
              OR NOT (
-                  state.state = 'confirmed'
+                  state.state = 'settled'
                   OR (state.state = 'n/a' AND btrim(coalesce(state.na_reason, '')) <> '')
                 )`,
         [input.specId, [...input.requiredSectionIds]],

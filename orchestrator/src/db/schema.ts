@@ -378,7 +378,7 @@ export const specSectionState = pgTable(
     sectionId: text("section_id").notNull(),
     state: text("state").notNull(),
     naReason: text("na_reason"),
-    confirmedBy: text("confirmed_by").references(() => user.id, { onDelete: "set null" }),
+    settledBy: text("settled_by").references(() => user.id, { onDelete: "set null" }),
     updatedAt: timestamp("updated_at", { withTimezone: true })
       .notNull()
       .defaultNow()

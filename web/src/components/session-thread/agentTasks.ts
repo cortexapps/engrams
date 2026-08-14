@@ -9,7 +9,7 @@ import type { IndexedEvent } from "../../events";
 // Correlation quirk: the harness assigns the task id INSIDE the guest, so a
 // TaskCreate's id only appears in its RESULT text ("Task #3 created
 // successfully: <subject>"). The fold parses it out; a create whose result
-// has not landed yet is provisional (id null) and updates cannot target it
+// has not landed yet is unresolved (id null) and updates cannot target it
 // until the result arrives — the next fold pass resolves it.
 
 export type AgentTaskStatus = "pending" | "in_progress" | "completed";
