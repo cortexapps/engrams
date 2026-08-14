@@ -41,6 +41,19 @@ vi.mock("@/components/spec/LazySpecCanvas", () => ({
 vi.mock("@/hooks/useSpecPublish", () => ({
   useSpecPublish: () => ({ data: { gate: { openQuestions: [] } } }),
 }));
+vi.mock("@/hooks/useSpecEvents", () => ({
+  useSpecEvents: () => ({ events: [], streamingText: "", error: null, missed: 0 }),
+}));
+
+vi.mock("@/hooks/useSpecMessages", () => ({
+  useSpecMessages: () => ({
+    data: { messages: [], byPromptId: new Map(), nextAfter: null },
+    error: null,
+  }),
+  useSendSpecMessage: () => ({
+    mutateAsync: vi.fn(async () => ({ promptId: "prompt-1" })),
+  }),
+}));
 
 vi.mock("@/hooks/useSpecRead", () => ({
   useSpecRead: () => ({

@@ -1,4 +1,3 @@
-import { useMutation } from "@connectrpc/connect-query";
 import { useParams } from "@tanstack/react-router";
 import { useEffect, useRef, useState, type UIEvent } from "react";
 import type { SpecSelectionActionPayload } from "@engrams/spec-document";
@@ -11,8 +10,8 @@ import { useScrollAnchors } from "@/components/spec-mode/useScrollAnchors";
 import { LazySpecCanvas } from "@/components/spec/LazySpecCanvas";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Text } from "@/components/ui/text";
-import { sendPrompt as sendPromptMethod } from "@/gen/engram/app/v1/session-SessionService_connectquery";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { useSendSpecMessage } from "@/hooks/useSpecMessages";
 import { useSpecPublish } from "@/hooks/useSpecPublish";
 import { type SpecReadResponse, useSpecRail, useSpecRead } from "@/hooks/useSpecRead";
 
@@ -25,7 +24,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   const read = useSpecRead(specId);
   const rail = useSpecRail(specId);
   const publish = useSpecPublish(specId);
-  const sendSelectionPrompt = useMutation(sendPromptMethod);
+  const sendSelectionPrompt = useSendSpecMessage(specId);
   const phase = read.data ? currentPhase(read.data) : null;
   const { connection, synced } = useSpecConnection(specId, phase === "drafting");
   const [readingSectionId, setReadingSectionId] = useState<string | null>(null);
@@ -96,18 +95,14 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
 
   const { spec, checkpoints, publishedCheckpoint } = read.data;
   const selectionActions =
-    phase === "drafting" && spec.sessionId
+    phase === "drafting"
       ? {
           onAction: (payload: SpecSelectionActionPayload) => {
             if (payload.specId !== specId || payload.span.specId !== specId) {
               throw new Error("The selection action belongs to a different spec.");
             }
             sendSelectionPrompt
-              .mutateAsync({
-                sessionId: spec.sessionId!,
-                promptId: crypto.randomUUID(),
-                text: selectionActionPrompt(payload),
-              })
+              .mutateAsync(selectionActionPrompt(payload))
               .catch((error) => console.warn("selection action failed", error));
           },
         }

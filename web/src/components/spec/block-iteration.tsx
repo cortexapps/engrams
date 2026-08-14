@@ -1,5 +1,7 @@
 import { createContext, useCallback, useContext, type ReactNode } from "react";
 
+import { useSendSpecMessage } from "@/hooks/useSpecMessages";
+
 export interface SpecBlockIterationRequest {
   sectionId: string;
   blockId: string;
@@ -17,9 +19,12 @@ export function SpecBlockIterationProvider({
   specId: string;
   children: ReactNode;
 }) {
+  const sendMessage = useSendSpecMessage(specId);
   const submit = useCallback<SubmitBlockIteration>(
-    async (request) => submitBlockIteration(specId, request),
-    [specId],
+    async (request) => {
+      await sendMessage.mutateAsync(blockIterationMessage(request));
+    },
+    [sendMessage],
   );
   return (
     <SpecBlockIterationContext.Provider value={submit}>
@@ -32,33 +37,6 @@ export function useSpecBlockIteration(): SubmitBlockIteration | null {
   return useContext(SpecBlockIterationContext);
 }
 
-export async function submitBlockIteration(
-  specId: string,
-  request: SpecBlockIterationRequest,
-): Promise<void> {
-  const response = await fetch(
-    `/api/v1/specs/${encodeURIComponent(specId)}/blocks/${encodeURIComponent(request.blockId)}/messages`,
-    {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ section_id: request.sectionId, message: request.message }),
-    },
-  );
-  if (response.ok) return;
-  let detail = `Request failed (${response.status})`;
-  try {
-    const body: unknown = await response.json();
-    if (
-      body !== null &&
-      typeof body === "object" &&
-      !Array.isArray(body) &&
-      typeof Reflect.get(body, "error") === "string"
-    ) {
-      detail = Reflect.get(body, "error");
-    }
-  } catch {
-    // Keep the status-derived message when the server did not return JSON.
-  }
-  throw new Error(detail);
+export function blockIterationMessage(request: SpecBlockIterationRequest): string {
+  return `Use spec_update_block to update block ${request.blockId} in §${request.sectionId}: ${request.message}`;
 }

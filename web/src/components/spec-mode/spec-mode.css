@@ -500,9 +500,243 @@
 
 .spec-mode-conversation {
   grid-area: conversation;
+  display: flex;
   min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
   border-left: 1px solid var(--border);
   background: var(--card);
+}
+
+.spec-mode-conversation-header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  padding: 14px 18px 12px;
+}
+
+.spec-mode-conversation-header > :last-child {
+  font-size: 0.68rem;
+}
+
+.spec-mode-thread {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 16px;
+  overflow-y: auto;
+  padding: 18px;
+  overscroll-behavior: contain;
+}
+
+.spec-mode-activity {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 9px;
+  color: inherit;
+  text-align: left;
+}
+
+.spec-mode-activity:hover,
+.spec-mode-activity:focus-visible {
+  background: var(--accent);
+}
+
+.spec-mode-activity:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+.spec-mode-activity-mark {
+  flex: none;
+  color: var(--ring);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+}
+
+.spec-mode-activity-copy {
+  min-width: 0;
+  flex: 1;
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
+.spec-mode-activity time,
+.spec-mode-human-turn time,
+.spec-mode-agent-turn time {
+  font-size: 0.62rem;
+}
+
+.spec-mode-human-turn,
+.spec-mode-agent-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.spec-mode-human-turn {
+  align-items: flex-end;
+}
+
+.spec-mode-human-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.spec-mode-human-avatar {
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--secondary);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  font-weight: 600;
+}
+
+.spec-mode-human-bubble {
+  max-width: 300px;
+  margin: 0;
+  border-radius: 10px;
+  padding: 9px 12px;
+  background: var(--secondary);
+  font-size: 0.84rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.spec-mode-agent-copy {
+  margin: 0;
+  font-size: 0.84rem;
+  line-height: 1.68;
+  text-wrap: pretty;
+  white-space: pre-wrap;
+}
+
+.spec-mode-citations {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.spec-mode-citations span {
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 2px 7px;
+  font-size: 0.66rem;
+}
+
+.spec-mode-thinking {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.spec-mode-thinking > :first-child {
+  color: var(--ring);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+
+.spec-mode-thinking > :last-child {
+  font-size: 0.78rem;
+}
+
+.spec-mode-conversation-warning {
+  border-top: 1px solid var(--border);
+  padding: 8px 18px;
+  font-size: 0.75rem;
+}
+
+.spec-mode-next {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding: 14px 18px;
+  background: var(--background);
+}
+
+.spec-mode-next-copy {
+  margin: 0;
+  font-size: 0.84rem;
+  line-height: 1.6;
+  text-wrap: pretty;
+}
+
+.spec-mode-next-actions,
+.spec-mode-next-error,
+.spec-mode-composer-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.spec-mode-next-error,
+.spec-mode-composer-error {
+  justify-content: space-between;
+}
+
+.spec-mode-next-error p,
+.spec-mode-composer-error p {
+  margin: 0;
+  font-size: 0.75rem;
+}
+
+.spec-mode-composer {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 7px;
+  border-top: 1px solid var(--border);
+  padding: 12px 14px;
+  background: var(--background);
+}
+
+.spec-mode-composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.spec-mode-composer textarea {
+  min-height: 48px;
+  flex: 1;
+  resize: none;
+  border: 0;
+  border-radius: 4px;
+  outline: none;
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+  font-size: 0.84rem;
+  line-height: 1.55;
+}
+
+.spec-mode-composer textarea:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.spec-mode-composer textarea:disabled {
+  opacity: 0.7;
+}
+
+.spec-mode-composer-status {
+  font-size: 0.72rem;
 }
 
 .spec-mode-published-document {

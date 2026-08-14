@@ -1,6 +1,7 @@
 import type { ReactNode, RefObject, UIEventHandler } from "react";
 
 import type { SpecCheckpointSummary } from "@/hooks/useSpecRead";
+import { ConversationRail } from "./ConversationRail";
 import { SectionList } from "./SectionList";
 import type { SpecSurface } from "./spec-surface";
 import { SpecSpine } from "./SpecSpine";
@@ -71,8 +72,11 @@ export function SpecShell({
         >
           <div className="spec-mode-document-inner">{children}</div>
         </section>
-        {/* F4 owns the shared conversation rail. */}
-        <aside className="spec-mode-conversation" aria-label="Conversation" />
+        <aside className="spec-mode-conversation" aria-label="Conversation">
+          {surface ? (
+            <ConversationRail specId={specId} surface={surface} onSelectSection={onSelectSection} />
+          ) : null}
+        </aside>
       </div>
     </div>
   );
