@@ -54,7 +54,7 @@ describe("SpecShell", () => {
       />,
     );
 
-    expect((await screen.findByLabelText("Presence")).childElementCount).toBe(0);
+    expect(screen.queryByLabelText(/present$/)).toBeNull();
     expect(screen.queryByRole("button", { name: "Publish" })).toBeNull();
   });
 });

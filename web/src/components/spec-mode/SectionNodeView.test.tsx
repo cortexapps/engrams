@@ -37,7 +37,7 @@ describe("SectionNodeView", () => {
         <SectionList surface={surface} onSelectSection={() => undefined} />
         <ConnectedSpecCanvas
           connection={{ doc, provider }}
-          user={{ name: "Grace", color: "#2563eb" }}
+          user={{ id: "grace", name: "Grace", color: "#2563eb" }}
           specId="spec-1"
           revision="17"
           surface={surface}
@@ -48,6 +48,11 @@ describe("SectionNodeView", () => {
     );
 
     await waitFor(() => expect(screen.getAllByRole("img", { name: "Proposed" })).toHaveLength(2));
+    await waitFor(() =>
+      expect(provider.awareness.getLocalState()?.location).toEqual({
+        sectionId: "design",
+      }),
+    );
     await user.click(screen.getByRole("button", { name: "Keep" }));
     await user.click(screen.getByRole("button", { name: "Revise" }));
     await user.click(screen.getByRole("button", { name: "Drop" }));
@@ -71,7 +76,7 @@ describe("SectionNodeView", () => {
     render(
       <ConnectedSpecCanvas
         connection={{ doc, provider }}
-        user={{ name: "Grace", color: "#2563eb" }}
+        user={{ id: "grace", name: "Grace", color: "#2563eb" }}
         specId="spec-1"
         revision="17"
         surface={surface}
@@ -104,7 +109,7 @@ describe("SectionNodeView", () => {
     render(
       <ConnectedSpecCanvas
         connection={{ doc, provider }}
-        user={{ name: "Grace", color: "#2563eb" }}
+        user={{ id: "grace", name: "Grace", color: "#2563eb" }}
         specId="spec-1"
         revision="17"
         surface={deriveSpecSurface(rail("open"), doc)}
@@ -133,7 +138,7 @@ describe("SectionNodeView", () => {
       const view = render(
         <ConnectedSpecCanvas
           connection={{ doc, provider }}
-          user={{ name: "Grace", color: "#2563eb" }}
+          user={{ id: "grace", name: "Grace", color: "#2563eb" }}
           specId="spec-1"
           revision="17"
           surface={deriveSpecSurface(railValue, doc)}
@@ -154,7 +159,7 @@ describe("SectionNodeView", () => {
     const view = render(
       <ConnectedSpecCanvas
         connection={{ doc, provider }}
-        user={{ name: "Grace", color: "#2563eb" }}
+        user={{ id: "grace", name: "Grace", color: "#2563eb" }}
         specId="spec-1"
         revision="17"
         surface={surface}
@@ -170,7 +175,7 @@ describe("SectionNodeView", () => {
     view.rerender(
       <ConnectedSpecCanvas
         connection={{ doc, provider }}
-        user={{ name: "Grace", color: "#2563eb" }}
+        user={{ id: "grace", name: "Grace", color: "#2563eb" }}
         specId="spec-1"
         revision="17"
         surface={surface}

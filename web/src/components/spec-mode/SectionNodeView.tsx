@@ -7,6 +7,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Text } from "@/components/ui/text";
 import { Textarea } from "@/components/ui/textarea";
 import { SectionGlyph } from "./SectionGlyph";
+import type { HumanPresence, SpecPresenceEntry } from "./section-presence";
 import type { SpecSurface } from "./spec-surface";
 
 export interface SectionStateAction {
@@ -19,6 +20,7 @@ export interface SectionNodeViewContextValue {
   surface: SpecSurface;
   showProvenance: boolean;
   pendingSectionId: string | null;
+  presence: SpecPresenceEntry[];
   setSectionState: (action: SectionStateAction) => void;
 }
 
@@ -83,8 +85,7 @@ export function SectionNodeView({ editor, getPos, node }: NodeViewProps) {
             Settled by {section.credit.by.name}
           </Text>
         ) : null}
-        {/* F5 adds the inline cursor flag in this flow slot. */}
-        <span className="spec-mode-inline-cursor-slot" aria-hidden="true" />
+        <InlineSectionPresence presence={context.presence} sectionId={sectionId} />
       </header>
 
       <NodeViewContent className="spec-mode-section-content" />
@@ -162,6 +163,44 @@ export function SectionNodeView({ editor, getPos, node }: NodeViewProps) {
         </div>
       ) : null}
     </NodeViewWrapper>
+  );
+}
+
+export function InlineSectionPresence({
+  presence,
+  sectionId,
+}: {
+  presence: SpecPresenceEntry[];
+  sectionId: string;
+}) {
+  const people = presence.filter(
+    (entry): entry is HumanPresence => entry.kind === "human" && entry.sectionId === sectionId,
+  );
+  if (people.length === 0) return null;
+  return (
+    <span className="spec-mode-inline-cursors">
+      {people.map((person) => (
+        <span
+          key={person.clientId}
+          className="spec-mode-inline-cursor"
+          aria-label={`${person.isSelf ? "You are" : `${person.name} is`} in this section`}
+        >
+          <span
+            className="spec-mode-inline-cursor-bar"
+            style={{ backgroundColor: person.color }}
+            aria-hidden="true"
+          />
+          <Text
+            as="span"
+            variant="code"
+            className="spec-mode-inline-cursor-name"
+            style={{ backgroundColor: person.color }}
+          >
+            {person.isSelf ? "you" : person.name}
+          </Text>
+        </span>
+      ))}
+    </span>
   );
 }
 

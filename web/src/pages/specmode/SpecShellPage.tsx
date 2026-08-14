@@ -5,6 +5,7 @@ import type { SpecSelectionActionPayload } from "@engrams/spec-document";
 import { Markdown } from "@/components/Markdown";
 import { SpecShell } from "@/components/spec-mode/SpecShell";
 import type { SpecConnection } from "@/components/spec/SpecConnection";
+import { useSpecPresence } from "@/components/spec-mode/section-presence";
 import { useSpecSurface } from "@/components/spec-mode/spec-surface";
 import { useScrollAnchors } from "@/components/spec-mode/useScrollAnchors";
 import { LazySpecCanvas } from "@/components/spec/LazySpecCanvas";
@@ -27,6 +28,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   const sendSelectionPrompt = useSendSpecMessage(specId);
   const phase = read.data ? currentPhase(read.data) : null;
   const { connection, synced } = useSpecConnection(specId, phase === "drafting");
+  const presence = useSpecPresence(connection?.provider.awareness ?? null);
   const [readingSectionId, setReadingSectionId] = useState<string | null>(null);
   const [showProvenance, setShowProvenance] = useState(true);
   const documentPaneRef = useRef<HTMLElement | null>(null);
@@ -116,6 +118,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
       checkpoints={checkpoints}
       viewerIsOwner={spec.viewerIsOwner}
       surface={phase === "drafting" ? surface : undefined}
+      presence={presence}
       onSelectSection={selectSection}
       documentPaneRef={documentPaneRef}
       onDocumentScroll={trackReadingSection}
@@ -131,6 +134,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
             revision={spec.revision}
             selectionActions={selectionActions}
             surface={surface}
+            presence={presence}
             showProvenance={showProvenance}
           />
         ) : (

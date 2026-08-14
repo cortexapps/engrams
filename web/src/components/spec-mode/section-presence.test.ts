@@ -5,6 +5,7 @@ import { describe, expect, test } from "vitest";
 import * as Y from "yjs";
 import { schema } from "@engrams/spec-document";
 
+import { collaboratorColor, MISSING_COLLABORATOR_COLOR } from "./collaborator-colors";
 import {
   mapAwarenessCursorsToSections,
   readSpecPresence,
@@ -35,7 +36,7 @@ describe("section presence", () => {
         clientId: expect.any(Number),
         userId: "alice",
         name: "Alice",
-        color: "#2563eb",
+        color: collaboratorColor("alice"),
         sectionId: "problem",
       },
     ]);
@@ -50,6 +51,7 @@ describe("section presence", () => {
     receiver.setLocalState(null);
     const state = awarenessState({
       user: { id: "alice", name: "Alice", color: "#2563eb" },
+      location: { sectionId: "problem" },
       agentPresence: [
         {
           name: "engram",
@@ -62,11 +64,29 @@ describe("section presence", () => {
     applyAwarenessUpdate(receiver, state.update, "test");
 
     expect(readSpecPresence(receiver)).toMatchObject([
-      { kind: "human", id: "alice", name: "Alice" },
+      {
+        kind: "human",
+        id: "alice",
+        name: "Alice",
+        color: collaboratorColor("alice"),
+        sectionId: "problem",
+        isSelf: false,
+      },
       { kind: "agent", name: "engram", sectionId: "failure-modes" },
     ]);
 
     state.destroy();
+    receiver.destroy();
+  });
+
+  test("uses the shared neutral color when a person has no id", () => {
+    const receiver = new Awareness(new Y.Doc());
+    receiver.setLocalState({ user: { name: "Former member", color: "#ffffff" } });
+
+    expect(readSpecPresence(receiver)).toMatchObject([
+      { kind: "human", name: "Former member", color: MISSING_COLLABORATOR_COLOR },
+    ]);
+
     receiver.destroy();
   });
 });

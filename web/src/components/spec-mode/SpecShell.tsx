@@ -3,6 +3,7 @@ import type { ReactNode, RefObject, UIEventHandler } from "react";
 import type { SpecCheckpointSummary } from "@/hooks/useSpecRead";
 import { ConversationRail } from "./ConversationRail";
 import { SectionList } from "./SectionList";
+import type { SpecPresenceEntry } from "./section-presence";
 import type { SpecSurface } from "./spec-surface";
 import { SpecSpine } from "./SpecSpine";
 import { SpecTopBar } from "./SpecTopBar";
@@ -15,6 +16,7 @@ export function SpecShell({
   checkpoints,
   viewerIsOwner,
   surface,
+  presence = [],
   onSelectSection = () => undefined,
   documentPaneRef,
   onDocumentScroll,
@@ -28,6 +30,7 @@ export function SpecShell({
   checkpoints: SpecCheckpointSummary[];
   viewerIsOwner: boolean;
   surface?: SpecSurface;
+  presence?: SpecPresenceEntry[];
   onSelectSection?: (sectionId: string) => void;
   documentPaneRef?: RefObject<HTMLElement | null>;
   onDocumentScroll?: UIEventHandler<HTMLElement>;
@@ -56,11 +59,15 @@ export function SpecShell({
           templateName={templateName}
           checkpoints={checkpoints}
           viewerIsOwner={viewerIsOwner}
+          presence={presence}
+          sections={surface?.sections ?? []}
           showProvenance={showProvenance}
           onShowProvenanceChange={onShowProvenanceChange}
         />
         <aside className="spec-mode-sections" aria-label="Spec sections">
-          {surface ? <SectionList surface={surface} onSelectSection={onSelectSection} /> : null}
+          {surface ? (
+            <SectionList surface={surface} presence={presence} onSelectSection={onSelectSection} />
+          ) : null}
         </aside>
         <section
           ref={documentPaneRef}

@@ -10,7 +10,7 @@ import type { SpecRail } from "@/hooks/useSpecRead";
 import { ConnectedSpecCanvas } from "./SpecCanvas";
 import { createSpecProvider } from "./SpecConnection";
 
-const USER = { name: "Grace", color: "#2563eb" };
+const USER = { id: "grace", name: "Grace", color: "#2563eb" };
 const TEMPLATE: SpecTemplate = {
   sections: [{ id: "context", key: "context", title: "Context" }],
 };
