@@ -3,7 +3,8 @@ import { describe, expect, test } from "vitest";
 import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from "y-protocols/awareness";
 import * as Y from "yjs";
 
-import { SpecPresence, readSpecPresence } from "./SpecPresence";
+import { readSpecPresence } from "@/components/spec-mode/section-presence";
+import { SpecPresence } from "./SpecPresence";
 
 describe("spec presence", () => {
   test("renders three participants, including section-level agent presence", () => {

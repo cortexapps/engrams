@@ -6,4 +6,4 @@ export {
   type SpecSelectionActions,
 } from "./SpecSelectionActions";
 export { TrackedEditTranscriptChip } from "./TrackedEditTranscriptChip";
-export { SpecPresence, readSpecPresence } from "./SpecPresence";
+export { SpecPresence } from "./SpecPresence";
