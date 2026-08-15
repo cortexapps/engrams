@@ -23,13 +23,21 @@ describe("GET /api/v1/auth-config", () => {
     setIapAudiences([]);
     const res = await authConfigRoute.request("/api/v1/auth-config");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ passwordAuth: true, signup: true });
+    expect(await res.json()).toEqual({
+      passwordAuth: true,
+      signup: true,
+      previewBaseDomain: "lvh.me:8787",
+    });
   });
 
   test("IAP on → password auth + signup disabled", async () => {
     setIapAudiences(["/projects/123/apps/test"]);
     const res = await authConfigRoute.request("/api/v1/auth-config");
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ passwordAuth: false, signup: false });
+    expect(await res.json()).toEqual({
+      passwordAuth: false,
+      signup: false,
+      previewBaseDomain: "lvh.me:8787",
+    });
   });
 });

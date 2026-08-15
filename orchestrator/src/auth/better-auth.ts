@@ -136,7 +136,34 @@ export const auth = betterAuth({
   // The browser reaches this through the vite proxy with
   // Origin: http://localhost:5173 — without trustedOrigins, better-auth
   // 403s every non-GET auth route (CSRF protection).
+  //
+  // ADR 0118: session-app origins are deliberately NOT here. A guest page is
+  // attacker-authored (any org member controls their own app), and because the
+  // session cookie is now scoped to the shared parent domain, a request from a
+  // guest page to the main host is SAME-SITE — so the visitor's cookie rides
+  // along whatever SameSite says, and this CSRF origin check is the only
+  // remaining guard on state-changing auth routes. Trusting `*.<preview>` would
+  // waive it for exactly the origins that should never have it.
+  //
+  // Nothing needs it: the preview edge authenticates server-side from the
+  // Cookie header (routes/preview-proxy.ts), never through a browser call to
+  // the auth API.
   trustedOrigins: config.trustedOrigins,
+  // ADR 0118: scope the session cookie to the domain the main host and the
+  // preview base domain share, so ONE login covers the main host and every app
+  // URL and a sibling fetch carries the cookie with no redirect. Omitted
+  // entirely when unset, which leaves the cookie host-only — the behaviour
+  // every deployment had before session apps.
+  ...(config.sessionCookieDomain
+    ? {
+        advanced: {
+          crossSubDomainCookies: {
+            enabled: true,
+            domain: config.sessionCookieDomain,
+          },
+        },
+      }
+    : {}),
   // Lazy Proxy: defers getDb() until better-auth first accesses the db
   // object (i.e., on the first actual auth request). This lets the module
   // be imported in `bun test` without ORCHESTRATOR_DATABASE_URL set — the

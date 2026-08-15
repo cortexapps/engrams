@@ -135,6 +135,21 @@ export interface Config {
    */
   previewBaseDomain: string;
   /**
+   * ORCHESTRATOR_SESSION_COOKIE_DOMAIN — the domain the session cookie is
+   * scoped to (ADR 0118). Empty (the default) leaves the cookie HOST-ONLY,
+   * which is the behaviour every deployment had before session apps.
+   *
+   * Set it to the domain the main host and the preview base domain SHARE — for
+   * `app.example.com` + `*.preview.example.com`, that is `.example.com`. One
+   * login then covers the main host and every app URL, and a sibling `fetch()`
+   * carries the cookie with no redirect because the two origins are same-site.
+   *
+   * It is explicit rather than derived from the two hostnames: deriving it
+   * means guessing where the registrable domain boundary is, and guessing too
+   * wide (`.com`) would broadcast the session cookie to the whole TLD.
+   */
+  sessionCookieDomain: string;
+  /**
    * ORCHESTRATOR_ADMIN_EMAILS — comma-separated bootstrap-admin allowlist.
    * Restores the pre-ADR-0051 `auth.bootstrapAdmins` Helm value: matching
    * emails are created with role 'admin' (any JIT path — IAP bridge, OIDC,
@@ -300,6 +315,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // OPTIONAL: preview base domain for live-host port URLs (ADR 0064). Dev
   // default `lvh.me:<port>` resolves `*.lvh.me` → 127.0.0.1 → this orchestrator.
   const previewBaseDomain = optional("ORCHESTRATOR_PREVIEW_BASE_DOMAIN", `lvh.me:${port}`);
+  // ADR 0118: empty = host-only, i.e. exactly the pre-session-apps behaviour.
+  const sessionCookieDomain = optional("ORCHESTRATOR_SESSION_COOKIE_DOMAIN", "");
 
   // OPTIONAL: deployment identity for OIDC claims (ADR 0109). Defaults to the
   // public hostname; a malformed base URL falls back to the raw string so the
@@ -379,6 +396,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     iapJwksUrl,
     oidc,
     previewBaseDomain,
+    sessionCookieDomain,
     adminEmails,
     sweepDisabled,
     sweepIntervalMs,

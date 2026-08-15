@@ -12,11 +12,14 @@
  * the bidi relay stream — so the guest's HTTP/1.1 framing rides the tunnel
  * unchanged.
  *
- * Auth: the host label resolves to a `session_app` row; access requires the
- * authenticated principal to own the session or be an admin. IAP still fronts
- * everything on a deployment that runs it, so this is the second gate. ADR 0118
- * P2 moves the wall here entirely (and adds org visibility, the login redirect,
- * the unauthenticated `OPTIONS` path, and sibling-origin enforcement).
+ * Auth (ADR 0118): this handler IS the wall for the preview domain. Four rules,
+ * each an invariant rather than a policy knob — see the middleware at the foot
+ * of this file, where each is stated with why it cannot be relaxed:
+ *
+ *   1. Every Host under the preview base domain terminates here. Never next().
+ *   2. `OPTIONS` skips authentication (a browser sends no cookie on a preflight).
+ *   3. A credentialed cross-origin request must come from a sibling app.
+ *   4. An unauthenticated navigation redirects to login; anything else gets 401.
  *
  * WebSocket upgrades are handled separately (P2b-ws) — Bun's node:http `upgrade`
  * handler can't write to the raw socket (see server.ts), so raw WS passthrough
@@ -37,7 +40,7 @@ import {
 } from "../gen/engram/app/v1/session_pb.ts";
 import { portRelay as defaultPortRelay } from "../control-plane/client.ts";
 import { config } from "../config.ts";
-import { isValidHostLabel } from "../apps/hostname.ts";
+import { isValidHostLabel, schemeFor } from "../apps/hostname.ts";
 import {
   makeSessionAppStore,
   type SessionAppRow,
@@ -62,6 +65,8 @@ export interface PreviewProxyDeps {
   portRelay?: PortRelayClient;
   getSession?: GetSession;
   previewBaseDomain?: string;
+  /** Where an unauthenticated navigation is sent (default: the main host's /login). */
+  loginUrl?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -97,35 +102,183 @@ export type PreviewAuth =
   | { ok: false; status: 401 | 403 | 404 };
 
 /**
- * Resolve + authorize a preview request.
- *   404 unknown host label · 401 no session · 403 not owner/admin.
+ * True if `host` is under the preview base domain at all — apex, nested label,
+ * junk label, or a real app. This is the TERMINATION test: everything it
+ * matches must be answered by the preview handler, never passed to the app.
  *
- * ADR 0118 retired ADR 0064's unauthenticated `shareToken` capability: the
- * requirement is that nobody reaches an app without passing the login wall, and
- * a token in a URL is exactly a way around it. It also retired `expiresAt`,
- * which was enforced here but never written by anything.
- *
- * The `visibility = "org"` widening (any authenticated principal, so a teammate
- * can open your preview) lands with the rest of the wall move in P2. Until then
- * this stays at owner-or-admin, which is the stricter of the two.
+ * `previewHostLabel` is the narrower question ("does it name a routable app?")
+ * and returns null for the cases this still matches.
  */
-export async function authorizePreview(
+export function isUnderPreviewDomain(
+  hostHeader: string | undefined,
+  baseDomain: string,
+): boolean {
+  if (!hostHeader || !baseDomain) return false;
+  const host = hostHeader.toLowerCase();
+  const base = baseDomain.toLowerCase();
+  return host === base || host.endsWith("." + base);
+}
+
+/**
+ * Authorize a resolved app.
+ *   401 no session · 403 authenticated but not permitted.
+ *
+ * `visibility = "org"` (the default) admits any authenticated principal, so a
+ * teammate can open a preview by URL. `private` narrows it to the owner and
+ * admins. Either way the caller is past the login wall, which is the property
+ * that matters: ADR 0118 retired ADR 0064's unauthenticated `shareToken`
+ * because a capability in a URL is precisely a way around that wall.
+ */
+export async function authorizeApp(
   opts: {
-    hostLabel: string;
+    row: SessionAppRow;
     headers: Headers;
-    store: SessionAppStore;
     getSession: GetSession;
   },
 ): Promise<PreviewAuth> {
-  const row = await opts.store.getByHostLabel(opts.hostLabel);
-  if (!row) return { ok: false, status: 404 };
-
   const session = await opts.getSession(opts.headers);
   if (!session) return { ok: false, status: 401 };
-  const isOwner = session.user.id === row.ownerUserId;
+  if (opts.row.visibility === "org") return { ok: true, row: opts.row };
+  const isOwner = session.user.id === opts.row.ownerUserId;
   const isAdmin = (session.user.role ?? "user") === "admin";
   if (!isOwner && !isAdmin) return { ok: false, status: 403 };
-  return { ok: true, row };
+  return { ok: true, row: opts.row };
+}
+
+/**
+ * Is `origin` the target app itself, or another app of the SAME session?
+ *
+ * Anything else — another session's app, or a foreign site — is refused before
+ * the request reaches the guest. Note this deliberately does not consult the
+ * principal: two apps of one session share a trust domain, two sessions do not,
+ * even when one user owns both.
+ */
+export async function isSiblingOrigin(
+  origin: string,
+  target: SessionAppRow,
+  baseDomain: string,
+  store: SessionAppStore,
+): Promise<boolean> {
+  let originHost: string;
+  try {
+    originHost = new URL(origin).host;
+  } catch {
+    return false; // unparseable Origin (including the literal "null")
+  }
+  const label = previewHostLabel(originHost, baseDomain);
+  if (!label) return false; // not a preview origin at all
+  if (label === target.hostLabel) return true; // same app
+  const peer = await store.getByHostLabel(label);
+  return peer != null && peer.sessionId === target.sessionId;
+}
+
+/** The main host's login page, used to send an unauthenticated browser to log in. */
+function defaultLoginUrl(): string {
+  return `${config.baseUrl.replace(/\/$/, "")}/login`;
+}
+
+/**
+ * Refuse an unauthenticated request in the shape its caller can act on.
+ *
+ * A browser NAVIGATION gets a 302 to the main host's login page, which is still
+ * IAP-gated, so the human is challenged, the bridge mints the now
+ * parent-domain-scoped cookie, and the page returns them here.
+ *
+ * Anything else gets a 401. Redirecting an XHR into an HTML login page turns a
+ * clean "you are not logged in" into an opaque CORS or parse failure at the
+ * caller, so the distinction is load-bearing, not cosmetic.
+ */
+function unauthenticatedResponse(c: Context, loginUrl: string, baseDomain: string): Response {
+  const accept = c.req.header("accept") ?? "";
+  const mode = c.req.header("sec-fetch-mode");
+  const isNavigation =
+    (mode === "navigate" || mode === undefined) && accept.includes("text/html");
+  if (!isNavigation) return c.text("unauthenticated", 401);
+  const next = new URL(c.req.url);
+  // `c.req.url`'s scheme is whatever the SOCKET carried, which is plain http
+  // behind a TLS-terminating load balancer — the production topology. Sending
+  // the user back to an `http://` app URL after login is an insecure hop, and
+  // fails outright where the LB serves only 443. Use the address the user
+  // actually browsed: X-Forwarded-Proto when the edge sets it, else the scheme
+  // this deployment's preview domain is served over.
+  next.protocol = c.req.header("x-forwarded-proto") ?? schemeFor(baseDomain);
+  return c.redirect(`${loginUrl}?next=${encodeURIComponent(next.toString())}`, 302);
+}
+
+// ---------------------------------------------------------------------------
+// The guest trust boundary
+// ---------------------------------------------------------------------------
+
+/**
+ * Cookies belonging to the orchestrator's own auth, which must never reach a
+ * guest. Matched by substring so the `__Secure-`/`__Host-` prefixed variants
+ * better-auth uses over HTTPS are covered too.
+ */
+const ORCHESTRATOR_COOKIE_MARKER = "better-auth";
+
+/** Request headers that carry a credential for the ORCHESTRATOR, not the app. */
+const CREDENTIAL_HEADERS = [
+  "authorization",
+  "x-api-key",
+  "x-goog-iap-jwt-assertion",
+] as const;
+
+/**
+ * Strip the orchestrator's own credentials from a request before it reaches the
+ * guest.
+ *
+ * The guest runs agent-authored code. Once the session cookie is scoped to the
+ * shared parent domain (so one login covers every app URL), the browser attaches
+ * it to every preview request — and forwarding it verbatim would hand a
+ * visitor's session token to whoever wrote that app, who could replay it
+ * against the main host as that visitor. The cookie has to stop at this
+ * boundary: it authenticates the caller TO the orchestrator and means nothing
+ * to the app.
+ *
+ * Only the orchestrator's own cookies are removed. An app's own cookies pass
+ * through untouched, which is what makes a session's apps work at all.
+ */
+export function stripOrchestratorCredentials(headers: Headers): Headers {
+  const out = new Headers(headers);
+  for (const name of CREDENTIAL_HEADERS) out.delete(name);
+  const cookie = out.get("cookie");
+  if (cookie != null) {
+    const kept = cookie
+      .split(";")
+      .map((c) => c.trim())
+      .filter((c) => c !== "" && !c.split("=", 1)[0]!.includes(ORCHESTRATOR_COOKIE_MARKER));
+    if (kept.length > 0) out.set("cookie", kept.join("; "));
+    else out.delete("cookie");
+  }
+  return out;
+}
+
+/**
+ * Neutralize a guest's `Set-Cookie` at the same boundary.
+ *
+ * Two things a guest must not be able to do:
+ *   1. set a cookie named like the orchestrator's session cookie — that is
+ *      session fixation, or a denial of the visitor's real session;
+ *   2. set ANY cookie on the shared parent domain — its app lives at exactly
+ *      one hostname, so a `Domain=` attribute is never legitimate and would
+ *      let it write cookies readable by every other app and by the main host.
+ *
+ * So orchestrator-named cookies are dropped and `Domain=` is removed from the
+ * rest, making every guest cookie host-only. A host-only cookie is what an app
+ * that sets its own session cookie already emits, so this changes nothing for
+ * a well-behaved guest.
+ */
+export function sanitizeGuestSetCookie(values: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const value of values) {
+    const name = value.split("=", 1)[0]!.trim();
+    if (name.includes(ORCHESTRATOR_COOKIE_MARKER)) continue;
+    const attrs = value
+      .split(";")
+      .filter((part, i) => i === 0 || part.trim().split("=", 1)[0]!.toLowerCase() !== "domain");
+    out.push(attrs.join(";"));
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +395,10 @@ export function proxyHttp(
   port: number,
   c: Context,
   targetPath?: string,
+  /** ADR 0118: `dropBody` is used by the preflight path, which is the one
+   *  request shape that reaches the guest WITHOUT a session — forwarding a body
+   *  there would turn it into a general-purpose unauthenticated request path. */
+  opts?: { dropBody?: boolean },
 ): Promise<Response> {
   const signal = c.req.raw.signal;
 
@@ -277,17 +434,21 @@ export function proxyHttp(
         return url.pathname + url.search;
       })();
       // Rewrite Host so guest apps that self-reference localhost keep working.
-      const headers = new Headers(c.req.raw.headers);
+      // Strip the orchestrator's own credentials FIRST: the guest is untrusted
+      // code and the parent-domain session cookie would otherwise be handed
+      // straight to it.
+      const headers = stripOrchestratorCredentials(c.req.raw.headers);
       headers.set("host", `localhost:${port}`);
 
+      const body = opts?.dropBody ? null : c.req.raw.body;
       const init: FetchInit = {
         method: c.req.method,
         headers,
-        body: c.req.raw.body,
+        body,
         redirect: "manual",
         signal,
       };
-      if (c.req.raw.body) init.duplex = "half";
+      if (body) init.duplex = "half";
 
       fetch(`http://127.0.0.1:${localPort}${path}`, init)
         .then((upstream) => {
@@ -301,6 +462,11 @@ export function proxyHttp(
           const headers = new Headers(upstream.headers);
           headers.delete("content-encoding");
           headers.delete("content-length");
+          // A guest must not be able to overwrite the visitor's session cookie
+          // or write one on the shared parent domain.
+          const cookies = sanitizeGuestSetCookie(upstream.headers.getSetCookie());
+          headers.delete("set-cookie");
+          for (const cookie of cookies) headers.append("set-cookie", cookie);
           resolve(
             new Response(upstream.body, {
               status: upstream.status,
@@ -335,12 +501,13 @@ function previewErrorResponse(err: unknown): Response {
 // ---------------------------------------------------------------------------
 
 /**
- * Hono middleware: when the request Host is a preview host, resolve + authorize
- * the slug and proxy to the guest port; otherwise pass through to the app.
+ * Hono middleware: a request whose Host is under the preview base domain is
+ * answered HERE — authorized and proxied to the guest port, or refused.
  * Mount FIRST (before the normal routes) in index.ts.
  */
 export function makePreviewProxyMiddleware(deps?: PreviewProxyDeps): MiddlewareHandler {
   const baseDomain = deps?.previewBaseDomain ?? config.previewBaseDomain;
+  const loginUrl = deps?.loginUrl ?? defaultLoginUrl();
   const relay: PortRelayClient =
     (deps?.portRelay as PortRelayClient | undefined) ??
     (defaultPortRelay as unknown as PortRelayClient);
@@ -355,25 +522,69 @@ export function makePreviewProxyMiddleware(deps?: PreviewProxyDeps): MiddlewareH
     });
 
   return async (c, next) => {
-    const slug = previewHostLabel(c.req.header("host"), baseDomain);
-    if (!slug) return next();
+    const host = c.req.header("host");
+    // Not addressed to the preview domain at all → the normal app.
+    if (!isUnderPreviewDomain(host, baseDomain)) return next();
 
-    const authz = await authorizePreview({
-      hostLabel: slug,
+    const label = previewHostLabel(host, baseDomain);
+
+    // INVARIANT — preview hosts terminate (ADR 0118). A Host under the preview
+    // base domain is ALWAYS answered here, even when it names no app: the apex,
+    // a nested label, a junk label. Falling through would hand an unauthenticated
+    // request to the whole orchestrator API, because this domain is deliberately
+    // exempt from the IAP bridge (auth/iap-bridge.ts `isPreviewHost`). IAP hides
+    // that today; it will not once the wall moves here.
+    if (!label) return c.text("not found", 404);
+
+    const row = await getStore().getByHostLabel(label);
+    if (!row) return c.text("not found", 404);
+
+    // INVARIANT — a genuine CORS preflight skips the wall (ADR 0118). A browser
+    // NEVER sends cookies on a preflight, so authenticating it would reject
+    // every cross-app call and no CORS config in the app could repair it.
+    //
+    // The carve-out is narrowed to what a preflight actually is, because
+    // `proxyHttp` opens a real relay tunnel and those are capped per session
+    // (ADR 0066): an unauthenticated `OPTIONS` that skipped every check would
+    // be an anonymous tunnel-open primitive — a flood would exhaust a session's
+    // cap and 503 its legitimate users, and would reach even a `private` app.
+    // So it must carry the preflight headers AND come from a sibling app of the
+    // same session, which is the only origin that can legitimately preflight
+    // this one. Anything else falls through to the wall below.
+    const preflightOrigin = c.req.header("origin");
+    const isPreflight =
+      c.req.method === "OPTIONS" &&
+      preflightOrigin != null &&
+      c.req.header("access-control-request-method") != null;
+    if (isPreflight) {
+      if (!(await isSiblingOrigin(preflightOrigin, row, baseDomain, getStore()))) {
+        return c.text("cross-origin preflight from a non-sibling app", 403);
+      }
+      // No body reaches the guest: a preflight has none, and forwarding one
+      // would make this a general-purpose unauthenticated request path.
+      return proxyHttp(relay, row.sessionId, row.port, c, undefined, { dropBody: true });
+    }
+
+    // INVARIANT — a credentialed cross-origin request must come from a sibling
+    // (ADR 0118). The parent-domain cookie is what makes one login cover every
+    // app; it is also what would let ANY preview origin issue credentialed
+    // requests to any other. CORS does not contain that — it blocks reading a
+    // response, not sending the request — so the refusal has to happen here.
+    const origin = c.req.header("origin");
+    if (origin && !(await isSiblingOrigin(origin, row, baseDomain, getStore()))) {
+      return c.text("cross-origin request from a non-sibling app", 403);
+    }
+
+    const authz = await authorizeApp({
+      row,
       headers: c.req.raw.headers,
-      store: getStore(),
       getSession: resolveSession,
     });
     if (!authz.ok) {
-      const msg =
-        authz.status === 401
-          ? "unauthenticated"
-          : authz.status === 403
-            ? "forbidden"
-            : "not found";
-      return c.text(msg, authz.status);
+      if (authz.status === 401) return unauthenticatedResponse(c, loginUrl, baseDomain);
+      return c.text(authz.status === 403 ? "forbidden" : "not found", authz.status);
     }
 
-    return proxyHttp(relay, authz.row.sessionId, authz.row.port, c);
+    return proxyHttp(relay, row.sessionId, row.port, c);
   };
 }

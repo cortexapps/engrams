@@ -400,8 +400,8 @@ orchestrator:
   # public https URL in any OIDC deploy, or the IdP redirect lands nowhere.
   publicUrl: ""
 
-  # ADR 0064 — live-host port previews. The wildcard base domain under which a
-  # session's exposed guest port is served at `<slug>.<baseDomain>`
+  # ADR 0118 — session apps. The wildcard base domain under which a session's
+  # apps are served at `<app name>-<session slug>.<baseDomain>`
   # (ORCHESTRATOR_PREVIEW_BASE_DOMAIN). Empty ⇒ the env var is omitted and the
   # orchestrator uses its dev default (`lvh.me:<port>`, which only resolves to
   # 127.0.0.1 locally), so the feature is inert in a stock deploy. To enable in
@@ -413,11 +413,28 @@ orchestrator:
   #     the session's guest port;
   #   - provision a wildcard TLS cert for `*.<baseDomain>` + a wildcard DNS
   #     record pointing at the web Ingress IP;
-  #   - keep it behind your auth wall (e.g. the IAP BackendConfig). The
-  #     orchestrator additionally enforces a per-exposure owner/admin/share-token
-  #     check, so a leaked slug alone grants nothing.
+  #   - set sessionCookieDomain below, and do NOT put a separate identity-aware
+  #     proxy in front of this host. The orchestrator IS the wall for it: it
+  #     authenticates every request and terminates them all. An external proxy
+  #     additionally breaks cross-app browser calls, because a browser sends no
+  #     cookie on a CORS preflight, so the proxy rejects the OPTIONS before the
+  #     app ever sees it.
   preview:
     baseDomain: ""
+
+  # ADR 0118 — the domain the session cookie is scoped to
+  # (ORCHESTRATOR_SESSION_COOKIE_DOMAIN). Empty ⇒ the cookie stays HOST-ONLY,
+  # which is the behaviour every deployment had before session apps.
+  #
+  # Set it, together with preview.baseDomain, to the domain the main host and
+  # the preview base domain SHARE — for "app.example.com" plus
+  # "*.preview.example.com", that is ".example.com". One login then covers the
+  # main host and every app URL.
+  #
+  # It must be no wider than that shared domain. A value like ".com" would
+  # broadcast the session cookie to every site under the TLD, which is why this
+  # is set explicitly rather than derived from the two hostnames.
+  sessionCookieDomain: ""
 
   # TRUSTED_ORIGINS — comma-joined here from this list; better-auth CORS /
   # CSRF origin allowlist (the browser origins that may call the API).

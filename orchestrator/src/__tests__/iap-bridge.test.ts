@@ -42,7 +42,7 @@ import type { AddressInfo } from "net";
 import { generateKeyPair, SignJWT, exportJWK } from "jose";
 import { Hono } from "hono";
 import { buildServer } from "../server.ts";
-import { iapBridge, _resetJwksCache } from "../auth/iap-bridge.ts";
+import { iapBridge, isPreviewHost, _resetJwksCache } from "../auth/iap-bridge.ts";
 import { checkDb } from "../db/client.ts";
 import authRoute from "../routes/auth.ts";
 import health from "../routes/health.ts";
@@ -898,4 +898,38 @@ describe("IAP bridge — existing-cookie fast path", () => {
       expect(res2.status).not.toBe(401);
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// ADR 0118: the preview-host exemption
+// ---------------------------------------------------------------------------
+
+describe("isPreviewHost (ADR 0118)", () => {
+  const BASE = "preview.example.com";
+
+  test("matches exactly one label under the preview base domain", () => {
+    expect(isPreviewHost("web-tidy-swift-otters.preview.example.com", BASE)).toBe(true);
+    expect(isPreviewHost("WEB-X.PREVIEW.EXAMPLE.COM", BASE)).toBe(true); // case-insensitive
+  });
+
+  test("does NOT match the apex or a nested label", () => {
+    // The exemption must cover only names the preview handler claims. The apex
+    // is not one, so letting it through would exempt a host nothing answers.
+    expect(isPreviewHost(BASE, BASE)).toBe(false);
+    expect(isPreviewHost("a.b.preview.example.com", BASE)).toBe(false);
+  });
+
+  test("does NOT match the main host or a suffix near-miss", () => {
+    // The whole point of keying on host rather than path: the main host, which
+    // is the one surface IAP must keep fronting, can never be exempted.
+    expect(isPreviewHost("app.example.com", BASE)).toBe(false);
+    expect(isPreviewHost("evilpreview.example.com", BASE)).toBe(false);
+    expect(isPreviewHost("preview.example.com.evil.test", BASE)).toBe(false);
+  });
+
+  test("is inert when no preview base domain is configured", () => {
+    // A deployment that runs no preview edge behaves exactly as before.
+    expect(isPreviewHost("anything.example.com", "")).toBe(false);
+    expect(isPreviewHost(undefined, BASE)).toBe(false);
+  });
 });

@@ -31,7 +31,9 @@ import { ConnectError, Code } from "@connectrpc/connect";
 import { config } from "../config.ts";
 import { portRelay as defaultPortRelay } from "../control-plane/client.ts";
 import {
-  authorizePreview,
+  authorizeApp,
+  isSiblingOrigin,
+  isUnderPreviewDomain,
   previewHostLabel,
   tunnelSocket,
   type PortRelayClient,
@@ -101,8 +103,8 @@ export function makePreviewUpgradeHandler(
   });
 
   return async function tryPreviewUpgrade(req, socket, head) {
-    const slug = previewHostLabel(req.headers.host, baseDomain);
-    if (!slug) return false; // not a preview host — let the shell handler run
+    // Not the preview domain at all — let the shell/IDE handlers run.
+    if (!isUnderPreviewDomain(req.headers.host, baseDomain)) return false;
 
     const url = new URL(req.url ?? "/", "http://localhost");
     const headers = new Headers();
@@ -111,21 +113,35 @@ export function makePreviewUpgradeHandler(
       if (v) headers.set(key, Array.isArray(v) ? v[0]! : v);
     }
 
-    const authz = await authorizePreview({
-      hostLabel: slug,
-      headers,
-      store: getStore(),
-      getSession: resolveSession,
-    });
-
-    if (!authz.ok) {
-      // Reject Bun-safely: complete the upgrade, then close with 4000+status so
-      // the browser can read the reason (mirrors server.ts's shell rejection).
+    /** Reject Bun-safely: complete the upgrade, then close with 4000+status so
+     *  the browser can read the reason (mirrors server.ts's shell rejection). */
+    const reject = (status: number): true => {
       wss.handleUpgrade(req, socket, head, (ws) =>
-        ws.close(4000 + authz.status, `preview ${authz.status}`),
+        ws.close(4000 + status, `preview ${status}`),
       );
       return true;
+    };
+
+    // INVARIANT — preview hosts terminate (ADR 0118). Claim the upgrade even
+    // when the Host names no app: returning false would hand it to the shell
+    // handler, which routes by PATH and would happily serve a session shell on
+    // a hostname the preview domain is supposed to own.
+    const slug = previewHostLabel(req.headers.host, baseDomain);
+    if (!slug) return reject(404);
+
+    const row = await getStore().getByHostLabel(slug);
+    if (!row) return reject(404);
+
+    // A WS handshake is not preflighted, so there is no OPTIONS carve-out here
+    // — but Origin IS sent, and it is the only thing standing between one
+    // session's page and another session's socket.
+    const origin = req.headers.origin;
+    if (origin && !(await isSiblingOrigin(origin, row, baseDomain, getStore()))) {
+      return reject(403);
     }
+
+    const authz = await authorizeApp({ row, headers, getSession: resolveSession });
+    if (!authz.ok) return reject(authz.status);
 
     const subprotocols = (req.headers["sec-websocket-protocol"] ?? "")
       .split(",")

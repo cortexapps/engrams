@@ -178,6 +178,32 @@ export function isIapPublicPath(url: string, method = "GET"): boolean {
     (method === "POST" && HOOK_PATH_RE.test(path));
 }
 
+/**
+ * ADR 0118: is this request addressed to a session-app preview host?
+ *
+ * Preview hosts are exempt from this bridge because the preview handler is
+ * their wall — it authenticates every request itself, and it TERMINATES, so a
+ * request that reaches it never falls through to the rest of the app.
+ *
+ * The exemption is deliberately keyed on HOST, not path. A path exemption would
+ * open that path on the MAIN host too, which is the one surface IAP must keep
+ * fronting. A host exemption cannot: it only ever matches names under the
+ * preview base domain, and every one of those is answered by the preview
+ * handler.
+ *
+ * Inert when `previewBaseDomain` is unset, so a deployment that runs no preview
+ * edge behaves exactly as before.
+ */
+export function isPreviewHost(host: string | undefined, baseDomain: string): boolean {
+  if (!host || !baseDomain) return false;
+  const h = host.toLowerCase();
+  const suffix = "." + baseDomain.toLowerCase();
+  if (!h.endsWith(suffix)) return false;
+  // A single label only — `a.b.<base>` is not a preview host, and letting it
+  // through would exempt a name the preview handler does not claim.
+  return !h.slice(0, -suffix.length).includes(".");
+}
+
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
@@ -348,6 +374,12 @@ async function buildSessionCookie(token: string): Promise<SessionCookie> {
 
   const parts: string[] = [`${cookieName}=${signedValue}`];
   if (attrs.path) parts.push(`Path=${attrs.path}`);
+  // ADR 0118: better-auth's crossSubDomainCookies puts the shared domain on
+  // `attrs.domain`. This builder mirrors setSignedCookie by hand, so a missing
+  // `Domain=` here would silently leave the JIT-minted cookie host-only — the
+  // session would work on the main host and be absent on every app URL, with no
+  // error anywhere. Emit it whenever better-auth configured one.
+  if (attrs.domain) parts.push(`Domain=${attrs.domain}`);
   if (attrs.httpOnly) parts.push("HttpOnly");
   if (attrs.secure) parts.push("Secure");
   if (attrs.sameSite) parts.push(`SameSite=${attrs.sameSite}`);
@@ -469,6 +501,14 @@ export async function iapBridge(
   // allowlist through before any IAP logic. Checked even when IAP is inert so
   // the path is identical in dev and prod. See PUBLIC_PATHS for the rationale.
   if (isIapPublicPath(req.url ?? "/", req.method ?? "GET")) {
+    next();
+    return;
+  }
+
+  // ADR 0118 PREVIEW-HOST EXEMPTION: a session-app host authenticates itself in
+  // the preview handler and never falls through, so the bridge must not 401 it
+  // first. Host-keyed, so the main host is untouched. See `isPreviewHost`.
+  if (isPreviewHost(req.headers.host, config.previewBaseDomain)) {
     next();
     return;
   }

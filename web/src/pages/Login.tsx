@@ -15,6 +15,7 @@
 import { useEffect, useState } from "react";
 import { authClient } from "@/lib/auth-client";
 import { API_BASE } from "@/lib/base";
+import { safeNextUrl, DEFAULT_AFTER_LOGIN } from "@/lib/next-url";
 import { EngramMark } from "@/components/EngramMark";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -24,6 +25,8 @@ import { Label } from "@/components/ui/label";
 interface AuthConfig {
   passwordAuth: boolean;
   signup: boolean;
+  /** ADR 0118: needed to validate a `?next=` pointing at a session app. */
+  previewBaseDomain?: string;
 }
 
 export function Login() {
@@ -57,6 +60,25 @@ export function Login() {
     };
   }, []);
 
+  // ADR 0118: behind IAP the bridge has already minted a session by the time
+  // this page renders, so a `?next=` arrival is a round trip that is already
+  // complete — send them on rather than showing an SSO notice they cannot act
+  // on. `authConfig` gates it so the destination is validated against the live
+  // preview domain, not a guess.
+  useEffect(() => {
+    if (!authConfig) return;
+    const next = safeNextUrl(window.location.search, authConfig.previewBaseDomain);
+    if (next === DEFAULT_AFTER_LOGIN) return;
+    let cancelled = false;
+    void (async () => {
+      const { data } = await authClient.getSession();
+      if (!cancelled && data?.session) window.location.assign(next);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [authConfig]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -76,10 +98,11 @@ export function Login() {
           return;
         }
       }
-      // Hard-navigate to / so AuthProvider's session query re-initialises and
-      // the router re-evaluates the appLayoutRoute.beforeLoad guard with the
-      // freshly issued session cookie.
-      window.location.assign("/");
+      // Hard-navigate so AuthProvider's session query re-initialises and the
+      // router re-evaluates the appLayoutRoute.beforeLoad guard with the freshly
+      // issued session cookie. ADR 0118: a validated `?next=` returns the user
+      // to the session app they were trying to open.
+      window.location.assign(safeNextUrl(window.location.search, authConfig?.previewBaseDomain));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Authentication failed");
     } finally {
