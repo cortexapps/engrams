@@ -9,7 +9,7 @@
 
 # Keep this major in step with the web CI lane (.github/workflows/ci.yml)
 # and flake.nix — see the note beside `setup-node` in that workflow.
-FROM node:24-alpine AS builder
+FROM node:26-alpine AS builder
 WORKDIR /src/web
 
 # pnpm v9, matching the CI web lane (pnpm/action-setup version 9 in
