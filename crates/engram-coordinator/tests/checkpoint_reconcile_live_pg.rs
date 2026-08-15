@@ -926,6 +926,7 @@ async fn runtime_spec_round_trips_and_absent_reads_none() {
         vec!["git".into(), "browser".into()],
         Some("claude".into()),
         Some("/workspace".into()),
+        Vec::new(),
     );
     meta.put_session_runtime_spec(session_id, &spec)
         .await
@@ -937,7 +938,12 @@ async fn runtime_spec_round_trips_and_absent_reads_none() {
     );
 
     // Upsert replaces.
-    let spec2 = engram_core::types::runtime_spec::RuntimeSpec::new(vec!["git".into()], None, None);
+    let spec2 = engram_core::types::runtime_spec::RuntimeSpec::new(
+        vec!["git".into()],
+        None,
+        None,
+        Vec::new(),
+    );
     meta.put_session_runtime_spec(session_id, &spec2)
         .await
         .unwrap();

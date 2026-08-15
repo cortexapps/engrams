@@ -117,6 +117,11 @@ export type Db = NodePgDatabase<typeof schema>;
 export interface SessionCreateInput {
   /** ADR 0109: reserved before boot so the authorization snapshot exists. */
   requestedSessionId?: string;
+  /** ADR 0118: the session's apps, already resolved to public hostnames. The
+   *  coordinator persists them and hands them to the host's egress proxy, which
+   *  uses them to splice a same-session app-to-app call back into the sandbox
+   *  instead of sending it out to the internet. */
+  apps?: Array<{ hostname: string; port: number }>;
   imageUri: string;
   mode: string;
   prompt?: string;
@@ -1173,6 +1178,13 @@ export async function createTaskWithSession(
     }
     // Ingress vars first so a profile may deliberately override one by name.
     sessionInput.harnessEnv = { ...ingress, ...remapped };
+    // ADR 0118 P3: the coordinator needs the resolved addresses too, so the
+    // host's egress proxy can recognise one of this guest's own hostnames at
+    // SNI-peek time and splice the call back in.
+    sessionInput.apps = appRows.map((r) => ({
+      hostname: `${r.hostLabel}.${deps.previewBaseDomain ?? config.previewBaseDomain}`,
+      port: r.port,
+    }));
   }
 
   let createdSessionId: string | undefined;

@@ -409,6 +409,20 @@ pub(crate) async fn build_resume_egress_policy(
         crate::session_boot::resolve_inject_entries(state, session_id, policy.as_ref(), image)
             .await;
     let observes = crate::session_boot::build_observe_entries(policy.as_ref());
+    // ADR 0118: replay the session's apps from the persisted RuntimeSpec. A
+    // resume that dropped them would silently kill the app-to-app short circuit
+    // for the rest of the session's life; one that re-minted them would publish
+    // addresses the guest's env — fixed at its first bind — knows nothing about.
+    // A read failure degrades like every other input on this lossy-by-design
+    // path: the session still comes up, without the short circuit.
+    let apps = state
+        .services
+        .meta
+        .get_session_runtime_spec(session_id)
+        .await
+        .unwrap_or_default()
+        .map(|rs| rs.apps)
+        .unwrap_or_default();
     Some(assemble_resume_egress_policy(
         session_id,
         sandbox_id,
@@ -425,6 +439,7 @@ pub(crate) async fn build_resume_egress_policy(
             .as_ref()
             .map(|policy| policy.tunnels.clone())
             .unwrap_or_default(),
+        apps,
     ))
 }
 
@@ -445,6 +460,7 @@ pub(crate) fn assemble_resume_egress_policy(
     observes: Vec<engram_core::types::egress::EgressObserveEntry>,
     guest_services: Vec<GuestService>,
     tunnels: Vec<engram_core::types::integration::SessionTunnel>,
+    apps: Vec<engram_core::types::egress::AppEndpoint>,
 ) -> engram_core::types::egress::SessionEgressPolicy {
     engram_core::types::egress::SessionEgressPolicy {
         session_id,
@@ -465,6 +481,9 @@ pub(crate) fn assemble_resume_egress_policy(
         observes,
         guest_services,
         tunnels,
+        // ADR 0118: the session's own app hostnames, replayed verbatim so the
+        // short circuit survives the move to a new host.
+        apps,
         // ADR 0057: per-secret mode; the proxy substitutes per entry. Vestigial.
         secret_mode: engram_core::types::image::SecretMode::Broker,
     }
@@ -543,6 +562,12 @@ pub struct CreateSessionRequest {
     /// non-gRPC / legacy callers.
     #[serde(default)]
     pub selected_skills: Vec<String>,
+    /// ADR 0118: the session's apps as `(hostname, port)`. The orchestrator
+    /// reserves the hostnames before it calls create, so they arrive here
+    /// already minted; the coordinator only persists them and hands them to the
+    /// host's egress proxy. Empty for non-gRPC / legacy callers.
+    #[serde(default)]
+    pub apps: Vec<engram_core::types::egress::AppEndpoint>,
     /// ADR 0056: profile-granted "provider:action[@resource]" capability
     /// strings, parsed + validated at `prepare_inner` and bound to the session
     /// after its row exists. Empty for non-gRPC / legacy callers.
@@ -807,6 +832,11 @@ async fn boot_prepared(
             // workdir re-derives from the stable image manifest at boot; it is
             // not a re-derivation-drift source, so it is not persisted here.
             None,
+            // ADR 0118: apps are minted BEFORE the session exists and can never
+            // be re-derived — a resume that re-minted them would produce fresh
+            // hostnames while the guest's env, fixed at the first bind, still
+            // pointed at the originals.
+            inputs.apps.clone(),
         ),
         oauth_binding: oauth_credential
             .map(|key| engram_core::types::oauth::SessionOAuthBinding { session_id, key }),
@@ -1031,6 +1061,7 @@ pub(crate) async fn prepare_from_grpc(
             .unwrap_or_else(|| SessionId::from(state.services.entropy.uuid())),
         bundle,
         req.selected_skills.clone(),
+        req.apps.clone(),
         req.capabilities.clone(),
         req.integration_policy.clone(),
         req.selected_harness.clone(),
@@ -1108,8 +1139,9 @@ pub(crate) async fn prepare_from_row(
                 session.id
             ))
         })?
-        .map(|rs| rs.selected_skills)
+        .map(|rs| (rs.selected_skills, rs.apps))
         .unwrap_or_default();
+    let (persisted_skills, persisted_apps) = persisted_skills;
     prepare_inner(
         state,
         HashMap::new(),
@@ -1127,6 +1159,10 @@ pub(crate) async fn prepare_from_row(
         // (the TODO(P1-D) fix) — re-resolved against the current fleet catalog
         // below, since the sha may have rolled while queued.
         persisted_skills,
+        // ADR 0118: the persisted app hostnames, replayed VERBATIM. Re-minting
+        // them here would publish fresh addresses while the guest's env, fixed
+        // at its first bind, still pointed at the originals.
+        persisted_apps,
         // ADR 0056: a queued session's capabilities were already bound to
         // `session_capabilities` at create/enqueue (issue #535 (b): now in
         // the SAME transaction as the row); the re-prepare carries an empty
@@ -1343,6 +1379,8 @@ async fn prepare_inner(
     bundle: std::sync::Arc<crate::boot_bundle::BootBundle>,
     // ADR 0055: profile-selected skill names; resolved to reserved-slot mounts.
     selected_skills: Vec<String>,
+    // ADR 0118: the session's apps, already resolved to public hostnames.
+    apps: Vec<engram_core::types::egress::AppEndpoint>,
     // ADR 0056: profile-granted "provider:action[@resource]" capability strings.
     capabilities: Vec<String>,
     // ADR 0056 (B′): the orchestrator-compiled integration policy, if any.
@@ -1535,6 +1573,10 @@ async fn prepare_inner(
             // ADR 0077 phase 3: the raw skill names, persisted in the
             // RuntimeSpec so a queued re-prepare / resume re-resolves them.
             selected_skills,
+            // ADR 0118: persisted verbatim in the RuntimeSpec — unlike skills
+            // these are never RE-resolved, because the guest's env was built
+            // from these exact hostnames before the first boot.
+            apps,
             capabilities,
             integration_policy,
             selected_harness,
@@ -2452,6 +2494,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
 
         // Real IP, not UNSPECIFIED.
@@ -2485,6 +2528,7 @@ mod tests {
             guest_ip,
             Vec::new(),
             &NetworkPolicy::default(),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),

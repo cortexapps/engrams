@@ -437,6 +437,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         engram_egress_proxy::HostList::from_manifest(&[TEST_HOST.into()], &[]).unwrap();
     registry.register(engram_egress_proxy::SessionState {
         session_id,
+        sandbox_id,
         guest_ip,
         network_allow,
         allow_all: false,
@@ -445,6 +446,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         observes: Vec::new(),
         guest_services: vec![GuestService::new("gcp.gce_metadata")],
         tunnels: Vec::new(),
+        apps: Vec::new(),
     });
 
     // PID-1's env doesn't carry a PATH; child execs need one to

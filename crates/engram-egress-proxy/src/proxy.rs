@@ -70,6 +70,12 @@ pub struct ProxyConfig {
     /// expiry — the pre-WS4 behaviour). The host-agent wires this to its coord
     /// client; tests pass a stub.
     pub inject_refresher: Option<Arc<dyn InjectRefresher>>,
+    /// ADR 0118: opens a byte stream to a port inside a session's guest, so a
+    /// call to one of the session's OWN app hostnames is spliced back into the
+    /// sandbox instead of leaving the host. `None` leaves the short circuit
+    /// inert — the proxy still recognises the hostname but has no way to reach
+    /// the sibling, so it closes the connection rather than pretending.
+    pub guest_port_dialer: Option<crate::app_relay::SharedGuestPortDialer>,
     /// Trusted host implementations for compatibility services and tunnels.
     pub guest_gateway: Arc<crate::guest_gateway::GuestGatewayRegistry>,
     /// Extra trust roots for hermetic full-network tests. Production leaves
@@ -99,6 +105,7 @@ impl ProxyConfig {
                 .expect("dns upstream default parses"),
             observe_sink: None,
             inject_refresher: None,
+            guest_port_dialer: None,
             guest_gateway: Arc::new(crate::guest_gateway::GuestGatewayRegistry::default()),
             upstream_test_roots: None,
         }
@@ -216,6 +223,7 @@ impl Proxy {
             let client_cfg = self.client_cfg.clone();
             let observe_sink = self.cfg.observe_sink.clone();
             let inject_refresher = self.cfg.inject_refresher.clone();
+            let guest_port_dialer = self.cfg.guest_port_dialer.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle(
                     stream,
@@ -226,6 +234,7 @@ impl Proxy {
                     client_cfg,
                     observe_sink,
                     inject_refresher,
+                    guest_port_dialer,
                 )
                 .await
                 {
@@ -255,6 +264,7 @@ async fn handle(
     client_cfg: Arc<rustls::ClientConfig>,
     observe_sink: Option<crate::observe::ObserveSink>,
     inject_refresher: Option<Arc<dyn InjectRefresher>>,
+    guest_port_dialer: Option<crate::app_relay::SharedGuestPortDialer>,
 ) -> Result<(), HandleError> {
     let guest_ip = match peer.ip() {
         IpAddr::V4(v4) => v4,
@@ -299,6 +309,42 @@ async fn handle(
                 sni = %sni,
                 original_dst = ?original_dst,
                 "egress rejected — destination not in any allow_hosts",
+            );
+            Ok(())
+        }
+        // ADR 0118: the SNI names one of this session's own apps. Splice it
+        // back into the sibling's guest port; the call never leaves the host.
+        Decision::OwnApp { port: app_port } => {
+            let Some(dialer) = guest_port_dialer else {
+                // Recognised the hostname but cannot reach the guest. Closing
+                // is the honest answer: sending it upstream instead would
+                // resolve the name off-box and take the whole internet round
+                // trip this arm exists to avoid, and would then be refused by
+                // the login wall anyway.
+                tracing::warn!(
+                    session_id = %session.session_id,
+                    sni = %sni,
+                    "own-app short circuit unavailable — no guest-port dialer installed",
+                );
+                return Ok(());
+            };
+            let (up, down) = crate::app_relay::serve(
+                stream,
+                peeked,
+                session.sandbox_id,
+                app_port,
+                dialer.as_ref(),
+                server_cfg,
+            )
+            .await
+            .map_err(HandleError::OwnApp)?;
+            tracing::debug!(
+                session_id = %session.session_id,
+                sni = %sni,
+                guest_port = app_port,
+                bytes_up = up,
+                bytes_down = down,
+                "own-app short circuit complete",
             );
             Ok(())
         }
@@ -397,6 +443,8 @@ enum HandleError {
     Bypass(crate::bypass::BypassError),
     Intercept(crate::intercept::InterceptError),
     OriginalDest(std::io::Error),
+    /// ADR 0118: the same-session app-to-app short circuit failed.
+    OwnApp(std::io::Error),
 }
 
 impl std::fmt::Display for HandleError {
@@ -407,6 +455,7 @@ impl std::fmt::Display for HandleError {
             Self::Bypass(e) => write!(f, "bypass: {e}"),
             Self::Intercept(e) => write!(f, "intercept: {e}"),
             Self::OriginalDest(e) => write!(f, "SO_ORIGINAL_DST: {e}"),
+            Self::OwnApp(e) => write!(f, "own-app short circuit: {e}"),
         }
     }
 }

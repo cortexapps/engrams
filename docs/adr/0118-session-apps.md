@@ -233,10 +233,18 @@ credential — the two apps are already in one trust domain.
 
 Supporting decisions:
 
-- **The filtering DNS proxy answers a session's own app names** with a synthetic
-  address, checked *before* the `allow_hosts` filter. The redirect captures port 443
-  whatever the destination address is, so the address does not matter. No manifest
-  change and no `allow_host_patterns` entry is needed.
+- **The filtering DNS proxy resolves a session's own app names**, checked *before*
+  the deny-list and the allow-list. A sibling app is not an egress destination — the
+  connection never leaves the host — so a session should not have to ask permission
+  to look up its own address. No manifest change and no `allow_host_patterns` entry
+  is needed.
+
+  The name is then forwarded to the upstream resolver like any other allowed name,
+  rather than answered with a synthetic address. The answer does not matter: the
+  iptables redirect captures port 443 whatever the destination address is, so the
+  SNI short circuit fires either way. Forwarding is simply the path that already
+  exists, and it introduces no new failure mode — a preview base domain that
+  browsers reach necessarily resolves publicly.
 - **The short circuit is checked before the allow list**, next to the secret, inject,
   and observe arms that already take precedence.
 - **The splice is raw**, not an HTTP proxy. WebSocket and h2c pass through unchanged.
@@ -249,6 +257,13 @@ Supporting decisions:
   dev servers, which are callers rather than callees. If that stops being true, the
   fix is to add the app's hostname to that server's allowed-hosts list, not to make
   the splice parse HTTP.
+- **`apps` is the LAST field of `SessionEgressPolicy`.** That type crosses the
+  coord↔host wire as positional bincode (ADR 0013), so field order IS the format:
+  a non-trailing insertion shifts every byte after it and desyncs a peer built
+  from an older tree across a roll. A trailing field is the only wire-safe
+  evolution, and `engram-protocol/tests/wire_golden.rs` pins the bytes to enforce
+  it — the regenerated corpus must be a pure APPEND, with every pre-existing byte
+  unchanged.
 - **A new narrow seam.** `engram-egress-proxy` gets a `GuestPortDialer` trait that
   returns the `TunnelStream` it already defines. `engram-host-agent` implements it
   over `SandboxBackend::open_guest_stream`. `proxy_port::open_vsock_tunnel_at` is

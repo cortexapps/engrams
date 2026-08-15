@@ -205,6 +205,28 @@ message CreateSessionRequest {
   // stores the task-session authorization snapshot. Public HTTP callers cannot
   // select session IDs.
   optional string requested_session_id = 14;
+  // ADR 0118: the session's apps, already resolved to their public hostnames by
+  // the orchestrator (which reserves them BEFORE this call, so the addresses can
+  // be injected into the guest's env). The coordinator persists them on the
+  // runtime spec and hands them to the host's egress proxy, which uses them to
+  // recognise one of this guest's own hostnames at SNI-peek time and splice the
+  // connection back into the sibling's port instead of sending it to the
+  // internet. Empty = no apps.
+  repeated AppEndpoint apps = 15;
+}
+
+// ADR 0118: one app's RESOLVED public address. Distinct from the declaration
+// in profile.proto (`SessionApp{name, port}`): by the time a create request is
+// built the orchestrator has already reserved the hostname, so what travels
+// here is the address, not the request for one.
+//
+// `hostname` is the FULL public name, not just the label, because SNI carries
+// the whole name and comparing the whole string is what makes the match exact —
+// a label-only compare would have to reconstruct the domain and could be fooled
+// by a suffix near-miss.
+message AppEndpoint {
+  string hostname = 1;
+  uint32 port = 2;
 }
 
 message OAuthCredentialBinding {

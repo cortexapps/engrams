@@ -134,6 +134,7 @@ impl Cosim {
                 Vec::new(),
                 None,
                 None,
+                Vec::new(),
             ),
             oauth_binding: None,
         };

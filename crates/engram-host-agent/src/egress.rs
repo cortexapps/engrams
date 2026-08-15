@@ -270,6 +270,9 @@ impl HostEgress {
     /// `None` disables the DNS listener entirely — used by tests that
     /// exercise only the egress registry and would otherwise collide on
     /// the fixed DNS port when the suite runs in parallel.
+    // Cohesive proxy wiring — one call site (main.rs), and threading a struct
+    // through it would only move the same list one level out.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         ca_source: Arc<dyn CaSource>,
         bind_addr: SocketAddr,
@@ -278,6 +281,9 @@ impl HostEgress {
         observe_sink: Option<engram_egress_proxy::ObserveSink>,
         inject_refresher: Option<Arc<dyn InjectRefresher>>,
         guest_gateway: Arc<GuestGatewayRegistry>,
+        // ADR 0118: reaches a port inside a session's guest, so a call to one
+        // of the session's own app hostnames is spliced back into the sandbox.
+        guest_port_dialer: Option<engram_egress_proxy::SharedGuestPortDialer>,
     ) -> Result<Self, EgressError> {
         let ca = ca_source.load().await.map_err(EgressError::Ca)?;
         let ca_cert_pem = ca.cert_pem.clone();
@@ -298,6 +304,7 @@ impl HostEgress {
         proxy_cfg.observe_sink = observe_sink;
         proxy_cfg.inject_refresher = inject_refresher;
         proxy_cfg.guest_gateway = guest_gateway.clone();
+        proxy_cfg.guest_port_dialer = guest_port_dialer;
         let proxy = Proxy::new(proxy_cfg);
 
         let listeners = bind_with_retry(&proxy).await.map_err(EgressError::Bind)?;
@@ -489,6 +496,7 @@ pub fn register_policy(
     }
     registry.register(engram_egress_proxy::SessionState {
         session_id: policy.session_id,
+        sandbox_id: policy.sandbox_id,
         guest_ip: policy.guest_ip,
         network_allow,
         allow_all,
@@ -497,6 +505,8 @@ pub fn register_policy(
         observes,
         guest_services: policy.guest_services,
         tunnels: policy.tunnels,
+        // ADR 0118: the session's own app hostnames, for the SNI short circuit.
+        apps: policy.apps,
     });
     Ok(())
 }
@@ -529,6 +539,7 @@ mod tests {
                 network_allow_host_patterns: vec![],
                 allow_all: false,
                 secrets: vec![],
+                apps: Vec::new(),
                 injects: vec![
                     EgressInjectEntry {
                         secret: "dd-secret".into(),

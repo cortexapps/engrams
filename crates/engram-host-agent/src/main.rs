@@ -643,6 +643,9 @@ async fn main() -> Result<(), HostAgentError> {
     let cloud_sql_coord_url = observe_coord_url.clone();
     let cloud_sql_token = cfg.coordinator_token.clone();
 
+    // ADR 0118: the egress proxy needs the backend to reach a guest port for
+    // the app-to-app short circuit; `sandbox` moves into HostAgent below.
+    let sandbox_for_egress = sandbox.clone();
     let mut agent = HostAgent::new(cfg, sandbox, cloud)
         .with_chunk_store(chunk_store, materialize_dir)
         .with_chunk_cache(chunk_cache)
@@ -735,6 +738,9 @@ async fn main() -> Result<(), HostAgentError> {
                 as Arc<dyn engram_egress_proxy::GuestServiceAdapter>],
             [cloud_sql_connector],
         )),
+        Arc::new(engram_host_agent::proxy_port::BackendGuestPortDialer::new(
+            sandbox_for_egress,
+        )),
     )
     .await
     {
@@ -761,6 +767,10 @@ async fn build_host_egress(
     observe_sink: Option<engram_egress_proxy::ObserveSink>,
     inject_refresher: Option<Arc<dyn engram_egress_proxy::InjectRefresher>>,
     guest_gateway: Arc<engram_egress_proxy::GuestGatewayRegistry>,
+    // ADR 0118: opens a byte stream to a port inside a session's guest, so a
+    // call to one of the session's own app hostnames is spliced back into the
+    // sandbox instead of leaving the host.
+    guest_port_dialer: engram_egress_proxy::SharedGuestPortDialer,
 ) -> Result<engram_host_agent::egress::HostEgress, String> {
     use std::sync::Arc;
     // Port 0 would bind an ephemeral port while the iptables REDIRECT
@@ -822,6 +832,7 @@ async fn build_host_egress(
         observe_sink,
         inject_refresher,
         guest_gateway,
+        Some(guest_port_dialer),
     )
     .await
     .map_err(|e| e.to_string())

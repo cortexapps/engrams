@@ -925,7 +925,12 @@ async fn queue_fifo(ctx: &Ctx) {
         sealed_secrets: None,
         capabilities: Vec::new(),
         integration_policy_json: None,
-        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        ),
         oauth_binding: None,
     };
     // No candidate hosts: both dispositions are Queued.
@@ -3556,7 +3561,12 @@ async fn stale_pending_reservation(ctx: &Ctx) {
         sealed_secrets: None,
         capabilities: Vec::new(),
         integration_policy_json: None,
-        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        ),
         oauth_binding: None,
     };
     let d = meta

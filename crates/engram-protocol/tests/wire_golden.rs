@@ -238,6 +238,7 @@ fn session_egress_policy() -> SessionEgressPolicy {
         // because an empty Vec encodes to a length prefix only (no element bytes).
         injects: vec![],
         observes: vec![],
+        apps: Vec::new(),
         secret_mode: SecretMode::Broker,
         // ADR 0109: the host exposes metadata-style ADC only for sessions
         // whose immutable launch policy enables Google Cloud.

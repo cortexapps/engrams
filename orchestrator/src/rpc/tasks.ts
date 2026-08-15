@@ -109,6 +109,10 @@ export interface SessionsClient {
     // ADR 0055: profile-selected skill bundle names; the coordinator resolves
     // them to reserved-slot mounts at boot.
     selectedSkills?: string[];
+    // ADR 0118: the session's apps, already resolved to public hostnames. The
+    // coordinator persists them on the runtime spec (so a resume replays the
+    // same addresses) and hands them to the host's egress proxy.
+    apps?: Array<{ hostname: string; port: number }>;
     // ADR 0056: profile-granted "provider:action[@resource]" capabilities; the
     // coordinator binds them to the session (+ later clamps).
     capabilities?: string[];

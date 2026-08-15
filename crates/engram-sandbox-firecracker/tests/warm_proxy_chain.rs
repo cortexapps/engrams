@@ -242,6 +242,7 @@ async fn warm_path_redirects_through_proxy_with_correct_source_lookup() {
     };
     registry.register(engram_egress_proxy::SessionState {
         session_id,
+        sandbox_id,
         guest_ip: snat_ip,
         network_allow,
         allow_all: false,
@@ -250,6 +251,7 @@ async fn warm_path_redirects_through_proxy_with_correct_source_lookup() {
         observes: Vec::new(),
         guest_services: Vec::new(),
         tunnels: Vec::new(),
+        apps: Vec::new(),
     });
 
     // ---- 5. From inside the netns, dial TEST_DEST_IP:443 with a
