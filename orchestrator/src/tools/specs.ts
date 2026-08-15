@@ -50,6 +50,9 @@ const UpdateSectionInput = z
     section_id: SectionId,
     markdown: z
       .string()
+      // Bounded like every other free-text field: unbounded text reaches the
+      // markdown parser on the orchestrator's one event loop.
+      .max(200_000)
       .describe(
         "Replacement Markdown for the section, or for only the selected range when selection anchors are present",
       ),
@@ -131,6 +134,7 @@ const ResolveOpenQuestionInput = z.object({
   answer_markdown: z
     .string()
     .min(1)
+    .max(20_000)
     .describe("Answer to add to the section before the question is resolved"),
   expected_rev: ExpectedRevision,
 });
@@ -140,6 +144,7 @@ const UpdateBlockInput = z.object({
   block_id: z.string().min(1).max(200),
   source: z
     .string()
+    .max(200_000)
     .describe("Replacement source specification for the diagram block"),
   expected_rev: RequiredRevision,
 });

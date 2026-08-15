@@ -145,6 +145,69 @@ describe("markdown round-trip", () => {
       schema.nodes.codeBlock!.create({ language: "go" }, schema.text("func main() {}")),
     ]);
   });
+
+  test("a paragraph that starts with a numbered marker round-trips without a stray backslash", () => {
+    // The line-start escape must sit before punctuation the inline parser
+    // unescapes. Escaping the digit (`\1.`) leaked the backslash into the
+    // text, because digits are not in the unescape class.
+    expectRoundTrip([paragraph(text("1. A numbered opening that is prose, not a list."))]);
+    expectRoundTrip([paragraph(text("42) Another prose opener."))]);
+  });
+
+  test("a leading code span with a doubled backtick round-trips", () => {
+    // Renders as ``` a``b ``` at line start. The old fence escape prepended
+    // a backslash that consumed one backtick on reparse and split the span.
+    expectRoundTrip([
+      paragraph(text("a``b", ["code"]), text(" ends the span.")),
+    ]);
+  });
+
+  test("newlines inside a code span normalize to spaces, both directions", () => {
+    const [block] = parseMarkdownBlocks("`line one\nline two` after");
+    expect(block!.firstChild!.text).toBe("line one line two");
+    const rendered = renderMarkdown(
+      sectionDocument([paragraph(text("line one\nline two", ["code"]))]),
+    );
+    expect(rendered).toContain("`line one line two`");
+  });
+
+  test("a backtick-led line that opens no fence parses as text and terminates", () => {
+    // This line starts with ``` but is not a fence opener (backticks follow
+    // on the same line). The block loop used to exclude it from paragraph
+    // collection too, consuming nothing and pushing empty paragraphs forever.
+    const blocks = parseMarkdownBlocks("``` a``b ``` ends the span.");
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]!.type.name).toBe("paragraph");
+    expect(blocks[0]!.firstChild!.text).toBe("a``b");
+  });
+
+  test("an unclosed code fence is refused, quickly", () => {
+    const startedAt = performance.now();
+    expect(() => parseMarkdownBlocks("```go\n" + "`".repeat(20_000))).toThrow(
+      "An open code fence has no closing fence",
+    );
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  test("unclosed delimiter floods parse in linear time", () => {
+    // A crafted 20k-character run of unclosed delimiters made the old scan
+    // quadratic (~2×10⁸ comparisons) and pinned the event loop. The bound is
+    // generous for a linear scan and hopeless for a quadratic one. The "x "
+    // prefix keeps each flood on the inline path (a bare backtick flood at
+    // line start is an unclosed block fence, refused above).
+    for (const flood of [
+      "x " + "`".repeat(20_000),
+      "x " + "*".repeat(20_000),
+      "x " + "_a".repeat(10_000),
+      "x " + "``a`a".repeat(4_000),
+      ("``` a``b ``` x\n").repeat(2_000),
+    ]) {
+      const startedAt = performance.now();
+      const blocks = parseMarkdownBlocks(flood);
+      expect(performance.now() - startedAt).toBeLessThan(1_000);
+      expect(blocks.length).toBeGreaterThan(0);
+    }
+  });
 });
 
 describe("parseSectionBody", () => {

@@ -182,11 +182,26 @@ function escapeText(value: string): string {
   return value.replace(/([\\`*_])/g, "\\$1").replace(/\{(?=\{)/g, "\\{");
 }
 
-/** Escape a block-construct prefix so a paragraph line never re-parses as one. */
+/**
+ * Escape a block-construct prefix so a paragraph line never re-parses as one.
+ *
+ * Every inserted backslash must sit before a character the inline parser
+ * unescapes (its PUNCTUATION class), or the escape leaks into the text. A
+ * numbered marker therefore escapes its delimiter (`1\.`), never the digit —
+ * digits are not punctuation, so `\1.` came back as a literal backslash.
+ * Backtick fences need no rule here: a code span renders on one line (see
+ * `renderCodeSpan`), and a one-line span whose fence is three-plus backticks
+ * always has more backticks later on the line, which the fence-opener grammar
+ * (`parseFencedSource`) already rejects.
+ */
 function escapeLineStarts(value: string): string {
   return value
     .split("\n")
-    .map((line) => line.replace(/^(\s*)([#>]|[-+]\s|\d{1,9}[.)]\s|`{3,})/, "$1\\$2"))
+    .map((line) =>
+      line
+        .replace(/^(\s*)([#]|[-+]\s)/, "$1\\$2")
+        .replace(/^(\s*\d{1,9})([.)]\s)/, "$1\\$2"),
+    )
     .join("\n");
 }
 
@@ -240,7 +255,12 @@ function renderInline(node: ProseMirrorNode): string {
 }
 
 /** A code span whose fence is longer than any backtick run inside it. */
-function renderCodeSpan(text: string): string {
+function renderCodeSpan(rawText: string): string {
+  // One line always: a multi-line span would let `escapeLineStarts` (which
+  // cannot see span boundaries) insert an escape inside code, and its first
+  // line could satisfy the block-fence grammar. CommonMark makes the same
+  // normalization; the parser mirrors it, so this is not lossy.
+  const text = rawText.replaceAll("\n", " ");
   const longestRun = Math.max(0, ...[...text.matchAll(/`+/g)].map((match) => match[0].length));
   const fence = "`".repeat(Math.max(1, longestRun + 1));
   const pad = longestRun > 0 || text.startsWith("`") || text.endsWith("`") ? " " : "";
@@ -366,7 +386,23 @@ function withMark(state: InlineParseState, markName: "strong" | "em", inner: str
   state.marks = before;
 }
 
+/**
+ * Failed close searches, remembered for the rest of the string.
+ *
+ * A close search that reaches end-of-string proves no later opener of the
+ * same delimiter can close either (its closer would have closed the earlier
+ * search). Without this memo — and without consuming a failed run whole — an
+ * adversarial string of unclosed delimiters made the scan quadratic: 20 000
+ * bare backticks cost ~2×10⁸ comparisons on the orchestrator's one event
+ * loop. With it, each delimiter pays for at most one full scan.
+ */
+interface InlineScanMemo {
+  failedCode: Set<number>;
+  failedEmphasis: Set<string>;
+}
+
 function parseInlineInto(state: InlineParseState, value: string): void {
+  const memo: InlineScanMemo = { failedCode: new Set(), failedEmphasis: new Set() };
   let cursor = 0;
   while (cursor < value.length) {
     const char = value[cursor]!;
@@ -390,10 +426,10 @@ function parseInlineInto(state: InlineParseState, value: string): void {
     }
     if (char === "`") {
       const run = runLength(value, cursor, "`");
-      const close = findCodeClose(value, cursor + run, run);
+      const close = findCodeClose(value, cursor + run, run, memo);
       if (close >= 0) {
         flushText(state);
-        let code = value.slice(cursor + run, close);
+        let code = value.slice(cursor + run, close).replaceAll("\n", " ");
         if (code.startsWith(" ") && code.endsWith(" ") && code.trim().length > 0) {
           code = code.slice(1, -1);
         }
@@ -403,24 +439,57 @@ function parseInlineInto(state: InlineParseState, value: string): void {
         cursor = close + run;
         continue;
       }
+      // No close anywhere ahead: the whole run is literal. Consuming it one
+      // character at a time re-ran the search per character — O(run²).
+      state.text += value.slice(cursor, cursor + run);
+      cursor += run;
+      continue;
     }
     if (char === "*" || char === "_") {
       const run = runLength(value, cursor, char);
-      const delimiter = run >= 2 ? char.repeat(2) : char;
-      const close = findEmphasisClose(value, cursor + delimiter.length, delimiter);
-      if (close >= 0) {
-        withMark(
-          state,
-          delimiter.length === 2 ? "strong" : "em",
-          value.slice(cursor + delimiter.length, close),
-        );
-        cursor = close + delimiter.length;
+      const spans = emphasisSpans(value, cursor, run, memo);
+      if (spans) {
+        withMark(state, spans.mark, value.slice(spans.innerFrom, spans.innerTo));
+        cursor = spans.nextCursor;
         continue;
       }
+      state.text += value.slice(cursor, cursor + run);
+      cursor += run;
+      continue;
     }
     state.text += char;
     cursor += 1;
   }
+}
+
+interface EmphasisSpan {
+  mark: "strong" | "em";
+  innerFrom: number;
+  innerTo: number;
+  nextCursor: number;
+}
+
+/** Try the two-character delimiter first, then the single, so `**a*` still
+ *  yields emphasis instead of turning the whole run literal. */
+function emphasisSpans(
+  value: string,
+  cursor: number,
+  run: number,
+  memo: InlineScanMemo,
+): EmphasisSpan | null {
+  const char = value[cursor]!;
+  if (run >= 2) {
+    const delimiter = char.repeat(2);
+    const close = findEmphasisClose(value, cursor + 2, delimiter, memo);
+    if (close >= 0) {
+      return { mark: "strong", innerFrom: cursor + 2, innerTo: close, nextCursor: close + 2 };
+    }
+  }
+  const close = findEmphasisClose(value, cursor + 1, char, memo);
+  if (close >= 0) {
+    return { mark: "em", innerFrom: cursor + 1, innerTo: close, nextCursor: close + 1 };
+  }
+  return null;
 }
 
 const PUNCTUATION = /[!-/:-@[-`{-~]/;
@@ -432,7 +501,8 @@ function runLength(value: string, index: number, char: string): number {
 }
 
 /** The close of a code span: the next run of exactly the opening length. */
-function findCodeClose(value: string, from: number, run: number): number {
+function findCodeClose(value: string, from: number, run: number, memo: InlineScanMemo): number {
+  if (memo.failedCode.has(run)) return -1;
   let cursor = from;
   while (cursor < value.length) {
     if (value[cursor] === "`") {
@@ -443,11 +513,18 @@ function findCodeClose(value: string, from: number, run: number): number {
       cursor += 1;
     }
   }
+  memo.failedCode.add(run);
   return -1;
 }
 
 /** The close of an emphasis span: non-empty, no spaces hugging the delimiters. */
-function findEmphasisClose(value: string, from: number, delimiter: string): number {
+function findEmphasisClose(
+  value: string,
+  from: number,
+  delimiter: string,
+  memo: InlineScanMemo,
+): number {
+  if (memo.failedEmphasis.has(delimiter)) return -1;
   if (from >= value.length || value[from] === " ") return -1;
   let cursor = from;
   while (cursor < value.length) {
@@ -457,7 +534,7 @@ function findEmphasisClose(value: string, from: number, delimiter: string): numb
     }
     if (value[cursor] === "`") {
       const run = runLength(value, cursor, "`");
-      const close = findCodeClose(value, cursor + run, run);
+      const close = findCodeClose(value, cursor + run, run, memo);
       cursor = close >= 0 ? close + run : cursor + run;
       continue;
     }
@@ -469,6 +546,9 @@ function findEmphasisClose(value: string, from: number, delimiter: string): numb
     }
     cursor += 1;
   }
+  // The scan reached the end: no valid closer exists after `from`, so none
+  // exists for any later opener of this delimiter either.
+  memo.failedEmphasis.add(delimiter);
   return -1;
 }
 
@@ -554,7 +634,13 @@ function parseBlocks(lines: string[]): ProseMirrorNode[] {
       continue;
     }
 
-    const paragraphLines: string[] = [];
+    // The current line failed every block form above, so it is paragraph text
+    // no matter what it starts with. Consuming it unconditionally guarantees
+    // progress: a line such as "``` a``b ``` more" opens no fence (backticks
+    // follow on the same line) yet also matched this loop's fence guard — the
+    // parser pushed empty paragraphs forever without ever advancing.
+    const paragraphLines: string[] = [lines[index]!];
+    index += 1;
     while (
       index < lines.length &&
       lines[index]!.trim().length > 0 &&
