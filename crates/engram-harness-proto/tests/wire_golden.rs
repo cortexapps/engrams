@@ -257,6 +257,25 @@ fn ev_title_suggested() -> HarnessEvent {
     }
 }
 
+fn ev_generation() -> HarnessEvent {
+    HarnessEvent::Generation {
+        run_id: "run-1".into(),
+        message_id: "msg_01AAA".into(),
+        model: "claude-sonnet-5".into(),
+        input_tokens: 12,
+        output_tokens: 345,
+        cache_read_tokens: 6789,
+        cache_creation_tokens: 42,
+    }
+}
+
+fn ev_run_cost() -> HarnessEvent {
+    HarnessEvent::RunCost {
+        run_id: "run-1".into(),
+        cost_micro_usd: 1_234_567,
+    }
+}
+
 fn cmd_checkpoint() -> HarnessCommand {
     HarnessCommand::Checkpoint {
         reason: CheckpointReason::Idle,
@@ -332,6 +351,8 @@ fn harness_event_golden_and_variant_indices() {
     assert_golden("event_parked", &HarnessEvent::Parked);
     assert_golden("event_browser_activity", &ev_browser_activity());
     assert_golden("event_busy", &HarnessEvent::Busy);
+    assert_golden("event_generation", &ev_generation());
+    assert_golden("event_run_cost", &ev_run_cost());
 
     assert_variant_index(&ev_run_started(), 0, "HarnessEvent::RunStarted");
     assert_variant_index(&ev_agent_message(), 1, "HarnessEvent::AgentMessage");
@@ -369,6 +390,8 @@ fn harness_event_golden_and_variant_indices() {
     assert_variant_index(&HarnessEvent::Parked, 15, "HarnessEvent::Parked");
     assert_variant_index(&ev_browser_activity(), 16, "HarnessEvent::BrowserActivity");
     assert_variant_index(&HarnessEvent::Busy, 17, "HarnessEvent::Busy");
+    assert_variant_index(&ev_generation(), 18, "HarnessEvent::Generation");
+    assert_variant_index(&ev_run_cost(), 19, "HarnessEvent::RunCost");
 }
 
 #[test]
@@ -601,6 +624,8 @@ fn regen_golden() {
     write("event_parked", &HarnessEvent::Parked);
     write("event_browser_activity", &ev_browser_activity());
     write("event_busy", &HarnessEvent::Busy);
+    write("event_generation", &ev_generation());
+    write("event_run_cost", &ev_run_cost());
 
     write("agent_role_assistant", &AgentRole::Assistant);
     write("agent_role_user", &AgentRole::User);

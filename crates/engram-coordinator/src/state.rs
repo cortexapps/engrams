@@ -282,6 +282,32 @@ pub enum SessionEvent {
         title: String,
         at: DateTime<Utc>,
     },
+    /// Telemetry: one model generation with its token usage (a single
+    /// provider API message for Claude Code; one whole turn for Codex).
+    /// Token fields carry the provider's NATIVE semantics — Anthropic
+    /// `input_tokens` excludes cache reads, OpenAI includes them; the
+    /// control-plane exporter owns interpretation. Opaque JSONB
+    /// passthrough like the other harness events. Survives an ADR 0028
+    /// rewind (tokens were genuinely spent).
+    HarnessGeneration {
+        run_id: String,
+        message_id: String,
+        model: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+        at: DateTime<Utc>,
+    },
+    /// Telemetry: the run's cost in integer micro-USD, exactly as the
+    /// agent reported it (pure passthrough — the platform never computes
+    /// prices). At most one per run. Survives a rewind, like
+    /// `HarnessGeneration`.
+    HarnessRunCost {
+        run_id: String,
+        cost_micro_usd: u64,
+        at: DateTime<Utc>,
+    },
     /// ADR 0056: a third-party integration surfaced a typed asset/action
     /// into the session. Subsumes the retired `PullRequestOpened` — an
     /// opened PR is now `provider: "forge"`, `asset_kind: "pull_request"`.
@@ -499,6 +525,8 @@ impl SessionEvent {
             Self::HarnessAgentMessageChunk { .. } => "agent_message_chunk",
             Self::HarnessFileChanged { .. } => "file_changed",
             Self::HarnessTitleSuggested { .. } => "title_suggested",
+            Self::HarnessGeneration { .. } => "generation",
+            Self::HarnessRunCost { .. } => "run_cost",
             Self::IntegrationAsset { .. } => "integration_asset",
             Self::FileShared { .. } => "file_shared",
             Self::RecoveredFromCheckpoint { .. } => "recovered_from_checkpoint",
@@ -632,6 +660,32 @@ impl SessionEvent {
                 at,
             },
             HarnessEvent::TitleSuggested { title } => Self::HarnessTitleSuggested { title, at },
+            HarnessEvent::Generation {
+                run_id,
+                message_id,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+            } => Self::HarnessGeneration {
+                run_id,
+                message_id,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                at,
+            },
+            HarnessEvent::RunCost {
+                run_id,
+                cost_micro_usd,
+            } => Self::HarnessRunCost {
+                run_id,
+                cost_micro_usd,
+                at,
+            },
         }
     }
 }
@@ -1717,6 +1771,71 @@ pub(crate) mod tests {
         let json = serde_json::to_value(&ev).expect("serialize");
         assert_eq!(json["type"], "harness_title_suggested");
         assert_eq!(json["title"], "Fix the flaky test");
+    }
+
+    #[test]
+    fn generation_maps_from_harness_with_stable_kind_and_round_trips() {
+        // Telemetry: Generation maps under the stable `generation` kind
+        // (payload serde tag `harness_generation`, like every harness event)
+        // with the token fields and the coordinator-stamped `at` intact.
+        let at = chrono::Utc::now();
+        let ev = SessionEvent::from_harness(
+            HarnessEvent::Generation {
+                run_id: "run-1".into(),
+                message_id: "msg_01AAA".into(),
+                model: "claude-sonnet-5".into(),
+                input_tokens: 12,
+                output_tokens: 345,
+                cache_read_tokens: 6789,
+                cache_creation_tokens: 42,
+            },
+            at,
+        );
+        match &ev {
+            SessionEvent::HarnessGeneration {
+                run_id,
+                message_id,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                at: stamped,
+            } => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(message_id, "msg_01AAA");
+                assert_eq!(model, "claude-sonnet-5");
+                assert_eq!(*input_tokens, 12);
+                assert_eq!(*output_tokens, 345);
+                assert_eq!(*cache_read_tokens, 6789);
+                assert_eq!(*cache_creation_tokens, 42);
+                assert_eq!(*stamped, at);
+            }
+            other => panic!("expected HarnessGeneration, got {other:?}"),
+        }
+        assert_eq!(ev.kind(), "generation");
+
+        let json = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(json["type"], "harness_generation");
+        assert_eq!(json["model"], "claude-sonnet-5");
+        assert_eq!(json["output_tokens"], 345);
+    }
+
+    #[test]
+    fn run_cost_maps_from_harness_with_stable_kind_and_round_trips() {
+        let ev = SessionEvent::from_harness(
+            HarnessEvent::RunCost {
+                run_id: "run-1".into(),
+                cost_micro_usd: 1_234_567,
+            },
+            chrono::Utc::now(),
+        );
+        assert_eq!(ev.kind(), "run_cost");
+
+        let json = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(json["type"], "harness_run_cost");
+        assert_eq!(json["run_id"], "run-1");
+        assert_eq!(json["cost_micro_usd"], 1_234_567);
     }
 
     /// Issue #527 Phase 1: `PromptReceived` is coordinator-native (never

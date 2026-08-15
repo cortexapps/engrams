@@ -146,6 +146,40 @@ pub fn harness_event() -> impl Strategy<Value = HarnessEvent> {
             }
         }),
         Just(HarnessEvent::Busy),
+        (
+            s(),
+            s(),
+            s(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+        )
+            .prop_map(
+                |(
+                    run_id,
+                    message_id,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                )| {
+                    HarnessEvent::Generation {
+                        run_id,
+                        message_id,
+                        model,
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
+                    }
+                },
+            ),
+        (s(), any::<u64>()).prop_map(|(run_id, cost_micro_usd)| HarnessEvent::RunCost {
+            run_id,
+            cost_micro_usd,
+        }),
     ]
 }
 
@@ -345,6 +379,8 @@ fn _exhaustiveness_harness_event(e: &HarnessEvent) {
         HarnessEvent::Parked => {}
         HarnessEvent::BrowserActivity { .. } => {}
         HarnessEvent::Busy => {}
+        HarnessEvent::Generation { .. } => {}
+        HarnessEvent::RunCost { .. } => {}
     }
 }
 
