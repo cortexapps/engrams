@@ -950,6 +950,7 @@ async fn drive(
 ) -> DriveOutcome {
     let mut active: Option<String> = None;
     let mut pending = HashMap::<i64, Pending>::new();
+    let mut usage_acc = HashMap::<String, TurnUsage>::new();
     let mut interrupt = InterruptWatchdog::default();
     emit(events, HarnessEvent::Idle).await;
     let mut index = 0;
@@ -1019,6 +1020,7 @@ async fn drive(
                 &mut active,
                 &mut pending,
                 queued,
+                &mut usage_acc,
                 ToolContext { parked, manifest },
             )
             .await;
@@ -1159,6 +1161,7 @@ async fn drive(
                         &mut active,
                         &mut pending,
                         queued,
+                        &mut usage_acc,
                         ToolContext { parked, manifest },
                     ).await;
                     if completed {
@@ -1783,6 +1786,18 @@ async fn send_follow_up(
     Ok(())
 }
 
+/// Telemetry: token usage accumulated for one in-flight turn from
+/// `thread/tokenUsage/updated` notifications. Field semantics follow the
+/// OpenAI/Codex breakdown — `input_tokens` INCLUDES the cached tokens
+/// (unlike Anthropic's accounting; documented on the wire type).
+#[derive(Default)]
+struct TurnUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+}
+
+#[allow(clippy::too_many_arguments)] // mirrors translate_jsonl_with_deferred_tools: per-turn state threads through
 async fn handle_message(
     server: &mut AppServer,
     value: Value,
@@ -1790,6 +1805,7 @@ async fn handle_message(
     active: &mut Option<String>,
     pending: &mut HashMap<i64, Pending>,
     queued: &mut VecDeque<QueuedPrompt>,
+    usage_acc: &mut HashMap<String, TurnUsage>,
     tools: ToolContext<'_>,
 ) {
     if value.get("method").and_then(Value::as_str) == Some("item/tool/call") {
@@ -1992,6 +2008,23 @@ async fn handle_message(
                 emit_item_completed(events, &run_id, item).await;
             }
         }
+        // Telemetry: per-request usage samples for the in-flight turn.
+        // `tokenUsage.last` is the most recent sampling request's usage;
+        // summing the samples per `turnId` gives the turn total. (The
+        // `total` field is thread-cumulative and would mis-attribute
+        // pre-resume history on the first turn after an attach.)
+        "thread/tokenUsage/updated" => {
+            if let (Some(turn_id), Some(last)) = (
+                params.get("turnId").and_then(Value::as_str),
+                params.pointer("/tokenUsage/last"),
+            ) {
+                let tok = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
+                let acc = usage_acc.entry(turn_id.to_owned()).or_default();
+                acc.input_tokens += tok("inputTokens");
+                acc.output_tokens += tok("outputTokens");
+                acc.cache_read_tokens += tok("cachedInputTokens");
+            }
+        }
         "turn/completed" => {
             let status = params
                 .pointer("/turn/status")
@@ -2002,6 +2035,27 @@ async fn handle_message(
                 .and_then(Value::as_str)
                 .unwrap_or(&run_id)
                 .to_owned();
+            // Telemetry: one per-turn Generation, emitted before the
+            // RunCompleted/RunInterrupted that closes the run. Accumulators
+            // for turn ids that never complete in this process (resume
+            // replays) are dropped with the map when `drive` returns.
+            if let Some(usage) = usage_acc.remove(&completed) {
+                emit(
+                    events,
+                    HarnessEvent::Generation {
+                        run_id: completed.clone(),
+                        message_id: completed.clone(),
+                        model: std::env::var("ENGRAM_MODEL_ROUTER_MODEL")
+                            .or_else(|_| std::env::var("ENGRAM_CODEX_MODEL"))
+                            .unwrap_or_default(),
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        cache_read_tokens: usage.cache_read_tokens,
+                        cache_creation_tokens: 0,
+                    },
+                )
+                .await;
+            }
             if status == "interrupted" {
                 emit(
                     events,
@@ -2746,6 +2800,81 @@ done
             engine.abort();
         }
         completed.expect("fake app-server prompt turn timed out");
+
+        engine.abort();
+    }
+
+    /// Telemetry: `thread/tokenUsage/updated` samples for the in-flight
+    /// turn are summed and surface as ONE `Generation` ordered before the
+    /// closing `RunCompleted`; samples for a foreign turn id are ignored.
+    #[tokio::test]
+    async fn token_usage_samples_become_one_generation_before_run_completed() {
+        let usage_1 = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"t1","turnId":"turn-1","tokenUsage":{"last":{"inputTokens":100,"cachedInputTokens":40,"outputTokens":7},"total":{"inputTokens":100,"cachedInputTokens":40,"outputTokens":7}}}}"#;
+        let usage_2 = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"t1","turnId":"turn-1","tokenUsage":{"last":{"inputTokens":150,"cachedInputTokens":90,"outputTokens":13},"total":{"inputTokens":250,"cachedInputTokens":130,"outputTokens":20}}}}"#;
+        let usage_foreign = r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"t1","turnId":"turn-OLD","tokenUsage":{"last":{"inputTokens":999,"cachedInputTokens":999,"outputTokens":999},"total":{"inputTokens":999,"cachedInputTokens":999,"outputTokens":999}}}}"#;
+        let completed = r#"{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"turn-1","status":"completed"}}}"#;
+        let (script, _) = write_fake_codex(&[usage_1, usage_2, usage_foreign, completed]).await;
+        let cli = test_cli(script.clone());
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-1".into(),
+                text: "hello".into(),
+                mode: None,
+            })
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut generation: Option<HarnessEvent> = None;
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    HarnessEvent::Generation { .. } => {
+                        assert!(generation.is_none(), "exactly one Generation");
+                        generation = Some(event);
+                    }
+                    HarnessEvent::RunCompleted { run_id, ok } => {
+                        assert_eq!(run_id, "turn-1");
+                        assert!(ok);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            match generation {
+                Some(HarnessEvent::Generation {
+                    run_id,
+                    message_id,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                    ..
+                }) => {
+                    assert_eq!(run_id, "turn-1");
+                    assert_eq!(message_id, "turn-1");
+                    // Summed `last` samples for turn-1 only — the
+                    // foreign-turn sample must not leak in.
+                    assert_eq!(input_tokens, 250);
+                    assert_eq!(output_tokens, 20);
+                    assert_eq!(cache_read_tokens, 130);
+                    assert_eq!(cache_creation_tokens, 0);
+                }
+                other => panic!("expected Generation before RunCompleted, got {other:?}"),
+            }
+        })
+        .await;
+        if outcome.is_err() {
+            engine.abort();
+        }
+        outcome.expect("token-usage turn timed out");
 
         engine.abort();
     }

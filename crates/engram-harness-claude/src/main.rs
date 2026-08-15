@@ -2361,6 +2361,10 @@ mod adapter {
         /// gap, then removed from claude's transcript before `--resume` (see
         /// `scrub_transcript`).
         suppressed_msg_ids: Vec<String>,
+        /// Telemetry: message ids whose `Generation` already fired this
+        /// turn (the CLI repeats `assistant` lines per content block with
+        /// the same id + usage; without this the tokens double-count).
+        emitted_generation_ids: HashSet<String>,
     }
 
     /// A prompt waiting in the harness-owned queue (Phase 1b — type-ahead
@@ -2605,6 +2609,11 @@ mod adapter {
         // the abort's `result` lands.
         let mut interrupt_deadline: Option<Instant> = None;
 
+        // Telemetry: `result.total_cost_usd` is a running total for THIS
+        // claude process (resets on respawn/`--resume`), so per-process
+        // tracking here yields each turn's delta for `RunCost`.
+        let mut last_cost_total_usd: f64 = 0.0;
+
         // Steering: armed when the pending queue wants the in-flight turn
         // aborted (a mid-turn prompt, or leftover type-ahead at a
         // consumption boundary). The sleeper fires the actual interrupt
@@ -2790,6 +2799,33 @@ mod adapter {
                                             marker.terminal_reason.as_deref().unwrap_or(""),
                                         "turn result"
                                     );
+                                    // Telemetry: cost passthrough. The
+                                    // marker's total is this process's
+                                    // running sum, so the turn's cost is
+                                    // the delta since the previous result.
+                                    // A smaller total means the CLI reset
+                                    // its counter — rebaseline rather than
+                                    // emit a bogus delta.
+                                    if let Some(total) = marker.total_cost_usd {
+                                        let delta = if total >= last_cost_total_usd {
+                                            total - last_cost_total_usd
+                                        } else {
+                                            total
+                                        };
+                                        last_cost_total_usd = total;
+                                        let cost_micro_usd =
+                                            (delta * 1_000_000.0).round() as u64;
+                                        if cost_micro_usd > 0 {
+                                            emit(
+                                                evt_tx,
+                                                HarnessEvent::RunCost {
+                                                    run_id: run_id.clone(),
+                                                    cost_micro_usd,
+                                                },
+                                            )
+                                            .await;
+                                        }
+                                    }
                                     if narrated_past {
                                         tracing::warn!(
                                             %run_id,
@@ -3028,6 +3064,7 @@ mod adapter {
                                     &t.deferred_tool_names,
                                     &mut t.deferred_pending,
                                     &mut t.suppressed_msg_ids,
+                                    &mut t.emitted_generation_ids,
                                 ) {
                                     for mut ev in translated {
                                         // The hook gave #64389 duplicates no
@@ -3614,6 +3651,7 @@ mod adapter {
             deferred_tool_names: deferred_tool_names(&cli.tool_manifest),
             is_delivery_resume: false,
             suppressed_msg_ids: Vec::new(),
+            emitted_generation_ids: HashSet::new(),
         }
     }
 
@@ -3654,6 +3692,7 @@ mod adapter {
             deferred_tool_names: deferred_tool_names(&cli.tool_manifest),
             is_delivery_resume: true,
             suppressed_msg_ids: Vec::new(),
+            emitted_generation_ids: HashSet::new(),
         }
     }
 
@@ -4062,6 +4101,11 @@ mod adapter {
         /// the Agent SDK's `SDKResultSuccess.terminal_reason`. `None` on older
         /// CLIs that don't emit the field.
         pub terminal_reason: Option<String>,
+        /// Telemetry: the CLI's running cost total for this process so far
+        /// (docs: agent-sdk/cost-tracking — cumulative across turns of one
+        /// streaming-input call, NOT per-turn). `None` on CLIs that don't
+        /// report cost. The engine emits the per-turn DELTA as `RunCost`.
+        pub total_cost_usd: Option<f64>,
     }
 
     /// Detect claude's terminal `result` line. Substring-gated so we
@@ -4088,6 +4132,7 @@ mod adapter {
                 .get("terminal_reason")
                 .and_then(|s| s.as_str())
                 .map(str::to_string),
+            total_cost_usd: v.get("total_cost_usd").and_then(|x| x.as_f64()),
         })
     }
 
@@ -4216,6 +4261,7 @@ mod adapter {
             &HashSet::new(),
             deferred_pending,
             suppressed_msg_ids,
+            &mut HashSet::new(),
         )
     }
 
@@ -4249,6 +4295,11 @@ mod adapter {
         // this turn, recorded here so `scrub_transcript` can delete them from
         // claude's transcript before the answer-resume.
         suppressed_msg_ids: &mut Vec<String>,
+        // Telemetry: message ids whose `Generation` (token usage) already
+        // fired this turn. The CLI re-emits an `assistant` line per content
+        // block with the SAME `message.id` and usage — without this set the
+        // tokens would double-count.
+        emitted_generation_ids: &mut HashSet<String>,
     ) -> Option<Vec<HarnessEvent>> {
         let v: Value = serde_json::from_str(line).ok()?;
         let ty = v.get("type")?.as_str()?;
@@ -4318,6 +4369,31 @@ mod adapter {
                     .and_then(|s| s.as_str())
                     .unwrap_or("msg-?")
                     .to_string();
+                // Telemetry: one `Generation` per assistant message (one
+                // provider API call), main-loop and subagent alike — the
+                // tokens were spent either way. Emitted even for
+                // narrate-past-suppressed and tool_use-only messages, and
+                // deduped by `message.id` (the CLI repeats the line per
+                // content block with identical usage). Fields the CLI
+                // doesn't send read as 0.
+                if let Some(usage) = msg.get("usage").filter(|u| u.is_object()) {
+                    let tok = |k: &str| usage.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+                    if msg_id == "msg-?" || emitted_generation_ids.insert(msg_id.clone()) {
+                        out.push(HarnessEvent::Generation {
+                            run_id: rid.clone(),
+                            message_id: msg_id.clone(),
+                            model: msg
+                                .get("model")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            input_tokens: tok("input_tokens"),
+                            output_tokens: tok("output_tokens"),
+                            cache_read_tokens: tok("cache_read_input_tokens"),
+                            cache_creation_tokens: tok("cache_creation_input_tokens"),
+                        });
+                    }
+                }
                 if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
                     let mut text_buf = String::new();
                     for b in blocks {
@@ -8727,6 +8803,111 @@ mod tests {
         }
     }
 
+    /// Telemetry: an assistant line with `message.usage` yields exactly one
+    /// `Generation` (before the message's other events), deduped by
+    /// `message.id` across the CLI's per-content-block re-emissions.
+    #[test]
+    fn assistant_usage_emits_generation_once_per_message_id() {
+        let line = r#"{"type":"assistant","message":{"id":"msg_1","model":"claude-sonnet-5","usage":{"input_tokens":12,"output_tokens":345,"cache_read_input_tokens":6789,"cache_creation_input_tokens":42},"content":[{"type":"text","text":"hi"}]}}"#;
+        let mut tc = 0u32;
+        let mut gen_ids = std::collections::HashSet::new();
+        let translate = |tc: &mut u32, gen_ids: &mut std::collections::HashSet<String>| {
+            translate_jsonl_with_deferred_tools(
+                line,
+                "run-1",
+                tc,
+                50,
+                &mut None,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &std::collections::HashSet::new(),
+                &mut std::collections::HashSet::new(),
+                &mut Vec::new(),
+                gen_ids,
+            )
+            .unwrap()
+        };
+        let evs = translate(&mut tc, &mut gen_ids);
+        assert_eq!(evs.len(), 2, "Generation + AgentMessage: {evs:?}");
+        match &evs[0] {
+            HarnessEvent::Generation {
+                run_id,
+                message_id,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+            } => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(message_id, "msg_1");
+                assert_eq!(model, "claude-sonnet-5");
+                assert_eq!(*input_tokens, 12);
+                assert_eq!(*output_tokens, 345);
+                assert_eq!(*cache_read_tokens, 6789);
+                assert_eq!(*cache_creation_tokens, 42);
+            }
+            other => panic!("expected Generation first, got {other:?}"),
+        }
+
+        // The CLI re-emits the line (same message.id, same usage) per
+        // content block — the second pass must not double-count.
+        let evs = translate(&mut tc, &mut gen_ids);
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, HarnessEvent::Generation { .. })),
+            "repeated message.id must not emit a second Generation: {evs:?}"
+        );
+    }
+
+    /// Telemetry: a narrate-past-suppressed assistant message still emits
+    /// its `Generation` — the tokens were genuinely spent — while the
+    /// hallucinated `AgentMessage` text stays suppressed (ADR 0054).
+    #[test]
+    fn suppressed_narrate_past_still_emits_generation() {
+        let line = r#"{"type":"assistant","message":{"id":"msg_2","model":"claude-sonnet-5","usage":{"input_tokens":5,"output_tokens":7},"content":[{"type":"text","text":"I'll try again"}]}}"#;
+        let mut tc = 0u32;
+        let mut deferred_pending: std::collections::HashSet<String> =
+            ["toolu_parked".to_string()].into_iter().collect();
+        let mut suppressed = Vec::new();
+        let evs = translate_jsonl_with_deferred_tools(
+            line,
+            "run-1",
+            &mut tc,
+            50,
+            &mut None,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &std::collections::HashSet::new(),
+            &mut deferred_pending,
+            &mut suppressed,
+            &mut std::collections::HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(evs.len(), 1, "Generation only: {evs:?}");
+        assert!(matches!(
+            &evs[0],
+            HarnessEvent::Generation {
+                output_tokens: 7,
+                ..
+            }
+        ));
+        assert_eq!(suppressed, vec!["msg_2".to_string()]);
+    }
+
+    /// Telemetry: `detect_result_marker` surfaces `total_cost_usd` (the
+    /// process-cumulative running total) for the engine's RunCost delta.
+    #[test]
+    fn result_marker_carries_total_cost_usd() {
+        let with_cost =
+            r#"{"type":"result","subtype":"success","is_error":false,"total_cost_usd":1.234567}"#;
+        let marker = detect_result_marker(with_cost).unwrap();
+        assert_eq!(marker.total_cost_usd, Some(1.234567));
+
+        let without = r#"{"type":"result","subtype":"success","is_error":false}"#;
+        assert_eq!(detect_result_marker(without).unwrap().total_cost_usd, None);
+    }
+
     #[test]
     fn ai_title_line_becomes_title_suggested() {
         // Claude Code's `ai-title` line surfaces as a `TitleSuggested` event.
@@ -9212,6 +9393,7 @@ mod tests {
             &deferred_names,
             &mut pending,
             &mut Vec::new(),
+            &mut std::collections::HashSet::new(),
         )
         .unwrap();
         assert!(events
@@ -9231,6 +9413,7 @@ mod tests {
             &deferred_names,
             &mut pending,
             &mut Vec::new(),
+            &mut std::collections::HashSet::new(),
         )
         .unwrap();
         assert!(
@@ -9300,6 +9483,7 @@ mod tests {
             &deferred_names,
             &mut pending,
             &mut suppressed,
+            &mut std::collections::HashSet::new(),
         )
         .unwrap();
         assert!(
@@ -9319,6 +9503,7 @@ mod tests {
             &deferred_names,
             &mut pending,
             &mut suppressed,
+            &mut std::collections::HashSet::new(),
         )
         .unwrap();
         assert!(

@@ -392,6 +392,42 @@ pub enum HarnessEvent {
     /// subscription list or the orchestrator frame taxonomy (surfaces
     /// adopt it when they render subagent status).
     Busy,
+    // ── Telemetry (OTel GenAI export). APPENDED after `Busy` so existing
+    //    bincode variant indices never shift (… Busy=17, Generation=18,
+    //    RunCost=19) — see tests/wire_golden.rs.
+    /// One model generation with its token usage: a single provider API
+    /// message for Claude Code; one whole agent turn for Codex. Token
+    /// fields carry the PROVIDER'S native semantics, unharmonized —
+    /// Anthropic `input_tokens` EXCLUDES cache reads, OpenAI
+    /// `inputTokens` INCLUDES them; the control-plane exporter owns
+    /// interpretation. 0 means "not reported by the source".
+    Generation {
+        run_id: String,
+        /// Dedupe / correlation id: Claude's `message.id` (the same id
+        /// as the accompanying `AgentMessage`); Codex's turn id.
+        message_id: String,
+        /// Provider model id as reported (Claude `message.model`) or as
+        /// configured (Codex launch params). Empty when unknown.
+        model: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        /// Cache-hit prompt tokens (Anthropic `cache_read_input_tokens`,
+        /// Codex `cachedInputTokens`).
+        cache_read_tokens: u64,
+        /// Anthropic `cache_creation_input_tokens`. Always 0 for Codex.
+        cache_creation_tokens: u64,
+    },
+    /// Cost of one run, as the agent itself reports it — pure
+    /// passthrough, the platform never computes prices. Emitted at most
+    /// once per run, before `RunCompleted`. Adapters whose agent
+    /// reports no cost (Codex) never emit it.
+    RunCost {
+        run_id: String,
+        /// This run's cost delta in integer micro-USD (1 USD =
+        /// 1_000_000). Integer so the enum keeps `Eq` and the wire
+        /// carries no float-equality / NaN hazards.
+        cost_micro_usd: u64,
+    },
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -431,6 +467,8 @@ impl HarnessEvent {
             Self::Parked => "harness_parked",
             Self::Busy => "harness_busy",
             Self::BrowserActivity { .. } => "browser_activity",
+            Self::Generation { .. } => "generation",
+            Self::RunCost { .. } => "run_cost",
         }
     }
 
