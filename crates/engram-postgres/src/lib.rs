@@ -4484,7 +4484,11 @@ impl MetadataStore for PostgresStore {
         // ADR 0116 A5: one transaction — prune stale sightings, stamp
         // current unbound ones, graduate the stably-unbound to
         // tombstones. `bound` is the global binding check (sandbox ids
-        // are unique across hosts).
+        // are unique across hosts). A live capture job protects every
+        // unbound sandbox on its assigned host because the host does not
+        // report which running sandbox is the capture VM. Capture jobs
+        // are host-anti-affine, and the next heartbeat resumes cleanup
+        // after the job becomes terminal.
         let now = self.clock.now_utc();
         let running_uuids: Vec<uuid::Uuid> = running.iter().map(|s| s.as_uuid()).collect();
         let rows: Vec<uuid::Uuid> = sqlx::query_scalar(
@@ -4494,6 +4498,11 @@ impl MetadataStore for PostgresStore {
                   FROM unnest($2::uuid[]) AS r(sandbox_id)
                  WHERE NOT EXISTS (
                      SELECT 1 FROM sessions s WHERE s.sandbox_id = r.sandbox_id
+                 )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM capture_jobs c
+                      WHERE c.host_id = $1
+                        AND c.stage NOT IN ('done', 'failed')
                  )
             ),
             pruned AS (

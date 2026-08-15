@@ -1768,11 +1768,12 @@ pub trait MetadataStore: Send + Sync {
     /// an unbound-sighting; a sighting older than `grace_secs` GRADUATES
     /// to a tombstone (host-affirmed present + coordinator-confirmed
     /// unowned, stable past the create→bind window — both facts
-    /// explicit, no liveness inference). Sightings for sandboxes that
-    /// became bound, left the running set, or graduated are pruned in
-    /// the same transaction. Returns the newly entombed ids. Default
-    /// body is a mock no-op; PG and sim implement the real semantics
-    /// (conformance: `t_sandbox_tombstones`).
+    /// explicit, no liveness inference). A host with a live capture job
+    /// is exempt because its capture VM is intentionally not session-
+    /// bound. Sightings for protected, bound, absent, or graduated
+    /// sandboxes are pruned in the same transaction. Returns the newly
+    /// entombed ids. Default body is a mock no-op; PG and sim implement
+    /// the real semantics (conformance: `t_sandbox_tombstones`).
     async fn entomb_stably_unbound(
         &self,
         host_id: HostId,
