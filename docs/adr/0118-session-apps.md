@@ -25,19 +25,18 @@ the exposure is minted *after* the session is live
 (`orchestrator/src/rpc/task-create.ts:1171-1190`). The name does not exist when the
 guest starts, so it can never become an environment variable.
 
-The edge makes this worse. It rewrites the request to `Host: localhost:<port>`
-(`orchestrator/src/routes/preview-proxy.ts:294`). An app that builds absolute URLs
-from `Host` therefore emits `http://localhost:3000/...` links to the browser. That
-rewrite was necessary before ADR 0066, when the host dialed the guest's external
-interface. It is now the opposite of what we want.
+The edge cannot supply the missing address either. It sends `Host: localhost:<port>`
+upstream (`orchestrator/src/routes/preview-proxy.ts:294`) — which is what keeps dev
+servers working, since they reject an unknown `Host` outright — so an app that derives
+its own public address from the request sees `localhost` too.
 
-**2. The wall is the wrong shape.** IAP fronts the preview Gateway
-on the deployment that runs it. It keeps the public
-internet out, which is correct and must stay true. But IAP challenges each hostname
-with a redirect to Google. A browser can follow that redirect for a top-level
-navigation. A cross-origin `fetch()` from one app's page to a sibling app's origin
-cannot: the browser sees a redirect to a foreign origin and CORS rejects it. A call
-made from inside the guest carries no IAP assertion at all.
+**2. The wall is the wrong shape.** IAP fronts the preview Gateway on the deployment
+that runs it. It keeps the public internet out, which is correct and must stay true.
+But IAP challenges each hostname with a redirect to its identity provider. A browser
+can follow that redirect for a top-level navigation. A cross-origin `fetch()` from one
+app's page to a sibling app's origin cannot: the browser sees a redirect to a foreign
+origin and CORS rejects it. A call made from inside the guest carries no IAP assertion
+at all.
 
 **3. Reservation is slow.** The auto-mint loop runs after `createSession` returns
 and costs three serial round trips per port
@@ -58,9 +57,7 @@ without leaving the host machine.
 
 ### Every app learns every peer's address
 
-An earlier draft let each app name the variables carrying **its own** address. That
-is not enough. Surveying real multi-service stacks, roughly half the addresses a
-service needs are a *peer's*, not its own:
+Roughly half the addresses a service needs are a *peer's*, not its own:
 
 | Kind of setting | Lives on | Wants the address of |
 | --- | --- | --- |
@@ -69,8 +66,8 @@ service needs are a *peer's*, not its own:
 | Cookie domain, OAuth redirect URI | the API | itself |
 | HTTP client base URL | the frontend | the API |
 
-A model where an app can only name its own address cannot express the first two rows,
-which is most of the work.
+An app therefore cannot be given only its own address; the first two rows, which are
+most of the work, would have no way to be filled in.
 
 So the platform injects **both forms of every app's address, for every app**, and the
 profile remaps them into whatever names its services actually read. This is
@@ -101,7 +98,7 @@ nothing is logged, because that shape is always a typo.
 ### The hostname
 
 `<app-name>-<session-slug>` — one DNS label under the preview base domain. The
-session draws one random tri-word slug (`orchestrator/src/ports/slug.ts`); every app
+session draws one random tri-word slug (`orchestrator/src/apps/hostname.ts`); every app
 in that session shares it. The label is readable, it is a single label so the
 existing wildcard certificate covers it, and it still does not encode the port. The
 whole label is the routing key, so the platform never parses it back into parts.
@@ -149,6 +146,7 @@ the better-auth session it already owns.
   may set an app to `private` (owner and admin only). Unauthenticated share tokens
   are retired: the requirement is that nobody reaches an app without passing the
   login wall.
+
 **Invariant — `OPTIONS` skips the wall.** A browser **never** sends cookies on a CORS
 preflight. An auth wall in front of per-app hostnames therefore rejects every
 preflight before the app sees it, and no amount of CORS configuration in the app can
@@ -241,8 +239,16 @@ Supporting decisions:
   change and no `allow_host_patterns` entry is needed.
 - **The short circuit is checked before the allow list**, next to the secret, inject,
   and observe arms that already take precedence.
-- **The splice is raw**, not an HTTP proxy. WebSocket and h2c pass through unchanged,
-  and the real `Host` header survives.
+- **The splice is raw**, not an HTTP proxy. WebSocket and h2c pass through unchanged.
+  This means the callee sees the app's **real** hostname in `Host`, where the browser
+  edge would have sent `localhost:<port>`. The divergence is deliberate — a raw splice
+  cannot rewrite without parsing HTTP, and parsing would cost the protocol
+  transparency the splice exists for — but it has one consequence worth stating: a
+  callee that rejects an unknown `Host` refuses the call. In practice the services
+  reached this way are APIs, which do not host-check, while the services that do are
+  dev servers, which are callers rather than callees. If that stops being true, the
+  fix is to add the app's hostname to that server's allowed-hosts list, not to make
+  the splice parse HTTP.
 - **A new narrow seam.** `engram-egress-proxy` gets a `GuestPortDialer` trait that
   returns the `TunnelStream` it already defines. `engram-host-agent` implements it
   over `SandboxBackend::open_guest_stream`. `proxy_port::open_vsock_tunnel_at` is
@@ -306,8 +312,8 @@ Each phase is one PR.
   reservation, env injection through `harness_env`, the `apps` proto fields, and the
   web editors. Retires `port_exposure` and `profile.port_exposures`.
 - **P2 — the wall.** The parent-domain cookie, the host-based bridge exemption, the
-  termination invariant, org visibility, the login redirect, sibling CORS, and the
-  `Host`-rewrite reversal.
+  termination invariant, org visibility, the login redirect, the unauthenticated
+  `OPTIONS` path, and sibling-origin enforcement.
 - **P3 — app to app.** `apps` through `RuntimeSpec` and `SessionEgressPolicy` to the
   egress proxy's session state, the DNS answer, the SNI short circuit, and the
   `GuestPortDialer` seam. One small Firecracker integration test, wired into
