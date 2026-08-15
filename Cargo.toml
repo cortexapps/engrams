@@ -139,7 +139,7 @@ futures-util = "0.3"
 # Lever 3 (ADR 0045 C2 restore tail): netlink-first netns provisioning —
 # the ~14 ip/iptables subprocess spawns were ~90-95ms of every sandbox
 # boot AND the teleport dest pipeline.
-rtnetlink = "0.21"
+rtnetlink = "0.22"
 bytes = "1"
 pin-project-lite = "0.2"
 # 0.23 added a default-on `simd-unsafe` feature, which is the only `unsafe` in
