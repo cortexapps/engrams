@@ -106,6 +106,12 @@ export interface TaskComposerProps {
   ariaLabel?: string;
   placeholder?: string;
   uploads?: TaskComposerUploads;
+  /**
+   * Fold the session plumbing (harness, route, model, effort, the reachable-
+   * hosts receipt) behind one Advanced control. For a surface whose subject is
+   * the prompt — the new-spec page — the plumbing is noise until asked for.
+   */
+  quiet?: boolean;
 }
 
 /**
@@ -124,8 +130,11 @@ export function TaskComposer({
   ariaLabel = "Task",
   placeholder = "Fix the flaky billing-gateway integration test and open a PR.",
   uploads,
+  quiet = false,
 }: TaskComposerProps) {
   const navigate = useNavigate();
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const plumbingVisible = !quiet || showAdvanced;
   const { principal } = useAuth();
   const isAdmin = principal.is_admin;
   const {
@@ -440,15 +449,27 @@ export function TaskComposer({
               disabled={pending}
             />
             <div className="@md/composer:ml-auto">
-              <SessionHarnessControls
-                harnesses={harnesses}
-                profileHarness={selected?.harness}
-                profileModelRouter={selected?.modelRouter}
-                profileModel={selected?.model}
-                value={harnessOverride}
-                onChange={setHarnessOverride}
-                disabled={pending}
-              />
+              {plumbingVisible ? (
+                <SessionHarnessControls
+                  harnesses={harnesses}
+                  profileHarness={selected?.harness}
+                  profileModelRouter={selected?.modelRouter}
+                  profileModel={selected?.model}
+                  value={harnessOverride}
+                  onChange={setHarnessOverride}
+                  disabled={pending}
+                />
+              ) : (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground"
+                  onClick={() => setShowAdvanced(true)}
+                >
+                  Advanced
+                </Button>
+              )}
             </div>
           </div>
           <Button
@@ -471,7 +492,7 @@ export function TaskComposer({
         </div>
       </div>
 
-      {policy && (policy.capCount > 0 || policy.reachable.length > 0) && (
+      {plumbingVisible && policy && (policy.capCount > 0 || policy.reachable.length > 0) && (
         <PolicyReceipt
           policy={policy}
           imageName={imageName}

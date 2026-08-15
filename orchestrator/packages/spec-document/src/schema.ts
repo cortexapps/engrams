@@ -1,4 +1,10 @@
-import { Fragment, Node as ProseMirrorNode, Schema, type NodeSpec } from "prosemirror-model";
+import {
+  Fragment,
+  Node as ProseMirrorNode,
+  Schema,
+  type Mark,
+  type NodeSpec,
+} from "prosemirror-model";
 import { Transform } from "prosemirror-transform";
 
 import {
@@ -48,6 +54,19 @@ export const specNodeSpecs: Readonly<Record<string, NodeSpec>> = {
     group: "block",
     defining: true,
   },
+  bulletList: {
+    content: "listItem+",
+    group: "block",
+  },
+  orderedList: {
+    attrs: { start: { default: 1 } },
+    content: "listItem+",
+    group: "block",
+  },
+  listItem: {
+    content: "paragraph block*",
+    defining: true,
+  },
   codeBlock: {
     attrs: { language: { default: "" } },
     content: "text*",
@@ -82,7 +101,18 @@ export const specNodeSpecs: Readonly<Record<string, NodeSpec>> = {
   text: { group: "inline" },
 };
 
-export const schema = new Schema({ nodes: specNodeSpecs });
+/**
+ * Inline marks the markdown round-trip understands. The `code` mark excludes
+ * the others, so a code span never carries emphasis — exactly the markdown
+ * rule.
+ */
+export const specMarkSpecs = {
+  strong: {},
+  em: {},
+  code: { excludes: "_" },
+} as const;
+
+export const schema = new Schema({ nodes: specNodeSpecs, marks: specMarkSpecs });
 
 function textNode(value: string): ProseMirrorNode | null {
   return value.length > 0 ? schema.text(value) : null;
@@ -143,32 +173,117 @@ export function replaceSection(
     .doc;
 }
 
+/**
+ * Escape the characters that would re-parse as markup. The parser reverses
+ * every one of these, so escaped text round-trips instead of accumulating
+ * literal backslashes — the defect that taught the agent to write plain prose.
+ */
 function escapeText(value: string): string {
-  return value.replace(/([\\`*_{}\[\]<>])/g, "\\$1");
+  return value.replace(/([\\`*_])/g, "\\$1").replace(/\{(?=\{)/g, "\\{");
 }
+
+/** Escape a block-construct prefix so a paragraph line never re-parses as one. */
+function escapeLineStarts(value: string): string {
+  return value
+    .split("\n")
+    .map((line) => line.replace(/^(\s*)([#>]|[-+]\s|\d{1,9}[.)]\s|`{3,})/, "$1\\$2"))
+    .join("\n");
+}
+
+// `em` serializes as `_` so strong-plus-em text emits the unambiguous
+// `**_text_**` rather than `***text***`, which the parser cannot split.
+const MARK_DELIMITERS: ReadonlyArray<{ name: "strong" | "em"; delimiter: string }> = [
+  { name: "strong", delimiter: "**" },
+  { name: "em", delimiter: "_" },
+];
 
 function renderInline(node: ProseMirrorNode): string {
   let result = "";
+  const active: string[] = [];
+  const closeTo = (keep: number) => {
+    while (active.length > keep) {
+      const name = active.pop()!;
+      result += MARK_DELIMITERS.find((mark) => mark.name === name)!.delimiter;
+    }
+  };
   node.forEach((child) => {
     if (child.isText) {
-      result += escapeText(child.text ?? "");
+      const text = child.text ?? "";
+      const code = child.marks.some((mark) => mark.type === schema.marks.code);
+      if (code) {
+        closeTo(0);
+        result += renderCodeSpan(text);
+        return;
+      }
+      const wanted = MARK_DELIMITERS.filter((mark) =>
+        child.marks.some((markInstance) => markInstance.type === schema.marks[mark.name]),
+      ).map((mark) => mark.name);
+      let shared = 0;
+      while (shared < active.length && shared < wanted.length && active[shared] === wanted[shared]) {
+        shared += 1;
+      }
+      closeTo(shared);
+      for (const name of wanted.slice(shared)) {
+        active.push(name);
+        result += MARK_DELIMITERS.find((mark) => mark.name === name)!.delimiter;
+      }
+      result += escapeText(text);
     } else if (child.type === schema.nodes.openQuestion) {
       if (child.attrs.resolved !== true) {
+        closeTo(0);
         result += `{{open-question:${String(child.attrs.questionId)}}}`;
       }
     }
   });
+  closeTo(0);
   return result;
 }
 
+/** A code span whose fence is longer than any backtick run inside it. */
+function renderCodeSpan(text: string): string {
+  const longestRun = Math.max(0, ...[...text.matchAll(/`+/g)].map((match) => match[0].length));
+  const fence = "`".repeat(Math.max(1, longestRun + 1));
+  const pad = longestRun > 0 || text.startsWith("`") || text.endsWith("`") ? " " : "";
+  return `${fence}${pad}${text}${pad}${fence}`;
+}
+
+function renderListItem(item: ProseMirrorNode, marker: string, target: SpecRenderTarget): string {
+  const indent = " ".repeat(marker.length);
+  const blocks: string[] = [];
+  item.forEach((block) => {
+    blocks.push(renderBlock(block, target));
+  });
+  const body = blocks.join("\n\n");
+  return (
+    marker +
+    body
+      .split("\n")
+      .map((line, index) => (index === 0 ? line : line.length > 0 ? indent + line : line))
+      .join("\n")
+  );
+}
+
 function renderBlock(node: ProseMirrorNode, target: SpecRenderTarget): string {
-  if (node.type === schema.nodes.paragraph) return renderInline(node);
+  if (node.type === schema.nodes.paragraph) return escapeLineStarts(renderInline(node));
   if (node.type === schema.nodes.heading) {
     const level = Math.min(6, Math.max(3, Number(node.attrs.level)));
     return `${"#".repeat(level)} ${renderInline(node)}`;
   }
+  if (node.type === schema.nodes.bulletList) {
+    const items: string[] = [];
+    node.forEach((item) => items.push(renderListItem(item, "- ", target)));
+    return items.join("\n");
+  }
+  if (node.type === schema.nodes.orderedList) {
+    const start = Number(node.attrs.start) || 1;
+    const items: string[] = [];
+    node.forEach((item, _offset, index) => {
+      items.push(renderListItem(item, `${start + index}. `, target));
+    });
+    return items.join("\n");
+  }
   if (node.type === schema.nodes.codeBlock) {
-    return `\`\`\`${String(node.attrs.language)}\n${node.textContent}\n\`\`\``;
+    return renderCodeFence(String(node.attrs.language), node.textContent);
   }
   if (node.type === schema.nodes.diagramBlock) {
     const block = readSpecBlockAttrs(node.attrs);
@@ -217,18 +332,144 @@ function renderBlockMetadata(block: SpecBlockAttrs, includeSource: boolean): str
   return `<!-- spec-block ${escapeComment(JSON.stringify(metadata))} -->`;
 }
 
+interface InlineParseState {
+  children: ProseMirrorNode[];
+  text: string;
+  marks: readonly Mark[];
+}
+
+/**
+ * Parse inline markdown: `**strong**`, `*em*`/`_em_`, `` `code` ``, backslash
+ * escapes, and `{{open-question:id}}` markers. Unmatched delimiters stay
+ * literal, and every character `escapeText` escapes is unescaped here — the
+ * two halves are a round trip, not a ratchet.
+ */
 function parseInline(value: string): Fragment {
-  const children: ProseMirrorNode[] = [];
-  const marker = /\{\{open-question:([^}]+)}}/g;
+  const state: InlineParseState = { children: [], text: "", marks: [] };
+  parseInlineInto(state, value);
+  flushText(state);
+  return Fragment.fromArray(state.children);
+}
+
+function flushText(state: InlineParseState): void {
+  if (state.text.length === 0) return;
+  state.children.push(schema.text(state.text, state.marks));
+  state.text = "";
+}
+
+function withMark(state: InlineParseState, markName: "strong" | "em", inner: string): void {
+  flushText(state);
+  const before = state.marks;
+  state.marks = schema.marks[markName]!.create().addToSet([...before]);
+  parseInlineInto(state, inner);
+  flushText(state);
+  state.marks = before;
+}
+
+function parseInlineInto(state: InlineParseState, value: string): void {
   let cursor = 0;
-  for (const match of value.matchAll(marker)) {
-    const start = match.index;
-    if (start > cursor) children.push(schema.text(value.slice(cursor, start)));
-    children.push(schema.nodes.openQuestion!.create({ questionId: match[1] }));
-    cursor = start + match[0].length;
+  while (cursor < value.length) {
+    const char = value[cursor]!;
+    if (char === "\\" && cursor + 1 < value.length && PUNCTUATION.test(value[cursor + 1]!)) {
+      state.text += value[cursor + 1]!;
+      cursor += 2;
+      continue;
+    }
+    if (char === "{" && value.startsWith("{{open-question:", cursor)) {
+      const end = value.indexOf("}}", cursor);
+      if (end > cursor) {
+        flushText(state);
+        state.children.push(
+          schema.nodes.openQuestion!.create({
+            questionId: value.slice(cursor + "{{open-question:".length, end),
+          }),
+        );
+        cursor = end + 2;
+        continue;
+      }
+    }
+    if (char === "`") {
+      const run = runLength(value, cursor, "`");
+      const close = findCodeClose(value, cursor + run, run);
+      if (close >= 0) {
+        flushText(state);
+        let code = value.slice(cursor + run, close);
+        if (code.startsWith(" ") && code.endsWith(" ") && code.trim().length > 0) {
+          code = code.slice(1, -1);
+        }
+        if (code.length > 0) {
+          state.children.push(schema.text(code, [schema.marks.code!.create()]));
+        }
+        cursor = close + run;
+        continue;
+      }
+    }
+    if (char === "*" || char === "_") {
+      const run = runLength(value, cursor, char);
+      const delimiter = run >= 2 ? char.repeat(2) : char;
+      const close = findEmphasisClose(value, cursor + delimiter.length, delimiter);
+      if (close >= 0) {
+        withMark(
+          state,
+          delimiter.length === 2 ? "strong" : "em",
+          value.slice(cursor + delimiter.length, close),
+        );
+        cursor = close + delimiter.length;
+        continue;
+      }
+    }
+    state.text += char;
+    cursor += 1;
   }
-  if (cursor < value.length) children.push(schema.text(value.slice(cursor)));
-  return Fragment.fromArray(children);
+}
+
+const PUNCTUATION = /[!-/:-@[-`{-~]/;
+
+function runLength(value: string, index: number, char: string): number {
+  let end = index;
+  while (end < value.length && value[end] === char) end += 1;
+  return end - index;
+}
+
+/** The close of a code span: the next run of exactly the opening length. */
+function findCodeClose(value: string, from: number, run: number): number {
+  let cursor = from;
+  while (cursor < value.length) {
+    if (value[cursor] === "`") {
+      const length = runLength(value, cursor, "`");
+      if (length === run) return cursor;
+      cursor += length;
+    } else {
+      cursor += 1;
+    }
+  }
+  return -1;
+}
+
+/** The close of an emphasis span: non-empty, no spaces hugging the delimiters. */
+function findEmphasisClose(value: string, from: number, delimiter: string): number {
+  if (from >= value.length || value[from] === " ") return -1;
+  let cursor = from;
+  while (cursor < value.length) {
+    if (value[cursor] === "\\") {
+      cursor += 2;
+      continue;
+    }
+    if (value[cursor] === "`") {
+      const run = runLength(value, cursor, "`");
+      const close = findCodeClose(value, cursor + run, run);
+      cursor = close >= 0 ? close + run : cursor + run;
+      continue;
+    }
+    if (value.startsWith(delimiter, cursor)) {
+      const more = runLength(value, cursor, delimiter[0]!);
+      if (more === delimiter.length && cursor > from && value[cursor - 1] !== " ") return cursor;
+      cursor += more;
+      continue;
+    }
+    cursor += 1;
+  }
+  return -1;
 }
 
 interface MarkdownSection {
@@ -252,6 +493,8 @@ function splitSections(markdown: string): MarkdownSection[] {
   }
   return sections;
 }
+
+const LIST_MARKER = /^(\s*)([-+*]|\d{1,9}[.)])\s+(.*)$/;
 
 function parseBlocks(lines: string[]): ProseMirrorNode[] {
   const blocks: ProseMirrorNode[] = [];
@@ -291,15 +534,23 @@ function parseBlocks(lines: string[]): ProseMirrorNode[] {
       index = fence.nextIndex;
       continue;
     }
-    const heading = /^(#{3,6})\s+(.+)$/.exec(lines[index]!);
+    // A section body may use any heading depth; the document clamps to h3+
+    // because h2 is the section boundary.
+    const heading = /^(#{1,6})\s+(.+)$/.exec(lines[index]!);
     if (heading) {
       blocks.push(
         schema.nodes.heading!.create(
-          { level: heading[1]!.length },
+          { level: Math.max(3, heading[1]!.length) },
           parseInline(heading[2]!),
         ),
       );
       index += 1;
+      continue;
+    }
+    if (LIST_MARKER.test(lines[index]!)) {
+      const list = parseList(lines, index);
+      blocks.push(list.node);
+      index = list.nextIndex;
       continue;
     }
 
@@ -308,7 +559,8 @@ function parseBlocks(lines: string[]): ProseMirrorNode[] {
       index < lines.length &&
       lines[index]!.trim().length > 0 &&
       !/^`{3,}/.test(lines[index]!) &&
-      !/^#{3,6}\s+/.test(lines[index]!)
+      !/^#{1,6}\s+/.test(lines[index]!) &&
+      !LIST_MARKER.test(lines[index]!)
     ) {
       paragraphLines.push(lines[index]!);
       index += 1;
@@ -316,6 +568,75 @@ function parseBlocks(lines: string[]): ProseMirrorNode[] {
     blocks.push(schema.nodes.paragraph!.create(null, parseInline(paragraphLines.join("\n"))));
   }
   return blocks.length > 0 ? blocks : [paragraph()];
+}
+
+interface ParsedList {
+  node: ProseMirrorNode;
+  nextIndex: number;
+}
+
+/**
+ * Parse one list whose items sit at the indent of the first marker. Lines
+ * indented past a marker continue that item and are parsed recursively, so
+ * nested lists work. The list ends at a dedent or at a blank line followed by
+ * a non-list line.
+ */
+function parseList(lines: string[], start: number): ParsedList {
+  const first = LIST_MARKER.exec(lines[start]!)!;
+  const indent = first[1]!.length;
+  const ordered = /\d/.test(first[2]![0]!);
+  const items: ProseMirrorNode[] = [];
+  let index = start;
+  while (index < lines.length) {
+    const line = lines[index]!;
+    if (line.trim().length === 0) {
+      // A blank line ends the list unless another item (or continuation)
+      // of this same list follows.
+      const next = lines[index + 1];
+      if (next === undefined) break;
+      const marker = LIST_MARKER.exec(next);
+      const continues =
+        (marker !== null && marker[1]!.length >= indent) ||
+        (next.trim().length > 0 && leadingSpaces(next) > indent);
+      if (!continues) break;
+      index += 1;
+      continue;
+    }
+    const marker = LIST_MARKER.exec(line);
+    if (!marker || marker[1]!.length !== indent) break;
+    // A marker of the other kind starts a new list, not a new item.
+    if (/\d/.test(marker[2]![0]!) !== ordered) break;
+    const itemIndent = indent + marker[2]!.length + 1;
+    const content: string[] = [marker[3]!];
+    index += 1;
+    while (index < lines.length) {
+      const candidate = lines[index]!;
+      if (candidate.trim().length === 0) {
+        const next = lines[index + 1];
+        if (next !== undefined && next.trim().length > 0 && leadingSpaces(next) >= itemIndent) {
+          content.push("");
+          index += 1;
+          continue;
+        }
+        break;
+      }
+      if (leadingSpaces(candidate) < itemIndent) break;
+      content.push(candidate.slice(itemIndent));
+      index += 1;
+    }
+    items.push(schema.nodes.listItem!.create(null, parseBlocks(content)));
+  }
+  const node = ordered
+    ? schema.nodes.orderedList!.create(
+        { start: Number.parseInt(first[2]!, 10) || 1 },
+        items,
+      )
+    : schema.nodes.bulletList!.create(null, items);
+  return { node, nextIndex: index };
+}
+
+function leadingSpaces(line: string): number {
+  return line.length - line.trimStart().length;
 }
 
 interface ParsedFence {
@@ -380,6 +701,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export function parseMarkdownBlocks(markdown: string): ProseMirrorNode[] {
   return parseBlocks(markdown.replace(/\r\n/g, "\n").split("\n"));
+}
+
+/**
+ * Parse a section body, dropping a leading heading that repeats the section
+ * title. The canvas renders the stable section heading itself, so a body that
+ * opens with `## Goals` (or `**Goals**` alone) would show the title twice —
+ * the first live drive produced exactly that in every seeded section.
+ */
+export function parseSectionBody(markdown: string, sectionTitle: string): ProseMirrorNode[] {
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+  let start = 0;
+  while (start < lines.length && lines[start]!.trim().length === 0) start += 1;
+  const first = lines[start]?.trim() ?? "";
+  const title = sectionTitle.trim().toLowerCase();
+  const heading = /^#{1,6}\s+(.+?)\s*$/.exec(first);
+  const bold = /^\*\*(.+?)\*\*$/.exec(first);
+  const repeated = (heading?.[1] ?? bold?.[1])?.trim().toLowerCase();
+  if (repeated !== undefined && repeated === title) {
+    return parseBlocks(lines.slice(start + 1));
+  }
+  return parseBlocks(lines);
 }
 
 export function parseMarkdown(markdown: string, template: SpecTemplate): ProseMirrorNode {

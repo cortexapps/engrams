@@ -2,7 +2,7 @@ import { useMemo } from "react";
 
 import { buildMessages } from "@/components/session-thread/buildMessages";
 import { useSpecEvents } from "@/hooks/useSpecEvents";
-import { useSpecMessages } from "@/hooks/useSpecMessages";
+import { useSpecMessages, type SpecMessage } from "@/hooks/useSpecMessages";
 import type { IndexedEvent } from "@/lib/types";
 import { buildSpecThread } from "./buildSpecThread";
 
@@ -12,6 +12,7 @@ const EMPTY_SECTION_TITLES = new Map<string, string>();
 export function useSpecConversation(
   specId: string,
   sectionTitles: ReadonlyMap<string, string> = EMPTY_SECTION_TITLES,
+  owner: SpecMessage["author"] | null = null,
 ) {
   const eventState = useSpecEvents(specId);
   const messageState = useSpecMessages(specId);
@@ -21,8 +22,8 @@ export function useSpecConversation(
   );
   const messagesByPromptId = messageState.data?.byPromptId ?? EMPTY_MESSAGES;
   const entries = useMemo(
-    () => buildSpecThread(folded.messages, messagesByPromptId, sectionTitles),
-    [folded.messages, messagesByPromptId, sectionTitles],
+    () => buildSpecThread(folded.messages, messagesByPromptId, sectionTitles, owner),
+    [folded.messages, messagesByPromptId, owner, sectionTitles],
   );
   const acknowledgedPromptIds = useMemo(
     () => new Set(messageState.data?.messages.map((message) => message.promptId) ?? []),

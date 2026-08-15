@@ -111,6 +111,10 @@ class CrashOnceQuestionStore implements OpenQuestionStore {
     return this.record.state === "open" ? { [SECTION_ID]: 1 } : {};
   }
 
+  async listOpenBySpec(): Promise<OpenQuestionRecord[]> {
+    return this.record.state === "open" ? [{ ...this.record }] : [];
+  }
+
   async create(): Promise<OpenQuestionRecord> {
     return { ...this.record };
   }
@@ -163,6 +167,10 @@ class ConcurrentQuestionStore implements OpenQuestionStore {
 
   async countOpenBySection(): Promise<Record<string, number>> {
     return this.record.state === "open" ? { [SECTION_ID]: 1 } : {};
+  }
+
+  async listOpenBySpec(): Promise<OpenQuestionRecord[]> {
+    return this.record.state === "open" ? [{ ...this.record }] : [];
   }
 
   async create(): Promise<OpenQuestionRecord> {

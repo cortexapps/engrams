@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef } from "react";
+import { toast } from "sonner";
 import { Collaboration } from "@tiptap/extension-collaboration";
 import { CollaborationCaret } from "@tiptap/extension-collaboration-caret";
 import { EditorContent, useEditor } from "@tiptap/react";
@@ -11,6 +12,7 @@ import { collaboratorColor } from "@/components/spec-mode/collaborator-colors";
 import {
   SectionNodeViewProvider,
   type SectionStateAction,
+  type SpecQuestionActions,
 } from "@/components/spec-mode/SectionNodeView";
 import { sectionIdAtPos, type SpecPresenceEntry } from "@/components/spec-mode/section-presence";
 import type { SpecSurface } from "@/components/spec-mode/spec-surface";
@@ -18,7 +20,8 @@ import { Provenance, refreshProvenance } from "@/components/spec-mode/provenance
 import { Button } from "@/components/ui/button";
 import { useIsMobile } from "@/hooks/use-mobile";
 import type { SpecConnection } from "./SpecConnection";
-import { useSetSpecSectionState } from "@/hooks/useSpecRead";
+import { useSetSpecSectionState, useUndoSpecSectionState } from "@/hooks/useSpecRead";
+import { useDismissSpecQuestion, useResolveSpecQuestion } from "@/hooks/useSpecQuestions";
 import { SpecSelectionBubbleMenu, type SpecSelectionActions } from "./SpecSelectionActions";
 import { SpecBlockIterationProvider } from "./block-iteration";
 import { specNodeExtensions } from "./extensions";
@@ -49,6 +52,31 @@ export function SpecCanvas({
 }) {
   const { principal } = useAuth();
   const sectionState = useSetSpecSectionState(specId);
+  const undoSectionState = useUndoSpecSectionState(specId);
+  const resolveQuestion = useResolveSpecQuestion(specId);
+  const dismissQuestion = useDismissSpecQuestion(specId);
+  const questionActions = useMemo<SpecQuestionActions>(
+    () => ({
+      resolve: (questionId, answer) =>
+        resolveQuestion.mutate(
+          { questionId, answer },
+          {
+            onError: (error) =>
+              toast.error("The answer did not save.", {
+                description: error instanceof Error ? error.message : undefined,
+              }),
+          },
+        ),
+      dismiss: (questionId) =>
+        dismissQuestion.mutate(questionId, {
+          onError: (error) =>
+            toast.error("The question did not close.", {
+              description: error instanceof Error ? error.message : undefined,
+            }),
+        }),
+    }),
+    [dismissQuestion, resolveQuestion],
+  );
   const user = useMemo(
     () => ({
       name: principal.display_name || principal.email,
@@ -70,11 +98,45 @@ export function SpecCanvas({
         showProvenance={showProvenance}
         presence={presence}
         readOnly={readOnly}
+        questionActions={questionActions}
         pendingSectionId={
           sectionState.isPending ? (sectionState.variables?.sectionId ?? null) : null
         }
         onSetSectionState={(action) =>
-          sectionState.mutate({ ...action, actionId: crypto.randomUUID() })
+          sectionState.mutate(
+            { ...action, actionId: crypto.randomUUID() },
+            {
+              // The settle confirms with an undo chip (a locked mock-review
+              // decision the first build skipped): the action stays quiet and
+              // reversible instead of silently permanent.
+              onSuccess: (result) => {
+                const chip = result.chip;
+                if (chip.after.state !== "settled") return;
+                const remaining =
+                  surface.sections.find((section) => section.id === action.sectionId)
+                    ?.openQuestionCount ?? 0;
+                toast(`Settled §${chip.sectionTitle}`, {
+                  description:
+                    remaining > 0
+                      ? `${remaining} open ${remaining === 1 ? "question" : "questions"} remain in this section.`
+                      : undefined,
+                  action: {
+                    label: "Undo",
+                    onClick: () =>
+                      undoSectionState.mutate({
+                        sectionId: action.sectionId,
+                        undo: chip.undo,
+                        actionId: crypto.randomUUID(),
+                      }),
+                  },
+                });
+              },
+              onError: (error) =>
+                toast.error("The section state did not change.", {
+                  description: error instanceof Error ? error.message : undefined,
+                }),
+            },
+          )
         }
       />
     </SpecBlockIterationProvider>
@@ -99,6 +161,7 @@ export function ConnectedSpecCanvas({
   presence = [],
   pendingSectionId = null,
   onSetSectionState = () => undefined,
+  questionActions,
   readOnly: forcedReadOnly = false,
 }: {
   connection: SpecConnection;
@@ -111,6 +174,7 @@ export function ConnectedSpecCanvas({
   presence?: SpecPresenceEntry[];
   pendingSectionId?: string | null;
   onSetSectionState?: (action: SectionStateAction) => void;
+  questionActions?: SpecQuestionActions;
   readOnly?: boolean;
 }) {
   const surfaceRef = useRef(surface);
@@ -194,11 +258,13 @@ export function ConnectedSpecCanvas({
       )}
       <SectionNodeViewProvider
         value={{
+          specId,
           surface,
           showProvenance,
           pendingSectionId,
           presence,
           setSectionState: onSetSectionState,
+          ...(questionActions ? { questionActions } : {}),
         }}
       >
         <EditorContent editor={editor} />

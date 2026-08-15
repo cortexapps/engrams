@@ -45,9 +45,11 @@ export function SpecPublishedView({
 
   if (ticketSurface === "sync") {
     return (
-      <main className="spec-mode-published-tickets">
-        <SpecTicketSyncPanel specId={specId} onBack={() => setTicketSurface(null)} />
-      </main>
+      <div className="spec-mode-published-surface">
+        <main className="spec-mode-published-tickets">
+          <SpecTicketSyncPanel specId={specId} onBack={() => setTicketSurface(null)} />
+        </main>
+      </div>
     );
   }
   if (ticketSurface === "tree") {
@@ -57,102 +59,118 @@ export function SpecPublishedView({
   }
 
   return (
-    <main className="spec-mode-published" aria-label="Published spec">
-      <header className="spec-mode-published-header">
-        <div className="spec-mode-published-meta">
-          <Text as="span" variant="label" tone="muted">
-            Published
-          </Text>
-          <Text as="span" variant="code" tone="muted">
-            v{checkpoint.docSeq} · pinned {formatDate(publishedAt ?? checkpoint.createdAt)} ·
-            immutable
-          </Text>
-        </div>
-        <Text as="h1" variant="heading" className="spec-mode-published-title">
-          {title}
-        </Text>
-        <div className="spec-mode-published-byline">
-          {decisions.isPending ? (
-            <Text tone="muted">Loading decision attribution…</Text>
-          ) : people.length > 0 ? (
-            <Text>Decided by {people.map((person) => person.name).join(", ")} · with engram</Text>
-          ) : (
-            <Text tone="muted">Decision attribution is not available.</Text>
-          )}
-          <span aria-hidden="true" />
-          <Text as="span" variant="code" tone="muted">
-            {checkpoint.sections.length} {checkpoint.sections.length === 1 ? "section" : "sections"}
-            {" · "}
-            {openQuestions.length} open {openQuestions.length === 1 ? "question" : "questions"}
-          </Text>
-        </div>
-      </header>
-
-      <DecisionCard
-        decisions={decisionRows}
-        pending={decisions.isPending}
-        error={decisions.error}
-      />
-
-      <PublishedDocument markdown={checkpoint.markdown} decisions={decisionRows} />
-
-      {openQuestions.length > 0 ? (
-        <section className="spec-mode-published-questions" aria-labelledby="carried-questions">
-          <div>
-            <Text as="h2" variant="heading" id="carried-questions">
-              Questions carried forward
+    // The surface paints its own paper. Without it, this main sat directly on
+    // the app shell's dark ground while keeping light-theme ink — the
+    // published page rendered dark-on-dark, unreadable.
+    <div className="spec-mode-published-surface">
+      <main className="spec-mode-published" aria-label="Published spec">
+        <header className="spec-mode-published-header">
+          <div className="spec-mode-published-meta">
+            <Text as="span" variant="label" tone="muted">
+              Published
             </Text>
-            <Text tone="muted">
-              Publishing acknowledged these questions. It did not resolve them.
+            <Text as="span" variant="code" tone="muted">
+              {/* The pinned date, never the internal doc_seq: a first publish
+                once introduced itself as "v11". */}
+              Published {formatDate(publishedAt ?? checkpoint.createdAt)} · immutable
             </Text>
           </div>
-          <ul>
-            {openQuestions.map((question) => (
-              <li key={question.id}>
-                <span aria-hidden="true">⚑</span>
-                <span>
-                  <Text>{question.text}</Text>
-                  <Text as="span" variant="code" tone="muted">
-                    Open question · §{question.sectionTitle} · carried into the rollout tickets
-                  </Text>
-                </span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
-
-      <footer className="spec-mode-published-footer">
-        <div className="spec-mode-published-footer-actions">
-          <Button type="button" variant="outline" onClick={onOpenDraft}>
-            Open the draft
-          </Button>
-          <Button type="button" variant="outline" onClick={() => setTicketSurface("tree")}>
-            Open tickets
-          </Button>
-          <Button type="button" variant="ghost" onClick={() => setTicketSurface("sync")}>
-            Sync tickets
-          </Button>
-        </div>
-        {currentRevision !== checkpoint.docSeq ? (
-          <Text as="span" variant="code" tone="muted">
-            The draft has moved on since this version.
+          <Text as="h1" variant="heading" className="spec-mode-published-title">
+            {title}
           </Text>
+          <div className="spec-mode-published-byline">
+            {decisions.isPending ? (
+              <Text tone="muted">Loading decision attribution…</Text>
+            ) : people.length > 0 ? (
+              <Text>Decided by {people.map((person) => person.name).join(", ")} · with engram</Text>
+            ) : (
+              <Text tone="muted">Decision attribution is not available.</Text>
+            )}
+            <span aria-hidden="true" />
+            <Text as="span" variant="code" tone="muted">
+              {checkpoint.sections.length}{" "}
+              {checkpoint.sections.length === 1 ? "section" : "sections"}
+              {" · "}
+              {openQuestions.length} open {openQuestions.length === 1 ? "question" : "questions"}
+            </Text>
+          </div>
+        </header>
+
+        <DecisionCard
+          decisions={decisionRows}
+          sections={checkpoint.sections}
+          pending={decisions.isPending}
+          error={decisions.error}
+        />
+
+        <PublishedDocument markdown={checkpoint.markdown} decisions={decisionRows} />
+
+        {openQuestions.length > 0 ? (
+          <section className="spec-mode-published-questions" aria-labelledby="carried-questions">
+            <div>
+              <Text as="h2" variant="heading" id="carried-questions">
+                Questions carried forward
+              </Text>
+              <Text tone="muted">
+                Publishing acknowledged these questions. It did not resolve them.
+              </Text>
+            </div>
+            <ul>
+              {openQuestions.map((question) => (
+                <li key={question.id}>
+                  <span aria-hidden="true">⚑</span>
+                  <span>
+                    <Text>{question.text}</Text>
+                    <Text as="span" variant="code" tone="muted">
+                      Open question · §{question.sectionTitle} · carried into the rollout tickets
+                    </Text>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </section>
         ) : null}
-      </footer>
-    </main>
+
+        <footer className="spec-mode-published-footer">
+          <div className="spec-mode-published-footer-actions">
+            <Button type="button" variant="outline" onClick={onOpenDraft}>
+              Open the draft
+            </Button>
+            <Button type="button" variant="outline" onClick={() => setTicketSurface("tree")}>
+              Open tickets
+            </Button>
+            <Button type="button" variant="ghost" onClick={() => setTicketSurface("sync")}>
+              Sync tickets
+            </Button>
+          </div>
+          {currentRevision !== checkpoint.docSeq ? (
+            <Text as="span" variant="code" tone="muted">
+              The draft has moved on since this version.
+            </Text>
+          ) : null}
+        </footer>
+      </main>
+    </div>
   );
 }
 
 function DecisionCard({
   decisions,
+  sections,
   pending,
   error,
 }: {
   decisions: SpecDecision[];
+  sections: Array<{ id: string; title: string }>;
   pending: boolean;
   error: Error | null;
 }) {
+  // The pinned document owns the headings. The server falls back to the raw
+  // section id when no transcript action named the section, which rendered
+  // "§9d23bd84-…" in the ledger.
+  const titles = new Map(sections.map((section) => [section.id, section.title]));
+  const sectionTitle = (decision: SpecDecision) =>
+    titles.get(decision.sectionId) ?? decision.sectionTitle;
   return (
     <section className="spec-mode-decisions" aria-labelledby="published-decisions">
       <header>
@@ -184,12 +202,12 @@ function DecisionCard({
               <div>
                 <Text className="spec-mode-decision-copy">
                   {decision.kind === "section_settled"
-                    ? `Settled §${decision.sectionTitle}`
+                    ? `Settled §${sectionTitle(decision)}`
                     : `Resolved: “${decision.question}”`}
                 </Text>
                 <Text as="span" variant="code" tone="muted">
                   {decision.actor.name}
-                  {decision.kind === "question_resolved" ? ` · §${decision.sectionTitle}` : ""}
+                  {decision.kind === "question_resolved" ? ` · §${sectionTitle(decision)}` : ""}
                 </Text>
               </div>
             </li>
@@ -254,34 +272,36 @@ function PublishedTicketTree({
   const command = useSpecTicketCommand(specId);
   const queryClient = useQueryClient();
   return (
-    <main className="spec-mode-published-tickets">
-      <header>
-        <div>
-          <Text as="span" variant="label" tone="muted">
-            Published tickets
+    <div className="spec-mode-published-surface">
+      <main className="spec-mode-published-tickets">
+        <header>
+          <div>
+            <Text as="span" variant="label" tone="muted">
+              Published tickets
+            </Text>
+            <Text as="h1" variant="heading">
+              {title}
+            </Text>
+          </div>
+          <Button type="button" variant="outline" onClick={onBack}>
+            Back to spec
+          </Button>
+        </header>
+        {tickets.isPending ? <Skeleton className="h-40 w-full" /> : null}
+        {tickets.error ? (
+          <Text tone="destructive" role="alert">
+            The ticket tree is not available. {tickets.error.message}
           </Text>
-          <Text as="h1" variant="heading">
-            {title}
-          </Text>
-        </div>
-        <Button type="button" variant="outline" onClick={onBack}>
-          Back to spec
-        </Button>
-      </header>
-      {tickets.isPending ? <Skeleton className="h-40 w-full" /> : null}
-      {tickets.error ? (
-        <Text tone="destructive" role="alert">
-          The ticket tree is not available. {tickets.error.message}
-        </Text>
-      ) : null}
-      {tickets.data ? (
-        <SpecTicketTree
-          tree={tickets.data}
-          onCommand={(ticketCommand) => command.mutateAsync(ticketCommand)}
-          onTree={(tree) => writeTree(queryClient, specId, tree)}
-        />
-      ) : null}
-    </main>
+        ) : null}
+        {tickets.data ? (
+          <SpecTicketTree
+            tree={tickets.data}
+            onCommand={(ticketCommand) => command.mutateAsync(ticketCommand)}
+            onTree={(tree) => writeTree(queryClient, specId, tree)}
+          />
+        ) : null}
+      </main>
+    </div>
   );
 }
 
@@ -329,7 +349,7 @@ export function markdownSections(markdown: string): MarkdownSection[] {
   return sections;
 }
 
-const PROVENANCE = /[A-Za-z0-9_./-]+\s+@\s+[0-9a-f]{7,40}/gi;
+const PROVENANCE = /[A-Za-z0-9_./-]+(?::[0-9-]+)?\s+@\s+[0-9a-f]{7,40}/gi;
 
 export function provenanceSources(markdown: string): string[] {
   return [...new Set(markdown.match(PROVENANCE) ?? [])];

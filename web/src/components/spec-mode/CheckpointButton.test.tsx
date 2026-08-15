@@ -28,7 +28,7 @@ describe("CheckpointButton", () => {
     ];
     const view = render(<CheckpointButton specId="spec-1" checkpoints={initialCheckpoints} />);
 
-    await user.click(screen.getByRole("button", { name: /v3/ }));
+    await user.click(screen.getByRole("button", { name: /History/ }));
     await user.click(screen.getByRole("button", { name: /Checkpoint 1/ }));
     expect(screen.getByRole("button", { name: /Checkpoint 1/ }).getAttribute("aria-pressed")).toBe(
       "true",

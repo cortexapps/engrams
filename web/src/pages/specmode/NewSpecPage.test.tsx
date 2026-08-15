@@ -218,6 +218,8 @@ describe("NewSpecPage", () => {
     await user.click(screen.getByTestId("profile-switcher"));
     await user.click(screen.getByTestId("profile-option-" + platform.id));
 
+    // The new-spec composer is quiet: the plumbing sits behind Advanced.
+    await user.click(screen.getByRole("button", { name: "Advanced" }));
     await user.click(screen.getByTestId("session-harness-select"));
     await user.click(screen.getByRole("menuitem", { name: "Codex" }));
     await user.click(screen.getByTestId("session-router-select"));

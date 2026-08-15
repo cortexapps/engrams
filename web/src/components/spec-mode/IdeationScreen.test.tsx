@@ -12,7 +12,6 @@ const conversation = vi.hoisted(() => ({
     kind: "agent";
     id: string;
     text: string;
-    citations: string[];
     createdAt: string | null;
   }>,
   acknowledgedPromptIds: new Set<string>(),
@@ -71,8 +70,7 @@ describe("IdeationScreen", () => {
       {
         kind: "agent",
         id: "agent-1",
-        text: "The limiter uses one bucket per user.",
-        citations: ["gateway/limits.rs @ 8f2c1a4"],
+        text: "The limiter uses one bucket per user. `gateway/limits.rs @ 8f2c1a4`",
         createdAt: null,
       },
     ];
@@ -88,7 +86,9 @@ describe("IdeationScreen", () => {
       />,
     );
 
-    expect(await screen.findByText("The limiter uses one bucket per user.")).toBeTruthy();
+    expect(
+      await screen.findByText("The limiter uses one bucket per user.", { exact: false }),
+    ).toBeTruthy();
     expect(screen.getByText("gateway/limits.rs @ 8f2c1a4")).toBeTruthy();
     expect(
       screen.getByText("The conversation has findings ready to shape the document."),

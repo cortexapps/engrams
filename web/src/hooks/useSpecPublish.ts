@@ -46,20 +46,27 @@ export function specPublishKey(specId: string) {
   return ["spec", specId, "publish"] as const;
 }
 
-/** Poll while the durable publish scanner advances the recorded request. */
+/**
+ * Poll fast while the durable publish scanner advances the recorded request,
+ * and at the drafting cadence otherwise: the payload also carries the open
+ * questions, and a stale copy rendered question cards with no text.
+ */
 export function useSpecPublish(specId: string) {
   return useQuery({
     queryKey: specPublishKey(specId),
     queryFn: () => specRequest<SpecPublishStatus>(`/specs/${specId}/publish`),
     refetchInterval: (query) => {
-      const publish = query.state.data?.publish;
+      const data = query.state.data;
+      const publish = data?.publish;
       const advancing =
         publish !== null &&
         publish !== undefined &&
         publish.state !== "complete" &&
         publish.state !== "blocked";
-      return advancing ? 2_000 : false;
+      if (advancing) return 2_000;
+      return data?.phase === "drafting" ? 5_000 : false;
     },
+    refetchIntervalInBackground: false,
   });
 }
 

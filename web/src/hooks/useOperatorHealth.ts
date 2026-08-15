@@ -14,9 +14,14 @@ export interface OperatorHealth {
 // worst thing an operator should know about without opening the cockpit. The
 // thresholds live in operator-health.ts, shared with the Overview verdict, so the
 // dot and the cockpit can never disagree.
+// The telltale rides every page for every user, so it polls at a background
+// cadence. At 1 s (the cockpit rate) it cost ~1 fleet query per second per
+// open tab, from the spec editor and the login screen alike.
+const TELLTALE_INTERVAL_MS = 30_000;
+
 export function useOperatorHealth(): OperatorHealth {
-  const { data: hosts } = useHosts();
-  const { data: storage } = useStorageSummary();
+  const { data: hosts } = useHosts(TELLTALE_INTERVAL_MS);
+  const { data: storage } = useStorageSummary(TELLTALE_INTERVAL_MS);
 
   const h = hosts ?? [];
   if (h.length === 0) return { tone: null, reason: null }; // nothing registered — nothing to watch

@@ -186,7 +186,9 @@ export function deriveSpecSurface(
         provenance: documentSection?.provenance ?? [],
       };
     }),
-    settledCount: rail.sections.filter((section) => section.state === "settled").length,
+    // Count what the publish gate counts (settled or n/a), so the rail tally
+    // and the publish dialog can never disagree.
+    settledCount: rail.sections.filter(isSectionComplete).length,
     totalCount: rail.sections.length,
     openQuestions:
       documentSections?.openQuestions.map((question) => ({
@@ -228,7 +230,7 @@ interface DocumentFacts {
   provenanceRanges: SpecSurfaceProvenanceRange[];
 }
 
-const PROVENANCE_PATTERN = /[A-Za-z0-9_./-]+\s+@\s+[0-9a-f]{7,40}/gi;
+const PROVENANCE_PATTERN = /[A-Za-z0-9_./-]+(?::[0-9-]+)?\s+@\s+[0-9a-f]{7,40}/gi;
 
 function readDocumentSections(document: Y.Doc): DocumentFacts {
   const fragment = document.getXmlFragment(SPEC_FRAGMENT_NAME);

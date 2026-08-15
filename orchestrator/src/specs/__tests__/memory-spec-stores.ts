@@ -128,6 +128,10 @@ export class MemoryQuestionStore implements OpenQuestionStore {
     return {};
   }
 
+  async listOpenBySpec(specId: string): Promise<OpenQuestionRecord[]> {
+    return [...this.rows.values()].filter((row) => row.specId === specId && row.state === "open");
+  }
+
   async create(input: CreateOpenQuestionInput): Promise<OpenQuestionRecord> {
     const existing = this.rows.get(input.id);
     if (existing) return existing;

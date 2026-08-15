@@ -89,6 +89,47 @@
   white-space: nowrap;
 }
 
+.spec-mode-title-edit {
+  overflow: hidden;
+  min-width: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  padding: 0 4px;
+  margin: 0 -4px;
+  background: none;
+  text-align: left;
+  cursor: text;
+}
+
+.spec-mode-title-edit:hover,
+.spec-mode-title-edit:focus-visible {
+  background: color-mix(in oklab, var(--foreground) 6%, transparent);
+  outline: none;
+}
+
+.spec-mode-title-input {
+  min-width: 0;
+  flex: 1;
+  border: 1px solid var(--ring);
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  background: var(--background);
+  color: var(--foreground);
+  font: inherit;
+  font-weight: 600;
+}
+
+.spec-mode-not-found {
+  display: grid;
+  height: 100%;
+  place-content: center;
+  gap: 10px;
+  justify-items: start;
+  padding: 40px;
+  background: var(--background);
+  color: var(--foreground);
+}
+
 .spec-mode-template-name {
   flex: none;
   white-space: nowrap;
@@ -406,7 +447,11 @@
   white-space: nowrap;
 }
 
-.spec-mode-section-content > h2:first-child {
+/* The chrome header renders the section title; the document's own heading
+   node stays hidden. A descendant selector, because tiptap's NodeViewContent
+   wraps the content in an extra div — the old `> h2:first-child` never
+   matched, and every section showed its title twice. */
+.spec-mode-section-content h2[data-spec-section-heading] {
   display: none;
 }
 
@@ -417,7 +462,47 @@
   text-wrap: pretty;
 }
 
-.spec-mode-section-content > * + * {
+.spec-mode-section-content ul,
+.spec-mode-section-content ol {
+  margin: 0;
+  padding-left: 1.4em;
+  font-size: 0.92rem;
+  line-height: 1.72;
+}
+
+.spec-mode-section-content li + li {
+  margin-top: 4px;
+}
+
+.spec-mode-section-content li > ul,
+.spec-mode-section-content li > ol {
+  margin-top: 4px;
+}
+
+.spec-mode-section-content code {
+  border-radius: 4px;
+  background: color-mix(in oklab, var(--foreground) 7%, transparent);
+  padding: 0.08em 0.34em;
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+}
+
+.spec-mode-section-content pre {
+  overflow-x: auto;
+  border-radius: 6px;
+  background: color-mix(in oklab, var(--foreground) 5%, transparent);
+  padding: 10px 12px;
+}
+
+.spec-mode-section-content pre code {
+  background: none;
+  padding: 0;
+}
+
+/* Both forms: the direct children when the content is plain HTML (published,
+   tests), and one level down for tiptap's NodeViewContent wrapper div. */
+.spec-mode-section-content > * + *,
+.spec-mode-section-content > div > * + * {
   margin-top: 10px;
 }
 
@@ -477,15 +562,30 @@
   background: color-mix(in oklab, var(--ring) 8%, transparent);
 }
 
+/* Block-level even though the node is inline: a question card jammed into a
+   paragraph's tail read as stray text. */
 .spec-mode-open-question {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 10px;
+  margin: 8px 0;
   border: 1px dashed var(--instrument-caution);
   border-radius: var(--radius-sm);
   padding: 10px 12px;
   background: color-mix(in oklch, var(--instrument-caution) 8%, transparent);
   vertical-align: middle;
+}
+
+.spec-mode-open-question-actions {
+  display: inline-flex;
+  flex: none;
+  gap: 6px;
+}
+
+.spec-mode-question-answer {
+  display: grid;
+  width: 340px;
+  gap: 10px;
 }
 
 .spec-mode-open-question[data-resolved="true"] {
@@ -500,6 +600,8 @@
 
 .spec-mode-open-question-copy {
   display: inline-flex;
+  flex: 1;
+  min-width: 0;
   flex-direction: column;
   gap: 3px;
 }
@@ -629,7 +731,6 @@
   background: var(--secondary);
   font-size: 0.84rem;
   line-height: 1.6;
-  white-space: pre-wrap;
 }
 
 .spec-mode-agent-copy {
@@ -637,20 +738,52 @@
   font-size: 0.84rem;
   line-height: 1.68;
   text-wrap: pretty;
-  white-space: pre-wrap;
 }
 
-.spec-mode-citations {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
+/* Rendered markdown inside a rail bubble: the shared .md-* styles carry the
+   look; this scopes the sizes to the rail's compact scale. */
+.spec-mode-markdown > * {
+  margin: 0;
 }
 
-.spec-mode-citations span {
+.spec-mode-markdown > * + * {
+  margin-top: 8px;
+}
+
+.spec-mode-markdown ul,
+.spec-mode-markdown ol {
+  padding-left: 1.3em;
+}
+
+.spec-mode-markdown table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.spec-mode-markdown th,
+.spec-mode-markdown td {
   border: 1px solid var(--border);
-  border-radius: 5px;
-  padding: 2px 7px;
-  font-size: 0.66rem;
+  padding: 4px 8px;
+  text-align: left;
+}
+
+.spec-mode-markdown .md-h {
+  font-size: 0.9rem;
+}
+
+.spec-mode-pending {
+  opacity: 0.65;
+}
+
+.spec-mode-phase-chip {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 8px;
+  margin: 4px 0;
 }
 
 .spec-mode-thinking {
@@ -1067,6 +1200,16 @@
     flex-direction: column;
     gap: 7px;
   }
+}
+
+/* The published page's own paper. The app layout's ground is the dark shell
+   color; every published surface must paint a full-bleed background from the
+   same token set as its ink, or the page renders dark-on-dark. */
+.spec-mode-published-surface {
+  height: 100%;
+  overflow-y: auto;
+  background: var(--background);
+  color: var(--foreground);
 }
 
 .spec-mode-published {

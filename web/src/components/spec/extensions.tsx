@@ -1,4 +1,4 @@
-import { Node, Extension, type Attributes, type NodeConfig } from "@tiptap/core";
+import { Node, Extension, Mark, type Attributes, type NodeConfig } from "@tiptap/core";
 import { Plugin } from "@tiptap/pm/state";
 import { ReactNodeViewRenderer } from "@tiptap/react";
 import { specNodeSpecs } from "@engrams/spec-document";
@@ -68,7 +68,10 @@ const SpecSectionHeading = Node.create({
   name: "sectionHeading",
   ...sharedConfig("sectionHeading"),
   parseHTML: () => [{ tag: "h2[data-spec-section-heading]" }],
-  renderHTML: () => ["h2", { "data-spec-section-heading": "" }, 0],
+  // contenteditable=false: the section title is template structure. The canvas
+  // chrome renders the visible title; an editable copy in the document let one
+  // stray keystroke rename "Problem" to "Problemf" across the whole product.
+  renderHTML: () => ["h2", { "data-spec-section-heading": "", contenteditable: "false" }, 0],
 });
 
 const SpecParagraph = Node.create({
@@ -83,6 +86,53 @@ const SpecHeading = Node.create({
   ...sharedConfig("heading"),
   parseHTML: () => [3, 4, 5, 6].map((level) => ({ tag: `h${level}`, attrs: { level } })),
   renderHTML: ({ node }) => [`h${clampHeadingLevel(node.attrs.level)}`, 0],
+});
+
+const SpecBulletList = Node.create({
+  name: "bulletList",
+  ...sharedConfig("bulletList"),
+  parseHTML: () => [{ tag: "ul" }],
+  renderHTML: () => ["ul", 0],
+});
+
+const SpecOrderedList = Node.create({
+  name: "orderedList",
+  ...sharedConfig("orderedList"),
+  parseHTML: () => [
+    {
+      tag: "ol",
+      getAttrs: (element) => ({
+        start: element instanceof HTMLElement ? Number(element.getAttribute("start")) || 1 : 1,
+      }),
+    },
+  ],
+  renderHTML: ({ node }) => ["ol", { start: node.attrs.start }, 0],
+});
+
+const SpecListItem = Node.create({
+  name: "listItem",
+  ...sharedConfig("listItem"),
+  parseHTML: () => [{ tag: "li" }],
+  renderHTML: () => ["li", 0],
+});
+
+const SpecStrong = Mark.create({
+  name: "strong",
+  parseHTML: () => [{ tag: "strong" }, { tag: "b" }],
+  renderHTML: () => ["strong", 0],
+});
+
+const SpecEm = Mark.create({
+  name: "em",
+  parseHTML: () => [{ tag: "em" }, { tag: "i" }],
+  renderHTML: () => ["em", 0],
+});
+
+const SpecCodeMark = Mark.create({
+  name: "code",
+  excludes: "_",
+  parseHTML: () => [{ tag: "code" }],
+  renderHTML: () => ["code", 0],
 });
 
 const SpecCodeBlock = Node.create({
@@ -177,10 +227,16 @@ export const specNodeExtensions = [
   SpecSectionHeading,
   SpecParagraph,
   SpecHeading,
+  SpecBulletList,
+  SpecOrderedList,
+  SpecListItem,
   SpecCodeBlock,
   SpecDiagramBlock,
   SpecOpenQuestion,
   SpecText,
+  SpecStrong,
+  SpecEm,
+  SpecCodeMark,
   SectionStructure,
 ];
 

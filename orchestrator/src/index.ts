@@ -112,6 +112,7 @@ import { renderReviewer } from "./reviewers/render.ts";
 import { makeSessionFilesRoute } from "./routes/session-files.ts";
 import { makeSpecsRoute, PostgresSpecReadStore } from "./routes/specs.ts";
 import { makeSpecRailRoute, PostgresSpecRailStore } from "./routes/spec-rail.ts";
+import { makeSpecQuestionsRoute } from "./routes/spec-questions.ts";
 import { makeSpecBlockIterationRoute } from "./routes/spec-block-iteration.ts";
 import { makeSpecMessagesRoute, PostgresSpecMessageStore } from "./routes/spec-messages.ts";
 import { makeSpecStartDraftingRoute } from "./routes/spec-start-drafting.ts";
@@ -162,6 +163,19 @@ const specOpenQuestions = new PostgresOpenQuestionStore(getPool());
 const specSectionStates = new SectionStateService({
   store: new PostgresSectionStateStore(getPool()),
   now: specNow,
+  // Save a version at each settle. `specCheckpoints` initializes below in this
+  // module; the callback runs long after startup, so the reference is live.
+  onSettled: ({ specId, sectionTitle, actorUserId }) => {
+    void specCheckpoints
+      .createCheckpoint(specId, {
+        reason: "section_settled",
+        label: `Settled §${sectionTitle}`,
+        authorUserId: actorUserId,
+      })
+      .catch((error: unknown) => {
+        log.warn({ specId, err: error }, "spec settle checkpoint failed");
+      });
+  },
 });
 // The post-publish ticket tree (ADR 0114 D6). It reads the pinned checkpoint,
 // never the live head, so every §backlink stays resolvable.
@@ -181,14 +195,15 @@ const specTicketSync = new SpecTicketSyncService({
   log: log.child({ component: "spec-ticket-sync" }),
   start: startSpecTicketSyncWorkflow,
 });
+const specQuestions = new OpenQuestionService({
+  store: specOpenQuestions,
+  document: new SpecQuestionDocument(specDocuments, "spec-question-service"),
+  now: specNow,
+});
 const specToolService = new SpecToolService({
   documents: specDocuments,
   sectionStates: specSectionStates,
-  questions: new OpenQuestionService({
-    store: specOpenQuestions,
-    document: new SpecQuestionDocument(specDocuments, "spec-agent-question"),
-    now: specNow,
-  }),
+  questions: specQuestions,
   questionStore: specOpenQuestions,
   metadata: new PostgresSpecToolMetadataStore(getPool(), specNow),
   tickets: specTickets,
@@ -294,6 +309,8 @@ app.route(
     checkpoints: specCheckpoints,
     resolveMembership: resolveSpecMembership,
     orgId: config.deploymentId,
+    readSuggestedTitle: async (sessionId) =>
+      (await controlPlaneSessions.getSession({ sessionId })).session?.suggestedTitle ?? null,
     create: (request) =>
       createSpec(
         {
@@ -338,6 +355,13 @@ app.route(
   makeSpecPublishRoute({
     publish: specPublish,
     wake: (specId) => specPublishScanner.wake(specId),
+    resolveMembership: resolveSpecMembership,
+  }),
+);
+app.route(
+  "/",
+  makeSpecQuestionsRoute({
+    questions: specQuestions,
     resolveMembership: resolveSpecMembership,
   }),
 );

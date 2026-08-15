@@ -32,6 +32,7 @@ function documentService(
       markdown: sectionId === undefined ? "# Live revision 8" : "Live section revision 8",
       ...(sectionId === undefined ? {} : { sectionId }),
       sections: [{ id: "context", key: "context", title: "Context" }],
+      openQuestions: [],
     }),
     updateSection: async (_specId, input) => mutation("updateSection", input),
     setSectionState: async (_specId, input) => mutation("setSectionState", input),
@@ -182,6 +183,7 @@ describe("spec tools", () => {
       rev: "8",
       markdown: "# Live revision 8",
       sections: [{ section_id: "context", key: "context", title: "Context" }],
+      open_questions: [],
     });
     expect(result).not.toEqual({
       rev: 7,

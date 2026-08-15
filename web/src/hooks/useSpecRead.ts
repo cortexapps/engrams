@@ -53,6 +53,7 @@ export interface SpecReadResponse {
     id: string;
     title: string;
     phase: "ideation" | "drafting" | "published";
+    owner: { id: string; name: string } | null;
     sessionId: string | null;
     viewerIsOwner: boolean;
     publishedCheckpointId: string | null;
@@ -73,6 +74,24 @@ export function useSpecRead(specId: string) {
     refetchInterval: (query) =>
       query.state.data?.spec.phase !== "published" ? ACTIVE_SPEC_REFETCH_INTERVAL_MS : false,
     refetchIntervalInBackground: false,
+  });
+}
+
+export function useRenameSpec(specId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (title: string) =>
+      specRequest<{ title: string }>(`/specs/${encodeURIComponent(specId)}/title`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title }),
+      }),
+    onSuccess: (result) => {
+      queryClient.setQueryData<SpecReadResponse>(["spec", specId], (current) =>
+        current ? { ...current, spec: { ...current.spec, title: result.title } } : current,
+      );
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["spec", specId] }),
   });
 }
 

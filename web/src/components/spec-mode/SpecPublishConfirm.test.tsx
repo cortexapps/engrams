@@ -37,6 +37,15 @@ vi.mock("@/hooks/useSpecPublish", async (importOriginal) => {
   };
 });
 
+// The readiness line reads the rail; these tests exercise the questions face.
+vi.mock("@/hooks/useSpecRead", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@/hooks/useSpecRead")>();
+  return {
+    ...original,
+    useSpecRail: () => ({ data: undefined }),
+  };
+});
+
 import { SpecPublishConfirm } from "./SpecPublishConfirm";
 
 const questions = [

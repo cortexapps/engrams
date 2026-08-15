@@ -55,7 +55,7 @@ export function CheckpointButton({
       <SheetTrigger asChild>
         <Button variant="outline" size="sm" className="spec-mode-checkpoint-trigger">
           <History aria-hidden="true" />
-          {latest ? `v${latest.docSeq} · ${relativeTime(latest.createdAt)}` : "History"}
+          {latest ? `History · ${relativeTime(latest.createdAt)}` : "History"}
         </Button>
       </SheetTrigger>
       <SheetContent className="spec-mode-checkpoint-sheet sm:max-w-2xl">
@@ -81,7 +81,7 @@ export function CheckpointButton({
                     <span>
                       <strong>{checkpoint.label}</strong>
                       <small>
-                        {checkpoint.author?.name ?? "System"} · v{checkpoint.docSeq}
+                        {checkpoint.author?.name ?? "System"} · {relativeTime(checkpoint.createdAt)}
                       </small>
                     </span>
                   </button>
@@ -90,7 +90,9 @@ export function CheckpointButton({
             })}
           </ol>
           {ordered.length === 0 ? (
-            <Text tone="muted">No checkpoints yet.</Text>
+            <Text tone="muted">
+              No versions yet. A version is saved each time a section settles, and at publish.
+            </Text>
           ) : selectedIds.length < 2 ? (
             <Text tone="muted">Select one more checkpoint to compare.</Text>
           ) : before.isPending || after.isPending ? (

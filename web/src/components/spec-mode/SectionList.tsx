@@ -93,7 +93,7 @@ export function SectionList({
           Legend
         </Text>
         <Text as="span" variant="code" tone="muted">
-          ✓ settled · ◐ proposed · ○ open
+          ✓ settled · ◐ proposed · ○ open · ● reading · ⚑ questions
         </Text>
       </footer>
     </div>

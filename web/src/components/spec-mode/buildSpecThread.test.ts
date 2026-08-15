@@ -3,12 +3,12 @@ import { describe, expect, test } from "vitest";
 import { buildMessages } from "@/components/session-thread/buildMessages";
 import type { IndexedEvent, SessionEvent } from "@/lib/types";
 import type { SpecMessage } from "@/hooks/useSpecMessages";
-import { buildSpecThread, parseSpecAgentText } from "./buildSpecThread";
+import { buildSpecThread } from "./buildSpecThread";
 
 const AT = "2026-08-13T10:00:00.000Z";
 
 describe("buildSpecThread", () => {
-  test("whitelists stored human text, agent prose, citations, and coalesced document activity", () => {
+  test("whitelists stored human text, agent prose, and coalesced document activity", () => {
     const messages = buildMessages(
       indexed([
         {
@@ -91,8 +91,9 @@ describe("buildSpecThread", () => {
       {
         kind: "agent",
         id: expect.stringMatching(/^agent:/),
-        text: "The limiter is per user.",
-        citations: ["gateway/limits.rs @ 8f2c1a4"],
+        // The raw markdown, citation spans included: the thread renders it
+        // with the shared Markdown component instead of stripping chips out.
+        text: "The limiter is per user. `gateway/limits.rs @ 8f2c1a4`",
         createdAt: AT,
       },
       {
@@ -190,16 +191,60 @@ describe("buildSpecThread", () => {
   });
 });
 
-describe("parseSpecAgentText", () => {
-  test("deduplicates repository citation chips and leaves prose", () => {
-    expect(
-      parseSpecAgentText(
-        "First `src/a.ts @ abcdef1` and again `src/a.ts @ abcdef1`. Then `src/b.ts @ 1234567` and `spec se_41c2 · Jun`.",
-      ),
-    ).toEqual({
-      text: "First and again . Then and .",
-      citations: ["src/a.ts @ abcdef1", "src/b.ts @ 1234567", "spec se_41c2 · Jun"],
-    });
+describe("phase changes and attribution", () => {
+  test("renders the start-drafting frame as a system chip, not a speech bubble", () => {
+    const messages = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "seed-prompt",
+          role: "user",
+          text: "[start drafting — requested by Priya]",
+          at: AT,
+        },
+      ]),
+      "session-1",
+    ).messages;
+
+    expect(buildSpecThread(messages, new Map())).toEqual([
+      {
+        kind: "phase_change",
+        id: expect.stringMatching(/^phase:/),
+        requestedBy: "Priya",
+        createdAt: AT,
+      },
+    ]);
+  });
+
+  test("attributes the founding row-less turn to the owner, and only that one", () => {
+    const messages = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "founding-prompt",
+          role: "user",
+          text: "jq ignores a duplicate --arg name and keeps the last value.",
+          at: AT,
+        },
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "later-rowless",
+          role: "user",
+          text: "A later turn without a stored row.",
+          at: AT,
+        },
+      ]),
+      "session-1",
+    ).messages;
+    const owner = { id: "nikhil", name: "Nikhil" };
+
+    expect(buildSpecThread(messages, new Map(), new Map(), owner)).toMatchObject([
+      { kind: "human", author: owner },
+      { kind: "human", author: null },
+    ]);
   });
 });
 
