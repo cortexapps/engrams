@@ -418,22 +418,19 @@ describe("SpecProjectionDriver", () => {
     expect(store.rows[2]!.discardNotice).toBe(true);
   });
 
-  test("a prompt waits across a failed exec until its durable successor publishes", async () => {
+  test("a prompt records its durable intent without waiting on the guest", async () => {
+    // The send path must not gate on sandbox state: an earlier build blocked
+    // here for up to 15 seconds and then failed the whole send. The intent is
+    // durable, so the scanner retries a failed exec until the file publishes.
     const { driver, guest, store } = fixture();
     guest.failNextPublish = true;
-    let ready = false;
-    const prompt = driver.preparePrompt(SESSION_ID, "parked").then(() => {
-      ready = true;
-    });
-    while ((await store.pending(SESSION_ID)).length === 0) await Promise.resolve();
+    await driver.preparePrompt(SESSION_ID, "parked");
+    expect((await store.pending(SESSION_ID)).map((row) => row.rev)).toEqual([1n]);
+
     await expect(driver.runOnce(SESSION_ID)).rejects.toThrow("status 1");
-    await Promise.resolve();
-    expect(ready).toBe(false);
     expect((await store.pending(SESSION_ID)).map((row) => row.rev)).toEqual([2n]);
 
     await driver.runOnce(SESSION_ID);
-    await prompt;
-    expect(ready).toBe(true);
     expect(store.rows.map((row) => row.state)).toEqual(["superseded", "published"]);
   });
 

@@ -16,6 +16,7 @@ export function IdeationScreen({
   specId,
   title,
   templateName,
+  owner = null,
   awareness,
   isStartingDrafting,
   startDraftingError,
@@ -24,15 +25,19 @@ export function IdeationScreen({
   specId: string;
   title: string;
   templateName: string;
+  owner?: { id: string; name: string } | null;
   awareness?: Awareness;
   isStartingDrafting: boolean;
   startDraftingError: string | null;
   onStartDrafting: () => void;
 }) {
-  const conversation = useSpecConversation(specId);
+  const conversation = useSpecConversation(specId, undefined, owner);
   const sendMessage = useSendSpecMessage(specId);
+  // A finding is an agent statement with repository provenance (path @ sha).
   const hasFinding = conversation.entries.some(
-    (entry) => entry.kind === "agent" && entry.text.trim().length > 0 && entry.citations.length > 0,
+    (entry) =>
+      entry.kind === "agent" &&
+      /[A-Za-z0-9_./-]+(?::[0-9-]+)?\s+@\s+[0-9a-f]{7,40}/i.test(entry.text),
   );
 
   return (

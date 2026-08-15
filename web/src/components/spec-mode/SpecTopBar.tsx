@@ -1,7 +1,10 @@
+import { useState, type KeyboardEvent } from "react";
+import { toast } from "sonner";
+
 import { SpecPublishConfirm } from "./SpecPublishConfirm";
 import { Switch } from "@/components/ui/switch";
 import { Text } from "@/components/ui/text";
-import type { SpecCheckpointSummary } from "@/hooks/useSpecRead";
+import { useRenameSpec, type SpecCheckpointSummary } from "@/hooks/useSpecRead";
 import { CheckpointButton } from "./CheckpointButton";
 import { PresenceGroup } from "./PresenceGroup";
 import type { SpecPresenceEntry } from "./section-presence";
@@ -31,9 +34,13 @@ export function SpecTopBar({
   return (
     <header className="spec-mode-top-bar">
       <div className="spec-mode-title-group">
-        <Text as="h1" variant="heading" className="spec-mode-title">
-          {title}
-        </Text>
+        {viewerIsOwner ? (
+          <EditableTitle specId={specId} title={title} />
+        ) : (
+          <Text as="h1" variant="heading" className="spec-mode-title">
+            {title}
+          </Text>
+        )}
         <Text as="span" variant="code" tone="muted" className="spec-mode-template-name">
           {templateName}
         </Text>
@@ -59,5 +66,55 @@ export function SpecTopBar({
         ) : null}
       </div>
     </header>
+  );
+}
+
+/** The owner renames in place. Without this, a spec keeps whatever sentence
+ *  created it as its name in every list, tab, and header. */
+function EditableTitle({ specId, title }: { specId: string; title: string }) {
+  const rename = useRenameSpec(specId);
+  const [draft, setDraft] = useState<string | null>(null);
+
+  const save = () => {
+    const next = draft?.trim() ?? "";
+    setDraft(null);
+    if (next.length === 0 || next === title) return;
+    rename.mutate(next, {
+      onError: (error) =>
+        toast.error("The rename did not save.", {
+          description: error instanceof Error ? error.message : undefined,
+        }),
+    });
+  };
+  const keyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Enter") save();
+    if (event.key === "Escape") setDraft(null);
+  };
+
+  if (draft === null) {
+    return (
+      <button
+        type="button"
+        className="spec-mode-title-edit"
+        title="Rename this spec"
+        onClick={() => setDraft(title)}
+      >
+        <Text as="h1" variant="heading" className="spec-mode-title">
+          {title}
+        </Text>
+      </button>
+    );
+  }
+  return (
+    <input
+      className="spec-mode-title-input"
+      value={draft}
+      maxLength={200}
+      autoFocus
+      aria-label="Spec title"
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={save}
+      onKeyDown={keyDown}
+    />
   );
 }

@@ -16,12 +16,20 @@ export interface SectionStateAction {
   reason?: string;
 }
 
+export interface SpecQuestionActions {
+  resolve: (questionId: string, answer: string) => void;
+  dismiss: (questionId: string) => void;
+}
+
 export interface SectionNodeViewContextValue {
+  specId: string;
   surface: SpecSurface;
   showProvenance: boolean;
   pendingSectionId: string | null;
   presence: SpecPresenceEntry[];
   setSectionState: (action: SectionStateAction) => void;
+  /** Absent on a read-only mount; the question cards then show no actions. */
+  questionActions?: SpecQuestionActions;
 }
 
 const SectionNodeViewContext = createContext<SectionNodeViewContextValue | null>(null);
@@ -109,11 +117,8 @@ export function SectionNodeView({ editor, getPos, node }: NodeViewProps) {
       {section.state === "open" && section.isEmpty && section.isReached ? (
         <div className="spec-mode-empty-invitation" contentEditable={false}>
           <Text tone="muted" className="spec-mode-empty-copy">
-            Nothing here yet. I can draft this from the three handlers that already touch quota in{" "}
-            <Text as="span" variant="code">
-              gateway/routes.rs @ 8f2c1a4
-            </Text>{" "}
-            — or tell me the shape you want and I&apos;ll check it against them.
+            Nothing here yet. Ask engram to draft it from the evidence so far, or start typing and
+            it follows your lead.
           </Text>
           <div className="spec-mode-section-actions">
             <Button type="button" size="xs" disabled={pending} onClick={() => setState("proposed")}>
@@ -158,7 +163,7 @@ export function SectionNodeView({ editor, getPos, node }: NodeViewProps) {
             </Button>
           </div>
           <Text as="span" variant="code" tone="muted">
-            Nobody has blessed this yet
+            Proposed — Keep settles it
           </Text>
         </div>
       ) : null}

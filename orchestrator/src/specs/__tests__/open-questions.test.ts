@@ -41,6 +41,7 @@ function setup(
   const store: OpenQuestionStore = {
     find: async () => question,
     countOpenBySection: async () => ({ [question.sectionId]: 1 }),
+    listOpenBySpec: async () => [],
     create: async () => question,
     resolve: async (input) => {
       resolveInputs.push(input);
@@ -82,6 +83,7 @@ describe("open questions", () => {
     const store: OpenQuestionStore = {
       find: async () => null,
       countOpenBySection: async () => ({}),
+      listOpenBySpec: async () => [],
       create: async (input) => {
         createInputs.push(input);
         return question;
@@ -129,6 +131,7 @@ describe("open questions", () => {
     const store: OpenQuestionStore = {
       find: async () => null,
       countOpenBySection: async () => ({}),
+      listOpenBySpec: async () => [],
       create: async (input) => ({
         ...question,
         requestFingerprint: input.requestFingerprint,
@@ -205,6 +208,7 @@ describe("open questions", () => {
       store: {
         find: async () => question,
         countOpenBySection: async () => ({ [question.sectionId]: 1 }),
+        listOpenBySpec: async () => [],
         create: async () => question,
         resolve: async (input) => {
           resolveInputs.push(input);
@@ -244,6 +248,7 @@ describe("open questions", () => {
       store: {
         find: async () => null,
         countOpenBySection: async () => ({}),
+        listOpenBySpec: async () => [],
         create: async () => {
           createCalls += 1;
           return question;
@@ -285,6 +290,7 @@ describe("open questions", () => {
       store: {
         find: async () => stored,
         countOpenBySection: async () => ({}),
+        listOpenBySpec: async () => [],
         create: async () => {
           stored = question;
           throw new Error("The response was lost after commit.");
@@ -320,6 +326,7 @@ describe("open questions", () => {
       store: {
         find: async () => question,
         countOpenBySection: async () => ({ [question.sectionId]: 1 }),
+        listOpenBySpec: async () => [],
         create: async () => question,
         resolve: async () => false,
       },
@@ -351,6 +358,7 @@ describe("open questions", () => {
       store: {
         find: async () => question,
         countOpenBySection: async () => ({ [question.sectionId]: 1 }),
+        listOpenBySpec: async () => [],
         create: async () => question,
         resolve: async () => false,
       },

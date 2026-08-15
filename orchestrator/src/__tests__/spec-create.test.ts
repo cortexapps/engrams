@@ -291,6 +291,7 @@ describe("createSpec", () => {
 const READ_STORE: SpecReadStore = {
   readSpec: async () => null,
   listCheckpoints: async () => [],
+  renameSpec: async () => false,
 };
 
 function testApp(overrides?: {

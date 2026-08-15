@@ -50,6 +50,9 @@ const UpdateSectionInput = z
     section_id: SectionId,
     markdown: z
       .string()
+      // Bounded like every other free-text field: unbounded text reaches the
+      // markdown parser on the orchestrator's one event loop.
+      .max(200_000)
       .describe(
         "Replacement Markdown for the section, or for only the selected range when selection anchors are present",
       ),
@@ -131,6 +134,7 @@ const ResolveOpenQuestionInput = z.object({
   answer_markdown: z
     .string()
     .min(1)
+    .max(20_000)
     .describe("Answer to add to the section before the question is resolved"),
   expected_rev: ExpectedRevision,
 });
@@ -140,6 +144,7 @@ const UpdateBlockInput = z.object({
   block_id: z.string().min(1).max(200),
   source: z
     .string()
+    .max(200_000)
     .describe("Replacement source specification for the diagram block"),
   expected_rev: RequiredRevision,
 });
@@ -215,6 +220,17 @@ const ReadOutput = z.object({
       }),
     )
     .describe("Every section's id — pass one as section_id in the spec_* mutation tools"),
+  open_questions: z
+    .array(
+      z.object({
+        question_id: z.string().uuid(),
+        section_id: SectionId,
+        text: z.string(),
+      }),
+    )
+    .describe(
+      "Every unresolved question with its stable id — resolve with spec_resolve_open_question, never by re-raising",
+    ),
 });
 
 const MutationOutput = z.object({
@@ -246,6 +262,10 @@ export interface LiveSpecRead {
    *  every mutation requires one, so this list is the agent's ONLY way to
    *  learn them — a spec agent without it cannot write at all. */
   sections: Array<{ id: string; key: string; title: string }>;
+  /** Every unresolved question with its ledger id. Without this the agent
+   *  cannot list what it owes — the first live drive left it guessing about
+   *  its own duplicates. */
+  openQuestions: Array<{ id: string; sectionId: string; text: string }>;
 }
 
 export interface SpecMutationResult {
@@ -521,6 +541,11 @@ export function registerSpecTools(
           section_id: section.id,
           key: section.key,
           title: section.title,
+        })),
+        open_questions: result.openQuestions.map((question) => ({
+          question_id: question.id,
+          section_id: question.sectionId,
+          text: question.text,
         })),
       };
     },

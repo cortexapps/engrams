@@ -62,11 +62,16 @@ interface ParticipantSampleRow {
 }
 
 function repoLabel(policy: TaskLaunchPolicy | null): string | null {
-  const repo = policy?.repos[0];
+  const repos = policy?.repos ?? [];
+  const repo = repos[0];
   if (!repo) return null;
-  if (repo.remote) return `${repo.remote.owner}/${repo.remote.name}`;
-  const pathName = repo.path.split("/").filter(Boolean).at(-1);
-  return pathName ?? null;
+  const name = repo.remote
+    ? `${repo.remote.owner}/${repo.remote.name}`
+    : (repo.path.split("/").filter(Boolean).at(-1) ?? null);
+  if (name === null) return null;
+  // A multi-repo workspace named after its first repo misattributes the spec
+  // — a gin rate-limit spec once introduced itself as "jqlang/jq".
+  return repos.length > 1 ? `${name} +${repos.length - 1}` : name;
 }
 
 export function makeSpecListStore(

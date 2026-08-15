@@ -335,6 +335,7 @@ describe("production spec tool service", () => {
         { id: "context", key: "context", title: "Context" },
         { id: "requirements", key: "requirements", title: "Requirements" },
       ],
+      openQuestions: [],
     });
     // A wrong guess teaches the valid ids instead of stonewalling.
     await expect(service.read(SPEC_ID, "missing")).rejects.toThrow(

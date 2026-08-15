@@ -140,6 +140,14 @@
   box-shadow: 0 18px 45px color-mix(in oklab, var(--foreground) 18%, transparent);
 }
 
+/* A modal owns the screen: the selection menu floats above the page scrim, so
+   it hovered — stale and clickable — over the History sheet and the publish
+   dialog. */
+body:has([data-slot="dialog-content"]) .spec-selection-menu,
+body:has([data-slot="sheet-content"]) .spec-selection-menu {
+  display: none;
+}
+
 .spec-selection-presets {
   display: flex;
   flex-wrap: wrap;

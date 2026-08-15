@@ -7,6 +7,7 @@ import {
   isRangeInSectionBody,
   parseSectionRelativeAnchor,
   parseMarkdownBlocks,
+  parseSectionBody,
   renderMarkdown,
   replaceSection,
   resolveSectionRelativeAnchor,
@@ -156,10 +157,26 @@ export class SpecToolService implements SpecToolDocumentService {
     const document = proseMirrorDocument(loaded.doc);
     // The rendered markdown carries no section ids, and every mutation
     // requires one, so the section map rides EVERY read — without it an
-    // agent has no way to learn the ids and cannot write at all.
+    // agent has no way to learn the ids and cannot write at all. The open
+    // questions ride along for the same reason: their ledger ids are what
+    // spec_resolve_open_question takes, and an agent that cannot list them
+    // re-raises duplicates instead of resolving.
     const sections = documentSections(document);
+    const openQuestions = (await this.options.questionStore.listOpenBySpec(specId)).map(
+      (question) => ({
+        id: question.id,
+        sectionId: question.sectionId,
+        text: question.text,
+      }),
+    );
     if (sectionId === undefined) {
-      return { specId, rev: loaded.semanticDocSeq, markdown: renderMarkdown(document), sections };
+      return {
+        specId,
+        rev: loaded.semanticDocSeq,
+        markdown: renderMarkdown(document),
+        sections,
+        openQuestions,
+      };
     }
     const section = requireSection(document, sectionId);
     const sectionDocument = schema.nodes.doc!.create(null, section.node);
@@ -169,6 +186,7 @@ export class SpecToolService implements SpecToolDocumentService {
       markdown: renderMarkdown(sectionDocument),
       sectionId,
       sections,
+      openQuestions,
     };
   }
 
@@ -600,7 +618,54 @@ function replacementSection(
   if (!heading || heading.type !== schema.nodes.sectionHeading) {
     throw new Error(`Spec section ${sectionId} has no stable heading.`);
   }
-  return section.type.create(section.attrs, [heading, ...parseMarkdownBlocks(markdown)]);
+  const body = parseSectionBody(markdown, heading.textContent);
+  return section.type.create(section.attrs, [
+    heading,
+    ...preserveQuestionMarkers(section, body),
+  ]);
+}
+
+/**
+ * Carry unresolved question markers a full-section rewrite left out.
+ *
+ * A rewrite that drops a marker orphans its ledger row: the row stays open
+ * and counted, but no card renders and nothing can resolve it. The first live
+ * drive hit exactly this — the agent's rewrite deleted two markers, it
+ * re-raised both under new ids, and the spec carried two unresolvable
+ * duplicates into publish. A marker leaves the document through resolution
+ * (or an explicit dismissal), never through a rewrite.
+ */
+function preserveQuestionMarkers(
+  section: ProseMirrorNode,
+  body: ProseMirrorNode[],
+): ProseMirrorNode[] {
+  const kept = new Set<string>();
+  for (const block of body) {
+    block.descendants((node) => {
+      if (node.type === schema.nodes.openQuestion) kept.add(String(node.attrs.questionId));
+      return true;
+    });
+  }
+  const dropped: ProseMirrorNode[] = [];
+  section.descendants((node) => {
+    if (
+      node.type === schema.nodes.openQuestion &&
+      node.attrs.resolved !== true &&
+      !kept.has(String(node.attrs.questionId))
+    ) {
+      dropped.push(node);
+    }
+    return true;
+  });
+  if (dropped.length === 0) return body;
+  const last = body[body.length - 1];
+  if (last && last.type === schema.nodes.paragraph) {
+    return [
+      ...body.slice(0, -1),
+      last.type.create(last.attrs, last.content.append(Fragment.fromArray(dropped))),
+    ];
+  }
+  return [...body, schema.nodes.paragraph!.create(null, Fragment.fromArray(dropped))];
 }
 
 /** Replace the exact anchored range. Transform.replace does not expand the range. */

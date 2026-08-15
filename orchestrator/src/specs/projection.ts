@@ -467,10 +467,13 @@ export class SpecProjectionDriver implements SpecProjection {
     if (!new Set(["created", "idle", "parked"]).has(sessionStatus)) return;
     const specId = await this.store.specForSession(sessionId);
     if (!specId) return;
-    const rev = await this.enqueue({ specId, sessionId, source: "prompt-delivery" });
-    // The listener-lease scanner performs the publish. This request only waits
-    // for its durable intent; it never runs the file pipeline itself.
-    await this.waitUntilPublished(specId, rev);
+    // Record the durable intent and return. The listener-lease scanner
+    // performs the publish on its own cadence. The send path must never wait
+    // on the guest: an earlier build blocked here for up to 15 seconds and
+    // then failed the whole send — after the message text was already typed
+    // and before it was persisted, so the text was lost. Projection freshness
+    // is a turn-start concern; the agent reads live state through spec_read.
+    await this.enqueue({ specId, sessionId, source: "prompt-delivery" });
   }
 
   async checkDrift(specId: string, sessionId: string): Promise<boolean> {

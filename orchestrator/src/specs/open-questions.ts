@@ -35,6 +35,7 @@ export interface ResolveOpenQuestionInput {
 export interface OpenQuestionStore {
   find(id: string): Promise<OpenQuestionRecord | null>;
   countOpenBySection(specId: string): Promise<Record<string, number>>;
+  listOpenBySpec(specId: string): Promise<OpenQuestionRecord[]>;
   create(input: CreateOpenQuestionInput): Promise<OpenQuestionRecord>;
   resolve(input: ResolveOpenQuestionInput): Promise<boolean>;
 }
@@ -196,6 +197,52 @@ export class OpenQuestionService {
     }
   }
 
+  /**
+   * Close a question without a document answer.
+   *
+   * Resolution requires the answer in the document; dismissal is the other
+   * honest exit — the question no longer applies. It removes the marker and
+   * records who dismissed it, so an irrelevant or duplicated question is not
+   * carried to publish forever. Dismissing an already-closed question replays.
+   */
+  async dismiss(input: {
+    questionId: string;
+    resolvedBy: string | null;
+  }): Promise<OpenQuestionRecord> {
+    const question = await this.options.store.find(input.questionId);
+    if (!question) {
+      throw new OpenQuestionError("question_not_found", "The open question does not exist.");
+    }
+    if (question.state !== "open") return question;
+    await this.options.document.removeQuestionMarker({
+      questionId: question.id,
+      specId: question.specId,
+    });
+    const resolvedAt = this.options.now();
+    const applied = await this.options.store.resolve({
+      id: question.id,
+      expectedState: "open",
+      resolutionLink: DISMISSED_RESOLUTION,
+      resolvedBy: input.resolvedBy,
+      resolvedAt,
+    });
+    if (!applied) {
+      const latest = await this.options.store.find(question.id);
+      if (latest?.state === "resolved") return latest;
+      throw new OpenQuestionError(
+        "stale_question",
+        "The open question changed before the dismissal was stored.",
+      );
+    }
+    return {
+      ...question,
+      state: "resolved",
+      resolutionLink: DISMISSED_RESOLUTION,
+      resolvedBy: input.resolvedBy,
+      resolvedAt,
+    };
+  }
+
   async resolve(input: {
     questionId: string;
     answerMarkdown: string;
@@ -260,6 +307,9 @@ export class OpenQuestionService {
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The resolution note a dismissal records instead of a document anchor. */
+export const DISMISSED_RESOLUTION = "dismissed";
 
 async function removeMarkerAfterProvenFailure(
   document: QuestionDocument,
@@ -332,6 +382,29 @@ export class PostgresOpenQuestionStore implements OpenQuestionStore {
       [specId],
     );
     return Object.fromEntries(result.rows.map((row) => [row.section_id, Number(row.count)]));
+  }
+
+  async listOpenBySpec(specId: string): Promise<OpenQuestionRecord[]> {
+    const result = await this.pool.query<OpenQuestionRow>(
+      `SELECT id, spec_id, section_id, text, opened_by, request_fingerprint,
+              state, resolution_note, resolved_by, resolved_at
+         FROM spec_open_question
+        WHERE spec_id = $1 AND state = 'open'
+        ORDER BY created_at, id`,
+      [specId],
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      specId: row.spec_id,
+      sectionId: row.section_id,
+      text: row.text,
+      openedBy: row.opened_by,
+      requestFingerprint: row.request_fingerprint,
+      state: row.state,
+      resolutionLink: row.resolution_note,
+      resolvedBy: row.resolved_by,
+      resolvedAt: row.resolved_at,
+    }));
   }
 
   async create(input: CreateOpenQuestionInput): Promise<OpenQuestionRecord> {

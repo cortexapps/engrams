@@ -30,6 +30,7 @@ export interface SpecReadRecord {
   title: string;
   phase: "ideation" | "drafting" | "published";
   ownerUserId: string | null;
+  ownerName: string | null;
   sessionId: string | null;
   publishedCheckpointId: string | null;
   publishedAt: Date | null;
@@ -37,6 +38,10 @@ export interface SpecReadRecord {
   /** The template the spec locked at creation (ADR 0114 D3). */
   templateId: string;
   templateName: string;
+  /** The task title the create wrote; unchanged means nobody renamed the spec. */
+  taskTitle: string | null;
+  /** The session-titling model's name for the drafting session, when it has one. */
+  suggestedTitle: string | null;
 }
 
 export interface SpecCheckpointSummary {
@@ -52,6 +57,8 @@ export interface SpecCheckpointSummary {
 export interface SpecReadStore {
   readSpec(specId: string): Promise<SpecReadRecord | null>;
   listCheckpoints(specId: string): Promise<SpecCheckpointSummary[]>;
+  /** Rename, guarded by the expected current title. False means it moved. */
+  renameSpec(specId: string, expectedTitle: string | null, title: string): Promise<boolean>;
 }
 
 interface SpecRow {
@@ -59,12 +66,15 @@ interface SpecRow {
   title: string;
   phase: string;
   owner_user_id: string | null;
+  owner_name: string | null;
   session_id: string | null;
   published_checkpoint_id: string | null;
   published_at: Date | null;
   current_semantic_doc_seq: string;
   template_id: string;
   template_name: string;
+  task_title: string | null;
+  suggested_title: string | null;
 }
 
 interface CheckpointSummaryRow {
@@ -85,9 +95,14 @@ export class PostgresSpecReadStore implements SpecReadStore {
     const result = await this.pool.query<SpecRow>(
       `SELECT spec.id, spec.title, spec.phase, spec.owner_user_id, spec.session_id,
               spec.published_checkpoint_id, spec.published_at, spec.current_semantic_doc_seq,
-              spec.template_id, spec_template.name AS template_name
+              spec.template_id, spec_template.name AS template_name,
+              owner.name AS owner_name,
+              task.title AS task_title, task.suggested_title
          FROM spec
          JOIN spec_template ON spec_template.id = spec.template_id
+         LEFT JOIN "user" AS owner ON owner.id = spec.owner_user_id
+         LEFT JOIN task_session ON task_session.session_id = spec.session_id::text
+         LEFT JOIN task ON task.id = task_session.task_id
         WHERE spec.id = $1`,
       [specId],
     );
@@ -101,13 +116,26 @@ export class PostgresSpecReadStore implements SpecReadStore {
       title: row.title,
       phase: row.phase,
       ownerUserId: row.owner_user_id,
+      ownerName: row.owner_name,
       sessionId: row.session_id,
       publishedCheckpointId: row.published_checkpoint_id,
       publishedAt: row.published_at,
       currentSemanticDocSeq: BigInt(row.current_semantic_doc_seq),
       templateId: row.template_id,
       templateName: row.template_name,
+      taskTitle: row.task_title,
+      suggestedTitle: row.suggested_title,
     };
+  }
+
+  async renameSpec(specId: string, expectedTitle: string | null, title: string): Promise<boolean> {
+    const result = await this.pool.query(
+      expectedTitle === null
+        ? `UPDATE spec SET title = $2 WHERE id = $1 AND phase <> 'published'`
+        : `UPDATE spec SET title = $2 WHERE id = $1 AND title = $3 AND phase <> 'published'`,
+      expectedTitle === null ? [specId, title] : [specId, title, expectedTitle],
+    );
+    return result.rowCount === 1;
   }
 
   async listCheckpoints(specId: string): Promise<SpecCheckpointSummary[]> {
@@ -143,6 +171,8 @@ export interface SpecsRouteDeps {
   orgId: string;
   create: (request: CreateSpecRequest) => Promise<CreateSpecResult>;
   getSession?: GetSession;
+  /** Read the drafting session's live suggested title. Read-only; optional. */
+  readSuggestedTitle?: (sessionId: string) => Promise<string | null>;
 }
 
 export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
@@ -218,8 +248,9 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
 
   app.get("/api/v1/specs/:id", async (c) => {
     const { specId, userId } = await requireMember(c);
-    const record = await deps.store.readSpec(specId);
+    let record = await deps.store.readSpec(specId);
     if (!record) throw new HTTPException(404, { message: "not found" });
+    record = await adoptSuggestedTitle(deps.store, record, deps.readSuggestedTitle);
 
     const summaries = await deps.store.listCheckpoints(specId);
     let publishedCheckpoint: SpecCheckpointRecord | null = null;
@@ -241,6 +272,9 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
         id: record.id,
         title: record.title,
         phase: record.phase,
+        owner: record.ownerUserId
+          ? { id: record.ownerUserId, name: record.ownerName ?? "Unknown member" }
+          : null,
         sessionId: record.ownerUserId === userId ? record.sessionId : null,
         viewerIsOwner: record.ownerUserId === userId,
         publishedCheckpointId: record.publishedCheckpointId,
@@ -253,6 +287,31 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
       checkpoints: summaries.map(checkpointSummaryJson),
       publishedCheckpoint: publishedCheckpoint ? checkpointJson(publishedCheckpoint) : null,
     });
+  });
+
+  /** Rename a spec. Owner only; the title stays frozen after publish. */
+  app.patch("/api/v1/specs/:id/title", async (c) => {
+    const { specId, userId } = await requireMember(c);
+    const record = await deps.store.readSpec(specId);
+    if (!record) throw new HTTPException(404, { message: "not found" });
+    if (record.ownerUserId !== userId) throw new HTTPException(403, { message: "forbidden" });
+    if (record.phase === "published") {
+      throw new HTTPException(409, { message: "a published spec keeps its title" });
+    }
+    let body: { title?: unknown };
+    try {
+      body = (await c.req.json()) as { title?: unknown };
+    } catch {
+      throw new HTTPException(400, { message: "invalid JSON body" });
+    }
+    const title = typeof body.title === "string" ? body.title.trim() : "";
+    if (title.length === 0 || title.length > SPEC_TITLE_MAX_CHARS) {
+      throw new HTTPException(400, {
+        message: `title must be text of at most ${SPEC_TITLE_MAX_CHARS} characters`,
+      });
+    }
+    await deps.store.renameSpec(specId, null, title);
+    return c.json({ title });
   });
 
   app.get("/api/v1/specs/:id/checkpoints/:checkpointId", async (c) => {
@@ -314,6 +373,37 @@ export function makeSpecsRoute(deps: SpecsRouteDeps): Hono {
   });
 
   return app;
+}
+
+/**
+ * Adopt the session-titling model's name while the spec still wears its
+ * default. The create names a spec after its raw problem statement — a
+ * truncated sentence in every list and tab. The compare-and-set on the
+ * expected title means a manual rename always wins, and one adoption ends the
+ * follow (the spec title then differs from the task title the create wrote).
+ */
+async function adoptSuggestedTitle(
+  store: SpecReadStore,
+  record: SpecReadRecord,
+  readSuggestedTitle?: (sessionId: string) => Promise<string | null>,
+): Promise<SpecReadRecord> {
+  if (
+    record.phase === "published" ||
+    record.taskTitle === null ||
+    record.title !== record.taskTitle
+  ) {
+    return record;
+  }
+  // The persisted snapshot first; else the live session, best-effort. Spec
+  // tasks rarely pass through the Tasks page whose reads persist snapshots,
+  // so without the live read the raw prompt stays the name forever.
+  let suggested = record.suggestedTitle?.trim();
+  if (!suggested && record.sessionId && readSuggestedTitle) {
+    suggested = (await readSuggestedTitle(record.sessionId).catch(() => null))?.trim() ?? "";
+  }
+  if (!suggested || suggested === record.title) return record;
+  const adopted = await store.renameSpec(record.id, record.title, suggested);
+  return adopted ? { ...record, title: suggested } : record;
 }
 
 type CreateSpecInput = Omit<CreateSpecRequest, "orgId" | "ownerUserId">;

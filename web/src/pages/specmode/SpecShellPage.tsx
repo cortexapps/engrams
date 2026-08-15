@@ -1,5 +1,6 @@
-import { useParams } from "@tanstack/react-router";
+import { Link, useParams } from "@tanstack/react-router";
 import { useEffect, useRef, useState, type UIEvent } from "react";
+import { toast } from "sonner";
 import type { SpecSelectionActionPayload } from "@engrams/spec-document";
 
 import { IdeationScreen } from "@/components/spec-mode/IdeationScreen";
@@ -33,10 +34,14 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   const phase = read.data?.spec.phase ?? null;
   const [showDraft, setShowDraft] = useState(false);
   // Ideation connects too: the screen has no document, but it shows who is
-  // here, and presence rides the same awareness.
+  // here, and presence rides the same awareness. The connection is keyed on
+  // the phase: a socket opened during ideation never document-syncs, and the
+  // in-place flip to drafting left the canvas on its loading skeleton until a
+  // manual reload. Reconnecting on the flip costs one presence blip.
   const { connection, synced } = useSpecConnection(
     specId,
     phase === "ideation" || phase === "drafting" || (phase === "published" && showDraft),
+    phase,
   );
   const presence = useSpecPresence(connection?.provider.awareness ?? null);
   const [readingSectionId, setReadingSectionId] = useState<string | null>(null);
@@ -90,23 +95,18 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   }
 
   if (read.error || !read.data || !phase) {
+    // A plain answer, not a ghost shell: rendering the full chrome (History,
+    // Sources, empty rails) around a missing spec dressed a 404 as a page.
     return (
-      <SpecShell
-        specId={specId}
-        title="Spec not available"
-        templateName=""
-        checkpoints={[]}
-        viewerIsOwner={false}
-        showProvenance={showProvenance}
-        onShowProvenanceChange={setShowProvenance}
-      >
-        <div className="spec-mode-error">
-          <Text as="h2" variant="heading">
-            Spec not available
-          </Text>
-          <Text tone="muted">The spec does not exist, or you do not have access.</Text>
-        </div>
-      </SpecShell>
+      <main className="spec-mode-not-found">
+        <Text as="h1" variant="heading">
+          Spec not available
+        </Text>
+        <Text tone="muted">The spec does not exist, or you do not have access.</Text>
+        <Button asChild variant="outline">
+          <Link to="/specs">Back to Tech Specs</Link>
+        </Button>
+      </main>
     );
   }
 
@@ -117,6 +117,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
         specId={specId}
         title={spec.title}
         templateName={spec.template.name}
+        owner={spec.owner}
         awareness={connection?.provider.awareness}
         isStartingDrafting={startDrafting.isPending}
         startDraftingError={startDraftingError(startDrafting.error)}
@@ -155,9 +156,15 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
             if (payload.specId !== specId || payload.span.specId !== specId) {
               throw new Error("The selection action belongs to a different spec.");
             }
-            sendSelectionPrompt
-              .mutateAsync(selectionActionPrompt(payload))
-              .catch((error) => console.warn("selection action failed", error));
+            const prompt = selectionActionPrompt(payload);
+            const deliver = () =>
+              sendSelectionPrompt.mutateAsync(prompt).catch((error: unknown) => {
+                toast.error("The request did not reach the agent.", {
+                  description: error instanceof Error ? error.message : undefined,
+                  action: { label: "Retry", onClick: () => void deliver() },
+                });
+              });
+            void deliver();
           },
         }
       : undefined;
@@ -214,6 +221,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
         templateName={spec.template.name}
         checkpoints={checkpoints}
         viewerIsOwner={phase === "drafting" && spec.viewerIsOwner}
+        owner={spec.owner}
         surface={surface}
         presence={presence}
         onSelectSection={selectSection}
@@ -228,7 +236,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   );
 }
 
-function useSpecConnection(specId: string, enabled: boolean) {
+function useSpecConnection(specId: string, enabled: boolean, phase: string | null) {
   const [connection, setConnection] = useState<SpecConnection | null>(null);
   const [synced, setSynced] = useState(false);
 
@@ -258,7 +266,7 @@ function useSpecConnection(specId: string, enabled: boolean) {
       disposed = true;
       disposeConnection?.();
     };
-  }, [enabled, specId]);
+  }, [enabled, phase, specId]);
 
   return { connection, synced };
 }

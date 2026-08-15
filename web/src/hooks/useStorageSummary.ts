@@ -39,13 +39,13 @@ function protoStorageSummaryToLegacy(r: GetStorageSummaryResponse): StorageSumma
   };
 }
 
-export function useStorageSummary() {
+export function useStorageSummary(intervalMs = POLL_INTERVAL_MS) {
   return useQuery(
     getStorageSummary,
     {},
     {
       select: protoStorageSummaryToLegacy,
-      refetchInterval: POLL_INTERVAL_MS,
+      refetchInterval: intervalMs,
       refetchOnWindowFocus: false,
       staleTime: 0,
       placeholderData: (prev) => prev,

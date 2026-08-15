@@ -149,6 +149,7 @@ export function NewSpecPage() {
           pendingLabel="Starting…"
           pending={create.isPending}
           disabled={!templateId}
+          quiet
           ariaLabel="What is the spec about?"
           placeholder="Per-org caps on sandbox creation, plus a meter we can bill against."
           onStateChange={setComposerState}

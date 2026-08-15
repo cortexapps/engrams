@@ -15,7 +15,6 @@ export interface SpecAgentThreadEntry {
   kind: "agent";
   id: string;
   text: string;
-  citations: string[];
   createdAt: string | null;
 }
 
@@ -27,15 +26,19 @@ export interface SpecDocumentActivityEntry {
   createdAt: string | null;
 }
 
+/** A phase transition, rendered as a system chip rather than a speech bubble. */
+export interface SpecPhaseChangeEntry {
+  kind: "phase_change";
+  id: string;
+  requestedBy: string;
+  createdAt: string | null;
+}
+
 export type SpecThreadEntry =
   | SpecHumanThreadEntry
   | SpecAgentThreadEntry
-  | SpecDocumentActivityEntry;
-
-export interface ParsedSpecAgentText {
-  text: string;
-  citations: string[];
-}
+  | SpecDocumentActivityEntry
+  | SpecPhaseChangeEntry;
 
 /**
  * The text of a human turn that has no row in the message store.
@@ -64,6 +67,13 @@ function unattributedText(message: ThreadMessageLike): string {
 const SPEAKER_HEADER = /^\[speaker:/m;
 
 /**
+ * The durable start-drafting seed. It is a protocol frame for the agent, not
+ * something a person said — an earlier build rendered it as a human speech
+ * bubble, brackets and all.
+ */
+const START_DRAFTING_FRAME = /^\[start drafting — requested by (.+)\]$/;
+
+/**
  * Project the shared buildMessages fold through an explicit allow-list. No
  * unrecognized message role or part can enter the spec conversation.
  */
@@ -71,19 +81,37 @@ export function buildSpecThread(
   messages: readonly ThreadMessageLike[],
   messagesByPromptId: ReadonlyMap<string, SpecMessage>,
   sectionTitles: ReadonlyMap<string, string> = new Map(),
+  owner: SpecMessage["author"] | null = null,
 ): SpecThreadEntry[] {
   const result: SpecThreadEntry[] = [];
+  let sawHumanTurn = false;
   for (const [messageIndex, message] of messages.entries()) {
     const messageId = message.id ?? `message:${messageIndex}`;
     if (message.role === "user") {
       const promptId = messageId;
       const stored = messagesByPromptId.get(promptId);
+      const text = stored?.text ?? unattributedText(message);
+      const frame = START_DRAFTING_FRAME.exec(text.trim());
+      if (frame) {
+        result.push({
+          kind: "phase_change",
+          id: `phase:${promptId}`,
+          requestedBy: frame[1]!,
+          createdAt: stored?.createdAt ?? toIso(message.createdAt),
+        });
+        continue;
+      }
+      // The founding prompt is sent with the session, so it has no stored
+      // row. Its author is the owner by construction; later row-less turns
+      // stay unattributed rather than guessed.
+      const author = stored?.author ?? (sawHumanTurn ? null : owner);
+      sawHumanTurn = true;
       result.push({
         kind: "human",
         id: `human:${promptId}`,
         promptId,
-        author: stored?.author ?? null,
-        text: stored?.text ?? unattributedText(message),
+        author,
+        text,
         createdAt: stored?.createdAt ?? toIso(message.createdAt),
       });
       continue;
@@ -92,12 +120,10 @@ export function buildSpecThread(
     let agentIndex = 0;
     for (const part of message.content) {
       if (part.type === "text" && typeof part.text === "string" && part.text.trim().length > 0) {
-        const parsed = parseSpecAgentText(part.text);
         result.push({
           kind: "agent",
           id: `agent:${messageId}:${agentIndex++}`,
-          text: parsed.text,
-          citations: parsed.citations,
+          text: part.text,
           createdAt: toIso(message.createdAt),
         });
       } else if (
@@ -114,25 +140,6 @@ export function buildSpecThread(
     }
   }
   return result;
-}
-
-/** Extract repository citations that the normal thread renders as code chips. */
-export function parseSpecAgentText(text: string): ParsedSpecAgentText {
-  const citations: string[] = [];
-  const withoutCitations = text.replace(
-    /`((?:[^`\n]+\s@\s[0-9a-f]{7,40})|(?:spec\s+[^`\n]+))`/gi,
-    (_match, citation) => {
-      if (!citations.includes(citation)) citations.push(citation);
-      return "";
-    },
-  );
-  return {
-    text: withoutCitations
-      .replace(/[ \t]+\n/g, "\n")
-      .replace(/ {2,}/g, " ")
-      .trim(),
-    citations,
-  };
 }
 
 function pushDocumentActivity(

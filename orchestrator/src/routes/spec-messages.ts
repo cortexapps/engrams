@@ -184,13 +184,11 @@ export function makeSpecMessagesRoute(deps: SpecMessagesRouteDeps): Hono {
 
     const sessionId = await deps.store.resolveSessionId(specId);
     if (!sessionId) throw new HTTPException(404, { message: "not found" });
-    const session = await client.getSession({ sessionId });
-    await deps.preparePrompt(sessionId, session.session?.status ?? "");
 
     const promptId = `spec-chat:${randomId()}`;
     const authorName = speakerName(user.name);
-    // Persist first. An event consumer can then always join the agent reply to
-    // the clean human turn as soon as the prompt reaches the shared session.
+    // Persist before anything can fail. A send that dies past this point
+    // reports its error with the text safely stored, never silently dropped.
     await deps.store.insertMessage({
       promptId,
       specId,
@@ -198,6 +196,10 @@ export function makeSpecMessagesRoute(deps: SpecMessagesRouteDeps): Hono {
       authorName,
       text: message,
     });
+    // Record the projection-refresh intent without waiting on the guest; the
+    // scanner publishes it. Prompt delivery must not gate on sandbox state.
+    const session = await client.getSession({ sessionId });
+    await deps.preparePrompt(sessionId, session.session?.status ?? "");
     await client.sendPrompt({
       sessionId,
       promptId,

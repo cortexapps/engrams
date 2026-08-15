@@ -20,6 +20,7 @@ import {
   type SpecPublishRefusalReason,
   type SpecPublishStatus,
 } from "@/hooks/useSpecPublish";
+import { useSpecRail } from "@/hooks/useSpecRead";
 
 export function SpecPublishConfirm({
   specId,
@@ -29,6 +30,7 @@ export function SpecPublishConfirm({
   viewerIsOwner: boolean;
 }) {
   const status = useSpecPublish(specId);
+  const rail = useSpecRail(specId);
   const publish = usePublishSpec(specId);
   const [open, setOpen] = useState(false);
   const [acknowledged, setAcknowledged] = useState(false);
@@ -86,12 +88,16 @@ export function SpecPublishConfirm({
         {running ? "Publishing…" : "Publish"}
       </Button>
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent>
+        {/* The dialog itself never grows past the viewport: with enough open
+            questions the buttons fell below the fold, with the page behind
+            scroll-locked — publish was physically unclickable. */}
+        <DialogContent className="max-h-[85svh] overflow-y-auto">
           {running ? (
             <PublishingFace publish={recorded} onClose={() => setOpen(false)} />
           ) : (
             <ConfirmFace
               questions={questions}
+              completeness={rail.data?.completeness ?? null}
               acknowledged={acknowledged}
               onAcknowledgedChange={(value) => {
                 setAcknowledged(value);
@@ -111,6 +117,7 @@ export function SpecPublishConfirm({
 
 function ConfirmFace({
   questions,
+  completeness,
   acknowledged,
   onAcknowledgedChange,
   pending,
@@ -119,6 +126,7 @@ function ConfirmFace({
   onPublish,
 }: {
   questions: SpecPublishQuestion[];
+  completeness: { complete: number; total: number } | null;
   acknowledged: boolean;
   onAcknowledgedChange: (value: boolean) => void;
   pending: boolean;
@@ -128,6 +136,7 @@ function ConfirmFace({
 }) {
   const count = questions.length;
   const questionLabel = `${count} open ${count === 1 ? "question" : "questions"}`;
+  const unsettled = completeness ? completeness.total - completeness.complete : 0;
 
   return (
     <>
@@ -136,7 +145,7 @@ function ConfirmFace({
           Publish spec
         </Text>
         <DialogTitle>
-          {count === 0 ? "Publish with 0 open questions?" : `Publish with ${questionLabel}?`}
+          {count === 0 ? "Publish this spec?" : `Publish with ${questionLabel}?`}
         </DialogTitle>
         <DialogDescription>
           Publishing is irreversible. It is a one-way action: drafting ends, and this spec becomes
@@ -144,12 +153,24 @@ function ConfirmFace({
         </DialogDescription>
       </DialogHeader>
 
+      {completeness ? (
+        <Text {...(unsettled > 0 ? { role: "status" } : { tone: "muted" as const })}>
+          {completeness.complete} of {completeness.total} sections settled.
+          {unsettled > 0
+            ? ` Publishing pins the other ${unsettled} ${unsettled === 1 ? "section" : "sections"} as ${unsettled === 1 ? "it stands" : "they stand"}.`
+            : ""}
+        </Text>
+      ) : null}
+
       {count > 0 ? (
         <>
           <Text tone="muted">
             {questionLabel} will remain unresolved. They do not block publication.
           </Text>
-          <ul aria-label="Open questions" className="grid gap-3 rounded-lg border bg-muted/30 p-4">
+          <ul
+            aria-label="Open questions"
+            className="grid max-h-[38svh] gap-3 overflow-y-auto rounded-lg border bg-muted/30 p-4"
+          >
             {questions.map((question) => (
               <li key={question.id} className="grid gap-1">
                 <Text>{question.text}</Text>

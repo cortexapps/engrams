@@ -51,10 +51,20 @@ class MemoryReadStore implements SpecReadStore {
     currentSemanticDocSeq: 3n,
     templateId: TEMPLATE_ID,
     templateName: "Engineering design doc",
+    ownerName: "Owner One",
+    taskTitle: null,
+    suggestedTitle: null,
   };
 
   async readSpec(specId: string): Promise<SpecReadRecord | null> {
     return specId === SPEC_ID ? this.record : null;
+  }
+
+  async renameSpec(specId: string, expectedTitle: string | null, title: string): Promise<boolean> {
+    if (specId !== SPEC_ID) return false;
+    if (expectedTitle !== null && this.record.title !== expectedTitle) return false;
+    this.record = { ...this.record, title };
+    return true;
   }
 
   async listCheckpoints() {
@@ -155,6 +165,7 @@ describe("spec read routes", () => {
         id: string;
         title: string;
         phase: string;
+        owner: { id: string; name: string } | null;
         sessionId: string | null;
         viewerIsOwner: boolean;
         publishedCheckpointId: string;
@@ -169,6 +180,7 @@ describe("spec read routes", () => {
       id: SPEC_ID,
       title: "Checkpoint-safe restore",
       phase: "published",
+      owner: { id: "owner-1", name: "Owner One" },
       sessionId: null,
       viewerIsOwner: false,
       publishedCheckpointId: PINNED_ID,

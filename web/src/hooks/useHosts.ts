@@ -28,13 +28,19 @@ function protoHostToLegacy(h: ProtoHostView): HostView {
   };
 }
 
-export function useHosts() {
+/**
+ * The operator cockpit polls at 1 s. A passive consumer (the sidebar health
+ * telltale, mounted on every page) passes its own relaxed interval; the query
+ * key is shared, so the fastest mounted observer sets the real cadence and an
+ * idle app never polls the fleet at cockpit speed.
+ */
+export function useHosts(intervalMs = 1000) {
   return useQuery(
     listHosts,
     {},
     {
       select: (data) => data.hosts.map(protoHostToLegacy),
-      refetchInterval: 1000,
+      refetchInterval: intervalMs,
       refetchOnWindowFocus: false,
       staleTime: 0,
       placeholderData: (prev) => prev,

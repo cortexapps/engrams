@@ -77,6 +77,18 @@ export interface SectionStateServiceOptions {
   store: SectionStateStore;
   transcript?: SectionStateTranscriptPublisher;
   now: () => Date;
+  /**
+   * Fires after a settle is stored. The wiring saves a version here, so
+   * History has one entry per decision instead of staying empty until
+   * publish. Best-effort by contract: the callback owns its errors, because a
+   * missed version must never fail the settle it records.
+   */
+  onSettled?: (input: {
+    specId: string;
+    sectionId: string;
+    sectionTitle: string;
+    actorUserId: string | null;
+  }) => void;
 }
 
 /** Stores each state change and its transcript action in one transaction. */
@@ -239,6 +251,14 @@ export class SectionStateService {
     if (result.status === "conflict") throw new SectionStateConflictError();
     if (result.status === "read_only") throw new SectionStateReadOnlyError();
     this.assertActionContext(result.action, context, requestFingerprint);
+    if (result.status === "stored" && change.value.state === "settled") {
+      this.options.onSettled?.({
+        specId: context.specId,
+        sectionId: context.sectionId,
+        sectionTitle: context.sectionTitle,
+        actorUserId,
+      });
+    }
     if (deliver) await this.deliver(result.action);
     return changeFromAction(result.action);
   }

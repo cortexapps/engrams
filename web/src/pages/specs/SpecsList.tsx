@@ -184,10 +184,16 @@ export function SpecRow({ spec, now }: { spec: SpecListItem; now: number }) {
         />
       </TableCell>
       <TableCell>
-        <span className="inline-flex items-center gap-1.5 font-mono text-xs tabular-nums">
-          <CircleHelp className="size-3.5 text-muted-foreground" aria-hidden />
-          {spec.openQuestionCount}
-        </span>
+        {spec.openQuestionCount > 0 ? (
+          <span className="inline-flex items-center gap-1.5 font-mono text-xs tabular-nums">
+            <CircleHelp className="size-3.5 text-muted-foreground" aria-hidden />
+            {spec.openQuestionCount}
+          </span>
+        ) : (
+          <span aria-label="No open questions" className="text-muted-foreground">
+            —
+          </span>
+        )}
       </TableCell>
       <TableCell>
         <SpecTicketSyncBadge state={spec.ticketSyncState} />

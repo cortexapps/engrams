@@ -14,6 +14,7 @@ export function SpecShell({
   templateName,
   checkpoints,
   viewerIsOwner,
+  owner = null,
   surface,
   presence = [],
   onSelectSection = () => undefined,
@@ -28,6 +29,7 @@ export function SpecShell({
   templateName: string;
   checkpoints: SpecCheckpointSummary[];
   viewerIsOwner: boolean;
+  owner?: { id: string; name: string } | null;
   surface?: SpecSurface;
   presence?: SpecPresenceEntry[];
   onSelectSection?: (sectionId: string) => void;
@@ -85,6 +87,7 @@ export function SpecShell({
               specId={specId}
               surface={surface}
               presence={presence}
+              owner={owner}
               onSelectSection={onSelectSection}
             />
           ) : null}
