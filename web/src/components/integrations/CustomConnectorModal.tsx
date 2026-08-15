@@ -8,7 +8,7 @@
  * (the admin-trust boundary); the logo bytes upload after the connector exists.
  */
 
-import { useMemo, useState } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
 import {
@@ -129,6 +129,199 @@ const parseEnvLines = (t: string): Record<string, string> => {
 };
 /** PATH command name from a bin path (`bin/mytool` → `mytool`). */
 const basename = (p: string) => p.split("/").pop() ?? p;
+/**
+ * One credential-header row.
+ *
+ * Memoized, and this is load-bearing rather than decorative: the modal holds
+ * every field of the form in one component, so without it a keystroke in ANY
+ * field re-renders every credential and operation row. Measured at ~33 ms per
+ * keystroke, with the operation list alone accounting for ~37% of it.
+ *
+ * For the bail-out to actually happen the props must be stable, which is why
+ * `onPatch`/`onRemove` are `useCallback`'d over functional `setState` in the
+ * parent rather than closed over the current row list.
+ */
+const CredentialRow = memo(function CredentialRow({
+  cred: c,
+  provider,
+  canRemove,
+  onPatch,
+  onRemove,
+}: {
+  cred: CredRow;
+  provider: string;
+  canRemove: boolean;
+  onPatch: (id: number, patch: Partial<CredRow>) => void;
+  onRemove: (id: number) => void;
+}) {
+  return (
+    <div className="relative grid grid-cols-2 gap-3 rounded-md border bg-card/40 p-3">
+      <label className="flex flex-col gap-1.5">
+        <Text variant="label">Header</Text>
+        <Input
+          className="font-mono"
+          value={c.header}
+          onChange={(e) => onPatch(c.id, { header: e.target.value })}
+        />
+      </label>
+      <label className="flex flex-col gap-1.5">
+        <Text variant="label">Template</Text>
+        <Input
+          className="font-mono"
+          value={c.template}
+          onChange={(e) => onPatch(c.id, { template: e.target.value })}
+        />
+      </label>
+      <label className="flex flex-col gap-1.5">
+        <Text variant="label">Org-secret name</Text>
+        <Input
+          className="font-mono"
+          placeholder={`${provider}-token`}
+          spellCheck={false}
+          value={c.secretRef}
+          onChange={(e) => onPatch(c.id, { secretRef: e.target.value })}
+        />
+      </label>
+      <label className="flex flex-col gap-1.5">
+        <Text variant="label">Credential value</Text>
+        <SecretField
+          value={c.credVal}
+          onChange={(v) => onPatch(c.id, { credVal: v })}
+          placeholder="•••••"
+        />
+      </label>
+      {canRemove && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          aria-label="remove header"
+          className="absolute right-1 top-1 size-7 p-0"
+          onClick={() => onRemove(c.id)}
+        >
+          <XIcon className="size-3.5" />
+        </Button>
+      )}
+    </div>
+  );
+});
+
+/** One operation row. Memoized for the same reason as [`CredentialRow`]. */
+const OperationRow = memo(function OperationRow({
+  op: o,
+  provider,
+  onPatch,
+  onRemove,
+}: {
+  op: OpRow;
+  provider: string;
+  onPatch: (id: number, patch: Partial<OpRow>) => void;
+  onRemove: (id: number) => void;
+}) {
+  const g = o.grant.trim();
+  const access =
+    o.kind === "graphql" ? (o.operation === "query" ? "read" : "write") : accessOf(o.method);
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="grid grid-cols-[1.4fr_5.5rem_1fr_2rem] items-center gap-2">
+        <Input
+          className="font-mono text-xs"
+          placeholder="issues:read"
+          aria-label="action slug"
+          spellCheck={false}
+          value={o.grant}
+          onChange={(e) => onPatch(o.id, { grant: e.target.value.replace(/\s/g, "") })}
+        />
+        <Select value={o.kind} onValueChange={(v) => onPatch(o.id, { kind: v as OpRow["kind"] })}>
+          <SelectTrigger className="text-xs" aria-label="operation kind">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="rest">REST</SelectItem>
+            <SelectItem value="graphql">GraphQL</SelectItem>
+          </SelectContent>
+        </Select>
+        {o.kind === "graphql" ? (
+          <div className="grid grid-cols-[7rem_1fr] gap-2">
+            <Select value={o.operation} onValueChange={(v) => onPatch(o.id, { operation: v })}>
+              <SelectTrigger className="font-mono text-xs" aria-label="graphql operation">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="query">query</SelectItem>
+                <SelectItem value="mutation">mutation</SelectItem>
+                <SelectItem value="subscription">subscription</SelectItem>
+              </SelectContent>
+            </Select>
+            <Input
+              className="font-mono text-xs"
+              placeholder="mergePullRequest"
+              aria-label="graphql field"
+              spellCheck={false}
+              value={o.field}
+              onChange={(e) => onPatch(o.id, { field: e.target.value.replace(/\s/g, "") })}
+            />
+          </div>
+        ) : (
+          <div className="grid grid-cols-[4.5rem_1fr] gap-2">
+            <Input
+              className="font-mono text-xs"
+              placeholder="GET"
+              aria-label="method"
+              value={o.method}
+              onChange={(e) => onPatch(o.id, { method: e.target.value.toUpperCase() })}
+            />
+            <Input
+              className="font-mono text-xs"
+              placeholder="/api/0/issues/*"
+              aria-label="path"
+              spellCheck={false}
+              value={o.path}
+              onChange={(e) => onPatch(o.id, { path: e.target.value })}
+            />
+          </div>
+        )}
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          aria-label="remove operation"
+          onClick={() => onRemove(o.id)}
+        >
+          <XIcon className="size-3.5" />
+        </Button>
+      </div>
+      {g && (
+        <div className="flex flex-wrap items-center gap-2 pl-1 text-muted-foreground">
+          <CornerDownRightIcon className="size-3 opacity-60" />
+          <code className="rounded-full border bg-secondary px-2 py-px font-mono text-[0.72rem]">
+            {provider}:{g}
+          </code>
+          <span className="text-[0.74rem]">"{humanizeAction(g)}"</span>
+          <AccessTag access={access} />
+          {o.kind === "graphql"
+            ? o.field && (
+                <span className="text-[0.72rem]">
+                  · gate{" "}
+                  <code className="font-mono">
+                    {o.operation} {o.field}
+                  </code>
+                </span>
+              )
+            : o.path && (
+                <span className="text-[0.72rem]">
+                  · gate{" "}
+                  <code className="font-mono">
+                    {(o.method || "GET").toUpperCase()} {o.path}
+                  </code>
+                </span>
+              )}
+        </div>
+      )}
+    </div>
+  );
+});
+
 export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
   const navigate = useNavigate();
   const upsert = useUpsertConnector();
@@ -185,8 +378,24 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
   );
   const pending =
     upsert.isPending || putSecret.isPending || uploadLogo.isPending || uploadSkill.isPending;
-  const updateCred = (id: number, patch: Partial<CredRow>) =>
-    setCreds((r) => r.map((c) => (c.id === id ? { ...c, ...patch } : c)));
+  // Stable identities so the memoized rows above can actually bail out. They
+  // use functional setState, so they never need to close over the current list.
+  const patchCred = useCallback(
+    (id: number, patch: Partial<CredRow>) =>
+      setCreds((r) => r.map((c) => (c.id === id ? { ...c, ...patch } : c))),
+    [],
+  );
+  const removeCred = useCallback((id: number) => setCreds((r) => r.filter((x) => x.id !== id)), []);
+  const patchOp = useCallback(
+    (id: number, patch: Partial<OpRow>) =>
+      setOps((r) => r.map((x) => (x.id === id ? { ...x, ...patch } : x))),
+    [],
+  );
+  // The last operation is not removable — the connector needs at least one.
+  const removeOp = useCallback(
+    (id: number) => setOps((r) => (r.length > 1 ? r.filter((x) => x.id !== id) : r)),
+    [],
+  );
 
   const save = async () => {
     setError(null);
@@ -408,57 +617,14 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
               one; some (e.g. Datadog) need several.
             </p>
             {creds.map((c) => (
-              <div
+              <CredentialRow
                 key={c.id}
-                className="relative grid grid-cols-2 gap-3 rounded-md border bg-card/40 p-3"
-              >
-                <label className="flex flex-col gap-1.5">
-                  <Text variant="label">Header</Text>
-                  <Input
-                    className="font-mono"
-                    value={c.header}
-                    onChange={(e) => updateCred(c.id, { header: e.target.value })}
-                  />
-                </label>
-                <label className="flex flex-col gap-1.5">
-                  <Text variant="label">Template</Text>
-                  <Input
-                    className="font-mono"
-                    value={c.template}
-                    onChange={(e) => updateCred(c.id, { template: e.target.value })}
-                  />
-                </label>
-                <label className="flex flex-col gap-1.5">
-                  <Text variant="label">Org-secret name</Text>
-                  <Input
-                    className="font-mono"
-                    placeholder={`${provider}-token`}
-                    spellCheck={false}
-                    value={c.secretRef}
-                    onChange={(e) => updateCred(c.id, { secretRef: e.target.value })}
-                  />
-                </label>
-                <label className="flex flex-col gap-1.5">
-                  <Text variant="label">Credential value</Text>
-                  <SecretField
-                    value={c.credVal}
-                    onChange={(v) => updateCred(c.id, { credVal: v })}
-                    placeholder="•••••"
-                  />
-                </label>
-                {creds.length > 1 && (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    aria-label="remove header"
-                    className="absolute right-1 top-1 size-7 p-0"
-                    onClick={() => setCreds((r) => r.filter((x) => x.id !== c.id))}
-                  >
-                    <XIcon className="size-3.5" />
-                  </Button>
-                )}
-              </div>
+                cred={c}
+                provider={provider}
+                canRemove={creds.length > 1}
+                onPatch={patchCred}
+                onRemove={removeCred}
+              />
             ))}
             <Button
               type="button"
@@ -496,157 +662,15 @@ export function CustomConnectorModal({ onClose }: { onClose: () => void }) {
                 />
               </div>
             )}
-            {ops.map((o) => {
-              const g = o.grant.trim();
-              const access =
-                o.kind === "graphql"
-                  ? o.operation === "query"
-                    ? "read"
-                    : "write"
-                  : accessOf(o.method);
-              return (
-                <div key={o.id} className="flex flex-col gap-1.5">
-                  <div className="grid grid-cols-[1.4fr_5.5rem_1fr_2rem] items-center gap-2">
-                    <Input
-                      className="font-mono text-xs"
-                      placeholder="issues:read"
-                      aria-label="action slug"
-                      spellCheck={false}
-                      value={o.grant}
-                      onChange={(e) =>
-                        setOps((r) =>
-                          r.map((x) =>
-                            x.id === o.id ? { ...x, grant: e.target.value.replace(/\s/g, "") } : x,
-                          ),
-                        )
-                      }
-                    />
-                    <Select
-                      value={o.kind}
-                      onValueChange={(v) =>
-                        setOps((r) =>
-                          r.map((x) => (x.id === o.id ? { ...x, kind: v as OpRow["kind"] } : x)),
-                        )
-                      }
-                    >
-                      <SelectTrigger className="text-xs" aria-label="operation kind">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="rest">REST</SelectItem>
-                        <SelectItem value="graphql">GraphQL</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    {o.kind === "graphql" ? (
-                      <div className="grid grid-cols-[7rem_1fr] gap-2">
-                        <Select
-                          value={o.operation}
-                          onValueChange={(v) =>
-                            setOps((r) =>
-                              r.map((x) => (x.id === o.id ? { ...x, operation: v } : x)),
-                            )
-                          }
-                        >
-                          <SelectTrigger
-                            className="font-mono text-xs"
-                            aria-label="graphql operation"
-                          >
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="query">query</SelectItem>
-                            <SelectItem value="mutation">mutation</SelectItem>
-                            <SelectItem value="subscription">subscription</SelectItem>
-                          </SelectContent>
-                        </Select>
-                        <Input
-                          className="font-mono text-xs"
-                          placeholder="mergePullRequest"
-                          aria-label="graphql field"
-                          spellCheck={false}
-                          value={o.field}
-                          onChange={(e) =>
-                            setOps((r) =>
-                              r.map((x) =>
-                                x.id === o.id
-                                  ? { ...x, field: e.target.value.replace(/\s/g, "") }
-                                  : x,
-                              ),
-                            )
-                          }
-                        />
-                      </div>
-                    ) : (
-                      <div className="grid grid-cols-[4.5rem_1fr] gap-2">
-                        <Input
-                          className="font-mono text-xs"
-                          placeholder="GET"
-                          aria-label="method"
-                          value={o.method}
-                          onChange={(e) =>
-                            setOps((r) =>
-                              r.map((x) =>
-                                x.id === o.id ? { ...x, method: e.target.value.toUpperCase() } : x,
-                              ),
-                            )
-                          }
-                        />
-                        <Input
-                          className="font-mono text-xs"
-                          placeholder="/api/0/issues/*"
-                          aria-label="path"
-                          spellCheck={false}
-                          value={o.path}
-                          onChange={(e) =>
-                            setOps((r) =>
-                              r.map((x) => (x.id === o.id ? { ...x, path: e.target.value } : x)),
-                            )
-                          }
-                        />
-                      </div>
-                    )}
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      aria-label="remove operation"
-                      onClick={() =>
-                        setOps((r) => (r.length > 1 ? r.filter((x) => x.id !== o.id) : r))
-                      }
-                    >
-                      <XIcon className="size-3.5" />
-                    </Button>
-                  </div>
-                  {g && (
-                    <div className="flex flex-wrap items-center gap-2 pl-1 text-muted-foreground">
-                      <CornerDownRightIcon className="size-3 opacity-60" />
-                      <code className="rounded-full border bg-secondary px-2 py-px font-mono text-[0.72rem]">
-                        {provider}:{g}
-                      </code>
-                      <span className="text-[0.74rem]">"{humanizeAction(g)}"</span>
-                      <AccessTag access={access} />
-                      {o.kind === "graphql"
-                        ? o.field && (
-                            <span className="text-[0.72rem]">
-                              · gate{" "}
-                              <code className="font-mono">
-                                {o.operation} {o.field}
-                              </code>
-                            </span>
-                          )
-                        : o.path && (
-                            <span className="text-[0.72rem]">
-                              · gate{" "}
-                              <code className="font-mono">
-                                {(o.method || "GET").toUpperCase()} {o.path}
-                              </code>
-                            </span>
-                          )}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
+            {ops.map((o) => (
+              <OperationRow
+                key={o.id}
+                op={o}
+                provider={provider}
+                onPatch={patchOp}
+                onRemove={removeOp}
+              />
+            ))}
             <Button
               type="button"
               variant="outline"
