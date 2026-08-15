@@ -90,6 +90,17 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.orchestrator.kekSecret.existingSecret | default .Values.database.existingSecret }}
                   key: {{ .Values.orchestrator.kekSecret.key }}
+            {{- if .Values.orchestrator.telemetry.existingSecret }}
+            # Session-telemetry OTLP sinks (docs/telemetry.md). The whole JSON
+            # rides a Secret ref because sink entries carry auth headers
+            # (Langfuse Basic auth) — never ConfigMap material. Unset = the
+            # exporter consumers are never registered.
+            - name: ENGRAM_TELEMETRY_SINKS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.orchestrator.telemetry.existingSecret }}
+                  key: {{ .Values.orchestrator.telemetry.sinksKey }}
+            {{- end }}
             {{- if .Values.orchestrator.auth.oidc.clientSecret.existingSecret }}
             # OIDC client secret (only when OIDC is configured). config.ts makes
             # CLIENT_ID + CLIENT_SECRET required once ORCHESTRATOR_OIDC_ISSUER is

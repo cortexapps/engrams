@@ -481,6 +481,15 @@ orchestrator:
     existingSecret: ""          # "" -> falls back to .Values.database.existingSecret
     key: ENGRAM_KEK_MASTER_KEY
 
+  # Session telemetry: OTLP trace sinks for the orchestrator's OTel GenAI
+  # exporter (docs/telemetry.md). The value is a JSON array of sinks and
+  # carries auth headers, so it rides a Secret, not the ConfigMap. Empty
+  # existingSecret (default) = telemetry off — no exporter consumers are
+  # registered and the deployment env omits the var entirely.
+  telemetry:
+    existingSecret: ""
+    sinksKey: ENGRAM_TELEMETRY_SINKS
+
   # Drizzle migrations (orchestrator/drizzle/) MUST be applied to the
   # orchestrator's database before/at deploy. We run them as a pre-install /
   # pre-upgrade Helm Job (mirrors chart conventions: hooks, weights) that
