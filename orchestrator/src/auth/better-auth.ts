@@ -128,25 +128,6 @@ const oidcPlugins = config.oidc
     ]
   : [];
 
-/**
- * ADR 0118: the configured trusted origins, plus the preview wildcard when a
- * preview base domain is set.
- *
- * A session app's page is a legitimate origin for an auth call (it is inside
- * the same login wall), but it is one of an unbounded set of hostnames minted
- * per session, so it cannot be enumerated in TRUSTED_ORIGINS. The wildcard
- * covers exactly one label under the base domain — the same shape the preview
- * handler routes — and nothing else.
- */
-function previewTrustedOrigins(): string[] {
-  const base = config.previewBaseDomain;
-  if (!base) return config.trustedOrigins;
-  const scheme = /(localhost|127\.0\.0\.1|lvh\.me|localtest\.me)/.test(base)
-    ? "http"
-    : "https";
-  return [...config.trustedOrigins, `${scheme}://*.${base}`];
-}
-
 export const auth = betterAuth({
   // Public base URL (ORCHESTRATOR_PUBLIC_URL); dev defaults to loopback. Drives
   // the cookie domain + the OIDC redirect callback, so it MUST be the
@@ -154,10 +135,20 @@ export const auth = betterAuth({
   baseURL: config.baseUrl,
   // The browser reaches this through the vite proxy with
   // Origin: http://localhost:5173 — without trustedOrigins, better-auth
-  // 403s every non-GET auth route (CSRF protection). ADR 0118 adds the preview
-  // wildcard: a session app's page is a legitimate origin for an auth call, and
-  // without it every such call would be CSRF-rejected.
-  trustedOrigins: previewTrustedOrigins(),
+  // 403s every non-GET auth route (CSRF protection).
+  //
+  // ADR 0118: session-app origins are deliberately NOT here. A guest page is
+  // attacker-authored (any org member controls their own app), and because the
+  // session cookie is now scoped to the shared parent domain, a request from a
+  // guest page to the main host is SAME-SITE — so the visitor's cookie rides
+  // along whatever SameSite says, and this CSRF origin check is the only
+  // remaining guard on state-changing auth routes. Trusting `*.<preview>` would
+  // waive it for exactly the origins that should never have it.
+  //
+  // Nothing needs it: the preview edge authenticates server-side from the
+  // Cookie header (routes/preview-proxy.ts), never through a browser call to
+  // the auth API.
+  trustedOrigins: config.trustedOrigins,
   // ADR 0118: scope the session cookie to the domain the main host and the
   // preview base domain share, so ONE login covers the main host and every app
   // URL and a sibling fetch carries the cookie with no redirect. Omitted

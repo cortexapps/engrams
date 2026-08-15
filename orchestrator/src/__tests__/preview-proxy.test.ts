@@ -16,6 +16,8 @@ import { create } from "@bufbuild/protobuf";
 import {
   previewHostLabel,
   authorizeApp,
+  sanitizeGuestSetCookie,
+  stripOrchestratorCredentials,
   isSiblingOrigin,
   isUnderPreviewDomain,
   makePreviewProxyMiddleware,
@@ -355,13 +357,19 @@ describe("ADR 0118 invariants", () => {
     });
   });
 
-  describe("OPTIONS skips the wall", () => {
+  describe("a genuine preflight skips the wall", () => {
     // A browser never sends cookies on a preflight, so authenticating it would
     // reject every cross-app call and no CORS config in the app could fix it.
-    test("an unauthenticated preflight is forwarded to the guest", async () => {
+    const PREFLIGHT = {
+      host: HOST,
+      origin: "http://api-jumping-fat-kittens.lvh.me:8787",
+      "access-control-request-method": "POST",
+    };
+
+    test("an unauthenticated preflight from a sibling reaches the guest", async () => {
       const res = await appWith({ getSession: noSession }).request(`http://${HOST}/api`, {
         method: "OPTIONS",
-        headers: { host: HOST, origin: "http://api-jumping-fat-kittens.lvh.me:8787" },
+        headers: PREFLIGHT,
       });
       expect(res.status).toBe(200); // reached the guest, not the wall
     });
@@ -372,6 +380,36 @@ describe("ADR 0118 invariants", () => {
         headers: { host: HOST },
       });
       expect(res.status).toBe(401);
+    });
+
+    // `proxyHttp` opens a real relay tunnel and those are capped per session,
+    // so an OPTIONS that skipped every check would be an anonymous
+    // tunnel-open primitive: a flood exhausts the cap and 503s the session's
+    // real users, and it would reach even a private app.
+    test("an OPTIONS that is not a preflight is walled like any other request", async () => {
+      const res = await appWith({ getSession: noSession }).request(`http://${HOST}/api`, {
+        method: "OPTIONS",
+        headers: { host: HOST }, // no Origin, no Access-Control-Request-Method
+      });
+      expect(res.status).toBe(401);
+    });
+
+    test("a preflight missing Access-Control-Request-Method is walled", async () => {
+      const res = await appWith({ getSession: noSession }).request(`http://${HOST}/api`, {
+        method: "OPTIONS",
+        headers: { host: HOST, origin: "http://api-jumping-fat-kittens.lvh.me:8787" },
+      });
+      expect(res.status).toBe(401);
+    });
+
+    test("a preflight from a NON-sibling origin is refused without a tunnel", async () => {
+      for (const origin of ["http://web-other.lvh.me:8787", "https://evil.example.com"]) {
+        const res = await appWith({ getSession: noSession }).request(`http://${HOST}/api`, {
+          method: "OPTIONS",
+          headers: { ...PREFLIGHT, origin },
+        });
+        expect(res.status).toBe(403);
+      }
     });
   });
 
@@ -418,11 +456,121 @@ describe("ADR 0118 invariants", () => {
       expect(loc.searchParams.get("next")).toBe(`http://${HOST}/page`);
     });
 
+    // `c.req.url`'s scheme is the SOCKET's, which is plain http behind a
+    // TLS-terminating load balancer — the production topology. Sending the user
+    // back to an http:// app URL after login is an insecure hop, and fails
+    // outright where the LB serves only 443.
+    test("next carries the PUBLIC scheme, not the socket's", async () => {
+      const res = await appWith({
+        getSession: noSession,
+        previewBaseDomain: "preview.example.com",
+        store: fakeStore([row({ hostLabel: "web-x" })]),
+      }).request("http://web-x.preview.example.com/page", {
+        headers: {
+          host: "web-x.preview.example.com",
+          accept: "text/html",
+          "sec-fetch-mode": "navigate",
+        },
+      });
+      expect(res.status).toBe(302);
+      const next = new URL(res.headers.get("location")!).searchParams.get("next")!;
+      expect(next.startsWith("https://")).toBe(true);
+    });
+
+    test("next honours X-Forwarded-Proto when the edge sets it", async () => {
+      const res = await appWith({ getSession: noSession }).request(`http://${HOST}/page`, {
+        headers: {
+          host: HOST,
+          accept: "text/html",
+          "sec-fetch-mode": "navigate",
+          "x-forwarded-proto": "https",
+        },
+      });
+      const next = new URL(res.headers.get("location")!).searchParams.get("next")!;
+      expect(next.startsWith("https://")).toBe(true);
+    });
+
     test("an unauthenticated XHR gets 401, never a redirect into an HTML page", async () => {
       const res = await appWith({ getSession: noSession }).request(`http://${HOST}/api`, {
         headers: { host: HOST, accept: "application/json", "sec-fetch-mode": "cors" },
       });
       expect(res.status).toBe(401);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The guest trust boundary (review findings on #1268)
+// ---------------------------------------------------------------------------
+
+describe("stripOrchestratorCredentials", () => {
+  // The guest runs agent-authored code. Once the session cookie is scoped to
+  // the shared parent domain the browser attaches it to every preview request,
+  // and forwarding it would hand a visitor's session token to whoever wrote the
+  // app — replayable against the main host as that visitor.
+  test("removes the orchestrator session cookie, keeps the app's own", () => {
+    const h = stripOrchestratorCredentials(
+      new Headers({
+        cookie: "app_session=keep-me; better-auth.session_token=tok.HMAC; theme=dark",
+      }),
+    );
+    expect(h.get("cookie")).toBe("app_session=keep-me; theme=dark");
+  });
+
+  test("covers the __Secure- prefixed variant used over HTTPS", () => {
+    const h = stripOrchestratorCredentials(
+      new Headers({ cookie: "__Secure-better-auth.session_token=tok; a=1" }),
+    );
+    expect(h.get("cookie")).toBe("a=1");
+  });
+
+  test("drops the Cookie header entirely when nothing survives", () => {
+    const h = stripOrchestratorCredentials(
+      new Headers({ cookie: "better-auth.session_token=tok" }),
+    );
+    expect(h.has("cookie")).toBe(false);
+  });
+
+  test("removes every header that credentials the ORCHESTRATOR", () => {
+    const h = stripOrchestratorCredentials(
+      new Headers({
+        authorization: "Bearer engk_secret",
+        "x-api-key": "engk_secret",
+        "x-goog-iap-jwt-assertion": "jwt",
+        "x-app-header": "kept",
+      }),
+    );
+    expect(h.has("authorization")).toBe(false);
+    expect(h.has("x-api-key")).toBe(false);
+    expect(h.has("x-goog-iap-jwt-assertion")).toBe(false);
+    expect(h.get("x-app-header")).toBe("kept");
+  });
+});
+
+describe("sanitizeGuestSetCookie", () => {
+  test("drops a guest cookie named like the orchestrator's session", () => {
+    // Otherwise a guest could overwrite the visitor's real session across the
+    // shared domain — fixation, or denial of their main-host session.
+    expect(
+      sanitizeGuestSetCookie([
+        "better-auth.session_token=attacker; Domain=.example.com; Path=/",
+      ]),
+    ).toEqual([]);
+  });
+
+  test("strips Domain so a guest cookie can only ever be host-only", () => {
+    // A guest's app lives at exactly one hostname, so Domain= is never
+    // legitimate and would make the cookie readable by every sibling app and
+    // by the main host.
+    expect(
+      sanitizeGuestSetCookie(["SESSION=abc; Domain=.example.com; Path=/; HttpOnly"]),
+    ).toEqual(["SESSION=abc; Path=/; HttpOnly"]);
+  });
+
+  test("leaves a well-behaved host-only app cookie untouched", () => {
+    // The case that has to keep working: an app setting its own session cookie.
+    expect(sanitizeGuestSetCookie(["SESSION=abc; Path=/; HttpOnly; SameSite=Lax"])).toEqual([
+      "SESSION=abc; Path=/; HttpOnly; SameSite=Lax",
+    ]);
   });
 });
