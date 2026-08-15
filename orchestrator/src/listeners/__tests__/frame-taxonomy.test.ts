@@ -95,7 +95,9 @@ const KINDS_OF = (cls: FrameClass): string[] =>
 const never = () => new Promise<void>(() => {});
 
 function page(events: CuratedEvent[], nextAfter: bigint): BoundedRead {
-  return { events, nextAfter };
+  // Fixture pages treat their curated list as the whole log slice, so the
+  // raw list is the same events (idx-bearing by construction).
+  return { events, raw: events, nextAfter };
 }
 
 function opened(

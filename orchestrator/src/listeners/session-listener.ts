@@ -403,8 +403,13 @@ export class SessionListener {
               terminalOutcome = parseTerminalOutcome(frame.payloadJson);
               if (terminalOutcome) break;
             }
-            const event = curateWireEvent(frame);
-            if (event) await this.#offer(event);
+            // Per-consumer curation happens in #offer (raw consumers get the
+            // frame as-is, curated consumers get exactly the pre-raw stream).
+            await this.#offer({
+              idx: frame.idx,
+              kind: frame.kind,
+              payloadJson: frame.payloadJson,
+            });
             issuePull(); // request the next frame
           }
         } finally {
@@ -588,7 +593,7 @@ export class SessionListener {
       const page = await this.#guarded("catch-up read", (signal) =>
         this.#deps.readPage(this.#deps.sessionId, after, signal));
       this.#touchLive();
-      for (const event of page.events) {
+      for (const event of page.raw) {
         if (this.#stopRequested) return { lastSeen: after, eventCount };
         await this.#offer(event);
         eventCount++;
@@ -610,8 +615,15 @@ export class SessionListener {
     );
   }
 
-  async #offer(event: CuratedEvent): Promise<void> {
+  async #offer(rawEvent: CuratedEvent): Promise<void> {
     for (const state of this.#states) {
+      // Curate PER CONSUMER: raw consumers see every durable event; curated
+      // consumers see exactly the pre-raw stream. A curated-away event must
+      // not touch the state's bookkeeping — advancing highestSeen without
+      // ever offering the event would leave recovery chasing a gap it can
+      // never close.
+      const event = state.consumer.raw ? rawEvent : curateWireEvent(rawEvent);
+      if (event === undefined) continue;
       if (event.idx > state.highestSeen) state.highestSeen = event.idx;
       if (event.idx <= state.highestOffered) continue;
       if (
@@ -653,7 +665,7 @@ export class SessionListener {
           this.#deps.readPage(this.#deps.sessionId, after, signal));
         this.#touchLive();
         attempt = 0;
-        for (const event of page.events) {
+        for (const event of state.consumer.raw ? page.raw : page.events) {
           if (event.idx <= state.highestOffered) continue;
           if (event.idx > state.highestSeen) state.highestSeen = event.idx;
           while (
@@ -718,15 +730,20 @@ export class SessionListener {
     for (;;) {
       if (this.#stopRequested) return false;
       try {
-        if (state.consumer.interestedIn(event.kind)) {
-          await state.consumer.handle(event, this.#context);
+        // A bigint return overrides the commit (a buffering consumer's held
+        // floor — see SessionConsumer.handle); void keeps the default.
+        const returned = state.consumer.interestedIn(event.kind)
+          ? await state.consumer.handle(event, this.#context)
+          : undefined;
+        const commit = typeof returned === "bigint" ? returned : event.idx;
+        if (commit > state.cursor) {
+          await this.#deps.cursorStore.set(
+            this.#deps.sessionId,
+            state.consumer.name,
+            commit,
+          );
+          state.cursor = commit;
         }
-        await this.#deps.cursorStore.set(
-          this.#deps.sessionId,
-          state.consumer.name,
-          event.idx,
-        );
-        state.cursor = event.idx;
         return true;
       } catch (err) {
         attempt++;

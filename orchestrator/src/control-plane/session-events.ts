@@ -75,6 +75,10 @@ export interface CuratedEvent {
 export interface BoundedRead {
   /** Curated content events, in idx order. */
   events: CuratedEvent[];
+  /** EVERY durable (idx-bearing) event of the page, uncurated and in idx
+   *  order — status_changed and all. Raw consumers (SessionConsumer.raw)
+   *  are fed from this list; curated consumers keep reading `events`. */
+  raw: CuratedEvent[];
   /** Cursor to pass as `after` next call. Echoes `after` on an empty/tail page. */
   nextAfter: bigint;
   /** Set when the page contained a terminal `status_changed`. `outcome`
@@ -149,9 +153,13 @@ export async function readSessionEventsBounded(
 ): Promise<BoundedRead> {
   const { events: page, nextAfterIdx } = await list(sessionId, after, PAGE_LIMIT, signal);
   const events: CuratedEvent[] = [];
+  const raw: CuratedEvent[] = [];
   let terminal: { outcome: TerminalOutcome } | undefined;
   let lastAssistantText: string | undefined;
   for (const ev of page) {
+    if (ev.idx !== undefined) {
+      raw.push({ idx: ev.idx, kind: ev.kind, payloadJson: ev.payloadJson });
+    }
     if (ev.kind === "status_changed") {
       const outcome = parseTerminalOutcome(ev.payloadJson);
       if (outcome) terminal = { outcome };
@@ -175,7 +183,7 @@ export async function readSessionEventsBounded(
     const curatedEvent = curateWireEvent(ev);
     if (curatedEvent) events.push(curatedEvent);
   }
-  return { events, nextAfter: nextAfterIdx, terminal, lastAssistantText };
+  return { events, raw, nextAfter: nextAfterIdx, terminal, lastAssistantText };
 }
 
 /** Parse an `agent_message` payload into the two roles the reverse channel

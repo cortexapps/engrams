@@ -6,11 +6,13 @@ import { makeCursorStore } from "./cursor-store.ts";
 import { makeLeaseStore } from "./lease-store.ts";
 import type { LeaseStore } from "./lease-store.ts";
 import { SessionListener } from "./session-listener.ts";
+import { makeProductionOtelExporterConsumers } from "./otel-exporter-consumer.ts";
 import { makeProductionPrLinkConsumer } from "./pr-link-consumer.ts";
 import { makeProductionReviewConsumer } from "./review-consumer.ts";
 import { makeProductionSlackConsumer } from "./slack-consumer.ts";
 import { makeProductionTitleConsumer } from "./title-consumer.ts";
 import { makeProductionToolConsumer } from "./tool-consumer.ts";
+import { config } from "../config.ts";
 import { makeSpecProjectionConsumer } from "./spec-projection-consumer.ts";
 import { productionSpecProjection } from "../specs/projection.ts";
 
@@ -165,6 +167,8 @@ export function makeProductionListenerManager(): ListenerManager {
           makeProductionReviewConsumer(),
           makeProductionTitleConsumer(),
           makeSpecProjectionConsumer(productionSpecProjection),
+          // [] when config.telemetry is unset — telemetry off costs nothing.
+          ...makeProductionOtelExporterConsumers(config.telemetry),
         ],
         readPage: (id, after, signal) =>
           readSessionEventsBounded(id, after, undefined, signal),
