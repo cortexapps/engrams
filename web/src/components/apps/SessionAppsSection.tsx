@@ -1,7 +1,12 @@
 /**
- * Live-host port exposures (ADR 0064) — a compact section for the Diagnostics
- * drawer: a liveness dot + an external link per exposed guest port, plus a
- * minimal "expose a port" control.
+ * Session apps (ADR 0118) — a compact section for the Diagnostics drawer: a
+ * liveness dot + an external link per app, plus a minimal "publish a port"
+ * control.
+ *
+ * An app added here gets no environment variable: the guest's environment is
+ * fixed when the harness binds, so a process that is already running cannot be
+ * told about a name that did not exist when it started. Declare the app on the
+ * profile if a sibling has to reach it.
  *
  * INTERIM HOME. This is deliberately *not* a first-class surface yet — it lives
  * in the operator drawer, out of the developer's way, until ADR 0065 lands the
@@ -13,14 +18,13 @@
 
 import { useState } from "react";
 import {
-  usePorts,
-  usePortHealth,
-  useExposePort,
-  useRevokePort,
-  shareUrl,
-  type PortExposure,
-  type PortHealth,
-} from "../../hooks/usePorts";
+  useApps,
+  useAppHealth,
+  useReserveApp,
+  useRevokeApp,
+  type SessionApp,
+  type AppHealth,
+} from "../../hooks/useApps";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -29,7 +33,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
  * DurabilityReadout: the tooltip word carries the meaning, colour is
  * reinforcement). `unknown` is a hollow ring — honest silence when the session
  * isn't running, never a red "down" guess. */
-function livenessDot(health: PortHealth | undefined): { color: string; title: string } {
+function livenessDot(health: AppHealth | undefined): { color: string; title: string } {
   switch (health) {
     case "up":
       return { color: "var(--color-instrument-nominal)", title: "serving" };
@@ -40,24 +44,23 @@ function livenessDot(health: PortHealth | undefined): { color: string; title: st
   }
 }
 
-function ExposureRow({
+function AppRow({
   sessionId,
-  exposure,
+  app,
   active,
   onRevoke,
   revoking,
 }: {
   sessionId: string;
-  exposure: PortExposure;
+  app: SessionApp;
   active: boolean;
   onRevoke: () => void;
   revoking: boolean;
 }) {
   // Only probe (and thus poll) while the session is active — the gate that keeps
   // a liveness check from ever waking a suspended VM.
-  const { data: health } = usePortHealth(sessionId, exposure.slug, active);
+  const { data: health } = useAppHealth(sessionId, app.hostLabel, active);
   const dot = livenessDot(active ? health : undefined);
-  const link = shareUrl(exposure);
 
   return (
     <div className="flex items-center justify-between gap-2 py-1.5 text-sm">
@@ -69,7 +72,7 @@ function ExposureRow({
                 aria-hidden
                 className="size-1.5 shrink-0 rounded-full ring-1 ring-border"
                 style={{ backgroundColor: dot.color }}
-                data-testid={`liveness-${exposure.slug}`}
+                data-testid={`liveness-${app.hostLabel}`}
                 data-health={active ? (health ?? "unknown") : "unknown"}
               />
             </TooltipTrigger>
@@ -77,14 +80,13 @@ function ExposureRow({
           </Tooltip>
         </TooltipProvider>
         <a
-          href={link}
+          href={app.url}
           target="_blank"
           rel="noreferrer"
           className="truncate font-mono text-xs text-primary hover:underline"
-          data-testid={`open-${exposure.slug}`}
+          data-testid={`open-${app.hostLabel}`}
         >
-          :{exposure.port}
-          {exposure.label ? ` · ${exposure.label}` : ""} ↗
+          {app.name} :{app.port} ↗
         </a>
       </div>
       <Button
@@ -93,7 +95,7 @@ function ExposureRow({
         className="h-6 shrink-0 px-2 text-xs"
         onClick={onRevoke}
         disabled={revoking}
-        data-testid={`revoke-${exposure.slug}`}
+        data-testid={`revoke-${app.hostLabel}`}
       >
         Revoke
       </Button>
@@ -101,7 +103,7 @@ function ExposureRow({
   );
 }
 
-export function ExposedPortsSection({
+export function SessionAppsSection({
   sessionId,
   active,
 }: {
@@ -109,9 +111,9 @@ export function ExposedPortsSection({
   /** Session is running — gates the liveness probe (no probe → no resume). */
   active: boolean;
 }) {
-  const { data: exposures } = usePorts(sessionId);
-  const expose = useExposePort(sessionId);
-  const revoke = useRevokePort(sessionId);
+  const { data: apps } = useApps(sessionId);
+  const reserve = useReserveApp(sessionId);
+  const revoke = useRevokeApp(sessionId);
   const [port, setPort] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -122,15 +124,15 @@ export function ExposedPortsSection({
       return;
     }
     setError(null);
-    expose.mutate(
+    reserve.mutate(
       { port: p },
       {
         onSuccess: () => setPort(""),
         onError: (e) => {
-          // The unique (session, port) index 409s a re-expose; say so plainly
+          // The unique (session, port) index 409s a re-reserve; say so plainly
           // rather than surfacing the raw status.
           const msg = String(e);
-          setError(/409/.test(msg) ? `Port ${p} is already exposed` : msg);
+          setError(/409/.test(msg) ? `Port ${p} is already published` : msg);
         },
       },
     );
@@ -157,10 +159,10 @@ export function ExposedPortsSection({
           variant="secondary"
           className="h-7 text-xs"
           onClick={onExpose}
-          disabled={expose.isPending}
+          disabled={reserve.isPending}
           data-testid="expose-btn"
         >
-          {expose.isPending ? "Exposing…" : "Expose"}
+          {reserve.isPending ? "Publishing…" : "Publish"}
         </Button>
       </div>
       {error && (
@@ -169,18 +171,18 @@ export function ExposedPortsSection({
         </p>
       )}
       <div className="mt-2 divide-y">
-        {exposures && exposures.length === 0 && (
+        {apps && apps.length === 0 && (
           <p className="py-1.5 text-xs text-muted-foreground" data-testid="ports-empty">
-            No ports exposed.
+            No apps published.
           </p>
         )}
-        {exposures?.map((e) => (
-          <ExposureRow
-            key={e.slug}
+        {apps?.map((a) => (
+          <AppRow
+            key={a.hostLabel}
             sessionId={sessionId}
-            exposure={e}
+            app={a}
             active={active}
-            onRevoke={() => revoke.mutate(e.slug)}
+            onRevoke={() => revoke.mutate(a.hostLabel)}
             revoking={revoke.isPending}
           />
         ))}

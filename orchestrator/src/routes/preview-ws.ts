@@ -32,15 +32,15 @@ import { config } from "../config.ts";
 import { portRelay as defaultPortRelay } from "../control-plane/client.ts";
 import {
   authorizePreview,
-  previewSlugFromHost,
+  previewHostLabel,
   tunnelSocket,
   type PortRelayClient,
 } from "./preview-proxy.ts";
-import { makePortExposureStore, type PortExposureStore } from "../db/port-exposures.ts";
+import { makeSessionAppStore, type SessionAppStore } from "../db/session-apps.ts";
 import type { GetSession } from "./guard.ts";
 
 export interface PreviewWsDeps {
-  store?: PortExposureStore;
+  store?: SessionAppStore;
   portRelay?: PortRelayClient;
   getSession?: GetSession;
   previewBaseDomain?: string;
@@ -81,7 +81,7 @@ export function makePreviewUpgradeHandler(
     (deps?.portRelay as PortRelayClient | undefined) ??
     (defaultPortRelay as unknown as PortRelayClient);
   let store = deps?.store;
-  const getStore = (): PortExposureStore => (store ??= makePortExposureStore());
+  const getStore = (): SessionAppStore => (store ??= makeSessionAppStore());
   const resolveSession: GetSession =
     deps?.getSession ??
     (async (headers) => {
@@ -101,7 +101,7 @@ export function makePreviewUpgradeHandler(
   });
 
   return async function tryPreviewUpgrade(req, socket, head) {
-    const slug = previewSlugFromHost(req.headers.host, baseDomain);
+    const slug = previewHostLabel(req.headers.host, baseDomain);
     if (!slug) return false; // not a preview host — let the shell handler run
 
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -112,8 +112,7 @@ export function makePreviewUpgradeHandler(
     }
 
     const authz = await authorizePreview({
-      slug,
-      token: url.searchParams.get("token"),
+      hostLabel: slug,
       headers,
       store: getStore(),
       getSession: resolveSession,

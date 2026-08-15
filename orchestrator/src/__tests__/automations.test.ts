@@ -1,3 +1,4 @@
+import type { ProfileApp } from "../db/schema.ts";
 import { beforeEach, describe, expect, test } from "bun:test";
 import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 
@@ -28,7 +29,7 @@ function session(userId: string | null, role: "user" | "admin" = "user"): GetSes
   return async () => (userId ? { user: { id: userId, role } } : null);
 }
 
-const profile = (portExposures: number[] = []): ProfileRow => ({
+const profile = (apps: ProfileApp[] = []): ProfileRow => ({
   id: "profile-1",
   name: "Automation profile",
   description: "",
@@ -44,7 +45,7 @@ const profile = (portExposures: number[] = []): ProfileRow => ({
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   repos: [],
-  portExposures,
+  apps,
   designation: null,
   createdAt: NOW,
   updatedAt: NOW,
@@ -305,11 +306,11 @@ describe("AutomationService", () => {
     expect(response.automation?.nextFireAt).toBeTruthy();
   });
 
-  test("accepts a profile with port exposures — the run ignores them", async () => {
+  test("accepts a profile that declares apps — the run ignores them", async () => {
     const { automations } = clients({
       getSession: session("admin", "admin"),
       store: fakeStore(),
-      profiles: { getActive: async () => profile([3000]) },
+      profiles: { getActive: async () => profile([{ name: "web", port: 3000 }]) },
       now: () => NOW,
     });
     const response = await automations.createAutomation(cronRequest);

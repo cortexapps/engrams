@@ -1,30 +1,36 @@
 /**
- * Port-exposure CRUD route (ADR 0064 P2a).
+ * Session-app CRUD route (ADR 0118, replacing ADR 0064's ports route).
  *
- *   POST   /api/v1/sessions/:id/ports        { port, label?, visibility? }  → mint/return a slug
- *   GET    /api/v1/sessions/:id/ports                                       → list this session's exposures
- *   DELETE /api/v1/sessions/:id/ports/:slug                                 → revoke one exposure
+ *   POST   /api/v1/sessions/:id/apps                    { port, name?, visibility? }
+ *   GET    /api/v1/sessions/:id/apps                    → list this session's apps
+ *   GET    /api/v1/sessions/:id/apps/:hostLabel/health  → is the guest port answering?
+ *   DELETE /api/v1/sessions/:id/apps/:hostLabel         → revoke one app
+ *
+ * The declarative path (profile.apps, reserved before the session is created)
+ * is the primary one; this route is the ad-hoc "expose what I just started"
+ * surface. An ad-hoc exposure IS an app — omitting `name` derives `port-<port>`
+ * — so the product keeps the capability with one model instead of two.
+ *
+ * An app added here gets no env var: the guest's environment is fixed when the
+ * harness binds, and a process that is already running cannot be told about a
+ * name that did not exist when it started. Declare the app on the profile if a
+ * sibling has to reach it.
  *
  * Auth: the same ownership gate as the rest of the session-scoped surface
- * (guard.ts). Mutations use the `shell` action — exposing a guest port is the
- * same live-interactive-access bar as opening the shell — so an owner (or an
- * admin via `manage('all')`) may create/revoke; listing uses `read`.
+ * (guard.ts). Mutations use the `shell` action — publishing a guest port is the
+ * same live-interactive-access bar as opening the shell; listing uses `read`.
  *
- * This phase only manages the registry; the edge reverse-proxy that actually
- * serves `<slug>.<previewBaseDomain>` over PortRelayService lands in P2b. The
- * returned `url` is therefore the eventual address, not yet reachable.
- *
- * All deps are injectable for tests (see makePortsRoute(deps)).
+ * All deps are injectable for tests (see makeAppsRoute(deps)).
  */
 
 import { Hono } from "hono";
 import { config } from "../config.ts";
 import {
-  makePortExposureStore,
-  type PortExposureRow,
-  type PortExposureStore,
+  makeSessionAppStore,
+  type SessionAppRow,
+  type SessionAppStore,
   type Visibility,
-} from "../db/port-exposures.ts";
+} from "../db/session-apps.ts";
 import {
   portRelay as defaultPortRelay,
   sessions as defaultSessions,
@@ -32,9 +38,10 @@ import {
 import { tunnelSocket, type PortRelayClient } from "./preview-proxy.ts";
 import { makeGuard } from "./guard.ts";
 import type { GetSession, ResolveOwner } from "./guard.ts";
+import { appUrl, defaultAppName, isValidAppName } from "../apps/hostname.ts";
 
-export interface PortsDeps {
-  store?: PortExposureStore;
+export interface AppsDeps {
+  store?: SessionAppStore;
   getSession?: GetSession;
   resolveOwner?: ResolveOwner;
   /** Override the preview base domain (default: config.previewBaseDomain). */
@@ -85,24 +92,18 @@ async function probeLiveness(
   });
 }
 
-/** Local-dev preview domains are served over plain http; everything else https. */
-function schemeFor(domain: string): "http" | "https" {
-  return /(localhost|127\.0\.0\.1|lvh\.me|localtest\.me)/.test(domain) ? "http" : "https";
-}
-
 function isValidVisibility(v: unknown): v is Visibility {
-  return v === "private" || v === "shared";
+  return v === "org" || v === "private";
 }
 
-export function makePortsRoute(deps?: PortsDeps): Hono {
+export function makeAppsRoute(deps?: AppsDeps): Hono {
   const app = new Hono();
   // Resolve the store lazily so the module-level default export doesn't call
   // getDb() at import time (it throws without a DB URL — e.g. in unit tests).
   let store = deps?.store;
-  const getStore = (): PortExposureStore => (store ??= makePortExposureStore());
+  const getStore = (): SessionAppStore => (store ??= makeSessionAppStore());
   const guardFn = makeGuard(deps?.getSession, deps?.resolveOwner);
   const baseDomain = deps?.previewBaseDomain ?? config.previewBaseDomain;
-  const scheme = schemeFor(baseDomain);
   const relay: PortRelayClient = deps?.portRelay ?? defaultPortRelay;
   const sessionStatus =
     deps?.sessionStatus ??
@@ -111,29 +112,25 @@ export function makePortsRoute(deps?: PortsDeps): Hono {
       return r.session?.status ?? null;
     });
 
-  const urlFor = (slug: string): string => `${scheme}://${slug}.${baseDomain}`;
-
-  /** Shape a row for the wire — adds the (eventual) preview URL. */
-  const toJson = (r: PortExposureRow) => ({
-    slug: r.slug,
+  /** Shape a row for the wire — adds the public URL. */
+  const toJson = (r: SessionAppRow) => ({
+    hostLabel: r.hostLabel,
     sessionId: r.sessionId,
+    name: r.name,
     port: r.port,
-    label: r.label,
     visibility: r.visibility,
-    shareToken: r.shareToken,
-    url: urlFor(r.slug),
+    url: appUrl(r.hostLabel, baseDomain),
     createdAt: r.createdAt,
-    expiresAt: r.expiresAt,
   });
 
-  // ---- POST: create / re-expose ----
-  app.post("/api/v1/sessions/:id/ports", async (c) => {
+  // ---- POST: reserve / re-reserve ----
+  app.post("/api/v1/sessions/:id/apps", async (c) => {
     const user = await guardFn(c, "shell");
     const sessionId = c.req.param("id");
 
     const body = (await c.req.json().catch(() => null)) as {
       port?: unknown;
-      label?: unknown;
+      name?: unknown;
       visibility?: unknown;
     } | null;
 
@@ -141,40 +138,43 @@ export function makePortsRoute(deps?: PortsDeps): Hono {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       return c.json({ error: "port must be an integer in 1..=65535" }, 400);
     }
-    const label = typeof body?.label === "string" ? body.label.slice(0, 200) : "";
+    const name =
+      typeof body?.name === "string" && body.name.trim() !== ""
+        ? body.name.trim().toLowerCase()
+        : defaultAppName(port);
+    if (!isValidAppName(name)) {
+      return c.json(
+        { error: "name must be 1-24 lowercase alphanumeric characters or interior hyphens" },
+        400,
+      );
+    }
     const visibility: Visibility = isValidVisibility(body?.visibility)
       ? body.visibility
-      : "private";
+      : "org";
 
-    const row = await getStore().createOrGet({
-      sessionId,
-      port,
-      label,
-      ownerUserId: user.id,
-      visibility,
-    });
+    const row = await getStore().createOne(sessionId, user.id, { name, port, visibility });
     return c.json(toJson(row), 201);
   });
 
   // ---- GET: list ----
-  app.get("/api/v1/sessions/:id/ports", async (c) => {
+  app.get("/api/v1/sessions/:id/apps", async (c) => {
     await guardFn(c, "read");
     const sessionId = c.req.param("id");
     const rows = await getStore().listBySession(sessionId);
-    return c.json({ exposures: rows.map(toJson) });
+    return c.json({ apps: rows.map(toJson) });
   });
 
   // ---- GET: liveness ----
-  // "Is the guest port answering?" for one exposure. Gated on the session being
+  // "Is the guest port answering?" for one app. Gated on the session being
   // active: a suspended session has no live port, and opening the relay would
   // auto-resume it — which a health check must never do. Non-active → "unknown"
-  // (honest, and silent in the UI). Returns 404 for a slug not on this session.
-  app.get("/api/v1/sessions/:id/ports/:slug/health", async (c) => {
+  // (honest, and silent in the UI). Returns 404 for a label not on this session.
+  app.get("/api/v1/sessions/:id/apps/:hostLabel/health", async (c) => {
     await guardFn(c, "read");
     const sessionId = c.req.param("id");
-    const slug = c.req.param("slug");
+    const hostLabel = c.req.param("hostLabel");
 
-    const row = await getStore().getBySlug(slug);
+    const row = await getStore().getByHostLabel(hostLabel);
     if (!row || row.sessionId !== sessionId) {
       return c.json({ error: "not found" }, 404);
     }
@@ -188,22 +188,22 @@ export function makePortsRoute(deps?: PortsDeps): Hono {
   });
 
   // ---- DELETE: revoke ----
-  app.delete("/api/v1/sessions/:id/ports/:slug", async (c) => {
+  app.delete("/api/v1/sessions/:id/apps/:hostLabel", async (c) => {
     await guardFn(c, "shell");
     const sessionId = c.req.param("id");
-    const slug = c.req.param("slug");
+    const hostLabel = c.req.param("hostLabel");
 
-    // Anti-cross-session: the slug must belong to THIS session (404 otherwise,
+    // Anti-cross-session: the label must belong to THIS session (404 otherwise,
     // matching the guard's anti-enumeration shape).
-    const row = await getStore().getBySlug(slug);
+    const row = await getStore().getByHostLabel(hostLabel);
     if (!row || row.sessionId !== sessionId) {
       return c.json({ error: "not found" }, 404);
     }
-    await getStore().deleteBySlug(slug);
+    await getStore().deleteByHostLabel(hostLabel);
     return c.body(null, 204);
   });
 
   return app;
 }
 
-export default makePortsRoute();
+export default makeAppsRoute();

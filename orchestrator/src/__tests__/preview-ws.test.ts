@@ -20,7 +20,7 @@ import {
   RelayPortResponseSchema,
   type RelayPortRequest,
 } from "../gen/engram/app/v1/session_pb.ts";
-import type { PortExposureRow, PortExposureStore } from "../db/port-exposures.ts";
+import type { SessionAppRow, SessionAppStore } from "../db/session-apps.ts";
 import type { PortRelayClient } from "../routes/preview-proxy.ts";
 
 const cleanups: Array<() => void> = [];
@@ -28,19 +28,25 @@ afterEach(() => {
   for (const c of cleanups.splice(0)) c();
 });
 
-function fakeStore(row: PortExposureRow): PortExposureStore {
+function fakeStore(row: SessionAppRow): SessionAppStore {
   return {
-    async createOrGet() {
+    async createMany() {
+      throw new Error("unused");
+    },
+    async createOne() {
       throw new Error("unused");
     },
     async listBySession() {
       return [];
     },
-    async getBySlug(slug) {
-      return slug === row.slug ? row : null;
+    async getByHostLabel(label) {
+      return label === row.hostLabel ? row : null;
     },
-    async deleteBySlug() {
+    async deleteByHostLabel() {
       return false;
+    },
+    async deleteBySession() {
+      return 0;
     },
   };
 }
@@ -78,16 +84,14 @@ function fakeRelayToPort(targetPort: number): PortRelayClient {
 
 const authedOwner = async () => ({ user: { id: "owner" } });
 
-const exposure: PortExposureRow = {
-  slug: "jumping-fat-kittens",
+const sessionApp: SessionAppRow = {
+  hostLabel: "web-jumping-fat-kittens",
   sessionId: "sess_1",
+  name: "web",
   port: 3000, // ignored by the fake relay (which targets the guest echo port)
-  label: "",
   ownerUserId: "owner",
-  visibility: "private",
-  shareToken: null,
+  visibility: "org",
   createdAt: new Date(0),
-  expiresAt: null,
 };
 
 describe("preview WS passthrough", () => {
@@ -109,7 +113,7 @@ describe("preview WS passthrough", () => {
       nodeWs,
       [
         makePreviewUpgradeHandler({
-          store: fakeStore(exposure),
+          store: fakeStore(sessionApp),
           portRelay: fakeRelayToPort(guestPort),
           getSession: authedOwner,
           previewBaseDomain: "lvh.me:8787",
@@ -122,7 +126,7 @@ describe("preview WS passthrough", () => {
 
     // 3. Client: a real ws client with the preview Host header.
     const client = new WsClient(`ws://127.0.0.1:${serverPort}/socket`, {
-      headers: { host: "jumping-fat-kittens.lvh.me:8787" },
+      headers: { host: "web-jumping-fat-kittens.lvh.me:8787" },
     });
     cleanups.push(() => client.close());
 
@@ -150,7 +154,7 @@ describe("preview WS passthrough", () => {
       nodeWs,
       [
         makePreviewUpgradeHandler({
-          store: fakeStore(exposure),
+          store: fakeStore(sessionApp),
           portRelay: fakeRelayToPort(0), // never dialed — auth fails first
           getSession: async () => null,
           previewBaseDomain: "lvh.me:8787",
@@ -162,7 +166,7 @@ describe("preview WS passthrough", () => {
     cleanups.push(() => server.close());
 
     const client = new WsClient(`ws://127.0.0.1:${serverPort}/`, {
-      headers: { host: "jumping-fat-kittens.lvh.me:8787" },
+      headers: { host: "web-jumping-fat-kittens.lvh.me:8787" },
     });
     cleanups.push(() => client.close());
 

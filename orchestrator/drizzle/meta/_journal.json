@@ -519,6 +519,13 @@
       "when": 1787291200000,
       "tag": "0073_spec_reset_v2",
       "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "7",
+      "when": 1787377600000,
+      "tag": "0074_session_apps",
+      "breakpoints": true
     }
   ]
 }

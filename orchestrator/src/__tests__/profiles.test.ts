@@ -164,7 +164,7 @@ const archived: ProfileRow = {
   includeUserTokens: false, envVars: { K: "V" }, skills: [], integrationGrants: [], createdAt: new Date(0), updatedAt: new Date(0),
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] }, secrets: [],
   repos: [],
-  portExposures: [],
+  apps: [],
   designation: null,
   deletedAt: new Date(0),
 };
@@ -608,28 +608,50 @@ describe("ProfileService — auth + field filtering", () => {
 
   // ADR 0064: declarative port exposures round-trip through create/update and
   // default to [] when the field is omitted.
-  test("admin CreateProfile round-trips port_exposures + defaults to [] (ADR 0064)", async () => {
+  test("admin CreateProfile round-trips apps, defaults to [], and rejects a bad one (ADR 0118)", async () => {
     const s = await spawn({
       getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
       images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]),
     });
     try {
-      const withPorts = await s.client.createProfile({
-        name: "Ported", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {},
-        portExposures: [3000, 8080],
+      const withApps = await s.client.createProfile({
+        name: "Apped", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {},
+        apps: [{ name: "web", port: 3000 }, { name: "api", port: 8080 }],
       });
-      expect(withPorts.profile!.portExposures).toEqual([3000, 8080]);
+      // Map off the proto wrapper ($typeName) before comparing.
+      const plain = (as: Array<{ name: string; port: number }>) =>
+        as.map((a) => ({ name: a.name, port: a.port }));
+      expect(plain(withApps.profile!.apps)).toEqual([
+        { name: "web", port: 3000 },
+        { name: "api", port: 8080 },
+      ]);
 
       const bare = await s.client.createProfile({
         name: "Bare", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {},
       });
-      expect(bare.profile!.portExposures).toEqual([]);
+      expect(bare.profile!.apps).toEqual([]);
 
       const updated = await s.client.updateProfile({
-        id: withPorts.profile!.id, name: "Ported", description: "", icon: "Bot", imageId: "img-1",
-        harness: "claude", includeUserTokens: false, envVars: {}, portExposures: [5173],
+        id: withApps.profile!.id, name: "Apped", description: "", icon: "Bot", imageId: "img-1",
+        harness: "claude", includeUserTokens: false, envVars: {},
+        apps: [{ name: "vite", port: 5173 }],
       });
-      expect(updated.profile!.portExposures).toEqual([5173]);
+      expect(plain(updated.profile!.apps)).toEqual([{ name: "vite", port: 5173 }]);
+
+      // Save-time validation REJECTS rather than drops — this is where a user
+      // finds out. (The create path drops, so one bad app can't stop a boot.)
+      await expect(
+        s.client.createProfile({
+          name: "Bad", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {},
+          apps: [{ name: "bad name", port: 3000 }],
+        }),
+      ).rejects.toThrow(/invalid_argument/i);
+      await expect(
+        s.client.createProfile({
+          name: "Dup", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {},
+          apps: [{ name: "web", port: 3000 }, { name: "web", port: 4000 }],
+        }),
+      ).rejects.toThrow(/duplicate app name/i);
     } finally { await s.close(); }
   });
 

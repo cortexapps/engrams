@@ -10,7 +10,7 @@ import authRoute from "./routes/auth.ts";
 import authConfigRoute from "./routes/auth-config.ts";
 import eventsRoute from "./routes/events.ts";
 import artifactsRoute from "./routes/artifacts.ts";
-import portsRoute from "./routes/ports.ts";
+import appsRoute from "./routes/apps.ts";
 import connectorLogoRoute from "./routes/connector-logo.ts";
 import meRoute from "./routes/me.ts";
 import adminRoute from "./routes/admin.ts";
@@ -436,7 +436,7 @@ app.route(
 );
 // ADR 0064 P2a: live-host port-exposure registry (CRUD). The edge reverse-proxy
 // that serves the minted slugs lands in P2b.
-app.route("/", portsRoute);
+app.route("/", appsRoute);
 // Connector logos (redesign): orchestrator-owned brand marks, served for <img>.
 app.route("/", connectorLogoRoute);
 app.route("/", meRoute);

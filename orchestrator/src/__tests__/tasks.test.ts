@@ -51,6 +51,7 @@ import {
   taskSession as taskSessionTable,
   profile as profileTable,
   sessionListener as sessionListenerTable,
+  type ProfileApp,
 } from "../db/schema.ts";
 import { eq, sql, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
@@ -248,7 +249,7 @@ function makeFakeProfiles(opts?: {
   imageId?: string;
   skills?: string[];
   capabilities?: string[];
-  portExposures?: number[];
+  apps?: ProfileApp[];
 }): ProfileStore {
   const row: ProfileRow = {
     id: PROFILE_ID,
@@ -266,7 +267,7 @@ function makeFakeProfiles(opts?: {
     network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
     secrets: [],
     repos: [],
-    portExposures: opts?.portExposures ?? [],
+    apps: opts?.apps ?? [],
     designation: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),

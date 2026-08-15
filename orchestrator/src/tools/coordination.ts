@@ -255,7 +255,7 @@ async function compileChildInput(
     network: structuredClone(policy.network),
     secrets: structuredClone(policy.secrets),
     repos: structuredClone(policy.repos),
-    portExposures: [...policy.portExposures],
+    apps: structuredClone(policy.apps),
     designation: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),

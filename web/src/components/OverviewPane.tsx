@@ -14,7 +14,7 @@ import type { ProfileSnapshotView, Session } from "../lib/types";
 import type { Task } from "../gen/engram/app/v1/task_pb";
 import { statusLabel } from "../pages/sessions/session-format";
 import { StatusGlyph } from "./Glyph";
-import { ExposedPortsSection } from "./ports/ExposedPortsSection";
+import { SessionAppsSection } from "./apps/SessionAppsSection";
 import { ProfileChip } from "./profiles/ProfileChip";
 import { extractFileChanges, totalCounts } from "./session-thread/fileChanges";
 import { TaskTreeNavigation } from "./TaskTreeNavigation";
@@ -167,7 +167,7 @@ export function OverviewPane({
         <div className="flex items-start gap-3 rounded-lg border bg-card p-3">
           <RadioTowerIcon className="mt-1.5 size-4 shrink-0 text-muted-foreground" />
           <div className="min-w-0 flex-1">
-            <ExposedPortsSection sessionId={sessionId} active={session.status === "active"} />
+            <SessionAppsSection sessionId={sessionId} active={session.status === "active"} />
           </div>
         </div>
       </div>

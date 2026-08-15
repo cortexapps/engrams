@@ -277,23 +277,35 @@ describe("SessionProfileEditor (create)", () => {
     expect(create.mock.calls[0][0].skills).toEqual(["browser"]);
   });
 
-  it("adding a port includes portExposures in the create payload (ADR 0064 P4)", async () => {
+  it("adding an app includes apps in the create payload (ADR 0118)", async () => {
     render(<SessionProfileEditor mode="create" />);
     fireEvent.change(screen.getByLabelText(/profile name/i), {
       target: { value: "Dev Server Agent" },
     });
     openAdvanced();
+    fireEvent.change(screen.getByTestId("app-name-input"), { target: { value: "web" } });
     fireEvent.change(screen.getByTestId("port-add-input"), { target: { value: "3000" } });
     fireEvent.click(screen.getByTestId("port-add-btn"));
     expect(screen.getByTestId("port-chip-3000")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
     await waitFor(() => expect(create).toHaveBeenCalled());
-    expect(create.mock.calls[0][0].portExposures).toEqual([3000]);
+    expect(create.mock.calls[0][0].apps).toEqual([{ name: "web", port: 3000 }]);
   });
 
-  it("rejects an out-of-range port without adding a chip (ADR 0064 P4)", () => {
+  it("rejects a name that cannot be a DNS label (ADR 0118)", () => {
     render(<SessionProfileEditor mode="create" />);
     openAdvanced();
+    fireEvent.change(screen.getByTestId("app-name-input"), { target: { value: "bad name" } });
+    fireEvent.change(screen.getByTestId("port-add-input"), { target: { value: "3000" } });
+    fireEvent.click(screen.getByTestId("port-add-btn"));
+    expect(screen.getByTestId("port-add-error")).toBeTruthy();
+    expect(screen.queryByTestId("port-chip-3000")).toBeNull();
+  });
+
+  it("rejects an out-of-range port without adding a chip (ADR 0118)", () => {
+    render(<SessionProfileEditor mode="create" />);
+    openAdvanced();
+    fireEvent.change(screen.getByTestId("app-name-input"), { target: { value: "web" } });
     fireEvent.change(screen.getByTestId("port-add-input"), { target: { value: "0" } });
     fireEvent.click(screen.getByTestId("port-add-btn"));
     expect(screen.getByTestId("port-add-error")).toBeTruthy();
@@ -410,7 +422,7 @@ describe("SessionProfileEditor (Google Cloud connections)", () => {
         skills: [],
         network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
         secrets: [],
-        portExposures: [],
+        apps: [],
       },
     };
     render(<SessionProfileEditor mode="edit" />);
@@ -449,7 +461,7 @@ describe("SessionProfileEditor (Google Cloud connections)", () => {
         skills: [],
         network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
         secrets: [],
-        portExposures: [],
+        apps: [],
       },
     };
     render(<SessionProfileEditor mode="edit" />);
@@ -504,7 +516,10 @@ describe("SessionProfileEditor (edit)", () => {
             allowHostPatterns: ["*.db.internal"],
           },
         ],
-        portExposures: [3000, 8080],
+        apps: [
+          { name: "web", port: 3000 },
+          { name: "api", port: 8080 },
+        ],
       },
     };
     render(<SessionProfileEditor mode="edit" />);
@@ -576,7 +591,10 @@ describe("SessionProfileEditor (edit)", () => {
           allowHostPatterns: ["*.db.internal"],
         },
       ],
-      portExposures: [3000, 8080],
+      apps: [
+        { name: "web", port: 3000 },
+        { name: "api", port: 8080 },
+      ],
     });
     // An unchanged save must NOT re-send designation — otherwise a stale tab
     // could silently steal or drop the reviewer role on an unrelated edit.
@@ -602,7 +620,7 @@ describe("SessionProfileEditor (edit)", () => {
         skills: [],
         network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
         secrets: [],
-        portExposures: [],
+        apps: [],
       },
     };
     render(<SessionProfileEditor mode="edit" />);
@@ -634,7 +652,7 @@ describe("SessionProfileEditor (edit)", () => {
         network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
         secrets: [],
         repos: [],
-        portExposures: [],
+        apps: [],
       },
     };
     render(<SessionProfileEditor mode="edit" />);
@@ -671,7 +689,7 @@ describe("SessionProfileEditor (edit)", () => {
         skills: [],
         network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
         secrets: [],
-        portExposures: [],
+        apps: [],
       },
     };
     render(<SessionProfileEditor mode="edit" />);

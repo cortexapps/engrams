@@ -65,8 +65,7 @@ message Profile {
   optional string harness = 16;
   optional string model = 17;
   optional string effort = 18;
-  // ADR 0064: guest ports auto-exposed (private) for every session from this profile.
-  repeated uint32 port_exposures = 19;
+  reserved 19; // was port_exposures (ADR 0064); superseded by `apps` (ADR 0118).
   // ADR 0100: system-role marker (e.g. "pr_reviewer"). At most one active
   // profile per designation (the store clears the prior when one is set); a
   // designated profile cannot be deleted. Empty = an ordinary profile.
@@ -80,6 +79,22 @@ message Profile {
   repeated ProfileRepo repos = 22;
   // Empty means direct/native provider. Otherwise this is a ModelRouter id.
   optional string model_router = 23;
+  // ADR 0118: the services every session from this profile hosts.
+  repeated SessionApp apps = 24;
+}
+
+// ADR 0118: one service a session hosts, published at
+// `<name>-<session slug>.<preview base domain>`.
+//
+// There is deliberately no per-app "which env var carries my address" field.
+// Roughly half the addresses a service needs are a PEER's, not its own (a CORS
+// allowlist and a post-login redirect target both live on the API and want the
+// frontend's address), so the platform injects `<NAME>_INGRESS_HOST` and
+// `<NAME>_INGRESS_URL` for EVERY app, and `Profile.env_vars` remaps them with
+// `${…}` interpolation.
+message SessionApp {
+  string name = 1; // DNS-label-safe, e.g. "api"
+  uint32 port = 2; // guest TCP port (1..=65535)
 }
 
 // One git checkout inside the profile's image. `remote` is the parsed identity
@@ -200,13 +215,14 @@ message CreateProfileRequest {
   optional string harness = 12;
   optional string model = 13;
   optional string effort = 14;
-  // ADR 0064: guest ports auto-exposed (private) for every session from this profile.
-  repeated uint32 port_exposures = 15;
+  reserved 15; // was port_exposures (ADR 0064); superseded by `apps` (ADR 0118).
   // ADR 0100: system-role marker (see Profile.designation). Admin-only.
   optional string designation = 16;
   repeated ProfileIntegrationGrant integration_grants = 17;
   repeated ProfileRepo repos = 18;
   optional string model_router = 19;
+  // ADR 0118: see Profile.apps.
+  repeated SessionApp apps = 20;
 }
 
 message CreateProfileResponse {
@@ -232,13 +248,14 @@ message UpdateProfileRequest {
   optional string harness = 13;
   optional string model = 14;
   optional string effort = 15;
-  // ADR 0064: guest ports auto-exposed (private) for every session from this profile.
-  repeated uint32 port_exposures = 16;
+  reserved 16; // was port_exposures (ADR 0064); superseded by `apps` (ADR 0118).
   // ADR 0100: system-role marker (see Profile.designation). Admin-only.
   optional string designation = 17;
   repeated ProfileIntegrationGrant integration_grants = 18;
   repeated ProfileRepo repos = 19;
   optional string model_router = 20;
+  // ADR 0118: see Profile.apps.
+  repeated SessionApp apps = 21;
 }
 
 message UpdateProfileResponse {

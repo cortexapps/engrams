@@ -26,10 +26,12 @@ import { getDb } from "../db/client.ts";
 import { makeProfileStore, type ProfileRow, type ProfileStore } from "../db/profiles.ts";
 import {
   DEFAULT_PROFILE_NETWORK,
+  type ProfileApp,
   type ProfileNetwork,
   type ProfileSecret,
   type ProfileIntegrationGrant,
 } from "../db/schema.ts";
+import { appSpecError } from "../apps/env.ts";
 import {
   images as defaultImages,
   harnessCatalog as defaultHarnessCatalog,
@@ -147,9 +149,9 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
     designation: row.designation ?? undefined,
-    // ADR 0064: ports auto-exposed for this profile's sessions (member-visible —
+    // ADR 0118: the services this profile's sessions host (member-visible —
     // describes config, not a secret, like skills).
-    portExposures: row.portExposures,
+    apps: row.apps.map((a) => ({ name: a.name, port: a.port })),
     archived: row.deletedAt != null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -186,6 +188,40 @@ function normalizeReposChecked(
   } catch (err) {
     throw new ConnectError(err instanceof Error ? err.message : "invalid repos", Code.InvalidArgument);
   }
+}
+
+/**
+ * ADR 0118: map + validate proto apps to the stored shape.
+ *
+ * Rejects rather than drops — this is where a user finds out their declaration
+ * is wrong. `appSpecError` is shared with the create path (which drops, so one
+ * bad app cannot stop a session booting), so the two can never disagree about
+ * what a valid app is.
+ */
+function normalizeAppsChecked(
+  apps: ReadonlyArray<{ name?: string; port?: number }>,
+): ProfileApp[] {
+  const out: ProfileApp[] = [];
+  const seenNames = new Set<string>();
+  const seenPorts = new Set<number>();
+  for (const a of apps) {
+    const app: ProfileApp = {
+      name: (a.name ?? "").trim().toLowerCase(),
+      port: a.port ?? 0,
+    };
+    const err = appSpecError(app);
+    if (err) throw new ConnectError(`app "${app.name}": ${err}`, Code.InvalidArgument);
+    if (seenNames.has(app.name)) {
+      throw new ConnectError(`duplicate app name "${app.name}"`, Code.InvalidArgument);
+    }
+    if (seenPorts.has(app.port)) {
+      throw new ConnectError(`duplicate app port ${app.port}`, Code.InvalidArgument);
+    }
+    seenNames.add(app.name);
+    seenPorts.add(app.port);
+    out.push(app);
+  }
+  return out;
 }
 
 /** ADR 0057: map proto secrets to the stored shape (mode coerced to broker|literal). */
@@ -546,7 +582,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         modelRouter,
         model,
         effort,
-        portExposures: req.portExposures ?? [],
+        apps: normalizeAppsChecked(req.apps ?? []),
       });
       if (req.designation) {
         await store.setDesignation(row.id, req.designation);
@@ -596,7 +632,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         modelRouter,
         model,
         effort,
-        portExposures: req.portExposures ?? [],
+        apps: normalizeAppsChecked(req.apps ?? []),
       });
       if (!row) throw new ConnectError("not found", Code.NotFound);
       if (req.designation !== undefined) {

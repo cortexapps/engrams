@@ -22,7 +22,7 @@ const baseInput = {
   network: { default: "deny" as const, allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   repos: [],
-  portExposures: [],
+  apps: [],
 };
 
 describe("ProfileStore", () => {
@@ -118,19 +118,25 @@ describe("ProfileStore", () => {
       network: { default: "deny" as const, allowHosts: [], allowHostPatterns: [] },
       secrets: [],
       repos: [],
-      portExposures: [3000, 8080],
+      apps: [{ name: "web", port: 3000 }, { name: "api", port: 8080 }],
     };
     const created = await store.create(input);
     try {
       expect(created.id).toBeDefined();
       expect(created.deletedAt).toBeNull();
       expect(created.integrationGrants).toEqual(input.integrationGrants);
-      // ADR 0064: port_exposures round-trip through the store.
-      expect(created.portExposures).toEqual([3000, 8080]);
+      // ADR 0118: apps round-trip through the store.
+      expect(created.apps).toEqual([
+        { name: "web", port: 3000 },
+        { name: "api", port: 8080 },
+      ]);
 
       const active = await store.getActive(created.id);
       expect(active?.name).toBe(input.name);
-      expect(active?.portExposures).toEqual([3000, 8080]);
+      expect(active?.apps).toEqual([
+        { name: "web", port: 3000 },
+        { name: "api", port: 8080 },
+      ]);
 
       const listed = await store.list({ includeArchived: false });
       expect(listed.some((p) => p.id === created.id)).toBe(true);

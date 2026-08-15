@@ -25,7 +25,13 @@ import { log as rootLog } from "../log.ts";
 import type { ProfileRow, ProfileStore } from "../db/profiles.ts";
 import { makeUserIdentityStore, type UserIdentityStore } from "../db/users.ts";
 import { isServiceAccountEmail } from "./api-key.ts";
-import { makePortExposureStore, type PortExposureStore } from "../db/port-exposures.ts";
+import {
+  makeSessionAppStore,
+  type SessionAppRow,
+  type SessionAppStore,
+} from "../db/session-apps.ts";
+import { buildIngressEnv, interpolateEnv, normalizeApps } from "../apps/env.ts";
+import { config } from "../config.ts";
 import type { ImagesClient } from "./profiles.ts";
 import { evictOwnerCacheEntry } from "../authz/resolve.ts";
 import {
@@ -719,9 +725,12 @@ export interface CreateTaskDeps {
     }>;
   };
   db: Db;
-  /** ADR 0064: port-exposure store for auto-minting `profile.portExposures`.
+  /** ADR 0118: session-app store, used to reserve `profile.apps` hostnames
+   *  inside the pre-create transaction.
    *  Defaults to a Drizzle store over `db` when omitted. */
-  portExposures?: PortExposureStore;
+  sessionApps?: SessionAppStore;
+  /** ADR 0118: override the preview base domain (default: config.previewBaseDomain). */
+  previewBaseDomain?: string;
   /** ADR 0031 §7: owner identity lookup for git commit attribution.
    *  Defaults to a Drizzle store over `db` when omitted. */
   users?: UserIdentityStore;
@@ -1086,8 +1095,18 @@ export async function createTaskWithSession(
     network: profile.network,
     secrets: [...profile.secrets],
     repos: [...profile.repos],
-    portExposures: [...profile.portExposures],
+    apps: profile.apps.map((a) => ({ ...a })),
   };
+
+  // ADR 0118: the apps this session hosts. A malformed declaration is DROPPED,
+  // not fatal — one bad app must never stop a session booting — and logged so
+  // the mistake is visible. Save-time validation (rpc/profiles.ts) is where a
+  // user is told about it, and it rejects rather than drops.
+  const { specs: appSpecs, rejected: rejectedApps } = normalizeApps(profile.apps);
+  if (rejectedApps.length > 0) {
+    log.warn({ sessionId, rejected: rejectedApps }, "task-create: dropped invalid profile apps");
+  }
+  let appRows: SessionAppRow[] = [];
 
   // ADR 0109: the broker must see this snapshot before the VM can make its
   // first credentialed request. Listener registration remains post-boot.
@@ -1129,7 +1148,32 @@ export async function createTaskWithSession(
         threadWfId: params.slackThreadWorkflowId,
       });
     }
+    // ADR 0118: reserve every app's hostname HERE — one batched insert inside a
+    // transaction that already runs, before the session exists. That is what
+    // makes the addresses available as env vars below, and it costs no extra
+    // round trip (it replaces three serial ones per port, post-create).
+    if (appSpecs.length > 0) {
+      const store = deps.sessionApps ?? makeSessionAppStore(deps.db);
+      appRows = await store.createMany(sessionId, params.ownerUserId, appSpecs, tx);
+    }
   });
+
+  // ADR 0118: give every process both forms of every app's address, then let
+  // profile.envVars remap them into the names this profile's services read.
+  // `harnessEnv` becomes the coordinator's identity_env → session_env → the
+  // SpawnHarness frame agentd applies to everything it spawns.
+  if (appRows.length > 0) {
+    const ingress = buildIngressEnv(appRows, deps.previewBaseDomain ?? config.previewBaseDomain);
+    const { env: remapped, unresolved } = interpolateEnv(sessionInput.harnessEnv ?? {}, ingress);
+    if (unresolved.length > 0) {
+      log.warn(
+        { sessionId, unresolved },
+        "task-create: env references an app address that does not exist (left verbatim)",
+      );
+    }
+    // Ingress vars first so a profile may deliberately override one by name.
+    sessionInput.harnessEnv = { ...ingress, ...remapped };
+  }
 
   let createdSessionId: string | undefined;
   try {
@@ -1167,26 +1211,6 @@ export async function createTaskWithSession(
       );
     }
     throw err;
-  }
-
-  // ADR 0064: auto-mint one private port-exposure per port the profile declares.
-  // Best-effort — an exposure failure must NOT fail the task (the session is
-  // already live + persisted); log and continue so the rest still land.
-  if (profile.portExposures.length > 0) {
-    const store = deps.portExposures ?? makePortExposureStore(deps.db);
-    for (const port of profile.portExposures) {
-      try {
-        await store.createOrGet({
-          sessionId,
-          port,
-          label: "",
-          ownerUserId: params.ownerUserId,
-          visibility: "private",
-        });
-      } catch (e) {
-        log.warn({ sessionId, port, err: e }, "task-create: auto-expose port failed (continuing)");
-      }
-    }
   }
 
   // A just-created session must not be served a stale null from the owner
