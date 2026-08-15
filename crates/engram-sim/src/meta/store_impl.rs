@@ -922,7 +922,8 @@ impl MetadataStore for SimMetadataStore {
     }
 
     /// ADR 0116 A5: exactly the `entomb_stably_unbound` transaction —
-    /// prune, stamp, graduate.
+    /// protect hosts with live capture jobs, then prune, stamp, and
+    /// graduate.
     async fn entomb_stably_unbound(
         &self,
         host_id: HostId,
@@ -937,10 +938,14 @@ impl MetadataStore for SimMetadataStore {
             .values()
             .filter_map(|r| r.session.sandbox_id)
             .collect();
+        let capture_active = db
+            .capture_jobs
+            .values()
+            .any(|job| job.host_id == Some(host_id) && !job.stage.is_terminal());
         let unbound: Vec<engram_core::SandboxId> = running
             .iter()
             .copied()
-            .filter(|s| !bound.contains(s))
+            .filter(|s| !capture_active && !bound.contains(s))
             .collect();
         db.sandbox_unbound_sightings
             .retain(|(h, s), _| *h != host_id || unbound.contains(s));

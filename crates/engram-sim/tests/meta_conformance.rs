@@ -1279,6 +1279,77 @@ async fn sandbox_tombstones(ctx: &Ctx) {
         none.is_empty(),
         "a now-bound sandbox is pruned, never entombed"
     );
+
+    // A capture VM is intentionally not bound to a session. Its live
+    // capture-job assignment protects the host's unbound sandboxes from
+    // the lost-destroy sweep until the job becomes terminal.
+    let capture_host = HostId::new();
+    meta.upsert_host(host_record(
+        capture_host,
+        "capture-tomb-host",
+        ctx.clock.now_utc(),
+    ))
+    .await
+    .unwrap();
+    let capture_parent = meta
+        .create_or_get_enable_job("conf:tombstone:capture", None, &ImageConfig::default())
+        .await
+        .unwrap()
+        .id;
+    let capture = meta
+        .insert_capture_job(new_capture(capture_parent))
+        .await
+        .unwrap();
+    let capture = meta
+        .place_capture_job(capture.id, &[capture_host])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(capture.host_id, Some(capture_host));
+    let capture_sb = engram_core::SandboxId::new();
+    assert!(meta
+        .entomb_stably_unbound(capture_host, &[capture_sb], 30)
+        .await
+        .unwrap()
+        .is_empty());
+    ctx.clock.advance(Duration::from_secs(31));
+    assert!(meta
+        .entomb_stably_unbound(capture_host, &[capture_sb], 30)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!meta
+        .sandbox_tombstones_for_host(capture_host)
+        .await
+        .unwrap()
+        .contains(&capture_sb));
+
+    assert!(meta
+        .record_capture_job_report(&CaptureJobReport {
+            job_id: capture.id,
+            epoch: capture.epoch,
+            stage: CaptureJobStage::Done,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: Some(CaptureTerminalReport::Done {
+                result_bincode: Vec::new(),
+            }),
+        })
+        .await
+        .unwrap());
+    assert!(meta
+        .entomb_stably_unbound(capture_host, &[capture_sb], 30)
+        .await
+        .unwrap()
+        .is_empty());
+    ctx.clock.advance(Duration::from_secs(31));
+    assert_eq!(
+        meta.entomb_stably_unbound(capture_host, &[capture_sb], 30)
+            .await
+            .unwrap(),
+        vec![capture_sb],
+        "capture VM cleanup resumes after the job becomes terminal"
+    );
 }
 
 /// Dead-host lease: acquire, contest, claimant-guarded release, stale
