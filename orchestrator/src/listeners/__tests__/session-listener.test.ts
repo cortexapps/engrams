@@ -33,6 +33,7 @@ function page(
 ): BoundedRead {
   return {
     events,
+    raw: events,
     nextAfter,
     ...(outcome ? { terminal: { outcome } } : {}),
   };
@@ -826,5 +827,81 @@ describe("SessionListener", () => {
 
     await subject.stop();
     await running;
+  });
+});
+
+describe("SessionListener — raw consumers and commit-idx overrides", () => {
+  test("a raw consumer receives uncurated kinds; curated consumers see today's exact stream", async () => {
+    const curatedRec = recordingConsumer({ name: "curated" });
+    const rawRec = recordingConsumer({ name: "raw" });
+    rawRec.consumer.raw = true;
+    const cursors = makeInMemoryCursorStore();
+    // The raw list carries kinds curation drops (generation, stdout); the
+    // curated list is what today's readers produce for the same page.
+    const rawEvents = [
+      event(0n, "run_started"),
+      event(1n, "generation"),
+      event(2n, "stdout"),
+      event(3n, "run_completed"),
+    ];
+    const subject = await listener({
+      cursorStore: cursors,
+      readPage: async () => ({
+        events: [event(0n, "run_started"), event(3n, "run_completed")],
+        raw: rawEvents,
+        nextAfter: 4n,
+        terminal: { outcome: "completed" as const },
+      }),
+    }, [curatedRec.consumer, rawRec.consumer], cursors);
+
+    await subject.run();
+
+    expect(rawRec.events.map((ev) => [ev.idx, ev.kind])).toEqual([
+      [0n, "run_started"],
+      [1n, "generation"],
+      [2n, "stdout"],
+      [3n, "run_completed"],
+    ]);
+    // The curated consumer never sees the uncurated kinds — and its cursor
+    // still reaches the page tail (uninterested deliveries commit too).
+    expect(curatedRec.events.map((ev) => ev.kind)).toEqual(["run_started", "run_completed"]);
+    expect(await cursors.get("session-1", "curated")).toBe(3n);
+    expect(await cursors.get("session-1", "raw")).toBe(3n);
+  });
+
+  test("a bigint handle return holds the durable cursor until the consumer releases it", async () => {
+    const cursors = makeInMemoryCursorStore();
+    const observed: Array<[bigint, bigint]> = [];
+    const holding: SessionConsumer = {
+      name: "holder",
+      raw: true,
+      interestedIn: () => true,
+      appliesTo: async () => true,
+      // Buffer events 0-1 (commit the floor, -1n), release at event 2.
+      handle: async (ev) => {
+        observed.push([ev.idx, await cursors.get("session-1", "holder")]);
+        return ev.idx === 2n ? ev.idx : -1n;
+      },
+    };
+    const subject = await listener({
+      cursorStore: cursors,
+      readPage: async () => ({
+        events: [],
+        raw: [event(0n, "generation"), event(1n, "generation"), event(2n, "run_completed")],
+        nextAfter: 3n,
+        terminal: { outcome: "completed" as const },
+      }),
+    }, [holding], cursors);
+
+    await subject.run();
+
+    // The cursor never moved while the floor was held…
+    expect(observed).toEqual([
+      [0n, -1n],
+      [1n, -1n],
+      [2n, -1n],
+    ]);
+    // …and lands on the released idx afterwards.
+    expect(await cursors.get("session-1", "holder")).toBe(2n);
   });
 });

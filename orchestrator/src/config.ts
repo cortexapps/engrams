@@ -177,6 +177,111 @@ export interface Config {
   /** ADR 0113 recursive session limits. */
   subSessionMaxDepth: number;
   subSessionMaxDescendants: number;
+  /**
+   * ENGRAM_TELEMETRY_SINKS — optional JSON array of OTLP trace sinks the
+   * session-telemetry exporter posts OTel GenAI spans to (Langfuse, any OTLP
+   * collector). Unset/empty → undefined → the exporter consumers are never
+   * registered (zero overhead). See TelemetrySink for the entry shape.
+   */
+  telemetry?: TelemetryConfig;
+}
+
+/** One OTLP/HTTP trace sink for the session-telemetry exporter. */
+export interface TelemetrySink {
+  /**
+   * Unique, STABLE sink name. It keys the sink's durable per-session cursor
+   * (`consumer_cursors.consumer = "otel-exporter:<name>"`), so renaming a
+   * sink restarts its export position from the log head.
+   */
+  name: string;
+  /** Full OTLP/HTTP traces endpoint, e.g.
+   *  https://langfuse.example.com/api/public/otel/v1/traces */
+  endpoint: string;
+  /** Extra request headers (auth). Values are secrets — never logged. */
+  headers: Record<string, string>;
+  /** Include prompt/message text and tool arg/result summaries as span
+   *  attributes. Default false: metadata only (model, tokens, latency,
+   *  tool names). */
+  captureContent: boolean;
+  /** OTel resource `service.name`. Default "engrams". */
+  serviceName: string;
+}
+
+export interface TelemetryConfig {
+  sinks: TelemetrySink[];
+}
+
+/** Parse + validate ENGRAM_TELEMETRY_SINKS. Exported for tests. */
+export function parseTelemetrySinks(raw: string | undefined): TelemetryConfig | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (err) {
+    throw new Error(`Orchestrator: ENGRAM_TELEMETRY_SINKS is not valid JSON: ${String(err)}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error("Orchestrator: ENGRAM_TELEMETRY_SINKS must be a JSON array");
+  }
+  if (parsed.length === 0) return undefined;
+  const seen = new Set<string>();
+  const sinks = parsed.map((entry, i): TelemetrySink => {
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error(`Orchestrator: ENGRAM_TELEMETRY_SINKS[${i}] must be an object`);
+    }
+    const e = entry as Record<string, unknown>;
+    const name = typeof e["name"] === "string" ? e["name"].trim() : "";
+    if (!name) {
+      throw new Error(`Orchestrator: ENGRAM_TELEMETRY_SINKS[${i}].name is required`);
+    }
+    if (seen.has(name)) {
+      throw new Error(
+        `Orchestrator: ENGRAM_TELEMETRY_SINKS has duplicate sink name "${name}" — names key durable cursors and must be unique`,
+      );
+    }
+    seen.add(name);
+    const endpoint = typeof e["endpoint"] === "string" ? e["endpoint"].trim() : "";
+    let url: URL;
+    try {
+      url = new URL(endpoint);
+    } catch {
+      throw new Error(
+        `Orchestrator: ENGRAM_TELEMETRY_SINKS[${i}] ("${name}") endpoint is not a valid URL`,
+      );
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      throw new Error(
+        `Orchestrator: ENGRAM_TELEMETRY_SINKS[${i}] ("${name}") endpoint must be http(s)`,
+      );
+    }
+    const headersRaw = e["headers"] ?? {};
+    if (typeof headersRaw !== "object" || headersRaw === null || Array.isArray(headersRaw)) {
+      throw new Error(
+        `Orchestrator: ENGRAM_TELEMETRY_SINKS[${i}] ("${name}") headers must be an object`,
+      );
+    }
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(headersRaw)) {
+      if (typeof v !== "string") {
+        throw new Error(
+          `Orchestrator: ENGRAM_TELEMETRY_SINKS[${i}] ("${name}") header "${k}" must be a string`,
+        );
+      }
+      headers[k] = v;
+    }
+    return {
+      name,
+      endpoint,
+      headers,
+      captureContent: e["captureContent"] === true,
+      serviceName:
+        typeof e["serviceName"] === "string" && e["serviceName"].trim() !== ""
+          ? e["serviceName"].trim()
+          : "engrams",
+    };
+  });
+  return { sinks };
 }
 
 /** A configured generic OIDC provider (better-auth genericOAuth). */
@@ -352,6 +457,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   );
   const subSessionMaxDepth = positiveNumber("ORCHESTRATOR_SUBSESSION_MAX_DEPTH", 4);
   const subSessionMaxDescendants = positiveNumber("ORCHESTRATOR_SUBSESSION_MAX_DESCENDANTS", 8);
+
+  // OPTIONAL: session-telemetry OTLP sinks. Unset/empty = telemetry off — the
+  // exporter consumers are never registered. Invalid JSON / shape is a hard
+  // error (you meant to enable telemetry but misconfigured it).
+  const telemetry = parseTelemetrySinks(env["ENGRAM_TELEMETRY_SINKS"]);
   // A live pod proves its version with a heartbeat every interval, and the
   // SIGTERM handler stops the heartbeat only AFTER the DBOS drain completes
   // (index.ts) — so whenever workflow code can execute, the freshest beat is
@@ -404,6 +514,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     sweepHeartbeatIntervalMs,
     subSessionMaxDepth,
     subSessionMaxDescendants,
+    ...(telemetry ? { telemetry } : {}),
   };
 }
 
