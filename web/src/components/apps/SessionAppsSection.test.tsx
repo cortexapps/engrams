@@ -1,13 +1,13 @@
 /**
- * ExposedPortsSection (ADR 0064) — the Diagnostics-drawer port list:
+ * SessionAppsSection (ADR 0118) — the Diagnostics-drawer app list:
  * external-link rows + a liveness dot (gated on the session being active) +
- * expose/validate, against a mocked REST API.
+ * publish/validate, against a mocked REST API.
  */
 
 import { describe, test, expect, vi, afterEach } from "vitest";
 import { screen, fireEvent, waitFor } from "@testing-library/react";
 import { renderWithProviders } from "../../test-utils";
-import { ExposedPortsSection } from "./ExposedPortsSection";
+import { SessionAppsSection } from "./SessionAppsSection";
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -16,53 +16,51 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-const exposure = {
-  slug: "jumping-fat-kittens",
+const app = {
+  hostLabel: "web-jumping-fat-kittens",
   sessionId: "s1",
+  name: "web",
   port: 3000,
-  label: "Vite",
-  visibility: "private" as const,
-  shareToken: null,
-  url: "https://jumping-fat-kittens.preview.example.com",
+  visibility: "org" as const,
+  url: "https://web-jumping-fat-kittens.preview.example.com",
   createdAt: "",
-  expiresAt: null,
 };
 
 afterEach(() => vi.unstubAllGlobals());
 
-describe("ExposedPortsSection", () => {
+describe("SessionAppsSection", () => {
   test("shows the empty state", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => json({ exposures: [] })),
+      vi.fn(async () => json({ apps: [] })),
     );
-    renderWithProviders(<ExposedPortsSection sessionId="s1" active={false} />);
+    renderWithProviders(<SessionAppsSection sessionId="s1" active={false} />);
     await screen.findByTestId("ports-empty");
   });
 
-  test("renders an exposure as an external link", async () => {
+  test("renders an app as an external link", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string) =>
-        url.endsWith("/health") ? json({ status: "up" }) : json({ exposures: [exposure] }),
+        url.endsWith("/health") ? json({ status: "up" }) : json({ apps: [app] }),
       ),
     );
-    renderWithProviders(<ExposedPortsSection sessionId="s1" active={true} />);
-    const link = await screen.findByTestId("open-jumping-fat-kittens");
-    expect(link.getAttribute("href")).toBe("https://jumping-fat-kittens.preview.example.com");
+    renderWithProviders(<SessionAppsSection sessionId="s1" active={true} />);
+    const link = await screen.findByTestId("open-web-jumping-fat-kittens");
+    expect(link.getAttribute("href")).toBe("https://web-jumping-fat-kittens.preview.example.com");
     expect(link.getAttribute("target")).toBe("_blank");
     expect(link.textContent).toContain(":3000");
-    expect(link.textContent).toContain("Vite");
+    expect(link.textContent).toContain("web");
   });
 
   test("inactive session: NO liveness probe, dot stays unknown", async () => {
     const fetchMock = vi.fn(async (url: string) =>
-      url.endsWith("/health") ? json({ status: "up" }) : json({ exposures: [exposure] }),
+      url.endsWith("/health") ? json({ status: "up" }) : json({ apps: [app] }),
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    renderWithProviders(<ExposedPortsSection sessionId="s1" active={false} />);
-    const dot = await screen.findByTestId("liveness-jumping-fat-kittens");
+    renderWithProviders(<SessionAppsSection sessionId="s1" active={false} />);
+    const dot = await screen.findByTestId("liveness-web-jumping-fat-kittens");
     expect(dot.getAttribute("data-health")).toBe("unknown");
     expect(fetchMock.mock.calls.some((c) => String(c[0]).endsWith("/health"))).toBe(false);
   });
@@ -71,12 +69,12 @@ describe("ExposedPortsSection", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string) =>
-        url.endsWith("/health") ? json({ status: "up" }) : json({ exposures: [exposure] }),
+        url.endsWith("/health") ? json({ status: "up" }) : json({ apps: [app] }),
       ),
     );
-    renderWithProviders(<ExposedPortsSection sessionId="s1" active={true} />);
+    renderWithProviders(<SessionAppsSection sessionId="s1" active={true} />);
     await waitFor(() => {
-      const dot = screen.getByTestId("liveness-jumping-fat-kittens");
+      const dot = screen.getByTestId("liveness-web-jumping-fat-kittens");
       expect(dot.getAttribute("data-health")).toBe("up");
     });
   });
@@ -84,24 +82,24 @@ describe("ExposedPortsSection", () => {
   test("a duplicate port (409) gets a friendly message", async () => {
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
       if ((init?.method ?? "GET") === "POST") return json({ error: "exists" }, 409);
-      return json({ exposures: [] });
+      return json({ apps: [] });
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    renderWithProviders(<ExposedPortsSection sessionId="s1" active={false} />);
+    renderWithProviders(<SessionAppsSection sessionId="s1" active={false} />);
     await screen.findByTestId("ports-empty");
     fireEvent.change(screen.getByTestId("port-input"), { target: { value: "3000" } });
     fireEvent.click(screen.getByTestId("expose-btn"));
 
     const err = await screen.findByTestId("ports-error");
-    expect(err.textContent).toContain("already exposed");
+    expect(err.textContent).toContain("already published");
   });
 
   test("rejects an out-of-range port without calling the API", async () => {
-    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => json({ exposures: [] }));
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => json({ apps: [] }));
     vi.stubGlobal("fetch", fetchMock);
 
-    renderWithProviders(<ExposedPortsSection sessionId="s1" active={false} />);
+    renderWithProviders(<SessionAppsSection sessionId="s1" active={false} />);
     await screen.findByTestId("ports-empty");
     fireEvent.change(screen.getByTestId("port-input"), { target: { value: "0" } });
     fireEvent.click(screen.getByTestId("expose-btn"));

@@ -12,6 +12,7 @@ import { getDb } from "./client.ts";
 import {
   profile as profileTable,
   DEFAULT_PROFILE_NETWORK,
+  type ProfileApp,
   type ProfileNetwork,
   type ProfileRepo,
   type ProfileSecret,
@@ -42,8 +43,8 @@ export interface ProfileRow {
   secrets: ProfileSecret[];
   // Git checkouts inside the image (user-managed; picker card input).
   repos: ProfileRepo[];
-  // ADR 0064: guest ports auto-exposed (private) for every session from this profile.
-  portExposures: number[];
+  // ADR 0118: the services every session from this profile hosts.
+  apps: ProfileApp[];
   designation: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -68,7 +69,7 @@ export interface ProfileInput {
   network: ProfileNetwork;
   secrets: ProfileSecret[];
   repos: ProfileRepo[];
-  portExposures: number[];
+  apps: ProfileApp[];
 }
 
 /** The seam injected into ProfileService and TaskService. */
@@ -110,7 +111,7 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     network: (r.network ?? DEFAULT_PROFILE_NETWORK) as ProfileNetwork,
     secrets: (r.secrets ?? []) as ProfileSecret[],
     repos: (r.repos ?? []) as ProfileRepo[],
-    portExposures: (r.portExposures ?? []) as number[],
+    apps: (r.apps ?? []) as ProfileApp[],
     designation: r.designation ?? null,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,

@@ -1,6 +1,6 @@
 /**
  * Live-host preview reverse-proxy (ADR 0064 P2b):
- *   - previewSlugFromHost host parsing
+ *   - previewHostLabel host parsing
  *   - authorizePreview matrix (404/410/401/403, owner/admin/share-token)
  *   - end-to-end HTTP proxy over a FAKE PortRelay (validates the
  *     http.request-over-Duplex tunnel mechanics on the real Bun runtime)
@@ -12,7 +12,7 @@ import { Hono } from "hono";
 import { create } from "@bufbuild/protobuf";
 
 import {
-  previewSlugFromHost,
+  previewHostLabel,
   authorizePreview,
   makePreviewProxyMiddleware,
   type PortRelayClient,
@@ -21,41 +21,45 @@ import {
   RelayPortResponseSchema,
   type RelayPortRequest,
 } from "../gen/engram/app/v1/session_pb.ts";
-import type { PortExposureRow, PortExposureStore } from "../db/port-exposures.ts";
+import type { SessionAppRow, SessionAppStore } from "../db/session-apps.ts";
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
-function row(overrides: Partial<PortExposureRow> = {}): PortExposureRow {
+function row(overrides: Partial<SessionAppRow> = {}): SessionAppRow {
   return {
-    slug: "jumping-fat-kittens",
+    hostLabel: "web-jumping-fat-kittens",
     sessionId: "sess_1",
+    name: "web",
     port: 3000,
-    label: "",
     ownerUserId: "owner",
-    visibility: "private",
-    shareToken: null,
+    visibility: "org",
     createdAt: new Date(0),
-    expiresAt: null,
     ...overrides,
   };
 }
 
-function fakeStore(seed: PortExposureRow[]): PortExposureStore {
-  const bySlug = new Map(seed.map((r) => [r.slug, r]));
+function fakeStore(seed: SessionAppRow[]): SessionAppStore {
+  const byLabel = new Map(seed.map((r) => [r.hostLabel, r]));
   return {
-    async createOrGet() {
+    async createMany() {
+      throw new Error("unused");
+    },
+    async createOne() {
       throw new Error("unused");
     },
     async listBySession() {
       return [];
     },
-    async getBySlug(slug) {
-      return bySlug.get(slug) ?? null;
+    async getByHostLabel(label) {
+      return byLabel.get(label) ?? null;
     },
-    async deleteBySlug() {
+    async deleteByHostLabel() {
       return false;
+    },
+    async deleteBySession() {
+      return 0;
     },
   };
 }
@@ -91,25 +95,25 @@ const CANNED_200 =
 // Host parsing
 // ---------------------------------------------------------------------------
 
-describe("previewSlugFromHost", () => {
+describe("previewHostLabel", () => {
   test("matches dev (with port) and prod (no port) preview hosts", () => {
-    expect(previewSlugFromHost("jumping-fat-kittens.lvh.me:8787", "lvh.me:8787")).toBe(
-      "jumping-fat-kittens",
+    expect(previewHostLabel("web-jumping-fat-kittens.lvh.me:8787", "lvh.me:8787")).toBe(
+      "web-jumping-fat-kittens",
     );
     expect(
-      previewSlugFromHost(
-        "jumping-fat-kittens.preview.engrams.cortex.io",
-        "preview.engrams.cortex.io",
+      previewHostLabel(
+        "web-jumping-fat-kittens.preview.example.com",
+        "preview.example.com",
       ),
-    ).toBe("jumping-fat-kittens");
+    ).toBe("web-jumping-fat-kittens");
   });
 
   test("rejects apex, multi-level, foreign, and junk-slug hosts", () => {
-    expect(previewSlugFromHost("lvh.me:8787", "lvh.me:8787")).toBeNull(); // apex
-    expect(previewSlugFromHost("a.b.lvh.me:8787", "lvh.me:8787")).toBeNull(); // nested
-    expect(previewSlugFromHost("evil.example.com", "lvh.me:8787")).toBeNull(); // foreign
-    expect(previewSlugFromHost("UPPER.lvh.me:8787", "lvh.me:8787")).toBe("upper"); // lowercased
-    expect(previewSlugFromHost(undefined, "lvh.me:8787")).toBeNull();
+    expect(previewHostLabel("lvh.me:8787", "lvh.me:8787")).toBeNull(); // apex
+    expect(previewHostLabel("a.b.lvh.me:8787", "lvh.me:8787")).toBeNull(); // nested
+    expect(previewHostLabel("evil.example.com", "lvh.me:8787")).toBeNull(); // foreign
+    expect(previewHostLabel("UPPER.lvh.me:8787", "lvh.me:8787")).toBe("upper"); // lowercased
+    expect(previewHostLabel(undefined, "lvh.me:8787")).toBeNull();
   });
 });
 
@@ -120,10 +124,9 @@ describe("previewSlugFromHost", () => {
 describe("authorizePreview", () => {
   const H = new Headers();
 
-  test("404 for an unknown slug", async () => {
+  test("404 for an unknown host label", async () => {
     const r = await authorizePreview({
-      slug: "nope",
-      token: null,
+      hostLabel: "nope",
       headers: H,
       store: fakeStore([]),
       getSession: asUser("owner"),
@@ -131,22 +134,9 @@ describe("authorizePreview", () => {
     expect(r).toEqual({ ok: false, status: 404 });
   });
 
-  test("410 for an expired exposure", async () => {
+  test("401 when there is no session", async () => {
     const r = await authorizePreview({
-      slug: "jumping-fat-kittens",
-      token: null,
-      headers: H,
-      store: fakeStore([row({ expiresAt: new Date(1000) })]),
-      getSession: asUser("owner"),
-      now: new Date(2000),
-    });
-    expect(r).toEqual({ ok: false, status: 410 });
-  });
-
-  test("401 when private + no session", async () => {
-    const r = await authorizePreview({
-      slug: "jumping-fat-kittens",
-      token: null,
+      hostLabel: "web-jumping-fat-kittens",
       headers: H,
       store: fakeStore([row()]),
       getSession: noSession,
@@ -156,8 +146,7 @@ describe("authorizePreview", () => {
 
   test("403 when authenticated but not owner/admin", async () => {
     const r = await authorizePreview({
-      slug: "jumping-fat-kittens",
-      token: null,
+      hostLabel: "web-jumping-fat-kittens",
       headers: H,
       store: fakeStore([row()]),
       getSession: asUser("intruder"),
@@ -167,8 +156,7 @@ describe("authorizePreview", () => {
 
   test("owner and admin are allowed", async () => {
     const owner = await authorizePreview({
-      slug: "jumping-fat-kittens",
-      token: null,
+      hostLabel: "web-jumping-fat-kittens",
       headers: H,
       store: fakeStore([row()]),
       getSession: asUser("owner"),
@@ -176,8 +164,7 @@ describe("authorizePreview", () => {
     expect(owner.ok).toBe(true);
 
     const admin = await authorizePreview({
-      slug: "jumping-fat-kittens",
-      token: null,
+      hostLabel: "web-jumping-fat-kittens",
       headers: H,
       store: fakeStore([row()]),
       getSession: asUser("someone", "admin"),
@@ -185,36 +172,6 @@ describe("authorizePreview", () => {
     expect(admin.ok).toBe(true);
   });
 
-  test("a valid share-token grants access without a session; a wrong one falls through", async () => {
-    const shared = row({ visibility: "shared", shareToken: "secret-token" });
-    const ok = await authorizePreview({
-      slug: "jumping-fat-kittens",
-      token: "secret-token",
-      headers: H,
-      store: fakeStore([shared]),
-      getSession: noSession,
-    });
-    expect(ok.ok).toBe(true);
-
-    const wrong = await authorizePreview({
-      slug: "jumping-fat-kittens",
-      token: "wrong",
-      headers: H,
-      store: fakeStore([shared]),
-      getSession: noSession,
-    });
-    expect(wrong).toEqual({ ok: false, status: 401 }); // falls through to session check
-
-    // A token is ignored for a private exposure.
-    const priv = await authorizePreview({
-      slug: "jumping-fat-kittens",
-      token: "secret-token",
-      headers: H,
-      store: fakeStore([row({ shareToken: "secret-token" })]), // visibility=private
-      getSession: noSession,
-    });
-    expect(priv).toEqual({ ok: false, status: 401 });
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -238,8 +195,8 @@ describe("preview proxy middleware (HTTP)", () => {
 
   test("proxies a preview host to the guest response over the tunnel", async () => {
     const app = appWith(fakeRelayServing(CANNED_200));
-    const res = await app.request("http://jumping-fat-kittens.lvh.me:8787/index.html", {
-      headers: { host: "jumping-fat-kittens.lvh.me:8787" },
+    const res = await app.request("http://web-jumping-fat-kittens.lvh.me:8787/index.html", {
+      headers: { host: "web-jumping-fat-kittens.lvh.me:8787" },
     });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("text/plain");
@@ -261,9 +218,9 @@ describe("preview proxy middleware (HTTP)", () => {
     const canned = Buffer.concat([Buffer.from(head), body]);
 
     const app = appWith(fakeRelayServing(new Uint8Array(canned)));
-    const res = await app.request("http://jumping-fat-kittens.lvh.me:8787/", {
+    const res = await app.request("http://web-jumping-fat-kittens.lvh.me:8787/", {
       headers: {
-        host: "jumping-fat-kittens.lvh.me:8787",
+        host: "web-jumping-fat-kittens.lvh.me:8787",
         "accept-encoding": "gzip, deflate, br",
       },
     });
@@ -293,8 +250,8 @@ describe("preview proxy middleware (HTTP)", () => {
         previewBaseDomain: "lvh.me:8787",
       }),
     );
-    const res = await app.request("http://jumping-fat-kittens.lvh.me:8787/", {
-      headers: { host: "jumping-fat-kittens.lvh.me:8787" },
+    const res = await app.request("http://web-jumping-fat-kittens.lvh.me:8787/", {
+      headers: { host: "web-jumping-fat-kittens.lvh.me:8787" },
     });
     expect(res.status).toBe(401);
   });

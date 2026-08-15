@@ -33,7 +33,7 @@ function profileRow(overrides: Partial<ProfileRow> = {}): ProfileRow {
     network: { default: "allow", allowHosts: ["example.com"], allowHostPatterns: [] },
     secrets: [{ ref: "token", envVar: "TOKEN", mode: "literal", allowHosts: [], allowHostPatterns: [] }],
     repos: [],
-    portExposures: [3000],
+    apps: [{ name: "web", port: 3000 }],
     designation: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),
@@ -179,7 +179,7 @@ describe("seedReviewerProfile", () => {
         envVars: {},
         skills: ["skills"],
         secrets: [],
-        portExposures: [],
+        apps: [],
       },
     });
     expect(store.creates[0]?.input.network).toEqual({

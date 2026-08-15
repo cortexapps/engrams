@@ -104,6 +104,17 @@ export interface RepoRow {
   remoteUrl: string;
 }
 
+/** ADR 0118: one service a session hosts. `name` is the app half of its public
+ *  hostname; the platform derives `<NAME>_INGRESS_HOST` / `_URL` from it. */
+interface AppRow {
+  name: string;
+  port: number;
+}
+
+/** Must compose a legal DNS label with the session slug — see the orchestrator's
+ *  `apps/hostname.ts`, which is the authority; this only fails fast in the UI. */
+const APP_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,22}[a-z0-9])?$/;
+
 const schema = z.object({
   name: z.string().trim().min(1, "Name the profile first"),
   description: z.string(),
@@ -134,16 +145,15 @@ const schema = z.object({
   allowHostsText: z.string(),
   allowPatternsText: z.string(),
   secretRows: z.array(z.custom<SecretRow>()),
-  // ADR 0064 P4: guest ports auto-exposed (private) for every session started
-  // from this profile.
-  portExposures: z.array(z.number()),
+  // ADR 0118: the services every session from this profile hosts.
+  apps: z.array(z.custom<AppRow>()),
 });
 type ProfileFormValues = z.infer<typeof schema>;
 
 /**
  * Read/write one form field that has no registered input behind it — the row
  * editors (`envRows`, `secretRows`), the multi-selects (`skills`,
- * `capabilities`), and `portExposures`.
+ * `capabilities`), and `apps`.
  *
  * These MUST go through `useController`, not `watch(name)` + `setValue(name, v)`.
  * Measured on react-hook-form 7.83: with no registered field behind the name,
@@ -208,7 +218,7 @@ const EMPTY: ProfileFormValues = {
   allowHostsText: "",
   allowPatternsText: "",
   secretRows: [],
-  portExposures: [],
+  apps: [],
 };
 
 export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
@@ -244,7 +254,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const [envRows, setEnvRows] = useFieldValue(control, "envRows");
   const [secretRows, setSecretRows] = useFieldValue(control, "secretRows");
   const [repoRows, setRepoRows] = useFieldValue(control, "repos");
-  const [portExposures, setPortExposures] = useFieldValue(control, "portExposures");
+  const [apps, setApps] = useFieldValue(control, "apps");
   // Derived, never stored: capabilities follow from the granted integrations.
   const capabilities = defaultCapabilitiesForGrants(integrationGrants, views);
   const includeUserTokens = watch("includeUserTokens");
@@ -296,7 +306,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       allowHostsText: (p.network?.allowHosts ?? []).join("\n"),
       allowPatternsText: (p.network?.allowHostPatterns ?? []).join("\n"),
       secretRows: wireToSecretRows(p.secrets ?? []),
-      portExposures: p.portExposures ?? [],
+      apps: (p.apps ?? []).map((a) => ({ name: a.name, port: a.port })),
     });
     setHydratedProfileId(p.id);
     if ((p.network?.allowHosts ?? []).length || (p.network?.allowHostPatterns ?? []).length)
@@ -465,7 +475,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       repos: vals.repos
         .map((r) => ({ path: r.path.trim(), remoteUrl: r.remoteUrl.trim() }))
         .filter((r) => r.path !== ""),
-      portExposures: vals.portExposures,
+      apps: vals.apps,
     };
     const designationValue = vals.designation ? "pr_reviewer" : "";
     try {
@@ -1090,8 +1100,8 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                   setIncludeUserTokens={(b) =>
                     setValue("includeUserTokens", b, { shouldDirty: true })
                   }
-                  portExposures={portExposures}
-                  setPortExposures={setPortExposures}
+                  apps={apps}
+                  setApps={setApps}
                 />
               </CardContent>
             )}
@@ -1320,8 +1330,8 @@ function Advanced({
   orgSecretNames,
   includeUserTokens,
   setIncludeUserTokens,
-  portExposures,
-  setPortExposures,
+  apps,
+  setApps,
 }: {
   skillCatalog: Skill[];
   skills: string[];
@@ -1333,8 +1343,8 @@ function Advanced({
   orgSecretNames: string[];
   includeUserTokens: boolean;
   setIncludeUserTokens: (b: boolean) => void;
-  portExposures: number[];
-  setPortExposures: (p: number[]) => void;
+  apps: AppRow[];
+  setApps: (a: AppRow[]) => void;
 }) {
   const uploadSkill = useUploadSkill();
   const [skillName, setSkillName] = useState("");
@@ -1343,22 +1353,32 @@ function Advanced({
   const [uploadErr, setUploadErr] = useState<string | null>(null);
   const skillFileInput = useRef<HTMLInputElement>(null);
   const [portInput, setPortInput] = useState("");
+  const [appNameInput, setAppNameInput] = useState("");
   const [portErr, setPortErr] = useState<string | null>(null);
 
-  const addPort = () => {
+  const addApp = () => {
     const p = Number(portInput);
     if (!Number.isInteger(p) || p < 1 || p > 65535) {
       setPortErr("Enter a port between 1 and 65535");
       return;
     }
-    if (portExposures.includes(p)) {
+    const name = appNameInput.trim().toLowerCase();
+    if (!APP_NAME_RE.test(name)) {
+      setPortErr("Name must be 1-24 lowercase letters, digits or interior hyphens");
+      return;
+    }
+    if (apps.some((a) => a.name === name)) {
+      setPortErr(`An app named "${name}" is already added`);
+      return;
+    }
+    if (apps.some((a) => a.port === p)) {
       setPortErr(`Port ${p} is already added`);
-      setPortInput("");
       return;
     }
     setPortErr(null);
-    setPortExposures([...portExposures, p].sort((a, b) => a - b));
+    setApps([...apps, { name, port: p }].sort((a, b) => a.port - b.port));
     setPortInput("");
+    setAppNameInput("");
   };
 
   const onUploadSkill = async () => {
@@ -1482,32 +1502,39 @@ function Advanced({
         </div>
       </div>
 
-      {/* auto-exposed ports (ADR 0064 P4) */}
+      {/* apps (ADR 0118) */}
       <div>
-        <Text variant="label">Auto-exposed ports</Text>
+        <Text variant="label">Apps</Text>
         <p className="mt-1 text-[0.74rem] text-muted-foreground">
-          Guest ports every session from this profile exposes as private live-host previews (e.g. a
-          dev server on 3000). Manage individual previews from a session's Diagnostics → Ports.
+          The services every session from this profile hosts. Each one gets a stable public address,
+          and the platform injects <code className="font-mono">&lt;NAME&gt;_INGRESS_HOST</code> and{" "}
+          <code className="font-mono">&lt;NAME&gt;_INGRESS_URL</code> for every app into the
+          session. Reference them from Environment variables above with{" "}
+          <code className="font-mono">
+            ${"{"}WEB_INGRESS_URL{"}"}
+          </code>{" "}
+          — including from another app, which is how a backend learns its frontend&rsquo;s origin
+          for a CORS allow-list.
         </p>
         <div className="mt-2 flex flex-wrap items-center gap-1.5">
-          {portExposures.length === 0 && (
+          {apps.length === 0 && (
             <span className="text-[0.74rem] text-muted-foreground">
-              None — sessions expose nothing by default.
+              None — sessions publish nothing by default.
             </span>
           )}
-          {portExposures.map((p) => (
+          {apps.map((a) => (
             <span
-              key={p}
-              data-testid={`port-chip-${p}`}
+              key={a.name}
+              data-testid={`port-chip-${a.port}`}
               className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 font-mono text-xs"
             >
-              :{p}
+              {a.name}:{a.port}
               <button
                 type="button"
-                aria-label={`remove port ${p}`}
-                data-testid={`port-remove-${p}`}
+                aria-label={`remove app ${a.name}`}
+                data-testid={`port-remove-${a.port}`}
                 className="text-muted-foreground hover:text-foreground"
-                onClick={() => setPortExposures(portExposures.filter((n) => n !== p))}
+                onClick={() => setApps(apps.filter((x) => x.name !== a.name))}
               >
                 ×
               </button>
@@ -1515,6 +1542,19 @@ function Advanced({
           ))}
         </div>
         <div className="mt-2 flex items-center gap-2">
+          <Input
+            placeholder="name (e.g. web)"
+            className="w-36"
+            value={appNameInput}
+            data-testid="app-name-input"
+            onChange={(e) => setAppNameInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addApp();
+              }
+            }}
+          />
           <Input
             type="number"
             min={1}
@@ -1527,7 +1567,7 @@ function Advanced({
             onKeyDown={(e) => {
               if (e.key === "Enter") {
                 e.preventDefault();
-                addPort();
+                addApp();
               }
             }}
           />
@@ -1536,7 +1576,7 @@ function Advanced({
             variant="outline"
             size="sm"
             data-testid="port-add-btn"
-            onClick={addPort}
+            onClick={addApp}
           >
             Add
           </Button>

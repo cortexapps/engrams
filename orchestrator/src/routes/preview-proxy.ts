@@ -1,7 +1,7 @@
 /**
- * Live-host preview reverse-proxy (ADR 0064 P2b) — HTTP.
+ * Session-app preview reverse-proxy (ADR 0064 P2b, model per ADR 0118) — HTTP.
  *
- * A request to `<slug>.<previewBaseDomain>` is proxied to the guest's
+ * A request to `<host label>.<previewBaseDomain>` is proxied to the guest's
  * `localhost:<port>` over the `PortRelayService` raw-byte tunnel:
  *
  *   browser → LB (TLS) → orchestrator [this middleware]
@@ -12,12 +12,11 @@
  * the bidi relay stream — so the guest's HTTP/1.1 framing rides the tunnel
  * unchanged.
  *
- * Auth (owner-by-default + share-link + admin-sees-all): the slug resolves to a
- * `(session, port, owner, visibility, shareToken)` row; access requires the
- * authenticated principal to own the session, OR be an admin, OR present the
- * row's `shareToken` (visibility = "shared"). On the internal deployment IAP
- * still fronts everything (caller is already an org member); this adds the
- * per-exposure check.
+ * Auth: the host label resolves to a `session_app` row; access requires the
+ * authenticated principal to own the session or be an admin. IAP still fronts
+ * everything on a deployment that runs it, so this is the second gate. ADR 0118
+ * P2 moves the wall here entirely (and adds org visibility, the login redirect,
+ * the unauthenticated `OPTIONS` path, and sibling-origin enforcement).
  *
  * WebSocket upgrades are handled separately (P2b-ws) — Bun's node:http `upgrade`
  * handler can't write to the raw socket (see server.ts), so raw WS passthrough
@@ -38,13 +37,12 @@ import {
 } from "../gen/engram/app/v1/session_pb.ts";
 import { portRelay as defaultPortRelay } from "../control-plane/client.ts";
 import { config } from "../config.ts";
-import { constantTimeEquals } from "../crypto/constant-time.ts";
-import { isValidSlug } from "../ports/slug.ts";
+import { isValidHostLabel } from "../apps/hostname.ts";
 import {
-  makePortExposureStore,
-  type PortExposureRow,
-  type PortExposureStore,
-} from "../db/port-exposures.ts";
+  makeSessionAppStore,
+  type SessionAppRow,
+  type SessionAppStore,
+} from "../db/session-apps.ts";
 import { pushableQueue } from "./shell.ts";
 import type { GetSession } from "./guard.ts";
 
@@ -60,7 +58,7 @@ export interface PortRelayClient {
 }
 
 export interface PreviewProxyDeps {
-  store?: PortExposureStore;
+  store?: SessionAppStore;
   portRelay?: PortRelayClient;
   getSession?: GetSession;
   previewBaseDomain?: string;
@@ -71,12 +69,12 @@ export interface PreviewProxyDeps {
 // ---------------------------------------------------------------------------
 
 /**
- * If `hostHeader` is `<slug>.<baseDomain>` for a single valid slug label,
- * return the slug; otherwise null (apex, multi-level, or foreign host).
- * `baseDomain` carries its port in dev (`lvh.me:8787`) and none in prod
- * (`preview.engrams.cortex.io`, behind the :443 LB) — we compare verbatim.
+ * If `hostHeader` is `<label>.<baseDomain>` for a single valid label, return the
+ * label; otherwise null (apex, multi-level, or foreign host). `baseDomain`
+ * carries its port in dev (`lvh.me:8787`) and none in prod (behind the :443 LB)
+ * — we compare verbatim.
  */
-export function previewSlugFromHost(
+export function previewHostLabel(
   hostHeader: string | undefined,
   baseDomain: string,
 ): string | null {
@@ -84,10 +82,10 @@ export function previewSlugFromHost(
   const host = hostHeader.toLowerCase();
   const suffix = "." + baseDomain.toLowerCase();
   if (!host.endsWith(suffix)) return null;
-  const slug = host.slice(0, -suffix.length);
-  // Must be a single DNS label (no nested subdomain) and slug-shaped.
-  if (slug.includes(".") || !isValidSlug(slug)) return null;
-  return slug;
+  const label = host.slice(0, -suffix.length);
+  // Must be a single DNS label (no nested subdomain) and label-shaped.
+  if (label.includes(".") || !isValidHostLabel(label)) return null;
+  return label;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,44 +93,33 @@ export function previewSlugFromHost(
 // ---------------------------------------------------------------------------
 
 export type PreviewAuth =
-  | { ok: true; row: PortExposureRow }
-  | { ok: false; status: 401 | 403 | 404 | 410 };
-
+  | { ok: true; row: SessionAppRow }
+  | { ok: false; status: 401 | 403 | 404 };
 
 /**
- * Resolve + authorize a preview request. `now` is injectable for tests.
- *   404 unknown slug · 410 expired · (then) share-token OR session owner/admin.
+ * Resolve + authorize a preview request.
+ *   404 unknown host label · 401 no session · 403 not owner/admin.
+ *
+ * ADR 0118 retired ADR 0064's unauthenticated `shareToken` capability: the
+ * requirement is that nobody reaches an app without passing the login wall, and
+ * a token in a URL is exactly a way around it. It also retired `expiresAt`,
+ * which was enforced here but never written by anything.
+ *
+ * The `visibility = "org"` widening (any authenticated principal, so a teammate
+ * can open your preview) lands with the rest of the wall move in P2. Until then
+ * this stays at owner-or-admin, which is the stricter of the two.
  */
 export async function authorizePreview(
   opts: {
-    slug: string;
-    token: string | null;
+    hostLabel: string;
     headers: Headers;
-    store: PortExposureStore;
+    store: SessionAppStore;
     getSession: GetSession;
-    now?: Date;
   },
 ): Promise<PreviewAuth> {
-  const row = await opts.store.getBySlug(opts.slug);
+  const row = await opts.store.getByHostLabel(opts.hostLabel);
   if (!row) return { ok: false, status: 404 };
 
-  const now = opts.now ?? new Date();
-  if (row.expiresAt && row.expiresAt.getTime() <= now.getTime()) {
-    return { ok: false, status: 410 };
-  }
-
-  // Share-link: a valid token for a shared exposure grants access without a
-  // session (still inside the IAP wall on the internal deployment).
-  if (
-    row.visibility === "shared" &&
-    row.shareToken &&
-    opts.token &&
-    constantTimeEquals(opts.token, row.shareToken)
-  ) {
-    return { ok: true, row };
-  }
-
-  // Otherwise require an authenticated owner or admin.
   const session = await opts.getSession(opts.headers);
   if (!session) return { ok: false, status: 401 };
   const isOwner = session.user.id === row.ownerUserId;
@@ -359,7 +346,7 @@ export function makePreviewProxyMiddleware(deps?: PreviewProxyDeps): MiddlewareH
     (defaultPortRelay as unknown as PortRelayClient);
   // Lazy store so importing this module doesn't call getDb() at load.
   let store = deps?.store;
-  const getStore = (): PortExposureStore => (store ??= makePortExposureStore());
+  const getStore = (): SessionAppStore => (store ??= makeSessionAppStore());
   const resolveSession: GetSession =
     deps?.getSession ??
     (async (headers) => {
@@ -368,13 +355,11 @@ export function makePreviewProxyMiddleware(deps?: PreviewProxyDeps): MiddlewareH
     });
 
   return async (c, next) => {
-    const slug = previewSlugFromHost(c.req.header("host"), baseDomain);
+    const slug = previewHostLabel(c.req.header("host"), baseDomain);
     if (!slug) return next();
 
-    const token = new URL(c.req.url).searchParams.get("token");
     const authz = await authorizePreview({
-      slug,
-      token,
+      hostLabel: slug,
       headers: c.req.raw.headers,
       store: getStore(),
       getSession: resolveSession,
@@ -385,9 +370,7 @@ export function makePreviewProxyMiddleware(deps?: PreviewProxyDeps): MiddlewareH
           ? "unauthenticated"
           : authz.status === 403
             ? "forbidden"
-            : authz.status === 410
-              ? "preview expired"
-              : "not found";
+            : "not found";
       return c.text(msg, authz.status);
     }
 

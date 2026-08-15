@@ -71,7 +71,23 @@ export interface TaskLaunchPolicy {
   network: ProfileNetwork;
   secrets: ProfileSecret[];
   repos: ProfileRepo[];
-  portExposures: number[];
+  apps: ProfileApp[];
+}
+
+/**
+ * ADR 0118: one service a session hosts. `name` is the app half of its public
+ * hostname; `port` is where it listens inside the guest.
+ *
+ * There is deliberately no per-app "which env var carries my address" field.
+ * Roughly half the addresses a service needs are a PEER's, not its own — a CORS
+ * allowlist and a post-login redirect target both live on the API and want the
+ * frontend's address — so the platform injects `<NAME>_INGRESS_HOST` and
+ * `<NAME>_INGRESS_URL` for EVERY app instead, and `profile.envVars` remaps them
+ * with `${…}` interpolation. See src/apps/env.ts.
+ */
+export interface ProfileApp {
+  name: string;
+  port: number;
 }
 
 export const task = pgTable(
@@ -1215,10 +1231,12 @@ export const profile = pgTable(
     // Git repositories this profile's image contains — explicit, user-managed
     // (by hand or via DiscoverProfileRepos). Fed to the routing picker's cards.
     repos: jsonb("repos").$type<ProfileRepo[]>().notNull().default([]),
-    // ADR 0064: guest ports auto-exposed (private) for every session from this
-    // profile. The orchestrator mints one private port_exposure per declared port
-    // at session create (best-effort). Empty = no auto-exposed ports.
-    portExposures: jsonb("port_exposures").$type<number[]>().notNull().default([]),
+    // ADR 0118: the services every session from this profile hosts. The
+    // orchestrator reserves one hostname per app BEFORE it creates the session
+    // (inside the transaction below this one) and injects each app's address
+    // into the guest's env, so a sibling app is configured with an address the
+    // user's browser can reach too. Empty = no apps.
+    apps: jsonb("apps").$type<ProfileApp[]>().notNull().default([]),
     // System marker (ADR 0100): at most one profile per value; the review
     // workflow finds its profile by this marker, and designated profiles cannot
     // be deleted.
@@ -1509,41 +1527,49 @@ export const connectorLogo = pgTable("connector_logo", {
 });
 
 // ---------------------------------------------------------------------------
-// Port exposures (ADR 0064): live-host a session's guest port at a vanity
-// subdomain.
+// Session apps (ADR 0118, superseding ADR 0064's port_exposure): live-host one
+// of a session's services at a stable vanity subdomain.
 //
-// Orchestrator-owned (the coordinator never learns about exposures) — a row maps
-// an auto-minted, opaque tri-word `slug` to a `(session, port)` pair the edge
-// reverse-proxy (P2b) tunnels to via PortRelayService. `session_id` is a LOGICAL
-// ref to the control-plane session (different tier, like profiles' image_id — no
-// DB FK). The slug is the routing key (`<slug>.preview.<domain>`); it deliberately
-// does NOT encode the port, so it can't be used to scan a session's other ports.
-// Hard delete: revoking an exposure must stop serving it immediately (no history).
-// `share_token` is a capability for `visibility = "shared"` links (still inside
-// the IAP wall); null for `private`. Admins can view any exposure regardless.
+// Orchestrator-owned for routing and authorization (the coordinator learns the
+// `(host_label, port)` pairs only so the host's egress proxy can short-circuit
+// a same-session app→app call — ADR 0118 P3). `session_id` is a LOGICAL ref to
+// the control-plane session (different tier, like profiles' image_id — no DB
+// FK); session teardown deletes these rows explicitly.
+//
+// `host_label` is the routing key — `<app name>-<session slug>`, one DNS label
+// under the preview base domain, minted BEFORE the session is created so the
+// address can be injected into the guest's env. It deliberately does not encode
+// the port (ADR 0064's property, kept), so it cannot be used to scan a
+// session's other ports. It is an address, not a secret: authorization is the
+// wall, which is why ADR 0064's unauthenticated `share_token` is retired.
+//
+// `visibility`: "org" (any authenticated principal — the default, so a teammate
+// can open your preview) or "private" (owner + admin only).
+//
+// Hard delete: revoking an app must stop serving it immediately (no history).
 // ---------------------------------------------------------------------------
 
-export const portExposure = pgTable(
-  "port_exposure",
+export const sessionApp = pgTable(
+  "session_app",
   {
-    slug: text("slug").primaryKey(), // tri-word, e.g. "jumping-fat-kittens"
+    hostLabel: text("host_label").primaryKey(), // e.g. "api-tidy-swift-otters"
     sessionId: text("session_id").notNull(), // control-plane session id (logical ref, §3-style)
+    name: text("name").notNull(), // app half of host_label, e.g. "api"
     port: integer("port").notNull(), // guest TCP port (1..=65535)
-    label: text("label").notNull().default(""), // human label, e.g. "Vite dev server"
     ownerUserId: text("owner_user_id")
       .notNull()
       .references(() => user.id, { onDelete: "cascade" }), // creator (= session owner)
-    visibility: text("visibility").notNull().default("private"), // "private" | "shared"
-    shareToken: text("share_token"), // capability for visibility=shared; null for private
+    visibility: text("visibility").notNull().default("org"), // "org" | "private"
     createdAt: timestamp("created_at").notNull().defaultNow(),
-    expiresAt: timestamp("expires_at"), // null = no expiry
   },
   (t) => [
-    // One exposure per (session, port) — re-exposing returns the existing slug.
-    uniqueIndex("port_exposure_session_port_idx").on(t.sessionId, t.port),
-    // List-by-session + cascade-on-session-delete (P2b/cleanup).
-    index("port_exposure_session_idx").on(t.sessionId),
-    index("port_exposure_owner_idx").on(t.ownerUserId),
+    // One app per name, and one per port — re-declaring either returns the
+    // existing row, which is what makes the create-time mint idempotent.
+    uniqueIndex("session_app_session_name_idx").on(t.sessionId, t.name),
+    uniqueIndex("session_app_session_port_idx").on(t.sessionId, t.port),
+    // List-by-session + teardown delete.
+    index("session_app_session_idx").on(t.sessionId),
+    index("session_app_owner_idx").on(t.ownerUserId),
   ],
 );
 

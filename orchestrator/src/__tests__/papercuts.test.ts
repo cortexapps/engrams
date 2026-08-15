@@ -86,7 +86,7 @@ function profileRow(overrides: Partial<ProfileRow> = {}): ProfileRow {
     network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
     secrets: [],
     repos: [],
-    portExposures: [],
+    apps: [],
     designation: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),

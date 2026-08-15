@@ -61,7 +61,7 @@ export async function seedReviewerProfile(
         network: DEFAULT_PROFILE_NETWORK,
         secrets: [],
         repos: [],
-        portExposures: [],
+        apps: [],
       },
       PR_REVIEWER_DESIGNATION,
     );

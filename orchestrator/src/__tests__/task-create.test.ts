@@ -26,10 +26,10 @@ import {
 } from "../rpc/task-create.ts";
 import type { ProfileRow, ProfileStore } from "../db/profiles.ts";
 import type {
-  PortExposureStore,
-  PortExposureInput,
-  PortExposureRow,
-} from "../db/port-exposures.ts";
+  SessionAppStore,
+  SessionAppSpec,
+  SessionAppRow,
+} from "../db/session-apps.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
 import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
 import { createToolRegistry } from "../tools/registry.ts";
@@ -68,7 +68,7 @@ const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   repos: [],
-  portExposures: [],
+  apps: [],
   designation: null,
   createdAt: new Date(0),
   updatedAt: new Date(0),
@@ -1270,42 +1270,49 @@ const fakeProfiles = (active = true, over: Partial<ProfileRow> = {}): ProfileSto
     getActive: async (id: string) => (active && id === "p1" ? profile(over) : null),
   }) as unknown as ProfileStore;
 
-/** A full PortExposureStore fake that records createOrGet inputs and can be made
- *  to throw for a given port (to exercise the best-effort path). */
-function fakePortExposures(opts: { failOnPort?: number } = {}): PortExposureStore & {
-  calls: PortExposureInput[];
+/** A SessionAppStore fake that records what was reserved, and when. `order`
+ *  is shared with the sessions fake so a test can assert that reservation
+ *  happens BEFORE createSession — the ordering the whole feature rests on. */
+function fakeSessionApps(order: string[] = []): SessionAppStore & {
+  calls: Array<{ sessionId: string; ownerUserId: string; apps: SessionAppSpec[] }>;
 } {
-  const calls: PortExposureInput[] = [];
+  const calls: Array<{ sessionId: string; ownerUserId: string; apps: SessionAppSpec[] }> = [];
   return {
     calls,
-    async createOrGet(input: PortExposureInput): Promise<PortExposureRow> {
-      calls.push(input);
-      if (opts.failOnPort === input.port) throw new Error("port store boom");
-      return {
-        slug: `slug-${input.port}`,
-        sessionId: input.sessionId,
-        port: input.port,
-        label: input.label,
-        ownerUserId: input.ownerUserId,
-        visibility: input.visibility,
-        shareToken: null,
+    async createMany(sessionId, ownerUserId, apps): Promise<SessionAppRow[]> {
+      calls.push({ sessionId, ownerUserId, apps: [...apps] });
+      order.push("reserve");
+      return apps.map((a) => ({
+        hostLabel: `${a.name}-tidy-swift-otters`,
+        sessionId,
+        name: a.name,
+        port: a.port,
+        ownerUserId,
+        visibility: a.visibility ?? "org",
         createdAt: new Date(0),
-        expiresAt: null,
-      };
+      }));
+    },
+    async createOne() {
+      throw new Error("unused");
     },
     async listBySession() {
       return [];
     },
-    async getBySlug() {
+    async getByHostLabel() {
       return null;
     },
-    async deleteBySlug() {
+    async deleteByHostLabel() {
       return false;
+    },
+    async deleteBySession() {
+      return 0;
     },
   };
 }
 
-function fakeSessions(): TaskSessionsClient & { createReqs: unknown[]; deletedIds: string[] } {
+function fakeSessions(
+  order: string[] = [],
+): TaskSessionsClient & { createReqs: unknown[]; deletedIds: string[] } {
   const createReqs: unknown[] = [];
   const deletedIds: string[] = [];
   return {
@@ -1313,6 +1320,7 @@ function fakeSessions(): TaskSessionsClient & { createReqs: unknown[]; deletedId
     deletedIds,
     createSession: async (req) => {
       createReqs.push(req);
+      order.push("createSession");
       return { sessionId: "sess-1" };
     },
     deleteSession: async (req) => {
@@ -1377,7 +1385,8 @@ const createDeps = (
   opts: {
     active?: boolean;
     profileOver?: Partial<ProfileRow>;
-    portExposures?: PortExposureStore;
+    sessionApps?: SessionAppStore;
+    previewBaseDomain?: string;
     users?: CreateTaskDeps["users"];
   } = {},
 ): CreateTaskDeps => ({
@@ -1397,7 +1406,8 @@ const createDeps = (
   users: opts.users ?? fakeUsers(),
   newTaskId: () => "task-1",
   newSessionId: () => "sess-1",
-  ...(opts.portExposures ? { portExposures: opts.portExposures } : {}),
+  ...(opts.sessionApps ? { sessionApps: opts.sessionApps } : {}),
+  ...(opts.previewBaseDomain ? { previewBaseDomain: opts.previewBaseDomain } : {}),
 });
 
 describe("createTaskWithSession", () => {
@@ -1584,41 +1594,123 @@ describe("createTaskWithSession", () => {
     ).rejects.toThrow(/boot boom/);
   });
 
-  // ADR 0064: a profile's declared portExposures auto-mint one private exposure
-  // per port at session create, against the injected PortExposureStore.
-  test("auto-mints one private port-exposure per profile.portExposures port", async () => {
-    const records: Record<string, unknown>[] = [];
-    const ports = fakePortExposures();
+  // ADR 0118: a profile's declared apps are reserved INSIDE the pre-create
+  // transaction — before the session exists — and every app's address is then
+  // injected as env. The ordering is the whole point: an address minted after
+  // the guest boots can never become an environment variable.
+  test("reserves every declared app BEFORE createSession", async () => {
+    const order: string[] = [];
+    const apps = fakeSessionApps(order);
+    const sessions = fakeSessions(order);
     const out = await createTaskWithSession(
-      createDeps(fakeSessions(), recordingDb(records), {
-        profileOver: { portExposures: [3000, 8080] },
-        portExposures: ports,
+      createDeps(sessions, recordingDb([]), {
+        profileOver: {
+          apps: [
+            { name: "web", port: 3000 },
+            { name: "api", port: 8080 },
+          ],
+        },
+        sessionApps: apps,
       }),
       { type: "chat", ownerUserId: "user-1", profileId: "p1" },
     );
 
-    expect(ports.calls).toHaveLength(2);
-    expect(ports.calls[0]).toEqual({
+    expect(order).toEqual(["reserve", "createSession"]);
+    expect(apps.calls).toHaveLength(1); // ONE batched call, not one per port
+    expect(apps.calls[0]).toEqual({
       sessionId: out.sessionId,
-      port: 3000,
-      label: "",
       ownerUserId: "user-1",
-      visibility: "private",
-    });
-    expect(ports.calls[1]).toMatchObject({
-      port: 8080,
-      visibility: "private",
-      ownerUserId: "user-1",
+      apps: [
+        { name: "web", port: 3000 },
+        { name: "api", port: 8080 },
+      ],
     });
   });
 
-  test("does NOT mint when the profile declares no portExposures", async () => {
-    const ports = fakePortExposures();
+  test("injects both address forms for EVERY app into the session's env", async () => {
+    const sessions = fakeSessions();
     await createTaskWithSession(
-      createDeps(fakeSessions(), recordingDb([]), { portExposures: ports }),
+      createDeps(sessions, recordingDb([]), {
+        profileOver: {
+          apps: [
+            { name: "web", port: 3000 },
+            { name: "api", port: 8080 },
+          ],
+        },
+        sessionApps: fakeSessionApps(),
+        previewBaseDomain: "preview.example.com",
+      }),
       { type: "chat", ownerUserId: "u", profileId: "p1" },
     );
-    expect(ports.calls).toHaveLength(0);
+
+    const env = (sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv;
+    expect(env).toMatchObject({
+      WEB_INGRESS_HOST: "web-tidy-swift-otters.preview.example.com",
+      WEB_INGRESS_URL: "https://web-tidy-swift-otters.preview.example.com",
+      API_INGRESS_HOST: "api-tidy-swift-otters.preview.example.com",
+      API_INGRESS_URL: "https://api-tidy-swift-otters.preview.example.com",
+    });
+  });
+
+  test("interpolates a PEER's address into a profile env var", async () => {
+    // The case a per-app "my own address" model cannot express: the CORS
+    // allowlist lives on the API and wants the FRONTEND's origin.
+    const sessions = fakeSessions();
+    await createTaskWithSession(
+      createDeps(sessions, recordingDb([]), {
+        profileOver: {
+          apps: [
+            { name: "web", port: 3000 },
+            { name: "api", port: 8080 },
+          ],
+          envVars: {
+            CORS_ALLOWED_ORIGINS: "${WEB_INGRESS_URL}",
+            API_BASE_URL: "${API_INGRESS_URL}",
+            LEFT_ALONE: "${HOME}/bin",
+          },
+        },
+        sessionApps: fakeSessionApps(),
+        previewBaseDomain: "preview.example.com",
+      }),
+      { type: "chat", ownerUserId: "u", profileId: "p1" },
+    );
+
+    const env = (sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv;
+    expect(env?.CORS_ALLOWED_ORIGINS).toBe("https://web-tidy-swift-otters.preview.example.com");
+    expect(env?.API_BASE_URL).toBe("https://api-tidy-swift-otters.preview.example.com");
+    // An unknown reference is left verbatim, never blanked.
+    expect(env?.LEFT_ALONE).toBe("${HOME}/bin");
+  });
+
+  test("drops an invalid app declaration and still reserves the rest", async () => {
+    // One malformed app must never stop a session booting; profile save-time
+    // validation is where a user is told about it.
+    const apps = fakeSessionApps();
+    await createTaskWithSession(
+      createDeps(fakeSessions(), recordingDb([]), {
+        profileOver: {
+          apps: [
+            { name: "bad name", port: 3000 },
+            { name: "api", port: 8080 },
+          ],
+        },
+        sessionApps: apps,
+      }),
+      { type: "chat", ownerUserId: "u", profileId: "p1" },
+    );
+    expect(apps.calls[0]?.apps).toEqual([{ name: "api", port: 8080 }]);
+  });
+
+  test("reserves nothing and injects nothing when the profile declares no apps", async () => {
+    const apps = fakeSessionApps();
+    const sessions = fakeSessions();
+    await createTaskWithSession(
+      createDeps(sessions, recordingDb([]), { sessionApps: apps }),
+      { type: "chat", ownerUserId: "u", profileId: "p1" },
+    );
+    expect(apps.calls).toHaveLength(0);
+    const env = (sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv;
+    expect(Object.keys(env ?? {}).some((k) => k.endsWith("_INGRESS_URL"))).toBe(false);
   });
 
   // ADR 0031 §7: the owner's identity threads into the session's harness env
@@ -1670,23 +1762,6 @@ describe("createTaskWithSession", () => {
     expect(env?.ENGRAM_USER_EMAIL).toBeUndefined();
   });
 
-  test("a port-exposure failure does NOT fail the task (best-effort) and later ports still mint", async () => {
-    const records: Record<string, unknown>[] = [];
-    const ports = fakePortExposures({ failOnPort: 3000 });
-    const out = await createTaskWithSession(
-      createDeps(fakeSessions(), recordingDb(records), {
-        profileOver: { portExposures: [3000, 8080] },
-        portExposures: ports,
-      }),
-      { type: "chat", ownerUserId: "u", profileId: "p1" },
-    );
-
-    // Task still created + persisted despite the 3000 failure.
-    expect(out.sessionId).toBe("sess-1");
-    expect(records).toHaveLength(3); // task + primary task_session + listener
-    // Both ports were attempted; 8080 succeeded after 3000 threw.
-    expect(ports.calls.map((c) => c.port)).toEqual([3000, 8080]);
-  });
 });
 
 describe("createSessionForExistingTask", () => {

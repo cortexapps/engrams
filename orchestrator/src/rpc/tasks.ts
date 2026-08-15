@@ -72,7 +72,7 @@ import {
 const log = rootLog.child({ component: "task" });
 import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
-import { makePortExposureStore, type PortExposureStore } from "../db/port-exposures.ts";
+import { makeSessionAppStore, type SessionAppStore } from "../db/session-apps.ts";
 import { makeUserIdentityStore, type UserIdentity, type UserIdentityStore } from "../db/users.ts";
 import type { ImagesClient } from "./profiles.ts";
 import type { CustomConnectorSource } from "../connectors/registry.ts";
@@ -149,8 +149,8 @@ export interface TaskDeps {
   images?: ImagesClient;
   /** Connector catalog (ADR 0057) — custom connectors merged with built-in seeds. */
   connectors?: CustomConnectorSource;
-  /** Port-exposure store (ADR 0064) — auto-mints profile.portExposures at create. */
-  portExposures?: PortExposureStore;
+  /** Session-app store (ADR 0118) — reserves profile.apps hostnames at create. */
+  sessionApps?: SessionAppStore;
   /** Owner identity lookup for git attribution and task read enrichment. */
   users?: UserIdentityStore;
   connections?: IntegrationConnectionStore;
@@ -768,8 +768,8 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
   const profiles: ProfileStore = deps?.profiles ?? makeProfileStore(getDbFn());
   // Lazy (like resolveSecrets): touch getDb() only when createTask actually runs,
   // so registering without a DB (the auth/validation tests) doesn't throw.
-  const resolvePortExposures = (): PortExposureStore =>
-    deps?.portExposures ?? makePortExposureStore(getDbFn());
+  const resolveSessionApps = (): SessionAppStore =>
+    deps?.sessionApps ?? makeSessionAppStore(getDbFn());
   // Lazy like the other DB-backed stores: registration itself must not require
   // a configured database.
   const resolveUsers = (): UserIdentityStore => deps?.users ?? makeUserIdentityStore(getDbFn());
@@ -821,7 +821,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           harnessCatalog: harnessCatalogClient,
           sessions: sessionsClient,
           secrets: resolveSecrets(),
-          portExposures: resolvePortExposures(),
+          sessionApps: resolveSessionApps(),
           users: resolveUsers(),
           ...(deps?.connections ? { connections: deps.connections } : {}),
           ...(deps?.modelRouters ? { modelRouters: deps.modelRouters } : {}),
@@ -1173,6 +1173,18 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         } catch (err) {
           console.error(
             `[TaskService] deleteTask: failed to delete upstream session ${ref.sessionId}`,
+            err,
+          );
+        }
+        // ADR 0118: `session_app.session_id` is a logical cross-tier reference
+        // with no foreign key, so nothing cascades — the rows have to go
+        // explicitly or they outlive their session and hold their hostnames
+        // forever. (ADR 0064's `port_exposure` had this leak and no sweep.)
+        try {
+          await resolveSessionApps().deleteBySession(ref.sessionId);
+        } catch (err) {
+          console.error(
+            `[TaskService] deleteTask: failed to delete session apps for ${ref.sessionId}`,
             err,
           );
         }

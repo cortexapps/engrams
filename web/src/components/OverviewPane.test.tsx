@@ -8,8 +8,8 @@ import type { IndexedEvent } from "../events";
 import type { ProfileSnapshotView, Session } from "../lib/types";
 import { OverviewPane, type OverviewSelection } from "./OverviewPane";
 
-vi.mock("./ports/ExposedPortsSection", () => ({
-  ExposedPortsSection: () => <div data-testid="ports" />,
+vi.mock("./apps/SessionAppsSection", () => ({
+  SessionAppsSection: () => <div data-testid="ports" />,
 }));
 
 afterEach(cleanup);
