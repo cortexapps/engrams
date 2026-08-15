@@ -14,6 +14,11 @@
  *     page must not render a form the server would reject.
  *   - `signup`: public sign-up is available. Tracks `passwordAuth` — there is no
  *     password sign-up door when password auth itself is off.
+ *   - `previewBaseDomain`: ADR 0118. The preview handler sends an
+ *     unauthenticated navigation here with `?next=<the app URL>`; the page needs
+ *     this to decide whether that URL is one it may bounce back to. It is not a
+ *     secret — it is in every preview URL a user has ever seen — and the page
+ *     cannot safely hardcode it, since it differs per deployment.
  *
  * Behind IAP the SPA never actually reaches /login (the bridge authenticates
  * every request), so this mainly drives the dev / self-hosted (no-IAP) login
@@ -32,6 +37,7 @@ authConfigRoute.get("/api/v1/auth-config", (c) => {
     passwordAuth,
     // No public sign-up without a password door.
     signup: passwordAuth,
+    previewBaseDomain: config.previewBaseDomain,
   });
 });
 

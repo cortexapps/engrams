@@ -12,11 +12,14 @@
  * the bidi relay stream — so the guest's HTTP/1.1 framing rides the tunnel
  * unchanged.
  *
- * Auth: the host label resolves to a `session_app` row; access requires the
- * authenticated principal to own the session or be an admin. IAP still fronts
- * everything on a deployment that runs it, so this is the second gate. ADR 0118
- * P2 moves the wall here entirely (and adds org visibility, the login redirect,
- * the unauthenticated `OPTIONS` path, and sibling-origin enforcement).
+ * Auth (ADR 0118): this handler IS the wall for the preview domain. Four rules,
+ * each an invariant rather than a policy knob — see the middleware at the foot
+ * of this file, where each is stated with why it cannot be relaxed:
+ *
+ *   1. Every Host under the preview base domain terminates here. Never next().
+ *   2. `OPTIONS` skips authentication (a browser sends no cookie on a preflight).
+ *   3. A credentialed cross-origin request must come from a sibling app.
+ *   4. An unauthenticated navigation redirects to login; anything else gets 401.
  *
  * WebSocket upgrades are handled separately (P2b-ws) — Bun's node:http `upgrade`
  * handler can't write to the raw socket (see server.ts), so raw WS passthrough
@@ -62,6 +65,8 @@ export interface PreviewProxyDeps {
   portRelay?: PortRelayClient;
   getSession?: GetSession;
   previewBaseDomain?: string;
+  /** Where an unauthenticated navigation is sent (default: the main host's /login). */
+  loginUrl?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -97,35 +102,100 @@ export type PreviewAuth =
   | { ok: false; status: 401 | 403 | 404 };
 
 /**
- * Resolve + authorize a preview request.
- *   404 unknown host label · 401 no session · 403 not owner/admin.
+ * True if `host` is under the preview base domain at all — apex, nested label,
+ * junk label, or a real app. This is the TERMINATION test: everything it
+ * matches must be answered by the preview handler, never passed to the app.
  *
- * ADR 0118 retired ADR 0064's unauthenticated `shareToken` capability: the
- * requirement is that nobody reaches an app without passing the login wall, and
- * a token in a URL is exactly a way around it. It also retired `expiresAt`,
- * which was enforced here but never written by anything.
- *
- * The `visibility = "org"` widening (any authenticated principal, so a teammate
- * can open your preview) lands with the rest of the wall move in P2. Until then
- * this stays at owner-or-admin, which is the stricter of the two.
+ * `previewHostLabel` is the narrower question ("does it name a routable app?")
+ * and returns null for the cases this still matches.
  */
-export async function authorizePreview(
+export function isUnderPreviewDomain(
+  hostHeader: string | undefined,
+  baseDomain: string,
+): boolean {
+  if (!hostHeader || !baseDomain) return false;
+  const host = hostHeader.toLowerCase();
+  const base = baseDomain.toLowerCase();
+  return host === base || host.endsWith("." + base);
+}
+
+/**
+ * Authorize a resolved app.
+ *   401 no session · 403 authenticated but not permitted.
+ *
+ * `visibility = "org"` (the default) admits any authenticated principal, so a
+ * teammate can open a preview by URL. `private` narrows it to the owner and
+ * admins. Either way the caller is past the login wall, which is the property
+ * that matters: ADR 0118 retired ADR 0064's unauthenticated `shareToken`
+ * because a capability in a URL is precisely a way around that wall.
+ */
+export async function authorizeApp(
   opts: {
-    hostLabel: string;
+    row: SessionAppRow;
     headers: Headers;
-    store: SessionAppStore;
     getSession: GetSession;
   },
 ): Promise<PreviewAuth> {
-  const row = await opts.store.getByHostLabel(opts.hostLabel);
-  if (!row) return { ok: false, status: 404 };
-
   const session = await opts.getSession(opts.headers);
   if (!session) return { ok: false, status: 401 };
-  const isOwner = session.user.id === row.ownerUserId;
+  if (opts.row.visibility === "org") return { ok: true, row: opts.row };
+  const isOwner = session.user.id === opts.row.ownerUserId;
   const isAdmin = (session.user.role ?? "user") === "admin";
   if (!isOwner && !isAdmin) return { ok: false, status: 403 };
-  return { ok: true, row };
+  return { ok: true, row: opts.row };
+}
+
+/**
+ * Is `origin` the target app itself, or another app of the SAME session?
+ *
+ * Anything else — another session's app, or a foreign site — is refused before
+ * the request reaches the guest. Note this deliberately does not consult the
+ * principal: two apps of one session share a trust domain, two sessions do not,
+ * even when one user owns both.
+ */
+export async function isSiblingOrigin(
+  origin: string,
+  target: SessionAppRow,
+  baseDomain: string,
+  store: SessionAppStore,
+): Promise<boolean> {
+  let originHost: string;
+  try {
+    originHost = new URL(origin).host;
+  } catch {
+    return false; // unparseable Origin (including the literal "null")
+  }
+  const label = previewHostLabel(originHost, baseDomain);
+  if (!label) return false; // not a preview origin at all
+  if (label === target.hostLabel) return true; // same app
+  const peer = await store.getByHostLabel(label);
+  return peer != null && peer.sessionId === target.sessionId;
+}
+
+/** The main host's login page, used to send an unauthenticated browser to log in. */
+function defaultLoginUrl(): string {
+  return `${config.baseUrl.replace(/\/$/, "")}/login`;
+}
+
+/**
+ * Refuse an unauthenticated request in the shape its caller can act on.
+ *
+ * A browser NAVIGATION gets a 302 to the main host's login page, which is still
+ * IAP-gated, so the human is challenged, the bridge mints the now
+ * parent-domain-scoped cookie, and the page returns them here.
+ *
+ * Anything else gets a 401. Redirecting an XHR into an HTML login page turns a
+ * clean "you are not logged in" into an opaque CORS or parse failure at the
+ * caller, so the distinction is load-bearing, not cosmetic.
+ */
+function unauthenticatedResponse(c: Context, loginUrl: string): Response {
+  const accept = c.req.header("accept") ?? "";
+  const mode = c.req.header("sec-fetch-mode");
+  const isNavigation =
+    (mode === "navigate" || mode === undefined) && accept.includes("text/html");
+  if (!isNavigation) return c.text("unauthenticated", 401);
+  const next = new URL(c.req.url);
+  return c.redirect(`${loginUrl}?next=${encodeURIComponent(next.toString())}`, 302);
 }
 
 // ---------------------------------------------------------------------------
@@ -335,12 +405,13 @@ function previewErrorResponse(err: unknown): Response {
 // ---------------------------------------------------------------------------
 
 /**
- * Hono middleware: when the request Host is a preview host, resolve + authorize
- * the slug and proxy to the guest port; otherwise pass through to the app.
+ * Hono middleware: a request whose Host is under the preview base domain is
+ * answered HERE — authorized and proxied to the guest port, or refused.
  * Mount FIRST (before the normal routes) in index.ts.
  */
 export function makePreviewProxyMiddleware(deps?: PreviewProxyDeps): MiddlewareHandler {
   const baseDomain = deps?.previewBaseDomain ?? config.previewBaseDomain;
+  const loginUrl = deps?.loginUrl ?? defaultLoginUrl();
   const relay: PortRelayClient =
     (deps?.portRelay as PortRelayClient | undefined) ??
     (defaultPortRelay as unknown as PortRelayClient);
@@ -355,25 +426,53 @@ export function makePreviewProxyMiddleware(deps?: PreviewProxyDeps): MiddlewareH
     });
 
   return async (c, next) => {
-    const slug = previewHostLabel(c.req.header("host"), baseDomain);
-    if (!slug) return next();
+    const host = c.req.header("host");
+    // Not addressed to the preview domain at all → the normal app.
+    if (!isUnderPreviewDomain(host, baseDomain)) return next();
 
-    const authz = await authorizePreview({
-      hostLabel: slug,
+    const label = previewHostLabel(host, baseDomain);
+
+    // INVARIANT — preview hosts terminate (ADR 0118). A Host under the preview
+    // base domain is ALWAYS answered here, even when it names no app: the apex,
+    // a nested label, a junk label. Falling through would hand an unauthenticated
+    // request to the whole orchestrator API, because this domain is deliberately
+    // exempt from the IAP bridge (auth/iap-bridge.ts `isPreviewHost`). IAP hides
+    // that today; it will not once the wall moves here.
+    if (!label) return c.text("not found", 404);
+
+    const row = await getStore().getByHostLabel(label);
+    if (!row) return c.text("not found", 404);
+
+    // INVARIANT — OPTIONS skips the wall (ADR 0118). A browser NEVER sends
+    // cookies on a CORS preflight, so authenticating it would reject every
+    // cross-app call and no CORS config in the app could repair it. Forward it
+    // unauthenticated and let the app answer with its own CORS policy; the app
+    // stays authoritative, so nothing we inject can contradict what it emits.
+    // A preflight carries no body and returns only headers.
+    if (c.req.method === "OPTIONS") {
+      return proxyHttp(relay, row.sessionId, row.port, c);
+    }
+
+    // INVARIANT — a credentialed cross-origin request must come from a sibling
+    // (ADR 0118). The parent-domain cookie is what makes one login cover every
+    // app; it is also what would let ANY preview origin issue credentialed
+    // requests to any other. CORS does not contain that — it blocks reading a
+    // response, not sending the request — so the refusal has to happen here.
+    const origin = c.req.header("origin");
+    if (origin && !(await isSiblingOrigin(origin, row, baseDomain, getStore()))) {
+      return c.text("cross-origin request from a non-sibling app", 403);
+    }
+
+    const authz = await authorizeApp({
+      row,
       headers: c.req.raw.headers,
-      store: getStore(),
       getSession: resolveSession,
     });
     if (!authz.ok) {
-      const msg =
-        authz.status === 401
-          ? "unauthenticated"
-          : authz.status === 403
-            ? "forbidden"
-            : "not found";
-      return c.text(msg, authz.status);
+      if (authz.status === 401) return unauthenticatedResponse(c, loginUrl);
+      return c.text(authz.status === 403 ? "forbidden" : "not found", authz.status);
     }
 
-    return proxyHttp(relay, authz.row.sessionId, authz.row.port, c);
+    return proxyHttp(relay, row.sessionId, row.port, c);
   };
 }
