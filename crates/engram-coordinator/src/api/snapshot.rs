@@ -66,6 +66,9 @@ pub(crate) fn placeholder_egress_policy(
         observes: vec![],
         guest_services: Vec::new(),
         tunnels: vec![],
+        // A zero-IP policy means "no policy applied", so the ADR 0118 SNI short
+        // circuit could never fire anyway.
+        apps: vec![],
         secret_mode: engram_core::types::image::SecretMode::Broker,
     }
 }

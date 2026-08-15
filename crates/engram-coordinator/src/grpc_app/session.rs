@@ -838,6 +838,7 @@ mod tests {
         use engram_protocol::app;
         let r = app::CreateSessionRequest {
             selected_skills: Vec::new(),
+            apps: Vec::new(),
             capabilities: Vec::new(),
             integration_policy_json: String::new(),
             requested_session_id: None,
@@ -871,6 +872,7 @@ mod tests {
         use engram_protocol::app;
         let r = app::CreateSessionRequest {
             selected_skills: Vec::new(),
+            apps: Vec::new(),
             capabilities: Vec::new(),
             integration_policy_json: String::new(),
             requested_session_id: None,
@@ -898,6 +900,7 @@ mod tests {
         use engram_protocol::app;
         let r = app::CreateSessionRequest {
             selected_skills: Vec::new(),
+            apps: Vec::new(),
             capabilities: Vec::new(),
             integration_policy_json: String::new(),
             requested_session_id: None,

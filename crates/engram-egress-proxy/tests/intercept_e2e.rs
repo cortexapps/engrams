@@ -336,6 +336,7 @@ async fn violation_returned_when_placeholder_targets_disallowed_host() {
     // fire in production, and this test could not notice.
     let session = SessionState {
         session_id: SessionId::new(),
+        sandbox_id: engram_core::SandboxId::new(),
         guest_ip: "10.200.0.2".parse().unwrap(),
         allow_all: false,
         network_allow: HostList::from_manifest(&["fake-upstream".into()], &[]).unwrap(),
@@ -358,6 +359,7 @@ async fn violation_returned_when_placeholder_targets_disallowed_host() {
         }],
         guest_services: Vec::new(),
         tunnels: Vec::new(),
+        apps: Vec::new(),
     };
     let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
     let proxy_task = tokio::spawn(async move {

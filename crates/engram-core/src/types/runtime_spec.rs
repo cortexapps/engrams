@@ -14,6 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::egress::AppEndpoint;
+
 /// The persisted boot-input document. Phase 3 carries the fields whose
 /// re-derivation was lossy or bug-prone; the egress template + sealed
 /// secret refs (documented in ADR 0077) extend this in phase 3b, at
@@ -36,6 +38,15 @@ pub struct RuntimeSpec {
     /// Image manifest workdir the harness runs in.
     #[serde(default)]
     pub workdir: Option<String>,
+    /// ADR 0118: the session's apps, as `(hostname, port)`.
+    ///
+    /// They live here for the same reason `selected_skills` does: they are
+    /// minted once, before the session exists, and every later boot has to
+    /// reproduce them exactly. A resume that re-derived them would mint fresh
+    /// hostnames, and the guest's env — fixed at the first bind — would then
+    /// point at addresses nothing serves.
+    #[serde(default)]
+    pub apps: Vec<AppEndpoint>,
 }
 
 fn default_version() -> u32 {
@@ -47,12 +58,14 @@ impl RuntimeSpec {
         selected_skills: Vec<String>,
         selected_harness: Option<String>,
         workdir: Option<String>,
+        apps: Vec<AppEndpoint>,
     ) -> Self {
         Self {
             v: 1,
             selected_skills,
             selected_harness,
             workdir,
+            apps,
         }
     }
 }

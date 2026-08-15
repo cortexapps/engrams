@@ -651,6 +651,7 @@ impl Sim {
                         Vec::new(),
                         None,
                         None,
+                        Vec::new(),
                     ),
                     oauth_binding: None,
                 };

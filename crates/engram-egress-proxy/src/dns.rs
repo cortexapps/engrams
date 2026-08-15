@@ -349,6 +349,15 @@ fn decide(registry: &Registry, guest_ip: Ipv4Addr, query: &Message) -> Decision 
 ///
 /// A credential-exchange host is refused outright, matching `decide()`.
 fn name_allowed(state: &SessionState, qname: &str) -> bool {
+    // ADR 0118: the session's OWN apps resolve unconditionally — before the
+    // deny-list and before the allow-list. A sibling app is not an egress
+    // destination at all: the TCP connection never leaves the host, so
+    // requiring an allow-list entry would make the session ask permission to
+    // talk to itself. Scoped to THIS session's apps, so it can never make
+    // another session's hostname resolvable.
+    if crate::app_relay::own_app_port(&state.apps, qname).is_some() {
+        return true;
+    }
     if crate::google_denylist::denies_host(qname) {
         return false;
     }
@@ -409,6 +418,7 @@ mod tests {
     fn allows_exact_match_in_network_allow() {
         let state = SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
             allow_all: false,
             network_allow: HostList::from_manifest(&["api.anthropic.com".into()], &[]).unwrap(),
@@ -417,6 +427,7 @@ mod tests {
             observes: Vec::new(),
             guest_services: Vec::new(),
             tunnels: Vec::new(),
+            apps: Vec::new(),
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -442,6 +453,7 @@ mod tests {
         };
         let state = SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
             allow_all: false,
             network_allow: HostList::from_manifest(&[], &[]).unwrap(),
@@ -450,6 +462,7 @@ mod tests {
             observes: Vec::new(),
             guest_services: Vec::new(),
             tunnels: Vec::new(),
+            apps: Vec::new(),
         };
         let reg = registry_with(state);
         let query = make_query("compute.googleapis.com.", RecordType::A);
@@ -463,6 +476,7 @@ mod tests {
     fn refuses_to_resolve_a_credential_exchange_host() {
         let state = SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
             allow_all: true,
             network_allow: HostList::from_manifest(&[], &[]).unwrap(),
@@ -471,6 +485,7 @@ mod tests {
             observes: Vec::new(),
             guest_services: Vec::new(),
             tunnels: Vec::new(),
+            apps: Vec::new(),
         };
         let reg = registry_with(state);
         for name in ["sts.googleapis.com.", "sts.mtls.googleapis.com."] {
@@ -489,6 +504,7 @@ mod tests {
     fn allows_wildcard_pattern() {
         let state = SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
             allow_all: false,
             network_allow: HostList::from_manifest(&[], &["*.anthropic.com".into()]).unwrap(),
@@ -497,6 +513,7 @@ mod tests {
             observes: Vec::new(),
             guest_services: Vec::new(),
             tunnels: Vec::new(),
+            apps: Vec::new(),
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -520,6 +537,7 @@ mod tests {
     fn denies_name_not_in_allow_list() {
         let state = SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
             allow_all: false,
             network_allow: HostList::from_manifest(&["api.anthropic.com".into()], &[]).unwrap(),
@@ -528,6 +546,7 @@ mod tests {
             observes: Vec::new(),
             guest_services: Vec::new(),
             tunnels: Vec::new(),
+            apps: Vec::new(),
         };
         let reg = registry_with(state);
         let q = make_query("evil.example.com.", RecordType::A);
@@ -558,6 +577,7 @@ mod tests {
         // path's `Intercept` decision.
         let state = SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::new(10, 200, 0, 2),
             allow_all: false,
             network_allow: HostList::empty(),
@@ -570,6 +590,7 @@ mod tests {
             observes: Vec::new(),
             guest_services: Vec::new(),
             tunnels: Vec::new(),
+            apps: Vec::new(),
         };
         let reg = registry_with(state);
         let q = make_query("api.anthropic.com.", RecordType::A);
@@ -614,6 +635,7 @@ mod tests {
         };
         registry.register(SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: client_ip,
             allow_all: false,
             network_allow: HostList::from_manifest(&["allowed.example.com".into()], &[]).unwrap(),
@@ -622,6 +644,7 @@ mod tests {
             observes: Vec::new(),
             guest_services: Vec::new(),
             tunnels: Vec::new(),
+            apps: Vec::new(),
         });
         let proxy_task = tokio::spawn(serve_udp(proxy_sock.clone(), registry, upstream_addr));
 
@@ -653,6 +676,7 @@ mod tests {
         };
         registry.register(SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: client_ip,
             allow_all: false,
             network_allow: HostList::from_manifest(&["allowed.example.com".into()], &[]).unwrap(),
@@ -661,6 +685,7 @@ mod tests {
             observes: Vec::new(),
             guest_services: Vec::new(),
             tunnels: Vec::new(),
+            apps: Vec::new(),
         });
         // Point upstream at an obviously-dead address so the test
         // can't accidentally succeed by hitting a real resolver.

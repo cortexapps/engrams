@@ -15,6 +15,7 @@
 //! placeholder-leak detection. Phase B wires it into the FC backend
 //! and adds the sudo-gated VM-level e2e test.
 
+pub mod app_relay;
 pub mod bypass;
 pub mod ca;
 pub mod cert_mint;
@@ -41,6 +42,7 @@ pub use resolver::{
     default_resolver, ResolveError, StaticResolver, SystemResolver, UpstreamResolver,
 };
 
+pub use app_relay::{own_app_port, GuestPortDialer, NoGuestPortDialer, SharedGuestPortDialer};
 pub use ca::{Ca, CaError, CaSource, EnvCaSource, LocalDiskCaSource};
 pub use cert_mint::{CertMint, MintError};
 pub use graphql::{parse_request_body as parse_graphql_request, ParsedGraphql};

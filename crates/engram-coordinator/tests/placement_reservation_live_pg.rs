@@ -126,7 +126,12 @@ fn bare_write_set(
         sealed_secrets: None,
         capabilities: Vec::new(),
         integration_policy_json: None,
-        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        ),
         oauth_binding: None,
     }
 }
@@ -275,6 +280,7 @@ async fn reserve_and_persist_create_commits_the_full_write_set_together() {
             vec!["browser".into()],
             Some("claude".into()),
             None,
+            Vec::new(),
         ),
         oauth_binding: None,
     };

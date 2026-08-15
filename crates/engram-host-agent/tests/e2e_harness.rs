@@ -718,6 +718,8 @@ async fn e2e_harness_cold_via_pooled_backend() {
         observes: Vec::new(),
         guest_services: Vec::new(),
         tunnels: Vec::new(),
+        apps: Vec::new(),
+        sandbox_id,
     });
 
     drive_harness(&pooled, sandbox_id, session_id, &ca_pem, captured, cmd_tx).await;
@@ -817,6 +819,8 @@ async fn e2e_harness_warm_via_pooled_backend() {
         observes: Vec::new(),
         guest_services: Vec::new(),
         tunnels: Vec::new(),
+        apps: Vec::new(),
+        sandbox_id: warm_id,
     });
 
     drive_harness(&pooled, warm_id, session_id, &ca_pem, captured, cmd_tx).await;

@@ -66,6 +66,41 @@ pub struct SessionEgressPolicy {
     /// Image's secret delivery mode. The proxy uses this to decide
     /// whether to MITM (`Broker`) or just SNI-filter (`Literal`).
     pub secret_mode: SecretMode,
+    /// ADR 0118: the session's own apps, so the proxy can recognise one of this
+    /// guest's public hostnames at SNI-peek time and splice the connection
+    /// straight back into the sibling's guest port instead of sending it out to
+    /// the internet.
+    ///
+    /// LAST on purpose. This type crosses the coord↔host wire as positional
+    /// bincode (ADR 0013), so field ORDER is the format: an inserted
+    /// non-trailing field shifts every byte after it and desyncs a peer built
+    /// from an older tree across a roll. A trailing field is the only wire-safe
+    /// evolution — see `engram-protocol/tests/wire_golden.rs`, which pins these
+    /// bytes and is what catches the mistake.
+    ///
+    /// `#[serde(default)]` so policies serialized before this field decode with
+    /// none, and the short circuit simply never fires — the pre-ADR-0118
+    /// behaviour.
+    #[serde(default)]
+    pub apps: Vec<AppEndpoint>,
+}
+
+/// ADR 0118: one app's resolved public address, as the egress proxy needs it.
+///
+/// Distinct from the orchestrator's app DECLARATION (`{name, port}`): by the
+/// time a policy is assembled the hostname has already been reserved, so what
+/// travels here is the address.
+///
+/// `hostname` is the app's FULL public name (`<label>.<preview base domain>`),
+/// not just the label, because SNI carries the whole name and comparing the
+/// whole string is what makes the match exact — a label-only compare would have
+/// to reconstruct the domain and could be fooled by a suffix near-miss.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppEndpoint {
+    /// e.g. `api-tidy-swift-otters.preview.example.com`.
+    pub hostname: String,
+    /// The guest TCP port the app listens on.
+    pub port: u16,
 }
 
 /// One secret's substitution policy. `placeholder` is the value the

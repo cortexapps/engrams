@@ -295,6 +295,14 @@ fn secret_mode() -> impl Strategy<Value = SecretMode> {
     shapes(SecretMode::Literal)
 }
 
+/// ADR 0118: one resolved app address. Generated (not stubbed) so the codec
+/// round-trip actually covers the field — a strategy that always produced an
+/// empty vec would leave the new wire surface untested while looking covered.
+pub fn app_endpoint() -> impl Strategy<Value = engram_core::types::egress::AppEndpoint> {
+    (s(), any::<u16>())
+        .prop_map(|(hostname, port)| engram_core::types::egress::AppEndpoint { hostname, port })
+}
+
 pub fn session_egress_policy() -> impl Strategy<Value = SessionEgressPolicy> {
     (
         (any::<u128>(), any::<u128>(), any::<[u8; 4]>()),
@@ -308,14 +316,18 @@ pub fn session_egress_policy() -> impl Strategy<Value = SessionEgressPolicy> {
             proptest::collection::vec(egress_inject_entry(), 0..2),
             proptest::collection::vec(egress_observe_entry(), 0..2),
         ),
-        (guest_services(), secret_mode()),
+        (
+            guest_services(),
+            secret_mode(),
+            proptest::collection::vec(app_endpoint(), 0..3),
+        ),
     )
         .prop_map(
             |(
                 (session, sandbox, ip),
                 (network_allow_hosts, network_allow_host_patterns, allow_all),
                 (secrets, injects, observes),
-                (guest_services, secret_mode),
+                (guest_services, secret_mode, apps),
             )| SessionEgressPolicy {
                 session_id: SessionId::from(uuid::Uuid::from_u128(session)),
                 sandbox_id: SandboxId::from(uuid::Uuid::from_u128(sandbox)),
@@ -328,6 +340,7 @@ pub fn session_egress_policy() -> impl Strategy<Value = SessionEgressPolicy> {
                 observes,
                 guest_services,
                 tunnels: Vec::new(),
+                apps,
                 secret_mode,
             },
         )

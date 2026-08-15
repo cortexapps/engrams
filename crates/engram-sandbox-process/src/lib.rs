@@ -1929,6 +1929,7 @@ mod tests {
                 observes: Vec::new(),
                 guest_services: vec![GuestService::new("gcp.gce_metadata")],
                 tunnels: Vec::new(),
+                apps: Vec::new(),
                 secret_mode: SecretMode::Broker,
             })
             .await

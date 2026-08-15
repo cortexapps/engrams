@@ -88,6 +88,12 @@ pub(crate) struct BootInputs {
     /// are already-resolved-to-slots and re-derived fresh on every prepare —
     /// the sha may have rolled while queued).
     pub selected_skills: Vec<String>,
+    /// ADR 0118: the session's apps, as `(hostname, port)`. Sourced from the
+    /// create request on a live create and from the persisted RuntimeSpec on a
+    /// queued re-prepare or a resume, so every boot of the session publishes
+    /// the SAME hostnames — the guest's env was built from them once, before
+    /// the first boot, and never rebuilt.
+    pub apps: Vec<engram_core::types::egress::AppEndpoint>,
     /// ADR 0056: the profile-granted capabilities (parsed + validated).
     /// Issue #535 (b): bound to `session_capabilities` by `reserve_and_
     /// persist_create` BEFORE `boot_on_reserved_host` ever runs — this field
@@ -197,6 +203,7 @@ pub(crate) async fn boot_on_reserved_host(
         network,
         selected_mounts,
         selected_skills: _,
+        apps,
         capabilities: _,
         integration_policy,
         selected_harness: _,
@@ -341,6 +348,7 @@ pub(crate) async fn boot_on_reserved_host(
             .as_ref()
             .map(|policy| policy.tunnels.clone())
             .unwrap_or_default(),
+        apps,
     };
     let egress_policy =
         assemble_egress_policy(state, session_id, sandbox_id, &network, resolved_policy).await;
@@ -428,6 +436,10 @@ pub(crate) async fn boot_on_reserved_host(
                 .map(|policy| policy.guest_services.clone())
                 .unwrap_or_default(),
             tunnels: Vec::new(),
+            // No guest IP means no iptables REDIRECT for this sandbox, so the
+            // SNI short circuit can never fire — carrying the apps here would
+            // be inert.
+            apps: Vec::new(),
             // ADR 0057: vestigial wire field; substitution is per-entry.
             secret_mode: engram_core::types::image::SecretMode::Broker,
         }
@@ -567,6 +579,8 @@ struct ResolvedEgressPolicy {
     observes: Vec<engram_core::types::egress::EgressObserveEntry>,
     guest_services: Vec<GuestService>,
     tunnels: Vec<engram_core::types::integration::SessionTunnel>,
+    /// ADR 0118: the session's own app hostnames, for the SNI short circuit.
+    apps: Vec<engram_core::types::egress::AppEndpoint>,
 }
 
 async fn assemble_egress_policy(
@@ -591,6 +605,7 @@ async fn assemble_egress_policy(
         observes: resolved.observes,
         guest_services: resolved.guest_services,
         tunnels: resolved.tunnels,
+        apps: resolved.apps,
         // ADR 0057: per-secret mode replaces a session-level mode; the proxy
         // substitutes per `EgressSecretEntry`. Kept Broker for the (vestigial)
         // wire field — substitution is driven by the entries, not this flag.
@@ -651,6 +666,8 @@ pub(crate) fn assemble_capture_egress_policy(
         observes: Vec::new(),
         guest_services: Vec::new(),
         tunnels: Vec::new(),
+        // A capture VM hosts no session apps.
+        apps: Vec::new(),
         secret_mode: engram_core::types::image::SecretMode::Literal,
     })
 }

@@ -43,10 +43,32 @@ const READ_CHUNK: usize = 64 * 1024;
 /// 0064's fail-fast contract — then splice through the unchanged pump. The
 /// guest reaches loopback-bound dev servers a direct dial_ip dial cannot.
 pub async fn open_vsock_tunnel_at(
-    mut stream: HarnessByteStream,
+    stream: HarnessByteStream,
     target_port: u16,
     ends: PortTunnelEnds,
 ) -> Result<(), SandboxError> {
+    let stream = relay_connect(stream, target_port).await?;
+    pump_tcp_through_tunnel(stream, ends);
+    Ok(())
+}
+
+/// The ADR 0066 relay handshake, on its own.
+///
+/// Sends [`RelayConnect`](engram_harness_proto::RelayConnect) and awaits the
+/// [`RelayAck`](engram_harness_proto::RelayAck), returning the same stream now
+/// positioned at the first spliced byte. A NAK becomes a synchronous error, so
+/// a dev server that is not listening surfaces as a clean failure rather than a
+/// connection that dies on first read.
+///
+/// Split out from [`open_vsock_tunnel_at`] because two callers need it and only
+/// one of them wants the channel-based pump: the ADR 0064 preview tunnel pumps
+/// into a `PortTunnel`, while the ADR 0118 app-to-app short circuit wants the
+/// raw stream so it can `copy_bidirectional` against a TLS session. Written
+/// once here so the two can never drift.
+pub async fn relay_connect(
+    mut stream: HarnessByteStream,
+    target_port: u16,
+) -> Result<HarnessByteStream, SandboxError> {
     engram_harness_proto::write_msg(
         &mut stream,
         &engram_harness_proto::RelayConnect { target_port },
@@ -65,8 +87,54 @@ pub async fn open_vsock_tunnel_at(
             .into(),
         ));
     }
-    pump_tcp_through_tunnel(stream, ends);
-    Ok(())
+    Ok(stream)
+}
+
+/// ADR 0118: the [`GuestPortDialer`](engram_egress_proxy::GuestPortDialer) the
+/// egress proxy uses to splice a same-session app-to-app call back into the
+/// sandbox it came from.
+///
+/// This is the one place that knows both halves: the sandbox backend (which
+/// opens the vsock channel) and the ADR 0066 relay handshake (which turns that
+/// channel into a connection to a guest port). The proxy crate stays free of
+/// both.
+pub struct BackendGuestPortDialer {
+    sandbox: std::sync::Arc<dyn engram_core::traits::SandboxBackend>,
+}
+
+impl BackendGuestPortDialer {
+    pub fn new(sandbox: std::sync::Arc<dyn engram_core::traits::SandboxBackend>) -> Self {
+        Self { sandbox }
+    }
+}
+
+#[async_trait::async_trait]
+impl engram_egress_proxy::GuestPortDialer for BackendGuestPortDialer {
+    async fn dial(
+        &self,
+        sandbox_id: engram_core::SandboxId,
+        port: u16,
+    ) -> std::io::Result<Box<dyn engram_egress_proxy::TunnelStream>> {
+        let stream = self
+            .sandbox
+            .open_guest_stream(sandbox_id, engram_harness_proto::PROXY_PORT_VSOCK_PORT)
+            .await
+            .map_err(|e| std::io::Error::other(format!("open guest stream: {e}")))?
+            .ok_or_else(|| {
+                // A backend with no vsock relay (the Process backend) has no
+                // way to reach a guest port from here. Refusing is correct:
+                // the alternative is dialing the host's own loopback, which
+                // would be a different machine's port entirely.
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "backend exposes no guest stream for the app relay",
+                )
+            })?;
+        let stream = relay_connect(stream, port)
+            .await
+            .map_err(|e| std::io::Error::other(format!("{e}")))?;
+        Ok(Box::new(stream))
+    }
 }
 
 /// Open a raw-byte tunnel by dialing `dial_ip:port` directly (host root netns,

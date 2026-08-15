@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use engram_core::types::egress::AppEndpoint;
 use engram_core::types::integration::{CredentialMintSource, GuestService, SessionTunnel};
 use engram_core::SessionId;
 use parking_lot::RwLock;
@@ -27,6 +28,10 @@ use crate::policy::HostList;
 #[derive(Clone, Debug)]
 pub struct SessionState {
     pub session_id: SessionId,
+    /// The sandbox this session is bound to. Carried so the ADR 0118 short
+    /// circuit can dial a guest port without a session→sandbox lookup — the
+    /// policy that built this state already knew both.
+    pub sandbox_id: engram_core::SandboxId,
     pub guest_ip: Ipv4Addr,
     /// `manifest.network.allow_hosts` ∪ `allow_host_patterns`.
     /// Hosts on this list are reachable; the proxy splices traffic
@@ -56,6 +61,16 @@ pub struct SessionState {
     pub guest_services: Vec<GuestService>,
     /// Exact host-side tunnels compiled for this session.
     pub tunnels: Vec<SessionTunnel>,
+    /// ADR 0118: this session's OWN app hostnames. When a guest dials one of
+    /// them, the proxy splices the connection straight back into the sibling's
+    /// guest port instead of sending it to the internet — the two apps are
+    /// already in one trust domain, so a round trip through DNS, the load
+    /// balancer and the orchestrator would buy nothing but latency.
+    ///
+    /// Checked BEFORE `network_allow`, like the secret/inject/observe arms: an
+    /// app's own sibling is not an egress destination, so it does not need an
+    /// allow-list entry.
+    pub apps: Vec<AppEndpoint>,
 }
 
 #[derive(Clone, Debug)]
@@ -511,6 +526,15 @@ impl SessionState {
     /// straight through — the guest could trade its session token for a
     /// credential this proxy no longer bounds.
     pub fn decide(&self, hostname: &str) -> Decision<'_> {
+        // ADR 0118: checked FIRST, before the deny-list and the allow-list. A
+        // sibling app is not an egress destination — the connection is spliced
+        // back into this same sandbox and never leaves the host — so it is not
+        // subject to rules about where the session may reach on the internet.
+        // Scoped to THIS session's apps (the caller resolved the source IP to
+        // its own SessionState), so it can never reach another session.
+        if let Some(port) = crate::app_relay::own_app_port(&self.apps, hostname) {
+            return Decision::OwnApp { port };
+        }
         if crate::google_denylist::denies_host(hostname) {
             return Decision::Reject;
         }
@@ -590,6 +614,11 @@ impl SessionState {
 pub enum Decision<'a> {
     /// SNI not in `network_allow` and no secret/injection applies. Drop.
     Reject,
+    /// ADR 0118: the SNI names one of THIS session's own apps. Terminate TLS
+    /// with a minted leaf (the guest already trusts our CA) and splice the
+    /// plaintext into the sibling's guest port — the call never leaves the
+    /// host. Carries the guest port to dial.
+    OwnApp { port: u16 },
     /// SNI in `network_allow`, nothing to substitute or inject. Splice through.
     Bypass,
     /// One or more secrets/injections/observations apply. MITM, then
@@ -616,6 +645,7 @@ mod tests {
     fn state() -> SessionState {
         SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: Ipv4Addr::from_str("10.200.0.2").unwrap(),
             allow_all: false,
             network_allow: HostList::from_manifest(
@@ -657,6 +687,7 @@ mod tests {
             }],
             guest_services: Vec::new(),
             tunnels: Vec::new(),
+            apps: Vec::new(),
         }
     }
 

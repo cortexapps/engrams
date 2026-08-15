@@ -708,6 +708,7 @@ async fn create_session_unknown_image_is_invalid_argument() {
             integration_policy_json: String::new(),
             requested_session_id: None,
             selected_skills: Vec::new(),
+            apps: Vec::new(),
             image_uri: "localhost:5001/never-enabled:warm".into(),
             mode: "agent".into(),
             prompt: None,

@@ -413,6 +413,7 @@ mod tests {
             observes: Vec::new(),
             guest_services: Vec::new(),
             tunnels: Vec::new(),
+            apps: Vec::new(),
             secret_mode: engram_core::types::image::SecretMode::Broker,
         }
     }

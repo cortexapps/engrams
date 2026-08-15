@@ -147,6 +147,9 @@ pub(crate) fn create_request_from_proto(
         // deferred refinement; acknowledge the drop here.
         prompt_id: _,
         oauth_credential,
+        // ADR 0118: apps arrive already resolved to public hostnames (the
+        // orchestrator reserves them before this call).
+        apps,
     } = r;
     let mode = match mode.as_str() {
         "" | "agent" => SessionMode::Agent,
@@ -207,6 +210,33 @@ pub(crate) fn create_request_from_proto(
                 .map_err(|_| ApiError::BadRequest("requested_session_id must be a UUID".into()))
         })
         .transpose()?;
+    // ADR 0118: a malformed app is a create-time 400, not a silent drop — the
+    // guest's env has already been built from these hostnames by the caller, so
+    // dropping one here would boot a session configured to reach an address
+    // nothing serves.
+    let apps = apps
+        .into_iter()
+        .map(|a| {
+            let port = u16::try_from(a.port)
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "app {:?}: port {} out of range (1..=65535)",
+                        a.hostname, a.port
+                    ))
+                })?;
+            if a.hostname.trim().is_empty() {
+                return Err(ApiError::BadRequest(
+                    "app hostname must not be empty".into(),
+                ));
+            }
+            Ok(engram_core::types::egress::AppEndpoint {
+                hostname: a.hostname.to_ascii_lowercase(),
+                port,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(CreateSessionRequest {
         requested_session_id,
         image: image_uri,
@@ -215,6 +245,7 @@ pub(crate) fn create_request_from_proto(
         harness_mode,
         secrets,
         selected_skills,
+        apps,
         capabilities,
         integration_policy,
         selected_harness: harness,

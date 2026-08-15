@@ -53,6 +53,9 @@ async fn spawn_egress(dir: &Path) -> HostEgress {
         None,
         None,
         Arc::new(engram_egress_proxy::GuestGatewayRegistry::default()),
+        // ADR 0118: no guest-port dialer — this test exercises policy replay
+        // across a roll, not the app-to-app short circuit.
+        None,
     )
     .await
     .expect("spawn egress")
@@ -166,6 +169,7 @@ async fn survivor_keeps_egress_across_a_host_agent_roll() {
         observes: Vec::new(),
         guest_services: Vec::new(),
         tunnels: Vec::new(),
+        apps: Vec::new(),
         secret_mode: engram_core::types::image::SecretMode::Broker,
     };
     pooled_a

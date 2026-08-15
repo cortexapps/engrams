@@ -11173,6 +11173,7 @@ mod tests {
                     observes: Vec::new(),
                     guest_services,
                     tunnels,
+                    apps: Vec::new(),
                     secret_mode: engram_core::types::image::SecretMode::Broker,
                 })
                 .await
@@ -11494,6 +11495,7 @@ mod tests {
             observes: Vec::new(),
             guest_services: Vec::new(),
             tunnels: Vec::new(),
+            apps: Vec::new(),
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -11518,6 +11520,7 @@ mod tests {
             observes: Vec::new(),
             guest_services: Vec::new(),
             tunnels: Vec::new(),
+            apps: Vec::new(),
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -14954,6 +14957,7 @@ mod tests {
                 None,
                 None,
                 Arc::new(engram_egress_proxy::GuestGatewayRegistry::default()),
+                None,
             )
             .await
             .expect("spawn egress");
@@ -14978,6 +14982,7 @@ mod tests {
                 observes: Vec::new(),
                 guest_services: Vec::new(),
                 tunnels: Vec::new(),
+                apps: Vec::new(),
                 secret_mode: SecretMode::Literal,
             }
         }

@@ -666,6 +666,7 @@ mod tests {
         let guest_ip = "10.200.0.2".parse().unwrap();
         let state = |guest_services| SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip,
             network_allow: HostList::empty(),
             allow_all: false,
@@ -674,6 +675,7 @@ mod tests {
             observes: Vec::new(),
             guest_services,
             tunnels: Vec::new(),
+            apps: Vec::new(),
         };
         registry.register(state(Vec::new()));
         assert!(session_guest_services(&registry, guest_ip).is_empty());
@@ -691,6 +693,7 @@ mod tests {
         let registry = Arc::new(Registry::new());
         registry.register(SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: std::net::Ipv4Addr::LOCALHOST,
             network_allow: HostList::empty(),
             allow_all: false,
@@ -699,6 +702,7 @@ mod tests {
             observes: Vec::new(),
             guest_services: vec![GuestService::new("gcp.gce_metadata")],
             tunnels: Vec::new(),
+            apps: Vec::new(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -733,6 +737,7 @@ mod tests {
         let registry = Arc::new(Registry::new());
         registry.register(SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: std::net::Ipv4Addr::LOCALHOST,
             network_allow: HostList::empty(),
             allow_all: false,
@@ -740,6 +745,7 @@ mod tests {
             injects: Vec::new(),
             observes: Vec::new(),
             guest_services: Vec::new(),
+            apps: Vec::new(),
             tunnels: vec![SessionTunnel {
                 id: "prod-readonly".into(),
                 connector: "gcp.cloud_sql".into(),
@@ -794,6 +800,7 @@ mod tests {
         let registry = Arc::new(Registry::new());
         registry.register(SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: std::net::Ipv4Addr::LOCALHOST,
             network_allow: HostList::empty(),
             allow_all: false,
@@ -801,6 +808,7 @@ mod tests {
             injects: Vec::new(),
             observes: Vec::new(),
             guest_services: Vec::new(),
+            apps: Vec::new(),
             tunnels: vec![SessionTunnel {
                 id: "capture".into(),
                 connector: "test.capture".into(),
@@ -847,6 +855,7 @@ mod tests {
         let registry = Arc::new(Registry::new());
         registry.register(SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: std::net::Ipv4Addr::LOCALHOST,
             network_allow: HostList::empty(),
             allow_all: false,
@@ -854,6 +863,7 @@ mod tests {
             injects: Vec::new(),
             observes: Vec::new(),
             guest_services: Vec::new(),
+            apps: Vec::new(),
             tunnels: vec![SessionTunnel {
                 id: "prod-readonly".into(),
                 connector: "test.failing".into(),
@@ -932,6 +942,7 @@ mod tests {
 
         let session = SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: std::net::Ipv4Addr::LOCALHOST,
             network_allow: HostList::empty(),
             allow_all: false,
@@ -939,6 +950,7 @@ mod tests {
             injects: Vec::new(),
             observes: Vec::new(),
             guest_services: vec![GuestService::new("gcp.gce_metadata")],
+            apps: Vec::new(),
             tunnels: vec![SessionTunnel {
                 id: "prod-readonly".into(),
                 connector: "gcp.cloud_sql".into(),
@@ -973,6 +985,7 @@ mod tests {
         let registry = Arc::new(Registry::new());
         registry.register(SessionState {
             session_id: SessionId::new(),
+            sandbox_id: engram_core::SandboxId::new(),
             guest_ip: std::net::Ipv4Addr::LOCALHOST,
             network_allow: HostList::empty(),
             allow_all: false,
@@ -981,6 +994,7 @@ mod tests {
             observes: Vec::new(),
             guest_services: vec![GuestService::new("gcp.gce_metadata")],
             tunnels: Vec::new(),
+            apps: Vec::new(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
