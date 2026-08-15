@@ -9,11 +9,11 @@ importers:
   .:
     dependencies:
       '@assistant-ui/react':
-        specifier: ^0.15.13
-        version: 0.15.13(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(use-sync-external-store@1.6.0(react@19.2.8))
+        specifier: ^0.15.14
+        version: 0.15.14(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(use-sync-external-store@1.6.0(react@19.2.8))
       '@assistant-ui/react-markdown':
         specifier: ^0.14.10
-        version: 0.14.10(@assistant-ui/react@0.15.13(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(use-sync-external-store@1.6.0(react@19.2.8)))(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
+        version: 0.14.10(@assistant-ui/react@0.15.14(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(use-sync-external-store@1.6.0(react@19.2.8)))(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       '@bufbuild/protobuf':
         specifier: ^2.13.0
         version: 2.13.0
@@ -54,8 +54,8 @@ importers:
         specifier: ^5.101.4
         version: 5.101.4(react@19.2.8)
       '@tanstack/react-router':
-        specifier: ^1.170.25
-        version: 1.170.25(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
+        specifier: ^1.170.27
+        version: 1.170.27(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       '@tanstack/react-table':
         specifier: ^9.1.2
         version: 9.1.2(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
@@ -81,8 +81,8 @@ importers:
         specifier: ^3.30.0
         version: 3.30.0(@floating-ui/dom@1.8.0)(@tiptap/core@3.30.0(@tiptap/pm@3.30.0))(@tiptap/pm@3.30.0)(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       better-auth:
-        specifier: ^1.6.26
-        version: 1.6.26(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(vitest@4.1.10(@types/node@26.2.0)(jsdom@30.0.1(@noble/hashes@2.3.0))(vite@8.2.1(@types/node@26.2.0)(jiti@2.7.0)(yaml@2.9.0)))
+        specifier: ^1.6.27
+        version: 1.6.27(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(vitest@4.1.10(@types/node@26.2.0)(jsdom@30.0.1(@noble/hashes@2.3.0))(vite@8.2.1(@types/node@26.2.0)(jiti@2.7.0)(yaml@2.9.0)))
       class-variance-authority:
         specifier: ^0.7.1
         version: 0.7.1
@@ -184,8 +184,8 @@ importers:
         specifier: ^16.3.2
         version: 16.3.2(@testing-library/dom@10.4.1)(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       '@testing-library/user-event':
-        specifier: ^14.6.3
-        version: 14.6.3(@testing-library/dom@10.4.1)
+        specifier: ^14.6.4
+        version: 14.6.4(@testing-library/dom@10.4.1)
       '@types/node':
         specifier: ^26.2.0
         version: 26.2.0
@@ -274,8 +274,8 @@ packages:
       '@types/react':
         optional: true
 
-  '@assistant-ui/react@0.15.13':
-    resolution: {integrity: sha512-Cw9D5+MfnvWNqBPjHm2Td+Dgb9zVY+5hvV5dN6/q7wW+xTfXrz8JOCt9f/cYyaGNdpiXXYJLxCpSkrTYya02+w==}
+  '@assistant-ui/react@0.15.14':
+    resolution: {integrity: sha512-lBkW+RJTrZhC0TlgLTbM4KxMRIKoj17ALCfckfSXN6Uw/3arSZS36+Qz9NOHxD1cMHlpVxOttOVgFsI68pblzw==}
     peerDependencies:
       '@types/react': '*'
       '@types/react-dom': '*'
@@ -326,14 +326,14 @@ packages:
     resolution: {integrity: sha512-Nq8OhGWiZIZGV6hLHoyAKLLcJihP/xFeBMGJoUrxTX2psI8dCifzLhZISFb+VWS3wFMRDmCGw5R+dOySCqPLhw==}
     engines: {node: '>=6.9.0'}
 
-  '@better-auth/core@1.6.26':
-    resolution: {integrity: sha512-Ud4FqnjIJDvmeo+3bN+OsuVVAiuvFjNERbW7G8/65ictSxCox62gNgTOsJ4YXmbwXzBzyyekStzrupg2qNGEkA==}
+  '@better-auth/core@1.6.27':
+    resolution: {integrity: sha512-A6/mQW4AT2kSHCRZDh9+k8jPUqnCUUCymzBgIroK0l60wLioMtJdcmZiTwrAn6KVUw+4XWw64MgaRn7LOie3wg==}
     peerDependencies:
       '@better-auth/utils': 0.4.2
       '@better-fetch/fetch': 1.3.1
       '@cloudflare/workers-types': '>=4'
       '@opentelemetry/api': ^1.9.0
-      better-call: 1.3.7
+      better-call: 1.4.0
       jose: ^6.1.0
       kysely: ^0.28.5 || ^0.29.0
       nanostores: ^1.0.1
@@ -343,46 +343,46 @@ packages:
       '@opentelemetry/api':
         optional: true
 
-  '@better-auth/drizzle-adapter@1.6.26':
-    resolution: {integrity: sha512-SMvAeeUqEsz0BLtWVVp+HdStAVOwcxs4vPkL/AVmFJ0e9dDKItXl881xWeB/Ze4NgBW6NYmUId9qI4LrdQu3hA==}
+  '@better-auth/drizzle-adapter@1.6.27':
+    resolution: {integrity: sha512-BDJ02ra/fji/ah3aIpxjjNOu/JQVex0UisxS4S0vGZZyiAs+DL24mn3/iovyD5dWB3u3NaGg1n8zpTOntiIXcg==}
     peerDependencies:
-      '@better-auth/core': ^1.6.26
+      '@better-auth/core': ^1.6.27
       '@better-auth/utils': 0.4.2
       drizzle-orm: ^0.45.2
     peerDependenciesMeta:
       drizzle-orm:
         optional: true
 
-  '@better-auth/kysely-adapter@1.6.26':
-    resolution: {integrity: sha512-Y0Kdqn8JQMR8dHMtUnbBNqq7Mk8mDf18DwTves2uhjtRfcOWByVTGxsFMDVUbedMuoM+Ab+v04bwCk94sAo8NA==}
+  '@better-auth/kysely-adapter@1.6.27':
+    resolution: {integrity: sha512-aavv7W4+b3QVObYo166baplWvwocCk8ORDxRqQ9ytzVl/waiUpSXAOtDHdXZHFsoVHFVPtEzyEq0Tqr3Qvvfig==}
     peerDependencies:
-      '@better-auth/core': ^1.6.26
+      '@better-auth/core': ^1.6.27
       '@better-auth/utils': 0.4.2
       kysely: ^0.28.17 || ^0.29.0
     peerDependenciesMeta:
       kysely:
         optional: true
 
-  '@better-auth/memory-adapter@1.6.26':
-    resolution: {integrity: sha512-kb5ahphEp9jyMleXU4T8I/xgWPa8gjOLFKKsnaVqR/BU+h7xqTOsjJwTY3evY+PFYHvjNFUlrjZ1Km8A/w1p/w==}
+  '@better-auth/memory-adapter@1.6.27':
+    resolution: {integrity: sha512-p4NB37MdaVFkxkpLEAKjORgTPhaOAPu1M2zgQXiTJJ3F6Uq3Y1YcCgoz+VxJu0TQfxibCsJD/dZlJMVgf+CF7A==}
     peerDependencies:
-      '@better-auth/core': ^1.6.26
+      '@better-auth/core': ^1.6.27
       '@better-auth/utils': 0.4.2
 
-  '@better-auth/mongo-adapter@1.6.26':
-    resolution: {integrity: sha512-jYGhuIQqj48h69ROLPYdc8jgqDaMmRRLLFiRViZFYarNyBuYUV07DywJXvRuw8l9ADx+M1TB+BJZGnLE2nnmwQ==}
+  '@better-auth/mongo-adapter@1.6.27':
+    resolution: {integrity: sha512-IOYbJMIjEC//f+JpFlmIQjh6x1R/rGAfdzlojFk6HeAJqbsELuMcI+27dIoesbfHLF/icTrSpZtK986XhJrCfA==}
     peerDependencies:
-      '@better-auth/core': ^1.6.26
+      '@better-auth/core': ^1.6.27
       '@better-auth/utils': 0.4.2
       mongodb: ^6.0.0 || ^7.0.0
     peerDependenciesMeta:
       mongodb:
         optional: true
 
-  '@better-auth/prisma-adapter@1.6.26':
-    resolution: {integrity: sha512-ILQoYmnoYyghDP4iN1h/Gkd9Jt7Xs/vxoNAt4AuuJJbqs73u27LlQM4P1YiP7nJ+bM1iVTBI1dDF73myIAtjzQ==}
+  '@better-auth/prisma-adapter@1.6.27':
+    resolution: {integrity: sha512-v7DXVyaFbkrfLoiFDtcVF7BkEZgFa/DgEGE7XjrAXmMACa5pjDvb7lm8W5X+/qgIbQP04eThhgFQ6EWOsjr8OQ==}
     peerDependencies:
-      '@better-auth/core': ^1.6.26
+      '@better-auth/core': ^1.6.27
       '@better-auth/utils': 0.4.2
       '@prisma/client': ^5.0.0 || ^6.0.0 || ^7.0.0
       prisma: ^5.0.0 || ^6.0.0 || ^7.0.0
@@ -392,15 +392,18 @@ packages:
       prisma:
         optional: true
 
-  '@better-auth/telemetry@1.6.26':
-    resolution: {integrity: sha512-pBs69RORUSJHRF9r5PdeY7pzLRga09YSWew8igFYrBvT2tLt7DktrbD5WjryLZpAZOuKAMZ+Xo0DlJbnvLWGpQ==}
+  '@better-auth/telemetry@1.6.27':
+    resolution: {integrity: sha512-aYrSiVWQfua8w5YX8X1cM6ca48EdS0t5k+CvYXIsruaNIpR1DXMe1DOD0M5FWAVABnlCf9joyHXbFRSIZSNY/A==}
     peerDependencies:
-      '@better-auth/core': ^1.6.26
+      '@better-auth/core': ^1.6.27
       '@better-auth/utils': 0.4.2
       '@better-fetch/fetch': 1.3.1
 
   '@better-auth/utils@0.4.2':
     resolution: {integrity: sha512-AUxrvu+HaaODsUyzDxFgwd/8RZ1yZaYo42LXKSrU2oGgR38pS1ij8nqQKNgtTWoYGpNevNXtCfgTy6loHveW9A==}
+
+  '@better-auth/utils@0.5.0':
+    resolution: {integrity: sha512-BL8W4EfIZFwlu0r54m3v1ztjDhu6dDe/amLTm0xybmbZaNgYUqhD3SjpAsnq0q8YD6/ki4iwIgxJNLP/N3TxiA==}
 
   '@better-fetch/fetch@1.3.1':
     resolution: {integrity: sha512-ABkD1WhyfPZprKRQI3bhATjeiFuNWC9PXhfGWqL+sg/gKrM977oFrYkdb4msM3hgUGonr7KlOsOFT5TU2rht9g==}
@@ -2057,8 +2060,8 @@ packages:
     peerDependencies:
       react: ^18 || ^19
 
-  '@tanstack/react-router@1.170.25':
-    resolution: {integrity: sha512-XiWYvkLAGhcZHhV2xUvicpF/VfTVSnewP6CqviDONAjmD50tBob5x/93u2W8QZAc/JgkPd+jijCmu6t4NCzmew==}
+  '@tanstack/react-router@1.170.27':
+    resolution: {integrity: sha512-Hxl49xzd8ffWd2ZMigqfXZmpySpixWGvjq5zfh2nK2DbzzDH6IGVh+iUuwarK9MJNcnhWPZ85tOoy6o/OmNlww==}
     engines: {node: '>=20.19'}
     peerDependencies:
       react: '>=18.0.0 || >=19.0.0'
@@ -2088,8 +2091,8 @@ packages:
       react: ^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
       react-dom: ^16.8.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
 
-  '@tanstack/router-core@1.171.21':
-    resolution: {integrity: sha512-t6xUHBO94nQDrPHPh6ag5UuKHWIkVjq9s63q2ctbxgzq3vtSoGKmAIdLD5o+NU6JUS1ppXRHgL0YGzEHvH32Ng==}
+  '@tanstack/router-core@1.171.22':
+    resolution: {integrity: sha512-sitsuRkz4qpTjIAV97S5zFCoeGv0OFd6+VWg3ZcIlQbi5R4NIXfz6ogg51n5w6rvTwSODz/lKWb5dl5tvh2bQw==}
     engines: {node: '>=20.19'}
 
   '@tanstack/store@0.11.1':
@@ -2127,8 +2130,8 @@ packages:
       '@types/react-dom':
         optional: true
 
-  '@testing-library/user-event@14.6.3':
-    resolution: {integrity: sha512-6dBq67jT8lE+JTE8Exm02Kt6ze43hz1jdiSpSJwtTZiT1xQQ6b7nZYTTQ9njdArdU8XklOwaDp/AbT/eYSKF4g==}
+  '@testing-library/user-event@14.6.4':
+    resolution: {integrity: sha512-QCGwP6QrjypBLwyj5cuyfVamkaIEy/XGY+1VDehbtbQqOggYmTFpFOdWR5mPz14vX8vXLMVjDHlRNBcClyO9ew==}
     engines: {node: '>=12', npm: '>=6'}
     peerDependencies:
       '@testing-library/dom': '>=7.21.4'
@@ -2565,8 +2568,8 @@ packages:
   bail@2.0.2:
     resolution: {integrity: sha512-0xO6mYd7JB2YesxDKplafRpsiOzPt9V02ddPCLbY1xYGPOX24NTyN50qnUxgCPcSoYMhKpAuBTjQoRZCAkUDRw==}
 
-  better-auth@1.6.26:
-    resolution: {integrity: sha512-nhXWrDDj+EnZsHq1j0z1c6DowOMFZWZHe6LCaXbBfLIgHHZm6dyazBQcbRspM4spUIcUt250Mc1BFOSuP7eniQ==}
+  better-auth@1.6.27:
+    resolution: {integrity: sha512-x3jyxpAiBSsMO/DaXMFSVwM8bTqnYZlCKsZxBV43zL3ZtsGa/CzeUuNKxPT2Lsz7ahTBY90Ku1tibN6nRpVEbw==}
     peerDependencies:
       '@lynx-js/react': '*'
       '@prisma/client': ^5.0.0 || ^6.0.0 || ^7.0.0
@@ -2627,8 +2630,8 @@ packages:
       vue:
         optional: true
 
-  better-call@1.3.7:
-    resolution: {integrity: sha512-Al51/hjp2SSp6CRTa3F2ptcx4yQVS1xWKoY6jcVXqNYOap6mHFP2jUBn5EwIL4iIed1/Sq4hlQ+Umm6EflZG+w==}
+  better-call@1.4.0:
+    resolution: {integrity: sha512-bBKOT4vv1kZLDgxVePdilk/Jwkn+dtRRsmi3DzHcDP+WnswyVl6dR59l2HEeP/0cB+bDoopASAesWDPIdd/zZA==}
     peerDependencies:
       zod: ^4.0.0
     peerDependenciesMeta:
@@ -3111,8 +3114,8 @@ packages:
     resolution: {integrity: sha512-AC/7JofJvZGrrneWNaEnJeOLUx+JlGt7tNa0wZiRPT4MY1wmfKjt2+6O2p2uz2+skll8OZZmJMNqeke7kKbNgQ==}
     hasBin: true
 
-  jose@6.2.8:
-    resolution: {integrity: sha512-Bsdjwm3Qsd/P0jR+BHDe3LytDfY7WBq2HmCCLIwuVRHMuEC9ae7/R474GIUdF1NgCyZjzVo/A9DOiOBtXq8ZoQ==}
+  jose@6.2.9:
+    resolution: {integrity: sha512-XrchZOFZUl/T3vTwRe8XK+cJrGtMF4th1ARnDfwbBXFKThGhlsxEE4Zu03AD/bjJSt/9jT/mxrOCkJWOg77aPA==}
 
   js-tokens@4.0.0:
     resolution: {integrity: sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==}
@@ -3136,8 +3139,8 @@ packages:
   khroma@2.1.0:
     resolution: {integrity: sha512-Ls993zuzfayK269Svk9hzpeGUKob/sIgZzyHYdjQoAdQetRKpOLj+k/QQQ/6Qi0Yz65mlROrfd+Ev+1+7dz9Kw==}
 
-  kysely@0.29.4:
-    resolution: {integrity: sha512-y5mVgQNkMbs1eK9Xyc0pmNdabN2wHhRYY/5r4W5HrUT1rYCEPeVNSj1RUJeSDKT3U0p+mXCvLgkrFuIafYI6BA==}
+  kysely@0.29.5:
+    resolution: {integrity: sha512-ooa+eSbBNPTo3MycPEuW5jdrxQdQwdtB3LC3h43FiXQbIry5tR0C5lDG7eealK0E4D7XjrnOP5DIUg/LyjRMYQ==}
     engines: {node: '>=22.0.0'}
 
   layout-base@1.0.2:
@@ -3753,8 +3756,8 @@ packages:
   rope-sequence@1.3.4:
     resolution: {integrity: sha512-UT5EDe2cu2E/6O4igUr5PSFs23nvvukicWHx6GnOPlHAiiYbzNuCRQCuiUdHJQcqKalLKlrYJnjY0ySGsXNQXQ==}
 
-  rou3@0.7.12:
-    resolution: {integrity: sha512-iFE4hLDuloSWcD7mjdCDhx2bKcIsYbtOTpfH5MHHLSKMOUyjqQXTeZVa289uuwEGEKFoE/BAPbhaU4B774nceg==}
+  rou3@0.9.2:
+    resolution: {integrity: sha512-3SOzvaAg8rkHrXtRjpCvCvbyO5to9oOO27Z/XqHEYXfMRVSw/qMIVdmaOk9W2lcRLtR6dlqTjo9hDeJk70QBYQ==}
 
   roughjs@4.6.6:
     resolution: {integrity: sha512-ZUz/69+SYpFN/g/lUlo2FXcIjRkSu3nDarreVdGGndHEBJ6cXPdKguS8JGxwj5HA5xIbVKSmLgr5b3AWxtRfvQ==}
@@ -4015,11 +4018,11 @@ packages:
   vega-canvas@2.0.0:
     resolution: {integrity: sha512-9x+4TTw/USYST5nx4yN272sy9WcqSRjAR0tkQYZJ4cQIeon7uVsnohvoPQK1JZu7K1QXGUqzj08z0u/UegBVMA==}
 
-  vega-crossfilter@5.1.2:
-    resolution: {integrity: sha512-K14PtfBxQzb7UJq5rL1IuwDdPov6lucoHVzRaraGiBBnfc963jkWHQNfRFAuEj/nIt5BIixXBiqIrGKgfScjSA==}
+  vega-crossfilter@5.1.3:
+    resolution: {integrity: sha512-goGulwrrbmv9mY4Za8HQiiFk7WV1OTyrSVZzrMR0Keeiyzh9cnkxRGF1W2fAhMNA3HSaRaBoxWHGr7H9fvovuQ==}
 
-  vega-dataflow@6.1.2:
-    resolution: {integrity: sha512-0/HBBlzPERh0wV5kUOh/N4aAAmb3rB18Kfpej+nWvDIjPk3dixTapNkVVkoA9CsB5dY5bY+HNqiM/Pp4XPduGQ==}
+  vega-dataflow@6.1.3:
+    resolution: {integrity: sha512-ac51FLdYT8XAcDaHt3bQtVAR3UFdKfPMQBhjvBMXp69mdeq2ERfM1u9CUyDQAVZJylkIbWEwDnsp72tIwenPUA==}
 
   vega-embed@7.1.0:
     resolution: {integrity: sha512-ZmEIn5XJrQt7fSh2lwtSdXG/9uf3yIqZnvXFEwBJRppiBgrEWZcZbj6VK3xn8sNTFQ+sQDXW5sl/6kmbAW3s5A==}
@@ -4027,8 +4030,8 @@ packages:
       vega: '*'
       vega-lite: '*'
 
-  vega-encode@5.2.1:
-    resolution: {integrity: sha512-YuvJ66z6FQRtu0n0IYxsJp7BpliXVgaxNsur0Fqic10/a5TLMQmDYURPUcrtWViAMpqKgdNMyxnmr0ZQ4bjwCA==}
+  vega-encode@5.2.2:
+    resolution: {integrity: sha512-YmriG349VjJsIxXE1gkxHj6fPF87T2t/fYmAUUlGzTGarSy3KF93t8Fqc6EPupsgnCDEhe3+0NsSWTVxiOJ1Ow==}
 
   vega-event-selector@4.0.0:
     resolution: {integrity: sha512-CcWF4m4KL/al1Oa5qSzZ5R776q8lRxCj3IafCHs5xipoEHrkgu1BWa7F/IH5HrDNXeIDnqOpSV1pFsAWRak4gQ==}
@@ -4036,29 +4039,32 @@ packages:
   vega-expression@6.1.0:
     resolution: {integrity: sha512-hHgNx/fQ1Vn1u6vHSamH7lRMsOa/yQeHGGcWVmh8fZafLdwdhCM91kZD9p7+AleNpgwiwzfGogtpATFaMmDFYg==}
 
-  vega-expression@6.2.1:
-    resolution: {integrity: sha512-AK4EYh9ErCC7KU8vGigsetwG66S1wLLfPFnfjkOdydRaN4kNJp129qp4jos0wA/r7F/lIlhM3uIzw+KSA2cZEg==}
+  vega-expression@6.2.2:
+    resolution: {integrity: sha512-9yTpQBYDnl4yC27iGbUxDUnRAeO+la/lfzA5WSALB0INvA2A2NVxIorBakfqIkO7nwKM9bT3rmNRfj8Z3hjb7g==}
 
-  vega-force@5.1.2:
-    resolution: {integrity: sha512-693paaBvACvAtUO8vp4m/KUJ0F3tKaoXixzw+ExpP4qKkqJ/Me2MGWsVrEJh/f6KuU9bp7xv+g7OPNhqnVrpoQ==}
+  vega-force@5.1.3:
+    resolution: {integrity: sha512-njBlnPeeMY0uz1Fbdqa5jnOsSUrUo2s3z/Eb4qo486hhrwNtNpmeCsN+4PBasoblf/4pOpbvKULzolZmG+R7QA==}
 
-  vega-format@2.1.2:
-    resolution: {integrity: sha512-cJ2oqGEGYJ2NbkIIUDic03ZZX1meE+sq330gq4HFf3CvzSupTwHLWQj3/H5zug5DrqEQhLCLkiRwvmMe4pEqfg==}
+  vega-format@2.1.3:
+    resolution: {integrity: sha512-VK0yh3BtK5MUoG7aAXuwb678r2wDdykAUFIKHd9MWvXNo857UqNzZfYixfyXi8xXBK2AV38R4IiQmNKUrXBMUA==}
 
   vega-functions@6.1.3:
     resolution: {integrity: sha512-WOgWVxGg1T1tuICyylIppxXWXWEtl7P81Xnj0vQtoIn11VvQ0mrsBZr1aia4g8Sw0fEH1mUO7Dtj7v3o8BgBmQ==}
 
-  vega-geo@5.1.2:
-    resolution: {integrity: sha512-tls2+IVuKaIOxEqdshuSk2Til8qcF7SUNaWkATKu5hwWqQEY3cp7tfdXosuTMaDTkLp+Nw84iWfe5BzfoxDYMA==}
+  vega-functions@6.2.0:
+    resolution: {integrity: sha512-MRFL7RjVmsv6iYuRZVvrDPZbySLa5Dzd5hC+0LTubysy8OrPengKZEHeRnibvHH6odg3IsKUV44Wv8dN3XzYAw==}
 
-  vega-hierarchy@5.1.2:
-    resolution: {integrity: sha512-7a72/lA6j50HU6PQe5ChbomftHi29V1oCcibaQpDozZncHuAnsQummqfiPyTMPpNMrSRtyZy18do0IEoOvrbMg==}
+  vega-geo@5.1.3:
+    resolution: {integrity: sha512-UfTVPV+O+7elFyUsw8FLjiDOJkF0VZanC5tHLaSSue5h+xLzG6SDKQ7xEBIQSaTBE8nLSBtHm45Qve0SFjILVQ==}
+
+  vega-hierarchy@5.1.3:
+    resolution: {integrity: sha512-bDWDNGuUA4WcOD5CMh9Mahs3CwKxSU3W1XAnDGCpAwfJVoWp7vlVMt1paoTczPFTXtXGxIa3vJu94xWGmI3/og==}
 
   vega-interpreter@2.3.1:
     resolution: {integrity: sha512-IYleUp+lXVIGjJUQg+5WJ/xUdteMxEGEnSyWtRhagVuUDiXD0JnERKWffIrQSCUypA86UOuyjzVDtb7oNOsaxw==}
 
-  vega-label@2.1.2:
-    resolution: {integrity: sha512-MFsOKOCG6a5QwP5atoFFi+R58IP/Q7//65UvgrSeankX2QrDcWjBtzIqS6JlYBOAdyjoiAAghx7pnIAj5nAO6A==}
+  vega-label@2.1.3:
+    resolution: {integrity: sha512-UcaGgrVr2Gb0sUj4j3L5tZuL6GOn7tyauYsfXsS0hURoIbHCfQI4SnRq89vl5ub5DL1SEWaJTKag4GdAm1hcGw==}
 
   vega-lite@6.4.3:
     resolution: {integrity: sha512-d/7hPjfz560UERaQuTmGgIVfXAe3g2hJWeC+igDeaGohUdEoNrHLXgR/yTOBT8vV/lIuuKnw+0/xWWblkDwkMQ==}
@@ -4067,32 +4073,35 @@ packages:
     peerDependencies:
       vega: ^6.0.0
 
-  vega-loader@5.1.2:
-    resolution: {integrity: sha512-O29bKHsSJBi391H88OZXH8vgUdopWMorC5ZJ/8XjTq8TIXVdeUrNnI8dMkUyv7yQg3ywMTji+5fHhov1TOkkyA==}
+  vega-loader@5.1.3:
+    resolution: {integrity: sha512-gJGoI262B5EEUGRFRY2mH+SJbVc+b4MTQfASNYpyIBqGxHqmjvNQqTyB+7bjReRYJjExjXL/MnKJmJHL6dAOwA==}
 
-  vega-parser@7.1.2:
-    resolution: {integrity: sha512-88HNkVrEwWbMmbbhPCmFHPrl/ClTcvThRv2UMZqMJJ5IqgjWLUolCA1fhAvnAbvRPe+Z1j+GbV/WWjYWAjEuyw==}
+  vega-parser@7.1.3:
+    resolution: {integrity: sha512-bT0pmzPF79ECFilKotgo92OUi25MGGgrEj9M0piiIpJZXQwcF2xsCf+5YRND1R0zd4zodNpqpJtIw0sl6TaqMg==}
 
-  vega-projection@2.1.2:
-    resolution: {integrity: sha512-HL+FS9AgYSOa1UOIJfhOD39RMT4tDODkMcN6MCRsdlRNnukVm1+JhrixDnciBjqiZLxDhUjESJwgLQtXx8cUyw==}
+  vega-projection@2.1.3:
+    resolution: {integrity: sha512-IYGBnT+8a3ZH2bOM48c2qSZAnuPyyYTua/kMeXjwxFKI1/BjzlchQ9QCKxGeBqJGdG2pp9YMW2oS/F1dw/IQXw==}
 
-  vega-regression@2.1.2:
-    resolution: {integrity: sha512-2dyb2sT6cxdTK5K87uNDYpW7LbTP90lplxW62imjfLAwKUq1wL74X8y03a0W5tpRfV8+f3ai+cYTv+HXB3XmDQ==}
+  vega-regression@2.1.3:
+    resolution: {integrity: sha512-qssCjc6KEV8pUQEEliZSTRv4cuhl5D2MgyfbKnIYbJM7B/lW/vubCPBr8oGzxVEGJd3D5kxEtXJORPipawdVEA==}
 
-  vega-runtime@7.1.2:
-    resolution: {integrity: sha512-MMfm7FeWLX2XqaY26i99GrlToexO/EWYqT7MRqEkpw+0nYgKh4zpQ47j04LB3ishnSZAj2AL0HNl9uPZLxgFhg==}
+  vega-runtime@7.1.3:
+    resolution: {integrity: sha512-27id9NGfnGh0u/NpQMagAmS5wDa7ELKDv1SYysiJp05HOYPuLD9XT3NSblPjZhDhyk1eApzWJAoegUoosJJtkA==}
 
-  vega-scale@8.1.2:
-    resolution: {integrity: sha512-ADCGgdSmhcZyHxtHbrVcDrG76er2s2eXowO3qDg0vx2eclHdXL4YNaEjTHrosNG/1TAI5LAe7aQ2BGssJFfAXA==}
+  vega-scale@8.1.3:
+    resolution: {integrity: sha512-6Tx/1XMz2EtjOZm2zEONqJfYGfUWwSauhEyMCH5XWpnqoGjHQfDzDCFtBUFDs/6N+nNi3ldxCshraMiC4XCXLg==}
 
   vega-scenegraph@5.2.1:
     resolution: {integrity: sha512-tWolI3s/cjU5g8evEjpxJqgqKQ2IJv1FoPXqvNuviLNdylP1I/h5iF5RY08Cz4jkuP9zircSskFEBsHylD1dgQ==}
 
+  vega-scenegraph@5.3.0:
+    resolution: {integrity: sha512-sJbrDxGhyw8KFgC8NIEPBsZBZaOHAO4YtFcjw71bqIwVy6kIHlzc5I+buvJkEcBKkSTbsIdKRT1jUOHPDbBEKw==}
+
   vega-schema-url-parser@3.0.2:
     resolution: {integrity: sha512-xAnR7KAvNPYewI3O0l5QGdT8Tv0+GCZQjqfP39cW/hbe/b3aYMAQ39vm8O2wfXUHzm04xTe7nolcsx8WQNVLRQ==}
 
-  vega-selections@6.1.4:
-    resolution: {integrity: sha512-qR5feBL8xq5BjoG3rf7e2WKle/cn5Fa9pBFMBnzoOYp4nTA0GYDoKuOjZkftibsQcmdST0HzPjSrS14jH3TCQw==}
+  vega-selections@6.1.5:
+    resolution: {integrity: sha512-evYoCV1wuE0kuiDrKH2dVVweMUuz0pNN7rYTYKBSNDqa7TBjDU4+tbWFm/CgowoaAqjC6Omd+jEZz9lwpgeE3w==}
 
   vega-statistics@2.0.0:
     resolution: {integrity: sha512-dGPfDXnBlgXbZF3oxtkb8JfeRXd5TYHx25Z/tIoaa9jWua4Vf/AoW2wwh8J1qmMy8J03/29aowkp1yk4DOPazQ==}
@@ -4106,11 +4115,14 @@ packages:
   vega-time@3.2.1:
     resolution: {integrity: sha512-SXo1klLYPsmBdSj9itYSuFMmCpwnnIvQS8jWFxsCTnyWcPaBQKz0kf2M7DqTysi34KTk+6ws4kqZg11XMWnIYA==}
 
+  vega-time@3.3.0:
+    resolution: {integrity: sha512-bm9uMPrGIPQ52jD3Ltr6gUspogDtO0G8pEzLKvLySX84reeShHTH6jOd9YXwISNfuS4LT+cmPr9Ct6TMgvPMOA==}
+
   vega-tooltip@1.0.0:
     resolution: {integrity: sha512-P1R0JP29v0qnTuwzCQ0SPJlkjAzr6qeyj+H4VgUFSykHmHc1OBxda//XBaFDl/bZgIscEMvjKSjZpXd84x3aZQ==}
 
-  vega-transforms@5.2.1:
-    resolution: {integrity: sha512-csKiYXJFa0YY5lubP1wc8b99SJ8nHLG/sOWvKFpW3CfDfjp8LoB0exrxgtIoClCsngAguKiuZVDwQZxBhPJZwA==}
+  vega-transforms@5.2.2:
+    resolution: {integrity: sha512-0vlu/36sBbHKw4dN/7BKCUPOzXc2oYObRxGMcROFLk+BwfjE/cqtfuXbLHzOinXtfLOhblmT0Agx+BSYXN8k/Q==}
 
   vega-typings@2.2.0:
     resolution: {integrity: sha512-pX7LsqgMpzMPOyydg/drYbIjh+mmvLfKtuKr75OpCu/ZYKJ2i8UjSmNlpARYeYGLaXfuNUAM3hMN8NPZPDYiBQ==}
@@ -4118,17 +4130,20 @@ packages:
   vega-util@2.1.2:
     resolution: {integrity: sha512-Mdvv33BUlx4no5gz2VHdue4bJ6ejWmInuieID3JGnAXwewHKrPWE/Xr2vVWA+xS9Om1eHvj/0wVsiBGJ61v2uQ==}
 
-  vega-view-transforms@5.2.1:
-    resolution: {integrity: sha512-TiguoCJ6BB7TEV+s3nNMoCoH4+q5A6XQsDMEzbVuRaSWmfIJxvWUlbZQqn4CUt65VMDr63Fy21Xpb0ntlaU5LQ==}
+  vega-util@2.1.3:
+    resolution: {integrity: sha512-Znj01Gj5XVUw/U7QvwjMhl+XCGs09UF5KDyMXZz9NtjhoKP04anWjcbA7hqoVH+eEigO92KlTi+Yai6Roo1n0A==}
+
+  vega-view-transforms@5.2.2:
+    resolution: {integrity: sha512-Zsfqy0AzCStVSEoS2lf416heWQp0lQpg9LxJhqLJVZLpTh9UzcTdxP5hMwN1StrB2gWCk7TEfBgJC9FBBzxiZA==}
 
   vega-view@6.1.2:
     resolution: {integrity: sha512-BG/Kqd1csdK4uKdJ4hv72msgQX3Ry5SzCV1ngbytkn6QwuQPpFWzya/f0OSWyMQP9S79avdHXqdLCxjSeiDQRw==}
 
-  vega-voronoi@5.1.2:
-    resolution: {integrity: sha512-8BgKb6aF/42L/PrFi3Idqag7FtbzNqDVhvPD4SfswSzGYlRDcxcn1eQQsa//q72qIZk4i5rsHeAiH2QbIjPSBg==}
+  vega-voronoi@5.1.3:
+    resolution: {integrity: sha512-1EYf2KFE/otZmjyQSw2xisnT6QDXouyofHBI9o9C1zOfNM284+wmJ0qbvL46wX9jEauH+RKG5qnx0eDWQHVjYw==}
 
-  vega-wordcloud@5.1.2:
-    resolution: {integrity: sha512-ZSw6fupf4qx4hBzL9q/oVUKPVbVePjJ/FSgfxxgRcKvE1VoYq3HWfx9qg+CQMvgDS+oGDsn2WoQJuNLYx9T3AQ==}
+  vega-wordcloud@5.1.3:
+    resolution: {integrity: sha512-DxghqU1U9VPSKWmvatyQiDNShz1XfKv/XnIGlRWYdfTMnZvD3Y46mdrxPBhqFMF6TQKjZKyeqz5GtukA/RaH5Q==}
 
   vega@6.3.1:
     resolution: {integrity: sha512-mX5tvY3ISCSiPPmunuZyQfccq0XlUvJd2t5oyc6SNS0N0TwnPNoklx0mVod5n+qbzuUoiuxl7Ve/SvoRqH4RzA==}
@@ -4378,9 +4393,9 @@ snapshots:
       - ioredis
       - redis
 
-  '@assistant-ui/react-markdown@0.14.10(@assistant-ui/react@0.15.13(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(use-sync-external-store@1.6.0(react@19.2.8)))(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
+  '@assistant-ui/react-markdown@0.14.10(@assistant-ui/react@0.15.14(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(use-sync-external-store@1.6.0(react@19.2.8)))(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
     dependencies:
-      '@assistant-ui/react': 0.15.13(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(use-sync-external-store@1.6.0(react@19.2.8))
+      '@assistant-ui/react': 0.15.14(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(use-sync-external-store@1.6.0(react@19.2.8))
       '@radix-ui/react-primitive': 2.1.10(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
       '@radix-ui/react-use-callback-ref': 1.1.4(@types/react@19.2.18)(react@19.2.8)
       classnames: 2.5.1
@@ -4393,7 +4408,7 @@ snapshots:
       - react-dom
       - supports-color
 
-  '@assistant-ui/react@0.15.13(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(use-sync-external-store@1.6.0(react@19.2.8))':
+  '@assistant-ui/react@0.15.14(@types/react-dom@19.2.4(@types/react@19.2.18))(@types/react@19.2.18)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(use-sync-external-store@1.6.0(react@19.2.8))':
     dependencies:
       '@assistant-ui/core': 0.3.13(@assistant-ui/store@0.3.9(@assistant-ui/tap@0.9.12(@types/react@19.2.18)(react@19.2.8))(@types/react@19.2.18)(react@19.2.8))(@assistant-ui/tap@0.9.12(@types/react@19.2.18)(react@19.2.8))(@types/react@19.2.18)(assistant-cloud@0.1.40)(react@19.2.8)(zustand@5.0.14(@types/react@19.2.18)(react@19.2.8)(use-sync-external-store@1.6.0(react@19.2.8)))
       '@assistant-ui/store': 0.3.9(@assistant-ui/tap@0.9.12(@types/react@19.2.18)(react@19.2.8))(@types/react@19.2.18)(react@19.2.8)
@@ -4448,52 +4463,56 @@ snapshots:
 
   '@babel/runtime@7.29.7': {}
 
-  '@better-auth/core@1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2)':
+  '@better-auth/core@1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2)':
     dependencies:
       '@better-auth/utils': 0.4.2
       '@better-fetch/fetch': 1.3.1
       '@opentelemetry/semantic-conventions': 1.43.0
       '@standard-schema/spec': 1.1.0
-      better-call: 1.3.7(zod@4.4.3)
-      jose: 6.2.8
-      kysely: 0.29.4
+      better-call: 1.4.0(zod@4.4.3)
+      jose: 6.2.9
+      kysely: 0.29.5
       nanostores: 1.4.2
       zod: 4.4.3
 
-  '@better-auth/drizzle-adapter@1.6.26(@better-auth/core@1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2))(@better-auth/utils@0.4.2)':
+  '@better-auth/drizzle-adapter@1.6.27(@better-auth/core@1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2))(@better-auth/utils@0.4.2)':
     dependencies:
-      '@better-auth/core': 1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2)
+      '@better-auth/core': 1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2)
       '@better-auth/utils': 0.4.2
 
-  '@better-auth/kysely-adapter@1.6.26(@better-auth/core@1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2))(@better-auth/utils@0.4.2)(kysely@0.29.4)':
+  '@better-auth/kysely-adapter@1.6.27(@better-auth/core@1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2))(@better-auth/utils@0.4.2)(kysely@0.29.5)':
     dependencies:
-      '@better-auth/core': 1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2)
+      '@better-auth/core': 1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2)
       '@better-auth/utils': 0.4.2
     optionalDependencies:
-      kysely: 0.29.4
+      kysely: 0.29.5
 
-  '@better-auth/memory-adapter@1.6.26(@better-auth/core@1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2))(@better-auth/utils@0.4.2)':
+  '@better-auth/memory-adapter@1.6.27(@better-auth/core@1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2))(@better-auth/utils@0.4.2)':
     dependencies:
-      '@better-auth/core': 1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2)
+      '@better-auth/core': 1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2)
       '@better-auth/utils': 0.4.2
 
-  '@better-auth/mongo-adapter@1.6.26(@better-auth/core@1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2))(@better-auth/utils@0.4.2)':
+  '@better-auth/mongo-adapter@1.6.27(@better-auth/core@1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2))(@better-auth/utils@0.4.2)':
     dependencies:
-      '@better-auth/core': 1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2)
+      '@better-auth/core': 1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2)
       '@better-auth/utils': 0.4.2
 
-  '@better-auth/prisma-adapter@1.6.26(@better-auth/core@1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2))(@better-auth/utils@0.4.2)':
+  '@better-auth/prisma-adapter@1.6.27(@better-auth/core@1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2))(@better-auth/utils@0.4.2)':
     dependencies:
-      '@better-auth/core': 1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2)
+      '@better-auth/core': 1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2)
       '@better-auth/utils': 0.4.2
 
-  '@better-auth/telemetry@1.6.26(@better-auth/core@1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2))(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)':
+  '@better-auth/telemetry@1.6.27(@better-auth/core@1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2))(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)':
     dependencies:
-      '@better-auth/core': 1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2)
+      '@better-auth/core': 1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2)
       '@better-auth/utils': 0.4.2
       '@better-fetch/fetch': 1.3.1
 
   '@better-auth/utils@0.4.2':
+    dependencies:
+      '@noble/hashes': 2.3.0
+
+  '@better-auth/utils@0.5.0':
     dependencies:
       '@noble/hashes': 2.3.0
 
@@ -5886,11 +5905,11 @@ snapshots:
       '@tanstack/query-core': 5.101.4
       react: 19.2.8
 
-  '@tanstack/react-router@1.170.25(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
+  '@tanstack/react-router@1.170.27(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
     dependencies:
       '@tanstack/history': 1.162.1
       '@tanstack/react-store': 0.9.3(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
-      '@tanstack/router-core': 1.171.21
+      '@tanstack/router-core': 1.171.22
       isbot: 5.2.1
       react: 19.2.8
       react-dom: 19.2.8(react@19.2.8)
@@ -5923,7 +5942,7 @@ snapshots:
       react: 19.2.8
       react-dom: 19.2.8(react@19.2.8)
 
-  '@tanstack/router-core@1.171.21':
+  '@tanstack/router-core@1.171.22':
     dependencies:
       '@tanstack/history': 1.162.1
       cookie-es: 3.1.1
@@ -5963,7 +5982,7 @@ snapshots:
       '@types/react': 19.2.18
       '@types/react-dom': 19.2.4(@types/react@19.2.18)
 
-  '@testing-library/user-event@14.6.3(@testing-library/dom@10.4.1)':
+  '@testing-library/user-event@14.6.4(@testing-library/dom@10.4.1)':
     dependencies:
       '@testing-library/dom': 10.4.1
 
@@ -6377,23 +6396,23 @@ snapshots:
 
   bail@2.0.2: {}
 
-  better-auth@1.6.26(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(vitest@4.1.10(@types/node@26.2.0)(jsdom@30.0.1(@noble/hashes@2.3.0))(vite@8.2.1(@types/node@26.2.0)(jiti@2.7.0)(yaml@2.9.0))):
+  better-auth@1.6.27(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(vitest@4.1.10(@types/node@26.2.0)(jsdom@30.0.1(@noble/hashes@2.3.0))(vite@8.2.1(@types/node@26.2.0)(jiti@2.7.0)(yaml@2.9.0))):
     dependencies:
-      '@better-auth/core': 1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2)
-      '@better-auth/drizzle-adapter': 1.6.26(@better-auth/core@1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2))(@better-auth/utils@0.4.2)
-      '@better-auth/kysely-adapter': 1.6.26(@better-auth/core@1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2))(@better-auth/utils@0.4.2)(kysely@0.29.4)
-      '@better-auth/memory-adapter': 1.6.26(@better-auth/core@1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2))(@better-auth/utils@0.4.2)
-      '@better-auth/mongo-adapter': 1.6.26(@better-auth/core@1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2))(@better-auth/utils@0.4.2)
-      '@better-auth/prisma-adapter': 1.6.26(@better-auth/core@1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2))(@better-auth/utils@0.4.2)
-      '@better-auth/telemetry': 1.6.26(@better-auth/core@1.6.26(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.3.7(zod@4.4.3))(jose@6.2.8)(kysely@0.29.4)(nanostores@1.4.2))(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)
+      '@better-auth/core': 1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2)
+      '@better-auth/drizzle-adapter': 1.6.27(@better-auth/core@1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2))(@better-auth/utils@0.4.2)
+      '@better-auth/kysely-adapter': 1.6.27(@better-auth/core@1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2))(@better-auth/utils@0.4.2)(kysely@0.29.5)
+      '@better-auth/memory-adapter': 1.6.27(@better-auth/core@1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2))(@better-auth/utils@0.4.2)
+      '@better-auth/mongo-adapter': 1.6.27(@better-auth/core@1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2))(@better-auth/utils@0.4.2)
+      '@better-auth/prisma-adapter': 1.6.27(@better-auth/core@1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2))(@better-auth/utils@0.4.2)
+      '@better-auth/telemetry': 1.6.27(@better-auth/core@1.6.27(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)(better-call@1.4.0(zod@4.4.3))(jose@6.2.9)(kysely@0.29.5)(nanostores@1.4.2))(@better-auth/utils@0.4.2)(@better-fetch/fetch@1.3.1)
       '@better-auth/utils': 0.4.2
       '@better-fetch/fetch': 1.3.1
       '@noble/ciphers': 2.3.0
       '@noble/hashes': 2.3.0
-      better-call: 1.3.7(zod@4.4.3)
+      better-call: 1.4.0(zod@4.4.3)
       defu: 6.1.7
-      jose: 6.2.8
-      kysely: 0.29.4
+      jose: 6.2.9
+      kysely: 0.29.5
       nanostores: 1.4.2
       zod: 4.4.3
     optionalDependencies:
@@ -6404,11 +6423,11 @@ snapshots:
       - '@cloudflare/workers-types'
       - '@opentelemetry/api'
 
-  better-call@1.3.7(zod@4.4.3):
+  better-call@1.4.0(zod@4.4.3):
     dependencies:
-      '@better-auth/utils': 0.4.2
+      '@better-auth/utils': 0.5.0
       '@better-fetch/fetch': 1.3.1
-      rou3: 0.7.12
+      rou3: 0.9.2
       set-cookie-parser: 3.1.2
     optionalDependencies:
       zod: 4.4.3
@@ -6865,7 +6884,7 @@ snapshots:
 
   jiti@2.7.0: {}
 
-  jose@6.2.8: {}
+  jose@6.2.9: {}
 
   js-tokens@4.0.0: {}
 
@@ -6903,7 +6922,7 @@ snapshots:
 
   khroma@2.1.0: {}
 
-  kysely@0.29.4: {}
+  kysely@0.29.5: {}
 
   layout-base@1.0.2: {}
 
@@ -7827,7 +7846,7 @@ snapshots:
 
   rope-sequence@1.3.4: {}
 
-  rou3@0.7.12: {}
+  rou3@0.9.2: {}
 
   roughjs@4.6.6:
     dependencies:
@@ -8072,17 +8091,17 @@ snapshots:
 
   vega-canvas@2.0.0: {}
 
-  vega-crossfilter@5.1.2:
+  vega-crossfilter@5.1.3:
     dependencies:
       d3-array: 3.2.4
-      vega-dataflow: 6.1.2
-      vega-util: 2.1.2
+      vega-dataflow: 6.1.3
+      vega-util: 2.1.3
 
-  vega-dataflow@6.1.2:
+  vega-dataflow@6.1.3:
     dependencies:
-      vega-format: 2.1.2
-      vega-loader: 5.1.2
-      vega-util: 2.1.2
+      vega-format: 2.1.3
+      vega-loader: 5.1.3
+      vega-util: 2.1.3
 
   vega-embed@7.1.0(vega-lite@6.4.3(vega@6.3.1))(vega@6.3.1):
     dependencies:
@@ -8097,81 +8116,96 @@ snapshots:
       vega-themes: 3.0.0(vega-lite@6.4.3(vega@6.3.1))(vega@6.3.1)
       vega-tooltip: 1.0.0
 
-  vega-encode@5.2.1:
+  vega-encode@5.2.2:
     dependencies:
       d3-array: 3.2.4
       d3-interpolate: 3.0.1
-      vega-dataflow: 6.1.2
-      vega-scale: 8.1.2
-      vega-util: 2.1.2
+      vega-dataflow: 6.1.3
+      vega-scale: 8.1.3
+      vega-util: 2.1.3
 
   vega-event-selector@4.0.0: {}
 
   vega-expression@6.1.0:
     dependencies:
       '@types/estree': 1.0.9
-      vega-util: 2.1.2
+      vega-util: 2.1.3
 
-  vega-expression@6.2.1:
+  vega-expression@6.2.2:
     dependencies:
       '@types/estree': 1.0.9
-      vega-util: 2.1.2
+      vega-util: 2.1.3
 
-  vega-force@5.1.2:
+  vega-force@5.1.3:
     dependencies:
       d3-force: 3.0.0
-      vega-dataflow: 6.1.2
-      vega-util: 2.1.2
+      vega-dataflow: 6.1.3
+      vega-util: 2.1.3
 
-  vega-format@2.1.2:
+  vega-format@2.1.3:
     dependencies:
       d3-array: 3.2.4
       d3-format: 3.1.2
       d3-time-format: 4.1.0
-      vega-time: 3.2.1
-      vega-util: 2.1.2
+      vega-time: 3.3.0
+      vega-util: 2.1.3
 
   vega-functions@6.1.3:
     dependencies:
       d3-array: 3.2.4
       d3-color: 3.1.0
       d3-geo: 3.1.1
-      vega-dataflow: 6.1.2
-      vega-expression: 6.2.1
-      vega-scale: 8.1.2
-      vega-scenegraph: 5.2.1
-      vega-selections: 6.1.4
+      vega-dataflow: 6.1.3
+      vega-expression: 6.2.2
+      vega-scale: 8.1.3
+      vega-scenegraph: 5.3.0
+      vega-selections: 6.1.5
       vega-statistics: 2.0.0
-      vega-time: 3.2.1
-      vega-util: 2.1.2
+      vega-time: 3.3.0
+      vega-util: 2.1.3
 
-  vega-geo@5.1.2:
+  vega-functions@6.2.0:
+    dependencies:
+      d3-array: 3.2.4
+      d3-color: 3.1.0
+      d3-ease: 3.0.1
+      d3-geo: 3.1.1
+      vega-dataflow: 6.1.3
+      vega-expression: 6.2.2
+      vega-scale: 8.1.3
+      vega-scenegraph: 5.3.0
+      vega-selections: 6.1.5
+      vega-statistics: 2.0.0
+      vega-time: 3.3.0
+      vega-util: 2.1.3
+
+  vega-geo@5.1.3:
     dependencies:
       d3-array: 3.2.4
       d3-color: 3.1.0
       d3-geo: 3.1.1
       vega-canvas: 2.0.0
-      vega-dataflow: 6.1.2
-      vega-projection: 2.1.2
+      vega-dataflow: 6.1.3
+      vega-projection: 2.1.3
       vega-statistics: 2.0.0
-      vega-util: 2.1.2
+      vega-util: 2.1.3
 
-  vega-hierarchy@5.1.2:
+  vega-hierarchy@5.1.3:
     dependencies:
       d3-hierarchy: 3.1.2
-      vega-dataflow: 6.1.2
-      vega-util: 2.1.2
+      vega-dataflow: 6.1.3
+      vega-util: 2.1.3
 
   vega-interpreter@2.3.1:
     dependencies:
       vega-util: 2.1.2
 
-  vega-label@2.1.2:
+  vega-label@2.1.3:
     dependencies:
       vega-canvas: 2.0.0
-      vega-dataflow: 6.1.2
-      vega-scenegraph: 5.2.1
-      vega-util: 2.1.2
+      vega-dataflow: 6.1.3
+      vega-scenegraph: 5.3.0
+      vega-util: 2.1.3
 
   vega-lite@6.4.3(vega@6.3.1):
     dependencies:
@@ -8180,67 +8214,76 @@ snapshots:
       vega: 6.3.1
       vega-event-selector: 4.0.0
       vega-expression: 6.1.0
-      vega-util: 2.1.2
+      vega-util: 2.1.3
       yargs: 18.0.0
 
-  vega-loader@5.1.2:
+  vega-loader@5.1.3:
     dependencies:
       d3-dsv: 3.0.1
       topojson-client: 3.1.0
-      vega-format: 2.1.2
-      vega-util: 2.1.2
+      vega-format: 2.1.3
+      vega-util: 2.1.3
 
-  vega-parser@7.1.2:
+  vega-parser@7.1.3:
     dependencies:
-      vega-dataflow: 6.1.2
+      vega-dataflow: 6.1.3
       vega-event-selector: 4.0.0
-      vega-functions: 6.1.3
-      vega-scale: 8.1.2
-      vega-util: 2.1.2
+      vega-functions: 6.2.0
+      vega-scale: 8.1.3
+      vega-util: 2.1.3
 
-  vega-projection@2.1.2:
+  vega-projection@2.1.3:
     dependencies:
       d3-geo: 3.1.1
       d3-geo-projection: 4.0.0
-      vega-scale: 8.1.2
+      vega-scale: 8.1.3
 
-  vega-regression@2.1.2:
+  vega-regression@2.1.3:
     dependencies:
       d3-array: 3.2.4
-      vega-dataflow: 6.1.2
+      vega-dataflow: 6.1.3
       vega-statistics: 2.0.0
-      vega-util: 2.1.2
+      vega-util: 2.1.3
 
-  vega-runtime@7.1.2:
+  vega-runtime@7.1.3:
     dependencies:
-      vega-dataflow: 6.1.2
-      vega-util: 2.1.2
+      vega-dataflow: 6.1.3
+      vega-util: 2.1.3
 
-  vega-scale@8.1.2:
+  vega-scale@8.1.3:
     dependencies:
       d3-array: 3.2.4
       d3-interpolate: 3.0.1
       d3-scale: 4.0.2
       d3-scale-chromatic: 3.1.0
-      vega-time: 3.2.1
-      vega-util: 2.1.2
+      vega-time: 3.3.0
+      vega-util: 2.1.3
 
   vega-scenegraph@5.2.1:
     dependencies:
       d3-path: 3.1.0
       d3-shape: 3.2.0
       vega-canvas: 2.0.0
-      vega-loader: 5.1.2
-      vega-scale: 8.1.2
-      vega-util: 2.1.2
+      vega-loader: 5.1.3
+      vega-scale: 8.1.3
+      vega-util: 2.1.3
+
+  vega-scenegraph@5.3.0:
+    dependencies:
+      d3-path: 3.1.0
+      d3-shape: 3.2.0
+      vega-canvas: 2.0.0
+      vega-loader: 5.1.3
+      vega-scale: 8.1.3
+      vega-util: 2.1.3
 
   vega-schema-url-parser@3.0.2: {}
 
-  vega-selections@6.1.4:
+  vega-selections@6.1.5:
     dependencies:
       d3-array: 3.2.4
-      vega-expression: 6.2.1
-      vega-util: 2.1.2
+      vega-expression: 6.2.2
+      vega-util: 2.1.3
 
   vega-statistics@2.0.0:
     dependencies:
@@ -8255,89 +8298,97 @@ snapshots:
     dependencies:
       d3-array: 3.2.4
       d3-time: 3.1.0
-      vega-util: 2.1.2
+      vega-util: 2.1.3
+
+  vega-time@3.3.0:
+    dependencies:
+      d3-array: 3.2.4
+      d3-time: 3.1.0
+      vega-util: 2.1.3
 
   vega-tooltip@1.0.0:
     dependencies:
       vega-util: 2.1.2
 
-  vega-transforms@5.2.1:
+  vega-transforms@5.2.2:
     dependencies:
       d3-array: 3.2.4
-      vega-dataflow: 6.1.2
+      vega-dataflow: 6.1.3
       vega-statistics: 2.0.0
-      vega-time: 3.2.1
-      vega-util: 2.1.2
+      vega-time: 3.3.0
+      vega-util: 2.1.3
 
   vega-typings@2.2.0:
     dependencies:
       '@types/geojson': 7946.0.16
       vega-event-selector: 4.0.0
-      vega-expression: 6.2.1
-      vega-util: 2.1.2
+      vega-expression: 6.2.2
+      vega-util: 2.1.3
 
   vega-util@2.1.2: {}
 
-  vega-view-transforms@5.2.1:
+  vega-util@2.1.3: {}
+
+  vega-view-transforms@5.2.2:
     dependencies:
-      vega-dataflow: 6.1.2
-      vega-scenegraph: 5.2.1
-      vega-util: 2.1.2
+      vega-dataflow: 6.1.3
+      vega-scenegraph: 5.3.0
+      vega-util: 2.1.3
 
   vega-view@6.1.2:
     dependencies:
       d3-array: 3.2.4
       d3-timer: 3.0.1
-      vega-dataflow: 6.1.2
-      vega-format: 2.1.2
-      vega-functions: 6.1.3
-      vega-runtime: 7.1.2
-      vega-scenegraph: 5.2.1
-      vega-util: 2.1.2
+      vega-dataflow: 6.1.3
+      vega-format: 2.1.3
+      vega-functions: 6.2.0
+      vega-runtime: 7.1.3
+      vega-scenegraph: 5.3.0
+      vega-util: 2.1.3
 
-  vega-voronoi@5.1.2:
+  vega-voronoi@5.1.3:
     dependencies:
       d3-delaunay: 6.0.4
-      vega-dataflow: 6.1.2
-      vega-util: 2.1.2
+      vega-dataflow: 6.1.3
+      vega-util: 2.1.3
 
-  vega-wordcloud@5.1.2:
+  vega-wordcloud@5.1.3:
     dependencies:
       vega-canvas: 2.0.0
-      vega-dataflow: 6.1.2
-      vega-scale: 8.1.2
+      vega-dataflow: 6.1.3
+      vega-scale: 8.1.3
       vega-statistics: 2.0.0
-      vega-util: 2.1.2
+      vega-util: 2.1.3
 
   vega@6.3.1:
     dependencies:
-      vega-crossfilter: 5.1.2
-      vega-dataflow: 6.1.2
-      vega-encode: 5.2.1
+      vega-crossfilter: 5.1.3
+      vega-dataflow: 6.1.3
+      vega-encode: 5.2.2
       vega-event-selector: 4.0.0
-      vega-expression: 6.2.1
-      vega-force: 5.1.2
-      vega-format: 2.1.2
+      vega-expression: 6.2.2
+      vega-force: 5.1.3
+      vega-format: 2.1.3
       vega-functions: 6.1.3
-      vega-geo: 5.1.2
-      vega-hierarchy: 5.1.2
-      vega-label: 2.1.2
-      vega-loader: 5.1.2
-      vega-parser: 7.1.2
-      vega-projection: 2.1.2
-      vega-regression: 2.1.2
-      vega-runtime: 7.1.2
-      vega-scale: 8.1.2
+      vega-geo: 5.1.3
+      vega-hierarchy: 5.1.3
+      vega-label: 2.1.3
+      vega-loader: 5.1.3
+      vega-parser: 7.1.3
+      vega-projection: 2.1.3
+      vega-regression: 2.1.3
+      vega-runtime: 7.1.3
+      vega-scale: 8.1.3
       vega-scenegraph: 5.2.1
       vega-statistics: 2.0.0
       vega-time: 3.2.1
-      vega-transforms: 5.2.1
+      vega-transforms: 5.2.2
       vega-typings: 2.2.0
-      vega-util: 2.1.2
+      vega-util: 2.1.3
       vega-view: 6.1.2
-      vega-view-transforms: 5.2.1
-      vega-voronoi: 5.1.2
-      vega-wordcloud: 5.1.2
+      vega-view-transforms: 5.2.2
+      vega-voronoi: 5.1.3
+      vega-wordcloud: 5.1.3
 
   vfile-message@4.0.3:
     dependencies:
