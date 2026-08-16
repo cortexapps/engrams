@@ -2365,6 +2365,19 @@ mod adapter {
         /// turn (the CLI repeats `assistant` lines per content block with
         /// the same id + usage; without this the tokens double-count).
         emitted_generation_ids: HashSet<String>,
+        /// Telemetry: when the prompt hit claude's stdin, consumed by the
+        /// FIRST token of the turn to log time-to-first-token.
+        ///
+        /// This window — `RunStarted` → first `AgentMessageChunk` — is
+        /// otherwise unmeasured, and it is the largest single term in
+        /// cold-boot latency: everything before it is host-side and
+        /// instrumented (`engram_sandbox_boot_seconds`,
+        /// `engram_prompt_to_run_started_seconds`), everything inside it
+        /// is opaque vendor-CLI init plus the first model round trip. A
+        /// stale-ARP black-hole sat here at ~60s for months
+        /// (2026-08-16) and no metric could see it; only a hand-built
+        /// prod repro could. `Some` until the first chunk consumes it.
+        first_token_at: Option<std::time::Instant>,
     }
 
     /// A prompt waiting in the harness-owned queue (Phase 1b — type-ahead
@@ -3082,6 +3095,22 @@ mod adapter {
                                                 continue;
                                             }
                                         }
+                                        // Time-to-first-token for this turn.
+                                        // Measured on the EMITTED chunk, not the
+                                        // parsed one: a chunk suppressed as
+                                        // narrate-past never reached anybody, so
+                                        // it isn't the turn's first token. See
+                                        // `TurnState::first_token_at` for why this
+                                        // window earns its own log line.
+                                        if matches!(ev, HarnessEvent::AgentMessageChunk { .. }) {
+                                            if let Some(started) = t.first_token_at.take() {
+                                                tracing::info!(
+                                                    run_id = %t.run_id,
+                                                    ttft_ms = started.elapsed().as_millis() as u64,
+                                                    "first token"
+                                                );
+                                            }
+                                        }
                                         normalize_native_tool_event(&mut ev, &cli.tool_manifest);
                                         emit(evt_tx, ev).await;
                                     }
@@ -3652,6 +3681,9 @@ mod adapter {
             is_delivery_resume: false,
             suppressed_msg_ids: Vec::new(),
             emitted_generation_ids: HashSet::new(),
+            // Stamped AFTER the write: the measured window is
+            // "prompt is in claude's hands" → "first token out".
+            first_token_at: Some(std::time::Instant::now()),
         }
     }
 
@@ -3693,6 +3725,7 @@ mod adapter {
             is_delivery_resume: true,
             suppressed_msg_ids: Vec::new(),
             emitted_generation_ids: HashSet::new(),
+            first_token_at: Some(std::time::Instant::now()),
         }
     }
 
