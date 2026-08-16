@@ -986,6 +986,11 @@ if dev_split:
 
 orchestrator_db_url = 'postgres://engram:engram@localhost:5435/engram_orchestrator'
 
+# The origin the BROWSER uses. Everything origin-shaped in the orchestrator
+# derives from this one value, so a tunnel or a session app hostname only has
+# to be set once.
+orchestrator_public_url = env_or('ORCHESTRATOR_PUBLIC_URL', 'http://localhost:5173')
+
 # CONTROL_PLANE_BEARER MUST match the coordinator's accepted app-gRPC
 # token (ENGRAM_APP_GRPC_TOKENS in coord_env above), else the coord
 # fails the orchestrator's RPCs closed.
@@ -1006,8 +1011,12 @@ orchestrator_env = {
     # it. Unset → it falls back to 127.0.0.1:8787, so the OAuth callback bypasses the
     # proxy and arrives cookie-less → 401. Override with an https tunnel URL (ngrok/
     # cloudflared) for real Slack OAuth, which rejects non-https redirect URLs.
-    'ORCHESTRATOR_PUBLIC_URL': env_or('ORCHESTRATOR_PUBLIC_URL', 'http://localhost:5173'),
-    'TRUSTED_ORIGINS': 'http://localhost:5173',
+    'ORCHESTRATOR_PUBLIC_URL': orchestrator_public_url,
+    # CSRF origin allow-list. Defaults to the public URL rather than a literal,
+    # so pointing the stack at a tunnel or a session app hostname does not also
+    # need this set by hand — better-auth rejects the browser's Origin as
+    # untrusted otherwise, which reads as an unexplained 403 on every auth call.
+    'TRUSTED_ORIGINS': env_or('TRUSTED_ORIGINS', orchestrator_public_url),
     # Dev-only better-auth signing secret (≥32 chars). better-auth 1.6.16
     # silently falls back to a publicly-known constant when unset, so the
     # orchestrator requires it; a fixed dev literal is fine locally but
