@@ -46,6 +46,7 @@ import { RouterModelAudience } from "../../gen/engram/app/v1/model_router_pb";
 import { SearchableOptionMenu } from "../sessions/SessionHarnessControls";
 import { useSkills, useUploadSkill } from "../../hooks/useSkills";
 import { useOrgSecretNames } from "../../hooks/useOrgSecrets";
+import { usePreviewBaseDomain } from "../../hooks/usePreviewBaseDomain";
 import { defaultCapabilitiesForGrants } from "../../lib/profileIntegrations";
 import { useIntegrationConnections } from "../../hooks/useIntegrations";
 import {
@@ -1347,6 +1348,9 @@ function Advanced({
   setApps: (a: AppRow[]) => void;
 }) {
   const uploadSkill = useUploadSkill();
+  // Optional: absent deployments (and a failed fetch) simply lose the
+  // resolved-shape hint under a `${…_INGRESS_*}` value.
+  const previewBaseDomain = usePreviewBaseDomain();
   const [skillName, setSkillName] = useState("");
   const [skillDesc, setSkillDesc] = useState("");
   const [skillFile, setSkillFile] = useState<File | null>(null);
@@ -1494,14 +1498,6 @@ function Advanced({
         </div>
       </div>
 
-      {/* env vars */}
-      <div>
-        <Text variant="label">Environment variables</Text>
-        <div className="mt-2">
-          <EnvVarsEditor rows={envRows} onChange={setEnvRows} />
-        </div>
-      </div>
-
       {/* apps (ADR 0118) */}
       <div>
         <Text variant="label">Apps</Text>
@@ -1509,7 +1505,7 @@ function Advanced({
           The services every session from this profile hosts. Each one gets a stable public address,
           and the platform injects <code className="font-mono">&lt;NAME&gt;_INGRESS_HOST</code> and{" "}
           <code className="font-mono">&lt;NAME&gt;_INGRESS_URL</code> for every app into the
-          session. Reference them from Environment variables above with{" "}
+          session. Reference them from Environment variables below with{" "}
           <code className="font-mono">
             ${"{"}WEB_INGRESS_URL{"}"}
           </code>{" "}
@@ -1586,6 +1582,19 @@ function Advanced({
             {portErr}
           </p>
         )}
+      </div>
+
+      {/* env vars */}
+      <div>
+        <Text variant="label">Environment variables</Text>
+        <div className="mt-2">
+          <EnvVarsEditor
+            rows={envRows}
+            onChange={setEnvRows}
+            apps={apps}
+            previewBaseDomain={previewBaseDomain}
+          />
+        </div>
       </div>
 
       {/* custom secrets */}
