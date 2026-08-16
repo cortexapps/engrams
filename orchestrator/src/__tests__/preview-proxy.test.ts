@@ -453,7 +453,23 @@ describe("ADR 0118 invariants", () => {
       expect(res.status).toBe(302);
       const loc = new URL(res.headers.get("location")!);
       expect(loc.origin + loc.pathname).toBe("https://app.example.com/login");
-      expect(loc.searchParams.get("next")).toBe(`http://${HOST}/page`);
+      // Carries the bounce marker, so a second unauthenticated arrival is
+      // recognisable as a cookie-scope failure rather than looped on.
+      expect(loc.searchParams.get("next")).toBe(`http://${HOST}/page?__engrams_login=1`);
+    });
+
+    // The bounce back from login assumes the session cookie is visible on THIS
+    // host, which needs it scoped to the shared parent domain. When it is not —
+    // the deployment never set the domain, or the browser still holds a
+    // host-only cookie minted before it did — the human returns still
+    // unauthenticated, and redirecting again would spin forever.
+    test("a second unauthenticated arrival stops instead of looping", async () => {
+      const res = await appWith({ getSession: noSession }).request(
+        `http://${HOST}/page?__engrams_login=1`,
+        { headers: { host: HOST, accept: "text/html", "sec-fetch-mode": "navigate" } },
+      );
+      expect(res.status).toBe(403);
+      expect(await res.text()).toContain("ORCHESTRATOR_SESSION_COOKIE_DOMAIN");
     });
 
     // `c.req.url`'s scheme is the SOCKET's, which is plain http behind a

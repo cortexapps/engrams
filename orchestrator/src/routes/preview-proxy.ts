@@ -188,6 +188,21 @@ function defaultLoginUrl(): string {
  * clean "you are not logged in" into an opaque CORS or parse failure at the
  * caller, so the distinction is load-bearing, not cosmetic.
  */
+/**
+ * Marker the login page puts on the URL when it bounces someone back here.
+ *
+ * The bounce assumes the session cookie is visible on this host — which needs
+ * it scoped to the shared parent domain (ORCHESTRATOR_SESSION_COOKIE_DOMAIN).
+ * When it is not — the deployment never set the domain, or the browser holds a
+ * host-only cookie minted before it did — the human arrives still
+ * unauthenticated and we would redirect them to log in again, forever.
+ *
+ * One marker breaks that: a second arrival with no session is not a login
+ * problem, it is a cookie-scope problem, and it gets said out loud instead of
+ * spun on.
+ */
+export const BOUNCED_PARAM = "__engrams_login";
+
 function unauthenticatedResponse(c: Context, loginUrl: string, baseDomain: string): Response {
   const accept = c.req.header("accept") ?? "";
   const mode = c.req.header("sec-fetch-mode");
@@ -195,6 +210,16 @@ function unauthenticatedResponse(c: Context, loginUrl: string, baseDomain: strin
     (mode === "navigate" || mode === undefined) && accept.includes("text/html");
   if (!isNavigation) return c.text("unauthenticated", 401);
   const next = new URL(c.req.url);
+  if (next.searchParams.has(BOUNCED_PARAM)) {
+    return c.text(
+      "Signed in, but this app's hostname cannot see your session cookie, so we " +
+        "stopped rather than send you round the login loop again. The deployment " +
+        "needs ORCHESTRATOR_SESSION_COOKIE_DOMAIN set to the shared parent domain; " +
+        "if it is set, sign out and back in once to be issued a cookie scoped to it.",
+      403,
+    );
+  }
+  next.searchParams.set(BOUNCED_PARAM, "1");
   // `c.req.url`'s scheme is whatever the SOCKET carried, which is plain http
   // behind a TLS-terminating load balancer — the production topology. Sending
   // the user back to an `http://` app URL after login is an insecure hop, and

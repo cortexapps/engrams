@@ -22,6 +22,7 @@ import {
   redirect,
 } from "@tanstack/react-router";
 import type { AuthState } from "./auth/AuthProvider";
+import { hasNextParam } from "./lib/next-url";
 import { RootLayout } from "./pages/RootLayout";
 import { Login } from "./pages/Login";
 import { DeviceAuth } from "./pages/DeviceAuth";
@@ -103,10 +104,18 @@ const rootRoute = createRootRoute();
 const loginRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/login",
-  beforeLoad: ({ context }) => {
-    if (context.auth) {
-      throw redirect({ to: "/" });
-    }
+  beforeLoad: ({ context, location }) => {
+    if (!context.auth) return;
+    // ADR 0118: a `?next=` arrival is a session-app round trip — the preview
+    // edge bounced an unauthenticated navigation here and wants the human
+    // returned to the app. Only the Login page can finish it: validating a
+    // cross-origin destination needs the deployment's preview domain, which is
+    // fetched, and the hop is a full-page navigation off this origin that a
+    // router redirect cannot express. Falling through is the whole point —
+    // redirecting to "/" here silently discarded the destination and stranded
+    // the user on the dashboard, which is what it did in prod.
+    if (hasNextParam(location.searchStr)) return;
+    throw redirect({ to: "/" });
   },
   component: Login,
 });
