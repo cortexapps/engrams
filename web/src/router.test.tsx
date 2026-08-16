@@ -94,6 +94,27 @@ test("redirects authenticated user away from /login to /sessions", async () => {
   expect(screen.queryByLabelText(/email/i)).toBeNull();
 });
 
+// ADR 0118 regression (prod, 2026-08-16): every session-app link bounced the
+// human to the dashboard. The preview edge 302s an unauthenticated navigation
+// to `/login?next=<app url>`, but this gate fired first and threw
+// `redirect({ to: "/" })`, discarding `next` — so Login's bounce-back, which is
+// the only code that can validate a cross-origin destination, never ran.
+// Falling through to the page is the fix, so assert the gate does NOT redirect.
+test("keeps an authenticated /login?next= arrival on the page so it can bounce back", async () => {
+  const router = makeTestRouter(
+    AUTH,
+    "/login?next=" + encodeURIComponent("https://tilt-azure-bold-quokkas.preview.example.com/"),
+  );
+  await router.load();
+  expect(router.state.location.pathname).toBe("/login");
+});
+
+test("still short-circuits an authenticated /login with no next", async () => {
+  const router = makeTestRouter(AUTH, "/login");
+  await router.load();
+  expect(router.state.location.pathname).not.toBe("/login");
+});
+
 test("routes an authenticated member to the Tech Specs list", async () => {
   render(<RouterProvider router={makeTestRouter(AUTH, "/specs")} />);
   await screen.findByTestId("tech-specs");

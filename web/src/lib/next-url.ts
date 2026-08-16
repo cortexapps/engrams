@@ -20,6 +20,19 @@
 export const DEFAULT_AFTER_LOGIN = "/";
 
 /**
+ * Is there a `next` to honour at all?
+ *
+ * Separate from `safeNextUrl` because the router's `beforeLoad` must decide
+ * synchronously whether to short-circuit an already-authenticated visitor,
+ * while VALIDATING a cross-origin destination needs the deployment's preview
+ * domain — which is fetched. So the gate asks only this, and defers the
+ * validated navigation to the page that has the domain.
+ */
+export function hasNextParam(search: string): boolean {
+  return Boolean(new URLSearchParams(search).get("next"));
+}
+
+/**
  * Validate a `next` value against the two allowed destinations.
  *
  * `search` is a query string (`window.location.search`); `previewBaseDomain` is

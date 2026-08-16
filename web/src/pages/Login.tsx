@@ -15,7 +15,7 @@
 import { useEffect, useState } from "react";
 import { authClient } from "@/lib/auth-client";
 import { API_BASE } from "@/lib/base";
-import { safeNextUrl, DEFAULT_AFTER_LOGIN } from "@/lib/next-url";
+import { safeNextUrl, hasNextParam } from "@/lib/next-url";
 import { EngramMark } from "@/components/EngramMark";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -67,12 +67,18 @@ export function Login() {
   // preview domain, not a guess.
   useEffect(() => {
     if (!authConfig) return;
-    const next = safeNextUrl(window.location.search, authConfig.previewBaseDomain);
-    if (next === DEFAULT_AFTER_LOGIN) return;
+    // Only act when a `next` actually arrived: without one, an ordinary visitor
+    // to /login must keep seeing the form (and the router's beforeLoad has
+    // already sent an authenticated one to the app).
+    if (!hasNextParam(window.location.search)) return;
     let cancelled = false;
     void (async () => {
       const { data } = await authClient.getSession();
-      if (!cancelled && data?.session) window.location.assign(next);
+      if (cancelled || !data?.session) return;
+      // safeNextUrl falls back to DEFAULT_AFTER_LOGIN, so an unusable `next`
+      // lands on the dashboard rather than leaving a signed-in user parked in
+      // front of a login form they have no reason to fill in.
+      window.location.assign(safeNextUrl(window.location.search, authConfig.previewBaseDomain));
     })();
     return () => {
       cancelled = true;
