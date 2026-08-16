@@ -13,7 +13,11 @@
 //!      succeed independently — TAP-name collisions don't happen
 //!      because TAP names are netns-local.
 //!   2. Each netns has the bake's TAP inside it (`ip -n <ns> link
-//!      show <tap>`), and the TAP carries the bake's gateway IP.
+//!      show <tap>`), and the TAP carries the bake's gateway IP —
+//!      and its MAC, which must be `VmCidr::tap_mac()` and therefore
+//!      identical in both netns. A restored guest's neighbour entry
+//!      for the gateway is frozen at capture time, so a per-restore
+//!      random MAC black-holes its egress until the entry ages out.
 //!   3. Each netns gets a distinct host-side `snat_cidr.guest()`
 //!      from `NetworkAllocator` — these are the host-reachable IPs
 //!      the egress proxy registry indexes against and the dashboard
@@ -163,6 +167,28 @@ fn tap_in_host_root(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `ip -n <ns> link show <iface>` → the device's `link/ether` MAC,
+/// lowercased. Pins the MAC-assignment step of `provision_netns`.
+fn iface_mac_in_netns(ns: &str, iface: &str) -> Option<String> {
+    let out = std::process::Command::new("ip")
+        .args(["-n", ns, "link", "show", iface])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let rest = text.split("link/ether").nth(1)?;
+    Some(rest.split_whitespace().next()?.to_ascii_lowercase())
+}
+
+fn mac_to_string(mac: [u8; 6]) -> String {
+    mac.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 /// `ip -n <ns> addr show dev <iface>` — returns true if the listed
 /// addresses contain `expected`. Pins the address-assignment step
 /// of `provision_netns`.
@@ -275,6 +301,35 @@ async fn netns_provision_isolates_two_warm_slots_from_one_snapshot() {
     assert!(
         iface_has_addr_in_netns(&ns2_name, bake_tap, bake_cidr.host()),
         "bake TAP in slot 2's netns must hold gateway IP {}",
+        bake_cidr.host(),
+    );
+
+    // 4b. Both TAPs carry the SAME MAC, derived from the bake's
+    //     gateway. This is the anti-black-hole invariant: a restored
+    //     guest resumes with a frozen neighbour entry for
+    //     `bake_cidr.host()` pointing at the MAC its TAP had at
+    //     CAPTURE time. Let the kernel pick one per TAP (the pre-fix
+    //     behaviour) and every restore mints a different MAC, so the
+    //     guest frames egress to a MAC that isn't there and stalls
+    //     ~60s until the entry ages out — measured in prod
+    //     2026-08-16. These two netns are exactly the "two restores
+    //     of one snapshot" case, so their TAP MACs must be identical
+    //     AND equal to the value derived from the gateway.
+    let want_mac = mac_to_string(bake_cidr.tap_mac());
+    let mac1 = iface_mac_in_netns(&ns1_name, bake_tap).expect("slot 1 TAP has a link/ether");
+    let mac2 = iface_mac_in_netns(&ns2_name, bake_tap).expect("slot 2 TAP has a link/ether");
+    assert_eq!(
+        mac1,
+        want_mac,
+        "slot 1 TAP MAC must be derived from gateway {} — a random MAC \
+         black-holes a restored guest's egress for ~60s",
+        bake_cidr.host(),
+    );
+    assert_eq!(
+        mac2,
+        want_mac,
+        "slot 2 TAP MAC must be derived from gateway {} — a random MAC \
+         black-holes a restored guest's egress for ~60s",
         bake_cidr.host(),
     );
 

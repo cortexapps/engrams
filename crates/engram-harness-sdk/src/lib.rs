@@ -6,6 +6,7 @@
 
 pub mod browser_activity;
 pub mod browser_view;
+mod first_output;
 pub mod mode_stamp;
 pub mod parked;
 pub mod plan;
@@ -118,6 +119,9 @@ pub async fn serve(
     reattach: Arc<Notify>,
 ) -> ExitCode {
     let held: HeldEvent = Arc::new(Mutex::new(None));
+    // Outlives each connection: a reconnect mid-turn must not lose the
+    // turn's stopwatch (that reconnect is often the interesting case).
+    let mut first_output = first_output::FirstOutput::default();
     let mut reconnect_nudge =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
             .expect("install SIGUSR1 handler");
@@ -135,8 +139,16 @@ pub async fn serve(
             o = async {
                 match tokio::time::timeout(DIAL_TIMEOUT, dial(&cfg)).await {
                     Ok(Some(stream)) => {
-                        run_one_connection(stream, &cfg, &command_tx, &mut event_rx, &held, &reattach)
-                            .await
+                        run_one_connection(
+                            stream,
+                            &cfg,
+                            &command_tx,
+                            &mut event_rx,
+                            &held,
+                            &reattach,
+                            &mut first_output,
+                        )
+                        .await
                     }
                     Ok(None) => ConnOutcome::DialFailed,
                     Err(_) => {
@@ -240,6 +252,7 @@ async fn run_one_connection(
     event_rx: &mut mpsc::Receiver<HarnessEvent>,
     held: &HeldEvent,
     reattach: &Notify,
+    first_output: &mut first_output::FirstOutput,
 ) -> ConnOutcome {
     let attach = HarnessAttach {
         session_id: cfg.session_id,
@@ -266,7 +279,7 @@ async fn run_one_connection(
     reattach.notify_one();
     tokio::select! {
         reason = forward_commands(&mut reader, command_tx) => ConnOutcome::Dropped(reason),
-        result = pump_events(&mut writer, event_rx, held) => result,
+        result = pump_events(&mut writer, event_rx, held, first_output) => result,
     }
 }
 
@@ -292,6 +305,7 @@ async fn pump_events<W: AsyncWrite + Unpin>(
     writer: &mut W,
     rx: &mut mpsc::Receiver<HarnessEvent>,
     held: &HeldEvent,
+    first_output: &mut first_output::FirstOutput,
 ) -> ConnOutcome {
     loop {
         let parked = held.lock().expect("held event lock poisoned").clone();
@@ -299,6 +313,10 @@ async fn pump_events<W: AsyncWrite + Unpin>(
             Some(event) => event,
             None => match rx.recv().await {
                 Some(event) => {
+                    // Observe here — the fresh-from-the-engine arm — so
+                    // each event is seen exactly once. The `parked` arm
+                    // above re-sends a held event after a reconnect.
+                    first_output.observe(&event);
                     *held.lock().expect("held event lock poisoned") = Some(event.clone());
                     event
                 }
@@ -483,6 +501,7 @@ mod tests {
             &mut event_rx,
             &held,
             &Notify::new(),
+            &mut first_output::FirstOutput::default(),
         )
         .await;
         host_task.await.unwrap();
@@ -522,6 +541,7 @@ mod tests {
             &mut event_rx,
             &held,
             &Notify::new(),
+            &mut first_output::FirstOutput::default(),
         )
         .await;
         host_task.abort();
