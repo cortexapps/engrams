@@ -74,6 +74,12 @@ const connectionsHolder = vi.hoisted(() => ({ value: [] as unknown[] }));
 vi.mock("../../hooks/useIntegrations", () => ({
   useIntegrationConnections: () => ({ data: { connections: connectionsHolder.value } }),
 }));
+// The app-variable hints resolve against the deployment's preview domain
+// (ADR 0118). Mocked like the hooks above so the editor still needs no
+// QueryClient; the real hook degrades to undefined, which the editor tolerates.
+vi.mock("../../hooks/usePreviewBaseDomain", () => ({
+  usePreviewBaseDomain: () => "preview.example.com",
+}));
 // The editor derives its policy rail, its connected-connector cards AND — since
 // the provider seam — the named-connection blocks from the joined catalog. Mock
 // only the hook, keeping the real helpers, and serve the Google entry the
@@ -290,6 +296,46 @@ describe("SessionProfileEditor (create)", () => {
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
     await waitFor(() => expect(create).toHaveBeenCalled());
     expect(create.mock.calls[0][0].apps).toEqual([{ name: "web", port: 3000 }]);
+  });
+
+  it("offers a declared app's variables as insert chips, and inserts one (ADR 0118)", async () => {
+    render(<SessionProfileEditor mode="create" />);
+    openAdvanced();
+    // No apps yet → nothing to advertise.
+    expect(screen.queryByTestId("env-app-vars")).toBeNull();
+
+    fireEvent.change(screen.getByTestId("app-name-input"), { target: { value: "web" } });
+    fireEvent.change(screen.getByTestId("port-add-input"), { target: { value: "5173" } });
+    fireEvent.click(screen.getByTestId("port-add-btn"));
+
+    const chip = screen.getByTestId("env-var-chip-WEB_INGRESS_URL");
+    expect(screen.getByTestId("env-var-chip-WEB_INGRESS_HOST")).toBeTruthy();
+
+    // With no value focused the chip starts a row rather than doing nothing.
+    fireEvent.click(chip);
+    const value = screen.getByLabelText("Variable value") as HTMLInputElement;
+    expect(value.value).toBe("${WEB_INGRESS_URL}");
+    // ...and the admin can see what it will become.
+    expect(screen.getByTestId("env-resolved-preview").textContent).toContain(
+      "https://web-<session>.preview.example.com",
+    );
+  });
+
+  it("flags an ingress reference that names no app (ADR 0118)", async () => {
+    render(<SessionProfileEditor mode="create" />);
+    openAdvanced();
+    fireEvent.change(screen.getByTestId("app-name-input"), { target: { value: "web" } });
+    fireEvent.change(screen.getByTestId("port-add-input"), { target: { value: "5173" } });
+    fireEvent.click(screen.getByTestId("port-add-btn"));
+
+    fireEvent.click(screen.getByTestId("env-var-chip-WEB_INGRESS_URL"));
+    const value = screen.getByLabelText("Variable value") as HTMLInputElement;
+    fireEvent.change(value, { target: { value: "${API_INGRESS_URL}" } });
+
+    expect(screen.getByTestId("env-dangling").textContent).toContain("${API_INGRESS_URL}");
+    // A declared app's reference is never flagged.
+    fireEvent.change(value, { target: { value: "${WEB_INGRESS_URL}" } });
+    expect(screen.queryByTestId("env-dangling")).toBeNull();
   });
 
   it("rejects a name that cannot be a DNS label (ADR 0118)", () => {
