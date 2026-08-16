@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use engram_core::types::egress::AppEndpoint;
 use engram_core::SandboxId;
 use rustls::ServerConfig;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::LazyConfigAcceptor;
 
 use crate::guest_gateway::TunnelStream;
@@ -82,6 +82,29 @@ pub fn own_app_port(apps: &[AppEndpoint], sni: &str) -> Option<u16> {
         .map(|a| a.port)
 }
 
+/// The HTTP/1.1 answer for an app whose port refused the connection.
+///
+/// Plain text on purpose: this is read by a browser AND by `curl` from inside
+/// the guest, and the useful content is one sentence plus the port number.
+/// ALPN is declined for this connection, so the client is speaking HTTP/1.1.
+pub fn app_unreachable_response(port: u16) -> Vec<u8> {
+    let body = format!(
+        "This session app is reserved, but nothing is listening on port {port} inside the \
+         session.\n\nStart the process that serves it, then reload. If it is already \
+         running, check that it binds 0.0.0.0 or 127.0.0.1 on that exact port.\n"
+    );
+    format!(
+        "HTTP/1.1 502 Bad Gateway\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
 /// Serve one short-circuited connection.
 ///
 /// The guest opened a TLS connection to a sibling app's public hostname. We
@@ -107,15 +130,23 @@ pub async fn serve<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // Dial the sibling BEFORE completing the guest handshake. A refused port
-    // then closes the connection without ever presenting a certificate, which
-    // is the same shape the guest would see dialing a dead local port —
-    // rather than a successful TLS session that dies on first byte.
-    let mut guest = dialer
-        .dial(sandbox_id, port)
-        .await
-        .map_err(|e| std::io::Error::other(format!("dial own app port {port}: {e}")))?;
-
+    // Complete the guest handshake BEFORE dialing the sibling.
+    //
+    // The reverse order is tempting — why handshake for a connection that is
+    // about to fail? — and it is what shipped first. It produced a bad bug on
+    // the day this went live (2026-08-16): the dev server simply was not up
+    // yet, the dial was refused, and the connection closed before any
+    // certificate was presented. In a browser that renders as
+    // ERR_CONNECTION_CLOSED, and with curl as SSL_ERROR_SYSCALL after the
+    // ClientHello. Both read as "the platform is blocking this hostname"
+    // rather than "my app is not listening", and an agent spent an afternoon
+    // hand-patching an auth allow-list chasing it.
+    //
+    // We own this hostname and mint a leaf the guest already trusts, so
+    // finishing the handshake first lets a refused dial answer with a plain
+    // 502 that says which port was dead. One wasted handshake buys an error a
+    // human can act on.
+    //
     // Stitch the peeked bytes back on so the acceptor sees the ClientHello from
     // byte 0 (the SNI peek already consumed them).
     let stitched = Replayed::new(peeked, client_stream);
@@ -132,6 +163,28 @@ where
         .into_stream(Arc::new(connection_cfg))
         .await
         .map_err(|e| std::io::Error::other(format!("own-app tls handshake: {e}")))?;
+
+    let mut guest = match dialer.dial(sandbox_id, port).await {
+        Ok(guest) => guest,
+        Err(e) => {
+            // The app is declared but nothing answers on its port — almost
+            // always "the dev server is not running yet". Say so, in the
+            // browser, instead of dropping the connection.
+            tracing::info!(
+                port,
+                error = %e,
+                "own-app short circuit: nothing listening on the app's port"
+            );
+            let _ = client_tls.write_all(&app_unreachable_response(port)).await;
+            let _ = client_tls.flush().await;
+            // Shut the TLS session down properly. Without close_notify a client
+            // treats the EOF as a truncation attack and surfaces an error
+            // INSTEAD of the body — which would put us straight back to an
+            // unreadable failure, the whole thing this branch exists to fix.
+            let _ = client_tls.shutdown().await;
+            return Ok((0, 0));
+        }
+    };
 
     tokio::io::copy_bidirectional(&mut client_tls, &mut guest).await
 }
@@ -191,5 +244,32 @@ mod tests {
     #[test]
     fn a_session_with_no_apps_never_short_circuits() {
         assert_eq!(own_app_port(&[], "anything.preview.example.com"), None);
+    }
+
+    /// The dial used to happen BEFORE the handshake, so a dev server that was
+    /// not up yet closed the connection with no certificate — indistinguishable
+    /// from the platform blocking the hostname. It cost a real afternoon on
+    /// 2026-08-16. The answer must be a readable HTTP response instead.
+    #[test]
+    fn unreachable_response_names_the_port_and_is_well_formed() {
+        let raw = app_unreachable_response(5173);
+        let text = String::from_utf8(raw).expect("response is utf-8");
+        let (head, body) = text
+            .split_once("\r\n\r\n")
+            .expect("headers end with a blank line");
+
+        assert!(head.starts_with("HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(head.contains("Connection: close"));
+        // The port is the actionable half of the message.
+        assert!(body.contains("5173"), "body must name the port: {body}");
+        // Content-Length must match the body exactly, or the client hangs
+        // waiting for bytes that never come.
+        let declared: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))
+            .expect("Content-Length present")
+            .parse()
+            .expect("Content-Length is a number");
+        assert_eq!(declared, body.len());
     }
 }

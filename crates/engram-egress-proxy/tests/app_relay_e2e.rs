@@ -149,10 +149,17 @@ async fn splices_a_tls_call_to_the_sibling_guest_port() {
 }
 
 #[tokio::test]
-async fn a_dead_sibling_port_fails_before_any_certificate_is_presented() {
-    // The dial happens BEFORE the handshake on purpose: a refused sibling then
-    // looks to the guest like a refused local port, rather than a successful
-    // TLS session that dies on the first read.
+async fn a_dead_sibling_port_answers_with_a_readable_502() {
+    // Regression, prod 2026-08-16. The dial used to happen BEFORE the
+    // handshake, so a dev server that was not up yet closed the connection with
+    // no certificate: ERR_CONNECTION_CLOSED in a browser, SSL_ERROR_SYSCALL in
+    // curl. Both read as "the platform is blocking this hostname" rather than
+    // "my app is not listening", and an afternoon went into chasing an auth
+    // allow-list that was never the problem.
+    //
+    // We own this hostname and mint a leaf the guest trusts, so the handshake
+    // MUST complete and the failure MUST arrive as an HTTP response naming the
+    // dead port.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let ca = ca();
     let (client_side, proxy_side) = tokio::io::duplex(64 * 1024);
@@ -170,12 +177,27 @@ async fn a_dead_sibling_port_fails_before_any_certificate_is_presented() {
         .await
     });
 
+    let mut tls = tls_client_to(&ca, APP_HOST, client_side)
+        .await
+        .expect("handshake completes even though the sibling port is dead");
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: app\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut out = String::new();
+    tls.read_to_string(&mut out).await.unwrap();
     assert!(
-        tls_client_to(&ca, APP_HOST, client_side).await.is_err(),
-        "handshake must not complete when the sibling port is dead"
+        out.starts_with("HTTP/1.1 502 Bad Gateway"),
+        "a dead app port must answer, not hang up: {out}"
     );
     assert!(
-        served.await.unwrap().is_err(),
-        "serve reports the dial failure"
+        out.contains("8080"),
+        "the response names the dead port: {out}"
     );
+
+    // The connection is served, not errored — the caller logs it and moves on.
+    served
+        .await
+        .unwrap()
+        .expect("serve completes after answering");
 }
