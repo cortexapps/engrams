@@ -351,11 +351,23 @@ export function buildRunSpans(opts: {
   return spans;
 }
 
-/** The session root span, emitted once at terminal. */
+/**
+ * The session root span — the ONLY carrier of the trace-level identity
+ * (user.id, task, harness, profile) and, in Langfuse, of the trace name.
+ *
+ * Emitted twice under the same deterministic span id: a PROVISIONAL
+ * version (no `outcome`, status unset, end = "now") on the consumer's
+ * first flush, so identity and the trace name exist from the first turn
+ * — engrams sessions live for days, and deferring the root to terminal
+ * left every live trace anonymous (the 2026-08-16 finding: 1,159 turn
+ * spans, zero session spans, every trace user-less) — and a FINAL
+ * version at terminal that upserts real end time and outcome.
+ */
 export function buildSessionSpan(opts: {
   sessionId: string;
   identity: SessionIdentity | null;
-  outcome: "completed" | "failed" | "neutral";
+  /** Absent = the provisional (mid-session) emission. */
+  outcome?: "completed" | "failed" | "neutral";
   endMs: number;
 }): OtlpSpan {
   const { sessionId, identity, outcome } = opts;
@@ -363,8 +375,10 @@ export function buildSessionSpan(opts: {
   const attributes: OtlpAttribute[] = [
     strAttr("gen_ai.operation.name", "invoke_agent"),
     strAttr("session.id", sessionId),
-    strAttr("engrams.session.outcome", outcome),
   ];
+  if (outcome !== undefined) {
+    attributes.push(strAttr("engrams.session.outcome", outcome));
+  }
   if (identity) {
     attributes.push(strAttr("engrams.task.id", identity.taskId));
     if (identity.rootTaskId) attributes.push(strAttr("engrams.root_task.id", identity.rootTaskId));
@@ -382,7 +396,11 @@ export function buildSessionSpan(opts: {
       identity?.taskCreatedAtMs != null ? msToUnixNano(identity.taskCreatedAtMs) : endNano,
     endTimeUnixNano: endNano,
     attributes,
-    status: outcome === "failed" ? { code: STATUS_ERROR } : { code: STATUS_OK },
+    // Provisional emission carries no status (unset); the terminal upsert
+    // sets OK/ERROR.
+    ...(outcome !== undefined
+      ? { status: outcome === "failed" ? { code: STATUS_ERROR } : { code: STATUS_OK } }
+      : {}),
   };
 }
 

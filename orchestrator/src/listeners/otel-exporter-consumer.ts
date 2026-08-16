@@ -97,6 +97,34 @@ export function makeOtelExporterConsumer(
   // pattern: in-memory on purpose — a listener restart grants a fresh budget).
   let attemptEventIdx = -1n;
   let attempts = 0;
+  // The session root span carries the trace identity (user.id, task,
+  // harness, profile) and, in Langfuse, the trace name. Emit a PROVISIONAL
+  // version with the FIRST flush so live traces are attributed from their
+  // first turn — engrams sessions run for days, and a terminal-only root
+  // left every live trace anonymous. The terminal flush re-emits the same
+  // deterministic span id with final end time + outcome (an upsert).
+  let sessionSpanPosted = false;
+
+  function withSessionSpan(sessionId: string, spans: OtlpSpan[]): OtlpSpan[] {
+    if (sessionSpanPosted || spans.length === 0) return spans;
+    return [
+      buildSessionSpan({ sessionId, identity, endMs: nowMs() }),
+      ...spans,
+    ];
+  }
+
+  /** Flush with the provisional session root prepended on the first
+   *  successful POST (and only marked posted when it actually went out). */
+  async function postFlush(
+    eventIdx: bigint,
+    sessionId: string,
+    spans: OtlpSpan[],
+  ): Promise<boolean> {
+    const withRoot = withSessionSpan(sessionId, spans);
+    const ok = await postWithBudget(eventIdx, withRoot);
+    if (ok && withRoot.length > spans.length) sessionSpanPosted = true;
+    return ok;
+  }
 
   function commitFloor(eventIdx: bigint): bigint {
     let floor: bigint | null = null;
@@ -264,7 +292,7 @@ export function makeOtelExporterConsumer(
               captureContent: sink.captureContent,
               fallbackMs: nowMs(),
             });
-            if (await postWithBudget(event.idx, spans)) {
+            if (await postFlush(event.idx, ctx.sessionId, spans)) {
               run.events = [];
               run.approxBytes = 0;
               run.firstBufferedMs = nowMs();
@@ -296,7 +324,7 @@ export function makeOtelExporterConsumer(
             captureContent: sink.captureContent,
             fallbackMs: nowMs(),
           });
-          await postWithBudget(event.idx, spans);
+          await postFlush(event.idx, ctx.sessionId, spans);
           // Success and budget exhaustion both release the run: either the
           // spans are exported, or we deliberately gave up on them.
           runs.delete(runId);

@@ -100,7 +100,36 @@ describe("otel-exporter consumer", () => {
     ).toBe(13n);
     expect(posted).toHaveLength(1);
     const spans = spansOf(posted[0]!);
-    expect(spans.map((s) => s.name)).toEqual(["chat claude-sonnet-5", "agent_turn"]);
+    // The FIRST flush carries the provisional session root, so the trace
+    // has identity (user.id, harness, task) and a name from its first turn
+    // — not only at terminal.
+    expect(spans.map((s) => s.name)).toEqual([
+      "agent_session",
+      "chat claude-sonnet-5",
+      "agent_turn",
+    ]);
+    const root = spans[0]!;
+    expect(JSON.stringify(root.attributes)).toContain("user-1");
+    expect(root.status).toBeUndefined(); // provisional: status unset
+    expect(JSON.stringify(root.attributes)).not.toContain("session.outcome");
+
+    // A second turn's flush must NOT re-emit the root.
+    await consumer.handle(ev(14n, "run_started", { run_id: "r2", at: AT }), CTX);
+    await consumer.handle(ev(15n, "run_completed", { run_id: "r2", ok: true, at: AT }), CTX);
+    expect(posted).toHaveLength(2);
+    expect(spansOf(posted[1]!).map((s) => s.name)).toEqual(["agent_turn"]);
+  });
+
+  test("terminal upserts the session root under the same span id, with outcome", async () => {
+    const { consumer, posted } = makeHarness();
+    await consumer.handle(ev(1n, "run_started", { run_id: "r1", at: AT }), CTX);
+    await consumer.handle(ev(2n, "run_completed", { run_id: "r1", ok: true, at: AT }), CTX);
+    const provisional = spansOf(posted[0]!).find((s) => s.name === "agent_session")!;
+    await consumer.onTerminal!("completed", CTX);
+    const final = spansOf(posted.at(-1)!).find((s) => s.name === "agent_session")!;
+    expect(final.spanId).toBe(provisional.spanId); // upsert, not duplicate
+    expect(final.status).toEqual({ code: 1 });
+    expect(JSON.stringify(final.attributes)).toContain("completed");
   });
 
   test("transient post failures rethrow (pump retries), then drop after the budget", async () => {
