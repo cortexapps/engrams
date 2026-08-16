@@ -81,6 +81,34 @@ impl VmCidr {
             self.host()
         )
     }
+
+    /// MAC for the TAP that terminates `host()` — a pure function of
+    /// that address, and it MUST stay one.
+    ///
+    /// A restore provisions a brand-new TAP (`create_persistent_tap`),
+    /// but the guest resumes with its neighbour table frozen from
+    /// capture time: a COMPLETE entry mapping `host()` to whatever MAC
+    /// the TAP had then. Let the kernel pick that MAC and it differs on
+    /// every restore, so the guest happily frames every packet to a MAC
+    /// that no longer exists and black-holes ALL egress until the
+    /// neighbour entry ages out — `base_reachable_time_ms` (30s) plus
+    /// the probe ladder, measured at 55-65s in prod on 2026-08-16.
+    ///
+    /// Deriving the MAC from the address the entry is keyed on keeps
+    /// both halves of that mapping frozen in the same snapshot, so the
+    /// baked entry is correct on every restore, on any host, with no
+    /// flush and no window. `bake_cidr` is read back out of the
+    /// snapshot sidecar on the warm leg, which is what makes this hold
+    /// across a cross-host restore too.
+    ///
+    /// `0x02` sets the locally-administered bit and clears the
+    /// multicast bit. Keying on the gateway rather than a single
+    /// constant also keeps cold-create TAPs — which share the host root
+    /// netns — distinct from one another.
+    pub fn tap_mac(&self) -> [u8; 6] {
+        let o = self.host().octets();
+        [0x02, 0x00, o[0], o[1], o[2], o[3]]
+    }
 }
 
 /// Carves the host-agent's engram CIDR into /30s. Sequential
@@ -826,12 +854,19 @@ pub async fn provision_with_named_tap(
         .execute()
         .await
         .map_err(|e| netlink_err("tap addr", e.to_string()))?;
+    // MAC + up in ONE message: the TAP is never briefly live carrying
+    // the kernel's random address. See `VmCidr::tap_mac`.
     handle
         .link()
-        .set(rtnetlink::LinkUnspec::new_with_index(tap_idx).up().build())
+        .set(
+            rtnetlink::LinkUnspec::new_with_index(tap_idx)
+                .address(vm_cidr.tap_mac().to_vec())
+                .up()
+                .build(),
+        )
         .execute()
         .await
-        .map_err(|e| netlink_err("tap up", e.to_string()))?;
+        .map_err(|e| netlink_err("tap mac+up", e.to_string()))?;
     drop(handle);
     conn_task.abort();
 
@@ -1169,12 +1204,20 @@ async fn provision_netns_inner(
             .execute()
             .await
             .map_err(|e| netlink_err("tap addr", e.to_string()))?;
+        // MAC + up in ONE message. `bake_cidr` comes from the snapshot
+        // sidecar, so this reproduces the exact MAC the guest's frozen
+        // neighbour entry already points at. See `VmCidr::tap_mac`.
         ns_handle
             .link()
-            .set(rtnetlink::LinkUnspec::new_with_index(tap_idx).up().build())
+            .set(
+                rtnetlink::LinkUnspec::new_with_index(tap_idx)
+                    .address(bake_cidr.tap_mac().to_vec())
+                    .up()
+                    .build(),
+            )
             .execute()
             .await
-            .map_err(|e| netlink_err("tap up", e.to_string()))?;
+            .map_err(|e| netlink_err("tap mac+up", e.to_string()))?;
         let route = rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
             .destination_prefix(std::net::Ipv4Addr::UNSPECIFIED, 0)
             .gateway(snat_cidr.host())
@@ -1464,6 +1507,51 @@ mod tests {
         assert_eq!(c.host(), Ipv4Addr::from_str("10.200.0.1").unwrap());
         assert_eq!(c.guest(), Ipv4Addr::from_str("10.200.0.2").unwrap());
         assert_eq!(c.cidr_str(), "10.200.0.0/30");
+    }
+
+    /// The TAP MAC is what a restored guest's frozen neighbour entry
+    /// already points at, so it must be a pure function of the gateway
+    /// address and nothing else. If this test ever needs relaxing, the
+    /// 60s black-hole in `VmCidr::tap_mac`'s doc comment is back.
+    #[test]
+    fn tap_mac_is_derived_from_the_gateway_address() {
+        let c = VmCidr::new(Ipv4Addr::from_str("10.200.0.4").unwrap());
+        assert_eq!(c.host(), Ipv4Addr::from_str("10.200.0.5").unwrap());
+        assert_eq!(c.tap_mac(), [0x02, 0x00, 10, 200, 0, 5]);
+
+        // Same /30 -> same MAC, every time. This is the whole property:
+        // a restore on any host reproduces the captured MAC exactly.
+        let again = VmCidr::new(Ipv4Addr::from_str("10.200.0.4").unwrap());
+        assert_eq!(c.tap_mac(), again.tap_mac());
+    }
+
+    #[test]
+    fn tap_mac_is_locally_administered_unicast() {
+        for net in ["10.200.0.0", "10.200.0.4", "10.200.255.252"] {
+            let mac = VmCidr::new(Ipv4Addr::from_str(net).unwrap()).tap_mac();
+            // Bit 1 of octet 0 set = locally administered (no OUI
+            // collision with real hardware).
+            assert_eq!(mac[0] & 0b10, 0b10, "{net}: not locally administered");
+            // Bit 0 clear = unicast. A multicast source MAC is
+            // discarded by the peer.
+            assert_eq!(mac[0] & 0b01, 0, "{net}: multicast bit set");
+        }
+    }
+
+    /// Cold-create TAPs share the host root netns, so distinct /30s
+    /// must not collide on a MAC there.
+    #[test]
+    fn tap_mac_is_distinct_per_slot() {
+        let mut seen = HashSet::new();
+        let mut a = NetworkAllocator::new(Ipv4Addr::from_str("10.200.0.0").unwrap());
+        for _ in 0..64 {
+            let cidr = a.alloc().expect("pool exhausted");
+            assert!(
+                seen.insert(cidr.tap_mac()),
+                "duplicate TAP MAC for {}",
+                cidr.cidr_str()
+            );
+        }
     }
 
     #[test]
