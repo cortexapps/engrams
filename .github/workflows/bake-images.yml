@@ -44,9 +44,16 @@ permissions:
 jobs:
   detect:
     runs-on: ubuntu-latest
-    concurrency:
-      group: bake-detect-${{ github.ref }}
-      cancel-in-progress: true
+    # NO concurrency group — deliberately (#1281). Lane detection for the
+    # dispatch-only lanes (tf_or_helm, host_base, bundles) is EDGE-triggered
+    # on the push range, which is complete only if EVERY push's detect runs
+    # to completion: the old `cancel-in-progress: true` group let a burst of
+    # merges cancel the superseded push's detect and its lanes were lost
+    # forever (2026-08-15: #1278's orchestrator lane died 34s in when #1279
+    # merged; the successors were docs/chart-only, so nothing rebaked the
+    # orchestrator and prod silently ran a stale image for hours). detect is
+    # a ~40s read-only job; running one per push costs nothing, and the
+    # expensive work below keeps its own per-image supersede groups.
     outputs:
       images: ${{ steps.lanes.outputs.images }}
       # The exact subset of container images to (re)bake — a JSON array like
@@ -90,11 +97,39 @@ jobs:
       # The host image is itself two-staged — a binary change re-drops the
       # binaries (host_binaries -> thin bake); an OS-layer change rebakes the
       # base (host_base -> base bake, which then re-triggers a thin bake).
+      # Level-triggered image lanes (#1281): resolve each container image's
+      # newest published GHCR SHA tag as its BASELINE, so the detector can
+      # evaluate the lane against the registry↔HEAD divergence instead of
+      # only this push's range. A cancelled or failed predecessor's bake
+      # then self-heals on the NEXT push of any kind, and a re-run of an old
+      # run no-ops instead of republishing stale content as newest. A failed
+      # lookup falls back to the push range for that image, loudly — never
+      # silently narrower than the pre-baseline behavior.
+      - id: baselines
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          args=""
+          for image in coordinator host-agent host-operator web orchestrator; do
+            versions="/orgs/${{ github.repository_owner }}/packages/container/engrams%2F$image/versions?per_page=100"
+            sha=$(gh api "$versions" \
+              --jq 'first(.[] | .metadata.container.tags[]? | select(test("^[0-9a-f]{40}$")))' \
+              2>/dev/null) || sha=""
+            if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              args="$args --image-baseline $image=$sha"
+              echo "$image baseline: $sha"
+            else
+              echo "::warning::no GHCR baseline for $image (lookup failed or no SHA tag); its lane falls back to the push range"
+            fi
+          done
+          echo "args=$args" >> "$GITHUB_OUTPUT"
       - id: lanes
         run: |
           python3 .github/scripts/detect-rebake-lanes.py \
             --base "${{ github.event.before }}" \
-            --head "${{ github.sha }}"
+            --head "${{ github.sha }}" \
+            ${{ steps.baselines.outputs.args }}
 
   bake:
     needs: detect
@@ -843,6 +878,7 @@ jobs:
       always() &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
+      needs.detect.result == 'success' &&
       needs.bake.result != 'failure' &&
       needs.bake.result != 'cancelled' &&
       needs.publish-host-binaries.result != 'failure' &&

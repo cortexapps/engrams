@@ -52,6 +52,32 @@ conservative triggers for the host_binaries lane.
 
 Usage (CI):   detect-rebake-lanes.py --base "$BEFORE" --head "$HEAD"
 Usage (test): printf 'crates/engram-postgres/src/x.rs\n' | detect-rebake-lanes.py --stdin
+
+## Level-triggered image lanes (--image-baseline, bake-images.yml only)
+
+Push-range diffs are EDGE-triggered: they are complete only if every push's
+lanes actually execute. The 2026-08-15 incident (#1281) broke that chain —
+a burst of merges cancelled the superseded run's detect, the successors'
+own ranges were docs/chart-only, and the orchestrator lane was silently
+lost: prod ran a stale image for hours with every run green.
+
+For the container images the ground truth of "done" is GHCR, so their lanes
+are LEVEL-triggered instead: bake-images.yml resolves each image's newest
+SHA-tagged GHCR version and passes it as `--image-baseline NAME=SHA`; the
+image's lane is then evaluated against `git diff <baseline> <head>` — the
+divergence between what is published and what HEAD needs. This converges
+regardless of cancelled or failed predecessors (any later push re-trips the
+lane until an image actually lands) and no-ops when the registry is already
+at-or-ahead (baseline contains head), which also stops a re-run of an OLD
+run from rebaking stale content over a newer image.
+
+An image without a usable baseline (no published SHA tag yet, registry
+lookup failed, baseline commit unknown locally) falls back to the push
+range for that image, with a loud warning — behavior is then exactly the
+pre-baseline status quo, never silently narrower.
+
+ci.yml's PR test-lane gating never passes baselines; that path is
+byte-identical to before.
 """
 import argparse
 import json
@@ -307,11 +333,67 @@ def any_path(changed, prefixes):
     return any(c == p or c.startswith(p) for c in changed for p in prefixes)
 
 
+def diff_names(a, b):
+    """Changed paths between two trees (endpoint compare — ancestry-free)."""
+    out = subprocess.check_output(["git", "diff", "--name-only", a, b]).decode()
+    return [c for c in out.split("\n") if c]
+
+
+def resolve_image_changed(baselines, head, fallback_changed):
+    """Per-image changed set from its GHCR baseline (see module doc).
+
+    Returns (changed_by_image, skip_by_image). An image absent from both
+    uses `fallback_changed` (the push range). skip=True means the registry
+    is at-or-ahead of head — nothing to bake, even if the fallback range
+    would have tripped.
+    """
+    changed_by_image, skip_by_image = {}, {}
+    for name, sha in baselines.items():
+        probe = subprocess.run(
+            ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if probe.returncode != 0:
+            # Baseline commit not in this clone (deleted branch bake, shallow
+            # fetch) — fall back to the push range, loudly. Never silently
+            # narrower than the pre-baseline behavior.
+            print(f"::warning::image baseline {name}={sha} is not a known "
+                  f"commit here; falling back to the push range for {name}",
+                  file=sys.stderr)
+            continue
+        ahead = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", head, sha],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if ahead.returncode == 0:
+            # The published image already contains this head (a re-run of an
+            # old run, or a race with a newer push's bake). Rebaking would
+            # publish STALE content as the newest GHCR version — skip.
+            print(f"-> baseline {name}={sha[:12]}: registry at-or-ahead; skip",
+                  file=sys.stderr)
+            skip_by_image[name] = True
+            changed_by_image[name] = []
+            continue
+        changed_by_image[name] = diff_names(sha, head)
+        print(f"-> baseline {name}={sha[:12]}: registry diff, "
+              f"{len(changed_by_image[name])} paths", file=sys.stderr)
+    for name in baselines:
+        if name not in changed_by_image and name not in skip_by_image:
+            changed_by_image[name] = list(fallback_changed)
+    return changed_by_image, skip_by_image
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="")
     ap.add_argument("--head", default="HEAD")
     ap.add_argument("--stdin", action="store_true", help="read changed paths from stdin (testing)")
+    ap.add_argument(
+        "--image-baseline", action="append", default=[], metavar="IMAGE=SHA",
+        help="newest published GHCR SHA for IMAGE; switches that image's lane "
+             "to a level-triggered registry diff (bake-images.yml only). "
+             "Ignored with --stdin.",
+    )
     args = ap.parse_args()
 
     if args.stdin:
@@ -476,31 +558,67 @@ def main():
     test_cosim = ci_self or bool(cc & cosim_closure)
 
     # ── per-image bake selectivity ─────────────────────────────────────
-    bake_all = any_path(changed, BAKE_ALL_PATHS)
+    # Each image's lane evaluates against ITS OWN changed set: the registry
+    # diff (baseline..head) when bake-images.yml supplied a usable
+    # --image-baseline (level-triggered — see the module doc), else the push
+    # range (edge-triggered fallback / ci.yml behavior). All derived terms
+    # (crate hits, proto, bake_all) come from the same per-image set, so a
+    # detector/workflow change SINCE THE BASELINE also re-trips the lane.
+    baselines = {}
+    if not args.stdin:
+        for spec in args.image_baseline:
+            name, sep, sha = spec.partition("=")
+            if sep and name and sha:
+                baselines[name] = sha
+    image_changed, image_skip = resolve_image_changed(baselines, args.head, changed) \
+        if baselines else ({}, {})
+
     coord_closure = release_closure(meta, {"engram-coordinator"})
     ha_closure = release_closure(meta, {"engram-host-agent", "engram-uffd-handler"})
     hop_closure = release_closure(meta, {"engram-host-operator"})
-    image_flags = {
-        # Rust images: their release closure, own Dockerfile, or a lockfile bump
-        # (migrations bake into the coord image specifically).
-        "coordinator": bake_all or bool(cc & coord_closure)
-        or any_path(changed, ["docker/coordinator.Dockerfile", "deploy/migrations/", "Cargo.lock", "Cargo.toml"]),
-        "host-agent": bake_all or bool(cc & ha_closure)
-        or any_path(changed, ["docker/host-agent.Dockerfile", "Cargo.lock", "Cargo.toml"]),
-        "host-operator": bake_all or bool(cc & hop_closure)
-        or any_path(changed, ["docker/host-operator.Dockerfile", "Cargo.lock", "Cargo.toml"]),
-        # Bun images: own sources, own Dockerfile, or the protos they codegen.
-        "web": bake_all or proto or any_path(changed, [
-            "web/",
-            "orchestrator/packages/spec-document/",
-            "docker/web.Dockerfile",
-        ]),
-        "orchestrator": bake_all or proto or any_path(changed, ["orchestrator/", "docker/orchestrator.Dockerfile"]),
-    }
+    dirs = crate_dirs(meta, repo_root)
+
+    def image_flag(name):
+        if image_skip.get(name):
+            return False  # registry at-or-ahead of head — nothing to bake
+        cs = image_changed.get(name, changed)
+        cc_l = changed_crates(cs, dirs)
+        bake_all_l = any_path(cs, BAKE_ALL_PATHS)
+        proto_l = any_path(cs, PROTO_PATHS)
+        if name == "coordinator":
+            # Rust images: their release closure, own Dockerfile, or a lockfile
+            # bump (migrations bake into the coord image specifically).
+            return bake_all_l or bool(cc_l & coord_closure) or any_path(
+                cs, ["docker/coordinator.Dockerfile", "deploy/migrations/", "Cargo.lock", "Cargo.toml"])
+        if name == "host-agent":
+            return bake_all_l or bool(cc_l & ha_closure) or any_path(
+                cs, ["docker/host-agent.Dockerfile", "Cargo.lock", "Cargo.toml"])
+        if name == "host-operator":
+            return bake_all_l or bool(cc_l & hop_closure) or any_path(
+                cs, ["docker/host-operator.Dockerfile", "Cargo.lock", "Cargo.toml"])
+        if name == "web":
+            # Bun images: own sources, own Dockerfile, or the protos they codegen.
+            return bake_all_l or proto_l or any_path(cs, [
+                "web/",
+                "orchestrator/packages/spec-document/",
+                "docker/web.Dockerfile",
+            ])
+        if name == "orchestrator":
+            return bake_all_l or proto_l or any_path(
+                cs, ["orchestrator/", "docker/orchestrator.Dockerfile"])
+        raise ValueError(name)
+
+    image_flags = {name: image_flag(name) for name in
+                   ["coordinator", "host-agent", "host-operator", "web", "orchestrator"]}
     # Stable matrix order; the bake job consumes this as `fromJSON`.
     images_matrix = [name for name in
                      ["coordinator", "host-agent", "host-operator", "web", "orchestrator"]
                      if image_flags[name]]
+    # The deploy-dispatch gate must fire whenever ANY container lane trips —
+    # level-triggered lanes can trip when the push range alone would not
+    # (healing a lost/failed predecessor), so widen the legacy edge signal
+    # with the matrix.
+    images = images or bool(images_matrix)
 
     print(f"changed files: {len(changed)}", file=sys.stderr)
     print(f"changed crates: {sorted(cc)}", file=sys.stderr)
