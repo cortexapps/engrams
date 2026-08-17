@@ -149,10 +149,17 @@ async fn splices_a_tls_call_to_the_sibling_guest_port() {
 }
 
 #[tokio::test]
-async fn a_dead_sibling_port_fails_before_any_certificate_is_presented() {
-    // The dial happens BEFORE the handshake on purpose: a refused sibling then
-    // looks to the guest like a refused local port, rather than a successful
-    // TLS session that dies on the first read.
+async fn a_dead_sibling_port_answers_with_a_readable_502() {
+    // Regression, prod 2026-08-16. The dial used to happen BEFORE the
+    // handshake, so a dev server that was not up yet closed the connection with
+    // no certificate: ERR_CONNECTION_CLOSED in a browser, SSL_ERROR_SYSCALL in
+    // curl. Both read as "the platform is blocking this hostname" rather than
+    // "my app is not listening", and an afternoon went into chasing an auth
+    // allow-list that was never the problem.
+    //
+    // We own this hostname and mint a leaf the guest trusts, so the handshake
+    // MUST complete and the failure MUST arrive as an HTTP response naming the
+    // dead port.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let ca = ca();
     let (client_side, proxy_side) = tokio::io::duplex(64 * 1024);
@@ -170,12 +177,91 @@ async fn a_dead_sibling_port_fails_before_any_certificate_is_presented() {
         .await
     });
 
+    let mut tls = tls_client_to(&ca, APP_HOST, client_side)
+        .await
+        .expect("handshake completes even though the sibling port is dead");
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: app\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut out = String::new();
+    tls.read_to_string(&mut out).await.unwrap();
     assert!(
-        tls_client_to(&ca, APP_HOST, client_side).await.is_err(),
-        "handshake must not complete when the sibling port is dead"
+        out.starts_with("HTTP/1.1 502 Bad Gateway"),
+        "a dead app port must answer, not hang up: {out}"
     );
     assert!(
-        served.await.unwrap().is_err(),
-        "serve reports the dial failure"
+        out.contains("8080"),
+        "the response names the dead port: {out}"
     );
+
+    // The connection is served, not errored — the caller logs it and moves on.
+    served
+        .await
+        .unwrap()
+        .expect("serve completes after answering");
+}
+
+#[tokio::test]
+async fn the_502_survives_a_client_whose_request_is_still_in_flight() {
+    // The 502 is only useful if it ARRIVES. A client sends its request right
+    // after the handshake; if we answer and close while those bytes sit unread,
+    // Linux emits an RST on close, and an RST lets the peer's kernel discard
+    // data it has buffered but not yet handed to the application — i.e. the
+    // very 502 we just wrote. So the branch drains the request first (the
+    // classic HTTP "lingering close").
+    //
+    // duplex() has no RST semantics, so this cannot reproduce the reset itself.
+    // What it CAN pin is the behaviour that prevents it: the proxy must consume
+    // the client's request. The request here is deliberately larger than the
+    // duplex buffer, so a proxy that never reads leaves the client's write
+    // blocked forever on backpressure — the timeout below is what catches a
+    // regression, instead of CI hanging.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ca = ca();
+    let (client_side, proxy_side) = tokio::io::duplex(16 * 1024);
+    let server_cfg =
+        engram_egress_proxy::intercept::build_server_config(Arc::new(CertMint::new(ca.clone())));
+    let served = tokio::spawn(async move {
+        app_relay::serve(
+            proxy_side,
+            Vec::new(),
+            SandboxId::new(),
+            5173,
+            &RefusingDialer,
+            server_cfg,
+        )
+        .await
+    });
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut tls = tls_client_to(&ca, APP_HOST, client_side).await.unwrap();
+        // 48 KiB: over the 16 KiB duplex buffer, under the drain's 64 KiB cap.
+        let mut req = b"POST / HTTP/1.1\r\nHost: app\r\nContent-Length: 49152\r\n\r\n".to_vec();
+        req.extend(std::iter::repeat_n(b'x', 48 * 1024));
+        tls.write_all(&req)
+            .await
+            .expect("write buffers into rustls");
+        // The flush is the load-bearing call: write_all only fills rustls'
+        // internal buffer, so it completes whether or not anyone is reading.
+        // Flushing pushes the records into the transport, which blocks once the
+        // buffer fills unless the proxy is draining.
+        tls.flush()
+            .await
+            .expect("the proxy drains, so the flush completes");
+        let mut out = String::new();
+        tls.read_to_string(&mut out).await.unwrap();
+        out
+    })
+    .await
+    .expect("the proxy must consume the request rather than leave the client blocked");
+
+    assert!(
+        outcome.starts_with("HTTP/1.1 502 Bad Gateway"),
+        "the 502 still arrives after an in-flight request: {outcome}"
+    );
+    served
+        .await
+        .unwrap()
+        .expect("serve completes after answering");
 }
