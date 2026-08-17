@@ -52,8 +52,19 @@ pub struct SimHostState {
 pub enum Effect {
     /// `create` / `restore` / `restore_base_for_session`: a new sandbox
     /// appears on the host, ownership learned later at bind time.
+    /// `warm_harness` = the VM carries a captured-warm harness (ADR
+    /// 0037: a snapshot `restore`) that re-dials the moment the VM
+    /// materializes — so the dial is scheduled AT APPLY TIME, never at
+    /// verb-ack time. The harness lives INSIDE the VM: a dial that ran
+    /// ahead of a deferred create used to resolve against world truth
+    /// with no sandbox, die permanently, and leave the later-applied VM
+    /// running with no harness and nothing left to re-dial — a zombie
+    /// no production mechanism can produce (in prod the in-guest SDK
+    /// keeps re-dialing, ADR 0108 A1). Nightly `attach-disagreement`,
+    /// issue #1271.
     Create {
         sandbox: SandboxId,
+        warm_harness: bool,
     },
     Destroy {
         sandbox: SandboxId,
@@ -294,7 +305,8 @@ impl SimHostWorld {
     /// Apply one effect to world truth. A down/absent host swallows it —
     /// the machine that would have held the sandbox is gone (a create
     /// effect never resurrects a restarted host's cleared VM set; a stale
-    /// destroy is a harmless no-op).
+    /// destroy is a harmless no-op — and a swallowed warm create dials
+    /// nothing: no VM, no in-guest harness).
     fn apply_effect(&self, host: HostId, effect: &Effect) {
         // ADR 0108 E: a destroyed VM takes its harness connection (and
         // any in-flight dial) with it. Done BEFORE the hosts lock —
@@ -308,32 +320,49 @@ impl SimHostWorld {
             // capturable by future oracles if needed.
             self.destroyed.lock().push((host, *sandbox));
         }
-        let mut hosts = self.hosts.lock();
-        let Some(h) = hosts.get_mut(&host) else {
-            return;
-        };
-        if !h.up {
-            return;
-        }
-        match effect {
-            Effect::Create { sandbox } => {
-                h.sandboxes.entry(*sandbox).or_insert(None);
+        let warm_dial = {
+            let mut hosts = self.hosts.lock();
+            let Some(h) = hosts.get_mut(&host) else {
+                return;
+            };
+            if !h.up {
+                return;
             }
-            Effect::Destroy { sandbox } => {
-                h.sandboxes.remove(sandbox);
-            }
-            Effect::Bind { session, sandbox } => {
-                if let Some(owner) = h.sandboxes.get_mut(sandbox) {
-                    *owner = Some(*session);
+            match effect {
+                Effect::Create {
+                    sandbox,
+                    warm_harness,
+                } => {
+                    h.sandboxes.entry(*sandbox).or_insert(None);
+                    warm_harness.then_some(*sandbox)
                 }
-            }
-            Effect::Unbind { session } => {
-                for owner in h.sandboxes.values_mut() {
-                    if *owner == Some(*session) {
-                        *owner = None;
+                Effect::Destroy { sandbox } => {
+                    h.sandboxes.remove(sandbox);
+                    None
+                }
+                Effect::Bind { session, sandbox } => {
+                    if let Some(owner) = h.sandboxes.get_mut(sandbox) {
+                        *owner = Some(*session);
                     }
+                    None
+                }
+                Effect::Unbind { session } => {
+                    for owner in h.sandboxes.values_mut() {
+                        if *owner == Some(*session) {
+                            *owner = None;
+                        }
+                    }
+                    None
                 }
             }
+        };
+        // ADR 0108 E: the captured-warm harness (ADR 0037) re-dials when
+        // the restored VM MATERIALIZES — this apply, not the verb's ack.
+        // Outside the hosts lock (order: hosts → attach). A duplicated
+        // warm create re-nudges: the re-delivered restore drops and
+        // re-dials the link, which converges 200 ms later.
+        if let Some(sandbox) = warm_dial {
+            self.nudge_attach(host, sandbox);
         }
     }
 
@@ -739,8 +768,13 @@ impl HostClient for SimHostClient {
         self.world.require_up(self.host_id)?;
         // Ownership is learned at bind_session time (the spec is a
         // template, not a binding — see sandbox.rs's type docs).
-        self.world
-            .record_effect(self.host_id, Effect::Create { sandbox: id });
+        self.world.record_effect(
+            self.host_id,
+            Effect::Create {
+                sandbox: id,
+                warm_harness: false,
+            },
+        );
         Ok(id)
     }
 
@@ -856,13 +890,21 @@ impl HostClient for SimHostClient {
         self.maybe_hang().await;
         let id = SandboxId::from(self.entropy.uuid());
         self.world.require_up(self.host_id)?;
-        self.world
-            .record_effect(self.host_id, Effect::Create { sandbox: id });
         // ADR 0108 E: a snapshot restore resumes a captured-warm harness
-        // (ADR 0037) which re-dials on the vsock epoch bump — schedule
-        // the dial now, independent of any later `start_agent` (which
-        // would nudge/replace it harmlessly).
-        self.world.nudge_attach(self.host_id, id);
+        // (ADR 0037) which re-dials on the vsock epoch bump. The dial is
+        // scheduled by the effect's APPLICATION (the harness lives inside
+        // the VM, so it cannot dial before the VM materializes) — under a
+        // deferred window, an ack-time dial resolved against a world with
+        // no sandbox yet, died permanently, and left the later-applied VM
+        // an unattachable zombie (issue #1271). A later `start_agent`
+        // nudges/replaces the applied dial harmlessly.
+        self.world.record_effect(
+            self.host_id,
+            Effect::Create {
+                sandbox: id,
+                warm_harness: true,
+            },
+        );
         Ok(id)
     }
 
@@ -903,8 +945,15 @@ impl HostClient for SimHostClient {
         self.maybe_hang().await;
         let id = SandboxId::from(self.entropy.uuid());
         self.world.require_up(self.host_id)?;
-        self.world
-            .record_effect(self.host_id, Effect::Create { sandbox: id });
+        // Fresh boot from the image's base snapshot: no session harness
+        // is warm inside it — the dial waits for `start_agent`.
+        self.world.record_effect(
+            self.host_id,
+            Effect::Create {
+                sandbox: id,
+                warm_harness: false,
+            },
+        );
         Ok(id)
     }
 

@@ -427,6 +427,28 @@ fn seed_33058131_evacuation_waits_for_confirmed_source_teardown() {
     run(33058131, Profile::Chaos, 5000);
 }
 
+/// Issue #1271: nightly `attach-disagreement`, firing on ~10 chaos seeds
+/// per nightly since the ADR 0108 E oracle landed (#952 collected the
+/// first two weeks). `SimHostClient::restore` scheduled the captured-warm
+/// harness dial at verb-ACK time while its create effect rode the
+/// deferred queue; a dial due before delivery resolved against world
+/// truth with no sandbox and died permanently, so the VM later
+/// materialized running under an Active session with no harness and
+/// nothing left to re-dial — a plain resume queues no outbox row, so
+/// neither the A4 delivery remedy nor the A8 heartbeat recall ever
+/// fires, and the zombie stands until the oracle's 30 s bound. In
+/// production the state is unreachable: the harness lives INSIDE the
+/// restored VM (its dial cannot precede the VM) and a failed dial
+/// re-dials from the guest (ADR 0108 A1). Fix: the warm dial rides the
+/// create effect's APPLICATION (`Effect::Create { warm_harness }`); the
+/// hand-driven interleaving is pinned in ttft_attach.rs. This seed fired
+/// at step 2190 (45 s unattached) and was the replay diagnosed
+/// end-to-end.
+#[test]
+fn issue_1271_restore_dial_must_ride_the_deferred_create_effect() {
+    run(33091230, Profile::Chaos, 5000);
+}
+
 /// #896 review (HIGH): a budget-exhausted evacuation deliberately leaves
 /// the row Idle WITH its unconfirmed source binding — ownership is never
 /// released on a guess. That residue must stay RECOVERABLE: the resume
