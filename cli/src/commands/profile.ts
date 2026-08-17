@@ -27,6 +27,14 @@ function profileJson(p: Profile) {
       operation: grant.operation,
       resource_constraints: grant.resourceConstraints,
     })),
+    // ADR 0118. Omitting these was actively misleading rather than merely
+    // incomplete: a consumer writing `profile.apps ?? []` cannot tell "this
+    // profile declares no apps" from "the CLI did not serialize the field", and
+    // reads the second as the first. That happened — a correctly-configured
+    // profile was reported as having no apps, and the next step was nearly to
+    // tell the operator their change had not saved.
+    apps: p.apps.map((a) => ({ name: a.name, port: a.port })),
+    env_vars: p.envVars,
     archived: p.archived,
     created_at: p.createdAt,
     updated_at: p.updatedAt,
@@ -70,6 +78,13 @@ export async function get(c: Clients, id: string, json: boolean): Promise<void> 
     ["description", p.description],
     ["image_id", p.imageId],
     ["skills", p.skills.join(", ")],
+    // ADR 0118: `<name>:<port>`, matching how the dashboard renders them.
+    ["apps", p.apps.map((a) => `${a.name}:${a.port}`).join(", ")],
+    // NAMES only. The values are ordinary profile config rather than secrets,
+    // but they are the kind of thing an operator pastes into a shared terminal
+    // or a ticket, and there is no reason to spill them for a `get`. `--json`
+    // carries the full map for anyone who explicitly asked for it.
+    ["env_vars", Object.keys(p.envVars).sort().join(", ")],
     ["integration_grants", p.integrationGrants.map(formatIntegrationGrant).join(", ")],
     ["created_at", p.createdAt],
   ]);
