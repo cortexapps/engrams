@@ -81,7 +81,10 @@ pub async fn relay_connect(
     if !ack.ok {
         return Err(SandboxError::Vm(
             format!(
-                "proxy_port: guest relay could not reach 127.0.0.1:{target_port}: {}",
+                // "loopback", not "127.0.0.1": the relay tries both families,
+                // so naming one sent a reader hunting an IPv4 bind that was
+                // never the question.
+                "proxy_port: guest relay could not reach loopback:{target_port} (tried 127.0.0.1 and [::1]): {}",
                 ack.error.unwrap_or_default()
             )
             .into(),
