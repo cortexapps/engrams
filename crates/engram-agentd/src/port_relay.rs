@@ -2,9 +2,12 @@
 //!
 //! The host-agent dials this listener ([`PROXY_PORT_VSOCK_PORT`]) once per
 //! forwarded browser connection, sends a [`RelayConnect`] naming the guest TCP
-//! port, and we dial `127.0.0.1:target_port` *inside* the guest and splice raw
+//! port, and we dial `target_port` on loopback *inside* the guest and splice raw
 //! bytes. That reaches loopback-bound dev servers (Vite, the Tilt UI, `next
 //! dev`) that a direct dial_ip dial cannot.
+//!
+//! BOTH loopback families are tried, IPv4 first — a server told to bind
+//! `localhost` under Node 17+ listens on `::1` alone. See [`dial_loopback`].
 //!
 //! **No head-of-line blocking:** one vsock connection per forwarded TCP
 //! connection, one task per connection, no shared state on the data path. The
@@ -255,22 +258,50 @@ where
     }
 }
 
-/// Dial `127.0.0.1:port`, retrying connection-refused within [`DIAL_DEADLINE`].
+/// Dial the app's port on loopback — BOTH families — retrying
+/// connection-refused within [`DIAL_DEADLINE`].
+///
+/// IPv6 is not optional here. A dev server told to bind `localhost` asks the
+/// resolver, and Node 17+ (so Vite, Next, and most of the JS ecosystem) prefers
+/// the AAAA answer: it binds `::1` and NOTHING listens on `127.0.0.1`. Dialing
+/// only IPv4 then fails with ECONNREFUSED for an app that is running perfectly,
+/// and the browser sees a bare 502 from the preview edge.
+///
+/// That is not hypothetical — it is engrams' own `web` dev server. Vite's
+/// config sets `port: 5173` and no `host`, so a session with a fully green Tilt
+/// stack served 502s on its `web` app URL, and `curl` inside the guest confirmed
+/// it: `127.0.0.1:5173` refused, `[::1]:5173` answered 200. Every app that
+/// binds `localhost` the modern way was invisible to previews.
+///
+/// IPv4 is tried first because it is still the more common bind, and its error
+/// is the one worth reporting when both families are dead.
 async fn dial_loopback(port: u16) -> std::io::Result<TcpStream> {
     let deadline = crate::time_source::metrics_now() + DIAL_DEADLINE;
     let mut backoff = BACKOFF_START;
     loop {
-        match TcpStream::connect(("127.0.0.1", port)).await {
+        let v4 = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await;
+        let refused = match v4 {
             Ok(s) => return Ok(s),
             Err(e) => {
-                let refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
-                if !refused || crate::time_source::metrics_now() >= deadline {
+                // Anything other than "nothing is listening" is a real error
+                // and says nothing about the other family — surface it as-is,
+                // with its os error intact.
+                if e.kind() != std::io::ErrorKind::ConnectionRefused {
                     return Err(e);
                 }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(BACKOFF_MAX);
+                e
             }
+        };
+        // Nothing on IPv4 loopback: the listener may be on ::1 only.
+        if let Ok(s) = TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port)).await {
+            return Ok(s);
         }
+        // Neither family answered. The port may still be coming up.
+        if crate::time_source::metrics_now() >= deadline {
+            return Err(refused);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
 
@@ -368,6 +399,62 @@ mod tests {
 
     /// Drive one RelayConnect → ack → echo round trip over `host`, against a
     /// throwaway `127.0.0.1` echo server standing in for the guest dev
+    /// A dev server on IPv6 loopback ONLY must still be reachable.
+    ///
+    /// Regression, prod 2026-08-17: engrams' own `web` app served 502s from its
+    /// preview URL while Tilt reported it green. Vite binds `localhost`, Node
+    /// 17+ prefers the AAAA answer, so it listened on `::1` and nothing was on
+    /// `127.0.0.1` — and the relay only ever dialed IPv4. Every app that binds
+    /// `localhost` the modern way was invisible to previews.
+    #[tokio::test]
+    async fn relay_reaches_a_listener_bound_only_on_ipv6_loopback() {
+        let listener = match TcpListener::bind("[::1]:0").await {
+            Ok(l) => l,
+            // A CI kernel with IPv6 disabled cannot host this case; the IPv4
+            // coverage above still applies. Skip rather than fail spuriously.
+            Err(e) => {
+                eprintln!("skipping: no IPv6 loopback available ({e})");
+                return;
+            }
+        };
+        let target = listener.local_addr().unwrap().port();
+        // Prove the premise: nothing on IPv4 at that port, so a v4-only dial
+        // would fail and this test would be vacuous.
+        assert!(
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, target))
+                .await
+                .is_err(),
+            "the listener must be IPv6-only for this test to mean anything",
+        );
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64];
+            let n = s.read(&mut buf).await.unwrap();
+            s.write_all(&buf[..n]).await.unwrap();
+            let _ = s.shutdown().await;
+        });
+
+        let (mut host, guest) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(serve_relay_connection(guest));
+        write_msg(
+            &mut host,
+            &RelayConnect {
+                target_port: target,
+            },
+        )
+        .await
+        .unwrap();
+        let ack: RelayAck = read_msg(&mut host).await.unwrap();
+        assert!(ack.ok, "relay must reach an IPv6-only listener: {ack:?}");
+
+        host.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        host.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ping");
+        drop(host);
+        let _ = relay.await;
+    }
+
     /// server. Factored out of `relay_dials_loopback_and_round_trips` above
     /// so the backoff/supervisor tests below can reuse the same handshake
     /// without retyping it.
