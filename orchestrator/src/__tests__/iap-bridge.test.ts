@@ -42,7 +42,12 @@ import type { AddressInfo } from "net";
 import { generateKeyPair, SignJWT, exportJWK } from "jose";
 import { Hono } from "hono";
 import { buildServer } from "../server.ts";
-import { iapBridge, isPreviewHost, _resetJwksCache } from "../auth/iap-bridge.ts";
+import {
+  iapBridge,
+  isPreviewHost,
+  buildRescopedCookie,
+  _resetJwksCache,
+} from "../auth/iap-bridge.ts";
 import { checkDb } from "../db/client.ts";
 import authRoute from "../routes/auth.ts";
 import health from "../routes/health.ts";
@@ -931,5 +936,65 @@ describe("isPreviewHost (ADR 0118)", () => {
     // A deployment that runs no preview edge behaves exactly as before.
     expect(isPreviewHost("anything.example.com", "")).toBe(false);
     expect(isPreviewHost(undefined, BASE)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADR 0118: repairing a legacy host-only session cookie
+// ---------------------------------------------------------------------------
+
+describe("buildRescopedCookie (ADR 0118)", () => {
+  const NAME = "__Secure-better-auth.session_token";
+  const ATTRS = {
+    domain: ".engrams.cortex.io",
+    path: "/",
+    httpOnly: true,
+    secure: true,
+    sameSite: "lax",
+    maxAge: 604800,
+  };
+
+  // A cookie minted before the domain config landed is host-only, and the
+  // Cookie header cannot say so — it carries names and values, never
+  // attributes. The bridge's fast path then makes it permanent: the session
+  // verifies, so it returns early and never re-mints, and the user works on the
+  // main host while being invisible on every session-app hostname.
+  test("re-emits the SAME token with the configured Domain", () => {
+    const out = buildRescopedCookie(`${NAME}=abc.def`, NAME, ATTRS)!;
+    expect(out[0]).toBe(
+      `${NAME}=abc.def; Path=/; Domain=.engrams.cortex.io; HttpOnly; Secure; SameSite=lax; Max-Age=604800`,
+    );
+  });
+
+  // Two cookies of one name is not a stable resting place: the browser sends
+  // both, RFC 6265 orders the older first, and after a session refresh the
+  // stale value is the one the server parses — random 401s no sign-in fixes.
+  test("expires the host-only copy, targeting it by having NO Domain", () => {
+    const out = buildRescopedCookie(`${NAME}=abc.def`, NAME, ATTRS)!;
+    expect(out).toHaveLength(2);
+    expect(out[1]).toBe(`${NAME}=; Path=/; Max-Age=0; HttpOnly; Secure`);
+    expect(out[1]).not.toContain("Domain=");
+  });
+
+  // Re-using the value rather than minting a new session is what keeps this
+  // safe: if the legacy host-only copy survives, both carry the same token, so
+  // whichever the server parses resolves the same session.
+  test("picks the session cookie out of a crowded header, value intact", () => {
+    const out = buildRescopedCookie(`other=1; ${NAME}=tok%3Dwith.chars; last=2`, NAME, ATTRS)!;
+    expect(out[0].startsWith(`${NAME}=tok%3Dwith.chars;`)).toBe(true);
+  });
+
+  test("no domain configured → nothing to repair (host-only by design)", () => {
+    expect(buildRescopedCookie(`${NAME}=abc`, NAME, { ...ATTRS, domain: undefined })).toBeNull();
+  });
+
+  test("no cookie header, or no session cookie in it → null", () => {
+    expect(buildRescopedCookie(undefined, NAME, ATTRS)).toBeNull();
+    expect(buildRescopedCookie("unrelated=1; other=2", NAME, ATTRS)).toBeNull();
+  });
+
+  // A cookie whose name merely CONTAINS ours must not be mistaken for it.
+  test("matches the cookie name exactly, not by prefix", () => {
+    expect(buildRescopedCookie(`x${NAME}=abc`, NAME, ATTRS)).toBeNull();
   });
 });
