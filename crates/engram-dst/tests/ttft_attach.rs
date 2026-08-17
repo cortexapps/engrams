@@ -662,3 +662,69 @@ fn ttft_liveness_oracle_fires_on_a_stale_handle_without_the_repair() {
         assert_eq!(violation.invariant, "ttft-liveness");
     });
 }
+
+/// Issue #1271 (nightly `attach-disagreement`): the captured-warm
+/// harness dial rides the restore's CREATE EFFECT, never the verb's
+/// ack. Under a deferred-effect window the ack-time dial used to come
+/// due against world truth with no sandbox, die permanently, and leave
+/// the later-applied VM running under an Active session with no harness
+/// and nothing left to re-dial — a plain resume queues no outbox row,
+/// so neither the A4 delivery remedy nor the A8 heartbeat recall ever
+/// fires, and the silent zombie stands until the oracle's 30 s bound.
+/// In production the state is unreachable: the harness lives INSIDE the
+/// restored VM (its dial cannot precede the VM's materialization), and
+/// a failed dial re-dials from the guest (ADR 0108 A1). The full
+/// nightly shape is pinned in regression_seeds.rs (seed 33091230).
+#[test]
+fn restore_dial_rides_the_deferred_create_effect() {
+    rt().block_on(async {
+        tokio::time::pause();
+        let mut sim = Sim::new(0x010D, Profile::Calm);
+        let host = sim.world.host_ids[0];
+        let client = engram_dst::world::SimHostClient {
+            host_id: host,
+            world: sim.world.host_world.clone(),
+            entropy: sim.world.entropy.clone(),
+        };
+        // Open the deferred window, then restore: the coordinator holds
+        // the ack (a sandbox id) while the world effect stays queued.
+        sim.world.host_world.set_deferred(host, true);
+        let metadata: engram_core::types::snapshot::SnapshotMetadata =
+            serde_json::from_value(serde_json::json!({
+                "id": engram_core::SnapshotId::from(sim.world.entropy.uuid()),
+                "size_bytes": 0,
+                "created_at": chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+                "image_version": SIM_IMAGE,
+            }))
+            .expect("minimal snapshot metadata");
+        use engram_core::traits::HostClient as _;
+        let sandbox = client
+            .restore(metadata, engram_core::traits::SessionFence::unfenced())
+            .await
+            .expect("restore acks under a deferred window");
+
+        // No VM yet, no dial: the warm harness cannot run ahead of the
+        // machine it lives in, and passing time must kill nothing.
+        sim.execute(Step::AdvanceTime(Duration::from_secs(5))).await;
+        assert_eq!(
+            sim.world.host_world.attach_nudges(sandbox),
+            0,
+            "the dial waits for the VM to materialize",
+        );
+        assert!(!sim.world.host_world.harness_attached(sandbox));
+
+        // Delivery materializes the VM — the captured-warm harness dials
+        // NOW and registers one dial-delay later.
+        sim.execute(Step::DeliverEffects).await;
+        assert_eq!(
+            sim.world.host_world.attach_nudges(sandbox),
+            1,
+            "the dial began at effect application",
+        );
+        sim.execute(Step::AdvanceTime(Duration::from_secs(1))).await;
+        assert!(
+            sim.world.host_world.harness_attached(sandbox),
+            "the materialized VM's captured-warm harness attached",
+        );
+    });
+}
