@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use engram_core::types::egress::AppEndpoint;
 use engram_core::SandboxId;
 use rustls::ServerConfig;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::LazyConfigAcceptor;
 
 use crate::guest_gateway::TunnelStream;
@@ -105,6 +105,37 @@ pub fn app_unreachable_response(port: u16) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Read and discard whatever the client already sent, so the connection closes
+/// with a FIN rather than an RST.
+///
+/// This is the HTTP "lingering close" every serious server implements, and it
+/// is what makes the 502 above actually arrive. The client sends its request
+/// right after the handshake; if we answer and close while those bytes sit
+/// unread in the receive buffer, Linux emits an **RST** on close, and an RST
+/// lets the peer's kernel discard data it has buffered but not yet handed to
+/// the application. The response we just wrote is exactly that data — so a
+/// client that has not read it yet gets `ECONNRESET` instead, and we are back
+/// to the unreadable failure this whole branch exists to remove. `close_notify`
+/// does not help: it addresses the TLS truncation signal, not the RST.
+///
+/// Bounded on both axes, because the peer is a guest we do not trust to behave:
+/// at most `DRAIN_LIMIT` bytes and `DRAIN_WINDOW` of wall time, then we close
+/// regardless. Neither bound needs to be generous — the payload we are draining
+/// is one HTTP request that has already been sent.
+async fn lingering_close<S>(stream: &mut S)
+where
+    S: AsyncRead + Unpin,
+{
+    const DRAIN_LIMIT: u64 = 64 * 1024;
+    const DRAIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let _ = tokio::time::timeout(DRAIN_WINDOW, async {
+        let mut sink = tokio::io::sink();
+        tokio::io::copy(&mut stream.take(DRAIN_LIMIT), &mut sink).await
+    })
+    .await;
+}
+
 /// Serve one short-circuited connection.
 ///
 /// The guest opened a TLS connection to a sibling app's public hostname. We
@@ -182,6 +213,7 @@ where
             // INSTEAD of the body — which would put us straight back to an
             // unreadable failure, the whole thing this branch exists to fix.
             let _ = client_tls.shutdown().await;
+            lingering_close(&mut client_tls).await;
             return Ok((0, 0));
         }
     };

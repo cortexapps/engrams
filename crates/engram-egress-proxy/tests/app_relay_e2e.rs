@@ -201,3 +201,67 @@ async fn a_dead_sibling_port_answers_with_a_readable_502() {
         .unwrap()
         .expect("serve completes after answering");
 }
+
+#[tokio::test]
+async fn the_502_survives_a_client_whose_request_is_still_in_flight() {
+    // The 502 is only useful if it ARRIVES. A client sends its request right
+    // after the handshake; if we answer and close while those bytes sit unread,
+    // Linux emits an RST on close, and an RST lets the peer's kernel discard
+    // data it has buffered but not yet handed to the application — i.e. the
+    // very 502 we just wrote. So the branch drains the request first (the
+    // classic HTTP "lingering close").
+    //
+    // duplex() has no RST semantics, so this cannot reproduce the reset itself.
+    // What it CAN pin is the behaviour that prevents it: the proxy must consume
+    // the client's request. The request here is deliberately larger than the
+    // duplex buffer, so a proxy that never reads leaves the client's write
+    // blocked forever on backpressure — the timeout below is what catches a
+    // regression, instead of CI hanging.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ca = ca();
+    let (client_side, proxy_side) = tokio::io::duplex(16 * 1024);
+    let server_cfg =
+        engram_egress_proxy::intercept::build_server_config(Arc::new(CertMint::new(ca.clone())));
+    let served = tokio::spawn(async move {
+        app_relay::serve(
+            proxy_side,
+            Vec::new(),
+            SandboxId::new(),
+            5173,
+            &RefusingDialer,
+            server_cfg,
+        )
+        .await
+    });
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut tls = tls_client_to(&ca, APP_HOST, client_side).await.unwrap();
+        // 48 KiB: over the 16 KiB duplex buffer, under the drain's 64 KiB cap.
+        let mut req = b"POST / HTTP/1.1\r\nHost: app\r\nContent-Length: 49152\r\n\r\n".to_vec();
+        req.extend(std::iter::repeat_n(b'x', 48 * 1024));
+        tls.write_all(&req)
+            .await
+            .expect("write buffers into rustls");
+        // The flush is the load-bearing call: write_all only fills rustls'
+        // internal buffer, so it completes whether or not anyone is reading.
+        // Flushing pushes the records into the transport, which blocks once the
+        // buffer fills unless the proxy is draining.
+        tls.flush()
+            .await
+            .expect("the proxy drains, so the flush completes");
+        let mut out = String::new();
+        tls.read_to_string(&mut out).await.unwrap();
+        out
+    })
+    .await
+    .expect("the proxy must consume the request rather than leave the client blocked");
+
+    assert!(
+        outcome.starts_with("HTTP/1.1 502 Bad Gateway"),
+        "the 502 still arrives after an in-flight request: {outcome}"
+    );
+    served
+        .await
+        .unwrap()
+        .expect("serve completes after answering");
+}
