@@ -215,3 +215,61 @@ re-bake, and the exactly-once oracle), A7 (vsock severance watch,
 ping/pong liveness, the Firecracker RX-gate arm), and the two swarm-found
 livelocks recorded above. A6/A7 get their own ADR if they change the
 architecture beyond what is described here.
+
+## A6 design (2026-08-20, Proposed)
+
+A6 stays inside this ADR: the prompt rides the existing free-form
+`SpawnHarnessRequest.env` map, so no wire shape changes (the
+`HARNESS_CWD_ENV` precedent — engram-harness-proto — an old agentd
+ignores an unknown env key; no `WIRE_VERSION` bump, no base-snapshot
+re-bake; the harness rides the fleet bundle stamp per ADR 0062).
+
+**Mechanism.** `create_session_core` keeps the durable accept exactly as
+today (`emit_prompt_accept`: receipt + user echo + outbox row with the
+deterministic id `create:{session_id}`, committed before any boot — the
+echo-before-`run_started` ordering stays true by construction) but skips
+the Deliver-op enqueue on this lane. `boot_on_reserved_host` — the one
+fn both create lanes traverse — peeks the undelivered `create:{sid}`
+outbox row (`outbox_next_due`, no new store method) at the `AgentSpec`
+stamp site and sets three env keys: `ENGRAM_INITIAL_PROMPT`,
+`ENGRAM_INITIAL_PROMPT_ID`, `ENGRAM_INITIAL_PROMPT_MODE` (ADR 0107 mode
+rides too). The peek, not `BootInputs.prompt`, is the source of truth:
+env text equals durable text, including a pre-boot edit, and the queued
+(no-capacity) lane gets the same rail for free. After `start_agent`
+returns Ok with the env stamped, the boot marks the row delivered
+(`outbox_mark_delivered`, the ordinary `ACK_TIMEOUT`); the harness's
+`run_started{prompt_id}` acks it. The row is thereby demoted from
+delivery vehicle to at-least-once crash-recovery record.
+
+**Guest consumer.** `run_engine` seeds one synthetic
+`HarnessCommand::Prompt` from the env, through the same intake as a wire
+frame, before the select loop. `seen_prompt_ids` makes double delivery
+(env + a redelivered row) run exactly once. The env is read once at
+process start; the supervisor's reattach path never re-applies env, so a
+respawn or reattach cannot re-inject the prompt — the
+resume/reattach spec stays prompt-less by construction
+(`materialize_snapshot_resume` is untouched).
+
+**Size.** Env eligibility is capped at 24 KiB (headroom under the
+per-string `E2BIG` budget); an oversize prompt falls through to the
+outbox rail silently. Separately, `send_prompt_core` gains the API-level
+sanity cap it never had (~1 MiB, 4xx).
+
+**Skew.** Rollout order is the fence: the harness bundle restages and
+the host fleet rolls BEFORE the coordinator stamps the env. The residual
+skew (a host that missed the roll drops the env silently) costs at most
+one `ACK_TIMEOUT` on that host — the marked-delivered row redelivers and
+the guest dedups. `engram_initial_prompt_env_{stamped,fallback}_total`
+and redelivery counts on `create:*` rows are the skew detectors. No
+`HarnessDescriptor` capability gate.
+
+**Landing condition.** The exactly-once oracle above (Workstream E)
+ships BEFORE the behavior change and must pass on the outbox-only path
+first.
+
+**Planned deletions once the fallback counters read zero.** The
+create-lane Deliver enqueue; the boot-tail sibling-deliver wake (ADR
+0094 — the `finish_op` wake for `for_delivery` resumes stays); the
+create-lane share of the attach-grace machinery (the deliver-races-attach
+window no longer exists on create). The `KNOWN_WAIT_RETRY` pre-Active
+arm stays for follow-up prompts sent during a boot.
