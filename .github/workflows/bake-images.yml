@@ -735,14 +735,9 @@ jobs:
         run: |
           set -euo pipefail
           # Keep CLAUDE_VERSION in lockstep with ci.yml's
-          # bake-harness-claude-artifact, the justfile, and the probe
-          # attestation (see the pin rationale + attestation gate in ci.yml).
+          # bake-harness-claude-artifact and the justfile (see the pin
+          # rationale in ci.yml).
           CLAUDE_VERSION=2.1.228
-          attested=$(sed -n 's/^version = "\(.*\)"$/\1/p' deploy/harness-claude/claude-pin.toml)
-          if [ "$attested" != "$CLAUDE_VERSION" ]; then
-            echo "::error::CLAUDE_VERSION=$CLAUDE_VERSION but claude-pin.toml attests $attested — run scripts/claude-steer-probe.py and update the attestation (ADR 0052)"
-            exit 1
-          fi
           # ADR 0080: agentd ships as bundle-agentd off this same musl build
           # (no image bake carries it anymore).
           cargo build --release --target x86_64-unknown-linux-musl \

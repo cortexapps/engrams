@@ -765,17 +765,15 @@ bundles-squashfs: dev-link-shared
     # nix cross toolchain on PATH (this recipe runs under `nix develop`).
     harness_tree="${ENGRAM_HARNESS_CLAUDE_TREE:-}"
     if [ -z "$harness_tree" ]; then
-        # PINNED — keep in lockstep with ci.yml's bake-harness-claude-artifact,
-        # bake-images.yml, AND deploy/harness-claude/claude-pin.toml (the
-        # probe attestation CI asserts against). Questions and plan approval
-        # ride the injected MCP tools (ask_user_question / exit_plan_mode)
-        # since the CLI removed the AskUserQuestion + ExitPlanMode built-ins
-        # from headless mode (cortexapps/engrams#431). Bump deliberately and
-        # re-verify BOTH spines: the deferred-tool spine (defer parks the
-        # turn, `--resume` re-fires id-stable, the MCP bridge serves the
-        # stash) and the steering behavior
-        # (`python3 scripts/claude-steer-probe.py` must report STEER —
-        # ADR 0052 2026-08-20 update; update claude-pin.toml with the result).
+        # PINNED — keep in lockstep with ci.yml's bake-harness-claude-artifact
+        # and bake-images.yml. Questions and plan approval ride the injected
+        # MCP tools (ask_user_question / exit_plan_mode) since the CLI removed
+        # the AskUserQuestion + ExitPlanMode built-ins from headless mode
+        # (cortexapps/engrams#431). Bump deliberately and re-verify BOTH
+        # spines: the deferred-tool spine (defer parks the turn, `--resume`
+        # re-fires id-stable, the MCP bridge serves the stash) and the
+        # steering behavior (`python3 scripts/claude-steer-probe.py` must
+        # report STEER — ADR 0052 2026-08-20 update).
         CLAUDE_VERSION=2.1.228
         case "$(uname -m)" in
             arm64 | aarch64) htarget=aarch64-unknown-linux-musl; carch=linux-arm64 ;;

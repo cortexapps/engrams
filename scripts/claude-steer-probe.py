@@ -10,15 +10,13 @@ was over-generalized; the CLI drifting under a pin with no engrams code
 change is a proven failure mode (the 2.1.187 AskUserQuestion removal,
 engrams#431). This probe pins the behavior empirically.
 
-Run it against the EXACT binary the pin names, then record the result
-in deploy/harness-claude/claude-pin.toml (CI asserts the attestation
-version matches CLAUDE_VERSION, so a pin bump without a re-probe fails
-the build):
+Run it against the EXACT binary a pin bump names (the CLAUDE_VERSION
+sites list this probe in their bump procedure):
 
     python3 scripts/claude-steer-probe.py [path-to-claude-binary]
 
 Needs a logged-in claude (or ANTHROPIC_API_KEY) — it makes ~2 real
-model calls. Not wired into CI directly: CI has no model credentials.
+model calls, so it runs on the bumper's machine, not in CI.
 
 Verdict (exit code):
   0 STEER  — the injected instruction was attended within the same
