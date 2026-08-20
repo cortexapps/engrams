@@ -273,29 +273,42 @@ pub(crate) async fn edit_queued_prompt_core(
     if text.is_empty() {
         return Err(ApiError::BadRequest("`text` is required".into()));
     }
-    // ADR 0073: the prompt may still be an UNDELIVERED outbox row (the
-    // driver hasn't handed it to the relay yet) — edit it in place in
-    // PG. Otherwise it lives in the harness's type-ahead queue: edit it
-    // there, exactly as before.
-    if state
+    // ADR 0052 (2026-08-20 correction): the durable row stays UNACKED
+    // through a running turn (`prompt_queued` no longer acks), so an
+    // edit must land in BOTH copies — the PG row (what a redelivery
+    // reads after a harness death) and, when the prompt already reached
+    // the harness, its in-memory queue (what the turn boundary
+    // consumes). The harness leg is a no-op for ids it doesn't hold
+    // (an undelivered row has no queue copy), so forwarding is always
+    // safe; it is REQUIRED to succeed only when PG had nothing (the
+    // prompt lives solely in the queue — pre-correction rows).
+    let row_updated = state
         .services
         .meta
         .outbox_update_prompt_text(&prompt_id, &text)
         .await
-        .map_err(|e| ApiError::Internal(format!("edit queued prompt: {e}")))?
-    {
-        return Ok("queued prompt edited");
-    }
-    let sandbox_id = state
-        .resolve_sandbox(id)
-        .await
-        .ok_or_else(|| ApiError::Conflict("session has no live sandbox".into()))?;
-    state
-        .services
-        .host
-        .edit_queued_prompt(sandbox_id, prompt_id, text)
-        .await
         .map_err(|e| ApiError::Internal(format!("edit queued prompt: {e}")))?;
+    match state.resolve_sandbox(id).await {
+        Some(sandbox_id) => {
+            if let Err(e) = state
+                .services
+                .host
+                .edit_queued_prompt(sandbox_id, prompt_id.clone(), text)
+                .await
+            {
+                if !row_updated {
+                    return Err(ApiError::Internal(format!("edit queued prompt: {e}")));
+                }
+                tracing::debug!(session_id = %id, prompt_id, error = %e,
+                    "harness-side edit failed; the durable row carries the edit and a \
+                     redelivery replays it");
+            }
+        }
+        None if !row_updated => {
+            return Err(ApiError::Conflict("session has no live sandbox".into()));
+        }
+        None => {}
+    }
     Ok("queued prompt edited")
 }
 
@@ -309,30 +322,42 @@ pub(crate) async fn dequeue_queued_prompt_core(
     if prompt_id.is_empty() {
         return Err(ApiError::BadRequest("`prompt_id` is required".into()));
     }
-    // ADR 0073: an undelivered outbox row is dequeued by deleting it —
-    // it never reached the harness. The web's transcript reconciles via
-    // the PromptDequeued event, which the HOST path emits; for the
-    // PG-only path the held echo is simply never consumed (same render
-    // outcome as pre-0067's failed-forward shape).
-    if state
+    // ADR 0052 (2026-08-20 correction): kill BOTH copies. The durable
+    // row (unacked through a running turn) dies first, so the withdrawn
+    // prompt can never redeliver — then the harness's in-memory copy is
+    // dropped by the forwarded DequeueQueued, whose `PromptDequeued`
+    // echo is also a terminal ack (belt-and-suspenders for the copy
+    // that raced this delete). The web's transcript reconciles via the
+    // PromptDequeued event on the harness path; for the PG-only path
+    // the held echo is simply never consumed (same render outcome as
+    // pre-0067's failed-forward shape).
+    let row_deleted = state
         .services
         .meta
-        .outbox_delete_undelivered(&prompt_id)
-        .await
-        .map_err(|e| ApiError::Internal(format!("dequeue queued prompt: {e}")))?
-    {
-        return Ok("queued prompt dequeued");
-    }
-    let sandbox_id = state
-        .resolve_sandbox(id)
-        .await
-        .ok_or_else(|| ApiError::Conflict("session has no live sandbox".into()))?;
-    state
-        .services
-        .host
-        .dequeue_queued_prompt(sandbox_id, prompt_id)
+        .outbox_delete_unacked(&prompt_id)
         .await
         .map_err(|e| ApiError::Internal(format!("dequeue queued prompt: {e}")))?;
+    match state.resolve_sandbox(id).await {
+        Some(sandbox_id) => {
+            if let Err(e) = state
+                .services
+                .host
+                .dequeue_queued_prompt(sandbox_id, prompt_id.clone())
+                .await
+            {
+                if !row_deleted {
+                    return Err(ApiError::Internal(format!("dequeue queued prompt: {e}")));
+                }
+                tracing::debug!(session_id = %id, prompt_id, error = %e,
+                    "harness-side dequeue failed; the durable row is gone so the prompt \
+                     cannot redeliver (the queue copy dies with the harness)");
+            }
+        }
+        None if !row_deleted => {
+            return Err(ApiError::Conflict("session has no live sandbox".into()));
+        }
+        None => {}
+    }
     Ok("queued prompt dequeued")
 }
 

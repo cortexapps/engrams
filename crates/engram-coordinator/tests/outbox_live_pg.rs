@@ -261,7 +261,13 @@ async fn delivered_row_rearms_after_ack_timeout() {
 
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
-async fn undelivered_rows_are_editable_and_dequeueable_delivered_are_not() {
+async fn unacked_rows_are_editable_and_dequeueable_acked_are_immutable() {
+    // ADR 0052 (2026-08-20 correction): `prompt_queued` no longer acks,
+    // so a queued prompt's row stays delivered-but-unacked through the
+    // running turn — and it is the durable copy a redelivery reads. The
+    // edit/dequeue arms therefore match ANY unacked row (delivered or
+    // not); only an ACKED row (the prompt ran or was withdrawn) is
+    // immutable.
     let Some(meta) = connect().await else { return };
     let sid = seed_session(&meta).await;
     let row = prompt_row(sid, &format!("ed-{sid}"), "original");
@@ -275,27 +281,46 @@ async fn undelivered_rows_are_editable_and_dequeueable_delivered_are_not() {
     let head = meta.outbox_next_due(sid).await.unwrap().unwrap();
     assert_eq!(head.payload["text"], "edited");
 
-    // Once delivered, the PG arms refuse — the harness queue owns it.
+    // Delivered-but-unacked (the queued-through-a-turn shape): STILL
+    // editable — a redelivery after a harness death must carry the
+    // edit, not resurrect the original.
     meta.outbox_mark_delivered(&row.prompt_id, Duration::from_secs(30))
         .await
         .expect("deliver");
-    assert!(!meta
-        .outbox_update_prompt_text(&row.prompt_id, "too late")
+    assert!(meta
+        .outbox_update_prompt_text(&row.prompt_id, "edited again")
         .await
         .expect("edit after delivery"));
-    assert!(!meta
-        .outbox_delete_undelivered(&row.prompt_id)
+    meta.outbox_defer(&row.prompt_id, Duration::ZERO)
         .await
-        .expect("dequeue after delivery"));
+        .expect("make due for the re-read");
+    let redelivered = meta.outbox_next_due(sid).await.unwrap().unwrap();
+    assert_eq!(
+        redelivered.payload["text"], "edited again",
+        "a redelivery carries the post-delivery edit",
+    );
 
-    // A second, undelivered row deletes cleanly.
-    let mut second = prompt_row(sid, &format!("dq-{sid}"), "dequeue me");
+    // Delivered-but-unacked: dequeue deletes it — a withdrawn prompt
+    // can never redeliver.
+    assert!(meta
+        .outbox_delete_unacked(&row.prompt_id)
+        .await
+        .expect("dequeue delivered-unacked"));
+    assert!(meta.outbox_next_due(sid).await.unwrap().is_none());
+
+    // ACKED: immutable — no edit, no dequeue.
+    let mut second = prompt_row(sid, &format!("ack-{sid}"), "ran already");
     second.created_at = Utc::now();
     meta.outbox_enqueue(&second).await.expect("enqueue second");
-    assert!(meta
-        .outbox_delete_undelivered(&second.prompt_id)
+    assert!(meta.outbox_ack(&second.prompt_id).await.expect("ack"));
+    assert!(!meta
+        .outbox_update_prompt_text(&second.prompt_id, "too late")
         .await
-        .expect("dequeue undelivered"));
+        .expect("edit after ack"));
+    assert!(!meta
+        .outbox_delete_unacked(&second.prompt_id)
+        .await
+        .expect("dequeue after ack"));
 }
 
 #[tokio::test]

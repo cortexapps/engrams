@@ -3717,11 +3717,14 @@ impl MetadataStore for PostgresStore {
         prompt_id: &str,
         text: &str,
     ) -> Result<bool, MetaError> {
+        // ADR 0052 (2026-08-20 correction): matches any UNACKED row —
+        // a queued prompt's row stays delivered-but-unacked through the
+        // running turn, and it is the durable copy a redelivery reads,
+        // so the edit must land here too. An acked row is immutable.
         let res = sqlx::query(
             "UPDATE session_outbox
              SET payload = jsonb_set(payload, '{text}', to_jsonb($2::text))
-             WHERE prompt_id = $1 AND kind = 'prompt'
-               AND delivered_at IS NULL AND acked_at IS NULL",
+             WHERE prompt_id = $1 AND kind = 'prompt' AND acked_at IS NULL",
         )
         .bind(prompt_id)
         .bind(text)
@@ -3731,10 +3734,14 @@ impl MetadataStore for PostgresStore {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn outbox_delete_undelivered(&self, prompt_id: &str) -> Result<bool, MetaError> {
+    async fn outbox_delete_unacked(&self, prompt_id: &str) -> Result<bool, MetaError> {
+        // ADR 0052 (2026-08-20 correction): a user-withdrawn prompt's
+        // durable copy dies here regardless of delivery state, so it
+        // can never redeliver; the harness's in-memory copy is dropped
+        // by the forwarded DequeueQueued, best-effort.
         let res = sqlx::query(
             "DELETE FROM session_outbox
-             WHERE prompt_id = $1 AND delivered_at IS NULL AND acked_at IS NULL",
+             WHERE prompt_id = $1 AND acked_at IS NULL",
         )
         .bind(prompt_id)
         .execute(&self.pool)

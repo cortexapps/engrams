@@ -2000,13 +2000,65 @@ async fn outbox_flow(ctx: &Ctx) {
         .expect("redelivery due");
     assert_eq!(redue.attempts, 1);
 
+    // ADR 0052 (2026-08-20 correction): edit/dequeue match any UNACKED
+    // row — a queued prompt's row stays delivered-but-unacked through a
+    // running turn and is the durable copy a redelivery reads.
     assert!(
-        !meta.outbox_delete_undelivered("p-1").await.unwrap(),
-        "delivered row not deletable"
+        meta.outbox_update_prompt_text("p-1", "edited-post-delivery")
+            .await
+            .unwrap(),
+        "delivered-but-unacked row is editable"
+    );
+    assert_eq!(
+        meta.outbox_next_due(sid).await.unwrap().unwrap().payload["text"],
+        "edited-post-delivery",
+        "a redelivery carries the post-delivery edit"
     );
     assert!(meta.outbox_ack("p-1").await.unwrap());
     assert!(!meta.outbox_ack("p-1").await.unwrap(), "ack is once-only");
     assert!(meta.outbox_next_due(sid).await.unwrap().is_none());
+    assert!(
+        !meta
+            .outbox_update_prompt_text("p-1", "too late")
+            .await
+            .unwrap(),
+        "acked row is immutable"
+    );
+    assert!(
+        !meta.outbox_delete_unacked("p-1").await.unwrap(),
+        "acked row not deletable"
+    );
+
+    // Dequeue of a delivered-but-unacked row deletes it — a withdrawn
+    // prompt can never redeliver (the pre-correction arm refused here
+    // and relied on the harness's memory-only queue, the silent-loss
+    // window).
+    let now = ctx.clock.now_utc();
+    meta.outbox_enqueue(&engram_core::types::outbox::OutboxRow {
+        prompt_id: "p-dq".into(),
+        session_id: sid,
+        kind: engram_core::types::outbox::OutboxKind::Prompt,
+        payload: serde_json::json!({"text": "withdraw me"}),
+        created_at: now,
+        attempts: 0,
+        not_before: now,
+        delivered_at: None,
+        acked_at: None,
+    })
+    .await
+    .unwrap();
+    meta.outbox_mark_delivered("p-dq", Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert!(
+        meta.outbox_delete_unacked("p-dq").await.unwrap(),
+        "delivered-but-unacked row is dequeueable"
+    );
+    ctx.clock.advance(Duration::from_secs(21));
+    assert!(
+        meta.outbox_next_due(sid).await.unwrap().is_none(),
+        "a withdrawn prompt never redelivers"
+    );
 
     // ADR 0108: `outbox_make_due` — the inverse of defer. Stage a
     // deferred row (p-2), a delivered-but-unacked row (p-3), and an

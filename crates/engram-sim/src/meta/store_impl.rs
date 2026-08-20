@@ -3279,8 +3279,9 @@ impl MetadataStore for SimMetadataStore {
         Ok(Some(idxs))
     }
 
-    /// Read-only fetch by id, regardless of due-ness (ADR 0108 A6: the
-    /// boot's spawn-env peek).
+    /// Read-only fetch by id, regardless of due-ness or state (the
+    /// boot's ADR 0108 A6 spawn-env peek; the edit/dequeue cores'
+    /// delivered-ness read).
     async fn outbox_get(
         &self,
         prompt_id: &str,
@@ -3289,7 +3290,10 @@ impl MetadataStore for SimMetadataStore {
         Ok(self.db.lock().outbox.get(prompt_id).cloned())
     }
 
-    /// Only mutable pre-delivery.
+    /// Mutable while UNACKED (ADR 0052 2026-08-20 correction) — parity
+    /// with PostgresStore: a queued prompt's row stays delivered-but-
+    /// unacked through the running turn and is the durable copy a
+    /// redelivery reads. Acked rows are immutable.
     async fn outbox_update_prompt_text(
         &self,
         prompt_id: &str,
@@ -3300,7 +3304,6 @@ impl MetadataStore for SimMetadataStore {
         match db.outbox.get_mut(prompt_id) {
             Some(r)
                 if r.kind == engram_core::types::outbox::OutboxKind::Prompt
-                    && r.delivered_at.is_none()
                     && r.acked_at.is_none() =>
             {
                 r.payload["text"] = serde_json::Value::String(text.to_string());
@@ -3310,13 +3313,15 @@ impl MetadataStore for SimMetadataStore {
         }
     }
 
-    async fn outbox_delete_undelivered(&self, prompt_id: &str) -> Result<bool, MetaError> {
+    /// Deletes any UNACKED row (ADR 0052 2026-08-20 correction) — a
+    /// withdrawn prompt must never redeliver.
+    async fn outbox_delete_unacked(&self, prompt_id: &str) -> Result<bool, MetaError> {
         self.gate()?;
         let mut db = self.db.lock();
         let deletable = db
             .outbox
             .get(prompt_id)
-            .is_some_and(|r| r.delivered_at.is_none() && r.acked_at.is_none());
+            .is_some_and(|r| r.acked_at.is_none());
         if deletable {
             db.outbox.remove(prompt_id);
         }
