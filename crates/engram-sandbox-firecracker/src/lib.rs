@@ -6379,7 +6379,24 @@ impl SandboxBackend for FirecrackerBackend {
         // Assert the guest's wall clock BEFORE the harness child exists, so
         // it starts on a correct clock. See `step_guest_clock` for why the
         // host pushes instead of trusting the guest's own PTP sync.
-        self.step_guest_clock(id, &vsock_uds_path).await;
+        //
+        // Overlapped, not serialized (event-driven campaign, C3): the push
+        // runs concurrently with the spawn attempt's CONNECT leg below, and
+        // each attempt's SpawnHarness WRITE gates on `clock_done` — so the
+        // harness still never spawns on an un-asserted clock (the
+        // 2026-08-07 TLS-outage invariant), but a starved guest pays
+        // max(clock budget, connect ladder) instead of their sum, and the
+        // happy path saves the serial round trip. `watch` (not a
+        // JoinHandle) because every retry attempt re-checks it.
+        let (clock_done_tx, clock_done_rx) = tokio::sync::watch::channel(false);
+        {
+            let sandboxes = self.sandboxes.clone();
+            let path = vsock_uds_path.clone();
+            tokio::spawn(async move {
+                Self::step_guest_clock(&sandboxes, id, &path).await;
+                let _ = clock_done_tx.send(true);
+            });
+        }
 
         // ADR 0021 P1.4: no harness drive — argv points at a path
         // inside the rootfs (the image manifest's `[harness] exec`).
@@ -6524,6 +6541,12 @@ impl SandboxBackend for FirecrackerBackend {
                     connect_ms = t_attempt.elapsed().as_millis() as u64,
                     "spawn-harness vsock connected",
                 );
+                // Gate the WRITE on the concurrent clock push (see the
+                // `clock_done` note above). Best-effort like the push
+                // itself: a sender dropped without sending (task panic)
+                // must not fail the spawn.
+                let mut clock_done = clock_done_rx.clone();
+                let _ = clock_done.wait_for(|done| *done).await;
                 engram_agentd::write_msg(&mut conn, &req)
                     .await
                     .map_err(|e| SandboxError::Vm(format!("write SpawnHarness: {e}").into()))?;
@@ -6922,7 +6945,11 @@ impl FirecrackerBackend {
     /// than the `StepClock` variant cannot decode the frame, and failing
     /// the handshake on them would brick exactly the stale-snapshot
     /// population this exists to rescue. A failure is loud instead.
-    async fn step_guest_clock(&self, id: SandboxId, vsock_uds_path: &Path) {
+    async fn step_guest_clock(
+        sandboxes: &Arc<DashMap<SandboxId, LiveSandbox>>,
+        id: SandboxId,
+        vsock_uds_path: &Path,
+    ) {
         /// Metric name, documented alongside every other host metric in
         /// the host-agent's `metrics` registry. A literal here for the
         /// same reason `engram_sandbox_boot_seconds` is one: the registry
@@ -6954,7 +6981,7 @@ impl FirecrackerBackend {
             }
             let inner = async {
                 let mut conn =
-                    Self::connect_fc_vsock(&self.sandboxes, id, vsock_uds_path, ENGRAM_AGENTD_PORT)
+                    Self::connect_fc_vsock(sandboxes, id, vsock_uds_path, ENGRAM_AGENTD_PORT)
                         .await
                         .map_err(|e| format!("connect: {e}"))?;
                 engram_agentd::write_msg(&mut conn, &req)
