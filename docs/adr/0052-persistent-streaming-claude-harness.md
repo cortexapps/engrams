@@ -171,14 +171,18 @@ on a CLI pin ≥ 2.1.237.
   not redeliver), and `prompt_edited` updates the delivered-unacked
   row's text so a redelivery carries the edit (MetadataStore semantic
   change → ADR 0098 D4 conformance scenarios).
-- The CLI pin moves 2.1.212 → ≥ 2.1.237, and the steering behavior gets
-  an automated probe wired as a bake/CI gate (mid-tool injection must be
-  attended same-turn), so a future CLI drift fails loudly — the
-  2.1.185→2.1.187 AskUserQuestion removal is the precedent for silent
-  drift. Note claude does not persist mid-turn messages to the resume
-  JSONL (upstream #41230, closed not-planned): a steered message that
-  ran is durable in OUR transcript, but a `--resume` respawn may lack it
-  in claude's own context — acceptable, recorded.
+- The CLI pin moves 2.1.212 → 2.1.228 (steering verified there and on
+  2.1.237), and the steering behavior gets a checked-in probe
+  (`scripts/claude-steer-probe.py`: mid-tool injection must be attended
+  same-turn) that the pin sites name in their bump procedure. The probe
+  needs model credentials, so it runs on the bumper's machine, not in
+  CI; a version's binary is immutable, so drift can only enter at a
+  bump — the 2.1.185→2.1.187 AskUserQuestion removal is the precedent
+  for skipping that re-check. Note claude does not persist mid-turn
+  messages to the resume JSONL (upstream #41230, closed not-planned): a
+  steered message that ran is durable in OUR transcript, but a
+  `--resume` respawn may lack it in claude's own context — acceptable,
+  recorded.
 
 ## Rollout (stacked PRs; ADR bookends)
 
