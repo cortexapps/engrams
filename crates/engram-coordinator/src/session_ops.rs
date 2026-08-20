@@ -854,12 +854,20 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
         OpOutcome::Retry(e) => {
             let paced = attempt_elapsed(state, attempt_started) + backoff(op.attempts);
             tracing::debug!(op_id = op.id, session_id = %op.session_id, kind = op.kind.as_str(), attempts = op.attempts, delay_ms = paced.as_millis() as u64, error = %e, "op deferred (retryable)");
-            meta.op_requeue_with_backoff(op.id, epoch, paced, &e).await
+            let requeued = meta.op_requeue_with_backoff(op.id, epoch, paced, &e).await;
+            if matches!(requeued, Ok(true)) {
+                arm_maturity_wake(state, paced);
+            }
+            requeued
         }
         OpOutcome::RetryAfter(delay, e) => {
             let paced = attempt_elapsed(state, attempt_started) + delay;
             tracing::debug!(op_id = op.id, session_id = %op.session_id, kind = op.kind.as_str(), attempts = op.attempts, delay_ms = paced.as_millis() as u64, error = %e, "op deferred (fixed cadence)");
-            meta.op_requeue_with_backoff(op.id, epoch, paced, &e).await
+            let requeued = meta.op_requeue_with_backoff(op.id, epoch, paced, &e).await;
+            if matches!(requeued, Ok(true)) {
+                arm_maturity_wake(state, paced);
+            }
+            requeued
         }
     };
     // ADR 0079 + ADR 0094: the initial-prompt DELIVER op is deferred
@@ -915,6 +923,28 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
             }
         }
     }
+}
+
+/// The maturity wake (event-driven campaign, ADR 0108/0052 follow-up):
+/// a requeued op's `not_before` matures with NO wake —
+/// `op_requeue_with_backoff` fires no NOTIFY — so absent an event wake
+/// (`op_wake_queued_kind`, the completion re-drive) the op waited for
+/// the executor's 5 s fallback rescan: up to a full interval of pure
+/// latency stacked on EVERY retry (the #1300 stranding class,
+/// generalized). Arm a local timer that nudges THIS pod's executor when
+/// the pace matures. Local on purpose — any pod may claim (the CAS
+/// decides), and the requeueing pod is the one whose rescan would
+/// otherwise pay the tail. One sleeping future per requeue, and
+/// `Notify::notify_one` stores a permit, so a nudge landing mid-scan is
+/// never lost. Event wakes still cut every pace short; this only bounds
+/// the tail, and `SESSION_OP_RESCAN_CLAIMED_TOTAL` measures whatever
+/// still slips through.
+fn arm_maturity_wake(state: &SharedState, delay: Duration) {
+    let wake = state.session_ops_wake.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        wake.notify_one();
+    });
 }
 
 /// The attempt's own duration on the injected clock — the pacing floor
