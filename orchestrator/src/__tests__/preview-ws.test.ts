@@ -183,3 +183,69 @@ describe("preview WS passthrough", () => {
     expect(code).toBe(4401); // 4000 + 401 (unauthenticated)
   });
 });
+
+// ---------------------------------------------------------------------------
+// Prod incident, 2026-08-20: both orchestrator pods crash-looped 11 times.
+//
+// A preview WebSocket upgrade reached `ws`'s abort path — abortHandshake with a
+// code `http.STATUS_CODES` has no entry for — and the TypeError escaped the
+// ASYNC `upgrade` listener as an unhandled rejection, which under Bun exits the
+// process. One client's failed handshake took the whole orchestrator down.
+//
+// Two independent defences. server.ts now contains any upgrade error to the one
+// socket; this asserts the other half — that a socket which has already gone
+// away never reaches ws.handleUpgrade at all. A browser abandoning an HMR
+// reconnect makes that routine rather than rare.
+// ---------------------------------------------------------------------------
+
+describe("preview WS upgrade — a socket that already hung up", () => {
+  /** A client that vanished while we awaited the store lookup. */
+  const goneSocket = () =>
+    ({ destroyed: true, writable: false, destroy() {}, on() {}, end() {} }) as unknown as net.Socket;
+
+  const anyRow: SessionAppRow = {
+    hostLabel: "web-gone",
+    sessionId: "sess_gone",
+    name: "web",
+    port: 3000,
+    ownerUserId: "owner",
+    visibility: "org",
+    createdAt: new Date(0),
+  };
+
+  test("still claims the upgrade, but does not throw handing it to ws", async () => {
+    const handler = makePreviewUpgradeHandler({
+      previewBaseDomain: "preview.example.com",
+      store: fakeStore(anyRow),
+      getSession: async () => null,
+    });
+
+    // Host names no app → the reject(404) path, which is the one an abandoned
+    // HMR reconnect hits over and over.
+    const claimed = await handler(
+      { headers: { host: "web-nosuchapp.preview.example.com" }, url: "/" } as never,
+      goneSocket(),
+      Buffer.alloc(0),
+    );
+
+    // Claimed: ADR 0118's termination invariant still holds for a preview host.
+    expect(claimed).toBe(true);
+  });
+
+  test("an authorized upgrade on a gone socket is also a no-op, not a throw", async () => {
+    const handler = makePreviewUpgradeHandler({
+      previewBaseDomain: "preview.example.com",
+      store: fakeStore(anyRow),
+      // Authorized, so this reaches the SUCCESS path's handleUpgrade guard.
+      getSession: async () => ({ user: { id: "owner", role: "user" } }),
+    });
+
+    const claimed = await handler(
+      { headers: { host: "web-gone.preview.example.com" }, url: "/" } as never,
+      goneSocket(),
+      Buffer.alloc(0),
+    );
+    expect(claimed).toBe(true);
+  });
+});
+
