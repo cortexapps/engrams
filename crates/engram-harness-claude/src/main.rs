@@ -1984,10 +1984,7 @@ mod adapter {
         // prompt queued mid-turn (type-ahead) or one that hadn't started
         // when claude crashed isn't lost across the process restart.
         // Phase 1b: this IS the user-visible editable queue — each entry
-        // carries its `prompt_id`. Issue #535 (d): starts EMPTY — the
-        // create-time initial prompt is no longer env-seeded; it arrives as
-        // an ordinary `HarnessCommand::Prompt` frame once the host attaches,
-        // same as every follow-up.
+        // carries its `prompt_id`.
         let mut pending: VecDeque<QueuedPrompt> = VecDeque::new();
 
         // ADR 0052: prompt_ids we've already accepted (started or queued).
@@ -1996,6 +1993,38 @@ mod adapter {
         // already have so it can't double-run. Owned here so it survives a
         // claude respawn (a re-delivery racing the respawn is still caught).
         let mut seen_prompt_ids: HashSet<String> = HashSet::new();
+
+        // ADR 0108 A6: the create-time initial prompt rides the spawn env
+        // (`ENGRAM_INITIAL_PROMPT*`, stamped by the coordinator's boot
+        // pipeline from the durable `create:{session_id}` outbox row), so
+        // the first turn starts the moment this process is up — zero
+        // delivery round trips. Read ONCE, at engine start: agentd never
+        // re-applies env to a live child and resume/reattach specs are
+        // prompt-less by construction, so a respawn cannot re-inject it.
+        // Issue #535 (d) retired the ORIGINAL env rail for having no
+        // consumer and no durable record; this is that consumer, now WITH
+        // the outbox row as the record — `run_started{prompt_id}` acks it,
+        // and inserting the id into `seen_prompt_ids` here makes the
+        // rail's at-least-once redelivery of the same row a deduped no-op.
+        // The mode stamp is latched exactly like the wire path does before
+        // a prompt reaches the queue head (the pre-spawn invariant).
+        if let (Ok(text), Ok(prompt_id)) = (
+            std::env::var(engram_harness_proto::INITIAL_PROMPT_ENV),
+            std::env::var(engram_harness_proto::INITIAL_PROMPT_ID_ENV),
+        ) {
+            if !text.is_empty() && !prompt_id.is_empty() {
+                let mode = std::env::var(engram_harness_proto::INITIAL_PROMPT_MODE_ENV)
+                    .ok()
+                    .filter(|m| !m.is_empty());
+                apply_prompt_mode(&cli, mode.as_deref());
+                seen_prompt_ids.insert(prompt_id.clone());
+                pending.push_back(QueuedPrompt {
+                    prompt_id: Some(prompt_id),
+                    text,
+                    mode,
+                });
+            }
+        }
 
         // Bounded fast-crash backoff: a `claude` that dies within
         // FAST_CRASH_WINDOW of spawning is "failing to start" — back off
@@ -2539,6 +2568,14 @@ mod adapter {
             )
             .env("ENGRAM_HOOK_SOCK", state.hook_sock().as_os_str())
             .env("ENGRAM_MCP_SOCK", state.mcp_sock().as_os_str())
+            // ADR 0108 A6: the spawn-carried initial prompt is the
+            // HARNESS's input (consumed once at engine start) — strip it
+            // from claude's environ, like agentd strips HARNESS_CWD_ENV
+            // from ours (a prompt can be ~24 KiB; the child has no use
+            // for it).
+            .env_remove(engram_harness_proto::INITIAL_PROMPT_ENV)
+            .env_remove(engram_harness_proto::INITIAL_PROMPT_ID_ENV)
+            .env_remove(engram_harness_proto::INITIAL_PROMPT_MODE_ENV)
             // Held open for the whole session: we write one newline-
             // delimited `user` message per prompt and close it (drop) to
             // signal a clean drain on Shutdown.
@@ -5897,6 +5934,72 @@ mod adapter {
         /// "engrams hook bridge unavailable" until it was recreated. Per test
         /// (not per suite) so parallel engines cannot leak one test's
         /// resumable id or latched mode into another's first spawn.
+        /// ADR 0108 A6 (the guest half of the exactly-once landing
+        /// condition): the spawn-carried initial prompt seeds the queue at
+        /// engine start — the first turn runs with the env `prompt_id`
+        /// (which is what acks the durable outbox row), the mode stamp is
+        /// latched before the first spawn, and the outbox rail's
+        /// at-least-once REDELIVERY of the same id is a deduped no-op:
+        /// no second run, not even a `PromptQueued`.
+        ///
+        /// Env-mutating: relies on nextest's process-per-test isolation
+        /// (the repo's only test runner — no doc-tests, no plain
+        /// `cargo test`).
+        #[tokio::test]
+        async fn env_seeded_initial_prompt_runs_once_and_dedupes_redelivery() {
+            let script = write_persistent_fake_claude(&[
+                r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"seeded"}]}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed"}"#,
+            ])
+            .await;
+            std::env::set_var(
+                engram_harness_proto::INITIAL_PROMPT_ENV,
+                "spawn-carried hello",
+            );
+            std::env::set_var(
+                engram_harness_proto::INITIAL_PROMPT_ID_ENV,
+                "create:a6-test",
+            );
+            std::env::set_var(engram_harness_proto::INITIAL_PROMPT_MODE_ENV, "plan");
+            let cli = test_cli(script.clone());
+            let stamp_path = state_dir(&cli).mode_stamp();
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(16);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(cli, cmd_rx, reattach, evt_tx));
+
+            // The first event is the seeded turn's RunStarted — carrying
+            // the env prompt_id — never an Idle announcement.
+            let (_, prompt_id) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(prompt_id.as_deref(), Some("create:a6-test"));
+            assert_eq!(
+                engram_harness_sdk::mode_stamp::read_mode_stamp(&stamp_path),
+                "plan",
+                "the env mode is latched before the first spawn",
+            );
+            expect_agent_message(&mut evt_rx, "seeded").await;
+            expect_run_completed(&mut evt_rx).await;
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            // The outbox rail redelivers the same row (at-least-once).
+            // seen_prompt_ids drops it silently: no run, no PromptQueued.
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "create:a6-test".into(),
+                    text: "spawn-carried hello".into(),
+                    mode: None,
+                })
+                .await
+                .unwrap();
+            expect_silence(&mut evt_rx, "redelivered spawn prompt is deduped").await;
+
+            std::env::remove_var(engram_harness_proto::INITIAL_PROMPT_ENV);
+            std::env::remove_var(engram_harness_proto::INITIAL_PROMPT_ID_ENV);
+            std::env::remove_var(engram_harness_proto::INITIAL_PROMPT_MODE_ENV);
+            drop(cmd_tx);
+            let _ = engine.await;
+        }
+
         fn test_cli(claude_bin: String) -> Cli {
             let state_dir =
                 std::env::temp_dir().join(format!("engram-claude-state-{}", uuid::Uuid::new_v4()));
