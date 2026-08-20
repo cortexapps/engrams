@@ -119,6 +119,66 @@ pipe survives a UFFD restore before Track C relies on it.
    reconstructs from replayed `session_events` (refresh / multi-client). Because
    every mutation is a durable event, the coordinator can replay un-consumed
    queued prompts to the harness on respawn (queue survives eviction).
+   *Correction 2026-08-20: that replay was never built, and `prompt_queued`
+   ACKS the durable outbox row — so the only copy of a queued prompt is the
+   harness process's memory, and a `Shutdown`-drain (idle capture) or harness
+   restart after `PromptQueued` loses it silently. The 2026-08-20 update
+   below fixes this by removing `prompt_queued` from the ack table.*
+
+## Update 2026-08-20: the CLI steers at step boundaries — write-through replaces the interrupt-steer
+
+Two probes against claude **2.1.237** (`--print --input-format
+stream-json`; scripts recorded with the probe session) revise the 2.1.179
+measurement above:
+
+- Mid-GENERATION injection: unchanged — buffered, runs as the next turn.
+- Mid-TOOL-LOOP injection: **attended at the next step boundary within
+  the SAME turn.** A message injected during a running `Bash(sleep 8)`
+  redirected the turn: claude skipped its remaining planned steps and
+  answered the injected instruction inside result #1.
+
+The 2.1.179 probe used a single-generation turn, which has no step
+boundary to inject at — so "does NOT redirect the running turn" was
+over-generalized. Engrams' long turns are agentic tool loops, which is
+exactly where step-boundary attendance applies. Real steering is
+therefore available by writing the mid-turn message straight to stdin,
+on a CLI pin ≥ 2.1.237.
+
+**Revised decision 5 (supersedes the 2026-07-31 update):**
+
+- A mid-turn `Prompt` is WRITTEN THROUGH to claude's stdin immediately
+  and the harness emits `PromptSteered{prompt_id}` (already on the wire
+  and already an acking event coordinator-side — codex parity). The
+  debounced auto-interrupt (`STEER_DEBOUNCE_MS`, `arm_steer`, the 8 s
+  grace SIGINT escalation on the steer path) is deleted; the interrupt
+  machinery stays for the operator interrupt and the mode-mismatch
+  respawn only. A written message cannot be recalled, so the
+  edit/dequeue affordance for a steered prompt closes at the write —
+  the web copy reflects that type-ahead editability now applies only to
+  prompts that have not yet been written (mode-mismatch queue, shutdown
+  drain).
+- Turn accounting: a written-through message is attended inside the
+  running turn (no new `run_id`), or — if the turn ends before the next
+  step boundary — the CLI runs it as the next turn itself; the harness
+  brackets that CLI-initiated turn with `RunStarted{prompt_id}` from its
+  write-order ledger.
+- Durability fix (independent of the CLI behavior): `prompt_queued` no
+  longer acks the outbox row. The row stays delivered-but-unacked until
+  `run_started{prompt_id}` / `prompt_steered`; `ACK_TIMEOUT`
+  redeliveries during a long turn are deduped by `seen_prompt_ids` (the
+  pattern the idle mode-mismatch path already relies on).
+  `prompt_dequeued` becomes a terminal ack (a user-withdrawn prompt must
+  not redeliver), and `prompt_edited` updates the delivered-unacked
+  row's text so a redelivery carries the edit (MetadataStore semantic
+  change → ADR 0098 D4 conformance scenarios).
+- The CLI pin moves 2.1.212 → ≥ 2.1.237, and the steering behavior gets
+  an automated probe wired as a bake/CI gate (mid-tool injection must be
+  attended same-turn), so a future CLI drift fails loudly — the
+  2.1.185→2.1.187 AskUserQuestion removal is the precedent for silent
+  drift. Note claude does not persist mid-turn messages to the resume
+  JSONL (upstream #41230, closed not-planned): a steered message that
+  ran is durable in OUR transcript, but a `--resume` respawn may lack it
+  in claude's own context — acceptable, recorded.
 
 ## Rollout (stacked PRs; ADR bookends)
 
