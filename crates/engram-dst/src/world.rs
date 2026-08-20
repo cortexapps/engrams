@@ -1031,7 +1031,10 @@ impl HostClient for SimHostClient {
         // consumes the same env keys the real harness does; a host in
         // the stale-bundle set drops it (record_spawn_prompt samples
         // the fault), and the outbox rail backstops.
-        if agent.env.contains_key(engram_harness_proto::INITIAL_PROMPT_ENV) {
+        if agent
+            .env
+            .contains_key(engram_harness_proto::INITIAL_PROMPT_ENV)
+        {
             if let Some(prompt_id) = agent.env.get(engram_harness_proto::INITIAL_PROMPT_ID_ENV) {
                 self.world
                     .record_spawn_prompt(self.host_id, id, prompt_id.clone());
