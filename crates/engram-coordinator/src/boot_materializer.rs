@@ -346,11 +346,13 @@ pub(crate) struct ResumeMaterials {
 /// `api/snapshot.rs::resolve_resume_agent_and_policy`; the manifest +
 /// SecretBundle + env load once, reused for both).
 ///
-/// The spec is **resume-shaped**: harness resolved with `prompt = None`.
-/// Prompt-less is load-bearing — the initial prompt rides the harness
-/// env, so a boot-shape respawn of an *exited* harness would re-inject
-/// it mid-conversation; the resume shape just `--resume`s the existing
-/// claude session and goes `Idle`.
+/// The spec is **resume-shaped**: no `ENGRAM_INITIAL_PROMPT*` env.
+/// Prompt-less is load-bearing — ADR 0108 A6 stamps the create-time
+/// prompt into the spawn env in `boot_on_reserved_host` (the CREATE
+/// lanes only, never here), so a boot-shape respawn of an *exited*
+/// harness would re-inject it mid-conversation; the resume shape just
+/// `--resume`s the existing claude session and goes `Idle`. This
+/// structural split is the A6 no-reinject guarantee.
 ///
 /// Shared by `finish_resume_to_active` (a fresh post-restore sandbox)
 /// and the ADR 0034 Track A desync watchdog's in-place reattach (the

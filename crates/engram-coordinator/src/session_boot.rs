@@ -39,6 +39,14 @@ use engram_core::{HostId, SandboxId, SessionId};
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
 
+/// ADR 0108 A6: the spawn-env eligibility cutoff for the create-time
+/// prompt. Linux caps a single env string at 128 KiB (`MAX_ARG_STRLEN`)
+/// and the whole environ shares the spawn budget with everything agentd
+/// already stamps — 24 KiB leaves wide headroom. An oversize prompt
+/// silently rides the outbox rail instead (the API-level cap in
+/// `send_prompt_core` is far above this on purpose).
+const INITIAL_PROMPT_ENV_MAX_BYTES: usize = 24 * 1024;
+
 /// Everything [`boot_on_reserved_host`] needs once a host is reserved —
 /// the product of resolving a session's manifest, secrets, env, and
 /// harness. Built by the create handler from the request, or by the
@@ -396,6 +404,77 @@ pub(crate) async fn boot_on_reserved_host(
         binding_epoch: 0,
     });
     agent.binding_epoch = binding_epoch;
+
+    // ADR 0108 A6: the create-time initial prompt rides the spawn.
+    // Peek the session's `create:{sid}` outbox row — its durable accept
+    // committed before any boot began (`create_session_core`,
+    // `PromptDelivery::RidesBoot`) — and stamp it into the spawn env
+    // when it fits the E2BIG budget. The PEEK, not `BootInputs.prompt`,
+    // is the source of truth: env text equals durable text (including a
+    // pre-boot edit), and the queued lane's eventual boot gets the same
+    // rail with zero extra plumbing. Resume/reattach specs never pass
+    // through this fn (`materialize_snapshot_resume` builds prompt-less
+    // specs by construction), so a respawn cannot re-inject the prompt.
+    // An undelivered check guards the re-boot-after-partial-failure
+    // case; every fallback path (oversize, missing consumer, peek
+    // error) leaves the row to the ordinary outbox rail.
+    let mut spawn_prompt_id: Option<String> = None;
+    {
+        let create_pid = format!("create:{session_id}");
+        match state.services.meta.outbox_get(&create_pid).await {
+            Ok(Some(row))
+                if row.kind == engram_core::types::outbox::OutboxKind::Prompt
+                    && row.delivered_at.is_none()
+                    && row.acked_at.is_none() =>
+            {
+                let text = row
+                    .payload
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default();
+                if !text.is_empty() && text.len() <= INITIAL_PROMPT_ENV_MAX_BYTES {
+                    agent.env.insert(
+                        engram_harness_proto::INITIAL_PROMPT_ENV.to_string(),
+                        text.to_string(),
+                    );
+                    agent.env.insert(
+                        engram_harness_proto::INITIAL_PROMPT_ID_ENV.to_string(),
+                        create_pid.clone(),
+                    );
+                    if let Some(mode) = row.payload.get("mode").and_then(|m| m.as_str()) {
+                        agent.env.insert(
+                            engram_harness_proto::INITIAL_PROMPT_MODE_ENV.to_string(),
+                            mode.to_string(),
+                        );
+                    }
+                    spawn_prompt_id = Some(create_pid);
+                    ::metrics::counter!(crate::metrics::INITIAL_PROMPT_ENV_STAMPED_TOTAL)
+                        .increment(1);
+                } else if !text.is_empty() {
+                    ::metrics::counter!(
+                        crate::metrics::INITIAL_PROMPT_ENV_FALLBACK_TOTAL,
+                        "reason" => "oversize",
+                    )
+                    .increment(1);
+                    tracing::info!(
+                        %session_id,
+                        bytes = text.len(),
+                        "create-time prompt exceeds the spawn-env budget; riding the outbox rail",
+                    );
+                }
+            }
+            Ok(_) => {} // no create-time prompt (or already delivered/acked)
+            Err(e) => {
+                ::metrics::counter!(
+                    crate::metrics::INITIAL_PROMPT_ENV_FALLBACK_TOTAL,
+                    "reason" => "peek_error",
+                )
+                .increment(1);
+                tracing::debug!(%session_id, error = %e,
+                    "create-prompt peek failed; the outbox rail delivers instead");
+            }
+        }
+    }
     // `assemble_egress_policy` returned `None` — the backend could not
     // name this sandbox's guest IP. ADR 0013 bundled the policy into
     // `start_agent` so the host applies it BEFORE spawning the agent
@@ -474,6 +553,23 @@ pub(crate) async fn boot_on_reserved_host(
         );
         state.services.host.unbind_session(session_id).await;
         return Err(BootError::Started(e.into()));
+    }
+    // ADR 0108 A6: the spawn WAS the relay handoff for the stamped
+    // prompt — demote the row to the at-least-once backstop. It
+    // redelivers only if the harness's `run_started{prompt_id}` ack
+    // never lands (a stale-bundle host that ignored the env; the guest
+    // dedups every other shape). A failure here just means the shim may
+    // forward one redundant copy sooner — also deduped.
+    if let Some(prompt_id) = &spawn_prompt_id {
+        if let Err(e) = state
+            .services
+            .meta
+            .outbox_mark_delivered(prompt_id, crate::session_verbs::ACK_TIMEOUT)
+            .await
+        {
+            tracing::warn!(%session_id, prompt_id, error = %e,
+                "mark spawn-carried prompt delivered failed (redelivery dedups)");
+        }
     }
 
     // ---- created → active ----

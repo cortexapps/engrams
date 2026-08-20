@@ -810,7 +810,7 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
 /// How long a delivered row waits for its confirming event before it
 /// re-becomes due. Generous: covers a slow first token from the agent
 /// after a cold resume; the cost of redelivering early is nil (dedup).
-const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Backoff for rows whose delivery attempt FAILED (host error, harness
 /// not yet re-bound). Grows linearly with attempts, capped — an

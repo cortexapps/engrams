@@ -3696,6 +3696,22 @@ impl MetadataStore for PostgresStore {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn outbox_get(
+        &self,
+        prompt_id: &str,
+    ) -> Result<Option<engram_core::types::outbox::OutboxRow>, MetaError> {
+        let row = sqlx::query(
+            "SELECT prompt_id, session_id, kind, payload, created_at, attempts,
+                    not_before, delivered_at, acked_at
+             FROM session_outbox WHERE prompt_id = $1",
+        )
+        .bind(prompt_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|r| outbox_row_from_pg(&r)).transpose()
+    }
+
     async fn outbox_update_prompt_text(
         &self,
         prompt_id: &str,

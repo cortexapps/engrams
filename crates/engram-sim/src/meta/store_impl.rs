@@ -3279,6 +3279,16 @@ impl MetadataStore for SimMetadataStore {
         Ok(Some(idxs))
     }
 
+    /// Read-only fetch by id, regardless of due-ness (ADR 0108 A6: the
+    /// boot's spawn-env peek).
+    async fn outbox_get(
+        &self,
+        prompt_id: &str,
+    ) -> Result<Option<engram_core::types::outbox::OutboxRow>, MetaError> {
+        self.gate()?;
+        Ok(self.db.lock().outbox.get(prompt_id).cloned())
+    }
+
     /// Only mutable pre-delivery.
     async fn outbox_update_prompt_text(
         &self,

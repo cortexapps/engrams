@@ -849,19 +849,23 @@ async fn boot_prepared(
         .await
         .map_err(|e| ApiError::Internal(format!("reserve_and_persist_create: {e}")))?;
 
-    // ADR 0073 (completion): the create-time initial prompt rides the SAME
-    // durable outbox path as every follow-up — enqueue it now that the session
-    // row is committed. `send_prompt_core` writes the `prompt_received` receipt
-    // + the user echo and INSERTs the outbox row; the delivery driver forwards
-    // it once the harness attaches, deferring (retryable) while the session is
-    // still Pending/Queued. This covers BOTH dispositions below (a Queued
-    // session's prompt is delivered by the driver once the queue scanner boots
-    // it) and retires the never-consumed `ENGRAM_INITIAL_PROMPT` env var — #542
-    // stamped it but no in-guest consumer was ever written, so create-time
-    // prompts were silently dropped. Deterministic `prompt_id` so a create
-    // retry dedups against the same outbox row. Best-effort: a failure here
-    // logs + proceeds (the session is still usable via a follow-up prompt); we
-    // never fail the create over the initial-prompt enqueue.
+    // ADR 0073 → ADR 0108 A6: the create-time initial prompt gets its
+    // durable accept here (receipt + user echo + outbox row, committed
+    // before any boot), but its DELIVERY rides the spawn:
+    // `boot_on_reserved_host` peeks this row, stamps the
+    // `ENGRAM_INITIAL_PROMPT*` env (the #542 rail, revived now that the
+    // harness consumer exists — #1309 — and WITH a durable record this
+    // time), and marks it delivered once `start_agent` returns; the
+    // harness's `run_started{prompt_id}` acks it. `RidesBoot` mints no
+    // Deliver op and defers the row's due-ness one ACK_TIMEOUT, so
+    // nothing chases a prompt that is already riding the boot — the row
+    // is purely the at-least-once backstop (a stale-bundle host that
+    // ignores the env, a boot that dies pre-stamp, an oversize prompt).
+    // Covers BOTH dispositions below (the queued lane's eventual boot
+    // runs the same fn). Deterministic `prompt_id` so a create retry
+    // dedups against the same outbox row. Best-effort: a failure here
+    // logs + proceeds (the session is still usable via a follow-up
+    // prompt); we never fail the create over the initial-prompt accept.
     if let Some(text) = inputs.prompt.clone().filter(|s| !s.is_empty()) {
         if let Err(e) = crate::api::prompt::send_prompt_core(
             state,
@@ -869,10 +873,11 @@ async fn boot_prepared(
             format!("create:{session_id}"),
             text,
             inputs.harness_mode.clone(),
+            crate::api::prompt::PromptDelivery::RidesBoot,
         )
         .await
         {
-            tracing::warn!(%session_id, error = %e, "enqueue create-time prompt failed");
+            tracing::warn!(%session_id, error = %e, "accept create-time prompt failed");
         }
     }
 

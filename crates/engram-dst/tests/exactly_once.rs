@@ -5,9 +5,10 @@
 //! harness's `seen_prompt_ids` dedup; the spawn-carried prompt rides
 //! the `ENGRAM_INITIAL_PROMPT*` env keys on `start_agent`'s AgentSpec
 //! and is delivered when the dial completes (a harness cannot run a
-//! prompt before it exists). The coordinator does not stamp those keys
-//! yet — these scenarios drive `start_agent` directly, so the oracle
-//! and the world model land green on the current outbox-only path.
+//! prompt before it exists). The coordinator stamps those keys in
+//! `boot_on_reserved_host` for the `create:{session_id}` row
+//! (`create_id_prompt_rides_the_real_boot` covers that path end to
+//! end); the direct `start_agent` scenarios pin the plane itself.
 //!
 //! Scenarios hand-drive `Sim::execute` (the pinned-regression pattern).
 //! Everything runs on the paused tokio clock; no wall-clock sleeps.
@@ -32,14 +33,10 @@ fn rt() -> tokio::runtime::Runtime {
         .expect("current-thread runtime")
 }
 
-/// Reserve + boot one session to Active with the real CreateBoot op
-/// (the ttft_attach boot shape). `create_prompt`: `Some` enqueues the
-/// prompt while the session is still Pending — outbox row + Deliver op
-/// exist before the boot completes.
-async fn boot_session(
-    sim: &mut Sim,
-    create_prompt: Option<&str>,
-) -> (SessionId, SandboxId, HostId) {
+/// Reserve one session onto the sim fleet (the create handler's exact
+/// persistence shape). Returns the replica state + session id so the
+/// caller can stage prompts BEFORE the boot (the create shape).
+async fn reserve_session(sim: &mut Sim) -> (engram_coordinator::state::SharedState, SessionId) {
     sim.execute(Step::HostHeartbeats).await;
     let state = sim.world.replicas[0]
         .state
@@ -75,6 +72,18 @@ async fn boot_session(
         matches!(disp, CreateDisposition::Placed(_)),
         "the fresh sim fleet must fit the create"
     );
+    (state, session_id)
+}
+
+/// Reserve + boot one session to Active with the real CreateBoot op
+/// (the ttft_attach boot shape). `create_prompt`: `Some` enqueues the
+/// prompt while the session is still Pending — outbox row + Deliver op
+/// exist before the boot completes.
+async fn boot_session(
+    sim: &mut Sim,
+    create_prompt: Option<&str>,
+) -> (SessionId, SandboxId, HostId) {
+    let (state, session_id) = reserve_session(sim).await;
     if let Some(prompt_id) = create_prompt {
         assert!(
             workload::api_prompt(&state, session_id, prompt_id).await,
@@ -82,6 +91,17 @@ async fn boot_session(
         );
         workload::drain_detached().await;
     }
+    let (sandbox, host) = drive_create_boot(sim, &state, session_id).await;
+    (session_id, sandbox, host)
+}
+
+/// Drive the real CreateBoot op to Active and return the bound
+/// sandbox/host.
+async fn drive_create_boot(
+    sim: &mut Sim,
+    state: &engram_coordinator::state::SharedState,
+    session_id: SessionId,
+) -> (SandboxId, HostId) {
     match engram_coordinator::session_ops::enqueue_claim(
         &state,
         session_id,
@@ -110,11 +130,7 @@ async fn boot_session(
         )
     });
     assert_eq!(status, SessionState::Active, "boot must land Active");
-    (
-        session_id,
-        sandbox.expect("bound sandbox"),
-        host.expect("bound host"),
-    )
+    (sandbox.expect("bound sandbox"), host.expect("bound host"))
 }
 
 fn host_client(sim: &Sim, host: HostId) -> engram_dst::world::SimHostClient {
@@ -325,6 +341,56 @@ fn duplicate_forward_echoes_exactly_once() {
             "the guest dedup collapses the duplicate to one run"
         );
         invariants::run_started_exactly_once(&sim.world).expect("oracle holds");
+    });
+}
+
+/// The A6 end-to-end (this PR's coordinator half): a prompt whose row
+/// carries the deterministic `create:{session_id}` id is PEEKED by the
+/// real boot (`boot_on_reserved_host` → `outbox_get`), stamped into the
+/// spawn env, delivered by the attach — and the outbox rail's racing
+/// Deliver op (this test enqueues via the gRPC surface, which mints
+/// one) dedupes against it. Exactly one run, row acked, no manual
+/// `start_agent` anywhere: the stamp is the boot's own.
+#[test]
+fn create_id_prompt_rides_the_real_boot() {
+    rt().block_on(async {
+        tokio::time::pause();
+        let mut sim = Sim::new(0x0A65, Profile::Calm);
+        sim.world.host_world.set_attach_announce(true);
+        let (state, sid) = reserve_session(&mut sim).await;
+        let prompt_id = format!("create:{sid}");
+        assert!(
+            workload::api_prompt(&state, sid, &prompt_id).await,
+            "the create-id prompt must ack"
+        );
+        workload::drain_detached().await;
+        let (sandbox, _host) = drive_create_boot(&mut sim, &state, sid).await;
+
+        // The boot stamped the env; the dial completes and the spawn
+        // rail delivers — no reattach, no extra nudge.
+        sim.execute(Step::AdvanceTime(Duration::from_millis(300)))
+            .await;
+        assert!(sim.world.host_world.harness_attached(sandbox));
+        assert!(
+            prompt_acked(&sim, &prompt_id),
+            "the spawn-carried prompt acked at the attach"
+        );
+        assert_eq!(run_started_count(&sim, sid, &prompt_id), 1);
+        assert_eq!(
+            sim.world.host_world.attach_nudges(sandbox),
+            1,
+            "one start_agent, no destructive reattach",
+        );
+
+        // The racing outbox rail (the gRPC enqueue minted a Deliver op)
+        // finds the row acked / dedupes at the guest — never a second run.
+        sim.execute(Step::AdvanceTime(Duration::from_secs(2))).await;
+        sim.execute(Step::Driver(0, DriverKind::SessionOps)).await;
+        sim.execute(Step::Driver(0, DriverKind::OutboxDelivery))
+            .await;
+        assert_eq!(run_started_count(&sim, sid, &prompt_id), 1);
+        invariants::run_started_exactly_once(&sim.world).expect("oracle holds");
+        invariants::check_quiescence(&sim.world).expect("quiescent");
     });
 }
 

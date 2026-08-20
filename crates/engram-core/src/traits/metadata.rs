@@ -1459,6 +1459,19 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
+    /// Fetch one row by id, regardless of due-ness or state. ADR 0108
+    /// A6: the boot pipeline peeks the create-time prompt row
+    /// (`create:{session_id}`) to stamp it into the spawn env — the
+    /// row is deliberately NOT due while it rides the boot, so the
+    /// due-gated `outbox_next_due` cannot see it. Read-only.
+    async fn outbox_get(
+        &self,
+        prompt_id: &str,
+    ) -> Result<Option<crate::types::outbox::OutboxRow>, MetaError> {
+        let _ = prompt_id;
+        Ok(None)
+    }
+
     /// Phase-1b type-ahead edit for a row the relay has NOT yet handed
     /// off (`delivered_at IS NULL AND acked_at IS NULL`): swap the
     /// prompt text in place. Returns false when no such row exists
