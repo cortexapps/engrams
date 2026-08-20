@@ -71,6 +71,9 @@ pub async fn enqueue_deliver_op(state: &SharedState, session_id: engram_core::Se
 
 pub fn spawn(state: SharedState, wake: Arc<Notify>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // The startup scan is crash recovery — timer-attributed on
+        // purpose: work found there rode no event either.
+        let mut woke_by_timer = true;
         loop {
             let due = match state.services.meta.outbox_due_sessions().await {
                 Ok(d) => d,
@@ -79,13 +82,20 @@ pub fn spawn(state: SharedState, wake: Arc<Notify>) -> tokio::task::JoinHandle<(
                     Vec::new()
                 }
             };
+            if woke_by_timer && !due.is_empty() {
+                // Work the fallback tick found instead of a wake — the
+                // event-driven campaign's residue gauge (see the metric
+                // doc for the expected sources).
+                ::metrics::counter!(crate::metrics::OUTBOX_RESCAN_CLAIMED_TOTAL)
+                    .increment(due.len() as u64);
+            }
             for session_id in due {
                 enqueue_deliver_op(&state, session_id).await;
             }
-            tokio::select! {
-                _ = wake.notified() => {}
-                _ = tokio::time::sleep(RESCAN_INTERVAL) => {}
-            }
+            woke_by_timer = tokio::select! {
+                _ = wake.notified() => false,
+                _ = tokio::time::sleep(RESCAN_INTERVAL) => true,
+            };
         }
     })
 }
