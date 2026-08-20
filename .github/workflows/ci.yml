@@ -1259,12 +1259,15 @@ jobs:
           # >=2.1.187 removed the AskUserQuestion + ExitPlanMode built-ins from
           # headless `--print` mode, so questions and plan approval ride the
           # injected MCP tools (ask_user_question / exit_plan_mode) instead of
-          # native bindings. Bump deliberately and re-verify the deferred-tool
-          # spine against the new CLI: defer parks the turn
-          # (`terminal_reason: tool_deferred`), `--resume` re-fires id-stable,
-          # and the MCP bridge serves the stashed result. Keep in lockstep with
+          # native bindings. Bump deliberately and re-verify BOTH spines
+          # against the new CLI: the deferred-tool spine (defer parks the turn
+          # with `terminal_reason: tool_deferred`, `--resume` re-fires
+          # id-stable, the MCP bridge serves the stashed result) and the
+          # steering behavior (`scripts/claude-steer-probe.py` must report
+          # STEER — ADR 0052 2026-08-20 update; needs model credentials, so
+          # it runs on the bumper's machine, not here). Keep in lockstep with
           # the justfile and bake-images.yml.
-          CLAUDE_VERSION=2.1.212
+          CLAUDE_VERSION=2.1.228
           curl -fsSL --retry 3 \
             "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
             -o /tmp/claude
