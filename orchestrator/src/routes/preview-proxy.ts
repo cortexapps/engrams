@@ -241,6 +241,22 @@ function unauthenticatedResponse(c: Context, loginUrl: string, baseDomain: strin
  */
 const ORCHESTRATOR_COOKIE_MARKER = "better-auth";
 
+/*
+ * SHARP EDGE, and there is no way around it from here: this matches by NAME, so
+ * a guest app that also uses better-auth under its default cookie name loses
+ * its own session cookie in both directions and bounces every login back to the
+ * form. That is not hypothetical — the dogfooding image runs an engrams stack as
+ * a session app, and it presented exactly that way.
+ *
+ * Name is nonetheless the only discriminator available. The browser sends one
+ * `Cookie` header; a visitor's parent-domain token and a nested stack's
+ * host-only cookie of the identical name are indistinguishable in it, and
+ * forwarding the former to agent-authored code is the leak this boundary
+ * exists to prevent. So the guest renames instead:
+ * ORCHESTRATOR_COOKIE_PREFIX for a nested engrams, or the equivalent in
+ * whatever library the app uses.
+ */
+
 /** Request headers that carry a credential for the ORCHESTRATOR, not the app. */
 const CREDENTIAL_HEADERS = [
   "authorization",
