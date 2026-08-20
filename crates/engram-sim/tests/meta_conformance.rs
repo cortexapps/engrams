@@ -1488,6 +1488,90 @@ async fn ops_pipeline(ctx: &Ctx) {
         .unwrap());
 }
 
+/// `op_wake_queued_kind` makes every queued op of the kind due now and
+/// reports the count (the NOTIFY rides a nonzero count in both stores).
+/// The already-due case is the create-lane stranding regression: the
+/// deliver op defers on the 1 s known-wait cadence while the boot runs
+/// longer, so it is usually ALREADY due when the active-flip /
+/// harness_idle wake fires — the pre-fix `not_before > now` guard
+/// matched zero rows there, skipped the NOTIFY, and stranded the
+/// create-time prompt on the executor's 5 s rescan.
+async fn op_wake_queued_kind_counts_due_ops(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:wake")).await.unwrap();
+
+    // Nothing queued → nothing to wake.
+    assert_eq!(
+        meta.op_wake_queued_kind(sid, OpKind::Deliver)
+            .await
+            .unwrap(),
+        0
+    );
+
+    let claimed = match meta
+        .op_enqueue_and_claim(sid, OpKind::Deliver, serde_json::json!({}), None, "pod-a")
+        .await
+        .unwrap()
+    {
+        EnqueueOutcome::Claimed(op) => op,
+        other => panic!("expected Claimed, got {other:?}"),
+    };
+    // A running op is never woken.
+    assert_eq!(
+        meta.op_wake_queued_kind(sid, OpKind::Deliver)
+            .await
+            .unwrap(),
+        0
+    );
+
+    // Backed off into the future → the wake pulls it due now.
+    meta.op_requeue_with_backoff(
+        claimed.id,
+        claimed.epoch.unwrap(),
+        Duration::from_secs(60),
+        "wait",
+    )
+    .await
+    .unwrap();
+    assert!(meta.op_claim_head(sid, "pod-b").await.unwrap().is_none());
+    assert_eq!(
+        meta.op_wake_queued_kind(sid, OpKind::Deliver)
+            .await
+            .unwrap(),
+        1
+    );
+    let rewoken = meta
+        .op_claim_head(sid, "pod-b")
+        .await
+        .unwrap()
+        .expect("woken op is immediately claimable");
+
+    // ALREADY due (backoff elapsed, unclaimed) → still counted, never
+    // moved later.
+    meta.op_requeue_with_backoff(
+        rewoken.id,
+        rewoken.epoch.unwrap(),
+        Duration::from_secs(1),
+        "boot in progress",
+    )
+    .await
+    .unwrap();
+    ctx.clock.advance(Duration::from_secs(2));
+    assert_eq!(
+        meta.op_wake_queued_kind(sid, OpKind::Deliver)
+            .await
+            .unwrap(),
+        1,
+        "an already-due queued op is counted (the NOTIFY must fire)"
+    );
+    let head = meta
+        .op_claim_head(sid, "pod-b")
+        .await
+        .unwrap()
+        .expect("already-due op stays claimable");
+    assert_eq!(head.id, claimed.id, "the deliver is still the due head");
+}
+
 /// Idempotency keys dedupe ACTIVE ops only — a terminal keyed row does
 /// not burn the key.
 /// ADR 0101 C (engrams review, #836 rounds 2+3): `op_latest_for_kind` —
@@ -3507,6 +3591,10 @@ conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_host_binding_lease, super::host_binding_lease);
 conformance!(t_sandbox_tombstones, super::sandbox_tombstones);
 conformance!(t_ops_pipeline, super::ops_pipeline);
+conformance!(
+    t_op_wake_queued_kind_counts_due_ops,
+    super::op_wake_queued_kind_counts_due_ops
+);
 conformance!(t_ops_idempotency, super::ops_idempotency);
 conformance!(
     t_op_latest_for_kind_reads_terminal_mints,

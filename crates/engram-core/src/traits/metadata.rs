@@ -1115,17 +1115,19 @@ pub trait MetadataStore: Send + Sync {
         Ok(true)
     }
 
-    /// Wake every QUEUED op of `kind` for this session by resetting its
-    /// `not_before` to now (and NOTIFY). ADR 0079 latency fix: the deliver
-    /// verb, on an Idle session, enqueues a Resume op and requeues itself
-    /// with a FAILURE backoff — but the resume completing is not a
-    /// failure, and the backed-off deliver would otherwise wait out the
-    /// 5 s fallback poll after the resume finishes (prod: prompt-after-
-    /// idle regressed ~10 s → ~21 s). When a `for_delivery` resume reaches
-    /// terminal, we wake its sibling deliver so the executor's completion
-    /// re-drive claims it in <100 ms. A no-spin wake (only fired on the
-    /// resume's terminal, never while it runs — the one-running slot
-    /// already blocks the deliver during the resume). Returns rows woken.
+    /// Make every QUEUED op of `kind` for this session due now
+    /// (`not_before = LEAST(not_before, now)`) and NOTIFY when any such
+    /// op exists — INCLUDING ops that are already due. ADR 0079
+    /// established the wake for the deliver-behind-resume backoff (prod:
+    /// prompt-after-idle regressed ~10 s → ~21 s); the widened form also
+    /// covers the create-lane stranding: the deliver op defers on the
+    /// 1 s known-wait cadence (ADR 0108 A5) while the boot runs longer,
+    /// so at the wake sites (active flip, harness_idle ingest) it is
+    /// usually already due when the wake fires — and skipping the NOTIFY
+    /// there stranded the prompt on the executor's 5 s rescan, because
+    /// the direct create lane is out-of-op and no completion re-drive
+    /// claims the queue. Returns the number of queued ops made (or
+    /// kept) due — 0 means nothing of that kind is queued.
     async fn op_wake_queued_kind(
         &self,
         session_id: SessionId,

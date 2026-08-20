@@ -421,20 +421,20 @@ impl InMemoryOpLog {
         any
     }
 
-    /// Wake queued ops of `kind` (reset `not_before` to now). Mirrors
-    /// `MetadataStore::op_wake_queued_kind` for mock stores. Returns rows
-    /// woken.
+    /// Make every queued op of `kind` due now (`not_before = LEAST(
+    /// not_before, now)`); already-due ops count too. Mirrors
+    /// `MetadataStore::op_wake_queued_kind` for mock stores. Returns
+    /// the number of queued ops made (or kept) due.
     pub fn wake_queued_kind(&self, session_id: SessionId, kind: OpKind) -> u64 {
         let now = Utc::now();
         let mut inner = self.inner.lock().unwrap();
         let mut woken = 0;
-        for op in inner.ops.iter_mut().filter(|o| {
-            o.session_id == session_id
-                && o.kind == kind
-                && o.state == OpState::Queued
-                && o.not_before.map(|nb| nb > now).unwrap_or(false)
-        }) {
-            op.not_before = Some(now);
+        for op in inner
+            .ops
+            .iter_mut()
+            .filter(|o| o.session_id == session_id && o.kind == kind && o.state == OpState::Queued)
+        {
+            op.not_before = Some(op.not_before.map_or(now, |nb| nb.min(now)));
             woken += 1;
         }
         woken

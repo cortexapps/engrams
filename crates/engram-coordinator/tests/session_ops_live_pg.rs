@@ -929,11 +929,12 @@ async fn orphaned_pending_detected_only_without_active_create_boot() {
     );
 }
 
-/// ADR 0079 latency fix: a backed-off queued op is woken (not_before → now)
-/// by op_wake_queued_kind, so the completion re-drive claims it immediately
-/// instead of waiting out the 5s fallback poll. Models the deliver-behind-
-/// for_delivery-resume path: the deliver requeues with a failure backoff,
-/// the resume completes and wakes it, and it becomes due at once.
+/// ADR 0079 latency fix (widened): op_wake_queued_kind makes every queued
+/// op of the kind due now — a future not_before is pulled to now, and an
+/// ALREADY-due op still counts, so the NOTIFY (gated on a nonzero count)
+/// fires for it too. Models both wake shapes: the deliver-behind-
+/// for_delivery-resume backoff, and the create-lane deliver that finished
+/// its 1 s known-wait deferral before the boot completed.
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn wake_queued_kind_pulls_not_before_to_now() {
@@ -970,12 +971,38 @@ async fn wake_queued_kind_pulls_not_before_to_now() {
         .await
         .expect("wake");
     assert_eq!(woken, 1, "one queued deliver woken");
-    let claimed = meta.op_claim_head(sid, "pod-a").await.unwrap();
-    assert!(
-        claimed.is_some(),
-        "woken deliver must be immediately claimable (no poll wait)",
+    let claimed = meta
+        .op_claim_head(sid, "pod-a")
+        .await
+        .unwrap()
+        .expect("woken deliver must be immediately claimable (no poll wait)");
+
+    // The create-lane stranding regression: a queued op whose
+    // `not_before` has ALREADY passed must still be counted — the
+    // NOTIFY rides a nonzero count, and on the direct create lane that
+    // NOTIFY is the only wake (pre-fix this returned 0, the NOTIFY was
+    // skipped, and the prompt waited out the executor's 5 s rescan).
+    meta.op_requeue_with_backoff(
+        claimed.id,
+        claimed.epoch.unwrap(),
+        std::time::Duration::ZERO,
+        "boot in progress",
+    )
+    .await
+    .expect("requeue due-now");
+    assert_eq!(
+        meta.op_wake_queued_kind(sid, OpKind::Deliver)
+            .await
+            .expect("wake already-due"),
+        1,
+        "an already-due queued deliver is woken too",
     );
-    // A second wake with nothing backed-off is a no-op (idempotent).
+    assert!(
+        meta.op_claim_head(sid, "pod-a").await.unwrap().is_some(),
+        "already-due deliver stays claimable",
+    );
+    // A wake with nothing queued is a no-op (idempotent) — the op is
+    // running again after the claim above.
     assert_eq!(
         meta.op_wake_queued_kind(sid, OpKind::Deliver)
             .await

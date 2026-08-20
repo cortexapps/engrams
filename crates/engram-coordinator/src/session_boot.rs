@@ -524,20 +524,20 @@ pub(crate) async fn boot_on_reserved_host(
     //
     // ADR 0094: wake the sibling DELIVER op now that the boot is done. The
     // create-time DELIVER was enqueued while the session was still `pending`,
-    // so it deferred ("not deliverable yet") and requeued on a growing linear
-    // backoff (`(attempts+1)×2 s`). `start_agent` above already attached the
-    // harness, so the prompt is deliverable the instant we flip to `Active` —
-    // but nothing made the backed-off DELIVER *ready*, so it would wait out
-    // its backoff (+ the 5 s fallback poll): the dominant fresh-create TTFM
-    // cost (measured ~5 s locally, ~36 s on the dev VM). Pulling its
-    // `not_before` to now + a NOTIFY lets the executor forward the prompt in
-    // <100 ms. This is the SAME wake ADR 0079 established for resumes and
-    // PR #676 wired onto the `CreateBoot` op — but #676 only covered the
-    // queued (no-capacity) path; the capacity-available create is out-of-op
-    // and boots straight through here, so it never fired for the common case.
-    // Idempotent: a no-op if the op executor's completion re-drive already
-    // claimed the DELIVER, and harmless when there is no create-time prompt
-    // (0 rows matched). The 5 s fallback poll still backstops a missed NOTIFY.
+    // so it deferred ("not deliverable yet") on the 1 s known-wait cadence
+    // (ADR 0108 A5). The boot runs longer than that cadence, so by this
+    // point the op is usually ALREADY due — just unclaimed, because op
+    // requeues never NOTIFY. The wake must therefore count already-due ops
+    // too: this lane is out-of-op (no completion re-drive claims the
+    // queue), so its NOTIFY is the ONLY wake, and the pre-widening
+    // `not_before > now` guard skipped it here for the common case —
+    // stranding every fresh create's prompt on the executor's 5 s rescan
+    // (prod: run_started pinned at prompt+5.3 s while the harness idled
+    // from ~2.3 s). This is the SAME wake ADR 0079 established for resumes
+    // and PR #676 wired onto the `CreateBoot` op. Idempotent: harmless if
+    // the executor already claimed the DELIVER or there is no create-time
+    // prompt (0 rows matched → no NOTIFY). The 5 s fallback poll still
+    // backstops a missed NOTIFY.
     if let Err(e) = state
         .services
         .meta

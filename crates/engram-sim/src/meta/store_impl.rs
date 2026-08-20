@@ -2236,7 +2236,10 @@ impl MetadataStore for SimMetadataStore {
         Ok(any)
     }
 
-    /// Pull queued rows' not_before forward to now; notify if any moved.
+    /// Make every queued row of `kind` due now; notify when any exists.
+    /// Already-due rows count too — parity with PostgresStore's
+    /// `LEAST(not_before, now)` shape (an already-due-but-unclaimed op
+    /// is exactly what a wake exists to escalate).
     async fn op_wake_queued_kind(
         &self,
         session_id: SessionId,
@@ -2248,12 +2251,8 @@ impl MetadataStore for SimMetadataStore {
         let mut db = self.db.lock();
         let mut woken = 0u64;
         for o in db.session_ops.values_mut() {
-            if o.session_id == session_id
-                && o.kind == kind
-                && o.state == OpState::Queued
-                && o.not_before.is_some_and(|nb| nb > now)
-            {
-                o.not_before = Some(now);
+            if o.session_id == session_id && o.kind == kind && o.state == OpState::Queued {
+                o.not_before = Some(o.not_before.map_or(now, |nb| nb.min(now)));
                 woken += 1;
             }
         }
