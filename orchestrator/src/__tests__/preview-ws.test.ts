@@ -249,3 +249,82 @@ describe("preview WS upgrade — a socket that already hung up", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// The upgrade that took prod down on 2026-08-20.
+//
+// A handshake with no `Sec-WebSocket-Key` drives Bun's BUILTIN `ws` into its
+// abort path (the crash frames read `ws:671` with no file — the npm package in
+// node_modules is not what runs), and that path mishandles its own arguments:
+// on Bun 1.3.14 it answers `HTTP/1.1 400 [object Object]`, on the 1.4.0 the pods
+// run it throws `TypeError: undefined is not an object (evaluating 'message')`.
+// The throw escaped the async upgrade listener and exited the process.
+//
+// server.ts now refuses such a handshake before `ws` sees it. Dropping the
+// socket is the only available answer: `socket.end()` in an upgrade listener is
+// a no-op under Bun, and completing the handshake to send a close frame needs
+// the key that is missing.
+// ---------------------------------------------------------------------------
+
+describe("malformed websocket upgrade", () => {
+  /** Raw TCP so we can send a handshake a real WS client would never produce. */
+  async function rawUpgrade(port: number, lines: string[]): Promise<string> {
+    return await new Promise<string>((resolve) => {
+      const c = net.connect(port, "127.0.0.1", () => {
+        c.write(lines.join("\r\n") + "\r\n\r\n");
+      });
+      let got = "";
+      c.on("data", (d) => (got += d.toString()));
+      const done = () => {
+        c.destroy();
+        resolve(got);
+      };
+      c.on("close", done);
+      c.on("error", done);
+      setTimeout(done, 600);
+    });
+  }
+
+  async function serverWithWs(): Promise<number> {
+    const app = new Hono();
+    app.get("/healthz", (c) => c.json({ ok: true }));
+    const nodeWs = createNodeWebSocket({ app });
+    const server = buildServer(app, () => {}, nodeWs, []);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    cleanups.push(() => server.close());
+    return (server.address() as net.AddressInfo).port;
+  }
+
+  const BASE = ["GET / HTTP/1.1", "Host: x", "Upgrade: websocket", "Connection: Upgrade"];
+
+  test("no Sec-WebSocket-Key: socket dropped, process survives", async () => {
+    const port = await serverWithWs();
+    const reply = await rawUpgrade(port, [...BASE, "Sec-WebSocket-Version: 13"]);
+
+    // Dropped, not answered — and crucially NOT `400 [object Object]`, which is
+    // what reaching ws's abort path looks like.
+    expect(reply).toBe("");
+    expect(reply).not.toContain("[object Object]");
+
+    // The server is still serving, which is the whole point: one malformed
+    // handshake used to exit the process.
+    const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+    expect(res.status).toBe(200);
+  });
+
+  test("wrong Sec-WebSocket-Version is refused too", async () => {
+    const port = await serverWithWs();
+    const key = "dGhlIHNhbXBsZSBub25jZQ==";
+    // Bun's ws shim answers 101 to version 8, which is its own bug; we refuse
+    // before it can.
+    const reply = await rawUpgrade(port, [
+      ...BASE,
+      `Sec-WebSocket-Key: ${key}`,
+      "Sec-WebSocket-Version: 8",
+    ]);
+    expect(reply).not.toContain("101 Switching Protocols");
+
+    const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+    expect(res.status).toBe(200);
+  });
+});
+
