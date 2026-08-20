@@ -509,6 +509,26 @@ async fn run_engine(
 ) -> ExitCode {
     let mut queued = VecDeque::<QueuedPrompt>::new();
     let mut seen = HashSet::<String>::new();
+    // ADR 0108 A6: the create-time initial prompt rides the spawn env
+    // (see engram-harness-claude's run_engine for the full rationale).
+    // Read once at engine start; `seen` makes the outbox rail's
+    // at-least-once redelivery of the same row a deduped no-op, and
+    // `run_started{prompt_id}` acks the durable record.
+    if let (Ok(text), Ok(prompt_id)) = (
+        std::env::var(engram_harness_proto::INITIAL_PROMPT_ENV),
+        std::env::var(engram_harness_proto::INITIAL_PROMPT_ID_ENV),
+    ) {
+        if !text.is_empty() && !prompt_id.is_empty() {
+            seen.insert(prompt_id.clone());
+            queued.push_back(QueuedPrompt {
+                prompt_id,
+                text,
+                mode: std::env::var(engram_harness_proto::INITIAL_PROMPT_MODE_ENV)
+                    .ok()
+                    .filter(|m| !m.is_empty()),
+            });
+        }
+    }
     let mut failures = 0u32;
     let mut generation = 0u64;
     let mut parked = match ParkedCallStore::open(cli.parked_calls_file()) {
