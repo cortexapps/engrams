@@ -281,6 +281,7 @@ impl CosimExecPlane {
             cacerts: Arc::new(CaCertInstaller::new(CaCertPaths {
                 bundle: root.join("cacerts/ca-bundle"),
                 extra_cert: root.join("cacerts/engram.crt"),
+                chromium_policy: root.join("cacerts/chromium-policy.json"),
             })),
             epoch: tokio::sync::watch::channel(0).0,
             connection_tasks: Vec::new(),
