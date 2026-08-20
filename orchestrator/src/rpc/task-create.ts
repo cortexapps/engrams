@@ -292,8 +292,14 @@ export async function compileSessionCreateInput(
   deps: SessionCompileDeps,
   opts: SessionCompileOpts = {},
 ): Promise<SessionCreateInput> {
+  // The two unconditional control-plane reads are independent — fetch
+  // them together (this fn sits on the ENTER→first-message hot path;
+  // every serial await here is user-visible latency).
+  const [catalog, { harnesses }] = await Promise.all([
+    deps.images.listEnabledImages({}),
+    deps.harnessCatalog.listHarnesses({}),
+  ]);
   // Resolve image_id → current image_uri (defense in depth behind DisableImage).
-  const catalog = await deps.images.listEnabledImages({});
   const image = catalog.images.find((i) => i.id === profile.imageId);
   if (!image) {
     throw new ConnectError(
@@ -306,7 +312,6 @@ export async function compileSessionCreateInput(
   // override < profile default < deployment/descriptor default).
   const selectedHarness = opts.harness ?? profile.harness ?? DEFAULT_HARNESS;
   const selectedRouterId = opts.modelRouter ?? profile.modelRouter ?? undefined;
-  const { harnesses } = await deps.harnessCatalog.listHarnesses({});
   const descriptor = harnesses.find((h) => h.name === selectedHarness)?.descriptor;
   if (!descriptor) {
     throw new ConnectError(`harness \`${selectedHarness}\` is not in the catalog`, Code.FailedPrecondition);
@@ -337,7 +342,16 @@ export async function compileSessionCreateInput(
   let routedModel;
   if (router) {
     if (!modelId) throw new ConnectError("a routed launch requires a model", Code.InvalidArgument);
-    routedModel = await (deps.modelRouters ?? makeModelRouterStore()).getModel(router.id, modelId);
+    // Independent reads (DB + control plane); the policy checks below
+    // keep their original order over the resolved results.
+    const secretClient: OrgSecretNameClient = deps.orgSecret ?? defaultOrgSecret;
+    const [routed, availableSecrets] = await Promise.all([
+      (deps.modelRouters ?? makeModelRouterStore()).getModel(router.id, modelId),
+      secretClient
+        .listSecrets({})
+        .then((r) => new Set(r.secrets.map((secret) => secret.name))),
+    ]);
+    routedModel = routed;
     if (!routedModel || !routedModel.available) {
       throw new ConnectError(`router model \`${modelId}\` is unavailable`, Code.FailedPrecondition);
     }
@@ -348,9 +362,7 @@ export async function compileSessionCreateInput(
     if (!routedModel.supportedParameters.includes("reasoning") && !routedModel.supportedParameters.includes("reasoning_effort")) {
       effortId = undefined;
     }
-    const client: OrgSecretNameClient = deps.orgSecret ?? defaultOrgSecret;
-    const available = new Set((await client.listSecrets({})).secrets.map((secret) => secret.name));
-    if (!available.has(router.credentialSecret)) {
+    if (!availableSecrets.has(router.credentialSecret)) {
       throw new ConnectError(
         `${router.label} needs the organization secret ${router.credentialSecret}`,
         Code.FailedPrecondition,
