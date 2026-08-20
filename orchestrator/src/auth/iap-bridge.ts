@@ -471,100 +471,6 @@ async function verifyExistingSession(
   }
 }
 
-/**
- * Re-issue an already-valid session cookie with the configured `Domain`.
- *
- * ADR 0118 scoped the session cookie to the shared parent domain so one login
- * covers the main host and every session-app URL. But a cookie minted BEFORE
- * that config landed is host-only, and nothing here can tell: a Cookie header
- * carries names and values, never attributes. The bridge's fast path then makes
- * it permanent — the session verifies, so it returns early and never re-mints —
- * leaving a user who works fine on the main host and is invisible on every app
- * hostname, with no error anywhere. Signing out does not necessarily clear it
- * either: a host-only cookie and a domain-scoped one of the same name are two
- * different cookies to the browser, so a deletion aimed at one can miss the
- * other.
- *
- * So re-emit the SAME token with the right attributes on every bridged request.
- * The browser then also holds a domain-scoped copy, which is the one preview
- * hosts see. Re-using the existing value rather than minting a new session is
- * what keeps this safe: if the legacy host-only cookie survives, both copies
- * carry the same token, so whichever the server parses resolves the same
- * session. Idempotent, and a no-op for anyone already correctly scoped.
- *
- * Only runs when a domain is configured; without one the cookie is host-only by
- * design and there is nothing to repair.
- */
-/** Cookie attributes we mirror, matching better-auth's `authCookies` shape. */
-export interface RescopeAttributes {
-  domain?: string;
-  path?: string;
-  httpOnly?: boolean;
-  secure?: boolean;
-  sameSite?: string;
-  maxAge?: number;
-}
-
-/**
- * The `Set-Cookie` that re-scopes an existing session cookie, or null when
- * there is nothing to do (no domain configured, no Cookie header, or this
- * request carries no session cookie).
- *
- * Pure, so the repair is testable without a database or a live better-auth.
- */
-export function buildRescopedCookie(
-  rawCookieHeader: string | undefined,
-  name: string,
-  attributes: RescopeAttributes,
-): string[] | null {
-  if (!attributes.domain || !rawCookieHeader) return null;
-  const current = rawCookieHeader
-    .split(";")
-    .map((c) => c.trim())
-    .find((c) => c.startsWith(`${name}=`));
-  if (!current) return null;
-
-  const value = current.slice(name.length + 1);
-  const parts: string[] = [`${name}=${value}`];
-  if (attributes.path) parts.push(`Path=${attributes.path}`);
-  parts.push(`Domain=${attributes.domain}`);
-  if (attributes.httpOnly) parts.push("HttpOnly");
-  if (attributes.secure) parts.push("Secure");
-  if (attributes.sameSite) parts.push(`SameSite=${attributes.sameSite}`);
-  if (attributes.maxAge !== undefined) parts.push(`Max-Age=${attributes.maxAge}`);
-
-  // Also EXPIRE the host-only copy. Leaving both alive is not stable: they are
-  // two cookies of one name, the browser sends both, and RFC 6265 orders the
-  // older first — so once better-auth refreshes the session the stale value
-  // would be the one the server parses, and the user would see random 401s
-  // that no amount of signing in fixes. A Set-Cookie with no `Domain` targets
-  // exactly the host-only copy and leaves the domain-scoped one alone.
-  //
-  // Safe when there is nothing to delete (the common case, where the cookie is
-  // already correctly scoped): expiring a cookie that does not exist is a
-  // no-op. And in the worst case — the deletion lands, the re-scope somehow
-  // does not — the next request simply has no session and the bridge mints a
-  // fresh one, which is a transparent recovery rather than a lockout.
-  const expireHostOnly = [`${name}=`, `Path=${attributes.path ?? "/"}`, "Max-Age=0"];
-  if (attributes.httpOnly) expireHostOnly.push("HttpOnly");
-  if (attributes.secure) expireHostOnly.push("Secure");
-
-  return [parts.join("; "), expireHostOnly.join("; ")];
-}
-
-async function rescopeSessionCookie(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  try {
-    const ctx = await auth.$context;
-    const { name, attributes } = ctx.authCookies.sessionToken;
-    const header = buildRescopedCookie(req.headers.cookie, name, attributes);
-    // Never clobber a Set-Cookie the full bridge path already wrote.
-    if (header && !res.getHeader("Set-Cookie")) res.setHeader("Set-Cookie", header);
-  } catch {
-    // Best-effort repair: a failure here must not break an authenticated
-    // request that is otherwise fine.
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Bridge handler (public API consumed by buildServer)
 // ---------------------------------------------------------------------------
@@ -657,10 +563,7 @@ export async function iapBridge(
           ) as JWTPayload;
           const iapEmail = extractEmail(rawPayload);
           if (iapEmail && iapEmail.toLowerCase() === existingSession.email.toLowerCase()) {
-            // Same user — fast path, skip full JWT verification. Repair the
-            // cookie's scope on the way past: this early return is exactly what
-            // made a legacy host-only cookie permanent.
-            await rescopeSessionCookie(req, res);
+            // Same user — fast path, skip full JWT verification.
             next();
             return;
           }
@@ -676,7 +579,6 @@ export async function iapBridge(
       // request came through a load balancer that strips the header), we
       // let the session cookie stand and pass through. This is a conservative
       // choice: the cookie was set by a prior verified bridge request.
-      await rescopeSessionCookie(req, res);
       next();
       return;
     }
