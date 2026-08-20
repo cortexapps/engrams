@@ -443,13 +443,16 @@ mod tests {
         .expect("accept");
 
         assert_eq!(mini.events.lock().len(), 2, "receipt + echo, as always");
-        let outbox = mini.outbox.lock();
-        assert_eq!(outbox.len(), 1, "the durable backstop row exists");
-        assert!(
-            outbox[0].not_before > outbox[0].created_at,
-            "the row is deferred — not due while it rides the boot",
-        );
-        drop(outbox);
+        // Block-scoped: clippy's await_holding_lock is scope-based and
+        // does not credit an explicit drop().
+        {
+            let outbox = mini.outbox.lock();
+            assert_eq!(outbox.len(), 1, "the durable backstop row exists");
+            assert!(
+                outbox[0].not_before > outbox[0].created_at,
+                "the row is deferred — not due while it rides the boot",
+            );
+        }
         assert!(
             !state
                 .services

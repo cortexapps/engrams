@@ -103,7 +103,7 @@ async fn drive_create_boot(
     session_id: SessionId,
 ) -> (SandboxId, HostId) {
     match engram_coordinator::session_ops::enqueue_claim(
-        &state,
+        state,
         session_id,
         OpKind::CreateBoot,
         serde_json::json!({}),
@@ -112,10 +112,10 @@ async fn drive_create_boot(
     .await
     {
         Ok(EnqueueOutcome::Claimed(op)) => {
-            engram_coordinator::session_ops::drive_claimed(&state, op).await;
+            engram_coordinator::session_ops::drive_claimed(state, op).await;
         }
         Ok(EnqueueOutcome::Queued(_)) => {
-            engram_coordinator::session_ops::drive_session(&state, session_id).await;
+            engram_coordinator::session_ops::drive_session(state, session_id).await;
         }
         Ok(EnqueueOutcome::Duplicate) => panic!("fresh create key cannot be a duplicate"),
         Err(e) => panic!("create_boot enqueue failed: {e}"),
