@@ -20,12 +20,37 @@ use engram_harness_proto::AgentRole;
 use crate::error::ApiError;
 use crate::state::{SessionEvent, SharedState};
 
+/// ADR 0108 A6: how an accepted prompt reaches the harness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromptDelivery {
+    /// Enqueue a Deliver op now — every follow-up prompt. The op-log
+    /// ladder owns ordering, auto-resume, and redelivery.
+    Enqueue,
+    /// The create boot carries the prompt in the spawn env:
+    /// `boot_on_reserved_host` peeks the row, stamps
+    /// `ENGRAM_INITIAL_PROMPT*`, and marks it delivered after
+    /// `start_agent` returns Ok — the harness's `run_started{prompt_id}`
+    /// acks it. No Deliver op is minted, and the row's `not_before` is
+    /// pushed one `ACK_TIMEOUT` out, so neither the executor nor the
+    /// outbox shim has anything to chase during a normal boot; a boot
+    /// that dies before the stamp leaves the row to come due and the
+    /// ordinary rail recovers it.
+    RidesBoot,
+}
+
+/// The hard API-level prompt size cap. There was NO bound before
+/// (only non-empty) — the app-gRPC surface accepts 80 MiB frames, so an
+/// unbounded prompt was a latent jsonb/outbox DoS. Generous: two orders
+/// of magnitude above the 24 KiB spawn-env eligibility cutoff; a prompt
+/// above THAT silently rides the outbox rail instead of the env.
+const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+
 /// ADR 0051: transport-agnostic prompt core (gRPC `SendPrompt`).
-/// ADR 0079: enqueue-only — the durable receipts + one outbox row + a
-/// Deliver op, then return. Delivery ordering (behind an in-flight
-/// resume/evict), the auto-resume, and the mid-move wait all ride the
-/// deliver op's position in the session op log; the 60s mid-move HOLD
-/// this handler used to poll is gone.
+/// ADR 0079: enqueue-only — the durable receipts + one outbox row (+ a
+/// Deliver op, per `delivery`), then return. Delivery ordering (behind
+/// an in-flight resume/evict), the auto-resume, and the mid-move wait
+/// all ride the deliver op's position in the session op log; the 60s
+/// mid-move HOLD this handler used to poll is gone.
 pub(crate) async fn send_prompt_core(
     state: &SharedState,
     id: SessionId,
@@ -36,9 +61,16 @@ pub(crate) async fn send_prompt_core(
     // modes BEFORE any durable write it causes; rides the outbox payload and
     // `HarnessCommand::Prompt.mode`.
     harness_mode: Option<String>,
+    delivery: PromptDelivery,
 ) -> Result<&'static str, ApiError> {
     if text.is_empty() {
         return Err(ApiError::BadRequest("`text` is required".into()));
+    }
+    if text.len() > MAX_PROMPT_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "`text` is {} bytes; the maximum is {MAX_PROMPT_BYTES}",
+            text.len(),
+        )));
     }
     let harness_mode = harness_mode.filter(|m| !m.is_empty());
     if let Some(mode) = &harness_mode {
@@ -135,7 +167,16 @@ pub(crate) async fn send_prompt_core(
         payload,
         created_at: now,
         attempts: 0,
-        not_before: now,
+        // ADR 0108 A6: a boot-carried prompt is not DUE — the boot is
+        // its delivery vehicle, and a due row would have the shim
+        // minting Deliver ops to chase a prompt that is already riding
+        // the spawn. One ACK_TIMEOUT of grace covers the boot with wide
+        // margin; a boot that dies first leaves the row to come due and
+        // the ordinary rail recovers it.
+        not_before: match delivery {
+            PromptDelivery::Enqueue => now,
+            PromptDelivery::RidesBoot => now + crate::session_verbs::ACK_TIMEOUT,
+        },
         delivered_at: None,
         acked_at: None,
     };
@@ -155,10 +196,12 @@ pub(crate) async fn send_prompt_core(
             "duplicate SendPrompt (same prompt_id); accept is idempotent — nudging delivery only",
         );
     }
-    // ADR 0079: enqueue the Deliver op directly (no wake hop for first
-    // delivery); the shim's NOTIFY/poll loop owns redelivery.
-    crate::outbox_delivery::enqueue_deliver_op(state, id).await;
-    state.outbox_wake.notify_one();
+    if matches!(delivery, PromptDelivery::Enqueue) {
+        // ADR 0079: enqueue the Deliver op directly (no wake hop for
+        // first delivery); the shim's NOTIFY/poll loop owns redelivery.
+        crate::outbox_delivery::enqueue_deliver_op(state, id).await;
+        state.outbox_wake.notify_one();
+    }
 
     Ok("prompt queued")
 }
@@ -348,9 +391,16 @@ mod tests {
         let id = SessionId::new();
         let (state, mini, _local) = build_state_for_session(idle_session(id));
 
-        send_prompt_core(&state, id, String::new(), "hello".into(), None)
-            .await
-            .expect("an idle session accepts the prompt");
+        send_prompt_core(
+            &state,
+            id,
+            String::new(),
+            "hello".into(),
+            None,
+            PromptDelivery::Enqueue,
+        )
+        .await
+        .expect("an idle session accepts the prompt");
 
         let events = mini.events.lock();
         assert_eq!(
@@ -369,6 +419,72 @@ mod tests {
         );
     }
 
+    /// ADR 0108 A6: `RidesBoot` writes the same durable accept (receipt
+    /// + echo + row) but mints NO Deliver op and defers the row one
+    /// ACK_TIMEOUT — the boot is the delivery vehicle, and nothing may
+    /// chase a prompt that is already riding the spawn. The row stays
+    /// the at-least-once backstop: it comes due on its own if the boot
+    /// dies before the stamp.
+    #[tokio::test]
+    async fn rides_boot_accepts_durably_without_minting_a_deliver_op() {
+        use engram_core::types::session_op::OpKind;
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(idle_session(id));
+
+        send_prompt_core(
+            &state,
+            id,
+            format!("create:{id}"),
+            "boot-carried".into(),
+            None,
+            PromptDelivery::RidesBoot,
+        )
+        .await
+        .expect("accept");
+
+        assert_eq!(mini.events.lock().len(), 2, "receipt + echo, as always");
+        // Block-scoped: clippy's await_holding_lock is scope-based and
+        // does not credit an explicit drop().
+        {
+            let outbox = mini.outbox.lock();
+            assert_eq!(outbox.len(), 1, "the durable backstop row exists");
+            assert!(
+                outbox[0].not_before > outbox[0].created_at,
+                "the row is deferred — not due while it rides the boot",
+            );
+        }
+        assert!(
+            !state
+                .services
+                .meta
+                .op_pending_exists(id, OpKind::Deliver)
+                .await
+                .expect("op probe"),
+            "RidesBoot mints no Deliver op",
+        );
+    }
+
+    /// The API-level size cap (there was none): an oversize prompt is a
+    /// BadRequest with no durable trace.
+    #[tokio::test]
+    async fn oversize_prompt_is_rejected_with_no_side_effects() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(idle_session(id));
+        let err = send_prompt_core(
+            &state,
+            id,
+            "pid".into(),
+            "x".repeat(MAX_PROMPT_BYTES + 1),
+            None,
+            PromptDelivery::Enqueue,
+        )
+        .await
+        .expect_err("oversize must be rejected");
+        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
+        assert!(mini.events.lock().is_empty(), "no durable writes");
+        assert!(mini.outbox.lock().is_empty(), "no outbox row");
+    }
+
     /// A rejected SendPrompt (terminal session → Gone) leaves NO durable
     /// trace: no receipt, no echo, no outbox row. (The terminal gate
     /// precedes the accept write — the pre-idempotency behavior that
@@ -378,9 +494,16 @@ mod tests {
         let id = SessionId::new();
         let (state, mini, _local) = build_state_for_session(dead_session(id));
 
-        let err = send_prompt_core(&state, id, String::new(), "hello".into(), None)
-            .await
-            .expect_err("a Dead session cannot accept a prompt");
+        let err = send_prompt_core(
+            &state,
+            id,
+            String::new(),
+            "hello".into(),
+            None,
+            PromptDelivery::Enqueue,
+        )
+        .await
+        .expect_err("a Dead session cannot accept a prompt");
         assert!(
             matches!(err, ApiError::Gone(_)),
             "expected the Dead-session Gone mapping, got {err:?}",
@@ -399,7 +522,15 @@ mod tests {
         let id = SessionId::new();
         let (state, mini, _local) = build_state_for_session(idle_session(id));
 
-        let _ = send_prompt_core(&state, id, "client-pid-42".into(), "hello".into(), None).await;
+        let _ = send_prompt_core(
+            &state,
+            id,
+            "client-pid-42".into(),
+            "hello".into(),
+            None,
+            PromptDelivery::Enqueue,
+        )
+        .await;
 
         let events = mini.events.lock();
         assert_eq!(events.len(), 2, "receipt + echo");
@@ -433,6 +564,7 @@ mod tests {
             "pid".into(),
             "hello".into(),
             Some("bogus".into()),
+            PromptDelivery::Enqueue,
         )
         .await
         .expect_err("unknown mode must be rejected");
@@ -449,9 +581,16 @@ mod tests {
         let (state, mini, _local) = build_state_for_session(idle_session(id));
         assert!(mini.harness.lock().is_none());
 
-        let err = send_prompt_core(&state, id, "pid".into(), "hi".into(), Some("plan".into()))
-            .await
-            .expect_err("mode without a harness must be rejected");
+        let err = send_prompt_core(
+            &state,
+            id,
+            "pid".into(),
+            "hi".into(),
+            Some("plan".into()),
+            PromptDelivery::Enqueue,
+        )
+        .await
+        .expect_err("mode without a harness must be rejected");
         assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
     }
 
@@ -471,6 +610,7 @@ mod tests {
             "pid".into(),
             "plan it".into(),
             Some("plan".into()),
+            PromptDelivery::Enqueue,
         )
         .await
         .expect("declared mode is accepted");
@@ -496,9 +636,16 @@ mod tests {
         let id = SessionId::new();
         let (state, mini, _local) = build_state_for_session(idle_session(id));
 
-        send_prompt_core(&state, id, "pid".into(), "hello".into(), None)
-            .await
-            .expect("plain prompt");
+        send_prompt_core(
+            &state,
+            id,
+            "pid".into(),
+            "hello".into(),
+            None,
+            PromptDelivery::Enqueue,
+        )
+        .await
+        .expect("plain prompt");
 
         let events = mini.events.lock();
         assert!(events.iter().all(|e| e.kind != "harness_mode_changed"));

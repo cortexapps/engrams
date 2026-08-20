@@ -349,11 +349,13 @@ pub struct AgentSpec {
     /// Firecracker it's a path inside the rootfs.
     pub argv: Vec<String>,
     /// Harness-*only* extras, layered on top of [`Self::session_env`]
-    /// for the harness child: the initial prompt, the harness dial
-    /// address, the working-directory key, and the per-request forge
-    /// broker token. These are deliberately NOT in `session_env` —
-    /// they're either harness-specific or short-lived credentials, so
-    /// they don't belong in the env every session process inherits.
+    /// for the harness child: the create-time initial prompt (ADR 0108
+    /// A6 — `ENGRAM_INITIAL_PROMPT*`, stamped by `boot_on_reserved_host`
+    /// on the create lanes only, consumed once at harness-engine start),
+    /// the working-directory key, and the per-request forge broker
+    /// token. These are deliberately NOT in `session_env` — they're
+    /// either harness-specific or short-lived credentials, so they
+    /// don't belong in the env every session process inherits.
     #[serde(default)]
     pub env: HashMap<String, String>,
     /// The durable session environment: the image manifest `[env]` +

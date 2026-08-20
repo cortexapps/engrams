@@ -171,6 +171,7 @@ pub fn init(addr: SocketAddr) {
     ::metrics::counter!(QUARANTINE_STUCK_TOTAL).absolute(0);
     ::metrics::counter!(OUTBOX_RESCAN_CLAIMED_TOTAL).absolute(0);
     ::metrics::counter!(SESSION_OP_RESCAN_CLAIMED_TOTAL).absolute(0);
+    ::metrics::counter!(INITIAL_PROMPT_ENV_STAMPED_TOTAL).absolute(0);
 }
 
 // ─── metric name constants ────────────────────────────────────────
@@ -239,6 +240,17 @@ pub const HOSTS_READY: &str = "engram_hosts_ready";
 /// between this and OUTBOX_ACKED going nonzero-and-growing is the
 /// alarmed "delivered but never acked" signal.
 pub const OUTBOX_DELIVERED_TOTAL: &str = "engram_outbox_delivered_total";
+/// Counter (ADR 0108 A6). Create-time prompts stamped into the spawn
+/// env by `boot_on_reserved_host` — the zero-round-trip delivery rail.
+/// Compare against `engram_session_create_total{outcome="success"}`:
+/// every create-with-prompt should stamp.
+pub const INITIAL_PROMPT_ENV_STAMPED_TOTAL: &str = "engram_initial_prompt_env_stamped_total";
+/// Counter (ADR 0108 A6). Create-time prompts that could NOT ride the
+/// spawn env and fell back to the outbox rail. Labels: `reason`
+/// (`oversize` / `peek_error`). Zero-normally; a sustained rate is the
+/// skew/misconfig detector (redelivery counts on `create:*` rows catch
+/// the stale-bundle shape, which stamps fine but is ignored in-guest).
+pub const INITIAL_PROMPT_ENV_FALLBACK_TOTAL: &str = "engram_initial_prompt_env_fallback_total";
 /// Counter. Due outbox sessions found by the shim's FALLBACK rescan tick
 /// (the 2 s timer arm), not by a NOTIFY/direct wake. This is the "how
 /// much delivery work rides a timer instead of an event" gauge for the

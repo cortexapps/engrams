@@ -1980,6 +1980,18 @@ async fn outbox_flow(ctx: &Ctx) {
         meta.outbox_next_due(sid).await.unwrap().is_none(),
         "ack window gates redelivery"
     );
+    // ADR 0108 A6: `outbox_get` fetches by id regardless of due-ness —
+    // the boot's spawn-env peek reads a row `outbox_next_due` cannot
+    // see (deferred, delivered-unacked, any state). Unknown id → None.
+    let peeked = meta
+        .outbox_get("p-1")
+        .await
+        .unwrap()
+        .expect("outbox_get sees the not-due row");
+    assert_eq!(peeked.prompt_id, "p-1");
+    assert!(peeked.delivered_at.is_some());
+    assert!(peeked.acked_at.is_none());
+    assert!(meta.outbox_get("p-nope").await.unwrap().is_none());
     ctx.clock.advance(Duration::from_secs(21));
     let redue = meta
         .outbox_next_due(sid)

@@ -111,6 +111,7 @@ impl app::session_service_server::SessionService for AppSessionService {
             r.prompt_id,
             r.text,
             r.harness_mode,
+            crate::api::prompt::PromptDelivery::Enqueue,
         )
         .await
         .map_err(into_status)?;
