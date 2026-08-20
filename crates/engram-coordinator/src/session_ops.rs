@@ -661,6 +661,9 @@ pub fn spawn(state: SharedState, wake: Arc<Notify>) -> tokio::task::JoinHandle<(
 
     tokio::spawn(async move {
         let inflight: Arc<dashmap::DashSet<SessionId>> = Arc::new(dashmap::DashSet::new());
+        // The startup scan is crash recovery — timer-attributed on
+        // purpose: work found there rode no event either.
+        let mut woke_by_timer = true;
         loop {
             let due = match state.services.meta.op_due_sessions().await {
                 Ok(d) => d,
@@ -673,6 +676,19 @@ pub fn spawn(state: SharedState, wake: Arc<Notify>) -> tokio::task::JoinHandle<(
                 if !inflight.insert(session_id) {
                     continue; // this pod is already driving the session
                 }
+                if woke_by_timer {
+                    // Work the fallback tick found instead of a NOTIFY —
+                    // it waited up to RESCAN_INTERVAL of pure latency.
+                    // Zero-normally; see the metric doc. Counted after
+                    // the inflight dedup so a session this pod is
+                    // already driving never inflates it.
+                    ::metrics::counter!(crate::metrics::SESSION_OP_RESCAN_CLAIMED_TOTAL)
+                        .increment(1);
+                    tracing::debug!(
+                        %session_id,
+                        "op executor: fallback rescan found due work (a wake was missed)",
+                    );
+                }
                 let state = state.clone();
                 let inflight = inflight.clone();
                 tokio::spawn(async move {
@@ -680,10 +696,10 @@ pub fn spawn(state: SharedState, wake: Arc<Notify>) -> tokio::task::JoinHandle<(
                     inflight.remove(&session_id);
                 });
             }
-            tokio::select! {
-                _ = wake.notified() => {}
-                _ = tokio::time::sleep(RESCAN_INTERVAL) => {}
-            }
+            woke_by_timer = tokio::select! {
+                _ = wake.notified() => false,
+                _ = tokio::time::sleep(RESCAN_INTERVAL) => true,
+            };
         }
     })
 }

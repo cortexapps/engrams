@@ -169,6 +169,8 @@ pub fn init(addr: SocketAddr) {
     // series must too.
     ::metrics::counter!(DURABILITY_ROLLBACK_TOTAL).absolute(0);
     ::metrics::counter!(QUARANTINE_STUCK_TOTAL).absolute(0);
+    ::metrics::counter!(OUTBOX_RESCAN_CLAIMED_TOTAL).absolute(0);
+    ::metrics::counter!(SESSION_OP_RESCAN_CLAIMED_TOTAL).absolute(0);
 }
 
 // ─── metric name constants ────────────────────────────────────────
@@ -237,6 +239,23 @@ pub const HOSTS_READY: &str = "engram_hosts_ready";
 /// between this and OUTBOX_ACKED going nonzero-and-growing is the
 /// alarmed "delivered but never acked" signal.
 pub const OUTBOX_DELIVERED_TOTAL: &str = "engram_outbox_delivered_total";
+/// Counter. Due outbox sessions found by the shim's FALLBACK rescan tick
+/// (the 2 s timer arm), not by a NOTIFY/direct wake. This is the "how
+/// much delivery work rides a timer instead of an event" gauge for the
+/// event-driven campaign. Expected nonzero sources: ACK_TIMEOUT
+/// redelivery (the rescan owns it today) and crash recovery — both
+/// shrink as the A6/steering tracks land. An unexpected sustained rate
+/// with no redeliveries means a wake path is broken (the #1300 class).
+pub const OUTBOX_RESCAN_CLAIMED_TOTAL: &str = "engram_outbox_rescan_claimed_total";
+/// Counter. Due op-sessions found by the executor's FALLBACK rescan tick
+/// (the 5 s timer arm), not by a `session_ops` NOTIFY. The op kernel's
+/// wake paths are supposed to make this zero-normally: enqueues NOTIFY,
+/// completions re-drive, and the boot/attach wakes pull deferred ops
+/// due. Anything here waited up to a full rescan interval — each unit is
+/// user-visible latency, and a sustained rate means a wake edge case is
+/// dropping (requeues never NOTIFY; permit-less notify_waiters; the
+/// #1300 already-due guard class). Alert on rate > ~0.
+pub const SESSION_OP_RESCAN_CLAIMED_TOTAL: &str = "engram_session_op_rescan_claimed_total";
 /// ADR 0079: enqueue->claim latency (seconds). The kernel's hotness
 /// proof — a poll-hop executor shows up here as multi-second p99.
 pub const SESSION_OP_CLAIM_LATENCY_SECONDS: &str = "engram_session_op_claim_latency_seconds";
