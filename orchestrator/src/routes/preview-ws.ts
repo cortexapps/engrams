@@ -114,8 +114,16 @@ export function makePreviewUpgradeHandler(
     }
 
     /** Reject Bun-safely: complete the upgrade, then close with 4000+status so
-     *  the browser can read the reason (mirrors server.ts's shell rejection). */
+     *  the browser can read the reason (mirrors server.ts's shell rejection).
+     *
+     *  Bails when the socket is already gone. `ws`'s handleUpgrade on a dead
+     *  socket walks into its abort path, and under Bun that threw a TypeError
+     *  out of the async upgrade listener — which exited the process (prod,
+     *  2026-08-20). server.ts now contains that blast radius; this stops us
+     *  walking into it in the first place, which matters because a browser
+     *  abandoning an HMR reconnect makes it routine rather than rare. */
     const reject = (status: number): true => {
+      if (socket.destroyed || !socket.writable) return true;
       wss.handleUpgrade(req, socket, head, (ws) =>
         ws.close(4000 + status, `preview ${status}`),
       );
@@ -148,6 +156,9 @@ export function makePreviewUpgradeHandler(
       .map((s) => s.trim())
       .filter(Boolean);
 
+    // Same guard as `reject`: everything above awaited I/O (a store lookup, a
+    // session resolve), so the client may well have hung up by now.
+    if (socket.destroyed || !socket.writable) return true;
     wss.handleUpgrade(req, socket, head, (clientWs) => {
       bridgeClientToGuest(clientWs, relay, authz.row.sessionId, authz.row.port, url, subprotocols);
     });

@@ -46,6 +46,7 @@ import { connectNodeAdapter } from "@connectrpc/connect-node";
 import type { ConnectRouter } from "@connectrpc/connect";
 import type { NodeWebSocket } from "@hono/node-ws";
 import { iapBridge } from "./auth/iap-bridge.ts";
+import { log } from "./log.ts";
 
 export type RouteRegistrar = (router: ConnectRouter) => void;
 
@@ -123,6 +124,38 @@ export function buildServer(
     //       4404 = Not Found, etc.).  Bun socket.end() is not used at all.
     const { wss } = nodeWs;
     server.on("upgrade", async (request: IncomingMessage, socket: Socket, head: Buffer) => {
+      // EVERYTHING below runs inside this try. An `upgrade` listener is async,
+      // so anything it throws becomes an unhandled rejection — and under Bun
+      // that exits the process. One client's failed handshake then takes the
+      // whole orchestrator down, which is exactly what happened in prod on
+      // 2026-08-20: a preview WebSocket hit an error path inside `ws`
+      // (abortHandshake with a code http.STATUS_CODES has no entry for), the
+      // rejection escaped, and both pods crash-looped 11 times.
+      //
+      // An upgrade concerns ONE connection. The blast radius has to be that
+      // connection, so the catch destroys the socket and nothing else.
+      try {
+        await handleUpgradeRequest(request, socket, head);
+      } catch (err) {
+        log.error(
+          { component: "ws", err, url: request.url, host: request.headers.host },
+          "websocket upgrade failed; destroying the socket",
+        );
+        // Best-effort: the socket may already be gone, which is frequently the
+        // reason we are here at all.
+        try {
+          socket.destroy();
+        } catch {
+          /* already destroyed */
+        }
+      }
+    });
+
+    async function handleUpgradeRequest(
+      request: IncomingMessage,
+      socket: Socket,
+      head: Buffer,
+    ): Promise<void> {
       // Raw-socket proxy hooks (preview by Host, IDE by path — see UpgradeHook)
       // run in order; unmatched upgrades fall through to the shell/vnc path.
       for (const hook of upgradeHooks) {
@@ -158,7 +191,7 @@ export function buildServer(
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit("connection", ws, request);
       });
-    });
+    }
   }
 
   return server;
