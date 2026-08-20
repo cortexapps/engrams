@@ -1259,12 +1259,25 @@ jobs:
           # >=2.1.187 removed the AskUserQuestion + ExitPlanMode built-ins from
           # headless `--print` mode, so questions and plan approval ride the
           # injected MCP tools (ask_user_question / exit_plan_mode) instead of
-          # native bindings. Bump deliberately and re-verify the deferred-tool
-          # spine against the new CLI: defer parks the turn
-          # (`terminal_reason: tool_deferred`), `--resume` re-fires id-stable,
-          # and the MCP bridge serves the stashed result. Keep in lockstep with
-          # the justfile and bake-images.yml.
-          CLAUDE_VERSION=2.1.212
+          # native bindings. Bump deliberately and re-verify BOTH spines
+          # against the new CLI: the deferred-tool spine (defer parks the turn
+          # with `terminal_reason: tool_deferred`, `--resume` re-fires
+          # id-stable, the MCP bridge serves the stashed result) and the
+          # steering behavior (`scripts/claude-steer-probe.py` must report
+          # STEER — ADR 0052 2026-08-20 update). Keep in lockstep with the
+          # justfile, bake-images.yml, and the probe attestation asserted
+          # below.
+          CLAUDE_VERSION=2.1.228
+          # The probe attestation gate: a pin bump that skipped the steering
+          # re-probe (deploy/harness-claude/claude-pin.toml) fails here. CI
+          # has no model credentials, so the probe runs at bump time on the
+          # bumper's machine; a version's binary is immutable, so drift can
+          # only enter at a bump — lockstep is the whole gate.
+          attested=$(sed -n 's/^version = "\(.*\)"$/\1/p' deploy/harness-claude/claude-pin.toml)
+          if [ "$attested" != "$CLAUDE_VERSION" ]; then
+            echo "::error::CLAUDE_VERSION=$CLAUDE_VERSION but claude-pin.toml attests $attested — run scripts/claude-steer-probe.py against the new binary and update the attestation (ADR 0052)"
+            exit 1
+          fi
           curl -fsSL --retry 3 \
             "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
             -o /tmp/claude

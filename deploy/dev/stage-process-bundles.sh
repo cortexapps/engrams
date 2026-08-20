@@ -55,7 +55,7 @@ if (( build_wrappers )); then
     cargo build -p engram-harness-codex
 fi
 
-claude_version=2.1.212
+claude_version=2.1.228
 claude_bin="$cache/claude-$claude_version-$claude_arch"
 if [[ ! -x "$claude_bin" ]]; then
     curl -fsSL --retry 3 \
