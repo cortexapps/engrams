@@ -156,6 +156,41 @@ export function buildServer(
       socket: Socket,
       head: Buffer,
     ): Promise<void> {
+      // Refuse a malformed handshake before `ws` ever sees it.
+      //
+      // This is what took prod down on 2026-08-20. An upgrade with no valid
+      // `Sec-WebSocket-Key` drives Bun's BUILTIN `ws` into its abort path —
+      // note the crash frames read `ws:671` with no file, so the npm package in
+      // node_modules is not what runs — and that path mishandles its own
+      // arguments. Reproduced locally on Bun 1.3.14, where it answers
+      // `HTTP/1.1 400 [object Object]`; on the 1.4.0 the pods run it throws
+      // `TypeError: undefined is not an object (evaluating 'message')` instead,
+      // which is how one bad handshake killed the process.
+      //
+      // Dropping the socket is the only available answer, not a shortcut:
+      // `socket.end(...)` in an upgrade listener is a NO-OP under Bun (measured
+      // — the client receives nothing), and completing the handshake to send a
+      // close frame needs the very key that is missing. A client that omits it
+      // is not a conforming WebSocket client, so there is nobody to explain
+      // ourselves to. Preview hostnames are internet-reachable (ADR 0118 moved
+      // the wall into this process), so this arrives as background noise.
+      const wsKey = request.headers["sec-websocket-key"];
+      const wsVersion = request.headers["sec-websocket-version"];
+      if (typeof wsKey !== "string" || wsKey.length === 0 || wsVersion !== "13") {
+        log.warn(
+          {
+            component: "ws",
+            host: request.headers.host,
+            url: request.url,
+            hasKey: typeof wsKey === "string" && wsKey.length > 0,
+            version: wsVersion,
+          },
+          "refusing a malformed websocket upgrade",
+        );
+        socket.destroy();
+        return;
+      }
+
       // Raw-socket proxy hooks (preview by Host, IDE by path — see UpgradeHook)
       // run in order; unmatched upgrades fall through to the shell/vnc path.
       for (const hook of upgradeHooks) {
