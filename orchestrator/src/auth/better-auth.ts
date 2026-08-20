@@ -154,13 +154,25 @@ export const auth = betterAuth({
   // URL and a sibling fetch carries the cookie with no redirect. Omitted
   // entirely when unset, which leaves the cookie host-only — the behaviour
   // every deployment had before session apps.
-  ...(config.sessionCookieDomain
+  //
+  // ORCHESTRATOR_COOKIE_PREFIX renames the auth cookies. It matters only for an
+  // engrams running as a session app of another engrams: the outer preview edge
+  // strips `better-auth`-named cookies in both directions (it cannot tell the
+  // visitor's outer token from an identically-named nested one), so a nested
+  // stack that keeps the default name never sees its own session and bounces
+  // every login back to the form. See routes/preview-proxy.ts.
+  ...(config.sessionCookieDomain || config.cookiePrefix
     ? {
         advanced: {
-          crossSubDomainCookies: {
-            enabled: true,
-            domain: config.sessionCookieDomain,
-          },
+          ...(config.sessionCookieDomain
+            ? {
+                crossSubDomainCookies: {
+                  enabled: true,
+                  domain: config.sessionCookieDomain,
+                },
+              }
+            : {}),
+          ...(config.cookiePrefix ? { cookiePrefix: config.cookiePrefix } : {}),
         },
       }
     : {}),

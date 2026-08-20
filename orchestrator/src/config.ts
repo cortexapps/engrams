@@ -55,6 +55,20 @@ export interface Config {
   githubAppLogin: string;
   /** TRUSTED_ORIGINS — comma-separated list; dev default: http://localhost:5173 */
   trustedOrigins: string[];
+
+  /**
+   * ORCHESTRATOR_COOKIE_PREFIX — better-auth `advanced.cookiePrefix`, i.e. the
+   * first segment of every auth cookie name (default `better-auth`).
+   *
+   * Exists for ONE case, and it is a real one: an engrams stack running as a
+   * session app of another engrams (the dogfooding image). The outer preview
+   * edge strips any cookie whose name contains `better-auth` in BOTH
+   * directions — it cannot tell a visitor's outer session token from a nested
+   * stack's own cookie of the identical name, and forwarding the former to
+   * agent-authored code is the thing that must never happen. So the nested
+   * stack renames its own cookie instead. Empty = the better-auth default.
+   */
+  cookiePrefix: string;
   /**
    * ORCHESTRATOR_DEVICE_VERIFICATION_URL — the human-facing page `engrams
    * auth login` sends the browser to (the SPA's /device route). Default:
@@ -422,6 +436,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const previewBaseDomain = optional("ORCHESTRATOR_PREVIEW_BASE_DOMAIN", `lvh.me:${port}`);
   // ADR 0118: empty = host-only, i.e. exactly the pre-session-apps behaviour.
   const sessionCookieDomain = optional("ORCHESTRATOR_SESSION_COOKIE_DOMAIN", "");
+  const cookiePrefix = optional("ORCHESTRATOR_COOKIE_PREFIX", "");
 
   // OPTIONAL: deployment identity for OIDC claims (ADR 0109). Defaults to the
   // public hostname; a malformed base URL falls back to the raw string so the
@@ -507,6 +522,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     oidc,
     previewBaseDomain,
     sessionCookieDomain,
+    cookiePrefix,
     adminEmails,
     sweepDisabled,
     sweepIntervalMs,

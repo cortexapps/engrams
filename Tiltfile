@@ -1017,6 +1017,19 @@ orchestrator_env = {
     # need this set by hand — better-auth rejects the browser's Origin as
     # untrusted otherwise, which reads as an unexplained 403 on every auth call.
     'TRUSTED_ORIGINS': env_or('TRUSTED_ORIGINS', orchestrator_public_url),
+    # Rename this stack's auth cookies away from better-auth's default.
+    #
+    # A dev stack is exactly the thing that ends up running as a session app of
+    # ANOTHER engrams (the dogfooding image), and that outer preview edge strips
+    # any cookie whose name contains `better-auth` in both directions — it
+    # cannot tell a visitor's outer session token from a nested stack's own
+    # cookie of the identical name, and forwarding the former into
+    # agent-authored code is the leak that boundary exists to prevent. A nested
+    # stack keeping the default name therefore never sees its own session and
+    # bounces every login straight back to the form, which is how it presented.
+    # Defaulted here rather than left to a profile so the nested case works with
+    # nothing to configure; the name is cosmetic for a non-nested `just dev`.
+    'ORCHESTRATOR_COOKIE_PREFIX': env_or('ORCHESTRATOR_COOKIE_PREFIX', 'engrams-dev'),
     # Dev-only better-auth signing secret (≥32 chars). better-auth 1.6.16
     # silently falls back to a publicly-known constant when unset, so the
     # orchestrator requires it; a fixed dev literal is fine locally but
