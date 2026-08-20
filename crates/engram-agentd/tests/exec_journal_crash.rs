@@ -158,6 +158,7 @@ async fn command_mismatch_is_loud_before_any_recorded_output_is_replayed() {
     let ca = CaCertInstaller::new(CaCertPaths {
         bundle: temp.path().join("ca-bundle"),
         extra_cert: temp.path().join("ca-extra"),
+        chromium_policy: temp.path().join("ca-extra-chromium-policy.json"),
     });
     let server_task = tokio::spawn(serve_connection_with_journal(
         server,
@@ -204,6 +205,7 @@ async fn attach_only_missing_journal_never_authorizes_a_second_spawn() {
     let ca = CaCertInstaller::new(CaCertPaths {
         bundle: temp.path().join("ca-bundle"),
         extra_cert: temp.path().join("ca-extra"),
+        chromium_policy: temp.path().join("ca-extra-chromium-policy.json"),
     });
     let server_task = tokio::spawn(serve_connection_with_journal(
         server,
@@ -267,6 +269,7 @@ async fn nonzero_offsets_against_vacant_journal_refuse_without_spawn_or_leak() {
     let ca = CaCertInstaller::new(CaCertPaths {
         bundle: temp.path().join("ca-bundle"),
         extra_cert: temp.path().join("ca-extra"),
+        chromium_policy: temp.path().join("ca-extra-chromium-policy.json"),
     });
     let server_task = tokio::spawn(serve_connection_with_journal(
         server,
@@ -296,6 +299,7 @@ async fn nonzero_offsets_against_vacant_journal_refuse_without_spawn_or_leak() {
     let ca = CaCertInstaller::new(CaCertPaths {
         bundle: temp.path().join("ca-bundle-2"),
         extra_cert: temp.path().join("ca-extra-2"),
+        chromium_policy: temp.path().join("ca-extra-2-chromium-policy.json"),
     });
     let server_task = tokio::spawn(serve_connection_with_journal(
         server,
@@ -477,6 +481,7 @@ async fn died_attach_drains_the_full_journal_before_exit_none() {
     let ca = CaCertInstaller::new(CaCertPaths {
         bundle: temp.path().join("ca-bundle"),
         extra_cert: temp.path().join("ca-extra"),
+        chromium_policy: temp.path().join("ca-extra-chromium-policy.json"),
     });
     let server_task = tokio::spawn(serve_connection_with_journal(
         server,
@@ -600,6 +605,7 @@ fn replay_case(stdout: Vec<u8>, stderr: Vec<u8>, out_seed: u16, err_seed: u16) {
         let ca = CaCertInstaller::new(CaCertPaths {
             bundle: temp.path().join("ca-bundle"),
             extra_cert: temp.path().join("ca-extra"),
+            chromium_policy: temp.path().join("ca-extra-chromium-policy.json"),
         });
         let server_task = tokio::spawn(serve_connection_with_journal(
             server,

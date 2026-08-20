@@ -68,6 +68,7 @@ async fn cancel_with_traversal_exec_id_is_refused_and_kills_nothing() {
     let ca = CaCertInstaller::new(CaCertPaths {
         bundle: temp.path().join("ca-bundle"),
         extra_cert: temp.path().join("ca-extra"),
+        chromium_policy: temp.path().join("ca-extra-chromium-policy.json"),
     });
     let server_task = tokio::spawn(serve_connection_with_journal(
         server,

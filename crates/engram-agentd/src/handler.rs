@@ -2187,6 +2187,9 @@ mod tests {
             extra_cert: tmp
                 .path()
                 .join("usr/local/share/ca-certificates/engram.crt"),
+            chromium_policy: tmp
+                .path()
+                .join("etc/chromium/policies/managed/engram-egress-ca.json"),
         }
     }
 
@@ -2296,6 +2299,9 @@ mod tests {
             extra_cert: tmp
                 .path()
                 .join("usr/local/share/ca-certificates/engram.crt"),
+            chromium_policy: tmp
+                .path()
+                .join("etc/chromium/policies/managed/engram-egress-ca.json"),
         };
         let cacerts = Arc::new(crate::cacerts::CaCertInstaller::new(paths));
         // The issue spec required pinning "supervisor never spawned", not
