@@ -1057,14 +1057,27 @@ impl Sim {
                     )
                     .await;
                     crate::workload::drain_detached().await;
-                    // The synthetic confirming event retires the row within
-                    // the step (see the SCOPE note above). When the forward
-                    // already succeeded, the pump's echo re-ingests the same
-                    // prompt_id: `outbox_ack` is idempotent and the extra
-                    // event row is deterministic.
-                    let at = state.services.clock.now_utc();
-                    crate::workload::api_run_started(&state, sid, sandbox, &prompt_id, at).await;
-                    crate::workload::drain_detached().await;
+                    // Retire the row within the step (see the SCOPE note
+                    // above) — but never twice. The synthetic used to
+                    // fire unconditionally; a successful forward then
+                    // produced TWO run_started rows for one prompt_id
+                    // (the pump's echo plus this), which the ADR 0108 A6
+                    // exactly-once oracle rejects. Pump first so a
+                    // queued echo drains and acks; synthesize only for a
+                    // row still unacked after that (the deferred-
+                    // delivery case the SCOPE posture exists for).
+                    pump_harness_plane(&self.world).await;
+                    let acked = self.world.meta.with_db(|db| {
+                        db.outbox
+                            .get(&prompt_id)
+                            .is_none_or(|r| r.acked_at.is_some())
+                    });
+                    if !acked {
+                        let at = state.services.clock.now_utc();
+                        crate::workload::api_run_started(&state, sid, sandbox, &prompt_id, at)
+                            .await;
+                        crate::workload::drain_detached().await;
+                    }
                     // An acked prompt on a live session keeps it tracked.
                     self.record_if_live(sid);
                 }
