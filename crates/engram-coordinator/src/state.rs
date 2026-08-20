@@ -2857,6 +2857,40 @@ pub(crate) mod tests {
             out.dedup();
             Ok(out)
         }
+        async fn outbox_get(
+            &self,
+            prompt_id: &str,
+        ) -> Result<Option<engram_core::types::outbox::OutboxRow>, MetaError> {
+            Ok(self
+                .outbox
+                .lock()
+                .iter()
+                .find(|r| r.prompt_id == prompt_id)
+                .cloned())
+        }
+        async fn outbox_update_prompt_text(
+            &self,
+            prompt_id: &str,
+            text: &str,
+        ) -> Result<bool, MetaError> {
+            let mut rows = self.outbox.lock();
+            match rows
+                .iter_mut()
+                .find(|r| r.prompt_id == prompt_id && r.acked_at.is_none())
+            {
+                Some(r) => {
+                    r.payload["text"] = serde_json::Value::String(text.to_string());
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+        async fn outbox_delete_unacked(&self, prompt_id: &str) -> Result<bool, MetaError> {
+            let mut rows = self.outbox.lock();
+            let before = rows.len();
+            rows.retain(|r| !(r.prompt_id == prompt_id && r.acked_at.is_none()));
+            Ok(rows.len() < before)
+        }
         async fn outbox_next_due(
             &self,
             session_id: SessionId,

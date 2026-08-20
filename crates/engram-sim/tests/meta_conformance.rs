@@ -1980,8 +1980,9 @@ async fn outbox_flow(ctx: &Ctx) {
         meta.outbox_next_due(sid).await.unwrap().is_none(),
         "ack window gates redelivery"
     );
-    // ADR 0108 A6: `outbox_get` fetches by id regardless of due-ness —
-    // the boot's spawn-env peek reads a row `outbox_next_due` cannot
+    // `outbox_get` fetches by id regardless of due-ness — the boot's
+    // ADR 0108 A6 spawn-env peek and the edit/dequeue cores'
+    // delivered-ness read both consume rows `outbox_next_due` cannot
     // see (deferred, delivered-unacked, any state). Unknown id → None.
     let peeked = meta
         .outbox_get("p-1")

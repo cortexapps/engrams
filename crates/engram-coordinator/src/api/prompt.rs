@@ -278,36 +278,68 @@ pub(crate) async fn edit_queued_prompt_core(
     // edit must land in BOTH copies — the PG row (what a redelivery
     // reads after a harness death) and, when the prompt already reached
     // the harness, its in-memory queue (what the turn boundary
-    // consumes). The harness leg is a no-op for ids it doesn't hold
-    // (an undelivered row has no queue copy), so forwarding is always
-    // safe; it is REQUIRED to succeed only when PG had nothing (the
-    // prompt lives solely in the queue — pre-correction rows).
-    let row_updated = state
+    // consumes). Ordering (engrams review on #1312): when a DELIVERED-
+    // unacked row exists, a live harness may hold the copy that will
+    // actually run — including one that is alive but momentarily
+    // unregistered (the issue-#218 reconnect bounce) — so the harness
+    // forward must SUCCEED before this call reports success; swallowing
+    // its failure would let the old text run while the API says
+    // "edited". An UNDELIVERED row has no queue copy (the harness never
+    // received it), so the PG update alone is complete there.
+    let row = state
         .services
         .meta
-        .outbox_update_prompt_text(&prompt_id, &text)
+        .outbox_get(&prompt_id)
         .await
         .map_err(|e| ApiError::Internal(format!("edit queued prompt: {e}")))?;
+    let unacked = row.as_ref().is_some_and(|r| r.acked_at.is_none());
+    let delivered_unacked = row
+        .as_ref()
+        .is_some_and(|r| r.acked_at.is_none() && r.delivered_at.is_some());
     match state.resolve_sandbox(id).await {
         Some(sandbox_id) => {
-            if let Err(e) = state
+            match state
                 .services
                 .host
-                .edit_queued_prompt(sandbox_id, prompt_id.clone(), text)
+                .edit_queued_prompt(sandbox_id, prompt_id.clone(), text.clone())
                 .await
             {
-                if !row_updated {
+                Ok(()) => {}
+                Err(e) if delivered_unacked => {
+                    // The harness may hold the live copy and we could not
+                    // reach it — fail WITHOUT touching the durable row, so
+                    // a retry converges once the reattach lands.
+                    return Err(ApiError::Internal(format!(
+                        "edit queued prompt: harness unreachable while it may hold the \
+                         queued copy: {e}"
+                    )));
+                }
+                Err(e) if unacked => {
+                    // Undelivered: the harness never received it; the PG
+                    // update below is the whole edit.
+                    tracing::debug!(session_id = %id, prompt_id, error = %e,
+                        "harness-side edit skipped (undelivered row; no queue copy exists)");
+                }
+                Err(e) => {
+                    // No unacked row at all (legacy queue-only shape, or
+                    // already consumed) — nothing succeeded.
                     return Err(ApiError::Internal(format!("edit queued prompt: {e}")));
                 }
-                tracing::debug!(session_id = %id, prompt_id, error = %e,
-                    "harness-side edit failed; the durable row carries the edit and a \
-                     redelivery replays it");
             }
         }
-        None if !row_updated => {
+        None if !unacked => {
             return Err(ApiError::Conflict("session has no live sandbox".into()));
         }
+        // No live process → no queue copy can exist; PG is the only copy.
         None => {}
+    }
+    if unacked {
+        state
+            .services
+            .meta
+            .outbox_update_prompt_text(&prompt_id, &text)
+            .await
+            .map_err(|e| ApiError::Internal(format!("edit queued prompt: {e}")))?;
     }
     Ok("queued prompt edited")
 }
@@ -322,41 +354,68 @@ pub(crate) async fn dequeue_queued_prompt_core(
     if prompt_id.is_empty() {
         return Err(ApiError::BadRequest("`prompt_id` is required".into()));
     }
-    // ADR 0052 (2026-08-20 correction): kill BOTH copies. The durable
-    // row (unacked through a running turn) dies first, so the withdrawn
-    // prompt can never redeliver — then the harness's in-memory copy is
-    // dropped by the forwarded DequeueQueued, whose `PromptDequeued`
-    // echo is also a terminal ack (belt-and-suspenders for the copy
-    // that raced this delete). The web's transcript reconciles via the
+    // ADR 0052 (2026-08-20 correction): kill BOTH copies — in the order
+    // the engrams review on #1312 established. When a DELIVERED-unacked
+    // row exists, a live harness may hold the copy that will actually
+    // run — including one that is alive but momentarily unregistered
+    // (the issue-#218 reconnect bounce) — so the harness must CONFIRM
+    // the drop before the durable copy dies; deleting PG first and
+    // swallowing the forward failure let a withdrawn prompt run while
+    // the API said "dequeued". An UNDELIVERED row has no queue copy, so
+    // the PG delete alone is complete; no live sandbox means no process
+    // holds a copy at all. The forwarded DequeueQueued's PromptDequeued
+    // echo is also a terminal ack (belt-and-suspenders for a copy that
+    // races this delete). The web's transcript reconciles via the
     // PromptDequeued event on the harness path; for the PG-only path
     // the held echo is simply never consumed (same render outcome as
     // pre-0067's failed-forward shape).
-    let row_deleted = state
+    let row = state
         .services
         .meta
-        .outbox_delete_unacked(&prompt_id)
+        .outbox_get(&prompt_id)
         .await
         .map_err(|e| ApiError::Internal(format!("dequeue queued prompt: {e}")))?;
+    let unacked = row.as_ref().is_some_and(|r| r.acked_at.is_none());
+    let delivered_unacked = row
+        .as_ref()
+        .is_some_and(|r| r.acked_at.is_none() && r.delivered_at.is_some());
     match state.resolve_sandbox(id).await {
         Some(sandbox_id) => {
-            if let Err(e) = state
+            match state
                 .services
                 .host
                 .dequeue_queued_prompt(sandbox_id, prompt_id.clone())
                 .await
             {
-                if !row_deleted {
+                Ok(()) => {}
+                Err(e) if delivered_unacked => {
+                    return Err(ApiError::Internal(format!(
+                        "dequeue queued prompt: harness unreachable while it may hold \
+                         the queued copy: {e}"
+                    )));
+                }
+                Err(e) if unacked => {
+                    tracing::debug!(session_id = %id, prompt_id, error = %e,
+                        "harness-side dequeue skipped (undelivered row; no queue copy exists)");
+                }
+                Err(e) => {
                     return Err(ApiError::Internal(format!("dequeue queued prompt: {e}")));
                 }
-                tracing::debug!(session_id = %id, prompt_id, error = %e,
-                    "harness-side dequeue failed; the durable row is gone so the prompt \
-                     cannot redeliver (the queue copy dies with the harness)");
             }
         }
-        None if !row_deleted => {
+        None if !unacked => {
             return Err(ApiError::Conflict("session has no live sandbox".into()));
         }
+        // No live process → no queue copy can exist; PG is the only copy.
         None => {}
+    }
+    if unacked {
+        state
+            .services
+            .meta
+            .outbox_delete_unacked(&prompt_id)
+            .await
+            .map_err(|e| ApiError::Internal(format!("dequeue queued prompt: {e}")))?;
     }
     Ok("queued prompt dequeued")
 }
@@ -677,5 +736,106 @@ mod tests {
         let outbox = mini.outbox.lock();
         assert_eq!(outbox.len(), 1);
         assert!(outbox[0].payload.get("mode").is_none());
+    }
+
+    // -- ADR 0052 correction: dequeue/edit vs the live-copy holder ------
+
+    fn active_session_with_sandbox(id: SessionId) -> engram_core::types::Session {
+        engram_core::types::Session {
+            status: engram_core::types::SessionState::Active,
+            sandbox_id: Some(engram_core::SandboxId::new()),
+            ..dead_session(id)
+        }
+    }
+
+    fn queued_row(
+        id: SessionId,
+        prompt_id: &str,
+        delivered: bool,
+    ) -> engram_core::types::outbox::OutboxRow {
+        let now = chrono::Utc::now();
+        engram_core::types::outbox::OutboxRow {
+            prompt_id: prompt_id.into(),
+            session_id: id,
+            kind: engram_core::types::outbox::OutboxKind::Prompt,
+            payload: serde_json::json!({ "text": "original" }),
+            created_at: now,
+            attempts: if delivered { 1 } else { 0 },
+            not_before: now,
+            delivered_at: delivered.then_some(now),
+            acked_at: None,
+        }
+    }
+
+    /// The engrams-review finding on #1312: a DELIVERED-unacked row means
+    /// a live harness may hold the queue copy — including one that is
+    /// alive but momentarily unregistered (the issue-#218 reconnect
+    /// bounce). If the forward fails there, the dequeue must FAIL CLOSED
+    /// with the durable row intact; deleting PG and reporting success let
+    /// the withdrawn prompt run anyway. (The fixture's registry has no
+    /// registered sandbox owner, so the forward fails exactly like the
+    /// bounce window.)
+    #[tokio::test]
+    async fn dequeue_fails_closed_when_a_live_harness_may_hold_the_copy() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(active_session_with_sandbox(id));
+        mini.outbox.lock().push(queued_row(id, "p-held", true));
+
+        let err = dequeue_queued_prompt_core(&state, id, "p-held".into())
+            .await
+            .expect_err("unreachable harness with a possible live copy must fail closed");
+        assert!(matches!(err, ApiError::Internal(_)), "got {err:?}");
+        let rows = mini.outbox.lock();
+        assert_eq!(rows.len(), 1, "the durable row is untouched");
+        assert!(rows[0].acked_at.is_none());
+    }
+
+    /// An UNDELIVERED row has no queue copy — the harness never received
+    /// it — so an unreachable harness must not block the withdrawal: the
+    /// PG delete alone is complete.
+    #[tokio::test]
+    async fn dequeue_of_an_undelivered_row_survives_an_unreachable_harness() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(active_session_with_sandbox(id));
+        mini.outbox.lock().push(queued_row(id, "p-fresh", false));
+
+        dequeue_queued_prompt_core(&state, id, "p-fresh".into())
+            .await
+            .expect("undelivered rows dequeue without the harness");
+        assert!(mini.outbox.lock().is_empty(), "the durable row is gone");
+    }
+
+    /// The edit twin of the fail-closed case: the old text must not be
+    /// left where a live harness could run it while the API says
+    /// "edited".
+    #[tokio::test]
+    async fn edit_fails_closed_when_a_live_harness_may_hold_the_copy() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(active_session_with_sandbox(id));
+        mini.outbox.lock().push(queued_row(id, "p-held", true));
+
+        let err = edit_queued_prompt_core(&state, id, "p-held".into(), "edited".into())
+            .await
+            .expect_err("unreachable harness with a possible live copy must fail closed");
+        assert!(matches!(err, ApiError::Internal(_)), "got {err:?}");
+        let rows = mini.outbox.lock();
+        assert_eq!(
+            rows[0].payload["text"], "original",
+            "the durable text is untouched — a retry converges post-reattach",
+        );
+    }
+
+    /// The edit of an undelivered row is complete with the PG update
+    /// alone.
+    #[tokio::test]
+    async fn edit_of_an_undelivered_row_survives_an_unreachable_harness() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(active_session_with_sandbox(id));
+        mini.outbox.lock().push(queued_row(id, "p-fresh", false));
+
+        edit_queued_prompt_core(&state, id, "p-fresh".into(), "edited".into())
+            .await
+            .expect("undelivered rows edit without the harness");
+        assert_eq!(mini.outbox.lock()[0].payload["text"], "edited");
     }
 }
