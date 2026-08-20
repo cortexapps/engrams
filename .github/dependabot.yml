@@ -319,6 +319,16 @@ updates:
       # install pnpm. So it could not have built either. Skip odd majors; the
       # even ones (26, 28, …) still arrive normally.
       #
+      # TEMPORARY exception to "even majors arrive normally": node 26. 26 is an
+      # even major and WILL become LTS, but it is not LTS *yet* — v26.0.0
+      # shipped 2026-05 and the line only enters Active LTS on 2026-10-28.
+      # Until then it is a Current (non-LTS) line, and this repo pins runtimes
+      # to the newest LTS (node 24 today), so #1155 (`24-alpine` -> `26-alpine`)
+      # is deferred rather than merged. This is NOT a permanent skip like the
+      # odd majors above: REMOVE the `>= 26, < 27` entry once 26 reaches Active
+      # LTS (2026-10-28), at which point it is the newest LTS line and the right
+      # next bump from 24.
+      #
       # NOTE THE SYNTAX. For `package-ecosystem: docker`, `versions:` entries
       # are RubyGems requirement strings — NOT the npm/NuGet `x`-wildcards.
       # The first attempt here was `["25.x", "27.x", …]`, which was a SILENT
@@ -333,6 +343,7 @@ updates:
       - dependency-name: "node"
         versions:
           - ">= 25, < 26"
+          - ">= 26, < 27"
           - ">= 27, < 28"
           - ">= 29, < 30"
           - ">= 31, < 32"
