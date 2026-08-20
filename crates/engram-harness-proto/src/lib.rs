@@ -61,6 +61,28 @@ pub const MAX_MSG_BYTES: usize = 16 * 1024 * 1024;
 /// env) by `engram-agentd`'s harness supervisor.
 pub const HARNESS_CWD_ENV: &str = "ENGRAM_HARNESS_CWD";
 
+/// ADR 0108 A6: the create-time initial prompt, riding the same
+/// `SpawnHarnessRequest.env` rail as [`HARNESS_CWD_ENV`] (same
+/// wire-evolution reasoning: an env entry an old harness ignores and a
+/// new harness honors — no positional-bincode field, no `WIRE_VERSION`
+/// bump). Stamped by the coordinator's boot pipeline from the session's
+/// undelivered `create:{session_id}` outbox row; consumed ONCE at
+/// harness-process start (`run_engine` seeds one synthetic
+/// `HarnessCommand::Prompt` through the normal intake, so
+/// `seen_prompt_ids` dedups a later outbox redelivery). The outbox row
+/// stays the durable at-least-once record — `run_started{prompt_id}`
+/// acks it. Never set on a resume/reattach spec: agentd's supervisor
+/// does not re-apply env to a live child, and `materialize_snapshot_
+/// resume` builds prompt-less specs by construction.
+pub const INITIAL_PROMPT_ENV: &str = "ENGRAM_INITIAL_PROMPT";
+/// The `prompt_id` paired with [`INITIAL_PROMPT_ENV`] (the outbox row
+/// id, `create:{session_id}`) — the id the harness's `run_started`
+/// echoes so the ack joins the durable row.
+pub const INITIAL_PROMPT_ID_ENV: &str = "ENGRAM_INITIAL_PROMPT_ID";
+/// The ADR 0107 session-mode directive riding the initial prompt
+/// (e.g. `plan`). Meaningless without [`INITIAL_PROMPT_ENV`].
+pub const INITIAL_PROMPT_MODE_ENV: &str = "ENGRAM_INITIAL_PROMPT_MODE";
+
 /// First frame the harness sends after dialing the host. Carries the
 /// full attach token (ADR 0073): the hub validates it against the
 /// host-durable binding record — never an in-memory map — and rejects

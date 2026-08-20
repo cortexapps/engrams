@@ -512,6 +512,7 @@ pub fn check_quiescence(world: &SimWorld) -> Result<(), Violation> {
     no_op_dropped(world)?;
     no_orphan_sandboxes(world)?;
     ttft_liveness(world)?;
+    run_started_exactly_once(world)?;
     let sessions = world.meta.with_db(|db| {
         db.sessions
             .values()
@@ -613,6 +614,78 @@ pub fn ttft_liveness(world: &SimWorld) -> Result<(), Violation> {
                         age.num_seconds(),
                         TTFT_BOUND_SECS,
                         row.attempts,
+                    ),
+                });
+            }
+        }
+        Ok(())
+    })
+}
+
+/// ADR 0108 A6's landing-condition oracle: `run_started{prompt_id}`
+/// fires EXACTLY once per prompt, across spawn-carried delivery, the
+/// outbox rail, redelivery, and respawn interleavings. Two halves:
+///
+/// 1. **At most once, ever** (events are append-only, so checking at
+///    quiescence catches any duplicate the run produced): no prompt_id
+///    has two `run_started` events on its session. Double delivery is
+///    LEGAL on the wire (env + a redelivered row; a forward retried
+///    after a lost ack) — the guest's `seen_prompt_ids` dedup is what
+///    makes the echo single; this half is the check on it.
+/// 2. **At least once for consumed prompts** (quiescence-only): an
+///    ACKED Prompt row on a non-terminal session has exactly one
+///    `run_started` — an ack with no confirming run means an ack
+///    source lied (the `prompt_queued`-acks-a-memory-queue class, ADR
+///    0052 correction). Terminal sessions are exempt: the deliver verb
+///    legitimately acks their rows as consumed-by-termination.
+///
+/// `pub` for the non-vacuity proof in tests (guest dedup off → a
+/// double delivery must trip half 1).
+pub fn run_started_exactly_once(world: &SimWorld) -> Result<(), Violation> {
+    use engram_core::types::outbox::OutboxKind;
+    world.meta.with_db(|db| {
+        let mut counts: BTreeMap<(SessionId, &str), u32> = BTreeMap::new();
+        for (sid, events) in &db.session_events {
+            for ev in events {
+                if ev.kind != "run_started" {
+                    continue;
+                }
+                if let Some(pid) = ev.payload.get("prompt_id").and_then(|v| v.as_str()) {
+                    let n = counts.entry((*sid, pid)).or_default();
+                    *n += 1;
+                    if *n > 1 {
+                        return Err(Violation {
+                            invariant: "run-started-exactly-once",
+                            detail: format!(
+                                "session {sid}: prompt {pid} has {n} run_started events — \
+                                 a duplicate delivery echoed twice (guest dedup hole)",
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        for row in db.outbox.values() {
+            if row.kind != OutboxKind::Prompt || row.acked_at.is_none() {
+                continue;
+            }
+            let Some(session) = db.sessions.get(&row.session_id) else {
+                continue;
+            };
+            if session.session.status.is_terminal() {
+                continue;
+            }
+            let n = counts
+                .get(&(row.session_id, row.prompt_id.as_str()))
+                .copied()
+                .unwrap_or(0);
+            if n != 1 {
+                return Err(Violation {
+                    invariant: "run-started-exactly-once",
+                    detail: format!(
+                        "session {}: prompt {} is acked on a non-terminal session with {} \
+                         run_started events — an ack source confirmed a run that never started",
+                        row.session_id, row.prompt_id, n,
                     ),
                 });
             }

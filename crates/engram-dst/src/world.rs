@@ -152,6 +152,28 @@ pub struct AttachPlane {
     /// the sim guest's `run_started` echo (drained by the scheduler's
     /// harness pump).
     delivered: Vec<(SandboxId, Option<SessionId>, String)>,
+    /// The sim guest's `seen_prompt_ids` (ADR 0108 A6): prompt ids this
+    /// sandbox's harness already accepted. A duplicate delivery (env +
+    /// outbox redelivery, or a double forward) is accepted on the wire
+    /// but never recorded again — exactly one `run_started` echo per
+    /// prompt, as in production. Lives with the sandbox's harness
+    /// identity: survives a nudge/reattach (same process), dies with
+    /// the sandbox (destroy / host death), like `run_engine`'s set.
+    seen: BTreeMap<SandboxId, BTreeSet<String>>,
+    /// Test-only vacuity switch for the exactly-once oracle: `false`
+    /// disables the guest dedup so a double delivery double-echoes.
+    guest_dedup: bool,
+    /// ADR 0108 A6: the spawn-carried initial prompt (`start_agent`
+    /// found the `ENGRAM_INITIAL_PROMPT*` env keys). Held until the
+    /// dial completes — the harness lives inside the VM and can run
+    /// nothing before it attaches — then recorded as a delivery
+    /// (through the dedup) so the pump echoes `run_started`.
+    spawn_prompts: BTreeMap<SandboxId, String>,
+    /// Hosts whose harness bundle predates the A6 consumer (the
+    /// stale-bundle skew shape): the spawn env is silently ignored —
+    /// `start_agent` records no spawn prompt, and delivery falls back
+    /// to the outbox rail's ACK_TIMEOUT redelivery.
+    drop_spawn_prompt_hosts: BTreeSet<HostId>,
     /// Dial nudges per sandbox (every `start_agent`/SIGUSR1-equivalent
     /// bumps this) — observability for the no-destructive-reattach
     /// assertions in the pinned regression scenarios.
@@ -176,9 +198,32 @@ impl Default for AttachPlane {
             reap_window: std::time::Duration::from_secs(5),
             swallowed_hosts: BTreeSet::new(),
             delivered: Vec::new(),
+            seen: BTreeMap::new(),
+            guest_dedup: true,
+            spawn_prompts: BTreeMap::new(),
+            drop_spawn_prompt_hosts: BTreeSet::new(),
             nudges: BTreeMap::new(),
             announce: false,
         }
+    }
+}
+
+impl AttachPlane {
+    /// Record one accepted prompt for the pump's `run_started` echo,
+    /// through the guest dedup: an id this sandbox's harness already
+    /// accepted is dropped silently (production `seen_prompt_ids`),
+    /// so double delivery echoes exactly once.
+    fn record_delivery(&mut self, sandbox: SandboxId, owner: Option<SessionId>, prompt_id: String) {
+        if self.guest_dedup
+            && !self
+                .seen
+                .entry(sandbox)
+                .or_default()
+                .insert(prompt_id.clone())
+        {
+            return;
+        }
+        self.delivered.push((sandbox, owner, prompt_id));
     }
 }
 
@@ -312,7 +357,14 @@ impl SimHostWorld {
         // any in-flight dial) with it. Done BEFORE the hosts lock —
         // lock order is hosts → attach, never nested the other way.
         if let Effect::Destroy { sandbox } = effect {
-            self.attach.lock().harness.remove(sandbox);
+            {
+                let mut plane = self.attach.lock();
+                plane.harness.remove(sandbox);
+                // The guest's seen-set and any spawn-carried prompt die
+                // with the harness process (ADR 0108 A6).
+                plane.seen.remove(sandbox);
+                plane.spawn_prompts.remove(sandbox);
+            }
             // ADR 0116 A4: the destroy log (oracle memory) — every
             // applied destroy is recorded for the destroy-of-bound
             // oracle, which checks it against the PG bindings AFTER the
@@ -622,11 +674,22 @@ impl SimHostWorld {
                     if let Some((_, phase)) = plane.harness.get_mut(&sandbox) {
                         *phase = HarnessPhase::Attached;
                     }
+                    // ADR 0108 A6: the spawn-carried prompt runs the
+                    // moment the harness is up — recorded through the
+                    // guest dedup, so an outbox redelivery of the same
+                    // id later echoes nothing extra.
+                    if let Some(prompt_id) = plane.spawn_prompts.remove(&sandbox) {
+                        plane.record_delivery(sandbox, owner, prompt_id);
+                    }
                     completed.push((sandbox, owner));
                 }
-                // Host down or sandbox gone: the dial dies.
+                // Host down or sandbox gone: the dial dies (and any
+                // spawn-carried prompt with it — the outbox rail is
+                // the recovery).
                 None => {
                     plane.harness.remove(&sandbox);
+                    plane.spawn_prompts.remove(&sandbox);
+                    plane.seen.remove(&sandbox);
                 }
             }
         }
@@ -707,12 +770,43 @@ impl SimHostWorld {
         let mut plane = self.attach.lock();
         match plane.harness.get(&sandbox) {
             Some((_, HarnessPhase::Attached)) => {
-                plane.delivered.push((sandbox, owner, prompt_id));
+                plane.record_delivery(sandbox, owner, prompt_id);
                 Ok(())
             }
             Some((_, HarnessPhase::Stale { .. })) => Ok(()),
             Some((_, HarnessPhase::Dialing { .. })) | None => Err(SandboxError::NotFound),
         }
+    }
+
+    /// ADR 0108 A6: `start_agent` found the spawn-carried initial
+    /// prompt in the AgentSpec env. Held until the dial completes; a
+    /// host in the stale-bundle set ignores it (the pre-A6-consumer
+    /// skew shape — sampled here, at spawn time, like the swallow
+    /// fault).
+    pub fn record_spawn_prompt(&self, host: HostId, sandbox: SandboxId, prompt_id: String) {
+        let mut plane = self.attach.lock();
+        if plane.drop_spawn_prompt_hosts.contains(&host) {
+            return;
+        }
+        plane.spawn_prompts.insert(sandbox, prompt_id);
+    }
+
+    /// Arm/heal the stale-bundle fault: this host's harness ignores the
+    /// spawn-carried prompt env (ADR 0108 A6 skew shape).
+    pub fn set_drop_spawn_prompt(&self, host: HostId, on: bool) {
+        let mut plane = self.attach.lock();
+        if on {
+            plane.drop_spawn_prompt_hosts.insert(host);
+        } else {
+            plane.drop_spawn_prompt_hosts.remove(&host);
+        }
+    }
+
+    /// Test-only vacuity switch: disable the sim guest's
+    /// `seen_prompt_ids` dedup so a double delivery double-echoes —
+    /// the exactly-once oracle's non-vacuity proof.
+    pub fn set_guest_dedup(&self, on: bool) {
+        self.attach.lock().guest_dedup = on;
     }
 
     /// Drain the accepted prompts awaiting their `run_started` echo.
@@ -723,7 +817,17 @@ impl SimHostWorld {
     /// A dead host machine severs its harness plane: every connection and
     /// in-flight dial on it dies (crash AND restart).
     pub fn drop_host_harness(&self, host: HostId) {
-        self.attach.lock().harness.retain(|_, (h, _)| *h != host);
+        let mut plane = self.attach.lock();
+        let dead: Vec<SandboxId> = plane
+            .harness
+            .iter()
+            .filter_map(|(s, (h, _))| (*h == host).then_some(*s))
+            .collect();
+        for sandbox in dead {
+            plane.harness.remove(&sandbox);
+            plane.seen.remove(&sandbox);
+            plane.spawn_prompts.remove(&sandbox);
+        }
     }
 }
 
@@ -911,7 +1015,7 @@ impl HostClient for SimHostClient {
     async fn start_agent(
         &self,
         id: SandboxId,
-        _agent: AgentSpec,
+        agent: AgentSpec,
         _policy: SessionEgressPolicy,
         _fence: SessionFence,
     ) -> Result<(), SandboxError> {
@@ -923,6 +1027,19 @@ impl HostClient for SimHostClient {
                 Err(SandboxError::NotFound)
             }
         })?;
+        // ADR 0108 A6: the spawn-carried initial prompt. The sim guest
+        // consumes the same env keys the real harness does; a host in
+        // the stale-bundle set drops it (record_spawn_prompt samples
+        // the fault), and the outbox rail backstops.
+        if agent
+            .env
+            .contains_key(engram_harness_proto::INITIAL_PROMPT_ENV)
+        {
+            if let Some(prompt_id) = agent.env.get(engram_harness_proto::INITIAL_PROMPT_ID_ENV) {
+                self.world
+                    .record_spawn_prompt(self.host_id, id, prompt_id.clone());
+            }
+        }
         // ADR 0108 E: a successful `start_agent` begins the harness dial
         // (fresh spawn) or SIGUSR1-nudges an existing one (drop +
         // re-dial). Registration is NOT synchronous with the verb — it
