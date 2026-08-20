@@ -635,6 +635,33 @@ export async function buildProfileMap(
   return out;
 }
 
+/**
+ * Fetch live session state for a set of task_session refs, concurrently.
+ * Best-effort per session: an upstream session that is gone is omitted
+ * from the map (the persisted task state stays visible). Replaces the
+ * serial per-ref loop — one control-plane round trip of wall time
+ * instead of N.
+ */
+async function fetchSessionMap(
+  refs: Array<{ sessionId: string }>,
+  sessionsClient: SessionsClient,
+): Promise<Map<string, Session>> {
+  const sessionMap = new Map<string, Session>();
+  await Promise.all(
+    refs.map(async (ref) => {
+      try {
+        const resp = await sessionsClient.getSession({ sessionId: ref.sessionId });
+        if (resp.session) {
+          sessionMap.set(ref.sessionId, resp.session);
+        }
+      } catch {
+        // Best-effort: upstream session may be gone; omit from map.
+      }
+    }),
+  );
+  return sessionMap;
+}
+
 // ---------------------------------------------------------------------------
 // Core loader
 // ---------------------------------------------------------------------------
@@ -670,20 +697,8 @@ async function loadTask(
     .from(taskSessionTable)
     .where(eq(taskSessionTable.taskId, taskId));
 
-  // Fetch live session state for each session.
-  const sessionMap = new Map<string, Session>();
-  for (const ref of sessionRefRows) {
-    try {
-      const resp = await sessionsClient.getSession({ sessionId: ref.sessionId });
-      if (resp.session) {
-        sessionMap.set(ref.sessionId, resp.session);
-      }
-    } catch {
-      // Best-effort: upstream session may be gone; omit from map.
-    }
-  }
-
-  const [profileMap, identityMap, awaitingSessionIds] = await Promise.all([
+  const [sessionMap, profileMap, identityMap, awaitingSessionIds] = await Promise.all([
+    fetchSessionMap(sessionRefRows, sessionsClient),
     buildProfileMap(sessionRefRows, profiles, imagesClient),
     users.getIdentities(taskRow.createdByUserId != null ? [taskRow.createdByUserId] : []),
     fetchAwaitingSessionIds(pendingCalls),
@@ -718,16 +733,8 @@ async function loadTask(
       .select()
       .from(taskSessionTable)
       .where(inArray(taskSessionTable.taskId, [...childIds]));
-    const descendantSessionMap = new Map<string, Session>();
-    for (const ref of descendantRefs) {
-      try {
-        const response = await sessionsClient.getSession({ sessionId: ref.sessionId });
-        if (response.session) descendantSessionMap.set(ref.sessionId, response.session);
-      } catch {
-        // A deleted child remains visible from its persisted task state.
-      }
-    }
-    const [descendantProfileMap, descendantIdentityMap] = await Promise.all([
+    const [descendantSessionMap, descendantProfileMap, descendantIdentityMap] = await Promise.all([
+      fetchSessionMap(descendantRefs, sessionsClient),
       buildProfileMap(descendantRefs, profiles, imagesClient),
       users.getIdentities([...new Set(descendantRows.flatMap((row) => row.createdByUserId ?? []))]),
     ]);
