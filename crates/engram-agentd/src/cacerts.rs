@@ -45,6 +45,20 @@ pub struct CaCertPaths {
     /// The source-of-truth file `update-ca-certificates` regenerates
     /// the bundle from. One PEM per file.
     pub extra_cert: PathBuf,
+    /// Chromium's managed-policy file carrying the same CA.
+    ///
+    /// Chromium on Linux does NOT read the OpenSSL bundle above — it uses its
+    /// own verifier, so the two writes that make curl/Node/Java trust the
+    /// egress proxy leave the browser rejecting every intercepted origin with
+    /// ERR_CERT_AUTHORITY_INVALID. The in-guest browser is a first-class
+    /// surface (ADR 0065), so it needs its own install.
+    ///
+    /// The `CACertificates` enterprise policy is the mechanism, chosen over
+    /// seeding an NSS database because it needs no `certutil` in the image and
+    /// no per-user state. Measured against the bundled Chromium 149: with this
+    /// file the app loads, without it the same URL is REJECTED, and the Google
+    /// Chrome path (`/etc/opt/chrome/...`) is not read by a Chromium build.
+    pub chromium_policy: PathBuf,
 }
 
 impl CaCertPaths {
@@ -56,6 +70,7 @@ impl CaCertPaths {
             extra_cert: PathBuf::from(
                 "/usr/local/share/ca-certificates/engram-egress-proxy-ca.crt",
             ),
+            chromium_policy: PathBuf::from("/etc/chromium/policies/managed/engram-egress-ca.json"),
         }
     }
 }
@@ -103,6 +118,7 @@ impl CaCertInstaller {
         Self::new(CaCertPaths {
             bundle: root.join("etc/ssl/certs/ca-certificates.crt"),
             extra_cert: root.join("usr/local/share/ca-certificates/engram.crt"),
+            chromium_policy: root.join("etc/chromium/policies/managed/engram.json"),
         })
     }
 
@@ -124,6 +140,17 @@ impl CaCertInstaller {
 
         append_to_bundle(&self.paths.bundle, &normalized)?;
         write_extra_cert(&self.paths.extra_cert, &normalized)?;
+        // Best-effort, unlike the two above: an image with no browser still
+        // wants a working TLS trust store, and a rootfs that refuses this
+        // write must not fail the whole CA exchange over it.
+        if let Err(e) = write_chromium_policy(&self.paths.chromium_policy, &normalized) {
+            tracing::warn!(
+                error = %e,
+                policy = %self.paths.chromium_policy.display(),
+                "failed to write Chromium CA policy; the in-guest browser will \
+                 reject intercepted TLS even though other clients trust it",
+            );
+        }
 
         if let Some(prev_pem) = prev {
             // Best-effort: a failed rewrite leaves the *previous*
@@ -142,6 +169,34 @@ impl CaCertInstaller {
         state.last_pem = Some(normalized);
         Ok(true)
     }
+}
+
+/// Write Chromium's `CACertificates` managed policy for `pem`.
+///
+/// The policy value is the certificate's base64 DER — i.e. the PEM body with
+/// its armour lines and newlines removed. Overwrites rather than accumulates:
+/// this file belongs to us alone, and a rotation should leave exactly the CA
+/// that is currently in force.
+fn write_chromium_policy(policy: &Path, pem: &str) -> io::Result<()> {
+    if let Some(parent) = policy.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let der_b64: String = pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .flat_map(|l| l.chars().filter(|c| !c.is_whitespace()))
+        .collect();
+    if der_b64.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PEM carried no base64 body",
+        ));
+    }
+    // Hand-rolled rather than pulled through a JSON crate: the only dynamic
+    // value is base64, whose alphabet cannot produce a character that needs
+    // escaping, so there is nothing for a serializer to protect us from.
+    let json = format!("{{\n  \"CACertificates\": [\"{der_b64}\"]\n}}\n");
+    std::fs::write(policy, json)
 }
 
 /// Trim trailing whitespace and append a single newline so the bundle
@@ -226,6 +281,9 @@ mod tests {
             extra_cert: tmp
                 .path()
                 .join("usr/local/share/ca-certificates/engram.crt"),
+            chromium_policy: tmp
+                .path()
+                .join("etc/chromium/policies/managed/engram-egress-ca.json"),
         };
         let inst = CaCertInstaller::new(paths);
         (tmp, inst)
@@ -316,5 +374,72 @@ mod tests {
         let bundle = std::fs::read_to_string(&inst.paths.bundle).unwrap();
         assert!(bundle.contains("DIFFERENT CERT"));
         assert!(bundle.contains("AAAA"));
+    }
+
+    /// Chromium does not read the OpenSSL bundle, so the two writes that make
+    /// curl and Node trust the egress proxy left the in-guest browser
+    /// rejecting every intercepted origin with ERR_CERT_AUTHORITY_INVALID —
+    /// reproduced against the bundled Chromium 149 before this was added.
+    #[tokio::test]
+    async fn install_writes_the_chromium_policy_with_the_bare_base64() {
+        let (_tmp, inst) = fixture();
+        inst.install(PEM_A).await.unwrap();
+
+        let json = std::fs::read_to_string(&inst.paths.chromium_policy).unwrap();
+        assert!(
+            json.contains("\"CACertificates\""),
+            "policy key present: {json}"
+        );
+        // The value is the PEM BODY only: armour lines and newlines are what
+        // Chromium rejects, and a `-----BEGIN` in there is the likeliest
+        // regression.
+        assert!(json.contains("AAAA"), "carries the cert body: {json}");
+        assert!(!json.contains("-----"), "no PEM armour: {json}");
+        assert!(
+            !json.contains("\\n"),
+            "no escaped newlines in the value: {json}"
+        );
+        // Valid JSON, not just string-shaped.
+        assert_eq!(json.matches('[').count(), 1);
+        assert_eq!(json.matches(']').count(), 1);
+    }
+
+    /// A rotation must leave exactly the CA now in force. The bundle
+    /// accumulates and is pruned; this file is ours alone, so it is replaced.
+    #[tokio::test]
+    async fn rotation_replaces_the_policy_rather_than_appending() {
+        let (_tmp, inst) = fixture();
+        inst.install(PEM_A).await.unwrap();
+        inst.install(PEM_B).await.unwrap();
+
+        let json = std::fs::read_to_string(&inst.paths.chromium_policy).unwrap();
+        assert!(json.contains("BBBB"), "new cert present: {json}");
+        assert!(!json.contains("AAAA"), "old cert gone: {json}");
+    }
+
+    /// The critical path is the TLS trust store. A rootfs that refuses the
+    /// policy write (no /etc, read-only, no browser) must still get a working
+    /// bundle rather than failing the whole CA exchange.
+    #[tokio::test]
+    async fn a_failed_policy_write_does_not_fail_the_install() {
+        let tmp = TempDir::new().unwrap();
+        // A FILE where the policy's parent directory needs to be, so
+        // create_dir_all cannot succeed.
+        let blocker = tmp.path().join("blocked");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let inst = CaCertInstaller::new(CaCertPaths {
+            bundle: tmp.path().join("etc/ssl/certs/ca-certificates.crt"),
+            extra_cert: tmp
+                .path()
+                .join("usr/local/share/ca-certificates/engram.crt"),
+            chromium_policy: blocker.join("managed/engram.json"),
+        });
+
+        assert!(
+            inst.install(PEM_A).await.unwrap(),
+            "install still reports success"
+        );
+        let bundle = std::fs::read_to_string(&inst.paths.bundle).unwrap();
+        assert!(bundle.contains("AAAA"), "the trust store was still written");
     }
 }
