@@ -45,6 +45,15 @@ export const listAutomationRuns = AutomationService.method.listAutomationRuns;
 export const testRender = AutomationService.method.testRender;
 
 /**
+ * Evaluate a code-block source in the QuickJS sandbox against a sample
+ * input (ADR 0119 D6). Same limits as a real run; powers the editor's
+ * Run button.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.EvalCode
+ */
+export const evalCode = AutomationService.method.evalCode;
+
+/**
  * @generated from rpc engram.app.v1.AutomationService.ListWebhookSamples
  */
 export const listWebhookSamples = AutomationService.method.listWebhookSamples;

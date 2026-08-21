@@ -14,6 +14,10 @@ service AutomationService {
   rpc SetAutomationEnabled(SetAutomationEnabledRequest) returns (SetAutomationEnabledResponse);
   rpc ListAutomationRuns(ListAutomationRunsRequest) returns (ListAutomationRunsResponse);
   rpc TestRender(TestRenderRequest) returns (TestRenderResponse);
+  // Evaluate a code-block source in the QuickJS sandbox against a sample
+  // input (ADR 0119 D6). Same limits as a real run; powers the editor's
+  // Run button.
+  rpc EvalCode(EvalCodeRequest) returns (EvalCodeResponse);
   rpc ListWebhookSamples(ListWebhookSamplesRequest) returns (ListWebhookSamplesResponse);
 }
 
@@ -197,6 +201,24 @@ message TestRenderResponse {
   optional string rendered_prompt = 1;
   optional string rendered_title = 2;
   repeated TemplateError errors = 3;
+}
+
+message EvalCodeRequest {
+  string source = 1;
+  // "value" | "boolean"
+  string mode = 2;
+  // JSON object with optional event/steps/inputs/trigger keys; the scope the
+  // code sees. Capped at 512 KiB.
+  string input_json = 3;
+}
+
+message EvalCodeResponse {
+  optional string value_json = 1;
+  optional string error_name = 2;
+  optional string error_message = 3;
+  optional int32 error_line = 4;
+  repeated string logs = 5;
+  int64 duration_ms = 6;
 }
 
 message WebhookSample {

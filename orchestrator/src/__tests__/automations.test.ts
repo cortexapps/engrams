@@ -20,6 +20,7 @@ import { invalidateRegistry } from "../connectors/registry.ts";
 import { definitionFromLegacyAction } from "../automations/legacy-compat.ts";
 import {
   registerAutomations,
+  EVAL_CODE_LIMIT_PER_MINUTE,
   type AutomationDeps,
   type GetSession,
 } from "../rpc/automations.ts";
@@ -685,5 +686,86 @@ describe("WebhookRegistrationService", () => {
     // Hidden lifecycle events (installation.*) reach the ledger but never the
     // trigger picker.
     expect(response.events.some((event) => event.key.startsWith("installation"))).toBe(false);
+  });
+});
+
+describe("AutomationService.EvalCode", () => {
+  const admin = () => ({
+    getSession: session("admin-1", "admin"),
+    store: fakeStore(),
+    profiles: { getActive: async () => profile() },
+  });
+
+  test("runs the real sandbox and returns value, logs, duration", async () => {
+    const { automations } = clients(admin());
+    const response = await automations.evalCode({
+      source: `export default ({ event }) => { console.log("seen", event.n); return event.n * 2; };`,
+      mode: "value",
+      inputJson: JSON.stringify({ event: { n: 21 } }),
+    });
+    expect(response.valueJson).toBe("42");
+    expect(response.logs).toEqual(["log: seen 21"]);
+    expect(response.errorName).toBeUndefined();
+  });
+
+  test("returns typed errors with line numbers instead of failing the RPC", async () => {
+    const { automations } = clients(admin());
+    const response = await automations.evalCode({
+      source: 'export default () => {\n  throw new Error("boom");\n};',
+      mode: "value",
+      inputJson: "",
+    });
+    expect(response.valueJson).toBeUndefined();
+    expect(response.errorName).toBe("Error");
+    expect(response.errorMessage).toBe("boom");
+    expect(response.errorLine).toBe(2);
+  });
+
+  test("admin-gated", async () => {
+    const member = clients({ ...admin(), getSession: session("user-1", "user") });
+    await expectCode(
+      member.automations.evalCode({ source: "export default () => 1;", mode: "value", inputJson: "" }),
+      Code.PermissionDenied,
+    );
+    const anonymous = clients({ ...admin(), getSession: session(null) });
+    await expectCode(
+      anonymous.automations.evalCode({ source: "export default () => 1;", mode: "value", inputJson: "" }),
+      Code.Unauthenticated,
+    );
+  });
+
+  test("validates mode and input_json", async () => {
+    const { automations } = clients(admin());
+    await expectCode(
+      automations.evalCode({ source: "export default () => 1;", mode: "maybe", inputJson: "" }),
+      Code.InvalidArgument,
+    );
+    await expectCode(
+      automations.evalCode({ source: "export default () => 1;", mode: "value", inputJson: "not json" }),
+      Code.InvalidArgument,
+    );
+    await expectCode(
+      automations.evalCode({ source: "export default () => 1;", mode: "value", inputJson: "[1,2]" }),
+      Code.InvalidArgument,
+    );
+  });
+
+  test("rate limits per user with a fake sandbox", async () => {
+    let calls = 0;
+    const { automations } = clients({
+      ...admin(),
+      evalCode: async () => {
+        calls += 1;
+        return { ok: true, value: calls, durationMs: 1, logs: [] };
+      },
+    });
+    for (let i = 0; i < EVAL_CODE_LIMIT_PER_MINUTE; i += 1) {
+      await automations.evalCode({ source: "export default () => 1;", mode: "value", inputJson: "" });
+    }
+    await expectCode(
+      automations.evalCode({ source: "export default () => 1;", mode: "value", inputJson: "" }),
+      Code.ResourceExhausted,
+    );
+    expect(calls).toBe(EVAL_CODE_LIMIT_PER_MINUTE);
   });
 });
