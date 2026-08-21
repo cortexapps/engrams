@@ -1352,6 +1352,9 @@ export interface AutomationRunTrigger {
   payload?: Record<string, unknown>;
   /** ISO timestamp at which the orchestrator accepted the trigger. */
   receivedAt?: string;
+  /** Integration triggers: the provider-noun value the delivery carried
+   * (repository full name, channel id, team key). */
+  scopeValue?: string;
 }
 
 export const webhookRegistration = pgTable(

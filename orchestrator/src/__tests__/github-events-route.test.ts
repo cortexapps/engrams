@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { EnrollmentRow } from "../db/enrollments.ts";
 import type { UpsertReviewTargetInput } from "../db/reviews.ts";
-import type { DispatchWebhookInput } from "../automations/dispatch.ts";
+import { dispatchIntegrationEvent, type DispatchWebhookInput } from "../automations/dispatch.ts";
 import type { IntegrationEventDispatchInput } from "../automations/integration-ingress.ts";
 import type {
   IntegrationEventStore,
@@ -497,5 +497,118 @@ describe("POST /api/v1/integrations/github/events", () => {
     });
     expect(res.status).toBe(200);
     expect(fixture.dispatches).toEqual([]);
+  });
+});
+
+describe("ingress → integration-trigger dispatch (2.C)", () => {
+  function integrationApp(triggerScope?: { values: string[] } | { fromInput: string }) {
+    const ingress = fakeIngress();
+    const starts: string[] = [];
+    const target = {
+      automation: {
+        id: "auto-int-1",
+        name: "PR triage",
+        description: "",
+        enabled: true,
+        kind: "user",
+        builtinKey: null,
+        currentVersion: 1,
+        inputs: { repos: { [enrollment.repo]: { mode: "auto" } } },
+        endSessionsOnFinish: false,
+        createdByUserId: null,
+        nextFireAt: null,
+        lastFiredAt: null,
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+        archivedAt: null,
+      },
+      definition: {
+        engine: 1 as const,
+        trigger: {
+          kind: "integration" as const,
+          provider: "github",
+          connectionId: "conn-github",
+          eventKeys: ["pull_request.opened"],
+          ...(triggerScope ? { scope: triggerScope } : {}),
+        },
+        blocks: [],
+        inputsSchema: [],
+        settings: { endSessionsOnFinish: false },
+      },
+    };
+    const dispatchDeps = {
+      store: {
+        async listEnabledForIntegrationTrigger() {
+          return [target];
+        },
+        async insertRun(input: { id: string }) {
+          return { id: input.id } as never;
+        },
+        async claimConcurrency() {
+          return { claimed: true } as const;
+        },
+        async casConcurrency() {
+          return true;
+        },
+      },
+      workflowStarter: {
+        async start(_wf: unknown, workflowId: string) {
+          starts.push(workflowId);
+        },
+      },
+      sender: { async send() {} },
+    };
+    const route = makeGithubEventsRoute({
+      ingress: {
+        store: ingress.deps.store,
+        connectionIdFor: async () => "conn-github",
+        dispatch: (input) => dispatchIntegrationEvent(input, dispatchDeps),
+      },
+      webhookSecret: async () => SECRET,
+      mentionHandle: "acme-reviewer",
+      enrollments: { get: async () => null },
+      dispatch: async () => ({
+        enrolled: false,
+        activePass: false,
+        workflowId: "",
+        reviewId: "",
+      }),
+      startIngress: async () => {},
+      refreshTarget: async () => true,
+      automationDispatch: async () => {},
+      now: () => new Date("2026-08-21T12:00:00Z"),
+    });
+    return { route, ledger: ingress.recorded, starts };
+  }
+
+  test("a signed delivery lands in the ledger and starts a matching run", async () => {
+    const fixture = integrationApp({ fromInput: "repos" });
+    const body = pullRequestBody();
+    const res = await fixture.route.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "pull_request"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.ledger).toHaveLength(1);
+    expect(fixture.ledger[0]).toMatchObject({
+      provider: "github",
+      eventKey: "pull_request.opened",
+      scopeValue: enrollment.repo,
+    });
+    expect(fixture.starts).toEqual(["autorun:auto-int-1:github:delivery-1"]);
+  });
+
+  test("a delivery outside the trigger's scope is ledgered but starts nothing", async () => {
+    const fixture = integrationApp({ values: ["someone/else"] });
+    const body = pullRequestBody();
+    const res = await fixture.route.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "pull_request"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.ledger).toHaveLength(1);
+    expect(fixture.starts).toEqual([]);
   });
 });
