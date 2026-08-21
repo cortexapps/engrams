@@ -1208,10 +1208,38 @@ export function buildMessages(
         heldUserText.delete(ev.prompt_id);
         break;
       }
-      case "prompt_steered":
-        // The durable user echo is already present; this is only the
-        // confirmation that the active agent turn consumed it.
+      case "prompt_steered": {
+        // A steered prompt is consumed INSIDE the running turn — no
+        // `run_started{prompt_id}` ever arrives for it, so the held echo
+        // must be released HERE, at its consumption position (mid-turn,
+        // after whatever the agent produced before the steer landed).
+        // Pre-fix the echo stayed held forever: the trailing pending
+        // render skips consumed ids, so the user's own message vanished
+        // from the thread (prod 963df54e; the same swallow on every codex
+        // steer). Same fallbacks as the run_started arm, same id, so a
+        // pending/type-ahead bubble transitions in place.
+        const text =
+          heldUserText.get(ev.prompt_id)?.text ??
+          userEchoByPromptId.get(ev.prompt_id) ??
+          queued.get(ev.prompt_id) ??
+          "";
+        if (text) {
+          const held = heldUserText.get(ev.prompt_id);
+          // Close the in-progress assistant draft so the steer sits
+          // between what ran before it and what runs after it.
+          active = null;
+          out.push({
+            role: "user",
+            content: [{ type: "text", text }],
+            id: ev.prompt_id,
+            createdAt: held ? new Date(held.at) : new Date(ev.at),
+            metadata: { custom: { steered: true } },
+          });
+        }
+        heldUserText.delete(ev.prompt_id);
+        queued.delete(ev.prompt_id);
         break;
+      }
 
       default:
         // status_changed, evicted, checkpoint_* — not surfaced; the RAW
