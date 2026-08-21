@@ -4,6 +4,7 @@ import { Check } from "lucide-react";
 import { RadioGroup as RadioGroupPrimitive } from "radix-ui";
 
 import { TaskComposer, type TaskComposerState } from "@/components/composer/TaskComposer";
+import { useProfiles } from "@/hooks/useProfiles";
 import { RadioGroup } from "@/components/ui/radio-group";
 import { Text } from "@/components/ui/text";
 import { useCreateSpec } from "@/hooks/useSpecCreate";
@@ -22,6 +23,19 @@ export function NewSpecPage() {
   const [templateId, setTemplateId] = useState("");
   const [composerState, setComposerState] = useState<TaskComposerState | null>(null);
   const templateList = useMemo(() => templates.data ?? [], [templates.data]);
+  // The header promises a repository read before the first question, and the
+  // profile silently decides WHICH repositories. Naming them is the difference
+  // between recon you can trust and recon that spent its whole budget in the
+  // wrong codebase — which is what happened on the first live drive.
+  const profiles = useProfiles(false);
+  const reconRepos = useMemo(() => {
+    const profile = profiles.data?.profiles.find(
+      (candidate) => candidate.id === composerState?.profileId,
+    );
+    return (profile?.repos ?? [])
+      .map((repo) => (repo.remote ? `${repo.remote.owner}/${repo.remote.name}` : repo.path))
+      .filter(Boolean);
+  }, [profiles.data, composerState?.profileId]);
 
   useEffect(() => {
     setTemplateId((current) => current || defaultTemplateId(templateList));
@@ -80,8 +94,8 @@ export function NewSpecPage() {
             What are we designing?
           </Text>
           <Text tone="muted" className="max-w-[60ch] text-[0.92rem]">
-            Rough is fine. I read the repository before I ask you anything, so the first thing you
-            see is what I found — not a blank page.
+            Rough is fine. I read the code before I ask you anything, so the first thing you see is
+            what I found — not a blank page.
           </Text>
         </header>
 
@@ -163,7 +177,9 @@ export function NewSpecPage() {
         ) : null}
 
         <Text variant="code" tone="muted" className="text-xs">
-          Recon takes about 40 seconds
+          {reconRepos.length > 0
+            ? `Reads ${reconRepos.join(", ")} · about 40 seconds`
+            : "Recon takes about 40 seconds"}
         </Text>
       </div>
     </main>

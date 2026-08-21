@@ -1,16 +1,21 @@
 import type { SpecSurfaceSection } from "./spec-surface";
 
 interface GlyphPresentation {
-  glyph: "✓" | "◐" | "○" | "⚑" | "●";
+  glyph: "✓" | "◐" | "○" | "⚑";
   label: string;
-  tone: "nominal" | "proposal" | "open" | "question" | "reading";
+  tone: "nominal" | "proposal" | "open" | "question";
 }
 
 export function sectionGlyph(section: SpecSurfaceSection): GlyphPresentation {
-  if (section.isBeingRead) return { glyph: "●", label: "Being read", tone: "reading" };
   // The state keeps its glyph even with open questions: the rail already
   // shows a ⚑n badge for those, and replacing the state glyph hid whether a
   // flagged section was settled.
+  //
+  // The same rule now covers where the reader is. `isBeingRead` is local
+  // scroll position, not another person, and it used to take the glyph slot
+  // outright — so the section you were looking at was the one whose state you
+  // could not see, and its ● was a shape away from ◐ "proposed". The row
+  // already carries a background for it, and `aria-current` names it.
   if (section.state === "settled" || section.state === "n/a") {
     return { glyph: "✓", label: "Settled", tone: "nominal" };
   }

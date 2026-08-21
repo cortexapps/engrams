@@ -227,6 +227,55 @@ describe("the spec sync UpgradeHook", () => {
     expect(await waitForClose(missingClientId)).toBe(4400);
   });
 
+  // A prod sync outage produced zero server-side log lines, because the
+  // upgrade handler was wired without `onWarning` and only the catch path
+  // reported anything. Every refusal now names itself, so a handshake the
+  // browser reports as "failed" can be told apart from a dead upstream.
+  test("reports every upgrade refusal through onWarning", async () => {
+    const sync = (port: number, query = "?clientId=42") =>
+      new WebSocketClient(`ws://127.0.0.1:${port}/api/v1/specs/${SPEC_ONE}/sync${query}`);
+
+    const nonMember: string[] = [];
+    const nonMemberPort = await listenForSpecSync({
+      member: false,
+      onWarning: (message) => nonMember.push(message),
+    });
+    expect(await waitForClose(sync(nonMemberPort))).toBe(4404);
+    await eventually(() => nonMember.length === 1);
+    expect(nonMember[0]).toContain("404 not a spec member");
+    expect(nonMember[0]).toContain(SPEC_ONE);
+
+    const badClientId: string[] = [];
+    const badClientIdPort = await listenForSpecSync({
+      member: true,
+      onWarning: (message) => badClientId.push(message),
+    });
+    expect(await waitForClose(sync(badClientIdPort, ""))).toBe(4400);
+    await eventually(() => badClientId.length === 1);
+    expect(badClientId[0]).toContain("400 bad client id");
+
+    const published: string[] = [];
+    const publishedPort = await listenForSpecSync({
+      member: true,
+      draft: false,
+      onWarning: (message) => published.push(message),
+    });
+    expect(await waitForClose(sync(publishedPort))).toBe(4404);
+    await eventually(() => published.length === 1);
+    expect(published[0]).toContain("404 spec is not drafting");
+
+    const threw: string[] = [];
+    const threwPort = await listenForSpecSync({
+      member: true,
+      membershipError: new Error("membership store unavailable"),
+      onWarning: (message) => threw.push(message),
+    });
+    expect(await waitForClose(sync(threwPort))).toBe(4500);
+    await eventually(() => threw.length === 1);
+    expect(threw[0]).toContain("membership store unavailable");
+    expect(threw[0]).toContain(SPEC_ONE);
+  });
+
   test("relays document and awareness updates between two replicas", async () => {
     const documents = fakeDocumentNetwork();
     const awareness = fakeAwarenessNetwork();

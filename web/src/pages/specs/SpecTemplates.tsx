@@ -1,5 +1,6 @@
 import { ArrowDown, ArrowUp, Copy, Layers3, Plus, RotateCcw, Save, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -80,16 +81,24 @@ export function SpecTemplates() {
     setCreating(false);
     setSelectedId(saved.id);
     setDraft(definitionOf(saved));
+    // A save only moved a badge, so it was easy to believe nothing had
+    // happened — and a template edit only shows up in the NEXT spec, so
+    // there is nothing else to look at for confirmation.
+    toast.success(`Saved "${saved.name}". New specs use it from now on.`);
   }
 
   async function cloneSelected() {
     if (!selectedId) return;
-    choose(await clone.mutateAsync(selectedId));
+    const cloned = await clone.mutateAsync(selectedId);
+    choose(cloned);
+    toast.success(`Copied to "${cloned.name}".`);
   }
 
   async function restoreSelected() {
     if (!selectedId) return;
-    choose(await restore.mutateAsync(selectedId));
+    const restored = await restore.mutateAsync(selectedId);
+    choose(restored);
+    toast.success(`"${restored.name}" is back to its built-in structure.`);
   }
 
   return (

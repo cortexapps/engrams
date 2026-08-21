@@ -46,7 +46,7 @@ vi.mock("@/hooks/useSpecRead", async (importOriginal) => {
   };
 });
 
-import { SpecPublishConfirm } from "./SpecPublishConfirm";
+import { SpecPublishConfirm, unsettledSentence } from "./SpecPublishConfirm";
 
 const questions = [
   {
@@ -155,6 +155,15 @@ describe("SpecPublishConfirm", () => {
 
     expect(screen.getByText("Start drafting before you publish this spec.")).toBeTruthy();
     expect(screen.queryByText("internal phase mismatch")).toBeNull();
+  });
+
+  // "the other 11" reads as nonsense when nothing is settled — there is no
+  // set for the rest to be "other" than.
+  test("says all, not the other, when nothing is settled", () => {
+    expect(unsettledSentence(0, 11)).toBe("Publishing pins all 11 sections as they stand.");
+    expect(unsettledSentence(0, 1)).toBe("Publishing pins all 1 section as it stands.");
+    expect(unsettledSentence(3, 8)).toBe("Publishing pins the other 8 sections as they stand.");
+    expect(unsettledSentence(10, 1)).toBe("Publishing pins the other 1 section as it stands.");
   });
 
   test("does not render a publish trigger for a non-owner", () => {

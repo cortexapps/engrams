@@ -210,6 +210,24 @@ describe("NewSpecPage", () => {
     expect(screen.queryByText("+1 more")).toBeNull();
   });
 
+  // The header promises a code read before the first question, and the profile
+  // silently decides which repositories that covers. A live drive spent its
+  // whole recon budget in the wrong codebase with no way to tell beforehand.
+  // Named in the footer line, NOT as chips — the chips were rejected above.
+  test("names the repositories the recon will read", async () => {
+    renderWithProviders(<NewSpecPage />);
+
+    expect(await screen.findByText("Reads cortexapps/engrams · about 40 seconds")).toBeTruthy();
+    expect(screen.queryByText("Recon takes about 40 seconds")).toBeNull();
+  });
+
+  test("falls back to the plain timing line when the profile mounts no repository", async () => {
+    state.profiles = [{ ...backend, repos: [] }];
+    renderWithProviders(<NewSpecPage />);
+
+    expect(await screen.findByText("Recon takes about 40 seconds")).toBeTruthy();
+  });
+
   test("posts the chosen profile and all composer overrides", async () => {
     const user = userEvent.setup();
     renderWithProviders(<NewSpecPage />);

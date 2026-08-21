@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
+import { useMutation } from "@connectrpc/connect-query";
+import { toast } from "sonner";
 import type { Awareness } from "y-protocols/awareness";
 
 import { useAuth } from "@/auth/AuthProvider";
+import { interrupt as interruptMethod } from "@/gen/engram/app/v1/session-SessionService_connectquery";
 import { Button } from "@/components/ui/button";
 import { Text } from "@/components/ui/text";
 import { useSendSpecMessage } from "@/hooks/useSpecMessages";
@@ -14,6 +17,7 @@ import "./spec-mode.css";
 
 export function IdeationScreen({
   specId,
+  sessionId = null,
   title,
   templateName,
   owner = null,
@@ -23,6 +27,8 @@ export function IdeationScreen({
   onStartDrafting,
 }: {
   specId: string;
+  /** The spec's agent session, when it has one — the interrupt target. */
+  sessionId?: string | null;
   title: string;
   templateName: string;
   owner?: { id: string; name: string } | null;
@@ -33,6 +39,21 @@ export function IdeationScreen({
 }) {
   const conversation = useSpecConversation(specId, undefined, owner);
   const sendMessage = useSendSpecMessage(specId);
+  // Recon runs long — this is where a person first waits on the agent, so the
+  // way out has to exist here too (ADR 0030 SIGINTs the agent's child).
+  const interruptRun = useMutation(interruptMethod);
+  const stopRun =
+    sessionId && conversation.isRunning
+      ? () => {
+          interruptRun
+            .mutateAsync({ sessionId, source: "spec-ideation" })
+            .catch((error: unknown) => {
+              toast.error("The agent did not stop.", {
+                description: error instanceof Error ? error.message : undefined,
+              });
+            });
+        }
+      : undefined;
   // A finding is an agent statement with repository provenance (path @ sha).
   const hasFinding = conversation.entries.some(
     (entry) =>
@@ -63,6 +84,7 @@ export function IdeationScreen({
           isRunning={conversation.isRunning}
           toolLabel={conversation.toolLabel}
           onActivity={() => undefined}
+          onStop={stopRun}
           emptyState={
             <div className="spec-mode-ideation-empty">
               <Text as="h2" variant="heading">

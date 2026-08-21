@@ -570,6 +570,11 @@ const server = buildServer(
         awarenessBus: specAwarenessBus,
         resolveMembership: resolveSpecMembership,
         resolveDraft: resolveDraftingSpec,
+        // The hub carries this logger already; the upgrade handler must too, or
+        // every rejection and throw between parseSpecSyncPath and the accept is
+        // silent. A prod sync outage produced ZERO log lines because this was
+        // missing — the whole handshake path was invisible.
+        onWarning: warnSpecSync,
       },
       specSyncHub,
     ),

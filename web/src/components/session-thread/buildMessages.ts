@@ -424,6 +424,13 @@ export function buildMessages(
 
   // Is a run in flight (run_started seen, no run_completed/_interrupted yet)?
   let runOpen = false;
+  // Has the harness said it has nothing in flight, with nothing since? The
+  // harness is authoritative about its own idleness, so this vetoes the
+  // "trailing user turn ⇒ awaiting a reply" guess below. Without it, a run
+  // that ends without a closing assistant message — a model that declines a
+  // steered prompt, say — leaves the steered echo as the thread tail and the
+  // working indicator spinning forever.
+  let harnessIdle = false;
   // `out.length` when the current run opened — bounds the search for "this
   // run's assistant message" so the run receipt attaches to the right bubble
   // even when a trailing harness marker (e.g. a deferred question) broke the
@@ -686,6 +693,7 @@ export function buildMessages(
         clearWaking();
         tally = { reads: 0, edits: 0, ran: 0, other: 0 };
         runOpen = true;
+        harnessIdle = false;
         planHandoff = false;
         active = null;
         runStartLen = out.length;
@@ -750,6 +758,10 @@ export function buildMessages(
       case "agent_message": {
         if (ev.role === "user") {
           active = null;
+          // A new prompt supersedes an earlier idle report: the harness has
+          // something again, so a trailing user turn genuinely is awaiting a
+          // reply until the next `harness_idle`.
+          harnessIdle = false;
           if (ev.prompt_id) {
             // HOLD — don't render inline. The echo of a prompt_id user message
             // is logged at send/queue time, which for a queued message is mid
@@ -1146,6 +1158,7 @@ export function buildMessages(
 
       case "harness_idle":
         active = null;
+        harnessIdle = true;
         break;
 
       // ADR 0090: the durability-rollback warning boundary. The next resume
@@ -1325,7 +1338,8 @@ export function buildMessages(
   const awaitingDecision =
     [...planToolCallIds].some((id) => decisionKnown(id) && !planResolutionByToolCallId.has(id)) ||
     [...questionToolCallIds].some((id) => decisionKnown(id) && !answersByToolCallId.has(id));
-  const isRunning = !sessionInactive && !awaitingDecision && (runOpen || tailAwaiting(out));
+  const isRunning =
+    !sessionInactive && !awaitingDecision && (runOpen || (tailAwaiting(out) && !harnessIdle));
 
   // Give the working indicator somewhere to live when we're running but the
   // tail isn't already a running assistant message (e.g. the user just sent

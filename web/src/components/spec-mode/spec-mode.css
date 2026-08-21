@@ -321,10 +321,6 @@
   color: var(--instrument-caution);
 }
 
-.spec-mode-section-glyph[data-glyph-tone="reading"] {
-  color: var(--ring);
-}
-
 .spec-mode-section-glyph[data-proposed="true"] {
   animation: penbeat 2.4s ease-in-out infinite;
 }
@@ -485,6 +481,12 @@
   padding: 0.08em 0.34em;
   font-family: var(--font-mono);
   font-size: 0.86em;
+}
+
+/* Same reason as the thread: a spec cites file paths, and a path has no break
+   opportunity of its own. A fenced block keeps its own scroll. */
+.spec-mode-section-content :not(pre) > code {
+  overflow-wrap: anywhere;
 }
 
 .spec-mode-section-content pre {
@@ -755,6 +757,24 @@
   padding-left: 1.3em;
 }
 
+/* Recon messages are mostly repository paths, and a path is one long word with
+   no break opportunity: `brain-backend/web/src/main/kotlin/...`. Left alone it
+   pushes past the column, and because the thread sets `overflow-y: auto` the
+   other axis computes to `auto` too — so the whole conversation scrolled
+   sideways and the provenance ran off the edge unread. Break inside these
+   words; a fenced block keeps its own horizontal scroll below. */
+.spec-mode-markdown :not(pre) > code {
+  overflow-wrap: anywhere;
+}
+
+/* A flex/grid item defaults to `min-width: auto`, which refuses to shrink below
+   its content — so wrapping alone is not enough, the bubble has to be allowed
+   to get narrower than the longest path in it. */
+.spec-mode-markdown,
+.spec-mode-agent-copy {
+  min-width: 0;
+}
+
 .spec-mode-markdown table {
   display: block;
   max-width: 100%;
@@ -798,7 +818,9 @@
   font-size: 0.75rem;
 }
 
-.spec-mode-thinking > :last-child {
+/* Named, not positional: the row gained a trailing Stop button, and a
+   `:last-child` rule would have restyled that instead of the label. */
+.spec-mode-thinking-label {
   font-size: 0.78rem;
 }
 
@@ -901,6 +923,16 @@
 .spec-mode-error {
   display: grid;
   gap: 8px;
+}
+
+/* Shown in place of the document when its socket cannot connect. The reader
+   needs to know the pane is dead rather than slow, and that the conversation
+   beside it still works. */
+.spec-mode-link-error {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  max-width: 46ch;
 }
 
 .spec-mode-proposal[data-proposal-treatment="gutter"] {
