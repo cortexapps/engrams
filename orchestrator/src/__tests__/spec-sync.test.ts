@@ -61,6 +61,9 @@ function fakeAwarenessBus(): SpecAwarenessBus {
   };
 }
 
+/** One real event-loop turn, as any Postgres round-trip costs. */
+const ioTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 async function listenForSpecSync(input: {
   member: boolean;
   authenticated?: boolean;
@@ -70,6 +73,8 @@ async function listenForSpecSync(input: {
   onWarning?: (message: string) => void;
   membershipError?: Error;
   draft?: boolean;
+  /** Holds `resolveDraft` open so a test can close the client mid-auth. */
+  draftGate?: Promise<void>;
 }) {
   const app = new Hono();
   const nodeWs = createNodeWebSocket({ app });
@@ -82,15 +87,28 @@ async function listenForSpecSync(input: {
     documents: input.documents ?? fakeDocuments(),
     participants,
     awarenessBus: input.awarenessBus ?? fakeAwarenessBus(),
-    getSession: async () =>
-      input.authenticated === false
+    getSession: async () => {
+      // The real guard reads the session from Postgres, which yields a full
+      // event-loop turn. An `async` fake that resolves on a microtask does
+      // NOT, and that difference hid a total prod outage: Bun's builtin `ws`
+      // delegates the handshake to native `server.upgrade()`, which is only
+      // valid inside the request's own turn. Yield for real so these tests
+      // exercise the same window the DB does.
+      await ioTurn();
+      return input.authenticated === false
         ? null
-        : { user: { id: "member-not-owner", name: "Taylor Member" } },
+        : { user: { id: "member-not-owner", name: "Taylor Member" } };
+    },
     resolveMembership: async () => {
+      await ioTurn();
       if (input.membershipError) throw input.membershipError;
       return input.member;
     },
-    resolveDraft: async () => input.draft ?? true,
+    resolveDraft: async () => {
+      await ioTurn();
+      if (input.draftGate) await input.draftGate;
+      return input.draft ?? true;
+    },
     onWarning: input.onWarning,
   };
   const hub = new SpecSyncHub(deps);
@@ -231,6 +249,60 @@ describe("the spec sync UpgradeHook", () => {
   // upgrade handler was wired without `onWarning` and only the catch path
   // reported anything. Every refusal now names itself, so a handshake the
   // browser reports as "failed" can be told apart from a dead upstream.
+  // The handshake now completes BEFORE the auth round-trips (Bun's builtin
+  // `ws` can only upgrade inside the request's own event-loop turn), which
+  // opens a window where the client can hang up before `hub.connect` has
+  // attached its close handler. An EventEmitter does not replay that `close`,
+  // so joining the room anyway would write a participant epoch, add the socket
+  // to `room.sockets`, and start a heartbeat that early-returns on a non-OPEN
+  // socket without ever terminating it — leaking the row, the room and the
+  // timer, and showing everyone else a phantom collaborator.
+  test("does not join a client that hangs up during the auth window", async () => {
+    let openAuthGate = () => {};
+    const authGate = new Promise<void>((resolve) => {
+      openAuthGate = resolve;
+    });
+    const connected: string[] = [];
+    const port = await listenForSpecSync({
+      member: true,
+      draftGate: authGate,
+      participants: {
+        connect: async (_specId, clientId) => {
+          connected.push(clientId);
+          return 1n;
+        },
+        renew: async () => true,
+        disconnect: async () => {},
+      },
+    });
+
+    const client = new WebSocketClient(
+      `ws://127.0.0.1:${port}/api/v1/specs/${SPEC_ONE}/sync?clientId=42`,
+    );
+    cleanups.push(() => client.close());
+
+    // Wait for the 101, then hang up while the guard is still gated.
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("no open within 5s")), 5_000);
+      client.once("open", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      client.once("error", reject);
+    });
+    client.close();
+    await new Promise<void>((resolve) => client.once("close", () => resolve()));
+    // The client's own close event fires before the FIN necessarily reaches
+    // the server. Give the server side a beat to observe it, otherwise this
+    // test races the very window it is checking.
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+
+    // Now let authorization finish. It must notice the client is gone.
+    openAuthGate();
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    expect(connected).toEqual([]);
+  });
+
   test("reports every upgrade refusal through onWarning", async () => {
     const sync = (port: number, query = "?clientId=42") =>
       new WebSocketClient(`ws://127.0.0.1:${port}/api/v1/specs/${SPEC_ONE}/sync${query}`);

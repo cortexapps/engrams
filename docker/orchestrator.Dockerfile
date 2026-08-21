@@ -11,8 +11,17 @@
 #
 #   docker buildx build -f docker/orchestrator.Dockerfile -t engram/orchestrator:dev .
 
-# Pin the Bun major to match orchestrator/bun.lock's lockfile version + CI.
-FROM oven/bun:1-alpine AS deps
+# EXACT version, and it must equal `.bun-version` at the repo root — CI reads
+# that file via setup-bun's `bun-version-file`, and a `just check` step fails
+# the build if the two drift.
+#
+# This was `oven/bun:1`, a floating major. Every bake silently took the newest
+# Bun 1.x while CI stayed pinned to 1.3.14, so the runtime prod ran was never
+# the runtime the tests ran. Bun 1.4.0 then tightened the window on native
+# `server.upgrade()`, which broke every WebSocket in the product — the spec
+# document, the IDE, previews — with CI fully green, because on 1.3.14 the same
+# code is fine. Bumping Bun is a decision that belongs in a reviewed diff.
+FROM oven/bun:1.4.0-alpine AS deps
 WORKDIR /app/orchestrator
 
 # Lockfile + manifest first so the production install layer stays warm across
@@ -25,7 +34,8 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
     bun install --frozen-lockfile --production
 
 # ── runtime ──────────────────────────────────────────────────────────────
-FROM oven/bun:1-alpine
+# Keep in lockstep with the deps stage and `.bun-version` (see above).
+FROM oven/bun:1.4.0-alpine
 WORKDIR /app/orchestrator
 
 # The orchestrator runs the TypeScript entry directly under Bun (no compile
