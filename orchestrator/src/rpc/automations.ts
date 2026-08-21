@@ -825,7 +825,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
           event.key,
           {
             key: event.key,
-            displayName: event.displayName,
+            displayName: event.label,
             observed: observed.has(event.key),
           },
         ]),

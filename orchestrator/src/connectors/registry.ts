@@ -31,6 +31,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 
 import type { ConnectionProvider } from "../integrations/providers/provider.ts";
+import { BUILTIN_ACTION_IDS } from "./builtin-actions-allowlist.ts";
 import { join } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -345,9 +346,44 @@ export type WebhookVerificationScheme =
   | "slack_v0"
   | "generic_hmac_sha256";
 
+/** Bounded JSON-Schema subset for typed event fields and action inputs
+ * (ADR 0119 D5). Deliberately tiny: enough to type a field picker and
+ * validate action params, nothing more. */
+export type FieldSchema =
+  | { type: "object"; properties: Record<string, FieldSchema>; required?: string[] }
+  | { type: "array"; items?: FieldSchema }
+  | { type: "string"; enum?: string[]; format?: "date-time" | "uri" }
+  | { type: "number" }
+  | { type: "integer" }
+  | { type: "boolean" };
+
 export interface WebhookEventSpec {
   key: string;
-  displayName: string;
+  /** Human picker label (was `displayName`; renamed with the catalog growth). */
+  label: string;
+  /** One-line picker description. */
+  description?: string;
+  /** Typed picker-useful fields; curated partial shape, never a full vendored
+   * provider schema. */
+  schema?: FieldSchema;
+  /** Delivered to the event ledger but hidden from trigger pickers (e.g.
+   * `installation.*` lifecycle noise). */
+  hidden?: true;
+}
+
+/** Provider-owned ingress (ADR 0119 D5): how the integration event route
+ * verifies deliveries and which sealed org secret signs them. */
+export interface WebhookIngressSpec {
+  scheme: "github_hmac_sha256" | "slack_v0" | "linear_hmac_sha256";
+  secretRef: string;
+}
+
+/** Provider-specific coarse scope: one payload path whose value a trigger can
+ * pin (GitHub repositories, Slack channels, Linear teams). */
+export interface WebhookScopeSpec {
+  key: string;
+  label: string;
+  path: string;
 }
 
 /** Declarative payload-path to curated-event-alias mapping. Custom connectors
@@ -359,9 +395,53 @@ export interface WebhookAliasSpec {
 }
 
 export interface WebhookFacet {
+  /** Custom webhook-REGISTRATION scheme hint (ADR 0102). Still read by the
+   * `/api/v1/hooks/:id` path; retires with the provider schemes in the HMAC
+   * retirement stack item. New code reads `ingress`. */
   verificationScheme: WebhookVerificationScheme;
   events: WebhookEventSpec[];
   aliases: WebhookAliasSpec[];
+  /** ADR 0119 D5: the provider-owned integration event route. */
+  ingress?: WebhookIngressSpec;
+  scope?: WebhookScopeSpec;
+}
+
+// ---------------------------------------------------------------------------
+// Actions facet (ADR 0119 D5): outbound operations the integration_action
+// block may execute with the connection's org credential.
+// ---------------------------------------------------------------------------
+
+export type ActionExecution =
+  | {
+      kind: "http";
+      method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
+      /** Path with `{input.X}` placeholders over top-level inputSchema
+       * properties; rendered values are URI-encoded segment-wise. */
+      pathTemplate: string;
+      /** JSON body template; string leaves may be `{input.X}` placeholders. */
+      bodyTemplate?: Record<string, unknown>;
+    }
+  | { kind: "graphql"; document: string }
+  | { kind: "builtin"; id: string };
+
+export type ActionIdempotency =
+  | { kind: "natural" }
+  | { kind: "marker_comment"; markerTemplate?: string }
+  | { kind: "client_id" }
+  | { kind: "none" };
+
+export interface ActionSpec {
+  id: string;
+  label: string;
+  description?: string;
+  /** Object-root FieldSchema; `required[]` enforced before execute. */
+  inputSchema: Extract<FieldSchema, { type: "object" }>;
+  execute: ActionExecution;
+  /** Output field → dot-path into the parsed JSON response. */
+  output?: Record<string, string>;
+  idempotency: ActionIdempotency;
+  /** HTTP statuses treated as success (default 200/201/204). */
+  successStatus?: number[];
 }
 
 export interface Connector {
@@ -389,6 +469,8 @@ export interface Connector {
   userCredential?: UserCredentialFacet;
   /** Optional inbound-webhook taxonomy + declarative curated alias mapping. */
   webhook?: WebhookFacet;
+  /** ADR 0119 D5: outbound action catalog (built-in seed connectors only). */
+  actions?: ActionSpec[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,6 +1151,96 @@ const WEBHOOK_SCHEMES: ReadonlySet<WebhookVerificationScheme> = new Set([
   "slack_v0",
   "generic_hmac_sha256",
 ]);
+const INGRESS_SCHEMES: ReadonlySet<WebhookIngressSpec["scheme"]> = new Set([
+  "github_hmac_sha256",
+  "slack_v0",
+  "linear_hmac_sha256",
+]);
+const MAX_EVENT_DESCRIPTION_LENGTH = 300;
+const FIELD_SCHEMA_MAX_DEPTH = 8;
+const FIELD_SCHEMA_MAX_PROPERTIES = 250;
+const FIELD_SCHEMA_ENUM_MAX = 40;
+const FIELD_SCHEMA_SEGMENT_RE = /^[A-Za-z0-9_-]+$/;
+const MAX_ACTIONS = 40;
+const ACTION_ID_RE = /^[a-z][a-z0-9_]*$/;
+const ACTION_PLACEHOLDER_RE = /\{input\.([A-Za-z0-9_-]+)\}/g;
+
+/** Parse one bounded FieldSchema node. `budget` counts object properties
+ * across the whole tree so one event/action cannot smuggle a huge schema. */
+export function parseFieldSchema(
+  where: string,
+  raw: unknown,
+  depth = 1,
+  budget = { properties: 0 },
+): FieldSchema {
+  if (depth > FIELD_SCHEMA_MAX_DEPTH) fail(where, `schema deeper than ${FIELD_SCHEMA_MAX_DEPTH}`);
+  if (typeof raw !== "object" || raw === null) fail(where, "schema node must be an object");
+  const o = raw as Record<string, unknown>;
+  switch (o.type) {
+    case "object": {
+      if (typeof o.properties !== "object" || o.properties === null || Array.isArray(o.properties)) {
+        fail(where, '"properties" must be an object');
+      }
+      const properties: Record<string, FieldSchema> = {};
+      for (const [name, child] of Object.entries(o.properties as Record<string, unknown>)) {
+        if (!FIELD_SCHEMA_SEGMENT_RE.test(name) || UNSAFE_OBJECT_PATH_SEGMENTS.has(name)) {
+          fail(where, `invalid property name ${JSON.stringify(name)}`);
+        }
+        budget.properties += 1;
+        if (budget.properties > FIELD_SCHEMA_MAX_PROPERTIES) {
+          fail(where, `schema has more than ${FIELD_SCHEMA_MAX_PROPERTIES} properties`);
+        }
+        properties[name] = parseFieldSchema(`${where}.${name}`, child, depth + 1, budget);
+      }
+      let required: string[] | undefined;
+      if (o.required !== undefined) {
+        if (
+          !Array.isArray(o.required) ||
+          o.required.some((r) => typeof r !== "string" || !(r in properties))
+        ) {
+          fail(where, '"required" must list declared property names');
+        }
+        required = o.required as string[];
+      }
+      return { type: "object", properties, ...(required ? { required } : {}) };
+    }
+    case "array": {
+      const items =
+        o.items !== undefined
+          ? parseFieldSchema(`${where}[]`, o.items, depth + 1, budget)
+          : undefined;
+      return { type: "array", ...(items ? { items } : {}) };
+    }
+    case "string": {
+      let values: string[] | undefined;
+      if (o.enum !== undefined) {
+        if (
+          !Array.isArray(o.enum) ||
+          o.enum.length === 0 ||
+          o.enum.length > FIELD_SCHEMA_ENUM_MAX ||
+          o.enum.some((v) => typeof v !== "string")
+        ) {
+          fail(where, `"enum" must be 1..${FIELD_SCHEMA_ENUM_MAX} strings`);
+        }
+        values = o.enum as string[];
+      }
+      if (o.format !== undefined && o.format !== "date-time" && o.format !== "uri") {
+        fail(where, '"format" must be "date-time" or "uri"');
+      }
+      return {
+        type: "string",
+        ...(values ? { enum: values } : {}),
+        ...(o.format !== undefined ? { format: o.format as "date-time" | "uri" } : {}),
+      };
+    }
+    case "number":
+    case "integer":
+    case "boolean":
+      return { type: o.type };
+    default:
+      fail(where, `unknown schema type ${JSON.stringify(o.type)}`);
+  }
+}
 
 /** Parse the optional connector webhook facet at the same allowlist boundary as
  * every other connector field. The result is bounded and declarative only. */
@@ -1103,14 +1275,28 @@ export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
     }
     if (eventKeys.has(event.key)) fail(eventWhere, `duplicate event key "${event.key}"`);
     eventKeys.add(event.key);
-    if (
-      typeof event.displayName !== "string" ||
-      !event.displayName.trim() ||
-      event.displayName.length > 120
-    ) {
-      fail(eventWhere, '"displayName" must be a non-empty string of at most 120 characters');
+    if (typeof event.label !== "string" || !event.label.trim() || event.label.length > 120) {
+      fail(eventWhere, '"label" must be a non-empty string of at most 120 characters');
     }
-    return { key: event.key, displayName: event.displayName };
+    if (
+      event.description !== undefined &&
+      (typeof event.description !== "string" ||
+        event.description.length > MAX_EVENT_DESCRIPTION_LENGTH)
+    ) {
+      fail(eventWhere, `"description" must be a string of at most ${MAX_EVENT_DESCRIPTION_LENGTH} characters`);
+    }
+    if (event.hidden !== undefined && event.hidden !== true) {
+      fail(eventWhere, '"hidden" must be true when present');
+    }
+    const schema =
+      event.schema !== undefined ? parseFieldSchema(`${eventWhere}.schema`, event.schema) : undefined;
+    return {
+      key: event.key,
+      label: event.label,
+      ...(event.description !== undefined ? { description: event.description } : {}),
+      ...(schema !== undefined ? { schema } : {}),
+      ...(event.hidden === true ? { hidden: true as const } : {}),
+    };
   });
 
   if (!Array.isArray(o.aliases)) fail(where, '"webhook.aliases" must be an array');
@@ -1150,15 +1336,243 @@ export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
     return { path: alias.path, alias: alias.alias };
   });
 
+  let ingress: WebhookIngressSpec | undefined;
+  if (o.ingress !== undefined) {
+    if (typeof o.ingress !== "object" || o.ingress === null) {
+      fail(where, '"webhook.ingress" must be an object');
+    }
+    const i = o.ingress as Record<string, unknown>;
+    if (
+      typeof i.scheme !== "string" ||
+      !INGRESS_SCHEMES.has(i.scheme as WebhookIngressSpec["scheme"])
+    ) {
+      fail(where, '"webhook.ingress.scheme" must be "github_hmac_sha256", "slack_v0", or "linear_hmac_sha256"');
+    }
+    if (typeof i.secretRef !== "string" || !/^\S+$/.test(i.secretRef)) {
+      fail(where, '"webhook.ingress.secretRef" must be a non-empty org-secret name');
+    }
+    ingress = { scheme: i.scheme as WebhookIngressSpec["scheme"], secretRef: i.secretRef };
+  }
+
+  let scope: WebhookScopeSpec | undefined;
+  if (o.scope !== undefined) {
+    if (typeof o.scope !== "object" || o.scope === null) fail(where, '"webhook.scope" must be an object');
+    const s = o.scope as Record<string, unknown>;
+    if (typeof s.key !== "string" || !/^[a-z][a-z0-9_]*$/.test(s.key) || s.key.length > 40) {
+      fail(where, '"webhook.scope.key" must be a short lowercase identifier');
+    }
+    if (typeof s.label !== "string" || !s.label.trim() || s.label.length > 120) {
+      fail(where, '"webhook.scope.label" must be a non-empty string of at most 120 characters');
+    }
+    if (
+      typeof s.path !== "string" ||
+      s.path.length > MAX_WEBHOOK_PATH_LENGTH ||
+      !WEBHOOK_PATH_RE.test(s.path) ||
+      s.path.split(".").some((segment) => UNSAFE_OBJECT_PATH_SEGMENTS.has(segment))
+    ) {
+      fail(where, '"webhook.scope.path" must be a dot-delimited payload path');
+    }
+    scope = { key: s.key, label: s.label, path: s.path };
+  }
+
   return {
     verificationScheme: o.verificationScheme as WebhookVerificationScheme,
     events,
     aliases,
+    ...(ingress !== undefined ? { ingress } : {}),
+    ...(scope !== undefined ? { scope } : {}),
   };
 }
 
+/** Parse the optional connector actions facet (ADR 0119 D5). Only built-in
+ * seed connectors may declare actions: the executor runs with the org
+ * credential, so a DB-authored connector must never smuggle one in. */
+export function parseActionsFacet(
+  where: string,
+  raw: unknown,
+  context: { graphqlEndpoint?: string; builtin: boolean },
+): ActionSpec[] {
+  if (!context.builtin) fail(where, '"actions" is not allowed on custom connectors');
+  if (!Array.isArray(raw)) fail(where, '"actions" must be an array');
+  if (raw.length > MAX_ACTIONS) fail(where, `"actions" has ${raw.length} entries (max ${MAX_ACTIONS})`);
+  const ids = new Set<string>();
+  return raw.map((rawAction, i): ActionSpec => {
+    const actionWhere = `${where} actions[${i}]`;
+    if (typeof rawAction !== "object" || rawAction === null) fail(actionWhere, "must be an object");
+    const a = rawAction as Record<string, unknown>;
+    if (typeof a.id !== "string" || !ACTION_ID_RE.test(a.id) || a.id.length > 64) {
+      fail(actionWhere, '"id" must be a lowercase identifier');
+    }
+    if (ids.has(a.id)) fail(actionWhere, `duplicate action id "${a.id}"`);
+    ids.add(a.id);
+    if (typeof a.label !== "string" || !a.label.trim() || a.label.length > 120) {
+      fail(actionWhere, '"label" must be a non-empty string of at most 120 characters');
+    }
+    if (
+      a.description !== undefined &&
+      (typeof a.description !== "string" || a.description.length > MAX_EVENT_DESCRIPTION_LENGTH)
+    ) {
+      fail(actionWhere, '"description" too long');
+    }
+    const inputSchema = parseFieldSchema(`${actionWhere}.inputSchema`, a.inputSchema);
+    if (inputSchema.type !== "object") fail(actionWhere, '"inputSchema" must have an object root');
+
+    const execute = parseActionExecution(actionWhere, a.execute, inputSchema, context);
+
+    let output: Record<string, string> | undefined;
+    if (a.output !== undefined) {
+      if (typeof a.output !== "object" || a.output === null || Array.isArray(a.output)) {
+        fail(actionWhere, '"output" must be an object');
+      }
+      output = {};
+      for (const [field, path] of Object.entries(a.output as Record<string, unknown>)) {
+        if (!FIELD_SCHEMA_SEGMENT_RE.test(field)) fail(actionWhere, `invalid output field "${field}"`);
+        if (
+          typeof path !== "string" ||
+          !WEBHOOK_PATH_RE.test(path) ||
+          path.split(".").some((segment) => UNSAFE_OBJECT_PATH_SEGMENTS.has(segment))
+        ) {
+          fail(actionWhere, `"output.${field}" must be a dot-delimited response path`);
+        }
+        output[field] = path;
+      }
+    }
+
+    const idempotency = parseActionIdempotency(actionWhere, a.idempotency);
+
+    let successStatus: number[] | undefined;
+    if (a.successStatus !== undefined) {
+      if (
+        !Array.isArray(a.successStatus) ||
+        a.successStatus.length === 0 ||
+        a.successStatus.some((s) => typeof s !== "number" || !Number.isInteger(s) || s < 200 || s > 299)
+      ) {
+        fail(actionWhere, '"successStatus" must list 2xx integers');
+      }
+      successStatus = a.successStatus as number[];
+    }
+
+    return {
+      id: a.id,
+      label: a.label,
+      ...(a.description !== undefined ? { description: a.description as string } : {}),
+      inputSchema,
+      execute,
+      ...(output !== undefined ? { output } : {}),
+      idempotency,
+      ...(successStatus !== undefined ? { successStatus } : {}),
+    };
+  });
+}
+
+function parseActionExecution(
+  where: string,
+  raw: unknown,
+  inputSchema: Extract<FieldSchema, { type: "object" }>,
+  context: { graphqlEndpoint?: string },
+): ActionExecution {
+  if (typeof raw !== "object" || raw === null) fail(where, '"execute" must be an object');
+  const e = raw as Record<string, unknown>;
+  switch (e.kind) {
+    case "http": {
+      if (
+        e.method !== "GET" && e.method !== "POST" && e.method !== "PATCH" &&
+        e.method !== "PUT" && e.method !== "DELETE"
+      ) {
+        fail(where, '"execute.method" must be GET/POST/PATCH/PUT/DELETE');
+      }
+      if (typeof e.pathTemplate !== "string" || !e.pathTemplate.startsWith("/")) {
+        fail(where, '"execute.pathTemplate" must start with "/"');
+      }
+      if (
+        e.pathTemplate.includes("..") ||
+        /\s/.test(e.pathTemplate) ||
+        [...e.pathTemplate].some((ch) => ch.charCodeAt(0) < 0x20 || ch.charCodeAt(0) === 0x7f)
+      ) {
+        fail(where, '"execute.pathTemplate" must not contain "..", whitespace, or control characters');
+      }
+      const assertPlaceholders = (text: string, field: string): void => {
+        for (const match of text.matchAll(ACTION_PLACEHOLDER_RE)) {
+          const property = inputSchema.properties[match[1]!];
+          if (!property) fail(where, `"${field}" references undeclared input "${match[1]}"`);
+          if (field.startsWith("execute.pathTemplate") &&
+              property.type !== "string" && property.type !== "number" && property.type !== "integer") {
+            fail(where, `"${field}" placeholder "${match[1]}" must be string/number/integer`);
+          }
+        }
+      };
+      assertPlaceholders(e.pathTemplate, "execute.pathTemplate");
+      let bodyTemplate: Record<string, unknown> | undefined;
+      if (e.bodyTemplate !== undefined) {
+        if (typeof e.bodyTemplate !== "object" || e.bodyTemplate === null || Array.isArray(e.bodyTemplate)) {
+          fail(where, '"execute.bodyTemplate" must be an object');
+        }
+        const walk = (node: unknown): void => {
+          if (typeof node === "string") assertPlaceholders(node, "execute.bodyTemplate");
+          else if (Array.isArray(node)) node.forEach(walk);
+          else if (typeof node === "object" && node !== null) Object.values(node).forEach(walk);
+        };
+        walk(e.bodyTemplate);
+        bodyTemplate = e.bodyTemplate as Record<string, unknown>;
+      }
+      return {
+        kind: "http",
+        method: e.method,
+        pathTemplate: e.pathTemplate,
+        ...(bodyTemplate !== undefined ? { bodyTemplate } : {}),
+      };
+    }
+    case "graphql": {
+      if (context.graphqlEndpoint === undefined) {
+        fail(where, 'graphql actions require the connector to declare "graphqlEndpoint"');
+      }
+      if (typeof e.document !== "string" || !e.document.trim() || e.document.length > 4096) {
+        fail(where, '"execute.document" must be a non-empty GraphQL document (max 4096 chars)');
+      }
+      return { kind: "graphql", document: e.document };
+    }
+    case "builtin": {
+      if (typeof e.id !== "string" || !BUILTIN_ACTION_IDS.has(e.id)) {
+        fail(where, `"execute.id" must be one of the registered builtin actions`);
+      }
+      return { kind: "builtin", id: e.id };
+    }
+    default:
+      fail(where, '"execute.kind" must be "http", "graphql", or "builtin"');
+  }
+}
+
+function parseActionIdempotency(where: string, raw: unknown): ActionIdempotency {
+  if (typeof raw !== "object" || raw === null) fail(where, '"idempotency" must be an object');
+  const i = raw as Record<string, unknown>;
+  switch (i.kind) {
+    case "natural":
+    case "client_id":
+    case "none":
+      return { kind: i.kind };
+    case "marker_comment": {
+      if (
+        i.markerTemplate !== undefined &&
+        (typeof i.markerTemplate !== "string" || i.markerTemplate.length > 200)
+      ) {
+        fail(where, '"idempotency.markerTemplate" must be a short string');
+      }
+      return {
+        kind: "marker_comment",
+        ...(i.markerTemplate !== undefined ? { markerTemplate: i.markerTemplate as string } : {}),
+      };
+    }
+    default:
+      fail(where, '"idempotency.kind" must be natural/marker_comment/client_id/none');
+  }
+}
+
 /** Validate + narrow one raw connector object. Throws Error on any malformation. */
-export function parseConnector(raw: unknown, where: string): Connector {
+export function parseConnector(
+  raw: unknown,
+  where: string,
+  opts: { builtin?: boolean } = {},
+): Connector {
   if (typeof raw !== "object" || raw === null) fail(where, "must be a JSON object");
   const o = raw as Record<string, unknown>;
 
@@ -1567,6 +1981,14 @@ export function parseConnector(raw: unknown, where: string): Connector {
     graphqlEndpoint = "/graphql";
   }
 
+  const actions =
+    o.actions !== undefined
+      ? parseActionsFacet(where, o.actions, {
+          ...(graphqlEndpoint !== undefined ? { graphqlEndpoint } : {}),
+          builtin: opts.builtin === true,
+        })
+      : undefined;
+
   return {
     provider: o.provider,
     protocol: "http",
@@ -1580,6 +2002,7 @@ export function parseConnector(raw: unknown, where: string): Connector {
     ...(oauth ? { oauth } : {}),
     ...(userCredential ? { userCredential } : {}),
     ...(webhook ? { webhook } : {}),
+    ...(actions ? { actions } : {}),
   };
 }
 
@@ -1609,7 +2032,7 @@ function loadFromDisk(): Map<string, Connector> {
     } catch (e) {
       throw new Error(`connector ${f}: invalid JSON — ${(e as Error).message}`);
     }
-    return parseConnector(raw, f);
+    return parseConnector(raw, f, { builtin: true });
   });
   return buildRegistry(connectors);
 }
