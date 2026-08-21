@@ -42,10 +42,20 @@ import type {
   WebhookVerificationScheme,
 } from "../db/schema.ts";
 import {
+  type Connector,
   type CustomConnectorSource,
   loadRegistry,
   type WebhookAliasSpec,
 } from "../connectors/registry.ts";
+import { loadEventSample } from "../connectors/samples.ts";
+import {
+  makeIntegrationEventStore,
+  type IntegrationEventStore,
+} from "../db/integration-events.ts";
+import {
+  makeIntegrationConnectionStore,
+  type IntegrationConnectionStore,
+} from "../db/integration-connections.ts";
 import {
   harnessCatalog as defaultHarnessCatalog,
   orgSecret as defaultOrgSecret,
@@ -80,6 +90,9 @@ export interface AutomationDeps {
   harnessCatalog?: HarnessCatalogClient;
   orgSecret?: OrgSecretClient;
   modelRouters?: ModelRouterStore;
+  integrationEvents?: Pick<IntegrationEventStore, "getLatest" | "listObservedEventKeys">;
+  connections?: Pick<IntegrationConnectionStore, "getDefault">;
+  eventSample?: typeof loadEventSample;
   now?: () => Date;
   randomSecret?: () => string;
   /** Test seam for the QuickJS sandbox behind EvalCode. */
@@ -239,6 +252,48 @@ function parseTrigger(value: ProtoAutomationTrigger | undefined): AutomationTrig
         ...(filter ? { filter } : {}),
       };
     }
+    case "integration": {
+      const provider = requiredText(value.trigger.value.provider, "integration provider");
+      const connectionId = requiredText(
+        value.trigger.value.connectionId,
+        "integration connection_id",
+      );
+      const eventKeys = [...new Set(value.trigger.value.eventKeys.map((key) => key.trim()))];
+      if (
+        eventKeys.length === 0 ||
+        eventKeys.length > MAX_WEBHOOK_EVENTS ||
+        eventKeys.some((key) => key.length > MAX_EVENT_KEY_LENGTH || !EVENT_KEY_RE.test(key))
+      ) {
+        throw new ConnectError(
+          `integration event_keys must contain 1-${MAX_WEBHOOK_EVENTS} lowercase dot-delimited event keys`,
+          Code.InvalidArgument,
+        );
+      }
+      const scopeValues = value.trigger.value.scopeValues.map((v) => v.trim());
+      const scopeFromInput = value.trigger.value.scopeFromInput?.trim() || undefined;
+      if (scopeValues.length > 0 && scopeFromInput !== undefined) {
+        throw new ConnectError(
+          "integration scope takes values or an input binding, not both",
+          Code.InvalidArgument,
+        );
+      }
+      if (scopeValues.some((v) => v.length === 0)) {
+        throw new ConnectError("integration scope values must be non-empty", Code.InvalidArgument);
+      }
+      const scope =
+        scopeValues.length > 0
+          ? { values: scopeValues }
+          : scopeFromInput !== undefined
+            ? { fromInput: scopeFromInput }
+            : undefined;
+      return {
+        kind: "integration",
+        provider,
+        connectionId,
+        eventKeys,
+        ...(scope ? { scope } : {}),
+      };
+    }
     default:
       throw new ConnectError("automation trigger is required", Code.InvalidArgument);
   }
@@ -285,9 +340,27 @@ function protoTrigger(trigger: AutomationTrigger): ProtoAutomationTrigger {
       },
     });
   }
+  if (trigger.kind === "integration") {
+    return create(AutomationTriggerSchema, {
+      trigger: {
+        case: "integration",
+        value: {
+          provider: trigger.provider,
+          connectionId: trigger.connectionId,
+          eventKeys: trigger.eventKeys,
+          ...(trigger.scope && "values" in trigger.scope
+            ? { scopeValues: trigger.scope.values }
+            : {}),
+          ...(trigger.scope && "fromInput" in trigger.scope
+            ? { scopeFromInput: trigger.scope.fromInput }
+            : {}),
+        },
+      },
+    });
+  }
   if (trigger.kind !== "webhook") {
-    // integration/manual triggers arrive with the phase-3 proto; the legacy
-    // list/get surface only ever reconstructs cron/webhook rows.
+    // Manual triggers arrive with the phase-3 proto; the legacy list/get
+    // surface only reconstructs cron/webhook/integration rows.
     throw new ConnectError(
       `trigger kind "${trigger.kind}" has no legacy proto shape`,
       Code.Internal,
@@ -419,9 +492,32 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
   // dependency-injected tests do not open the production database.
   const modelRouters = (): ModelRouterStore =>
     deps?.modelRouters ?? makeModelRouterStore(getDb());
+  const integrationEvents = (): Pick<
+    IntegrationEventStore,
+    "getLatest" | "listObservedEventKeys"
+  > => deps?.integrationEvents ?? makeIntegrationEventStore(getDb());
+  const connections = (): Pick<IntegrationConnectionStore, "getDefault"> =>
+    deps?.connections ?? makeIntegrationConnectionStore(getDb());
+  const eventSample = deps?.eventSample ?? loadEventSample;
   const now = deps?.now ?? (() => new Date());
   const evalCode = deps?.evalCode ?? evaluateCode;
   const rateLimiter = makeEvalRateLimiter();
+
+  /** Resolve a provider that declares inbound events, or InvalidArgument. */
+  async function connectorWithWebhookFacet(
+    provider: string,
+  ): Promise<{ connector: Connector; webhook: NonNullable<Connector["webhook"]> }> {
+    const connector = (await loadRegistry(connectors)).get(provider);
+    const webhook = connector?.webhook;
+    if (!connector || !webhook) {
+      throw new ConnectError(
+        `provider "${provider}" has no webhook event catalog`,
+        Code.InvalidArgument,
+      );
+    }
+    return { connector, webhook };
+  }
+
   const randomSecret =
     deps?.randomSecret ??
     (() => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url"));
@@ -534,6 +630,16 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       && !(await store.getRegistration(trigger.registrationId))
     ) {
       throw new ConnectError("webhook registration not found", Code.InvalidArgument);
+    } else if (trigger.kind === "integration") {
+      const { webhook } = await connectorWithWebhookFacet(trigger.provider);
+      const declared = new Set(webhook.events.map((event) => event.key));
+      const unknown = trigger.eventKeys.filter((key) => !declared.has(key));
+      if (unknown.length > 0) {
+        throw new ConnectError(
+          `provider "${trigger.provider}" does not declare event keys: ${unknown.join(", ")}`,
+          Code.InvalidArgument,
+        );
+      }
     }
 
     return {
@@ -820,6 +926,64 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         ...(outcome.error.line !== undefined ? { errorLine: outcome.error.line } : {}),
         logs: outcome.logs,
         durationMs: BigInt(outcome.durationMs),
+      };
+    },
+    // Admin-gated like the rest of this service; the plan's member-readable
+    // posture arrives with the phase-3 surface (the whole page is admin).
+    async listEventCatalog(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const provider = requiredText(req.provider, "provider");
+      const { webhook: facet } = await connectorWithWebhookFacet(provider);
+      const connection = await connections().getDefault(provider);
+      const observed = new Set(
+        connection ? await integrationEvents().listObservedEventKeys(connection.id) : [],
+      );
+
+      const events = [];
+      for (const event of facet.events) {
+        let sampleJson = "";
+        if (connection) {
+          const latest = await integrationEvents().getLatest(connection.id, event.key);
+          if (latest) sampleJson = JSON.stringify(latest.payload);
+        }
+        if (sampleJson === "") {
+          const fixture = eventSample(provider, event.key);
+          if (fixture) sampleJson = JSON.stringify(fixture);
+        }
+        events.push({
+          key: event.key,
+          label: event.label,
+          description: event.description ?? "",
+          schemaJson: event.schema ? JSON.stringify(event.schema) : "",
+          sampleJson,
+          observed: observed.has(event.key),
+          hidden: event.hidden === true,
+        });
+      }
+      return {
+        events,
+        ...(facet.scope ? { scope: { key: facet.scope.key, label: facet.scope.label } } : {}),
+        variables: facet.aliases,
+        defaultConnectionId: connection?.id ?? "",
+      };
+    },
+
+    async listActionCatalog(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const provider = requiredText(req.provider, "provider");
+      const connector = (await loadRegistry(connectors)).get(provider);
+      if (!connector) {
+        throw new ConnectError(`provider "${provider}" is not a connector`, Code.InvalidArgument);
+      }
+      // Member-safe projection: id/label/description/input schema only —
+      // never the execution details (buildProviderCatalog precedent).
+      return {
+        actions: (connector.actions ?? []).map((action) => ({
+          id: action.id,
+          label: action.label,
+          description: action.description ?? "",
+          inputSchemaJson: JSON.stringify(action.inputSchema),
+        })),
       };
     },
   });

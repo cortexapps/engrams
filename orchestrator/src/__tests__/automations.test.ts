@@ -111,6 +111,9 @@ function fakeStore(seed?: {
     async list({ includeArchived }) {
       return [...automations.values()].filter((row) => includeArchived || !row.archivedAt);
     },
+    async listEnabledForIntegrationTrigger() {
+      return [];
+    },
     async get(id) {
       return automations.get(id) ?? null;
     },
@@ -767,5 +770,145 @@ describe("AutomationService.EvalCode", () => {
       Code.ResourceExhausted,
     );
     expect(calls).toBe(EVAL_CODE_LIMIT_PER_MINUTE);
+  });
+});
+
+
+describe("integration triggers (2.C)", () => {
+  const integrationRequest = (overrides = {}) => ({
+    ...cronRequest,
+    name: "PR watcher",
+    trigger: {
+      trigger: {
+        case: "integration" as const,
+        value: {
+          provider: "github",
+          connectionId: "conn-github",
+          eventKeys: ["pull_request.opened", "issue_comment.created"],
+          scopeValues: [],
+          ...overrides,
+        },
+      },
+    },
+  });
+
+  const baseDeps = (store = fakeStore()) => ({
+    getSession: session("admin-1", "admin"),
+    store,
+    profiles: { getActive: async () => profile() },
+    connectors: { async list() { return []; } },
+    harnessCatalog: catalog(),
+    now: () => NOW,
+  });
+
+  test("create round-trips an integration trigger with input-bound scope", async () => {
+    const store = fakeStore();
+    const { automations } = clients(baseDeps(store));
+    const created = await automations.createAutomation(integrationRequest({ scopeFromInput: "repos" }));
+    const trigger = created.automation?.trigger?.trigger;
+    if (trigger?.case !== "integration") throw new Error("expected integration trigger");
+    expect(trigger.value.provider).toBe("github");
+    expect(trigger.value.connectionId).toBe("conn-github");
+    expect(trigger.value.eventKeys).toEqual(["pull_request.opened", "issue_comment.created"]);
+    expect(trigger.value.scopeFromInput).toBe("repos");
+
+    const fetched = await automations.getAutomation({ id: created.automation!.id });
+    expect(fetched.automation?.trigger?.trigger.case).toBe("integration");
+  });
+
+  test("create round-trips literal scope values", async () => {
+    const { automations } = clients(baseDeps());
+    const created = await automations.createAutomation(integrationRequest({ scopeValues: ["engrams/engrams"] }));
+    const trigger = created.automation?.trigger?.trigger;
+    if (trigger?.case !== "integration") throw new Error("expected integration trigger");
+    expect(trigger.value.scopeValues).toEqual(["engrams/engrams"]);
+  });
+
+  test("rejects undeclared event keys, unknown providers, and double scope", async () => {
+    const { automations } = clients(baseDeps());
+    await expectCode(
+      automations.createAutomation(integrationRequest({ eventKeys: ["pull_request.opened", "made.up"] })),
+      Code.InvalidArgument,
+    );
+    await expectCode(
+      automations.createAutomation(integrationRequest({ provider: "notaprovider" })),
+      Code.InvalidArgument,
+    );
+    await expectCode(
+      automations.createAutomation(
+        integrationRequest({ scopeValues: ["engrams/engrams"], scopeFromInput: "repos" }),
+      ),
+      Code.InvalidArgument,
+    );
+  });
+
+  test("listEventCatalog serves labels, schemas, samples, observed and hidden flags", async () => {
+    const latest = { issue: { title: "from-ledger" } };
+    const { automations } = clients({
+      ...baseDeps(),
+      connections: {
+        getDefault: async () => ({
+          id: "conn-github", alias: "default", provider: "github",
+          displayName: "GitHub (default)", isDefault: true, config: {},
+          enabled: true, testedAt: null, createdAt: NOW, updatedAt: NOW,
+        }),
+      },
+      integrationEvents: {
+        getLatest: async (_connectionId: string, eventKey: string) =>
+          eventKey === "issues.opened"
+            ? { id: "evt-1", provider: "github", connectionId: "conn-github",
+                eventKey, deliveryId: "d1", payload: latest, scopeValue: null,
+                receivedAt: NOW }
+            : null,
+        listObservedEventKeys: async () => ["issues.opened"],
+      },
+    });
+    const response = await automations.listEventCatalog({ provider: "github" });
+    const issues = response.events.find((event) => event.key === "issues.opened");
+    expect(issues).toMatchObject({ observed: true });
+    expect(JSON.parse(issues!.sampleJson)).toEqual(latest);
+    const pr = response.events.find((event) => event.key === "pull_request.opened");
+    expect(pr).toMatchObject({ observed: false, hidden: false });
+    expect(pr!.label.length).toBeGreaterThan(0);
+    expect(JSON.parse(pr!.sampleJson)).toBeTruthy(); // fixture fallback
+    expect(JSON.parse(pr!.schemaJson)).toMatchObject({ type: "object" });
+    const installation = response.events.find((event) => event.key === "installation.created");
+    expect(installation?.hidden).toBe(true);
+    expect(response.scope).toMatchObject({ key: "repositories" });
+    expect(response.defaultConnectionId).toBe("conn-github");
+  });
+
+  test("listEventCatalog without a connection still serves fixtures", async () => {
+    const { automations } = clients({
+      ...baseDeps(),
+      connections: { getDefault: async () => null },
+      integrationEvents: {
+        getLatest: async () => null,
+        listObservedEventKeys: async () => [],
+      },
+    });
+    const response = await automations.listEventCatalog({ provider: "slack" });
+    expect(response.defaultConnectionId).toBe("");
+    expect(response.events.every((event) => !event.observed)).toBe(true);
+  });
+
+  test("listActionCatalog is a member-safe projection", async () => {
+    const { automations } = clients(baseDeps());
+    const response = await automations.listActionCatalog({ provider: "github" });
+    const post = response.actions.find((action) => action.id === "create_issue_comment");
+    expect(post).toBeDefined();
+    expect(post!.label.length).toBeGreaterThan(0);
+    expect(JSON.parse(post!.inputSchemaJson)).toMatchObject({ type: "object" });
+    expect(Object.keys(post!)).not.toContain("execute");
+    await expectCode(
+      automations.listActionCatalog({ provider: "notaprovider" }),
+      Code.InvalidArgument,
+    );
+  });
+
+  test("catalogs are admin-gated", async () => {
+    const { automations } = clients({ ...baseDeps(), getSession: session("user-1", "user") });
+    await expectCode(automations.listEventCatalog({ provider: "github" }), Code.PermissionDenied);
+    await expectCode(automations.listActionCatalog({ provider: "github" }), Code.PermissionDenied);
   });
 });
