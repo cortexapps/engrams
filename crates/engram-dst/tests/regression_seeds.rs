@@ -449,6 +449,24 @@ fn issue_1271_restore_dial_must_ride_the_deferred_create_effect() {
     run(33091230, Profile::Chaos, 5000);
 }
 
+/// Issue #1295: nightly `single-ownership`, one or two chaos seeds per
+/// night (33095501 / 33096693 / 33096736 / 33098720 — all the same
+/// shape, and the same seed fails identically on the pre-#1292 tree, so
+/// the class is as old as the oracle). Host 0 crashed; the session's
+/// lease expired and the dead-host path settled it HostLost → Idle
+/// (tombstone written); a later `ResumeSession` restored it on a peer.
+/// That is the CORRECT recovery — the crashed machine's VM is dead and
+/// nothing can reach it — but the oracle counted the down host's
+/// sandbox-map entry as a live VM and reported a split-brain. The fix
+/// aligns the oracle with oracle #8's rule ("sandboxes on down hosts are
+/// dead state"): only UP hosts' VMs count toward ownership; a partitioned
+/// host stays `up` and its VMs keep counting. Fired at step 134, the
+/// smallest of the four; the full nightly shape pins the convergence too.
+#[test]
+fn issue_1295_crashed_host_vm_is_not_a_live_owner() {
+    run(33095501, Profile::Chaos, 5000);
+}
+
 /// #896 review (HIGH): a budget-exhausted evacuation deliberately leaves
 /// the row Idle WITH its unconfirmed source binding — ownership is never
 /// released on a guess. That residue must stay RECOVERABLE: the resume

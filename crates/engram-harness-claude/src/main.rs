@@ -6816,16 +6816,30 @@ mod adapter {
                 })
                 .await
                 .unwrap();
-            assert!(matches!(
-                evt_rx.recv().await,
-                Some(HarnessEvent::PromptSteered { prompt_id }) if prompt_id == "p3"
-            ));
-
-            // The fake (single-threaded, 300ms per line) consumes both
-            // inside r1, in stdin order — no interrupt is ever written,
-            // no run boundary appears.
-            expect_agent_message(&mut evt_rx, "working").await;
-            expect_agent_message(&mut evt_rx, "working").await;
+            // The fake answers p2 on stdout at once, so the engine's next
+            // `select!` sees BOTH that line and the p3 command ready and
+            // picks either first: p2's `working` may precede
+            // `PromptSteered{p3}`. Accept both orders, but every
+            // `working` must still arrive inside r1 — no interrupt is
+            // ever written, no run boundary appears.
+            let mut working = 0u32;
+            loop {
+                match evt_rx.recv().await {
+                    Some(HarnessEvent::PromptSteered { prompt_id }) => {
+                        assert_eq!(prompt_id, "p3");
+                        break;
+                    }
+                    Some(HarnessEvent::AgentMessage { text, .. }) => {
+                        assert_eq!(text, "working");
+                        working += 1;
+                    }
+                    other => panic!("expected PromptSteered(p3) or AgentMessage, got {other:?}"),
+                }
+            }
+            while working < 2 {
+                expect_agent_message(&mut evt_rx, "working").await;
+                working += 1;
+            }
             let quiet = tokio::time::timeout(Duration::from_millis(500), evt_rx.recv()).await;
             assert!(
                 quiet.is_err(),
