@@ -1,8 +1,10 @@
 # ADR 0052: Persistent streaming Claude harness session
 
 Status: 2026-06-18 — **Accepted** (Phases 0–4 shipped; warm mid-turn teleport
-proven, gated in prod behind `ENGRAM_LIVE_TELEPORT=1`). See the Progress section
-for the per-phase bookends and the commit chain.
+proven, gated in prod behind `ENGRAM_LIVE_TELEPORT=1`). The 2026-08-20 steering
+revision (write-through replaces the interrupt-steer) shipped and was
+prod-verified 2026-08-21 — #1303/#1312/#1315. See the Progress section for the
+per-phase bookends and the commit chain.
 
 ## Context
 
@@ -442,6 +444,32 @@ on a CLI pin ≥ 2.1.237.
   This closes the ADR. **Status → Accepted**; commit chain: PR-A (Track A) → PR-0
   (ADR + Phase 0) → PR-1/1b/1c (streaming engine, queue, token streaming) → PR-3
   (interrupt) → PR-2 (clean-idle-shutdown) → PR-4 (this — warm-teleport proofs).
+
+- **2026-08-21 — the 2026-08-20 steering revision SHIPPED + prod-verified.**
+  Commit chain: #1303 (pin 2.1.212→2.1.228 + `scripts/claude-steer-probe.py`),
+  #1312 (S2 — the durability correction: `prompt_queued` no longer acks,
+  `prompt_dequeued` terminal-acks, `prompt_edited` updates the delivered-unacked
+  row; fail-closed edit/dequeue when a live harness may hold the copy), #1315
+  (S3 — write-through: `PromptSteered` at the write, the `steered` write-order
+  ledger attributes CLI-initiated spontaneous turns, `STEER_DEBOUNCE_MS` /
+  `arm_steer` / the steer-fired interrupt escalation DELETED; the queue survives
+  only for mode-mismatch / shutdown-drain / abort-in-flight / condemned /
+  no-stdin). Prod verification (session `2a2ce436`, demo image, haiku): a
+  mid-tool-loop prompt emitted `prompt_steered` 183 ms after receipt and the
+  SAME run's reply answered both the original ask and the steer — zero
+  interrupts, zero respawns.
+  - *Behavioral finding (recorded for operators and future probes):* the CLI
+    delivers a mid-turn stdin message as a `queued_command` attachment rendered
+    to the model as a **system reminder** at the next step boundary — so the
+    MODEL arbitrates it. An adversarially-phrased steer ("STEER TEST: ignore
+    the previous instruction…") was reasoned about and deliberately declined as
+    a suspected injection; naturally-phrased steers are followed immediately. A
+    steer is a suggestion at a step boundary, not a command. When steering
+    looks broken, read the CLI's own queue ledger first:
+    `$HOME/.claude/projects/<cwd-hash>/<session>.jsonl` records
+    `queue-operation` enqueue/remove pairs and the attachment line — enqueue
+    with no remove = never attended; remove + attachment = delivered, model
+    declined.
 
 ## Prior art
 
