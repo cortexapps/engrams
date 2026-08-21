@@ -364,10 +364,23 @@ fn placement_accounting(world: &SimWorld) -> Result<(), Violation> {
 /// ADR 0090: at most one live sandbox per session across ALL hosts, and
 /// the coordinator's binding (sessions.sandbox_id) never points at a
 /// sandbox owned by a DIFFERENT session on the world side.
+///
+/// "Live" means on an UP host. A crashed host keeps its sandbox map as
+/// down-host memory (the owners-agree oracle reads it), but the VMs in
+/// it are dead: `CrashHost` stops the machine, a down host swallows
+/// every effect, and the only way back up (`RestartHost`) clears the map
+/// — the same "down-host sandboxes are dead state" rule oracle #8
+/// (`no_orphan_sandboxes`) applies. Counting them here flagged the
+/// CORRECT recovery as split-brain: crash → lease expiry → HostLost →
+/// settle → Idle → resume on a peer, with the dead host still holding
+/// the old VM's entry because nothing restarted it yet (nightly
+/// `single-ownership`, issue #1295). A host that is UP but unreachable
+/// (heartbeat partition) keeps `up == true` and its VMs stay counted —
+/// that is the real split-brain this oracle guards.
 fn single_ownership(world: &SimWorld) -> Result<(), Violation> {
     let hosts = world.host_world.hosts.lock();
     let mut owner_of: std::collections::BTreeMap<SessionId, u32> = Default::default();
-    for host in hosts.values() {
+    for host in hosts.values().filter(|host| host.up) {
         for owner in host.sandboxes.values().flatten() {
             *owner_of.entry(*owner).or_default() += 1;
         }
