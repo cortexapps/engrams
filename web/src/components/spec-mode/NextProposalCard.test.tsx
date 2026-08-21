@@ -45,4 +45,52 @@ describe("NextProposalCard", () => {
     await user.click(screen.getByRole("button", { name: content.secondaryLabel }));
     await waitFor(() => expect(onSend).toHaveBeenCalledWith(content.secondaryPrompt));
   });
+
+  // A proposal comes from server state that only moves once the agent has done
+  // the work, so an accepted card used to sit there still offering the same
+  // instruction. Clicking twice sent it twice.
+  test("stops offering a proposal it has already sent", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn(async () => undefined);
+    const next: Exclude<NextProposal, null> = {
+      kind: "draft_section",
+      sectionId: "api",
+      sectionTitle: "API",
+    };
+    const content = proposalContent(next)!;
+    const view = render(<NextProposalCard next={next} onSend={onSend} />);
+
+    await user.click(screen.getByRole("button", { name: content.primaryLabel }));
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+
+    expect(screen.queryByRole("button", { name: content.primaryLabel })).toBeNull();
+    expect(screen.queryByRole("button", { name: content.secondaryLabel })).toBeNull();
+    expect(screen.getByRole("status").textContent).toContain("Waiting for the agent");
+
+    // The next proposal is a different ask, so it gets its own buttons.
+    view.rerender(
+      <NextProposalCard
+        next={{ kind: "draft_section", sectionId: "design", sectionTitle: "Design" }}
+        onSend={onSend}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Do it" })).toBeTruthy();
+  });
+
+  test("keeps the buttons when the send fails, so it can be retried", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn(async () => {
+      throw new Error("offline");
+    });
+    const next: Exclude<NextProposal, null> = {
+      kind: "draft_section",
+      sectionId: "api",
+      sectionTitle: "API",
+    };
+    render(<NextProposalCard next={next} onSend={onSend} />);
+
+    await user.click(screen.getByRole("button", { name: "Do it" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "Do it" })).toBeTruthy();
+  });
 });

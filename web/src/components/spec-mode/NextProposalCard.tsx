@@ -23,14 +23,22 @@ export function NextProposalCard({
 }) {
   const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
   const [failedPrompt, setFailedPrompt] = useState<string | null>(null);
+  // Which proposal we have already accepted. A proposal is derived from server
+  // state that only moves once the agent has done the work, so without this the
+  // card keeps offering an instruction that is already in flight — and a second
+  // click enqueues it twice.
+  const [acceptedKey, setAcceptedKey] = useState<string | null>(null);
   const content = proposalContent(next);
   if (!content) return null;
+  const key = proposalKey(next);
+  const accepted = acceptedKey === key;
 
   const send = async (prompt: string) => {
     setPendingPrompt(prompt);
     setFailedPrompt(null);
     try {
       await onSend(prompt);
+      setAcceptedKey(key);
     } catch {
       setFailedPrompt(prompt);
     } finally {
@@ -44,28 +52,35 @@ export function NextProposalCard({
         Next — I propose
       </Text>
       <Text className="spec-mode-next-copy">{content.description}</Text>
-      <div className="spec-mode-next-actions">
-        <Button
-          type="button"
-          size="sm"
-          disabled={pendingPrompt !== null}
-          onClick={() => void send(content.primaryPrompt)}
-        >
-          {content.primaryLabel}
-        </Button>
-        <Button
-          type="button"
-          size="sm"
-          variant="outline"
-          disabled={pendingPrompt !== null}
-          onClick={() => void send(content.secondaryPrompt)}
-        >
-          {alternateLabel ?? content.secondaryLabel}
-        </Button>
-      </div>
+      {accepted ? null : (
+        <div className="spec-mode-next-actions">
+          <Button
+            type="button"
+            size="sm"
+            disabled={pendingPrompt !== null}
+            onClick={() => void send(content.primaryPrompt)}
+          >
+            {content.primaryLabel}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={pendingPrompt !== null}
+            onClick={() => void send(content.secondaryPrompt)}
+          >
+            {alternateLabel ?? content.secondaryLabel}
+          </Button>
+        </div>
+      )}
       {pendingPrompt ? (
         <Text as="div" tone="muted" role="status">
           Sending next step…
+        </Text>
+      ) : null}
+      {accepted && !pendingPrompt ? (
+        <Text as="div" tone="muted" role="status">
+          Asked. Waiting for the agent to pick it up.
         </Text>
       ) : null}
       {failedPrompt ? (
@@ -78,6 +93,16 @@ export function NextProposalCard({
       ) : null}
     </section>
   );
+}
+
+// Identifies a proposal so an accepted one can be told from the next one. Two
+// proposals that read the same ask for the same work.
+export function proposalKey(next: NextProposal): string {
+  if (!next) return "none";
+  if (next.kind === "draft_section" || next.kind === "settle_section") {
+    return `${next.kind}:${next.sectionId}`;
+  }
+  return next.kind;
 }
 
 export function proposalContent(next: NextProposal): ProposalContent | null {
