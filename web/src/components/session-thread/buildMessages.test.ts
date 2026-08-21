@@ -747,6 +747,100 @@ describe("buildMessages — Phase 1b queued/optimistic greying", () => {
     expect(users[0]!.metadata?.custom?.delivering).toBeUndefined();
   });
 
+  // Prod 963df54e (and every codex steer before it): a STEERED prompt is
+  // consumed inside the running turn, so no run_started{prompt_id} ever
+  // arrives to release its held echo, and the trailing pending render skips
+  // consumed ids — the user's own message vanished from the thread while the
+  // agent did react to it. The prompt_steered event is the consumption point.
+  test("a steered prompt renders at its prompt_steered position, inside the running turn", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, prompt_id: "p1", at: AT },
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "sleep then turtles",
+          prompt_id: "p1",
+          at: AT,
+        },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "sleeping…",
+          at: AT,
+        },
+        // Mid-turn steer: echo + steered, no run_started for p2 ever.
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u2",
+          role: "user",
+          text: "also tell me 17*23",
+          prompt_id: "p2",
+          at: AT2,
+        },
+        { type: "prompt_steered", prompt_id: "p2", at: AT2 },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a2",
+          role: "assistant",
+          text: "Turtles are old. 17*23 is 391.",
+          at: AT2,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const real_ = real(messages);
+    const roles = real_.map((m) => `${m.role}:${m.id}`);
+    // The steer sits between what ran before it and what ran after it.
+    const steerAt = real_.findIndex((m) => m.id === "p2");
+    expect(steerAt).toBeGreaterThan(0);
+    expect(real_[steerAt]).toMatchObject({
+      role: "user",
+      content: [{ type: "text", text: "also tell me 17*23" }],
+    });
+    expect(real_[steerAt]!.metadata?.custom?.steered).toBe(true);
+    expect(real_[steerAt]!.metadata?.custom?.pending).toBeUndefined();
+    expect(real_[steerAt - 1]!.role, roles.join(" ")).toBe("assistant");
+    expect(real_[steerAt + 1]!.role, roles.join(" ")).toBe("assistant");
+    // Exactly one bubble for the steer; both assistant bubbles settle.
+    expect(real_.filter((m) => m.id === "p2")).toHaveLength(1);
+    for (const m of real_.filter((m) => m.role === "assistant")) {
+      expect(m.status?.type).toBe("complete");
+    }
+  });
+
+  test("a steered echo that lands AFTER its prompt_steered still renders once", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, prompt_id: "p1", at: AT },
+        { type: "prompt_steered", prompt_id: "p2", at: AT2 },
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u2",
+          role: "user",
+          text: "late echo",
+          prompt_id: "p2",
+          at: AT2,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const p2 = real(messages).filter((m) => m.id === "p2");
+    expect(p2).toHaveLength(1);
+    expect(p2[0]).toMatchObject({ role: "user", content: [{ type: "text", text: "late echo" }] });
+  });
+
   test("a dequeued (recalled) echo still never renders", () => {
     const { messages } = buildMessages(
       indexed([
