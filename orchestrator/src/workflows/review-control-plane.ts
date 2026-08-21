@@ -1,7 +1,6 @@
 /** Durable review-record and finder-session operations behind the workflow seam. */
 
 import { Code, ConnectError } from "@connectrpc/connect";
-import { createHash } from "node:crypto";
 
 import { getDb } from "../db/client.ts";
 import {
@@ -12,6 +11,7 @@ import {
   type RunExecResult,
   type RunExecRuntime,
 } from "../exec/durable-exec.ts";
+import { stageFiles, type FileStagingClient } from "../exec/stage-files.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
@@ -235,69 +235,11 @@ interface ReviewControlPlaneStore extends Pick<
 
 // The review control plane knows nothing about exec transport mechanics
 // (severance, replay offsets, backoff) — that is `DurableExecClient` /
-// `runExec`'s job, in ../exec/durable-exec.ts. Reviews only decide WHAT to
-// run (clone, merge-base), the ticket name, and the deadline.
-export interface ReviewSessionsClient extends TaskSessionsClient, DurableExecClient {
-  writeFile(input: AsyncIterable<{
-    frame:
-      | {
-        case: "metadata";
-        value: {
-          sessionId: string;
-          path: string;
-          sizeBytes: bigint;
-          sha256: string;
-          mode?: number;
-        };
-      }
-      | { case: "chunk"; value: Uint8Array };
-  }>): Promise<{ path: string; sizeBytes: bigint; sha256: string }>;
+// `runExec`'s job, in ../exec/durable-exec.ts — nor about WriteFile framing,
+// which lives in ../exec/stage-files.ts. Reviews only decide WHAT to run
+// (clone, merge-base), the files to stage, the ticket name, and the deadline.
+export interface ReviewSessionsClient extends TaskSessionsClient, DurableExecClient, FileStagingClient {
   sendPrompt(req: { sessionId: string; promptId: string; text: string }): Promise<unknown>;
-}
-
-interface FileToStage {
-  path: string;
-  content: Uint8Array;
-  mode: number;
-}
-
-async function stageFiles(
-  sessions: ReviewSessionsClient,
-  sessionId: string,
-  files: readonly FileToStage[],
-): Promise<Array<{ path: string; ok: boolean; error?: string }>> {
-  const results: Array<{ path: string; ok: boolean; error?: string }> = [];
-  for (const file of files) {
-    const sha256 = createHash("sha256").update(file.content).digest("hex");
-    async function* frames() {
-      yield {
-        frame: {
-          case: "metadata" as const,
-          value: {
-            sessionId,
-            path: file.path,
-            sizeBytes: BigInt(file.content.byteLength),
-            sha256,
-            mode: file.mode,
-          },
-        },
-      };
-      if (file.content.byteLength > 0) {
-        yield { frame: { case: "chunk" as const, value: file.content } };
-      }
-    }
-    try {
-      await sessions.writeFile(frames());
-      results.push({ path: file.path, ok: true });
-    } catch (error) {
-      results.push({
-        path: file.path,
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-  return results;
 }
 
 type RenderReviewer = (opts: RenderReviewerOptions) => RenderedReviewerFile[];
