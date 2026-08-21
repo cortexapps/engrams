@@ -682,5 +682,8 @@ describe("WebhookRegistrationService", () => {
       observed: true,
     });
     expect(response.variables.some((variable) => variable.alias === "issue.title")).toBe(true);
+    // Hidden lifecycle events (installation.*) reach the ledger but never the
+    // trigger picker.
+    expect(response.events.some((event) => event.key.startsWith("installation"))).toBe(false);
   });
 });

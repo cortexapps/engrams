@@ -11,6 +11,7 @@ import {
   type FieldSchema,
 } from "../connectors/registry.ts";
 import { loadEventSample } from "../connectors/samples.ts";
+import { ownPath } from "../automations/paths.ts";
 import { redactWebhookPayload } from "../automations/webhook.ts";
 
 const base = {
@@ -261,5 +262,20 @@ describe("built-in seeds", () => {
   test("hidden events have no picker sample requirement and unknown keys return null", () => {
     expect(loadEventSample("github", "not.declared")).toBeNull();
     expect(loadEventSample("../evil", "x")).toBeNull();
+  });
+
+  test("every declared event resolves at least one connector alias from its own sample", () => {
+    // Aliases are connector-wide; an event whose sample resolves none of them
+    // gives templates nothing curated to reference (the reaction_added gap).
+    for (const [provider, connector] of providers) {
+      const aliases = connector.webhook?.aliases ?? [];
+      for (const event of connector.webhook?.events ?? []) {
+        if (event.hidden) continue;
+        const sample = loadEventSample(provider, event.key);
+        if (sample === null) continue;
+        const resolved = aliases.filter((mapping) => ownPath(sample, mapping.path) !== undefined);
+        expect(resolved.length, `${provider}/${event.key} resolves no aliases`).toBeGreaterThan(0);
+      }
+    }
   });
 });

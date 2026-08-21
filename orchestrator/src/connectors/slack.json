@@ -171,6 +171,18 @@
       {
         "path": "event.ts",
         "alias": "message.timestamp"
+      },
+      {
+        "path": "event.reaction",
+        "alias": "reaction.name"
+      },
+      {
+        "path": "event.item.channel",
+        "alias": "reaction.channel.id"
+      },
+      {
+        "path": "event.item.ts",
+        "alias": "reaction.message_timestamp"
       }
     ],
     "ingress": {
