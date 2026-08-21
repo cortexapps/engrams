@@ -9,6 +9,8 @@
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
+import { log as rootLog } from "../log.ts";
+
 import {
   makeAutomationStore,
   type AutomationDispatchStore,
@@ -28,6 +30,8 @@ import { matchesWebhookFilter, SYSTEM_GITHUB_REGISTRATION_ID } from "./webhook.t
 
 export { SYSTEM_GITHUB_REGISTRATION_ID } from "./webhook.ts";
 export const WEBHOOK_SAMPLE_RETENTION = 20;
+
+const log = rootLog.child({ component: "automation-dispatch" });
 
 export interface AutomationWebhookStore extends AutomationDispatchStore {
   recordWebhookSample(input: {
@@ -303,6 +307,8 @@ export interface DispatchIntegrationResult {
   joined: number;
   queued: number;
   skipped: number;
+  /** Targets whose admission threw; the dispatcher rethrows after the loop. */
+  failed: number;
 }
 
 /** Providers whose scope noun compares case-insensitively (GitHub owner/repo).
@@ -385,29 +391,63 @@ export async function dispatchIntegrationEvent(
     joined: 0,
     queued: 0,
     skipped: 0,
+    failed: 0,
   };
 
+  // Each target is admitted in isolation: one transient fault must never drop
+  // the sibling automations matched by the same delivery. Failures are
+  // counted and rethrown AFTER every target was tried, so the ingress fails
+  // the provider's delivery (it retries; the ledger and the run id dedupe the
+  // targets that already succeeded).
+  const failures: Array<{ automationId: string; error: unknown }> = [];
   for (const target of targets) {
     const deliveryKey = `${input.provider}:${input.deliveryId}`;
-    const outcome = await admitAutomationRun(
-      {
-        target,
-        runId: automationRunId(target.automation.id, deliveryKey),
-        deliveryKey,
-        trigger: {
-          source: "integration",
-          eventKey: input.eventKey,
-          deliveryId: input.deliveryId,
-          payload: input.payload,
-          receivedAt: input.receivedAt.toISOString(),
-          ...(input.scopeValue !== undefined ? { scopeValue: input.scopeValue } : {}),
+    try {
+      const outcome = await admitAutomationRun(
+        {
+          target,
+          runId: automationRunId(target.automation.id, deliveryKey),
+          deliveryKey,
+          trigger: {
+            source: "integration",
+            eventKey: input.eventKey,
+            deliveryId: input.deliveryId,
+            payload: input.payload,
+            receivedAt: input.receivedAt.toISOString(),
+            ...(input.scopeValue !== undefined ? { scopeValue: input.scopeValue } : {}),
+          },
+          scheduledFor: null,
         },
-        scheduledFor: null,
-      },
-      { store, starter, sender, now },
-    );
-    result[outcome] += 1;
+        { store, starter, sender, now },
+      );
+      result[outcome] += 1;
+    } catch (error) {
+      result.failed += 1;
+      failures.push({ automationId: target.automation.id, error });
+      log.error(
+        { automationId: target.automation.id, provider: input.provider, eventKey: input.eventKey, error },
+        "integration dispatch: admission failed for one target",
+      );
+    }
   }
 
+  if (failures.length > 0) {
+    throw new IntegrationDispatchError(result, failures);
+  }
   return result;
+}
+
+/** Raised after every target was tried when at least one admission failed.
+ * Carries the partial tally so the caller can fail the delivery (provider
+ * retry) without losing what already started. */
+export class IntegrationDispatchError extends Error {
+  constructor(
+    readonly result: DispatchIntegrationResult,
+    readonly failures: ReadonlyArray<{ automationId: string; error: unknown }>,
+  ) {
+    super(
+      `integration dispatch: ${failures.length} of ${result.matched} matched automation(s) failed admission`,
+    );
+    this.name = "IntegrationDispatchError";
+  }
 }

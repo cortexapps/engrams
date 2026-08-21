@@ -8,6 +8,7 @@ import type {
 import type { AutomationDefinition } from "../engine/definition.ts";
 import {
   dispatchIntegrationEvent,
+  IntegrationDispatchError,
   matchesIntegrationTrigger,
   scopeValuesFromInput,
   type IntegrationDispatchStore,
@@ -260,7 +261,7 @@ describe("dispatchIntegrationEvent", () => {
       deps(h),
     );
 
-    expect(result).toEqual({ matched: 1, started: 1, joined: 0, queued: 0, skipped: 0 });
+    expect(result).toEqual({ matched: 1, started: 1, joined: 0, queued: 0, skipped: 0, failed: 0 });
     expect(h.starts).toEqual([
       {
         runId: "autorun:automation-1:github:gh-delivery-1",
@@ -320,5 +321,45 @@ describe("dispatchIntegrationEvent", () => {
     expect(second).toMatchObject({ queued: 1, started: 0 });
     const pending = h.runs.get("autorun:automation-1:github:gh-delivery-2")!;
     expect(pending.status).toBe("pending");
+  });
+
+  test("one target's admission fault never drops its siblings, and the delivery fails afterwards", async () => {
+    const a = { automation: meta({ id: "automation-a" }), definition: definition(trigger()) };
+    const b = { automation: meta({ id: "automation-b" }), definition: definition(trigger()) };
+    const c = { automation: meta({ id: "automation-c" }), definition: definition(trigger()) };
+    const h = makeHarness([a, b, c]);
+    const d = deps(h);
+    // The middle target's workflow start throws (transient DBOS fault).
+    d.workflowStarter = {
+      async start(wf, workflowId) {
+        if (wf.automationId === "automation-b") throw new Error("dbos unavailable");
+        h.starts.push({ ...wf, workflowId });
+      },
+    };
+
+    let thrown: unknown;
+    try {
+      await dispatchIntegrationEvent(input(), d);
+    } catch (error) {
+      thrown = error;
+    }
+
+    // a and c were still admitted; only b failed.
+    expect(h.starts.map((s) => s.automationId).sort()).toEqual(["automation-a", "automation-c"]);
+    expect(thrown).toBeInstanceOf(IntegrationDispatchError);
+    const err = thrown as IntegrationDispatchError;
+    expect(err.result).toMatchObject({ matched: 3, started: 2, failed: 1 });
+    expect(err.failures.map((f) => f.automationId)).toEqual(["automation-b"]);
+
+    // The provider's retry replays the same delivery: a and c dedupe on
+    // their fixed run ids, b gets its second chance.
+    d.workflowStarter = {
+      async start(wf, workflowId) {
+        h.starts.push({ ...wf, workflowId });
+      },
+    };
+    const retry = await dispatchIntegrationEvent(input(), d);
+    expect(retry.failed).toBe(0);
+    expect(new Set(h.starts.map((s) => s.workflowId)).size).toBe(3);
   });
 });

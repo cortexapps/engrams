@@ -183,12 +183,19 @@ export async function handleIntegrationDelivery(
       receivedAt,
     });
   } catch (error) {
-    // The ledger row is durable and delivery-unique; a dispatch outage must
-    // not fail the provider's delivery (it would retry and dedupe anyway).
+    // A dispatch fault must FAIL the delivery, not be swallowed behind a 200:
+    // the provider only redelivers on a non-2xx, and nothing else re-drives
+    // a ledgered row. The retry is safe — the ledger row is delivery-unique
+    // and every run id is derived from the delivery id, so targets that
+    // already admitted dedupe on the replay.
     log.error(
       { provider: route.provider, eventKey: outcome.event.eventKey, error },
-      "integration event dispatch failed",
+      "integration event dispatch failed; failing the delivery so the provider retries",
     );
+    return {
+      kind: "rejected",
+      response: jsonResponse(500, "dispatch failed; retry"),
+    };
   }
 
   return {

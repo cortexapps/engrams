@@ -309,6 +309,35 @@ describe("POST /api/v1/integrations/github/events", () => {
     expect(fixture.automationDispatches).toHaveLength(1);
   });
 
+  test("a dispatch fault fails the delivery (500) so the provider retries; the ledger row stays", async () => {
+    const body = JSON.stringify({
+      action: "opened",
+      issue: { number: 1 },
+      repository: { full_name: "acme/repo" },
+    });
+    const ingress = fakeIngress();
+    const route = makeGithubEventsRoute({
+      webhookSecret: async () => SECRET,
+      ingress: {
+        ...ingress.deps,
+        dispatch: async () => {
+          throw new Error("dbos unavailable");
+        },
+      },
+      enrollments: { get: async () => null },
+      automationDispatch: async () => {},
+    });
+    const res = await route.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "issues"),
+    });
+    // Never a 200: GitHub only redelivers on a non-2xx, and nothing else
+    // re-drives a ledgered row. The retry dedupes on the delivery id.
+    expect(res.status).toBe(500);
+    expect(ingress.recorded).toHaveLength(1);
+  });
+
   test("the PR-review classifier still runs on a spine-ledgered delivery", async () => {
     const body = pullRequestBody();
     const fixture = app();
