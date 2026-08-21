@@ -7,7 +7,7 @@ import { hostname } from "node:os";
 import { makeAutomationStore, type AutomationCronStore, type DueCronAutomation } from "../db/automations.ts";
 import { log as rootLog } from "../log.ts";
 import { automationRunWorkflow, type AutomationRunWorkflowInput } from "../workflows/automation-run.ts";
-import { automationRunId } from "./dispatch.ts";
+import { automationRunId, cronDeliveryKey } from "./dispatch.ts";
 
 const log = rootLog.child({ component: "automation-scheduler" });
 
@@ -39,7 +39,7 @@ export function automationCronWorkflowId(
   automationId: string,
   scheduledFor: Date,
 ): string {
-  return automationRunId(automationId, `cron:${Math.floor(scheduledFor.getTime() / 1_000)}`);
+  return automationRunId(automationId, cronDeliveryKey(scheduledFor));
 }
 
 export function nextCronOccurrence(

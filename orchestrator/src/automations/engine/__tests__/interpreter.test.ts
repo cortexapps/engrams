@@ -23,6 +23,7 @@ interface Harness {
   finalized: Array<{ status: string; error?: string }>;
   ended: string[];
   created: string[];
+  createdInputs: Array<Parameters<EngineSessionOps["createSession"]>[0]>;
   prompts: Array<{ sessionId: string; promptId: string; text: string }>;
   execs: Array<{ sessionId: string; command: string; execId: string }>;
   released: string[];
@@ -58,6 +59,7 @@ function makeHarness(
   const finalized: Harness["finalized"] = [];
   const ended: string[] = [];
   const created: string[] = [];
+  const createdInputs: Array<Parameters<EngineSessionOps["createSession"]>[0]> = [];
   const prompts: Harness["prompts"] = [];
   const execs: Harness["execs"] = [];
   const released: string[] = [];
@@ -104,6 +106,7 @@ function makeHarness(
   const sessions: EngineSessionOps = {
     async createSession(input) {
       const sessionId = `s-${input.blockId}`;
+      createdInputs.push(input);
       created.push(sessionId);
       runSessions.push({ sessionId, keep: input.keep });
       return { sessionId, taskId: `t-${input.blockId}` };
@@ -143,7 +146,7 @@ function makeHarness(
     },
   };
 
-  return { deps, names, stepRecords, finalized, ended, created, prompts, execs, released, promoted };
+  return { deps, names, stepRecords, finalized, ended, created, createdInputs, prompts, execs, released, promoted };
 }
 
 const RUN = { runId: "autorun:auto-1:manual:x", automationId: "auto-1" };
@@ -457,6 +460,30 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
     const h = makeHarness(definition, { promote: "autorun:auto-1:manual:next" });
     await interpretAutomation(RUN, h.deps);
     expect(h.promoted).toEqual(["autorun:auto-1:manual:next"]);
+  });
+
+  test("includeEventContext appends the redacted payload with the disclaimer (ADR 0102 parity)", async () => {
+    const definition = makeDefinition([
+      {
+        id: "launch",
+        type: "create_session",
+        config: { profileId: "p", promptTemplate: "Triage this.", includeEventContext: true },
+      },
+    ]);
+    const withEvent = makeHarness(definition, {
+      payload: { issue: { title: "boom" } },
+    });
+    await interpretAutomation(RUN, withEvent.deps);
+    const prompt = withEvent.createdInputs[0]!.prompt;
+    expect(prompt).toStartWith("Triage this.");
+    expect(prompt).toContain("untrusted external input");
+    expect(prompt).toContain('"boom"');
+    expect(prompt).toContain("test.event");
+
+    // No event key (cron/manual) → nothing appended, the legacy gate.
+    const withoutEvent = makeHarness(definition);
+    await interpretAutomation(RUN, withoutEvent.deps);
+    expect(withoutEvent.createdInputs[0]!.prompt).toBe("Triage this.");
   });
 
   test("phase-2 stubs return typed unavailable failures", async () => {

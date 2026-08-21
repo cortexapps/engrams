@@ -28,6 +28,8 @@ import {
 import { ENGINE_VERSION, type AutomationDefinition } from "../automations/engine/definition.ts";
 import type { EngineRunStore, EngineStepRecord } from "../automations/engine/deps.ts";
 import type { RunSnapshot } from "../automations/engine/context.ts";
+import { RUN_TERMINAL_STATUSES } from "../automations/engine/interpreter.ts";
+import { cronDeliveryKey } from "../automations/ids.ts";
 import type { WebhookAliasMapping } from "../automations/template.ts";
 
 // ---------------------------------------------------------------------------
@@ -378,14 +380,10 @@ export function resolveAutomationInputs(
   return resolved;
 }
 
-const TERMINAL_RUN_STATUSES = new Set([
-  "completed",
-  "filtered",
-  "failed",
-  "superseded",
-  "halted",
-  "deadline",
-]);
+// Derived from the interpreter's source-of-truth array so a new terminal
+// status is a compile-visible change here, never a silently frozen cron
+// schedule (claimCronOccurrence treats non-terminal as "occurrence taken").
+const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set(RUN_TERMINAL_STATUSES);
 
 // ---------------------------------------------------------------------------
 // Store factory
@@ -631,7 +629,7 @@ export function makeAutomationStore(
           automationId: input.automationId,
           version: input.version,
           trigger,
-          deliveryKey: `cron:${Math.floor(input.scheduledFor.getTime() / 1_000)}`,
+          deliveryKey: cronDeliveryKey(input.scheduledFor),
           scheduledFor: input.scheduledFor,
           leaseOwner: input.leaseOwner,
           leaseExpiresAt: input.leaseExpiresAt,

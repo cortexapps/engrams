@@ -68,12 +68,9 @@ export interface DispatchWebhookDeps {
   now?: () => Date;
 }
 
-export function automationRunId(automationId: string, deliveryKey: string): string {
-  // The run id IS the DBOS workflow id (ADR 0119 D3). DBOS treats workflowID
-  // as the durable execution identity: starting an existing running or
-  // terminal id returns its handle and never re-executes the body.
-  return `autorun:${automationId}:${deliveryKey}`;
-}
+import { automationRunId } from "./ids.ts";
+
+export { automationRunId, cronDeliveryKey } from "./ids.ts";
 
 export function defaultWorkflowStarter(): AutomationWebhookStarter {
   return {

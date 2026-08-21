@@ -33,13 +33,19 @@ import {
   type Frame,
 } from "./step-name.ts";
 
-export type RunTerminalStatus =
-  | "completed"
-  | "filtered"
-  | "failed"
-  | "superseded"
-  | "halted"
-  | "deadline";
+/** Single source of truth for terminal run statuses. Everything that gates
+ * on terminality (e.g. claimCronOccurrence) derives from this array, so a
+ * new status is a compile-time update, never a silently-frozen scheduler. */
+export const RUN_TERMINAL_STATUSES = [
+  "completed",
+  "filtered",
+  "failed",
+  "superseded",
+  "halted",
+  "deadline",
+] as const;
+
+export type RunTerminalStatus = (typeof RUN_TERMINAL_STATUSES)[number];
 
 export interface EngineRunInput {
   runId: string;
