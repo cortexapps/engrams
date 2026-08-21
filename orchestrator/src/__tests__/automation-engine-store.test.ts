@@ -67,6 +67,80 @@ afterAll(async () => {
   await db.delete(automationTable).where(inArray(automationTable.id, createdAutomationIds));
 });
 
+async function seedIntegrationAutomation(
+  id: string,
+  trigger: Record<string, unknown>,
+): Promise<void> {
+  const db = getDb();
+  await db.insert(automationTable).values({
+    id,
+    name: `Integration trigger test ${id}`,
+    description: "",
+    enabled: true,
+    currentVersion: 1,
+  });
+  createdAutomationIds.push(id);
+  await db.execute(sql`
+    insert into automation_version (automation_id, version, trigger, blocks, inputs_schema, settings)
+    values (${id}, 1, ${JSON.stringify(trigger)}::jsonb,
+            ${JSON.stringify([
+              {
+                id: "create_session",
+                type: "create_session",
+                config: { profileId: "p1", promptTemplate: "go", includeEventContext: false },
+              },
+            ])}::jsonb,
+            '[]'::jsonb,
+            ${JSON.stringify({ endSessionsOnFinish: false })}::jsonb)
+  `);
+}
+
+describe("integration trigger store (live PG)", () => {
+  test.skipIf(!dbReachable)(
+    "listEnabledForIntegrationTrigger filters by kind, provider, and connection",
+    async () => {
+      const connectionId = `conn-${UNIQ}`;
+      const hit = `${AUTO_ID}-int-hit`;
+      const otherConn = `${AUTO_ID}-int-conn`;
+      const otherProvider = `${AUTO_ID}-int-prov`;
+      const cron = `${AUTO_ID}-int-cron`;
+      await seedIntegrationAutomation(hit, {
+        kind: "integration",
+        provider: "github",
+        connectionId,
+        eventKeys: ["pull_request.opened"],
+      });
+      await seedIntegrationAutomation(otherConn, {
+        kind: "integration",
+        provider: "github",
+        connectionId: `${connectionId}-other`,
+        eventKeys: ["pull_request.opened"],
+      });
+      await seedIntegrationAutomation(otherProvider, {
+        kind: "integration",
+        provider: "slack",
+        connectionId,
+        eventKeys: ["app_mention"],
+      });
+      await seedIntegrationAutomation(cron, {
+        kind: "cron",
+        schedule: "0 9 * * 1-5",
+        timezone: "UTC",
+      });
+
+      const store = makeAutomationStore(getDb());
+      const targets = await store.listEnabledForIntegrationTrigger("github", connectionId);
+      const ids = targets.map((t) => t.automation.id);
+      expect(ids).toEqual([hit]);
+      expect(targets[0]!.definition.trigger).toMatchObject({
+        kind: "integration",
+        provider: "github",
+        connectionId,
+      });
+    },
+  );
+});
+
 describe("automation engine store (live PG)", () => {
   test.skipIf(!dbReachable)("loadSnapshot pins the run's version and inputs", async () => {
     const id = `${AUTO_ID}-snapshot`;

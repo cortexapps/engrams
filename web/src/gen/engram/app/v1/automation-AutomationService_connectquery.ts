@@ -57,3 +57,16 @@ export const evalCode = AutomationService.method.evalCode;
  * @generated from rpc engram.app.v1.AutomationService.ListWebhookSamples
  */
 export const listWebhookSamples = AutomationService.method.listWebhookSamples;
+
+/**
+ * ADR 0119 D5: the connector-declared event and action catalogs that back
+ * integration triggers and integration_action blocks.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.ListEventCatalog
+ */
+export const listEventCatalog = AutomationService.method.listEventCatalog;
+
+/**
+ * @generated from rpc engram.app.v1.AutomationService.ListActionCatalog
+ */
+export const listActionCatalog = AutomationService.method.listActionCatalog;

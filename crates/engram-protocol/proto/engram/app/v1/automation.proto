@@ -19,6 +19,10 @@ service AutomationService {
   // Run button.
   rpc EvalCode(EvalCodeRequest) returns (EvalCodeResponse);
   rpc ListWebhookSamples(ListWebhookSamplesRequest) returns (ListWebhookSamplesResponse);
+  // ADR 0119 D5: the connector-declared event and action catalogs that back
+  // integration triggers and integration_action blocks.
+  rpc ListEventCatalog(ListEventCatalogRequest) returns (ListEventCatalogResponse);
+  rpc ListActionCatalog(ListActionCatalogRequest) returns (ListActionCatalogResponse);
 }
 
 service WebhookRegistrationService {
@@ -49,7 +53,21 @@ message AutomationTrigger {
   oneof trigger {
     CronAutomationTrigger cron = 1;
     WebhookAutomationTrigger webhook = 2;
+    IntegrationAutomationTrigger integration = 3;
   }
+}
+
+// ADR 0119 D5: subscribe to a connector's verified event stream. Verification
+// lives with the integration; no user-managed secret exists on this path.
+message IntegrationAutomationTrigger {
+  string provider = 1;
+  string connection_id = 2;
+  repeated string event_keys = 3;
+  // Scope narrowing by the provider noun (repository / channel / team):
+  // literal values, or the key of an automation input whose keys/elements
+  // supply them. At most one is set.
+  repeated string scope_values = 4;
+  optional string scope_from_input = 5;
 }
 
 message CronAutomationTrigger {
@@ -296,4 +314,50 @@ message WebhookVariable {
 message ListWebhookEventsResponse {
   repeated WebhookEvent events = 1;
   repeated WebhookVariable variables = 2;
+}
+
+message ListEventCatalogRequest {
+  string provider = 1;
+}
+
+message EventCatalogEntry {
+  string key = 1;
+  string label = 2;
+  string description = 3;
+  // FieldSchema JSON (the bounded subset the connector declared); empty when
+  // the event has no curated schema.
+  string schema_json = 4;
+  // Newest ledgered payload for the default connection, else the checked-in
+  // fixture; empty when neither exists.
+  string sample_json = 5;
+  bool observed = 6;
+  bool hidden = 7;
+}
+
+message EventCatalogScope {
+  string key = 1;
+  string label = 2;
+}
+
+message ListEventCatalogResponse {
+  repeated EventCatalogEntry events = 1;
+  optional EventCatalogScope scope = 2;
+  repeated WebhookVariable variables = 3;
+  string default_connection_id = 4;
+}
+
+message ListActionCatalogRequest {
+  string provider = 1;
+}
+
+// Member-safe projection: never the execution details.
+message ActionCatalogEntry {
+  string id = 1;
+  string label = 2;
+  string description = 3;
+  string input_schema_json = 4;
+}
+
+message ListActionCatalogResponse {
+  repeated ActionCatalogEntry actions = 1;
 }

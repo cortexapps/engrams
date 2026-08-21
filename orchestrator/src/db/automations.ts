@@ -142,6 +142,10 @@ export interface AutomationStore {
   /** Enabled, non-archived automations whose current version references the
    * registration — the dispatch view (covers non-legacy graphs). */
   listEnabledForWebhookRegistration(registrationId: string): Promise<DispatchTarget[]>;
+  listEnabledForIntegrationTrigger(
+    provider: string,
+    connectionId: string,
+  ): Promise<DispatchTarget[]>;
   create(input: AutomationInput, createdByUserId: string): Promise<AutomationRow>;
   update(id: string, input: AutomationInput): Promise<AutomationRow | null>;
   archive(id: string): Promise<AutomationRow | null>;
@@ -468,6 +472,22 @@ export function makeAutomationStore(
           isNull(automationTable.archivedAt),
           sql`${versionTable.trigger}->>'kind' = 'webhook'`,
           sql`${versionTable.trigger}->>'registrationId' = ${registrationId}`,
+        ),
+      );
+      return rows.map(({ meta, version }) => ({
+        automation: meta,
+        definition: definitionOf(version),
+      }));
+    },
+
+    async listEnabledForIntegrationTrigger(provider, connectionId) {
+      const rows = await listWithCurrentVersions(
+        and(
+          eq(automationTable.enabled, true),
+          isNull(automationTable.archivedAt),
+          sql`${versionTable.trigger}->>'kind' = 'integration'`,
+          sql`${versionTable.trigger}->>'provider' = ${provider}`,
+          sql`${versionTable.trigger}->>'connectionId' = ${connectionId}`,
         ),
       );
       return rows.map(({ meta, version }) => ({

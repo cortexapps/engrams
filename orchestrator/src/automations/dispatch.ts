@@ -9,13 +9,16 @@
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
+import { log as rootLog } from "../log.ts";
+
 import {
   makeAutomationStore,
   type AutomationDispatchStore,
   type DispatchTarget,
   type WebhookRegistrationRow,
 } from "../db/automations.ts";
-import type { AutomationRunTrigger } from "../db/schema.ts";
+import type { AutomationRunTrigger, AutomationTrigger } from "../db/schema.ts";
+import type { IntegrationEventDispatchInput } from "./integration-ingress.ts";
 import { renderAutomationTemplateInScope } from "./template.ts";
 import {
   defaultAutomationSender,
@@ -27,6 +30,8 @@ import { matchesWebhookFilter, SYSTEM_GITHUB_REGISTRATION_ID } from "./webhook.t
 
 export { SYSTEM_GITHUB_REGISTRATION_ID } from "./webhook.ts";
 export const WEBHOOK_SAMPLE_RETENTION = 20;
+
+const log = rootLog.child({ component: "automation-dispatch" });
 
 export interface AutomationWebhookStore extends AutomationDispatchStore {
   recordWebhookSample(input: {
@@ -274,4 +279,175 @@ export async function dispatchWebhookOccurrence(
   }
 
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Integration triggers (ADR 0119 D5, stack item 2.C)
+// ---------------------------------------------------------------------------
+
+export type IntegrationTriggerSpec = Extract<AutomationTrigger, { kind: "integration" }>;
+
+export interface IntegrationDispatchStore extends AutomationDispatchStore {
+  listEnabledForIntegrationTrigger(
+    provider: string,
+    connectionId: string,
+  ): Promise<DispatchTarget[]>;
+}
+
+export interface DispatchIntegrationDeps {
+  store?: IntegrationDispatchStore;
+  workflowStarter?: AutomationWebhookStarter;
+  sender?: AutomationSender;
+  now?: () => Date;
+}
+
+export interface DispatchIntegrationResult {
+  matched: number;
+  started: number;
+  joined: number;
+  queued: number;
+  skipped: number;
+  /** Targets whose admission threw; the dispatcher rethrows after the loop. */
+  failed: number;
+}
+
+/** Providers whose scope noun compares case-insensitively (GitHub owner/repo).
+ * Slack channel ids and Linear team keys are exact. */
+const CASE_INSENSITIVE_SCOPE_PROVIDERS = new Set(["github"]);
+
+function normalizeScope(provider: string, value: string): string {
+  return CASE_INSENSITIVE_SCOPE_PROVIDERS.has(provider) ? value.toLowerCase() : value;
+}
+
+/** Resolve a {fromInput} scope binding against the automation's input values:
+ * a map-typed input contributes its keys, a list input its string elements.
+ * Anything else (absent, wrong shape) resolves to undefined → no match. */
+export function scopeValuesFromInput(
+  inputs: Record<string, unknown>,
+  key: string,
+): string[] | undefined {
+  if (!Object.prototype.hasOwnProperty.call(inputs, key)) return undefined;
+  const value = inputs[key];
+  if (Array.isArray(value)) {
+    const strings = value.filter((item): item is string => typeof item === "string");
+    return strings.length === value.length ? strings : undefined;
+  }
+  if (typeof value === "object" && value !== null) {
+    return Object.keys(value);
+  }
+  return undefined;
+}
+
+export function matchesIntegrationTrigger(
+  trigger: IntegrationTriggerSpec,
+  event: { provider: string; connectionId: string; eventKey: string; scopeValue?: string },
+  resolveInput: (key: string) => string[] | undefined,
+): boolean {
+  if (trigger.provider !== event.provider) return false;
+  if (trigger.connectionId !== event.connectionId) return false;
+  if (!trigger.eventKeys.includes(event.eventKey)) return false;
+  if (trigger.scope === undefined) return true;
+  const values =
+    "values" in trigger.scope ? trigger.scope.values : resolveInput(trigger.scope.fromInput);
+  // An unresolved input binding narrows to nothing: never fire on a scope the
+  // author has not spelled out.
+  if (values === undefined || event.scopeValue === undefined) return false;
+  const scoped = normalizeScope(event.provider, event.scopeValue);
+  return values.some((value) => normalizeScope(event.provider, value) === scoped);
+}
+
+/** Route one verified, ledgered integration delivery to every enabled
+ * automation whose trigger matches, through the shared admission path.
+ * Installed onto the ingress spine's dispatch seam at boot. */
+export async function dispatchIntegrationEvent(
+  input: IntegrationEventDispatchInput,
+  deps: DispatchIntegrationDeps = {},
+): Promise<DispatchIntegrationResult> {
+  const store = deps.store ?? makeAutomationStore();
+  const starter = deps.workflowStarter ?? defaultWorkflowStarter();
+  const sender = deps.sender ?? defaultAutomationSender;
+  const now = deps.now ?? (() => new Date());
+
+  const targets = (
+    await store.listEnabledForIntegrationTrigger(input.provider, input.connectionId)
+  ).filter((target) => {
+    const trigger = target.definition.trigger;
+    if (trigger.kind !== "integration") return false;
+    return matchesIntegrationTrigger(
+      trigger,
+      {
+        provider: input.provider,
+        connectionId: input.connectionId,
+        eventKey: input.eventKey,
+        ...(input.scopeValue !== undefined ? { scopeValue: input.scopeValue } : {}),
+      },
+      (key) => scopeValuesFromInput(target.automation.inputs, key),
+    );
+  });
+
+  const result: DispatchIntegrationResult = {
+    matched: targets.length,
+    started: 0,
+    joined: 0,
+    queued: 0,
+    skipped: 0,
+    failed: 0,
+  };
+
+  // Each target is admitted in isolation: one transient fault must never drop
+  // the sibling automations matched by the same delivery. Failures are
+  // counted and rethrown AFTER every target was tried, so the ingress fails
+  // the provider's delivery (it retries; the ledger and the run id dedupe the
+  // targets that already succeeded).
+  const failures: Array<{ automationId: string; error: unknown }> = [];
+  for (const target of targets) {
+    const deliveryKey = `${input.provider}:${input.deliveryId}`;
+    try {
+      const outcome = await admitAutomationRun(
+        {
+          target,
+          runId: automationRunId(target.automation.id, deliveryKey),
+          deliveryKey,
+          trigger: {
+            source: "integration",
+            eventKey: input.eventKey,
+            deliveryId: input.deliveryId,
+            payload: input.payload,
+            receivedAt: input.receivedAt.toISOString(),
+            ...(input.scopeValue !== undefined ? { scopeValue: input.scopeValue } : {}),
+          },
+          scheduledFor: null,
+        },
+        { store, starter, sender, now },
+      );
+      result[outcome] += 1;
+    } catch (error) {
+      result.failed += 1;
+      failures.push({ automationId: target.automation.id, error });
+      log.error(
+        { automationId: target.automation.id, provider: input.provider, eventKey: input.eventKey, error },
+        "integration dispatch: admission failed for one target",
+      );
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new IntegrationDispatchError(result, failures);
+  }
+  return result;
+}
+
+/** Raised after every target was tried when at least one admission failed.
+ * Carries the partial tally so the caller can fail the delivery (provider
+ * retry) without losing what already started. */
+export class IntegrationDispatchError extends Error {
+  constructor(
+    readonly result: DispatchIntegrationResult,
+    readonly failures: ReadonlyArray<{ automationId: string; error: unknown }>,
+  ) {
+    super(
+      `integration dispatch: ${failures.length} of ${result.matched} matched automation(s) failed admission`,
+    );
+    this.name = "IntegrationDispatchError";
+  }
 }

@@ -82,6 +82,8 @@ import {
   makeProductionAutomationScheduler,
   makeProductionIntegrationEventSweeper,
 } from "./automations/scheduler.ts";
+import { setIntegrationEventDispatch } from "./automations/integration-ingress.ts";
+import { dispatchIntegrationEvent } from "./automations/dispatch.ts";
 import { assertSweepPoliciesExhaustive } from "./sweep/policy.ts";
 import { makeSweepRuntime } from "./sweep/production.ts";
 import { getDb, getPool } from "./db/client.ts";
@@ -670,6 +672,9 @@ const automationScheduler = makeProductionAutomationScheduler();
 await automationScheduler.start();
 const integrationEventSweeper = makeProductionIntegrationEventSweeper();
 await integrationEventSweeper.start();
+// ADR 0119 D5 (2.C): verified, ledgered integration deliveries route to
+// matching automations through the ingress spine's dispatch seam.
+setIntegrationEventDispatch((input) => dispatchIntegrationEvent(input));
 const modelRouterRefresher = new ModelRouterCatalogRefresher({
   store: makeModelRouterStore(getDb()),
 });

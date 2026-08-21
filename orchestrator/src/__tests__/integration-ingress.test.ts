@@ -141,7 +141,10 @@ describe("handleIntegrationDelivery", () => {
     expect(s.recorded).toHaveLength(0);
   });
 
-  test("a dispatch outage never fails the delivery (ledger row is durable)", async () => {
+  test("a dispatch outage fails the delivery (500) so the provider retries; the ledger row stays", async () => {
+    // A swallowed 200 here would lose the matched runs for good: providers
+    // only redeliver on non-2xx, and nothing re-drives a ledgered row. The
+    // retry is safe — the ledger row is delivery-unique.
     const { store, recorded } = fakeStore();
     const result = await handleIntegrationDelivery(
       passRoute,
@@ -154,7 +157,8 @@ describe("handleIntegrationDelivery", () => {
         },
       },
     );
-    expect(result.kind).toBe("recorded");
+    expect(result.kind).toBe("rejected");
+    if (result.kind === "rejected") expect(result.response.status).toBe(500);
     expect(recorded).toHaveLength(1);
   });
 });
