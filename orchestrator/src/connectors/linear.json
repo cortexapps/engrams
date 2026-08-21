@@ -4,7 +4,7 @@
   "display": {
     "name": "Linear",
     "category": "Issue tracking",
-    "blurb": "Query and mutate Linear issues, projects, teams, and comments through its GraphQL API — authenticated with the workspace's OAuth app token, brokered at the egress proxy and never seen by the agent.",
+    "blurb": "Query and mutate Linear issues, projects, teams, and comments through its GraphQL API \u2014 authenticated with the workspace's OAuth app token, brokered at the egress proxy and never seen by the agent.",
     "icon": {
       "mono": "LI",
       "color": "#5e6ad2"
@@ -22,7 +22,7 @@
   "userCredential": {
     "oauth": true,
     "token": {
-      "hint": "Create a personal API key under Linear Settings → Security & access → API keys, or connect with OAuth."
+      "hint": "Create a personal API key under Linear Settings \u2192 Security & access \u2192 API keys, or connect with OAuth."
     }
   },
   "hosts": [
@@ -562,7 +562,338 @@
       "LINEAR_API_KEY": "x-engrams-managed"
     },
     "credentialDelivery": "inject",
-    "doc": "Use `linear` to query and mutate Linear from this session via its GraphQL API. Authentication is automatic: the egress proxy injects the workspace's Linear OAuth app token (actor=app — actions attribute to the workspace's agent app user) on requests to api.linear.app; `LINEAR_API_KEY` is a managed placeholder. Do NOT set a real key or run any login.\n\nLinear is a GraphQL-only API: ONE endpoint, POST https://api.linear.app/graphql. Powers gate the TOP-LEVEL GraphQL fields a request may select, by product area:\n  org:read        viewer, organization, team(s), user(s), cycle(s), workflowState(s)\n  issues:read     issue(s), issueSearch, comment(s), attachment(s), issueLabel(s)\n  issues:write    issueCreate/Update/Archive/Unarchive, commentCreate/Update, attachmentCreate, attachmentLinkURL, issueLabelCreate, reactionCreate\n  projects:read   project(s), projectUpdate(s), initiative(s), document(s)\n  projects:write  projectCreate, projectUpdate, projectUpdateCreate\nA request must have EVERY top-level field it selects covered by a granted power, or the proxy rejects it before it leaves the sandbox.\n\nSubcommands (all run a GraphQL document; the power each needs):\n  linear whoami                       Current identity (`viewer`) — org:read.\n  linear teams                        List your teams — org:read.\n  linear issues [query]               Search issues by free text — issues:read.\n  linear issue <id>                   Fetch one issue by id or identifier (e.g. ENG-123) — issues:read.\n  linear projects                     List projects — projects:read.\n  linear comment <issueId> <text>     Add a comment — issues:write.\n  linear create <teamId> <title> [description]   Create an issue — issues:write.\n  linear query '<graphql>' [varsJSON] Run an arbitrary query or mutation (covered fields only).\n  linear raw '<json-body>'            POST a raw GraphQL JSON body verbatim (covered fields only).\n\nExamples:\n  linear whoami\n  linear issues \"login bug\"\n  linear query 'query{ teams{ nodes{ id name } } }'\n  linear query 'mutation($t:String!){ issueCreate(input:{teamId:\"...\",title:$t}){ success issue{ identifier } } }' '{\"t\":\"New bug\"}'\n\nResponses are JSON of the form {\"data\":{...}} or {\"errors\":[...]}. GraphQL can return HTTP 200 with an `errors` array; a missing/invalid token yields HTTP 401 with extensions.type=authentication_error. A request selecting a field outside your granted powers is refused at the network boundary (not a Linear error)."
+    "doc": "Use `linear` to query and mutate Linear from this session via its GraphQL API. Authentication is automatic: the egress proxy injects the workspace's Linear OAuth app token (actor=app \u2014 actions attribute to the workspace's agent app user) on requests to api.linear.app; `LINEAR_API_KEY` is a managed placeholder. Do NOT set a real key or run any login.\n\nLinear is a GraphQL-only API: ONE endpoint, POST https://api.linear.app/graphql. Powers gate the TOP-LEVEL GraphQL fields a request may select, by product area:\n  org:read        viewer, organization, team(s), user(s), cycle(s), workflowState(s)\n  issues:read     issue(s), issueSearch, comment(s), attachment(s), issueLabel(s)\n  issues:write    issueCreate/Update/Archive/Unarchive, commentCreate/Update, attachmentCreate, attachmentLinkURL, issueLabelCreate, reactionCreate\n  projects:read   project(s), projectUpdate(s), initiative(s), document(s)\n  projects:write  projectCreate, projectUpdate, projectUpdateCreate\nA request must have EVERY top-level field it selects covered by a granted power, or the proxy rejects it before it leaves the sandbox.\n\nSubcommands (all run a GraphQL document; the power each needs):\n  linear whoami                       Current identity (`viewer`) \u2014 org:read.\n  linear teams                        List your teams \u2014 org:read.\n  linear issues [query]               Search issues by free text \u2014 issues:read.\n  linear issue <id>                   Fetch one issue by id or identifier (e.g. ENG-123) \u2014 issues:read.\n  linear projects                     List projects \u2014 projects:read.\n  linear comment <issueId> <text>     Add a comment \u2014 issues:write.\n  linear create <teamId> <title> [description]   Create an issue \u2014 issues:write.\n  linear query '<graphql>' [varsJSON] Run an arbitrary query or mutation (covered fields only).\n  linear raw '<json-body>'            POST a raw GraphQL JSON body verbatim (covered fields only).\n\nExamples:\n  linear whoami\n  linear issues \"login bug\"\n  linear query 'query{ teams{ nodes{ id name } } }'\n  linear query 'mutation($t:String!){ issueCreate(input:{teamId:\"...\",title:$t}){ success issue{ identifier } } }' '{\"t\":\"New bug\"}'\n\nResponses are JSON of the form {\"data\":{...}} or {\"errors\":[...]}. GraphQL can return HTTP 200 with an `errors` array; a missing/invalid token yields HTTP 401 with extensions.type=authentication_error. A request selecting a field outside your granted powers is refused at the network boundary (not a Linear error)."
   },
-  "graphqlEndpoint": "/graphql"
+  "graphqlEndpoint": "/graphql",
+  "webhook": {
+    "verificationScheme": "generic_hmac_sha256",
+    "ingress": {
+      "scheme": "linear_hmac_sha256",
+      "secretRef": "linear.webhook_secret"
+    },
+    "scope": {
+      "key": "teams",
+      "label": "Teams",
+      "path": "data.team.key"
+    },
+    "events": [
+      {
+        "key": "issue.create",
+        "label": "Issue created",
+        "description": "An issue was created.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "identifier": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "priority": {
+                  "type": "number"
+                },
+                "state": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "team": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "key": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "assignee": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "url": {
+              "type": "string",
+              "format": "uri"
+            },
+            "actor": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "key": "issue.update",
+        "label": "Issue updated",
+        "description": "An issue changed (state, assignee, title, ...).",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "identifier": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "priority": {
+                  "type": "number"
+                },
+                "state": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "team": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "key": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "assignee": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "updatedFrom": {
+              "type": "object",
+              "properties": {
+                "stateId": {
+                  "type": "string"
+                },
+                "assigneeId": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                }
+              }
+            },
+            "url": {
+              "type": "string",
+              "format": "uri"
+            },
+            "actor": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "key": "comment.create",
+        "label": "Comment created",
+        "description": "A comment was posted on an issue.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "body": {
+                  "type": "string"
+                },
+                "issue": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "identifier": {
+                      "type": "string"
+                    },
+                    "title": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "url": {
+              "type": "string",
+              "format": "uri"
+            },
+            "actor": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    ],
+    "aliases": [
+      {
+        "path": "data.identifier",
+        "alias": "issue.identifier"
+      },
+      {
+        "path": "data.title",
+        "alias": "issue.title"
+      },
+      {
+        "path": "data.team.key",
+        "alias": "team.key"
+      },
+      {
+        "path": "actor.name",
+        "alias": "actor.name"
+      }
+    ]
+  },
+  "actions": [
+    {
+      "id": "create_issue",
+      "label": "Create an issue",
+      "description": "Create a Linear issue in a team.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "teamId": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "teamId",
+          "title"
+        ]
+      },
+      "execute": {
+        "kind": "builtin",
+        "id": "linear.create_issue"
+      },
+      "output": {
+        "issueId": "id",
+        "identifier": "identifier",
+        "url": "url"
+      },
+      "idempotency": {
+        "kind": "client_id"
+      }
+    },
+    {
+      "id": "create_comment",
+      "label": "Comment on an issue",
+      "description": "Post a comment on a Linear issue.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "issueId": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "issueId",
+          "body"
+        ]
+      },
+      "execute": {
+        "kind": "graphql",
+        "document": "mutation EngramsCommentCreate($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }"
+      },
+      "output": {
+        "commentId": "data.commentCreate.comment.id"
+      },
+      "idempotency": {
+        "kind": "client_id"
+      }
+    }
+  ]
 }

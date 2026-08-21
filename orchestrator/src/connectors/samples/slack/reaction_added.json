@@ -1,0 +1,16 @@
+{
+  "type": "event_callback",
+  "team_id": "T0AAAAAAA",
+  "event_id": "Ev0CCCCCCCCC",
+  "event_time": 1755763320,
+  "event": {
+    "type": "reaction_added",
+    "reaction": "white_check_mark",
+    "user": "U0AAAAAAA",
+    "item": {
+      "type": "message",
+      "channel": "C0AAAAAAA",
+      "ts": "1755763260.000200"
+    }
+  }
+}

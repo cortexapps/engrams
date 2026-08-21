@@ -1,0 +1,29 @@
+{
+  "action": "create",
+  "type": "Issue",
+  "data": {
+    "id": "0f1e2d3c-aaaa-bbbb-cccc-908070605040",
+    "identifier": "ENG-123",
+    "title": "Empty payloads crash the parser",
+    "description": "Repro steps...",
+    "priority": 2,
+    "state": {
+      "name": "In Progress"
+    },
+    "team": {
+      "id": "6f0a1b2c-aaaa-bbbb-cccc-1d2e3f405060",
+      "key": "ENG",
+      "name": "Engineering"
+    },
+    "assignee": {
+      "id": "8a1b2c3d-aaaa-bbbb-cccc-405060708090",
+      "name": "Nikhil"
+    }
+  },
+  "url": "https://linear.app/acme/issue/ENG-123",
+  "webhookTimestamp": 1755763200000,
+  "actor": {
+    "id": "8a1b2c3d-aaaa-bbbb-cccc-405060708090",
+    "name": "Nikhil"
+  }
+}

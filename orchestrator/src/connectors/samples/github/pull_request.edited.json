@@ -1,0 +1,46 @@
+{
+  "action": "edited",
+  "number": 41,
+  "pull_request": {
+    "id": 2436817,
+    "number": 41,
+    "state": "open",
+    "draft": false,
+    "merged": false,
+    "title": "fix: handle empty payloads",
+    "body": "Fixes the empty-payload crash.",
+    "html_url": "https://github.com/acme/engrams/pull/41",
+    "user": {
+      "login": "octocat",
+      "id": 583231,
+      "type": "User"
+    },
+    "head": {
+      "ref": "fix/empty-payloads",
+      "sha": "6dcb09b5b57875f334f61aebed695e2e4193db5e"
+    },
+    "base": {
+      "ref": "main",
+      "sha": "9049f1265b7d61be4a8904a9a27120d2064dab3b"
+    },
+    "author_association": "MEMBER"
+  },
+  "repository": {
+    "id": 5580001,
+    "name": "engrams",
+    "full_name": "acme/engrams",
+    "private": true,
+    "html_url": "https://github.com/acme/engrams",
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "octocat",
+    "id": 583231,
+    "type": "User"
+  },
+  "changes": {
+    "title": {
+      "from": "fix: old title"
+    }
+  }
+}

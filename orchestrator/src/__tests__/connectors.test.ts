@@ -128,7 +128,7 @@ describe("parseConnector", () => {
         ...githubRaw,
         webhook: {
           verificationScheme: "github_hmac_sha256",
-          events: [{ key: "issues.opened", displayName: "Issue opened" }],
+          events: [{ key: "issues.opened", label: "Issue opened" }],
           aliases: [
             { path: "issue.title", alias: "issue.title" },
             { path: "sender.login", alias: "actor.login" },
@@ -139,7 +139,7 @@ describe("parseConnector", () => {
     );
     expect(c.webhook).toEqual({
       verificationScheme: "github_hmac_sha256",
-      events: [{ key: "issues.opened", displayName: "Issue opened" }],
+      events: [{ key: "issues.opened", label: "Issue opened" }],
       aliases: [
         { path: "issue.title", alias: "issue.title" },
         { path: "sender.login", alias: "actor.login" },
@@ -217,7 +217,7 @@ describe("parseConnector", () => {
           ...githubRaw,
           webhook: {
             verificationScheme: "github_hmac_sha256",
-            events: [{ key: `issue.${"x".repeat(200)}`, displayName: "Too long" }],
+            events: [{ key: `issue.${"x".repeat(200)}`, label: "Too long" }],
             aliases: [],
           },
         },

@@ -1,0 +1,34 @@
+{
+  "action": "closed",
+  "issue": {
+    "id": 1173491,
+    "number": 73,
+    "state": "closed",
+    "title": "Crash on empty payload",
+    "body": "Steps to reproduce...",
+    "user": {
+      "login": "octocat",
+      "id": 583231,
+      "type": "User"
+    },
+    "labels": [
+      {
+        "name": "bug"
+      }
+    ],
+    "author_association": "MEMBER"
+  },
+  "repository": {
+    "id": 5580001,
+    "name": "engrams",
+    "full_name": "acme/engrams",
+    "private": true,
+    "html_url": "https://github.com/acme/engrams",
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "octocat",
+    "id": 583231,
+    "type": "User"
+  }
+}

@@ -821,14 +821,18 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         ? (await loadRegistry(connectors)).get(registration.providerHint)?.webhook
         : undefined;
       const events = new Map(
-        (facet?.events ?? []).map((event) => [
-          event.key,
-          {
-            key: event.key,
-            displayName: event.displayName,
-            observed: observed.has(event.key),
-          },
-        ]),
+        (facet?.events ?? [])
+          // hidden events reach the ledger but never the trigger picker
+          // (installation.* lifecycle noise).
+          .filter((event) => event.hidden !== true)
+          .map((event) => [
+            event.key,
+            {
+              key: event.key,
+              displayName: event.label,
+              observed: observed.has(event.key),
+            },
+          ]),
       );
       for (const key of observed) {
         if (!events.has(key)) events.set(key, { key, displayName: key, observed: true });

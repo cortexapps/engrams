@@ -4,7 +4,7 @@
   "display": {
     "name": "Slack",
     "category": "Communication",
-    "blurb": "Post and manage messages, browse channels and history, react, pin, upload files, and read users — authenticated with a workspace bot token obtained via OAuth (\"Add to Slack\").",
+    "blurb": "Post and manage messages, browse channels and history, react, pin, upload files, and read users \u2014 authenticated with a workspace bot token obtained via OAuth (\"Add to Slack\").",
     "icon": {
       "mono": "SL",
       "color": "#611f69"
@@ -61,7 +61,98 @@
     "events": [
       {
         "key": "app_mention",
-        "displayName": "App mention"
+        "label": "App mention",
+        "description": "The app was @-mentioned in a channel.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "object",
+              "properties": {
+                "text": {
+                  "type": "string"
+                },
+                "user": {
+                  "type": "string"
+                },
+                "channel": {
+                  "type": "string"
+                },
+                "ts": {
+                  "type": "string"
+                },
+                "thread_ts": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "key": "message",
+        "label": "Message posted (incl. thread replies)",
+        "description": "A message was posted in a channel or thread the app can see.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "object",
+              "properties": {
+                "text": {
+                  "type": "string"
+                },
+                "user": {
+                  "type": "string"
+                },
+                "channel": {
+                  "type": "string"
+                },
+                "ts": {
+                  "type": "string"
+                },
+                "thread_ts": {
+                  "type": "string"
+                },
+                "channel_type": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "key": "reaction_added",
+        "label": "Reaction added",
+        "description": "An emoji reaction was added to a message.",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "object",
+              "properties": {
+                "reaction": {
+                  "type": "string"
+                },
+                "user": {
+                  "type": "string"
+                },
+                "item": {
+                  "type": "object",
+                  "properties": {
+                    "channel": {
+                      "type": "string"
+                    },
+                    "ts": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     ],
     "aliases": [
@@ -80,8 +171,29 @@
       {
         "path": "event.ts",
         "alias": "message.timestamp"
+      },
+      {
+        "path": "event.reaction",
+        "alias": "reaction.name"
+      },
+      {
+        "path": "event.item.channel",
+        "alias": "reaction.channel.id"
+      },
+      {
+        "path": "event.item.ts",
+        "alias": "reaction.message_timestamp"
       }
-    ]
+    ],
+    "ingress": {
+      "scheme": "slack_v0",
+      "secretRef": "slack.signing_secret"
+    },
+    "scope": {
+      "key": "channels",
+      "label": "Channels",
+      "path": "event.channel"
+    }
   },
   "hosts": [
     "slack.com"
@@ -402,7 +514,7 @@
       "SLACK_TOKEN": "x-engrams-managed"
     },
     "credentialDelivery": "inject",
-    "doc": "Use `slack` to interact with Slack from this session — post and manage messages, browse channels and history, react, pin, upload files, and read users. Authentication is automatic: the egress proxy injects the workspace bot token on requests to slack.com; `SLACK_TOKEN` is a managed placeholder. Do NOT set a real token or run any login. Slack always replies HTTP 200 with JSON `{\"ok\":true,…}` or `{\"ok\":false,\"error\":…}`.\n\n<channel> is a channel ID (e.g. C0123456789) or #name; the bot must be in the channel (or the app needs chat:write.public).\n\nMessaging (needs `chat:write`):\n  slack post <channel> <text...>        Post a message (chat.postMessage)\n  slack reply <channel> <thread-ts> <text...>  Reply in a thread (chat.postMessage with thread_ts)\n  slack dm <user-id> <text...>          DM a user by ID\nReading channels (needs `channels:read`):\n  slack channels [field=value ...]      List conversations (conversations.list)\n  slack history <channel> [field=value] List recent messages (conversations.history)\n  slack replies <channel> <ts>          List a thread (conversations.replies)\nManaging channels (needs `channels:manage`): create/invite/archive/rename/join — via `slack api conversations.<method> …`.\nUsers (needs `users:read`):\n  slack users [field=value ...]         List members (users.list)\nFiles: `slack upload <channel> <file> [title]` needs `files:write`; `slack api files.list` needs `files:read`.\nReactions (needs `reactions:write`):\n  slack react <channel> <ts> <emoji>    Add a reaction (reactions.add)\nPins (needs `pins:write`):\n  slack pin <channel> <ts>              Pin a message (pins.add)\nIdentity: `slack whoami` (auth.test). Other Web API methods: `slack api <method> field=value …` (e.g. `slack api conversations.create name=proj-x`). Bookmarks (`bookmarks:*`), usergroups (`usergroups:read`), modals/App Home (`views:write`), and team/emoji (`team:read`) are reachable via `slack api`. A method whose power your profile didn't grant is denied at the network boundary, not authenticated."
+    "doc": "Use `slack` to interact with Slack from this session \u2014 post and manage messages, browse channels and history, react, pin, upload files, and read users. Authentication is automatic: the egress proxy injects the workspace bot token on requests to slack.com; `SLACK_TOKEN` is a managed placeholder. Do NOT set a real token or run any login. Slack always replies HTTP 200 with JSON `{\"ok\":true,\u2026}` or `{\"ok\":false,\"error\":\u2026}`.\n\n<channel> is a channel ID (e.g. C0123456789) or #name; the bot must be in the channel (or the app needs chat:write.public).\n\nMessaging (needs `chat:write`):\n  slack post <channel> <text...>        Post a message (chat.postMessage)\n  slack reply <channel> <thread-ts> <text...>  Reply in a thread (chat.postMessage with thread_ts)\n  slack dm <user-id> <text...>          DM a user by ID\nReading channels (needs `channels:read`):\n  slack channels [field=value ...]      List conversations (conversations.list)\n  slack history <channel> [field=value] List recent messages (conversations.history)\n  slack replies <channel> <ts>          List a thread (conversations.replies)\nManaging channels (needs `channels:manage`): create/invite/archive/rename/join \u2014 via `slack api conversations.<method> \u2026`.\nUsers (needs `users:read`):\n  slack users [field=value ...]         List members (users.list)\nFiles: `slack upload <channel> <file> [title]` needs `files:write`; `slack api files.list` needs `files:read`.\nReactions (needs `reactions:write`):\n  slack react <channel> <ts> <emoji>    Add a reaction (reactions.add)\nPins (needs `pins:write`):\n  slack pin <channel> <ts>              Pin a message (pins.add)\nIdentity: `slack whoami` (auth.test). Other Web API methods: `slack api <method> field=value \u2026` (e.g. `slack api conversations.create name=proj-x`). Bookmarks (`bookmarks:*`), usergroups (`usergroups:read`), modals/App Home (`views:write`), and team/emoji (`team:read`) are reachable via `slack api`. A method whose power your profile didn't grant is denied at the network boundary, not authenticated."
   },
   "oauth": {
     "authorizeUrl": "https://slack.com/oauth/v2/authorize",
@@ -442,5 +554,72 @@
         "workspaceName": "team.name"
       }
     }
-  }
+  },
+  "actions": [
+    {
+      "id": "post_message",
+      "label": "Post a message",
+      "description": "Post a message to a channel or thread.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "channel": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "threadTs": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "channel",
+          "text"
+        ]
+      },
+      "execute": {
+        "kind": "builtin",
+        "id": "slack.post_message"
+      },
+      "output": {
+        "ts": "ts",
+        "channel": "channel"
+      },
+      "idempotency": {
+        "kind": "none"
+      }
+    },
+    {
+      "id": "update_message",
+      "label": "Update a message",
+      "description": "Edit a message the app posted.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "channel": {
+            "type": "string"
+          },
+          "ts": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "channel",
+          "ts",
+          "text"
+        ]
+      },
+      "execute": {
+        "kind": "builtin",
+        "id": "slack.update_message"
+      },
+      "idempotency": {
+        "kind": "natural"
+      }
+    }
+  ]
 }

@@ -1,0 +1,15 @@
+{
+  "type": "event_callback",
+  "team_id": "T0AAAAAAA",
+  "event_id": "Ev0BBBBBBBBB",
+  "event_time": 1755763260,
+  "event": {
+    "type": "message",
+    "channel_type": "channel",
+    "text": "sounds good, shipping it",
+    "user": "U0AAAAAAA",
+    "channel": "C0AAAAAAA",
+    "ts": "1755763260.000200",
+    "thread_ts": "1755763100.000100"
+  }
+}
