@@ -704,16 +704,30 @@ jobs:
           # keeping CI alive during a degraded GitHub REST API.
           bun-version-file: .bun-version
       - name: Bun version matches the shipped image
+        # Both inputs are repo-root paths and this job defaults to
+        # `orchestrator/`, so it has to say so explicitly.
+        working-directory: ${{ github.workspace }}
         run: |
           # The image pins Bun explicitly; `.bun-version` is what CI installs.
           # If they drift, the tests run on a different runtime than prod — the
           # exact gap that let a Bun 1.4.0 change to native `server.upgrade()`
           # break every WebSocket in the product with CI green.
-          want="$(tr -d '[:space:]' < .bun-version)"
-          got="$(grep -oE 'FROM oven/bun:[^ ]+' docker/orchestrator.Dockerfile \
-                 | sed -E 's|FROM oven/bun:||; s|-alpine$||' | sort -u)"
-          if [ "$(printf '%s' "$got" | wc -l)" -ne 0 ] || [ "$got" != "$want" ]; then
-            echo "::error::Bun drift — .bun-version is '$want', orchestrator.Dockerfile pins '$got'."
+          version_file=".bun-version"
+          dockerfile="docker/orchestrator.Dockerfile"
+          for f in "$version_file" "$dockerfile"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Bun pin guard cannot read $f from $(pwd)."
+              exit 1
+            fi
+          done
+          want="$(tr -d '[:space:]' < "$version_file")"
+          # `|| true` so a Dockerfile with no FROM line reports as drift below
+          # rather than tripping pipefail with an opaque failure.
+          got="$(grep -oE 'FROM oven/bun:[^ ]+' "$dockerfile" \
+                 | sed -E 's|FROM oven/bun:||; s|-alpine$||' | sort -u || true)"
+          # More than one distinct tag = the stages disagree with each other.
+          if [ -z "$got" ] || [ "$(printf '%s\n' "$got" | wc -l)" -ne 1 ] || [ "$got" != "$want" ]; then
+            echo "::error::Bun drift — $version_file is '$want', $dockerfile pins '$got'."
             echo "Pin both to the same exact version (a floating tag such as 'oven/bun:1' is what caused this)."
             exit 1
           fi
