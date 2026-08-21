@@ -136,7 +136,9 @@ HARNESS_PATHS = ["deploy/harness-claude/", "deploy/harness-codex/"]
 # `cli-tools` GHCR artifact (publish-cli-tools); CI consumers pull that
 # instead of recompiling — exactly how the FC-host bakes consume
 # publish-host-binaries.
-CLI_PATHS = ["cli/"]
+# `.bun-version` is the Bun runtime for every Bun lane — a bump must run them
+# all, or a runtime change ships untested (see ORCH_PATHS).
+CLI_PATHS = ["cli/", ".bun-version"]
 # ADR 0080: the in-guest agent, exec'd out of its reserved bundle slot by the
 # stage-1 init. A change to it (or its release closure) must republish
 # `bundle-agentd` via publish-bundles — the identical coupling (and failure
@@ -258,7 +260,13 @@ WEB_PATHS = ["web/", "orchestrator/packages/spec-document/"]
 # the Rust egress proxy and the orchestrator's endpoint validator. It lives with
 # the proxy, so a cargo-closure change already runs the Rust lanes — this entry
 # makes the same edit run the orchestrator lane, which imports it.
+# The Dockerfile and `.bun-version` ARE the orchestrator's runtime: the Bun
+# version it ships on. They were absent here, so a change to either skipped
+# this lane entirely — which is half of how prod came to run a Bun the tests
+# never saw (the other half was the Dockerfile floating on `oven/bun:1`).
 ORCH_PATHS = ["orchestrator/",
+              "docker/orchestrator.Dockerfile",
+              ".bun-version",
               "crates/engram-egress-proxy/policy/google-credential-denylist.json"]
 # A lockfile/manifest/toolchain bump recompiles the whole workspace.
 RUST_COMMON = ["Cargo.lock", "Cargo.toml", "rust-toolchain.toml"]
