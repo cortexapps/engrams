@@ -6,7 +6,7 @@ import type {
   ReviewRow,
   ReviewVerdictRow,
 } from "../../db/reviews.ts";
-import { runPolicyGate } from "../policy-gate.ts";
+import { buildDecision, runPolicyGate } from "../policy-gate.ts";
 
 const review: ReviewRow = {
   id: "review-1",
@@ -193,5 +193,37 @@ describe("runPolicyGate", () => {
       counts: { critical: 0, high: 0, medium: 0, low: 0, total: 0 },
       overflow: 0,
     });
+  });
+});
+
+describe("buildDecision", () => {
+  test("demotes a confirmed finding with no inline anchor to ui_only", () => {
+    const anchored = finding("anchored", { confidence: "high" });
+    const unanchored = finding("unanchored", {
+      confidence: "high",
+      startLine: null,
+      endLine: null,
+    });
+    const result = buildDecision(detail(
+      [anchored, unanchored],
+      [verdict(anchored.id, "confirmed", "high"), verdict(unanchored.id, "confirmed", "high")],
+    ));
+
+    expect(result.toPost.map((item) => item.finding.id)).toEqual(["anchored"]);
+    expect(result.uiOnly).toHaveLength(1);
+    expect(result.uiOnly[0]).toMatchObject({ finding: { id: "unanchored" }, state: "ui_only" });
+    // Everything else passes through the policy gate untouched.
+    expect(result.suppressed).toEqual([]);
+    expect(result.counts).toEqual(runPolicyGate(detail(
+      [anchored, unanchored],
+      [verdict(anchored.id, "confirmed", "high"), verdict(unanchored.id, "confirmed", "high")],
+    )).counts);
+  });
+
+  test("a start line alone is an anchor", () => {
+    const startOnly = finding("start-only", { confidence: "high", endLine: null });
+    const result = buildDecision(detail([startOnly], [verdict(startOnly.id, "confirmed", "high")]));
+    expect(result.toPost.map((item) => item.finding.id)).toEqual(["start-only"]);
+    expect(result.uiOnly).toEqual([]);
   });
 });

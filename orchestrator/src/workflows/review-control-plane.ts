@@ -20,7 +20,6 @@ import {
   type BeginReviewPassInput,
   type BeginReviewPassResult,
   type PriorReviewPass,
-  type ReviewDetail,
   type ReviewStore,
   type UpdateReviewPassContextInput,
 } from "../db/reviews.ts";
@@ -53,11 +52,7 @@ import {
   type ReviewStatusPhase,
 } from "../reviews/github-review.ts";
 import type { PrContext } from "../reviews/pr-context.ts";
-import {
-  runPolicyGate,
-  type FindingDecision,
-  type PolicyDecision,
-} from "../reviews/policy-gate.ts";
+import { buildDecision, type PolicyDecision } from "../reviews/policy-gate.ts";
 import {
   renderReviewer as defaultRenderReviewer,
   type RenderReviewerOptions,
@@ -276,26 +271,6 @@ export interface ReviewControlPlaneDeps {
 function postedSummary(count: number): string {
   if (count === 0) return "No findings";
   return `${count} finding${count === 1 ? "" : "s"} posted`;
-}
-
-/**
- * The v1 policy gate plus the anchor split: a confirmed finding with no inline
- * anchor is demoted to ui_only. Shared by the live post and the crash-recovery
- * marker path so both settle findings into the same terminal states.
- */
-function buildDecision(detail: ReviewDetail): PolicyDecision {
-  const policy = runPolicyGate(detail);
-  const missingAnchors: FindingDecision[] = [];
-  const anchored = policy.toPost.filter((item) => {
-    const hasAnchor = item.finding.endLine != null || item.finding.startLine != null;
-    if (!hasAnchor) missingAnchors.push({ ...item, state: "ui_only" });
-    return hasAnchor;
-  });
-  return {
-    ...policy,
-    toPost: anchored,
-    uiOnly: [...policy.uiOnly, ...missingAnchors],
-  };
 }
 
 export class ReviewSetupError extends Error {
