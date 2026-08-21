@@ -216,7 +216,7 @@ ping/pong liveness, the Firecracker RX-gate arm), and the two swarm-found
 livelocks recorded above. A6/A7 get their own ADR if they change the
 architecture beyond what is described here.
 
-## A6 design (2026-08-20, Proposed)
+## A6 design (2026-08-20; SHIPPED + prod-verified 2026-08-21)
 
 A6 stays inside this ADR: the prompt rides the existing free-form
 `SpawnHarnessRequest.env` map, so no wire shape changes (the
@@ -273,3 +273,35 @@ create-lane Deliver enqueue; the boot-tail sibling-deliver wake (ADR
 create-lane share of the attach-grace machinery (the deliver-races-attach
 window no longer exists on create). The `KNOWN_WAIT_RETRY` pre-Active
 arm stays for follow-up prompts sent during a boot.
+
+### A6 shipped + verified (2026-08-20 → 08-21)
+
+Commit chain: #1305 (Workstream E — the `run_started_exactly_once` DST
+oracle + the `AttachPlane` spawn-carried-prompt bucket + the
+`drop_spawn_prompt` stale-bundle fault; ships first, on the outbox-only
+path), #1306 (C2 orchestrator read batching), #1307 (C1 maturity wake for
+`RetryAfter` requeues), #1308 (C3 `step_guest_clock` off the spawn path),
+#1309 (the harness env consumers — `run_engine` seeds one synthetic
+`Prompt` from `ENGRAM_INITIAL_PROMPT*`, `seen_prompt_ids` dedups a
+redelivered row; claude/codex/noop parity; inert until the coordinator
+stamps), #1313 (the coordinator stamp — `boot_on_reserved_host` peeks the
+`create:{sid}` row via the new `outbox_get`, stamps the env ≤ 24 KiB,
+marks the row delivered after `start_agent` Ok; `PromptDelivery::RidesBoot`
+mints no Deliver op and defers the row one `ACK_TIMEOUT`; the ~1 MiB API
+cap). Rollout order held: the harness fleet rolled onto the #1309 bundles
+and converged BEFORE #1313 deployed.
+
+Prod verification (2026-08-20 ~23:00Z, create-shape session `dac7693d`):
+prompt received at 0.07 s, **no `harness_idle` at all** — the harness's
+first act IS the run, `run_started` = the attach (4.36 s on a cold-cache
+freshly-rolled host; steady-state create→`run_started` p50 ≈ 5 s on the
+demo image, dominated by boot). `engram_initial_prompt_env_stamped_total`
+increments, `…_fallback_total` stays flat except one deliberate oversize
+send. Follow-up prompts to the running session deliver in 0.15–0.2 s.
+`engram_session_op_rescan_claimed_total` holds at 0 (the C1 maturity wake
+covers the requeue lane).
+
+**Status → this workstream (A6) is Accepted.** The planned deletions
+above are the only A6 follow-up and stay gated on a 1–2 week soak with
+`engram_outbox_rescan_claimed_total` and the env-fallback counter at their
+floor; they do not block acceptance.
