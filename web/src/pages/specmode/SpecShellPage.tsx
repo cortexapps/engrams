@@ -38,7 +38,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   // the phase: a socket opened during ideation never document-syncs, and the
   // in-place flip to drafting left the canvas on its loading skeleton until a
   // manual reload. Reconnecting on the flip costs one presence blip.
-  const { connection, synced } = useSpecConnection(
+  const { connection, synced, link, retryLink } = useSpecConnection(
     specId,
     phase === "ideation" || phase === "drafting" || (phase === "published" && showDraft),
     phase,
@@ -182,11 +182,29 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
         readOnly={phase === "published"}
       />
     ) : (
-      <div className="spec-mode-loading" aria-label="Loading collaborative spec">
-        <Skeleton className="h-7 w-2/5" />
-        <Skeleton className="h-4 w-full" />
-        <Skeleton className="h-4 w-5/6" />
-      </div>
+      (() => {
+        const failure = specLinkMessage(link);
+        if (!failure) {
+          return (
+            <div className="spec-mode-loading" aria-label="Loading collaborative spec">
+              <Skeleton className="h-7 w-2/5" />
+              <Skeleton className="h-4 w-full" />
+              <Skeleton className="h-4 w-5/6" />
+            </div>
+          );
+        }
+        return (
+          <div className="spec-mode-link-error" role="alert">
+            <Text variant="heading">{failure.title}</Text>
+            <Text tone="muted">{failure.detail}</Text>
+            {link.kind === "unreachable" ? (
+              <Button type="button" variant="outline" size="sm" onClick={retryLink}>
+                Try again
+              </Button>
+            ) : null}
+          </div>
+        );
+      })()
     );
 
   if (isMobile) {
@@ -236,13 +254,36 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
   );
 }
 
+// How the document socket is doing. Without this the pane cannot tell
+// "still connecting" from "will never connect", and a dead socket renders as
+// loading skeletons forever — which is exactly what a prod IAP misroute did
+// to every spec.
+export type SpecLinkState =
+  | { kind: "connecting" }
+  | { kind: "live" }
+  // The server refused us by application close code (rejectUpgrade sends
+  // 4000+status), so retrying the same socket cannot help.
+  | { kind: "refused"; code: number }
+  // The handshake itself never completed: proxy, ingress, or offline.
+  | { kind: "unreachable"; stopped: boolean };
+
+// Show the failure once a couple of attempts have gone nowhere; a single
+// blip should stay invisible. Then stop, rather than retry forever behind a
+// pane that is telling the reader nothing.
+const LINK_VISIBLE_AFTER_FAILURES = 3;
+const LINK_STOP_AFTER_FAILURES = 10;
+
 function useSpecConnection(specId: string, enabled: boolean, phase: string | null) {
   const [connection, setConnection] = useState<SpecConnection | null>(null);
   const [synced, setSynced] = useState(false);
+  const [link, setLink] = useState<SpecLinkState>({ kind: "connecting" });
+  const reconnect = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     setConnection(null);
     setSynced(false);
+    setLink({ kind: "connecting" });
+    reconnect.current = null;
     if (!enabled) return;
 
     let disposed = false;
@@ -251,24 +292,99 @@ function useSpecConnection(specId: string, enabled: boolean, phase: string | nul
       if (disposed) return;
 
       const nextConnection = createSpecConnection(specId);
-      const onSync = (isSynced: boolean) => setSynced(isSynced);
-      nextConnection.provider.on("sync", onSync);
+      const provider = nextConnection.provider;
+      let failures = 0;
+
+      const onSync = (isSynced: boolean) => {
+        setSynced(isSynced);
+        if (isSynced) {
+          failures = 0;
+          setLink({ kind: "live" });
+        }
+      };
+      // A transport-level failure: the handshake never completed, so there is
+      // no close code to read. Count them and give up rather than spin.
+      const onFailure = () => {
+        failures += 1;
+        if (failures >= LINK_STOP_AFTER_FAILURES) {
+          provider.disconnect();
+          setLink({ kind: "unreachable", stopped: true });
+          return;
+        }
+        if (failures >= LINK_VISIBLE_AFTER_FAILURES) {
+          setLink({ kind: "unreachable", stopped: false });
+        }
+      };
+      // An application close code (4401/4403/4404) is a decision, not a
+      // blip — stop immediately and say so.
+      const onClosed = (event: { code: number; reason: string }) => {
+        if (event.code >= 4400 && event.code <= 4499) {
+          provider.disconnect();
+          setLink({ kind: "refused", code: event.code - 4000 });
+        }
+      };
+
+      provider.on("sync", onSync);
+      provider.on("connection-error", onFailure);
+      provider.on("connection-close", onFailure);
+      provider.on("closed", onClosed);
+      reconnect.current = () => {
+        failures = 0;
+        setLink({ kind: "connecting" });
+        provider.connect();
+      };
       setConnection(nextConnection);
-      if (nextConnection.provider.synced) setSynced(true);
+      if (provider.synced) {
+        setSynced(true);
+        setLink({ kind: "live" });
+      }
       disposeConnection = () => {
-        nextConnection.provider.off("sync", onSync);
-        nextConnection.provider.destroy();
+        provider.off("sync", onSync);
+        provider.off("connection-error", onFailure);
+        provider.off("connection-close", onFailure);
+        provider.off("closed", onClosed);
+        provider.destroy();
         nextConnection.doc.destroy();
       };
     });
 
     return () => {
       disposed = true;
+      reconnect.current = null;
       disposeConnection?.();
     };
   }, [enabled, phase, specId]);
 
-  return { connection, synced };
+  return { connection, synced, link, retryLink: () => reconnect.current?.() };
+}
+
+export function specLinkMessage(link: SpecLinkState): { title: string; detail: string } | null {
+  if (link.kind === "live" || link.kind === "connecting") return null;
+  if (link.kind === "refused") {
+    if (link.code === 401) {
+      return {
+        title: "Your session expired",
+        detail: "Reload the page to sign in again and reopen the document.",
+      };
+    }
+    if (link.code === 404) {
+      return {
+        title: "This spec is no longer in drafting",
+        detail:
+          "It was published or removed while you had it open. Reload to see its current state.",
+      };
+    }
+    return {
+      title: "You do not have access to this document",
+      detail: "Ask the spec owner to add you, then reload the page.",
+    };
+  }
+  return {
+    title: "Cannot reach the document",
+    detail: link.stopped
+      ? "The connection kept failing, so it stopped trying. The conversation still works."
+      : "Reconnecting. The conversation still works while the document is offline.",
+  };
 }
 
 function startDraftingError(error: Error | null): string | null {

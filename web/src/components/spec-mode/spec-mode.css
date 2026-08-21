@@ -903,6 +903,16 @@
   gap: 8px;
 }
 
+/* Shown in place of the document when its socket cannot connect. The reader
+   needs to know the pane is dead rather than slow, and that the conversation
+   beside it still works. */
+.spec-mode-link-error {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  max-width: 46ch;
+}
+
 .spec-mode-proposal[data-proposal-treatment="gutter"] {
   margin-left: -18px;
   border-left: 3px solid var(--ring);
