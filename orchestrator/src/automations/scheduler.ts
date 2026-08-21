@@ -5,6 +5,7 @@ import { Cron } from "croner";
 import { hostname } from "node:os";
 
 import { makeAutomationStore, type AutomationCronStore, type DueCronAutomation } from "../db/automations.ts";
+import { makeIntegrationEventStore } from "../db/integration-events.ts";
 import { log as rootLog } from "../log.ts";
 import { automationRunWorkflow, type AutomationRunWorkflowInput } from "../workflows/automation-run.ts";
 import { automationRunId, cronDeliveryKey } from "./dispatch.ts";
@@ -186,6 +187,72 @@ export class AutomationScheduler {
     }
     await this.#tick;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Integration-event ledger sweep (ADR 0119 D5)
+// ---------------------------------------------------------------------------
+
+export const INTEGRATION_EVENT_SWEEP_INTERVAL_MS = 3600_000;
+
+export interface IntegrationEventSweeperDeps {
+  sweep(now: Date): Promise<number>;
+  now: () => Date;
+  onError?: (error: unknown) => void;
+  setInterval?: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
+  clearInterval?: (timer: ReturnType<typeof setInterval>) => void;
+}
+
+/** Hourly 7-day-retention sweep over integration_event. A plain timer with
+ * the spawn/run_once split — idempotent deletes, so no lease: concurrent pods
+ * racing the same sweep both succeed. */
+export class IntegrationEventSweeper {
+  readonly #deps: IntegrationEventSweeperDeps;
+  #timer: ReturnType<typeof setInterval> | null = null;
+  #run: Promise<number> | null = null;
+
+  constructor(deps: IntegrationEventSweeperDeps) {
+    this.#deps = deps;
+  }
+
+  runOnce(): Promise<number> {
+    this.#run ??= this.#deps
+      .sweep(this.#deps.now())
+      .catch((error) => {
+        this.#deps.onError?.(error);
+        return 0;
+      })
+      .finally(() => {
+        this.#run = null;
+      });
+    return this.#run;
+  }
+
+  async start(): Promise<void> {
+    if (this.#timer !== null) return;
+    await this.runOnce();
+    const schedule = this.#deps.setInterval ?? setInterval;
+    this.#timer = schedule(() => void this.runOnce(), INTEGRATION_EVENT_SWEEP_INTERVAL_MS);
+  }
+
+  async stop(): Promise<void> {
+    if (this.#timer !== null) {
+      const cancel = this.#deps.clearInterval ?? clearInterval;
+      cancel(this.#timer);
+      this.#timer = null;
+    }
+    await this.#run;
+  }
+}
+
+export function makeProductionIntegrationEventSweeper(): IntegrationEventSweeper {
+  return new IntegrationEventSweeper({
+    sweep: (now) => makeIntegrationEventStore().sweepExpired(now),
+    now: () => new Date(),
+    onError(error) {
+      log.error({ error }, "integration event sweep failed");
+    },
+  });
 }
 
 export function makeProductionAutomationScheduler(): AutomationScheduler {
