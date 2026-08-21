@@ -60,8 +60,20 @@ function fakeRelayToPort(targetPort: number): PortRelayClient {
   };
 }
 
-const authedOwner = async () => ({ user: { id: "owner" } });
-const ownedBy = (owner: string) => async () => owner;
+// The real guard reads Postgres, which costs a full event-loop turn. A fake
+// that resolves on a microtask does NOT, and that gap hid a total prod outage:
+// Bun's builtin `ws` completes a handshake through native `server.upgrade()`,
+// which is only valid inside the request's own turn, so awaiting the guard
+// before `handleUpgrade` threw and every IDE socket 502'd. Yield for real.
+const ioTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+const authedOwner = async () => {
+  await ioTurn();
+  return { user: { id: "owner" } };
+};
+const ownedBy = (owner: string) => async () => {
+  await ioTurn();
+  return owner;
+};
 
 describe("parseIdePath", () => {
   test("strips the route prefix and preserves path + query exactly", () => {

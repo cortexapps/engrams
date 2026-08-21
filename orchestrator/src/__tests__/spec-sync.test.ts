@@ -61,6 +61,9 @@ function fakeAwarenessBus(): SpecAwarenessBus {
   };
 }
 
+/** One real event-loop turn, as any Postgres round-trip costs. */
+const ioTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 async function listenForSpecSync(input: {
   member: boolean;
   authenticated?: boolean;
@@ -82,15 +85,27 @@ async function listenForSpecSync(input: {
     documents: input.documents ?? fakeDocuments(),
     participants,
     awarenessBus: input.awarenessBus ?? fakeAwarenessBus(),
-    getSession: async () =>
-      input.authenticated === false
+    getSession: async () => {
+      // The real guard reads the session from Postgres, which yields a full
+      // event-loop turn. An `async` fake that resolves on a microtask does
+      // NOT, and that difference hid a total prod outage: Bun's builtin `ws`
+      // delegates the handshake to native `server.upgrade()`, which is only
+      // valid inside the request's own turn. Yield for real so these tests
+      // exercise the same window the DB does.
+      await ioTurn();
+      return input.authenticated === false
         ? null
-        : { user: { id: "member-not-owner", name: "Taylor Member" } },
+        : { user: { id: "member-not-owner", name: "Taylor Member" } };
+    },
     resolveMembership: async () => {
+      await ioTurn();
       if (input.membershipError) throw input.membershipError;
       return input.member;
     },
-    resolveDraft: async () => input.draft ?? true,
+    resolveDraft: async () => {
+      await ioTurn();
+      return input.draft ?? true;
+    },
     onWarning: input.onWarning,
   };
   const hub = new SpecSyncHub(deps);
