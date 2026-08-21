@@ -42,6 +42,7 @@ import { runExec } from "../exec/durable-exec.ts";
 import { AUTOMATION_TOPIC, type AutomationInbox } from "../automations/engine/inbox.ts";
 import { interpretAutomation, type EngineRunResult } from "../automations/engine/interpreter.ts";
 import type { EngineDeps, EngineSessionOps } from "../automations/engine/deps.ts";
+import { makeCodeBlockRuntime } from "../automations/code/runtime.ts";
 
 export interface AutomationRunWorkflowInput {
   runId: string;
@@ -253,6 +254,7 @@ function productionEngineDeps(): EngineDeps {
     store,
     sessions: makeProductionSessionOps({ store }),
     clock: { nowMs: () => Date.now() },
+    code: makeCodeBlockRuntime(),
     async startQueuedRun(runId) {
       const run = await store.getRun(runId);
       if (!run) return;
