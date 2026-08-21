@@ -2,27 +2,66 @@ syntax = "proto3";
 
 package engram.app.v1;
 
-// Admin-authored cron/webhook triggers and their create-task action (ADR 0102).
-// ORCHESTRATOR-NATIVE: like task.proto/profile.proto, this service is not
-// compiled into the coordinator's Rust surface.
+// Automations v2 (ADR 0119): trigger + ordered block graph + inputs, run on
+// one durable interpreter workflow. ORCHESTRATOR-NATIVE: like task.proto /
+// profile.proto, this service is not compiled into the coordinator's Rust
+// surface.
+//
+// Definitions ride the wire as JSON strings (`definition_json`,
+// `inputs_schema_json`, `inputs_json`, `block_overrides_json`); the
+// orchestrator is the validation authority and answers with structured,
+// block-addressed BlockError values rather than prose.
 service AutomationService {
-  rpc CreateAutomation(CreateAutomationRequest) returns (CreateAutomationResponse);
-  rpc UpdateAutomation(UpdateAutomationRequest) returns (UpdateAutomationResponse);
-  rpc ArchiveAutomation(ArchiveAutomationRequest) returns (ArchiveAutomationResponse);
-  rpc GetAutomation(GetAutomationRequest) returns (GetAutomationResponse);
   rpc ListAutomations(ListAutomationsRequest) returns (ListAutomationsResponse);
+  // By id, or by builtin_key for the shipped automations.
+  rpc GetAutomation(GetAutomationRequest) returns (GetAutomationResponse);
+  // definition_json → version 1.
+  rpc CreateAutomation(CreateAutomationRequest) returns (CreateAutomationResponse);
+  // Save = a new immutable version; in-flight runs finish on theirs.
+  // PermissionDenied on a built-in (structure is locked — use
+  // SetBlockOverrides / SetInputs).
+  rpc SaveVersion(SaveVersionRequest) returns (SaveVersionResponse);
+  rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
   rpc SetAutomationEnabled(SetAutomationEnabledRequest) returns (SetAutomationEnabledResponse);
-  rpc ListAutomationRuns(ListAutomationRunsRequest) returns (ListAutomationRunsResponse);
+  // Name / description / run settings. Settings are PermissionDenied on a
+  // built-in.
+  rpc UpdateAutomationMeta(UpdateAutomationMetaRequest) returns (UpdateAutomationMetaResponse);
+  // Per-automation input values (allowed on built-ins).
+  rpc SetInputs(SetInputsRequest) returns (SetInputsResponse);
+  // Per-automation tunable block fields (allowed on built-ins). Every key
+  // must be a `tunable` field of that block in the current version, and the
+  // merged config must re-validate against the block's schema.
+  rpc SetBlockOverrides(SetBlockOverridesRequest) returns (SetBlockOverridesResponse);
+  // A fully editable user copy (built-ins included); overrides are folded in.
+  rpc DuplicateAutomation(DuplicateAutomationRequest) returns (DuplicateAutomationResponse);
+  rpc ArchiveAutomation(ArchiveAutomationRequest) returns (ArchiveAutomationResponse);
+  // Render every block against a sample without side effects: per-block
+  // rendered config, filter verdicts, and the scope visible at that block.
   rpc TestRender(TestRenderRequest) returns (TestRenderResponse);
-  // Evaluate a code-block source in the QuickJS sandbox against a sample
-  // input (ADR 0119 D6). Same limits as a real run; powers the editor's
-  // Run button.
+  // A real run whose integration actions are stubbed (they record what they
+  // would have done). Appears in the run list flagged dry_run.
+  rpc DryRun(DryRunRequest) returns (DryRunResponse);
+  // Evaluate a code-block source in the QuickJS sandbox (ADR 0119 D6).
   rpc EvalCode(EvalCodeRequest) returns (EvalCodeResponse);
-  rpc ListWebhookSamples(ListWebhookSamplesRequest) returns (ListWebhookSamplesResponse);
-  // ADR 0119 D5: the connector-declared event and action catalogs that back
-  // integration triggers and integration_action blocks.
+  // Manual trigger: start a run now with an optional input override.
+  rpc RunNow(RunNowRequest) returns (RunNowResponse);
+  // Stored deliveries for the automation's trigger source (integration ledger
+  // or custom-webhook samples).
+  rpc ListEventSamples(ListEventSamplesRequest) returns (ListEventSamplesResponse);
+  // Picker values for a map input keyed by an integration noun.
+  rpc ListInputKeyOptions(ListInputKeyOptionsRequest) returns (ListInputKeyOptionsResponse);
+  // ADR 0119 D5: the connector-declared event and action catalogs.
   rpc ListEventCatalog(ListEventCatalogRequest) returns (ListEventCatalogResponse);
   rpc ListActionCatalog(ListActionCatalogRequest) returns (ListActionCatalogResponse);
+}
+
+service AutomationRunService {
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+  rpc GetRun(GetRunRequest) returns (GetRunResponse);
+  rpc StopRun(StopRunRequest) returns (StopRunResponse);
+  // A fresh run with the same trigger payload. `from_step_id` is recorded
+  // but v1 always re-runs from the start.
+  rpc RetryRun(RetryRunRequest) returns (RetryRunResponse);
 }
 
 service WebhookRegistrationService {
@@ -34,126 +73,134 @@ service WebhookRegistrationService {
   rpc ListWebhookEvents(ListWebhookEventsRequest) returns (ListWebhookEventsResponse);
 }
 
+// ---------------------------------------------------------------------------
+// Core shapes
+// ---------------------------------------------------------------------------
+
 message Automation {
   string id = 1;
   string name = 2;
   string description = 3;
-  bool enabled = 4;
-  AutomationTrigger trigger = 5;
-  AutomationAction action = 6;
-  optional string created_by_user_id = 7;
-  optional string next_fire_at = 8;
-  optional string last_fired_at = 9;
+  // "user" | "builtin"
+  string kind = 4;
+  optional string builtin_key = 5;
+  bool enabled = 6;
+  int32 current_version = 7;
+  // Per-automation input values.
+  string inputs_json = 8;
+  // Per-automation tunable block overrides: {[blockId]: {[field]: value}}.
+  string block_overrides_json = 9;
   bool archived = 10;
-  string created_at = 11;
-  string updated_at = 12;
+  optional string created_by_user_id = 11;
+  optional string next_fire_at = 12;
+  optional string last_fired_at = 13;
+  string created_at = 14;
+  string updated_at = 15;
+  // The current version's definition, for the editor.
+  AutomationVersion version = 16;
 }
 
-message AutomationTrigger {
-  oneof trigger {
-    CronAutomationTrigger cron = 1;
-    WebhookAutomationTrigger webhook = 2;
-    IntegrationAutomationTrigger integration = 3;
-  }
+message AutomationVersion {
+  string automation_id = 1;
+  int32 number = 2;
+  // AutomationDefinition JSON: {engine, trigger, blocks, inputsSchema, settings}.
+  string definition_json = 3;
+  optional string created_by_user_id = 4;
+  string created_at = 5;
 }
 
-// ADR 0119 D5: subscribe to a connector's verified event stream. Verification
-// lives with the integration; no user-managed secret exists on this path.
-message IntegrationAutomationTrigger {
-  string provider = 1;
-  string connection_id = 2;
-  repeated string event_keys = 3;
-  // Scope narrowing by the provider noun (repository / channel / team):
-  // literal values, or the key of an automation input whose keys/elements
-  // supply them. At most one is set.
-  repeated string scope_values = 4;
-  optional string scope_from_input = 5;
-}
-
-message CronAutomationTrigger {
-  string schedule = 1;
-  string timezone = 2;
-}
-
-message WebhookAutomationTrigger {
-  string registration_id = 1;
-  repeated string events = 2;
-  // Optional declarative event filter. Phase 4 evaluates the validated shape.
-  optional string filter_json = 3;
-}
-
-message AutomationAction {
-  oneof action {
-    CreateTaskAutomationAction create_task = 1;
-  }
-}
-
-message CreateTaskAutomationAction {
-  string profile_id = 1;
-  string prompt_template = 2;
-  optional string title_template = 3;
-  bool include_event_context = 4;
-  // ADR 0107: session mode for the created session's initial prompt (e.g.
-  // "plan"). An ownerless (automation) plan auto-approves — the plan lands
-  // in the transcript as a reviewable record before the build runs.
-  optional string harness_mode = 5;
-  // ADR 0063 B2: the automation's override of the profile's default harness /
-  // model / effort, the same seam the interactive composer uses. Unset = inherit
-  // the profile default. `model`/`effort` are option ids on the EFFECTIVE
-  // harness's descriptor (this override, else the profile's harness).
-  optional string harness = 6;
-  optional string model = 7;
-  optional string effort = 8;
-  optional string model_router = 9;
-}
-
-message CreateAutomationRequest {
-  string name = 1;
-  string description = 2;
-  bool enabled = 3;
-  AutomationTrigger trigger = 4;
-  AutomationAction action = 5;
-}
-
-message CreateAutomationResponse {
-  Automation automation = 1;
-}
-
-message UpdateAutomationRequest {
+message AutomationRunBrief {
   string id = 1;
-  string name = 2;
-  string description = 3;
-  bool enabled = 4;
-  AutomationTrigger trigger = 5;
-  AutomationAction action = 6;
+  string automation_id = 2;
+  int32 version = 3;
+  string status = 4;
+  optional string error = 5;
+  // "cron" | "webhook" | "integration" | "manual"
+  string trigger_source = 6;
+  optional string event_key = 7;
+  optional string delivery_key = 8;
+  bool dry_run = 9;
+  optional string started_at = 10;
+  optional string ended_at = 11;
+  string created_at = 12;
 }
 
-message UpdateAutomationResponse {
+message DayRunCount {
+  // YYYY-MM-DD (UTC)
+  string day = 1;
+  int32 completed = 2;
+  int32 failed = 3;
+  int32 filtered = 4;
+  int32 other = 5;
+}
+
+message AutomationSummary {
   Automation automation = 1;
+  // Server-rendered, e.g. "GitHub · PR opened, synchronize · 4 repos".
+  string trigger_summary = 2;
+  optional AutomationRunBrief last_run = 3;
+  repeated DayRunCount runs_7d = 4;
 }
 
-message ArchiveAutomationRequest {
-  string id = 1;
+// A validation error addressed to the block and field the editor must show.
+// block_id is "" for definition-level errors (trigger, settings).
+message BlockError {
+  string block_id = 1;
+  string field = 2;
+  string code = 3;
+  string message = 4;
 }
 
-message ArchiveAutomationResponse {
-  Automation automation = 1;
-}
-
-message GetAutomationRequest {
-  string id = 1;
-}
-
-message GetAutomationResponse {
-  Automation automation = 1;
-}
+// ---------------------------------------------------------------------------
+// AutomationService requests/responses
+// ---------------------------------------------------------------------------
 
 message ListAutomationsRequest {
   bool include_archived = 1;
 }
 
 message ListAutomationsResponse {
-  repeated Automation automations = 1;
+  repeated AutomationSummary automations = 1;
+}
+
+message GetAutomationRequest {
+  oneof lookup {
+    string id = 1;
+    string builtin_key = 2;
+  }
+}
+
+message GetAutomationResponse {
+  Automation automation = 1;
+}
+
+message CreateAutomationRequest {
+  string name = 1;
+  string description = 2;
+  bool enabled = 3;
+  string definition_json = 4;
+  string inputs_json = 5;
+}
+
+message CreateAutomationResponse {
+  Automation automation = 1;
+}
+
+message SaveVersionRequest {
+  string automation_id = 1;
+  string definition_json = 2;
+}
+
+message SaveVersionResponse {
+  Automation automation = 1;
+}
+
+message ListVersionsRequest {
+  string automation_id = 1;
+}
+
+message ListVersionsResponse {
+  repeated AutomationVersion versions = 1;
 }
 
 message SetAutomationEnabledRequest {
@@ -165,60 +212,93 @@ message SetAutomationEnabledResponse {
   Automation automation = 1;
 }
 
-message AutomationRun {
+message UpdateAutomationMetaRequest {
   string id = 1;
-  string automation_id = 2;
-  string trigger_json = 3;
-  optional string rendered_prompt = 4;
-  optional string rendered_title = 5;
-  optional string task_id = 6;
-  optional string session_id = 7;
-  string status = 8;
-  optional string error = 9;
-  optional string scheduled_for = 10;
-  string created_at = 11;
+  optional string name = 2;
+  optional string description = 3;
+  // AutomationSettings JSON; saves a new version carrying the settings.
+  optional string settings_json = 4;
 }
 
-message ListAutomationRunsRequest {
+message UpdateAutomationMetaResponse {
+  Automation automation = 1;
+}
+
+message SetInputsRequest {
   string automation_id = 1;
-  // Most-recent first; 0 uses the server default, capped server-side.
-  int32 limit = 2;
+  string inputs_json = 2;
 }
 
-message ListAutomationRunsResponse {
-  repeated AutomationRun runs = 1;
+message SetInputsResponse {
+  Automation automation = 1;
 }
 
-message TemplateError {
-  // "prompt_template" | "title_template" | "sample"
-  string field = 1;
-  // "invalid_template" | "render_failed" | "output_too_long" | "invalid_sample"
-  string code = 2;
-  string message = 3;
+message SetBlockOverridesRequest {
+  string automation_id = 1;
+  string overrides_json = 2;
+}
+
+message SetBlockOverridesResponse {
+  Automation automation = 1;
+}
+
+message DuplicateAutomationRequest {
+  string automation_id = 1;
+  optional string name = 2;
+}
+
+message DuplicateAutomationResponse {
+  Automation automation = 1;
+}
+
+message ArchiveAutomationRequest {
+  string id = 1;
+}
+
+message ArchiveAutomationResponse {
+  Automation automation = 1;
 }
 
 message TestRenderRequest {
-  // When set, the stored automation supplies name/action unless draft_action or
-  // automation_name override them.
-  optional string automation_id = 1;
-  optional string automation_name = 2;
-  AutomationAction draft_action = 3;
-  // A stored sample id, or payload_json. If neither is set for a webhook
-  // trigger, registration_id + event_key select the newest stored sample.
+  string automation_id = 1;
+  // Unsaved editor state; falls back to the stored current version.
+  optional string draft_definition_json = 2;
+  // Draft input values; falls back to the stored values.
+  optional string inputs_json = 3;
   oneof sample {
     string sample_id = 4;
     string payload_json = 5;
   }
-  string registration_id = 6;
-  string event_key = 7;
-  // Cron previews carry no event payload.
-  optional string scheduled_for = 8;
+  // Cron/manual previews carry no payload; this names the occurrence.
+  optional string scheduled_for = 6;
+}
+
+message BlockRender {
+  string block_id = 1;
+  string block_type = 2;
+  // The block config with every Liquid template resolved.
+  string rendered_json = 3;
+  // Filter blocks: whether the sample passes.
+  optional bool filter_pass = 4;
+  // The variables visible AT this block (trigger/event/inputs/steps so far).
+  string scope_json = 5;
 }
 
 message TestRenderResponse {
-  optional string rendered_prompt = 1;
-  optional string rendered_title = 2;
-  repeated TemplateError errors = 3;
+  repeated BlockRender blocks = 1;
+  repeated BlockError errors = 2;
+}
+
+message DryRunRequest {
+  string automation_id = 1;
+  oneof sample {
+    string sample_id = 2;
+    string payload_json = 3;
+  }
+}
+
+message DryRunResponse {
+  string run_id = 1;
 }
 
 message EvalCodeRequest {
@@ -239,24 +319,125 @@ message EvalCodeResponse {
   int64 duration_ms = 6;
 }
 
-message WebhookSample {
-  string id = 1;
-  string registration_id = 2;
-  string event_key = 3;
-  string payload_json = 4;
-  string received_at = 5;
+message RunNowRequest {
+  string automation_id = 1;
+  // Optional one-off input override (merged over the stored values).
+  optional string inputs_json = 2;
+  // Optional event payload for integration/webhook-shaped automations.
+  optional string payload_json = 3;
 }
 
-message ListWebhookSamplesRequest {
-  string registration_id = 1;
+message RunNowResponse {
+  string run_id = 1;
+}
+
+message EventSample {
+  string id = 1;
+  string event_key = 2;
+  string payload_json = 3;
+  string received_at = 4;
+}
+
+message ListEventSamplesRequest {
+  string automation_id = 1;
   optional string event_key = 2;
-  // Most-recent first; 0 uses the server default, capped server-side.
   int32 limit = 3;
 }
 
-message ListWebhookSamplesResponse {
-  repeated WebhookSample samples = 1;
+message ListEventSamplesResponse {
+  repeated EventSample samples = 1;
 }
+
+message ListInputKeyOptionsRequest {
+  // "repository" | "channel" | "team"
+  string noun = 1;
+  optional string connection_id = 2;
+}
+
+message InputKeyOption {
+  string key = 1;
+  string label = 2;
+}
+
+message ListInputKeyOptionsResponse {
+  repeated InputKeyOption options = 1;
+}
+
+// ---------------------------------------------------------------------------
+// AutomationRunService
+// ---------------------------------------------------------------------------
+
+message ListRunsRequest {
+  string automation_id = 1;
+  // Most-recent first; 0 uses the server default, capped server-side.
+  int32 limit = 2;
+  // Include filtered runs individually instead of collapsing them.
+  bool include_filtered = 3;
+}
+
+// Consecutive filtered runs collapsed between real runs.
+message FilteredWindow {
+  int32 count = 1;
+  string first_at = 2;
+  string last_at = 3;
+  // The id of the run this window precedes (newest first), or "" at the end.
+  string before_run_id = 4;
+}
+
+message ListRunsResponse {
+  repeated AutomationRunBrief runs = 1;
+  repeated FilteredWindow filtered = 2;
+}
+
+message AutomationStepRun {
+  // The frame path (loop iterations suffixed blockId[i]).
+  string block_id = 1;
+  int32 attempt = 2;
+  string status = 3;
+  string inputs_json = 4;
+  string outputs_json = 5;
+  optional string error = 6;
+  optional string session_id = 7;
+  string started_at = 8;
+  optional string ended_at = 9;
+}
+
+message AutomationRun {
+  AutomationRunBrief brief = 1;
+  string trigger_json = 2;
+  repeated AutomationStepRun steps = 3;
+  repeated string session_ids = 4;
+}
+
+message GetRunRequest {
+  string run_id = 1;
+}
+
+message GetRunResponse {
+  AutomationRun run = 1;
+}
+
+message StopRunRequest {
+  string run_id = 1;
+  optional string reason = 2;
+}
+
+message StopRunResponse {
+  bool sent = 1;
+}
+
+message RetryRunRequest {
+  string run_id = 1;
+  optional string from_step_id = 2;
+}
+
+message RetryRunResponse {
+  string run_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Webhook registrations (custom generic hooks)
+// ---------------------------------------------------------------------------
 
 message WebhookRegistration {
   string id = 1;
@@ -318,6 +499,10 @@ message ListWebhookEventsResponse {
   repeated WebhookEvent events = 1;
   repeated WebhookVariable variables = 2;
 }
+
+// ---------------------------------------------------------------------------
+// Catalogs (ADR 0119 D5)
+// ---------------------------------------------------------------------------
 
 message ListEventCatalogRequest {
   string provider = 1;
