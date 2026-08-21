@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNull, lte, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, isNull, lte, ne, sql } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
 import {
@@ -12,7 +12,6 @@ import {
   taskSession as taskSessionTable,
   webhookRegistration as webhookRegistrationTable,
   webhookSample as webhookSampleTable,
-  type AutomationAction,
   type AutomationRunTrigger,
   type AutomationSettings,
   type AutomationTrigger,
@@ -22,10 +21,11 @@ import {
 } from "./schema.ts";
 import { makeWebhookAliasResolver } from "../automations/aliases.ts";
 import {
-  definitionFromLegacyAction,
-  legacyActionFromDefinition,
-} from "../automations/legacy-compat.ts";
-import { ENGINE_VERSION, type AutomationDefinition } from "../automations/engine/definition.ts";
+  applyBlockOverrides,
+  ENGINE_VERSION,
+  type AutomationDefinition,
+  type BlockOverrides,
+} from "../automations/engine/definition.ts";
 import type { EngineRunStore, EngineStepRecord } from "../automations/engine/deps.ts";
 import type { RunSnapshot } from "../automations/engine/context.ts";
 import { RUN_TERMINAL_STATUSES } from "../automations/engine/interpreter.ts";
@@ -46,6 +46,7 @@ export interface AutomationMetaRow {
   builtinKey: string | null;
   currentVersion: number;
   inputs: Record<string, unknown>;
+  blockOverrides: BlockOverrides;
   endSessionsOnFinish: boolean;
   createdByUserId: string | null;
   nextFireAt: Date | null;
@@ -55,11 +56,9 @@ export interface AutomationMetaRow {
   archivedAt: Date | null;
 }
 
-/** The legacy proto view (phase-3 removal): metadata + the reconstructed
- * trigger/action of a single-create_session-block definition. */
+/** Metadata plus the current version — the v2 read view. */
 export interface AutomationRow extends AutomationMetaRow {
-  trigger: AutomationTrigger;
-  action: AutomationAction;
+  version: AutomationVersionRow;
 }
 
 export interface AutomationVersionRow {
@@ -80,13 +79,43 @@ export interface DispatchTarget {
   definition: AutomationDefinition;
 }
 
-export interface AutomationInput {
+export interface CreateAutomationInput {
   name: string;
   description: string;
   enabled: boolean;
-  trigger: AutomationTrigger;
-  action: AutomationAction;
+  definition: AutomationDefinition;
   nextFireAt: Date | null;
+  kind?: "user" | "builtin";
+  builtinKey?: string | null;
+  inputs?: Record<string, unknown>;
+}
+
+export interface AutomationMetaPatch {
+  name?: string;
+  description?: string;
+  nextFireAt?: Date | null;
+  endSessionsOnFinish?: boolean;
+}
+
+export interface AutomationStepRunRow {
+  runId: string;
+  blockId: string;
+  attempt: number;
+  status: string;
+  inputs: Record<string, unknown> | null;
+  outputs: Record<string, unknown> | null;
+  error: string | null;
+  startedAt: Date;
+  endedAt: Date | null;
+}
+
+/** One calendar-day bucket of a 7-day run history. */
+export interface DayRunCount {
+  day: string;
+  completed: number;
+  failed: number;
+  filtered: number;
+  other: number;
 }
 
 export interface AutomationRunRow {
@@ -107,6 +136,7 @@ export interface AutomationRunRow {
   leaseExpiresAt: Date | null;
   startedAt: Date | null;
   endedAt: Date | null;
+  dryRun: boolean;
   createdAt: Date;
 }
 
@@ -138,26 +168,46 @@ export interface AutomationStore {
   list(opts: { includeArchived: boolean }): Promise<AutomationRow[]>;
   get(id: string): Promise<AutomationRow | null>;
   getActive(id: string): Promise<AutomationRow | null>;
+  getByBuiltinKey(key: string): Promise<AutomationRow | null>;
   /** Non-archived automations whose CURRENT version references the
    * registration, INCLUDING disabled ones — the deletion guard's view. */
   listBoundToWebhookRegistration(registrationId: string): Promise<AutomationMetaRow[]>;
   /** Enabled, non-archived automations whose current version references the
-   * registration — the dispatch view (covers non-legacy graphs). */
+   * registration — the dispatch view. */
   listEnabledForWebhookRegistration(registrationId: string): Promise<DispatchTarget[]>;
   listEnabledForIntegrationTrigger(
     provider: string,
     connectionId: string,
   ): Promise<DispatchTarget[]>;
-  create(input: AutomationInput, createdByUserId: string): Promise<AutomationRow>;
-  update(id: string, input: AutomationInput): Promise<AutomationRow | null>;
+  create(input: CreateAutomationInput, createdByUserId: string | null): Promise<AutomationRow>;
+  /** Insert version current+1 and repoint the automation at it, in one
+   * transaction. Returns null for a missing/archived automation. */
+  saveVersion(
+    automationId: string,
+    definition: AutomationDefinition,
+    createdByUserId: string | null,
+    meta?: AutomationMetaPatch,
+  ): Promise<AutomationRow | null>;
+  updateMeta(id: string, patch: AutomationMetaPatch): Promise<AutomationRow | null>;
+  setInputs(id: string, inputs: Record<string, unknown>): Promise<AutomationRow | null>;
+  setBlockOverrides(id: string, overrides: BlockOverrides): Promise<AutomationRow | null>;
   archive(id: string): Promise<AutomationRow | null>;
   setEnabled(
     id: string,
     enabled: boolean,
     nextFireAt?: Date | null,
   ): Promise<AutomationRow | null>;
-  listRuns(automationId: string, limit: number): Promise<AutomationRunRow[]>;
   getVersion(automationId: string, version: number): Promise<AutomationVersionRow | null>;
+  listVersions(automationId: string): Promise<AutomationVersionRow[]>;
+
+  listRuns(automationId: string, limit: number): Promise<AutomationRunRow[]>;
+  getRun(id: string): Promise<AutomationRunRow | null>;
+  listStepRuns(runId: string): Promise<AutomationStepRunRow[]>;
+  listRunSessionIds(runId: string): Promise<Array<{ sessionId: string; blockId: string }>>;
+  /** The newest run per automation id, for the list view. */
+  latestRuns(automationIds: string[]): Promise<Map<string, AutomationRunRow>>;
+  /** Per-day status counts over the last 7 days, per automation id. */
+  runCounts7d(automationIds: string[], now: Date): Promise<Map<string, DayRunCount[]>>;
 
   createRegistration(input: {
     id: string;
@@ -170,9 +220,7 @@ export interface AutomationStore {
   listRegistrations(): Promise<WebhookRegistrationRow[]>;
   deleteRegistration(id: string): Promise<boolean>;
   setRegistrationDisabledReason(id: string, reason: string | null): Promise<boolean>;
-  /** Insert version current+1 with an arbitrary definition and repoint the
-   * automation at it, in one transaction. The scheme-retirement backfill's
-   * write path; the legacy proto path keeps using create/update. */
+  /** The scheme-retirement backfill's write path (no metadata change). */
   replaceCurrentDefinition(
     automationId: string,
     definition: AutomationDefinition,
@@ -194,6 +242,9 @@ export interface AutomationStore {
 export interface DueCronAutomation {
   automation: AutomationMetaRow;
   trigger: Extract<AutomationTrigger, { kind: "cron" }>;
+  /** The effective definition (overrides applied) — carries the concurrency
+   * settings the scheduler admits against. */
+  definition: AutomationDefinition;
   nextFireAt: Date;
 }
 
@@ -216,6 +267,24 @@ export interface AutomationCronStore {
     now: Date;
   }): Promise<CronRunClaim | null>;
   markRunSkipped(runId: string, reason: string): Promise<void>;
+  /** Cron admission: stamp the concurrency key on a claimed pending run and,
+   * when the policy settled it here, its terminal status. */
+  settleRunConcurrency(
+    runId: string,
+    concurrencyKey: string,
+    terminal?: { status: "filtered"; error: string },
+  ): Promise<void>;
+  claimConcurrency(
+    automationId: string,
+    concurrencyKey: string,
+    runId: string,
+  ): Promise<ConcurrencyClaimResult>;
+  casConcurrency(
+    automationId: string,
+    concurrencyKey: string,
+    fromRunId: string,
+    toRunId: string,
+  ): Promise<boolean>;
   advanceCronSchedule(input: {
     automationId: string;
     scheduledFor: Date;
@@ -240,6 +309,7 @@ export interface AutomationDispatchStore {
     status?: string;
     error?: string;
     endedAt?: Date;
+    dryRun?: boolean;
   }): Promise<AutomationRunRow>;
   claimConcurrency(
     automationId: string,
@@ -297,6 +367,7 @@ function metaRow(row: typeof automationTable.$inferSelect): AutomationMetaRow {
     builtinKey: row.builtinKey ?? null,
     currentVersion: row.currentVersion,
     inputs: row.inputs,
+    blockOverrides: row.blockOverrides,
     endSessionsOnFinish: row.endSessionsOnFinish,
     createdByUserId: row.createdByUserId ?? null,
     nextFireAt: row.nextFireAt ?? null,
@@ -349,7 +420,22 @@ function runRow(row: typeof automationRunTable.$inferSelect): AutomationRunRow {
     leaseExpiresAt: row.leaseExpiresAt ?? null,
     startedAt: row.startedAt ?? null,
     endedAt: row.endedAt ?? null,
+    dryRun: row.dryRun,
     createdAt: row.createdAt,
+  };
+}
+
+function stepRunRowOf(row: typeof stepRunTable.$inferSelect): AutomationStepRunRow {
+  return {
+    runId: row.runId,
+    blockId: row.blockId,
+    attempt: row.attempt,
+    status: row.status,
+    inputs: row.inputs ?? null,
+    outputs: row.outputs ?? null,
+    error: row.error ?? null,
+    startedAt: row.startedAt,
+    endedAt: row.endedAt ?? null,
   };
 }
 
@@ -368,16 +454,18 @@ function sampleRow(row: typeof webhookSampleTable.$inferSelect): WebhookSampleRo
   return row;
 }
 
-/** Legacy view: meta + reconstructed trigger/action. Null when the current
- * definition is not a single create_session block (builtins, multi-block). */
-function legacyRow(
-  meta: AutomationMetaRow,
+function fullRow(meta: AutomationMetaRow, version: AutomationVersionRow): AutomationRow {
+  return { ...meta, version };
+}
+
+/** The definition a run walks: the pinned version with the automation's
+ * block overrides layered in (ADR 0119 built-in editing model). */
+export function effectiveDefinition(
   version: AutomationVersionRow,
-): AutomationRow | null {
-  if (meta.kind !== "user") return null;
-  const action = legacyActionFromDefinition(definitionOf(version));
-  if (action === null) return null;
-  return { ...meta, trigger: version.trigger, action };
+  overrides: BlockOverrides,
+): AutomationDefinition {
+  const base = definitionOf(version);
+  return Object.keys(overrides).length === 0 ? base : applyBlockOverrides(base, overrides);
 }
 
 /** Resolve input values: schema defaults overlaid by stored values. */
@@ -419,8 +507,8 @@ export function makeAutomationStore(
     return versionRow(row);
   }
 
-  async function legacyView(meta: AutomationMetaRow): Promise<AutomationRow | null> {
-    return legacyRow(meta, await currentVersionOf(meta));
+  async function fullView(meta: AutomationMetaRow): Promise<AutomationRow> {
+    return fullRow(meta, await currentVersionOf(meta));
   }
 
   async function listWithCurrentVersions(where: ReturnType<typeof and>): Promise<
@@ -441,19 +529,30 @@ export function makeAutomationStore(
     return rows.map((row) => ({ meta: metaRow(row.automation), version: versionRow(row.version) }));
   }
 
+  async function getRun(id: string): Promise<AutomationRunRow | null> {
+    const [row] = await db
+      .select()
+      .from(automationRunTable)
+      .where(eq(automationRunTable.id, id))
+      .limit(1);
+    return row ? runRow(row) : null;
+  }
+
+  function target(meta: AutomationMetaRow, version: AutomationVersionRow): DispatchTarget {
+    return { automation: meta, definition: effectiveDefinition(version, meta.blockOverrides) };
+  }
+
   return {
     async list({ includeArchived }) {
       const rows = await listWithCurrentVersions(
         includeArchived ? undefined : isNull(automationTable.archivedAt),
       );
-      return rows
-        .map(({ meta, version }) => legacyRow(meta, version))
-        .filter((row): row is AutomationRow => row !== null);
+      return rows.map(({ meta, version }) => fullRow(meta, version));
     },
 
     async get(id) {
       const [row] = await db.select().from(automationTable).where(eq(automationTable.id, id)).limit(1);
-      return row ? legacyView(metaRow(row)) : null;
+      return row ? fullView(metaRow(row)) : null;
     },
 
     async getActive(id) {
@@ -462,7 +561,16 @@ export function makeAutomationStore(
         .from(automationTable)
         .where(and(eq(automationTable.id, id), isNull(automationTable.archivedAt)))
         .limit(1);
-      return row ? legacyView(metaRow(row)) : null;
+      return row ? fullView(metaRow(row)) : null;
+    },
+
+    async getByBuiltinKey(key) {
+      const [row] = await db
+        .select()
+        .from(automationTable)
+        .where(eq(automationTable.builtinKey, key))
+        .limit(1);
+      return row ? fullView(metaRow(row)) : null;
     },
 
     async listBoundToWebhookRegistration(registrationId) {
@@ -485,10 +593,7 @@ export function makeAutomationStore(
           sql`${versionTable.trigger}->>'registrationId' = ${registrationId}`,
         ),
       );
-      return rows.map(({ meta, version }) => ({
-        automation: meta,
-        definition: definitionOf(version),
-      }));
+      return rows.map(({ meta, version }) => target(meta, version));
     },
 
     async listEnabledForIntegrationTrigger(provider, connectionId) {
@@ -501,22 +606,23 @@ export function makeAutomationStore(
           sql`${versionTable.trigger}->>'connectionId' = ${connectionId}`,
         ),
       );
-      return rows.map(({ meta, version }) => ({
-        automation: meta,
-        definition: definitionOf(version),
-      }));
+      return rows.map(({ meta, version }) => target(meta, version));
     },
 
     async create(input, createdByUserId) {
       const id = crypto.randomUUID();
-      const definition = definitionFromLegacyAction(input.trigger, input.action);
+      const definition = input.definition;
       await db.transaction(async (tx) => {
         await tx.insert(automationTable).values({
           id,
           name: input.name,
           description: input.description,
           enabled: input.enabled,
+          kind: input.kind ?? "user",
+          builtinKey: input.builtinKey ?? null,
           currentVersion: 1,
+          inputs: input.inputs ?? {},
+          endSessionsOnFinish: definition.settings.endSessionsOnFinish,
           nextFireAt: input.nextFireAt,
           createdByUserId,
         });
@@ -535,41 +641,75 @@ export function makeAutomationStore(
       return row;
     },
 
-    async update(id, input) {
-      const definition = definitionFromLegacyAction(input.trigger, input.action);
-      const updated = await db.transaction(async (tx) => {
+    async saveVersion(automationId, definition, createdByUserId, meta) {
+      const saved = await db.transaction(async (tx) => {
         const [existing] = await tx
           .select()
           .from(automationTable)
-          .where(and(eq(automationTable.id, id), isNull(automationTable.archivedAt)))
+          .where(and(eq(automationTable.id, automationId), isNull(automationTable.archivedAt)))
           .for("update")
           .limit(1);
-        if (!existing || existing.kind !== "user") return false;
+        if (!existing) return false;
         const nextVersion = existing.currentVersion + 1;
         await tx.insert(versionTable).values({
-          automationId: id,
+          automationId,
           version: nextVersion,
           trigger: definition.trigger,
           blocks: definition.blocks,
           inputsSchema: definition.inputsSchema,
           settings: definition.settings,
-          createdByUserId: existing.createdByUserId ?? null,
+          createdByUserId,
         });
         await tx
           .update(automationTable)
           .set({
-            name: input.name,
-            description: input.description,
-            enabled: input.enabled,
-            nextFireAt: input.nextFireAt,
             currentVersion: nextVersion,
+            endSessionsOnFinish: definition.settings.endSessionsOnFinish,
+            ...(meta?.name !== undefined ? { name: meta.name } : {}),
+            ...(meta?.description !== undefined ? { description: meta.description } : {}),
+            ...(meta?.nextFireAt !== undefined ? { nextFireAt: meta.nextFireAt } : {}),
             updatedAt: new Date(),
           })
-          .where(eq(automationTable.id, id));
+          .where(eq(automationTable.id, automationId));
         return true;
       });
-      if (!updated) return null;
-      return this.get(id);
+      if (!saved) return null;
+      return this.get(automationId);
+    },
+
+    async updateMeta(id, patch) {
+      const [row] = await db
+        .update(automationTable)
+        .set({
+          ...(patch.name !== undefined ? { name: patch.name } : {}),
+          ...(patch.description !== undefined ? { description: patch.description } : {}),
+          ...(patch.nextFireAt !== undefined ? { nextFireAt: patch.nextFireAt } : {}),
+          ...(patch.endSessionsOnFinish !== undefined
+            ? { endSessionsOnFinish: patch.endSessionsOnFinish }
+            : {}),
+          updatedAt: new Date(),
+        })
+        .where(and(eq(automationTable.id, id), isNull(automationTable.archivedAt)))
+        .returning();
+      return row ? fullView(metaRow(row)) : null;
+    },
+
+    async setInputs(id, inputs) {
+      const [row] = await db
+        .update(automationTable)
+        .set({ inputs, updatedAt: new Date() })
+        .where(and(eq(automationTable.id, id), isNull(automationTable.archivedAt)))
+        .returning();
+      return row ? fullView(metaRow(row)) : null;
+    },
+
+    async setBlockOverrides(id, overrides) {
+      const [row] = await db
+        .update(automationTable)
+        .set({ blockOverrides: overrides, updatedAt: new Date() })
+        .where(and(eq(automationTable.id, id), isNull(automationTable.archivedAt)))
+        .returning();
+      return row ? fullView(metaRow(row)) : null;
     },
 
     async archive(id) {
@@ -591,8 +731,30 @@ export function makeAutomationStore(
         })
         .where(and(eq(automationTable.id, id), isNull(automationTable.archivedAt)))
         .returning();
-      return row ? legacyView(metaRow(row)) : null;
+      return row ? fullView(metaRow(row)) : null;
     },
+
+    async getVersion(automationId, version) {
+      const [row] = await db
+        .select()
+        .from(versionTable)
+        .where(and(eq(versionTable.automationId, automationId), eq(versionTable.version, version)))
+        .limit(1);
+      return row ? versionRow(row) : null;
+    },
+
+    async listVersions(automationId) {
+      const rows = await db
+        .select()
+        .from(versionTable)
+        .where(eq(versionTable.automationId, automationId))
+        .orderBy(desc(versionTable.version));
+      return rows.map(versionRow);
+    },
+
+    // -----------------------------------------------------------------------
+    // Runs
+    // -----------------------------------------------------------------------
 
     async listRuns(automationId, limit) {
       const rows = await db
@@ -604,13 +766,74 @@ export function makeAutomationStore(
       return rows.map(runRow);
     },
 
-    async getVersion(automationId, version) {
-      const [row] = await db
+    getRun,
+
+    async listStepRuns(runId) {
+      const rows = await db
         .select()
-        .from(versionTable)
-        .where(and(eq(versionTable.automationId, automationId), eq(versionTable.version, version)))
-        .limit(1);
-      return row ? versionRow(row) : null;
+        .from(stepRunTable)
+        .where(eq(stepRunTable.runId, runId))
+        .orderBy(asc(stepRunTable.startedAt), asc(stepRunTable.blockId), asc(stepRunTable.attempt));
+      return rows.map(stepRunRowOf);
+    },
+
+    async listRunSessionIds(runId) {
+      return db
+        .select({ sessionId: automationSessionTable.sessionId, blockId: automationSessionTable.blockId })
+        .from(automationSessionTable)
+        .where(eq(automationSessionTable.runId, runId));
+    },
+
+    async latestRuns(automationIds) {
+      const result = new Map<string, AutomationRunRow>();
+      if (automationIds.length === 0) return result;
+      const rows = await db
+        .selectDistinctOn([automationRunTable.automationId])
+        .from(automationRunTable)
+        .where(sql`${automationRunTable.automationId} in ${automationIds}`)
+        .orderBy(automationRunTable.automationId, desc(automationRunTable.createdAt));
+      for (const row of rows) result.set(row.automationId, runRow(row));
+      return result;
+    },
+
+    async runCounts7d(automationIds, now) {
+      const result = new Map<string, DayRunCount[]>();
+      if (automationIds.length === 0) return result;
+      const since = new Date(now.getTime() - 7 * 86_400_000);
+      const rows = await db
+        .select({
+          automationId: automationRunTable.automationId,
+          day: sql<string>`to_char(${automationRunTable.createdAt} at time zone 'UTC', 'YYYY-MM-DD')`,
+          status: automationRunTable.status,
+          count: sql<number>`count(*)::int`,
+        })
+        .from(automationRunTable)
+        .where(
+          and(
+            sql`${automationRunTable.automationId} in ${automationIds}`,
+            gte(automationRunTable.createdAt, since),
+          ),
+        )
+        .groupBy(
+          automationRunTable.automationId,
+          sql`to_char(${automationRunTable.createdAt} at time zone 'UTC', 'YYYY-MM-DD')`,
+          automationRunTable.status,
+        );
+      for (const row of rows) {
+        const days = result.get(row.automationId) ?? [];
+        let bucket = days.find((d) => d.day === row.day);
+        if (!bucket) {
+          bucket = { day: row.day, completed: 0, failed: 0, filtered: 0, other: 0 };
+          days.push(bucket);
+        }
+        if (row.status === "completed") bucket.completed += row.count;
+        else if (row.status === "failed" || row.status === "deadline") bucket.failed += row.count;
+        else if (row.status === "filtered") bucket.filtered += row.count;
+        else bucket.other += row.count;
+        result.set(row.automationId, days);
+      }
+      for (const days of result.values()) days.sort((a, b) => a.day.localeCompare(b.day));
+      return result;
     },
 
     // -----------------------------------------------------------------------
@@ -644,7 +867,12 @@ export function makeAutomationStore(
         if (version.trigger.kind !== "cron" || meta.nextFireAt === null) {
           throw new Error(`due automation ${meta.id} did not contain a cron occurrence`);
         }
-        return { automation: meta, trigger: version.trigger, nextFireAt: meta.nextFireAt };
+        return {
+          automation: meta,
+          trigger: version.trigger,
+          definition: effectiveDefinition(version, meta.blockOverrides),
+          nextFireAt: meta.nextFireAt,
+        };
       });
     },
 
@@ -716,6 +944,24 @@ export function makeAutomationStore(
         .where(and(eq(automationRunTable.id, runId), eq(automationRunTable.status, "pending")));
     },
 
+    async settleRunConcurrency(runId, concurrencyKey, terminal) {
+      await db
+        .update(automationRunTable)
+        .set({
+          concurrencyKey,
+          ...(terminal
+            ? {
+                status: terminal.status,
+                error: terminal.error,
+                endedAt: new Date(),
+                leaseOwner: null,
+                leaseExpiresAt: null,
+              }
+            : {}),
+        })
+        .where(and(eq(automationRunTable.id, runId), eq(automationRunTable.status, "pending")));
+    },
+
     async advanceCronSchedule(input) {
       const rows = await db
         .update(automationTable)
@@ -754,6 +1000,7 @@ export function makeAutomationStore(
           ...(input.status !== undefined ? { status: input.status } : {}),
           ...(input.error !== undefined ? { error: input.error } : {}),
           ...(input.endedAt !== undefined ? { endedAt: input.endedAt } : {}),
+          ...(input.dryRun !== undefined ? { dryRun: input.dryRun } : {}),
         })
         .onConflictDoNothing();
       const [row] = await db
@@ -1006,7 +1253,10 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
         throw new Error(`automation ${run.automationId} is missing version ${run.version}`);
       }
       const version = versionRow(versionRaw);
-      const definition = definitionOf(version);
+      // ADR 0119 built-in editing model: the run walks the pinned version
+      // with the automation's block overrides merged in. The engine never
+      // sees overrides as a concept.
+      const definition = effectiveDefinition(version, meta.blockOverrides);
 
       let aliases: readonly WebhookAliasMapping[] = [];
       if (definition.trigger.kind === "webhook") {
@@ -1031,6 +1281,7 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
         aliases: [...aliases],
         ...(run.concurrencyKey !== null ? { concurrencyKey: run.concurrencyKey } : {}),
         startedAtMs: run.startedAt?.getTime() ?? now().getTime(),
+        dryRun: run.dryRun,
       };
     },
 

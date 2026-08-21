@@ -40,6 +40,10 @@ export interface IntegrationEventStore {
   ): Promise<IntegrationEventRow[]>;
   getLatest(connectionId: string, eventKey: string): Promise<IntegrationEventRow | null>;
   listObservedEventKeys(connectionId: string): Promise<string[]>;
+  getById(id: string): Promise<IntegrationEventRow | null>;
+  /** Distinct provider-noun values seen on this connection (repositories,
+   * channels, teams) — the input-key picker's fallback source. */
+  listObservedScopeValues(connectionId: string): Promise<string[]>;
 }
 
 export function makeIntegrationEventStore(
@@ -131,6 +135,24 @@ export function makeIntegrationEventStore(
         .where(eq(integrationEventTable.connectionId, connectionId))
         .orderBy(integrationEventTable.eventKey);
       return rows.map((r) => r.eventKey);
+    },
+
+    async getById(id) {
+      const [row] = await db
+        .select()
+        .from(integrationEventTable)
+        .where(eq(integrationEventTable.id, id))
+        .limit(1);
+      return row ?? null;
+    },
+
+    async listObservedScopeValues(connectionId) {
+      const rows = await db
+        .selectDistinct({ scopeValue: integrationEventTable.scopeValue })
+        .from(integrationEventTable)
+        .where(eq(integrationEventTable.connectionId, connectionId))
+        .orderBy(integrationEventTable.scopeValue);
+      return rows.map((r) => r.scopeValue).filter((v): v is string => v !== null);
     },
   };
 }

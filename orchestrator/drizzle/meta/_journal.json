@@ -547,6 +547,13 @@
       "when": 1787636800000,
       "tag": "0077_webhook_registration_disabled_reason",
       "breakpoints": true
+    },
+    {
+      "idx": 78,
+      "version": "7",
+      "when": 1787723200000,
+      "tag": "0078_automation_block_overrides",
+      "breakpoints": true
     }
   ]
 }

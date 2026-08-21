@@ -51,6 +51,22 @@ export function registerIntegrationActionBlock(): void {
         return { kind: "error", code: "engine_bug", message: "currentBlockId missing", retryable: false };
       }
       const params = await renderParams(config.params, (t) => ctx.render(t));
+      if (ctx.dryRun) {
+        // Editor DryRun: the provider is never called. The step output
+        // records what WOULD have been posted, so the run page shows it.
+        return {
+          kind: "ok",
+          outputs: {
+            dry_run: true,
+            would_execute: {
+              provider: config.provider,
+              action_id: config.actionId,
+              ...(config.connectionId !== undefined ? { connection_id: config.connectionId } : {}),
+              params,
+            },
+          },
+        };
+      }
       let outputs: Record<string, unknown>;
       try {
         outputs = await runtime.execute({

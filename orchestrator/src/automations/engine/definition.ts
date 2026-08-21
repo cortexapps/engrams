@@ -110,6 +110,11 @@ export interface BlockDef {
   retry?: RetryPolicy;
   /** Type-specific configuration, validated by the block's registered schema. */
   config: Record<string, unknown>;
+  /** Config field names a user may override per automation without editing
+   * the graph (built-ins: structure locked, properties editable). Absent or
+   * empty = nothing tunable. Overrides live in `automation.block_overrides`
+   * and are merged over `config` at snapshot time. */
+  tunable?: string[];
   /** branch */
   then?: BlockDef[];
   else?: BlockDef[];
@@ -123,11 +128,91 @@ const blockDefSchema: z.ZodType<BlockDef> = z.lazy(() =>
     type: z.string().min(1),
     retry: retryPolicySchema.optional(),
     config: z.record(z.string(), z.unknown()),
+    tunable: z.array(z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]*$/)).max(64).optional(),
     then: z.array(blockDefSchema).optional(),
     else: z.array(blockDefSchema).optional(),
     body: z.array(blockDefSchema).optional(),
   }),
 );
+
+/** Block overrides as stored on the automation row. */
+export type BlockOverrides = Record<string, Record<string, unknown>>;
+
+export class BlockOverrideError extends Error {
+  constructor(
+    readonly blockId: string,
+    readonly field: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "BlockOverrideError";
+  }
+}
+
+function* walkBlockTree(blocks: BlockDef[]): Generator<BlockDef> {
+  for (const block of blocks) {
+    yield block;
+    if (block.then) yield* walkBlockTree(block.then);
+    if (block.else) yield* walkBlockTree(block.else);
+    if (block.body) yield* walkBlockTree(block.body);
+  }
+}
+
+/** Validate overrides against a definition: every block id must exist, every
+ * field must be listed in that block's `tunable`, and the merged config must
+ * still satisfy the block's registered schema. Returns the merged definition
+ * (the engine walks the merge; it never sees overrides). */
+export function applyBlockOverrides(
+  definition: AutomationDefinition,
+  overrides: BlockOverrides,
+): AutomationDefinition {
+  const byId = new Map<string, BlockDef>();
+  for (const block of walkBlockTree(definition.blocks)) byId.set(block.id, block);
+
+  for (const [blockId, fields] of Object.entries(overrides)) {
+    const block = byId.get(blockId);
+    if (!block) {
+      throw new BlockOverrideError(blockId, "", `block "${blockId}" is not in this automation`);
+    }
+    const tunable = new Set(block.tunable ?? []);
+    for (const field of Object.keys(fields)) {
+      if (!tunable.has(field)) {
+        throw new BlockOverrideError(
+          blockId,
+          field,
+          `field "${field}" of block "${blockId}" is not tunable`,
+        );
+      }
+    }
+  }
+
+  const merge = (blocks: BlockDef[]): BlockDef[] =>
+    blocks.map((block) => {
+      const fields = overrides[block.id];
+      const merged: BlockDef = {
+        ...block,
+        config: fields ? { ...block.config, ...fields } : block.config,
+        ...(block.then ? { then: merge(block.then) } : {}),
+        ...(block.else ? { else: merge(block.else) } : {}),
+        ...(block.body ? { body: merge(block.body) } : {}),
+      };
+      if (fields) {
+        const executor = getBlock(block.type);
+        const parsed = executor?.configSchema.safeParse(merged.config);
+        if (parsed && !parsed.success) {
+          const issue = parsed.error.issues[0];
+          throw new BlockOverrideError(
+            block.id,
+            issue ? issue.path.join(".") : "config",
+            issue ? issue.message : "override produces an invalid block config",
+          );
+        }
+      }
+      return merged;
+    });
+
+  return { ...definition, blocks: merge(definition.blocks) };
+}
 
 export const definitionSchema = z.object({
   engine: z.literal(ENGINE_VERSION),

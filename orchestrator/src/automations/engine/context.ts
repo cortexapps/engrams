@@ -37,6 +37,8 @@ export interface RunSnapshot {
   aliases: WebhookAliasMapping[];
   concurrencyKey?: string;
   startedAtMs: number;
+  /** Editor dry run: integration actions are stubbed (record, never call). */
+  dryRun?: boolean;
 }
 
 export interface RunContext {
@@ -55,6 +57,8 @@ export interface RunContext {
   /** Set by the interpreter for the duration of one block's execute/wait. */
   currentBlockId?: string;
   currentAttempt?: number;
+  /** True for an editor DryRun (see RunSnapshot.dryRun). */
+  dryRun: boolean;
   deps: EngineDeps;
   render(template: string): Promise<string>;
   resolveSession(ref: SessionRef): Promise<string>;
@@ -92,6 +96,7 @@ export function buildRunContext(
     automationName: snapshot.automationName,
     version: snapshot.version,
     settings: snapshot.definition.settings,
+    dryRun: snapshot.dryRun === true,
     inputs: snapshot.inputs,
     trigger,
     event: base.event,

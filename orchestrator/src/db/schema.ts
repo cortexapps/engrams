@@ -1395,6 +1395,14 @@ export const automation = pgTable(
     currentVersion: integer("current_version").notNull().default(1),
     /** Per-automation input values; the schema lives in the version. */
     inputs: jsonb("inputs").$type<Record<string, unknown>>().notNull().default({}),
+    /** Per-automation block config overrides `{[blockId]: {[field]: value}}`,
+     * layered over the pinned version at snapshot time (ADR 0119: built-ins
+     * are structure-locked, properties editable). Only fields a block lists
+     * as `tunable` may appear. */
+    blockOverrides: jsonb("block_overrides")
+      .$type<Record<string, Record<string, unknown>>>()
+      .notNull()
+      .default({}),
     /** ADR 0119 D8: default false — sessions a run creates are kept. */
     endSessionsOnFinish: boolean("end_sessions_on_finish").notNull().default(false),
     createdByUserId: text("created_by_user_id"),
@@ -1465,6 +1473,9 @@ export const automationRun = pgTable(
     leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
     startedAt: timestamp("started_at", { withTimezone: true }),
     endedAt: timestamp("ended_at", { withTimezone: true }),
+    /** A DryRun from the editor: integration actions are stubbed and record
+     * what they would have done instead of calling the provider. */
+    dryRun: boolean("dry_run").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
