@@ -15,6 +15,7 @@ import { LazySpecCanvas } from "@/components/spec/LazySpecCanvas";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Text } from "@/components/ui/text";
+import { API_BASE } from "@/lib/base";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { useSendSpecMessage } from "@/hooks/useSpecMessages";
@@ -275,6 +276,48 @@ export type SpecLinkState =
 const LINK_VISIBLE_AFTER_FAILURES = 3;
 const LINK_STOP_AFTER_FAILURES = 10;
 
+/**
+ * Why did the socket really fail?
+ *
+ * The server refuses an upgrade by completing the handshake and closing with
+ * 4000+status, and the `closed` handler below reads that when it arrives. It
+ * usually does not: measured against prod, a refusal delivered its code once
+ * in eight attempts, and a refusal issued before any I/O lost even the 101.
+ * The orchestrator is not at fault — Bun flushes both the 101 and the close
+ * frame at every delay when measured directly — the load balancer declines to
+ * relay a WebSocket that closes promptly after the handshake.
+ *
+ * So do not depend on the close code. Ask the HTTP API, which crosses the same
+ * proxy without any of this, and let it say whether the reader is signed out,
+ * has no access, or is looking at a spec that has left drafting. The close code
+ * stays as the fast path for when it does arrive.
+ */
+async function classifyLinkFailure(specId: string): Promise<SpecLinkState | null> {
+  try {
+    const response = await fetch(`${API_BASE}/specs/${encodeURIComponent(specId)}`, {
+      credentials: "include",
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    if (response.status === 401) return { kind: "refused", code: 401 };
+    if (response.status === 403 || response.status === 404) {
+      return { kind: "refused", code: response.status };
+    }
+    if (response.ok) {
+      const body = (await response.json()) as { spec?: { phase?: string } };
+      const phase = body.spec?.phase;
+      // Reachable and readable, but the document socket only serves a draft.
+      if (phase && phase !== "drafting" && phase !== "ideation") {
+        return { kind: "refused", code: 404 };
+      }
+    }
+  } catch {
+    // The API is unreachable too, so "cannot reach the document" is the honest
+    // answer — fall through and leave the transport verdict alone.
+  }
+  return null;
+}
+
 function useSpecConnection(specId: string, enabled: boolean, phase: string | null) {
   const [connection, setConnection] = useState<SpecConnection | null>(null);
   const [synced, setSynced] = useState(false);
@@ -325,11 +368,23 @@ function useSpecConnection(specId: string, enabled: boolean, phase: string | nul
           setLink({ kind: "unreachable", stopped: true });
           // Deferred for the same reason: break the synchronous re-entry.
           queueMicrotask(() => provider.disconnect());
+          void explain();
           return;
         }
         if (failures >= LINK_VISIBLE_AFTER_FAILURES) {
           setLink({ kind: "unreachable", stopped: false });
+          void explain();
         }
+      };
+      // Replace the transport verdict with the real reason, when the HTTP API
+      // knows one. Guarded so a late answer cannot overwrite a live socket or
+      // a connection this effect has already torn down.
+      let explained = false;
+      const explain = async () => {
+        if (explained || disposed) return;
+        explained = true;
+        const refused = await classifyLinkFailure(specId);
+        if (refused && !disposed && !provider.synced) setLink(refused);
       };
       // An application close code is a decision, not a blip. y-websocket emits
       // `closed` only when its `shouldReconnect` says reconnecting is pointless,
@@ -352,6 +407,7 @@ function useSpecConnection(specId: string, enabled: boolean, phase: string | nul
       reconnect.current = () => {
         failures = 0;
         stopped = false;
+        explained = false;
         setLink({ kind: "connecting" });
         provider.connect();
       };

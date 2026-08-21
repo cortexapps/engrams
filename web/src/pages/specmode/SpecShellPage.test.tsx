@@ -284,6 +284,50 @@ describe("SpecShellPage", () => {
     await waitFor(() => expect(providerState.provider.disconnect).toHaveBeenCalledTimes(1));
   });
 
+  // The load balancer usually eats the refusal close code (measured against
+  // prod: delivered once in eight attempts, and a pre-I/O refusal loses even
+  // the 101). So the reason has to come from the HTTP API, which crosses the
+  // same proxy without any of this.
+  it("asks the API why, when the close code never arrives", async () => {
+    providerState.listeners.clear();
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 401 }));
+
+    renderWithProviders(<SpecShellPage specId="spec-1" />);
+    await waitFor(() => expect(providerState.listeners.has("connection-close")).toBe(true));
+
+    // Three transport failures, no close code — exactly what prod produces.
+    act(() => {
+      failedAttempt();
+      failedAttempt();
+      failedAttempt();
+    });
+
+    expect(await screen.findByText("Your session expired")).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/specs/spec-1"),
+      expect.objectContaining({ credentials: "include" }),
+    );
+    fetchMock.mockRestore();
+  });
+
+  it("keeps the transport verdict when the API is unreachable too", async () => {
+    providerState.listeners.clear();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("offline"));
+
+    renderWithProviders(<SpecShellPage specId="spec-1" />);
+    await waitFor(() => expect(providerState.listeners.has("connection-close")).toBe(true));
+    act(() => {
+      failedAttempt();
+      failedAttempt();
+      failedAttempt();
+    });
+
+    expect(await screen.findByText("Cannot reach the document")).toBeTruthy();
+    fetchMock.mockRestore();
+  });
+
   it("names an application close code instead of retrying a refusal", async () => {
     providerState.listeners.clear();
     providerState.provider.disconnect.mockClear();
