@@ -106,7 +106,13 @@ async function executeCreateSession(
   });
   return {
     kind: "ok",
-    outputs: { session_id: created.sessionId, task_id: created.taskId },
+    // initial_prompt feeds the interpreter's turn ledger: an empty initial
+    // prompt starts no harness run, so it must not count as turn 1.
+    outputs: {
+      session_id: created.sessionId,
+      task_id: created.taskId,
+      initial_prompt: prompt.length > 0,
+    },
   };
 }
 

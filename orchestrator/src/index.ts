@@ -40,6 +40,7 @@ import { makeExternalToolCompletionGuard } from "./rpc/tool-completion-guard.ts"
 import { registerBuiltinTools } from "./tools/builtin.ts";
 import { registerSpecTools } from "./tools/specs.ts";
 import { registerReviewTools } from "./tools/review.ts";
+import { registerAutomationTools } from "./tools/automation.ts";
 import { registerDevTools } from "./tools/dev-tools.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
@@ -602,6 +603,7 @@ setReviewIngressControlPlane(reviewControlPlane);
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
 registerReviewTools(tools, { reviews: makeReviewStore(getDb()) });
+registerAutomationTools(tools);
 registerSpecTools(tools, {
   resolveSpecForSession: async (sessionId) => {
     const id = await productionSpecProjection.storeSpecForSession(sessionId);
