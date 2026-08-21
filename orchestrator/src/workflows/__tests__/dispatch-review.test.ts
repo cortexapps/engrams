@@ -36,6 +36,7 @@ function activeReview(): ReviewRow {
     statusCommentId: null,
     finderSessionId: null,
     verifierSessionId: null,
+    automationRunId: null,
     summaryMd: null,
     providerId: "2158810101",
     prTitle: "Review me",

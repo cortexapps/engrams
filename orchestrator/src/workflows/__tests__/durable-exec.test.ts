@@ -46,6 +46,7 @@ const review: ReviewRow = {
   statusCommentId: null,
   finderSessionId: null,
   verifierSessionId: null,
+  automationRunId: null,
   summaryMd: null,
   providerId: null,
   prUrl: null,

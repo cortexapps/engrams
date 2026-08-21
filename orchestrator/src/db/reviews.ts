@@ -120,6 +120,8 @@ export interface ReviewRow {
   statusCommentId: string | null;
   finderSessionId: string | null;
   verifierSessionId: string | null;
+  /** ADR 0119 phase 4: the automation run that drove this pass, if any. */
+  automationRunId: string | null;
   summaryMd: string | null;
   // From the target: the PR as it is now, not as it was when this pass ran.
   // `providerId` is null only on a row backfilled from before the target table
@@ -283,6 +285,8 @@ export interface ReviewStore {
     role: "finder" | "verifier",
     sessionId: string,
   ): Promise<void>;
+  /** ADR 0119 phase 4: stamp the automation run that drives this pass. */
+  setAutomationRunId(reviewId: string, runId: string): Promise<void>;
   /** Applies only while the row is active; false exposes a refused late write. */
   updateReviewStatus(reviewId: string, status: string): Promise<boolean>;
   /**
@@ -353,6 +357,7 @@ function toReviewRow(row: JoinedReviewRow): ReviewRow {
     statusCommentId: row.statusCommentId ?? null,
     finderSessionId: row.finderSessionId ?? null,
     verifierSessionId: row.verifierSessionId ?? null,
+    automationRunId: row.automationRunId ?? null,
     summaryMd: row.summaryMd ?? null,
     providerId: row.providerId ?? null,
     prTitle: row.prTitle ?? null,
@@ -947,6 +952,12 @@ export function makeReviewStore(
       await db
         .update(reviewTable)
         .set({ ...column, updatedAt: new Date() })
+        .where(eq(reviewTable.id, reviewId));
+    },
+    async setAutomationRunId(reviewId, runId) {
+      await db
+        .update(reviewTable)
+        .set({ automationRunId: runId, updatedAt: new Date() })
         .where(eq(reviewTable.id, reviewId));
     },
 

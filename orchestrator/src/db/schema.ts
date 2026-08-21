@@ -924,6 +924,10 @@ export const review = pgTable(
     // ends, but the id is kept as the durable record of which session ran.
     finderSessionId: text("finder_session_id"),
     verifierSessionId: text("verifier_session_id"),
+    // ADR 0119 phase 4: the automation run that drove this pass when the
+    // built-in automation (not the legacy DBOS graph) ran it. Nullable during
+    // the parallel window; the legacy path never sets it.
+    automationRunId: text("automation_run_id"),
     summaryMd: text("summary_md"),
     // What THIS pass read (ADR 0100 decision 11). The PR's name and state live
     // on the target row because they describe the PR; these describe the code

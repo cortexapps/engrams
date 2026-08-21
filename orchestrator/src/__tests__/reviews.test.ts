@@ -46,6 +46,7 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     statusCommentId: null,
     finderSessionId: null,
     verifierSessionId: null,
+    automationRunId: null,
     summaryMd: "Finder summary",
     providerId: null,
     prUrl: null,
@@ -174,6 +175,7 @@ function makeStore(
     async setFinderSummary() {},
     async setStatusCommentId() {},
     async setReviewSessionId() {},
+    async setAutomationRunId() {},
     async updateReviewStatus() {
       return true;
     },
