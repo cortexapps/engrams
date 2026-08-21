@@ -1,104 +1,60 @@
-/** Durable one-occurrence automation launch workflow (ADR 0102). */
+/** The automation interpreter workflow (ADR 0119).
+ *
+ * The registered body is deliberately thin: DBOS derives the application
+ * version from this function's source (it does not recurse into helpers), so
+ * the interpreter and block executors can evolve without rotating the
+ * version. The ENGINE_STEP_CONTRACT literal below is the guard: any change to
+ * step naming, step order, recv semantics, or the finalize position MUST bump
+ * it, which rotates the version, strands in-flight executions loudly, and
+ * lets the sweep (adopt, 48h) fail them instead of replaying them through
+ * changed semantics. The golden step-sequence test in
+ * src/automations/engine/__tests__/interpreter.test.ts enforces the contract
+ * at review time. Additive changes (new block types, new outcome fields) keep
+ * the contract.
+ */
+
+import { createHash } from "node:crypto";
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
+import { Code, ConnectError } from "@connectrpc/connect";
 
-import { buildAutomationTemplateContext, AutomationTemplateError, renderAutomationAction } from "../automations/template.ts";
-import { makeWebhookAliasResolver } from "../automations/aliases.ts";
-import { sessions as defaultSessions, images as defaultImages, harnessCatalog as defaultHarnessCatalog } from "../control-plane/client.ts";
-import { makeAutomationStore, type AutomationWorkflowStore } from "../db/automations.ts";
+import {
+  sessions as defaultSessions,
+  images as defaultImages,
+  harnessCatalog as defaultHarnessCatalog,
+} from "../control-plane/client.ts";
+import {
+  makeAutomationEngineStore,
+  type AutomationEngineStore,
+} from "../db/automations.ts";
 import { getDb } from "../db/client.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeProfileStore } from "../db/profiles.ts";
-import type { AutomationRunTrigger } from "../db/schema.ts";
 import {
   createSessionForExistingTask,
+  registerSessionListener,
   truncatePrompt,
   type CreateSessionForExistingTaskParams,
   type HarnessCatalogClient,
 } from "../rpc/task-create.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
+import { runExec } from "../exec/durable-exec.ts";
+import { AUTOMATION_TOPIC, type AutomationInbox } from "../automations/engine/inbox.ts";
+import { interpretAutomation, type EngineRunResult } from "../automations/engine/interpreter.ts";
+import type { EngineDeps, EngineSessionOps } from "../automations/engine/deps.ts";
 
 export interface AutomationRunWorkflowInput {
-  automationId: string;
   runId: string;
-  trigger: AutomationRunTrigger;
-  /** ISO timestamp for the occurrence; required for cron runs. */
-  scheduledFor?: string;
-  /** ISO timestamp at which the trigger was accepted by the orchestrator. */
-  receivedAt: string;
+  automationId: string;
 }
-
-export interface PreparedAutomationRun {
-  profileId: string;
-  prompt: string;
-  title: string | null;
-  /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
-  harnessMode?: string;
-  /** ADR 0063 B2: the automation's harness/model/effort override, if any.
-   *  Resolved from the stored action so a retried occurrence launches the same
-   *  harness the render step read. */
-  harness?: string;
-  model?: string;
-  modelRouter?: string;
-  effort?: string;
-}
-
-export interface AutomationTaskCreator {
-  create(input: AutomationRunWorkflowInput, prepared: PreparedAutomationRun): Promise<{
-    taskId: string;
-    sessionId: string;
-  }>;
-}
-
-export interface AutomationStepOptions {
-  retry: boolean;
-  shouldRetry?: (error: unknown) => boolean | Promise<boolean>;
-}
-
-export type AutomationStepRunner = <T>(
-  fn: () => Promise<T>,
-  name: string,
-  options: AutomationStepOptions,
-) => Promise<T>;
 
 export interface AutomationRunWorkflowDeps {
-  store?: AutomationWorkflowStore;
-  taskCreator?: AutomationTaskCreator;
-  render?: typeof renderAutomationAction;
-  step?: AutomationStepRunner;
-  aliases?: (registrationId: string) => Promise<ReadonlyArray<{ path: string; alias: string }>>;
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function scheduledDate(input: AutomationRunWorkflowInput): Date | null {
-  if (input.scheduledFor === undefined) return null;
-  const date = new Date(input.scheduledFor);
-  if (Number.isNaN(date.getTime())) {
-    throw new Error(`invalid scheduledFor timestamp ${JSON.stringify(input.scheduledFor)}`);
-  }
-  return date;
-}
-
-function triggerSource(input: AutomationRunWorkflowInput): Record<string, unknown> {
-  return {
-    kind: input.trigger.source,
-    ...(input.scheduledFor !== undefined ? { scheduledFor: input.scheduledFor } : {}),
-    ...(input.trigger.eventKey !== undefined ? { eventKey: input.trigger.eventKey } : {}),
-    ...(input.trigger.deliveryId !== undefined ? { deliveryId: input.trigger.deliveryId } : {}),
-  };
+  engine?: EngineDeps;
 }
 
 type CreateExistingSession = (
   params: CreateSessionForExistingTaskParams,
 ) => Promise<{ sessionId: string }>;
-
-export interface AutomationTaskCreatorDeps {
-  store?: AutomationWorkflowStore;
-  createSessionForExistingTask?: CreateExistingSession;
-}
 
 function productionImagesClient(): ImagesClient {
   return {
@@ -128,187 +84,202 @@ function productionHarnessCatalogClient(): HarnessCatalogClient {
   };
 }
 
-/** Build the task/session primitive separately from the workflow graph so unit
- * tests can prove render failures never cross the billable-launch boundary. */
-export function makeAutomationTaskCreator(
-  deps: AutomationTaskCreatorDeps = {},
-): AutomationTaskCreator {
+export interface ProductionSessionOpsDeps {
+  store?: AutomationEngineStore;
+  createSessionForExistingTask?: CreateExistingSession;
+  registerListener?: (sessionId: string) => Promise<void>;
+}
+
+/** EngineSessionOps over the control plane. The binding row lands BEFORE the
+ * listener registration (the review-control-plane ordering), so no session
+ * event ever arrives without a mailbox. */
+export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): EngineSessionOps {
   let resolvedStore = deps.store;
-  const store = () => (resolvedStore ??= makeAutomationStore());
+  const store = () => (resolvedStore ??= makeAutomationEngineStore());
   let createExistingSession = deps.createSessionForExistingTask;
   const createSession = (): CreateExistingSession => {
     if (createExistingSession) return createExistingSession;
     const database = getDb();
-    createExistingSession = (params) => createSessionForExistingTask(
-      {
-        profiles: makeProfileStore(database),
-        images: productionImagesClient(),
-        connectors: { list: () => makeConnectorStore(database).list() },
-        harnessCatalog: productionHarnessCatalogClient(),
-        sessions: defaultSessions,
-        // With no owner, the shared helper deliberately ignores personal
-        // tokens and selects the harness's programmatic org credential.
-        secrets: { get: async () => null, getAll: async () => ({}) },
-        db: database,
-      },
-      params,
-    );
+    createExistingSession = (params) =>
+      createSessionForExistingTask(
+        {
+          profiles: makeProfileStore(database),
+          images: productionImagesClient(),
+          connectors: { list: () => makeConnectorStore(database).list() },
+          harnessCatalog: productionHarnessCatalogClient(),
+          sessions: defaultSessions,
+          // With no owner, the shared helper deliberately ignores personal
+          // tokens and selects the harness's programmatic org credential.
+          secrets: { get: async () => null, getAll: async () => ({}) },
+          db: database,
+        },
+        params,
+      );
     return createExistingSession;
   };
 
   return {
-    async create(input, prepared) {
+    async createSession(input) {
       const taskId = await store().ensureAutomationTask({
         runId: input.runId,
         automationId: input.automationId,
-        title: prepared.title ?? truncatePrompt(prepared.prompt),
+        title: input.title ?? truncatePrompt(input.prompt),
         source: {
           provider: "automation",
           automationId: input.automationId,
           runId: input.runId,
-          trigger: triggerSource(input),
         },
       });
-      const existingSessionId = await store().getAutomationTaskSession(input.runId);
-      if (existingSessionId !== null) return { taskId, sessionId: existingSessionId };
-
+      // A replayed/retried primary launch reuses the task's primary session.
+      if (input.role === "primary") {
+        const existing = await store().getAutomationTaskSession(input.runId);
+        if (existing !== null) return { sessionId: existing, taskId };
+      }
       const { sessionId } = await createSession()({
         taskId,
         taskType: "automation",
-        profileId: prepared.profileId,
+        profileId: input.profileId,
         integrationPrincipalId: `automation:${input.automationId}`,
-        role: "primary",
-        prompt: prepared.prompt,
-        ...(prepared.harnessMode != null ? { harnessMode: prepared.harnessMode } : {}),
-        // ADR 0063 B2: the automation's harness/model/effort selection, absent
-        // when it inherits the profile's default.
-        ...(prepared.harness !== undefined ? { harness: prepared.harness } : {}),
-        ...(prepared.model !== undefined ? { model: prepared.model } : {}),
-        ...(prepared.modelRouter !== undefined ? { modelRouter: prepared.modelRouter } : {}),
-        ...(prepared.effort !== undefined ? { effort: prepared.effort } : {}),
-        registerListener: true,
-        // No owner and no policy overrides: the shared compiler keeps profile
-        // secrets, env, capabilities, and network policy intact.
+        role: input.role,
+        prompt: input.prompt,
+        ...(input.harnessMode !== undefined ? { harnessMode: input.harnessMode } : {}),
+        ...(input.harness !== undefined ? { harness: input.harness } : {}),
+        ...(input.model !== undefined ? { model: input.model } : {}),
+        ...(input.modelRouter !== undefined ? { modelRouter: input.modelRouter } : {}),
+        ...(input.effort !== undefined ? { effort: input.effort } : {}),
+        registerListener: false,
       });
-      return { taskId, sessionId };
+      await store().recordSessionBinding({
+        sessionId,
+        runId: input.runId,
+        blockId: input.blockId,
+        role: input.role,
+        keep: input.keep,
+      });
+      const register =
+        deps.registerListener ?? ((id: string) => registerSessionListener(getDb(), id));
+      await register(sessionId);
+      if (input.role === "primary") {
+        await store().recordRunLaunch({
+          runId: input.runId,
+          taskId,
+          sessionId,
+          prompt: input.prompt,
+          title: input.title,
+        });
+      }
+      return { sessionId, taskId };
+    },
+
+    async sendPrompt(sessionId, promptId, text) {
+      await defaultSessions.sendPrompt({ sessionId, promptId, text });
+    },
+
+    async endSession(sessionId) {
+      try {
+        await defaultSessions.deleteSession({ sessionId });
+      } catch (error) {
+        if (error instanceof ConnectError && error.code === Code.NotFound) return;
+        throw error;
+      }
+    },
+
+    async exec(sessionId, command, options) {
+      const result = await runExec(defaultSessions, sessionId, command, options);
+      return {
+        exitStatus: result.exitStatus,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      };
+    },
+
+    async writeFiles(sessionId, files) {
+      // Metadata frame + one chunk per file, content-addressed by sha256 so a
+      // replay is idempotent. (Shared extraction with the review control
+      // plane lands in phase 2.D.)
+      const results: Array<{ path: string; ok: boolean; error?: string }> = [];
+      for (const file of files) {
+        const content = new TextEncoder().encode(file.content);
+        const sha256 = createHash("sha256").update(content).digest("hex");
+        async function* frames(): AsyncIterable<{
+          frame:
+            | {
+                case: "metadata";
+                value: {
+                  sessionId: string;
+                  path: string;
+                  sizeBytes: bigint;
+                  sha256: string;
+                  mode?: number;
+                };
+              }
+            | { case: "chunk"; value: Uint8Array };
+        }> {
+          yield {
+            frame: {
+              case: "metadata",
+              value: {
+                sessionId,
+                path: file.path,
+                sizeBytes: BigInt(content.byteLength),
+                sha256,
+                mode: file.mode ?? 0o644,
+              },
+            },
+          };
+          if (content.byteLength > 0) yield { frame: { case: "chunk", value: content } };
+        }
+        try {
+          await defaultSessions.writeFile(frames());
+          results.push({ path: file.path, ok: true });
+        } catch (error) {
+          results.push({
+            path: file.path,
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      return results;
     },
   };
 }
 
+function productionEngineDeps(): EngineDeps {
+  const store = makeAutomationEngineStore();
+  return {
+    step: (fn, name) => DBOS.runStep(fn, { name }),
+    recv: (topic, timeoutSeconds) => DBOS.recv<AutomationInbox>(topic, timeoutSeconds),
+    store,
+    sessions: makeProductionSessionOps({ store }),
+    clock: { nowMs: () => Date.now() },
+    async startQueuedRun(runId) {
+      const run = await store.getRun(runId);
+      if (!run) return;
+      await DBOS.startWorkflow(automationRunWorkflow, { workflowID: runId })({
+        runId,
+        automationId: run.automationId,
+      });
+    },
+  };
+}
+
+// Re-exported so dispatch/scheduler name the topic without importing engine
+// internals directly.
+export { AUTOMATION_TOPIC };
+
 export async function automationRunWorkflowImpl(
   input: AutomationRunWorkflowInput,
   deps: AutomationRunWorkflowDeps = {},
-): Promise<void> {
-  const store = deps.store ?? makeAutomationStore();
-  const taskCreator = deps.taskCreator ?? makeAutomationTaskCreator({ store });
-  const render = deps.render ?? renderAutomationAction;
-  const aliases = deps.aliases ?? makeWebhookAliasResolver();
-  const step: AutomationStepRunner = deps.step ?? ((fn, name, options) =>
-    DBOS.runStep(fn, {
-      name,
-      retriesAllowed: options.retry,
-      ...(options.shouldRetry ? { shouldRetry: options.shouldRetry } : {}),
-    }));
-
-  const run = await step(
-    () => store.ensureRun({
-      id: input.runId,
-      automationId: input.automationId,
-      trigger: input.trigger,
-      scheduledFor: scheduledDate(input),
-    }),
-    "ensureAutomationRun",
-    { retry: true },
-  );
-  // DBOS normally prevents this body from re-running. Keep the ledger itself
-  // defensive too: a terminal occurrence can never create another task.
-  if (run.status !== "pending") return;
-
-  let prepared: PreparedAutomationRun;
-  try {
-    prepared = await step(
-      async () => {
-        const automation = await store.getAutomation(input.automationId);
-        if (!automation) throw new Error(`automation ${input.automationId} not found`);
-        const scheduledFor = input.scheduledFor;
-        if (input.trigger.source === "cron" && scheduledFor === undefined) {
-          throw new Error("cron automation run is missing scheduledFor");
-        }
-        const webhookAliases = automation.trigger.kind === "webhook"
-          ? await aliases(automation.trigger.registrationId)
-          : [];
-        const context = buildAutomationTemplateContext({
-          automationName: automation.name,
-          triggerKind: input.trigger.source,
-          receivedAt: input.receivedAt,
-          ...(input.trigger.eventKey !== undefined ? { eventKey: input.trigger.eventKey } : {}),
-          ...(scheduledFor !== undefined ? { scheduledFor } : {}),
-          ...(input.trigger.payload !== undefined ? { rawPayload: input.trigger.payload } : {}),
-          aliases: webhookAliases,
-        });
-        const rendered = await render(automation.action, context);
-        const title = rendered.title ?? null;
-        await store.recordRendered(input.runId, rendered.prompt, title);
-        return {
-          profileId: automation.action.profileId,
-          prompt: rendered.prompt,
-          title,
-          ...(automation.action.harnessMode != null
-            ? { harnessMode: automation.action.harnessMode }
-            : {}),
-          ...(automation.action.harness !== undefined
-            ? { harness: automation.action.harness }
-            : {}),
-          ...(automation.action.model !== undefined ? { model: automation.action.model } : {}),
-          ...(automation.action.modelRouter !== undefined
-            ? { modelRouter: automation.action.modelRouter }
-            : {}),
-          ...(automation.action.effort !== undefined ? { effort: automation.action.effort } : {}),
-        };
-      },
-      "renderAutomationAction",
-      {
-        retry: true,
-        shouldRetry: (error) => !(error instanceof AutomationTemplateError),
-      },
-    );
-  } catch (error) {
-    if (error instanceof AutomationTemplateError) {
-      await step(
-        () => store.markRunRenderFailed(input.runId, messageOf(error)),
-        "markAutomationRenderFailed",
-        { retry: true },
-      );
-    } else {
-      await step(
-        () => store.markRunLaunchFailed(input.runId, messageOf(error)),
-        "markAutomationLaunchFailed",
-        { retry: true },
-      );
-    }
-    return;
-  }
-
-  let launched: { taskId: string; sessionId: string };
-  try {
-    launched = await step(
-      () => taskCreator.create(input, prepared),
-      "launchAutomationTask",
-      { retry: true },
-    );
-  } catch (error) {
-    await step(
-      () => store.markRunLaunchFailed(input.runId, messageOf(error)),
-      "markAutomationLaunchFailed",
-      { retry: true },
-    );
-    return;
-  }
-
-  await step(
-    () => store.markRunLaunched(input.runId, launched.taskId, launched.sessionId),
-    "markAutomationLaunched",
-    { retry: true },
+): Promise<EngineRunResult> {
+  // ADR 0119 D2: bump on ANY change to step naming, step order, recv
+  // semantics, or finalize position anywhere in the engine. The literal lives
+  // in this registered body so the bump rotates the DBOS application version.
+  const ENGINE_STEP_CONTRACT = 1;
+  const engine = deps.engine ?? productionEngineDeps();
+  return interpretAutomation(
+    { runId: input.runId, automationId: input.automationId, contract: ENGINE_STEP_CONTRACT },
+    engine,
   );
 }
 

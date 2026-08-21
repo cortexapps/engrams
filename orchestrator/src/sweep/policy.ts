@@ -20,7 +20,9 @@ export const SWEEP_POLICIES: Record<string, SweepPolicy> = {
   // review that was asked for and never began, so adopting it is the point.
   ReviewIngressWorkflow: { mode: "adopt", staleAfterHours: 1 },
   ToolExecWorkflow: { mode: "adopt", staleAfterHours: 1 },
-  AutomationRunWorkflow: { mode: "adopt", staleAfterHours: 1 },
+  // ADR 0119: interpreter runs park on recv (waits, session phases) like
+  // PrReviewWorkflow, so the launch-scale 1h staleness no longer applies.
+  AutomationRunWorkflow: { mode: "adopt", staleAfterHours: 48 },
   // A ticket sync is a handful of Linear calls, so an hour is generous. A
   // stranded batch is rows a person asked to sync that never reached Linear,
   // and adopting it is exactly what N4 makes safe: the ledger keeps the resumed
