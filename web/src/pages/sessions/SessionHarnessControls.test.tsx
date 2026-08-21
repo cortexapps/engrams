@@ -66,6 +66,37 @@ describe("SessionHarnessControls", () => {
     expect(screen.queryByTestId("session-harness-select")).toBeNull();
   });
 
+  // A profile that pins a model outranks the descriptor default, so the chip
+  // has to say the profile's model. It used to show the descriptor default: a
+  // spec launched under a profile pinned to GPT-5 mini advertised "GPT-5" and
+  // then ran the other one.
+  test("shows the profile's pinned model ahead of the descriptor default", () => {
+    render(
+      <SessionHarnessControls
+        harnesses={[codex]}
+        profileHarness="codex"
+        profileModel="gpt-5-mini"
+        value={EMPTY_OVERRIDE}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("session-model-select").textContent).toContain("GPT-5 mini");
+  });
+
+  test("an explicit override still outranks the profile's model", () => {
+    render(
+      <SessionHarnessControls
+        harnesses={[codex]}
+        profileHarness="codex"
+        profileModel="gpt-5-mini"
+        value={{ ...EMPTY_OVERRIDE, model: "gpt-5" }}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("session-model-select").textContent).toContain("GPT-5");
+    expect(screen.getByTestId("session-model-select").textContent).not.toContain("mini");
+  });
+
   test("picking an option records the override", async () => {
     const onChange = vi.fn();
     render(

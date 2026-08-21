@@ -188,7 +188,9 @@ function OptionMenu({
 const optionLabel = (options: HarnessOption[], id: string | null): string | undefined =>
   options.find((o) => o.id === id)?.label || (id ?? undefined);
 
-/** The label a launch resolves to with no override: the descriptor's default. */
+/** The descriptor's own default — the LAST resort for a chip label. A profile
+ *  that pins a model outranks it, so check `profileModel` first or the chip
+ *  advertises a model the launch will not use. */
 const defaultLabel = (options: HarnessOption[]): string | undefined => {
   const fallback = options.find((o) => o.default);
   return fallback ? fallback.label || fallback.id : undefined;
@@ -312,7 +314,10 @@ export function SessionHarnessControls({
               ? (routerModels.find((m) => m.id === effectiveRoutedModelId)?.name ??
                 effectiveRoutedModelId ??
                 "Model")
-              : (optionLabel(models, value.model) ?? defaultLabel(models) ?? "Model")
+              : (optionLabel(models, value.model) ??
+                optionLabel(models, profileModel ?? null) ??
+                defaultLabel(models) ??
+                "Model")
           }
           options={
             effectiveRouter
