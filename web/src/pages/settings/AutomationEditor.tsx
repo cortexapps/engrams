@@ -5,10 +5,8 @@ import {
   AlertCircleIcon,
   ArrowLeftIcon,
   CheckCircle2Icon,
-  ChevronDownIcon,
   Clock3Icon,
   Code2Icon,
-  ExternalLinkIcon,
   FileJson2Icon,
   Loader2Icon,
   SaveIcon,
@@ -16,27 +14,38 @@ import {
   WebhookIcon,
 } from "lucide-react";
 
-import type { TestRenderResponse } from "@/gen/engram/app/v1/automation_pb";
+import type { BlockError } from "@/gen/engram/app/v1/automation_pb";
 import {
   useAutomation,
   useAutomationRuns,
   useCreateAutomation,
   useTestAutomationRender,
-  useUpdateAutomation,
+  useSaveVersion,
+  useSetAutomationEnabled,
+  useUpdateAutomationMeta,
   useWebhookEvents,
   useWebhookRegistrations,
-  useWebhookSamples,
+  useEventSamples,
 } from "@/hooks/useAutomations";
 import { useHarnessCatalog } from "@/hooks/useHarnessCatalog";
 import { useProfiles } from "@/hooks/useProfiles";
 import {
   automationErrorField,
   automationStatusLabel,
+  definitionFromDraft,
+  draftFromDefinition,
   rawVariables,
+  singleBlockPreview,
   type AutomationField,
 } from "@/lib/automations";
+
+/** The legacy single-block preview shape, lifted from v2's per-block render. */
+interface RenderedPreview {
+  errors: BlockError[];
+  renderedPrompt?: string;
+  renderedTitle?: string;
+}
 import { errorMessage } from "@/lib/errors";
-import { shortId } from "@/pages/sessions/session-format";
 import {
   EMPTY_OVERRIDE,
   SessionHarnessControls,
@@ -46,7 +55,6 @@ import { PageHeading } from "@/components/page-heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Field, FieldDescription, FieldError, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -171,9 +179,8 @@ function RunHistory({ automationId }: { automationId: string }) {
             <TableHeader>
               <TableRow>
                 <TableHead>Status</TableHead>
+                <TableHead>Trigger</TableHead>
                 <TableHead>Created</TableHead>
-                <TableHead>Prompt</TableHead>
-                <TableHead>Task</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -182,6 +189,7 @@ function RunHistory({ automationId }: { automationId: string }) {
                   <TableCell className="align-top">
                     <Badge variant={runStatusVariant(run.status)}>
                       {automationStatusLabel(run.status)}
+                      {run.dryRun ? " (dry run)" : ""}
                     </Badge>
                     {run.error && (
                       <p className="mt-2 max-w-xs whitespace-normal text-xs text-destructive">
@@ -190,57 +198,11 @@ function RunHistory({ automationId }: { automationId: string }) {
                     )}
                   </TableCell>
                   <TableCell className="align-top text-xs text-muted-foreground">
+                    {run.triggerSource}
+                    {run.eventKey ? ` · ${run.eventKey}` : ""}
+                  </TableCell>
+                  <TableCell className="align-top text-xs text-muted-foreground">
                     <time dateTime={run.createdAt}>{new Date(run.createdAt).toLocaleString()}</time>
-                  </TableCell>
-                  <TableCell className="max-w-md align-top whitespace-normal">
-                    {run.renderedPrompt ? (
-                      <Collapsible>
-                        <CollapsibleTrigger asChild>
-                          <Button variant="ghost" size="sm" className="h-auto px-0">
-                            <ChevronDownIcon className="size-3.5" />
-                            Show rendered prompt
-                          </Button>
-                        </CollapsibleTrigger>
-                        <CollapsibleContent>
-                          <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-3 font-mono text-xs">
-                            {run.renderedPrompt}
-                          </pre>
-                        </CollapsibleContent>
-                      </Collapsible>
-                    ) : (
-                      <span className="text-xs text-muted-foreground">—</span>
-                    )}
-                  </TableCell>
-                  <TableCell className="align-top">
-                    {run.taskId ? (
-                      run.sessionId ? (
-                        <Button
-                          asChild
-                          variant="link"
-                          size="sm"
-                          className="h-auto px-0 font-mono text-xs"
-                        >
-                          <Link to="/sessions/$id" params={{ id: run.sessionId }}>
-                            {shortId(run.taskId)}
-                            <ExternalLinkIcon className="size-3" />
-                          </Link>
-                        </Button>
-                      ) : (
-                        <Button
-                          asChild
-                          variant="link"
-                          size="sm"
-                          className="h-auto px-0 font-mono text-xs"
-                        >
-                          <Link to="/sessions/list">
-                            {shortId(run.taskId)}
-                            <ExternalLinkIcon className="size-3" />
-                          </Link>
-                        </Button>
-                      )
-                    ) : (
-                      <span className="text-xs text-muted-foreground">—</span>
-                    )}
                   </TableCell>
                 </TableRow>
               ))}
@@ -257,7 +219,7 @@ function PreviewPanel({
   pending,
   requestError,
 }: {
-  preview: TestRenderResponse | null;
+  preview: RenderedPreview | null;
   pending: boolean;
   requestError: string;
 }) {
@@ -334,12 +296,15 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
   const harnesses = useHarnessCatalog();
   const registrations = useWebhookRegistrations();
   const createAutomation = useCreateAutomation();
-  const updateAutomation = useUpdateAutomation();
+  const saveVersion = useSaveVersion();
+  const updateMeta = useUpdateAutomationMeta();
+  const setEnabled = useSetAutomationEnabled();
   const testRender = useTestAutomationRender();
   const [draft, setDraft] = useState<EditorDraft>(EMPTY_DRAFT);
   const [hydratedId, setHydratedId] = useState<string | null>(null);
   const [errors, setErrors] = useState<EditorErrors>({});
-  const [preview, setPreview] = useState<TestRenderResponse | null>(null);
+  const [preview, setPreview] = useState<RenderedPreview | null>(null);
+  const [unsupportedGraph, setUnsupportedGraph] = useState(false);
   const [previewRequestError, setPreviewRequestError] = useState("");
   const [selectedSampleId, setSelectedSampleId] = useState("");
   const [activeTemplate, setActiveTemplate] = useState<TemplateTarget>("prompt");
@@ -349,41 +314,50 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
   const events = useWebhookEvents(
     draft.triggerKind === "webhook" ? draft.registrationId : undefined,
   );
-  const samples = useWebhookSamples(
-    draft.triggerKind === "webhook" ? draft.registrationId : undefined,
+  const samples = useEventSamples(
+    mode === "edit" && draft.triggerKind === "webhook" ? id : undefined,
     25,
   );
 
   useEffect(() => {
     const automation = existing.data?.automation;
     if (mode !== "edit" || !automation || hydratedId === automation.id) return;
-    const trigger = automation.trigger?.trigger;
-    const action = automation.action?.action;
+    const single = draftFromDefinition(automation.version?.definitionJson ?? "");
+    if (!single) {
+      // A built-in or multi-block graph: the legacy editor cannot edit its
+      // structure. The phase-3 editor replaces this page.
+      setUnsupportedGraph(true);
+      setDraft((current) => ({
+        ...current,
+        name: automation.name,
+        description: automation.description,
+        enabled: automation.enabled,
+      }));
+      setHydratedId(automation.id);
+      return;
+    }
     setDraft({
       name: automation.name,
       description: automation.description,
       enabled: automation.enabled,
-      triggerKind: trigger?.case === "webhook" ? "webhook" : "cron",
-      schedule: trigger?.case === "cron" ? trigger.value.schedule : EMPTY_DRAFT.schedule,
-      timezone: trigger?.case === "cron" ? trigger.value.timezone : EMPTY_DRAFT.timezone,
-      registrationId: trigger?.case === "webhook" ? trigger.value.registrationId : "",
-      events: trigger?.case === "webhook" ? [...trigger.value.events] : [],
-      profileId: action?.case === "createTask" ? action.value.profileId : "",
-      override:
-        action?.case === "createTask"
-          ? {
-              harness: action.value.harness ?? null,
-              modelRouter: action.value.modelRouter ?? null,
-              model: action.value.model ?? null,
-              effort: action.value.effort ?? null,
-              // Mode is the `planFirst` switch below, not one of these pickers.
-              mode: null,
-            }
-          : EMPTY_OVERRIDE,
-      promptTemplate: action?.case === "createTask" ? action.value.promptTemplate : "",
-      titleTemplate: action?.case === "createTask" ? (action.value.titleTemplate ?? "") : "",
-      includeEventContext: action?.case === "createTask" ? action.value.includeEventContext : true,
-      planFirst: action?.case === "createTask" ? action.value.harnessMode === "plan" : false,
+      triggerKind: single.triggerKind,
+      schedule: single.schedule || EMPTY_DRAFT.schedule,
+      timezone: single.timezone || EMPTY_DRAFT.timezone,
+      registrationId: single.registrationId,
+      events: single.events,
+      profileId: single.profileId,
+      override: {
+        harness: single.harness ?? null,
+        modelRouter: single.modelRouter ?? null,
+        model: single.model ?? null,
+        effort: single.effort ?? null,
+        // Mode is the `planFirst` switch below, not one of these pickers.
+        mode: null,
+      },
+      promptTemplate: single.promptTemplate,
+      titleTemplate: single.titleTemplate,
+      includeEventContext: single.includeEventContext,
+      planFirst: single.harnessMode === "plan",
     });
     setHydratedId(automation.id);
   }, [existing.data?.automation, hydratedId, mode]);
@@ -407,35 +381,37 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
       setPreviewRequestError("");
       return;
     }
+    if (mode !== "edit" || !id) {
+      // v2 TestRender renders a saved automation (draft or stored definition);
+      // there is nothing to render against before the first save.
+      setPreview(null);
+      setPreviewRequestError("");
+      return;
+    }
     const timer = window.setTimeout(async () => {
       try {
-        const response = await testRender.mutateAsync({
-          ...(mode === "edit" && id ? { automationId: id } : {}),
-          automationName: draft.name || "Draft automation",
-          draftAction: {
-            action: {
-              case: "createTask",
-              value: {
-                // The preview renders templates only; the harness/model/effort
-                // override does not affect the rendered text.
-                profileId: draft.profileId,
-                promptTemplate: draft.promptTemplate,
-                ...(draft.titleTemplate.trim() ? { titleTemplate: draft.titleTemplate } : {}),
-                includeEventContext: draft.includeEventContext,
-                ...(draft.planFirst ? { harnessMode: "plan" } : {}),
-              },
-            },
-          },
-          ...(draft.triggerKind === "cron"
-            ? { scheduledFor: new Date().toISOString() }
-            : {
-                registrationId: draft.registrationId,
-                eventKey: draft.events[0] ?? "",
-                ...(selectedSampleId
-                  ? { sample: { case: "sampleId" as const, value: selectedSampleId } }
-                  : {}),
-              }),
+        const raw = await testRender.mutateAsync({
+          automationId: id,
+          draftDefinitionJson: definitionFromDraft({
+            triggerKind: draft.triggerKind,
+            schedule: draft.schedule,
+            timezone: draft.timezone,
+            registrationId: draft.registrationId,
+            events: draft.events,
+            // The preview renders templates only; the harness/model/effort
+            // override does not affect the rendered text.
+            profileId: draft.profileId,
+            promptTemplate: draft.promptTemplate,
+            titleTemplate: draft.titleTemplate,
+            includeEventContext: draft.includeEventContext,
+            ...(draft.planFirst ? { harnessMode: "plan" } : {}),
+          }),
+          sample: selectedSampleId
+            ? { case: "sampleId" as const, value: selectedSampleId }
+            : { case: undefined },
+          ...(draft.triggerKind === "cron" ? { scheduledFor: new Date().toISOString() } : {}),
         });
+        const response: RenderedPreview = { errors: raw.errors, ...singleBlockPreview(raw.blocks) };
         if (previewSequence.current === sequence) {
           setPreview(response);
           setPreviewRequestError("");
@@ -535,9 +511,9 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
     }
     const templateErrors: EditorErrors = {};
     for (const templateError of preview?.errors ?? []) {
-      if (templateError.field === "prompt_template") {
+      if (templateError.field === "promptTemplate") {
         templateErrors.promptTemplate = templateError.message;
-      } else if (templateError.field === "title_template") {
+      } else if (templateError.field === "titleTemplate") {
         templateErrors.titleTemplate = templateError.message;
       }
     }
@@ -546,41 +522,36 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
       return;
     }
     setErrors({});
-    const request = {
-      name: draft.name,
-      description: draft.description,
-      enabled: draft.enabled,
-      trigger: {
-        trigger:
-          draft.triggerKind === "cron"
-            ? {
-                case: "cron" as const,
-                value: { schedule: draft.schedule, timezone: draft.timezone },
-              }
-            : {
-                case: "webhook" as const,
-                value: { registrationId: draft.registrationId, events: draft.events },
-              },
-      },
-      action: {
-        action: {
-          case: "createTask" as const,
-          value: {
-            profileId: draft.profileId,
-            promptTemplate: draft.promptTemplate,
-            ...(draft.titleTemplate.trim() ? { titleTemplate: draft.titleTemplate } : {}),
-            includeEventContext: draft.includeEventContext,
-            ...(draft.planFirst ? { harnessMode: "plan" } : {}),
-            ...overrideFields(draft.override),
-          },
-        },
-      },
-    };
+    const definitionJson = definitionFromDraft({
+      triggerKind: draft.triggerKind,
+      schedule: draft.schedule,
+      timezone: draft.timezone,
+      registrationId: draft.registrationId,
+      events: draft.events,
+      profileId: draft.profileId,
+      promptTemplate: draft.promptTemplate,
+      titleTemplate: draft.titleTemplate,
+      includeEventContext: draft.includeEventContext,
+      ...(draft.planFirst ? { harnessMode: "plan" } : {}),
+      ...overrideFields(draft.override),
+    });
     try {
-      const response =
-        mode === "edit" && id
-          ? await updateAutomation.mutateAsync({ id, ...request })
-          : await createAutomation.mutateAsync(request);
+      let response;
+      if (mode === "edit" && id) {
+        await updateMeta.mutateAsync({ id, name: draft.name, description: draft.description });
+        response = await saveVersion.mutateAsync({ automationId: id, definitionJson });
+        if (response.automation && response.automation.enabled !== draft.enabled) {
+          response = await setEnabled.mutateAsync({ id, enabled: draft.enabled });
+        }
+      } else {
+        response = await createAutomation.mutateAsync({
+          name: draft.name,
+          description: draft.description,
+          enabled: draft.enabled,
+          definitionJson,
+          inputsJson: "{}",
+        });
+      }
       const saved = response.automation;
       if (!saved) throw new Error("Saved automation was not returned");
       toast.success(mode === "edit" ? "Automation updated" : "Automation created");
@@ -613,11 +584,21 @@ export function AutomationEditor({ mode }: { mode: "create" | "edit" }) {
     );
   }
 
-  const pending = createAutomation.isPending || updateAutomation.isPending;
+  const pending =
+    createAutomation.isPending ||
+    saveVersion.isPending ||
+    updateMeta.isPending ||
+    setEnabled.isPending;
   const availableEvents = events.data?.events ?? [];
 
   return (
     <div className="space-y-6">
+      {unsupportedGraph && (
+        <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+          This automation is a built-in or a multi-block graph. This editor can only change
+          single-block automations; the block editor arrives with the next release.
+        </div>
+      )}
       <PageHeading
         title={mode === "create" ? "New automation" : draft.name || "Automation"}
         actions={
