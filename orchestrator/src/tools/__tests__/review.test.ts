@@ -8,6 +8,7 @@ import type {
   ReviewStore,
   ReviewVerdictInput,
 } from "../../db/reviews.ts";
+import type { AutomationInbox } from "../../automations/engine/inbox.ts";
 import { REVIEW_TOPIC, type ReviewInbox } from "../../workflows/review-inbox.ts";
 import { compileToolManifest } from "../manifest.ts";
 import { createToolRegistry, type ToolContext } from "../registry.ts";
@@ -187,8 +188,25 @@ function reviewRegistry(
     reviews: store,
     reviewSessions: deps.reviewSessions ?? { find: async () => null },
     ...(deps.notify ? { notify: deps.notify } : {}),
+    // Default: not owned by an automation run, so the legacy binding decides.
+    findAutomationBinding: deps.findAutomationBinding ?? (async () => null),
+    ...(deps.notifyAutomation ? { notifyAutomation: deps.notifyAutomation } : {}),
   });
   return registry;
+}
+
+function automationNotifier() {
+  const calls: Array<{
+    runId: string;
+    message: AutomationInbox;
+    idempotencyKey: string;
+  }> = [];
+  const notifyAutomation: NonNullable<ReviewToolDeps["notifyAutomation"]> = async (
+    runId,
+    message,
+    idempotencyKey,
+  ) => void calls.push({ runId, message, idempotencyKey });
+  return { notifyAutomation, calls };
 }
 
 function notifier() {
@@ -422,6 +440,86 @@ describe("review tools", () => {
     await expect(failing.handler(
       context(failing.name),
       failing.input.parse({ summary_md: "Still recorded." }),
+    )).resolves.toEqual({ recorded: true });
+  });
+
+  test("finder_done on an automation-owned session signals the run, not the legacy workflow", async () => {
+    const fake = fakeReviewStore();
+    const legacy = notifier();
+    const automation = automationNotifier();
+    const done = reviewRegistry(fake.store, {
+      // Both bindings exist during the parallel window; the automation one wins.
+      reviewSessions: {
+        find: async () => ({ reviewWorkflowId: "review-wf-1", role: "finder" }),
+      },
+      notify: legacy.notify,
+      findAutomationBinding: async () => ({ runId: "autorun:auto-1:github:d1" }),
+      notifyAutomation: automation.notifyAutomation,
+    }).get("finder_done");
+    if (!done || done.handling !== "handled") throw new Error("finder_done not registered");
+
+    await expect(done.handler(
+      context(done.name),
+      done.input.parse({ summary_md: "Finished." }),
+    )).resolves.toEqual({ recorded: true });
+
+    expect(automation.calls).toEqual([{
+      runId: "autorun:auto-1:github:d1",
+      message: { kind: "signal", name: "finder_done", sessionId: "session-1" },
+      idempotencyKey: "autorun:session-1:signal:finder_done:call-1",
+    }]);
+    expect(legacy.calls).toEqual([]);
+  });
+
+  test("submit_verdict on an automation-owned session signals verifier_done to the run", async () => {
+    const fake = fakeReviewStore({
+      active: reviewRow({ status: "verifying" }),
+      detail: {
+        review: reviewRow({ status: "verifying" }),
+        findings: [findingRow()],
+        verdicts: [],
+      },
+    });
+    const legacy = notifier();
+    const automation = automationNotifier();
+    const verdict = reviewRegistry(fake.store, {
+      reviewSessions: {
+        find: async () => ({ reviewWorkflowId: "review-wf-1", role: "verifier" }),
+      },
+      notify: legacy.notify,
+      findAutomationBinding: async () => ({ runId: "autorun:auto-1:github:d1" }),
+      notifyAutomation: automation.notifyAutomation,
+    }).get("submit_verdict");
+    if (!verdict || verdict.handling !== "handled") {
+      throw new Error("submit_verdict not registered");
+    }
+
+    // The single candidate's verdict completes the phase.
+    await verdict.handler(context(verdict.name), verdict.input.parse({
+      finding_id: FINDING_ID,
+      verdict: "confirmed",
+      confidence: "high",
+      reasoning: "Reproduced.",
+    }));
+
+    expect(automation.calls.map((call) => call.message)).toEqual([
+      { kind: "signal", name: "verifier_done", sessionId: "session-1" },
+    ]);
+    expect(legacy.calls).toEqual([]);
+  });
+
+  test("an automation notification outage never fails the tool", async () => {
+    const fake = fakeReviewStore();
+    const done = reviewRegistry(fake.store, {
+      findAutomationBinding: async () => ({ runId: "autorun:auto-1:github:d1" }),
+      notifyAutomation: async () => {
+        throw new Error("mailbox unavailable");
+      },
+    }).get("finder_done");
+    if (!done || done.handling !== "handled") throw new Error("finder_done not registered");
+    await expect(done.handler(
+      context(done.name),
+      done.input.parse({ summary_md: "Still recorded." }),
     )).resolves.toEqual({ recorded: true });
   });
 
