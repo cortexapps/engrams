@@ -2,10 +2,7 @@
 
 import { createHash } from "node:crypto";
 
-import type { WebhookRegistrationRow } from "../db/automations.ts";
-
 export const EVENT_KEY_RE = /^[a-z0-9_-]+(?:\.[a-z0-9_-]+)*$/;
-export const SYSTEM_GITHUB_REGISTRATION_ID = "github-app";
 const DELIVERY_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/;
 const SAFE_PATH_RE = /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
 const UNSAFE_PATH_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
@@ -60,55 +57,15 @@ export interface ExtractedWebhookEvent {
   payload: Record<string, unknown>;
 }
 
+/** Generic custom-webhook extraction (ADR 0102 §2). Provider-shaped
+ * extraction (GitHub/Slack) lives on the integration ingress routes now
+ * (ADR 0119 D5). */
 export function extractWebhookEvent(input: {
-  registration: Pick<WebhookRegistrationRow, "verification" | "providerHint">;
   headers: Headers;
   rawBody: Uint8Array;
   payload?: Record<string, unknown>;
 }): ExtractedWebhookEvent {
   const payload = input.payload ?? parseWebhookPayload(input.rawBody);
-  const provider = input.registration.providerHint;
-  const scheme = input.registration.verification.scheme;
-
-  if (provider === "github" || scheme === "github_hmac_sha256") {
-    const base = requiredEventKey(input.headers.get("x-github-event"), "X-GitHub-Event");
-    const action = payload["action"];
-    const eventKey = action === undefined
-      ? base
-      : `${base}.${requiredEventKey(
-          typeof action === "string" ? action : null,
-          "GitHub payload action",
-        )}`;
-    return {
-      eventKey,
-      deliveryId: requiredDeliveryId(
-        input.headers.get("x-github-delivery"),
-        "X-GitHub-Delivery",
-      ),
-      payload,
-    };
-  }
-
-  if (provider === "slack" || scheme === "slack_v0") {
-    if (payload["type"] !== "event_callback") {
-      throw new WebhookEventError('Slack payload type must be "event_callback"');
-    }
-    const event = payload["event"];
-    if (typeof event !== "object" || event === null || Array.isArray(event)) {
-      throw new WebhookEventError("Slack event_callback must contain an event object");
-    }
-    return {
-      eventKey: requiredEventKey(
-        typeof (event as Record<string, unknown>)["type"] === "string"
-          ? (event as Record<string, unknown>)["type"] as string
-          : null,
-        "Slack inner event type",
-      ),
-      deliveryId: requiredDeliveryId(payload["event_id"], "Slack event_id"),
-      payload,
-    };
-  }
-
   const declaredDelivery = input.headers.get("x-engrams-delivery");
   return {
     eventKey: requiredEventKey(

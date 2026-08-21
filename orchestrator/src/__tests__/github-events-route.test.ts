@@ -139,13 +139,11 @@ function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment) {
   const dispatches: DispatchReviewInput[] = [];
   const ingresses: ReviewIngressStart[] = [];
   const refreshes: UpsertReviewTargetInput[] = [];
-  const automationDispatches: DispatchWebhookInput[] = [];
   const ingress = fakeIngress();
   return {
     dispatches,
     ingresses,
     refreshes,
-    automationDispatches,
     ledger: ingress.recorded,
     integrationDispatches: ingress.dispatched,
     app: makeGithubEventsRoute({
@@ -168,9 +166,6 @@ function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment) {
       refreshTarget: async (input) => {
         refreshes.push(input);
         return true;
-      },
-      automationDispatch: async (input) => {
-        automationDispatches.push(input);
       },
       now: () => new Date("2026-07-22T12:00:00Z"),
     }),
@@ -246,10 +241,11 @@ describe("POST /api/v1/integrations/github/events", () => {
     });
     expect(res.status).toBe(200);
     expect(fixture.dispatches).toEqual([]);
-    expect(fixture.automationDispatches).toHaveLength(1);
+    // Even a ping is a verified delivery: the spine ledgers it.
+    expect(fixture.integrationDispatches).toHaveLength(1);
   });
 
-  test("forwards an event ignored by the PR-review classifier to automations", async () => {
+  test("forwards an event ignored by the PR-review classifier to integration triggers", async () => {
     const body = JSON.stringify({
       action: "opened",
       issue: { number: 7, title: "Broken" },
@@ -264,21 +260,23 @@ describe("POST /api/v1/integrations/github/events", () => {
     });
     expect(res.status).toBe(200);
     expect(fixture.dispatches).toEqual([]);
-    expect(fixture.automationDispatches).toEqual([{
-      registrationId: "github-app",
-      registration: null,
-      eventKey: "issues.opened",
-      deliveryId: "delivery-1",
-      payload: {
-        action: "opened",
-        issue: { number: 7, title: "Broken" },
-        repository: { full_name: enrollment.repo },
-      },
-      receivedAt: new Date("2026-07-22T12:00:00Z"),
-    }]);
+    // The retired github-app system registration no longer exists; the
+    // 2.C integration-trigger seam is the only automation path.
+    expect(fixture.integrationDispatches).toEqual([
+      expect.objectContaining({
+        provider: "github",
+        eventKey: "issues.opened",
+        deliveryId: "delivery-1",
+        payload: {
+          action: "opened",
+          issue: { number: 7, title: "Broken" },
+          repository: { full_name: enrollment.repo },
+        },
+      }),
+    ]);
   });
 
-  test("every verified delivery lands in the integration-event ledger AND the legacy fan-out", async () => {
+  test("every verified delivery lands in the integration-event ledger and the trigger seam", async () => {
     const body = JSON.stringify({
       action: "opened",
       issue: { number: 7, title: "Broken" },
@@ -303,10 +301,8 @@ describe("POST /api/v1/integrations/github/events", () => {
       }),
     ]);
     expect(fixture.ledger[0]!.payload["token"]).toBeUndefined();
-    // …and dispatched to the 2.C trigger seam…
+    // …and dispatched to the trigger seam exactly once.
     expect(fixture.integrationDispatches).toHaveLength(1);
-    // …while the legacy github-app fan-out kept working (retires in 2.H).
-    expect(fixture.automationDispatches).toHaveLength(1);
   });
 
   test("a dispatch fault fails the delivery (500) so the provider retries; the ledger row stays", async () => {
@@ -604,7 +600,6 @@ describe("ingress → integration-trigger dispatch (2.C)", () => {
       }),
       startIngress: async () => {},
       refreshTarget: async () => true,
-      automationDispatch: async () => {},
       now: () => new Date("2026-08-21T12:00:00Z"),
     });
     return { route, ledger: ingress.recorded, starts };

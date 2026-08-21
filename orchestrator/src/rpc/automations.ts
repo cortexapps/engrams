@@ -68,7 +68,6 @@ import {
   renderAutomationTemplate,
   validateAutomationTemplate,
 } from "../automations/template.ts";
-import { SYSTEM_GITHUB_REGISTRATION_ID } from "../automations/webhook.ts";
 import { legacyRunStatus } from "../automations/legacy-compat.ts";
 import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
 import { getModelRouterDefinition, selectRouterProtocol } from "../model-routers/registry.ts";
@@ -183,10 +182,16 @@ function parseObjectJson(value: string, field: string): Record<string, unknown> 
 
 function verificationScheme(value: string): WebhookVerificationScheme {
   switch (value) {
-    case "github_hmac_sha256":
-    case "slack_v0":
     case "generic_hmac_sha256":
       return value;
+    case "github_hmac_sha256":
+    case "slack_v0":
+      // Retired with ADR 0119 D5: provider events ride the integration
+      // ingress routes and are selected as integration triggers.
+      throw new ConnectError(
+        `verification_scheme ${value} is retired; create an integration trigger for the provider, or a generic webhook`,
+        Code.InvalidArgument,
+      );
     default:
       throw new ConnectError("unknown verification_scheme", Code.InvalidArgument);
   }
@@ -438,6 +443,7 @@ function toProtoRegistration(row: WebhookRegistrationRow): ProtoWebhookRegistrat
     name: row.name,
     verificationScheme: row.verification.scheme,
     ...(row.providerHint ? { providerHint: row.providerHint } : {}),
+    ...(row.disabledReason !== null ? { disabledReason: row.disabledReason } : {}),
     ...(row.createdByUserId ? { createdByUserId: row.createdByUserId } : {}),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -626,7 +632,6 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       nextFireAt = nextCronFire(trigger.schedule, trigger.timezone, now());
     } else if (
       trigger.kind === "webhook"
-      && trigger.registrationId !== SYSTEM_GITHUB_REGISTRATION_ID
       && !(await store.getRegistration(trigger.registrationId))
     ) {
       throw new ConnectError("webhook registration not found", Code.InvalidArgument);
@@ -1011,9 +1016,11 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
             Code.InvalidArgument,
           );
         }
-        if (connector.webhook.verificationScheme !== scheme) {
+        if (connector.webhook.ingress) {
+          // The provider has its own verified ingress: its events are
+          // integration triggers, never a custom registration.
           throw new ConnectError(
-            `verification_scheme must be ${connector.webhook.verificationScheme} for ${providerHint}`,
+            `${providerHint} events arrive through the integration ingress; use an integration trigger instead of a custom webhook`,
             Code.InvalidArgument,
           );
         }

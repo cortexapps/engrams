@@ -1336,7 +1336,11 @@ export const routerSyncState = pgTable("router_sync_state", {
   lastError: text("last_error"),
 });
 
-export type WebhookVerificationScheme = "github_hmac_sha256" | "slack_v0" | "generic_hmac_sha256";
+/** Custom webhook registrations verify with the generic scheme only. The
+ * provider schemes (github_hmac_sha256, slack_v0) retired with ADR 0119 D5:
+ * provider events arrive on the integration ingress routes, verified by the
+ * connection's own secret. */
+export type WebhookVerificationScheme = "generic_hmac_sha256";
 
 export interface WebhookVerification {
   scheme: WebhookVerificationScheme;
@@ -1364,6 +1368,9 @@ export const webhookRegistration = pgTable(
     name: text("name").notNull(),
     verification: jsonb("verification").$type<WebhookVerification>().notNull(),
     providerHint: text("provider_hint"), // optional connector registry key
+    /** Non-null once the registration can no longer receive deliveries; the
+     * hook URL answers 410 Gone (ADR 0119 D5 scheme retirement). */
+    disabledReason: text("disabled_reason"),
     createdByUserId: text("created_by_user_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true })

@@ -16,6 +16,7 @@ const registration: WebhookRegistrationRow = {
     secretRef: "webhook.my-hook.secret",
   },
   providerHint: null,
+  disabledReason: null,
   createdByUserId: "admin-1",
   createdAt: NOW,
   updatedAt: NOW,
@@ -30,14 +31,15 @@ function signedHeaders(body: string): Record<string, string> {
   };
 }
 
-function fixture(found = true) {
+function fixture(found: boolean | WebhookRegistrationRow = true) {
   const dispatches: DispatchWebhookInput[] = [];
   const secretRequests: Array<{ provider: string; secretRef: string }> = [];
+  const row = found === true ? registration : found === false ? null : found;
   return {
     dispatches,
     secretRequests,
     app: makeHooksRoute({
-      store: { getRegistration: async () => found ? registration : null },
+      store: { getRegistration: async () => row },
       secretResolver: {
         async resolve(input) {
           secretRequests.push(input);
@@ -68,6 +70,23 @@ describe("POST /api/v1/hooks/:registrationId", () => {
     });
     expect(res.status).toBe(404);
     expect(f.secretRequests).toEqual([]);
+  });
+
+  test("answers 410 Gone for a retired registration before verification (ADR 0119 D5)", async () => {
+    const body = JSON.stringify({ incident: { id: 7 } });
+    const f = fixture({
+      ...registration,
+      disabledReason: "provider signature schemes retired — recreate as an integration trigger or a generic webhook",
+    });
+    const res = await f.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: signedHeaders(body),
+    });
+    expect(res.status).toBe(410);
+    expect(await res.json()).toMatchObject({ error: expect.stringContaining("retired") });
+    expect(f.secretRequests).toEqual([]);
+    expect(f.dispatches).toEqual([]);
   });
 
   test("rejects an invalid signature before parsing or dispatch", async () => {

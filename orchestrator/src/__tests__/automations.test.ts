@@ -200,6 +200,7 @@ function fakeStore(seed?: {
     async createRegistration(input) {
       const row: WebhookRegistrationRow = {
         ...input,
+        disabledReason: null,
         createdAt: NOW,
         updatedAt: NOW,
       };
@@ -214,6 +215,15 @@ function fakeStore(seed?: {
     },
     async deleteRegistration(id) {
       return registrations.delete(id);
+    },
+    async setRegistrationDisabledReason(id, reason) {
+      const row = registrations.get(id);
+      if (!row) return false;
+      registrations.set(id, { ...row, disabledReason: reason });
+      return true;
+    },
+    async replaceCurrentDefinition() {
+      throw new Error("not exercised by the RPC suite");
     },
     async getSample(id) {
       return samples.get(id) ?? null;
@@ -450,6 +460,7 @@ describe("AutomationService", () => {
         secretRef: "webhook.generic.secret",
       },
       providerHint: null,
+      disabledReason: null,
       createdByUserId: "admin",
       createdAt: NOW,
       updatedAt: NOW,
@@ -484,14 +495,14 @@ describe("AutomationService", () => {
     });
   });
 
-  test("accepts the github-app system registration without a PG registration row", async () => {
+  test("the retired github-app system registration is just an unknown registration", async () => {
     const { automations } = clients({
       getSession: session("admin", "admin"),
       store: fakeStore(),
       profiles: { getActive: async () => profile() },
       now: () => NOW,
     });
-    const created = await automations.createAutomation({
+    await expect(automations.createAutomation({
       name: "GitHub issues",
       description: "",
       enabled: true,
@@ -505,11 +516,7 @@ describe("AutomationService", () => {
         },
       },
       action: cronRequest.action,
-    });
-    expect(created.automation?.trigger?.trigger.value).toMatchObject({
-      registrationId: "github-app",
-      events: ["issues.opened"],
-    });
+    })).rejects.toMatchObject({ code: Code.InvalidArgument });
   });
 });
 
@@ -534,19 +541,73 @@ describe("WebhookRegistrationService", () => {
     });
 
     const created = await registrations.createWebhookRegistration({
-      id: "github-team",
-      name: "GitHub team",
-      verificationScheme: "github_hmac_sha256",
-      providerHint: "github",
+      id: "incident-feed",
+      name: "Incident feed",
+      verificationScheme: "generic_hmac_sha256",
     });
     expect(created.secret).toBe("generated-secret");
     expect(writes).toEqual([
-      { name: "webhook.github-team.secret", value: "generated-secret" },
+      { name: "webhook.incident-feed.secret", value: "generated-secret" },
     ]);
 
     const listed = await registrations.listWebhookRegistrations({});
-    expect(listed.registrations.map((row) => row.id)).toEqual(["github-team"]);
+    expect(listed.registrations.map((row) => row.id)).toEqual(["incident-feed"]);
     expect(Object.keys(listed.registrations[0]!)).not.toContain("secret");
+    expect(listed.registrations[0]!.disabledReason).toBeUndefined();
+  });
+
+  test("provider signature schemes and ingress-backed provider hints are rejected (ADR 0119 D5)", async () => {
+    const { registrations } = clients({
+      getSession: session("admin", "admin"),
+      store: fakeStore(),
+      profiles: { getActive: async () => profile() },
+      connectors: { async list() { return []; } },
+      randomSecret: () => "generated-secret",
+      orgSecret: {
+        async putSecret() { return {}; },
+        async deleteSecret() { return { deleted: true }; },
+      },
+    });
+    await expect(registrations.createWebhookRegistration({
+      id: "gh",
+      name: "GitHub",
+      verificationScheme: "github_hmac_sha256",
+    })).rejects.toMatchObject({ code: Code.InvalidArgument, rawMessage: expect.stringContaining("retired") });
+    await expect(registrations.createWebhookRegistration({
+      id: "sl",
+      name: "Slack",
+      verificationScheme: "slack_v0",
+    })).rejects.toMatchObject({ code: Code.InvalidArgument });
+    // A generic registration may not impersonate a provider that has its own
+    // verified ingress; that is an integration trigger now.
+    await expect(registrations.createWebhookRegistration({
+      id: "gh-generic",
+      name: "GitHub generic",
+      verificationScheme: "generic_hmac_sha256",
+      providerHint: "github",
+    })).rejects.toMatchObject({ code: Code.InvalidArgument, rawMessage: expect.stringContaining("integration trigger") });
+  });
+
+  test("a retired registration reports its disabled_reason", async () => {
+    const store = fakeStore({
+      registrations: [{
+        id: "old-slack",
+        name: "Old Slack hook",
+        verification: { scheme: "generic_hmac_sha256", secretRef: "webhook.old-slack.secret" },
+        providerHint: "slack",
+        disabledReason: "provider signature schemes retired",
+        createdByUserId: "admin",
+        createdAt: NOW,
+        updatedAt: NOW,
+      }],
+    });
+    const { registrations } = clients({
+      getSession: session("admin", "admin"),
+      store,
+      profiles: { getActive: async () => profile() },
+    });
+    const listed = await registrations.listWebhookRegistrations({});
+    expect(listed.registrations[0]!.disabledReason).toBe("provider signature schemes retired");
   });
 
   test("rolls the registration back when secret provisioning fails", async () => {
@@ -654,10 +715,11 @@ describe("WebhookRegistrationService", () => {
       id: "github-team",
       name: "GitHub team",
       verification: {
-        scheme: "github_hmac_sha256",
+        scheme: "generic_hmac_sha256",
         secretRef: "webhook.github-team.secret",
       },
       providerHint: "github",
+      disabledReason: null,
       createdByUserId: "admin",
       createdAt: NOW,
       updatedAt: NOW,

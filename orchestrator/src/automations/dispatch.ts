@@ -26,9 +26,8 @@ import {
   type AutomationSender,
 } from "./engine/inbox.ts";
 import { automationRunWorkflow, type AutomationRunWorkflowInput } from "../workflows/automation-run.ts";
-import { matchesWebhookFilter, SYSTEM_GITHUB_REGISTRATION_ID } from "./webhook.ts";
+import { matchesWebhookFilter } from "./webhook.ts";
 
-export { SYSTEM_GITHUB_REGISTRATION_ID } from "./webhook.ts";
 export const WEBHOOK_SAMPLE_RETENTION = 20;
 
 const log = rootLog.child({ component: "automation-dispatch" });
@@ -50,8 +49,7 @@ export interface AutomationWebhookStarter {
 
 export interface DispatchWebhookInput {
   registrationId: string;
-  /** Null for well-known system registrations that are not persisted in PG. */
-  registration: WebhookRegistrationRow | null;
+  registration: WebhookRegistrationRow;
   eventKey: string;
   deliveryId: string;
   payload: Record<string, unknown>;
@@ -228,15 +226,13 @@ export async function dispatchWebhookOccurrence(
   const sender = deps.sender ?? defaultAutomationSender;
   const now = deps.now ?? (() => new Date());
 
-  if (input.registration !== null) {
-    await store.recordWebhookSample({
-      registrationId: input.registrationId,
-      eventKey: input.eventKey,
-      payload: input.payload,
-      receivedAt: input.receivedAt,
-      retain: WEBHOOK_SAMPLE_RETENTION,
-    });
-  }
+  await store.recordWebhookSample({
+    registrationId: input.registrationId,
+    eventKey: input.eventKey,
+    payload: input.payload,
+    receivedAt: input.receivedAt,
+    retain: WEBHOOK_SAMPLE_RETENTION,
+  });
 
   const targets = (await store.listEnabledForWebhookRegistration(input.registrationId)).filter(
     (target) => {
