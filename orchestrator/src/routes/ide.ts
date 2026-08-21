@@ -164,27 +164,38 @@ export function makeIdeUpgradeHandler(
       if (v) headers.set(key, Array.isArray(v) ? v[0]! : v);
     }
 
-    // Auth + ownership — same gate as the HTTP leg. Reject Bun-safely:
-    // complete the upgrade, then close with 4000+status so the browser can
-    // read the reason (socket.write is a no-op under Bun — see server.ts).
-    const authz = await headerGuard(headers, parsed.sessionId, "shell");
-    if (!authz.ok) {
-      wss.handleUpgrade(req, socket, head, (ws) =>
-        ws.close(4000 + authz.status, `ide ${authz.status}`),
-      );
-      return true;
-    }
-
     const subprotocols = (req.headers["sec-websocket-protocol"] ?? "")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
 
-    // Complete the client upgrade first, THEN ensure the IDE: EnsureIde may
-    // auto-resume an evicted session (seconds), and holding the raw socket
-    // un-upgraded that long risks client timeouts. Failure closes 1011.
+    // Complete the client upgrade BEFORE the auth guard, not after.
+    //
+    // Under Bun, `ws` is the runtime's builtin shim and its `completeUpgrade`
+    // delegates to native `server.upgrade(req)`, which is only valid inside the
+    // request's OWN event-loop turn. `headerGuard` reads Postgres, so awaiting
+    // it first burned that window: `server.upgrade()` returned false and the
+    // shim called `abortHandshake` with an undefined response, throwing
+    // `TypeError: undefined is not an object (evaluating 'message')` out of
+    // this function. That is the error that was flooding the prod logs, and
+    // every IDE socket 502'd because of it.
+    //
+    // Authorization still happens before any bridge is built; a refused caller
+    // gets the same 4000+status close it always did, just after the handshake
+    // rather than instead of it.
     wss.handleUpgrade(req, socket, head, (clientWs) => {
       void (async () => {
+        const authz = await headerGuard(headers, parsed.sessionId, "shell");
+        if (!authz.ok) {
+          try {
+            clientWs.close(4000 + authz.status, `ide ${authz.status}`);
+          } catch {
+            /* already closing */
+          }
+          return;
+        }
+        // EnsureIde may auto-resume an evicted session (seconds); the client is
+        // already upgraded, so it waits on an open socket. Failure closes 1011.
         let port: number;
         try {
           ({ port } = await sessions.ensureIde({ sessionId: parsed.sessionId }));

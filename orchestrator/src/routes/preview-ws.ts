@@ -18,8 +18,11 @@
  *     Bun's native `WebSocket` client to that local port. The guest dev server
  *     does its own WS handshake over the tunnel; we bridge messages both ways.
  *
- * Auth is identical to the HTTP path (owner / admin / share-token), evaluated
- * BEFORE completing the upgrade.
+ * Auth is identical to the HTTP path (owner / admin / share-token). It is
+ * evaluated AFTER completing the upgrade and before any byte reaches the guest:
+ * Bun's builtin `ws` can only complete a handshake inside the request's own
+ * event-loop turn, so an awaited store lookup has to come second. A refused
+ * caller gets a 4000+status close on an accepted socket.
  */
 
 import net from "node:net";
@@ -137,31 +140,77 @@ export function makePreviewUpgradeHandler(
     const slug = previewHostLabel(req.headers.host, baseDomain);
     if (!slug) return reject(404);
 
-    const row = await getStore().getByHostLabel(slug);
-    if (!row) return reject(404);
-
-    // A WS handshake is not preflighted, so there is no OPTIONS carve-out here
-    // — but Origin IS sent, and it is the only thing standing between one
-    // session's page and another session's socket.
-    const origin = req.headers.origin;
-    if (origin && !(await isSiblingOrigin(origin, row, baseDomain, getStore()))) {
-      return reject(403);
-    }
-
-    const authz = await authorizeApp({ row, headers, getSession: resolveSession });
-    if (!authz.ok) return reject(authz.status);
-
     const subprotocols = (req.headers["sec-websocket-protocol"] ?? "")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
 
-    // Same guard as `reject`: everything above awaited I/O (a store lookup, a
-    // session resolve), so the client may well have hung up by now.
-    if (socket.destroyed || !socket.writable) return true;
-    wss.handleUpgrade(req, socket, head, (clientWs) => {
-      bridgeClientToGuest(clientWs, relay, authz.row.sessionId, authz.row.port, url, subprotocols);
-    });
+    // Handshake BEFORE the store lookup and the session resolve.
+    //
+    // Under Bun, `ws` is the runtime's builtin shim: `completeUpgrade`
+    // delegates to native `server.upgrade(req)`, which is only valid inside the
+    // request's OWN event-loop turn. Awaiting I/O first burns that window, and
+    // the shim then calls `abortHandshake` with an undefined response, throwing
+    // `TypeError: undefined is not an object (evaluating 'message')`.
+    //
+    // The `socket.destroyed || !socket.writable` check that used to guard this
+    // call could not catch it: the socket is still perfectly writable, it is
+    // Bun's upgrade window that is gone. That is why the 2026-08-20 mitigation
+    // did not hold.
+    //
+    // Everything below still runs before a single byte reaches the guest, so
+    // the origin check and app authorization gate exactly what they did before
+    // — they just close an accepted socket instead of refusing the handshake.
+    let accepted: WsConn | null = null;
+    try {
+      wss.handleUpgrade(req, socket, head, (clientWs) => {
+        accepted = clientWs;
+      });
+    } catch {
+      socket.destroy();
+      return true;
+    }
+    if (!accepted) {
+      socket.destroy();
+      return true;
+    }
+    const clientWs: WsConn = accepted;
+    const refuse = (status: number) => {
+      try {
+        clientWs.close(4000 + status, `preview ${status}`);
+      } catch {
+        /* already closing */
+      }
+    };
+
+    void (async () => {
+      try {
+        const row = await getStore().getByHostLabel(slug);
+        if (!row) return refuse(404);
+
+        // A WS handshake is not preflighted, so there is no OPTIONS carve-out
+        // here — but Origin IS sent, and it is the only thing standing between
+        // one session's page and another session's socket.
+        const origin = req.headers.origin;
+        if (origin && !(await isSiblingOrigin(origin, row, baseDomain, getStore()))) {
+          return refuse(403);
+        }
+
+        const authz = await authorizeApp({ row, headers, getSession: resolveSession });
+        if (!authz.ok) return refuse(authz.status);
+
+        bridgeClientToGuest(
+          clientWs,
+          relay,
+          authz.row.sessionId,
+          authz.row.port,
+          url,
+          subprotocols,
+        );
+      } catch {
+        refuse(500);
+      }
+    })();
     return true;
   };
 }

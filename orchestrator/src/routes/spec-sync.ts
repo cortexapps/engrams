@@ -726,36 +726,71 @@ export function makeSpecSyncUpgradeHandler(
       return reject(req, socket, head, 400, "unparsable url");
     }
     if (!parsed) return false;
+    if (!parsed.specId) return reject(req, socket, head, 400, "bad spec id");
+    if (!parsed.clientId) return reject(req, socket, head, 400, "bad client id");
+    const specId = parsed.specId;
+    const clientId = parsed.clientId;
+    const headers = requestHeaders(req);
 
+    // THE HANDSHAKE MUST COMPLETE BEFORE ANY AWAITED I/O.
+    //
+    // Under Bun, `ws` is the runtime's builtin shim, not the npm package, and
+    // its `completeUpgrade` does not write the 101 itself — it delegates to
+    // native `server.upgrade(req)`, which is only valid inside the request's
+    // OWN event-loop turn. Await a Postgres round-trip first and that window
+    // is gone: `server.upgrade()` returns false and the shim calls
+    // `abortHandshake(socket._httpMessage, 500)` with an undefined response,
+    // throwing `TypeError: undefined is not an object (evaluating 'message')`.
+    // The socket then dies with no response at all and the load balancer
+    // answers 502.
+    //
+    // That took the spec document offline for every spec in prod. A microtask
+    // is harmless; a real I/O turn is fatal — which is why it never reproduced
+    // against fakes that resolve immediately, and why an unauthenticated probe
+    // (no cookie, so no DB read) kept working while a signed-in browser failed.
+    //
+    // So: accept first, authorize second, and close with the same 4000+status
+    // the rejection path uses. This costs an accepted-then-closed socket for an
+    // unauthorized caller, which is exactly what `rejectUpgrade` already does.
+    let accepted: SpecSyncSocket | null = null;
     try {
-      if (!parsed.specId) return reject(req, socket, head, 400, "bad spec id");
-      if (!parsed.clientId) return reject(req, socket, head, 400, "bad client id");
-      const headers = requestHeaders(req);
-      const authz = await guard(headers, parsed.specId);
-      if (!authz.ok) return reject(req, socket, head, authz.status, "not a spec member");
-      if (!(await deps.resolveDraft(parsed.specId))) {
-        return reject(req, socket, head, 404, "spec is not drafting");
-      }
-      const specId = parsed.specId;
-      const clientId = parsed.clientId;
-
       wss.handleUpgrade(req, socket, head, (ws) => {
-        void hub
-          .connect(
-            specId,
-            clientId,
-            { id: authz.user.id, ...(authz.user.name ? { name: authz.user.name } : {}) },
-            ws,
-          )
-          .catch(() => ws.close(1011, "spec sync failed"));
+        accepted = ws as unknown as SpecSyncSocket;
       });
-      return true;
     } catch (error: unknown) {
-      deps.onWarning?.(
-        `Spec sync upgrade failed for ${req.url ?? "/"}: ${errorMessage(error)}`,
-      );
-      return rejectUpgrade(wss, req, socket, head, 500);
+      deps.onWarning?.(`Spec sync handshake failed for ${req.url ?? "/"}: ${errorMessage(error)}`);
+      socket.destroy();
+      return true;
     }
+    if (!accepted) {
+      deps.onWarning?.(`Spec sync handshake produced no socket for ${req.url ?? "/"}`);
+      socket.destroy();
+      return true;
+    }
+    const ws: SpecSyncSocket = accepted;
+
+    const refuse = (status: number, reason: string) => {
+      deps.onWarning?.(`Spec sync upgrade rejected (${status} ${reason}): ${req.url ?? "/"}`);
+      ws.close(Math.min(4000 + status, 4999), `spec sync ${status}`);
+    };
+
+    void (async () => {
+      try {
+        const authz = await guard(headers, specId);
+        if (!authz.ok) return refuse(authz.status, "not a spec member");
+        if (!(await deps.resolveDraft(specId))) return refuse(404, "spec is not drafting");
+        await hub.connect(
+          specId,
+          clientId,
+          { id: authz.user.id, ...(authz.user.name ? { name: authz.user.name } : {}) },
+          ws,
+        );
+      } catch (error: unknown) {
+        deps.onWarning?.(`Spec sync upgrade failed for ${req.url ?? "/"}: ${errorMessage(error)}`);
+        ws.close(4500, "spec sync 500");
+      }
+    })();
+    return true;
   };
 }
 
