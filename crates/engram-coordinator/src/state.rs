@@ -1249,21 +1249,31 @@ pub(crate) fn wire_events(
         .collect()
 }
 
-/// ADR 0073: which outbox row (if any) does this event confirm?
-/// - `run_started{prompt_id}` / `prompt_queued{prompt_id}` — the
-///   harness took ownership of the prompt (running it or holding it in
-///   its type-ahead queue; the queue survives via the replay the
-///   harness itself does, and an edit/dequeue of a queued prompt keeps
-///   its own confirmations).
+/// ADR 0073 → ADR 0052 (2026-08-20 correction): which outbox row (if
+/// any) does this event confirm?
+/// - `run_started{prompt_id}` / `prompt_steered{prompt_id}` — the
+///   prompt RAN (started a turn, or was injected into the running one).
+/// - `prompt_dequeued{prompt_id}` — the user withdrew it; the row is
+///   consumed-by-withdrawal and must never redeliver.
 /// - `tool_call_completed{tool_call_id}` — a generic tool result landed.
+///
+/// `prompt_queued` deliberately does NOT ack (the ADR 0052 silent-loss
+/// correction): the type-ahead queue is harness-process memory — a
+/// Shutdown-drain (idle capture) or harness restart after the queue
+/// event silently lost the prompt while the acked row could never
+/// redeliver. The row now stays delivered-but-unacked through the turn;
+/// `ACK_TIMEOUT` redeliveries during a long turn are deduped by the
+/// harness's `seen_prompt_ids` (one extra frame per prompt per 30 s,
+/// bounded), and a harness death re-delivers to the fresh process,
+/// which runs it — exactly once, per the #1305 oracle.
 pub(crate) fn outbox_ack_id(session_id: SessionId, event: &SessionEvent) -> Option<String> {
     match event {
         SessionEvent::HarnessRunStarted {
             prompt_id: Some(pid),
             ..
         } => Some(pid.clone()),
-        SessionEvent::HarnessPromptQueued { prompt_id, .. } => Some(prompt_id.clone()),
         SessionEvent::HarnessPromptSteered { prompt_id, .. } => Some(prompt_id.clone()),
+        SessionEvent::HarnessPromptDequeued { prompt_id, .. } => Some(prompt_id.clone()),
         SessionEvent::HarnessToolCallCompleted { tool_call_id, .. } => Some(
             engram_core::types::outbox::tool_result_outbox_id(session_id, tool_call_id),
         ),
@@ -1744,6 +1754,36 @@ pub(crate) mod tests {
         );
         assert_eq!(ev.kind(), "prompt_steered");
         assert_eq!(outbox_ack_id(session_id, &ev).as_deref(), Some("p-steer"));
+    }
+
+    /// ADR 0052 (2026-08-20 correction): `prompt_queued` must NOT ack —
+    /// the type-ahead queue is harness-process memory, and acking on the
+    /// queue event made a Shutdown-drain/harness-restart after it a
+    /// silent prompt loss (the row could never redeliver). The row now
+    /// stays unacked until the prompt RUNS (`run_started`/`prompt_
+    /// steered`) or the user WITHDRAWS it (`prompt_dequeued`, which must
+    /// ack terminally so a withdrawn prompt never redelivers).
+    #[test]
+    fn prompt_queued_does_not_ack_and_prompt_dequeued_does() {
+        let session_id = SessionId::new();
+        let queued = SessionEvent::from_harness(
+            HarnessEvent::PromptQueued {
+                prompt_id: "p-q".into(),
+                summary: Some("hi".into()),
+            },
+            chrono::Utc::now(),
+        );
+        assert_eq!(queued.kind(), "prompt_queued");
+        assert_eq!(outbox_ack_id(session_id, &queued), None);
+
+        let dequeued = SessionEvent::from_harness(
+            HarnessEvent::PromptDequeued {
+                prompt_id: "p-q".into(),
+            },
+            chrono::Utc::now(),
+        );
+        assert_eq!(dequeued.kind(), "prompt_dequeued");
+        assert_eq!(outbox_ack_id(session_id, &dequeued).as_deref(), Some("p-q"));
     }
 
     #[test]
@@ -2816,6 +2856,40 @@ pub(crate) mod tests {
                 .collect();
             out.dedup();
             Ok(out)
+        }
+        async fn outbox_get(
+            &self,
+            prompt_id: &str,
+        ) -> Result<Option<engram_core::types::outbox::OutboxRow>, MetaError> {
+            Ok(self
+                .outbox
+                .lock()
+                .iter()
+                .find(|r| r.prompt_id == prompt_id)
+                .cloned())
+        }
+        async fn outbox_update_prompt_text(
+            &self,
+            prompt_id: &str,
+            text: &str,
+        ) -> Result<bool, MetaError> {
+            let mut rows = self.outbox.lock();
+            match rows
+                .iter_mut()
+                .find(|r| r.prompt_id == prompt_id && r.acked_at.is_none())
+            {
+                Some(r) => {
+                    r.payload["text"] = serde_json::Value::String(text.to_string());
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+        async fn outbox_delete_unacked(&self, prompt_id: &str) -> Result<bool, MetaError> {
+            let mut rows = self.outbox.lock();
+            let before = rows.len();
+            rows.retain(|r| !(r.prompt_id == prompt_id && r.acked_at.is_none()));
+            Ok(rows.len() < before)
         }
         async fn outbox_next_due(
             &self,

@@ -1459,11 +1459,14 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
-    /// Fetch one row by id, regardless of due-ness or state. ADR 0108
-    /// A6: the boot pipeline peeks the create-time prompt row
-    /// (`create:{session_id}`) to stamp it into the spawn env — the
+    /// Fetch one row by id, regardless of due-ness or state. Read-only.
+    /// Two consumers: ADR 0108 A6's boot pipeline peeks the
+    /// `create:{session_id}` row to stamp it into the spawn env (the
     /// row is deliberately NOT due while it rides the boot, so the
-    /// due-gated `outbox_next_due` cannot see it. Read-only.
+    /// due-gated `outbox_next_due` cannot see it), and the edit/dequeue
+    /// cores read `delivered_at` to decide whether a live harness may
+    /// hold a queue copy (ADR 0052 correction — the forward must
+    /// succeed before the durable copy is touched in that case).
     async fn outbox_get(
         &self,
         prompt_id: &str,
@@ -1472,10 +1475,15 @@ pub trait MetadataStore: Send + Sync {
         Ok(None)
     }
 
-    /// Phase-1b type-ahead edit for a row the relay has NOT yet handed
-    /// off (`delivered_at IS NULL AND acked_at IS NULL`): swap the
-    /// prompt text in place. Returns false when no such row exists
-    /// (the prompt already reached the harness queue — edit it there).
+    /// Phase-1b type-ahead edit, on any UNACKED row (`acked_at IS
+    /// NULL`): swap the prompt text in place. ADR 0052 (2026-08-20
+    /// correction): with `prompt_queued` no longer acking, a queued
+    /// prompt's row stays delivered-but-unacked through the running
+    /// turn — the durable copy a redelivery reads — so an edit must
+    /// land HERE as well as in the harness's in-memory queue, or a
+    /// redelivery after a harness death would resurrect the pre-edit
+    /// text. An acked row (the prompt ran, or was withdrawn) is
+    /// immutable: returns false.
     async fn outbox_update_prompt_text(
         &self,
         prompt_id: &str,
@@ -1485,10 +1493,16 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
-    /// Phase-1b dequeue for an undelivered row: delete it. Returns
-    /// false when the row was already delivered/acked (dequeue via the
-    /// harness queue instead).
-    async fn outbox_delete_undelivered(&self, prompt_id: &str) -> Result<bool, MetaError> {
+    /// Phase-1b dequeue, on any UNACKED row: delete it, so the
+    /// withdrawn prompt can never redeliver. ADR 0052 (2026-08-20
+    /// correction): pre-correction this matched undelivered rows only
+    /// (a delivered row was already acked by `prompt_queued`, and the
+    /// harness queue owned the withdrawal); with the row now unacked
+    /// through the turn, the durable copy must die with the user's
+    /// dequeue — the harness's in-memory copy is dropped by the
+    /// forwarded `DequeueQueued`, best-effort. Returns false when no
+    /// unacked row exists (already ran, already withdrawn, unknown id).
+    async fn outbox_delete_unacked(&self, prompt_id: &str) -> Result<bool, MetaError> {
         let _ = prompt_id;
         Ok(false)
     }
