@@ -51,15 +51,36 @@ export function registerIntegrationActionBlock(): void {
         return { kind: "error", code: "engine_bug", message: "currentBlockId missing", retryable: false };
       }
       const params = await renderParams(config.params, (t) => ctx.render(t));
-      const outputs = await runtime.execute({
-        provider: config.provider,
-        actionId: config.actionId,
-        ...(config.connectionId !== undefined ? { connectionId: config.connectionId } : {}),
-        params,
-        runId: ctx.runId,
-        blockId: ctx.currentBlockId,
-      });
+      let outputs: Record<string, unknown>;
+      try {
+        outputs = await runtime.execute({
+          provider: config.provider,
+          actionId: config.actionId,
+          ...(config.connectionId !== undefined ? { connectionId: config.connectionId } : {}),
+          params,
+          runId: ctx.runId,
+          blockId: ctx.currentBlockId,
+        });
+      } catch (error) {
+        // The runtime raises typed errors carrying `permanent` (see
+        // automations/actions/errors.ts); surface transience honestly so the
+        // block's retry policy can act on 5xx/429-class failures.
+        return {
+          kind: "error",
+          code: "integration_action_failed",
+          message: error instanceof Error ? error.message : String(error),
+          retryable: isTransientActionError(error),
+        };
+      }
       return { kind: "ok", outputs };
     },
   });
+}
+
+function isTransientActionError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "permanent" in error &&
+    (error as Error & { permanent: unknown }).permanent === false
+  );
 }

@@ -43,6 +43,7 @@ import { AUTOMATION_TOPIC, type AutomationInbox } from "../automations/engine/in
 import { interpretAutomation, type EngineRunResult } from "../automations/engine/interpreter.ts";
 import type { EngineDeps, EngineSessionOps } from "../automations/engine/deps.ts";
 import { makeCodeBlockRuntime } from "../automations/code/runtime.ts";
+import { makeIntegrationActionRuntime } from "../automations/actions/runtime.ts";
 
 export interface AutomationRunWorkflowInput {
   runId: string;
@@ -219,6 +220,7 @@ function productionEngineDeps(): EngineDeps {
     sessions: makeProductionSessionOps({ store }),
     clock: { nowMs: () => Date.now() },
     code: makeCodeBlockRuntime(),
+    integrationActions: makeIntegrationActionRuntime(),
     async startQueuedRun(runId) {
       const run = await store.getRun(runId);
       if (!run) return;

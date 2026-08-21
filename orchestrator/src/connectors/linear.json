@@ -842,9 +842,6 @@
           },
           "description": {
             "type": "string"
-          },
-          "priority": {
-            "type": "integer"
           }
         },
         "required": [
@@ -886,7 +883,7 @@
       },
       "execute": {
         "kind": "graphql",
-        "document": "mutation EngramsCommentCreate($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }"
+        "document": "mutation EngramsAutomationCommentCreate($id: String, $issueId: String!, $body: String!) { commentCreate(input: { id: $id, issueId: $issueId, body: $body }) { success comment { id } } }"
       },
       "output": {
         "commentId": "data.commentCreate.comment.id"
