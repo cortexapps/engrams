@@ -229,11 +229,35 @@ describe("SpecShellPage", () => {
     act(() => {
       for (let attempt = 0; attempt < 7; attempt += 1) failedAttempt();
     });
-    expect(providerState.provider.disconnect).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/stopped trying/)).toBeTruthy();
+    // Deferred to a microtask to break the re-entrancy, so await it.
+    await waitFor(() => expect(providerState.provider.disconnect).toHaveBeenCalledTimes(1));
 
     screen.getByRole("button", { name: "Try again" }).click();
     await waitFor(() => expect(providerState.provider.connect).toHaveBeenCalledTimes(1));
+  });
+
+  // `disconnect()` re-enters y-websocket's closeWebsocketConnection, which
+  // re-emits `connection-close` BEFORE clearing `provider.ws`. Calling it from
+  // inside that handler recursed until the stack blew — seen in prod as
+  // `RangeError: Maximum call stack size exceeded`.
+  it("does not recurse when giving up triggers a disconnect", async () => {
+    providerState.listeners.clear();
+    providerState.provider.disconnect.mockReset();
+    providerState.provider.disconnect.mockImplementation(() => {
+      providerState.emit("connection-close", new CloseEvent("close", { code: 1006 }));
+    });
+
+    renderWithProviders(<SpecShellPage specId="spec-1" />);
+    await waitFor(() => expect(providerState.listeners.has("connection-close")).toBe(true));
+
+    act(() => {
+      for (let attempt = 0; attempt < 12; attempt += 1) failedAttempt();
+    });
+
+    expect(screen.getByText(/stopped trying/)).toBeTruthy();
+    await waitFor(() => expect(providerState.provider.disconnect).toHaveBeenCalledTimes(1));
+    providerState.provider.disconnect.mockReset();
   });
 
   // The error and close pair used to increment twice, so the pane gave up
@@ -257,7 +281,7 @@ describe("SpecShellPage", () => {
       failedAttempt();
     });
     expect(screen.getByText(/stopped trying/)).toBeTruthy();
-    expect(providerState.provider.disconnect).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(providerState.provider.disconnect).toHaveBeenCalledTimes(1));
   });
 
   it("names an application close code instead of retrying a refusal", async () => {

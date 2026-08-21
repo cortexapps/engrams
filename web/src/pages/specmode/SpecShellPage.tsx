@@ -296,6 +296,7 @@ function useSpecConnection(specId: string, enabled: boolean, phase: string | nul
       const nextConnection = createSpecConnection(specId);
       const provider = nextConnection.provider;
       let failures = 0;
+      let stopped = false;
 
       const onSync = (isSynced: boolean) => {
         setSynced(isSynced);
@@ -312,10 +313,18 @@ function useSpecConnection(specId: string, enabled: boolean, phase: string | nul
       // `connection-error` is deliberately NOT counted: a failed handshake
       // fires onerror AND onclose, so counting both halved these thresholds.
       const onAttemptEnded = () => {
+        // Re-entry guard. `disconnect()` calls y-websocket's
+        // closeWebsocketConnection, which emits `connection-close` BEFORE it
+        // clears `provider.ws` — so disconnecting from inside this handler
+        // re-enters it and recurses until the stack blows. Observed in prod as
+        // `RangeError: Maximum call stack size exceeded`.
+        if (stopped) return;
         failures += 1;
         if (failures >= LINK_STOP_AFTER_FAILURES) {
-          provider.disconnect();
+          stopped = true;
           setLink({ kind: "unreachable", stopped: true });
+          // Deferred for the same reason: break the synchronous re-entry.
+          queueMicrotask(() => provider.disconnect());
           return;
         }
         if (failures >= LINK_VISIBLE_AFTER_FAILURES) {
@@ -342,6 +351,7 @@ function useSpecConnection(specId: string, enabled: boolean, phase: string | nul
       provider.on("closed", onClosed);
       reconnect.current = () => {
         failures = 0;
+        stopped = false;
         setLink({ kind: "connecting" });
         provider.connect();
       };
