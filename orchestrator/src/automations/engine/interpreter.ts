@@ -33,17 +33,26 @@ import {
   type Frame,
 } from "./step-name.ts";
 
-export type RunTerminalStatus =
-  | "completed"
-  | "filtered"
-  | "failed"
-  | "superseded"
-  | "halted"
-  | "deadline";
+/** Single source of truth for terminal run statuses. Everything that gates
+ * on terminality (e.g. claimCronOccurrence) derives from this array, so a
+ * new status is a compile-time update, never a silently-frozen scheduler. */
+export const RUN_TERMINAL_STATUSES = [
+  "completed",
+  "filtered",
+  "failed",
+  "superseded",
+  "halted",
+  "deadline",
+] as const;
+
+export type RunTerminalStatus = (typeof RUN_TERMINAL_STATUSES)[number];
 
 export interface EngineRunInput {
   runId: string;
   automationId: string;
+  /** The registered workflow body's ENGINE_STEP_CONTRACT literal (ADR 0119
+   * D2); carried for observability, never branched on. */
+  contract?: number;
 }
 
 export interface EngineRunResult {
@@ -359,11 +368,14 @@ export async function interpretAutomation(
         // Teardown is best-effort; the reconciler owns stragglers.
       }
     }
+    // Terminal status FIRST: promotion selects pending runs, and a run that
+    // released its claim must already read as terminal so no later release
+    // can promote it.
+    await deps.store.finalizeRun(input.runId, terminal.status, terminal.error);
     if (terminal.status !== "superseded") {
       const promoted = await deps.store.releaseConcurrency(input.runId);
       if (promoted !== null && deps.startQueuedRun) await deps.startQueuedRun(promoted);
     }
-    await deps.store.finalizeRun(input.runId, terminal.status, terminal.error);
   }, FINALIZE_STEP);
 
   return terminal;

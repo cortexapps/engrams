@@ -1,4 +1,4 @@
-/** Lease-claimed dynamic cron scanner (ADR 0102). */
+/** Lease-claimed dynamic cron scanner (ADR 0102, runs on the ADR 0119 engine). */
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import { Cron } from "croner";
@@ -7,6 +7,7 @@ import { hostname } from "node:os";
 import { makeAutomationStore, type AutomationCronStore, type DueCronAutomation } from "../db/automations.ts";
 import { log as rootLog } from "../log.ts";
 import { automationRunWorkflow, type AutomationRunWorkflowInput } from "../workflows/automation-run.ts";
+import { automationRunId, cronDeliveryKey } from "./dispatch.ts";
 
 const log = rootLog.child({ component: "automation-scheduler" });
 
@@ -38,7 +39,7 @@ export function automationCronWorkflowId(
   automationId: string,
   scheduledFor: Date,
 ): string {
-  return `auto:${automationId}:${Math.floor(scheduledFor.getTime() / 1_000)}`;
+  return automationRunId(automationId, cronDeliveryKey(scheduledFor));
 }
 
 export function nextCronOccurrence(
@@ -56,7 +57,12 @@ export function nextCronOccurrence(
 
 /** One independently driveable scanner step. Every database decision remains
  * in AutomationCronStore; this function only sequences claim, durable start,
- * and the post-start schedule CAS. */
+ * and the post-start schedule CAS.
+ *
+ * Cron occurrences bypass concurrency admission in phase 1: the occurrence
+ * claim is already exclusive per (automation, scheduled_for), and no
+ * migrated automation carries a concurrency setting. Cron + concurrency
+ * composes when settings become authorable (phase 3). */
 export async function runSchedulerTick(
   deps: AutomationSchedulerTickDeps,
 ): Promise<AutomationSchedulerTickResult> {
@@ -70,11 +76,15 @@ export async function runSchedulerTick(
     errors: 0,
   };
 
-  for (const automation of due) {
+  for (const dueAutomation of due) {
+    const automation = dueAutomation.automation;
     try {
-      const scheduledFor = automation.nextFireAt;
+      const scheduledFor = dueAutomation.nextFireAt;
+      const workflowId = automationCronWorkflowId(automation.id, scheduledFor);
       const claim = await deps.store.claimCronOccurrence({
+        runId: workflowId,
         automationId: automation.id,
+        version: automation.currentVersion,
         scheduledFor,
         leaseOwner: deps.owner,
         leaseExpiresAt: new Date(now.getTime() + AUTOMATION_LEASE_TTL_MS),
@@ -83,29 +93,24 @@ export async function runSchedulerTick(
       if (claim === null) continue;
       if (claim.kind === "claimed") result.claimed++;
 
-      const nextFireAt = nextCronOccurrence(automation, now);
-      const workflowId = automationCronWorkflowId(automation.id, scheduledFor);
+      const nextFireAt = nextCronOccurrence(dueAutomation, now);
       const workflowInput: AutomationRunWorkflowInput = {
-        automationId: automation.id,
         runId: claim.run.id,
-        trigger: { source: "cron" },
-        scheduledFor: scheduledFor.toISOString(),
-        // Keep retries of this occurrence byte-for-byte stable.
-        receivedAt: scheduledFor.toISOString(),
+        automationId: automation.id,
       };
 
       if (claim.kind === "terminal") {
-        if (claim.run.status !== "skipped") {
+        if (claim.run.status !== "filtered") {
           // This is the start-before-advance crash window. Starting the same
           // terminal DBOS id is a no-op and never creates a successor epoch.
-          await deps.workflowStarter.start(workflowInput, workflowId);
+          await deps.workflowStarter.start(workflowInput, claim.run.id);
           result.started++;
         }
         await deps.store.advanceCronSchedule({
           automationId: automation.id,
           scheduledFor,
           nextFireAt,
-          fired: claim.run.status !== "skipped",
+          fired: claim.run.status !== "filtered",
           now,
         });
         continue;
@@ -128,7 +133,7 @@ export async function runSchedulerTick(
         continue;
       }
 
-      await deps.workflowStarter.start(workflowInput, workflowId);
+      await deps.workflowStarter.start(workflowInput, claim.run.id);
       result.started++;
       await deps.store.advanceCronSchedule({
         automationId: automation.id,
@@ -139,7 +144,7 @@ export async function runSchedulerTick(
       });
     } catch (error) {
       result.errors++;
-      deps.onError?.(automation, error);
+      deps.onError?.(dueAutomation, error);
     }
   }
   return result;
@@ -195,7 +200,7 @@ export function makeProductionAutomationScheduler(): AutomationScheduler {
       },
     },
     onError(automation, error) {
-      log.error({ automationId: automation.id, error }, "automation scheduler tick failed");
+      log.error({ automationId: automation.automation.id, error }, "automation scheduler tick failed");
     },
   });
 }

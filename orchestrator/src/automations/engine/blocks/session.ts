@@ -8,6 +8,10 @@
 
 import { z } from "zod";
 
+import {
+  appendAutomationEventContext,
+  AUTOMATION_OUTPUT_MAX_CHARS,
+} from "../../template.ts";
 import { sessionRefSchema } from "../definition.ts";
 import type { RunContext } from "../context.ts";
 import type { AutomationInbox } from "../inbox.ts";
@@ -62,7 +66,26 @@ async function executeCreateSession(
   config: CreateSessionConfig,
   ctx: RunContext,
 ): Promise<BlockOutcome> {
-  const prompt = await ctx.render(config.promptTemplate);
+  let prompt = await ctx.render(config.promptTemplate);
+  // ADR 0102 parity: includeEventContext appends the redacted payload with
+  // the untrusted-data disclaimer, exactly as renderAutomationAction did on
+  // the legacy run path. trigger.event is the event key; a cron/manual run
+  // has none and appends nothing (the legacy gate).
+  if (config.includeEventContext && typeof ctx.trigger.event === "string") {
+    prompt = appendAutomationEventContext(prompt, {
+      automationName: ctx.automationName,
+      eventKey: ctx.trigger.event,
+      redactedPayload: ctx.event.raw,
+    });
+    if (prompt.length > AUTOMATION_OUTPUT_MAX_CHARS) {
+      return {
+        kind: "error",
+        code: "output_too_long",
+        message: `prompt with event context is ${prompt.length} characters (max ${AUTOMATION_OUTPUT_MAX_CHARS})`,
+        retryable: false,
+      };
+    }
+  }
   const title = config.titleTemplate !== undefined ? await ctx.render(config.titleTemplate) : null;
   const created = await ctx.deps.sessions.createSession({
     runId: ctx.runId,
