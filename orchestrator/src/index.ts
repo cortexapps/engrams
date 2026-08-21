@@ -156,6 +156,10 @@ import { SpecTicketSyncService } from "./specs/ticket-sync-service.ts";
 import { PostgresSpecTicketSyncStore } from "./specs/ticket-sync-store.ts";
 import { makeSpecTicketSyncConnector } from "./specs/ticket-sync-connector.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
+import { retireProviderWebhookSchemes } from "./automations/retire-provider-webhooks.ts";
+import { makeVerificationSecretResolver } from "./automations/verify.ts";
+import { makeAutomationStore } from "./db/automations.ts";
+import { orgSecret as controlPlaneOrgSecret } from "./control-plane/client.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
 
@@ -633,6 +637,28 @@ await Promise.all([
 void seedReviewerProfile(makeProfileStore(getDb()), integrationConnections, log).catch((err) =>
   log.error({ err }, "reviewer profile seed failed"),
 );
+// ADR 0119 D5: one-shot, idempotent move of provider-scheme webhooks onto
+// integration triggers. Needs the default connections ensured above.
+{
+  const secretResolver = makeVerificationSecretResolver();
+  void retireProviderWebhookSchemes({
+    store: makeAutomationStore(getDb()),
+    connections: integrationConnections,
+    orgSecret: controlPlaneOrgSecret,
+    registry: configuredConnectors,
+    async ingressReady(provider) {
+      const ingress = configuredConnectors.get(provider)?.webhook?.ingress;
+      if (!ingress) return false;
+      try {
+        await secretResolver.resolve({ provider, secretRef: ingress.secretRef });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    log,
+  }).catch((err) => log.error({ err }, "provider webhook scheme retirement failed"));
+}
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
 assertSweepPoliciesExhaustive();
