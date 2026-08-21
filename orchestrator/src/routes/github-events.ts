@@ -9,7 +9,6 @@ import {
 } from "../automations/dispatch.ts";
 import {
   extractWebhookEvent,
-  parseWebhookPayload,
   redactWebhookPayload,
   WebhookEventError,
 } from "../automations/webhook.ts";
@@ -28,7 +27,12 @@ import {
   getGithubWebhookSecret,
   verifyGithubSignature,
 } from "../integrations/github.ts";
-import { BodyTooLargeError, readBoundedBody } from "../http/bounded-body.ts";
+import {
+  handleIntegrationDelivery,
+  type HandleDeliveryDeps,
+  type IntegrationEventRoute,
+} from "../automations/integration-ingress.ts";
+import { ownPath } from "../automations/paths.ts";
 import { log as rootLog } from "../log.ts";
 import {
   dispatchReview,
@@ -59,6 +63,8 @@ export interface GithubEventsDeps {
    *  must never create dossiers for pull requests engrams has never reviewed. */
   refreshTarget?: (input: UpsertReviewTargetInput) => Promise<boolean>;
   automationDispatch?: (input: DispatchWebhookInput) => Promise<unknown>;
+  /** Ingress-spine seams (ledger store, new-trigger dispatch, connection). */
+  ingress?: HandleDeliveryDeps;
   now?: () => Date;
   /** The review App's @-mention handle (its slug). Defaults to the deployment's
    *  GITHUB_APP_LOGIN; blank disables mention commands. */
@@ -93,52 +99,82 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
   });
   const automationDispatch = deps.automationDispatch ?? dispatchWebhookOccurrence;
   const now = deps.now ?? (() => new Date());
+  const ingressDeps: HandleDeliveryDeps = { ...(deps.ingress ?? {}), now };
+
+  // The ingress spine (ADR 0119 D5): verify → ledger → new-trigger dispatch.
+  // Verification is the same App-webhook-secret HMAC as before; extraction is
+  // deliberately tolerant (skip, never reject) so the PR-review classifier
+  // below keeps its exact behavior for every signed request.
+  const ingressRoute: IntegrationEventRoute = {
+    provider: "github",
+    displayName: "GitHub (default)",
+    verify: async (headers, rawBody) =>
+      verifyGithubSignature(
+        await webhookSecret(),
+        rawBody,
+        headers.get("x-hub-signature-256") ?? undefined,
+      ),
+    extract: (headers, payload) => {
+      const base = headers.get("x-github-event");
+      if (!base) return { kind: "skip", reason: "missing x-github-event" };
+      const action = payload["action"];
+      if (action !== undefined && (typeof action !== "string" || action === "")) {
+        return { kind: "skip", reason: "non-string payload action" };
+      }
+      const deliveryId = headers.get("x-github-delivery");
+      if (!deliveryId) return { kind: "skip", reason: "missing x-github-delivery" };
+      const repo = ownPath(payload, "repository.full_name");
+      return {
+        kind: "event",
+        event: {
+          eventKey: action === undefined ? base : `${base}.${action}`,
+          deliveryId,
+          ...(typeof repo === "string" ? { scopeValue: repo.toLowerCase() } : {}),
+        },
+      };
+    },
+  };
+
   const app = new Hono();
 
   app.post("/api/v1/integrations/github/events", async (c) => {
-    let rawBytes: Uint8Array;
-    try {
-      rawBytes = await readBoundedBody(c.req.raw);
-    } catch (error) {
-      if (error instanceof BodyTooLargeError) return c.body(null, 413);
-      throw error;
+    const delivery = await handleIntegrationDelivery(ingressRoute, c.req.raw, ingressDeps);
+    if (delivery.kind === "rejected" || delivery.kind === "responded") {
+      return delivery.response;
     }
-    const valid = verifyGithubSignature(
-      await webhookSecret(),
-      rawBytes,
-      c.req.header("x-hub-signature-256"),
-    );
-    if (!valid) return c.json({ error: "invalid signature" }, 401);
-
+    const rawBytes = delivery.rawBody;
     const rawBody = new TextDecoder().decode(rawBytes);
-    // The installed GitHub App is a well-known system registration. It has no
-    // PG registration row, so dispatch skips sample persistence but still
-    // matches automations bound to "github-app". This happens before the
-    // PR-review classifier so every verified GitHub event is forwarded.
-    try {
-      const occurrence = extractWebhookEvent({
-        registration: {
-          verification: { scheme: "github_hmac_sha256", secretRef: "github.webhook_secret" },
-          providerHint: "github",
-        },
-        headers: c.req.raw.headers,
-        rawBody: rawBytes,
-        payload: parseWebhookPayload(rawBytes),
-      });
-      await automationDispatch({
-        registrationId: SYSTEM_GITHUB_REGISTRATION_ID,
-        registration: null,
-        eventKey: occurrence.eventKey,
-        deliveryId: occurrence.deliveryId,
-        payload: redactWebhookPayload(occurrence.payload),
-        receivedAt: now(),
-      });
-    } catch (error) {
-      if (!(error instanceof WebhookEventError)) throw error;
-      // Preserve the pre-existing PR-review classifier's tolerant behavior for
-      // signed-but-malformed/non-JSON requests. Legitimate GitHub deliveries
-      // always carry the event and delivery headers and a JSON object body.
-      log.warn({ error: error.message }, "github delivery not eligible for automation dispatch");
+    const parsedPayload = delivery.payload;
+
+    // Legacy github-app fan-out (retires with the provider HMAC schemes): the
+    // installed GitHub App is a well-known system registration with no PG row;
+    // automations bound to "github-app" still receive every verified event.
+    if (parsedPayload !== undefined) {
+      try {
+        const occurrence = extractWebhookEvent({
+          registration: {
+            verification: { scheme: "github_hmac_sha256", secretRef: "github.webhook_secret" },
+            providerHint: "github",
+          },
+          headers: c.req.raw.headers,
+          rawBody: rawBytes,
+          payload: parsedPayload,
+        });
+        await automationDispatch({
+          registrationId: SYSTEM_GITHUB_REGISTRATION_ID,
+          registration: null,
+          eventKey: occurrence.eventKey,
+          deliveryId: occurrence.deliveryId,
+          payload: redactWebhookPayload(occurrence.payload),
+          receivedAt: now(),
+        });
+      } catch (error) {
+        if (!(error instanceof WebhookEventError)) throw error;
+        // Preserve the pre-existing PR-review classifier's tolerant behavior
+        // for signed-but-malformed requests. Legitimate GitHub deliveries
+        // always carry the event and delivery headers and a JSON object body.
+        log.warn({ error: error.message }, "github delivery not eligible for automation dispatch");
+      }
     }
 
     const event = classifyGithubEvent(

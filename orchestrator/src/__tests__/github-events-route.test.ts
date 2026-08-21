@@ -4,6 +4,11 @@ import { describe, expect, test } from "bun:test";
 import type { EnrollmentRow } from "../db/enrollments.ts";
 import type { UpsertReviewTargetInput } from "../db/reviews.ts";
 import type { DispatchWebhookInput } from "../automations/dispatch.ts";
+import type { IntegrationEventDispatchInput } from "../automations/integration-ingress.ts";
+import type {
+  IntegrationEventStore,
+  RecordIntegrationEventInput,
+} from "../db/integration-events.ts";
 import type { DispatchReviewInput } from "../workflows/dispatch-review.ts";
 import type { ReviewIngressStart } from "../workflows/review-ingress.ts";
 import { makeGithubEventsRoute } from "../routes/github-events.ts";
@@ -88,17 +93,63 @@ function commentBody(
   });
 }
 
+/** In-memory ingress-spine seams: the ledger store, connection resolution,
+ * and the 2.C dispatch — no database. */
+export function fakeIngress() {
+  const recorded: RecordIntegrationEventInput[] = [];
+  const dispatched: IntegrationEventDispatchInput[] = [];
+  const store: IntegrationEventStore = {
+    async record(input) {
+      const duplicate = recorded.some(
+        (e) =>
+          e.provider === input.provider &&
+          e.connectionId === input.connectionId &&
+          e.deliveryId === input.deliveryId,
+      );
+      if (!duplicate) recorded.push(input);
+      return { recorded: !duplicate };
+    },
+    async sweepExpired() {
+      return 0;
+    },
+    async list() {
+      return [];
+    },
+    async getLatest() {
+      return null;
+    },
+    async listObservedEventKeys() {
+      return [];
+    },
+  };
+  return {
+    recorded,
+    dispatched,
+    deps: {
+      store,
+      connectionIdFor: async (provider: string) => `conn-${provider}`,
+      dispatch: async (input: IntegrationEventDispatchInput) => {
+        dispatched.push(input);
+      },
+    },
+  };
+}
+
 function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment) {
   const dispatches: DispatchReviewInput[] = [];
   const ingresses: ReviewIngressStart[] = [];
   const refreshes: UpsertReviewTargetInput[] = [];
   const automationDispatches: DispatchWebhookInput[] = [];
+  const ingress = fakeIngress();
   return {
     dispatches,
     ingresses,
     refreshes,
     automationDispatches,
+    ledger: ingress.recorded,
+    integrationDispatches: ingress.dispatched,
     app: makeGithubEventsRoute({
+      ingress: ingress.deps,
       webhookSecret: async () => SECRET,
       mentionHandle: "acme-reviewer",
       enrollments: { get: async () => enrolled ? enrollmentRow : null },
@@ -136,6 +187,7 @@ describe("POST /api/v1/integrations/github/events", () => {
         secretCalls++;
         return SECRET;
       },
+      ingress: fakeIngress().deps,
     });
     const body = "{}";
     const res = await route.request(PATH, {
@@ -224,6 +276,50 @@ describe("POST /api/v1/integrations/github/events", () => {
       },
       receivedAt: new Date("2026-07-22T12:00:00Z"),
     }]);
+  });
+
+  test("every verified delivery lands in the integration-event ledger AND the legacy fan-out", async () => {
+    const body = JSON.stringify({
+      action: "opened",
+      issue: { number: 7, title: "Broken" },
+      repository: { full_name: "OpenAI/Engrams" },
+      token: "must-not-persist",
+    });
+    const fixture = app();
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "issues"),
+    });
+    expect(res.status).toBe(200);
+    // The spine ledgered the redacted payload with the lowercased repo scope…
+    expect(fixture.ledger).toEqual([
+      expect.objectContaining({
+        provider: "github",
+        connectionId: "conn-github",
+        eventKey: "issues.opened",
+        deliveryId: "delivery-1",
+        scopeValue: "openai/engrams",
+      }),
+    ]);
+    expect(fixture.ledger[0]!.payload["token"]).toBeUndefined();
+    // …and dispatched to the 2.C trigger seam…
+    expect(fixture.integrationDispatches).toHaveLength(1);
+    // …while the legacy github-app fan-out kept working (retires in 2.H).
+    expect(fixture.automationDispatches).toHaveLength(1);
+  });
+
+  test("the PR-review classifier still runs on a spine-ledgered delivery", async () => {
+    const body = pullRequestBody();
+    const fixture = app();
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "pull_request"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.ledger).toHaveLength(1);
+    expect(fixture.ingresses).toHaveLength(1);
   });
 
   test("drops un-enrolled repos", async () => {
