@@ -321,10 +321,6 @@
   color: var(--instrument-caution);
 }
 
-.spec-mode-section-glyph[data-glyph-tone="reading"] {
-  color: var(--ring);
-}
-
 .spec-mode-section-glyph[data-proposed="true"] {
   animation: penbeat 2.4s ease-in-out infinite;
 }

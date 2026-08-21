@@ -14,7 +14,13 @@ describe("SectionList", () => {
     expect(screen.getByRole("img", { name: "Proposed" }).textContent).toBe("◐");
     expect(screen.getAllByRole("img", { name: "Open" })[0]?.textContent).toBe("○");
     expect(screen.getByRole("img", { name: "Has open questions" }).textContent).toBe("⚑");
-    expect(screen.getByRole("img", { name: "Being read" }).textContent).toBe("●");
+    // The section the reader is on keeps its own state glyph: it is marked by
+    // the row, not by taking the glyph slot.
+    expect(screen.queryByRole("img", { name: "Being read" })).toBeNull();
+    expect(screen.getByRole("button", { name: /Data model/ }).getAttribute("aria-current")).toBe(
+      "true",
+    );
+    expect(screen.getByRole("button", { name: /API/ }).getAttribute("aria-current")).toBeNull();
     expect(screen.getByText("Settled by Ada")).toBeTruthy();
     expect(screen.getByLabelText("2 open questions")).toBeTruthy();
     expect(screen.getByRole("button", { name: /Rollout/ }).dataset.reached).toBe("false");

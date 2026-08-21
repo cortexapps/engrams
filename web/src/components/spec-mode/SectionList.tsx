@@ -42,6 +42,9 @@ export function SectionList({
                 data-state={section.state}
                 data-reached={section.isReached ? "true" : "false"}
                 data-reading={section.isBeingRead ? "true" : undefined}
+                // Where the reader is, said semantically rather than by
+                // stealing the state glyph.
+                aria-current={section.isBeingRead ? "true" : undefined}
                 onClick={() => onSelectSection(section.id)}
               >
                 <SectionGlyph section={section} />
@@ -93,7 +96,7 @@ export function SectionList({
           Legend
         </Text>
         <Text as="span" variant="code" tone="muted">
-          ✓ settled · ◐ proposed · ○ open · ● reading · ⚑ questions
+          ✓ settled · ◐ proposed · ○ open · ⚑ questions
         </Text>
       </footer>
     </div>
