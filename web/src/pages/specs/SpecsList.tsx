@@ -196,7 +196,16 @@ export function SpecRow({ spec, now }: { spec: SpecListItem; now: number }) {
         )}
       </TableCell>
       <TableCell>
-        <SpecTicketSyncBadge state={spec.ticketSyncState} />
+        {/* The badge is deliberately absent before a ticket draft exists, but
+            the cell still needs the same em dash People and Questions use —
+            a blank cell on every row reads as a column that failed to load. */}
+        {spec.ticketSyncState && spec.ticketSyncState !== "none" ? (
+          <SpecTicketSyncBadge state={spec.ticketSyncState} />
+        ) : (
+          <span aria-label="No tickets" className="text-muted-foreground">
+            —
+          </span>
+        )}
       </TableCell>
       <TableCell className="text-right font-mono text-xs tabular-nums text-muted-foreground">
         {relativeTime(spec.updatedAt, now)}

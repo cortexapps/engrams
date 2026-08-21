@@ -156,9 +156,7 @@ function ConfirmFace({
       {completeness ? (
         <Text {...(unsettled > 0 ? { role: "status" } : { tone: "muted" as const })}>
           {completeness.complete} of {completeness.total} sections settled.
-          {unsettled > 0
-            ? ` Publishing pins the other ${unsettled} ${unsettled === 1 ? "section" : "sections"} as ${unsettled === 1 ? "it stands" : "they stand"}.`
-            : ""}
+          {unsettled > 0 ? ` ${unsettledSentence(completeness.complete, unsettled)}` : ""}
         </Text>
       ) : null}
 
@@ -253,6 +251,15 @@ function PublishingFace({ publish, onClose }: { publish: SpecPublishRecord; onCl
       </DialogFooter>
     </>
   );
+}
+
+// "the other 11" only makes sense when some are settled. With none settled
+// there is nothing for the rest to be "other" than, so say "all".
+export function unsettledSentence(settled: number, unsettled: number): string {
+  const noun = unsettled === 1 ? "section" : "sections";
+  const verb = unsettled === 1 ? "it stands" : "they stand";
+  const scope = settled === 0 ? `all ${unsettled}` : `the other ${unsettled}`;
+  return `Publishing pins ${scope} ${noun} as ${verb}.`;
 }
 
 function publishErrorMessage(reason: SpecPublishRefusalReason | undefined) {
