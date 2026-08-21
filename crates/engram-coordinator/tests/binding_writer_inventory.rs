@@ -71,7 +71,7 @@ const DECLARED: &[(&str, &str, usize, &str)] = &[
     ("session_ops", "transition_session", 2, "the wrappers' epoch-0 fallbacks"),
     ("session_verbs", "fenced_assign_sandbox", 1, "destroy's host-affinity clear (sandbox already detached by the fused flip)"),
     ("session_verbs", "fenced_transition_session", 1, "rebuild_binding's ATOMIC release: Idle flip + Detach in one write (#1237 review — the two-write window stranded Created+unbound)"),
-    ("session_verbs", "transition_with_fence", 6, "boot-failure Detach flips + evict exhaustion Retain + unreachable RequireUnbound + destroy Detach fusion"),
+    ("session_verbs", "transition_with_fence", 7, "boot-failure Detach flips + evict exhaustion Retain + unreachable RequireUnbound + destroy Detach fusion + resume-streak demotion Detach (#1314: Idle→Dead / Created→Failed on a row with no live binding)"),
 ];
 
 fn strip_line_comments(source: &str) -> String {

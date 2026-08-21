@@ -3214,6 +3214,33 @@ pub(crate) mod tests {
             Ok(self.ops.pending_exists(session_id, kind))
         }
 
+        /// Issue #1314: mirrors PG — failed resume ops with a
+        /// side-effectful step, newer than the latest done resume.
+        async fn op_resume_failure_streak(&self, session_id: SessionId) -> Result<i64, MetaError> {
+            use engram_core::types::session_op::{OpKind, OpState};
+            let all = self.ops.all();
+            let last_done = all
+                .iter()
+                .filter(|o| {
+                    o.session_id == session_id
+                        && o.kind == OpKind::Resume
+                        && o.state == OpState::Done
+                })
+                .map(|o| o.id)
+                .max()
+                .unwrap_or(0);
+            Ok(all
+                .iter()
+                .filter(|o| {
+                    o.session_id == session_id
+                        && o.kind == OpKind::Resume
+                        && o.state == OpState::Failed
+                        && o.id > last_done
+                        && matches!(o.step.as_deref(), Some("restore" | "bind" | "finish"))
+                })
+                .count() as i64)
+        }
+
         async fn fenced_transition_session(
             &self,
             session_id: SessionId,

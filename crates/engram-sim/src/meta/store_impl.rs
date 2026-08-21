@@ -2363,6 +2363,35 @@ impl MetadataStore for SimMetadataStore {
         }))
     }
 
+    /// Issue #1314: mirrors PG — failed resume ops that recorded a
+    /// side-effectful step (`restore`/`bind`/`finish`), newer than the
+    /// latest successful (`done`) resume.
+    async fn op_resume_failure_streak(&self, session_id: SessionId) -> Result<i64, MetaError> {
+        use engram_core::types::session_op::{OpKind, OpState};
+        self.gate()?;
+        let db = self.db.lock();
+        let last_done = db
+            .session_ops
+            .values()
+            .filter(|o| {
+                o.session_id == session_id && o.kind == OpKind::Resume && o.state == OpState::Done
+            })
+            .map(|o| o.id)
+            .max()
+            .unwrap_or(0);
+        Ok(db
+            .session_ops
+            .values()
+            .filter(|o| {
+                o.session_id == session_id
+                    && o.kind == OpKind::Resume
+                    && o.state == OpState::Failed
+                    && o.id > last_done
+                    && matches!(o.step.as_deref(), Some("restore" | "bind" | "finish"))
+            })
+            .count() as i64)
+    }
+
     /// Stale pending sessions with no create_boot op in flight.
     async fn orphaned_pending_sessions(
         &self,

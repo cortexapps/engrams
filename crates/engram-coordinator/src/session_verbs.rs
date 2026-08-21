@@ -63,6 +63,23 @@ fn outcome_from_api_error(e: ApiError) -> OpOutcome {
 /// past any legitimate evict-ahead wait — before the terminal `gone:`.
 const RESUME_MAX_ATTEMPTS: i32 = 60;
 
+/// Issue #1314: the CROSS-OP resume failure budget. `RESUME_MAX_ATTEMPTS`
+/// bounds retries within one op, but a resume that fails TERMINALLY
+/// (attempts=1, e.g. the host answered the restore with a real VM error)
+/// leaves the session where it was — and the deliver verb's next retry
+/// mints a FRESH Resume op, resetting the per-op budget forever. An
+/// unresumable session (prod 61dace68: the snapshot's uffd base file was
+/// re-baked away) then churns the outbox shim every 2s indefinitely.
+/// After this many consecutive terminally-failed side-effectful resume
+/// attempts (`op_resume_failure_streak`: step restore/bind/finish, no
+/// successful resume in between), the session itself is declared
+/// unresumable and routed terminal — the deliver verb's terminal arm
+/// then acks the row as consumed-by-termination and the churn ends by
+/// construction. Each counted attempt was a real restore/finish attempt
+/// on a host, so 5 spans several minutes of the deliver verb's scaled
+/// backoff — far past any transient blip.
+const RESUME_FAILURE_STREAK_BUDGET: i64 = 5;
+
 /// After this many attempts the resume crash-shortcut (finish-only on a
 /// prior binding) is presumed to be latching a STALE binding and falls
 /// through to a full re-restore (review finding #10). Small — a live
@@ -241,7 +258,100 @@ async fn resume(ctx: &OpCtx<'_>) -> OpOutcome {
                 ctx.op.attempts
             ))
         }
+        // Issue #1314: a TERMINAL failure ends this op but not the
+        // deliver verb's re-minting — arbitrate the cross-op streak
+        // before handing the outcome back, so a session whose resumes
+        // keep failing terminally is eventually routed terminal itself
+        // instead of churning forever.
+        OpOutcome::Failed(e) => {
+            demote_session_past_resume_streak_budget(ctx, &e).await;
+            OpOutcome::Failed(e)
+        }
         other => other,
+    }
+}
+
+/// Issue #1314: the cross-op unresumability arbiter. Called on every
+/// terminal resume failure; demotes the session only when the durable
+/// streak (`op_resume_failure_streak`: consecutive terminally-failed
+/// resume ops that reached a side-effectful step, plus this failure)
+/// exhausts [`RESUME_FAILURE_STREAK_BUDGET`]. Idle demotes to `Dead`
+/// with the fork affordance (mirroring the no-recoverable-snapshot
+/// arm); Created demotes to `Failed` (the harness never started —
+/// mirroring [`fail_wedged_created_session`]). Other states are left
+/// alone: their scanners own recovery. Best-effort and self-fencing —
+/// the fenced transition no-ops if a successor re-claimed the session.
+async fn demote_session_past_resume_streak_budget(ctx: &OpCtx<'_>, reason: &str) {
+    let state = ctx.state;
+    let id = ctx.op.session_id;
+    let target = match state.services.meta.get_session(id).await {
+        Ok(s) if s.status == SessionState::Idle => SessionState::Dead,
+        Ok(s) if s.status == SessionState::Created => SessionState::Failed,
+        _ => return,
+    };
+    let prior = match state.services.meta.op_resume_failure_streak(id).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::debug!(session_id = %id, error = %e,
+                "resume failure-streak read failed; skipping the demotion check");
+            return;
+        }
+    };
+    // `prior` counts finished op rows only — this op is still `running`,
+    // so its failure makes the streak `prior + 1`.
+    if prior + 1 < RESUME_FAILURE_STREAK_BUDGET {
+        return;
+    }
+    ::metrics::counter!(crate::metrics::SESSION_UNRESUMABLE_DEMOTED_TOTAL).increment(1);
+    tracing::warn!(
+        session_id = %id,
+        prior_failures = prior,
+        to = target.as_str(),
+        error = %reason,
+        "consecutive resume ops keep failing terminally; declaring the session unresumable",
+    );
+    if let Err(e) = state
+        .services
+        .meta
+        .append_session_event(
+            id,
+            "session_unresumable",
+            serde_json::json!({
+                "reason": "consecutive resume attempts failed terminally; \
+                           the session cannot be revived — use `engram session fork <id>` \
+                           to continue from the workspace",
+                "detail": reason,
+                "consecutive_failures": prior + 1,
+            }),
+        )
+        .await
+    {
+        tracing::warn!(session_id = %id, error = %e, "session_unresumable event failed");
+    }
+    match crate::session_ops::transition_with_fence(
+        state,
+        id,
+        ctx.fence(),
+        target,
+        BindingDisposition::Detach,
+    )
+    .await
+    {
+        Ok(prev) => {
+            let _ = state
+                .emit_fenced(
+                    id,
+                    ctx.fence(),
+                    SessionEvent::StatusChanged {
+                        from: prev,
+                        to: target,
+                        at: state.services.clock.now_utc(),
+                    },
+                )
+                .await;
+        }
+        Err(e) => tracing::warn!(session_id = %id, error = %e,
+            "resume streak budget exhausted but the terminal flip failed (state moved on?)"),
     }
 }
 
@@ -1850,6 +1960,206 @@ mod tests {
             parked_at: None,
             suggested_title: None,
         }
+    }
+
+    /// Seed one finished Resume op: claim, record `step`, finish at `end`.
+    async fn seed_finished_resume(
+        state: &crate::state::SharedState,
+        id: SessionId,
+        step: &str,
+        end: OpState,
+    ) {
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(id, OpKind::Resume, serde_json::json!({}), None, "test-pod")
+            .await
+            .expect("enqueue resume")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+        let epoch = op.epoch.unwrap();
+        assert!(state
+            .services
+            .meta
+            .op_record_step(op.id, epoch, step)
+            .await
+            .unwrap());
+        assert!(state
+            .services
+            .meta
+            .op_finish(op.id, epoch, end, Some("seed: restore failed"))
+            .await
+            .unwrap());
+    }
+
+    /// Claim a running Resume op for `id` and hand back everything an
+    /// `OpCtx` needs (the caller builds the ctx so the borrow lives).
+    async fn claim_running_resume(
+        state: &crate::state::SharedState,
+        id: SessionId,
+    ) -> engram_core::types::session_op::SessionOp {
+        match state
+            .services
+            .meta
+            .op_enqueue_and_claim(id, OpKind::Resume, serde_json::json!({}), None, "test-pod")
+            .await
+            .expect("enqueue resume")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        }
+    }
+
+    /// Issue #1314: the cross-op streak budget. Per-op budgets reset on
+    /// every deliver-verb re-mint, so an unresumable Idle session churned
+    /// forever (prod 61dace68: ops 139201…139206, each `failed` at
+    /// attempts=1). With `RESUME_FAILURE_STREAK_BUDGET - 1` prior
+    /// terminally-failed restore attempts on record, the NEXT terminal
+    /// failure demotes the session to Dead — the deliver verb's terminal
+    /// arm then acks the row consumed-by-termination and the churn ends.
+    #[tokio::test]
+    async fn resume_streak_budget_demotes_an_unresumable_idle_session_to_dead() {
+        let id = SessionId::new();
+        let (state, mini, _local) = crate::state::tests::build_state_for_session(idle_session(id));
+        for _ in 0..(RESUME_FAILURE_STREAK_BUDGET - 1) {
+            seed_finished_resume(&state, id, "restore", OpState::Failed).await;
+        }
+        let op = claim_running_resume(&state, id).await;
+        let ctx = crate::session_ops::OpCtx {
+            state: &state,
+            epoch: op.epoch.unwrap(),
+            op: &op,
+        };
+
+        demote_session_past_resume_streak_budget(&ctx, "internal: sandbox vm error").await;
+
+        let after = state.services.meta.get_session(id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::Dead,
+            "the streak budget must declare the session unresumable",
+        );
+        let events = mini.events.lock();
+        assert!(
+            events.iter().any(|e| e.kind == "session_unresumable"),
+            "the demotion is user-visible",
+        );
+        assert!(
+            events.iter().any(|e| e.kind == "status_changed"),
+            "the terminal flip emits StatusChanged",
+        );
+    }
+
+    /// Below the budget the session is left exactly where it was — a
+    /// transient terminal failure (or a short streak) must never kill a
+    /// recoverable Idle session ("its durable state is intact and a
+    /// later resume can succeed").
+    #[tokio::test]
+    async fn resume_streak_below_budget_leaves_the_idle_session_alone() {
+        let id = SessionId::new();
+        let (state, mini, _local) = crate::state::tests::build_state_for_session(idle_session(id));
+        for _ in 0..(RESUME_FAILURE_STREAK_BUDGET - 2) {
+            seed_finished_resume(&state, id, "restore", OpState::Failed).await;
+        }
+        let op = claim_running_resume(&state, id).await;
+        let ctx = crate::session_ops::OpCtx {
+            state: &state,
+            epoch: op.epoch.unwrap(),
+            op: &op,
+        };
+
+        demote_session_past_resume_streak_budget(&ctx, "internal: sandbox vm error").await;
+
+        let after = state.services.meta.get_session(id).await.unwrap();
+        assert_eq!(after.status, SessionState::Idle, "below budget: untouched");
+        let events = mini.events.lock();
+        assert!(
+            !events.iter().any(|e| e.kind == "session_unresumable"),
+            "no demotion event below the budget",
+        );
+    }
+
+    /// Dispatch-step terminal failures are routing arms (Evacuating /
+    /// scanner-owned states), not real restore attempts — a history of
+    /// them must not poison the budget.
+    #[tokio::test]
+    async fn resume_streak_ignores_dispatch_step_routing_failures() {
+        let id = SessionId::new();
+        let (state, _mini, _local) = crate::state::tests::build_state_for_session(idle_session(id));
+        for _ in 0..(RESUME_FAILURE_STREAK_BUDGET + 2) {
+            seed_finished_resume(&state, id, "dispatch", OpState::Failed).await;
+        }
+        let op = claim_running_resume(&state, id).await;
+        let ctx = crate::session_ops::OpCtx {
+            state: &state,
+            epoch: op.epoch.unwrap(),
+            op: &op,
+        };
+
+        demote_session_past_resume_streak_budget(&ctx, "gone: fenced at dispatch").await;
+
+        let after = state.services.meta.get_session(id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::Idle,
+            "routing-arm failures are not evidence of unresumability",
+        );
+    }
+
+    /// The Created flavor of the same livelock (a session parked at
+    /// Created whose resumes keep failing terminally) demotes to Failed —
+    /// the harness never started, mirroring `fail_wedged_created_session`.
+    #[tokio::test]
+    async fn resume_streak_budget_fails_a_wedged_created_session() {
+        let id = SessionId::new();
+        let created = Session {
+            status: SessionState::Created,
+            ..idle_session(id)
+        };
+        let (state, _mini, _local) = crate::state::tests::build_state_for_session(created);
+        for _ in 0..(RESUME_FAILURE_STREAK_BUDGET - 1) {
+            seed_finished_resume(&state, id, "finish", OpState::Failed).await;
+        }
+        let op = claim_running_resume(&state, id).await;
+        let ctx = crate::session_ops::OpCtx {
+            state: &state,
+            epoch: op.epoch.unwrap(),
+            op: &op,
+        };
+
+        demote_session_past_resume_streak_budget(&ctx, "harness start failed").await;
+
+        let after = state.services.meta.get_session(id).await.unwrap();
+        assert_eq!(after.status, SessionState::Failed);
+    }
+
+    /// A successful resume between the failures RESETS the streak: the
+    /// budget is consecutive failure, not lifetime failure.
+    #[tokio::test]
+    async fn resume_streak_resets_on_a_successful_resume() {
+        let id = SessionId::new();
+        let (state, _mini, _local) = crate::state::tests::build_state_for_session(idle_session(id));
+        for _ in 0..(RESUME_FAILURE_STREAK_BUDGET - 1) {
+            seed_finished_resume(&state, id, "restore", OpState::Failed).await;
+        }
+        seed_finished_resume(&state, id, "finish", OpState::Done).await;
+        let op = claim_running_resume(&state, id).await;
+        let ctx = crate::session_ops::OpCtx {
+            state: &state,
+            epoch: op.epoch.unwrap(),
+            op: &op,
+        };
+
+        demote_session_past_resume_streak_budget(&ctx, "internal: sandbox vm error").await;
+
+        let after = state.services.meta.get_session(id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::Idle,
+            "a success resets the streak; one fresh failure is not a demotion",
+        );
     }
 
     fn outbox_prompt(id: SessionId, prompt_id: &str) -> engram_core::types::outbox::OutboxRow {

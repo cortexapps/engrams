@@ -8003,6 +8003,27 @@ impl MetadataStore for PostgresStore {
         Ok(exists)
     }
 
+    /// Issue #1314: failed resume ops that reached a side-effectful step,
+    /// newer than the latest successful resume — the cross-op streak a
+    /// per-op budget can't see because the deliver verb re-mints.
+    async fn op_resume_failure_streak(&self, session_id: SessionId) -> Result<i64, MetaError> {
+        let kind = engram_core::types::session_op::OpKind::Resume.as_str();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM session_ops
+              WHERE session_id = $1 AND kind = $2 AND state = 'failed'
+                AND step IN ('restore', 'bind', 'finish')
+                AND id > COALESCE((SELECT max(id) FROM session_ops
+                                    WHERE session_id = $1 AND kind = $2
+                                      AND state = 'done'), 0)",
+        )
+        .bind(session_id.as_uuid())
+        .bind(kind)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(n)
+    }
+
     async fn orphaned_pending_sessions(
         &self,
         older_than: std::time::Duration,

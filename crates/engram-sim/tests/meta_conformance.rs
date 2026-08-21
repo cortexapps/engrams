@@ -1488,6 +1488,81 @@ async fn ops_pipeline(ctx: &Ctx) {
         .unwrap());
 }
 
+/// Issue #1314: `op_resume_failure_streak` counts terminally-failed
+/// resume ops that recorded a side-effectful step (`restore`/`bind`/
+/// `finish`), newer than the latest successful resume. Every clause is
+/// pinned: the step filter (a routing arm's `dispatch`-step terminal
+/// must not count), the `done` reset, the kind filter, and session
+/// scoping.
+async fn op_resume_failure_streak(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:streak")).await.unwrap();
+    let other = meta
+        .create_session(spec("conf:streak-other"))
+        .await
+        .unwrap();
+
+    // Claim one resume op, record `step`, finish it at `state`.
+    let run_resume = |step: &'static str, state: OpState| async move {
+        let out = meta
+            .op_enqueue_and_claim(sid, OpKind::Resume, serde_json::json!({}), None, "pod-a")
+            .await
+            .unwrap();
+        let EnqueueOutcome::Claimed(op) = out else {
+            panic!("nothing else runs; the claim must land, got {out:?}")
+        };
+        let epoch = op.epoch.unwrap();
+        assert!(meta.op_record_step(op.id, epoch, step).await.unwrap());
+        assert!(meta
+            .op_finish(op.id, epoch, state, Some("conf"))
+            .await
+            .unwrap());
+    };
+
+    assert_eq!(meta.op_resume_failure_streak(sid).await.unwrap(), 0);
+
+    // Two real restore-attempt failures count...
+    run_resume("restore", OpState::Failed).await;
+    assert_eq!(meta.op_resume_failure_streak(sid).await.unwrap(), 1);
+    run_resume("bind", OpState::Failed).await;
+    assert_eq!(meta.op_resume_failure_streak(sid).await.unwrap(), 2);
+
+    // ...a dispatch-step terminal (a routing arm, no side effect) does
+    // not...
+    run_resume("dispatch", OpState::Failed).await;
+    assert_eq!(meta.op_resume_failure_streak(sid).await.unwrap(), 2);
+
+    // ...another kind's failure does not...
+    {
+        let out = meta
+            .op_enqueue_and_claim(sid, OpKind::Deliver, serde_json::json!({}), None, "pod-a")
+            .await
+            .unwrap();
+        let EnqueueOutcome::Claimed(op) = out else {
+            panic!("deliver claim must land, got {out:?}")
+        };
+        let epoch = op.epoch.unwrap();
+        assert!(meta.op_record_step(op.id, epoch, "drain").await.unwrap());
+        assert!(meta
+            .op_finish(op.id, epoch, OpState::Failed, Some("conf"))
+            .await
+            .unwrap());
+        assert_eq!(meta.op_resume_failure_streak(sid).await.unwrap(), 2);
+    }
+
+    // ...and a successful resume RESETS the streak (the budget is
+    // consecutive failure, not lifetime failure).
+    run_resume("finish", OpState::Done).await;
+    assert_eq!(meta.op_resume_failure_streak(sid).await.unwrap(), 0);
+
+    // A fresh failure after the reset starts a new streak.
+    run_resume("finish", OpState::Failed).await;
+    assert_eq!(meta.op_resume_failure_streak(sid).await.unwrap(), 1);
+
+    // Session scoping: the other session's streak is untouched.
+    assert_eq!(meta.op_resume_failure_streak(other).await.unwrap(), 0);
+}
+
 /// `op_wake_queued_kind` makes every queued op of the kind due now and
 /// reports the count (the NOTIFY rides a nonzero count in both stores).
 /// The already-due case is the create-lane stranding regression: the
@@ -3656,6 +3731,7 @@ conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_host_binding_lease, super::host_binding_lease);
 conformance!(t_sandbox_tombstones, super::sandbox_tombstones);
 conformance!(t_ops_pipeline, super::ops_pipeline);
+conformance!(t_op_resume_failure_streak, super::op_resume_failure_streak);
 conformance!(
     t_op_wake_queued_kind_counts_due_ops,
     super::op_wake_queued_kind_counts_due_ops
