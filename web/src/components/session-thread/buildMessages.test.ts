@@ -539,6 +539,31 @@ describe("buildMessages — isRunning", () => {
     expect(isRunning).toBe(true);
   });
 
+  // The harness is authoritative about its own idleness. A run can end without
+  // a closing assistant message — a model that declines a steered prompt — and
+  // then the steered echo is the thread tail, which the trailing-user-turn
+  // guess reads as "awaiting a reply" forever.
+  test("harness_idle beats a trailing user turn", () => {
+    const trailing = [
+      { type: "agent_message", run_id: "", message_id: "u1", role: "user", text: "go", at: AT },
+    ] as const;
+    expect(buildMessages(indexed([...trailing]), SID).isRunning).toBe(true);
+    expect(
+      buildMessages(indexed([...trailing, { type: "harness_idle", at: AT }]), SID).isRunning,
+    ).toBe(false);
+  });
+
+  test("a prompt after harness_idle is running again", () => {
+    const { isRunning } = buildMessages(
+      indexed([
+        { type: "harness_idle", at: AT },
+        { type: "agent_message", run_id: "", message_id: "u2", role: "user", text: "go", at: AT },
+      ]),
+      SID,
+    );
+    expect(isRunning).toBe(true);
+  });
+
   test("a completed run ending in an assistant message is not running", () => {
     const { isRunning } = buildMessages(
       indexed([
