@@ -291,6 +291,12 @@ pub const SESSION_OP_RECLAIMS_TOTAL: &str = "engram_session_op_reclaims_total";
 /// healthy fleet; a sustained rate means resumes are persistently failing.
 pub const SESSION_OP_RESUME_BUDGET_EXHAUSTED_TOTAL: &str =
     "engram_session_op_resume_budget_exhausted_total";
+/// Issue #1314: sessions demoted to a terminal state because consecutive
+/// resume ops kept failing terminally (the cross-op streak the per-op
+/// budget can't see — the deliver verb re-mints a fresh op per retry).
+/// Should be ~0; each increment is one session honestly declared
+/// unresumable instead of churning the outbox shim forever.
+pub const SESSION_UNRESUMABLE_DEMOTED_TOTAL: &str = "engram_session_unresumable_demoted_total";
 /// ADR 0079 (review finding #5): orphaned Pending sessions (placed but
 /// no active create_boot op) re-enqueued by the reclaim sweep backstop.
 pub const SESSION_OP_PENDING_ORPHANS_RECOVERED_TOTAL: &str =

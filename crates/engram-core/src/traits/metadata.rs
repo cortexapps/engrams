@@ -1230,6 +1230,21 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
+    /// The session's consecutive terminally-failed resume attempts:
+    /// `failed` Resume ops that recorded a real pipeline step
+    /// (`restore`/`bind`/`finish` — a side-effectful attempt, not a
+    /// routing arm's `dispatch`-step terminal), newer than the most
+    /// recent successful (`done`) Resume op. Issue #1314: the deliver
+    /// verb mints a FRESH Resume op per retry, so `RESUME_MAX_ATTEMPTS`
+    /// (a per-op budget) resets on every re-mint and an unresumable
+    /// session churns forever; this cross-op streak is the durable
+    /// evidence the resume verb reads to declare the session
+    /// unresumable. Default 0: a quiet mock never demotes a session.
+    async fn op_resume_failure_streak(&self, session_id: SessionId) -> Result<i64, MetaError> {
+        let _ = session_id;
+        Ok(0)
+    }
+
     /// ADR 0079 (review finding #5): PENDING sessions that lost their
     /// create_boot op — placed (`queued → pending`, host reserved) but no
     /// active (`queued|running`) create_boot op exists, older than
