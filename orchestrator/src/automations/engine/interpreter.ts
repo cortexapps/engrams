@@ -12,6 +12,14 @@
  *     :clock:<n> micro-steps during waits;
  *   - condition/branch/loop decisions are step outputs, never re-evaluated;
  *   - one recv loop, messages for other blocks buffer in arrival order;
+ *   - session messages are TURN-CORRELATED: the run counts the prompts it
+ *     sent per session (create_session's initial prompt is turn 1); the Nth
+ *     session_idle corresponds to the Nth prompt, and an idle or signal from
+ *     a turn older than the session's latest prompt is stale — dropped, never
+ *     matched. A banked idle from an un-awaited turn can therefore never
+ *     satisfy a later wait on the same session. (A human prompting a
+ *     run-owned session mid-run inflates the idle count and turns a would-be
+ *     false match into a wait deadline — the safe failure.)
  *   - finalize runs exactly once, from every exit path.
  */
 
@@ -91,9 +99,28 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** A buffered message plus the turn bookkeeping stamped when it was first
+ * received. Both stamps are pure functions of the checkpointed recv history,
+ * so replay reproduces them exactly. */
+interface BufferedEntry {
+  msg: AutomationInbox;
+  /** session_idle: the ordinal of this idle for its session (1-based). */
+  idleTurn?: number;
+  /** signal with a session: the session's prompt count at receipt. */
+  signalTurn?: number;
+}
+
 interface WaitState {
-  buffer: AutomationInbox[];
+  buffer: BufferedEntry[];
   clockSteps: number;
+}
+
+/** Per-session prompt/idle counters (see the turn-correlation invariant). */
+interface TurnLedger {
+  /** Prompts sent per session by this run (create_session initial = 1). */
+  started: Map<string, number>;
+  /** session_idle messages first-received per session. */
+  idleSeen: Map<string, number>;
 }
 
 export async function interpretAutomation(
@@ -112,6 +139,34 @@ export async function interpretAutomation(
 
   const ctx = buildRunContext(input.runId, snapshot, deps);
   const wait: WaitState = { buffer: [], clockSteps: 0 };
+  const ledger: TurnLedger = { started: new Map(), idleSeen: new Map() };
+
+  /** Stamp a freshly received message with its turn bookkeeping. */
+  const annotate = (msg: AutomationInbox): BufferedEntry => {
+    if (msg.kind === "session_idle") {
+      const seen = (ledger.idleSeen.get(msg.sessionId) ?? 0) + 1;
+      ledger.idleSeen.set(msg.sessionId, seen);
+      return { msg, idleTurn: seen };
+    }
+    if (msg.kind === "signal" && msg.sessionId !== undefined) {
+      return { msg, signalTurn: ledger.started.get(msg.sessionId) ?? 0 };
+    }
+    return { msg };
+  };
+
+  /** Turn-correlation gate: a session message from a turn older than the
+   * session's latest prompt is stale and must never match a wait. */
+  const gate = (entry: BufferedEntry): "stale" | "pass" => {
+    const msg = entry.msg;
+    if (msg.kind === "session_idle") {
+      const started = ledger.started.get(msg.sessionId) ?? 0;
+      if ((entry.idleTurn ?? 0) < started) return "stale";
+    }
+    if (msg.kind === "signal" && msg.sessionId !== undefined) {
+      if ((entry.signalTurn ?? 0) < (ledger.started.get(msg.sessionId) ?? 0)) return "stale";
+    }
+    return "pass";
+  };
   const runDeadlineAtMs =
     snapshot.definition.settings.runDeadlineSeconds !== undefined
       ? snapshot.startedAtMs + snapshot.definition.settings.runDeadlineSeconds * 1000
@@ -137,9 +192,13 @@ export async function interpretAutomation(
         ? Math.min(nowMs + blockDeadlineS * 1000, runDeadlineAtMs ?? Number.POSITIVE_INFINITY)
         : (runDeadlineAtMs ?? null);
 
-    const tryMatch = (msg: AutomationInbox): Record<string, unknown> | "ignore" | "buffer" => {
+    const tryMatch = (
+      entry: BufferedEntry,
+    ): Record<string, unknown> | "ignore" | "buffer" | "stale" => {
+      const msg = entry.msg;
       if (msg.kind === "stop") throw new RunEnd("halted", msg.reason ?? "stopped");
       if (msg.kind === "supersede") throw new RunEnd("superseded", `superseded by ${msg.byRunId}`);
+      if (gate(entry) === "stale") return "stale";
       const matched = executor.wait!.matches(msg, config, ctx);
       if (matched === null) return "buffer";
       if (matched === "ignore") return "ignore";
@@ -147,12 +206,12 @@ export async function interpretAutomation(
     };
 
     // Drain buffered messages first (deterministic: pure function of the
-    // checkpointed recv history).
+    // checkpointed recv history). Stale entries are removed for good.
     for (let i = 0; i < wait.buffer.length; i += 1) {
       const result = tryMatch(wait.buffer[i]!);
       if (result === "buffer") continue;
       wait.buffer.splice(i, 1);
-      if (result === "ignore") {
+      if (result === "ignore" || result === "stale") {
         i -= 1;
         continue;
       }
@@ -182,13 +241,14 @@ export async function interpretAutomation(
         }
         continue;
       }
-      const result = tryMatch(msg);
+      const entry = annotate(msg);
+      const result = tryMatch(entry);
       if (result === "buffer") {
-        wait.buffer.push(msg);
+        wait.buffer.push(entry);
         await checkpointClock(frames);
         continue;
       }
-      if (result === "ignore") {
+      if (result === "ignore" || result === "stale") {
         await checkpointClock(frames);
         continue;
       }
@@ -304,6 +364,17 @@ export async function interpretAutomation(
 
       recordStepOutputs(ctx, block.id, path, outcome.outputs);
       lastError = null;
+
+      // Turn ledger: count the prompts this run sends per session, from
+      // checkpointed step outputs only (replay-deterministic).
+      const outputSessionId = outcome.outputs["session_id"];
+      if (typeof outputSessionId === "string") {
+        if (block.type === "create_session" && outcome.outputs["initial_prompt"] !== false) {
+          ledger.started.set(outputSessionId, 1);
+        } else if (block.type === "send_prompt") {
+          ledger.started.set(outputSessionId, (ledger.started.get(outputSessionId) ?? 0) + 1);
+        }
+      }
 
       // Wait half, when the block has one and its config asks for it.
       if (executor.wait) {

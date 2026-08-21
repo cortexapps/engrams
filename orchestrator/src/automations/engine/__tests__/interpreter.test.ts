@@ -175,7 +175,12 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 1)
     ]);
     const h = makeHarness(definition, {
       inputs: { on: true },
-      recv: [{ kind: "session_idle", sessionId: "s-launch" }],
+      // Two idles: the create prompt's turn, then the notify prompt's turn.
+      // The wait must skip the first (stale) and consume the second.
+      recv: [
+        { kind: "session_idle", sessionId: "s-launch" },
+        { kind: "session_idle", sessionId: "s-launch" },
+      ],
     });
 
     const result = await interpretAutomation(RUN, h.deps);
@@ -187,6 +192,7 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 1)
       "step:check:0:ledger",
       "step:launch:0",
       "step:notify:0",
+      "step:notify:clock:1",
       "step:notify:0:wait",
       "step:cleanup:0",
       "step:__finalize__:0",
@@ -354,10 +360,12 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
       { id: "wait_b", type: "wait_session", config: { session: { blockId: "b" }, until: "idle" } },
     ]);
     // b's idle arrives while we wait on a; it buffers, then wait_b consumes it
-    // without another recv.
+    // without another recv. a's create-turn idle is stale for wait_a and is
+    // dropped; a's second idle (the awaited prompt's turn) matches.
     const h = makeHarness(definition, {
       recv: [
         { kind: "session_idle", sessionId: "s-b" },
+        { kind: "session_idle", sessionId: "s-a" },
         { kind: "session_idle", sessionId: "s-a" },
       ],
     });
@@ -369,7 +377,10 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
 
   test("a failed session run fails the run", async () => {
     const h = makeHarness(waitingDefinition, {
-      recv: [{ kind: "session_idle", sessionId: "s-launch", runFailed: true }],
+      recv: [
+        { kind: "session_idle", sessionId: "s-launch" },
+        { kind: "session_idle", sessionId: "s-launch", runFailed: true },
+      ],
     });
     const result = await interpretAutomation(RUN, h.deps);
     expect(result.status).toBe("failed");
@@ -484,6 +495,91 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
     const withoutEvent = makeHarness(definition);
     await interpretAutomation(RUN, withoutEvent.deps);
     expect(withoutEvent.createdInputs[0]!.prompt).toBe("Triage this.");
+  });
+
+  test("a banked idle from an un-awaited turn never satisfies a later wait (turn correlation)", async () => {
+    // The review-flagged shape: fire-and-forget prompt X, then wait on Y.
+    const definition = makeDefinition([
+      { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },
+      {
+        id: "fire_x",
+        type: "send_prompt",
+        config: { session: { blockId: "launch" }, promptTemplate: "do X", waitFor: { kind: "none" } },
+      },
+      {
+        id: "wait_y",
+        type: "send_prompt",
+        config: {
+          session: { blockId: "launch" },
+          promptTemplate: "do Y",
+          waitFor: { kind: "run_end" },
+          deadlineSeconds: 600,
+        },
+      },
+    ]);
+
+    // Only the create and X turns' idles arrive: Y must NOT complete.
+    const starved = makeHarness(definition, {
+      recv: [
+        { kind: "session_idle", sessionId: "s-launch" },
+        { kind: "session_idle", sessionId: "s-launch" },
+        null,
+        null,
+      ],
+    });
+    expect((await interpretAutomation(RUN, starved.deps)).status).toBe("deadline");
+
+    // With Y's own idle (the third), the run completes.
+    const fed = makeHarness(definition, {
+      recv: [
+        { kind: "session_idle", sessionId: "s-launch" },
+        { kind: "session_idle", sessionId: "s-launch" },
+        { kind: "session_idle", sessionId: "s-launch" },
+      ],
+    });
+    expect((await interpretAutomation(RUN, fed.deps)).status).toBe("completed");
+  });
+
+  test("a banked signal goes stale once a newer prompt targets its session", async () => {
+    const definition = makeDefinition([
+      { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },
+      {
+        id: "phase_a",
+        type: "send_prompt",
+        config: {
+          session: { blockId: "launch" },
+          promptTemplate: "A",
+          waitFor: { kind: "signal", name: "a_done" },
+        },
+      },
+      {
+        id: "phase_b",
+        type: "send_prompt",
+        config: {
+          session: { blockId: "launch" },
+          promptTemplate: "B",
+          waitFor: { kind: "signal", name: "b_done" },
+          deadlineSeconds: 600,
+        },
+      },
+    ]);
+    // A stray early "b_done" arrives during phase A's wait and banks in the
+    // buffer. Phase B's own prompt then makes it stale, so phase B must wait
+    // for a fresh "b_done" — the banked one can never satisfy it. (An
+    // in-flight duplicate first received AFTER the next prompt cannot be
+    // distinguished without producer-side turn info; the ledger closes the
+    // banked path, which is the routine one.)
+    const h = makeHarness(definition, {
+      recv: [
+        { kind: "signal", name: "b_done", sessionId: "s-launch", payload: { phase: "early" } },
+        { kind: "signal", name: "a_done", sessionId: "s-launch", payload: { phase: "a" } },
+        { kind: "signal", name: "b_done", sessionId: "s-launch", payload: { phase: "b" } },
+      ],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    const phaseB = h.stepRecords.filter((r) => r.framePath === "phase_b").at(-1)!;
+    expect(phaseB.record.outputs).toMatchObject({ signal: { phase: "b" } });
   });
 
   test("phase-2 stubs return typed unavailable failures", async () => {
