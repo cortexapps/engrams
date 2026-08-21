@@ -8,13 +8,19 @@
  *    verified ingress, so they rewrite unconditionally onto the default
  *    GitHub connection.
  * 2. Custom registrations that carried a provider scheme (github_hmac_sha256,
- *    slack_v0). Their bound automations rewrite onto the provider's default
- *    connection when that provider's ingress is READY (its signing secret
- *    resolves); the registration row and its sealed secret are then deleted.
- *    When the ingress is not ready, the registration is kept with a
- *    `disabled_reason` so the hook URL answers 410 and the UI can explain —
- *    silently re-pointing deliveries at an unconfigured ingress would be a
- *    quieter failure than a visible one.
+ *    slack_v0). These are EXTERNAL webhooks the user configured by hand (a
+ *    repo or workspace POSTing to the hook URL with that registration's
+ *    secret), so the set of events they received is unknowable here: it is
+ *    whatever the user wired up, which may be repos where the engrams App is
+ *    not installed, or a strict subset of what the App's firehose carries.
+ *    Re-pointing their automations onto the provider's default connection
+ *    would silently change coverage in both directions (stop firing for
+ *    un-installed repos; start firing on every installation). So this
+ *    population is NEVER re-pointed: the registration is kept with a
+ *    `disabled_reason` (the hook URL answers 410, the UI explains, and the
+ *    bound automations are named in the log) and the user re-creates the
+ *    trigger deliberately — as an integration trigger with an explicit scope,
+ *    or as a generic webhook. A visible stop beats a quiet drift.
  *
  * A legacy `trigger.filter` (AND of payload path → JSON value) becomes a
  * `filter` block ahead of the graph. `matchesWebhookFilter` resolved paths
@@ -63,22 +69,14 @@ export interface RetireWebhookStore {
     definition: AutomationDefinition,
   ): Promise<AutomationMetaRow | null>;
   listRegistrations(): Promise<WebhookRegistrationRow[]>;
-  deleteRegistration(id: string): Promise<boolean>;
   setRegistrationDisabledReason(id: string, reason: string | null): Promise<boolean>;
 }
 
 export interface RetireWebhookDeps {
   store: RetireWebhookStore;
   connections: {
-    getDefault(provider: string): Promise<IntegrationConnectionRow | null>;
     ensureDefault(provider: string, displayName: string): Promise<IntegrationConnectionRow>;
   };
-  orgSecret: { deleteSecret(req: { name: string }): Promise<{ deleted: boolean }> };
-  /** Whether the provider's integration ingress can verify deliveries now
-   * (its signing secret resolves). Production resolves the connector's
-   * `webhook.ingress.secretRef`; tests script it. */
-  ingressReady(provider: string): Promise<boolean>;
-  registry: Pick<Map<string, Connector>, "get">;
   log: {
     info(bindings: Record<string, unknown>, message: string): void;
     warn(bindings: Record<string, unknown>, message: string): void;
@@ -87,7 +85,6 @@ export interface RetireWebhookDeps {
 
 export interface RetireWebhookResult {
   rewritten: string[];
-  deletedRegistrations: string[];
   disabledRegistrations: string[];
 }
 
@@ -148,7 +145,6 @@ export async function retireProviderWebhookSchemes(
 ): Promise<RetireWebhookResult> {
   const result: RetireWebhookResult = {
     rewritten: [],
-    deletedRegistrations: [],
     disabledRegistrations: [],
   };
 
@@ -165,55 +161,28 @@ export async function retireProviderWebhookSchemes(
     }
   }
 
-  // 2. Custom registrations carrying a retired provider scheme.
+  // 2. Custom registrations carrying a retired provider scheme: visible stop,
+  //    never a re-point (see the header).
   for (const registration of await deps.store.listRegistrations()) {
     if (!RETIRED_PROVIDER_SCHEMES.has(registration.verification.scheme)) continue;
-    const provider = registration.providerHint;
-    const ready =
-      provider !== null &&
-      deps.registry.get(provider)?.webhook?.ingress !== undefined &&
-      (await deps.connections.getDefault(provider)) !== null &&
-      (await deps.ingressReady(provider));
-    if (!ready || provider === null) {
-      if (registration.disabledReason === null) {
-        await deps.store.setRegistrationDisabledReason(
-          registration.id,
-          RETIRED_SCHEME_DISABLED_REASON,
-        );
-        result.disabledRegistrations.push(registration.id);
-        deps.log.warn(
-          { registrationId: registration.id, provider },
-          "custom webhook registration retired: provider ingress not ready, registration disabled",
-        );
-      }
-      continue;
-    }
-    const connection = await deps.connections.getDefault(provider);
-    if (!connection) continue;
-    for (const meta of await deps.store.listBoundToWebhookRegistration(registration.id)) {
-      if (await rewriteOntoIntegrationTrigger(deps, meta, provider, connection.id)) {
-        result.rewritten.push(meta.id);
-      }
-    }
-    await deps.store.deleteRegistration(registration.id);
-    try {
-      await deps.orgSecret.deleteSecret({ name: `webhook.${registration.id}.secret` });
-    } catch (error) {
-      // The row is gone; a lingering sealed secret is harmless and the
-      // deletion is retried by nobody — log it for the operator.
-      deps.log.warn(
-        { registrationId: registration.id, error: error instanceof Error ? error.message : String(error) },
-        "retired webhook registration: sealed secret deletion failed",
-      );
-    }
-    result.deletedRegistrations.push(registration.id);
+    if (registration.disabledReason !== null) continue;
+    await deps.store.setRegistrationDisabledReason(
+      registration.id,
+      RETIRED_SCHEME_DISABLED_REASON,
+    );
+    result.disabledRegistrations.push(registration.id);
+    const bound = await deps.store.listBoundToWebhookRegistration(registration.id);
+    deps.log.warn(
+      {
+        registrationId: registration.id,
+        provider: registration.providerHint,
+        boundAutomationIds: bound.map((meta) => meta.id),
+      },
+      "custom webhook registration retired: provider signature scheme removed; hook answers 410 until its automations are re-created as integration triggers",
+    );
   }
 
-  if (
-    result.rewritten.length > 0 ||
-    result.deletedRegistrations.length > 0 ||
-    result.disabledRegistrations.length > 0
-  ) {
+  if (result.rewritten.length > 0 || result.disabledRegistrations.length > 0) {
     deps.log.info({ ...result }, "provider webhook scheme retirement applied");
   }
   return result;

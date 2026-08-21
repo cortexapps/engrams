@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 
-import { connectorRegistry } from "../../connectors/registry.ts";
 import type {
   AutomationMetaRow,
   AutomationVersionRow,
@@ -106,7 +105,6 @@ function connection(provider: string): IntegrationConnectionRow {
 function harness(seed: {
   automations: Array<{ meta: AutomationMetaRow; trigger: AutomationTrigger }>;
   registrations?: WebhookRegistrationRow[];
-  ready?: Record<string, boolean>;
   connections?: string[];
 }) {
   const automations = new Map<string, StoredAutomation>(
@@ -116,7 +114,6 @@ function harness(seed: {
     ]),
   );
   const registrations = new Map((seed.registrations ?? []).map((r) => [r.id, r]));
-  const deletedSecrets: string[] = [];
   const connections = new Set(seed.connections ?? ["github", "slack"]);
   const logs: string[] = [];
 
@@ -155,9 +152,6 @@ function harness(seed: {
     async listRegistrations() {
       return [...registrations.values()];
     },
-    async deleteRegistration(id) {
-      return registrations.delete(id);
-    },
     async setRegistrationDisabledReason(id, reason) {
       const row = registrations.get(id);
       if (!row) return false;
@@ -169,31 +163,18 @@ function harness(seed: {
   const deps: RetireWebhookDeps = {
     store,
     connections: {
-      async getDefault(provider) {
-        return connections.has(provider) ? connection(provider) : null;
-      },
       async ensureDefault(provider) {
         connections.add(provider);
         return connection(provider);
       },
     },
-    orgSecret: {
-      async deleteSecret({ name }) {
-        deletedSecrets.push(name);
-        return { deleted: true };
-      },
-    },
-    async ingressReady(provider) {
-      return seed.ready?.[provider] ?? true;
-    },
-    registry: connectorRegistry(),
     log: {
       info: (_b, m) => void logs.push(`info:${m}`),
       warn: (_b, m) => void logs.push(`warn:${m}`),
     },
   };
 
-  return { deps, automations, registrations, deletedSecrets, logs, currentTrigger };
+  return { deps, automations, registrations, logs, currentTrigger };
 }
 
 describe("filterGroupFromLegacyWebhookFilter", () => {
@@ -265,7 +246,7 @@ describe("retireProviderWebhookSchemes", () => {
 
     // Idempotent: a second boot finds nothing bound and writes nothing.
     const again = await retireProviderWebhookSchemes(h.deps);
-    expect(again).toEqual({ rewritten: [], deletedRegistrations: [], disabledRegistrations: [] });
+    expect(again).toEqual({ rewritten: [], disabledRegistrations: [] });
     expect(h.automations.get("auto-gh")!.meta.currentVersion).toBe(2);
   });
 
@@ -283,7 +264,10 @@ describe("retireProviderWebhookSchemes", () => {
     expect(v2.blocks.map((b) => b.id)).toEqual(["create_session"]);
   });
 
-  test("a provider-scheme registration with a ready ingress moves its automations and is deleted with its secret", async () => {
+  test("a custom provider-scheme registration is NEVER re-pointed: disabled with a reason, automations untouched, nothing deleted", async () => {
+    // The App's default connection exists and would even verify — coverage is
+    // still unknowable (the user wired this hook to repos of their choosing),
+    // so the only honest move is a visible stop.
     const h = harness({
       automations: [
         {
@@ -292,23 +276,26 @@ describe("retireProviderWebhookSchemes", () => {
         },
       ],
       registrations: [registration("team-gh", "github_hmac_sha256", "github")],
-      ready: { github: true },
+      connections: ["github"],
     });
 
     const result = await retireProviderWebhookSchemes(h.deps);
 
-    expect(result.rewritten).toEqual(["auto-custom"]);
-    expect(result.deletedRegistrations).toEqual(["team-gh"]);
-    expect(h.registrations.has("team-gh")).toBe(false);
-    expect(h.deletedSecrets).toEqual(["webhook.team-gh.secret"]);
+    expect(result.rewritten).toEqual([]);
+    expect(result.disabledRegistrations).toEqual(["team-gh"]);
+    expect(h.registrations.get("team-gh")!.disabledReason).toBe(RETIRED_SCHEME_DISABLED_REASON);
+    // The automation keeps its webhook trigger at version 1 — no new version,
+    // no integration trigger, no firehose.
+    expect(h.automations.get("auto-custom")!.meta.currentVersion).toBe(1);
     expect(h.currentTrigger(h.automations.get("auto-custom")!)).toMatchObject({
-      kind: "integration",
-      provider: "github",
-      connectionId: "conn-github",
+      kind: "webhook",
+      registrationId: "team-gh",
     });
+    // The operator log names the automations that now need re-creating.
+    expect(h.logs.some((l) => l.startsWith("warn:") && l.includes("re-created"))).toBe(true);
   });
 
-  test("a provider-scheme registration whose ingress is not ready is disabled, not deleted, and its automations stay", async () => {
+  test("disabling is idempotent and leaves bound automations at their current version", async () => {
     const h = harness({
       automations: [
         {
@@ -317,14 +304,12 @@ describe("retireProviderWebhookSchemes", () => {
         },
       ],
       registrations: [registration("team-slack", "slack_v0", "slack")],
-      ready: { slack: false },
     });
 
     const result = await retireProviderWebhookSchemes(h.deps);
 
     expect(result.disabledRegistrations).toEqual(["team-slack"]);
     expect(h.registrations.get("team-slack")!.disabledReason).toBe(RETIRED_SCHEME_DISABLED_REASON);
-    expect(h.deletedSecrets).toEqual([]);
     expect(h.automations.get("auto-slack")!.meta.currentVersion).toBe(1);
 
     // Idempotent: already disabled → no second write, no log noise.
@@ -347,7 +332,7 @@ describe("retireProviderWebhookSchemes", () => {
       registrations: [registration("generic-1", "generic_hmac_sha256", null)],
     });
     const result = await retireProviderWebhookSchemes(h.deps);
-    expect(result).toEqual({ rewritten: [], deletedRegistrations: [], disabledRegistrations: [] });
+    expect(result).toEqual({ rewritten: [], disabledRegistrations: [] });
     expect(h.registrations.get("generic-1")!.disabledReason).toBeNull();
   });
 });

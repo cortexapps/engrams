@@ -321,7 +321,6 @@ describe("POST /api/v1/integrations/github/events", () => {
         },
       },
       enrollments: { get: async () => null },
-      automationDispatch: async () => {},
     });
     const res = await route.request(PATH, {
       method: "POST",
