@@ -21,6 +21,8 @@ import {
 } from "../gen/engram/app/v1/automation_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
 import { requireAdmin } from "./require.ts";
+import { evaluateCode, type CodeInput } from "../automations/code/sandbox.ts";
+import { CODE_SOURCE_MAX_CHARS } from "../automations/engine/blocks/code.ts";
 import {
   makeAutomationStore,
   type AutomationInput,
@@ -80,6 +82,30 @@ export interface AutomationDeps {
   modelRouters?: ModelRouterStore;
   now?: () => Date;
   randomSecret?: () => string;
+  /** Test seam for the QuickJS sandbox behind EvalCode. */
+  evalCode?: typeof evaluateCode;
+}
+
+export const EVAL_CODE_LIMIT_PER_MINUTE = 30;
+export const EVAL_CODE_INPUT_MAX_CHARS = 512 * 1024;
+
+/** Sliding-window per-user limiter for the arbitrary-compute endpoint.
+ * In-memory per pod: the cap is a courtesy brake, not an SLO. */
+function makeEvalRateLimiter() {
+  const windows = new Map<string, number[]>();
+  return {
+    allow(userId: string, nowMs: number): boolean {
+      const cutoff = nowMs - 60_000;
+      const stamps = (windows.get(userId) ?? []).filter((t) => t > cutoff);
+      if (stamps.length >= EVAL_CODE_LIMIT_PER_MINUTE) {
+        windows.set(userId, stamps);
+        return false;
+      }
+      stamps.push(nowMs);
+      windows.set(userId, stamps);
+      return true;
+    },
+  };
 }
 
 const REGISTRATION_ID_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -394,6 +420,8 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
   const modelRouters = (): ModelRouterStore =>
     deps?.modelRouters ?? makeModelRouterStore(getDb());
   const now = deps?.now ?? (() => new Date());
+  const evalCode = deps?.evalCode ?? evaluateCode;
+  const rateLimiter = makeEvalRateLimiter();
   const randomSecret =
     deps?.randomSecret ??
     (() => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url"));
@@ -728,6 +756,70 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         renderedPrompt,
         ...(renderedTitle !== undefined ? { renderedTitle } : {}),
         errors: [],
+      };
+    },
+
+    // ADR 0119 D6: the editor's Run button. Admin-gated like the rest of the
+    // service (the design doc floated member-callable; the whole page is
+    // admin-only today, so the wider gate waits for phase 3). Rate-limited —
+    // it is an arbitrary-compute endpoint, even caged.
+    async evalCode(req, ctx) {
+      const userId = (await requireAdmin(ctx, getSession)).id;
+      if (!rateLimiter.allow(userId, now().getTime())) {
+        throw new ConnectError(
+          `rate limit: at most ${EVAL_CODE_LIMIT_PER_MINUTE} evaluations per minute`,
+          Code.ResourceExhausted,
+        );
+      }
+      const source = requiredText(req.source, "source");
+      if (source.length > CODE_SOURCE_MAX_CHARS) {
+        throw new ConnectError(
+          `source is ${source.length} characters (max ${CODE_SOURCE_MAX_CHARS})`,
+          Code.InvalidArgument,
+        );
+      }
+      if (req.mode !== "value" && req.mode !== "boolean") {
+        throw new ConnectError(`mode must be "value" or "boolean"`, Code.InvalidArgument);
+      }
+      if (req.inputJson.length > EVAL_CODE_INPUT_MAX_CHARS) {
+        throw new ConnectError(
+          `input_json is ${req.inputJson.length} characters (max ${EVAL_CODE_INPUT_MAX_CHARS})`,
+          Code.InvalidArgument,
+        );
+      }
+      let input: CodeInput = {};
+      if (req.inputJson !== "") {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(req.inputJson);
+        } catch {
+          throw new ConnectError("input_json is not valid JSON", Code.InvalidArgument);
+        }
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          throw new ConnectError("input_json must be a JSON object", Code.InvalidArgument);
+        }
+        const record = parsed as Record<string, unknown>;
+        input = {
+          ...(record["event"] !== undefined ? { event: record["event"] } : {}),
+          ...(record["steps"] !== undefined ? { steps: record["steps"] } : {}),
+          ...(record["inputs"] !== undefined ? { inputs: record["inputs"] } : {}),
+          ...(record["trigger"] !== undefined ? { trigger: record["trigger"] } : {}),
+        };
+      }
+      const outcome = await evalCode(source, input, req.mode);
+      if (outcome.ok) {
+        return {
+          valueJson: JSON.stringify(outcome.value),
+          logs: outcome.logs,
+          durationMs: BigInt(outcome.durationMs),
+        };
+      }
+      return {
+        errorName: outcome.error.name,
+        errorMessage: outcome.error.message,
+        ...(outcome.error.line !== undefined ? { errorLine: outcome.error.line } : {}),
+        logs: outcome.logs,
+        durationMs: BigInt(outcome.durationMs),
       };
     },
   });
