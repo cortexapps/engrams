@@ -242,6 +242,26 @@ export function appendAutomationEventContext(
   ].join("\n\n");
 }
 
+/** Engine-scope render (ADR 0119): the same hardened single-pass engine over
+ * a wider scope object (`inputs`, `trigger`, `event`, `steps`, `run`). The
+ * scope is data the engine assembled, never a parsed template. */
+export async function renderAutomationTemplateInScope(
+  template: string,
+  scope: Record<string, unknown>,
+  options: RenderOptions = {},
+): Promise<string> {
+  validateAutomationTemplate(template);
+  let output: string;
+  try {
+    output = await engine.parseAndRender(template, scope);
+  } catch (error) {
+    if (error instanceof AutomationTemplateError) throw error;
+    throw new AutomationTemplateError("render_failed", messageOf(error), { cause: error });
+  }
+  assertOutputLength(output, options.maxOutputChars ?? AUTOMATION_OUTPUT_MAX_CHARS);
+  return output;
+}
+
 export async function renderAutomationAction(
   action: CreateTaskAutomationAction,
   context: AutomationTemplateContext,
