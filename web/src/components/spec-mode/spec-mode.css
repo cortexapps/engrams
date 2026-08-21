@@ -487,6 +487,12 @@
   font-size: 0.86em;
 }
 
+/* Same reason as the thread: a spec cites file paths, and a path has no break
+   opportunity of its own. A fenced block keeps its own scroll. */
+.spec-mode-section-content :not(pre) > code {
+  overflow-wrap: anywhere;
+}
+
 .spec-mode-section-content pre {
   overflow-x: auto;
   border-radius: 6px;
@@ -753,6 +759,24 @@
 .spec-mode-markdown ul,
 .spec-mode-markdown ol {
   padding-left: 1.3em;
+}
+
+/* Recon messages are mostly repository paths, and a path is one long word with
+   no break opportunity: `brain-backend/web/src/main/kotlin/...`. Left alone it
+   pushes past the column, and because the thread sets `overflow-y: auto` the
+   other axis computes to `auto` too — so the whole conversation scrolled
+   sideways and the provenance ran off the edge unread. Break inside these
+   words; a fenced block keeps its own horizontal scroll below. */
+.spec-mode-markdown :not(pre) > code {
+  overflow-wrap: anywhere;
+}
+
+/* A flex/grid item defaults to `min-width: auto`, which refuses to shrink below
+   its content — so wrapping alone is not enough, the bubble has to be allowed
+   to get narrower than the longest path in it. */
+.spec-mode-markdown,
+.spec-mode-agent-copy {
+  min-width: 0;
 }
 
 .spec-mode-markdown table {
