@@ -1,0 +1,30 @@
+{
+  "ref": "refs/heads/main",
+  "before": "9049f1265b7d61be4a8904a9a27120d2064dab3b",
+  "after": "6dcb09b5b57875f334f61aebed695e2e4193db5e",
+  "commits": [
+    {
+      "id": "6dcb09b5b57875f334f61aebed695e2e4193db5e",
+      "message": "fix: handle empty payloads",
+      "author": {
+        "name": "Octo Cat"
+      }
+    }
+  ],
+  "repository": {
+    "id": 5580001,
+    "name": "engrams",
+    "full_name": "acme/engrams",
+    "private": true,
+    "html_url": "https://github.com/acme/engrams",
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "octocat",
+    "id": 583231,
+    "type": "User"
+  },
+  "pusher": {
+    "name": "octocat"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "action": "create",
+  "type": "Comment",
+  "data": {
+    "id": "5a6b7c8d-aaaa-bbbb-cccc-102030405060",
+    "body": "This is fixed on the branch.",
+    "issue": {
+      "id": "0f1e2d3c-aaaa-bbbb-cccc-908070605040",
+      "identifier": "ENG-123",
+      "title": "Empty payloads crash the parser"
+    }
+  },
+  "url": "https://linear.app/acme/issue/ENG-123#comment",
+  "webhookTimestamp": 1755763320000,
+  "actor": {
+    "id": "8a1b2c3d-aaaa-bbbb-cccc-405060708090",
+    "name": "Nikhil"
+  }
+}
