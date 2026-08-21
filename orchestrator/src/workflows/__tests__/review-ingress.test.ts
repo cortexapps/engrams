@@ -314,7 +314,7 @@ describe("ReviewIngressWorkflow", () => {
 
   test("a permanent retry resolution failure leaves its early pass failed", async () => {
     // `abandonIngress` carries the review id, which is what makes the pass fail
-    // rather than merely be reported (review-control-plane.test.ts asserts that
+    // rather than merely be reported (reviews/__tests__/control-plane.test.ts asserts that
     // arm actually reaches failReview).
     const abandoned: Array<{ reviewId?: string; reason: string }> = [];
     let started = 0;
