@@ -372,6 +372,11 @@ export const InlineUploadComposer = forwardRef<
       role="textbox"
       aria-label={ariaLabel}
       aria-multiline="true"
+      // The visible placeholder is `::before` generated content, which Chrome
+      // folds into the accessible value — so an empty box announced itself as
+      // already filled with the placeholder. Naming it as a placeholder is
+      // what assistive tech reads; a pseudo-element cannot be aria-hidden.
+      aria-placeholder={placeholder}
       data-placeholder={placeholder}
       className={cn(
         "max-h-40 min-h-9 flex-1 overflow-y-auto whitespace-pre-wrap bg-transparent outline-none empty:before:pointer-events-none empty:before:text-muted-foreground/80 empty:before:content-[attr(data-placeholder)]",

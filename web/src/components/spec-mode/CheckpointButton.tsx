@@ -61,7 +61,14 @@ export function CheckpointButton({
       <SheetContent className="spec-mode-checkpoint-sheet sm:max-w-2xl">
         <SheetHeader className="border-b">
           <SheetTitle>Checkpoint history</SheetTitle>
-          <SheetDescription>Select two saved versions to compare.</SheetDescription>
+          {/* Instructing someone to select two versions directly above "No
+              versions yet" reads as a broken panel. Only ask once there is
+              something to ask for. */}
+          <SheetDescription>
+            {ordered.length === 0
+              ? "Versions appear here as the spec progresses."
+              : "Select two saved versions to compare."}
+          </SheetDescription>
         </SheetHeader>
         <div className="spec-mode-checkpoint-body">
           <ol className="spec-mode-checkpoint-list" aria-label="Checkpoints">
