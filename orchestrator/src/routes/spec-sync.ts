@@ -769,6 +769,24 @@ export function makeSpecSyncUpgradeHandler(
     }
     const ws: SpecSyncSocket = accepted;
 
+    // Watch for a hang-up from the instant the handshake completes.
+    //
+    // `hub.connect` attaches its own close handler, but it only runs after the
+    // auth round-trips below — and an EventEmitter does not replay a `close`
+    // that fired with no listener attached. A client that aborts inside that
+    // window (an abandoned reconnect, a navigation, a React unmount) would
+    // otherwise be joined to the room dead: the participant epoch is written,
+    // the socket is added to `room.sockets`, and the heartbeat early-returns
+    // on any non-OPEN socket without terminating it — so the participant row,
+    // the room (never retired, so the doc is never evicted) and the interval
+    // all leak, and other people see a phantom collaborator.
+    let closedEarly = false;
+    ws.once("close", () => {
+      closedEarly = true;
+    });
+    /** Has the client gone since the handshake? Checked after every await. */
+    const gone = () => closedEarly || ws.readyState !== WebSocket.OPEN;
+
     const refuse = (status: number, reason: string) => {
       deps.onWarning?.(`Spec sync upgrade rejected (${status} ${reason}): ${req.url ?? "/"}`);
       ws.close(Math.min(4000 + status, 4999), `spec sync ${status}`);
@@ -777,8 +795,11 @@ export function makeSpecSyncUpgradeHandler(
     void (async () => {
       try {
         const authz = await guard(headers, specId);
+        if (gone()) return;
         if (!authz.ok) return refuse(authz.status, "not a spec member");
-        if (!(await deps.resolveDraft(specId))) return refuse(404, "spec is not drafting");
+        const drafting = await deps.resolveDraft(specId);
+        if (gone()) return;
+        if (!drafting) return refuse(404, "spec is not drafting");
         await hub.connect(
           specId,
           clientId,

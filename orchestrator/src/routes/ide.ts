@@ -184,8 +184,23 @@ export function makeIdeUpgradeHandler(
     // gets the same 4000+status close it always did, just after the handshake
     // rather than instead of it.
     wss.handleUpgrade(req, socket, head, (clientWs) => {
+      // Watch for a hang-up from the instant the handshake completes.
+      // `bridgeClientToGuest` attaches its own close/error handlers, but only
+      // after the guard and EnsureIde below — and an EventEmitter does not
+      // replay a `close` that fired with no listener. EnsureIde can take
+      // SECONDS when it auto-resumes an evicted session, which makes this
+      // window wide: bridging a client that has already gone would leave the
+      // loopback server, the relay tunnel and the guest socket standing with
+      // nothing left to tear them down.
+      let closedEarly = false;
+      clientWs.once("close", () => {
+        closedEarly = true;
+      });
+      const gone = () => closedEarly || clientWs.readyState !== clientWs.OPEN;
+
       void (async () => {
         const authz = await headerGuard(headers, parsed.sessionId, "shell");
+        if (gone()) return;
         if (!authz.ok) {
           try {
             clientWs.close(4000 + authz.status, `ide ${authz.status}`);
@@ -208,6 +223,7 @@ export function makeIdeUpgradeHandler(
           }
           return;
         }
+        if (gone()) return;
         // Bridge with the prefix-stripped URL so code-server handshakes on the
         // path (+ query) its client actually asked for.
         const guestUrl = new URL(parsed.guestPath, "http://localhost");

@@ -175,6 +175,23 @@ export function makePreviewUpgradeHandler(
       return true;
     }
     const clientWs: WsConn = accepted;
+
+    // Watch for a hang-up from the instant the handshake completes.
+    // `bridgeClientToGuest` attaches its own close/error handlers, but only
+    // after the lookups below — and an EventEmitter does not replay a `close`
+    // that fired with no listener. An abandoned HMR reconnect is routine here
+    // (see the reject comment above), and building the bridge against a dead
+    // client would stand up the loopback server, the relay tunnel and the
+    // guest socket with nothing left to tear them down — holding one of the
+    // session's capped preview-connection slots (ADR 0066) until the guest
+    // side times out.
+    let closedEarly = false;
+    clientWs.once("close", () => {
+      closedEarly = true;
+    });
+    /** Has the client gone since the handshake? Checked after every await. */
+    const gone = () => closedEarly || clientWs.readyState !== clientWs.OPEN;
+
     const refuse = (status: number) => {
       try {
         clientWs.close(4000 + status, `preview ${status}`);
@@ -186,17 +203,21 @@ export function makePreviewUpgradeHandler(
     void (async () => {
       try {
         const row = await getStore().getByHostLabel(slug);
+        if (gone()) return;
         if (!row) return refuse(404);
 
         // A WS handshake is not preflighted, so there is no OPTIONS carve-out
         // here — but Origin IS sent, and it is the only thing standing between
         // one session's page and another session's socket.
         const origin = req.headers.origin;
-        if (origin && !(await isSiblingOrigin(origin, row, baseDomain, getStore()))) {
-          return refuse(403);
+        if (origin) {
+          const sibling = await isSiblingOrigin(origin, row, baseDomain, getStore());
+          if (gone()) return;
+          if (!sibling) return refuse(403);
         }
 
         const authz = await authorizeApp({ row, headers, getSession: resolveSession });
+        if (gone()) return;
         if (!authz.ok) return refuse(authz.status);
 
         bridgeClientToGuest(
