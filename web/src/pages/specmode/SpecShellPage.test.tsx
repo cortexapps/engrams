@@ -188,12 +188,19 @@ describe("SpecShellPage", () => {
     );
 
     view.unmount();
-    // One `off` per listener the hook registered: sync, connection-error,
-    // connection-close, closed.
-    expect(providerState.provider.off).toHaveBeenCalledTimes(4);
+    // One `off` per listener the hook registered: sync, connection-close, closed.
+    expect(providerState.provider.off).toHaveBeenCalledTimes(3);
     expect(providerState.provider.destroy).toHaveBeenCalledTimes(1);
     expect((createdDoc as Y.Doc).isDestroyed).toBe(true);
   });
+
+  // y-websocket fires BOTH onerror and onclose for one failed handshake, so a
+  // real attempt is modelled as both here: the pane must count it once.
+  const failedAttempt = () => {
+    providerState.emit("connection-error", new Event("error"));
+    providerState.emit("connection-close", new CloseEvent("close", { code: 1006 }));
+  };
+
   // A dead document socket used to render as loading skeletons forever, so a
   // reader could not tell "slow" from "will never connect". Prod ran that way
   // for every spec.
@@ -203,32 +210,54 @@ describe("SpecShellPage", () => {
     providerState.provider.connect.mockClear();
 
     renderWithProviders(<SpecShellPage specId="spec-1" />);
-    await waitFor(() => expect(providerState.listeners.has("connection-error")).toBe(true));
+    await waitFor(() => expect(providerState.listeners.has("connection-close")).toBe(true));
 
     // Below the threshold the pane stays quiet — one blip is not a failure.
     act(() => {
-      providerState.emit("connection-error", new Event("error"));
-      providerState.emit("connection-error", new Event("error"));
+      failedAttempt();
+      failedAttempt();
     });
     expect(screen.getByLabelText("Loading collaborative spec")).toBeTruthy();
 
     act(() => {
-      providerState.emit("connection-error", new Event("error"));
+      failedAttempt();
     });
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(screen.getByText("Cannot reach the document")).toBeTruthy();
 
     // Keeps trying for a while, then stops instead of spinning forever.
     act(() => {
-      for (let attempt = 0; attempt < 7; attempt += 1) {
-        providerState.emit("connection-error", new Event("error"));
-      }
+      for (let attempt = 0; attempt < 7; attempt += 1) failedAttempt();
     });
     expect(providerState.provider.disconnect).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/stopped trying/)).toBeTruthy();
 
     screen.getByRole("button", { name: "Try again" }).click();
     await waitFor(() => expect(providerState.provider.connect).toHaveBeenCalledTimes(1));
+  });
+
+  // The error and close pair used to increment twice, so the pane gave up
+  // after five attempts while claiming ten.
+  it("counts one failure per attempt, not one per event", async () => {
+    providerState.listeners.clear();
+    providerState.provider.disconnect.mockClear();
+
+    renderWithProviders(<SpecShellPage specId="spec-1" />);
+    await waitFor(() => expect(providerState.listeners.has("connection-close")).toBe(true));
+
+    // Nine attempts: visible, but not yet given up.
+    act(() => {
+      for (let attempt = 0; attempt < 9; attempt += 1) failedAttempt();
+    });
+    expect(screen.getByText("Cannot reach the document")).toBeTruthy();
+    expect(screen.queryByText(/stopped trying/)).toBeNull();
+    expect(providerState.provider.disconnect).not.toHaveBeenCalled();
+
+    act(() => {
+      failedAttempt();
+    });
+    expect(screen.getByText(/stopped trying/)).toBeTruthy();
+    expect(providerState.provider.disconnect).toHaveBeenCalledTimes(1);
   });
 
   it("names an application close code instead of retrying a refusal", async () => {
@@ -238,7 +267,10 @@ describe("SpecShellPage", () => {
     renderWithProviders(<SpecShellPage specId="spec-1" />);
     await waitFor(() => expect(providerState.listeners.has("closed")).toBe(true));
 
+    // y-websocket emits `connection-close` before `closed`; the refusal must
+    // win over the transient state that sets.
     act(() => {
+      providerState.emit("connection-close", new CloseEvent("close", { code: 4401 }));
       providerState.emit("closed", { code: 4401, reason: "spec sync 401" });
     });
 

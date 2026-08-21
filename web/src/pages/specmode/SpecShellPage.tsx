@@ -304,9 +304,14 @@ function useSpecConnection(specId: string, enabled: boolean, phase: string | nul
           setLink({ kind: "live" });
         }
       };
-      // A transport-level failure: the handshake never completed, so there is
-      // no close code to read. Count them and give up rather than spin.
-      const onFailure = () => {
+      // ONE failure per attempt. `connection-close` is the once-per-attempt
+      // signal — it is the same call site where y-websocket increments its own
+      // `wsUnsuccessfulReconnects`, and it fires for a handshake that never
+      // completed as well as for a socket that opened and then dropped.
+      //
+      // `connection-error` is deliberately NOT counted: a failed handshake
+      // fires onerror AND onclose, so counting both halved these thresholds.
+      const onAttemptEnded = () => {
         failures += 1;
         if (failures >= LINK_STOP_AFTER_FAILURES) {
           provider.disconnect();
@@ -317,8 +322,14 @@ function useSpecConnection(specId: string, enabled: boolean, phase: string | nul
           setLink({ kind: "unreachable", stopped: false });
         }
       };
-      // An application close code (4401/4403/4404) is a decision, not a
-      // blip — stop immediately and say so.
+      // An application close code is a decision, not a blip. y-websocket emits
+      // `closed` only when its `shouldReconnect` says reconnecting is pointless,
+      // and the default is exactly `!(code >= 4400 && code < 4500)` — the same
+      // range `rejectUpgrade` encodes into, so 4401/4403/4404 land here and
+      // land here only. The provider has already stopped reconnecting by this
+      // point; `disconnect()` keeps that explicit if a custom shouldReconnect
+      // is ever passed. Emitted after `connection-close`, so it overwrites the
+      // transient state that handler just set.
       const onClosed = (event: { code: number; reason: string }) => {
         if (event.code >= 4400 && event.code <= 4499) {
           provider.disconnect();
@@ -327,8 +338,7 @@ function useSpecConnection(specId: string, enabled: boolean, phase: string | nul
       };
 
       provider.on("sync", onSync);
-      provider.on("connection-error", onFailure);
-      provider.on("connection-close", onFailure);
+      provider.on("connection-close", onAttemptEnded);
       provider.on("closed", onClosed);
       reconnect.current = () => {
         failures = 0;
@@ -342,8 +352,7 @@ function useSpecConnection(specId: string, enabled: boolean, phase: string | nul
       }
       disposeConnection = () => {
         provider.off("sync", onSync);
-        provider.off("connection-error", onFailure);
-        provider.off("connection-close", onFailure);
+        provider.off("connection-close", onAttemptEnded);
         provider.off("closed", onClosed);
         provider.destroy();
         nextConnection.doc.destroy();
