@@ -13,7 +13,6 @@
  * the contract.
  */
 
-import { createHash } from "node:crypto";
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -39,6 +38,7 @@ import {
 } from "../rpc/task-create.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
 import { runExec } from "../exec/durable-exec.ts";
+import { stageFiles } from "../exec/stage-files.ts";
 import { AUTOMATION_TOPIC, type AutomationInbox } from "../automations/engine/inbox.ts";
 import { interpretAutomation, type EngineRunResult } from "../automations/engine/interpreter.ts";
 import type { EngineDeps, EngineSessionOps } from "../automations/engine/deps.ts";
@@ -194,53 +194,17 @@ export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): E
     },
 
     async writeFiles(sessionId, files) {
-      // Metadata frame + one chunk per file, content-addressed by sha256 so a
-      // replay is idempotent. (Shared extraction with the review control
-      // plane lands in phase 2.D.)
-      const results: Array<{ path: string; ok: boolean; error?: string }> = [];
-      for (const file of files) {
-        const content = new TextEncoder().encode(file.content);
-        const sha256 = createHash("sha256").update(content).digest("hex");
-        async function* frames(): AsyncIterable<{
-          frame:
-            | {
-                case: "metadata";
-                value: {
-                  sessionId: string;
-                  path: string;
-                  sizeBytes: bigint;
-                  sha256: string;
-                  mode?: number;
-                };
-              }
-            | { case: "chunk"; value: Uint8Array };
-        }> {
-          yield {
-            frame: {
-              case: "metadata",
-              value: {
-                sessionId,
-                path: file.path,
-                sizeBytes: BigInt(content.byteLength),
-                sha256,
-                mode: file.mode ?? 0o644,
-              },
-            },
-          };
-          if (content.byteLength > 0) yield { frame: { case: "chunk", value: content } };
-        }
-        try {
-          await defaultSessions.writeFile(frames());
-          results.push({ path: file.path, ok: true });
-        } catch (error) {
-          results.push({
-            path: file.path,
-            ok: false,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-      return results;
+      // Shared WriteFile staging (exec/stage-files.ts): content-addressed by
+      // sha256 so a replay is idempotent; per-file error capture.
+      return stageFiles(
+        defaultSessions,
+        sessionId,
+        files.map((file) => ({
+          path: file.path,
+          content: new TextEncoder().encode(file.content),
+          mode: file.mode ?? 0o644,
+        })),
+      );
     },
   };
 }
