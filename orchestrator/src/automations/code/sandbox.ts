@@ -114,10 +114,9 @@ const GUEST_DRIVER = `
 `;
 
 type CoreModule = typeof import("quickjs-emscripten-core");
+type SyncVariant = typeof import("@jitl/quickjs-singlefile-mjs-release-sync").default;
 
-let coreLoader:
-  | Promise<{ core: CoreModule; baseVariant: Parameters<CoreModule["newVariant"]>[0] }>
-  | undefined;
+let coreLoader: Promise<{ core: CoreModule; baseVariant: SyncVariant }> | undefined;
 
 /** The base variant import is cached; each evaluation instantiates a fresh
  * module over a fresh capped memory from it. Lazy so boot pays nothing. */
