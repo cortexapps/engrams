@@ -8,7 +8,8 @@ import { makeAutomationStore, type AutomationCronStore, type DueCronAutomation }
 import { makeIntegrationEventStore } from "../db/integration-events.ts";
 import { log as rootLog } from "../log.ts";
 import { automationRunWorkflow, type AutomationRunWorkflowInput } from "../workflows/automation-run.ts";
-import { automationRunId, cronDeliveryKey } from "./dispatch.ts";
+import { admitClaimedCronRun, automationRunId, cronDeliveryKey } from "./dispatch.ts";
+import { defaultAutomationSender, type AutomationSender } from "./engine/inbox.ts";
 
 const log = rootLog.child({ component: "automation-scheduler" });
 
@@ -24,6 +25,8 @@ export interface AutomationSchedulerTickDeps {
   owner: string;
   store: AutomationCronStore;
   workflowStarter: AutomationWorkflowStarter;
+  /** Mailbox sender for join/supersede policies; defaults to DBOS. */
+  sender?: AutomationSender;
   now: () => Date;
   onError?: (automation: DueCronAutomation, error: unknown) => void;
 }
@@ -33,6 +36,9 @@ export interface AutomationSchedulerTickResult {
   claimed: number;
   started: number;
   skipped: number;
+  /** Occurrences settled by a concurrency policy without starting (join,
+   * skip, lost supersede race) or parked as queued. */
+  admitted: { joined: number; queued: number; skipped: number };
   errors: number;
 }
 
@@ -57,23 +63,25 @@ export function nextCronOccurrence(
 }
 
 /** One independently driveable scanner step. Every database decision remains
- * in AutomationCronStore; this function only sequences claim, durable start,
- * and the post-start schedule CAS.
+ * in AutomationCronStore; this function sequences claim, concurrency
+ * admission, durable start, and the post-start schedule CAS.
  *
- * Cron occurrences bypass concurrency admission in phase 1: the occurrence
- * claim is already exclusive per (automation, scheduled_for), and no
- * migrated automation carries a concurrency setting. Cron + concurrency
- * composes when settings become authorable (phase 3). */
+ * The occurrence claim is exclusive per (automation, scheduled_for); the
+ * concurrency policy (queue | supersede | skip | join) is then applied to
+ * the claimed run exactly as the dispatchers apply it — one admission
+ * semantics for every trigger kind. */
 export async function runSchedulerTick(
   deps: AutomationSchedulerTickDeps,
 ): Promise<AutomationSchedulerTickResult> {
   const now = deps.now();
+  const sender = deps.sender ?? defaultAutomationSender;
   const due = await deps.store.listDueCron(now);
   const result: AutomationSchedulerTickResult = {
     due: due.length,
     claimed: 0,
     started: 0,
     skipped: 0,
+    admitted: { joined: 0, queued: 0, skipped: 0 },
     errors: 0,
   };
 
@@ -131,6 +139,25 @@ export async function runSchedulerTick(
           now,
         });
         result.skipped++;
+        continue;
+      }
+
+      // Concurrency admission on the claimed row (debt ledger 3.1). A
+      // settled/queued occurrence still advances the schedule: the
+      // occurrence happened, the policy decided what to do with it.
+      const admission = await admitClaimedCronRun(
+        { target: { automation, definition: dueAutomation.definition }, run: claim.run, trigger: claim.run.trigger },
+        { store: deps.store, sender, now: deps.now },
+      );
+      if (admission !== "started") {
+        result.admitted[admission]++;
+        await deps.store.advanceCronSchedule({
+          automationId: automation.id,
+          scheduledFor,
+          nextFireAt,
+          fired: true,
+          now,
+        });
         continue;
       }
 

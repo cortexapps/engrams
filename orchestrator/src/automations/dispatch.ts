@@ -89,9 +89,106 @@ export interface AdmitRunInput {
   deliveryKey: string;
   trigger: AutomationRunTrigger;
   scheduledFor: Date | null;
+  /** Editor DryRun: the run row is flagged and integration actions stub. */
+  dryRun?: boolean;
 }
 
 export type AdmitOutcome = "started" | "joined" | "queued" | "skipped";
+
+/** The concurrency key renders from trigger/event/inputs only — no steps
+ * exist before admission. Shared by webhook/integration dispatch and the cron
+ * scheduler. */
+export async function renderConcurrencyKey(
+  keyTemplate: string,
+  target: DispatchTarget,
+  trigger: AutomationRunTrigger,
+): Promise<string> {
+  return renderAutomationTemplateInScope(keyTemplate, {
+    trigger: {
+      kind: trigger.source,
+      ...(trigger.eventKey !== undefined ? { event: trigger.eventKey } : {}),
+      ...(trigger.receivedAt !== undefined ? { received_at: trigger.receivedAt } : {}),
+    },
+    event: { raw: trigger.payload ?? {} },
+    inputs: target.automation.inputs,
+  });
+}
+
+/** Cron admission (debt ledger 3.1): the occurrence claim already created
+ * the run row, so this applies ONLY the concurrency policy to an existing
+ * pending run. Returns the outcome; "started" means the caller should start
+ * the workflow, anything else means the row was settled here. */
+export async function admitClaimedCronRun(
+  input: { target: DispatchTarget; run: { id: string; deliveryKey: string | null }; trigger: AutomationRunTrigger },
+  deps: {
+    store: Pick<AutomationDispatchStore, "claimConcurrency" | "casConcurrency"> & {
+      settleRunConcurrency(
+        runId: string,
+        concurrencyKey: string,
+        terminal?: { status: "filtered"; error: string },
+      ): Promise<void>;
+    };
+    sender: AutomationSender;
+    now: () => Date;
+  },
+): Promise<AdmitOutcome> {
+  const { target, run, trigger } = input;
+  const concurrency = target.definition.settings.concurrency;
+  if (!concurrency) return "started";
+  const automationId = target.automation.id;
+  const key = await renderConcurrencyKey(concurrency.keyTemplate, target, trigger);
+  const claim = await deps.store.claimConcurrency(automationId, key, run.id);
+  if (claim.claimed) {
+    await deps.store.settleRunConcurrency(run.id, key);
+    return "started";
+  }
+  const deliveryKey = run.deliveryKey ?? run.id;
+  switch (concurrency.policy) {
+    case "join":
+      await deps.sender.send(
+        claim.holderRunId,
+        {
+          kind: "event",
+          eventKey: trigger.eventKey ?? trigger.source,
+          deliveryKey,
+          payload: trigger.payload ?? {},
+          receivedAt: trigger.receivedAt ?? deps.now().toISOString(),
+        },
+        inboxKeys.joinedEvent(deliveryKey, claim.holderRunId),
+      );
+      await deps.store.settleRunConcurrency(run.id, key, {
+        status: "filtered",
+        error: `concurrency: joined active run ${claim.holderRunId}`,
+      });
+      return "joined";
+    case "queue":
+      await deps.store.settleRunConcurrency(run.id, key);
+      return "queued";
+    case "skip":
+      await deps.store.settleRunConcurrency(run.id, key, {
+        status: "filtered",
+        error: `concurrency: skipped (active run ${claim.holderRunId})`,
+      });
+      return "skipped";
+    case "supersede": {
+      const won = await deps.store.casConcurrency(automationId, key, claim.holderRunId, run.id);
+      if (!won) {
+        await deps.store.settleRunConcurrency(run.id, key, {
+          status: "filtered",
+          error: "concurrency: superseded before start",
+        });
+        return "skipped";
+      }
+      await deps.sender.send(
+        claim.holderRunId,
+        { kind: "supersede", byRunId: run.id },
+        inboxKeys.supersede(claim.holderRunId, run.id),
+      );
+      await deps.store.settleRunConcurrency(run.id, key);
+      return "started";
+    }
+  }
+}
 
 /** Decide admission for one matched occurrence and, unless the policy says
  * otherwise, create the run row and start its workflow. Shared by the webhook
@@ -118,6 +215,7 @@ export async function admitAutomationRun(
       deliveryKey,
       concurrencyKey,
       scheduledFor: input.scheduledFor,
+      ...(input.dryRun ? { dryRun: true } : {}),
     });
     await deps.starter.start({ runId, automationId }, runId);
   };
@@ -127,16 +225,7 @@ export async function admitAutomationRun(
     return "started";
   }
 
-  // The key renders from trigger/event/inputs only (no steps exist yet).
-  const key = await renderAutomationTemplateInScope(concurrency.keyTemplate, {
-    trigger: {
-      kind: trigger.source,
-      ...(trigger.eventKey !== undefined ? { event: trigger.eventKey } : {}),
-      ...(trigger.receivedAt !== undefined ? { received_at: trigger.receivedAt } : {}),
-    },
-    event: { raw: trigger.payload ?? {} },
-    inputs: target.automation.inputs,
-  });
+  const key = await renderConcurrencyKey(concurrency.keyTemplate, target, trigger);
 
   const claim = await deps.store.claimConcurrency(automationId, key, runId);
   if (claim.claimed) {

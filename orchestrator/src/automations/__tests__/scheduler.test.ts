@@ -6,6 +6,8 @@ import type {
   AutomationRunRow,
   DueCronAutomation,
 } from "../../db/automations.ts";
+import type { AutomationDefinition } from "../engine/definition.ts";
+import type { AutomationInbox } from "../engine/inbox.ts";
 import {
   AUTOMATION_LEASE_TTL_MS,
   automationCronWorkflowId,
@@ -25,6 +27,7 @@ function meta(scheduledFor = NOW): AutomationMetaRow {
     builtinKey: null,
     currentVersion: 3,
     inputs: {},
+    blockOverrides: {},
     endSessionsOnFinish: false,
     createdByUserId: "admin-1",
     nextFireAt: scheduledFor,
@@ -35,10 +38,15 @@ function meta(scheduledFor = NOW): AutomationMetaRow {
   };
 }
 
-function dueAutomation(scheduledFor = NOW): DueCronAutomation {
+function dueAutomation(
+  scheduledFor = NOW,
+  settings: AutomationDefinition["settings"] = { endSessionsOnFinish: false },
+): DueCronAutomation {
+  const trigger = { kind: "cron", schedule: "* * * * *", timezone: "UTC" } as const;
   return {
     automation: meta(scheduledFor),
-    trigger: { kind: "cron", schedule: "* * * * *", timezone: "UTC" },
+    trigger,
+    definition: { engine: 1, trigger, blocks: [], inputsSchema: [], settings },
     nextFireAt: scheduledFor,
   };
 }
@@ -53,6 +61,7 @@ function pendingRun(
     version: 3,
     trigger: { source: "cron", receivedAt: scheduledFor.toISOString() },
     deliveryKey: `cron:${Math.floor(scheduledFor.getTime() / 1_000)}`,
+    dryRun: false,
     concurrencyKey: null,
     renderedPrompt: null,
     renderedTitle: null,
@@ -73,13 +82,44 @@ function pendingRun(
 function fixture(input?: {
   scheduledFor?: Date;
   existingRun?: AutomationRunRow;
+  settings?: AutomationDefinition["settings"];
+  /** Pre-existing holder of the concurrency key (simulates an active run). */
+  claimHolder?: string;
 }) {
-  let automation = dueAutomation(input?.scheduledFor);
+  let automation = dueAutomation(input?.scheduledFor, input?.settings);
   let run = input?.existingRun;
   const advances: Array<{ fired: boolean; scheduledFor: Date }> = [];
   const claimVersions: number[] = [];
 
+  const claims = new Map<string, string>();
+  const settled: Array<{ runId: string; key: string; terminal?: { status: string; error: string } }> = [];
   const store: AutomationCronStore = {
+    async settleRunConcurrency(runId, concurrencyKey, terminal) {
+      settled.push({ runId, key: concurrencyKey, ...(terminal ? { terminal } : {}) });
+      if (run && run.id === runId) {
+        run = {
+          ...run,
+          concurrencyKey,
+          ...(terminal ? { status: terminal.status, error: terminal.error } : {}),
+        };
+      }
+    },
+    async claimConcurrency(automationId, key, runId) {
+      const mapKey = `${automationId}:${key}`;
+      const holder = input?.claimHolder ?? claims.get(mapKey);
+      if (holder === undefined || holder === runId) {
+        claims.set(mapKey, runId);
+        return { claimed: true };
+      }
+      return { claimed: false, holderRunId: holder };
+    },
+    async casConcurrency(automationId, key, fromRunId, toRunId) {
+      const mapKey = `${automationId}:${key}`;
+      const holder = input?.claimHolder ?? claims.get(mapKey);
+      if (holder !== fromRunId) return false;
+      claims.set(mapKey, toRunId);
+      return true;
+    },
     async listDueCron(now) {
       return automation.automation.enabled && automation.nextFireAt <= now ? [automation] : [];
     },
@@ -133,8 +173,19 @@ function fixture(input?: {
     store,
     advances,
     claimVersions,
+    settled,
     get run() {
       return run;
+    },
+  };
+}
+
+function recordingSender() {
+  const sent: Array<{ runId: string; message: AutomationInbox; key: string }> = [];
+  return {
+    sent,
+    async send(runId: string, message: AutomationInbox, key: string) {
+      sent.push({ runId, message, key });
     },
   };
 }
@@ -243,5 +294,60 @@ describe("automation cron scheduler", () => {
   test("workflow id format is pinned to automation and fire epoch seconds", () => {
     expect(automationCronWorkflowId("abc-123", new Date("2026-07-22T12:34:56.999Z")))
       .toBe("autorun:abc-123:cron:1784723696");
+  });
+
+  test("cron admission: a configured concurrency key is claimed and stamped on the run", async () => {
+    const f = fixture({
+      settings: {
+        endSessionsOnFinish: false,
+        concurrency: { keyTemplate: "nightly", policy: "supersede" },
+      },
+    });
+    const starter = recordingStarter();
+    const sender = recordingSender();
+    const result = await runSchedulerTick({
+      owner: "pod-a",
+      store: f.store,
+      workflowStarter: starter,
+      sender,
+      now: () => NOW,
+    });
+    expect(result.started).toBe(1);
+    expect(f.settled).toEqual([{ runId: automationCronWorkflowId("automation-1", NOW), key: "nightly" }]);
+    expect(f.run?.concurrencyKey).toBe("nightly");
+    expect(sender.sent).toEqual([]);
+  });
+
+  test("cron admission: supersede signals the holder and still starts; skip settles as filtered and advances", async () => {
+    const holder = "autorun:automation-1:cron:1";
+    const supersede = fixture({
+      settings: { endSessionsOnFinish: false, concurrency: { keyTemplate: "nightly", policy: "supersede" } },
+      claimHolder: holder,
+    });
+    const starter = recordingStarter();
+    const sender = recordingSender();
+    const r1 = await runSchedulerTick({ owner: "pod-a", store: supersede.store, workflowStarter: starter, sender, now: () => NOW });
+    expect(r1.started).toBe(1);
+    expect(sender.sent).toEqual([
+      {
+        runId: holder,
+        message: { kind: "supersede", byRunId: automationCronWorkflowId("automation-1", NOW) },
+        key: `autorun:${holder}:supersede:${automationCronWorkflowId("automation-1", NOW)}`,
+      },
+    ]);
+    expect(supersede.advances).toEqual([{ fired: true, scheduledFor: NOW }]);
+
+    const skip = fixture({
+      settings: { endSessionsOnFinish: false, concurrency: { keyTemplate: "nightly", policy: "skip" } },
+      claimHolder: holder,
+    });
+    const starter2 = recordingStarter();
+    const r2 = await runSchedulerTick({ owner: "pod-a", store: skip.store, workflowStarter: starter2, sender: recordingSender(), now: () => NOW });
+    expect(r2.started).toBe(0);
+    expect(r2.admitted.skipped).toBe(1);
+    expect(starter2.starts).toEqual([]);
+    expect(skip.run?.status).toBe("filtered");
+    // The occurrence happened and was decided: the schedule still advances.
+    expect(skip.advances).toEqual([{ fired: true, scheduledFor: NOW }]);
   });
 });

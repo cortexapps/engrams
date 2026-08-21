@@ -44,6 +44,7 @@ function meta(id: string, kind: "user" | "builtin" = "user"): AutomationMetaRow 
     builtinKey: null,
     currentVersion: 1,
     inputs: {},
+    blockOverrides: {},
     endSessionsOnFinish: false,
     createdByUserId: "admin",
     nextFireAt: null,
