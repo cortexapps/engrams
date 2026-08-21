@@ -122,6 +122,27 @@ web:
           - path: /api/v1/hooks/
             pathType: Prefix
             service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
+          # WebSocket surfaces MUST live on the no-IAP backend. IAP does not
+          # carry a WebSocket upgrade — the load balancer answers 502 — and
+          # IAP is enabled per backend SERVICE, not per path, so a socket
+          # routed at the IAP'd web backend can never connect. Any path left
+          # to the default "/" rule below inherits IAP.
+          #
+          # Both prefixes below are guarded by the orchestrator itself
+          # (makeHeaderGuard / makeSpecMemberHeaderGuard); an anonymous
+          # caller completes the handshake and is closed with 4401, so
+          # dropping IAP here does not widen access.
+          #   - sessions: the shell (ADR 0051), the IDE proxy (ADR 0085),
+          #     plus the SSE + artifact routes the CLI reads.
+          #   - specs: the Yjs spec-document socket at
+          #     /api/v1/specs/:id/sync (ADR 0117). Note that
+          #     /api/v1/spec-templates is a separate prefix and stays IAP'd.
+          - path: /api/v1/sessions/
+            pathType: Prefix
+            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
+          - path: /api/v1/specs/
+            pathType: Prefix
+            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
           # Everything else → web nginx (IAP-protected).
           - path: /
             pathType: Prefix
