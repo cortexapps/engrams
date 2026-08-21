@@ -526,6 +526,13 @@
       "when": 1787377600000,
       "tag": "0074_session_apps",
       "breakpoints": true
+    },
+    {
+      "idx": 75,
+      "version": "7",
+      "when": 1787464000000,
+      "tag": "0075_automation_workflow_engine",
+      "breakpoints": true
     }
   ]
 }

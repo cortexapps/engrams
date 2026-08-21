@@ -1256,17 +1256,21 @@ export const profile = pgTable(
 );
 
 // ---------------------------------------------------------------------------
-// Automations (ADR 0102): dynamic triggers that launch profile-backed tasks.
+// Automations (ADR 0102 → ADR 0119): versioned block-graph definitions whose
+// runs execute on the interpreter workflow.
 // ---------------------------------------------------------------------------
 
-export type AutomationTrigger =
-  | { kind: "cron"; schedule: string; timezone: string }
-  | {
-      kind: "webhook";
-      registrationId: string;
-      events: string[];
-      filter?: Record<string, unknown>;
-    };
+// The canonical trigger union lives with the engine's definition schema; the
+// import is type-only, so no runtime cycle exists.
+import type {
+  AutomationSettings,
+  BlockDef,
+  InputFieldSpec,
+  TriggerSpec,
+} from "../automations/engine/definition.ts";
+
+export type AutomationTrigger = TriggerSpec;
+export type { AutomationSettings, BlockDef, InputFieldSpec };
 
 export interface CreateTaskAutomationAction {
   kind: "create_task";
@@ -1342,10 +1346,12 @@ export interface WebhookVerification {
 /** Redacted trigger input persisted with a run. The provider-specific payload
  * stays data, never executable template source. */
 export interface AutomationRunTrigger {
-  source: "cron" | "webhook";
+  source: "cron" | "webhook" | "integration" | "manual";
   eventKey?: string;
   deliveryId?: string;
   payload?: Record<string, unknown>;
+  /** ISO timestamp at which the orchestrator accepted the trigger. */
+  receivedAt?: string;
 }
 
 export const webhookRegistration = pgTable(
@@ -1372,10 +1378,17 @@ export const automation = pgTable(
     name: text("name").notNull(),
     description: text("description").notNull().default(""),
     enabled: boolean("enabled").notNull().default(true),
-    trigger: jsonb("trigger").$type<AutomationTrigger>().notNull(),
-    action: jsonb("action").$type<AutomationAction>().notNull(),
+    /** ADR 0119 D7: "user" or "builtin". A builtin's graph is read-only. */
+    kind: text("kind").notNull().default("user"),
+    builtinKey: text("builtin_key"),
+    /** The version new runs pin (automation_version.version). */
+    currentVersion: integer("current_version").notNull().default(1),
+    /** Per-automation input values; the schema lives in the version. */
+    inputs: jsonb("inputs").$type<Record<string, unknown>>().notNull().default({}),
+    /** ADR 0119 D8: default false — sessions a run creates are kept. */
+    endSessionsOnFinish: boolean("end_sessions_on_finish").notNull().default(false),
     createdByUserId: text("created_by_user_id"),
-    // Kept outside trigger JSON so the Phase 3 scanner can use an indexed due
+    // Kept outside the definition JSON so the scanner can use an indexed due
     // query and advance a claimed cron occurrence without rewriting config.
     nextFireAt: timestamp("next_fire_at", { withTimezone: true }),
     lastFiredAt: timestamp("last_fired_at", { withTimezone: true }),
@@ -1386,17 +1399,48 @@ export const automation = pgTable(
       .$onUpdate(() => new Date()),
     archivedAt: timestamp("archived_at", { withTimezone: true }),
   },
-  (t) => [index("automation_due_idx").on(t.enabled, t.nextFireAt)],
+  (t) => [
+    index("automation_due_idx").on(t.enabled, t.nextFireAt),
+    uniqueIndex("automation_builtin_key_unique")
+      .on(t.builtinKey)
+      .where(sql`builtin_key is not null`),
+  ],
+);
+
+/** Immutable definition snapshots (ADR 0119 D1). Every save writes version
+ * N+1; a run pins the version it started with. */
+export const automationVersion = pgTable(
+  "automation_version",
+  {
+    automationId: text("automation_id")
+      .notNull()
+      .references(() => automation.id, { onDelete: "cascade" }),
+    version: integer("version").notNull(),
+    trigger: jsonb("trigger").$type<AutomationTrigger>().notNull(),
+    blocks: jsonb("blocks").$type<BlockDef[]>().notNull(),
+    inputsSchema: jsonb("inputs_schema").$type<InputFieldSpec[]>().notNull().default([]),
+    settings: jsonb("settings").$type<AutomationSettings>().notNull(),
+    createdByUserId: text("created_by_user_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.automationId, t.version] })],
 );
 
 export const automationRun = pgTable(
   "automation_run",
   {
+    /** ADR 0119 D3: the run id IS the DBOS workflow id
+     * (autorun:<automationId>:<deliveryKey>). */
     id: text("id").primaryKey(),
     automationId: text("automation_id")
       .notNull()
       .references(() => automation.id, { onDelete: "cascade" }),
+    version: integer("version").notNull().default(1),
     trigger: jsonb("trigger").$type<AutomationRunTrigger>().notNull(),
+    /** cron:<epoch> | webhook:<deliveryId> | <provider>:<deliveryId> | manual:<uuid>. */
+    deliveryKey: text("delivery_key"),
+    concurrencyKey: text("concurrency_key"),
+    context: jsonb("context").$type<Record<string, unknown>>(),
     renderedPrompt: text("rendered_prompt"),
     renderedTitle: text("rendered_title"),
     taskId: text("task_id").references(() => task.id, { onDelete: "set null" }),
@@ -1409,15 +1453,74 @@ export const automationRun = pgTable(
     scheduledFor: timestamp("scheduled_for", { withTimezone: true }),
     leaseOwner: text("lease_owner"),
     leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    endedAt: timestamp("ended_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
     uniqueIndex("automation_run_occurrence_unique")
       .on(t.automationId, t.scheduledFor)
       .where(sql`scheduled_for is not null`),
+    uniqueIndex("automation_run_delivery_unique")
+      .on(t.automationId, t.deliveryKey)
+      .where(sql`delivery_key is not null`),
     index("automation_run_automation_created_idx").on(t.automationId, t.createdAt),
     index("automation_run_lease_idx").on(t.leaseExpiresAt),
+    index("automation_run_concurrency_idx").on(t.automationId, t.concurrencyKey, t.status),
   ],
+);
+
+/** Step ledger (ADR 0119 D2): one row per block frame path per attempt. */
+export const automationStepRun = pgTable(
+  "automation_step_run",
+  {
+    runId: text("run_id")
+      .notNull()
+      .references(() => automationRun.id, { onDelete: "cascade" }),
+    /** The frame path (blockId, loop iterations suffixed as blockId[i]). */
+    blockId: text("block_id").notNull(),
+    attempt: integer("attempt").notNull(),
+    status: text("status").notNull().default("pending"),
+    inputs: jsonb("inputs").$type<Record<string, unknown>>(),
+    outputs: jsonb("outputs").$type<Record<string, unknown>>(),
+    error: text("error"),
+    startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+    endedAt: timestamp("ended_at", { withTimezone: true }),
+  },
+  (t) => [primaryKey({ columns: [t.runId, t.blockId, t.attempt] })],
+);
+
+/** Session → run mailbox binding (ADR 0119 D3). Recorded BEFORE the session
+ * listener registration, so no event arrives without a mailbox. */
+export const automationSession = pgTable(
+  "automation_session",
+  {
+    sessionId: text("session_id").primaryKey(),
+    runId: text("run_id")
+      .notNull()
+      .references(() => automationRun.id, { onDelete: "cascade" }),
+    blockId: text("block_id").notNull(),
+    role: text("role").notNull().default("primary"),
+    /** ADR 0119 D8: finalize ends only keep=false sessions. */
+    keep: boolean("keep").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("automation_session_run_idx").on(t.runId)],
+);
+
+/** Concurrency claim (ADR 0119 D4): a PG leasing row, INSERT ON CONFLICT +
+ * CAS + DELETE — never an advisory lock. */
+export const automationConcurrencyClaim = pgTable(
+  "automation_concurrency_claim",
+  {
+    automationId: text("automation_id")
+      .notNull()
+      .references(() => automation.id, { onDelete: "cascade" }),
+    concurrencyKey: text("concurrency_key").notNull(),
+    runId: text("run_id").notNull(),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.automationId, t.concurrencyKey] })],
 );
 
 export const webhookSample = pgTable(
