@@ -1,35 +1,33 @@
 import type { Connector } from "@/gen/engram/app/v1/integration_pb";
 
-export type VerificationScheme = "github_hmac_sha256" | "slack_v0" | "generic_hmac_sha256";
+/** Custom registrations verify with the generic scheme only (ADR 0119 D5);
+ * provider events are integration triggers. */
+export type VerificationScheme = "generic_hmac_sha256";
 
 export interface WebhookConnectorHint {
   provider: string;
   name: string;
-  verificationScheme: VerificationScheme;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isVerificationScheme(value: unknown): value is VerificationScheme {
-  return value === "github_hmac_sha256" || value === "slack_v0" || value === "generic_hmac_sha256";
-}
-
-/** Read only the display fields the server already validated from connector JSON. */
+/** Read only the display fields the server already validated from connector
+ * JSON. Providers that own an integration ingress (an `ingress` facet) are
+ * excluded: their events are integration triggers, and the server rejects
+ * them as custom-registration hints. */
 export function webhookConnectorHints(connectors: Connector[]): WebhookConnectorHint[] {
   const hints: WebhookConnectorHint[] = [];
   for (const connector of connectors) {
     try {
       const config: unknown = JSON.parse(connector.configJson);
       if (!isRecord(config) || !isRecord(config.webhook)) continue;
-      const scheme = config.webhook.verificationScheme;
-      if (!isVerificationScheme(scheme)) continue;
+      if (config.webhook.ingress !== undefined) continue;
       const display = isRecord(config.display) ? config.display : undefined;
       hints.push({
         provider: connector.provider,
         name: typeof display?.name === "string" ? display.name : connector.provider,
-        verificationScheme: scheme,
       });
     } catch {
       // The server validates connector JSON. Ignore a stale malformed row rather
