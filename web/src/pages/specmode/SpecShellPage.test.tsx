@@ -312,6 +312,51 @@ describe("SpecShellPage", () => {
     fetchMock.mockRestore();
   });
 
+  // A mount-lifetime latch would spend its one classification on the first
+  // blip. The reason can change while the tab stays open — a cookie expiring
+  // mid-session is the ordinary case — so every failure episode must be able
+  // to ask again.
+  it("classifies a later failure episode after the socket recovered", async () => {
+    providerState.listeners.clear();
+    // Episode 1: the spec is fine, so the API declines to override the
+    // transport verdict.
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify({ spec: { phase: "drafting" } }), { status: 200 }),
+      );
+
+    renderWithProviders(<SpecShellPage specId="spec-1" />);
+    await waitFor(() => expect(providerState.listeners.has("connection-close")).toBe(true));
+    act(() => {
+      failedAttempt();
+      failedAttempt();
+      failedAttempt();
+    });
+    expect(await screen.findByText("Cannot reach the document")).toBeTruthy();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    // The socket recovers.
+    act(() => {
+      providerState.emit("sync", true);
+    });
+    expect(await screen.findByLabelText("Collaborative spec canvas")).toBeTruthy();
+
+    // Episode 2: now the session has expired.
+    providerState.provider.synced = false;
+    fetchMock.mockResolvedValue(new Response(null, { status: 401 }));
+    act(() => {
+      providerState.emit("sync", false);
+      failedAttempt();
+      failedAttempt();
+      failedAttempt();
+    });
+
+    expect(await screen.findByText("Your session expired")).toBeTruthy();
+    providerState.provider.synced = false;
+    fetchMock.mockRestore();
+  });
+
   it("keeps the transport verdict when the API is unreachable too", async () => {
     providerState.listeners.clear();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("offline"));

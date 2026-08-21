@@ -373,18 +373,30 @@ function useSpecConnection(specId: string, enabled: boolean, phase: string | nul
         }
         if (failures >= LINK_VISIBLE_AFTER_FAILURES) {
           setLink({ kind: "unreachable", stopped: false });
-          void explain();
+          // Exactly ON the threshold, not past it: one classification when the
+          // failure first becomes visible, and one more from the give-up branch
+          // above. `failures` resets on sync, so a LATER episode in the same
+          // mount classifies again — which matters, because the reason can
+          // change while the tab stays open (a cookie expiring mid-session is
+          // the ordinary case, and it is precisely the one worth naming).
+          if (failures === LINK_VISIBLE_AFTER_FAILURES) void explain();
         }
       };
       // Replace the transport verdict with the real reason, when the HTTP API
-      // knows one. Guarded so a late answer cannot overwrite a live socket or
-      // a connection this effect has already torn down.
-      let explained = false;
+      // knows one. The guard is in-flight de-dup ONLY — a mount-lifetime latch
+      // would spend the single classification on the first blip and leave every
+      // later refusal unexplained, and would also never retry a classification
+      // whose own fetch failed transiently.
+      let classifying = false;
       const explain = async () => {
-        if (explained || disposed) return;
-        explained = true;
-        const refused = await classifyLinkFailure(specId);
-        if (refused && !disposed && !provider.synced) setLink(refused);
+        if (classifying || disposed) return;
+        classifying = true;
+        try {
+          const refused = await classifyLinkFailure(specId);
+          if (refused && !disposed && !provider.synced) setLink(refused);
+        } finally {
+          classifying = false;
+        }
       };
       // An application close code is a decision, not a blip. y-websocket emits
       // `closed` only when its `shouldReconnect` says reconnecting is pointless,
@@ -407,7 +419,6 @@ function useSpecConnection(specId: string, enabled: boolean, phase: string | nul
       reconnect.current = () => {
         failures = 0;
         stopped = false;
-        explained = false;
         setLink({ kind: "connecting" });
         provider.connect();
       };
