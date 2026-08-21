@@ -54,6 +54,7 @@ const active: ReviewRow = {
   statusCommentId: null,
   finderSessionId: null,
   verifierSessionId: null,
+  automationRunId: null,
   summaryMd: null,
   providerId: null,
   prUrl: null,
@@ -1428,5 +1429,150 @@ describe("ReviewControlPlane", () => {
     // #764-2: both SHAs already stored → no live fetch, commit_id is the reviewed head.
     expect(fetchCalls).toBe(0);
     expect(postedCommit).toBe(reviewed.headSha);
+  });
+
+  // ADR 0119 phase 4.2: the decision half without the GitHub post.
+  test("decideReviewResults settles findings, finalizes, and returns the post payload without posting", async () => {
+    const confirmed = { ...finding("confirmed"), suggestedFix: "return afterVerification;" };
+    const refuted = finding("refuted");
+    const verdicts: ReviewVerdictRow[] = [
+      {
+        id: "v-c",
+        findingId: confirmed.id,
+        verdict: "confirmed",
+        confidence: "high",
+        reasoning: "Confirmed from the retry branch.",
+        sessionId: "verifier-session",
+        toolCallId: "c1",
+        createdAt: new Date(1),
+      },
+      {
+        id: "v-r",
+        findingId: refuted.id,
+        verdict: "refuted",
+        confidence: "high",
+        reasoning: "The terminal guard prevents this path.",
+        sessionId: "verifier-session",
+        toolCallId: "c2",
+        createdAt: new Date(1),
+      },
+    ];
+    const reviewed: ReviewRow = { ...active, baseSha: "base-reviewed" };
+    const findingUpdates: Array<{ id: string; state: string }> = [];
+    const finalizations: Array<Parameters<ReviewStore["finalizeReview"]>[1]> = [];
+    const events: string[] = [];
+    let postCalls = 0;
+    let fetchCalls = 0;
+    const sessions = fakeSessions();
+    const cp = makeReviewControlPlane({
+      sessions,
+      reviews: {
+        ...reviewPostingNoops,
+        getReview: async () => ({ review: reviewed, findings: [confirmed, refuted], verdicts }),
+        updateReviewStatus: async () => true,
+        async updateFindingState(id, state) {
+          findingUpdates.push({ id, state });
+        },
+        async finalizeReview(_id, input) {
+          finalizations.push(input);
+          return true;
+        },
+        async recordEvent(_id, kind) {
+          events.push(kind);
+        },
+      },
+      githubPoster: {
+        fetchPrContext: async () => {
+          fetchCalls++;
+          return { headSha: "live", baseSha: "live", pr: NO_PR_CONTEXT };
+        },
+        alreadyPosted: async () => false,
+        listReviewComments: async () => [],
+        upsertStatusComment: async () => ({ commentId: "status-1" }),
+        async postReview() {
+          postCalls++;
+          throw new Error("must not post");
+        },
+      },
+    });
+
+    const payload = await cp.decideReviewResults(reviewed.id, { sessionId: "verifier-session" });
+
+    // The verifier worker was retired first (best-effort), GitHub was never
+    // posted to, and no live fetch was needed with both SHAs stored.
+    expect(sessions.deletedIds).toEqual(["verifier-session"]);
+    expect(postCalls).toBe(0);
+    expect(fetchCalls).toBe(0);
+    // Findings settled as on the inline-posted path; review finalized posted.
+    expect(findingUpdates).toEqual([
+      { id: confirmed.id, state: "posted" },
+      { id: refuted.id, state: "suppressed_refuted" },
+    ]);
+    expect(finalizations.at(-1)).toMatchObject({ status: "posted" });
+    expect(events).toContain("posted");
+    // The payload is what github.post_pr_review posts: reviewed head, the
+    // inline comment with its suggestion, and the crash-safe marker.
+    expect(payload).toMatchObject({
+      review_id: reviewed.id,
+      repo: reviewed.repo,
+      pr_number: reviewed.prNumber,
+      commit_id: reviewed.headSha,
+      to_post_count: 1,
+      ui_only_count: 0,
+      comments: [{ finding_id: confirmed.id, path: confirmed.path, start_line: 42, line: 45, side: "RIGHT" }],
+    });
+    expect(payload.comments[0]!.body).toContain("```suggestion\nreturn afterVerification;\n```");
+    expect(payload.summary_md.endsWith(`<!-- engrams-review:${reviewed.id} -->`)).toBe(true);
+  });
+
+  // ADR 0119 phase 4.2: the engine's session binding in place of review_session.
+  test("an injected session binding records the worker for the run and skips review_session", async () => {
+    const order: string[] = [];
+    const reviewSessions = reviewSessionRecorder(order);
+    const bound: Array<{ sessionId: string; role: string; legacyWorkflowId: string }> = [];
+    const stamped: Array<[string, string, string]> = [];
+    const cp = makeReviewControlPlane({
+      reviews: {
+        ...reviewStoreStub,
+        async setReviewSessionId(reviewId, role, sessionId) {
+          stamped.push([reviewId, role, sessionId]);
+        },
+      },
+      profiles: profileLookup(reviewerProfile("profile-designated")),
+      enrollments: { get: async () => enrollment(active.repo, null) },
+      createSessionForExistingTask: async () => {
+        order.push("create");
+        return { sessionId: "finder-session" };
+      },
+      reviewSessions,
+      sessionBinding: {
+        async record(sessionId, role, legacyWorkflowId) {
+          order.push(`binding:${sessionId}`);
+          bound.push({ sessionId, role, legacyWorkflowId });
+        },
+        async remove() {},
+      },
+      registerSessionListener: async (sessionId) => {
+        order.push(`listener:${sessionId}`);
+      },
+    });
+
+    await cp.createFinderSession({
+      reviewId: active.id,
+      taskId: active.taskId,
+      repo: active.repo,
+      prNumber: active.prNumber,
+      workflowId: "autorun:auto-1:github:d1",
+    });
+
+    // The injected binding got the record; the legacy store saw nothing.
+    expect(bound).toEqual([
+      { sessionId: "finder-session", role: "finder", legacyWorkflowId: "autorun:auto-1:github:d1" },
+    ]);
+    expect(reviewSessions.calls).toEqual([]);
+    // The review row still gets the live-watch session stamp (first-party UI).
+    expect(stamped).toEqual([[active.id, "finder", "finder-session"]]);
+    // Binding lands BEFORE listener publication, same as the legacy path.
+    expect(order).toEqual(["create", "binding:finder-session", "listener:finder-session"]);
   });
 });
