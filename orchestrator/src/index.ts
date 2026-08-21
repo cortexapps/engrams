@@ -19,6 +19,7 @@ import integrationOauthRoute from "./routes/integration-oauth.ts";
 import slackEventsRoute from "./routes/slack-events.ts";
 import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 import githubEventsRoute from "./routes/github-events.ts";
+import linearEventsRoute from "./routes/linear-events.ts";
 import hooksRoute from "./routes/hooks.ts";
 import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
 import { makeGoogleOidcRoute } from "./routes/google-oidc.ts";
@@ -77,7 +78,10 @@ import { makeSlackPolicy } from "./integrations/slack-policy.ts";
 import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
 import { makeReviewControlPlane } from "./workflows/review-control-plane.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
-import { makeProductionAutomationScheduler } from "./automations/scheduler.ts";
+import {
+  makeProductionAutomationScheduler,
+  makeProductionIntegrationEventSweeper,
+} from "./automations/scheduler.ts";
 import { assertSweepPoliciesExhaustive } from "./sweep/policy.ts";
 import { makeSweepRuntime } from "./sweep/production.ts";
 import { getDb, getPool } from "./db/client.ts";
@@ -454,6 +458,8 @@ app.route("/", slackInteractivityRoute);
 // ADR 0100: GitHub's signed webhook and the bearer-authenticated CI trigger
 // converge on the same durable per-PR workflow.
 app.route("/", githubEventsRoute);
+// Linear webhook ingress (ADR 0119 D5) — new with the integration-event ledger.
+app.route("/", linearEventsRoute);
 // ADR 0102: dynamically registered webhooks verify their own registration
 // secret and dispatch one-shot AutomationRunWorkflow occurrences.
 app.route("/", hooksRoute);
@@ -662,6 +668,8 @@ const listenerManager = makeProductionListenerManager();
 await listenerManager.start();
 const automationScheduler = makeProductionAutomationScheduler();
 await automationScheduler.start();
+const integrationEventSweeper = makeProductionIntegrationEventSweeper();
+await integrationEventSweeper.start();
 const modelRouterRefresher = new ModelRouterCatalogRefresher({
   store: makeModelRouterStore(getDb()),
 });
@@ -686,6 +694,7 @@ process.on("SIGTERM", () => {
     oidcKeyRotation.stop();
     modelRouterRefresher.stop();
     await automationScheduler.stop();
+    await integrationEventSweeper.stop();
     await listenerManager.stop();
     await specPublishScanner.stop();
     await draftingSeedScanner.stop();

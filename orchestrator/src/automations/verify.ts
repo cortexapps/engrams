@@ -88,6 +88,16 @@ function sha256Signature(secret: string, body: Uint8Array): string {
   return createHmac("sha256", secret).update(body).digest("hex");
 }
 
+/** Bare hex-encoded HMAC-SHA256 of the raw body (no scheme prefix) — the
+ * Linear-Signature format (ADR 0119 D5). Timing-safe with a length pre-check. */
+export function verifyHexHmacSha256(
+  secret: string,
+  rawBody: Uint8Array,
+  actual: string | null,
+): boolean {
+  return timingSafeHeader(sha256Signature(secret, rawBody), actual);
+}
+
 export function verifyWebhook(input: VerifyWebhookInput): boolean {
   switch (input.verification.scheme) {
     case "github_hmac_sha256":

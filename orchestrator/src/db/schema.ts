@@ -1588,6 +1588,33 @@ export const integrationConnection = pgTable(
   ],
 );
 
+/** Inbound provider deliveries, verified and redacted (ADR 0119 D5).
+ * One row per delivery; the unique index makes provider retries no-ops.
+ * Retention: 20 newest per (connection, event key) at write time plus a
+ * 7-day sweep — the ledger feeds trigger dispatch and editor samples, it is
+ * not an archive. */
+export const integrationEvent = pgTable(
+  "integration_event",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    provider: text("provider").notNull(),
+    connectionId: text("connection_id")
+      .notNull()
+      .references(() => integrationConnection.id, { onDelete: "cascade" }),
+    eventKey: text("event_key").notNull(),
+    deliveryId: text("delivery_id").notNull(),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
+    scopeValue: text("scope_value"),
+    receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("integration_event_delivery_unique").on(t.provider, t.connectionId, t.deliveryId),
+    index("integration_event_conn_key_idx").on(t.connectionId, t.eventKey, t.receivedAt),
+  ],
+);
+
+export type IntegrationEventRow = typeof integrationEvent.$inferSelect;
+
 /** KEK-sealed private keys for the deployment OIDC issuer (ADR 0109). */
 export const integrationOidcKey = pgTable(
   "integration_oidc_key",
