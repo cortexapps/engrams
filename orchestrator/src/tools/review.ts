@@ -10,6 +10,13 @@ import {
   type ReviewRow,
   type ReviewStore,
 } from "../db/reviews.ts";
+import { makeAutomationEngineStore } from "../db/automations.ts";
+import {
+  AUTOMATION_TOPIC,
+  assertIdempotencyKey,
+  inboxKeys,
+  type AutomationInbox,
+} from "../automations/engine/inbox.ts";
 import { log as rootLog } from "../log.ts";
 import {
   REVIEW_TOPIC,
@@ -72,7 +79,21 @@ export interface ReviewToolDeps {
     topic: string,
     idempotencyKey: string,
   ) => Promise<void>;
+  /** ADR 0119: a worker session owned by a built-in automation run is bound in
+   *  automation_session; its phase signals go to the run's mailbox instead. */
+  findAutomationBinding?: (sessionId: string) => Promise<{ runId: string } | null>;
+  notifyAutomation?: (
+    runId: string,
+    message: AutomationInbox,
+    idempotencyKey: string,
+  ) => Promise<void>;
 }
+
+/** The signal names the review built-in's send_prompt waits park on. */
+export const REVIEW_PHASE_SIGNALS = {
+  finder: "finder_done",
+  verifier: "verifier_done",
+} as const;
 
 async function activeReview(
   ctx: ToolContext,
@@ -111,11 +132,38 @@ export function registerReviewTools(
       idempotencyKey,
     );
   });
+  let engineStore: ReturnType<typeof makeAutomationEngineStore> | undefined;
+  const findAutomationBinding = deps?.findAutomationBinding ?? (async (sessionId: string) => {
+    engineStore ??= makeAutomationEngineStore();
+    const binding = await engineStore.findSessionBinding(sessionId);
+    return binding === null ? null : { runId: binding.runId };
+  });
+  const notifyAutomation = deps?.notifyAutomation ?? (async (
+    runId: string,
+    message: AutomationInbox,
+    idempotencyKey: string,
+  ) => {
+    assertIdempotencyKey(idempotencyKey);
+    await DBOS.send<AutomationInbox>(runId, message, AUTOMATION_TOPIC, idempotencyKey);
+  });
   const notifyPhaseDone = async (
     ctx: ToolContext,
     role: "finder" | "verifier",
   ): Promise<void> => {
     try {
+      // ADR 0119: a session the built-in review automation owns signals its
+      // run directly; the engine's send_prompt wait parks on this name.
+      const automation = await findAutomationBinding(ctx.sessionId);
+      if (automation !== null) {
+        const name = REVIEW_PHASE_SIGNALS[role];
+        await notifyAutomation(
+          automation.runId,
+          { kind: "signal", name, sessionId: ctx.sessionId },
+          inboxKeys.signal(ctx.sessionId, name, ctx.toolCallId),
+        );
+        return;
+      }
+      // legacy path — deleted in phase 4.7
       const binding = await reviewSessions().find(ctx.sessionId);
       if (!binding || binding.role !== role) return;
       await notify(

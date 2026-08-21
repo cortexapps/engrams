@@ -14,14 +14,14 @@ import type { ReviewSessionStore } from "../../db/review-sessions.ts";
 import type {
   GithubReviewPoster,
   PostReviewInput,
-} from "../../reviews/github-review.ts";
-import type { PrContext } from "../../reviews/pr-context.ts";
+} from "../github-review.ts";
+import type { PrContext } from "../pr-context.ts";
 import type { CreateSessionForExistingTaskParams } from "../../rpc/task-create.ts";
 import {
   makeReviewControlPlane,
   ReviewSetupError,
   type ReviewSessionsClient,
-} from "../review-control-plane.ts";
+} from "../control-plane.ts";
 
 /** A PR whose descriptive context is unavailable — what every review recorded
  *  before ADR 0100 decision 9 looks like, and what a junk payload degrades to. */

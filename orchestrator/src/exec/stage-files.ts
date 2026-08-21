@@ -6,7 +6,7 @@
  * per file, never thrown: callers decide whether a failed path is fatal.
  *
  * Shared by the review control plane and the automation engine's
- * write_files block; extracted from workflows/review-control-plane.ts.
+ * write_files block; extracted from the review control plane (reviews/control-plane.ts).
  */
 
 import { createHash } from "node:crypto";

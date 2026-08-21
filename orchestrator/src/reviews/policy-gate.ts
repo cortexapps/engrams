@@ -151,3 +151,23 @@ export function runPolicyGate(
     overflow: overflowDecisions.length,
   };
 }
+
+/**
+ * The v1 policy gate plus the anchor split: a confirmed finding with no inline
+ * anchor is demoted to ui_only. Shared by the live post and the crash-recovery
+ * marker path so both settle findings into the same terminal states.
+ */
+export function buildDecision(detail: ReviewDetail): PolicyDecision {
+  const policy = runPolicyGate(detail);
+  const missingAnchors: FindingDecision[] = [];
+  const anchored = policy.toPost.filter((item) => {
+    const hasAnchor = item.finding.endLine != null || item.finding.startLine != null;
+    if (!hasAnchor) missingAnchors.push({ ...item, state: "ui_only" });
+    return hasAnchor;
+  });
+  return {
+    ...policy,
+    toPost: anchored,
+    uiOnly: [...policy.uiOnly, ...missingAnchors],
+  };
+}

@@ -159,4 +159,26 @@ describe("Review consumer", () => {
 
     expect(sent.calls).toEqual([]);
   });
+
+  test("does not apply to a session the built-in automation owns (no double send)", async () => {
+    // ADR 0119 phase 4: a review worker created by the built-in automation is
+    // bound in automation_session, never review_session, so this consumer
+    // stays silent and only the automation consumer feeds the run's mailbox.
+    // The contract is "review_session-only": an absent legacy binding is the
+    // whole test.
+    const sent = sender();
+    const consumer = makeReviewConsumer({
+      findReviewSession: async () => null,
+      send: sent.send,
+    });
+    expect(await consumer.appliesTo("automation-owned-session")).toBe(false);
+    await consumer.handle(
+      { idx: 1n, kind: "run_completed", payloadJson: `{"ok":true}` },
+      { sessionId: "automation-owned-session" },
+    ).catch(() => undefined);
+    await consumer.onTerminal?.("completed", { sessionId: "automation-owned-session" }).catch(
+      () => undefined,
+    );
+    expect(sent.calls).toEqual([]);
+  });
 });
