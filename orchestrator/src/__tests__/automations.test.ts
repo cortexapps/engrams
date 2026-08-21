@@ -17,6 +17,7 @@ import {
   WebhookRegistrationService,
 } from "../gen/engram/app/v1/automation_pb.ts";
 import { invalidateRegistry } from "../connectors/registry.ts";
+import { definitionFromLegacyAction } from "../automations/legacy-compat.ts";
 import {
   registerAutomations,
   type AutomationDeps,
@@ -93,6 +94,11 @@ function fakeStore(seed?: {
   ): AutomationRow => ({
     id,
     ...input,
+    kind: "user",
+    builtinKey: null,
+    currentVersion: 1,
+    inputs: {},
+    endSessionsOnFinish: false,
     createdByUserId,
     lastFiredAt: null,
     createdAt: NOW,
@@ -130,7 +136,26 @@ function fakeStore(seed?: {
             row.trigger.kind === "webhook" &&
             row.trigger.registrationId === registrationId,
         )
-        .sort((a, b) => a.id.localeCompare(b.id));
+        .sort((a, b) => a.id.localeCompare(b.id))
+        .map((row) => ({
+          automation: row,
+          definition: definitionFromLegacyAction(row.trigger, row.action),
+        }));
+    },
+    async getVersion(automationId, version) {
+      const row = automations.get(automationId);
+      if (!row || version !== row.currentVersion) return null;
+      const definition = definitionFromLegacyAction(row.trigger, row.action);
+      return {
+        automationId,
+        version,
+        trigger: definition.trigger,
+        blocks: definition.blocks,
+        inputsSchema: definition.inputsSchema,
+        settings: definition.settings,
+        createdByUserId: row.createdByUserId,
+        createdAt: row.createdAt,
+      };
     },
     async create(input, createdByUserId) {
       const row = rowFor(`automation-${++automationSequence}`, input, createdByUserId);

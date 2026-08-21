@@ -57,6 +57,7 @@ import {
   validateAutomationTemplate,
 } from "../automations/template.ts";
 import { SYSTEM_GITHUB_REGISTRATION_ID } from "../automations/webhook.ts";
+import { legacyRunStatus } from "../automations/legacy-compat.ts";
 import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
 import { getModelRouterDefinition, selectRouterProtocol } from "../model-routers/registry.ts";
 
@@ -258,6 +259,14 @@ function protoTrigger(trigger: AutomationTrigger): ProtoAutomationTrigger {
       },
     });
   }
+  if (trigger.kind !== "webhook") {
+    // integration/manual triggers arrive with the phase-3 proto; the legacy
+    // list/get surface only ever reconstructs cron/webhook rows.
+    throw new ConnectError(
+      `trigger kind "${trigger.kind}" has no legacy proto shape`,
+      Code.Internal,
+    );
+  }
   return create(AutomationTriggerSchema, {
     trigger: {
       case: "webhook",
@@ -315,7 +324,9 @@ function toProtoRun(row: AutomationRunRow): ProtoAutomationRun {
     ...(row.renderedTitle !== null ? { renderedTitle: row.renderedTitle } : {}),
     ...(row.taskId !== null ? { taskId: row.taskId } : {}),
     ...(row.sessionId !== null ? { sessionId: row.sessionId } : {}),
-    status: row.status,
+    // Engine statuses mapped onto the strings the current page renders;
+    // remove in phase 3 with the proto break.
+    status: legacyRunStatus(row.status),
     ...(row.error !== null ? { error: row.error } : {}),
     ...(row.scheduledFor ? { scheduledFor: row.scheduledFor.toISOString() } : {}),
     createdAt: row.createdAt.toISOString(),
@@ -490,7 +501,8 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     if (trigger.kind === "cron") {
       nextFireAt = nextCronFire(trigger.schedule, trigger.timezone, now());
     } else if (
-      trigger.registrationId !== SYSTEM_GITHUB_REGISTRATION_ID
+      trigger.kind === "webhook"
+      && trigger.registrationId !== SYSTEM_GITHUB_REGISTRATION_ID
       && !(await store.getRegistration(trigger.registrationId))
     ) {
       throw new ConnectError("webhook registration not found", Code.InvalidArgument);

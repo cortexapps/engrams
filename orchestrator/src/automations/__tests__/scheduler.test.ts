@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import type {
   AutomationCronStore,
+  AutomationMetaRow,
   AutomationRunRow,
   DueCronAutomation,
 } from "../../db/automations.ts";
@@ -14,19 +15,17 @@ import {
 
 const NOW = new Date("2026-07-22T12:00:00Z");
 
-function dueAutomation(scheduledFor = NOW): DueCronAutomation {
+function meta(scheduledFor = NOW): AutomationMetaRow {
   return {
     id: "automation-1",
     name: "Every minute",
     description: "",
     enabled: true,
-    trigger: { kind: "cron", schedule: "* * * * *", timezone: "UTC" },
-    action: {
-      kind: "create_task",
-      profileId: "profile-1",
-      promptTemplate: "Run",
-      includeEventContext: false,
-    },
+    kind: "user",
+    builtinKey: null,
+    currentVersion: 3,
+    inputs: {},
+    endSessionsOnFinish: false,
     createdByUserId: "admin-1",
     nextFireAt: scheduledFor,
     lastFiredAt: null,
@@ -36,14 +35,25 @@ function dueAutomation(scheduledFor = NOW): DueCronAutomation {
   };
 }
 
+function dueAutomation(scheduledFor = NOW): DueCronAutomation {
+  return {
+    automation: meta(scheduledFor),
+    trigger: { kind: "cron", schedule: "* * * * *", timezone: "UTC" },
+    nextFireAt: scheduledFor,
+  };
+}
+
 function pendingRun(
   scheduledFor: Date,
   overrides: Partial<AutomationRunRow> = {},
 ): AutomationRunRow {
   return {
-    id: "run-1",
+    id: automationCronWorkflowId("automation-1", scheduledFor),
     automationId: "automation-1",
-    trigger: { source: "cron" },
+    version: 3,
+    trigger: { source: "cron", receivedAt: scheduledFor.toISOString() },
+    deliveryKey: `cron:${Math.floor(scheduledFor.getTime() / 1_000)}`,
+    concurrencyKey: null,
     renderedPrompt: null,
     renderedTitle: null,
     taskId: null,
@@ -53,6 +63,8 @@ function pendingRun(
     scheduledFor,
     leaseOwner: "dead-pod",
     leaseExpiresAt: new Date(NOW.getTime() - 1),
+    startedAt: null,
+    endedAt: null,
     createdAt: scheduledFor,
     ...overrides,
   };
@@ -64,17 +76,18 @@ function fixture(input?: {
 }) {
   let automation = dueAutomation(input?.scheduledFor);
   let run = input?.existingRun;
-  let sequence = 0;
   const advances: Array<{ fired: boolean; scheduledFor: Date }> = [];
+  const claimVersions: number[] = [];
 
   const store: AutomationCronStore = {
     async listDueCron(now) {
-      return automation.enabled && automation.nextFireAt <= now ? [automation] : [];
+      return automation.automation.enabled && automation.nextFireAt <= now ? [automation] : [];
     },
     async claimCronOccurrence(claim) {
+      claimVersions.push(claim.version);
       if (!run) {
         run = pendingRun(claim.scheduledFor, {
-          id: `run-${++sequence}`,
+          id: claim.runId,
           leaseOwner: claim.leaseOwner,
           leaseExpiresAt: claim.leaseExpiresAt,
         });
@@ -93,7 +106,7 @@ function fixture(input?: {
       if (run?.id === runId && run.status === "pending") {
         run = {
           ...run,
-          status: "skipped",
+          status: "filtered",
           error: reason,
           leaseOwner: null,
           leaseExpiresAt: null,
@@ -105,8 +118,12 @@ function fixture(input?: {
       advances.push({ fired: advance.fired, scheduledFor: advance.scheduledFor });
       automation = {
         ...automation,
+        automation: {
+          ...automation.automation,
+          nextFireAt: advance.nextFireAt,
+          ...(advance.fired ? { lastFiredAt: advance.scheduledFor } : {}),
+        },
         nextFireAt: advance.nextFireAt,
-        ...(advance.fired ? { lastFiredAt: advance.scheduledFor } : {}),
       };
       return true;
     },
@@ -115,18 +132,21 @@ function fixture(input?: {
   return {
     store,
     advances,
+    claimVersions,
     get run() {
       return run;
     },
   };
 }
 
-function recordingStarter(): AutomationWorkflowStarter & { starts: string[] } {
-  const starts: string[] = [];
+function recordingStarter(): AutomationWorkflowStarter & {
+  starts: Array<{ workflowId: string; runId: string; automationId: string }>;
+} {
+  const starts: Array<{ workflowId: string; runId: string; automationId: string }> = [];
   return {
     starts,
-    async start(_input, workflowId) {
-      starts.push(workflowId);
+    async start(input, workflowId) {
+      starts.push({ workflowId, runId: input.runId, automationId: input.automationId });
     },
   };
 }
@@ -146,9 +166,17 @@ describe("automation cron scheduler", () => {
       runSchedulerTick({ ...deps, owner: "pod-b" }),
     ]);
 
-    expect(f.run?.id).toBe("run-1");
-    expect(starter.starts).toEqual(["auto:automation-1:1784721600"]);
+    expect(f.run?.id).toBe("autorun:automation-1:cron:1784721600");
+    expect(starter.starts).toEqual([
+      {
+        workflowId: "autorun:automation-1:cron:1784721600",
+        runId: "autorun:automation-1:cron:1784721600",
+        automationId: "automation-1",
+      },
+    ]);
     expect(f.advances).toHaveLength(1);
+    // The claim pins the automation's current version onto the run.
+    expect(f.claimVersions).toEqual([3, 3]);
   });
 
   test("an expired claim is reacquired and restarts the same workflow id", async () => {
@@ -166,9 +194,11 @@ describe("automation cron scheduler", () => {
 
     expect(f.run?.id).toBe(existingRun.id);
     expect(f.run?.leaseOwner).toBe("replacement-pod");
-    expect(starter.starts).toEqual([
+    expect(starter.starts.map((s) => s.workflowId)).toEqual([
       automationCronWorkflowId(existingRun.automationId, existingRun.scheduledFor!),
     ]);
+    // The run id IS the workflow id (ADR 0119 D3).
+    expect(starter.starts[0]!.runId).toBe(starter.starts[0]!.workflowId);
   });
 
   test("an occurrence beyond grace is skipped without starting a workflow", async () => {
@@ -185,12 +215,33 @@ describe("automation cron scheduler", () => {
 
     expect(result.skipped).toBe(1);
     expect(starter.starts).toEqual([]);
-    expect(f.run?.status).toBe("skipped");
+    expect(f.run?.status).toBe("filtered");
+    expect(f.advances).toEqual([{ fired: false, scheduledFor }]);
+  });
+
+  test("a terminal filtered occurrence advances without restarting", async () => {
+    const scheduledFor = NOW;
+    const existingRun = pendingRun(scheduledFor, {
+      status: "filtered",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    });
+    const f = fixture({ scheduledFor, existingRun });
+    const starter = recordingStarter();
+
+    await runSchedulerTick({
+      owner: "pod-a",
+      store: f.store,
+      workflowStarter: starter,
+      now: () => NOW,
+    });
+
+    expect(starter.starts).toEqual([]);
     expect(f.advances).toEqual([{ fired: false, scheduledFor }]);
   });
 
   test("workflow id format is pinned to automation and fire epoch seconds", () => {
     expect(automationCronWorkflowId("abc-123", new Date("2026-07-22T12:34:56.999Z")))
-      .toBe("auto:abc-123:1784723696");
+      .toBe("autorun:abc-123:cron:1784723696");
   });
 });

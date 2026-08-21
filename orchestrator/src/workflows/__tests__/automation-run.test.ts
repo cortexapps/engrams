@@ -1,372 +1,194 @@
 import { describe, expect, test } from "bun:test";
 
 import type {
-  AutomationRow,
-  AutomationRunRow,
-  AutomationWorkflowStore,
+  AutomationEngineStore,
 } from "../../db/automations.ts";
+import type { RunSnapshot } from "../../automations/engine/context.ts";
+import type { EngineDeps } from "../../automations/engine/deps.ts";
 import type { CreateSessionForExistingTaskParams } from "../../rpc/task-create.ts";
 import {
   automationRunWorkflowImpl,
-  makeAutomationTaskCreator,
-  type AutomationRunWorkflowInput,
-  type AutomationStepRunner,
-  type PreparedAutomationRun,
+  makeProductionSessionOps,
 } from "../automation-run.ts";
 
-const NOW = new Date("2026-07-22T12:00:00Z");
-const input: AutomationRunWorkflowInput = {
-  automationId: "automation-1",
-  runId: "run-1",
-  trigger: { source: "cron" },
-  scheduledFor: NOW.toISOString(),
-  receivedAt: NOW.toISOString(),
-};
+const RUN_ID = "autorun:auto-1:manual:x";
 
-function automation(
-  promptTemplate: string,
-  override: { harness?: string; model?: string; effort?: string } = {},
-): AutomationRow {
-  return {
-    id: input.automationId,
-    name: "Daily triage",
-    description: "",
-    enabled: true,
-    trigger: { kind: "cron", schedule: "0 12 * * *", timezone: "UTC" },
-    action: {
-      kind: "create_task",
-      profileId: "profile-1",
-      promptTemplate,
-      includeEventContext: true,
-      ...override,
+function fakeEngineStore(overrides: Partial<AutomationEngineStore> = {}): AutomationEngineStore {
+  const snapshot: RunSnapshot = {
+    definition: {
+      engine: 1,
+      trigger: { kind: "manual" },
+      blocks: [],
+      inputsSchema: [],
+      settings: { endSessionsOnFinish: false },
     },
-    createdByUserId: "admin-1",
-    nextFireAt: NOW,
-    lastFiredAt: null,
-    createdAt: NOW,
-    updatedAt: NOW,
-    archivedAt: null,
+    inputs: {},
+    automationId: "auto-1",
+    automationName: "Test",
+    version: 1,
+    trigger: { kind: "manual", receivedAt: "2026-08-21T00:00:00Z" },
+    aliases: [],
+    startedAtMs: 1_000,
   };
-}
-
-function run(status = "pending"): AutomationRunRow {
   return {
-    id: input.runId,
-    automationId: input.automationId,
-    trigger: input.trigger,
-    renderedPrompt: null,
-    renderedTitle: null,
-    taskId: null,
-    sessionId: null,
-    status,
-    error: null,
-    scheduledFor: NOW,
-    leaseOwner: "pod-a",
-    leaseExpiresAt: new Date(NOW.getTime() + 120_000),
-    createdAt: NOW,
-  };
-}
-
-function fixture(
-  promptTemplate = "Run at ${{ trigger.scheduled_for }}",
-  status = "pending",
-  override: { harness?: string; model?: string; effort?: string } = {},
-) {
-  let runRow = run(status);
-  const automationRow = automation(promptTemplate, override);
-  const store: AutomationWorkflowStore = {
-    async ensureRun() {
-      return runRow;
+    async loadSnapshot() {
+      return snapshot;
+    },
+    async markRunning() {},
+    async recordStep() {},
+    async finalizeRun() {},
+    async listRunSessions() {
+      return [];
+    },
+    async releaseConcurrency() {
+      return null;
     },
     async getRun() {
-      return runRow;
-    },
-    async getAutomation() {
-      return automationRow;
-    },
-    async recordRendered(_runId, prompt, title) {
-      runRow = { ...runRow, renderedPrompt: prompt, renderedTitle: title };
+      return null;
     },
     async ensureAutomationTask() {
-      runRow = { ...runRow, taskId: "task-1" };
-      return "task-1";
+      return "automation:run";
     },
     async getAutomationTaskSession() {
       return null;
     },
-    async markRunRenderFailed(_runId, error) {
-      runRow = { ...runRow, status: "render_failed", error };
+    async recordSessionBinding() {},
+    async recordRunLaunch() {},
+    async findSessionBinding() {
+      return null;
     },
-    async markRunLaunchFailed(_runId, error) {
-      runRow = { ...runRow, status: "launch_failed", error };
-    },
-    async markRunLaunched(_runId, taskId, sessionId) {
-      runRow = { ...runRow, status: "launched", taskId, sessionId };
-    },
-  };
-  return {
-    store,
-    get run() {
-      return runRow;
-    },
+    ...overrides,
   };
 }
 
-function immediateSteps(): { step: AutomationStepRunner; names: string[] } {
-  const names: string[] = [];
-  return {
-    names,
-    step: async (fn, name) => {
-      names.push(name);
-      return fn();
-    },
-  };
-}
-
-describe("AutomationRunWorkflow", () => {
-  test("a template error stamps render_failed and creates no task or session", async () => {
-    const f = fixture("${{ event.issue.title }}");
-    const steps = immediateSteps();
-    let launches = 0;
-
-    await automationRunWorkflowImpl(input, {
-      store: f.store,
-      step: steps.step,
-      taskCreator: {
-        async create() {
-          launches++;
-          return { taskId: "unexpected", sessionId: "unexpected" };
-        },
+describe("automationRunWorkflowImpl", () => {
+  test("the registered body is a thin snapshot + interpret call", async () => {
+    const names: string[] = [];
+    const finalized: string[] = [];
+    const store = fakeEngineStore({
+      async finalizeRun(_runId, status) {
+        finalized.push(status);
       },
     });
-
-    expect(f.run.status).toBe("render_failed");
-    expect(f.run.error).toContain("undefined variable");
-    expect(f.run.taskId).toBeNull();
-    expect(f.run.sessionId).toBeNull();
-    expect(launches).toBe(0);
-    expect(steps.names).toEqual([
-      "ensureAutomationRun",
-      "renderAutomationAction",
-      "markAutomationRenderFailed",
-    ]);
-  });
-
-  test("a terminal occurrence is a no-op even if invoked again", async () => {
-    const f = fixture("Run", "launched");
-    const steps = immediateSteps();
-    let launches = 0;
-
-    await automationRunWorkflowImpl(input, {
-      store: f.store,
-      step: steps.step,
-      taskCreator: {
-        async create() {
-          launches++;
-          return { taskId: "unexpected", sessionId: "unexpected" };
-        },
+    const engine: EngineDeps = {
+      step: async (fn, name) => {
+        names.push(name);
+        return fn();
       },
-    });
-
-    expect(launches).toBe(0);
-    expect(steps.names).toEqual(["ensureAutomationRun"]);
-    expect(f.run.status).toBe("launched");
-  });
-
-  test("a successful launch records rendered values and task/session ids", async () => {
-    const f = fixture("Run at ${{ trigger.scheduled_for }}");
-    const steps = immediateSteps();
-
-    await automationRunWorkflowImpl(input, {
-      store: f.store,
-      step: steps.step,
-      taskCreator: {
-        async create(_workflowInput, prepared) {
-          expect(prepared).toEqual({
-            profileId: "profile-1",
-            prompt: `Run at ${NOW.toISOString()}`,
-            title: null,
-          });
-          return { taskId: "task-1", sessionId: "session-1" };
-        },
-      },
-    });
-
-    expect(f.run).toMatchObject({
-      status: "launched",
-      renderedPrompt: `Run at ${NOW.toISOString()}`,
-      taskId: "task-1",
-      sessionId: "session-1",
-    });
-  });
-
-  test("the stored harness/model/effort override reaches the launch step", async () => {
-    const f = fixture("Run", "pending", { harness: "codex", model: "gpt", effort: "high" });
-    let prepared: PreparedAutomationRun | undefined;
-
-    await automationRunWorkflowImpl(input, {
-      store: f.store,
-      step: immediateSteps().step,
-      taskCreator: {
-        async create(_input, value) {
-          prepared = value;
-          return { taskId: "task-1", sessionId: "session-1" };
-        },
-      },
-    });
-
-    expect(prepared).toEqual({
-      profileId: "profile-1",
-      prompt: "Run",
-      title: null,
-      harness: "codex",
-      model: "gpt",
-      effort: "high",
-    });
-  });
-
-  test("an automation with no override prepares no harness selection", async () => {
-    const f = fixture("Run");
-    let prepared: PreparedAutomationRun | undefined;
-
-    await automationRunWorkflowImpl(input, {
-      store: f.store,
-      step: immediateSteps().step,
-      taskCreator: {
-        async create(_input, value) {
-          prepared = value;
-          return { taskId: "task-1", sessionId: "session-1" };
-        },
-      },
-    });
-
-    expect(prepared).not.toHaveProperty("harness");
-    expect(prepared).not.toHaveProperty("model");
-    expect(prepared).not.toHaveProperty("effort");
-  });
-
-  test("a webhook run renders declarative connector aliases from its redacted payload", async () => {
-    const webhookInput: AutomationRunWorkflowInput = {
-      automationId: "automation-1",
-      runId: "webhook-run",
-      trigger: {
-        source: "webhook",
-        eventKey: "issues.opened",
-        deliveryId: "delivery-1",
-        payload: { issue: { title: "Broken build" } },
-      },
-      receivedAt: NOW.toISOString(),
-    };
-    const f = fixture("Triage ${{ event.issue.title }}");
-    const webhookAutomation = automation("Triage ${{ event.issue.title }}");
-    webhookAutomation.trigger = {
-      kind: "webhook",
-      registrationId: "github-app",
-      events: ["issues.opened"],
-    };
-    const store: AutomationWorkflowStore = {
-      ...f.store,
-      async getAutomation() {
-        return webhookAutomation;
-      },
-    };
-    let preparedPrompt = "";
-
-    await automationRunWorkflowImpl(webhookInput, {
+      recv: async () => null,
       store,
-      step: immediateSteps().step,
-      aliases: async (registrationId) => {
-        expect(registrationId).toBe("github-app");
-        return [{ path: "issue.title", alias: "issue.title" }];
+      sessions: {
+        createSession: async () => ({ sessionId: "s", taskId: "t" }),
+        sendPrompt: async () => {},
+        endSession: async () => {},
+        exec: async () => ({ exitStatus: 0, stdout: "", stderr: "" }),
+        writeFiles: async () => [],
       },
-      taskCreator: {
-        async create(_input, prepared) {
-          preparedPrompt = prepared.prompt;
-          return { taskId: "task-1", sessionId: "session-1" };
-        },
-      },
-    });
+      clock: { nowMs: () => 1_000 },
+    };
 
-    expect(preparedPrompt).toContain("Triage Broken build");
+    const result = await automationRunWorkflowImpl(
+      { runId: RUN_ID, automationId: "auto-1" },
+      { engine },
+    );
+
+    expect(result.status).toBe("completed");
+    expect(names).toEqual(["step:__snapshot__:0", "step:__finalize__:0"]);
+    expect(finalized).toEqual(["completed"]);
   });
 });
 
-describe("automation task creator", () => {
-  test("uses a null owner and keeps the selected profile policy intact", async () => {
-    const f = fixture("Run");
-    let taskInput: Parameters<AutomationWorkflowStore["ensureAutomationTask"]>[0] | undefined;
-    let sessionInput: CreateSessionForExistingTaskParams | undefined;
-    const store: AutomationWorkflowStore = {
-      ...f.store,
-      async ensureAutomationTask(value) {
-        taskInput = value;
-        return "task-1";
+describe("makeProductionSessionOps.createSession", () => {
+  function harness() {
+    const calls: string[] = [];
+    const createdParams: CreateSessionForExistingTaskParams[] = [];
+    const bindings: Array<Record<string, unknown>> = [];
+    const launches: Array<Record<string, unknown>> = [];
+    let existingPrimary: string | null = null;
+    const store = fakeEngineStore({
+      async ensureAutomationTask(input) {
+        calls.push("task");
+        return `automation:${input.runId}`;
+      },
+      async getAutomationTaskSession() {
+        calls.push("existing");
+        return existingPrimary;
+      },
+      async recordSessionBinding(input) {
+        calls.push("binding");
+        bindings.push({ ...input });
+      },
+      async recordRunLaunch(input) {
+        calls.push("launch");
+        launches.push({ ...input });
+      },
+    });
+    const ops = makeProductionSessionOps({
+      store,
+      createSessionForExistingTask: async (params) => {
+        calls.push("create");
+        createdParams.push(params);
+        return { sessionId: "s-new" };
+      },
+      registerListener: async () => {
+        calls.push("listener");
+      },
+    });
+    return {
+      ops,
+      calls,
+      createdParams,
+      bindings,
+      launches,
+      setExistingPrimary(id: string) {
+        existingPrimary = id;
       },
     };
-    const creator = makeAutomationTaskCreator({
-      store,
-      async createSessionForExistingTask(value) {
-        sessionInput = value;
-        return { sessionId: "session-1" };
-      },
-    });
+  }
 
-    const created = await creator.create(input, {
-      profileId: "profile-1",
-      prompt: "Do the work",
-      title: null,
-    });
+  const input = {
+    runId: RUN_ID,
+    blockId: "launch",
+    automationId: "auto-1",
+    profileId: "p1",
+    prompt: "go",
+    title: null,
+    role: "primary",
+    keep: true,
+  };
 
-    expect(created).toEqual({ taskId: "task-1", sessionId: "session-1" });
-    expect(taskInput).toEqual({
-      runId: "run-1",
-      automationId: "automation-1",
-      title: "Do the work",
-      source: {
-        provider: "automation",
-        automationId: "automation-1",
-        runId: "run-1",
-        trigger: { kind: "cron", scheduledFor: NOW.toISOString() },
-      },
-    });
-    expect(sessionInput).toEqual({
-      taskId: "task-1",
-      taskType: "automation",
-      profileId: "profile-1",
-      integrationPrincipalId: "automation:automation-1",
-      role: "primary",
-      prompt: "Do the work",
-      registerListener: true,
-    });
-    expect(sessionInput).not.toHaveProperty("ownerUserId");
-    expect(sessionInput).not.toHaveProperty("dropProfileSecretsAndEnv");
-    expect(sessionInput).not.toHaveProperty("capabilityOverride");
-    expect(sessionInput).not.toHaveProperty("networkOverride");
-    expect(sessionInput).not.toHaveProperty("harness");
-    expect(sessionInput).not.toHaveProperty("model");
-    expect(sessionInput).not.toHaveProperty("effort");
+  test("binding lands BEFORE listener registration; launch denormalizes", async () => {
+    const h = harness();
+    const created = await h.ops.createSession(input);
+
+    expect(created).toEqual({ sessionId: "s-new", taskId: `automation:${RUN_ID}` });
+    // The review-control-plane ordering: create → binding → listener.
+    expect(h.calls).toEqual(["task", "existing", "create", "binding", "listener", "launch"]);
+    expect(h.bindings[0]).toMatchObject({ sessionId: "s-new", runId: RUN_ID, keep: true });
+    expect(h.launches[0]).toMatchObject({ runId: RUN_ID, sessionId: "s-new" });
+    const params = h.createdParams[0]!;
+    expect(params.taskType).toBe("automation");
+    expect(params.integrationPrincipalId).toBe("automation:auto-1");
+    expect(params.registerListener).toBe(false);
+    expect(params.role).toBe("primary");
   });
 
-  test("forwards the prepared harness/model/effort to session create", async () => {
-    const f = fixture("Run");
-    let sessionInput: CreateSessionForExistingTaskParams | undefined;
-    const creator = makeAutomationTaskCreator({
-      store: f.store,
-      async createSessionForExistingTask(value) {
-        sessionInput = value;
-        return { sessionId: "session-1" };
-      },
-    });
+  test("a primary launch reuses the task's existing primary session", async () => {
+    const h = harness();
+    h.setExistingPrimary("s-existing");
+    const created = await h.ops.createSession(input);
+    expect(created.sessionId).toBe("s-existing");
+    expect(h.calls).toEqual(["task", "existing"]);
+  });
 
-    await creator.create(input, {
-      profileId: "profile-1",
-      prompt: "Do the work",
-      title: null,
-      harness: "codex",
-      model: "gpt",
-      effort: "high",
-    });
-
-    expect(sessionInput).toMatchObject({ harness: "codex", model: "gpt", effort: "high" });
+  test("non-primary roles always create a fresh session", async () => {
+    const h = harness();
+    h.setExistingPrimary("s-existing");
+    const created = await h.ops.createSession({ ...input, role: "verifier", keep: false });
+    expect(created.sessionId).toBe("s-new");
+    expect(h.calls).toContain("create");
+    // Only the primary launch denormalizes onto the run row.
+    expect(h.launches).toEqual([]);
+    expect(h.bindings[0]).toMatchObject({ role: "verifier", keep: false });
   });
 });
