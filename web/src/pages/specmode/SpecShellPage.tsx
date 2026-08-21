@@ -115,6 +115,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
     return (
       <IdeationScreen
         specId={specId}
+        sessionId={spec.sessionId}
         title={spec.title}
         templateName={spec.template.name}
         owner={spec.owner}
@@ -235,6 +236,7 @@ export function SpecShellPage({ specId: explicitSpecId }: { specId?: string }) {
       ) : null}
       <SpecShell
         specId={specId}
+        sessionId={spec.sessionId}
         title={spec.title}
         templateName={spec.template.name}
         checkpoints={checkpoints}

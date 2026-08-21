@@ -822,7 +822,9 @@
   font-size: 0.75rem;
 }
 
-.spec-mode-thinking > :last-child {
+/* Named, not positional: the row gained a trailing Stop button, and a
+   `:last-child` rule would have restyled that instead of the label. */
+.spec-mode-thinking-label {
   font-size: 0.78rem;
 }
 

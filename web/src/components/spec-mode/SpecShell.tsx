@@ -10,6 +10,7 @@ import "./spec-mode.css";
 
 export function SpecShell({
   specId,
+  sessionId = null,
   title,
   templateName,
   checkpoints,
@@ -25,6 +26,8 @@ export function SpecShell({
   children,
 }: {
   specId: string;
+  /** The spec's agent session, when it has one — the interrupt target. */
+  sessionId?: string | null;
   title: string;
   templateName: string;
   checkpoints: SpecCheckpointSummary[];
@@ -85,6 +88,7 @@ export function SpecShell({
           {surface ? (
             <ConversationRail
               specId={specId}
+              sessionId={sessionId}
               surface={surface}
               presence={presence}
               owner={owner}

@@ -1,5 +1,8 @@
 import { useMemo, useState } from "react";
+import { useMutation } from "@connectrpc/connect-query";
+import { toast } from "sonner";
 
+import { interrupt as interruptMethod } from "@/gen/engram/app/v1/session-SessionService_connectquery";
 import { Text } from "@/components/ui/text";
 import { useSendSpecMessage, type SpecMessage } from "@/hooks/useSpecMessages";
 import { NextProposalCard } from "./NextProposalCard";
@@ -31,12 +34,15 @@ interface InFlightSend {
 
 export function ConversationRail({
   specId,
+  sessionId = null,
   surface,
   presence = [],
   owner = null,
   onSelectSection,
 }: {
   specId: string;
+  /** The spec's agent session, when it has one — the interrupt target. */
+  sessionId?: string | null;
   surface: SpecSurface;
   presence?: SpecPresenceEntry[];
   owner?: SpecMessage["author"] | null;
@@ -49,6 +55,23 @@ export function ConversationRail({
     [surface.sections],
   );
   const conversation = useSpecConversation(specId, sectionTitles, owner);
+
+  // ADR 0030: interrupting SIGINTs the agent's child process. Offered only
+  // while a run is live and only when the spec has a session to interrupt —
+  // the same two gates the task thread applies, so a stale page cannot fire a
+  // phantom interrupt. A failure is reported rather than swallowed: the run
+  // keeps going, and the person needs to know their Stop did not land.
+  const interruptRun = useMutation(interruptMethod);
+  const stopRun =
+    sessionId && conversation.isRunning
+      ? () => {
+          interruptRun.mutateAsync({ sessionId, source: "spec-thread" }).catch((error: unknown) => {
+            toast.error("The agent did not stop.", {
+              description: error instanceof Error ? error.message : undefined,
+            });
+          });
+        }
+      : undefined;
 
   // A sent message renders immediately as a pending bubble and stays until
   // the shared conversation echoes it back. Without this the send gave no
@@ -106,6 +129,7 @@ export function ConversationRail({
         isRunning={conversation.isRunning}
         toolLabel={conversation.toolLabel}
         onActivity={onSelectSection}
+        onStop={stopRun}
       />
       {conversation.hasError ? (
         <Text as="div" className="spec-mode-conversation-warning" tone="destructive" role="status">

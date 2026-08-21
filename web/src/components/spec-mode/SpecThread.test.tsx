@@ -150,6 +150,28 @@ describe("SpecThread", () => {
     );
     expect(scrollTo).not.toHaveBeenCalled();
   });
+
+  // A single tool call can run for many minutes — one prod spec spent thirty
+  // on a filesystem-wide grep — and there was no way to end it from here.
+  test("offers Stop only while a run is live", async () => {
+    const onStop = vi.fn();
+    const view = render(
+      <SpecThread entries={[]} isRunning={false} onActivity={vi.fn()} onStop={onStop} />,
+    );
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+
+    view.rerender(
+      <SpecThread entries={[]} isRunning={true} onActivity={vi.fn()} onStop={onStop} />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Stop" }));
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  test("omits Stop when there is no session to interrupt", () => {
+    render(<SpecThread entries={[]} isRunning={true} onActivity={vi.fn()} />);
+    expect(screen.getByRole("status")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+  });
 });
 
 function human(id: string, text: string): SpecThreadEntry {

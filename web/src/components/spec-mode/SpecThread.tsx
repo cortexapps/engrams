@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, type ReactNode, type UIEvent } from "react";
 
 import { Markdown } from "@/components/Markdown";
+import { Button } from "@/components/ui/button";
 import { Text } from "@/components/ui/text";
 import { collaboratorColor } from "./collaborator-colors";
 import type { SpecThreadEntry } from "./buildSpecThread";
@@ -21,6 +22,7 @@ export function SpecThread({
   toolLabel,
   onActivity,
   emptyState,
+  onStop,
 }: {
   entries: readonly SpecThreadEntry[];
   pending?: readonly PendingSpecMessage[];
@@ -28,6 +30,8 @@ export function SpecThread({
   toolLabel?: string | null;
   onActivity: (sectionId: string) => void;
   emptyState?: ReactNode;
+  /** Interrupt the run. Absent when there is no session to interrupt. */
+  onStop?: (() => void) | undefined;
 }) {
   const threadRef = useRef<HTMLDivElement | null>(null);
   const followsTail = useRef(true);
@@ -147,9 +151,17 @@ export function SpecThread({
           <span className="spec-mode-penbeat" aria-hidden="true">
             ●
           </span>
-          <Text as="span" tone="muted">
+          <Text as="span" tone="muted" className="spec-mode-thinking-label">
             {toolLabel ?? "Engram is thinking"}
           </Text>
+          {/* A single tool call can run for many minutes — one prod spec spent
+              thirty on a filesystem-wide grep. Without this the only way out
+              was to abandon the spec. */}
+          {onStop ? (
+            <Button type="button" variant="outline" size="xs" onClick={onStop}>
+              Stop
+            </Button>
+          ) : null}
         </div>
       ) : null}
     </div>
