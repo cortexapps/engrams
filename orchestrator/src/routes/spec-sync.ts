@@ -703,24 +703,38 @@ export function makeSpecSyncUpgradeHandler(
   const guard = makeSpecMemberHeaderGuard(deps.resolveMembership, deps.getSession);
   const wss = new WebSocketServer({ noServer: true });
 
+  // Every exit from this function is reported. A spec-sync outage is otherwise
+  // undiagnosable from the server side: a rejection and a dead upstream look
+  // identical to the browser (both surface as a failed handshake), and without
+  // a line per rejection there is nothing to correlate against.
+  const reject = (
+    req: IncomingMessage,
+    socket: Socket,
+    head: Buffer,
+    status: number,
+    reason: string,
+  ): true => {
+    deps.onWarning?.(`Spec sync upgrade rejected (${status} ${reason}): ${req.url ?? "/"}`);
+    return rejectUpgrade(wss, req, socket, head, status);
+  };
+
   return async function trySpecSyncUpgrade(req, socket, head) {
     let parsed: ParsedSpecSyncPath | null;
     try {
       parsed = parseSpecSyncPath(new URL(req.url ?? "/", "http://localhost"));
     } catch {
-      return rejectUpgrade(wss, req, socket, head, 400);
+      return reject(req, socket, head, 400, "unparsable url");
     }
     if (!parsed) return false;
 
     try {
-      if (!parsed.specId || !parsed.clientId) {
-        return rejectUpgrade(wss, req, socket, head, 400);
-      }
+      if (!parsed.specId) return reject(req, socket, head, 400, "bad spec id");
+      if (!parsed.clientId) return reject(req, socket, head, 400, "bad client id");
       const headers = requestHeaders(req);
       const authz = await guard(headers, parsed.specId);
-      if (!authz.ok) return rejectUpgrade(wss, req, socket, head, authz.status);
+      if (!authz.ok) return reject(req, socket, head, authz.status, "not a spec member");
       if (!(await deps.resolveDraft(parsed.specId))) {
-        return rejectUpgrade(wss, req, socket, head, 404);
+        return reject(req, socket, head, 404, "spec is not drafting");
       }
       const specId = parsed.specId;
       const clientId = parsed.clientId;
@@ -737,7 +751,9 @@ export function makeSpecSyncUpgradeHandler(
       });
       return true;
     } catch (error: unknown) {
-      deps.onWarning?.(`Spec sync upgrade failed: ${errorMessage(error)}`);
+      deps.onWarning?.(
+        `Spec sync upgrade failed for ${req.url ?? "/"}: ${errorMessage(error)}`,
+      );
       return rejectUpgrade(wss, req, socket, head, 500);
     }
   };
