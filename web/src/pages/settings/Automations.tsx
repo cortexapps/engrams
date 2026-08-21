@@ -196,8 +196,6 @@ function AutomationRow({
 
 const SCHEME_LABELS: Record<VerificationScheme, string> = {
   generic_hmac_sha256: "Generic HMAC SHA-256",
-  github_hmac_sha256: "GitHub HMAC SHA-256",
-  slack_v0: "Slack v0 signature",
 };
 
 interface CreatedRegistration {
@@ -239,8 +237,6 @@ function CreateRegistrationDialog() {
   const onProviderChange = (provider: string) => {
     const value = provider === "generic" ? "" : provider;
     setProviderHint(value);
-    const hint = hints.find((item) => item.provider === value);
-    if (hint) setScheme(hint.verificationScheme);
   };
 
   const onCreate = async () => {
@@ -363,22 +359,11 @@ function CreateRegistrationDialog() {
               </Field>
               <Field>
                 <FieldLabel>Verification scheme</FieldLabel>
-                <Select
-                  value={scheme}
-                  onValueChange={(value) => setScheme(value as VerificationScheme)}
-                  disabled={!!providerHint}
-                >
-                  <SelectTrigger className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {Object.entries(SCHEME_LABELS).map(([value, label]) => (
-                      <SelectItem key={value} value={value}>
-                        {label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                <p className="text-sm text-muted-foreground">{SCHEME_LABELS[scheme]}</p>
+                <FieldDescription>
+                  GitHub, Slack, and Linear events arrive through their integrations: select them as
+                  an automation trigger instead of registering a webhook.
+                </FieldDescription>
               </Field>
               <FieldError>{error}</FieldError>
             </div>
@@ -452,9 +437,15 @@ function RegistrationRow({ registration }: { registration: WebhookRegistration }
           </div>
           <p className="mt-1 font-mono text-xs text-muted-foreground">{hookPath}</p>
           <p className="mt-1 text-xs text-muted-foreground">
-            {SCHEME_LABELS[registration.verificationScheme as VerificationScheme] ??
-              registration.verificationScheme}
+            {registration.verificationScheme === "generic_hmac_sha256"
+              ? SCHEME_LABELS.generic_hmac_sha256
+              : registration.verificationScheme}
           </p>
+          {registration.disabledReason && (
+            <p className="mt-2 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1 text-xs text-destructive">
+              Retired: {registration.disabledReason}
+            </p>
+          )}
         </div>
         <AlertDialog>
           <AlertDialogTrigger asChild>

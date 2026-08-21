@@ -156,6 +156,8 @@ import { SpecTicketSyncService } from "./specs/ticket-sync-service.ts";
 import { PostgresSpecTicketSyncStore } from "./specs/ticket-sync-store.ts";
 import { makeSpecTicketSyncConnector } from "./specs/ticket-sync-connector.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
+import { retireProviderWebhookSchemes } from "./automations/retire-provider-webhooks.ts";
+import { makeAutomationStore } from "./db/automations.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
 import { DEFAULT_TARGET_HYDRATOR_CONFIG, TargetHydrator } from "./reviews/target-hydrator.ts";
 
@@ -633,6 +635,16 @@ await Promise.all([
 void seedReviewerProfile(makeProfileStore(getDb()), integrationConnections, log).catch((err) =>
   log.error({ err }, "reviewer profile seed failed"),
 );
+// ADR 0119 D5: one-shot, idempotent retirement of provider-scheme webhooks —
+// github-app-bound automations move onto the default GitHub connection;
+// custom provider-scheme registrations are disabled with a reason, never
+// re-pointed (see retire-provider-webhooks.ts). Needs the default
+// connections ensured above.
+void retireProviderWebhookSchemes({
+  store: makeAutomationStore(getDb()),
+  connections: integrationConnections,
+  log,
+}).catch((err) => log.error({ err }, "provider webhook scheme retirement failed"));
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
 assertSweepPoliciesExhaustive();

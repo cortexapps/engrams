@@ -14,8 +14,7 @@ import {
 } from "../verify.ts";
 
 const SECRET = "verification-secret";
-const BODY_TEXT = JSON.stringify({ action: "opened" });
-const BODY = new TextEncoder().encode(BODY_TEXT);
+const BODY = new TextEncoder().encode(JSON.stringify({ action: "opened" }));
 
 function verify(scheme: WebhookVerificationScheme, headers: Record<string, string>): boolean {
   return verifyWebhook({
@@ -31,17 +30,9 @@ function digest(value: string | Uint8Array): string {
 }
 
 describe("webhook verification strategies", () => {
-  test("github_hmac_sha256 accepts a valid signature", () => {
-    expect(verify("github_hmac_sha256", {
-      "x-hub-signature-256": `sha256=${digest(BODY)}`,
-    })).toBe(true);
-  });
-
-  test("github_hmac_sha256 rejects invalid and missing signatures", () => {
-    expect(verify("github_hmac_sha256", { "x-hub-signature-256": "sha256=bad" })).toBe(false);
-    expect(verify("github_hmac_sha256", {})).toBe(false);
-  });
-
+  // Only the generic scheme survives ADR 0119 D5; the provider schemes
+  // (github_hmac_sha256, slack_v0) are verified on the integration ingress
+  // routes and can no longer be stored on a registration.
   test("generic_hmac_sha256 accepts a valid signature", () => {
     expect(verify("generic_hmac_sha256", {
       "x-engrams-signature-256": `sha256=${digest(BODY)}`,
@@ -55,28 +46,9 @@ describe("webhook verification strategies", () => {
     expect(verify("generic_hmac_sha256", {})).toBe(false);
   });
 
-  test("slack_v0 accepts a valid fresh signature", () => {
-    const timestamp = String(Math.floor(Date.now() / 1_000));
-    expect(verify("slack_v0", {
-      "x-slack-request-timestamp": timestamp,
-      "x-slack-signature": `v0=${digest(`v0:${timestamp}:${BODY_TEXT}`)}`,
-    })).toBe(true);
-  });
-
-  test("slack_v0 rejects invalid and missing signatures", () => {
-    const timestamp = String(Math.floor(Date.now() / 1_000));
-    expect(verify("slack_v0", {
-      "x-slack-request-timestamp": timestamp,
-      "x-slack-signature": `v0=${"0".repeat(64)}`,
-    })).toBe(false);
-    expect(verify("slack_v0", { "x-slack-request-timestamp": timestamp })).toBe(false);
-  });
-
-  test("slack_v0 rejects a correctly signed stale timestamp", () => {
-    const timestamp = String(Math.floor(Date.now() / 1_000) - 301);
-    expect(verify("slack_v0", {
-      "x-slack-request-timestamp": timestamp,
-      "x-slack-signature": `v0=${digest(`v0:${timestamp}:${BODY_TEXT}`)}`,
+  test("a provider header never satisfies the generic scheme", () => {
+    expect(verify("generic_hmac_sha256", {
+      "x-hub-signature-256": `sha256=${digest(BODY)}`,
     })).toBe(false);
   });
 });

@@ -4,7 +4,6 @@ import { loadRegistry, type CustomConnectorSource, type WebhookAliasSpec } from 
 import { makeAutomationStore, type WebhookRegistrationRow } from "../db/automations.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { getDb } from "../db/client.ts";
-import { SYSTEM_GITHUB_REGISTRATION_ID } from "./webhook.ts";
 
 export interface WebhookAliasResolverDeps {
   registrations?: {
@@ -22,10 +21,8 @@ export function makeWebhookAliasResolver(deps: WebhookAliasResolverDeps = {}) {
   let registrations = deps.registrations;
   let connectors = deps.connectors;
   return async (registrationId: string): Promise<WebhookAliasSpec[]> => {
-    const provider = registrationId === SYSTEM_GITHUB_REGISTRATION_ID
-      ? "github"
-      : (await (registrations ??= makeAutomationStore()).getRegistration(registrationId))
-          ?.providerHint;
+    const provider = (await (registrations ??= makeAutomationStore()).getRegistration(registrationId))
+      ?.providerHint;
     if (!provider) return [];
     connectors ??= makeConnectorStore(getDb());
     return (await loadRegistry(connectors)).get(provider)?.webhook?.aliases ?? [];

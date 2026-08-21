@@ -154,6 +154,7 @@ function delivery(overrides: Partial<Parameters<typeof dispatchWebhookOccurrence
       name: "Hooks",
       verification: { scheme: "generic_hmac_sha256" as const, secretRef: "webhook.hooks-1.secret" },
       providerHint: null,
+      disabledReason: null,
       createdByUserId: "admin-1",
       createdAt: RECEIVED_AT,
       updatedAt: RECEIVED_AT,
@@ -188,14 +189,14 @@ describe("dispatchWebhookOccurrence", () => {
     expect(h.samples).toEqual([{ registrationId: "hooks-1", retain: WEBHOOK_SAMPLE_RETENTION }]);
   });
 
-  test("system registrations store no sample; mismatches never start", async () => {
+  test("a mismatched event key stores the sample but never starts a run", async () => {
     const h = makeHarness([{ automation: meta(), definition: definition() }]);
     const result = await dispatchWebhookOccurrence(
-      delivery({ registration: null, eventKey: "issues.closed" }),
+      delivery({ eventKey: "issues.closed" }),
       deps(h),
     );
     expect(result.matched).toBe(0);
-    expect(h.samples).toEqual([]);
+    expect(h.samples).toEqual([{ registrationId: "hooks-1", retain: WEBHOOK_SAMPLE_RETENTION }]);
     expect(h.starts).toEqual([]);
   });
 

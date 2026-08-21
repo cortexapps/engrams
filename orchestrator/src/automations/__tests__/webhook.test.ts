@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 
-import type { WebhookRegistrationRow } from "../../db/automations.ts";
 import {
   extractWebhookEvent,
   matchesWebhookFilter,
@@ -9,53 +8,15 @@ import {
   redactWebhookPayload,
 } from "../webhook.ts";
 
-const NOW = new Date("2026-07-22T12:00:00Z");
-const registration = (
-  scheme: WebhookRegistrationRow["verification"]["scheme"],
-  providerHint: string | null,
-): WebhookRegistrationRow => ({
-  id: "example",
-  name: "Example",
-  verification: { scheme, secretRef: "webhook.example.secret" },
-  providerHint,
-  createdByUserId: "admin",
-  createdAt: NOW,
-  updatedAt: NOW,
-});
-
 const encoded = (value: Record<string, unknown>) =>
   new TextEncoder().encode(JSON.stringify(value));
 
 describe("webhook event extraction", () => {
-  test("GitHub combines event and payload action and reads the delivery id", () => {
-    const rawBody = encoded({ action: "opened", issue: { number: 7 } });
-    expect(extractWebhookEvent({
-      registration: registration("github_hmac_sha256", "github"),
-      headers: new Headers({
-        "x-github-event": "issues",
-        "x-github-delivery": "delivery-1",
-      }),
-      rawBody,
-    })).toMatchObject({ eventKey: "issues.opened", deliveryId: "delivery-1" });
-  });
-
-  test("Slack extracts event_callback inner type and event_id", () => {
-    const rawBody = encoded({
-      type: "event_callback",
-      event_id: "Ev123",
-      event: { type: "app_mention", text: "hello" },
-    });
-    expect(extractWebhookEvent({
-      registration: registration("slack_v0", "slack"),
-      headers: new Headers(),
-      rawBody,
-    })).toMatchObject({ eventKey: "app_mention", deliveryId: "Ev123" });
-  });
-
-  test("generic validates the event header and uses the declared delivery id", () => {
+  // Generic only (ADR 0119 D5): provider-shaped extraction moved to the
+  // integration ingress routes.
+  test("validates the event header and uses the declared delivery id", () => {
     const rawBody = encoded({ state: "open" });
     expect(extractWebhookEvent({
-      registration: registration("generic_hmac_sha256", null),
       headers: new Headers({
         "x-engrams-event": "incident.opened",
         "x-engrams-delivery": "delivery_42",
@@ -64,20 +25,26 @@ describe("webhook event extraction", () => {
     })).toMatchObject({ eventKey: "incident.opened", deliveryId: "delivery_42" });
   });
 
-  test("generic falls back to the stable raw-body sha256", () => {
+  test("falls back to the stable raw-body sha256", () => {
     const rawBody = encoded({ state: "open" });
     const event = extractWebhookEvent({
-      registration: registration("generic_hmac_sha256", null),
       headers: new Headers({ "x-engrams-event": "incident.opened" }),
       rawBody,
     });
     expect(event.deliveryId).toBe(createHash("sha256").update(rawBody).digest("hex"));
   });
 
+  test("GitHub-shaped headers are not special-cased any more", () => {
+    const rawBody = encoded({ action: "opened" });
+    expect(() => extractWebhookEvent({
+      headers: new Headers({ "x-github-event": "issues", "x-github-delivery": "d1" }),
+      rawBody,
+    })).toThrow(/X-Engrams-Event/);
+  });
+
   test("rejects malformed generic event keys", () => {
     const rawBody = encoded({});
     expect(() => extractWebhookEvent({
-      registration: registration("generic_hmac_sha256", null),
       headers: new Headers({ "x-engrams-event": "../../bad" }),
       rawBody,
     })).toThrow(/event key/);

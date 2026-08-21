@@ -1,6 +1,5 @@
 /** Webhook verification strategies and sealed-secret resolution (ADR 0102). */
 
-import { isValidSlackRequest } from "@slack/bolt";
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 import { integrationOp as defaultIntegrationOp } from "../control-plane/client.ts";
@@ -98,44 +97,15 @@ export function verifyHexHmacSha256(
   return timingSafeHeader(sha256Signature(secret, rawBody), actual);
 }
 
+/** Custom-registration verification: the generic scheme only. Provider
+ * schemes retired with ADR 0119 D5 — GitHub/Slack/Linear deliveries arrive on
+ * the integration ingress routes and verify with the connection's secret. */
 export function verifyWebhook(input: VerifyWebhookInput): boolean {
   switch (input.verification.scheme) {
-    case "github_hmac_sha256":
-      return timingSafeHeader(
-        `sha256=${sha256Signature(input.secret, input.rawBody)}`,
-        input.headers.get("x-hub-signature-256"),
-      );
     case "generic_hmac_sha256":
       return timingSafeHeader(
         `sha256=${sha256Signature(input.secret, input.rawBody)}`,
         input.headers.get("x-engrams-signature-256"),
       );
-    case "slack_v0": {
-      const timestamp = input.headers.get("x-slack-request-timestamp");
-      const signature = input.headers.get("x-slack-signature");
-      if (!timestamp || !/^\d+$/.test(timestamp) || !signature) return false;
-      const timestampSeconds = Number(timestamp);
-      if (!Number.isSafeInteger(timestampSeconds) || timestampSeconds <= 0) return false;
-      let body: string;
-      try {
-        body = new TextDecoder("utf-8", { fatal: true }).decode(input.rawBody);
-      } catch {
-        return false;
-      }
-      try {
-        // Bolt implements Slack's v0 base string, timing-safe signature check,
-        // and five-minute timestamp freshness rule.
-        return isValidSlackRequest({
-          signingSecret: input.secret,
-          body,
-          headers: {
-            "x-slack-signature": signature,
-            "x-slack-request-timestamp": timestampSeconds,
-          },
-        });
-      } catch {
-        return false;
-      }
-    }
   }
 }

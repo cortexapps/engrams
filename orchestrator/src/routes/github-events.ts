@@ -2,16 +2,6 @@
 
 import { Hono } from "hono";
 
-import {
-  dispatchWebhookOccurrence,
-  SYSTEM_GITHUB_REGISTRATION_ID,
-  type DispatchWebhookInput,
-} from "../automations/dispatch.ts";
-import {
-  extractWebhookEvent,
-  redactWebhookPayload,
-  WebhookEventError,
-} from "../automations/webhook.ts";
 import { config } from "../config.ts";
 import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
 import {
@@ -62,7 +52,6 @@ export interface GithubEventsDeps {
   /** Refresh a target only when it already exists. Non-reviewing PR actions
    *  must never create dossiers for pull requests engrams has never reviewed. */
   refreshTarget?: (input: UpsertReviewTargetInput) => Promise<boolean>;
-  automationDispatch?: (input: DispatchWebhookInput) => Promise<unknown>;
   /** Ingress-spine seams (ledger store, new-trigger dispatch, connection). */
   ingress?: HandleDeliveryDeps;
   now?: () => Date;
@@ -97,7 +86,6 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
     await reviews().upsertTarget(input);
     return true;
   });
-  const automationDispatch = deps.automationDispatch ?? dispatchWebhookOccurrence;
   const now = deps.now ?? (() => new Date());
   const ingressDeps: HandleDeliveryDeps = { ...(deps.ingress ?? {}), now };
 
@@ -142,40 +130,9 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
     if (delivery.kind === "rejected" || delivery.kind === "responded") {
       return delivery.response;
     }
-    const rawBytes = delivery.rawBody;
-    const rawBody = new TextDecoder().decode(rawBytes);
-    const parsedPayload = delivery.payload;
-
-    // Legacy github-app fan-out (retires with the provider HMAC schemes): the
-    // installed GitHub App is a well-known system registration with no PG row;
-    // automations bound to "github-app" still receive every verified event.
-    if (parsedPayload !== undefined) {
-      try {
-        const occurrence = extractWebhookEvent({
-          registration: {
-            verification: { scheme: "github_hmac_sha256", secretRef: "github.webhook_secret" },
-            providerHint: "github",
-          },
-          headers: c.req.raw.headers,
-          rawBody: rawBytes,
-          payload: parsedPayload,
-        });
-        await automationDispatch({
-          registrationId: SYSTEM_GITHUB_REGISTRATION_ID,
-          registration: null,
-          eventKey: occurrence.eventKey,
-          deliveryId: occurrence.deliveryId,
-          payload: redactWebhookPayload(occurrence.payload),
-          receivedAt: now(),
-        });
-      } catch (error) {
-        if (!(error instanceof WebhookEventError)) throw error;
-        // Preserve the pre-existing PR-review classifier's tolerant behavior
-        // for signed-but-malformed requests. Legitimate GitHub deliveries
-        // always carry the event and delivery headers and a JSON object body.
-        log.warn({ error: error.message }, "github delivery not eligible for automation dispatch");
-      }
-    }
+    // The spine (ledger + integration-trigger dispatch) has run; the PR-review
+    // classifier below consumes the same verified body.
+    const rawBody = new TextDecoder().decode(delivery.rawBody);
 
     const event = classifyGithubEvent(
       c.req.header("x-github-event") ?? "",

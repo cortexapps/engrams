@@ -32,6 +32,11 @@ export function makeHooksRoute(deps: HooksRouteDeps = {}): Hono {
     }
     const registration = await store().getRegistration(registrationId);
     if (!registration) return c.json({ error: "webhook registration not found" }, 404);
+    // A retired registration (provider signature schemes, ADR 0119 D5) keeps
+    // its row so the UI can explain itself, but the hook URL is gone for good.
+    if (registration.disabledReason !== null) {
+      return c.json({ error: registration.disabledReason }, 410);
+    }
 
     let rawBody: Uint8Array;
     try {
@@ -58,7 +63,6 @@ export function makeHooksRoute(deps: HooksRouteDeps = {}): Hono {
     try {
       const payload = parseWebhookPayload(rawBody);
       occurrence = extractWebhookEvent({
-        registration,
         headers: c.req.raw.headers,
         rawBody,
         payload,

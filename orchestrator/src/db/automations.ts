@@ -115,6 +115,8 @@ export interface WebhookRegistrationRow {
   name: string;
   verification: WebhookVerification;
   providerHint: string | null;
+  /** Non-null once deliveries are refused with 410 Gone (ADR 0119 D5). */
+  disabledReason: string | null;
   createdByUserId: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -167,6 +169,14 @@ export interface AutomationStore {
   getRegistration(id: string): Promise<WebhookRegistrationRow | null>;
   listRegistrations(): Promise<WebhookRegistrationRow[]>;
   deleteRegistration(id: string): Promise<boolean>;
+  setRegistrationDisabledReason(id: string, reason: string | null): Promise<boolean>;
+  /** Insert version current+1 with an arbitrary definition and repoint the
+   * automation at it, in one transaction. The scheme-retirement backfill's
+   * write path; the legacy proto path keeps using create/update. */
+  replaceCurrentDefinition(
+    automationId: string,
+    definition: AutomationDefinition,
+  ): Promise<AutomationMetaRow | null>;
 
   getSample(id: string): Promise<WebhookSampleRow | null>;
   recordWebhookSample(input: {
@@ -349,6 +359,7 @@ function registrationRow(
   return {
     ...row,
     providerHint: row.providerHint ?? null,
+    disabledReason: row.disabledReason ?? null,
     createdByUserId: row.createdByUserId ?? null,
   };
 }
@@ -829,6 +840,41 @@ export function makeAutomationStore(
         .where(eq(webhookRegistrationTable.id, id))
         .returning({ id: webhookRegistrationTable.id });
       return rows.length > 0;
+    },
+
+    async setRegistrationDisabledReason(id, reason) {
+      const rows = await db
+        .update(webhookRegistrationTable)
+        .set({ disabledReason: reason })
+        .where(eq(webhookRegistrationTable.id, id))
+        .returning({ id: webhookRegistrationTable.id });
+      return rows.length > 0;
+    },
+
+    async replaceCurrentDefinition(automationId, definition) {
+      return db.transaction(async (tx) => {
+        const [current] = await tx
+          .select({ currentVersion: automationTable.currentVersion })
+          .from(automationTable)
+          .where(eq(automationTable.id, automationId))
+          .limit(1);
+        if (!current) return null;
+        const version = current.currentVersion + 1;
+        await tx.insert(versionTable).values({
+          automationId,
+          version,
+          trigger: definition.trigger,
+          blocks: definition.blocks,
+          inputsSchema: definition.inputsSchema,
+          settings: definition.settings,
+          createdByUserId: null,
+        });
+        await tx
+          .update(automationTable)
+          .set({ currentVersion: version, updatedAt: new Date() })
+          .where(eq(automationTable.id, automationId));
+        return (await this.get(automationId)) ?? null;
+      });
     },
 
     async getSample(id) {
