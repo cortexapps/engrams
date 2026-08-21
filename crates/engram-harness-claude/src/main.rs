@@ -289,20 +289,6 @@ mod adapter {
     /// SIGINT so an interrupt can never wedge a run.
     pub const INTERRUPT_GRACE_SECS: u64 = 8;
 
-    /// Steering debounce: a mid-turn prompt ARMS the auto-interrupt rather
-    /// than firing it; the `control_request` is written only when this
-    /// window elapses with the queue still non-empty. The window is the
-    /// cancel affordance — a `control_request`, once written, cannot be
-    /// recalled, so a queue-then-cancel (or pull-back-to-edit, which also
-    /// dequeues) inside the window must cost the running turn nothing.
-    /// It also absorbs the natural-completion race: a turn that ends
-    /// within the window delivers the queued prompt at the boundary with
-    /// no interrupt (and no stale control frame) at all. Sized to cover a
-    /// human "oops" cancel round-tripping web → coordinator → harness;
-    /// after it elapses the abort is committed — a later cancel still
-    /// loses the run (context survives on the warm process).
-    pub const STEER_DEBOUNCE_MS: u64 = 1_000;
-
     #[derive(Parser, Debug, Clone)]
     #[command(
         name = "engram-harness-claude",
@@ -2651,13 +2637,17 @@ mod adapter {
         // tracking here yields each turn's delta for `RunCost`.
         let mut last_cost_total_usd: f64 = 0.0;
 
-        // Steering: armed when the pending queue wants the in-flight turn
-        // aborted (a mid-turn prompt, or leftover type-ahead at a
-        // consumption boundary). The sleeper fires the actual interrupt
-        // once `STEER_DEBOUNCE_MS` elapses with the queue STILL non-empty —
-        // a dequeue that empties the queue inside the window disarms it and
-        // the running turn is never touched.
-        let mut steer_deadline: Option<Instant> = None;
+        // ADR 0052 (2026-08-20 revision): the write-order ledger of
+        // steered prompt ids. A mid-turn prompt is written straight to
+        // claude's stdin; when the CLI defers it to a spontaneous next
+        // turn (a fresh `init` with no open turn), the continuation-turn
+        // bracket below attributes that turn to the ledger head. An
+        // ATTENDED steer (consumed inside the running turn — no marker
+        // exists) leaves its entry here until the process ends; the
+        // ledger is per-process on purpose: a respawned CLI has no
+        // buffered messages, so stale entries must not misattribute a
+        // background-wake continuation turn.
+        let mut steered: VecDeque<String> = VecDeque::new();
 
         // In-flight background subagents, from the CLI's
         // `background_tasks_changed` inventory (`local_agent` entries only —
@@ -2692,7 +2682,7 @@ mod adapter {
             // both drives the model and acks the outbox row. Approve was
             // respawned with the stamp already flipped to build, so this
             // continuation turn runs under default mode.
-            turn = Some(start_continuation_turn(evt_tx, cli, current_run_id).await);
+            turn = Some(start_continuation_turn(evt_tx, cli, current_run_id, None).await);
         } else {
             // Kick off the first queued prompt (an initial prompt, or a
             // queue that survived a respawn) with no leading waiting marker;
@@ -2706,12 +2696,11 @@ mod adapter {
                                 .await,
                         );
                     }
-                    // Steering: a respawn-surviving queue can hold more than
-                    // one prompt — same invariant as the result-marker
-                    // consumption site (queue non-empty ⇒ a steer is armed).
-                    if !pending.is_empty() && turn.is_some() {
-                        arm_steer(&mut steer_deadline, &interrupted_run);
-                    }
+                    // A respawn-surviving queue can hold more than one
+                    // prompt; the remainder is consumed at each turn's
+                    // result boundary, exactly as before write-through
+                    // steering (queued entries are the mode-mismatch /
+                    // drain / write-failure shapes — never auto-aborted).
                 }
                 None => {
                     let parked = !deferred_calls.lock().await.is_empty();
@@ -2736,7 +2725,6 @@ mod adapter {
                 turn.as_ref().map(|t| t.deadline),
                 shutdown_deadline,
                 interrupt_deadline,
-                steer_deadline,
             ]
             .into_iter()
             .flatten()
@@ -2793,7 +2781,23 @@ mod adapter {
                             // set) never open one.
                             if turn.is_none() && is_main_loop_message(&line) {
                                 turn =
-                                    Some(start_continuation_turn(evt_tx, cli, current_run_id).await);
+                                    // ADR 0052 (2026-08-20 revision): a
+                                    // spontaneous turn with steered writes
+                                    // outstanding is the CLI running a
+                                    // DEFERRED write-through steer as its own
+                                    // turn (announced by a fresh `init`) —
+                                    // attribute it to the ledger head.
+                                    // Background-wake continuations (empty
+                                    // ledger) stay unattributed.
+                                    Some(
+                                        start_continuation_turn(
+                                            evt_tx,
+                                            cli,
+                                            current_run_id,
+                                            steered.pop_front(),
+                                        )
+                                        .await,
+                                    );
                             }
                             if let Some(marker) = detect_result_marker(&line) {
                                 // Explicit turn-end. Close the in-flight
@@ -3029,21 +3033,13 @@ mod adapter {
                                                         .await,
                                                     );
                                                 }
-                                                // Steering: more type-ahead
-                                                // is stacked behind the
-                                                // prompt just consumed —
-                                                // re-arm against the fresh
-                                                // run so the tail never
-                                                // waits out a full turn
-                                                // (invariant: queue
-                                                // non-empty ⇒ a steer is
-                                                // armed).
-                                                if !pending.is_empty() && turn.is_some() {
-                                                    arm_steer(
-                                                        &mut steer_deadline,
-                                                        &interrupted_run,
-                                                    );
-                                                }
+                                                // Remaining queued entries
+                                                // (mode-mismatch / drain /
+                                                // write-failure shapes)
+                                                // consume at each boundary;
+                                                // write-through steering
+                                                // means fresh mid-turn
+                                                // prompts never join them.
                                             }
                                             None => {
                                                 if bg_agents > 0 {
@@ -3219,45 +3215,90 @@ mod adapter {
                                     );
                                 }
                             } else {
-                                // Type-ahead: a prompt arriving mid-turn is
-                                // QUEUED (not written to claude yet, so it
-                                // stays editable). The harness owns the
-                                // queue; `PromptQueued` reflects it up so the
-                                // web renders a greyed/editable composer item.
-                                emit(
-                                    evt_tx,
-                                    HarnessEvent::PromptQueued {
-                                        prompt_id: prompt_id.clone(),
-                                        summary: Some(truncate_str(&text, MAX_ARGS_SUMMARY_BYTES)),
+                                // ADR 0052 (2026-08-20 revision): WRITE-
+                                // THROUGH steering, guarded. Steer only when
+                                // no queue-shape applies: a mode mismatch
+                                // must not inject into the RUNNING turn
+                                // under the OLD permission mode (ADR 0107) —
+                                // it waits for the boundary and the respawn
+                                // picks up the stamp; a Shutdown drain keeps
+                                // the queue so the respawn delivers; an
+                                // abort in flight (or a condemned child)
+                                // must never receive another message — the
+                                // write would land in a dying process and be
+                                // lost (the 2026-08-03 aa0829b0 contract:
+                                // the queue survives to the fresh
+                                // generation); and no stdin means no wire to
+                                // write.
+                                let steerable = !mode_mismatch
+                                    && !shutting_down
+                                    && interrupted_run.is_none()
+                                    && !condemned;
+                                // claude ≥ 2.1.228 attends a mid-turn stdin
+                                // `user` message at the next tool-loop step
+                                // boundary INSIDE the running turn (probed —
+                                // `scripts/claude-steer-probe.py` re-verifies
+                                // on every pin bump), or, when the turn ends
+                                // without another boundary, runs it as its
+                                // own next turn — announced by a fresh
+                                // `init` and bracketed by the continuation-
+                                // turn arm below, attributed off the
+                                // `steered` ledger. This replaces PR #903's
+                                // debounced `control_request` abort: the
+                                // running turn is never killed to deliver
+                                // type-ahead.
+                                //
+                                // A written message cannot be recalled:
+                                // `PromptSteered` acks the durable row
+                                // (consumed-at-write — codex parity), and an
+                                // edit/dequeue of a steered id is a silent
+                                // no-op. The narrow loss window (CLI dies
+                                // after the write, before attending; upstream
+                                // #41230 keeps mid-turn messages out of the
+                                // resume JSONL) is accepted and recorded in
+                                // ADR 0052 — identical to the interactive
+                                // CLI's own semantics. A failed write falls
+                                // back to the queue.
+                                let wrote = match stdin.as_mut().filter(|_| steerable) {
+                                    Some(s) => match write_user_message(s, &text).await {
+                                        Ok(()) => true,
+                                        Err(e) => {
+                                            tracing::warn!(%prompt_id, error = %e,
+                                                "steer write failed; queueing for the turn boundary");
+                                            false
+                                        }
                                     },
-                                )
-                                .await;
-                                pending.push_back(QueuedPrompt {
-                                    prompt_id: Some(prompt_id),
-                                    text,
-                                    mode,
-                                });
-                                // Steering (ADR 0094 follow-through): a
-                                // prompt must not rot behind a long run —
-                                // prod showed 7–56 min waits behind
-                                // hour-long agentic turns. The CLI can't
-                                // redirect a running turn (ADR 0052:
-                                // "immediate steering = interrupt + queued
-                                // message"), so ARM the debounced
-                                // auto-interrupt; once the window elapses
-                                // with this entry still queued, the abort's
-                                // `result` consumes it back-to-back on the
-                                // same warm process (RunInterrupted →
-                                // RunStarted{prompt_id}). Not during a
-                                // Shutdown drain: the queue survives the
-                                // respawn and delivers there. Not on a mode
-                                // mismatch either (ADR 0107): steering
-                                // injects into the RUNNING turn under the
-                                // OLD permission mode — let the prompt queue
-                                // and the turn-boundary mismatch check
-                                // respawn into the requested mode instead.
-                                if !shutting_down && !mode_mismatch {
-                                    arm_steer(&mut steer_deadline, &interrupted_run);
+                                    None => false,
+                                };
+                                if wrote {
+                                    emit(
+                                        evt_tx,
+                                        HarnessEvent::PromptSteered {
+                                            prompt_id: prompt_id.clone(),
+                                        },
+                                    )
+                                    .await;
+                                    steered.push_back(prompt_id);
+                                } else {
+                                    // `PromptQueued` reflects the queue up
+                                    // so the web renders the editable
+                                    // composer item.
+                                    emit(
+                                        evt_tx,
+                                        HarnessEvent::PromptQueued {
+                                            prompt_id: prompt_id.clone(),
+                                            summary: Some(truncate_str(
+                                                &text,
+                                                MAX_ARGS_SUMMARY_BYTES,
+                                            )),
+                                        },
+                                    )
+                                    .await;
+                                    pending.push_back(QueuedPrompt {
+                                        prompt_id: Some(prompt_id),
+                                        text,
+                                        mode,
+                                    });
                                 }
                             }
                         }
@@ -3362,17 +3403,12 @@ mod adapter {
                             pending
                                 .retain(|q| q.prompt_id.as_deref() != Some(prompt_id.as_str()));
                             if pending.len() != before {
-                                // The dequeue emptied the queue: the reason
-                                // to steer is gone. Disarming inside the
-                                // debounce window means a queue-then-cancel
-                                // (or pull-back-to-edit) costs the running
-                                // turn nothing — the `control_request` was
-                                // never written.
-                                if pending.is_empty() {
-                                    steer_deadline = None;
-                                }
                                 emit(evt_tx, HarnessEvent::PromptDequeued { prompt_id }).await;
                             } else {
+                                // Also the STEERED shape (ADR 0052 2026-08-20
+                                // revision): a written message cannot be
+                                // recalled — the dequeue is a silent no-op,
+                                // exactly like one for a consumed prompt.
                                 tracing::debug!(%prompt_id, "dequeue for a non-queued prompt; ignoring");
                             }
                         }
@@ -3465,34 +3501,13 @@ mod adapter {
                     }
                 }
                 _ = &mut sleeper => {
-                    if steer_deadline.is_some_and(|d| Instant::now() >= d) {
-                        // The debounce elapsed. Fire the steering interrupt
-                        // only if the queue STILL wants it — a dequeue may
-                        // have emptied it (disarmed above, but re-check
-                        // defensively) and the turn may have ended on its
-                        // own (the boundary already consumed the prompt).
-                        // This MUST stay an arm of the else-chain below: the
-                        // chain's tail treats any unclaimed wake as the
-                        // max_run_secs turn deadline and KILLS claude — a
-                        // steer wake falling through would tear down the
-                        // very process it was steering (caught by CI round 2
-                        // on PR #903: the reap surfaced RunInterrupted +
-                        // Idle instead of the steered RunStarted).
-                        steer_deadline = None;
-                        if !shutting_down && interrupted_run.is_none() && !pending.is_empty() {
-                            if let Some(rid) = turn.as_ref().map(|t| t.run_id.clone()) {
-                                request_interrupt(
-                                    &rid,
-                                    &mut stdin,
-                                    &child,
-                                    &mut interrupted_run,
-                                    &mut interrupt_deadline,
-                                    &mut condemned,
-                                )
-                                .await;
-                            }
-                        }
-                    } else if interrupt_deadline.is_some_and(|d| Instant::now() >= d)
+                    // (The PR #903 steer-debounce arm lived at the head of
+                    // this else-chain; write-through steering — ADR 0052
+                    // 2026-08-20 revision — deleted it. The chain's tail
+                    // still treats any unclaimed wake as the max_run_secs
+                    // turn deadline and kills claude, so every remaining
+                    // deadline must keep an arm here.)
+                    if interrupt_deadline.is_some_and(|d| Instant::now() >= d)
                         && turn.is_some()
                     {
                         // Phase 3 fallback: the `control_request` interrupt
@@ -3702,10 +3717,16 @@ mod adapter {
     /// becomes an engram `session_event`. Reuses `max_run_secs` — the model
     /// can grind arbitrarily long once unblocked; the defer-spin never arms
     /// because the answer is in hand on the first re-fire.
+    /// `prompt_id`: the steered ledger head when this continuation is a
+    /// CLI-initiated spontaneous turn for a deferred write-through steer
+    /// (ADR 0052 2026-08-20 revision) — attributes the turn to the prompt
+    /// that caused it. `None` for background-wake and deferred-result
+    /// continuations.
     async fn start_continuation_turn(
         evt_tx: &mpsc::Sender<HarnessEvent>,
         cli: &Cli,
         current_run_id: &hook_server::CurrentRunId,
+        prompt_id: Option<String>,
     ) -> TurnState {
         let run_id = format!("run-{}", uuid::Uuid::new_v4());
         *current_run_id.lock().await = Some(run_id.clone());
@@ -3713,7 +3734,7 @@ mod adapter {
             evt_tx,
             HarnessEvent::RunStarted {
                 run_id: run_id.clone(),
-                prompt_id: None,
+                prompt_id,
                 prompt_summary: None,
             },
         )
@@ -3795,22 +3816,12 @@ mod adapter {
         stdin.flush().await
     }
 
-    /// Arm the debounced steering interrupt: the sleeper writes the actual
-    /// `control_request` once [`STEER_DEBOUNCE_MS`] elapses with the pending
-    /// queue still non-empty. No-op when already armed (one timer covers the
-    /// whole queue) or while an abort is already in flight (the boundary
-    /// re-arms after it resolves).
-    fn arm_steer(steer_deadline: &mut Option<Instant>, interrupted_run: &Option<String>) {
-        if steer_deadline.is_none() && interrupted_run.is_none() {
-            *steer_deadline = Some(Instant::now() + Duration::from_millis(STEER_DEBOUNCE_MS));
-        }
-    }
-
     /// Request an abort of the in-flight run `run_id`: mark it so the
     /// `result`/reap path closes it as interrupted, send the Phase-3
     /// `control_request` (SIGINT fallback when stdin is unavailable), and
-    /// arm the escalation grace. Shared by the operator Interrupt and the
-    /// steering type-ahead paths.
+    /// arm the escalation grace. The operator Interrupt's path (ADR 0052
+    /// 2026-08-20 revision retired the steering caller — type-ahead now
+    /// writes through instead of aborting the turn).
     ///
     /// No-op while an abort is already in flight: one outstanding
     /// interrupt reaches the next consumption boundary, and a second
@@ -6086,14 +6097,15 @@ mod adapter {
             }
         }
 
-        // Phase 1b: a prompt arriving mid-turn is QUEUED (PromptQueued),
-        // stays editable (PromptEdited) / cancellable (PromptDequeued)
-        // until the consumption boundary — whose `RunStarted` carries that
-        // prompt_id. A Dequeue after consumption is a no-op (single-writer).
-        // Steering era: queueing arms the debounced auto-interrupt, but
-        // this fake's turn (300ms) ends inside the window, so no
-        // `control_request` is ever written and the armed steer no-ops at
-        // the boundary — the queue mechanics are identical to pre-steering.
+        // Phase 1b queue mechanics, post-write-through (ADR 0052
+        // 2026-08-20 revision): the queue now holds only the shapes that
+        // must NOT steer — this test stages the mode-mismatch shape
+        // (prompts carrying `plan` against a default-mode process). A
+        // queued prompt stays editable (PromptEdited) / cancellable
+        // (PromptDequeued) until the consumption boundary; the mismatch
+        // head then condemns + respawns, and the FRESH (plan-stamped)
+        // process's first `RunStarted` carries that prompt_id. A Dequeue
+        // after consumption is a no-op (single-writer).
         #[tokio::test]
         async fn queue_holds_edits_and_consumes_type_ahead() {
             // Each turn: sleep, then one assistant line + result.
@@ -6145,7 +6157,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p2".into(),
                     text: "second".into(),
-                    mode: None,
+                    mode: Some("plan".into()),
                 })
                 .await
                 .unwrap();
@@ -6168,7 +6180,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p3".into(),
                     text: "third".into(),
-                    mode: None,
+                    mode: Some("plan".into()),
                 })
                 .await
                 .unwrap();
@@ -6187,12 +6199,13 @@ mod adapter {
                 Some(HarnessEvent::PromptDequeued { prompt_id }) if prompt_id == "p3"
             ));
 
-            // Turn 1 completes; p2 (edited) is consumed back-to-back as a
-            // new run carrying prompt_id "p2".
+            // Turn 1 completes; the boundary latches p2's `plan` mode,
+            // condemns, and respawns — the FRESH (plan-stamped) process
+            // consumes p2 (edited): its first RunStarted carries "p2".
             expect_agent_message(&mut evt_rx, "ok").await;
             let c1 = expect_run_completed(&mut evt_rx).await;
             assert_eq!(r1, c1);
-            let (r2, pid2) = expect_run_started_id(&mut evt_rx).await;
+            let (r2, pid2) = next_run_started_id(&mut evt_rx).await;
             assert_ne!(r1, r2);
             assert_eq!(pid2.as_deref(), Some("p2"), "consumed queued prompt id");
             expect_agent_message(&mut evt_rx, "ok").await;
@@ -6593,20 +6606,16 @@ mod adapter {
             }
         }
 
-        // Phase 3 regression for session ba3ae8d5: interrupting WITH a queued
-        // message must abort the turn and run the queued message on the SAME
-        // warm process — RunInterrupted then RunStarted{queued}, no respawn,
-        // and crucially NO abnormal-exit / RunCompleted{ok:false}. (The old
-        // SIGINT path respawned `--resume` into a context-less process and
-        // misread its immediate exit as a crash — the "An error occurred".)
-        //
-        // Steering era: the queued prompt ARMS the debounced auto-interrupt;
-        // the explicit Interrupt below preempts it inside the window (the
-        // armed steer later finds the queue empty and no-ops). Whichever
-        // fires first, a second `control_request` is never written — the
-        // event sequence is unchanged either way.
+        // Phase 3 regression for session ba3ae8d5, write-through era (ADR
+        // 0052 2026-08-20 revision): a mid-turn prompt is WRITTEN THROUGH
+        // (PromptSteered — the fake consumes it inside the running turn),
+        // and a subsequent operator Interrupt aborts the turn cleanly on
+        // the SAME warm process — RunInterrupted then Idle, no respawn,
+        // and crucially NO abnormal-exit / RunCompleted{ok:false}. (The
+        // old SIGINT path respawned `--resume` into a context-less
+        // process and misread its immediate exit as a crash.)
         #[tokio::test]
-        async fn interrupt_with_queued_message_steers_on_same_process() {
+        async fn interrupt_after_steered_message_aborts_cleanly_on_same_process() {
             let pidfile = temp_pidfile();
             let script = write_interrupt_aware_fake_claude(&pidfile, 0).await;
 
@@ -6637,7 +6646,8 @@ mod adapter {
             expect_agent_message(&mut evt_rx, "working").await;
             let pid_before = read_pid(&pidfile).await;
 
-            // Queue a message mid-turn, then interrupt.
+            // Steer a message mid-turn (written through, consumed by the
+            // fake inside the running turn), then interrupt.
             cmd_tx
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p2".into(),
@@ -6648,32 +6658,26 @@ mod adapter {
                 .unwrap();
             assert!(matches!(
                 evt_rx.recv().await,
-                Some(HarnessEvent::PromptQueued { prompt_id, .. }) if prompt_id == "p2"
+                Some(HarnessEvent::PromptSteered { prompt_id }) if prompt_id == "p2"
             ));
+            // The fake reads the steered line and emits inside r1 — the
+            // attended shape.
+            expect_agent_message(&mut evt_rx, "working").await;
             cmd_tx.send(HarnessCommand::Interrupt).await.unwrap();
 
-            // Turn 1 aborts cleanly...
+            // Turn 1 aborts cleanly — no crash artifact, no respawn, no
+            // RunCompleted{ok:false}; the steered content was already
+            // delivered, so the boundary goes straight to Idle.
             match evt_rx.recv().await {
                 Some(HarnessEvent::RunInterrupted { run_id }) => assert_eq!(run_id, r1),
                 other => panic!("expected RunInterrupted, got {other:?}"),
             }
-            // ...and the queued message runs as the NEXT turn — a fresh run_id
-            // carrying its prompt_id, on the same process. The very next events
-            // are RunStarted{p2} + its assistant text: no crash artifact, no
-            // RunCompleted{ok:false} ever appears (the bug).
-            let (r2, pid2) = expect_run_started_id(&mut evt_rx).await;
-            assert_ne!(r1, r2, "the steered turn gets a fresh run_id");
-            assert_eq!(
-                pid2,
-                Some("p2".to_string()),
-                "the queued prompt is consumed"
-            );
-            expect_agent_message(&mut evt_rx, "working").await;
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
 
             assert_eq!(
                 pid_before,
                 read_pid(&pidfile).await,
-                "interrupt + queued message must run on the same warm process",
+                "interrupt after a steered message must stay on the same warm process",
             );
 
             cmd_tx
@@ -6685,15 +6689,14 @@ mod adapter {
             let _ = tokio::fs::remove_file(&pidfile).await;
         }
 
-        // Steering (the ADR 0094 follow-through): a prompt arriving mid-turn
-        // AUTO-interrupts — no explicit Interrupt command anywhere — after
-        // the debounce window elapses with it still queued, and runs
-        // back-to-back on the same warm process: PromptQueued →
-        // RunInterrupted{r1} → RunStarted{p2}, PID unchanged. This is the fix
-        // for type-ahead rotting behind a long agentic run (prod sessions
-        // waited 7–56 min for the running turn's result before this).
+        // Write-through steering (ADR 0052 2026-08-20 revision): a prompt
+        // arriving mid-turn is written straight to claude's stdin —
+        // PromptSteered, its content delivered INSIDE the running turn —
+        // and the turn is NEVER aborted: no RunInterrupted, no respawn,
+        // PID unchanged. This replaces PR #903's debounced auto-interrupt
+        // (which killed the running turn to deliver type-ahead).
         #[tokio::test]
-        async fn mid_turn_prompt_auto_steers_without_explicit_interrupt() {
+        async fn mid_turn_prompt_writes_through_and_the_turn_survives() {
             let pidfile = temp_pidfile();
             let script = write_interrupt_aware_fake_claude(&pidfile, 0).await;
 
@@ -6731,20 +6734,23 @@ mod adapter {
                 .unwrap();
             assert!(matches!(
                 evt_rx.recv().await,
-                Some(HarnessEvent::PromptQueued { prompt_id, .. }) if prompt_id == "p2"
+                Some(HarnessEvent::PromptSteered { prompt_id }) if prompt_id == "p2"
             ));
-            match evt_rx.recv().await {
-                Some(HarnessEvent::RunInterrupted { run_id }) => assert_eq!(run_id, r1),
-                other => panic!("expected RunInterrupted, got {other:?}"),
-            }
-            let (r2, pid2) = expect_run_started_id(&mut evt_rx).await;
-            assert_ne!(r1, r2, "the steered turn gets a fresh run_id");
-            assert_eq!(pid2.as_deref(), Some("p2"), "the queued prompt is consumed");
+            // The fake consumes the steered line inside r1 (attended
+            // shape) — same run, no interrupt, and then NOTHING: the
+            // running turn survives untouched. (`r1` stays the open run;
+            // the silence below is what proves no abort was written —
+            // this fake answers any control frame instantly.)
             expect_agent_message(&mut evt_rx, "working").await;
+            let quiet = tokio::time::timeout(Duration::from_millis(500), evt_rx.recv()).await;
+            assert!(
+                quiet.is_err(),
+                "write-through must not abort run {r1}, got {quiet:?}",
+            );
             assert_eq!(
                 pid_before,
                 read_pid(&pidfile).await,
-                "steering must run on the same warm process",
+                "write-through must land on the same warm process",
             );
 
             cmd_tx
@@ -6756,15 +6762,13 @@ mod adapter {
             let _ = tokio::fs::remove_file(&pidfile).await;
         }
 
-        // The steering invariant: queue non-empty ⇒ a steer is armed. Two
-        // prompts stacked mid-turn steer SEQUENTIALLY: both queue inside
-        // one debounce window (a single timer covers the queue), and the
-        // consumption boundary re-arms against the first steered run — the
-        // tail never waits out a full run. The fake also delays its abort
-        // 300ms for realism (the abort is in flight while the queue holds
-        // both prompts).
+        // Stacked type-ahead under write-through (ADR 0052 2026-08-20
+        // revision): both prompts write straight to claude's stdin in
+        // send order — two PromptSteered events, their content delivered
+        // inside the running turn by the single-threaded fake, no
+        // interrupt anywhere, one warm process.
         #[tokio::test]
-        async fn stacked_type_ahead_steers_each_boundary() {
+        async fn stacked_type_ahead_writes_through_in_order() {
             let pidfile = temp_pidfile();
             let script = write_interrupt_aware_fake_claude(&pidfile, 300).await;
 
@@ -6791,7 +6795,7 @@ mod adapter {
             expect_agent_message(&mut evt_rx, "working").await;
             let pid_before = read_pid(&pidfile).await;
 
-            // Both land inside the fake's 300ms abort delay.
+            // Both write through, in send order.
             cmd_tx
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p2".into(),
@@ -6802,7 +6806,7 @@ mod adapter {
                 .unwrap();
             assert!(matches!(
                 evt_rx.recv().await,
-                Some(HarnessEvent::PromptQueued { prompt_id, .. }) if prompt_id == "p2"
+                Some(HarnessEvent::PromptSteered { prompt_id }) if prompt_id == "p2"
             ));
             cmd_tx
                 .send(HarnessCommand::Prompt {
@@ -6814,33 +6818,24 @@ mod adapter {
                 .unwrap();
             assert!(matches!(
                 evt_rx.recv().await,
-                Some(HarnessEvent::PromptQueued { prompt_id, .. }) if prompt_id == "p3"
+                Some(HarnessEvent::PromptSteered { prompt_id }) if prompt_id == "p3"
             ));
 
-            // Boundary 1: r1 aborts, p2 starts — and because p3 is still
-            // queued, the engine re-arms the interrupt against p2's run.
-            match evt_rx.recv().await {
-                Some(HarnessEvent::RunInterrupted { run_id }) => assert_eq!(run_id, r1),
-                other => panic!("expected RunInterrupted(r1), got {other:?}"),
-            }
-            let (r2, pid2) = expect_run_started_id(&mut evt_rx).await;
-            assert_eq!(pid2.as_deref(), Some("p2"));
+            // The fake (single-threaded, 300ms per line) consumes both
+            // inside r1, in stdin order — no interrupt is ever written,
+            // no run boundary appears.
             expect_agent_message(&mut evt_rx, "working").await;
-
-            // Boundary 2: p2's run aborts in turn, p3 starts.
-            match evt_rx.recv().await {
-                Some(HarnessEvent::RunInterrupted { run_id }) => assert_eq!(run_id, r2),
-                other => panic!("expected RunInterrupted(r2), got {other:?}"),
-            }
-            let (r3, pid3) = expect_run_started_id(&mut evt_rx).await;
-            assert_eq!(pid3.as_deref(), Some("p3"));
-            assert_ne!(r2, r3);
             expect_agent_message(&mut evt_rx, "working").await;
+            let quiet = tokio::time::timeout(Duration::from_millis(500), evt_rx.recv()).await;
+            assert!(
+                quiet.is_err(),
+                "stacked write-through must not abort run {r1}, got {quiet:?}",
+            );
 
             assert_eq!(
                 pid_before,
                 read_pid(&pidfile).await,
-                "the whole steer chain must stay on one warm process",
+                "the whole write-through chain must stay on one warm process",
             );
 
             cmd_tx
@@ -6852,16 +6847,16 @@ mod adapter {
             let _ = tokio::fs::remove_file(&pidfile).await;
         }
 
-        // The steer→completion race: the turn's own `result` (success) beats
-        // the abort — claude then reads the stale `control_request` between
-        // turns and acks it as a no-op. The raced run must close as
-        // RunCompleted (an interrupt that never landed must not falsify a
-        // fully delivered completion) and the steered prompt still runs
-        // next, on the same process. The fake's turn (2s) outlasts the
-        // debounce (1s) so the control frame IS written, then loses the
-        // race to the result.
+        // The DEFERRED write-through shape (ADR 0052 2026-08-20 revision;
+        // probed on 2.1.228): the steered message lands too late for the
+        // running turn (no step boundary remains — this fake, like the
+        // CLI, finishes the turn it is on), so the CLI runs it as its own
+        // SPONTANEOUS next turn. The harness closes r1 as RunCompleted
+        // (nothing was aborted), and the continuation-turn bracket
+        // attributes the spontaneous turn to the steered ledger head:
+        // RunStarted{p2} with no harness-side stdin write.
         #[tokio::test]
-        async fn steer_raced_by_completion_reports_run_completed() {
+        async fn deferred_steer_runs_as_a_spontaneous_turn_with_attribution() {
             let script = write_slow_fake_claude(
                 &[
                     r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"ok"}]}}"#,
@@ -6892,7 +6887,8 @@ mod adapter {
                 .unwrap();
             let r1 = expect_run_started(&mut evt_rx).await;
 
-            // Steer lands mid-sleep; the fake completes the turn anyway.
+            // The steer lands mid-sleep; the fake completes the turn
+            // anyway (the deferred shape).
             cmd_tx
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p2".into(),
@@ -6903,19 +6899,28 @@ mod adapter {
                 .unwrap();
             assert!(matches!(
                 evt_rx.recv().await,
-                Some(HarnessEvent::PromptQueued { prompt_id, .. }) if prompt_id == "p2"
+                Some(HarnessEvent::PromptSteered { prompt_id }) if prompt_id == "p2"
             ));
 
-            // r1 closes as COMPLETED — the marker (subtype success) wins
-            // over the requested-but-never-landed abort.
+            // r1 closes as COMPLETED — nothing was aborted.
             expect_agent_message(&mut evt_rx, "ok").await;
             let c1 = expect_run_completed(&mut evt_rx).await;
-            assert_eq!(r1, c1, "a raced steer must not relabel a completed run");
+            assert_eq!(r1, c1, "write-through must not relabel a completed run");
+            // The boundary sees an empty queue and announces Idle; the
+            // spontaneous turn for the deferred steer follows ~sleep
+            // later and re-opens the session (a legal Idle→RunStarted
+            // flap — eviction operates on minutes).
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
 
-            // The steered prompt still consumes back-to-back.
-            let (r2, pid2) = expect_run_started_id(&mut evt_rx).await;
+            // The spontaneous turn is bracketed as a continuation and
+            // ATTRIBUTED to the steered ledger head — no harness write.
+            let (r2, pid2) = next_run_started_id(&mut evt_rx).await;
             assert_ne!(r1, r2);
-            assert_eq!(pid2.as_deref(), Some("p2"));
+            assert_eq!(
+                pid2.as_deref(),
+                Some("p2"),
+                "the spontaneous turn carries the steered prompt_id",
+            );
             expect_agent_message(&mut evt_rx, "ok").await;
             let c2 = expect_run_completed(&mut evt_rx).await;
             assert_eq!(r2, c2);
@@ -6932,14 +6937,14 @@ mod adapter {
             let _ = tokio::fs::remove_file(&script).await;
         }
 
-        // PR #903 review finding: a `control_request`, once written, cannot
-        // be recalled — so the steer is DEBOUNCED and a dequeue that empties
-        // the queue inside the window disarms it. Queue-then-cancel (the
-        // "oops, wrong prompt" pattern, and pull-back-to-edit which also
-        // dequeues) must cost the running turn nothing: no RunInterrupted
-        // ever appears, the turn keeps running.
+        // Write-through era (ADR 0052 2026-08-20 revision): a WRITTEN
+        // message cannot be recalled — a dequeue of a steered id is a
+        // silent no-op (no PromptDequeued), and the running turn is never
+        // touched: no RunInterrupted, no control frame (this fake aborts
+        // instantly on any control frame, so silence proves none was
+        // written).
         #[tokio::test]
-        async fn dequeue_within_debounce_never_interrupts_the_run() {
+        async fn dequeue_of_a_steered_prompt_is_a_silent_no_op() {
             let pidfile = temp_pidfile();
             let script = write_interrupt_aware_fake_claude(&pidfile, 0).await;
 
@@ -6965,7 +6970,7 @@ mod adapter {
             let _r1 = expect_run_started(&mut evt_rx).await;
             expect_agent_message(&mut evt_rx, "working").await;
 
-            // Queue, then cancel inside the debounce window.
+            // Steer, then try to cancel — the write already happened.
             cmd_tx
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p2".into(),
@@ -6976,29 +6981,23 @@ mod adapter {
                 .unwrap();
             assert!(matches!(
                 evt_rx.recv().await,
-                Some(HarnessEvent::PromptQueued { prompt_id, .. }) if prompt_id == "p2"
+                Some(HarnessEvent::PromptSteered { prompt_id }) if prompt_id == "p2"
             ));
+            // The fake consumes the steered line inside r1.
+            expect_agent_message(&mut evt_rx, "working").await;
             cmd_tx
                 .send(HarnessCommand::DequeueQueued {
                     prompt_id: "p2".into(),
                 })
                 .await
                 .unwrap();
-            assert!(matches!(
-                evt_rx.recv().await,
-                Some(HarnessEvent::PromptDequeued { prompt_id }) if prompt_id == "p2"
-            ));
 
-            // Well past the debounce: the turn must still be running —
-            // no RunInterrupted (or anything else) may surface. The fake
-            // aborts instantly on any control frame, so silence here proves
-            // the frame was never written.
-            let quiet =
-                tokio::time::timeout(Duration::from_millis(3 * STEER_DEBOUNCE_MS), evt_rx.recv())
-                    .await;
+            // No PromptDequeued (the id is not queued — it was written),
+            // no RunInterrupted, nothing: the running turn is untouched.
+            let quiet = tokio::time::timeout(Duration::from_millis(1_500), evt_rx.recv()).await;
             assert!(
                 quiet.is_err(),
-                "cancelled steer must not touch the running turn, got {quiet:?}",
+                "a dequeue of a steered prompt must be a silent no-op, got {quiet:?}",
             );
 
             cmd_tx
