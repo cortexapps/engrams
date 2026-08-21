@@ -56,6 +56,34 @@ describe("evaluateCode — values and contract", () => {
     if (!undef.ok) expect(undef.error.message).toContain("undefined");
   });
 
+  test("async default exports are a clear ContractError, never a silent {}", async () => {
+    // JSON.stringify(<Promise>) is "{}"; without the thenable guard an async
+    // export would succeed with a silently wrong empty object.
+    const asyncValue = await evaluateCode(
+      `export default async ({ n }) => ({ total: n * 2 });`,
+      { inputs: { n: 2 } },
+      "value",
+    );
+    expect(asyncValue.ok).toBe(false);
+    if (!asyncValue.ok) {
+      expect(asyncValue.error.name).toBe("ContractError");
+      expect(asyncValue.error.message).toContain("async code is not supported");
+    }
+
+    const asyncBool = await evaluateCode(`export default async () => true;`, {}, "boolean");
+    expect(asyncBool.ok).toBe(false);
+    if (!asyncBool.ok) expect(asyncBool.error.message).toContain("async code is not supported");
+
+    // A hand-rolled thenable is caught the same way.
+    const thenable = await evaluateCode(
+      `export default () => ({ then: (resolve) => resolve(1) });`,
+      {},
+      "value",
+    );
+    expect(thenable.ok).toBe(false);
+    if (!thenable.ok) expect(thenable.error.name).toBe("ContractError");
+  });
+
   test("syntax errors surface with name and message", async () => {
     const result = await evaluateCode(`export default ({) => 1;`, {}, "value");
     expect(result.ok).toBe(false);

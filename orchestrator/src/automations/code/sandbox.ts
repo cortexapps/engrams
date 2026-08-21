@@ -102,6 +102,12 @@ const GUEST_DRIVER = `
   }
   const r = globalThis.__default(globalThis.__ctx);
   if (r === undefined) throw contract("code returned undefined; return a JSON value");
+  if (r !== null && (typeof r === "object" || typeof r === "function") && typeof r.then === "function") {
+    // An async default export returns a Promise, which JSON.stringify would
+    // silently serialize as "{}". Reject it with a clear contract error; the
+    // sandbox is synchronous by design (no job-queue drain).
+    throw contract("async code is not supported; return a JSON value, not a Promise");
+  }
   const s = JSON.stringify(r);
   if (s === undefined) throw contract("result is not JSON-serializable");
   if (s.length > ${CODE_OUTPUT_MAX_BYTES}) {
