@@ -62,11 +62,22 @@ describe("validateDefinition", () => {
   });
 
   test("system block types are builtin-only", () => {
-    const raw = def({ blocks: [{ id: "x", type: "system.review_policy_gate", config: {} }] } as never);
+    const raw = def({
+      blocks: [{ id: "x", type: "system.review_policy_gate", config: { reviewId: "r-1" } }],
+    } as never);
     expect(() => validateDefinition(raw, { kind: "user" })).toThrow(/reserved for built-in/);
-    // Still unknown for builtins until phase 4 registers it — but the gate
-    // fires first for users, and builtins get the unknown-type error.
-    expect(() => validateDefinition(raw, { kind: "builtin" })).toThrow(/unknown block type/);
+    // A built-in may reference it (phase 4.2 registers the review blocks),
+    // and its config schema is enforced like any other block's.
+    expect(validateDefinition(raw, { kind: "builtin" }).blocks[0]!.type).toBe(
+      "system.review_policy_gate",
+    );
+    const badConfig = def({
+      blocks: [{ id: "x", type: "system.review_policy_gate", config: {} }],
+    } as never);
+    expect(() => validateDefinition(badConfig, { kind: "builtin" })).toThrow(DefinitionError);
+    // An unregistered system type is still unknown for a built-in.
+    const unknown = def({ blocks: [{ id: "x", type: "system.not_a_thing", config: {} }] } as never);
+    expect(() => validateDefinition(unknown, { kind: "builtin" })).toThrow(/unknown block type/);
   });
 
   test("rejects invalid Liquid templates with the offending field", () => {
