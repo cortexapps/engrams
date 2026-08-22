@@ -773,6 +773,21 @@ describe("SpecDocumentService", () => {
     expect(store.updates.get(SPEC_ID)).toHaveLength(1);
   });
 
+  // Creating a spec writes every template section in one update. Those
+  // sections are "changed" but empty, and an empty section is not a proposal
+  // waiting for review — so the effects must say which ones actually hold
+  // something.
+  test("a freshly seeded document reports every section as changed but empty", async () => {
+    const store = new MemoryDocumentStore();
+    await seededService(store);
+
+    const sections = store.lastEffects?.sections ?? [];
+    expect(sections.length).toBeGreaterThan(0);
+    expect(sections.map(({ changed, hasBody }) => ({ changed, hasBody }))).toEqual(
+      sections.map(() => ({ changed: true, hasBody: false })),
+    );
+  });
+
   test("central validation reports only the sections changed by a client update", async () => {
     const store = new MemoryDocumentStore();
     const service = await seededService(store);
@@ -784,7 +799,7 @@ describe("SpecDocumentService", () => {
     );
 
     expect(store.lastEffects?.sections.filter((section) => section.changed)).toEqual([
-      { id: "context", title: "Context", changed: true },
+      { id: "context", title: "Context", changed: true, hasBody: true },
     ]);
   });
 
@@ -1609,6 +1624,36 @@ describe("SpecDocumentService with live Postgres", () => {
     expect(checkpoints.at(-1)?.label).toBe("Checkpoint 6");
   });
 
+  // The agent drafts most of a spec, and its writes carry a client id that
+  // resolves to no participant row. Proposing was once gated on a resolved
+  // human actor, so an agent-drafted section stayed `open` however much prose
+  // it held — and `open` renders no Keep control, so nobody could settle it.
+  test.skipIf(!liveDbReachable)("an agent edit proposes the section it wrote", async () => {
+    if (!livePool) throw new Error("The live Postgres pool is not available");
+    const at = new Date("2026-08-09T12:02:00.000Z");
+    const seeded = new SpecDocumentService(new PostgresSpecDocumentStore(livePool), {
+      now: () => at,
+    });
+    await seeded.applyUpdate(specId, initialUpdate(), "seed");
+    const agentUpdate = clientInsert(
+      Y.encodeStateAsUpdate((await seeded.loadDoc(specId)).doc),
+      0,
+      "agent draft",
+    );
+
+    await seeded.applyUpdate(specId, agentUpdate, `agent:${randomUUID()}:${randomUUID()}`);
+
+    const committed = await livePool.query<{ state: string; actor_user_id: string | null }>(
+      `SELECT st.state, a.actor_user_id
+         FROM spec_section_state st
+         JOIN spec_transcript_action a
+           ON a.spec_id = st.spec_id AND a.section_id = st.section_id
+        WHERE st.spec_id = $1 AND st.section_id = 'context'`,
+      [specId],
+    );
+    expect(committed.rows[0]).toEqual({ state: "proposed", actor_user_id: null });
+  });
+
   test.skipIf(!liveDbReachable)(
     "a human edit commits its update, proposed state, and transcript action atomically",
     async () => {
@@ -1662,7 +1707,7 @@ describe("SpecDocumentService with live Postgres", () => {
       });
       const stored = await documents.applyUpdate(specId, humanUpdate, humanClientId);
       expect(stored.seq).toBe(2n);
-      const actionId = `human-edit:${specId}:2:context`;
+      const actionId = `section-edit:${specId}:2:context`;
       const committed = await livePool.query<{
         state: string;
         action_id: string;

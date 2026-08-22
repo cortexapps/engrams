@@ -154,6 +154,40 @@ export function findSection(doc: ProseMirrorNode, sectionId: string): LocatedSec
   return found;
 }
 
+/**
+ * Whether a section shows a reader anything past its heading.
+ *
+ * Prose is visible to a text scan; an atom is not. A diagram block carries no
+ * text at all, so a section holding only a diagram reads as complete and
+ * measures as empty — which would leave it `open`, with no control to settle
+ * it and no way to publish the spec. Testing the atom rather than a list of
+ * node names keeps a future atom from reintroducing that.
+ *
+ * The browser's "Nothing here yet" and the orchestrator's proposal gate both
+ * read this, so the two cannot disagree about whether a section was drafted.
+ */
+export function sectionHasBody(section: ProseMirrorNode): boolean {
+  let hasBody = false;
+  section.forEach((block, _offset, index) => {
+    if (index === 0 || hasBody) return; // index 0 is the section heading
+    if (carriesBody(block)) {
+      hasBody = true;
+      return;
+    }
+    // A diagram nested in a list item is still a drafted section.
+    block.descendants((node) => {
+      if (carriesBody(node)) hasBody = true;
+      return !hasBody;
+    });
+  });
+  return hasBody;
+}
+
+function carriesBody(node: ProseMirrorNode): boolean {
+  if (node.isText) return (node.text ?? "").trim().length > 0;
+  return node.type.isAtom || node.textContent.trim().length > 0;
+}
+
 export function replaceSection(
   doc: ProseMirrorNode,
   sectionId: string,

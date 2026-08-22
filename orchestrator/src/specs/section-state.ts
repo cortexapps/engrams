@@ -125,10 +125,14 @@ export function transitionSectionState(
 }
 
 /**
- * Apply a human document edit. A first edit proposes an open section. An edit
- * also proposes settled or n/a content because the old decision is stale.
+ * Apply a document edit. A first edit proposes an open section. An edit also
+ * proposes settled or n/a content because the old decision is stale.
+ *
+ * This is a property of the content changing, not of who changed it: the agent
+ * drafts most sections, and a draft nobody has marked `proposed` shows the
+ * reader no Keep control and never counts toward the spec being settled.
  */
-export function applyHumanSectionEdit(
+export function applySectionEdit(
   current: SectionStateValue,
   context: SectionStateContext,
 ): SectionStateChange | null {

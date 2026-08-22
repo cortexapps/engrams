@@ -1,7 +1,6 @@
 import type { Pool, PoolClient } from "pg";
 
 import {
-  applyHumanSectionEdit,
   applySectionStateUndo,
   transitionSectionState,
   type RestoreSectionStateUndo,
@@ -147,23 +146,6 @@ export class SectionStateService {
     );
     if (!change) throw new Error("A section transition did not change the state.");
     return change;
-  }
-
-  /** Records an accepted document edit with the edit event's stable action ID. */
-  recordHumanEdit(input: {
-    actionId: string;
-    context: SectionStateContext;
-    actorUserId: string;
-    expectedDocSeq?: bigint;
-  }): Promise<SectionStateChange | null> {
-    return this.execute(
-      input.actionId,
-      humanEditRequestFingerprint(input.actorUserId, input.expectedDocSeq),
-      input.context,
-      input.actorUserId,
-      input.expectedDocSeq,
-      (current) => applyHumanSectionEdit(current, input.context),
-    );
   }
 
   async undo(input: {
@@ -536,9 +518,12 @@ function fingerprint(value: object): string {
   return JSON.stringify(canonicalValue(value));
 }
 
-export function humanEditRequestFingerprint(actorUserId: string, expectedDocSeq?: bigint): string {
+export function sectionEditRequestFingerprint(
+  actorUserId: string | null,
+  expectedDocSeq?: bigint,
+): string {
   return fingerprint({
-    kind: "human_edit",
+    kind: "section_edit",
     actorUserId,
     expectedDocSeq: expectedDocSeq?.toString() ?? null,
   });
