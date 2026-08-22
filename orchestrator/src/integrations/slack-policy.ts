@@ -26,6 +26,7 @@ import {
   buildMessageBlocks,
   buildProfilePickerBlocks,
   buildProfileChosenBlocks,
+  type ThreadRoute,
 } from "./slack-blocks.ts";
 import { summarizeAsset, type CommunicationPolicy, type StartedSession } from "../workflows/communication-policy.ts";
 import type { SourceMention } from "../workflows/thread-inbox.ts";
@@ -93,6 +94,9 @@ export type FetchArtifactFn = (sessionId: string, artifactId: string) => Promise
 
 export interface SlackPolicyDeps {
   client?: () => Promise<SlackPolicyClient>;
+  /** Extra route fields stamped into every Block Kit value this policy posts
+   * (the automation relay sets `{runId}` so answers route to its run). */
+  routeExtras?: Partial<Pick<ThreadRoute, "runId">>;
   /** The bot's own user id, so its `<@bot>` mention is stripped from prompts.
    *  Optional: when unset, all `<@…>` mentions are stripped. */
   botUserId?: string;
@@ -215,10 +219,11 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
     deps.fetchArtifact ??
     ((sessionId, artifactId) => fetchArtifactBytes(sessionId, artifactId, MAX_SLACK_UPLOAD_BYTES));
 
-  const route = (m: SourceMention) => ({
+  const route = (m: SourceMention): ThreadRoute => ({
     team: m.team,
     channel: m.channel,
     threadRoot: m.threadRoot,
+    ...(deps.routeExtras ?? {}),
   });
 
   /** React on the mention; best-effort (a replayed/duplicate add must not wedge

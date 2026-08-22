@@ -23,6 +23,13 @@
  *   - finalize hooks (contract 2): for a run ending in a hook's `when`, the
  *     hook block runs as `step:__finalize__.<blockId>:0` BEFORE the finalize
  *     step, in definition order; outcomes never change the terminal status;
+ *   - installed message handlers (contract 3): a block whose executor has
+ *     `onMessage` is INSTALLED once its execute step succeeds; from then until
+ *     the run ends, every received mailbox message is offered to it first —
+ *     inside `step:<relayPath>.__relay__:<n>` (n = per-relay counter, a pure
+ *     function of the recv sequence) — BEFORE stop/supersede handling and the
+ *     active wait's matcher. "consumed" swallows the message. At most one
+ *     installed handler per run (validation);
  *   - finalize runs exactly once, from every exit path.
  */
 
@@ -38,6 +45,7 @@ import {
   clockStepName,
   conditionStepName,
   framePath,
+  relayStepName,
   stepName,
   untilStepName,
   FINALIZE_STEP,
@@ -186,6 +194,32 @@ export async function interpretAutomation(
   const ledger: TurnLedger = { started: new Map(), idleSeen: new Map() };
   /** Sessions an end_session block already ended (see finalize). */
   const endedByBlock = new Set<string>();
+  /** The one installed message handler (contract 3), once its block ran. */
+  let installed:
+    | { path: string; executor: BlockExecutor<never>; config: never; count: number }
+    | null = null;
+
+  /** Offer a fresh message to the installed handler (if any) inside its own
+   * checkpointed step. Returns true when the handler consumed it. */
+  const offerToInstalled = async (msg: AutomationInbox): Promise<boolean> => {
+    if (installed === null) return false;
+    const relay = installed;
+    relay.count += 1;
+    const verdict = await deps.step(async () => {
+      try {
+        return await relay.executor.onMessage!(msg, relay.config, ctx);
+      } catch (error) {
+        // A relay's delivery failure is recorded on its step and never fails
+        // the run (the legacy thread loop's "drop it, keep the thread alive").
+        await deps.store.recordStep(input.runId, `${relay.path}.__relay__`, relay.count, {
+          status: "failed",
+          error: errorMessage(error),
+        });
+        return "pass" as const;
+      }
+    }, relayStepName(relay.path, relay.count));
+    return verdict === "consumed";
+  };
 
   /** Stamp a freshly received message with its turn bookkeeping. */
   const annotate = (msg: AutomationInbox): BufferedEntry => {
@@ -285,6 +319,10 @@ export async function interpretAutomation(
           }
           return null;
         }
+        continue;
+      }
+      if (await offerToInstalled(msg)) {
+        await checkpointClock(frames);
         continue;
       }
       const entry = annotate(msg);
@@ -454,6 +492,22 @@ export async function interpretAutomation(
 
       recordStepOutputs(ctx, block.id, path, outcome.outputs);
       lastError = null;
+
+      // Contract 3: a block with an onMessage handler is installed for the
+      // rest of the run once its execute step succeeded. Validation allows
+      // one per definition, so a second install is an engine invariant.
+      if (executor.onMessage) {
+        if (installed !== null && installed.executor !== executor) {
+          throw new RunEnd("failed", `block "${block.id}": a message handler is already installed`);
+        }
+        if (installed === null) {
+          installed = { path, executor, config: block.config as never, count: 0 };
+        } else {
+          // The same block re-executed (e.g. a loop body re-pointing a relay
+          // at a new turn): refresh its config, keep the counter.
+          installed.config = block.config as never;
+        }
+      }
 
       // Turn ledger: count the prompts this run sends per session, from
       // checkpointed step outputs only (replay-deterministic).

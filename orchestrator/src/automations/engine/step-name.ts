@@ -37,3 +37,8 @@ export function untilStepName(frames: readonly Frame[], iteration: number): stri
 export function clockStepName(frames: readonly Frame[], n: number): string {
   return `step:${framePath(frames)}:clock:${n}`;
 }
+
+/** An installed message handler's n-th invocation (contract 3). */
+export function relayStepName(relayPath: string, n: number): string {
+  return `step:${relayPath}.__relay__:${n}`;
+}

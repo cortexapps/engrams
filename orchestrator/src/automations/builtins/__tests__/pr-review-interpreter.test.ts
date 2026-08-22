@@ -206,6 +206,7 @@ function harness(options: {
       runSessions.push({ sessionId: id, keep: input.keep });
       return { sessionId: id, taskId: `t-${input.role}` };
     },
+    async setSessionRelay() {},
     async sendPrompt(sessionId, _promptId, text) {
       prompts.push({ sessionId, text });
     },

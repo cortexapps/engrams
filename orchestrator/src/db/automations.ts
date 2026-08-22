@@ -351,7 +351,11 @@ export interface AutomationEngineStore extends EngineRunStore {
     prompt: string;
     title: string | null;
   }): Promise<void>;
-  findSessionBinding(sessionId: string): Promise<{ runId: string; blockId: string; role: string } | null>;
+  findSessionBinding(
+    sessionId: string,
+  ): Promise<{ runId: string; blockId: string; role: string; relay: boolean } | null>;
+  /** Flip curated-event forwarding for a bound session (the relay block). */
+  setSessionRelay(sessionId: string, relay: boolean): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1483,11 +1487,19 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
           runId: automationSessionTable.runId,
           blockId: automationSessionTable.blockId,
           role: automationSessionTable.role,
+          relay: automationSessionTable.relay,
         })
         .from(automationSessionTable)
         .where(eq(automationSessionTable.sessionId, sessionId))
         .limit(1);
       return row ?? null;
+    },
+
+    async setSessionRelay(sessionId, relay) {
+      await db
+        .update(automationSessionTable)
+        .set({ relay })
+        .where(eq(automationSessionTable.sessionId, sessionId));
     },
   };
 }

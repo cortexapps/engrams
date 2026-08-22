@@ -54,6 +54,7 @@ function fakeEngineStore(overrides: Partial<AutomationEngineStore> = {}): Automa
     },
     async recordSessionBinding() {},
     async recordRunLaunch() {},
+    async setSessionRelay() {},
     async findSessionBinding() {
       return null;
     },
@@ -79,6 +80,7 @@ describe("automationRunWorkflowImpl", () => {
       store,
       sessions: {
         createSession: async () => ({ sessionId: "s", taskId: "t" }),
+        setSessionRelay: async () => {},
         sendPrompt: async () => {},
         endSession: async () => {},
         exec: async () => ({ exitStatus: 0, stdout: "", stderr: "" }),

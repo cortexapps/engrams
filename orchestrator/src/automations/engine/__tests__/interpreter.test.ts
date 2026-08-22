@@ -115,6 +115,7 @@ function makeHarness(
       runSessions.push({ sessionId, keep: input.keep });
       return { sessionId, taskId: `t-${input.blockId}` };
     },
+    async setSessionRelay() {},
     async sendPrompt(sessionId, promptId, text) {
       prompts.push({ sessionId, promptId, text });
     },
@@ -164,7 +165,7 @@ const RUN = { runId: "autorun:auto-1:manual:x", automationId: "auto-1" };
 
 // ---------------------------------------------------------------------------
 
-describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 2)", () => {
+describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 3)", () => {
   test("linear graph: filter → create_session → send_prompt(wait) → end_session", async () => {
     const definition = makeDefinition([
       {
@@ -699,5 +700,127 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
     const result = await interpretAutomation(RUN, h.deps);
     expect(result.status).toBe("failed");
     expect(result.error).toContain("code_runtime_unavailable");
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Contract 3: installed message handlers
+// ---------------------------------------------------------------------------
+
+import { z } from "zod";
+import { registerBlock, unregisterBlockForTest } from "../blocks/registry.ts";
+
+describe("interpretAutomation — installed message handlers (contract 3)", () => {
+  const TYPE = "system.test_relay";
+
+  const relayDefinition = (config: Record<string, unknown>): AutomationDefinition => ({
+    engine: 1,
+    trigger: { kind: "manual" },
+    blocks: [
+      { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },
+      { id: "relay", type: TYPE, config },
+      {
+        id: "turn",
+        type: "send_prompt",
+        config: {
+          session: { blockId: "launch" },
+          promptTemplate: "ping",
+          waitFor: { kind: "run_end" },
+          deadlineSeconds: 600,
+        },
+      },
+    ],
+    inputsSchema: [],
+    settings: { endSessionsOnFinish: false },
+  });
+
+  test("every message after install is offered to the handler first, in its own step; consumed ones never reach the wait", async () => {
+    const seen: AutomationInbox[] = [];
+    registerBlock<{ consume: string[] }>({
+      type: TYPE,
+      system: true,
+      configSchema: z.object({ consume: z.array(z.string()) }),
+      async execute() {
+        return { kind: "ok", outputs: { installed: true } };
+      },
+      async onMessage(msg, config) {
+        seen.push(msg);
+        return config.consume.includes(msg.kind) ? "consumed" : "pass";
+      },
+    });
+    try {
+      // Two curated events (consumed by the relay) interleave with the two
+      // idles the wait needs (create turn = stale, prompt turn = match).
+      const curated = (n: number): AutomationInbox => ({
+        kind: "session_event",
+        sessionId: "s-launch",
+        event: { idx: BigInt(n), kind: "agent_message", payloadJson: "{}" },
+      });
+      const h = makeHarness(relayDefinition({ consume: ["session_event"] }), {
+        recv: [
+          curated(1),
+          { kind: "session_idle", sessionId: "s-launch" },
+          curated(2),
+          { kind: "session_idle", sessionId: "s-launch" },
+        ],
+      });
+      const result = await interpretAutomation(RUN, h.deps);
+      expect(result.status).toBe("completed");
+      expect(h.names).toEqual([
+        "step:__snapshot__:0",
+        "step:launch:0",
+        "step:relay:0",
+        "step:turn:0",
+        "step:relay.__relay__:1",
+        "step:turn:clock:1",
+        "step:relay.__relay__:2",
+        "step:turn:clock:2",
+        "step:relay.__relay__:3",
+        "step:turn:clock:3",
+        "step:relay.__relay__:4",
+        "step:turn:0:wait",
+        "step:__finalize__:0",
+      ]);
+      // The handler saw all four; it consumed the curated two and passed the
+      // idles through to the wait (stale first, then the match).
+      expect(seen.map((m) => m.kind)).toEqual([
+        "session_event",
+        "session_idle",
+        "session_event",
+        "session_idle",
+      ]);
+    } finally {
+      unregisterBlockForTest(TYPE);
+    }
+  });
+
+  test("a throwing handler is recorded on its relay step and never fails the run", async () => {
+    registerBlock<Record<string, never>>({
+      type: TYPE,
+      system: true,
+      configSchema: z.object({}),
+      async execute() {
+        return { kind: "ok", outputs: {} };
+      },
+      async onMessage() {
+        throw new Error("slack exploded");
+      },
+    });
+    try {
+      const h = makeHarness(relayDefinition({}), {
+        recv: [
+          { kind: "session_idle", sessionId: "s-launch" },
+          { kind: "session_idle", sessionId: "s-launch" },
+        ],
+      });
+      const result = await interpretAutomation(RUN, h.deps);
+      expect(result.status).toBe("completed");
+      const relayRows = h.stepRecords.filter((r) => r.framePath === "relay.__relay__");
+      expect(relayRows.length).toBe(2);
+      expect(relayRows.every((r) => r.record.status === "failed")).toBe(true);
+    } finally {
+      unregisterBlockForTest(TYPE);
+    }
   });
 });

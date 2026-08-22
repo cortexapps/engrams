@@ -51,6 +51,7 @@ function makeDeps(blocks: BlockDef[], payload?: Record<string, unknown>) {
     async createSession() {
       throw new Error("unused");
     },
+    async setSessionRelay() {},
     async sendPrompt() {},
     async endSession() {},
     async exec() {

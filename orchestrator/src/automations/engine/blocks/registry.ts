@@ -44,6 +44,18 @@ export interface BlockExecutor<C = unknown> {
   /** When true the interpreter refuses to run the block without a resolvable
    * session (config carries a SessionRef). */
   requiresSession?: boolean;
+  /** Installed message handler (contract 3). After this block's execute step
+   * succeeds, the interpreter calls `onMessage` for EVERY mailbox message it
+   * receives until the run ends — BEFORE the active wait's `matches` — each
+   * call inside its own checkpointed step. "consumed" swallows the message;
+   * "pass" hands it on. Exactly one installable block per run (validation).
+   * This is how a long-lived relay (Slack thread ↔ session) rides the run's
+   * single recv loop without becoming a wait block. */
+  onMessage?(
+    msg: AutomationInbox,
+    config: C,
+    ctx: RunContext,
+  ): Promise<"consumed" | "pass">;
 }
 
 const registry = new Map<string, BlockExecutor<never>>();
