@@ -335,6 +335,51 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.policyCalls.at(-1)).toBe("complete:");
   });
 
+  test("(d'') a bot-authored app_mention in the thread is ignored by the continuation wait", async () => {
+    const botMention = (ts: string): AutomationInbox => ({
+      kind: "event",
+      eventKey: "app_mention",
+      deliveryKey: `slack:Ev-${ts}`,
+      payload: {
+        team_id: "T1",
+        event_id: `Ev-${ts}`,
+        event: {
+          type: "app_mention",
+          channel: "C1",
+          bot_id: "B1",
+          user: "UBOT2",
+          ts,
+          thread_ts: "100.1",
+          text: "<@UBOT> look at this",
+        },
+      },
+      receivedAt: "2026-08-22T10:00:05Z",
+    });
+    const h = harness({
+      recv: [
+        { kind: "session_idle", sessionId: "s-1" },
+        botMention("100.2"),
+        joined("<@UBOT> a human follow-up", "100.3"),
+        { kind: "session_idle", sessionId: "s-1" },
+        null,
+        null,
+      ],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    // The bot's mention never became a turn; the wait kept listening and the
+    // human's message did.
+    expect(h.prompts.map((p) => p.text)).toEqual(["a human follow-up"]);
+    expect(h.names.filter((n) => /\.has_turn\.turn:0$/.test(n))).toHaveLength(1);
+    // The WAIT itself refused the bot event (not only the turn gate): the
+    // first iteration's `next` matched the human's message.
+    const firstNext = h.records.filter((r) => r.path === "thread[0].next").at(-1);
+    expect(firstNext?.record.outputs).toMatchObject({
+      outcome: "event",
+      event: { event: { ts: "100.3", user: "U2" } },
+    });
+  });
+
   test("(e) a failed turn ends the run as failed and posts ❌ through the policy", async () => {
     const h = harness({
       recv: [{ kind: "session_idle", sessionId: "s-1", runFailed: true }],

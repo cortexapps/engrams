@@ -92,17 +92,22 @@ export default ({ event, inputs, trigger }) => {
 /** The joined follow-up message, as wait_event leaves it in steps.next.event.
  * `has_text` is the turn gate: a bare `@bot` (nothing left once the mention
  * is stripped) is not a prompt — send_prompt refuses an empty prompt, and
- * that refusal would fail the whole run. */
+ * that refusal would fail the whole run. The bot guard is repeated here
+ * (the `next` wait already refuses bot-authored events) so the gate stays
+ * correct even if the wait's conditions are ever tuned away: the relay's
+ * own bubbles arrive as `app_mention`/`message` events with a `bot_id`,
+ * and answering them would make the brain talk to itself. */
 const NEXT_TEXT_SOURCE = `
 export default ({ steps }) => {
   const ev = steps.next?.event?.event ?? {};
+  const fromBot = Boolean(ev.bot_id) || ev.subtype === "bot_message";
   const text = String(ev.text ?? "")
     .replace(/<@[^>]+>/g, " ")
     .replace(/[^\\S\\n]+/g, " ")
     .trim();
   return {
     text,
-    has_text: text.length > 0,
+    has_text: !fromBot && text.length > 0,
     mention_ts: String(ev.ts ?? ""),
     user_id: String(ev.user ?? ""),
   };
@@ -181,6 +186,18 @@ const conversation: BlockDef = {
       type: "wait_event",
       config: {
         eventKeys: ["message", "app_mention"],
+        // Bots never continue a thread either (the opening admission has the
+        // same rule). The ingress route drops bot/subtype `message`s, but an
+        // `app_mention` authored by a bot — including our own bubbles when
+        // they quote the handle — reaches the mailbox, so the wait refuses
+        // it here and keeps listening.
+        conditions: {
+          mode: "all",
+          conditions: [
+            { path: "event.event.bot_id", op: "is_empty" },
+            { path: "event.event.subtype", op: "is_empty" },
+          ],
+        },
         // Typed-through at run time: the wait half reads the execute step's
         // resolved config (see BlockOutcome.resolvedConfig).
         deadlineSeconds: { $ref: "inputs.idle_timeout" },
