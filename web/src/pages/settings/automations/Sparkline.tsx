@@ -21,10 +21,50 @@ const W = 84;
 const H = 24;
 const GAP = 2;
 
+const UTC_DAY_MS = 86_400_000;
+
+function utcDay(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+/** The server reports only the days that had runs; the widget promises seven
+ * calendar-aligned slots, newest on the right. Build that window here: the
+ * last seven UTC dates ending today, each taking its reported bucket or a
+ * zero bucket. Exported for the test. */
+export function sevenDayWindow(
+  days: readonly DayRunCount[],
+  now: Date = new Date(),
+): DayRunCount[] {
+  const byDay = new Map(days.map((d) => [d.day, d]));
+  const todayMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return Array.from({ length: 7 }, (_, i) => {
+    const day = utcDay(todayMs - (6 - i) * UTC_DAY_MS);
+    return (
+      byDay.get(day) ?? {
+        $typeName: "engram.app.v1.DayRunCount",
+        day,
+        completed: 0,
+        failed: 0,
+        filtered: 0,
+        other: 0,
+      }
+    );
+  });
+}
+
 /** Seven bars, newest on the right. Height ∝ that day's run count; a zero
  * day keeps a 2px stub so the week reads as seven slots. */
-export function Sparkline({ days, label }: { days: DayRunCount[]; label?: string }) {
-  const week = days.slice(-7);
+export function Sparkline({
+  days,
+  label,
+  now,
+}: {
+  days: DayRunCount[];
+  label?: string;
+  /** Test seam; defaults to the wall clock. */
+  now?: Date;
+}) {
+  const week = sevenDayWindow(days, now);
   const slot = (W - GAP * 6) / 7;
   const max = Math.max(1, ...week.map((d) => d.completed + d.failed + d.filtered));
   return (
