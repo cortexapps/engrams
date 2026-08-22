@@ -127,18 +127,23 @@ export function runStatusTone(status: string): RunTone {
 }
 
 /** "3m ago" / "2h ago" / "5d ago"; falls back to the ISO date past a month. */
+/** Past or future, symmetric: "4m ago" / "in 4m". Within a minute either
+ * way reads as "just now" / "any moment"; beyond a month, the date. */
 export function relativeTime(iso: string | undefined, now: Date = new Date()): string {
   if (!iso) return "never";
   const then = new Date(iso);
   if (Number.isNaN(then.getTime())) return iso;
-  const s = Math.max(0, Math.round((now.getTime() - then.getTime()) / 1000));
-  if (s < 60) return "just now";
+  const delta = Math.round((now.getTime() - then.getTime()) / 1000);
+  const future = delta < 0;
+  const s = Math.abs(delta);
+  if (s < 60) return future ? "any moment" : "just now";
+  const unit = (n: number, suffix: string) => (future ? `in ${n}${suffix}` : `${n}${suffix} ago`);
   const m = Math.round(s / 60);
-  if (m < 60) return `${m}m ago`;
+  if (m < 60) return unit(m, "m");
   const h = Math.round(m / 60);
-  if (h < 24) return `${h}h ago`;
+  if (h < 24) return unit(h, "h");
   const d = Math.round(h / 24);
-  if (d < 31) return `${d}d ago`;
+  if (d < 31) return unit(d, "d");
   return then.toISOString().slice(0, 10);
 }
 
