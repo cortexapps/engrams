@@ -99,6 +99,59 @@ describe("validateDefinition", () => {
     }
   });
 
+  test("finalize hooks: valid action hooks pass; waits and control blocks are refused", () => {
+    const withHook = (block: unknown) =>
+      def({
+        settings: {
+          endSessionsOnFinish: false,
+          onFinalize: [{ when: ["failed"], block }],
+        },
+      } as never);
+    const ok = validateDefinition(
+      withHook({
+        id: "report",
+        type: "integration_action",
+        config: { provider: "github", actionId: "update_issue_comment", params: { body: "x" } },
+      }),
+      { kind: "user" },
+    );
+    expect(ok.settings.onFinalize?.[0]?.block.id).toBe("report");
+    // send_prompt parks on the mailbox; a hook may never wait.
+    expect(() =>
+      validateDefinition(
+        withHook({
+          id: "nudge",
+          type: "send_prompt",
+          config: { session: { blockId: "launch" }, promptTemplate: "x", waitFor: { kind: "none" } },
+        }),
+        { kind: "user" },
+      ),
+    ).toThrow(/cannot wait/);
+    expect(() =>
+      validateDefinition(
+        withHook({ id: "w", type: "wait_event", config: {} }),
+        { kind: "user" },
+      ),
+    ).toThrow(/cannot wait/);
+    expect(() =>
+      validateDefinition(
+        withHook({ id: "b", type: "branch", config: { conditions: { mode: "all", conditions: [] } }, then: [] }),
+        { kind: "user" },
+      ),
+    ).toThrow(/not allowed in a finalize hook/);
+    // Hook ids share the automation's id space.
+    expect(() =>
+      validateDefinition(
+        withHook({
+          id: "launch",
+          type: "integration_action",
+          config: { provider: "github", actionId: "x", params: {} },
+        }),
+        { kind: "user" },
+      ),
+    ).toThrow(/duplicate block id/);
+  });
+
   test("branch/loop nesting rules", () => {
     expect(() =>
       validateDefinition(

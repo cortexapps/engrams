@@ -57,6 +57,9 @@ export interface RunContext {
   /** Set by the interpreter for the duration of one block's execute/wait. */
   currentBlockId?: string;
   currentAttempt?: number;
+  /** Set once the run has a terminal status, before finalize hooks run, so
+   * a hook's templates can read `run.status` / `run.error`. */
+  terminal?: { status: string; error?: string };
   /** True for an editor DryRun (see RunSnapshot.dryRun). */
   dryRun: boolean;
   deps: EngineDeps;
@@ -108,7 +111,13 @@ export function buildRunContext(
         trigger: ctx.trigger,
         event: ctx.event,
         steps: ctx.steps,
-        run: { id: runId, automation: { id: ctx.automationId, name: ctx.automationName } },
+        run: {
+          id: runId,
+          automation: { id: ctx.automationId, name: ctx.automationName },
+          ...(ctx.terminal
+            ? { status: ctx.terminal.status, error: ctx.terminal.error ?? "" }
+            : {}),
+        },
       };
     },
     async render(template: string): Promise<string> {

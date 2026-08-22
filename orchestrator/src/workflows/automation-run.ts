@@ -260,7 +260,7 @@ export async function automationRunWorkflowImpl(
   // ADR 0119 D2: bump on ANY change to step naming, step order, recv
   // semantics, or finalize position anywhere in the engine. The literal lives
   // in this registered body so the bump rotates the DBOS application version.
-  const ENGINE_STEP_CONTRACT = 1;
+  const ENGINE_STEP_CONTRACT = 2;
   const engine = deps.engine ?? productionEngineDeps();
   return interpretAutomation(
     { runId: input.runId, automationId: input.automationId, contract: ENGINE_STEP_CONTRACT },

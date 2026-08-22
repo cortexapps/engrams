@@ -20,6 +20,9 @@
  *     satisfy a later wait on the same session. (A human prompting a
  *     run-owned session mid-run inflates the idle count and turns a would-be
  *     false match into a wait deadline — the safe failure.)
+ *   - finalize hooks (contract 2): for a run ending in a hook's `when`, the
+ *     hook block runs as `step:__finalize__.<blockId>:0` BEFORE the finalize
+ *     step, in definition order; outcomes never change the terminal status;
  *   - finalize runs exactly once, from every exit path.
  */
 
@@ -309,6 +312,71 @@ export async function interpretAutomation(
       return evaluateFilter(group, ctx.scope());
     }, name);
 
+  /** One data block's resolve → validate → execute → record, as the body of
+   * one DBOS step. Shared by the graph walk and the finalize hooks so both
+   * checkpoint identically. */
+  const executeDataBlock = async (
+    block: BlockDef,
+    executor: BlockExecutor<never>,
+    path: string,
+    attempt: number,
+  ): Promise<BlockOutcome> => {
+    // Resolve the config inside the step (checkpointed): `$ref` value
+    // references become the referenced scope value, and templated
+    // strings render. Blocks that render their own prompt/command fields
+    // see them already rendered (a no-op for a plain string).
+    let resolved: Record<string, unknown>;
+    try {
+      resolved = await resolveBlockConfig(block.config, ctx);
+      // Save-time validation skipped `$ref` fields; check the resolved
+      // shape against the block's schema before the executor sees it.
+      const checked = executor.configSchema.safeParse(resolved);
+      if (!checked.success) {
+        const issue = checked.error.issues[0];
+        throw new Error(
+          `resolved config invalid at ${issue ? issue.path.join(".") : "config"}: ${issue ? issue.message : "unknown"}`,
+        );
+      }
+      resolved = checked.data as Record<string, unknown>;
+    } catch (error) {
+      const failure: BlockOutcome = {
+        kind: "error",
+        code: "config_render_failed",
+        message: errorMessage(error),
+        retryable: false,
+      };
+      await deps.store.recordStep(input.runId, path, attempt, {
+        status: "failed",
+        inputs: block.config,
+        error: `${failure.code}: ${failure.message}`,
+      });
+      return failure;
+    }
+    await deps.store.recordStep(input.runId, path, attempt, {
+      status: "running",
+      inputs: resolved,
+    });
+    let result: BlockOutcome;
+    try {
+      result = executor.execute
+        ? await executor.execute(resolved as never, ctx)
+        : { kind: "ok", outputs: {} };
+    } catch (error) {
+      result = {
+        kind: "error",
+        code: "block_threw",
+        message: errorMessage(error),
+        retryable: false,
+      };
+    }
+    await deps.store.recordStep(input.runId, path, attempt, {
+      status: result.kind === "error" ? "failed" : "succeeded",
+      ...(result.kind === "ok" ? { outputs: result.outputs } : {}),
+      ...(result.kind === "error" ? { error: `${result.code}: ${result.message}` } : {}),
+    });
+    return result;
+  };
+
   const runBlock = async (block: BlockDef, frames: Frame[]): Promise<void> => {
     const path = framePath(frames);
     const executor = getBlock(block.type);
@@ -370,62 +438,10 @@ export async function interpretAutomation(
     for (let attempt = 0; attempt < policy.attempts; attempt += 1) {
       ctx.currentAttempt = attempt;
       const name = stepName(frames, attempt);
-      const outcome: BlockOutcome = await deps.step(async () => {
-        // Resolve the config inside the step (checkpointed): `$ref` value
-        // references become the referenced scope value, and templated
-        // strings render. Blocks that render their own prompt/command fields
-        // see them already rendered (a no-op for a plain string).
-        let resolved: Record<string, unknown>;
-        try {
-          resolved = await resolveBlockConfig(block.config, ctx);
-          // Save-time validation skipped `$ref` fields; check the resolved
-          // shape against the block's schema before the executor sees it.
-          const checked = executor.configSchema.safeParse(resolved);
-          if (!checked.success) {
-            const issue = checked.error.issues[0];
-            throw new Error(
-              `resolved config invalid at ${issue ? issue.path.join(".") : "config"}: ${issue ? issue.message : "unknown"}`,
-            );
-          }
-          resolved = checked.data as Record<string, unknown>;
-        } catch (error) {
-          const failure: BlockOutcome = {
-            kind: "error",
-            code: "config_render_failed",
-            message: errorMessage(error),
-            retryable: false,
-          };
-          await deps.store.recordStep(input.runId, path, attempt, {
-            status: "failed",
-            inputs: block.config,
-            error: `${failure.code}: ${failure.message}`,
-          });
-          return failure;
-        }
-        await deps.store.recordStep(input.runId, path, attempt, {
-          status: "running",
-          inputs: resolved,
-        });
-        let result: BlockOutcome;
-        try {
-          result = executor.execute
-            ? await executor.execute(resolved as never, ctx)
-            : { kind: "ok", outputs: {} };
-        } catch (error) {
-          result = {
-            kind: "error",
-            code: "block_threw",
-            message: errorMessage(error),
-            retryable: false,
-          };
-        }
-        await deps.store.recordStep(input.runId, path, attempt, {
-          status: result.kind === "error" ? "failed" : "succeeded",
-          ...(result.kind === "ok" ? { outputs: result.outputs } : {}),
-          ...(result.kind === "error" ? { error: `${result.code}: ${result.message}` } : {}),
-        });
-        return result;
-      }, name);
+      const outcome: BlockOutcome = await deps.step(
+        () => executeDataBlock(block, executor, path, attempt),
+        name,
+      );
 
       if (outcome.kind === "end_run") {
         throw new RunEnd(outcome.status, outcome.reason);
@@ -502,6 +518,41 @@ export async function interpretAutomation(
     } else {
       terminal = { status: "failed", error: errorMessage(error) };
     }
+  }
+
+  // Finalize hooks (contract 2): blocks that observe the terminal status
+  // before teardown — each its own step, named under __finalize__ so the
+  // ledger groups them with the run's end. A hook can post, clean up, or
+  // record; it can NEVER change the outcome (a throwing hook is recorded on
+  // its own step row and logged), and it never waits (validation refuses
+  // wait-capable blocks). `run.status`/`run.error` are in scope so a comment
+  // can say why.
+  ctx.terminal = { status: terminal.status, ...(terminal.error ? { error: terminal.error } : {}) };
+  for (const hook of snapshot.definition.settings.onFinalize ?? []) {
+    if (!hook.when.includes(terminal.status)) continue;
+    const block = hook.block;
+    const executor = getBlock(block.type);
+    const path = `__finalize__.${block.id}`;
+    ctx.currentBlockId = block.id;
+    ctx.currentAttempt = 0;
+    const outcome: BlockOutcome = await deps.step(async () => {
+      if (!executor) {
+        return {
+          kind: "error",
+          code: "unknown_block_type",
+          message: `unknown block type "${block.type}"`,
+          retryable: false,
+        };
+      }
+      return executeDataBlock(block, executor, path, 0);
+    }, `step:${path}:0`);
+    ctx.currentBlockId = undefined;
+    ctx.currentAttempt = undefined;
+    if (outcome.kind === "ok") {
+      recordStepOutputs(ctx, block.id, path, outcome.outputs);
+    }
+    // Any other outcome (error, or an end_run a hook has no business
+    // issuing) is already on the step row; the terminal status stands.
   }
 
   // step:__finalize__:0 — exactly once, from every exit path. Sessions with
