@@ -37,6 +37,7 @@ import { evaluateFilter, parseFilterGroup } from "./conditions.ts";
 import { isSafePath, ownPath } from "../paths.ts";
 import { buildRunContext, recordStepOutputs, type RunContext, type RunSnapshot } from "./context.ts";
 import type { EngineDeps } from "./deps.ts";
+import { log as rootLog } from "../../log.ts";
 import {
   isValueRef,
   MAX_LOOP_ITERATIONS,
@@ -59,6 +60,8 @@ import {
   SNAPSHOT_STEP,
   type Frame,
 } from "./step-name.ts";
+
+const log = rootLog.child({ component: "automation-interpreter" });
 
 /** Single source of truth for terminal run statuses. Everything that gates
  * on terminality (e.g. claimCronOccurrence) derives from this array, so a
@@ -239,6 +242,30 @@ export async function interpretAutomation(
    * checkpointed step. The step's recorded output is `{verdict, state}`; on
    * recovery DBOS replays that output without running the closure, which is
    * exactly why the state must ride the output and not a closure-local. */
+  const recordRelayLedgerBestEffort = async (
+    stepPath: string,
+    count: number,
+    state: Record<string, unknown> | undefined,
+  ): Promise<void> => {
+    const record = {
+      status: "succeeded" as const,
+      ...(state !== undefined ? { outputs: { handler_state: state } } : {}),
+    };
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await deps.store.recordStep(input.runId, stepPath, count, record);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    log.warn(
+      { runId: input.runId, path: stepPath, attempt: count, err: lastError },
+      "relay step ledger write failed; the checkpointed step result stands",
+    );
+  };
+
   const offerToInstalled = async (msg: AutomationInbox): Promise<boolean> => {
     if (installed === null) return false;
     const relay = installed;
@@ -262,15 +289,14 @@ export async function interpretAutomation(
         });
         return { verdict: "pass" as const };
       }
-      // The ledger write sits OUTSIDE the handler's try: the handler
-      // succeeded, so its result (verdict + state) is the truth of this
-      // step. A bookkeeping failure here must throw — DBOS then retries the
-      // step instead of checkpointing a fabricated `pass` with no state,
-      // which would silently drop the handler's work from the state chain.
-      await deps.store.recordStep(input.runId, stepPath, relay.count, {
-        status: "succeeded",
-        ...(r.state !== undefined ? { outputs: { handler_state: r.state } } : {}),
-      });
+      // The step's RETURN VALUE ({verdict, state}) is the checkpointed,
+      // durable truth of this step; the `automation_step_run` row is
+      // observability only. `deps.step` is DBOS.runStep with no retries and
+      // the run's catch turns a throw into a failed run, so the ledger write
+      // is best-effort (one bounded retry): on persistent failure it is
+      // logged and the REAL result is still returned. The state is never
+      // discarded and the run never dies because of the ledger.
+      await recordRelayLedgerBestEffort(stepPath, relay.count, r.state);
       return r;
     }, relayStepName(relay.path, relay.count));
     if (result.state !== undefined) {

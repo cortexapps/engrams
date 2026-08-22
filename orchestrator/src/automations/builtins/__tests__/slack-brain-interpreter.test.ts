@@ -90,6 +90,8 @@ function harness(options: {
   replay?: ReplayScript;
   /** Slack user → engrams user (default: U1 → user-1; everyone else unlinked). */
   linkedUsers?: Record<string, string>;
+  /** Make every relay-step ledger write throw (the row is observability). */
+  failRelayLedger?: boolean;
 }): Harness {
   const runner = options.replay ? makeReplayRunner(options.replay) : null;
   const names: string[] = runner ? runner.names : [];
@@ -187,7 +189,10 @@ function harness(options: {
     store: {
       async loadSnapshot() { return snapshot; },
       async markRunning() {},
-      async recordStep(_r, path, attempt, record) { records.push({ path, attempt, record }); },
+      async recordStep(_r, path, attempt, record) {
+        if (options.failRelayLedger && path.endsWith(".__relay__")) throw new Error("ledger down");
+        records.push({ path, attempt, record });
+      },
       async finalizeRun(_r, status, error) { finalized.push({ status, ...(error !== undefined ? { error } : {}) }); },
       async listRunSessions() { return runSessions; },
       async releaseConcurrency() { return null; },
@@ -317,6 +322,36 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.names).toContain("step:identity:0");
     expect(h.names).not.toContain("step:session:0");
     expect(h.finalized).toEqual([{ status: "filtered", error: expect.stringContaining("not linked") }]);
+  });
+
+  test("(a3) recovery still rebuilds the relay state when every ledger write fails", async () => {
+    // Same crash/restart script as (a'), with the observability row never
+    // landing: the checkpointed step outputs alone carry the state.
+    const h = harness({
+      failRelayLedger: true,
+      replay: [
+        curated(1, "run_started", {}),
+        curated(2, "agent_message", { role: "assistant", text: "one" }),
+        curated(3, "agent_message", { role: "assistant", text: "two" }),
+        "crash",
+        curated(4, "agent_message", { role: "assistant", text: "three" }),
+        curated(5, "run_completed", { ok: true }),
+        { kind: "session_idle", sessionId: "s-1" },
+        null,
+        null,
+      ],
+    });
+    const runner = h.runner!;
+    void interpretAutomation(RUN, h.deps).catch(() => {});
+    for (let i = 0; i < 50 && !h.policyCalls.includes("msg:one\n\ntwo"); i += 1) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    runner.restart();
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    expect(h.policyCalls).toContain("msg:one\n\ntwo\n\nthree");
+    expect(h.policyCalls.at(-1)).toBe("complete:three");
+    expect(h.records.filter((r) => r.path.endsWith(".__relay__"))).toEqual([]);
   });
 
   test("(a4) each accepted turn re-points the relay: ⏳/✅ land on the reply that started it", async () => {
