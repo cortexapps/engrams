@@ -101,11 +101,53 @@ export function automationStatusLabel(status: string): string {
   return status.replaceAll("_", " ");
 }
 
+export type RunTone = "nominal" | "caution" | "critical" | "muted" | "active";
+
+/** Status → instrument tone for the list's status dot. `filtered`,
+ * `superseded`, and `halted` are neutral outcomes (the run ended on purpose),
+ * not failures; `active` covers everything still moving. */
+export function runStatusTone(status: string): RunTone {
+  switch (status) {
+    case "completed":
+      return "nominal";
+    case "failed":
+    case "deadline":
+      return "critical";
+    case "filtered":
+    case "superseded":
+    case "halted":
+      return "caution";
+    case "pending":
+    case "running":
+    case "waiting":
+      return "active";
+    default:
+      return "muted";
+  }
+}
+
+/** "3m ago" / "2h ago" / "5d ago"; falls back to the ISO date past a month. */
+export function relativeTime(iso: string | undefined, now: Date = new Date()): string {
+  if (!iso) return "never";
+  const then = new Date(iso);
+  if (Number.isNaN(then.getTime())) return iso;
+  const s = Math.max(0, Math.round((now.getTime() - then.getTime()) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.round(h / 24);
+  if (d < 31) return `${d}d ago`;
+  return then.toISOString().slice(0, 10);
+}
+
 // ---------------------------------------------------------------------------
 // Single-block definition adapter (ADR 0119 phase 3.1). The legacy editor
 // still authors "trigger + one create_session block"; these helpers convert
-// that draft to/from the v2 `definition_json` the RPC speaks. The phase-3 UI
-// replaces this page and these helpers go with it.
+// that draft to/from the v2 `definition_json` the RPC speaks.
+// TODO(3.3): delete this whole section with `AutomationEditor.tsx` — the
+// rebuilt editor edits definitions directly and nothing else imports these.
 // ---------------------------------------------------------------------------
 
 export const SINGLE_BLOCK_ID = "create_session";
