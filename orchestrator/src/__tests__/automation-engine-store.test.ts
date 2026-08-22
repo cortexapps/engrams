@@ -171,6 +171,46 @@ describe("automation engine store (live PG)", () => {
   });
 
   test.skipIf(!dbReachable)(
+    "loadSnapshot fails the run BEFORE the walk when stored inputs violate the pinned schema (phase 4.3b)",
+    async () => {
+      // A built-in version bump that tightens a rule after the org saved its
+      // values: the run must end `failed` with the routed reason, terminal
+      // and visible, never start on inputs the schema rejects.
+      const id = `${AUTO_ID}-bad-inputs`;
+      await seedAutomation(id);
+      const db = getDb();
+      await db.execute(sql`
+        update automation_version
+        set inputs_schema = ${JSON.stringify([
+          { key: "limit", label: "Limit", type: "number", required: true },
+        ])}::jsonb
+        where automation_id = ${id} and version = 1
+      `);
+      await db.execute(sql`
+        update automation set inputs = ${JSON.stringify({ limit: "ten" })}::jsonb where id = ${id}
+      `);
+      const store = makeAutomationStore(db);
+      const runId = `autorun:${id}:manual:1`;
+      await store.insertRun({
+        id: runId,
+        automationId: id,
+        version: 1,
+        trigger: TRIGGER,
+        deliveryKey: "manual:1",
+        concurrencyKey: null,
+        scheduledFor: null,
+      });
+
+      const engine = makeAutomationEngineStore();
+      await expect(engine.loadSnapshot(runId)).rejects.toThrow(/inputs.limit: must be a number/);
+      const run = await engine.getRun(runId);
+      expect(run?.status).toBe("failed");
+      expect(run?.error).toContain("inputs.limit: must be a number");
+      expect(run?.endedAt).not.toBeNull();
+    },
+  );
+
+  test.skipIf(!dbReachable)(
     "loadSnapshot merges block overrides over the pinned version; dry_run rides the run row",
     async () => {
       const id = `${AUTO_ID}-overrides`;

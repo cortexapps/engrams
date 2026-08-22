@@ -24,7 +24,8 @@ import { makeEnrollmentStore } from "../../db/enrollments.ts";
 import { makeIntegrationConnectionStore } from "../../db/integration-connections.ts";
 import { isUniqueViolation } from "../../db/pg-errors.ts";
 import { log as rootLog } from "../../log.ts";
-import type { AutomationDefinition, BlockDef, BlockOverrides } from "../engine/definition.ts";
+import type { AutomationDefinition, BlockDef, BlockOverrides, InputFieldSpec } from "../engine/definition.ts";
+import { validateInputValues } from "../inputs.ts";
 import {
   listBuiltinAutomations,
   mergeBuiltinOverrides,
@@ -126,6 +127,44 @@ async function liftEnrollments(
   return repos;
 }
 
+/** Seed-time guard (ADR 0119 phase 4.3b): a legacy enrollment row (or a
+ * default) the schema rejects must not block the built-in from seeding. A
+ * bad map ROW drops just that row; any other violation reverts the whole
+ * key to its schema default. Every fallback is logged with the violation. */
+function sanitizeSeedInputs(
+  schema: readonly InputFieldSpec[],
+  inputs: Record<string, unknown>,
+  logger: { warn(b: Record<string, unknown>, m: string): void },
+  builtinKey: string,
+): Record<string, unknown> {
+  const errors = validateInputValues(schema, inputs);
+  if (errors.length === 0) return inputs;
+  const out: Record<string, unknown> = { ...inputs };
+  for (const error of errors) {
+    const spec = schema.find((f) => f.key === error.key);
+    const current = out[error.key];
+    const rowKey = error.path?.split(".")[0];
+    if (
+      spec?.type === "map" &&
+      rowKey !== undefined &&
+      typeof current === "object" &&
+      current !== null &&
+      !Array.isArray(current) &&
+      rowKey in (current as Record<string, unknown>)
+    ) {
+      const { [rowKey]: _dropped, ...rest } = current as Record<string, unknown>;
+      out[error.key] = rest;
+    } else {
+      out[error.key] = spec?.default;
+    }
+    logger.warn(
+      { builtinKey, key: error.key, path: error.path, message: error.message },
+      "built-in seed: input value rejected by its schema; falling back to the default",
+    );
+  }
+  return out;
+}
+
 async function seedOne(
   builtin: BuiltinAutomation,
   deps: BuiltinSeedDeps,
@@ -137,10 +176,11 @@ async function seedOne(
   const existing = await deps.store.getByBuiltinKey(builtin.key);
 
   if (!existing) {
-    const inputs = await builtin.defaultInputs();
+    const assembled = await builtin.defaultInputs();
     if (builtin.key === PR_REVIEW_BUILTIN_KEY) {
-      inputs["repos"] = await liftEnrollments(deps);
+      assembled["repos"] = await liftEnrollments(deps);
     }
+    const inputs = sanitizeSeedInputs(definition.inputsSchema, assembled, logger, builtin.key);
     try {
       await deps.store.create(
         {
@@ -193,8 +233,14 @@ async function bumpVersion(
   builtin: BuiltinAutomation,
   deps: BuiltinSeedDeps,
 ): Promise<void> {
-  // 1. Inputs: add defaults for NEW keys; never overwrite an org value.
-  const defaults = await builtin.defaultInputs();
+  // 1. Inputs: add defaults for NEW keys; never overwrite an org value. The
+  //    defaults we ship are validated like everything else.
+  const defaults = sanitizeSeedInputs(
+    shipped.inputsSchema,
+    await builtin.defaultInputs(),
+    deps.log ?? log,
+    builtin.key,
+  );
   const mergedInputs: Record<string, unknown> = { ...existing.inputs };
   for (const field of shipped.inputsSchema) {
     if (!(field.key in mergedInputs) && field.key in defaults) {

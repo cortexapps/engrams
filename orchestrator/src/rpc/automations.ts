@@ -43,6 +43,7 @@ import {
   type WebhookRegistrationRow,
 } from "../db/automations.ts";
 import { getDb } from "../db/client.ts";
+import { inputErrorField, validateInputValues } from "../automations/inputs.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
@@ -74,6 +75,7 @@ import {
   type AutomationDefinition,
   type AutomationSettings,
   type BlockOverrides,
+  type InputFieldSpec,
 } from "../automations/engine/definition.ts";
 import { previewDefinition } from "../automations/engine/preview.ts";
 import { makeWebhookAliasResolver } from "../automations/aliases.ts";
@@ -225,6 +227,22 @@ function toBlockError(error: unknown): ProtoBlockError | null {
     return blockError(error.blockId, error.field, "invalid_override", error.message);
   }
   return null;
+}
+
+/** Reject input VALUES the version's schema does not accept, one routed line
+ * per violation (`inputs.<key>[.path]: message` — the form the web's
+ * inputErrorFromServer maps back to a field). Undeclared keys are checked by
+ * the caller first; this is the value half (ADR 0119 phase 4.3b). */
+function assertInputValues(
+  schema: readonly InputFieldSpec[],
+  inputs: Record<string, unknown>,
+): void {
+  const errors = validateInputValues(schema, inputs);
+  if (errors.length > 0) {
+    throw new BlockValidationError(
+      errors.map((e) => blockError("", inputErrorField(e), `invalid_input_${e.code}`, e.message)),
+    );
+  }
 }
 
 function verificationScheme(value: string): WebhookVerificationScheme {
@@ -756,6 +774,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       const name = requiredText(req.name, "name");
       const { definition, nextFireAt } = await parseDefinition(req.definitionJson, "user");
       const inputs = req.inputsJson ? parseObjectJson(req.inputsJson, "inputs_json") : {};
+      assertInputValues(definition.inputsSchema, inputs);
       const row = await store.create(
         {
           name,
@@ -857,6 +876,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
           unknown.map((k) => blockError("", `inputs.${k}`, "unknown_input", `input "${k}" is not declared`)),
         );
       }
+      assertInputValues(row.version.inputsSchema, inputs);
       const updated = await store.setInputs(row.id, inputs);
       if (!updated) throw new ConnectError("automation not found", Code.NotFound);
       return { automation: toProtoAutomation(updated) };
@@ -983,7 +1003,16 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         // from the row at snapshot time. Honest and simple; the editor shows
         // the stored values, so "one-off" means "until you change it back".
         const inputs = parseObjectJson(req.inputsJson, "inputs_json");
-        await store.setInputs(row.id, { ...row.inputs, ...inputs });
+        const declared = new Set(row.version.inputsSchema.map((f) => f.key));
+        const unknown = Object.keys(inputs).filter((k) => !declared.has(k));
+        if (unknown.length > 0) {
+          throw new BlockValidationError(
+            unknown.map((k) => blockError("", `inputs.${k}`, "unknown_input", `input "${k}" is not declared`)),
+          );
+        }
+        const merged = { ...row.inputs, ...inputs };
+        assertInputValues(row.version.inputsSchema, merged);
+        await store.setInputs(row.id, merged);
       }
       const payload =
         req.payloadJson !== undefined ? parseObjectJson(req.payloadJson, "payload_json", DEFINITION_MAX_CHARS) : {};

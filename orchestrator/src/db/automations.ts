@@ -29,6 +29,7 @@ import {
 import type { EngineRunStore, EngineStepRecord } from "../automations/engine/deps.ts";
 import type { RunSnapshot } from "../automations/engine/context.ts";
 import { RUN_TERMINAL_STATUSES } from "../automations/engine/interpreter.ts";
+import { InputValidationError, validateInputValues } from "../automations/inputs.ts";
 import { cronDeliveryKey } from "../automations/ids.ts";
 import type { WebhookAliasMapping } from "../automations/template.ts";
 
@@ -1264,9 +1265,25 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
         aliases = await aliasResolver(definition.trigger.registrationId);
       }
 
+      // ADR 0119 phase 4.3b: a run must never start on inputs the pinned
+      // schema rejects (e.g. a built-in version bump tightened a rule after
+      // the org saved its values). Fail the run row HERE, before the walk,
+      // so it is terminal and visible; the workflow's thrown error then
+      // replays as a no-op against a finalized row.
+      const resolvedInputs = resolveAutomationInputs(version.inputsSchema, meta.inputs);
+      const inputErrors = validateInputValues(version.inputsSchema, resolvedInputs);
+      if (inputErrors.length > 0) {
+        const error = new InputValidationError(inputErrors);
+        await db
+          .update(automationRunTable)
+          .set({ status: "failed", error: error.message, endedAt: now(), leaseOwner: null, leaseExpiresAt: null })
+          .where(eq(automationRunTable.id, runId));
+        throw error;
+      }
+
       return {
         definition,
-        inputs: resolveAutomationInputs(version.inputsSchema, meta.inputs),
+        inputs: resolvedInputs,
         automationId: meta.id,
         automationName: meta.name,
         version: version.version,

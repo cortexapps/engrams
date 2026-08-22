@@ -129,6 +129,31 @@ describe("seedBuiltinAutomations", () => {
     expect(v1.trigger).toMatchObject({ kind: "integration", provider: "github", connectionId: "conn-github" });
   });
 
+  test("a legacy enrollment row the schema rejects drops just that row and never blocks the seed (phase 4.3b)", async () => {
+    // review_enrollment.repo is a free text PK; a malformed legacy value
+    // must not stop the built-in from seeding for every healthy repo.
+    const warnings: Array<Record<string, unknown>> = [];
+    const h = harness({
+      enrollments: [
+        { repo: "acme/app", triggerMode: "auto", autofix: "off" },
+        { repo: "not a repo", triggerMode: "auto", autofix: "off" },
+      ],
+    });
+    const result = await seedBuiltinAutomations({
+      ...h.deps,
+      log: { info() {}, warn: (b: Record<string, unknown>) => void warnings.push(b) },
+      builtins: [PR_REVIEW_BUILTIN],
+    });
+    expect(result.created).toEqual([PR_REVIEW_BUILTIN_KEY]);
+    const row = h.rows.get("auto-pr-review")!;
+    expect(row.inputs["repos"]).toEqual({ "acme/app": { mode: "auto", autofix: false } });
+    expect(warnings).toEqual([
+      expect.objectContaining({ key: "repos", path: "not a repo", builtinKey: PR_REVIEW_BUILTIN_KEY }),
+    ]);
+    // The shipped schema's own defaults are valid: no other key fell back.
+    expect(warnings).toHaveLength(1);
+  });
+
   test("re-run with an unchanged shipped definition is a no-op", async () => {
     const h = harness();
     await seedBuiltinAutomations({ ...h.deps, builtins: [PR_REVIEW_BUILTIN] });
