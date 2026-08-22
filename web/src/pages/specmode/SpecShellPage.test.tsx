@@ -1,5 +1,5 @@
 import { act, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { WebsocketProvider } from "y-websocket";
 import * as Y from "yjs";
 
@@ -159,6 +159,14 @@ vi.mock("@/hooks/useSpecRead", () => ({
 describe("SpecShellPage", () => {
   beforeEach(() => {
     readState.phase = "drafting";
+  });
+
+  // Several cases below spy on the GLOBAL fetch. An inline `mockRestore()` at
+  // the end of each is not enough: a failing assertion throws before it, and
+  // the spy then leaks into whatever runs next. That showed up as two
+  // unrelated suites failing in one full run and passing in isolation.
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it("owns one Yjs connection and disposes it after the canvas unmounts", async () => {
@@ -354,6 +362,37 @@ describe("SpecShellPage", () => {
 
     expect(await screen.findByText("Your session expired")).toBeTruthy();
     providerState.provider.synced = false;
+    fetchMock.mockRestore();
+  });
+
+  // Caught driving prod, not by these tests: the classifier's answer lands
+  // asynchronously while the socket is STILL failing, so the next
+  // connection-close re-set "unreachable" and wiped the reason a moment after
+  // it appeared. The other cases emit exactly the threshold count and stop, so
+  // they could never see it.
+  it("does not let further failures clobber a classified refusal", async () => {
+    providerState.listeners.clear();
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 401 }));
+
+    renderWithProviders(<SpecShellPage specId="spec-1" />);
+    await waitFor(() => expect(providerState.listeners.has("connection-close")).toBe(true));
+    act(() => {
+      failedAttempt();
+      failedAttempt();
+      failedAttempt();
+    });
+    expect(await screen.findByText("Your session expired")).toBeTruthy();
+
+    // The socket keeps failing after the reason is known.
+    act(() => {
+      failedAttempt();
+      failedAttempt();
+      failedAttempt();
+    });
+    expect(screen.getByText("Your session expired")).toBeTruthy();
+    expect(screen.queryByText("Cannot reach the document")).toBeNull();
     fetchMock.mockRestore();
   });
 
