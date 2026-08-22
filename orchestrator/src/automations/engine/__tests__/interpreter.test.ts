@@ -55,6 +55,8 @@ function makeHarness(
     failExec?: boolean;
     /** Fake integration-action runtime: records calls; throws when asked. */
     failActions?: boolean;
+    /** Make recordStep throw for these frame paths (a ledger blip). */
+    failRecordStepFor?: string[];
   } = {},
 ): Harness {
   const names: string[] = [];
@@ -93,6 +95,7 @@ function makeHarness(
     },
     async markRunning() {},
     async recordStep(_runId, framePath, attempt, record) {
+      if (options.failRecordStepFor?.includes(framePath)) throw new Error("ledger down");
       stepRecords.push({ framePath, attempt, record });
     },
     async finalizeRun(_runId, status, error) {
@@ -879,6 +882,42 @@ describe("interpretAutomation — installed message handlers (contract 3)", () =
         "session_event",
         "session_idle",
       ]);
+    } finally {
+      unregisterBlockForTest(TYPE);
+    }
+  });
+
+  test("a ledger blip AFTER a successful handler call throws out of the step — it never checkpoints a fabricated pass", async () => {
+    // The handler succeeded (consumed, new state); only the success-path
+    // recordStep fails. The step must throw (DBOS retries it) rather than
+    // return {verdict:"pass"} with no state, which would checkpoint a lie.
+    let calls = 0;
+    registerBlock<Record<string, never>>({
+      type: TYPE,
+      system: true,
+      configSchema: z.object({}),
+      async execute() {
+        return { kind: "ok", outputs: { handler_state: { n: 0 } } };
+      },
+      async onMessage() {
+        calls += 1;
+        return { verdict: "consumed", state: { n: calls } };
+      },
+    });
+    try {
+      const h = makeHarness(relayDefinition({}), {
+        recv: [{ kind: "session_idle", sessionId: "s-launch" }],
+        failRecordStepFor: ["relay.__relay__"],
+      });
+      const result = await interpretAutomation(RUN, h.deps);
+      // The step's throw surfaces as the run's failure in this unit harness
+      // (the real DBOS step runner retries it); what matters is that NO
+      // relay step row recorded a success-with-no-state and the run did not
+      // continue as if the message had passed.
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("ledger down");
+      expect(calls).toBe(1);
+      expect(h.stepRecords.filter((r) => r.framePath === "relay.__relay__")).toEqual([]);
     } finally {
       unregisterBlockForTest(TYPE);
     }

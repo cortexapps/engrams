@@ -243,13 +243,9 @@ export async function interpretAutomation(
       state?: Record<string, unknown>;
     }> => {
       ctx.handlerState = relay.state;
+      let r: { verdict: "consumed" | "pass"; state?: Record<string, unknown> };
       try {
-        const r = await relay.executor.onMessage!(msg, relay.config, ctx);
-        await deps.store.recordStep(input.runId, stepPath, relay.count, {
-          status: "succeeded",
-          ...(r.state !== undefined ? { outputs: { handler_state: r.state } } : {}),
-        });
-        return r;
+        r = await relay.executor.onMessage!(msg, relay.config, ctx);
       } catch (error) {
         // A relay's delivery failure is recorded on its step and never fails
         // the run (the legacy thread loop's "drop it, keep the thread alive").
@@ -260,6 +256,16 @@ export async function interpretAutomation(
         });
         return { verdict: "pass" as const };
       }
+      // The ledger write sits OUTSIDE the handler's try: the handler
+      // succeeded, so its result (verdict + state) is the truth of this
+      // step. A bookkeeping failure here must throw — DBOS then retries the
+      // step instead of checkpointing a fabricated `pass` with no state,
+      // which would silently drop the handler's work from the state chain.
+      await deps.store.recordStep(input.runId, stepPath, relay.count, {
+        status: "succeeded",
+        ...(r.state !== undefined ? { outputs: { handler_state: r.state } } : {}),
+      });
+      return r;
     }, relayStepName(relay.path, relay.count));
     if (result.state !== undefined) {
       relay.state = result.state;
