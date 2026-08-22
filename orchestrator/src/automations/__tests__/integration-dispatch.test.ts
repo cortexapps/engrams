@@ -351,6 +351,37 @@ describe("dispatchIntegrationEvent", () => {
     });
     expect(on).toMatchObject({ matched: 1, started: 1 });
     expect(h2.starts.map((s) => s.automationId)).toEqual(["user-auto"]);
+
+    // The Slack switch registers its key the same way (4.6).
+    const slack = {
+      automation: meta({ id: "builtin-slack", kind: "builtin", builtinKey: "slack_brain" }),
+      definition: definition(trigger()),
+    };
+    const h3 = makeHarness([slack, user]);
+    const slackOff = await dispatchIntegrationEvent(input(), {
+      ...deps(h3),
+      disabledBuiltins: new Set(["slack_brain"]),
+    });
+    expect(slackOff).toMatchObject({ matched: 1, started: 1 });
+    expect(h3.starts.map((s) => s.automationId)).toEqual(["user-auto"]);
+  });
+
+  test("disabledBuiltinsFromConfig maps each switch to its built-in key", async () => {
+    const { disabledBuiltinsFromConfig } = await import("../dispatch.ts");
+    const { config } = await import("../../config.ts");
+    const saved = { r: config.reviewAutomationDisabled, s: config.slackAutomationDisabled };
+    try {
+      config.reviewAutomationDisabled = false;
+      config.slackAutomationDisabled = false;
+      expect([...disabledBuiltinsFromConfig()]).toEqual([]);
+      config.reviewAutomationDisabled = true;
+      expect([...disabledBuiltinsFromConfig()]).toEqual(["pr_review"]);
+      config.slackAutomationDisabled = true;
+      expect([...disabledBuiltinsFromConfig()].sort()).toEqual(["pr_review", "slack_brain"]);
+    } finally {
+      config.reviewAutomationDisabled = saved.r;
+      config.slackAutomationDisabled = saved.s;
+    }
   });
 
   test("one target's admission fault never drops its siblings, and the delivery fails afterwards", async () => {

@@ -387,6 +387,8 @@ export interface IntegrationDispatchStore extends AutomationDispatchStore {
 export function disabledBuiltinsFromConfig(): ReadonlySet<string> {
   const keys: string[] = [];
   if (config.reviewAutomationDisabled) keys.push("pr_review");
+  // "slack_brain" ← ORCHESTRATOR_SLACK_AUTOMATION_DISABLED (4.6).
+  if (config.slackAutomationDisabled) keys.push("slack_brain");
   return new Set(keys);
 }
 

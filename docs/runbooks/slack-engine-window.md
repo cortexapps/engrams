@@ -68,11 +68,13 @@ session is kept — and the next mention in that thread goes to legacy.
   to the orchestrator ConfigMap values and roll the deployment. The flags
   survive, so lifting the switch re-opens the same window.
 
-Neither brake stops the ingress spine: events keep landing in
-`integration_event` and the engine's trigger dispatch keeps matching. With
-the kill switch on, a flagged channel is served by BOTH brains (the engine
-run starts from the dispatch, the legacy workflow from the route). Treat
-the switch as an emergency exit and clear `channels` as soon as you can.
+The ingress spine keeps ledgering events in `integration_event` either way
+(the ledger is the audit trail, not a brain). The kill switch gates BOTH
+halves: the Slack route falls back to the legacy thread workflow, and the
+integration dispatcher refuses to admit runs for the `slack_brain` built-in
+(`disabledBuiltinsFromConfig` in `automations/dispatch.ts`) — so a flagged
+channel is never served by two brains. You do not need to clear `channels`
+to use the switch; the flags survive, so lifting it re-opens the same window.
 
 ## What to watch
 
@@ -89,8 +91,9 @@ the switch as an emergency exit and clear `channels` as soon as you can.
 - **Sessions**: `keepOnFinish: true` — a thread's session outlives the
   run. Expect kept sessions to accumulate; this is by design (D8).
 - **Pod log**: the route line above, plus `integration_event` dispatch
-  lines. Two brains on one thread (double ⏳ reactions, two answers) means
-  the kill switch is on while a channel is flagged — clear `channels`.
+  lines. Two brains on one thread (double ⏳ reactions, two answers) should
+  be impossible; if you see it, the dispatcher gate has regressed — set the
+  kill switch AND disable the built-in, then file it.
 - **Inputs**: `idle_timeout` (default 3600 s) ends a quiet thread's run;
   `max_turns` (default 50) bounds follow-ups one run answers. Both are
   read at run time (`$ref`), so a change applies to the next wait of
@@ -128,6 +131,6 @@ the "which profile?" dropdown are retired in favour of the `channels` map.
    alone is enough; in-flight runs end on their idle timeout.
 2. If the route or the engine misbehaves in a way the flag does not
    contain, set `ORCHESTRATOR_SLACK_AUTOMATION_DISABLED=1` and roll the
-   orchestrator. Then clear `channels` so no thread has two brains.
+   orchestrator. Every channel is back on legacy, flagged or not.
 3. A run that must stop now: Runs → the run → Stop (`StopRun`). The
    session is kept.
