@@ -11,12 +11,13 @@ import { RunStatusDot } from "./RunsTab";
 import { RunTimeline } from "./RunTimeline";
 import { StepRunDrawer } from "./StepRunDrawer";
 import {
+  buildTimeline,
+  findTimelineStep,
   formatDuration,
   isActiveRunStatus,
   parseJsonObject,
   runStatusLabel,
   triggerSourceLabel,
-  type TimelineStep,
 } from "./run-format";
 
 /** Block id → type from the pinned definition, for timeline labels. The
@@ -58,11 +59,20 @@ export function RunPage(props: RunPageProps = {}) {
   const automation = useAutomation(automationId);
   const stop = useStopRun();
   const retry = useRetryRun();
-  const [selected, setSelected] = useState<TimelineStep | null>(null);
+  // Selection is keyed on the step's stable frame path, never the step
+  // object: the run polls while active, and the drawer must show each poll's
+  // status/outputs/attempts, not the snapshot captured at click time.
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
 
   const blockTypes = useMemo(
     () => blockTypesFromDefinition(automation.data?.automation?.version?.definitionJson),
     [automation.data],
+  );
+
+  const steps = run.data?.run?.steps ?? [];
+  const selected = useMemo(
+    () => (selectedPath === null ? null : findTimelineStep(buildTimeline(steps), selectedPath)),
+    [steps, selectedPath],
   );
 
   const brief = run.data?.run?.brief;
@@ -164,16 +174,16 @@ export function RunPage(props: RunPageProps = {}) {
       )}
 
       <RunTimeline
-        steps={run.data?.run?.steps ?? []}
+        steps={steps}
         blockTypes={blockTypes}
-        selectedPath={selected?.path}
-        onSelect={setSelected}
+        selectedPath={selectedPath ?? undefined}
+        onSelect={(step) => setSelectedPath(step.path)}
       />
 
       <StepRunDrawer
         step={selected}
         blockType={selected ? blockTypes[selected.blockId] : undefined}
-        onClose={() => setSelected(null)}
+        onClose={() => setSelectedPath(null)}
       />
     </div>
   );

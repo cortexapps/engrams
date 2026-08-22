@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRouterTransport } from "@connectrpc/connect";
 
@@ -132,6 +132,72 @@ describe("RunPage", () => {
         params: { id: "auto-1", runId: "autorun:auto-1:retry:x" },
       }),
     );
+  });
+
+  it("an open step drawer follows the run's polls instead of freezing at click time", async () => {
+    // First poll: the step is still running with no session. Every later
+    // poll: it succeeded and has a session. The drawer is opened on the first
+    // shape and must show the second without being reopened.
+    let polls = 0;
+    const transport = createRouterTransport((router) => {
+      router.service(AutomationRunService, {
+        listRuns: () => ({ runs: [], filtered: [] }),
+        getRun: () => {
+          polls += 1;
+          const base = runResponse("running");
+          const step = base.run.steps[0]!;
+          if (polls === 1) {
+            return {
+              run: {
+                ...base.run,
+                steps: [
+                  {
+                    ...step,
+                    status: "running",
+                    outputsJson: "{}",
+                    sessionId: undefined,
+                    endedAt: undefined,
+                  },
+                ],
+                sessionIds: [],
+              },
+            };
+          }
+          return base;
+        },
+        stopRun: () => ({ sent: true }),
+        retryRun: () => ({ runId: "x" }),
+      });
+      router.service(AutomationService, {
+        getAutomation: () => ({
+          automation: {
+            id: "auto-1",
+            name: "Nightly triage",
+            version: {
+              definitionJson: JSON.stringify({
+                blocks: [{ id: "launch", type: "create_session", config: {} }],
+              }),
+            },
+          },
+        }),
+      });
+    });
+    renderWithProviders(<RunPage automationId="auto-1" runId={RUN_ID} />, { transport });
+
+    await userEvent.setup().click(await screen.findByTestId("timeline-step"));
+    const drawer = await screen.findByRole("dialog");
+    expect(within(drawer).getByLabelText("status running")).toBeTruthy();
+    expect(within(drawer).queryByTestId("session-link")).toBeNull();
+
+    // The 2s active poll lands the new shape; the SAME open drawer reflects it.
+    await waitFor(
+      () => {
+        expect(within(drawer).getByLabelText("status succeeded")).toBeTruthy();
+        expect(within(drawer).getByTestId("session-link")).toBeTruthy();
+      },
+      { timeout: 5_000 },
+    );
+    expect(polls).toBeGreaterThanOrEqual(2);
   });
 
   it("labels a completed run's action Re-run and opens the step drawer with a session link", async () => {
