@@ -1,13 +1,23 @@
 import type { DayRunCount } from "@/gen/engram/app/v1/automation_pb";
 
+/** Every run the server counted for the day. `other` is the server's bucket
+ * for pending/running/waiting/superseded/halted — a superseding automation
+ * can have whole days that are other-only, and those days RAN. */
+export function dayTotal(day: DayRunCount): number {
+  return day.completed + day.failed + day.filtered + day.other;
+}
+
 /** Colour class for one day's bar: instrument tokens only (lime is a fill
- * reserved for the accent, never a status — web/DESIGN.md). */
+ * reserved for the accent, never a status — web/DESIGN.md). Failures win;
+ * then any verdict (completed/filtered); an other-only day (superseded or
+ * in flight) is real activity without a verdict, so it reads as caution
+ * rather than as the zero stub. */
 export function dayTone(day: DayRunCount): "nominal" | "caution" | "critical" | "muted" {
-  const total = day.completed + day.failed + day.filtered;
-  if (total === 0) return "muted";
+  if (dayTotal(day) === 0) return "muted";
   if (day.failed > 0 && day.completed === 0) return "critical";
   if (day.failed > 0) return "caution";
-  return "nominal";
+  if (day.completed > 0 || day.filtered > 0) return "nominal";
+  return "caution";
 }
 
 const FILL: Record<ReturnType<typeof dayTone>, string> = {
@@ -66,7 +76,7 @@ export function Sparkline({
 }) {
   const week = sevenDayWindow(days, now);
   const slot = (W - GAP * 6) / 7;
-  const max = Math.max(1, ...week.map((d) => d.completed + d.failed + d.filtered));
+  const max = Math.max(1, ...week.map(dayTotal));
   return (
     <svg
       width={W}
@@ -77,7 +87,7 @@ export function Sparkline({
       className="shrink-0"
     >
       {week.map((day, i) => {
-        const total = day.completed + day.failed + day.filtered;
+        const total = dayTotal(day);
         const h = total === 0 ? 2 : Math.max(3, Math.round((total / max) * H));
         return (
           <rect

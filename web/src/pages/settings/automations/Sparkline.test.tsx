@@ -3,14 +3,14 @@ import { render } from "@testing-library/react";
 import { create } from "@bufbuild/protobuf";
 
 import { DayRunCountSchema, type DayRunCount } from "@/gen/engram/app/v1/automation_pb";
-import { dayTone, sevenDayWindow, Sparkline } from "./Sparkline";
+import { dayTone, dayTotal, sevenDayWindow, Sparkline } from "./Sparkline";
 
 // A pinned clock: "today" is 2026-08-21 UTC, so the window is 08-15..08-21.
 const NOW = new Date("2026-08-21T15:30:00Z");
 const D = (offset: number) => `2026-08-${String(15 + offset).padStart(2, "0")}`;
 
-function day(completed: number, failed = 0, filtered = 0, label = D(6)): DayRunCount {
-  return create(DayRunCountSchema, { day: label, completed, failed, filtered });
+function day(completed: number, failed = 0, filtered = 0, label = D(6), other = 0): DayRunCount {
+  return create(DayRunCountSchema, { day: label, completed, failed, filtered, other });
 }
 
 describe("dayTone", () => {
@@ -20,6 +20,16 @@ describe("dayTone", () => {
     expect(dayTone(day(0, 0, 2))).toBe("nominal"); // filtered-only is not a failure
     expect(dayTone(day(2, 1))).toBe("caution");
     expect(dayTone(day(0, 2))).toBe("critical");
+  });
+
+  it("an other-only day (superseded / in flight) is activity, not a zero stub", () => {
+    // A superseding automation can have whole days of superseded runs.
+    expect(dayTone(day(0, 0, 0, D(6), 5))).toBe("caution");
+    expect(dayTotal(day(1, 0, 0, D(6), 4))).toBe(5);
+    const { container } = render(<Sparkline days={[day(0, 0, 0, D(6), 5)]} now={NOW} />);
+    const today = container.querySelectorAll("rect")[6]!;
+    expect(today.getAttribute("data-tone")).toBe("caution");
+    expect(Number(today.getAttribute("height"))).toBeGreaterThan(2);
   });
 });
 
