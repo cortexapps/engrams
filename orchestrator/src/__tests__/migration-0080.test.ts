@@ -50,9 +50,15 @@ describe("migration 0080", () => {
     const files = (await readdir(DRIZZLE_DIR))
       .filter((name) => /^\d{4}_.*\.sql$/.test(name))
       .sort();
-    const upTo = files.filter((name) => name <= "0080_");
-    expect(upTo.at(-1)).toBe("0080_review_enrollment_engine.sql");
-    for (const file of upTo) await applyMigrationFile(file);
+    // Everything strictly before 0080, then 0080 itself. (Not `<= "0080_"`:
+    // "0080_review…" sorts AFTER the bare prefix, so that comparison silently
+    // excluded the target — and it would also have dragged in any later
+    // migration that now follows 0080, which is the 0075 test's idiom to
+    // avoid.)
+    const pre = files.filter((name) => name < "0080_");
+    const target = files.find((name) => name.startsWith("0080_"))!;
+    expect(target).toBe("0080_review_enrollment_engine.sql");
+    for (const file of [...pre, target]) await applyMigrationFile(file);
 
     // An enrolled repo from before the migration defaults to legacy.
     await pool!.query(`
