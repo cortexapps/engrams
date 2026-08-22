@@ -197,6 +197,24 @@ export function buildTimeline(steps: readonly AutomationStepRun[]): TimelineNode
   return roots;
 }
 
+/** Locate a step by its stable frame path in a (freshly built) tree. The run
+ * page keys its selection on the path, never on a step object, so an open
+ * drawer follows each poll instead of freezing at click time. */
+export function findTimelineStep(
+  nodes: readonly TimelineNode[],
+  path: string,
+): TimelineStep | null {
+  for (const node of nodes) {
+    if (node.kind === "step") {
+      if (node.step.path === path) return node.step;
+      continue;
+    }
+    const found = findTimelineStep(node.steps, path);
+    if (found) return found;
+  }
+  return null;
+}
+
 export function parseJsonObject(text: string): Record<string, unknown> | null {
   if (!text) return null;
   try {
