@@ -1,36 +1,21 @@
+/** Custom (generic HMAC) webhook registrations — the escape hatch for
+ * providers without a connector. Moved verbatim from the legacy Automations
+ * page (ADR 0119 phase 3.2); behavior unchanged: generic-only schemes, the
+ * one-time secret reveal, and the retired-registration banner (#1334).
+ */
 import { useMemo, useState } from "react";
-import { Link } from "@tanstack/react-router";
 import { toast } from "sonner";
-import {
-  ArchiveIcon,
-  CheckIcon,
-  Clock3Icon,
-  CopyIcon,
-  PlusIcon,
-  RadioTowerIcon,
-  Trash2Icon,
-  WebhookIcon,
-} from "lucide-react";
+import { CheckIcon, CopyIcon, PlusIcon, Trash2Icon, WebhookIcon } from "lucide-react";
 
-import type { Automation, WebhookRegistration } from "@/gen/engram/app/v1/automation_pb";
+import type { WebhookRegistration } from "@/gen/engram/app/v1/automation_pb";
 import { useConnectors } from "@/hooks/useIntegrations";
-import { useProfiles } from "@/hooks/useProfiles";
 import {
-  useArchiveAutomation,
-  useAutomations,
   useCreateWebhookRegistration,
   useDeleteWebhookRegistration,
-  useSetAutomationEnabled,
   useWebhookRegistrations,
 } from "@/hooks/useAutomations";
-import {
-  automationStatusLabel,
-  draftFromDefinition,
-  webhookConnectorHints,
-  type VerificationScheme,
-} from "@/lib/automations";
+import { webhookConnectorHints, type VerificationScheme } from "@/lib/automations";
 import { errorMessage } from "@/lib/errors";
-import { PageHeading } from "@/components/page-heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -62,133 +47,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
-
-function dateTime(value: string | undefined): string {
-  if (!value) return "—";
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
-}
-
-/** The automation's harness/model/effort override, or "" when it inherits the
- *  profile's default (ADR 0063 B2). Ids, not labels — the descriptor labels are
- *  not loaded on the list page. */
-function overrideSummary(automation: Automation): string {
-  const single = draftFromDefinition(automation.version?.definitionJson ?? "");
-  if (!single) return "";
-  return [single.harness, single.model, single.effort].filter((part) => !!part).join(" · ");
-}
-
-function StatusBadge({ status }: { status: string }) {
-  const variant =
-    status === "launched"
-      ? "default"
-      : status === "skipped"
-        ? "secondary"
-        : status
-          ? "destructive"
-          : "outline";
-  return <Badge variant={variant}>{status ? automationStatusLabel(status) : "never run"}</Badge>;
-}
-
-function AutomationRow({
-  automation,
-  triggerSummary,
-  lastRunStatus,
-  profileName,
-}: {
-  automation: Automation;
-  triggerSummary: string;
-  lastRunStatus: string;
-  profileName: string;
-}) {
-  const setEnabled = useSetAutomationEnabled();
-  const archive = useArchiveAutomation();
-  const override = overrideSummary(automation);
-  const summary = triggerSummary || "Trigger not configured";
-
-  const onEnabledChange = async (enabled: boolean) => {
-    try {
-      await setEnabled.mutateAsync({ id: automation.id, enabled });
-      toast.success(enabled ? "Automation enabled" : "Automation paused");
-    } catch (error) {
-      toast.error(errorMessage(error));
-    }
-  };
-
-  const onArchive = async () => {
-    try {
-      await archive.mutateAsync({ id: automation.id });
-      toast.success("Automation archived");
-    } catch (error) {
-      toast.error(errorMessage(error));
-    }
-  };
-
-  return (
-    <div className="grid gap-4 rounded-lg border bg-card p-4 shadow-xs md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
-      <Link
-        to="/settings/automations/$id"
-        params={{ id: automation.id }}
-        className="group min-w-0 outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-      >
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-base font-semibold group-hover:underline">{automation.name}</span>
-          <StatusBadge status={lastRunStatus} />
-          {automation.kind === "builtin" && <Badge variant="secondary">built-in</Badge>}
-        </div>
-        {automation.description && (
-          <p className="mt-1 truncate text-sm text-muted-foreground">{automation.description}</p>
-        )}
-        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-          <span className="inline-flex min-w-0 items-center gap-1.5 font-mono">
-            {summary.startsWith("Cron") ? (
-              <Clock3Icon className="size-3.5 shrink-0" />
-            ) : (
-              <WebhookIcon className="size-3.5 shrink-0" />
-            )}
-            <span className="truncate">{summary}</span>
-          </span>
-          <span>Profile: {profileName}</span>
-          {override && <span>Runs on: {override}</span>}
-          {automation.nextFireAt && <span>Next: {dateTime(automation.nextFireAt)}</span>}
-        </div>
-      </Link>
-      <div className="flex items-center justify-between gap-2 md:justify-end">
-        <label className="inline-flex items-center gap-2 text-sm">
-          <Switch
-            aria-label={`${automation.enabled ? "Disable" : "Enable"} ${automation.name}`}
-            checked={automation.enabled}
-            disabled={setEnabled.isPending}
-            onCheckedChange={onEnabledChange}
-          />
-          {automation.enabled ? "Enabled" : "Paused"}
-        </label>
-        <AlertDialog>
-          <AlertDialogTrigger asChild>
-            <Button variant="ghost" size="sm">
-              <ArchiveIcon className="size-4" />
-              Archive
-            </Button>
-          </AlertDialogTrigger>
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>Archive “{automation.name}”?</AlertDialogTitle>
-              <AlertDialogDescription>
-                It will stop receiving webhook events or scheduled fires. Run history remains
-                available in the database.
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <AlertDialogAction onClick={onArchive}>Archive automation</AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
-      </div>
-    </div>
-  );
-}
 
 const SCHEME_LABELS: Record<VerificationScheme, string> = {
   generic_hmac_sha256: "Generic HMAC SHA-256",
@@ -470,99 +328,38 @@ function RegistrationRow({ registration }: { registration: WebhookRegistration }
   );
 }
 
-export function Automations() {
-  const automations = useAutomations();
+export function WebhookRegistrationsPanel() {
   const registrations = useWebhookRegistrations();
-  const profiles = useProfiles(true);
-  const profileNames = new Map(
-    (profiles.data?.profiles ?? []).map((profile) => [profile.id, profile.name]),
-  );
-
   return (
-    <div className="space-y-8">
-      <PageHeading
-        title="Automations"
-        actions={
-          <Button asChild size="sm">
-            <Link to="/settings/automations/new">
-              <PlusIcon className="size-3.5" />
-              New automation
-            </Link>
-          </Button>
-        }
-      />
-
-      <section className="space-y-3" aria-labelledby="automation-list-heading">
-        <div className="flex items-center gap-2">
-          <RadioTowerIcon className="size-4 text-muted-foreground" />
-          <h2 id="automation-list-heading" className="font-semibold">
-            Active automations
-          </h2>
-          <span className="font-mono text-xs text-muted-foreground">
-            {automations.data?.automations.length ?? 0}
-          </span>
-        </div>
-        {automations.isPending && <p className="text-sm text-muted-foreground">Loading…</p>}
-        {automations.error && (
-          <p className="text-sm text-destructive">{errorMessage(automations.error)}</p>
-        )}
-        {!automations.isPending && (automations.data?.automations.length ?? 0) === 0 && (
-          <div className="rounded-lg border border-dashed p-8 text-center">
-            <p className="text-sm text-muted-foreground">No automations yet</p>
-            <Button asChild className="mt-3">
-              <Link to="/settings/automations/new">Create automation</Link>
-            </Button>
+    <section className="space-y-3 border-t pt-6" aria-labelledby="webhook-list-heading">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <WebhookIcon className="size-4 text-muted-foreground" />
+            <h2 id="webhook-list-heading" className="font-semibold">
+              Webhook registrations
+            </h2>
           </div>
-        )}
-        <div className="space-y-3">
-          {automations.data?.automations.map((summary) => {
-            const automation = summary.automation;
-            if (!automation) return null;
-            const profileId =
-              draftFromDefinition(automation.version?.definitionJson ?? "")?.profileId ?? "";
-            return (
-              <AutomationRow
-                key={automation.id}
-                automation={automation}
-                triggerSummary={summary.triggerSummary}
-                lastRunStatus={summary.lastRun?.status ?? ""}
-                profileName={profileNames.get(profileId) ?? profileId ?? "—"}
-              />
-            );
-          })}
+          <p className="mt-1 text-sm text-muted-foreground">
+            Verified endpoints that can feed one or more automations.
+          </p>
         </div>
-      </section>
-
-      <section className="space-y-3 border-t pt-6" aria-labelledby="webhook-list-heading">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <div className="flex items-center gap-2">
-              <WebhookIcon className="size-4 text-muted-foreground" />
-              <h2 id="webhook-list-heading" className="font-semibold">
-                Webhook registrations
-              </h2>
-            </div>
-            <p className="mt-1 text-sm text-muted-foreground">
-              Verified endpoints that can feed one or more automations.
-            </p>
-          </div>
-          <CreateRegistrationDialog />
+        <CreateRegistrationDialog />
+      </div>
+      {registrations.isPending && <p className="text-sm text-muted-foreground">Loading…</p>}
+      {registrations.error && (
+        <p className="text-sm text-destructive">{errorMessage(registrations.error)}</p>
+      )}
+      {!registrations.isPending && (registrations.data?.registrations.length ?? 0) === 0 && (
+        <div className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">
+          No registered webhook endpoints. Cron automations do not need one.
         </div>
-        {registrations.isPending && <p className="text-sm text-muted-foreground">Loading…</p>}
-        {registrations.error && (
-          <p className="text-sm text-destructive">{errorMessage(registrations.error)}</p>
-        )}
-        {!registrations.isPending && (registrations.data?.registrations.length ?? 0) === 0 && (
-          <div className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">
-            No registered webhook endpoints. Cron automations do not need one.
-          </div>
-        )}
-        <div className="grid gap-3 lg:grid-cols-2">
-          {registrations.data?.registrations.map((registration) => (
-            <RegistrationRow key={registration.id} registration={registration} />
-          ))}
-        </div>
-      </section>
-    </div>
+      )}
+      <div className="grid gap-3 lg:grid-cols-2">
+        {registrations.data?.registrations.map((registration) => (
+          <RegistrationRow key={registration.id} registration={registration} />
+        ))}
+      </div>
+    </section>
   );
 }

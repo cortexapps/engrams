@@ -7,11 +7,23 @@ import {
   definitionFromDraft,
   draftFromDefinition,
   rawVariables,
+  relativeTime,
   singleBlockPreview,
   webhookConnectorHints,
 } from "@/lib/automations";
 
 describe("automation UI helpers", () => {
+  it("relativeTime is symmetric for past and future (next-fire renders 'in Xm', never 'just now')", () => {
+    const now = new Date("2026-08-22T12:00:00Z");
+    expect(relativeTime("2026-08-22T11:56:00Z", now)).toBe("4m ago");
+    expect(relativeTime("2026-08-22T12:04:00Z", now)).toBe("in 4m");
+    expect(relativeTime("2026-08-22T15:00:00Z", now)).toBe("in 3h");
+    expect(relativeTime("2026-08-24T12:00:00Z", now)).toBe("in 2d");
+    expect(relativeTime("2026-08-22T12:00:30Z", now)).toBe("any moment");
+    expect(relativeTime("2026-08-22T11:59:30Z", now)).toBe("just now");
+    expect(relativeTime(undefined, now)).toBe("never");
+  });
+
   it("offers only connectors with a webhook facet and no integration ingress", () => {
     const connectors = [
       create(ConnectorSchema, {

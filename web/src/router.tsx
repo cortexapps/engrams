@@ -65,7 +65,7 @@ import { GoogleCloudSetupPage } from "./components/integrations/GoogleCloudSetup
 import { TokensPanel } from "./components/settings/TokensPanel";
 import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
-import { Automations } from "./pages/settings/Automations";
+import { AutomationsList } from "./pages/settings/automations/AutomationsList";
 import {
   AutomationEditor,
   isEditorTab,
@@ -465,11 +465,15 @@ const profileEditRoute = createRoute({
   beforeLoad: requireAdmin,
   component: () => <SessionProfileEditor mode="edit" />,
 });
+export type AutomationEditorTab = EditorTab;
+export interface AutomationEditorSearch {
+  tab?: AutomationEditorTab;
+}
 const automationsRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "automations",
   beforeLoad: requireAdmin,
-  component: Automations,
+  component: AutomationsList,
 });
 const automationsNewRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
