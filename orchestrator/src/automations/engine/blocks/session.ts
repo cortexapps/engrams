@@ -204,7 +204,6 @@ export function registerSessionBlocks(): void {
     type: "send_prompt",
     outputs: ["outcome", "signal"],
     configSchema: sendPromptConfigSchema,
-    requiresSession: true,
     async execute(config, ctx) {
       const sessionId = await ctx.resolveSession(config.session);
       const text = await ctx.render(config.promptTemplate);
@@ -235,7 +234,6 @@ export function registerSessionBlocks(): void {
     type: "wait_session",
     outputs: ["outcome"],
     configSchema: waitSessionConfigSchema,
-    requiresSession: true,
     async execute(config, ctx) {
       const sessionId = await ctx.resolveSession(config.session);
       return { kind: "ok", outputs: { session_id: sessionId } };
@@ -258,7 +256,6 @@ export function registerSessionBlocks(): void {
   registerBlock<EndSessionConfig>({
     type: "end_session",
     configSchema: endSessionConfigSchema,
-    requiresSession: true,
     async execute(config, ctx) {
       const sessionId = await ctx.resolveSession(config.session);
       await ctx.deps.sessions.endSession(sessionId);
