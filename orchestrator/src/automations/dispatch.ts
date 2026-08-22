@@ -9,6 +9,7 @@
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
+import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
 
 import {
@@ -379,7 +380,19 @@ export interface IntegrationDispatchStore extends AutomationDispatchStore {
   ): Promise<DispatchTarget[]>;
 }
 
+/** Built-in keys whose kill switch is ON. Resolved from config by default;
+ * tests inject. Each built-in's switch registers its key here — one line per
+ * switch, so the dispatcher gate and the route fallback can never disagree.
+ * "pr_review" ← ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED (4.4). */
+export function disabledBuiltinsFromConfig(): ReadonlySet<string> {
+  const keys: string[] = [];
+  if (config.reviewAutomationDisabled) keys.push("pr_review");
+  return new Set(keys);
+}
+
 export interface DispatchIntegrationDeps {
+  /** Kill-switched built-in keys; their triggers never admit a run. */
+  disabledBuiltins?: ReadonlySet<string>;
   store?: IntegrationDispatchStore;
   workflowStarter?: AutomationWebhookStarter;
   sender?: AutomationSender;
@@ -452,10 +465,22 @@ export async function dispatchIntegrationEvent(
   const starter = deps.workflowStarter ?? defaultWorkflowStarter();
   const sender = deps.sender ?? defaultAutomationSender;
   const now = deps.now ?? (() => new Date());
+  const disabledBuiltins = deps.disabledBuiltins ?? disabledBuiltinsFromConfig();
 
   const targets = (
     await store.listEnabledForIntegrationTrigger(input.provider, input.connectionId)
   ).filter((target) => {
+    // A built-in's kill switch must stop its TRIGGER path too, not only the
+    // legacy route's fallback: otherwise a flagged repo/channel is served by
+    // both brains at once (the legacy graph via the route, the built-in via
+    // this dispatcher). The switch is the fleet-wide brake; the built-in's
+    // own `enabled` toggle is the independent second one.
+    if (
+      target.automation.builtinKey !== null &&
+      disabledBuiltins.has(target.automation.builtinKey)
+    ) {
+      return false;
+    }
     const trigger = target.definition.trigger;
     if (trigger.kind !== "integration") return false;
     return matchesIntegrationTrigger(

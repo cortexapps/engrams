@@ -39,7 +39,10 @@ the PR-review automation on the Automations page is **enabled** with
    delivery reviews on the legacy path.
 2. **Fleet-wide kill switch:** set `ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED=1`
    (or `true`) and restart the orchestrator pods. Every repo reviews on legacy
-   regardless of its flag, without touching any row. The built-in's own
+   regardless of its flag, without touching any row. The switch gates BOTH
+   halves — the GitHub route falls back to the legacy graph, and the
+   integration dispatcher refuses to admit runs for the `pr_review` built-in —
+   so a flagged repo is never reviewed by both brains. The built-in's own
    `enabled=false` toggle is an independent third brake.
 
 ## What to watch on the first flagged repo
