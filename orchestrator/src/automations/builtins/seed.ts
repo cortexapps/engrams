@@ -34,6 +34,7 @@ import {
   type BuiltinAutomation,
 } from "../engine/builtins.ts";
 import { DEFAULT_CONNECTION_PLACEHOLDER, PR_REVIEW_BUILTIN, PR_REVIEW_BUILTIN_KEY } from "./pr-review.ts";
+import { SLACK_BRAIN_BUILTIN } from "./slack-brain.ts";
 
 const log = rootLog.child({ component: "builtin-seed" });
 
@@ -282,6 +283,7 @@ export function registerShippedBuiltins(): void {
   if (registered) return;
   registered = true;
   registerBuiltinAutomation(PR_REVIEW_BUILTIN);
+  registerBuiltinAutomation(SLACK_BRAIN_BUILTIN);
 }
 
 /** Production wiring; fire-and-forget at boot next to the reviewer-profile seed. */
