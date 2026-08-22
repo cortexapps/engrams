@@ -472,6 +472,7 @@ export async function interpretAutomation(
     // Data / wait blocks: engine-level retry loop, one step per attempt.
     const policy = retryPolicy(block);
     ctx.currentBlockId = block.id;
+    ctx.currentPath = path;
     let lastError: Extract<BlockOutcome, { kind: "error" }> | null = null;
     for (let attempt = 0; attempt < policy.attempts; attempt += 1) {
       ctx.currentAttempt = attempt;
@@ -554,6 +555,7 @@ export async function interpretAutomation(
       break;
     }
     ctx.currentBlockId = undefined;
+    ctx.currentPath = undefined;
     ctx.currentAttempt = undefined;
     if (lastError) {
       throw new RunEnd("failed", `block "${block.id}": ${lastError.code}: ${lastError.message}`);
@@ -588,6 +590,7 @@ export async function interpretAutomation(
     const executor = getBlock(block.type);
     const path = `__finalize__.${block.id}`;
     ctx.currentBlockId = block.id;
+    ctx.currentPath = path;
     ctx.currentAttempt = 0;
     const outcome: BlockOutcome = await deps.step(async () => {
       if (!executor) {
@@ -601,6 +604,7 @@ export async function interpretAutomation(
       return executeDataBlock(block, executor, path, 0);
     }, `step:${path}:0`);
     ctx.currentBlockId = undefined;
+    ctx.currentPath = undefined;
     ctx.currentAttempt = undefined;
     if (outcome.kind === "ok") {
       recordStepOutputs(ctx, block.id, path, outcome.outputs);

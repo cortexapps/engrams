@@ -161,6 +161,11 @@ function currentBlockId(ctx: RunContext): string {
   return ctx.currentBlockId;
 }
 
+function currentPath(ctx: RunContext): string {
+  if (ctx.currentPath === undefined) throw new Error("engine bug: currentPath missing");
+  return ctx.currentPath;
+}
+
 function matchesSessionMessage(
   msg: AutomationInbox,
   sessionId: string,
@@ -203,7 +208,10 @@ export function registerSessionBlocks(): void {
     async execute(config, ctx) {
       const sessionId = await ctx.resolveSession(config.session);
       const text = await ctx.render(config.promptTemplate);
-      const promptId = `autorun:${ctx.runId}:${currentBlockId(ctx)}:${sessionId}`;
+      // Keyed by frame path: the coordinator outbox dedupes on prompt_id
+      // (ON CONFLICT DO NOTHING), so a send_prompt inside a loop must mint
+      // a new id per iteration or every prompt after the first is dropped.
+      const promptId = `autorun:${ctx.runId}:${currentPath(ctx)}:${sessionId}`;
       await ctx.deps.sessions.sendPrompt(sessionId, promptId, text, config.harnessMode);
       return { kind: "ok", outputs: { session_id: sessionId, sent: true } };
     },

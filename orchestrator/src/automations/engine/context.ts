@@ -56,6 +56,12 @@ export interface RunContext {
   loop?: { index: number };
   /** Set by the interpreter for the duration of one block's execute/wait. */
   currentBlockId?: string;
+  /** The block's frame path (`loop[2].post`, `__finalize__.recap`): the
+   * run-durable identity of THIS execution. Every idempotency key a block
+   * mints (prompt ids, action client ids, markers) derives from it, never
+   * from `currentBlockId` — a block inside a loop runs once per iteration
+   * and each must reach its own external resource. */
+  currentPath?: string;
   currentAttempt?: number;
   /** Set once the run has a terminal status, before finalize hooks run, so
    * a hook's templates can read `run.status` / `run.error`. */

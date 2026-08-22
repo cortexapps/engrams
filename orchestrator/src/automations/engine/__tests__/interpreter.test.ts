@@ -28,7 +28,7 @@ interface Harness {
   execs: Array<{ sessionId: string; command: string; execId: string }>;
   released: string[];
   promoted: string[];
-  actions: Array<{ actionId: string; params: Record<string, unknown> }>;
+  actions: Array<{ actionId: string; stepPath: string; params: Record<string, unknown> }>;
 }
 
 function makeDefinition(
@@ -67,7 +67,7 @@ function makeHarness(
   const execs: Harness["execs"] = [];
   const released: string[] = [];
   const promoted: string[] = [];
-  const actions: Array<{ actionId: string; params: Record<string, unknown> }> = [];
+  const actions: Array<{ actionId: string; stepPath: string; params: Record<string, unknown> }> = [];
   const recvQueue = [...(options.recv ?? [])];
   const runSessions = options.sessions ?? [];
   let clock = 1_000_000_000;
@@ -152,7 +152,7 @@ function makeHarness(
     integrationActions: {
       async execute(input) {
         if (options.failActions) throw new Error("provider down");
-        actions.push({ actionId: input.actionId, params: input.params });
+        actions.push({ actionId: input.actionId, stepPath: input.stepPath, params: input.params });
         return { comment_id: 7 };
       },
     },
@@ -296,7 +296,48 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 3)
       "step:poll[0].__until__:0",
       "step:__finalize__:0",
     ]);
-    expect(h.execs[0]!.execId).toBe(`exec:auto:${RUN.runId}:tick:a0`);
+    expect(h.execs[0]!.execId).toBe(`exec:auto:${RUN.runId}:poll[0].tick:a0`);
+  });
+
+  test("every loop iteration mints its own idempotency identity (exec, prompt, action)", async () => {
+    // Regression: keys derived from the static block id collapsed a loop's
+    // iterations onto one external resource — the coordinator outbox dedupes
+    // prompt_id (ON CONFLICT DO NOTHING), durable exec attaches to an
+    // existing execId, and action client ids / markers dedupe on the provider.
+    const definition = makeDefinition([
+      { id: "launch", type: "create_session", config: { profileId: "p", promptTemplate: "go" } },
+      {
+        id: "turns",
+        type: "loop",
+        config: { maxIterations: 2 },
+        body: [
+          {
+            id: "ask",
+            type: "send_prompt",
+            config: { session: { blockId: "launch" }, promptTemplate: "again", waitFor: { kind: "none" } },
+          },
+          { id: "tick", type: "run_command", config: { session: { blockId: "launch" }, commandTemplate: "true" } },
+          {
+            id: "post",
+            type: "integration_action",
+            config: { provider: "github", actionId: "create_issue_comment", params: { body: "hi" } },
+          },
+        ],
+      },
+    ]);
+    const h = makeHarness(definition);
+    const result = await interpretAutomation(RUN, h.deps);
+
+    expect(result.status).toBe("completed");
+    expect(h.prompts.map((p) => p.promptId)).toEqual([
+      `autorun:${RUN.runId}:turns[0].ask:s-launch`,
+      `autorun:${RUN.runId}:turns[1].ask:s-launch`,
+    ]);
+    expect(h.execs.map((e) => e.execId)).toEqual([
+      `exec:auto:${RUN.runId}:turns[0].tick:a0`,
+      `exec:auto:${RUN.runId}:turns[1].tick:a0`,
+    ]);
+    expect(h.actions.map((a) => a.stepPath)).toEqual(["turns[0].post", "turns[1].post"]);
   });
 
   test("engine-level retries mint attempt-scoped steps then fail the run", async () => {

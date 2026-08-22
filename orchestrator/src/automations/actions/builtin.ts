@@ -45,7 +45,7 @@ export interface SlackChatClient {
 
 export interface BuiltinActionContext {
   runId: string;
-  blockId: string;
+  stepPath: string;
   /** Rendered marker for marker_comment idempotency; null otherwise. */
   marker: string | null;
 }
@@ -156,7 +156,7 @@ export const BUILTIN_ACTIONS: BuiltinActionTable = {
       throw new IntegrationActionError(`missing required integer "prNumber"`, true);
     }
     const summary = requireString(params, "summary");
-    const marker = ctx.marker ?? `<!-- engrams-automation:${ctx.runId}:${ctx.blockId} -->`;
+    const marker = ctx.marker ?? `<!-- engrams-automation:${ctx.runId}:${ctx.stepPath} -->`;
     if (await markerAlreadyPosted(deps.runOp, repo, prNumber, marker)) {
       return { posted: false, already_posted: true };
     }
@@ -205,7 +205,7 @@ export const BUILTIN_ACTIONS: BuiltinActionTable = {
     // CreateLinearIssueInput takes a caller-minted id (the in-repo spec-ticket
     // precedent), so client_id idempotency is real: a retried create adopts.
     const issue = await deps.linearClient().createIssue({
-      id: actionClientId(ctx.runId, ctx.blockId),
+      id: actionClientId(ctx.runId, ctx.stepPath),
       teamId: requireString(params, "teamId"),
       title: requireString(params, "title"),
       description: optionalString(params, "description") ?? "",
