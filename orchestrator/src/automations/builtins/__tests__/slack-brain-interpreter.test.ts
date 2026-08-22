@@ -313,6 +313,28 @@ describe("Slack thread brain through the interpreter", () => {
     expect(h.policyCalls.some((c) => c.startsWith("complete:"))).toBe(true);
   });
 
+  test("(d') a bare `@bot` follow-up is not a turn: no prompt, no failure, the thread continues", async () => {
+    const h = harness({
+      recv: [
+        { kind: "session_idle", sessionId: "s-1" },
+        // Nothing left once the mention is stripped.
+        joined("<@UBOT>", "100.2"),
+        joined("<@UBOT> now the real question", "100.3"),
+        { kind: "session_idle", sessionId: "s-1" },
+        null,
+        null,
+      ],
+    });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("completed");
+    // The empty turn never reached send_prompt (which refuses an empty prompt);
+    // the next real message did.
+    expect(h.prompts.map((p) => p.text)).toEqual(["now the real question"]);
+    expect(h.names).not.toContain("step:thread[0].has_turn.turn:0");
+    expect(h.names).toContain("step:thread[1].has_turn.turn:0");
+    expect(h.policyCalls.at(-1)).toBe("complete:");
+  });
+
   test("(e) a failed turn ends the run as failed and posts ❌ through the policy", async () => {
     const h = harness({
       recv: [{ kind: "session_idle", sessionId: "s-1", runFailed: true }],

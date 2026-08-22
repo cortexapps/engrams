@@ -89,7 +89,10 @@ export default ({ event, inputs, trigger }) => {
 };
 `.trim();
 
-/** The joined follow-up message, as wait_event leaves it in steps.next.event. */
+/** The joined follow-up message, as wait_event leaves it in steps.next.event.
+ * `has_text` is the turn gate: a bare `@bot` (nothing left once the mention
+ * is stripped) is not a prompt — send_prompt refuses an empty prompt, and
+ * that refusal would fail the whole run. */
 const NEXT_TEXT_SOURCE = `
 export default ({ steps }) => {
   const ev = steps.next?.event?.event ?? {};
@@ -97,7 +100,12 @@ export default ({ steps }) => {
     .replace(/<@[^>]+>/g, " ")
     .replace(/[^\\S\\n]+/g, " ")
     .trim();
-  return { text, mention_ts: String(ev.ts ?? ""), user_id: String(ev.user ?? "") };
+  return {
+    text,
+    has_text: text.length > 0,
+    mention_ts: String(ev.ts ?? ""),
+    user_id: String(ev.user ?? ""),
+  };
 };
 `.trim();
 
@@ -187,15 +195,20 @@ const conversation: BlockDef = {
       type: "code",
       config: { source: NEXT_TEXT_SOURCE, mode: "value" },
     },
-    // The deadline branch: wait_event leaves outcome=deadline and no event;
-    // send_prompt must not fire on an empty turn, so gate it.
+    // The turn gate: wait_event leaves outcome=deadline and no event on a
+    // quiet thread, and a bare mention leaves no text; send_prompt must not
+    // fire on either (an empty prompt is a render failure that would end the
+    // run), so the branch requires an event WITH text.
     {
       id: "has_turn",
       type: "branch",
       config: {
         conditions: {
           mode: "all",
-          conditions: [{ path: "steps.next.outcome", op: "equals", value: "event" }],
+          conditions: [
+            { path: "steps.next.outcome", op: "equals", value: "event" },
+            { path: "steps.turn_text.value.has_text", op: "is_true" },
+          ],
         },
       },
       then: [
