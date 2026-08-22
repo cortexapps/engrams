@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Error as DBOSErrors } from "@dbos-inc/dbos-sdk";
 
 import { AUTOMATION_TOPIC, type AutomationInbox } from "../../automations/engine/inbox.ts";
 import {
@@ -34,6 +35,37 @@ describe("Automation consumer", () => {
     expect(await consumer.appliesTo("session-1")).toBe(false);
     expect(await consumer.appliesTo("session-1")).toBe(false);
     expect(lookups).toBe(1);
+  });
+
+  test("a send to a finished run is a no-op; any other send failure still propagates", async () => {
+    // A kept session outlives its run: DBOS rejects the send. The event is
+    // dropped (not retried forever), so the listener's cursor advances.
+    let calls = 0;
+    const consumer = makeAutomationConsumer({
+      findSessionBinding: async () => ({ runId: RUN_ID, relay: true }),
+      send: async () => {
+        calls += 1;
+        throw new DBOSErrors.DBOSNonExistentWorkflowError(RUN_ID);
+      },
+    });
+    expect(await consumer.appliesTo("session-1")).toBe(true);
+    await consumer.handle(
+      { idx: 7n, kind: "run_completed", payloadJson: `{"ok":true}` },
+      { sessionId: "session-1" },
+    );
+    await consumer.onTerminal?.("failed", { sessionId: "session-1" });
+    expect(calls).toBe(3); // session_event, session_idle, session_ended — each dropped
+
+    const broken = makeAutomationConsumer({
+      findSessionBinding: async () => ({ runId: RUN_ID }),
+      send: async () => {
+        throw new Error("postgres down");
+      },
+    });
+    await broken.appliesTo("session-2");
+    await expect(
+      broken.handle({ idx: 1n, kind: "run_completed", payloadJson: "{}" }, { sessionId: "session-2" }),
+    ).rejects.toThrow("postgres down");
   });
 
   test("run_completed becomes session_idle with an idx-scoped key", async () => {
