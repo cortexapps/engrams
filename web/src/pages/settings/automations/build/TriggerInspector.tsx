@@ -39,7 +39,8 @@ const KINDS: ReadonlyArray<{ kind: TriggerSpec["kind"]; label: string; help: str
 export interface TriggerInspectorProps {
   trigger: TriggerSpec;
   onChange: (next: TriggerSpec) => void;
-  /** Built-in: trigger kind/provider/events are pinned; scope stays editable. */
+  /** Built-in: the whole trigger is pinned, scope included (narrow via the
+   * Inputs tab when the scope reads from an input). */
   builtin: boolean;
   errors: readonly BlockErrorRef[];
 }
@@ -209,6 +210,7 @@ function IntegrationTrigger({ trigger, onChange, builtin, errors }: TriggerInspe
           <FieldLabel>{catalog.data.scope.label}</FieldLabel>
           <Select
             value={scopeMode}
+            disabled={builtin}
             onValueChange={(mode) =>
               onChange({
                 ...trigger,
@@ -235,6 +237,7 @@ function IntegrationTrigger({ trigger, onChange, builtin, errors }: TriggerInspe
               className="font-mono text-sm"
               placeholder="owner/repo, owner/other"
               value={(scope?.values ?? []).join(", ")}
+              disabled={builtin}
               onChange={(e) =>
                 onChange({
                   ...trigger,
@@ -253,13 +256,18 @@ function IntegrationTrigger({ trigger, onChange, builtin, errors }: TriggerInspe
               className="font-mono text-sm"
               placeholder="repos"
               value={scope?.fromInput ?? ""}
+              disabled={builtin}
               onChange={(e) => onChange({ ...trigger, scope: { fromInput: e.target.value } })}
             />
           )}
           <FieldDescription>
-            {scopeMode === "input"
-              ? "The keys of a map input (or items of a list input) narrow which deliveries match."
-              : "Narrow deliveries to a subset; the scope stays editable on built-ins."}
+            {builtin
+              ? scopeMode === "input"
+                ? `Set by the built-in: the keys of the "${scope?.fromInput ?? ""}" input narrow which deliveries match — edit that input on the Inputs tab.`
+                : "Set by the built-in."
+              : scopeMode === "input"
+                ? "The keys of a map input (or items of a list input) narrow which deliveries match."
+                : "Narrow deliveries to a subset."}
           </FieldDescription>
         </Field>
       )}
