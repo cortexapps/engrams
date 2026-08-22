@@ -30,6 +30,23 @@ vi.mock("@/hooks/useAutomationEditor", () => ({
   useActionCatalog: () => ({ data: undefined }),
   useEditorWebhookRegistrations: () => ({ data: { registrations: [] } }),
 }));
+// 3.4: the shell instantiates the test-with-sample state; the shell tests
+// exercise save paths, not rendering, so the hook is inert here.
+vi.mock("@/hooks/useAutomationTest", () => ({
+  useAutomationTest: () => ({
+    isTimed: false,
+    samples: [],
+    samplesLoading: false,
+    sample: { kind: "none" },
+    setSample: vi.fn(),
+    latest: null,
+    tally: null,
+    running: false,
+    runOnce: vi.fn(),
+    runAcrossSamples: vi.fn(),
+    variableValues: {},
+  }),
+}));
 vi.mock("@/hooks/useProfiles", () => ({
   useProfiles: () => ({
     data: { profiles: [{ id: "pr_reviewer", name: "PR reviewer", harness: "claude" }] },
