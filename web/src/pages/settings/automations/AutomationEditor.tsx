@@ -45,6 +45,7 @@ import { useAutomationTest } from "@/hooks/useAutomationTest";
 
 import { BuildTab } from "./build/BuildTab";
 import { TestPanel } from "./build/test/TestPanel";
+import { InputsTab } from "./inputs/InputsTab";
 
 export const EDITOR_TABS = ["build", "inputs", "runs", "settings"] as const;
 export type EditorTab = (typeof EDITOR_TABS)[number];
@@ -355,7 +356,7 @@ export function AutomationEditor({
           />
         </TabsContent>
         <TabsContent value="inputs" className="pt-4">
-          {inputsTab ?? <Placeholder item="3.6 (Inputs)" />}
+          {inputsTab ?? <InputsTab automationId={id} />}
         </TabsContent>
         <TabsContent value="runs" className="pt-4">
           {runsTab ?? <Placeholder item="3.7 (Runs)" />}
