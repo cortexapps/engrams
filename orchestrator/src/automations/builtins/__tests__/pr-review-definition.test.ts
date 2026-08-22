@@ -1,0 +1,139 @@
+import { describe, expect, test } from "bun:test";
+
+import { registerEngineBlocks } from "../../engine/blocks/index.ts";
+import { validateDefinition, applyBlockOverrides } from "../../engine/definition.ts";
+import { evaluateCode } from "../../code/sandbox.ts";
+import { PR_REVIEW_BUILTIN, PR_REVIEW_DEFINITION, REVIEW_FACTS_SOURCE } from "../pr-review.ts";
+
+registerEngineBlocks();
+
+const inputs = {
+  repos: { "Acme/Repo": { mode: "auto", autofix: false }, "acme/manual": { mode: "on_request", autofix: false } },
+  profile: "pr_reviewer",
+  mention: "@engrams",
+  categories: ["functional-correctness"],
+  instructions: "Prefer small diffs.",
+};
+
+function prEvent(action: string, overrides: Record<string, unknown> = {}) {
+  return {
+    raw: {
+      action,
+      repository: { full_name: "acme/repo", name: "repo" },
+      pull_request: {
+        id: 42,
+        number: 7,
+        draft: false,
+        html_url: "https://github.com/acme/repo/pull/7",
+        title: "Fix",
+        user: { login: "dev" },
+        state: "open",
+        updated_at: "2026-08-21T00:00:00Z",
+        head: { sha: "a".repeat(40), ref: "fix" },
+        base: { sha: "b".repeat(40), ref: "main" },
+        additions: 1,
+        deletions: 0,
+        changed_files: 1,
+        ...overrides,
+      },
+    },
+  };
+}
+
+function commentEvent(body: string, assoc = "MEMBER", senderType = "User", repo = "acme/manual") {
+  return {
+    raw: {
+      action: "created",
+      repository: { full_name: repo, name: repo.split("/")[1] },
+      issue: { number: 9, pull_request: { url: "x" }, html_url: `https://github.com/${repo}/pull/9` },
+      comment: { body, author_association: assoc },
+      sender: { type: senderType },
+    },
+  };
+}
+
+describe("PR_REVIEW_BUILTIN definition", () => {
+  test("validates as a builtin and rejects as a user definition (system blocks)", () => {
+    expect(() => validateDefinition(PR_REVIEW_DEFINITION, { kind: "builtin" })).not.toThrow();
+    expect(() => validateDefinition(PR_REVIEW_DEFINITION, { kind: "user" })).toThrow(/reserved/);
+  });
+
+  test("every tunable field exists in its block's config", () => {
+    const walk = (blocks: typeof PR_REVIEW_DEFINITION.blocks) => {
+      for (const b of blocks) {
+        for (const f of b.tunable ?? []) {
+          expect(Object.keys(b.config), `${b.id}.${f}`).toContain(f);
+        }
+        if (b.then) walk(b.then);
+        if (b.else) walk(b.else);
+        if (b.body) walk(b.body);
+      }
+    };
+    walk(PR_REVIEW_DEFINITION.blocks);
+  });
+
+  test("a block override on a tunable field merges and re-validates", () => {
+    const merged = applyBlockOverrides(PR_REVIEW_DEFINITION, {
+      find: { deadlineSeconds: 900 },
+      finder: { networkOverride: { default: "deny", allowHosts: ["github.com", "pypi.org"], allowHostPatterns: [] } },
+    });
+    const find = merged.blocks.find((b) => b.id === "find")!;
+    expect(find.config["deadlineSeconds"]).toBe(900);
+    expect(() => applyBlockOverrides(PR_REVIEW_DEFINITION, { open: { repo: "x/y" } })).toThrow(/not tunable/);
+  });
+
+  test("defaultInputs matches the inputs schema keys", async () => {
+    const defaults = await PR_REVIEW_BUILTIN.defaultInputs();
+    expect(Object.keys(defaults).sort()).toEqual(
+      PR_REVIEW_DEFINITION.inputsSchema.map((f) => f.key).sort(),
+    );
+  });
+});
+
+describe("review facts predicate (QuickJS)", () => {
+  const run = (event: unknown, trigger: Record<string, unknown>) =>
+    evaluateCode(REVIEW_FACTS_SOURCE, { event, inputs, trigger }, "value");
+
+  test("admits an auto-mode PR and derives the facts", async () => {
+    const r = await run(prEvent("opened"), { event: "pull_request.opened" });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value).toMatchObject({
+      admit: true,
+      repo: "acme/repo",
+      repo_name: "repo",
+      pr_number: 7,
+      trigger: "opened",
+      head_sha: "a".repeat(40),
+      pr_context: { providerId: "42", title: "Fix", additions: 1 },
+      categories: ["functional-correctness"],
+    });
+  });
+
+  test("rejects drafts, on_request repos for PR events, and unknown repos", async () => {
+    expect((await run(prEvent("opened", { draft: true }), { event: "pull_request.opened" })).ok && null).toBeNull();
+    const draft = await run(prEvent("opened", { draft: true }), { event: "pull_request.opened" });
+    if (draft.ok) expect(draft.value).toBeNull();
+    const manual = await run(
+      { raw: { ...prEvent("opened").raw, repository: { full_name: "acme/manual", name: "manual" } } },
+      { event: "pull_request.opened" },
+    );
+    if (manual.ok) expect(manual.value).toBeNull();
+    const unknown = await run(
+      { raw: { ...prEvent("opened").raw, repository: { full_name: "other/repo", name: "repo" } } },
+      { event: "pull_request.opened" },
+    );
+    if (unknown.ok) expect(unknown.value).toBeNull();
+  });
+
+  test("admits a member's review command on a mapped repo; rejects bots, outsiders, other text", async () => {
+    const ok = await run(commentEvent("@engrams review please"), { event: "issue_comment.created" });
+    if (ok.ok) expect(ok.value).toMatchObject({ admit: true, trigger: "command", pr_number: 9 });
+    const bot = await run(commentEvent("@engrams review", "MEMBER", "Bot"), { event: "issue_comment.created" });
+    if (bot.ok) expect(bot.value).toBeNull();
+    const outsider = await run(commentEvent("@engrams review", "NONE"), { event: "issue_comment.created" });
+    if (outsider.ok) expect(outsider.value).toBeNull();
+    const chatter = await run(commentEvent("nice work @engrams"), { event: "issue_comment.created" });
+    if (chatter.ok) expect(chatter.value).toBeNull();
+  });
+});

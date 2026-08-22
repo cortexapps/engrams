@@ -135,6 +135,57 @@ const blockDefSchema: z.ZodType<BlockDef> = z.lazy(() =>
   }),
 );
 
+/** `{ "$ref": "<safe.path>" }` — a run-time value reference (ADR 0119
+ * phase 4.3): the interpreter replaces it with the JSON value at that scope
+ * path before the block executes. Liquid yields strings only; structured
+ * outputs of earlier blocks pass this way. */
+export function isValueRef(value: unknown): value is { $ref: string } {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === 1 && keys[0] === "$ref" && typeof (value as { $ref: unknown }).$ref === "string";
+}
+
+/** A config with every RUN-TIME-VALUED field removed, for save-time schema
+ * checks: `$ref` objects and templated strings both take their final shape
+ * only when the run resolves them (a `${{ steps.open.head_sha }}` cannot
+ * satisfy a SHA regex at save time). Templates are still parse-validated by
+ * validateTemplatesIn, and the interpreter re-runs the full schema on the
+ * resolved config inside the block's step. Nested objects are walked. */
+export function withoutValueRefs(config: Record<string, unknown>): Record<string, unknown> {
+  const strip = (value: unknown): unknown => {
+    if (isValueRef(value)) return undefined;
+    if (typeof value === "string" && value.includes("${{")) return undefined;
+    if (Array.isArray(value)) {
+      const items = value.map(strip).filter((v) => v !== undefined);
+      // An array whose every element was templated is unknowable; drop it.
+      return items.length === 0 && value.length > 0 ? undefined : items;
+    }
+    if (typeof value === "object" && value !== null) {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(value)) {
+        const s = strip(v);
+        if (s !== undefined) out[k] = s;
+      }
+      return out;
+    }
+    return value;
+  };
+  return strip(config) as Record<string, unknown>;
+}
+
+/** The save-time view of a block schema: every key optional, so a key whose
+ * value was stripped (run-time-valued) is not a "required" failure, while
+ * any key that IS present still validates in full. Block schemas are
+ * z.object by convention; anything else validates as-is. */
+function saveTimeSchema(schema: z.ZodType, config: Record<string, unknown>): z.ZodType {
+  // Only relax when a top-level key was actually stripped; a config with
+  // nothing run-time-valued keeps the full required-field check.
+  const stripped = Object.keys(config).some(
+    (k) => isValueRef(config[k]) || (typeof config[k] === "string" && (config[k] as string).includes("${{")),
+  );
+  return stripped && schema instanceof z.ZodObject ? schema.partial() : schema;
+}
+
 /** Block overrides as stored on the automation row. */
 export type BlockOverrides = Record<string, Record<string, unknown>>;
 
@@ -198,7 +249,11 @@ export function applyBlockOverrides(
       };
       if (fields) {
         const executor = getBlock(block.type);
-        const parsed = executor?.configSchema.safeParse(merged.config);
+        const parsed = executor
+          ? saveTimeSchema(executor.configSchema, merged.config).safeParse(
+              withoutValueRefs(merged.config),
+            )
+          : undefined;
         if (parsed && !parsed.success) {
           const issue = parsed.error.issues[0];
           throw new BlockOverrideError(
@@ -334,7 +389,13 @@ export function validateDefinition(
     if (!executor) {
       throw new DefinitionError(block.id, "type", `unknown block type "${block.type}"`);
     }
-    const config = executor.configSchema.safeParse(block.config);
+    // Run-time-valued fields (`$ref` objects, templated strings) take their
+    // final shape only when the run resolves them; validate the statically
+    // known remainder now — leniently on the keys that were stripped — and
+    // the fully resolved config again in the interpreter step.
+    const config = saveTimeSchema(executor.configSchema, block.config).safeParse(
+      withoutValueRefs(block.config),
+    );
     if (!config.success) {
       const issue = config.error.issues[0];
       throw new DefinitionError(
