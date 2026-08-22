@@ -5,6 +5,7 @@ import {
   parseSectionBody,
   renderMarkdown,
   schema,
+  sectionHasBody,
 } from "./schema.ts";
 import type { Node as ProseMirrorNode } from "prosemirror-model";
 
@@ -232,5 +233,42 @@ describe("parseSectionBody", () => {
   test("keeps a plain first line even when it matches the title", () => {
     const blocks = parseSectionBody("Goals are stated below.", "Goals");
     expect(blocks[0]!.textContent).toBe("Goals are stated below.");
+  });
+});
+
+describe("sectionHasBody", () => {
+  const section = (blocks: ProseMirrorNode[]) => sectionDocument(blocks).child(0);
+  const diagram = () =>
+    schema.nodes.diagramBlock!.create({ id: "diagram-1", kind: "mermaid", source: "graph TD;" });
+  const question = () =>
+    schema.nodes.openQuestion!.create({ questionId: "q-1", resolved: false });
+
+  test("a heading alone is not a body", () => {
+    expect(sectionHasBody(section([]))).toBe(false);
+    expect(sectionHasBody(section([paragraph()]))).toBe(false);
+    expect(sectionHasBody(section([paragraph(text("   "))]))).toBe(false);
+  });
+
+  test("prose is a body", () => {
+    expect(sectionHasBody(section([paragraph(text("The limiter is per org."))]))).toBe(true);
+  });
+
+  // A diagram block is an atom carrying no text. A section holding only one
+  // reads as drafted and measures as empty to any text check — which left it
+  // `open`, with no control to settle it and no way to publish the spec.
+  test("a diagram alone is a body", () => {
+    expect(sectionHasBody(section([diagram()]))).toBe(true);
+  });
+
+  test("a diagram nested in a list is a body", () => {
+    const nested = schema.nodes.bulletList!.create(null, [
+      schema.nodes.listItem!.create(null, [paragraph(), diagram()]),
+    ]);
+
+    expect(sectionHasBody(section([nested]))).toBe(true);
+  });
+
+  test("an open question is a body even with no text of its own", () => {
+    expect(sectionHasBody(section([question()]))).toBe(true);
   });
 });

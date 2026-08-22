@@ -1,5 +1,10 @@
 import { useEffect, useMemo, useReducer } from "react";
-import { SPEC_FRAGMENT_NAME, schema, type SectionState } from "@engrams/spec-document";
+import {
+  SPEC_FRAGMENT_NAME,
+  schema,
+  sectionHasBody,
+  type SectionState,
+} from "@engrams/spec-document";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { yXmlFragmentToProseMirrorRootNode } from "y-prosemirror";
 import type * as Y from "yjs";
@@ -255,20 +260,16 @@ function sectionFacts(
   openQuestions: SpecSurfaceOpenQuestion[],
   provenanceRanges: SpecSurfaceProvenanceRange[],
 ): DocumentSectionFacts {
-  let hasBody = false;
   let openQuestionCount = 0;
   const provenance: SpecSurfaceProvenance[] = [];
   section.forEach((block, _offset, index) => {
     if (index === 0) return;
-    if (block.type.name === "diagramBlock") hasBody = true;
     block.descendants((node, nodeOffset) => {
       if (node.type.name === "openQuestion") {
         const resolved = node.attrs.resolved === true;
         openQuestions.push({ id: String(node.attrs.questionId), resolved, text: null });
         if (!resolved) openQuestionCount += 1;
-        hasBody = true;
       } else if (node.isText && (node.text ?? "").trim().length > 0) {
-        hasBody = true;
         for (const match of (node.text ?? "").matchAll(PROVENANCE_PATTERN)) {
           const label = match[0];
           if (!provenance.some((item) => item.label === label)) provenance.push({ label });
@@ -279,5 +280,7 @@ function sectionFacts(
       return true;
     });
   });
-  return { isEmpty: !hasBody, openQuestionCount, provenance };
+  // "Nothing here yet" and the orchestrator's proposal gate read one predicate,
+  // so the pane cannot call a section drafted while the server calls it empty.
+  return { isEmpty: !sectionHasBody(section), openQuestionCount, provenance };
 }

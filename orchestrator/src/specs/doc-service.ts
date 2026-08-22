@@ -3,6 +3,7 @@ import {
   readSpecBlockAttrs,
   renderMarkdown,
   schema,
+  sectionHasBody,
   SPEC_BLOCK_CACHE_MAX_BYTES,
   SPEC_FRAGMENT_NAME,
   specNodesSemanticallyEqual,
@@ -1008,29 +1009,6 @@ function compareSections(
     changed: prior[index] == null || !specNodesSemanticallyEqual(prior[index].node, section.node),
     hasBody: sectionHasBody(section.node),
   }));
-}
-
-/**
- * Whether a section shows the reader anything past its heading. This is the
- * same judgement the document pane makes when it offers "Nothing here yet."
- */
-function sectionHasBody(section: ProseMirrorNode): boolean {
-  let hasBody = false;
-  section.forEach((child, _offset, index) => {
-    if (index === 0 || hasBody) return; // index 0 is the section heading
-    // An open question counts even when it carries no text, so it is tested
-    // before the text check and on the child itself — `descendants` starts
-    // below the node it is called on.
-    if (child.type.name === "openQuestion" || child.textContent.trim().length > 0) {
-      hasBody = true;
-      return;
-    }
-    child.descendants((node) => {
-      if (node.type.name === "openQuestion") hasBody = true;
-      return !hasBody;
-    });
-  });
-  return hasBody;
 }
 
 interface DocumentSection {

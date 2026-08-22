@@ -138,6 +138,7 @@ export {
   parseSectionBody,
   renderMarkdown,
   replaceSection,
+  sectionHasBody,
   schema,
   specMarkSpecs,
   specNodeSpecs,
