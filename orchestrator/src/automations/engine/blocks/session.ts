@@ -144,6 +144,10 @@ async function executeCreateSession(
       session_id: created.sessionId,
       task_id: created.taskId,
       initial_prompt: prompt.length > 0,
+      // The rendered initial prompt (after includeEventContext): downstream
+      // blocks may reference it, the run page shows it, and the e2e suite
+      // asserts templating end to end through it.
+      prompt,
     },
   };
 }
@@ -186,7 +190,7 @@ function matchesSessionMessage(
 export function registerSessionBlocks(): void {
   registerBlock<CreateSessionConfig>({
     type: "create_session",
-    outputs: ["session_id", "task_id"],
+    outputs: ["session_id", "task_id", "prompt"],
     configSchema: createSessionConfigSchema,
     execute: executeCreateSession,
   });
