@@ -35,7 +35,7 @@ function fakeStore() {
       if (!duplicate) recorded.push(input);
       return { recorded: !duplicate };
     },
-    async sweepExpired() {
+    async sweep() {
       return 0;
     },
     async list() {
