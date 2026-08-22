@@ -16,6 +16,10 @@ import {
   type ReviewTriggerMode,
 } from "../db/enrollments.ts";
 import { makeProfileStore } from "../db/profiles.ts";
+import { makeAutomationStore } from "../db/automations.ts";
+import { setReviewEngine, EngineFlagError, type EngineFlagStore } from "../reviews/engine-flag.ts";
+import { retryAutomationReview } from "../reviews/retry-automation.ts";
+import { log as rootLog } from "../log.ts";
 import {
   makeReviewStore,
   type FindingCounts,
@@ -57,6 +61,9 @@ export interface ReviewDeps {
    *  (ADR 0100 d11). A re-run goes through it like any other request. */
   startIngress?: (input: ReviewIngressStart) => Promise<void>;
   randomUUID?: () => string;
+  /** ADR 0119 phase 4.4 seams (default to the production stores). */
+  builtins?: EngineFlagStore;
+  retryAutomation?: (automationRunId: string) => Promise<string>;
 }
 
 
@@ -66,6 +73,7 @@ function enrollmentToProto(row: EnrollmentRow): RepoEnrollment {
     triggerMode: row.triggerMode,
     autofix: row.autofix,
     ...(row.profileId != null ? { profileId: row.profileId } : {}),
+    engine: row.engine,
     createdAt: timestampFromDate(row.createdAt),
     updatedAt: timestampFromDate(row.updatedAt),
   } as RepoEnrollment;
@@ -202,6 +210,11 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
     (profileStore ??= makeProfileStore(deps?.db ?? getDb()));
   const startIngress = deps?.startIngress ?? startReviewIngress;
   const randomUUID = deps?.randomUUID ?? (() => crypto.randomUUID());
+  const engineLog = rootLog.child({ component: "review-engine-flag" });
+  const builtins = (): EngineFlagStore =>
+    deps?.builtins ?? makeAutomationStore(deps?.db ?? getDb());
+  const retryAutomation =
+    deps?.retryAutomation ?? ((runId: string) => retryAutomationReview(runId));
 
   router.service(ReviewService, {
     async listReviews(req, ctx) {
@@ -236,8 +249,21 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       const detail = await reviews().getReview(id);
       if (!detail) throw new ConnectError("not found", Code.NotFound);
       const { repo, prNumber, provider, targetId } = detail.review;
-      if (!(await enrollments().get(repo))) {
+      const enrollment = await enrollments().get(repo);
+      if (!enrollment) {
         throw new ConnectError("repo is not enrolled", Code.FailedPrecondition);
+      }
+      // A repo on the automation engine retries the BUILT-IN with the original
+      // run's trigger, not a legacy ingress epoch.
+      if (enrollment.engine === "automation") {
+        if (!detail.review.automationRunId) {
+          throw new ConnectError(
+            "this review has no automation run to retry (it ran on the legacy engine)",
+            Code.FailedPrecondition,
+          );
+        }
+        const runId = await retryAutomation(detail.review.automationRunId);
+        return { workflowId: runId };
       }
       // Ingress resolves the PR's CURRENT head and identity, then mints a new
       // review record (a terminal review is not "active") and a successor workflow
@@ -302,12 +328,33 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       if (profileId != null && !(await profiles().get(profileId))) {
         throw new ConnectError("profile_id does not exist", Code.InvalidArgument);
       }
+      const engine = req.engine?.trim();
+      if (engine !== undefined && engine !== "" && engine !== "legacy" && engine !== "automation") {
+        throw new ConnectError("engine must be legacy or automation", Code.InvalidArgument);
+      }
+      // Upsert first so the row exists (and its trigger/autofix are current)
+      // before the engine flip reconciles the built-in from them.
       const enrollment = await enrollments().upsert({
         repo,
         triggerMode: req.triggerMode,
         autofix: req.autofix,
         profileId,
       });
+      if (engine === "legacy" || engine === "automation") {
+        try {
+          const result = await setReviewEngine(repo, engine, {
+            setEnrollmentEngine: (r, e) => enrollments().setEngine(r, e),
+            builtins: builtins(),
+            log: engineLog,
+          });
+          return { enrollment: enrollmentToProto(result.enrollment) };
+        } catch (error) {
+          if (error instanceof EngineFlagError) {
+            throw new ConnectError(error.message, Code.FailedPrecondition);
+          }
+          throw error;
+        }
+      }
       return { enrollment: enrollmentToProto(enrollment) };
     },
 
