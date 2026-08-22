@@ -5,13 +5,14 @@ import {
   archiveAutomation,
   createAutomation,
   getAutomation,
-  listAutomationRuns,
   listAutomations,
-  listWebhookSamples,
+  listEventSamples,
+  saveVersion,
   setAutomationEnabled,
   testRender,
-  updateAutomation,
+  updateAutomationMeta,
 } from "@/gen/engram/app/v1/automation-AutomationService_connectquery";
+import { listRuns } from "@/gen/engram/app/v1/automation-AutomationRunService_connectquery";
 import {
   createWebhookRegistration,
   deleteWebhookRegistration,
@@ -24,13 +25,13 @@ export function useAutomations(includeArchived = false) {
 }
 
 export function useAutomation(id: string | undefined) {
-  return useQuery(getAutomation, { id: id ?? "" }, { enabled: !!id });
+  return useQuery(getAutomation, { lookup: { case: "id", value: id ?? "" } }, { enabled: !!id });
 }
 
 export function useAutomationRuns(id: string | undefined, limit = 25) {
   return useQuery(
-    listAutomationRuns,
-    { automationId: id ?? "", limit },
+    listRuns,
+    { automationId: id ?? "", limit, includeFiltered: true },
     { enabled: !!id, staleTime: 5_000 },
   );
 }
@@ -47,11 +48,12 @@ export function useWebhookEvents(registrationId: string | undefined) {
   );
 }
 
-export function useWebhookSamples(registrationId: string | undefined, limit = 25) {
+/** Stored deliveries for a saved automation's trigger source. */
+export function useEventSamples(automationId: string | undefined, limit = 25) {
   return useQuery(
-    listWebhookSamples,
-    { registrationId: registrationId ?? "", limit },
-    { enabled: !!registrationId, staleTime: 5_000 },
+    listEventSamples,
+    { automationId: automationId ?? "", limit },
+    { enabled: !!automationId, staleTime: 5_000 },
   );
 }
 
@@ -66,7 +68,7 @@ function useInvalidateAutomations() {
         queryKey: createConnectQueryKey({ schema: getAutomation, cardinality: "finite" }),
       }),
       queryClient.invalidateQueries({
-        queryKey: createConnectQueryKey({ schema: listAutomationRuns, cardinality: "finite" }),
+        queryKey: createConnectQueryKey({ schema: listRuns, cardinality: "finite" }),
       }),
     ]);
   };
@@ -95,9 +97,14 @@ export function useCreateAutomation() {
   return useMutation(createAutomation, { onSuccess: invalidate });
 }
 
-export function useUpdateAutomation() {
+export function useSaveVersion() {
   const invalidate = useInvalidateAutomations();
-  return useMutation(updateAutomation, { onSuccess: invalidate });
+  return useMutation(saveVersion, { onSuccess: invalidate });
+}
+
+export function useUpdateAutomationMeta() {
+  const invalidate = useInvalidateAutomations();
+  return useMutation(updateAutomationMeta, { onSuccess: invalidate });
 }
 
 export function useArchiveAutomation() {

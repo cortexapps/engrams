@@ -17,7 +17,6 @@ import { useConnectors } from "@/hooks/useIntegrations";
 import { useProfiles } from "@/hooks/useProfiles";
 import {
   useArchiveAutomation,
-  useAutomationRuns,
   useAutomations,
   useCreateWebhookRegistration,
   useDeleteWebhookRegistration,
@@ -26,6 +25,7 @@ import {
 } from "@/hooks/useAutomations";
 import {
   automationStatusLabel,
+  draftFromDefinition,
   webhookConnectorHints,
   type VerificationScheme,
 } from "@/lib/automations";
@@ -74,11 +74,9 @@ function dateTime(value: string | undefined): string {
  *  profile's default (ADR 0063 B2). Ids, not labels — the descriptor labels are
  *  not loaded on the list page. */
 function overrideSummary(automation: Automation): string {
-  const action = automation.action?.action;
-  if (action?.case !== "createTask") return "";
-  return [action.value.harness, action.value.model, action.value.effort]
-    .filter((part) => !!part)
-    .join(" · ");
+  const single = draftFromDefinition(automation.version?.definitionJson ?? "");
+  if (!single) return "";
+  return [single.harness, single.model, single.effort].filter((part) => !!part).join(" · ");
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -95,22 +93,19 @@ function StatusBadge({ status }: { status: string }) {
 
 function AutomationRow({
   automation,
+  triggerSummary,
+  lastRunStatus,
   profileName,
 }: {
   automation: Automation;
+  triggerSummary: string;
+  lastRunStatus: string;
   profileName: string;
 }) {
-  const runs = useAutomationRuns(automation.id, 1);
   const setEnabled = useSetAutomationEnabled();
   const archive = useArchiveAutomation();
-  const trigger = automation.trigger?.trigger;
   const override = overrideSummary(automation);
-  const summary =
-    trigger?.case === "cron"
-      ? `${trigger.value.schedule} · ${trigger.value.timezone}`
-      : trigger?.case === "webhook"
-        ? `${trigger.value.registrationId} · ${trigger.value.events.join(", ")}`
-        : "Trigger not configured";
+  const summary = triggerSummary || "Trigger not configured";
 
   const onEnabledChange = async (enabled: boolean) => {
     try {
@@ -139,14 +134,15 @@ function AutomationRow({
       >
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-base font-semibold group-hover:underline">{automation.name}</span>
-          <StatusBadge status={runs.data?.runs[0]?.status ?? ""} />
+          <StatusBadge status={lastRunStatus} />
+          {automation.kind === "builtin" && <Badge variant="secondary">built-in</Badge>}
         </div>
         {automation.description && (
           <p className="mt-1 truncate text-sm text-muted-foreground">{automation.description}</p>
         )}
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
           <span className="inline-flex min-w-0 items-center gap-1.5 font-mono">
-            {trigger?.case === "cron" ? (
+            {summary.startsWith("Cron") ? (
               <Clock3Icon className="size-3.5 shrink-0" />
             ) : (
               <WebhookIcon className="size-3.5 shrink-0" />
@@ -519,15 +515,17 @@ export function Automations() {
           </div>
         )}
         <div className="space-y-3">
-          {automations.data?.automations.map((automation) => {
+          {automations.data?.automations.map((summary) => {
+            const automation = summary.automation;
+            if (!automation) return null;
             const profileId =
-              automation.action?.action.case === "createTask"
-                ? automation.action.action.value.profileId
-                : "";
+              draftFromDefinition(automation.version?.definitionJson ?? "")?.profileId ?? "";
             return (
               <AutomationRow
                 key={automation.id}
                 automation={automation}
+                triggerSummary={summary.triggerSummary}
+                lastRunStatus={summary.lastRun?.status ?? ""}
                 profileName={profileNames.get(profileId) ?? profileId ?? "—"}
               />
             );

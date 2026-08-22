@@ -1,51 +1,59 @@
+/** AutomationService / AutomationRunService v2 (ADR 0119 phase 3).
+ *
+ * Definitions are data; the orchestrator validates and answers with
+ * block-addressed errors. Built-ins are structure-locked: SaveVersion and
+ * settings changes are refused, while inputs and tunable block overrides are
+ * the per-org edit surface (the ADR 0119 built-in editing model).
+ */
+
 import { create } from "@bufbuild/protobuf";
 import { ConnectError, Code } from "@connectrpc/connect";
 import type { ConnectRouter } from "@connectrpc/connect";
 import { Cron } from "croner";
 
 import {
-  AutomationRunSchema,
-  AutomationActionSchema,
+  AutomationRunService,
   AutomationSchema,
   AutomationService,
-  AutomationTriggerSchema,
   WebhookRegistrationSchema,
   WebhookRegistrationService,
-  WebhookSampleSchema,
   type Automation as ProtoAutomation,
-  type AutomationAction as ProtoAutomationAction,
-  type AutomationRun as ProtoAutomationRun,
-  type AutomationTrigger as ProtoAutomationTrigger,
+  type AutomationRunBrief as ProtoRunBrief,
+  type AutomationStepRun as ProtoStepRun,
+  type AutomationVersion as ProtoVersion,
+  type BlockError as ProtoBlockError,
+  type DayRunCount as ProtoDayRunCount,
   type WebhookRegistration as ProtoWebhookRegistration,
-  type WebhookSample as ProtoWebhookSample,
 } from "../gen/engram/app/v1/automation_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
 import { requireAdmin } from "./require.ts";
 import { evaluateCode, type CodeInput } from "../automations/code/sandbox.ts";
 import { CODE_SOURCE_MAX_CHARS } from "../automations/engine/blocks/code.ts";
 import {
+  definitionOf,
+  effectiveDefinition,
   makeAutomationStore,
-  type AutomationInput,
+  resolveAutomationInputs,
   type AutomationRow,
   type AutomationRunRow,
+  type AutomationStepRunRow,
   type AutomationStore,
+  type AutomationVersionRow,
+  type DayRunCount,
   type WebhookRegistrationRow,
-  type WebhookSampleRow,
 } from "../db/automations.ts";
 import { getDb } from "../db/client.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
-import type {
-  AutomationAction,
-  AutomationTrigger,
-  CreateTaskAutomationAction,
-  WebhookVerificationScheme,
-} from "../db/schema.ts";
+import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
+import { getModelRouterDefinition, selectRouterProtocol } from "../model-routers/registry.ts";
+import { harnessCatalog as defaultHarnessCatalog } from "../control-plane/client.ts";
+import type { HarnessCatalogClient } from "./task-create.ts";
+import type { WebhookVerificationScheme } from "../db/schema.ts";
 import {
   type Connector,
   type CustomConnectorSource,
   loadRegistry,
-  type WebhookAliasSpec,
 } from "../connectors/registry.ts";
 import { loadEventSample } from "../connectors/samples.ts";
 import {
@@ -56,21 +64,34 @@ import {
   makeIntegrationConnectionStore,
   type IntegrationConnectionStore,
 } from "../db/integration-connections.ts";
+import { orgSecret as defaultOrgSecret } from "../control-plane/client.ts";
 import {
-  harnessCatalog as defaultHarnessCatalog,
-  orgSecret as defaultOrgSecret,
-} from "../control-plane/client.ts";
-import type { HarnessCatalogClient } from "./task-create.ts";
+  applyBlockOverrides,
+  BlockOverrideError,
+  DefinitionError,
+  settingsSchema,
+  validateDefinition,
+  type AutomationDefinition,
+  type AutomationSettings,
+  type BlockOverrides,
+} from "../automations/engine/definition.ts";
+import { previewDefinition } from "../automations/engine/preview.ts";
+import { makeWebhookAliasResolver } from "../automations/aliases.ts";
 import {
-  AutomationTemplateError,
-  buildAutomationTemplateContext,
-  renderAutomationAction,
-  renderAutomationTemplate,
-  validateAutomationTemplate,
-} from "../automations/template.ts";
-import { legacyRunStatus } from "../automations/legacy-compat.ts";
-import { makeModelRouterStore, type ModelRouterStore } from "../db/model-routers.ts";
-import { getModelRouterDefinition, selectRouterProtocol } from "../model-routers/registry.ts";
+  admitAutomationRun,
+  automationRunId,
+  defaultWorkflowStarter,
+  type AutomationWebhookStarter,
+} from "../automations/dispatch.ts";
+import {
+  defaultAutomationSender,
+  inboxKeys,
+  type AutomationSender,
+} from "../automations/engine/inbox.ts";
+import type { AutomationDispatchStore } from "../db/automations.ts";
+import { getSlackClient } from "../integrations/slack.ts";
+import { makeLinearIssueClient } from "../integrations/linear-issues.ts";
+import type { WebhookAliasMapping } from "../automations/template.ts";
 
 export type GetSession = (
   headers: Headers,
@@ -81,18 +102,30 @@ export interface OrgSecretClient {
   deleteSecret(req: { name: string }): Promise<{ deleted: boolean }>;
 }
 
+export interface InputKeyOptionSource {
+  list(noun: string, connectionId: string | undefined): Promise<Array<{ key: string; label: string }>>;
+}
+
 export interface AutomationDeps {
   getSession?: GetSession;
-  store?: AutomationStore;
+  store?: AutomationStore & AutomationDispatchStore;
   profiles?: Pick<ProfileStore, "getActive">;
-  connectors?: CustomConnectorSource;
   harnessCatalog?: HarnessCatalogClient;
-  orgSecret?: OrgSecretClient;
   modelRouters?: ModelRouterStore;
-  integrationEvents?: Pick<IntegrationEventStore, "getLatest" | "listObservedEventKeys">;
+  connectors?: CustomConnectorSource;
+  orgSecret?: OrgSecretClient;
+  integrationEvents?: Pick<
+    IntegrationEventStore,
+    "getLatest" | "listObservedEventKeys" | "list" | "getById" | "listObservedScopeValues"
+  >;
   connections?: Pick<IntegrationConnectionStore, "getDefault">;
   eventSample?: typeof loadEventSample;
+  aliases?: (registrationId: string) => Promise<readonly WebhookAliasMapping[]>;
+  workflowStarter?: AutomationWebhookStarter;
+  sender?: AutomationSender;
+  inputKeyOptions?: InputKeyOptionSource;
   now?: () => Date;
+  randomId?: () => string;
   randomSecret?: () => string;
   /** Test seam for the QuickJS sandbox behind EvalCode. */
   evalCode?: typeof evaluateCode;
@@ -100,6 +133,8 @@ export interface AutomationDeps {
 
 export const EVAL_CODE_LIMIT_PER_MINUTE = 30;
 export const EVAL_CODE_INPUT_MAX_CHARS = 512 * 1024;
+export const DEFINITION_MAX_CHARS = 512 * 1024;
+export const INPUTS_MAX_CHARS = 256 * 1024;
 
 /** Sliding-window per-user limiter for the arbitrary-compute endpoint.
  * In-memory per pod: the cap is a courtesy brake, not an SLO. */
@@ -121,35 +156,12 @@ function makeEvalRateLimiter() {
 }
 
 const REGISTRATION_ID_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-const EVENT_KEY_RE = /^[a-z0-9_-]+(?:\.[a-z0-9_-]+)*$/;
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 200;
-const MAX_WEBHOOK_EVENTS = 200;
-const MAX_EVENT_KEY_LENGTH = 160;
-const MAX_WEBHOOK_FILTER_PATHS = 100;
-const MAX_WEBHOOK_FILTER_PATH_LENGTH = 512;
-const WEBHOOK_FILTER_PATH_RE = /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
-const UNSAFE_FILTER_PATH_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
 
-function assertWebhookFilter(filter: Record<string, unknown>): void {
-  const paths = Object.keys(filter);
-  if (paths.length > MAX_WEBHOOK_FILTER_PATHS) {
-    throw new ConnectError(
-      `webhook filter may contain at most ${MAX_WEBHOOK_FILTER_PATHS} paths`,
-      Code.InvalidArgument,
-    );
-  }
-  if (paths.some((path) =>
-    path.length > MAX_WEBHOOK_FILTER_PATH_LENGTH
-    || !WEBHOOK_FILTER_PATH_RE.test(path)
-    || path.split(".").some((segment) => UNSAFE_FILTER_PATH_SEGMENTS.has(segment)))) {
-    throw new ConnectError(
-      "webhook filter keys must be safe dotted payload paths",
-      Code.InvalidArgument,
-    );
-  }
-}
-
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
 
 function requiredText(value: string, field: string): string {
   const trimmed = value.trim();
@@ -164,20 +176,55 @@ function listLimit(value: number): number {
   return value === 0 ? DEFAULT_LIST_LIMIT : Math.min(value, MAX_LIST_LIMIT);
 }
 
-function parseObjectJson(value: string, field: string): Record<string, unknown> {
-  let parsed: unknown;
+function parseJson(value: string, field: string, maxChars: number): unknown {
+  if (value.length > maxChars) {
+    throw new ConnectError(
+      `${field} is ${value.length} characters (max ${maxChars})`,
+      Code.InvalidArgument,
+    );
+  }
   try {
-    parsed = JSON.parse(value);
+    return JSON.parse(value);
   } catch (error) {
     throw new ConnectError(
       `${field} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
       Code.InvalidArgument,
     );
   }
+}
+
+function parseObjectJson(value: string, field: string, maxChars = INPUTS_MAX_CHARS): Record<string, unknown> {
+  const parsed = parseJson(value, field, maxChars);
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new ConnectError(`${field} must be a JSON object`, Code.InvalidArgument);
   }
   return parsed as Record<string, unknown>;
+}
+
+/** A validation failure the editor can route to a block + field. The Connect
+ * error carries the structured BlockError in its details-compatible message
+ * AND the response-level list where the RPC has one. */
+export class BlockValidationError extends ConnectError {
+  constructor(readonly blockErrors: ProtoBlockError[]) {
+    super(
+      blockErrors.map((e) => (e.blockId ? `${e.blockId}.${e.field}: ${e.message}` : `${e.field}: ${e.message}`)).join("; "),
+      Code.InvalidArgument,
+    );
+  }
+}
+
+function blockError(blockId: string, field: string, code: string, message: string): ProtoBlockError {
+  return { $typeName: "engram.app.v1.BlockError", blockId, field, code, message };
+}
+
+function toBlockError(error: unknown): ProtoBlockError | null {
+  if (error instanceof DefinitionError) {
+    return blockError(error.blockId ?? "", error.field, "invalid_definition", error.message);
+  }
+  if (error instanceof BlockOverrideError) {
+    return blockError(error.blockId, error.field, "invalid_override", error.message);
+  }
+  return null;
 }
 
 function verificationScheme(value: string): WebhookVerificationScheme {
@@ -186,8 +233,6 @@ function verificationScheme(value: string): WebhookVerificationScheme {
       return value;
     case "github_hmac_sha256":
     case "slack_v0":
-      // Retired with ADR 0119 D5: provider events ride the integration
-      // ingress routes and are selected as integration triggers.
       throw new ConnectError(
         `verification_scheme ${value} is retired; create an integration trigger for the provider, or a generic webhook`,
         Code.InvalidArgument,
@@ -214,192 +259,54 @@ function nextCronFire(schedule: string, timezone: string, now: Date): Date {
     if (!next) throw new Error("schedule has no future occurrence");
     return next;
   } catch (error) {
-    throw new ConnectError(
-      `invalid cron schedule: ${error instanceof Error ? error.message : String(error)}`,
-      Code.InvalidArgument,
-    );
+    throw new BlockValidationError([
+      blockError(
+        "",
+        "trigger.schedule",
+        "invalid_cron",
+        `invalid cron schedule: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    ]);
   }
 }
 
-function parseTrigger(value: ProtoAutomationTrigger | undefined): AutomationTrigger {
-  switch (value?.trigger.case) {
-    case "cron": {
-      const schedule = requiredText(value.trigger.value.schedule, "cron schedule");
-      const timezone = requiredText(value.trigger.value.timezone, "cron timezone");
-      return { kind: "cron", schedule, timezone };
-    }
-    case "webhook": {
-      const registrationId = requiredText(
-        value.trigger.value.registrationId,
-        "webhook registration_id",
-      );
-      const events = [...new Set(value.trigger.value.events.map((event) => event.trim()))];
-      if (
-        events.length === 0 ||
-        events.length > MAX_WEBHOOK_EVENTS ||
-        events.some(
-          (event) => event.length > MAX_EVENT_KEY_LENGTH || !EVENT_KEY_RE.test(event),
-        )
-      ) {
-        throw new ConnectError(
-          `webhook events must contain 1-${MAX_WEBHOOK_EVENTS} lowercase dot-delimited event keys`,
-          Code.InvalidArgument,
-        );
-      }
-      const filter = value.trigger.value.filterJson
-        ? parseObjectJson(value.trigger.value.filterJson, "webhook filter_json")
-        : undefined;
-      if (filter) assertWebhookFilter(filter);
-      return {
-        kind: "webhook",
-        registrationId,
-        events,
-        ...(filter ? { filter } : {}),
-      };
-    }
+/** Human trigger summary for the list row. */
+export function triggerSummary(definition: AutomationDefinition): string {
+  const t = definition.trigger;
+  switch (t.kind) {
+    case "cron":
+      return `Cron · ${t.schedule} ${t.timezone}`;
+    case "webhook":
+      return `Webhook · ${t.registrationId} · ${t.events.join(", ")}`;
     case "integration": {
-      const provider = requiredText(value.trigger.value.provider, "integration provider");
-      const connectionId = requiredText(
-        value.trigger.value.connectionId,
-        "integration connection_id",
-      );
-      const eventKeys = [...new Set(value.trigger.value.eventKeys.map((key) => key.trim()))];
-      if (
-        eventKeys.length === 0 ||
-        eventKeys.length > MAX_WEBHOOK_EVENTS ||
-        eventKeys.some((key) => key.length > MAX_EVENT_KEY_LENGTH || !EVENT_KEY_RE.test(key))
-      ) {
-        throw new ConnectError(
-          `integration event_keys must contain 1-${MAX_WEBHOOK_EVENTS} lowercase dot-delimited event keys`,
-          Code.InvalidArgument,
-        );
-      }
-      const scopeValues = value.trigger.value.scopeValues.map((v) => v.trim());
-      const scopeFromInput = value.trigger.value.scopeFromInput?.trim() || undefined;
-      if (scopeValues.length > 0 && scopeFromInput !== undefined) {
-        throw new ConnectError(
-          "integration scope takes values or an input binding, not both",
-          Code.InvalidArgument,
-        );
-      }
-      if (scopeValues.some((v) => v.length === 0)) {
-        throw new ConnectError("integration scope values must be non-empty", Code.InvalidArgument);
-      }
+      const provider = t.provider.charAt(0).toUpperCase() + t.provider.slice(1);
+      const events = t.eventKeys.join(", ");
       const scope =
-        scopeValues.length > 0
-          ? { values: scopeValues }
-          : scopeFromInput !== undefined
-            ? { fromInput: scopeFromInput }
-            : undefined;
-      return {
-        kind: "integration",
-        provider,
-        connectionId,
-        eventKeys,
-        ...(scope ? { scope } : {}),
-      };
+        t.scope === undefined
+          ? ""
+          : "values" in t.scope
+            ? ` · ${t.scope.values.length} scoped`
+            : ` · scope from input ${t.scope.fromInput}`;
+      return `${provider} · ${events}${scope}`;
     }
-    default:
-      throw new ConnectError("automation trigger is required", Code.InvalidArgument);
+    case "manual":
+      return "Manual";
   }
 }
 
-/** Optional catalog selections may arrive as ""; absent means "inherit". */
-function catalogOptionId(value: string | undefined): string | undefined {
-  return value?.trim() || undefined;
-}
+// ---------------------------------------------------------------------------
+// Proto mappers
+// ---------------------------------------------------------------------------
 
-function parseAction(value: ProtoAutomationAction | undefined): AutomationAction {
-  if (value?.action.case !== "createTask") {
-    throw new ConnectError("create_task automation action is required", Code.InvalidArgument);
-  }
-  const action = value.action.value;
-  const titleTemplate = action.titleTemplate || undefined;
-  const harness = catalogOptionId(action.harness);
-  const model = catalogOptionId(action.model);
-  const effort = catalogOptionId(action.effort);
-  // Presence matters for the router field: absent inherits the profile, while
-  // an explicitly empty value selects the direct/native route.
-  const modelRouter =
-    action.modelRouter === undefined ? undefined : action.modelRouter.trim();
+function toProtoVersion(row: AutomationVersionRow): ProtoVersion {
   return {
-    kind: "create_task",
-    profileId: requiredText(action.profileId, "action profile_id"),
-    promptTemplate: action.promptTemplate,
-    ...(titleTemplate !== undefined ? { titleTemplate } : {}),
-    includeEventContext: action.includeEventContext,
-    ...(action.harnessMode ? { harnessMode: action.harnessMode } : {}),
-    ...(harness !== undefined ? { harness } : {}),
-    ...(model !== undefined ? { model } : {}),
-    ...(modelRouter !== undefined ? { modelRouter } : {}),
-    ...(effort !== undefined ? { effort } : {}),
+    $typeName: "engram.app.v1.AutomationVersion",
+    automationId: row.automationId,
+    number: row.version,
+    definitionJson: JSON.stringify(definitionOf(row)),
+    ...(row.createdByUserId ? { createdByUserId: row.createdByUserId } : {}),
+    createdAt: row.createdAt.toISOString(),
   };
-}
-
-function protoTrigger(trigger: AutomationTrigger): ProtoAutomationTrigger {
-  if (trigger.kind === "cron") {
-    return create(AutomationTriggerSchema, {
-      trigger: {
-        case: "cron",
-        value: { schedule: trigger.schedule, timezone: trigger.timezone },
-      },
-    });
-  }
-  if (trigger.kind === "integration") {
-    return create(AutomationTriggerSchema, {
-      trigger: {
-        case: "integration",
-        value: {
-          provider: trigger.provider,
-          connectionId: trigger.connectionId,
-          eventKeys: trigger.eventKeys,
-          ...(trigger.scope && "values" in trigger.scope
-            ? { scopeValues: trigger.scope.values }
-            : {}),
-          ...(trigger.scope && "fromInput" in trigger.scope
-            ? { scopeFromInput: trigger.scope.fromInput }
-            : {}),
-        },
-      },
-    });
-  }
-  if (trigger.kind !== "webhook") {
-    // Manual triggers arrive with the phase-3 proto; the legacy list/get
-    // surface only reconstructs cron/webhook/integration rows.
-    throw new ConnectError(
-      `trigger kind "${trigger.kind}" has no legacy proto shape`,
-      Code.Internal,
-    );
-  }
-  return create(AutomationTriggerSchema, {
-    trigger: {
-      case: "webhook",
-      value: {
-        registrationId: trigger.registrationId,
-        events: trigger.events,
-        ...(trigger.filter ? { filterJson: JSON.stringify(trigger.filter) } : {}),
-      },
-    },
-  });
-}
-
-function protoAction(action: AutomationAction): ProtoAutomationAction {
-  return create(AutomationActionSchema, {
-    action: {
-      case: "createTask",
-      value: {
-        profileId: action.profileId,
-        promptTemplate: action.promptTemplate,
-        ...(action.titleTemplate !== undefined ? { titleTemplate: action.titleTemplate } : {}),
-        includeEventContext: action.includeEventContext,
-        ...(action.harnessMode !== undefined ? { harnessMode: action.harnessMode } : {}),
-        ...(action.harness !== undefined ? { harness: action.harness } : {}),
-        ...(action.model !== undefined ? { model: action.model } : {}),
-        ...(action.modelRouter !== undefined ? { modelRouter: action.modelRouter } : {}),
-        ...(action.effort !== undefined ? { effort: action.effort } : {}),
-      },
-    },
-  });
 }
 
 function toProtoAutomation(row: AutomationRow): ProtoAutomation {
@@ -407,34 +314,57 @@ function toProtoAutomation(row: AutomationRow): ProtoAutomation {
     id: row.id,
     name: row.name,
     description: row.description,
+    kind: row.kind,
+    ...(row.builtinKey ? { builtinKey: row.builtinKey } : {}),
     enabled: row.enabled,
-    trigger: protoTrigger(row.trigger),
-    action: protoAction(row.action),
+    currentVersion: row.currentVersion,
+    inputsJson: JSON.stringify(row.inputs),
+    blockOverridesJson: JSON.stringify(row.blockOverrides),
+    archived: row.archivedAt !== null,
     ...(row.createdByUserId ? { createdByUserId: row.createdByUserId } : {}),
     ...(row.nextFireAt ? { nextFireAt: row.nextFireAt.toISOString() } : {}),
     ...(row.lastFiredAt ? { lastFiredAt: row.lastFiredAt.toISOString() } : {}),
-    archived: row.archivedAt !== null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
+    version: toProtoVersion(row.version),
   });
 }
 
-function toProtoRun(row: AutomationRunRow): ProtoAutomationRun {
-  return create(AutomationRunSchema, {
+function toProtoRunBrief(row: AutomationRunRow): ProtoRunBrief {
+  return {
+    $typeName: "engram.app.v1.AutomationRunBrief",
     id: row.id,
     automationId: row.automationId,
-    triggerJson: JSON.stringify(row.trigger),
-    ...(row.renderedPrompt !== null ? { renderedPrompt: row.renderedPrompt } : {}),
-    ...(row.renderedTitle !== null ? { renderedTitle: row.renderedTitle } : {}),
-    ...(row.taskId !== null ? { taskId: row.taskId } : {}),
-    ...(row.sessionId !== null ? { sessionId: row.sessionId } : {}),
-    // Engine statuses mapped onto the strings the current page renders;
-    // remove in phase 3 with the proto break.
-    status: legacyRunStatus(row.status),
+    version: row.version,
+    status: row.status,
     ...(row.error !== null ? { error: row.error } : {}),
-    ...(row.scheduledFor ? { scheduledFor: row.scheduledFor.toISOString() } : {}),
+    triggerSource: row.trigger.source,
+    ...(row.trigger.eventKey !== undefined ? { eventKey: row.trigger.eventKey } : {}),
+    ...(row.deliveryKey !== null ? { deliveryKey: row.deliveryKey } : {}),
+    dryRun: row.dryRun,
+    ...(row.startedAt ? { startedAt: row.startedAt.toISOString() } : {}),
+    ...(row.endedAt ? { endedAt: row.endedAt.toISOString() } : {}),
     createdAt: row.createdAt.toISOString(),
-  });
+  };
+}
+
+function toProtoStepRun(row: AutomationStepRunRow, sessionId: string | undefined): ProtoStepRun {
+  return {
+    $typeName: "engram.app.v1.AutomationStepRun",
+    blockId: row.blockId,
+    attempt: row.attempt,
+    status: row.status,
+    inputsJson: row.inputs ? JSON.stringify(row.inputs) : "",
+    outputsJson: row.outputs ? JSON.stringify(row.outputs) : "",
+    ...(row.error !== null ? { error: row.error } : {}),
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    startedAt: row.startedAt.toISOString(),
+    ...(row.endedAt ? { endedAt: row.endedAt.toISOString() } : {}),
+  };
+}
+
+function toProtoDayCount(row: DayRunCount): ProtoDayRunCount {
+  return { $typeName: "engram.app.v1.DayRunCount", ...row };
 }
 
 function toProtoRegistration(row: WebhookRegistrationRow): ProtoWebhookRegistration {
@@ -450,80 +380,69 @@ function toProtoRegistration(row: WebhookRegistrationRow): ProtoWebhookRegistrat
   });
 }
 
-function toProtoSample(row: WebhookSampleRow): ProtoWebhookSample {
-  return create(WebhookSampleSchema, {
-    id: row.id,
-    registrationId: row.registrationId,
-    eventKey: row.eventKey,
-    payloadJson: JSON.stringify(row.payload),
-    receivedAt: row.receivedAt.toISOString(),
-  });
-}
+// ---------------------------------------------------------------------------
+// Production input-key options
+// ---------------------------------------------------------------------------
 
-function templateError(field: string, error: unknown): {
-  field: string;
-  code: string;
-  message: string;
-} {
-  if (error instanceof AutomationTemplateError) {
-    return { field, code: error.code, message: error.message };
-  }
+function productionInputKeyOptions(
+  integrationEvents: () => Pick<IntegrationEventStore, "listObservedScopeValues">,
+  connections: () => Pick<IntegrationConnectionStore, "getDefault">,
+): InputKeyOptionSource {
   return {
-    field,
-    code: "render_failed",
-    message: error instanceof Error ? error.message : String(error),
+    async list(noun, connectionId) {
+      switch (noun) {
+        case "repository": {
+          // Repositories observed on the GitHub connection's ledger: the
+          // installation-repos capability is not exposed to the orchestrator.
+          const connection = connectionId
+            ? { id: connectionId }
+            : await connections().getDefault("github");
+          if (!connection) return [];
+          const repos = await integrationEvents().listObservedScopeValues(connection.id);
+          return repos.map((repo) => ({ key: repo, label: repo }));
+        }
+        case "channel": {
+          const client = await getSlackClient();
+          const result = await client.conversations.list({ limit: 200, exclude_archived: true });
+          return (result.channels ?? [])
+            .filter((c) => typeof c.id === "string")
+            .map((c) => ({ key: c.id!, label: c.name ? `#${c.name}` : c.id! }));
+        }
+        case "team": {
+          const workspace = await makeLinearIssueClient().readWorkspace();
+          return workspace.teams.map((team) => ({ key: team.id, label: team.name }));
+        }
+        default:
+          throw new ConnectError(`unknown input noun "${noun}"`, Code.InvalidArgument);
+      }
+    },
   };
 }
 
-async function facetAliases(
-  registrationId: string,
-  store: AutomationStore,
-  connectors: CustomConnectorSource,
-): Promise<WebhookAliasSpec[]> {
-  if (!registrationId) return [];
-  const registration = await store.getRegistration(registrationId);
-  if (!registration?.providerHint) return [];
-  const registry = await loadRegistry(connectors);
-  return registry.get(registration.providerHint)?.webhook?.aliases ?? [];
-}
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
 
 export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps): void {
   const getSession = deps?.getSession ?? getSessionFromHeaders;
   const store = deps?.store ?? makeAutomationStore(getDb());
-  const profiles = deps?.profiles ?? makeProfileStore(getDb());
-  const connectors = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
-  const harnessCatalog: HarnessCatalogClient =
+  const profiles = () => deps?.profiles ?? makeProfileStore(getDb());
+  const harnessCatalog = (): HarnessCatalogClient =>
     deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
-  // Keep router persistence lazy so non-routed automation requests and
-  // dependency-injected tests do not open the production database.
-  const modelRouters = (): ModelRouterStore =>
-    deps?.modelRouters ?? makeModelRouterStore(getDb());
-  const integrationEvents = (): Pick<
-    IntegrationEventStore,
-    "getLatest" | "listObservedEventKeys"
-  > => deps?.integrationEvents ?? makeIntegrationEventStore(getDb());
-  const connections = (): Pick<IntegrationConnectionStore, "getDefault"> =>
-    deps?.connections ?? makeIntegrationConnectionStore(getDb());
+  const modelRouters = (): ModelRouterStore => deps?.modelRouters ?? makeModelRouterStore(getDb());
+  const connectors = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
+  const integrationEvents = () => deps?.integrationEvents ?? makeIntegrationEventStore(getDb());
+  const connections = () => deps?.connections ?? makeIntegrationConnectionStore(getDb());
   const eventSample = deps?.eventSample ?? loadEventSample;
+  const aliasesFor = deps?.aliases ?? makeWebhookAliasResolver();
+  const starter = () => deps?.workflowStarter ?? defaultWorkflowStarter();
+  const sender = () => deps?.sender ?? defaultAutomationSender;
+  const inputKeyOptions =
+    deps?.inputKeyOptions ?? productionInputKeyOptions(integrationEvents, connections);
   const now = deps?.now ?? (() => new Date());
+  const randomId = deps?.randomId ?? (() => crypto.randomUUID());
   const evalCode = deps?.evalCode ?? evaluateCode;
   const rateLimiter = makeEvalRateLimiter();
-
-  /** Resolve a provider that declares inbound events, or InvalidArgument. */
-  async function connectorWithWebhookFacet(
-    provider: string,
-  ): Promise<{ connector: Connector; webhook: NonNullable<Connector["webhook"]> }> {
-    const connector = (await loadRegistry(connectors)).get(provider);
-    const webhook = connector?.webhook;
-    if (!connector || !webhook) {
-      throw new ConnectError(
-        `provider "${provider}" has no webhook event catalog`,
-        Code.InvalidArgument,
-      );
-    }
-    return { connector, webhook };
-  }
-
   const randomSecret =
     deps?.randomSecret ??
     (() => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url"));
@@ -533,167 +452,350 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       deleteSecret: (req) => defaultOrgSecret.deleteSecret(req),
     };
 
-  /**
-   * ADR 0063 B2: validate the automation's harness/model/effort override against
-   * the live catalog, returning the action with the harness those option ids
-   * belong to PINNED onto it.
-   *
-   * A model/effort id is only meaningful next to one harness, so an action that
-   * names a model but inherits its harness is under-specified: an admin who
-   * later switches the profile's harness would orphan the stored id, and the
-   * launch path resolves an unknown id to nothing (compileSessionCreateInput
-   * sets no model env), silently running the new harness's default months later.
-   * A profile can't drift this way because ProfileService validates its whole
-   * triple on every save; pinning gives the action the same property instead of
-   * a second guard in ProfileService that must stay in sync forever. Clearing
-   * the harness in the editor clears model/effort with it, so "follow the
-   * profile" stays reachable — it just cannot mean "keep a foreign model id".
-   *
-   * The catalog is read only when the automation overrides something; the
-   * profile's own selection was already validated by ProfileService.
-   */
-  async function resolveOverride(
-    action: CreateTaskAutomationAction,
-    profileHarness: string,
-  ): Promise<CreateTaskAutomationAction> {
-    if (
-      action.harness === undefined
-      && action.model === undefined
-      && action.modelRouter === undefined
-      && action.effort === undefined
-    ) {
-      return action;
+  async function connectorWithWebhookFacet(
+    provider: string,
+  ): Promise<{ connector: Connector; webhook: NonNullable<Connector["webhook"]> }> {
+    const connector = (await loadRegistry(connectors)).get(provider);
+    const webhook = connector?.webhook;
+    if (!connector || !webhook) {
+      throw new BlockValidationError([
+        blockError("", "trigger.provider", "unknown_provider", `provider "${provider}" has no webhook event catalog`),
+      ]);
     }
-    const harness = action.harness ?? profileHarness;
-    const { harnesses } = await harnessCatalog.listHarnesses({});
-    const descriptor = harnesses.find((h) => h.name === harness)?.descriptor;
-    if (!descriptor) {
-      throw new ConnectError(`harness "${harness}" is not in the catalog`, Code.InvalidArgument);
-    }
-    if (action.modelRouter) {
-      const router = getModelRouterDefinition(action.modelRouter);
-      if (!router) throw new ConnectError(`model router "${action.modelRouter}" is not registered`, Code.InvalidArgument);
-      if (!selectRouterProtocol(router, descriptor.routerProtocols ?? [])) {
-        throw new ConnectError(`harness "${harness}" does not support model router "${router.id}"`, Code.InvalidArgument);
-      }
-      if (action.model !== undefined && !(await modelRouters().getModel(router.id, action.model))) {
-        throw new ConnectError(`model "${action.model}" is not in router "${router.id}"`, Code.InvalidArgument);
-      }
-    } else if (action.model !== undefined && !(descriptor.models ?? []).some((m) => m.id === action.model)) {
-      throw new ConnectError(
-        `model "${action.model}" is not valid for harness "${harness}"`,
-        Code.InvalidArgument,
-      );
-    }
-    if (action.effort !== undefined && !(descriptor.effort ?? []).some((e) => e.id === action.effort)) {
-      throw new ConnectError(
-        `effort "${action.effort}" is not valid for harness "${harness}"`,
-        Code.InvalidArgument,
-      );
-    }
-    return { ...action, harness };
+    return { connector, webhook };
   }
 
-  async function validateInput(input: {
-    name: string;
-    description: string;
-    enabled: boolean;
-    trigger?: ProtoAutomationTrigger;
-    action?: ProtoAutomationAction;
-  }): Promise<AutomationInput> {
-    const name = requiredText(input.name, "name");
-    const trigger = parseTrigger(input.trigger);
-    const parsed = parseAction(input.action);
-
-    const profile = await profiles.getActive(parsed.profileId);
-    if (!profile) {
-      throw new ConnectError("action profile_id is not an active profile", Code.InvalidArgument);
-    }
-    // A profile's port_exposures are ignored on the automation path, not a
-    // reason to reject the profile: an automation session has no user owner,
-    // and `port_exposure.owner_user_id` is NOT NULL. Only
-    // `createTaskWithSession` auto-mints; `createSessionForExistingTask` (the
-    // automation path) never does. An admin can still expose a port by hand on
-    // a live automation session via POST /api/v1/sessions/:id/ports.
-    const action = await resolveOverride(parsed, profile.harness);
-
+  /** Parse + validate a definition JSON, with trigger-level checks that need
+   * the registry/store (cron schedule, registration existence, declared
+   * event keys). */
+  async function parseDefinition(
+    raw: string,
+    kind: "user" | "builtin",
+  ): Promise<{ definition: AutomationDefinition; nextFireAt: Date | null }> {
+    const parsed = parseJson(raw, "definition_json", DEFINITION_MAX_CHARS);
+    let definition: AutomationDefinition;
     try {
-      validateAutomationTemplate(action.promptTemplate);
-      if (action.titleTemplate !== undefined) validateAutomationTemplate(action.titleTemplate);
+      definition = validateDefinition(parsed, { kind });
     } catch (error) {
-      throw new ConnectError(
-        error instanceof Error ? error.message : String(error),
-        Code.InvalidArgument,
-      );
+      const be = toBlockError(error);
+      if (be) throw new BlockValidationError([be]);
+      throw error;
     }
-
+    await validateSessionBlocks(definition);
     let nextFireAt: Date | null = null;
+    const trigger = definition.trigger;
     if (trigger.kind === "cron") {
       nextFireAt = nextCronFire(trigger.schedule, trigger.timezone, now());
-    } else if (
-      trigger.kind === "webhook"
-      && !(await store.getRegistration(trigger.registrationId))
-    ) {
-      throw new ConnectError("webhook registration not found", Code.InvalidArgument);
+    } else if (trigger.kind === "webhook") {
+      if (!(await store.getRegistration(trigger.registrationId))) {
+        throw new BlockValidationError([
+          blockError("", "trigger.registrationId", "unknown_registration", "webhook registration not found"),
+        ]);
+      }
     } else if (trigger.kind === "integration") {
       const { webhook } = await connectorWithWebhookFacet(trigger.provider);
       const declared = new Set(webhook.events.map((event) => event.key));
       const unknown = trigger.eventKeys.filter((key) => !declared.has(key));
       if (unknown.length > 0) {
-        throw new ConnectError(
-          `provider "${trigger.provider}" does not declare event keys: ${unknown.join(", ")}`,
-          Code.InvalidArgument,
-        );
+        throw new BlockValidationError([
+          blockError(
+            "",
+            "trigger.eventKeys",
+            "unknown_event",
+            `provider "${trigger.provider}" does not declare event keys: ${unknown.join(", ")}`,
+          ),
+        ]);
       }
     }
+    return { definition, nextFireAt };
+  }
 
-    return {
-      name,
-      description: input.description.trim(),
-      enabled: input.enabled,
-      trigger,
-      action,
-      nextFireAt,
+  /**
+   * ADR 0063 B2, per create_session block: the profile must be active, and a
+   * model/effort override is only meaningful next to one harness, so the
+   * EFFECTIVE harness is validated against the live catalog and PINNED onto
+   * the block config (an admin switching the profile's harness later cannot
+   * orphan a stored model id). Blocks with no override never read the
+   * catalog.
+   */
+  async function validateSessionBlocks(definition: AutomationDefinition): Promise<void> {
+    const walk = async (blocks: AutomationDefinition["blocks"]): Promise<void> => {
+      for (const block of blocks) {
+        if (block.type === "create_session") {
+          const config = block.config as {
+            profileId?: unknown;
+            harness?: unknown;
+            model?: unknown;
+            modelRouter?: unknown;
+            effort?: unknown;
+          };
+          const profileId = typeof config.profileId === "string" ? config.profileId : "";
+          const profile = await profiles().getActive(profileId);
+          if (!profile) {
+            throw new BlockValidationError([
+              blockError(block.id, "profileId", "unknown_profile", "profileId is not an active profile"),
+            ]);
+          }
+          const hasOverride =
+            config.harness !== undefined ||
+            config.model !== undefined ||
+            config.modelRouter !== undefined ||
+            config.effort !== undefined;
+          if (hasOverride) {
+            const harness = typeof config.harness === "string" ? config.harness : profile.harness;
+            const { harnesses } = await harnessCatalog().listHarnesses({});
+            const descriptor = harnesses.find((h) => h.name === harness)?.descriptor;
+            if (!descriptor) {
+              throw new BlockValidationError([
+                blockError(block.id, "harness", "unknown_harness", `harness "${harness}" is not in the catalog`),
+              ]);
+            }
+            const model = typeof config.model === "string" ? config.model : undefined;
+            const routerId =
+              typeof config.modelRouter === "string" && config.modelRouter !== "" ? config.modelRouter : undefined;
+            const effort = typeof config.effort === "string" ? config.effort : undefined;
+            if (routerId !== undefined) {
+              const router = getModelRouterDefinition(routerId);
+              if (!router) {
+                throw new BlockValidationError([
+                  blockError(block.id, "modelRouter", "unknown_router", `model router "${routerId}" is not registered`),
+                ]);
+              }
+              if (!selectRouterProtocol(router, descriptor.routerProtocols ?? [])) {
+                throw new BlockValidationError([
+                  blockError(
+                    block.id,
+                    "modelRouter",
+                    "unsupported_router",
+                    `harness "${harness}" does not support model router "${router.id}"`,
+                  ),
+                ]);
+              }
+              if (model !== undefined && !(await modelRouters().getModel(router.id, model))) {
+                throw new BlockValidationError([
+                  blockError(block.id, "model", "unknown_model", `model "${model}" is not in router "${router.id}"`),
+                ]);
+              }
+            } else if (model !== undefined && !(descriptor.models ?? []).some((m) => m.id === model)) {
+              throw new BlockValidationError([
+                blockError(block.id, "model", "unknown_model", `model "${model}" is not valid for harness "${harness}"`),
+              ]);
+            }
+            if (effort !== undefined && !(descriptor.effort ?? []).some((e) => e.id === effort)) {
+              throw new BlockValidationError([
+                blockError(block.id, "effort", "unknown_effort", `effort "${effort}" is not valid for harness "${harness}"`),
+              ]);
+            }
+            // Pin the effective harness so "follow the profile" can never
+            // silently mean "keep a foreign model id".
+            block.config = { ...block.config, harness };
+          }
+        }
+        if (block.then) await walk(block.then);
+        if (block.else) await walk(block.else);
+        if (block.body) await walk(block.body);
+      }
     };
+    await walk(definition.blocks);
+  }
+
+  async function requireAutomation(id: string): Promise<AutomationRow> {
+    const row = await store.get(requiredText(id, "automation_id"));
+    if (!row) throw new ConnectError("automation not found", Code.NotFound);
+    return row;
+  }
+
+  function refuseOnBuiltin(row: AutomationRow, what: string): void {
+    if (row.kind === "builtin") {
+      throw new ConnectError(
+        `${what} is not allowed on a built-in automation; edit its inputs or tunable block fields, or duplicate it`,
+        Code.PermissionDenied,
+      );
+    }
+  }
+
+  async function summaries(rows: AutomationRow[]) {
+    const ids = rows.map((row) => row.id);
+    const [latest, counts] = await Promise.all([store.latestRuns(ids), store.runCounts7d(ids, now())]);
+    return rows.map((row) => {
+      const last = latest.get(row.id);
+      return {
+        automation: toProtoAutomation(row),
+        triggerSummary: triggerSummary(definitionOf(row.version)),
+        ...(last ? { lastRun: toProtoRunBrief(last) } : {}),
+        runs7d: (counts.get(row.id) ?? []).map(toProtoDayCount),
+      };
+    });
+  }
+
+  /** Resolve the sample a TestRender/DryRun/RunNow should use. */
+  async function resolveSample(
+    row: AutomationRow,
+    sample: { case: "sampleId"; value: string } | { case: "payloadJson"; value: string } | { case: undefined },
+  ): Promise<{ payload: Record<string, unknown>; eventKey?: string; receivedAt: Date; aliases: WebhookAliasMapping[] }> {
+    const trigger = row.version.trigger;
+    let payload: Record<string, unknown> = {};
+    let eventKey: string | undefined;
+    let receivedAt = now();
+    if (sample.case === "payloadJson") {
+      payload = parseObjectJson(sample.value, "payload_json", DEFINITION_MAX_CHARS);
+    } else if (sample.case === "sampleId") {
+      if (trigger.kind === "integration") {
+        const event = await integrationEvents().getById(sample.value);
+        if (!event) throw new ConnectError("sample not found", Code.NotFound);
+        payload = event.payload;
+        eventKey = event.eventKey;
+        receivedAt = event.receivedAt;
+      } else {
+        const stored = await store.getSample(sample.value);
+        if (!stored) throw new ConnectError("sample not found", Code.NotFound);
+        payload = stored.payload;
+        eventKey = stored.eventKey;
+        receivedAt = stored.receivedAt;
+      }
+    } else if (trigger.kind === "integration") {
+      // Newest ledgered delivery for the first declared key, else the fixture.
+      const [first] = trigger.eventKeys;
+      const latest = first ? await integrationEvents().getLatest(trigger.connectionId, first) : null;
+      if (latest) {
+        payload = latest.payload;
+        eventKey = latest.eventKey;
+        receivedAt = latest.receivedAt;
+      } else if (first) {
+        payload = eventSample(trigger.provider, first) ?? {};
+        eventKey = first;
+      }
+    } else if (trigger.kind === "webhook") {
+      const latest = await store.getLatestSample(trigger.registrationId);
+      if (latest) {
+        payload = latest.payload;
+        eventKey = latest.eventKey;
+        receivedAt = latest.receivedAt;
+      }
+    }
+    if (eventKey === undefined && trigger.kind === "integration") eventKey = trigger.eventKeys[0];
+    if (eventKey === undefined && trigger.kind === "webhook") eventKey = trigger.events[0];
+
+    let aliases: WebhookAliasMapping[] = [];
+    if (trigger.kind === "webhook") {
+      aliases = [...(await aliasesFor(trigger.registrationId))];
+    } else if (trigger.kind === "integration") {
+      aliases = (await loadRegistry(connectors)).get(trigger.provider)?.webhook?.aliases ?? [];
+    }
+    return { payload, ...(eventKey !== undefined ? { eventKey } : {}), receivedAt, aliases };
+  }
+
+  /** Start a run for an automation outside its trigger path (RunNow, DryRun,
+   * RetryRun). Goes through the same admission as dispatch. */
+  async function startAdHocRun(
+    row: AutomationRow,
+    input: {
+      source: "manual";
+      payload: Record<string, unknown>;
+      eventKey?: string;
+      dryRun: boolean;
+      deliveryKey: string;
+    },
+  ): Promise<string> {
+    const definition = effectiveDefinition(row.version, row.blockOverrides);
+    const runId = automationRunId(row.id, input.deliveryKey);
+    const receivedAt = now().toISOString();
+    const outcome = await admitAutomationRun(
+      {
+        target: { automation: row, definition },
+        runId,
+        deliveryKey: input.deliveryKey,
+        trigger: {
+          source: input.source,
+          receivedAt,
+          payload: input.payload,
+          ...(input.eventKey !== undefined ? { eventKey: input.eventKey } : {}),
+        },
+        scheduledFor: null,
+        ...(input.dryRun ? { dryRun: true } : {}),
+      },
+      { store, starter: starter(), sender: sender(), now },
+    );
+    if (outcome === "joined") {
+      throw new ConnectError(
+        "an active run holds this automation's concurrency key; the payload was joined to it",
+        Code.FailedPrecondition,
+      );
+    }
+    return runId;
   }
 
   router.service(AutomationService, {
-    async createAutomation(req, ctx) {
-      const userId = (await requireAdmin(ctx, getSession)).id;
-      const input = await validateInput(req);
-      return { automation: toProtoAutomation(await store.create(input, userId)) };
-    },
-
-    async updateAutomation(req, ctx) {
+    async listAutomations(req, ctx) {
       await requireAdmin(ctx, getSession);
-      const id = requiredText(req.id, "id");
-      const input = await validateInput(req);
-      const row = await store.update(id, input);
-      if (!row) throw new ConnectError("automation not found", Code.NotFound);
-      return { automation: toProtoAutomation(row) };
-    },
-
-    async archiveAutomation(req, ctx) {
-      await requireAdmin(ctx, getSession);
-      const row = await store.archive(requiredText(req.id, "id"));
-      if (!row) throw new ConnectError("automation not found", Code.NotFound);
-      return { automation: toProtoAutomation(row) };
+      const rows = await store.list({ includeArchived: req.includeArchived });
+      // Built-ins pin to the top.
+      rows.sort((a, b) => {
+        if ((a.kind === "builtin") !== (b.kind === "builtin")) return a.kind === "builtin" ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+      return { automations: await summaries(rows) };
     },
 
     async getAutomation(req, ctx) {
       await requireAdmin(ctx, getSession);
-      const row = await store.get(requiredText(req.id, "id"));
+      let row: AutomationRow | null;
+      if (req.lookup.case === "builtinKey") {
+        row = await store.getByBuiltinKey(requiredText(req.lookup.value, "builtin_key"));
+      } else if (req.lookup.case === "id") {
+        row = await store.get(requiredText(req.lookup.value, "id"));
+      } else {
+        throw new ConnectError("id or builtin_key is required", Code.InvalidArgument);
+      }
       if (!row) throw new ConnectError("automation not found", Code.NotFound);
       return { automation: toProtoAutomation(row) };
     },
 
-    async listAutomations(req, ctx) {
+    async createAutomation(req, ctx) {
+      const userId = (await requireAdmin(ctx, getSession)).id;
+      const name = requiredText(req.name, "name");
+      const { definition, nextFireAt } = await parseDefinition(req.definitionJson, "user");
+      const inputs = req.inputsJson ? parseObjectJson(req.inputsJson, "inputs_json") : {};
+      const row = await store.create(
+        {
+          name,
+          description: req.description.trim(),
+          enabled: req.enabled,
+          definition,
+          nextFireAt: req.enabled ? nextFireAt : null,
+          inputs,
+        },
+        userId,
+      );
+      return { automation: toProtoAutomation(row) };
+    },
+
+    async saveVersion(req, ctx) {
+      const userId = (await requireAdmin(ctx, getSession)).id;
+      const row = await requireAutomation(req.automationId);
+      refuseOnBuiltin(row, "saving a new version");
+      if (row.archivedAt) throw new ConnectError("automation is archived", Code.FailedPrecondition);
+      const { definition, nextFireAt } = await parseDefinition(req.definitionJson, "user");
+      // Existing overrides must still be valid against the new graph; drop
+      // the ones that no longer apply rather than refusing the save.
+      let overrides: BlockOverrides = row.blockOverrides;
+      try {
+        applyBlockOverrides(definition, overrides);
+      } catch {
+        overrides = {};
+      }
+      const saved = await store.saveVersion(row.id, definition, userId, {
+        nextFireAt: row.enabled ? nextFireAt : null,
+      });
+      if (!saved) throw new ConnectError("automation not found", Code.NotFound);
+      if (overrides !== row.blockOverrides) await store.setBlockOverrides(row.id, overrides);
+      return { automation: toProtoAutomation((await store.get(row.id)) ?? saved) };
+    },
+
+    async listVersions(req, ctx) {
       await requireAdmin(ctx, getSession);
-      return {
-        automations: (await store.list({ includeArchived: req.includeArchived })).map(
-          toProtoAutomation,
-        ),
-      };
+      const row = await requireAutomation(req.automationId);
+      return { versions: (await store.listVersions(row.id)).map(toProtoVersion) };
     },
 
     async setAutomationEnabled(req, ctx) {
@@ -701,179 +803,205 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       const id = requiredText(req.id, "id");
       const existing = await store.getActive(id);
       if (!existing) throw new ConnectError("automation not found", Code.NotFound);
+      const trigger = existing.version.trigger;
       const nextFireAt =
-        req.enabled && existing.trigger.kind === "cron"
-          ? nextCronFire(existing.trigger.schedule, existing.trigger.timezone, now())
-          : undefined;
+        req.enabled && trigger.kind === "cron"
+          ? nextCronFire(trigger.schedule, trigger.timezone, now())
+          : req.enabled
+            ? undefined
+            : null;
       const row = await store.setEnabled(id, req.enabled, nextFireAt);
       if (!row) throw new ConnectError("automation not found", Code.NotFound);
       return { automation: toProtoAutomation(row) };
     },
 
-    async listAutomationRuns(req, ctx) {
-      await requireAdmin(ctx, getSession);
-      const automationId = requiredText(req.automationId, "automation_id");
-      if (!(await store.get(automationId))) {
-        throw new ConnectError("automation not found", Code.NotFound);
-      }
-      return {
-        runs: (await store.listRuns(automationId, listLimit(req.limit))).map(toProtoRun),
+    async updateAutomationMeta(req, ctx) {
+      const userId = (await requireAdmin(ctx, getSession)).id;
+      const row = await requireAutomation(req.id);
+      if (row.archivedAt) throw new ConnectError("automation is archived", Code.FailedPrecondition);
+      const patch = {
+        ...(req.name !== undefined ? { name: requiredText(req.name, "name") } : {}),
+        ...(req.description !== undefined ? { description: req.description.trim() } : {}),
       };
+      if (req.settingsJson !== undefined) {
+        refuseOnBuiltin(row, "changing run settings");
+        const parsed = settingsSchema.safeParse(parseJson(req.settingsJson, "settings_json", INPUTS_MAX_CHARS));
+        if (!parsed.success) {
+          const issue = parsed.error.issues[0];
+          throw new BlockValidationError([
+            blockError("", `settings.${issue?.path.join(".") ?? ""}`, "invalid_settings", issue?.message ?? "invalid settings"),
+          ]);
+        }
+        const settings: AutomationSettings = parsed.data;
+        const definition: AutomationDefinition = { ...definitionOf(row.version), settings };
+        // Re-validate the whole definition (templates inside settings).
+        const { definition: validated } = await parseDefinition(JSON.stringify(definition), "user");
+        const saved = await store.saveVersion(row.id, validated, userId, patch);
+        if (!saved) throw new ConnectError("automation not found", Code.NotFound);
+        return { automation: toProtoAutomation(saved) };
+      }
+      const updated = await store.updateMeta(row.id, patch);
+      if (!updated) throw new ConnectError("automation not found", Code.NotFound);
+      return { automation: toProtoAutomation(updated) };
     },
 
-    async listWebhookSamples(req, ctx) {
+    async setInputs(req, ctx) {
       await requireAdmin(ctx, getSession);
-      const registrationId = requiredText(req.registrationId, "registration_id");
-      if (!(await store.getRegistration(registrationId))) {
-        throw new ConnectError("webhook registration not found", Code.NotFound);
+      const row = await requireAutomation(req.automationId);
+      const inputs = parseObjectJson(req.inputsJson, "inputs_json");
+      // Keys must be declared by the version's inputs schema.
+      const declared = new Set(row.version.inputsSchema.map((f) => f.key));
+      const unknown = Object.keys(inputs).filter((k) => !declared.has(k));
+      if (unknown.length > 0) {
+        throw new BlockValidationError(
+          unknown.map((k) => blockError("", `inputs.${k}`, "unknown_input", `input "${k}" is not declared`)),
+        );
       }
-      return {
-        samples: (
-          await store.listSamples(
-            registrationId,
-            req.eventKey || undefined,
-            listLimit(req.limit),
-          )
-        ).map(toProtoSample),
-      };
+      const updated = await store.setInputs(row.id, inputs);
+      if (!updated) throw new ConnectError("automation not found", Code.NotFound);
+      return { automation: toProtoAutomation(updated) };
+    },
+
+    async setBlockOverrides(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.automationId);
+      const raw = parseObjectJson(req.overridesJson, "overrides_json");
+      const overrides: BlockOverrides = {};
+      for (const [blockId, fields] of Object.entries(raw)) {
+        if (typeof fields !== "object" || fields === null || Array.isArray(fields)) {
+          throw new BlockValidationError([
+            blockError(blockId, "", "invalid_override", "override must be an object of field values"),
+          ]);
+        }
+        overrides[blockId] = fields as Record<string, unknown>;
+      }
+      try {
+        applyBlockOverrides(definitionOf(row.version), overrides);
+      } catch (error) {
+        const be = toBlockError(error);
+        if (be) throw new BlockValidationError([be]);
+        throw error;
+      }
+      const updated = await store.setBlockOverrides(row.id, overrides);
+      if (!updated) throw new ConnectError("automation not found", Code.NotFound);
+      return { automation: toProtoAutomation(updated) };
+    },
+
+    async duplicateAutomation(req, ctx) {
+      const userId = (await requireAdmin(ctx, getSession)).id;
+      const row = await requireAutomation(req.automationId);
+      // The copy folds overrides into the graph and is fully editable.
+      const definition = effectiveDefinition(row.version, row.blockOverrides);
+      const name = req.name?.trim() || `${row.name} (copy)`;
+      const nextFireAt =
+        definition.trigger.kind === "cron"
+          ? nextCronFire(definition.trigger.schedule, definition.trigger.timezone, now())
+          : null;
+      const copy = await store.create(
+        { name, description: row.description, enabled: false, definition, nextFireAt: null, inputs: row.inputs },
+        userId,
+      );
+      void nextFireAt;
+      return { automation: toProtoAutomation(copy) };
+    },
+
+    async archiveAutomation(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.id);
+      refuseOnBuiltin(row, "archiving");
+      const archived = await store.archive(row.id);
+      if (!archived) throw new ConnectError("automation not found", Code.NotFound);
+      return { automation: toProtoAutomation(archived) };
     },
 
     async testRender(req, ctx) {
       await requireAdmin(ctx, getSession);
-      const stored = req.automationId ? await store.get(req.automationId) : null;
-      if (req.automationId && !stored) {
-        throw new ConnectError("automation not found", Code.NotFound);
-      }
-
-      let action: CreateTaskAutomationAction;
-      try {
-        const candidate = req.draftAction ? parseAction(req.draftAction) : stored?.action;
-        if (!candidate) {
-          throw new ConnectError(
-            "automation_id or draft_action is required",
-            Code.InvalidArgument,
-          );
-        }
-        action = candidate;
-      } catch (error) {
-        if (error instanceof ConnectError) throw error;
-        throw new ConnectError(String(error), Code.InvalidArgument);
-      }
-
-      let sample: WebhookSampleRow | null = null;
-      let rawPayload: Record<string, unknown> = {};
-      if (req.sample.case === "sampleId") {
-        sample = await store.getSample(req.sample.value);
-        if (!sample) {
-          return {
-            errors: [
-              { field: "sample", code: "invalid_sample", message: "sample not found" },
-            ],
-          };
-        }
-        const expectedRegistrationId =
-          req.registrationId ||
-          (stored?.trigger.kind === "webhook" ? stored.trigger.registrationId : "");
-        if (expectedRegistrationId && sample.registrationId !== expectedRegistrationId) {
-          return {
-            errors: [
-              {
-                field: "sample",
-                code: "invalid_sample",
-                message: "sample belongs to a different webhook registration",
-              },
-            ],
-          };
-        }
-        rawPayload = sample.payload;
-      } else if (req.sample.case === "payloadJson") {
+      const row = await requireAutomation(req.automationId);
+      let definition: AutomationDefinition;
+      if (req.draftDefinitionJson !== undefined) {
+        const parsed = parseJson(req.draftDefinitionJson, "draft_definition_json", DEFINITION_MAX_CHARS);
         try {
-          rawPayload = parseObjectJson(req.sample.value, "payload_json");
+          definition = validateDefinition(parsed, { kind: row.kind === "builtin" ? "builtin" : "user" });
         } catch (error) {
-          return {
-            errors: [
-              {
-                field: "sample",
-                code: "invalid_sample",
-                message: error instanceof Error ? error.message : String(error),
-              },
-            ],
-          };
+          const be = toBlockError(error);
+          if (be) return { blocks: [], errors: [be] };
+          throw error;
         }
+      } else {
+        definition = effectiveDefinition(row.version, row.blockOverrides);
       }
-
-      const storedWebhook = stored?.trigger.kind === "webhook" ? stored.trigger : undefined;
-      const registrationId =
-        req.registrationId || sample?.registrationId || storedWebhook?.registrationId || "";
-      let eventKey = req.eventKey || sample?.eventKey || "";
-      if (!sample && req.sample.case === undefined && registrationId) {
-        const latest = await store.getLatestSample(registrationId, eventKey || undefined);
-        if (latest) {
-          sample = latest;
-          rawPayload = latest.payload;
-          eventKey ||= latest.eventKey;
-        }
-      }
-
-      const isCron = req.scheduledFor !== undefined || stored?.trigger.kind === "cron";
-      if (
-        !isCron &&
-        registrationId &&
-        req.sample.case === undefined &&
-        sample === null
-      ) {
-        return {
-          errors: [
-            {
-              field: "sample",
-              code: "invalid_sample",
-              message: "no stored sample is available for this webhook registration",
-            },
-          ],
-        };
-      }
-      const aliases = isCron ? [] : await facetAliases(registrationId, store, connectors);
-      const context = buildAutomationTemplateContext({
-        automationName: req.automationName ?? stored?.name ?? "Draft automation",
-        triggerKind: isCron ? "cron" : "webhook",
-        receivedAt: (sample?.receivedAt ?? now()).toISOString(),
-        ...(eventKey ? { eventKey } : {}),
-        ...(req.scheduledFor !== undefined ? { scheduledFor: req.scheduledFor } : {}),
-        rawPayload,
-        aliases,
+      const inputValues =
+        req.inputsJson !== undefined ? parseObjectJson(req.inputsJson, "inputs_json") : row.inputs;
+      const sample = await resolveSample(row, req.sample);
+      const result = await previewDefinition({
+        definition,
+        inputs: resolveAutomationInputs(definition.inputsSchema, inputValues),
+        automationId: row.id,
+        automationName: row.name,
+        trigger: {
+          kind: definition.trigger.kind,
+          receivedAt: sample.receivedAt.toISOString(),
+          ...(sample.eventKey !== undefined ? { eventKey: sample.eventKey } : {}),
+          ...(req.scheduledFor !== undefined ? { scheduledFor: req.scheduledFor } : {}),
+          payload: sample.payload,
+        },
+        aliases: sample.aliases,
       });
-
-      let renderedPrompt: string;
-      try {
-        renderedPrompt = (
-          await renderAutomationAction(
-            { ...action, titleTemplate: undefined },
-            context,
-          )
-        ).prompt;
-      } catch (error) {
-        return { errors: [templateError("prompt_template", error)] };
-      }
-
-      let renderedTitle: string | undefined;
-      if (action.titleTemplate !== undefined) {
-        try {
-          renderedTitle = await renderAutomationTemplate(action.titleTemplate, context);
-        } catch (error) {
-          return { errors: [templateError("title_template", error)] };
-        }
-      }
       return {
-        renderedPrompt,
-        ...(renderedTitle !== undefined ? { renderedTitle } : {}),
-        errors: [],
+        blocks: result.blocks.map((b) => ({
+          blockId: b.blockId,
+          blockType: b.blockType,
+          renderedJson: JSON.stringify(b.rendered),
+          ...(b.filterPass !== undefined ? { filterPass: b.filterPass } : {}),
+          scopeJson: JSON.stringify(b.scope),
+        })),
+        errors: result.errors.map((e) => blockError(e.blockId, e.field, e.code, e.message)),
       };
     },
 
-    // ADR 0119 D6: the editor's Run button. Admin-gated like the rest of the
-    // service (the design doc floated member-callable; the whole page is
-    // admin-only today, so the wider gate waits for phase 3). Rate-limited —
-    // it is an arbitrary-compute endpoint, even caged.
+    async dryRun(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.automationId);
+      if (row.archivedAt) throw new ConnectError("automation is archived", Code.FailedPrecondition);
+      const sample = await resolveSample(row, req.sample);
+      const runId = await startAdHocRun(row, {
+        source: "manual",
+        payload: sample.payload,
+        ...(sample.eventKey !== undefined ? { eventKey: sample.eventKey } : {}),
+        dryRun: true,
+        deliveryKey: `dryrun:${randomId()}`,
+      });
+      return { runId };
+    },
+
+    async runNow(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.automationId);
+      if (row.archivedAt) throw new ConnectError("automation is archived", Code.FailedPrecondition);
+      if (req.inputsJson !== undefined) {
+        // A one-off override is applied by persisting it: runs read inputs
+        // from the row at snapshot time. Honest and simple; the editor shows
+        // the stored values, so "one-off" means "until you change it back".
+        const inputs = parseObjectJson(req.inputsJson, "inputs_json");
+        await store.setInputs(row.id, { ...row.inputs, ...inputs });
+      }
+      const payload =
+        req.payloadJson !== undefined ? parseObjectJson(req.payloadJson, "payload_json", DEFINITION_MAX_CHARS) : {};
+      const refreshed = (await store.get(row.id)) ?? row;
+      const sample =
+        req.payloadJson !== undefined
+          ? { payload, eventKey: refreshed.version.trigger.kind === "integration" ? refreshed.version.trigger.eventKeys[0] : undefined }
+          : await resolveSample(refreshed, { case: undefined });
+      const runId = await startAdHocRun(refreshed, {
+        source: "manual",
+        payload: sample.payload,
+        ...(sample.eventKey !== undefined ? { eventKey: sample.eventKey } : {}),
+        dryRun: false,
+        deliveryKey: `manual:${randomId()}`,
+      });
+      return { runId };
+    },
+
     async evalCode(req, ctx) {
       const userId = (await requireAdmin(ctx, getSession)).id;
       if (!rateLimiter.allow(userId, now().getTime())) {
@@ -892,24 +1020,9 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       if (req.mode !== "value" && req.mode !== "boolean") {
         throw new ConnectError(`mode must be "value" or "boolean"`, Code.InvalidArgument);
       }
-      if (req.inputJson.length > EVAL_CODE_INPUT_MAX_CHARS) {
-        throw new ConnectError(
-          `input_json is ${req.inputJson.length} characters (max ${EVAL_CODE_INPUT_MAX_CHARS})`,
-          Code.InvalidArgument,
-        );
-      }
       let input: CodeInput = {};
       if (req.inputJson !== "") {
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(req.inputJson);
-        } catch {
-          throw new ConnectError("input_json is not valid JSON", Code.InvalidArgument);
-        }
-        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-          throw new ConnectError("input_json must be a JSON object", Code.InvalidArgument);
-        }
-        const record = parsed as Record<string, unknown>;
+        const record = parseObjectJson(req.inputJson, "input_json", EVAL_CODE_INPUT_MAX_CHARS);
         input = {
           ...(record["event"] !== undefined ? { event: record["event"] } : {}),
           ...(record["steps"] !== undefined ? { steps: record["steps"] } : {}),
@@ -933,8 +1046,46 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         durationMs: BigInt(outcome.durationMs),
       };
     },
-    // Admin-gated like the rest of this service; the plan's member-readable
-    // posture arrives with the phase-3 surface (the whole page is admin).
+
+    async listEventSamples(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.automationId);
+      const trigger = row.version.trigger;
+      const limit = listLimit(req.limit);
+      if (trigger.kind === "integration") {
+        const rows = await integrationEvents().list(trigger.connectionId, req.eventKey || undefined, limit);
+        return {
+          samples: rows
+            .filter((r) => trigger.eventKeys.includes(r.eventKey))
+            .map((r) => ({
+              id: r.id,
+              eventKey: r.eventKey,
+              payloadJson: JSON.stringify(r.payload),
+              receivedAt: r.receivedAt.toISOString(),
+            })),
+        };
+      }
+      if (trigger.kind === "webhook") {
+        const rows = await store.listSamples(trigger.registrationId, req.eventKey || undefined, limit);
+        return {
+          samples: rows.map((r) => ({
+            id: r.id,
+            eventKey: r.eventKey,
+            payloadJson: JSON.stringify(r.payload),
+            receivedAt: r.receivedAt.toISOString(),
+          })),
+        };
+      }
+      return { samples: [] };
+    },
+
+    async listInputKeyOptions(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const noun = requiredText(req.noun, "noun");
+      const options = await inputKeyOptions.list(noun, req.connectionId?.trim() || undefined);
+      return { options };
+    },
+
     async listEventCatalog(req, ctx) {
       await requireAdmin(ctx, getSession);
       const provider = requiredText(req.provider, "provider");
@@ -980,8 +1131,6 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
       if (!connector) {
         throw new ConnectError(`provider "${provider}" is not a connector`, Code.InvalidArgument);
       }
-      // Member-safe projection: id/label/description/input schema only —
-      // never the execution details (buildProviderCatalog precedent).
       return {
         actions: (connector.actions ?? []).map((action) => ({
           id: action.id,
@@ -990,6 +1139,98 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
           inputSchemaJson: JSON.stringify(action.inputSchema),
         })),
       };
+    },
+  });
+
+  router.service(AutomationRunService, {
+    async listRuns(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const row = await requireAutomation(req.automationId);
+      const rows = await store.listRuns(row.id, listLimit(req.limit));
+      if (req.includeFiltered) {
+        return { runs: rows.map(toProtoRunBrief), filtered: [] };
+      }
+      // Collapse consecutive filtered runs (newest first) into windows keyed
+      // by the real run they precede.
+      const runs: ProtoRunBrief[] = [];
+      const filtered: Array<{ count: number; firstAt: string; lastAt: string; beforeRunId: string }> = [];
+      let window: { count: number; firstAt: Date; lastAt: Date } | null = null;
+      const flush = (beforeRunId: string) => {
+        if (!window) return;
+        filtered.push({
+          count: window.count,
+          firstAt: window.firstAt.toISOString(),
+          lastAt: window.lastAt.toISOString(),
+          beforeRunId,
+        });
+        window = null;
+      };
+      for (const run of rows) {
+        if (run.status === "filtered") {
+          if (!window) window = { count: 0, firstAt: run.createdAt, lastAt: run.createdAt };
+          window.count += 1;
+          if (run.createdAt < window.firstAt) window.firstAt = run.createdAt;
+          if (run.createdAt > window.lastAt) window.lastAt = run.createdAt;
+          continue;
+        }
+        flush(run.id);
+        runs.push(toProtoRunBrief(run));
+      }
+      flush("");
+      return { runs, filtered };
+    },
+
+    async getRun(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const run = await store.getRun(requiredText(req.runId, "run_id"));
+      if (!run) throw new ConnectError("run not found", Code.NotFound);
+      const [steps, sessions] = await Promise.all([
+        store.listStepRuns(run.id),
+        store.listRunSessionIds(run.id),
+      ]);
+      const sessionByBlock = new Map(sessions.map((s) => [s.blockId, s.sessionId]));
+      return {
+        run: {
+          brief: toProtoRunBrief(run),
+          triggerJson: JSON.stringify(run.trigger),
+          steps: steps.map((s) => toProtoStepRun(s, sessionByBlock.get(s.blockId.replace(/\[\d+\]$/, "")))),
+          sessionIds: sessions.map((s) => s.sessionId),
+        },
+      };
+    },
+
+    async stopRun(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const run = await store.getRun(requiredText(req.runId, "run_id"));
+      if (!run) throw new ConnectError("run not found", Code.NotFound);
+      if (run.status !== "running" && run.status !== "waiting" && run.status !== "pending") {
+        return { sent: false };
+      }
+      const requestId = randomId();
+      await sender().send(
+        run.id,
+        { kind: "stop", ...(req.reason ? { reason: req.reason } : {}) },
+        inboxKeys.stop(run.id, requestId),
+      );
+      return { sent: true };
+    },
+
+    async retryRun(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const run = await store.getRun(requiredText(req.runId, "run_id"));
+      if (!run) throw new ConnectError("run not found", Code.NotFound);
+      const row = await requireAutomation(run.automationId);
+      if (row.archivedAt) throw new ConnectError("automation is archived", Code.FailedPrecondition);
+      // v1: always from the start with the same trigger payload. from_step_id
+      // is accepted and recorded for the phase that implements replay-to-step.
+      const runId = await startAdHocRun(row, {
+        source: "manual",
+        payload: run.trigger.payload ?? {},
+        ...(run.trigger.eventKey !== undefined ? { eventKey: run.trigger.eventKey } : {}),
+        dryRun: run.dryRun,
+        deliveryKey: `retry:${randomId()}`,
+      });
+      return { runId };
     },
   });
 
@@ -1017,8 +1258,6 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
           );
         }
         if (connector.webhook.ingress) {
-          // The provider has its own verified ingress: its events are
-          // integration triggers, never a custom registration.
           throw new ConnectError(
             `${providerHint} events arrive through the integration ingress; use an integration trigger instead of a custom webhook`,
             Code.InvalidArgument,
@@ -1065,8 +1304,6 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         );
       }
       const deleted = await store.deleteRegistration(id);
-      // Always attempt the deterministic secret key so retrying after a partial
-      // failure cleans up the sealed value even when the PG row is already gone.
       await orgSecret.deleteSecret({ name: `webhook.${id}.secret` });
       return { deleted };
     },
@@ -1085,16 +1322,10 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
         : undefined;
       const events = new Map(
         (facet?.events ?? [])
-          // hidden events reach the ledger but never the trigger picker
-          // (installation.* lifecycle noise).
           .filter((event) => event.hidden !== true)
           .map((event) => [
             event.key,
-            {
-              key: event.key,
-              displayName: event.label,
-              observed: observed.has(event.key),
-            },
+            { key: event.key, displayName: event.label, observed: observed.has(event.key) },
           ]),
       );
       for (const key of observed) {

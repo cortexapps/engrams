@@ -887,6 +887,10 @@ impl OrchestratorDriver {
             .to_string()
     }
 
+    /// ADR 0119: an automation is a block-graph definition. The e2e shape is
+    /// the smallest real one — the trigger plus a single `create_session`
+    /// block — posted as `definition_json` (the v2 proto carries definitions
+    /// as JSON strings; the orchestrator validates the shape).
     async fn create_automation(
         &self,
         name: &str,
@@ -894,6 +898,21 @@ impl OrchestratorDriver {
         profile_id: &str,
         prompt: &str,
     ) -> String {
+        let definition = json!({
+            "engine": 1,
+            "trigger": trigger,
+            "blocks": [{
+                "id": "launch",
+                "type": "create_session",
+                "config": {
+                    "profileId": profile_id,
+                    "promptTemplate": prompt,
+                    "includeEventContext": false
+                }
+            }],
+            "inputsSchema": [],
+            "settings": { "endSessionsOnFinish": false }
+        });
         let response = self
             .rpc(
                 "AutomationService",
@@ -902,14 +921,8 @@ impl OrchestratorDriver {
                     "name": name,
                     "description": "e2e",
                     "enabled": true,
-                    "trigger": trigger,
-                    "action": {
-                        "createTask": {
-                            "profileId": profile_id,
-                            "promptTemplate": prompt,
-                            "includeEventContext": false
-                        }
-                    }
+                    "definitionJson": definition.to_string(),
+                    "inputsJson": "{}"
                 }),
             )
             .await;
@@ -930,6 +943,12 @@ impl OrchestratorDriver {
 
     /// Returns Err instead of panicking so callers can disable the automation
     /// (stopping further fires against the shared stack) before failing.
+    ///
+    /// ADR 0119: a one-block run reaches `completed` as soon as its
+    /// `create_session` step lands (sessions are kept by default, so nothing
+    /// waits on the harness). "Launched" therefore means: a terminal
+    /// `completed` run whose `GetRun` lists at least one session id. Any
+    /// other terminal status is a failure to launch.
     async fn wait_for_launched_run(
         &self,
         automation_id: &str,
@@ -939,20 +958,33 @@ impl OrchestratorDriver {
         loop {
             let response = self
                 .rpc(
-                    "AutomationService",
-                    "ListAutomationRuns",
+                    "AutomationRunService",
+                    "ListRuns",
                     json!({ "automationId": automation_id, "limit": 10 }),
                 )
                 .await;
             // Connect's proto3 JSON omits an empty repeated field entirely, so
             // a missing `runs` before the first fire is normal, not an error.
             static EMPTY: Vec<Value> = Vec::new();
-            for run in response["runs"].as_array().unwrap_or(&EMPTY) {
-                match run["status"].as_str() {
-                    Some("launched") => return Ok(run.clone()),
-                    Some("render_failed" | "launch_failed" | "skipped") => {
+            for brief in response["runs"].as_array().unwrap_or(&EMPTY) {
+                match brief["status"].as_str() {
+                    Some("completed") => {
+                        let run_id = brief["id"].as_str().expect("run brief id");
+                        let detail = self
+                            .rpc("AutomationRunService", "GetRun", json!({ "runId": run_id }))
+                            .await;
+                        let session_id = detail["run"]["sessionIds"]
+                            .as_array()
+                            .and_then(|ids| ids.first())
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                format!("automation {automation_id} completed without a session: {detail}")
+                            })?;
+                        return Ok(json!({ "runId": run_id, "sessionId": session_id }));
+                    }
+                    Some("failed" | "filtered" | "deadline" | "halted" | "superseded") => {
                         return Err(format!(
-                            "automation {automation_id} terminated without launch: {run}"
+                            "automation {automation_id} terminated without launch: {brief}"
                         ));
                     }
                     _ => {}
@@ -969,14 +1001,12 @@ impl OrchestratorDriver {
     }
 
     async fn assert_task_session(&self, run: &Value) -> SessionId {
-        let task_id = run["taskId"]
-            .as_str()
-            .expect("launched automation run taskId");
         let session_id = run["sessionId"]
             .as_str()
             .expect("launched automation run sessionId");
+        // GetTask resolves by task id OR session id (ADR 0087).
         let response = self
-            .rpc("TaskService", "GetTask", json!({ "taskId": task_id }))
+            .rpc("TaskService", "GetTask", json!({ "sessionId": session_id }))
             .await;
         assert_eq!(response["task"]["type"], "automation");
         assert!(
@@ -985,7 +1015,7 @@ impl OrchestratorDriver {
                 .expect("GetTask task.sessions")
                 .iter()
                 .any(|session| session["sessionId"] == session_id),
-            "automation task {task_id} did not contain session {session_id}: {response}"
+            "automation task for session {session_id} did not contain it: {response}"
         );
         session_id
             .parse()
@@ -1078,10 +1108,9 @@ async fn e2e_automation_webhook_launches_session() {
         .create_automation(
             &format!("Webhook e2e {suffix}"),
             json!({
-                "webhook": {
-                    "registrationId": registration_id,
-                    "events": ["incident.opened"]
-                }
+                "kind": "webhook",
+                "registrationId": registration_id,
+                "events": ["incident.opened"]
             }),
             &profile_id,
             "Webhook incident ${{ event.raw.incident.id }}",
@@ -1123,7 +1152,7 @@ async fn e2e_automation_cron_launches_session() {
     let automation_id = orchestrator
         .create_automation(
             &format!("Cron e2e {suffix}"),
-            json!({ "cron": { "schedule": "*/5 * * * * *", "timezone": "UTC" } }),
+            json!({ "kind": "cron", "schedule": "*/5 * * * * *", "timezone": "UTC" }),
             &profile_id,
             "Cron fired at ${{ trigger.scheduled_for }}",
         )

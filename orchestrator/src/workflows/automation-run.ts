@@ -173,8 +173,15 @@ export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): E
       return { sessionId, taskId };
     },
 
-    async sendPrompt(sessionId, promptId, text) {
-      await defaultSessions.sendPrompt({ sessionId, promptId, text });
+    async sendPrompt(sessionId, promptId, text, harnessMode) {
+      // ADR 0107: a mid-run prompt may select a harness mode (e.g. "plan");
+      // SendPromptRequest carries it as an optional field.
+      await defaultSessions.sendPrompt({
+        sessionId,
+        promptId,
+        text,
+        ...(harnessMode !== undefined ? { harnessMode } : {}),
+      });
     },
 
     async endSession(sessionId) {

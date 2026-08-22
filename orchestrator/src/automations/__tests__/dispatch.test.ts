@@ -26,6 +26,7 @@ function meta(overrides: Partial<AutomationMetaRow> = {}): AutomationMetaRow {
     builtinKey: null,
     currentVersion: 2,
     inputs: {},
+    blockOverrides: {},
     endSessionsOnFinish: false,
     createdByUserId: "admin-1",
     nextFireAt: null,
@@ -97,6 +98,7 @@ function makeHarness(targets: DispatchTarget[]): Harness {
           leaseExpiresAt: null,
           startedAt: null,
           endedAt: input.endedAt ?? null,
+          dryRun: input.dryRun ?? false,
           createdAt: RECEIVED_AT,
         });
       }

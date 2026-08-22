@@ -170,6 +170,76 @@ describe("automation engine store (live PG)", () => {
     expect(run?.startedAt?.toISOString()).toBe("2026-08-21T10:00:05.000Z");
   });
 
+  test.skipIf(!dbReachable)(
+    "loadSnapshot merges block overrides over the pinned version; dry_run rides the run row",
+    async () => {
+      const id = `${AUTO_ID}-overrides`;
+      await seedAutomation(id);
+      const db = getDb();
+      // Mark promptTemplate tunable on the seeded version, then store an override.
+      await db.execute(sql`
+        update automation_version
+        set blocks = ${JSON.stringify([
+          {
+            id: "create_session",
+            type: "create_session",
+            config: { profileId: "p1", promptTemplate: "go", includeEventContext: false },
+            tunable: ["promptTemplate"],
+          },
+        ])}::jsonb
+        where automation_id = ${id} and version = 1
+      `);
+      const store = makeAutomationStore(db);
+      await store.setBlockOverrides(id, { create_session: { promptTemplate: "overridden" } });
+      const runId = `autorun:${id}:dryrun:1`;
+      await store.insertRun({
+        id: runId,
+        automationId: id,
+        version: 1,
+        trigger: TRIGGER,
+        deliveryKey: "dryrun:1",
+        concurrencyKey: null,
+        scheduledFor: null,
+        dryRun: true,
+      });
+
+      const snapshot = await makeAutomationEngineStore().loadSnapshot(runId);
+      expect(snapshot.definition.blocks[0]!.config["promptTemplate"]).toBe("overridden");
+      expect(snapshot.dryRun).toBe(true);
+      // The stored version itself is untouched.
+      const version = await store.getVersion(id, 1);
+      expect(version?.blocks[0]!.config["promptTemplate"]).toBe("go");
+    },
+  );
+
+  test.skipIf(!dbReachable)("latestRuns and runCounts7d summarize per automation", async () => {
+    const id = `${AUTO_ID}-summary`;
+    await seedAutomation(id);
+    const store = makeAutomationStore(getDb());
+    for (const [n, status] of [["1", "completed"], ["2", "failed"], ["3", "filtered"]] as const) {
+      await store.insertRun({
+        id: `autorun:${id}:manual:${n}`,
+        automationId: id,
+        version: 1,
+        trigger: TRIGGER,
+        deliveryKey: `manual:${n}`,
+        concurrencyKey: null,
+        scheduledFor: null,
+        status,
+      });
+    }
+    const latest = await store.latestRuns([id]);
+    expect(latest.get(id)).toBeDefined();
+    const counts = await store.runCounts7d([id], new Date());
+    const days = counts.get(id) ?? [];
+    expect(days.length).toBeGreaterThanOrEqual(1);
+    const total = days.reduce((acc, d) => acc + d.completed + d.failed + d.filtered + d.other, 0);
+    expect(total).toBe(3);
+    expect(days.reduce((acc, d) => acc + d.completed, 0)).toBe(1);
+    expect(days.reduce((acc, d) => acc + d.failed, 0)).toBe(1);
+    expect(days.reduce((acc, d) => acc + d.filtered, 0)).toBe(1);
+  });
+
   test.skipIf(!dbReachable)("claim race: one winner, holder visible to the loser", async () => {
     const id = `${AUTO_ID}-race`;
     await seedAutomation(id);

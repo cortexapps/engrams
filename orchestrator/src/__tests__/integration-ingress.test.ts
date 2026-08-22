@@ -47,6 +47,12 @@ function fakeStore() {
     async listObservedEventKeys() {
       return [];
     },
+    async getById() {
+      return null;
+    },
+    async listObservedScopeValues() {
+      return [];
+    },
   };
   return { recorded, store };
 }

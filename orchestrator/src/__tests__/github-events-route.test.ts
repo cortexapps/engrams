@@ -121,6 +121,12 @@ export function fakeIngress() {
     async listObservedEventKeys() {
       return [];
     },
+    async getById() {
+      return null;
+    },
+    async listObservedScopeValues() {
+      return [];
+    },
   };
   return {
     recorded,
@@ -538,6 +544,7 @@ describe("ingress → integration-trigger dispatch (2.C)", () => {
         builtinKey: null,
         currentVersion: 1,
         inputs: { repos: { [enrollment.repo]: { mode: "auto" } } },
+        blockOverrides: {},
         endSessionsOnFinish: false,
         createdByUserId: null,
         nextFireAt: null,

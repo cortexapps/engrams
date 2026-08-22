@@ -21,18 +21,24 @@ const automationHolder = vi.hoisted(() => ({
 }));
 const paramsHolder = vi.hoisted(() => ({ value: {} as { id?: string } }));
 const create = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "new" } }));
-const update = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "a1" } }));
-const testRender = vi.hoisted(() => vi.fn().mockResolvedValue({ errors: [] }));
+const update = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ automation: { id: "a1", enabled: true } }),
+);
+const updateMeta = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "a1" } }));
+const setEnabled = vi.hoisted(() => vi.fn().mockResolvedValue({ automation: { id: "a1" } }));
+const testRender = vi.hoisted(() => vi.fn().mockResolvedValue({ blocks: [], errors: [] }));
 
 vi.mock("@/hooks/useAutomations", () => ({
   useAutomation: () => ({ data: automationHolder.value, isPending: false, error: null }),
-  useAutomationRuns: () => ({ data: { runs: [] }, isPending: false, error: null }),
+  useAutomationRuns: () => ({ data: { runs: [], filtered: [] }, isPending: false, error: null }),
   useCreateAutomation: () => ({ mutateAsync: create, isPending: false }),
-  useUpdateAutomation: () => ({ mutateAsync: update, isPending: false }),
+  useSaveVersion: () => ({ mutateAsync: update, isPending: false }),
+  useUpdateAutomationMeta: () => ({ mutateAsync: updateMeta, isPending: false }),
+  useSetAutomationEnabled: () => ({ mutateAsync: setEnabled, isPending: false }),
   useTestAutomationRender: () => ({ mutateAsync: testRender, isPending: false }),
   useWebhookEvents: () => ({ data: { events: [], variables: [] }, isPending: false }),
   useWebhookRegistrations: () => ({ data: { registrations: [] } }),
-  useWebhookSamples: () => ({ data: { samples: [] } }),
+  useEventSamples: () => ({ data: { samples: [] } }),
 }));
 vi.mock("@/hooks/useProfiles", () => ({
   useProfiles: () => ({
@@ -82,33 +88,53 @@ vi.mock("@tanstack/react-router", async (orig) => ({
   }: Record<string, unknown> & { children: React.ReactNode }) => <a {...rest}>{children}</a>,
 }));
 
+/** A v2 automation: the current version carries a single create_session
+ * block (the shape the phase-1 migration produced). */
 function automation(override: Partial<CreateTaskValue>) {
   return {
     automation: {
       id: "a1",
       name: "Daily triage",
       description: "",
+      kind: "user",
       enabled: true,
-      trigger: {
-        trigger: { case: "cron", value: { schedule: "0 9 * * *", timezone: "UTC" } },
-      },
-      action: {
-        action: {
-          case: "createTask",
-          value: {
-            profileId: "pf1",
-            promptTemplate: "Triage the queue",
-            includeEventContext: true,
-            ...override,
-          },
-        },
+      currentVersion: 1,
+      inputsJson: "{}",
+      blockOverridesJson: "{}",
+      version: {
+        automationId: "a1",
+        number: 1,
+        definitionJson: JSON.stringify({
+          engine: 1,
+          trigger: { kind: "cron", schedule: "0 9 * * *", timezone: "UTC" },
+          blocks: [
+            {
+              id: "create_session",
+              type: "create_session",
+              config: {
+                profileId: "pf1",
+                promptTemplate: "Triage the queue",
+                includeEventContext: true,
+                ...override,
+              },
+            },
+          ],
+          inputsSchema: [],
+          settings: { endSessionsOnFinish: false },
+        }),
+        createdAt: "2026-08-21T00:00:00Z",
       },
     },
   };
 }
 
+/** The saved definition's single block config, parsed from definition_json. */
 function savedAction(): CreateTaskValue {
-  return update.mock.calls[0]![0].action.action.value as CreateTaskValue;
+  const request = update.mock.calls[0]![0] as { definitionJson: string };
+  const definition = JSON.parse(request.definitionJson) as {
+    blocks: Array<{ config: CreateTaskValue }>;
+  };
+  return definition.blocks[0]!.config;
 }
 
 beforeEach(() => {
@@ -116,6 +142,8 @@ beforeEach(() => {
   paramsHolder.value = { id: "a1" };
   create.mockClear();
   update.mockClear();
+  updateMeta.mockClear();
+  setEnabled.mockClear();
   testRender.mockClear();
 });
 

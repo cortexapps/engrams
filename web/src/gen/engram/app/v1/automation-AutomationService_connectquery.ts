@@ -5,29 +5,37 @@
 import { AutomationService } from "./automation_pb";
 
 /**
- * @generated from rpc engram.app.v1.AutomationService.CreateAutomation
+ * @generated from rpc engram.app.v1.AutomationService.ListAutomations
  */
-export const createAutomation = AutomationService.method.createAutomation;
+export const listAutomations = AutomationService.method.listAutomations;
 
 /**
- * @generated from rpc engram.app.v1.AutomationService.UpdateAutomation
- */
-export const updateAutomation = AutomationService.method.updateAutomation;
-
-/**
- * @generated from rpc engram.app.v1.AutomationService.ArchiveAutomation
- */
-export const archiveAutomation = AutomationService.method.archiveAutomation;
-
-/**
+ * By id, or by builtin_key for the shipped automations.
+ *
  * @generated from rpc engram.app.v1.AutomationService.GetAutomation
  */
 export const getAutomation = AutomationService.method.getAutomation;
 
 /**
- * @generated from rpc engram.app.v1.AutomationService.ListAutomations
+ * definition_json → version 1.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.CreateAutomation
  */
-export const listAutomations = AutomationService.method.listAutomations;
+export const createAutomation = AutomationService.method.createAutomation;
+
+/**
+ * Save = a new immutable version; in-flight runs finish on theirs.
+ * PermissionDenied on a built-in (structure is locked — use
+ * SetBlockOverrides / SetInputs).
+ *
+ * @generated from rpc engram.app.v1.AutomationService.SaveVersion
+ */
+export const saveVersion = AutomationService.method.saveVersion;
+
+/**
+ * @generated from rpc engram.app.v1.AutomationService.ListVersions
+ */
+export const listVersions = AutomationService.method.listVersions;
 
 /**
  * @generated from rpc engram.app.v1.AutomationService.SetAutomationEnabled
@@ -35,32 +43,88 @@ export const listAutomations = AutomationService.method.listAutomations;
 export const setAutomationEnabled = AutomationService.method.setAutomationEnabled;
 
 /**
- * @generated from rpc engram.app.v1.AutomationService.ListAutomationRuns
+ * Name / description / run settings. Settings are PermissionDenied on a
+ * built-in.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.UpdateAutomationMeta
  */
-export const listAutomationRuns = AutomationService.method.listAutomationRuns;
+export const updateAutomationMeta = AutomationService.method.updateAutomationMeta;
 
 /**
+ * Per-automation input values (allowed on built-ins).
+ *
+ * @generated from rpc engram.app.v1.AutomationService.SetInputs
+ */
+export const setInputs = AutomationService.method.setInputs;
+
+/**
+ * Per-automation tunable block fields (allowed on built-ins). Every key
+ * must be a `tunable` field of that block in the current version, and the
+ * merged config must re-validate against the block's schema.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.SetBlockOverrides
+ */
+export const setBlockOverrides = AutomationService.method.setBlockOverrides;
+
+/**
+ * A fully editable user copy (built-ins included); overrides are folded in.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.DuplicateAutomation
+ */
+export const duplicateAutomation = AutomationService.method.duplicateAutomation;
+
+/**
+ * @generated from rpc engram.app.v1.AutomationService.ArchiveAutomation
+ */
+export const archiveAutomation = AutomationService.method.archiveAutomation;
+
+/**
+ * Render every block against a sample without side effects: per-block
+ * rendered config, filter verdicts, and the scope visible at that block.
+ *
  * @generated from rpc engram.app.v1.AutomationService.TestRender
  */
 export const testRender = AutomationService.method.testRender;
 
 /**
- * Evaluate a code-block source in the QuickJS sandbox against a sample
- * input (ADR 0119 D6). Same limits as a real run; powers the editor's
- * Run button.
+ * A real run whose integration actions are stubbed (they record what they
+ * would have done). Appears in the run list flagged dry_run.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.DryRun
+ */
+export const dryRun = AutomationService.method.dryRun;
+
+/**
+ * Evaluate a code-block source in the QuickJS sandbox (ADR 0119 D6).
  *
  * @generated from rpc engram.app.v1.AutomationService.EvalCode
  */
 export const evalCode = AutomationService.method.evalCode;
 
 /**
- * @generated from rpc engram.app.v1.AutomationService.ListWebhookSamples
+ * Manual trigger: start a run now with an optional input override.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.RunNow
  */
-export const listWebhookSamples = AutomationService.method.listWebhookSamples;
+export const runNow = AutomationService.method.runNow;
 
 /**
- * ADR 0119 D5: the connector-declared event and action catalogs that back
- * integration triggers and integration_action blocks.
+ * Stored deliveries for the automation's trigger source (integration ledger
+ * or custom-webhook samples).
+ *
+ * @generated from rpc engram.app.v1.AutomationService.ListEventSamples
+ */
+export const listEventSamples = AutomationService.method.listEventSamples;
+
+/**
+ * Picker values for a map input keyed by an integration noun.
+ *
+ * @generated from rpc engram.app.v1.AutomationService.ListInputKeyOptions
+ */
+export const listInputKeyOptions = AutomationService.method.listInputKeyOptions;
+
+/**
+ * ADR 0119 D5: the connector-declared event and action catalogs.
  *
  * @generated from rpc engram.app.v1.AutomationService.ListEventCatalog
  */

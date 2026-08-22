@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/automation.proto.
  */
 export const file_engram_app_v1_automation: GenFile = /*@__PURE__*/
-  fileDesc("Ch5lbmdyYW0vYXBwL3YxL2F1dG9tYXRpb24ucHJvdG8SDWVuZ3JhbS5hcHAudjEi/AIKCkF1dG9tYXRpb24SCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCRIPCgdlbmFibGVkGAQgASgIEjEKB3RyaWdnZXIYBSABKAsyIC5lbmdyYW0uYXBwLnYxLkF1dG9tYXRpb25UcmlnZ2VyEi8KBmFjdGlvbhgGIAEoCzIfLmVuZ3JhbS5hcHAudjEuQXV0b21hdGlvbkFjdGlvbhIfChJjcmVhdGVkX2J5X3VzZXJfaWQYByABKAlIAIgBARIZCgxuZXh0X2ZpcmVfYXQYCCABKAlIAYgBARIaCg1sYXN0X2ZpcmVkX2F0GAkgASgJSAKIAQESEAoIYXJjaGl2ZWQYCiABKAgSEgoKY3JlYXRlZF9hdBgLIAEoCRISCgp1cGRhdGVkX2F0GAwgASgJQhUKE19jcmVhdGVkX2J5X3VzZXJfaWRCDwoNX25leHRfZmlyZV9hdEIQCg5fbGFzdF9maXJlZF9hdCLUAQoRQXV0b21hdGlvblRyaWdnZXISNAoEY3JvbhgBIAEoCzIkLmVuZ3JhbS5hcHAudjEuQ3JvbkF1dG9tYXRpb25UcmlnZ2VySAASOgoHd2ViaG9vaxgCIAEoCzInLmVuZ3JhbS5hcHAudjEuV2ViaG9va0F1dG9tYXRpb25UcmlnZ2VySAASQgoLaW50ZWdyYXRpb24YAyABKAsyKy5lbmdyYW0uYXBwLnYxLkludGVncmF0aW9uQXV0b21hdGlvblRyaWdnZXJIAEIJCgd0cmlnZ2VyIqUBChxJbnRlZ3JhdGlvbkF1dG9tYXRpb25UcmlnZ2VyEhAKCHByb3ZpZGVyGAEgASgJEhUKDWNvbm5lY3Rpb25faWQYAiABKAkSEgoKZXZlbnRfa2V5cxgDIAMoCRIUCgxzY29wZV92YWx1ZXMYBCADKAkSHQoQc2NvcGVfZnJvbV9pbnB1dBgFIAEoCUgAiAEBQhMKEV9zY29wZV9mcm9tX2lucHV0IjsKFUNyb25BdXRvbWF0aW9uVHJpZ2dlchIQCghzY2hlZHVsZRgBIAEoCRIQCgh0aW1lem9uZRgCIAEoCSJtChhXZWJob29rQXV0b21hdGlvblRyaWdnZXISFwoPcmVnaXN0cmF0aW9uX2lkGAEgASgJEg4KBmV2ZW50cxgCIAMoCRIYCgtmaWx0ZXJfanNvbhgDIAEoCUgAiAEBQg4KDF9maWx0ZXJfanNvbiJeChBBdXRvbWF0aW9uQWN0aW9uEkAKC2NyZWF0ZV90YXNrGAEgASgLMikuZW5ncmFtLmFwcC52MS5DcmVhdGVUYXNrQXV0b21hdGlvbkFjdGlvbkgAQggKBmFjdGlvbiLQAgoaQ3JlYXRlVGFza0F1dG9tYXRpb25BY3Rpb24SEgoKcHJvZmlsZV9pZBgBIAEoCRIXCg9wcm9tcHRfdGVtcGxhdGUYAiABKAkSGwoOdGl0bGVfdGVtcGxhdGUYAyABKAlIAIgBARIdChVpbmNsdWRlX2V2ZW50X2NvbnRleHQYBCABKAgSGQoMaGFybmVzc19tb2RlGAUgASgJSAGIAQESFAoHaGFybmVzcxgGIAEoCUgCiAEBEhIKBW1vZGVsGAcgASgJSAOIAQESEwoGZWZmb3J0GAggASgJSASIAQESGQoMbW9kZWxfcm91dGVyGAkgASgJSAWIAQFCEQoPX3RpdGxlX3RlbXBsYXRlQg8KDV9oYXJuZXNzX21vZGVCCgoIX2hhcm5lc3NCCAoGX21vZGVsQgkKB19lZmZvcnRCDwoNX21vZGVsX3JvdXRlciKxAQoXQ3JlYXRlQXV0b21hdGlvblJlcXVlc3QSDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCRIPCgdlbmFibGVkGAMgASgIEjEKB3RyaWdnZXIYBCABKAsyIC5lbmdyYW0uYXBwLnYxLkF1dG9tYXRpb25UcmlnZ2VyEi8KBmFjdGlvbhgFIAEoCzIfLmVuZ3JhbS5hcHAudjEuQXV0b21hdGlvbkFjdGlvbiJJChhDcmVhdGVBdXRvbWF0aW9uUmVzcG9uc2USLQoKYXV0b21hdGlvbhgBIAEoCzIZLmVuZ3JhbS5hcHAudjEuQXV0b21hdGlvbiK9AQoXVXBkYXRlQXV0b21hdGlvblJlcXVlc3QSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCRIPCgdlbmFibGVkGAQgASgIEjEKB3RyaWdnZXIYBSABKAsyIC5lbmdyYW0uYXBwLnYxLkF1dG9tYXRpb25UcmlnZ2VyEi8KBmFjdGlvbhgGIAEoCzIfLmVuZ3JhbS5hcHAudjEuQXV0b21hdGlvbkFjdGlvbiJJChhVcGRhdGVBdXRvbWF0aW9uUmVzcG9uc2USLQoKYXV0b21hdGlvbhgBIAEoCzIZLmVuZ3JhbS5hcHAudjEuQXV0b21hdGlvbiImChhBcmNoaXZlQXV0b21hdGlvblJlcXVlc3QSCgoCaWQYASABKAkiSgoZQXJjaGl2ZUF1dG9tYXRpb25SZXNwb25zZRItCgphdXRvbWF0aW9uGAEgASgLMhkuZW5ncmFtLmFwcC52MS5BdXRvbWF0aW9uIiIKFEdldEF1dG9tYXRpb25SZXF1ZXN0EgoKAmlkGAEgASgJIkYKFUdldEF1dG9tYXRpb25SZXNwb25zZRItCgphdXRvbWF0aW9uGAEgASgLMhkuZW5ncmFtLmFwcC52MS5BdXRvbWF0aW9uIjIKFkxpc3RBdXRvbWF0aW9uc1JlcXVlc3QSGAoQaW5jbHVkZV9hcmNoaXZlZBgBIAEoCCJJChdMaXN0QXV0b21hdGlvbnNSZXNwb25zZRIuCgthdXRvbWF0aW9ucxgBIAMoCzIZLmVuZ3JhbS5hcHAudjEuQXV0b21hdGlvbiI6ChtTZXRBdXRvbWF0aW9uRW5hYmxlZFJlcXVlc3QSCgoCaWQYASABKAkSDwoHZW5hYmxlZBgCIAEoCCJNChxTZXRBdXRvbWF0aW9uRW5hYmxlZFJlc3BvbnNlEi0KCmF1dG9tYXRpb24YASABKAsyGS5lbmdyYW0uYXBwLnYxLkF1dG9tYXRpb24i5AIKDUF1dG9tYXRpb25SdW4SCgoCaWQYASABKAkSFQoNYXV0b21hdGlvbl9pZBgCIAEoCRIUCgx0cmlnZ2VyX2pzb24YAyABKAkSHAoPcmVuZGVyZWRfcHJvbXB0GAQgASgJSACIAQESGwoOcmVuZGVyZWRfdGl0bGUYBSABKAlIAYgBARIUCgd0YXNrX2lkGAYgASgJSAKIAQESFwoKc2Vzc2lvbl9pZBgHIAEoCUgDiAEBEg4KBnN0YXR1cxgIIAEoCRISCgVlcnJvchgJIAEoCUgEiAEBEhoKDXNjaGVkdWxlZF9mb3IYCiABKAlIBYgBARISCgpjcmVhdGVkX2F0GAsgASgJQhIKEF9yZW5kZXJlZF9wcm9tcHRCEQoPX3JlbmRlcmVkX3RpdGxlQgoKCF90YXNrX2lkQg0KC19zZXNzaW9uX2lkQggKBl9lcnJvckIQCg5fc2NoZWR1bGVkX2ZvciJBChlMaXN0QXV0b21hdGlvblJ1bnNSZXF1ZXN0EhUKDWF1dG9tYXRpb25faWQYASABKAkSDQoFbGltaXQYAiABKAUiSAoaTGlzdEF1dG9tYXRpb25SdW5zUmVzcG9uc2USKgoEcnVucxgBIAMoCzIcLmVuZ3JhbS5hcHAudjEuQXV0b21hdGlvblJ1biI9Cg1UZW1wbGF0ZUVycm9yEg0KBWZpZWxkGAEgASgJEgwKBGNvZGUYAiABKAkSDwoHbWVzc2FnZRgDIAEoCSK7AgoRVGVzdFJlbmRlclJlcXVlc3QSGgoNYXV0b21hdGlvbl9pZBgBIAEoCUgBiAEBEhwKD2F1dG9tYXRpb25fbmFtZRgCIAEoCUgCiAEBEjUKDGRyYWZ0X2FjdGlvbhgDIAEoCzIfLmVuZ3JhbS5hcHAudjEuQXV0b21hdGlvbkFjdGlvbhITCglzYW1wbGVfaWQYBCABKAlIABIWCgxwYXlsb2FkX2pzb24YBSABKAlIABIXCg9yZWdpc3RyYXRpb25faWQYBiABKAkSEQoJZXZlbnRfa2V5GAcgASgJEhoKDXNjaGVkdWxlZF9mb3IYCCABKAlIA4gBAUIICgZzYW1wbGVCEAoOX2F1dG9tYXRpb25faWRCEgoQX2F1dG9tYXRpb25fbmFtZUIQCg5fc2NoZWR1bGVkX2ZvciKkAQoSVGVzdFJlbmRlclJlc3BvbnNlEhwKD3JlbmRlcmVkX3Byb21wdBgBIAEoCUgAiAEBEhsKDnJlbmRlcmVkX3RpdGxlGAIgASgJSAGIAQESLAoGZXJyb3JzGAMgAygLMhwuZW5ncmFtLmFwcC52MS5UZW1wbGF0ZUVycm9yQhIKEF9yZW5kZXJlZF9wcm9tcHRCEQoPX3JlbmRlcmVkX3RpdGxlIkMKD0V2YWxDb2RlUmVxdWVzdBIOCgZzb3VyY2UYASABKAkSDAoEbW9kZRgCIAEoCRISCgppbnB1dF9qc29uGAMgASgJItsBChBFdmFsQ29kZVJlc3BvbnNlEhcKCnZhbHVlX2pzb24YASABKAlIAIgBARIXCgplcnJvcl9uYW1lGAIgASgJSAGIAQESGgoNZXJyb3JfbWVzc2FnZRgDIAEoCUgCiAEBEhcKCmVycm9yX2xpbmUYBCABKAVIA4gBARIMCgRsb2dzGAUgAygJEhMKC2R1cmF0aW9uX21zGAYgASgDQg0KC192YWx1ZV9qc29uQg0KC19lcnJvcl9uYW1lQhAKDl9lcnJvcl9tZXNzYWdlQg0KC19lcnJvcl9saW5lInIKDVdlYmhvb2tTYW1wbGUSCgoCaWQYASABKAkSFwoPcmVnaXN0cmF0aW9uX2lkGAIgASgJEhEKCWV2ZW50X2tleRgDIAEoCRIUCgxwYXlsb2FkX2pzb24YBCABKAkSEwoLcmVjZWl2ZWRfYXQYBSABKAkiaQoZTGlzdFdlYmhvb2tTYW1wbGVzUmVxdWVzdBIXCg9yZWdpc3RyYXRpb25faWQYASABKAkSFgoJZXZlbnRfa2V5GAIgASgJSACIAQESDQoFbGltaXQYAyABKAVCDAoKX2V2ZW50X2tleSJLChpMaXN0V2ViaG9va1NhbXBsZXNSZXNwb25zZRItCgdzYW1wbGVzGAEgAygLMhwuZW5ncmFtLmFwcC52MS5XZWJob29rU2FtcGxlIowCChNXZWJob29rUmVnaXN0cmF0aW9uEgoKAmlkGAEgASgJEgwKBG5hbWUYAiABKAkSGwoTdmVyaWZpY2F0aW9uX3NjaGVtZRgDIAEoCRIaCg1wcm92aWRlcl9oaW50GAQgASgJSACIAQESHwoSY3JlYXRlZF9ieV91c2VyX2lkGAUgASgJSAGIAQESEgoKY3JlYXRlZF9hdBgGIAEoCRISCgp1cGRhdGVkX2F0GAcgASgJEhwKD2Rpc2FibGVkX3JlYXNvbhgIIAEoCUgCiAEBQhAKDl9wcm92aWRlcl9oaW50QhUKE19jcmVhdGVkX2J5X3VzZXJfaWRCEgoQX2Rpc2FibGVkX3JlYXNvbiKHAQogQ3JlYXRlV2ViaG9va1JlZ2lzdHJhdGlvblJlcXVlc3QSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIbChN2ZXJpZmljYXRpb25fc2NoZW1lGAMgASgJEhoKDXByb3ZpZGVyX2hpbnQYBCABKAlIAIgBAUIQCg5fcHJvdmlkZXJfaGludCJtCiFDcmVhdGVXZWJob29rUmVnaXN0cmF0aW9uUmVzcG9uc2USOAoMcmVnaXN0cmF0aW9uGAEgASgLMiIuZW5ncmFtLmFwcC52MS5XZWJob29rUmVnaXN0cmF0aW9uEg4KBnNlY3JldBgCIAEoCSIhCh9MaXN0V2ViaG9va1JlZ2lzdHJhdGlvbnNSZXF1ZXN0Il0KIExpc3RXZWJob29rUmVnaXN0cmF0aW9uc1Jlc3BvbnNlEjkKDXJlZ2lzdHJhdGlvbnMYASADKAsyIi5lbmdyYW0uYXBwLnYxLldlYmhvb2tSZWdpc3RyYXRpb24iLgogRGVsZXRlV2ViaG9va1JlZ2lzdHJhdGlvblJlcXVlc3QSCgoCaWQYASABKAkiNAohRGVsZXRlV2ViaG9va1JlZ2lzdHJhdGlvblJlc3BvbnNlEg8KB2RlbGV0ZWQYASABKAgiMwoYTGlzdFdlYmhvb2tFdmVudHNSZXF1ZXN0EhcKD3JlZ2lzdHJhdGlvbl9pZBgBIAEoCSJDCgxXZWJob29rRXZlbnQSCwoDa2V5GAEgASgJEhQKDGRpc3BsYXlfbmFtZRgCIAEoCRIQCghvYnNlcnZlZBgDIAEoCCIuCg9XZWJob29rVmFyaWFibGUSDAoEcGF0aBgBIAEoCRINCgVhbGlhcxgCIAEoCSJ7ChlMaXN0V2ViaG9va0V2ZW50c1Jlc3BvbnNlEisKBmV2ZW50cxgBIAMoCzIbLmVuZ3JhbS5hcHAudjEuV2ViaG9va0V2ZW50EjEKCXZhcmlhYmxlcxgCIAMoCzIeLmVuZ3JhbS5hcHAudjEuV2ViaG9va1ZhcmlhYmxlIisKF0xpc3RFdmVudENhdGFsb2dSZXF1ZXN0EhAKCHByb3ZpZGVyGAEgASgJIpABChFFdmVudENhdGFsb2dFbnRyeRILCgNrZXkYASABKAkSDQoFbGFiZWwYAiABKAkSEwoLZGVzY3JpcHRpb24YAyABKAkSEwoLc2NoZW1hX2pzb24YBCABKAkSEwoLc2FtcGxlX2pzb24YBSABKAkSEAoIb2JzZXJ2ZWQYBiABKAgSDgoGaGlkZGVuGAcgASgIIi8KEUV2ZW50Q2F0YWxvZ1Njb3BlEgsKA2tleRgBIAEoCRINCgVsYWJlbBgCIAEoCSLeAQoYTGlzdEV2ZW50Q2F0YWxvZ1Jlc3BvbnNlEjAKBmV2ZW50cxgBIAMoCzIgLmVuZ3JhbS5hcHAudjEuRXZlbnRDYXRhbG9nRW50cnkSNAoFc2NvcGUYAiABKAsyIC5lbmdyYW0uYXBwLnYxLkV2ZW50Q2F0YWxvZ1Njb3BlSACIAQESMQoJdmFyaWFibGVzGAMgAygLMh4uZW5ncmFtLmFwcC52MS5XZWJob29rVmFyaWFibGUSHQoVZGVmYXVsdF9jb25uZWN0aW9uX2lkGAQgASgJQggKBl9zY29wZSIsChhMaXN0QWN0aW9uQ2F0YWxvZ1JlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkiXwoSQWN0aW9uQ2F0YWxvZ0VudHJ5EgoKAmlkGAEgASgJEg0KBWxhYmVsGAIgASgJEhMKC2Rlc2NyaXB0aW9uGAMgASgJEhkKEWlucHV0X3NjaGVtYV9qc29uGAQgASgJIk8KGUxpc3RBY3Rpb25DYXRhbG9nUmVzcG9uc2USMgoHYWN0aW9ucxgBIAMoCzIhLmVuZ3JhbS5hcHAudjEuQWN0aW9uQ2F0YWxvZ0VudHJ5MrcJChFBdXRvbWF0aW9uU2VydmljZRJjChBDcmVhdGVBdXRvbWF0aW9uEiYuZW5ncmFtLmFwcC52MS5DcmVhdGVBdXRvbWF0aW9uUmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQXV0b21hdGlvblJlc3BvbnNlEmMKEFVwZGF0ZUF1dG9tYXRpb24SJi5lbmdyYW0uYXBwLnYxLlVwZGF0ZUF1dG9tYXRpb25SZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5VcGRhdGVBdXRvbWF0aW9uUmVzcG9uc2USZgoRQXJjaGl2ZUF1dG9tYXRpb24SJy5lbmdyYW0uYXBwLnYxLkFyY2hpdmVBdXRvbWF0aW9uUmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuQXJjaGl2ZUF1dG9tYXRpb25SZXNwb25zZRJaCg1HZXRBdXRvbWF0aW9uEiMuZW5ncmFtLmFwcC52MS5HZXRBdXRvbWF0aW9uUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuR2V0QXV0b21hdGlvblJlc3BvbnNlEmAKD0xpc3RBdXRvbWF0aW9ucxIlLmVuZ3JhbS5hcHAudjEuTGlzdEF1dG9tYXRpb25zUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuTGlzdEF1dG9tYXRpb25zUmVzcG9uc2USbwoUU2V0QXV0b21hdGlvbkVuYWJsZWQSKi5lbmdyYW0uYXBwLnYxLlNldEF1dG9tYXRpb25FbmFibGVkUmVxdWVzdBorLmVuZ3JhbS5hcHAudjEuU2V0QXV0b21hdGlvbkVuYWJsZWRSZXNwb25zZRJpChJMaXN0QXV0b21hdGlvblJ1bnMSKC5lbmdyYW0uYXBwLnYxLkxpc3RBdXRvbWF0aW9uUnVuc1JlcXVlc3QaKS5lbmdyYW0uYXBwLnYxLkxpc3RBdXRvbWF0aW9uUnVuc1Jlc3BvbnNlElEKClRlc3RSZW5kZXISIC5lbmdyYW0uYXBwLnYxLlRlc3RSZW5kZXJSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5UZXN0UmVuZGVyUmVzcG9uc2USSwoIRXZhbENvZGUSHi5lbmdyYW0uYXBwLnYxLkV2YWxDb2RlUmVxdWVzdBofLmVuZ3JhbS5hcHAudjEuRXZhbENvZGVSZXNwb25zZRJpChJMaXN0V2ViaG9va1NhbXBsZXMSKC5lbmdyYW0uYXBwLnYxLkxpc3RXZWJob29rU2FtcGxlc1JlcXVlc3QaKS5lbmdyYW0uYXBwLnYxLkxpc3RXZWJob29rU2FtcGxlc1Jlc3BvbnNlEmMKEExpc3RFdmVudENhdGFsb2cSJi5lbmdyYW0uYXBwLnYxLkxpc3RFdmVudENhdGFsb2dSZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5MaXN0RXZlbnRDYXRhbG9nUmVzcG9uc2USZgoRTGlzdEFjdGlvbkNhdGFsb2cSJy5lbmdyYW0uYXBwLnYxLkxpc3RBY3Rpb25DYXRhbG9nUmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuTGlzdEFjdGlvbkNhdGFsb2dSZXNwb25zZTKBBAoaV2ViaG9va1JlZ2lzdHJhdGlvblNlcnZpY2USfgoZQ3JlYXRlV2ViaG9va1JlZ2lzdHJhdGlvbhIvLmVuZ3JhbS5hcHAudjEuQ3JlYXRlV2ViaG9va1JlZ2lzdHJhdGlvblJlcXVlc3QaMC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVdlYmhvb2tSZWdpc3RyYXRpb25SZXNwb25zZRJ7ChhMaXN0V2ViaG9va1JlZ2lzdHJhdGlvbnMSLi5lbmdyYW0uYXBwLnYxLkxpc3RXZWJob29rUmVnaXN0cmF0aW9uc1JlcXVlc3QaLy5lbmdyYW0uYXBwLnYxLkxpc3RXZWJob29rUmVnaXN0cmF0aW9uc1Jlc3BvbnNlEn4KGURlbGV0ZVdlYmhvb2tSZWdpc3RyYXRpb24SLy5lbmdyYW0uYXBwLnYxLkRlbGV0ZVdlYmhvb2tSZWdpc3RyYXRpb25SZXF1ZXN0GjAuZW5ncmFtLmFwcC52MS5EZWxldGVXZWJob29rUmVnaXN0cmF0aW9uUmVzcG9uc2USZgoRTGlzdFdlYmhvb2tFdmVudHMSJy5lbmdyYW0uYXBwLnYxLkxpc3RXZWJob29rRXZlbnRzUmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuTGlzdFdlYmhvb2tFdmVudHNSZXNwb25zZWIGcHJvdG8z");
+  fileDesc("Ch5lbmdyYW0vYXBwL3YxL2F1dG9tYXRpb24ucHJvdG8SDWVuZ3JhbS5hcHAudjEizwMKCkF1dG9tYXRpb24SCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRITCgtkZXNjcmlwdGlvbhgDIAEoCRIMCgRraW5kGAQgASgJEhgKC2J1aWx0aW5fa2V5GAUgASgJSACIAQESDwoHZW5hYmxlZBgGIAEoCBIXCg9jdXJyZW50X3ZlcnNpb24YByABKAUSEwoLaW5wdXRzX2pzb24YCCABKAkSHAoUYmxvY2tfb3ZlcnJpZGVzX2pzb24YCSABKAkSEAoIYXJjaGl2ZWQYCiABKAgSHwoSY3JlYXRlZF9ieV91c2VyX2lkGAsgASgJSAGIAQESGQoMbmV4dF9maXJlX2F0GAwgASgJSAKIAQESGgoNbGFzdF9maXJlZF9hdBgNIAEoCUgDiAEBEhIKCmNyZWF0ZWRfYXQYDiABKAkSEgoKdXBkYXRlZF9hdBgPIAEoCRIxCgd2ZXJzaW9uGBAgASgLMiAuZW5ncmFtLmFwcC52MS5BdXRvbWF0aW9uVmVyc2lvbkIOCgxfYnVpbHRpbl9rZXlCFQoTX2NyZWF0ZWRfYnlfdXNlcl9pZEIPCg1fbmV4dF9maXJlX2F0QhAKDl9sYXN0X2ZpcmVkX2F0Ip8BChFBdXRvbWF0aW9uVmVyc2lvbhIVCg1hdXRvbWF0aW9uX2lkGAEgASgJEg4KBm51bWJlchgCIAEoBRIXCg9kZWZpbml0aW9uX2pzb24YAyABKAkSHwoSY3JlYXRlZF9ieV91c2VyX2lkGAQgASgJSACIAQESEgoKY3JlYXRlZF9hdBgFIAEoCUIVChNfY3JlYXRlZF9ieV91c2VyX2lkItECChJBdXRvbWF0aW9uUnVuQnJpZWYSCgoCaWQYASABKAkSFQoNYXV0b21hdGlvbl9pZBgCIAEoCRIPCgd2ZXJzaW9uGAMgASgFEg4KBnN0YXR1cxgEIAEoCRISCgVlcnJvchgFIAEoCUgAiAEBEhYKDnRyaWdnZXJfc291cmNlGAYgASgJEhYKCWV2ZW50X2tleRgHIAEoCUgBiAEBEhkKDGRlbGl2ZXJ5X2tleRgIIAEoCUgCiAEBEg8KB2RyeV9ydW4YCSABKAgSFwoKc3RhcnRlZF9hdBgKIAEoCUgDiAEBEhUKCGVuZGVkX2F0GAsgASgJSASIAQESEgoKY3JlYXRlZF9hdBgMIAEoCUIICgZfZXJyb3JCDAoKX2V2ZW50X2tleUIPCg1fZGVsaXZlcnlfa2V5Qg0KC19zdGFydGVkX2F0QgsKCV9lbmRlZF9hdCJeCgtEYXlSdW5Db3VudBILCgNkYXkYASABKAkSEQoJY29tcGxldGVkGAIgASgFEg4KBmZhaWxlZBgDIAEoBRIQCghmaWx0ZXJlZBgEIAEoBRINCgVvdGhlchgFIAEoBSLPAQoRQXV0b21hdGlvblN1bW1hcnkSLQoKYXV0b21hdGlvbhgBIAEoCzIZLmVuZ3JhbS5hcHAudjEuQXV0b21hdGlvbhIXCg90cmlnZ2VyX3N1bW1hcnkYAiABKAkSOAoIbGFzdF9ydW4YAyABKAsyIS5lbmdyYW0uYXBwLnYxLkF1dG9tYXRpb25SdW5CcmllZkgAiAEBEisKB3J1bnNfN2QYBCADKAsyGi5lbmdyYW0uYXBwLnYxLkRheVJ1bkNvdW50QgsKCV9sYXN0X3J1biJMCgpCbG9ja0Vycm9yEhAKCGJsb2NrX2lkGAEgASgJEg0KBWZpZWxkGAIgASgJEgwKBGNvZGUYAyABKAkSDwoHbWVzc2FnZRgEIAEoCSIyChZMaXN0QXV0b21hdGlvbnNSZXF1ZXN0EhgKEGluY2x1ZGVfYXJjaGl2ZWQYASABKAgiUAoXTGlzdEF1dG9tYXRpb25zUmVzcG9uc2USNQoLYXV0b21hdGlvbnMYASADKAsyIC5lbmdyYW0uYXBwLnYxLkF1dG9tYXRpb25TdW1tYXJ5IkUKFEdldEF1dG9tYXRpb25SZXF1ZXN0EgwKAmlkGAEgASgJSAASFQoLYnVpbHRpbl9rZXkYAiABKAlIAEIICgZsb29rdXAiRgoVR2V0QXV0b21hdGlvblJlc3BvbnNlEi0KCmF1dG9tYXRpb24YASABKAsyGS5lbmdyYW0uYXBwLnYxLkF1dG9tYXRpb24iewoXQ3JlYXRlQXV0b21hdGlvblJlcXVlc3QSDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCRIPCgdlbmFibGVkGAMgASgIEhcKD2RlZmluaXRpb25fanNvbhgEIAEoCRITCgtpbnB1dHNfanNvbhgFIAEoCSJJChhDcmVhdGVBdXRvbWF0aW9uUmVzcG9uc2USLQoKYXV0b21hdGlvbhgBIAEoCzIZLmVuZ3JhbS5hcHAudjEuQXV0b21hdGlvbiJEChJTYXZlVmVyc2lvblJlcXVlc3QSFQoNYXV0b21hdGlvbl9pZBgBIAEoCRIXCg9kZWZpbml0aW9uX2pzb24YAiABKAkiRAoTU2F2ZVZlcnNpb25SZXNwb25zZRItCgphdXRvbWF0aW9uGAEgASgLMhkuZW5ncmFtLmFwcC52MS5BdXRvbWF0aW9uIiwKE0xpc3RWZXJzaW9uc1JlcXVlc3QSFQoNYXV0b21hdGlvbl9pZBgBIAEoCSJKChRMaXN0VmVyc2lvbnNSZXNwb25zZRIyCgh2ZXJzaW9ucxgBIAMoCzIgLmVuZ3JhbS5hcHAudjEuQXV0b21hdGlvblZlcnNpb24iOgobU2V0QXV0b21hdGlvbkVuYWJsZWRSZXF1ZXN0EgoKAmlkGAEgASgJEg8KB2VuYWJsZWQYAiABKAgiTQocU2V0QXV0b21hdGlvbkVuYWJsZWRSZXNwb25zZRItCgphdXRvbWF0aW9uGAEgASgLMhkuZW5ncmFtLmFwcC52MS5BdXRvbWF0aW9uIp0BChtVcGRhdGVBdXRvbWF0aW9uTWV0YVJlcXVlc3QSCgoCaWQYASABKAkSEQoEbmFtZRgCIAEoCUgAiAEBEhgKC2Rlc2NyaXB0aW9uGAMgASgJSAGIAQESGgoNc2V0dGluZ3NfanNvbhgEIAEoCUgCiAEBQgcKBV9uYW1lQg4KDF9kZXNjcmlwdGlvbkIQCg5fc2V0dGluZ3NfanNvbiJNChxVcGRhdGVBdXRvbWF0aW9uTWV0YVJlc3BvbnNlEi0KCmF1dG9tYXRpb24YASABKAsyGS5lbmdyYW0uYXBwLnYxLkF1dG9tYXRpb24iPgoQU2V0SW5wdXRzUmVxdWVzdBIVCg1hdXRvbWF0aW9uX2lkGAEgASgJEhMKC2lucHV0c19qc29uGAIgASgJIkIKEVNldElucHV0c1Jlc3BvbnNlEi0KCmF1dG9tYXRpb24YASABKAsyGS5lbmdyYW0uYXBwLnYxLkF1dG9tYXRpb24iSQoYU2V0QmxvY2tPdmVycmlkZXNSZXF1ZXN0EhUKDWF1dG9tYXRpb25faWQYASABKAkSFgoOb3ZlcnJpZGVzX2pzb24YAiABKAkiSgoZU2V0QmxvY2tPdmVycmlkZXNSZXNwb25zZRItCgphdXRvbWF0aW9uGAEgASgLMhkuZW5ncmFtLmFwcC52MS5BdXRvbWF0aW9uIk8KGkR1cGxpY2F0ZUF1dG9tYXRpb25SZXF1ZXN0EhUKDWF1dG9tYXRpb25faWQYASABKAkSEQoEbmFtZRgCIAEoCUgAiAEBQgcKBV9uYW1lIkwKG0R1cGxpY2F0ZUF1dG9tYXRpb25SZXNwb25zZRItCgphdXRvbWF0aW9uGAEgASgLMhkuZW5ncmFtLmFwcC52MS5BdXRvbWF0aW9uIiYKGEFyY2hpdmVBdXRvbWF0aW9uUmVxdWVzdBIKCgJpZBgBIAEoCSJKChlBcmNoaXZlQXV0b21hdGlvblJlc3BvbnNlEi0KCmF1dG9tYXRpb24YASABKAsyGS5lbmdyYW0uYXBwLnYxLkF1dG9tYXRpb24i9wEKEVRlc3RSZW5kZXJSZXF1ZXN0EhUKDWF1dG9tYXRpb25faWQYASABKAkSIgoVZHJhZnRfZGVmaW5pdGlvbl9qc29uGAIgASgJSAGIAQESGAoLaW5wdXRzX2pzb24YAyABKAlIAogBARITCglzYW1wbGVfaWQYBCABKAlIABIWCgxwYXlsb2FkX2pzb24YBSABKAlIABIaCg1zY2hlZHVsZWRfZm9yGAYgASgJSAOIAQFCCAoGc2FtcGxlQhgKFl9kcmFmdF9kZWZpbml0aW9uX2pzb25CDgoMX2lucHV0c19qc29uQhAKDl9zY2hlZHVsZWRfZm9yIogBCgtCbG9ja1JlbmRlchIQCghibG9ja19pZBgBIAEoCRISCgpibG9ja190eXBlGAIgASgJEhUKDXJlbmRlcmVkX2pzb24YAyABKAkSGAoLZmlsdGVyX3Bhc3MYBCABKAhIAIgBARISCgpzY29wZV9qc29uGAUgASgJQg4KDF9maWx0ZXJfcGFzcyJrChJUZXN0UmVuZGVyUmVzcG9uc2USKgoGYmxvY2tzGAEgAygLMhouZW5ncmFtLmFwcC52MS5CbG9ja1JlbmRlchIpCgZlcnJvcnMYAiADKAsyGS5lbmdyYW0uYXBwLnYxLkJsb2NrRXJyb3IiXQoNRHJ5UnVuUmVxdWVzdBIVCg1hdXRvbWF0aW9uX2lkGAEgASgJEhMKCXNhbXBsZV9pZBgCIAEoCUgAEhYKDHBheWxvYWRfanNvbhgDIAEoCUgAQggKBnNhbXBsZSIgCg5EcnlSdW5SZXNwb25zZRIOCgZydW5faWQYASABKAkiQwoPRXZhbENvZGVSZXF1ZXN0Eg4KBnNvdXJjZRgBIAEoCRIMCgRtb2RlGAIgASgJEhIKCmlucHV0X2pzb24YAyABKAki2wEKEEV2YWxDb2RlUmVzcG9uc2USFwoKdmFsdWVfanNvbhgBIAEoCUgAiAEBEhcKCmVycm9yX25hbWUYAiABKAlIAYgBARIaCg1lcnJvcl9tZXNzYWdlGAMgASgJSAKIAQESFwoKZXJyb3JfbGluZRgEIAEoBUgDiAEBEgwKBGxvZ3MYBSADKAkSEwoLZHVyYXRpb25fbXMYBiABKANCDQoLX3ZhbHVlX2pzb25CDQoLX2Vycm9yX25hbWVCEAoOX2Vycm9yX21lc3NhZ2VCDQoLX2Vycm9yX2xpbmUifAoNUnVuTm93UmVxdWVzdBIVCg1hdXRvbWF0aW9uX2lkGAEgASgJEhgKC2lucHV0c19qc29uGAIgASgJSACIAQESGQoMcGF5bG9hZF9qc29uGAMgASgJSAGIAQFCDgoMX2lucHV0c19qc29uQg8KDV9wYXlsb2FkX2pzb24iIAoOUnVuTm93UmVzcG9uc2USDgoGcnVuX2lkGAEgASgJIlcKC0V2ZW50U2FtcGxlEgoKAmlkGAEgASgJEhEKCWV2ZW50X2tleRgCIAEoCRIUCgxwYXlsb2FkX2pzb24YAyABKAkSEwoLcmVjZWl2ZWRfYXQYBCABKAkiZQoXTGlzdEV2ZW50U2FtcGxlc1JlcXVlc3QSFQoNYXV0b21hdGlvbl9pZBgBIAEoCRIWCglldmVudF9rZXkYAiABKAlIAIgBARINCgVsaW1pdBgDIAEoBUIMCgpfZXZlbnRfa2V5IkcKGExpc3RFdmVudFNhbXBsZXNSZXNwb25zZRIrCgdzYW1wbGVzGAEgAygLMhouZW5ncmFtLmFwcC52MS5FdmVudFNhbXBsZSJYChpMaXN0SW5wdXRLZXlPcHRpb25zUmVxdWVzdBIMCgRub3VuGAEgASgJEhoKDWNvbm5lY3Rpb25faWQYAiABKAlIAIgBAUIQCg5fY29ubmVjdGlvbl9pZCIsCg5JbnB1dEtleU9wdGlvbhILCgNrZXkYASABKAkSDQoFbGFiZWwYAiABKAkiTQobTGlzdElucHV0S2V5T3B0aW9uc1Jlc3BvbnNlEi4KB29wdGlvbnMYASADKAsyHS5lbmdyYW0uYXBwLnYxLklucHV0S2V5T3B0aW9uIlEKD0xpc3RSdW5zUmVxdWVzdBIVCg1hdXRvbWF0aW9uX2lkGAEgASgJEg0KBWxpbWl0GAIgASgFEhgKEGluY2x1ZGVfZmlsdGVyZWQYAyABKAgiWQoORmlsdGVyZWRXaW5kb3cSDQoFY291bnQYASABKAUSEAoIZmlyc3RfYXQYAiABKAkSDwoHbGFzdF9hdBgDIAEoCRIVCg1iZWZvcmVfcnVuX2lkGAQgASgJInQKEExpc3RSdW5zUmVzcG9uc2USLwoEcnVucxgBIAMoCzIhLmVuZ3JhbS5hcHAudjEuQXV0b21hdGlvblJ1bkJyaWVmEi8KCGZpbHRlcmVkGAIgAygLMh0uZW5ncmFtLmFwcC52MS5GaWx0ZXJlZFdpbmRvdyLvAQoRQXV0b21hdGlvblN0ZXBSdW4SEAoIYmxvY2tfaWQYASABKAkSDwoHYXR0ZW1wdBgCIAEoBRIOCgZzdGF0dXMYAyABKAkSEwoLaW5wdXRzX2pzb24YBCABKAkSFAoMb3V0cHV0c19qc29uGAUgASgJEhIKBWVycm9yGAYgASgJSACIAQESFwoKc2Vzc2lvbl9pZBgHIAEoCUgBiAEBEhIKCnN0YXJ0ZWRfYXQYCCABKAkSFQoIZW5kZWRfYXQYCSABKAlIAogBAUIICgZfZXJyb3JCDQoLX3Nlc3Npb25faWRCCwoJX2VuZGVkX2F0Ip0BCg1BdXRvbWF0aW9uUnVuEjAKBWJyaWVmGAEgASgLMiEuZW5ncmFtLmFwcC52MS5BdXRvbWF0aW9uUnVuQnJpZWYSFAoMdHJpZ2dlcl9qc29uGAIgASgJEi8KBXN0ZXBzGAMgAygLMiAuZW5ncmFtLmFwcC52MS5BdXRvbWF0aW9uU3RlcFJ1bhITCgtzZXNzaW9uX2lkcxgEIAMoCSIfCg1HZXRSdW5SZXF1ZXN0Eg4KBnJ1bl9pZBgBIAEoCSI7Cg5HZXRSdW5SZXNwb25zZRIpCgNydW4YASABKAsyHC5lbmdyYW0uYXBwLnYxLkF1dG9tYXRpb25SdW4iQAoOU3RvcFJ1blJlcXVlc3QSDgoGcnVuX2lkGAEgASgJEhMKBnJlYXNvbhgCIAEoCUgAiAEBQgkKB19yZWFzb24iHwoPU3RvcFJ1blJlc3BvbnNlEgwKBHNlbnQYASABKAgiTQoPUmV0cnlSdW5SZXF1ZXN0Eg4KBnJ1bl9pZBgBIAEoCRIZCgxmcm9tX3N0ZXBfaWQYAiABKAlIAIgBAUIPCg1fZnJvbV9zdGVwX2lkIiIKEFJldHJ5UnVuUmVzcG9uc2USDgoGcnVuX2lkGAEgASgJIowCChNXZWJob29rUmVnaXN0cmF0aW9uEgoKAmlkGAEgASgJEgwKBG5hbWUYAiABKAkSGwoTdmVyaWZpY2F0aW9uX3NjaGVtZRgDIAEoCRIaCg1wcm92aWRlcl9oaW50GAQgASgJSACIAQESHwoSY3JlYXRlZF9ieV91c2VyX2lkGAUgASgJSAGIAQESEgoKY3JlYXRlZF9hdBgGIAEoCRISCgp1cGRhdGVkX2F0GAcgASgJEhwKD2Rpc2FibGVkX3JlYXNvbhgIIAEoCUgCiAEBQhAKDl9wcm92aWRlcl9oaW50QhUKE19jcmVhdGVkX2J5X3VzZXJfaWRCEgoQX2Rpc2FibGVkX3JlYXNvbiKHAQogQ3JlYXRlV2ViaG9va1JlZ2lzdHJhdGlvblJlcXVlc3QSCgoCaWQYASABKAkSDAoEbmFtZRgCIAEoCRIbChN2ZXJpZmljYXRpb25fc2NoZW1lGAMgASgJEhoKDXByb3ZpZGVyX2hpbnQYBCABKAlIAIgBAUIQCg5fcHJvdmlkZXJfaGludCJtCiFDcmVhdGVXZWJob29rUmVnaXN0cmF0aW9uUmVzcG9uc2USOAoMcmVnaXN0cmF0aW9uGAEgASgLMiIuZW5ncmFtLmFwcC52MS5XZWJob29rUmVnaXN0cmF0aW9uEg4KBnNlY3JldBgCIAEoCSIhCh9MaXN0V2ViaG9va1JlZ2lzdHJhdGlvbnNSZXF1ZXN0Il0KIExpc3RXZWJob29rUmVnaXN0cmF0aW9uc1Jlc3BvbnNlEjkKDXJlZ2lzdHJhdGlvbnMYASADKAsyIi5lbmdyYW0uYXBwLnYxLldlYmhvb2tSZWdpc3RyYXRpb24iLgogRGVsZXRlV2ViaG9va1JlZ2lzdHJhdGlvblJlcXVlc3QSCgoCaWQYASABKAkiNAohRGVsZXRlV2ViaG9va1JlZ2lzdHJhdGlvblJlc3BvbnNlEg8KB2RlbGV0ZWQYASABKAgiMwoYTGlzdFdlYmhvb2tFdmVudHNSZXF1ZXN0EhcKD3JlZ2lzdHJhdGlvbl9pZBgBIAEoCSJDCgxXZWJob29rRXZlbnQSCwoDa2V5GAEgASgJEhQKDGRpc3BsYXlfbmFtZRgCIAEoCRIQCghvYnNlcnZlZBgDIAEoCCIuCg9XZWJob29rVmFyaWFibGUSDAoEcGF0aBgBIAEoCRINCgVhbGlhcxgCIAEoCSJ7ChlMaXN0V2ViaG9va0V2ZW50c1Jlc3BvbnNlEisKBmV2ZW50cxgBIAMoCzIbLmVuZ3JhbS5hcHAudjEuV2ViaG9va0V2ZW50EjEKCXZhcmlhYmxlcxgCIAMoCzIeLmVuZ3JhbS5hcHAudjEuV2ViaG9va1ZhcmlhYmxlIisKF0xpc3RFdmVudENhdGFsb2dSZXF1ZXN0EhAKCHByb3ZpZGVyGAEgASgJIpABChFFdmVudENhdGFsb2dFbnRyeRILCgNrZXkYASABKAkSDQoFbGFiZWwYAiABKAkSEwoLZGVzY3JpcHRpb24YAyABKAkSEwoLc2NoZW1hX2pzb24YBCABKAkSEwoLc2FtcGxlX2pzb24YBSABKAkSEAoIb2JzZXJ2ZWQYBiABKAgSDgoGaGlkZGVuGAcgASgIIi8KEUV2ZW50Q2F0YWxvZ1Njb3BlEgsKA2tleRgBIAEoCRINCgVsYWJlbBgCIAEoCSLeAQoYTGlzdEV2ZW50Q2F0YWxvZ1Jlc3BvbnNlEjAKBmV2ZW50cxgBIAMoCzIgLmVuZ3JhbS5hcHAudjEuRXZlbnRDYXRhbG9nRW50cnkSNAoFc2NvcGUYAiABKAsyIC5lbmdyYW0uYXBwLnYxLkV2ZW50Q2F0YWxvZ1Njb3BlSACIAQESMQoJdmFyaWFibGVzGAMgAygLMh4uZW5ncmFtLmFwcC52MS5XZWJob29rVmFyaWFibGUSHQoVZGVmYXVsdF9jb25uZWN0aW9uX2lkGAQgASgJQggKBl9zY29wZSIsChhMaXN0QWN0aW9uQ2F0YWxvZ1JlcXVlc3QSEAoIcHJvdmlkZXIYASABKAkiXwoSQWN0aW9uQ2F0YWxvZ0VudHJ5EgoKAmlkGAEgASgJEg0KBWxhYmVsGAIgASgJEhMKC2Rlc2NyaXB0aW9uGAMgASgJEhkKEWlucHV0X3NjaGVtYV9qc29uGAQgASgJIk8KGUxpc3RBY3Rpb25DYXRhbG9nUmVzcG9uc2USMgoHYWN0aW9ucxgBIAMoCzIhLmVuZ3JhbS5hcHAudjEuQWN0aW9uQ2F0YWxvZ0VudHJ5MqMOChFBdXRvbWF0aW9uU2VydmljZRJgCg9MaXN0QXV0b21hdGlvbnMSJS5lbmdyYW0uYXBwLnYxLkxpc3RBdXRvbWF0aW9uc1JlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLkxpc3RBdXRvbWF0aW9uc1Jlc3BvbnNlEloKDUdldEF1dG9tYXRpb24SIy5lbmdyYW0uYXBwLnYxLkdldEF1dG9tYXRpb25SZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5HZXRBdXRvbWF0aW9uUmVzcG9uc2USYwoQQ3JlYXRlQXV0b21hdGlvbhImLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQXV0b21hdGlvblJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLkNyZWF0ZUF1dG9tYXRpb25SZXNwb25zZRJUCgtTYXZlVmVyc2lvbhIhLmVuZ3JhbS5hcHAudjEuU2F2ZVZlcnNpb25SZXF1ZXN0GiIuZW5ncmFtLmFwcC52MS5TYXZlVmVyc2lvblJlc3BvbnNlElcKDExpc3RWZXJzaW9ucxIiLmVuZ3JhbS5hcHAudjEuTGlzdFZlcnNpb25zUmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuTGlzdFZlcnNpb25zUmVzcG9uc2USbwoUU2V0QXV0b21hdGlvbkVuYWJsZWQSKi5lbmdyYW0uYXBwLnYxLlNldEF1dG9tYXRpb25FbmFibGVkUmVxdWVzdBorLmVuZ3JhbS5hcHAudjEuU2V0QXV0b21hdGlvbkVuYWJsZWRSZXNwb25zZRJvChRVcGRhdGVBdXRvbWF0aW9uTWV0YRIqLmVuZ3JhbS5hcHAudjEuVXBkYXRlQXV0b21hdGlvbk1ldGFSZXF1ZXN0GisuZW5ncmFtLmFwcC52MS5VcGRhdGVBdXRvbWF0aW9uTWV0YVJlc3BvbnNlEk4KCVNldElucHV0cxIfLmVuZ3JhbS5hcHAudjEuU2V0SW5wdXRzUmVxdWVzdBogLmVuZ3JhbS5hcHAudjEuU2V0SW5wdXRzUmVzcG9uc2USZgoRU2V0QmxvY2tPdmVycmlkZXMSJy5lbmdyYW0uYXBwLnYxLlNldEJsb2NrT3ZlcnJpZGVzUmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuU2V0QmxvY2tPdmVycmlkZXNSZXNwb25zZRJsChNEdXBsaWNhdGVBdXRvbWF0aW9uEikuZW5ncmFtLmFwcC52MS5EdXBsaWNhdGVBdXRvbWF0aW9uUmVxdWVzdBoqLmVuZ3JhbS5hcHAudjEuRHVwbGljYXRlQXV0b21hdGlvblJlc3BvbnNlEmYKEUFyY2hpdmVBdXRvbWF0aW9uEicuZW5ncmFtLmFwcC52MS5BcmNoaXZlQXV0b21hdGlvblJlcXVlc3QaKC5lbmdyYW0uYXBwLnYxLkFyY2hpdmVBdXRvbWF0aW9uUmVzcG9uc2USUQoKVGVzdFJlbmRlchIgLmVuZ3JhbS5hcHAudjEuVGVzdFJlbmRlclJlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLlRlc3RSZW5kZXJSZXNwb25zZRJFCgZEcnlSdW4SHC5lbmdyYW0uYXBwLnYxLkRyeVJ1blJlcXVlc3QaHS5lbmdyYW0uYXBwLnYxLkRyeVJ1blJlc3BvbnNlEksKCEV2YWxDb2RlEh4uZW5ncmFtLmFwcC52MS5FdmFsQ29kZVJlcXVlc3QaHy5lbmdyYW0uYXBwLnYxLkV2YWxDb2RlUmVzcG9uc2USRQoGUnVuTm93EhwuZW5ncmFtLmFwcC52MS5SdW5Ob3dSZXF1ZXN0Gh0uZW5ncmFtLmFwcC52MS5SdW5Ob3dSZXNwb25zZRJjChBMaXN0RXZlbnRTYW1wbGVzEiYuZW5ncmFtLmFwcC52MS5MaXN0RXZlbnRTYW1wbGVzUmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuTGlzdEV2ZW50U2FtcGxlc1Jlc3BvbnNlEmwKE0xpc3RJbnB1dEtleU9wdGlvbnMSKS5lbmdyYW0uYXBwLnYxLkxpc3RJbnB1dEtleU9wdGlvbnNSZXF1ZXN0GiouZW5ncmFtLmFwcC52MS5MaXN0SW5wdXRLZXlPcHRpb25zUmVzcG9uc2USYwoQTGlzdEV2ZW50Q2F0YWxvZxImLmVuZ3JhbS5hcHAudjEuTGlzdEV2ZW50Q2F0YWxvZ1JlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLkxpc3RFdmVudENhdGFsb2dSZXNwb25zZRJmChFMaXN0QWN0aW9uQ2F0YWxvZxInLmVuZ3JhbS5hcHAudjEuTGlzdEFjdGlvbkNhdGFsb2dSZXF1ZXN0GiguZW5ncmFtLmFwcC52MS5MaXN0QWN0aW9uQ2F0YWxvZ1Jlc3BvbnNlMsECChRBdXRvbWF0aW9uUnVuU2VydmljZRJLCghMaXN0UnVucxIeLmVuZ3JhbS5hcHAudjEuTGlzdFJ1bnNSZXF1ZXN0Gh8uZW5ncmFtLmFwcC52MS5MaXN0UnVuc1Jlc3BvbnNlEkUKBkdldFJ1bhIcLmVuZ3JhbS5hcHAudjEuR2V0UnVuUmVxdWVzdBodLmVuZ3JhbS5hcHAudjEuR2V0UnVuUmVzcG9uc2USSAoHU3RvcFJ1bhIdLmVuZ3JhbS5hcHAudjEuU3RvcFJ1blJlcXVlc3QaHi5lbmdyYW0uYXBwLnYxLlN0b3BSdW5SZXNwb25zZRJLCghSZXRyeVJ1bhIeLmVuZ3JhbS5hcHAudjEuUmV0cnlSdW5SZXF1ZXN0Gh8uZW5ncmFtLmFwcC52MS5SZXRyeVJ1blJlc3BvbnNlMoEEChpXZWJob29rUmVnaXN0cmF0aW9uU2VydmljZRJ+ChlDcmVhdGVXZWJob29rUmVnaXN0cmF0aW9uEi8uZW5ncmFtLmFwcC52MS5DcmVhdGVXZWJob29rUmVnaXN0cmF0aW9uUmVxdWVzdBowLmVuZ3JhbS5hcHAudjEuQ3JlYXRlV2ViaG9va1JlZ2lzdHJhdGlvblJlc3BvbnNlEnsKGExpc3RXZWJob29rUmVnaXN0cmF0aW9ucxIuLmVuZ3JhbS5hcHAudjEuTGlzdFdlYmhvb2tSZWdpc3RyYXRpb25zUmVxdWVzdBovLmVuZ3JhbS5hcHAudjEuTGlzdFdlYmhvb2tSZWdpc3RyYXRpb25zUmVzcG9uc2USfgoZRGVsZXRlV2ViaG9va1JlZ2lzdHJhdGlvbhIvLmVuZ3JhbS5hcHAudjEuRGVsZXRlV2ViaG9va1JlZ2lzdHJhdGlvblJlcXVlc3QaMC5lbmdyYW0uYXBwLnYxLkRlbGV0ZVdlYmhvb2tSZWdpc3RyYXRpb25SZXNwb25zZRJmChFMaXN0V2ViaG9va0V2ZW50cxInLmVuZ3JhbS5hcHAudjEuTGlzdFdlYmhvb2tFdmVudHNSZXF1ZXN0GiguZW5ncmFtLmFwcC52MS5MaXN0V2ViaG9va0V2ZW50c1Jlc3BvbnNlYgZwcm90bzM");
 
 /**
  * @generated from message engram.app.v1.Automation
@@ -32,34 +32,40 @@ export type Automation = Message<"engram.app.v1.Automation"> & {
   description: string;
 
   /**
-   * @generated from field: bool enabled = 4;
+   * "user" | "builtin"
+   *
+   * @generated from field: string kind = 4;
+   */
+  kind: string;
+
+  /**
+   * @generated from field: optional string builtin_key = 5;
+   */
+  builtinKey?: string;
+
+  /**
+   * @generated from field: bool enabled = 6;
    */
   enabled: boolean;
 
   /**
-   * @generated from field: engram.app.v1.AutomationTrigger trigger = 5;
+   * @generated from field: int32 current_version = 7;
    */
-  trigger?: AutomationTrigger;
+  currentVersion: number;
 
   /**
-   * @generated from field: engram.app.v1.AutomationAction action = 6;
+   * Per-automation input values.
+   *
+   * @generated from field: string inputs_json = 8;
    */
-  action?: AutomationAction;
+  inputsJson: string;
 
   /**
-   * @generated from field: optional string created_by_user_id = 7;
+   * Per-automation tunable block overrides: {[blockId]: {[field]: value}}.
+   *
+   * @generated from field: string block_overrides_json = 9;
    */
-  createdByUserId?: string;
-
-  /**
-   * @generated from field: optional string next_fire_at = 8;
-   */
-  nextFireAt?: string;
-
-  /**
-   * @generated from field: optional string last_fired_at = 9;
-   */
-  lastFiredAt?: string;
+  blockOverridesJson: string;
 
   /**
    * @generated from field: bool archived = 10;
@@ -67,14 +73,36 @@ export type Automation = Message<"engram.app.v1.Automation"> & {
   archived: boolean;
 
   /**
-   * @generated from field: string created_at = 11;
+   * @generated from field: optional string created_by_user_id = 11;
+   */
+  createdByUserId?: string;
+
+  /**
+   * @generated from field: optional string next_fire_at = 12;
+   */
+  nextFireAt?: string;
+
+  /**
+   * @generated from field: optional string last_fired_at = 13;
+   */
+  lastFiredAt?: string;
+
+  /**
+   * @generated from field: string created_at = 14;
    */
   createdAt: string;
 
   /**
-   * @generated from field: string updated_at = 12;
+   * @generated from field: string updated_at = 15;
    */
   updatedAt: string;
+
+  /**
+   * The current version's definition, for the editor.
+   *
+   * @generated from field: engram.app.v1.AutomationVersion version = 16;
+   */
+  version?: AutomationVersion;
 };
 
 /**
@@ -85,223 +113,305 @@ export const AutomationSchema: GenMessage<Automation> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_automation, 0);
 
 /**
- * @generated from message engram.app.v1.AutomationTrigger
+ * @generated from message engram.app.v1.AutomationVersion
  */
-export type AutomationTrigger = Message<"engram.app.v1.AutomationTrigger"> & {
+export type AutomationVersion = Message<"engram.app.v1.AutomationVersion"> & {
   /**
-   * @generated from oneof engram.app.v1.AutomationTrigger.trigger
+   * @generated from field: string automation_id = 1;
    */
-  trigger: {
-    /**
-     * @generated from field: engram.app.v1.CronAutomationTrigger cron = 1;
-     */
-    value: CronAutomationTrigger;
-    case: "cron";
-  } | {
-    /**
-     * @generated from field: engram.app.v1.WebhookAutomationTrigger webhook = 2;
-     */
-    value: WebhookAutomationTrigger;
-    case: "webhook";
-  } | {
-    /**
-     * @generated from field: engram.app.v1.IntegrationAutomationTrigger integration = 3;
-     */
-    value: IntegrationAutomationTrigger;
-    case: "integration";
-  } | { case: undefined; value?: undefined };
+  automationId: string;
+
+  /**
+   * @generated from field: int32 number = 2;
+   */
+  number: number;
+
+  /**
+   * AutomationDefinition JSON: {engine, trigger, blocks, inputsSchema, settings}.
+   *
+   * @generated from field: string definition_json = 3;
+   */
+  definitionJson: string;
+
+  /**
+   * @generated from field: optional string created_by_user_id = 4;
+   */
+  createdByUserId?: string;
+
+  /**
+   * @generated from field: string created_at = 5;
+   */
+  createdAt: string;
 };
 
 /**
- * Describes the message engram.app.v1.AutomationTrigger.
- * Use `create(AutomationTriggerSchema)` to create a new message.
+ * Describes the message engram.app.v1.AutomationVersion.
+ * Use `create(AutomationVersionSchema)` to create a new message.
  */
-export const AutomationTriggerSchema: GenMessage<AutomationTrigger> = /*@__PURE__*/
+export const AutomationVersionSchema: GenMessage<AutomationVersion> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_automation, 1);
 
 /**
- * ADR 0119 D5: subscribe to a connector's verified event stream. Verification
- * lives with the integration; no user-managed secret exists on this path.
- *
- * @generated from message engram.app.v1.IntegrationAutomationTrigger
+ * @generated from message engram.app.v1.AutomationRunBrief
  */
-export type IntegrationAutomationTrigger = Message<"engram.app.v1.IntegrationAutomationTrigger"> & {
+export type AutomationRunBrief = Message<"engram.app.v1.AutomationRunBrief"> & {
   /**
-   * @generated from field: string provider = 1;
+   * @generated from field: string id = 1;
    */
-  provider: string;
+  id: string;
 
   /**
-   * @generated from field: string connection_id = 2;
+   * @generated from field: string automation_id = 2;
    */
-  connectionId: string;
+  automationId: string;
 
   /**
-   * @generated from field: repeated string event_keys = 3;
+   * @generated from field: int32 version = 3;
    */
-  eventKeys: string[];
+  version: number;
 
   /**
-   * Scope narrowing by the provider noun (repository / channel / team):
-   * literal values, or the key of an automation input whose keys/elements
-   * supply them. At most one is set.
+   * @generated from field: string status = 4;
+   */
+  status: string;
+
+  /**
+   * @generated from field: optional string error = 5;
+   */
+  error?: string;
+
+  /**
+   * "cron" | "webhook" | "integration" | "manual"
    *
-   * @generated from field: repeated string scope_values = 4;
+   * @generated from field: string trigger_source = 6;
    */
-  scopeValues: string[];
+  triggerSource: string;
 
   /**
-   * @generated from field: optional string scope_from_input = 5;
+   * @generated from field: optional string event_key = 7;
    */
-  scopeFromInput?: string;
+  eventKey?: string;
+
+  /**
+   * @generated from field: optional string delivery_key = 8;
+   */
+  deliveryKey?: string;
+
+  /**
+   * @generated from field: bool dry_run = 9;
+   */
+  dryRun: boolean;
+
+  /**
+   * @generated from field: optional string started_at = 10;
+   */
+  startedAt?: string;
+
+  /**
+   * @generated from field: optional string ended_at = 11;
+   */
+  endedAt?: string;
+
+  /**
+   * @generated from field: string created_at = 12;
+   */
+  createdAt: string;
 };
 
 /**
- * Describes the message engram.app.v1.IntegrationAutomationTrigger.
- * Use `create(IntegrationAutomationTriggerSchema)` to create a new message.
+ * Describes the message engram.app.v1.AutomationRunBrief.
+ * Use `create(AutomationRunBriefSchema)` to create a new message.
  */
-export const IntegrationAutomationTriggerSchema: GenMessage<IntegrationAutomationTrigger> = /*@__PURE__*/
+export const AutomationRunBriefSchema: GenMessage<AutomationRunBrief> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_automation, 2);
 
 /**
- * @generated from message engram.app.v1.CronAutomationTrigger
+ * @generated from message engram.app.v1.DayRunCount
  */
-export type CronAutomationTrigger = Message<"engram.app.v1.CronAutomationTrigger"> & {
+export type DayRunCount = Message<"engram.app.v1.DayRunCount"> & {
   /**
-   * @generated from field: string schedule = 1;
+   * YYYY-MM-DD (UTC)
+   *
+   * @generated from field: string day = 1;
    */
-  schedule: string;
+  day: string;
 
   /**
-   * @generated from field: string timezone = 2;
+   * @generated from field: int32 completed = 2;
    */
-  timezone: string;
+  completed: number;
+
+  /**
+   * @generated from field: int32 failed = 3;
+   */
+  failed: number;
+
+  /**
+   * @generated from field: int32 filtered = 4;
+   */
+  filtered: number;
+
+  /**
+   * @generated from field: int32 other = 5;
+   */
+  other: number;
 };
 
 /**
- * Describes the message engram.app.v1.CronAutomationTrigger.
- * Use `create(CronAutomationTriggerSchema)` to create a new message.
+ * Describes the message engram.app.v1.DayRunCount.
+ * Use `create(DayRunCountSchema)` to create a new message.
  */
-export const CronAutomationTriggerSchema: GenMessage<CronAutomationTrigger> = /*@__PURE__*/
+export const DayRunCountSchema: GenMessage<DayRunCount> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_automation, 3);
 
 /**
- * @generated from message engram.app.v1.WebhookAutomationTrigger
+ * @generated from message engram.app.v1.AutomationSummary
  */
-export type WebhookAutomationTrigger = Message<"engram.app.v1.WebhookAutomationTrigger"> & {
+export type AutomationSummary = Message<"engram.app.v1.AutomationSummary"> & {
   /**
-   * @generated from field: string registration_id = 1;
+   * @generated from field: engram.app.v1.Automation automation = 1;
    */
-  registrationId: string;
+  automation?: Automation;
 
   /**
-   * @generated from field: repeated string events = 2;
-   */
-  events: string[];
-
-  /**
-   * Optional declarative event filter. Phase 4 evaluates the validated shape.
+   * Server-rendered, e.g. "GitHub · PR opened, synchronize · 4 repos".
    *
-   * @generated from field: optional string filter_json = 3;
+   * @generated from field: string trigger_summary = 2;
    */
-  filterJson?: string;
+  triggerSummary: string;
+
+  /**
+   * @generated from field: optional engram.app.v1.AutomationRunBrief last_run = 3;
+   */
+  lastRun?: AutomationRunBrief;
+
+  /**
+   * @generated from field: repeated engram.app.v1.DayRunCount runs_7d = 4;
+   */
+  runs7d: DayRunCount[];
 };
 
 /**
- * Describes the message engram.app.v1.WebhookAutomationTrigger.
- * Use `create(WebhookAutomationTriggerSchema)` to create a new message.
+ * Describes the message engram.app.v1.AutomationSummary.
+ * Use `create(AutomationSummarySchema)` to create a new message.
  */
-export const WebhookAutomationTriggerSchema: GenMessage<WebhookAutomationTrigger> = /*@__PURE__*/
+export const AutomationSummarySchema: GenMessage<AutomationSummary> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_automation, 4);
 
 /**
- * @generated from message engram.app.v1.AutomationAction
+ * A validation error addressed to the block and field the editor must show.
+ * block_id is "" for definition-level errors (trigger, settings).
+ *
+ * @generated from message engram.app.v1.BlockError
  */
-export type AutomationAction = Message<"engram.app.v1.AutomationAction"> & {
+export type BlockError = Message<"engram.app.v1.BlockError"> & {
   /**
-   * @generated from oneof engram.app.v1.AutomationAction.action
+   * @generated from field: string block_id = 1;
    */
-  action: {
+  blockId: string;
+
+  /**
+   * @generated from field: string field = 2;
+   */
+  field: string;
+
+  /**
+   * @generated from field: string code = 3;
+   */
+  code: string;
+
+  /**
+   * @generated from field: string message = 4;
+   */
+  message: string;
+};
+
+/**
+ * Describes the message engram.app.v1.BlockError.
+ * Use `create(BlockErrorSchema)` to create a new message.
+ */
+export const BlockErrorSchema: GenMessage<BlockError> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 5);
+
+/**
+ * @generated from message engram.app.v1.ListAutomationsRequest
+ */
+export type ListAutomationsRequest = Message<"engram.app.v1.ListAutomationsRequest"> & {
+  /**
+   * @generated from field: bool include_archived = 1;
+   */
+  includeArchived: boolean;
+};
+
+/**
+ * Describes the message engram.app.v1.ListAutomationsRequest.
+ * Use `create(ListAutomationsRequestSchema)` to create a new message.
+ */
+export const ListAutomationsRequestSchema: GenMessage<ListAutomationsRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 6);
+
+/**
+ * @generated from message engram.app.v1.ListAutomationsResponse
+ */
+export type ListAutomationsResponse = Message<"engram.app.v1.ListAutomationsResponse"> & {
+  /**
+   * @generated from field: repeated engram.app.v1.AutomationSummary automations = 1;
+   */
+  automations: AutomationSummary[];
+};
+
+/**
+ * Describes the message engram.app.v1.ListAutomationsResponse.
+ * Use `create(ListAutomationsResponseSchema)` to create a new message.
+ */
+export const ListAutomationsResponseSchema: GenMessage<ListAutomationsResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 7);
+
+/**
+ * @generated from message engram.app.v1.GetAutomationRequest
+ */
+export type GetAutomationRequest = Message<"engram.app.v1.GetAutomationRequest"> & {
+  /**
+   * @generated from oneof engram.app.v1.GetAutomationRequest.lookup
+   */
+  lookup: {
     /**
-     * @generated from field: engram.app.v1.CreateTaskAutomationAction create_task = 1;
+     * @generated from field: string id = 1;
      */
-    value: CreateTaskAutomationAction;
-    case: "createTask";
+    value: string;
+    case: "id";
+  } | {
+    /**
+     * @generated from field: string builtin_key = 2;
+     */
+    value: string;
+    case: "builtinKey";
   } | { case: undefined; value?: undefined };
 };
 
 /**
- * Describes the message engram.app.v1.AutomationAction.
- * Use `create(AutomationActionSchema)` to create a new message.
+ * Describes the message engram.app.v1.GetAutomationRequest.
+ * Use `create(GetAutomationRequestSchema)` to create a new message.
  */
-export const AutomationActionSchema: GenMessage<AutomationAction> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 5);
+export const GetAutomationRequestSchema: GenMessage<GetAutomationRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 8);
 
 /**
- * @generated from message engram.app.v1.CreateTaskAutomationAction
+ * @generated from message engram.app.v1.GetAutomationResponse
  */
-export type CreateTaskAutomationAction = Message<"engram.app.v1.CreateTaskAutomationAction"> & {
+export type GetAutomationResponse = Message<"engram.app.v1.GetAutomationResponse"> & {
   /**
-   * @generated from field: string profile_id = 1;
+   * @generated from field: engram.app.v1.Automation automation = 1;
    */
-  profileId: string;
-
-  /**
-   * @generated from field: string prompt_template = 2;
-   */
-  promptTemplate: string;
-
-  /**
-   * @generated from field: optional string title_template = 3;
-   */
-  titleTemplate?: string;
-
-  /**
-   * @generated from field: bool include_event_context = 4;
-   */
-  includeEventContext: boolean;
-
-  /**
-   * ADR 0107: session mode for the created session's initial prompt (e.g.
-   * "plan"). An ownerless (automation) plan auto-approves — the plan lands
-   * in the transcript as a reviewable record before the build runs.
-   *
-   * @generated from field: optional string harness_mode = 5;
-   */
-  harnessMode?: string;
-
-  /**
-   * ADR 0063 B2: the automation's override of the profile's default harness /
-   * model / effort, the same seam the interactive composer uses. Unset = inherit
-   * the profile default. `model`/`effort` are option ids on the EFFECTIVE
-   * harness's descriptor (this override, else the profile's harness).
-   *
-   * @generated from field: optional string harness = 6;
-   */
-  harness?: string;
-
-  /**
-   * @generated from field: optional string model = 7;
-   */
-  model?: string;
-
-  /**
-   * @generated from field: optional string effort = 8;
-   */
-  effort?: string;
-
-  /**
-   * @generated from field: optional string model_router = 9;
-   */
-  modelRouter?: string;
+  automation?: Automation;
 };
 
 /**
- * Describes the message engram.app.v1.CreateTaskAutomationAction.
- * Use `create(CreateTaskAutomationActionSchema)` to create a new message.
+ * Describes the message engram.app.v1.GetAutomationResponse.
+ * Use `create(GetAutomationResponseSchema)` to create a new message.
  */
-export const CreateTaskAutomationActionSchema: GenMessage<CreateTaskAutomationAction> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 6);
+export const GetAutomationResponseSchema: GenMessage<GetAutomationResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 9);
 
 /**
  * @generated from message engram.app.v1.CreateAutomationRequest
@@ -323,14 +433,14 @@ export type CreateAutomationRequest = Message<"engram.app.v1.CreateAutomationReq
   enabled: boolean;
 
   /**
-   * @generated from field: engram.app.v1.AutomationTrigger trigger = 4;
+   * @generated from field: string definition_json = 4;
    */
-  trigger?: AutomationTrigger;
+  definitionJson: string;
 
   /**
-   * @generated from field: engram.app.v1.AutomationAction action = 5;
+   * @generated from field: string inputs_json = 5;
    */
-  action?: AutomationAction;
+  inputsJson: string;
 };
 
 /**
@@ -338,7 +448,7 @@ export type CreateAutomationRequest = Message<"engram.app.v1.CreateAutomationReq
  * Use `create(CreateAutomationRequestSchema)` to create a new message.
  */
 export const CreateAutomationRequestSchema: GenMessage<CreateAutomationRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 7);
+  messageDesc(file_engram_app_v1_automation, 10);
 
 /**
  * @generated from message engram.app.v1.CreateAutomationResponse
@@ -355,122 +465,34 @@ export type CreateAutomationResponse = Message<"engram.app.v1.CreateAutomationRe
  * Use `create(CreateAutomationResponseSchema)` to create a new message.
  */
 export const CreateAutomationResponseSchema: GenMessage<CreateAutomationResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 8);
-
-/**
- * @generated from message engram.app.v1.UpdateAutomationRequest
- */
-export type UpdateAutomationRequest = Message<"engram.app.v1.UpdateAutomationRequest"> & {
-  /**
-   * @generated from field: string id = 1;
-   */
-  id: string;
-
-  /**
-   * @generated from field: string name = 2;
-   */
-  name: string;
-
-  /**
-   * @generated from field: string description = 3;
-   */
-  description: string;
-
-  /**
-   * @generated from field: bool enabled = 4;
-   */
-  enabled: boolean;
-
-  /**
-   * @generated from field: engram.app.v1.AutomationTrigger trigger = 5;
-   */
-  trigger?: AutomationTrigger;
-
-  /**
-   * @generated from field: engram.app.v1.AutomationAction action = 6;
-   */
-  action?: AutomationAction;
-};
-
-/**
- * Describes the message engram.app.v1.UpdateAutomationRequest.
- * Use `create(UpdateAutomationRequestSchema)` to create a new message.
- */
-export const UpdateAutomationRequestSchema: GenMessage<UpdateAutomationRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 9);
-
-/**
- * @generated from message engram.app.v1.UpdateAutomationResponse
- */
-export type UpdateAutomationResponse = Message<"engram.app.v1.UpdateAutomationResponse"> & {
-  /**
-   * @generated from field: engram.app.v1.Automation automation = 1;
-   */
-  automation?: Automation;
-};
-
-/**
- * Describes the message engram.app.v1.UpdateAutomationResponse.
- * Use `create(UpdateAutomationResponseSchema)` to create a new message.
- */
-export const UpdateAutomationResponseSchema: GenMessage<UpdateAutomationResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 10);
-
-/**
- * @generated from message engram.app.v1.ArchiveAutomationRequest
- */
-export type ArchiveAutomationRequest = Message<"engram.app.v1.ArchiveAutomationRequest"> & {
-  /**
-   * @generated from field: string id = 1;
-   */
-  id: string;
-};
-
-/**
- * Describes the message engram.app.v1.ArchiveAutomationRequest.
- * Use `create(ArchiveAutomationRequestSchema)` to create a new message.
- */
-export const ArchiveAutomationRequestSchema: GenMessage<ArchiveAutomationRequest> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_automation, 11);
 
 /**
- * @generated from message engram.app.v1.ArchiveAutomationResponse
+ * @generated from message engram.app.v1.SaveVersionRequest
  */
-export type ArchiveAutomationResponse = Message<"engram.app.v1.ArchiveAutomationResponse"> & {
+export type SaveVersionRequest = Message<"engram.app.v1.SaveVersionRequest"> & {
   /**
-   * @generated from field: engram.app.v1.Automation automation = 1;
+   * @generated from field: string automation_id = 1;
    */
-  automation?: Automation;
+  automationId: string;
+
+  /**
+   * @generated from field: string definition_json = 2;
+   */
+  definitionJson: string;
 };
 
 /**
- * Describes the message engram.app.v1.ArchiveAutomationResponse.
- * Use `create(ArchiveAutomationResponseSchema)` to create a new message.
+ * Describes the message engram.app.v1.SaveVersionRequest.
+ * Use `create(SaveVersionRequestSchema)` to create a new message.
  */
-export const ArchiveAutomationResponseSchema: GenMessage<ArchiveAutomationResponse> = /*@__PURE__*/
+export const SaveVersionRequestSchema: GenMessage<SaveVersionRequest> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_automation, 12);
 
 /**
- * @generated from message engram.app.v1.GetAutomationRequest
+ * @generated from message engram.app.v1.SaveVersionResponse
  */
-export type GetAutomationRequest = Message<"engram.app.v1.GetAutomationRequest"> & {
-  /**
-   * @generated from field: string id = 1;
-   */
-  id: string;
-};
-
-/**
- * Describes the message engram.app.v1.GetAutomationRequest.
- * Use `create(GetAutomationRequestSchema)` to create a new message.
- */
-export const GetAutomationRequestSchema: GenMessage<GetAutomationRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 13);
-
-/**
- * @generated from message engram.app.v1.GetAutomationResponse
- */
-export type GetAutomationResponse = Message<"engram.app.v1.GetAutomationResponse"> & {
+export type SaveVersionResponse = Message<"engram.app.v1.SaveVersionResponse"> & {
   /**
    * @generated from field: engram.app.v1.Automation automation = 1;
    */
@@ -478,45 +500,45 @@ export type GetAutomationResponse = Message<"engram.app.v1.GetAutomationResponse
 };
 
 /**
- * Describes the message engram.app.v1.GetAutomationResponse.
- * Use `create(GetAutomationResponseSchema)` to create a new message.
+ * Describes the message engram.app.v1.SaveVersionResponse.
+ * Use `create(SaveVersionResponseSchema)` to create a new message.
  */
-export const GetAutomationResponseSchema: GenMessage<GetAutomationResponse> = /*@__PURE__*/
+export const SaveVersionResponseSchema: GenMessage<SaveVersionResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 13);
+
+/**
+ * @generated from message engram.app.v1.ListVersionsRequest
+ */
+export type ListVersionsRequest = Message<"engram.app.v1.ListVersionsRequest"> & {
+  /**
+   * @generated from field: string automation_id = 1;
+   */
+  automationId: string;
+};
+
+/**
+ * Describes the message engram.app.v1.ListVersionsRequest.
+ * Use `create(ListVersionsRequestSchema)` to create a new message.
+ */
+export const ListVersionsRequestSchema: GenMessage<ListVersionsRequest> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_automation, 14);
 
 /**
- * @generated from message engram.app.v1.ListAutomationsRequest
+ * @generated from message engram.app.v1.ListVersionsResponse
  */
-export type ListAutomationsRequest = Message<"engram.app.v1.ListAutomationsRequest"> & {
+export type ListVersionsResponse = Message<"engram.app.v1.ListVersionsResponse"> & {
   /**
-   * @generated from field: bool include_archived = 1;
+   * @generated from field: repeated engram.app.v1.AutomationVersion versions = 1;
    */
-  includeArchived: boolean;
+  versions: AutomationVersion[];
 };
 
 /**
- * Describes the message engram.app.v1.ListAutomationsRequest.
- * Use `create(ListAutomationsRequestSchema)` to create a new message.
+ * Describes the message engram.app.v1.ListVersionsResponse.
+ * Use `create(ListVersionsResponseSchema)` to create a new message.
  */
-export const ListAutomationsRequestSchema: GenMessage<ListAutomationsRequest> = /*@__PURE__*/
+export const ListVersionsResponseSchema: GenMessage<ListVersionsResponse> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_automation, 15);
-
-/**
- * @generated from message engram.app.v1.ListAutomationsResponse
- */
-export type ListAutomationsResponse = Message<"engram.app.v1.ListAutomationsResponse"> & {
-  /**
-   * @generated from field: repeated engram.app.v1.Automation automations = 1;
-   */
-  automations: Automation[];
-};
-
-/**
- * Describes the message engram.app.v1.ListAutomationsResponse.
- * Use `create(ListAutomationsResponseSchema)` to create a new message.
- */
-export const ListAutomationsResponseSchema: GenMessage<ListAutomationsResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 16);
 
 /**
  * @generated from message engram.app.v1.SetAutomationEnabledRequest
@@ -538,7 +560,7 @@ export type SetAutomationEnabledRequest = Message<"engram.app.v1.SetAutomationEn
  * Use `create(SetAutomationEnabledRequestSchema)` to create a new message.
  */
 export const SetAutomationEnabledRequestSchema: GenMessage<SetAutomationEnabledRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 17);
+  messageDesc(file_engram_app_v1_automation, 16);
 
 /**
  * @generated from message engram.app.v1.SetAutomationEnabledResponse
@@ -555,173 +577,234 @@ export type SetAutomationEnabledResponse = Message<"engram.app.v1.SetAutomationE
  * Use `create(SetAutomationEnabledResponseSchema)` to create a new message.
  */
 export const SetAutomationEnabledResponseSchema: GenMessage<SetAutomationEnabledResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 18);
+  messageDesc(file_engram_app_v1_automation, 17);
 
 /**
- * @generated from message engram.app.v1.AutomationRun
+ * @generated from message engram.app.v1.UpdateAutomationMetaRequest
  */
-export type AutomationRun = Message<"engram.app.v1.AutomationRun"> & {
+export type UpdateAutomationMetaRequest = Message<"engram.app.v1.UpdateAutomationMetaRequest"> & {
   /**
    * @generated from field: string id = 1;
    */
   id: string;
 
   /**
-   * @generated from field: string automation_id = 2;
+   * @generated from field: optional string name = 2;
    */
-  automationId: string;
+  name?: string;
 
   /**
-   * @generated from field: string trigger_json = 3;
+   * @generated from field: optional string description = 3;
    */
-  triggerJson: string;
+  description?: string;
 
   /**
-   * @generated from field: optional string rendered_prompt = 4;
+   * AutomationSettings JSON; saves a new version carrying the settings.
+   *
+   * @generated from field: optional string settings_json = 4;
    */
-  renderedPrompt?: string;
-
-  /**
-   * @generated from field: optional string rendered_title = 5;
-   */
-  renderedTitle?: string;
-
-  /**
-   * @generated from field: optional string task_id = 6;
-   */
-  taskId?: string;
-
-  /**
-   * @generated from field: optional string session_id = 7;
-   */
-  sessionId?: string;
-
-  /**
-   * @generated from field: string status = 8;
-   */
-  status: string;
-
-  /**
-   * @generated from field: optional string error = 9;
-   */
-  error?: string;
-
-  /**
-   * @generated from field: optional string scheduled_for = 10;
-   */
-  scheduledFor?: string;
-
-  /**
-   * @generated from field: string created_at = 11;
-   */
-  createdAt: string;
+  settingsJson?: string;
 };
 
 /**
- * Describes the message engram.app.v1.AutomationRun.
- * Use `create(AutomationRunSchema)` to create a new message.
+ * Describes the message engram.app.v1.UpdateAutomationMetaRequest.
+ * Use `create(UpdateAutomationMetaRequestSchema)` to create a new message.
  */
-export const AutomationRunSchema: GenMessage<AutomationRun> = /*@__PURE__*/
+export const UpdateAutomationMetaRequestSchema: GenMessage<UpdateAutomationMetaRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 18);
+
+/**
+ * @generated from message engram.app.v1.UpdateAutomationMetaResponse
+ */
+export type UpdateAutomationMetaResponse = Message<"engram.app.v1.UpdateAutomationMetaResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.Automation automation = 1;
+   */
+  automation?: Automation;
+};
+
+/**
+ * Describes the message engram.app.v1.UpdateAutomationMetaResponse.
+ * Use `create(UpdateAutomationMetaResponseSchema)` to create a new message.
+ */
+export const UpdateAutomationMetaResponseSchema: GenMessage<UpdateAutomationMetaResponse> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_automation, 19);
 
 /**
- * @generated from message engram.app.v1.ListAutomationRunsRequest
+ * @generated from message engram.app.v1.SetInputsRequest
  */
-export type ListAutomationRunsRequest = Message<"engram.app.v1.ListAutomationRunsRequest"> & {
+export type SetInputsRequest = Message<"engram.app.v1.SetInputsRequest"> & {
   /**
    * @generated from field: string automation_id = 1;
    */
   automationId: string;
 
   /**
-   * Most-recent first; 0 uses the server default, capped server-side.
-   *
-   * @generated from field: int32 limit = 2;
+   * @generated from field: string inputs_json = 2;
    */
-  limit: number;
+  inputsJson: string;
 };
 
 /**
- * Describes the message engram.app.v1.ListAutomationRunsRequest.
- * Use `create(ListAutomationRunsRequestSchema)` to create a new message.
+ * Describes the message engram.app.v1.SetInputsRequest.
+ * Use `create(SetInputsRequestSchema)` to create a new message.
  */
-export const ListAutomationRunsRequestSchema: GenMessage<ListAutomationRunsRequest> = /*@__PURE__*/
+export const SetInputsRequestSchema: GenMessage<SetInputsRequest> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_automation, 20);
 
 /**
- * @generated from message engram.app.v1.ListAutomationRunsResponse
+ * @generated from message engram.app.v1.SetInputsResponse
  */
-export type ListAutomationRunsResponse = Message<"engram.app.v1.ListAutomationRunsResponse"> & {
+export type SetInputsResponse = Message<"engram.app.v1.SetInputsResponse"> & {
   /**
-   * @generated from field: repeated engram.app.v1.AutomationRun runs = 1;
+   * @generated from field: engram.app.v1.Automation automation = 1;
    */
-  runs: AutomationRun[];
+  automation?: Automation;
 };
 
 /**
- * Describes the message engram.app.v1.ListAutomationRunsResponse.
- * Use `create(ListAutomationRunsResponseSchema)` to create a new message.
+ * Describes the message engram.app.v1.SetInputsResponse.
+ * Use `create(SetInputsResponseSchema)` to create a new message.
  */
-export const ListAutomationRunsResponseSchema: GenMessage<ListAutomationRunsResponse> = /*@__PURE__*/
+export const SetInputsResponseSchema: GenMessage<SetInputsResponse> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_automation, 21);
 
 /**
- * @generated from message engram.app.v1.TemplateError
+ * @generated from message engram.app.v1.SetBlockOverridesRequest
  */
-export type TemplateError = Message<"engram.app.v1.TemplateError"> & {
+export type SetBlockOverridesRequest = Message<"engram.app.v1.SetBlockOverridesRequest"> & {
   /**
-   * "prompt_template" | "title_template" | "sample"
-   *
-   * @generated from field: string field = 1;
+   * @generated from field: string automation_id = 1;
    */
-  field: string;
+  automationId: string;
 
   /**
-   * "invalid_template" | "render_failed" | "output_too_long" | "invalid_sample"
-   *
-   * @generated from field: string code = 2;
+   * @generated from field: string overrides_json = 2;
    */
-  code: string;
-
-  /**
-   * @generated from field: string message = 3;
-   */
-  message: string;
+  overridesJson: string;
 };
 
 /**
- * Describes the message engram.app.v1.TemplateError.
- * Use `create(TemplateErrorSchema)` to create a new message.
+ * Describes the message engram.app.v1.SetBlockOverridesRequest.
+ * Use `create(SetBlockOverridesRequestSchema)` to create a new message.
  */
-export const TemplateErrorSchema: GenMessage<TemplateError> = /*@__PURE__*/
+export const SetBlockOverridesRequestSchema: GenMessage<SetBlockOverridesRequest> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_automation, 22);
+
+/**
+ * @generated from message engram.app.v1.SetBlockOverridesResponse
+ */
+export type SetBlockOverridesResponse = Message<"engram.app.v1.SetBlockOverridesResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.Automation automation = 1;
+   */
+  automation?: Automation;
+};
+
+/**
+ * Describes the message engram.app.v1.SetBlockOverridesResponse.
+ * Use `create(SetBlockOverridesResponseSchema)` to create a new message.
+ */
+export const SetBlockOverridesResponseSchema: GenMessage<SetBlockOverridesResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 23);
+
+/**
+ * @generated from message engram.app.v1.DuplicateAutomationRequest
+ */
+export type DuplicateAutomationRequest = Message<"engram.app.v1.DuplicateAutomationRequest"> & {
+  /**
+   * @generated from field: string automation_id = 1;
+   */
+  automationId: string;
+
+  /**
+   * @generated from field: optional string name = 2;
+   */
+  name?: string;
+};
+
+/**
+ * Describes the message engram.app.v1.DuplicateAutomationRequest.
+ * Use `create(DuplicateAutomationRequestSchema)` to create a new message.
+ */
+export const DuplicateAutomationRequestSchema: GenMessage<DuplicateAutomationRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 24);
+
+/**
+ * @generated from message engram.app.v1.DuplicateAutomationResponse
+ */
+export type DuplicateAutomationResponse = Message<"engram.app.v1.DuplicateAutomationResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.Automation automation = 1;
+   */
+  automation?: Automation;
+};
+
+/**
+ * Describes the message engram.app.v1.DuplicateAutomationResponse.
+ * Use `create(DuplicateAutomationResponseSchema)` to create a new message.
+ */
+export const DuplicateAutomationResponseSchema: GenMessage<DuplicateAutomationResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 25);
+
+/**
+ * @generated from message engram.app.v1.ArchiveAutomationRequest
+ */
+export type ArchiveAutomationRequest = Message<"engram.app.v1.ArchiveAutomationRequest"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+};
+
+/**
+ * Describes the message engram.app.v1.ArchiveAutomationRequest.
+ * Use `create(ArchiveAutomationRequestSchema)` to create a new message.
+ */
+export const ArchiveAutomationRequestSchema: GenMessage<ArchiveAutomationRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 26);
+
+/**
+ * @generated from message engram.app.v1.ArchiveAutomationResponse
+ */
+export type ArchiveAutomationResponse = Message<"engram.app.v1.ArchiveAutomationResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.Automation automation = 1;
+   */
+  automation?: Automation;
+};
+
+/**
+ * Describes the message engram.app.v1.ArchiveAutomationResponse.
+ * Use `create(ArchiveAutomationResponseSchema)` to create a new message.
+ */
+export const ArchiveAutomationResponseSchema: GenMessage<ArchiveAutomationResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 27);
 
 /**
  * @generated from message engram.app.v1.TestRenderRequest
  */
 export type TestRenderRequest = Message<"engram.app.v1.TestRenderRequest"> & {
   /**
-   * When set, the stored automation supplies name/action unless draft_action or
-   * automation_name override them.
+   * @generated from field: string automation_id = 1;
+   */
+  automationId: string;
+
+  /**
+   * Unsaved editor state; falls back to the stored current version.
    *
-   * @generated from field: optional string automation_id = 1;
+   * @generated from field: optional string draft_definition_json = 2;
    */
-  automationId?: string;
+  draftDefinitionJson?: string;
 
   /**
-   * @generated from field: optional string automation_name = 2;
-   */
-  automationName?: string;
-
-  /**
-   * @generated from field: engram.app.v1.AutomationAction draft_action = 3;
-   */
-  draftAction?: AutomationAction;
-
-  /**
-   * A stored sample id, or payload_json. If neither is set for a webhook
-   * trigger, registration_id + event_key select the newest stored sample.
+   * Draft input values; falls back to the stored values.
    *
+   * @generated from field: optional string inputs_json = 3;
+   */
+  inputsJson?: string;
+
+  /**
    * @generated from oneof engram.app.v1.TestRenderRequest.sample
    */
   sample: {
@@ -739,19 +822,9 @@ export type TestRenderRequest = Message<"engram.app.v1.TestRenderRequest"> & {
   } | { case: undefined; value?: undefined };
 
   /**
-   * @generated from field: string registration_id = 6;
-   */
-  registrationId: string;
-
-  /**
-   * @generated from field: string event_key = 7;
-   */
-  eventKey: string;
-
-  /**
-   * Cron previews carry no event payload.
+   * Cron/manual previews carry no payload; this names the occurrence.
    *
-   * @generated from field: optional string scheduled_for = 8;
+   * @generated from field: optional string scheduled_for = 6;
    */
   scheduledFor?: string;
 };
@@ -761,26 +834,64 @@ export type TestRenderRequest = Message<"engram.app.v1.TestRenderRequest"> & {
  * Use `create(TestRenderRequestSchema)` to create a new message.
  */
 export const TestRenderRequestSchema: GenMessage<TestRenderRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 23);
+  messageDesc(file_engram_app_v1_automation, 28);
+
+/**
+ * @generated from message engram.app.v1.BlockRender
+ */
+export type BlockRender = Message<"engram.app.v1.BlockRender"> & {
+  /**
+   * @generated from field: string block_id = 1;
+   */
+  blockId: string;
+
+  /**
+   * @generated from field: string block_type = 2;
+   */
+  blockType: string;
+
+  /**
+   * The block config with every Liquid template resolved.
+   *
+   * @generated from field: string rendered_json = 3;
+   */
+  renderedJson: string;
+
+  /**
+   * Filter blocks: whether the sample passes.
+   *
+   * @generated from field: optional bool filter_pass = 4;
+   */
+  filterPass?: boolean;
+
+  /**
+   * The variables visible AT this block (trigger/event/inputs/steps so far).
+   *
+   * @generated from field: string scope_json = 5;
+   */
+  scopeJson: string;
+};
+
+/**
+ * Describes the message engram.app.v1.BlockRender.
+ * Use `create(BlockRenderSchema)` to create a new message.
+ */
+export const BlockRenderSchema: GenMessage<BlockRender> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 29);
 
 /**
  * @generated from message engram.app.v1.TestRenderResponse
  */
 export type TestRenderResponse = Message<"engram.app.v1.TestRenderResponse"> & {
   /**
-   * @generated from field: optional string rendered_prompt = 1;
+   * @generated from field: repeated engram.app.v1.BlockRender blocks = 1;
    */
-  renderedPrompt?: string;
+  blocks: BlockRender[];
 
   /**
-   * @generated from field: optional string rendered_title = 2;
+   * @generated from field: repeated engram.app.v1.BlockError errors = 2;
    */
-  renderedTitle?: string;
-
-  /**
-   * @generated from field: repeated engram.app.v1.TemplateError errors = 3;
-   */
-  errors: TemplateError[];
+  errors: BlockError[];
 };
 
 /**
@@ -788,7 +899,58 @@ export type TestRenderResponse = Message<"engram.app.v1.TestRenderResponse"> & {
  * Use `create(TestRenderResponseSchema)` to create a new message.
  */
 export const TestRenderResponseSchema: GenMessage<TestRenderResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 24);
+  messageDesc(file_engram_app_v1_automation, 30);
+
+/**
+ * @generated from message engram.app.v1.DryRunRequest
+ */
+export type DryRunRequest = Message<"engram.app.v1.DryRunRequest"> & {
+  /**
+   * @generated from field: string automation_id = 1;
+   */
+  automationId: string;
+
+  /**
+   * @generated from oneof engram.app.v1.DryRunRequest.sample
+   */
+  sample: {
+    /**
+     * @generated from field: string sample_id = 2;
+     */
+    value: string;
+    case: "sampleId";
+  } | {
+    /**
+     * @generated from field: string payload_json = 3;
+     */
+    value: string;
+    case: "payloadJson";
+  } | { case: undefined; value?: undefined };
+};
+
+/**
+ * Describes the message engram.app.v1.DryRunRequest.
+ * Use `create(DryRunRequestSchema)` to create a new message.
+ */
+export const DryRunRequestSchema: GenMessage<DryRunRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 31);
+
+/**
+ * @generated from message engram.app.v1.DryRunResponse
+ */
+export type DryRunResponse = Message<"engram.app.v1.DryRunResponse"> & {
+  /**
+   * @generated from field: string run_id = 1;
+   */
+  runId: string;
+};
+
+/**
+ * Describes the message engram.app.v1.DryRunResponse.
+ * Use `create(DryRunResponseSchema)` to create a new message.
+ */
+export const DryRunResponseSchema: GenMessage<DryRunResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 32);
 
 /**
  * @generated from message engram.app.v1.EvalCodeRequest
@@ -820,7 +982,7 @@ export type EvalCodeRequest = Message<"engram.app.v1.EvalCodeRequest"> & {
  * Use `create(EvalCodeRequestSchema)` to create a new message.
  */
 export const EvalCodeRequestSchema: GenMessage<EvalCodeRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 25);
+  messageDesc(file_engram_app_v1_automation, 33);
 
 /**
  * @generated from message engram.app.v1.EvalCodeResponse
@@ -862,53 +1024,96 @@ export type EvalCodeResponse = Message<"engram.app.v1.EvalCodeResponse"> & {
  * Use `create(EvalCodeResponseSchema)` to create a new message.
  */
 export const EvalCodeResponseSchema: GenMessage<EvalCodeResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 26);
+  messageDesc(file_engram_app_v1_automation, 34);
 
 /**
- * @generated from message engram.app.v1.WebhookSample
+ * @generated from message engram.app.v1.RunNowRequest
  */
-export type WebhookSample = Message<"engram.app.v1.WebhookSample"> & {
+export type RunNowRequest = Message<"engram.app.v1.RunNowRequest"> & {
+  /**
+   * @generated from field: string automation_id = 1;
+   */
+  automationId: string;
+
+  /**
+   * Optional one-off input override (merged over the stored values).
+   *
+   * @generated from field: optional string inputs_json = 2;
+   */
+  inputsJson?: string;
+
+  /**
+   * Optional event payload for integration/webhook-shaped automations.
+   *
+   * @generated from field: optional string payload_json = 3;
+   */
+  payloadJson?: string;
+};
+
+/**
+ * Describes the message engram.app.v1.RunNowRequest.
+ * Use `create(RunNowRequestSchema)` to create a new message.
+ */
+export const RunNowRequestSchema: GenMessage<RunNowRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 35);
+
+/**
+ * @generated from message engram.app.v1.RunNowResponse
+ */
+export type RunNowResponse = Message<"engram.app.v1.RunNowResponse"> & {
+  /**
+   * @generated from field: string run_id = 1;
+   */
+  runId: string;
+};
+
+/**
+ * Describes the message engram.app.v1.RunNowResponse.
+ * Use `create(RunNowResponseSchema)` to create a new message.
+ */
+export const RunNowResponseSchema: GenMessage<RunNowResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 36);
+
+/**
+ * @generated from message engram.app.v1.EventSample
+ */
+export type EventSample = Message<"engram.app.v1.EventSample"> & {
   /**
    * @generated from field: string id = 1;
    */
   id: string;
 
   /**
-   * @generated from field: string registration_id = 2;
-   */
-  registrationId: string;
-
-  /**
-   * @generated from field: string event_key = 3;
+   * @generated from field: string event_key = 2;
    */
   eventKey: string;
 
   /**
-   * @generated from field: string payload_json = 4;
+   * @generated from field: string payload_json = 3;
    */
   payloadJson: string;
 
   /**
-   * @generated from field: string received_at = 5;
+   * @generated from field: string received_at = 4;
    */
   receivedAt: string;
 };
 
 /**
- * Describes the message engram.app.v1.WebhookSample.
- * Use `create(WebhookSampleSchema)` to create a new message.
+ * Describes the message engram.app.v1.EventSample.
+ * Use `create(EventSampleSchema)` to create a new message.
  */
-export const WebhookSampleSchema: GenMessage<WebhookSample> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 27);
+export const EventSampleSchema: GenMessage<EventSample> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 37);
 
 /**
- * @generated from message engram.app.v1.ListWebhookSamplesRequest
+ * @generated from message engram.app.v1.ListEventSamplesRequest
  */
-export type ListWebhookSamplesRequest = Message<"engram.app.v1.ListWebhookSamplesRequest"> & {
+export type ListEventSamplesRequest = Message<"engram.app.v1.ListEventSamplesRequest"> & {
   /**
-   * @generated from field: string registration_id = 1;
+   * @generated from field: string automation_id = 1;
    */
-  registrationId: string;
+  automationId: string;
 
   /**
    * @generated from field: optional string event_key = 2;
@@ -916,36 +1121,389 @@ export type ListWebhookSamplesRequest = Message<"engram.app.v1.ListWebhookSample
   eventKey?: string;
 
   /**
-   * Most-recent first; 0 uses the server default, capped server-side.
-   *
    * @generated from field: int32 limit = 3;
    */
   limit: number;
 };
 
 /**
- * Describes the message engram.app.v1.ListWebhookSamplesRequest.
- * Use `create(ListWebhookSamplesRequestSchema)` to create a new message.
+ * Describes the message engram.app.v1.ListEventSamplesRequest.
+ * Use `create(ListEventSamplesRequestSchema)` to create a new message.
  */
-export const ListWebhookSamplesRequestSchema: GenMessage<ListWebhookSamplesRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 28);
+export const ListEventSamplesRequestSchema: GenMessage<ListEventSamplesRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 38);
 
 /**
- * @generated from message engram.app.v1.ListWebhookSamplesResponse
+ * @generated from message engram.app.v1.ListEventSamplesResponse
  */
-export type ListWebhookSamplesResponse = Message<"engram.app.v1.ListWebhookSamplesResponse"> & {
+export type ListEventSamplesResponse = Message<"engram.app.v1.ListEventSamplesResponse"> & {
   /**
-   * @generated from field: repeated engram.app.v1.WebhookSample samples = 1;
+   * @generated from field: repeated engram.app.v1.EventSample samples = 1;
    */
-  samples: WebhookSample[];
+  samples: EventSample[];
 };
 
 /**
- * Describes the message engram.app.v1.ListWebhookSamplesResponse.
- * Use `create(ListWebhookSamplesResponseSchema)` to create a new message.
+ * Describes the message engram.app.v1.ListEventSamplesResponse.
+ * Use `create(ListEventSamplesResponseSchema)` to create a new message.
  */
-export const ListWebhookSamplesResponseSchema: GenMessage<ListWebhookSamplesResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 29);
+export const ListEventSamplesResponseSchema: GenMessage<ListEventSamplesResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 39);
+
+/**
+ * @generated from message engram.app.v1.ListInputKeyOptionsRequest
+ */
+export type ListInputKeyOptionsRequest = Message<"engram.app.v1.ListInputKeyOptionsRequest"> & {
+  /**
+   * "repository" | "channel" | "team"
+   *
+   * @generated from field: string noun = 1;
+   */
+  noun: string;
+
+  /**
+   * @generated from field: optional string connection_id = 2;
+   */
+  connectionId?: string;
+};
+
+/**
+ * Describes the message engram.app.v1.ListInputKeyOptionsRequest.
+ * Use `create(ListInputKeyOptionsRequestSchema)` to create a new message.
+ */
+export const ListInputKeyOptionsRequestSchema: GenMessage<ListInputKeyOptionsRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 40);
+
+/**
+ * @generated from message engram.app.v1.InputKeyOption
+ */
+export type InputKeyOption = Message<"engram.app.v1.InputKeyOption"> & {
+  /**
+   * @generated from field: string key = 1;
+   */
+  key: string;
+
+  /**
+   * @generated from field: string label = 2;
+   */
+  label: string;
+};
+
+/**
+ * Describes the message engram.app.v1.InputKeyOption.
+ * Use `create(InputKeyOptionSchema)` to create a new message.
+ */
+export const InputKeyOptionSchema: GenMessage<InputKeyOption> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 41);
+
+/**
+ * @generated from message engram.app.v1.ListInputKeyOptionsResponse
+ */
+export type ListInputKeyOptionsResponse = Message<"engram.app.v1.ListInputKeyOptionsResponse"> & {
+  /**
+   * @generated from field: repeated engram.app.v1.InputKeyOption options = 1;
+   */
+  options: InputKeyOption[];
+};
+
+/**
+ * Describes the message engram.app.v1.ListInputKeyOptionsResponse.
+ * Use `create(ListInputKeyOptionsResponseSchema)` to create a new message.
+ */
+export const ListInputKeyOptionsResponseSchema: GenMessage<ListInputKeyOptionsResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 42);
+
+/**
+ * @generated from message engram.app.v1.ListRunsRequest
+ */
+export type ListRunsRequest = Message<"engram.app.v1.ListRunsRequest"> & {
+  /**
+   * @generated from field: string automation_id = 1;
+   */
+  automationId: string;
+
+  /**
+   * Most-recent first; 0 uses the server default, capped server-side.
+   *
+   * @generated from field: int32 limit = 2;
+   */
+  limit: number;
+
+  /**
+   * Include filtered runs individually instead of collapsing them.
+   *
+   * @generated from field: bool include_filtered = 3;
+   */
+  includeFiltered: boolean;
+};
+
+/**
+ * Describes the message engram.app.v1.ListRunsRequest.
+ * Use `create(ListRunsRequestSchema)` to create a new message.
+ */
+export const ListRunsRequestSchema: GenMessage<ListRunsRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 43);
+
+/**
+ * Consecutive filtered runs collapsed between real runs.
+ *
+ * @generated from message engram.app.v1.FilteredWindow
+ */
+export type FilteredWindow = Message<"engram.app.v1.FilteredWindow"> & {
+  /**
+   * @generated from field: int32 count = 1;
+   */
+  count: number;
+
+  /**
+   * @generated from field: string first_at = 2;
+   */
+  firstAt: string;
+
+  /**
+   * @generated from field: string last_at = 3;
+   */
+  lastAt: string;
+
+  /**
+   * The id of the run this window precedes (newest first), or "" at the end.
+   *
+   * @generated from field: string before_run_id = 4;
+   */
+  beforeRunId: string;
+};
+
+/**
+ * Describes the message engram.app.v1.FilteredWindow.
+ * Use `create(FilteredWindowSchema)` to create a new message.
+ */
+export const FilteredWindowSchema: GenMessage<FilteredWindow> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 44);
+
+/**
+ * @generated from message engram.app.v1.ListRunsResponse
+ */
+export type ListRunsResponse = Message<"engram.app.v1.ListRunsResponse"> & {
+  /**
+   * @generated from field: repeated engram.app.v1.AutomationRunBrief runs = 1;
+   */
+  runs: AutomationRunBrief[];
+
+  /**
+   * @generated from field: repeated engram.app.v1.FilteredWindow filtered = 2;
+   */
+  filtered: FilteredWindow[];
+};
+
+/**
+ * Describes the message engram.app.v1.ListRunsResponse.
+ * Use `create(ListRunsResponseSchema)` to create a new message.
+ */
+export const ListRunsResponseSchema: GenMessage<ListRunsResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 45);
+
+/**
+ * @generated from message engram.app.v1.AutomationStepRun
+ */
+export type AutomationStepRun = Message<"engram.app.v1.AutomationStepRun"> & {
+  /**
+   * The frame path (loop iterations suffixed blockId[i]).
+   *
+   * @generated from field: string block_id = 1;
+   */
+  blockId: string;
+
+  /**
+   * @generated from field: int32 attempt = 2;
+   */
+  attempt: number;
+
+  /**
+   * @generated from field: string status = 3;
+   */
+  status: string;
+
+  /**
+   * @generated from field: string inputs_json = 4;
+   */
+  inputsJson: string;
+
+  /**
+   * @generated from field: string outputs_json = 5;
+   */
+  outputsJson: string;
+
+  /**
+   * @generated from field: optional string error = 6;
+   */
+  error?: string;
+
+  /**
+   * @generated from field: optional string session_id = 7;
+   */
+  sessionId?: string;
+
+  /**
+   * @generated from field: string started_at = 8;
+   */
+  startedAt: string;
+
+  /**
+   * @generated from field: optional string ended_at = 9;
+   */
+  endedAt?: string;
+};
+
+/**
+ * Describes the message engram.app.v1.AutomationStepRun.
+ * Use `create(AutomationStepRunSchema)` to create a new message.
+ */
+export const AutomationStepRunSchema: GenMessage<AutomationStepRun> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 46);
+
+/**
+ * @generated from message engram.app.v1.AutomationRun
+ */
+export type AutomationRun = Message<"engram.app.v1.AutomationRun"> & {
+  /**
+   * @generated from field: engram.app.v1.AutomationRunBrief brief = 1;
+   */
+  brief?: AutomationRunBrief;
+
+  /**
+   * @generated from field: string trigger_json = 2;
+   */
+  triggerJson: string;
+
+  /**
+   * @generated from field: repeated engram.app.v1.AutomationStepRun steps = 3;
+   */
+  steps: AutomationStepRun[];
+
+  /**
+   * @generated from field: repeated string session_ids = 4;
+   */
+  sessionIds: string[];
+};
+
+/**
+ * Describes the message engram.app.v1.AutomationRun.
+ * Use `create(AutomationRunSchema)` to create a new message.
+ */
+export const AutomationRunSchema: GenMessage<AutomationRun> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 47);
+
+/**
+ * @generated from message engram.app.v1.GetRunRequest
+ */
+export type GetRunRequest = Message<"engram.app.v1.GetRunRequest"> & {
+  /**
+   * @generated from field: string run_id = 1;
+   */
+  runId: string;
+};
+
+/**
+ * Describes the message engram.app.v1.GetRunRequest.
+ * Use `create(GetRunRequestSchema)` to create a new message.
+ */
+export const GetRunRequestSchema: GenMessage<GetRunRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 48);
+
+/**
+ * @generated from message engram.app.v1.GetRunResponse
+ */
+export type GetRunResponse = Message<"engram.app.v1.GetRunResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.AutomationRun run = 1;
+   */
+  run?: AutomationRun;
+};
+
+/**
+ * Describes the message engram.app.v1.GetRunResponse.
+ * Use `create(GetRunResponseSchema)` to create a new message.
+ */
+export const GetRunResponseSchema: GenMessage<GetRunResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 49);
+
+/**
+ * @generated from message engram.app.v1.StopRunRequest
+ */
+export type StopRunRequest = Message<"engram.app.v1.StopRunRequest"> & {
+  /**
+   * @generated from field: string run_id = 1;
+   */
+  runId: string;
+
+  /**
+   * @generated from field: optional string reason = 2;
+   */
+  reason?: string;
+};
+
+/**
+ * Describes the message engram.app.v1.StopRunRequest.
+ * Use `create(StopRunRequestSchema)` to create a new message.
+ */
+export const StopRunRequestSchema: GenMessage<StopRunRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 50);
+
+/**
+ * @generated from message engram.app.v1.StopRunResponse
+ */
+export type StopRunResponse = Message<"engram.app.v1.StopRunResponse"> & {
+  /**
+   * @generated from field: bool sent = 1;
+   */
+  sent: boolean;
+};
+
+/**
+ * Describes the message engram.app.v1.StopRunResponse.
+ * Use `create(StopRunResponseSchema)` to create a new message.
+ */
+export const StopRunResponseSchema: GenMessage<StopRunResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 51);
+
+/**
+ * @generated from message engram.app.v1.RetryRunRequest
+ */
+export type RetryRunRequest = Message<"engram.app.v1.RetryRunRequest"> & {
+  /**
+   * @generated from field: string run_id = 1;
+   */
+  runId: string;
+
+  /**
+   * @generated from field: optional string from_step_id = 2;
+   */
+  fromStepId?: string;
+};
+
+/**
+ * Describes the message engram.app.v1.RetryRunRequest.
+ * Use `create(RetryRunRequestSchema)` to create a new message.
+ */
+export const RetryRunRequestSchema: GenMessage<RetryRunRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 52);
+
+/**
+ * @generated from message engram.app.v1.RetryRunResponse
+ */
+export type RetryRunResponse = Message<"engram.app.v1.RetryRunResponse"> & {
+  /**
+   * @generated from field: string run_id = 1;
+   */
+  runId: string;
+};
+
+/**
+ * Describes the message engram.app.v1.RetryRunResponse.
+ * Use `create(RetryRunResponseSchema)` to create a new message.
+ */
+export const RetryRunResponseSchema: GenMessage<RetryRunResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_automation, 53);
 
 /**
  * @generated from message engram.app.v1.WebhookRegistration
@@ -1000,7 +1558,7 @@ export type WebhookRegistration = Message<"engram.app.v1.WebhookRegistration"> &
  * Use `create(WebhookRegistrationSchema)` to create a new message.
  */
 export const WebhookRegistrationSchema: GenMessage<WebhookRegistration> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 30);
+  messageDesc(file_engram_app_v1_automation, 54);
 
 /**
  * @generated from message engram.app.v1.CreateWebhookRegistrationRequest
@@ -1034,7 +1592,7 @@ export type CreateWebhookRegistrationRequest = Message<"engram.app.v1.CreateWebh
  * Use `create(CreateWebhookRegistrationRequestSchema)` to create a new message.
  */
 export const CreateWebhookRegistrationRequestSchema: GenMessage<CreateWebhookRegistrationRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 31);
+  messageDesc(file_engram_app_v1_automation, 55);
 
 /**
  * @generated from message engram.app.v1.CreateWebhookRegistrationResponse
@@ -1058,7 +1616,7 @@ export type CreateWebhookRegistrationResponse = Message<"engram.app.v1.CreateWeb
  * Use `create(CreateWebhookRegistrationResponseSchema)` to create a new message.
  */
 export const CreateWebhookRegistrationResponseSchema: GenMessage<CreateWebhookRegistrationResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 32);
+  messageDesc(file_engram_app_v1_automation, 56);
 
 /**
  * @generated from message engram.app.v1.ListWebhookRegistrationsRequest
@@ -1071,7 +1629,7 @@ export type ListWebhookRegistrationsRequest = Message<"engram.app.v1.ListWebhook
  * Use `create(ListWebhookRegistrationsRequestSchema)` to create a new message.
  */
 export const ListWebhookRegistrationsRequestSchema: GenMessage<ListWebhookRegistrationsRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 33);
+  messageDesc(file_engram_app_v1_automation, 57);
 
 /**
  * @generated from message engram.app.v1.ListWebhookRegistrationsResponse
@@ -1088,7 +1646,7 @@ export type ListWebhookRegistrationsResponse = Message<"engram.app.v1.ListWebhoo
  * Use `create(ListWebhookRegistrationsResponseSchema)` to create a new message.
  */
 export const ListWebhookRegistrationsResponseSchema: GenMessage<ListWebhookRegistrationsResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 34);
+  messageDesc(file_engram_app_v1_automation, 58);
 
 /**
  * @generated from message engram.app.v1.DeleteWebhookRegistrationRequest
@@ -1105,7 +1663,7 @@ export type DeleteWebhookRegistrationRequest = Message<"engram.app.v1.DeleteWebh
  * Use `create(DeleteWebhookRegistrationRequestSchema)` to create a new message.
  */
 export const DeleteWebhookRegistrationRequestSchema: GenMessage<DeleteWebhookRegistrationRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 35);
+  messageDesc(file_engram_app_v1_automation, 59);
 
 /**
  * @generated from message engram.app.v1.DeleteWebhookRegistrationResponse
@@ -1122,7 +1680,7 @@ export type DeleteWebhookRegistrationResponse = Message<"engram.app.v1.DeleteWeb
  * Use `create(DeleteWebhookRegistrationResponseSchema)` to create a new message.
  */
 export const DeleteWebhookRegistrationResponseSchema: GenMessage<DeleteWebhookRegistrationResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 36);
+  messageDesc(file_engram_app_v1_automation, 60);
 
 /**
  * @generated from message engram.app.v1.ListWebhookEventsRequest
@@ -1139,7 +1697,7 @@ export type ListWebhookEventsRequest = Message<"engram.app.v1.ListWebhookEventsR
  * Use `create(ListWebhookEventsRequestSchema)` to create a new message.
  */
 export const ListWebhookEventsRequestSchema: GenMessage<ListWebhookEventsRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 37);
+  messageDesc(file_engram_app_v1_automation, 61);
 
 /**
  * @generated from message engram.app.v1.WebhookEvent
@@ -1166,7 +1724,7 @@ export type WebhookEvent = Message<"engram.app.v1.WebhookEvent"> & {
  * Use `create(WebhookEventSchema)` to create a new message.
  */
 export const WebhookEventSchema: GenMessage<WebhookEvent> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 38);
+  messageDesc(file_engram_app_v1_automation, 62);
 
 /**
  * @generated from message engram.app.v1.WebhookVariable
@@ -1188,7 +1746,7 @@ export type WebhookVariable = Message<"engram.app.v1.WebhookVariable"> & {
  * Use `create(WebhookVariableSchema)` to create a new message.
  */
 export const WebhookVariableSchema: GenMessage<WebhookVariable> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 39);
+  messageDesc(file_engram_app_v1_automation, 63);
 
 /**
  * @generated from message engram.app.v1.ListWebhookEventsResponse
@@ -1210,7 +1768,7 @@ export type ListWebhookEventsResponse = Message<"engram.app.v1.ListWebhookEvents
  * Use `create(ListWebhookEventsResponseSchema)` to create a new message.
  */
 export const ListWebhookEventsResponseSchema: GenMessage<ListWebhookEventsResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 40);
+  messageDesc(file_engram_app_v1_automation, 64);
 
 /**
  * @generated from message engram.app.v1.ListEventCatalogRequest
@@ -1227,7 +1785,7 @@ export type ListEventCatalogRequest = Message<"engram.app.v1.ListEventCatalogReq
  * Use `create(ListEventCatalogRequestSchema)` to create a new message.
  */
 export const ListEventCatalogRequestSchema: GenMessage<ListEventCatalogRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 41);
+  messageDesc(file_engram_app_v1_automation, 65);
 
 /**
  * @generated from message engram.app.v1.EventCatalogEntry
@@ -1280,7 +1838,7 @@ export type EventCatalogEntry = Message<"engram.app.v1.EventCatalogEntry"> & {
  * Use `create(EventCatalogEntrySchema)` to create a new message.
  */
 export const EventCatalogEntrySchema: GenMessage<EventCatalogEntry> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 42);
+  messageDesc(file_engram_app_v1_automation, 66);
 
 /**
  * @generated from message engram.app.v1.EventCatalogScope
@@ -1302,7 +1860,7 @@ export type EventCatalogScope = Message<"engram.app.v1.EventCatalogScope"> & {
  * Use `create(EventCatalogScopeSchema)` to create a new message.
  */
 export const EventCatalogScopeSchema: GenMessage<EventCatalogScope> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 43);
+  messageDesc(file_engram_app_v1_automation, 67);
 
 /**
  * @generated from message engram.app.v1.ListEventCatalogResponse
@@ -1334,7 +1892,7 @@ export type ListEventCatalogResponse = Message<"engram.app.v1.ListEventCatalogRe
  * Use `create(ListEventCatalogResponseSchema)` to create a new message.
  */
 export const ListEventCatalogResponseSchema: GenMessage<ListEventCatalogResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 44);
+  messageDesc(file_engram_app_v1_automation, 68);
 
 /**
  * @generated from message engram.app.v1.ListActionCatalogRequest
@@ -1351,7 +1909,7 @@ export type ListActionCatalogRequest = Message<"engram.app.v1.ListActionCatalogR
  * Use `create(ListActionCatalogRequestSchema)` to create a new message.
  */
 export const ListActionCatalogRequestSchema: GenMessage<ListActionCatalogRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 45);
+  messageDesc(file_engram_app_v1_automation, 69);
 
 /**
  * Member-safe projection: never the execution details.
@@ -1385,7 +1943,7 @@ export type ActionCatalogEntry = Message<"engram.app.v1.ActionCatalogEntry"> & {
  * Use `create(ActionCatalogEntrySchema)` to create a new message.
  */
 export const ActionCatalogEntrySchema: GenMessage<ActionCatalogEntry> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 46);
+  messageDesc(file_engram_app_v1_automation, 70);
 
 /**
  * @generated from message engram.app.v1.ListActionCatalogResponse
@@ -1402,41 +1960,33 @@ export type ListActionCatalogResponse = Message<"engram.app.v1.ListActionCatalog
  * Use `create(ListActionCatalogResponseSchema)` to create a new message.
  */
 export const ListActionCatalogResponseSchema: GenMessage<ListActionCatalogResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_automation, 47);
+  messageDesc(file_engram_app_v1_automation, 71);
 
 /**
- * Admin-authored cron/webhook triggers and their create-task action (ADR 0102).
- * ORCHESTRATOR-NATIVE: like task.proto/profile.proto, this service is not
- * compiled into the coordinator's Rust surface.
+ * Automations v2 (ADR 0119): trigger + ordered block graph + inputs, run on
+ * one durable interpreter workflow. ORCHESTRATOR-NATIVE: like task.proto /
+ * profile.proto, this service is not compiled into the coordinator's Rust
+ * surface.
+ *
+ * Definitions ride the wire as JSON strings (`definition_json`,
+ * `inputs_schema_json`, `inputs_json`, `block_overrides_json`); the
+ * orchestrator is the validation authority and answers with structured,
+ * block-addressed BlockError values rather than prose.
  *
  * @generated from service engram.app.v1.AutomationService
  */
 export const AutomationService: GenService<{
   /**
-   * @generated from rpc engram.app.v1.AutomationService.CreateAutomation
+   * @generated from rpc engram.app.v1.AutomationService.ListAutomations
    */
-  createAutomation: {
+  listAutomations: {
     methodKind: "unary";
-    input: typeof CreateAutomationRequestSchema;
-    output: typeof CreateAutomationResponseSchema;
+    input: typeof ListAutomationsRequestSchema;
+    output: typeof ListAutomationsResponseSchema;
   },
   /**
-   * @generated from rpc engram.app.v1.AutomationService.UpdateAutomation
-   */
-  updateAutomation: {
-    methodKind: "unary";
-    input: typeof UpdateAutomationRequestSchema;
-    output: typeof UpdateAutomationResponseSchema;
-  },
-  /**
-   * @generated from rpc engram.app.v1.AutomationService.ArchiveAutomation
-   */
-  archiveAutomation: {
-    methodKind: "unary";
-    input: typeof ArchiveAutomationRequestSchema;
-    output: typeof ArchiveAutomationResponseSchema;
-  },
-  /**
+   * By id, or by builtin_key for the shipped automations.
+   *
    * @generated from rpc engram.app.v1.AutomationService.GetAutomation
    */
   getAutomation: {
@@ -1445,12 +1995,34 @@ export const AutomationService: GenService<{
     output: typeof GetAutomationResponseSchema;
   },
   /**
-   * @generated from rpc engram.app.v1.AutomationService.ListAutomations
+   * definition_json → version 1.
+   *
+   * @generated from rpc engram.app.v1.AutomationService.CreateAutomation
    */
-  listAutomations: {
+  createAutomation: {
     methodKind: "unary";
-    input: typeof ListAutomationsRequestSchema;
-    output: typeof ListAutomationsResponseSchema;
+    input: typeof CreateAutomationRequestSchema;
+    output: typeof CreateAutomationResponseSchema;
+  },
+  /**
+   * Save = a new immutable version; in-flight runs finish on theirs.
+   * PermissionDenied on a built-in (structure is locked — use
+   * SetBlockOverrides / SetInputs).
+   *
+   * @generated from rpc engram.app.v1.AutomationService.SaveVersion
+   */
+  saveVersion: {
+    methodKind: "unary";
+    input: typeof SaveVersionRequestSchema;
+    output: typeof SaveVersionResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.AutomationService.ListVersions
+   */
+  listVersions: {
+    methodKind: "unary";
+    input: typeof ListVersionsRequestSchema;
+    output: typeof ListVersionsResponseSchema;
   },
   /**
    * @generated from rpc engram.app.v1.AutomationService.SetAutomationEnabled
@@ -1461,14 +2033,60 @@ export const AutomationService: GenService<{
     output: typeof SetAutomationEnabledResponseSchema;
   },
   /**
-   * @generated from rpc engram.app.v1.AutomationService.ListAutomationRuns
+   * Name / description / run settings. Settings are PermissionDenied on a
+   * built-in.
+   *
+   * @generated from rpc engram.app.v1.AutomationService.UpdateAutomationMeta
    */
-  listAutomationRuns: {
+  updateAutomationMeta: {
     methodKind: "unary";
-    input: typeof ListAutomationRunsRequestSchema;
-    output: typeof ListAutomationRunsResponseSchema;
+    input: typeof UpdateAutomationMetaRequestSchema;
+    output: typeof UpdateAutomationMetaResponseSchema;
   },
   /**
+   * Per-automation input values (allowed on built-ins).
+   *
+   * @generated from rpc engram.app.v1.AutomationService.SetInputs
+   */
+  setInputs: {
+    methodKind: "unary";
+    input: typeof SetInputsRequestSchema;
+    output: typeof SetInputsResponseSchema;
+  },
+  /**
+   * Per-automation tunable block fields (allowed on built-ins). Every key
+   * must be a `tunable` field of that block in the current version, and the
+   * merged config must re-validate against the block's schema.
+   *
+   * @generated from rpc engram.app.v1.AutomationService.SetBlockOverrides
+   */
+  setBlockOverrides: {
+    methodKind: "unary";
+    input: typeof SetBlockOverridesRequestSchema;
+    output: typeof SetBlockOverridesResponseSchema;
+  },
+  /**
+   * A fully editable user copy (built-ins included); overrides are folded in.
+   *
+   * @generated from rpc engram.app.v1.AutomationService.DuplicateAutomation
+   */
+  duplicateAutomation: {
+    methodKind: "unary";
+    input: typeof DuplicateAutomationRequestSchema;
+    output: typeof DuplicateAutomationResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.AutomationService.ArchiveAutomation
+   */
+  archiveAutomation: {
+    methodKind: "unary";
+    input: typeof ArchiveAutomationRequestSchema;
+    output: typeof ArchiveAutomationResponseSchema;
+  },
+  /**
+   * Render every block against a sample without side effects: per-block
+   * rendered config, filter verdicts, and the scope visible at that block.
+   *
    * @generated from rpc engram.app.v1.AutomationService.TestRender
    */
   testRender: {
@@ -1477,9 +2095,18 @@ export const AutomationService: GenService<{
     output: typeof TestRenderResponseSchema;
   },
   /**
-   * Evaluate a code-block source in the QuickJS sandbox against a sample
-   * input (ADR 0119 D6). Same limits as a real run; powers the editor's
-   * Run button.
+   * A real run whose integration actions are stubbed (they record what they
+   * would have done). Appears in the run list flagged dry_run.
+   *
+   * @generated from rpc engram.app.v1.AutomationService.DryRun
+   */
+  dryRun: {
+    methodKind: "unary";
+    input: typeof DryRunRequestSchema;
+    output: typeof DryRunResponseSchema;
+  },
+  /**
+   * Evaluate a code-block source in the QuickJS sandbox (ADR 0119 D6).
    *
    * @generated from rpc engram.app.v1.AutomationService.EvalCode
    */
@@ -1489,16 +2116,38 @@ export const AutomationService: GenService<{
     output: typeof EvalCodeResponseSchema;
   },
   /**
-   * @generated from rpc engram.app.v1.AutomationService.ListWebhookSamples
+   * Manual trigger: start a run now with an optional input override.
+   *
+   * @generated from rpc engram.app.v1.AutomationService.RunNow
    */
-  listWebhookSamples: {
+  runNow: {
     methodKind: "unary";
-    input: typeof ListWebhookSamplesRequestSchema;
-    output: typeof ListWebhookSamplesResponseSchema;
+    input: typeof RunNowRequestSchema;
+    output: typeof RunNowResponseSchema;
   },
   /**
-   * ADR 0119 D5: the connector-declared event and action catalogs that back
-   * integration triggers and integration_action blocks.
+   * Stored deliveries for the automation's trigger source (integration ledger
+   * or custom-webhook samples).
+   *
+   * @generated from rpc engram.app.v1.AutomationService.ListEventSamples
+   */
+  listEventSamples: {
+    methodKind: "unary";
+    input: typeof ListEventSamplesRequestSchema;
+    output: typeof ListEventSamplesResponseSchema;
+  },
+  /**
+   * Picker values for a map input keyed by an integration noun.
+   *
+   * @generated from rpc engram.app.v1.AutomationService.ListInputKeyOptions
+   */
+  listInputKeyOptions: {
+    methodKind: "unary";
+    input: typeof ListInputKeyOptionsRequestSchema;
+    output: typeof ListInputKeyOptionsResponseSchema;
+  },
+  /**
+   * ADR 0119 D5: the connector-declared event and action catalogs.
    *
    * @generated from rpc engram.app.v1.AutomationService.ListEventCatalog
    */
@@ -1517,6 +2166,48 @@ export const AutomationService: GenService<{
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_automation, 0);
+
+/**
+ * @generated from service engram.app.v1.AutomationRunService
+ */
+export const AutomationRunService: GenService<{
+  /**
+   * @generated from rpc engram.app.v1.AutomationRunService.ListRuns
+   */
+  listRuns: {
+    methodKind: "unary";
+    input: typeof ListRunsRequestSchema;
+    output: typeof ListRunsResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.AutomationRunService.GetRun
+   */
+  getRun: {
+    methodKind: "unary";
+    input: typeof GetRunRequestSchema;
+    output: typeof GetRunResponseSchema;
+  },
+  /**
+   * @generated from rpc engram.app.v1.AutomationRunService.StopRun
+   */
+  stopRun: {
+    methodKind: "unary";
+    input: typeof StopRunRequestSchema;
+    output: typeof StopRunResponseSchema;
+  },
+  /**
+   * A fresh run with the same trigger payload. `from_step_id` is recorded
+   * but v1 always re-runs from the start.
+   *
+   * @generated from rpc engram.app.v1.AutomationRunService.RetryRun
+   */
+  retryRun: {
+    methodKind: "unary";
+    input: typeof RetryRunRequestSchema;
+    output: typeof RetryRunResponseSchema;
+  },
+}> = /*@__PURE__*/
+  serviceDesc(file_engram_app_v1_automation, 1);
 
 /**
  * @generated from service engram.app.v1.WebhookRegistrationService
@@ -1558,5 +2249,5 @@ export const WebhookRegistrationService: GenService<{
     output: typeof ListWebhookEventsResponseSchema;
   },
 }> = /*@__PURE__*/
-  serviceDesc(file_engram_app_v1_automation, 1);
+  serviceDesc(file_engram_app_v1_automation, 2);
 
