@@ -521,7 +521,17 @@ export function applyOverrides(
 }
 
 /** The overrides a built-in edit produces: for each block, only the tunable
- * top-level keys whose effective value differs from the shipped version. */
+ * top-level keys whose effective value differs from the shipped version.
+ *
+ * An override is a VALUE layered over the shipped config (the server merges
+ * with spread and re-validates); there is no "unset" representation, and a
+ * literal null fails every `.optional()` string schema. So a field the user
+ * CLEARS (absent in the edit) is treated as "revert to shipped" — the key is
+ * omitted and the shipped value wins. Under the editing model that is the
+ * honest reading: a built-in's config is tuned, never made smaller than
+ * shipped. Expressing "unset a shipped value" would need a server-side
+ * sentinel; until then the Harness control labels the cleared state
+ * "Shipped default". */
 export function diffOverrides(
   shipped: AutomationDefinition,
   edited: AutomationDefinition,
@@ -532,10 +542,10 @@ export function diffOverrides(
     const base = shippedById.get(block.id);
     if (!base) continue;
     for (const key of base.tunable ?? []) {
-      const before = JSON.stringify(base.config[key] ?? null);
-      const after = JSON.stringify(block.config[key] ?? null);
-      if (before !== after) {
-        (out[block.id] ??= {})[key] = block.config[key] ?? null;
+      const after = block.config[key];
+      if (after === undefined) continue; // cleared → revert to shipped
+      if (JSON.stringify(base.config[key]) !== JSON.stringify(after)) {
+        (out[block.id] ??= {})[key] = after;
       }
     }
   }
