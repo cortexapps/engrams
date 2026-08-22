@@ -63,6 +63,23 @@ function fake(options: { deduplicate?: boolean; payload?: ReviewPostPayload } = 
   const targets: unknown[] = [];
   const passes: unknown[] = [];
   const cp: ReviewBlockControlPlane = {
+    async bootstrapFinderSession() {
+      calls.push("bootstrapFinderSession");
+    },
+    async bootstrapVerifierSession() {
+      calls.push("bootstrapVerifierSession");
+    },
+    async composeFinderPrompt() {
+      calls.push("composeFinderPrompt");
+      return { prompt: "finder prompt", mergeBase: BASE };
+    },
+    composeVerifierPrompt() {
+      calls.push("composeVerifierPrompt");
+      return { prompt: "verifier prompt" };
+    },
+    async markPhasePrompted(_reviewId, role) {
+      calls.push(`markPhasePrompted:${role}`);
+    },
     async resolvePrHeads() {
       calls.push("resolvePrHeads");
       return { headSha: HEAD, baseSha: BASE, pr: FULL_PR };

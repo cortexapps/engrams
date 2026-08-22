@@ -24,6 +24,7 @@
  */
 
 import { evaluateFilter, parseFilterGroup } from "./conditions.ts";
+import { isSafePath, ownPath } from "../paths.ts";
 import { buildRunContext, recordStepOutputs, type RunContext, type RunSnapshot } from "./context.ts";
 import type { EngineDeps } from "./deps.ts";
 import type { BlockDef, RetryPolicy } from "./definition.ts";
@@ -99,6 +100,46 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** `{ "$ref": "steps.x.y" }` → the JSON value at that scope path. Liquid can
+ * only produce strings; structured values from earlier blocks (an array of
+ * review comments, a PR-context object) pass by reference. */
+function asValueRef(value: unknown): string | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || keys[0] !== "$ref") return null;
+  const path = (value as { $ref: unknown }).$ref;
+  return typeof path === "string" && isSafePath(path) ? path : null;
+}
+
+/** Which config fields the interpreter leaves UNRENDERED: a wait block's
+ * session reference is resolved by the block (it reads its own outputs), a
+ * code block's source is JS not a template, and condition groups are data. */
+const UNRENDERED_FIELDS = new Set(["session", "source", "conditions", "until", "waitFor"]);
+
+async function resolveBlockConfig(
+  config: Record<string, unknown>,
+  ctx: RunContext,
+): Promise<Record<string, unknown>> {
+  const scope = ctx.scope();
+  const walk = async (value: unknown, top: boolean): Promise<unknown> => {
+    const ref = asValueRef(value);
+    if (ref !== null) return ownPath(scope, ref);
+    if (typeof value === "string") {
+      return value.includes("${{") ? ctx.render(value) : value;
+    }
+    if (Array.isArray(value)) return Promise.all(value.map((v) => walk(v, false)));
+    if (typeof value === "object" && value !== null) {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(value)) {
+        out[k] = top && UNRENDERED_FIELDS.has(k) ? v : await walk(v, false);
+      }
+      return out;
+    }
+    return value;
+  };
+  return (await walk(config, true)) as Record<string, unknown>;
+}
+
 /** A buffered message plus the turn bookkeeping stamped when it was first
  * received. Both stamps are pure functions of the checkpointed recv history,
  * so replay reproduces them exactly. */
@@ -140,6 +181,8 @@ export async function interpretAutomation(
   const ctx = buildRunContext(input.runId, snapshot, deps);
   const wait: WaitState = { buffer: [], clockSteps: 0 };
   const ledger: TurnLedger = { started: new Map(), idleSeen: new Map() };
+  /** Sessions an end_session block already ended (see finalize). */
+  const endedByBlock = new Set<string>();
 
   /** Stamp a freshly received message with its turn bookkeeping. */
   const annotate = (msg: AutomationInbox): BufferedEntry => {
@@ -328,14 +371,45 @@ export async function interpretAutomation(
       ctx.currentAttempt = attempt;
       const name = stepName(frames, attempt);
       const outcome: BlockOutcome = await deps.step(async () => {
+        // Resolve the config inside the step (checkpointed): `$ref` value
+        // references become the referenced scope value, and templated
+        // strings render. Blocks that render their own prompt/command fields
+        // see them already rendered (a no-op for a plain string).
+        let resolved: Record<string, unknown>;
+        try {
+          resolved = await resolveBlockConfig(block.config, ctx);
+          // Save-time validation skipped `$ref` fields; check the resolved
+          // shape against the block's schema before the executor sees it.
+          const checked = executor.configSchema.safeParse(resolved);
+          if (!checked.success) {
+            const issue = checked.error.issues[0];
+            throw new Error(
+              `resolved config invalid at ${issue ? issue.path.join(".") : "config"}: ${issue ? issue.message : "unknown"}`,
+            );
+          }
+          resolved = checked.data as Record<string, unknown>;
+        } catch (error) {
+          const failure: BlockOutcome = {
+            kind: "error",
+            code: "config_render_failed",
+            message: errorMessage(error),
+            retryable: false,
+          };
+          await deps.store.recordStep(input.runId, path, attempt, {
+            status: "failed",
+            inputs: block.config,
+            error: `${failure.code}: ${failure.message}`,
+          });
+          return failure;
+        }
         await deps.store.recordStep(input.runId, path, attempt, {
           status: "running",
-          inputs: block.config,
+          inputs: resolved,
         });
         let result: BlockOutcome;
         try {
           result = executor.execute
-            ? await executor.execute(block.config as never, ctx)
+            ? await executor.execute(resolved as never, ctx)
             : { kind: "ok", outputs: {} };
         } catch (error) {
           result = {
@@ -373,6 +447,10 @@ export async function interpretAutomation(
           ledger.started.set(outputSessionId, 1);
         } else if (block.type === "send_prompt") {
           ledger.started.set(outputSessionId, (ledger.started.get(outputSessionId) ?? 0) + 1);
+        } else if (block.type === "end_session" && outcome.outputs["ended"] === true) {
+          // Finalize skips what an explicit end_session already ended
+          // (replay-deterministic: read from the checkpointed outputs).
+          endedByBlock.add(outputSessionId);
         }
       }
 
@@ -432,7 +510,7 @@ export async function interpretAutomation(
   await deps.step(async () => {
     const sessions = await deps.store.listRunSessions(input.runId);
     for (const session of sessions) {
-      if (session.keep) continue;
+      if (session.keep || endedByBlock.has(session.sessionId)) continue;
       try {
         await deps.sessions.endSession(session.sessionId);
       } catch {

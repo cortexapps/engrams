@@ -980,7 +980,29 @@ impl OrchestratorDriver {
                             .ok_or_else(|| {
                                 format!("automation {automation_id} completed without a session: {detail}")
                             })?;
-                        return Ok(json!({ "runId": run_id, "sessionId": session_id }));
+                        // The rendered initial prompt is the create_session
+                        // step's `prompt` output. For a cron run the stored
+                        // trigger facts' `receivedAt` IS the scheduled
+                        // instant (the occurrence claim writes it so), and it
+                        // is what `${{ trigger.scheduled_for }}` rendered.
+                        // Both prove templating end to end, which is what
+                        // these tests are for.
+                        let step_outputs = detail["run"]["steps"]
+                            .as_array()
+                            .and_then(|steps| steps.iter().find(|s| s["blockId"] == "launch"))
+                            .and_then(|s| s["outputsJson"].as_str())
+                            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                            .unwrap_or(Value::Null);
+                        let trigger = detail["run"]["triggerJson"]
+                            .as_str()
+                            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                            .unwrap_or(Value::Null);
+                        return Ok(json!({
+                            "runId": run_id,
+                            "sessionId": session_id,
+                            "renderedPrompt": step_outputs["prompt"],
+                            "scheduledFor": trigger["receivedAt"],
+                        }));
                     }
                     Some("failed" | "filtered" | "deadline" | "halted" | "superseded") => {
                         return Err(format!(

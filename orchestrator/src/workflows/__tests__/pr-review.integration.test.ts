@@ -70,6 +70,9 @@ function recordingControlPlane(
     cleanupSupersededReview: async () => {
       rec("cleanupSupersededReview", undefined);
     },
+    composeFinderPrompt: async () => ({ prompt: "finder prompt", mergeBase: "" }),
+    composeVerifierPrompt: () => ({ prompt: "verifier prompt" }),
+    markPhasePrompted: async () => {},
     decideReviewResults: async () => {
       throw new Error("not used by the legacy workflow");
     },
