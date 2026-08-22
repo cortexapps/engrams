@@ -4,9 +4,9 @@
  * automation's `inputs_json`. Editable on EVERY automation, built-ins
  * included: inputs are the per-org knobs a locked graph exposes (the review
  * built-in's repos map, mention, categories, instructions…). Save posts the
- * whole value object through SetInputs. Value validation is CLIENT-side
- * (lib/automation-inputs.ts — see its header): the server currently rejects
- * only undeclared keys, and its errors route back by field key. */
+ * whole value object through SetInputs; the server re-validates values with
+ * the same rules and its errors route back by field key (and by row/field
+ * path for maps and lists). */
 
 import { ConnectError } from "@connectrpc/connect";
 import { Lock, RotateCcw } from "lucide-react";

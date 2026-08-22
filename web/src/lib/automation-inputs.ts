@@ -5,12 +5,13 @@
  * The schema is the `inputsSchema` array of the automation's current
  * version; the values are `inputs_json` on the automation row.
  *
- * Validation here is load-bearing, not a courtesy: today SetInputs rejects
- * only UNDECLARED keys server-side and stores values verbatim, and nothing
- * in the engine re-validates values at run time. Until server-side value
- * validation lands (tracked for the phase-4.3b orchestrator change), these
- * checks are the only guard on what a running automation receives. Do not
- * weaken them on the assumption the server backstops them. */
+ * Validation here is a courtesy for the form: the orchestrator re-validates
+ * VALUES on SetInputs/CreateAutomation/RunNow with the same rules
+ * (orchestrator/src/automations/inputs.ts — the two are pinned to each
+ * other by a shared-fixture test) and answers in `inputs.<key>[.path]:
+ * message` lines that inputErrorFromServer routes back to the field. The
+ * seeder and the run snapshot apply the same rules, so nothing reaches a
+ * running automation that this form would have refused. */
 
 export const INPUT_TYPES = [
   "string",
