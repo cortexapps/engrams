@@ -291,7 +291,6 @@ export function registerSlackRelayBlock(): void {
     system: true,
     outputs: ["session_id", "installed"],
     configSchema: slackRelayConfigSchema,
-    requiresSession: true,
     async execute(config, ctx) {
       if (states.has(ctx.runId)) {
         repoint(config, ctx);

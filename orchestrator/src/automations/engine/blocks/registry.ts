@@ -41,9 +41,6 @@ export interface BlockExecutor<C = unknown> {
   execute?(config: C, ctx: RunContext): Promise<BlockOutcome>;
   /** Wait half: the interpreter parks on recv and routes messages here. */
   wait?: BlockWaitSpec<C>;
-  /** When true the interpreter refuses to run the block without a resolvable
-   * session (config carries a SessionRef). */
-  requiresSession?: boolean;
   /** Installed message handler (contract 3). After this block's execute step
    * succeeds, the interpreter calls `onMessage` for EVERY mailbox message it
    * receives until the run ends — BEFORE the active wait's `matches` — each
