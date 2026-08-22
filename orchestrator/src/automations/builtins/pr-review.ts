@@ -389,6 +389,7 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
       key: "instructions",
       label: "Org instructions",
       type: "string",
+      multiline: true,
       help: "Free-text guidance rendered into the reviewer brief.",
       default: "",
     },

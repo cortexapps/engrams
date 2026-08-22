@@ -71,6 +71,8 @@ export const inputFieldSchema = z.object({
   default: z.unknown().optional(),
   /** enum: allowed values. */
   values: z.array(z.string()).optional(),
+  /** string: render a textarea (the web Inputs tab honors it). */
+  multiline: z.boolean().optional(),
   /** map: the integration noun that populates the key picker. */
   keyNoun: z.enum(["repository", "channel", "team"]).optional(),
   /** map: field specs for the value object; list: the element type. */
