@@ -9,12 +9,18 @@
  * runtime (sessions, commands, actions) contribute nothing to `steps.*` here;
  * a later block that references them renders with those values missing,
  * which the editor surfaces as a render error on that field.
+ *
+ * The one block that DOES run is `code`: it is pure and sandboxed (QuickJS,
+ * frozen JSON in, bounded JSON out, a time budget), so evaluating it is
+ * side-effect free, and the built-ins compute admission in a Code block —
+ * without its `steps.<id>.value` every filter after it would report a false
+ * "fail". Its row shows the value it produced, not its source.
  */
 
 import { evaluateFilter, parseFilterGroup, ConditionParseError } from "./conditions.ts";
 import { buildRunContext, type RunContext, type RunSnapshot } from "./context.ts";
 import type { AutomationDefinition, BlockDef } from "./definition.ts";
-import type { EngineDeps } from "./deps.ts";
+import type { CodeBlockRuntime, EngineDeps } from "./deps.ts";
 import { AutomationTemplateError } from "../template.ts";
 
 export interface PreviewBlockResult {
@@ -44,6 +50,8 @@ export interface PreviewInput {
   automationName: string;
   trigger: RunSnapshot["trigger"];
   aliases: RunSnapshot["aliases"];
+  /** When present, `code` blocks are evaluated (see the module comment). */
+  code?: CodeBlockRuntime;
 }
 
 /** Deps the preview needs: only `render` goes through the context, and the
@@ -165,6 +173,42 @@ export async function previewDefinition(input: PreviewInput): Promise<PreviewRes
         rendered,
         scope,
       };
+      if (block.type === "code") {
+        const config = block.config as { source: string; mode: "value" | "boolean" };
+        if (!input.code) {
+          blocks.push({ ...result, rendered: { mode: config.mode, value: null } });
+          ctx.steps[block.id] = {};
+          continue;
+        }
+        const run = await input.code.evaluate(
+          config.source,
+          { inputs: ctx.inputs, trigger: ctx.trigger, event: ctx.event, steps: ctx.steps },
+          config.mode,
+        );
+        if (!run.ok) {
+          errors.push({
+            blockId: block.id,
+            field: "source",
+            code: `code_${run.error.name.toLowerCase()}`,
+            message:
+              run.error.line !== undefined
+                ? `${run.error.message} (line ${run.error.line})`
+                : run.error.message,
+          });
+          blocks.push({ ...result, rendered: { mode: config.mode, value: null } });
+          return false;
+        }
+        const value = config.mode === "boolean" ? run.value === true : run.value;
+        ctx.steps[block.id] = { value };
+        blocks.push({
+          ...result,
+          rendered: { mode: config.mode, value },
+          // A boolean-mode code block is a filter: false ends the walk.
+          ...(config.mode === "boolean" ? { filterPass: value === true } : {}),
+        });
+        if (config.mode === "boolean" && value !== true) return false;
+        continue;
+      }
       if (block.type === "filter") {
         const pass = evaluate(block.id, block.config["conditions"]);
         result.filterPass = pass === true;

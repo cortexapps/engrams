@@ -138,3 +138,83 @@ describe("previewDefinition", () => {
     expect(res.blocks.map((b) => b.blockId)).toEqual(["launch", "after"]);
   });
 });
+
+import { makeCodeBlockRuntime } from "../../code/runtime.ts";
+import { SLACK_BRAIN_BUILTIN } from "../../builtins/slack-brain.ts";
+
+describe("previewDefinition — code blocks run (the editor's Test with sample)", () => {
+  const base = {
+    automationId: "a",
+    automationName: "Preview",
+    aliases: [],
+  };
+  const mention = {
+    team_id: "T1",
+    event_id: "Ev1",
+    event: { type: "app_mention", channel: "C1", user: "U1", ts: "100.1", text: "<@UBOT> summarize the incident" },
+  };
+  const trigger = (payload: Record<string, unknown>) => ({
+    kind: "integration" as const,
+    receivedAt: "2026-08-21T00:00:00Z",
+    eventKey: "app_mention",
+    payload,
+  });
+  const inputs = (channels: Record<string, string>) => ({
+    channels,
+    default_profile: "",
+    idle_timeout: 600,
+    max_turns: 5,
+  });
+
+  test("a code block's value feeds the filter after it; the row shows the value, not the source", async () => {
+    registerEngineBlocks();
+    const res = await previewDefinition({
+      ...base,
+      definition: SLACK_BRAIN_BUILTIN.definition,
+      inputs: inputs({ C1: "prof-a" }),
+      trigger: trigger(mention),
+      code: makeCodeBlockRuntime(),
+    });
+    const byId = Object.fromEntries(res.blocks.map((b) => [b.blockId, b]));
+    const facts = byId["facts"]!.rendered as { mode: string; value: Record<string, unknown> };
+    expect(facts.mode).toBe("value");
+    expect(facts.value["admit"]).toBe(true);
+    expect(facts.value["profile_id"]).toBe("prof-a");
+    expect(JSON.stringify(facts)).not.toContain("export default");
+    expect(byId["admit"]!.filterPass).toBe(true);
+    // The walk went on past the filter and rendered the session prompt.
+    expect(byId["session"]).toBeDefined();
+    expect(JSON.stringify(byId["session"]!.rendered)).toContain("summarize the incident");
+    // The only gap left is an EXECUTING block's output (the identity system
+    // block resolves the user at run time) — reported on the field, as documented.
+    expect(res.errors.map((e) => `${e.blockId}.${e.field}`)).toEqual(["session.ownerUserId"]);
+  });
+
+  test("an unflagged channel is a real fail at the filter, not a missing value", async () => {
+    registerEngineBlocks();
+    const res = await previewDefinition({
+      ...base,
+      definition: SLACK_BRAIN_BUILTIN.definition,
+      inputs: inputs({}),
+      trigger: trigger(mention),
+      code: makeCodeBlockRuntime(),
+    });
+    const byId = Object.fromEntries(res.blocks.map((b) => [b.blockId, b]));
+    expect((byId["facts"]!.rendered as { value: unknown }).value).toBeNull();
+    expect(byId["admit"]!.filterPass).toBe(false);
+    expect(byId["session"]).toBeUndefined();
+  });
+
+  test("without a runtime the code block is inert and reports a null value", async () => {
+    registerEngineBlocks();
+    const res = await previewDefinition({
+      ...base,
+      definition: SLACK_BRAIN_BUILTIN.definition,
+      inputs: inputs({ C1: "prof-a" }),
+      trigger: trigger(mention),
+    });
+    const byId = Object.fromEntries(res.blocks.map((b) => [b.blockId, b]));
+    expect(byId["facts"]!.rendered).toEqual({ mode: "value", value: null });
+    expect(byId["admit"]!.filterPass).toBe(false);
+  });
+});
