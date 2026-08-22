@@ -224,6 +224,15 @@ function* walkBlockTree(blocks: BlockDef[]): Generator<BlockDef> {
   }
 }
 
+/** Every block an override can target: the graph (depth-first) AND the
+ * finalize-hook blocks. The one list both the run-time merge and the
+ * built-in seeder's version-bump reconciliation walk — a hook block with a
+ * `tunable` field is editable exactly like a graph block. */
+export function* overrideTargets(definition: AutomationDefinition): Generator<BlockDef> {
+  yield* walkBlockTree(definition.blocks);
+  for (const hook of definition.settings.onFinalize ?? []) yield hook.block;
+}
+
 /** Validate overrides against a definition: every block id must exist, every
  * field must be listed in that block's `tunable`, and the merged config must
  * still satisfy the block's registered schema. Returns the merged definition
@@ -233,10 +242,7 @@ export function applyBlockOverrides(
   overrides: BlockOverrides,
 ): AutomationDefinition {
   const byId = new Map<string, BlockDef>();
-  for (const block of walkBlockTree(definition.blocks)) byId.set(block.id, block);
-  // Finalize hooks are tunable too (e.g. the review built-in's failure
-  // comment body).
-  for (const hook of definition.settings.onFinalize ?? []) byId.set(hook.block.id, hook.block);
+  for (const block of overrideTargets(definition)) byId.set(block.id, block);
 
   for (const [blockId, fields] of Object.entries(overrides)) {
     const block = byId.get(blockId);
