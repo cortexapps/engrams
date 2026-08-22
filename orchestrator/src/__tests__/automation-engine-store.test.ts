@@ -20,6 +20,8 @@ import {
   automationRun as automationRunTable,
 } from "../db/schema.ts";
 import type { AutomationRunTrigger } from "../db/schema.ts";
+import { interpretAutomation } from "../automations/engine/interpreter.ts";
+import type { EngineDeps } from "../automations/engine/deps.ts";
 
 const DB_URL = process.env["ORCHESTRATOR_DATABASE_URL"];
 const dbReachable = DB_URL ? await checkDb() : false;
@@ -171,11 +173,13 @@ describe("automation engine store (live PG)", () => {
   });
 
   test.skipIf(!dbReachable)(
-    "loadSnapshot fails the run BEFORE the walk when stored inputs violate the pinned schema (phase 4.3b)",
+    "a run on inputs the pinned schema rejects ends failed AND releases its concurrency claim (phase 4.3b)",
     async () => {
       // A built-in version bump that tightens a rule after the org saved its
       // values: the run must end `failed` with the routed reason, terminal
-      // and visible, never start on inputs the schema rejects.
+      // and visible, never start on inputs the schema rejects — and it must
+      // still go through finalize, or a queue|join|skip key stays held by
+      // the dead run forever (#1350 review finding).
       const id = `${AUTO_ID}-bad-inputs`;
       await seedAutomation(id);
       const db = getDb();
@@ -191,22 +195,58 @@ describe("automation engine store (live PG)", () => {
       `);
       const store = makeAutomationStore(db);
       const runId = `autorun:${id}:manual:1`;
-      await store.insertRun({
-        id: runId,
-        automationId: id,
-        version: 1,
-        trigger: TRIGGER,
-        deliveryKey: "manual:1",
-        concurrencyKey: null,
-        scheduledFor: null,
-      });
+      const queued = `autorun:${id}:manual:2`;
+      for (const [rid, key] of [
+        [runId, "manual:1"],
+        [queued, "manual:2"],
+      ] as const) {
+        await store.insertRun({
+          id: rid,
+          automationId: id,
+          version: 1,
+          trigger: TRIGGER,
+          deliveryKey: key,
+          concurrencyKey: "k",
+          scheduledFor: null,
+        });
+      }
+      expect(await store.claimConcurrency(id, "k", runId)).toEqual({ claimed: true });
 
       const engine = makeAutomationEngineStore();
       await expect(engine.loadSnapshot(runId)).rejects.toThrow(/inputs.limit: must be a number/);
+
+      const promoted: string[] = [];
+      const deps: EngineDeps = {
+        step: (fn) => fn(),
+        recv: async () => null,
+        store: engine,
+        sessions: {
+          createSession: () => Promise.reject(new Error("unused")),
+          setSessionRelay: () => Promise.reject(new Error("unused")),
+          sendPrompt: () => Promise.reject(new Error("unused")),
+          endSession: () => Promise.reject(new Error("unused")),
+          exec: () => Promise.reject(new Error("unused")),
+          writeFiles: () => Promise.reject(new Error("unused")),
+        },
+        clock: { nowMs: () => 0 },
+        startQueuedRun: async (rid) => {
+          promoted.push(rid);
+        },
+      };
+      const result = await interpretAutomation({ runId, automationId: id }, deps);
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("inputs.limit: must be a number");
+
       const run = await engine.getRun(runId);
       expect(run?.status).toBe("failed");
       expect(run?.error).toContain("inputs.limit: must be a number");
       expect(run?.endedAt).not.toBeNull();
+      // The claim moved to the queued successor and it was started.
+      expect(promoted).toEqual([queued]);
+      expect(await store.claimConcurrency(id, "k", "autorun:x")).toEqual({
+        claimed: false,
+        holderRunId: queued,
+      });
     },
   );
 
@@ -298,8 +338,12 @@ describe("automation engine store (live PG)", () => {
     }
     // CAS moves the claim only from the current holder.
     const holder = winners[0] === a ? "run-a" : "run-b";
+    // The peek reads the holder without claiming (a continue-only delivery).
+    expect(await store.getConcurrencyHolder(id, "pr-7")).toBe(holder);
+    expect(await store.getConcurrencyHolder(id, "pr-8")).toBeNull();
     expect(await store.casConcurrency(id, "pr-7", "run-neither", "run-c")).toBe(false);
     expect(await store.casConcurrency(id, "pr-7", holder, "run-c")).toBe(true);
+    expect(await store.getConcurrencyHolder(id, "pr-7")).toBe("run-c");
   });
 
   test.skipIf(!dbReachable)(

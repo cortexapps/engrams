@@ -24,6 +24,7 @@ import { makeEnrollmentStore } from "../../db/enrollments.ts";
 import { makeIntegrationConnectionStore } from "../../db/integration-connections.ts";
 import { isUniqueViolation } from "../../db/pg-errors.ts";
 import { log as rootLog } from "../../log.ts";
+import { overrideTargets } from "../engine/definition.ts";
 import type { AutomationDefinition, BlockDef, BlockOverrides, InputFieldSpec } from "../engine/definition.ts";
 import { validateInputValues } from "../inputs.ts";
 import {
@@ -33,6 +34,7 @@ import {
   type BuiltinAutomation,
 } from "../engine/builtins.ts";
 import { DEFAULT_CONNECTION_PLACEHOLDER, PR_REVIEW_BUILTIN, PR_REVIEW_BUILTIN_KEY } from "./pr-review.ts";
+import { SLACK_BRAIN_BUILTIN } from "./slack-brain.ts";
 
 const log = rootLog.child({ component: "builtin-seed" });
 
@@ -99,15 +101,6 @@ async function materialize(
     definition.trigger.connectionId = connection.id;
   }
   return definition;
-}
-
-function* walkBlocks(blocks: BlockDef[]): Generator<BlockDef> {
-  for (const block of blocks) {
-    yield block;
-    if (block.then) yield* walkBlocks(block.then);
-    if (block.else) yield* walkBlocks(block.else);
-    if (block.body) yield* walkBlocks(block.body);
-  }
 }
 
 /** The review enrollment lift: each legacy review_enrollment row becomes an
@@ -250,10 +243,11 @@ async function bumpVersion(
 
   // 2. Block overrides: three-way per block over the shipped-old/shipped-new
   //    configs; an override for a block the new version dropped is discarded.
+  //    Same target set as the run-time merge (graph + finalize hooks).
   const oldById = new Map<string, BlockDef>();
-  for (const block of walkBlocks(stored.blocks)) oldById.set(block.id, block);
+  for (const block of overrideTargets(stored)) oldById.set(block.id, block);
   const newById = new Map<string, BlockDef>();
-  for (const block of walkBlocks(shipped.blocks)) newById.set(block.id, block);
+  for (const block of overrideTargets(shipped)) newById.set(block.id, block);
   const reconciled: BlockOverrides = {};
   for (const [blockId, override] of Object.entries(existing.blockOverrides)) {
     const oldBlock = oldById.get(blockId);
@@ -289,6 +283,7 @@ export function registerShippedBuiltins(): void {
   if (registered) return;
   registered = true;
   registerBuiltinAutomation(PR_REVIEW_BUILTIN);
+  registerBuiltinAutomation(SLACK_BRAIN_BUILTIN);
 }
 
 /** Production wiring; fire-and-forget at boot next to the reviewer-profile seed. */

@@ -28,6 +28,35 @@ describe("validateDefinition", () => {
     expect(parsed.blocks[0]!.type).toBe("create_session");
   });
 
+  test("continueOnly must be a subset of eventKeys and needs policy join", () => {
+    const integration = (continueOnly: string[], policy?: "join" | "queue") =>
+      def({
+        trigger: {
+          kind: "integration",
+          provider: "slack",
+          connectionId: "c",
+          eventKeys: ["app_mention", "message"],
+          continueOnly,
+        },
+        settings: {
+          endSessionsOnFinish: false,
+          ...(policy ? { concurrency: { keyTemplate: "k", policy } } : {}),
+        },
+      } as Partial<AutomationDefinition>);
+    expect(validateDefinition(integration(["message"], "join"), { kind: "user" }).trigger).toMatchObject({
+      continueOnly: ["message"],
+    });
+    expect(() => validateDefinition(integration(["reaction_added"], "join"), { kind: "user" })).toThrow(
+      /continueOnly event "reaction_added" is not one of the trigger's eventKeys/,
+    );
+    expect(() => validateDefinition(integration(["message"], "queue"), { kind: "user" })).toThrow(
+      /continueOnly needs settings.concurrency.policy "join"/,
+    );
+    expect(() => validateDefinition(integration(["message"]), { kind: "user" })).toThrow(
+      /continueOnly needs settings.concurrency.policy "join"/,
+    );
+  });
+
   test("rejects duplicate block ids across nesting", () => {
     const raw = def({
       blocks: [

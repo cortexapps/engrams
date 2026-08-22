@@ -29,9 +29,16 @@ export type FilterBlockConfig = z.infer<typeof filterConfigSchema>;
 export const branchConfigSchema = z.object({ conditions: conditionGroup });
 export type BranchBlockConfig = z.infer<typeof branchConfigSchema>;
 
+/** `$ref` lets a built-in bound a loop by an input (`inputs.max_turns`);
+ * the interpreter resolves and clamps it in the loop's bound step. */
+const loopBound = z.union([
+  z.number().int().min(1).max(MAX_LOOP_ITERATIONS),
+  z.object({ $ref: z.string().min(1) }),
+]);
+
 export const loopConfigSchema = z.object({
   until: conditionGroup.optional(),
-  maxIterations: z.number().int().min(1).max(MAX_LOOP_ITERATIONS),
+  maxIterations: loopBound,
 });
 export type LoopBlockConfig = z.infer<typeof loopConfigSchema>;
 

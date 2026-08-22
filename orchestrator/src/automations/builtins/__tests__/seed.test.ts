@@ -172,6 +172,13 @@ describe("seedBuiltinAutomations", () => {
     // Stored: the current shipped definition with org edits layered on.
     const stored = structuredClone(PR_REVIEW_BUILTIN.definition);
     if (stored.trigger.kind === "integration") stored.trigger.connectionId = "conn-github";
+    // A tunable field on a finalize-hook block: its override must survive a
+    // bump like a graph block's (the seeder walks the same target set).
+    const markHookTunable = (d: typeof stored) => {
+      const hook = d.settings.onFinalize!.find((h) => h.block.id === "report_failure")!;
+      hook.block.tunable = ["reason"];
+    };
+    markHookTunable(stored);
     const h = harness({
       existing: {
         definition: stored,
@@ -181,6 +188,8 @@ describe("seedBuiltinAutomations", () => {
           find: { deadlineSeconds: 900 },
           // Equal to the OLD shipped default — not an edit; follows the new default.
           verify: { deadlineSeconds: 7200 },
+          // A real edit on a finalize-hook block — kept.
+          report_failure: { reason: "custom: ${{ run.error }}" },
         },
       },
     });
@@ -191,6 +200,7 @@ describe("seedBuiltinAutomations", () => {
       ...PR_REVIEW_BUILTIN,
       definition: (() => {
         const d = structuredClone(PR_REVIEW_BUILTIN.definition);
+        markHookTunable(d);
         const then = d.blocks.find((b) => b.id === "has_candidates")!.then!;
         const verify = then.find((b) => b.id === "verify")!;
         verify.config = { ...verify.config, deadlineSeconds: 3600 };
@@ -212,7 +222,10 @@ describe("seedBuiltinAutomations", () => {
     expect(row.inputs["repos"]).toEqual({ "acme/app": { mode: "auto", autofix: false } });
     expect(row.inputs["new_knob"]).toBe("x");
     // Overrides: the real edit survives; the un-edited one follows the new default.
-    expect(row.blockOverrides).toEqual({ find: { deadlineSeconds: 900 } });
+    expect(row.blockOverrides).toEqual({
+      find: { deadlineSeconds: 900 },
+      report_failure: { reason: "custom: ${{ run.error }}" },
+    });
   });
 
   test("content hash ignores key order and is stable", () => {

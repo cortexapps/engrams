@@ -15,6 +15,9 @@ import { getBlock, isSystemBlockType } from "./blocks/registry.ts";
 export const ENGINE_VERSION = 1;
 export const MAX_BLOCKS = 64;
 export const MAX_LOOP_ITERATIONS = 100;
+/** The ceiling every wait block's `deadlineSeconds` schema enforces, and
+ * the clamp the interpreter applies to a `$ref`-resolved deadline. */
+export const MAX_WAIT_DEADLINE_S = 24 * 3600;
 
 // ---------------------------------------------------------------------------
 // Triggers
@@ -46,6 +49,13 @@ const integrationTrigger = z.object({
       z.object({ fromInput: z.string().min(1) }),
     ])
     .optional(),
+  /** Event keys that only CONTINUE an active run (delivered into the
+   * concurrency holder's mailbox under policy `join`) and never open one:
+   * with no active run for the key, the delivery is dropped at admission.
+   * The conversation-shaped built-ins use it — a Slack thread reply belongs
+   * to a thread the bot was mentioned in, or to nobody. Must be a subset of
+   * `eventKeys`, and requires `settings.concurrency.policy: "join"`. */
+  continueOnly: z.array(z.string().min(1)).optional(),
 });
 
 const manualTrigger = z.object({ kind: z.literal("manual") });
@@ -71,6 +81,12 @@ export const inputFieldSchema = z.object({
   default: z.unknown().optional(),
   /** enum: allowed values. */
   values: z.array(z.string()).optional(),
+  /** number: inclusive bounds, enforced on every value write (SetInputs,
+   * the seeder, the run snapshot) and mirrored by the web Inputs tab. A
+   * block that consumes the input through a `$ref` has its own schema
+   * ceiling; bounding the input is what makes a saved value always run. */
+  min: z.number().optional(),
+  max: z.number().optional(),
   /** string: render a textarea (the web Inputs tab honors it). */
   multiline: z.boolean().optional(),
   /** map: the integration noun that populates the key picker. */
@@ -224,6 +240,15 @@ function* walkBlockTree(blocks: BlockDef[]): Generator<BlockDef> {
   }
 }
 
+/** Every block an override can target: the graph (depth-first) AND the
+ * finalize-hook blocks. The one list both the run-time merge and the
+ * built-in seeder's version-bump reconciliation walk — a hook block with a
+ * `tunable` field is editable exactly like a graph block. */
+export function* overrideTargets(definition: AutomationDefinition): Generator<BlockDef> {
+  yield* walkBlockTree(definition.blocks);
+  for (const hook of definition.settings.onFinalize ?? []) yield hook.block;
+}
+
 /** Validate overrides against a definition: every block id must exist, every
  * field must be listed in that block's `tunable`, and the merged config must
  * still satisfy the block's registered schema. Returns the merged definition
@@ -233,10 +258,7 @@ export function applyBlockOverrides(
   overrides: BlockOverrides,
 ): AutomationDefinition {
   const byId = new Map<string, BlockDef>();
-  for (const block of walkBlockTree(definition.blocks)) byId.set(block.id, block);
-  // Finalize hooks are tunable too (e.g. the review built-in's failure
-  // comment body).
-  for (const hook of definition.settings.onFinalize ?? []) byId.set(hook.block.id, hook.block);
+  for (const block of overrideTargets(definition)) byId.set(block.id, block);
 
   for (const [blockId, fields] of Object.entries(overrides)) {
     const block = byId.get(blockId);
@@ -413,7 +435,11 @@ export function validateDefinition(
 
   const seen = new Set<string>();
   let count = 0;
-  const installers: string[] = [];
+  /** Contract 3: one message handler per run. Several blocks may carry it
+   * as long as they are the SAME type — a later one (a loop body re-pointing
+   * the Slack relay at a new turn) is a re-point of the installed handler,
+   * never a second install (the interpreter enforces the same executor). */
+  const installers: Array<{ id: string; type: string }> = [];
   const checkBlock = (block: BlockDef, hook: boolean): void => {
     count += 1;
     if (count > MAX_BLOCKS) {
@@ -473,14 +499,15 @@ export function validateDefinition(
           `block type "${block.type}" installs a message handler; not allowed in a finalize hook`,
         );
       }
-      installers.push(block.id);
-      if (installers.length > 1) {
+      const first = installers[0];
+      if (first !== undefined && first.type !== block.type) {
         throw new DefinitionError(
           block.id,
           "type",
-          `only one message-handler block per automation (already: "${installers[0]}")`,
+          `only one message-handler type per automation (already: "${first.id}" of type "${first.type}")`,
         );
       }
+      installers.push({ id: block.id, type: block.type });
     }
     if (hook) {
       // A finalize hook runs inside the finalize step: nothing may park on
@@ -508,6 +535,25 @@ export function validateDefinition(
 
   if (definition.settings.concurrency) {
     validateTemplatesIn("__settings__", definition.settings.concurrency.keyTemplate, "concurrency.keyTemplate");
+  }
+  if (definition.trigger.kind === "integration" && definition.trigger.continueOnly !== undefined) {
+    const trigger = definition.trigger;
+    for (const key of definition.trigger.continueOnly) {
+      if (!trigger.eventKeys.includes(key)) {
+        throw new DefinitionError(
+          "__trigger__",
+          "continueOnly",
+          `continueOnly event "${key}" is not one of the trigger's eventKeys`,
+        );
+      }
+    }
+    if (definition.settings.concurrency?.policy !== "join") {
+      throw new DefinitionError(
+        "__trigger__",
+        "continueOnly",
+        "continueOnly needs settings.concurrency.policy \"join\" (a continue-only event joins the active run's mailbox)",
+      );
+    }
   }
 
   return definition;

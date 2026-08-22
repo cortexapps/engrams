@@ -47,8 +47,8 @@ export function registerIntegrationActionBlock(): void {
           retryable: false,
         };
       }
-      if (ctx.currentBlockId === undefined) {
-        return { kind: "error", code: "engine_bug", message: "currentBlockId missing", retryable: false };
+      if (ctx.currentPath === undefined) {
+        return { kind: "error", code: "engine_bug", message: "currentPath missing", retryable: false };
       }
       const params = await renderParams(config.params, (t) => ctx.render(t));
       if (ctx.dryRun) {
@@ -75,7 +75,7 @@ export function registerIntegrationActionBlock(): void {
           ...(config.connectionId !== undefined ? { connectionId: config.connectionId } : {}),
           params,
           runId: ctx.runId,
-          blockId: ctx.currentBlockId,
+          stepPath: ctx.currentPath,
         });
       } catch (error) {
         // The runtime raises typed errors carrying `permanent` (see

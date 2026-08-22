@@ -176,3 +176,26 @@ describe("validateInputValues — every rule", () => {
     );
   });
 });
+
+describe("validateInputValues — number bounds", () => {
+  const schema: InputFieldSpec[] = [
+    { key: "idle_timeout", label: "Idle", type: "number", min: 60, max: 86400 },
+    { key: "floor_only", label: "Floor", type: "number", min: 1 },
+    { key: "cap_only", label: "Cap", type: "number", max: 10 },
+  ];
+  test("in range passes; out of range is a range error with the web's wording", () => {
+    expect(validateInputValues(schema, { idle_timeout: 3600, floor_only: 1, cap_only: 10 })).toEqual([]);
+    expect(validateInputValues(schema, { idle_timeout: 90_000 })).toEqual([
+      { key: "idle_timeout", code: "range", message: "must be between 60 and 86400" },
+    ]);
+    expect(validateInputValues(schema, { idle_timeout: 5 })).toEqual([
+      { key: "idle_timeout", code: "range", message: "must be between 60 and 86400" },
+    ]);
+    expect(validateInputValues(schema, { floor_only: 0 })).toEqual([
+      { key: "floor_only", code: "range", message: "must be at least 1" },
+    ]);
+    expect(validateInputValues(schema, { cap_only: 11 })).toEqual([
+      { key: "cap_only", code: "range", message: "must be at most 10" },
+    ]);
+  });
+});

@@ -37,6 +37,8 @@
  * step row, and the run's status stands — there is no pass to report on.
  */
 
+import { config } from "../../config.ts";
+import { normalizeMentionHandle } from "../../integrations/github-webhook.ts";
 import { PR_REVIEWER_DESIGNATION } from "../../reviewers/seed-profile.ts";
 import { REVIEW_CATEGORIES } from "../../reviewers/render.ts";
 import {
@@ -374,7 +376,7 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
       key: "mention",
       label: "Mention handle",
       type: "string",
-      help: 'The handle a comment must mention to request a review, e.g. "@engrams review".',
+      help: 'The handle a comment must mention to request a review, e.g. "@engrams-agent review". Defaults to the review App\'s login.',
       default: "@engrams",
     },
     {
@@ -438,6 +440,16 @@ export const PR_REVIEW_DEFINITION: AutomationDefinition = {
   },
 };
 
+/** The seeded `mention` default: the review App's own login
+ * (`GITHUB_APP_LOGIN`, the same handle the legacy route matches), so a
+ * fresh deployment answers `@<app> review` out of the box. A deployment
+ * without an App login gets the historical placeholder. The org can still
+ * edit the input afterwards; the seeder never overwrites an org value. */
+export function defaultMentionHandle(appLogin: string = config.githubAppLogin): string {
+  const slug = normalizeMentionHandle(appLogin);
+  return slug ? `@${slug}` : "@engrams";
+}
+
 export const PR_REVIEW_BUILTIN: BuiltinAutomation = {
   key: PR_REVIEW_BUILTIN_KEY,
   name: "PR review",
@@ -449,7 +461,7 @@ export const PR_REVIEW_BUILTIN: BuiltinAutomation = {
     return {
       repos: {},
       profile: PR_REVIEWER_DESIGNATION,
-      mention: "@engrams",
+      mention: defaultMentionHandle(),
       categories: [...REVIEW_CATEGORIES],
       instructions: "",
     };

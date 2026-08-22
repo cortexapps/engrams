@@ -19,6 +19,11 @@ import { getDb } from "../db/client.ts";
 import { user as userTable } from "../db/schema.ts";
 import { getSlackClient } from "./slack.ts";
 
+/** What the thread gets when its author has no engrams user (legacy
+ * slack-thread.ts and the engine's `system.slack_resolve_user` post the same
+ * sentence). */
+export const NO_USER_MSG = "You don't have a user in engrams — log in first, then try again.";
+
 export interface ResolveIdentityDeps {
   /** Override the Slack client (tests inject a fake; default = getSlackClient()). */
   slack?: WebClient;

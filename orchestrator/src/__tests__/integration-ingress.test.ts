@@ -35,7 +35,7 @@ function fakeStore() {
       if (!duplicate) recorded.push(input);
       return { recorded: !duplicate };
     },
-    async sweepExpired() {
+    async sweep() {
       return 0;
     },
     async list() {
@@ -68,6 +68,7 @@ function seams() {
       connectionIdFor: async (provider: string) => `conn-${provider}`,
       dispatch: async (input: IntegrationEventDispatchInput) => {
         dispatched.push(input);
+        return undefined;
       },
     },
   };

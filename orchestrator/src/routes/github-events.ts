@@ -58,11 +58,23 @@ export interface GithubEventsDeps {
   /** The review App's @-mention handle (its slug). Defaults to the deployment's
    *  GITHUB_APP_LOGIN; blank disables mention commands. */
   mentionHandle?: string;
+  /** ADR 0119 phase 4.4: the kill switch. When true, every repo reviews on the
+   *  legacy path regardless of its `engine` flag. Defaults to the config value. */
+  reviewAutomationDisabled?: boolean;
 }
 
 export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
   const webhookSecret = deps.webhookSecret ?? getGithubWebhookSecret;
   const mentionHandle = deps.mentionHandle ?? config.githubAppLogin;
+  const reviewAutomationDisabled = deps.reviewAutomationDisabled ?? config.reviewAutomationDisabled;
+  // A repo reviews on the built-in engine when its enrollment says so AND the
+  // fleet-wide kill switch is off. The ingress spine has already ledgered the
+  // delivery and dispatchIntegrationEvent routes it to the built-in, whose
+  // inputs.repos filter admits the repo — so on this path the legacy start is
+  // simply skipped (the target is still refreshed so the dossier stays current).
+  const onAutomationEngine = (
+    enrollment: { engine: "legacy" | "automation" } | null | undefined,
+  ): boolean => enrollment?.engine === "automation" && !reviewAutomationDisabled;
   let enrollmentStore = deps.enrollments;
   const enrollments = (): Pick<EnrollmentStore, "get"> =>
     (enrollmentStore ??= makeEnrollmentStore());
@@ -196,6 +208,29 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
         );
         return c.body(null, 200);
       }
+      if (onAutomationEngine(enrollment)) {
+        // The built-in engine reviews this repo: the spine dispatched the
+        // delivery to it already. Keep the dossier target fresh (same as the
+        // non-starting path) and skip the legacy ingress.
+        if (event.pr.providerId !== null) {
+          await refreshTarget({
+            provider: "github",
+            providerId: event.pr.providerId,
+            repo: event.repo,
+            number: event.prNumber,
+            title: event.pr.title,
+            author: event.pr.author,
+            state: event.pr.state,
+            url: event.pr.url,
+            providerUpdatedAt: event.pr.providerUpdatedAt,
+          });
+        }
+        log.info(
+          { repo: event.repo, prNumber: event.prNumber, action: event.action },
+          "github PR review runs on the automation engine; legacy ingress skipped",
+        );
+        return c.body(null, 200);
+      }
       // The delivery already describes the change in full, so ingress starts a
       // review without asking GitHub anything (ADR 0100 decision 11).
       await startIngress({
@@ -236,6 +271,15 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
     }
 
     if (command.kind === "review") {
+      if (onAutomationEngine(enrollment)) {
+        // The @mention delivery was ledgered and dispatched to the built-in,
+        // whose filter admits the `^@engrams review` comment. Nothing to start.
+        log.info(
+          { repo: event.repo, prNumber: event.prNumber },
+          "github review command runs on the automation engine; legacy ingress skipped",
+        );
+        return c.body(null, 200);
+      }
       // An issue_comment payload describes the ISSUE, and `issue.id` is the
       // issue's id, not the pull request's. So ingress must resolve this one.
       await startIngress({

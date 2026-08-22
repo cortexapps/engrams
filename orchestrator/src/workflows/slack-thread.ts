@@ -30,6 +30,7 @@ import { DBOS } from "@dbos-inc/dbos-sdk";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
+import { NO_USER_MSG } from "../integrations/slack-identity.ts";
 import {
   routeSessionEvent,
   summarizeAsset,
@@ -101,8 +102,6 @@ function requireControlPlane(): ThreadControlPlane {
  *  for a long time between events; the listener sends the terminal. */
 const RECV_TIMEOUT_S = 3_600;
 
-const NO_USER_MSG =
-  "You don't have a user in engrams — log in first, then try again.";
 const NO_PROFILES_MSG = "No profiles are configured — create one in engrams first.";
 const CREATE_FAIL_MSG = "Couldn't start a session for this request.";
 const SESSION_FAILED_MSG = "The session ended in failure.";

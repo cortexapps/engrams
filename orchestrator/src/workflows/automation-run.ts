@@ -28,6 +28,7 @@ import {
 } from "../db/automations.ts";
 import { getDb } from "../db/client.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
+import { makeUserSecretStore } from "../db/user-secrets.ts";
 import { makeProfileStore } from "../db/profiles.ts";
 import {
   createSessionForExistingTask,
@@ -110,9 +111,11 @@ export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): E
           connectors: { list: () => makeConnectorStore(database).list() },
           harnessCatalog: productionHarnessCatalogClient(),
           sessions: defaultSessions,
-          // With no owner, the shared helper deliberately ignores personal
-          // tokens and selects the harness's programmatic org credential.
-          secrets: { get: async () => null, getAll: async () => ({}) },
+          // With no owner (the default), the shared helper ignores this
+          // store and selects the harness's programmatic org credential. A
+          // block that names an owner (the Slack brain's identity gate)
+          // gets that user's tokens, as the legacy thread workflow did.
+          secrets: makeUserSecretStore(database),
           db: database,
         },
         params,
@@ -131,6 +134,7 @@ export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): E
           automationId: input.automationId,
           runId: input.runId,
         },
+        ...(input.ownerUserId !== undefined ? { createdByUserId: input.ownerUserId } : {}),
       });
       // A replayed/retried primary launch reuses the task's primary session.
       if (input.role === "primary") {
@@ -142,6 +146,7 @@ export function makeProductionSessionOps(deps: ProductionSessionOpsDeps = {}): E
         taskType: "automation",
         profileId: input.profileId,
         integrationPrincipalId: `automation:${input.automationId}`,
+        ...(input.ownerUserId !== undefined ? { ownerUserId: input.ownerUserId } : {}),
         role: input.role,
         prompt: input.prompt,
         ...(input.harnessMode !== undefined ? { harnessMode: input.harnessMode } : {}),
@@ -264,7 +269,7 @@ export async function automationRunWorkflowImpl(
   // ADR 0119 D2: bump on ANY change to step naming, step order, recv
   // semantics, or finalize position anywhere in the engine. The literal lives
   // in this registered body so the bump rotates the DBOS application version.
-  const ENGINE_STEP_CONTRACT = 3;
+  const ENGINE_STEP_CONTRACT = 4;
   const engine = deps.engine ?? productionEngineDeps();
   return interpretAutomation(
     { runId: input.runId, automationId: input.automationId, contract: ENGINE_STEP_CONTRACT },

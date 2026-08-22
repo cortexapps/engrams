@@ -280,6 +280,9 @@ export interface AutomationCronStore {
     concurrencyKey: string,
     runId: string,
   ): Promise<ConcurrencyClaimResult>;
+  /** The run holding the key, or null — a read, never a claim (a
+   * continue-only delivery must not leave a phantom claim behind). */
+  getConcurrencyHolder(automationId: string, concurrencyKey: string): Promise<string | null>;
   casConcurrency(
     automationId: string,
     concurrencyKey: string,
@@ -317,6 +320,9 @@ export interface AutomationDispatchStore {
     concurrencyKey: string,
     runId: string,
   ): Promise<ConcurrencyClaimResult>;
+  /** The run holding the key, or null — a read, never a claim (a
+   * continue-only delivery must not leave a phantom claim behind). */
+  getConcurrencyHolder(automationId: string, concurrencyKey: string): Promise<string | null>;
   casConcurrency(
     automationId: string,
     concurrencyKey: string,
@@ -334,6 +340,8 @@ export interface AutomationEngineStore extends EngineRunStore {
     automationId: string;
     title: string | null;
     source: Record<string, unknown>;
+    /** The task's owner (CASL subject); null = the automation itself. */
+    createdByUserId?: string | null;
   }): Promise<string>;
   getAutomationTaskSession(runId: string): Promise<string | null>;
   recordSessionBinding(input: {
@@ -1043,6 +1051,20 @@ export function makeAutomationStore(
       return { claimed: false, holderRunId: holder.runId };
     },
 
+    async getConcurrencyHolder(automationId, concurrencyKey) {
+      const [holder] = await db
+        .select({ runId: claimTable.runId })
+        .from(claimTable)
+        .where(
+          and(
+            eq(claimTable.automationId, automationId),
+            eq(claimTable.concurrencyKey, concurrencyKey),
+          ),
+        )
+        .limit(1);
+      return holder?.runId ?? null;
+    },
+
     async casConcurrency(automationId, concurrencyKey, fromRunId, toRunId) {
       const rows = await db
         .update(claimTable)
@@ -1271,19 +1293,12 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
 
       // ADR 0119 phase 4.3b: a run must never start on inputs the pinned
       // schema rejects (e.g. a built-in version bump tightened a rule after
-      // the org saved its values). Fail the run row HERE, before the walk,
-      // so it is terminal and visible; the workflow's thrown error then
-      // replays as a no-op against a finalized row.
+      // the org saved its values). Throw: the interpreter turns a snapshot
+      // failure into the normal finalize (terminal `failed` row + concurrency
+      // release), so the row is visible AND the key is free.
       const resolvedInputs = resolveAutomationInputs(version.inputsSchema, meta.inputs);
       const inputErrors = validateInputValues(version.inputsSchema, resolvedInputs);
-      if (inputErrors.length > 0) {
-        const error = new InputValidationError(inputErrors);
-        await db
-          .update(automationRunTable)
-          .set({ status: "failed", error: error.message, endedAt: now(), leaseOwner: null, leaseExpiresAt: null })
-          .where(eq(automationRunTable.id, runId));
-        throw error;
-      }
+      if (inputErrors.length > 0) throw new InputValidationError(inputErrors);
 
       return {
         definition,
@@ -1424,7 +1439,7 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
             type: "automation",
             title: input.title,
             status: "working",
-            createdByUserId: null,
+            createdByUserId: input.createdByUserId ?? null,
             source: input.source,
           })
           .onConflictDoNothing();

@@ -207,6 +207,9 @@ function makeHarness(targets: DispatchTarget[]): Harness {
       }
       return { claimed: false, holderRunId: holder };
     },
+    async getConcurrencyHolder(automationId, key) {
+      return claims.get(`${automationId}:${key}`) ?? null;
+    },
     async casConcurrency(automationId, key, fromRunId, toRunId) {
       const mapKey = `${automationId}:${key}`;
       if (claims.get(mapKey) !== fromRunId) return false;
@@ -263,7 +266,15 @@ describe("dispatchIntegrationEvent", () => {
       deps(h),
     );
 
-    expect(result).toEqual({ matched: 1, started: 1, joined: 0, queued: 0, skipped: 0, failed: 0 });
+    expect(result).toEqual({
+      matched: 1,
+      started: 1,
+      joined: 0,
+      queued: 0,
+      skipped: 0,
+      failed: 0,
+      builtins: {},
+    });
     expect(h.starts).toEqual([
       {
         runId: "autorun:automation-1:github:gh-delivery-1",
@@ -323,6 +334,143 @@ describe("dispatchIntegrationEvent", () => {
     expect(second).toMatchObject({ queued: 1, started: 0 });
     const pending = h.runs.get("autorun:automation-1:github:gh-delivery-2")!;
     expect(pending.status).toBe("pending");
+  });
+
+  test("a continue-only event joins an active run or is dropped — it never opens one", async () => {
+    // The Slack thread brain's shape: app_mention opens a thread run (join
+    // policy, one run per thread); a `message` reply only continues it. A
+    // reply in a thread the bot was never mentioned in must not become a
+    // fresh run (the legacy brain only engaged app_mention-opened threads).
+    const threadKey = "${{ event.raw.event.thread_ts | default: event.raw.event.ts }}";
+    const brain = {
+      automation: meta({ id: "slack-brain", kind: "builtin", builtinKey: "slack_brain" }),
+      definition: {
+        ...definition(
+          trigger({
+            provider: "slack",
+            eventKeys: ["app_mention", "message"],
+            continueOnly: ["message"],
+          }),
+        ),
+        settings: {
+          endSessionsOnFinish: false,
+          concurrency: { keyTemplate: threadKey, policy: "join" as const },
+        },
+      },
+    };
+    const h = makeHarness([brain]);
+    const sent: Array<{ runId: string; deliveryKey: string }> = [];
+    const d = {
+      ...deps(h),
+      sender: {
+        async send(runId: string, msg: { kind: string; deliveryKey?: string }) {
+          sent.push({ runId, deliveryKey: msg.deliveryKey ?? "" });
+        },
+      },
+    };
+    const slack = (eventKey: string, deliveryId: string, event: Record<string, unknown>) =>
+      input({ provider: "slack", eventKey, deliveryId, payload: { event } });
+
+    // A reply in a thread nobody opened: dropped — no run row, no claim, no send.
+    const stray = await dispatchIntegrationEvent(
+      slack("message", "d-stray", { ts: "5.2", thread_ts: "5.0", text: "hi" }),
+      d,
+    );
+    expect(stray).toMatchObject({ matched: 1, skipped: 1, started: 0, joined: 0 });
+    expect(h.runs.size).toBe(0);
+    expect(h.starts).toEqual([]);
+    expect(sent).toEqual([]);
+    expect(await h.store.getConcurrencyHolder("slack-brain", "5.0")).toBeNull();
+
+    // The mention opens the thread run …
+    const opened = await dispatchIntegrationEvent(
+      slack("app_mention", "d-open", { ts: "7.0", text: "<@bot> hello" }),
+      d,
+    );
+    expect(opened).toMatchObject({ started: 1, builtins: { slack_brain: "started" } });
+    const runId = h.starts[0]!.runId;
+
+    // … and a reply in THAT thread joins it (delivered into its mailbox).
+    const reply = await dispatchIntegrationEvent(
+      slack("message", "d-reply", { ts: "7.1", thread_ts: "7.0", text: "and?" }),
+      d,
+    );
+    expect(reply).toMatchObject({ joined: 1, builtins: { slack_brain: "joined" } });
+    expect(sent).toEqual([{ runId, deliveryKey: "slack:d-reply" }]);
+    expect(h.runs.size).toBe(1);
+  });
+
+  test("a kill-switched built-in never admits a run, so a flagged repo is not served by both brains", async () => {
+    // With ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED on, the GitHub route falls
+    // back to the legacy review graph. If the dispatcher still delivered to
+    // the enabled built-in, a flagged repo would get TWO reviews. The switch
+    // gates the trigger path too; a user automation on the same event is
+    // unaffected.
+    const builtin = {
+      automation: meta({ id: "builtin-review", kind: "builtin", builtinKey: "pr_review" }),
+      definition: definition(trigger()),
+    };
+    const user = { automation: meta({ id: "user-auto" }), definition: definition(trigger()) };
+    const h = makeHarness([builtin, user]);
+
+    const off = await dispatchIntegrationEvent(input(), {
+      ...deps(h),
+      disabledBuiltins: new Set<string>(),
+    });
+    expect(off.started).toBe(2);
+    // The per-built-in tally is what a legacy route consults (the Slack
+    // window): the built-in's own admission outcome, user automations absent.
+    expect(off.builtins).toEqual({ pr_review: "started" });
+
+    const h2 = makeHarness([builtin, user]);
+    const on = await dispatchIntegrationEvent(input(), {
+      ...deps(h2),
+      disabledBuiltins: new Set(["pr_review"]),
+    });
+    expect(on).toMatchObject({ matched: 1, started: 1, builtins: {} });
+    expect(h2.starts.map((s) => s.automationId)).toEqual(["user-auto"]);
+
+    // The Slack switch registers its key the same way (4.6).
+    const slack = {
+      automation: meta({ id: "builtin-slack", kind: "builtin", builtinKey: "slack_brain" }),
+      definition: definition(trigger()),
+    };
+    const h3 = makeHarness([slack, user]);
+    const slackOff = await dispatchIntegrationEvent(input(), {
+      ...deps(h3),
+      disabledBuiltins: new Set(["slack_brain"]),
+    });
+    expect(slackOff).toMatchObject({ matched: 1, started: 1, builtins: {} });
+    expect(h3.starts.map((s) => s.automationId)).toEqual(["user-auto"]);
+  });
+
+  test("builtinTookDelivery: started/joined/queued = the engine owns it; absent or skipped = legacy", async () => {
+    const { builtinTookDelivery } = await import("../dispatch.ts");
+    const base = { matched: 1, started: 0, joined: 0, queued: 0, skipped: 0, failed: 0 };
+    expect(builtinTookDelivery(undefined, "slack_brain")).toBe(false);
+    expect(builtinTookDelivery({ ...base, builtins: {} }, "slack_brain")).toBe(false);
+    expect(builtinTookDelivery({ ...base, builtins: { slack_brain: "skipped" } }, "slack_brain")).toBe(false);
+    expect(builtinTookDelivery({ ...base, builtins: { slack_brain: "started" } }, "slack_brain")).toBe(true);
+    expect(builtinTookDelivery({ ...base, builtins: { slack_brain: "joined" } }, "slack_brain")).toBe(true);
+    expect(builtinTookDelivery({ ...base, builtins: { pr_review: "started" } }, "slack_brain")).toBe(false);
+  });
+
+  test("disabledBuiltinsFromConfig maps each switch to its built-in key", async () => {
+    const { disabledBuiltinsFromConfig } = await import("../dispatch.ts");
+    const { config } = await import("../../config.ts");
+    const saved = { r: config.reviewAutomationDisabled, s: config.slackAutomationDisabled };
+    try {
+      config.reviewAutomationDisabled = false;
+      config.slackAutomationDisabled = false;
+      expect([...disabledBuiltinsFromConfig()]).toEqual([]);
+      config.reviewAutomationDisabled = true;
+      expect([...disabledBuiltinsFromConfig()]).toEqual(["pr_review"]);
+      config.slackAutomationDisabled = true;
+      expect([...disabledBuiltinsFromConfig()].sort()).toEqual(["pr_review", "slack_brain"]);
+    } finally {
+      config.reviewAutomationDisabled = saved.r;
+      config.slackAutomationDisabled = saved.s;
+    }
   });
 
   test("one target's admission fault never drops its siblings, and the delivery fails afterwards", async () => {

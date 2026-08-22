@@ -274,7 +274,7 @@ export class IntegrationEventSweeper {
 
 export function makeProductionIntegrationEventSweeper(): IntegrationEventSweeper {
   return new IntegrationEventSweeper({
-    sweep: (now) => makeIntegrationEventStore().sweepExpired(now),
+    sweep: (now) => makeIntegrationEventStore().sweep(now),
     now: () => new Date(),
     onError(error) {
       log.error({ error }, "integration event sweep failed");

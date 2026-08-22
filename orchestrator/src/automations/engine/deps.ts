@@ -67,6 +67,9 @@ export interface EngineSessionOps {
     title: string | null;
     role: string;
     keep: boolean;
+    /** Run the session as this engrams user (their credentials + task
+     * ownership). Unset = the harness's programmatic org credential. */
+    ownerUserId?: string;
     harnessMode?: string;
     harness?: string;
     model?: string;
@@ -116,7 +119,9 @@ export interface IntegrationActionRuntime {
     connectionId?: string;
     params: Record<string, unknown>;
     runId: string;
-    blockId: string;
+    /** Frame path of the executing block (not the block id): the identity
+     * every idempotency key (client id, marker) derives from. */
+    stepPath: string;
   }): Promise<Record<string, unknown>>;
 }
 

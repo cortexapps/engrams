@@ -9,7 +9,7 @@ import { IntegrationActionError } from "../errors.ts";
 import { executeIntegrationAction, type ExecuteIntegrationActionDeps } from "../execute.ts";
 
 const emptySource = { list: async () => [] };
-const CTX = { runId: "autorun:auto-1:webhook:d1", blockId: "notify" };
+const CTX = { runId: "autorun:auto-1:webhook:d1", stepPath: "notify" };
 
 function json(status: number, value: unknown): IntegrationOpResult {
   return {
@@ -127,12 +127,12 @@ describe("executeIntegrationAction — http", () => {
     expect(fresh.calls[0]!.req.method).toBe("GET");
     const posted = JSON.parse(fresh.calls[1]!.req.body as string) as { body: string };
     expect(posted.body).toContain("hello");
-    expect(posted.body).toContain(`<!-- engrams-automation:${CTX.runId}:${CTX.blockId} -->`);
+    expect(posted.body).toContain(`<!-- engrams-automation:${CTX.runId}:${CTX.stepPath} -->`);
     expect(outputs).toEqual({ commentId: 42 });
 
     // Replay: the scan finds the marker; no second create.
     const replay = fakeRunOp([
-      json(200, [{ id: 42, body: `hi\n\n<!-- engrams-automation:${CTX.runId}:${CTX.blockId} -->` }]),
+      json(200, [{ id: 42, body: `hi\n\n<!-- engrams-automation:${CTX.runId}:${CTX.stepPath} -->` }]),
     ]);
     const replayed = await executeIntegrationAction(
       {
@@ -187,7 +187,7 @@ describe("executeIntegrationAction — graphql", () => {
     expect(body.variables).toEqual({
       issueId: "issue-1",
       body: "ping",
-      id: actionClientId(CTX.runId, CTX.blockId),
+      id: actionClientId(CTX.runId, CTX.stepPath),
     });
     expect(outputs).toEqual({ commentId: "c1" });
   });
@@ -248,12 +248,12 @@ describe("executeIntegrationAction — builtins", () => {
     expect(f.calls).toHaveLength(3);
     const fallback = JSON.parse(f.calls[2]!.req.body as string) as Record<string, unknown>;
     expect(fallback["comments"]).toBeUndefined();
-    expect(String(fallback["body"])).toContain(`<!-- engrams-automation:${CTX.runId}:${CTX.blockId} -->`);
+    expect(String(fallback["body"])).toContain(`<!-- engrams-automation:${CTX.runId}:${CTX.stepPath} -->`);
     expect(outputs).toMatchObject({ posted: true, inline_posted: false, github_review_id: "99" });
   });
 
   test("github.post_pr_review short-circuits when the marker is already on a review", async () => {
-    const marker = `<!-- engrams-automation:${CTX.runId}:${CTX.blockId} -->`;
+    const marker = `<!-- engrams-automation:${CTX.runId}:${CTX.stepPath} -->`;
     const f = fakeRunOp([json(200, [{ body: `Looks fine.\n\n${marker}` }])]);
     const outputs = await executeIntegrationAction(
       {
@@ -320,9 +320,9 @@ describe("executeIntegrationAction — builtins", () => {
         }),
       }),
     );
-    expect(created[0]!["id"]).toBe(actionClientId(CTX.runId, CTX.blockId));
+    expect(created[0]!["id"]).toBe(actionClientId(CTX.runId, CTX.stepPath));
     expect(outputs).toEqual({
-      issueId: actionClientId(CTX.runId, CTX.blockId),
+      issueId: actionClientId(CTX.runId, CTX.stepPath),
       identifier: "ENG-1",
       url: "https://linear.app/i/ENG-1",
     });

@@ -1037,6 +1037,10 @@ export const reviewEnrollment = pgTable("review_enrollment", {
   triggerMode: text("trigger_mode").notNull().default("manual"), // auto|manual
   autofix: text("autofix").notNull().default("off"), // auto|manual|off
   profileId: text("profile_id").references(() => profile.id),
+  // ADR 0119 phase 4.4: which engine reviews this repo during the parallel
+  // window. legacy = the hand-written PrReviewWorkflow; automation = the
+  // seeded PR-review built-in. Dropped with this table in phase 4.7.
+  engine: text("engine").notNull().default("legacy"), // legacy|automation
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true })
     .notNull()

@@ -13,11 +13,17 @@
  *
  * Execute installs: it marks the session relay-bound (so the automation
  * consumer forwards CURATED events, not just idle/terminal), flips the
- * session's binding, and records the render state it will thread through
- * every later handler call. Handler calls run inside their own checkpointed
- * steps (`step:<path>.__relay__:<n>`); render state lives in this module's
- * per-run map, rebuilt deterministically on replay because every mutation
- * happens inside a step whose outcome is checkpointed.
+ * session's binding, and returns the initial render state as its
+ * `handler_state` output. Handler calls run inside their own checkpointed
+ * steps (`step:<path>.__relay__:<n>`), and EVERY call returns the next
+ * render state as its step output (`HandlerResult.state`). The interpreter
+ * hands the previous step's recorded state back in as `ctx.handlerState`.
+ * This module keeps NO per-run memory: a checkpointed step's closure does
+ * not re-run on DBOS recovery — only its recorded output is replayed — so a
+ * process-local map would be empty after a pod restart and the relay would
+ * silently stop rendering. Threading the state through the outputs is what
+ * makes a restarted pod continue the bubble / answer the question exactly
+ * where the old one stopped.
  *
  * Delivery failures never fail the run — the legacy loop's "log and drop it,
  * keep the thread alive" posture (slack-thread.ts handleInbound).
@@ -31,6 +37,7 @@ import {
   routeSessionEvent,
   summarizeAsset,
   type AssetSummary,
+  type ClosingSummary,
   type CommunicationPolicy,
   type QuestionProtocol,
   type StartedSession,
@@ -41,7 +48,7 @@ import { tools as defaultTools } from "../../../../tools/registry.ts";
 import { sessionRefSchema } from "../../definition.ts";
 import type { RunContext } from "../../context.ts";
 import type { AutomationInbox } from "../../inbox.ts";
-import { registerBlock, type BlockOutcome } from "../registry.ts";
+import { registerBlock, type BlockOutcome, type HandlerResult } from "../registry.ts";
 
 const log = rootLog.child({ component: "slack-relay" });
 
@@ -99,24 +106,51 @@ export const slackRelayConfigSchema = z.object({
 });
 export type SlackRelayConfig = z.infer<typeof slackRelayConfigSchema>;
 
-/** Per-run render state (the legacy `ThreadRender`). Keyed by run id; every
- * mutation happens inside a checkpointed handler step, so replay rebuilds it
- * identically from the recv sequence. */
-interface RelayState {
+export const RELAY_STATE_KIND = "slack_relay";
+
+/** The relay's render state (the legacy `ThreadRender`), as a checkpointed
+ * step output: plain JSON only (Records, not Maps), tagged so the recap can
+ * find it among the run's step outputs without knowing the relay's block id. */
+export interface RelayState extends Record<string, unknown> {
+  kind: typeof RELAY_STATE_KIND;
+  /** Monotonic per change. Install and re-point blocks each record a state
+   * on their own outputs, so "the latest" is the highest seq among the
+   * run's step outputs, not a position in the graph. */
+  seq: number;
   sessionId: string;
   mention: SourceMention;
-  questionTs: Map<string, string>;
-  questionProtocols: Map<string, QuestionProtocol>;
+  questionTs: Record<string, string>;
+  questionProtocols: Record<string, QuestionProtocol>;
   assets: AssetSummary[];
   bubble: { ts: string; text: string } | null;
   lastAssistantText: string | null;
 }
 
-const states = new Map<string, RelayState>();
+function isRelayState(v: unknown): v is RelayState {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    (v as { kind?: unknown }).kind === RELAY_STATE_KIND &&
+    typeof (v as { sessionId?: unknown }).sessionId === "string"
+  );
+}
 
-/** Test hook: the module-level state map is per process. */
-export function resetSlackRelayStateForTest(): void {
-  states.clear();
+/** The threaded state the interpreter handed this call (see registry.ts
+ * `onMessage`): the previous handler step's recorded output. */
+function stateFrom(ctx: RunContext): RelayState | null {
+  return isRelayState(ctx.handlerState) ? ctx.handlerState : null;
+}
+
+/** The latest relay state among the run's recorded step outputs — what the
+ * interpreter mirrors onto the relay block's `handler_state` after every
+ * handler step. Null when no relay was installed on this run. */
+function stateFromSteps(ctx: RunContext): RelayState | null {
+  let latest: RelayState | null = null;
+  for (const outputs of Object.values(ctx.steps)) {
+    const st = outputs["handler_state"];
+    if (isRelayState(st) && (latest === null || st.seq > latest.seq)) latest = st;
+  }
+  return latest;
 }
 
 function mentionFrom(config: SlackRelayConfig): SourceMention {
@@ -137,36 +171,59 @@ function mentionFrom(config: SlackRelayConfig): SourceMention {
 async function install(config: SlackRelayConfig, ctx: RunContext): Promise<BlockOutcome> {
   const sessionId = await ctx.resolveSession(config.session);
   await ctx.deps.sessions.setSessionRelay(sessionId, true);
-  states.set(ctx.runId, {
+  const state: RelayState = {
+    kind: RELAY_STATE_KIND,
+    seq: 0,
     sessionId,
     mention: mentionFrom(config),
-    questionTs: new Map(),
-    questionProtocols: new Map(),
+    questionTs: {},
+    questionProtocols: {},
     assets: [],
     bubble: null,
     lastAssistantText: null,
-  });
-  return { kind: "ok", outputs: { session_id: sessionId, installed: true } };
+  };
+  return {
+    kind: "ok",
+    outputs: { session_id: sessionId, installed: true, handler_state: state },
+  };
 }
 
-/** A later `send_prompt` for a new mention re-points the turn: the built-in
- * graph calls this block again with the new mention ts (structure-locked,
- * but `mentionTs`/`eventId` are tunable at runtime via `$ref`). Re-executing
- * an installed relay is a re-point, not a second install. */
-function repoint(config: SlackRelayConfig, ctx: RunContext): void {
-  const st = states.get(ctx.runId);
-  if (!st) return;
-  st.mention = mentionFrom(config);
-  st.bubble = null; // a new turn — the next response opens a fresh message
+/** A later turn re-points the relay: the built-in graph carries a second
+ * relay block inside its loop body, templated on the accepted follow-up's
+ * ts/user/event, so ⏳/✅ land on the message that started THAT turn and
+ * its responses open a fresh bubble. Executing the relay's type while one
+ * is installed is a re-point, not a second install: the carried state
+ * (questions, assets, last message) continues; only the mention and the
+ * bubble change. */
+function repoint(config: SlackRelayConfig, prev: RelayState): BlockOutcome {
+  const state: RelayState = {
+    ...prev,
+    seq: prev.seq + 1,
+    mention: mentionFrom(config),
+    bubble: null, // a new turn — the next response opens a fresh message
+  };
+  return {
+    kind: "ok",
+    outputs: { session_id: prev.sessionId, installed: true, handler_state: state },
+  };
 }
 
 async function onMessage(
   msg: AutomationInbox,
   config: SlackRelayConfig,
   ctx: RunContext,
-): Promise<"consumed" | "pass"> {
-  const st = states.get(ctx.runId);
-  if (!st) return "pass";
+): Promise<HandlerResult> {
+  const prev = stateFrom(ctx);
+  if (!prev) return { verdict: "pass" };
+  // Work on a copy: the previous state is a recorded step output and must
+  // stay what that step recorded.
+  const st: RelayState = {
+    ...prev,
+    seq: prev.seq + 1,
+    questionTs: { ...prev.questionTs },
+    questionProtocols: { ...prev.questionProtocols },
+    assets: [...prev.assets],
+  };
   const pol = deps().policy(ctx.runId);
   const session: StartedSession = {
     id: st.sessionId,
@@ -174,7 +231,7 @@ async function onMessage(
   };
 
   if (msg.kind === "session_event") {
-    if (msg.sessionId !== st.sessionId) return "pass";
+    if (msg.sessionId !== st.sessionId) return { verdict: "pass" };
     try {
       await dispatch(pol, st, msg.event, session);
     } catch (err) {
@@ -183,16 +240,18 @@ async function onMessage(
         "slack relay: failed to render a session event; dropping it",
       );
     }
-    return "consumed";
+    // Whatever dispatch mutated before a throw is the truth of the thread
+    // (a bubble that was posted exists), so the state is returned either way.
+    return { verdict: "consumed", state: st };
   }
 
   if (msg.kind === "signal" && msg.name === SLACK_ANSWER_SIGNAL) {
     const answer = parseAnswer(msg.payload);
-    if (!answer) return "consumed";
-    const via = st.questionProtocols.get(answer.toolCallId) ?? "legacy";
+    if (!answer) return { verdict: "consumed" };
+    const via = st.questionProtocols[answer.toolCallId] ?? "legacy";
     if (via === "legacy") {
       await pol.onDeliveryError(st.mention, LEGACY_QUESTION_MSG).catch(() => {});
-      return "consumed";
+      return { verdict: "consumed" };
     }
     try {
       await deps().completeToolCall(st.sessionId, answer.toolCallId, answer.answers);
@@ -203,12 +262,12 @@ async function onMessage(
       );
       await pol.onDeliveryError(st.mention, ANSWER_FAIL_MSG).catch(() => {});
     }
-    return "consumed";
+    return { verdict: "consumed" };
   }
 
   // Idle/ended/other signals/events belong to the graph's waits.
   void config;
-  return "pass";
+  return { verdict: "pass" };
 }
 
 function parseAnswer(
@@ -230,7 +289,7 @@ async function dispatch(
   session: StartedSession,
 ): Promise<void> {
   const m = st.mention;
-  const effect = routeSessionEvent(event, st.questionProtocols);
+  const effect = routeSessionEvent(event, new Map(Object.entries(st.questionProtocols)));
   switch (effect.kind) {
     case "message": {
       if (!effect.text) break;
@@ -255,13 +314,13 @@ async function dispatch(
       st.bubble = null;
       const ref = await pol.onUserQuestion(m, event);
       if (effect.toolCallId) {
-        st.questionTs.set(effect.toolCallId, ref);
-        st.questionProtocols.set(effect.toolCallId, effect.via);
+        st.questionTs[effect.toolCallId] = ref;
+        st.questionProtocols[effect.toolCallId] = effect.via;
       }
       break;
     }
     case "answered": {
-      const ref = effect.toolCallId ? st.questionTs.get(effect.toolCallId) : undefined;
+      const ref = effect.toolCallId ? st.questionTs[effect.toolCallId] : undefined;
       await pol.onAnswered(m, event, ref);
       break;
     }
@@ -277,27 +336,48 @@ async function dispatch(
   }
 }
 
-/** The closing recap the Slack built-in's finalize hook posts. */
-export function slackRelayClosingSummary(
-  runId: string,
-): { lastMessage: string | null; assets: AssetSummary[] } | null {
-  const st = states.get(runId);
+/** The closing recap the Slack built-in's finalize hook posts, read from the
+ * run's recorded step outputs (never process memory). */
+export function slackRelayClosingSummary(ctx: RunContext): ClosingSummary | null {
+  const st = stateFromSteps(ctx);
   return st ? { lastMessage: st.lastAssistantText, assets: [...st.assets] } : null;
+}
+
+/** Everything the recap block needs to render a terminal message the way the
+ * legacy loop did: the thread route, the session, and the summary. Null when
+ * no relay was installed on this run (the run ended before the relay block).
+ * Read from `ctx.steps`, so a recap after a pod restart sees the state the
+ * last handler step recorded. */
+export function slackRelayFinalFacts(ctx: RunContext): {
+  mention: SourceMention;
+  session: StartedSession;
+  summary: ClosingSummary;
+} | null {
+  const st = stateFromSteps(ctx);
+  if (!st) return null;
+  return {
+    mention: st.mention,
+    session: { id: st.sessionId, webUrl: deps().sessionWebUrl(st.sessionId) },
+    summary: { lastMessage: st.lastAssistantText, assets: [...st.assets] },
+  };
+}
+
+/** Production policy access for sibling system blocks (the recap). */
+export function slackRelayPolicy(runId: string): CommunicationPolicy {
+  return deps().policy(runId);
 }
 
 export function registerSlackRelayBlock(): void {
   registerBlock<SlackRelayConfig>({
     type: "system.slack_thread_relay",
     system: true,
-    outputs: ["session_id", "installed"],
+    outputs: ["session_id", "installed", "handler_state"],
     configSchema: slackRelayConfigSchema,
-    requiresSession: true,
     async execute(config, ctx) {
-      if (states.has(ctx.runId)) {
-        repoint(config, ctx);
-        return { kind: "ok", outputs: { session_id: states.get(ctx.runId)!.sessionId, installed: true } };
-      }
-      return install(config, ctx);
+      // An installed relay re-executed is a re-point: the interpreter hands
+      // the threaded state in as `ctx.handlerState`.
+      const prev = stateFrom(ctx);
+      return prev ? repoint(config, prev) : install(config, ctx);
     },
     onMessage,
   });
