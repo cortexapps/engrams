@@ -149,16 +149,19 @@ export function registerReviewTools(
   const notifyPhaseDone = async (
     ctx: ToolContext,
     role: "finder" | "verifier",
+    payload: Record<string, unknown> = {},
   ): Promise<void> => {
     try {
       // ADR 0119: a session the built-in review automation owns signals its
-      // run directly; the engine's send_prompt wait parks on this name.
+      // run directly; the engine's send_prompt wait parks on this name. The
+      // payload lands in steps.<block>.signal, so the built-in's branch reads
+      // e.g. candidate_count without a store round-trip.
       const automation = await findAutomationBinding(ctx.sessionId);
       if (automation !== null) {
         const name = REVIEW_PHASE_SIGNALS[role];
         await notifyAutomation(
           automation.runId,
-          { kind: "signal", name, sessionId: ctx.sessionId },
+          { kind: "signal", name, sessionId: ctx.sessionId, payload },
           inboxKeys.signal(ctx.sessionId, name, ctx.toolCallId),
         );
         return;
@@ -252,7 +255,10 @@ export function registerReviewTools(
         return NOT_FINDING_PHASE;
       }
       await reviews.setFinderSummary(active.id, args.summary_md);
-      await notifyPhaseDone(ctx, "finder");
+      // Every finding is still a candidate at finder_done (verdicts come
+      // later), so the finding count IS the candidate count.
+      const candidateCount = await reviews.countFindings(active.id);
+      await notifyPhaseDone(ctx, "finder", { candidate_count: candidateCount });
       return { recorded: true };
     },
   });

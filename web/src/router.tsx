@@ -470,9 +470,11 @@ const profileEditRoute = createRoute({
   beforeLoad: requireAdmin,
   component: () => <SessionProfileEditor mode="edit" />,
 });
+/** The editor shell owns the tab vocabulary (`isEditorTab`); these names are
+ * kept as aliases so either spelling resolves to the one definition. */
 export type AutomationEditorTab = EditorTab;
 export interface AutomationEditorSearch {
-  tab?: AutomationEditorTab;
+  tab?: EditorTab;
 }
 const automationsRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,

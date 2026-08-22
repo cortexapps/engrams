@@ -85,6 +85,7 @@ import {
 import { setIntegrationEventDispatch } from "./automations/integration-ingress.ts";
 import { dispatchIntegrationEvent } from "./automations/dispatch.ts";
 import { assertSweepPoliciesExhaustive } from "./sweep/policy.ts";
+import { assertBlockRegistryComplete } from "./automations/engine/blocks/index.ts";
 import { makeSweepRuntime } from "./sweep/production.ts";
 import { getDb, getPool } from "./db/client.ts";
 import { resolveDraftingSpec, resolveSpecMembership } from "./authz/resolve.ts";
@@ -156,6 +157,11 @@ import { SpecTicketSyncService } from "./specs/ticket-sync-service.ts";
 import { PostgresSpecTicketSyncStore } from "./specs/ticket-sync-store.ts";
 import { makeSpecTicketSyncConnector } from "./specs/ticket-sync-connector.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
+import {
+  productionBuiltinSeedDeps,
+  registerShippedBuiltins,
+  seedBuiltinAutomations,
+} from "./automations/builtins/seed.ts";
 import { retireProviderWebhookSchemes } from "./automations/retire-provider-webhooks.ts";
 import { makeAutomationStore } from "./db/automations.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
@@ -635,6 +641,13 @@ await Promise.all([
 void seedReviewerProfile(makeProfileStore(getDb()), integrationConnections, log).catch((err) =>
   log.error({ err }, "reviewer profile seed failed"),
 );
+// ADR 0119 D7: the shipped built-in automations (PR review). Seeded DISABLED;
+// the per-repo flag (4.4) opens the parallel window. Idempotent; a changed
+// shipped definition bumps the version and preserves org inputs/overrides.
+registerShippedBuiltins();
+void seedBuiltinAutomations(productionBuiltinSeedDeps()).catch((err) =>
+  log.error({ err }, "built-in automation seed failed"),
+);
 // ADR 0119 D5: one-shot, idempotent retirement of provider-scheme webhooks —
 // github-app-bound automations move onto the default GitHub connection;
 // custom provider-scheme registrations are disabled with a reason, never
@@ -648,6 +661,12 @@ void retireProviderWebhookSchemes({
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
 assertSweepPoliciesExhaustive();
+// ADR 0119 D1: the block registry is static and must be populated before the
+// first RPC validates a definition — registration was lazy (first interpreter
+// run) and the e2e suite caught a cold CreateAutomation rejecting
+// create_session as unknown. Registers every v1 + system block and fails boot
+// if any v1 type is missing, mirroring the sweep-policy assertion above.
+assertBlockRegistryComplete();
 const { heartbeat, sweeper } = makeSweepRuntime({
   config: {
     sweepDisabled: config.sweepDisabled,

@@ -72,6 +72,14 @@ export interface EngineSessionOps {
     model?: string;
     modelRouter?: string;
     effort?: string;
+    /** Session-policy clamps (ADR 0119 phase 4.3): the built-in review
+     * workers run with a fixed capability set, a deny-default network, no
+     * profile secrets, and a role system prompt. Pass-through to
+     * createSessionForExistingTask. */
+    capabilityOverride?: readonly string[];
+    networkOverride?: { default: "deny" | "allow"; allowHosts: string[]; allowHostPatterns: string[] };
+    dropProfileSecretsAndEnv?: boolean;
+    appendSystemPrompt?: string;
   }): Promise<EngineCreateSessionResult>;
   sendPrompt(sessionId: string, promptId: string, text: string, harnessMode?: string): Promise<void>;
   endSession(sessionId: string): Promise<void>;
