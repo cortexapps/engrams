@@ -129,12 +129,16 @@ export function AutomationEditor({
   const saving =
     create.isPending || saveVersion.isPending || setOverrides.isPending || updateMeta.isPending;
 
+  // On a built-in the trigger is pinned (structure locked) and the save path
+  // sends only block overrides + meta, so a trigger edit could never persist;
+  // compare blocks alone there, so Save never lights for a no-op.
+  const comparable = (d: typeof draft) => (builtin ? d.blocks : d);
   const dirty =
     mode === "create" ||
     (automation !== undefined &&
       (name !== automation.name ||
         description !== automation.description ||
-        JSON.stringify(draft) !== JSON.stringify(effective)));
+        JSON.stringify(comparable(draft)) !== JSON.stringify(comparable(effective))));
 
   const setTab = (next: EditorTab) => {
     void navigate({
