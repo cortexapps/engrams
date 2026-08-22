@@ -835,7 +835,7 @@ describe("interpretAutomation — installed message handlers (contract 3)", () =
       },
       async onMessage(msg, config) {
         seen.push(msg);
-        return config.consume.includes(msg.kind) ? "consumed" : "pass";
+        return { verdict: config.consume.includes(msg.kind) ? "consumed" : "pass" };
       },
     });
     try {

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 
 import type { CuratedEvent } from "../../../control-plane/session-events.ts";
 import type { CommunicationPolicy } from "../../../workflows/communication-policy.ts";
@@ -7,7 +7,6 @@ import { getBlock } from "../blocks/registry.ts";
 import {
   MAX_BUBBLE_CHARS,
   SLACK_ANSWER_SIGNAL,
-  resetSlackRelayStateForTest,
   setSlackRelayDeps,
   slackRelayClosingSummary,
   type SlackRelayConfig,
@@ -141,13 +140,36 @@ function harness() {
   ctx.steps["launch"] = { session_id: "s-launch" };
   ctx.currentBlockId = "relay";
   const block = getBlock("system.slack_thread_relay")!;
-  const send = (msg: AutomationInbox) => block.onMessage!(msg, CONFIG as never, ctx);
+  // The harness does what the interpreter does with the threaded state
+  // (contract 3): the execute step's `handler_state` output seeds it, every
+  // handler call sees the previous call's returned state, and the latest
+  // state is mirrored onto the relay block's outputs for the recap.
+  let state: Record<string, unknown> | undefined;
+  const install = async (config: Record<string, unknown> = CONFIG) => {
+    ctx.handlerState = state;
+    const out = await block.execute!(config as never, ctx);
+    if (out.kind === "ok") {
+      state = out.outputs["handler_state"] as Record<string, unknown> | undefined;
+      ctx.steps["relay"] = out.outputs;
+    }
+    return out;
+  };
+  const send = async (msg: AutomationInbox) => {
+    ctx.handlerState = state;
+    const r = await block.onMessage!(msg, CONFIG as never, ctx);
+    if (r.state !== undefined) {
+      state = r.state;
+      ctx.steps["relay"] = { ...ctx.steps["relay"], handler_state: r.state };
+    }
+    return r.verdict;
+  };
   return {
     policy,
     completed,
     relayFlags,
     ctx,
     block,
+    install,
     send,
     setFailComplete(v: boolean) {
       failComplete = v;
@@ -162,19 +184,27 @@ const sessionEvent = (event: CuratedEvent): AutomationInbox => ({
 });
 
 describe("system.slack_thread_relay", () => {
-  beforeEach(() => resetSlackRelayStateForTest());
   afterEach(() => setSlackRelayDeps(null));
 
-  test("install flips the session's relay flag and returns the session id", async () => {
+  test("install flips the session's relay flag and returns the session id + initial state", async () => {
     const h = harness();
-    const out = await h.block.execute!(CONFIG as never, h.ctx);
-    expect(out).toEqual({ kind: "ok", outputs: { session_id: "s-launch", installed: true } });
+    const out = await h.install();
+    expect(out.kind).toBe("ok");
+    const outputs = (out as { outputs: Record<string, unknown> }).outputs;
+    expect(outputs["session_id"]).toBe("s-launch");
+    expect(outputs["installed"]).toBe(true);
+    expect(outputs["handler_state"]).toMatchObject({
+      kind: "slack_relay",
+      sessionId: "s-launch",
+      bubble: null,
+      lastAssistantText: null,
+    });
     expect(h.relayFlags).toEqual([{ sessionId: "s-launch", relay: true }]);
   });
 
   test("assistant messages coalesce into one bubble and roll past the cap", async () => {
     const h = harness();
-    await h.block.execute!(CONFIG as never, h.ctx);
+    await h.install();
     await h.send(sessionEvent(ev("run_started", {})));
     await h.send(sessionEvent(ev("agent_message", { role: "assistant", text: "one" })));
     await h.send(sessionEvent(ev("agent_message", { role: "assistant", text: "two" })));
@@ -194,7 +224,7 @@ describe("system.slack_thread_relay", () => {
 
   test("run lifecycle reacts on the mention and seals the bubble", async () => {
     const h = harness();
-    await h.block.execute!(CONFIG as never, h.ctx);
+    await h.install();
     expect(await h.send(sessionEvent(ev("run_started", {})))).toBe("consumed");
     expect(await h.send(sessionEvent(ev("run_completed", { ok: true })))).toBe("consumed");
     expect(h.policy.calls.onWorking).toHaveLength(1);
@@ -204,7 +234,7 @@ describe("system.slack_thread_relay", () => {
 
   test("a generic AskUserQuestion posts a card, and its answer completes the tool call", async () => {
     const h = harness();
-    await h.block.execute!(CONFIG as never, h.ctx);
+    await h.install();
     const request = ev("tool_call_requested", {
       tool_call_id: "tc-1",
       name: "ask_user_question",
@@ -238,7 +268,7 @@ describe("system.slack_thread_relay", () => {
 
   test("an answer to a legacy-protocol or unknown question posts the legacy notice", async () => {
     const h = harness();
-    await h.block.execute!(CONFIG as never, h.ctx);
+    await h.install();
     await h.send({
       kind: "signal",
       name: SLACK_ANSWER_SIGNAL,
@@ -250,7 +280,7 @@ describe("system.slack_thread_relay", () => {
 
   test("a failed tool completion keeps the thread alive with a ⚠️ note", async () => {
     const h = harness();
-    await h.block.execute!(CONFIG as never, h.ctx);
+    await h.install();
     await h.send(
       sessionEvent(
         ev("tool_call_requested", {
@@ -274,7 +304,7 @@ describe("system.slack_thread_relay", () => {
 
   test("assets post their own message and accumulate into the closing recap", async () => {
     const h = harness();
-    await h.block.execute!(CONFIG as never, h.ctx);
+    await h.install();
     await h.send(sessionEvent(ev("agent_message", { role: "assistant", text: "done" })));
     await h.send(
       sessionEvent(
@@ -287,14 +317,14 @@ describe("system.slack_thread_relay", () => {
       ),
     );
     expect(h.policy.calls.onAsset).toHaveLength(1);
-    const summary = slackRelayClosingSummary(RUN_ID);
+    const summary = slackRelayClosingSummary(h.ctx);
     expect(summary?.lastMessage).toBe("done");
     expect(summary?.assets.length).toBe(1);
   });
 
   test("a render failure is dropped, never thrown, and the message still counts as consumed", async () => {
     const h = harness();
-    await h.block.execute!(CONFIG as never, h.ctx);
+    await h.install();
     h.policy.setThrow(true);
     const verdict = await h.send(sessionEvent(ev("agent_message", { role: "assistant", text: "boom" })));
     expect(verdict).toBe("consumed");
@@ -302,7 +332,7 @@ describe("system.slack_thread_relay", () => {
 
   test("messages for other sessions and non-relay signals pass through", async () => {
     const h = harness();
-    await h.block.execute!(CONFIG as never, h.ctx);
+    await h.install();
     expect(
       await h.send({ kind: "session_event", sessionId: "s-other", event: ev("agent_message", {}) }),
     ).toBe("pass");
@@ -312,9 +342,9 @@ describe("system.slack_thread_relay", () => {
 
   test("re-executing the block re-points the turn's mention and opens a fresh bubble", async () => {
     const h = harness();
-    await h.block.execute!(CONFIG as never, h.ctx);
+    await h.install();
     await h.send(sessionEvent(ev("agent_message", { role: "assistant", text: "one" })));
-    await h.block.execute!({ ...CONFIG, mentionTs: "200.0", eventId: "E2" } as never, h.ctx);
+    await h.install({ ...CONFIG, mentionTs: "200.0", eventId: "E2" });
     await h.send(sessionEvent(ev("agent_message", { role: "assistant", text: "two" })));
     // Fresh bubble (no ref) after the re-point, reacting on the new mention.
     expect(h.policy.calls.onAssistantMessage[1]![2]).toBeUndefined();

@@ -213,31 +213,64 @@ export async function interpretAutomation(
   const ledger: TurnLedger = { started: new Map(), idleSeen: new Map() };
   /** Sessions an end_session block already ended (see finalize). */
   const endedByBlock = new Set<string>();
-  /** The one installed message handler (contract 3), once its block ran. */
+  /** The one installed message handler (contract 3), once its block ran.
+   * `state` is the handler's threaded state — ALWAYS a value that came out of
+   * a checkpointed step (the install step's `outputs.handler_state`, then
+   * each handler step's recorded `state`), so recovery rebuilds it from the
+   * replayed outputs. Never module memory. */
   let installed:
-    | { path: string; executor: BlockExecutor<never>; config: never; count: number }
+    | {
+        blockId: string;
+        path: string;
+        executor: BlockExecutor<never>;
+        config: never;
+        count: number;
+        state: Record<string, unknown> | undefined;
+      }
     | null = null;
 
   /** Offer a fresh message to the installed handler (if any) inside its own
-   * checkpointed step. Returns true when the handler consumed it. */
+   * checkpointed step. The step's recorded output is `{verdict, state}`; on
+   * recovery DBOS replays that output without running the closure, which is
+   * exactly why the state must ride the output and not a closure-local. */
   const offerToInstalled = async (msg: AutomationInbox): Promise<boolean> => {
     if (installed === null) return false;
     const relay = installed;
     relay.count += 1;
-    const verdict = await deps.step(async () => {
+    const stepPath = `${relay.path}.__relay__`;
+    const result = await deps.step(async (): Promise<{
+      verdict: "consumed" | "pass";
+      state?: Record<string, unknown>;
+    }> => {
+      ctx.handlerState = relay.state;
       try {
-        return await relay.executor.onMessage!(msg, relay.config, ctx);
+        const r = await relay.executor.onMessage!(msg, relay.config, ctx);
+        await deps.store.recordStep(input.runId, stepPath, relay.count, {
+          status: "succeeded",
+          ...(r.state !== undefined ? { outputs: { handler_state: r.state } } : {}),
+        });
+        return r;
       } catch (error) {
         // A relay's delivery failure is recorded on its step and never fails
         // the run (the legacy thread loop's "drop it, keep the thread alive").
-        await deps.store.recordStep(input.runId, `${relay.path}.__relay__`, relay.count, {
+        // State is unchanged: the next call sees what this one saw.
+        await deps.store.recordStep(input.runId, stepPath, relay.count, {
           status: "failed",
           error: errorMessage(error),
         });
-        return "pass" as const;
+        return { verdict: "pass" as const };
       }
     }, relayStepName(relay.path, relay.count));
-    return verdict === "consumed";
+    if (result.state !== undefined) {
+      relay.state = result.state;
+      // Mirror the latest state onto the relay block's own outputs so a
+      // later block (the closing recap) reads checkpointed data, not memory.
+      recordStepOutputs(ctx, relay.blockId, relay.path, {
+        ...(ctx.steps[relay.blockId] ?? {}),
+        handler_state: result.state,
+      });
+    }
+    return result.verdict === "consumed";
   };
 
   /** Stamp a freshly received message with its turn bookkeeping. */
@@ -508,6 +541,10 @@ export async function interpretAutomation(
     let lastError: Extract<BlockOutcome, { kind: "error" }> | null = null;
     for (let attempt = 0; attempt < policy.attempts; attempt += 1) {
       ctx.currentAttempt = attempt;
+      // A re-executed installed block (re-point) must see the threaded
+      // state so it can carry it forward into its new handler_state output.
+      ctx.handlerState =
+        installed !== null && installed.executor === executor ? installed.state : undefined;
       const name = stepName(frames, attempt);
       const outcome: BlockOutcome = await deps.step(
         () => executeDataBlock(block, executor, path, attempt),
@@ -533,12 +570,27 @@ export async function interpretAutomation(
         if (installed !== null && installed.executor !== executor) {
           throw new RunEnd("failed", `block "${block.id}": a message handler is already installed`);
         }
+        // The install/re-point execute step's output carries the handler's
+        // state (`handler_state`) — checkpointed, so recovery seeds it too.
+        const seeded = outcome.outputs["handler_state"];
+        const seededState =
+          typeof seeded === "object" && seeded !== null && !Array.isArray(seeded)
+            ? (seeded as Record<string, unknown>)
+            : undefined;
         if (installed === null) {
-          installed = { path, executor, config: block.config as never, count: 0 };
+          installed = {
+            blockId: block.id,
+            path,
+            executor,
+            config: block.config as never,
+            count: 0,
+            state: seededState,
+          };
         } else {
           // The same block re-executed (e.g. a loop body re-pointing a relay
-          // at a new turn): refresh its config, keep the counter.
+          // at a new turn): refresh its config and state, keep the counter.
           installed.config = block.config as never;
+          if (seededState !== undefined) installed.state = seededState;
         }
       }
 

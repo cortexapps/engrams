@@ -5,10 +5,11 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 
+import type { CuratedEvent } from "../../../control-plane/session-events.ts";
 import { makeCodeBlockRuntime } from "../../code/runtime.ts";
+import { makeReplayRunner, type ReplayRunner, type ReplayScript } from "../../engine/__tests__/replay-step.ts";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
 import {
-  resetSlackRelayStateForTest,
   setSlackRelayDeps,
 } from "../../engine/blocks/system/slack-relay.ts";
 import type { RunSnapshot } from "../../engine/context.ts";
@@ -49,8 +50,16 @@ function joined(text: string, ts: string): AutomationInbox {
   };
 }
 
+/** A curated session event as the automation consumer forwards it. */
+function curated(n: number, kind: string, payload: unknown): AutomationInbox {
+  const event: CuratedEvent = { idx: BigInt(n), kind, payloadJson: JSON.stringify(payload) };
+  return { kind: "session_event", sessionId: "s-1", event };
+}
+
 interface Harness {
   deps: EngineDeps;
+  /** Set when the harness was built with `replay`. */
+  runner: ReplayRunner | null;
   names: string[];
   records: Array<{ path: string; attempt: number; record: EngineStepRecord }>;
   sessions: Array<{ id: string; profileId: string; prompt: string; keep: boolean; title: string | null }>;
@@ -67,8 +76,12 @@ function harness(options: {
   inputs?: Record<string, unknown>;
   /** null = a recv timeout (the wait's deadline). */
   recv?: Array<AutomationInbox | null>;
+  /** Drive step + recv through the DBOS-recovery simulator instead
+   * (`"crash"` entries kill the pod; `runner.restart()` brings it back). */
+  replay?: ReplayScript;
 }): Harness {
-  const names: string[] = [];
+  const runner = options.replay ? makeReplayRunner(options.replay) : null;
+  const names: string[] = runner ? runner.names : [];
   const records: Harness["records"] = [];
   const sessions: Harness["sessions"] = [];
   const prompts: Harness["prompts"] = [];
@@ -142,8 +155,8 @@ function harness(options: {
   };
 
   const deps: EngineDeps = {
-    step: async (fn, name) => { names.push(name); return fn(); },
-    recv: async () => recvQueue.shift() ?? null,
+    step: runner ? runner.step : async (fn, name) => { names.push(name); return fn(); },
+    recv: runner ? runner.recv : async () => recvQueue.shift() ?? null,
     store: {
       async loadSnapshot() { return snapshot; },
       async markRunning() {},
@@ -157,11 +170,10 @@ function harness(options: {
     code: makeCodeBlockRuntime(),
   };
 
-  return { deps, names, records, sessions, prompts, relayFlags, policyCalls, ended, finalized };
+  return { deps, runner, names, records, sessions, prompts, relayFlags, policyCalls, ended, finalized };
 }
 
 afterEach(() => {
-  resetSlackRelayStateForTest();
   setSlackRelayDeps(null);
 });
 
@@ -203,6 +215,62 @@ describe("Slack thread brain through the interpreter", () => {
     // The recap hook posted the ✅ completion through the same policy as legacy.
     expect(h.policyCalls).toContain("complete:");
     expect(h.finalized).toEqual([{ status: "completed" }]);
+  });
+
+  test("(a') the relay survives a pod restart: its state rides the checkpointed step outputs, not process memory", async () => {
+    // Pass 1: the relay renders three messages into one bubble, then the pod
+    // dies while waiting. Pass 2 (recovery): DBOS replays the recorded step
+    // outputs WITHOUT re-running their closures and re-delivers the recv'd
+    // messages, then the run goes live: message 4 must append to the SAME
+    // bubble (the state the dead pod built), and the ✅ recap must carry the
+    // last message. With state in a module map both would be lost — the
+    // relay would answer "pass" forever and the recap would post nothing.
+    const h = harness({
+      replay: [
+        curated(1, "run_started", {}),
+        curated(2, "agent_message", { role: "assistant", text: "one" }),
+        curated(3, "agent_message", { role: "assistant", text: "two" }),
+        "crash",
+        curated(4, "agent_message", { role: "assistant", text: "three" }),
+        curated(5, "run_completed", { ok: true }),
+        { kind: "session_idle", sessionId: "s-1" },
+        null,
+        null,
+      ],
+    });
+    const runner = h.runner!;
+    // The dying pod: its interpretAutomation never settles (recv hangs).
+    void interpretAutomation(RUN, h.deps).catch(() => {});
+    // Let pass 1 run up to the hang.
+    for (let i = 0; i < 50 && !h.policyCalls.includes("msg:one\n\ntwo"); i += 1) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    expect(h.policyCalls).toEqual(["working", "msg:one", "msg:one\n\ntwo"]);
+    const liveBeforeCrash = runner.executed.length;
+    expect(liveBeforeCrash).toBeGreaterThan(0);
+
+    runner.restart();
+    const result = await interpretAutomation(RUN, h.deps);
+
+    expect(result.status).toBe("completed");
+    // Recovery replayed the recorded relay steps (their closures did not
+    // run again: no duplicate "msg:one"/"working" through the policy) …
+    expect(h.policyCalls.filter((c) => c === "msg:one")).toHaveLength(1);
+    expect(h.policyCalls.filter((c) => c === "working")).toHaveLength(1);
+    expect(new Set(runner.executed).size).toBe(runner.executed.length);
+    expect(runner.executed.length).toBeGreaterThan(liveBeforeCrash);
+    // … then message 4 appended to the bubble the dead pod opened (the
+    // relay's state came back through the checkpointed outputs) …
+    expect(h.policyCalls).toContain("msg:one\n\ntwo\n\nthree");
+    expect(h.policyCalls).toContain("idle");
+    // … and the recap read the last message from the recorded step outputs.
+    expect(h.policyCalls.at(-1)).toBe("complete:three");
+    // The relay's step names are unchanged across passes (contract stays 4).
+    const relaySteps = h.names.filter((n) => n.includes(".__relay__:"));
+    expect(relaySteps.slice(0, 3)).toEqual(relaySteps.slice(0, 3).map((n, i) => `step:relay.__relay__:${i + 1}`));
+    // Only one install: recovery re-seeded the state, it did not re-bind.
+    expect(h.relayFlags).toEqual([{ sessionId: "s-1", relay: true }]);
+    expect(h.sessions).toHaveLength(1);
   });
 
   test("(b) a top-level channel message (no thread_ts) is filtered, never a session", async () => {

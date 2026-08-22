@@ -51,7 +51,7 @@ export function registerSlackRecapBlock(): void {
     outputs: ["posted", "rendered_as"],
     configSchema: slackRecapConfigSchema,
     async execute(config, ctx) {
-      const facts = deps().facts(ctx.runId);
+      const facts = deps().facts(ctx);
       if (!facts) {
         return { kind: "ok", outputs: { posted: false, rendered_as: "none" } };
       }

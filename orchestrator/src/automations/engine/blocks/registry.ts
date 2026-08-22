@@ -21,6 +21,14 @@ export type BlockOutcome<O extends Record<string, unknown> = Record<string, unkn
   | { kind: "end_run"; status: "filtered" | "completed"; reason?: string }
   | { kind: "error"; code: string; message: string; retryable: boolean };
 
+/** What an installed handler returns: the verdict for this message and the
+ * state the NEXT invocation must see. `state` must be JSON-serializable — it
+ * is a checkpointed step output. */
+export interface HandlerResult {
+  verdict: "consumed" | "pass";
+  state?: Record<string, unknown>;
+}
+
 export interface BlockWaitSpec<C> {
   /** null = no per-block deadline (the run deadline still applies). */
   deadlineSeconds(config: C, ctx: RunContext): number | null;
@@ -52,12 +60,21 @@ export interface BlockExecutor<C = unknown> {
    * call inside its own checkpointed step. "consumed" swallows the message;
    * "pass" hands it on. Exactly one installable block per run (validation).
    * This is how a long-lived relay (Slack thread ↔ session) rides the run's
-   * single recv loop without becoming a wait block. */
+   * single recv loop without becoming a wait block.
+   *
+   * STATE THREADS THROUGH STEP OUTPUTS, never through module memory. A
+   * checkpointed step's closure does NOT re-run on DBOS recovery — only its
+   * recorded output is replayed — so any state a handler keeps in a
+   * process-local map is gone after a pod restart. The handler therefore
+   * receives `ctx.handlerState` (the previous handler step's recorded
+   * `state`, seeded from the install step's `outputs.handler_state`) and
+   * returns the next one; the interpreter records it as the step output.
+   * On recovery the chain of recorded outputs rebuilds the state exactly. */
   onMessage?(
     msg: AutomationInbox,
     config: C,
     ctx: RunContext,
-  ): Promise<"consumed" | "pass">;
+  ): Promise<HandlerResult>;
 }
 
 const registry = new Map<string, BlockExecutor<never>>();
