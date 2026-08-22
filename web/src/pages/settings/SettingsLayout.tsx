@@ -7,7 +7,6 @@ import {
   UserCircle,
   IdCard,
   Cpu,
-  GitPullRequestArrow,
   RadioTower,
   Route,
 } from "lucide-react";
@@ -42,7 +41,6 @@ const ORG: NavItem[] = [
   { to: "/settings/model-routers", label: "Model routers", icon: Route },
   { to: "/settings/profiles", label: "Profiles", icon: IdCard },
   { to: "/settings/automations", label: "Automations", icon: RadioTower },
-  { to: "/settings/reviewed-repos", label: "Reviewed repos", icon: GitPullRequestArrow },
 ];
 
 export function SettingsLayout() {

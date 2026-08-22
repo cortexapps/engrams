@@ -5,12 +5,14 @@ import { createConnectQueryKey, useMutation, useQuery } from "@connectrpc/connec
 import { useQueryClient } from "@tanstack/react-query";
 
 import {
+  archiveAutomation,
   createAutomation,
   duplicateAutomation,
   getAutomation,
   listActionCatalog,
   listAutomations,
   listEventCatalog,
+  listVersions,
   saveVersion,
   setAutomationEnabled,
   setBlockOverrides,
@@ -38,6 +40,15 @@ export function useActionCatalog(provider: string | undefined) {
     listActionCatalog,
     { provider: provider ?? "" },
     { enabled: !!provider, staleTime: 60_000 },
+  );
+}
+
+/** Every version of an automation, newest first (phase 3.8 Settings). */
+export function useAutomationVersions(automationId: string | undefined) {
+  return useQuery(
+    listVersions,
+    { automationId: automationId ?? "" },
+    { enabled: !!automationId, staleTime: 10_000 },
   );
 }
 
@@ -85,6 +96,11 @@ export function useSetAutomationEnabledV2() {
 export function useDuplicateAutomation() {
   const invalidate = useInvalidateEditor();
   return useMutation(duplicateAutomation, { onSuccess: invalidate });
+}
+
+export function useArchiveAutomationV2() {
+  const invalidate = useInvalidateEditor();
+  return useMutation(archiveAutomation, { onSuccess: invalidate });
 }
 
 export function useCreateWebhookRegistrationV2() {

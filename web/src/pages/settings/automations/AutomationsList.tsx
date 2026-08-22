@@ -28,6 +28,7 @@ import {
 import {
   relativeTime,
   runStatusTone,
+  toneDotClass,
   automationStatusLabel,
   type RunTone,
 } from "@/lib/automations";
@@ -52,14 +53,6 @@ import { WebhookRegistrationsPanel } from "./WebhookRegistrationsPanel";
 
 export const PR_REVIEW_BUILTIN_KEY = "pr_review";
 
-const DOT: Record<RunTone, string> = {
-  nominal: "bg-instrument-nominal",
-  caution: "bg-instrument-caution",
-  critical: "bg-instrument-critical",
-  active: "bg-instrument-nominal animate-pulse",
-  muted: "bg-muted-foreground/30",
-};
-
 /** Built-ins first (stable by name), then the rest by name. */
 export function orderAutomations(items: AutomationSummary[]): AutomationSummary[] {
   return [...items].sort((a, b) => {
@@ -78,7 +71,7 @@ function StatusDot({ status, at }: { status: string | undefined; at: string | un
       <span
         data-testid="status-dot"
         data-tone={tone}
-        className={`inline-block size-2 rounded-full ${DOT[tone]}`}
+        className={`inline-block size-2 rounded-full ${toneDotClass(tone)}`}
         aria-hidden
       />
       <span>{text}</span>
