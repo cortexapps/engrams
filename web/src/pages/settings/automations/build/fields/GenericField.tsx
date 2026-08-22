@@ -6,7 +6,7 @@
  * locked, properties editable only where `tunable`). */
 
 import { Lock } from "lucide-react";
-import type { ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { Field, FieldDescription, FieldError, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
@@ -237,7 +237,30 @@ function ProfileField({ spec, value, onChange, pinned, error }: GenericFieldProp
 }
 
 function JsonField({ spec, value, onChange, pinned, error }: GenericFieldProps) {
-  const text = value === undefined ? "" : JSON.stringify(value, null, 2);
+  // The textarea owns its text: a fully controlled field that only commits on
+  // a valid parse reverts every intermediate keystroke (almost all partial
+  // JSON is invalid), which made the field un-typeable. Keystrokes always
+  // land locally; the config updates only on a valid parse; an external
+  // change to `value` (discard, reload) re-syncs the text — compared
+  // SEMANTICALLY so a valid mid-edit keeps its formatting and cursor.
+  const committed = value === undefined ? "" : JSON.stringify(value, null, 2);
+  const [text, setText] = useState(committed);
+  const [invalid, setInvalid] = useState(false);
+  const lastCommitted = useRef(committed);
+  const textRef = useRef(text);
+  textRef.current = text;
+  useEffect(() => {
+    if (lastCommitted.current === committed) return;
+    lastCommitted.current = committed;
+    if (textRef.current.trim() === "" && committed === "") return;
+    try {
+      if (JSON.stringify(JSON.parse(textRef.current), null, 2) === committed) return;
+    } catch {
+      // invalid text is replaced by the committed value
+    }
+    setText(committed);
+    setInvalid(false);
+  }, [committed]);
   return (
     <Shell spec={spec} pinned={pinned} error={error}>
       <Textarea
@@ -245,20 +268,25 @@ function JsonField({ spec, value, onChange, pinned, error }: GenericFieldProps) 
         rows={4}
         className="font-mono text-sm"
         disabled={pinned}
+        aria-invalid={invalid || undefined}
         onChange={(e) => {
           const raw = e.target.value;
+          setText(raw);
           if (raw.trim() === "") {
+            setInvalid(false);
             onChange(undefined);
             return;
           }
           try {
-            onChange(JSON.parse(raw));
+            const parsed: unknown = JSON.parse(raw);
+            setInvalid(false);
+            onChange(parsed);
           } catch {
-            // Keep the last valid value; the server surfaces a BlockError on
-            // save if the user leaves it malformed.
+            setInvalid(true);
           }
         }}
       />
+      {invalid && <FieldError>Not valid JSON</FieldError>}
     </Shell>
   );
 }

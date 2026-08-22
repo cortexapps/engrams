@@ -96,6 +96,47 @@ describe("built-in editing model", () => {
     // Unchanged tunable → absent; pinned change → never sent.
     expect(diffOverrides(shipped, shipped)).toEqual({});
   });
+
+  it("clearing a tunable field reverts to shipped — never a null override the server would reject", () => {
+    const withMode = def([
+      {
+        ...shipped.blocks[0]!,
+        tunable: ["promptTemplate", "profileId", "harnessMode"],
+        config: { ...shipped.blocks[0]!.config, harnessMode: "plan" },
+      },
+      shipped.blocks[1]!,
+    ]);
+    // The user clears harnessMode (the shell deletes the key).
+    const cleared = def([
+      {
+        ...withMode.blocks[0]!,
+        config: { profileId: "pr_reviewer", promptTemplate: "Review it.", role: "finder" },
+      },
+      withMode.blocks[1]!,
+    ]);
+    expect(diffOverrides(withMode, cleared)).toEqual({});
+
+    // Change, then clear, round-trips to no override.
+    const changed = def([
+      { ...withMode.blocks[0]!, config: { ...withMode.blocks[0]!.config, harnessMode: "act" } },
+      withMode.blocks[1]!,
+    ]);
+    expect(diffOverrides(withMode, changed)).toEqual({ finder: { harnessMode: "act" } });
+    expect(diffOverrides(withMode, cleared)).toEqual({});
+
+    // A field absent from the SHIPPED config set by the user is an override;
+    // clearing it again removes the override.
+    const added = def([
+      { ...shipped.blocks[0]!, config: { ...shipped.blocks[0]!.config, harnessMode: "plan" } },
+      shipped.blocks[1]!,
+    ]);
+    const shippedTunable = def([
+      { ...shipped.blocks[0]!, tunable: ["promptTemplate", "profileId", "harnessMode"] },
+      shipped.blocks[1]!,
+    ]);
+    expect(diffOverrides(shippedTunable, added)).toEqual({ finder: { harnessMode: "plan" } });
+    expect(diffOverrides(shippedTunable, shippedTunable)).toEqual({});
+  });
 });
 
 describe("parseBlockErrors", () => {
