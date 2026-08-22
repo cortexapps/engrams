@@ -9,9 +9,9 @@ import type { CuratedEvent } from "../../../control-plane/session-events.ts";
 import { makeCodeBlockRuntime } from "../../code/runtime.ts";
 import { makeReplayRunner, type ReplayRunner, type ReplayScript } from "../../engine/__tests__/replay-step.ts";
 import { registerEngineBlocks } from "../../engine/blocks/index.ts";
-import {
-  setSlackRelayDeps,
-} from "../../engine/blocks/system/slack-relay.ts";
+import { setSlackIdentityDeps } from "../../engine/blocks/system/slack-identity.ts";
+import { setSlackRelayDeps } from "../../engine/blocks/system/slack-relay.ts";
+import { NO_USER_MSG } from "../../../integrations/slack-identity.ts";
 import type { RunSnapshot } from "../../engine/context.ts";
 import type { EngineDeps, EngineSessionOps, EngineStepRecord } from "../../engine/deps.ts";
 import type { AutomationInbox } from "../../engine/inbox.ts";
@@ -62,7 +62,16 @@ interface Harness {
   runner: ReplayRunner | null;
   names: string[];
   records: Array<{ path: string; attempt: number; record: EngineStepRecord }>;
-  sessions: Array<{ id: string; profileId: string; prompt: string; keep: boolean; title: string | null }>;
+  sessions: Array<{
+    id: string;
+    profileId: string;
+    prompt: string;
+    keep: boolean;
+    title: string | null;
+    ownerUserId: string | undefined;
+  }>;
+  /** Slack user ids the identity gate was asked about. */
+  resolved: string[];
   prompts: Array<{ sessionId: string; text: string }>;
   relayFlags: Array<{ sessionId: string; relay: boolean }>;
   policyCalls: string[];
@@ -79,6 +88,8 @@ function harness(options: {
   /** Drive step + recv through the DBOS-recovery simulator instead
    * (`"crash"` entries kill the pod; `runner.restart()` brings it back). */
   replay?: ReplayScript;
+  /** Slack user → engrams user (default: U1 → user-1; everyone else unlinked). */
+  linkedUsers?: Record<string, string>;
 }): Harness {
   const runner = options.replay ? makeReplayRunner(options.replay) : null;
   const names: string[] = runner ? runner.names : [];
@@ -89,6 +100,8 @@ function harness(options: {
   const policyCalls: string[] = [];
   const ended: string[] = [];
   const finalized: Harness["finalized"] = [];
+  const resolved: string[] = [];
+  const linked = options.linkedUsers ?? { U1: "user-1", U2: "user-2" };
   const recvQueue = [...(options.recv ?? [])];
   const runSessions: Array<{ sessionId: string; keep: boolean }> = [];
   let clock = 1_000_000;
@@ -115,6 +128,13 @@ function harness(options: {
     policy: () => policy,
     completeToolCall: async () => {},
     sessionWebUrl: (id) => `https://engrams.test/sessions/${id}`,
+  });
+  setSlackIdentityDeps({
+    resolveUser: async (_provider, externalUserId) => {
+      resolved.push(externalUserId);
+      return linked[externalUserId] ?? null;
+    },
+    policy: () => policy,
   });
 
   const snapshot: RunSnapshot = {
@@ -143,7 +163,14 @@ function harness(options: {
   const sessionOps: EngineSessionOps = {
     async createSession(input) {
       const id = `s-${sessions.length + 1}`;
-      sessions.push({ id, profileId: input.profileId, prompt: input.prompt, keep: input.keep, title: input.title });
+      sessions.push({
+        id,
+        profileId: input.profileId,
+        prompt: input.prompt,
+        keep: input.keep,
+        title: input.title,
+        ownerUserId: input.ownerUserId,
+      });
       runSessions.push({ sessionId: id, keep: input.keep });
       return { sessionId: id, taskId: `t-${id}` };
     },
@@ -170,11 +197,12 @@ function harness(options: {
     code: makeCodeBlockRuntime(),
   };
 
-  return { deps, runner, names, records, sessions, prompts, relayFlags, policyCalls, ended, finalized };
+  return { deps, runner, names, records, sessions, prompts, relayFlags, policyCalls, ended, finalized, resolved };
 }
 
 afterEach(() => {
   setSlackRelayDeps(null);
+  setSlackIdentityDeps(null);
 });
 
 describe("Slack thread brain through the interpreter", () => {
@@ -201,6 +229,10 @@ describe("Slack thread brain through the interpreter", () => {
       expect.objectContaining({ profileId: "prof-a", prompt: "summarize the incident", keep: true }),
     ]);
     expect(h.sessions[0]!.title).toBe("summarize the incident");
+    // The session is the asking user's (legacy resolveUser parity): the
+    // identity gate resolved U1 and create_session passed the owner through.
+    expect(h.resolved).toEqual(["U1"]);
+    expect(h.sessions[0]!.ownerUserId).toBe("user-1");
     // The relay was installed on that session (consumer will forward curated events).
     expect(h.relayFlags).toEqual([{ sessionId: "s-1", relay: true }]);
     // The follow-up became the second prompt, mention stripped.
@@ -271,6 +303,20 @@ describe("Slack thread brain through the interpreter", () => {
     // Only one install: recovery re-seeded the state, it did not re-bind.
     expect(h.relayFlags).toEqual([{ sessionId: "s-1", relay: true }]);
     expect(h.sessions).toHaveLength(1);
+  });
+
+  test("(a'') an author with no engrams user gets the legacy \"log in first\" message and no session", async () => {
+    const h = harness({ linkedUsers: {} });
+    const result = await interpretAutomation(RUN, h.deps);
+    expect(result.status).toBe("filtered");
+    expect(h.resolved).toEqual(["U1"]);
+    expect(h.sessions).toEqual([]);
+    expect(h.relayFlags).toEqual([]);
+    // Posted through the same policy as legacy, as a ❌ on the mention.
+    expect(h.policyCalls).toEqual([`fail:${NO_USER_MSG}`]);
+    expect(h.names).toContain("step:identity:0");
+    expect(h.names).not.toContain("step:session:0");
+    expect(h.finalized).toEqual([{ status: "filtered", error: expect.stringContaining("not linked") }]);
   });
 
   test("(b) a top-level channel message (no thread_ts) is filtered, never a session", async () => {

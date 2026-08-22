@@ -18,6 +18,7 @@ describe("Slack thread brain built-in — definition", () => {
     expect(parsed.blocks.map((b) => b.id)).toEqual([
       "facts",
       "admit",
+      "identity",
       "session",
       "relay",
       "first_turn",

@@ -130,6 +130,21 @@ const admit: BlockDef[] = [
       },
     },
   },
+  // The identity gate (legacy resolveUser): the author must be an engrams
+  // user, and the session runs AS that user. Unlinked → "log in first" in
+  // the thread and the run ends `filtered` before any session exists.
+  {
+    id: "identity",
+    type: "system.slack_resolve_user",
+    config: {
+      userId: `\${{ ${F}.user_id }}`,
+      team: `\${{ ${F}.team }}`,
+      channel: `\${{ ${F}.channel }}`,
+      threadTs: `\${{ ${F}.thread_ts }}`,
+      mentionTs: `\${{ ${F}.mention_ts }}`,
+      eventId: `\${{ ${F}.event_id }}`,
+    },
+  },
 ];
 
 const session: BlockDef = {
@@ -141,6 +156,9 @@ const session: BlockDef = {
     promptTemplate: `\${{ ${F}.text }}`,
     titleTemplate: `\${{ ${F}.title }}`,
     role: "primary",
+    // The session is the asking user's: their credentials and attribution
+    // (never the programmatic org credential a stranger could borrow).
+    ownerUserId: "${{ steps.identity.user_id }}",
     // D8 + the thread model: the session outlives the run.
     keepOnFinish: true,
   },

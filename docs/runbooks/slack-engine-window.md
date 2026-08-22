@@ -83,10 +83,12 @@ to use the switch; the flags survive, so lifting it re-opens the same window.
 
 - **Runs**: Settings → Automations → Slack thread brain → Runs. One run per
   thread (concurrency key `team:channel:thread_ts`, policy `join`). A
-  healthy thread: `facts` → `admit` → `session` → `relay` → `first_turn` →
-  `thread[n].next` … and ends `completed` when the idle timeout expires
-  (the `until` exits the loop). `filtered` = the admission code rejected
-  the event (bot message, top-level message, no profile for the channel).
+  healthy thread: `facts` → `admit` → `identity` → `session` → `relay` →
+  `first_turn` → `thread[n].next` … and ends `completed` when the idle
+  timeout expires (the `until` exits the loop). `filtered` = the admission
+  code rejected the event (bot message, top-level message, no profile for
+  the channel) or the identity gate did (the author has no engrams user —
+  the thread got the legacy "log in first" ❌, exactly as before).
 - **Recap**: the finalize hook `__finalize__.recap` posts ✅ (completed),
   ❌ (failed / deadline) or a neutral note (halted / superseded) through
   the same Slack policy as legacy. `posted: false, rendered_as: "none"`
@@ -118,6 +120,11 @@ channel before any real one:
 - [ ] A failed turn → ❌ recap with the error; the session is kept.
 - [ ] A bot message / an edited message / a top-level channel message →
       `filtered`, no session.
+- [ ] A mention from a Slack user with no engrams account → the "log in
+      first" ❌ on the mention, `filtered`, no session (legacy parity).
+- [ ] The session of a linked user is owned by that user (Sessions list:
+      the creator is the asker, not the automation) and runs with their
+      credentials.
 - [ ] A mention in an UNFLAGGED channel → legacy behaves exactly as before
       (no engine run beyond the ledgered event; a run may show `filtered`
       if the channel has a `default_profile` — set `default_profile` only
@@ -127,6 +134,13 @@ Known v1 divergences (by design, see `builtins/slack-brain.ts`): the prompt
 is the message text with the bot mention stripped, not the legacy
 `<thread context>` fold of the whole thread; the LLM profile picker and
 the "which profile?" dropdown are retired in favour of the `channels` map.
+
+Parity that is NOT a divergence: the identity gate. `system.slack_resolve_user`
+is the legacy `resolveUser` — an unlinked author gets the same message and
+no session — and `create_session` carries the resolved user as
+`ownerUserId`, so the thread's session runs with that user's credentials,
+OAuth subject and git attribution (the programmatic org credential is
+reserved for the review workers, which deliberately have no owner).
 
 ## Rollback
 

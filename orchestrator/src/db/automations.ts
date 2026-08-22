@@ -334,6 +334,8 @@ export interface AutomationEngineStore extends EngineRunStore {
     automationId: string;
     title: string | null;
     source: Record<string, unknown>;
+    /** The task's owner (CASL subject); null = the automation itself. */
+    createdByUserId?: string | null;
   }): Promise<string>;
   getAutomationTaskSession(runId: string): Promise<string | null>;
   recordSessionBinding(input: {
@@ -1417,7 +1419,7 @@ export function makeAutomationEngineStore(deps: EngineStoreDeps = {}): Automatio
             type: "automation",
             title: input.title,
             status: "working",
-            createdByUserId: null,
+            createdByUserId: input.createdByUserId ?? null,
             source: input.source,
           })
           .onConflictDoNothing();
