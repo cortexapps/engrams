@@ -181,6 +181,8 @@ export async function interpretAutomation(
   const ctx = buildRunContext(input.runId, snapshot, deps);
   const wait: WaitState = { buffer: [], clockSteps: 0 };
   const ledger: TurnLedger = { started: new Map(), idleSeen: new Map() };
+  /** Sessions an end_session block already ended (see finalize). */
+  const endedByBlock = new Set<string>();
 
   /** Stamp a freshly received message with its turn bookkeeping. */
   const annotate = (msg: AutomationInbox): BufferedEntry => {
@@ -445,6 +447,10 @@ export async function interpretAutomation(
           ledger.started.set(outputSessionId, 1);
         } else if (block.type === "send_prompt") {
           ledger.started.set(outputSessionId, (ledger.started.get(outputSessionId) ?? 0) + 1);
+        } else if (block.type === "end_session" && outcome.outputs["ended"] === true) {
+          // Finalize skips what an explicit end_session already ended
+          // (replay-deterministic: read from the checkpointed outputs).
+          endedByBlock.add(outputSessionId);
         }
       }
 
@@ -504,7 +510,7 @@ export async function interpretAutomation(
   await deps.step(async () => {
     const sessions = await deps.store.listRunSessions(input.runId);
     for (const session of sessions) {
-      if (session.keep) continue;
+      if (session.keep || endedByBlock.has(session.sessionId)) continue;
       try {
         await deps.sessions.endSession(session.sessionId);
       } catch {

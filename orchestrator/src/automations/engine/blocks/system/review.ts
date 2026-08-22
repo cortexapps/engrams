@@ -100,13 +100,22 @@ export const prContextConfigSchema = z.object({
   changedFiles: nullableInt,
 });
 
+/** A SHA that a template may have rendered EMPTY (a comment command carries
+ * no pull_request object): empty means absent, and absent means "resolve
+ * from GitHub". */
+const optionalSha = z
+  .string()
+  .optional()
+  .transform((v) => (v === undefined || v === "" ? undefined : v))
+  .pipe(z.string().regex(/^[0-9a-fA-F]{7,40}$/).optional());
+
 export const openReviewPassConfigSchema = z.object({
   provider: z.string().min(1).default("github"),
   repo: z.string().regex(/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/),
   prNumber: z.coerce.number().int().positive(),
   trigger: z.enum(["opened", "synchronize", "ready_for_review", "command", "retry", "dispatch"]),
-  headSha: z.string().regex(/^[0-9a-fA-F]{7,40}$/).optional(),
-  baseSha: z.string().regex(/^[0-9a-fA-F]{7,40}$/).optional(),
+  headSha: optionalSha,
+  baseSha: optionalSha,
   pr: prContextConfigSchema.optional(),
 });
 export type OpenReviewPassConfig = z.infer<typeof openReviewPassConfigSchema>;
