@@ -729,7 +729,10 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
           payload: input.payload,
           ...(input.eventKey !== undefined ? { eventKey: input.eventKey } : {}),
         },
-        scheduledFor: null,
+        // A cron automation's templates read `trigger.scheduled_for`
+        // (strict Liquid: an absent variable fails the render). An ad-hoc
+        // run has no tick, so the would-be fire time is "now".
+        scheduledFor: definition.trigger.kind === "cron" ? new Date(receivedAt) : null,
         ...(input.dryRun ? { dryRun: true } : {}),
       },
       { store, starter: starter(), sender: sender(), now },

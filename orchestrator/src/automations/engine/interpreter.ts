@@ -597,10 +597,25 @@ export async function interpretAutomation(
       ctx.handlerState =
         installed !== null && installed.executor === executor ? installed.state : undefined;
       const name = stepName(frames, attempt);
-      const outcome: BlockOutcome = await deps.step(
-        () => executeDataBlock(block, executor, path, attempt),
-        name,
-      );
+      const outcome: BlockOutcome = await deps.step(async () => {
+        // A system block carries product side effects (review rows, Slack
+        // posts) that have no stub; a dry run refuses it loudly rather than
+        // half-running the product.
+        if (ctx.dryRun && executor.system) {
+          const refused: BlockOutcome = {
+            kind: "error",
+            code: "dry_run_unsupported",
+            message: `system block "${block.type}" cannot run in a dry run`,
+            retryable: false,
+          };
+          await deps.store.recordStep(input.runId, path, attempt, {
+            status: "failed",
+            error: `${refused.code}: ${refused.message}`,
+          });
+          return refused;
+        }
+        return executeDataBlock(block, executor, path, attempt);
+      }, name);
 
       if (outcome.kind === "end_run") {
         throw new RunEnd(outcome.status, outcome.reason);
@@ -666,7 +681,20 @@ export async function interpretAutomation(
       if (executor.wait) {
         const waitConfig = (outcome.resolvedConfig ?? block.config) as never;
         const deadlineS = executor.wait.deadlineSeconds(waitConfig, ctx);
-        if (deadlineS !== 0) {
+        if (deadlineS !== 0 && ctx.dryRun) {
+          // Nothing will ever arrive for a dry run (no session exists, no
+          // event is routed to it), so the wait resolves at once with the
+          // block's dry-run outcome — the happy path for a session wait, the
+          // deadline for an event wait — and the graph walks on.
+          const waited = executor.wait.dryRunOutcome
+            ? executor.wait.dryRunOutcome(waitConfig, ctx)
+            : { outcome: "completed" };
+          const merged = { ...ctx.steps[block.id], ...waited, dry_run: true };
+          recordStepOutputs(ctx, block.id, path, merged);
+          await deps.step(async () => {
+            await deps.store.recordStep(input.runId, path, attempt, { status: "succeeded", outputs: merged });
+          }, `${name}:wait`);
+        } else if (deadlineS !== 0) {
           const matched = await waitForMessage(frames, executor, waitConfig, deadlineS);
           const waited =
             matched ??

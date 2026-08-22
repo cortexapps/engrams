@@ -791,6 +791,31 @@ describe("AutomationService v2", () => {
     expect(starts).toEqual([dry.runId, live.runId]);
   });
 
+  test("an ad-hoc run of a cron automation carries a would-be scheduled_for; a manual one does not", async () => {
+    const deps = adminDeps({ workflowStarter: { async start() {} } });
+    const { automations } = clients(deps);
+    const cron = await automations.createAutomation({
+      name: "Cron",
+      description: "",
+      enabled: true,
+      definitionJson: JSON.stringify(cronDefinition()),
+      inputsJson: "{}",
+    });
+    const dry = await automations.dryRun({ automationId: cron.automation!.id, sample: { case: undefined } });
+    const row = deps.fake.runs.get(dry.runId)!;
+    expect(row.scheduledFor).toBeInstanceOf(Date);
+    expect(row.scheduledFor?.toISOString()).toBe(row.trigger.receivedAt);
+    const manual = await automations.createAutomation({
+      name: "Manual2",
+      description: "",
+      enabled: true,
+      definitionJson: JSON.stringify(cronDefinition({ trigger: { kind: "manual" } })),
+      inputsJson: "{}",
+    });
+    const m = await automations.runNow({ automationId: manual.automation!.id });
+    expect(deps.fake.runs.get(m.runId)?.scheduledFor).toBeNull();
+  });
+
   test("ListInputKeyOptions goes through the injected source", async () => {
     const { automations } = clients(
       adminDeps({ inputKeyOptions: { async list(noun) { return [{ key: `${noun}-1`, label: "One" }]; } } }),

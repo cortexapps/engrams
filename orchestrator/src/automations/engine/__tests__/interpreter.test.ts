@@ -10,6 +10,8 @@ import type { AutomationDefinition, BlockDef } from "../definition.ts";
 import type { RunSnapshot } from "../context.ts";
 import type { AutomationInbox } from "../inbox.ts";
 import { interpretAutomation } from "../interpreter.ts";
+import { registerBlock, unregisterBlockForTest } from "../blocks/registry.ts";
+import { z } from "zod";
 
 // ---------------------------------------------------------------------------
 // Fakes (the automation-run.test.ts pattern: immediate steps + in-memory
@@ -55,6 +57,7 @@ function makeHarness(
     failExec?: boolean;
     /** Fake integration-action runtime: records calls; throws when asked. */
     failActions?: boolean;
+    dryRun?: boolean;
     /** Make recordStep throw for these frame paths (a ledger blip). */
     failRecordStepFor?: string[];
   } = {},
@@ -87,6 +90,7 @@ function makeHarness(
     },
     aliases: [],
     startedAtMs: clock,
+    ...(options.dryRun ? { dryRun: true } : {}),
   };
 
   const store: EngineRunStore = {
@@ -389,6 +393,100 @@ describe("interpretAutomation — golden step sequences (ENGINE_STEP_CONTRACT 4)
     const none = makeHarness(definition, { inputs: {} });
     expect((await interpretAutomation(RUN, none.deps)).status).toBe("completed");
     expect(none.names.filter((n) => n.startsWith("step:poll[")).length).toBe(0);
+  });
+
+  test("a dry run walks the whole graph without a single side effect", async () => {
+    // Every side-effecting block stubs itself; waits resolve at once (no
+    // session exists to signal, no event is routed); the run completes.
+    const definition = makeDefinition([
+      {
+        id: "launch",
+        type: "create_session",
+        config: { profileId: "p", promptTemplate: "go ${{ inputs.x }}", titleTemplate: "T" },
+      },
+      { id: "tick", type: "run_command", config: { session: { blockId: "launch" }, commandTemplate: "make" } },
+      {
+        id: "files",
+        type: "write_files",
+        config: { session: { blockId: "launch" }, files: [{ path: "/w/a.txt", contentTemplate: "hi" }] },
+      },
+      {
+        id: "ask",
+        type: "send_prompt",
+        config: { session: { blockId: "launch" }, promptTemplate: "more", waitFor: { kind: "run_end" } },
+      },
+      { id: "settle", type: "wait_session", config: { session: { blockId: "launch" }, until: "idle" } },
+      {
+        id: "turns",
+        type: "loop",
+        config: {
+          maxIterations: 5,
+          until: { mode: "all", conditions: [{ path: "steps.next.outcome", op: "equals", value: "deadline" }] },
+        },
+        body: [
+          {
+            id: "next",
+            type: "wait_event",
+            config: { eventKeys: ["x.y"], deadlineSeconds: 60, onDeadline: "continue" },
+          },
+        ],
+      },
+      {
+        id: "post",
+        type: "integration_action",
+        config: { provider: "github", actionId: "create_issue_comment", params: { body: "b" } },
+      },
+      { id: "bye", type: "end_session", config: { session: { blockId: "launch" } } },
+    ]);
+    const h = makeHarness(definition, { dryRun: true, inputs: { x: "1" } });
+    const result = await interpretAutomation(RUN, h.deps);
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe("completed");
+    expect(h.created).toEqual([]);
+    expect(h.execs).toEqual([]);
+    expect(h.prompts).toEqual([]);
+    expect(h.ended).toEqual([]);
+    expect(h.actions).toEqual([]);
+    const outputs = Object.fromEntries(h.stepRecords.map((r) => [r.framePath, r.record.outputs ?? {}]));
+    expect(outputs["launch"]).toMatchObject({
+      session_id: `dry-run:${RUN.runId}:launch`,
+      prompt: "go 1",
+      dry_run: true,
+    });
+    expect(outputs["tick"]).toMatchObject({ dry_run: true, would_execute: { command: "make" }, exit_status: 0 });
+    expect(outputs["files"]).toMatchObject({ would_execute: { files: [{ path: "/w/a.txt", chars: 2 }] } });
+    expect(outputs["ask"]).toMatchObject({ sent: false, would_execute: { prompt: "more" }, outcome: "completed" });
+    expect(outputs["settle"]).toMatchObject({ outcome: "completed", dry_run: true });
+    // The event wait "expired" at once, so the loop ran exactly once.
+    expect(outputs["turns[0].next"]).toMatchObject({ outcome: "deadline" });
+    expect(h.names.filter((n) => n.startsWith("step:turns["))).toEqual([
+      "step:turns[0].next:0",
+      "step:turns[0].next:0:wait",
+      "step:turns[0].__until__:0",
+    ]);
+    expect(outputs["bye"]).toMatchObject({ ended: false, dry_run: true });
+  });
+
+  test("a dry run refuses a system block instead of half-running the product", async () => {
+    registerBlock({
+      type: "system.test_effect",
+      system: true,
+      configSchema: z.object({}),
+      async execute() {
+        throw new Error("must not run");
+      },
+    });
+    try {
+      const definition = makeDefinition([{ id: "fx", type: "system.test_effect", config: {} }]);
+      const h = makeHarness(definition, { dryRun: true });
+      const result = await interpretAutomation(RUN, h.deps);
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("dry_run_unsupported");
+      expect(h.stepRecords.find((r) => r.framePath === "fx")?.record.status).toBe("failed");
+    } finally {
+      unregisterBlockForTest("system.test_effect");
+    }
   });
 
   test("engine-level retries mint attempt-scoped steps then fail the run", async () => {
@@ -844,8 +942,6 @@ describe("interpretAutomation — waits, control messages, finalize", () => {
 // Contract 3: installed message handlers
 // ---------------------------------------------------------------------------
 
-import { z } from "zod";
-import { registerBlock, unregisterBlockForTest } from "../blocks/registry.ts";
 
 describe("interpretAutomation — installed message handlers (contract 3)", () => {
   const TYPE = "system.test_relay";

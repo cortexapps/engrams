@@ -1,6 +1,8 @@
 /** Launch an editor dry run (ADR 0119 phase 3.5): a real run row flagged
- * dry_run, integration actions stubbed to "would have posted …". Navigates to
- * the run page so the timeline shows it live. */
+ * dry_run that boots no session, sends no prompt, runs no command and posts
+ * nothing — every side-effecting block records what it would have done and
+ * waits resolve at once. Navigates to the run page so the timeline shows it
+ * live. */
 
 import { FlaskConical } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
