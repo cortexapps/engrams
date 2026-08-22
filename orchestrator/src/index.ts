@@ -156,6 +156,11 @@ import { SpecTicketSyncService } from "./specs/ticket-sync-service.ts";
 import { PostgresSpecTicketSyncStore } from "./specs/ticket-sync-store.ts";
 import { makeSpecTicketSyncConnector } from "./specs/ticket-sync-connector.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
+import {
+  productionBuiltinSeedDeps,
+  registerShippedBuiltins,
+  seedBuiltinAutomations,
+} from "./automations/builtins/seed.ts";
 import { retireProviderWebhookSchemes } from "./automations/retire-provider-webhooks.ts";
 import { makeAutomationStore } from "./db/automations.ts";
 import { makeGithubReviewPoster } from "./reviews/github-review.ts";
@@ -634,6 +639,13 @@ await Promise.all([
 ]);
 void seedReviewerProfile(makeProfileStore(getDb()), integrationConnections, log).catch((err) =>
   log.error({ err }, "reviewer profile seed failed"),
+);
+// ADR 0119 D7: the shipped built-in automations (PR review). Seeded DISABLED;
+// the per-repo flag (4.4) opens the parallel window. Idempotent; a changed
+// shipped definition bumps the version and preserves org inputs/overrides.
+registerShippedBuiltins();
+void seedBuiltinAutomations(productionBuiltinSeedDeps()).catch((err) =>
+  log.error({ err }, "built-in automation seed failed"),
 );
 // ADR 0119 D5: one-shot, idempotent retirement of provider-scheme webhooks —
 // github-app-bound automations move onto the default GitHub connection;
