@@ -1,6 +1,6 @@
 {
-  "id": "aa88be64-c062-465a-ae0d-6e22849a53f0",
-  "prevId": "766980f4-e20e-409d-8817-013117363d88",
+  "id": "766980f4-e20e-409d-8817-013117363d88",
+  "prevId": "48d29714-306d-4295-8a97-9ce1137d6512",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -1051,13 +1051,6 @@
           "primaryKey": false,
           "notNull": true,
           "default": true
-        },
-        "relay": {
-          "name": "relay",
-          "type": "boolean",
-          "primaryKey": false,
-          "notNull": true,
-          "default": false
         },
         "created_at": {
           "name": "created_at",

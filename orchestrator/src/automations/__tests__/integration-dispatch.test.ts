@@ -325,6 +325,34 @@ describe("dispatchIntegrationEvent", () => {
     expect(pending.status).toBe("pending");
   });
 
+  test("a kill-switched built-in never admits a run, so a flagged repo is not served by both brains", async () => {
+    // With ORCHESTRATOR_REVIEW_AUTOMATION_DISABLED on, the GitHub route falls
+    // back to the legacy review graph. If the dispatcher still delivered to
+    // the enabled built-in, a flagged repo would get TWO reviews. The switch
+    // gates the trigger path too; a user automation on the same event is
+    // unaffected.
+    const builtin = {
+      automation: meta({ id: "builtin-review", kind: "builtin", builtinKey: "pr_review" }),
+      definition: definition(trigger()),
+    };
+    const user = { automation: meta({ id: "user-auto" }), definition: definition(trigger()) };
+    const h = makeHarness([builtin, user]);
+
+    const off = await dispatchIntegrationEvent(input(), {
+      ...deps(h),
+      disabledBuiltins: new Set<string>(),
+    });
+    expect(off.started).toBe(2);
+
+    const h2 = makeHarness([builtin, user]);
+    const on = await dispatchIntegrationEvent(input(), {
+      ...deps(h2),
+      disabledBuiltins: new Set(["pr_review"]),
+    });
+    expect(on).toMatchObject({ matched: 1, started: 1 });
+    expect(h2.starts.map((s) => s.automationId)).toEqual(["user-auto"]);
+  });
+
   test("one target's admission fault never drops its siblings, and the delivery fails afterwards", async () => {
     const a = { automation: meta({ id: "automation-a" }), definition: definition(trigger()) };
     const b = { automation: meta({ id: "automation-b" }), definition: definition(trigger()) };

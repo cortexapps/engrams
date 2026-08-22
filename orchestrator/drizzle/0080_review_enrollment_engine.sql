@@ -1,0 +1,1 @@
+ALTER TABLE "review_enrollment" ADD COLUMN "engine" text DEFAULT 'legacy' NOT NULL;

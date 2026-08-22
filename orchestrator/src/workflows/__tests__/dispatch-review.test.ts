@@ -14,6 +14,7 @@ import type { ReviewInbox } from "../review-inbox.ts";
 const enrollment: EnrollmentRow = {
   repo: "openai/engrams",
   triggerMode: "manual",
+  engine: "legacy" as const,
   autofix: "off",
   profileId: null,
   createdAt: new Date("2026-07-17T00:00:00Z"),
